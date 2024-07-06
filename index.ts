@@ -1,0 +1,133 @@
+import fs from 'fs/promises';
+import { pull } from "langchain/hub";
+import { ChatOpenAI } from "@langchain/openai";
+import type { ChatPromptTemplate } from "@langchain/core/prompts";
+import { AgentExecutor, createOpenAIFunctionsAgent, AgentStep } from "langchain/agents";
+import { TavilySearchResults } from "@langchain/community/tools/tavily_search";
+import type { RunLogPatch } from "@langchain/core/tracers/log_stream";
+import dotenv from 'dotenv';
+
+// Load environment variables from .env file
+dotenv.config();
+
+// Define the tools the agent will have access to.
+const tools = [new TavilySearchResults({})];
+
+const llm = new ChatOpenAI({
+  model: "gpt-3.5-turbo-1106",
+  temperature: 0,
+  streaming: true,
+});
+
+// Get the prompt to use - you can modify this!
+// If you want to see the prompt in full, you can at:
+// https://smith.langchain.com/hub/hwchase17/openai-functions-agent
+const prompt = await pull<ChatPromptTemplate>(
+  "hwchase17/openai-functions-agent"
+);
+
+const agent = await createOpenAIFunctionsAgent({
+  llm,
+  tools,
+  prompt,
+});
+
+const agentExecutor = new AgentExecutor({
+  agent,
+  tools,
+});
+
+const logStream = await agentExecutor.streamLog({
+  input: "what is the weather in SF",
+});
+
+const finalState: RunLogPatch[] = [];
+const outputs: RunLogPatch[] = [];
+let accumulatedOutput = '';
+
+function processStreamedOutput(op: any) {
+  let output = '';
+  if (op.value.text !== undefined) {
+    output += op.value.text;
+  }
+  if (op.value.message && op.value.message.kwargs) {
+    const kwargs = op.value.message.kwargs;
+    if (kwargs.content) {
+      output += kwargs.content;
+    }
+  }
+  if (output) {
+    accumulatedOutput += output;
+    process.stdout.write(output);
+  }
+}
+
+for await (const chunk of logStream) {
+  finalState.push(chunk);
+  outputs.push(chunk);
+
+  if (chunk.ops) {
+    for (const op of chunk.ops) {
+      if (op.op === 'add' && (
+        op.path.includes('/streamed_output/-') || 
+        op.path.includes('/streamed_output_str/-')
+      )) {
+        processStreamedOutput(op);
+        if (op.value?.message?.additional_kwargs?.function_call) {
+          process.stdout.write(`\nLogged Argument: ${JSON.stringify(op.value.message.additional_kwargs.function_call, null, 2)}\n`);
+        }
+    }
+    }
+  }
+}
+
+// Define types for the final output structure
+interface FinalOutput {
+  id: string;
+  streamed_output: Array<{
+    intermediateSteps?: AgentStep[];
+    output?: string;
+  }>;
+  final_output?: {
+    output: string;
+  };
+  logs: Record<string, any>;
+}
+
+// Process finalState to create FinalOutput
+const finalOutput: FinalOutput = {
+  id: '',
+  streamed_output: [],
+  logs: {},
+};
+
+for (const patch of finalState) {
+  if (patch.ops) {
+    for (const op of patch.ops) {
+      if (op.op === 'add' || op.op === 'replace') {
+        if (op.path === '/id') {
+          finalOutput.id = op.value;
+        } else if (op.path === '/streamed_output/-') {
+          finalOutput.streamed_output.push(op.value);
+        } else if (op.path === '/final_output') {
+          finalOutput.final_output = op.value;
+        } else if (op.path.startsWith('/logs/')) {
+          const logKey = op.path.split('/')[2];
+          finalOutput.logs[logKey] = op.value;
+        }
+      }
+    }
+  }
+}
+
+// Save outputs to a JSON file
+await fs.writeFile('outputs.json', JSON.stringify(outputs, null, 2));
+console.log("\n\nOutputs have been saved to outputs.json");
+
+// Save the final state separately
+await fs.writeFile('final_output.json', JSON.stringify(finalOutput, null, 2));
+console.log("\n\nFinal output has been saved to final_output.json");
+
+// Save the cleaned-up accumulated output
+await fs.writeFile('cleaned_output.txt', accumulatedOutput);
+console.log("\n\nCleaned output has been saved to cleaned_output.txt");
