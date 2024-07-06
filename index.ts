@@ -44,6 +44,9 @@ const logStream = await agentExecutor.streamLog({
 const finalState: RunLogPatch[] = [];
 const outputs: RunLogPatch[] = [];
 let accumulatedOutput = '';
+let accumulatedArguments = '';
+
+let functionName: string | undefined = undefined;
 
 function processStreamedOutput(op: any) {
   let output = '';
@@ -62,6 +65,40 @@ function processStreamedOutput(op: any) {
   }
 }
 
+// A helper function to handle the event pattern for logged arguments
+function handleLoggedArgument(loggedArgument: any) {
+  if (loggedArgument.value?.message?.additional_kwargs?.function_call) {
+    const functionCall = loggedArgument.value.message.additional_kwargs.function_call;
+
+    if (functionCall.name) {
+      functionName = functionCall.name;
+      process.stdout.write(`Logged Function Name:
+        ${JSON.stringify(functionCall, null, 2)}
+      `);
+    }
+
+    if (functionCall.arguments) {
+      accumulatedArguments += functionCall.arguments;
+      // Print the part of the argument as it comes
+      // process.stdout.write(`Logged Argument: { "arguments": "${functionCall.arguments}" }\n`);
+      process.stdout.write(`Logged Argument:\n${JSON.stringify(functionCall, null, 2)}`);
+    }
+
+    // Check if the full arguments string has been accumulated
+    if (accumulatedArguments.startsWith("{") && accumulatedArguments.endsWith("}")) {
+      // Build the final logged argument string
+      const completeArguments = accumulatedArguments;
+      const namePart = functionName ? `"name": "${functionName}", ` : '';
+
+      console.log(`\nLogged Argument: {\n  ${namePart}"arguments": ${completeArguments}\n}\n`);
+
+      // Reset accumulators
+      accumulatedArguments = '';
+      functionName = undefined;
+    }
+  }
+}
+
 for await (const chunk of logStream) {
   finalState.push(chunk);
   outputs.push(chunk);
@@ -74,9 +111,9 @@ for await (const chunk of logStream) {
       )) {
         processStreamedOutput(op);
         if (op.value?.message?.additional_kwargs?.function_call) {
-          process.stdout.write(`\nLogged Argument: ${JSON.stringify(op.value.message.additional_kwargs.function_call, null, 2)}\n`);
+          handleLoggedArgument(op);
         }
-    }
+      }
     }
   }
 }
