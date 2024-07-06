@@ -4,4 +4,6 @@ dist/
 *.log
 outputs.json
 *_output.txt
+*_*.txt
+*_output.json
 *.txt
