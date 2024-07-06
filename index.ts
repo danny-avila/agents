@@ -7,6 +7,10 @@ import { TavilySearchResults } from "@langchain/community/tools/tavily_search";
 import type { RunLogPatch } from "@langchain/core/tracers/log_stream";
 import dotenv from 'dotenv';
 
+type ExtractedJSONPatchOperation = Pick<RunLogPatch, 'ops'>;
+type OperationType = ExtractedJSONPatchOperation extends { ops: (infer T)[] } ? T : never;
+
+
 // Load environment variables from .env file
 dotenv.config();
 
@@ -38,7 +42,7 @@ const agentExecutor = new AgentExecutor({
 });
 
 const logStream = await agentExecutor.streamLog({
-  input: "what is the weather in SF",
+  input: "what are the current US election polls 2024. today is 7/6/24",
 });
 
 const finalState: RunLogPatch[] = [];
@@ -103,19 +107,48 @@ for await (const chunk of logStream) {
   finalState.push(chunk);
   outputs.push(chunk);
 
-  if (chunk.ops) {
-    for (const op of chunk.ops) {
-      if (op.op === 'add' && (
-        op.path.includes('/streamed_output/-') || 
-        op.path.includes('/streamed_output_str/-')
-      )) {
-        processStreamedOutput(op);
-        if (op.value?.message?.additional_kwargs?.function_call) {
-          handleLoggedArgument(op);
-        }
+  if (!chunk.ops) continue;
+
+  for (const op of chunk.ops) {
+    if (isStreamedOutput(op)) {
+      processStreamedOutput(op);
+      if (hasFunctionCall(op)) {
+        handleLoggedArgument(op);
       }
+    } else if (isFinalOutput(op)) {
+      printFinalOutput(op);
     }
   }
+}
+
+function isStreamedOutput(op: OperationType) {
+  return op.op === 'add' && (
+    op.path.includes('/streamed_output/-') || 
+    op.path.includes('/streamed_output_str/-')
+  );
+}
+
+function hasFunctionCall(op: OperationType) {
+  return op?.['value']?.message?.additional_kwargs?.function_call;
+}
+
+function isFinalOutput(op: OperationType) {
+  return op.op === 'add' && 
+         op.value?.output && 
+         op.path?.startsWith('/logs/') && 
+         op.path?.endsWith('final_output') && 
+         !op.path?.includes('Runnable');
+}
+
+function printFinalOutput(op: OperationType) {
+  process.stdout.write(JSON.stringify(op, null, 2));
+  process.stdout.write(`
+
+########################_START_##########################
+        ${JSON.stringify(op?.['value']?.output, null, 2)}
+########################__END__##########################
+
+        `);
 }
 
 // Define types for the final output structure
