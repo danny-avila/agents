@@ -1,96 +1,76 @@
-/* eslint-disable no-console */
-// src/scripts/cli.ts
 import { config } from 'dotenv';
 config();
-import { HumanMessage, BaseMessage, AIMessage, SystemMessage, ToolMessage } from '@langchain/core/messages';
+import { HumanMessage, BaseMessage } from '@langchain/core/messages';
 import { TavilySearchResults } from '@langchain/community/tools/tavily_search';
 import type * as t from '@/types';
 import {
   ChatModelStreamHandler,
   LLMStreamHandler,
 } from '@/stream';
-
 import { getArgs } from '@/scripts/args';
 import { Processor } from '@/processor';
 import { GraphEvents } from '@/common';
 import { getLLMConfig } from '@/utils/llmConfig';
+import type { RunnableConfig } from '@langchain/core/runnables';
+import * as readline from 'readline';
 
 const conversationHistory: BaseMessage[] = [];
-async function testStandardStreaming(): Promise<void> {
+
+const rl = readline.createInterface({
+  input: process.stdin,
+  output: process.stdout
+});
+
+async function promptUser(question: string): Promise<string> {
+  return new Promise((resolve) => {
+    rl.question(question, (answer) => {
+      resolve(answer);
+    });
+  });
+}
+
+async function interactiveConversation(): Promise<void> {
   const { userName, location, provider, currentDate } = await getArgs();
+  
   const customHandlers = {
-    // [GraphEvents.LLM_STREAM]: new LLMStreamHandler(),
+    [GraphEvents.LLM_STREAM]: new LLMStreamHandler(),
     [GraphEvents.CHAT_MODEL_STREAM]: new ChatModelStreamHandler(),
-    [GraphEvents.ON_RUN_STEP]: {
+    [GraphEvents.LLM_START]: {
       handle: (_event: string, data: t.StreamEventData): void => {
-        console.log('====== ON_RUN_STEP ======');
+        console.log('====== LLM_START ======');
         console.dir(data, { depth: null });
       }
     },
-    [GraphEvents.ON_RUN_STEP_DELTA]: {
+    [GraphEvents.LLM_END]: {
       handle: (_event: string, data: t.StreamEventData): void => {
-        console.log('====== ON_RUN_STEP_DELTA ======');
+        console.log('====== LLM_END ======');
         console.dir(data, { depth: null });
       }
     },
-    [GraphEvents.ON_MESSAGE_DELTA]: {
+    [GraphEvents.CHAT_MODEL_START]: {
+      handle: (_event: string, _data: t.StreamEventData): void => {
+        console.log('====== CHAT_MODEL_START ======');
+        console.dir(_data, { depth: null });
+      }
+    },
+    [GraphEvents.CHAT_MODEL_END]: {
+      handle: (_event: string, _data: t.StreamEventData): void => {
+        console.log('====== CHAT_MODEL_END ======');
+        console.dir(_data, { depth: null });
+      }
+    },
+    [GraphEvents.TOOL_START]: {
       handle: (_event: string, data: t.StreamEventData): void => {
-        console.log('====== ON_MESSAGE_DELTA ======');
+        console.log('====== TOOL_START ======');
         console.dir(data, { depth: null });
       }
     },
-    // [GraphEvents.LLM_START]: {
-    //   handle: (_event: string, data: t.StreamEventData): void => {
-    //     console.log('====== LLM_START ======');
-    //     console.dir(data, { depth: null });
-    //   }
-    // },
-    // [GraphEvents.LLM_END]: {
-    //   handle: (_event: string, data: t.StreamEventData): void => {
-    //     console.log('====== LLM_END ======');
-    //     console.dir(data, { depth: null });
-    //   }
-    // },
-    /*
-    [GraphEvents.CHAIN_START]: {
+    [GraphEvents.TOOL_END]: {
       handle: (_event: string, data: t.StreamEventData): void => {
-        console.log('====== CHAIN_START ======');
-        // console.dir(data, { depth: null });
+        console.log('====== TOOL_END ======');
+        console.dir(data, { depth: null });
       }
     },
-    [GraphEvents.CHAIN_END]: {
-      handle: (_event: string, data: t.StreamEventData): void => {
-        console.log('====== CHAIN_END ======');
-        // console.dir(data, { depth: null });
-      }
-    },
-    */
-    // [GraphEvents.CHAT_MODEL_START]: {
-    //   handle: (_event: string, _data: t.StreamEventData): void => {
-    //     console.log('====== CHAT_MODEL_START ======');
-    //     console.dir(_data, { depth: null });
-    //     // Intentionally left empty
-    //   }
-    // },
-    // [GraphEvents.CHAT_MODEL_END]: {
-    //   handle: (_event: string, _data: t.StreamEventData): void => {
-    //     console.log('====== CHAT_MODEL_END ======');
-    //     console.dir(_data, { depth: null });
-    //     // Intentionally left empty
-    //   }
-    // },
-    // [GraphEvents.TOOL_START]: {
-    //   handle: (_event: string, data: t.StreamEventData): void => {
-    //     console.log('====== TOOL_START ======');
-    //     console.dir(data, { depth: null });
-    //   }
-    // },
-    // [GraphEvents.TOOL_END]: {
-    //   handle: (_event: string, data: t.StreamEventData): void => {
-    //     console.log('====== TOOL_END ======');
-    //     console.dir(data, { depth: null });
-    //   }
-    // },
   };
 
   const llmConfig = getLLMConfig(provider);
@@ -104,51 +84,65 @@ async function testStandardStreaming(): Promise<void> {
     customHandlers,
   });
 
-  const config = {
+  const sessionConfig: Partial<RunnableConfig> & { version: 'v2' | 'v1' } = {
     configurable: {
       provider,
-      thread_id: 'conversation-num-1',
-      instructions: 'You are a friendly AI assistant. Always address the user by their name.',
-      additional_instructions: `The user's name is ${userName} and they are located in ${location}.`
+      thread_id: `${userName}-session-${Date.now()}`,
+      instructions: `You are a knowledgeable and friendly AI assistant. Tailor your responses to ${userName}'s interests in ${location}.`,
+      additional_instructions: `Today is ${currentDate}. Use the tools available when necessary to provide accurate and up-to-date information. Maintain a warm, personalized tone throughout.`
     },
     streamMode: 'values',
     version: 'v2' as const,
   };
 
-  console.log(' Test 1: Initial greeting');
+  console.log(`Starting interactive conversation for ${userName} in ${location}`);
 
-  conversationHistory.push(new HumanMessage(`Hi I'm ${userName}.`));
-  let inputs = {
-    messages: conversationHistory,
-  };
-  const finalMessage = await processor.processStream(inputs, config);
-  if (finalMessage) {
-    conversationHistory.push(finalMessage);
-  }
+  // Initial system message
+  const systemMessage = new HumanMessage(`Hello! I'm ${userName}, currently in ${location}. Today's date is ${currentDate}. I'm looking forward to our conversation!`);
+  conversationHistory.push(systemMessage);
 
-  console.log(' Test 2: Weather query');
+  while (true) {
+    const userInput = await promptUser("You: ");
+    if (userInput.toLowerCase() === 'exit') {
+      console.log("Ending conversation. Goodbye!");
+      rl.close();
+      break;
+    }
 
-  const userMessage = `
-  Make a search for the weather in ${location} today, which is ${currentDate}.
-  Make sure to always refer to me by name.
-  After giving me a thorough summary, tell me a joke about the weather forecast we went over.
-  `;
+    const userMessage = new HumanMessage(userInput);
+    conversationHistory.push(userMessage);
 
-  conversationHistory.push(new HumanMessage(userMessage));
+    const processorInput: t.IState = {
+      messages: conversationHistory,
+    };
 
-  inputs = {
-    messages: conversationHistory,
-  };
-  const finalMessage2 = await processor.processStream(inputs, config);
-  if (finalMessage2) {
-    conversationHistory.push(finalMessage2);
-    console.dir(conversationHistory, { depth: null });
+    try {
+      const aiResponse = await processor.processStream(processorInput, sessionConfig);
+      console.log("Debug - AI Response:", aiResponse);
+      console.log("Debug - AI Response Type:", typeof aiResponse);
+      if (aiResponse) {
+        console.log("Debug - AI Content Type:", typeof aiResponse.content);
+        conversationHistory.push(aiResponse);
+        if (typeof aiResponse.content === 'string') {
+          console.log("AI: " + aiResponse.content);
+        } else if (aiResponse.content && typeof aiResponse.content === 'object') {
+          console.log("AI: " + JSON.stringify(aiResponse.content, null, 2));
+        } else {
+          console.log("AI: [Unable to display response]");
+        }
+      } else {
+        console.log("AI: [No response]");
+      }
+    } catch (error) {
+      console.error("An error occurred during processing:", error);
+    }
   }
 }
 
-testStandardStreaming().catch((err) => {
-  console.error(err);
-  console.log('Conversation history:');
+interactiveConversation().catch((error) => {
+  console.error("An error occurred during the conversation:", error);
+  console.log("Final conversation state:");
   console.dir(conversationHistory, { depth: null });
+  rl.close();
   process.exit(1);
 });
