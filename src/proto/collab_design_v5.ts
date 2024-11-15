@@ -77,7 +77,7 @@ export class CollaborativeProcessor {
   }
 
   private async createGraph(): Promise<t.CompiledWorkflow> {
-    const agentStateChannels: StateGraphArgs['channels'] = {
+    const agentStateChannels: StateGraphArgs<AgentStateChannels>['channels'] = {
       messages: {
         value: (x?: BaseMessage[], y?: BaseMessage[]) => (x ?? []).concat(y ?? []),
         default: () => [],
