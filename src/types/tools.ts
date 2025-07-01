@@ -1,6 +1,6 @@
 // src/types/tools.ts
-import type { RunnableToolLike } from '@langchain/core/runnables';
-import type { StructuredToolInterface } from '@langchain/core/tools';
+import type { BindToolsInput } from '@langchain/core/language_models/chat_models';
+import type { GoogleAIToolType } from '@langchain/google-common';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type { ToolErrorData } from './stream';
 import { EnvVar } from '@/common';
@@ -13,9 +13,9 @@ export type CustomToolCall = {
   id?: string;
   type?: 'tool_call';
   output?: string;
-}
+};
 
-export type GenericTool = StructuredToolInterface | RunnableToolLike;
+export type GenericTool = BindToolsInput | GoogleAIToolType;
 export type ToolMap = Map<string, GenericTool>;
 export type ToolRefs = {
   tools: GenericTool[];
@@ -30,7 +30,10 @@ export type ToolNodeOptions = {
   handleToolErrors?: boolean;
   loadRuntimeTools?: ToolRefGenerator;
   toolCallStepIds?: Map<string, string>;
-  errorHandler?: (data: ToolErrorData, metadata?: Record<string, unknown>) => void
+  errorHandler?: (
+    data: ToolErrorData,
+    metadata?: Record<string, unknown>
+  ) => void;
 };
 
 export type ToolNodeConstructorParams = ToolRefs & ToolNodeOptions;
@@ -50,13 +53,15 @@ export type CodeEnvFile = {
   session_id: string;
 };
 
-export type CodeExecutionToolParams = undefined | {
-  session_id?: string;
-  user_id?: string;
-  apiKey?: string;
-  files?: CodeEnvFile[];
-  [EnvVar.CODE_API_KEY]?: string;
-}
+export type CodeExecutionToolParams =
+  | undefined
+  | {
+      session_id?: string;
+      user_id?: string;
+      apiKey?: string;
+      files?: CodeEnvFile[];
+      [EnvVar.CODE_API_KEY]?: string;
+    };
 
 export type FileRef = {
   id: string;

@@ -497,6 +497,7 @@ export function convertResponseContentToChatGenerationChunk(
   // Checks if some parts do not have text. If false, it means that the content is a string.
   const reasoningParts: string[] = [];
   if (
+    candidateContent &&
     Array.isArray(candidateContent.parts) &&
     candidateContent.parts.every((p) => 'text' in p)
   ) {
@@ -510,7 +511,7 @@ export function convertResponseContentToChatGenerationChunk(
       textParts.push(part.text ?? '');
     }
     content = textParts.join('');
-  } else if (Array.isArray(candidateContent.parts)) {
+  } else if (candidateContent && Array.isArray(candidateContent.parts)) {
     content = candidateContent.parts.map((p) => {
       if ('text' in p && 'thought' in p && p.thought === true) {
         reasoningParts.push(p.text ?? '');
@@ -563,6 +564,10 @@ export function convertResponseContentToChatGenerationChunk(
   const additional_kwargs: ChatGeneration['message']['additional_kwargs'] = {};
   if (reasoningParts.length > 0) {
     additional_kwargs.reasoning = reasoningParts.join('');
+  }
+
+  if (candidate.groundingMetadata) {
+    additional_kwargs.groundingMetadata = candidate.groundingMetadata;
   }
 
   return new ChatGenerationChunk({
