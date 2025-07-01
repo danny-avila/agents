@@ -492,9 +492,10 @@ export function convertResponseContentToChatGenerationChunk(
     return null;
   }
   const functionCalls = response.functionCalls();
-  const [candidate] = response.candidates;
-  const { content: candidateContent, ...generationInfo } =
-    (candidate as Partial<GenerateContentCandidate> | undefined) ?? {};
+  const [candidate] = response.candidates as [
+    Partial<GenerateContentCandidate> | undefined,
+  ];
+  const { content: candidateContent, ...generationInfo } = candidate ?? {};
   let content: MessageContent | undefined;
   // Checks if some parts do not have text. If false, it means that the content is a string.
   const reasoningParts: string[] = [];
@@ -568,7 +569,7 @@ export function convertResponseContentToChatGenerationChunk(
     additional_kwargs.reasoning = reasoningParts.join('');
   }
 
-  if (candidate.groundingMetadata) {
+  if (candidate?.groundingMetadata) {
     additional_kwargs.groundingMetadata = candidate.groundingMetadata;
   }
 
