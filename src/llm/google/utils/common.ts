@@ -1,14 +1,15 @@
 import {
-  EnhancedGenerateContentResponse,
-  Content,
-  Part,
-  type FunctionDeclarationsTool as GoogleGenerativeAIFunctionDeclarationsTool,
-  type FunctionDeclaration as GenerativeAIFunctionDeclaration,
   POSSIBLE_ROLES,
-  FunctionCallPart,
-  TextPart,
-  FileDataPart,
-  InlineDataPart,
+  type Part,
+  type Content,
+  type TextPart,
+  type FileDataPart,
+  type InlineDataPart,
+  type FunctionCallPart,
+  type GenerateContentCandidate,
+  type EnhancedGenerateContentResponse,
+  type FunctionDeclaration as GenerativeAIFunctionDeclaration,
+  type FunctionDeclarationsTool as GoogleGenerativeAIFunctionDeclarationsTool,
 } from '@google/generative-ai';
 import {
   AIMessageChunk,
@@ -412,9 +413,9 @@ export function convertBaseMessagesToContent(
   messages: BaseMessage[],
   isMultimodalModel: boolean,
   convertSystemMessageToHumanContent: boolean = false
-): Content[] {
+): Content[] | undefined {
   return messages.reduce<{
-    content: Content[];
+    content: Content[] | undefined;
     mergeWithPreviousContent: boolean;
   }>(
     (acc, message, index) => {
@@ -427,7 +428,7 @@ export function convertBaseMessagesToContent(
       }
       const role = convertAuthorToRole(author);
 
-      const prevContent = acc.content[acc.content.length];
+      const prevContent = acc.content?.[acc.content.length];
       if (
         !acc.mergeWithPreviousContent &&
         prevContent &&
@@ -445,7 +446,7 @@ export function convertBaseMessagesToContent(
       );
 
       if (acc.mergeWithPreviousContent) {
-        const prevContent = acc.content[acc.content.length - 1];
+        const prevContent = acc.content?.[acc.content.length - 1];
         if (!prevContent) {
           throw new Error(
             'There was a problem parsing your system message. Please try a prompt without one.'
@@ -473,7 +474,7 @@ export function convertBaseMessagesToContent(
       return {
         mergeWithPreviousContent:
           author === 'system' && !convertSystemMessageToHumanContent,
-        content: [...acc.content, content],
+        content: [...(acc.content ?? []), content],
       };
     },
     { content: [], mergeWithPreviousContent: false }
@@ -492,12 +493,13 @@ export function convertResponseContentToChatGenerationChunk(
   }
   const functionCalls = response.functionCalls();
   const [candidate] = response.candidates;
-  const { content: candidateContent, ...generationInfo } = candidate;
+  const { content: candidateContent, ...generationInfo } =
+    (candidate as Partial<GenerateContentCandidate> | undefined) ?? {};
   let content: MessageContent | undefined;
   // Checks if some parts do not have text. If false, it means that the content is a string.
   const reasoningParts: string[] = [];
   if (
-    candidateContent &&
+    candidateContent != null &&
     Array.isArray(candidateContent.parts) &&
     candidateContent.parts.every((p) => 'text' in p)
   ) {
@@ -573,7 +575,7 @@ export function convertResponseContentToChatGenerationChunk(
   return new ChatGenerationChunk({
     text,
     message: new AIMessageChunk({
-      content: content || '',
+      content: content,
       name: !candidateContent ? undefined : candidateContent.role,
       tool_call_chunks: toolCallChunks,
       // Each chunk can have unique "generationInfo", and merging strategy is unclear,

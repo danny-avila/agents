@@ -133,7 +133,7 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
       this.useSystemInstruction
     );
     let actualPrompt = prompt;
-    if (prompt[0].role === 'system') {
+    if (prompt?.[0].role === 'system') {
       const [systemInstruction] = prompt;
       /** @ts-ignore */
       this.client.systemInstruction = systemInstruction;
