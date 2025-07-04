@@ -290,31 +290,53 @@ const createSearXNGAPI = (
       // Transform SearXNG results to match SerperAPI format
       const organicResults = (data.results ?? [])
         .slice(0, numResults)
-        .map((result: t.SearXNGResult) => ({
-          title: result.title ?? '',
-          link: result.url ?? '',
-          snippet: result.content ?? '',
-          date: result.publishedDate ?? '',
-        }));
+        .map((result: t.SearXNGResult, index: number) => {
+          let attribution = '';
+          try {
+            attribution = new URL(result.url ?? '').hostname;
+          } catch {
+            attribution = '';
+          }
 
-      // Extract image results if available
+          return {
+            position: index + 1,
+            title: result.title ?? '',
+            link: result.url ?? '',
+            snippet: result.content ?? '',
+            date: result.publishedDate ?? '',
+            attribution,
+          };
+        });
+
       const imageResults = (data.results ?? [])
         .filter((result: t.SearXNGResult) => result.img_src)
         .slice(0, 6)
-        .map((result: t.SearXNGResult) => ({
+        .map((result: t.SearXNGResult, index: number) => ({
           title: result.title ?? '',
           imageUrl: result.img_src ?? '',
+          position: index + 1,
+          source: new URL(result.url ?? '').hostname,
+          domain: new URL(result.url ?? '').hostname,
+          link: result.url ?? '',
         }));
 
-      // Format results to match SerperAPI structure
+      const relatedSearches = Array.isArray(data.suggestions)
+        ? data.suggestions.map((suggestion: string) => ({ query: suggestion }))
+        : [];
+
       const results: t.SearchResultData = {
         organic: organicResults,
         images: imageResults,
-        topStories: [],
-        // Use undefined instead of null for optional properties
-        relatedSearches: data.suggestions ?? [],
+        topStories: [], // SearXNG doesn't provide separate top stories
+        relatedSearches,
         videos: [],
         news: [],
+        // Add empty arrays for other Serper fields to maintain parity
+        places: [],
+        shopping: [],
+        peopleAlsoAsk: [],
+        knowledgeGraph: undefined,
+        answerBox: undefined,
       };
 
       return { success: true, data: results };

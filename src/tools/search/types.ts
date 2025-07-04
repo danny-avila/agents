@@ -581,6 +581,15 @@ export interface SearXNGResult {
   content?: string;
   publishedDate?: string;
   img_src?: string;
+  score?: number;
+  engine?: string;
+  category?: string;
+  thumbnail?: string;
+  priority?: string;
+  engines?: string[];
+  positions?: number[];
+  template?: string;
+  parsed_url?: string[];
 }
 
 export type ProcessSourcesFields = {
