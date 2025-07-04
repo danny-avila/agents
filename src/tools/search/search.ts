@@ -287,6 +287,37 @@ const createSearXNGAPI = (
 
       const data = response.data;
 
+      // Helper function to identify news results since SearXNG doesn't provide that classification by default
+      const isNewsResult = (result: t.SearXNGResult): boolean => {
+        const url = result.url?.toLowerCase() ?? '';
+        const title = result.title?.toLowerCase() ?? '';
+
+        // News-related keywords in title/content
+        const newsKeywords = [
+          'breaking news',
+          'latest news',
+          'top stories',
+          'news today',
+          'developing story',
+          'trending news',
+          'news',
+        ];
+
+        // Check if title/content contains news keywords
+        const hasNewsKeywords = newsKeywords.some(
+          (keyword) => title.toLowerCase().includes(keyword) // just title probably fine, content parsing is overkill for what we need: || content.includes(keyword)
+        );
+
+        // Check if URL contains news-related paths
+        const hasNewsPath =
+          url.includes('/news/') ||
+          url.includes('/world/') ||
+          url.includes('/politics/') ||
+          url.includes('/breaking/');
+
+        return hasNewsKeywords || hasNewsPath;
+      };
+
       // Transform SearXNG results to match SerperAPI format
       const organicResults = (data.results ?? [])
         .slice(0, numResults)
@@ -320,6 +351,30 @@ const createSearXNGAPI = (
           link: result.url ?? '',
         }));
 
+      // Extract news results from organic results
+      const newsResults = (data.results ?? [])
+        .filter(isNewsResult)
+        .map((result: t.SearXNGResult, index: number) => {
+          let attribution = '';
+          try {
+            attribution = new URL(result.url ?? '').hostname;
+          } catch {
+            attribution = '';
+          }
+
+          return {
+            title: result.title ?? '',
+            link: result.url ?? '',
+            snippet: result.content ?? '',
+            date: result.publishedDate ?? '',
+            source: attribution,
+            imageUrl: result.img_src ?? '',
+            position: index + 1,
+          };
+        });
+
+      const topStories = newsResults.slice(0, 5);
+
       const relatedSearches = Array.isArray(data.suggestions)
         ? data.suggestions.map((suggestion: string) => ({ query: suggestion }))
         : [];
@@ -327,10 +382,10 @@ const createSearXNGAPI = (
       const results: t.SearchResultData = {
         organic: organicResults,
         images: imageResults,
-        topStories: [], // SearXNG doesn't provide separate top stories
+        topStories: topStories, // Use first 5 extracted news as top stories
         relatedSearches,
         videos: [],
-        news: [],
+        news: newsResults,
         // Add empty arrays for other Serper fields to maintain parity
         places: [],
         shopping: [],
