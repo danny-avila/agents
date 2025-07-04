@@ -97,14 +97,15 @@ export function _makeMessageChunkFromAnthropicEvent(
       ];
     } else if (contentBlock.type === 'server_tool_use') {
       // Handle anthropic built-in server tool use (like web search)
-      toolCallChunks = [
-        {
-          id: contentBlock.id,
-          index: data.index,
-          name: contentBlock.name,
-          args: '',
-        },
-      ];
+      // toolCallChunks = [
+      //   {
+      //     id: contentBlock.id,
+      //     index: data.index,
+      //     name: contentBlock.name,
+      //     args: '',
+      //   },
+      // ];
+      toolCallChunks = [];
     } else {
       toolCallChunks = [];
     }
