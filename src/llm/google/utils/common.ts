@@ -573,6 +573,11 @@ export function convertResponseContentToChatGenerationChunk(
     additional_kwargs.groundingMetadata = candidate.groundingMetadata;
   }
 
+  const isFinalChunk =
+    response.candidates[0]?.finishReason === 'STOP' ||
+    response.candidates[0]?.finishReason === 'MAX_TOKENS' ||
+    response.candidates[0]?.finishReason === 'SAFETY';
+
   return new ChatGenerationChunk({
     text,
     message: new AIMessageChunk({
@@ -582,11 +587,31 @@ export function convertResponseContentToChatGenerationChunk(
       // Each chunk can have unique "generationInfo", and merging strategy is unclear,
       // so leave blank for now.
       additional_kwargs,
-      usage_metadata: extra.usageMetadata,
+      usage_metadata: isFinalChunk
+        ? extra.usageMetadata
+        : ({
+          input_tokens: extra.usageMetadata?.input_tokens ?? 0,
+          output_tokens: 0,
+          total_tokens: 0,
+        } as UsageMetadata), // Only pass on final chunk
     }),
     generationInfo,
   });
 }
+
+// old broken version:
+// return new ChatGenerationChunk({
+//   text,
+//   message: new AIMessageChunk({
+//     content: content,
+//     name: !candidateContent ? undefined : candidateContent.role,
+//     tool_call_chunks: toolCallChunks,
+//     additional_kwargs,
+//     usage_metadata: extra.usageMetadata,
+//   }),
+//   generationInfo,
+// });
+// }
 
 export function convertToGenerativeAITools(
   tools: GoogleGenerativeAIToolType[]
