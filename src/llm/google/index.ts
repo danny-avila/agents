@@ -1,4 +1,6 @@
 /* eslint-disable @typescript-eslint/ban-ts-comment */
+import { AIMessageChunk } from '@langchain/core/messages';
+import { ChatGenerationChunk } from '@langchain/core/outputs';
 import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
 import { getEnvironmentVariable } from '@langchain/core/utils/env';
 import { GoogleGenerativeAI as GenerativeAI } from '@google/generative-ai';
@@ -9,7 +11,6 @@ import type {
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { BaseMessage, UsageMetadata } from '@langchain/core/messages';
 import type { GeminiGenerationConfig } from '@langchain/google-common';
-import type { ChatGenerationChunk } from '@langchain/core/outputs';
 import type { GeminiApiUsageMetadata } from './types';
 import type { GoogleClientOptions } from '@/types';
 import {
@@ -153,8 +154,8 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
       }
     );
 
-    let usageMetadata: UsageMetadata | undefined;
     let index = 0;
+    let lastUsageMetadata: UsageMetadata | undefined;
     for await (const response of stream) {
       if (
         'usageMetadata' in response &&
@@ -164,29 +165,19 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
         const genAIUsageMetadata = response.usageMetadata as
           | GeminiApiUsageMetadata
           | undefined;
+
         const output_tokens =
           (genAIUsageMetadata?.candidatesTokenCount ?? 0) +
           (genAIUsageMetadata?.thoughtsTokenCount ?? 0);
-        if (!usageMetadata) {
-          usageMetadata = {
-            input_tokens: genAIUsageMetadata?.promptTokenCount ?? 0,
-            output_tokens,
-            total_tokens: genAIUsageMetadata?.totalTokenCount ?? 0,
-          };
-        } else {
-          // Under the hood, LangChain combines the prompt tokens. Google returns the updated
-          // total each time, so we need to find the difference between the tokens.
-          const outputTokenDiff = output_tokens - usageMetadata.output_tokens;
-          usageMetadata = {
-            input_tokens: 0,
-            output_tokens: outputTokenDiff,
-            total_tokens: outputTokenDiff,
-          };
-        }
+        lastUsageMetadata = {
+          input_tokens: genAIUsageMetadata?.promptTokenCount ?? 0,
+          output_tokens,
+          total_tokens: genAIUsageMetadata?.totalTokenCount ?? 0,
+        };
       }
 
       const chunk = convertResponseContentToChatGenerationChunk(response, {
-        usageMetadata,
+        usageMetadata: undefined,
         index,
       });
       index += 1;
@@ -202,6 +193,25 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
         undefined,
         undefined,
         { chunk }
+      );
+    }
+
+    if (lastUsageMetadata) {
+      const finalChunk = new ChatGenerationChunk({
+        text: '',
+        message: new AIMessageChunk({
+          content: '',
+          usage_metadata: lastUsageMetadata,
+        }),
+      });
+      yield finalChunk;
+      await runManager?.handleLLMNewToken(
+        finalChunk.text || '',
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { chunk: finalChunk }
       );
     }
   }
