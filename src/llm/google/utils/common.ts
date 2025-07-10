@@ -587,13 +587,7 @@ export function convertResponseContentToChatGenerationChunk(
       // Each chunk can have unique "generationInfo", and merging strategy is unclear,
       // so leave blank for now.
       additional_kwargs,
-      usage_metadata: isFinalChunk
-        ? extra.usageMetadata
-        : ({
-          input_tokens: 0,
-          output_tokens: 0,
-          total_tokens: 0,
-        } as UsageMetadata), // Only pass on final chunk
+      usage_metadata: isFinalChunk ? extra.usageMetadata : undefined,
     }),
     generationInfo,
   });
