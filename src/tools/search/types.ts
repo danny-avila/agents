@@ -94,7 +94,7 @@ export interface ProcessSourcesConfig {
 export interface FirecrawlConfig {
   firecrawlApiKey?: string;
   firecrawlApiUrl?: string;
-  firecrawlFormats?: string[];
+  firecrawlOptions?: FirecrawlScraperConfig;
 }
 
 export interface ScraperContentResult {
@@ -170,15 +170,10 @@ export type UsedReferences = {
 }[];
 
 /** Firecrawl */
-
-export interface FirecrawlScrapeOptions {
-  formats?: string[];
-  includeTags?: string[];
-  excludeTags?: string[];
-  headers?: Record<string, string>;
-  waitFor?: number;
-  timeout?: number;
-}
+export type FirecrawlScrapeOptions = Omit<
+  FirecrawlScraperConfig,
+  'apiKey' | 'apiUrl' | 'logger'
+>;
 
 export interface ScrapeMetadata {
   // Core source information
@@ -261,6 +256,21 @@ export interface FirecrawlScraperConfig {
   formats?: string[];
   timeout?: number;
   logger?: Logger;
+  includeTags?: string[];
+  excludeTags?: string[];
+  waitFor?: number;
+  maxAge?: number;
+  mobile?: boolean;
+  skipTlsVerification?: boolean;
+  blockAds?: boolean;
+  removeBase64Images?: boolean;
+  parsePDF?: boolean;
+  storeInCache?: boolean;
+  zeroDataRetention?: boolean;
+  headers?: Record<string, string>;
+  location?: { country?: string; languages?: string[] };
+  onlyMainContent?: boolean;
+  changeTrackingOptions?: object;
 }
 
 export type GetSourcesParams = {

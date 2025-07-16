@@ -346,7 +346,7 @@ export const createSearchTool = (
     safeSearch = 1,
     firecrawlApiKey,
     firecrawlApiUrl,
-    firecrawlFormats = ['markdown', 'html'],
+    firecrawlOptions,
     scraperTimeout,
     jinaApiKey,
     cohereApiKey,
@@ -385,10 +385,11 @@ export const createSearchTool = (
   });
 
   const firecrawlScraper = createFirecrawlScraper({
+    ...firecrawlOptions,
     apiKey: firecrawlApiKey ?? process.env.FIRECRAWL_API_KEY,
     apiUrl: firecrawlApiUrl,
-    timeout: scraperTimeout,
-    formats: firecrawlFormats,
+    timeout: scraperTimeout ?? firecrawlOptions?.timeout,
+    formats: firecrawlOptions?.formats ?? ['markdown', 'rawHtml'],
   });
 
   const selectedReranker = createReranker({

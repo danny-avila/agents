@@ -13,6 +13,21 @@ export class FirecrawlScraper {
   private defaultFormats: string[];
   private timeout: number;
   private logger: t.Logger;
+  private includeTags?: string[];
+  private excludeTags?: string[];
+  private waitFor?: number;
+  private maxAge?: number;
+  private mobile?: boolean;
+  private skipTlsVerification?: boolean;
+  private blockAds?: boolean;
+  private removeBase64Images?: boolean;
+  private parsePDF?: boolean;
+  private storeInCache?: boolean;
+  private zeroDataRetention?: boolean;
+  private headers?: Record<string, string>;
+  private location?: { country?: string; languages?: string[] };
+  private onlyMainContent?: boolean;
+  private changeTrackingOptions?: object;
 
   constructor(config: t.FirecrawlScraperConfig = {}) {
     this.apiKey = config.apiKey ?? process.env.FIRECRAWL_API_KEY ?? '';
@@ -23,10 +38,26 @@ export class FirecrawlScraper {
       'https://api.firecrawl.dev';
     this.apiUrl = `${baseUrl.replace(/\/+$/, '')}/v1/scrape`;
 
-    this.defaultFormats = config.formats ?? ['markdown', 'html'];
+    this.defaultFormats = config.formats ?? ['markdown', 'rawHtml'];
     this.timeout = config.timeout ?? 7500;
 
     this.logger = config.logger || createDefaultLogger();
+
+    this.includeTags = config.includeTags;
+    this.excludeTags = config.excludeTags;
+    this.waitFor = config.waitFor;
+    this.maxAge = config.maxAge;
+    this.mobile = config.mobile;
+    this.skipTlsVerification = config.skipTlsVerification;
+    this.blockAds = config.blockAds;
+    this.removeBase64Images = config.removeBase64Images;
+    this.parsePDF = config.parsePDF;
+    this.storeInCache = config.storeInCache;
+    this.zeroDataRetention = config.zeroDataRetention;
+    this.headers = config.headers;
+    this.location = config.location;
+    this.onlyMainContent = config.onlyMainContent;
+    this.changeTrackingOptions = config.changeTrackingOptions;
 
     if (!this.apiKey) {
       this.logger.warn('FIRECRAWL_API_KEY is not set. Scraping will not work.');
@@ -58,25 +89,36 @@ export class FirecrawlScraper {
     }
 
     try {
-      const response = await axios.post(
-        this.apiUrl,
-        {
-          url,
-          formats: options.formats || this.defaultFormats,
-          includeTags: options.includeTags,
-          excludeTags: options.excludeTags,
-          headers: options.headers,
-          waitFor: options.waitFor,
-          timeout: options.timeout ?? this.timeout,
+      const payload = omitUndefined({
+        url,
+        formats: options.formats ?? this.defaultFormats,
+        includeTags: options.includeTags ?? this.includeTags,
+        excludeTags: options.excludeTags ?? this.excludeTags,
+        headers: options.headers ?? this.headers,
+        waitFor: options.waitFor ?? this.waitFor,
+        timeout: options.timeout ?? this.timeout,
+        onlyMainContent: options.onlyMainContent ?? this.onlyMainContent,
+        maxAge: options.maxAge ?? this.maxAge,
+        mobile: options.mobile ?? this.mobile,
+        skipTlsVerification:
+          options.skipTlsVerification ?? this.skipTlsVerification,
+        parsePDF: options.parsePDF ?? this.parsePDF,
+        location: options.location ?? this.location,
+        removeBase64Images:
+          options.removeBase64Images ?? this.removeBase64Images,
+        blockAds: options.blockAds ?? this.blockAds,
+        storeInCache: options.storeInCache ?? this.storeInCache,
+        zeroDataRetention: options.zeroDataRetention ?? this.zeroDataRetention,
+        changeTrackingOptions:
+          options.changeTrackingOptions ?? this.changeTrackingOptions,
+      });
+      const response = await axios.post(this.apiUrl, payload, {
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${this.apiKey}`,
         },
-        {
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${this.apiKey}`,
-          },
-          timeout: this.timeout,
-        }
-      );
+        timeout: this.timeout,
+      });
 
       return [url, response.data];
     } catch (error) {
@@ -156,3 +198,10 @@ export const createFirecrawlScraper = (
 ): FirecrawlScraper => {
   return new FirecrawlScraper(config);
 };
+
+// Helper function to clean up payload for firecrawl
+function omitUndefined<T extends object>(obj: T): Partial<T> {
+  return Object.fromEntries(
+    Object.entries(obj).filter(([, v]) => v !== undefined)
+  ) as Partial<T>;
+}
