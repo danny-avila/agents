@@ -61,7 +61,7 @@ export class JinaReranker extends BaseReranker {
       };
 
       const response = await axios.post<t.JinaRerankerResponse | undefined>(
-        'https://api.jina.ai/v1/rerank',
+        process.env.JINA_URL || 'https://api.jina.ai/v1/rerank',
         requestData,
         {
           headers: {
