@@ -10,6 +10,7 @@ import {
 import type { MessageContentImageUrl } from '@langchain/core/messages';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type {
+  MessageContentDocument,
   MessageContentComplex,
   ToolCallPart,
   TPayload,
@@ -25,6 +26,7 @@ interface VisionMessageParams {
     [key: string]: any;
   };
   image_urls: MessageContentImageUrl[];
+  documents: MessageContentDocument[];
   endpoint?: Providers;
 }
 
@@ -37,6 +39,7 @@ interface VisionMessageParams {
 export const formatVisionMessage = ({
   message,
   image_urls,
+  documents,
   endpoint,
 }: VisionMessageParams): {
   role: string;
@@ -58,6 +61,7 @@ export const formatVisionMessage = ({
   if (endpoint === Providers.ANTHROPIC) {
     result.content = [
       ...image_urls,
+      ...documents,
       { type: ContentTypes.TEXT, text: message.content },
     ] as MessageContentComplex[];
     return result;
@@ -66,6 +70,7 @@ export const formatVisionMessage = ({
   result.content = [
     { type: ContentTypes.TEXT, text: message.content },
     ...image_urls,
+    ...documents,
   ] as MessageContentComplex[];
 
   return result;
@@ -78,6 +83,7 @@ interface MessageInput {
   text?: string;
   content?: string | MessageContentComplex[];
   image_urls?: MessageContentImageUrl[];
+  documents?: MessageContentDocument[];
   lc_id?: string[];
   [key: string]: any;
 }
@@ -135,8 +141,12 @@ export const formatMessage = ({
     content,
   };
 
-  const { image_urls } = message;
-  if (Array.isArray(image_urls) && image_urls.length > 0 && role === 'user') {
+  const { image_urls, documents } = message;
+  if (
+    ((Array.isArray(image_urls) && image_urls.length > 0) ||
+      (Array.isArray(documents) && documents.length > 0)) &&
+    role === 'user'
+  ) {
     return formatVisionMessage({
       message: {
         ...formattedMessage,
@@ -145,7 +155,8 @@ export const formatMessage = ({
             ? formattedMessage.content
             : '',
       },
-      image_urls,
+      image_urls: image_urls ?? [],
+      documents: documents ?? [],
       endpoint,
     });
   }

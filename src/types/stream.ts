@@ -320,9 +320,10 @@ export type MessageContentComplex = (
   | ReasoningContentText
   | MessageContentText
   | MessageContentImageUrl
+  | MessageContentDocument
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   | (Record<string, any> & {
-      type?: 'text' | 'image_url' | 'think' | 'thinking' | string;
+      type?: 'text' | 'image_url' | 'document' | 'think' | 'thinking' | string;
     })
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   | (Record<string, any> & {
@@ -330,6 +331,23 @@ export type MessageContentComplex = (
     })
 ) & {
   tool_call_ids?: string[];
+};
+
+export type MessageContentDocument = {
+  type: 'document';
+  source: {
+    type: 'url' | 'base64' | 'file';
+    url?: string;
+    data?: string;
+    file_id?: string;
+    media_type?: string;
+  };
+  cache_control?: {
+    type: 'ephemeral' | 'persistent';
+  };
+  citations?: {
+    enabled: boolean;
+  };
 };
 
 export interface TMessage {
