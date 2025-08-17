@@ -301,6 +301,27 @@ function _convertLangChainContentToPart(
         mimeType,
       },
     };
+  } else if (content.type === 'document') {
+    if (!isMultimodalModel) {
+      throw new Error('This model does not support PDFs');
+    }
+    const source: string = content.data;
+    const [dm, data] = source.split(',');
+    if (!dm.startsWith('data:')) {
+      throw new Error('Please provide PDF as base64 encoded data URL');
+    }
+
+    const [mimeType, encoding] = dm.replace(/^data:/, '').split(';');
+    if (encoding !== 'base64') {
+      throw new Error('Please provide PDF as base64 encoded data URL');
+    }
+
+    return {
+      inlineData: {
+        data,
+        mimeType,
+      },
+    };
   } else if (content.type === 'media') {
     return messageContentMedia(content);
   } else if (content.type === 'tool_use') {
