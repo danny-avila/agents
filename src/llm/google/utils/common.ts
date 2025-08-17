@@ -301,25 +301,18 @@ function _convertLangChainContentToPart(
         mimeType,
       },
     };
-  } else if (content.type === 'document') {
+  } else if (
+    content.type === 'document' ||
+    content.type === 'audio' ||
+    content.type === 'video'
+  ) {
     if (!isMultimodalModel) {
-      throw new Error('This model does not support PDFs');
+      throw new Error(`This model does not support ${content.type}s`);
     }
-    const source: string = content.data;
-    const [dm, data] = source.split(',');
-    if (!dm.startsWith('data:')) {
-      throw new Error('Please provide PDF as base64 encoded data URL');
-    }
-
-    const [mimeType, encoding] = dm.replace(/^data:/, '').split(';');
-    if (encoding !== 'base64') {
-      throw new Error('Please provide PDF as base64 encoded data URL');
-    }
-
     return {
       inlineData: {
-        data,
-        mimeType,
+        data: content.data,
+        mimeType: content.mimeType,
       },
     };
   } else if (content.type === 'media') {
