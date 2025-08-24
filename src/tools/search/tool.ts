@@ -349,6 +349,7 @@ export const createSearchTool = (
     firecrawlOptions,
     scraperTimeout,
     jinaApiKey,
+    jinaApiUrl,
     cohereApiKey,
     onSearchResults: _onSearchResults,
     onGetHighlights,
@@ -395,6 +396,7 @@ export const createSearchTool = (
   const selectedReranker = createReranker({
     rerankerType,
     jinaApiKey,
+    jinaApiUrl,
     cohereApiKey,
     logger,
   });

@@ -148,6 +148,7 @@ export interface SearchToolConfig
   logger?: Logger;
   safeSearch?: SafeSearchLevel;
   jinaApiKey?: string;
+  jinaApiUrl?: string;
   cohereApiKey?: string;
   rerankerType?: RerankerType;
   scraperTimeout?: number;
