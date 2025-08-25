@@ -59,7 +59,6 @@ const modifyContent = ({
     allowedTypesByProvider[provider] ?? allowedTypesByProvider.default;
   return content.map((item) => {
     if (
-      item &&
       typeof item === 'object' &&
       'type' in item &&
       item.type != null &&
@@ -386,7 +385,20 @@ export function formatAnthropicArtifactContent(messages: BaseMessage[]): void {
   }
 }
 
-export function formatArtifactPayload(messages: BaseMessage[]): void {
+/**
+ * Formats tool responses for OpenAI/Google providers that require string content in ToolMessages.
+ *
+ * OpenAI and Google APIs have a limitation where ToolMessages can only contain string content.
+ * When tools return complex content (arrays with images, formatted text, etc.), this function
+ * converts those ToolMessages to HumanMessages which can handle complex content arrays.
+ *
+ * IMPORTANT: This function specifically does NOT include artifact content in the HumanMessage.
+ * Artifacts should remain in the ToolMessage's artifact field for UI display purposes only
+ * and should never be sent to the LLM to prevent prompt injection vulnerabilities.
+ *
+ * @param messages - The array of messages to process
+ */
+export function formatToolArrayContent(messages: BaseMessage[]): void {
   const lastMessageY = messages[messages.length - 1];
   if (!(lastMessageY instanceof ToolMessage)) return;
 
@@ -402,43 +414,42 @@ export function formatArtifactPayload(messages: BaseMessage[]): void {
 
   if (latestAIParentIndex === -1) return;
 
-  // Check if any tool message after the AI message has array artifact content
-  const hasArtifactContent = messages.some(
+  // Check if any tool message after the AI message has array content
+  // This is needed because OpenAI/Google can only handle string content in ToolMessages
+  const hasArrayContent = messages.some(
     (msg, i) =>
       i > latestAIParentIndex &&
       msg instanceof ToolMessage &&
-      msg.artifact != null &&
-      msg.artifact?.content != null &&
-      Array.isArray(msg.artifact.content)
+      Array.isArray(msg.content)
   );
 
-  if (!hasArtifactContent) return;
+  if (!hasArrayContent) return;
 
-  // Collect all relevant tool messages and their artifacts
+  // Collect all relevant tool messages
   const relevantMessages = messages
     .slice(latestAIParentIndex + 1)
     .filter((msg) => msg instanceof ToolMessage) as ToolMessage[];
 
-  // Aggregate all content and artifacts
+  // Aggregate only the actual tool content (not artifacts)
   const aggregatedContent: t.MessageContentComplex[] = [];
 
   relevantMessages.forEach((msg) => {
-    if (!Array.isArray(msg.artifact?.content)) {
+    // Only process messages with array content
+    if (!Array.isArray(msg.content)) {
       return;
     }
-    let currentContent = msg.content;
-    if (!Array.isArray(currentContent)) {
-      currentContent = [
-        {
-          type: 'text',
-          text: msg.content,
-        },
-      ];
-    }
-    aggregatedContent.push(...currentContent);
+
+    // Add the tool's actual content to the aggregated content
+    aggregatedContent.push(...msg.content);
+
+    // Replace the tool message content with a placeholder
+    // This is necessary because OpenAI/Google expect string content in ToolMessages
     msg.content =
       'Tool response is included in the next message as a Human message';
-    aggregatedContent.push(...msg.artifact.content);
+
+    // IMPORTANT: Do NOT include artifact content here
+    // Artifacts should remain in the ToolMessage's artifact field
+    // and should NOT be sent to the LLM
   });
 
   // Add single HumanMessage with all aggregated content

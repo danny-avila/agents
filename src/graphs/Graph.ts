@@ -32,7 +32,7 @@ import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
 import {
   createPruneMessages,
   modifyDeltaProperties,
-  formatArtifactPayload,
+  formatToolArrayContent,
   convertMessagesToContent,
   formatAnthropicArtifactContent,
 } from '@/messages';
@@ -553,7 +553,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
         isLatestToolMessage &&
         (isOpenAILike(provider) || isGoogleLike(provider))
       ) {
-        formatArtifactPayload(finalMessages);
+        formatToolArrayContent(finalMessages);
       }
 
       if (this.lastStreamCall != null && this.streamBuffer != null) {
