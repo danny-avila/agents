@@ -340,49 +340,24 @@ export function convertMessagesToContent(
   return processedContent;
 }
 
+/**
+ * Handles tool responses for Anthropic provider.
+ *
+ * Previously, this function would concatenate artifact content into ToolMessage content,
+ * but this was removed to prevent prompt injection vulnerabilities. Artifacts should
+ * remain in the ToolMessage's artifact field for UI display purposes only and should
+ * never be sent to the LLM.
+ *
+ * Unlike OpenAI/Google, Anthropic can handle array content in ToolMessages directly,
+ * so no conversion to HumanMessages is needed.
+ *
+ * @param messages - The array of messages to process
+ */
+/* eslint-disable @typescript-eslint/no-unused-vars */
 export function formatAnthropicArtifactContent(messages: BaseMessage[]): void {
-  const lastMessage = messages[messages.length - 1];
-  if (!(lastMessage instanceof ToolMessage)) return;
-
-  // Find the latest AIMessage with tool_calls that this tool message belongs to
-  const latestAIParentIndex = findLastIndex(
-    messages,
-    (msg) =>
-      (msg instanceof AIMessageChunk &&
-        (msg.tool_calls?.length ?? 0) > 0 &&
-        msg.tool_calls?.some((tc) => tc.id === lastMessage.tool_call_id)) ??
-      false
-  );
-
-  if (latestAIParentIndex === -1) return;
-
-  // Check if any tool message after the AI message has array artifact content
-  const hasArtifactContent = messages.some(
-    (msg, i) =>
-      i > latestAIParentIndex &&
-      msg instanceof ToolMessage &&
-      msg.artifact != null &&
-      msg.artifact?.content != null &&
-      Array.isArray(msg.artifact.content)
-  );
-
-  if (!hasArtifactContent) return;
-
-  const message = messages[latestAIParentIndex] as AIMessageChunk;
-  const toolCallIds = message.tool_calls?.map((tc) => tc.id) ?? [];
-
-  for (let j = latestAIParentIndex + 1; j < messages.length; j++) {
-    const msg = messages[j];
-    if (
-      msg instanceof ToolMessage &&
-      toolCallIds.includes(msg.tool_call_id) &&
-      msg.artifact != null &&
-      Array.isArray(msg.artifact?.content) &&
-      Array.isArray(msg.content)
-    ) {
-      msg.content = msg.content.concat(msg.artifact.content);
-    }
-  }
+  // This function is now a no-op to prevent artifact injection
+  // Keeping it for backwards compatibility and to maintain the same API
+  return;
 }
 
 /**
