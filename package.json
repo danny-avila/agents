@@ -97,7 +97,8 @@
     "dotenv": "^16.4.7",
     "https-proxy-agent": "^7.0.6",
     "nanoid": "^3.3.7",
-    "openai": "^5.10.1"
+    "openai": "^5.10.1",
+    "promise-retry": "^2.0.1"
   },
   "imports": {
     "@/*": "./src/*",
@@ -114,7 +115,9 @@
     "@rollup/plugin-typescript": "^12.1.2",
     "@swc/core": "^1.6.13",
     "@types/jest": "^29.5.14",
+    "@types/lodash": "^4.17.20",
     "@types/node": "^20.14.11",
+    "@types/promise-retry": "^1.1.3",
     "@types/yargs-parser": "^21.0.3",
     "@typescript-eslint/eslint-plugin": "^8.24.0",
     "@typescript-eslint/parser": "^8.24.0",

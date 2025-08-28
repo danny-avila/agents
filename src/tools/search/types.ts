@@ -119,6 +119,21 @@ export interface JinaRerankerResponse {
   results: JinaRerankerResult[];
 }
 
+export interface JinaChunkingConfig {
+  maxChunkSize: number; // Default: 1800 (buffer under 2048)
+  overlapSize: number; // Default: 200 (for context preservation)
+  enableParallelProcessing: boolean; // Default: true
+  aggregationStrategy: 'weighted_average' | 'max_score' | 'first_chunk'; // Default: weighted_average
+}
+
+export interface JinaChunkResult {
+  originalIndex: number;
+  chunkIndex: number;
+  relevanceScore: number;
+  text: string;
+  documentLength: number;
+}
+
 export interface CohereRerankerResult {
   index: number;
   relevance_score: number;
