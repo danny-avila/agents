@@ -23,8 +23,18 @@ import { getLLMConfig } from '@/utils/llmConfig';
 import { getArgs } from '@/scripts/args';
 import { Run } from '@/run';
 
+// Auto-skip this suite if Azure env vars are not present
+const requiredAzureEnv = [
+  'AZURE_OPENAI_API_KEY',
+  'AZURE_OPENAI_API_INSTANCE',
+  'AZURE_OPENAI_API_DEPLOYMENT',
+  'AZURE_OPENAI_API_VERSION',
+];
+const hasAzure = requiredAzureEnv.every((k) => (process.env[k] ?? '').trim() !== '');
+const describeIfAzure = hasAzure ? describe : describe.skip;
+
 const provider = Providers.AZURE;
-describe(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
+describeIfAzure(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
   jest.setTimeout(30000);
   let run: Run<t.IState>;
   let runningHistory: BaseMessage[];

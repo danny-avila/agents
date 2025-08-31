@@ -19,6 +19,9 @@ import {
 } from '@/utils/title';
 import { createTokenCounter } from '@/utils/tokens';
 import { StandardGraph } from '@/graphs/Graph';
+import { SupervisedGraph } from '@/graphs/SupervisedGraph';
+import { CollaborativeGraph } from '@/graphs/CollaborativeGraph';
+import { TaskManagerGraph } from '@/graphs/TaskManagerGraph';
 import { HandlerRegistry } from '@/events';
 import { isOpenAILike } from '@/utils/llm';
 
@@ -75,6 +78,79 @@ export class Run<T extends t.BaseGraphState> {
         config.graphConfig
       ) as unknown as t.CompiledWorkflow<T, Partial<T>, string>;
       if (this.Graph) {
+        // apply compile options if provided at config level
+        this.Graph.compileOptions = config.graphConfig.compileOptions ?? this.Graph.compileOptions;
+        this.Graph.handlerRegistry = handlerRegistry;
+      }
+    } else if (config.graphConfig.type === 'supervised') {
+      const supervisedConfig = config.graphConfig as t.SupervisedGraphConfig;
+      const { llmConfig, tools = [], ...graphInput } = supervisedConfig;
+      const { provider, ...clientOptions } = llmConfig;
+
+      const supervisedGraph = new SupervisedGraph({
+        tools,
+        provider,
+        clientOptions,
+        ...(graphInput as Omit<t.SupervisedGraphConfig, 'type' | 'llmConfig'>),
+        runId: this.id,
+      });
+      supervisedGraph.compileOptions = supervisedConfig.compileOptions;
+      this.Graph = supervisedGraph;
+      this.provider = provider;
+      this.graphRunnable = supervisedGraph.createWorkflow() as unknown as t.CompiledWorkflow<
+        T,
+        Partial<T>,
+        string
+      >;
+      if (this.Graph) {
+        this.Graph.handlerRegistry = handlerRegistry;
+      }
+    } else if (config.graphConfig.type === 'collaborative') {
+      const collabConfig = config.graphConfig as t.CollaborativeGraphConfig;
+      const { llmConfig, tools = [], ...graphInput } = collabConfig as unknown as t.StandardGraphConfig & {
+        members?: t.Member[];
+        supervisorConfig?: { systemPrompt?: string; llmConfig: t.LLMConfig };
+      };
+      const { provider, ...clientOptions } = llmConfig;
+
+      const collabGraph = new CollaborativeGraph({
+        tools,
+        provider,
+        clientOptions,
+        ...(graphInput as Omit<t.StandardGraphConfig, 'type' | 'llmConfig'>),
+        runId: this.id,
+      } as unknown as t.StandardGraphInput & {
+        members?: t.Member[];
+        supervisorConfig?: { systemPrompt?: string; llmConfig: t.LLMConfig };
+      });
+      this.Graph = collabGraph;
+      this.provider = provider;
+      this.graphRunnable = collabGraph.createWorkflow() as unknown as t.CompiledWorkflow<T, Partial<T>, string>;
+      if (this.Graph) {
+        this.Graph.handlerRegistry = handlerRegistry;
+      }
+    } else if (config.graphConfig.type === 'taskmanager') {
+      const tmConfig = config.graphConfig as t.TaskManagerGraphConfig;
+      const { llmConfig, tools = [], ...graphInput } = tmConfig as unknown as t.StandardGraphConfig & {
+        members?: t.Member[];
+        supervisorConfig?: { systemPrompt?: string; llmConfig: t.LLMConfig };
+      };
+      const { provider, ...clientOptions } = llmConfig;
+
+      const tmGraph = new TaskManagerGraph({
+        tools,
+        provider,
+        clientOptions,
+        ...(graphInput as Omit<t.StandardGraphConfig, 'type' | 'llmConfig'>),
+        runId: this.id,
+      } as unknown as t.StandardGraphInput & {
+        members?: t.Member[];
+        supervisorConfig?: { systemPrompt?: string; llmConfig: t.LLMConfig };
+      });
+      this.Graph = tmGraph;
+      this.provider = provider;
+      this.graphRunnable = tmGraph.createWorkflow() as unknown as t.CompiledWorkflow<T, Partial<T>, string>;
+      if (this.Graph) {
         this.Graph.handlerRegistry = handlerRegistry;
       }
     }
@@ -95,6 +171,8 @@ export class Run<T extends t.BaseGraphState> {
       ...graphInput,
       runId: this.id,
     });
+    // propagate compile options from graph config
+    standardGraph.compileOptions = (config as t.StandardGraphConfig).compileOptions;
     this.Graph = standardGraph;
     return standardGraph.createWorkflow();
   }
@@ -202,6 +280,11 @@ export class Run<T extends t.BaseGraphState> {
       const { data, name, metadata, ...info } = event;
 
       let eventName: t.EventName = info.event;
+      // First normalize custom events to their named variant
+      if (eventName && eventName === GraphEvents.ON_CUSTOM_EVENT) {
+        eventName = name;
+      }
+      // Then apply suppression for manual tool-stream providers
       if (
         hasTools &&
         manualToolStreamProviders.has(provider) &&
@@ -209,10 +292,6 @@ export class Run<T extends t.BaseGraphState> {
       ) {
         /* Skipping CHAT_MODEL_STREAM event due to double-call edge case */
         continue;
-      }
-
-      if (eventName && eventName === GraphEvents.ON_CUSTOM_EVENT) {
-        eventName = name;
       }
 
       const handler = this.handlerRegistry.getHandler(eventName);

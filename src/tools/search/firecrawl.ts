@@ -39,7 +39,7 @@ export class FirecrawlScraper {
     this.apiUrl = `${baseUrl.replace(/\/+$/, '')}/v1/scrape`;
 
     this.defaultFormats = config.formats ?? ['markdown', 'rawHtml'];
-    this.timeout = config.timeout ?? 7500;
+    this.timeout = config.timeout ?? 120000;
 
     this.logger = config.logger || createDefaultLogger();
 

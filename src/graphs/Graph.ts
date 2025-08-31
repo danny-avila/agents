@@ -133,6 +133,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
   private graphState: t.GraphStateChannels<t.BaseGraphState>;
   clientOptions: t.ClientOptions;
   boundModel?: Runnable;
+  /** Optional compile options passed into workflow.compile() */
+  compileOptions?: t.CompileOptions | undefined;
   /** The last recorded timestamp that a stream API call was invoked */
   lastStreamCall: number | undefined;
   systemMessage: SystemMessage | undefined;
@@ -224,7 +226,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
       new Map()
     );
     this.messageStepHasToolCalls = resetIfNotEmpty(
-      this.prelimMessageIdsByStepKey,
+      this.messageStepHasToolCalls,
       new Map()
     );
     this.prelimMessageIdsByStepKey = resetIfNotEmpty(
@@ -567,42 +569,68 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
 
       this.lastStreamCall = Date.now();
 
-      let result: Partial<t.BaseGraphState>;
-      if (
-        (this.tools?.length ?? 0) > 0 &&
-        manualToolStreamProviders.has(provider)
-      ) {
-        const stream = await this.boundModel.stream(finalMessages, config);
-        let finalChunk: AIMessageChunk | undefined;
-        for await (const chunk of stream) {
-          dispatchCustomEvent(GraphEvents.CHAT_MODEL_STREAM, { chunk }, config);
-          if (!finalChunk) {
-            finalChunk = chunk;
-          } else {
-            finalChunk = concat(finalChunk, chunk);
+      const attemptInvoke = async (): Promise<Partial<t.BaseGraphState>> => {
+        const bound = this.boundModel;
+        if (
+          (this.tools?.length ?? 0) > 0 &&
+          manualToolStreamProviders.has(provider)
+        ) {
+          if (!bound?.stream) {
+            throw new Error('Model does not support stream');
+          }
+          const stream = await bound.stream(finalMessages, config);
+          let finalChunk: AIMessageChunk | undefined;
+          for await (const chunk of stream) {
+            try { dispatchCustomEvent(GraphEvents.CHAT_MODEL_STREAM, { chunk }, config); } catch {
+              console.error('Error dispatching chat model stream event');
+            }
+            finalChunk = finalChunk ? concat(finalChunk, chunk) : chunk;
+          }
+          finalChunk = modifyDeltaProperties(this.provider, finalChunk);
+          return { messages: [finalChunk as AIMessageChunk] };
+        } else {
+          if (!bound?.invoke) {
+            throw new Error('Model does not support invoke');
+          }
+          const finalMessage = (await (bound.invoke as (msgs: unknown, cfg?: unknown) => Promise<AIMessageChunk>)(
+            finalMessages,
+            config
+          )) as AIMessageChunk;
+          if ((finalMessage.tool_calls?.length ?? 0) > 0) {
+            finalMessage.tool_calls = finalMessage.tool_calls?.filter((tool_call) => !!tool_call.name);
+          }
+          return { messages: [finalMessage] };
+        }
+      };
+
+      let result: Partial<t.BaseGraphState> | undefined;
+      const fallbacks = (this.clientOptions as t.LLMConfig | undefined)?.fallbacks ?? [];
+      try {
+        result = await attemptInvoke();
+      } catch (primaryError) {
+        let lastError: Error | undefined= primaryError as Error;
+        for (const fb of fallbacks) {
+          try {
+            const model = this.getNewModel({ provider: fb.provider, clientOptions: fb.clientOptions });
+            this.boundModel = !this.tools || this.tools.length === 0
+              ? (model as unknown as Runnable)
+              : (model as t.ModelWithTools).bindTools(this.tools);
+            result = await attemptInvoke();
+            lastError = undefined;
+            break;
+          } catch (e) {
+            lastError = e as Error;
+            continue;
           }
         }
-
-        finalChunk = modifyDeltaProperties(this.provider, finalChunk);
-        result = { messages: [finalChunk as AIMessageChunk] };
-      } else {
-        const finalMessage = (await this.boundModel.invoke(
-          finalMessages,
-          config
-        )) as AIMessageChunk;
-        if ((finalMessage.tool_calls?.length ?? 0) > 0) {
-          finalMessage.tool_calls = finalMessage.tool_calls?.filter(
-            (tool_call) => {
-              if (!tool_call.name) {
-                return false;
-              }
-              return true;
-            }
-          );
+        if (lastError) {
+          throw lastError;
         }
-        result = { messages: [finalMessage] };
       }
 
+      if (!result) {
+        throw new Error('No result after model invocation');
+      }
       this.storeUsageMetadata(result.messages?.[0]);
       this.cleanupSignalListener();
       return result;
@@ -627,7 +655,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
       .addConditionalEdges(AGENT, routeMessage)
       .addEdge(TOOLS, this.toolEnd ? END : AGENT);
 
-    return workflow.compile();
+    // Cast to unknown to avoid tight coupling to external types; options are opt-in
+    return workflow.compile(this.compileOptions as unknown as never);
   }
 
   /* Dispatchers */
@@ -667,7 +696,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
 
     this.contentData.push(runStep);
     this.contentIndexMap.set(stepId, runStep.index);
-    dispatchCustomEvent(GraphEvents.ON_RUN_STEP, runStep, this.config);
+    try { dispatchCustomEvent(GraphEvents.ON_RUN_STEP, runStep, this.config); } catch {
+      console.error('Error dispatching on run step event');
+    }
     return stepId;
   }
 
@@ -800,11 +831,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
       id,
       delta,
     };
-    dispatchCustomEvent(
-      GraphEvents.ON_RUN_STEP_DELTA,
-      runStepDelta,
-      this.config
-    );
+    try { dispatchCustomEvent(GraphEvents.ON_RUN_STEP_DELTA, runStepDelta, this.config); } catch {
+      console.error('Error dispatching on run step delta event');
+    }
   }
 
   dispatchMessageDelta(id: string, delta: t.MessageDelta): void {
@@ -815,11 +844,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
       id,
       delta,
     };
-    dispatchCustomEvent(
-      GraphEvents.ON_MESSAGE_DELTA,
-      messageDelta,
-      this.config
-    );
+    try { dispatchCustomEvent(GraphEvents.ON_MESSAGE_DELTA, messageDelta, this.config); } catch {
+      console.error('Error dispatching on message delta event');
+    }
   }
 
   dispatchReasoningDelta = (stepId: string, delta: t.ReasoningDelta): void => {
@@ -830,10 +857,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
       id: stepId,
       delta,
     };
-    dispatchCustomEvent(
-      GraphEvents.ON_REASONING_DELTA,
-      reasoningDelta,
-      this.config
-    );
+    try { dispatchCustomEvent(GraphEvents.ON_REASONING_DELTA, reasoningDelta, this.config); } catch {
+      console.error('Error dispatching on reasoning delta event');
+    }
   };
 }

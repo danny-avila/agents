@@ -51,6 +51,18 @@ export type CompiledWorkflow<
   N extends string = string,
 > = CompiledStateGraph<T, U, N>;
 
+/**
+ * Optional compile options passed to workflow.compile().
+ * These are intentionally untyped to avoid coupling to library internals.
+ */
+export type CompileOptions = {
+  // A checkpointer instance (e.g., MemorySaver, SQL saver)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  checkpointer?: any;
+  interruptBefore?: string[];
+  interruptAfter?: string[];
+};
+
 export type EventStreamCallbackHandlerInput =
   Parameters<CompiledWorkflow['streamEvents']>[2] extends Omit<
     infer T,

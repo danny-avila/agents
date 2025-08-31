@@ -39,8 +39,6 @@ async function testStandardStreaming(): Promise<void> {
         event: GraphEvents.ON_RUN_STEP,
         data: t.StreamEventData
       ): void => {
-        console.log('====== ON_RUN_STEP ======');
-        console.dir(data, { depth: null });
         aggregateContent({ event, data: data as t.RunStep });
       },
     },
@@ -49,8 +47,6 @@ async function testStandardStreaming(): Promise<void> {
         event: GraphEvents.ON_RUN_STEP_DELTA,
         data: t.StreamEventData
       ): void => {
-        console.log('====== ON_RUN_STEP_DELTA ======');
-        console.dir(data, { depth: null });
         aggregateContent({ event, data: data as t.RunStepDeltaEvent });
       },
     },
@@ -59,8 +55,6 @@ async function testStandardStreaming(): Promise<void> {
         event: GraphEvents.ON_MESSAGE_DELTA,
         data: t.StreamEventData
       ): void => {
-        console.log('====== ON_MESSAGE_DELTA ======');
-        console.dir(data, { depth: null });
         aggregateContent({ event, data: data as t.MessageDeltaEvent });
       },
     },
@@ -133,9 +127,7 @@ async function testStandardStreaming(): Promise<void> {
 }
 
 process.on('unhandledRejection', (reason, promise) => {
-  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
-  console.log('Conversation history:');
-  process.exit(1);
+  console.warn('Unhandled Rejection (non-fatal):', reason);
 });
 
 testStandardStreaming().catch((err) => {

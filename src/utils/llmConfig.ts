@@ -63,7 +63,7 @@ export const llmConfigs: Record<string, t.LLMConfig | undefined> = {
   },
   lmstudio: {
     provider: Providers.OPENAI,
-    model: 'gpt-oss-20b',
+    model: 'gpt-oss-120b',
     streaming: true,
     streamUsage: true,
     configuration: {
