@@ -49,6 +49,13 @@ import { createFakeStreamingLLM } from '@/llm/fake';
 import { HandlerRegistry } from '@/events';
 
 const { AGENT, TOOLS } = GraphNodeKeys;
+
+/** Interface for bound model with stream and invoke methods */
+interface BoundModel {
+  stream?: (messages: BaseMessage[], config?: RunnableConfig) => Promise<AsyncIterable<AIMessageChunk>>;
+  invoke: (messages: BaseMessage[], config?: RunnableConfig) => Promise<AIMessageChunk>;
+}
+
 export type GraphNode = GraphNodeKeys | typeof START;
 export type ClientCallback<T extends unknown[]> = (
   graph: StandardGraph,
@@ -461,6 +468,40 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
     }
   }
 
+  /** Execute model invocation with streaming support */
+  private async attemptInvoke(
+    finalMessages: BaseMessage[],
+    provider: Providers,
+    config?: RunnableConfig
+  ): Promise<Partial<t.BaseGraphState>> {
+    const bound = this.boundModel as BoundModel | undefined;
+
+    if (
+      (this.tools?.length ?? 0) > 0 &&
+      manualToolStreamProviders.has(provider)
+    ) {
+      if (!bound?.stream) {
+        throw new Error('Model does not support stream');
+      }
+      const stream = await bound.stream(finalMessages, config);
+      let finalChunk: AIMessageChunk | undefined;
+      for await (const chunk of stream) {
+        finalChunk = finalChunk ? concat(finalChunk, chunk) : chunk;
+      }
+      finalChunk = modifyDeltaProperties(this.provider, finalChunk);
+      return { messages: [finalChunk as AIMessageChunk] };
+    } else {
+      if (!bound?.invoke) {
+        throw new Error('Model does not support invoke');
+      }
+      const finalMessage = await bound.invoke(finalMessages, config);
+      if ((finalMessage.tool_calls?.length ?? 0) > 0) {
+        finalMessage.tool_calls = finalMessage.tool_calls?.filter((tool_call) => !!tool_call.name);
+      }
+      return { messages: [finalMessage] };
+    }
+  }
+
   cleanupSignalListener(): void {
     if (!this.signal) {
       return;
@@ -570,41 +611,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
 
       this.lastStreamCall = Date.now();
 
-      const attemptInvoke = async (): Promise<Partial<t.BaseGraphState>> => {
-        const bound = this.boundModel as unknown as { stream?: Function; invoke: Function } | undefined;
-        if (
-          (this.tools?.length ?? 0) > 0 &&
-          manualToolStreamProviders.has(provider)
-        ) {
-          if (!bound?.stream) {
-            throw new Error('Model does not support stream');
-          }
-          const stream = await (bound.stream as (msgs: unknown, cfg?: unknown) => AsyncIterable<AIMessageChunk>)(finalMessages, config);
-          let finalChunk: AIMessageChunk | undefined;
-          for await (const chunk of stream) {
-            finalChunk = finalChunk ? concat(finalChunk, chunk) : chunk;
-          }
-          finalChunk = modifyDeltaProperties(this.provider, finalChunk);
-          return { messages: [finalChunk as AIMessageChunk] };
-        } else {
-          if (!bound?.invoke) {
-            throw new Error('Model does not support invoke');
-          }
-          const finalMessage = (await (bound.invoke as (msgs: unknown, cfg?: unknown) => Promise<AIMessageChunk>)(
-            finalMessages,
-            config
-          )) as AIMessageChunk;
-          if ((finalMessage.tool_calls?.length ?? 0) > 0) {
-            finalMessage.tool_calls = finalMessage.tool_calls?.filter((tool_call) => !!tool_call.name);
-          }
-          return { messages: [finalMessage] };
-        }
-      };
-
       let result: Partial<t.BaseGraphState> | undefined;
       const fallbacks = (this.clientOptions as t.LLMConfig | undefined)?.fallbacks ?? [];
       try {
-        result = await attemptInvoke();
+        result = await this.attemptInvoke(finalMessages, provider as Providers, config);
       } catch (primaryError) {
         let lastError: unknown = primaryError;
         for (const fb of fallbacks) {
@@ -613,7 +623,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
             this.boundModel = !this.tools || this.tools.length === 0
               ? (model as unknown as Runnable)
               : (model as t.ModelWithTools).bindTools(this.tools);
-            result = await attemptInvoke();
+            result = await this.attemptInvoke(finalMessages, fb.provider, config);
             lastError = undefined;
             break;
           } catch (e) {
@@ -621,7 +631,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
             continue;
           }
         }
-        if (lastError) {
+        if (lastError !== undefined) {
           throw lastError;
         }
       }
@@ -763,7 +773,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
   static handleToolCallErrorStatic(
     graph: StandardGraph,
     data: t.ToolErrorData,
-    metadata?: Record<string, unknown>
+    _metadata?: Record<string, unknown>
   ): void {
     if (!graph.config) {
       throw new Error('No config provided');
