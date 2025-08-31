@@ -2,8 +2,8 @@
 import { START, END, StateGraph } from '@langchain/langgraph';
 import type { Runnable, RunnableConfig } from '@langchain/core/runnables';
 import type * as t from '@/types';
-import { AIMessage, HumanMessage } from '@langchain/core/messages';
-import { dispatchCustomEvent } from '@langchain/core/callbacks/dispatch';
+import { HumanMessage } from '@langchain/core/messages';
+import type { BaseMessageLike } from '@langchain/core/messages';
 import { GraphNodeKeys, Providers } from '@/common';
 import { toolsCondition } from '@/tools/ToolNode';
 import type * as l from '@/types/llm';
@@ -11,14 +11,37 @@ import { StandardGraph } from '@/graphs/Graph';
 
 const { ROUTER, AGENT, TOOLS } = GraphNodeKeys;
 
+/** Circuit breaker state for a provider */
+interface CircuitBreakerState {
+  failures: number;
+  openedUntil: number;
+}
+
+/** Configuration for fan-out execution */
+interface FanOutConfig {
+  timeoutMs: number;
+  maxRetries: number;
+  baseBackoffMs: number;
+  maxConcurrency: number;
+}
+
+/** Aggregator for fan-out model execution */
+interface ModelAggregator {
+  invoke: (messages: BaseMessageLike[], config?: RunnableConfig) => Promise<unknown>;
+  stream: (messages: BaseMessageLike[], config?: RunnableConfig) => AsyncGenerator<unknown, void, unknown>;
+}
+
+export type RoutingPolicy = {
+
+  stage: string;
+  agents?: string[];
+  model?: Providers;
+  parallel?: boolean;
+};
+
 export type SupervisedGraphInput = t.StandardGraphInput & {
   routerEnabled?: boolean;
-  routingPolicies?: Array<{
-    stage: string;
-    agents?: string[];
-    model?: Providers;
-    parallel?: boolean;
-  }>;
+  routingPolicies?: Array<RoutingPolicy>;
   featureFlags?: { multi_model_routing?: boolean; fan_out?: boolean };
   models?: Record<string, l.LLMConfig>;
 };
@@ -35,6 +58,8 @@ export class SupervisedGraph extends StandardGraph {
   models?: SupervisedGraphInput['models'];
   /** Tracks which routing policy/stage is active. Starts at -1 so first router pass selects index 0. */
   private currentStageIndex: number = -1;
+  /** Circuit breaker for providers */
+  private circuitBreaker = new Map<string, CircuitBreakerState>();
 
   constructor({
     routerEnabled,
@@ -48,6 +73,272 @@ export class SupervisedGraph extends StandardGraph {
     this.routingPolicies = routingPolicies;
     this.featureFlags = featureFlags;
     this.models = models;
+  }
+
+  buildModel(agentName: string, policy: RoutingPolicy): t.ChatModelInstance {
+    const cfg = this.models?.[agentName];
+    const provider = cfg?.provider ?? policy.model!;
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const { provider: _p, ...clientOptions } = (cfg ?? {}) as l.LLMConfig & t.ClientOptions;
+    const instance = this.getNewModel({ provider, clientOptions: clientOptions as unknown as t.ClientOptions });
+    return (!this.tools || this.tools.length === 0)
+      ? instance
+      : instance.bindTools(this.tools) as t.ChatModelInstance;
+  }
+
+  /** Execute a function with circuit breaker protection */
+  private async withCircuitBreaker<T>(
+    providerKey: string,
+    fn: () => Promise<T>
+  ): Promise<T | undefined> {
+    const now = Date.now();
+    const state = this.circuitBreaker.get(providerKey);
+
+    if (state && state.openedUntil > now) {
+      return undefined; // Circuit is open
+    }
+
+    try {
+      const result = await fn();
+      this.circuitBreaker.set(providerKey, { failures: 0, openedUntil: 0 });
+      return result;
+    } catch (error) {
+      const current = this.circuitBreaker.get(providerKey) ?? { failures: 0, openedUntil: 0 };
+      const failures = current.failures + 1;
+      // Open circuit for 10s after 3 consecutive failures
+      const openedUntil = failures >= 3 ? now + 10_000 : 0;
+      this.circuitBreaker.set(providerKey, { failures, openedUntil });
+      throw error;
+    }
+  }
+
+  /** Get fan-out configuration from feature flags */
+  private getFanOutConfig(): FanOutConfig {
+    const flags = this.featureFlags as Record<string, unknown> | undefined;
+    return {
+      timeoutMs: 12000,
+      maxRetries: Math.max(0, (flags?.fan_out_retries ? flags.fan_out_retries as number : 1)),
+      baseBackoffMs: Math.max(100, (flags?.fan_out_backoff_ms ? flags.fan_out_backoff_ms as number : 400)),
+      maxConcurrency: Math.max(1, (flags?.fan_out_concurrency ? flags.fan_out_concurrency as number : 2)),
+    };
+  }
+
+  /** Add jitter to a delay value */
+  private jitter(ms: number): number {
+    return ms + Math.floor(Math.random() * 100);
+  }
+
+  /** Sleep for specified milliseconds */
+  private sleepMs(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  /** Execute a single branch with timeout and abort handling */
+  private async executeBranchWithTimeout(
+    model: t.ChatModelInstance,
+    messages: BaseMessageLike[],
+    config: RunnableConfig | undefined,
+    timeoutMs: number,
+    providerKey: string
+  ): Promise<unknown> {
+    const parentSignal = (config as { signal?: AbortSignal } | undefined)?.signal;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    const onAbort = (): void => controller.abort();
+    if (parentSignal) {
+      try {
+        parentSignal.addEventListener('abort', onAbort, { once: true });
+      } catch {
+        // Ignore error adding abort event listener
+      }
+    }
+
+    const started = Date.now();
+    try {
+      const result = await model.invoke(messages, {
+        ...(config ?? {}),
+        signal: controller.signal,
+      } as RunnableConfig);
+
+      const duration = Date.now() - started;
+      try {
+        this.handlerRegistry
+          ?.getHandler('fanout_branch_end')
+          ?.handle('fanout_branch_end', {
+            provider: providerKey,
+            duration,
+            status: 'ok',
+          } as never, undefined, this);
+      } catch {
+        // Ignore error dispatching fanout branch end event
+      }
+
+      return result;
+    } catch (error) {
+      const duration = Date.now() - started;
+      try {
+        this.handlerRegistry
+          ?.getHandler('fanout_branch_end')
+          ?.handle('fanout_branch_end', {
+            provider: providerKey,
+            duration,
+            status: 'error',
+          } as never, undefined, this);
+      } catch {
+        // Ignore error dispatching fanout branch end event
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+      if (parentSignal) {
+        try {
+          parentSignal.removeEventListener('abort', onAbort as EventListener);
+        } catch {
+          console.error('Error removing abort event listener');
+        }
+      }
+    }
+  }
+
+  /** Execute a branch with retries and circuit breaker */
+  private async executeBranchWithRetries(
+    name: string,
+    policy: RoutingPolicy,
+    messages: BaseMessageLike[],
+    config: RunnableConfig | undefined,
+    fanOutConfig: FanOutConfig
+  ): Promise<unknown> {
+    const model = this.buildModel(name, policy);
+    if (!model.invoke) {
+      return undefined;
+    }
+
+    const modelCfg = this.models?.[name];
+    const providerKey = modelCfg?.provider ?? policy.model!;
+
+    for (let attempt = 0; attempt <= fanOutConfig.maxRetries; attempt++) {
+      try {
+        return await this.withCircuitBreaker(
+          String(providerKey),
+          () => this.executeBranchWithTimeout(model, messages, config, fanOutConfig.timeoutMs, String(providerKey))
+        );
+      } catch (error) {
+        console.error('Error with circuit breaker:', error);
+        if (attempt === fanOutConfig.maxRetries) {
+          return undefined;
+        }
+        const delay = this.jitter(fanOutConfig.baseBackoffMs * Math.pow(2, attempt));
+        await this.sleepMs(delay);
+      }
+    }
+
+    return undefined;
+  }
+
+  /** Create an aggregator for fan-out model execution */
+  private createFanOutAggregator(
+    agentNames: string[],
+    policy: RoutingPolicy
+  ): ModelAggregator {
+    return {
+      invoke: async (messages: BaseMessageLike[], config?: RunnableConfig): Promise<unknown> => {
+        const fanOutConfig = this.getFanOutConfig();
+
+        // Concurrent execution with controlled concurrency
+        const queue = [...agentNames];
+        const running: Promise<unknown>[] = [];
+        const results: PromiseSettledResult<unknown>[] = [];
+
+        const launchNext = (): void => {
+          if (queue.length === 0) return;
+
+          const name = queue.shift()!;
+          const promise = this.executeBranchWithRetries(name, policy, messages, config, fanOutConfig)
+            .then((value) => ({ status: 'fulfilled', value } as PromiseSettledResult<unknown>))
+            .catch((reason) => ({ status: 'rejected', reason } as PromiseSettledResult<unknown>))
+            .finally(() => {
+              const index = running.indexOf(promise);
+              if (index !== -1) {
+                results.push(running.splice(index, 1)[0] as unknown as PromiseSettledResult<unknown>);
+              }
+              launchNext();
+            });
+
+          running.push(promise);
+
+          if (running.length < fanOutConfig.maxConcurrency) {
+            launchNext();
+          }
+        };
+
+        // Start execution
+        launchNext();
+        await Promise.all(running);
+
+        // Use results if available, otherwise fallback to allSettled
+        const settled = results.length > 0
+          ? results
+          : await Promise.allSettled(
+            agentNames.map((name) =>
+              this.executeBranchWithRetries(name, policy, messages, config, fanOutConfig)
+            )
+          );
+
+        // Extract successful outputs
+        const outputs = settled
+          .map((result) => (result.status === 'fulfilled' ? result.value : undefined))
+          .filter((value) => value != null);
+
+        // Combine text content
+        const textParts = outputs
+          .map((output) => {
+            const content = (output as { content?: unknown }).content;
+            return typeof content === 'string' ? content : '';
+          })
+          .filter(Boolean);
+
+        const combinedText = textParts.join('\n\n');
+
+        // Synthesize final answer
+        return this.synthesizeResults(combinedText, messages, config, policy);
+      },
+
+      stream: async function* (messages: BaseMessageLike[], config?: RunnableConfig): AsyncGenerator<unknown, void, unknown> {
+        // For streaming, we invoke and yield the final result
+        const result = await this.invoke(messages, config);
+        yield result;
+      },
+    } as ModelAggregator;
+  }
+
+  /** Synthesize multiple model outputs into a single result */
+  private async synthesizeResults(
+    combinedText: string,
+    originalMessages: BaseMessageLike[],
+    config: RunnableConfig | undefined,
+    policy: RoutingPolicy
+  ): Promise<unknown> {
+    const synthCfg = this.models?.['synth'] as l.LLMConfig | undefined;
+    const synthProvider = synthCfg?.provider ?? policy.model!;
+
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const { provider: _p, ...synthClientOptions } = (synthCfg ?? {}) as l.LLMConfig & t.ClientOptions;
+
+    const synthInstance = this.getNewModel({
+      provider: synthProvider,
+      clientOptions: synthClientOptions as unknown as t.ClientOptions,
+    });
+
+    const synthModel = (!this.tools || this.tools.length === 0)
+      ? synthInstance
+      : (synthInstance as t.ModelWithTools).bindTools(this.tools);
+
+    const prompt = new HumanMessage(
+      `Synthesize the following model outputs into one concise, high-quality answer. Do not repeat, deduplicate overlap, and keep it short.\n\n${combinedText}`
+    );
+
+    return synthModel.invoke([...originalMessages, prompt], config);
   }
 
   /** Decide the next node after ROUTER and apply per-stage provider overrides if configured. */
@@ -76,7 +367,7 @@ export class SupervisedGraph extends StandardGraph {
           | undefined;
         if (cond === 'always') return i;
         if (cond != null) {
-          const contentVal = (lastMsg as { content?: unknown })?.content as unknown;
+          const contentVal = (lastMsg as { content?: unknown }).content as unknown;
           const contentStr = typeof contentVal === 'string' ? contentVal : '';
           const hasTools = 'tool_calls' in (lastMsg ?? {}) && ((lastMsg as unknown as { tool_calls?: unknown[] }).tool_calls?.length ?? 0) > 0;
           if (cond === 'has_tools' && hasTools) return i;
@@ -106,149 +397,7 @@ export class SupervisedGraph extends StandardGraph {
         const enableFanOut = this.featureFlags?.fan_out === true && policy.parallel === true && (policy.agents?.length ?? 0) > 1;
         if (enableFanOut) {
           const agentNames = policy.agents as string[];
-          const self = this;
-          const buildModel = (agentName: string) => {
-            const cfg = self.models?.[agentName];
-            const provider = cfg?.provider ?? policy.model!;
-            // eslint-disable-next-line @typescript-eslint/no-unused-vars
-            const { provider: _p, ...clientOptions } = (cfg ?? {}) as l.LLMConfig & t.ClientOptions;
-            const instance = self.getNewModel({ provider, clientOptions: clientOptions as unknown as t.ClientOptions });
-            return (!self.tools || self.tools.length === 0)
-              ? (instance as unknown as Runnable)
-              : (instance as t.ModelWithTools).bindTools(self.tools);
-          };
-          const aggregator = {
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            invoke: async (messages: any, cfg?: RunnableConfig) => {
-              const TIMEOUT_MS = 12000;
-              const MAX_RETRIES = Math.max(0, ((self.featureFlags as unknown as { fan_out_retries?: number })?.fan_out_retries ?? 1));
-              const BASE_BACKOFF = Math.max(100, ((self.featureFlags as unknown as { fan_out_backoff_ms?: number })?.fan_out_backoff_ms ?? 400));
-              const MAX_CONCURRENCY = Math.max(1, ((self.featureFlags as unknown as { fan_out_concurrency?: number })?.fan_out_concurrency ?? 2));
-
-              // Simple in-memory circuit breaker per provider
-              // provider -> { failures: number, openedUntil: number }
-              const breaker = new Map<string, { failures: number; openedUntil: number }>();
-
-              const jitter = (n: number): number => n + Math.floor(Math.random() * 100);
-              const sleepMs = (n: number): Promise<void> => new Promise((r) => setTimeout(r, n));
-
-              const withBreaker = async (
-                providerKey: string,
-                fn: () => Promise<unknown>
-              ): Promise<unknown> => {
-                const now = Date.now();
-                const state = breaker.get(providerKey);
-                if (state && state.openedUntil > now) {
-                  return undefined; // short-circuit while open
-                }
-                try {
-                  const res = await fn();
-                  breaker.set(providerKey, { failures: 0, openedUntil: 0 });
-                  return res;
-                } catch (e) {
-                  const current = breaker.get(providerKey) ?? { failures: 0, openedUntil: 0 };
-                  const failures = current.failures + 1;
-                  // open for 10s after 3 consecutive failures
-                  const openedUntil = failures >= 3 ? now + 10_000 : 0;
-                  breaker.set(providerKey, { failures, openedUntil });
-                  throw e;
-                }
-              };
-              const runBranch = async (name: string): Promise<unknown> => {
-                const model = buildModel(name) as unknown as { invoke?: Function };
-                if (!model.invoke) { return undefined; }
-                const modelCfg = self.models?.[name];
-                const providerKey = modelCfg?.provider ?? policy.model!;
-
-                const attemptOnce = async (): Promise<unknown> => {
-                  const parentSignal = (cfg as unknown as { signal?: AbortSignal })?.signal;
-                  const controller = new AbortController();
-                  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
-                  const onAbort = (): void => controller.abort();
-                  if (parentSignal) {
-                    try { parentSignal.addEventListener('abort', onAbort, { once: true }); } catch {}
-                  }
-                  const started = Date.now();
-                  try {
-                    const out = await (model.invoke as Function)(messages, { ...(cfg as object), signal: controller.signal } as RunnableConfig);
-                    const duration = Date.now() - started;
-                    try { dispatchCustomEvent('fanout_branch_end', { provider: providerKey, duration, status: 'ok' }, self.config); } catch {}
-                    return out;
-                  } catch (e) {
-                    const duration = Date.now() - started;
-                    try { dispatchCustomEvent('fanout_branch_end', { provider: providerKey, duration, status: 'error' }, self.config); } catch {}
-                    throw e;
-                  } finally {
-                    clearTimeout(timer);
-                    if (parentSignal) {
-                      try { parentSignal.removeEventListener('abort', onAbort as EventListener); } catch {}
-                    }
-                  }
-                };
-
-                for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-                  try {
-                    return await withBreaker(String(providerKey), attemptOnce);
-                  } catch (e) {
-                    if (attempt === MAX_RETRIES) return undefined;
-                    const delay = jitter(BASE_BACKOFF * Math.pow(2, attempt));
-                    await sleepMs(delay);
-                  }
-                }
-                return undefined;
-              };
-
-              // Concurrency limiter
-              const queue = agentNames.slice();
-              const running: Promise<unknown>[] = [];
-              const settledResults: PromiseSettledResult<unknown>[] = [] as unknown as PromiseSettledResult<unknown>[];
-              const launchNext = (): void => {
-                if (queue.length === 0) return;
-                const name = queue.shift() as string;
-                const p = runBranch(name)
-                  .then((v) => ({ status: 'fulfilled', value: v } as PromiseSettledResult<unknown>))
-                  .catch((err) => ({ status: 'rejected', reason: err } as PromiseSettledResult<unknown>))
-                  .finally(() => {
-                    settledResults.push(running.splice(running.indexOf(p as unknown as Promise<unknown>), 1)[0] as unknown as PromiseSettledResult<unknown>);
-                    launchNext();
-                  });
-                running.push(p as unknown as Promise<unknown>);
-                if (running.length < MAX_CONCURRENCY) launchNext();
-              };
-              launchNext();
-              await Promise.all(running);
-              const settled = settledResults.length > 0 ? settledResults : (await Promise.allSettled(agentNames.map((n) => runBranch(n))));
-              const outputs = settled.map((s) => (s.status === 'fulfilled' ? s.value : undefined)).filter((v) => v != null);
-              // Combine text content strings
-              const textParts = outputs.map((o) => (typeof (o as { content?: unknown })?.content === 'string' ? (o as { content: string }).content : '')).filter(Boolean);
-              const combinedText = textParts.join('\n\n');
-
-              // Synthesize a single final answer using a chosen synthesizer model
-              const synthCfg = self.models?.['synth'] as l.LLMConfig | undefined;
-              const synthProvider = synthCfg?.provider ?? policy.model!;
-              // eslint-disable-next-line @typescript-eslint/no-unused-vars
-              const { provider: _p2, ...synthClientOptions } = (synthCfg ?? {}) as l.LLMConfig & t.ClientOptions;
-              const synthInstance = self.getNewModel({ provider: synthProvider, clientOptions: synthClientOptions as unknown as t.ClientOptions });
-              const synthModel = (!self.tools || self.tools.length === 0)
-                ? (synthInstance as unknown as Runnable)
-                : (synthInstance as t.ModelWithTools).bindTools(self.tools);
-
-              const prompt = new HumanMessage(`Synthesize the following model outputs into one concise, high-quality answer. Do not repeat, deduplicate overlap, and keep it short.\n\n${combinedText}`);
-              const baseMessages = Array.isArray(messages) ? (messages as unknown as unknown[]) : [];
-              const finalMsg = await (synthModel as unknown as { invoke: Function }).invoke([...baseMessages, prompt], cfg);
-              return finalMsg as unknown;
-            },
-            // Provide a minimal stream API yielding the final aggregated chunk
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            stream: async function* (messages: any, cfg?: RunnableConfig) {
-              const selfAny = this as unknown as { invoke?: Function };
-              const finalMsg = selfAny.invoke ? await selfAny.invoke(messages, cfg) : { content: '' };
-              // yield a single chunk-like object
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              yield finalMsg as any;
-            },
-          } as unknown as Runnable;
-          this.boundModel = aggregator;
+          this.boundModel = this.createFanOutAggregator(agentNames, policy) as unknown as Runnable;
         } else if (stageConfig) {
           const stageProvider = stageConfig.provider ?? policy.model;
           // Extract provider-specific client options from stage config

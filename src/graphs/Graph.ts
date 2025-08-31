@@ -6,7 +6,8 @@ import { ToolNode } from '@langchain/langgraph/prebuilt';
 import { ChatVertexAI } from '@langchain/google-vertexai';
 import { START, END, StateGraph } from '@langchain/langgraph';
 import { Runnable, RunnableConfig } from '@langchain/core/runnables';
-import { dispatchCustomEvent } from '@langchain/core/callbacks/dispatch';
+// import { dispatchCustomEvent } from '@langchain/core/callbacks/dispatch';
+import { safeDispatchCustomEvent } from '@/utils/events';
 import {
   AIMessageChunk,
   ToolMessage,
@@ -570,7 +571,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
       this.lastStreamCall = Date.now();
 
       const attemptInvoke = async (): Promise<Partial<t.BaseGraphState>> => {
-        const bound = this.boundModel;
+        const bound = this.boundModel as unknown as { stream?: Function; invoke: Function } | undefined;
         if (
           (this.tools?.length ?? 0) > 0 &&
           manualToolStreamProviders.has(provider)
@@ -578,12 +579,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
           if (!bound?.stream) {
             throw new Error('Model does not support stream');
           }
-          const stream = await bound.stream(finalMessages, config);
+          const stream = await (bound.stream as (msgs: unknown, cfg?: unknown) => AsyncIterable<AIMessageChunk>)(finalMessages, config);
           let finalChunk: AIMessageChunk | undefined;
           for await (const chunk of stream) {
-            try { dispatchCustomEvent(GraphEvents.CHAT_MODEL_STREAM, { chunk }, config); } catch {
-              console.error('Error dispatching chat model stream event');
-            }
             finalChunk = finalChunk ? concat(finalChunk, chunk) : chunk;
           }
           finalChunk = modifyDeltaProperties(this.provider, finalChunk);
@@ -608,7 +606,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
       try {
         result = await attemptInvoke();
       } catch (primaryError) {
-        let lastError: Error | undefined= primaryError as Error;
+        let lastError: unknown = primaryError;
         for (const fb of fallbacks) {
           try {
             const model = this.getNewModel({ provider: fb.provider, clientOptions: fb.clientOptions });
@@ -619,7 +617,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
             lastError = undefined;
             break;
           } catch (e) {
-            lastError = e as Error;
+            lastError = e;
             continue;
           }
         }
@@ -696,7 +694,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
 
     this.contentData.push(runStep);
     this.contentIndexMap.set(stepId, runStep.index);
-    try { dispatchCustomEvent(GraphEvents.ON_RUN_STEP, runStep, this.config); } catch {
+    try {
+      this.handlerRegistry
+        ?.getHandler(GraphEvents.ON_RUN_STEP)
+        ?.handle(GraphEvents.ON_RUN_STEP, runStep, undefined, this);
+    } catch {
       console.error('Error dispatching on run step event');
     }
     return stepId;
@@ -741,19 +743,18 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
       progress: 1,
     };
 
-    this.handlerRegistry?.getHandler(GraphEvents.ON_RUN_STEP_COMPLETED)?.handle(
-      GraphEvents.ON_RUN_STEP_COMPLETED,
-      {
-        result: {
-          id: stepId,
-          index: runStep.index,
-          type: 'tool_call',
-          tool_call,
-        } as t.ToolCompleteEvent,
-      },
-      metadata,
-      this
-    );
+    try {
+      this.handlerRegistry
+        ?.getHandler(GraphEvents.ON_RUN_STEP_COMPLETED)
+        ?.handle(
+          GraphEvents.ON_RUN_STEP_COMPLETED,
+          { result: { id: stepId, index: runStep.index, type: 'tool_call', tool_call } as t.ToolCompleteEvent },
+          undefined,
+          this
+        );
+    } catch {
+      console.error('Error dispatching on run step completed event');
+    }
   }
   /**
    * Static version of handleToolCallError to avoid creating strong references
@@ -793,21 +794,18 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
       progress: 1,
     };
 
-    graph.handlerRegistry
-      ?.getHandler(GraphEvents.ON_RUN_STEP_COMPLETED)
-      ?.handle(
-        GraphEvents.ON_RUN_STEP_COMPLETED,
-        {
-          result: {
-            id: stepId,
-            index: runStep.index,
-            type: 'tool_call',
-            tool_call,
-          } as t.ToolCompleteEvent,
-        },
-        metadata,
-        graph
-      );
+    try {
+      graph.handlerRegistry
+        ?.getHandler(GraphEvents.ON_RUN_STEP_COMPLETED)
+        ?.handle(
+          GraphEvents.ON_RUN_STEP_COMPLETED,
+          { result: { id: stepId, index: runStep.index, type: 'tool_call', tool_call } as t.ToolCompleteEvent },
+          undefined,
+          graph
+        );
+    } catch {
+      console.error('Error dispatching on run step completed event');
+    }
   }
 
   /**
@@ -831,7 +829,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
       id,
       delta,
     };
-    try { dispatchCustomEvent(GraphEvents.ON_RUN_STEP_DELTA, runStepDelta, this.config); } catch {
+    try {
+      this.handlerRegistry
+        ?.getHandler(GraphEvents.ON_RUN_STEP_DELTA)
+        ?.handle(GraphEvents.ON_RUN_STEP_DELTA, runStepDelta, undefined, this);
+    } catch {
       console.error('Error dispatching on run step delta event');
     }
   }
@@ -844,7 +846,18 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
       id,
       delta,
     };
-    try { dispatchCustomEvent(GraphEvents.ON_MESSAGE_DELTA, messageDelta, this.config); } catch {
+    try {
+      this.handlerRegistry
+        ?.getHandler(GraphEvents.ON_MESSAGE_DELTA)
+        ?.handle(GraphEvents.ON_MESSAGE_DELTA, messageDelta, undefined, this);
+    } catch {
+      console.error('Error dispatching on message delta event');
+    }
+    // Also emit via LC custom event for tests that listen through callbacks
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (safeDispatchCustomEvent as any)(GraphEvents.ON_MESSAGE_DELTA, messageDelta, this.config as never);
+    } catch {
       console.error('Error dispatching on message delta event');
     }
   }
@@ -857,7 +870,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
       id: stepId,
       delta,
     };
-    try { dispatchCustomEvent(GraphEvents.ON_REASONING_DELTA, reasoningDelta, this.config); } catch {
+    try {
+      this.handlerRegistry
+        ?.getHandler(GraphEvents.ON_REASONING_DELTA)
+        ?.handle(GraphEvents.ON_REASONING_DELTA, reasoningDelta, undefined, this);
+    } catch {
       console.error('Error dispatching on reasoning delta event');
     }
   };

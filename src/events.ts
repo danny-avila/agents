@@ -167,6 +167,14 @@ export class ToolEndHandler implements t.EventHandler {
       tool_call_id: toolCallId,
     } as NonNullable<typeof toolEndData.output>;
 
+    // Mark tool call as invoked to prevent router loops
+    if (graph.invokedToolIds == null) {
+      graph.invokedToolIds = new Set<string>();
+    }
+    if (toolCallId) {
+      graph.invokedToolIds.add(toolCallId);
+    }
+
     graph.handleToolCallCompleted(
       { input: toolEndData.input, output: outputForDispatch },
       metadata,

@@ -48,6 +48,7 @@ async function testHandoff(): Promise<void> {
       type: 'supervised',
       llmConfig,
       routerEnabled: true,
+      toolEnd: false,
       tools: [createHandoffTool()],
       instructions:
         'You can call the handoff tool to jump between nodes (router/agent/tools).',

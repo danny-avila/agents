@@ -1,7 +1,7 @@
 // src/tools/handoff.ts
 import { z } from 'zod';
 import { tool, type DynamicStructuredTool } from '@langchain/core/tools';
-import { Command } from '@langchain/langgraph';
+import { ToolMessage } from '@langchain/core/messages';
 
 /**
  * Minimal supervised handoff tool that emits LangGraph Commands.
@@ -22,9 +22,13 @@ export type HandoffParams = z.infer<typeof handoffSchema>;
 export function createHandoffTool(): DynamicStructuredTool<typeof handoffSchema> {
   return tool<typeof handoffSchema>(
     async (params) => {
-      const { target } = params;
-      // For initial implementation, simply jump to the target node
-      return new Command({ goto: target });
+      const { target, mode } = params;
+      // Emit a ToolMessage so the tool call is marked as completed; routing continues via graph edges
+      return new ToolMessage({
+        name: 'handoff',
+        content: `handoff: target=${String(target)} mode=${String(mode)}`,
+        tool_call_id: '',
+      });
     },
     {
       name: 'handoff',

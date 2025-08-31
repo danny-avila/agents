@@ -1,4 +1,4 @@
-/* eslint-disable no-console */
+
 import { config } from 'dotenv';
 config();
 import { Calculator } from '@langchain/community/tools/calculator';
@@ -91,5 +91,3 @@ describe('Supervised router loop with toolEnd=false (real provider)', () => {
     expect(agentEnds).toBe(1);
   });
 });
-
-

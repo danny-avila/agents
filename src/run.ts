@@ -23,6 +23,7 @@ import { SupervisedGraph } from '@/graphs/SupervisedGraph';
 import { CollaborativeGraph } from '@/graphs/CollaborativeGraph';
 import { TaskManagerGraph } from '@/graphs/TaskManagerGraph';
 import { HandlerRegistry } from '@/events';
+import { ChatModelStreamHandler } from '@/stream';
 import { isOpenAILike } from '@/utils/llm';
 
 export const defaultOmitOptions = new Set([
@@ -284,13 +285,17 @@ export class Run<T extends t.BaseGraphState> {
       if (eventName && eventName === GraphEvents.ON_CUSTOM_EVENT) {
         eventName = name;
       }
-      // Then apply suppression for manual tool-stream providers
+      // Suppress CHAT_MODEL_STREAM when provider is in manualToolStreamProviders and tools are present
       if (
+        eventName === GraphEvents.CHAT_MODEL_STREAM &&
         hasTools &&
-        manualToolStreamProviders.has(provider) &&
-        eventName === GraphEvents.CHAT_MODEL_STREAM
+        provider &&
+        manualToolStreamProviders.has(provider)
       ) {
-        /* Skipping CHAT_MODEL_STREAM event due to double-call edge case */
+        // Internally process stream to maintain Graph state and deltas, but suppress external handlers
+        try {
+          new ChatModelStreamHandler().handle(eventName, data as never, metadata, this.Graph);
+        } catch {}
         continue;
       }
 
@@ -387,6 +392,14 @@ export class Run<T extends t.BaseGraphState> {
       titleMethod === TitleMethod.COMPLETION
         ? await createCompletionTitleRunnable(model, titlePrompt)
         : await createTitleRunnable(model, titlePrompt);
-    return await chain.invoke({ convo, inputText, skipLanguage }, chainOptions);
+    const invokeConfig = Object.assign({}, chainOptions, { run_id: this.id, runId: this.id });
+    try {
+      return await chain.invoke({ convo, inputText, skipLanguage }, invokeConfig);
+    } catch (e) {
+      // Fallback: strip callbacks to avoid EventStream tracer errors in certain environments
+      const { callbacks: _cb, ...rest } = (invokeConfig ?? {}) as Record<string, unknown>;
+      const safeConfig = Object.assign({}, rest, { callbacks: [] });
+      return await chain.invoke({ convo, inputText, skipLanguage }, safeConfig as Partial<RunnableConfig>);
+    }
   }
 }
