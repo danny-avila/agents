@@ -75,7 +75,10 @@ export class ModelEndHandler implements t.EventHandler {
       { depth: null }
     );
 
-    if (metadata.provider !== Providers.GOOGLE) {
+    if (
+      metadata.provider !== Providers.GOOGLE &&
+      metadata.provider !== Providers.BEDROCK
+    ) {
       return;
     }
 

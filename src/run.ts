@@ -222,15 +222,17 @@ export class Run<T extends t.BaseGraphState> {
       if (eventName && eventName === GraphEvents.ON_CUSTOM_EVENT) {
         eventName = name;
       }
-      // Suppress CHAT_MODEL_STREAM from `info.event` when provider is in manualToolStreamProviders and tools are present
-      // if (
-      //   info.event === GraphEvents.CHAT_MODEL_STREAM &&
-      //   hasTools &&
-      //   manualToolStreamProviders.has(provider ?? '')
-      // ) {
-      //   /* Skipping CHAT_MODEL_STREAM event due to double-call edge case */
-      //   continue;
-      // }
+      /**
+       * Suppress CHAT_MODEL_STREAM if custom event, meaning the provider
+       * is in `manualToolStreamProviders` and `tools` are present, which
+       * creates a double-call of the event.
+       */
+      if (
+        (data as t.StreamEventData)['emitted'] === true &&
+        eventName === GraphEvents.CHAT_MODEL_STREAM
+      ) {
+        continue;
+      }
 
       const handler = this.handlerRegistry.getHandler(eventName);
       if (handler) {

@@ -161,18 +161,16 @@ export class ChatModelStreamHandler implements t.EventHandler {
       typeof content === 'undefined' ||
       !content.length ||
       (typeof content === 'string' && !content);
-    const isEmptyChunk = isEmptyContent && !hasToolCallChunks;
-    const chunkId = chunk.id ?? '';
-    if (isEmptyChunk && chunkId && chunkId.startsWith('msg')) {
-      if (graph.messageIdsByStepKey.has(chunkId)) {
-        return;
-      } else if (graph.prelimMessageIdsByStepKey.has(chunkId)) {
-        return;
-      }
 
+    /** Set a preliminary message ID if found in empty chunk */
+    const isEmptyChunk = isEmptyContent && !hasToolCallChunks;
+    if (
+      isEmptyChunk &&
+      (chunk.id ?? '') !== '' &&
+      !graph.prelimMessageIdsByStepKey.has(chunk.id ?? '')
+    ) {
       const stepKey = graph.getStepKey(metadata);
-      graph.prelimMessageIdsByStepKey.set(stepKey, chunkId);
-      return;
+      graph.prelimMessageIdsByStepKey.set(stepKey, chunk.id ?? '');
     } else if (isEmptyChunk) {
       return;
     }

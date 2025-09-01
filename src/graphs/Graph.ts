@@ -524,7 +524,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
       for await (const chunk of stream) {
         safeDispatchCustomEvent(
           GraphEvents.CHAT_MODEL_STREAM,
-          { chunk },
+          { chunk, emitted: true },
           config
         );
         finalChunk = finalChunk ? concat(finalChunk, chunk) : chunk;
@@ -803,8 +803,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
     const workflow = new StateGraph<t.BaseGraphState>({
       channels: graphState,
     })
-      .addNode(AGENT, agentNode, { ends: [END] })
-      .addEdge(START, AGENT)
+      .addNode('000', agentNode, { ends: [END] })
+      .addEdge(START, '000')
       .compile();
 
     return workflow;

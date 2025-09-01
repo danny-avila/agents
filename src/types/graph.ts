@@ -125,6 +125,10 @@ export type StreamEventData = {
    * Custom result from the runnable that generated the event.
    */
   result?: unknown;
+  /**
+   * Custom field to indicate the event was manually emitted, and may have been handled already
+   */
+  emitted?: boolean;
 };
 
 /**
