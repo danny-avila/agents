@@ -2,7 +2,10 @@ import { Tiktoken } from 'js-tiktoken/lite';
 import type { BaseMessage } from '@langchain/core/messages';
 import { ContentTypes } from '@/common/enum';
 
-export function getTokenCountForMessage(message: BaseMessage, getTokenCount: (text: string) => number): number {
+export function getTokenCountForMessage(
+  message: BaseMessage,
+  getTokenCount: (text: string) => number
+): number {
   const tokensPerMessage = 3;
 
   const processValue = (value: unknown): void => {
@@ -57,14 +60,23 @@ export function getTokenCountForMessage(message: BaseMessage, getTokenCount: (te
   return numTokens;
 }
 
+let encoderPromise: Promise<Tiktoken> | undefined;
+
+async function getSharedEncoder(): Promise<Tiktoken> {
+  if (encoderPromise) {
+    return encoderPromise;
+  }
+  encoderPromise = (async (): Promise<Tiktoken> => {
+    const res = await fetch('https://tiktoken.pages.dev/js/o200k_base.json');
+    const o200k_base = await res.json();
+    return new Tiktoken(o200k_base);
+  })();
+  return encoderPromise;
+}
+
 export const createTokenCounter = async () => {
-  const res = await fetch('https://tiktoken.pages.dev/js/o200k_base.json');
-  const o200k_base = await res.json();
-
-  const countTokens = (text: string): number => {
-    const enc = new Tiktoken(o200k_base);
-    return enc.encode(text).length;
-  };
-
-  return (message: BaseMessage): number => getTokenCountForMessage(message, countTokens);
+  const enc = await getSharedEncoder();
+  const countTokens = (text: string): number => enc.encode(text).length;
+  return (message: BaseMessage): number =>
+    getTokenCountForMessage(message, countTokens);
 };

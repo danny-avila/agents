@@ -7,7 +7,8 @@ import type {
 import type { Graph } from '@/graphs';
 import type * as t from '@/types';
 import { handleToolCalls } from '@/tools/handlers';
-import { Providers } from '@/common';
+import { Providers, StepTypes, ToolCallTypes } from '@/common';
+import { getMessageId } from '@/messages';
 
 export class HandlerRegistry {
   private handlers: Map<string, t.EventHandler> = new Map();
@@ -18,6 +19,23 @@ export class HandlerRegistry {
 
   getHandler(eventType: string): t.EventHandler | undefined {
     return this.handlers.get(eventType);
+  }
+}
+
+export class FanoutMetricsHandler implements t.EventHandler {
+  handle(
+    event: string,
+    data: t.StreamEventData | undefined,
+    metadata?: Record<string, unknown>
+  ): void {
+    if (event !== 'fanout_branch_end') return;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const detail = data as any;
+    const provider = detail?.provider ?? '';
+    const duration = detail?.duration ?? 0;
+    const status = detail?.status ?? 'unknown';
+    // Minimal structured log; can be wired to metrics sink
+    console.log('[fanout]', { provider, duration, status, metadata });
   }
 }
 
@@ -94,8 +112,72 @@ export class ToolEndHandler implements t.EventHandler {
     }
 
     this.callback?.(toolEndData, metadata);
+
+    /** Backfill mapping if tool_call_id wasn't registered or missing (e.g., some providers omit it) */
+    const rawId = toolEndData.output.tool_call_id || '';
+    let toolCallId = rawId;
+    try {
+      const stepKey = graph.getStepKey(metadata);
+      let lastStepId = '';
+      try {
+        lastStepId = graph.getStepIdByKey(
+          stepKey,
+          graph.contentData.length - 1
+        );
+      } catch {
+        // Ensure a message creation step exists
+        const messageId = getMessageId(stepKey, graph, true) ?? '';
+        lastStepId = graph.dispatchRunStep(stepKey, {
+          type: StepTypes.MESSAGE_CREATION,
+          message_creation: { message_id: messageId },
+        });
+      }
+
+      // Synthesize an ID if provider didn't supply one
+      if (!toolCallId || toolCallId === '') {
+        toolCallId = `${toolEndData.output.name ?? 'tool'}_${Date.now()}`;
+      }
+
+      if (!graph.toolCallStepIds.has(toolCallId)) {
+        // Attach tool_call_ids to the last message so UI/state understands association
+        graph.dispatchMessageDelta(lastStepId, {
+          content: [{ type: 'text', text: '', tool_call_ids: [toolCallId] }],
+        });
+
+        // Create a TOOL_CALLS run step so Graph maps toolCallId -> stepId
+        graph.dispatchRunStep(stepKey, {
+          type: StepTypes.TOOL_CALLS,
+          tool_calls: [
+            {
+              id: toolCallId,
+              name: toolEndData.output.name ?? '',
+              args: {},
+              type: ToolCallTypes.TOOL_CALL,
+            } as unknown as t.AgentToolCall,
+          ],
+        });
+      }
+    } catch (e) {
+      console.error('Error backfilling tool_call_id:', e);
+      // If backfill fails, continue; the completion call below will surface issues
+    }
+
+    // Ensure handleToolCallCompleted receives a populated tool_call_id
+    const outputForDispatch = {
+      ...toolEndData.output,
+      tool_call_id: toolCallId,
+    } as NonNullable<typeof toolEndData.output>;
+
+    // Mark tool call as invoked to prevent router loops
+    if (graph.invokedToolIds == null) {
+      graph.invokedToolIds = new Set<string>();
+    }
+    if (toolCallId) {
+      graph.invokedToolIds.add(toolCallId);
+    }
+
     graph.handleToolCallCompleted(
-      { input: toolEndData.input, output: toolEndData.output },
+      { input: toolEndData.input, output: outputForDispatch },
       metadata,
       this.omitOutput?.(toolEndData.output.name)
     );

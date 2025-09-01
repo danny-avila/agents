@@ -9,10 +9,16 @@ import type { BaseMessage, AIMessageChunk } from '@langchain/core/messages';
 import type { ChatGenerationChunk } from '@langchain/core/outputs';
 import type { GoogleAIToolType } from '@langchain/google-common';
 import type { RunnableConfig } from '@langchain/core/runnables';
-import type { ToolMap, GenericTool } from '@/types/tools';
+import type { ToolMap, ToolEndEvent, GenericTool } from '@/types/tools';
 import type { ClientOptions } from '@/types/llm';
 import type { Providers } from '@/common';
 import type { Graph } from '@/graphs';
+import type {
+  RunStep,
+  RunStepDeltaEvent,
+  MessageDeltaEvent,
+  ReasoningDeltaEvent,
+} from '@/types/stream';
 // import type { RunnableConfig } from '@langchain/core/runnables';
 
 export type BaseGraphState = {
@@ -30,7 +36,14 @@ export type IState = BaseGraphState;
 export interface EventHandler {
   handle(
     event: string,
-    data: StreamEventData | ModelEndData,
+    data:
+      | StreamEventData
+      | ModelEndData
+      | RunStep
+      | RunStepDeltaEvent
+      | MessageDeltaEvent
+      | ReasoningDeltaEvent
+      | { result: ToolEndEvent },
     metadata?: Record<string, unknown>,
     graph?: Graph
   ): void;
@@ -50,6 +63,18 @@ export type CompiledWorkflow<
   U extends Partial<T> = Partial<T>,
   N extends string = string,
 > = CompiledStateGraph<T, U, N>;
+
+/**
+ * Optional compile options passed to workflow.compile().
+ * These are intentionally untyped to avoid coupling to library internals.
+ */
+export type CompileOptions = {
+  // A checkpointer instance (e.g., MemorySaver, SQL saver)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  checkpointer?: any;
+  interruptBefore?: string[];
+  interruptAfter?: string[];
+};
 
 export type EventStreamCallbackHandlerInput =
   Parameters<CompiledWorkflow['streamEvents']>[2] extends Omit<
