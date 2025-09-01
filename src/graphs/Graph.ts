@@ -4,8 +4,18 @@ import { nanoid } from 'nanoid';
 import { concat } from '@langchain/core/utils/stream';
 import { ToolNode } from '@langchain/langgraph/prebuilt';
 import { ChatVertexAI } from '@langchain/google-vertexai';
-import { START, END, StateGraph } from '@langchain/langgraph';
-import { Runnable, RunnableConfig } from '@langchain/core/runnables';
+import {
+  START,
+  END,
+  StateGraph,
+  Annotation,
+  messagesStateReducer,
+} from '@langchain/langgraph';
+import {
+  Runnable,
+  RunnableConfig,
+  RunnableLambda,
+} from '@langchain/core/runnables';
 import {
   ToolMessage,
   SystemMessage,
@@ -85,7 +95,6 @@ export abstract class Graph<
   TNodeName extends string = string,
 > {
   abstract resetValues(): void;
-  abstract createGraphState(): t.GraphStateChannels<T>;
   abstract initializeTools({
     currentTools,
     currentToolMap,
@@ -134,7 +143,6 @@ export abstract class Graph<
     tools?: t.GraphTools;
     clientOptions?: t.ClientOptions;
   }): (state: T, config?: RunnableConfig) => Promise<Partial<T>>;
-  abstract createWorkflow(agentInputs: t.AgentInputs): t.CompiledWorkflow<T>;
   lastToken?: string;
   tokenTypeSwitch?: 'reasoning' | 'content';
   reasoningKey: 'reasoning_content' | 'reasoning' = 'reasoning_content';
@@ -310,7 +318,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
   }
 
   /* Graph */
-
   createGraphState(): t.GraphStateChannels<t.BaseGraphState> {
     return {
       messages: {
@@ -326,17 +333,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
       },
     };
   }
-  createAgentState(
-    systemMessage?: SystemMessage
-  ): t.GraphStateChannels<t.BaseGraphState> {
+  createAgentState(): t.GraphStateChannels<t.BaseGraphState> {
     return {
       messages: {
         value: (x: BaseMessage[], y: BaseMessage[]): BaseMessage[] => {
           if (!x.length) {
-            if (systemMessage) {
-              x.push(systemMessage);
-            }
-
             this.startIndex = x.length + y.length;
           }
           const current = x.concat(y);
@@ -348,7 +349,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
     };
   }
 
-  createSystemMessage({
+  createSystemRunnable({
     provider,
     clientOptions,
     instructions,
@@ -358,7 +359,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
     clientOptions?: t.ClientOptions;
     instructions?: string;
     additional_instructions?: string;
-  }): SystemMessage | undefined {
+  }): t.SystemRunnable | undefined {
     let finalInstructions: string | BaseMessageFields | undefined =
       instructions;
     if (additional_instructions != null && additional_instructions !== '') {
@@ -390,7 +391,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
     }
 
     if (finalInstructions != null && finalInstructions !== '') {
-      return new SystemMessage(finalInstructions);
+      const systemMessage = new SystemMessage(finalInstructions);
+      return RunnableLambda.from((messages: BaseMessage[]) => {
+        return [systemMessage, ...messages];
+      }).withConfig({ runName: 'prompt' });
     }
   }
 
@@ -721,6 +725,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
     };
   }
 
+  // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
   createAgentNode({
     tools,
     toolMap,
@@ -741,7 +746,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
     maxContextTokens?: number;
     clientOptions?: t.ClientOptions;
     additional_instructions?: string;
-  }): t.CompiledWorkflow<t.BaseGraphState> {
+  }) {
     const routeMessage = (
       state: t.BaseGraphState,
       config?: RunnableConfig
@@ -750,24 +755,31 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
       return toolsCondition(state, this.invokedToolIds);
     };
 
-    const systemMessage = this.createSystemMessage({
+    const systemRunnable = this.createSystemRunnable({
       provider,
       instructions,
       clientOptions,
       additional_instructions,
     });
 
-    const agentState = this.createAgentState(systemMessage);
-
-    const currentModel = this.initializeModel({
+    let currentModel = this.initializeModel({
       tools,
       provider,
       clientOptions,
     });
 
-    const workflow = new StateGraph<t.BaseGraphState>({
-      channels: agentState,
-    })
+    if (systemRunnable) {
+      currentModel = systemRunnable.pipe(currentModel);
+    }
+
+    const StateAnnotation = Annotation.Root({
+      messages: Annotation<BaseMessage[]>({
+        reducer: messagesStateReducer,
+        default: () => [],
+      }),
+    });
+
+    const workflow = new StateGraph(StateAnnotation)
       .addNode(
         AGENT,
         this.createCallModel({
@@ -794,15 +806,20 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
     return workflow.compile(this.compileOptions as unknown as never);
   }
 
-  createWorkflow(
-    agentInputs: t.AgentInputs
-  ): t.CompiledWorkflow<t.BaseGraphState> {
+  // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
+  createWorkflow(agentInputs: t.AgentInputs) {
     const agentNode = this.createAgentNode(agentInputs);
-    const graphState = this.createGraphState();
-
-    const workflow = new StateGraph<t.BaseGraphState>({
-      channels: graphState,
-    })
+    const StateAnnotation = Annotation.Root({
+      messages: Annotation<BaseMessage[]>({
+        reducer: (...args) => {
+          const result = messagesStateReducer(...args);
+          this.messages = result;
+          return result;
+        },
+        default: () => [],
+      }),
+    });
+    const workflow = new StateGraph(StateAnnotation)
       .addNode('000', agentNode, { ends: [END] })
       .addEdge(START, '000')
       .compile();

@@ -6,8 +6,8 @@ import type * as t from '@/types';
 export const llmConfigs: Record<string, t.LLMConfig | undefined> = {
   [Providers.OPENAI]: {
     provider: Providers.OPENAI,
-    model: 'gpt-4.1',
-    temperature: 0.7,
+    model: 'gpt-5-mini',
+    // temperature: 0.7,
     streaming: true,
     streamUsage: true,
     // disableStreaming: true,
@@ -32,7 +32,7 @@ export const llmConfigs: Record<string, t.LLMConfig | undefined> = {
     provider: Providers.OPENROUTER,
     streaming: true,
     streamUsage: true,
-    model: 'deepseek/deepseek-r1',
+    model: 'openai/gpt-4.1',
     openAIApiKey: process.env.OPENROUTER_API_KEY,
     configuration: {
       baseURL: process.env.OPENROUTER_BASE_URL,

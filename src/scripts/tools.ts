@@ -61,8 +61,8 @@ async function testStandardStreaming(): Promise<void> {
         event: GraphEvents.ON_MESSAGE_DELTA,
         data: t.StreamEventData
       ): void => {
-        console.log('====== ON_MESSAGE_DELTA ======');
-        console.dir(data, { depth: null });
+        // console.log('====== ON_MESSAGE_DELTA ======');
+        // console.dir(data, { depth: null });
         aggregateContent({ event, data: data as t.MessageDeltaEvent });
       },
     },
@@ -117,7 +117,6 @@ async function testStandardStreaming(): Promise<void> {
 
   const userMessage = `
   Make a search for the weather in ${location} today, which is ${currentDate}.
-  Before making the search, please let me know what you're about to do, then immediately start searching without hesitation.
   Make sure to always refer to me by name, which is ${userName}.
   After giving me a thorough summary, tell me a joke about the weather forecast we went over.
   `;
@@ -133,7 +132,7 @@ async function testStandardStreaming(): Promise<void> {
     conversationHistory.push(...finalMessages);
     console.dir(conversationHistory, { depth: null });
   }
-  // console.dir(finalContentParts, { depth: null });
+  console.dir(finalContentParts, { depth: null });
   console.log('\n\n====================\n\n');
   // console.dir(contentParts, { depth: null });
 }

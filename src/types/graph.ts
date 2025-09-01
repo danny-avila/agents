@@ -1,14 +1,18 @@
 // src/types/graph.ts
 import type {
-  StateGraphArgs,
   StateGraph,
+  StateGraphArgs,
   CompiledStateGraph,
 } from '@langchain/langgraph';
 import type { BindToolsInput } from '@langchain/core/language_models/chat_models';
-import type { BaseMessage, AIMessageChunk } from '@langchain/core/messages';
+import type {
+  BaseMessage,
+  AIMessageChunk,
+  SystemMessage,
+} from '@langchain/core/messages';
+import type { RunnableConfig, Runnable } from '@langchain/core/runnables';
 import type { ChatGenerationChunk } from '@langchain/core/outputs';
 import type { GoogleAIToolType } from '@langchain/google-common';
-import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ToolMap, ToolEndEvent, GenericTool } from '@/types/tools';
 import type { ClientOptions } from '@/types/llm';
 import type { Providers } from '@/common';
@@ -63,6 +67,14 @@ export type CompiledWorkflow<
   U extends Partial<T> = Partial<T>,
   N extends string = string,
 > = CompiledStateGraph<T, U, N>;
+
+export type SystemRunnable =
+  | Runnable<
+      BaseMessage[],
+      (BaseMessage | SystemMessage)[],
+      RunnableConfig<Record<string, unknown>>
+    >
+  | undefined;
 
 /**
  * Optional compile options passed to workflow.compile().
