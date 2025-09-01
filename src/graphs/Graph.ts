@@ -7,25 +7,25 @@ import { ChatVertexAI } from '@langchain/google-vertexai';
 import { START, END, StateGraph } from '@langchain/langgraph';
 import { Runnable, RunnableConfig } from '@langchain/core/runnables';
 import {
-  AIMessageChunk,
   ToolMessage,
   SystemMessage,
+  AIMessageChunk,
 } from '@langchain/core/messages';
 import type {
-  BaseMessage,
   BaseMessageFields,
   UsageMetadata,
+  BaseMessage,
 } from '@langchain/core/messages';
+import type { ToolCall } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
 import {
-  Providers,
-  GraphEvents,
   GraphNodeKeys,
+  ContentTypes,
+  GraphEvents,
+  Providers,
   StepTypes,
   Callback,
-  ContentTypes,
 } from '@/common';
-import type { ToolCall } from '@langchain/core/messages/tool';
 import { getChatModelClass, manualToolStreamProviders } from '@/llm/providers';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
 import {
@@ -50,7 +50,7 @@ import { HandlerRegistry } from '@/events';
 const { AGENT, TOOLS } = GraphNodeKeys;
 
 /** Interface for bound model with stream and invoke methods */
-interface BoundModel {
+interface ChatModel {
   stream?: (
     messages: BaseMessage[],
     config?: RunnableConfig
@@ -86,8 +86,22 @@ export abstract class Graph<
 > {
   abstract resetValues(): void;
   abstract createGraphState(): t.GraphStateChannels<T>;
-  abstract initializeTools(): CustomToolNode<T> | ToolNode<T>;
-  abstract initializeModel(): Runnable;
+  abstract initializeTools({
+    currentTools,
+    currentToolMap,
+  }: {
+    currentTools?: t.GraphTools;
+    currentToolMap?: t.ToolMap;
+  }): CustomToolNode<T> | ToolNode<T>;
+  abstract initializeModel({
+    currentModel,
+    tools,
+    clientOptions,
+  }: {
+    currentModel?: ChatModel;
+    tools?: t.GraphTools;
+    clientOptions?: t.ClientOptions;
+  }): Runnable;
   abstract getRunMessages(): BaseMessage[] | undefined;
   abstract getContentParts(): t.MessageContentComplex[] | undefined;
   abstract generateStepId(stepKey: string): [string, number];
@@ -111,11 +125,16 @@ export abstract class Graph<
     omitOutput?: boolean
   ): void;
 
-  abstract createCallModel(): (
-    state: T,
-    config?: RunnableConfig
-  ) => Promise<Partial<T>>;
-  abstract createWorkflow(): t.CompiledWorkflow<T>;
+  abstract createCallModel({
+    currentModel,
+    tools,
+    clientOptions,
+  }: {
+    currentModel?: ChatModel;
+    tools?: t.GraphTools;
+    clientOptions?: t.ClientOptions;
+  }): (state: T, config?: RunnableConfig) => Promise<Partial<T>>;
+  abstract createWorkflow(agentInputs: t.AgentInputs): t.CompiledWorkflow<T>;
   lastToken?: string;
   tokenTypeSwitch?: 'reasoning' | 'content';
   reasoningKey: 'reasoning_content' | 'reasoning' = 'reasoning_content';
@@ -129,12 +148,7 @@ export abstract class Graph<
   stepKeyIds: Map<string, string[]> = new Map<string, string[]>();
   contentIndexMap: Map<string, number> = new Map();
   toolCallStepIds: Map<string, string> = new Map();
-  currentUsage: Partial<UsageMetadata> | undefined;
   indexTokenCountMap: Record<string, number | undefined> = {};
-  maxContextTokens: number | undefined;
-  pruneMessages?: ReturnType<typeof createPruneMessages>;
-  /** The amount of time that should pass before another consecutive API call */
-  streamBuffer: number | undefined;
   tokenCounter?: t.TokenCounter;
   signal?: AbortSignal;
   /** Set of invoked tool call IDs from non-message run steps completed mid-run, if any */
@@ -143,83 +157,30 @@ export abstract class Graph<
 }
 
 export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
-  private graphState: t.GraphStateChannels<t.BaseGraphState>;
-  clientOptions: t.ClientOptions;
-  boundModel?: Runnable;
+  overrideModel?: ChatModel;
   /** Optional compile options passed into workflow.compile() */
   compileOptions?: t.CompileOptions | undefined;
-  /** The last recorded timestamp that a stream API call was invoked */
-  lastStreamCall: number | undefined;
-  systemMessage: SystemMessage | undefined;
   messages: BaseMessage[] = [];
   runId: string | undefined;
-  tools?: t.GraphTools;
-  toolMap?: t.ToolMap;
   startIndex: number = 0;
-  provider: Providers;
-  toolEnd: boolean;
   signal?: AbortSignal;
 
   constructor({
+    // parent-level graph inputs
     runId,
-    tools,
     signal,
-    toolMap,
-    provider,
-    streamBuffer,
-    instructions,
+    // TODO: reasoningKey used by chat stream handler, needs to be dynamic per agent
     reasoningKey,
-    clientOptions,
-    toolEnd = false,
-    additional_instructions = '',
   }: t.StandardGraphInput) {
     super();
     this.runId = runId;
-    this.tools = tools;
     this.signal = signal;
-    this.toolEnd = toolEnd;
-    this.toolMap = toolMap;
-    this.provider = provider;
-    this.streamBuffer = streamBuffer;
-    this.clientOptions = clientOptions;
-    this.graphState = this.createGraphState();
-    this.boundModel = this.initializeModel();
+
+    // TODO, `toolEnd`, `streamBuffer`, `reasoningKey`, `systemMessage` should be agent-specific
+    // this.toolEnd = toolEnd;
+    // this.streamBuffer = streamBuffer;
     if (reasoningKey) {
       this.reasoningKey = reasoningKey;
-    }
-
-    let finalInstructions: string | BaseMessageFields | undefined =
-      instructions;
-    if (additional_instructions) {
-      finalInstructions =
-        finalInstructions != null && finalInstructions
-          ? `${finalInstructions}\n\n${additional_instructions}`
-          : additional_instructions;
-    }
-
-    if (
-      finalInstructions != null &&
-      finalInstructions &&
-      provider === Providers.ANTHROPIC &&
-      ((
-        (clientOptions as t.AnthropicClientOptions).clientOptions
-          ?.defaultHeaders as Record<string, string> | undefined
-      )?.['anthropic-beta']?.includes('prompt-caching') ??
-        false)
-    ) {
-      finalInstructions = {
-        content: [
-          {
-            type: 'text',
-            text: instructions,
-            cache_control: { type: 'ephemeral' },
-          },
-        ],
-      };
-    }
-
-    if (finalInstructions != null && finalInstructions !== '') {
-      this.systemMessage = new SystemMessage(finalInstructions);
     }
   }
 
@@ -253,9 +214,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
     this.lastToken = resetIfNotEmpty(this.lastToken, undefined);
     this.tokenTypeSwitch = resetIfNotEmpty(this.tokenTypeSwitch, undefined);
     this.indexTokenCountMap = resetIfNotEmpty(this.indexTokenCountMap, {});
-    this.currentUsage = resetIfNotEmpty(this.currentUsage, undefined);
     this.tokenCounter = resetIfNotEmpty(this.tokenCounter, undefined);
-    this.maxContextTokens = resetIfNotEmpty(this.maxContextTokens, undefined);
     this.invokedToolIds = resetIfNotEmpty(this.invokedToolIds, undefined);
   }
 
@@ -357,10 +316,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
       messages: {
         value: (x: BaseMessage[], y: BaseMessage[]): BaseMessage[] => {
           if (!x.length) {
-            if (this.systemMessage) {
-              x.push(this.systemMessage);
-            }
-
             this.startIndex = x.length + y.length;
           }
           const current = x.concat(y);
@@ -371,68 +326,146 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
       },
     };
   }
+  createAgentState(
+    systemMessage?: SystemMessage
+  ): t.GraphStateChannels<t.BaseGraphState> {
+    return {
+      messages: {
+        value: (x: BaseMessage[], y: BaseMessage[]): BaseMessage[] => {
+          if (!x.length) {
+            if (systemMessage) {
+              x.push(systemMessage);
+            }
 
-  initializeTools():
-    | CustomToolNode<t.BaseGraphState>
-    | ToolNode<t.BaseGraphState> {
+            this.startIndex = x.length + y.length;
+          }
+          const current = x.concat(y);
+          // this.messages = current;
+          return current;
+        },
+        default: () => [],
+      },
+    };
+  }
+
+  createSystemMessage({
+    provider,
+    clientOptions,
+    instructions,
+    additional_instructions,
+  }: {
+    provider?: Providers;
+    clientOptions?: t.ClientOptions;
+    instructions?: string;
+    additional_instructions?: string;
+  }): SystemMessage | undefined {
+    let finalInstructions: string | BaseMessageFields | undefined =
+      instructions;
+    if (additional_instructions != null && additional_instructions !== '') {
+      finalInstructions =
+        finalInstructions != null && finalInstructions
+          ? `${finalInstructions}\n\n${additional_instructions}`
+          : additional_instructions;
+    }
+
+    if (
+      finalInstructions != null &&
+      finalInstructions &&
+      provider === Providers.ANTHROPIC &&
+      ((
+        (clientOptions as t.AnthropicClientOptions).clientOptions
+          ?.defaultHeaders as Record<string, string> | undefined
+      )?.['anthropic-beta']?.includes('prompt-caching') ??
+        false)
+    ) {
+      finalInstructions = {
+        content: [
+          {
+            type: 'text',
+            text: instructions,
+            cache_control: { type: 'ephemeral' },
+          },
+        ],
+      };
+    }
+
+    if (finalInstructions != null && finalInstructions !== '') {
+      return new SystemMessage(finalInstructions);
+    }
+  }
+
+  initializeTools({
+    currentTools,
+    currentToolMap,
+  }: {
+    currentTools?: t.GraphTools;
+    currentToolMap?: t.ToolMap;
+  }): CustomToolNode<t.BaseGraphState> | ToolNode<t.BaseGraphState> {
     // return new ToolNode<t.BaseGraphState>(this.tools);
     return new CustomToolNode<t.BaseGraphState>({
-      tools: (this.tools as t.GenericTool[] | undefined) || [],
-      toolMap: this.toolMap,
+      tools: (currentTools as t.GenericTool[] | undefined) ?? [],
+      toolMap: currentToolMap,
       toolCallStepIds: this.toolCallStepIds,
       errorHandler: (data, metadata) =>
         StandardGraph.handleToolCallErrorStatic(this, data, metadata),
     });
   }
 
-  initializeModel(): Runnable {
-    const ChatModelClass = getChatModelClass(this.provider);
-    const model = new ChatModelClass(this.clientOptions);
+  initializeModel({
+    provider,
+    tools,
+    clientOptions,
+  }: {
+    provider: Providers;
+    tools?: t.GraphTools;
+    clientOptions?: t.ClientOptions;
+  }): Runnable {
+    const ChatModelClass = getChatModelClass(provider);
+    const model = new ChatModelClass(clientOptions ?? {});
 
     if (
-      isOpenAILike(this.provider) &&
+      isOpenAILike(provider) &&
       (model instanceof ChatOpenAI || model instanceof AzureChatOpenAI)
     ) {
-      model.temperature = (this.clientOptions as t.OpenAIClientOptions)
+      model.temperature = (clientOptions as t.OpenAIClientOptions)
         .temperature as number;
-      model.topP = (this.clientOptions as t.OpenAIClientOptions).topP as number;
-      model.frequencyPenalty = (this.clientOptions as t.OpenAIClientOptions)
+      model.topP = (clientOptions as t.OpenAIClientOptions).topP as number;
+      model.frequencyPenalty = (clientOptions as t.OpenAIClientOptions)
         .frequencyPenalty as number;
-      model.presencePenalty = (this.clientOptions as t.OpenAIClientOptions)
+      model.presencePenalty = (clientOptions as t.OpenAIClientOptions)
         .presencePenalty as number;
-      model.n = (this.clientOptions as t.OpenAIClientOptions).n as number;
+      model.n = (clientOptions as t.OpenAIClientOptions).n as number;
     } else if (
-      this.provider === Providers.VERTEXAI &&
+      provider === Providers.VERTEXAI &&
       model instanceof ChatVertexAI
     ) {
-      model.temperature = (this.clientOptions as t.VertexAIClientOptions)
+      model.temperature = (clientOptions as t.VertexAIClientOptions)
         .temperature as number;
-      model.topP = (this.clientOptions as t.VertexAIClientOptions)
-        .topP as number;
-      model.topK = (this.clientOptions as t.VertexAIClientOptions)
-        .topK as number;
-      model.topLogprobs = (this.clientOptions as t.VertexAIClientOptions)
+      model.topP = (clientOptions as t.VertexAIClientOptions).topP as number;
+      model.topK = (clientOptions as t.VertexAIClientOptions).topK as number;
+      model.topLogprobs = (clientOptions as t.VertexAIClientOptions)
         .topLogprobs as number;
-      model.frequencyPenalty = (this.clientOptions as t.VertexAIClientOptions)
+      model.frequencyPenalty = (clientOptions as t.VertexAIClientOptions)
         .frequencyPenalty as number;
-      model.presencePenalty = (this.clientOptions as t.VertexAIClientOptions)
+      model.presencePenalty = (clientOptions as t.VertexAIClientOptions)
         .presencePenalty as number;
-      model.maxOutputTokens = (this.clientOptions as t.VertexAIClientOptions)
+      model.maxOutputTokens = (clientOptions as t.VertexAIClientOptions)
         .maxOutputTokens as number;
     }
 
-    if (!this.tools || this.tools.length === 0) {
+    if (!tools || tools.length === 0) {
       return model as unknown as Runnable;
     }
 
-    return (model as t.ModelWithTools).bindTools(this.tools);
+    return (model as t.ModelWithTools).bindTools(tools);
   }
+
   overrideTestModel(
     responses: string[],
     sleep?: number,
     toolCalls?: ToolCall[]
   ): void {
-    this.boundModel = createFakeStreamingLLM({
+    this.overrideModel = createFakeStreamingLLM({
       responses,
       sleep,
       toolCalls,
@@ -442,50 +475,48 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
   getNewModel({
     provider,
     clientOptions,
-    omitOptions,
   }: {
     provider: Providers;
     clientOptions?: t.ClientOptions;
-    omitOptions?: Set<string>;
   }): t.ChatModelInstance {
     const ChatModelClass = getChatModelClass(provider);
-    const options =
-      omitOptions && clientOptions == null
-        ? Object.assign(
-          Object.fromEntries(
-            Object.entries(this.clientOptions).filter(
-              ([key]) => !omitOptions.has(key)
-            )
-          ),
-          clientOptions
-        )
-        : (clientOptions ?? this.clientOptions);
-    return new ChatModelClass(options);
+    return new ChatModelClass(clientOptions ?? {});
   }
 
-  storeUsageMetadata(finalMessage?: BaseMessage): void {
+  getUsageMetadata(
+    finalMessage?: BaseMessage
+  ): Partial<UsageMetadata> | undefined {
     if (
       finalMessage &&
       'usage_metadata' in finalMessage &&
       finalMessage.usage_metadata != null
     ) {
-      this.currentUsage = finalMessage.usage_metadata as Partial<UsageMetadata>;
+      return finalMessage.usage_metadata as Partial<UsageMetadata>;
     }
   }
 
   /** Execute model invocation with streaming support */
   private async attemptInvoke(
-    finalMessages: BaseMessage[],
-    provider: Providers,
+    {
+      currentModel,
+      finalMessages,
+      provider,
+      tools,
+    }: {
+      currentModel?: ChatModel;
+      finalMessages: BaseMessage[];
+      provider: Providers;
+      tools?: t.GraphTools;
+    },
     config?: RunnableConfig
   ): Promise<Partial<t.BaseGraphState>> {
-    const bound = this.boundModel as BoundModel | undefined;
+    const bound = this.overrideModel ?? currentModel;
+    if (!bound) {
+      throw new Error('No model found');
+    }
 
-    if (
-      (this.tools?.length ?? 0) > 0 &&
-      manualToolStreamProviders.has(provider)
-    ) {
-      if (!bound?.stream) {
+    if ((tools?.length ?? 0) > 0 && manualToolStreamProviders.has(provider)) {
+      if (!bound.stream) {
         throw new Error('Model does not support stream');
       }
       const stream = await bound.stream(finalMessages, config);
@@ -498,12 +529,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
         );
         finalChunk = finalChunk ? concat(finalChunk, chunk) : chunk;
       }
-      finalChunk = modifyDeltaProperties(this.provider, finalChunk);
+      finalChunk = modifyDeltaProperties(provider, finalChunk);
       return { messages: [finalChunk as AIMessageChunk] };
     } else {
-      if (!bound?.invoke) {
-        throw new Error('Model does not support invoke');
-      }
       const finalMessage = await bound.invoke(finalMessages, config);
       if ((finalMessage.tool_calls?.length ?? 0) > 0) {
         finalMessage.tool_calls = finalMessage.tool_calls?.filter(
@@ -514,14 +542,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
     }
   }
 
-  cleanupSignalListener(): void {
+  cleanupSignalListener(currentModel?: ChatModel): void {
     if (!this.signal) {
       return;
     }
-    if (!this.boundModel) {
+    const model = this.overrideModel ?? currentModel;
+    if (!model) {
       return;
     }
-    const client = (this.boundModel as ChatOpenAI | undefined)?.exposedClient;
+    const client = (model as ChatOpenAI | undefined)?.exposedClient;
     if (!client?.abortHandler) {
       return;
     }
@@ -529,18 +558,34 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
     client.abortHandler = undefined;
   }
 
-  createCallModel() {
+  createCallModel({
+    tools,
+    provider,
+    currentModel,
+    streamBuffer,
+    clientOptions,
+    maxContextTokens,
+  }: {
+    provider: Providers;
+    streamBuffer?: number;
+    tools?: t.GraphTools;
+    currentModel?: ChatModel;
+    maxContextTokens?: number;
+    clientOptions?: t.ClientOptions;
+  }) {
+    let lastStreamCall: number | undefined;
+    let currentUsage: Partial<UsageMetadata> | undefined;
+    let pruneMessages: ReturnType<typeof createPruneMessages> | undefined;
     return async (
       state: t.BaseGraphState,
       config?: RunnableConfig
     ): Promise<Partial<t.BaseGraphState>> => {
-      const { provider = '' } =
-        (config?.configurable as t.GraphConfig | undefined) ?? {};
-      if (this.boundModel == null) {
+      const model = this.overrideModel ?? currentModel;
+      if (!model) {
         throw new Error('No Graph model found');
       }
-      if (!config || !provider) {
-        throw new Error(`No ${config ? 'provider' : 'config'} provided`);
+      if (!config) {
+        throw new Error('No config provided');
       }
       if (!config.signal) {
         config.signal = this.signal;
@@ -550,32 +595,31 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
 
       let messagesToUse = messages;
       if (
-        !this.pruneMessages &&
+        !pruneMessages &&
         this.tokenCounter &&
-        this.maxContextTokens != null &&
+        maxContextTokens != null &&
         this.indexTokenCountMap[0] != null
       ) {
         const isAnthropicWithThinking =
-          (this.provider === Providers.ANTHROPIC &&
-            (this.clientOptions as t.AnthropicClientOptions).thinking !=
-              null) ||
-          (this.provider === Providers.BEDROCK &&
-            (this.clientOptions as t.BedrockAnthropicInput)
+          (provider === Providers.ANTHROPIC &&
+            (clientOptions as t.AnthropicClientOptions).thinking != null) ||
+          (provider === Providers.BEDROCK &&
+            (clientOptions as t.BedrockAnthropicInput)
               .additionalModelRequestFields?.['thinking'] != null);
 
-        this.pruneMessages = createPruneMessages({
-          provider: this.provider,
-          indexTokenCountMap: this.indexTokenCountMap,
-          maxTokens: this.maxContextTokens,
-          tokenCounter: this.tokenCounter,
+        pruneMessages = createPruneMessages({
+          provider,
+          maxTokens: maxContextTokens,
           startIndex: this.startIndex,
+          tokenCounter: this.tokenCounter,
           thinkingEnabled: isAnthropicWithThinking,
+          indexTokenCountMap: this.indexTokenCountMap,
         });
       }
-      if (this.pruneMessages) {
-        const { context, indexTokenCountMap } = this.pruneMessages({
+      if (pruneMessages) {
+        const { context, indexTokenCountMap } = pruneMessages({
           messages,
-          usageMetadata: this.currentUsage,
+          usageMetadata: currentUsage,
           // startOnMessageType: 'human',
         });
         this.indexTokenCountMap = indexTokenCountMap;
@@ -612,41 +656,48 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
         formatArtifactPayload(finalMessages);
       }
 
-      if (this.lastStreamCall != null && this.streamBuffer != null) {
-        const timeSinceLastCall = Date.now() - this.lastStreamCall;
-        if (timeSinceLastCall < this.streamBuffer) {
+      if (lastStreamCall != null && streamBuffer != null) {
+        const timeSinceLastCall = Date.now() - lastStreamCall;
+        if (timeSinceLastCall < streamBuffer) {
           const timeToWait =
-            Math.ceil((this.streamBuffer - timeSinceLastCall) / 1000) * 1000;
+            Math.ceil((streamBuffer - timeSinceLastCall) / 1000) * 1000;
           await sleep(timeToWait);
         }
       }
 
-      this.lastStreamCall = Date.now();
+      lastStreamCall = Date.now();
 
       let result: Partial<t.BaseGraphState> | undefined;
       const fallbacks =
-        (this.clientOptions as t.LLMConfig | undefined)?.fallbacks ?? [];
+        (clientOptions as t.LLMConfig | undefined)?.fallbacks ?? [];
       try {
         result = await this.attemptInvoke(
-          finalMessages,
-          provider as Providers,
+          {
+            currentModel: model,
+            finalMessages,
+            provider,
+            tools,
+          },
           config
         );
       } catch (primaryError) {
         let lastError: unknown = primaryError;
         for (const fb of fallbacks) {
           try {
-            const model = this.getNewModel({
+            let model = this.getNewModel({
               provider: fb.provider,
               clientOptions: fb.clientOptions,
             });
-            this.boundModel =
-              !this.tools || this.tools.length === 0
-                ? model
-                : (model as t.ModelWithTools).bindTools(this.tools);
+            model = (
+              !tools || tools.length === 0 ? model : model.bindTools(tools)
+            ) as t.ChatModelInstance;
             result = await this.attemptInvoke(
-              finalMessages,
-              fb.provider,
+              {
+                currentModel: model,
+                finalMessages,
+                provider: fb.provider,
+                tools,
+              },
               config
             );
             lastError = undefined;
@@ -664,13 +715,33 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
       if (!result) {
         throw new Error('No result after model invocation');
       }
-      this.storeUsageMetadata(result.messages?.[0]);
+      currentUsage = this.getUsageMetadata(result.messages?.[0]);
       this.cleanupSignalListener();
       return result;
     };
   }
 
-  createWorkflow(): t.CompiledWorkflow<t.BaseGraphState> {
+  createAgentNode({
+    tools,
+    toolMap,
+    provider,
+    toolEnd,
+    streamBuffer,
+    instructions,
+    clientOptions,
+    maxContextTokens,
+    additional_instructions,
+  }: {
+    toolEnd?: boolean;
+    provider: Providers;
+    toolMap?: t.ToolMap;
+    instructions?: string;
+    streamBuffer?: number;
+    tools?: t.GraphTools;
+    maxContextTokens?: number;
+    clientOptions?: t.ClientOptions;
+    additional_instructions?: string;
+  }): t.CompiledWorkflow<t.BaseGraphState> {
     const routeMessage = (
       state: t.BaseGraphState,
       config?: RunnableConfig
@@ -679,17 +750,64 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
       return toolsCondition(state, this.invokedToolIds);
     };
 
+    const systemMessage = this.createSystemMessage({
+      provider,
+      instructions,
+      clientOptions,
+      additional_instructions,
+    });
+
+    const agentState = this.createAgentState(systemMessage);
+
+    const currentModel = this.initializeModel({
+      tools,
+      provider,
+      clientOptions,
+    });
+
     const workflow = new StateGraph<t.BaseGraphState>({
-      channels: this.graphState,
+      channels: agentState,
     })
-      .addNode(AGENT, this.createCallModel())
-      .addNode(TOOLS, this.initializeTools())
+      .addNode(
+        AGENT,
+        this.createCallModel({
+          tools,
+          provider,
+          currentModel,
+          streamBuffer,
+          clientOptions,
+          maxContextTokens,
+        })
+      )
+      .addNode(
+        TOOLS,
+        this.initializeTools({
+          currentTools: tools,
+          currentToolMap: toolMap,
+        })
+      )
       .addEdge(START, AGENT)
       .addConditionalEdges(AGENT, routeMessage)
-      .addEdge(TOOLS, this.toolEnd ? END : AGENT);
+      .addEdge(TOOLS, toolEnd === true ? END : AGENT);
 
     // Cast to unknown to avoid tight coupling to external types; options are opt-in
     return workflow.compile(this.compileOptions as unknown as never);
+  }
+
+  createWorkflow(
+    agentInputs: t.AgentInputs
+  ): t.CompiledWorkflow<t.BaseGraphState> {
+    const agentNode = this.createAgentNode(agentInputs);
+    const graphState = this.createGraphState();
+
+    const workflow = new StateGraph<t.BaseGraphState>({
+      channels: graphState,
+    })
+      .addNode(AGENT, agentNode, { ends: [END] })
+      .addEdge(START, AGENT)
+      .compile();
+
+    return workflow;
   }
 
   /* Dispatchers */

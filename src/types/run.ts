@@ -24,7 +24,8 @@ export type BaseGraphConfig = {
 };
 export type StandardGraphConfig = BaseGraphConfig & {
   type?: 'standard';
-} & Omit<g.StandardGraphInput, 'provider' | 'clientOptions'>;
+} & Omit<g.StandardGraphInput, 'provider' | 'clientOptions'> &
+  Omit<g.AgentInputs, 'provider' | 'clientOptions'>;
 
 /* Supervised graph (opt-in) */
 export type SupervisedGraphConfig = BaseGraphConfig & {
@@ -98,11 +99,8 @@ export type TaskManagerGraphConfig = {
 
 export type RunConfig = {
   runId: string;
-  graphConfig:
-    | StandardGraphConfig
-    | SupervisedGraphConfig
-    | CollaborativeGraphConfig
-    | TaskManagerGraphConfig;
+  graphConfig: StandardGraphConfig &
+    Omit<g.AgentInputs, 'provider' | 'clientOptions'>;
   customHandlers?: Record<string, g.EventHandler>;
   returnContent?: boolean;
 };

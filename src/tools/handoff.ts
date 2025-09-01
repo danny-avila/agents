@@ -2,44 +2,50 @@
 import { z } from 'zod';
 import { tool, type DynamicStructuredTool } from '@langchain/core/tools';
 import { ToolMessage } from '@langchain/core/messages';
+import { Command, getCurrentTaskInput } from '@langchain/langgraph';
+import type { MessagesAnnotation } from '@langchain/langgraph';
+
+interface CreateHandoffToolParams {
+  agentName: string;
+  description?: string;
+}
 
 /**
- * Minimal supervised handoff tool that emits LangGraph Commands.
- *
- * Note: Current graph defines nodes: 'router', 'agent', 'tools'.
- * Returning a Command with { goto: target } will route to that node.
+ * Creates a handoff tool that properly routes to another agent using LangGraph Commands
  */
-const handoffSchema = z.object({
-  target: z.enum(['router', 'agent', 'tools']).describe('Destination node.'),
-  mode: z
-    .enum(['one_way', 'call_return', 'fan_out'])
-    .describe('Handoff mode. For now, all modes route to the target.'),
-  args: z
-    .unknown()
-    .optional()
-    .describe('Optional payload for future routing logic.'),
-});
+export function createHandoffTool({
+  agentName,
+  description,
+}: CreateHandoffToolParams): DynamicStructuredTool {
+  const toolName = `transfer_to_${agentName}`;
+  const toolDescription =
+    description ?? `Transfer control to the ${agentName} agent`;
 
-export type HandoffParams = z.infer<typeof handoffSchema>;
-
-export function createHandoffTool(): DynamicStructuredTool<
-  typeof handoffSchema
-  > {
-  return tool<typeof handoffSchema>(
-    async (params, config) => {
-      const { target, mode } = params;
-      // Emit a ToolMessage so the tool call is marked as completed; routing continues via graph edges
-      return new ToolMessage({
-        name: 'handoff',
-        content: `handoff: target=${String(target)} mode=${String(mode)}`,
+  return tool(
+    async (_, config) => {
+      const toolMessage = new ToolMessage({
+        content: `Successfully transferred to ${agentName}`,
+        name: toolName,
         tool_call_id: config.toolCall.id,
+      });
+
+      // Get current state from the graph context
+      const state = getCurrentTaskInput() as typeof MessagesAnnotation.State;
+
+      // Return a Command to navigate to the target agent
+      return new Command({
+        goto: agentName,
+        update: {
+          messages: state.messages.concat(toolMessage),
+        },
+        // Indicate we're navigating within the parent graph
+        graph: Command.PARENT,
       });
     },
     {
-      name: 'handoff',
-      description:
-        'Route control flow to another node within the supervised graph (router/agent/tools). Returns a LangGraph Command.',
-      schema: handoffSchema,
+      name: toolName,
+      schema: z.object({}),
+      description: toolDescription,
     }
   );
 }

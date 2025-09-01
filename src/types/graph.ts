@@ -197,14 +197,18 @@ export type ModelEndData =
 export type GraphTools = GenericTool[] | BindToolsInput[] | GoogleAIToolType[];
 export type StandardGraphInput = {
   runId?: string;
+  signal?: AbortSignal;
+  reasoningKey?: 'reasoning_content' | 'reasoning';
+};
+
+export interface AgentInputs {
   toolEnd?: boolean;
   toolMap?: ToolMap;
+  tools?: GraphTools;
   provider: Providers;
-  signal?: AbortSignal;
   instructions?: string;
   streamBuffer?: number;
-  clientOptions: ClientOptions;
+  maxContextTokens?: number;
+  clientOptions?: ClientOptions;
   additional_instructions?: string;
-  reasoningKey?: 'reasoning_content' | 'reasoning';
-  tools?: GraphTools;
-};
+}

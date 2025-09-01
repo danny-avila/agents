@@ -37,7 +37,7 @@ async function testStandardStreaming(): Promise<void> {
         data: t.StreamEventData
       ): void => {
         console.log('====== ON_RUN_STEP_COMPLETED ======');
-        // console.dir(data, { depth: null });
+        console.dir(data, { depth: null });
         aggregateContent({
           event,
           data: data as unknown as { result: t.ToolEndEvent },

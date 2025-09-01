@@ -1,7 +1,7 @@
 // src/run.ts
-import { zodToJsonSchema } from 'zod-to-json-schema';
+// import { zodToJsonSchema } from 'zod-to-json-schema';
 import { PromptTemplate } from '@langchain/core/prompts';
-import { SystemMessage } from '@langchain/core/messages';
+// import { SystemMessage } from '@langchain/core/messages';
 import { AzureChatOpenAI, ChatOpenAI } from '@langchain/openai';
 import type {
   BaseMessage,
@@ -11,15 +11,12 @@ import type { ClientCallbacks, SystemCallbacks } from '@/graphs/Graph';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type * as t from '@/types';
 import { GraphEvents, Providers, Callback, TitleMethod } from '@/common';
-import { manualToolStreamProviders } from '@/llm/providers';
-import { shiftIndexTokenCountMap } from '@/messages/format';
+// import { manualToolStreamProviders } from '@/llm/providers';
+// import { shiftIndexTokenCountMap } from '@/messages/format';
 import {
   createCompletionTitleRunnable,
   createTitleRunnable,
 } from '@/utils/title';
-import { CollaborativeGraph } from '@/graphs/CollaborativeGraph';
-import { TaskManagerGraph } from '@/graphs/TaskManagerGraph';
-import { SupervisedGraph } from '@/graphs/SupervisedGraph';
 import { createTokenCounter } from '@/utils/tokens';
 import { StandardGraph } from '@/graphs/Graph';
 import { HandlerRegistry } from '@/events';
@@ -72,7 +69,7 @@ export class Run<T extends t.BaseGraphState> {
       throw new Error('Graph config not provided');
     }
 
-    if (config.graphConfig.type === 'standard' || !config.graphConfig.type) {
+    if (config.graphConfig.type === 'standard') {
       this.provider = config.graphConfig.llmConfig.provider;
       this.graphRunnable = this.createStandardGraph(
         config.graphConfig
@@ -83,96 +80,6 @@ export class Run<T extends t.BaseGraphState> {
           config.graphConfig.compileOptions ?? this.Graph.compileOptions;
         this.Graph.handlerRegistry = handlerRegistry;
       }
-    } else if (config.graphConfig.type === 'supervised') {
-      const supervisedConfig = config.graphConfig as t.SupervisedGraphConfig;
-      const { llmConfig, tools = [], ...graphInput } = supervisedConfig;
-      const { provider, ...clientOptions } = llmConfig;
-
-      const supervisedGraph = new SupervisedGraph({
-        tools,
-        provider,
-        clientOptions,
-        ...(graphInput as Omit<t.SupervisedGraphConfig, 'type' | 'llmConfig'>),
-        runId: this.id,
-      });
-      supervisedGraph.compileOptions = supervisedConfig.compileOptions;
-      this.Graph = supervisedGraph;
-      this.provider = provider;
-      this.graphRunnable =
-        supervisedGraph.createWorkflow() as unknown as t.CompiledWorkflow<
-          T,
-          Partial<T>,
-          string
-        >;
-      if (this.Graph) {
-        this.Graph.handlerRegistry = handlerRegistry;
-      }
-    } else if (config.graphConfig.type === 'collaborative') {
-      const collabConfig = config.graphConfig as t.CollaborativeGraphConfig;
-      const {
-        llmConfig,
-        tools = [],
-        ...graphInput
-      } = collabConfig as unknown as t.StandardGraphConfig & {
-        members?: t.Member[];
-        supervisorConfig?: { systemPrompt?: string; llmConfig: t.LLMConfig };
-      };
-      const { provider, ...clientOptions } = llmConfig;
-
-      const collabGraph = new CollaborativeGraph({
-        tools,
-        provider,
-        clientOptions,
-        ...(graphInput as Omit<t.StandardGraphConfig, 'type' | 'llmConfig'>),
-        runId: this.id,
-      } as unknown as t.StandardGraphInput & {
-        members?: t.Member[];
-        supervisorConfig?: { systemPrompt?: string; llmConfig: t.LLMConfig };
-      });
-      this.Graph = collabGraph;
-      this.provider = provider;
-      this.graphRunnable =
-        collabGraph.createWorkflow() as unknown as t.CompiledWorkflow<
-          T,
-          Partial<T>,
-          string
-        >;
-      if (this.Graph) {
-        this.Graph.handlerRegistry = handlerRegistry;
-      }
-    } else if (config.graphConfig.type === 'taskmanager') {
-      const tmConfig = config.graphConfig as t.TaskManagerGraphConfig;
-      const {
-        llmConfig,
-        tools = [],
-        ...graphInput
-      } = tmConfig as unknown as t.StandardGraphConfig & {
-        members?: t.Member[];
-        supervisorConfig?: { systemPrompt?: string; llmConfig: t.LLMConfig };
-      };
-      const { provider, ...clientOptions } = llmConfig;
-
-      const tmGraph = new TaskManagerGraph({
-        tools,
-        provider,
-        clientOptions,
-        ...(graphInput as Omit<t.StandardGraphConfig, 'type' | 'llmConfig'>),
-        runId: this.id,
-      } as unknown as t.StandardGraphInput & {
-        members?: t.Member[];
-        supervisorConfig?: { systemPrompt?: string; llmConfig: t.LLMConfig };
-      });
-      this.Graph = tmGraph;
-      this.provider = provider;
-      this.graphRunnable =
-        tmGraph.createWorkflow() as unknown as t.CompiledWorkflow<
-          T,
-          Partial<T>,
-          string
-        >;
-      if (this.Graph) {
-        this.Graph.handlerRegistry = handlerRegistry;
-      }
     }
 
     this.returnContent = config.returnContent ?? false;
@@ -181,14 +88,18 @@ export class Run<T extends t.BaseGraphState> {
   private createStandardGraph(
     config: t.StandardGraphConfig
   ): t.CompiledWorkflow<t.IState, Partial<t.IState>, string> {
-    const { llmConfig, tools = [], ...graphInput } = config;
+    const {
+      llmConfig,
+      signal,
+      reasoningKey,
+      tools = [],
+      ...agentInputs
+    } = config;
     const { provider, ...clientOptions } = llmConfig;
 
     const standardGraph = new StandardGraph({
-      tools,
-      provider,
-      clientOptions,
-      ...graphInput,
+      signal,
+      reasoningKey,
       runId: this.id,
     });
     // propagate compile options from graph config
@@ -196,7 +107,12 @@ export class Run<T extends t.BaseGraphState> {
       config as t.StandardGraphConfig
     ).compileOptions;
     this.Graph = standardGraph;
-    return standardGraph.createWorkflow();
+    return standardGraph.createWorkflow({
+      tools,
+      ...agentInputs,
+      provider,
+      clientOptions,
+    });
   }
 
   static async create<T extends t.BaseGraphState>(
@@ -231,8 +147,8 @@ export class Run<T extends t.BaseGraphState> {
     }
 
     this.Graph.resetValues(streamOptions?.keepContent);
-    const provider = this.Graph.provider as Providers | undefined;
-    const hasTools = this.Graph.tools ? this.Graph.tools.length > 0 : false;
+    // const provider = this.Graph.provider as Providers | undefined;
+    // const hasTools = this.Graph.tools ? this.Graph.tools.length > 0 : false;
     if (streamOptions?.callbacks) {
       /* TODO: conflicts with callback manager */
       const callbacks = (config.callbacks as t.ProvidedCallbacks) ?? [];
@@ -250,42 +166,42 @@ export class Run<T extends t.BaseGraphState> {
       (streamOptions?.indexTokenCountMap
         ? await createTokenCounter()
         : undefined);
-    const tools = this.Graph.tools as
-      | Array<t.GenericTool | undefined>
-      | undefined;
-    const toolTokens = tokenCounter
-      ? (tools?.reduce((acc, tool) => {
-        if (!(tool as Partial<t.GenericTool>).schema) {
-          return acc;
-        }
+    // const tools = this.Graph.tools as
+    //   | Array<t.GenericTool | undefined>
+    //   | undefined;
+    // const toolTokens = tokenCounter
+    //   ? (tools?.reduce((acc, tool) => {
+    //     if (!(tool as Partial<t.GenericTool>).schema) {
+    //       return acc;
+    //     }
 
-        const jsonSchema = zodToJsonSchema(
-          (tool?.schema as t.ZodObjectAny).describe(tool?.description ?? ''),
-          tool?.name ?? ''
-        );
-        return (
-          acc + tokenCounter(new SystemMessage(JSON.stringify(jsonSchema)))
-        );
-      }, 0) ?? 0)
-      : 0;
-    let instructionTokens = toolTokens;
-    if (this.Graph.systemMessage && tokenCounter) {
-      instructionTokens += tokenCounter(this.Graph.systemMessage);
-    }
-    const tokenMap = streamOptions?.indexTokenCountMap ?? {};
-    if (this.Graph.systemMessage && instructionTokens > 0) {
-      this.Graph.indexTokenCountMap = shiftIndexTokenCountMap(
-        tokenMap,
-        instructionTokens
-      );
-    } else if (instructionTokens > 0) {
-      tokenMap[0] = tokenMap[0] + instructionTokens;
-      this.Graph.indexTokenCountMap = tokenMap;
-    } else {
-      this.Graph.indexTokenCountMap = tokenMap;
-    }
+    //     const jsonSchema = zodToJsonSchema(
+    //       (tool?.schema as t.ZodObjectAny).describe(tool?.description ?? ''),
+    //       tool?.name ?? ''
+    //     );
+    //     return (
+    //       acc + tokenCounter(new SystemMessage(JSON.stringify(jsonSchema)))
+    //     );
+    //   }, 0) ?? 0)
+    //   : 0;
+    // let instructionTokens = toolTokens;
+    // if (this.Graph.systemMessage && tokenCounter) {
+    //   instructionTokens += tokenCounter(this.Graph.systemMessage);
+    // }
+    // const tokenMap = streamOptions?.indexTokenCountMap ?? {};
+    // if (this.Graph.systemMessage && instructionTokens > 0) {
+    //   this.Graph.indexTokenCountMap = shiftIndexTokenCountMap(
+    //     tokenMap,
+    //     instructionTokens
+    //   );
+    // } else if (instructionTokens > 0) {
+    //   tokenMap[0] = tokenMap[0] + instructionTokens;
+    //   this.Graph.indexTokenCountMap = tokenMap;
+    // } else {
+    //   this.Graph.indexTokenCountMap = tokenMap;
+    // }
 
-    this.Graph.maxContextTokens = streamOptions?.maxContextTokens;
+    // this.Graph.maxContextTokens = streamOptions?.maxContextTokens;
     this.Graph.tokenCounter = tokenCounter;
 
     config.run_id = this.id;
@@ -307,14 +223,14 @@ export class Run<T extends t.BaseGraphState> {
         eventName = name;
       }
       // Suppress CHAT_MODEL_STREAM from `info.event` when provider is in manualToolStreamProviders and tools are present
-      if (
-        info.event === GraphEvents.CHAT_MODEL_STREAM &&
-        hasTools &&
-        manualToolStreamProviders.has(provider ?? '')
-      ) {
-        /* Skipping CHAT_MODEL_STREAM event due to double-call edge case */
-        continue;
-      }
+      // if (
+      //   info.event === GraphEvents.CHAT_MODEL_STREAM &&
+      //   hasTools &&
+      //   manualToolStreamProviders.has(provider ?? '')
+      // ) {
+      //   /* Skipping CHAT_MODEL_STREAM event due to double-call edge case */
+      //   continue;
+      // }
 
       const handler = this.handlerRegistry.getHandler(eventName);
       if (handler) {
@@ -364,7 +280,6 @@ export class Run<T extends t.BaseGraphState> {
     clientOptions,
     chainOptions,
     skipLanguage,
-    omitOptions = defaultOmitOptions,
     titleMethod = TitleMethod.COMPLETION,
     titlePromptTemplate,
   }: t.RunTitleOptions): Promise<{ language?: string; title?: string }> {
@@ -382,7 +297,6 @@ export class Run<T extends t.BaseGraphState> {
     ).value;
     const model = this.Graph?.getNewModel({
       provider,
-      omitOptions,
       clientOptions,
     });
     if (!model) {
