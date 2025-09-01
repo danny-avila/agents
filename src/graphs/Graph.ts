@@ -510,16 +510,16 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
     },
     config?: RunnableConfig
   ): Promise<Partial<t.BaseGraphState>> {
-    const bound = this.overrideModel ?? currentModel;
-    if (!bound) {
+    const model = this.overrideModel ?? currentModel;
+    if (!model) {
       throw new Error('No model found');
     }
 
     if ((tools?.length ?? 0) > 0 && manualToolStreamProviders.has(provider)) {
-      if (!bound.stream) {
+      if (!model.stream) {
         throw new Error('Model does not support stream');
       }
-      const stream = await bound.stream(finalMessages, config);
+      const stream = await model.stream(finalMessages, config);
       let finalChunk: AIMessageChunk | undefined;
       for await (const chunk of stream) {
         safeDispatchCustomEvent(
@@ -532,7 +532,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
       finalChunk = modifyDeltaProperties(provider, finalChunk);
       return { messages: [finalChunk as AIMessageChunk] };
     } else {
-      const finalMessage = await bound.invoke(finalMessages, config);
+      const finalMessage = await model.invoke(finalMessages, config);
       if ((finalMessage.tool_calls?.length ?? 0) > 0) {
         finalMessage.tool_calls = finalMessage.tool_calls?.filter(
           (tool_call) => !!tool_call.name
