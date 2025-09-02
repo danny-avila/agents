@@ -29,7 +29,7 @@ async function testStandardStreaming(): Promise<void> {
         data: t.StreamEventData
       ): void => {
         console.log('====== ON_RUN_STEP_COMPLETED ======');
-        // console.dir(data, { depth: null });
+        console.dir(data, { depth: null });
         aggregateContent({
           event,
           data: data as unknown as { result: t.ToolEndEvent },
@@ -61,8 +61,8 @@ async function testStandardStreaming(): Promise<void> {
         event: GraphEvents.ON_MESSAGE_DELTA,
         data: t.StreamEventData
       ): void => {
-        // console.log('====== ON_MESSAGE_DELTA ======');
-        // console.dir(data, { depth: null });
+        console.log('====== ON_MESSAGE_DELTA ======');
+        console.dir(data, { depth: null });
         aggregateContent({ event, data: data as t.MessageDeltaEvent });
       },
     },
@@ -83,7 +83,7 @@ async function testStandardStreaming(): Promise<void> {
         metadata?: Record<string, unknown>
       ): void => {
         console.log('====== TOOL_START ======');
-        // console.dir(data, { depth: null });
+        console.dir(data, { depth: null });
       },
     },
   };

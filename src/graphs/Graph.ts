@@ -767,12 +767,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
       currentModel = agentContext.systemRunnable.pipe(currentModel);
     }
 
+    const agentNode = `${AGENT}${agentId}`;
+    const toolNode = `${TOOLS}${agentId}`;
+
     const routeMessage = (
       state: t.BaseGraphState,
       config?: RunnableConfig
     ): string => {
       this.config = config;
-      return toolsCondition(state, this.invokedToolIds);
+      return toolsCondition(state, toolNode, this.invokedToolIds);
     };
 
     const StateAnnotation = Annotation.Root({
@@ -781,9 +784,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
         default: () => [],
       }),
     });
-
-    const agentNode = `${AGENT}${agentId}`;
-    const toolNode = `${TOOLS}${agentId}`;
 
     const workflow = new StateGraph(StateAnnotation)
       .addNode(agentNode, this.createCallModel(agentId, currentModel))
