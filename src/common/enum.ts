@@ -139,6 +139,7 @@ export enum Callback {
   TOOL_ERROR = 'handleToolError',
   TOOL_START = 'handleToolStart',
   TOOL_END = 'handleToolEnd',
+  CUSTOM_EVENT = 'handleCustomEvent',
   /*
   LLM_START = 'handleLLMStart',
   LLM_NEW_TOKEN = 'handleLLMNewToken',
@@ -154,7 +155,6 @@ export enum Callback {
   RETRIEVER_START = 'handleRetrieverStart',
   RETRIEVER_END = 'handleRetrieverEnd',
   RETRIEVER_ERROR = 'handleRetrieverError',
-  CUSTOM_EVENT = 'handleCustomEvent'
   */
 }
 

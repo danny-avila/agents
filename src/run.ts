@@ -162,6 +162,43 @@ export class Run<_T extends t.BaseGraphState> {
     return this.Graph.getRunMessages();
   }
 
+  /**
+   * Creates a custom event callback handler that intercepts custom events
+   * and processes them through our handler registry instead of EventStreamCallbackHandler
+   */
+  private createCustomEventCallback() {
+    return async (
+      eventName: string,
+      data: unknown,
+      runId: string,
+      tags?: string[],
+      metadata?: Record<string, unknown>
+    ): Promise<void> => {
+      if (
+        (data as t.StreamEventData)['emitted'] === true &&
+        eventName === GraphEvents.CHAT_MODEL_STREAM
+      ) {
+        return;
+      }
+      const handler = this.handlerRegistry.getHandler(eventName);
+      if (handler && this.Graph) {
+        await handler.handle(
+          eventName,
+          data as
+            | t.StreamEventData
+            | t.ModelEndData
+            | t.RunStep
+            | t.RunStepDeltaEvent
+            | t.MessageDeltaEvent
+            | t.ReasoningDeltaEvent
+            | { result: t.ToolEndEvent },
+          metadata,
+          this.Graph
+        );
+      }
+    };
+  }
+
   async processStream(
     inputs: t.IState,
     config: Partial<RunnableConfig> & { version: 'v1' | 'v2'; run_id?: string },
@@ -180,13 +217,17 @@ export class Run<_T extends t.BaseGraphState> {
 
     this.Graph.resetValues(streamOptions?.keepContent);
 
-    if (streamOptions?.callbacks) {
-      /* TODO: conflicts with callback manager */
-      const callbacks = (config.callbacks as t.ProvidedCallbacks) ?? [];
-      config.callbacks = callbacks.concat(
-        this.getCallbacks(streamOptions.callbacks)
-      );
-    }
+    /** Custom event callback to intercept and handle custom events */
+    const customEventCallback = this.createCustomEventCallback();
+
+    const baseCallbacks = (config.callbacks as t.ProvidedCallbacks) ?? [];
+    const streamCallbacks = streamOptions?.callbacks
+      ? this.getCallbacks(streamOptions.callbacks)
+      : [];
+
+    config.callbacks = baseCallbacks.concat(streamCallbacks).concat({
+      [Callback.CUSTOM_EVENT]: customEventCallback,
+    });
 
     if (!this.id) {
       throw new Error('Run ID not provided');
@@ -202,22 +243,12 @@ export class Run<_T extends t.BaseGraphState> {
     });
 
     for await (const event of stream) {
-      const { data, name, metadata, ...info } = event;
+      const { data, metadata, ...info } = event;
 
-      let eventName: t.EventName = info.event;
-      // First normalize custom events to their named variant
-      if (eventName && eventName === GraphEvents.ON_CUSTOM_EVENT) {
-        eventName = name;
-      }
-      /**
-       * Suppress CHAT_MODEL_STREAM if custom event, meaning the provider
-       * is in `manualToolStreamProviders` and `tools` are present, which
-       * creates a double-call of the event.
-       */
-      if (
-        (data as t.StreamEventData)['emitted'] === true &&
-        eventName === GraphEvents.CHAT_MODEL_STREAM
-      ) {
+      const eventName: t.EventName = info.event;
+
+      /** Skip custom events as they're handled by our callback */
+      if (eventName === GraphEvents.ON_CUSTOM_EVENT) {
         continue;
       }
 
