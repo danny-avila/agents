@@ -89,6 +89,28 @@ export type CompiledStateWorkflow = CompiledStateGraph<
   StateDefinition
 >;
 
+export type CompiledAgentWorfklow = CompiledStateGraph<
+  {
+    messages: BaseMessage[];
+  },
+  {
+    messages?: BaseMessage[] | undefined;
+  },
+  '__start__' | `agent=${string}` | `tools=${string}`,
+  {
+    messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
+  },
+  {
+    messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
+  },
+  StateDefinition,
+  {
+    [x: `agent=${string}`]: Partial<BaseGraphState>;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    [x: `tools=${string}`]: any;
+  }
+>;
+
 export type SystemRunnable =
   | Runnable<
       BaseMessage[],

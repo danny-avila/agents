@@ -751,7 +751,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
     };
   }
 
-  createAgentNode(agentId: string): t.CompiledStateWorkflow {
+  createAgentNode(agentId: string): t.CompiledAgentWorfklow {
     const agentContext = this.agentContexts.get(agentId);
     if (!agentContext) {
       throw new Error(`Agent context not found for agentId: ${agentId}`);

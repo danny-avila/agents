@@ -232,7 +232,7 @@ export class MultiAgentGraph extends StandardGraph {
   /**
    * Create a complete agent subgraph (similar to createReactAgent)
    */
-  private createAgentSubgraph(agentId: string): t.CompiledStateWorkflow {
+  private createAgentSubgraph(agentId: string): t.CompiledAgentWorfklow {
     // This is essentially the same as createAgentNode from StandardGraph
     return this.createAgentNode(agentId);
   }
