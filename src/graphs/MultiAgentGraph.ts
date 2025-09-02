@@ -28,11 +28,7 @@ export class MultiAgentGraph extends StandardGraph {
   constructor(input: t.MultiAgentGraphInput) {
     super(input);
     this.edges = input.edges;
-
-    // Categorize edges by type
     this.categorizeEdges();
-
-    // Determine starting nodes and create handoff tools
     this.analyzeGraph();
     this.createHandoffTools();
   }
@@ -301,50 +297,74 @@ export class MultiAgentGraph extends StandardGraph {
       builder.addEdge(START, startNode);
     }
 
-    // Add direct edges for parallel execution
+    /** Add direct edges for parallel execution
+     * Group edges by destination to handle fan-in scenarios
+     */
+    const edgesByDestination = new Map<string, t.GraphEdge[]>();
+
     for (const edge of this.parallelEdges) {
-      const sources = Array.isArray(edge.from) ? edge.from : [edge.from];
       const destinations = Array.isArray(edge.to) ? edge.to : [edge.to];
+      for (const destination of destinations) {
+        if (!edgesByDestination.has(destination)) {
+          edgesByDestination.set(destination, []);
+        }
+        edgesByDestination.get(destination)!.push(edge);
+      }
+    }
 
-      // For each source, add edges to all destinations (fan-out)
-      for (const source of sources) {
-        for (const destination of destinations) {
-          if (
-            edge.promptInstructions != null &&
-            edge.promptInstructions !== ''
-          ) {
-            // Create a wrapper node that adds the prompt before the destination
-            const wrapperNodeId = `${source}_to_${destination}_prompt`;
+    for (const [destination, edges] of edgesByDestination) {
+      /** Checks if this is a fan-in scenario with prompt instructions */
+      const edgesWithPrompt = edges.filter(
+        (edge) =>
+          edge.promptInstructions != null && edge.promptInstructions !== ''
+      );
 
-            builder.addNode(wrapperNodeId, async (state: t.BaseGraphState) => {
-              let promptText: string | undefined;
+      if (edgesWithPrompt.length > 0) {
+        // Fan-in with prompt: create a single wrapper node for this destination
+        const wrapperNodeId = `fan_in_${destination}_prompt`;
 
-              if (typeof edge.promptInstructions === 'function') {
-                promptText = edge.promptInstructions(state.messages);
-              } else {
-                promptText = edge.promptInstructions;
-              }
+        // Use the first edge's prompt instructions (they should all be the same for fan-in)
+        const promptInstructions = edgesWithPrompt[0].promptInstructions;
 
-              if (promptText != null && promptText !== '') {
-                // Return state with the prompt message added
-                return {
-                  messages: [...state.messages, new HumanMessage(promptText)],
-                };
-              }
+        builder.addNode(wrapperNodeId, async (state: t.BaseGraphState) => {
+          let promptText: string | undefined;
 
-              // No prompt needed, return empty update
-              return {};
-            });
+          if (typeof promptInstructions === 'function') {
+            promptText = promptInstructions(state.messages);
+          } else {
+            promptText = promptInstructions;
+          }
 
-            // Add edges through the wrapper
+          if (promptText != null && promptText !== '') {
+            // Return state with the prompt message added
+            return {
+              messages: [...state.messages, new HumanMessage(promptText)],
+            };
+          }
+
+          // No prompt needed, return empty update
+          return {};
+        });
+
+        // Add edges from all sources to the wrapper, then wrapper to destination
+        for (const edge of edges) {
+          const sources = Array.isArray(edge.from) ? edge.from : [edge.from];
+          for (const source of sources) {
             // eslint-disable-next-line @typescript-eslint/ban-ts-comment
             /** @ts-ignore */
             builder.addEdge(source, wrapperNodeId);
-            // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-            /** @ts-ignore */
-            builder.addEdge(wrapperNodeId, destination);
-          } else {
-            // No prompt, direct edge
+          }
+        }
+
+        // Single edge from wrapper to destination
+        // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+        /** @ts-ignore */
+        builder.addEdge(wrapperNodeId, destination);
+      } else {
+        // No prompt instructions, add direct edges
+        for (const edge of edges) {
+          const sources = Array.isArray(edge.from) ? edge.from : [edge.from];
+          for (const source of sources) {
             // eslint-disable-next-line @typescript-eslint/ban-ts-comment
             /** @ts-ignore */
             builder.addEdge(source, destination);
@@ -353,26 +373,6 @@ export class MultiAgentGraph extends StandardGraph {
       }
     }
 
-    // Compile with options
     return builder.compile(this.compileOptions as unknown as never);
-  }
-
-  /**
-   * Override createGraphState to return appropriate state for multi-agent
-   */
-  override createGraphState(): t.GraphStateChannels<t.BaseGraphState> {
-    return {
-      messages: {
-        value: (x: BaseMessage[], y: BaseMessage[]): BaseMessage[] => {
-          if (!x.length) {
-            this.startIndex = x.length + y.length;
-          }
-          const current = x.concat(y);
-          this.messages = current;
-          return current;
-        },
-        default: () => [],
-      },
-    };
   }
 }
