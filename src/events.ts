@@ -1,6 +1,7 @@
 /* eslint-disable no-console */
 // src/events.ts
 import type {
+  ToolMessage,
   UsageMetadata,
   BaseMessageFields,
 } from '@langchain/core/messages';
@@ -119,7 +120,7 @@ export class ToolEndHandler implements t.EventHandler {
     graph.handleToolCallCompleted(
       { input: toolEndData.input, output: toolEndData.output },
       metadata,
-      this.omitOutput?.(toolEndData.output.name)
+      this.omitOutput?.((toolEndData.output as ToolMessage | undefined)?.name)
     );
   }
 }

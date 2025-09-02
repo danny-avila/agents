@@ -240,6 +240,18 @@ export type StandardGraphInput = {
   indexTokenCountMap?: Record<string, number>;
 };
 
+export type GraphEdge = {
+  from: string | string[]; // Support fan-in (multiple sources)
+  to: string | string[]; // Support fan-out (multiple destinations)
+  description?: string;
+  condition?: (state: BaseGraphState) => boolean | string | string[]; // Can return boolean or specific destination(s)
+  edgeType?: 'handoff' | 'parallel'; // 'handoff' creates tools for dynamic routing, 'parallel' creates direct edges for simultaneous execution
+};
+
+export type MultiAgentGraphInput = StandardGraphInput & {
+  edges: GraphEdge[];
+};
+
 export interface AgentInputs {
   agentId: string;
   toolEnd?: boolean;

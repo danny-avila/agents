@@ -7,6 +7,7 @@ import { ChatVertexAI } from '@langchain/google-vertexai';
 import {
   START,
   END,
+  Command,
   StateGraph,
   Annotation,
   messagesStateReducer,
@@ -876,7 +877,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
       return;
     }
 
-    const { input, output } = data;
+    const { input, output: _output } = data;
+    if ((_output as Command | undefined)?.lg_name === 'Command') {
+      return;
+    }
+    const output = _output as ToolMessage;
     const { tool_call_id } = output;
     const stepId = this.toolCallStepIds.get(tool_call_id) ?? '';
     if (!stepId) {

@@ -14,6 +14,7 @@ import {
   createCompletionTitleRunnable,
   createTitleRunnable,
 } from '@/utils/title';
+import { MultiAgentGraph } from '@/graphs/MultiAgentGraph';
 import { StandardGraph } from '@/graphs/Graph';
 import { HandlerRegistry } from '@/events';
 import { isOpenAILike } from '@/utils/llm';
@@ -37,7 +38,7 @@ export class Run<_T extends t.BaseGraphState> {
   private handlerRegistry: HandlerRegistry;
   private indexTokenCountMap?: Record<string, number>;
   graphRunnable?: t.CompiledStateWorkflow;
-  Graph: StandardGraph | undefined;
+  Graph: StandardGraph | MultiAgentGraph | undefined;
   returnContent: boolean = false;
 
   private constructor(config: Partial<t.RunConfig>) {
@@ -66,8 +67,14 @@ export class Run<_T extends t.BaseGraphState> {
       throw new Error('Graph config not provided');
     }
 
-    /** TEMP: use `standard` for `legacy` for now */
-    if (config.graphConfig.type === 'standard') {
+    /** Handle different graph types */
+    if (config.graphConfig.type === 'multi-agent') {
+      this.graphRunnable = this.createMultiAgentGraph(config.graphConfig);
+      if (this.Graph) {
+        this.Graph.handlerRegistry = handlerRegistry;
+      }
+    } else {
+      // Default to legacy graph for 'standard' or undefined type
       this.graphRunnable = this.createLegacyGraph(config.graphConfig);
       if (this.Graph) {
         this.Graph.compileOptions =
@@ -115,6 +122,27 @@ export class Run<_T extends t.BaseGraphState> {
     return standardGraph.createWorkflow();
   }
 
+  private createMultiAgentGraph(
+    config: t.MultiAgentGraphConfig
+  ): t.CompiledStateWorkflow {
+    const { agents, edges, compileOptions } = config;
+
+    const multiAgentGraph = new MultiAgentGraph({
+      runId: this.id,
+      agents,
+      edges,
+      tokenCounter: this.tokenCounter,
+      indexTokenCountMap: this.indexTokenCountMap,
+    });
+
+    if (compileOptions != null) {
+      multiAgentGraph.compileOptions = compileOptions;
+    }
+
+    this.Graph = multiAgentGraph;
+    return multiAgentGraph.createWorkflow();
+  }
+
   static async create<T extends t.BaseGraphState>(
     config: t.RunConfig
   ): Promise<Run<T>> {
@@ -139,7 +167,7 @@ export class Run<_T extends t.BaseGraphState> {
     config: Partial<RunnableConfig> & { version: 'v1' | 'v2'; run_id?: string },
     streamOptions?: t.EventStreamOptions
   ): Promise<MessageContentComplex[] | undefined> {
-    if (!this.graphRunnable) {
+    if (this.graphRunnable == null) {
       throw new Error(
         'Run not initialized. Make sure to use Run.create() to instantiate the Run.'
       );

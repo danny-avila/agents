@@ -97,9 +97,16 @@ export type TaskManagerGraphConfig = {
   supervisorConfig: { systemPrompt?: string; llmConfig: l.LLMConfig };
 };
 
+export type MultiAgentGraphConfig = {
+  type: 'multi-agent';
+  compileOptions?: g.CompileOptions;
+  agents: g.AgentInputs[];
+  edges: g.GraphEdge[];
+};
+
 export type RunConfig = {
   runId: string;
-  graphConfig: LegacyGraphConfig;
+  graphConfig: LegacyGraphConfig | MultiAgentGraphConfig;
   customHandlers?: Record<string, g.EventHandler>;
   returnContent?: boolean;
   tokenCounter?: TokenCounter;
