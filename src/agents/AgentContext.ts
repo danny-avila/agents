@@ -51,13 +51,12 @@ export class AgentContext {
       reasoningKey,
       toolEnd,
       instructionTokens: 0,
+      tokenCounter,
     });
 
     if (tokenCounter) {
-      agentContext.tokenCounter = tokenCounter;
       const tokenMap = indexTokenCountMap || {};
       agentContext.indexTokenCountMap = tokenMap;
-      // Store promise for token calculation to be awaited later
       agentContext.tokenCalculationPromise = agentContext
         .calculateInstructionTokens(tokenCounter)
         .then(() => {
@@ -179,7 +178,7 @@ export class AgentContext {
   }
 
   /**
-   * Create system runnable from instructions
+   * Create system runnable from instructions and calculate tokens if tokenCounter is available
    */
   private createSystemRunnable():
     | Runnable<
@@ -232,6 +231,11 @@ export class AgentContext {
 
     if (finalInstructions != null && finalInstructions !== '') {
       const systemMessage = new SystemMessage(finalInstructions);
+
+      if (this.tokenCounter) {
+        this.instructionTokens += this.tokenCounter(systemMessage);
+      }
+
       return RunnableLambda.from((messages: BaseMessage[]) => {
         return [systemMessage, ...messages];
       }).withConfig({ runName: 'prompt' });
@@ -276,14 +280,13 @@ export class AgentContext {
   }
 
   /**
-   * Calculate and update instruction tokens when tokenCounter becomes available
+   * Calculate tool tokens and add to instruction tokens
+   * Note: System message tokens are calculated during systemRunnable creation
    */
   async calculateInstructionTokens(
     tokenCounter: t.TokenCounter
   ): Promise<void> {
-    let tokens = 0;
-
-    // Count tool tokens
+    let toolTokens = 0;
     if (this.tools && this.tools.length > 0) {
       const { zodToJsonSchema } = await import('zod-to-json-schema');
 
@@ -303,37 +306,14 @@ export class AgentContext {
             describedSchema as Parameters<typeof zodToJsonSchema>[0],
             (genericTool.name as string) || ''
           );
-          tokens += tokenCounter(new SystemMessage(JSON.stringify(jsonSchema)));
+          toolTokens += tokenCounter(
+            new SystemMessage(JSON.stringify(jsonSchema))
+          );
         }
       }
     }
 
-    // Count system message tokens if systemRunnable exists
-    if (this.systemRunnable) {
-      // The system message is already included in the systemRunnable
-      // We need to extract it to count tokens
-      const systemRunnableRecord = this.systemRunnable as unknown as Record<
-        string,
-        unknown
-      >;
-      const systemRunnableConfig = systemRunnableRecord.config as
-        | Record<string, unknown>
-        | undefined;
-      if (systemRunnableConfig?.runName === 'prompt') {
-        // This is our system runnable with a system message
-        const func = systemRunnableRecord.func as
-          | ((messages: unknown[]) => unknown)
-          | undefined;
-        if (func && typeof func === 'function') {
-          // Call the function with empty messages to get the system message
-          const messages = func([]) as unknown[];
-          if (Array.isArray(messages) && messages[0] instanceof SystemMessage) {
-            tokens += tokenCounter(messages[0]);
-          }
-        }
-      }
-    }
-
-    this.instructionTokens = tokens;
+    // Add tool tokens to existing instruction tokens (which may already include system message tokens)
+    this.instructionTokens += toolTokens;
   }
 }
