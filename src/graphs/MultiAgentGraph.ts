@@ -243,7 +243,11 @@ export class MultiAgentGraph extends StandardGraph {
   override createWorkflow(): t.CompiledStateWorkflow {
     const StateAnnotation = Annotation.Root({
       messages: Annotation<BaseMessage[]>({
-        reducer: messagesStateReducer,
+        reducer: (...args) => {
+          const result = messagesStateReducer(...args);
+          this.messages = result;
+          return result;
+        },
         default: () => [],
       }),
     });
