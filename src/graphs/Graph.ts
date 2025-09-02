@@ -35,16 +35,13 @@ import {
   GraphEvents,
   Providers,
   StepTypes,
-  Callback,
 } from '@/common';
-import { getChatModelClass, manualToolStreamProviders } from '@/llm/providers';
-import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
 import {
-  createPruneMessages,
+  formatAnthropicArtifactContent,
+  convertMessagesToContent,
   modifyDeltaProperties,
   formatArtifactPayload,
-  convertMessagesToContent,
-  formatAnthropicArtifactContent,
+  createPruneMessages,
 } from '@/messages';
 import {
   resetIfNotEmpty,
@@ -53,6 +50,8 @@ import {
   joinKeys,
   sleep,
 } from '@/utils';
+import { getChatModelClass, manualToolStreamProviders } from '@/llm/providers';
+import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
 import { ChatOpenAI, AzureChatOpenAI } from '@/llm/openai';
 import { safeDispatchCustomEvent } from '@/utils/events';
 import { AgentContext } from '@/agents/AgentContext';
@@ -61,40 +60,9 @@ import { HandlerRegistry } from '@/events';
 
 const { AGENT, TOOLS } = GraphNodeKeys;
 
-/** Interface for bound model with stream and invoke methods */
-interface ChatModel {
-  stream?: (
-    messages: BaseMessage[],
-    config?: RunnableConfig
-  ) => Promise<AsyncIterable<AIMessageChunk>>;
-  invoke: (
-    messages: BaseMessage[],
-    config?: RunnableConfig
-  ) => Promise<AIMessageChunk>;
-}
-
-export type GraphNode = GraphNodeKeys | typeof START;
-export type ClientCallback<T extends unknown[]> = (
-  graph: StandardGraph,
-  ...args: T
-) => void;
-export type ClientCallbacks = {
-  [Callback.TOOL_ERROR]?: ClientCallback<[Error, string]>;
-  [Callback.TOOL_START]?: ClientCallback<unknown[]>;
-  [Callback.TOOL_END]?: ClientCallback<unknown[]>;
-};
-export type SystemCallbacks = {
-  [K in keyof ClientCallbacks]: ClientCallbacks[K] extends ClientCallback<
-    infer Args
-  >
-    ? (...args: Args) => void
-    : never;
-};
-
 export abstract class Graph<
   T extends t.BaseGraphState = t.BaseGraphState,
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  TNodeName extends string = string,
+  _TNodeName extends string = string,
 > {
   abstract resetValues(): void;
   abstract initializeTools({
@@ -109,7 +77,7 @@ export abstract class Graph<
     tools,
     clientOptions,
   }: {
-    currentModel?: ChatModel;
+    currentModel?: t.ChatModel;
     tools?: t.GraphTools;
     clientOptions?: t.ClientOptions;
   }): Runnable;
@@ -147,7 +115,7 @@ export abstract class Graph<
 
   abstract createCallModel(
     agentId?: string,
-    currentModel?: ChatModel
+    currentModel?: t.ChatModel
   ): (state: T, config?: RunnableConfig) => Promise<Partial<T>>;
   messageStepHasToolCalls: Map<string, boolean> = new Map();
   messageIdsByStepKey: Map<string, string> = new Map();
@@ -163,8 +131,8 @@ export abstract class Graph<
   handlerRegistry: HandlerRegistry | undefined;
 }
 
-export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
-  overrideModel?: ChatModel;
+export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
+  overrideModel?: t.ChatModel;
   /** Optional compile options passed into workflow.compile() */
   compileOptions?: t.CompileOptions | undefined;
   messages: BaseMessage[] = [];
@@ -202,7 +170,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
       this.agentContexts.set(agentConfig.agentId, agentContext);
     }
 
-    // Set the default agent ID to the first agent
     this.defaultAgentId = agents[0].agentId;
   }
 
@@ -230,7 +197,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
       new Map()
     );
     this.invokedToolIds = resetIfNotEmpty(this.invokedToolIds, undefined);
-    // Reset all agent contexts
     for (const context of this.agentContexts.values()) {
       context.reset();
     }
@@ -533,7 +499,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
       provider,
       tools,
     }: {
-      currentModel?: ChatModel;
+      currentModel?: t.ChatModel;
       finalMessages: BaseMessage[];
       provider: Providers;
       tools?: t.GraphTools;
@@ -565,14 +531,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
       const finalMessage = await model.invoke(finalMessages, config);
       if ((finalMessage.tool_calls?.length ?? 0) > 0) {
         finalMessage.tool_calls = finalMessage.tool_calls?.filter(
-          (tool_call) => !!tool_call.name
+          (tool_call: ToolCall) => !!tool_call.name
         );
       }
       return { messages: [finalMessage] };
     }
   }
 
-  cleanupSignalListener(currentModel?: ChatModel): void {
+  cleanupSignalListener(currentModel?: t.ChatModel): void {
     if (!this.signal) {
       return;
     }
@@ -588,7 +554,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
     client.abortHandler = undefined;
   }
 
-  createCallModel(agentId = 'default', currentModel?: ChatModel) {
+  createCallModel(agentId = 'default', currentModel?: t.ChatModel) {
     return async (
       state: t.BaseGraphState,
       config?: RunnableConfig

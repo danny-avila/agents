@@ -5,16 +5,15 @@ import type {
   BaseMessage,
   MessageContentComplex,
 } from '@langchain/core/messages';
-import type { ClientCallbacks, SystemCallbacks } from '@/graphs/Graph';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type * as t from '@/types';
-import { GraphEvents, Callback, TitleMethod } from '@/common';
-import { createTokenCounter } from '@/utils/tokens';
 import {
   createCompletionTitleRunnable,
   createTitleRunnable,
 } from '@/utils/title';
+import { GraphEvents, Callback, TitleMethod } from '@/common';
 import { MultiAgentGraph } from '@/graphs/MultiAgentGraph';
+import { createTokenCounter } from '@/utils/tokens';
 import { StandardGraph } from '@/graphs/Graph';
 import { HandlerRegistry } from '@/events';
 import { isOpenAILike } from '@/utils/llm';
@@ -263,19 +262,19 @@ export class Run<_T extends t.BaseGraphState> {
     }
   }
 
-  private createSystemCallback<K extends keyof ClientCallbacks>(
-    clientCallbacks: ClientCallbacks,
+  private createSystemCallback<K extends keyof t.ClientCallbacks>(
+    clientCallbacks: t.ClientCallbacks,
     key: K
-  ): SystemCallbacks[K] {
+  ): t.SystemCallbacks[K] {
     return ((...args: unknown[]) => {
       const clientCallback = clientCallbacks[key];
       if (clientCallback && this.Graph) {
         (clientCallback as (...args: unknown[]) => void)(this.Graph, ...args);
       }
-    }) as SystemCallbacks[K];
+    }) as t.SystemCallbacks[K];
   }
 
-  getCallbacks(clientCallbacks: ClientCallbacks): SystemCallbacks {
+  getCallbacks(clientCallbacks: t.ClientCallbacks): t.SystemCallbacks {
     return {
       [Callback.TOOL_ERROR]: this.createSystemCallback(
         clientCallbacks,

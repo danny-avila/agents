@@ -1,11 +1,12 @@
 // src/types/graph.ts
 import type {
+  START,
+  StateType,
+  UpdateType,
   StateGraph,
   StateGraphArgs,
   StateDefinition,
   CompiledStateGraph,
-  StateType,
-  UpdateType,
   BinaryOperatorAggregate,
 } from '@langchain/langgraph';
 import type { BindToolsInput } from '@langchain/core/language_models/chat_models';
@@ -18,9 +19,9 @@ import type { RunnableConfig, Runnable } from '@langchain/core/runnables';
 import type { ChatGenerationChunk } from '@langchain/core/outputs';
 import type { GoogleAIToolType } from '@langchain/google-common';
 import type { ToolMap, ToolEndEvent, GenericTool } from '@/types/tools';
+import type { Providers, Callback, GraphNodeKeys } from '@/common';
 import type { StandardGraph, MultiAgentGraph } from '@/graphs';
 import type { ClientOptions } from '@/types/llm';
-import type { Providers } from '@/common';
 import type {
   RunStep,
   RunStepDeltaEvent,
@@ -28,19 +29,44 @@ import type {
   ReasoningDeltaEvent,
 } from '@/types/stream';
 import type { TokenCounter } from '@/types/run';
-// import type { RunnableConfig } from '@langchain/core/runnables';
+
+/** Interface for bound model with stream and invoke methods */
+export interface ChatModel {
+  stream?: (
+    messages: BaseMessage[],
+    config?: RunnableConfig
+  ) => Promise<AsyncIterable<AIMessageChunk>>;
+  invoke: (
+    messages: BaseMessage[],
+    config?: RunnableConfig
+  ) => Promise<AIMessageChunk>;
+}
+
+export type GraphNode = GraphNodeKeys | typeof START;
+export type ClientCallback<T extends unknown[]> = (
+  graph: StandardGraph,
+  ...args: T
+) => void;
+
+export type ClientCallbacks = {
+  [Callback.TOOL_ERROR]?: ClientCallback<[Error, string]>;
+  [Callback.TOOL_START]?: ClientCallback<unknown[]>;
+  [Callback.TOOL_END]?: ClientCallback<unknown[]>;
+};
+
+export type SystemCallbacks = {
+  [K in keyof ClientCallbacks]: ClientCallbacks[K] extends ClientCallback<
+    infer Args
+  >
+    ? (...args: Args) => void
+    : never;
+};
 
 export type BaseGraphState = {
   messages: BaseMessage[];
-  // [key: string]: unknown;
 };
 
 export type IState = BaseGraphState;
-
-// export interface IState extends BaseGraphState {
-//   instructions?: string;
-//   additional_instructions?: string;
-// }
 
 export interface EventHandler {
   handle(
@@ -264,14 +290,19 @@ export type StandardGraphInput = {
 };
 
 export type GraphEdge = {
-  from: string | string[]; // Support fan-in (multiple sources)
-  to: string | string[]; // Support fan-out (multiple destinations)
+  /** Use a list for multiple sources */
+  from: string | string[];
+  /** Use a list for multiple destinations */
+  to: string | string[];
   description?: string;
-  condition?: (state: BaseGraphState) => boolean | string | string[]; // Can return boolean or specific destination(s)
-  edgeType?: 'handoff' | 'parallel'; // 'handoff' creates tools for dynamic routing, 'parallel' creates direct edges for simultaneous execution
+  /** Can return boolean or specific destination(s) */
+  condition?: (state: BaseGraphState) => boolean | string | string[];
+  /** 'handoff' creates tools for dynamic routing, 'parallel' creates direct edges for simultaneous execution */
+  edgeType?: 'handoff' | 'parallel';
+  /** Optional prompt to add when transitioning through this edge */
   promptInstructions?:
     | string
-    | ((messages: BaseMessage[]) => string | undefined); // Optional prompt to add when transitioning through this edge
+    | ((messages: BaseMessage[]) => string | undefined);
 };
 
 export type MultiAgentGraphInput = StandardGraphInput & {

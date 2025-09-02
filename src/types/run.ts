@@ -7,7 +7,6 @@ import type {
   BaseCallbackHandler,
   CallbackHandlerMethods,
 } from '@langchain/core/callbacks/base';
-import type * as graph from '@/graphs/Graph';
 import type * as s from '@/types/stream';
 import type * as e from '@/common/enum';
 import type * as g from '@/types/graph';
@@ -119,6 +118,6 @@ export type ProvidedCallbacks =
 
 export type TokenCounter = (message: BaseMessage) => number;
 export type EventStreamOptions = {
-  callbacks?: graph.ClientCallbacks;
+  callbacks?: g.ClientCallbacks;
   keepContent?: boolean;
 };
