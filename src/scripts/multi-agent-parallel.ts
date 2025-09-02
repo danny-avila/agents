@@ -38,9 +38,22 @@ async function testParallelMultiAgent() {
         modelName: 'claude-3-5-sonnet-latest',
         apiKey: process.env.ANTHROPIC_API_KEY,
       },
-      instructions:
-        'You are a research assistant. Break down complex topics into key areas for analysis.',
-      maxContextTokens: 28000,
+      instructions: `You are a research coordinator in a multi-agent analysis workflow. Your sole job is to:
+
+  1. Analyze the incoming request and break it down into exactly 3 distinct research areas
+  2. Create specific, actionable analysis tasks for each specialist team
+  3. Format your output as clear directives (not analysis yourself)
+  4. Keep your response under 200 words - you are NOT doing the analysis, just coordinating it
+
+  Example format:
+  "ANALYSIS COORDINATION:
+  Financial Team: [specific financial analysis task]
+  Technical Team: [specific technical analysis task] 
+  Market Team: [specific market analysis task]
+
+  Proceed with parallel analysis."
+
+  Do NOT provide any actual analysis - your job is purely coordination and task assignment.`,
     },
     {
       agentId: 'analyst1',
@@ -49,9 +62,21 @@ async function testParallelMultiAgent() {
         modelName: 'claude-3-5-sonnet-latest',
         apiKey: process.env.ANTHROPIC_API_KEY,
       },
-      instructions:
-        'You are a financial analyst. Focus on economic and financial aspects.',
-      maxContextTokens: 28000,
+      instructions: `You are a FINANCIAL AND ECONOMIC ANALYST in a parallel analysis workflow. 
+
+  CRITICAL: You must provide detailed, substantive financial analysis (minimum 300 words). Focus specifically on:
+
+  • Economic impact metrics (GDP, productivity, employment effects)
+  • Monetary policy implications and inflation considerations  
+  • Investment flows and capital market disruptions
+  • Financial sector transformation and banking impacts
+  • Government fiscal policy and tax revenue effects
+  • International trade and currency implications
+  • Risk assessment and financial stability concerns
+
+  Provide concrete data, projections, and financial reasoning. Never give empty responses, brief acknowledgments, or defer to other analysts. This is your domain expertise - deliver comprehensive financial analysis.
+
+  Start your response with "FINANCIAL ANALYSIS:" and provide detailed insights.`,
     },
     {
       agentId: 'analyst2',
@@ -60,9 +85,22 @@ async function testParallelMultiAgent() {
         modelName: 'claude-3-5-sonnet-latest',
         apiKey: process.env.ANTHROPIC_API_KEY,
       },
-      instructions:
-        'You are a technical analyst. Focus on technological and implementation aspects.',
-      maxContextTokens: 28000,
+      instructions: `You are a TECHNICAL AND IMPLEMENTATION ANALYST in a parallel analysis workflow.
+
+  CRITICAL: You must provide detailed, substantive technical analysis (minimum 300 words). Focus specifically on:
+
+  • AI infrastructure requirements and scalability challenges
+  • Computing power, data center, and energy demands
+  • Network connectivity and bandwidth requirements
+  • Technical barriers to widespread AI adoption
+  • Implementation timelines and deployment phases
+  • Skills gap analysis and workforce technical requirements
+  • Security vulnerabilities and technical risk mitigation
+  • Integration challenges with existing systems
+
+  Provide concrete technical assessments, infrastructure projections, and implementation roadmaps. Never give empty responses, brief acknowledgments, or defer to other analysts. This is your technical expertise domain.
+
+  Start your response with "TECHNICAL ANALYSIS:" and provide detailed technical insights.`,
     },
     {
       agentId: 'analyst3',
@@ -71,9 +109,22 @@ async function testParallelMultiAgent() {
         modelName: 'claude-3-5-sonnet-latest',
         apiKey: process.env.ANTHROPIC_API_KEY,
       },
-      instructions:
-        'You are a market analyst. Focus on market trends and competitive landscape.',
-      maxContextTokens: 28000,
+      instructions: `You are a MARKET AND INDUSTRY ANALYST in a parallel analysis workflow.
+
+  CRITICAL: You must provide detailed, substantive market analysis (minimum 300 words). Focus specifically on:
+
+  • Industry disruption patterns and transformation timelines
+  • Competitive landscape shifts and market consolidation
+  • Consumer adoption rates and behavior changes
+  • New business models and market opportunities
+  • Geographic market variations and regional impacts
+  • Regulatory environment and policy implications
+  • Market size projections and growth trajectories
+  • Sector-specific impacts (healthcare, finance, manufacturing, etc.)
+
+  Provide concrete market assessments, competitive analysis, and industry projections. Never give empty responses, brief acknowledgments, or defer to other analysts. This is your market expertise domain.
+
+  Start your response with "MARKET ANALYSIS:" and provide detailed market insights.`,
     },
     {
       agentId: 'summarizer',
@@ -82,9 +133,23 @@ async function testParallelMultiAgent() {
         modelName: 'claude-3-5-sonnet-latest',
         apiKey: process.env.ANTHROPIC_API_KEY,
       },
-      instructions:
-        'You are a summary expert. Synthesize insights from multiple analysts into a coherent report.',
-      maxContextTokens: 28000,
+      instructions: `You are the SYNTHESIS AND SUMMARY EXPERT in a multi-agent workflow.
+
+  Your job is to:
+  1. Receive and analyze the outputs from all three specialist analysts
+  2. Identify key themes, conflicts, and complementary insights across analyses
+  3. Synthesize findings into a coherent, comprehensive executive summary
+  4. Highlight critical interdependencies between financial, technical, and market factors
+  5. Provide integrated conclusions and strategic recommendations
+
+  Structure your summary as:
+  - EXECUTIVE SUMMARY (key findings)
+  - INTEGRATED INSIGHTS (how the three analyses connect)
+  - CRITICAL INTERDEPENDENCIES (financial-technical-market intersections)
+  - STRATEGIC RECOMMENDATIONS (actionable next steps)
+  - RISK ASSESSMENT (combined risk factors from all domains)
+
+  Minimum 400 words. Create value through integration, not just concatenation of the three analyses.`,
     },
   ];
 
@@ -156,8 +221,8 @@ async function testParallelMultiAgent() {
         event: GraphEvents.ON_MESSAGE_DELTA,
         data: t.StreamEventData
       ): void => {
-        // console.log('====== ON_MESSAGE_DELTA ======');
-        // console.dir(data, { depth: null });
+        console.log('====== ON_MESSAGE_DELTA ======');
+        console.dir(data, { depth: null });
         aggregateContent({ event, data: data as t.MessageDeltaEvent });
       },
     },
@@ -202,14 +267,16 @@ async function testParallelMultiAgent() {
     }
     console.log('=== END DEBUG ===\n');
 
-    const userMessage = `I need a comprehensive analysis of AI's impact on the global economy over the next decade. 
+    const userMessage = `EXECUTE PARALLEL ANALYSIS WORKFLOW:
 
-CRITICAL: This analysis must be conducted by ALL THREE specialist teams working in parallel:
-1. Financial analyst team - focus on monetary policy, investment flows, and economic metrics
-2. Technical analyst team - focus on AI implementation, infrastructure, and technological barriers  
-3. Market analyst team - focus on industry disruption, competitive dynamics, and consumer adoption
+Step 1: Researcher - identify 3 key analysis areas for AI economic impact
+Step 2: IMMEDIATELY send to ALL THREE analysts simultaneously:
+  - analyst1 (financial): Provide detailed economic impact analysis
+  - analyst2 (technical): Provide detailed technical implementation analysis  
+  - analyst3 (market): Provide detailed market disruption analysis
+Step 3: Summarizer - compile all three analyses
 
-Each team should provide independent analysis that will be synthesized into a final report. Do NOT provide a single unified response - delegate this work to the specialist analyst teams for parallel processing.`;
+IMPORTANT: Each analyst must produce substantive analysis (200+ words), not just acknowledgments or empty responses. This is a multi-agent workflow test requiring actual parallel execution.`;
     conversationHistory.push(new HumanMessage(userMessage));
 
     console.log('Invoking parallel multi-agent graph...\n');
