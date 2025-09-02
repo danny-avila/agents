@@ -123,18 +123,27 @@ export abstract class Graph<
   abstract checkKeyList(keyList: (string | number | undefined)[]): boolean;
   abstract getStepIdByKey(stepKey: string, index?: number): string;
   abstract getRunStep(stepId: string): t.RunStep | undefined;
-  abstract dispatchRunStep(stepKey: string, stepDetails: t.StepDetails): string;
-  abstract dispatchRunStepDelta(id: string, delta: t.ToolCallDelta): void;
-  abstract dispatchMessageDelta(id: string, delta: t.MessageDelta): void;
+  abstract dispatchRunStep(
+    stepKey: string,
+    stepDetails: t.StepDetails
+  ): Promise<string>;
+  abstract dispatchRunStepDelta(
+    id: string,
+    delta: t.ToolCallDelta
+  ): Promise<void>;
+  abstract dispatchMessageDelta(
+    id: string,
+    delta: t.MessageDelta
+  ): Promise<void>;
   abstract dispatchReasoningDelta(
     stepId: string,
     delta: t.ReasoningDelta
-  ): void;
+  ): Promise<void>;
   abstract handleToolCallCompleted(
     data: t.ToolEndData,
     metadata?: Record<string, unknown>,
     omitOutput?: boolean
-  ): void;
+  ): Promise<void>;
 
   abstract createCallModel(
     agentId?: string,
@@ -543,7 +552,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
       const stream = await model.stream(finalMessages, config);
       let finalChunk: AIMessageChunk | undefined;
       for await (const chunk of stream) {
-        safeDispatchCustomEvent(
+        await safeDispatchCustomEvent(
           GraphEvents.CHAT_MODEL_STREAM,
           { chunk, emitted: true },
           config
@@ -828,7 +837,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
   /**
    * Dispatches a run step to the client, returns the step ID
    */
-  dispatchRunStep(stepKey: string, stepDetails: t.StepDetails): string {
+  async dispatchRunStep(
+    stepKey: string,
+    stepDetails: t.StepDetails
+  ): Promise<string> {
     if (!this.config) {
       throw new Error('No config provided');
     }
@@ -860,15 +872,19 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
 
     this.contentData.push(runStep);
     this.contentIndexMap.set(stepId, runStep.index);
-    safeDispatchCustomEvent(GraphEvents.ON_RUN_STEP, runStep, this.config);
+    await safeDispatchCustomEvent(
+      GraphEvents.ON_RUN_STEP,
+      runStep,
+      this.config
+    );
     return stepId;
   }
 
-  handleToolCallCompleted(
+  async handleToolCallCompleted(
     data: t.ToolEndData,
     metadata?: Record<string, unknown>,
     omitOutput?: boolean
-  ): void {
+  ): Promise<void> {
     if (!this.config) {
       throw new Error('No config provided');
     }
@@ -907,29 +923,31 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
       progress: 1,
     };
 
-    this.handlerRegistry?.getHandler(GraphEvents.ON_RUN_STEP_COMPLETED)?.handle(
-      GraphEvents.ON_RUN_STEP_COMPLETED,
-      {
-        result: {
-          id: stepId,
-          index: runStep.index,
-          type: 'tool_call',
-          tool_call,
-        } as t.ToolCompleteEvent,
-      },
-      metadata,
-      this
-    );
+    await this.handlerRegistry
+      ?.getHandler(GraphEvents.ON_RUN_STEP_COMPLETED)
+      ?.handle(
+        GraphEvents.ON_RUN_STEP_COMPLETED,
+        {
+          result: {
+            id: stepId,
+            index: runStep.index,
+            type: 'tool_call',
+            tool_call,
+          } as t.ToolCompleteEvent,
+        },
+        metadata,
+        this
+      );
   }
   /**
    * Static version of handleToolCallError to avoid creating strong references
    * that prevent garbage collection
    */
-  static handleToolCallErrorStatic(
+  static async handleToolCallErrorStatic(
     graph: StandardGraph,
     data: t.ToolErrorData,
     metadata?: Record<string, unknown>
-  ): void {
+  ): Promise<void> {
     if (!graph.config) {
       throw new Error('No config provided');
     }
@@ -959,7 +977,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
       progress: 1,
     };
 
-    graph.handlerRegistry
+    await graph.handlerRegistry
       ?.getHandler(GraphEvents.ON_RUN_STEP_COMPLETED)
       ?.handle(
         GraphEvents.ON_RUN_STEP_COMPLETED,
@@ -980,14 +998,17 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
    * Instance method that delegates to the static method
    * Kept for backward compatibility
    */
-  handleToolCallError(
+  async handleToolCallError(
     data: t.ToolErrorData,
     metadata?: Record<string, unknown>
-  ): void {
-    StandardGraph.handleToolCallErrorStatic(this, data, metadata);
+  ): Promise<void> {
+    await StandardGraph.handleToolCallErrorStatic(this, data, metadata);
   }
 
-  dispatchRunStepDelta(id: string, delta: t.ToolCallDelta): void {
+  async dispatchRunStepDelta(
+    id: string,
+    delta: t.ToolCallDelta
+  ): Promise<void> {
     if (!this.config) {
       throw new Error('No config provided');
     } else if (!id) {
@@ -997,14 +1018,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
       id,
       delta,
     };
-    safeDispatchCustomEvent(
+    await safeDispatchCustomEvent(
       GraphEvents.ON_RUN_STEP_DELTA,
       runStepDelta,
       this.config
     );
   }
 
-  dispatchMessageDelta(id: string, delta: t.MessageDelta): void {
+  async dispatchMessageDelta(id: string, delta: t.MessageDelta): Promise<void> {
     if (!this.config) {
       throw new Error('No config provided');
     }
@@ -1012,14 +1033,17 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
       id,
       delta,
     };
-    safeDispatchCustomEvent(
+    await safeDispatchCustomEvent(
       GraphEvents.ON_MESSAGE_DELTA,
       messageDelta,
       this.config
     );
   }
 
-  dispatchReasoningDelta = (stepId: string, delta: t.ReasoningDelta): void => {
+  dispatchReasoningDelta = async (
+    stepId: string,
+    delta: t.ReasoningDelta
+  ): Promise<void> => {
     if (!this.config) {
       throw new Error('No config provided');
     }
@@ -1027,7 +1051,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
       id: stepId,
       delta,
     };
-    safeDispatchCustomEvent(
+    await safeDispatchCustomEvent(
       GraphEvents.ON_REASONING_DELTA,
       reasoningDelta,
       this.config

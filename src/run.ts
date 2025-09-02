@@ -223,7 +223,7 @@ export class Run<_T extends t.BaseGraphState> {
 
       const handler = this.handlerRegistry.getHandler(eventName);
       if (handler) {
-        handler.handle(eventName, data, metadata, this.Graph);
+        await handler.handle(eventName, data, metadata, this.Graph);
       }
     }
 

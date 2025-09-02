@@ -3,28 +3,17 @@ import { dispatchCustomEvent } from '@langchain/core/callbacks/dispatch';
 import type { RunnableConfig } from '@langchain/core/runnables';
 
 /**
- * Safely dispatches a custom event and swallows async rejections to avoid
- * unhandled promise rejections from tracer run-map mismatches.
+ * Safely dispatches a custom event and properly awaits it to avoid
+ * race conditions where events are dispatched after run cleanup.
  */
-export function safeDispatchCustomEvent(
+export async function safeDispatchCustomEvent(
   event: string,
   payload: unknown,
   config?: RunnableConfig
-): void {
+): Promise<void> {
   try {
-    const maybePromise = dispatchCustomEvent(
-      event,
-      payload,
-      config
-    ) as Promise<unknown> | void;
-    if (
-      maybePromise != null &&
-      typeof (maybePromise as Promise<unknown>).then === 'function'
-    ) {
-      void Promise.resolve(maybePromise as Promise<unknown>).catch(() => {});
-    }
+    await dispatchCustomEvent(event, payload, config);
   } catch (e) {
-    // Swallow synchronous errors as well; eventing should not break execution
     // eslint-disable-next-line no-console
     console.error('Error dispatching custom event:', e);
   }

@@ -18,9 +18,9 @@ import type { RunnableConfig, Runnable } from '@langchain/core/runnables';
 import type { ChatGenerationChunk } from '@langchain/core/outputs';
 import type { GoogleAIToolType } from '@langchain/google-common';
 import type { ToolMap, ToolEndEvent, GenericTool } from '@/types/tools';
+import type { StandardGraph, MultiAgentGraph } from '@/graphs';
 import type { ClientOptions } from '@/types/llm';
 import type { Providers } from '@/common';
-import type { Graph } from '@/graphs';
 import type {
   RunStep,
   RunStepDeltaEvent,
@@ -54,8 +54,8 @@ export interface EventHandler {
       | ReasoningDeltaEvent
       | { result: ToolEndEvent },
     metadata?: Record<string, unknown>,
-    graph?: Graph
-  ): void;
+    graph?: StandardGraph | MultiAgentGraph
+  ): void | Promise<void>;
 }
 
 export type GraphStateChannels<T extends BaseGraphState> =

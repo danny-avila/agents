@@ -114,12 +114,12 @@ export function getChunkContent({
 }
 
 export class ChatModelStreamHandler implements t.EventHandler {
-  handle(
+  async handle(
     event: string,
     data: t.StreamEventData,
     metadata?: Record<string, unknown>,
     graph?: StandardGraph
-  ): void {
+  ): Promise<void> {
     if (!graph) {
       throw new Error('Graph not found');
     }
@@ -139,7 +139,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
       reasoningKey: agentContext.reasoningKey,
       provider: agentContext.provider,
     });
-    const skipHandling = handleServerToolResult({
+    const skipHandling = await handleServerToolResult({
       graph,
       content,
       metadata,
@@ -156,7 +156,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
       chunk.tool_calls.every((tc) => tc.id != null && tc.id !== '')
     ) {
       hasToolCalls = true;
-      handleToolCalls(chunk.tool_calls, metadata, graph);
+      await handleToolCalls(chunk.tool_calls, metadata, graph);
     }
 
     const hasToolCallChunks =
@@ -187,7 +187,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
       chunk.tool_call_chunks.length &&
       typeof chunk.tool_call_chunks[0]?.index === 'number'
     ) {
-      handleToolCallChunks({
+      await handleToolCallChunks({
         graph,
         stepKey,
         toolCallChunks: chunk.tool_call_chunks,
@@ -200,7 +200,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
 
     const message_id = getMessageId(stepKey, graph) ?? '';
     if (message_id) {
-      graph.dispatchRunStep(stepKey, {
+      await graph.dispatchRunStep(stepKey, {
         type: StepTypes.MESSAGE_CREATION,
         message_creation: {
           message_id,
@@ -239,7 +239,7 @@ hasToolCallChunks: ${hasToolCallChunks}
       return;
     } else if (typeof content === 'string') {
       if (agentContext.currentTokenType === ContentTypes.TEXT) {
-        graph.dispatchMessageDelta(stepId, {
+        await graph.dispatchMessageDelta(stepId, {
           content: [
             {
               type: ContentTypes.TEXT,
@@ -250,7 +250,7 @@ hasToolCallChunks: ${hasToolCallChunks}
       } else if (agentContext.currentTokenType === 'think_and_text') {
         const { text, thinking } = parseThinkingContent(content);
         if (thinking) {
-          graph.dispatchReasoningDelta(stepId, {
+          await graph.dispatchReasoningDelta(stepId, {
             content: [
               {
                 type: ContentTypes.THINK,
@@ -264,7 +264,7 @@ hasToolCallChunks: ${hasToolCallChunks}
           agentContext.tokenTypeSwitch = 'content';
           const newStepKey = graph.getStepKey(metadata);
           const message_id = getMessageId(newStepKey, graph) ?? '';
-          graph.dispatchRunStep(newStepKey, {
+          await graph.dispatchRunStep(newStepKey, {
             type: StepTypes.MESSAGE_CREATION,
             message_creation: {
               message_id,
@@ -272,7 +272,7 @@ hasToolCallChunks: ${hasToolCallChunks}
           });
 
           const newStepId = graph.getStepIdByKey(newStepKey);
-          graph.dispatchMessageDelta(newStepId, {
+          await graph.dispatchMessageDelta(newStepId, {
             content: [
               {
                 type: ContentTypes.TEXT,
@@ -282,7 +282,7 @@ hasToolCallChunks: ${hasToolCallChunks}
           });
         }
       } else {
-        graph.dispatchReasoningDelta(stepId, {
+        await graph.dispatchReasoningDelta(stepId, {
           content: [
             {
               type: ContentTypes.THINK,
@@ -294,7 +294,7 @@ hasToolCallChunks: ${hasToolCallChunks}
     } else if (
       content.every((c) => c.type?.startsWith(ContentTypes.TEXT) ?? false)
     ) {
-      graph.dispatchMessageDelta(stepId, {
+      await graph.dispatchMessageDelta(stepId, {
         content,
       });
     } else if (
@@ -305,7 +305,7 @@ hasToolCallChunks: ${hasToolCallChunks}
           (c.type?.startsWith(ContentTypes.REASONING_CONTENT) ?? false)
       )
     ) {
-      graph.dispatchReasoningDelta(stepId, {
+      await graph.dispatchReasoningDelta(stepId, {
         content: content.map((c) => ({
           type: ContentTypes.THINK,
           think:
