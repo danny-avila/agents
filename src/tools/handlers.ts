@@ -4,6 +4,7 @@ import { nanoid } from 'nanoid';
 import { ToolMessage } from '@langchain/core/messages';
 import type { AnthropicWebSearchResultBlockParam } from '@/llm/anthropic/types';
 import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
+import type { AgentContext } from '@/agents/AgentContext';
 import type { Graph } from '@/graphs';
 import type * as t from '@/types';
 import {
@@ -194,16 +195,18 @@ export const toolResultTypes = new Set([
  * As of 2025-07-06, only Anthropic handles server tool calls with this pattern.
  */
 export function handleServerToolResult({
+  graph,
   content,
   metadata,
-  graph,
+  agentContext,
 }: {
+  graph: Graph;
   content?: string | t.MessageContentComplex[];
   metadata?: Record<string, unknown>;
-  graph: Graph;
+  agentContext?: AgentContext;
 }): boolean {
   let skipHandling = false;
-  if (metadata?.provider !== Providers.ANTHROPIC) {
+  if (agentContext?.provider !== Providers.ANTHROPIC) {
     return skipHandling;
   }
   if (

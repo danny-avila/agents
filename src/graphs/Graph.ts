@@ -54,6 +54,7 @@ import {
 } from '@/utils';
 import { ChatOpenAI, AzureChatOpenAI } from '@/llm/openai';
 import { safeDispatchCustomEvent } from '@/utils/events';
+import { AgentContext } from '@/agents/AgentContext';
 import { createFakeStreamingLLM } from '@/llm/fake';
 import { HandlerRegistry } from '@/events';
 
@@ -134,20 +135,10 @@ export abstract class Graph<
     omitOutput?: boolean
   ): void;
 
-  abstract createCallModel({
-    currentModel,
-    tools,
-    clientOptions,
-  }: {
-    currentModel?: ChatModel;
-    tools?: t.GraphTools;
-    clientOptions?: t.ClientOptions;
-  }): (state: T, config?: RunnableConfig) => Promise<Partial<T>>;
-  lastToken?: string;
-  tokenTypeSwitch?: 'reasoning' | 'content';
-  reasoningKey: 'reasoning_content' | 'reasoning' = 'reasoning_content';
-  currentTokenType: ContentTypes.TEXT | ContentTypes.THINK | 'think_and_text' =
-    ContentTypes.TEXT;
+  abstract createCallModel(
+    agentId?: string,
+    currentModel?: ChatModel
+  ): (state: T, config?: RunnableConfig) => Promise<Partial<T>>;
   messageStepHasToolCalls: Map<string, boolean> = new Map();
   messageIdsByStepKey: Map<string, string> = new Map();
   prelimMessageIdsByStepKey: Map<string, string> = new Map();
@@ -156,8 +147,6 @@ export abstract class Graph<
   stepKeyIds: Map<string, string[]> = new Map<string, string[]>();
   contentIndexMap: Map<string, number> = new Map();
   toolCallStepIds: Map<string, string> = new Map();
-  indexTokenCountMap: Record<string, number | undefined> = {};
-  tokenCounter?: t.TokenCounter;
   signal?: AbortSignal;
   /** Set of invoked tool call IDs from non-message run steps completed mid-run, if any */
   invokedToolIds?: Set<string>;
@@ -172,24 +161,39 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
   runId: string | undefined;
   startIndex: number = 0;
   signal?: AbortSignal;
+  /** Map of agent contexts by agent ID */
+  agentContexts: Map<string, AgentContext> = new Map();
+  /** Default agent ID to use */
+  defaultAgentId: string;
 
   constructor({
     // parent-level graph inputs
     runId,
     signal,
-    // TODO: reasoningKey used by chat stream handler, needs to be dynamic per agent
-    reasoningKey,
+    agents,
+    tokenCounter,
+    indexTokenCountMap,
   }: t.StandardGraphInput) {
     super();
     this.runId = runId;
     this.signal = signal;
 
-    // TODO, `toolEnd`, `streamBuffer`, `reasoningKey`, `systemMessage` should be agent-specific
-    // this.toolEnd = toolEnd;
-    // this.streamBuffer = streamBuffer;
-    if (reasoningKey) {
-      this.reasoningKey = reasoningKey;
+    if (agents.length === 0) {
+      throw new Error('At least one agent configuration is required');
     }
+
+    for (const agentConfig of agents) {
+      const agentContext = AgentContext.fromConfig(
+        agentConfig,
+        tokenCounter,
+        indexTokenCountMap
+      );
+
+      this.agentContexts.set(agentConfig.agentId, agentContext);
+    }
+
+    // Set the default agent ID to the first agent
+    this.defaultAgentId = agents[0].agentId;
   }
 
   /* Init */
@@ -215,15 +219,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
       this.prelimMessageIdsByStepKey,
       new Map()
     );
-    this.currentTokenType = resetIfNotEmpty(
-      this.currentTokenType,
-      ContentTypes.TEXT
-    );
-    this.lastToken = resetIfNotEmpty(this.lastToken, undefined);
-    this.tokenTypeSwitch = resetIfNotEmpty(this.tokenTypeSwitch, undefined);
-    this.indexTokenCountMap = resetIfNotEmpty(this.indexTokenCountMap, {});
-    this.tokenCounter = resetIfNotEmpty(this.tokenCounter, undefined);
     this.invokedToolIds = resetIfNotEmpty(this.invokedToolIds, undefined);
+    // Reset all agent contexts
+    for (const context of this.agentContexts.values()) {
+      context.reset();
+    }
   }
 
   /* Run Step Processing */
@@ -234,6 +234,33 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
       return this.contentData[index];
     }
     return undefined;
+  }
+
+  getAgentContext(metadata: Record<string, unknown> | undefined): AgentContext {
+    if (!metadata) {
+      throw new Error('No metadata provided to retrieve agent context');
+    }
+
+    const currentNode = metadata.langgraph_node as string;
+    if (!currentNode) {
+      throw new Error(
+        'No langgraph_node in metadata to retrieve agent context'
+      );
+    }
+
+    let agentId: string | undefined;
+    if (currentNode.startsWith(AGENT)) {
+      agentId = currentNode.substring(AGENT.length);
+    } else if (currentNode.startsWith(TOOLS)) {
+      agentId = currentNode.substring(TOOLS.length);
+    }
+
+    const agentContext = this.agentContexts.get(agentId ?? '');
+    if (!agentContext) {
+      throw new Error(`No agent context found for agent ID ${agentId}`);
+    }
+
+    return agentContext;
   }
 
   getStepKey(metadata: Record<string, unknown> | undefined): string {
@@ -289,9 +316,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
       metadata.langgraph_step as number,
       metadata.checkpoint_ns as string,
     ];
+
+    const agentContext = this.getAgentContext(metadata);
     if (
-      this.currentTokenType === ContentTypes.THINK ||
-      this.currentTokenType === 'think_and_text'
+      agentContext.currentTokenType === ContentTypes.THINK ||
+      agentContext.currentTokenType === 'think_and_text'
     ) {
       keyList.push('reasoning');
     }
@@ -318,6 +347,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
   }
 
   /* Graph */
+
+  /** @deprecated */
   createGraphState(): t.GraphStateChannels<t.BaseGraphState> {
     return {
       messages: {
@@ -327,21 +358,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
           }
           const current = x.concat(y);
           this.messages = current;
-          return current;
-        },
-        default: () => [],
-      },
-    };
-  }
-  createAgentState(): t.GraphStateChannels<t.BaseGraphState> {
-    return {
-      messages: {
-        value: (x: BaseMessage[], y: BaseMessage[]): BaseMessage[] => {
-          if (!x.length) {
-            this.startIndex = x.length + y.length;
-          }
-          const current = x.concat(y);
-          // this.messages = current;
           return current;
         },
         default: () => [],
@@ -562,34 +578,30 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
     client.abortHandler = undefined;
   }
 
-  createCallModel({
-    tools,
-    provider,
-    currentModel,
-    streamBuffer,
-    clientOptions,
-    maxContextTokens,
-  }: {
-    provider: Providers;
-    streamBuffer?: number;
-    tools?: t.GraphTools;
-    currentModel?: ChatModel;
-    maxContextTokens?: number;
-    clientOptions?: t.ClientOptions;
-  }) {
-    let lastStreamCall: number | undefined;
-    let currentUsage: Partial<UsageMetadata> | undefined;
-    let pruneMessages: ReturnType<typeof createPruneMessages> | undefined;
+  createCallModel(agentId = 'default', currentModel?: ChatModel) {
     return async (
       state: t.BaseGraphState,
       config?: RunnableConfig
     ): Promise<Partial<t.BaseGraphState>> => {
+      /**
+       * Get agent context - it must exist by this point
+       */
+      const agentContext = this.agentContexts.get(agentId);
+      if (!agentContext) {
+        throw new Error(`Agent context not found for agentId: ${agentId}`);
+      }
+
       const model = this.overrideModel ?? currentModel;
       if (!model) {
         throw new Error('No Graph model found');
       }
       if (!config) {
         throw new Error('No config provided');
+      }
+
+      // Ensure token calculations are complete before proceeding
+      if (agentContext.tokenCalculationPromise) {
+        await agentContext.tokenCalculationPromise;
       }
       if (!config.signal) {
         config.signal = this.signal;
@@ -599,34 +611,35 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
 
       let messagesToUse = messages;
       if (
-        !pruneMessages &&
-        this.tokenCounter &&
-        maxContextTokens != null &&
-        this.indexTokenCountMap[0] != null
+        !agentContext.pruneMessages &&
+        agentContext.tokenCounter &&
+        agentContext.maxContextTokens != null &&
+        agentContext.indexTokenCountMap[0] != null
       ) {
         const isAnthropicWithThinking =
-          (provider === Providers.ANTHROPIC &&
-            (clientOptions as t.AnthropicClientOptions).thinking != null) ||
-          (provider === Providers.BEDROCK &&
-            (clientOptions as t.BedrockAnthropicInput)
+          (agentContext.provider === Providers.ANTHROPIC &&
+            (agentContext.clientOptions as t.AnthropicClientOptions).thinking !=
+              null) ||
+          (agentContext.provider === Providers.BEDROCK &&
+            (agentContext.clientOptions as t.BedrockAnthropicInput)
               .additionalModelRequestFields?.['thinking'] != null);
 
-        pruneMessages = createPruneMessages({
-          provider,
-          maxTokens: maxContextTokens,
-          startIndex: this.startIndex,
-          tokenCounter: this.tokenCounter,
+        agentContext.pruneMessages = createPruneMessages({
+          provider: agentContext.provider,
+          maxTokens: agentContext.maxContextTokens,
+          startIndex: agentContext.startIndex,
+          tokenCounter: agentContext.tokenCounter,
           thinkingEnabled: isAnthropicWithThinking,
-          indexTokenCountMap: this.indexTokenCountMap,
+          indexTokenCountMap: agentContext.indexTokenCountMap,
         });
       }
-      if (pruneMessages) {
-        const { context, indexTokenCountMap } = pruneMessages({
+      if (agentContext.pruneMessages) {
+        const { context, indexTokenCountMap } = agentContext.pruneMessages({
           messages,
-          usageMetadata: currentUsage,
+          usageMetadata: agentContext.currentUsage,
           // startOnMessageType: 'human',
         });
-        this.indexTokenCountMap = indexTokenCountMap;
+        agentContext.indexTokenCountMap = indexTokenCountMap;
         messagesToUse = context;
       }
 
@@ -641,7 +654,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
           : null;
 
       if (
-        provider === Providers.BEDROCK &&
+        agentContext.provider === Providers.BEDROCK &&
         lastMessageX instanceof AIMessageChunk &&
         lastMessageY instanceof ToolMessage &&
         typeof lastMessageX.content === 'string'
@@ -651,36 +664,45 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
 
       const isLatestToolMessage = lastMessageY instanceof ToolMessage;
 
-      if (isLatestToolMessage && provider === Providers.ANTHROPIC) {
+      if (
+        isLatestToolMessage &&
+        agentContext.provider === Providers.ANTHROPIC
+      ) {
         formatAnthropicArtifactContent(finalMessages);
       } else if (
         isLatestToolMessage &&
-        (isOpenAILike(provider) || isGoogleLike(provider))
+        (isOpenAILike(agentContext.provider) ||
+          isGoogleLike(agentContext.provider))
       ) {
         formatArtifactPayload(finalMessages);
       }
 
-      if (lastStreamCall != null && streamBuffer != null) {
-        const timeSinceLastCall = Date.now() - lastStreamCall;
-        if (timeSinceLastCall < streamBuffer) {
+      if (
+        agentContext.lastStreamCall != null &&
+        agentContext.streamBuffer != null
+      ) {
+        const timeSinceLastCall = Date.now() - agentContext.lastStreamCall;
+        if (timeSinceLastCall < agentContext.streamBuffer) {
           const timeToWait =
-            Math.ceil((streamBuffer - timeSinceLastCall) / 1000) * 1000;
+            Math.ceil((agentContext.streamBuffer - timeSinceLastCall) / 1000) *
+            1000;
           await sleep(timeToWait);
         }
       }
 
-      lastStreamCall = Date.now();
+      agentContext.lastStreamCall = Date.now();
 
       let result: Partial<t.BaseGraphState> | undefined;
       const fallbacks =
-        (clientOptions as t.LLMConfig | undefined)?.fallbacks ?? [];
+        (agentContext.clientOptions as t.LLMConfig | undefined)?.fallbacks ??
+        [];
       try {
         result = await this.attemptInvoke(
           {
             currentModel: model,
             finalMessages,
-            provider,
-            tools,
+            provider: agentContext.provider,
+            tools: agentContext.tools,
           },
           config
         );
@@ -692,15 +714,18 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
               provider: fb.provider,
               clientOptions: fb.clientOptions,
             });
+            const bindableTools = agentContext.tools;
             model = (
-              !tools || tools.length === 0 ? model : model.bindTools(tools)
+              !bindableTools || bindableTools.length === 0
+                ? model
+                : model.bindTools(bindableTools)
             ) as t.ChatModelInstance;
             result = await this.attemptInvoke(
               {
                 currentModel: model,
                 finalMessages,
                 provider: fb.provider,
-                tools,
+                tools: agentContext.tools,
               },
               config
             );
@@ -719,34 +744,29 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
       if (!result) {
         throw new Error('No result after model invocation');
       }
-      currentUsage = this.getUsageMetadata(result.messages?.[0]);
+      agentContext.currentUsage = this.getUsageMetadata(result.messages?.[0]);
       this.cleanupSignalListener();
       return result;
     };
   }
 
   // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
-  createAgentNode({
-    tools,
-    toolMap,
-    provider,
-    toolEnd,
-    streamBuffer,
-    instructions,
-    clientOptions,
-    maxContextTokens,
-    additional_instructions,
-  }: {
-    toolEnd?: boolean;
-    provider: Providers;
-    toolMap?: t.ToolMap;
-    instructions?: string;
-    streamBuffer?: number;
-    tools?: t.GraphTools;
-    maxContextTokens?: number;
-    clientOptions?: t.ClientOptions;
-    additional_instructions?: string;
-  }) {
+  createAgentNode(agentId: string) {
+    const agentContext = this.agentContexts.get(agentId);
+    if (!agentContext) {
+      throw new Error(`Agent context not found for agentId: ${agentId}`);
+    }
+
+    let currentModel = this.initializeModel({
+      tools: agentContext.tools,
+      provider: agentContext.provider,
+      clientOptions: agentContext.clientOptions,
+    });
+
+    if (agentContext.systemRunnable) {
+      currentModel = agentContext.systemRunnable.pipe(currentModel);
+    }
+
     const routeMessage = (
       state: t.BaseGraphState,
       config?: RunnableConfig
@@ -755,23 +775,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
       return toolsCondition(state, this.invokedToolIds);
     };
 
-    const systemRunnable = this.createSystemRunnable({
-      provider,
-      instructions,
-      clientOptions,
-      additional_instructions,
-    });
-
-    let currentModel = this.initializeModel({
-      tools,
-      provider,
-      clientOptions,
-    });
-
-    if (systemRunnable) {
-      currentModel = systemRunnable.pipe(currentModel);
-    }
-
     const StateAnnotation = Annotation.Root({
       messages: Annotation<BaseMessage[]>({
         reducer: messagesStateReducer,
@@ -779,36 +782,30 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
       }),
     });
 
+    const agentNode = `${AGENT}${agentId}`;
+    const toolNode = `${TOOLS}${agentId}`;
+
     const workflow = new StateGraph(StateAnnotation)
+      .addNode(agentNode, this.createCallModel(agentId, currentModel))
       .addNode(
-        AGENT,
-        this.createCallModel({
-          tools,
-          provider,
-          currentModel,
-          streamBuffer,
-          clientOptions,
-          maxContextTokens,
-        })
-      )
-      .addNode(
-        TOOLS,
+        toolNode,
         this.initializeTools({
-          currentTools: tools,
-          currentToolMap: toolMap,
+          currentTools: agentContext.tools,
+          currentToolMap: agentContext.toolMap,
         })
       )
-      .addEdge(START, AGENT)
-      .addConditionalEdges(AGENT, routeMessage)
-      .addEdge(TOOLS, toolEnd === true ? END : AGENT);
+      .addEdge(START, agentNode)
+      .addConditionalEdges(agentNode, routeMessage)
+      .addEdge(toolNode, agentContext.toolEnd ? END : agentNode);
 
     // Cast to unknown to avoid tight coupling to external types; options are opt-in
     return workflow.compile(this.compileOptions as unknown as never);
   }
 
   // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
-  createWorkflow(agentInputs: t.AgentInputs) {
-    const agentNode = this.createAgentNode(agentInputs);
+  createWorkflow() {
+    /** Use the default (first) agent for now */
+    const agentNode = this.createAgentNode(this.defaultAgentId);
     const StateAnnotation = Annotation.Root({
       messages: Annotation<BaseMessage[]>({
         reducer: (...args) => {
@@ -820,8 +817,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
       }),
     });
     const workflow = new StateGraph(StateAnnotation)
-      .addNode('000', agentNode, { ends: [END] })
-      .addEdge(START, '000')
+      .addNode(this.defaultAgentId, agentNode, { ends: [END] })
+      .addEdge(START, this.defaultAgentId)
       .compile();
 
     return workflow;

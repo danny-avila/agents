@@ -87,8 +87,8 @@ export enum Providers {
 }
 
 export enum GraphNodeKeys {
-  TOOLS = 'tools',
-  AGENT = 'agent',
+  TOOLS = 'tools=',
+  AGENT = 'agent=',
   ROUTER = 'router',
   PRE_TOOLS = 'pre_tools',
   POST_TOOLS = 'post_tools',

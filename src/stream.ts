@@ -2,7 +2,8 @@
 import type { ChatOpenAIReasoningSummary } from '@langchain/openai';
 import type { AIMessageChunk } from '@langchain/core/messages';
 import type { ToolCall } from '@langchain/core/messages/tool';
-import type { Graph } from '@/graphs';
+import type { AgentContext } from '@/agents/AgentContext';
+import type { StandardGraph } from '@/graphs';
 import type * as t from '@/types';
 import {
   ToolCallTypes,
@@ -117,7 +118,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
     event: string,
     data: t.StreamEventData,
     metadata?: Record<string, unknown>,
-    graph?: Graph
+    graph?: StandardGraph
   ): void {
     if (!graph) {
       throw new Error('Graph not found');
@@ -130,21 +131,24 @@ export class ChatModelStreamHandler implements t.EventHandler {
       return;
     }
 
+    const agentContext = graph.getAgentContext(metadata);
+
     const chunk = data.chunk as Partial<AIMessageChunk>;
     const content = getChunkContent({
       chunk,
-      reasoningKey: graph.reasoningKey,
-      provider: metadata?.provider as Providers,
+      reasoningKey: agentContext.reasoningKey,
+      provider: agentContext.provider,
     });
     const skipHandling = handleServerToolResult({
+      graph,
       content,
       metadata,
-      graph,
+      agentContext,
     });
     if (skipHandling) {
       return;
     }
-    this.handleReasoning(chunk, graph, metadata?.provider as Providers);
+    this.handleReasoning(chunk, agentContext);
     let hasToolCalls = false;
     if (
       chunk.tool_calls &&
@@ -234,7 +238,7 @@ hasToolCallChunks: ${hasToolCallChunks}
     ) {
       return;
     } else if (typeof content === 'string') {
-      if (graph.currentTokenType === ContentTypes.TEXT) {
+      if (agentContext.currentTokenType === ContentTypes.TEXT) {
         graph.dispatchMessageDelta(stepId, {
           content: [
             {
@@ -243,7 +247,7 @@ hasToolCallChunks: ${hasToolCallChunks}
             },
           ],
         });
-      } else if (graph.currentTokenType === 'think_and_text') {
+      } else if (agentContext.currentTokenType === 'think_and_text') {
         const { text, thinking } = parseThinkingContent(content);
         if (thinking) {
           graph.dispatchReasoningDelta(stepId, {
@@ -256,8 +260,8 @@ hasToolCallChunks: ${hasToolCallChunks}
           });
         }
         if (text) {
-          graph.currentTokenType = ContentTypes.TEXT;
-          graph.tokenTypeSwitch = 'content';
+          agentContext.currentTokenType = ContentTypes.TEXT;
+          agentContext.tokenTypeSwitch = 'content';
           const newStepKey = graph.getStepKey(metadata);
           const message_id = getMessageId(newStepKey, graph) ?? '';
           graph.dispatchRunStep(newStepKey, {
@@ -315,13 +319,11 @@ hasToolCallChunks: ${hasToolCallChunks}
   }
   handleReasoning(
     chunk: Partial<AIMessageChunk>,
-    graph: Graph,
-    provider?: Providers
+    agentContext: AgentContext
   ): void {
-    let reasoning_content = chunk.additional_kwargs?.[graph.reasoningKey] as
-      | string
-      | Partial<ChatOpenAIReasoningSummary>
-      | undefined;
+    let reasoning_content = chunk.additional_kwargs?.[
+      agentContext.reasoningKey
+    ] as string | Partial<ChatOpenAIReasoningSummary> | undefined;
     if (
       Array.isArray(chunk.content) &&
       (chunk.content[0]?.type === ContentTypes.THINKING ||
@@ -330,7 +332,8 @@ hasToolCallChunks: ${hasToolCallChunks}
     ) {
       reasoning_content = 'valid';
     } else if (
-      (provider === Providers.OPENAI || provider === Providers.AZURE) &&
+      (agentContext.provider === Providers.OPENAI ||
+        agentContext.provider === Providers.AZURE) &&
       reasoning_content != null &&
       typeof reasoning_content !== 'string' &&
       reasoning_content.summary?.[0]?.text != null &&
@@ -345,43 +348,43 @@ hasToolCallChunks: ${hasToolCallChunks}
         chunk.content === '' ||
         reasoning_content === 'valid')
     ) {
-      graph.currentTokenType = ContentTypes.THINK;
-      graph.tokenTypeSwitch = 'reasoning';
+      agentContext.currentTokenType = ContentTypes.THINK;
+      agentContext.tokenTypeSwitch = 'reasoning';
       return;
     } else if (
-      graph.tokenTypeSwitch === 'reasoning' &&
-      graph.currentTokenType !== ContentTypes.TEXT &&
+      agentContext.tokenTypeSwitch === 'reasoning' &&
+      agentContext.currentTokenType !== ContentTypes.TEXT &&
       ((chunk.content != null && chunk.content !== '') ||
         (chunk.tool_calls?.length ?? 0) > 0)
     ) {
-      graph.currentTokenType = ContentTypes.TEXT;
-      graph.tokenTypeSwitch = 'content';
+      agentContext.currentTokenType = ContentTypes.TEXT;
+      agentContext.tokenTypeSwitch = 'content';
     } else if (
       chunk.content != null &&
       typeof chunk.content === 'string' &&
       chunk.content.includes('<think>') &&
       chunk.content.includes('</think>')
     ) {
-      graph.currentTokenType = 'think_and_text';
-      graph.tokenTypeSwitch = 'content';
+      agentContext.currentTokenType = 'think_and_text';
+      agentContext.tokenTypeSwitch = 'content';
     } else if (
       chunk.content != null &&
       typeof chunk.content === 'string' &&
       chunk.content.includes('<think>')
     ) {
-      graph.currentTokenType = ContentTypes.THINK;
-      graph.tokenTypeSwitch = 'content';
+      agentContext.currentTokenType = ContentTypes.THINK;
+      agentContext.tokenTypeSwitch = 'content';
     } else if (
-      graph.lastToken != null &&
-      graph.lastToken.includes('</think>')
+      agentContext.lastToken != null &&
+      agentContext.lastToken.includes('</think>')
     ) {
-      graph.currentTokenType = ContentTypes.TEXT;
-      graph.tokenTypeSwitch = 'content';
+      agentContext.currentTokenType = ContentTypes.TEXT;
+      agentContext.tokenTypeSwitch = 'content';
     }
     if (typeof chunk.content !== 'string') {
       return;
     }
-    graph.lastToken = chunk.content;
+    agentContext.lastToken = chunk.content;
   }
 }
 

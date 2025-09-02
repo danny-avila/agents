@@ -214,10 +214,13 @@ export type GraphTools = GenericTool[] | BindToolsInput[] | GoogleAIToolType[];
 export type StandardGraphInput = {
   runId?: string;
   signal?: AbortSignal;
-  reasoningKey?: 'reasoning_content' | 'reasoning';
+  agents: AgentInputs[];
+  tokenCounter?: import('./run').TokenCounter;
+  indexTokenCountMap?: Record<string, number>;
 };
 
 export interface AgentInputs {
+  agentId: string;
   toolEnd?: boolean;
   toolMap?: ToolMap;
   tools?: GraphTools;
@@ -227,4 +230,5 @@ export interface AgentInputs {
   maxContextTokens?: number;
   clientOptions?: ClientOptions;
   additional_instructions?: string;
+  reasoningKey?: 'reasoning_content' | 'reasoning';
 }

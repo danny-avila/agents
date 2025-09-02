@@ -4,7 +4,7 @@ import type {
   UsageMetadata,
   BaseMessageFields,
 } from '@langchain/core/messages';
-import type { Graph } from '@/graphs';
+import type { Graph, StandardGraph } from '@/graphs';
 import type * as t from '@/types';
 import { handleToolCalls } from '@/tools/handlers';
 import { Providers } from '@/common';
@@ -51,7 +51,7 @@ export class ModelEndHandler implements t.EventHandler {
     event: string,
     data: t.ModelEndData,
     metadata?: Record<string, unknown>,
-    graph?: Graph
+    graph?: StandardGraph
   ): void {
     if (!graph || !metadata) {
       console.warn(`Graph or metadata not found in ${event} event`);
@@ -75,9 +75,11 @@ export class ModelEndHandler implements t.EventHandler {
       { depth: null }
     );
 
+    const agentContext = graph.getAgentContext(metadata);
+
     if (
-      metadata.provider !== Providers.GOOGLE &&
-      metadata.provider !== Providers.BEDROCK
+      agentContext.provider !== Providers.GOOGLE &&
+      agentContext.provider !== Providers.BEDROCK
     ) {
       return;
     }

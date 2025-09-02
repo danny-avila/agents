@@ -1,7 +1,5 @@
 // src/run.ts
-// import { zodToJsonSchema } from 'zod-to-json-schema';
 import { PromptTemplate } from '@langchain/core/prompts';
-// import { SystemMessage } from '@langchain/core/messages';
 import { AzureChatOpenAI, ChatOpenAI } from '@langchain/openai';
 import type {
   BaseMessage,
@@ -10,14 +8,12 @@ import type {
 import type { ClientCallbacks, SystemCallbacks } from '@/graphs/Graph';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type * as t from '@/types';
-import { GraphEvents, Providers, Callback, TitleMethod } from '@/common';
-// import { manualToolStreamProviders } from '@/llm/providers';
-// import { shiftIndexTokenCountMap } from '@/messages/format';
+import { GraphEvents, Callback, TitleMethod } from '@/common';
+import { createTokenCounter } from '@/utils/tokens';
 import {
   createCompletionTitleRunnable,
   createTitleRunnable,
 } from '@/utils/title';
-import { createTokenCounter } from '@/utils/tokens';
 import { StandardGraph } from '@/graphs/Graph';
 import { HandlerRegistry } from '@/events';
 import { isOpenAILike } from '@/utils/llm';
@@ -36,13 +32,12 @@ export const defaultOmitOptions = new Set([
 ]);
 
 export class Run<T extends t.BaseGraphState> {
-  graphRunnable?: t.CompiledWorkflow<T, Partial<T>, string>;
-  // private collab!: CollabGraph;
-  // private taskManager!: TaskManager;
-  private handlerRegistry: HandlerRegistry;
   id: string;
+  private tokenCounter?: t.TokenCounter;
+  private handlerRegistry: HandlerRegistry;
+  private indexTokenCountMap?: Record<string, number>;
+  graphRunnable?: t.CompiledWorkflow<T, Partial<T>, string>;
   Graph: StandardGraph | undefined;
-  provider: Providers | undefined;
   returnContent: boolean = false;
 
   private constructor(config: Partial<t.RunConfig>) {
@@ -52,6 +47,8 @@ export class Run<T extends t.BaseGraphState> {
     }
 
     this.id = runId;
+    this.tokenCounter = config.tokenCounter;
+    this.indexTokenCountMap = config.indexTokenCountMap;
 
     const handlerRegistry = new HandlerRegistry();
 
@@ -69,13 +66,12 @@ export class Run<T extends t.BaseGraphState> {
       throw new Error('Graph config not provided');
     }
 
+    /** TEMP: use `standard` for `legacy` for now */
     if (config.graphConfig.type === 'standard') {
-      this.provider = config.graphConfig.llmConfig.provider;
-      this.graphRunnable = this.createStandardGraph(
+      this.graphRunnable = this.createLegacyGraph(
         config.graphConfig
       ) as unknown as t.CompiledWorkflow<T, Partial<T>, string>;
       if (this.Graph) {
-        // apply compile options if provided at config level
         this.Graph.compileOptions =
           config.graphConfig.compileOptions ?? this.Graph.compileOptions;
         this.Graph.handlerRegistry = handlerRegistry;
@@ -85,39 +81,49 @@ export class Run<T extends t.BaseGraphState> {
     this.returnContent = config.returnContent ?? false;
   }
 
-  private createStandardGraph(
-    config: t.StandardGraphConfig
+  private createLegacyGraph(
+    config: t.LegacyGraphConfig
   ): t.CompiledWorkflow<t.IState, Partial<t.IState>, string> {
     const {
+      type: _type,
       llmConfig,
       signal,
-      reasoningKey,
       tools = [],
       ...agentInputs
     } = config;
     const { provider, ...clientOptions } = llmConfig;
 
+    /** TEMP: Create agent configuration for the single agent */
+    const agentConfig: t.AgentInputs = {
+      ...agentInputs,
+      tools,
+      provider,
+      clientOptions,
+      agentId: 'default',
+    };
+
     const standardGraph = new StandardGraph({
       signal,
-      reasoningKey,
       runId: this.id,
+      agents: [agentConfig],
+      tokenCounter: this.tokenCounter,
+      indexTokenCountMap: this.indexTokenCountMap,
     });
     // propagate compile options from graph config
     standardGraph.compileOptions = (
-      config as t.StandardGraphConfig
+      config as t.LegacyGraphConfig
     ).compileOptions;
     this.Graph = standardGraph;
-    return standardGraph.createWorkflow({
-      tools,
-      ...agentInputs,
-      provider,
-      clientOptions,
-    });
+    return standardGraph.createWorkflow();
   }
 
   static async create<T extends t.BaseGraphState>(
     config: t.RunConfig
   ): Promise<Run<T>> {
+    // Create tokenCounter if indexTokenCountMap is provided but tokenCounter is not
+    if (config.indexTokenCountMap && !config.tokenCounter) {
+      config.tokenCounter = await createTokenCounter();
+    }
     return new Run<T>(config);
   }
 
@@ -147,8 +153,7 @@ export class Run<T extends t.BaseGraphState> {
     }
 
     this.Graph.resetValues(streamOptions?.keepContent);
-    // const provider = this.Graph.provider as Providers | undefined;
-    // const hasTools = this.Graph.tools ? this.Graph.tools.length > 0 : false;
+
     if (streamOptions?.callbacks) {
       /* TODO: conflicts with callback manager */
       const callbacks = (config.callbacks as t.ProvidedCallbacks) ?? [];
@@ -161,53 +166,9 @@ export class Run<T extends t.BaseGraphState> {
       throw new Error('Run ID not provided');
     }
 
-    const tokenCounter =
-      streamOptions?.tokenCounter ??
-      (streamOptions?.indexTokenCountMap
-        ? await createTokenCounter()
-        : undefined);
-    // const tools = this.Graph.tools as
-    //   | Array<t.GenericTool | undefined>
-    //   | undefined;
-    // const toolTokens = tokenCounter
-    //   ? (tools?.reduce((acc, tool) => {
-    //     if (!(tool as Partial<t.GenericTool>).schema) {
-    //       return acc;
-    //     }
-
-    //     const jsonSchema = zodToJsonSchema(
-    //       (tool?.schema as t.ZodObjectAny).describe(tool?.description ?? ''),
-    //       tool?.name ?? ''
-    //     );
-    //     return (
-    //       acc + tokenCounter(new SystemMessage(JSON.stringify(jsonSchema)))
-    //     );
-    //   }, 0) ?? 0)
-    //   : 0;
-    // let instructionTokens = toolTokens;
-    // if (this.Graph.systemMessage && tokenCounter) {
-    //   instructionTokens += tokenCounter(this.Graph.systemMessage);
-    // }
-    // const tokenMap = streamOptions?.indexTokenCountMap ?? {};
-    // if (this.Graph.systemMessage && instructionTokens > 0) {
-    //   this.Graph.indexTokenCountMap = shiftIndexTokenCountMap(
-    //     tokenMap,
-    //     instructionTokens
-    //   );
-    // } else if (instructionTokens > 0) {
-    //   tokenMap[0] = tokenMap[0] + instructionTokens;
-    //   this.Graph.indexTokenCountMap = tokenMap;
-    // } else {
-    //   this.Graph.indexTokenCountMap = tokenMap;
-    // }
-
-    // this.Graph.maxContextTokens = streamOptions?.maxContextTokens;
-    this.Graph.tokenCounter = tokenCounter;
-
     config.run_id = this.id;
     config.configurable = Object.assign(config.configurable ?? {}, {
       run_id: this.id,
-      provider: this.provider,
     });
 
     const stream = this.graphRunnable.streamEvents(inputs, config, {

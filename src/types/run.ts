@@ -20,12 +20,12 @@ export type BaseGraphConfig = {
   provider?: e.Providers;
   clientOptions?: l.ClientOptions;
   /** Optional compile options for workflow.compile() */
-  compileOptions?: import('./graph').CompileOptions;
+  compileOptions?: g.CompileOptions;
 };
-export type StandardGraphConfig = BaseGraphConfig & {
+export type LegacyGraphConfig = BaseGraphConfig & {
   type?: 'standard';
-} & Omit<g.StandardGraphInput, 'provider' | 'clientOptions'> &
-  Omit<g.AgentInputs, 'provider' | 'clientOptions'>;
+} & Omit<g.StandardGraphInput, 'provider' | 'clientOptions' | 'agents'> &
+  Omit<g.AgentInputs, 'provider' | 'clientOptions' | 'agentId'>;
 
 /* Supervised graph (opt-in) */
 export type SupervisedGraphConfig = BaseGraphConfig & {
@@ -99,10 +99,11 @@ export type TaskManagerGraphConfig = {
 
 export type RunConfig = {
   runId: string;
-  graphConfig: StandardGraphConfig &
-    Omit<g.AgentInputs, 'provider' | 'clientOptions'>;
+  graphConfig: LegacyGraphConfig;
   customHandlers?: Record<string, g.EventHandler>;
   returnContent?: boolean;
+  tokenCounter?: TokenCounter;
+  indexTokenCountMap?: Record<string, number>;
 };
 
 export type ProvidedCallbacks =
@@ -113,8 +114,4 @@ export type TokenCounter = (message: BaseMessage) => number;
 export type EventStreamOptions = {
   callbacks?: graph.ClientCallbacks;
   keepContent?: boolean;
-  /* Context Management */
-  maxContextTokens?: number;
-  tokenCounter?: TokenCounter;
-  indexTokenCountMap?: Record<string, number>;
 };
