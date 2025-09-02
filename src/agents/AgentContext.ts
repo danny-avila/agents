@@ -1,5 +1,6 @@
 /* eslint-disable no-console */
 // src/agents/AgentContext.ts
+import { zodToJsonSchema } from 'zod-to-json-schema';
 import { SystemMessage } from '@langchain/core/messages';
 import { RunnableLambda } from '@langchain/core/runnables';
 import type {
@@ -288,8 +289,6 @@ export class AgentContext {
   ): Promise<void> {
     let toolTokens = 0;
     if (this.tools && this.tools.length > 0) {
-      const { zodToJsonSchema } = await import('zod-to-json-schema');
-
       for (const tool of this.tools) {
         const genericTool = tool as Record<string, unknown>;
         if (

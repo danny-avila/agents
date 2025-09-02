@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { tool } from '@langchain/core/tools';
-import { ToolMessage } from '@langchain/core/messages';
+import { ToolMessage, HumanMessage } from '@langchain/core/messages';
 import {
   StateGraph,
   Command,
@@ -309,9 +309,46 @@ export class MultiAgentGraph extends StandardGraph {
       // For each source, add edges to all destinations (fan-out)
       for (const source of sources) {
         for (const destination of destinations) {
-          // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-          /** @ts-ignore */
-          builder.addEdge(source, destination);
+          if (
+            edge.promptInstructions != null &&
+            edge.promptInstructions !== ''
+          ) {
+            // Create a wrapper node that adds the prompt before the destination
+            const wrapperNodeId = `${source}_to_${destination}_prompt`;
+
+            builder.addNode(wrapperNodeId, async (state: t.BaseGraphState) => {
+              let promptText: string | undefined;
+
+              if (typeof edge.promptInstructions === 'function') {
+                promptText = edge.promptInstructions(state.messages);
+              } else {
+                promptText = edge.promptInstructions;
+              }
+
+              if (promptText != null && promptText !== '') {
+                // Return state with the prompt message added
+                return {
+                  messages: [...state.messages, new HumanMessage(promptText)],
+                };
+              }
+
+              // No prompt needed, return empty update
+              return {};
+            });
+
+            // Add edges through the wrapper
+            // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+            /** @ts-ignore */
+            builder.addEdge(source, wrapperNodeId);
+            // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+            /** @ts-ignore */
+            builder.addEdge(wrapperNodeId, destination);
+          } else {
+            // No prompt, direct edge
+            // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+            /** @ts-ignore */
+            builder.addEdge(source, destination);
+          }
         }
       }
     }

@@ -27,6 +27,7 @@ import type {
   MessageDeltaEvent,
   ReasoningDeltaEvent,
 } from '@/types/stream';
+import type { TokenCounter } from '@/types/run';
 // import type { RunnableConfig } from '@langchain/core/runnables';
 
 export type BaseGraphState = {
@@ -258,7 +259,7 @@ export type StandardGraphInput = {
   runId?: string;
   signal?: AbortSignal;
   agents: AgentInputs[];
-  tokenCounter?: import('./run').TokenCounter;
+  tokenCounter?: TokenCounter;
   indexTokenCountMap?: Record<string, number>;
 };
 
@@ -268,6 +269,9 @@ export type GraphEdge = {
   description?: string;
   condition?: (state: BaseGraphState) => boolean | string | string[]; // Can return boolean or specific destination(s)
   edgeType?: 'handoff' | 'parallel'; // 'handoff' creates tools for dynamic routing, 'parallel' creates direct edges for simultaneous execution
+  promptInstructions?:
+    | string
+    | ((messages: BaseMessage[]) => string | undefined); // Optional prompt to add when transitioning through this edge
 };
 
 export type MultiAgentGraphInput = StandardGraphInput & {

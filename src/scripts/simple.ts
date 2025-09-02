@@ -1,5 +1,6 @@
 // src/scripts/cli.ts
 import { config } from 'dotenv';
+import { v4 as uuidv4 } from 'uuid';
 config();
 import {
   HumanMessage,
@@ -123,7 +124,7 @@ async function testStandardStreaming(): Promise<void> {
   }
 
   const run = await Run.create<t.IState>({
-    runId: 'test-run-id',
+    runId: uuidv4(),
     graphConfig: {
       type: 'standard',
       llmConfig,
