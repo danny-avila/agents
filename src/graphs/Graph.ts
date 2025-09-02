@@ -750,8 +750,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
     };
   }
 
-  // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
-  createAgentNode(agentId: string) {
+  createAgentNode(agentId: string): t.CompiledStateWorkflow {
     const agentContext = this.agentContexts.get(agentId);
     if (!agentContext) {
       throw new Error(`Agent context not found for agentId: ${agentId}`);
@@ -802,8 +801,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
     return workflow.compile(this.compileOptions as unknown as never);
   }
 
-  // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
-  createWorkflow() {
+  createWorkflow(): t.CompiledStateWorkflow {
     /** Use the default (first) agent for now */
     const agentNode = this.createAgentNode(this.defaultAgentId);
     const StateAnnotation = Annotation.Root({

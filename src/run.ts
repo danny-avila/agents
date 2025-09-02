@@ -31,12 +31,12 @@ export const defaultOmitOptions = new Set([
   'additionalModelRequestFields',
 ]);
 
-export class Run<T extends t.BaseGraphState> {
+export class Run<_T extends t.BaseGraphState> {
   id: string;
   private tokenCounter?: t.TokenCounter;
   private handlerRegistry: HandlerRegistry;
   private indexTokenCountMap?: Record<string, number>;
-  graphRunnable?: t.CompiledWorkflow<T, Partial<T>, string>;
+  graphRunnable?: t.CompiledStateWorkflow;
   Graph: StandardGraph | undefined;
   returnContent: boolean = false;
 
@@ -68,9 +68,7 @@ export class Run<T extends t.BaseGraphState> {
 
     /** TEMP: use `standard` for `legacy` for now */
     if (config.graphConfig.type === 'standard') {
-      this.graphRunnable = this.createLegacyGraph(
-        config.graphConfig
-      ) as unknown as t.CompiledWorkflow<T, Partial<T>, string>;
+      this.graphRunnable = this.createLegacyGraph(config.graphConfig);
       if (this.Graph) {
         this.Graph.compileOptions =
           config.graphConfig.compileOptions ?? this.Graph.compileOptions;
@@ -83,7 +81,7 @@ export class Run<T extends t.BaseGraphState> {
 
   private createLegacyGraph(
     config: t.LegacyGraphConfig
-  ): t.CompiledWorkflow<t.IState, Partial<t.IState>, string> {
+  ): t.CompiledStateWorkflow {
     const {
       type: _type,
       llmConfig,

@@ -2,7 +2,11 @@
 import type {
   StateGraph,
   StateGraphArgs,
+  StateDefinition,
   CompiledStateGraph,
+  StateType,
+  UpdateType,
+  BinaryOperatorAggregate,
 } from '@langchain/langgraph';
 import type { BindToolsInput } from '@langchain/core/language_models/chat_models';
 import type {
@@ -67,6 +71,23 @@ export type CompiledWorkflow<
   U extends Partial<T> = Partial<T>,
   N extends string = string,
 > = CompiledStateGraph<T, U, N>;
+
+export type CompiledStateWorkflow = CompiledStateGraph<
+  StateType<{
+    messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
+  }>,
+  UpdateType<{
+    messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
+  }>,
+  string,
+  {
+    messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
+  },
+  {
+    messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
+  },
+  StateDefinition
+>;
 
 export type SystemRunnable =
   | Runnable<
