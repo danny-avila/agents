@@ -767,8 +767,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
       currentModel = agentContext.systemRunnable.pipe(currentModel);
     }
 
-    const agentNode = `${AGENT}${agentId}`;
-    const toolNode = `${TOOLS}${agentId}`;
+    const agentNode = `${AGENT}${agentId}` as const;
+    const toolNode = `${TOOLS}${agentId}` as const;
 
     const routeMessage = (
       state: t.BaseGraphState,
