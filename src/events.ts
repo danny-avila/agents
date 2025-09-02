@@ -22,23 +22,6 @@ export class HandlerRegistry {
   }
 }
 
-export class FanoutMetricsHandler implements t.EventHandler {
-  handle(
-    event: string,
-    data: t.StreamEventData | undefined,
-    metadata?: Record<string, unknown>
-  ): void {
-    if (event !== 'fanout_branch_end') return;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const detail = data as any;
-    const provider = detail?.provider ?? '';
-    const duration = detail?.duration ?? 0;
-    const status = detail?.status ?? 'unknown';
-    // Minimal structured log; can be wired to metrics sink
-    console.log('[fanout]', { provider, duration, status, metadata });
-  }
-}
-
 export class ModelEndHandler implements t.EventHandler {
   collectedUsage?: UsageMetadata[];
   constructor(collectedUsage?: UsageMetadata[]) {
