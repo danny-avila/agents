@@ -63,6 +63,7 @@
     "multi-agent-supervisor": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/multi-agent-supervisor.ts",
     "multi-agent-list-handoff": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/test-multi-agent-list-handoff.ts",
     "test-handoff-input": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/test-handoff-input.ts",
+    "test-custom-prompt-key": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/test-custom-prompt-key.ts",
     "script2": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/proto/example_test.ts",
     "script3": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/proto/example_test_anthropic.ts",
     "script4": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/cli4.ts --name 'Jo' --location 'New York, NY'",
