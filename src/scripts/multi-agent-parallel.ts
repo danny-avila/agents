@@ -167,10 +167,12 @@ async function testParallelMultiAgent() {
       description: 'Aggregate analysis results',
       edgeType: 'direct', // Fan-in is also direct
       // Add prompt when all analysts have provided input
-      promptInstructions: (messages) => {
+      promptInstructions: (messages, runStartIndex) => {
         // Check if we have analysis content from all three analysts
         // Look for the specific headers each analyst uses
-        const aiMessages = messages.filter((msg) => msg._getType() === 'ai');
+        const aiMessages = messages.filter(
+          (msg, index) => msg.getType() === 'ai' && index >= runStartIndex
+        );
         const messageContent = aiMessages.map((msg) => msg.content).join('\n');
 
         const hasFinancialAnalysis = messageContent.includes(
