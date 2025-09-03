@@ -61,6 +61,7 @@ export function getTokenCountForMessage(
 }
 
 let encoderPromise: Promise<Tiktoken> | undefined;
+let tokenCounterPromise: Promise<(message: BaseMessage) => number> | undefined;
 
 async function getSharedEncoder(): Promise<Tiktoken> {
   if (encoderPromise) {
@@ -74,9 +75,55 @@ async function getSharedEncoder(): Promise<Tiktoken> {
   return encoderPromise;
 }
 
-export const createTokenCounter = async () => {
-  const enc = await getSharedEncoder();
-  const countTokens = (text: string): number => enc.encode(text).length;
-  return (message: BaseMessage): number =>
-    getTokenCountForMessage(message, countTokens);
+/**
+ * Creates a singleton token counter function that reuses the same encoder instance.
+ * This avoids creating multiple function closures and prevents potential memory issues.
+ */
+export const createTokenCounter = async (): Promise<
+  (message: BaseMessage) => number
+> => {
+  if (tokenCounterPromise) {
+    return tokenCounterPromise;
+  }
+
+  tokenCounterPromise = (async (): Promise<
+    (message: BaseMessage) => number
+  > => {
+    const enc = await getSharedEncoder();
+    const countTokens = (text: string): number => enc.encode(text).length;
+    return (message: BaseMessage): number =>
+      getTokenCountForMessage(message, countTokens);
+  })();
+
+  return tokenCounterPromise;
+};
+
+/**
+ * Utility to manage the token encoder lifecycle explicitly.
+ * Useful for applications that need fine-grained control over resource management.
+ */
+export const TokenEncoderManager = {
+  /**
+   * Pre-initializes the encoder. This can be called during app startup
+   * to avoid lazy loading delays later.
+   */
+  async initialize(): Promise<void> {
+    await getSharedEncoder();
+  },
+
+  /**
+   * Clears the cached encoder and token counter.
+   * Useful for testing or when you need to force a fresh reload.
+   */
+  reset(): void {
+    encoderPromise = undefined;
+    tokenCounterPromise = undefined;
+  },
+
+  /**
+   * Checks if the encoder has been initialized.
+   */
+  isInitialized(): boolean {
+    return encoderPromise !== undefined;
+  },
 };
