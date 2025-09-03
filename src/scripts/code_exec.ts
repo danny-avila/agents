@@ -54,8 +54,8 @@ async function testCodeExecution(): Promise<void> {
         event: GraphEvents.ON_RUN_STEP_DELTA,
         data: t.StreamEventData
       ): void => {
-        console.log('====== ON_RUN_STEP_DELTA ======');
-        console.dir(data, { depth: null });
+        // console.log('====== ON_RUN_STEP_DELTA ======');
+        // console.dir(data, { depth: null });
         aggregateContent({ event, data: data as t.RunStepDeltaEvent });
       },
     },
@@ -64,8 +64,8 @@ async function testCodeExecution(): Promise<void> {
         event: GraphEvents.ON_MESSAGE_DELTA,
         data: t.StreamEventData
       ): void => {
-        console.log('====== ON_MESSAGE_DELTA ======');
-        console.dir(data, { depth: null });
+        // console.log('====== ON_MESSAGE_DELTA ======');
+        // console.dir(data, { depth: null });
         aggregateContent({ event, data: data as t.MessageDeltaEvent });
       },
     },
@@ -176,7 +176,7 @@ async function testCodeExecution(): Promise<void> {
     conversationHistory.push(...finalMessages2);
   }
   console.log('\n\n====================\n\n');
-  console.dir(contentParts, { depth: null });
+  console.dir(finalContentParts2, { depth: null });
 
   const { handleLLMEnd, collected } = createMetadataAggregator();
   const titleResult = await run.generateTitle({

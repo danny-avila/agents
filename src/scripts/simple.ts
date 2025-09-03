@@ -1,5 +1,6 @@
 // src/scripts/cli.ts
 import { config } from 'dotenv';
+import { v4 as uuidv4 } from 'uuid';
 config();
 import {
   HumanMessage,
@@ -42,7 +43,7 @@ async function testStandardStreaming(): Promise<void> {
         data: t.StreamEventData
       ): void => {
         console.log('====== ON_RUN_STEP_COMPLETED ======');
-        // console.dir(data, { depth: null });
+        console.dir(data, { depth: null });
         aggregateContent({
           event,
           data: data as unknown as { result: t.ToolEndEvent },
@@ -129,7 +130,7 @@ async function testStandardStreaming(): Promise<void> {
   }
 
   const run = await Run.create<t.IState>({
-    runId: 'test-run-id',
+    runId: uuidv4(),
     graphConfig: {
       type: 'standard',
       llmConfig,

@@ -1,39 +1,87 @@
 // src/types/graph.ts
 import type {
-  StateGraphArgs,
+  START,
+  StateType,
+  UpdateType,
   StateGraph,
+  StateGraphArgs,
+  StateDefinition,
   CompiledStateGraph,
+  BinaryOperatorAggregate,
 } from '@langchain/langgraph';
 import type { BindToolsInput } from '@langchain/core/language_models/chat_models';
-import type { BaseMessage, AIMessageChunk } from '@langchain/core/messages';
+import type {
+  BaseMessage,
+  AIMessageChunk,
+  SystemMessage,
+} from '@langchain/core/messages';
+import type { RunnableConfig, Runnable } from '@langchain/core/runnables';
 import type { ChatGenerationChunk } from '@langchain/core/outputs';
 import type { GoogleAIToolType } from '@langchain/google-common';
-import type { RunnableConfig } from '@langchain/core/runnables';
-import type { ToolMap, GenericTool } from '@/types/tools';
+import type { ToolMap, ToolEndEvent, GenericTool } from '@/types/tools';
+import type { Providers, Callback, GraphNodeKeys } from '@/common';
+import type { StandardGraph, MultiAgentGraph } from '@/graphs';
 import type { ClientOptions } from '@/types/llm';
-import type { Providers } from '@/common';
-import type { Graph } from '@/graphs';
-// import type { RunnableConfig } from '@langchain/core/runnables';
+import type {
+  RunStep,
+  RunStepDeltaEvent,
+  MessageDeltaEvent,
+  ReasoningDeltaEvent,
+} from '@/types/stream';
+import type { TokenCounter } from '@/types/run';
+
+/** Interface for bound model with stream and invoke methods */
+export interface ChatModel {
+  stream?: (
+    messages: BaseMessage[],
+    config?: RunnableConfig
+  ) => Promise<AsyncIterable<AIMessageChunk>>;
+  invoke: (
+    messages: BaseMessage[],
+    config?: RunnableConfig
+  ) => Promise<AIMessageChunk>;
+}
+
+export type GraphNode = GraphNodeKeys | typeof START;
+export type ClientCallback<T extends unknown[]> = (
+  graph: StandardGraph,
+  ...args: T
+) => void;
+
+export type ClientCallbacks = {
+  [Callback.TOOL_ERROR]?: ClientCallback<[Error, string]>;
+  [Callback.TOOL_START]?: ClientCallback<unknown[]>;
+  [Callback.TOOL_END]?: ClientCallback<unknown[]>;
+};
+
+export type SystemCallbacks = {
+  [K in keyof ClientCallbacks]: ClientCallbacks[K] extends ClientCallback<
+    infer Args
+  >
+    ? (...args: Args) => void
+    : never;
+};
 
 export type BaseGraphState = {
   messages: BaseMessage[];
-  // [key: string]: unknown;
 };
 
 export type IState = BaseGraphState;
 
-// export interface IState extends BaseGraphState {
-//   instructions?: string;
-//   additional_instructions?: string;
-// }
-
 export interface EventHandler {
   handle(
     event: string,
-    data: StreamEventData | ModelEndData,
+    data:
+      | StreamEventData
+      | ModelEndData
+      | RunStep
+      | RunStepDeltaEvent
+      | MessageDeltaEvent
+      | ReasoningDeltaEvent
+      | { result: ToolEndEvent },
     metadata?: Record<string, unknown>,
-    graph?: Graph
-  ): void;
+    graph?: StandardGraph | MultiAgentGraph
+  ): void | Promise<void>;
 }
 
 export type GraphStateChannels<T extends BaseGraphState> =
@@ -50,6 +98,65 @@ export type CompiledWorkflow<
   U extends Partial<T> = Partial<T>,
   N extends string = string,
 > = CompiledStateGraph<T, U, N>;
+
+export type CompiledStateWorkflow = CompiledStateGraph<
+  StateType<{
+    messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
+  }>,
+  UpdateType<{
+    messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
+  }>,
+  string,
+  {
+    messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
+  },
+  {
+    messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
+  },
+  StateDefinition
+>;
+
+export type CompiledAgentWorfklow = CompiledStateGraph<
+  {
+    messages: BaseMessage[];
+  },
+  {
+    messages?: BaseMessage[] | undefined;
+  },
+  '__start__' | `agent=${string}` | `tools=${string}`,
+  {
+    messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
+  },
+  {
+    messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
+  },
+  StateDefinition,
+  {
+    [x: `agent=${string}`]: Partial<BaseGraphState>;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    [x: `tools=${string}`]: any;
+  }
+>;
+
+export type SystemRunnable =
+  | Runnable<
+      BaseMessage[],
+      (BaseMessage | SystemMessage)[],
+      RunnableConfig<Record<string, unknown>>
+    >
+  | undefined;
+
+/**
+ * Optional compile options passed to workflow.compile().
+ * These are intentionally untyped to avoid coupling to library internals.
+ */
+export type CompileOptions = {
+  // A checkpointer instance (e.g., MemorySaver, SQL saver)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  checkpointer?: any;
+  interruptBefore?: string[];
+  interruptAfter?: string[];
+};
 
 export type EventStreamCallbackHandlerInput =
   Parameters<CompiledWorkflow['streamEvents']>[2] extends Omit<
@@ -100,6 +207,10 @@ export type StreamEventData = {
    * Custom result from the runnable that generated the event.
    */
   result?: unknown;
+  /**
+   * Custom field to indicate the event was manually emitted, and may have been handled already
+   */
+  emitted?: boolean;
 };
 
 /**
@@ -172,14 +283,42 @@ export type ModelEndData =
 export type GraphTools = GenericTool[] | BindToolsInput[] | GoogleAIToolType[];
 export type StandardGraphInput = {
   runId?: string;
+  signal?: AbortSignal;
+  agents: AgentInputs[];
+  tokenCounter?: TokenCounter;
+  indexTokenCountMap?: Record<string, number>;
+};
+
+export type GraphEdge = {
+  /** Use a list for multiple sources */
+  from: string | string[];
+  /** Use a list for multiple destinations */
+  to: string | string[];
+  description?: string;
+  /** Can return boolean or specific destination(s) */
+  condition?: (state: BaseGraphState) => boolean | string | string[];
+  /** 'handoff' creates tools for dynamic routing, 'direct' creates direct edges, which also allow parallel execution */
+  edgeType?: 'handoff' | 'direct';
+  /** Optional prompt to add when transitioning through this edge */
+  promptInstructions?:
+    | string
+    | ((messages: BaseMessage[]) => string | undefined);
+};
+
+export type MultiAgentGraphInput = StandardGraphInput & {
+  edges: GraphEdge[];
+};
+
+export interface AgentInputs {
+  agentId: string;
   toolEnd?: boolean;
   toolMap?: ToolMap;
+  tools?: GraphTools;
   provider: Providers;
-  signal?: AbortSignal;
   instructions?: string;
   streamBuffer?: number;
-  clientOptions: ClientOptions;
+  maxContextTokens?: number;
+  clientOptions?: ClientOptions;
   additional_instructions?: string;
   reasoningKey?: 'reasoning_content' | 'reasoning';
-  tools?: GraphTools;
-};
+}

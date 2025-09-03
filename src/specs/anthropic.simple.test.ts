@@ -9,7 +9,6 @@ import {
   BaseMessage,
   UsageMetadata,
 } from '@langchain/core/messages';
-import type { StandardGraph } from '@/graphs';
 import type * as t from '@/types';
 import {
   ToolEndHandler,
@@ -161,15 +160,11 @@ describe(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
 
     expect(onMessageDeltaSpy).toHaveBeenCalled();
     expect(onMessageDeltaSpy.mock.calls.length).toBeGreaterThan(1);
-    expect(
-      (onMessageDeltaSpy.mock.calls[0][3] as StandardGraph).provider
-    ).toBeDefined();
+    expect(onMessageDeltaSpy.mock.calls[0][3]).toBeDefined(); // Graph exists
 
     expect(onRunStepSpy).toHaveBeenCalled();
     expect(onRunStepSpy.mock.calls.length).toBeGreaterThan(0);
-    expect(
-      (onRunStepSpy.mock.calls[0][3] as StandardGraph).provider
-    ).toBeDefined();
+    expect(onRunStepSpy.mock.calls[0][3]).toBeDefined(); // Graph exists
 
     const { handleLLMEnd, collected } = createMetadataAggregator();
     const titleResult = await run.generateTitle({
@@ -177,6 +172,10 @@ describe(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
       inputText: userMessage,
       titleMethod: TitleMethod.STRUCTURED,
       contentParts,
+      clientOptions: {
+        ...llmConfig,
+        model: 'claude-3-5-haiku-latest',
+      },
       chainOptions: {
         callbacks: [
           {
@@ -229,6 +228,10 @@ describe(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
       inputText: userMessage,
       titleMethod: TitleMethod.COMPLETION, // Using completion method
       contentParts,
+      clientOptions: {
+        ...llmConfig,
+        model: 'claude-3-5-haiku-latest',
+      },
       chainOptions: {
         callbacks: [
           {
