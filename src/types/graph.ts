@@ -303,6 +303,8 @@ export type GraphEdge = {
   promptInstructions?:
     | string
     | ((messages: BaseMessage[], runStartIndex: number) => string | undefined);
+  /** When true, excludes messages from startIndex when adding promptInstructions */
+  excludeResults?: boolean;
 };
 
 export type MultiAgentGraphInput = StandardGraphInput & {

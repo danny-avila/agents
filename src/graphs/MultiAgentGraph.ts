@@ -300,7 +300,8 @@ export class MultiAgentGraph extends StandardGraph {
       builder.addEdge(START, startNode);
     }
 
-    /** Add direct edges for automatic transitions
+    /**
+     * Add direct edges for automatic transitions
      * Group edges by destination to handle fan-in scenarios
      */
     const edgesByDestination = new Map<string, t.GraphEdge[]>();
@@ -323,11 +324,20 @@ export class MultiAgentGraph extends StandardGraph {
       );
 
       if (edgesWithPrompt.length > 0) {
-        // Fan-in with prompt: create a single wrapper node for this destination
+        /**
+         * Single wrapper node for destination (Fan-in with prompt)
+         */
         const wrapperNodeId = `fan_in_${destination}_prompt`;
-
-        // Use the first edge's prompt instructions (they should all be the same for fan-in)
+        /**
+         * First edge's `promptInstructions`
+         * (they should all be the same for fan-in)
+         */
         const promptInstructions = edgesWithPrompt[0].promptInstructions;
+        /**
+         * First edge's `excludeResults` flag
+         * (they should all be the same for fan-in)
+         */
+        const excludeResults = edgesWithPrompt[0].excludeResults;
 
         builder.addNode(wrapperNodeId, async (state: t.BaseGraphState) => {
           let promptText: string | undefined;
@@ -339,17 +349,28 @@ export class MultiAgentGraph extends StandardGraph {
           }
 
           if (promptText != null && promptText !== '') {
-            // Return state with the prompt message added
+            /**
+             * Messages to include based on `excludeResults`,
+             * excluded from `startIndex` onwards.
+             * Includes all messages by default.
+             */
+            let messagesToInclude: BaseMessage[];
+            if (excludeResults) {
+              messagesToInclude = state.messages.slice(0, this.startIndex);
+            } else {
+              messagesToInclude = state.messages;
+            }
+
             return {
-              messages: [...state.messages, new HumanMessage(promptText)],
+              messages: [...messagesToInclude, new HumanMessage(promptText)],
             };
           }
 
-          // No prompt needed, return empty update
+          /** No prompt needed, return empty update */
           return {};
         });
 
-        // Add edges from all sources to the wrapper, then wrapper to destination
+        /** Add edges from all sources to the wrapper, then wrapper to destination */
         for (const edge of edges) {
           const sources = Array.isArray(edge.from) ? edge.from : [edge.from];
           for (const source of sources) {
@@ -359,12 +380,12 @@ export class MultiAgentGraph extends StandardGraph {
           }
         }
 
-        // Single edge from wrapper to destination
+        /** Single edge from wrapper to destination */
         // eslint-disable-next-line @typescript-eslint/ban-ts-comment
         /** @ts-ignore */
         builder.addEdge(wrapperNodeId, destination);
       } else {
-        // No prompt instructions, add direct edges
+        /** No prompt instructions, add direct edges */
         for (const edge of edges) {
           const sources = Array.isArray(edge.from) ? edge.from : [edge.from];
           for (const source of sources) {
