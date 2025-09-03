@@ -12,7 +12,6 @@ export * from './graphs';
 export * from './tools/CodeExecutor';
 export * from './tools/handlers';
 export * from './tools/search';
-export * from './tools/handoff';
 
 /* Misc. */
 export * from './common';
