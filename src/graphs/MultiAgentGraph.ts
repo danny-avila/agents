@@ -142,7 +142,7 @@ export class MultiAgentGraph extends StandardGraph {
     const tools: t.GenericTool[] = [];
     const destinations = Array.isArray(edge.to) ? edge.to : [edge.to];
 
-    // If there's a condition, create a single conditional handoff tool
+    /** If there's a condition, create a single conditional handoff tool */
     if (edge.condition != null) {
       const toolName = 'conditional_transfer';
       const toolDescription =
@@ -156,18 +156,18 @@ export class MultiAgentGraph extends StandardGraph {
               (config as ToolRunnableConfig | undefined)?.toolCall?.id ??
               'unknown';
 
-            // Evaluate condition
+            /** Evaluated condition */
             const result = edge.condition!(state);
             let destination: string;
 
             if (typeof result === 'boolean') {
-              // If true, use first destination; if false, don't transfer
+              /** If true, use first destination; if false, don't transfer */
               if (!result) return null;
               destination = destinations[0];
             } else if (typeof result === 'string') {
               destination = result;
             } else {
-              // Array of destinations - for now, use the first
+              /** Array of destinations - for now, use the first */
               destination = Array.isArray(result) ? result[0] : destinations[0];
             }
 
@@ -191,7 +191,7 @@ export class MultiAgentGraph extends StandardGraph {
         )
       );
     } else {
-      // Create individual tools for each destination
+      /** Create individual tools for each destination */
       for (const destination of destinations) {
         const toolName = `transfer_to_${destination}`;
         const toolDescription =
@@ -234,7 +234,7 @@ export class MultiAgentGraph extends StandardGraph {
    * Create a complete agent subgraph (similar to createReactAgent)
    */
   private createAgentSubgraph(agentId: string): t.CompiledAgentWorfklow {
-    // This is essentially the same as createAgentNode from StandardGraph
+    /** This is essentially the same as `createAgentNode` from `StandardGraph` */
     return this.createAgentNode(agentId);
   }
 
@@ -252,6 +252,12 @@ export class MultiAgentGraph extends StandardGraph {
           this.messages = result;
           return result;
         },
+        default: () => [],
+      }),
+      /** Channel for passing filtered messages to agents when excludeResults is true */
+      agentMessages: Annotation<BaseMessage[]>({
+        /** Replaces state entirely */
+        reducer: (a, b) => b,
         default: () => [],
       }),
     });
@@ -282,18 +288,40 @@ export class MultiAgentGraph extends StandardGraph {
         }
       }
 
-      // If agent has handoff destinations, add END to possible ends
-      // If agent only has direct destinations, it naturally ends without explicit END
+      /** If agent has handoff destinations, add END to possible ends
+       * If agent only has direct destinations, it naturally ends without explicit END
+       */
       const destinations = new Set([...handoffDestinations]);
       if (handoffDestinations.size > 0 || directDestinations.size === 0) {
         destinations.add(END);
       }
 
-      // Create the agent subgraph (includes agent + tools)
+      /** Agent subgraph (includes agent + tools) */
       const agentSubgraph = this.createAgentSubgraph(agentId);
 
-      // Add the agent as a node with its possible destinations
-      builder.addNode(agentId, agentSubgraph, {
+      /** Wrapper function that handles agentMessages channel */
+      const agentWrapper = async (
+        state: t.MultiAgentGraphState
+      ): Promise<t.MultiAgentGraphState> => {
+        if (state.agentMessages != null && state.agentMessages.length > 0) {
+          /** Temporary state with messages replaced by `agentMessages` */
+          const transformedState: t.MultiAgentGraphState = {
+            ...state,
+            messages: state.agentMessages,
+          };
+          const result = await agentSubgraph.invoke(transformedState);
+          return {
+            ...result,
+            /** Clear agentMessages for next agent */
+            agentMessages: [],
+          };
+        } else {
+          return await agentSubgraph.invoke(state);
+        }
+      };
+
+      /** Wrapped agent as a node with its possible destinations */
+      builder.addNode(agentId, agentWrapper, {
         ends: Array.from(destinations),
       });
     }
@@ -359,29 +387,33 @@ export class MultiAgentGraph extends StandardGraph {
               const formattedPromptValue = await promptTemplate.invoke({
                 results: resultsString,
               });
-              promptText = formattedPromptValue.toString();
-
-              effectiveExcludeResults = excludeResults ?? true;
+              promptText = formattedPromptValue.messages[0].content.toString();
+              effectiveExcludeResults =
+                excludeResults !== false && promptText !== '';
             } else {
               promptText = promptInstructions;
             }
           }
 
           if (promptText != null && promptText !== '') {
-            /**
-             * Messages to include based on `excludeResults`,
-             * excluded from `startIndex` onwards.
-             * Includes all messages by default.
-             */
-            let messagesToInclude: BaseMessage[];
-            if (effectiveExcludeResults) {
-              messagesToInclude = state.messages.slice(0, this.startIndex);
-            } else {
-              messagesToInclude = state.messages;
+            if (
+              effectiveExcludeResults == null ||
+              effectiveExcludeResults === false
+            ) {
+              return {
+                messages: [new HumanMessage(promptText)],
+              };
             }
 
+            /** When `excludeResults` is true, use agentMessages channel
+             * to pass filtered messages + prompt to the destination agent
+             */
+            const filteredMessages = state.messages.slice(0, this.startIndex);
             return {
-              messages: [...messagesToInclude, new HumanMessage(promptText)],
+              messages: [new HumanMessage(promptText)],
+              agentMessages: messagesStateReducer(filteredMessages, [
+                new HumanMessage(promptText),
+              ]),
             };
           }
 
