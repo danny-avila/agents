@@ -167,31 +167,33 @@ async function testParallelMultiAgent() {
       description: 'Aggregate analysis results',
       edgeType: 'direct', // Fan-in is also direct
       // Add prompt when all analysts have provided input
-      promptInstructions: (messages, runStartIndex) => {
-        // Check if we have analysis content from all three analysts
-        // Look for the specific headers each analyst uses
-        const aiMessages = messages.filter(
-          (msg, index) => msg.getType() === 'ai' && index >= runStartIndex
-        );
-        const messageContent = aiMessages.map((msg) => msg.content).join('\n');
+      // promptInstructions: (messages, runStartIndex) => {
+      //   // Check if we have analysis content from all three analysts
+      //   // Look for the specific headers each analyst uses
+      //   const aiMessages = messages.filter(
+      //     (msg, index) => msg.getType() === 'ai' && index >= runStartIndex
+      //   );
+      //   const messageContent = aiMessages.map((msg) => msg.content).join('\n');
 
-        const hasFinancialAnalysis = messageContent.includes(
-          'FINANCIAL ANALYSIS:'
-        );
-        const hasTechnicalAnalysis = messageContent.includes(
-          'TECHNICAL ANALYSIS:'
-        );
-        const hasMarketAnalysis = messageContent.includes('MARKET ANALYSIS:');
+      //   const hasFinancialAnalysis = messageContent.includes(
+      //     'FINANCIAL ANALYSIS:'
+      //   );
+      //   const hasTechnicalAnalysis = messageContent.includes(
+      //     'TECHNICAL ANALYSIS:'
+      //   );
+      //   const hasMarketAnalysis = messageContent.includes('MARKET ANALYSIS:');
 
-        console.log(
-          `Checking for analyses - Financial: ${hasFinancialAnalysis}, Technical: ${hasTechnicalAnalysis}, Market: ${hasMarketAnalysis}`
-        );
+      //   console.log(
+      //     `Checking for analyses - Financial: ${hasFinancialAnalysis}, Technical: ${hasTechnicalAnalysis}, Market: ${hasMarketAnalysis}`
+      //   );
 
-        if (hasFinancialAnalysis && hasTechnicalAnalysis && hasMarketAnalysis) {
-          return 'Based on the comprehensive analyses from all three specialist teams above, please synthesize their insights into a cohesive executive summary. Focus on the key findings, common themes, and strategic implications across the financial, technical, and market perspectives.';
-        }
-        return undefined; // No prompt if we haven't received all analyst inputs
-      },
+      //   if (hasFinancialAnalysis && hasTechnicalAnalysis && hasMarketAnalysis) {
+      //     return 'Based on the comprehensive analyses from all three specialist teams above, please synthesize their insights into a cohesive executive summary. Focus on the key findings, common themes, and strategic implications across the financial, technical, and market perspectives.';
+      //   }
+      //   return undefined; // No prompt if we haven't received all analyst inputs
+      // },
+      promptInstructions:
+        'Based on the comprehensive analyses from all three specialist teams below, please synthesize their insights into a cohesive executive summary. Focus on the key findings, common themes, and strategic implications across the financial, technical, and market perspectives.\n\n{results}',
     },
   ];
 
