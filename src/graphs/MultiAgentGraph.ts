@@ -148,9 +148,14 @@ export class MultiAgentGraph extends StandardGraph {
       const toolDescription =
         edge.description ?? 'Conditionally transfer control based on state';
 
+      /** Check if we have a prompt for handoff input */
+      const hasHandoffInput =
+        edge.prompt != null && typeof edge.prompt === 'string';
+      const handoffInputDescription = hasHandoffInput ? edge.prompt : undefined;
+
       tools.push(
         tool(
-          async (_, config) => {
+          async (input, config) => {
             const state = getCurrentTaskInput() as t.BaseGraphState;
             const toolCallId =
               (config as ToolRunnableConfig | undefined)?.toolCall?.id ??
@@ -171,8 +176,17 @@ export class MultiAgentGraph extends StandardGraph {
               destination = Array.isArray(result) ? result[0] : destinations[0];
             }
 
+            let content = `Conditionally transferred to ${destination}`;
+            if (
+              hasHandoffInput &&
+              'instructions' in input &&
+              input.instructions != null
+            ) {
+              content += `\n\nInstructions: ${input.instructions}`;
+            }
+
             const toolMessage = new ToolMessage({
-              content: `Conditionally transferred to ${destination}`,
+              content,
               name: toolName,
               tool_call_id: toolCallId,
             });
@@ -185,7 +199,14 @@ export class MultiAgentGraph extends StandardGraph {
           },
           {
             name: toolName,
-            schema: z.object({}),
+            schema: hasHandoffInput
+              ? z.object({
+                instructions: z
+                  .string()
+                  .optional()
+                  .describe(handoffInputDescription as string),
+              })
+              : z.object({}),
             description: toolDescription,
           }
         )
@@ -197,14 +218,31 @@ export class MultiAgentGraph extends StandardGraph {
         const toolDescription =
           edge.description ?? `Transfer control to agent '${destination}'`;
 
+        /** Check if we have a prompt for handoff input */
+        const hasHandoffInput =
+          edge.prompt != null && typeof edge.prompt === 'string';
+        const handoffInputDescription = hasHandoffInput
+          ? edge.prompt
+          : undefined;
+
         tools.push(
           tool(
-            async (_, config) => {
+            async (input, config) => {
               const toolCallId =
                 (config as ToolRunnableConfig | undefined)?.toolCall?.id ??
                 'unknown';
+
+              let content = `Successfully transferred to ${destination}`;
+              if (
+                hasHandoffInput &&
+                'instructions' in input &&
+                input.instructions != null
+              ) {
+                content += `\n\nInstructions: ${input.instructions}`;
+              }
+
               const toolMessage = new ToolMessage({
-                content: `Successfully transferred to ${destination}`,
+                content,
                 name: toolName,
                 tool_call_id: toolCallId,
               });
@@ -219,7 +257,14 @@ export class MultiAgentGraph extends StandardGraph {
             },
             {
               name: toolName,
-              schema: z.object({}),
+              schema: hasHandoffInput
+                ? z.object({
+                  instructions: z
+                    .string()
+                    .optional()
+                    .describe(handoffInputDescription as string),
+                })
+                : z.object({}),
               description: toolDescription,
             }
           )
