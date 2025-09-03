@@ -1,6 +1,11 @@
 import { z } from 'zod';
 import { tool } from '@langchain/core/tools';
-import { ToolMessage, HumanMessage } from '@langchain/core/messages';
+import {
+  ToolMessage,
+  HumanMessage,
+  getBufferString,
+} from '@langchain/core/messages';
+import { ChatPromptTemplate } from '@langchain/core/prompts';
 import {
   END,
   START,
@@ -341,11 +346,25 @@ export class MultiAgentGraph extends StandardGraph {
 
         builder.addNode(wrapperNodeId, async (state: t.BaseGraphState) => {
           let promptText: string | undefined;
+          let effectiveExcludeResults = excludeResults;
 
           if (typeof promptInstructions === 'function') {
             promptText = promptInstructions(state.messages, this.startIndex);
-          } else {
-            promptText = promptInstructions;
+          } else if (promptInstructions != null) {
+            if (promptInstructions.includes('{results}')) {
+              const resultsMessages = state.messages.slice(this.startIndex);
+              const resultsString = getBufferString(resultsMessages);
+              const promptTemplate =
+                ChatPromptTemplate.fromTemplate(promptInstructions);
+              const formattedPromptValue = await promptTemplate.invoke({
+                results: resultsString,
+              });
+              promptText = formattedPromptValue.toString();
+
+              effectiveExcludeResults = excludeResults ?? true;
+            } else {
+              promptText = promptInstructions;
+            }
           }
 
           if (promptText != null && promptText !== '') {
@@ -355,7 +374,7 @@ export class MultiAgentGraph extends StandardGraph {
              * Includes all messages by default.
              */
             let messagesToInclude: BaseMessage[];
-            if (excludeResults) {
+            if (effectiveExcludeResults) {
               messagesToInclude = state.messages.slice(0, this.startIndex);
             } else {
               messagesToInclude = state.messages;
