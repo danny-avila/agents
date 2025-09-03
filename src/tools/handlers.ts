@@ -4,7 +4,8 @@ import { nanoid } from 'nanoid';
 import { ToolMessage } from '@langchain/core/messages';
 import type { AnthropicWebSearchResultBlockParam } from '@/llm/anthropic/types';
 import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
-import type { Graph } from '@/graphs';
+import type { MultiAgentGraph, StandardGraph } from '@/graphs';
+import type { AgentContext } from '@/agents/AgentContext';
 import type * as t from '@/types';
 import {
   ToolCallTypes,
@@ -21,15 +22,15 @@ import {
 import { formatResultsForLLM } from '@/tools/search/format';
 import { getMessageId } from '@/messages';
 
-export function handleToolCallChunks({
+export async function handleToolCallChunks({
   graph,
   stepKey,
   toolCallChunks,
 }: {
-  graph: Graph;
+  graph: StandardGraph | MultiAgentGraph;
   stepKey: string;
   toolCallChunks: ToolCallChunk[];
-}): void {
+}): Promise<void> {
   let prevStepId: string;
   let prevRunStep: t.RunStep | undefined;
   try {
@@ -38,7 +39,7 @@ export function handleToolCallChunks({
   } catch {
     /** Edge Case: If no previous step exists, create a new message creation step */
     const message_id = getMessageId(stepKey, graph, true) ?? '';
-    prevStepId = graph.dispatchRunStep(stepKey, {
+    prevStepId = await graph.dispatchRunStep(stepKey, {
       type: StepTypes.MESSAGE_CREATION,
       message_creation: {
         message_id,
@@ -81,7 +82,7 @@ export function handleToolCallChunks({
     prevRunStep?.type === StepTypes.MESSAGE_CREATION &&
     graph.messageStepHasToolCalls.has(prevStepId);
   if (!alreadyDispatched && tool_calls?.length === toolCallChunks.length) {
-    graph.dispatchMessageDelta(prevStepId, {
+    await graph.dispatchMessageDelta(prevStepId, {
       content: [
         {
           type: ContentTypes.TEXT,
@@ -91,22 +92,22 @@ export function handleToolCallChunks({
       ],
     });
     graph.messageStepHasToolCalls.set(prevStepId, true);
-    stepId = graph.dispatchRunStep(stepKey, {
+    stepId = await graph.dispatchRunStep(stepKey, {
       type: StepTypes.TOOL_CALLS,
       tool_calls,
     });
   }
-  graph.dispatchRunStepDelta(stepId, {
+  await graph.dispatchRunStepDelta(stepId, {
     type: StepTypes.TOOL_CALLS,
     tool_calls: toolCallChunks,
   });
 }
 
-export const handleToolCalls = (
+export const handleToolCalls = async (
   toolCalls?: ToolCall[],
   metadata?: Record<string, unknown>,
-  graph?: Graph
-): void => {
+  graph?: StandardGraph | MultiAgentGraph
+): Promise<void> => {
   if (!graph || !metadata) {
     console.warn(`Graph or metadata not found in ${event} event`);
     return;
@@ -138,8 +139,10 @@ export const handleToolCalls = (
       // no previous step
     }
 
-    const dispatchToolCallIds = (lastMessageStepId: string): void => {
-      graph.dispatchMessageDelta(lastMessageStepId, {
+    const dispatchToolCallIds = async (
+      lastMessageStepId: string
+    ): Promise<void> => {
+      await graph.dispatchMessageDelta(lastMessageStepId, {
         content: [
           {
             type: 'text',
@@ -155,7 +158,7 @@ export const handleToolCalls = (
       prevRunStep &&
       prevRunStep.type === StepTypes.MESSAGE_CREATION
     ) {
-      dispatchToolCallIds(prevStepId);
+      await dispatchToolCallIds(prevStepId);
       graph.messageStepHasToolCalls.set(prevStepId, true);
       /* If the previous step doesn't exist or is not a message creation */
     } else if (
@@ -163,17 +166,17 @@ export const handleToolCalls = (
       prevRunStep.type !== StepTypes.MESSAGE_CREATION
     ) {
       const messageId = getMessageId(stepKey, graph, true) ?? '';
-      const stepId = graph.dispatchRunStep(stepKey, {
+      const stepId = await graph.dispatchRunStep(stepKey, {
         type: StepTypes.MESSAGE_CREATION,
         message_creation: {
           message_id: messageId,
         },
       });
-      dispatchToolCallIds(stepId);
+      await dispatchToolCallIds(stepId);
       graph.messageStepHasToolCalls.set(prevStepId, true);
     }
 
-    graph.dispatchRunStep(stepKey, {
+    await graph.dispatchRunStep(stepKey, {
       type: StepTypes.TOOL_CALLS,
       tool_calls: [tool_call],
     });
@@ -193,17 +196,19 @@ export const toolResultTypes = new Set([
  * Handles the result of a server tool call; in other words, a provider's built-in tool.
  * As of 2025-07-06, only Anthropic handles server tool calls with this pattern.
  */
-export function handleServerToolResult({
+export async function handleServerToolResult({
+  graph,
   content,
   metadata,
-  graph,
+  agentContext,
 }: {
+  graph: StandardGraph | MultiAgentGraph;
   content?: string | t.MessageContentComplex[];
   metadata?: Record<string, unknown>;
-  graph: Graph;
-}): boolean {
+  agentContext?: AgentContext;
+}): Promise<boolean> {
   let skipHandling = false;
-  if (metadata?.provider !== Providers.ANTHROPIC) {
+  if (agentContext?.provider !== Providers.ANTHROPIC) {
     return skipHandling;
   }
   if (
@@ -256,7 +261,7 @@ export function handleServerToolResult({
       contentPart.type === 'web_search_result' ||
       contentPart.type === 'web_search_tool_result'
     ) {
-      handleAnthropicSearchResults({
+      await handleAnthropicSearchResults({
         contentPart: contentPart as t.ToolResultContent,
         toolCall,
         metadata,
@@ -272,7 +277,7 @@ export function handleServerToolResult({
   return skipHandling;
 }
 
-function handleAnthropicSearchResults({
+async function handleAnthropicSearchResults({
   contentPart,
   toolCall,
   metadata,
@@ -281,8 +286,8 @@ function handleAnthropicSearchResults({
   contentPart: t.ToolResultContent;
   toolCall: Partial<ToolCall>;
   metadata?: Record<string, unknown>;
-  graph: Graph;
-}): void {
+  graph: StandardGraph | MultiAgentGraph;
+}): Promise<void> {
   if (!Array.isArray(contentPart.content)) {
     console.warn(
       `Expected content to be an array, got ${typeof contentPart.content}`
@@ -324,7 +329,7 @@ function handleAnthropicSearchResults({
     input,
     output,
   };
-  graph.handlerRegistry
+  await graph.handlerRegistry
     ?.getHandler(GraphEvents.TOOL_END)
     ?.handle(GraphEvents.TOOL_END, toolEndData, metadata, graph);
 

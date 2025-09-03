@@ -13,7 +13,6 @@ import type { BaseMessage, AIMessage } from '@langchain/core/messages';
 import type { StructuredToolInterface } from '@langchain/core/tools';
 import type * as t from '@/types';
 import { RunnableCallable } from '@/utils';
-import { GraphNodeKeys } from '@/common';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export class ToolNode<T = any> extends RunnableCallable<T, T> {
@@ -150,10 +149,11 @@ function areToolCallsInvoked(
   );
 }
 
-export function toolsCondition(
+export function toolsCondition<T extends string>(
   state: BaseMessage[] | typeof MessagesAnnotation.State,
+  toolNode: T,
   invokedToolIds?: Set<string>
-): 'tools' | typeof END {
+): T | typeof END {
   const message: AIMessage = Array.isArray(state)
     ? state[state.length - 1]
     : state.messages[state.messages.length - 1];
@@ -163,7 +163,7 @@ export function toolsCondition(
     (message.tool_calls?.length ?? 0) > 0 &&
     !areToolCallsInvoked(message, invokedToolIds)
   ) {
-    return GraphNodeKeys.TOOLS;
+    return toolNode;
   } else {
     return END;
   }

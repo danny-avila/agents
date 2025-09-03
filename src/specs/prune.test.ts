@@ -725,18 +725,17 @@ describe('Prune Messages Tests', () => {
           type: 'standard',
           llmConfig,
           instructions: 'You are a helpful assistant.',
+          maxContextTokens: 1000,
         },
         returnContent: true,
+        tokenCounter,
+        indexTokenCountMap: {},
       });
 
       // Override the model to use a fake LLM
       run.Graph?.overrideTestModel(['This is a test response'], 1);
 
       const messages = [new HumanMessage('Hello, how are you?')];
-
-      const indexTokenCountMap = {
-        0: tokenCounter(messages[0]),
-      };
 
       const config: Partial<RunnableConfig> & {
         version: 'v1' | 'v2';
@@ -749,11 +748,7 @@ describe('Prune Messages Tests', () => {
         version: 'v2' as const,
       };
 
-      await run.processStream({ messages }, config, {
-        maxContextTokens: 1000,
-        indexTokenCountMap,
-        tokenCounter,
-      });
+      await run.processStream({ messages }, config);
 
       const finalMessages = run.getRunMessages();
       expect(finalMessages).toBeDefined();
