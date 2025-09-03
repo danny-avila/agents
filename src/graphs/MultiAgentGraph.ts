@@ -333,7 +333,7 @@ export class MultiAgentGraph extends StandardGraph {
           let promptText: string | undefined;
 
           if (typeof promptInstructions === 'function') {
-            promptText = promptInstructions(state.messages);
+            promptText = promptInstructions(state.messages, this.startIndex);
           } else {
             promptText = promptInstructions;
           }
