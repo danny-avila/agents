@@ -22,7 +22,7 @@ import { StandardGraph } from './Graph';
 export class MultiAgentGraph extends StandardGraph {
   private edges: t.GraphEdge[];
   private startingNodes: Set<string> = new Set();
-  private parallelEdges: t.GraphEdge[] = [];
+  private directEdges: t.GraphEdge[] = [];
   private handoffEdges: t.GraphEdge[] = [];
 
   constructor(input: t.MultiAgentGraphInput) {
@@ -34,24 +34,24 @@ export class MultiAgentGraph extends StandardGraph {
   }
 
   /**
-   * Categorize edges into handoff and parallel types
+   * Categorize edges into handoff and direct types
    */
   private categorizeEdges(): void {
     for (const edge of this.edges) {
       // Default behavior: edges with conditions or explicit 'handoff' type are handoff edges
-      // Edges with explicit 'direct' type or multi-destination without conditions are parallel edges
+      // Edges with explicit 'direct' type or multi-destination without conditions are direct edges
       if (edge.edgeType === 'direct') {
-        this.parallelEdges.push(edge);
+        this.directEdges.push(edge);
       } else if (edge.edgeType === 'handoff' || edge.condition != null) {
         this.handoffEdges.push(edge);
       } else {
-        // Default: single-to-single edges are handoff, single-to-multiple are parallel
+        // Default: single-to-single edges are handoff, single-to-multiple are direct
         const destinations = Array.isArray(edge.to) ? edge.to : [edge.to];
         const sources = Array.isArray(edge.from) ? edge.from : [edge.from];
 
         if (sources.length === 1 && destinations.length > 1) {
-          // Fan-out pattern defaults to parallel
-          this.parallelEdges.push(edge);
+          // Fan-out pattern defaults to direct
+          this.directEdges.push(edge);
         } else {
           // Everything else defaults to handoff
           this.handoffEdges.push(edge);
@@ -257,7 +257,7 @@ export class MultiAgentGraph extends StandardGraph {
     for (const [agentId] of this.agentContexts) {
       // Get all possible destinations for this agent
       const handoffDestinations = new Set<string>();
-      const parallelDestinations = new Set<string>();
+      const directDestinations = new Set<string>();
 
       // Check handoff edges for destinations
       for (const edge of this.handoffEdges) {
@@ -268,19 +268,19 @@ export class MultiAgentGraph extends StandardGraph {
         }
       }
 
-      // Check parallel edges for destinations
-      for (const edge of this.parallelEdges) {
+      // Check direct edges for destinations
+      for (const edge of this.directEdges) {
         const sources = Array.isArray(edge.from) ? edge.from : [edge.from];
         if (sources.includes(agentId) === true) {
           const dests = Array.isArray(edge.to) ? edge.to : [edge.to];
-          dests.forEach((dest) => parallelDestinations.add(dest));
+          dests.forEach((dest) => directDestinations.add(dest));
         }
       }
 
       // If agent has handoff destinations, add END to possible ends
-      // If agent only has parallel destinations, it naturally ends without explicit END
+      // If agent only has direct destinations, it naturally ends without explicit END
       const destinations = new Set([...handoffDestinations]);
-      if (handoffDestinations.size > 0 || parallelDestinations.size === 0) {
+      if (handoffDestinations.size > 0 || directDestinations.size === 0) {
         destinations.add(END);
       }
 
@@ -300,12 +300,12 @@ export class MultiAgentGraph extends StandardGraph {
       builder.addEdge(START, startNode);
     }
 
-    /** Add direct edges for parallel execution
+    /** Add direct edges for automatic transitions
      * Group edges by destination to handle fan-in scenarios
      */
     const edgesByDestination = new Map<string, t.GraphEdge[]>();
 
-    for (const edge of this.parallelEdges) {
+    for (const edge of this.directEdges) {
       const destinations = Array.isArray(edge.to) ? edge.to : [edge.to];
       for (const destination of destinations) {
         if (!edgesByDestination.has(destination)) {

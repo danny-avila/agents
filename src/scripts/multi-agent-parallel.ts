@@ -153,19 +153,19 @@ async function testParallelMultiAgent() {
     },
   ];
 
-  // Define parallel edges (fan-out and fan-in)
+  // Define direct edges (fan-out and fan-in)
   const edges: t.GraphEdge[] = [
     {
       from: 'researcher',
       to: ['analyst1', 'analyst2', 'analyst3'], // Fan-out to multiple analysts
       description: 'Distribute research to specialist analysts',
-      edgeType: 'direct', // Explicitly set as parallel for simultaneous execution
+      edgeType: 'direct', // Explicitly set as direct for automatic transition (enables parallel execution)
     },
     {
       from: ['analyst1', 'analyst2', 'analyst3'], // Fan-in from multiple sources
       to: 'summarizer',
       description: 'Aggregate analysis results',
-      edgeType: 'direct', // Fan-in is also parallel
+      edgeType: 'direct', // Fan-in is also direct
       // Add prompt when all analysts have provided input
       promptInstructions: (messages) => {
         // Check if we have analysis content from all three analysts
