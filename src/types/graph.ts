@@ -106,6 +106,23 @@ export type CompiledWorkflow<
 export type CompiledStateWorkflow = CompiledStateGraph<
   StateType<{
     messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
+  }>,
+  UpdateType<{
+    messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
+  }>,
+  string,
+  {
+    messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
+  },
+  {
+    messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
+  },
+  StateDefinition
+>;
+
+export type CompiledMultiAgentWorkflow = CompiledStateGraph<
+  StateType<{
+    messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
     agentMessages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
   }>,
   UpdateType<{
