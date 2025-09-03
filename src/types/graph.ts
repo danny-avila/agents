@@ -66,6 +66,10 @@ export type BaseGraphState = {
   messages: BaseMessage[];
 };
 
+export type MultiAgentGraphState = BaseGraphState & {
+  agentMessages?: BaseMessage[];
+};
+
 export type IState = BaseGraphState;
 
 export interface EventHandler {
@@ -102,16 +106,20 @@ export type CompiledWorkflow<
 export type CompiledStateWorkflow = CompiledStateGraph<
   StateType<{
     messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
+    agentMessages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
   }>,
   UpdateType<{
     messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
+    agentMessages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
   }>,
   string,
   {
     messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
+    agentMessages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
   },
   {
     messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
+    agentMessages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
   },
   StateDefinition
 >;
