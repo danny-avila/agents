@@ -329,12 +329,12 @@ export type GraphEdge = {
    * String prompts can include variables like {results} which will be replaced with
    * messages from startIndex onwards. When {results} is used, excludeResults defaults to true.
    */
-  promptInstructions?:
+  prompt?:
     | string
     | ((messages: BaseMessage[], runStartIndex: number) => string | undefined);
   /**
-   * When true, excludes messages from startIndex when adding promptInstructions.
-   * Automatically set to true when {results} variable is used in promptInstructions.
+   * When true, excludes messages from startIndex when adding prompt.
+   * Automatically set to true when {results} variable is used in prompt.
    */
   excludeResults?: boolean;
 };
