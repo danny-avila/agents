@@ -352,8 +352,7 @@ export class MultiAgentGraph extends StandardGraph {
     for (const [destination, edges] of edgesByDestination) {
       /** Checks if this is a fan-in scenario with prompt instructions */
       const edgesWithPrompt = edges.filter(
-        (edge) =>
-          edge.promptInstructions != null && edge.promptInstructions !== ''
+        (edge) => edge.prompt != null && edge.prompt !== ''
       );
 
       if (edgesWithPrompt.length > 0) {
@@ -362,10 +361,10 @@ export class MultiAgentGraph extends StandardGraph {
          */
         const wrapperNodeId = `fan_in_${destination}_prompt`;
         /**
-         * First edge's `promptInstructions`
+         * First edge's `prompt`
          * (they should all be the same for fan-in)
          */
-        const promptInstructions = edgesWithPrompt[0].promptInstructions;
+        const prompt = edgesWithPrompt[0].prompt;
         /**
          * First edge's `excludeResults` flag
          * (they should all be the same for fan-in)
@@ -376,14 +375,13 @@ export class MultiAgentGraph extends StandardGraph {
           let promptText: string | undefined;
           let effectiveExcludeResults = excludeResults;
 
-          if (typeof promptInstructions === 'function') {
-            promptText = promptInstructions(state.messages, this.startIndex);
-          } else if (promptInstructions != null) {
-            if (promptInstructions.includes('{results}')) {
+          if (typeof prompt === 'function') {
+            promptText = prompt(state.messages, this.startIndex);
+          } else if (prompt != null) {
+            if (prompt.includes('{results}')) {
               const resultsMessages = state.messages.slice(this.startIndex);
               const resultsString = getBufferString(resultsMessages);
-              const promptTemplate =
-                ChatPromptTemplate.fromTemplate(promptInstructions);
+              const promptTemplate = ChatPromptTemplate.fromTemplate(prompt);
               const formattedPromptValue = await promptTemplate.invoke({
                 results: resultsString,
               });
@@ -391,7 +389,7 @@ export class MultiAgentGraph extends StandardGraph {
               effectiveExcludeResults =
                 excludeResults !== false && promptText !== '';
             } else {
-              promptText = promptInstructions;
+              promptText = prompt;
             }
           }
 
