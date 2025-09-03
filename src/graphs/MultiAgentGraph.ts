@@ -152,10 +152,11 @@ export class MultiAgentGraph extends StandardGraph {
       const hasHandoffInput =
         edge.prompt != null && typeof edge.prompt === 'string';
       const handoffInputDescription = hasHandoffInput ? edge.prompt : undefined;
+      const promptKey = edge.promptKey ?? 'instructions';
 
       tools.push(
         tool(
-          async (input, config) => {
+          async (input: Record<string, unknown>, config) => {
             const state = getCurrentTaskInput() as t.BaseGraphState;
             const toolCallId =
               (config as ToolRunnableConfig | undefined)?.toolCall?.id ??
@@ -179,10 +180,10 @@ export class MultiAgentGraph extends StandardGraph {
             let content = `Conditionally transferred to ${destination}`;
             if (
               hasHandoffInput &&
-              'instructions' in input &&
-              input.instructions != null
+              promptKey in input &&
+              input[promptKey] != null
             ) {
-              content += `\n\nInstructions: ${input.instructions}`;
+              content += `\n\n${promptKey.charAt(0).toUpperCase() + promptKey.slice(1)}: ${input[promptKey]}`;
             }
 
             const toolMessage = new ToolMessage({
@@ -201,7 +202,7 @@ export class MultiAgentGraph extends StandardGraph {
             name: toolName,
             schema: hasHandoffInput
               ? z.object({
-                instructions: z
+                [promptKey]: z
                   .string()
                   .optional()
                   .describe(handoffInputDescription as string),
@@ -224,10 +225,11 @@ export class MultiAgentGraph extends StandardGraph {
         const handoffInputDescription = hasHandoffInput
           ? edge.prompt
           : undefined;
+        const promptKey = edge.promptKey ?? 'instructions';
 
         tools.push(
           tool(
-            async (input, config) => {
+            async (input: Record<string, unknown>, config) => {
               const toolCallId =
                 (config as ToolRunnableConfig | undefined)?.toolCall?.id ??
                 'unknown';
@@ -235,10 +237,10 @@ export class MultiAgentGraph extends StandardGraph {
               let content = `Successfully transferred to ${destination}`;
               if (
                 hasHandoffInput &&
-                'instructions' in input &&
-                input.instructions != null
+                promptKey in input &&
+                input[promptKey] != null
               ) {
-                content += `\n\nInstructions: ${input.instructions}`;
+                content += `\n\n${promptKey.charAt(0).toUpperCase() + promptKey.slice(1)}: ${input[promptKey]}`;
               }
 
               const toolMessage = new ToolMessage({
@@ -259,7 +261,7 @@ export class MultiAgentGraph extends StandardGraph {
               name: toolName,
               schema: hasHandoffInput
                 ? z.object({
-                  instructions: z
+                  [promptKey]: z
                     .string()
                     .optional()
                     .describe(handoffInputDescription as string),
