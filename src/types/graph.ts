@@ -315,9 +315,9 @@ export type StandardGraphInput = {
 };
 
 export type GraphEdge = {
-  /** Use a list for multiple sources */
+  /** Agent ID, use a list for multiple sources */
   from: string | string[];
-  /** Use a list for multiple destinations */
+  /** Agent ID, use a list for multiple destinations */
   to: string | string[];
   description?: string;
   /** Can return boolean or specific destination(s) */
