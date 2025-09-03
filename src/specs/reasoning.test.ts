@@ -3,9 +3,12 @@
 // src/scripts/cli.test.ts
 import { config } from 'dotenv';
 config();
-import { HumanMessage, BaseMessage, MessageContentText } from '@langchain/core/messages';
+import {
+  HumanMessage,
+  BaseMessage,
+  MessageContentText,
+} from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
-import type { StandardGraph } from '@/graphs';
 import type * as t from '@/types';
 import { ChatModelStreamHandler, createContentAggregator } from '@/stream';
 import { capitalizeFirstLetter } from './spec.utils';
@@ -28,40 +31,49 @@ describe(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
   let aggregateContent: t.ContentAggregator;
   let runSteps: Set<string>;
 
-  const config: Partial<RunnableConfig> & { version: 'v1' | 'v2'; run_id?: string; streamMode: string } = {
+  const config: Partial<RunnableConfig> & {
+    version: 'v1' | 'v2';
+    run_id?: string;
+    streamMode: string;
+  } = {
     configurable: {
       thread_id: 'conversation-num-1',
     },
     streamMode: 'values',
     version: 'v2' as const,
-    callbacks: [{
-      async handleCustomEvent(event, data, metadata): Promise<void> {
-        if (event !== GraphEvents.ON_MESSAGE_DELTA) {
-          return;
-        }
-        const messageDeltaData = data as t.MessageDeltaEvent;
+    callbacks: [
+      {
+        async handleCustomEvent(event, data, metadata): Promise<void> {
+          if (event !== GraphEvents.ON_MESSAGE_DELTA) {
+            return;
+          }
+          const messageDeltaData = data as t.MessageDeltaEvent;
 
-        // Wait until we see the run step (with timeout for safety)
-        const maxAttempts = 50; // 5 seconds total
-        let attempts = 0;
-        while (!runSteps.has(messageDeltaData.id) && attempts < maxAttempts) {
-          await new Promise(resolve => setTimeout(resolve, 100));
-          attempts++;
-        }
+          // Wait until we see the run step (with timeout for safety)
+          const maxAttempts = 50; // 5 seconds total
+          let attempts = 0;
+          while (!runSteps.has(messageDeltaData.id) && attempts < maxAttempts) {
+            await new Promise((resolve) => setTimeout(resolve, 100));
+            attempts++;
+          }
 
-        if (!runSteps.has(messageDeltaData.id)) {
-          console.warn(`Timeout waiting for run step: ${messageDeltaData.id}`);
-        }
+          if (!runSteps.has(messageDeltaData.id)) {
+            console.warn(
+              `Timeout waiting for run step: ${messageDeltaData.id}`
+            );
+          }
 
-        onMessageDeltaSpy(event, data, metadata, run.Graph);
-        aggregateContent({ event, data: messageDeltaData });
+          onMessageDeltaSpy(event, data, metadata, run.Graph);
+          aggregateContent({ event, data: messageDeltaData });
+        },
       },
-    }],
+    ],
   };
 
   beforeEach(async () => {
     conversationHistory = [];
-    const { contentParts: parts, aggregateContent: ac } = createContentAggregator();
+    const { contentParts: parts, aggregateContent: ac } =
+      createContentAggregator();
     aggregateContent = ac;
     runSteps = new Set();
     contentParts = parts as t.MessageContentComplex[];
@@ -81,32 +93,54 @@ describe(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
     onRunStepSpy.mockReset();
   });
 
-  const setupCustomHandlers = (): Record<string | GraphEvents, t.EventHandler> => ({
+  const setupCustomHandlers = (): Record<
+    string | GraphEvents,
+    t.EventHandler
+  > => ({
     [GraphEvents.CHAT_MODEL_STREAM]: new ChatModelStreamHandler(),
     [GraphEvents.ON_RUN_STEP_COMPLETED]: {
-      handle: (event: GraphEvents.ON_RUN_STEP_COMPLETED, data: t.StreamEventData): void => {
-        aggregateContent({ event, data: data as unknown as { result: t.ToolEndEvent; } });
-      }
+      handle: (
+        event: GraphEvents.ON_RUN_STEP_COMPLETED,
+        data: t.StreamEventData
+      ): void => {
+        aggregateContent({
+          event,
+          data: data as unknown as { result: t.ToolEndEvent },
+        });
+      },
     },
     [GraphEvents.ON_RUN_STEP]: {
-      handle: (event: GraphEvents.ON_RUN_STEP, data: t.StreamEventData, metadata, graph): void => {
+      handle: (
+        event: GraphEvents.ON_RUN_STEP,
+        data: t.StreamEventData,
+        metadata,
+        graph
+      ): void => {
         const runStepData = data as t.RunStep;
         runSteps.add(runStepData.id);
 
         onRunStepSpy(event, runStepData, metadata, graph);
         aggregateContent({ event, data: runStepData });
-      }
+      },
     },
     [GraphEvents.ON_RUN_STEP_DELTA]: {
-      handle: (event: GraphEvents.ON_RUN_STEP_DELTA, data: t.StreamEventData): void => {
+      handle: (
+        event: GraphEvents.ON_RUN_STEP_DELTA,
+        data: t.StreamEventData
+      ): void => {
         aggregateContent({ event, data: data as t.RunStepDeltaEvent });
-      }
+      },
     },
     [GraphEvents.ON_REASONING_DELTA]: {
-      handle: (event: GraphEvents.ON_REASONING_DELTA, data: t.StreamEventData, metadata, graph): void => {
+      handle: (
+        event: GraphEvents.ON_REASONING_DELTA,
+        data: t.StreamEventData,
+        metadata,
+        graph
+      ): void => {
         onReasoningDeltaSpy(event, data, metadata, graph);
         aggregateContent({ event, data: data as t.ReasoningDeltaEvent });
-      }
+      },
     },
   });
 
@@ -120,7 +154,8 @@ describe(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
       graphConfig: {
         type: 'standard',
         llmConfig,
-        instructions: 'You are a friendly AI assistant. Always address the user by their name.',
+        instructions:
+          'You are a friendly AI assistant. Always address the user by their name.',
         additional_instructions: `The user's name is ${userName} and they are located in ${location}.`,
       },
       returnContent: true,
@@ -141,25 +176,26 @@ describe(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
     expect(contentParts.length).toBe(2);
     const reasoningContent = reasoningText.match(/<think>(.*)<\/think>/s)?.[0];
     const content = reasoningText.split(/<\/think>/)[1];
-    expect((contentParts[0] as t.ReasoningContentText).think).toBe(reasoningContent);
+    expect((contentParts[0] as t.ReasoningContentText).think).toBe(
+      reasoningContent
+    );
     expect((contentParts[1] as MessageContentText).text).toBe(content);
 
     const finalMessages = run.getRunMessages();
     expect(finalMessages).toBeDefined();
-    conversationHistory.push(...finalMessages ?? []);
+    conversationHistory.push(...(finalMessages ?? []));
     expect(conversationHistory.length).toBeGreaterThan(1);
 
     expect(onMessageDeltaSpy).toHaveBeenCalled();
     expect(onMessageDeltaSpy.mock.calls.length).toBeGreaterThan(1);
-    expect((onMessageDeltaSpy.mock.calls[0][3] as StandardGraph).provider).toBeDefined();
+    expect(onMessageDeltaSpy.mock.calls[0][3]).toBeDefined(); // Graph exists
 
     expect(onReasoningDeltaSpy).toHaveBeenCalled();
     expect(onReasoningDeltaSpy.mock.calls.length).toBeGreaterThan(1);
-    expect((onReasoningDeltaSpy.mock.calls[0][3] as StandardGraph).provider).toBeDefined();
+    expect(onReasoningDeltaSpy.mock.calls[0][3]).toBeDefined(); // Graph exists
 
     expect(onRunStepSpy).toHaveBeenCalled();
     expect(onRunStepSpy.mock.calls.length).toBeGreaterThan(0);
-    expect((onRunStepSpy.mock.calls[0][3] as StandardGraph).provider).toBeDefined();
-
+    expect(onRunStepSpy.mock.calls[0][3]).toBeDefined(); // Graph exists
   });
 });

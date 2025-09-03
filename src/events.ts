@@ -1,10 +1,11 @@
 /* eslint-disable no-console */
 // src/events.ts
 import type {
+  ToolMessage,
   UsageMetadata,
   BaseMessageFields,
 } from '@langchain/core/messages';
-import type { Graph } from '@/graphs';
+import type { MultiAgentGraph, StandardGraph } from '@/graphs';
 import type * as t from '@/types';
 import { handleToolCalls } from '@/tools/handlers';
 import { Providers } from '@/common';
@@ -30,12 +31,12 @@ export class ModelEndHandler implements t.EventHandler {
     this.collectedUsage = collectedUsage;
   }
 
-  handle(
+  async handle(
     event: string,
     data: t.ModelEndData,
     metadata?: Record<string, unknown>,
-    graph?: Graph
-  ): void {
+    graph?: StandardGraph | MultiAgentGraph
+  ): Promise<void> {
     if (!graph || !metadata) {
       console.warn(`Graph or metadata not found in ${event} event`);
       return;
@@ -58,11 +59,16 @@ export class ModelEndHandler implements t.EventHandler {
       { depth: null }
     );
 
-    if (metadata.provider !== Providers.GOOGLE) {
+    const agentContext = graph.getAgentContext(metadata);
+
+    if (
+      agentContext.provider !== Providers.GOOGLE &&
+      agentContext.provider !== Providers.BEDROCK
+    ) {
       return;
     }
 
-    handleToolCalls(data?.output?.tool_calls, metadata, graph);
+    await handleToolCalls(data?.output?.tool_calls, metadata, graph);
   }
 }
 
@@ -76,12 +82,12 @@ export class ToolEndHandler implements t.EventHandler {
     this.callback = callback;
     this.omitOutput = omitOutput;
   }
-  handle(
+  async handle(
     event: string,
     data: t.StreamEventData | undefined,
     metadata?: Record<string, unknown>,
-    graph?: Graph
-  ): void {
+    graph?: StandardGraph | MultiAgentGraph
+  ): Promise<void> {
     if (!graph || !metadata) {
       console.warn(`Graph or metadata not found in ${event} event`);
       return;
@@ -94,10 +100,10 @@ export class ToolEndHandler implements t.EventHandler {
     }
 
     this.callback?.(toolEndData, metadata);
-    graph.handleToolCallCompleted(
+    await graph.handleToolCallCompleted(
       { input: toolEndData.input, output: toolEndData.output },
       metadata,
-      this.omitOutput?.(toolEndData.output.name)
+      this.omitOutput?.((toolEndData.output as ToolMessage | undefined)?.name)
     );
   }
 }

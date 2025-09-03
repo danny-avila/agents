@@ -8,7 +8,6 @@ import type * as t from '@/types';
 import { ModelEndHandler, ToolEndHandler } from '@/events';
 import { ChatModelStreamHandler } from '@/stream';
 
-
 import { getArgs } from '@/scripts/args';
 import { Run } from '@/run';
 import { GraphEvents, Callback, Providers } from '@/common';
@@ -25,31 +24,35 @@ async function testStandardStreaming(): Promise<void> {
       handle: (_event: string, data: t.StreamEventData): void => {
         console.log('====== ON_RUN_STEP_COMPLETED ======');
         console.dir(data, { depth: null });
-      }
+      },
     },
     [GraphEvents.ON_RUN_STEP]: {
       handle: (_event: string, data: t.StreamEventData): void => {
         console.log('====== ON_RUN_STEP ======');
         console.dir(data, { depth: null });
-      }
+      },
     },
     [GraphEvents.ON_RUN_STEP_DELTA]: {
       handle: (_event: string, data: t.StreamEventData): void => {
         console.log('====== ON_RUN_STEP_DELTA ======');
         console.dir(data, { depth: null });
-      }
+      },
     },
     [GraphEvents.ON_MESSAGE_DELTA]: {
       handle: (_event: string, data: t.StreamEventData): void => {
         console.log('====== ON_MESSAGE_DELTA ======');
         console.dir(data, { depth: null });
-      }
+      },
     },
     [GraphEvents.TOOL_START]: {
-      handle: (_event: string, data: t.StreamEventData, metadata?: Record<string, unknown>): void => {
+      handle: (
+        _event: string,
+        data: t.StreamEventData,
+        metadata?: Record<string, unknown>
+      ): void => {
         console.log('====== TOOL_START ======');
         console.dir(data, { depth: null });
-      }
+      },
     },
     // [GraphEvents.LLM_STREAM]: new LLMStreamHandler(),
     // [GraphEvents.LLM_START]: {
@@ -90,11 +93,12 @@ async function testStandardStreaming(): Promise<void> {
   // const llmConfig = getLLMConfig(provider);
   let llmConfig = getLLMConfig(Providers.OPENAI);
 
-  const graphConfig: t.StandardGraphConfig  = {
+  const graphConfig: t.LegacyGraphConfig = {
     type: 'standard',
     llmConfig,
     tools: [new TavilySearchResults()],
-    instructions: 'You are a friendly AI assistant. Always address the user by their name.',
+    instructions:
+      'You are a friendly AI assistant. Always address the user by their name.',
     additional_instructions: `The user's name is ${userName} and they are located in ${location}.`,
   };
 
@@ -116,21 +120,25 @@ async function testStandardStreaming(): Promise<void> {
   console.log(' Test 1: OpenAI Tool Usage');
 
   // conversationHistory.push(new HumanMessage(`Hi I'm ${userName}.`));
-  conversationHistory.push(new HumanMessage(`search for good sunrise hikes near ${location}
-then search weather in ${location} for today which is ${currentDate}`));
+  conversationHistory.push(
+    new HumanMessage(`search for good sunrise hikes near ${location}
+then search weather in ${location} for today which is ${currentDate}`)
+  );
   let inputs = {
     messages: conversationHistory,
   };
-  const contentParts = await run.processStream(inputs, config,
-  //   {
-  //   [Callback.TOOL_START]: (graph, ...args) => {
-  //       console.log('TOOL_START callback');
-  //   },
-  //   [Callback.TOOL_END]: (graph, ...args) => {
-  //       console.log('TOOL_END callback');
-  //   },
-  // }
-);
+  const contentParts = await run.processStream(
+    inputs,
+    config
+    //   {
+    //   [Callback.TOOL_START]: (graph, ...args) => {
+    //       console.log('TOOL_START callback');
+    //   },
+    //   [Callback.TOOL_END]: (graph, ...args) => {
+    //       console.log('TOOL_END callback');
+    //   },
+    // }
+  );
   const finalMessages = run.getRunMessages();
   if (finalMessages) {
     conversationHistory.push(...finalMessages);

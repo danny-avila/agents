@@ -1,9 +1,7 @@
 // src/run.ts
 import './instrumentation';
-import { zodToJsonSchema } from 'zod-to-json-schema';
 import { CallbackHandler } from '@langfuse/langchain';
 import { PromptTemplate } from '@langchain/core/prompts';
-import { SystemMessage } from '@langchain/core/messages';
 import { RunnableLambda } from '@langchain/core/runnables';
 import { AzureChatOpenAI, ChatOpenAI } from '@langchain/openai';
 import type {
@@ -12,15 +10,13 @@ import type {
 } from '@langchain/core/messages';
 import type { StringPromptValue } from '@langchain/core/prompt_values';
 import type { RunnableConfig } from '@langchain/core/runnables';
-import type { ClientCallbacks, SystemCallbacks } from '@/graphs/Graph';
 import type * as t from '@/types';
-import { GraphEvents, Providers, Callback, TitleMethod } from '@/common';
-import { manualToolStreamProviders } from '@/llm/providers';
-import { shiftIndexTokenCountMap } from '@/messages/format';
 import {
-  createTitleRunnable,
   createCompletionTitleRunnable,
+  createTitleRunnable,
 } from '@/utils/title';
+import { GraphEvents, Callback, TitleMethod } from '@/common';
+import { MultiAgentGraph } from '@/graphs/MultiAgentGraph';
 import { createTokenCounter } from '@/utils/tokens';
 import { StandardGraph } from '@/graphs/Graph';
 import { HandlerRegistry } from '@/events';
@@ -40,14 +36,13 @@ export const defaultOmitOptions = new Set([
   'additionalModelRequestFields',
 ]);
 
-export class Run<T extends t.BaseGraphState> {
-  graphRunnable?: t.CompiledWorkflow<T, Partial<T>, string>;
-  // private collab!: CollabGraph;
-  // private taskManager!: TaskManager;
-  private handlerRegistry: HandlerRegistry;
+export class Run<_T extends t.BaseGraphState> {
   id: string;
-  Graph: StandardGraph | undefined;
-  provider: Providers | undefined;
+  private tokenCounter?: t.TokenCounter;
+  private handlerRegistry: HandlerRegistry;
+  private indexTokenCountMap?: Record<string, number>;
+  graphRunnable?: t.CompiledStateWorkflow;
+  Graph: StandardGraph | MultiAgentGraph | undefined;
   returnContent: boolean = false;
 
   private constructor(config: Partial<t.RunConfig>) {
@@ -57,6 +52,8 @@ export class Run<T extends t.BaseGraphState> {
     }
 
     this.id = runId;
+    this.tokenCounter = config.tokenCounter;
+    this.indexTokenCountMap = config.indexTokenCountMap;
 
     const handlerRegistry = new HandlerRegistry();
 
@@ -74,12 +71,18 @@ export class Run<T extends t.BaseGraphState> {
       throw new Error('Graph config not provided');
     }
 
-    if (config.graphConfig.type === 'standard' || !config.graphConfig.type) {
-      this.provider = config.graphConfig.llmConfig.provider;
-      this.graphRunnable = this.createStandardGraph(
-        config.graphConfig
-      ) as unknown as t.CompiledWorkflow<T, Partial<T>, string>;
+    /** Handle different graph types */
+    if (config.graphConfig.type === 'multi-agent') {
+      this.graphRunnable = this.createMultiAgentGraph(config.graphConfig);
       if (this.Graph) {
+        this.Graph.handlerRegistry = handlerRegistry;
+      }
+    } else {
+      // Default to legacy graph for 'standard' or undefined type
+      this.graphRunnable = this.createLegacyGraph(config.graphConfig);
+      if (this.Graph) {
+        this.Graph.compileOptions =
+          config.graphConfig.compileOptions ?? this.Graph.compileOptions;
         this.Graph.handlerRegistry = handlerRegistry;
       }
     }
@@ -87,26 +90,70 @@ export class Run<T extends t.BaseGraphState> {
     this.returnContent = config.returnContent ?? false;
   }
 
-  private createStandardGraph(
-    config: t.StandardGraphConfig
-  ): t.CompiledWorkflow<t.IState, Partial<t.IState>, string> {
-    const { llmConfig, tools = [], ...graphInput } = config;
+  private createLegacyGraph(
+    config: t.LegacyGraphConfig
+  ): t.CompiledStateWorkflow {
+    const {
+      type: _type,
+      llmConfig,
+      signal,
+      tools = [],
+      ...agentInputs
+    } = config;
     const { provider, ...clientOptions } = llmConfig;
 
-    const standardGraph = new StandardGraph({
+    /** TEMP: Create agent configuration for the single agent */
+    const agentConfig: t.AgentInputs = {
+      ...agentInputs,
       tools,
       provider,
       clientOptions,
-      ...graphInput,
+      agentId: 'default',
+    };
+
+    const standardGraph = new StandardGraph({
+      signal,
       runId: this.id,
+      agents: [agentConfig],
+      tokenCounter: this.tokenCounter,
+      indexTokenCountMap: this.indexTokenCountMap,
     });
+    // propagate compile options from graph config
+    standardGraph.compileOptions = (
+      config as t.LegacyGraphConfig
+    ).compileOptions;
     this.Graph = standardGraph;
     return standardGraph.createWorkflow();
+  }
+
+  private createMultiAgentGraph(
+    config: t.MultiAgentGraphConfig
+  ): t.CompiledStateWorkflow {
+    const { agents, edges, compileOptions } = config;
+
+    const multiAgentGraph = new MultiAgentGraph({
+      runId: this.id,
+      agents,
+      edges,
+      tokenCounter: this.tokenCounter,
+      indexTokenCountMap: this.indexTokenCountMap,
+    });
+
+    if (compileOptions != null) {
+      multiAgentGraph.compileOptions = compileOptions;
+    }
+
+    this.Graph = multiAgentGraph;
+    return multiAgentGraph.createWorkflow();
   }
 
   static async create<T extends t.BaseGraphState>(
     config: t.RunConfig
   ): Promise<Run<T>> {
+    // Create tokenCounter if indexTokenCountMap is provided but tokenCounter is not
+    if (config.indexTokenCountMap && !config.tokenCounter) {
+      config.tokenCounter = await createTokenCounter();
+    }
     return new Run<T>(config);
   }
 
@@ -119,12 +166,49 @@ export class Run<T extends t.BaseGraphState> {
     return this.Graph.getRunMessages();
   }
 
+  /**
+   * Creates a custom event callback handler that intercepts custom events
+   * and processes them through our handler registry instead of EventStreamCallbackHandler
+   */
+  private createCustomEventCallback() {
+    return async (
+      eventName: string,
+      data: unknown,
+      runId: string,
+      tags?: string[],
+      metadata?: Record<string, unknown>
+    ): Promise<void> => {
+      if (
+        (data as t.StreamEventData)['emitted'] === true &&
+        eventName === GraphEvents.CHAT_MODEL_STREAM
+      ) {
+        return;
+      }
+      const handler = this.handlerRegistry.getHandler(eventName);
+      if (handler && this.Graph) {
+        await handler.handle(
+          eventName,
+          data as
+            | t.StreamEventData
+            | t.ModelEndData
+            | t.RunStep
+            | t.RunStepDeltaEvent
+            | t.MessageDeltaEvent
+            | t.ReasoningDeltaEvent
+            | { result: t.ToolEndEvent },
+          metadata,
+          this.Graph
+        );
+      }
+    };
+  }
+
   async processStream(
     inputs: t.IState,
     config: Partial<RunnableConfig> & { version: 'v1' | 'v2'; run_id?: string },
     streamOptions?: t.EventStreamOptions
   ): Promise<MessageContentComplex[] | undefined> {
-    if (!this.graphRunnable) {
+    if (this.graphRunnable == null) {
       throw new Error(
         'Run not initialized. Make sure to use Run.create() to instantiate the Run.'
       );
@@ -136,15 +220,18 @@ export class Run<T extends t.BaseGraphState> {
     }
 
     this.Graph.resetValues(streamOptions?.keepContent);
-    const provider = this.Graph.provider;
-    const hasTools = this.Graph.tools ? this.Graph.tools.length > 0 : false;
-    if (streamOptions?.callbacks) {
-      /* TODO: conflicts with callback manager */
-      const callbacks = (config.callbacks as t.ProvidedCallbacks) ?? [];
-      config.callbacks = callbacks.concat(
-        this.getCallbacks(streamOptions.callbacks)
-      );
-    }
+
+    /** Custom event callback to intercept and handle custom events */
+    const customEventCallback = this.createCustomEventCallback();
+
+    const baseCallbacks = (config.callbacks as t.ProvidedCallbacks) ?? [];
+    const streamCallbacks = streamOptions?.callbacks
+      ? this.getCallbacks(streamOptions.callbacks)
+      : [];
+
+    config.callbacks = baseCallbacks.concat(streamCallbacks).concat({
+      [Callback.CUSTOM_EVENT]: customEventCallback,
+    });
 
     if (
       isPresent(process.env.LANGFUSE_SECRET_KEY) &&
@@ -171,53 +258,9 @@ export class Run<T extends t.BaseGraphState> {
       throw new Error('Run ID not provided');
     }
 
-    const tokenCounter =
-      streamOptions?.tokenCounter ??
-      (streamOptions?.indexTokenCountMap
-        ? await createTokenCounter()
-        : undefined);
-    const tools = this.Graph.tools as
-      | Array<t.GenericTool | undefined>
-      | undefined;
-    const toolTokens = tokenCounter
-      ? (tools?.reduce((acc, tool) => {
-        if (!(tool as Partial<t.GenericTool>).schema) {
-          return acc;
-        }
-
-        const jsonSchema = zodToJsonSchema(
-          (tool?.schema as t.ZodObjectAny).describe(tool?.description ?? ''),
-          tool?.name ?? ''
-        );
-        return (
-          acc + tokenCounter(new SystemMessage(JSON.stringify(jsonSchema)))
-        );
-      }, 0) ?? 0)
-      : 0;
-    let instructionTokens = toolTokens;
-    if (this.Graph.systemMessage && tokenCounter) {
-      instructionTokens += tokenCounter(this.Graph.systemMessage);
-    }
-    const tokenMap = streamOptions?.indexTokenCountMap ?? {};
-    if (this.Graph.systemMessage && instructionTokens > 0) {
-      this.Graph.indexTokenCountMap = shiftIndexTokenCountMap(
-        tokenMap,
-        instructionTokens
-      );
-    } else if (instructionTokens > 0) {
-      tokenMap[0] = tokenMap[0] + instructionTokens;
-      this.Graph.indexTokenCountMap = tokenMap;
-    } else {
-      this.Graph.indexTokenCountMap = tokenMap;
-    }
-
-    this.Graph.maxContextTokens = streamOptions?.maxContextTokens;
-    this.Graph.tokenCounter = tokenCounter;
-
     config.run_id = this.id;
     config.configurable = Object.assign(config.configurable ?? {}, {
       run_id: this.id,
-      provider: this.provider,
     });
 
     const stream = this.graphRunnable.streamEvents(inputs, config, {
@@ -225,25 +268,18 @@ export class Run<T extends t.BaseGraphState> {
     });
 
     for await (const event of stream) {
-      const { data, name, metadata, ...info } = event;
+      const { data, metadata, ...info } = event;
 
-      let eventName: t.EventName = info.event;
-      if (
-        hasTools &&
-        manualToolStreamProviders.has(provider) &&
-        eventName === GraphEvents.CHAT_MODEL_STREAM
-      ) {
-        /* Skipping CHAT_MODEL_STREAM event due to double-call edge case */
+      const eventName: t.EventName = info.event;
+
+      /** Skip custom events as they're handled by our callback */
+      if (eventName === GraphEvents.ON_CUSTOM_EVENT) {
         continue;
-      }
-
-      if (eventName && eventName === GraphEvents.ON_CUSTOM_EVENT) {
-        eventName = name;
       }
 
       const handler = this.handlerRegistry.getHandler(eventName);
       if (handler) {
-        handler.handle(eventName, data, metadata, this.Graph);
+        await handler.handle(eventName, data, metadata, this.Graph);
       }
     }
 
@@ -252,19 +288,19 @@ export class Run<T extends t.BaseGraphState> {
     }
   }
 
-  private createSystemCallback<K extends keyof ClientCallbacks>(
-    clientCallbacks: ClientCallbacks,
+  private createSystemCallback<K extends keyof t.ClientCallbacks>(
+    clientCallbacks: t.ClientCallbacks,
     key: K
-  ): SystemCallbacks[K] {
+  ): t.SystemCallbacks[K] {
     return ((...args: unknown[]) => {
       const clientCallback = clientCallbacks[key];
       if (clientCallback && this.Graph) {
         (clientCallback as (...args: unknown[]) => void)(this.Graph, ...args);
       }
-    }) as SystemCallbacks[K];
+    }) as t.SystemCallbacks[K];
   }
 
-  getCallbacks(clientCallbacks: ClientCallbacks): SystemCallbacks {
+  getCallbacks(clientCallbacks: t.ClientCallbacks): t.SystemCallbacks {
     return {
       [Callback.TOOL_ERROR]: this.createSystemCallback(
         clientCallbacks,
@@ -289,7 +325,6 @@ export class Run<T extends t.BaseGraphState> {
     clientOptions,
     chainOptions,
     skipLanguage,
-    omitOptions = defaultOmitOptions,
     titleMethod = TitleMethod.COMPLETION,
     titlePromptTemplate,
   }: t.RunTitleOptions): Promise<{ language?: string; title?: string }> {
@@ -327,7 +362,6 @@ export class Run<T extends t.BaseGraphState> {
 
     const model = this.Graph?.getNewModel({
       provider,
-      omitOptions,
       clientOptions,
     });
     if (!model) {
@@ -373,9 +407,30 @@ export class Run<T extends t.BaseGraphState> {
       .pipe(titleChain)
       .withConfig({ runName: 'TitleChain' });
 
-    return await fullChain.invoke(
-      { input: inputText, output: response },
-      chainOptions
-    );
+    const invokeConfig = Object.assign({}, chainOptions, {
+      run_id: this.id,
+      runId: this.id,
+    });
+
+    try {
+      return await fullChain.invoke(
+        { input: inputText, output: response },
+        invokeConfig
+      );
+    } catch (_e) {
+      // Fallback: strip callbacks to avoid EventStream tracer errors in certain environments
+      // But preserve langfuse handler if it exists
+      const langfuseHandler = (invokeConfig.callbacks as t.ProvidedCallbacks)?.find(
+        (cb) => cb instanceof CallbackHandler
+      );
+      const { callbacks: _cb, ...rest } = invokeConfig;
+      const safeConfig = Object.assign({}, rest, {
+        callbacks: langfuseHandler ? [langfuseHandler] : [],
+      });
+      return await fullChain.invoke(
+        { input: inputText, output: response },
+        safeConfig as Partial<RunnableConfig>
+      );
+    }
   }
 }

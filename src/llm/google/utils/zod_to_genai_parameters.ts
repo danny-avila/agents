@@ -1,5 +1,3 @@
-/* eslint-disable @typescript-eslint/no-unused-vars */
-
 import {
   type FunctionDeclarationSchema as GenerativeAIFunctionDeclarationSchema,
   type SchemaType as FunctionDeclarationSchemaType,
@@ -67,7 +65,7 @@ export function schemaToGenerativeAIParameters<
   const jsonSchema = removeAdditionalProperties(
     isInteropZodSchema(schema) ? toJsonSchema(schema) : schema
   );
-  const { $schema, ...rest } = jsonSchema;
+  const { $schema: _s, ...rest } = jsonSchema;
 
   return rest as GenerativeAIFunctionDeclarationSchema;
 }
@@ -82,7 +80,7 @@ export function jsonSchemaToGeminiParameters(
   const jsonSchema = removeAdditionalProperties(
     schema as GenerativeAIJsonSchemaDirty
   );
-  const { $schema, ...rest } = jsonSchema;
+  const { $schema: _s, ...rest } = jsonSchema;
 
   return rest as GenerativeAIFunctionDeclarationSchema;
 }
