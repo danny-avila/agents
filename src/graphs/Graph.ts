@@ -324,23 +324,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
   /* Graph */
 
-  /** @deprecated */
-  createGraphState(): t.GraphStateChannels<t.BaseGraphState> {
-    return {
-      messages: {
-        value: (x: BaseMessage[], y: BaseMessage[]): BaseMessage[] => {
-          if (!x.length) {
-            this.startIndex = x.length + y.length;
-          }
-          const current = x.concat(y);
-          this.messages = current;
-          return current;
-        },
-        default: () => [],
-      },
-    };
-  }
-
   createSystemRunnable({
     provider,
     clientOptions,
@@ -601,10 +584,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               .additionalModelRequestFields?.['thinking'] != null);
 
         agentContext.pruneMessages = createPruneMessages({
+          startIndex: this.startIndex,
           provider: agentContext.provider,
-          maxTokens: agentContext.maxContextTokens,
-          startIndex: agentContext.startIndex,
           tokenCounter: agentContext.tokenCounter,
+          maxTokens: agentContext.maxContextTokens,
           thinkingEnabled: isAnthropicWithThinking,
           indexTokenCountMap: agentContext.indexTokenCountMap,
         });
@@ -782,8 +765,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     const agentNode = this.createAgentNode(this.defaultAgentId);
     const StateAnnotation = Annotation.Root({
       messages: Annotation<BaseMessage[]>({
-        reducer: (...args) => {
-          const result = messagesStateReducer(...args);
+        reducer: (a, b) => {
+          if (!a.length) {
+            this.startIndex = a.length + b.length;
+          }
+          const result = messagesStateReducer(a, b);
           this.messages = result;
           return result;
         },

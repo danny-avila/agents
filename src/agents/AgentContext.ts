@@ -80,8 +80,6 @@ export class AgentContext {
   provider: Providers;
   /** Client options for this agent */
   clientOptions?: t.ClientOptions;
-  /** Starting index for messages specific to this agent */
-  startIndex: number = 0;
   /** Token count map indexed by message position */
   indexTokenCountMap: Record<string, number | undefined> = {};
   /** Maximum context tokens for this agent */
@@ -249,13 +247,12 @@ export class AgentContext {
    * Reset context for a new run
    */
   reset(): void {
-    this.startIndex = 0;
+    this.instructionTokens = 0;
+    this.lastToken = undefined;
     this.indexTokenCountMap = {};
     this.currentUsage = undefined;
     this.pruneMessages = undefined;
     this.lastStreamCall = undefined;
-    this.instructionTokens = 0;
-    this.lastToken = undefined;
     this.tokenTypeSwitch = undefined;
     this.currentTokenType = ContentTypes.TEXT;
   }
