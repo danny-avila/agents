@@ -23,44 +23,73 @@ async function testCodeExecution(): Promise<void> {
     [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(),
     [GraphEvents.CHAT_MODEL_STREAM]: new ChatModelStreamHandler(),
     [GraphEvents.ON_RUN_STEP_COMPLETED]: {
-      handle: (event: GraphEvents.ON_RUN_STEP_COMPLETED, data: t.StreamEventData): void => {
+      handle: (
+        event: GraphEvents.ON_RUN_STEP_COMPLETED,
+        data: t.StreamEventData
+      ): void => {
         console.log('====== ON_RUN_STEP_COMPLETED ======');
         console.dir(data, { depth: null });
-        aggregateContent({ event, data: data as unknown as { result: t.ToolEndEvent } });
-      }
+        aggregateContent({
+          event,
+          data: data as unknown as { result: t.ToolEndEvent },
+        });
+      },
     },
     [GraphEvents.ON_RUN_STEP]: {
-      handle: (event: GraphEvents.ON_RUN_STEP, data: t.StreamEventData): void => {
+      handle: (
+        event: GraphEvents.ON_RUN_STEP,
+        data: t.StreamEventData
+      ): void => {
         console.log('====== ON_RUN_STEP ======');
         console.dir(data, { depth: null });
         aggregateContent({ event, data: data as t.RunStep });
-      }
+      },
     },
     [GraphEvents.ON_RUN_STEP_DELTA]: {
-      handle: (event: GraphEvents.ON_RUN_STEP_DELTA, data: t.StreamEventData): void => {
+      handle: (
+        event: GraphEvents.ON_RUN_STEP_DELTA,
+        data: t.StreamEventData
+      ): void => {
         console.log('====== ON_RUN_STEP_DELTA ======');
         console.dir(data, { depth: null });
         aggregateContent({ event, data: data as t.RunStepDeltaEvent });
-      }
+      },
     },
     [GraphEvents.ON_MESSAGE_DELTA]: {
-      handle: (event: GraphEvents.ON_MESSAGE_DELTA, data: t.StreamEventData): void => {
+      handle: (
+        event: GraphEvents.ON_MESSAGE_DELTA,
+        data: t.StreamEventData
+      ): void => {
         console.log('====== ON_MESSAGE_DELTA ======');
         console.dir(data, { depth: null });
         aggregateContent({ event, data: data as t.MessageDeltaEvent });
-      }
+      },
     },
     [GraphEvents.TOOL_START]: {
-      handle: (_event: string, data: t.StreamEventData, metadata?: Record<string, unknown>): void => {
+      handle: (
+        _event: string,
+        data: t.StreamEventData,
+        metadata?: Record<string, unknown>
+      ): void => {
         console.log('====== TOOL_START ======');
         console.dir(data, { depth: null });
-      }
+      },
     },
   };
 
   const llmConfig = getLLMConfig(provider);
-  const instructions = 'You are a friendly AI assistant with coding capabilities. Always address the user by their name.';
+  const instructions =
+    'You are a friendly AI assistant with coding capabilities. Always address the user by their name.';
   const additional_instructions = `The user's name is ${userName} and they are located in ${location}.`;
+
+  // const userMessage1 = `how much memory is this (its in bytes) in MB? 31192000`;
+  // const userMessage1 = `can you show me a good use case for rscript by running some code`;
+  const userMessage1 = `Run hello world in french and in english, using python. please run 2 parallel code executions.`;
+  const humanMessage = new HumanMessage(userMessage1);
+  const tokenCounter = await createTokenCounter();
+  const indexTokenCountMap = {
+    0: tokenCounter(humanMessage),
+  };
 
   const runConfig: t.RunConfig = {
     runId: 'message-num-1',
@@ -70,9 +99,12 @@ async function testCodeExecution(): Promise<void> {
       tools: [new TavilySearchResults(), createCodeExecutionTool()],
       instructions,
       additional_instructions,
+      maxContextTokens: 8000,
     },
     returnContent: true,
     customHandlers,
+    indexTokenCountMap,
+    tokenCounter,
   };
   const run = await Run.create<t.IState>(runConfig);
 
@@ -87,25 +119,12 @@ async function testCodeExecution(): Promise<void> {
 
   console.log('Test 1: Simple Code Execution');
 
-  // const userMessage1 = `how much memory is this (its in bytes) in MB? 31192000`;
-  // const userMessage1 = `can you show me a good use case for rscript by running some code`;
-  const userMessage1 = `Run hello world in french and in english, using python. please run 2 parallel code executions.`;
-  const humanMessage = new HumanMessage(userMessage1);
-  const tokenCounter = await createTokenCounter();
-  const indexTokenCountMap = {
-    0: tokenCounter(humanMessage),
-  };
-
   conversationHistory.push(humanMessage);
 
   let inputs = {
     messages: conversationHistory,
   };
-  const finalContentParts1 = await run.processStream(inputs, config, {
-    maxContextTokens: 8000,
-    indexTokenCountMap,
-    tokenCounter,
-  });
+  const finalContentParts1 = await run.processStream(inputs, config);
   const finalMessages1 = run.getRunMessages();
   if (finalMessages1) {
     conversationHistory.push(...finalMessages1);

@@ -1,6 +1,5 @@
 // src/types/llm.ts
 import { ChatOllama } from '@langchain/ollama';
-import { ChatAnthropic } from '@langchain/anthropic';
 import { ChatMistralAI } from '@langchain/mistralai';
 import { ChatBedrockConverse } from '@langchain/aws';
 import { BedrockChat } from '@langchain/community/chat_models/bedrock/web';
@@ -36,6 +35,7 @@ import {
   ChatXAI,
 } from '@/llm/openai';
 import { CustomChatGoogleGenerativeAI } from '@/llm/google';
+import { CustomAnthropic } from '@/llm/anthropic';
 import { ChatOpenRouter } from '@/llm/openrouter';
 import { ChatVertexAI } from '@/llm/vertexai';
 import { Providers } from '@/common';
@@ -95,7 +95,11 @@ export type SharedLLMConfig = {
   provider: Providers;
 };
 
-export type LLMConfig = SharedLLMConfig & ClientOptions;
+export type LLMConfig = SharedLLMConfig &
+  ClientOptions & {
+    /** Optional provider fallbacks in order of attempt */
+    fallbacks?: Array<{ provider: Providers; clientOptions?: ClientOptions }>;
+  };
 
 export type ProviderOptionsMap = {
   [Providers.AZURE]: AzureClientOptions;
@@ -120,7 +124,7 @@ export type ChatModelMap = {
   [Providers.AZURE]: AzureChatOpenAI;
   [Providers.DEEPSEEK]: ChatDeepSeek;
   [Providers.VERTEXAI]: ChatVertexAI;
-  [Providers.ANTHROPIC]: ChatAnthropic;
+  [Providers.ANTHROPIC]: CustomAnthropic;
   [Providers.MISTRALAI]: ChatMistralAI;
   [Providers.MISTRAL]: ChatMistralAI;
   [Providers.OPENROUTER]: ChatOpenRouter;

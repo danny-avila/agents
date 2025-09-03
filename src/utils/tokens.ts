@@ -2,7 +2,10 @@ import { Tiktoken } from 'js-tiktoken/lite';
 import type { BaseMessage } from '@langchain/core/messages';
 import { ContentTypes } from '@/common/enum';
 
-export function getTokenCountForMessage(message: BaseMessage, getTokenCount: (text: string) => number): number {
+export function getTokenCountForMessage(
+  message: BaseMessage,
+  getTokenCount: (text: string) => number
+): number {
   const tokensPerMessage = 3;
 
   const processValue = (value: unknown): void => {
@@ -57,14 +60,70 @@ export function getTokenCountForMessage(message: BaseMessage, getTokenCount: (te
   return numTokens;
 }
 
-export const createTokenCounter = async () => {
-  const res = await fetch('https://tiktoken.pages.dev/js/o200k_base.json');
-  const o200k_base = await res.json();
+let encoderPromise: Promise<Tiktoken> | undefined;
+let tokenCounterPromise: Promise<(message: BaseMessage) => number> | undefined;
 
-  const countTokens = (text: string): number => {
-    const enc = new Tiktoken(o200k_base);
-    return enc.encode(text).length;
-  };
+async function getSharedEncoder(): Promise<Tiktoken> {
+  if (encoderPromise) {
+    return encoderPromise;
+  }
+  encoderPromise = (async (): Promise<Tiktoken> => {
+    const res = await fetch('https://tiktoken.pages.dev/js/o200k_base.json');
+    const o200k_base = await res.json();
+    return new Tiktoken(o200k_base);
+  })();
+  return encoderPromise;
+}
 
-  return (message: BaseMessage): number => getTokenCountForMessage(message, countTokens);
+/**
+ * Creates a singleton token counter function that reuses the same encoder instance.
+ * This avoids creating multiple function closures and prevents potential memory issues.
+ */
+export const createTokenCounter = async (): Promise<
+  (message: BaseMessage) => number
+> => {
+  if (tokenCounterPromise) {
+    return tokenCounterPromise;
+  }
+
+  tokenCounterPromise = (async (): Promise<
+    (message: BaseMessage) => number
+  > => {
+    const enc = await getSharedEncoder();
+    const countTokens = (text: string): number => enc.encode(text).length;
+    return (message: BaseMessage): number =>
+      getTokenCountForMessage(message, countTokens);
+  })();
+
+  return tokenCounterPromise;
+};
+
+/**
+ * Utility to manage the token encoder lifecycle explicitly.
+ * Useful for applications that need fine-grained control over resource management.
+ */
+export const TokenEncoderManager = {
+  /**
+   * Pre-initializes the encoder. This can be called during app startup
+   * to avoid lazy loading delays later.
+   */
+  async initialize(): Promise<void> {
+    await getSharedEncoder();
+  },
+
+  /**
+   * Clears the cached encoder and token counter.
+   * Useful for testing or when you need to force a fresh reload.
+   */
+  reset(): void {
+    encoderPromise = undefined;
+    tokenCounterPromise = undefined;
+  },
+
+  /**
+   * Checks if the encoder has been initialized.
+   */
+  isInitialized(): boolean {
+    return encoderPromise !== undefined;
+  },
 };

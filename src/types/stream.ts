@@ -9,6 +9,7 @@ import type {
 import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
 import type { LLMResult, Generation } from '@langchain/core/outputs';
 import type { AnthropicContentBlock } from '@/llm/anthropic/types';
+import type { Command } from '@langchain/langgraph';
 import type { ToolEndEvent } from '@/types/tools';
 import { StepTypes, ContentTypes, GraphEvents } from '@/common/enum';
 
@@ -104,7 +105,7 @@ export type MessageCreationDetails = {
 
 export type ToolEndData = {
   input: string | Record<string, unknown>;
-  output?: ToolMessage;
+  output?: ToolMessage | Command;
 };
 export type ToolErrorData = {
   id: string;
