@@ -340,6 +340,12 @@ export type GraphEdge = {
    * Automatically set to true when {results} variable is used in prompt.
    */
   excludeResults?: boolean;
+  /**
+   * For handoff edges: Customizes the parameter name for the handoff input.
+   * Defaults to "instructions" if not specified.
+   * Only applies when prompt is provided for handoff edges.
+   */
+  promptKey?: string;
 };
 
 export type MultiAgentGraphInput = StandardGraphInput & {
