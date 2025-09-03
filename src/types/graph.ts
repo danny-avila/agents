@@ -302,7 +302,7 @@ export type GraphEdge = {
   /** Optional prompt to add when transitioning through this edge */
   promptInstructions?:
     | string
-    | ((messages: BaseMessage[]) => string | undefined);
+    | ((messages: BaseMessage[], runStartIndex: number) => string | undefined);
 };
 
 export type MultiAgentGraphInput = StandardGraphInput & {

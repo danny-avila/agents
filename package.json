@@ -60,6 +60,7 @@
     "multi-agent-parallel": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/multi-agent-parallel.ts",
     "multi-agent-sequence": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/multi-agent-sequence.ts",
     "multi-agent-conditional": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/multi-agent-conditional.ts",
+    "multi-agent-supervisor": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/multi-agent-supervisor.ts",
     "script2": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/proto/example_test.ts",
     "script3": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/proto/example_test_anthropic.ts",
     "script4": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/cli4.ts --name 'Jo' --location 'New York, NY'",
