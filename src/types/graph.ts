@@ -325,9 +325,12 @@ export type GraphEdge = {
   /** 'handoff' creates tools for dynamic routing, 'direct' creates direct edges, which also allow parallel execution */
   edgeType?: 'handoff' | 'direct';
   /**
-   * Optional prompt to add when transitioning through this edge.
+   * For direct edges: Optional prompt to add when transitioning through this edge.
    * String prompts can include variables like {results} which will be replaced with
    * messages from startIndex onwards. When {results} is used, excludeResults defaults to true.
+   *
+   * For handoff edges: Description for the input parameter that the handoff tool accepts,
+   * allowing the supervisor to pass specific instructions/context to the transferred agent.
    */
   prompt?:
     | string
