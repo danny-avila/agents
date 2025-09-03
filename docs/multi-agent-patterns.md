@@ -52,13 +52,13 @@ const edges: t.GraphEdge[] = [
     from: 'researcher',
     to: ['analyst1', 'analyst2', 'analyst3'], // Fan-out
     description: 'Distribute to all analysts for parallel processing',
-    edgeType: 'parallel', // Explicit parallel execution
+    edgeType: 'direct', // Explicit parallel execution
   },
   {
     from: ['analyst1', 'analyst2', 'analyst3'], // Fan-in
     to: 'summarizer',
     description: 'Aggregate results from all analysts',
-    edgeType: 'parallel',
+    edgeType: 'direct',
   },
 ];
 ```
@@ -66,7 +66,7 @@ const edges: t.GraphEdge[] = [
 **Default behavior**:
 
 - Single-to-multiple edges default to parallel (fan-out)
-- Multiple-to-single edges should explicitly set `edgeType: 'parallel'` for fan-in
+- Multiple-to-single edges should explicitly set `edgeType: 'direct'` for fan-in
 
 ## Common Patterns
 
@@ -104,12 +104,12 @@ const edges = [
   {
     from: 'coordinator',
     to: ['worker1', 'worker2', 'worker3'],
-    edgeType: 'parallel', // Fan-out
+    edgeType: 'direct', // Fan-out
   },
   {
     from: ['worker1', 'worker2', 'worker3'],
     to: 'aggregator',
-    edgeType: 'parallel', // Fan-in
+    edgeType: 'direct', // Fan-in
   },
 ];
 ```
@@ -129,13 +129,13 @@ const edges = [
   {
     from: 'path_a',
     to: ['processor1', 'processor2'],
-    edgeType: 'parallel',
+    edgeType: 'direct',
   },
   // Processors converge
   {
     from: ['processor1', 'processor2'],
     to: 'finalizer',
-    edgeType: 'parallel',
+    edgeType: 'direct',
   },
 ];
 ```
@@ -147,7 +147,6 @@ const edges = [
 2. **State Management**: All agents share the same state (messages). Parallel agents see the same state snapshot and their updates are merged.
 
 3. **Tool Creation**:
-
    - Handoff edges create transfer tools (e.g., `transfer_to_agent_name`)
    - Parallel edges create direct graph connections (no tools)
 

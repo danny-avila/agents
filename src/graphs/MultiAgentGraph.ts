@@ -39,8 +39,8 @@ export class MultiAgentGraph extends StandardGraph {
   private categorizeEdges(): void {
     for (const edge of this.edges) {
       // Default behavior: edges with conditions or explicit 'handoff' type are handoff edges
-      // Edges with explicit 'parallel' type or multi-destination without conditions are parallel edges
-      if (edge.edgeType === 'parallel') {
+      // Edges with explicit 'direct' type or multi-destination without conditions are parallel edges
+      if (edge.edgeType === 'direct') {
         this.parallelEdges.push(edge);
       } else if (edge.edgeType === 'handoff' || edge.condition != null) {
         this.handoffEdges.push(edge);

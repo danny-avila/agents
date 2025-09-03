@@ -297,8 +297,8 @@ export type GraphEdge = {
   description?: string;
   /** Can return boolean or specific destination(s) */
   condition?: (state: BaseGraphState) => boolean | string | string[];
-  /** 'handoff' creates tools for dynamic routing, 'parallel' creates direct edges for simultaneous execution */
-  edgeType?: 'handoff' | 'parallel';
+  /** 'handoff' creates tools for dynamic routing, 'direct' creates direct edges, which also allow parallel execution */
+  edgeType?: 'handoff' | 'direct';
   /** Optional prompt to add when transitioning through this edge */
   promptInstructions?:
     | string
