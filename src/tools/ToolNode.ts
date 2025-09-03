@@ -85,6 +85,21 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             { ...call, args, type: 'tool_call', stepId, turn },
             config
           );
+
+          // Filter out content items with metadata property.
+          // This property is used to pass UI Resources from the tool response to the frontend.
+          // But it should not be sent to the LLM since it's not part of the tool response schema.
+          if (
+            isBaseMessage(output) &&
+            output.content &&
+            Array.isArray(output.content)
+          ) {
+            output.content = output.content.filter(
+              (item: t.MessageContentComplex) =>
+                typeof item === 'string' || !('metadata' in item)
+            );
+          }
+
           if (
             (isBaseMessage(output) && output._getType() === 'tool') ||
             isCommand(output)
