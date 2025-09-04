@@ -382,7 +382,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     currentTools?: t.GraphTools;
     currentToolMap?: t.ToolMap;
   }): CustomToolNode<t.BaseGraphState> | ToolNode<t.BaseGraphState> {
-    // return new ToolNode<t.BaseGraphState>(this.tools);
     return new CustomToolNode<t.BaseGraphState>({
       tools: (currentTools as t.GenericTool[] | undefined) ?? [],
       toolMap: currentToolMap,
