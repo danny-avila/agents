@@ -153,7 +153,10 @@ export class ChatModelStreamHandler implements t.EventHandler {
     if (
       chunk.tool_calls &&
       chunk.tool_calls.length > 0 &&
-      chunk.tool_calls.every((tc) => tc.id != null && tc.id !== '')
+      chunk.tool_calls.every(
+        (tc) =>
+          tc.id != null && tc.id !== '' && tc.name != null && tc.name !== ''
+      )
     ) {
       hasToolCalls = true;
       await handleToolCalls(chunk.tool_calls, metadata, graph);
