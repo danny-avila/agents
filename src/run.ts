@@ -34,7 +34,7 @@ export const defaultOmitOptions = new Set([
 export class Run<_T extends t.BaseGraphState> {
   id: string;
   private tokenCounter?: t.TokenCounter;
-  private handlerRegistry: HandlerRegistry;
+  private handlerRegistry?: HandlerRegistry;
   private indexTokenCountMap?: Record<string, number>;
   graphRunnable?: t.CompiledStateWorkflow;
   Graph: StandardGraph | MultiAgentGraph | undefined;
@@ -190,7 +190,7 @@ export class Run<_T extends t.BaseGraphState> {
       ) {
         return;
       }
-      const handler = this.handlerRegistry.getHandler(eventName);
+      const handler = this.handlerRegistry?.getHandler(eventName);
       if (handler && this.Graph) {
         await handler.handle(
           eventName,
@@ -262,7 +262,7 @@ export class Run<_T extends t.BaseGraphState> {
         continue;
       }
 
-      const handler = this.handlerRegistry.getHandler(eventName);
+      const handler = this.handlerRegistry?.getHandler(eventName);
       if (handler) {
         await handler.handle(eventName, data, metadata, this.Graph);
       }
