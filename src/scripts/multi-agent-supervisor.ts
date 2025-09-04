@@ -36,10 +36,10 @@ async function testSupervisorMultiAgent() {
   // Define configurations for all possible specialists
   const specialistConfigs = {
     data_analyst: {
-      provider: Providers.ANTHROPIC,
+      provider: Providers.OPENAI,
       clientOptions: {
-        modelName: 'claude-3-5-sonnet-latest',
-        apiKey: process.env.ANTHROPIC_API_KEY,
+        modelName: 'gpt-4.1',
+        apiKey: process.env.OPENAI_API_KEY,
       },
       instructions: `You are a Data Analyst specialist. Your expertise includes:
       - Statistical analysis and data visualization
@@ -52,10 +52,10 @@ async function testSupervisorMultiAgent() {
       maxContextTokens: 8000,
     },
     security_expert: {
-      provider: Providers.ANTHROPIC,
+      provider: Providers.OPENAI,
       clientOptions: {
-        modelName: 'claude-3-5-sonnet-latest',
-        apiKey: process.env.ANTHROPIC_API_KEY,
+        modelName: 'gpt-4.1',
+        apiKey: process.env.OPENAI_API_KEY,
       },
       instructions: `You are a Security Expert. Your expertise includes:
       - Cybersecurity best practices
@@ -68,10 +68,10 @@ async function testSupervisorMultiAgent() {
       maxContextTokens: 8000,
     },
     product_designer: {
-      provider: Providers.ANTHROPIC,
+      provider: Providers.OPENAI,
       clientOptions: {
-        modelName: 'claude-3-5-sonnet-latest',
-        apiKey: process.env.ANTHROPIC_API_KEY,
+        modelName: 'gpt-4.1',
+        apiKey: process.env.OPENAI_API_KEY,
       },
       instructions: `You are a Product Designer. Your expertise includes:
       - User experience (UX) design principles
@@ -84,10 +84,10 @@ async function testSupervisorMultiAgent() {
       maxContextTokens: 8000,
     },
     devops_engineer: {
-      provider: Providers.ANTHROPIC,
+      provider: Providers.OPENAI,
       clientOptions: {
-        modelName: 'claude-3-5-sonnet-latest',
-        apiKey: process.env.ANTHROPIC_API_KEY,
+        modelName: 'gpt-4.1',
+        apiKey: process.env.OPENAI_API_KEY,
       },
       instructions: `You are a DevOps Engineer. Your expertise includes:
       - CI/CD pipeline design and optimization
@@ -100,10 +100,10 @@ async function testSupervisorMultiAgent() {
       maxContextTokens: 8000,
     },
     legal_advisor: {
-      provider: Providers.ANTHROPIC,
+      provider: Providers.OPENAI,
       clientOptions: {
-        modelName: 'claude-3-5-sonnet-latest',
-        apiKey: process.env.ANTHROPIC_API_KEY,
+        modelName: 'gpt-4.1',
+        apiKey: process.env.OPENAI_API_KEY,
       },
       instructions: `You are a Legal Advisor specializing in technology. Your expertise includes:
       - Software licensing and open source compliance
@@ -154,6 +154,7 @@ async function testSupervisorMultiAgent() {
         event: GraphEvents.ON_MESSAGE_DELTA,
         data: t.StreamEventData
       ): void => {
+        console.dir(data, { depth: null });
         aggregateContent({ event, data: data as t.MessageDeltaEvent });
       },
     },
@@ -180,10 +181,10 @@ async function testSupervisorMultiAgent() {
 
     // Define the adaptive specialist configuration that will be reused
     const specialistConfig = {
-      provider: Providers.ANTHROPIC,
+      provider: Providers.OPENAI,
       clientOptions: {
-        modelName: 'claude-3-5-sonnet-latest',
-        apiKey: process.env.ANTHROPIC_API_KEY,
+        modelName: 'gpt-4.1',
+        apiKey: process.env.OPENAI_API_KEY,
       },
       instructions: `You are an Adaptive Specialist. Your agent ID indicates your role:
       
@@ -202,10 +203,10 @@ async function testSupervisorMultiAgent() {
     const agents: t.AgentInputs[] = [
       {
         agentId: 'supervisor',
-        provider: Providers.ANTHROPIC,
+        provider: Providers.OPENAI,
         clientOptions: {
-          modelName: 'claude-3-5-sonnet-latest',
-          apiKey: process.env.ANTHROPIC_API_KEY,
+          modelName: 'gpt-4.1-mini',
+          apiKey: process.env.OPENAI_API_KEY,
         },
         instructions: `You are a Task Supervisor with access to 5 specialist agents:
         1. transfer_to_data_analyst - For statistical analysis and metrics
@@ -298,10 +299,10 @@ async function testSupervisorMultiAgent() {
     // Test with different queries
     const testQueries = [
       'How can we analyze user engagement metrics to improve our product?',
-      'What security measures should we implement for our new API?',
-      'Can you help design a better onboarding flow for our mobile app?',
-      'We need to set up a CI/CD pipeline for our microservices.',
-      'What are the legal implications of using GPL-licensed code in our product?',
+      // 'What security measures should we implement for our new API?',
+      // 'Can you help design a better onboarding flow for our mobile app?',
+      // 'We need to set up a CI/CD pipeline for our microservices.',
+      // 'What are the legal implications of using GPL-licensed code in our product?',
     ];
 
     const config = {
