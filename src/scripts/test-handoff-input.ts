@@ -1,11 +1,11 @@
-#!/usr/bin/env bun
-
 import { config } from 'dotenv';
 config();
 
 import { HumanMessage } from '@langchain/core/messages';
 import { Run } from '@/run';
-import { Providers } from '@/common';
+import { Providers, GraphEvents } from '@/common';
+import { ChatModelStreamHandler, createContentAggregator } from '@/stream';
+import { ToolEndHandler, ModelEndHandler } from '@/events';
 import type * as t from '@/types';
 
 /**
@@ -14,8 +14,68 @@ import type * as t from '@/types';
  */
 async function testHandoffInput() {
   console.log('Testing Handoff Input Feature...\n');
+  // Set up content aggregator
+  const { contentParts, aggregateContent } = createContentAggregator();
+
+  // Track which specialist role was selected
+  let selectedRole = '';
+  let roleInstructions = '';
+
+  // Create custom handlers
+  const customHandlers = {
+    [GraphEvents.TOOL_END]: new ToolEndHandler(),
+    [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(),
+    [GraphEvents.CHAT_MODEL_STREAM]: new ChatModelStreamHandler(),
+    [GraphEvents.ON_RUN_STEP]: {
+      handle: (
+        event: GraphEvents.ON_RUN_STEP,
+        data: t.StreamEventData
+      ): void => {
+        const runStepData = data as any;
+        if (runStepData?.name) {
+          console.log(`\n[${runStepData.name}] Processing...`);
+        }
+        aggregateContent({ event, data: data as t.RunStep });
+      },
+    },
+    [GraphEvents.ON_RUN_STEP_COMPLETED]: {
+      handle: (
+        event: GraphEvents.ON_RUN_STEP_COMPLETED,
+        data: t.StreamEventData
+      ): void => {
+        aggregateContent({
+          event,
+          data: data as unknown as { result: t.ToolEndEvent },
+        });
+      },
+    },
+    [GraphEvents.ON_MESSAGE_DELTA]: {
+      handle: (
+        event: GraphEvents.ON_MESSAGE_DELTA,
+        data: t.StreamEventData
+      ): void => {
+        console.dir(data, { depth: null });
+        aggregateContent({ event, data: data as t.MessageDeltaEvent });
+      },
+    },
+    [GraphEvents.TOOL_START]: {
+      handle: (
+        _event: string,
+        data: t.StreamEventData,
+        metadata?: Record<string, unknown>
+      ): void => {
+        const toolData = data as any;
+        if (toolData?.name?.includes('transfer_to_')) {
+          const specialist = toolData.name.replace('transfer_to_', '');
+          console.log(`\n🔀 Transferring to ${specialist}...`);
+          selectedRole = specialist;
+        }
+      },
+    },
+  };
 
   const runConfig: t.RunConfig = {
+    customHandlers,
     runId: `test-handoff-input-${Date.now()}`,
     graphConfig: {
       type: 'multi-agent',
@@ -76,7 +136,7 @@ async function testHandoffInput() {
 
   // Test queries that should result in different handoffs with specific instructions
   const testQueries = [
-    'Analyze our Q4 sales data and identify the top 3 performing products',
+    // 'Analyze our Q4 sales data and identify the top 3 performing products',
     'Write a blog post about the benefits of remote work for software developers',
   ];
 
@@ -97,7 +157,7 @@ async function testHandoffInput() {
       messages: [new HumanMessage(query)],
     };
 
-    await run.processStream(inputs, config);
+    const finalContentParts = await run.processStream(inputs, config);
 
     console.log(`\n${'─'.repeat(60)}`);
     console.log('Notice how the supervisor passes specific instructions');
