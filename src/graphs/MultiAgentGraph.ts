@@ -23,7 +23,17 @@ import { Constants } from '@/common';
 
 /**
  * MultiAgentGraph extends StandardGraph to support dynamic multi-agent workflows
- * with handoffs, fan-in/fan-out, and other composable patterns
+ * with handoffs, fan-in/fan-out, and other composable patterns.
+ *
+ * Key behavior:
+ * - Agents with ONLY handoff edges: Can dynamically route to any handoff destination
+ * - Agents with ONLY direct edges: Always follow their direct edges
+ * - Agents with BOTH: Use Command for exclusive routing (handoff OR direct, not both)
+ *   - If handoff occurs: Only the handoff destination executes
+ *   - If no handoff: Direct edges execute (potentially in parallel)
+ *
+ * This enables the common pattern where an agent either delegates (handoff)
+ * OR continues its workflow (direct edges), but not both simultaneously.
  */
 export class MultiAgentGraph extends StandardGraph {
   private edges: t.GraphEdge[];
@@ -328,41 +338,91 @@ export class MultiAgentGraph extends StandardGraph {
         }
       }
 
-      /** If agent has handoff destinations, add END to possible ends
-       * If agent only has direct destinations, it naturally ends without explicit END
-       */
-      const destinations = new Set([...handoffDestinations]);
+      /** Check if this agent has BOTH handoff and direct edges */
+      const hasHandoffEdges = handoffDestinations.size > 0;
+      const hasDirectEdges = directDestinations.size > 0;
+      const needsCommandRouting = hasHandoffEdges && hasDirectEdges;
+
+      /** Collect all possible destinations for this agent */
+      const allDestinations = new Set([
+        ...handoffDestinations,
+        ...directDestinations,
+      ]);
       if (handoffDestinations.size > 0 || directDestinations.size === 0) {
-        destinations.add(END);
+        allDestinations.add(END);
       }
 
       /** Agent subgraph (includes agent + tools) */
       const agentSubgraph = this.createAgentSubgraph(agentId);
 
-      /** Wrapper function that handles agentMessages channel */
+      /** Wrapper function that handles agentMessages channel and conditional routing */
       const agentWrapper = async (
         state: t.MultiAgentGraphState
-      ): Promise<t.MultiAgentGraphState> => {
+      ): Promise<t.MultiAgentGraphState | Command> => {
+        let result: t.MultiAgentGraphState;
+
         if (state.agentMessages != null && state.agentMessages.length > 0) {
           /** Temporary state with messages replaced by `agentMessages` */
           const transformedState: t.MultiAgentGraphState = {
             ...state,
             messages: state.agentMessages,
           };
-          const result = await agentSubgraph.invoke(transformedState);
-          return {
+          result = await agentSubgraph.invoke(transformedState);
+          result = {
             ...result,
             /** Clear agentMessages for next agent */
             agentMessages: [],
           };
         } else {
-          return await agentSubgraph.invoke(state);
+          result = await agentSubgraph.invoke(state);
         }
+
+        /** If agent has both handoff and direct edges, use Command for exclusive routing */
+        if (needsCommandRouting) {
+          /** Check if a handoff occurred */
+          const lastMessage = result.messages[
+            result.messages.length - 1
+          ] as BaseMessage | null;
+          if (
+            lastMessage != null &&
+            lastMessage.getType() === 'tool' &&
+            typeof lastMessage.name === 'string' &&
+            lastMessage.name.startsWith(Constants.LC_TRANSFER_TO_)
+          ) {
+            /** Handoff occurred - extract destination and navigate there exclusively */
+            const handoffDest = lastMessage.name.replace(
+              Constants.LC_TRANSFER_TO_,
+              ''
+            );
+            return new Command({
+              update: result,
+              goto: handoffDest,
+            });
+          } else {
+            /** No handoff - proceed with direct edges */
+            const directDests = Array.from(directDestinations);
+            if (directDests.length === 1) {
+              return new Command({
+                update: result,
+                goto: directDests[0],
+              });
+            } else if (directDests.length > 1) {
+              /** Multiple direct destinations - they'll run in parallel */
+              return new Command({
+                update: result,
+                goto: directDests,
+              });
+            }
+          }
+        }
+
+        /** No special routing needed - return state normally */
+        return result;
       };
 
       /** Wrapped agent as a node with its possible destinations */
       builder.addNode(agentId, agentWrapper, {
-        ends: Array.from(destinations),
+        ends: Array.from(allDestinations),
       });
     }
 
@@ -474,10 +534,25 @@ export class MultiAgentGraph extends StandardGraph {
         /** @ts-ignore */
         builder.addEdge(wrapperNodeId, destination);
       } else {
-        /** No prompt instructions, add direct edges */
+        /** No prompt instructions, add direct edges (skip if source uses Command routing) */
         for (const edge of edges) {
           const sources = Array.isArray(edge.from) ? edge.from : [edge.from];
           for (const source of sources) {
+            /** Check if this source node has both handoff and direct edges */
+            const sourceHandoffEdges = this.handoffEdges.filter((e) => {
+              const eSources = Array.isArray(e.from) ? e.from : [e.from];
+              return eSources.includes(source);
+            });
+            const sourceDirectEdges = this.directEdges.filter((e) => {
+              const eSources = Array.isArray(e.from) ? e.from : [e.from];
+              return eSources.includes(source);
+            });
+
+            /** Skip adding edge if source uses Command routing (has both types) */
+            if (sourceHandoffEdges.length > 0 && sourceDirectEdges.length > 0) {
+              continue;
+            }
+
             // eslint-disable-next-line @typescript-eslint/ban-ts-comment
             /** @ts-ignore */
             builder.addEdge(source, destination);
