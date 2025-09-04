@@ -93,6 +93,7 @@ export type ClientOptions =
 
 export type SharedLLMConfig = {
   provider: Providers;
+  _lc_stream_delay?: number;
 };
 
 export type LLMConfig = SharedLLMConfig &
