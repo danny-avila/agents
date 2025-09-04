@@ -30,6 +30,7 @@ import {
   _convertOpenAIResponsesDeltaToBaseMessageChunk,
   type ResponseReturnStreamEvents,
 } from './utils';
+import { sleep } from '@/utils';
 
 // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
 const iife = <T>(fn: () => T) => fn();
@@ -195,6 +196,17 @@ export class CustomAzureOpenAIClient extends AzureOpenAIClient {
 
 /** @ts-expect-error We are intentionally overriding `getReasoningParams` */
 export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
+  _lc_stream_delay?: number;
+
+  constructor(
+    fields?: t.ChatOpenAICallOptions & {
+      _lc_stream_delay?: number;
+    } & t.OpenAIChatInput['modelKwargs']
+  ) {
+    super(fields);
+    this._lc_stream_delay = fields?._lc_stream_delay;
+  }
+
   public get exposedClient(): CustomOpenAIClient {
     return this.client;
   }
@@ -286,6 +298,9 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
         data as ResponseReturnStreamEvents
       );
       if (chunk == null) continue;
+      if (this._lc_stream_delay != null) {
+        await sleep(this._lc_stream_delay);
+      }
       yield chunk;
       await runManager?.handleLLMNewToken(
         chunk.text || '',
@@ -378,6 +393,9 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
         text: chunk.content,
         generationInfo,
       });
+      if (this._lc_stream_delay != null) {
+        await sleep(this._lc_stream_delay);
+      }
       yield generationChunk;
       await runManager?.handleLLMNewToken(
         generationChunk.text || '',
@@ -425,6 +443,9 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
         }),
         text: '',
       });
+      if (this._lc_stream_delay != null) {
+        await sleep(this._lc_stream_delay);
+      }
       yield generationChunk;
     }
     if (options.signal?.aborted === true) {
@@ -435,6 +456,13 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
 
 /** @ts-expect-error We are intentionally overriding `getReasoningParams` */
 export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
+  _lc_stream_delay?: number;
+
+  constructor(fields?: t.AzureOpenAIInput & { _lc_stream_delay?: number }) {
+    super(fields);
+    this._lc_stream_delay = fields?._lc_stream_delay;
+  }
+
   public get exposedClient(): CustomOpenAIClient {
     return this.client;
   }
@@ -564,6 +592,9 @@ export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
         data as ResponseReturnStreamEvents
       );
       if (chunk == null) continue;
+      if (this._lc_stream_delay != null) {
+        await sleep(this._lc_stream_delay);
+      }
       yield chunk;
       await runManager?.handleLLMNewToken(
         chunk.text || '',
@@ -633,13 +664,17 @@ export interface XAIUsageMetadata
 }
 
 export class ChatXAI extends OriginalChatXAI {
+  _lc_stream_delay?: number;
+
   constructor(
     fields?: Partial<ChatXAIInput> & {
       configuration?: { baseURL?: string };
       clientConfig?: { baseURL?: string };
+      _lc_stream_delay?: number;
     }
   ) {
     super(fields);
+    this._lc_stream_delay = fields?._lc_stream_delay;
     const customBaseURL =
       fields?.configuration?.baseURL ?? fields?.clientConfig?.baseURL;
     if (customBaseURL != null && customBaseURL) {
@@ -771,6 +806,9 @@ export class ChatXAI extends OriginalChatXAI {
         text: chunk.content,
         generationInfo,
       });
+      if (this._lc_stream_delay != null) {
+        await sleep(this._lc_stream_delay);
+      }
       yield generationChunk;
       await runManager?.handleLLMNewToken(
         generationChunk.text || '',
@@ -844,6 +882,9 @@ export class ChatXAI extends OriginalChatXAI {
         }),
         text: '',
       });
+      if (this._lc_stream_delay != null) {
+        await sleep(this._lc_stream_delay);
+      }
       yield generationChunk;
     }
     if (options.signal?.aborted === true) {
