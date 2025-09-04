@@ -103,9 +103,14 @@ export type MultiAgentGraphConfig = {
   edges: g.GraphEdge[];
 };
 
+export type StandardGraphConfig = Omit<
+  MultiAgentGraphConfig,
+  'edges' | 'type'
+> & { type?: 'standard'; signal?: AbortSignal };
+
 export type RunConfig = {
   runId: string;
-  graphConfig: LegacyGraphConfig | MultiAgentGraphConfig;
+  graphConfig: LegacyGraphConfig | StandardGraphConfig | MultiAgentGraphConfig;
   customHandlers?: Record<string, g.EventHandler>;
   returnContent?: boolean;
   tokenCounter?: TokenCounter;
