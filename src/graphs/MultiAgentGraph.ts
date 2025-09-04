@@ -125,14 +125,6 @@ export class MultiAgentGraph extends StandardGraph {
         agentContext.tools = [];
       }
       agentContext.tools.push(...handoffTools);
-
-      // Update tool map
-      for (const tool of handoffTools) {
-        if (!agentContext.toolMap) {
-          agentContext.toolMap = new Map();
-        }
-        agentContext.toolMap.set(tool.name, tool);
-      }
     }
   }
 
