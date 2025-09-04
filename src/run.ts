@@ -78,7 +78,7 @@ export class Run<_T extends t.BaseGraphState> {
         this.Graph.handlerRegistry = handlerRegistry;
       }
     } else {
-      // Default to legacy graph for 'standard' or undefined type
+      /** Default to legacy graph for 'standard' or undefined type */
       this.graphRunnable = this.createLegacyGraph(config.graphConfig);
       if (this.Graph) {
         this.Graph.compileOptions =
@@ -91,25 +91,38 @@ export class Run<_T extends t.BaseGraphState> {
   }
 
   private createLegacyGraph(
-    config: t.LegacyGraphConfig
+    config: t.LegacyGraphConfig | t.StandardGraphConfig
   ): t.CompiledStateWorkflow {
-    const {
-      type: _type,
-      llmConfig,
-      signal,
-      tools = [],
-      ...agentInputs
-    } = config;
-    const { provider, ...clientOptions } = llmConfig;
+    let agentConfig: t.AgentInputs;
+    let signal: AbortSignal | undefined;
 
-    /** TEMP: Create agent configuration for the single agent */
-    const agentConfig: t.AgentInputs = {
-      ...agentInputs,
-      tools,
-      provider,
-      clientOptions,
-      agentId: 'default',
-    };
+    /** Check if this is a multi-agent style config (has agents array) */
+    if ('agents' in config && Array.isArray(config.agents)) {
+      if (config.agents.length === 0) {
+        throw new Error('At least one agent must be provided');
+      }
+      agentConfig = config.agents[0];
+      signal = config.signal;
+    } else {
+      /** Legacy path: build agent config from llmConfig */
+      const {
+        type: _type,
+        llmConfig,
+        signal: legacySignal,
+        tools = [],
+        ...agentInputs
+      } = config as t.LegacyGraphConfig;
+      const { provider, ...clientOptions } = llmConfig;
+
+      agentConfig = {
+        ...agentInputs,
+        tools,
+        provider,
+        clientOptions,
+        agentId: 'default',
+      };
+      signal = legacySignal;
+    }
 
     const standardGraph = new StandardGraph({
       signal,
@@ -118,10 +131,8 @@ export class Run<_T extends t.BaseGraphState> {
       tokenCounter: this.tokenCounter,
       indexTokenCountMap: this.indexTokenCountMap,
     });
-    // propagate compile options from graph config
-    standardGraph.compileOptions = (
-      config as t.LegacyGraphConfig
-    ).compileOptions;
+    /** Propagate compile options from graph config */
+    standardGraph.compileOptions = config.compileOptions;
     this.Graph = standardGraph;
     return standardGraph.createWorkflow();
   }
@@ -150,7 +161,7 @@ export class Run<_T extends t.BaseGraphState> {
   static async create<T extends t.BaseGraphState>(
     config: t.RunConfig
   ): Promise<Run<T>> {
-    // Create tokenCounter if indexTokenCountMap is provided but tokenCounter is not
+    /** Create tokenCounter if indexTokenCountMap is provided but tokenCounter is not */
     if (config.indexTokenCountMap && !config.tokenCounter) {
       config.tokenCounter = await createTokenCounter();
     }
