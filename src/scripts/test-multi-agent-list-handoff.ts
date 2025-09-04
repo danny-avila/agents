@@ -5,8 +5,8 @@ config();
 
 import { HumanMessage, BaseMessage } from '@langchain/core/messages';
 import { Run } from '@/run';
-import { Providers, GraphEvents } from '@/common';
 import { ChatModelStreamHandler, createContentAggregator } from '@/stream';
+import { Providers, GraphEvents, Constants } from '@/common';
 import { ToolEndHandler, ModelEndHandler } from '@/events';
 import type * as t from '@/types';
 
@@ -70,8 +70,11 @@ async function testSupervisorListHandoff() {
         metadata?: Record<string, unknown>
       ): void => {
         const toolData = data as any;
-        if (toolData?.name?.includes('transfer_to_')) {
-          const specialist = toolData.name.replace('transfer_to_', '');
+        if (toolData?.name?.startsWith(Constants.LC_TRANSFER_TO_)) {
+          const specialist = toolData.name.replace(
+            Constants.LC_TRANSFER_TO_,
+            ''
+          );
           console.log(`\n🔀 Transferring to ${specialist}...`);
           selectedRole = specialist;
         }

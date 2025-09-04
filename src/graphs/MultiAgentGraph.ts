@@ -19,6 +19,7 @@ import type { ToolRunnableConfig } from '@langchain/core/tools';
 import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
 import { StandardGraph } from './Graph';
+import { Constants } from '@/common';
 
 /**
  * MultiAgentGraph extends StandardGraph to support dynamic multi-agent workflows
@@ -215,7 +216,7 @@ export class MultiAgentGraph extends StandardGraph {
     } else {
       /** Create individual tools for each destination */
       for (const destination of destinations) {
-        const toolName = `transfer_to_${destination}`;
+        const toolName = `${Constants.LC_TRANSFER_TO_}${destination}`;
         const toolDescription =
           edge.description ?? `Transfer control to agent '${destination}'`;
 
