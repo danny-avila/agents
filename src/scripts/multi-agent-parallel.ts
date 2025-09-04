@@ -167,7 +167,7 @@ async function testParallelMultiAgent() {
       description: 'Aggregate analysis results',
       edgeType: 'direct', // Fan-in is also direct
       // Add prompt when all analysts have provided input
-      // promptInstructions: (messages, runStartIndex) => {
+      // prompt: (messages, runStartIndex) => {
       //   // Check if we have analysis content from all three analysts
       //   // Look for the specific headers each analyst uses
       //   const aiMessages = messages.filter(
@@ -192,7 +192,7 @@ async function testParallelMultiAgent() {
       //   }
       //   return undefined; // No prompt if we haven't received all analyst inputs
       // },
-      promptInstructions:
+      prompt:
         'Based on the comprehensive analyses from all three specialist teams below, please synthesize their insights into a cohesive executive summary. Focus on the key findings, common themes, and strategic implications across the financial, technical, and market perspectives.\n\n{results}',
     },
   ];
