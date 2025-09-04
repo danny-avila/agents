@@ -298,10 +298,10 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
         data as ResponseReturnStreamEvents
       );
       if (chunk == null) continue;
+      yield chunk;
       if (this._lc_stream_delay != null) {
         await sleep(this._lc_stream_delay);
       }
-      yield chunk;
       await runManager?.handleLLMNewToken(
         chunk.text || '',
         undefined,
@@ -393,10 +393,10 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
         text: chunk.content,
         generationInfo,
       });
+      yield generationChunk;
       if (this._lc_stream_delay != null) {
         await sleep(this._lc_stream_delay);
       }
-      yield generationChunk;
       await runManager?.handleLLMNewToken(
         generationChunk.text || '',
         newTokenIndices,
@@ -443,10 +443,10 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
         }),
         text: '',
       });
+      yield generationChunk;
       if (this._lc_stream_delay != null) {
         await sleep(this._lc_stream_delay);
       }
-      yield generationChunk;
     }
     if (options.signal?.aborted === true) {
       throw new Error('AbortError');
@@ -592,10 +592,10 @@ export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
         data as ResponseReturnStreamEvents
       );
       if (chunk == null) continue;
+      yield chunk;
       if (this._lc_stream_delay != null) {
         await sleep(this._lc_stream_delay);
       }
-      yield chunk;
       await runManager?.handleLLMNewToken(
         chunk.text || '',
         undefined,
@@ -806,10 +806,10 @@ export class ChatXAI extends OriginalChatXAI {
         text: chunk.content,
         generationInfo,
       });
+      yield generationChunk;
       if (this._lc_stream_delay != null) {
         await sleep(this._lc_stream_delay);
       }
-      yield generationChunk;
       await runManager?.handleLLMNewToken(
         generationChunk.text || '',
         newTokenIndices,
@@ -882,10 +882,10 @@ export class ChatXAI extends OriginalChatXAI {
         }),
         text: '',
       });
+      yield generationChunk;
       if (this._lc_stream_delay != null) {
         await sleep(this._lc_stream_delay);
       }
-      yield generationChunk;
     }
     if (options.signal?.aborted === true) {
       throw new Error('AbortError');
