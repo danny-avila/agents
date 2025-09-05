@@ -334,7 +334,10 @@ export type GraphEdge = {
    */
   prompt?:
     | string
-    | ((messages: BaseMessage[], runStartIndex: number) => string | undefined);
+    | ((
+        messages: BaseMessage[],
+        runStartIndex: number
+      ) => string | Promise<string> | undefined);
   /**
    * When true, excludes messages from startIndex when adding prompt.
    * Automatically set to true when {results} variable is used in prompt.
