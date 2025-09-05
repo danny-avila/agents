@@ -362,6 +362,38 @@ export class MultiAgentGraph extends StandardGraph {
         let result: t.MultiAgentGraphState;
 
         if (state.agentMessages != null && state.agentMessages.length > 0) {
+          /**
+           * When using agentMessages (excludeResults=true), we need to update
+           * the token map to account for the new prompt message
+           */
+          const agentContext = this.agentContexts.get(agentId);
+          if (agentContext && agentContext.tokenCounter) {
+            // The agentMessages contains:
+            // 1. Filtered messages (0 to startIndex) - already have token counts
+            // 2. New prompt message - needs token counting
+
+            const freshTokenMap: Record<string, number> = {};
+
+            // Copy existing token counts for filtered messages (0 to startIndex)
+            for (let i = 0; i < this.startIndex; i++) {
+              const tokenCount = agentContext.indexTokenCountMap[i];
+              if (tokenCount !== undefined) {
+                freshTokenMap[i] = tokenCount;
+              }
+            }
+
+            // Calculate tokens only for the new prompt message (last message)
+            const promptMessageIndex = state.agentMessages.length - 1;
+            if (promptMessageIndex >= this.startIndex) {
+              const promptMessage = state.agentMessages[promptMessageIndex];
+              freshTokenMap[promptMessageIndex] =
+                agentContext.tokenCounter(promptMessage);
+            }
+
+            // Update the agent's token map with instructions added
+            agentContext.updateTokenMapWithInstructions(freshTokenMap);
+          }
+
           /** Temporary state with messages replaced by `agentMessages` */
           const transformedState: t.MultiAgentGraphState = {
             ...state,
