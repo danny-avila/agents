@@ -1,11 +1,11 @@
 import { z } from 'zod';
 import { tool } from '@langchain/core/tools';
+import { PromptTemplate } from '@langchain/core/prompts';
 import {
   ToolMessage,
   HumanMessage,
   getBufferString,
 } from '@langchain/core/messages';
-import { ChatPromptTemplate } from '@langchain/core/prompts';
 import {
   END,
   START,
@@ -508,16 +508,16 @@ export class MultiAgentGraph extends StandardGraph {
           let effectiveExcludeResults = excludeResults;
 
           if (typeof prompt === 'function') {
-            promptText = prompt(state.messages, this.startIndex);
+            promptText = await prompt(state.messages, this.startIndex);
           } else if (prompt != null) {
             if (prompt.includes('{results}')) {
               const resultsMessages = state.messages.slice(this.startIndex);
               const resultsString = getBufferString(resultsMessages);
-              const promptTemplate = ChatPromptTemplate.fromTemplate(prompt);
-              const formattedPromptValue = await promptTemplate.invoke({
+              const promptTemplate = PromptTemplate.fromTemplate(prompt);
+              const result = await promptTemplate.invoke({
                 results: resultsString,
               });
-              promptText = formattedPromptValue.messages[0].content.toString();
+              promptText = result.value;
               effectiveExcludeResults =
                 excludeResults !== false && promptText !== '';
             } else {
