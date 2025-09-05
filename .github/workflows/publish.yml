@@ -21,6 +21,11 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Build
+        run: npm run build
+        env:
+          NODE_ENV: production
+
       - name: Run tests
         run: npx jest --testPathIgnorePatterns=title.memory-leak.test.ts
         env:
@@ -32,11 +37,6 @@ jobs:
           AZURE_OPENAI_API_VERSION: ${{ secrets.AZURE_OPENAI_API_VERSION }}
           AZURE_OPENAI_API_INSTANCE: ${{ secrets.AZURE_OPENAI_API_INSTANCE }}
           AZURE_OPENAI_API_DEPLOYMENT: ${{ secrets.AZURE_OPENAI_API_DEPLOYMENT }}
-
-      - name: Build
-        run: npm run build
-        env:
-          NODE_ENV: production
 
       - name: Prune development dependencies
         run: npm prune --production
