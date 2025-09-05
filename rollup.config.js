@@ -20,19 +20,19 @@ const excludedDirsInProd = [
   'src/specs/',
   'src/proto/',
   'routes/',
-  'config/'
+  'config/',
 ];
 
 function filterProdFiles(id) {
-  if (!isProduction) {
-    return !excludedDirsInProd.some(dir => id.includes(dir));
+  if (isProduction) {
+    return !excludedDirsInProd.some((dir) => id.includes(dir));
   }
   return true;
 }
 
 export default {
   input: {
-    main: './src/index.ts'
+    main: './src/index.ts',
   },
   output: [
     {
@@ -42,7 +42,7 @@ export default {
       // sourcemap: !isProduction,
       sourcemap: true,
       preserveModules: true,
-      preserveModulesRoot: 'src'
+      preserveModulesRoot: 'src',
     },
     {
       dir: 'dist/cjs',
@@ -52,8 +52,8 @@ export default {
       sourcemap: true,
       preserveModules: true,
       preserveModulesRoot: 'src',
-      exports: 'named'
-    }
+      exports: 'named',
+    },
   ],
   plugins: [
     cleandir('dist'),
@@ -63,16 +63,14 @@ export default {
         if (importer && !filterProdFiles(source)) {
           return false;
         }
-      }
+      },
     },
     alias({
-      entries: [
-        { find: '@', replacement: path.resolve(__dirname, 'src') }
-      ]
+      entries: [{ find: '@', replacement: path.resolve(__dirname, 'src') }],
     }),
     nodeResolve({
       preferBuiltins: true,
-      extensions: ['.mjs', '.js', '.json', '.node', '.ts']
+      extensions: ['.mjs', '.js', '.json', '.node', '.ts'],
     }),
     commonjs({
       esmExternals: true,
@@ -80,7 +78,7 @@ export default {
     }),
     json(),
     typescript({
-      tsconfig: './tsconfig.json',
+      tsconfig: isProduction ? './tsconfig.build.json' : './tsconfig.json',
       /* enable source maps for testing with other production options */
       // sourceMap: !isProduction,
       // inlineSources: !isProduction,
@@ -90,10 +88,12 @@ export default {
       declaration: false,
       exclude: [
         'src/proto/**/*',
+        'src/scripts/**/*',
+        'src/specs/**/*',
         '**/*.test.ts',
         '**/*.spec.ts',
-        'node_modules/**'
-      ]
+        'node_modules/**',
+      ],
     }),
     /* Disable terser/obfuscator for now */
     // isProduction && terser(),
@@ -110,7 +110,5 @@ export default {
     //   ]
     // })
   ].filter(Boolean),
-  external: [
-    /node_modules/
-  ]
+  external: [/node_modules/],
 };
