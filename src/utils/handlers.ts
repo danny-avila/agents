@@ -39,7 +39,7 @@ interface HandlerCallbacks {
 /**
  * Creates handlers with content aggregation for multi-agent scripts
  */
-export function createHandlers(callbacks: HandlerCallbacks = {}): {
+export function createHandlers(callbacks?: HandlerCallbacks): {
   contentParts: Array<t.MessageContentComplex | undefined>;
   aggregateContent: ReturnType<
     typeof createContentAggregator
@@ -61,7 +61,7 @@ export function createHandlers(callbacks: HandlerCallbacks = {}): {
         data: t.StreamEventData
       ): void => {
         aggregateContent({ event, data: data as t.RunStep });
-        callbacks.onRunStep?.(event, data);
+        callbacks?.onRunStep?.(event, data);
       },
     },
 
@@ -74,7 +74,7 @@ export function createHandlers(callbacks: HandlerCallbacks = {}): {
           event,
           data: data as unknown as { result: t.ToolEndEvent },
         });
-        callbacks.onRunStepCompleted?.(event, data);
+        callbacks?.onRunStepCompleted?.(event, data);
       },
     },
 
@@ -84,7 +84,7 @@ export function createHandlers(callbacks: HandlerCallbacks = {}): {
         data: t.StreamEventData
       ): void => {
         aggregateContent({ event, data: data as t.RunStepDeltaEvent });
-        callbacks.onRunStepDelta?.(event, data);
+        callbacks?.onRunStepDelta?.(event, data);
       },
     },
 
@@ -94,7 +94,7 @@ export function createHandlers(callbacks: HandlerCallbacks = {}): {
         data: t.StreamEventData
       ): void => {
         aggregateContent({ event, data: data as t.MessageDeltaEvent });
-        callbacks.onMessageDelta?.(event, data);
+        callbacks?.onMessageDelta?.(event, data);
       },
     },
   };
