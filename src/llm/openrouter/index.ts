@@ -22,6 +22,9 @@ export class ChatOpenRouter extends ChatOpenAI {
       },
     });
   }
+  static lc_name(): 'LibreChatOpenRouter' {
+    return 'LibreChatOpenRouter';
+  }
   protected override _convertOpenAIDeltaToBaseMessageChunk(
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     delta: Record<string, any>,

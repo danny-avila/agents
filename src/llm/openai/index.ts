@@ -198,6 +198,9 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
   public get exposedClient(): CustomOpenAIClient {
     return this.client;
   }
+  static lc_name(): string {
+    return 'LibreChatOpenAI';
+  }
   protected _getClientOptions(
     options?: OpenAICoreRequestOptions
   ): OpenAICoreRequestOptions {
@@ -439,6 +442,9 @@ export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
   public get exposedClient(): CustomOpenAIClient {
     return this.client;
   }
+  static lc_name(): 'LibreChatAzureOpenAI' {
+    return 'LibreChatAzureOpenAI';
+  }
   /**
    * Returns backwards compatible reasoning parameters from constructor params and call options
    * @internal
@@ -580,6 +586,9 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
   public get exposedClient(): CustomOpenAIClient {
     return this.client;
   }
+  static lc_name(): 'LibreChatDeepSeek' {
+    return 'LibreChatDeepSeek';
+  }
   protected _getClientOptions(
     options?: OpenAICoreRequestOptions
   ): OpenAICoreRequestOptions {
@@ -646,6 +655,10 @@ export class ChatXAI extends OriginalChatXAI {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       this.client = undefined as any;
     }
+  }
+
+  static lc_name(): 'LibreChatXAI' {
+    return 'LibreChatXAI';
   }
 
   public get exposedClient(): CustomOpenAIClient {

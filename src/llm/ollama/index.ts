@@ -13,6 +13,9 @@ import {
 } from './utils';
 
 export class ChatOllama extends BaseChatOllama {
+  static lc_name(): 'LibreChatOllama' {
+    return 'LibreChatOllama';
+  }
   async *_streamResponseChunks(
     messages: BaseMessage[],
     options: this['ParsedCallOptions'],

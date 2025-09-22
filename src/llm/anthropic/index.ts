@@ -141,6 +141,10 @@ export class CustomAnthropic extends ChatAnthropicMessages {
     this._lc_stream_delay = fields?._lc_stream_delay ?? 25;
   }
 
+  static lc_name(): 'LibreChatAnthropic' {
+    return 'LibreChatAnthropic';
+  }
+
   /**
    * Get the parameters used to invoke the model
    */

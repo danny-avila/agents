@@ -107,6 +107,10 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
     this.streamUsage = fields.streamUsage ?? this.streamUsage;
   }
 
+  static lc_name(): 'LibreChatGoogleGenerativeAI' {
+    return 'LibreChatGoogleGenerativeAI';
+  }
+
   invocationParams(
     options?: this['ParsedCallOptions']
   ): Omit<GenerateContentRequest, 'contents'> {

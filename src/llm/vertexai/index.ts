@@ -313,8 +313,8 @@ export class ChatVertexAI extends ChatGoogle {
   lc_namespace = ['langchain', 'chat_models', 'vertexai'];
   dynamicThinkingBudget = false;
 
-  static lc_name(): 'ChatVertexAI' {
-    return 'ChatVertexAI';
+  static lc_name(): 'LibreChatVertexAI' {
+    return 'LibreChatVertexAI';
   }
 
   constructor(fields?: VertexAIClientOptions) {
