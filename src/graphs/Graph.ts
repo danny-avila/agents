@@ -583,9 +583,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           (agentContext.provider === Providers.BEDROCK &&
             (agentContext.clientOptions as t.BedrockAnthropicInput)
               .additionalModelRequestFields?.['thinking'] != null) ||
-          (this.provider === Providers.OPENAI &&
+          (agentContext.provider === Providers.OPENAI &&
             (
-              (this.clientOptions as t.OpenAIClientOptions).modelKwargs
+              (agentContext.clientOptions as t.OpenAIClientOptions).modelKwargs
                 ?.thinking as t.AnthropicClientOptions['thinking']
             )?.type === 'enabled');
 
