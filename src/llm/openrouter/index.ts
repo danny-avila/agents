@@ -1,23 +1,29 @@
-import type { ChatOpenAICallOptions, OpenAIClient } from '@langchain/openai';
+import { ChatOpenAI } from '@/llm/openai';
 import type {
-  AIMessageChunk,
-  HumanMessageChunk,
-  SystemMessageChunk,
   FunctionMessageChunk,
+  SystemMessageChunk,
+  HumanMessageChunk,
   ToolMessageChunk,
   ChatMessageChunk,
+  AIMessageChunk,
 } from '@langchain/core/messages';
-import { ChatOpenAI } from '@/llm/openai';
+import type {
+  ChatOpenAICallOptions,
+  OpenAIChatInput,
+  OpenAIClient,
+} from '@langchain/openai';
 
 export interface ChatOpenRouterCallOptions extends ChatOpenAICallOptions {
   include_reasoning?: boolean;
+  modelKwargs?: OpenAIChatInput['modelKwargs'];
 }
 export class ChatOpenRouter extends ChatOpenAI {
   constructor(_fields: Partial<ChatOpenRouterCallOptions>) {
-    const { include_reasoning, ...fields } = _fields;
+    const { include_reasoning, modelKwargs = {}, ...fields } = _fields;
     super({
       ...fields,
       modelKwargs: {
+        ...modelKwargs,
         include_reasoning,
       },
     });
