@@ -135,9 +135,11 @@ export class CustomAnthropic extends ChatAnthropicMessages {
   private message_delta: AnthropicMessageDeltaEvent | undefined;
   private tools_in_params?: boolean;
   private emitted_usage?: boolean;
+  top_k: number | undefined;
   constructor(fields?: CustomAnthropicInput) {
     super(fields);
     this.resetTokenEvents();
+    this.setDirectFields(fields);
     this._lc_stream_delay = fields?._lc_stream_delay ?? 25;
   }
 
@@ -162,7 +164,7 @@ export class CustomAnthropic extends ChatAnthropicMessages {
       | undefined = handleToolChoice(options?.tool_choice);
 
     if (this.thinking.type === 'enabled') {
-      if (this.topK !== -1 && (this.topK as number | undefined) != null) {
+      if (this.top_k !== -1 && (this.top_k as number | undefined) != null) {
         throw new Error('topK is not supported when thinking is enabled');
       }
       if (this.topP !== -1 && (this.topP as number | undefined) != null) {
@@ -191,7 +193,7 @@ export class CustomAnthropic extends ChatAnthropicMessages {
     return {
       model: this.model,
       temperature: this.temperature,
-      top_k: this.topK,
+      top_k: this.top_k,
       top_p: this.topP,
       stop_sequences: options?.stop ?? this.stopSequences,
       stream: this.streaming,
@@ -246,6 +248,21 @@ export class CustomAnthropic extends ChatAnthropicMessages {
     this.message_delta = undefined;
     this.emitted_usage = undefined;
     this.tools_in_params = undefined;
+  }
+
+  setDirectFields(fields?: CustomAnthropicInput): void {
+    this.temperature = fields?.temperature ?? undefined;
+    this.topP = fields?.topP ?? undefined;
+    this.top_k = fields?.topK;
+    if (this.temperature === -1 || this.temperature === 1) {
+      this.temperature = undefined;
+    }
+    if (this.topP === -1) {
+      this.topP = undefined;
+    }
+    if (this.top_k === -1) {
+      this.top_k = undefined;
+    }
   }
 
   private createGenerationChunk({
