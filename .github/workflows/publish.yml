@@ -41,9 +41,6 @@ jobs:
       - name: Prune development dependencies
         run: npm prune --production
 
-      - name: Set up npm authentication
-        run: echo "//registry.npmjs.org/:_authToken=${{ secrets.NPM_TOKEN }}" > ~/.npmrc
-
       - name: Check version change
         id: check
         run: |
@@ -56,6 +53,8 @@ jobs:
             echo "Version changed, proceeding with publish"
             echo "skip=false" >> $GITHUB_OUTPUT
           fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Pack package
         if: steps.check.outputs.skip != 'true'
