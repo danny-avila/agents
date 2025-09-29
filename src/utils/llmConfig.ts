@@ -102,7 +102,7 @@ export const llmConfigs: Record<string, t.LLMConfig | undefined> = {
   },
   [Providers.ANTHROPIC]: {
     provider: Providers.ANTHROPIC,
-    model: 'claude-3-5-sonnet-20240620',
+    model: 'claude-sonnet-4-5',
     streaming: true,
     streamUsage: true,
   },
