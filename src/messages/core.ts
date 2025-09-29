@@ -321,12 +321,15 @@ export function convertMessagesToContent(
       const id = (message as ToolMessage).tool_call_id;
       const output = (message as ToolMessage).content;
       const tool_call = toolCallMap.get(id);
-
+      if (currentAIMessageIndex === -1) {
+        processedContent.push({ type: 'text', text: '' });
+        currentAIMessageIndex = processedContent.length - 1;
+      }
+      const contentPart = processedContent[currentAIMessageIndex];
       processedContent.push({
         type: 'tool_call',
         tool_call: Object.assign({}, tool_call, { output }),
       });
-      const contentPart = processedContent[currentAIMessageIndex];
       const tool_call_ids = contentPart.tool_call_ids || [];
       tool_call_ids.push(id);
       contentPart.tool_call_ids = tool_call_ids;
