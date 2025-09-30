@@ -33,7 +33,7 @@ export function handleToolCallChunks({
   let prevStepId: string;
   let prevRunStep: t.RunStep | undefined;
   try {
-    prevStepId = graph.getStepIdByKey(stepKey, graph.contentData.length - 1);
+    prevStepId = graph.getStepIdByKey(stepKey);
     prevRunStep = graph.getRunStep(prevStepId);
   } catch {
     /** Edge Case: If no previous step exists, create a new message creation step */
@@ -47,7 +47,7 @@ export function handleToolCallChunks({
     prevRunStep = graph.getRunStep(prevStepId);
   }
 
-  const _stepId = graph.getStepIdByKey(stepKey, prevRunStep?.index);
+  const _stepId = graph.getStepIdByKey(stepKey);
 
   /** Edge Case: Tool Call Run Step or `tool_call_ids` never dispatched */
   const tool_calls: ToolCall[] | undefined =
