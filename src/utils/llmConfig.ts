@@ -94,6 +94,16 @@ export const llmConfigs: Record<string, t.LLMConfig | undefined> = {
       baseURL: 'http://192.168.254.183:1233/v1',
     },
   },
+  zhipu: {
+    provider: Providers.OPENAI,
+    streaming: true,
+    streamUsage: false,
+    model: 'glm-4.5-air',
+    apiKey: process.env.ZHIPU_API_KEY,
+    configuration: {
+      baseURL: 'https://open.bigmodel.cn/api/paas/v4',
+    },
+  },
   [Providers.DEEPSEEK]: {
     provider: Providers.DEEPSEEK,
     model: 'deepseek-reasoner',

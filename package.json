@@ -47,7 +47,7 @@
     "image": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/image.ts --provider 'google' --name 'Jo' --location 'New York, NY'",
     "code_exec_files": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/code_exec_files.ts --provider 'openAI' --name 'Jo' --location 'New York, NY'",
     "code_exec_simple": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/code_exec_simple.ts --provider 'google' --name 'Jo' --location 'New York, NY'",
-    "simple": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/simple.ts --provider 'lmstudio' --name 'Jo' --location 'New York, NY'",
+    "simple": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/simple.ts --provider 'zhipu' --name 'Jo' --location 'New York, NY'",
     "caching": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/caching.ts --name 'Jo' --location 'New York, NY'",
     "thinking": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/thinking.ts --name 'Jo' --location 'New York, NY'",
     "memory": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/memory.ts --provider 'openAI' --name 'Jo' --location 'New York, NY'",
