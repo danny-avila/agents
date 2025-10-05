@@ -12,6 +12,7 @@ import {
   newsSchema,
 } from './schema';
 import { createSearchAPI, createSourceProcessor } from './search';
+import { createSerperScraper } from './serper-scraper';
 import { createFirecrawlScraper } from './firecrawl';
 import { expandHighlights } from './highlights';
 import { formatResultsForLLM } from './format';
@@ -328,6 +329,27 @@ Use anchor marker(s) immediately after the statement:
  * Creates a search tool with a schema that dynamically includes the country field
  * only when the searchProvider is 'serper'.
  *
+ * Supports multiple scraper providers:
+ * - Firecrawl (default): Full-featured web scraping with multiple formats
+ * - Serper: Lightweight scraping using Serper's scrape API
+ *
+ * @example
+ * ```typescript
+ * // Using Firecrawl scraper (default)
+ * const searchTool = createSearchTool({
+ *   searchProvider: 'serper',
+ *   scraperProvider: 'firecrawl',
+ *   firecrawlApiKey: 'your-firecrawl-key'
+ * });
+ *
+ * // Using Serper scraper
+ * const searchTool = createSearchTool({
+ *   searchProvider: 'serper',
+ *   scraperProvider: 'serper',
+ *   serperApiKey: 'your-serper-key'
+ * });
+ * ```
+ *
  * @param config - The search tool configuration
  * @returns A DynamicStructuredTool with a schema that depends on the searchProvider
  */
@@ -344,10 +366,12 @@ export const createSearchTool = (
     strategies = ['no_extraction'],
     filterContent = true,
     safeSearch = 1,
+    scraperProvider = 'firecrawl',
     firecrawlApiKey,
     firecrawlApiUrl,
     firecrawlVersion,
     firecrawlOptions,
+    serperScraperOptions,
     scraperTimeout,
     jinaApiKey,
     jinaApiUrl,
@@ -386,14 +410,27 @@ export const createSearchTool = (
     searxngApiKey,
   });
 
-  const firecrawlScraper = createFirecrawlScraper({
-    ...firecrawlOptions,
-    apiKey: firecrawlApiKey ?? process.env.FIRECRAWL_API_KEY,
-    apiUrl: firecrawlApiUrl,
-    version: firecrawlVersion,
-    timeout: scraperTimeout ?? firecrawlOptions?.timeout,
-    formats: firecrawlOptions?.formats ?? ['markdown', 'rawHtml'],
-  });
+  /** Create scraper based on scraperProvider */
+  let scraperInstance: t.BaseScraper;
+
+  if (scraperProvider === 'serper') {
+    scraperInstance = createSerperScraper({
+      ...serperScraperOptions,
+      apiKey: serperApiKey,
+      timeout: scraperTimeout ?? serperScraperOptions?.timeout,
+      logger,
+    });
+  } else {
+    scraperInstance = createFirecrawlScraper({
+      ...firecrawlOptions,
+      apiKey: firecrawlApiKey ?? process.env.FIRECRAWL_API_KEY,
+      apiUrl: firecrawlApiUrl,
+      version: firecrawlVersion,
+      timeout: scraperTimeout ?? firecrawlOptions?.timeout,
+      formats: firecrawlOptions?.formats ?? ['markdown', 'rawHtml'],
+      logger,
+    });
+  }
 
   const selectedReranker = createReranker({
     rerankerType,
@@ -415,7 +452,7 @@ export const createSearchTool = (
       filterContent,
       logger,
     },
-    firecrawlScraper
+    scraperInstance
   );
 
   const search = createSearchProcessor({

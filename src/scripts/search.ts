@@ -83,7 +83,11 @@ async function testStandardStreaming(): Promise<void> {
     graphConfig: {
       type: 'standard',
       llmConfig,
-      tools: [createSearchTool()],
+      tools: [
+        createSearchTool({
+          scraperProvider: 'serper',
+        }),
+      ],
       instructions:
         'You are a friendly AI assistant. Always address the user by their name.',
       // additional_instructions: `The user's name is ${userName} and they are located in ${location}.`,

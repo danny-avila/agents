@@ -5,6 +5,7 @@ import type { BaseReranker } from './rerankers';
 import { DATE_RANGE } from './schema';
 
 export type SearchProvider = 'serper' | 'searxng';
+export type ScraperProvider = 'firecrawl' | 'serper';
 export type RerankerType = 'infinity' | 'jina' | 'cohere' | 'none';
 
 export interface Highlight {
@@ -98,6 +99,14 @@ export interface FirecrawlConfig {
   firecrawlOptions?: FirecrawlScraperConfig;
 }
 
+export interface SerperScraperConfig {
+  apiKey?: string;
+  apiUrl?: string;
+  timeout?: number;
+  logger?: Logger;
+  includeMarkdown?: boolean;
+}
+
 export interface ScraperContentResult {
   content: string;
 }
@@ -152,7 +161,9 @@ export interface SearchToolConfig
   jinaApiUrl?: string;
   cohereApiKey?: string;
   rerankerType?: RerankerType;
+  scraperProvider?: ScraperProvider;
   scraperTimeout?: number;
+  serperScraperOptions?: SerperScraperConfig;
   onSearchResults?: (
     results: SearchResult,
     runnableConfig?: RunnableConfig
@@ -171,10 +182,31 @@ export type UsedReferences = {
   reference: MediaReference;
 }[];
 
+/** Base Scraper Interface */
+export interface BaseScraper {
+  scrapeUrl(
+    url: string,
+    options?: unknown
+  ): Promise<[string, FirecrawlScrapeResponse | SerperScrapeResponse]>;
+  extractContent(
+    response: FirecrawlScrapeResponse | SerperScrapeResponse
+  ): [string, undefined | References];
+  extractMetadata(
+    response: FirecrawlScrapeResponse | SerperScrapeResponse
+  ):
+    | ScrapeMetadata
+    | Record<string, string | number | boolean | null | undefined>;
+}
+
 /** Firecrawl */
 export type FirecrawlScrapeOptions = Omit<
   FirecrawlScraperConfig,
   'apiKey' | 'apiUrl' | 'version' | 'logger'
+>;
+
+export type SerperScrapeOptions = Omit<
+  SerperScraperConfig,
+  'apiKey' | 'apiUrl' | 'logger'
 >;
 
 export interface ScrapeMetadata {
@@ -248,6 +280,17 @@ export interface FirecrawlScrapeResponse {
     screenshot?: string;
     links?: string[];
     metadata?: ScrapeMetadata;
+  };
+  error?: string;
+}
+
+export interface SerperScrapeResponse {
+  success: boolean;
+  data?: {
+    text?: string;
+    markdown?: string;
+    metadata?: Record<string, string | number | boolean | null | undefined>;
+    credits?: number;
   };
   error?: string;
 }

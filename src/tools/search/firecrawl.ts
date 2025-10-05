@@ -7,7 +7,7 @@ import { createDefaultLogger } from './utils';
  * Firecrawl scraper implementation
  * Uses the Firecrawl API to scrape web pages
  */
-export class FirecrawlScraper {
+export class FirecrawlScraper implements t.BaseScraper {
   private apiKey: string;
   private apiUrl: string;
   private version: string;

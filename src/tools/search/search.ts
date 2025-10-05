@@ -2,7 +2,6 @@ import axios from 'axios';
 import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
 import type * as t from './types';
 import { getAttribution, createDefaultLogger } from './utils';
-import { FirecrawlScraper } from './firecrawl';
 import { BaseReranker } from './rerankers';
 
 const chunker = {
@@ -434,7 +433,7 @@ export const createSearchAPI = (
 
 export const createSourceProcessor = (
   config: t.ProcessSourcesConfig = {},
-  scraperInstance?: FirecrawlScraper
+  scraperInstance?: t.BaseScraper
 ): {
   processSources: (
     fields: t.ProcessSourcesFields
@@ -442,7 +441,7 @@ export const createSourceProcessor = (
   topResults: number;
 } => {
   if (!scraperInstance) {
-    throw new Error('Firecrawl scraper instance is required');
+    throw new Error('Scraper instance is required');
   }
   const {
     topResults = 5,
@@ -453,7 +452,7 @@ export const createSourceProcessor = (
   } = config;
 
   const logger_ = logger || createDefaultLogger();
-  const firecrawlScraper = scraperInstance;
+  const scraper = scraperInstance;
 
   const webScraper = {
     scrapeMany: async ({
@@ -465,12 +464,12 @@ export const createSourceProcessor = (
       links: string[];
       onGetHighlights: t.SearchToolConfig['onGetHighlights'];
     }): Promise<Array<t.ScrapeResult>> => {
-      logger_.debug(`Scraping ${links.length} links with Firecrawl`);
+      logger_.debug(`Scraping ${links.length} links`);
       const promises: Array<Promise<t.ScrapeResult>> = [];
       try {
         for (let i = 0; i < links.length; i++) {
           const currentLink = links[i];
-          const promise: Promise<t.ScrapeResult> = firecrawlScraper
+          const promise: Promise<t.ScrapeResult> = scraper
             .scrapeUrl(currentLink, {})
             .then(([url, response]) => {
               const attribution = getAttribution(
@@ -479,8 +478,7 @@ export const createSourceProcessor = (
                 logger_
               );
               if (response.success && response.data) {
-                const [content, references] =
-                  firecrawlScraper.extractContent(response);
+                const [content, references] = scraper.extractContent(response);
                 return {
                   url,
                   references,
