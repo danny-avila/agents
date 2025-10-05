@@ -312,6 +312,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, GraphNode> {
       this.currentTokenType === 'think_and_text'
     ) {
       keyList.push('reasoning');
+    } else if (this.tokenTypeSwitch === 'content') {
+      keyList.push('post-reasoning');
     }
 
     if (this.invokedToolIds != null && this.invokedToolIds.size > 0) {
