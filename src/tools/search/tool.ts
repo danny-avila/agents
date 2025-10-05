@@ -346,6 +346,7 @@ export const createSearchTool = (
     safeSearch = 1,
     firecrawlApiKey,
     firecrawlApiUrl,
+    firecrawlVersion,
     firecrawlOptions,
     scraperTimeout,
     jinaApiKey,
@@ -389,6 +390,7 @@ export const createSearchTool = (
     ...firecrawlOptions,
     apiKey: firecrawlApiKey ?? process.env.FIRECRAWL_API_KEY,
     apiUrl: firecrawlApiUrl,
+    version: firecrawlVersion,
     timeout: scraperTimeout ?? firecrawlOptions?.timeout,
     formats: firecrawlOptions?.formats ?? ['markdown', 'rawHtml'],
   });

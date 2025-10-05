@@ -10,6 +10,7 @@ import { createDefaultLogger } from './utils';
 export class FirecrawlScraper {
   private apiKey: string;
   private apiUrl: string;
+  private version: string;
   private defaultFormats: string[];
   private timeout: number;
   private logger: t.Logger;
@@ -32,11 +33,13 @@ export class FirecrawlScraper {
   constructor(config: t.FirecrawlScraperConfig = {}) {
     this.apiKey = config.apiKey ?? process.env.FIRECRAWL_API_KEY ?? '';
 
+    this.version = config.version ?? 'v2';
+
     const baseUrl =
       config.apiUrl ??
       process.env.FIRECRAWL_BASE_URL ??
       'https://api.firecrawl.dev';
-    this.apiUrl = `${baseUrl.replace(/\/+$/, '')}/v1/scrape`;
+    this.apiUrl = `${baseUrl.replace(/\/+$/, '')}/${this.version}/scrape`;
 
     this.defaultFormats = config.formats ?? ['markdown', 'rawHtml'];
     this.timeout = config.timeout ?? 7500;

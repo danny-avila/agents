@@ -94,6 +94,7 @@ export interface ProcessSourcesConfig {
 export interface FirecrawlConfig {
   firecrawlApiKey?: string;
   firecrawlApiUrl?: string;
+  firecrawlVersion?: string;
   firecrawlOptions?: FirecrawlScraperConfig;
 }
 
@@ -173,7 +174,7 @@ export type UsedReferences = {
 /** Firecrawl */
 export type FirecrawlScrapeOptions = Omit<
   FirecrawlScraperConfig,
-  'apiKey' | 'apiUrl' | 'logger'
+  'apiKey' | 'apiUrl' | 'version' | 'logger'
 >;
 
 export interface ScrapeMetadata {
@@ -254,6 +255,7 @@ export interface FirecrawlScrapeResponse {
 export interface FirecrawlScraperConfig {
   apiKey?: string;
   apiUrl?: string;
+  version?: string;
   formats?: string[];
   timeout?: number;
   logger?: Logger;
