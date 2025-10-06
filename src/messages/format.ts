@@ -328,6 +328,9 @@ function formatAssistantMessage(
         part.type === ContentTypes.AGENT_UPDATE
       ) {
         continue;
+      } else if (part.type === 'document') {
+        // Preserve document content for Anthropic native PDF support
+        currentContent.push(part);
       } else {
         currentContent.push(part);
       }
@@ -381,20 +384,46 @@ export const formatAgentMessages = (
   // Process messages with tool conversion if tools set is provided
   for (let i = 0; i < payload.length; i++) {
     const message = payload[i];
-    // Q: Store the current length of messages to track where this payload message starts in the result?
-    // const startIndex = messages.length;
+
     if (typeof message.content === 'string') {
       message.content = [
         { type: ContentTypes.TEXT, [ContentTypes.TEXT]: message.content },
       ];
     }
+
     if (message.role !== 'assistant') {
-      messages.push(
-        formatMessage({
-          message: message as MessageInput,
-          langChain: true,
-        }) as HumanMessage | AIMessage | SystemMessage
-      );
+      // Enhanced document detection - check multiple patterns
+      const hasDocuments = Array.isArray(message.content) &&
+        message.content.some(part => {
+          const partAny = part as any;
+          return part && (
+            part.type === 'document' ||
+            part.type === 'pdf' ||
+            part.type === 'application/pdf' ||
+            (partAny.source && partAny.source.data) ||
+            (partAny.source && partAny.source.type === 'base64' && partAny.source.media_type === 'application/pdf')
+          );
+        });
+
+      if (hasDocuments && message.role === 'user') {
+        // For user messages with documents, create HumanMessage directly with array content
+        const humanMessage = new HumanMessage({ content: message.content as MessageContentComplex[] });
+        messages.push(humanMessage);
+
+      } else if (hasDocuments && message.role === 'system') {
+        // For system messages with documents, create SystemMessage directly with array content
+        const systemMessage = new SystemMessage({ content: message.content as MessageContentComplex[] });
+        messages.push(systemMessage);
+
+      } else {
+        // Use regular formatting for messages without documents
+        messages.push(
+          formatMessage({
+            message: message as MessageInput,
+            langChain: true,
+          }) as HumanMessage | AIMessage | SystemMessage
+        );
+      }
 
       // Update the index mapping for this message
       indexMapping[i] = [messages.length - 1];
@@ -529,6 +558,7 @@ export const formatAgentMessages = (
     }
   }
 
+
   return {
     messages,
     indexTokenCountMap: indexTokenCountMap
@@ -557,7 +587,21 @@ export const formatContentStrings = (
       continue;
     }
 
-    // Reduce text types to a single string, ignore all other types
+    // Check if this message has documents that should be preserved for Anthropic native PDF support
+    const hasDocuments = message.content.some(curr =>
+      curr && (
+        curr.type === 'document' ||
+        curr.type === 'pdf' ||
+        (curr as any).source?.data
+      )
+    );
+
+    if (hasDocuments) {
+      // For messages with documents, preserve the array structure for Anthropic native PDF support
+      continue;
+    }
+
+    // Reduce text types to a single string, ignore all other types (for non-document messages)
     const content = message.content.reduce((acc, curr) => {
       if (curr.type === ContentTypes.TEXT) {
         return `${acc}${curr[ContentTypes.TEXT] || ''}\n`;
