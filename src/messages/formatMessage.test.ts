@@ -1,7 +1,42 @@
-import { HumanMessage, AIMessage, SystemMessage } from '@langchain/core/messages';
-import { formatMessage, formatLangChainMessages, formatFromLangChain } from './format';
+import {
+  HumanMessage,
+  AIMessage,
+  SystemMessage,
+} from '@langchain/core/messages';
+import type { MessageContentComplex } from '@/types';
+import {
+  formatMessage,
+  formatLangChainMessages,
+  formatFromLangChain,
+  formatMediaMessage,
+} from './format';
+import { Providers } from '@/common';
 
 const NO_PARENT = '00000000-0000-0000-0000-000000000000';
+
+/**
+ * Type for formatted message results with media content
+ */
+interface FormattedMediaMessage {
+  role: string;
+  content: MessageContentComplex[];
+  name?: string;
+}
+
+/**
+ * Type guard to check if result is a FormattedMediaMessage
+ */
+function isFormattedMediaMessage(
+  result: unknown
+): result is FormattedMediaMessage {
+  return (
+    typeof result === 'object' &&
+    result !== null &&
+    'role' in result &&
+    'content' in result &&
+    Array.isArray((result as FormattedMediaMessage).content)
+  );
+}
 
 describe('formatMessage', () => {
   it('formats user message', () => {
@@ -184,6 +219,387 @@ describe('formatMessage', () => {
       role: 'assistant',
       content: 'Hello',
     });
+  });
+});
+
+describe('formatMediaMessage', () => {
+  it('formats message with images for default provider', () => {
+    const message = {
+      role: 'user',
+      content: 'Check out this image',
+      name: 'John',
+    };
+    const mediaParts = [
+      {
+        type: 'image_url',
+        image_url: { url: 'https://example.com/image1.jpg' },
+      },
+      {
+        type: 'image_url',
+        image_url: { url: 'https://example.com/image2.jpg' },
+      },
+    ];
+
+    const result = formatMediaMessage({ message, mediaParts });
+
+    expect(result.role).toBe('user');
+    expect(result.name).toBe('John');
+    expect(Array.isArray(result.content)).toBe(true);
+    expect(result.content).toHaveLength(3);
+    expect(result.content[0]).toEqual({
+      type: 'text',
+      text: 'Check out this image',
+    });
+    expect(result.content[1]).toEqual(mediaParts[0]);
+    expect(result.content[2]).toEqual(mediaParts[1]);
+  });
+
+  it('formats message with images for Anthropic (media first)', () => {
+    const message = {
+      role: 'user',
+      content: 'Check out this image',
+    };
+    const mediaParts = [
+      {
+        type: 'image_url',
+        image_url: { url: 'https://example.com/image.jpg' },
+      },
+    ];
+
+    const result = formatMediaMessage({
+      message,
+      mediaParts,
+      endpoint: Providers.ANTHROPIC,
+    });
+
+    expect(result.content).toHaveLength(2);
+    expect(result.content[0]).toEqual(mediaParts[0]);
+    expect(result.content[1]).toEqual({
+      type: 'text',
+      text: 'Check out this image',
+    });
+  });
+
+  it('formats message with multiple media types', () => {
+    const message = {
+      role: 'user',
+      content: 'Check out these files',
+    };
+    const mediaParts = [
+      { type: 'document', document: { url: 'https://example.com/doc.pdf' } },
+      { type: 'video', video: { url: 'https://example.com/video.mp4' } },
+      { type: 'audio', audio: { url: 'https://example.com/audio.mp3' } },
+      {
+        type: 'image_url',
+        image_url: { url: 'https://example.com/image.jpg' },
+      },
+    ];
+
+    const result = formatMediaMessage({ message, mediaParts });
+
+    expect(result.content).toHaveLength(5);
+    expect(result.content[0]).toEqual({
+      type: 'text',
+      text: 'Check out these files',
+    });
+    expect(result.content[1]).toEqual(mediaParts[0]);
+    expect(result.content[2]).toEqual(mediaParts[1]);
+    expect(result.content[3]).toEqual(mediaParts[2]);
+    expect(result.content[4]).toEqual(mediaParts[3]);
+  });
+});
+
+describe('formatMessage with media', () => {
+  it('formats user message with image_urls (backward compatibility)', () => {
+    const input = {
+      message: {
+        sender: 'user',
+        text: 'Check out this image',
+        image_urls: [
+          {
+            type: 'image_url' as const,
+            image_url: { url: 'https://example.com/image.jpg' },
+          },
+        ],
+      },
+      userName: 'John',
+    };
+
+    const result = formatMessage(input);
+
+    expect(isFormattedMediaMessage(result)).toBe(true);
+    if (isFormattedMediaMessage(result)) {
+      expect(result.role).toBe('user');
+      expect(result.name).toBe('John');
+      expect(Array.isArray(result.content)).toBe(true);
+      expect(result.content).toHaveLength(2);
+      expect(result.content[0]).toEqual({
+        type: 'text',
+        text: 'Check out this image',
+      });
+      expect(result.content[1]).toEqual(input.message.image_urls[0]);
+    }
+  });
+
+  it('formats user message with documents', () => {
+    const input = {
+      message: {
+        role: 'user',
+        content: 'Review this document',
+        documents: [
+          {
+            type: 'document',
+            document: { url: 'https://example.com/report.pdf' },
+          },
+        ],
+      },
+    };
+
+    const result = formatMessage(input);
+
+    expect(isFormattedMediaMessage(result)).toBe(true);
+    if (isFormattedMediaMessage(result)) {
+      expect(result.role).toBe('user');
+      expect(Array.isArray(result.content)).toBe(true);
+      expect(result.content).toHaveLength(2);
+      expect(result.content[0]).toEqual({
+        type: 'text',
+        text: 'Review this document',
+      });
+      expect(result.content[1]).toEqual(input.message.documents[0]);
+    }
+  });
+
+  it('formats user message with videos', () => {
+    const input = {
+      message: {
+        role: 'user',
+        content: 'Watch this video',
+        videos: [
+          { type: 'video', video: { url: 'https://example.com/demo.mp4' } },
+        ],
+      },
+    };
+
+    const result = formatMessage(input);
+
+    expect(isFormattedMediaMessage(result)).toBe(true);
+    if (isFormattedMediaMessage(result)) {
+      expect(result.role).toBe('user');
+      expect(Array.isArray(result.content)).toBe(true);
+      expect(result.content).toHaveLength(2);
+      expect(result.content[0]).toEqual({
+        type: 'text',
+        text: 'Watch this video',
+      });
+      expect(result.content[1]).toEqual(input.message.videos[0]);
+    }
+  });
+
+  it('formats user message with audios', () => {
+    const input = {
+      message: {
+        role: 'user',
+        content: 'Listen to this',
+        audios: [
+          { type: 'audio', audio: { url: 'https://example.com/podcast.mp3' } },
+        ],
+      },
+    };
+
+    const result = formatMessage(input);
+
+    expect(isFormattedMediaMessage(result)).toBe(true);
+    if (isFormattedMediaMessage(result)) {
+      expect(result.role).toBe('user');
+      expect(Array.isArray(result.content)).toBe(true);
+      expect(result.content).toHaveLength(2);
+      expect(result.content[0]).toEqual({
+        type: 'text',
+        text: 'Listen to this',
+      });
+      expect(result.content[1]).toEqual(input.message.audios[0]);
+    }
+  });
+
+  it('formats user message with all media types in correct order', () => {
+    const input = {
+      message: {
+        role: 'user',
+        content: 'Check out all these files',
+        documents: [
+          {
+            type: 'document',
+            document: { url: 'https://example.com/doc.pdf' },
+          },
+        ],
+        videos: [
+          { type: 'video', video: { url: 'https://example.com/video.mp4' } },
+        ],
+        audios: [
+          { type: 'audio', audio: { url: 'https://example.com/audio.mp3' } },
+        ],
+        image_urls: [
+          {
+            type: 'image_url' as const,
+            image_url: { url: 'https://example.com/image.jpg' },
+          },
+        ],
+      },
+    };
+
+    const result = formatMessage(input);
+
+    expect(isFormattedMediaMessage(result)).toBe(true);
+    if (isFormattedMediaMessage(result)) {
+      expect(result.role).toBe('user');
+      expect(Array.isArray(result.content)).toBe(true);
+      expect(result.content).toHaveLength(5);
+      // Text first
+      expect(result.content[0]).toEqual({
+        type: 'text',
+        text: 'Check out all these files',
+      });
+      // Then documents, videos, audios, images
+      expect(result.content[1]).toEqual(input.message.documents[0]);
+      expect(result.content[2]).toEqual(input.message.videos[0]);
+      expect(result.content[3]).toEqual(input.message.audios[0]);
+      expect(result.content[4]).toEqual(input.message.image_urls[0]);
+    }
+  });
+
+  it('formats user message with multiple files of the same type', () => {
+    const input = {
+      message: {
+        role: 'user',
+        content: 'Review these documents',
+        documents: [
+          {
+            type: 'document',
+            document: { url: 'https://example.com/doc1.pdf' },
+          },
+          {
+            type: 'document',
+            document: { url: 'https://example.com/doc2.pdf' },
+          },
+          {
+            type: 'document',
+            document: { url: 'https://example.com/doc3.pdf' },
+          },
+        ],
+      },
+    };
+
+    const result = formatMessage(input);
+
+    expect(isFormattedMediaMessage(result)).toBe(true);
+    if (isFormattedMediaMessage(result)) {
+      expect(result.content).toHaveLength(4);
+      expect(result.content[0].type).toBe('text');
+      expect(result.content[1]).toEqual(input.message.documents[0]);
+      expect(result.content[2]).toEqual(input.message.documents[1]);
+      expect(result.content[3]).toEqual(input.message.documents[2]);
+    }
+  });
+
+  it('respects Anthropic provider ordering (media before text)', () => {
+    const input = {
+      message: {
+        role: 'user',
+        content: 'Check this out',
+        documents: [
+          {
+            type: 'document',
+            document: { url: 'https://example.com/doc.pdf' },
+          },
+        ],
+        image_urls: [
+          {
+            type: 'image_url' as const,
+            image_url: { url: 'https://example.com/image.jpg' },
+          },
+        ],
+      },
+      endpoint: Providers.ANTHROPIC,
+    };
+
+    const result = formatMessage(input);
+
+    expect(isFormattedMediaMessage(result)).toBe(true);
+    if (isFormattedMediaMessage(result)) {
+      expect(result.content).toHaveLength(3);
+      // Media first for Anthropic
+      expect(result.content[0]).toEqual(input.message.documents[0]);
+      expect(result.content[1]).toEqual(input.message.image_urls[0]);
+      expect(result.content[2]).toEqual({
+        type: 'text',
+        text: 'Check this out',
+      });
+    }
+  });
+
+  it('does not format media for assistant messages', () => {
+    const input = {
+      message: {
+        role: 'assistant',
+        content: 'Here is a response',
+        documents: [
+          {
+            type: 'document',
+            document: { url: 'https://example.com/doc.pdf' },
+          },
+        ],
+      },
+    };
+
+    const result = formatMessage(input);
+
+    expect(result).toMatchObject({
+      role: 'assistant',
+      content: 'Here is a response',
+    });
+  });
+
+  it('handles empty media arrays gracefully', () => {
+    const input = {
+      message: {
+        role: 'user',
+        content: 'Just text',
+        documents: [],
+        videos: [],
+        audios: [],
+        image_urls: [],
+      },
+    };
+
+    const result = formatMessage(input);
+
+    expect(result).toMatchObject({
+      role: 'user',
+      content: 'Just text',
+    });
+  });
+
+  it('formats media with langChain flag', () => {
+    const input = {
+      message: {
+        role: 'user',
+        content: 'Check this image',
+        image_urls: [
+          {
+            type: 'image_url' as const,
+            image_url: { url: 'https://example.com/image.jpg' },
+          },
+        ],
+      },
+      langChain: true,
+    };
+
+    const result = formatMessage(input);
+
+    expect(result).toBeInstanceOf(HumanMessage);
+    expect(Array.isArray(result.lc_kwargs.content)).toBe(true);
+    expect(result.lc_kwargs.content).toHaveLength(2);
   });
 });
 

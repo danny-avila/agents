@@ -17,28 +17,28 @@ import type {
 } from '@/types';
 import { Providers, ContentTypes } from '@/common';
 
-interface VisionMessageParams {
+interface MediaMessageParams {
   message: {
     role: string;
     content: string;
     name?: string;
     [key: string]: any;
   };
-  image_urls: MessageContentImageUrl[];
+  mediaParts: MessageContentComplex[];
   endpoint?: Providers;
 }
 
 /**
- * Formats a message to OpenAI Vision API payload format.
+ * Formats a message with media content (images, documents, videos, audios) to API payload format.
  *
- * @param {VisionMessageParams} params - The parameters for formatting.
- * @returns {Object} - The formatted message.
+ * @param params - The parameters for formatting.
+ * @returns - The formatted message.
  */
-export const formatVisionMessage = ({
+export const formatMediaMessage = ({
   message,
-  image_urls,
   endpoint,
-}: VisionMessageParams): {
+  mediaParts,
+}: MediaMessageParams): {
   role: string;
   content: MessageContentComplex[];
   name?: string;
@@ -57,7 +57,7 @@ export const formatVisionMessage = ({
 
   if (endpoint === Providers.ANTHROPIC) {
     result.content = [
-      ...image_urls,
+      ...mediaParts,
       { type: ContentTypes.TEXT, text: message.content },
     ] as MessageContentComplex[];
     return result;
@@ -65,7 +65,7 @@ export const formatVisionMessage = ({
 
   result.content = [
     { type: ContentTypes.TEXT, text: message.content },
-    ...image_urls,
+    ...mediaParts,
   ] as MessageContentComplex[];
 
   return result;
@@ -78,6 +78,9 @@ interface MessageInput {
   text?: string;
   content?: string | MessageContentComplex[];
   image_urls?: MessageContentImageUrl[];
+  documents?: MessageContentComplex[];
+  videos?: MessageContentComplex[];
+  audios?: MessageContentComplex[];
   lc_id?: string[];
   [key: string]: any;
 }
@@ -100,14 +103,14 @@ interface FormattedMessage {
 /**
  * Formats a message to OpenAI payload format based on the provided options.
  *
- * @param {FormatMessageParams} params - The parameters for formatting.
- * @returns {FormattedMessage | HumanMessage | AIMessage | SystemMessage} - The formatted message.
+ * @param params - The parameters for formatting.
+ * @returns - The formatted message.
  */
 export const formatMessage = ({
   message,
   userName,
-  assistantName,
   endpoint,
+  assistantName,
   langChain = false,
 }: FormatMessageParams):
   | FormattedMessage
@@ -135,21 +138,7 @@ export const formatMessage = ({
     content,
   };
 
-  const { image_urls } = message;
-  if (Array.isArray(image_urls) && image_urls.length > 0 && role === 'user') {
-    return formatVisionMessage({
-      message: {
-        ...formattedMessage,
-        content:
-          typeof formattedMessage.content === 'string'
-            ? formattedMessage.content
-            : '',
-      },
-      image_urls,
-      endpoint,
-    });
-  }
-
+  // Set name fields first
   if (_name != null && _name) {
     formattedMessage.name = _name;
   }
@@ -179,6 +168,45 @@ export const formatMessage = ({
     }
   }
 
+  const { image_urls, documents, videos, audios } = message;
+  const mediaParts: MessageContentComplex[] = [];
+
+  if (Array.isArray(documents) && documents.length > 0) {
+    mediaParts.push(...documents);
+  }
+
+  if (Array.isArray(videos) && videos.length > 0) {
+    mediaParts.push(...videos);
+  }
+
+  if (Array.isArray(audios) && audios.length > 0) {
+    mediaParts.push(...audios);
+  }
+
+  if (Array.isArray(image_urls) && image_urls.length > 0) {
+    mediaParts.push(...image_urls);
+  }
+
+  if (mediaParts.length > 0 && role === 'user') {
+    const mediaMessage = formatMediaMessage({
+      message: {
+        ...formattedMessage,
+        content:
+          typeof formattedMessage.content === 'string'
+            ? formattedMessage.content
+            : '',
+      },
+      mediaParts,
+      endpoint,
+    });
+
+    if (!langChain) {
+      return mediaMessage;
+    }
+
+    return new HumanMessage(mediaMessage);
+  }
+
   if (!langChain) {
     return formattedMessage;
   }
@@ -195,9 +223,9 @@ export const formatMessage = ({
 /**
  * Formats an array of messages for LangChain.
  *
- * @param {Array<MessageInput>} messages - The array of messages to format.
- * @param {Omit<FormatMessageParams, 'message' | 'langChain'>} formatOptions - The options for formatting each message.
- * @returns {Array<HumanMessage | AIMessage | SystemMessage>} - The array of formatted LangChain messages.
+ * @param messages - The array of messages to format.
+ * @param formatOptions - The options for formatting each message.
+ * @returns - The array of formatted LangChain messages.
  */
 export const formatLangChainMessages = (
   messages: Array<MessageInput>,
@@ -228,8 +256,8 @@ interface LangChainMessage {
 /**
  * Formats a LangChain message object by merging properties from `lc_kwargs` or `kwargs` and `additional_kwargs`.
  *
- * @param {LangChainMessage} message - The message object to format.
- * @returns {Record<string, any>} The formatted LangChain message.
+ * @param message - The message object to format.
+ * @returns - The formatted LangChain message.
  */
 export const formatFromLangChain = (
   message: LangChainMessage
@@ -357,10 +385,10 @@ function formatAssistantMessage(
 /**
  * Formats an array of messages for LangChain, handling tool calls and creating ToolMessage instances.
  *
- * @param {TPayload} payload - The array of messages to format.
- * @param {Record<number, number>} [indexTokenCountMap] - Optional map of message indices to token counts.
- * @param {Set<string>} [tools] - Optional set of tool names that are allowed in the request.
- * @returns {Object} - Object containing formatted messages and updated indexTokenCountMap if provided.
+ * @param payload - The array of messages to format.
+ * @param indexTokenCountMap - Optional map of message indices to token counts.
+ * @param tools - Optional set of tool names that are allowed in the request.
+ * @returns - Object containing formatted messages and updated indexTokenCountMap if provided.
  */
 export const formatAgentMessages = (
   payload: TPayload,
@@ -539,8 +567,8 @@ export const formatAgentMessages = (
 
 /**
  * Formats an array of messages for LangChain, making sure all content fields are strings
- * @param {Array<HumanMessage | AIMessage | SystemMessage | ToolMessage>} payload - The array of messages to format.
- * @returns {Array<HumanMessage | AIMessage | SystemMessage | ToolMessage>} - The array of formatted LangChain messages, including ToolMessages for tool calls.
+ * @param payload - The array of messages to format.
+ * @returns - The array of formatted LangChain messages, including ToolMessages for tool calls.
  */
 export const formatContentStrings = (
   payload: Array<BaseMessage>
