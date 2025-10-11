@@ -299,7 +299,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       agentContext.currentTokenType === 'think_and_text'
     ) {
       keyList.push('reasoning');
-    } else if (this.tokenTypeSwitch === 'content') {
+    } else if (agentContext.tokenTypeSwitch === 'content') {
       keyList.push('post-reasoning');
     }
 
