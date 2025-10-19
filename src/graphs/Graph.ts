@@ -41,7 +41,9 @@ import {
   convertMessagesToContent,
   modifyDeltaProperties,
   formatArtifactPayload,
+  formatContentStrings,
   createPruneMessages,
+  addCacheControl,
 } from '@/messages';
 import {
   resetIfNotEmpty,
@@ -608,7 +610,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         messagesToUse = context;
       }
 
-      const finalMessages = messagesToUse;
+      let finalMessages = messagesToUse;
+      if (agentContext.useLegacyContent) {
+        finalMessages = formatContentStrings(finalMessages);
+      }
+
       const lastMessageX =
         finalMessages.length >= 2
           ? finalMessages[finalMessages.length - 2]
@@ -640,6 +646,22 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           isGoogleLike(agentContext.provider))
       ) {
         formatArtifactPayload(finalMessages);
+      }
+
+      if (agentContext.provider === Providers.ANTHROPIC) {
+        const anthropicOptions = agentContext.clientOptions as
+          | t.AnthropicClientOptions
+          | undefined;
+        const defaultHeaders = anthropicOptions?.clientOptions
+          ?.defaultHeaders as Record<string, string> | undefined;
+        const anthropicBeta = defaultHeaders?.['anthropic-beta'];
+
+        if (
+          typeof anthropicBeta === 'string' &&
+          anthropicBeta.includes('prompt-caching')
+        ) {
+          finalMessages = addCacheControl<BaseMessage>(finalMessages);
+        }
       }
 
       if (

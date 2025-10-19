@@ -37,6 +37,7 @@ export class AgentContext {
       streamBuffer,
       maxContextTokens,
       reasoningKey,
+      useLegacyContent,
     } = agentConfig;
 
     const agentContext = new AgentContext({
@@ -53,6 +54,7 @@ export class AgentContext {
       toolEnd,
       instructionTokens: 0,
       tokenCounter,
+      useLegacyContent,
     });
 
     if (tokenCounter) {
@@ -123,6 +125,8 @@ export class AgentContext {
   >;
   /** Promise for token calculation initialization */
   tokenCalculationPromise?: Promise<void>;
+  /** Format content blocks as strings (for legacy compatibility) */
+  useLegacyContent: boolean = false;
 
   constructor({
     agentId,
@@ -138,6 +142,7 @@ export class AgentContext {
     reasoningKey,
     toolEnd,
     instructionTokens,
+    useLegacyContent,
   }: {
     agentId: string;
     provider: Providers;
@@ -152,6 +157,7 @@ export class AgentContext {
     reasoningKey?: 'reasoning_content' | 'reasoning';
     toolEnd?: boolean;
     instructionTokens?: number;
+    useLegacyContent?: boolean;
   }) {
     this.agentId = agentId;
     this.provider = provider;
@@ -172,6 +178,8 @@ export class AgentContext {
     if (instructionTokens !== undefined) {
       this.instructionTokens = instructionTokens;
     }
+
+    this.useLegacyContent = useLegacyContent ?? false;
 
     this.systemRunnable = this.createSystemRunnable();
   }
