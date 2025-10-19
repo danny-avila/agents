@@ -367,6 +367,6 @@ export interface AgentInputs {
   clientOptions?: ClientOptions;
   additional_instructions?: string;
   reasoningKey?: 'reasoning_content' | 'reasoning';
-  /** Format content blocks as strings (for legacy compatibility) */
+  /** Format content blocks as strings (for legacy compatibility i.e. Ollama/Azure Serverless) */
   useLegacyContent?: boolean;
 }
