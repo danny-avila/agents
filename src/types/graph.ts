@@ -367,4 +367,6 @@ export interface AgentInputs {
   clientOptions?: ClientOptions;
   additional_instructions?: string;
   reasoningKey?: 'reasoning_content' | 'reasoning';
+  /** Format content blocks as strings (for legacy compatibility) */
+  useLegacyContent?: boolean;
 }

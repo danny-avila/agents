@@ -566,40 +566,6 @@ export const formatAgentMessages = (
 };
 
 /**
- * Formats an array of messages for LangChain, making sure all content fields are strings
- * @param payload - The array of messages to format.
- * @returns - The array of formatted LangChain messages, including ToolMessages for tool calls.
- */
-export const formatContentStrings = (
-  payload: Array<BaseMessage>
-): Array<BaseMessage> => {
-  // Create a copy of the payload to avoid modifying the original
-  const result = [...payload];
-
-  for (const message of result) {
-    if (typeof message.content === 'string') {
-      continue;
-    }
-
-    if (!Array.isArray(message.content)) {
-      continue;
-    }
-
-    // Reduce text types to a single string, ignore all other types
-    const content = message.content.reduce((acc, curr) => {
-      if (curr.type === ContentTypes.TEXT) {
-        return `${acc}${curr[ContentTypes.TEXT] || ''}\n`;
-      }
-      return acc;
-    }, '');
-
-    message.content = content.trim();
-  }
-
-  return result;
-};
-
-/**
  * Adds a value at key 0 for system messages and shifts all key indices by one in an indexTokenCountMap.
  * This is useful when adding a system message at the beginning of a conversation.
  *

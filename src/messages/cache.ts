@@ -1,14 +1,15 @@
-import type { AnthropicMessages } from '@/types/messages';
+import type { AnthropicMessage } from '@/types/messages';
 import type Anthropic from '@anthropic-ai/sdk';
+import { BaseMessage } from '@langchain/core/messages';
 
 /**
  * Anthropic API: Adds cache control to the appropriate user messages in the payload.
  * @param messages - The array of message objects.
  * @returns - The updated array of message objects with cache control added.
  */
-export function addCacheControl(
-  messages: AnthropicMessages
-): AnthropicMessages {
+export function addCacheControl<T extends AnthropicMessage | BaseMessage>(
+  messages: T[]
+): T[] {
   if (!Array.isArray(messages) || messages.length < 2) {
     return messages;
   }
