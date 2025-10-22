@@ -394,9 +394,13 @@ export function createContentAggregator(): t.ContentAggregatorResult {
 
   const updateContent = (
     index: number,
-    contentPart: t.MessageContentComplex,
+    contentPart?: t.MessageContentComplex,
     finalUpdate = false
   ): void => {
+    if (!contentPart) {
+      console.warn('No content part found in \'updateContent\'');
+      return;
+    }
     const partType = contentPart.type ?? '';
     if (!partType) {
       console.warn('No content type found in content part');
@@ -574,7 +578,10 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       event === GraphEvents.ON_AGENT_UPDATE &&
       (data as t.AgentUpdate | undefined)?.agent_update
     ) {
-      const contentPart = data as t.AgentUpdate;
+      const contentPart = data as t.AgentUpdate | undefined;
+      if (!contentPart) {
+        return;
+      }
       updateContent(contentPart.agent_update.index, contentPart);
     } else if (event === GraphEvents.ON_REASONING_DELTA) {
       const reasoningDelta = data as t.ReasoningDeltaEvent;
