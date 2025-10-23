@@ -20,7 +20,7 @@ import {
 import { createTokenCounter } from '@/utils/tokens';
 import { StandardGraph } from '@/graphs/Graph';
 import { HandlerRegistry } from '@/events';
-import { isOpenAILike } from '@/utils/llm';
+import { isOpenAILike, validateClientOptions } from '@/utils/llm'; // 🔥 added validateClientOptions
 
 export const defaultOmitOptions = new Set([
   'stream',
@@ -87,6 +87,16 @@ export class Run<T extends t.BaseGraphState> {
   ): t.CompiledWorkflow<t.IState, Partial<t.IState>, string> {
     const { llmConfig, tools = [], ...graphInput } = config;
     const { provider, ...clientOptions } = llmConfig;
+
+    // 🔥 Validate client options before creating the graph
+    const validationErrors = validateClientOptions(clientOptions, provider);
+    if (validationErrors.length > 0) {
+      throw new Error(
+        `Invalid client options for provider ${provider}: ${validationErrors.join(
+          ', '
+        )}`
+      );
+    }
 
     const standardGraph = new StandardGraph({
       tools,
