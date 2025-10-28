@@ -149,19 +149,20 @@ export class Run<T extends t.BaseGraphState> {
       isPresent(process.env.LANGFUSE_PUBLIC_KEY) &&
       isPresent(process.env.LANGFUSE_BASE_URL)
     ) {
+      const userId = config.configurable?.user_id;
+      const sessionId = config.configurable?.thread_id;
+      const traceMetadata = {
+        messageId: this.id,
+        parentMessageId: config.configurable?.requestBody?.parentMessageId,
+      };
+      const handler = new CallbackHandler({
+        userId,
+        sessionId,
+        traceMetadata,
+      });
       config.callbacks = (
         (config.callbacks as t.ProvidedCallbacks) ?? []
-      ).concat([
-        new CallbackHandler({
-          userId: config.configurable?.user_id,
-          sessionId: this.id,
-          traceMetadata: {
-            messageId: config.configurable?.requestBody?.messageId,
-            conversationId: config.configurable?.requestBody?.conversationId,
-            parentMessageId: config.configurable?.requestBody?.parentMessageId,
-          },
-        }),
-      ]);
+      ).concat([handler]);
     }
 
     if (!this.id) {
