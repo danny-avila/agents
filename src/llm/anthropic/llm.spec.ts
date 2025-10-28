@@ -58,7 +58,7 @@ async function invoke(
 const extendedThinkingModelName = 'claude-3-7-sonnet-20250219';
 
 // use this for tests involving citations
-const citationsModelName = 'claude-3-5-sonnet-20241022';
+const citationsModelName = 'claude-sonnet-4-5-20250929';
 
 // use this for tests involving PDF documents
 const pdfModelName = 'claude-3-5-haiku-20241022';
