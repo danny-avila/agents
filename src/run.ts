@@ -1,5 +1,7 @@
 // src/run.ts
+import './instrumentation';
 import { zodToJsonSchema } from 'zod-to-json-schema';
+import { CallbackHandler } from '@langfuse/langchain';
 import { PromptTemplate } from '@langchain/core/prompts';
 import { SystemMessage } from '@langchain/core/messages';
 import { AzureChatOpenAI, ChatOpenAI } from '@langchain/openai';
@@ -21,6 +23,7 @@ import { createTokenCounter } from '@/utils/tokens';
 import { StandardGraph } from '@/graphs/Graph';
 import { HandlerRegistry } from '@/events';
 import { isOpenAILike } from '@/utils/llm';
+import { isPresent } from '@/utils/misc';
 
 export const defaultOmitOptions = new Set([
   'stream',
@@ -139,6 +142,26 @@ export class Run<T extends t.BaseGraphState> {
       config.callbacks = callbacks.concat(
         this.getCallbacks(streamOptions.callbacks)
       );
+    }
+
+    if (
+      isPresent(process.env.LANGFUSE_SECRET_KEY) &&
+      isPresent(process.env.LANGFUSE_PUBLIC_KEY) &&
+      isPresent(process.env.LANGFUSE_BASE_URL)
+    ) {
+      config.callbacks = (
+        (config.callbacks as t.ProvidedCallbacks) ?? []
+      ).concat([
+        new CallbackHandler({
+          userId: config.configurable?.user_id,
+          sessionId: this.id,
+          traceMetadata: {
+            messageId: config.configurable?.requestBody?.messageId,
+            conversationId: config.configurable?.requestBody?.conversationId,
+            parentMessageId: config.configurable?.requestBody?.parentMessageId,
+          },
+        }),
+      ]);
     }
 
     if (!this.id) {
