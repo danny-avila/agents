@@ -236,11 +236,6 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
   getReasoningParams(
     options?: this['ParsedCallOptions']
   ): OpenAIClient.Reasoning | undefined {
-    const lc_name = (this.constructor as typeof ChatOpenAI).lc_name();
-    if (lc_name === 'LibreChatOpenAI' && !isReasoningModel(this.model)) {
-      return;
-    }
-
     // apply options in reverse order of importance -- newer options supersede older options
     let reasoning: OpenAIClient.Reasoning | undefined;
     if (this.reasoning !== undefined) {
