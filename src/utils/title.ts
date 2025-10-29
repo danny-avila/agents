@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { RunnableLambda } from '@langchain/core/runnables';
 import { ChatPromptTemplate } from '@langchain/core/prompts';
 import type { Runnable, RunnableConfig } from '@langchain/core/runnables';
+import type { AIMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
 import { ContentTypes } from '@/common';
 
@@ -90,20 +91,9 @@ export const createCompletionTitleRunnable = async (
     titlePrompt ?? defaultCompletionPrompt
   );
 
-  return new RunnableLambda({
-    func: async (
-      input: {
-        convo: string;
-        inputText: string;
-        skipLanguage: boolean;
-      },
-      config?: Partial<RunnableConfig>
-    ): Promise<{ title: string }> => {
-      const promptOutput = await completionPrompt.invoke({
-        convo: input.convo,
-      });
-
-      const response = await model.invoke(promptOutput, config);
+  /** Runnable to extract content from model response */
+  const extractContent = new RunnableLambda({
+    func: (response: AIMessage): { title: string } => {
       let content = '';
       if (typeof response.content === 'string') {
         content = response.content;
@@ -116,10 +106,22 @@ export const createCompletionTitleRunnable = async (
           .map((part) => part.text)
           .join('');
       }
-      const title = content.trim();
-      return {
-        title,
-      };
+      return { title: content.trim() };
+    },
+  });
+
+  const chain = completionPrompt.pipe(model).pipe(extractContent);
+
+  return new RunnableLambda({
+    func: async (
+      input: {
+        convo: string;
+        inputText: string;
+        skipLanguage: boolean;
+      },
+      config?: Partial<RunnableConfig>
+    ): Promise<{ title: string }> => {
+      return await chain.invoke({ convo: input.convo }, config);
     },
   });
 };
