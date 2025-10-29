@@ -24,7 +24,7 @@ async function testCustomPromptKey() {
           agentId: 'supervisor',
           provider: Providers.ANTHROPIC,
           clientOptions: {
-            modelName: 'claude-3-5-sonnet-latest',
+            modelName: 'claude-haiku-4-5',
             apiKey: process.env.ANTHROPIC_API_KEY,
           },
           instructions: `You are a Task Supervisor managing different agents:
@@ -41,7 +41,7 @@ async function testCustomPromptKey() {
           agentId: 'researcher',
           provider: Providers.ANTHROPIC,
           clientOptions: {
-            modelName: 'claude-3-5-sonnet-latest',
+            modelName: 'claude-haiku-4-5',
             apiKey: process.env.ANTHROPIC_API_KEY,
           },
           instructions: `You are a Research Agent. You receive research queries to investigate.
@@ -52,7 +52,7 @@ async function testCustomPromptKey() {
           agentId: 'designer',
           provider: Providers.ANTHROPIC,
           clientOptions: {
-            modelName: 'claude-3-5-sonnet-latest',
+            modelName: 'claude-haiku-4-5',
             apiKey: process.env.ANTHROPIC_API_KEY,
           },
           instructions: `You are a Design Agent. You receive design requirements to implement.
@@ -63,7 +63,7 @@ async function testCustomPromptKey() {
           agentId: 'coder',
           provider: Providers.ANTHROPIC,
           clientOptions: {
-            modelName: 'claude-3-5-sonnet-latest',
+            modelName: 'claude-haiku-4-5',
             apiKey: process.env.ANTHROPIC_API_KEY,
           },
           instructions: `You are a Coding Agent. You receive technical specifications to implement.

@@ -30,7 +30,7 @@ async function testSequentialMultiAgent() {
       agentId: 'agent_a',
       provider: Providers.ANTHROPIC,
       clientOptions: {
-        modelName: 'claude-3-5-sonnet-latest',
+        modelName: 'claude-haiku-4-5',
         apiKey: process.env.ANTHROPIC_API_KEY,
       },
       instructions: `You are Agent A, the first agent in a sequential workflow.
@@ -46,7 +46,7 @@ async function testSequentialMultiAgent() {
       agentId: 'agent_b',
       provider: Providers.ANTHROPIC,
       clientOptions: {
-        modelName: 'claude-3-5-sonnet-latest',
+        modelName: 'claude-haiku-4-5',
         apiKey: process.env.ANTHROPIC_API_KEY,
       },
       instructions: `You are Agent B, the second agent in a sequential workflow.
@@ -62,7 +62,7 @@ async function testSequentialMultiAgent() {
       agentId: 'agent_c',
       provider: Providers.ANTHROPIC,
       clientOptions: {
-        modelName: 'claude-3-5-sonnet-latest',
+        modelName: 'claude-haiku-4-5',
         apiKey: process.env.ANTHROPIC_API_KEY,
       },
       instructions: `You are Agent C, the final agent in a sequential workflow.

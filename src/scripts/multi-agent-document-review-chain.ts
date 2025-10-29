@@ -48,7 +48,7 @@ async function testDocumentReviewChain() {
       agentId: 'grammar_checker',
       provider: Providers.ANTHROPIC,
       clientOptions: {
-        modelName: 'claude-3-5-sonnet-latest',
+        modelName: 'claude-haiku-4-5',
         apiKey: process.env.ANTHROPIC_API_KEY,
       },
       instructions: `You are a Grammar and Style Checker.
@@ -65,7 +65,7 @@ async function testDocumentReviewChain() {
       agentId: 'fact_checker',
       provider: Providers.ANTHROPIC,
       clientOptions: {
-        modelName: 'claude-3-5-sonnet-latest',
+        modelName: 'claude-haiku-4-5',
         apiKey: process.env.ANTHROPIC_API_KEY,
       },
       instructions: `You are a Fact Checker.
@@ -82,7 +82,7 @@ async function testDocumentReviewChain() {
       agentId: 'tone_reviewer',
       provider: Providers.ANTHROPIC,
       clientOptions: {
-        modelName: 'claude-3-5-sonnet-latest',
+        modelName: 'claude-haiku-4-5',
         apiKey: process.env.ANTHROPIC_API_KEY,
       },
       instructions: `You are a Tone and Audience Reviewer.
@@ -99,7 +99,7 @@ async function testDocumentReviewChain() {
       agentId: 'final_editor',
       provider: Providers.ANTHROPIC,
       clientOptions: {
-        modelName: 'claude-3-5-sonnet-latest',
+        modelName: 'claude-haiku-4-5',
         apiKey: process.env.ANTHROPIC_API_KEY,
       },
       instructions: `You are the Final Editor.

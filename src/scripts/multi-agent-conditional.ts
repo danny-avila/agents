@@ -32,7 +32,7 @@ async function testConditionalMultiAgent() {
       agentId: 'classifier',
       provider: Providers.ANTHROPIC,
       clientOptions: {
-        modelName: 'claude-3-5-sonnet-latest',
+        modelName: 'claude-haiku-4-5',
         apiKey: process.env.ANTHROPIC_API_KEY,
       },
       instructions:
@@ -43,7 +43,7 @@ async function testConditionalMultiAgent() {
       agentId: 'technical_expert',
       provider: Providers.ANTHROPIC,
       clientOptions: {
-        modelName: 'claude-3-5-sonnet-latest',
+        modelName: 'claude-haiku-4-5',
         apiKey: process.env.ANTHROPIC_API_KEY,
       },
       instructions:
@@ -54,7 +54,7 @@ async function testConditionalMultiAgent() {
       agentId: 'business_expert',
       provider: Providers.ANTHROPIC,
       clientOptions: {
-        modelName: 'claude-3-5-sonnet-latest',
+        modelName: 'claude-haiku-4-5',
         apiKey: process.env.ANTHROPIC_API_KEY,
       },
       instructions:
@@ -65,7 +65,7 @@ async function testConditionalMultiAgent() {
       agentId: 'general_assistant',
       provider: Providers.ANTHROPIC,
       clientOptions: {
-        modelName: 'claude-3-5-sonnet-latest',
+        modelName: 'claude-haiku-4-5',
         apiKey: process.env.ANTHROPIC_API_KEY,
       },
       instructions:

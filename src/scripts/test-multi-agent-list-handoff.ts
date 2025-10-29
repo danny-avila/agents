@@ -93,7 +93,7 @@ async function testSupervisorListHandoff() {
     const specialistConfig = {
       provider: Providers.ANTHROPIC,
       clientOptions: {
-        modelName: 'claude-3-5-sonnet-latest',
+        modelName: 'claude-haiku-4-5',
         apiKey: process.env.ANTHROPIC_API_KEY,
       },
       instructions: `You are an Adaptive Specialist. Your agent ID indicates your role:
@@ -114,7 +114,7 @@ async function testSupervisorListHandoff() {
         agentId: 'supervisor',
         provider: Providers.ANTHROPIC,
         clientOptions: {
-          modelName: 'claude-3-5-sonnet-latest',
+          modelName: 'claude-haiku-4-5',
           apiKey: process.env.ANTHROPIC_API_KEY,
         },
         instructions: `You are a Task Supervisor with access to 5 specialist agents:

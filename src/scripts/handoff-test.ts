@@ -92,7 +92,7 @@ const transferToFlightAssistant = createHandoffTool({
 });
 
 const llm = new ChatAnthropic({
-  modelName: 'claude-3-5-sonnet-latest',
+  modelName: 'claude-haiku-4-5',
   apiKey: process.env.ANTHROPIC_API_KEY,
 });
 

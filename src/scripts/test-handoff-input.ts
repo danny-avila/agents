@@ -84,7 +84,7 @@ async function testHandoffInput() {
           agentId: 'supervisor',
           provider: Providers.ANTHROPIC,
           clientOptions: {
-            modelName: 'claude-3-5-sonnet-latest',
+            modelName: 'claude-haiku-4-5',
             apiKey: process.env.ANTHROPIC_API_KEY,
           },
           instructions: `You are a Task Supervisor. You have access to two specialist agents:
@@ -100,7 +100,7 @@ async function testHandoffInput() {
           agentId: 'analyst',
           provider: Providers.ANTHROPIC,
           clientOptions: {
-            modelName: 'claude-3-5-sonnet-latest',
+            modelName: 'claude-haiku-4-5',
             apiKey: process.env.ANTHROPIC_API_KEY,
           },
           instructions: `You are a Data Analyst. Follow the supervisor's instructions carefully.
@@ -111,7 +111,7 @@ async function testHandoffInput() {
           agentId: 'writer',
           provider: Providers.ANTHROPIC,
           clientOptions: {
-            modelName: 'claude-3-5-sonnet-latest',
+            modelName: 'claude-haiku-4-5',
             apiKey: process.env.ANTHROPIC_API_KEY,
           },
           instructions: `You are a Content Writer. Follow the supervisor's instructions carefully.

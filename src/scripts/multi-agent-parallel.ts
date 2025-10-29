@@ -36,7 +36,7 @@ async function testParallelMultiAgent() {
       agentId: 'researcher',
       provider: Providers.ANTHROPIC,
       clientOptions: {
-        modelName: 'claude-3-5-sonnet-latest',
+        modelName: 'claude-haiku-4-5',
         apiKey: process.env.ANTHROPIC_API_KEY,
       },
       instructions: `You are a research coordinator in a multi-agent analysis workflow. Your sole job is to:
@@ -60,7 +60,7 @@ async function testParallelMultiAgent() {
       agentId: 'analyst1',
       provider: Providers.ANTHROPIC,
       clientOptions: {
-        modelName: 'claude-3-5-sonnet-latest',
+        modelName: 'claude-haiku-4-5',
         apiKey: process.env.ANTHROPIC_API_KEY,
       },
       instructions: `You are a FINANCIAL AND ECONOMIC ANALYST in a parallel analysis workflow. 
@@ -83,7 +83,7 @@ async function testParallelMultiAgent() {
       agentId: 'analyst2',
       provider: Providers.ANTHROPIC,
       clientOptions: {
-        modelName: 'claude-3-5-sonnet-latest',
+        modelName: 'claude-haiku-4-5',
         apiKey: process.env.ANTHROPIC_API_KEY,
       },
       instructions: `You are a TECHNICAL AND IMPLEMENTATION ANALYST in a parallel analysis workflow.
@@ -107,7 +107,7 @@ async function testParallelMultiAgent() {
       agentId: 'analyst3',
       provider: Providers.ANTHROPIC,
       clientOptions: {
-        modelName: 'claude-3-5-sonnet-latest',
+        modelName: 'claude-haiku-4-5',
         apiKey: process.env.ANTHROPIC_API_KEY,
       },
       instructions: `You are a MARKET AND INDUSTRY ANALYST in a parallel analysis workflow.
@@ -131,7 +131,7 @@ async function testParallelMultiAgent() {
       agentId: 'summarizer',
       provider: Providers.ANTHROPIC,
       clientOptions: {
-        modelName: 'claude-3-5-sonnet-latest',
+        modelName: 'claude-haiku-4-5',
         apiKey: process.env.ANTHROPIC_API_KEY,
       },
       instructions: `You are the SYNTHESIS AND SUMMARY EXPERT in a multi-agent workflow.

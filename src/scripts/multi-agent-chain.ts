@@ -71,7 +71,7 @@ async function testSequentialAgentChain() {
       agentId: 'researcher',
       provider: Providers.ANTHROPIC,
       clientOptions: {
-        modelName: 'claude-3-5-sonnet-latest',
+        modelName: 'claude-haiku-4-5',
         apiKey: process.env.ANTHROPIC_API_KEY,
       },
       instructions: `You are a Research Agent specializing in gathering initial information.
@@ -88,7 +88,7 @@ async function testSequentialAgentChain() {
       agentId: 'analyst',
       provider: Providers.ANTHROPIC,
       clientOptions: {
-        modelName: 'claude-3-5-sonnet-latest',
+        modelName: 'claude-haiku-4-5',
         apiKey: process.env.ANTHROPIC_API_KEY,
       },
       instructions: `You are an Analysis Agent that builds upon research findings.
@@ -105,7 +105,7 @@ async function testSequentialAgentChain() {
       agentId: 'reviewer',
       provider: Providers.ANTHROPIC,
       clientOptions: {
-        modelName: 'claude-3-5-sonnet-latest',
+        modelName: 'claude-haiku-4-5',
         apiKey: process.env.ANTHROPIC_API_KEY,
       },
       instructions: `You are a Critical Review Agent that evaluates the work done so far.
@@ -122,7 +122,7 @@ async function testSequentialAgentChain() {
       agentId: 'summarizer',
       provider: Providers.ANTHROPIC,
       clientOptions: {
-        modelName: 'claude-3-5-sonnet-latest',
+        modelName: 'claude-haiku-4-5',
         apiKey: process.env.ANTHROPIC_API_KEY,
       },
       instructions: `You are a Summary Agent that creates the final comprehensive output.

@@ -80,7 +80,7 @@ async function testStandardStreaming(): Promise<void> {
   const llmConfig = getLLMConfig(
     Providers.ANTHROPIC
   ) as t.AnthropicClientOptions & t.SharedLLMConfig;
-  llmConfig.model = 'claude-3-5-sonnet-latest';
+  llmConfig.model = 'claude-haiku-4-5';
 
   const run = await Run.create<t.IState>({
     runId: 'test-run-id',
