@@ -17,6 +17,7 @@ import {
 import { GraphEvents, Providers, TitleMethod } from '@/common';
 import { getLLMConfig } from '@/utils/llmConfig';
 import { getArgs } from '@/scripts/args';
+import { sleep } from '@/utils/run';
 import { Run } from '@/run';
 
 const conversationHistory: BaseMessage[] = [];
@@ -129,7 +130,7 @@ async function testStandardStreaming(): Promise<void> {
   }
 
   const run = await Run.create<t.IState>({
-    runId: 'test-run-id',
+    runId: 'test-simple-script',
     graphConfig: {
       type: 'standard',
       llmConfig,
@@ -144,7 +145,9 @@ async function testStandardStreaming(): Promise<void> {
   });
 
   const config = {
+    runId: 'test-simple-script',
     configurable: {
+      user_id: 'user-123',
       thread_id: 'conversation-num-1',
     },
     streamMode: 'values',
@@ -176,6 +179,10 @@ async function testStandardStreaming(): Promise<void> {
     contentParts,
     // titleMethod: TitleMethod.STRUCTURED,
     chainOptions: {
+      configurable: {
+        user_id: 'user-123',
+        thread_id: 'conversation-num-1',
+      },
       callbacks: [
         {
           handleLLMEnd,
@@ -192,6 +199,7 @@ async function testStandardStreaming(): Promise<void> {
   console.log('Collected usage metadata:', collectedUsage);
   console.log('Generated Title:', titleResult);
   console.log('Collected title usage metadata:', collected);
+  await sleep(5000);
 }
 
 process.on('unhandledRejection', (reason, promise) => {
