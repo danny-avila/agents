@@ -2,11 +2,12 @@ import { config } from 'dotenv';
 config();
 
 import { HumanMessage, BaseMessage } from '@langchain/core/messages';
-import { Run } from '@/run';
-import { Providers, GraphEvents } from '@/common';
+import type * as t from '@/types';
 import { ChatModelStreamHandler, createContentAggregator } from '@/stream';
 import { ToolEndHandler, ModelEndHandler } from '@/events';
-import type * as t from '@/types';
+import { Providers, GraphEvents } from '@/common';
+import { sleep } from '@/utils/run';
+import { Run } from '@/run';
 
 const conversationHistory: BaseMessage[] = [];
 
@@ -353,6 +354,7 @@ async function testSupervisorMultiAgent() {
       console.log(`                 transfer_to_legal_advisor`);
       console.log('─'.repeat(60));
     }
+    await sleep(3000);
   } catch (error) {
     console.error('Error in supervisor multi-agent test:', error);
   }

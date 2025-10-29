@@ -2,11 +2,12 @@ import { config } from 'dotenv';
 config();
 
 import { HumanMessage, BaseMessage } from '@langchain/core/messages';
-import { Run } from '@/run';
-import { Providers, GraphEvents } from '@/common';
+import type * as t from '@/types';
 import { ChatModelStreamHandler, createContentAggregator } from '@/stream';
 import { ToolEndHandler, ModelEndHandler } from '@/events';
-import type * as t from '@/types';
+import { Providers, GraphEvents } from '@/common';
+import { sleep } from '@/utils/run';
+import { Run } from '@/run';
 
 const conversationHistory: BaseMessage[] = [];
 
@@ -332,6 +333,7 @@ IMPORTANT: Each analyst must produce substantive analysis (200+ words), not just
     console.log('\n\nActive agents during execution:', activeAgents.size);
     console.log('Final content parts:', contentParts.length, 'parts');
     console.dir(contentParts, { depth: null });
+    await sleep(3000);
   } catch (error) {
     console.error('Error in parallel multi-agent test:', error);
   }
