@@ -1,6 +1,6 @@
 import { z } from 'zod';
-import { RunnableLambda } from '@langchain/core/runnables';
 import { ChatPromptTemplate } from '@langchain/core/prompts';
+import { RunnableLambda, RunnableSequence } from '@langchain/core/runnables';
 import type { Runnable, RunnableConfig } from '@langchain/core/runnables';
 import type { AIMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
@@ -43,7 +43,55 @@ export const createTitleRunnable = async (
 
   const titlePrompt = ChatPromptTemplate.fromTemplate(
     _titlePrompt ?? defaultTitlePrompt
-  );
+  ).withConfig({ runName: 'TitlePrompt' });
+
+  const titleOnlyInnerChain = RunnableSequence.from([titlePrompt, titleLLM]);
+  const combinedInnerChain = RunnableSequence.from([titlePrompt, combinedLLM]);
+
+  /** Wrap titleOnlyChain in RunnableLambda to create parent span */
+  const titleOnlyChain = new RunnableLambda({
+    func: async (
+      input: { convo: string },
+      config?: Partial<RunnableConfig>
+    ): Promise<{ title: string }> => {
+      return await titleOnlyInnerChain.invoke(input, config);
+    },
+  }).withConfig({ runName: 'TitleOnlyChain' });
+
+  /** Wrap combinedChain in RunnableLambda to create parent span */
+  const combinedChain = new RunnableLambda({
+    func: async (
+      input: { convo: string },
+      config?: Partial<RunnableConfig>
+    ): Promise<{ language: string; title: string }> => {
+      return await combinedInnerChain.invoke(input, config);
+    },
+  }).withConfig({ runName: 'TitleLanguageChain' });
+
+  /** Runnable to add default values if needed */
+  const addDefaults = new RunnableLambda({
+    func: (
+      result: { language: string; title: string } | undefined
+    ): { language: string; title: string } => ({
+      language: result?.language ?? 'English',
+      title: result?.title ?? '',
+    }),
+  }).withConfig({ runName: 'AddDefaults' });
+
+  const combinedChainInner = RunnableSequence.from([
+    combinedChain,
+    addDefaults,
+  ]);
+
+  /** Wrap combinedChainWithDefaults in RunnableLambda to create parent span */
+  const combinedChainWithDefaults = new RunnableLambda({
+    func: async (
+      input: { convo: string },
+      config?: Partial<RunnableConfig>
+    ): Promise<{ language: string; title: string }> => {
+      return await combinedChainInner.invoke(input, config);
+    },
+  }).withConfig({ runName: 'CombinedChainWithDefaults' });
 
   return new RunnableLambda({
     func: async (
@@ -54,28 +102,17 @@ export const createTitleRunnable = async (
       },
       config?: Partial<RunnableConfig>
     ): Promise<{ language: string; title: string } | { title: string }> => {
+      const invokeInput = { convo: input.convo };
+
       if (input.skipLanguage) {
-        return (await titlePrompt.pipe(titleLLM).invoke(
-          {
-            convo: input.convo,
-          },
-          config
-        )) as { title: string };
+        return (await titleOnlyChain.invoke(invokeInput, config)) as {
+          title: string;
+        };
       }
 
-      const result = (await titlePrompt.pipe(combinedLLM).invoke(
-        {
-          convo: input.convo,
-        },
-        config
-      )) as { language: string; title: string } | undefined;
-
-      return {
-        language: result?.language ?? 'English',
-        title: result?.title ?? '',
-      };
+      return await combinedChainWithDefaults.invoke(invokeInput, config);
     },
-  });
+  }).withConfig({ runName: 'TitleGenerator' });
 };
 
 const defaultCompletionPrompt = `Provide a concise, 5-word-or-less title for the conversation, using title case conventions. Only return the title itself.
@@ -89,7 +126,7 @@ export const createCompletionTitleRunnable = async (
 ): Promise<Runnable> => {
   const completionPrompt = ChatPromptTemplate.fromTemplate(
     titlePrompt ?? defaultCompletionPrompt
-  );
+  ).withConfig({ runName: 'CompletionTitlePrompt' });
 
   /** Runnable to extract content from model response */
   const extractContent = new RunnableLambda({
@@ -108,20 +145,21 @@ export const createCompletionTitleRunnable = async (
       }
       return { title: content.trim() };
     },
-  });
+  }).withConfig({ runName: 'ExtractTitle' });
 
-  const chain = completionPrompt.pipe(model).pipe(extractContent);
+  const innerChain = RunnableSequence.from([
+    completionPrompt,
+    model,
+    extractContent,
+  ]);
 
+  /** Wrap in RunnableLambda to create a parent span for LangFuse */
   return new RunnableLambda({
     func: async (
-      input: {
-        convo: string;
-        inputText: string;
-        skipLanguage: boolean;
-      },
+      input: { convo: string },
       config?: Partial<RunnableConfig>
     ): Promise<{ title: string }> => {
-      return await chain.invoke({ convo: input.convo }, config);
+      return await innerChain.invoke(input, config);
     },
-  });
+  }).withConfig({ runName: 'CompletionTitleChain' });
 };

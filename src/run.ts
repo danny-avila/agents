@@ -4,13 +4,15 @@ import { zodToJsonSchema } from 'zod-to-json-schema';
 import { CallbackHandler } from '@langfuse/langchain';
 import { PromptTemplate } from '@langchain/core/prompts';
 import { SystemMessage } from '@langchain/core/messages';
+import { RunnableLambda } from '@langchain/core/runnables';
 import { AzureChatOpenAI, ChatOpenAI } from '@langchain/openai';
 import type {
-  BaseMessage,
   MessageContentComplex,
+  BaseMessage,
 } from '@langchain/core/messages';
-import type { ClientCallbacks, SystemCallbacks } from '@/graphs/Graph';
+import type { StringPromptValue } from '@langchain/core/prompt_values';
 import type { RunnableConfig } from '@langchain/core/runnables';
+import type { ClientCallbacks, SystemCallbacks } from '@/graphs/Graph';
 import type * as t from '@/types';
 import { GraphEvents, Providers, Callback, TitleMethod } from '@/common';
 import { manualToolStreamProviders } from '@/llm/providers';
@@ -291,18 +293,38 @@ export class Run<T extends t.BaseGraphState> {
     titleMethod = TitleMethod.COMPLETION,
     titlePromptTemplate,
   }: t.RunTitleOptions): Promise<{ language?: string; title?: string }> {
+    if (
+      chainOptions != null &&
+      isPresent(process.env.LANGFUSE_SECRET_KEY) &&
+      isPresent(process.env.LANGFUSE_PUBLIC_KEY) &&
+      isPresent(process.env.LANGFUSE_BASE_URL)
+    ) {
+      const userId = chainOptions.configurable?.user_id;
+      const sessionId = chainOptions.configurable?.thread_id;
+      const traceMetadata = {
+        messageId: 'title-' + this.id,
+      };
+      const handler = new CallbackHandler({
+        userId,
+        sessionId,
+        traceMetadata,
+      });
+      chainOptions.callbacks = (
+        (chainOptions.callbacks as t.ProvidedCallbacks) ?? []
+      ).concat([handler]);
+    }
+
     const convoTemplate = PromptTemplate.fromTemplate(
       titlePromptTemplate ?? 'User: {input}\nAI: {output}'
     );
+
     const response = contentParts
       .map((part) => {
         if (part?.type === 'text') return part.text;
         return '';
       })
       .join('\n');
-    const convo = (
-      await convoTemplate.invoke({ input: inputText, output: response })
-    ).value;
+
     const model = this.Graph?.getNewModel({
       provider,
       omitOptions,
@@ -328,10 +350,32 @@ export class Run<T extends t.BaseGraphState> {
       model.n = (clientOptions as t.OpenAIClientOptions | undefined)
         ?.n as number;
     }
-    const chain =
+
+    const convoToTitleInput = new RunnableLambda({
+      func: (
+        promptValue: StringPromptValue
+      ): { convo: string; inputText: string; skipLanguage?: boolean } => ({
+        convo: promptValue.value,
+        inputText,
+        skipLanguage,
+      }),
+    }).withConfig({ runName: 'ConvoTransform' });
+
+    const titleChain =
       titleMethod === TitleMethod.COMPLETION
         ? await createCompletionTitleRunnable(model, titlePrompt)
         : await createTitleRunnable(model, titlePrompt);
-    return await chain.invoke({ convo, inputText, skipLanguage }, chainOptions);
+
+    /** Pipes `convoTemplate` -> `transformer` -> `titleChain` */
+    const fullChain = convoTemplate
+      .withConfig({ runName: 'ConvoTemplate' })
+      .pipe(convoToTitleInput)
+      .pipe(titleChain)
+      .withConfig({ runName: 'TitleChain' });
+
+    return await fullChain.invoke(
+      { input: inputText, output: response },
+      chainOptions
+    );
   }
 }
