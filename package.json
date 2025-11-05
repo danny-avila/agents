@@ -103,6 +103,7 @@
     "@langchain/mistralai": "^0.2.1",
     "@langchain/ollama": "^0.2.3",
     "@langchain/openai": "0.5.18",
+    "@langchain/textsplitters": "^0.1.0",
     "@langchain/xai": "^0.0.3",
     "@langfuse/langchain": "^4.3.0",
     "@langfuse/otel": "^4.3.0",
