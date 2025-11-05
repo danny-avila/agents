@@ -108,6 +108,7 @@
     "@langfuse/otel": "^4.3.0",
     "@langfuse/tracing": "^4.3.0",
     "@opentelemetry/sdk-node": "^0.207.0",
+    "axios": "^1.12.1",
     "cheerio": "^1.0.0",
     "dotenv": "^16.4.7",
     "https-proxy-agent": "^7.0.6",
