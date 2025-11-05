@@ -95,7 +95,6 @@
   "dependencies": {
     "@langchain/anthropic": "^0.3.26",
     "@langchain/aws": "^0.1.12",
-    "@langchain/community": "^0.3.57",
     "@langchain/core": "^0.3.72",
     "@langchain/deepseek": "^0.0.2",
     "@langchain/google-genai": "^0.2.13",

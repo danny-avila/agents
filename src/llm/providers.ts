@@ -3,7 +3,6 @@ import { ChatMistralAI } from '@langchain/mistralai';
 import { ChatBedrockConverse } from '@langchain/aws';
 // import { ChatAnthropic } from '@langchain/anthropic';
 // import { ChatVertexAI } from '@langchain/google-vertexai';
-import { BedrockChat } from '@langchain/community/chat_models/bedrock/web';
 import type {
   ChatModelConstructorMap,
   ProviderOptionsMap,
@@ -33,7 +32,6 @@ export const llmProviders: Partial<ChatModelConstructorMap> = {
   [Providers.MISTRAL]: ChatMistralAI,
   [Providers.ANTHROPIC]: CustomAnthropic,
   [Providers.OPENROUTER]: ChatOpenRouter,
-  [Providers.BEDROCK_LEGACY]: BedrockChat,
   [Providers.BEDROCK]: ChatBedrockConverse,
   // [Providers.ANTHROPIC]: ChatAnthropic,
   [Providers.GOOGLE]: CustomChatGoogleGenerativeAI,

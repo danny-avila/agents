@@ -2,7 +2,6 @@
 import { ChatOllama } from '@langchain/ollama';
 import { ChatMistralAI } from '@langchain/mistralai';
 import { ChatBedrockConverse } from '@langchain/aws';
-import { BedrockChat } from '@langchain/community/chat_models/bedrock/web';
 import type {
   BindToolsInput,
   BaseChatModelParams,
@@ -13,7 +12,6 @@ import type {
   AzureOpenAIInput,
   ClientOptions as OAIClientOptions,
 } from '@langchain/openai';
-import type { BedrockChatFields } from '@langchain/community/chat_models/bedrock/web';
 import type { GoogleGenerativeAIChatInput } from '@langchain/google-genai';
 import type { GeminiGenerationConfig } from '@langchain/google-common';
 import type { ChatVertexAIInput } from '@langchain/google-vertexai';
@@ -65,7 +63,6 @@ export type MistralAIClientOptions = ChatMistralAIInput;
 export type VertexAIClientOptions = ChatVertexAIInput & {
   includeThoughts?: boolean;
 };
-export type BedrockClientOptions = BedrockChatFields;
 export type BedrockAnthropicInput = ChatBedrockConverseInput & {
   additionalModelRequestFields?: ChatBedrockConverseInput['additionalModelRequestFields'] &
     AnthropicReasoning;
@@ -85,7 +82,6 @@ export type ClientOptions =
   | AnthropicClientOptions
   | MistralAIClientOptions
   | VertexAIClientOptions
-  | BedrockClientOptions
   | BedrockConverseClientOptions
   | GoogleClientOptions
   | DeepSeekClientOptions
@@ -113,7 +109,6 @@ export type ProviderOptionsMap = {
   [Providers.MISTRALAI]: MistralAIClientOptions;
   [Providers.MISTRAL]: MistralAIClientOptions;
   [Providers.OPENROUTER]: ChatOpenRouterCallOptions;
-  [Providers.BEDROCK_LEGACY]: BedrockClientOptions;
   [Providers.BEDROCK]: BedrockConverseClientOptions;
   [Providers.XAI]: XAIClientOptions;
 };
@@ -129,7 +124,6 @@ export type ChatModelMap = {
   [Providers.MISTRALAI]: ChatMistralAI;
   [Providers.MISTRAL]: ChatMistralAI;
   [Providers.OPENROUTER]: ChatOpenRouter;
-  [Providers.BEDROCK_LEGACY]: BedrockChat;
   [Providers.BEDROCK]: ChatBedrockConverse;
   [Providers.GOOGLE]: CustomChatGoogleGenerativeAI;
 };
