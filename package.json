@@ -133,6 +133,7 @@
     "@swc/core": "^1.6.13",
     "@types/jest": "^29.5.14",
     "@types/node": "^20.14.11",
+    "@types/node-fetch": "^2.6.13",
     "@types/yargs-parser": "^21.0.3",
     "@typescript-eslint/eslint-plugin": "^8.24.0",
     "@typescript-eslint/parser": "^8.24.0",
