@@ -3,7 +3,7 @@
 // src/scripts/cli.test.ts
 import { config } from 'dotenv';
 config();
-import { Calculator } from '@langchain/community/tools/calculator';
+import { Calculator } from '@/tools/Calculator';
 import {
   HumanMessage,
   BaseMessage,

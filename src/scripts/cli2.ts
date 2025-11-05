@@ -3,7 +3,6 @@
 import { config } from 'dotenv';
 config();
 import { HumanMessage, BaseMessage } from '@langchain/core/messages';
-import { TavilySearchResults } from '@langchain/community/tools/tavily_search';
 import type * as t from '@/types';
 import { ChatModelStreamHandler } from '@/stream';
 import { TestLLMStreamHandler } from '@/events';
@@ -17,7 +16,7 @@ const conversationHistory: BaseMessage[] = [];
 
 async function executePersonalizedQuerySuite(): Promise<void> {
   const { userName, location, provider, currentDate } = await getArgs();
-  
+
   const customHandlers = {
     [GraphEvents.LLM_STREAM]: new TestLLMStreamHandler(),
     [GraphEvents.CHAT_MODEL_STREAM]: new ChatModelStreamHandler(),
@@ -25,37 +24,37 @@ async function executePersonalizedQuerySuite(): Promise<void> {
       handle: (_event: string, data: t.StreamEventData): void => {
         console.log('====== LLM_START ======');
         console.dir(data, { depth: null });
-      }
+      },
     },
     [GraphEvents.LLM_END]: {
       handle: (_event: string, data: t.StreamEventData): void => {
         console.log('====== LLM_END ======');
         console.dir(data, { depth: null });
-      }
+      },
     },
     [GraphEvents.CHAT_MODEL_START]: {
       handle: (_event: string, _data: t.StreamEventData): void => {
         console.log('====== CHAT_MODEL_START ======');
         console.dir(_data, { depth: null });
-      }
+      },
     },
     [GraphEvents.CHAT_MODEL_END]: {
       handle: (_event: string, _data: t.StreamEventData): void => {
         console.log('====== CHAT_MODEL_END ======');
         console.dir(_data, { depth: null });
-      }
+      },
     },
     [GraphEvents.TOOL_START]: {
       handle: (_event: string, data: t.StreamEventData): void => {
         console.log('====== TOOL_START ======');
         console.dir(data, { depth: null });
-      }
+      },
     },
     [GraphEvents.TOOL_END]: {
       handle: (_event: string, data: t.StreamEventData): void => {
         console.log('====== TOOL_END ======');
         console.dir(data, { depth: null });
-      }
+      },
     },
   };
 
@@ -66,7 +65,7 @@ async function executePersonalizedQuerySuite(): Promise<void> {
     graphConfig: {
       type: 'standard',
       llmConfig,
-      tools: [new TavilySearchResults()],
+      tools: [],
     },
     customHandlers,
   });
@@ -76,7 +75,7 @@ async function executePersonalizedQuerySuite(): Promise<void> {
       provider,
       thread_id: `${userName}-session-${Date.now()}`,
       instructions: `You are a knowledgeable and friendly AI assistant. Tailor your responses to ${userName}'s interests in ${location}.`,
-      additional_instructions: `Ensure each topic is thoroughly researched. Today is ${currentDate}. Maintain a warm, personalized tone throughout.`
+      additional_instructions: `Ensure each topic is thoroughly researched. Today is ${currentDate}. Maintain a warm, personalized tone throughout.`,
     },
     streamMode: 'values',
     version: 'v2' as const,
@@ -85,9 +84,18 @@ async function executePersonalizedQuerySuite(): Promise<void> {
   console.log(`Initiating personalized query suite for ${userName}`);
 
   const queryTopics = [
-    { task: "current weather", description: "Provide a detailed weather forecast" },
-    { task: "popular tourist attraction", description: "Describe a notable sight" },
-    { task: "upcoming events", description: "List major events or festivals this week" },
+    {
+      task: 'current weather',
+      description: 'Provide a detailed weather forecast',
+    },
+    {
+      task: 'popular tourist attraction',
+      description: 'Describe a notable sight',
+    },
+    {
+      task: 'upcoming events',
+      description: 'List major events or festivals this week',
+    },
     // { task: "famous local dish", description: "Share a recipe for a regional specialty" },
     // { task: "local humor", description: "Tell a joke related to the area or findings" }
   ];
@@ -118,8 +126,8 @@ async function executePersonalizedQuerySuite(): Promise<void> {
 }
 
 executePersonalizedQuerySuite().catch((error) => {
-  console.error("An error occurred during the query suite execution:", error);
-  console.log("Final conversation state:");
+  console.error('An error occurred during the query suite execution:', error);
+  console.log('Final conversation state:');
   console.dir(conversationHistory, { depth: null });
   process.exit(1);
 });

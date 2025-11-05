@@ -2,7 +2,6 @@
 import { config } from 'dotenv';
 config();
 import { HumanMessage, BaseMessage } from '@langchain/core/messages';
-import { TavilySearchResults } from '@langchain/community/tools/tavily_search';
 import type * as t from '@/types';
 import { ChatModelStreamHandler, createContentAggregator } from '@/stream';
 import { createCodeExecutionTool } from '@/tools/CodeExecutor';
@@ -96,7 +95,7 @@ async function testCodeExecution(): Promise<void> {
     graphConfig: {
       type: 'standard',
       llmConfig,
-      tools: [new TavilySearchResults(), createCodeExecutionTool()],
+      tools: [createCodeExecutionTool()],
       instructions,
       additional_instructions,
       maxContextTokens: 8000,

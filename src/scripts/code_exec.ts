@@ -2,7 +2,6 @@
 import { config } from 'dotenv';
 config();
 import { HumanMessage, AIMessage, BaseMessage } from '@langchain/core/messages';
-import { TavilySearchResults } from '@langchain/community/tools/tavily_search';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type * as t from '@/types';
 import { ChatModelStreamHandler, createContentAggregator } from '@/stream';
@@ -88,7 +87,7 @@ async function testCodeExecution(): Promise<void> {
     graphConfig: {
       type: 'standard',
       llmConfig,
-      tools: [new TavilySearchResults(), createCodeExecutionTool()],
+      tools: [createCodeExecutionTool()],
       instructions:
         'You are a friendly AI assistant with coding capabilities. Always address the user by their name.',
       additional_instructions: `The user's name is ${userName} and they are located in ${location}.`,

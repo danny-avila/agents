@@ -7,7 +7,6 @@ import {
   BaseMessage,
   UsageMetadata,
 } from '@langchain/core/messages';
-import { TavilySearchResults } from '@langchain/community/tools/tavily_search';
 import type * as t from '@/types';
 import { ChatModelStreamHandler, createContentAggregator } from '@/stream';
 import {
@@ -135,7 +134,7 @@ async function testStandardStreaming(): Promise<void> {
     graphConfig: {
       type: 'standard',
       llmConfig,
-      // tools: [new TavilySearchResults()],
+      // tools: [],
       // reasoningKey: 'reasoning',
       instructions:
         'You are a friendly AI assistant. Always address the user by their name.',

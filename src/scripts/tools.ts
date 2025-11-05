@@ -3,7 +3,6 @@
 import { config } from 'dotenv';
 config();
 import { HumanMessage, BaseMessage } from '@langchain/core/messages';
-import { TavilySearchResults } from '@langchain/community/tools/tavily_search';
 import type * as t from '@/types';
 import { ChatModelStreamHandler, createContentAggregator } from '@/stream';
 import { ToolEndHandler, ModelEndHandler } from '@/events';
@@ -95,11 +94,13 @@ async function testStandardStreaming(): Promise<void> {
     graphConfig: {
       type: 'standard',
       llmConfig,
-      tools: [new TavilySearchResults()],
+      tools: [],
       instructions:
         'You are a friendly AI assistant. Always address the user by their name.',
       additional_instructions: `The user's name is ${userName} and they are located in ${location}.`,
+      maxContextTokens: 89000,
     },
+    indexTokenCountMap: { 0: 35 },
     returnContent: true,
     customHandlers,
   });
@@ -126,10 +127,7 @@ async function testStandardStreaming(): Promise<void> {
   const inputs = {
     messages: conversationHistory,
   };
-  const finalContentParts = await run.processStream(inputs, config, {
-    indexTokenCountMap: { 0: 35 },
-    maxContextTokens: 89000,
-  });
+  const finalContentParts = await run.processStream(inputs, config);
   const finalMessages = run.getRunMessages();
   if (finalMessages) {
     conversationHistory.push(...finalMessages);

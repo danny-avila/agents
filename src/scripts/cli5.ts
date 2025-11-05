@@ -3,7 +3,6 @@
 import { config } from 'dotenv';
 config();
 import { HumanMessage, BaseMessage } from '@langchain/core/messages';
-import { TavilySearchResults } from '@langchain/community/tools/tavily_search';
 import type * as t from '@/types';
 import { ModelEndHandler, ToolEndHandler } from '@/events';
 import { ChatModelStreamHandler } from '@/stream';
@@ -96,7 +95,7 @@ async function testStandardStreaming(): Promise<void> {
   const graphConfig: t.LegacyGraphConfig = {
     type: 'standard',
     llmConfig,
-    tools: [new TavilySearchResults()],
+    tools: [],
     instructions:
       'You are a friendly AI assistant. Always address the user by their name.',
     additional_instructions: `The user's name is ${userName} and they are located in ${location}.`,

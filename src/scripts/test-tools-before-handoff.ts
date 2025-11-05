@@ -1,7 +1,6 @@
 import { config } from 'dotenv';
 config();
 
-import { TavilySearch } from '@langchain/tavily';
 import { HumanMessage, BaseMessage } from '@langchain/core/messages';
 import { Run } from '@/run';
 import { Providers, GraphEvents } from '@/common';
@@ -78,10 +77,7 @@ async function testToolsBeforeHandoff() {
         console.log(`\n🔧 Tool started:`);
         console.dir({ toolData, metadata }, { depth: null });
 
-        if (toolData?.output?.name === 'tavily_search_results_json') {
-          toolCallCount++;
-          console.log(`📊 Search #${toolCallCount} initiated`);
-        } else if (toolData?.output?.name?.includes('transfer_to_')) {
+        if (toolData?.output?.name?.includes('transfer_to_')) {
           handoffOccurred = true;
           const specialist = toolData.name.replace('transfer_to_', '');
           console.log(`\n🔀 Handoff initiated to: ${specialist}`);
@@ -100,21 +96,17 @@ async function testToolsBeforeHandoff() {
           modelName: 'gpt-4.1-mini',
           apiKey: process.env.OPENAI_API_KEY,
         },
-        tools: [new TavilySearch({ maxResults: 3 })],
-        instructions: `You are a Research Coordinator with access to web search and a report writer specialist.
+        tools: [],
+        instructions: `You are a Research Coordinator with access to a report writer specialist.
         
         Your workflow MUST follow these steps IN ORDER:
-        1. FIRST: Write an initial response acknowledging the request and outlining your research plan
-           - Explain what aspects you'll investigate
-           - Describe your search strategy
-        2. SECOND: Conduct exactly 2 web searches to gather comprehensive information
-           - Search 1: Get general information about the topic
-           - Search 2: Get specific details, recent updates, or complementary data
-           - Note: Even if your searches are unsuccessful, you MUST still proceed to handoff after EXACTLY 2 searches
-        3. FINALLY: After completing both searches, transfer to the report writer
-           - Provide the report writer with a summary of your findings
+        1. FIRST: Write an initial response acknowledging the request
+           - Explain what you understand about the topic
+           - Provide any general knowledge you have
+        2. FINALLY: Transfer to the report writer
+           - Provide the report writer with a summary of the information
         
-        CRITICAL: You MUST write your initial response before ANY tool use. Then complete both searches before handoff.`,
+        CRITICAL: You MUST write your initial response before transferring to the report writer.`,
         maxContextTokens: 8000,
       },
       {
@@ -159,10 +151,10 @@ async function testToolsBeforeHandoff() {
   }
 
   try {
-    // Single test query that requires research before report writing
-    const query = `Research the latest developments in quantum computing from 2025, 
+    // Single test query that requires handoff to report writer
+    const query = `Tell me about quantum computing developments, 
     including major breakthroughs and commercial applications. 
-    I need a comprehensive report with recent findings.`;
+    I need a comprehensive report.`;
 
     console.log('='.repeat(60));
     console.log(`USER QUERY: "${query}"`);
@@ -173,10 +165,9 @@ async function testToolsBeforeHandoff() {
     const run = await Run.create(runConfig);
 
     console.log('\nExpected behavior:');
-    console.log('1. Research Coordinator writes initial response/plan');
-    console.log('2. Research Coordinator performs 2 web searches');
-    console.log('3. Research Coordinator hands off to Report Writer');
-    console.log('4. Report Writer creates final report\n');
+    console.log('1. Research Coordinator writes initial response');
+    console.log('2. Research Coordinator hands off to Report Writer');
+    console.log('3. Report Writer creates final report\n');
 
     // Process with streaming
     conversationHistory.push(new HumanMessage(query));
@@ -204,11 +195,9 @@ async function testToolsBeforeHandoff() {
     console.log('EDGE CASE TEST RESULTS:');
     console.log('─'.repeat(60));
     console.log(`Tool calls before handoff: ${toolCallCount}`);
-    console.log(`Expected tool calls: 2`);
+    console.log(`Expected tool calls: 0 (no web search available)`);
     console.log(`Handoff occurred: ${handoffOccurred ? 'Yes ✅' : 'No ❌'}`);
-    console.log(
-      `Test status: ${toolCallCount === 2 && handoffOccurred ? 'PASSED ✅' : 'FAILED ❌'}`
-    );
+    console.log(`Test status: ${handoffOccurred ? 'PASSED ✅' : 'FAILED ❌'}`);
     console.log('─'.repeat(60));
 
     // Display conversation history

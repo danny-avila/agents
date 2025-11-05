@@ -2,15 +2,13 @@
 // src/scripts/cli.ts
 import { config } from 'dotenv';
 config();
-import { z } from "zod";
+import { z } from 'zod';
 import { HumanMessage, BaseMessage } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
-import { TavilySearchResults } from '@langchain/community/tools/tavily_search';
-import { tool } from "@langchain/core/tools";
+import { tool } from '@langchain/core/tools';
 import type * as t from '@/types';
 import { ModelEndHandler, ToolEndHandler } from '@/events';
 import { ChatModelStreamHandler } from '@/stream';
-
 
 import { getArgs } from '@/scripts/args';
 import { Run } from '@/run';
@@ -28,25 +26,29 @@ async function testStandardStreaming(): Promise<void> {
       handle: (_event: string, data: t.StreamEventData): void => {
         console.log('====== ON_RUN_STEP ======');
         console.dir(data, { depth: null });
-      }
+      },
     },
     [GraphEvents.ON_RUN_STEP_DELTA]: {
       handle: (_event: string, data: t.StreamEventData): void => {
         console.log('====== ON_RUN_STEP_DELTA ======');
         console.dir(data, { depth: null });
-      }
+      },
     },
     [GraphEvents.ON_MESSAGE_DELTA]: {
       handle: (_event: string, data: t.StreamEventData): void => {
         console.log('====== ON_MESSAGE_DELTA ======');
         console.dir(data, { depth: null });
-      }
+      },
     },
     [GraphEvents.TOOL_START]: {
-      handle: (_event: string, data: t.StreamEventData, metadata?: Record<string, unknown>): void => {
+      handle: (
+        _event: string,
+        data: t.StreamEventData,
+        metadata?: Record<string, unknown>
+      ): void => {
         console.log('====== TOOL_START ======');
         console.dir(data, { depth: null });
-      }
+      },
     },
     // [GraphEvents.LLM_STREAM]: new LLMStreamHandler(),
     // [GraphEvents.LLM_START]: {
@@ -86,21 +88,24 @@ async function testStandardStreaming(): Promise<void> {
 
   const llmConfig = getLLMConfig(provider);
 
-  const getWeather = tool(async ({ location }) => {
-    if (location === "SAN FRANCISCO") {
-      return "It's 60 degrees and foggy";
-    } else if (location.toLowerCase() === "san francisco") {
-      throw new Error("Input queries must be all capitals");
-    } else {
-      throw new Error("Invalid input.");
+  const getWeather = tool(
+    async ({ location }) => {
+      if (location === 'SAN FRANCISCO') {
+        return "It's 60 degrees and foggy";
+      } else if (location.toLowerCase() === 'san francisco') {
+        throw new Error('Input queries must be all capitals');
+      } else {
+        throw new Error('Invalid input.');
+      }
+    },
+    {
+      name: 'get_weather',
+      description: 'Call to get the current weather',
+      schema: z.object({
+        location: z.string(),
+      }),
     }
-  }, {
-    name: "get_weather",
-    description: "Call to get the current weather",
-    schema: z.object({
-      location: z.string(),
-    }),
-  });
+  );
 
   const run = await Run.create<t.IState>({
     runId: 'test-run-id',
@@ -108,7 +113,7 @@ async function testStandardStreaming(): Promise<void> {
       type: 'standard',
       llmConfig,
       tools: [getWeather],
-      // tools: [new TavilySearchResults()],
+      // tools: [],
     },
     customHandlers,
   });
@@ -117,8 +122,9 @@ async function testStandardStreaming(): Promise<void> {
     configurable: {
       provider,
       thread_id: 'conversation-num-1',
-      instructions: 'You are a friendly AI assistant. Always address the user by their name.',
-      additional_instructions: `The user's name is ${userName} and they are located in ${location}.`
+      instructions:
+        'You are a friendly AI assistant. Always address the user by their name.',
+      additional_instructions: `The user's name is ${userName} and they are located in ${location}.`,
     },
     streamMode: 'values',
     version: 'v2' as const,
@@ -132,10 +138,10 @@ async function testStandardStreaming(): Promise<void> {
   };
   const contentParts = await run.processStream(inputs, config, {
     callbacks: {
-    [Callback.TOOL_ERROR]: (graph, error, toolId) => {
-      console.error(`Tool ${toolId} failed with error: ${error.message}`);
+      [Callback.TOOL_ERROR]: (graph, error, toolId) => {
+        console.error(`Tool ${toolId} failed with error: ${error.message}`);
+      },
     },
-  },
   });
   const finalMessages = run.getRunMessages();
   if (finalMessages) {
