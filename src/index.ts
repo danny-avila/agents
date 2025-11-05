@@ -9,6 +9,7 @@ export * from './messages';
 export * from './graphs';
 
 /* Tools */
+export * from './tools/Calculator';
 export * from './tools/CodeExecutor';
 export * from './tools/handlers';
 export * from './tools/search';
