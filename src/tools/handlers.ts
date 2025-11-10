@@ -133,7 +133,7 @@ export const handleToolCalls = async (
     let prevStepId = '';
     let prevRunStep: t.RunStep | undefined;
     try {
-      prevStepId = graph.getStepIdByKey(stepKey, graph.contentData.length - 1);
+      prevStepId = graph.getStepIdByKey(stepKey);
       prevRunStep = graph.getRunStep(prevStepId);
     } catch {
       // no previous step
