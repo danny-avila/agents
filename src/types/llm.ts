@@ -66,8 +66,10 @@ export type VertexAIClientOptions = ChatVertexAIInput & {
 export type BedrockAnthropicInput = ChatBedrockConverseInput & {
   additionalModelRequestFields?: ChatBedrockConverseInput['additionalModelRequestFields'] &
     AnthropicReasoning;
+  promptCache?: boolean;
 };
 export type BedrockConverseClientOptions = ChatBedrockConverseInput;
+export type BedrockAnthropicClientOptions = BedrockAnthropicInput;
 export type GoogleClientOptions = GoogleGenerativeAIChatInput & {
   customHeaders?: RequestOptions['customHeaders'];
   thinkingConfig?: GeminiGenerationConfig['thinkingConfig'];

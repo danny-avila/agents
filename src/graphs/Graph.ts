@@ -39,6 +39,7 @@ import {
 import {
   formatAnthropicArtifactContent,
   convertMessagesToContent,
+  addBedrockCacheControl,
   modifyDeltaProperties,
   formatArtifactPayload,
   formatContentStrings,
@@ -661,6 +662,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           anthropicBeta.includes('prompt-caching')
         ) {
           finalMessages = addCacheControl<BaseMessage>(finalMessages);
+        }
+      } else if (agentContext.provider === Providers.BEDROCK) {
+        const bedrockOptions = agentContext.clientOptions as
+          | t.BedrockAnthropicClientOptions
+          | undefined;
+        if (bedrockOptions?.promptCache === true) {
+          finalMessages = addBedrockCacheControl<BaseMessage>(finalMessages);
         }
       }
 
