@@ -14,6 +14,7 @@ import {
 import { createSearchAPI, createSourceProcessor } from './search';
 import { createSerperScraper } from './serper-scraper';
 import { createFirecrawlScraper } from './firecrawl';
+import { createTavilyScraper } from './tavily-scraper';
 import { expandHighlights } from './highlights';
 import { formatResultsForLLM } from './format';
 import { createDefaultLogger } from './utils';
@@ -332,6 +333,12 @@ Use anchor marker(s) immediately after the statement:
  * Supports multiple scraper providers:
  * - Firecrawl (default): Full-featured web scraping with multiple formats
  * - Serper: Lightweight scraping using Serper's scrape API
+ * - Tavily: AI-powered extraction with basic/advanced depth options
+ *
+ * Supports multiple search providers:
+ * - Serper: Google search results via Serper API
+ * - SearXNG: Self-hosted meta-search engine
+ * - Tavily: AI-optimized search engine for LLMs
  *
  * @example
  * ```typescript
@@ -348,6 +355,13 @@ Use anchor marker(s) immediately after the statement:
  *   scraperProvider: 'serper',
  *   serperApiKey: 'your-serper-key'
  * });
+ *
+ * // Using Tavily as both search and scraper provider
+ * const searchTool = createSearchTool({
+ *   searchProvider: 'tavily',
+ *   scraperProvider: 'tavily',
+ *   tavilyApiKey: 'your-tavily-key'
+ * });
  * ```
  *
  * @param config - The search tool configuration
@@ -361,6 +375,8 @@ export const createSearchTool = (
     serperApiKey,
     searxngInstanceUrl,
     searxngApiKey,
+    tavilyApiKey,
+    tavilyApiUrl,
     rerankerType = 'cohere',
     topResults = 5,
     strategies = ['no_extraction'],
@@ -372,6 +388,7 @@ export const createSearchTool = (
     firecrawlVersion,
     firecrawlOptions,
     serperScraperOptions,
+    tavilyScraperOptions,
     scraperTimeout,
     jinaApiKey,
     jinaApiUrl,
@@ -397,7 +414,7 @@ export const createSearchTool = (
     news: newsSchema,
   };
 
-  if (searchProvider === 'serper') {
+  if (searchProvider === 'serper' || searchProvider === 'tavily') {
     schemaObject.country = countrySchema;
   }
 
@@ -408,6 +425,8 @@ export const createSearchTool = (
     serperApiKey,
     searxngInstanceUrl,
     searxngApiKey,
+    tavilyApiKey,
+    tavilyApiUrl,
   });
 
   /** Create scraper based on scraperProvider */
@@ -418,6 +437,14 @@ export const createSearchTool = (
       ...serperScraperOptions,
       apiKey: serperApiKey,
       timeout: scraperTimeout ?? serperScraperOptions?.timeout,
+      logger,
+    });
+  } else if (scraperProvider === 'tavily') {
+    scraperInstance = createTavilyScraper({
+      ...tavilyScraperOptions,
+      apiKey: tavilyApiKey ?? process.env.TAVILY_API_KEY,
+      apiUrl: tavilyApiUrl,
+      timeout: scraperTimeout ?? tavilyScraperOptions?.timeout,
       logger,
     });
   } else {
