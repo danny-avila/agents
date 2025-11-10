@@ -408,6 +408,168 @@ const createSearXNGAPI = (
   return { getSources };
 };
 
+const createTavilyAPI = (
+  apiKey?: string,
+  apiUrl?: string
+): {
+  getSources: (params: t.GetSourcesParams) => Promise<t.SearchResult>;
+} => {
+  const config = {
+    apiKey: apiKey ?? process.env.TAVILY_API_KEY,
+    apiUrl:
+      apiUrl ?? process.env.TAVILY_API_URL ?? 'https://api.tavily.com/search',
+    timeout: 60000,
+  };
+
+  if (config.apiKey == null || config.apiKey === '') {
+    throw new Error('TAVILY_API_KEY is required for Tavily API');
+  }
+
+  const getSources = async ({
+    query,
+    date,
+    numResults = 8,
+    type,
+    news,
+  }: t.GetSourcesParams): Promise<t.SearchResult> => {
+    if (!query.trim()) {
+      return { success: false, error: 'Query cannot be empty' };
+    }
+
+    try {
+      // Map DATE_RANGE to Tavily time_range format
+      let timeRange: string | undefined;
+      if (date != null) {
+        const timeRangeMap: Record<string, string> = {
+          h: 'day',
+          d: 'day',
+          w: 'week',
+          m: 'month',
+          y: 'year',
+        };
+        timeRange = timeRangeMap[date] ?? 'day';
+      }
+
+      // Determine topic based on type or news flag
+      const topic = news || type === 'news' ? 'news' : 'general';
+
+      const payload: {
+        query: string;
+        search_depth?: 'basic' | 'advanced';
+        topic?: 'general' | 'news';
+        max_results?: number;
+        time_range?: string;
+        include_images?: boolean;
+        include_raw_content?: boolean;
+      } = {
+        query,
+        search_depth: 'advanced',
+        topic,
+        max_results: Math.min(Math.max(1, numResults), 20),
+      };
+
+      if (timeRange) {
+        payload.time_range = timeRange;
+      }
+
+      // Include images if type is images
+      if (type === 'images') {
+        payload.include_images = true;
+      }
+
+      const response = await axios.post(config.apiUrl, payload, {
+        headers: {
+          Authorization: `Bearer ${config.apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: config.timeout,
+      });
+
+      const data = response.data;
+
+      // Transform Tavily results to match SearchResultData format
+      const organicResults: t.OrganicResult[] = (data.results ?? []).map(
+        (result: {
+          title?: string;
+          url?: string;
+          content?: string;
+          score?: number;
+          published_date?: string;
+        }) => ({
+          title: result.title ?? '',
+          link: result.url ?? '',
+          snippet: result.content ?? '',
+          date: result.published_date,
+        })
+      );
+
+      // Extract images if available
+      const imageResults: t.ImageResult[] = Array.isArray(data.images)
+        ? data.images
+          .slice(0, 6)
+          .map(
+            (
+              image: string | { url?: string; description?: string },
+              index: number
+            ) => {
+              if (typeof image === 'string') {
+                return {
+                  imageUrl: image,
+                  position: index + 1,
+                };
+              } else {
+                return {
+                  imageUrl: image.url ?? '',
+                  position: index + 1,
+                };
+              }
+            }
+          )
+        : [];
+
+      // For news topic, treat results as top stories
+      const topStories: t.TopStoryResult[] =
+        topic === 'news'
+          ? organicResults.slice(0, 5).map((result) => ({
+            title: result.title,
+            link: result.link,
+            source: new URL(result.link).hostname,
+            date: result.date,
+          }))
+          : [];
+
+      const results: t.SearchResultData = {
+        organic: organicResults,
+        images: imageResults,
+        topStories: topStories,
+        videos: [],
+        news:
+          topic === 'news'
+            ? organicResults.map((r) => ({
+              title: r.title,
+              link: r.link,
+              snippet: r.snippet,
+              date: r.date,
+              source: new URL(r.link).hostname,
+            }))
+            : [],
+        relatedSearches: [],
+      };
+
+      return { success: true, data: results };
+    } catch (error) {
+      const errorMessage =
+        error instanceof Error ? error.message : String(error);
+      return {
+        success: false,
+        error: `Tavily API request failed: ${errorMessage}`,
+      };
+    }
+  };
+
+  return { getSources };
+};
+
 export const createSearchAPI = (
   config: t.SearchConfig
 ): {
@@ -418,15 +580,19 @@ export const createSearchAPI = (
     serperApiKey,
     searxngInstanceUrl,
     searxngApiKey,
+    tavilyApiKey,
+    tavilyApiUrl,
   } = config;
 
   if (searchProvider.toLowerCase() === 'serper') {
     return createSerperAPI(serperApiKey);
   } else if (searchProvider.toLowerCase() === 'searxng') {
     return createSearXNGAPI(searxngInstanceUrl, searxngApiKey);
+  } else if (searchProvider.toLowerCase() === 'tavily') {
+    return createTavilyAPI(tavilyApiKey, tavilyApiUrl);
   } else {
     throw new Error(
-      `Invalid search provider: ${searchProvider}. Must be 'serper' or 'searxng'`
+      `Invalid search provider: ${searchProvider}. Must be 'serper', 'searxng', or 'tavily'`
     );
   }
 };
@@ -472,11 +638,12 @@ export const createSourceProcessor = (
           const promise: Promise<t.ScrapeResult> = scraper
             .scrapeUrl(currentLink, {})
             .then(([url, response]) => {
-              const attribution = getAttribution(
-                url,
-                response.data?.metadata,
-                logger_
-              );
+              // Extract metadata based on response type
+              const metadata =
+                'metadata' in (response.data || {})
+                  ? (response.data as { metadata?: t.ScrapeMetadata }).metadata
+                  : undefined;
+              const attribution = getAttribution(url, metadata, logger_);
               if (response.success && response.data) {
                 const [content, references] = scraper.extractContent(response);
                 return {
