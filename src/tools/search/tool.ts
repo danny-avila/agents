@@ -14,6 +14,7 @@ import {
 import { createSearchAPI, createSourceProcessor } from './search';
 import { createSerperScraper } from './serper-scraper';
 import { createFirecrawlScraper } from './firecrawl';
+import { createCrawl4AIScraper } from './crawl4ai-scraper';
 import { expandHighlights } from './highlights';
 import { formatResultsForLLM } from './format';
 import { createDefaultLogger } from './utils';
@@ -372,6 +373,9 @@ export const createSearchTool = (
     firecrawlVersion,
     firecrawlOptions,
     serperScraperOptions,
+    crawl4aiApiKey,
+    crawl4aiApiUrl,
+    crawl4aiOptions,
     scraperTimeout,
     jinaApiKey,
     jinaApiUrl,
@@ -418,6 +422,14 @@ export const createSearchTool = (
       ...serperScraperOptions,
       apiKey: serperApiKey,
       timeout: scraperTimeout ?? serperScraperOptions?.timeout,
+      logger,
+    });
+  } else if (scraperProvider === 'crawl4ai') {
+    scraperInstance = createCrawl4AIScraper({
+      ...crawl4aiOptions,
+      apiKey: crawl4aiApiKey,
+      apiUrl: crawl4aiApiUrl,
+      timeout: scraperTimeout ?? crawl4aiOptions?.timeout,
       logger,
     });
   } else {

@@ -5,7 +5,7 @@ import type { BaseReranker } from './rerankers';
 import { DATE_RANGE } from './schema';
 
 export type SearchProvider = 'serper' | 'searxng';
-export type ScraperProvider = 'firecrawl' | 'serper';
+export type ScraperProvider = 'firecrawl' | 'serper' | 'crawl4ai';
 export type RerankerType = 'infinity' | 'jina' | 'cohere' | 'none';
 
 export interface Highlight {
@@ -107,6 +107,15 @@ export interface SerperScraperConfig {
   includeMarkdown?: boolean;
 }
 
+export interface Crawl4AIScraperConfig {
+  apiKey?: string;
+  apiUrl?: string;
+  timeout?: number;
+  logger?: Logger;
+  extractionStrategy?: string;
+  chunkingStrategy?: string;
+}
+
 export interface ScraperContentResult {
   content: string;
 }
@@ -164,6 +173,9 @@ export interface SearchToolConfig
   scraperProvider?: ScraperProvider;
   scraperTimeout?: number;
   serperScraperOptions?: SerperScraperConfig;
+  crawl4aiApiKey?: string;
+  crawl4aiApiUrl?: string;
+  crawl4aiOptions?: Crawl4AIScraperConfig;
   onSearchResults?: (
     results: SearchResult,
     runnableConfig?: RunnableConfig
@@ -187,12 +199,12 @@ export interface BaseScraper {
   scrapeUrl(
     url: string,
     options?: unknown
-  ): Promise<[string, FirecrawlScrapeResponse | SerperScrapeResponse]>;
+  ): Promise<[string, FirecrawlScrapeResponse | SerperScrapeResponse | Crawl4AIScrapeResponse]>;
   extractContent(
-    response: FirecrawlScrapeResponse | SerperScrapeResponse
+    response: FirecrawlScrapeResponse | SerperScrapeResponse | Crawl4AIScrapeResponse
   ): [string, undefined | References];
   extractMetadata(
-    response: FirecrawlScrapeResponse | SerperScrapeResponse
+    response: FirecrawlScrapeResponse | SerperScrapeResponse | Crawl4AIScrapeResponse
   ):
     | ScrapeMetadata
     | Record<string, string | number | boolean | null | undefined>;
@@ -206,6 +218,11 @@ export type FirecrawlScrapeOptions = Omit<
 
 export type SerperScrapeOptions = Omit<
   SerperScraperConfig,
+  'apiKey' | 'apiUrl' | 'logger'
+>;
+
+export type Crawl4AIScrapeOptions = Omit<
+  Crawl4AIScraperConfig,
   'apiKey' | 'apiUrl' | 'logger'
 >;
 
@@ -291,6 +308,17 @@ export interface SerperScrapeResponse {
     markdown?: string;
     metadata?: Record<string, string | number | boolean | null | undefined>;
     credits?: number;
+  };
+  error?: string;
+}
+
+export interface Crawl4AIScrapeResponse {
+  success: boolean;
+  data?: {
+    markdown?: string;
+    text?: string;
+    html?: string;
+    metadata?: Record<string, string | number | boolean | null | undefined>;
   };
   error?: string;
 }
