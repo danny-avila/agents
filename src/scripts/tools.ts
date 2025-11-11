@@ -2,15 +2,16 @@
 // src/scripts/cli.ts
 import { config } from 'dotenv';
 config();
+
 import { HumanMessage, BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
 import { ChatModelStreamHandler, createContentAggregator } from '@/stream';
 import { ToolEndHandler, ModelEndHandler } from '@/events';
-
+import { GraphEvents, Providers } from '@/common';
+import { getLLMConfig } from '@/utils/llmConfig';
+import { Calculator } from '@/tools/Calculator';
 import { getArgs } from '@/scripts/args';
 import { Run } from '@/run';
-import { GraphEvents, Callback } from '@/common';
-import { getLLMConfig } from '@/utils/llmConfig';
 
 const conversationHistory: BaseMessage[] = [];
 async function testStandardStreaming(): Promise<void> {
@@ -89,12 +90,16 @@ async function testStandardStreaming(): Promise<void> {
 
   const llmConfig = getLLMConfig(provider);
 
+  if (llmConfig.provider === Providers.BEDROCK) {
+    (llmConfig as t.BedrockAnthropicInput).promptCache = true;
+  }
+
   const run = await Run.create<t.IState>({
     runId: 'test-run-id',
     graphConfig: {
       type: 'standard',
       llmConfig,
-      tools: [],
+      tools: [new Calculator()],
       instructions:
         'You are a friendly AI assistant. Always address the user by their name.',
       additional_instructions: `The user's name is ${userName} and they are located in ${location}.`,
@@ -114,13 +119,9 @@ async function testStandardStreaming(): Promise<void> {
     version: 'v2' as const,
   };
 
-  console.log('Test 1: Weather query (content parts test)');
+  console.log('Test 1: Calculation query');
 
-  const userMessage = `
-  Make a search for the weather in ${location} today, which is ${currentDate}.
-  Make sure to always refer to me by name, which is ${userName}.
-  After giving me a thorough summary, tell me a joke about the weather forecast we went over.
-  `;
+  const userMessage = `What is 1123123 + 123123 / 20348?`;
 
   conversationHistory.push(new HumanMessage(userMessage));
 

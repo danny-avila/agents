@@ -10,7 +10,7 @@ import { createSearchTool } from '@/tools/search';
 
 import { getArgs } from '@/scripts/args';
 import { Run } from '@/run';
-import { GraphEvents, Callback } from '@/common';
+import { GraphEvents, Callback, Providers } from '@/common';
 import { getLLMConfig } from '@/utils/llmConfig';
 
 const conversationHistory: BaseMessage[] = [];
@@ -71,6 +71,10 @@ async function testStandardStreaming(): Promise<void> {
   };
 
   const llmConfig = getLLMConfig(provider);
+
+  if (llmConfig.provider === Providers.BEDROCK) {
+    (llmConfig as t.BedrockAnthropicInput).promptCache = true;
+  }
 
   const run = await Run.create<t.IState>({
     runId: 'test-run-id',
