@@ -330,7 +330,7 @@ describe('addBedrockCacheControl (Bedrock cache checkpoints)', () => {
     expect(second[2]).toEqual({ cachePoint: { type: 'default' } });
   });
 
-  it('appends cachePoint when content is an empty array', () => {
+  it('skips adding cachePoint when content is an empty array', () => {
     const messages: TestMsg[] = [
       { role: 'user', content: [] },
       { role: 'assistant', content: [] },
@@ -346,8 +346,21 @@ describe('addBedrockCacheControl (Bedrock cache checkpoints)', () => {
     expect(first.length).toBe(0);
 
     expect(Array.isArray(second)).toBe(true);
-    expect(second.length).toBe(1);
-    expect(second[0]).toEqual({ cachePoint: { type: 'default' } });
+    expect(second.length).toBe(0);
+    expect(second[0]).not.toEqual({ cachePoint: { type: 'default' } });
+  });
+
+  it('skips adding cachePoint when content is an empty string', () => {
+    const messages: TestMsg[] = [
+      { role: 'user', content: '' },
+      { role: 'assistant', content: '' },
+      { role: 'user', content: 'ignored because only last two are modified' },
+    ];
+
+    const result = addBedrockCacheControl(messages);
+
+    expect(result[0].content).toBe('');
+    expect(result[1].content).toBe('');
   });
 
   /** (I don't think this will ever occur in actual use, but its the only branch left uncovered so I'm covering it */
