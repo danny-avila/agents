@@ -83,7 +83,20 @@ export function addBedrockCacheControl<
     i--
   ) {
     const message = updatedMessages[i];
+
+    if (
+      'getType' in message &&
+      typeof message.getType === 'function' &&
+      message.getType() === 'tool'
+    ) {
+      continue;
+    }
+
     const content = message.content;
+
+    if (typeof content === 'string' && content === '') {
+      continue;
+    }
 
     if (typeof content === 'string') {
       message.content = [
@@ -95,11 +108,29 @@ export function addBedrockCacheControl<
     }
 
     if (Array.isArray(content)) {
+      let hasCacheableContent = false;
+      for (const block of content) {
+        if (block.type === ContentTypes.TEXT) {
+          if (typeof block.text === 'string' && block.text !== '') {
+            hasCacheableContent = true;
+            break;
+          }
+        }
+      }
+
+      if (!hasCacheableContent) {
+        continue;
+      }
+
       let inserted = false;
       for (let j = content.length - 1; j >= 0; j--) {
         const block = content[j] as MessageContentComplex;
         const type = (block as { type?: string }).type;
         if (type === ContentTypes.TEXT || type === 'text') {
+          const text = (block as { text?: string }).text;
+          if (text === '' || text === undefined) {
+            continue;
+          }
           content.splice(j + 1, 0, {
             cachePoint: { type: 'default' },
           } as MessageContentComplex);
