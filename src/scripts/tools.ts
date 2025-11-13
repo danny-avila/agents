@@ -121,7 +121,7 @@ async function testStandardStreaming(): Promise<void> {
 
   console.log('Test 1: Calculation query');
 
-  const userMessage = `What is 1123123 + 123123 / 20348?`;
+  const userMessage = `What is 1123123 + 123123 / 20348? After that, run some interesting calculations based off the result`;
 
   conversationHistory.push(new HumanMessage(userMessage));
 
