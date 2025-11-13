@@ -691,6 +691,16 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       const fallbacks =
         (agentContext.clientOptions as t.LLMConfig | undefined)?.fallbacks ??
         [];
+
+      if (finalMessages.length === 0) {
+        throw new Error(
+          JSON.stringify({
+            type: 'empty_messages',
+            info: 'Message pruning removed all messages as none fit in the context window. Please increase the context window size or make your message shorter.',
+          })
+        );
+      }
+
       try {
         result = await this.attemptInvoke(
           {
