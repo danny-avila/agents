@@ -481,6 +481,21 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         | undefined;
 
       const toolCallArgs = (contentPart.tool_call as t.ToolCallPart).args;
+      const incomingName = contentPart.tool_call.name;
+      const incomingId = contentPart.tool_call.id;
+
+      // When we receive a tool call with a name, it's the complete tool call
+      // Consolidate with any previously accumulated args from chunks
+      const hasValidName = incomingName != null && incomingName !== '';
+      const existingHasValidName =
+        existingContent?.tool_call?.name != null &&
+        existingContent.tool_call.name !== '';
+
+      // If incoming has no valid name and existing has no valid name, skip (incomplete data)
+      if (!hasValidName && !existingHasValidName) {
+        return;
+      }
+
       /** When args are a valid object, they are likely already invoked */
       let args =
         finalUpdate ||
@@ -497,15 +512,10 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       }
 
       const id =
-        getNonEmptyValue([
-          contentPart.tool_call.id,
-          existingContent?.tool_call?.id,
-        ]) ?? '';
+        getNonEmptyValue([incomingId, existingContent?.tool_call?.id]) ?? '';
       const name =
-        getNonEmptyValue([
-          contentPart.tool_call.name,
-          existingContent?.tool_call?.name,
-        ]) ?? '';
+        getNonEmptyValue([incomingName, existingContent?.tool_call?.name]) ??
+        '';
 
       const newToolCall: ToolCall & t.PartMetadata = {
         id,
