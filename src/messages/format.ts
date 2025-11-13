@@ -310,18 +310,24 @@ function formatAssistantMessage(
         });
         formattedMessages.push(lastAIMessage);
       } else if (part.type === ContentTypes.TOOL_CALL) {
-        if (!lastAIMessage) {
-          // "Heal" the payload by creating an AIMessage to precede the tool call
-          lastAIMessage = new AIMessage({ content: '' });
-          formattedMessages.push(lastAIMessage);
-        }
-
         // Note: `tool_calls` list is defined when constructed by `AIMessage` class, and outputs should be excluded from it
         const {
           output,
           args: _args,
           ..._tool_call
         } = part.tool_call as ToolCallPart;
+
+        // Skip invalid tool calls that have no name AND no output
+        if (!_tool_call.name && (output == null || output === '')) {
+          continue;
+        }
+
+        if (!lastAIMessage) {
+          // "Heal" the payload by creating an AIMessage to precede the tool call
+          lastAIMessage = new AIMessage({ content: '' });
+          formattedMessages.push(lastAIMessage);
+        }
+
         const tool_call: ToolCallPart = _tool_call;
         // TODO: investigate; args as dictionary may need to be providers-or-tool-specific
         let args: any = _args;

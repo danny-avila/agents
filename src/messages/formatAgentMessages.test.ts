@@ -914,4 +914,171 @@ describe('formatAgentMessages', () => {
 
     expect(totalTokens).toBe(10);
   });
+
+  it('should skip invalid tool calls with no name AND no output', () => {
+    const payload = [
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]: 'Let me help you with that.',
+            tool_call_ids: ['valid_tool_1'],
+          },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 'invalid_tool_1',
+              name: '',
+              args: '{"query":"test"}',
+              output: '',
+            },
+          },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 'valid_tool_1',
+              name: 'search',
+              args: '{"query":"weather"}',
+              output: 'The weather is sunny.',
+            },
+          },
+        ],
+      },
+    ];
+
+    const result = formatAgentMessages(payload);
+
+    // Should have 2 messages: AIMessage and ToolMessage (invalid tool call is skipped)
+    expect(result.messages).toHaveLength(2);
+    expect(result.messages[0]).toBeInstanceOf(AIMessage);
+    expect(result.messages[1]).toBeInstanceOf(ToolMessage);
+
+    // The AIMessage should only have 1 tool call (the valid one)
+    expect((result.messages[0] as AIMessage).tool_calls).toHaveLength(1);
+    expect((result.messages[0] as AIMessage).tool_calls?.[0].name).toBe(
+      'search'
+    );
+    expect((result.messages[0] as AIMessage).tool_calls?.[0].id).toBe(
+      'valid_tool_1'
+    );
+
+    // The ToolMessage should be for the valid tool call
+    expect((result.messages[1] as ToolMessage).tool_call_id).toBe(
+      'valid_tool_1'
+    );
+    expect(result.messages[1].name).toBe('search');
+    expect(result.messages[1].content).toBe('The weather is sunny.');
+  });
+
+  it('should skip tool calls with no name AND null output', () => {
+    const payload = [
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 'invalid_tool_1',
+              name: '',
+              args: '{"query":"test"}',
+              output: null,
+            },
+          },
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]: 'Here is the information.',
+          },
+        ],
+      },
+    ];
+
+    const result = formatAgentMessages(payload);
+
+    // Should have 1 message: AIMessage (invalid tool call is skipped)
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0]).toBeInstanceOf(AIMessage);
+
+    // The AIMessage should have no tool calls or an empty array
+    const toolCalls = (result.messages[0] as AIMessage).tool_calls;
+    expect(toolCalls === undefined || toolCalls.length === 0).toBe(true);
+    expect(result.messages[0].content).toStrictEqual([
+      {
+        type: ContentTypes.TEXT,
+        [ContentTypes.TEXT]: 'Here is the information.',
+      },
+    ]);
+  });
+
+  it('should NOT skip tool calls with no name but valid output', () => {
+    const payload = [
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 'tool_1',
+              name: '',
+              args: '{"query":"test"}',
+              output: 'Valid output despite missing name',
+            },
+          },
+        ],
+      },
+    ];
+
+    const result = formatAgentMessages(payload);
+
+    // Should have 2 messages: AIMessage and ToolMessage
+    expect(result.messages).toHaveLength(2);
+    expect(result.messages[0]).toBeInstanceOf(AIMessage);
+    expect(result.messages[1]).toBeInstanceOf(ToolMessage);
+
+    // The AIMessage should have 1 tool call
+    expect((result.messages[0] as AIMessage).tool_calls).toHaveLength(1);
+
+    // The ToolMessage should have the output
+    expect((result.messages[1] as ToolMessage).tool_call_id).toBe('tool_1');
+    expect(result.messages[1].content).toBe(
+      'Valid output despite missing name'
+    );
+  });
+
+  it('should NOT skip tool calls with valid name but no output', () => {
+    const payload = [
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 'tool_1',
+              name: 'search',
+              args: '{"query":"test"}',
+              output: '',
+            },
+          },
+        ],
+      },
+    ];
+
+    const result = formatAgentMessages(payload);
+
+    // Should have 2 messages: AIMessage and ToolMessage
+    expect(result.messages).toHaveLength(2);
+    expect(result.messages[0]).toBeInstanceOf(AIMessage);
+    expect(result.messages[1]).toBeInstanceOf(ToolMessage);
+
+    // The AIMessage should have 1 tool call
+    expect((result.messages[0] as AIMessage).tool_calls).toHaveLength(1);
+    expect((result.messages[0] as AIMessage).tool_calls?.[0].name).toBe(
+      'search'
+    );
+
+    // The ToolMessage should have empty content
+    expect((result.messages[1] as ToolMessage).tool_call_id).toBe('tool_1');
+    expect(result.messages[1].name).toBe('search');
+    expect(result.messages[1].content).toBe('');
+  });
 });
