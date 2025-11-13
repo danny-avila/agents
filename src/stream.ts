@@ -474,27 +474,25 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       partType === ContentTypes.TOOL_CALL &&
       'tool_call' in contentPart
     ) {
+      const incomingName = contentPart.tool_call.name;
+      const incomingId = contentPart.tool_call.id;
+      const toolCallArgs = (contentPart.tool_call as t.ToolCallPart).args;
+
+      // When we receive a tool call with a name, it's the complete tool call
+      // Consolidate with any previously accumulated args from chunks
+      const hasValidName = incomingName != null && incomingName !== '';
+
+      // Only process if incoming has a valid name (complete tool call)
+      // or if we're doing a final update with complete data
+      if (!hasValidName && !finalUpdate) {
+        return;
+      }
+
       const existingContent = contentParts[index] as
         | (Omit<t.ToolCallContent, 'tool_call'> & {
             tool_call?: t.ToolCallPart;
           })
         | undefined;
-
-      const toolCallArgs = (contentPart.tool_call as t.ToolCallPart).args;
-      const incomingName = contentPart.tool_call.name;
-      const incomingId = contentPart.tool_call.id;
-
-      // When we receive a tool call with a name, it's the complete tool call
-      // Consolidate with any previously accumulated args from chunks
-      const hasValidName = incomingName != null && incomingName !== '';
-      const existingHasValidName =
-        existingContent?.tool_call?.name != null &&
-        existingContent.tool_call.name !== '';
-
-      // If incoming has no valid name and existing has no valid name, skip (incomplete data)
-      if (!hasValidName && !existingHasValidName) {
-        return;
-      }
 
       /** When args are a valid object, they are likely already invoked */
       let args =

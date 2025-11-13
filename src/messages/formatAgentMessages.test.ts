@@ -71,6 +71,66 @@ describe('formatAgentMessages', () => {
     expect((result.messages[1] as ToolMessage).tool_call_id).toBe('123');
   });
 
+  it('should handle malformed tool call entries with missing tool_call property', () => {
+    const tools = new Set(['search']);
+    const payload = [
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]: 'Let me check that.',
+            tool_call_ids: ['123'],
+          },
+          {
+            type: ContentTypes.TOOL_CALL,
+            // Missing tool_call property - should not crash
+          },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: '123',
+              name: 'search',
+              args: '{"query":"test"}',
+              output: 'Result',
+            },
+          },
+        ],
+      },
+    ];
+    // Should not throw error
+    const result = formatAgentMessages(payload, undefined, tools);
+    expect(result.messages).toBeDefined();
+    expect(result.messages.length).toBeGreaterThan(0);
+  });
+
+  it('should handle malformed tool call entries with missing name', () => {
+    const tools = new Set(['search']);
+    const payload = [
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]: 'Checking...',
+          },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: '456',
+              // Missing name property
+              args: '{}',
+            },
+          },
+        ],
+      },
+    ];
+    // Should not throw error
+    const result = formatAgentMessages(payload, undefined, tools);
+    expect(result.messages).toBeDefined();
+    expect(result.messages.length).toBeGreaterThan(0);
+  });
+
   it('should handle multiple content parts in assistant messages', () => {
     const payload = [
       {

@@ -281,7 +281,7 @@ export type ToolCallPart = {
   /** Type ("tool_call") according to Assistants Tool Call Structure */
   type: ContentTypes.TOOL_CALL;
   /** The name of the tool to be called */
-  name: string;
+  name?: string;
   /** The arguments to the tool call */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   args?: string | Record<string, any>;

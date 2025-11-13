@@ -310,6 +310,11 @@ function formatAssistantMessage(
         });
         formattedMessages.push(lastAIMessage);
       } else if (part.type === ContentTypes.TOOL_CALL) {
+        // Skip malformed tool call entries without tool_call property
+        if (!part.tool_call) {
+          continue;
+        }
+
         // Note: `tool_calls` list is defined when constructed by `AIMessage` class, and outputs should be excluded from it
         const {
           output,
@@ -453,6 +458,15 @@ export const formatAgentMessages = (
             if (tools.size === 0) {
               hasInvalidTool = true;
               break;
+            }
+            // Protect against malformed tool call entries
+            if (
+              !part.tool_call ||
+              part.tool_call.name == null ||
+              part.tool_call.name === ''
+            ) {
+              hasInvalidTool = true;
+              continue;
             }
             const toolName = part.tool_call.name;
             toolNames.push(toolName);
