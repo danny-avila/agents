@@ -199,12 +199,23 @@ export interface BaseScraper {
   scrapeUrl(
     url: string,
     options?: unknown
-  ): Promise<[string, FirecrawlScrapeResponse | SerperScrapeResponse | Crawl4AIScrapeResponse]>;
+  ): Promise<
+    [
+      string,
+      FirecrawlScrapeResponse | SerperScrapeResponse | Crawl4AIScrapeResponse,
+    ]
+  >;
   extractContent(
-    response: FirecrawlScrapeResponse | SerperScrapeResponse | Crawl4AIScrapeResponse
+    response:
+      | FirecrawlScrapeResponse
+      | SerperScrapeResponse
+      | Crawl4AIScrapeResponse
   ): [string, undefined | References];
   extractMetadata(
-    response: FirecrawlScrapeResponse | SerperScrapeResponse | Crawl4AIScrapeResponse
+    response:
+      | FirecrawlScrapeResponse
+      | SerperScrapeResponse
+      | Crawl4AIScrapeResponse
   ):
     | ScrapeMetadata
     | Record<string, string | number | boolean | null | undefined>;
@@ -319,6 +330,17 @@ export interface Crawl4AIScrapeResponse {
     text?: string;
     html?: string;
     metadata?: Record<string, string | number | boolean | null | undefined>;
+    // /crawl endpoint returns results array
+    results?: Array<{
+      url?: string;
+      markdown?: {
+        raw_markdown?: string;
+        markdown_with_citations?: string;
+        references_markdown?: string;
+      };
+      html?: string;
+      metadata?: Record<string, string | number | boolean | null | undefined>;
+    }>;
   };
   error?: string;
 }

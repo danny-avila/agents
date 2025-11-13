@@ -52,7 +52,9 @@ export class Crawl4AIScraper implements t.BaseScraper {
     this.logger = config.logger || createDefaultLogger();
 
     if (!this.apiKey) {
-      this.logger.warn('CRAWL4AI_API_KEY is not set. Scraping will not work.');
+      this.logger.info(
+        'CRAWL4AI_API_KEY is not set. Using public/unauthenticated mode.'
+      );
     }
 
     this.logger.debug(
@@ -70,36 +72,24 @@ export class Crawl4AIScraper implements t.BaseScraper {
     url: string,
     options: t.Crawl4AIScrapeOptions = {}
   ): Promise<[string, t.Crawl4AIScrapeResponse]> {
-    if (!this.apiKey) {
-      return [
-        url,
-        {
-          success: false,
-          error: 'CRAWL4AI_API_KEY is not set',
-        },
-      ];
-    }
-
     try {
+      // Crawl4AI /md endpoint for simple markdown extraction
       const payload: Record<string, unknown> = {
         url,
+        cache: '0', // Bypass cache by default
       };
 
-      // Add extraction strategy if provided
-      if (options.extractionStrategy ?? this.extractionStrategy) {
-        payload.extractionStrategy = options.extractionStrategy ?? this.extractionStrategy;
+      // Build headers - only include Authorization if API key is provided
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+      };
+
+      if (this.apiKey) {
+        headers['Authorization'] = `Bearer ${this.apiKey}`;
       }
 
-      // Add chunking strategy if provided
-      if (options.chunkingStrategy ?? this.chunkingStrategy) {
-        payload.chunkingStrategy = options.chunkingStrategy ?? this.chunkingStrategy;
-      }
-
-      const response = await axios.post(this.apiUrl, payload, {
-        headers: {
-          'Authorization': `Bearer ${this.apiKey}`,
-          'Content-Type': 'application/json',
-        },
+      const response = await axios.post(`${this.apiUrl}/md`, payload, {
+        headers,
         timeout: options.timeout ?? this.timeout,
       });
 
@@ -130,11 +120,36 @@ export class Crawl4AIScraper implements t.BaseScraper {
       return ['', undefined];
     }
 
-    // Prefer markdown over text
+    // Crawl4AI /md endpoint returns markdown directly at root level
     if (response.data.markdown != null) {
       return [response.data.markdown, undefined];
     }
 
+    // Fallback for /crawl endpoint which returns results array
+    if (
+      response.data.results &&
+      Array.isArray(response.data.results) &&
+      response.data.results.length > 0
+    ) {
+      const result = response.data.results[0];
+
+      // Extract from markdown object (Crawl4AI /crawl structure)
+      if (result.markdown?.raw_markdown != null) {
+        return [result.markdown.raw_markdown, undefined];
+      }
+
+      // Fallback to markdown_with_citations if raw_markdown not available
+      if (result.markdown?.markdown_with_citations != null) {
+        return [result.markdown.markdown_with_citations, undefined];
+      }
+
+      // Fallback to HTML if no markdown
+      if (result.html != null) {
+        return [result.html, undefined];
+      }
+    }
+
+    // Fallback to text field
     if (response.data.text != null) {
       return [response.data.text, undefined];
     }
@@ -150,11 +165,28 @@ export class Crawl4AIScraper implements t.BaseScraper {
   extractMetadata(
     response: t.Crawl4AIScrapeResponse
   ): Record<string, string | number | boolean | null | undefined> {
-    if (!response.success || !response.data || !response.data.metadata) {
+    if (!response.success || !response.data) {
       return {};
     }
 
-    return response.data.metadata;
+    // Crawl4AI returns results array
+    if (
+      response.data.results &&
+      Array.isArray(response.data.results) &&
+      response.data.results.length > 0
+    ) {
+      const result = response.data.results[0];
+      if (result.metadata) {
+        return result.metadata;
+      }
+    }
+
+    // Legacy format support (if data has metadata directly)
+    if (response.data.metadata) {
+      return response.data.metadata;
+    }
+
+    return {};
   }
 }
 
