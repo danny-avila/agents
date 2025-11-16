@@ -308,12 +308,12 @@ function formatAssistantMessage(
         }
         // Create a new AIMessage with this text and prepare for tool calls
         lastAIMessage = new AIMessage({
-          content: part.text || '',
+          content: part.text != null ? part.text : '',
         });
         formattedMessages.push(lastAIMessage);
       } else if (part.type === ContentTypes.TOOL_CALL) {
         // Skip malformed tool call entries without tool_call property
-        if (!part.tool_call) {
+        if (part.tool_call == null) {
           continue;
         }
 
@@ -325,7 +325,10 @@ function formatAssistantMessage(
         } = part.tool_call as ToolCallPart;
 
         // Skip invalid tool calls that have no name AND no output
-        if (!_tool_call.name && (output == null || output === '')) {
+        if (
+          _tool_call.name == null ||
+          (_tool_call.name === '' && (output == null || output === ''))
+        ) {
           continue;
         }
 
@@ -358,7 +361,7 @@ function formatAssistantMessage(
           new ToolMessage({
             tool_call_id: tool_call.id ?? '',
             name: tool_call.name,
-            content: output || '',
+            content: output != null ? output : '',
           })
         );
       } else if (part.type === ContentTypes.THINK) {
@@ -463,7 +466,7 @@ export const formatAgentMessages = (
             }
             // Protect against malformed tool call entries
             if (
-              !part.tool_call ||
+              part.tool_call == null ||
               part.tool_call.name == null ||
               part.tool_call.name === ''
             ) {
@@ -495,7 +498,7 @@ export const formatAgentMessages = (
           // Check if this is a continuation of the tool sequence
           let isToolResponse = false;
           const content = payload[j].content;
-          if (content && Array.isArray(content)) {
+          if (content != null && Array.isArray(content)) {
             for (const part of content) {
               if (part.type === ContentTypes.TOOL_CALL) {
                 isToolResponse = true;
