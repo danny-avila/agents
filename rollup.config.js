@@ -2,10 +2,8 @@
 import path from 'path';
 import { fileURLToPath } from 'url';
 import alias from '@rollup/plugin-alias';
-import terser from '@rollup/plugin-terser';
 import commonjs from '@rollup/plugin-commonjs';
 import { cleandir } from 'rollup-plugin-cleandir';
-import obfuscator from 'rollup-plugin-obfuscator';
 import typescript from '@rollup/plugin-typescript';
 import { nodeResolve } from '@rollup/plugin-node-resolve';
 import json from '@rollup/plugin-json';
