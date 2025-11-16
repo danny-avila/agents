@@ -38,6 +38,7 @@ import {
 } from '@/common';
 import {
   formatAnthropicArtifactContent,
+  ensureThinkingBlockInMessages,
   convertMessagesToContent,
   addBedrockCacheControl,
   modifyDeltaProperties,
@@ -727,6 +728,26 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         if (bedrockOptions?.promptCache === true) {
           finalMessages = addBedrockCacheControl<BaseMessage>(finalMessages);
         }
+      }
+
+      /**
+       * Handle edge case: when switching from a non-thinking agent to a thinking-enabled agent,
+       * convert AI messages with tool calls to HumanMessages to avoid thinking block requirements.
+       * This is required by Anthropic/Bedrock when thinking is enabled.
+       */
+      const isAnthropicWithThinking =
+        (agentContext.provider === Providers.ANTHROPIC &&
+          (agentContext.clientOptions as t.AnthropicClientOptions).thinking !=
+            null) ||
+        (agentContext.provider === Providers.BEDROCK &&
+          (agentContext.clientOptions as t.BedrockAnthropicInput)
+            .additionalModelRequestFields?.['thinking'] != null);
+
+      if (isAnthropicWithThinking) {
+        finalMessages = ensureThinkingBlockInMessages(
+          finalMessages,
+          agentContext.provider
+        );
       }
 
       if (

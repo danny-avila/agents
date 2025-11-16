@@ -1,6 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import {
   AIMessage,
+  AIMessageChunk,
   ToolMessage,
   BaseMessage,
   HumanMessage,
@@ -10,6 +11,7 @@ import {
 import type { MessageContentImageUrl } from '@langchain/core/messages';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type {
+  ExtendedMessageContent,
   MessageContentComplex,
   ToolCallPart,
   TPayload,
@@ -608,4 +610,83 @@ export function shiftIndexTokenCountMap(
   }
 
   return shiftedMap;
+}
+
+/**
+ * Ensures compatibility when switching from a non-thinking agent to a thinking-enabled agent.
+ * Converts AI messages with tool calls (that lack thinking blocks) into buffer strings,
+ * avoiding the thinking block signature requirement.
+ *
+ * @param messages - Array of messages to process
+ * @param provider - The provider being used (unused but kept for future compatibility)
+ * @returns The messages array with tool sequences converted to buffer strings if necessary
+ */
+export function ensureThinkingBlockInMessages(
+  messages: BaseMessage[],
+  _provider: Providers
+): BaseMessage[] {
+  const result: BaseMessage[] = [];
+  let i = 0;
+
+  while (i < messages.length) {
+    const msg = messages[i];
+    const isAI = msg instanceof AIMessage || msg instanceof AIMessageChunk;
+
+    if (!isAI) {
+      result.push(msg);
+      i++;
+      continue;
+    }
+
+    const aiMsg = msg as AIMessage | AIMessageChunk;
+    const hasToolCalls = aiMsg.tool_calls && aiMsg.tool_calls.length > 0;
+    const contentIsArray = Array.isArray(aiMsg.content);
+
+    // Check if the message has tool calls or tool_use content
+    let hasToolUse = hasToolCalls ?? false;
+    let firstContentType: string | undefined;
+
+    if (contentIsArray && aiMsg.content.length > 0) {
+      const content = aiMsg.content as ExtendedMessageContent[];
+      firstContentType = content[0]?.type;
+      hasToolUse =
+        hasToolUse ||
+        content.some((c) => typeof c === 'object' && c.type === 'tool_use');
+    }
+
+    // If message has tool use but no thinking block, convert to buffer string
+    if (
+      hasToolUse &&
+      firstContentType !== ContentTypes.THINKING &&
+      firstContentType !== 'redacted_thinking'
+    ) {
+      // Collect the AI message and any following tool messages
+      const toolSequence: BaseMessage[] = [msg];
+      let j = i + 1;
+
+      // Look ahead for tool messages that belong to this AI message
+      while (j < messages.length && messages[j] instanceof ToolMessage) {
+        toolSequence.push(messages[j]);
+        j++;
+      }
+
+      // Convert the sequence to a buffer string and wrap in a HumanMessage
+      // This avoids the thinking block requirement which only applies to AI messages
+      const bufferString = getBufferString(toolSequence);
+      result.push(
+        new HumanMessage({
+          content: `[Previous agent context]\n${bufferString}`,
+        })
+      );
+
+      // Skip the messages we've processed
+      i = j;
+    } else {
+      // Keep the message as is
+      result.push(msg);
+      i++;
+    }
+  }
+
+  return result;
 }
