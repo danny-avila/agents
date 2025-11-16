@@ -333,7 +333,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    * Get all run steps, optionally filtered by agent ID
    */
   getRunSteps(agentId?: string): t.RunStep[] {
-    if (!agentId) {
+    if (agentId == null || agentId === '') {
       return [...this.contentData];
     }
     return this.contentData.filter((step) => step.agentId === agentId);
@@ -346,7 +346,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     const stepsByAgent = new Map<string, t.RunStep[]>();
 
     for (const step of this.contentData) {
-      if (!step.agentId) continue;
+      if (step.agentId == null || step.agentId === '') continue;
 
       const steps = stepsByAgent.get(step.agentId) ?? [];
       steps.push(step);
@@ -362,7 +362,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   getActiveAgentIds(): string[] {
     const agentIds = new Set<string>();
     for (const step of this.contentData) {
-      if (step.agentId) {
+      if (step.agentId != null && step.agentId !== '') {
         agentIds.add(step.agentId);
       }
     }
@@ -377,7 +377,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     const contentPartAgentMap = new Map<number, string>();
 
     for (const step of this.contentData) {
-      if (step.agentId && step.index != null) {
+      if (
+        step.agentId != null &&
+        step.agentId !== '' &&
+        Number.isFinite(step.index)
+      ) {
         contentPartAgentMap.set(step.index, step.agentId);
       }
     }
