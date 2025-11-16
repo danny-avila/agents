@@ -26,10 +26,12 @@ export async function handleToolCallChunks({
   graph,
   stepKey,
   toolCallChunks,
+  metadata,
 }: {
   graph: StandardGraph | MultiAgentGraph;
   stepKey: string;
   toolCallChunks: ToolCallChunk[];
+  metadata?: Record<string, unknown>;
 }): Promise<void> {
   let prevStepId: string;
   let prevRunStep: t.RunStep | undefined;
@@ -39,12 +41,16 @@ export async function handleToolCallChunks({
   } catch {
     /** Edge Case: If no previous step exists, create a new message creation step */
     const message_id = getMessageId(stepKey, graph, true) ?? '';
-    prevStepId = await graph.dispatchRunStep(stepKey, {
-      type: StepTypes.MESSAGE_CREATION,
-      message_creation: {
-        message_id,
+    prevStepId = await graph.dispatchRunStep(
+      stepKey,
+      {
+        type: StepTypes.MESSAGE_CREATION,
+        message_creation: {
+          message_id,
+        },
       },
-    });
+      metadata
+    );
     prevRunStep = graph.getRunStep(prevStepId);
   }
 
@@ -92,10 +98,14 @@ export async function handleToolCallChunks({
       ],
     });
     graph.messageStepHasToolCalls.set(prevStepId, true);
-    stepId = await graph.dispatchRunStep(stepKey, {
-      type: StepTypes.TOOL_CALLS,
-      tool_calls,
-    });
+    stepId = await graph.dispatchRunStep(
+      stepKey,
+      {
+        type: StepTypes.TOOL_CALLS,
+        tool_calls,
+      },
+      metadata
+    );
   }
   await graph.dispatchRunStepDelta(stepId, {
     type: StepTypes.TOOL_CALLS,
@@ -166,20 +176,28 @@ export const handleToolCalls = async (
       prevRunStep.type !== StepTypes.MESSAGE_CREATION
     ) {
       const messageId = getMessageId(stepKey, graph, true) ?? '';
-      const stepId = await graph.dispatchRunStep(stepKey, {
-        type: StepTypes.MESSAGE_CREATION,
-        message_creation: {
-          message_id: messageId,
+      const stepId = await graph.dispatchRunStep(
+        stepKey,
+        {
+          type: StepTypes.MESSAGE_CREATION,
+          message_creation: {
+            message_id: messageId,
+          },
         },
-      });
+        metadata
+      );
       await dispatchToolCallIds(stepId);
       graph.messageStepHasToolCalls.set(prevStepId, true);
     }
 
-    await graph.dispatchRunStep(stepKey, {
-      type: StepTypes.TOOL_CALLS,
-      tool_calls: [tool_call],
-    });
+    await graph.dispatchRunStep(
+      stepKey,
+      {
+        type: StepTypes.TOOL_CALLS,
+        tool_calls: [tool_call],
+      },
+      metadata
+    );
   }
 };
 

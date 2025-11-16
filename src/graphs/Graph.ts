@@ -96,7 +96,8 @@ export abstract class Graph<
   abstract getRunStep(stepId: string): t.RunStep | undefined;
   abstract dispatchRunStep(
     stepKey: string,
-    stepDetails: t.StepDetails
+    stepDetails: t.StepDetails,
+    metadata?: Record<string, unknown>
   ): Promise<string>;
   abstract dispatchRunStepDelta(
     id: string,
@@ -325,6 +326,62 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
   getContentParts(): t.MessageContentComplex[] | undefined {
     return convertMessagesToContent(this.messages.slice(this.startIndex));
+  }
+
+  /**
+   * Get all run steps, optionally filtered by agent ID
+   */
+  getRunSteps(agentId?: string): t.RunStep[] {
+    if (!agentId) {
+      return [...this.contentData];
+    }
+    return this.contentData.filter((step) => step.agentId === agentId);
+  }
+
+  /**
+   * Get run steps grouped by agent ID
+   */
+  getRunStepsByAgent(): Map<string, t.RunStep[]> {
+    const stepsByAgent = new Map<string, t.RunStep[]>();
+
+    for (const step of this.contentData) {
+      if (!step.agentId) continue;
+
+      const steps = stepsByAgent.get(step.agentId) ?? [];
+      steps.push(step);
+      stepsByAgent.set(step.agentId, steps);
+    }
+
+    return stepsByAgent;
+  }
+
+  /**
+   * Get agent IDs that participated in this run
+   */
+  getActiveAgentIds(): string[] {
+    const agentIds = new Set<string>();
+    for (const step of this.contentData) {
+      if (step.agentId) {
+        agentIds.add(step.agentId);
+      }
+    }
+    return Array.from(agentIds);
+  }
+
+  /**
+   * Maps contentPart indices to agent IDs for post-run analysis
+   * Returns a map where key is the contentPart index and value is the agentId
+   */
+  getContentPartAgentMap(): Map<number, string> {
+    const contentPartAgentMap = new Map<number, string>();
+
+    for (const step of this.contentData) {
+      if (step.agentId && step.index != null) {
+        contentPartAgentMap.set(step.index, step.agentId);
+      }
+    }
+
+    return contentPartAgentMap;
   }
 
   /* Graph */
@@ -837,7 +894,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    */
   async dispatchRunStep(
     stepKey: string,
-    stepDetails: t.StepDetails
+    stepDetails: t.StepDetails,
+    metadata?: Record<string, unknown>
   ): Promise<string> {
     if (!this.config) {
       throw new Error('No config provided');
@@ -866,6 +924,20 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     const runId = this.runId ?? '';
     if (runId) {
       runStep.runId = runId;
+    }
+
+    /**
+     * Extract and store agentId from metadata
+     */
+    if (metadata) {
+      try {
+        const agentContext = this.getAgentContext(metadata);
+        if (agentContext.agentId) {
+          runStep.agentId = agentContext.agentId;
+        }
+      } catch (_e) {
+        /** If we can't get agent context, that's okay - agentId remains undefined */
+      }
     }
 
     this.contentData.push(runStep);

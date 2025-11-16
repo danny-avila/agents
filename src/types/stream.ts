@@ -65,6 +65,7 @@ export type RunStep = {
   // last_error: string | null;
   id: string; // #new
   runId?: string; // #new
+  agentId?: string; // #new - tracks which agent this step belongs to
   index: number; // #new
   stepIndex?: number; // #new
   stepDetails: StepDetails;

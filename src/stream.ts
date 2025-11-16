@@ -194,6 +194,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
         graph,
         stepKey,
         toolCallChunks: chunk.tool_call_chunks,
+        metadata,
       });
     }
 
@@ -203,12 +204,16 @@ export class ChatModelStreamHandler implements t.EventHandler {
 
     const message_id = getMessageId(stepKey, graph) ?? '';
     if (message_id) {
-      await graph.dispatchRunStep(stepKey, {
-        type: StepTypes.MESSAGE_CREATION,
-        message_creation: {
-          message_id,
+      await graph.dispatchRunStep(
+        stepKey,
+        {
+          type: StepTypes.MESSAGE_CREATION,
+          message_creation: {
+            message_id,
+          },
         },
-      });
+        metadata
+      );
     }
 
     const stepId = graph.getStepIdByKey(stepKey);
@@ -267,12 +272,16 @@ hasToolCallChunks: ${hasToolCallChunks}
           agentContext.tokenTypeSwitch = 'content';
           const newStepKey = graph.getStepKey(metadata);
           const message_id = getMessageId(newStepKey, graph) ?? '';
-          await graph.dispatchRunStep(newStepKey, {
-            type: StepTypes.MESSAGE_CREATION,
-            message_creation: {
-              message_id,
+          await graph.dispatchRunStep(
+            newStepKey,
+            {
+              type: StepTypes.MESSAGE_CREATION,
+              message_creation: {
+                message_id,
+              },
             },
-          });
+            metadata
+          );
 
           const newStepId = graph.getStepIdByKey(newStepKey);
           await graph.dispatchMessageDelta(newStepId, {

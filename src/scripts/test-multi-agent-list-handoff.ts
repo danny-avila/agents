@@ -6,7 +6,7 @@ config();
 import { HumanMessage, BaseMessage } from '@langchain/core/messages';
 import { Run } from '@/run';
 import { ChatModelStreamHandler, createContentAggregator } from '@/stream';
-import { Providers, GraphEvents, Constants } from '@/common';
+import { Providers, GraphEvents, Constants, StepTypes } from '@/common';
 import { ToolEndHandler, ModelEndHandler } from '@/events';
 import type * as t from '@/types';
 
@@ -230,9 +230,59 @@ async function testSupervisorListHandoff() {
         conversationHistory.push(...finalMessages);
       }
 
-      // Show summary
+      // Demo: Map contentParts to agentIds
       console.log(`\n${'─'.repeat(60)}`);
-      console.log(`Graph structure:`);
+      console.log('CONTENT PARTS TO AGENT MAPPING:');
+      console.log('─'.repeat(60));
+
+      if (run.Graph) {
+        // Get the mapping of contentPart index to agentId
+        const contentPartAgentMap = run.Graph.getContentPartAgentMap();
+
+        console.log(`\nTotal content parts: ${contentParts.length}`);
+        console.log(`\nContent Part → Agent Mapping:`);
+
+        contentPartAgentMap.forEach((agentId, index) => {
+          const contentPart = contentParts[index];
+          const contentType = contentPart?.type || 'unknown';
+          const preview =
+            contentType === 'text'
+              ? (contentPart as any).text?.slice(0, 50) || ''
+              : contentType === 'tool_call'
+                ? `Tool: ${(contentPart as any).tool_call?.name || 'unknown'}`
+                : contentType;
+
+          console.log(
+            `  [${index}] ${agentId} → ${contentType}: ${preview}${preview.length >= 50 ? '...' : ''}`
+          );
+        });
+
+        // Show agent participation summary
+        console.log(`\n${'─'.repeat(60)}`);
+        console.log('AGENT PARTICIPATION SUMMARY:');
+        console.log('─'.repeat(60));
+
+        const activeAgents = run.Graph.getActiveAgentIds();
+        console.log(`\nActive agents (${activeAgents.length}):`, activeAgents);
+
+        const stepsByAgent = run.Graph.getRunStepsByAgent();
+        stepsByAgent.forEach((steps, agentId) => {
+          const toolCallSteps = steps.filter(
+            (s) => s.type === StepTypes.TOOL_CALLS
+          ).length;
+          const messageSteps = steps.filter(
+            (s) => s.type === StepTypes.MESSAGE_CREATION
+          ).length;
+          console.log(`\n  ${agentId}:`);
+          console.log(`    - Total steps: ${steps.length}`);
+          console.log(`    - Message steps: ${messageSteps}`);
+          console.log(`    - Tool call steps: ${toolCallSteps}`);
+        });
+      }
+
+      // Show graph structure summary
+      console.log(`\n${'─'.repeat(60)}`);
+      console.log(`GRAPH STRUCTURE:`);
       console.log(`- Agents: 6 total (supervisor + 5 specialists)`);
       console.log(`- Edges: 1 edge with multiple destinations`);
       console.log(
