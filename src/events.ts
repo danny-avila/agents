@@ -88,15 +88,40 @@ export class ToolEndHandler implements t.EventHandler {
     metadata?: Record<string, unknown>,
     graph?: StandardGraph | MultiAgentGraph
   ): Promise<void> {
+    const toolEndData = data as t.ToolEndData | undefined;
+    const tool_call_id =
+      (toolEndData?.output as ToolMessage | undefined)?.tool_call_id ?? '';
+    const toolName =
+      (toolEndData?.output as ToolMessage | undefined)?.name ?? '';
+
     if (!graph || !metadata) {
       console.warn(`Graph or metadata not found in ${event} event`);
       return;
     }
 
-    const toolEndData = data as t.ToolEndData | undefined;
     if (!toolEndData?.output) {
       console.warn('No output found in tool_end event');
       return;
+    }
+
+    if (
+      tool_call_id !== '' &&
+      !graph.toolCallStepIds.has(tool_call_id) &&
+      toolName !== ''
+    ) {
+      const agentContext = graph.getAgentContext(metadata);
+      if (
+        agentContext.provider === Providers.BEDROCK ||
+        agentContext.provider === Providers.GOOGLE
+      ) {
+        const toolCall = {
+          id: tool_call_id,
+          name: toolName,
+          args: {},
+          type: 'tool_call' as const,
+        };
+        await handleToolCalls([toolCall], metadata, graph);
+      }
     }
 
     this.callback?.(toolEndData, metadata);

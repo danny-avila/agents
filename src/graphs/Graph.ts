@@ -60,6 +60,7 @@ import { ChatOpenAI, AzureChatOpenAI } from '@/llm/openai';
 import { safeDispatchCustomEvent } from '@/utils/events';
 import { AgentContext } from '@/agents/AgentContext';
 import { createFakeStreamingLLM } from '@/llm/fake';
+import { handleToolCalls } from '@/tools/handlers';
 import { HandlerRegistry } from '@/events';
 
 const { AGENT, TOOLS } = GraphNodeKeys;
@@ -1046,6 +1047,29 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     if (!data.id) {
       console.warn('No Tool ID provided for Tool Error');
       return;
+    }
+
+    const tool_call_id = data.id;
+    const toolName = data.name;
+    if (
+      tool_call_id !== '' &&
+      !graph.toolCallStepIds.has(tool_call_id) &&
+      toolName !== '' &&
+      metadata
+    ) {
+      const agentContext = graph.getAgentContext(metadata);
+      if (
+        agentContext.provider === Providers.BEDROCK ||
+        agentContext.provider === Providers.GOOGLE
+      ) {
+        const toolCall = {
+          id: tool_call_id,
+          name: toolName,
+          args: {},
+          type: 'tool_call' as const,
+        };
+        await handleToolCalls([toolCall], metadata, graph);
+      }
     }
 
     const stepId = graph.toolCallStepIds.get(data.id) ?? '';
