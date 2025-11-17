@@ -4,11 +4,12 @@ import { config } from 'dotenv';
 config();
 
 import { HumanMessage, BaseMessage } from '@langchain/core/messages';
-import { Run } from '@/run';
+import type * as t from '@/types';
+import { labelContentByAgent, formatAgentMessages } from '@/messages/format';
 import { ChatModelStreamHandler, createContentAggregator } from '@/stream';
 import { Providers, GraphEvents, Constants, StepTypes } from '@/common';
 import { ToolEndHandler, ModelEndHandler } from '@/events';
-import type * as t from '@/types';
+import { Run } from '@/run';
 
 const conversationHistory: BaseMessage[] = [];
 
@@ -188,10 +189,6 @@ async function testSupervisorListHandoff() {
   try {
     // Test with different queries
     const testQueries = [
-      // 'How can we analyze user engagement metrics to improve our product?',
-      // 'What security measures should we implement for our new API?',
-      // 'Can you help design a better onboarding flow for our mobile app?',
-      // 'We need to set up a CI/CD pipeline for our microservices.',
       'What are the legal implications of using GPL-licensed code in our product?',
     ];
 
@@ -204,9 +201,9 @@ async function testSupervisorListHandoff() {
     };
 
     for (const query of testQueries) {
-      console.log(`\n${'='.repeat(60)}`);
-      console.log(`USER QUERY: "${query}"`);
-      console.log('='.repeat(60));
+      console.log(`\n${'='.repeat(80)}`);
+      console.log(`FIRST RUN - USER QUERY: "${query}"`);
+      console.log('='.repeat(80));
 
       // Reset conversation
       conversationHistory.length = 0;
@@ -216,7 +213,7 @@ async function testSupervisorListHandoff() {
       const runConfig = createSupervisorGraphWithListEdge();
       const run = await Run.create(runConfig);
 
-      console.log('Processing request...');
+      console.log('Processing first request...');
 
       // Process with streaming
       const inputs = {
@@ -292,6 +289,115 @@ async function testSupervisorListHandoff() {
         `- Result: Supervisor has 5 handoff tools from a single edge`
       );
       console.log('─'.repeat(60));
+
+      // =============================================================
+      // SECOND RUN: Demonstrate agent-labeled history
+      // =============================================================
+      console.log(`\n${'='.repeat(80)}`);
+      console.log(`SECOND RUN - Simulating DB Load with Agent-Labeled History`);
+      console.log('='.repeat(80));
+
+      // Simulate what happens in the main app:
+      // 1. Store contentParts + agentIdMap to "DB" (in-memory here)
+      const dbStoredContentParts = [...contentParts];
+      const dbStoredAgentIdMap = Object.fromEntries(
+        run.Graph!.getContentPartAgentMap()
+      );
+
+      console.log('\n📦 Simulating DB storage:');
+      console.log(`  - Stored ${dbStoredContentParts.length} content parts`);
+      console.log(
+        `  - Stored agent mappings for ${Object.keys(dbStoredAgentIdMap).length} parts`
+      );
+
+      // 2. On next run, load from "DB" and label by agent
+      console.log('\n📥 Loading from DB and labeling by agent...');
+
+      const agentNames = {
+        supervisor: 'Supervisor',
+        legal_advisor: 'Legal Advisor',
+        data_analyst: 'Data Analyst',
+        security_expert: 'Security Expert',
+        product_designer: 'Product Designer',
+        devops_engineer: 'DevOps Engineer',
+      };
+
+      const labeledContentParts = labelContentByAgent(
+        dbStoredContentParts.filter(
+          (p): p is t.MessageContentComplex => p != null
+        ),
+        dbStoredAgentIdMap,
+        agentNames
+      );
+
+      console.log(
+        `  - Labeled ${labeledContentParts.length} content parts by agent`
+      );
+
+      // 3. Convert labeled content parts to payload format
+      const payload: t.TPayload = [
+        {
+          role: 'user',
+          content: query,
+        },
+        {
+          role: 'assistant',
+          content: labeledContentParts,
+        },
+      ];
+
+      // 4. Format using formatAgentMessages (simulates what main app does)
+      console.log('\n🔧 Calling formatAgentMessages...');
+      const { messages: formattedMessages } = formatAgentMessages(payload);
+
+      console.log(
+        `  - Formatted into ${formattedMessages.length} BaseMessages`
+      );
+
+      // Show a preview of what the supervisor will see
+      console.log('\n👁️  Preview of formatted history for supervisor:');
+      console.log('─'.repeat(80));
+      for (let i = 0; i < formattedMessages.length; i++) {
+        const msg = formattedMessages[i];
+        const role = msg._getType();
+        const preview =
+          typeof msg.content === 'string'
+            ? msg.content.slice(0, 200)
+            : JSON.stringify(msg.content).slice(0, 200);
+        console.log(
+          `[${i}] ${role}: ${preview}${preview.length >= 200 ? '...' : ''}`
+        );
+      }
+      console.log('─'.repeat(80));
+
+      // 5. Create a new run with the formatted history + a followup question
+      console.log(
+        '\n🚀 Starting second run with agent-labeled history + followup question...'
+      );
+      const followupQuery =
+        'Can you summarize the key legal points from your previous response?';
+      console.log(`   Followup: "${followupQuery}"`);
+
+      // Reset for second run
+      const secondRunHistory: BaseMessage[] = [
+        ...formattedMessages,
+        new HumanMessage(followupQuery),
+      ];
+
+      const runConfig2 = createSupervisorGraphWithListEdge();
+      const run2 = await Run.create(runConfig2);
+
+      const inputs2 = {
+        messages: secondRunHistory,
+      };
+
+      await run2.processStream(inputs2, config);
+
+      console.log('\n✅ Second run completed successfully!');
+      console.log(
+        '   The supervisor correctly understood that the legal_advisor handled'
+      );
+      console.log('   the previous query, avoiding identity confusion.');
     }
 
     // Final summary

@@ -13,6 +13,8 @@ import type { ToolCall } from '@langchain/core/messages/tool';
 import type {
   ExtendedMessageContent,
   MessageContentComplex,
+  ReasoningContentText,
+  ToolCallContent,
   ToolCallPart,
   TPayload,
   TMessage,
@@ -397,6 +399,226 @@ function formatAssistantMessage(
 
   return formattedMessages;
 }
+
+/**
+ * Labels all agent content for parallel patterns (fan-out/fan-in)
+ * Groups consecutive content by agent and wraps with clear labels
+ */
+function labelAllAgentContent(
+  contentParts: MessageContentComplex[],
+  agentIdMap: Record<number, string>,
+  agentNames?: Record<string, string>
+): MessageContentComplex[] {
+  const result: MessageContentComplex[] = [];
+  let currentAgentId: string | undefined;
+  let agentContentBuffer: MessageContentComplex[] = [];
+
+  const flushAgentBuffer = (): void => {
+    if (agentContentBuffer.length === 0) {
+      return;
+    }
+
+    if (currentAgentId != null && currentAgentId !== '') {
+      const agentName = (agentNames?.[currentAgentId] ?? '') || currentAgentId;
+      const formattedParts: string[] = [];
+
+      formattedParts.push(`--- ${agentName} ---`);
+
+      for (const part of agentContentBuffer) {
+        if (part.type === ContentTypes.THINK) {
+          const thinkContent = (part as ReasoningContentText).think || '';
+          if (thinkContent) {
+            formattedParts.push(
+              `${agentName}: ${JSON.stringify({
+                type: 'think',
+                think: thinkContent,
+              })}`
+            );
+          }
+        } else if (part.type === ContentTypes.TEXT) {
+          const textContent: string = part.text ?? '';
+          if (textContent) {
+            formattedParts.push(`${agentName}: ${textContent}`);
+          }
+        } else if (part.type === ContentTypes.TOOL_CALL) {
+          formattedParts.push(
+            `${agentName}: ${JSON.stringify({
+              type: 'tool_call',
+              tool_call: (part as ToolCallContent).tool_call,
+            })}`
+          );
+        }
+      }
+
+      formattedParts.push(`--- End of ${agentName} ---`);
+
+      // Create a single text content part with all agent content
+      result.push({
+        type: ContentTypes.TEXT,
+        text: formattedParts.join('\n\n'),
+      } as MessageContentComplex);
+    } else {
+      // No agent ID, pass through as-is
+      result.push(...agentContentBuffer);
+    }
+
+    agentContentBuffer = [];
+  };
+
+  for (let i = 0; i < contentParts.length; i++) {
+    const part = contentParts[i];
+    const agentId = agentIdMap[i];
+
+    // If agent changed, flush previous buffer
+    if (agentId !== currentAgentId && currentAgentId !== undefined) {
+      flushAgentBuffer();
+    }
+
+    currentAgentId = agentId;
+    agentContentBuffer.push(part);
+  }
+
+  // Flush any remaining content
+  flushAgentBuffer();
+
+  return result;
+}
+
+/**
+ * Groups content parts by agent and formats them with agent labels
+ * This preprocesses multi-agent content to prevent identity confusion
+ *
+ * @param contentParts - The content parts from a run
+ * @param agentIdMap - Map of content part index to agent ID
+ * @param agentNames - Optional map of agent ID to display name
+ * @param options - Configuration options
+ * @param options.labelNonTransferContent - If true, labels all agent transitions (for parallel patterns)
+ * @returns Modified content parts with agent labels where appropriate
+ */
+export const labelContentByAgent = (
+  contentParts: MessageContentComplex[],
+  agentIdMap?: Record<number, string>,
+  agentNames?: Record<string, string>,
+  options?: { labelNonTransferContent?: boolean }
+): MessageContentComplex[] => {
+  if (!agentIdMap || Object.keys(agentIdMap).length === 0) {
+    return contentParts;
+  }
+
+  // If labelNonTransferContent is true, use a different strategy for parallel patterns
+  if (options?.labelNonTransferContent === true) {
+    return labelAllAgentContent(contentParts, agentIdMap, agentNames);
+  }
+
+  const result: MessageContentComplex[] = [];
+  let currentAgentId: string | undefined;
+  let agentContentBuffer: MessageContentComplex[] = [];
+  let transferToolCallIndex: number | undefined;
+  let transferToolCallId: string | undefined;
+
+  const flushAgentBuffer = (): void => {
+    if (agentContentBuffer.length === 0) {
+      return;
+    }
+
+    // If this is content from a transferred agent, format it specially
+    if (
+      currentAgentId != null &&
+      currentAgentId !== '' &&
+      transferToolCallIndex !== undefined
+    ) {
+      const agentName = (agentNames?.[currentAgentId] ?? '') || currentAgentId;
+      const formattedParts: string[] = [];
+
+      formattedParts.push(`--- Transfer to ${agentName} ---`);
+
+      for (const part of agentContentBuffer) {
+        if (part.type === ContentTypes.THINK) {
+          formattedParts.push(
+            `${agentName}: ${JSON.stringify({
+              type: 'think',
+              think: (part as ReasoningContentText).think,
+            })}`
+          );
+        } else if ('text' in part && part.type === ContentTypes.TEXT) {
+          const textContent: string = part.text ?? '';
+          if (textContent) {
+            formattedParts.push(
+              `${agentName}: ${JSON.stringify({
+                type: 'text',
+                text: textContent,
+              })}`
+            );
+          }
+        } else if (part.type === ContentTypes.TOOL_CALL) {
+          formattedParts.push(
+            `${agentName}: ${JSON.stringify({
+              type: 'tool_call',
+              tool_call: (part as ToolCallContent).tool_call,
+            })}`
+          );
+        }
+      }
+
+      formattedParts.push(`--- End of ${agentName} response ---`);
+
+      // Find the tool call that triggered this transfer and update its output
+      if (transferToolCallIndex < result.length) {
+        const transferToolCall = result[transferToolCallIndex];
+        if (
+          transferToolCall.type === ContentTypes.TOOL_CALL &&
+          transferToolCall.tool_call?.id === transferToolCallId
+        ) {
+          transferToolCall.tool_call.output = formattedParts.join('\n\n');
+        }
+      }
+    } else {
+      // Not from a transfer, add as-is
+      result.push(...agentContentBuffer);
+    }
+
+    agentContentBuffer = [];
+    transferToolCallIndex = undefined;
+    transferToolCallId = undefined;
+  };
+
+  for (let i = 0; i < contentParts.length; i++) {
+    const part = contentParts[i];
+    const agentId = agentIdMap[i];
+
+    // Check if this is a transfer tool call
+    const isTransferTool =
+      (part.type === ContentTypes.TOOL_CALL &&
+        (part as ToolCallContent).tool_call?.name?.startsWith(
+          'lc_transfer_to_'
+        )) ??
+      false;
+
+    // If agent changed, flush previous buffer
+    if (agentId !== currentAgentId && currentAgentId !== undefined) {
+      flushAgentBuffer();
+    }
+
+    currentAgentId = agentId;
+
+    if (isTransferTool) {
+      // Flush any existing buffer first
+      flushAgentBuffer();
+      // Add the transfer tool call to result
+      result.push(part);
+      // Mark that the next agent's content should be captured
+      transferToolCallIndex = result.length - 1;
+      transferToolCallId = (part as ToolCallContent).tool_call?.id;
+      currentAgentId = undefined; // Reset to capture the next agent
+    } else {
+      agentContentBuffer.push(part);
+    }
+  }
+
+  flushAgentBuffer();
+
+  return result;
+};
 
 /**
  * Formats an array of messages for LangChain, handling tool calls and creating ToolMessage instances.
