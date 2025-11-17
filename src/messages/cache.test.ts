@@ -1,6 +1,11 @@
 import type Anthropic from '@anthropic-ai/sdk';
 import type { AnthropicMessages } from '@/types/messages';
-import { addCacheControl, addBedrockCacheControl } from './cache';
+import {
+  stripAnthropicCacheControl,
+  stripBedrockCacheControl,
+  addBedrockCacheControl,
+  addCacheControl,
+} from './cache';
 import { MessageContentComplex } from '@langchain/core/messages';
 import { ContentTypes } from '@/common/enum';
 
@@ -393,7 +398,7 @@ describe('addBedrockCacheControl (Bedrock cache checkpoints)', () => {
     expect(first[1]).toEqual({ cachePoint: { type: 'default' } });
   });
 
-  it('works with the example from the langchain pr', () => {
+  it('works with the example from the langchain pr (with multi-turn behavior)', () => {
     const messages: TestMsg[] = [
       {
         role: 'system',
@@ -445,7 +450,8 @@ describe('addBedrockCacheControl (Bedrock cache checkpoints)', () => {
       type: ContentTypes.TEXT,
       text: 'You\'re an advanced AI assistant.',
     });
-    expect(system[1]).toEqual({ cachePoint: { type: 'default' } });
+    expect(system.length).toBe(1);
+
     expect(user[0]).toEqual({
       type: ContentTypes.TEXT,
       text: 'What is the capital of France?',
@@ -457,5 +463,495 @@ describe('addBedrockCacheControl (Bedrock cache checkpoints)', () => {
       text: 'Sure! The capital of France is Paris.',
     });
     expect(assistant[1]).toEqual({ cachePoint: { type: 'default' } });
+  });
+
+  it('is idempotent - calling multiple times does not add duplicate cache points', () => {
+    const messages: TestMsg[] = [
+      {
+        role: 'user',
+        content: [{ type: ContentTypes.TEXT, text: 'First message' }],
+      },
+      {
+        role: 'assistant',
+        content: [{ type: ContentTypes.TEXT, text: 'First response' }],
+      },
+    ];
+
+    const result1 = addBedrockCacheControl(messages);
+    const firstContent = result1[0].content as MessageContentComplex[];
+    const secondContent = result1[1].content as MessageContentComplex[];
+
+    expect(firstContent.length).toBe(2);
+    expect(firstContent[0]).toEqual({
+      type: ContentTypes.TEXT,
+      text: 'First message',
+    });
+    expect(firstContent[1]).toEqual({ cachePoint: { type: 'default' } });
+
+    expect(secondContent.length).toBe(2);
+    expect(secondContent[0]).toEqual({
+      type: ContentTypes.TEXT,
+      text: 'First response',
+    });
+    expect(secondContent[1]).toEqual({ cachePoint: { type: 'default' } });
+
+    const result2 = addBedrockCacheControl(result1);
+    const firstContentAfter = result2[0].content as MessageContentComplex[];
+    const secondContentAfter = result2[1].content as MessageContentComplex[];
+
+    expect(firstContentAfter.length).toBe(2);
+    expect(firstContentAfter[0]).toEqual({
+      type: ContentTypes.TEXT,
+      text: 'First message',
+    });
+    expect(firstContentAfter[1]).toEqual({ cachePoint: { type: 'default' } });
+
+    expect(secondContentAfter.length).toBe(2);
+    expect(secondContentAfter[0]).toEqual({
+      type: ContentTypes.TEXT,
+      text: 'First response',
+    });
+    expect(secondContentAfter[1]).toEqual({ cachePoint: { type: 'default' } });
+  });
+
+  it('skips messages that already have cache points in multi-agent scenarios', () => {
+    const messages: TestMsg[] = [
+      {
+        role: 'user',
+        content: [{ type: ContentTypes.TEXT, text: 'Hello' }],
+      },
+      {
+        role: 'assistant',
+        content: [
+          { type: ContentTypes.TEXT, text: 'Response from agent 1' },
+          { cachePoint: { type: 'default' } },
+        ],
+      },
+      {
+        role: 'user',
+        content: [{ type: ContentTypes.TEXT, text: 'Follow-up question' }],
+      },
+    ];
+
+    const result = addBedrockCacheControl(messages);
+    const lastContent = result[2].content as MessageContentComplex[];
+    const secondLastContent = result[1].content as MessageContentComplex[];
+
+    expect(lastContent.length).toBe(2);
+    expect(lastContent[0]).toEqual({
+      type: ContentTypes.TEXT,
+      text: 'Follow-up question',
+    });
+    expect(lastContent[1]).toEqual({ cachePoint: { type: 'default' } });
+
+    expect(secondLastContent.length).toBe(2);
+    expect(secondLastContent[0]).toEqual({
+      type: ContentTypes.TEXT,
+      text: 'Response from agent 1',
+    });
+    expect(secondLastContent[1]).toEqual({ cachePoint: { type: 'default' } });
+  });
+});
+
+describe('stripAnthropicCacheControl', () => {
+  it('removes cache_control fields from content blocks', () => {
+    const messages: TestMsg[] = [
+      {
+        role: 'user',
+        content: [
+          {
+            type: ContentTypes.TEXT,
+            text: 'Hello',
+            cache_control: { type: 'ephemeral' },
+          } as MessageContentComplex,
+        ],
+      },
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.TEXT,
+            text: 'Hi there',
+            cache_control: { type: 'ephemeral' },
+          } as MessageContentComplex,
+        ],
+      },
+    ];
+
+    const result = stripAnthropicCacheControl(messages);
+
+    const firstContent = result[0].content as MessageContentComplex[];
+    const secondContent = result[1].content as MessageContentComplex[];
+
+    expect(firstContent[0]).toEqual({
+      type: ContentTypes.TEXT,
+      text: 'Hello',
+    });
+    expect('cache_control' in firstContent[0]).toBe(false);
+
+    expect(secondContent[0]).toEqual({
+      type: ContentTypes.TEXT,
+      text: 'Hi there',
+    });
+    expect('cache_control' in secondContent[0]).toBe(false);
+  });
+
+  it('handles messages without cache_control gracefully', () => {
+    const messages: TestMsg[] = [
+      {
+        role: 'user',
+        content: [{ type: ContentTypes.TEXT, text: 'Hello' }],
+      },
+    ];
+
+    const result = stripAnthropicCacheControl(messages);
+
+    expect(result[0].content).toEqual([
+      { type: ContentTypes.TEXT, text: 'Hello' },
+    ]);
+  });
+
+  it('handles string content gracefully', () => {
+    const messages: TestMsg[] = [
+      {
+        role: 'user',
+        content: 'Hello',
+      },
+    ];
+
+    const result = stripAnthropicCacheControl(messages);
+
+    expect(result[0].content).toBe('Hello');
+  });
+
+  it('returns non-array input unchanged', () => {
+    const notArray = 'not an array';
+    /** @ts-expect-error - Testing invalid input */
+    const result = stripAnthropicCacheControl(notArray);
+    expect(result).toBe('not an array');
+  });
+});
+
+describe('stripBedrockCacheControl', () => {
+  it('removes cachePoint blocks from content arrays', () => {
+    const messages: TestMsg[] = [
+      {
+        role: 'user',
+        content: [
+          { type: ContentTypes.TEXT, text: 'Hello' },
+          { cachePoint: { type: 'default' } },
+        ],
+      },
+      {
+        role: 'assistant',
+        content: [
+          { type: ContentTypes.TEXT, text: 'Hi there' },
+          { cachePoint: { type: 'default' } },
+        ],
+      },
+    ];
+
+    const result = stripBedrockCacheControl(messages);
+
+    const firstContent = result[0].content as MessageContentComplex[];
+    const secondContent = result[1].content as MessageContentComplex[];
+
+    expect(firstContent.length).toBe(1);
+    expect(firstContent[0]).toEqual({
+      type: ContentTypes.TEXT,
+      text: 'Hello',
+    });
+
+    expect(secondContent.length).toBe(1);
+    expect(secondContent[0]).toEqual({
+      type: ContentTypes.TEXT,
+      text: 'Hi there',
+    });
+  });
+
+  it('handles messages without cachePoint blocks gracefully', () => {
+    const messages: TestMsg[] = [
+      {
+        role: 'user',
+        content: [{ type: ContentTypes.TEXT, text: 'Hello' }],
+      },
+    ];
+
+    const result = stripBedrockCacheControl(messages);
+
+    expect(result[0].content).toEqual([
+      { type: ContentTypes.TEXT, text: 'Hello' },
+    ]);
+  });
+
+  it('handles string content gracefully', () => {
+    const messages: TestMsg[] = [
+      {
+        role: 'user',
+        content: 'Hello',
+      },
+    ];
+
+    const result = stripBedrockCacheControl(messages);
+
+    expect(result[0].content).toBe('Hello');
+  });
+
+  it('preserves content with type field', () => {
+    const messages: TestMsg[] = [
+      {
+        role: 'user',
+        content: [
+          { type: ContentTypes.TEXT, text: 'Hello' },
+          {
+            type: ContentTypes.IMAGE_FILE,
+            image_file: { file_id: 'file_123' },
+          },
+          { cachePoint: { type: 'default' } },
+        ],
+      },
+    ];
+
+    const result = stripBedrockCacheControl(messages);
+
+    const content = result[0].content as MessageContentComplex[];
+
+    expect(content.length).toBe(2);
+    expect(content[0]).toEqual({ type: ContentTypes.TEXT, text: 'Hello' });
+    expect(content[1]).toEqual({
+      type: ContentTypes.IMAGE_FILE,
+      image_file: { file_id: 'file_123' },
+    });
+  });
+
+  it('returns non-array input unchanged', () => {
+    const notArray = 'not an array';
+    /** @ts-expect-error - Testing invalid input */
+    const result = stripBedrockCacheControl(notArray);
+    expect(result).toBe('not an array');
+  });
+});
+
+describe('Multi-agent provider interoperability', () => {
+  it('strips Bedrock cache before applying Anthropic cache (single pass)', () => {
+    const messages: TestMsg[] = [
+      {
+        role: 'user',
+        content: [
+          { type: ContentTypes.TEXT, text: 'First message' },
+          { cachePoint: { type: 'default' } },
+        ],
+      },
+      {
+        role: 'assistant',
+        content: [
+          { type: ContentTypes.TEXT, text: 'Response' },
+          { cachePoint: { type: 'default' } },
+        ],
+      },
+    ];
+
+    /** @ts-expect-error - Testing cross-provider compatibility */
+    const result = addCacheControl(messages);
+
+    const firstContent = result[0].content as MessageContentComplex[];
+
+    expect(firstContent.some((b) => 'cachePoint' in b)).toBe(false);
+    expect('cache_control' in firstContent[0]).toBe(true);
+  });
+
+  it('strips Anthropic cache before applying Bedrock cache (single pass)', () => {
+    const messages: TestMsg[] = [
+      {
+        role: 'user',
+        content: [
+          {
+            type: ContentTypes.TEXT,
+            text: 'First message',
+            cache_control: { type: 'ephemeral' },
+          } as MessageContentComplex,
+        ],
+      },
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.TEXT,
+            text: 'Response',
+            cache_control: { type: 'ephemeral' },
+          } as MessageContentComplex,
+        ],
+      },
+    ];
+
+    const result = addBedrockCacheControl(messages);
+
+    const firstContent = result[0].content as MessageContentComplex[];
+    const secondContent = result[1].content as MessageContentComplex[];
+
+    expect('cache_control' in firstContent[0]).toBe(false);
+    expect('cache_control' in secondContent[0]).toBe(false);
+
+    expect(firstContent.some((b) => 'cachePoint' in b)).toBe(true);
+    expect(secondContent.some((b) => 'cachePoint' in b)).toBe(true);
+  });
+
+  it('strips Bedrock cache using separate function (backwards compat)', () => {
+    const messages: TestMsg[] = [
+      {
+        role: 'user',
+        content: [
+          { type: ContentTypes.TEXT, text: 'First message' },
+          { cachePoint: { type: 'default' } },
+        ],
+      },
+    ];
+
+    const stripped = stripBedrockCacheControl(messages);
+    const firstContent = stripped[0].content as MessageContentComplex[];
+
+    expect(firstContent.some((b) => 'cachePoint' in b)).toBe(false);
+    expect(firstContent.length).toBe(1);
+  });
+
+  it('strips Anthropic cache using separate function (backwards compat)', () => {
+    const messages: TestMsg[] = [
+      {
+        role: 'user',
+        content: [
+          {
+            type: ContentTypes.TEXT,
+            text: 'First message',
+            cache_control: { type: 'ephemeral' },
+          } as MessageContentComplex,
+        ],
+      },
+    ];
+
+    const stripped = stripAnthropicCacheControl(messages);
+    const firstContent = stripped[0].content as MessageContentComplex[];
+
+    expect('cache_control' in firstContent[0]).toBe(false);
+  });
+});
+
+describe('Multi-turn cache cleanup', () => {
+  it('strips stale Bedrock cache points from previous turns before applying new ones', () => {
+    const messages: TestMsg[] = [
+      {
+        role: 'user',
+        content: [
+          { type: ContentTypes.TEXT, text: 'Turn 1 message 1' },
+          { cachePoint: { type: 'default' } },
+        ],
+      },
+      {
+        role: 'assistant',
+        content: [
+          { type: ContentTypes.TEXT, text: 'Turn 1 response 1' },
+          { cachePoint: { type: 'default' } },
+        ],
+      },
+      {
+        role: 'user',
+        content: [{ type: ContentTypes.TEXT, text: 'Turn 2 message 2' }],
+      },
+      {
+        role: 'assistant',
+        content: [{ type: ContentTypes.TEXT, text: 'Turn 2 response 2' }],
+      },
+    ];
+
+    const result = addBedrockCacheControl(messages);
+
+    const cachePointCount = result.reduce((count, msg) => {
+      if (Array.isArray(msg.content)) {
+        return (
+          count +
+          msg.content.filter(
+            (block) => 'cachePoint' in block && !('type' in block)
+          ).length
+        );
+      }
+      return count;
+    }, 0);
+
+    expect(cachePointCount).toBe(2);
+
+    const lastContent = result[3].content as MessageContentComplex[];
+    const secondLastContent = result[2].content as MessageContentComplex[];
+
+    expect(lastContent.some((b) => 'cachePoint' in b)).toBe(true);
+    expect(secondLastContent.some((b) => 'cachePoint' in b)).toBe(true);
+
+    const firstContent = result[0].content as MessageContentComplex[];
+    const secondContent = result[1].content as MessageContentComplex[];
+
+    expect(firstContent.some((b) => 'cachePoint' in b)).toBe(false);
+    expect(secondContent.some((b) => 'cachePoint' in b)).toBe(false);
+  });
+
+  it('strips stale Anthropic cache_control from previous turns before applying new ones', () => {
+    const messages: TestMsg[] = [
+      {
+        role: 'user',
+        content: [
+          {
+            type: ContentTypes.TEXT,
+            text: 'Turn 1 message 1',
+            cache_control: { type: 'ephemeral' },
+          } as MessageContentComplex,
+        ],
+      },
+      {
+        role: 'assistant',
+        content: [{ type: ContentTypes.TEXT, text: 'Turn 1 response 1' }],
+      },
+      {
+        role: 'user',
+        content: [
+          {
+            type: ContentTypes.TEXT,
+            text: 'Turn 2 message 2',
+            cache_control: { type: 'ephemeral' },
+          } as MessageContentComplex,
+        ],
+      },
+      {
+        role: 'assistant',
+        content: [{ type: ContentTypes.TEXT, text: 'Turn 2 response 2' }],
+      },
+      {
+        role: 'user',
+        content: [{ type: ContentTypes.TEXT, text: 'Turn 3 message 3' }],
+      },
+    ];
+
+    /** @ts-expect-error - Testing cross-provider compatibility */
+    const result = addCacheControl(messages);
+
+    const cacheControlCount = result.reduce((count, msg) => {
+      if (Array.isArray(msg.content)) {
+        return (
+          count +
+          msg.content.filter(
+            (block) => 'cache_control' in block && 'type' in block
+          ).length
+        );
+      }
+      return count;
+    }, 0);
+
+    expect(cacheControlCount).toBe(2);
+
+    const lastContent = result[4].content as MessageContentComplex[];
+    const thirdContent = result[2].content as MessageContentComplex[];
+
+    expect('cache_control' in lastContent[0]).toBe(true);
+    expect('cache_control' in thirdContent[0]).toBe(true);
+
+    const firstContent = result[0].content as MessageContentComplex[];
+
+    expect('cache_control' in firstContent[0]).toBe(false);
   });
 });
