@@ -6,6 +6,7 @@ import type {
   BaseMessageFields,
 } from '@langchain/core/messages';
 import type { MultiAgentGraph, StandardGraph } from '@/graphs';
+import type { Logger } from 'winston';
 import type * as t from '@/types';
 import { handleToolCalls } from '@/tools/handlers';
 import { Providers } from '@/common';
@@ -74,12 +75,15 @@ export class ModelEndHandler implements t.EventHandler {
 
 export class ToolEndHandler implements t.EventHandler {
   private callback?: t.ToolEndCallback;
+  private logger?: Logger;
   private omitOutput?: (name?: string) => boolean;
   constructor(
     callback?: t.ToolEndCallback,
+    logger?: Logger,
     omitOutput?: (name?: string) => boolean
   ) {
     this.callback = callback;
+    this.logger = logger;
     this.omitOutput = omitOutput;
   }
   async handle(
@@ -88,23 +92,41 @@ export class ToolEndHandler implements t.EventHandler {
     metadata?: Record<string, unknown>,
     graph?: StandardGraph | MultiAgentGraph
   ): Promise<void> {
-    if (!graph || !metadata) {
-      console.warn(`Graph or metadata not found in ${event} event`);
-      return;
-    }
+    try {
+      if (!graph || !metadata) {
+        if (this.logger) {
+          this.logger.warn(`Graph or metadata not found in ${event} event`);
+        } else {
+          console.warn(`Graph or metadata not found in ${event} event`);
+        }
+        return;
+      }
 
-    const toolEndData = data as t.ToolEndData | undefined;
-    if (!toolEndData?.output) {
-      console.warn('No output found in tool_end event');
-      return;
-    }
+      const toolEndData = data as t.ToolEndData | undefined;
+      if (!toolEndData?.output) {
+        if (this.logger) {
+          this.logger.warn('No output found in tool_end event');
+        } else {
+          console.warn('No output found in tool_end event');
+        }
+        return;
+      }
 
-    this.callback?.(toolEndData, metadata);
-    await graph.handleToolCallCompleted(
-      { input: toolEndData.input, output: toolEndData.output },
-      metadata,
-      this.omitOutput?.((toolEndData.output as ToolMessage | undefined)?.name)
-    );
+      if (this.callback) {
+        await this.callback(toolEndData, metadata);
+      }
+      await graph.handleToolCallCompleted(
+        { input: toolEndData.input, output: toolEndData.output },
+        metadata,
+        this.omitOutput?.((toolEndData.output as ToolMessage | undefined)?.name)
+      );
+    } catch (error) {
+      if (this.logger) {
+        this.logger.error('Error handling tool_end event:', error);
+      } else {
+        console.error('Error handling tool_end event:', error);
+      }
+    }
   }
 }
 

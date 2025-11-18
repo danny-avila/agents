@@ -116,7 +116,7 @@ export type ToolErrorData = {
 export type ToolEndCallback = (
   data: ToolEndData,
   metadata?: Record<string, unknown>
-) => void;
+) => Promise<void>;
 
 export type ProcessedToolCall = {
   name: string;
