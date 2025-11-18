@@ -52,6 +52,81 @@ describe('ensureThinkingBlockInMessages', () => {
         'redacted_thinking'
       );
     });
+
+    test('should not modify AI message with reasoning_content block and tool calls', () => {
+      const messages = [
+        new HumanMessage({ content: 'Calculate something' }),
+        new AIMessage({
+          content: [
+            {
+              type: ContentTypes.REASONING_CONTENT,
+              reasoningText: { text: 'I need to use a calculator' },
+            },
+          ],
+          tool_calls: [
+            {
+              id: 'call_456',
+              name: 'calculator',
+              args: { input: '2+2' },
+              type: 'tool_call',
+            },
+          ],
+        }),
+        new ToolMessage({
+          content: '4',
+          tool_call_id: 'call_456',
+        }),
+      ];
+
+      const result = ensureThinkingBlockInMessages(messages, Providers.BEDROCK);
+
+      expect(result).toHaveLength(3);
+      expect(result[0]).toBeInstanceOf(HumanMessage);
+      expect(result[1]).toBeInstanceOf(AIMessage);
+      expect(result[2]).toBeInstanceOf(ToolMessage);
+      expect((result[1].content as ExtendedMessageContent[])[0].type).toBe(
+        ContentTypes.REASONING_CONTENT
+      );
+    });
+
+    test('should not modify AI message with reasoning block and tool calls', () => {
+      const messages = [
+        new HumanMessage({ content: 'Calculate something' }),
+        new AIMessage({
+          content: [
+            {
+              type: ContentTypes.REASONING,
+              reasoning: 'I need to use a calculator',
+            },
+          ],
+          tool_calls: [
+            {
+              id: 'call_789',
+              name: 'calculator',
+              args: { input: '3+3' },
+              type: 'tool_call',
+            },
+          ],
+        }),
+        new ToolMessage({
+          content: '6',
+          tool_call_id: 'call_789',
+        }),
+      ];
+
+      const result = ensureThinkingBlockInMessages(
+        messages,
+        Providers.VERTEXAI
+      );
+
+      expect(result).toHaveLength(3);
+      expect(result[0]).toBeInstanceOf(HumanMessage);
+      expect(result[1]).toBeInstanceOf(AIMessage);
+      expect(result[2]).toBeInstanceOf(ToolMessage);
+      expect((result[1].content as ExtendedMessageContent[])[0].type).toBe(
+        ContentTypes.REASONING
+      );
+    });
   });
 
   describe('messages with tool_calls (should be converted)', () => {

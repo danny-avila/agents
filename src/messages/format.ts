@@ -839,8 +839,14 @@ export function shiftIndexTokenCountMap(
 
 /**
  * Ensures compatibility when switching from a non-thinking agent to a thinking-enabled agent.
- * Converts AI messages with tool calls (that lack thinking blocks) into buffer strings,
+ * Converts AI messages with tool calls (that lack thinking/reasoning blocks) into buffer strings,
  * avoiding the thinking block signature requirement.
+ *
+ * Recognizes the following as valid thinking/reasoning blocks:
+ * - ContentTypes.THINKING (Anthropic)
+ * - ContentTypes.REASONING_CONTENT (Bedrock)
+ * - ContentTypes.REASONING (VertexAI / Google)
+ * - 'redacted_thinking'
  *
  * @param messages - Array of messages to process
  * @param provider - The provider being used (unused but kept for future compatibility)
@@ -883,6 +889,8 @@ export function ensureThinkingBlockInMessages(
     if (
       hasToolUse &&
       firstContentType !== ContentTypes.THINKING &&
+      firstContentType !== ContentTypes.REASONING_CONTENT &&
+      firstContentType !== ContentTypes.REASONING &&
       firstContentType !== 'redacted_thinking'
     ) {
       // Collect the AI message and any following tool messages
