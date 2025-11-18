@@ -6,6 +6,7 @@ import type {
   GoogleAbstractedClient,
 } from '@langchain/google-common';
 import type { BaseMessage } from '@langchain/core/messages';
+import { HumanMessage, BaseMessageChunk } from '@langchain/core/messages';
 import type { VertexAIClientOptions } from '@/types';
 
 class CustomChatConnection extends ChatConnection<VertexAIClientOptions> {
@@ -329,6 +330,74 @@ export class ChatVertexAI extends ChatGoogle {
     });
     this.dynamicThinkingBudget = dynamicThinkingBudget;
   }
+
+  private transformMessageContent(messages: BaseMessage[]): BaseMessage[] {
+    return messages.map((message) => {
+      if (message instanceof HumanMessage && Array.isArray(message.content)) {
+        const needsTransformation = message.content.some((part) => {
+          if (typeof part === 'string' || !('type' in part)) {
+            return false;
+          }
+          const partWithType = part as { type: string };
+          return (
+            partWithType.type === 'document' ||
+            partWithType.type === 'audio' ||
+            partWithType.type === 'video'
+          );
+        });
+
+        if (!needsTransformation) {
+          return message;
+        }
+
+        const transformedContent = message.content.map((part) => {
+          if (!('type' in part)) {
+            return part;
+          }
+
+          const partWithType = part as {
+            type: string;
+            mimeType?: string;
+            data?: string;
+          };
+
+          if (
+            partWithType.type === 'document' ||
+            partWithType.type === 'audio' ||
+            partWithType.type === 'video'
+          ) {
+            return {
+              type: 'media',
+              mimeType: partWithType.mimeType,
+              data: partWithType.data,
+            };
+          }
+
+          return part;
+        });
+
+        return new HumanMessage({
+          content: transformedContent,
+          additional_kwargs: message.additional_kwargs,
+          id: message.id,
+        });
+      }
+      return message;
+    });
+  }
+
+  /* input: string is for titleConvo invocations where input
+  comes in just as a string that needs no transformation */
+  async invoke(
+    input: BaseMessage[] | string,
+    options?: this['ParsedCallOptions']
+  ): Promise<BaseMessageChunk> {
+    const transformedInput = Array.isArray(input)
+      ? this.transformMessageContent(input)
+      : input;
+    return super.invoke(transformedInput, options);
+  }
+
   invocationParams(
     options?: this['ParsedCallOptions'] | undefined
   ): GoogleAIModelRequestParams {
