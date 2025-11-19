@@ -121,12 +121,27 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           );
         } catch (handlerError) {
           // eslint-disable-next-line no-console
-          console.error(
-            'Error in errorHandler for tool',
-            call.name,
-            ':',
-            handlerError
-          );
+          console.error('Error in errorHandler:', {
+            toolName: call.name,
+            toolCallId: call.id,
+            toolArgs: call.args,
+            stepId: this.toolCallStepIds?.get(call.id!),
+            turn: this.toolUsageCount.get(call.name),
+            originalError: {
+              message: e.message,
+              stack: e.stack ?? undefined,
+            },
+            handlerError:
+              handlerError instanceof Error
+                ? {
+                  message: handlerError.message,
+                  stack: handlerError.stack ?? undefined,
+                }
+                : {
+                  message: String(handlerError),
+                  stack: undefined,
+                },
+          });
         }
       }
       return new ToolMessage({
