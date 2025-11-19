@@ -109,15 +109,25 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         throw e;
       }
       if (this.errorHandler) {
-        await this.errorHandler(
-          {
-            error: e,
-            id: call.id!,
-            name: call.name,
-            input: call.args,
-          },
-          config.metadata
-        );
+        try {
+          await this.errorHandler(
+            {
+              error: e,
+              id: call.id!,
+              name: call.name,
+              input: call.args,
+            },
+            config.metadata
+          );
+        } catch (handlerError) {
+          // eslint-disable-next-line no-console
+          console.error(
+            'Error in errorHandler for tool',
+            call.name,
+            ':',
+            handlerError
+          );
+        }
       }
       return new ToolMessage({
         status: 'error',
