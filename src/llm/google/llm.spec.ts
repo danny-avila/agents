@@ -610,10 +610,24 @@ describe('GoogleSearch (new API)', () => {
       maxRetries: 0,
     }).bindTools([googleSearchTool]);
 
-    const result = await model.invoke('Who won the 2024 MLB World Series?');
+    // Ask about something that requires current web data beyond training cutoff
+    const result = await model.invoke(
+      'What was the closing price of NVIDIA stock yesterday? Use web search to find the exact current price.'
+    );
 
+    expect(result.content).toBeDefined();
+    expect(
+      typeof result.content === 'string' || Array.isArray(result.content)
+    ).toBe(true);
+
+    // Grounding metadata should be present when Google Search is used
     expect(result.response_metadata?.groundingMetadata).toBeDefined();
-    expect(result.content as string).toContain('Dodgers');
+    expect(result.response_metadata.groundingMetadata).toHaveProperty(
+      'groundingChunks'
+    );
+    expect(result.response_metadata.groundingMetadata).toHaveProperty(
+      'webSearchQueries'
+    );
   });
 
   test('Can stream GoogleSearch tool', async () => {
@@ -626,7 +640,9 @@ describe('GoogleSearch (new API)', () => {
       maxRetries: 0,
     }).bindTools([googleSearchTool]);
 
-    const stream = await model.stream('Who won the 2024 MLB World Series?');
+    const stream = await model.stream(
+      'What was the closing price of NVIDIA stock yesterday? Use web search to find the exact current price.'
+    );
     let finalMsg: AIMessageChunk | undefined;
     for await (const msg of stream) {
       finalMsg = finalMsg ? concat(finalMsg, msg) : msg;
@@ -634,8 +650,20 @@ describe('GoogleSearch (new API)', () => {
     if (!finalMsg) {
       throw new Error('finalMsg is undefined');
     }
-    expect(finalMsg.response_metadata.groundingMetadata).toBeDefined();
-    expect(finalMsg.content as string).toContain('Dodgers');
+
+    expect(finalMsg.content).toBeDefined();
+    expect(
+      typeof finalMsg.content === 'string' || Array.isArray(finalMsg.content)
+    ).toBe(true);
+
+    // Grounding metadata should be present when Google Search is used
+    expect(finalMsg.response_metadata?.groundingMetadata).toBeDefined();
+    expect(finalMsg.response_metadata.groundingMetadata).toHaveProperty(
+      'groundingChunks'
+    );
+    expect(finalMsg.response_metadata.groundingMetadata).toHaveProperty(
+      'webSearchQueries'
+    );
   });
 });
 
