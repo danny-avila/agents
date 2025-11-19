@@ -16,10 +16,25 @@ import type { GoogleClientOptions } from '@/types';
 import {
   convertResponseContentToChatGenerationChunk,
   convertBaseMessagesToContent,
+  mapGenerateContentResultToChatResult,
 } from './utils/common';
 
 export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
   thinkingConfig?: GeminiGenerationConfig['thinkingConfig'];
+
+  /**
+   * Override to add gemini-3 model support for multimodal and function calling thought signatures
+   */
+  get _isMultimodalModel(): boolean {
+    return (
+      this.model.startsWith('gemini-1.5') ||
+      this.model.startsWith('gemini-2') ||
+      (this.model.startsWith('gemma-3-') &&
+        !this.model.startsWith('gemma-3-1b')) ||
+      this.model.startsWith('gemini-3')
+    );
+  }
+
   constructor(fields: GoogleClientOptions) {
     super(fields);
 
@@ -127,6 +142,66 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
     return params;
   }
 
+  async _generate(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions'],
+    runManager?: CallbackManagerForLLMRun
+  ): Promise<import('@langchain/core/outputs').ChatResult> {
+    const prompt = convertBaseMessagesToContent(
+      messages,
+      this._isMultimodalModel,
+      this.useSystemInstruction,
+      this.model
+    );
+    let actualPrompt = prompt;
+    if (prompt?.[0].role === 'system') {
+      const [systemInstruction] = prompt;
+      /** @ts-ignore */
+      this.client.systemInstruction = systemInstruction;
+      actualPrompt = prompt.slice(1);
+    }
+    const parameters = this.invocationParams(options);
+    const request = {
+      ...parameters,
+      contents: actualPrompt,
+    };
+
+    const res = await this.caller.callWithOptions(
+      { signal: options.signal },
+      async () =>
+        /** @ts-ignore */
+        this.client.generateContent(request)
+    );
+
+    const response = res.response;
+    const usageMetadata =
+      response.usageMetadata != null
+        ? {
+          input_tokens: response.usageMetadata.promptTokenCount ?? 0,
+          output_tokens:
+              (response.usageMetadata.candidatesTokenCount ?? 0) +
+              /** @ts-ignore */
+              (response.usageMetadata.thoughtsTokenCount ?? 0),
+          total_tokens: response.usageMetadata.totalTokenCount ?? 0,
+        }
+        : undefined;
+
+    /** @ts-ignore */
+    const generationResult = mapGenerateContentResultToChatResult(response, {
+      usageMetadata,
+    });
+
+    await runManager?.handleLLMNewToken(
+      generationResult.generations[0].text || '',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined
+    );
+    return generationResult;
+  }
+
   async *_streamResponseChunks(
     messages: BaseMessage[],
     options: this['ParsedCallOptions'],
@@ -135,7 +210,8 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
     const prompt = convertBaseMessagesToContent(
       messages,
       this._isMultimodalModel,
-      this.useSystemInstruction
+      this.useSystemInstruction,
+      this.model
     );
     let actualPrompt = prompt;
     if (prompt?.[0].role === 'system') {

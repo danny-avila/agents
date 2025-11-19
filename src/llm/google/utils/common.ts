@@ -12,6 +12,7 @@ import {
   type FunctionDeclarationsTool as GoogleGenerativeAIFunctionDeclarationsTool,
 } from '@google/generative-ai';
 import {
+  AIMessage,
   AIMessageChunk,
   BaseMessage,
   ChatMessage,
@@ -29,7 +30,7 @@ import {
   isDataContentBlock,
 } from '@langchain/core/messages';
 import { ChatGenerationChunk } from '@langchain/core/outputs';
-import type { ChatGeneration } from '@langchain/core/outputs';
+import type { ChatGeneration, ChatResult } from '@langchain/core/outputs';
 import { isLangChainTool } from '@langchain/core/utils/function_calling';
 import { isOpenAITool } from '@langchain/core/language_models/base';
 import { ToolCallChunk } from '@langchain/core/messages/tool';
@@ -426,7 +427,9 @@ export function convertMessageContentToParts(
 export function convertBaseMessagesToContent(
   messages: BaseMessage[],
   isMultimodalModel: boolean,
-  convertSystemMessageToHumanContent: boolean = false
+  convertSystemMessageToHumanContent: boolean = false,
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  model?: string
 ): Content[] | undefined {
   return messages.reduce<{
     content: Content[] | undefined;
@@ -606,6 +609,104 @@ export function convertResponseContentToChatGenerationChunk(
     }),
     generationInfo,
   });
+}
+
+/**
+ * Maps a Google GenerateContentResult to a LangChain ChatResult
+ */
+export function mapGenerateContentResultToChatResult(
+  response: EnhancedGenerateContentResponse,
+  extra?: {
+    usageMetadata: UsageMetadata | undefined;
+  }
+): ChatResult {
+  if (
+    !response.candidates ||
+    response.candidates.length === 0 ||
+    !response.candidates[0]
+  ) {
+    return {
+      generations: [],
+      llmOutput: {
+        filters: response.promptFeedback,
+      },
+    };
+  }
+  const functionCalls = response.functionCalls();
+  const [candidate] = response.candidates as [
+    Partial<GenerateContentCandidate> | undefined,
+  ];
+  const { content: candidateContent, ...generationInfo } = candidate ?? {};
+  let content: MessageContent | undefined;
+  if (
+    Array.isArray(candidateContent?.parts) &&
+    candidateContent.parts.length === 1 &&
+    candidateContent.parts[0].text
+  ) {
+    content = candidateContent.parts[0].text;
+  } else if (
+    Array.isArray(candidateContent?.parts) &&
+    candidateContent.parts.length > 0
+  ) {
+    content = candidateContent.parts.map((p) => {
+      if ('text' in p) {
+        return {
+          type: 'text',
+          text: p.text,
+        };
+      } else if ('executableCode' in p) {
+        return {
+          type: 'executableCode',
+          executableCode: p.executableCode,
+        };
+      } else if ('codeExecutionResult' in p) {
+        return {
+          type: 'codeExecutionResult',
+          codeExecutionResult: p.codeExecutionResult,
+        };
+      }
+      return p;
+    });
+  } else {
+    content = [];
+  }
+  let text = '';
+  if (typeof content === 'string') {
+    text = content;
+  } else if (Array.isArray(content) && content.length > 0) {
+    const block = content.find((b) => 'text' in b) as
+      | { text: string }
+      | undefined;
+    text = block?.text ?? text;
+  }
+  const generation: ChatGeneration = {
+    text,
+    message: new AIMessage({
+      content: content ?? '',
+      tool_calls: functionCalls?.map((fc) => {
+        return {
+          ...fc,
+          type: 'tool_call' as const,
+          id: 'id' in fc && typeof fc.id === 'string' ? fc.id : uuidv4(),
+        };
+      }),
+      additional_kwargs: {
+        ...generationInfo,
+      },
+      usage_metadata: extra?.usageMetadata,
+    }),
+    generationInfo,
+  };
+  return {
+    generations: [generation],
+    llmOutput: {
+      tokenUsage: {
+        promptTokens: extra?.usageMetadata?.input_tokens,
+        completionTokens: extra?.usageMetadata?.output_tokens,
+        totalTokens: extra?.usageMetadata?.total_tokens,
+      },
+    },
+  };
 }
 
 export function convertToGenerativeAITools(
