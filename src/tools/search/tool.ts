@@ -376,6 +376,7 @@ export const createSearchTool = (
     jinaApiKey,
     jinaApiUrl,
     cohereApiKey,
+    simpleRerankerInstanceUrl,
     onSearchResults: _onSearchResults,
     onGetHighlights,
   } = config;
@@ -437,6 +438,7 @@ export const createSearchTool = (
     jinaApiKey,
     jinaApiUrl,
     cohereApiKey,
+    simpleRerankerInstanceUrl,
     logger,
   });
 
