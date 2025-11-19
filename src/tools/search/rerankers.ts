@@ -1,6 +1,8 @@
 import axios from 'axios';
 import type * as t from './types';
 import { createDefaultLogger } from './utils';
+import jwt from 'jsonwebtoken';
+import { nanoid } from 'nanoid';
 
 export abstract class BaseReranker {
   protected apiKey: string | undefined;
@@ -27,6 +29,87 @@ export abstract class BaseReranker {
   }
 }
 
+export class SimpleReranker extends BaseReranker {
+  private instanceUrl: string | undefined;
+
+  constructor({ logger }: { logger?: t.Logger }) {
+    super(logger);
+    if (
+      process.env.RAG_API_URL !== undefined &&
+      process.env.RAG_API_URL !== ''
+    ) {
+      this.instanceUrl = process.env.RAG_API_URL + '/rerank';
+    }
+  }
+
+  async rerank(
+    query: string,
+    documents: string[],
+    topK: number = 5
+  ): Promise<t.Highlight[]> {
+    this.logger.debug(
+      `Reranking ${documents.length} chunks with SimpleReranker`
+    );
+
+    if (this.instanceUrl === undefined || this.instanceUrl === '') {
+      this.logger.warn('RAG_API_URL is not set. Using default ranking.');
+      return this.getDefaultRanking(documents, topK);
+    }
+
+    try {
+      const requestData = {
+        query: query,
+        docs: documents,
+        k: topK,
+      };
+
+      const statePayload = {
+        nonce: nanoid(),
+      };
+
+      const jwtSecret = process.env.JWT_SECRET;
+
+      if (jwtSecret === undefined || jwtSecret === '') {
+        this.logger.warn('JWT_SECRET is not set. Using default ranking.');
+        return this.getDefaultRanking(documents, topK);
+      }
+
+      const stateToken = jwt.sign(statePayload, jwtSecret, {
+        expiresIn: '10m',
+      });
+
+      const resp = await axios.post<t.SimpleRerankerResponse | undefined>(
+        this.instanceUrl,
+        requestData,
+        {
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: 'Bearer ' + stateToken,
+          },
+        }
+      );
+
+      if (resp.data && Array.isArray(resp.data) && resp.data.length > 0) {
+        const isValid = resp.data.every(
+          (item: t.SimpleRerankerResponse) =>
+            typeof item.text === 'string' && typeof item.score === 'number'
+        );
+        if (isValid) {
+          return resp.data;
+        }
+        this.logger.warn(
+          'Unexpected response format from Simple reranker. Using default ranking.'
+        );
+      }
+      return this.getDefaultRanking(documents, topK);
+    } catch (error) {
+      this.logger.error('Error using Simple reranker:', error);
+      // Fallback to default ranking on error
+      return this.getDefaultRanking(documents, topK);
+    }
+  }
+}
+
 export class JinaReranker extends BaseReranker {
   private apiUrl: string;
 
@@ -49,7 +132,9 @@ export class JinaReranker extends BaseReranker {
     documents: string[],
     topK: number = 5
   ): Promise<t.Highlight[]> {
-    this.logger.debug(`Reranking ${documents.length} chunks with Jina using API URL: ${this.apiUrl}`);
+    this.logger.debug(
+      `Reranking ${documents.length} chunks with Jina using API URL: ${this.apiUrl}`
+    );
 
     try {
       if (this.apiKey == null || this.apiKey === '') {
@@ -217,10 +302,18 @@ export const createReranker = (config: {
 
   switch (rerankerType.toLowerCase()) {
   case 'jina':
-    return new JinaReranker({ apiKey: jinaApiKey, apiUrl: jinaApiUrl, logger: defaultLogger });
+    return new JinaReranker({
+      apiKey: jinaApiKey,
+      apiUrl: jinaApiUrl,
+      logger: defaultLogger,
+    });
   case 'cohere':
     return new CohereReranker({
       apiKey: cohereApiKey,
+      logger: defaultLogger,
+    });
+  case 'simple':
+    return new SimpleReranker({
       logger: defaultLogger,
     });
   case 'infinity':
@@ -230,9 +323,13 @@ export const createReranker = (config: {
     return undefined;
   default:
     defaultLogger.warn(
-      `Unknown reranker type: ${rerankerType}. Defaulting to InfinityReranker.`
+      `Unknown reranker type: ${rerankerType}. Defaulting to JinaReranker.`
     );
-    return new JinaReranker({ apiKey: jinaApiKey, apiUrl: jinaApiUrl, logger: defaultLogger });
+    return new JinaReranker({
+      apiKey: jinaApiKey,
+      apiUrl: jinaApiUrl,
+      logger: defaultLogger,
+    });
   }
 };
 
