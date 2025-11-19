@@ -5,11 +5,17 @@ import {
 } from '@google/generative-ai';
 import { BindToolsInput } from '@langchain/core/language_models/chat_models';
 
+/** New GoogleSearch tool for Gemini 2.0+ models */
+export interface GoogleSearchTool {
+  googleSearch: Record<string, never>;
+}
+
 export type GoogleGenerativeAIToolType =
   | BindToolsInput
   | GoogleGenerativeAIFunctionDeclarationsTool
   | CodeExecutionTool
-  | GoogleSearchRetrievalTool;
+  | GoogleSearchRetrievalTool
+  | GoogleSearchTool;
 
 /** Enum for content modality types */
 enum Modality {
@@ -25,6 +31,13 @@ enum Modality {
 interface ModalityTokenCount {
   modality: Modality;
   tokenCount: number;
+}
+
+/** Interface for input token details with cache and tier tracking */
+export interface InputTokenDetails {
+  cache_read?: number;
+  over_200k?: number;
+  cache_read_over_200k?: number;
 }
 
 /** Main interface for Gemini API usage metadata */

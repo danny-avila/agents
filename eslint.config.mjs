@@ -28,6 +28,7 @@ export default defineConfig([globalIgnores([
     "types/**/*",
     "./script_docs.ts",
     "src/llm/anthropic/llm.spec.ts",
+    "src/llm/google/llm.spec.ts",
 ]), {
     extends: fixupConfigRules(compat.extends(
         "eslint:recommended",
