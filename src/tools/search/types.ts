@@ -6,7 +6,7 @@ import { DATE_RANGE } from './schema';
 
 export type SearchProvider = 'serper' | 'searxng';
 export type ScraperProvider = 'firecrawl' | 'serper';
-export type RerankerType = 'infinity' | 'jina' | 'cohere' | 'none';
+export type RerankerType = 'infinity' | 'jina' | 'cohere' | 'simple' | 'none';
 
 export interface Highlight {
   score: number;
@@ -160,6 +160,7 @@ export interface SearchToolConfig
   jinaApiKey?: string;
   jinaApiUrl?: string;
   cohereApiKey?: string;
+  simpleRerankerInstanceUrl?: string;
   rerankerType?: RerankerType;
   scraperProvider?: ScraperProvider;
   scraperTimeout?: number;
