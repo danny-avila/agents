@@ -316,20 +316,6 @@ function _convertLangChainContentToPart(
         mimeType,
       },
     };
-  } else if (
-    content.type === 'document' ||
-    content.type === 'audio' ||
-    content.type === 'video'
-  ) {
-    if (!isMultimodalModel) {
-      throw new Error(`This model does not support ${content.type}s`);
-    }
-    return {
-      inlineData: {
-        data: content.data,
-        mimeType: content.mimeType,
-      },
-    };
   } else if (content.type === 'media') {
     return messageContentMedia(content);
   } else if (content.type === 'tool_use') {
