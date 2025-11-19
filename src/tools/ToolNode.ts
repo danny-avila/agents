@@ -1,20 +1,32 @@
+import { ToolCall } from '@langchain/core/messages/tool';
+import {
+  ToolMessage,
+  isAIMessage,
+  isBaseMessage,
+} from '@langchain/core/messages';
 import {
   END,
+  Send,
+  Command,
   isCommand,
   isGraphInterrupt,
   MessagesAnnotation,
 } from '@langchain/langgraph';
-import { ToolCall } from '@langchain/core/messages/tool';
-import { ToolMessage, isBaseMessage } from '@langchain/core/messages';
 import type {
   RunnableConfig,
   RunnableToolLike,
 } from '@langchain/core/runnables';
 import type { BaseMessage, AIMessage } from '@langchain/core/messages';
 import type { StructuredToolInterface } from '@langchain/core/tools';
-import type { Command } from '@langchain/langgraph';
 import type * as t from '@/types';
 import { RunnableCallable } from '@/utils';
+
+/**
+ * Helper to check if a value is a Send object
+ */
+function isSend(value: unknown): value is Send {
+  return value instanceof Send;
+}
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export class ToolNode<T = any> extends RunnableCallable<T, T> {
@@ -22,6 +34,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private toolMap: Map<string, StructuredToolInterface | RunnableToolLike>;
   private loadRuntimeTools?: t.ToolRefGenerator;
   handleToolErrors = true;
+  trace = false;
   toolCallStepIds?: Map<string, string>;
   errorHandler?: t.ToolNodeConstructorParams['errorHandler'];
   private toolUsageCount: Map<string, number>;
@@ -81,6 +94,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         return output;
       } else {
         return new ToolMessage({
+          status: 'success',
           name: tool.name,
           content: typeof output === 'string' ? output : JSON.stringify(output),
           tool_call_id: call.id!,
@@ -106,6 +120,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         );
       }
       return new ToolMessage({
+        status: 'error',
         content: `Error: ${e.message}\n Please fix your mistakes.`,
         name: call.name,
         tool_call_id: call.id ?? '',
@@ -115,38 +130,116 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   protected async run(input: any, config: RunnableConfig): Promise<T> {
-    const message = Array.isArray(input)
-      ? input[input.length - 1]
-      : input.messages[input.messages.length - 1];
+    let outputs: (BaseMessage | Command)[];
 
-    if (message._getType() !== 'ai') {
-      throw new Error('ToolNode only accepts AIMessages as input.');
-    }
+    if (this.isSendInput(input)) {
+      outputs = [await this.runTool(input.lg_tool_call, config)];
+    } else {
+      let messages: BaseMessage[];
+      if (Array.isArray(input)) {
+        messages = input;
+      } else if (this.isMessagesState(input)) {
+        messages = input.messages;
+      } else {
+        throw new Error(
+          'ToolNode only accepts BaseMessage[] or { messages: BaseMessage[] } as input.'
+        );
+      }
 
-    if (this.loadRuntimeTools) {
-      const { tools, toolMap } = this.loadRuntimeTools(
-        (message as AIMessage).tool_calls ?? []
+      const toolMessageIds: Set<string> = new Set(
+        messages
+          .filter((msg) => msg._getType() === 'tool')
+          .map((msg) => (msg as ToolMessage).tool_call_id)
       );
-      this.tools = tools;
-      this.toolMap = toolMap ?? new Map(tools.map((tool) => [tool.name, tool]));
+
+      let aiMessage: AIMessage | undefined;
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const message = messages[i];
+        if (isAIMessage(message)) {
+          aiMessage = message;
+          break;
+        }
+      }
+
+      if (aiMessage == null || !isAIMessage(aiMessage)) {
+        throw new Error('ToolNode only accepts AIMessages as input.');
+      }
+
+      if (this.loadRuntimeTools) {
+        const { tools, toolMap } = this.loadRuntimeTools(
+          aiMessage.tool_calls ?? []
+        );
+        this.tools = tools;
+        this.toolMap =
+          toolMap ?? new Map(tools.map((tool) => [tool.name, tool]));
+      }
+
+      outputs = await Promise.all(
+        aiMessage.tool_calls
+          ?.filter((call) => call.id == null || !toolMessageIds.has(call.id))
+          .map((call) => this.runTool(call, config)) ?? []
+      );
     }
-    const outputs = await Promise.all(
-      (message as AIMessage).tool_calls?.map((call) =>
-        this.runTool(call, config)
-      ) ?? []
-    );
 
     if (!outputs.some(isCommand)) {
       return (Array.isArray(input) ? outputs : { messages: outputs }) as T;
     }
 
-    const combinedOutputs = outputs.map((output) => {
+    const combinedOutputs: (
+      | { messages: BaseMessage[] }
+      | BaseMessage[]
+      | Command
+    )[] = [];
+    let parentCommand: Command | null = null;
+
+    for (const output of outputs) {
       if (isCommand(output)) {
-        return output;
+        if (
+          output.graph === Command.PARENT &&
+          Array.isArray(output.goto) &&
+          output.goto.every((send): send is Send => isSend(send))
+        ) {
+          if (parentCommand) {
+            (parentCommand.goto as Send[]).push(...(output.goto as Send[]));
+          } else {
+            parentCommand = new Command({
+              graph: Command.PARENT,
+              goto: output.goto,
+            });
+          }
+        } else {
+          combinedOutputs.push(output);
+        }
+      } else {
+        combinedOutputs.push(
+          Array.isArray(input) ? [output] : { messages: [output] }
+        );
       }
-      return Array.isArray(input) ? [output] : { messages: [output] };
-    });
+    }
+
+    if (parentCommand) {
+      combinedOutputs.push(parentCommand);
+    }
+
     return combinedOutputs as T;
+  }
+
+  private isSendInput(input: unknown): input is { lg_tool_call: ToolCall } {
+    return (
+      typeof input === 'object' && input != null && 'lg_tool_call' in input
+    );
+  }
+
+  private isMessagesState(
+    input: unknown
+  ): input is { messages: BaseMessage[] } {
+    return (
+      typeof input === 'object' &&
+      input != null &&
+      'messages' in input &&
+      Array.isArray((input as { messages: unknown }).messages) &&
+      (input as { messages: unknown[] }).messages.every(isBaseMessage)
+    );
   }
 }
 
