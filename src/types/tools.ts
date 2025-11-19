@@ -34,7 +34,7 @@ export type ToolNodeOptions = {
   errorHandler?: (
     data: ToolErrorData,
     metadata?: Record<string, unknown>
-  ) => void;
+  ) => Promise<void>;
 };
 
 export type ToolNodeConstructorParams = ToolRefs & ToolNodeOptions;
