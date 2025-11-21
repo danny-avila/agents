@@ -363,6 +363,32 @@ function _formatContent(message: BaseMessage) {
     return content;
   } else {
     const contentBlocks = content.map((contentPart) => {
+      /**
+       * Skip malformed blocks that have server tool fields mixed with text type.
+       * These can occur when server_tool_use blocks get mislabeled during aggregation.
+       */
+      if (
+        'id' in contentPart &&
+        'name' in contentPart &&
+        'input' in contentPart &&
+        contentPart.type === 'text'
+      ) {
+        return null;
+      }
+
+      /**
+       * Skip malformed web_search_tool_result blocks marked as text.
+       * These have tool_use_id and nested content arrays.
+       */
+      if (
+        'tool_use_id' in contentPart &&
+        'content' in contentPart &&
+        Array.isArray(contentPart.content) &&
+        contentPart.type === 'text'
+      ) {
+        return null;
+      }
+
       if (isDataContentBlock(contentPart)) {
         return convertToProviderContentBlock(
           contentPart,
@@ -459,6 +485,21 @@ function _formatContent(message: BaseMessage) {
           }
         }
 
+        /**
+         * Skip server tool blocks when formatting content for subsequent requests.
+         * Server tools (e.g., web_search) are executed by the provider's API, and both
+         * the tool use and their results are already included in the response.
+         * We should not send these back in subsequent requests as they're not tool_calls
+         * that need invocation - they're already completed inline.
+         */
+        if (
+          contentPartCopy.type === 'server_tool_use' ||
+          contentPartCopy.type === 'web_search_tool_result' ||
+          contentPartCopy.type === 'web_search_result'
+        ) {
+          return null;
+        }
+
         // TODO: Fix when SDK types are fixed
         return {
           ...contentPartCopy,
@@ -487,10 +528,14 @@ function _formatContent(message: BaseMessage) {
           input: contentPart.functionCall.args,
         };
       } else {
+        console.error(
+          'Unsupported content part:',
+          JSON.stringify(contentPart, null, 2)
+        );
         throw new Error('Unsupported message content format');
       }
     });
-    return contentBlocks;
+    return contentBlocks.filter((block) => block !== null);
   }
 }
 
@@ -545,14 +590,15 @@ export function _convertMessagesToAnthropicPayload(
         }
       } else {
         const { content } = message;
-        const hasMismatchedToolCalls = !message.tool_calls.every((toolCall) =>
-          content.find(
-            (contentPart) =>
-              (contentPart.type === 'tool_use' ||
-                contentPart.type === 'input_json_delta' ||
-                contentPart.type === 'server_tool_use') &&
-              contentPart.id === toolCall.id
-          )
+        const hasMismatchedToolCalls = !message.tool_calls.every(
+          (toolCall) =>
+            !!content.find(
+              (contentPart) =>
+                (contentPart.type === 'tool_use' ||
+                  contentPart.type === 'input_json_delta' ||
+                  contentPart.type === 'server_tool_use') &&
+                contentPart.id === toolCall.id
+            )
         );
         if (hasMismatchedToolCalls) {
           console.warn(

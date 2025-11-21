@@ -201,7 +201,18 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
       outputs = await Promise.all(
         aiMessage.tool_calls
-          ?.filter((call) => call.id == null || !toolMessageIds.has(call.id))
+          ?.filter((call) => {
+            /**
+             * Filter out:
+             * 1. Already processed tool calls (present in toolMessageIds)
+             * 2. Server tool calls (e.g., web_search with IDs starting with 'srvtoolu_')
+             *    which are executed by the provider's API and don't require invocation
+             */
+            return (
+              (call.id == null || !toolMessageIds.has(call.id)) &&
+              !(call.id?.startsWith('srvtoolu_') ?? false)
+            );
+          })
           .map((call) => this.runTool(call, config)) ?? []
       );
     }
