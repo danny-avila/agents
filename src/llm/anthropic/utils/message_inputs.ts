@@ -407,31 +407,43 @@ function _formatContent(message: BaseMessage) {
 
       /**
        * Handle malformed web_search_tool_result blocks marked as text.
-       * These have tool_use_id and nested content arrays - fix their type instead of filtering.
+       * These have tool_use_id and nested content - fix their type instead of filtering.
        * Only correct if we can confirm it's a web search result by checking the tool_use_id prefix.
+       *
+       * Handles both success results (array content) and error results (object with error_code).
        */
       if (
         'tool_use_id' in contentPart &&
         'content' in contentPart &&
-        Array.isArray(contentPart.content) &&
         contentPart.type === 'text'
       ) {
         const rawPart = contentPart as Record<string, unknown>;
         const toolUseId = rawPart.tool_use_id as string;
+        const content = rawPart.content;
 
         // Only correct if this is definitely a server tool result (tool_use_id starts with 'srvtoolu_')
         if (toolUseId && toolUseId.startsWith('srvtoolu_')) {
-          const corrected: AnthropicWebSearchToolResultBlockParam = {
-            type: 'web_search_tool_result',
-            tool_use_id: toolUseId,
-            content:
-              rawPart.content as AnthropicWebSearchToolResultBlockParam['content'],
-          };
+          // Verify content is either an array (success) or error object
+          const isValidContent =
+            Array.isArray(content) ||
+            (content != null &&
+              typeof content === 'object' &&
+              'type' in content &&
+              (content as Record<string, unknown>).type ===
+                'web_search_tool_result_error');
 
-          return corrected;
+          if (isValidContent) {
+            const corrected: AnthropicWebSearchToolResultBlockParam = {
+              type: 'web_search_tool_result',
+              tool_use_id: toolUseId,
+              content:
+                content as AnthropicWebSearchToolResultBlockParam['content'],
+            };
+            return corrected;
+          }
         }
 
-        // If it's not a server tool result, skip it (return null to filter it out)
+        // If it's not a recognized server tool result format, skip it (return null to filter it out)
         return null;
       }
 
