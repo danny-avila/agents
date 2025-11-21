@@ -364,8 +364,10 @@ function _formatContent(message: BaseMessage) {
   } else {
     const contentBlocks = content.map((contentPart) => {
       /**
-       * Skip malformed blocks that have server tool fields mixed with text type.
+       * Handle malformed blocks that have server tool fields mixed with text type.
        * These can occur when server_tool_use blocks get mislabeled during aggregation.
+       * Correct their type ONLY if we can confirm it's a server tool by checking the ID prefix.
+       * Anthropic needs both server_tool_use and web_search_tool_result blocks for citations to work.
        */
       if (
         'id' in contentPart &&
@@ -373,12 +375,40 @@ function _formatContent(message: BaseMessage) {
         'input' in contentPart &&
         contentPart.type === 'text'
       ) {
+        const rawPart = contentPart as Record<string, unknown>;
+        const id = rawPart.id as string;
+
+        // Only correct if this is definitely a server tool (ID starts with 'srvtoolu_')
+        if (id && id.startsWith('srvtoolu_')) {
+          let input = rawPart.input;
+
+          // Ensure input is an object
+          if (typeof input === 'string') {
+            try {
+              input = JSON.parse(input);
+            } catch {
+              input = {};
+            }
+          }
+
+          const corrected: AnthropicServerToolUseBlockParam = {
+            type: 'server_tool_use',
+            id,
+            name: 'web_search',
+            input: input as Record<string, unknown>,
+          };
+
+          return corrected;
+        }
+
+        // If it's not a server tool, skip it (return null to filter it out)
         return null;
       }
 
       /**
-       * Skip malformed web_search_tool_result blocks marked as text.
-       * These have tool_use_id and nested content arrays.
+       * Handle malformed web_search_tool_result blocks marked as text.
+       * These have tool_use_id and nested content arrays - fix their type instead of filtering.
+       * Only correct if we can confirm it's a web search result by checking the tool_use_id prefix.
        */
       if (
         'tool_use_id' in contentPart &&
@@ -386,6 +416,22 @@ function _formatContent(message: BaseMessage) {
         Array.isArray(contentPart.content) &&
         contentPart.type === 'text'
       ) {
+        const rawPart = contentPart as Record<string, unknown>;
+        const toolUseId = rawPart.tool_use_id as string;
+
+        // Only correct if this is definitely a server tool result (tool_use_id starts with 'srvtoolu_')
+        if (toolUseId && toolUseId.startsWith('srvtoolu_')) {
+          const corrected: AnthropicWebSearchToolResultBlockParam = {
+            type: 'web_search_tool_result',
+            tool_use_id: toolUseId,
+            content:
+              rawPart.content as AnthropicWebSearchToolResultBlockParam['content'],
+          };
+
+          return corrected;
+        }
+
+        // If it's not a server tool result, skip it (return null to filter it out)
         return null;
       }
 
@@ -486,19 +532,12 @@ function _formatContent(message: BaseMessage) {
         }
 
         /**
-         * Skip server tool blocks when formatting content for subsequent requests.
-         * Server tools (e.g., web_search) are executed by the provider's API, and both
-         * the tool use and their results are already included in the response.
-         * We should not send these back in subsequent requests as they're not tool_calls
-         * that need invocation - they're already completed inline.
+         * For multi-turn conversations with citations, we must preserve ALL blocks
+         * including server_tool_use, web_search_tool_result, and web_search_result.
+         * Citations reference search results by index, so filtering changes indices and breaks references.
+         *
+         * The ToolNode already handles skipping server tool invocations via the srvtoolu_ prefix check.
          */
-        if (
-          contentPartCopy.type === 'server_tool_use' ||
-          contentPartCopy.type === 'web_search_tool_result' ||
-          contentPartCopy.type === 'web_search_result'
-        ) {
-          return null;
-        }
 
         // TODO: Fix when SDK types are fixed
         return {

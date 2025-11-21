@@ -306,6 +306,73 @@ describe(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
     expect(onRunStepSpy.mock.calls.length).toBeGreaterThan(0);
   });
 
+  test(`${capitalizeFirstLetter(provider)}: should handle parallel tool usage (web search + calculator)`, async () => {
+    const llmConfig = getLLMConfig(provider);
+    const customHandlers = setupCustomHandlers();
+
+    run = await Run.create<t.IState>({
+      runId: 'test-parallel-tools',
+      graphConfig: {
+        type: 'standard',
+        llmConfig,
+        tools: [
+          {
+            type: 'web_search_20250305',
+            name: 'web_search',
+            max_uses: 5,
+          },
+          new Calculator(),
+        ],
+        instructions: 'You are a helpful AI assistant.',
+      },
+      returnContent: true,
+      customHandlers,
+    });
+
+    // Use the same query as the edge case script to test actual parallel tool usage
+    const userMessage =
+      'Can you search the web for the current population of Tokyo, and also calculate what 15% of that population would be? Do both at the same time.';
+    conversationHistory = [];
+    conversationHistory.push(new HumanMessage(userMessage));
+
+    const inputs = {
+      messages: conversationHistory,
+    };
+
+    // This should complete without errors despite using both server tools and regular tools in parallel
+    const finalContentParts = await run.processStream(inputs, config);
+    expect(finalContentParts).toBeDefined();
+
+    const finalMessages = run.getRunMessages();
+    expect(finalMessages).toBeDefined();
+    expect(finalMessages?.length).toBeGreaterThan(0);
+
+    const hasWebSearch = contentParts.some(
+      (part) =>
+        !!(
+          part.type === 'tool_call' &&
+          part.tool_call?.name === 'web_search' &&
+          part.tool_call?.id?.startsWith('srvtoolu_') === true
+        )
+    );
+    const hasCalculator = contentParts.some(
+      (part) =>
+        !!(
+          part.type === 'tool_call' &&
+          part.tool_call?.name === 'calculator' &&
+          part.tool_call?.id?.startsWith('toolu_') === true
+        )
+    );
+
+    // Both tools should have been used for this query
+    expect(hasWebSearch).toBe(true);
+    expect(hasCalculator).toBe(true);
+
+    console.log(
+      `${capitalizeFirstLetter(provider)} parallel tools test: web_search (server tool) + calculator (regular tool) both used successfully`
+    );
+  });
+
   test('should handle errors appropriately', async () => {
     // Test error scenarios
     await expect(async () => {
