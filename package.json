@@ -1,6 +1,6 @@
 {
   "name": "@librechat/agents",
-  "version": "3.0.30",
+  "version": "3.0.31",
   "main": "./dist/cjs/main.cjs",
   "module": "./dist/esm/main.mjs",
   "types": "./dist/types/index.d.ts",
