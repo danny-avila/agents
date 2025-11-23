@@ -1,7 +1,6 @@
 // src/types/llm.ts
 import { ChatOllama } from '@langchain/ollama';
 import { ChatMistralAI } from '@langchain/mistralai';
-import { ChatBedrockConverse } from '@langchain/aws';
 import type {
   BindToolsInput,
   BaseChatModelParams,
@@ -33,6 +32,7 @@ import {
   ChatXAI,
 } from '@/llm/openai';
 import { CustomChatGoogleGenerativeAI } from '@/llm/google';
+import { CustomChatBedrockConverse } from '@/llm/bedrock';
 import { CustomAnthropic } from '@/llm/anthropic';
 import { ChatOpenRouter } from '@/llm/openrouter';
 import { ChatVertexAI } from '@/llm/vertexai';
@@ -126,7 +126,7 @@ export type ChatModelMap = {
   [Providers.MISTRALAI]: ChatMistralAI;
   [Providers.MISTRAL]: ChatMistralAI;
   [Providers.OPENROUTER]: ChatOpenRouter;
-  [Providers.BEDROCK]: ChatBedrockConverse;
+  [Providers.BEDROCK]: CustomChatBedrockConverse;
   [Providers.GOOGLE]: CustomChatGoogleGenerativeAI;
 };
 

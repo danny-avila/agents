@@ -1,8 +1,5 @@
 // src/llm/providers.ts
 import { ChatMistralAI } from '@langchain/mistralai';
-import { ChatBedrockConverse } from '@langchain/aws';
-// import { ChatAnthropic } from '@langchain/anthropic';
-// import { ChatVertexAI } from '@langchain/google-vertexai';
 import type {
   ChatModelConstructorMap,
   ProviderOptionsMap,
@@ -15,6 +12,7 @@ import {
   ChatXAI,
 } from '@/llm/openai';
 import { CustomChatGoogleGenerativeAI } from '@/llm/google';
+import { CustomChatBedrockConverse } from '@/llm/bedrock';
 import { CustomAnthropic } from '@/llm/anthropic';
 import { ChatOpenRouter } from '@/llm/openrouter';
 import { ChatVertexAI } from '@/llm/vertexai';
@@ -32,7 +30,7 @@ export const llmProviders: Partial<ChatModelConstructorMap> = {
   [Providers.MISTRAL]: ChatMistralAI,
   [Providers.ANTHROPIC]: CustomAnthropic,
   [Providers.OPENROUTER]: ChatOpenRouter,
-  [Providers.BEDROCK]: ChatBedrockConverse,
+  [Providers.BEDROCK]: CustomChatBedrockConverse,
   // [Providers.ANTHROPIC]: ChatAnthropic,
   [Providers.GOOGLE]: CustomChatGoogleGenerativeAI,
 };
