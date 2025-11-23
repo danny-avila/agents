@@ -87,13 +87,27 @@ export async function handleToolCallChunks({
   const alreadyDispatched =
     prevRunStep?.type === StepTypes.MESSAGE_CREATION &&
     graph.messageStepHasToolCalls.has(prevStepId);
-  if (!alreadyDispatched && tool_calls?.length === toolCallChunks.length) {
+
+  if (prevRunStep?.type === StepTypes.TOOL_CALLS) {
+    /**
+     * If previous step is already a tool_calls step, use that step ID
+     * This ensures tool call deltas are dispatched to the correct step
+     */
+    stepId = prevStepId;
+  } else if (
+    !alreadyDispatched &&
+    prevRunStep?.type === StepTypes.MESSAGE_CREATION
+  ) {
+    /**
+     * Create tool_calls step as soon as we receive the first tool call chunk
+     * This ensures deltas are always associated with the correct step
+     */
     await graph.dispatchMessageDelta(prevStepId, {
       content: [
         {
           type: ContentTypes.TEXT,
           text: '',
-          tool_call_ids: tool_calls.map((tc) => tc.id ?? ''),
+          tool_call_ids: tool_calls?.map((tc) => tc.id ?? '') ?? [],
         },
       ],
     });
@@ -102,7 +116,7 @@ export async function handleToolCallChunks({
       stepKey,
       {
         type: StepTypes.TOOL_CALLS,
-        tool_calls,
+        tool_calls: tool_calls ?? [],
       },
       metadata
     );
