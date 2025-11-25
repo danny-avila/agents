@@ -329,9 +329,17 @@ export function _convertMessagesToOpenAIParams(
       completionParam.content = '';
     }
     if (isAIMessage(message) && !!message.tool_calls?.length) {
-      completionParam.tool_calls = message.tool_calls.map(
-        convertLangChainToolCallToOpenAI
-      );
+      const toolCallProviderFields = message.additional_kwargs
+        ._tool_call_provider_fields as
+        | Record<string, Record<string, unknown>>
+        | undefined;
+      completionParam.tool_calls = message.tool_calls.map((tc) => {
+        const providerFields = toolCallProviderFields?.[tc.id!];
+        return {
+          ...convertLangChainToolCallToOpenAI(tc),
+          ...(providerFields && { provider_specific_fields: providerFields }),
+        };
+      });
       completionParam.content = hasAnthropicThinkingBlock ? content : '';
     } else {
       if (message.additional_kwargs.tool_calls != null) {
@@ -402,6 +410,7 @@ export function _convertMessagesToOpenAIResponsesParams(
       const additional_kwargs =
         lcMsg.additional_kwargs as BaseMessageFields['additional_kwargs'] & {
           [_FUNCTION_CALL_IDS_MAP_KEY]?: Record<string, string>;
+          _tool_call_provider_fields?: Record<string, unknown>;
           reasoning?: OpenAIClient.Responses.ResponseReasoningItem;
           type?: string;
           refusal?: string;
@@ -534,29 +543,43 @@ export function _convertMessagesToOpenAIResponsesParams(
         });
 
         const functionCallIds = additional_kwargs[_FUNCTION_CALL_IDS_MAP_KEY];
+        const toolCallProviderFields =
+          additional_kwargs._tool_call_provider_fields as
+            | Record<string, Record<string, unknown>>
+            | undefined;
 
         if (isAIMessage(lcMsg) && !!lcMsg.tool_calls?.length) {
           input.push(
-            ...lcMsg.tool_calls.map(
-              (toolCall): ResponsesInputItem => ({
+            ...lcMsg.tool_calls.map((toolCall): ResponsesInputItem => {
+              const providerFields = toolCallProviderFields?.[toolCall.id!];
+              return {
                 type: 'function_call',
                 name: toolCall.name,
                 arguments: JSON.stringify(toolCall.args),
                 call_id: toolCall.id!,
                 ...(zdrEnabled ? { id: functionCallIds?.[toolCall.id!] } : {}),
-              })
-            )
+                ...(providerFields && {
+                  provider_specific_fields: providerFields,
+                }),
+              };
+            })
           );
         } else if (additional_kwargs.tool_calls) {
           input.push(
             ...additional_kwargs.tool_calls.map(
-              (toolCall): ResponsesInputItem => ({
-                type: 'function_call',
-                name: toolCall.function.name,
-                call_id: toolCall.id,
-                arguments: toolCall.function.arguments,
-                ...(zdrEnabled ? { id: functionCallIds?.[toolCall.id] } : {}),
-              })
+              (toolCall): ResponsesInputItem => {
+                const providerFields = toolCallProviderFields?.[toolCall.id];
+                return {
+                  type: 'function_call',
+                  name: toolCall.function.name,
+                  call_id: toolCall.id,
+                  arguments: toolCall.function.arguments,
+                  ...(zdrEnabled ? { id: functionCallIds?.[toolCall.id] } : {}),
+                  ...(providerFields && {
+                    provider_specific_fields: providerFields,
+                  }),
+                };
+              }
             )
           );
         }

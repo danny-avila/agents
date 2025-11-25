@@ -363,6 +363,27 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
         chunk.additional_kwargs.provider_specific_fields =
           delta.provider_specific_fields;
       }
+      // Capture provider_specific_fields from individual tool calls (e.g., Gemini thought_signature)
+      if (delta.tool_calls) {
+        const toolCallProviderFields =
+          (chunk.additional_kwargs._tool_call_provider_fields as Record<
+            string,
+            unknown
+          >) ?? {};
+        for (const tc of delta.tool_calls as Array<
+          (typeof delta.tool_calls)[number] & {
+            provider_specific_fields?: Record<string, unknown>;
+          }
+        >) {
+          if (tc.provider_specific_fields && tc.id) {
+            toolCallProviderFields[tc.id] = tc.provider_specific_fields;
+          }
+        }
+        if (Object.keys(toolCallProviderFields).length > 0) {
+          chunk.additional_kwargs._tool_call_provider_fields =
+            toolCallProviderFields;
+        }
+      }
       defaultRole = delta.role ?? defaultRole;
       const newTokenIndices = {
         prompt: options.promptIndex ?? 0,
@@ -775,6 +796,31 @@ export class ChatXAI extends OriginalChatXAI {
       }
       if ('reasoning_content' in delta) {
         chunk.additional_kwargs.reasoning_content = delta.reasoning_content;
+      }
+      if ('provider_specific_fields' in delta) {
+        chunk.additional_kwargs.provider_specific_fields =
+          delta.provider_specific_fields;
+      }
+      // Capture provider_specific_fields from individual tool calls (e.g., Gemini thought_signature)
+      if (delta.tool_calls) {
+        const toolCallProviderFields =
+          (chunk.additional_kwargs._tool_call_provider_fields as Record<
+            string,
+            unknown
+          >) ?? {};
+        for (const tc of delta.tool_calls as Array<
+          (typeof delta.tool_calls)[number] & {
+            provider_specific_fields?: Record<string, unknown>;
+          }
+        >) {
+          if (tc.provider_specific_fields && tc.id) {
+            toolCallProviderFields[tc.id] = tc.provider_specific_fields;
+          }
+        }
+        if (Object.keys(toolCallProviderFields).length > 0) {
+          chunk.additional_kwargs._tool_call_provider_fields =
+            toolCallProviderFields;
+        }
       }
       defaultRole = delta.role ?? defaultRole;
       const newTokenIndices = {
