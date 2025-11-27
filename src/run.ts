@@ -197,7 +197,7 @@ export class Run<_T extends t.BaseGraphState> {
       }
       const handler = this.handlerRegistry?.getHandler(eventName);
       if (handler && this.Graph) {
-        await handler.handle(
+        return await handler.handle(
           eventName,
           data as
             | t.StreamEventData
@@ -276,6 +276,15 @@ export class Run<_T extends t.BaseGraphState> {
 
     const stream = this.graphRunnable.streamEvents(inputs, config, {
       raiseError: true,
+      /**
+       * Prevent EventStreamCallbackHandler from processing custom events.
+       * Custom events are already handled via our createCustomEventCallback()
+       * which routes them through the handlerRegistry.
+       * Without this flag, EventStreamCallbackHandler throws errors when
+       * custom events are dispatched for run IDs not in its internal map
+       * (due to timing issues in parallel execution or after run cleanup).
+       */
+      ignoreCustomEvent: true,
     });
 
     for await (const event of stream) {
@@ -431,9 +440,9 @@ export class Run<_T extends t.BaseGraphState> {
     } catch (_e) {
       // Fallback: strip callbacks to avoid EventStream tracer errors in certain environments
       // But preserve langfuse handler if it exists
-      const langfuseHandler = (invokeConfig.callbacks as t.ProvidedCallbacks)?.find(
-        (cb) => cb instanceof CallbackHandler
-      );
+      const langfuseHandler = (
+        invokeConfig.callbacks as t.ProvidedCallbacks
+      )?.find((cb) => cb instanceof CallbackHandler);
       const { callbacks: _cb, ...rest } = invokeConfig;
       const safeConfig = Object.assign({}, rest, {
         callbacks: langfuseHandler ? [langfuseHandler] : [],
