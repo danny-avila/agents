@@ -4,8 +4,8 @@ import type { RunnableConfig } from '@langchain/core/runnables';
 import type { BaseReranker } from './rerankers';
 import { DATE_RANGE } from './schema';
 
-export type SearchProvider = 'serper' | 'searxng';
-export type ScraperProvider = 'firecrawl' | 'serper';
+export type SearchProvider = 'serper' | 'searxng' | 'tavily';
+export type ScraperProvider = 'firecrawl' | 'serper' | 'tavily';
 export type RerankerType = 'infinity' | 'jina' | 'cohere' | 'none';
 
 export interface Highlight {
@@ -68,6 +68,8 @@ export interface SearchConfig {
   serperApiKey?: string;
   searxngInstanceUrl?: string;
   searxngApiKey?: string;
+  tavilyApiKey?: string;
+  tavilyApiUrl?: string;
 }
 
 export type References = {
@@ -105,6 +107,15 @@ export interface SerperScraperConfig {
   timeout?: number;
   logger?: Logger;
   includeMarkdown?: boolean;
+}
+
+export interface TavilyScraperConfig {
+  apiKey?: string;
+  apiUrl?: string;
+  timeout?: number;
+  logger?: Logger;
+  extractDepth?: 'basic' | 'advanced';
+  includeImages?: boolean;
 }
 
 export interface ScraperContentResult {
@@ -151,10 +162,17 @@ export interface CohereRerankerResponse {
 export type SafeSearchLevel = 0 | 1 | 2;
 
 export type Logger = WinstonLogger;
+export interface TavilyConfig {
+  tavilyApiKey?: string;
+  tavilyApiUrl?: string;
+  tavilyScraperOptions?: TavilyScraperConfig;
+}
+
 export interface SearchToolConfig
   extends SearchConfig,
     ProcessSourcesConfig,
-    FirecrawlConfig {
+    FirecrawlConfig,
+    TavilyConfig {
   logger?: Logger;
   safeSearch?: SafeSearchLevel;
   jinaApiKey?: string;
@@ -187,12 +205,23 @@ export interface BaseScraper {
   scrapeUrl(
     url: string,
     options?: unknown
-  ): Promise<[string, FirecrawlScrapeResponse | SerperScrapeResponse]>;
+  ): Promise<
+    [
+      string,
+      FirecrawlScrapeResponse | SerperScrapeResponse | TavilyScrapeResponse,
+    ]
+  >;
   extractContent(
-    response: FirecrawlScrapeResponse | SerperScrapeResponse
+    response:
+      | FirecrawlScrapeResponse
+      | SerperScrapeResponse
+      | TavilyScrapeResponse
   ): [string, undefined | References];
   extractMetadata(
-    response: FirecrawlScrapeResponse | SerperScrapeResponse
+    response:
+      | FirecrawlScrapeResponse
+      | SerperScrapeResponse
+      | TavilyScrapeResponse
   ):
     | ScrapeMetadata
     | Record<string, string | number | boolean | null | undefined>;
@@ -206,6 +235,11 @@ export type FirecrawlScrapeOptions = Omit<
 
 export type SerperScrapeOptions = Omit<
   SerperScraperConfig,
+  'apiKey' | 'apiUrl' | 'logger'
+>;
+
+export type TavilyScrapeOptions = Omit<
+  TavilyScraperConfig,
   'apiKey' | 'apiUrl' | 'logger'
 >;
 
@@ -291,6 +325,15 @@ export interface SerperScrapeResponse {
     markdown?: string;
     metadata?: Record<string, string | number | boolean | null | undefined>;
     credits?: number;
+  };
+  error?: string;
+}
+
+export interface TavilyScrapeResponse {
+  success: boolean;
+  data?: {
+    raw_content?: string;
+    images?: string[];
   };
   error?: string;
 }
