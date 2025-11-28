@@ -1,5 +1,4 @@
 // src/types/llm.ts
-import { ChatOllama } from '@langchain/ollama';
 import { ChatMistralAI } from '@langchain/mistralai';
 import type {
   BindToolsInput,
@@ -22,7 +21,6 @@ import type { RequestOptions } from '@google/generative-ai';
 import type { StructuredTool } from '@langchain/core/tools';
 import type { AnthropicInput } from '@langchain/anthropic';
 import type { Runnable } from '@langchain/core/runnables';
-import type { ChatOllamaInput } from '@langchain/ollama';
 import type { OpenAI as OpenAIClient } from 'openai';
 import type { ChatXAIInput } from '@langchain/xai';
 import {
@@ -57,7 +55,6 @@ export type AnthropicReasoning = {
   thinkingBudget?: number;
 };
 export type OpenAIClientOptions = ChatOpenAIFields;
-export type OllamaClientOptions = ChatOllamaInput;
 export type AnthropicClientOptions = AnthropicInput;
 export type MistralAIClientOptions = ChatMistralAIInput;
 export type VertexAIClientOptions = ChatVertexAIInput & {
@@ -80,7 +77,6 @@ export type XAIClientOptions = ChatXAIInput;
 export type ClientOptions =
   | OpenAIClientOptions
   | AzureClientOptions
-  | OllamaClientOptions
   | AnthropicClientOptions
   | MistralAIClientOptions
   | VertexAIClientOptions
@@ -103,7 +99,6 @@ export type LLMConfig = SharedLLMConfig &
 export type ProviderOptionsMap = {
   [Providers.AZURE]: AzureClientOptions;
   [Providers.OPENAI]: OpenAIClientOptions;
-  [Providers.OLLAMA]: OllamaClientOptions;
   [Providers.GOOGLE]: GoogleClientOptions;
   [Providers.VERTEXAI]: VertexAIClientOptions;
   [Providers.DEEPSEEK]: DeepSeekClientOptions;
@@ -118,7 +113,6 @@ export type ProviderOptionsMap = {
 export type ChatModelMap = {
   [Providers.XAI]: ChatXAI;
   [Providers.OPENAI]: ChatOpenAI;
-  [Providers.OLLAMA]: ChatOllama;
   [Providers.AZURE]: AzureChatOpenAI;
   [Providers.DEEPSEEK]: ChatDeepSeek;
   [Providers.VERTEXAI]: ChatVertexAI;

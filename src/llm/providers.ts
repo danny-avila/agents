@@ -16,13 +16,11 @@ import { CustomChatBedrockConverse } from '@/llm/bedrock';
 import { CustomAnthropic } from '@/llm/anthropic';
 import { ChatOpenRouter } from '@/llm/openrouter';
 import { ChatVertexAI } from '@/llm/vertexai';
-import { ChatOllama } from '@/llm/ollama';
 import { Providers } from '@/common';
 
 export const llmProviders: Partial<ChatModelConstructorMap> = {
   [Providers.XAI]: ChatXAI,
   [Providers.OPENAI]: ChatOpenAI,
-  [Providers.OLLAMA]: ChatOllama,
   [Providers.AZURE]: AzureChatOpenAI,
   [Providers.VERTEXAI]: ChatVertexAI,
   [Providers.DEEPSEEK]: ChatDeepSeek,
@@ -38,7 +36,6 @@ export const llmProviders: Partial<ChatModelConstructorMap> = {
 export const manualToolStreamProviders = new Set<Providers | string>([
   Providers.ANTHROPIC,
   Providers.BEDROCK,
-  Providers.OLLAMA,
 ]);
 
 export const getChatModelClass = <P extends Providers>(

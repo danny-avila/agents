@@ -12,7 +12,6 @@ export function isOpenAILike(provider?: string | Providers): boolean {
       Providers.OPENROUTER,
       Providers.XAI,
       Providers.DEEPSEEK,
-      Providers.OLLAMA,
     ] as string[]
   ).includes(provider);
 }

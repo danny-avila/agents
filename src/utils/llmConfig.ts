@@ -78,12 +78,14 @@ export const llmConfigs: Record<string, t.LLMConfig | undefined> = {
     azureOpenAIApiVersion: process.env.AZURE_OPENAI_API_VERSION,
     model: process.env.AZURE_MODEL_NAME ?? 'gpt-4o',
   },
-  [Providers.OLLAMA]: {
-    provider: Providers.OLLAMA,
+  ollama: {
+    provider: Providers.OPENAI,
     model: 'gpt-oss:20b',
     streaming: true,
     streamUsage: true,
-    baseUrl: 'http://localhost:11434',
+    configuration: {
+      baseURL: 'http://localhost:11434/v1',
+    },
   },
   lmstudio: {
     provider: Providers.OPENAI,

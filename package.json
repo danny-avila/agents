@@ -106,7 +106,6 @@
     "@langchain/google-vertexai": "^0.2.18",
     "@langchain/langgraph": "^0.4.9",
     "@langchain/mistralai": "^0.2.1",
-    "@langchain/ollama": "^0.2.3",
     "@langchain/openai": "0.5.18",
     "@langchain/textsplitters": "^0.1.0",
     "@langchain/xai": "^0.0.3",

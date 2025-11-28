@@ -77,7 +77,6 @@ export enum Providers {
   ANTHROPIC = 'anthropic',
   MISTRALAI = 'mistralai',
   MISTRAL = 'mistral',
-  OLLAMA = 'ollama',
   GOOGLE = 'google',
   AZURE = 'azureOpenAI',
   DEEPSEEK = 'deepseek',
