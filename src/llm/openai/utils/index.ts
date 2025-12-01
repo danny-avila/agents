@@ -290,6 +290,8 @@ const completionsApiContentBlockConverter: StandardContentBlockConverter<{
 export interface ConvertMessagesOptions {
   /** Include reasoning_content field for DeepSeek thinking mode with tool calls */
   includeReasoningContent?: boolean;
+  /** Include reasoning_details field for OpenRouter/Gemini/Claude thinking mode with tool calls */
+  includeReasoningDetails?: boolean;
 }
 
 // Used in LangSmith, export is important here
@@ -347,6 +349,13 @@ export function _convertMessagesToOpenAIParams(
         completionParam.reasoning_content =
           message.additional_kwargs.reasoning_content;
       }
+      if (
+        options?.includeReasoningDetails === true &&
+        message.additional_kwargs.reasoning_details != null
+      ) {
+        completionParam.reasoning_details =
+          message.additional_kwargs.reasoning_details;
+      }
     } else {
       if (message.additional_kwargs.tool_calls != null) {
         completionParam.tool_calls = message.additional_kwargs.tool_calls;
@@ -356,6 +365,13 @@ export function _convertMessagesToOpenAIParams(
         ) {
           completionParam.reasoning_content =
             message.additional_kwargs.reasoning_content;
+        }
+        if (
+          options?.includeReasoningDetails === true &&
+          message.additional_kwargs.reasoning_details != null
+        ) {
+          completionParam.reasoning_details =
+            message.additional_kwargs.reasoning_details;
         }
       }
       if ((message as ToolMessage).tool_call_id != null) {

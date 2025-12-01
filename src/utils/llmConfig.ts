@@ -56,8 +56,8 @@ export const llmConfigs: Record<string, t.LLMConfig | undefined> = {
     provider: Providers.OPENROUTER,
     streaming: true,
     streamUsage: true,
-    model: 'openai/gpt-4.1',
-    openAIApiKey: process.env.OPENROUTER_API_KEY,
+    model: 'anthropic/claude-sonnet-4',
+    apiKey: process.env.OPENROUTER_API_KEY,
     configuration: {
       baseURL: process.env.OPENROUTER_BASE_URL,
       defaultHeaders: {
