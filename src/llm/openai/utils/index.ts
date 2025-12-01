@@ -286,10 +286,17 @@ const completionsApiContentBlockConverter: StandardContentBlockConverter<{
   },
 };
 
+/** Options for converting messages to OpenAI params */
+export interface ConvertMessagesOptions {
+  /** Include reasoning_content field for DeepSeek thinking mode with tool calls */
+  includeReasoningContent?: boolean;
+}
+
 // Used in LangSmith, export is important here
 export function _convertMessagesToOpenAIParams(
   messages: BaseMessage[],
-  model?: string
+  model?: string,
+  options?: ConvertMessagesOptions
 ): OpenAICompletionParam[] {
   // TODO: Function messages do not support array content, fix cast
   return messages.flatMap((message) => {
@@ -333,9 +340,23 @@ export function _convertMessagesToOpenAIParams(
         convertLangChainToolCallToOpenAI
       );
       completionParam.content = hasAnthropicThinkingBlock ? content : '';
+      if (
+        options?.includeReasoningContent === true &&
+        message.additional_kwargs.reasoning_content != null
+      ) {
+        completionParam.reasoning_content =
+          message.additional_kwargs.reasoning_content;
+      }
     } else {
       if (message.additional_kwargs.tool_calls != null) {
         completionParam.tool_calls = message.additional_kwargs.tool_calls;
+        if (
+          options?.includeReasoningContent === true &&
+          message.additional_kwargs.reasoning_content != null
+        ) {
+          completionParam.reasoning_content =
+            message.additional_kwargs.reasoning_content;
+        }
       }
       if ((message as ToolMessage).tool_call_id != null) {
         completionParam.tool_call_id = (message as ToolMessage).tool_call_id;
