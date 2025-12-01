@@ -88,6 +88,7 @@ export class ChatOpenRouter extends ChatOpenAI {
     const messagesMapped: OpenAICompletionParam[] =
       _convertMessagesToOpenAIParams(messages, this.model, {
         includeReasoningDetails: true,
+        convertReasoningDetailsToContent: true,
       });
 
     const params = {

@@ -107,6 +107,25 @@ export function getChunkContent({
         | undefined
     )?.summary?.[0]?.text;
   }
+  if (
+    provider === Providers.OPENROUTER &&
+    chunk?.additional_kwargs?.reasoning_details != null &&
+    Array.isArray(chunk.additional_kwargs.reasoning_details)
+  ) {
+    // Extract text from reasoning_details array (for Gemini, DeepSeek, etc.)
+    const textEntries = chunk.additional_kwargs.reasoning_details
+      .filter(
+        (detail) =>
+          detail.type === 'reasoning.text' &&
+          detail.text != null &&
+          detail.text !== ''
+      )
+      .map((detail) => detail.text)
+      .join('');
+    if (textEntries) {
+      return textEntries;
+    }
+  }
   return (
     ((chunk?.additional_kwargs?.[reasoningKey] as string | undefined) ?? '') ||
     chunk?.content
@@ -353,6 +372,13 @@ hasToolCallChunks: ${hasToolCallChunks}
       typeof reasoning_content !== 'string' &&
       reasoning_content.summary?.[0]?.text != null &&
       reasoning_content.summary[0].text
+    ) {
+      reasoning_content = 'valid';
+    } else if (
+      agentContext.provider === Providers.OPENROUTER &&
+      chunk.additional_kwargs?.reasoning_details != null &&
+      Array.isArray(chunk.additional_kwargs.reasoning_details) &&
+      chunk.additional_kwargs.reasoning_details.length > 0
     ) {
       reasoning_content = 'valid';
     }

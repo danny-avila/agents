@@ -66,6 +66,12 @@ export const llmConfigs: Record<string, t.LLMConfig | undefined> = {
       },
     },
     include_reasoning: true,
+    modelKwargs: {
+      reasoning: {
+        max_tokens: 8000,
+      },
+      max_tokens: 10000,
+    },
   } as or.ChatOpenRouterCallOptions & t.LLMConfig,
   [Providers.AZURE]: {
     provider: Providers.AZURE,

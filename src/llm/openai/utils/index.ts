@@ -290,8 +290,10 @@ const completionsApiContentBlockConverter: StandardContentBlockConverter<{
 export interface ConvertMessagesOptions {
   /** Include reasoning_content field for DeepSeek thinking mode with tool calls */
   includeReasoningContent?: boolean;
-  /** Include reasoning_details field for OpenRouter/Gemini/Claude thinking mode with tool calls */
+  /** Include reasoning_details field for OpenRouter/Gemini thinking mode with tool calls */
   includeReasoningDetails?: boolean;
+  /** Convert reasoning_details to content blocks for Claude (requires content array format) */
+  convertReasoningDetailsToContent?: boolean;
 }
 
 // Used in LangSmith, export is important here
@@ -353,8 +355,46 @@ export function _convertMessagesToOpenAIParams(
         options?.includeReasoningDetails === true &&
         message.additional_kwargs.reasoning_details != null
       ) {
-        completionParam.reasoning_details =
-          message.additional_kwargs.reasoning_details;
+        // For Claude via OpenRouter, convert reasoning_details to content blocks
+        const isClaudeModel =
+          model?.includes('claude') === true ||
+          model?.includes('anthropic') === true;
+        if (
+          options.convertReasoningDetailsToContent === true &&
+          isClaudeModel
+        ) {
+          const reasoningDetails = message.additional_kwargs
+            .reasoning_details as Record<string, unknown>[];
+          const contentBlocks = [];
+
+          // Add thinking blocks from reasoning_details
+          for (const detail of reasoningDetails) {
+            if (detail.type === 'reasoning.text' && detail.text != null) {
+              contentBlocks.push({
+                type: 'thinking',
+                thinking: detail.text,
+              });
+            } else if (
+              detail.type === 'reasoning.encrypted' &&
+              detail.data != null
+            ) {
+              contentBlocks.push({
+                type: 'redacted_thinking',
+                data: detail.data,
+                id: detail.id,
+              });
+            }
+          }
+
+          // Set content to array with thinking blocks
+          if (contentBlocks.length > 0) {
+            completionParam.content = contentBlocks;
+          }
+        } else {
+          // For non-Claude models, pass as separate field
+          completionParam.reasoning_details =
+            message.additional_kwargs.reasoning_details;
+        }
       }
     } else {
       if (message.additional_kwargs.tool_calls != null) {
@@ -370,8 +410,46 @@ export function _convertMessagesToOpenAIParams(
           options?.includeReasoningDetails === true &&
           message.additional_kwargs.reasoning_details != null
         ) {
-          completionParam.reasoning_details =
-            message.additional_kwargs.reasoning_details;
+          // For Claude via OpenRouter, convert reasoning_details to content blocks
+          const isClaudeModel =
+            model?.includes('claude') === true ||
+            model?.includes('anthropic') === true;
+          if (
+            options.convertReasoningDetailsToContent === true &&
+            isClaudeModel
+          ) {
+            const reasoningDetails = message.additional_kwargs
+              .reasoning_details as Record<string, unknown>[];
+            const contentBlocks = [];
+
+            // Add thinking blocks from reasoning_details
+            for (const detail of reasoningDetails) {
+              if (detail.type === 'reasoning.text' && detail.text != null) {
+                contentBlocks.push({
+                  type: 'thinking',
+                  thinking: detail.text,
+                });
+              } else if (
+                detail.type === 'reasoning.encrypted' &&
+                detail.data != null
+              ) {
+                contentBlocks.push({
+                  type: 'redacted_thinking',
+                  data: detail.data,
+                  id: detail.id,
+                });
+              }
+            }
+
+            // Set content to array with thinking blocks
+            if (contentBlocks.length > 0) {
+              completionParam.content = contentBlocks;
+            }
+          } else {
+            // For non-Claude models, pass as separate field
+            completionParam.reasoning_details =
+              message.additional_kwargs.reasoning_details;
+          }
         }
       }
       if ((message as ToolMessage).tool_call_id != null) {
