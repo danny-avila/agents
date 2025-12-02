@@ -1,6 +1,8 @@
 import { config } from 'dotenv';
 config();
-import { test } from '@jest/globals';
+import { test, jest } from '@jest/globals';
+
+jest.setTimeout(90000);
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import {
