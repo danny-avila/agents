@@ -705,7 +705,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         formatAnthropicArtifactContent(finalMessages);
       } else if (
         isLatestToolMessage &&
-        (isOpenAILike(agentContext.provider) ||
+        ((isOpenAILike(agentContext.provider) &&
+          agentContext.provider !== Providers.DEEPSEEK) ||
           isGoogleLike(agentContext.provider))
       ) {
         formatArtifactPayload(finalMessages);
