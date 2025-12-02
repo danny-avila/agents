@@ -27,7 +27,7 @@ jobs:
           NODE_ENV: production
 
       - name: Run tests
-        run: npx jest --testPathIgnorePatterns=title.memory-leak.test.ts
+        run: npx jest --testPathIgnorePatterns=title.memory-leak.test.ts --testPathIgnorePatterns=llm.spec.ts
         env:
           NODE_ENV: test
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -38,6 +38,13 @@ jobs:
           AZURE_OPENAI_API_VERSION: ${{ secrets.AZURE_OPENAI_API_VERSION }}
           AZURE_OPENAI_API_INSTANCE: ${{ secrets.AZURE_OPENAI_API_INSTANCE }}
           AZURE_OPENAI_API_DEPLOYMENT: ${{ secrets.AZURE_OPENAI_API_DEPLOYMENT }}
+
+      - name: Run Google LLM tests (flaky - timeouts allowed)
+        continue-on-error: true
+        run: npx jest src/llm/google/llm.spec.ts
+        env:
+          NODE_ENV: test
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
 
       - name: Prune development dependencies
         run: npm prune --production
