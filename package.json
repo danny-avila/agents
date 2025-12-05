@@ -54,6 +54,7 @@
     "tool": "node --trace-warnings -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/tools.ts --provider 'openrouter' --name 'Jo' --location 'New York, NY'",
     "search": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/search.ts --provider 'bedrock' --name 'Jo' --location 'New York, NY'",
     "tool_search_regex": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/tool_search_regex.ts",
+    "programmatic_exec": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/programmatic_exec.ts",
     "ant_web_search": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/ant_web_search.ts --name 'Jo' --location 'New York, NY'",
     "ant_web_search_edge_case": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/ant_web_search_edge_case.ts --name 'Jo' --location 'New York, NY'",
     "ant_web_search_error_edge_case": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/ant_web_search_error_edge_case.ts --name 'Jo' --location 'New York, NY'",

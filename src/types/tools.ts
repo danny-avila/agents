@@ -148,3 +148,87 @@ export type ToolSearchArtifact = {
     error?: string;
   };
 };
+
+// ============================================================================
+// Programmatic Tool Calling Types
+// ============================================================================
+
+/**
+ * Tool call requested by the Code API during programmatic execution
+ */
+export type PTCToolCall = {
+  /** Unique ID like "call_001" */
+  id: string;
+  /** Tool name */
+  name: string;
+  /** Input parameters */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  input: Record<string, any>;
+};
+
+/**
+ * Tool result sent back to the Code API
+ */
+export type PTCToolResult = {
+  /** Matches PTCToolCall.id */
+  call_id: string;
+  /** Tool execution result (any JSON-serializable value) */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  result: any;
+  /** Whether tool execution failed */
+  is_error: boolean;
+  /** Error details if is_error=true */
+  error_message?: string;
+};
+
+/**
+ * Response from the Code API for programmatic execution
+ */
+export type ProgrammaticExecutionResponse = {
+  status: 'tool_call_required' | 'completed' | 'error' | unknown;
+  session_id?: string;
+
+  /** Present when status='tool_call_required' */
+  continuation_token?: string;
+  tool_calls?: PTCToolCall[];
+
+  /** Present when status='completed' */
+  stdout?: string;
+  stderr?: string;
+  files?: FileRefs;
+
+  /** Present when status='error' */
+  error?: string;
+};
+
+/**
+ * Artifact returned by the PTC tool
+ */
+export type ProgrammaticExecutionArtifact = {
+  session_id?: string;
+  files?: FileRefs;
+};
+
+/**
+ * Runtime configuration passed via config.configurable for PTC
+ */
+export type ProgrammaticRuntimeConfig = {
+  /** Map of tool names to executable tools */
+  toolMap: ToolMap;
+};
+
+/**
+ * Initialization parameters for the PTC tool
+ */
+export type ProgrammaticToolCallingParams = {
+  /** Code API key (or use CODE_API_KEY env var) */
+  apiKey?: string;
+  /** Code API base URL (or use CODE_BASEURL env var) */
+  baseUrl?: string;
+  /** Safety limit for round-trips (default: 20) */
+  maxRoundTrips?: number;
+  /** HTTP proxy URL */
+  proxy?: string;
+  /** Environment variable key for API key */
+  [key: string]: unknown;
+};
