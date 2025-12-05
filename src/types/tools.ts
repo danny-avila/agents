@@ -78,3 +78,73 @@ export type ExecuteResult = {
   stderr: string;
   files?: FileRefs;
 };
+
+/** JSON Schema type definition for tool parameters */
+export type JsonSchemaType = {
+  type:
+    | 'string'
+    | 'number'
+    | 'integer'
+    | 'float'
+    | 'boolean'
+    | 'array'
+    | 'object';
+  enum?: string[];
+  items?: JsonSchemaType;
+  properties?: Record<string, JsonSchemaType>;
+  required?: string[];
+  description?: string;
+  additionalProperties?: boolean | JsonSchemaType;
+};
+
+/** Tool definition with optional deferred loading flag */
+export type LCTool = {
+  name: string;
+  description?: string;
+  parameters?: JsonSchemaType;
+  defer_loading?: boolean;
+};
+
+/** Map of tool names to tool definitions */
+export type LCToolRegistry = Map<string, LCTool>;
+
+/** Parameters for creating a Tool Search Regex tool */
+export type ToolSearchRegexParams = {
+  apiKey?: string;
+  toolRegistry?: LCToolRegistry;
+  onlyDeferred?: boolean;
+  baseUrl?: string;
+  [key: string]: unknown;
+};
+
+/** Simplified tool metadata for search purposes */
+export type ToolMetadata = {
+  name: string;
+  description: string;
+  parameters?: JsonSchemaType;
+};
+
+/** Individual search result for a matching tool */
+export type ToolSearchResult = {
+  tool_name: string;
+  match_score: number;
+  matched_field: string;
+  snippet: string;
+};
+
+/** Response from the tool search operation */
+export type ToolSearchResponse = {
+  tool_references: ToolSearchResult[];
+  total_tools_searched: number;
+  pattern_used: string;
+};
+
+/** Artifact returned alongside the formatted search results */
+export type ToolSearchArtifact = {
+  tool_references: ToolSearchResult[];
+  metadata: {
+    total_searched: number;
+    pattern: string;
+    error?: string;
+  };
+};

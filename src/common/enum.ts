@@ -159,6 +159,7 @@ export enum Callback {
 export enum Constants {
   OFFICIAL_CODE_BASEURL = 'https://api.librechat.ai/v1',
   EXECUTE_CODE = 'execute_code',
+  TOOL_SEARCH_REGEX = 'tool_search_regex',
   WEB_SEARCH = 'web_search',
   CONTENT_AND_ARTIFACT = 'content_and_artifact',
   LC_TRANSFER_TO_ = 'lc_transfer_to_',
