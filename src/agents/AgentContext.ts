@@ -14,6 +14,19 @@ import type { createPruneMessages } from '@/messages';
 import { ContentTypes, Providers } from '@/common';
 
 /**
+ * Checks if a tool allows the specified caller type.
+ * Default is 'direct' only if allowed_callers is not specified.
+ */
+function toolAllowsCaller(
+  toolDef: t.LCTool | undefined,
+  caller: t.AllowedCaller
+): boolean {
+  if (!toolDef) return false;
+  const allowedCallers = toolDef.allowed_callers ?? ['direct'];
+  return allowedCallers.includes(caller);
+}
+
+/**
  * Encapsulates agent-specific state that can vary between agents in a multi-agent system
  */
 export class AgentContext {
@@ -32,6 +45,7 @@ export class AgentContext {
       tools,
       toolMap,
       toolEnd,
+      toolRegistry,
       instructions,
       additional_instructions,
       streamBuffer,
@@ -48,6 +62,7 @@ export class AgentContext {
       streamBuffer,
       tools,
       toolMap,
+      toolRegistry,
       instructions,
       additionalInstructions: additional_instructions,
       reasoningKey,
@@ -102,6 +117,11 @@ export class AgentContext {
   tools?: t.GraphTools;
   /** Tool map for this agent */
   toolMap?: t.ToolMap;
+  /**
+   * Tool definitions registry (includes deferred and programmatic tool metadata).
+   * Used for tool search and programmatic tool calling.
+   */
+  toolRegistry?: t.LCToolRegistry;
   /** Instructions for this agent */
   instructions?: string;
   /** Additional instructions for this agent */
@@ -137,6 +157,7 @@ export class AgentContext {
     tokenCounter,
     tools,
     toolMap,
+    toolRegistry,
     instructions,
     additionalInstructions,
     reasoningKey,
@@ -152,6 +173,7 @@ export class AgentContext {
     tokenCounter?: t.TokenCounter;
     tools?: t.GraphTools;
     toolMap?: t.ToolMap;
+    toolRegistry?: t.LCToolRegistry;
     instructions?: string;
     additionalInstructions?: string;
     reasoningKey?: 'reasoning_content' | 'reasoning';
@@ -167,6 +189,7 @@ export class AgentContext {
     this.tokenCounter = tokenCounter;
     this.tools = tools;
     this.toolMap = toolMap;
+    this.toolRegistry = toolRegistry;
     this.instructions = instructions;
     this.additionalInstructions = additionalInstructions;
     if (reasoningKey) {
@@ -319,5 +342,68 @@ export class AgentContext {
 
     // Add tool tokens to existing instruction tokens (which may already include system message tokens)
     this.instructionTokens += toolTokens;
+  }
+
+  /**
+   * Gets a map of tools that allow programmatic (code_execution) calling.
+   * Filters toolMap based on toolRegistry's allowed_callers settings.
+   * @returns ToolMap containing only tools that allow code_execution
+   */
+  getProgrammaticToolMap(): t.ToolMap {
+    const programmaticMap: t.ToolMap = new Map();
+
+    if (!this.toolMap) {
+      return programmaticMap;
+    }
+
+    for (const [name, tool] of this.toolMap) {
+      const toolDef = this.toolRegistry?.get(name);
+      if (toolAllowsCaller(toolDef, 'code_execution')) {
+        programmaticMap.set(name, tool);
+      }
+    }
+
+    return programmaticMap;
+  }
+
+  /**
+   * Gets tool definitions for tools that allow programmatic calling.
+   * Used to send to the Code API for stub generation.
+   * @returns Array of LCTool definitions for programmatic tools
+   */
+  getProgrammaticToolDefs(): t.LCTool[] {
+    if (!this.toolRegistry) {
+      return [];
+    }
+
+    const defs: t.LCTool[] = [];
+    for (const [_name, toolDef] of this.toolRegistry) {
+      if (toolAllowsCaller(toolDef, 'code_execution')) {
+        defs.push(toolDef);
+      }
+    }
+
+    return defs;
+  }
+
+  /**
+   * Gets the tool registry for deferred tools (for tool search).
+   * @param onlyDeferred If true, only returns tools with defer_loading=true
+   * @returns LCToolRegistry with tool definitions
+   */
+  getDeferredToolRegistry(onlyDeferred: boolean = true): t.LCToolRegistry {
+    const registry: t.LCToolRegistry = new Map();
+
+    if (!this.toolRegistry) {
+      return registry;
+    }
+
+    for (const [name, toolDef] of this.toolRegistry) {
+      if (!onlyDeferred || toolDef.defer_loading === true) {
+        registry.set(name, toolDef);
+      }
+    }
+
+    return registry;
   }
 }

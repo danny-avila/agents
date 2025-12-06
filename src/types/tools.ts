@@ -35,6 +35,12 @@ export type ToolNodeOptions = {
     data: ToolErrorData,
     metadata?: Record<string, unknown>
   ) => Promise<void>;
+  /** Tools available for programmatic code execution (allowed_callers includes 'code_execution') */
+  programmaticToolMap?: ToolMap;
+  /** Tool definitions for programmatic code execution (sent to Code API for stub generation) */
+  programmaticToolDefs?: LCTool[];
+  /** Tool registry for tool search (deferred tool definitions) */
+  toolRegistry?: LCToolRegistry;
 };
 
 export type ToolNodeConstructorParams = ToolRefs & ToolNodeOptions;
@@ -97,12 +103,26 @@ export type JsonSchemaType = {
   additionalProperties?: boolean | JsonSchemaType;
 };
 
-/** Tool definition with optional deferred loading flag */
+/**
+ * Specifies which contexts can invoke a tool (inspired by Anthropic's allowed_callers)
+ * - 'direct': Only callable directly by the LLM (default if omitted)
+ * - 'code_execution': Only callable from within programmatic code execution
+ */
+export type AllowedCaller = 'direct' | 'code_execution';
+
+/** Tool definition with optional deferred loading and caller restrictions */
 export type LCTool = {
   name: string;
   description?: string;
   parameters?: JsonSchemaType;
+  /** When true, tool is not loaded into context initially (for tool search) */
   defer_loading?: boolean;
+  /**
+   * Which contexts can invoke this tool.
+   * Default: ['direct'] (only callable directly by LLM)
+   * Options: 'direct', 'code_execution'
+   */
+  allowed_callers?: AllowedCaller[];
 };
 
 /** Map of tool names to tool definitions */
@@ -207,14 +227,6 @@ export type ProgrammaticExecutionResponse = {
 export type ProgrammaticExecutionArtifact = {
   session_id?: string;
   files?: FileRefs;
-};
-
-/**
- * Runtime configuration passed via config.configurable for PTC
- */
-export type ProgrammaticRuntimeConfig = {
-  /** Map of tool names to executable tools */
-  toolMap: ToolMap;
 };
 
 /**

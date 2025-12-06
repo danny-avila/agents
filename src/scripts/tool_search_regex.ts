@@ -9,167 +9,9 @@
 import { config } from 'dotenv';
 config();
 
-import {
-  createToolSearchRegexTool,
-  ToolSearchRuntimeConfig,
-} from '@/tools/ToolSearchRegex';
-import type { LCTool, LCToolRegistry } from '@/types';
-
-/**
- * Creates a sample tool registry with various mock tools for testing.
- * These simulate the deferred tools that would exist in a real system.
- */
-function createSampleToolRegistry(): LCToolRegistry {
-  const tools: LCTool[] = [
-    {
-      name: 'get_expenses',
-      description:
-        'Retrieve expense records from the database. Supports filtering by date range, category, and amount.',
-      parameters: {
-        type: 'object',
-        properties: {
-          start_date: {
-            type: 'string',
-            description: 'Start date for filtering',
-          },
-          end_date: { type: 'string', description: 'End date for filtering' },
-          category: { type: 'string', description: 'Expense category' },
-        },
-      },
-      defer_loading: true,
-    },
-    {
-      name: 'calculate_expense_totals',
-      description:
-        'Calculate total expenses by category or time period. Returns aggregated financial data.',
-      parameters: {
-        type: 'object',
-        properties: {
-          group_by: {
-            type: 'string',
-            description: 'Group by category or month',
-          },
-        },
-      },
-      defer_loading: true,
-    },
-    {
-      name: 'create_budget',
-      description:
-        'Create a new budget plan with spending limits for different categories.',
-      parameters: {
-        type: 'object',
-        properties: {
-          name: { type: 'string', description: 'Budget name' },
-          limits: { type: 'object', description: 'Category spending limits' },
-        },
-      },
-      defer_loading: true,
-    },
-    {
-      name: 'get_weather',
-      description: 'Get current weather conditions for a specified location.',
-      parameters: {
-        type: 'object',
-        properties: {
-          location: { type: 'string', description: 'City or coordinates' },
-        },
-      },
-      defer_loading: true,
-    },
-    {
-      name: 'get_forecast',
-      description: 'Get weather forecast for the next 7 days for a location.',
-      parameters: {
-        type: 'object',
-        properties: {
-          location: { type: 'string', description: 'City or coordinates' },
-          days: { type: 'number', description: 'Number of days to forecast' },
-        },
-      },
-      defer_loading: true,
-    },
-    {
-      name: 'send_email',
-      description:
-        'Send an email to one or more recipients with attachments support.',
-      parameters: {
-        type: 'object',
-        properties: {
-          to: {
-            type: 'array',
-            items: { type: 'string' },
-            description: 'Recipients',
-          },
-          subject: { type: 'string', description: 'Email subject' },
-          body: { type: 'string', description: 'Email body' },
-        },
-      },
-      defer_loading: true,
-    },
-    {
-      name: 'search_files',
-      description: 'Search for files in the file system by name or content.',
-      parameters: {
-        type: 'object',
-        properties: {
-          query: { type: 'string', description: 'Search query' },
-          path: { type: 'string', description: 'Directory to search in' },
-        },
-      },
-      defer_loading: true,
-    },
-    {
-      name: 'run_database_query',
-      description:
-        'Execute a SQL query against the database and return results.',
-      parameters: {
-        type: 'object',
-        properties: {
-          query: { type: 'string', description: 'SQL query to execute' },
-          database: { type: 'string', description: 'Target database' },
-        },
-      },
-      defer_loading: true,
-    },
-    {
-      name: 'generate_report',
-      description:
-        'Generate a PDF or Excel report from data with customizable templates.',
-      parameters: {
-        type: 'object',
-        properties: {
-          template: { type: 'string', description: 'Report template name' },
-          format: { type: 'string', description: 'Output format: pdf or xlsx' },
-          data: { type: 'object', description: 'Data to include in report' },
-        },
-      },
-      defer_loading: true,
-    },
-    {
-      name: 'translate_text',
-      description:
-        'Translate text between languages using machine translation.',
-      parameters: {
-        type: 'object',
-        properties: {
-          text: { type: 'string', description: 'Text to translate' },
-          source_lang: { type: 'string', description: 'Source language code' },
-          target_lang: { type: 'string', description: 'Target language code' },
-        },
-      },
-      defer_loading: true,
-    },
-    {
-      name: 'calculator',
-      description:
-        'Perform mathematical calculations. Supports basic arithmetic and scientific functions.',
-      defer_loading: false, // This one is NOT deferred - should be excluded by default
-    },
-  ];
-
-  return new Map(tools.map((t) => [t.name, t]));
-}
+import { createToolSearchRegexTool } from '@/tools/ToolSearchRegex';
+import type { LCToolRegistry } from '@/types';
+import { createToolSearchToolRegistry } from '@/test/mockTools';
 
 interface RunTestOptions {
   fields?: ('name' | 'description' | 'parameters')[];
@@ -195,19 +37,13 @@ async function runTest(
   try {
     const startTime = Date.now();
 
-    const runtimeConfig: ToolSearchRuntimeConfig = {
-      toolRegistry: options.toolRegistry,
-      onlyDeferred: options.onlyDeferred ?? true,
-    };
-
-    const result = await searchTool.invoke(
-      {
-        query,
-        fields: options.fields,
-        max_results: options.max_results,
-      },
-      { configurable: runtimeConfig }
-    );
+    // Manual testing uses schema params directly
+    // (ToolNode uses different param structure when injecting)
+    const result = await searchTool.invoke({
+      query,
+      fields: options.fields,
+      max_results: options.max_results,
+    });
     const duration = Date.now() - startTime;
 
     console.log(`\nResult (${duration}ms):`);
@@ -240,16 +76,16 @@ async function main(): Promise<void> {
   }
 
   console.log('Creating sample tool registry...');
-  const toolRegistry = createSampleToolRegistry();
+  const toolRegistry = createToolSearchToolRegistry();
   console.log(
     `Registry contains ${toolRegistry.size} tools (${Array.from(toolRegistry.values()).filter((t) => t.defer_loading).length} deferred)`
   );
 
-  console.log('\nCreating Tool Search Regex tool (without registry)...');
-  const searchTool = createToolSearchRegexTool({ apiKey });
+  console.log('\nCreating Tool Search Regex tool WITH registry for testing...');
+  const searchTool = createToolSearchRegexTool({ apiKey, toolRegistry });
   console.log('Tool created successfully!');
   console.log(
-    'Note: Registry will be passed at runtime with each invocation.\n'
+    'Note: In production, ToolNode injects toolRegistry via params when invoked through the graph.\n'
   );
 
   const baseOptions = { toolRegistry, onlyDeferred: true };

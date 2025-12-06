@@ -3,10 +3,12 @@
  * Test script for Programmatic Tool Calling (PTC).
  * Run with: npm run programmatic_exec
  *
- * Demonstrates runtime toolMap injection - the tool map is passed
- * at invocation time, not at initialization time.
- *
- * This tests the PTC tool in isolation with mock tools.
+ * Demonstrates:
+ * 1. Runtime toolMap injection - the tool map is passed at invocation time
+ * 2. Tool classification with allowed_callers (inspired by Anthropic's API)
+ *    - 'direct': Tool can only be called directly by the LLM (default)
+ *    - 'code_execution': Tool can only be called from within PTC
+ *    - Both: Tool can be called either way
  *
  * IMPORTANT: The Python code passed to PTC should NOT define the tool functions.
  * The Code API automatically generates async function stubs from the tool definitions.
@@ -17,194 +19,16 @@
 import { config } from 'dotenv';
 config();
 
-import { z } from 'zod';
-import { tool } from '@langchain/core/tools';
 import type { StructuredToolInterface } from '@langchain/core/tools';
 import type { LCTool, ToolMap } from '@/types';
+import { createProgrammaticToolCallingTool } from '@/tools/ProgrammaticToolCalling';
 import {
-  createProgrammaticToolCallingTool,
-  ProgrammaticRuntimeConfig,
-} from '@/tools/ProgrammaticToolCalling';
-
-// ============================================================================
-// Mock Tool Factories
-// ============================================================================
-
-/**
- * Creates a mock get_team_members tool that returns a list of team members.
- */
-function createGetTeamMembersTool(): StructuredToolInterface {
-  return tool(
-    async () => {
-      // Simulate API delay
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      return [
-        { id: 'u1', name: 'Alice', department: 'Engineering' },
-        { id: 'u2', name: 'Bob', department: 'Marketing' },
-        { id: 'u3', name: 'Charlie', department: 'Engineering' },
-      ];
-    },
-    {
-      name: 'get_team_members',
-      description: 'Get list of team members with their IDs and departments',
-      schema: z.object({}),
-    }
-  );
-}
-
-/**
- * Creates a mock get_expenses tool that returns expenses for a user.
- */
-function createGetExpensesTool(): StructuredToolInterface {
-  const expenseData: Record<
-    string,
-    Array<{ amount: number; category: string }>
-  > = {
-    u1: [
-      { amount: 150.0, category: 'travel' },
-      { amount: 75.5, category: 'meals' },
-    ],
-    u2: [
-      { amount: 200.0, category: 'marketing' },
-      { amount: 50.0, category: 'meals' },
-      { amount: 300.0, category: 'events' },
-    ],
-    u3: [
-      { amount: 500.0, category: 'equipment' },
-      { amount: 120.0, category: 'travel' },
-      { amount: 80.0, category: 'meals' },
-    ],
-  };
-
-  return tool(
-    async ({ user_id }: { user_id: string }) => {
-      await new Promise((resolve) => setTimeout(resolve, 30));
-      return expenseData[user_id] ?? [];
-    },
-    {
-      name: 'get_expenses',
-      description: 'Get expense records for a specific user',
-      schema: z.object({
-        user_id: z.string().describe('The user ID to fetch expenses for'),
-      }),
-    }
-  );
-}
-
-/**
- * Creates a mock get_weather tool that returns weather data.
- */
-function createGetWeatherTool(): StructuredToolInterface {
-  const weatherData: Record<
-    string,
-    { temperature: number; condition: string }
-  > = {
-    'San Francisco': { temperature: 65, condition: 'Foggy' },
-    'New York': { temperature: 75, condition: 'Sunny' },
-    London: { temperature: 55, condition: 'Rainy' },
-    Tokyo: { temperature: 80, condition: 'Humid' },
-    SF: { temperature: 65, condition: 'Foggy' },
-    NYC: { temperature: 75, condition: 'Sunny' },
-  };
-
-  return tool(
-    async ({ city }: { city: string }) => {
-      await new Promise((resolve) => setTimeout(resolve, 40));
-      const weather = weatherData[city];
-      if (!weather) {
-        throw new Error(`Weather data not available for city: ${city}`);
-      }
-      return weather;
-    },
-    {
-      name: 'get_weather',
-      description: 'Get current weather for a city',
-      schema: z.object({
-        city: z.string().describe('City name'),
-      }),
-    }
-  );
-}
-
-/**
- * Creates a mock calculator tool.
- */
-function createCalculatorTool(): StructuredToolInterface {
-  return tool(
-    async ({ expression }: { expression: string }) => {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-      // Simple eval for demo (in production, use a proper math parser)
-      // eslint-disable-next-line no-eval
-      const result = eval(expression);
-      return { expression, result };
-    },
-    {
-      name: 'calculator',
-      description: 'Evaluate a mathematical expression',
-      schema: z.object({
-        expression: z.string().describe('Mathematical expression to evaluate'),
-      }),
-    }
-  );
-}
-
-// ============================================================================
-// Tool Definitions (Schemas for Code API)
-// ============================================================================
-
-const toolDefinitions: LCTool[] = [
-  {
-    name: 'get_team_members',
-    description: 'Get list of team members with their IDs and departments',
-    parameters: {
-      type: 'object',
-      properties: {},
-      required: [],
-    },
-  },
-  {
-    name: 'get_expenses',
-    description: 'Get expense records for a specific user',
-    parameters: {
-      type: 'object',
-      properties: {
-        user_id: {
-          type: 'string',
-          description: 'The user ID to fetch expenses for',
-        },
-      },
-      required: ['user_id'],
-    },
-  },
-  {
-    name: 'get_weather',
-    description: 'Get current weather for a city',
-    parameters: {
-      type: 'object',
-      properties: {
-        city: {
-          type: 'string',
-          description: 'City name',
-        },
-      },
-      required: ['city'],
-    },
-  },
-  {
-    name: 'calculator',
-    description: 'Evaluate a mathematical expression',
-    parameters: {
-      type: 'object',
-      properties: {
-        expression: {
-          type: 'string',
-          description: 'Mathematical expression to evaluate',
-        },
-      },
-      required: ['expression'],
-    },
-  },
-];
+  createGetTeamMembersTool,
+  createGetExpensesTool,
+  createGetWeatherTool,
+  createCalculatorTool,
+  createProgrammaticToolRegistry,
+} from '@/test/mockTools';
 
 // ============================================================================
 // Test Runner
@@ -235,19 +59,14 @@ async function runTest(
   try {
     const startTime = Date.now();
 
-    const runtimeConfig: ProgrammaticRuntimeConfig = {
-      toolMap: options.toolMap,
-    };
-
-    const result = await ptcTool.invoke(
-      {
-        code,
-        tools: options.tools ?? toolDefinitions,
-        session_id: options.session_id,
-        timeout: options.timeout,
-      },
-      { configurable: runtimeConfig }
-    );
+    // Manual testing: schema params + extras (LangChain moves extras to config.toolCall)
+    const result = await ptcTool.invoke({
+      code,
+      tools: options.tools,
+      session_id: options.session_id,
+      timeout: options.timeout,
+      toolMap: options.toolMap, // Non-schema field → config.toolCall.toolMap
+    });
 
     const duration = Date.now() - startTime;
 
@@ -293,6 +112,8 @@ async function main(): Promise<void> {
   ];
 
   const toolMap: ToolMap = new Map(mockTools.map((t) => [t.name, t]));
+  const toolDefinitions = Array.from(createProgrammaticToolRegistry().values());
+
   console.log(
     `ToolMap contains ${toolMap.size} tools: ${Array.from(toolMap.keys()).join(', ')}`
   );
@@ -304,7 +125,7 @@ async function main(): Promise<void> {
     'Note: toolMap will be passed at runtime with each invocation.\n'
   );
 
-  const baseOptions = { toolMap };
+  const baseOptions = { toolMap, tools: toolDefinitions };
 
   // =========================================================================
   // Test 1: Simple async tool call
@@ -524,9 +345,49 @@ print(f"Temperature difference: {difference}°F")
     }
   );
 
+  // =========================================================================
+  // Test 11: Note about ToolNode injection
+  // =========================================================================
+  console.log(`\n${'='.repeat(70)}`);
+  console.log('NOTE: ToolNode Runtime Injection');
+  console.log('='.repeat(70));
+  console.log(
+    '\nWhen PTC is invoked through ToolNode in a real agent:\n' +
+      '- ToolNode detects call.name === "programmatic_code_execution"\n' +
+      '- ToolNode injects: { ...invokeParams, toolMap, programmaticToolDefs }\n' +
+      '- PTC tool extracts these from params (not from config)\n' +
+      '- No explicit tools parameter needed in schema\n\n' +
+      'This test demonstrates param injection with explicit tools:\n'
+  );
+
+  await runTest(
+    ptcTool,
+    'Runtime injection with explicit tools',
+    `
+# ToolNode would inject toolMap+programmaticToolDefs
+# For this test, we pass tools explicitly (same effect)
+team = await get_team_members()
+print(f"Team size: {len(team)}")
+for member in team:
+    print(f"- {member['name']} ({member['department']})")
+    `,
+    baseOptions
+  );
+
   console.log('\n' + '='.repeat(70));
   console.log('All tests completed!');
   console.log('='.repeat(70) + '\n');
+  console.log('Summary of allowed_callers patterns:');
+  console.log(
+    '- get_team_members, get_expenses, calculator: code_execution only'
+  );
+  console.log('- get_weather: both direct and code_execution');
+  console.log(
+    '\nIn a real agent setup, the LLM would only see tools with allowed_callers'
+  );
+  console.log(
+    'including "direct", while PTC can call any tool with "code_execution".\n'
+  );
 }
 
 main().catch((err) => {

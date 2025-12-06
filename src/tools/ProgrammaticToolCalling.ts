@@ -82,9 +82,9 @@ Requirements:
         parameters: z.any(), // JsonSchemaType
       })
     )
-    .min(1)
+    .optional()
     .describe(
-      'Array of tool definitions that can be called from the code. Tool names must match tools available in the toolMap passed via config.configurable.'
+      'Optional array of tool definitions that can be called from the code. If not provided, uses programmatic tools configured in the agent context. Tool names must match tools available in the toolMap.'
     ),
   session_id: z
     .string()
@@ -238,18 +238,6 @@ function formatCompletedResponse(
 }
 
 // ============================================================================
-// Runtime Configuration Interface
-// ============================================================================
-
-/**
- * Runtime configuration that can be passed when invoking the tool.
- * This allows passing the tool map at invocation time rather than initialization.
- */
-export interface ProgrammaticRuntimeConfig {
-  toolMap?: t.ToolMap;
-}
-
-// ============================================================================
 // Tool Factory
 // ============================================================================
 
@@ -276,24 +264,24 @@ export interface ProgrammaticRuntimeConfig {
  * );
  */
 function createProgrammaticToolCallingTool(
-  params: t.ProgrammaticToolCallingParams = {}
+  initParams: t.ProgrammaticToolCallingParams = {}
 ): DynamicStructuredTool<typeof ProgrammaticToolCallingSchema> {
   const apiKey =
-    (params[EnvVar.CODE_API_KEY] as string | undefined) ??
-    params.apiKey ??
+    (initParams[EnvVar.CODE_API_KEY] as string | undefined) ??
+    initParams.apiKey ??
     getEnvironmentVariable(EnvVar.CODE_API_KEY) ??
     '';
 
   if (!apiKey) {
     throw new Error(
       'No API key provided for programmatic tool calling. ' +
-        'Set CODE_API_KEY environment variable or pass apiKey in params.'
+        'Set CODE_API_KEY environment variable or pass apiKey in initParams.'
     );
   }
 
-  const baseUrl = params.baseUrl ?? getCodeBaseURL();
-  const maxRoundTrips = params.maxRoundTrips ?? DEFAULT_MAX_ROUND_TRIPS;
-  const proxy = params.proxy ?? process.env.PROXY;
+  const baseUrl = initParams.baseUrl ?? getCodeBaseURL();
+  const maxRoundTrips = initParams.maxRoundTrips ?? DEFAULT_MAX_ROUND_TRIPS;
+  const proxy = initParams.proxy ?? process.env.PROXY;
   const EXEC_ENDPOINT = `${baseUrl}/exec/programmatic`;
 
   const description = `
@@ -321,15 +309,26 @@ Patterns:
 `.trim();
 
   return tool<typeof ProgrammaticToolCallingSchema>(
-    async ({ code, tools, session_id, timeout = DEFAULT_TIMEOUT }, config) => {
-      const runtimeConfig = (config.configurable ??
-        {}) as ProgrammaticRuntimeConfig;
-      const toolMap = runtimeConfig.toolMap;
+    async (params, config) => {
+      const { code, tools, session_id, timeout = DEFAULT_TIMEOUT } = params;
 
-      if (!toolMap || toolMap.size === 0) {
+      // Extra params injected by ToolNode (follows web_search pattern)
+      const { toolMap, programmaticToolDefs } = config.toolCall ?? {};
+
+      if (toolMap == null || toolMap.size === 0) {
         throw new Error(
-          'No toolMap provided in config.configurable. ' +
-            'Pass { configurable: { toolMap } } when invoking the tool.'
+          'No toolMap provided. ' +
+            'ToolNode should inject this from AgentContext when invoked through the graph.'
+        );
+      }
+
+      // Use provided tools or fall back to programmaticToolDefs from ToolNode
+      const effectiveTools = tools ?? programmaticToolDefs;
+
+      if (effectiveTools == null || effectiveTools.length === 0) {
+        throw new Error(
+          'No tool definitions provided. ' +
+            'Either pass tools in the input or ensure ToolNode injects programmaticToolDefs.'
         );
       }
 
@@ -345,7 +344,7 @@ Patterns:
           apiKey,
           {
             code,
-            tools,
+            tools: effectiveTools,
             session_id,
             timeout,
           },

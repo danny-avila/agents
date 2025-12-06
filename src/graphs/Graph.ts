@@ -443,9 +443,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   initializeTools({
     currentTools,
     currentToolMap,
+    agentContext,
   }: {
     currentTools?: t.GraphTools;
     currentToolMap?: t.ToolMap;
+    agentContext?: AgentContext;
   }): CustomToolNode<t.BaseGraphState> | ToolNode<t.BaseGraphState> {
     return new CustomToolNode<t.BaseGraphState>({
       tools: (currentTools as t.GenericTool[] | undefined) ?? [],
@@ -453,6 +455,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       toolCallStepIds: this.toolCallStepIds,
       errorHandler: (data, metadata) =>
         StandardGraph.handleToolCallErrorStatic(this, data, metadata),
+      toolRegistry: agentContext?.toolRegistry,
+      programmaticToolMap: agentContext?.getProgrammaticToolMap(),
+      programmaticToolDefs: agentContext?.getProgrammaticToolDefs(),
     });
   }
 
@@ -879,6 +884,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         this.initializeTools({
           currentTools: agentContext.tools,
           currentToolMap: agentContext.toolMap,
+          agentContext,
         })
       )
       .addEdge(START, agentNode)

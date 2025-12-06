@@ -18,7 +18,7 @@ import type {
 import type { RunnableConfig, Runnable } from '@langchain/core/runnables';
 import type { ChatGenerationChunk } from '@langchain/core/outputs';
 import type { GoogleAIToolType } from '@langchain/google-common';
-import type { ToolMap, ToolEndEvent, GenericTool } from '@/types/tools';
+import type { ToolMap, ToolEndEvent, GenericTool, LCTool } from '@/types/tools';
 import type { Providers, Callback, GraphNodeKeys } from '@/common';
 import type { StandardGraph, MultiAgentGraph } from '@/graphs';
 import type { ClientOptions } from '@/types/llm';
@@ -369,4 +369,10 @@ export interface AgentInputs {
   reasoningKey?: 'reasoning_content' | 'reasoning';
   /** Format content blocks as strings (for legacy compatibility i.e. Ollama/Azure Serverless) */
   useLegacyContent?: boolean;
+  /**
+   * Tool definitions for all tools, including deferred and programmatic.
+   * Used for tool search and programmatic tool calling.
+   * Maps tool name to LCTool definition.
+   */
+  toolRegistry?: Map<string, LCTool>;
 }

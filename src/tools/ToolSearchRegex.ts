@@ -307,15 +307,6 @@ function formatSearchResults(searchResponse: t.ToolSearchResponse): string {
 }
 
 /**
- * Runtime configuration that can be passed when invoking the tool.
- * This allows passing the tool registry at invocation time rather than initialization.
- */
-export interface ToolSearchRuntimeConfig {
-  toolRegistry?: t.LCToolRegistry;
-  onlyDeferred?: boolean;
-}
-
-/**
  * Creates a Tool Search Regex tool for discovering tools from a large registry.
  *
  * This tool enables AI agents to dynamically discover tools from a large library
@@ -343,11 +334,11 @@ export interface ToolSearchRuntimeConfig {
  * );
  */
 function createToolSearchRegexTool(
-  params: t.ToolSearchRegexParams = {}
+  initParams: t.ToolSearchRegexParams = {}
 ): DynamicStructuredTool<typeof ToolSearchRegexSchema> {
   const apiKey: string =
-    (params[EnvVar.CODE_API_KEY] as string | undefined) ??
-    params.apiKey ??
+    (initParams[EnvVar.CODE_API_KEY] as string | undefined) ??
+    initParams.apiKey ??
     getEnvironmentVariable(EnvVar.CODE_API_KEY) ??
     '';
 
@@ -355,9 +346,9 @@ function createToolSearchRegexTool(
     throw new Error('No API key provided for tool search regex tool.');
   }
 
-  const baseEndpoint = params.baseUrl ?? getCodeBaseURL();
+  const baseEndpoint = initParams.baseUrl ?? getCodeBaseURL();
   const EXEC_ENDPOINT = `${baseEndpoint}/exec`;
-  const defaultOnlyDeferred = params.onlyDeferred ?? true;
+  const defaultOnlyDeferred = initParams.onlyDeferred ?? true;
 
   const description = `
 Searches through available tools to find ones matching your query pattern.
@@ -370,10 +361,19 @@ Usage:
 `.trim();
 
   return tool<typeof ToolSearchRegexSchema>(
-    async (
-      { query, fields = ['name', 'description'], max_results = 10 },
-      config
-    ) => {
+    async (params, config) => {
+      const {
+        query,
+        fields = ['name', 'description'],
+        max_results = 10,
+      } = params;
+
+      // Extra params injected by ToolNode (follows web_search pattern)
+      const {
+        toolRegistry: paramToolRegistry,
+        onlyDeferred: paramOnlyDeferred,
+      } = config.toolCall ?? {};
+
       const { safe: sanitizedPattern, wasEscaped } = sanitizeRegex(query);
 
       let warningMessage = '';
@@ -382,14 +382,16 @@ Usage:
           'Note: The provided pattern was converted to a literal search for safety.\n\n';
       }
 
-      const runtimeConfig = (config.configurable ??
-        {}) as ToolSearchRuntimeConfig;
-      const toolRegistry = runtimeConfig.toolRegistry ?? params.toolRegistry;
-      const onlyDeferred = runtimeConfig.onlyDeferred ?? defaultOnlyDeferred;
+      // Priority: ToolNode injection (via config.toolCall) > initialization params
+      const toolRegistry = paramToolRegistry ?? initParams.toolRegistry;
+      const onlyDeferred =
+        paramOnlyDeferred !== undefined
+          ? paramOnlyDeferred
+          : defaultOnlyDeferred;
 
-      if (!toolRegistry) {
+      if (toolRegistry == null) {
         return [
-          `${warningMessage}Error: No tool registry provided. Pass toolRegistry either at initialization or via config.configurable.toolRegistry`,
+          `${warningMessage}Error: No tool registry provided. Configure toolRegistry at agent level or initialization.`,
           {
             tool_references: [],
             metadata: {
@@ -401,11 +403,11 @@ Usage:
         ];
       }
 
-      const toolsArray = Array.from(toolRegistry.values());
+      const toolsArray: t.LCTool[] = Array.from(toolRegistry.values());
 
       const deferredTools: t.ToolMetadata[] = toolsArray
         .filter((lcTool) => {
-          if (onlyDeferred) {
+          if (onlyDeferred === true) {
             return lcTool.defer_loading === true;
           }
           return true;

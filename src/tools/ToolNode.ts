@@ -20,6 +20,7 @@ import type { BaseMessage, AIMessage } from '@langchain/core/messages';
 import type { StructuredToolInterface } from '@langchain/core/tools';
 import type * as t from '@/types';
 import { RunnableCallable } from '@/utils';
+import { Constants } from '@/common';
 
 /**
  * Helper to check if a value is a Send object
@@ -38,6 +39,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   toolCallStepIds?: Map<string, string>;
   errorHandler?: t.ToolNodeConstructorParams['errorHandler'];
   private toolUsageCount: Map<string, number>;
+  /** Tools available for programmatic code execution */
+  private programmaticToolMap?: t.ToolMap;
+  /** Tool definitions for programmatic code execution (sent to Code API) */
+  private programmaticToolDefs?: t.LCTool[];
+  /** Tool registry for tool search (deferred tools) */
+  private toolRegistry?: t.LCToolRegistry;
 
   constructor({
     tools,
@@ -48,6 +55,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     toolCallStepIds,
     handleToolErrors,
     loadRuntimeTools,
+    programmaticToolMap,
+    programmaticToolDefs,
+    toolRegistry,
   }: t.ToolNodeConstructorParams) {
     super({ name, tags, func: (input, config) => this.run(input, config) });
     this.tools = tools;
@@ -57,6 +67,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     this.loadRuntimeTools = loadRuntimeTools;
     this.errorHandler = errorHandler;
     this.toolUsageCount = new Map<string, number>();
+    this.programmaticToolMap = programmaticToolMap;
+    this.programmaticToolDefs = programmaticToolDefs;
+    this.toolRegistry = toolRegistry;
   }
 
   /**
@@ -83,10 +96,31 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       this.toolUsageCount.set(call.name, turn + 1);
       const args = call.args;
       const stepId = this.toolCallStepIds?.get(call.id!);
-      const output = await tool.invoke(
-        { ...call, args, type: 'tool_call', stepId, turn },
-        config
-      );
+
+      // Build invoke params - LangChain extracts non-schema fields to config.toolCall
+      let invokeParams: Record<string, unknown> = {
+        ...call,
+        args,
+        type: 'tool_call',
+        stepId,
+        turn,
+      };
+
+      // Inject runtime data for special tools (becomes available at config.toolCall)
+      if (call.name === Constants.PROGRAMMATIC_TOOL_CALLING) {
+        invokeParams = {
+          ...invokeParams,
+          toolMap: this.programmaticToolMap,
+          programmaticToolDefs: this.programmaticToolDefs,
+        };
+      } else if (call.name === Constants.TOOL_SEARCH_REGEX) {
+        invokeParams = {
+          ...invokeParams,
+          toolRegistry: this.toolRegistry,
+        };
+      }
+
+      const output = await tool.invoke(invokeParams, config);
       if (
         (isBaseMessage(output) && output._getType() === 'tool') ||
         isCommand(output)
