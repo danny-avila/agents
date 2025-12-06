@@ -39,12 +39,63 @@ jobs:
           AZURE_OPENAI_API_INSTANCE: ${{ secrets.AZURE_OPENAI_API_INSTANCE }}
           AZURE_OPENAI_API_DEPLOYMENT: ${{ secrets.AZURE_OPENAI_API_DEPLOYMENT }}
 
+      - name: Check for Google LLM changes
+        id: google_changes
+        run: |
+          if git diff --name-only HEAD^ HEAD | grep -q "^src/llm/google/"; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Run Google LLM tests (flaky - timeouts allowed)
+        if: steps.google_changes.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
         continue-on-error: true
         run: npx jest src/llm/google/llm.spec.ts
         env:
           NODE_ENV: test
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+
+      - name: Check for Anthropic LLM changes
+        id: anthropic_changes
+        run: |
+          if git diff --name-only HEAD^ HEAD | grep -q "^src/llm/anthropic/"; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run Anthropic LLM tests (flaky - timeouts allowed)
+        if: steps.anthropic_changes.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+        continue-on-error: true
+        run: npx jest src/llm/anthropic/llm.spec.ts
+        env:
+          NODE_ENV: test
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      - name: Check for PTC changes
+        id: ptc_changes
+        run: |
+          if git diff --name-only HEAD^ HEAD | grep -qE "^src/tools/ProgrammaticToolCalling\.ts|^src/tools/ToolNode\.ts|^src/agents/AgentContext\.ts|^src/test/mockTools\.ts"; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run PTC unit tests
+        if: steps.ptc_changes.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+        run: npx jest src/tools/__tests__/ProgrammaticToolCalling.test.ts
+        env:
+          NODE_ENV: test
+          LIBRECHAT_CODE_API_KEY: ${{ secrets.LIBRECHAT_CODE_API_KEY }}
+
+      - name: Run PTC integration tests (manual only - requires prod API)
+        if: github.event_name == 'workflow_dispatch'
+        run: npx jest src/tools/__tests__/ProgrammaticToolCalling.integration.test.ts
+        env:
+          NODE_ENV: test
+          LIBRECHAT_CODE_API_KEY: ${{ secrets.LIBRECHAT_CODE_API_KEY }}
+          LIBRECHAT_CODE_BASEURL: ${{ secrets.LIBRECHAT_CODE_BASEURL }}
 
       - name: Prune development dependencies
         run: npm prune --production
