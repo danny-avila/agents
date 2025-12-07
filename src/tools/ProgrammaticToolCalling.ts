@@ -97,25 +97,90 @@ Requirements:
 // Helper Functions
 // ============================================================================
 
+/** Python reserved keywords that get `_tool` suffix in Code API */
+const PYTHON_KEYWORDS = new Set([
+  'False',
+  'None',
+  'True',
+  'and',
+  'as',
+  'assert',
+  'async',
+  'await',
+  'break',
+  'class',
+  'continue',
+  'def',
+  'del',
+  'elif',
+  'else',
+  'except',
+  'finally',
+  'for',
+  'from',
+  'global',
+  'if',
+  'import',
+  'in',
+  'is',
+  'lambda',
+  'nonlocal',
+  'not',
+  'or',
+  'pass',
+  'raise',
+  'return',
+  'try',
+  'while',
+  'with',
+  'yield',
+]);
+
+/**
+ * Normalizes a tool name to Python identifier format.
+ * Must match the Code API's `normalizePythonFunctionName` exactly:
+ * 1. Replace hyphens and spaces with underscores
+ * 2. Remove any other invalid characters
+ * 3. Prefix with underscore if starts with number
+ * 4. Append `_tool` if it's a Python keyword
+ * @param name - The tool name to normalize
+ * @returns Normalized Python-safe identifier
+ */
+export function normalizeToPythonIdentifier(name: string): string {
+  let normalized = name.replace(/[-\s]/g, '_');
+
+  normalized = normalized.replace(/[^a-zA-Z0-9_]/g, '');
+
+  if (/^[0-9]/.test(normalized)) {
+    normalized = '_' + normalized;
+  }
+
+  if (PYTHON_KEYWORDS.has(normalized)) {
+    normalized = normalized + '_tool';
+  }
+
+  return normalized;
+}
+
 /**
  * Extracts tool names that are actually called in the Python code.
- * Matches patterns like `await tool_name(`, `tool_name(`, and asyncio.gather calls.
+ * Handles hyphen/underscore conversion since Python identifiers use underscores.
  * @param code - The Python code to analyze
- * @param availableToolNames - Set of available tool names to match against
- * @returns Set of tool names found in the code
+ * @param toolNameMap - Map from normalized Python name to original tool name
+ * @returns Set of original tool names found in the code
  */
 export function extractUsedToolNames(
   code: string,
-  availableToolNames: Set<string>
+  toolNameMap: Map<string, string>
 ): Set<string> {
   const usedTools = new Set<string>();
 
-  for (const toolName of availableToolNames) {
-    const escapedName = toolName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  for (const [pythonName, originalName] of toolNameMap) {
+    const escapedName = pythonName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const pattern = new RegExp(`\\b${escapedName}\\s*\\(`, 'g');
 
     if (pattern.test(code)) {
-      usedTools.add(toolName);
+      usedTools.add(originalName);
     }
   }
 
@@ -124,18 +189,45 @@ export function extractUsedToolNames(
 
 /**
  * Filters tool definitions to only include tools actually used in the code.
+ * Handles the hyphen-to-underscore conversion for Python compatibility.
  * @param toolDefs - All available tool definitions
  * @param code - The Python code to analyze
+ * @param debug - Enable debug logging
  * @returns Filtered array of tool definitions
  */
 export function filterToolsByUsage(
   toolDefs: t.LCTool[],
-  code: string
+  code: string,
+  debug = false
 ): t.LCTool[] {
-  const availableToolNames = new Set(toolDefs.map((tool) => tool.name));
-  const usedToolNames = extractUsedToolNames(code, availableToolNames);
+  const toolNameMap = new Map<string, string>();
+  for (const tool of toolDefs) {
+    const pythonName = normalizeToPythonIdentifier(tool.name);
+    toolNameMap.set(pythonName, tool.name);
+  }
+
+  const usedToolNames = extractUsedToolNames(code, toolNameMap);
+
+  if (debug) {
+    // eslint-disable-next-line no-console
+    console.log(
+      `[PTC Debug] Tool filtering: found ${usedToolNames.size}/${toolDefs.length} tools in code`
+    );
+    if (usedToolNames.size > 0) {
+      // eslint-disable-next-line no-console
+      console.log(
+        `[PTC Debug] Matched tools: ${Array.from(usedToolNames).join(', ')}`
+      );
+    }
+  }
 
   if (usedToolNames.size === 0) {
+    if (debug) {
+      // eslint-disable-next-line no-console
+      console.log(
+        '[PTC Debug] No tools detected in code - sending all tools as fallback'
+      );
+    }
     return toolDefs;
   }
 
@@ -318,6 +410,7 @@ export function createProgrammaticToolCallingTool(
   const baseUrl = initParams.baseUrl ?? getCodeBaseURL();
   const maxRoundTrips = initParams.maxRoundTrips ?? DEFAULT_MAX_ROUND_TRIPS;
   const proxy = initParams.proxy ?? process.env.PROXY;
+  const debug = initParams.debug ?? process.env.PTC_DEBUG === 'true';
   const EXEC_ENDPOINT = `${baseUrl}/exec/programmatic`;
 
   const description = `
@@ -371,7 +464,15 @@ When to use this instead of calling tools directly:
         // Phase 1: Filter tools and make initial request
         // ====================================================================
 
-        const effectiveTools = filterToolsByUsage(toolDefs, code);
+        const effectiveTools = filterToolsByUsage(toolDefs, code, debug);
+
+        if (debug) {
+          // eslint-disable-next-line no-console
+          console.log(
+            `[PTC Debug] Sending ${effectiveTools.length} tools to API ` +
+              `(filtered from ${toolDefs.length})`
+          );
+        }
 
         let response = await makeRequest(
           EXEC_ENDPOINT,
@@ -400,10 +501,12 @@ When to use this instead of calling tools directly:
             );
           }
 
-          // eslint-disable-next-line no-console
-          console.log(
-            `[PTC] Round trip ${roundTrip}: ${response.tool_calls?.length ?? 0} tool(s) to execute`
-          );
+          if (debug) {
+            // eslint-disable-next-line no-console
+            console.log(
+              `[PTC Debug] Round trip ${roundTrip}: ${response.tool_calls?.length ?? 0} tool(s) to execute`
+            );
+          }
 
           const toolResults = await executeTools(
             response.tool_calls ?? [],

@@ -239,6 +239,8 @@ export type ProgrammaticToolCallingParams = {
   maxRoundTrips?: number;
   /** HTTP proxy URL */
   proxy?: string;
+  /** Enable debug logging (or set PTC_DEBUG=true env var) */
+  debug?: boolean;
   /** Environment variable key for API key */
   [key: string]: unknown;
 };

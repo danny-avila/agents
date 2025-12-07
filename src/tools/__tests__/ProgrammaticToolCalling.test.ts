@@ -11,6 +11,7 @@ import {
   extractUsedToolNames,
   filterToolsByUsage,
   executeTools,
+  normalizeToPythonIdentifier,
 } from '../ProgrammaticToolCalling';
 import {
   createProgrammaticToolRegistry,
@@ -185,8 +186,58 @@ describe('ProgrammaticToolCalling', () => {
     });
   });
 
+  describe('normalizeToPythonIdentifier', () => {
+    it('converts hyphens to underscores', () => {
+      expect(normalizeToPythonIdentifier('my-tool-name')).toBe('my_tool_name');
+    });
+
+    it('converts spaces to underscores', () => {
+      expect(normalizeToPythonIdentifier('my tool name')).toBe('my_tool_name');
+    });
+
+    it('leaves underscores unchanged', () => {
+      expect(normalizeToPythonIdentifier('my_tool_name')).toBe('my_tool_name');
+    });
+
+    it('handles mixed hyphens and underscores', () => {
+      expect(normalizeToPythonIdentifier('my-tool_name-v2')).toBe(
+        'my_tool_name_v2'
+      );
+    });
+
+    it('handles MCP-style names with hyphens', () => {
+      expect(
+        normalizeToPythonIdentifier('create_spreadsheet_mcp_Google-Workspace')
+      ).toBe('create_spreadsheet_mcp_Google_Workspace');
+    });
+
+    it('removes invalid characters', () => {
+      expect(normalizeToPythonIdentifier('tool@name!v2')).toBe('toolnamev2');
+      expect(normalizeToPythonIdentifier('get.data.v2')).toBe('getdatav2');
+    });
+
+    it('prefixes with underscore if starts with number', () => {
+      expect(normalizeToPythonIdentifier('123tool')).toBe('_123tool');
+      expect(normalizeToPythonIdentifier('1-tool')).toBe('_1_tool');
+    });
+
+    it('appends _tool suffix for Python keywords', () => {
+      expect(normalizeToPythonIdentifier('return')).toBe('return_tool');
+      expect(normalizeToPythonIdentifier('async')).toBe('async_tool');
+      expect(normalizeToPythonIdentifier('import')).toBe('import_tool');
+    });
+  });
+
   describe('extractUsedToolNames', () => {
-    const availableTools = new Set([
+    const createToolMap = (names: string[]): Map<string, string> => {
+      const map = new Map<string, string>();
+      for (const name of names) {
+        map.set(normalizeToPythonIdentifier(name), name);
+      }
+      return map;
+    };
+
+    const availableTools = createToolMap([
       'get_weather',
       'get_team_members',
       'get_expenses',
@@ -262,15 +313,29 @@ x = 1 + 2`;
       expect(used.size).toBe(0);
     });
 
-    it('handles tool names with special regex characters', () => {
-      const specialTools = new Set(['get_data.v2', 'calc+plus']);
-      const code = `await get_data.v2()
-await calc+plus()`;
+    it('handles tool names with special characters via normalization', () => {
+      const specialTools = createToolMap(['get_data.v2', 'calc+plus']);
+      const code = `await get_datav2()
+await calcplus()`;
 
       const used = extractUsedToolNames(code, specialTools);
 
       expect(used.has('get_data.v2')).toBe(true);
       expect(used.has('calc+plus')).toBe(true);
+    });
+
+    it('matches hyphenated tool names using underscore in code', () => {
+      const mcpTools = createToolMap([
+        'create_spreadsheet_mcp_Google-Workspace',
+        'search_gmail_mcp_Google-Workspace',
+      ]);
+      const code = `result = await create_spreadsheet_mcp_Google_Workspace(title="Test")
+print(result)`;
+
+      const used = extractUsedToolNames(code, mcpTools);
+
+      expect(used.size).toBe(1);
+      expect(used.has('create_spreadsheet_mcp_Google-Workspace')).toBe(true);
     });
   });
 
