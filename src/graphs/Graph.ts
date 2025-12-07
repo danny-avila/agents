@@ -35,7 +35,6 @@ import {
   GraphEvents,
   Providers,
   StepTypes,
-  Constants,
 } from '@/common';
 import {
   formatAnthropicArtifactContent,
@@ -47,6 +46,7 @@ import {
   formatContentStrings,
   createPruneMessages,
   addCacheControl,
+  extractToolDiscoveries,
 } from '@/messages';
 import {
   resetIfNotEmpty,
@@ -624,6 +624,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         throw new Error('No config provided');
       }
 
+      const { messages } = state;
+
+      // Extract tool discoveries from current turn only (similar to formatArtifactPayload pattern)
+      const discoveredNames = extractToolDiscoveries(messages);
+      if (discoveredNames.length > 0) {
+        agentContext.markToolsAsDiscovered(discoveredNames);
+      }
+
       const toolsForBinding = agentContext.getToolsForBinding();
       let model =
         this.overrideModel ??
@@ -644,7 +652,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         config.signal = this.signal;
       }
       this.config = config;
-      const { messages } = state;
 
       let messagesToUse = messages;
       if (
@@ -709,23 +716,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }
 
       const isLatestToolMessage = lastMessageY instanceof ToolMessage;
-
-      if (
-        isLatestToolMessage &&
-        lastMessageY.name === Constants.TOOL_SEARCH_REGEX &&
-        typeof lastMessageY.artifact === 'object' &&
-        lastMessageY.artifact != null
-      ) {
-        const artifact = lastMessageY.artifact as {
-          tool_references?: Array<{ tool_name: string }>;
-        };
-        if (artifact.tool_references && artifact.tool_references.length > 0) {
-          const discoveredNames = artifact.tool_references.map(
-            (ref) => ref.tool_name
-          );
-          agentContext.markToolsAsDiscovered(discoveredNames);
-        }
-      }
 
       if (
         isLatestToolMessage &&

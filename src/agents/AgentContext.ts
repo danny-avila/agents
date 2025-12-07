@@ -60,12 +60,17 @@ export class AgentContext {
     });
 
     if (tokenCounter) {
+      // Initialize system runnable BEFORE async tool token calculation
+      // This ensures system message tokens are in instructionTokens before
+      // updateTokenMapWithInstructions is called
+      agentContext.initializeSystemRunnable();
+
       const tokenMap = indexTokenCountMap || {};
       agentContext.indexTokenCountMap = tokenMap;
       agentContext.tokenCalculationPromise = agentContext
         .calculateInstructionTokens(tokenCounter)
         .then(() => {
-          // Update token map with instruction tokens
+          // Update token map with instruction tokens (includes system + tool tokens)
           agentContext.updateTokenMapWithInstructions(tokenMap);
         })
         .catch((err) => {
@@ -126,12 +131,16 @@ export class AgentContext {
     ContentTypes.TEXT;
   /** Whether tools should end the workflow */
   toolEnd: boolean = false;
-  /** System runnable for this agent */
-  systemRunnable?: Runnable<
+  /** Cached system runnable (created lazily) */
+  private cachedSystemRunnable?: Runnable<
     BaseMessage[],
     (BaseMessage | SystemMessage)[],
     RunnableConfig<Record<string, unknown>>
   >;
+  /** Whether system runnable needs rebuild (set when discovered tools change) */
+  private systemRunnableStale: boolean = true;
+  /** Cached system message token count (separate from tool tokens) */
+  private systemMessageTokens: number = 0;
   /** Promise for token calculation initialization */
   tokenCalculationPromise?: Promise<void>;
   /** Format content blocks as strings (for legacy compatibility) */
@@ -192,25 +201,33 @@ export class AgentContext {
     }
 
     this.useLegacyContent = useLegacyContent ?? false;
-
-    this.systemRunnable = this.createSystemRunnable();
   }
 
   /**
    * Builds instructions text for tools that are ONLY callable via programmatic code execution.
    * These tools cannot be called directly by the LLM but are available through the
    * programmatic_code_execution tool.
+   *
+   * Includes:
+   * - Code_execution-only tools that are NOT deferred
+   * - Code_execution-only tools that ARE deferred but have been discovered via tool search
    */
   private buildProgrammaticOnlyToolsInstructions(): string {
     if (!this.toolRegistry) return '';
 
     const programmaticOnlyTools: t.LCTool[] = [];
-    for (const toolDef of this.toolRegistry.values()) {
+    for (const [name, toolDef] of this.toolRegistry) {
       const allowedCallers = toolDef.allowed_callers ?? ['direct'];
       const isCodeExecutionOnly =
         allowedCallers.includes('code_execution') &&
         !allowedCallers.includes('direct');
-      if (isCodeExecutionOnly) {
+
+      if (!isCodeExecutionOnly) continue;
+
+      // Include if: not deferred OR deferred but discovered
+      const isDeferred = toolDef.defer_loading === true;
+      const isDiscovered = this.discoveredToolNames.has(name);
+      if (!isDeferred || isDiscovered) {
         programmaticOnlyTools.push(toolDef);
       }
     }
@@ -239,43 +256,90 @@ export class AgentContext {
   }
 
   /**
-   * Create system runnable from instructions and calculate tokens if tokenCounter is available
+   * Gets the system runnable, creating it lazily if needed.
+   * Includes instructions, additional instructions, and programmatic-only tools documentation.
+   * Only rebuilds when marked stale (via markToolsAsDiscovered).
    */
-  private createSystemRunnable():
+  get systemRunnable():
     | Runnable<
         BaseMessage[],
         (BaseMessage | SystemMessage)[],
         RunnableConfig<Record<string, unknown>>
       >
     | undefined {
-    let finalInstructions: string | BaseMessageFields | undefined =
-      this.instructions;
+    // Return cached if not stale
+    if (!this.systemRunnableStale && this.cachedSystemRunnable !== undefined) {
+      return this.cachedSystemRunnable;
+    }
+
+    // Stale or first access - rebuild
+    const instructionsString = this.buildInstructionsString();
+    this.cachedSystemRunnable = this.buildSystemRunnable(instructionsString);
+    this.systemRunnableStale = false;
+    return this.cachedSystemRunnable;
+  }
+
+  /**
+   * Explicitly initializes the system runnable.
+   * Call this before async token calculation to ensure system message tokens are counted first.
+   */
+  initializeSystemRunnable(): void {
+    if (this.systemRunnableStale || this.cachedSystemRunnable === undefined) {
+      const instructionsString = this.buildInstructionsString();
+      this.cachedSystemRunnable = this.buildSystemRunnable(instructionsString);
+      this.systemRunnableStale = false;
+    }
+  }
+
+  /**
+   * Builds the raw instructions string (without creating SystemMessage).
+   */
+  private buildInstructionsString(): string {
+    let result = this.instructions ?? '';
 
     if (
       this.additionalInstructions != null &&
       this.additionalInstructions !== ''
     ) {
-      finalInstructions =
-        finalInstructions != null && finalInstructions
-          ? `${finalInstructions}\n\n${this.additionalInstructions}`
-          : this.additionalInstructions;
+      result = result
+        ? `${result}\n\n${this.additionalInstructions}`
+        : this.additionalInstructions;
     }
 
-    // Append programmatic-only tools documentation
     const programmaticToolsDoc = this.buildProgrammaticOnlyToolsInstructions();
     if (programmaticToolsDoc) {
-      finalInstructions =
-        finalInstructions != null && finalInstructions
-          ? `${finalInstructions}${programmaticToolsDoc}`
-          : programmaticToolsDoc;
+      result = result
+        ? `${result}${programmaticToolsDoc}`
+        : programmaticToolsDoc;
     }
 
+    return result;
+  }
+
+  /**
+   * Build system runnable from pre-built instructions string.
+   * Only called when content has actually changed.
+   */
+  private buildSystemRunnable(
+    instructionsString: string
+  ):
+    | Runnable<
+        BaseMessage[],
+        (BaseMessage | SystemMessage)[],
+        RunnableConfig<Record<string, unknown>>
+      >
+    | undefined {
+    if (!instructionsString) {
+      // Remove previous tokens if we had a system message before
+      this.instructionTokens -= this.systemMessageTokens;
+      this.systemMessageTokens = 0;
+      return undefined;
+    }
+
+    let finalInstructions: string | BaseMessageFields = instructionsString;
+
     // Handle Anthropic prompt caching
-    if (
-      finalInstructions != null &&
-      finalInstructions !== '' &&
-      this.provider === Providers.ANTHROPIC
-    ) {
+    if (this.provider === Providers.ANTHROPIC) {
       const anthropicOptions = this.clientOptions as
         | t.AnthropicClientOptions
         | undefined;
@@ -291,10 +355,7 @@ export class AgentContext {
           content: [
             {
               type: 'text',
-              text:
-                typeof finalInstructions === 'string'
-                  ? finalInstructions
-                  : this.instructions,
+              text: instructionsString,
               cache_control: { type: 'ephemeral' },
             },
           ],
@@ -302,19 +363,18 @@ export class AgentContext {
       }
     }
 
-    if (finalInstructions != null && finalInstructions !== '') {
-      const systemMessage = new SystemMessage(finalInstructions);
+    const systemMessage = new SystemMessage(finalInstructions);
 
-      if (this.tokenCounter) {
-        this.instructionTokens += this.tokenCounter(systemMessage);
-      }
-
-      return RunnableLambda.from((messages: BaseMessage[]) => {
-        return [systemMessage, ...messages];
-      }).withConfig({ runName: 'prompt' });
+    // Update token counts (subtract old, add new)
+    if (this.tokenCounter) {
+      this.instructionTokens -= this.systemMessageTokens;
+      this.systemMessageTokens = this.tokenCounter(systemMessage);
+      this.instructionTokens += this.systemMessageTokens;
     }
 
-    return undefined;
+    return RunnableLambda.from((messages: BaseMessage[]) => {
+      return [systemMessage, ...messages];
+    }).withConfig({ runName: 'prompt' });
   }
 
   /**
@@ -322,6 +382,9 @@ export class AgentContext {
    */
   reset(): void {
     this.instructionTokens = 0;
+    this.systemMessageTokens = 0;
+    this.cachedSystemRunnable = undefined;
+    this.systemRunnableStale = true;
     this.lastToken = undefined;
     this.indexTokenCountMap = {};
     this.currentUsage = undefined;
@@ -412,12 +475,22 @@ export class AgentContext {
   /**
    * Marks tools as discovered via tool search.
    * Discovered tools will be included in the next model binding.
+   * Only marks system runnable stale if NEW tools were actually added.
    * @param toolNames - Array of discovered tool names
+   * @returns true if any new tools were discovered
    */
-  markToolsAsDiscovered(toolNames: string[]): void {
+  markToolsAsDiscovered(toolNames: string[]): boolean {
+    let hasNewDiscoveries = false;
     for (const name of toolNames) {
-      this.discoveredToolNames.add(name);
+      if (!this.discoveredToolNames.has(name)) {
+        this.discoveredToolNames.add(name);
+        hasNewDiscoveries = true;
+      }
     }
+    if (hasNewDiscoveries) {
+      this.systemRunnableStale = true;
+    }
+    return hasNewDiscoveries;
   }
 
   /**
