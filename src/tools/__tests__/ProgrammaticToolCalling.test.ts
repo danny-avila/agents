@@ -332,7 +332,7 @@ describe('ProgrammaticToolCalling', () => {
         name: 'programmatic_code_execution',
         args,
         toolMap,
-        // No programmaticToolDefs
+        // No `toolDefs`
       };
 
       await expect(ptcTool.invoke(args, { toolCall })).rejects.toThrow(
@@ -340,7 +340,7 @@ describe('ProgrammaticToolCalling', () => {
       );
     });
 
-    it('uses programmaticToolDefs from config when tools not provided', async () => {
+    it('uses toolDefs from config when tools not provided', async () => {
       // Skip this test - requires mocking fetch which has complex typing
       // This functionality is tested in the live script tests instead
     });

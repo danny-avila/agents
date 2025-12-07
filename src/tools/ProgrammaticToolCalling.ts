@@ -315,7 +315,7 @@ Patterns:
       const { code, tools, session_id, timeout = DEFAULT_TIMEOUT } = params;
 
       // Extra params injected by ToolNode (follows web_search pattern)
-      const { toolMap, programmaticToolDefs } = config.toolCall ?? {};
+      const { toolMap, toolDefs } = config.toolCall ?? {};
 
       if (toolMap == null || toolMap.size === 0) {
         throw new Error(
@@ -324,13 +324,13 @@ Patterns:
         );
       }
 
-      // Use provided tools or fall back to programmaticToolDefs from ToolNode
-      const effectiveTools = tools ?? programmaticToolDefs;
+      // Use provided tools or fall back to toolDefs from ToolNode
+      const effectiveTools = tools ?? toolDefs;
 
       if (effectiveTools == null || effectiveTools.length === 0) {
         throw new Error(
           'No tool definitions provided. ' +
-            'Either pass tools in the input or ensure ToolNode injects programmaticToolDefs.'
+            'Either pass tools in the input or ensure ToolNode injects toolDefs.'
         );
       }
 

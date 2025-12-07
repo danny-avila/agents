@@ -40,6 +40,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private toolUsageCount: Map<string, number>;
   /** Tool registry for filtering (lazy computation of programmatic maps) */
   private toolRegistry?: t.LCToolRegistry;
+  /** Cached programmatic tools (computed once on first PTC call) */
+  private programmaticCache?: { toolMap: t.ToolMap; toolDefs: t.LCTool[] };
 
   constructor({
     tools,
@@ -63,35 +65,29 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   }
 
   /**
-   * Lazily computes a map of tools that allow programmatic (code_execution) calling.
-   * @returns ToolMap containing only tools that allow code_execution
+   * Returns cached programmatic tools, computing once on first access.
+   * Single iteration builds both toolMap and toolDefs simultaneously.
    */
-  private getProgrammaticToolMap(): t.ToolMap {
-    const programmaticMap: t.ToolMap = new Map();
-    for (const [name, tool] of this.toolMap) {
-      const toolDef = this.toolRegistry?.get(name);
-      const allowedCallers = toolDef?.allowed_callers ?? ['direct'];
-      if (allowedCallers.includes('code_execution')) {
-        programmaticMap.set(name, tool);
-      }
-    }
-    return programmaticMap;
-  }
+  private getProgrammaticTools(): { toolMap: t.ToolMap; toolDefs: t.LCTool[] } {
+    if (this.programmaticCache) return this.programmaticCache;
 
-  /**
-   * Lazily extracts tool definitions for tools that allow programmatic calling.
-   * @returns Array of LCTool definitions for programmatic tools
-   */
-  private getProgrammaticToolDefs(): t.LCTool[] {
-    if (!this.toolRegistry) return [];
-    const defs: t.LCTool[] = [];
-    for (const toolDef of this.toolRegistry.values()) {
-      const allowedCallers = toolDef.allowed_callers ?? ['direct'];
-      if (allowedCallers.includes('code_execution')) {
-        defs.push(toolDef);
+    const toolMap: t.ToolMap = new Map();
+    const toolDefs: t.LCTool[] = [];
+
+    if (this.toolRegistry) {
+      for (const [name, toolDef] of this.toolRegistry) {
+        if (
+          (toolDef.allowed_callers ?? ['direct']).includes('code_execution')
+        ) {
+          toolDefs.push(toolDef);
+          const tool = this.toolMap.get(name);
+          if (tool) toolMap.set(name, tool);
+        }
       }
     }
-    return defs;
+
+    this.programmaticCache = { toolMap, toolDefs };
+    return this.programmaticCache;
   }
 
   /**
@@ -130,10 +126,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
       // Inject runtime data for special tools (becomes available at config.toolCall)
       if (call.name === Constants.PROGRAMMATIC_TOOL_CALLING) {
+        const { toolMap, toolDefs } = this.getProgrammaticTools();
         invokeParams = {
           ...invokeParams,
-          toolMap: this.getProgrammaticToolMap(),
-          programmaticToolDefs: this.getProgrammaticToolDefs(),
+          toolMap,
+          toolDefs,
         };
       } else if (call.name === Constants.TOOL_SEARCH_REGEX) {
         invokeParams = {
@@ -252,6 +249,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         );
         this.toolMap =
           toolMap ?? new Map(tools.map((tool) => [tool.name, tool]));
+        this.programmaticCache = undefined; // Invalidate cache on toolMap change
       }
 
       outputs = await Promise.all(

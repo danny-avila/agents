@@ -354,7 +354,7 @@ print(f"Temperature difference: {difference}°F")
   console.log(
     '\nWhen PTC is invoked through ToolNode in a real agent:\n' +
       '- ToolNode detects call.name === "programmatic_code_execution"\n' +
-      '- ToolNode injects: { ...invokeParams, toolMap, programmaticToolDefs }\n' +
+      '- ToolNode injects: { ...invokeParams, toolMap, toolDefs }\n' +
       '- PTC tool extracts these from params (not from config)\n' +
       '- No explicit tools parameter needed in schema\n\n' +
       'This test demonstrates param injection with explicit tools:\n'
@@ -364,7 +364,7 @@ print(f"Temperature difference: {difference}°F")
     ptcTool,
     'Runtime injection with explicit tools',
     `
-# ToolNode would inject toolMap+programmaticToolDefs
+# ToolNode would inject toolMap+toolDefs
 # For this test, we pass tools explicitly (same effect)
 team = await get_team_members()
 print(f"Team size: {len(team)}")
