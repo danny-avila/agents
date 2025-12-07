@@ -172,7 +172,9 @@ async function executeTools(
     }
 
     try {
-      const result = await tool.invoke(call.input);
+      const result = await tool.invoke(call.input, {
+        metadata: { [Constants.PROGRAMMATIC_TOOL_CALLING]: true },
+      });
       return {
         call_id: call.id,
         result,

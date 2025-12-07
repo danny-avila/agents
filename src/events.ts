@@ -9,7 +9,7 @@ import type { MultiAgentGraph, StandardGraph } from '@/graphs';
 import type { Logger } from 'winston';
 import type * as t from '@/types';
 import { handleToolCalls } from '@/tools/handlers';
-import { Providers } from '@/common';
+import { Constants, Providers } from '@/common';
 
 export class HandlerRegistry {
   private handlers: Map<string, t.EventHandler> = new Map();
@@ -109,6 +109,10 @@ export class ToolEndHandler implements t.EventHandler {
         } else {
           console.warn('No output found in tool_end event');
         }
+        return;
+      }
+
+      if (metadata[Constants.PROGRAMMATIC_TOOL_CALLING] === true) {
         return;
       }
 

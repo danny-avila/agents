@@ -12,6 +12,7 @@
 import { config } from 'dotenv';
 config();
 
+import { randomUUID } from 'crypto';
 import { HumanMessage, BaseMessage } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type * as t from '@/types';
@@ -136,7 +137,7 @@ async function testProgrammaticToolCalling(): Promise<void> {
   console.log('='.repeat(70) + '\n');
 
   const run = await Run.create<t.IState>({
-    runId: 'ptc-test-1',
+    runId: randomUUID(),
     graphConfig: {
       type: 'standard',
       llmConfig,
