@@ -31,7 +31,6 @@ function isSend(value: unknown): value is Send {
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export class ToolNode<T = any> extends RunnableCallable<T, T> {
-  tools: t.GenericTool[];
   private toolMap: Map<string, StructuredToolInterface | RunnableToolLike>;
   private loadRuntimeTools?: t.ToolRefGenerator;
   handleToolErrors = true;
@@ -39,11 +38,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   toolCallStepIds?: Map<string, string>;
   errorHandler?: t.ToolNodeConstructorParams['errorHandler'];
   private toolUsageCount: Map<string, number>;
-  /** Tools available for programmatic code execution */
-  private programmaticToolMap?: t.ToolMap;
-  /** Tool definitions for programmatic code execution (sent to Code API) */
-  private programmaticToolDefs?: t.LCTool[];
-  /** Tool registry for tool search (deferred tools) */
+  /** Tool registry for filtering (lazy computation of programmatic maps) */
   private toolRegistry?: t.LCToolRegistry;
 
   constructor({
@@ -55,21 +50,48 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     toolCallStepIds,
     handleToolErrors,
     loadRuntimeTools,
-    programmaticToolMap,
-    programmaticToolDefs,
     toolRegistry,
   }: t.ToolNodeConstructorParams) {
     super({ name, tags, func: (input, config) => this.run(input, config) });
-    this.tools = tools;
     this.toolMap = toolMap ?? new Map(tools.map((tool) => [tool.name, tool]));
     this.toolCallStepIds = toolCallStepIds;
     this.handleToolErrors = handleToolErrors ?? this.handleToolErrors;
     this.loadRuntimeTools = loadRuntimeTools;
     this.errorHandler = errorHandler;
     this.toolUsageCount = new Map<string, number>();
-    this.programmaticToolMap = programmaticToolMap;
-    this.programmaticToolDefs = programmaticToolDefs;
     this.toolRegistry = toolRegistry;
+  }
+
+  /**
+   * Lazily computes a map of tools that allow programmatic (code_execution) calling.
+   * @returns ToolMap containing only tools that allow code_execution
+   */
+  private getProgrammaticToolMap(): t.ToolMap {
+    const programmaticMap: t.ToolMap = new Map();
+    for (const [name, tool] of this.toolMap) {
+      const toolDef = this.toolRegistry?.get(name);
+      const allowedCallers = toolDef?.allowed_callers ?? ['direct'];
+      if (allowedCallers.includes('code_execution')) {
+        programmaticMap.set(name, tool);
+      }
+    }
+    return programmaticMap;
+  }
+
+  /**
+   * Lazily extracts tool definitions for tools that allow programmatic calling.
+   * @returns Array of LCTool definitions for programmatic tools
+   */
+  private getProgrammaticToolDefs(): t.LCTool[] {
+    if (!this.toolRegistry) return [];
+    const defs: t.LCTool[] = [];
+    for (const toolDef of this.toolRegistry.values()) {
+      const allowedCallers = toolDef.allowed_callers ?? ['direct'];
+      if (allowedCallers.includes('code_execution')) {
+        defs.push(toolDef);
+      }
+    }
+    return defs;
   }
 
   /**
@@ -110,8 +132,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       if (call.name === Constants.PROGRAMMATIC_TOOL_CALLING) {
         invokeParams = {
           ...invokeParams,
-          toolMap: this.programmaticToolMap,
-          programmaticToolDefs: this.programmaticToolDefs,
+          toolMap: this.getProgrammaticToolMap(),
+          programmaticToolDefs: this.getProgrammaticToolDefs(),
         };
       } else if (call.name === Constants.TOOL_SEARCH_REGEX) {
         invokeParams = {
@@ -228,7 +250,6 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         const { tools, toolMap } = this.loadRuntimeTools(
           aiMessage.tool_calls ?? []
         );
-        this.tools = tools;
         this.toolMap =
           toolMap ?? new Map(tools.map((tool) => [tool.name, tool]));
       }

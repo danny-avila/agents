@@ -35,11 +35,7 @@ export type ToolNodeOptions = {
     data: ToolErrorData,
     metadata?: Record<string, unknown>
   ) => Promise<void>;
-  /** Tools available for programmatic code execution (allowed_callers includes 'code_execution') */
-  programmaticToolMap?: ToolMap;
-  /** Tool definitions for programmatic code execution (sent to Code API for stub generation) */
-  programmaticToolDefs?: LCTool[];
-  /** Tool registry for tool search (deferred tool definitions) */
+  /** Tool registry for lazy computation of programmatic tools and tool search */
   toolRegistry?: LCToolRegistry;
 };
 

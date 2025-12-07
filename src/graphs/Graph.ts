@@ -457,8 +457,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       errorHandler: (data, metadata) =>
         StandardGraph.handleToolCallErrorStatic(this, data, metadata),
       toolRegistry: agentContext?.toolRegistry,
-      programmaticToolMap: agentContext?.getProgrammaticToolMap(),
-      programmaticToolDefs: agentContext?.getProgrammaticToolDefs(),
     });
   }
 
