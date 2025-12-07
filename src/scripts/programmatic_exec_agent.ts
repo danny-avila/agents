@@ -40,7 +40,7 @@ import {
 
 /**
  * Tool registry only needs business logic tools that require filtering.
- * Special tools (execute_code, programmatic_code_execution, tool_search_regex)
+ * Special tools (execute_code, run_tools_with_code, tool_search_regex)
  * are always bound directly to the LLM and don't need registry entries.
  */
 function createAgentToolRegistry(): t.LCToolRegistry {
@@ -133,7 +133,7 @@ async function main(): Promise<void> {
           instructions:
             'You are an AI assistant with access to programmatic tool calling. ' +
             'When you need to process multiple items or perform complex data operations, ' +
-            'use the programmatic_code_execution tool to write Python code that calls tools efficiently.',
+            'use the run_tools_with_code tool to write Python code that calls tools efficiently.',
         },
       ],
     },
@@ -164,7 +164,7 @@ async function main(): Promise<void> {
 4. Identify anyone who spent more than $300
 5. Show me the results in a nice format
 
-Use the programmatic_code_execution tool to do this efficiently - don't call each tool separately!`
+Use the run_tools_with_code tool to do this efficiently - don't call each tool separately!`
   );
 
   conversationHistory.push(userMessage);
@@ -199,7 +199,7 @@ Use the programmatic_code_execution tool to do this efficiently - don't call eac
   console.log('='.repeat(70));
   console.log('\nKey observations:');
   console.log(
-    '1. LLM only sees tools with allowed_callers including "direct" (get_weather, execute_code, programmatic_code_execution, tool_search_regex)'
+    '1. LLM only sees tools with allowed_callers including "direct" (get_weather, execute_code, run_tools_with_code, tool_search_regex)'
   );
   console.log(
     '2. When PTC is invoked, ToolNode automatically injects programmatic tools (get_team_members, get_expenses, get_weather)'

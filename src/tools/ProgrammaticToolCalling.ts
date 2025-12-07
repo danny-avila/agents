@@ -321,27 +321,25 @@ export function createProgrammaticToolCallingTool(
   const EXEC_ENDPOINT = `${baseUrl}/exec/programmatic`;
 
   const description = `
-Executes Python code with programmatic tool calling. Tools are automatically generated as async Python functions from the tool definitions - DO NOT define them in your code.
+Run tools by writing Python code. Tools are available as async functions - just call them with await.
+
+This is different from execute_code: here you can call your tools (like get_weather, get_expenses, etc.) directly in Python code.
 
 Usage:
-- Write Python code that calls tools using await: result = await get_data()
-- Tools are pre-defined as async functions - just call them
-- Use asyncio.gather() for parallel execution (single round-trip!)
-- Only print() output flows through the context window
-- Tool results from programmatic calls do NOT consume context tokens
+- Tools are pre-defined as async functions - call them with await
+- Use asyncio.gather() to run multiple tools in parallel
+- Only print() output is returned - tool results stay in Python
 
-When to use:
-- Processing multiple records with tool calls (10+ items)
-- Loops, conditionals, or aggregation based on tool results
-- Any workflow requiring 3+ sequential tool calls
-- Parallel execution of independent tool calls
-- Filtering/summarizing large data before returning to context
+Examples:
+- Simple: result = await get_weather(city="NYC")
+- Loop: for user in users: data = await get_expenses(user_id=user['id'])
+- Parallel: sf, ny = await asyncio.gather(get_weather(city="SF"), get_weather(city="NY"))
 
-Patterns:
-- Simple: result = await get_data()
-- Loop: for item in items: data = await fetch(item)
-- Parallel: results = await asyncio.gather(t1(), t2(), t3())
-- Conditional: if x: await tool_a() else: await tool_b()
+When to use this instead of calling tools directly:
+- You need to call tools in a loop (process many items)
+- You want parallel execution (asyncio.gather)
+- You need conditionals based on tool results
+- You want to aggregate/filter data before returning
 `.trim();
 
   return tool<typeof ProgrammaticToolCallingSchema>(

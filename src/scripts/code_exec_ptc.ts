@@ -18,24 +18,78 @@ import type { RunnableConfig } from '@langchain/core/runnables';
 import type * as t from '@/types';
 import { ChatModelStreamHandler, createContentAggregator } from '@/stream';
 import {
-  ToolEndHandler,
-  ModelEndHandler,
+  // createProgrammaticToolRegistry,
+  createGetTeamMembersTool,
+  createGetExpensesTool,
+  createGetWeatherTool,
+} from '@/test/mockTools';
+import {
   createMetadataAggregator,
+  ModelEndHandler,
+  ToolEndHandler,
 } from '@/events';
+import { createProgrammaticToolCallingTool } from '@/tools/ProgrammaticToolCalling';
+import { createCodeExecutionTool } from '@/tools/CodeExecutor';
 import { getLLMConfig } from '@/utils/llmConfig';
 import { getArgs } from '@/scripts/args';
 import { GraphEvents } from '@/common';
 import { Run } from '@/run';
-import { createCodeExecutionTool } from '@/tools/CodeExecutor';
-import { createProgrammaticToolCallingTool } from '@/tools/ProgrammaticToolCalling';
-import {
-  createGetTeamMembersTool,
-  createGetExpensesTool,
-  createGetWeatherTool,
-  createProgrammaticToolRegistry,
-} from '@/test/mockTools';
 
 const conversationHistory: BaseMessage[] = [];
+
+/**
+ * Creates a tool registry where ALL business tools are code_execution ONLY.
+ * This forces the LLM to use PTC - it cannot call these tools directly.
+ */
+function createPTCOnlyToolRegistry(): t.LCToolRegistry {
+  const toolDefs: t.LCTool[] = [
+    {
+      name: 'get_team_members',
+      description:
+        'Get list of team members. Returns array of objects with id, name, and department fields.',
+      parameters: {
+        type: 'object',
+        properties: {},
+        required: [],
+      },
+      allowed_callers: ['code_execution'], // PTC ONLY - not direct
+    },
+    {
+      name: 'get_expenses',
+      description:
+        'Get expense records for a user. Returns array of objects with amount and category fields.',
+      parameters: {
+        type: 'object',
+        properties: {
+          user_id: {
+            type: 'string',
+            description: 'The user ID to fetch expenses for',
+          },
+        },
+        required: ['user_id'],
+      },
+      allowed_callers: ['code_execution'], // PTC ONLY - not direct
+    },
+    {
+      name: 'get_weather',
+      description:
+        'Get current weather for a city. Returns object with temperature (number) and condition (string) fields.',
+      parameters: {
+        type: 'object',
+        properties: {
+          city: {
+            type: 'string',
+            description: 'City name',
+          },
+        },
+        required: ['city'],
+      },
+      allowed_callers: ['code_execution'], // PTC ONLY - not direct (changed from ['direct', 'code_execution'])
+    },
+  ];
+
+  return new Map(toolDefs.map((def) => [def.name, def]));
+}
 
 async function testProgrammaticToolCalling(): Promise<void> {
   const { userName, location, provider, currentDate } = await getArgs();
@@ -111,10 +165,10 @@ async function testProgrammaticToolCalling(): Promise<void> {
   const allTools = [teamTool, expensesTool, weatherTool, codeExecTool, ptcTool];
   const toolMap = new Map(allTools.map((t) => [t.name, t]));
 
-  // Create tool registry with allowed_callers configuration
-  // Only includes business logic tools (not special tools)
-  // Special tools (execute_code, PTC) are always bound directly to LLM
-  const toolRegistry = createProgrammaticToolRegistry();
+  // Create tool registry where ALL business tools are PTC-only
+  // This means the LLM CANNOT call get_team_members, get_expenses, get_weather directly
+  // It MUST use run_tools_with_code to invoke them
+  const toolRegistry = createPTCOnlyToolRegistry();
 
   console.log('\n' + '='.repeat(70));
   console.log('Tool Configuration Summary:');
@@ -150,11 +204,14 @@ async function testProgrammaticToolCalling(): Promise<void> {
           toolMap,
           toolRegistry,
           instructions:
-            'You are a friendly AI assistant with advanced coding capabilities. ' +
-            'You have access to team and expense management tools, but ONLY through programmatic code execution. ' +
-            'When you need to analyze expenses or process team data, use the programmatic_code_execution tool ' +
-            'to write Python code that calls get_team_members(), get_expenses(), and get_weather() functions. ' +
-            'These functions are async - use await. Use asyncio.gather() for parallel execution.',
+            'You are a friendly AI assistant with advanced coding capabilities.\n\n' +
+            'IMPORTANT: The tools get_team_members(), get_expenses(), and get_weather() are NOT available ' +
+            'for direct function calling. You MUST use the run_tools_with_code tool to invoke them.\n\n' +
+            'When you need to use these tools, write Python code using run_tools_with_code that calls:\n' +
+            '- await get_team_members() - returns list of team members\n' +
+            '- await get_expenses(user_id="...") - returns expenses for a user\n' +
+            '- await get_weather(city="...") - returns weather data\n\n' +
+            'Use asyncio.gather() for parallel execution when calling multiple tools.',
           additional_instructions: `The user's name is ${userName} and they are located in ${location}. Today is ${currentDate}.`,
         },
       ],
@@ -187,7 +244,7 @@ async function testProgrammaticToolCalling(): Promise<void> {
 4. Identify anyone who spent more than $500
 5. Show me a summary report
 
-IMPORTANT: Use the programmatic_code_execution tool to do this efficiently. 
+IMPORTANT: Use the run_tools_with_code tool to do this efficiently. 
 Don't call each tool separately - write Python code that orchestrates all the calls!`;
 
   conversationHistory.push(new HumanMessage(userMessage1));
@@ -217,7 +274,7 @@ Don't call each tool separately - write Python code that orchestrates all the ca
 3. For the Engineering team members only, calculate their travel expenses
 4. Show me the results
 
-Again, use programmatic_code_execution for maximum efficiency. Use asyncio.gather() 
+Again, use run_tools_with_code for maximum efficiency. Use asyncio.gather() 
 to check both cities' weather at the same time!`;
 
   conversationHistory.push(new HumanMessage(userMessage2));
