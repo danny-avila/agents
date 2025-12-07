@@ -849,8 +849,28 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       throw new Error(`Agent context not found for agentId: ${agentId}`);
     }
 
+    // Filter tools for LLM binding: only tools with allowed_callers including 'direct'
+    // Default: if allowed_callers is not specified, tool is bound to LLM (direct)
+    let toolsForLLM = agentContext.tools;
+    if (agentContext.toolRegistry != null && agentContext.tools != null) {
+      toolsForLLM = agentContext.tools.filter((tool) => {
+        const toolDef =
+          'name' in tool
+            ? agentContext.toolRegistry?.get(tool.name)
+            : undefined;
+        if (!toolDef) {
+          // Tool not in registry - bind to LLM by default
+          return true;
+        }
+        if (!toolDef.allowed_callers) {
+          return true;
+        }
+        return toolDef.allowed_callers.includes('direct');
+      });
+    }
+
     let currentModel = this.initializeModel({
-      tools: agentContext.tools,
+      tools: toolsForLLM,
       provider: agentContext.provider,
       clientOptions: agentContext.clientOptions,
     });
