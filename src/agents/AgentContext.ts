@@ -122,6 +122,8 @@ export class AgentContext {
    * Used for tool search and programmatic tool calling.
    */
   toolRegistry?: t.LCToolRegistry;
+  /** Set of tool names discovered via tool search (to be loaded) */
+  discoveredToolNames: Set<string> = new Set();
   /** Instructions for this agent */
   instructions?: string;
   /** Additional instructions for this agent */
@@ -286,6 +288,7 @@ export class AgentContext {
     this.lastStreamCall = undefined;
     this.tokenTypeSwitch = undefined;
     this.currentTokenType = ContentTypes.TEXT;
+    this.discoveredToolNames.clear();
   }
 
   /**
@@ -405,5 +408,55 @@ export class AgentContext {
     }
 
     return registry;
+  }
+
+  /**
+   * Marks tools as discovered via tool search.
+   * Discovered tools will be included in the next model binding.
+   * @param toolNames - Array of discovered tool names
+   */
+  markToolsAsDiscovered(toolNames: string[]): void {
+    for (const name of toolNames) {
+      this.discoveredToolNames.add(name);
+    }
+  }
+
+  /**
+   * Gets tools that should be bound to the LLM.
+   * Includes:
+   * 1. Non-deferred tools with allowed_callers: ['direct']
+   * 2. Discovered tools (from tool search)
+   * @returns Array of tools to bind to model
+   */
+  getToolsForBinding(): t.GraphTools | undefined {
+    if (!this.tools || !this.toolRegistry) {
+      return this.tools;
+    }
+
+    const toolsToInclude = this.tools.filter((tool) => {
+      if (!('name' in tool)) {
+        return true; // No name, include by default
+      }
+
+      const toolDef = this.toolRegistry?.get(tool.name);
+      if (!toolDef) {
+        return true; // Not in registry, include by default
+      }
+
+      // Check if discovered (overrides defer_loading)
+      if (this.discoveredToolNames.has(tool.name)) {
+        // Discovered tools must still have allowed_callers: ['direct']
+        const allowedCallers = toolDef.allowed_callers ?? ['direct'];
+        return allowedCallers.includes('direct');
+      }
+
+      // Not discovered: must be direct-callable AND not deferred
+      const allowedCallers = toolDef.allowed_callers ?? ['direct'];
+      return (
+        allowedCallers.includes('direct') && toolDef.defer_loading !== true
+      );
+    });
+
+    return toolsToInclude;
   }
 }

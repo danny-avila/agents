@@ -35,6 +35,7 @@ import {
   GraphEvents,
   Providers,
   StepTypes,
+  Constants,
 } from '@/common';
 import {
   formatAnthropicArtifactContent,
@@ -608,7 +609,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     client.abortHandler = undefined;
   }
 
-  createCallModel(agentId = 'default', currentModel?: t.ChatModel) {
+  createCallModel(agentId = 'default') {
     return async (
       state: t.BaseGraphState,
       config?: RunnableConfig
@@ -621,15 +622,23 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         throw new Error(`Agent context not found for agentId: ${agentId}`);
       }
 
-      const model = this.overrideModel ?? currentModel;
-      if (!model) {
-        throw new Error('No Graph model found');
-      }
       if (!config) {
         throw new Error('No config provided');
       }
 
-      // Ensure token calculations are complete before proceeding
+      const toolsForBinding = agentContext.getToolsForBinding();
+      let model =
+        this.overrideModel ??
+        this.initializeModel({
+          tools: toolsForBinding,
+          provider: agentContext.provider,
+          clientOptions: agentContext.clientOptions,
+        });
+
+      if (agentContext.systemRunnable) {
+        model = agentContext.systemRunnable.pipe(model as Runnable);
+      }
+
       if (agentContext.tokenCalculationPromise) {
         await agentContext.tokenCalculationPromise;
       }
@@ -702,6 +711,23 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }
 
       const isLatestToolMessage = lastMessageY instanceof ToolMessage;
+
+      if (
+        isLatestToolMessage &&
+        lastMessageY.name === Constants.TOOL_SEARCH_REGEX &&
+        typeof lastMessageY.artifact === 'object' &&
+        lastMessageY.artifact != null
+      ) {
+        const artifact = lastMessageY.artifact as {
+          tool_references?: Array<{ tool_name: string }>;
+        };
+        if (artifact.tool_references && artifact.tool_references.length > 0) {
+          const discoveredNames = artifact.tool_references.map(
+            (ref) => ref.tool_name
+          );
+          agentContext.markToolsAsDiscovered(discoveredNames);
+        }
+      }
 
       if (
         isLatestToolMessage &&
@@ -849,36 +875,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       throw new Error(`Agent context not found for agentId: ${agentId}`);
     }
 
-    // Filter tools for LLM binding: only tools with allowed_callers including 'direct'
-    // Default: if allowed_callers is not specified, tool is bound to LLM (direct)
-    let toolsForLLM = agentContext.tools;
-    if (agentContext.toolRegistry != null && agentContext.tools != null) {
-      toolsForLLM = agentContext.tools.filter((tool) => {
-        const toolDef =
-          'name' in tool
-            ? agentContext.toolRegistry?.get(tool.name)
-            : undefined;
-        if (!toolDef) {
-          // Tool not in registry - bind to LLM by default
-          return true;
-        }
-        if (!toolDef.allowed_callers) {
-          return true;
-        }
-        return toolDef.allowed_callers.includes('direct');
-      });
-    }
-
-    let currentModel = this.initializeModel({
-      tools: toolsForLLM,
-      provider: agentContext.provider,
-      clientOptions: agentContext.clientOptions,
-    });
-
-    if (agentContext.systemRunnable) {
-      currentModel = agentContext.systemRunnable.pipe(currentModel);
-    }
-
     const agentNode = `${AGENT}${agentId}` as const;
     const toolNode = `${TOOLS}${agentId}` as const;
 
@@ -898,7 +894,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     });
 
     const workflow = new StateGraph(StateAnnotation)
-      .addNode(agentNode, this.createCallModel(agentId, currentModel))
+      .addNode(agentNode, this.createCallModel(agentId))
       .addNode(
         toolNode,
         this.initializeTools({
