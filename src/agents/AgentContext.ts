@@ -197,6 +197,48 @@ export class AgentContext {
   }
 
   /**
+   * Builds instructions text for tools that are ONLY callable via programmatic code execution.
+   * These tools cannot be called directly by the LLM but are available through the
+   * programmatic_code_execution tool.
+   */
+  private buildProgrammaticOnlyToolsInstructions(): string {
+    if (!this.toolRegistry) return '';
+
+    const programmaticOnlyTools: t.LCTool[] = [];
+    for (const toolDef of this.toolRegistry.values()) {
+      const allowedCallers = toolDef.allowed_callers ?? ['direct'];
+      const isCodeExecutionOnly =
+        allowedCallers.includes('code_execution') &&
+        !allowedCallers.includes('direct');
+      if (isCodeExecutionOnly) {
+        programmaticOnlyTools.push(toolDef);
+      }
+    }
+
+    if (programmaticOnlyTools.length === 0) return '';
+
+    const toolDescriptions = programmaticOnlyTools
+      .map((tool) => {
+        let desc = `- **${tool.name}**`;
+        if (tool.description != null && tool.description !== '') {
+          desc += `: ${tool.description}`;
+        }
+        if (tool.parameters) {
+          desc += `\n  Parameters: ${JSON.stringify(tool.parameters, null, 2).replace(/\n/g, '\n  ')}`;
+        }
+        return desc;
+      })
+      .join('\n\n');
+
+    return (
+      '\n\n## Programmatic-Only Tools\n\n' +
+      'The following tools are available exclusively through the `programmatic_code_execution` tool. ' +
+      'You cannot call these tools directly; instead, use `programmatic_code_execution` with Python code that invokes them.\n\n' +
+      toolDescriptions
+    );
+  }
+
+  /**
    * Create system runnable from instructions and calculate tokens if tokenCounter is available
    */
   private createSystemRunnable():
@@ -217,6 +259,15 @@ export class AgentContext {
         finalInstructions != null && finalInstructions
           ? `${finalInstructions}\n\n${this.additionalInstructions}`
           : this.additionalInstructions;
+    }
+
+    // Append programmatic-only tools documentation
+    const programmaticToolsDoc = this.buildProgrammaticOnlyToolsInstructions();
+    if (programmaticToolsDoc) {
+      finalInstructions =
+        finalInstructions != null && finalInstructions
+          ? `${finalInstructions}${programmaticToolsDoc}`
+          : programmaticToolsDoc;
     }
 
     // Handle Anthropic prompt caching
@@ -240,7 +291,10 @@ export class AgentContext {
           content: [
             {
               type: 'text',
-              text: this.instructions,
+              text:
+                typeof finalInstructions === 'string'
+                  ? finalInstructions
+                  : this.instructions,
               cache_control: { type: 'ephemeral' },
             },
           ],
