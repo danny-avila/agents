@@ -41,7 +41,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   /** Tool registry for filtering (lazy computation of programmatic maps) */
   private toolRegistry?: t.LCToolRegistry;
   /** Cached programmatic tools (computed once on first PTC call) */
-  private programmaticCache?: { toolMap: t.ToolMap; toolDefs: t.LCTool[] };
+  private programmaticCache?: t.ProgrammaticCache;
 
   constructor({
     tools,

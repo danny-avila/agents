@@ -52,12 +52,12 @@ result = await get_weather(city="San Francisco")
 print(f"Temperature: {result['temperature']}°F")
 print(f"Condition: {result['condition']}")
       `,
-      tools: toolDefinitions,
     };
     const toolCall = {
       name: 'programmatic_code_execution',
       args,
       toolMap,
+      toolDefs: toolDefinitions,
     };
 
     const output = await ptcTool.invoke(args, { toolCall });
@@ -85,12 +85,12 @@ for member in team:
 
 print(f"Grand total: \${total:.2f}")
       `,
-      tools: toolDefinitions,
     };
     const toolCall = {
       name: 'programmatic_code_execution',
       args,
       toolMap,
+      toolDefs: toolDefinitions,
     };
 
     const output = await ptcTool.invoke(args, { toolCall });
@@ -116,12 +116,12 @@ results = await asyncio.gather(*[
 for city, weather in zip(cities, results):
     print(f"{city}: {weather['temperature']}°F, {weather['condition']}")
       `,
-      tools: toolDefinitions,
     };
     const toolCall = {
       name: 'programmatic_code_execution',
       args,
       toolMap,
+      toolDefs: toolDefinitions,
     };
 
     const output = await ptcTool.invoke(args, { toolCall });
@@ -150,12 +150,12 @@ if high_spenders:
 else:
     print("No high spenders found.")
       `,
-      tools: toolDefinitions,
     };
     const toolCall = {
       name: 'programmatic_code_execution',
       args,
       toolMap,
+      toolDefs: toolDefinitions,
     };
 
     const output = await ptcTool.invoke(args, { toolCall });
@@ -180,12 +180,12 @@ for member in team:
 else:
     print("No equipment expenses found")
       `,
-      tools: toolDefinitions,
     };
     const toolCall = {
       name: 'programmatic_code_execution',
       args,
       toolMap,
+      toolDefs: toolDefinitions,
     };
 
     const output = await ptcTool.invoke(args, { toolCall });
@@ -206,12 +206,12 @@ for city in cities:
     except Exception as e:
         print(f"{city}: Error - {e}")
       `,
-      tools: toolDefinitions,
     };
     const toolCall = {
       name: 'programmatic_code_execution',
       args,
       toolMap,
+      toolDefs: toolDefinitions,
     };
 
     const output = await ptcTool.invoke(args, { toolCall });
@@ -230,12 +230,12 @@ result2 = await calculator(expression="(10 + 5) / 3")
 print(f"2 + 2 * 3 = {result1['result']}")
 print(f"(10 + 5) / 3 = {result2['result']:.2f}")
       `,
-      tools: toolDefinitions,
     };
     const toolCall = {
       name: 'programmatic_code_execution',
       args,
       toolMap,
+      toolDefs: toolDefinitions,
     };
 
     const output = await ptcTool.invoke(args, { toolCall });
@@ -265,12 +265,12 @@ for member, expenses in zip(team, all_expenses):
     total = sum(e['amount'] for e in expenses)
     print(f"  {member['name']}: \${total:.2f} ({len(expenses)} items)")
       `,
-      tools: toolDefinitions,
     };
     const toolCall = {
       name: 'programmatic_code_execution',
       args,
       toolMap,
+      toolDefs: toolDefinitions,
     };
 
     const output = await ptcTool.invoke(args, { toolCall });
@@ -302,12 +302,12 @@ print(f"SF: {sf['temperature']}°F vs NYC: {nyc['temperature']}°F")
 difference = abs(sf['temperature'] - nyc['temperature'])
 print(f"Temperature difference: {difference}°F")
       `,
-      tools: [weatherToolDef!],
     };
     const toolCall = {
       name: 'programmatic_code_execution',
       args,
       toolMap,
+      toolDefs: [weatherToolDef!],
     };
 
     const output = await ptcTool.invoke(args, { toolCall });

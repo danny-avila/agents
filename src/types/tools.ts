@@ -124,6 +124,8 @@ export type LCTool = {
 /** Map of tool names to tool definitions */
 export type LCToolRegistry = Map<string, LCTool>;
 
+export type ProgrammaticCache = { toolMap: ToolMap; toolDefs: LCTool[] };
+
 /** Parameters for creating a Tool Search Regex tool */
 export type ToolSearchRegexParams = {
   apiKey?: string;

@@ -6,16 +6,18 @@
 import { describe, it, expect, beforeEach } from '@jest/globals';
 import type * as t from '@/types';
 import {
-  executeTools,
-  formatCompletedResponse,
   createProgrammaticToolCallingTool,
+  formatCompletedResponse,
+  extractUsedToolNames,
+  filterToolsByUsage,
+  executeTools,
 } from '../ProgrammaticToolCalling';
 import {
+  createProgrammaticToolRegistry,
   createGetTeamMembersTool,
   createGetExpensesTool,
   createGetWeatherTool,
   createCalculatorTool,
-  createProgrammaticToolRegistry,
 } from '@/test/mockTools';
 
 describe('ProgrammaticToolCalling', () => {
@@ -180,6 +182,179 @@ describe('ProgrammaticToolCalling', () => {
       expect(results[0].result).toHaveLength(3);
       expect(Array.isArray(results[1].result)).toBe(true);
       expect(results[2].result.result).toBe(8);
+    });
+  });
+
+  describe('extractUsedToolNames', () => {
+    const availableTools = new Set([
+      'get_weather',
+      'get_team_members',
+      'get_expenses',
+      'calculator',
+      'search_docs',
+    ]);
+
+    it('extracts single tool name from simple code', () => {
+      const code = `result = await get_weather(city="SF")
+print(result)`;
+      const used = extractUsedToolNames(code, availableTools);
+
+      expect(used.size).toBe(1);
+      expect(used.has('get_weather')).toBe(true);
+    });
+
+    it('extracts multiple tool names from code', () => {
+      const code = `team = await get_team_members()
+for member in team:
+    expenses = await get_expenses(user_id=member['id'])
+    print(f"{member['name']}: {sum(e['amount'] for e in expenses)}")`;
+
+      const used = extractUsedToolNames(code, availableTools);
+
+      expect(used.size).toBe(2);
+      expect(used.has('get_team_members')).toBe(true);
+      expect(used.has('get_expenses')).toBe(true);
+    });
+
+    it('extracts tools from asyncio.gather calls', () => {
+      const code = `results = await asyncio.gather(
+    get_weather(city="SF"),
+    get_weather(city="NYC"),
+    get_expenses(user_id="u1")
+)`;
+      const used = extractUsedToolNames(code, availableTools);
+
+      expect(used.size).toBe(2);
+      expect(used.has('get_weather')).toBe(true);
+      expect(used.has('get_expenses')).toBe(true);
+    });
+
+    it('does not match partial tool names', () => {
+      const code = `# Using get_weather_data instead
+result = await get_weather_data(city="SF")`;
+
+      const used = extractUsedToolNames(code, availableTools);
+      expect(used.has('get_weather')).toBe(false);
+    });
+
+    it('matches tool names in different contexts', () => {
+      const code = `# direct call
+x = await calculator(expression="1+1")
+# in list comprehension
+results = [await get_weather(city=c) for c in cities]
+# conditional
+if condition:
+    await get_team_members()`;
+
+      const used = extractUsedToolNames(code, availableTools);
+
+      expect(used.size).toBe(3);
+      expect(used.has('calculator')).toBe(true);
+      expect(used.has('get_weather')).toBe(true);
+      expect(used.has('get_team_members')).toBe(true);
+    });
+
+    it('returns empty set when no tools are used', () => {
+      const code = `print("Hello, World!")
+x = 1 + 2`;
+
+      const used = extractUsedToolNames(code, availableTools);
+      expect(used.size).toBe(0);
+    });
+
+    it('handles tool names with special regex characters', () => {
+      const specialTools = new Set(['get_data.v2', 'calc+plus']);
+      const code = `await get_data.v2()
+await calc+plus()`;
+
+      const used = extractUsedToolNames(code, specialTools);
+
+      expect(used.has('get_data.v2')).toBe(true);
+      expect(used.has('calc+plus')).toBe(true);
+    });
+  });
+
+  describe('filterToolsByUsage', () => {
+    const allToolDefs: t.LCTool[] = [
+      {
+        name: 'get_weather',
+        description: 'Get weather for a city',
+        parameters: {
+          type: 'object',
+          properties: { city: { type: 'string' } },
+        },
+      },
+      {
+        name: 'get_team_members',
+        description: 'Get team members',
+        parameters: { type: 'object', properties: {} },
+      },
+      {
+        name: 'get_expenses',
+        description: 'Get expenses for a user',
+        parameters: {
+          type: 'object',
+          properties: { user_id: { type: 'string' } },
+        },
+      },
+      {
+        name: 'calculator',
+        description: 'Evaluate an expression',
+        parameters: {
+          type: 'object',
+          properties: { expression: { type: 'string' } },
+        },
+      },
+    ];
+
+    it('filters to only used tools', () => {
+      const code = `result = await get_weather(city="SF")
+print(result)`;
+
+      const filtered = filterToolsByUsage(allToolDefs, code);
+
+      expect(filtered).toHaveLength(1);
+      expect(filtered[0].name).toBe('get_weather');
+    });
+
+    it('filters to multiple used tools', () => {
+      const code = `team = await get_team_members()
+for member in team:
+    expenses = await get_expenses(user_id=member['id'])`;
+
+      const filtered = filterToolsByUsage(allToolDefs, code);
+
+      expect(filtered).toHaveLength(2);
+      expect(filtered.map((t) => t.name).sort()).toEqual([
+        'get_expenses',
+        'get_team_members',
+      ]);
+    });
+
+    it('returns all tools when no tools are detected', () => {
+      const code = 'print("Hello, World!")';
+
+      const filtered = filterToolsByUsage(allToolDefs, code);
+
+      expect(filtered).toHaveLength(4);
+    });
+
+    it('preserves tool definition structure', () => {
+      const code = 'await calculator(expression="2+2")';
+
+      const filtered = filterToolsByUsage(allToolDefs, code);
+
+      expect(filtered).toHaveLength(1);
+      expect(filtered[0]).toEqual(allToolDefs[3]);
+      expect(filtered[0].parameters).toBeDefined();
+      expect(filtered[0].description).toBe('Evaluate an expression');
+    });
+
+    it('handles empty tool definitions', () => {
+      const code = 'await get_weather(city="SF")';
+      const filtered = filterToolsByUsage([], code);
+
+      expect(filtered).toHaveLength(0);
     });
   });
 

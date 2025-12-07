@@ -5,6 +5,7 @@ import fetch, { RequestInit } from 'node-fetch';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { getEnvironmentVariable } from '@langchain/core/utils/env';
 import { tool, DynamicStructuredTool } from '@langchain/core/tools';
+import type { ToolCall } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
 import { imageExtRegex, getCodeBaseURL } from './CodeExecutor';
 import { EnvVar, Constants } from '@/common';
@@ -74,18 +75,6 @@ Requirements:
 - Only print() output flows back to the context window
 - Tool results from programmatic calls do NOT consume context tokens`
     ),
-  tools: z
-    .array(
-      z.object({
-        name: z.string(),
-        description: z.string().optional(),
-        parameters: z.any(), // JsonSchemaType
-      })
-    )
-    .optional()
-    .describe(
-      'Optional array of tool definitions that can be called from the code. If not provided, uses programmatic tools configured in the agent context. Tool names must match tools available in the toolMap.'
-    ),
   session_id: z
     .string()
     .optional()
@@ -107,6 +96,51 @@ Requirements:
 // ============================================================================
 // Helper Functions
 // ============================================================================
+
+/**
+ * Extracts tool names that are actually called in the Python code.
+ * Matches patterns like `await tool_name(`, `tool_name(`, and asyncio.gather calls.
+ * @param code - The Python code to analyze
+ * @param availableToolNames - Set of available tool names to match against
+ * @returns Set of tool names found in the code
+ */
+export function extractUsedToolNames(
+  code: string,
+  availableToolNames: Set<string>
+): Set<string> {
+  const usedTools = new Set<string>();
+
+  for (const toolName of availableToolNames) {
+    const escapedName = toolName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const pattern = new RegExp(`\\b${escapedName}\\s*\\(`, 'g');
+
+    if (pattern.test(code)) {
+      usedTools.add(toolName);
+    }
+  }
+
+  return usedTools;
+}
+
+/**
+ * Filters tool definitions to only include tools actually used in the code.
+ * @param toolDefs - All available tool definitions
+ * @param code - The Python code to analyze
+ * @returns Filtered array of tool definitions
+ */
+export function filterToolsByUsage(
+  toolDefs: t.LCTool[],
+  code: string
+): t.LCTool[] {
+  const availableToolNames = new Set(toolDefs.map((tool) => tool.name));
+  const usedToolNames = extractUsedToolNames(code, availableToolNames);
+
+  if (usedToolNames.size === 0) {
+    return toolDefs;
+  }
+
+  return toolDefs.filter((tool) => usedToolNames.has(tool.name));
+}
 
 /**
  * Makes an HTTP request to the Code API.
@@ -312,10 +346,11 @@ Patterns:
 
   return tool<typeof ProgrammaticToolCallingSchema>(
     async (params, config) => {
-      const { code, tools, session_id, timeout = DEFAULT_TIMEOUT } = params;
+      const { code, session_id, timeout = DEFAULT_TIMEOUT } = params;
 
       // Extra params injected by ToolNode (follows web_search pattern)
-      const { toolMap, toolDefs } = config.toolCall ?? {};
+      const { toolMap, toolDefs } = (config.toolCall ?? {}) as ToolCall &
+        Partial<t.ProgrammaticCache>;
 
       if (toolMap == null || toolMap.size === 0) {
         throw new Error(
@@ -324,10 +359,7 @@ Patterns:
         );
       }
 
-      // Use provided tools or fall back to toolDefs from ToolNode
-      const effectiveTools = tools ?? toolDefs;
-
-      if (effectiveTools == null || effectiveTools.length === 0) {
+      if (toolDefs == null || toolDefs.length === 0) {
         throw new Error(
           'No tool definitions provided. ' +
             'Either pass tools in the input or ensure ToolNode injects toolDefs.'
@@ -338,8 +370,10 @@ Patterns:
 
       try {
         // ====================================================================
-        // Phase 1: Initial request
+        // Phase 1: Filter tools and make initial request
         // ====================================================================
+
+        const effectiveTools = filterToolsByUsage(toolDefs, code);
 
         let response = await makeRequest(
           EXEC_ENDPOINT,
