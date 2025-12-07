@@ -116,7 +116,7 @@ Requirements:
  * @param proxy - Optional HTTP proxy URL
  * @returns The parsed API response
  */
-async function makeRequest(
+export async function makeRequest(
   endpoint: string,
   apiKey: string,
   body: Record<string, unknown>,
@@ -155,7 +155,7 @@ async function makeRequest(
  * @param toolMap - Map of tool names to executable tools
  * @returns Array of tool results
  */
-async function executeTools(
+export async function executeTools(
   toolCalls: t.PTCToolCall[],
   toolMap: t.ToolMap
 ): Promise<t.PTCToolResult[]> {
@@ -198,7 +198,7 @@ async function executeTools(
  * @param response - The completed API response
  * @returns Tuple of [formatted string, artifact]
  */
-function formatCompletedResponse(
+export function formatCompletedResponse(
   response: t.ProgrammaticExecutionResponse
 ): [string, t.ProgrammaticExecutionArtifact] {
   let formatted = '';
@@ -265,7 +265,7 @@ function formatCompletedResponse(
  *   { configurable: { toolMap } }
  * );
  */
-function createProgrammaticToolCallingTool(
+export function createProgrammaticToolCallingTool(
   initParams: t.ProgrammaticToolCallingParams = {}
 ): DynamicStructuredTool<typeof ProgrammaticToolCallingSchema> {
   const apiKey =
@@ -421,10 +421,3 @@ Patterns:
     }
   );
 }
-
-export {
-  createProgrammaticToolCallingTool,
-  formatCompletedResponse,
-  executeTools,
-  makeRequest,
-};
