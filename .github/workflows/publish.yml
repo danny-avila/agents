@@ -44,10 +44,10 @@ jobs:
         run: |
           # Check all commits in this push (handles batch commits)
           BASE_REF="${{ github.event.before }}"
-          if [ "$BASE_REF" = "0000000000000000000000000000000000000000" ]; then
+          if [ "$BASE_REF" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$BASE_REF" 2>/dev/null; then
             BASE_REF="origin/main"
           fi
-          if git diff --name-only $BASE_REF HEAD | grep -q "^src/llm/google/"; then
+          if git diff --name-only $BASE_REF HEAD 2>/dev/null | grep -q "^src/llm/google/" || [ "$?" -ne 0 ]; then
             echo "changed=true" >> $GITHUB_OUTPUT
           else
             echo "changed=false" >> $GITHUB_OUTPUT
@@ -65,10 +65,10 @@ jobs:
         id: anthropic_changes
         run: |
           BASE_REF="${{ github.event.before }}"
-          if [ "$BASE_REF" = "0000000000000000000000000000000000000000" ]; then
+          if [ "$BASE_REF" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$BASE_REF" 2>/dev/null; then
             BASE_REF="origin/main"
           fi
-          if git diff --name-only $BASE_REF HEAD | grep -q "^src/llm/anthropic/"; then
+          if git diff --name-only $BASE_REF HEAD 2>/dev/null | grep -q "^src/llm/anthropic/" || [ "$?" -ne 0 ]; then
             echo "changed=true" >> $GITHUB_OUTPUT
           else
             echo "changed=false" >> $GITHUB_OUTPUT
@@ -86,10 +86,10 @@ jobs:
         id: ptc_changes
         run: |
           BASE_REF="${{ github.event.before }}"
-          if [ "$BASE_REF" = "0000000000000000000000000000000000000000" ]; then
+          if [ "$BASE_REF" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$BASE_REF" 2>/dev/null; then
             BASE_REF="origin/main"
           fi
-          if git diff --name-only $BASE_REF HEAD | grep -qE "^src/tools/ProgrammaticToolCalling\.ts|^src/tools/ToolNode\.ts|^src/agents/AgentContext\.ts|^src/test/mockTools\.ts"; then
+          if git diff --name-only $BASE_REF HEAD 2>/dev/null | grep -qE "^src/tools/ProgrammaticToolCalling\.ts|^src/tools/ToolNode\.ts|^src/agents/AgentContext\.ts|^src/test/mockTools\.ts" || [ "$?" -ne 0 ]; then
             echo "changed=true" >> $GITHUB_OUTPUT
           else
             echo "changed=false" >> $GITHUB_OUTPUT
@@ -115,10 +115,10 @@ jobs:
         id: tool_search_changes
         run: |
           BASE_REF="${{ github.event.before }}"
-          if [ "$BASE_REF" = "0000000000000000000000000000000000000000" ]; then
+          if [ "$BASE_REF" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$BASE_REF" 2>/dev/null; then
             BASE_REF="origin/main"
           fi
-          if git diff --name-only $BASE_REF HEAD | grep -qE "^src/tools/ToolSearchRegex\.ts|^src/tools/ToolNode\.ts|^src/agents/AgentContext\.ts|^src/test/mockTools\.ts"; then
+          if git diff --name-only $BASE_REF HEAD 2>/dev/null | grep -qE "^src/tools/ToolSearchRegex\.ts|^src/tools/ToolNode\.ts|^src/agents/AgentContext\.ts|^src/test/mockTools\.ts" || [ "$?" -ne 0 ]; then
             echo "changed=true" >> $GITHUB_OUTPUT
           else
             echo "changed=false" >> $GITHUB_OUTPUT
