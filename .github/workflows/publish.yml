@@ -42,7 +42,12 @@ jobs:
       - name: Check for Google LLM changes
         id: google_changes
         run: |
-          if git diff --name-only HEAD^ HEAD | grep -q "^src/llm/google/"; then
+          # Check all commits in this push (handles batch commits)
+          BASE_REF="${{ github.event.before }}"
+          if [ "$BASE_REF" = "0000000000000000000000000000000000000000" ]; then
+            BASE_REF="origin/main"
+          fi
+          if git diff --name-only $BASE_REF HEAD | grep -q "^src/llm/google/"; then
             echo "changed=true" >> $GITHUB_OUTPUT
           else
             echo "changed=false" >> $GITHUB_OUTPUT
@@ -59,7 +64,11 @@ jobs:
       - name: Check for Anthropic LLM changes
         id: anthropic_changes
         run: |
-          if git diff --name-only HEAD^ HEAD | grep -q "^src/llm/anthropic/"; then
+          BASE_REF="${{ github.event.before }}"
+          if [ "$BASE_REF" = "0000000000000000000000000000000000000000" ]; then
+            BASE_REF="origin/main"
+          fi
+          if git diff --name-only $BASE_REF HEAD | grep -q "^src/llm/anthropic/"; then
             echo "changed=true" >> $GITHUB_OUTPUT
           else
             echo "changed=false" >> $GITHUB_OUTPUT
@@ -76,7 +85,11 @@ jobs:
       - name: Check for PTC changes
         id: ptc_changes
         run: |
-          if git diff --name-only HEAD^ HEAD | grep -qE "^src/tools/ProgrammaticToolCalling\.ts|^src/tools/ToolNode\.ts|^src/agents/AgentContext\.ts|^src/test/mockTools\.ts"; then
+          BASE_REF="${{ github.event.before }}"
+          if [ "$BASE_REF" = "0000000000000000000000000000000000000000" ]; then
+            BASE_REF="origin/main"
+          fi
+          if git diff --name-only $BASE_REF HEAD | grep -qE "^src/tools/ProgrammaticToolCalling\.ts|^src/tools/ToolNode\.ts|^src/agents/AgentContext\.ts|^src/test/mockTools\.ts"; then
             echo "changed=true" >> $GITHUB_OUTPUT
           else
             echo "changed=false" >> $GITHUB_OUTPUT
@@ -88,10 +101,40 @@ jobs:
         env:
           NODE_ENV: test
           LIBRECHAT_CODE_API_KEY: ${{ secrets.LIBRECHAT_CODE_API_KEY }}
+          LIBRECHAT_CODE_BASEURL: ${{ secrets.LIBRECHAT_CODE_BASEURL }}
 
-      - name: Run PTC integration tests (manual only - requires prod API)
+      - name: Run PTC integration tests (manual dispatch only)
         if: github.event_name == 'workflow_dispatch'
         run: npx jest src/tools/__tests__/ProgrammaticToolCalling.integration.test.ts
+        env:
+          NODE_ENV: test
+          LIBRECHAT_CODE_API_KEY: ${{ secrets.LIBRECHAT_CODE_API_KEY }}
+          LIBRECHAT_CODE_BASEURL: ${{ secrets.LIBRECHAT_CODE_BASEURL }}
+
+      - name: Check for Tool Search changes
+        id: tool_search_changes
+        run: |
+          BASE_REF="${{ github.event.before }}"
+          if [ "$BASE_REF" = "0000000000000000000000000000000000000000" ]; then
+            BASE_REF="origin/main"
+          fi
+          if git diff --name-only $BASE_REF HEAD | grep -qE "^src/tools/ToolSearchRegex\.ts|^src/tools/ToolNode\.ts|^src/agents/AgentContext\.ts|^src/test/mockTools\.ts"; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run Tool Search unit tests
+        if: steps.tool_search_changes.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+        run: npx jest src/tools/__tests__/ToolSearchRegex.test.ts
+        env:
+          NODE_ENV: test
+          LIBRECHAT_CODE_API_KEY: ${{ secrets.LIBRECHAT_CODE_API_KEY }}
+          LIBRECHAT_CODE_BASEURL: ${{ secrets.LIBRECHAT_CODE_BASEURL }}
+
+      - name: Run Tool Search integration tests (manual dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        run: npx jest src/tools/__tests__/ToolSearchRegex.integration.test.ts
         env:
           NODE_ENV: test
           LIBRECHAT_CODE_API_KEY: ${{ secrets.LIBRECHAT_CODE_API_KEY }}
