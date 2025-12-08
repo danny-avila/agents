@@ -337,7 +337,7 @@ export async function makeRequest(
 }
 
 /**
- * Unwraps tool responses that may be formatted as tuples.
+ * Unwraps tool responses that may be formatted as tuples or content blocks.
  * MCP tools return [content, artifacts], we need to extract the raw data.
  * @param result - The raw result from tool.invoke()
  * @param isMCPTool - Whether this is an MCP tool (has mcp property)
@@ -352,67 +352,114 @@ export function unwrapToolResponse(
     return result;
   }
 
+  /**
+   * Checks if a value is a content block object (has type and text).
+   */
+  const isContentBlock = (value: unknown): boolean => {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      return false;
+    }
+    const obj = value as Record<string, unknown>;
+    return typeof obj.type === 'string';
+  };
+
+  /**
+   * Checks if an array is an array of content blocks.
+   */
+  const isContentBlockArray = (arr: unknown[]): boolean => {
+    return arr.length > 0 && arr.every(isContentBlock);
+  };
+
+  /**
+   * Extracts text from a single content block object.
+   * Returns the text if it's a text block, otherwise returns null.
+   */
+  const extractTextFromBlock = (block: unknown): string | null => {
+    if (typeof block !== 'object' || block === null) return null;
+    const b = block as Record<string, unknown>;
+    if (b.type === 'text' && typeof b.text === 'string') {
+      return b.text;
+    }
+    return null;
+  };
+
+  /**
+   * Extracts text from content blocks (array or single object).
+   * Returns combined text or null if no text blocks found.
+   */
+  const extractTextFromContent = (content: unknown): string | null => {
+    // Single content block object: { type: 'text', text: '...' }
+    if (
+      typeof content === 'object' &&
+      content !== null &&
+      !Array.isArray(content)
+    ) {
+      const text = extractTextFromBlock(content);
+      if (text !== null) return text;
+    }
+
+    // Array of content blocks: [{ type: 'text', text: '...' }, ...]
+    if (Array.isArray(content) && content.length > 0) {
+      const texts = content
+        .map(extractTextFromBlock)
+        .filter((t): t is string => t !== null);
+      if (texts.length > 0) {
+        return texts.join('\n');
+      }
+    }
+
+    return null;
+  };
+
+  /**
+   * Tries to parse a string as JSON if it looks like JSON.
+   */
+  const maybeParseJSON = (str: string): unknown => {
+    const trimmed = str.trim();
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+      try {
+        return JSON.parse(trimmed);
+      } catch {
+        return str;
+      }
+    }
+    return str;
+  };
+
+  // Handle array of content blocks at top level FIRST
+  // (before checking for tuple, since both are arrays)
+  if (Array.isArray(result) && isContentBlockArray(result)) {
+    const extractedText = extractTextFromContent(result);
+    if (extractedText !== null) {
+      return maybeParseJSON(extractedText);
+    }
+  }
+
   // Check if result is a tuple/array with [content, artifacts]
   if (Array.isArray(result) && result.length >= 1) {
     const [content] = result;
 
-    // If first element is a string, return it
+    // If first element is a string, return it (possibly parsed as JSON)
     if (typeof content === 'string') {
-      // Try to parse as JSON if it looks like JSON
-      if (typeof content === 'string' && content.trim().startsWith('{')) {
-        try {
-          return JSON.parse(content);
-        } catch {
-          return content;
-        }
-      }
-      return content;
+      return maybeParseJSON(content);
     }
 
-    // If first element is an array (content blocks), extract text/data
-    if (Array.isArray(content)) {
-      // If it's an array of content blocks (like [{ type: 'text', text: '...' }])
-      if (
-        content.length > 0 &&
-        typeof content[0] === 'object' &&
-        'type' in content[0]
-      ) {
-        // Extract text from content blocks
-        const texts = content
-          .filter((block: unknown) => {
-            if (typeof block !== 'object' || block === null) return false;
-            const b = block as Record<string, unknown>;
-            return b.type === 'text' && typeof b.text === 'string';
-          })
-          .map((block: unknown) => {
-            const b = block as Record<string, unknown>;
-            return b.text as string;
-          });
-
-        if (texts.length > 0) {
-          const combined = texts.join('\n');
-          // Try to parse as JSON if it looks like JSON (objects or arrays)
-          if (
-            combined.trim().startsWith('{') ||
-            combined.trim().startsWith('[')
-          ) {
-            try {
-              return JSON.parse(combined);
-            } catch {
-              return combined;
-            }
-          }
-          return combined;
-        }
-      }
-      // Otherwise return the content array as-is
-      return content;
+    // Try to extract text from content blocks
+    const extractedText = extractTextFromContent(content);
+    if (extractedText !== null) {
+      return maybeParseJSON(extractedText);
     }
 
-    // If first element is an object, return it
+    // If first element is an object (but not a text block), return it
     if (typeof content === 'object' && content !== null) {
       return content;
     }
+  }
+
+  // Handle single content block object at top level (not in tuple)
+  const extractedText = extractTextFromContent(result);
+  if (extractedText !== null) {
+    return maybeParseJSON(extractedText);
   }
 
   // Not a formatted response, return as-is

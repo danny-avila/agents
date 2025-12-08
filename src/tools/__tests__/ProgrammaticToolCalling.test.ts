@@ -12,6 +12,7 @@ import {
   filterToolsByUsage,
   executeTools,
   normalizeToPythonIdentifier,
+  unwrapToolResponse,
 } from '../ProgrammaticToolCalling';
 import {
   createProgrammaticToolRegistry,
@@ -225,6 +226,160 @@ describe('ProgrammaticToolCalling', () => {
       expect(normalizeToPythonIdentifier('return')).toBe('return_tool');
       expect(normalizeToPythonIdentifier('async')).toBe('async_tool');
       expect(normalizeToPythonIdentifier('import')).toBe('import_tool');
+    });
+  });
+
+  describe('unwrapToolResponse', () => {
+    describe('non-MCP tools', () => {
+      it('returns result as-is for non-MCP tools', () => {
+        const result = { temperature: 65, condition: 'Foggy' };
+        expect(unwrapToolResponse(result, false)).toEqual(result);
+      });
+
+      it('returns string as-is for non-MCP tools', () => {
+        expect(unwrapToolResponse('plain string', false)).toBe('plain string');
+      });
+
+      it('returns array as-is for non-MCP tools', () => {
+        const result = [1, 2, 3];
+        expect(unwrapToolResponse(result, false)).toEqual(result);
+      });
+    });
+
+    describe('MCP tools - tuple format [content, artifacts]', () => {
+      it('extracts string content from tuple', () => {
+        const result = ['Hello world', { artifacts: [] }];
+        expect(unwrapToolResponse(result, true)).toBe('Hello world');
+      });
+
+      it('parses JSON string content from tuple', () => {
+        const result = ['{"temperature": 65}', { artifacts: [] }];
+        expect(unwrapToolResponse(result, true)).toEqual({ temperature: 65 });
+      });
+
+      it('parses JSON array string content from tuple', () => {
+        const result = ['[1, 2, 3]', { artifacts: [] }];
+        expect(unwrapToolResponse(result, true)).toEqual([1, 2, 3]);
+      });
+
+      it('extracts text from single content block in tuple', () => {
+        const result = [{ type: 'text', text: 'Spreadsheet info here' }, {}];
+        expect(unwrapToolResponse(result, true)).toBe('Spreadsheet info here');
+      });
+
+      it('extracts and parses JSON from single content block in tuple', () => {
+        const result = [
+          { type: 'text', text: '{"id": "123", "name": "Test"}' },
+          {},
+        ];
+        expect(unwrapToolResponse(result, true)).toEqual({
+          id: '123',
+          name: 'Test',
+        });
+      });
+
+      it('extracts text from array of content blocks in tuple', () => {
+        const result = [
+          [
+            { type: 'text', text: 'Line 1' },
+            { type: 'text', text: 'Line 2' },
+          ],
+          {},
+        ];
+        expect(unwrapToolResponse(result, true)).toBe('Line 1\nLine 2');
+      });
+
+      it('returns object content as-is when not a text block', () => {
+        const result = [{ temperature: 65, condition: 'Foggy' }, {}];
+        expect(unwrapToolResponse(result, true)).toEqual({
+          temperature: 65,
+          condition: 'Foggy',
+        });
+      });
+    });
+
+    describe('MCP tools - single content block (not in tuple)', () => {
+      it('extracts text from single content block object', () => {
+        const result = { type: 'text', text: 'No data found in range' };
+        expect(unwrapToolResponse(result, true)).toBe('No data found in range');
+      });
+
+      it('extracts and parses JSON from single content block object', () => {
+        const result = {
+          type: 'text',
+          text: '{"sheets": [{"name": "raw_data"}]}',
+        };
+        expect(unwrapToolResponse(result, true)).toEqual({
+          sheets: [{ name: 'raw_data' }],
+        });
+      });
+
+      it('handles real-world MCP spreadsheet response', () => {
+        const result = {
+          type: 'text',
+          text: 'Spreadsheet: "NYC Taxi - Top Pickup Neighborhoods" (ID: abc123)\nSheets (2):\n  - "raw_data" (ID: 123) | Size: 1000x26',
+        };
+        expect(unwrapToolResponse(result, true)).toBe(
+          'Spreadsheet: "NYC Taxi - Top Pickup Neighborhoods" (ID: abc123)\nSheets (2):\n  - "raw_data" (ID: 123) | Size: 1000x26'
+        );
+      });
+
+      it('handles real-world MCP no data response', () => {
+        const result = {
+          type: 'text',
+          text: 'No data found in range \'raw_data!A1:D25\' for user@example.com.',
+        };
+        expect(unwrapToolResponse(result, true)).toBe(
+          'No data found in range \'raw_data!A1:D25\' for user@example.com.'
+        );
+      });
+    });
+
+    describe('MCP tools - array of content blocks (not in tuple)', () => {
+      it('extracts text from array of content blocks', () => {
+        const result = [
+          { type: 'text', text: 'First block' },
+          { type: 'text', text: 'Second block' },
+        ];
+        expect(unwrapToolResponse(result, true)).toBe(
+          'First block\nSecond block'
+        );
+      });
+
+      it('filters out non-text blocks', () => {
+        const result = [
+          { type: 'text', text: 'Text content' },
+          { type: 'image', data: 'base64...' },
+          { type: 'text', text: 'More text' },
+        ];
+        expect(unwrapToolResponse(result, true)).toBe(
+          'Text content\nMore text'
+        );
+      });
+    });
+
+    describe('edge cases', () => {
+      it('returns non-text block object as-is', () => {
+        const result = { type: 'image', data: 'base64...' };
+        expect(unwrapToolResponse(result, true)).toEqual(result);
+      });
+
+      it('handles empty array', () => {
+        expect(unwrapToolResponse([], true)).toEqual([]);
+      });
+
+      it('handles malformed JSON in text block gracefully', () => {
+        const result = { type: 'text', text: '{ invalid json }' };
+        expect(unwrapToolResponse(result, true)).toBe('{ invalid json }');
+      });
+
+      it('handles null', () => {
+        expect(unwrapToolResponse(null, true)).toBe(null);
+      });
+
+      it('handles undefined', () => {
+        expect(unwrapToolResponse(undefined, true)).toBe(undefined);
+      });
     });
   });
 
