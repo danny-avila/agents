@@ -72,6 +72,7 @@ Requirements:
 - Tools are pre-defined as async functions - DO NOT write function definitions
 - Use await for all tool calls
 - Use asyncio.gather() for parallel execution of independent calls
+- DO NOT call asyncio.run() - an event loop is already running
 - Only print() output flows back to the context window
 - Tool results from programmatic calls do NOT consume context tokens`
     ),
