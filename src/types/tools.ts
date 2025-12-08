@@ -15,7 +15,9 @@ export type CustomToolCall = {
   output?: string;
 };
 
-export type GenericTool = StructuredToolInterface | RunnableToolLike;
+export type GenericTool = (StructuredToolInterface | RunnableToolLike) & {
+  mcp?: boolean;
+};
 
 export type ToolMap = Map<string, GenericTool>;
 export type ToolRefs = {

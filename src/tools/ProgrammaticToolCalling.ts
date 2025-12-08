@@ -275,8 +275,92 @@ export async function makeRequest(
 }
 
 /**
+ * Unwraps tool responses that may be formatted as tuples.
+ * MCP tools return [content, artifacts], we need to extract the raw data.
+ * @param result - The raw result from tool.invoke()
+ * @param isMCPTool - Whether this is an MCP tool (has mcp property)
+ * @returns Unwrapped raw data (string, object, or parsed JSON)
+ */
+export function unwrapToolResponse(
+  result: unknown,
+  isMCPTool: boolean
+): unknown {
+  // Only unwrap if this is an MCP tool and result is a tuple
+  if (!isMCPTool) {
+    return result;
+  }
+
+  // Check if result is a tuple/array with [content, artifacts]
+  if (Array.isArray(result) && result.length >= 1) {
+    const [content] = result;
+
+    // If first element is a string, return it
+    if (typeof content === 'string') {
+      // Try to parse as JSON if it looks like JSON
+      if (typeof content === 'string' && content.trim().startsWith('{')) {
+        try {
+          return JSON.parse(content);
+        } catch {
+          return content;
+        }
+      }
+      return content;
+    }
+
+    // If first element is an array (content blocks), extract text/data
+    if (Array.isArray(content)) {
+      // If it's an array of content blocks (like [{ type: 'text', text: '...' }])
+      if (
+        content.length > 0 &&
+        typeof content[0] === 'object' &&
+        'type' in content[0]
+      ) {
+        // Extract text from content blocks
+        const texts = content
+          .filter((block: unknown) => {
+            if (typeof block !== 'object' || block === null) return false;
+            const b = block as Record<string, unknown>;
+            return b.type === 'text' && typeof b.text === 'string';
+          })
+          .map((block: unknown) => {
+            const b = block as Record<string, unknown>;
+            return b.text as string;
+          });
+
+        if (texts.length > 0) {
+          const combined = texts.join('\n');
+          // Try to parse as JSON if it looks like JSON (objects or arrays)
+          if (
+            combined.trim().startsWith('{') ||
+            combined.trim().startsWith('[')
+          ) {
+            try {
+              return JSON.parse(combined);
+            } catch {
+              return combined;
+            }
+          }
+          return combined;
+        }
+      }
+      // Otherwise return the content array as-is
+      return content;
+    }
+
+    // If first element is an object, return it
+    if (typeof content === 'object' && content !== null) {
+      return content;
+    }
+  }
+
+  // Not a formatted response, return as-is
+  return result;
+}
+
+/**
  * Executes tools in parallel when requested by the API.
  * Uses Promise.all for parallel execution, catching individual errors.
+ * Unwraps formatted responses (e.g., MCP tool tuples) to raw data.
  * @param toolCalls - Array of tool calls from the API
  * @param toolMap - Map of tool names to executable tools
  * @returns Array of tool results
@@ -301,9 +385,13 @@ export async function executeTools(
       const result = await tool.invoke(call.input, {
         metadata: { [Constants.PROGRAMMATIC_TOOL_CALLING]: true },
       });
+
+      const isMCPTool = tool.mcp === true;
+      const unwrappedResult = unwrapToolResponse(result, isMCPTool);
+
       return {
         call_id: call.id,
-        result,
+        result: unwrappedResult,
         is_error: false,
       };
     } catch (error) {
