@@ -38,43 +38,34 @@ const ProgrammaticToolCallingSchema = z.object({
     .string()
     .min(1)
     .describe(
-      `Python code that calls tools programmatically. Tools are automatically available as async Python functions - DO NOT define them yourself.
+      `Python code that calls tools programmatically. Tools are available as async functions.
 
-The Code API generates async function stubs from the tool definitions. Just call them directly:
+Your code is automatically wrapped in an async main() and executed. Just write your logic with await—no boilerplate needed.
 
 Example (Simple call):
   result = await get_weather(city="San Francisco")
   print(result)
 
-Example (Parallel - Fastest):
-  results = await asyncio.gather(
+Example (Parallel):
+  sf, ny, lon = await asyncio.gather(
       get_weather(city="SF"),
       get_weather(city="NYC"),
       get_weather(city="London")
   )
-  for city, weather in zip(["SF", "NYC", "London"], results):
-      print(f"{city}: {weather['temperature']}°F")
+  print(f"SF: {sf}, NY: {ny}, London: {lon}")
 
-Example (Loop with processing):
+Example (Loop):
   team = await get_team_members()
   for member in team:
       expenses = await get_expenses(user_id=member['id'])
-      total = sum(e['amount'] for e in expenses)
-      print(f"{member['name']}: \${total:.2f}")
+      print(f"{member['name']}: \${sum(e['amount'] for e in expenses):.2f}")
 
-Example (Conditional logic):
-  data = await fetch_data(source="primary")
-  if not data:
-      data = await fetch_data(source="backup")
-  print(f"Got {len(data)} records")
-
-Requirements:
-- Tools are pre-defined as async functions - DO NOT write function definitions
-- Use await for all tool calls
-- Use asyncio.gather() for parallel execution of independent calls
-- DO NOT call asyncio.run() - an event loop is already running
-- Only print() output flows back to the context window
-- Tool results from programmatic calls do NOT consume context tokens`
+Rules:
+- Just write code with await—it's auto-wrapped in async context
+- DO NOT define async def main() or call asyncio.run()
+- Tools are pre-defined—DO NOT write function definitions for them
+- Only print() output returns to the model
+- Tool results are raw dicts/lists/strings (already unwrapped)`
     ),
   session_id: z
     .string()
@@ -611,11 +602,13 @@ export function createProgrammaticToolCallingTool(
   const EXEC_ENDPOINT = `${baseUrl}/exec/programmatic`;
 
   const description = `
-Run tools via Python code. Tools are injected as async functions—call with \`await\`.
+Run tools via Python code. Your code is auto-wrapped in async context—just use \`await\` directly.
+
+CRITICAL: Do NOT define \`async def main()\` or call \`asyncio.run()\`. Just write code with await.
 
 Rules:
-- Tools are pre-defined—DO NOT define them yourself
-- Use \`await\` for calls, \`asyncio.gather()\` for parallel; NEVER call \`asyncio.run()\`
+- Tools are pre-defined as async functions—DO NOT define them yourself
+- Use \`await\` for tool calls, \`asyncio.gather()\` for parallel
 - Only \`print()\` output returns to the model; tool results are raw dicts/lists/strings
 - Stateless: variables/imports don't persist; use \`session_id\` param for file access
 - Files mount at \`/mnt/data/\` (READ-ONLY); write changes to NEW filenames
