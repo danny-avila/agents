@@ -235,6 +235,67 @@ export function filterToolsByUsage(
 }
 
 /**
+ * Fetches files from a previous session to make them available for the current execution.
+ * Files are returned as CodeEnvFile references to be included in the request.
+ * @param baseUrl - The base URL for the Code API
+ * @param apiKey - The API key for authentication
+ * @param sessionId - The session ID to fetch files from
+ * @param proxy - Optional HTTP proxy URL
+ * @returns Array of CodeEnvFile references, or empty array if fetch fails
+ */
+export async function fetchSessionFiles(
+  baseUrl: string,
+  apiKey: string,
+  sessionId: string,
+  proxy?: string
+): Promise<t.CodeEnvFile[]> {
+  try {
+    const filesEndpoint = `${baseUrl}/files/${sessionId}?detail=full`;
+    const fetchOptions: RequestInit = {
+      method: 'GET',
+      headers: {
+        'User-Agent': 'LibreChat/1.0',
+        'X-API-Key': apiKey,
+      },
+    };
+
+    if (proxy != null && proxy !== '') {
+      fetchOptions.agent = new HttpsProxyAgent(proxy);
+    }
+
+    const response = await fetch(filesEndpoint, fetchOptions);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch files for session: ${response.status}`);
+    }
+
+    const files = await response.json();
+    if (!Array.isArray(files) || files.length === 0) {
+      return [];
+    }
+
+    return files.map((file: Record<string, unknown>) => {
+      // Extract the ID from the file name (part after session ID prefix and before extension)
+      const nameParts = (file.name as string).split('/');
+      const id = nameParts.length > 1 ? nameParts[1].split('.')[0] : '';
+
+      return {
+        session_id: sessionId,
+        id,
+        name: (file.metadata as Record<string, unknown>)[
+          'original-filename'
+        ] as string,
+      };
+    });
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `Failed to fetch files for session: ${sessionId}, ${(error as Error).message}`
+    );
+    return [];
+  }
+}
+
+/**
  * Makes an HTTP request to the Code API.
  * @param endpoint - The API endpoint URL
  * @param apiKey - The API key for authentication
@@ -502,25 +563,21 @@ export function createProgrammaticToolCallingTool(
   const EXEC_ENDPOINT = `${baseUrl}/exec/programmatic`;
 
   const description = `
-Run tools by writing Python code. Tools are available as async functions - just call them with await.
+Run tools via Python code. Tools are injected as async functions—call with \`await\`.
 
-This is different from execute_code: here you can call your tools (like get_weather, get_expenses, etc.) directly in Python code.
+Rules:
+- Tools are pre-defined—DO NOT define them yourself
+- Use \`await\` for calls, \`asyncio.gather()\` for parallel; NEVER call \`asyncio.run()\`
+- Only \`print()\` output returns to the model; tool results are raw dicts/lists/strings
+- Stateless: variables/imports don't persist; use \`session_id\` param for file access
+- Files mount at \`/mnt/data/\` (READ-ONLY); write changes to NEW filenames
+- Tool names normalized: hyphens→underscores, keywords get \`_tool\` suffix
 
-Usage:
-- Tools are pre-defined as async functions - call them with await
-- Use asyncio.gather() to run multiple tools in parallel
-- Only print() output is returned - tool results stay in Python
+When to use (vs. direct tool calls): loops, conditionals, parallel execution, aggregation.
 
 Examples:
-- Simple: result = await get_weather(city="NYC")
-- Loop: for user in users: data = await get_expenses(user_id=user['id'])
-- Parallel: sf, ny = await asyncio.gather(get_weather(city="SF"), get_weather(city="NY"))
-
-When to use this instead of calling tools directly:
-- You need to call tools in a loop (process many items)
-- You want parallel execution (asyncio.gather)
-- You need conditionals based on tool results
-- You want to aggregate/filter data before returning
+  result = await get_weather(city="NYC"); print(result)
+  sf, ny = await asyncio.gather(get_weather(city="SF"), get_weather(city="NY"))
 `.trim();
 
   return tool<typeof ProgrammaticToolCallingSchema>(
@@ -562,6 +619,12 @@ When to use this instead of calling tools directly:
           );
         }
 
+        // Fetch files from previous session if session_id is provided
+        let files: t.CodeEnvFile[] | undefined;
+        if (session_id != null && session_id.length > 0) {
+          files = await fetchSessionFiles(baseUrl, apiKey, session_id, proxy);
+        }
+
         let response = await makeRequest(
           EXEC_ENDPOINT,
           apiKey,
@@ -570,6 +633,7 @@ When to use this instead of calling tools directly:
             tools: effectiveTools,
             session_id,
             timeout,
+            ...(files && files.length > 0 ? { files } : {}),
           },
           proxy
         );
