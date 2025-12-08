@@ -40,32 +40,33 @@ const ProgrammaticToolCallingSchema = z.object({
     .describe(
       `Python code that calls tools programmatically. Tools are available as async functions.
 
-Your code is automatically wrapped in an async main() and executed. Just write your logic with await—no boilerplate needed.
+CRITICAL - STATELESS EXECUTION:
+Each call is a fresh Python interpreter. Variables, imports, and data do NOT persist between calls.
+You MUST complete your entire workflow in ONE code block: query → process → output.
+DO NOT split work across multiple calls expecting to reuse variables.
 
-Example (Simple call):
-  result = await get_weather(city="San Francisco")
-  print(result)
+Your code is auto-wrapped in async context. Just write logic with await—no boilerplate needed.
 
-Example (Parallel):
-  sf, ny, lon = await asyncio.gather(
-      get_weather(city="SF"),
-      get_weather(city="NYC"),
-      get_weather(city="London")
-  )
-  print(f"SF: {sf}, NY: {ny}, London: {lon}")
+Example (Complete workflow in one call):
+  # Query data
+  data = await query_database(sql="SELECT * FROM users")
+  # Process it
+  df = pd.DataFrame(data)
+  summary = df.groupby('region').sum()
+  # Output results
+  await write_to_sheet(spreadsheet_id=sid, data=summary.to_dict())
+  print(f"Wrote {len(summary)} rows")
 
-Example (Loop):
-  team = await get_team_members()
-  for member in team:
-      expenses = await get_expenses(user_id=member['id'])
-      print(f"{member['name']}: \${sum(e['amount'] for e in expenses):.2f}")
+Example (Parallel calls):
+  sf, ny = await asyncio.gather(get_weather(city="SF"), get_weather(city="NY"))
+  print(f"SF: {sf}, NY: {ny}")
 
 Rules:
-- Just write code with await—it's auto-wrapped in async context
+- EVERYTHING in one call—no state persists between executions
+- Just write code with await—auto-wrapped in async context
 - DO NOT define async def main() or call asyncio.run()
-- Tools are pre-defined—DO NOT write function definitions for them
-- Only print() output returns to the model
-- Tool results are raw dicts/lists/strings (already unwrapped)`
+- Tools are pre-defined—DO NOT write function definitions
+- Only print() output returns to the model`
     ),
   session_id: z
     .string()
@@ -602,23 +603,23 @@ export function createProgrammaticToolCallingTool(
   const EXEC_ENDPOINT = `${baseUrl}/exec/programmatic`;
 
   const description = `
-Run tools via Python code. Your code is auto-wrapped in async context—just use \`await\` directly.
+Run tools via Python code. Auto-wrapped in async context—just use \`await\` directly.
 
-CRITICAL: Do NOT define \`async def main()\` or call \`asyncio.run()\`. Just write code with await.
+CRITICAL - STATELESS: Each call is a fresh interpreter. Variables/imports do NOT persist.
+Complete your ENTIRE workflow in ONE call: fetch → process → save. No splitting across calls.
 
 Rules:
-- Tools are pre-defined as async functions—DO NOT define them yourself
-- Use \`await\` for tool calls, \`asyncio.gather()\` for parallel
-- Only \`print()\` output returns to the model; tool results are raw dicts/lists/strings
-- Stateless: variables/imports don't persist; use \`session_id\` param for file access
-- Files mount at \`/mnt/data/\` (READ-ONLY); write changes to NEW filenames
+- Everything in ONE code block—no state carries over between executions
+- Do NOT define \`async def main()\` or call \`asyncio.run()\`—just write code with await
+- Tools are pre-defined—DO NOT write function definitions
+- Only \`print()\` output returns; tool results are raw dicts/lists/strings
+- Use \`session_id\` param for file persistence across calls
 - Tool names normalized: hyphens→underscores, keywords get \`_tool\` suffix
 
-When to use (vs. direct tool calls): loops, conditionals, parallel execution, aggregation.
+When to use: loops, conditionals, parallel (\`asyncio.gather\`), multi-step pipelines.
 
-Examples:
-  result = await get_weather(city="NYC"); print(result)
-  sf, ny = await asyncio.gather(get_weather(city="SF"), get_weather(city="NY"))
+Example (complete pipeline):
+  data = await query_db(sql="..."); df = process(data); await save_to_sheet(data=df); print("Done")
 `.trim();
 
   return tool<typeof ProgrammaticToolCallingSchema>(
