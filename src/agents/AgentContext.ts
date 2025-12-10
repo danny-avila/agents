@@ -141,6 +141,11 @@ export class AgentContext {
   /** Current token type being processed */
   currentTokenType: ContentTypes.TEXT | ContentTypes.THINK | 'think_and_text' =
     ContentTypes.TEXT;
+  /** State machine for detecting fragmented thinking tags */
+  thinkingState: 'normal' | 'buffering_open' | 'thinking' | 'buffering_close' =
+    'normal';
+  /** Buffer for accumulating potential thinking tags */
+  tagBuffer: string = '';
   /** Whether tools should end the workflow */
   toolEnd: boolean = false;
   /** Cached system runnable (created lazily) */
