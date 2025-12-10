@@ -112,18 +112,13 @@ describe('Fragmented Thinking Tags Tests', () => {
     },
   });
 
-  // Test with a complete thinking block that will be split by whitespace
-  // The fake model splits on whitespace by default, so this simulates
-  // receiving "<thinking>" and "</thinking>" as separate chunks
-  const thinkingResponse =
-    '<thinking> Let me think about this. </thinking> The answer is 42.';
-
-  test('should handle thinking tags in streamed content', async () => {
+  // Helper to create a fresh run for each test
+  const createTestRun = async (
+    customHandlers: Record<string | GraphEvents, t.EventHandler>
+  ): Promise<Run<t.IState>> => {
     const llmConfig = getLLMConfig(Providers.BEDROCK);
-    const customHandlers = setupCustomHandlers();
-
-    run = await Run.create<t.IState>({
-      runId: 'fragmented-thinking-test-run',
+    return Run.create<t.IState>({
+      runId: `fragmented-thinking-test-run-${Date.now()}`,
       graphConfig: {
         type: 'standard',
         llmConfig,
@@ -132,9 +127,16 @@ describe('Fragmented Thinking Tags Tests', () => {
       returnContent: true,
       customHandlers,
     });
+  };
 
-    // Pass the full response - the fake model will split it on whitespace
-    run.Graph?.overrideTestModel([thinkingResponse], 2);
+  // Test with <thinking> tags
+  test('should handle <thinking> tags in streamed content', async () => {
+    const customHandlers = setupCustomHandlers();
+    run = await createTestRun(customHandlers);
+
+    const responseWithThinkingTag =
+      '<thinking> Let me think about this. </thinking> The answer is 42.';
+    run.Graph?.overrideTestModel([responseWithThinkingTag], 2);
 
     const inputs = {
       messages: [new HumanMessage('What is the meaning of life?')],
@@ -145,7 +147,6 @@ describe('Fragmented Thinking Tags Tests', () => {
     expect(contentParts).toBeDefined();
     expect(contentParts.length).toBe(2);
 
-    // Find the thinking and text parts (order may vary based on event handling)
     const thinkingPart = contentParts.find(
       (p) => (p as t.ReasoningContentText).think !== undefined
     ) as t.ReasoningContentText;
@@ -153,18 +154,124 @@ describe('Fragmented Thinking Tags Tests', () => {
       (p) => (p as MessageContentText).text !== undefined
     ) as MessageContentText;
 
-    // Thinking content should not contain the tags
     expect(thinkingPart).toBeDefined();
     expect(thinkingPart.think).toContain('Let me think about this.');
     expect(thinkingPart.think).not.toContain('<thinking>');
     expect(thinkingPart.think).not.toContain('</thinking>');
 
-    // Text content should be the response after thinking
     expect(textPart).toBeDefined();
     expect(textPart.text).toContain('The answer is 42.');
     expect(textPart.text).not.toContain('<thinking>');
 
-    // Verify reasoning delta was called
+    expect(onReasoningDeltaSpy).toHaveBeenCalled();
+  });
+
+  // Test with <think> tags (shorter variant)
+  test('should handle <think> tags in streamed content', async () => {
+    onReasoningDeltaSpy.mockClear();
+    const customHandlers = setupCustomHandlers();
+    run = await createTestRun(customHandlers);
+
+    const responseWithThinkTag =
+      '<think> Processing the question... </think> Here is my response.';
+    run.Graph?.overrideTestModel([responseWithThinkTag], 2);
+
+    const inputs = {
+      messages: [new HumanMessage('Tell me something.')],
+    };
+
+    await run.processStream(inputs, config);
+
+    expect(contentParts).toBeDefined();
+    expect(contentParts.length).toBe(2);
+
+    const thinkingPart = contentParts.find(
+      (p) => (p as t.ReasoningContentText).think !== undefined
+    ) as t.ReasoningContentText;
+    const textPart = contentParts.find(
+      (p) => (p as MessageContentText).text !== undefined
+    ) as MessageContentText;
+
+    expect(thinkingPart).toBeDefined();
+    expect(thinkingPart.think).toContain('Processing the question...');
+    expect(thinkingPart.think).not.toContain('<think>');
+    expect(thinkingPart.think).not.toContain('</think>');
+
+    expect(textPart).toBeDefined();
+    expect(textPart.text).toContain('Here is my response.');
+    expect(textPart.text).not.toContain('<think>');
+
+    expect(onReasoningDeltaSpy).toHaveBeenCalled();
+  });
+
+  // Test with plain text (no thinking tags)
+  test('should handle plain text without thinking tags', async () => {
+    onReasoningDeltaSpy.mockClear();
+    const customHandlers = setupCustomHandlers();
+    run = await createTestRun(customHandlers);
+
+    const responseWithoutTags =
+      'This is a simple response without any thinking.';
+    run.Graph?.overrideTestModel([responseWithoutTags], 2);
+
+    const inputs = {
+      messages: [new HumanMessage('Say something simple.')],
+    };
+
+    await run.processStream(inputs, config);
+
+    expect(contentParts).toBeDefined();
+    expect(contentParts.length).toBe(1);
+
+    const textPart = contentParts[0] as MessageContentText;
+    expect(textPart.text).toBe(
+      'This is a simple response without any thinking.'
+    );
+
+    // No reasoning delta should be called for plain text
+    expect(onReasoningDeltaSpy).not.toHaveBeenCalled();
+  });
+
+  // Test with multiple thinking blocks in sequence
+  test('should handle multiple thinking blocks in sequence', async () => {
+    onReasoningDeltaSpy.mockClear();
+    const customHandlers = setupCustomHandlers();
+    run = await createTestRun(customHandlers);
+
+    const responseWithMultipleThinkingTags =
+      '<thinking> First thought. </thinking> Response one. <thinking> Second thought. </thinking> Response two.';
+    run.Graph?.overrideTestModel([responseWithMultipleThinkingTags], 2);
+
+    const inputs = {
+      messages: [new HumanMessage('Give me a complex response.')],
+    };
+
+    await run.processStream(inputs, config);
+
+    expect(contentParts).toBeDefined();
+    // Should have thinking and text parts (exact count depends on aggregation)
+    expect(contentParts.length).toBeGreaterThanOrEqual(2);
+
+    const thinkingPart = contentParts.find(
+      (p) => (p as t.ReasoningContentText).think !== undefined
+    ) as t.ReasoningContentText;
+    const textPart = contentParts.find(
+      (p) => (p as MessageContentText).text !== undefined
+    ) as MessageContentText;
+
+    // Verify thinking content contains both thoughts (accumulated)
+    expect(thinkingPart).toBeDefined();
+    expect(thinkingPart.think).toContain('First thought.');
+    expect(thinkingPart.think).toContain('Second thought.');
+    expect(thinkingPart.think).not.toContain('<thinking>');
+    expect(thinkingPart.think).not.toContain('</thinking>');
+
+    // Verify text content contains both responses
+    expect(textPart).toBeDefined();
+    expect(textPart.text).toContain('Response one.');
+    expect(textPart.text).toContain('Response two.');
+    expect(textPart.text).not.toContain('<thinking>');
+
     expect(onReasoningDeltaSpy).toHaveBeenCalled();
   });
 });
