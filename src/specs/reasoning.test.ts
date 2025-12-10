@@ -174,7 +174,8 @@ describe(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
     await run.processStream(inputs, config);
     expect(contentParts).toBeDefined();
     expect(contentParts.length).toBe(2);
-    const reasoningContent = reasoningText.match(/<think>(.*)<\/think>/s)?.[0];
+    // Tags are stripped from thinking content by the state machine
+    const reasoningContent = reasoningText.match(/<think>(.*)<\/think>/s)?.[1];
     const content = reasoningText.split(/<\/think>/)[1];
     expect((contentParts[0] as t.ReasoningContentText).think).toBe(
       reasoningContent
