@@ -177,8 +177,6 @@ jobs:
             echo "Version changed, proceeding with publish"
             echo "skip=false" >> $GITHUB_OUTPUT
           fi
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Pack package
         if: steps.check.outputs.skip != 'true'
@@ -189,4 +187,3 @@ jobs:
         run: npm publish $(ls librechat-agents-*.tgz) --access public --provenance
         env:
           NODE_ENV: production
-          # No NODE_AUTH_TOKEN needed - uses OIDC trusted publishing
