@@ -128,6 +128,8 @@ export class ChatOpenRouter extends ChatOpenAI {
       // Accumulate reasoning_details from each delta
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const deltaAny = delta as Record<string, any>;
+      // Extract current chunk's reasoning text for streaming (before accumulation)
+      let currentChunkReasoningText = '';
       if (
         deltaAny.reasoning_details != null &&
         Array.isArray(deltaAny.reasoning_details)
@@ -143,7 +145,9 @@ export class ChatOpenRouter extends ChatOpenAI {
               index: detail.index,
             });
           } else if (detail.type === 'reasoning.text') {
-            // For text reasoning, accumulate text by index
+            // Extract current chunk's text for streaming
+            currentChunkReasoningText += detail.text || '';
+            // For text reasoning, accumulate text by index for final message
             const idx = detail.index ?? 0;
             const existing = reasoningTextByIndex.get(idx);
             if (existing) {
@@ -166,6 +170,12 @@ export class ChatOpenRouter extends ChatOpenAI {
         data,
         defaultRole
       );
+
+      // For models that send reasoning_details (Gemini style) instead of reasoning (DeepSeek style),
+      // set the current chunk's reasoning text to additional_kwargs.reasoning for streaming
+      if (currentChunkReasoningText && !chunk.additional_kwargs.reasoning) {
+        chunk.additional_kwargs.reasoning = currentChunkReasoningText;
+      }
 
       // IMPORTANT: Only set reasoning_details on the FINAL chunk to prevent
       // LangChain's chunk concatenation from corrupting the array

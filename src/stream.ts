@@ -107,24 +107,22 @@ export function getChunkContent({
         | undefined
     )?.summary?.[0]?.text;
   }
-  if (
-    provider === Providers.OPENROUTER &&
-    chunk?.additional_kwargs?.reasoning_details != null &&
-    Array.isArray(chunk.additional_kwargs.reasoning_details)
-  ) {
-    // Extract text from reasoning_details array (for Gemini, DeepSeek, etc.)
-    const textEntries = chunk.additional_kwargs.reasoning_details
-      .filter(
-        (detail) =>
-          detail.type === 'reasoning.text' &&
-          detail.text != null &&
-          detail.text !== ''
-      )
-      .map((detail) => detail.text)
-      .join('');
-    if (textEntries) {
-      return textEntries;
+  /**
+   * For OpenRouter, reasoning is stored in additional_kwargs.reasoning (not reasoning_content).
+   * NOTE: We intentionally do NOT extract text from reasoning_details here.
+   * The reasoning_details array contains the FULL accumulated reasoning text (set only on final chunk),
+   * but individual reasoning tokens are already streamed via additional_kwargs.reasoning.
+   * Extracting from reasoning_details would cause duplication.
+   * The reasoning_details is only used for:
+   * 1. Detecting reasoning mode in handleReasoning()
+   * 2. Final message storage (for thought signatures)
+   */
+  if (provider === Providers.OPENROUTER) {
+    const reasoning = chunk?.additional_kwargs?.reasoning as string | undefined;
+    if (reasoning != null && reasoning !== '') {
+      return reasoning;
     }
+    return chunk?.content;
   }
   return (
     ((chunk?.additional_kwargs?.[reasoningKey] as string | undefined) ?? '') ||
@@ -376,9 +374,12 @@ hasToolCallChunks: ${hasToolCallChunks}
       reasoning_content = 'valid';
     } else if (
       agentContext.provider === Providers.OPENROUTER &&
-      chunk.additional_kwargs?.reasoning_details != null &&
-      Array.isArray(chunk.additional_kwargs.reasoning_details) &&
-      chunk.additional_kwargs.reasoning_details.length > 0
+      // Check for reasoning_details (final chunk) OR reasoning string (intermediate chunks)
+      ((chunk.additional_kwargs?.reasoning_details != null &&
+        Array.isArray(chunk.additional_kwargs.reasoning_details) &&
+        chunk.additional_kwargs.reasoning_details.length > 0) ||
+        (typeof chunk.additional_kwargs?.reasoning === 'string' &&
+          chunk.additional_kwargs.reasoning !== ''))
     ) {
       reasoning_content = 'valid';
     }
