@@ -13,6 +13,10 @@
   },
   "type": "module",
   "description": "",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/danny-avila/agents"
+  },
   "author": "Danny Avila",
   "license": "MIT",
   "licenses": [
