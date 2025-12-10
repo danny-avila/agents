@@ -146,6 +146,8 @@ export class AgentContext {
     'normal';
   /** Buffer for accumulating potential thinking tags */
   tagBuffer: string = '';
+  /** Current step ID for flushing buffer at stream end */
+  currentStepId?: string;
   /** Whether tools should end the workflow */
   toolEnd: boolean = false;
   /** Cached system runnable (created lazily) */

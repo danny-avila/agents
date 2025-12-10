@@ -28,6 +28,44 @@ function getNonEmptyValue(possibleValues: string[]): string | undefined {
   return undefined;
 }
 
+/**
+ * Flush any remaining buffered content from the thinking tag state machine.
+ * Called when the stream ends to ensure partial tags aren't lost.
+ */
+export async function flushThinkingBuffer(
+  agentContext: AgentContext,
+  graph: StandardGraph
+): Promise<void> {
+  if (!agentContext.tagBuffer || !agentContext.currentStepId) {
+    return;
+  }
+
+  const stepId = agentContext.currentStepId;
+
+  if (
+    agentContext.thinkingState === 'buffering_open' ||
+    agentContext.thinkingState === 'normal'
+  ) {
+    // Incomplete opening tag or normal state - flush as TEXT
+    await graph.dispatchMessageDelta(stepId, {
+      content: [{ type: ContentTypes.TEXT, text: agentContext.tagBuffer }],
+    });
+  } else if (
+    agentContext.thinkingState === 'buffering_close' ||
+    agentContext.thinkingState === 'thinking'
+  ) {
+    // Incomplete closing tag or thinking state - flush as THINK
+    await graph.dispatchReasoningDelta(stepId, {
+      content: [{ type: ContentTypes.THINK, think: agentContext.tagBuffer }],
+    });
+  }
+
+  // Reset buffer state
+  agentContext.tagBuffer = '';
+  agentContext.thinkingState = 'normal';
+  agentContext.currentStepId = undefined;
+}
+
 export function getChunkContent({
   chunk,
   provider,
@@ -226,6 +264,9 @@ hasToolCallChunks: ${hasToolCallChunks}
         agentContext.thinkingState = 'normal';
         agentContext.tagBuffer = '';
       }
+
+      // Store stepId for potential buffer flush at stream end
+      agentContext.currentStepId = stepId;
 
       let remaining = content;
 
