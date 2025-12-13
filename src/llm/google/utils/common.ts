@@ -595,6 +595,11 @@ export function convertResponseContentToChatGenerationChunk(
             type: 'codeExecutionResult',
             codeExecutionResult: p.codeExecutionResult,
           };
+        } else if ('inlineData' in p && p.inlineData) {
+          return {
+            type: 'image_url' as const,
+            image_url: `data:${p.inlineData.mimeType};base64,${p.inlineData.data}`,
+          };
         }
         return p;
       })
@@ -752,6 +757,11 @@ export function mapGenerateContentResultToChatResult(
           return {
             type: 'codeExecutionResult',
             codeExecutionResult: p.codeExecutionResult,
+          };
+        } else if ('inlineData' in p && p.inlineData) {
+          return {
+            type: 'image_url' as const,
+            image_url: `data:${p.inlineData.mimeType};base64,${p.inlineData.data}`,
           };
         }
         return p;
