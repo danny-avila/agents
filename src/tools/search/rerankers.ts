@@ -78,7 +78,7 @@ export class SimpleReranker extends BaseReranker {
         expiresIn: '10m',
       });
 
-      const resp = await axios.post<t.SimpleRerankerResponse | undefined>(
+      const resp = await axios.post<t.SimpleRerankerResponse[]>(
         this.instanceUrl,
         requestData,
         {
