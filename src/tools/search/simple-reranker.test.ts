@@ -1,4 +1,4 @@
-// simple-rerander.test.ts
+// simple-reranker.test.ts
 import axios from 'axios';
 import jwt from 'jsonwebtoken';
 import { nanoid } from 'nanoid';
