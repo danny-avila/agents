@@ -145,7 +145,7 @@ async function testStandardStreaming(): Promise<void> {
   });
 
   const config = {
-    runId: 'test-simple-script',
+    runId: uuidv4(),
     configurable: {
       user_id: 'user-123',
       thread_id: 'conversation-num-1',
