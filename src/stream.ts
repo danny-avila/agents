@@ -118,6 +118,11 @@ export function getChunkContent({
    * 2. Final message storage (for thought signatures)
    */
   if (provider === Providers.OPENROUTER) {
+    // Content presence signals end of reasoning phase - prefer content over reasoning
+    // This handles transitional chunks that may have both reasoning and content
+    if (typeof chunk?.content === 'string' && chunk.content !== '') {
+      return chunk.content;
+    }
     const reasoning = chunk?.additional_kwargs?.reasoning as string | undefined;
     if (reasoning != null && reasoning !== '') {
       return reasoning;
@@ -374,6 +379,8 @@ hasToolCallChunks: ${hasToolCallChunks}
       reasoning_content = 'valid';
     } else if (
       agentContext.provider === Providers.OPENROUTER &&
+      // Only set reasoning as valid if content is NOT present (content signals end of reasoning)
+      (chunk.content == null || chunk.content === '') &&
       // Check for reasoning_details (final chunk) OR reasoning string (intermediate chunks)
       ((chunk.additional_kwargs?.reasoning_details != null &&
         Array.isArray(chunk.additional_kwargs.reasoning_details) &&
