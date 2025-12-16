@@ -17,11 +17,14 @@ class CustomChatConnection extends ChatConnection<VertexAIClientOptions> {
       input,
       parameters
     )) as GeminiRequest;
-    if (
-      formattedData.generationConfig?.thinkingConfig?.thinkingBudget === -1 &&
-      formattedData.generationConfig.thinkingConfig.includeThoughts === false
-    ) {
-      formattedData.generationConfig.thinkingConfig.includeThoughts = true;
+    if (formattedData.generationConfig?.thinkingConfig?.thinkingBudget === -1) {
+      // -1 means "let the model decide" - delete the property so the API doesn't receive an invalid value
+      if (
+        formattedData.generationConfig.thinkingConfig.includeThoughts === false
+      ) {
+        formattedData.generationConfig.thinkingConfig.includeThoughts = true;
+      }
+      delete formattedData.generationConfig.thinkingConfig.thinkingBudget;
     }
     return formattedData;
   }
@@ -318,11 +321,7 @@ export class ChatVertexAI extends ChatGoogle {
   }
 
   constructor(fields?: VertexAIClientOptions) {
-    let dynamicThinkingBudget = false;
-    if (fields?.thinkingBudget === -1) {
-      dynamicThinkingBudget = true;
-      fields.thinkingBudget = 1;
-    }
+    const dynamicThinkingBudget = fields?.thinkingBudget === -1;
     super({
       ...fields,
       platformType: 'gcp',
