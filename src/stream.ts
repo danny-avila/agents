@@ -442,6 +442,8 @@ export function createContentAggregator(): t.ContentAggregatorResult {
   const contentParts: Array<t.MessageContentComplex | undefined> = [];
   const stepMap = new Map<string, t.RunStep>();
   const toolCallIdMap = new Map<string, string>();
+  // Track agentId for each content index (for parallel agent attribution)
+  const contentAgentMap = new Map<number, string>();
 
   const updateContent = (
     index: number,
@@ -578,6 +580,14 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         tool_call: newToolCall,
       };
     }
+
+    // Apply agentId to content part for parallel execution attribution
+    const agentId = contentAgentMap.get(index);
+    if (agentId !== undefined) {
+      (
+        contentParts[index] as t.MessageContentComplex & { agentId?: string }
+      ).agentId = agentId;
+    }
   };
 
   const aggregateContent = ({
@@ -595,6 +605,11 @@ export function createContentAggregator(): t.ContentAggregatorResult {
     if (event === GraphEvents.ON_RUN_STEP) {
       const runStep = data as t.RunStep;
       stepMap.set(runStep.id, runStep);
+
+      // Track agentId for this content index (for parallel execution)
+      if (runStep.agentId != null && runStep.agentId !== '') {
+        contentAgentMap.set(runStep.index, runStep.agentId);
+      }
 
       // Store tool call IDs if present
       if (
@@ -706,5 +721,5 @@ export function createContentAggregator(): t.ContentAggregatorResult {
     }
   };
 
-  return { contentParts, aggregateContent, stepMap };
+  return { contentParts, aggregateContent, stepMap, contentAgentMap };
 }

@@ -332,6 +332,8 @@ export type MessageContentComplex = (
     })
 ) & {
   tool_call_ids?: string[];
+  // Optional agentId for parallel execution attribution
+  agentId?: string;
 };
 
 export interface TMessage {
@@ -399,4 +401,6 @@ export type ContentAggregatorResult = {
   stepMap: Map<string, RunStep | undefined>;
   contentParts: Array<MessageContentComplex | undefined>;
   aggregateContent: ContentAggregator;
+  // Maps content index to agentId for parallel execution attribution
+  contentAgentMap: Map<number, string>;
 };

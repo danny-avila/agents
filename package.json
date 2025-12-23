@@ -69,6 +69,7 @@
     "multi-agent-test": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/multi-agent-test.ts",
     "test-tools-before-handoff": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/test-tools-before-handoff.ts",
     "multi-agent-parallel": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/multi-agent-parallel.ts",
+    "multi-agent-parallel-start": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/multi-agent-parallel-start.ts",
     "multi-agent-chain": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/multi-agent-chain.ts",
     "multi-agent-sequence": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/multi-agent-sequence.ts",
     "multi-agent-conditional": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/multi-agent-conditional.ts",
