@@ -110,7 +110,7 @@
   "dependencies": {
     "@langchain/anthropic": "^0.3.26",
     "@langchain/aws": "^0.1.15",
-    "@langchain/core": "^0.3.79",
+    "@langchain/core": "^0.3.80",
     "@langchain/deepseek": "^0.0.2",
     "@langchain/google-genai": "^0.2.18",
     "@langchain/google-vertexai": "^0.2.18",
