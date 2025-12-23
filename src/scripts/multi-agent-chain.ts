@@ -143,18 +143,49 @@ async function testSequentialAgentChain() {
 
   // Track agent progression
   let currentAgent = '';
+  const startTime = Date.now();
+  let messageCount = 0;
 
-  // Create custom handlers
+  // Create custom handlers with extensive metadata logging
   const customHandlers = {
     [GraphEvents.TOOL_END]: new ToolEndHandler(),
-    [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(),
+    [GraphEvents.CHAT_MODEL_END]: {
+      handle: (
+        _event: string,
+        _data: t.StreamEventData,
+        metadata?: Record<string, unknown>
+      ): void => {
+        console.log('\n====== CHAT_MODEL_END METADATA ======');
+        console.dir(metadata, { depth: null });
+        const elapsed = Date.now() - startTime;
+        console.log(`⏱️  COMPLETED at ${elapsed}ms`);
+      },
+    },
+    [GraphEvents.CHAT_MODEL_START]: {
+      handle: (
+        _event: string,
+        _data: t.StreamEventData,
+        metadata?: Record<string, unknown>
+      ): void => {
+        console.log('\n====== CHAT_MODEL_START METADATA ======');
+        console.dir(metadata, { depth: null });
+        const elapsed = Date.now() - startTime;
+        console.log(`⏱️  STARTED at ${elapsed}ms`);
+      },
+    },
     [GraphEvents.CHAT_MODEL_STREAM]: new ChatModelStreamHandler(),
     [GraphEvents.ON_RUN_STEP]: {
       handle: (
         event: GraphEvents.ON_RUN_STEP,
-        data: t.StreamEventData
+        data: t.StreamEventData,
+        metadata?: Record<string, unknown>
       ): void => {
         const runStepData = data as any;
+        console.log('\n====== ON_RUN_STEP ======');
+        console.log('DATA:');
+        console.dir(data, { depth: null });
+        console.log('METADATA:');
+        console.dir(metadata, { depth: null });
         if (runStepData?.name) {
           currentAgent = runStepData.name;
           console.log(`\n→ ${currentAgent} is processing...`);
@@ -165,9 +196,15 @@ async function testSequentialAgentChain() {
     [GraphEvents.ON_RUN_STEP_COMPLETED]: {
       handle: (
         event: GraphEvents.ON_RUN_STEP_COMPLETED,
-        data: t.StreamEventData
+        data: t.StreamEventData,
+        metadata?: Record<string, unknown>
       ): void => {
         const runStepData = data as any;
+        console.log('\n====== ON_RUN_STEP_COMPLETED ======');
+        console.log('DATA:');
+        console.dir(data, { depth: null });
+        console.log('METADATA:');
+        console.dir(metadata, { depth: null });
         if (runStepData?.name) {
           console.log(`✓ ${runStepData.name} completed`);
         }
@@ -180,16 +217,32 @@ async function testSequentialAgentChain() {
     [GraphEvents.ON_RUN_STEP_DELTA]: {
       handle: (
         event: GraphEvents.ON_RUN_STEP_DELTA,
-        data: t.StreamEventData
+        data: t.StreamEventData,
+        metadata?: Record<string, unknown>
       ): void => {
+        console.log('\n====== ON_RUN_STEP_DELTA ======');
+        console.log('DATA:');
+        console.dir(data, { depth: null });
+        console.log('METADATA:');
+        console.dir(metadata, { depth: null });
         aggregateContent({ event, data: data as t.RunStepDeltaEvent });
       },
     },
     [GraphEvents.ON_MESSAGE_DELTA]: {
       handle: (
         event: GraphEvents.ON_MESSAGE_DELTA,
-        data: t.StreamEventData
+        data: t.StreamEventData,
+        metadata?: Record<string, unknown>
       ): void => {
+        messageCount++;
+        // Only log first few message deltas to avoid spam
+        if (messageCount <= 3) {
+          console.log('\n====== ON_MESSAGE_DELTA ======');
+          console.log('DATA:');
+          console.dir(data, { depth: null });
+          console.log('METADATA:');
+          console.dir(metadata, { depth: null });
+        }
         aggregateContent({ event, data: data as t.MessageDeltaEvent });
       },
     },

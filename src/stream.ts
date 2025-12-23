@@ -442,8 +442,11 @@ export function createContentAggregator(): t.ContentAggregatorResult {
   const contentParts: Array<t.MessageContentComplex | undefined> = [];
   const stepMap = new Map<string, t.RunStep>();
   const toolCallIdMap = new Map<string, string>();
-  // Track agentId for each content index (for parallel agent attribution)
-  const contentAgentMap = new Map<number, string>();
+  // Track agentId and groupId for each content index (applied to content parts)
+  const contentMetaMap = new Map<
+    number,
+    { agentId?: string; groupId?: number }
+  >();
 
   const updateContent = (
     index: number,
@@ -581,12 +584,13 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       };
     }
 
-    // Apply agentId to content part for parallel execution attribution
-    const agentId = contentAgentMap.get(index);
-    if (agentId !== undefined) {
-      (
-        contentParts[index] as t.MessageContentComplex & { agentId?: string }
-      ).agentId = agentId;
+    // Apply agentId and groupId to content part for parallel execution attribution
+    const meta = contentMetaMap.get(index);
+    if (meta?.agentId !== undefined) {
+      (contentParts[index] as t.MessageContentComplex).agentId = meta.agentId;
+    }
+    if (meta?.groupId !== undefined) {
+      (contentParts[index] as t.MessageContentComplex).groupId = meta.groupId;
     }
   };
 
@@ -606,9 +610,19 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       const runStep = data as t.RunStep;
       stepMap.set(runStep.id, runStep);
 
-      // Track agentId for this content index (for parallel execution)
+      // Track agentId and groupId for this content index
+      const existingMeta = contentMetaMap.get(runStep.index) ?? {};
       if (runStep.agentId != null && runStep.agentId !== '') {
-        contentAgentMap.set(runStep.index, runStep.agentId);
+        existingMeta.agentId = runStep.agentId;
+      }
+      if (runStep.groupId != null) {
+        existingMeta.groupId = runStep.groupId;
+      }
+      if (
+        (existingMeta.agentId != null && existingMeta.agentId !== '') ||
+        existingMeta.groupId != null
+      ) {
+        contentMetaMap.set(runStep.index, existingMeta);
       }
 
       // Store tool call IDs if present
@@ -721,5 +735,5 @@ export function createContentAggregator(): t.ContentAggregatorResult {
     }
   };
 
-  return { contentParts, aggregateContent, stepMap, contentAgentMap };
+  return { contentParts, aggregateContent, stepMap };
 }

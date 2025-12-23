@@ -2,6 +2,7 @@ import { config } from 'dotenv';
 config();
 
 import { HumanMessage, BaseMessage } from '@langchain/core/messages';
+import { v4 as uuidv4 } from 'uuid';
 import type * as t from '@/types';
 import { ChatModelStreamHandler, createContentAggregator } from '@/stream';
 import { ToolEndHandler, ModelEndHandler } from '@/events';
@@ -12,50 +13,15 @@ import { Run } from '@/run';
 const conversationHistory: BaseMessage[] = [];
 
 /**
- * Example of parallel multi-agent system that starts with parallel execution immediately
- *
- * Graph structure:
- * START -> [analyst1, analyst2] -> END (parallel from start, both run simultaneously)
- *
- * This demonstrates getting a parallel stream from the very beginning,
- * with two agents running simultaneously. Useful for testing how different
- * models respond to the same input.
+ * Single agent test with extensive metadata logging
+ * Compare with multi-agent-parallel-start.ts to see metadata differences
  */
-async function testParallelFromStart() {
-  console.log('Testing Parallel From Start Multi-Agent System...\n');
+async function testSingleAgent() {
+  console.log('Testing Single Agent with Metadata Logging...\n');
 
   // Set up content aggregator
   const { contentParts, aggregateContent } = createContentAggregator();
 
-  // Define two agents - both have NO incoming edges, so they run in parallel from the start
-  const agents: t.AgentInputs[] = [
-    {
-      agentId: 'analyst1',
-      provider: Providers.ANTHROPIC,
-      clientOptions: {
-        modelName: 'claude-haiku-4-5',
-        apiKey: process.env.ANTHROPIC_API_KEY,
-      },
-      instructions: `You are a CREATIVE ANALYST. Analyze the user's query from a creative and innovative perspective. Focus on novel ideas, unconventional approaches, and imaginative possibilities. Keep your response concise (100-150 words). Start with "🎨 CREATIVE:"`,
-    },
-    {
-      agentId: 'analyst2',
-      provider: Providers.ANTHROPIC,
-      clientOptions: {
-        modelName: 'claude-haiku-4-5',
-        apiKey: process.env.ANTHROPIC_API_KEY,
-      },
-      instructions: `You are a PRACTICAL ANALYST. Analyze the user's query from a logical and practical perspective. Focus on feasibility, metrics, and actionable steps. Keep your response concise (100-150 words). Start with "📊 PRACTICAL:"`,
-    },
-  ];
-
-  // No edges needed - both agents have no incoming edges, so both are start nodes
-  // They will run in parallel and end when both complete
-  const edges: t.GraphEdge[] = [];
-
-  // Track which agents are active and their timing
-  const activeAgents = new Set<string>();
-  const agentTimings: Record<string, { start?: number; end?: number }> = {};
   const startTime = Date.now();
 
   // Create custom handlers with extensive metadata logging
@@ -69,13 +35,8 @@ async function testParallelFromStart() {
       ): void => {
         console.log('\n====== CHAT_MODEL_END METADATA ======');
         console.dir(metadata, { depth: null });
-        const nodeName = metadata?.langgraph_node as string;
-        if (nodeName) {
-          const elapsed = Date.now() - startTime;
-          agentTimings[nodeName] = agentTimings[nodeName] || {};
-          agentTimings[nodeName].end = elapsed;
-          console.log(`⏱️  [${nodeName}] COMPLETED at ${elapsed}ms`);
-        }
+        const elapsed = Date.now() - startTime;
+        console.log(`⏱️  COMPLETED at ${elapsed}ms`);
       },
     },
     [GraphEvents.CHAT_MODEL_START]: {
@@ -86,14 +47,8 @@ async function testParallelFromStart() {
       ): void => {
         console.log('\n====== CHAT_MODEL_START METADATA ======');
         console.dir(metadata, { depth: null });
-        const nodeName = metadata?.langgraph_node as string;
-        if (nodeName) {
-          const elapsed = Date.now() - startTime;
-          agentTimings[nodeName] = agentTimings[nodeName] || {};
-          agentTimings[nodeName].start = elapsed;
-          activeAgents.add(nodeName);
-          console.log(`⏱️  [${nodeName}] STARTED at ${elapsed}ms`);
-        }
+        const elapsed = Date.now() - startTime;
+        console.log(`⏱️  STARTED at ${elapsed}ms`);
       },
     },
     [GraphEvents.CHAT_MODEL_STREAM]: new ChatModelStreamHandler(),
@@ -148,7 +103,6 @@ async function testParallelFromStart() {
         data: t.StreamEventData,
         metadata?: Record<string, unknown>
       ): void => {
-        // Only log first delta per agent to avoid spam
         console.log('\n====== ON_MESSAGE_DELTA ======');
         console.log('DATA:');
         console.dir(data, { depth: null });
@@ -159,13 +113,17 @@ async function testParallelFromStart() {
     },
   };
 
-  // Create multi-agent run configuration
+  // Create single-agent run configuration (standard graph, not multi-agent)
   const runConfig: t.RunConfig = {
-    runId: `parallel-start-${Date.now()}`,
+    runId: `single-agent-${Date.now()}`,
     graphConfig: {
-      type: 'multi-agent',
-      agents,
-      edges,
+      type: 'standard',
+      llmConfig: {
+        provider: Providers.ANTHROPIC,
+        modelName: 'claude-haiku-4-5',
+        apiKey: process.env.ANTHROPIC_API_KEY,
+      },
+      instructions: `You are a helpful AI assistant. Keep your response concise (50-100 words).`,
     },
     customHandlers,
     returnContent: true,
@@ -197,12 +155,11 @@ async function testParallelFromStart() {
     const userMessage = `What are the best approaches to learning a new programming language?`;
     conversationHistory.push(new HumanMessage(userMessage));
 
-    console.log('Invoking parallel-from-start multi-agent graph...\n');
-    console.log('Both analyst1 and analyst2 should start simultaneously!\n');
+    console.log('Invoking single-agent graph...\n');
 
     const config = {
       configurable: {
-        thread_id: 'parallel-start-conversation-1',
+        thread_id: 'single-agent-conversation-1',
       },
       streamMode: 'values',
       version: 'v2' as const,
@@ -220,44 +177,16 @@ async function testParallelFromStart() {
       conversationHistory.push(...finalMessages);
     }
 
-    console.log('\n\n========== TIMING SUMMARY ==========');
-    for (const [agent, timing] of Object.entries(agentTimings)) {
-      const duration =
-        timing.end && timing.start ? timing.end - timing.start : 'N/A';
-      console.log(
-        `${agent}: started=${timing.start}ms, ended=${timing.end}ms, duration=${duration}ms`
-      );
-    }
-
-    // Check if parallel
-    const agents = Object.keys(agentTimings);
-    if (agents.length >= 2) {
-      const [a1, a2] = agents;
-      const t1 = agentTimings[a1];
-      const t2 = agentTimings[a2];
-      if (t1.start && t2.start && t1.end && t2.end) {
-        const overlap = Math.min(t1.end, t2.end) - Math.max(t1.start, t2.start);
-        if (overlap > 0) {
-          console.log(
-            `\n✅ PARALLEL EXECUTION CONFIRMED: ${overlap}ms overlap`
-          );
-        } else {
-          console.log(`\n❌ SEQUENTIAL EXECUTION: no overlap`);
-        }
-      }
-    }
-    console.log('====================================\n');
-
+    console.log('\n\n========== SUMMARY ==========');
     console.log('Final content parts:', contentParts.length, 'parts');
     console.dir(contentParts, { depth: null });
-
-    // groupId on each content part allows frontend to derive boundaries if needed
+    console.log('====================================\n');
 
     await sleep(3000);
   } catch (error) {
-    console.error('Error in parallel-from-start multi-agent test:', error);
+    console.error('Error in single-agent test:', error);
   }
 }
 
 // Run the test
-testParallelFromStart();
+testSingleAgent();

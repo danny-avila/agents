@@ -32,6 +32,14 @@ async function testThinkingHandoff() {
         }
       },
     },
+    [GraphEvents.ON_RUN_STEP]: {
+      handle: (_event: string, data: t.StreamEventData): void => {
+        const runStep = data as t.RunStep;
+        console.log(
+          `\n📍 ON_RUN_STEP: agentId=${runStep.agentId}, groupId=${runStep.groupId}`
+        );
+      },
+    },
   };
 
   // Create the graph configuration

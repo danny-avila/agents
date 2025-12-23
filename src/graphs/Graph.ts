@@ -923,6 +923,17 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     return workflow;
   }
 
+  /**
+   * Get the parallel group ID for an agent, if any.
+   * Override in MultiAgentGraph to provide actual group IDs.
+   * Group IDs are incrementing numbers (1, 2, 3...) reflecting execution order.
+   * @param _agentId - The agent ID to look up
+   * @returns undefined for StandardGraph (no parallel groups), or group number for MultiAgentGraph
+   */
+  protected getParallelGroupIdForAgent(_agentId: string): number | undefined {
+    return undefined;
+  }
+
   /* Dispatchers */
 
   /**
@@ -963,13 +974,20 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     }
 
     /**
-     * Extract and store agentId from metadata
+     * Extract agentId and parallelGroupId from metadata
      */
     if (metadata) {
       try {
         const agentContext = this.getAgentContext(metadata);
         if (agentContext.agentId) {
           runStep.agentId = agentContext.agentId;
+
+          // Set group ID if this agent is part of a parallel group
+          // Group IDs are incrementing numbers (1, 2, 3...) reflecting execution order
+          const groupId = this.getParallelGroupIdForAgent(agentContext.agentId);
+          if (groupId != null) {
+            runStep.groupId = groupId;
+          }
         }
       } catch (_e) {
         /** If we can't get agent context, that's okay - agentId remains undefined */

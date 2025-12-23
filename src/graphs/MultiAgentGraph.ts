@@ -40,6 +40,17 @@ export class MultiAgentGraph extends StandardGraph {
   private startingNodes: Set<string> = new Set();
   private directEdges: t.GraphEdge[] = [];
   private handoffEdges: t.GraphEdge[] = [];
+  /**
+   * Map of agentId to parallel group info.
+   * Contains groupId (incrementing number reflecting execution order) for agents in parallel groups.
+   * Sequential agents (not in any parallel group) have undefined entry.
+   *
+   * Example for: researcher -> [analyst1, analyst2, analyst3] -> summarizer
+   * - researcher: undefined (sequential, order 0)
+   * - analyst1, analyst2, analyst3: { groupId: 1 } (parallel group, order 1)
+   * - summarizer: undefined (sequential, order 2)
+   */
+  private agentParallelGroups: Map<string, number> = new Map();
 
   constructor(input: t.MultiAgentGraphInput) {
     super(input);
@@ -99,6 +110,106 @@ export class MultiAgentGraph extends StandardGraph {
     if (this.startingNodes.size === 0 && this.agentContexts.size > 0) {
       this.startingNodes.add(this.agentContexts.keys().next().value!);
     }
+
+    // Determine if graph has parallel execution capability
+    this.computeParallelCapability();
+  }
+
+  /**
+   * Compute parallel groups by traversing the graph in execution order.
+   * Assigns incrementing group IDs that reflect the sequential order of execution.
+   *
+   * For: researcher -> [analyst1, analyst2, analyst3] -> summarizer
+   * - researcher: no group (first sequential node)
+   * - analyst1, analyst2, analyst3: groupId 1 (first parallel group)
+   * - summarizer: no group (next sequential node)
+   *
+   * This allows frontend to render in order:
+   * Row 0: researcher
+   * Row 1: [analyst1, analyst2, analyst3] (grouped)
+   * Row 2: summarizer
+   */
+  private computeParallelCapability(): void {
+    let groupCounter = 1; // Start at 1, 0 reserved for "no group"
+
+    // Check 1: Multiple starting nodes means parallel from the start (group 1)
+    if (this.startingNodes.size > 1) {
+      for (const agentId of this.startingNodes) {
+        this.agentParallelGroups.set(agentId, groupCounter);
+      }
+      groupCounter++;
+    }
+
+    // Check 2: Traverse direct edges in order to find fan-out patterns
+    // Build a simple execution order by following edges from starting nodes
+    const visited = new Set<string>();
+    const queue: string[] = [...this.startingNodes];
+
+    while (queue.length > 0) {
+      const current = queue.shift()!;
+      if (visited.has(current)) continue;
+      visited.add(current);
+
+      // Find direct edges from this node
+      for (const edge of this.directEdges) {
+        const sources = Array.isArray(edge.from) ? edge.from : [edge.from];
+        if (!sources.includes(current)) continue;
+
+        const destinations = Array.isArray(edge.to) ? edge.to : [edge.to];
+
+        // Fan-out: multiple destinations = parallel group
+        if (destinations.length > 1) {
+          for (const dest of destinations) {
+            // Only set if not already in a group (first group wins)
+            if (!this.agentParallelGroups.has(dest)) {
+              this.agentParallelGroups.set(dest, groupCounter);
+            }
+            if (!visited.has(dest)) {
+              queue.push(dest);
+            }
+          }
+          groupCounter++;
+        } else {
+          // Single destination - add to queue for traversal
+          for (const dest of destinations) {
+            if (!visited.has(dest)) {
+              queue.push(dest);
+            }
+          }
+        }
+      }
+
+      // Also follow handoff edges for traversal (but they don't create parallel groups)
+      for (const edge of this.handoffEdges) {
+        const sources = Array.isArray(edge.from) ? edge.from : [edge.from];
+        if (!sources.includes(current)) continue;
+
+        const destinations = Array.isArray(edge.to) ? edge.to : [edge.to];
+        for (const dest of destinations) {
+          if (!visited.has(dest)) {
+            queue.push(dest);
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Get the parallel group ID for an agent, if any.
+   * Returns undefined if the agent is not part of a parallel group.
+   * Group IDs are incrementing numbers reflecting execution order.
+   */
+  getParallelGroupId(agentId: string): number | undefined {
+    return this.agentParallelGroups.get(agentId);
+  }
+
+  /**
+   * Override base class method to provide parallel group IDs for run steps.
+   */
+  protected override getParallelGroupIdForAgent(
+    agentId: string
+  ): number | undefined {
+    return this.agentParallelGroups.get(agentId);
   }
 
   /**
