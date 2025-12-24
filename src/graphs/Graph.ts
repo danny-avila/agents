@@ -924,6 +924,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   }
 
   /**
+   * Indicates if this is a multi-agent graph.
+   * Override in MultiAgentGraph to return true.
+   * Used to conditionally include agentId in RunStep for frontend rendering.
+   */
+  protected isMultiAgentGraph(): boolean {
+    return false;
+  }
+
+  /**
    * Get the parallel group ID for an agent, if any.
    * Override in MultiAgentGraph to provide actual group IDs.
    * Group IDs are incrementing numbers (1, 2, 3...) reflecting execution order.
@@ -975,13 +984,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
     /**
      * Extract agentId and parallelGroupId from metadata
+     * Only set agentId for MultiAgentGraph (so frontend knows when to show agent labels)
      */
     if (metadata) {
       try {
         const agentContext = this.getAgentContext(metadata);
-        if (agentContext.agentId) {
+        if (this.isMultiAgentGraph() && agentContext.agentId) {
+          // Only include agentId for MultiAgentGraph - enables frontend to show agent labels
           runStep.agentId = agentContext.agentId;
-
           // Set group ID if this agent is part of a parallel group
           // Group IDs are incrementing numbers (1, 2, 3...) reflecting execution order
           const groupId = this.getParallelGroupIdForAgent(agentContext.agentId);

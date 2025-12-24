@@ -204,6 +204,14 @@ export class MultiAgentGraph extends StandardGraph {
   }
 
   /**
+   * Override to indicate this is a multi-agent graph.
+   * Enables agentId to be included in RunStep for frontend agent labeling.
+   */
+  protected override isMultiAgentGraph(): boolean {
+    return true;
+  }
+
+  /**
    * Override base class method to provide parallel group IDs for run steps.
    */
   protected override getParallelGroupIdForAgent(

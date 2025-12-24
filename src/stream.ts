@@ -584,12 +584,14 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       };
     }
 
-    // Apply agentId and groupId to content part for parallel execution attribution
+    // Apply agentId (for MultiAgentGraph) and groupId (for parallel execution) to content parts
+    // - agentId present → MultiAgentGraph (show agent labels)
+    // - groupId present → parallel execution (render columns)
     const meta = contentMetaMap.get(index);
-    if (meta?.agentId !== undefined) {
+    if (meta?.agentId != null) {
       (contentParts[index] as t.MessageContentComplex).agentId = meta.agentId;
     }
-    if (meta?.groupId !== undefined) {
+    if (meta?.groupId != null) {
       (contentParts[index] as t.MessageContentComplex).groupId = meta.groupId;
     }
   };
@@ -610,18 +612,19 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       const runStep = data as t.RunStep;
       stepMap.set(runStep.id, runStep);
 
-      // Track agentId and groupId for this content index
-      const existingMeta = contentMetaMap.get(runStep.index) ?? {};
-      if (runStep.agentId != null && runStep.agentId !== '') {
-        existingMeta.agentId = runStep.agentId;
-      }
-      if (runStep.groupId != null) {
-        existingMeta.groupId = runStep.groupId;
-      }
-      if (
-        (existingMeta.agentId != null && existingMeta.agentId !== '') ||
-        existingMeta.groupId != null
-      ) {
+      // Track agentId (MultiAgentGraph) and groupId (parallel execution) separately
+      // - agentId: present for all MultiAgentGraph runs (enables agent labels in UI)
+      // - groupId: present only for parallel execution (enables column rendering)
+      const hasAgentId = runStep.agentId != null && runStep.agentId !== '';
+      const hasGroupId = runStep.groupId != null;
+      if (hasAgentId || hasGroupId) {
+        const existingMeta = contentMetaMap.get(runStep.index) ?? {};
+        if (hasAgentId) {
+          existingMeta.agentId = runStep.agentId;
+        }
+        if (hasGroupId) {
+          existingMeta.groupId = runStep.groupId;
+        }
         contentMetaMap.set(runStep.index, existingMeta);
       }
 
