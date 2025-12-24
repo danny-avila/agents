@@ -1308,5 +1308,84 @@ describe('formatAgentMessages', () => {
       expect(result.messages[1]).toBeInstanceOf(SystemMessage);
       expect(result.messages[2]).toBeInstanceOf(AIMessage);
     });
+
+    it('should include content parts without metadata (unattributed) when filtering by targetAgentId', () => {
+      const payload: TPayload = [
+        { role: 'user', content: 'Hello' },
+        {
+          role: 'assistant',
+          content: [
+            { type: ContentTypes.TEXT, text: 'Unattributed content' },
+            { type: ContentTypes.TEXT, text: 'Response from agent_a' },
+            { type: ContentTypes.TEXT, text: 'Response from agent_b' },
+            { type: ContentTypes.TEXT, text: 'Another unattributed' },
+          ],
+        },
+      ];
+
+      // Only indices 1 and 2 have metadata; 0 and 3 are unattributed
+      const contentMetadataMap = new Map([
+        [1, { agentId: 'agent_a' }],
+        [2, { agentId: 'agent_b' }],
+      ]);
+
+      const result = formatAgentMessages(payload, undefined, undefined, {
+        targetAgentId: 'agent_a',
+        contentMetadataMap,
+      });
+
+      // Should have user message + filtered assistant message
+      expect(result.messages).toHaveLength(2);
+      expect(result.messages[0]).toBeInstanceOf(HumanMessage);
+      expect(result.messages[1]).toBeInstanceOf(AIMessage);
+
+      // The AIMessage should have: unattributed (index 0) + agent_a (index 1) + unattributed (index 3)
+      const aiMessage = result.messages[1] as AIMessage;
+      expect(Array.isArray(aiMessage.content)).toBe(true);
+      expect(aiMessage.content as Array<{ text: string }>).toHaveLength(3);
+      expect((aiMessage.content as Array<{ text: string }>)[0].text).toBe(
+        'Unattributed content'
+      );
+      expect((aiMessage.content as Array<{ text: string }>)[1].text).toBe(
+        'Response from agent_a'
+      );
+      expect((aiMessage.content as Array<{ text: string }>)[2].text).toBe(
+        'Another unattributed'
+      );
+    });
+
+    it('should include all unattributed content even when no parts match targetAgentId', () => {
+      const payload: TPayload = [
+        {
+          role: 'assistant',
+          content: [
+            { type: ContentTypes.TEXT, text: 'Unattributed content 1' },
+            { type: ContentTypes.TEXT, text: 'Response from agent_b' },
+            { type: ContentTypes.TEXT, text: 'Unattributed content 2' },
+          ],
+        },
+      ];
+
+      // Only index 1 has metadata (agent_b)
+      const contentMetadataMap = new Map([[1, { agentId: 'agent_b' }]]);
+
+      const result = formatAgentMessages(payload, undefined, undefined, {
+        targetAgentId: 'agent_a', // Looking for agent_a, but only agent_b content exists
+        contentMetadataMap,
+      });
+
+      // Should still have the message with unattributed content
+      expect(result.messages).toHaveLength(1);
+      const aiMessage = result.messages[0] as AIMessage;
+      expect(Array.isArray(aiMessage.content)).toBe(true);
+      // Should have the 2 unattributed parts (indices 0 and 2), but NOT agent_b's content
+      expect(aiMessage.content as Array<{ text: string }>).toHaveLength(2);
+      expect((aiMessage.content as Array<{ text: string }>)[0].text).toBe(
+        'Unattributed content 1'
+      );
+      expect((aiMessage.content as Array<{ text: string }>)[1].text).toBe(
+        'Unattributed content 2'
+      );
+    });
   });
 });

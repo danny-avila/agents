@@ -665,6 +665,7 @@ export const formatAgentMessages = (
     }
 
     // Filter content parts by targetAgentId if provided (only for assistant messages with array content)
+    // Include parts that either: 1) match targetAgentId, or 2) have no metadata (not attributed to any agent)
     if (
       targetAgentId != null &&
       targetAgentId !== '' &&
@@ -674,7 +675,8 @@ export const formatAgentMessages = (
     ) {
       const filteredContent = message.content.filter((_, partIndex) => {
         const metadata = contentMetadataMap.get(partIndex);
-        return metadata?.agentId === targetAgentId;
+        // Include if no metadata (unattributed) or if agentId matches target
+        return metadata == null || metadata.agentId === targetAgentId;
       });
       // Skip this message entirely if no content parts match the target agent
       if (filteredContent.length === 0) {
