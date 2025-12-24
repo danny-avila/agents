@@ -14,6 +14,7 @@ import type {
   ExtendedMessageContent,
   MessageContentComplex,
   ReasoningContentText,
+  ContentMetadata,
   ToolCallContent,
   ToolCallPart,
   TPayload,
@@ -626,23 +627,31 @@ export const labelContentByAgent = (
  * @param payload - The array of messages to format.
  * @param indexTokenCountMap - Optional map of message indices to token counts.
  * @param tools - Optional set of tool names that are allowed in the request.
+ * @param options - Optional configuration for agent filtering.
+ * @param options.targetAgentId - If provided, only content parts from this agent will be included.
+ * @param options.contentMetadataMap - Map of content index to metadata (required when targetAgentId is provided).
  * @returns - Object containing formatted messages and updated indexTokenCountMap if provided.
  */
 export const formatAgentMessages = (
   payload: TPayload,
-  indexTokenCountMap?: Record<number, number>,
-  tools?: Set<string>
+  indexTokenCountMap?: Record<number, number | undefined>,
+  tools?: Set<string>,
+  options?: {
+    targetAgentId?: string;
+    contentMetadataMap?: Map<number, ContentMetadata>;
+  }
 ): {
   messages: Array<HumanMessage | AIMessage | SystemMessage | ToolMessage>;
   indexTokenCountMap?: Record<number, number>;
 } => {
+  const { targetAgentId, contentMetadataMap } = options ?? {};
   const messages: Array<
     HumanMessage | AIMessage | SystemMessage | ToolMessage
   > = [];
   // If indexTokenCountMap is provided, create a new map to track the updated indices
   const updatedIndexTokenCountMap: Record<number, number> = {};
   // Keep track of the mapping from original payload indices to result indices
-  const indexMapping: Record<number, number[]> = {};
+  const indexMapping: Record<number, number[] | undefined> = {};
 
   // Process messages with tool conversion if tools set is provided
   for (let i = 0; i < payload.length; i++) {
@@ -654,6 +663,27 @@ export const formatAgentMessages = (
         { type: ContentTypes.TEXT, [ContentTypes.TEXT]: message.content },
       ];
     }
+
+    // Filter content parts by targetAgentId if provided (only for assistant messages with array content)
+    if (
+      targetAgentId != null &&
+      targetAgentId !== '' &&
+      contentMetadataMap != null &&
+      message.role === 'assistant' &&
+      Array.isArray(message.content)
+    ) {
+      const filteredContent = message.content.filter((_, partIndex) => {
+        const metadata = contentMetadataMap.get(partIndex);
+        return metadata?.agentId === targetAgentId;
+      });
+      // Skip this message entirely if no content parts match the target agent
+      if (filteredContent.length === 0) {
+        indexMapping[i] = [];
+        continue;
+      }
+      message.content = filteredContent;
+    }
+
     if (message.role !== 'assistant') {
       messages.push(
         formatMessage({

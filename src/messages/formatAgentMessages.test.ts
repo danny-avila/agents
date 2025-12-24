@@ -1141,4 +1141,172 @@ describe('formatAgentMessages', () => {
     expect(result.messages[1].name).toBe('search');
     expect(result.messages[1].content).toBe('');
   });
+
+  describe('targetAgentId filtering', () => {
+    it('should filter content parts to only include those from targetAgentId', () => {
+      const payload: TPayload = [
+        { role: 'user', content: 'Hello' },
+        {
+          role: 'assistant',
+          content: [
+            { type: ContentTypes.TEXT, text: 'Response from agent_a' },
+            { type: ContentTypes.TEXT, text: 'Response from agent_b' },
+            { type: ContentTypes.TEXT, text: 'Another from agent_a' },
+          ],
+        },
+      ];
+
+      const contentMetadataMap = new Map([
+        [0, { agentId: 'agent_a' }],
+        [1, { agentId: 'agent_b' }],
+        [2, { agentId: 'agent_a' }],
+      ]);
+
+      const result = formatAgentMessages(payload, undefined, undefined, {
+        targetAgentId: 'agent_a',
+        contentMetadataMap,
+      });
+
+      // Should have user message + filtered assistant message
+      expect(result.messages).toHaveLength(2);
+      expect(result.messages[0]).toBeInstanceOf(HumanMessage);
+      expect(result.messages[1]).toBeInstanceOf(AIMessage);
+
+      // The AIMessage should only have agent_a's content parts
+      const aiMessage = result.messages[1] as AIMessage;
+      expect(Array.isArray(aiMessage.content)).toBe(true);
+      expect(aiMessage.content as Array<{ text: string }>).toHaveLength(2);
+      expect((aiMessage.content as Array<{ text: string }>)[0].text).toBe(
+        'Response from agent_a'
+      );
+      expect((aiMessage.content as Array<{ text: string }>)[1].text).toBe(
+        'Another from agent_a'
+      );
+    });
+
+    it('should skip assistant message entirely if no content parts match targetAgentId', () => {
+      const payload: TPayload = [
+        { role: 'user', content: 'Hello' },
+        {
+          role: 'assistant',
+          content: [{ type: ContentTypes.TEXT, text: 'Response from agent_b' }],
+        },
+      ];
+
+      const contentMetadataMap = new Map([[0, { agentId: 'agent_b' }]]);
+
+      const result = formatAgentMessages(payload, undefined, undefined, {
+        targetAgentId: 'agent_a',
+        contentMetadataMap,
+      });
+
+      // Should only have the user message, assistant message skipped
+      expect(result.messages).toHaveLength(1);
+      expect(result.messages[0]).toBeInstanceOf(HumanMessage);
+    });
+
+    it('should not filter when targetAgentId is not provided', () => {
+      const payload: TPayload = [
+        {
+          role: 'assistant',
+          content: [
+            { type: ContentTypes.TEXT, text: 'Response from agent_a' },
+            { type: ContentTypes.TEXT, text: 'Response from agent_b' },
+          ],
+        },
+      ];
+
+      const contentMetadataMap = new Map([
+        [0, { agentId: 'agent_a' }],
+        [1, { agentId: 'agent_b' }],
+      ]);
+
+      // No targetAgentId provided - should include all content
+      const result = formatAgentMessages(payload, undefined, undefined, {
+        contentMetadataMap,
+      });
+
+      expect(result.messages).toHaveLength(1);
+      const aiMessage = result.messages[0] as AIMessage;
+      expect(Array.isArray(aiMessage.content)).toBe(true);
+      expect(aiMessage.content as Array<{ text: string }>).toHaveLength(2);
+    });
+
+    it('should not filter when contentMetadataMap is not provided', () => {
+      const payload: TPayload = [
+        {
+          role: 'assistant',
+          content: [
+            { type: ContentTypes.TEXT, text: 'Response 1' },
+            { type: ContentTypes.TEXT, text: 'Response 2' },
+          ],
+        },
+      ];
+
+      // targetAgentId provided but no contentMetadataMap - should include all content
+      const result = formatAgentMessages(payload, undefined, undefined, {
+        targetAgentId: 'agent_a',
+      });
+
+      expect(result.messages).toHaveLength(1);
+      const aiMessage = result.messages[0] as AIMessage;
+      expect(Array.isArray(aiMessage.content)).toBe(true);
+      expect(aiMessage.content as Array<{ text: string }>).toHaveLength(2);
+    });
+
+    it('should filter content with groupId metadata (parallel execution)', () => {
+      const payload: TPayload = [
+        { role: 'user', content: 'Analyze this' },
+        {
+          role: 'assistant',
+          content: [
+            { type: ContentTypes.TEXT, text: 'Creative analysis' },
+            { type: ContentTypes.TEXT, text: 'Practical analysis' },
+          ],
+        },
+      ];
+
+      const contentMetadataMap = new Map([
+        [0, { agentId: 'creative_analyst', groupId: 1 }],
+        [1, { agentId: 'practical_analyst', groupId: 1 }],
+      ]);
+
+      const result = formatAgentMessages(payload, undefined, undefined, {
+        targetAgentId: 'creative_analyst',
+        contentMetadataMap,
+      });
+
+      expect(result.messages).toHaveLength(2);
+      const aiMessage = result.messages[1] as AIMessage;
+      expect(Array.isArray(aiMessage.content)).toBe(true);
+      expect(aiMessage.content as Array<{ text: string }>).toHaveLength(1);
+      expect((aiMessage.content as Array<{ text: string }>)[0].text).toBe(
+        'Creative analysis'
+      );
+    });
+
+    it('should not affect non-assistant messages when filtering', () => {
+      const payload: TPayload = [
+        { role: 'user', content: 'Hello from user' },
+        { role: 'system', content: 'System message' },
+        {
+          role: 'assistant',
+          content: [{ type: ContentTypes.TEXT, text: 'From agent_a' }],
+        },
+      ];
+
+      const contentMetadataMap = new Map([[0, { agentId: 'agent_a' }]]);
+
+      const result = formatAgentMessages(payload, undefined, undefined, {
+        targetAgentId: 'agent_a',
+        contentMetadataMap,
+      });
+
+      // All three messages should be present
+      expect(result.messages).toHaveLength(3);
+      expect(result.messages[0]).toBeInstanceOf(HumanMessage);
+      expect(result.messages[1]).toBeInstanceOf(SystemMessage);
+      expect(result.messages[2]).toBeInstanceOf(AIMessage);
+    });
+  });
 });
