@@ -194,6 +194,8 @@ async function testSequentialMultiAgent() {
     console.log('\n\n=== Final Output ===');
     console.log('Sequential flow completed successfully!');
     console.log(`Total content parts: ${contentParts.length}`);
+    console.log('\n=== Content Parts with Metadata ===');
+    console.dir(contentParts, { depth: null });
 
     // Display the sequential responses
     const aiMessages = conversationHistory.filter(
