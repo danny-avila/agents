@@ -14,7 +14,6 @@ import type {
   ExtendedMessageContent,
   MessageContentComplex,
   ReasoningContentText,
-  ContentMetadata,
   ToolCallContent,
   ToolCallPart,
   TPayload,
@@ -627,24 +626,16 @@ export const labelContentByAgent = (
  * @param payload - The array of messages to format.
  * @param indexTokenCountMap - Optional map of message indices to token counts.
  * @param tools - Optional set of tool names that are allowed in the request.
- * @param options - Optional configuration for agent filtering.
- * @param options.targetAgentId - If provided, only content parts from this agent will be included.
- * @param options.contentMetadataMap - Map of content index to metadata (required when targetAgentId is provided).
  * @returns - Object containing formatted messages and updated indexTokenCountMap if provided.
  */
 export const formatAgentMessages = (
   payload: TPayload,
   indexTokenCountMap?: Record<number, number | undefined>,
-  tools?: Set<string>,
-  options?: {
-    targetAgentId?: string;
-    contentMetadataMap?: Map<number, ContentMetadata>;
-  }
+  tools?: Set<string>
 ): {
   messages: Array<HumanMessage | AIMessage | SystemMessage | ToolMessage>;
   indexTokenCountMap?: Record<number, number>;
 } => {
-  const { targetAgentId, contentMetadataMap } = options ?? {};
   const messages: Array<
     HumanMessage | AIMessage | SystemMessage | ToolMessage
   > = [];
@@ -663,29 +654,6 @@ export const formatAgentMessages = (
         { type: ContentTypes.TEXT, [ContentTypes.TEXT]: message.content },
       ];
     }
-
-    // Filter content parts by targetAgentId if provided (only for assistant messages with array content)
-    // Include parts that either: 1) match targetAgentId, or 2) have no metadata (not attributed to any agent)
-    if (
-      targetAgentId != null &&
-      targetAgentId !== '' &&
-      contentMetadataMap != null &&
-      message.role === 'assistant' &&
-      Array.isArray(message.content)
-    ) {
-      const filteredContent = message.content.filter((_, partIndex) => {
-        const metadata = contentMetadataMap.get(partIndex);
-        // Include if no metadata (unattributed) or if agentId matches target
-        return metadata == null || metadata.agentId === targetAgentId;
-      });
-      // Skip this message entirely if no content parts match the target agent
-      if (filteredContent.length === 0) {
-        indexMapping[i] = [];
-        continue;
-      }
-      message.content = filteredContent;
-    }
-
     if (message.role !== 'assistant') {
       messages.push(
         formatMessage({
