@@ -343,10 +343,6 @@ export type MessageContentComplex = (
     })
 ) & {
   tool_call_ids?: string[];
-  // Optional agentId for parallel execution attribution
-  agentId?: string;
-  // Optional groupId for parallel group attribution
-  groupId?: number;
 };
 
 export interface TMessage {
@@ -410,8 +406,20 @@ export type ContentAggregator = ({
         result: ToolEndEvent;
       };
 }) => void;
+/**
+ * Metadata for content parts in multi-agent runs.
+ * - agentId: present for all MultiAgentGraph runs (enables agent labels in UI)
+ * - groupId: present only for parallel execution (enables column rendering)
+ */
+export type ContentMetadata = {
+  agentId?: string;
+  groupId?: number;
+};
+
 export type ContentAggregatorResult = {
   stepMap: Map<string, RunStep | undefined>;
   contentParts: Array<MessageContentComplex | undefined>;
+  /** Map of content index to metadata (agentId, groupId). Only populated for MultiAgentGraph runs. */
+  contentMetadataMap: Map<number, ContentMetadata>;
   aggregateContent: ContentAggregator;
 };

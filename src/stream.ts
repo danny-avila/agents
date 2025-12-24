@@ -583,17 +583,6 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         tool_call: newToolCall,
       };
     }
-
-    // Apply agentId (for MultiAgentGraph) and groupId (for parallel execution) to content parts
-    // - agentId present → MultiAgentGraph (show agent labels)
-    // - groupId present → parallel execution (render columns)
-    const meta = contentMetaMap.get(index);
-    if (meta?.agentId != null) {
-      (contentParts[index] as t.MessageContentComplex).agentId = meta.agentId;
-    }
-    if (meta?.groupId != null) {
-      (contentParts[index] as t.MessageContentComplex).groupId = meta.groupId;
-    }
   };
 
   const aggregateContent = ({
@@ -738,5 +727,10 @@ export function createContentAggregator(): t.ContentAggregatorResult {
     }
   };
 
-  return { contentParts, aggregateContent, stepMap };
+  return {
+    contentParts,
+    aggregateContent,
+    stepMap,
+    contentMetadataMap: contentMetaMap,
+  };
 }
