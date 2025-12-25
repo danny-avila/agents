@@ -21,6 +21,7 @@ import {
 
 export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
   thinkingConfig?: GeminiGenerationConfig['thinkingConfig'];
+  responseModalities?: ('TEXT' | 'IMAGE' | 'AUDIO')[];
 
   /**
    * Override to add gemini-3 model support for multimodal and function calling thought signatures
@@ -93,6 +94,8 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
     }
 
     this.thinkingConfig = fields.thinkingConfig ?? this.thinkingConfig;
+    this.responseModalities =
+      fields.responseModalities ?? this.responseModalities;
 
     this.streaming = fields.streaming ?? this.streaming;
     this.json = fields.json;
@@ -110,6 +113,9 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
           topK: this.topK,
           ...(this.json != null
             ? { responseMimeType: 'application/json' }
+            : {}),
+          ...(this.responseModalities != null
+            ? { responseModalities: this.responseModalities }
             : {}),
         },
       },

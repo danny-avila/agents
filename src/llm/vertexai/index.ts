@@ -26,6 +26,18 @@ class CustomChatConnection extends ChatConnection<VertexAIClientOptions> {
       }
       delete formattedData.generationConfig.thinkingConfig.thinkingBudget;
     }
+
+    // Add responseModalities if present in fields
+    const fields = (
+      this as unknown as { fields: VertexAIClientOptions | undefined }
+    ).fields;
+    if (fields?.responseModalities) {
+      formattedData.generationConfig = {
+        ...formattedData.generationConfig,
+        responseModalities: fields.responseModalities,
+      };
+    }
+
     return formattedData;
   }
 }
