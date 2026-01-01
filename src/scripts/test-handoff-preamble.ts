@@ -254,6 +254,8 @@ IMPORTANT: You are the specialist - provide a complete, helpful response to the 
   console.log('   - Specialist received and acted on instructions');
   console.log('   - No premature end tokens after handoff');
   console.log('   - Multi-turn conversation continued smoothly');
+
+  console.dir(contentParts, { depth: null });
 }
 
 process.on('unhandledRejection', (reason, promise) => {

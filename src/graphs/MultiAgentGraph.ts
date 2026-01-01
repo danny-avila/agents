@@ -381,9 +381,73 @@ export class MultiAgentGraph extends StandardGraph {
 
               const state = getCurrentTaskInput() as t.BaseGraphState;
 
+              /**
+               * For parallel handoff support:
+               * Build messages that include ONLY this tool call's context.
+               * This prevents errors when LLM calls multiple transfers simultaneously -
+               * each destination gets a valid AIMessage with matching tool_call and tool_result.
+               *
+               * Strategy:
+               * 1. Find the AIMessage containing this tool call
+               * 2. Create a filtered AIMessage with ONLY this tool_call
+               * 3. Include all messages before the AIMessage plus the filtered pair
+               */
+              const messages = state.messages;
+              let filteredMessages = messages;
+              let aiMessageIndex = -1;
+
+              /** Find the AIMessage containing this tool call */
+              for (let i = messages.length - 1; i >= 0; i--) {
+                const msg = messages[i];
+                if (msg.getType() === 'ai') {
+                  const aiMsg = msg as AIMessage;
+                  const hasThisCall = aiMsg.tool_calls?.some(
+                    (tc) => tc.id === toolCallId
+                  );
+                  if (hasThisCall === true) {
+                    aiMessageIndex = i;
+                    break;
+                  }
+                }
+              }
+
+              if (aiMessageIndex >= 0) {
+                const originalAiMsg = messages[aiMessageIndex] as AIMessage;
+                const thisToolCall = originalAiMsg.tool_calls?.find(
+                  (tc) => tc.id === toolCallId
+                );
+
+                if (
+                  thisToolCall != null &&
+                  (originalAiMsg.tool_calls?.length ?? 0) > 1
+                ) {
+                  /**
+                   * Multiple tool calls - create filtered AIMessage with ONLY this call.
+                   * This ensures valid message structure for parallel handoffs.
+                   */
+                  const filteredAiMsg = new AIMessage({
+                    content: originalAiMsg.content,
+                    tool_calls: [thisToolCall],
+                    id: originalAiMsg.id,
+                  });
+
+                  filteredMessages = [
+                    ...messages.slice(0, aiMessageIndex),
+                    filteredAiMsg,
+                    toolMessage,
+                  ];
+                } else {
+                  /** Single tool call - use messages as-is */
+                  filteredMessages = messages.concat(toolMessage);
+                }
+              } else {
+                /** Fallback - append tool message */
+                filteredMessages = messages.concat(toolMessage);
+              }
+
               return new Command({
                 goto: destination,
-                update: { messages: state.messages.concat(toolMessage) },
+                update: { messages: filteredMessages },
                 graph: Command.PARENT,
               });
             },

@@ -281,6 +281,13 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     )[] = [];
     let parentCommand: Command | null = null;
 
+    /**
+     * Collect handoff commands (Commands with string goto and Command.PARENT)
+     * for potential parallel handoff aggregation
+     */
+    const handoffCommands: Command[] = [];
+    const nonCommandOutputs: BaseMessage[] = [];
+
     for (const output of outputs) {
       if (isCommand(output)) {
         if (
@@ -297,22 +304,64 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               goto: output.goto,
             });
           }
-        } else {
+        } else if (output.graph === Command.PARENT) {
           /**
-           * Non-Send Commands (including handoff Commands with string goto)
-           * are passed through as-is. For single handoffs, this works correctly.
-           *
-           * Note: Parallel handoffs (LLM calling multiple transfer tools simultaneously)
-           * are not yet fully supported. For parallel agent execution, use direct edges
-           * with edgeType: 'direct' instead of handoff edges.
+           * Handoff Command with destination.
+           * Handle both string ('agent') and array (['agent']) formats.
+           * Collect for potential parallel aggregation.
            */
+          const goto = output.goto;
+          const isSingleStringDest = typeof goto === 'string';
+          const isSingleArrayDest =
+            Array.isArray(goto) &&
+            goto.length === 1 &&
+            typeof goto[0] === 'string';
+
+          if (isSingleStringDest || isSingleArrayDest) {
+            handoffCommands.push(output);
+          } else {
+            /** Multi-destination or other command - pass through */
+            combinedOutputs.push(output);
+          }
+        } else {
+          /** Other commands - pass through */
           combinedOutputs.push(output);
         }
       } else {
+        nonCommandOutputs.push(output);
         combinedOutputs.push(
           Array.isArray(input) ? [output] : { messages: [output] }
         );
       }
+    }
+
+    /**
+     * Handle handoff commands - convert to Send objects for parallel execution
+     * when multiple handoffs are requested
+     */
+    if (handoffCommands.length > 1) {
+      /**
+       * Multiple parallel handoffs - convert to Send objects.
+       * Each Send carries its own state with the appropriate messages.
+       * This enables LLM-initiated parallel execution when calling multiple
+       * transfer tools simultaneously.
+       */
+      const sends = handoffCommands.map((cmd) => {
+        /** Extract destination - handle both string and array formats */
+        const goto = cmd.goto;
+        const destination =
+          typeof goto === 'string' ? goto : (goto as string[])[0];
+        return new Send(destination, cmd.update);
+      });
+
+      const parallelCommand = new Command({
+        graph: Command.PARENT,
+        goto: sends,
+      });
+      combinedOutputs.push(parallelCommand);
+    } else if (handoffCommands.length === 1) {
+      /** Single handoff - pass through as-is */
+      combinedOutputs.push(handoffCommands[0]);
     }
 
     if (parentCommand) {
