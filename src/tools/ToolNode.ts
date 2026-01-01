@@ -346,11 +346,29 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
        * This enables LLM-initiated parallel execution when calling multiple
        * transfer tools simultaneously.
        */
-      const sends = handoffCommands.map((cmd) => {
-        /** Extract destination - handle both string and array formats */
+
+      /** Collect all destinations for sibling tracking */
+      const allDestinations = handoffCommands.map((cmd) => {
         const goto = cmd.goto;
-        const destination =
-          typeof goto === 'string' ? goto : (goto as string[])[0];
+        return typeof goto === 'string' ? goto : (goto as string[])[0];
+      });
+
+      const sends = handoffCommands.map((cmd, idx) => {
+        const destination = allDestinations[idx];
+        /** Get siblings (other destinations, not this one) */
+        const siblings = allDestinations.filter((d) => d !== destination);
+
+        /** Add siblings to ToolMessage additional_kwargs */
+        const update = cmd.update as { messages?: BaseMessage[] } | undefined;
+        if (update && update.messages) {
+          for (const msg of update.messages) {
+            if (msg.getType() === 'tool') {
+              (msg as ToolMessage).additional_kwargs.handoff_parallel_siblings =
+                siblings;
+            }
+          }
+        }
+
         return new Send(destination, cmd.update);
       });
 

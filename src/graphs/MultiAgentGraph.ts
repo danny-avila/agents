@@ -497,15 +497,15 @@ export class MultiAgentGraph extends StandardGraph {
 
   /**
    * Detects if the current agent is receiving a handoff and processes the messages accordingly.
-   * Returns filtered messages with the transfer tool call/message removed, plus any instructions
-   * and source agent information extracted from the transfer.
+   * Returns filtered messages with the transfer tool call/message removed, plus any instructions,
+   * source agent, and parallel sibling information extracted from the transfer.
    *
    * Supports both single handoffs (last message is the transfer) and parallel handoffs
    * (multiple transfer ToolMessages, need to find the one targeting this agent).
    *
    * @param messages - Current state messages
    * @param agentId - The agent ID to check for handoff reception
-   * @returns Object with filtered messages, extracted instructions, and source agent, or null if not a handoff
+   * @returns Object with filtered messages, extracted instructions, source agent, and parallel siblings
    */
   private processHandoffReception(
     messages: BaseMessage[],
@@ -514,6 +514,7 @@ export class MultiAgentGraph extends StandardGraph {
     filteredMessages: BaseMessage[];
     instructions: string | null;
     sourceAgentName: string | null;
+    parallelSiblings: string[];
   } | null {
     if (messages.length === 0) return null;
 
@@ -574,6 +575,17 @@ export class MultiAgentGraph extends StandardGraph {
     const handoffSourceName = toolMessage.additional_kwargs.handoff_source_name;
     const sourceAgentName =
       typeof handoffSourceName === 'string' ? handoffSourceName : null;
+
+    /** Extract parallel siblings (set by ToolNode for parallel handoffs) */
+    const rawSiblings = toolMessage.additional_kwargs.handoff_parallel_siblings;
+    const siblingIds: string[] = Array.isArray(rawSiblings)
+      ? rawSiblings.filter((s): s is string => typeof s === 'string')
+      : [];
+    /** Convert IDs to display names */
+    const parallelSiblings = siblingIds.map((id) => {
+      const ctx = this.agentContexts.get(id);
+      return ctx?.name ?? id;
+    });
 
     /** Get the tool_call_id to find and filter the AI message's tool call */
     const toolCallId = toolMessage.tool_call_id;
@@ -648,7 +660,12 @@ export class MultiAgentGraph extends StandardGraph {
       filteredMessages.push(msg);
     }
 
-    return { filteredMessages, instructions, sourceAgentName };
+    return {
+      filteredMessages,
+      instructions,
+      sourceAgentName,
+      parallelSiblings,
+    };
   }
 
   /**
@@ -736,12 +753,16 @@ export class MultiAgentGraph extends StandardGraph {
         );
 
         if (handoffContext !== null) {
-          const { filteredMessages, instructions, sourceAgentName } =
-            handoffContext;
+          const {
+            filteredMessages,
+            instructions,
+            sourceAgentName,
+            parallelSiblings,
+          } = handoffContext;
 
           /**
            * Set handoff context on the receiving agent.
-           * This updates the system message to include agent identity info.
+           * Uses pre-computed graph position for depth and parallel info.
            */
           const agentContext = this.agentContexts.get(agentId);
           if (
@@ -749,7 +770,7 @@ export class MultiAgentGraph extends StandardGraph {
             sourceAgentName != null &&
             sourceAgentName !== ''
           ) {
-            agentContext.setHandoffContext(sourceAgentName);
+            agentContext.setHandoffContext(sourceAgentName, parallelSiblings);
           }
 
           /** Build messages for the receiving agent */

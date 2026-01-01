@@ -151,10 +151,13 @@ export class AgentContext {
   useLegacyContent: boolean = false;
   /**
    * Handoff context when this agent receives control via handoff.
-   * Contains source agent name for system message identity context.
+   * Contains source and parallel execution info for system message context.
    */
   handoffContext?: {
+    /** Source agent that transferred control */
     sourceAgentName: string;
+    /** Names of sibling agents executing in parallel (empty if sequential) */
+    parallelSiblings: string[];
   };
 
   constructor({
@@ -345,21 +348,25 @@ export class AgentContext {
    * This helps the agent understand its role in the multi-agent workflow.
    */
   private buildIdentityPreamble(): string {
-    /** Only include preamble if we have handoff context (indicates multi-agent workflow) */
     if (!this.handoffContext) return '';
 
-    /** Use name (falls back to agentId if not provided) */
     const displayName = this.name ?? this.agentId;
+    const { sourceAgentName, parallelSiblings } = this.handoffContext;
+    const isParallel = parallelSiblings.length > 0;
 
     const lines: string[] = [];
-    lines.push('## Agent Context');
-    lines.push(`You are the "${displayName}" agent.`);
+    lines.push('## Multi-Agent Workflow');
+    lines.push(
+      `You are "${displayName}", transferred from "${sourceAgentName}".`
+    );
 
-    if (this.handoffContext.sourceAgentName) {
-      lines.push(
-        `Control was transferred to you from the "${this.handoffContext.sourceAgentName}" agent.`
-      );
+    if (isParallel) {
+      lines.push(`Running in parallel with: ${parallelSiblings.join(', ')}.`);
     }
+
+    lines.push(
+      'Execute only tasks relevant to your role. Routing is already handled if requested, unless you can route further.'
+    );
 
     return lines.join('\n');
   }
@@ -525,10 +532,11 @@ export class AgentContext {
    * Sets the handoff context for this agent.
    * Call this when the agent receives control via handoff from another agent.
    * Marks system runnable as stale to include handoff context in system message.
-   * @param sourceAgentName - The name of the agent that handed off to this agent
+   * @param sourceAgentName - Name of the agent that transferred control
+   * @param parallelSiblings - Names of other agents executing in parallel with this one
    */
-  setHandoffContext(sourceAgentName: string): void {
-    this.handoffContext = { sourceAgentName };
+  setHandoffContext(sourceAgentName: string, parallelSiblings: string[]): void {
+    this.handoffContext = { sourceAgentName, parallelSiblings };
     this.systemRunnableStale = true;
   }
 
