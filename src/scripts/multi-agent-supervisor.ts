@@ -353,6 +353,7 @@ async function testSupervisorMultiAgent() {
       );
       console.log(`                 transfer_to_legal_advisor`);
       console.log('─'.repeat(60));
+      console.dir(contentParts, { depth: null });
     }
     await sleep(3000);
   } catch (error) {

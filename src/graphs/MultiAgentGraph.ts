@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { tool } from '@langchain/core/tools';
 import { PromptTemplate } from '@langchain/core/prompts';
 import {
+  AIMessage,
   ToolMessage,
   HumanMessage,
   getBufferString,
@@ -15,11 +16,14 @@ import {
   getCurrentTaskInput,
   messagesStateReducer,
 } from '@langchain/langgraph';
+import type { BaseMessage, AIMessageChunk } from '@langchain/core/messages';
 import type { ToolRunnableConfig } from '@langchain/core/tools';
-import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
 import { StandardGraph } from './Graph';
 import { Constants } from '@/common';
+
+/** Pattern to extract instructions from transfer ToolMessage content */
+const HANDOFF_INSTRUCTIONS_PATTERN = /(?:Instructions?|Context):\s*(.+)/is;
 
 /**
  * MultiAgentGraph extends StandardGraph to support dynamic multi-agent workflows
@@ -312,6 +316,10 @@ export class MultiAgentGraph extends StandardGraph {
               content,
               name: toolName,
               tool_call_id: toolCallId,
+              additional_kwargs: {
+                /** Store destination for programmatic access in handoff detection */
+                handoff_destination: destination,
+              },
             });
 
             return new Command({
@@ -408,6 +416,112 @@ export class MultiAgentGraph extends StandardGraph {
   }
 
   /**
+   * Detects if the current agent is receiving a handoff and processes the messages accordingly.
+   * Returns filtered messages with the transfer tool call/message removed, plus any instructions
+   * extracted from the transfer to be injected as a HumanMessage preamble.
+   *
+   * @param messages - Current state messages
+   * @param agentId - The agent ID to check for handoff reception
+   * @returns Object with filtered messages and extracted instructions, or null if not a handoff
+   */
+  private processHandoffReception(
+    messages: BaseMessage[],
+    agentId: string
+  ): { filteredMessages: BaseMessage[]; instructions: string | null } | null {
+    if (messages.length === 0) return null;
+
+    const lastMessage = messages[messages.length - 1];
+
+    /** Check if last message is a transfer ToolMessage targeting this agent */
+    if (lastMessage.getType() !== 'tool') return null;
+
+    const toolMessage = lastMessage as ToolMessage;
+    const toolName = toolMessage.name;
+
+    if (typeof toolName !== 'string') return null;
+
+    /** Check for standard transfer pattern */
+    const isTransferMessage = toolName.startsWith(Constants.LC_TRANSFER_TO_);
+    const isConditionalTransfer = toolName === 'conditional_transfer';
+
+    if (!isTransferMessage && !isConditionalTransfer) return null;
+
+    /** Extract destination from tool name or additional_kwargs */
+    let destinationAgent: string | null = null;
+
+    if (isTransferMessage) {
+      destinationAgent = toolName.replace(Constants.LC_TRANSFER_TO_, '');
+    } else if (isConditionalTransfer) {
+      /** For conditional transfers, read destination from additional_kwargs */
+      const handoffDest = toolMessage.additional_kwargs.handoff_destination;
+      destinationAgent = typeof handoffDest === 'string' ? handoffDest : null;
+    }
+
+    /** Verify this agent is the intended destination */
+    if (destinationAgent !== agentId) return null;
+
+    /** Extract instructions from the ToolMessage content */
+    const contentStr =
+      typeof toolMessage.content === 'string'
+        ? toolMessage.content
+        : JSON.stringify(toolMessage.content);
+
+    const instructionsMatch = contentStr.match(HANDOFF_INSTRUCTIONS_PATTERN);
+    const instructions = instructionsMatch?.[1]?.trim() ?? null;
+
+    /** Get the tool_call_id to find and filter the AI message's tool call */
+    const toolCallId = toolMessage.tool_call_id;
+
+    /** Filter out the transfer messages */
+    const filteredMessages: BaseMessage[] = [];
+
+    for (let i = 0; i < messages.length - 1; i++) {
+      /** Exclude the last message (ToolMessage) by iterating to length - 1 */
+      const msg = messages[i];
+      const msgType = msg.getType();
+
+      if (msgType === 'ai') {
+        /** Check if this AI message contains the transfer tool call */
+        const aiMsg = msg as AIMessage | AIMessageChunk;
+        const toolCalls = aiMsg.tool_calls;
+
+        if (toolCalls && toolCalls.length > 0) {
+          const transferCallIndex = toolCalls.findIndex(
+            (tc) => tc.id === toolCallId
+          );
+
+          if (transferCallIndex >= 0) {
+            /** This AI message has the transfer tool call - filter it out */
+            const remainingToolCalls = toolCalls.filter(
+              (tc) => tc.id !== toolCallId
+            );
+
+            if (
+              remainingToolCalls.length > 0 ||
+              (typeof aiMsg.content === 'string' && aiMsg.content.trim())
+            ) {
+              /** Keep the message but without the transfer tool call */
+              const filteredAiMsg = new AIMessage({
+                content: aiMsg.content,
+                tool_calls: remainingToolCalls,
+                id: aiMsg.id,
+              });
+              filteredMessages.push(filteredAiMsg);
+            }
+            /** If no remaining content or tool calls, skip this message entirely */
+            continue;
+          }
+        }
+      }
+
+      /** Keep all other messages */
+      filteredMessages.push(msg);
+    }
+
+    return { filteredMessages, instructions };
+  }
+
+  /**
    * Create the multi-agent workflow with dynamic handoffs
    */
   override createWorkflow(): t.CompiledMultiAgentWorkflow {
@@ -474,26 +588,85 @@ export class MultiAgentGraph extends StandardGraph {
       /** Agent subgraph (includes agent + tools) */
       const agentSubgraph = this.createAgentSubgraph(agentId);
 
-      /** Wrapper function that handles agentMessages channel and conditional routing */
+      /** Wrapper function that handles agentMessages channel, handoff reception, and conditional routing */
       const agentWrapper = async (
         state: t.MultiAgentGraphState
       ): Promise<t.MultiAgentGraphState | Command> => {
         let result: t.MultiAgentGraphState;
 
-        if (state.agentMessages != null && state.agentMessages.length > 0) {
+        /**
+         * Check if this agent is receiving a handoff.
+         * If so, filter out the transfer messages and inject instructions as preamble.
+         * This prevents the receiving agent from seeing the transfer as "completed work"
+         * and prematurely producing an end token.
+         */
+        const handoffContext = this.processHandoffReception(
+          state.messages,
+          agentId
+        );
+
+        if (handoffContext !== null) {
+          const { filteredMessages, instructions } = handoffContext;
+
+          /** Build messages for the receiving agent */
+          let messagesForAgent = filteredMessages;
+
+          /** If there are instructions, inject them as a HumanMessage to ground the agent */
+          const hasInstructions = instructions !== null && instructions !== '';
+          if (hasInstructions) {
+            messagesForAgent = [
+              ...filteredMessages,
+              new HumanMessage(instructions),
+            ];
+          }
+
+          /** Update token map if we have a token counter */
+          const agentContext = this.agentContexts.get(agentId);
+          if (agentContext?.tokenCounter && hasInstructions) {
+            const freshTokenMap: Record<string, number> = {};
+            for (
+              let i = 0;
+              i < Math.min(filteredMessages.length, this.startIndex);
+              i++
+            ) {
+              const tokenCount = agentContext.indexTokenCountMap[i];
+              if (tokenCount !== undefined) {
+                freshTokenMap[i] = tokenCount;
+              }
+            }
+            /** Add tokens for the instructions message */
+            const instructionsMsg = new HumanMessage(instructions);
+            freshTokenMap[messagesForAgent.length - 1] =
+              agentContext.tokenCounter(instructionsMsg);
+            agentContext.updateTokenMapWithInstructions(freshTokenMap);
+          }
+
+          const transformedState: t.MultiAgentGraphState = {
+            ...state,
+            messages: messagesForAgent,
+          };
+          result = await agentSubgraph.invoke(transformedState);
+          result = {
+            ...result,
+            agentMessages: [],
+          };
+        } else if (
+          state.agentMessages != null &&
+          state.agentMessages.length > 0
+        ) {
           /**
            * When using agentMessages (excludeResults=true), we need to update
            * the token map to account for the new prompt message
            */
           const agentContext = this.agentContexts.get(agentId);
           if (agentContext && agentContext.tokenCounter) {
-            // The agentMessages contains:
-            // 1. Filtered messages (0 to startIndex) - already have token counts
-            // 2. New prompt message - needs token counting
-
+            /** The agentMessages contains:
+             * 1. Filtered messages (0 to startIndex) - already have token counts
+             * 2. New prompt message - needs token counting
+             */
             const freshTokenMap: Record<string, number> = {};
 
-            // Copy existing token counts for filtered messages (0 to startIndex)
+            /** Copy existing token counts for filtered messages (0 to startIndex) */
             for (let i = 0; i < this.startIndex; i++) {
               const tokenCount = agentContext.indexTokenCountMap[i];
               if (tokenCount !== undefined) {
@@ -501,7 +674,7 @@ export class MultiAgentGraph extends StandardGraph {
               }
             }
 
-            // Calculate tokens only for the new prompt message (last message)
+            /** Calculate tokens only for the new prompt message (last message) */
             const promptMessageIndex = state.agentMessages.length - 1;
             if (promptMessageIndex >= this.startIndex) {
               const promptMessage = state.agentMessages[promptMessageIndex];
@@ -509,7 +682,7 @@ export class MultiAgentGraph extends StandardGraph {
                 agentContext.tokenCounter(promptMessage);
             }
 
-            // Update the agent's token map with instructions added
+            /** Update the agent's token map with instructions added */
             agentContext.updateTokenMapWithInstructions(freshTokenMap);
           }
 

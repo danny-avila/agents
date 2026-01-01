@@ -210,6 +210,7 @@ async function testConditionalMultiAgent() {
       console.log(`\n\nExpert used: ${selectedExpert}`);
       console.log('Content parts:', contentParts.length);
       console.log('---');
+      console.dir(contentParts, { depth: null });
     }
   } catch (error) {
     console.error('Error in conditional multi-agent test:', error);
