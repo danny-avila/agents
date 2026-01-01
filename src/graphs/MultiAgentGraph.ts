@@ -420,6 +420,9 @@ export class MultiAgentGraph extends StandardGraph {
    * Returns filtered messages with the transfer tool call/message removed, plus any instructions
    * extracted from the transfer to be injected as a HumanMessage preamble.
    *
+   * Supports both single handoffs (last message is the transfer) and parallel handoffs
+   * (multiple transfer ToolMessages, need to find the one targeting this agent).
+   *
    * @param messages - Current state messages
    * @param agentId - The agent ID to check for handoff reception
    * @returns Object with filtered messages and extracted instructions, or null if not a handoff
@@ -430,35 +433,49 @@ export class MultiAgentGraph extends StandardGraph {
   ): { filteredMessages: BaseMessage[]; instructions: string | null } | null {
     if (messages.length === 0) return null;
 
-    const lastMessage = messages[messages.length - 1];
+    /**
+     * Search for a transfer ToolMessage targeting this agent.
+     * For parallel handoffs, multiple transfer messages may exist - find ours.
+     * Search backwards from the end to find the most recent transfer to this agent.
+     */
+    let toolMessage: ToolMessage | null = null;
+    let toolMessageIndex = -1;
 
-    /** Check if last message is a transfer ToolMessage targeting this agent */
-    if (lastMessage.getType() !== 'tool') return null;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const msg = messages[i];
+      if (msg.getType() !== 'tool') continue;
 
-    const toolMessage = lastMessage as ToolMessage;
-    const toolName = toolMessage.name;
+      const candidateMsg = msg as ToolMessage;
+      const toolName = candidateMsg.name;
 
-    if (typeof toolName !== 'string') return null;
+      if (typeof toolName !== 'string') continue;
 
-    /** Check for standard transfer pattern */
-    const isTransferMessage = toolName.startsWith(Constants.LC_TRANSFER_TO_);
-    const isConditionalTransfer = toolName === 'conditional_transfer';
+      /** Check for standard transfer pattern */
+      const isTransferMessage = toolName.startsWith(Constants.LC_TRANSFER_TO_);
+      const isConditionalTransfer = toolName === 'conditional_transfer';
 
-    if (!isTransferMessage && !isConditionalTransfer) return null;
+      if (!isTransferMessage && !isConditionalTransfer) continue;
 
-    /** Extract destination from tool name or additional_kwargs */
-    let destinationAgent: string | null = null;
+      /** Extract destination from tool name or additional_kwargs */
+      let destinationAgent: string | null = null;
 
-    if (isTransferMessage) {
-      destinationAgent = toolName.replace(Constants.LC_TRANSFER_TO_, '');
-    } else if (isConditionalTransfer) {
-      /** For conditional transfers, read destination from additional_kwargs */
-      const handoffDest = toolMessage.additional_kwargs.handoff_destination;
-      destinationAgent = typeof handoffDest === 'string' ? handoffDest : null;
+      if (isTransferMessage) {
+        destinationAgent = toolName.replace(Constants.LC_TRANSFER_TO_, '');
+      } else if (isConditionalTransfer) {
+        const handoffDest = candidateMsg.additional_kwargs.handoff_destination;
+        destinationAgent = typeof handoffDest === 'string' ? handoffDest : null;
+      }
+
+      /** Check if this transfer targets our agent */
+      if (destinationAgent === agentId) {
+        toolMessage = candidateMsg;
+        toolMessageIndex = i;
+        break;
+      }
     }
 
-    /** Verify this agent is the intended destination */
-    if (destinationAgent !== agentId) return null;
+    /** No transfer targeting this agent found */
+    if (toolMessage === null || toolMessageIndex < 0) return null;
 
     /** Extract instructions from the ToolMessage content */
     const contentStr =
@@ -472,35 +489,59 @@ export class MultiAgentGraph extends StandardGraph {
     /** Get the tool_call_id to find and filter the AI message's tool call */
     const toolCallId = toolMessage.tool_call_id;
 
-    /** Filter out the transfer messages */
+    /**
+     * Collect all transfer tool_call_ids to filter out.
+     * For parallel handoffs, we filter ALL transfer messages (not just ours)
+     * to give the receiving agent a clean context without handoff noise.
+     */
+    const transferToolCallIds = new Set<string>([toolCallId]);
+    for (const msg of messages) {
+      if (msg.getType() !== 'tool') continue;
+      const tm = msg as ToolMessage;
+      const tName = tm.name;
+      if (typeof tName !== 'string') continue;
+      if (
+        tName.startsWith(Constants.LC_TRANSFER_TO_) ||
+        tName === 'conditional_transfer'
+      ) {
+        transferToolCallIds.add(tm.tool_call_id);
+      }
+    }
+
+    /** Filter out all transfer messages */
     const filteredMessages: BaseMessage[] = [];
 
-    for (let i = 0; i < messages.length - 1; i++) {
-      /** Exclude the last message (ToolMessage) by iterating to length - 1 */
+    for (let i = 0; i < messages.length; i++) {
       const msg = messages[i];
       const msgType = msg.getType();
 
+      /** Skip transfer ToolMessages */
+      if (msgType === 'tool') {
+        const tm = msg as ToolMessage;
+        if (transferToolCallIds.has(tm.tool_call_id)) {
+          continue;
+        }
+      }
+
       if (msgType === 'ai') {
-        /** Check if this AI message contains the transfer tool call */
+        /** Check if this AI message contains any transfer tool calls */
         const aiMsg = msg as AIMessage | AIMessageChunk;
         const toolCalls = aiMsg.tool_calls;
 
         if (toolCalls && toolCalls.length > 0) {
-          const transferCallIndex = toolCalls.findIndex(
-            (tc) => tc.id === toolCallId
+          /** Filter out all transfer tool calls */
+          const remainingToolCalls = toolCalls.filter(
+            (tc) => tc.id == null || !transferToolCallIds.has(tc.id)
           );
 
-          if (transferCallIndex >= 0) {
-            /** This AI message has the transfer tool call - filter it out */
-            const remainingToolCalls = toolCalls.filter(
-              (tc) => tc.id !== toolCallId
-            );
+          const hasTransferCalls = remainingToolCalls.length < toolCalls.length;
 
+          if (hasTransferCalls) {
             if (
               remainingToolCalls.length > 0 ||
               (typeof aiMsg.content === 'string' && aiMsg.content.trim())
             ) {
-              /** Keep the message but without the transfer tool call */
+              /** Keep the message but without transfer tool calls */
               const filteredAiMsg = new AIMessage({
                 content: aiMsg.content,
                 tool_calls: remainingToolCalls,

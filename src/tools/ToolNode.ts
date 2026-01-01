@@ -288,6 +288,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           Array.isArray(output.goto) &&
           output.goto.every((send): send is Send => isSend(send))
         ) {
+          /** Aggregate Send-based commands */
           if (parentCommand) {
             (parentCommand.goto as Send[]).push(...(output.goto as Send[]));
           } else {
@@ -297,6 +298,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             });
           }
         } else {
+          /**
+           * Non-Send Commands (including handoff Commands with string goto)
+           * are passed through as-is. For single handoffs, this works correctly.
+           *
+           * Note: Parallel handoffs (LLM calling multiple transfer tools simultaneously)
+           * are not yet fully supported. For parallel agent execution, use direct edges
+           * with edgeType: 'direct' instead of handoff edges.
+           */
           combinedOutputs.push(output);
         }
       } else {
