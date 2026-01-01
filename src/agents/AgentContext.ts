@@ -27,6 +27,7 @@ export class AgentContext {
   ): AgentContext {
     const {
       agentId,
+      name,
       provider,
       clientOptions,
       tools,
@@ -43,6 +44,7 @@ export class AgentContext {
 
     const agentContext = new AgentContext({
       agentId,
+      name: name ?? agentId,
       provider,
       clientOptions,
       maxContextTokens,
@@ -85,6 +87,8 @@ export class AgentContext {
 
   /** Agent identifier */
   agentId: string;
+  /** Human-readable name for this agent (used in handoff context). Falls back to agentId if not provided. */
+  name?: string;
   /** Provider for this specific agent */
   provider: Providers;
   /** Client options for this agent */
@@ -145,9 +149,17 @@ export class AgentContext {
   tokenCalculationPromise?: Promise<void>;
   /** Format content blocks as strings (for legacy compatibility) */
   useLegacyContent: boolean = false;
+  /**
+   * Handoff context when this agent receives control via handoff.
+   * Contains source agent name for system message identity context.
+   */
+  handoffContext?: {
+    sourceAgentName: string;
+  };
 
   constructor({
     agentId,
+    name,
     provider,
     clientOptions,
     maxContextTokens,
@@ -164,6 +176,7 @@ export class AgentContext {
     useLegacyContent,
   }: {
     agentId: string;
+    name?: string;
     provider: Providers;
     clientOptions?: t.ClientOptions;
     maxContextTokens?: number;
@@ -180,6 +193,7 @@ export class AgentContext {
     useLegacyContent?: boolean;
   }) {
     this.agentId = agentId;
+    this.name = name;
     this.provider = provider;
     this.clientOptions = clientOptions;
     this.maxContextTokens = maxContextTokens;
@@ -293,27 +307,61 @@ export class AgentContext {
 
   /**
    * Builds the raw instructions string (without creating SystemMessage).
+   * Includes agent identity preamble and handoff context when available.
    */
   private buildInstructionsString(): string {
-    let result = this.instructions ?? '';
+    const parts: string[] = [];
 
+    /** Build agent identity and handoff context preamble */
+    const identityPreamble = this.buildIdentityPreamble();
+    if (identityPreamble) {
+      parts.push(identityPreamble);
+    }
+
+    /** Add main instructions */
+    if (this.instructions != null && this.instructions !== '') {
+      parts.push(this.instructions);
+    }
+
+    /** Add additional instructions */
     if (
       this.additionalInstructions != null &&
       this.additionalInstructions !== ''
     ) {
-      result = result
-        ? `${result}\n\n${this.additionalInstructions}`
-        : this.additionalInstructions;
+      parts.push(this.additionalInstructions);
     }
 
+    /** Add programmatic tools documentation */
     const programmaticToolsDoc = this.buildProgrammaticOnlyToolsInstructions();
     if (programmaticToolsDoc) {
-      result = result
-        ? `${result}${programmaticToolsDoc}`
-        : programmaticToolsDoc;
+      parts.push(programmaticToolsDoc);
     }
 
-    return result;
+    return parts.join('\n\n');
+  }
+
+  /**
+   * Builds the agent identity preamble including handoff context if present.
+   * This helps the agent understand its role in the multi-agent workflow.
+   */
+  private buildIdentityPreamble(): string {
+    /** Only include preamble if we have handoff context (indicates multi-agent workflow) */
+    if (!this.handoffContext) return '';
+
+    /** Use name (falls back to agentId if not provided) */
+    const displayName = this.name ?? this.agentId;
+
+    const lines: string[] = [];
+    lines.push('## Agent Context');
+    lines.push(`You are the "${displayName}" agent.`);
+
+    if (this.handoffContext.sourceAgentName) {
+      lines.push(
+        `Control was transferred to you from the "${this.handoffContext.sourceAgentName}" agent.`
+      );
+    }
+
+    return lines.join('\n');
   }
 
   /**
@@ -393,6 +441,7 @@ export class AgentContext {
     this.tokenTypeSwitch = undefined;
     this.currentTokenType = ContentTypes.TEXT;
     this.discoveredToolNames.clear();
+    this.handoffContext = undefined;
   }
 
   /**
@@ -470,6 +519,28 @@ export class AgentContext {
     }
 
     return registry;
+  }
+
+  /**
+   * Sets the handoff context for this agent.
+   * Call this when the agent receives control via handoff from another agent.
+   * Marks system runnable as stale to include handoff context in system message.
+   * @param sourceAgentName - The name of the agent that handed off to this agent
+   */
+  setHandoffContext(sourceAgentName: string): void {
+    this.handoffContext = { sourceAgentName };
+    this.systemRunnableStale = true;
+  }
+
+  /**
+   * Clears any handoff context.
+   * Call this when resetting the agent or when handoff context is no longer relevant.
+   */
+  clearHandoffContext(): void {
+    if (this.handoffContext) {
+      this.handoffContext = undefined;
+      this.systemRunnableStale = true;
+    }
   }
 
   /**

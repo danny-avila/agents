@@ -58,9 +58,8 @@ When delegating, provide clear instructions to each agent about what they should
         apiKey: process.env.ANTHROPIC_API_KEY,
       },
       instructions: `You are a RESEARCHER. When you receive a task:
-1. Acknowledge the handoff
-2. Provide concise research findings (100-150 words)
-3. Start your response with "📚 RESEARCH FINDINGS:"`,
+1. Provide concise research findings (100-150 words)
+2. Start your response with "📚 RESEARCH FINDINGS:"`,
     },
     {
       agentId: 'writer',
@@ -70,9 +69,8 @@ When delegating, provide clear instructions to each agent about what they should
         apiKey: process.env.ANTHROPIC_API_KEY,
       },
       instructions: `You are a WRITER. When you receive a task:
-1. Acknowledge the handoff
-2. Provide creative content (100-150 words)
-3. Start your response with "✍️ WRITTEN CONTENT:"`,
+1. Provide creative content (100-150 words)
+2. Start your response with "✍️ WRITTEN CONTENT:"`,
     },
   ];
 

@@ -357,6 +357,8 @@ export type MultiAgentGraphInput = StandardGraphInput & {
 
 export interface AgentInputs {
   agentId: string;
+  /** Human-readable name for the agent (used in handoff context). Defaults to agentId if not provided. */
+  name?: string;
   toolEnd?: boolean;
   toolMap?: ToolMap;
   tools?: GraphTools;

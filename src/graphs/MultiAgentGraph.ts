@@ -249,8 +249,11 @@ export class MultiAgentGraph extends StandardGraph {
 
       // Create handoff tools for this agent's outgoing edges
       const handoffTools: t.GenericTool[] = [];
+      const sourceAgentName = agentContext.name ?? agentId;
       for (const edge of edges) {
-        handoffTools.push(...this.createHandoffToolsForEdge(edge));
+        handoffTools.push(
+          ...this.createHandoffToolsForEdge(edge, agentId, sourceAgentName)
+        );
       }
 
       // Add handoff tools to the agent's existing tools
@@ -263,8 +266,15 @@ export class MultiAgentGraph extends StandardGraph {
 
   /**
    * Create handoff tools for an edge (handles multiple destinations)
+   * @param edge - The graph edge defining the handoff
+   * @param sourceAgentId - The ID of the agent that will perform the handoff
+   * @param sourceAgentName - The human-readable name of the source agent
    */
-  private createHandoffToolsForEdge(edge: t.GraphEdge): t.GenericTool[] {
+  private createHandoffToolsForEdge(
+    edge: t.GraphEdge,
+    sourceAgentId: string,
+    sourceAgentName: string
+  ): t.GenericTool[] {
     const tools: t.GenericTool[] = [];
     const destinations = Array.isArray(edge.to) ? edge.to : [edge.to];
 
@@ -319,6 +329,8 @@ export class MultiAgentGraph extends StandardGraph {
               additional_kwargs: {
                 /** Store destination for programmatic access in handoff detection */
                 handoff_destination: destination,
+                /** Store source agent name for receiving agent to know who handed off */
+                handoff_source_name: sourceAgentName,
               },
             });
 
@@ -377,6 +389,10 @@ export class MultiAgentGraph extends StandardGraph {
                 content,
                 name: toolName,
                 tool_call_id: toolCallId,
+                additional_kwargs: {
+                  /** Store source agent name for receiving agent to know who handed off */
+                  handoff_source_name: sourceAgentName,
+                },
               });
 
               const state = getCurrentTaskInput() as t.BaseGraphState;
@@ -482,19 +498,23 @@ export class MultiAgentGraph extends StandardGraph {
   /**
    * Detects if the current agent is receiving a handoff and processes the messages accordingly.
    * Returns filtered messages with the transfer tool call/message removed, plus any instructions
-   * extracted from the transfer to be injected as a HumanMessage preamble.
+   * and source agent information extracted from the transfer.
    *
    * Supports both single handoffs (last message is the transfer) and parallel handoffs
    * (multiple transfer ToolMessages, need to find the one targeting this agent).
    *
    * @param messages - Current state messages
    * @param agentId - The agent ID to check for handoff reception
-   * @returns Object with filtered messages and extracted instructions, or null if not a handoff
+   * @returns Object with filtered messages, extracted instructions, and source agent, or null if not a handoff
    */
   private processHandoffReception(
     messages: BaseMessage[],
     agentId: string
-  ): { filteredMessages: BaseMessage[]; instructions: string | null } | null {
+  ): {
+    filteredMessages: BaseMessage[];
+    instructions: string | null;
+    sourceAgentName: string | null;
+  } | null {
     if (messages.length === 0) return null;
 
     /**
@@ -549,6 +569,11 @@ export class MultiAgentGraph extends StandardGraph {
 
     const instructionsMatch = contentStr.match(HANDOFF_INSTRUCTIONS_PATTERN);
     const instructions = instructionsMatch?.[1]?.trim() ?? null;
+
+    /** Extract source agent name from additional_kwargs */
+    const handoffSourceName = toolMessage.additional_kwargs.handoff_source_name;
+    const sourceAgentName =
+      typeof handoffSourceName === 'string' ? handoffSourceName : null;
 
     /** Get the tool_call_id to find and filter the AI message's tool call */
     const toolCallId = toolMessage.tool_call_id;
@@ -623,7 +648,7 @@ export class MultiAgentGraph extends StandardGraph {
       filteredMessages.push(msg);
     }
 
-    return { filteredMessages, instructions };
+    return { filteredMessages, instructions, sourceAgentName };
   }
 
   /**
@@ -711,7 +736,21 @@ export class MultiAgentGraph extends StandardGraph {
         );
 
         if (handoffContext !== null) {
-          const { filteredMessages, instructions } = handoffContext;
+          const { filteredMessages, instructions, sourceAgentName } =
+            handoffContext;
+
+          /**
+           * Set handoff context on the receiving agent.
+           * This updates the system message to include agent identity info.
+           */
+          const agentContext = this.agentContexts.get(agentId);
+          if (
+            agentContext &&
+            sourceAgentName != null &&
+            sourceAgentName !== ''
+          ) {
+            agentContext.setHandoffContext(sourceAgentName);
+          }
 
           /** Build messages for the receiving agent */
           let messagesForAgent = filteredMessages;
@@ -726,7 +765,6 @@ export class MultiAgentGraph extends StandardGraph {
           }
 
           /** Update token map if we have a token counter */
-          const agentContext = this.agentContexts.get(agentId);
           if (agentContext?.tokenCounter && hasInstructions) {
             const freshTokenMap: Record<string, number> = {};
             for (
