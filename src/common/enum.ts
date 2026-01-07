@@ -164,6 +164,8 @@ export enum Constants {
   WEB_SEARCH = 'web_search',
   CONTENT_AND_ARTIFACT = 'content_and_artifact',
   LC_TRANSFER_TO_ = 'lc_transfer_to_',
+  /** Delimiter for MCP tools: toolName_mcp_serverName */
+  MCP_DELIMITER = '_mcp_',
 }
 
 export enum TitleMethod {

@@ -22,11 +22,12 @@ const SEARCH_TIMEOUT = 5000;
 
 /** Zod schema type for tool search parameters */
 type ToolSearchSchema = z.ZodObject<{
-  query: z.ZodString;
+  query: z.ZodDefault<z.ZodOptional<z.ZodString>>;
   fields: z.ZodDefault<
     z.ZodOptional<z.ZodArray<z.ZodEnum<['name', 'description', 'parameters']>>>
   >;
   max_results: z.ZodDefault<z.ZodOptional<z.ZodNumber>>;
+  mcp_server: z.ZodOptional<z.ZodUnion<[z.ZodString, z.ZodArray<z.ZodString>]>>;
 }>;
 
 /**
@@ -37,11 +38,16 @@ type ToolSearchSchema = z.ZodObject<{
 function createToolSearchSchema(mode: t.ToolSearchMode): ToolSearchSchema {
   const queryDescription =
     mode === 'local'
-      ? 'Search term to find in tool names and descriptions. Case-insensitive substring matching.'
-      : 'Regex pattern to search tool names and descriptions. Special regex characters will be sanitized for safety.';
+      ? 'Search term to find in tool names and descriptions. Case-insensitive substring matching. Optional if mcp_server is provided.'
+      : 'Regex pattern to search tool names and descriptions. Optional if mcp_server is provided.';
 
   return z.object({
-    query: z.string().min(1).max(MAX_PATTERN_LENGTH).describe(queryDescription),
+    query: z
+      .string()
+      .max(MAX_PATTERN_LENGTH)
+      .optional()
+      .default('')
+      .describe(queryDescription),
     fields: z
       .array(z.enum(['name', 'description', 'parameters']))
       .optional()
@@ -55,7 +61,69 @@ function createToolSearchSchema(mode: t.ToolSearchMode): ToolSearchSchema {
       .optional()
       .default(10)
       .describe('Maximum number of matching tools to return'),
+    mcp_server: z
+      .union([z.string(), z.array(z.string())])
+      .optional()
+      .describe(
+        'Filter to tools from specific MCP server(s). Can be a single server name or array of names. If provided without a query, lists all tools from those servers.'
+      ),
   });
+}
+
+/**
+ * Extracts the MCP server name from a tool name.
+ * MCP tools follow the pattern: toolName_mcp_serverName
+ * @param toolName - The full tool name
+ * @returns The server name if it's an MCP tool, undefined otherwise
+ */
+function extractMcpServerName(toolName: string): string | undefined {
+  const delimiterIndex = toolName.indexOf(Constants.MCP_DELIMITER);
+  if (delimiterIndex === -1) {
+    return undefined;
+  }
+  return toolName.substring(delimiterIndex + Constants.MCP_DELIMITER.length);
+}
+
+/**
+ * Checks if a tool belongs to a specific MCP server.
+ * @param toolName - The full tool name
+ * @param serverName - The server name to match
+ * @returns True if the tool belongs to the specified server
+ */
+function isFromMcpServer(toolName: string, serverName: string): boolean {
+  const toolServer = extractMcpServerName(toolName);
+  return toolServer === serverName;
+}
+
+/**
+ * Checks if a tool belongs to any of the specified MCP servers.
+ * @param toolName - The full tool name
+ * @param serverNames - Array of server names to match
+ * @returns True if the tool belongs to any of the specified servers
+ */
+function isFromAnyMcpServer(toolName: string, serverNames: string[]): boolean {
+  const toolServer = extractMcpServerName(toolName);
+  if (toolServer === undefined) {
+    return false;
+  }
+  return serverNames.includes(toolServer);
+}
+
+/**
+ * Normalizes server filter input to always be an array.
+ * @param serverFilter - String, array of strings, or undefined
+ * @returns Array of server names (empty if none specified)
+ */
+function normalizeServerFilter(
+  serverFilter: string | string[] | undefined
+): string[] {
+  if (serverFilter === undefined) {
+    return [];
+  }
+  if (typeof serverFilter === 'string') {
+    return serverFilter === '' ? [] : [serverFilter];
+  }
+  return serverFilter.filter((s) => s !== '');
 }
 
 /**
@@ -396,6 +464,78 @@ function formatSearchResults(searchResponse: t.ToolSearchResponse): string {
 }
 
 /**
+ * Extracts the base tool name (without MCP server suffix) from a full tool name.
+ * @param toolName - The full tool name
+ * @returns The base tool name without server suffix
+ */
+function getBaseToolName(toolName: string): string {
+  const delimiterIndex = toolName.indexOf(Constants.MCP_DELIMITER);
+  if (delimiterIndex === -1) {
+    return toolName;
+  }
+  return toolName.substring(0, delimiterIndex);
+}
+
+/**
+ * Formats a server listing response when listing all tools from MCP server(s).
+ * Provides a cohesive view of all tools grouped by server.
+ * NOTE: This is a PREVIEW only - tools are NOT discovered/loaded.
+ * @param tools - Array of tool metadata from the server(s)
+ * @param serverNames - The MCP server name(s)
+ * @returns Formatted string showing all tools from the server(s)
+ */
+function formatServerListing(
+  tools: t.ToolMetadata[],
+  serverNames: string | string[]
+): string {
+  const servers = Array.isArray(serverNames) ? serverNames : [serverNames];
+
+  if (tools.length === 0) {
+    return `No tools found from MCP server(s): ${servers.join(', ')}.`;
+  }
+
+  const toolsByServer = new Map<string, t.ToolMetadata[]>();
+  for (const tool of tools) {
+    const server = extractMcpServerName(tool.name) ?? 'unknown';
+    const existing = toolsByServer.get(server) ?? [];
+    existing.push(tool);
+    toolsByServer.set(server, existing);
+  }
+
+  let response =
+    servers.length === 1
+      ? `## Tools from MCP server: ${servers[0]}\n\n`
+      : `## Tools from MCP servers: ${servers.join(', ')}\n\n`;
+
+  response += `Found ${tools.length} tool(s) (preview only - not yet loaded):\n\n`;
+
+  for (const [server, serverTools] of toolsByServer) {
+    if (servers.length > 1) {
+      response += `### ${server}\n\n`;
+    }
+    for (const tool of serverTools) {
+      const baseName = getBaseToolName(tool.name);
+      response += `- **${baseName}**`;
+      if (tool.description) {
+        const shortDesc =
+          tool.description.length > 80
+            ? tool.description.substring(0, 77) + '...'
+            : tool.description;
+        response += `: ${shortDesc}`;
+      }
+      response += '\n';
+    }
+    if (servers.length > 1) {
+      response += '\n';
+    }
+  }
+
+  response += `\n_To use a tool, search for it by name (e.g., query: "${getBaseToolName(tools[0]?.name ?? 'tool_name')}") to load it._`;
+
+  return response;
+}
+
+/**
  * Creates a Tool Search tool for discovering tools from a large registry.
  *
  * This tool enables AI agents to dynamically discover tools from a large library
@@ -447,6 +587,14 @@ function createToolSearch(
   const baseEndpoint = initParams.baseUrl ?? getCodeBaseURL();
   const EXEC_ENDPOINT = `${baseEndpoint}/exec`;
 
+  const mcpInstructions = `
+
+MCP Server Tools:
+- Tools from MCP servers follow the naming convention: toolName${Constants.MCP_DELIMITER}serverName
+- Example: "get_weather${Constants.MCP_DELIMITER}weather-api" is the "get_weather" tool from the "weather-api" server
+- Use mcp_server parameter to filter by server (e.g., mcp_server: "weather-api")
+- If mcp_server is provided without a query, lists ALL tools from that server`;
+
   const description =
     mode === 'local'
       ? `
@@ -458,6 +606,7 @@ Usage:
 - Use this when you need to discover tools for a specific task.
 - Results include tool names, match quality scores, and snippets showing where the match occurred.
 - Higher scores (0.95+) indicate name matches, medium scores (0.70+) indicate description matches.
+${mcpInstructions}
 `.trim()
       : `
 Searches through available tools to find ones matching your query pattern.
@@ -467,6 +616,7 @@ Usage:
 - Use this when you need to discover tools for a specific task.
 - Results include tool names, match quality scores, and snippets showing where the match occurred.
 - Higher scores (0.9+) indicate name matches, medium scores (0.7+) indicate description matches.
+${mcpInstructions}
 `.trim();
 
   return tool<typeof schema>(
@@ -475,11 +625,13 @@ Usage:
         query,
         fields = ['name', 'description'],
         max_results = 10,
+        mcp_server,
       } = params;
 
       const {
         toolRegistry: paramToolRegistry,
         onlyDeferred: paramOnlyDeferred,
+        mcpServer: paramMcpServer,
       } = config.toolCall ?? {};
 
       const toolRegistry = paramToolRegistry ?? initParams.toolRegistry;
@@ -487,6 +639,10 @@ Usage:
         paramOnlyDeferred !== undefined
           ? paramOnlyDeferred
           : defaultOnlyDeferred;
+      const rawServerFilter =
+        mcp_server ?? paramMcpServer ?? initParams.mcpServer;
+      const serverFilters = normalizeServerFilter(rawServerFilter);
+      const hasServerFilter = serverFilters.length > 0;
 
       if (toolRegistry == null) {
         return [
@@ -504,9 +660,18 @@ Usage:
 
       const toolsArray: t.LCTool[] = Array.from(toolRegistry.values());
       const deferredTools: t.ToolMetadata[] = toolsArray
-        .filter((lcTool) =>
-          onlyDeferred === true ? lcTool.defer_loading === true : true
-        )
+        .filter((lcTool) => {
+          if (onlyDeferred === true && lcTool.defer_loading !== true) {
+            return false;
+          }
+          if (
+            hasServerFilter &&
+            !isFromAnyMcpServer(lcTool.name, serverFilters)
+          ) {
+            return false;
+          }
+          return true;
+        })
         .map((lcTool) => ({
           name: lcTool.name,
           description: lcTool.description ?? '',
@@ -514,11 +679,39 @@ Usage:
         }));
 
       if (deferredTools.length === 0) {
+        const serverMsg = hasServerFilter
+          ? ` from MCP server(s): ${serverFilters.join(', ')}`
+          : '';
         return [
-          'No tools available to search. The tool registry is empty or no deferred tools are registered.',
+          `No tools available to search${serverMsg}. The tool registry is empty or no matching deferred tools are registered.`,
           {
             tool_references: [],
-            metadata: { total_searched: 0, pattern: query },
+            metadata: {
+              total_searched: 0,
+              pattern: query,
+              mcp_server: serverFilters,
+            },
+          },
+        ];
+      }
+
+      const isServerListing = hasServerFilter && query === '';
+
+      if (isServerListing) {
+        const formattedOutput = formatServerListing(
+          deferredTools,
+          serverFilters
+        );
+
+        return [
+          formattedOutput,
+          {
+            tool_references: [],
+            metadata: {
+              total_available: deferredTools.length,
+              mcp_server: serverFilters,
+              listing_mode: true,
+            },
           },
         ];
       }
@@ -539,6 +732,7 @@ Usage:
             metadata: {
               total_searched: searchResponse.total_tools_searched,
               pattern: searchResponse.pattern_used,
+              mcp_server: serverFilters.length > 0 ? serverFilters : undefined,
             },
           },
         ];
@@ -648,6 +842,12 @@ Usage:
 export {
   createToolSearch,
   performLocalSearch,
+  extractMcpServerName,
+  isFromMcpServer,
+  isFromAnyMcpServer,
+  normalizeServerFilter,
+  getBaseToolName,
+  formatServerListing,
   sanitizeRegex,
   escapeRegexSpecialChars,
   isDangerousPattern,

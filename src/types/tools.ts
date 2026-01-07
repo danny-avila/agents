@@ -131,7 +131,7 @@ export type ProgrammaticCache = { toolMap: ToolMap; toolDefs: LCTool[] };
 /** Search mode: code_interpreter uses external sandbox, local uses safe substring matching */
 export type ToolSearchMode = 'code_interpreter' | 'local';
 
-/** Parameters for creating a Tool Search Regex tool */
+/** Parameters for creating a Tool Search tool */
 export type ToolSearchParams = {
   apiKey?: string;
   toolRegistry?: LCToolRegistry;
@@ -139,6 +139,8 @@ export type ToolSearchParams = {
   baseUrl?: string;
   /** Search mode: 'code_interpreter' (default) uses sandbox for regex, 'local' uses safe substring matching */
   mode?: ToolSearchMode;
+  /** Filter tools to only those from specific MCP server(s). Can be a single name or array of names. */
+  mcpServer?: string | string[];
   [key: string]: unknown;
 };
 

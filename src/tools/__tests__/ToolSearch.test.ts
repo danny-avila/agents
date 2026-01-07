@@ -1,6 +1,6 @@
 // src/tools/__tests__/ToolSearch.test.ts
 /**
- * Unit tests for Tool Search Regex.
+ * Unit tests for Tool Search.
  * Tests helper functions and sanitization logic without hitting the API.
  */
 import { describe, it, expect } from '@jest/globals';
@@ -11,6 +11,12 @@ import {
   countNestedGroups,
   hasNestedQuantifiers,
   performLocalSearch,
+  extractMcpServerName,
+  isFromMcpServer,
+  isFromAnyMcpServer,
+  normalizeServerFilter,
+  getBaseToolName,
+  formatServerListing,
 } from '../ToolSearch';
 import type { ToolMetadata } from '@/types';
 
@@ -436,6 +442,293 @@ describe('ToolSearch', () => {
 
       expect(result.tool_references[0].snippet).toBeTruthy();
       expect(result.tool_references[0].snippet.length).toBeGreaterThan(0);
+    });
+  });
+
+  describe('extractMcpServerName', () => {
+    it('extracts server name from MCP tool name', () => {
+      expect(extractMcpServerName('get_weather_mcp_weather-server')).toBe(
+        'weather-server'
+      );
+      expect(extractMcpServerName('send_email_mcp_gmail')).toBe('gmail');
+      expect(extractMcpServerName('query_database_mcp_postgres-mcp')).toBe(
+        'postgres-mcp'
+      );
+    });
+
+    it('returns undefined for non-MCP tools', () => {
+      expect(extractMcpServerName('get_weather')).toBeUndefined();
+      expect(extractMcpServerName('send_email')).toBeUndefined();
+      expect(extractMcpServerName('regular_tool_name')).toBeUndefined();
+    });
+
+    it('handles edge cases', () => {
+      expect(extractMcpServerName('_mcp_server')).toBe('server');
+      expect(extractMcpServerName('tool_mcp_')).toBe('');
+    });
+  });
+
+  describe('getBaseToolName', () => {
+    it('extracts base name from MCP tool name', () => {
+      expect(getBaseToolName('get_weather_mcp_weather-server')).toBe(
+        'get_weather'
+      );
+      expect(getBaseToolName('send_email_mcp_gmail')).toBe('send_email');
+    });
+
+    it('returns full name for non-MCP tools', () => {
+      expect(getBaseToolName('get_weather')).toBe('get_weather');
+      expect(getBaseToolName('regular_tool')).toBe('regular_tool');
+    });
+  });
+
+  describe('isFromMcpServer', () => {
+    it('returns true for matching MCP server', () => {
+      expect(
+        isFromMcpServer('get_weather_mcp_weather-server', 'weather-server')
+      ).toBe(true);
+      expect(isFromMcpServer('send_email_mcp_gmail', 'gmail')).toBe(true);
+    });
+
+    it('returns false for non-matching MCP server', () => {
+      expect(
+        isFromMcpServer('get_weather_mcp_weather-server', 'other-server')
+      ).toBe(false);
+      expect(isFromMcpServer('send_email_mcp_gmail', 'outlook')).toBe(false);
+    });
+
+    it('returns false for non-MCP tools', () => {
+      expect(isFromMcpServer('get_weather', 'weather-server')).toBe(false);
+      expect(isFromMcpServer('regular_tool', 'any-server')).toBe(false);
+    });
+  });
+
+  describe('isFromAnyMcpServer', () => {
+    it('returns true if tool is from any of the specified servers', () => {
+      expect(
+        isFromAnyMcpServer('get_weather_mcp_weather-api', [
+          'weather-api',
+          'gmail',
+        ])
+      ).toBe(true);
+      expect(
+        isFromAnyMcpServer('send_email_mcp_gmail', ['weather-api', 'gmail'])
+      ).toBe(true);
+    });
+
+    it('returns false if tool is not from any specified server', () => {
+      expect(
+        isFromAnyMcpServer('get_weather_mcp_weather-api', ['gmail', 'slack'])
+      ).toBe(false);
+    });
+
+    it('returns false for non-MCP tools', () => {
+      expect(isFromAnyMcpServer('regular_tool', ['weather-api', 'gmail'])).toBe(
+        false
+      );
+    });
+
+    it('returns false for empty server list', () => {
+      expect(isFromAnyMcpServer('get_weather_mcp_weather-api', [])).toBe(false);
+    });
+  });
+
+  describe('normalizeServerFilter', () => {
+    it('converts string to single-element array', () => {
+      expect(normalizeServerFilter('gmail')).toEqual(['gmail']);
+    });
+
+    it('passes through arrays unchanged', () => {
+      expect(normalizeServerFilter(['gmail', 'slack'])).toEqual([
+        'gmail',
+        'slack',
+      ]);
+    });
+
+    it('returns empty array for undefined', () => {
+      expect(normalizeServerFilter(undefined)).toEqual([]);
+    });
+
+    it('returns empty array for empty string', () => {
+      expect(normalizeServerFilter('')).toEqual([]);
+    });
+
+    it('filters out empty strings from arrays', () => {
+      expect(normalizeServerFilter(['gmail', '', 'slack'])).toEqual([
+        'gmail',
+        'slack',
+      ]);
+    });
+  });
+
+  describe('performLocalSearch with MCP tools', () => {
+    const mcpTools: ToolMetadata[] = [
+      {
+        name: 'get_weather_mcp_weather-server',
+        description: 'Get weather from MCP server',
+        parameters: undefined,
+      },
+      {
+        name: 'get_forecast_mcp_weather-server',
+        description: 'Get forecast from MCP server',
+        parameters: undefined,
+      },
+      {
+        name: 'send_email_mcp_gmail',
+        description: 'Send email via Gmail MCP',
+        parameters: undefined,
+      },
+      {
+        name: 'read_inbox_mcp_gmail',
+        description: 'Read inbox via Gmail MCP',
+        parameters: undefined,
+      },
+      {
+        name: 'get_weather',
+        description: 'Regular weather tool (not MCP)',
+        parameters: undefined,
+      },
+    ];
+
+    it('searches across all tools including MCP tools', () => {
+      const result = performLocalSearch(
+        mcpTools,
+        'weather',
+        ['name', 'description'],
+        10
+      );
+
+      expect(result.tool_references.length).toBe(3);
+      expect(result.tool_references.map((r) => r.tool_name)).toContain(
+        'get_weather_mcp_weather-server'
+      );
+      expect(result.tool_references.map((r) => r.tool_name)).toContain(
+        'get_weather'
+      );
+    });
+
+    it('finds MCP tools by searching the full name including server suffix', () => {
+      const result = performLocalSearch(mcpTools, 'gmail', ['name'], 10);
+
+      expect(result.tool_references.length).toBe(2);
+      expect(result.tool_references.map((r) => r.tool_name)).toContain(
+        'send_email_mcp_gmail'
+      );
+      expect(result.tool_references.map((r) => r.tool_name)).toContain(
+        'read_inbox_mcp_gmail'
+      );
+    });
+
+    it('can search for tools by MCP delimiter', () => {
+      const result = performLocalSearch(mcpTools, '_mcp_', ['name'], 10);
+
+      expect(result.tool_references.length).toBe(4);
+      expect(result.tool_references.map((r) => r.tool_name)).not.toContain(
+        'get_weather'
+      );
+    });
+  });
+
+  describe('formatServerListing', () => {
+    const serverTools: ToolMetadata[] = [
+      {
+        name: 'get_weather_mcp_weather-api',
+        description: 'Get current weather conditions for a location',
+        parameters: undefined,
+      },
+      {
+        name: 'get_forecast_mcp_weather-api',
+        description: 'Get weather forecast for the next 7 days',
+        parameters: undefined,
+      },
+    ];
+
+    it('formats server listing with tool names and descriptions', () => {
+      const result = formatServerListing(serverTools, 'weather-api');
+
+      expect(result).toContain('Tools from MCP server: weather-api');
+      expect(result).toContain('2 tool(s)');
+      expect(result).toContain('get_weather');
+      expect(result).toContain('get_forecast');
+      expect(result).toContain('preview only');
+    });
+
+    it('includes hint to search for specific tool to load it', () => {
+      const result = formatServerListing(serverTools, 'weather-api');
+
+      expect(result).toContain('To use a tool, search for it by name');
+    });
+
+    it('uses base tool name (without MCP suffix) in display', () => {
+      const result = formatServerListing(serverTools, 'weather-api');
+
+      expect(result).toContain('**get_weather**');
+      expect(result).not.toContain('**get_weather_mcp_weather-api**');
+    });
+
+    it('handles empty tools array', () => {
+      const result = formatServerListing([], 'empty-server');
+
+      expect(result).toContain('No tools found');
+      expect(result).toContain('empty-server');
+    });
+
+    it('truncates long descriptions', () => {
+      const toolsWithLongDesc: ToolMetadata[] = [
+        {
+          name: 'long_tool_mcp_server',
+          description:
+            'This is a very long description that exceeds 80 characters and should be truncated to keep the listing compact and readable.',
+          parameters: undefined,
+        },
+      ];
+
+      const result = formatServerListing(toolsWithLongDesc, 'server');
+
+      expect(result).toContain('...');
+      expect(result.length).toBeLessThan(
+        toolsWithLongDesc[0].description.length + 200
+      );
+    });
+
+    it('handles multiple servers with grouped output', () => {
+      const multiServerTools: ToolMetadata[] = [
+        {
+          name: 'get_weather_mcp_weather-api',
+          description: 'Get weather',
+          parameters: undefined,
+        },
+        {
+          name: 'send_email_mcp_gmail',
+          description: 'Send email',
+          parameters: undefined,
+        },
+        {
+          name: 'read_inbox_mcp_gmail',
+          description: 'Read inbox',
+          parameters: undefined,
+        },
+      ];
+
+      const result = formatServerListing(multiServerTools, [
+        'weather-api',
+        'gmail',
+      ]);
+
+      expect(result).toContain('Tools from MCP servers: weather-api, gmail');
+      expect(result).toContain('3 tool(s)');
+      expect(result).toContain('### weather-api');
+      expect(result).toContain('### gmail');
+      expect(result).toContain('get_weather');
+      expect(result).toContain('send_email');
+      expect(result).toContain('read_inbox');
+    });
+
+    it('accepts single server as array', () => {
+      const result = formatServerListing(serverTools, ['weather-api']);
+
+      expect(result).toContain('Tools from MCP server: weather-api');
+      expect(result).not.toContain('###');
     });
   });
 });
