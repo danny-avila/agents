@@ -41,7 +41,7 @@ describe('Tool Discovery Functions', () => {
     return new ToolMessage({
       content: `Found ${discoveredTools.length} tools`,
       tool_call_id: toolCallId,
-      name: Constants.TOOL_SEARCH_REGEX,
+      name: Constants.TOOL_SEARCH,
       artifact: {
         tool_references: discoveredTools.map((name) => ({
           tool_name: name,
@@ -79,7 +79,7 @@ describe('Tool Discovery Functions', () => {
         createAIMessage('Searching...', [
           {
             id: 'call_1',
-            name: Constants.TOOL_SEARCH_REGEX,
+            name: Constants.TOOL_SEARCH,
             args: { pattern: 'database' },
           },
         ]),
@@ -97,12 +97,12 @@ describe('Tool Discovery Functions', () => {
         createAIMessage('Searching...', [
           {
             id: 'call_1',
-            name: Constants.TOOL_SEARCH_REGEX,
+            name: Constants.TOOL_SEARCH,
             args: { pattern: 'database' },
           },
           {
             id: 'call_2',
-            name: Constants.TOOL_SEARCH_REGEX,
+            name: Constants.TOOL_SEARCH,
             args: { pattern: 'file' },
           },
         ]),
@@ -137,7 +137,7 @@ describe('Tool Discovery Functions', () => {
         new ToolMessage({
           content: 'Some result',
           tool_call_id: 'orphan_call',
-          name: Constants.TOOL_SEARCH_REGEX,
+          name: Constants.TOOL_SEARCH,
         }),
       ];
 
@@ -153,7 +153,7 @@ describe('Tool Discovery Functions', () => {
         createAIMessage('Searching...', [
           {
             id: 'old_call',
-            name: Constants.TOOL_SEARCH_REGEX,
+            name: Constants.TOOL_SEARCH,
             args: { pattern: 'old' },
           },
         ]),
@@ -163,7 +163,7 @@ describe('Tool Discovery Functions', () => {
         createAIMessage('Searching again...', [
           {
             id: 'new_call',
-            name: Constants.TOOL_SEARCH_REGEX,
+            name: Constants.TOOL_SEARCH,
             args: { pattern: 'new' },
           },
         ]),
@@ -182,7 +182,7 @@ describe('Tool Discovery Functions', () => {
         createAIMessage('Working...', [
           {
             id: 'search_call',
-            name: Constants.TOOL_SEARCH_REGEX,
+            name: Constants.TOOL_SEARCH,
             args: { pattern: 'test' },
           },
           { id: 'other_call', name: 'get_weather', args: { city: 'NYC' } },
@@ -202,14 +202,14 @@ describe('Tool Discovery Functions', () => {
         createAIMessage('Searching...', [
           {
             id: 'call_1',
-            name: Constants.TOOL_SEARCH_REGEX,
+            name: Constants.TOOL_SEARCH,
             args: { pattern: 'xyz' },
           },
         ]),
         new ToolMessage({
           content: 'No tools found',
           tool_call_id: 'call_1',
-          name: Constants.TOOL_SEARCH_REGEX,
+          name: Constants.TOOL_SEARCH,
           artifact: {
             tool_references: [],
             metadata: { total_searched: 10, pattern: 'xyz' },
@@ -228,14 +228,14 @@ describe('Tool Discovery Functions', () => {
         createAIMessage('Searching...', [
           {
             id: 'call_1',
-            name: Constants.TOOL_SEARCH_REGEX,
+            name: Constants.TOOL_SEARCH,
             args: { pattern: 'test' },
           },
         ]),
         new ToolMessage({
           content: 'Error occurred',
           tool_call_id: 'call_1',
-          name: Constants.TOOL_SEARCH_REGEX,
+          name: Constants.TOOL_SEARCH,
           // No artifact
         }),
       ];
@@ -251,7 +251,7 @@ describe('Tool Discovery Functions', () => {
         createAIMessage('Searching...', [
           {
             id: 'call_1',
-            name: Constants.TOOL_SEARCH_REGEX,
+            name: Constants.TOOL_SEARCH,
             args: { pattern: 'test' },
           },
         ]),
@@ -271,7 +271,7 @@ describe('Tool Discovery Functions', () => {
         createAIMessage('First search', [
           {
             id: 'first_call',
-            name: Constants.TOOL_SEARCH_REGEX,
+            name: Constants.TOOL_SEARCH,
             args: { pattern: 'first' },
           },
         ]),
@@ -280,7 +280,7 @@ describe('Tool Discovery Functions', () => {
         createAIMessage('Second search', [
           {
             id: 'second_call',
-            name: Constants.TOOL_SEARCH_REGEX,
+            name: Constants.TOOL_SEARCH,
             args: { pattern: 'second' },
           },
         ]),
@@ -301,7 +301,7 @@ describe('Tool Discovery Functions', () => {
         createAIMessage('Searching...', [
           {
             id: 'call_1',
-            name: Constants.TOOL_SEARCH_REGEX,
+            name: Constants.TOOL_SEARCH,
             args: { pattern: 'test' },
           },
         ]),
@@ -335,7 +335,7 @@ describe('Tool Discovery Functions', () => {
         new ToolMessage({
           content: 'Result',
           tool_call_id: 'orphan',
-          name: Constants.TOOL_SEARCH_REGEX,
+          name: Constants.TOOL_SEARCH,
         }),
       ];
 
@@ -364,7 +364,7 @@ describe('Tool Discovery Functions', () => {
         createAIMessage('Working...', [
           {
             id: 'search_call',
-            name: Constants.TOOL_SEARCH_REGEX,
+            name: Constants.TOOL_SEARCH,
             args: { pattern: 'test' },
           },
           { id: 'weather_call', name: 'get_weather', args: { city: 'NYC' } },
@@ -384,7 +384,7 @@ describe('Tool Discovery Functions', () => {
         createAIMessage('Searching...', [
           {
             id: 'old_call',
-            name: Constants.TOOL_SEARCH_REGEX,
+            name: Constants.TOOL_SEARCH,
             args: { pattern: 'old' },
           },
         ]),
@@ -410,7 +410,7 @@ describe('Tool Discovery Functions', () => {
         createAIMessage('Searching...', [
           {
             id: 'call_1',
-            name: Constants.TOOL_SEARCH_REGEX,
+            name: Constants.TOOL_SEARCH,
             args: { pattern: 'test' },
           },
         ]),
@@ -446,7 +446,7 @@ describe('Tool Discovery Functions', () => {
         createAIMessage('Searching...', [
           {
             id: 'call_1',
-            name: Constants.TOOL_SEARCH_REGEX,
+            name: Constants.TOOL_SEARCH,
             args: { pattern: 'test' },
           },
         ]),

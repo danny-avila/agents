@@ -132,7 +132,7 @@ export type ProgrammaticCache = { toolMap: ToolMap; toolDefs: LCTool[] };
 export type ToolSearchMode = 'code_interpreter' | 'local';
 
 /** Parameters for creating a Tool Search Regex tool */
-export type ToolSearchRegexParams = {
+export type ToolSearchParams = {
   apiKey?: string;
   toolRegistry?: LCToolRegistry;
   onlyDeferred?: boolean;

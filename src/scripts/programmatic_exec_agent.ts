@@ -23,7 +23,7 @@ import type { RunnableConfig } from '@langchain/core/runnables';
 import type * as t from '@/types';
 import { createCodeExecutionTool } from '@/tools/CodeExecutor';
 import { createProgrammaticToolCallingTool } from '@/tools/ProgrammaticToolCalling';
-import { createToolSearchRegexTool } from '@/tools/ToolSearchRegex';
+import { createToolSearch } from '@/tools/ToolSearch';
 import { getLLMConfig } from '@/utils/llmConfig';
 import { getArgs } from '@/scripts/args';
 import { Run } from '@/run';
@@ -40,7 +40,7 @@ import {
 
 /**
  * Tool registry only needs business logic tools that require filtering.
- * Special tools (execute_code, run_tools_with_code, tool_search_regex)
+ * Special tools (execute_code, run_tools_with_code, tool_search)
  * are always bound directly to the LLM and don't need registry entries.
  */
 function createAgentToolRegistry(): t.LCToolRegistry {
@@ -73,7 +73,7 @@ async function main(): Promise<void> {
   // Create special tools (PTC, code execution, tool search)
   const codeExecTool = createCodeExecutionTool();
   const ptcTool = createProgrammaticToolCallingTool();
-  const toolSearchTool = createToolSearchRegexTool();
+  const toolSearchTool = createToolSearch();
 
   // Build complete tool list and map
   const allTools = [...mockTools, codeExecTool, ptcTool, toolSearchTool];
@@ -199,7 +199,7 @@ Use the run_tools_with_code tool to do this efficiently - don't call each tool s
   console.log('='.repeat(70));
   console.log('\nKey observations:');
   console.log(
-    '1. LLM only sees tools with allowed_callers including "direct" (get_weather, execute_code, run_tools_with_code, tool_search_regex)'
+    '1. LLM only sees tools with allowed_callers including "direct" (get_weather, execute_code, run_tools_with_code, tool_search)'
   );
   console.log(
     '2. When PTC is invoked, ToolNode automatically injects programmatic tools (get_team_members, get_expenses, get_weather)'

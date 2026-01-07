@@ -1,19 +1,19 @@
-// src/tools/__tests__/ToolSearchRegex.integration.test.ts
+// src/tools/__tests__/ToolSearch.integration.test.ts
 /**
  * Integration tests for Tool Search Regex.
  * These tests hit the LIVE Code API and verify end-to-end search functionality.
  *
- * Run with: npm test -- ToolSearchRegex.integration.test.ts
+ * Run with: npm test -- ToolSearch.integration.test.ts
  */
 import { config as dotenvConfig } from 'dotenv';
 dotenvConfig();
 
 import { describe, it, expect, beforeAll } from '@jest/globals';
-import { createToolSearchRegexTool } from '../ToolSearchRegex';
+import { createToolSearch } from '../ToolSearch';
 import { createToolSearchToolRegistry } from '@/test/mockTools';
 
-describe('ToolSearchRegex - Live API Integration', () => {
-  let searchTool: ReturnType<typeof createToolSearchRegexTool>;
+describe('ToolSearch - Live API Integration', () => {
+  let searchTool: ReturnType<typeof createToolSearch>;
   const toolRegistry = createToolSearchToolRegistry();
 
   beforeAll(() => {
@@ -24,7 +24,7 @@ describe('ToolSearchRegex - Live API Integration', () => {
       );
     }
 
-    searchTool = createToolSearchRegexTool({ apiKey, toolRegistry });
+    searchTool = createToolSearch({ apiKey, toolRegistry });
   });
 
   it('searches for expense-related tools', async () => {

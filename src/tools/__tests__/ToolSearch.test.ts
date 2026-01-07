@@ -1,4 +1,4 @@
-// src/tools/__tests__/ToolSearchRegex.test.ts
+// src/tools/__tests__/ToolSearch.test.ts
 /**
  * Unit tests for Tool Search Regex.
  * Tests helper functions and sanitization logic without hitting the API.
@@ -11,10 +11,10 @@ import {
   countNestedGroups,
   hasNestedQuantifiers,
   performLocalSearch,
-} from '../ToolSearchRegex';
+} from '../ToolSearch';
 import type { ToolMetadata } from '@/types';
 
-describe('ToolSearchRegex', () => {
+describe('ToolSearch', () => {
   describe('escapeRegexSpecialChars', () => {
     it('escapes special regex characters', () => {
       expect(escapeRegexSpecialChars('hello.world')).toBe('hello\\.world');

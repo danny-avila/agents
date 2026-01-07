@@ -132,7 +132,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           toolMap,
           toolDefs,
         };
-      } else if (call.name === Constants.TOOL_SEARCH_REGEX) {
+      } else if (call.name === Constants.TOOL_SEARCH) {
         invokeParams = {
           ...invokeParams,
           toolRegistry: this.toolRegistry,

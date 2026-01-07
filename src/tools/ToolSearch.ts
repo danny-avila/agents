@@ -1,4 +1,4 @@
-// src/tools/ToolSearchRegex.ts
+// src/tools/ToolSearch.ts
 import { z } from 'zod';
 import { config } from 'dotenv';
 import fetch, { RequestInit } from 'node-fetch';
@@ -415,16 +415,16 @@ function formatSearchResults(searchResponse: t.ToolSearchResponse): string {
  *
  * @example
  * // Option 1: Code interpreter mode (regex via sandbox)
- * const tool = createToolSearchRegexTool({ apiKey, toolRegistry });
+ * const tool = createToolSearch({ apiKey, toolRegistry });
  * await tool.invoke({ query: 'expense.*report' });
  *
  * @example
  * // Option 2: Local mode (safe substring search, no API key needed)
- * const tool = createToolSearchRegexTool({ mode: 'local', toolRegistry });
+ * const tool = createToolSearch({ mode: 'local', toolRegistry });
  * await tool.invoke({ query: 'expense' });
  */
-function createToolSearchRegexTool(
-  initParams: t.ToolSearchRegexParams = {}
+function createToolSearch(
+  initParams: t.ToolSearchParams = {}
 ): DynamicStructuredTool<ReturnType<typeof createToolSearchSchema>> {
   const mode: t.ToolSearchMode = initParams.mode ?? 'code_interpreter';
   const defaultOnlyDeferred = initParams.onlyDeferred ?? true;
@@ -588,7 +588,7 @@ Usage:
 
         if (result.stderr && result.stderr.trim()) {
           // eslint-disable-next-line no-console
-          console.warn('[ToolSearchRegex] stderr:', result.stderr);
+          console.warn('[ToolSearch] stderr:', result.stderr);
         }
 
         if (!result.stdout || !result.stdout.trim()) {
@@ -619,7 +619,7 @@ Usage:
         ];
       } catch (error) {
         // eslint-disable-next-line no-console
-        console.error('[ToolSearchRegex] Error:', error);
+        console.error('[ToolSearch] Error:', error);
 
         const errorMessage =
           error instanceof Error ? error.message : String(error);
@@ -637,7 +637,7 @@ Usage:
       }
     },
     {
-      name: Constants.TOOL_SEARCH_REGEX,
+      name: Constants.TOOL_SEARCH,
       description,
       schema,
       responseFormat: Constants.CONTENT_AND_ARTIFACT,
@@ -646,7 +646,7 @@ Usage:
 }
 
 export {
-  createToolSearchRegexTool,
+  createToolSearch,
   performLocalSearch,
   sanitizeRegex,
   escapeRegexSpecialChars,

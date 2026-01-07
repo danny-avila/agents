@@ -1,7 +1,7 @@
-// src/scripts/tool_search_regex.ts
+// src/scripts/tool_search.ts
 /**
  * Test script for the Tool Search Regex tool.
- * Run with: npm run tool_search_regex
+ * Run with: npm run tool_search
  *
  * Demonstrates runtime registry injection - the tool registry is passed
  * at invocation time, not at initialization time.
@@ -9,7 +9,7 @@
 import { config } from 'dotenv';
 config();
 
-import { createToolSearchRegexTool } from '@/tools/ToolSearchRegex';
+import { createToolSearch } from '@/tools/ToolSearch';
 import type { LCToolRegistry } from '@/types';
 import { createToolSearchToolRegistry } from '@/test/mockTools';
 
@@ -22,7 +22,7 @@ interface RunTestOptions {
 }
 
 async function runTest(
-  searchTool: ReturnType<typeof createToolSearchRegexTool>,
+  searchTool: ReturnType<typeof createToolSearch>,
   testName: string,
   query: string,
   options: RunTestOptions
@@ -82,7 +82,7 @@ async function main(): Promise<void> {
   );
 
   console.log('\nCreating Tool Search Regex tool WITH registry for testing...');
-  const searchTool = createToolSearchRegexTool({ apiKey, toolRegistry });
+  const searchTool = createToolSearch({ apiKey, toolRegistry });
   console.log('Tool created successfully!');
   console.log(
     'Note: In production, ToolNode injects toolRegistry via params when invoked through the graph.\n'

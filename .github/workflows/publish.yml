@@ -140,7 +140,7 @@ jobs:
             BASE_REF="$LAST_VERSION"
           fi
           
-          if git diff --name-only $BASE_REF HEAD 2>/dev/null | grep -qE "^src/tools/ToolSearchRegex\.ts|^src/tools/ToolNode\.ts|^src/agents/AgentContext\.ts|^src/test/mockTools\.ts"; then
+          if git diff --name-only $BASE_REF HEAD 2>/dev/null | grep -qE "^src/tools/ToolSearch\.ts|^src/tools/ToolNode\.ts|^src/agents/AgentContext\.ts|^src/test/mockTools\.ts"; then
             echo "changed=true" >> $GITHUB_OUTPUT
           else
             echo "changed=false" >> $GITHUB_OUTPUT
@@ -148,7 +148,7 @@ jobs:
 
       - name: Run Tool Search unit tests
         if: steps.tool_search_changes.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
-        run: npx jest src/tools/__tests__/ToolSearchRegex.test.ts
+        run: npx jest src/tools/__tests__/ToolSearch.test.ts
         env:
           NODE_ENV: test
           LIBRECHAT_CODE_API_KEY: ${{ secrets.LIBRECHAT_CODE_API_KEY }}
@@ -156,7 +156,7 @@ jobs:
 
       - name: Run Tool Search integration tests (manual dispatch only)
         if: github.event_name == 'workflow_dispatch'
-        run: npx jest src/tools/__tests__/ToolSearchRegex.integration.test.ts
+        run: npx jest src/tools/__tests__/ToolSearch.integration.test.ts
         env:
           NODE_ENV: test
           LIBRECHAT_CODE_API_KEY: ${{ secrets.LIBRECHAT_CODE_API_KEY }}
