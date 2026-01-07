@@ -10,7 +10,9 @@ import {
   isDangerousPattern,
   countNestedGroups,
   hasNestedQuantifiers,
+  performLocalSearch,
 } from '../ToolSearchRegex';
+import type { ToolMetadata } from '@/types';
 
 describe('ToolSearchRegex', () => {
   describe('escapeRegexSpecialChars', () => {
@@ -227,6 +229,213 @@ describe('ToolSearchRegex', () => {
         expect(typeof result.safe).toBe('string');
         expect(typeof result.wasEscaped).toBe('boolean');
       }
+    });
+  });
+
+  describe('performLocalSearch', () => {
+    const mockTools: ToolMetadata[] = [
+      {
+        name: 'get_weather',
+        description: 'Get current weather data',
+        parameters: undefined,
+      },
+      {
+        name: 'get_forecast',
+        description: 'Get weather forecast for multiple days',
+        parameters: undefined,
+      },
+      {
+        name: 'send_email',
+        description: 'Send an email message',
+        parameters: undefined,
+      },
+      {
+        name: 'get_expenses',
+        description: 'Retrieve expense reports',
+        parameters: undefined,
+      },
+      {
+        name: 'calculate_expense_totals',
+        description: 'Sum up expenses by category',
+        parameters: undefined,
+      },
+      {
+        name: 'run_database_query',
+        description: 'Execute a database query',
+        parameters: {
+          type: 'object',
+          properties: {
+            query: { type: 'string' },
+            timeout: { type: 'number' },
+          },
+        },
+      },
+    ];
+
+    it('finds tools by exact name match', () => {
+      const result = performLocalSearch(mockTools, 'get_weather', ['name'], 10);
+
+      expect(result.tool_references.length).toBe(1);
+      expect(result.tool_references[0].tool_name).toBe('get_weather');
+      expect(result.tool_references[0].match_score).toBe(1.0);
+      expect(result.tool_references[0].matched_field).toBe('name');
+    });
+
+    it('finds tools by partial name match (starts with)', () => {
+      const result = performLocalSearch(mockTools, 'get_', ['name'], 10);
+
+      expect(result.tool_references.length).toBe(3);
+      expect(result.tool_references[0].match_score).toBe(0.95);
+      expect(result.tool_references.map((r) => r.tool_name)).toContain(
+        'get_weather'
+      );
+      expect(result.tool_references.map((r) => r.tool_name)).toContain(
+        'get_forecast'
+      );
+      expect(result.tool_references.map((r) => r.tool_name)).toContain(
+        'get_expenses'
+      );
+    });
+
+    it('finds tools by substring match in name', () => {
+      const result = performLocalSearch(mockTools, 'expense', ['name'], 10);
+
+      expect(result.tool_references.length).toBe(2);
+      expect(result.tool_references.map((r) => r.tool_name)).toContain(
+        'get_expenses'
+      );
+      expect(result.tool_references.map((r) => r.tool_name)).toContain(
+        'calculate_expense_totals'
+      );
+      expect(result.tool_references[0].match_score).toBe(0.85);
+    });
+
+    it('performs case-insensitive search', () => {
+      const result = performLocalSearch(
+        mockTools,
+        'WEATHER',
+        ['name', 'description'],
+        10
+      );
+
+      expect(result.tool_references.length).toBe(2);
+      expect(result.tool_references.map((r) => r.tool_name)).toContain(
+        'get_weather'
+      );
+      expect(result.tool_references.map((r) => r.tool_name)).toContain(
+        'get_forecast'
+      );
+    });
+
+    it('searches in description field', () => {
+      const result = performLocalSearch(
+        mockTools,
+        'email',
+        ['description'],
+        10
+      );
+
+      expect(result.tool_references.length).toBe(1);
+      expect(result.tool_references[0].tool_name).toBe('send_email');
+      expect(result.tool_references[0].matched_field).toBe('description');
+      expect(result.tool_references[0].match_score).toBe(0.7);
+    });
+
+    it('searches in parameter names', () => {
+      const result = performLocalSearch(mockTools, 'query', ['parameters'], 10);
+
+      expect(result.tool_references.length).toBe(1);
+      expect(result.tool_references[0].tool_name).toBe('run_database_query');
+      expect(result.tool_references[0].matched_field).toBe('parameters');
+      expect(result.tool_references[0].match_score).toBe(0.55);
+    });
+
+    it('prioritizes name matches over description matches', () => {
+      const result = performLocalSearch(
+        mockTools,
+        'weather',
+        ['name', 'description'],
+        10
+      );
+
+      const weatherTool = result.tool_references.find(
+        (r) => r.tool_name === 'get_weather'
+      );
+      const forecastTool = result.tool_references.find(
+        (r) => r.tool_name === 'get_forecast'
+      );
+
+      expect(weatherTool?.matched_field).toBe('name');
+      expect(forecastTool?.matched_field).toBe('description');
+      expect(weatherTool!.match_score).toBeGreaterThan(
+        forecastTool!.match_score
+      );
+    });
+
+    it('limits results to max_results', () => {
+      const result = performLocalSearch(mockTools, 'get', ['name'], 2);
+
+      expect(result.tool_references.length).toBe(2);
+      expect(result.total_tools_searched).toBe(mockTools.length);
+    });
+
+    it('returns empty array when no matches found', () => {
+      const result = performLocalSearch(
+        mockTools,
+        'nonexistent_xyz_123',
+        ['name', 'description'],
+        10
+      );
+
+      expect(result.tool_references.length).toBe(0);
+      expect(result.total_tools_searched).toBe(mockTools.length);
+    });
+
+    it('sorts results by score descending', () => {
+      const result = performLocalSearch(
+        mockTools,
+        'expense',
+        ['name', 'description'],
+        10
+      );
+
+      for (let i = 1; i < result.tool_references.length; i++) {
+        expect(
+          result.tool_references[i - 1].match_score
+        ).toBeGreaterThanOrEqual(result.tool_references[i].match_score);
+      }
+    });
+
+    it('handles empty tools array', () => {
+      const result = performLocalSearch([], 'test', ['name'], 10);
+
+      expect(result.tool_references.length).toBe(0);
+      expect(result.total_tools_searched).toBe(0);
+    });
+
+    it('handles empty query gracefully', () => {
+      const result = performLocalSearch(mockTools, '', ['name'], 10);
+
+      expect(result.tool_references.length).toBe(mockTools.length);
+    });
+
+    it('includes correct metadata in response', () => {
+      const result = performLocalSearch(mockTools, 'weather', ['name'], 10);
+
+      expect(result.total_tools_searched).toBe(mockTools.length);
+      expect(result.pattern_used).toBe('weather');
+    });
+
+    it('provides snippet in results', () => {
+      const result = performLocalSearch(
+        mockTools,
+        'database',
+        ['description'],
+        10
+      );
+
+      expect(result.tool_references[0].snippet).toBeTruthy();
+      expect(result.tool_references[0].snippet.length).toBeGreaterThan(0);
     });
   });
 });

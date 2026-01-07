@@ -20,28 +20,43 @@ const MAX_REGEX_COMPLEXITY = 5;
 /** Default search timeout in milliseconds */
 const SEARCH_TIMEOUT = 5000;
 
-const ToolSearchRegexSchema = z.object({
-  query: z
-    .string()
-    .min(1)
-    .max(MAX_PATTERN_LENGTH)
-    .describe(
-      'Regex pattern to search tool names and descriptions. Special regex characters will be sanitized for safety.'
-    ),
-  fields: z
-    .array(z.enum(['name', 'description', 'parameters']))
-    .optional()
-    .default(['name', 'description'])
-    .describe('Which fields to search. Default: name and description'),
-  max_results: z
-    .number()
-    .int()
-    .min(1)
-    .max(50)
-    .optional()
-    .default(10)
-    .describe('Maximum number of matching tools to return'),
-});
+/** Zod schema type for tool search parameters */
+type ToolSearchSchema = z.ZodObject<{
+  query: z.ZodString;
+  fields: z.ZodDefault<
+    z.ZodOptional<z.ZodArray<z.ZodEnum<['name', 'description', 'parameters']>>>
+  >;
+  max_results: z.ZodDefault<z.ZodOptional<z.ZodNumber>>;
+}>;
+
+/**
+ * Creates the Zod schema with dynamic query description based on mode.
+ * @param mode - The search mode determining query interpretation
+ * @returns Zod schema for tool search parameters
+ */
+function createToolSearchSchema(mode: t.ToolSearchMode): ToolSearchSchema {
+  const queryDescription =
+    mode === 'local'
+      ? 'Search term to find in tool names and descriptions. Case-insensitive substring matching.'
+      : 'Regex pattern to search tool names and descriptions. Special regex characters will be sanitized for safety.';
+
+  return z.object({
+    query: z.string().min(1).max(MAX_PATTERN_LENGTH).describe(queryDescription),
+    fields: z
+      .array(z.enum(['name', 'description', 'parameters']))
+      .optional()
+      .default(['name', 'description'])
+      .describe('Which fields to search. Default: name and description'),
+    max_results: z
+      .number()
+      .int()
+      .min(1)
+      .max(50)
+      .optional()
+      .default(10)
+      .describe('Maximum number of matching tools to return'),
+  });
+}
 
 /**
  * Escapes special regex characters in a string to use as a literal pattern.
@@ -168,6 +183,80 @@ function simplifyParametersForSearch(
   }
 
   return { type: parameters.type };
+}
+
+/**
+ * Performs safe local substring search without regex.
+ * Uses case-insensitive String.includes() for complete safety against ReDoS.
+ * @param tools - Array of tool metadata to search
+ * @param query - The search term (treated as literal substring)
+ * @param fields - Which fields to search
+ * @param maxResults - Maximum results to return
+ * @returns Search response with matching tools
+ */
+function performLocalSearch(
+  tools: t.ToolMetadata[],
+  query: string,
+  fields: string[],
+  maxResults: number
+): t.ToolSearchResponse {
+  const lowerQuery = query.toLowerCase();
+  const results: t.ToolSearchResult[] = [];
+
+  for (const tool of tools) {
+    let bestScore = 0;
+    let matchedField = '';
+    let snippet = '';
+
+    if (fields.includes('name')) {
+      const lowerName = tool.name.toLowerCase();
+      if (lowerName.includes(lowerQuery)) {
+        const isExactMatch = lowerName === lowerQuery;
+        const startsWithQuery = lowerName.startsWith(lowerQuery);
+        bestScore = isExactMatch ? 1.0 : startsWithQuery ? 0.95 : 0.85;
+        matchedField = 'name';
+        snippet = tool.name;
+      }
+    }
+
+    if (fields.includes('description') && tool.description) {
+      const lowerDesc = tool.description.toLowerCase();
+      if (lowerDesc.includes(lowerQuery) && bestScore === 0) {
+        bestScore = 0.7;
+        matchedField = 'description';
+        snippet = tool.description.substring(0, 100);
+      }
+    }
+
+    if (fields.includes('parameters') && tool.parameters?.properties) {
+      const paramNames = Object.keys(tool.parameters.properties)
+        .join(' ')
+        .toLowerCase();
+      if (paramNames.includes(lowerQuery) && bestScore === 0) {
+        bestScore = 0.55;
+        matchedField = 'parameters';
+        snippet = Object.keys(tool.parameters.properties).join(' ');
+      }
+    }
+
+    if (bestScore > 0) {
+      results.push({
+        tool_name: tool.name,
+        match_score: bestScore,
+        matched_field: matchedField,
+        snippet,
+      });
+    }
+  }
+
+  results.sort((a, b) => b.match_score - a.match_score);
+  const topResults = results.slice(0, maxResults);
+
+  return {
+    tool_references: topResults,
+    total_tools_searched: tools.length,
+    pattern_used: query,
+  };
 }
 
 /**
@@ -307,11 +396,15 @@ function formatSearchResults(searchResponse: t.ToolSearchResponse): string {
 }
 
 /**
- * Creates a Tool Search Regex tool for discovering tools from a large registry.
+ * Creates a Tool Search tool for discovering tools from a large registry.
  *
  * This tool enables AI agents to dynamically discover tools from a large library
  * without loading all tool definitions into the LLM context window. The agent
- * can search for relevant tools on-demand using regex patterns.
+ * can search for relevant tools on-demand.
+ *
+ * **Modes:**
+ * - `code_interpreter` (default): Uses external sandbox for regex search. Safer for complex patterns.
+ * - `local`: Uses safe substring matching locally. No network call, faster, completely safe from ReDoS.
  *
  * The tool registry can be provided either:
  * 1. At initialization time via params.toolRegistry
@@ -321,36 +414,52 @@ function formatSearchResults(searchResponse: t.ToolSearchResponse): string {
  * @returns A LangChain DynamicStructuredTool for tool searching
  *
  * @example
- * // Option 1: Registry at initialization
+ * // Option 1: Code interpreter mode (regex via sandbox)
  * const tool = createToolSearchRegexTool({ apiKey, toolRegistry });
- * await tool.invoke({ query: 'expense' });
+ * await tool.invoke({ query: 'expense.*report' });
  *
  * @example
- * // Option 2: Registry at runtime
- * const tool = createToolSearchRegexTool({ apiKey });
- * await tool.invoke(
- *   { query: 'expense' },
- *   { configurable: { toolRegistry, onlyDeferred: true } }
- * );
+ * // Option 2: Local mode (safe substring search, no API key needed)
+ * const tool = createToolSearchRegexTool({ mode: 'local', toolRegistry });
+ * await tool.invoke({ query: 'expense' });
  */
 function createToolSearchRegexTool(
   initParams: t.ToolSearchRegexParams = {}
-): DynamicStructuredTool<typeof ToolSearchRegexSchema> {
-  const apiKey: string =
-    (initParams[EnvVar.CODE_API_KEY] as string | undefined) ??
-    initParams.apiKey ??
-    getEnvironmentVariable(EnvVar.CODE_API_KEY) ??
-    '';
+): DynamicStructuredTool<ReturnType<typeof createToolSearchSchema>> {
+  const mode: t.ToolSearchMode = initParams.mode ?? 'code_interpreter';
+  const defaultOnlyDeferred = initParams.onlyDeferred ?? true;
+  const schema = createToolSearchSchema(mode);
 
-  if (!apiKey) {
-    throw new Error('No API key provided for tool search regex tool.');
+  const apiKey: string =
+    mode === 'code_interpreter'
+      ? ((initParams[EnvVar.CODE_API_KEY] as string | undefined) ??
+        initParams.apiKey ??
+        getEnvironmentVariable(EnvVar.CODE_API_KEY) ??
+        '')
+      : '';
+
+  if (mode === 'code_interpreter' && !apiKey) {
+    throw new Error(
+      'No API key provided for tool search in code_interpreter mode. Use mode: "local" to search without an API key.'
+    );
   }
 
   const baseEndpoint = initParams.baseUrl ?? getCodeBaseURL();
   const EXEC_ENDPOINT = `${baseEndpoint}/exec`;
-  const defaultOnlyDeferred = initParams.onlyDeferred ?? true;
 
-  const description = `
+  const description =
+    mode === 'local'
+      ? `
+Searches through available tools to find ones matching your search term.
+
+Usage:
+- Provide a search term to find in tool names and descriptions.
+- Uses case-insensitive substring matching (fast and safe).
+- Use this when you need to discover tools for a specific task.
+- Results include tool names, match quality scores, and snippets showing where the match occurred.
+- Higher scores (0.95+) indicate name matches, medium scores (0.70+) indicate description matches.
+`.trim()
+      : `
 Searches through available tools to find ones matching your query pattern.
 
 Usage:
@@ -360,7 +469,7 @@ Usage:
 - Higher scores (0.9+) indicate name matches, medium scores (0.7+) indicate description matches.
 `.trim();
 
-  return tool<typeof ToolSearchRegexSchema>(
+  return tool<typeof schema>(
     async (params, config) => {
       const {
         query,
@@ -368,21 +477,11 @@ Usage:
         max_results = 10,
       } = params;
 
-      // Extra params injected by ToolNode (follows web_search pattern)
       const {
         toolRegistry: paramToolRegistry,
         onlyDeferred: paramOnlyDeferred,
       } = config.toolCall ?? {};
 
-      const { safe: sanitizedPattern, wasEscaped } = sanitizeRegex(query);
-
-      let warningMessage = '';
-      if (wasEscaped) {
-        warningMessage =
-          'Note: The provided pattern was converted to a literal search for safety.\n\n';
-      }
-
-      // Priority: ToolNode injection (via config.toolCall) > initialization params
       const toolRegistry = paramToolRegistry ?? initParams.toolRegistry;
       const onlyDeferred =
         paramOnlyDeferred !== undefined
@@ -391,12 +490,12 @@ Usage:
 
       if (toolRegistry == null) {
         return [
-          `${warningMessage}Error: No tool registry provided. Configure toolRegistry at agent level or initialization.`,
+          'Error: No tool registry provided. Configure toolRegistry at agent level or initialization.',
           {
             tool_references: [],
             metadata: {
               total_searched: 0,
-              pattern: sanitizedPattern,
+              pattern: query,
               error: 'No tool registry provided',
             },
           },
@@ -404,14 +503,10 @@ Usage:
       }
 
       const toolsArray: t.LCTool[] = Array.from(toolRegistry.values());
-
       const deferredTools: t.ToolMetadata[] = toolsArray
-        .filter((lcTool) => {
-          if (onlyDeferred === true) {
-            return lcTool.defer_loading === true;
-          }
-          return true;
-        })
+        .filter((lcTool) =>
+          onlyDeferred === true ? lcTool.defer_loading === true : true
+        )
         .map((lcTool) => ({
           name: lcTool.name,
           description: lcTool.description ?? '',
@@ -420,15 +515,40 @@ Usage:
 
       if (deferredTools.length === 0) {
         return [
-          `${warningMessage}No tools available to search. The tool registry is empty or no deferred tools are registered.`,
+          'No tools available to search. The tool registry is empty or no deferred tools are registered.',
           {
             tool_references: [],
+            metadata: { total_searched: 0, pattern: query },
+          },
+        ];
+      }
+
+      if (mode === 'local') {
+        const searchResponse = performLocalSearch(
+          deferredTools,
+          query,
+          fields,
+          max_results
+        );
+        const formattedOutput = formatSearchResults(searchResponse);
+
+        return [
+          formattedOutput,
+          {
+            tool_references: searchResponse.tool_references,
             metadata: {
-              total_searched: 0,
-              pattern: sanitizedPattern,
+              total_searched: searchResponse.total_tools_searched,
+              pattern: searchResponse.pattern_used,
             },
           },
         ];
+      }
+
+      const { safe: sanitizedPattern, wasEscaped } = sanitizeRegex(query);
+      let warningMessage = '';
+      if (wasEscaped) {
+        warningMessage =
+          'Note: The provided pattern was converted to a literal search for safety.\n\n';
       }
 
       const searchScript = generateSearchScript(
@@ -519,7 +639,7 @@ Usage:
     {
       name: Constants.TOOL_SEARCH_REGEX,
       description,
-      schema: ToolSearchRegexSchema,
+      schema,
       responseFormat: Constants.CONTENT_AND_ARTIFACT,
     }
   );
@@ -527,6 +647,7 @@ Usage:
 
 export {
   createToolSearchRegexTool,
+  performLocalSearch,
   sanitizeRegex,
   escapeRegexSpecialChars,
   isDangerousPattern,

@@ -128,12 +128,17 @@ export type LCToolRegistry = Map<string, LCTool>;
 
 export type ProgrammaticCache = { toolMap: ToolMap; toolDefs: LCTool[] };
 
+/** Search mode: code_interpreter uses external sandbox, local uses safe substring matching */
+export type ToolSearchMode = 'code_interpreter' | 'local';
+
 /** Parameters for creating a Tool Search Regex tool */
 export type ToolSearchRegexParams = {
   apiKey?: string;
   toolRegistry?: LCToolRegistry;
   onlyDeferred?: boolean;
   baseUrl?: string;
+  /** Search mode: 'code_interpreter' (default) uses sandbox for regex, 'local' uses safe substring matching */
+  mode?: ToolSearchMode;
   [key: string]: unknown;
 };
 
