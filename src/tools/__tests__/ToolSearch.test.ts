@@ -16,6 +16,7 @@ import {
   isFromAnyMcpServer,
   normalizeServerFilter,
   getAvailableMcpServers,
+  getDeferredToolsListing,
   getBaseToolName,
   formatServerListing,
 } from '../ToolSearch';
@@ -647,6 +648,90 @@ describe('ToolSearch', () => {
       });
 
       expect(getAvailableMcpServers(registry, true)).toEqual([]);
+    });
+  });
+
+  describe('getDeferredToolsListing', () => {
+    const createRegistry = (): LCToolRegistry => {
+      const registry: LCToolRegistry = new Map();
+      registry.set('get_weather_mcp_weather-api', {
+        name: 'get_weather_mcp_weather-api',
+        description: 'Get weather',
+        defer_loading: true,
+      });
+      registry.set('get_forecast_mcp_weather-api', {
+        name: 'get_forecast_mcp_weather-api',
+        description: 'Get forecast',
+        defer_loading: true,
+      });
+      registry.set('send_email_mcp_gmail', {
+        name: 'send_email_mcp_gmail',
+        description: 'Send email',
+        defer_loading: true,
+      });
+      registry.set('execute_code', {
+        name: 'execute_code',
+        description: 'Execute code',
+        defer_loading: true,
+      });
+      registry.set('read_file', {
+        name: 'read_file',
+        description: 'Read file',
+        defer_loading: false,
+      });
+      return registry;
+    };
+
+    it('groups tools by server with format D', () => {
+      const registry = createRegistry();
+      const listing = getDeferredToolsListing(registry, true);
+
+      expect(listing).toContain('gmail: send_email');
+      expect(listing).toContain('weather-api: get_weather, get_forecast');
+      expect(listing).toContain('other: execute_code');
+    });
+
+    it('sorts servers alphabetically with other last', () => {
+      const registry = createRegistry();
+      const listing = getDeferredToolsListing(registry, true);
+      const lines = listing.split('\n');
+
+      expect(lines[0]).toMatch(/^gmail:/);
+      expect(lines[1]).toMatch(/^weather-api:/);
+      expect(lines[2]).toMatch(/^other:/);
+    });
+
+    it('uses base tool names without MCP suffix', () => {
+      const registry = createRegistry();
+      const listing = getDeferredToolsListing(registry, true);
+
+      expect(listing).toContain('get_weather');
+      expect(listing).not.toContain('get_weather_mcp_weather-api');
+    });
+
+    it('respects onlyDeferred flag', () => {
+      const registry = createRegistry();
+
+      const deferredOnly = getDeferredToolsListing(registry, true);
+      expect(deferredOnly).not.toContain('read_file');
+
+      const allTools = getDeferredToolsListing(registry, false);
+      expect(allTools).toContain('read_file');
+    });
+
+    it('returns empty string for undefined registry', () => {
+      expect(getDeferredToolsListing(undefined, true)).toBe('');
+    });
+
+    it('returns empty string for registry with no matching tools', () => {
+      const registry: LCToolRegistry = new Map();
+      registry.set('read_file', {
+        name: 'read_file',
+        description: 'Read file',
+        defer_loading: false,
+      });
+
+      expect(getDeferredToolsListing(registry, true)).toBe('');
     });
   });
 

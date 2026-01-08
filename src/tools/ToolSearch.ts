@@ -502,6 +502,56 @@ function getBaseToolName(toolName: string): string {
 }
 
 /**
+ * Generates a compact listing of deferred tools grouped by server.
+ * Format: "server: tool1, tool2, tool3"
+ * Non-MCP tools are grouped under "other".
+ * @param toolRegistry - The tool registry
+ * @param onlyDeferred - Whether to only include deferred tools
+ * @returns Formatted string with tools grouped by server
+ */
+function getDeferredToolsListing(
+  toolRegistry: t.LCToolRegistry | undefined,
+  onlyDeferred: boolean
+): string {
+  if (!toolRegistry) {
+    return '';
+  }
+
+  const toolsByServer: Record<string, string[]> = {};
+
+  for (const lcTool of toolRegistry.values()) {
+    if (onlyDeferred && lcTool.defer_loading !== true) {
+      continue;
+    }
+
+    const toolName = lcTool.name;
+    const serverName = extractMcpServerName(toolName) ?? 'other';
+    const baseName = getBaseToolName(toolName);
+
+    if (!(serverName in toolsByServer)) {
+      toolsByServer[serverName] = [];
+    }
+    toolsByServer[serverName].push(baseName);
+  }
+
+  const serverNames = Object.keys(toolsByServer).sort((a, b) => {
+    if (a === 'other') return 1;
+    if (b === 'other') return -1;
+    return a.localeCompare(b);
+  });
+
+  if (serverNames.length === 0) {
+    return '';
+  }
+
+  const lines = serverNames.map(
+    (server) => `${server}: ${toolsByServer[server].join(', ')}`
+  );
+
+  return lines.join('\n');
+}
+
+/**
  * Formats a server listing response as structured JSON.
  * NOTE: This is a PREVIEW only - tools are NOT discovered/loaded.
  * @param tools - Array of tool metadata from the server(s)
@@ -609,46 +659,36 @@ function createToolSearch(
   const baseEndpoint = initParams.baseUrl ?? getCodeBaseURL();
   const EXEC_ENDPOINT = `${baseEndpoint}/exec`;
 
-  const availableServers = getAvailableMcpServers(
+  const deferredToolsListing = getDeferredToolsListing(
     initParams.toolRegistry,
     defaultOnlyDeferred
   );
 
-  const serverListText =
-    availableServers.length > 0
-      ? `\n- Available MCP servers: ${availableServers.join(', ')}`
+  const toolsListSection =
+    deferredToolsListing.length > 0
+      ? `
+
+Deferred tools (search to load):
+${deferredToolsListing}`
       : '';
 
-  const mcpInstructions = `
-
-MCP Server Tools:
-- Tools from MCP servers follow the naming convention: toolName${Constants.MCP_DELIMITER}serverName
-- Example: "get_weather${Constants.MCP_DELIMITER}weather-api" is the "get_weather" tool from the "weather-api" server
-- Use mcp_server parameter to filter by server (e.g., mcp_server: "weather-api")
-- If mcp_server is provided without a query, lists ALL tools from that server${serverListText}`;
+  const mcpNote =
+    deferredToolsListing.includes(Constants.MCP_DELIMITER) ||
+    deferredToolsListing.split('\n').some((line) => !line.startsWith('other:'))
+      ? `
+- MCP tools use format: toolName${Constants.MCP_DELIMITER}serverName
+- Use mcp_server param to filter by server`
+      : '';
 
   const description =
     mode === 'local'
       ? `
-Searches through available tools to find ones matching your search term.
-
-Usage:
-- Provide a search term to find in tool names and descriptions.
-- Uses case-insensitive substring matching (fast and safe).
-- Use this when you need to discover tools for a specific task.
-- Results include tool names, match quality scores, and snippets showing where the match occurred.
-- Higher scores (0.95+) indicate name matches, medium scores (0.70+) indicate description matches.
-${mcpInstructions}
+Searches deferred tools by name/description. Case-insensitive substring matching.
+${mcpNote}${toolsListSection}
 `.trim()
       : `
-Searches through available tools to find ones matching your query pattern.
-
-Usage:
-- Provide a regex pattern to search tool names and descriptions.
-- Use this when you need to discover tools for a specific task.
-- Results include tool names, match quality scores, and snippets showing where the match occurred.
-- Higher scores (0.9+) indicate name matches, medium scores (0.7+) indicate description matches.
-${mcpInstructions}
+Searches deferred tools by regex pattern.
+${mcpNote}${toolsListSection}
 `.trim();
 
   return tool<typeof schema>(
@@ -879,6 +919,7 @@ export {
   isFromAnyMcpServer,
   normalizeServerFilter,
   getAvailableMcpServers,
+  getDeferredToolsListing,
   getBaseToolName,
   formatServerListing,
   sanitizeRegex,
