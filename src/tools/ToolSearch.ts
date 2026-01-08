@@ -1,7 +1,26 @@
 // src/tools/ToolSearch.ts
 import { z } from 'zod';
-import { default as BM25 } from 'okapibm25';
+import * as okapibm25Module from 'okapibm25';
 import { config } from 'dotenv';
+
+type BM25Fn = (
+  documents: string[],
+  keywords: string[],
+  constants?: { k1?: number; b?: number }
+) => number[];
+
+function getBM25Function(): BM25Fn {
+  const mod = okapibm25Module as unknown as {
+    default: BM25Fn | { default: BM25Fn } | undefined;
+  };
+  if (typeof mod === 'function') return mod;
+  if (typeof mod.default === 'function') return mod.default;
+  if (mod.default != null && typeof mod.default.default === 'function')
+    return mod.default.default;
+  throw new Error('Could not resolve BM25 function from okapibm25 module');
+}
+
+const BM25 = getBM25Function();
 import fetch, { RequestInit } from 'node-fetch';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { getEnvironmentVariable } from '@langchain/core/utils/env';
