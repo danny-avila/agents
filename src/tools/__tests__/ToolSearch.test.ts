@@ -806,6 +806,46 @@ describe('ToolSearch', () => {
         'get_weather'
       );
     });
+
+    it('finds tools when query contains underscores', () => {
+      // Underscores in query should be tokenized the same as in tool names
+      const tools: ToolMetadata[] = [
+        {
+          name: 'convert_time_mcp_time',
+          description: 'Convert time between timezones',
+          parameters: undefined,
+        },
+      ];
+
+      const result = performLocalSearch(tools, 'convert_time', ['name'], 10);
+
+      expect(result.tool_references.length).toBe(1);
+      expect(result.tool_references[0].tool_name).toBe('convert_time_mcp_time');
+      expect(result.tool_references[0].match_score).toBeGreaterThan(0.5);
+    });
+
+    it('finds tools with partial underscore query', () => {
+      const tools: ToolMetadata[] = [
+        {
+          name: 'get_current_time_mcp_time',
+          description: 'Get current time',
+          parameters: undefined,
+        },
+        {
+          name: 'convert_time_mcp_time',
+          description: 'Convert time between timezones',
+          parameters: undefined,
+        },
+      ];
+
+      // "current_time" should match "get_current_time_mcp_time"
+      const result = performLocalSearch(tools, 'current_time', ['name'], 10);
+
+      expect(result.tool_references.length).toBeGreaterThan(0);
+      expect(result.tool_references[0].tool_name).toBe(
+        'get_current_time_mcp_time'
+      );
+    });
   });
 
   describe('formatServerListing', () => {

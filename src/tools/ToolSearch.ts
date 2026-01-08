@@ -303,13 +303,14 @@ function simplifyParametersForSearch(
 
 /**
  * Tokenizes a string into lowercase words for BM25.
+ * Splits on underscores and non-alphanumeric characters for consistent matching.
  * @param text - The text to tokenize
  * @returns Array of lowercase tokens
  */
 function tokenize(text: string): string[] {
   return text
     .toLowerCase()
-    .replace(/[^a-z0-9_]/g, ' ')
+    .replace(/[^a-z0-9]/g, ' ')
     .split(/\s+/)
     .filter((token) => token.length > 0);
 }
