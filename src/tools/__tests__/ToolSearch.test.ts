@@ -15,10 +15,11 @@ import {
   isFromMcpServer,
   isFromAnyMcpServer,
   normalizeServerFilter,
+  getAvailableMcpServers,
   getBaseToolName,
   formatServerListing,
 } from '../ToolSearch';
-import type { ToolMetadata } from '@/types';
+import type { ToolMetadata, LCToolRegistry } from '@/types';
 
 describe('ToolSearch', () => {
   describe('escapeRegexSpecialChars', () => {
@@ -558,6 +559,94 @@ describe('ToolSearch', () => {
         'gmail',
         'slack',
       ]);
+    });
+  });
+
+  describe('getAvailableMcpServers', () => {
+    const createRegistry = (): LCToolRegistry => {
+      const registry: LCToolRegistry = new Map();
+      registry.set('get_weather_mcp_weather-api', {
+        name: 'get_weather_mcp_weather-api',
+        description: 'Get weather',
+        defer_loading: true,
+      });
+      registry.set('get_forecast_mcp_weather-api', {
+        name: 'get_forecast_mcp_weather-api',
+        description: 'Get forecast',
+        defer_loading: true,
+      });
+      registry.set('send_email_mcp_gmail', {
+        name: 'send_email_mcp_gmail',
+        description: 'Send email',
+        defer_loading: true,
+      });
+      registry.set('read_inbox_mcp_gmail', {
+        name: 'read_inbox_mcp_gmail',
+        description: 'Read inbox',
+        defer_loading: true,
+      });
+      registry.set('post_message_mcp_slack', {
+        name: 'post_message_mcp_slack',
+        description: 'Post to Slack',
+        defer_loading: true,
+      });
+      registry.set('regular_tool', {
+        name: 'regular_tool',
+        description: 'Not an MCP tool',
+        defer_loading: true,
+      });
+      registry.set('non_deferred_mcp_special', {
+        name: 'non_deferred_mcp_special',
+        description: 'Not deferred',
+        defer_loading: false,
+      });
+      return registry;
+    };
+
+    it('extracts unique server names from registry', () => {
+      const registry = createRegistry();
+      const servers = getAvailableMcpServers(registry, true);
+
+      expect(servers).toEqual(['gmail', 'slack', 'weather-api']);
+    });
+
+    it('returns servers sorted alphabetically', () => {
+      const registry = createRegistry();
+      const servers = getAvailableMcpServers(registry, true);
+
+      expect(servers).toEqual([...servers].sort());
+    });
+
+    it('excludes non-MCP tools', () => {
+      const registry = createRegistry();
+      const servers = getAvailableMcpServers(registry, true);
+
+      expect(servers).not.toContain('regular_tool');
+    });
+
+    it('respects onlyDeferred flag', () => {
+      const registry = createRegistry();
+
+      const deferredOnly = getAvailableMcpServers(registry, true);
+      expect(deferredOnly).not.toContain('special');
+
+      const allTools = getAvailableMcpServers(registry, false);
+      expect(allTools).toContain('special');
+    });
+
+    it('returns empty array for undefined registry', () => {
+      expect(getAvailableMcpServers(undefined, true)).toEqual([]);
+    });
+
+    it('returns empty array for registry with no MCP tools', () => {
+      const registry: LCToolRegistry = new Map();
+      registry.set('tool1', {
+        name: 'tool1',
+        description: 'Regular tool',
+        defer_loading: true,
+      });
+
+      expect(getAvailableMcpServers(registry, true)).toEqual([]);
     });
   });
 

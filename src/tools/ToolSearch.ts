@@ -127,6 +127,34 @@ function normalizeServerFilter(
 }
 
 /**
+ * Extracts all unique MCP server names from a tool registry.
+ * @param toolRegistry - The tool registry to scan
+ * @param onlyDeferred - If true, only considers deferred tools
+ * @returns Array of unique server names, sorted alphabetically
+ */
+function getAvailableMcpServers(
+  toolRegistry: t.LCToolRegistry | undefined,
+  onlyDeferred: boolean = true
+): string[] {
+  if (!toolRegistry) {
+    return [];
+  }
+
+  const servers = new Set<string>();
+  for (const [, toolDef] of toolRegistry) {
+    if (onlyDeferred && toolDef.defer_loading !== true) {
+      continue;
+    }
+    const server = extractMcpServerName(toolDef.name);
+    if (server !== undefined && server !== '') {
+      servers.add(server);
+    }
+  }
+
+  return Array.from(servers).sort();
+}
+
+/**
  * Escapes special regex characters in a string to use as a literal pattern.
  * @param pattern - The string to escape
  * @returns The escaped string safe for use in a RegExp
@@ -587,13 +615,23 @@ function createToolSearch(
   const baseEndpoint = initParams.baseUrl ?? getCodeBaseURL();
   const EXEC_ENDPOINT = `${baseEndpoint}/exec`;
 
+  const availableServers = getAvailableMcpServers(
+    initParams.toolRegistry,
+    defaultOnlyDeferred
+  );
+
+  const serverListText =
+    availableServers.length > 0
+      ? `\n- Available MCP servers: ${availableServers.join(', ')}`
+      : '';
+
   const mcpInstructions = `
 
 MCP Server Tools:
 - Tools from MCP servers follow the naming convention: toolName${Constants.MCP_DELIMITER}serverName
 - Example: "get_weather${Constants.MCP_DELIMITER}weather-api" is the "get_weather" tool from the "weather-api" server
 - Use mcp_server parameter to filter by server (e.g., mcp_server: "weather-api")
-- If mcp_server is provided without a query, lists ALL tools from that server`;
+- If mcp_server is provided without a query, lists ALL tools from that server${serverListText}`;
 
   const description =
     mode === 'local'
@@ -846,6 +884,7 @@ export {
   isFromMcpServer,
   isFromAnyMcpServer,
   normalizeServerFilter,
+  getAvailableMcpServers,
   getBaseToolName,
   formatServerListing,
   sanitizeRegex,
