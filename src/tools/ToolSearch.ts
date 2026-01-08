@@ -1,6 +1,6 @@
 // src/tools/ToolSearch.ts
 import { z } from 'zod';
-import BM25 from 'okapibm25';
+import { default as BM25 } from 'okapibm25';
 import { config } from 'dotenv';
 import fetch, { RequestInit } from 'node-fetch';
 import { HttpsProxyAgent } from 'https-proxy-agent';
