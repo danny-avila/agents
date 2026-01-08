@@ -732,34 +732,41 @@ describe('ToolSearch', () => {
       },
     ];
 
-    it('formats server listing with tool names and descriptions', () => {
+    it('returns valid JSON with tool listing', () => {
       const result = formatServerListing(serverTools, 'weather-api');
+      const parsed = JSON.parse(result);
 
-      expect(result).toContain('Tools from MCP server: weather-api');
-      expect(result).toContain('2 tool(s)');
-      expect(result).toContain('get_weather');
-      expect(result).toContain('get_forecast');
-      expect(result).toContain('preview only');
+      expect(parsed.listing_mode).toBe(true);
+      expect(parsed.servers).toEqual(['weather-api']);
+      expect(parsed.total_tools).toBe(2);
+      expect(parsed.tools_by_server['weather-api']).toHaveLength(2);
     });
 
     it('includes hint to search for specific tool to load it', () => {
       const result = formatServerListing(serverTools, 'weather-api');
+      const parsed = JSON.parse(result);
 
-      expect(result).toContain('To use a tool, search for it by name');
+      expect(parsed.hint).toContain('To use a tool, search for it by name');
     });
 
     it('uses base tool name (without MCP suffix) in display', () => {
       const result = formatServerListing(serverTools, 'weather-api');
+      const parsed = JSON.parse(result);
 
-      expect(result).toContain('**get_weather**');
-      expect(result).not.toContain('**get_weather_mcp_weather-api**');
+      const toolNames = parsed.tools_by_server['weather-api'].map(
+        (t: { name: string }) => t.name
+      );
+      expect(toolNames).toContain('get_weather');
+      expect(toolNames).not.toContain('get_weather_mcp_weather-api');
     });
 
     it('handles empty tools array', () => {
       const result = formatServerListing([], 'empty-server');
+      const parsed = JSON.parse(result);
 
-      expect(result).toContain('No tools found');
-      expect(result).toContain('empty-server');
+      expect(parsed.total_tools).toBe(0);
+      expect(parsed.servers).toContain('empty-server');
+      expect(parsed.hint).toContain('No tools found');
     });
 
     it('truncates long descriptions', () => {
@@ -767,17 +774,17 @@ describe('ToolSearch', () => {
         {
           name: 'long_tool_mcp_server',
           description:
-            'This is a very long description that exceeds 80 characters and should be truncated to keep the listing compact and readable.',
+            'This is a very long description that exceeds 100 characters and should be truncated to keep the listing compact and readable for the LLM.',
           parameters: undefined,
         },
       ];
 
       const result = formatServerListing(toolsWithLongDesc, 'server');
+      const parsed = JSON.parse(result);
 
-      expect(result).toContain('...');
-      expect(result.length).toBeLessThan(
-        toolsWithLongDesc[0].description.length + 200
-      );
+      const toolDesc = parsed.tools_by_server['server'][0].description;
+      expect(toolDesc).toContain('...');
+      expect(toolDesc.length).toBeLessThanOrEqual(100);
     });
 
     it('handles multiple servers with grouped output', () => {
@@ -803,21 +810,20 @@ describe('ToolSearch', () => {
         'weather-api',
         'gmail',
       ]);
+      const parsed = JSON.parse(result);
 
-      expect(result).toContain('Tools from MCP servers: weather-api, gmail');
-      expect(result).toContain('3 tool(s)');
-      expect(result).toContain('### weather-api');
-      expect(result).toContain('### gmail');
-      expect(result).toContain('get_weather');
-      expect(result).toContain('send_email');
-      expect(result).toContain('read_inbox');
+      expect(parsed.servers).toEqual(['weather-api', 'gmail']);
+      expect(parsed.total_tools).toBe(3);
+      expect(parsed.tools_by_server['weather-api']).toHaveLength(1);
+      expect(parsed.tools_by_server['gmail']).toHaveLength(2);
     });
 
     it('accepts single server as array', () => {
       const result = formatServerListing(serverTools, ['weather-api']);
+      const parsed = JSON.parse(result);
 
-      expect(result).toContain('Tools from MCP server: weather-api');
-      expect(result).not.toContain('###');
+      expect(parsed.servers).toEqual(['weather-api']);
+      expect(parsed.tools_by_server['weather-api']).toBeDefined();
     });
   });
 });

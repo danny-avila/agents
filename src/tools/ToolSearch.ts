@@ -465,30 +465,27 @@ function parseSearchResults(stdout: string): t.ToolSearchResponse {
 }
 
 /**
- * Formats search results into a human-readable string.
+ * Formats search results as structured JSON for efficient parsing.
  * @param searchResponse - The parsed search response
- * @returns Formatted string for LLM consumption
+ * @returns JSON string with search results
  */
 function formatSearchResults(searchResponse: t.ToolSearchResponse): string {
   const { tool_references, total_tools_searched, pattern_used } =
     searchResponse;
 
-  if (tool_references.length === 0) {
-    return `No tools matched the pattern "${pattern_used}".\nTotal tools searched: ${total_tools_searched}`;
-  }
+  const output = {
+    found: tool_references.length,
+    tools: tool_references.map((ref) => ({
+      name: ref.tool_name,
+      score: Number(ref.match_score.toFixed(2)),
+      matched_in: ref.matched_field,
+      snippet: ref.snippet,
+    })),
+    total_searched: total_tools_searched,
+    query: pattern_used,
+  };
 
-  let response = `Found ${tool_references.length} matching tools:\n\n`;
-
-  for (const ref of tool_references) {
-    response += `- ${ref.tool_name} (score: ${ref.match_score.toFixed(2)})\n`;
-    response += `  Matched in: ${ref.matched_field}\n`;
-    response += `  Snippet: ${ref.snippet}\n\n`;
-  }
-
-  response += `Total tools searched: ${total_tools_searched}\n`;
-  response += `Pattern used: ${pattern_used}`;
-
-  return response;
+  return JSON.stringify(output, null, 2);
 }
 
 /**
@@ -505,12 +502,11 @@ function getBaseToolName(toolName: string): string {
 }
 
 /**
- * Formats a server listing response when listing all tools from MCP server(s).
- * Provides a cohesive view of all tools grouped by server.
+ * Formats a server listing response as structured JSON.
  * NOTE: This is a PREVIEW only - tools are NOT discovered/loaded.
  * @param tools - Array of tool metadata from the server(s)
  * @param serverNames - The MCP server name(s)
- * @returns Formatted string showing all tools from the server(s)
+ * @returns JSON string showing all tools grouped by server
  */
 function formatServerListing(
   tools: t.ToolMetadata[],
@@ -519,48 +515,46 @@ function formatServerListing(
   const servers = Array.isArray(serverNames) ? serverNames : [serverNames];
 
   if (tools.length === 0) {
-    return `No tools found from MCP server(s): ${servers.join(', ')}.`;
+    return JSON.stringify(
+      {
+        listing_mode: true,
+        servers,
+        total_tools: 0,
+        tools_by_server: {},
+        hint: 'No tools found from the specified MCP server(s).',
+      },
+      null,
+      2
+    );
   }
 
-  const toolsByServer = new Map<string, t.ToolMetadata[]>();
+  const toolsByServer: Record<
+    string,
+    Array<{ name: string; description: string }>
+  > = {};
   for (const tool of tools) {
     const server = extractMcpServerName(tool.name) ?? 'unknown';
-    const existing = toolsByServer.get(server) ?? [];
-    existing.push(tool);
-    toolsByServer.set(server, existing);
+    if (!(server in toolsByServer)) {
+      toolsByServer[server] = [];
+    }
+    toolsByServer[server].push({
+      name: getBaseToolName(tool.name),
+      description:
+        tool.description.length > 100
+          ? tool.description.substring(0, 97) + '...'
+          : tool.description,
+    });
   }
 
-  let response =
-    servers.length === 1
-      ? `## Tools from MCP server: ${servers[0]}\n\n`
-      : `## Tools from MCP servers: ${servers.join(', ')}\n\n`;
+  const output = {
+    listing_mode: true,
+    servers,
+    total_tools: tools.length,
+    tools_by_server: toolsByServer,
+    hint: `To use a tool, search for it by name (e.g., query: "${getBaseToolName(tools[0]?.name ?? 'tool_name')}") to load it.`,
+  };
 
-  response += `Found ${tools.length} tool(s) (preview only - not yet loaded):\n\n`;
-
-  for (const [server, serverTools] of toolsByServer) {
-    if (servers.length > 1) {
-      response += `### ${server}\n\n`;
-    }
-    for (const tool of serverTools) {
-      const baseName = getBaseToolName(tool.name);
-      response += `- **${baseName}**`;
-      if (tool.description) {
-        const shortDesc =
-          tool.description.length > 80
-            ? tool.description.substring(0, 77) + '...'
-            : tool.description;
-        response += `: ${shortDesc}`;
-      }
-      response += '\n';
-    }
-    if (servers.length > 1) {
-      response += '\n';
-    }
-  }
-
-  response += `\n_To use a tool, search for it by name (e.g., query: "${getBaseToolName(tools[0]?.name ?? 'tool_name')}") to load it._`;
-
-  return response;
+  return JSON.stringify(output, null, 2);
 }
 
 /**
