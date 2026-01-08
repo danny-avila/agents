@@ -846,6 +846,50 @@ describe('ToolSearch', () => {
         'get_current_time_mcp_time'
       );
     });
+
+    it('gives exact base name match a perfect score', () => {
+      const tools: ToolMetadata[] = [
+        {
+          name: 'convert_time_mcp_time',
+          description: 'Convert time between timezones',
+          parameters: undefined,
+        },
+        {
+          name: 'get_current_time_mcp_time',
+          description: 'Get current time',
+          parameters: undefined,
+        },
+      ];
+
+      // Exact match on base name should get score of 1.0
+      const result = performLocalSearch(tools, 'convert_time', ['name'], 10);
+
+      expect(result.tool_references[0].tool_name).toBe('convert_time_mcp_time');
+      expect(result.tool_references[0].match_score).toBe(1.0);
+    });
+
+    it('boosts starts-with matches on base name', () => {
+      const tools: ToolMetadata[] = [
+        {
+          name: 'send_email_mcp_gmail',
+          description: 'Send email',
+          parameters: undefined,
+        },
+        {
+          name: 'read_email_mcp_gmail',
+          description: 'Read email',
+          parameters: undefined,
+        },
+      ];
+
+      // "send" starts-with "send_email", should get boosted score
+      const result = performLocalSearch(tools, 'send', ['name'], 10);
+
+      expect(result.tool_references[0].tool_name).toBe('send_email_mcp_gmail');
+      expect(result.tool_references[0].match_score).toBeGreaterThanOrEqual(
+        0.95
+      );
+    });
   });
 
   describe('formatServerListing', () => {

@@ -427,6 +427,7 @@ function performLocalSearch(
   const scores = BM25(documents, queryTokens, { k1: 1.5, b: 0.75 }) as number[];
 
   const maxScore = Math.max(...scores.filter((s) => s > 0), 1);
+  const queryLower = query.toLowerCase().trim();
 
   const results: t.ToolSearchResult[] = [];
   for (let i = 0; i < tools.length; i++) {
@@ -436,7 +437,15 @@ function performLocalSearch(
         queryTokens,
         fields
       );
-      const normalizedScore = Math.min(scores[i] / maxScore, 1.0);
+      let normalizedScore = Math.min(scores[i] / maxScore, 1.0);
+
+      // Boost score for exact base name match
+      const baseName = getBaseToolName(tools[i].name).toLowerCase();
+      if (baseName === queryLower) {
+        normalizedScore = 1.0;
+      } else if (baseName.startsWith(queryLower)) {
+        normalizedScore = Math.max(normalizedScore, 0.95);
+      }
 
       results.push({
         tool_name: tools[i].name,
