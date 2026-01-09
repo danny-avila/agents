@@ -18,6 +18,7 @@ import {
   handleToolCalls,
 } from '@/tools/handlers';
 import { getMessageId } from '@/messages';
+import { injectCitationMarkers } from '@/citations';
 
 /**
  * Parses content to extract thinking sections enclosed in <think> tags using string operations
@@ -156,6 +157,27 @@ export class ChatModelStreamHandler implements t.EventHandler {
     const agentContext = graph.getAgentContext(metadata);
 
     const chunk = data.chunk as Partial<AIMessageChunk>;
+
+    // Extract Perplexity citations from streaming chunk if present
+    /* eslint-disable @typescript-eslint/no-explicit-any */
+    const additionalKwargs = chunk.additional_kwargs as
+      | Record<string, any>
+      | undefined;
+    if (
+      additionalKwargs?.citations != null &&
+      Array.isArray(additionalKwargs.citations)
+    ) {
+      graph.perplexityCitations = additionalKwargs.citations as string[];
+    }
+    if (
+      additionalKwargs?.search_results != null &&
+      Array.isArray(additionalKwargs.search_results)
+    ) {
+      graph.perplexitySearchResults =
+        additionalKwargs.search_results as unknown[];
+    }
+    /* eslint-enable @typescript-eslint/no-explicit-any */
+
     const content = getChunkContent({
       chunk,
       reasoningKey: agentContext.reasoningKey,
@@ -271,17 +293,23 @@ hasToolCallChunks: ${hasToolCallChunks}
     ) {
       return;
     } else if (typeof content === 'string') {
+      // Inject Perplexity citation markers if citations are present
+      let processedContent = content;
+      if (graph.perplexityCitations && graph.perplexityCitations.length > 0) {
+        processedContent = injectCitationMarkers(content, 0);
+      }
+
       if (agentContext.currentTokenType === ContentTypes.TEXT) {
         await graph.dispatchMessageDelta(stepId, {
           content: [
             {
               type: ContentTypes.TEXT,
-              text: content,
+              text: processedContent,
             },
           ],
         });
       } else if (agentContext.currentTokenType === 'think_and_text') {
-        const { text, thinking } = parseThinkingContent(content);
+        const { text, thinking } = parseThinkingContent(processedContent);
         if (thinking) {
           await graph.dispatchReasoningDelta(stepId, {
             content: [
