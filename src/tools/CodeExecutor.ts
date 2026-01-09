@@ -84,6 +84,9 @@ function createCodeExecutionTool(
     throw new Error('No API key provided for code execution tool.');
   }
 
+  // Extract user_id for session isolation
+  const userId = params.user_id ?? '';
+
   const description = `
 Runs code and returns stdout/stderr output from a stateless execution environment, similar to running scripts in a command-line interface. Each execution is isolated and independent.
 
@@ -110,6 +113,7 @@ Usage:
             headers: {
               'User-Agent': 'LibreChat/1.0',
               'X-API-Key': apiKey,
+              'X-User-Id': userId,
             },
           };
 
@@ -157,6 +161,7 @@ Usage:
             'Content-Type': 'application/json',
             'User-Agent': 'LibreChat/1.0',
             'X-API-Key': apiKey,
+            'X-User-Id': userId,
           },
           body: JSON.stringify(postData),
         };
