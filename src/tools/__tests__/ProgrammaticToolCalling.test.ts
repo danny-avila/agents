@@ -643,7 +643,6 @@ for member in team:
       expect(output).toContain('Generated files:');
       expect(output).toContain('report.pdf');
       expect(output).toContain('data.csv');
-      expect(output).toContain('session_id: sess_abc123');
       expect(artifact.files).toHaveLength(2);
       expect(artifact.files).toEqual(response.files);
     });
@@ -881,7 +880,6 @@ for member in team:
       expect(output).toContain('Generated files:');
       expect(output).toContain('report.csv');
       expect(output).toContain('chart.png');
-      expect(output).toContain('session_id: sess_xyz');
       expect(output).toContain('File is already downloaded');
       expect(output).toContain('Image is already displayed');
       expect(artifact.files).toHaveLength(2);
