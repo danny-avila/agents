@@ -24,7 +24,12 @@ if (!API_KEY) {
 interface FileRef {
   id: string;
   name: string;
-  session_id?: string; // New: self-contained file reference
+  session_id?: string;
+  /** Lineage tracking - present if file was modified from previous session */
+  modified_from?: {
+    id: string;
+    session_id: string;
+  };
 }
 
 interface ExecResult {
@@ -217,6 +222,136 @@ with open("/mnt/data/test_config.json", "r") as f:
     console.log('stderr:', result3.stderr);
   } else {
     console.log('\n✅ File read successfully!');
+  }
+
+  // ============================================================
+  // TEST 4: MODIFY the file (same filename) - tests editable files
+  // ============================================================
+  console.log('\n' + '='.repeat(60));
+  console.log('TEST 4: MODIFY file in-place (testing editable files feature)');
+  console.log('='.repeat(60));
+
+  const modifyCode = `
+import json
+
+# Read the existing file
+with open("/mnt/data/test_config.json", "r") as f:
+    config = json.load(f)
+
+print("Original config:")
+print(json.dumps(config, indent=2))
+
+# Modify the config
+config["version"] = "2.0.0"
+config["modified"] = True
+
+# Write BACK to the SAME filename (should work now!)
+with open("/mnt/data/test_config.json", "w") as f:
+    json.dump(config, f, indent=2)
+
+# Verify the write
+with open("/mnt/data/test_config.json", "r") as f:
+    updated = json.load(f)
+
+print("\\nUpdated config:")
+print(json.dumps(updated, indent=2))
+`;
+
+  const result3 = (await makeRequest(`${BASE_URL}/exec`, {
+    lang: 'py',
+    code: modifyCode,
+    files: fileReferences,
+  })) as ExecResult;
+
+  console.log('\n--- Result Summary ---');
+  console.log('stdout:', result3.stdout);
+  console.log('stderr:', result3.stderr);
+  console.log('files:', JSON.stringify(result3.files, null, 2));
+
+  if (result3.stderr && result3.stderr.includes('Permission denied')) {
+    console.log('\n❌ Permission denied - files are still read-only!');
+  } else if (result3.stderr && result3.stderr.includes('Error')) {
+    console.log('\n❌ Error modifying file:', result3.stderr);
+  } else {
+    console.log('\n✅ File modified successfully!');
+
+    // Check for modified_from lineage
+    const modifiedFile = result3.files?.find(
+      (f) => f.name === 'test_config.json'
+    );
+    if (modifiedFile) {
+      console.log('\n--- Modified File Details ---');
+      console.log('  id:', modifiedFile.id);
+      console.log('  name:', modifiedFile.name);
+      console.log('  session_id:', modifiedFile.session_id);
+      if (modifiedFile.modified_from) {
+        console.log(
+          '  modified_from:',
+          JSON.stringify(modifiedFile.modified_from)
+        );
+        console.log(
+          '\n✅ Lineage tracking working! File shows it was modified from previous session.'
+        );
+      } else {
+        console.log(
+          '\n⚠️  No modified_from field - lineage tracking not present'
+        );
+      }
+    } else {
+      console.log('\n⚠️  Modified file not found in response files array');
+    }
+  }
+
+  // ============================================================
+  // TEST 5: Verify modification persists in next execution
+  // ============================================================
+  console.log('\n' + '='.repeat(60));
+  console.log(
+    'TEST 5: Verify modified file can be read in subsequent execution'
+  );
+  console.log('='.repeat(60));
+
+  // Use the new file references from the modify response
+  const newFileRefs: FileRef[] = (result3.files ?? []).map((file) => ({
+    session_id: file.session_id ?? result3.session_id,
+    id: file.id,
+    name: file.name,
+  }));
+
+  if (newFileRefs.length === 0) {
+    console.log(
+      '\n⚠️  No files returned from modification, skipping verification'
+    );
+  } else {
+    console.log(
+      '\nUsing new file references:',
+      JSON.stringify(newFileRefs, null, 2)
+    );
+
+    const verifyCode = `
+import json
+
+with open("/mnt/data/test_config.json", "r") as f:
+    config = json.load(f)
+
+print("Verified config:")
+print(json.dumps(config, indent=2))
+
+if config.get("version") == "2.0.0" and config.get("modified") == True:
+    print("\\n✅ Modification persisted correctly!")
+else:
+    print("\\n❌ Modification did NOT persist!")
+`;
+
+    const result4 = (await makeRequest(`${BASE_URL}/exec`, {
+      lang: 'py',
+      code: verifyCode,
+      files: newFileRefs,
+    })) as ExecResult;
+
+    console.log('\n--- Result Summary ---');
+    console.log('stdout:', result4.stdout);
+    console.log('stderr:', result4.stderr);
   }
 }
 

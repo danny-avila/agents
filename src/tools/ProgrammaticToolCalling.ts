@@ -19,7 +19,7 @@ config();
 const imageMessage = 'Image is already displayed to the user';
 const otherMessage = 'File is already downloaded by the user';
 const accessMessage =
-  'Note: Files are READ-ONLY. Save changes to NEW filenames. Files are automatically available in future executions.';
+  'Note: Files from previous executions are automatically available and can be modified.';
 const emptyOutputMessage =
   'stdout: Empty. Ensure you\'re writing output explicitly.\n';
 

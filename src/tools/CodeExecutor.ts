@@ -17,7 +17,7 @@ export const getCodeBaseURL = (): string =>
 const imageMessage = 'Image is already displayed to the user';
 const otherMessage = 'File is already downloaded by the user';
 const accessMessage =
-  'Note: Files are READ-ONLY. Save changes to NEW filenames. Files are automatically available in future executions.';
+  'Note: Files from previous executions are automatically available and can be modified.';
 const emptyOutputMessage =
   'stdout: Empty. Ensure you\'re writing output explicitly.\n';
 
@@ -42,7 +42,7 @@ const CodeExecutionToolSchema = z.object({
     .describe(`The complete, self-contained code to execute, without any truncation or minimization.
 - The environment is stateless; variables and imports don't persist between executions.
 - Generated files from previous executions are automatically available in "/mnt/data/".
-- Files from previous executions are READ-ONLY. To modify: read original file, write to NEW filename.
+- Files from previous executions are automatically available and can be modified in place.
 - Input code **IS ALREADY** displayed to the user, so **DO NOT** repeat it in your response unless asked.
 - Output code **IS NOT** displayed to the user, so **DO** write all desired output explicitly.
 - IMPORTANT: You MUST explicitly print/output ALL results you want the user to see.
