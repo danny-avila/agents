@@ -39,6 +39,8 @@ export type ToolNodeOptions = {
   ) => Promise<void>;
   /** Tool registry for lazy computation of programmatic tools and tool search */
   toolRegistry?: LCToolRegistry;
+  /** Reference to Graph's sessions map for automatic session injection */
+  sessions?: ToolSessionMap;
 };
 
 export type ToolNodeConstructorParams = ToolRefs & ToolNodeOptions;
@@ -253,3 +255,41 @@ export type ProgrammaticToolCallingParams = {
   /** Environment variable key for API key */
   [key: string]: unknown;
 };
+
+// ============================================================================
+// Tool Session Context Types
+// ============================================================================
+
+/**
+ * Tracks code execution session state for automatic file persistence.
+ * Stored in Graph.sessions and injected into subsequent tool invocations.
+ */
+export type CodeSessionContext = {
+  /** Session ID from the code execution environment */
+  session_id: string;
+  /** Files generated in this session (for context/tracking) */
+  files: FileRefs;
+  /** Timestamp of last update */
+  lastUpdated: number;
+};
+
+/**
+ * Artifact structure returned by code execution tools (CodeExecutor, PTC).
+ * Used to extract session context after tool completion.
+ */
+export type CodeExecutionArtifact = {
+  session_id?: string;
+  files?: FileRefs;
+};
+
+/**
+ * Generic session context union type for different tool types.
+ * Extend this as new tool session types are added.
+ */
+export type ToolSessionContext = CodeSessionContext;
+
+/**
+ * Map of tool names to their session contexts.
+ * Keys are tool constants (e.g., Constants.EXECUTE_CODE, Constants.PROGRAMMATIC_TOOL_CALLING).
+ */
+export type ToolSessionMap = Map<string, ToolSessionContext>;

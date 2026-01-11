@@ -1,10 +1,14 @@
-// src/scripts/code_exec_files.ts
+// src/scripts/code_exec_session.ts
 /**
- * Tests automatic session tracking for code execution file persistence.
- * Files created in one execution are automatically available in subsequent executions
- * without the LLM needing to track or pass session_id.
+ * Test script for automatic session tracking in code execution tools.
  *
- * Run with: npm run code_exec_files
+ * This tests the automatic session_id injection feature where:
+ * 1. First code execution generates files and returns a session_id
+ * 2. Session context is stored in Graph.sessions
+ * 3. Subsequent code executions automatically have access to previous files
+ *    without the LLM needing to explicitly pass session_id
+ *
+ * Run with: npm run code_exec_session
  */
 import { config } from 'dotenv';
 config();
@@ -24,6 +28,15 @@ import { Run } from '@/run';
 import { createCodeExecutionTool } from '@/tools/CodeExecutor';
 
 const conversationHistory: BaseMessage[] = [];
+
+/**
+ * Prints a formatted section header for test output
+ */
+function printSection(title: string): void {
+  console.log('\n' + '='.repeat(60));
+  console.log(` ${title}`);
+  console.log('='.repeat(60) + '\n');
+}
 
 /**
  * Prints session context from the graph for debugging
@@ -52,9 +65,10 @@ function printSessionContext(run: Run<t.IState>): void {
   );
 }
 
-async function testCodeExecution(): Promise<void> {
+async function testAutomaticSessionTracking(): Promise<void> {
   const { userName, location, provider, currentDate } = await getArgs();
   const { contentParts, aggregateContent } = createContentAggregator();
+
   const customHandlers = {
     [GraphEvents.TOOL_END]: new ToolEndHandler(),
     [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(),
@@ -87,8 +101,6 @@ async function testCodeExecution(): Promise<void> {
         event: GraphEvents.ON_RUN_STEP_DELTA,
         data: t.StreamEventData
       ): void => {
-        console.log('====== ON_RUN_STEP_DELTA ======');
-        console.dir(data, { depth: null });
         aggregateContent({ event, data: data as t.RunStepDeltaEvent });
       },
     },
@@ -97,8 +109,6 @@ async function testCodeExecution(): Promise<void> {
         event: GraphEvents.ON_MESSAGE_DELTA,
         data: t.StreamEventData
       ): void => {
-        console.log('====== ON_MESSAGE_DELTA ======');
-        console.dir(data, { depth: null });
         aggregateContent({ event, data: data as t.MessageDeltaEvent });
       },
     },
@@ -117,14 +127,18 @@ async function testCodeExecution(): Promise<void> {
   const llmConfig = getLLMConfig(provider);
 
   const run = await Run.create<t.IState>({
-    runId: 'message-num-1',
+    runId: 'session-tracking-test-1',
     graphConfig: {
       type: 'standard',
       llmConfig,
       tools: [createCodeExecutionTool()],
-      instructions:
-        'You are a friendly AI assistant with coding capabilities. Always address the user by their name.',
-      additional_instructions: `The user's name is ${userName} and they are located in ${location}. The current date is ${currentDate}.`,
+      instructions: `You are an AI assistant testing automatic file persistence.
+When writing Python code:
+- Use print() for all outputs
+- Files from previous executions are automatically available in /mnt/data/
+- Files are READ-ONLY; write modifications to NEW filenames
+- IMPORTANT: Do NOT include session_id in your tool calls - it's handled automatically.`,
+      additional_instructions: `User: ${userName}, Location: ${location}, Date: ${currentDate}.`,
     },
     returnContent: true,
     customHandlers,
@@ -137,80 +151,112 @@ async function testCodeExecution(): Promise<void> {
   } = {
     configurable: {
       provider,
-      thread_id: 'conversation-num-1',
+      thread_id: 'session-tracking-test',
     },
     streamMode: 'values',
     version: 'v2' as const,
   };
 
-  console.log('\n========== Test 1: Create Project Plan ==========\n');
+  // =========================================================================
+  // Test 1: Create initial file (establishes session)
+  // =========================================================================
+  printSection('Test 1: Create Initial File');
   console.log(
-    'Creating initial file - this establishes the session context.\n'
+    'This test creates a file, which should establish a session context.\n'
   );
 
   const userMessage1 = `
-  Hi ${userName} here. We are testing your file capabilities.
-  
-  1. Create a text file named "project_plan.txt" that contains: "This is a project plan for a new software development project."
-  
-  Please generate this file so I can review it.
-  `;
+Create a Python file that writes a simple JSON config file named "app_config.json" with the following content:
+{
+  "app_name": "TestApp",
+  "version": "1.0.0",
+  "debug": true
+}
+
+After writing, print the contents to confirm it was created correctly.
+`;
 
   conversationHistory.push(new HumanMessage(userMessage1));
+  await run.processStream({ messages: conversationHistory }, streamConfig);
 
-  let inputs = {
-    messages: conversationHistory,
-  };
-  await run.processStream(inputs, streamConfig);
   const finalMessages1 = run.getRunMessages();
   if (finalMessages1) {
     conversationHistory.push(...finalMessages1);
   }
 
-  console.log('\n\n========== Session Context After Test 1 ==========\n');
+  printSection('Session Context After Test 1');
   printSessionContext(run);
-  console.dir(contentParts, { depth: null });
 
-  console.log('\n========== Test 2: Edit Project Plan ==========\n');
+  // =========================================================================
+  // Test 2: Access previously created file (uses automatic session injection)
+  // =========================================================================
+  printSection('Test 2: Access Previous File (Automatic Session)');
+  console.log('This test reads the file created in Test 1.');
   console.log(
-    'Editing the file from Test 1 - session_id is automatically injected.\n'
+    'The LLM does NOT need to provide session_id - it should be injected automatically.\n'
   );
 
   const userMessage2 = `
-  Thanks for creating the project plan. Now I'd like you to edit the same plan to:
-  
-  1. Read the existing project_plan.txt file
-  2. Add a new section called "Technology Stack" that contains: "The technology stack for this project includes the following technologies" and nothing more.
-  3. Save this as a new file called "project_plan_v2.txt" (remember files are read-only)
-  4. Print the contents of both files to verify
+Now read the app_config.json file that was just created and:
+1. Print its contents
+2. Confirm the version is "1.0.0"
+
+Note: You should be able to access this file from the previous execution automatically.
 `;
 
   conversationHistory.push(new HumanMessage(userMessage2));
+  await run.processStream({ messages: conversationHistory }, streamConfig);
 
-  inputs = {
-    messages: conversationHistory,
-  };
-  await run.processStream(inputs, streamConfig);
   const finalMessages2 = run.getRunMessages();
   if (finalMessages2) {
     conversationHistory.push(...finalMessages2);
   }
 
-  console.log('\n\n========== Session Context After Test 2 ==========\n');
+  printSection('Session Context After Test 2');
   printSessionContext(run);
-  console.dir(contentParts, { depth: null });
 
+  // =========================================================================
+  // Test 3: Modify file (write to new filename)
+  // =========================================================================
+  printSection('Test 3: Modify File (Write to New Filename)');
+  console.log(
+    'This test modifies the config by reading the old file and writing a new one.\n'
+  );
+
+  const userMessage3 = `
+Read app_config.json, update the version to "2.0.0" and debug to false, 
+then save it as "app_config_v2.json". Print both the old and new contents.
+`;
+
+  conversationHistory.push(new HumanMessage(userMessage3));
+  await run.processStream({ messages: conversationHistory }, streamConfig);
+
+  const finalMessages3 = run.getRunMessages();
+  if (finalMessages3) {
+    conversationHistory.push(...finalMessages3);
+  }
+
+  printSection('Session Context After Test 3');
+  printSessionContext(run);
+
+  // =========================================================================
+  // Summary
+  // =========================================================================
+  printSection('Test Summary');
+  console.log('The automatic session tracking feature should have:');
+  console.log('1. Stored the session_id after the first code execution');
+  console.log('2. Automatically injected it into subsequent executions');
+  console.log('3. Accumulated file references across all executions');
+  console.log('\nCheck the session context output above to verify.\n');
+
+  // Generate title
   const { handleLLMEnd, collected } = createMetadataAggregator();
   const titleResult = await run.generateTitle({
     provider,
-    inputText: userMessage2,
+    inputText: 'Testing automatic session tracking for code execution',
     contentParts,
     chainOptions: {
-      callbacks: [
-        {
-          handleLLMEnd,
-        },
-      ],
+      callbacks: [{ handleLLMEnd }],
     },
   });
   console.log('Generated Title:', titleResult);
@@ -228,7 +274,7 @@ process.on('uncaughtException', (err) => {
   console.error('Uncaught Exception:', err);
 });
 
-testCodeExecution().catch((err) => {
+testAutomaticSessionTracking().catch((err) => {
   console.error(err);
   console.log('Conversation history:');
   console.dir(conversationHistory, { depth: null });

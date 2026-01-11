@@ -19,7 +19,7 @@ config();
 const imageMessage = 'Image is already displayed to the user';
 const otherMessage = 'File is already downloaded by the user';
 const accessMessage =
-  'Note: Files are READ-ONLY. Save changes to NEW filenames. To access these files in future executions, provide the `session_id` as a parameter (not in your code).';
+  'Note: Files are READ-ONLY. Save changes to NEW filenames. Files are automatically available in future executions.';
 const emptyOutputMessage =
   'stdout: Empty. Ensure you\'re writing output explicitly.\n';
 
@@ -67,12 +67,6 @@ Rules:
 - DO NOT define async def main() or call asyncio.run()
 - Tools are pre-defined—DO NOT write function definitions
 - Only print() output returns to the model`
-    ),
-  session_id: z
-    .string()
-    .optional()
-    .describe(
-      'Session ID for file access (same as regular code execution). Files load into /mnt/data/ and are READ-ONLY.'
     ),
   timeout: z
     .number()
@@ -542,7 +536,7 @@ export function formatCompletedResponse(
       }
     }
 
-    formatted += `\nsession_id: ${response.session_id}\n\n${accessMessage}`;
+    formatted += `\n\n${accessMessage}`;
   }
 
   return [
@@ -613,7 +607,7 @@ Rules:
 - Do NOT define \`async def main()\` or call \`asyncio.run()\`—just write code with await
 - Tools are pre-defined—DO NOT write function definitions
 - Only \`print()\` output returns; tool results are raw dicts/lists/strings
-- Use \`session_id\` param for file persistence across calls
+- Generated files are automatically available in /mnt/data/ for subsequent executions
 - Tool names normalized: hyphens→underscores, keywords get \`_tool\` suffix
 
 When to use: loops, conditionals, parallel (\`asyncio.gather\`), multi-step pipelines.
@@ -624,11 +618,15 @@ Example (complete pipeline):
 
   return tool<typeof ProgrammaticToolCallingSchema>(
     async (params, config) => {
-      const { code, session_id, timeout = DEFAULT_TIMEOUT } = params;
+      const { code, timeout = DEFAULT_TIMEOUT } = params;
 
       // Extra params injected by ToolNode (follows web_search pattern)
-      const { toolMap, toolDefs } = (config.toolCall ?? {}) as ToolCall &
-        Partial<t.ProgrammaticCache>;
+      const { toolMap, toolDefs, session_id, _injected_files } =
+        (config.toolCall ?? {}) as ToolCall &
+          Partial<t.ProgrammaticCache> & {
+            session_id?: string;
+            _injected_files?: t.CodeEnvFile[];
+          };
 
       if (toolMap == null || toolMap.size === 0) {
         throw new Error(
@@ -661,9 +659,15 @@ Example (complete pipeline):
           );
         }
 
-        // Fetch files from previous session if session_id is provided
+        /**
+         * File injection priority:
+         * 1. Use _injected_files from ToolNode (avoids /files endpoint race condition)
+         * 2. Fall back to fetching from /files endpoint if session_id provided but no injected files
+         */
         let files: t.CodeEnvFile[] | undefined;
-        if (session_id != null && session_id.length > 0) {
+        if (_injected_files && _injected_files.length > 0) {
+          files = _injected_files;
+        } else if (session_id != null && session_id.length > 0) {
           files = await fetchSessionFiles(baseUrl, apiKey, session_id, proxy);
         }
 
