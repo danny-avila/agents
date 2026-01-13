@@ -55,7 +55,9 @@ export type AnthropicReasoning = {
   thinkingBudget?: number;
 };
 export type OpenAIClientOptions = ChatOpenAIFields;
-export type AnthropicClientOptions = AnthropicInput;
+export type AnthropicClientOptions = AnthropicInput & {
+  promptCache?: boolean;
+};
 export type MistralAIClientOptions = ChatMistralAIInput;
 export type VertexAIClientOptions = ChatVertexAIInput & {
   includeThoughts?: boolean;

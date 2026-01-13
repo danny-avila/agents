@@ -423,11 +423,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       finalInstructions != null &&
       finalInstructions &&
       provider === Providers.ANTHROPIC &&
-      ((
-        (clientOptions as t.AnthropicClientOptions).clientOptions
-          ?.defaultHeaders as Record<string, string> | undefined
-      )?.['anthropic-beta']?.includes('prompt-caching') ??
-        false)
+      (clientOptions as t.AnthropicClientOptions).promptCache === true
     ) {
       finalInstructions = {
         content: [
@@ -743,14 +739,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         const anthropicOptions = agentContext.clientOptions as
           | t.AnthropicClientOptions
           | undefined;
-        const defaultHeaders = anthropicOptions?.clientOptions
-          ?.defaultHeaders as Record<string, string> | undefined;
-        const anthropicBeta = defaultHeaders?.['anthropic-beta'];
-
-        if (
-          typeof anthropicBeta === 'string' &&
-          anthropicBeta.includes('prompt-caching')
-        ) {
+        if (anthropicOptions?.promptCache === true) {
           finalMessages = addCacheControl<BaseMessage>(finalMessages);
         }
       } else if (agentContext.provider === Providers.BEDROCK) {

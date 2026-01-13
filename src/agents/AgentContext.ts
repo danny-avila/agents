@@ -398,14 +398,7 @@ export class AgentContext {
       const anthropicOptions = this.clientOptions as
         | t.AnthropicClientOptions
         | undefined;
-      const defaultHeaders = anthropicOptions?.clientOptions?.defaultHeaders as
-        | Record<string, string>
-        | undefined;
-      const anthropicBeta = defaultHeaders?.['anthropic-beta'];
-      if (
-        typeof anthropicBeta === 'string' &&
-        anthropicBeta.includes('prompt-caching')
-      ) {
+      if (anthropicOptions?.promptCache === true) {
         finalInstructions = {
           content: [
             {
