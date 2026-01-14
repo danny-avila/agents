@@ -74,6 +74,8 @@ export type FileRef = {
   id: string;
   name: string;
   path?: string;
+  /** Session ID this file belongs to (for multi-session file tracking) */
+  session_id?: string;
 };
 
 export type FileRefs = FileRef[];

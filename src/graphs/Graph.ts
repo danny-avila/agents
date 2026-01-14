@@ -1042,8 +1042,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
     /**
      * Extract and store code execution session context from artifacts.
-     * Only update session_id when files are generated - this ensures we don't
-     * lose the original session that contains the files.
+     * Each file is stamped with its source session_id to support multi-session file tracking.
+     * When the same filename appears in a later execution, the newer version replaces the old.
      */
     const toolName = output.name;
     if (
@@ -1060,17 +1060,35 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         artifact.session_id !== ''
       ) {
         /**
-         * Files were generated - update session with the new session_id.
-         * The new session_id is the one that contains these files.
+         * Stamp each new file with its source session_id.
+         * This enables files from different executions (parallel or sequential)
+         * to be tracked and passed to subsequent calls.
          */
+        const filesWithSession: t.FileRefs = newFiles.map((file) => ({
+          ...file,
+          session_id: artifact.session_id,
+        }));
+
         const existingSession = this.sessions.get(Constants.EXECUTE_CODE) as
           | t.CodeSessionContext
           | undefined;
         const existingFiles = existingSession?.files ?? [];
 
+        /**
+         * Merge files, preferring latest versions by name.
+         * If a file with the same name exists, replace it with the new version.
+         * This handles cases where files are edited/recreated in subsequent executions.
+         */
+        const newFileNames = new Set(filesWithSession.map((f) => f.name));
+        const filteredExisting = existingFiles.filter(
+          (f) => !newFileNames.has(f.name)
+        );
+
         this.sessions.set(Constants.EXECUTE_CODE, {
+          /** Keep latest session_id for reference/fallback */
           session_id: artifact.session_id,
-          files: [...existingFiles, ...newFiles],
+          /** Accumulated files with latest versions preferred */
+          files: [...filteredExisting, ...filesWithSession],
           lastUpdated: Date.now(),
         });
       }

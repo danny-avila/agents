@@ -145,9 +145,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
       /**
        * Inject session context for code execution tools when available.
+       * Each file uses its own session_id (supporting multi-session file tracking).
        * Both session_id and _injected_files are injected directly to invokeParams
        * (not inside args) so they bypass Zod schema validation and reach config.toolCall.
-       * This avoids /files endpoint race conditions.
        */
       if (
         call.name === Constants.EXECUTE_CODE ||
@@ -156,14 +156,18 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         const codeSession = this.sessions?.get(Constants.EXECUTE_CODE) as
           | t.CodeSessionContext
           | undefined;
-        if (codeSession?.session_id != null && codeSession.files.length > 0) {
-          /** Convert tracked files to CodeEnvFile format for the API */
+        if (codeSession?.files != null && codeSession.files.length > 0) {
+          /**
+           * Convert tracked files to CodeEnvFile format for the API.
+           * Each file uses its own session_id (set when file was created).
+           * This supports files from multiple parallel/sequential executions.
+           */
           const fileRefs: t.CodeEnvFile[] = codeSession.files.map((file) => ({
-            session_id: codeSession.session_id,
+            session_id: file.session_id ?? codeSession.session_id,
             id: file.id,
             name: file.name,
           }));
-          /** Inject session_id and files directly - bypasses Zod, reaches config.toolCall */
+          /** Inject latest session_id and files - bypasses Zod, reaches config.toolCall */
           invokeParams = {
             ...invokeParams,
             session_id: codeSession.session_id,
