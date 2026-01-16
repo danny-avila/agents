@@ -56,6 +56,7 @@
     "simple": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/simple.ts --provider 'bedrock' --name 'Jo' --location 'New York, NY'",
     "caching": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/caching.ts --name 'Jo' --location 'New York, NY'",
     "thinking": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/thinking.ts --name 'Jo' --location 'New York, NY'",
+    "thinking:bedrock": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/thinking-bedrock.ts --name 'Jo' --location 'New York, NY'",
     "memory": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/memory.ts --provider 'openAI' --name 'Jo' --location 'New York, NY'",
     "tool": "node --trace-warnings -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/tools.ts --provider 'bedrock' --name 'Jo' --location 'New York, NY'",
     "search": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/search.ts --provider 'bedrock' --name 'Jo' --location 'New York, NY'",

@@ -38,13 +38,13 @@ export function bedrockReasoningDeltaToLangchainPartialReasoningBlock(
       reasoningText: { text },
     };
   }
-  if (signature) {
+  if (signature != null) {
     return {
       type: 'reasoning_content',
       reasoningText: { signature },
     };
   }
-  if (redactedContent) {
+  if (redactedContent != null) {
     return {
       type: 'reasoning_content',
       redactedContent: Buffer.from(redactedContent).toString('base64'),
@@ -65,13 +65,13 @@ export function bedrockReasoningBlockToLangchainReasoningBlock(
       redactedContent?: Uint8Array;
     };
 
-  if (reasoningText) {
+  if (reasoningText != null) {
     return {
       type: 'reasoning_content',
       reasoningText: reasoningText,
     };
   }
-  if (redactedContent) {
+  if (redactedContent != null) {
     return {
       type: 'reasoning_content',
       redactedContent: Buffer.from(redactedContent).toString('base64'),
@@ -87,7 +87,7 @@ export function convertConverseMessageToLangChainMessage(
   message: BedrockMessage,
   responseMetadata: Omit<ConverseResponse, 'output'>
 ): AIMessage {
-  if (!message.content) {
+  if (message.content == null) {
     throw new Error('No message content found in response.');
   }
   if (message.role !== 'assistant') {
@@ -99,7 +99,7 @@ export function convertConverseMessageToLangChainMessage(
   let requestId: string | undefined;
   if (
     '$metadata' in responseMetadata &&
-    responseMetadata.$metadata &&
+    responseMetadata.$metadata != null &&
     typeof responseMetadata.$metadata === 'object' &&
     'requestId' in responseMetadata.$metadata
   ) {
@@ -109,7 +109,7 @@ export function convertConverseMessageToLangChainMessage(
   let tokenUsage:
     | { input_tokens: number; output_tokens: number; total_tokens: number }
     | undefined;
-  if (responseMetadata.usage) {
+  if (responseMetadata.usage != null) {
     const input_tokens = responseMetadata.usage.inputTokens ?? 0;
     const output_tokens = responseMetadata.usage.outputTokens ?? 0;
     tokenUsage = {
@@ -144,9 +144,10 @@ export function convertConverseMessageToLangChainMessage(
     message.content.forEach((c) => {
       if (
         'toolUse' in c &&
-        c.toolUse &&
-        c.toolUse.name &&
-        c.toolUse.input &&
+        c.toolUse != null &&
+        c.toolUse.name != null &&
+        c.toolUse.name !== '' &&
+        c.toolUse.input != null &&
         typeof c.toolUse.input === 'object'
       ) {
         toolCalls.push({
@@ -157,7 +158,7 @@ export function convertConverseMessageToLangChainMessage(
         });
       } else if ('text' in c && typeof c.text === 'string') {
         content.push({ type: 'text', text: c.text });
-      } else if ('reasoningContent' in c && c.reasoningContent) {
+      } else if ('reasoningContent' in c && c.reasoningContent != null) {
         content.push(
           bedrockReasoningBlockToLangchainReasoningBlock(c.reasoningContent)
         );
@@ -182,7 +183,7 @@ export function convertConverseMessageToLangChainMessage(
 export function handleConverseStreamContentBlockDelta(
   contentBlockDelta: ContentBlockDeltaEvent
 ): ChatGenerationChunk {
-  if (!contentBlockDelta.delta) {
+  if (contentBlockDelta.delta == null) {
     throw new Error('No delta found in content block.');
   }
 
@@ -196,7 +197,7 @@ export function handleConverseStreamContentBlockDelta(
         },
       }),
     });
-  } else if (contentBlockDelta.delta.toolUse) {
+  } else if (contentBlockDelta.delta.toolUse != null) {
     const index = contentBlockDelta.contentBlockIndex;
     return new ChatGenerationChunk({
       text: '',
@@ -214,15 +215,28 @@ export function handleConverseStreamContentBlockDelta(
         },
       }),
     });
-  } else if (contentBlockDelta.delta.reasoningContent) {
+  } else if (contentBlockDelta.delta.reasoningContent != null) {
+    const reasoningBlock =
+      bedrockReasoningDeltaToLangchainPartialReasoningBlock(
+        contentBlockDelta.delta.reasoningContent
+      );
+    // Extract the text for additional_kwargs.reasoning_content (for stream handler compatibility)
+    const reasoningText =
+      'reasoningText' in reasoningBlock
+        ? (reasoningBlock.reasoningText.text ??
+          reasoningBlock.reasoningText.signature ??
+          ('redactedContent' in reasoningBlock
+            ? reasoningBlock.redactedContent
+            : ''))
+        : '';
     return new ChatGenerationChunk({
       text: '',
       message: new AIMessageChunk({
-        content: [
-          bedrockReasoningDeltaToLangchainPartialReasoningBlock(
-            contentBlockDelta.delta.reasoningContent
-          ),
-        ],
+        content: [reasoningBlock],
+        additional_kwargs: {
+          // Set reasoning_content for stream handler to detect reasoning mode
+          reasoning_content: reasoningText,
+        },
         response_metadata: {
           contentBlockIndex: contentBlockDelta.contentBlockIndex,
         },
@@ -243,7 +257,7 @@ export function handleConverseStreamContentBlockStart(
 ): ChatGenerationChunk | null {
   const index = contentBlockStart.contentBlockIndex;
 
-  if (contentBlockStart.start?.toolUse) {
+  if (contentBlockStart.start?.toolUse != null) {
     return new ChatGenerationChunk({
       text: '',
       message: new AIMessageChunk({

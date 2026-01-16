@@ -21,17 +21,6 @@ import { ChatGenerationChunk, ChatResult } from '@langchain/core/outputs';
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { ChatBedrockConverseInput } from '@langchain/aws';
 import type { BaseMessage } from '@langchain/core/messages';
-import {
-  ConverseCommand,
-  ConverseStreamCommand,
-} from '@aws-sdk/client-bedrock-runtime';
-import {
-  convertToConverseMessages,
-  convertConverseMessageToLangChainMessage,
-  handleConverseStreamContentBlockStart,
-  handleConverseStreamContentBlockDelta,
-  handleConverseStreamMetadata,
-} from './utils';
 
 /**
  * Service tier type for Bedrock invocations.
@@ -119,7 +108,7 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
   } {
     const baseParams = super.invocationParams(options);
 
-    // Get serviceTier from options or fall back to class-level setting
+    /** Service tier from options or fall back to class-level setting */
     const serviceTierType = options?.serviceTier ?? this.serviceTier;
 
     return {
@@ -130,110 +119,67 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
 
   /**
    * Override _generateNonStreaming to use applicationInferenceProfile as modelId.
+   * Uses the same model-swapping pattern as streaming for consistency.
    */
   override async _generateNonStreaming(
     messages: BaseMessage[],
     options: this['ParsedCallOptions'] & CustomChatBedrockConverseCallOptions,
-    _runManager?: CallbackManagerForLLMRun
+    runManager?: CallbackManagerForLLMRun
   ): Promise<ChatResult> {
-    const { converseMessages, converseSystem } =
-      convertToConverseMessages(messages);
-    const params = this.invocationParams(options);
-
-    const command = new ConverseCommand({
-      modelId: this.getModelId(),
-      messages: converseMessages,
-      system: converseSystem,
-      requestMetadata: options.requestMetadata,
-      ...params,
-    });
-
-    const response = await this.client.send(command, {
-      abortSignal: options.signal,
-    });
-
-    const { output, ...responseMetadata } = response;
-    if (!output?.message) {
-      throw new Error('No message found in Bedrock response.');
+    // Temporarily swap model for applicationInferenceProfile support
+    const originalModel = this.model;
+    if (
+      this.applicationInferenceProfile != null &&
+      this.applicationInferenceProfile !== ''
+    ) {
+      this.model = this.applicationInferenceProfile;
     }
 
-    const message = convertConverseMessageToLangChainMessage(
-      output.message,
-      responseMetadata
-    );
-
-    return {
-      generations: [
-        {
-          text: typeof message.content === 'string' ? message.content : '',
-          message,
-        },
-      ],
-    };
+    try {
+      return await super._generateNonStreaming(messages, options, runManager);
+    } finally {
+      // Restore original model
+      this.model = originalModel;
+    }
   }
 
   /**
    * Override _streamResponseChunks to:
-   * 1. Use applicationInferenceProfile as modelId
-   * 2. Include serviceTier in request
-   * 3. Strip contentBlockIndex from response_metadata to prevent merge conflicts
+   * 1. Use applicationInferenceProfile as modelId (by temporarily swapping this.model)
+   * 2. Strip contentBlockIndex from response_metadata to prevent merge conflicts
+   *
+   * Note: We delegate to super._streamResponseChunks() to preserve @langchain/aws's
+   * internal chunk handling which correctly preserves array content for reasoning blocks.
    */
   override async *_streamResponseChunks(
     messages: BaseMessage[],
     options: this['ParsedCallOptions'] & CustomChatBedrockConverseCallOptions,
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
-    const { converseMessages, converseSystem } =
-      convertToConverseMessages(messages);
-    const params = this.invocationParams(options);
-
-    let { streamUsage } = this;
-    if (options.streamUsage !== undefined) {
-      streamUsage = options.streamUsage;
+    // Temporarily swap model for applicationInferenceProfile support
+    const originalModel = this.model;
+    if (
+      this.applicationInferenceProfile != null &&
+      this.applicationInferenceProfile !== ''
+    ) {
+      this.model = this.applicationInferenceProfile;
     }
 
-    const command = new ConverseStreamCommand({
-      modelId: this.getModelId(),
-      messages: converseMessages,
-      system: converseSystem,
-      requestMetadata: options.requestMetadata,
-      ...params,
-    });
+    try {
+      // Use parent's streaming logic which correctly handles reasoning content
+      const baseStream = super._streamResponseChunks(
+        messages,
+        options,
+        runManager
+      );
 
-    const response = await this.client.send(command, {
-      abortSignal: options.signal,
-    });
-
-    if (response.stream) {
-      for await (const event of response.stream) {
-        if (event.contentBlockStart != null) {
-          const chunk = handleConverseStreamContentBlockStart(
-            event.contentBlockStart
-          ) as ChatGenerationChunk | undefined;
-          if (chunk !== undefined) {
-            const cleanedChunk = this.cleanChunk(chunk);
-            yield cleanedChunk;
-            await runManager?.handleLLMNewToken(cleanedChunk.text || '');
-          }
-        } else if (event.contentBlockDelta != null) {
-          const chunk = handleConverseStreamContentBlockDelta(
-            event.contentBlockDelta
-          ) as ChatGenerationChunk | undefined;
-          if (chunk !== undefined) {
-            const cleanedChunk = this.cleanChunk(chunk);
-            yield cleanedChunk;
-            await runManager?.handleLLMNewToken(cleanedChunk.text || '');
-          }
-        } else if (event.metadata != null) {
-          const chunk = handleConverseStreamMetadata(event.metadata, {
-            streamUsage,
-          }) as ChatGenerationChunk | undefined;
-          if (chunk !== undefined) {
-            const cleanedChunk = this.cleanChunk(chunk);
-            yield cleanedChunk;
-          }
-        }
+      for await (const chunk of baseStream) {
+        // Clean contentBlockIndex from response_metadata to prevent merge conflicts
+        yield this.cleanChunk(chunk);
       }
+    } finally {
+      // Restore original model
+      this.model = originalModel;
     }
   }
 
