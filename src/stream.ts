@@ -339,7 +339,8 @@ hasToolCallChunks: ${hasToolCallChunks}
         (c) =>
           (c.type?.startsWith(ContentTypes.THINKING) ?? false) ||
           (c.type?.startsWith(ContentTypes.REASONING) ?? false) ||
-          (c.type?.startsWith(ContentTypes.REASONING_CONTENT) ?? false)
+          (c.type?.startsWith(ContentTypes.REASONING_CONTENT) ?? false) ||
+          c.type === 'redacted_thinking'
       )
     ) {
       await graph.dispatchReasoningDelta(stepId, {
@@ -365,7 +366,8 @@ hasToolCallChunks: ${hasToolCallChunks}
       Array.isArray(chunk.content) &&
       (chunk.content[0]?.type === ContentTypes.THINKING ||
         chunk.content[0]?.type === ContentTypes.REASONING ||
-        chunk.content[0]?.type === ContentTypes.REASONING_CONTENT)
+        chunk.content[0]?.type === ContentTypes.REASONING_CONTENT ||
+        chunk.content[0]?.type === 'redacted_thinking')
     ) {
       reasoning_content = 'valid';
     } else if (

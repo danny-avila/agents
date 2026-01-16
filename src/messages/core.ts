@@ -41,7 +41,7 @@ User: ${userMessage[1]}
 const _allowedTypes = ['image_url', 'text', 'tool_use', 'tool_result'];
 const allowedTypesByProvider: Record<string, string[]> = {
   default: _allowedTypes,
-  [Providers.ANTHROPIC]: [..._allowedTypes, 'thinking'],
+  [Providers.ANTHROPIC]: [..._allowedTypes, 'thinking', 'redacted_thinking'],
   [Providers.BEDROCK]: [..._allowedTypes, 'reasoning_content'],
   [Providers.OPENAI]: _allowedTypes,
 };
