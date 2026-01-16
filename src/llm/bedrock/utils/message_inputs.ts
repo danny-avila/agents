@@ -536,12 +536,15 @@ export function convertToConverseMessages(messages: BaseMessage[]): {
   const combinedConverseMessages = converseMessages.reduce<BedrockMessage[]>(
     (acc, curr) => {
       const lastMessage = acc[acc.length - 1];
+      if (lastMessage == null) {
+        acc.push(curr);
+        return acc;
+      }
       const lastHasToolResult =
         lastMessage.content?.some((c) => 'toolResult' in c) === true;
       const currHasToolResult =
         curr.content?.some((c) => 'toolResult' in c) === true;
       if (
-        lastMessage != null &&
         lastMessage.role === 'user' &&
         lastHasToolResult &&
         curr.role === 'user' &&
