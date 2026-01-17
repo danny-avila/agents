@@ -835,6 +835,221 @@ describe('Multi-agent provider interoperability', () => {
   });
 });
 
+describe('Immutability - addCacheControl does not mutate original messages', () => {
+  it('should not mutate original messages when adding cache control to string content', () => {
+    const originalMessages: TestMsg[] = [
+      { role: 'user', content: 'Hello' },
+      { role: 'assistant', content: 'Hi there' },
+      { role: 'user', content: 'How are you?' },
+    ];
+
+    const originalFirstContent = originalMessages[0].content;
+    const originalThirdContent = originalMessages[2].content;
+
+    const result = addCacheControl(originalMessages as never);
+
+    expect(originalMessages[0].content).toBe(originalFirstContent);
+    expect(originalMessages[2].content).toBe(originalThirdContent);
+    expect(typeof originalMessages[0].content).toBe('string');
+    expect(typeof originalMessages[2].content).toBe('string');
+
+    expect(Array.isArray(result[0].content)).toBe(true);
+    expect(Array.isArray(result[2].content)).toBe(true);
+  });
+
+  it('should not mutate original messages when adding cache control to array content', () => {
+    const originalMessages: TestMsg[] = [
+      {
+        role: 'user',
+        content: [{ type: ContentTypes.TEXT, text: 'Hello' }],
+      },
+      { role: 'assistant', content: 'Hi there' },
+      {
+        role: 'user',
+        content: [{ type: ContentTypes.TEXT, text: 'How are you?' }],
+      },
+    ];
+
+    const originalFirstBlock = {
+      ...(originalMessages[0].content as MessageContentComplex[])[0],
+    };
+    const originalThirdBlock = {
+      ...(originalMessages[2].content as MessageContentComplex[])[0],
+    };
+
+    const result = addCacheControl(originalMessages as never);
+
+    const firstContent = originalMessages[0].content as MessageContentComplex[];
+    const thirdContent = originalMessages[2].content as MessageContentComplex[];
+
+    expect('cache_control' in firstContent[0]).toBe(false);
+    expect('cache_control' in thirdContent[0]).toBe(false);
+    expect(firstContent[0]).toEqual(originalFirstBlock);
+    expect(thirdContent[0]).toEqual(originalThirdBlock);
+
+    const resultFirstContent = result[0].content as MessageContentComplex[];
+    const resultThirdContent = result[2].content as MessageContentComplex[];
+    expect('cache_control' in resultFirstContent[0]).toBe(true);
+    expect('cache_control' in resultThirdContent[0]).toBe(true);
+  });
+
+  it('should not mutate original messages when stripping existing cache control', () => {
+    const originalMessages: TestMsg[] = [
+      {
+        role: 'user',
+        content: [
+          {
+            type: ContentTypes.TEXT,
+            text: 'Hello',
+            cache_control: { type: 'ephemeral' },
+          } as MessageContentComplex,
+        ],
+      },
+      { role: 'assistant', content: 'Hi there' },
+      {
+        role: 'user',
+        content: [{ type: ContentTypes.TEXT, text: 'How are you?' }],
+      },
+    ];
+
+    const originalFirstBlock = (
+      originalMessages[0].content as MessageContentComplex[]
+    )[0];
+
+    addCacheControl(originalMessages as never);
+
+    expect('cache_control' in originalFirstBlock).toBe(true);
+  });
+});
+
+describe('Immutability - addBedrockCacheControl does not mutate original messages', () => {
+  it('should not mutate original messages when adding cache points to string content', () => {
+    const originalMessages: TestMsg[] = [
+      { role: 'user', content: 'Hello' },
+      { role: 'assistant', content: 'Hi there' },
+    ];
+
+    const originalFirstContent = originalMessages[0].content;
+    const originalSecondContent = originalMessages[1].content;
+
+    const result = addBedrockCacheControl(originalMessages);
+
+    expect(originalMessages[0].content).toBe(originalFirstContent);
+    expect(originalMessages[1].content).toBe(originalSecondContent);
+    expect(typeof originalMessages[0].content).toBe('string');
+    expect(typeof originalMessages[1].content).toBe('string');
+
+    expect(Array.isArray(result[0].content)).toBe(true);
+    expect(Array.isArray(result[1].content)).toBe(true);
+  });
+
+  it('should not mutate original messages when adding cache points to array content', () => {
+    const originalMessages: TestMsg[] = [
+      {
+        role: 'user',
+        content: [{ type: ContentTypes.TEXT, text: 'Hello' }],
+      },
+      {
+        role: 'assistant',
+        content: [{ type: ContentTypes.TEXT, text: 'Hi there' }],
+      },
+    ];
+
+    const originalFirstContentLength = (
+      originalMessages[0].content as MessageContentComplex[]
+    ).length;
+    const originalSecondContentLength = (
+      originalMessages[1].content as MessageContentComplex[]
+    ).length;
+
+    const result = addBedrockCacheControl(originalMessages);
+
+    const firstContent = originalMessages[0].content as MessageContentComplex[];
+    const secondContent = originalMessages[1]
+      .content as MessageContentComplex[];
+
+    expect(firstContent.length).toBe(originalFirstContentLength);
+    expect(secondContent.length).toBe(originalSecondContentLength);
+    expect(firstContent.some((b) => 'cachePoint' in b)).toBe(false);
+    expect(secondContent.some((b) => 'cachePoint' in b)).toBe(false);
+
+    const resultFirstContent = result[0].content as MessageContentComplex[];
+    const resultSecondContent = result[1].content as MessageContentComplex[];
+    expect(resultFirstContent.length).toBe(originalFirstContentLength + 1);
+    expect(resultSecondContent.length).toBe(originalSecondContentLength + 1);
+    expect(resultFirstContent.some((b) => 'cachePoint' in b)).toBe(true);
+    expect(resultSecondContent.some((b) => 'cachePoint' in b)).toBe(true);
+  });
+
+  it('should not mutate original messages when stripping existing cache control', () => {
+    const originalMessages: TestMsg[] = [
+      {
+        role: 'user',
+        content: [
+          {
+            type: ContentTypes.TEXT,
+            text: 'Hello',
+            cache_control: { type: 'ephemeral' },
+          } as MessageContentComplex,
+        ],
+      },
+      {
+        role: 'assistant',
+        content: [
+          { type: ContentTypes.TEXT, text: 'Hi there' },
+          { cachePoint: { type: 'default' } },
+        ],
+      },
+    ];
+
+    const originalFirstBlock = (
+      originalMessages[0].content as MessageContentComplex[]
+    )[0];
+    const originalSecondContentLength = (
+      originalMessages[1].content as MessageContentComplex[]
+    ).length;
+
+    addBedrockCacheControl(originalMessages);
+
+    expect('cache_control' in originalFirstBlock).toBe(true);
+    expect(
+      (originalMessages[1].content as MessageContentComplex[]).length
+    ).toBe(originalSecondContentLength);
+  });
+
+  it('should allow different providers to process same messages without cross-contamination', () => {
+    const sharedMessages: TestMsg[] = [
+      {
+        role: 'user',
+        content: [{ type: ContentTypes.TEXT, text: 'Shared message 1' }],
+      },
+      {
+        role: 'assistant',
+        content: [{ type: ContentTypes.TEXT, text: 'Shared response 1' }],
+      },
+    ];
+
+    const bedrockResult = addBedrockCacheControl(sharedMessages);
+
+    const anthropicResult = addCacheControl(sharedMessages as never);
+
+    const originalFirstContent = sharedMessages[0]
+      .content as MessageContentComplex[];
+    expect(originalFirstContent.some((b) => 'cachePoint' in b)).toBe(false);
+    expect('cache_control' in originalFirstContent[0]).toBe(false);
+
+    const bedrockFirstContent = bedrockResult[0]
+      .content as MessageContentComplex[];
+    expect(bedrockFirstContent.some((b) => 'cachePoint' in b)).toBe(true);
+    expect('cache_control' in bedrockFirstContent[0]).toBe(false);
+
+    const anthropicFirstContent = anthropicResult[0]
+      .content as MessageContentComplex[];
+    expect(anthropicFirstContent.some((b) => 'cachePoint' in b)).toBe(false);
+    expect('cache_control' in anthropicFirstContent[0]).toBe(true);
+  });
+});
+
 describe('Multi-turn cache cleanup', () => {
   it('strips stale Bedrock cache points from previous turns before applying new ones', () => {
     const messages: TestMsg[] = [
