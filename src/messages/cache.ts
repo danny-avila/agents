@@ -1,4 +1,11 @@
-import { BaseMessage, MessageContentComplex } from '@langchain/core/messages';
+import {
+  BaseMessage,
+  MessageContentComplex,
+  AIMessage,
+  HumanMessage,
+  SystemMessage,
+  ToolMessage,
+} from '@langchain/core/messages';
 import type { AnthropicMessage } from '@/types/messages';
 import type Anthropic from '@anthropic-ai/sdk';
 import { ContentTypes } from '@/common/enum';
@@ -9,7 +16,6 @@ type MessageWithContent = {
 
 /**
  * Deep clones a message's content to prevent mutation of the original.
- * Handles both string and array content types.
  */
 function deepCloneContent<T extends string | MessageContentComplex[]>(
   content: T
@@ -24,41 +30,74 @@ function deepCloneContent<T extends string | MessageContentComplex[]>(
 }
 
 /**
- * Creates a shallow clone of a message with deep-cloned content.
- * This ensures modifications to content don't affect the original message.
+ * Simple shallow clone with deep-cloned content.
+ * Used for stripping cache control where we don't need proper LangChain instances.
  */
-function cloneMessageWithContent<T extends MessageWithContent>(message: T): T {
-  if (message.content === undefined) {
-    return { ...message };
-  }
-
-  const clonedContent = deepCloneContent(message.content);
-  const cloned = {
+function shallowCloneMessage<T extends MessageWithContent>(message: T): T {
+  return {
     ...message,
-    content: clonedContent,
-  };
-
-  /**
-   * LangChain messages store internal state in lc_kwargs.
-   * Clone it but don't sync content yet - that happens after all modifications.
-   */
-  const lcKwargs = (message as Record<string, unknown>).lc_kwargs;
-  if (lcKwargs != null && typeof lcKwargs === 'object') {
-    (cloned as Record<string, unknown>).lc_kwargs = { ...lcKwargs };
-  }
-
-  return cloned;
+    content: deepCloneContent(message.content ?? ''),
+  } as T;
 }
 
 /**
- * Syncs lc_kwargs.content with the message's content property.
- * Call this after all modifications to ensure LangChain serialization works correctly.
+ * Creates a new LangChain message instance with the given content.
+ * Required when adding cache points to ensure proper serialization.
  */
-function syncLcKwargsContent<T extends MessageWithContent>(message: T): void {
-  const lcKwargs = (message as Record<string, unknown>).lc_kwargs;
-  if (lcKwargs != null && typeof lcKwargs === 'object') {
-    (lcKwargs as Record<string, unknown>).content = message.content;
+function createNewMessage<T extends MessageWithContent>(
+  message: T,
+  content: MessageContentComplex[]
+): T {
+  if ('getType' in message && typeof message.getType === 'function') {
+    const baseMsg = message as unknown as BaseMessage;
+    const msgType = baseMsg.getType();
+
+    const baseFields = {
+      content,
+      name: baseMsg.name,
+      additional_kwargs: { ...baseMsg.additional_kwargs },
+      response_metadata: { ...baseMsg.response_metadata },
+      id: baseMsg.id,
+    };
+
+    switch (msgType) {
+    case 'human':
+      return new HumanMessage(baseFields) as unknown as T;
+    case 'ai': {
+      const aiMsg = baseMsg as AIMessage;
+      return new AIMessage({
+        ...baseFields,
+        tool_calls: aiMsg.tool_calls ? [...aiMsg.tool_calls] : [],
+        invalid_tool_calls: aiMsg.invalid_tool_calls
+          ? [...aiMsg.invalid_tool_calls]
+          : [],
+        usage_metadata: aiMsg.usage_metadata,
+      }) as unknown as T;
+    }
+    case 'system':
+      return new SystemMessage(baseFields) as unknown as T;
+    case 'tool': {
+      const toolMsg = baseMsg as ToolMessage;
+      return new ToolMessage({
+        ...baseFields,
+        tool_call_id: toolMsg.tool_call_id,
+        status: toolMsg.status,
+        artifact: toolMsg.artifact,
+      }) as unknown as T;
+    }
+    default:
+      break;
+    }
   }
+
+  const cloned = { ...message, content } as T;
+  const lcKwargs = (cloned as Record<string, unknown>).lc_kwargs as
+    | Record<string, unknown>
+    | undefined;
+  if (lcKwargs != null) {
+    (cloned as Record<string, unknown>).lc_kwargs = { ...lcKwargs, content };
+  }
+  return cloned;
 }
 
 /**
@@ -112,7 +151,7 @@ export function addCacheControl<T extends AnthropicMessage | BaseMessage>(
       continue;
     }
 
-    const message = cloneMessageWithContent(
+    const message = shallowCloneMessage(
       originalMessage as MessageWithContent
     ) as T;
     updatedMessages[i] = message;
@@ -138,7 +177,6 @@ export function addCacheControl<T extends AnthropicMessage | BaseMessage>(
     }
 
     if (userMessagesModified >= 2 || !isUserMessage) {
-      syncLcKwargsContent(message);
       continue;
     }
 
@@ -163,8 +201,6 @@ export function addCacheControl<T extends AnthropicMessage | BaseMessage>(
         }
       }
     }
-
-    syncLcKwargsContent(message);
   }
 
   return updatedMessages;
@@ -209,7 +245,7 @@ export function stripAnthropicCacheControl<T extends MessageWithContent>(
       continue;
     }
 
-    const message = cloneMessageWithContent(originalMessage);
+    const message = shallowCloneMessage(originalMessage);
     updatedMessages[i] = message;
 
     for (
@@ -262,7 +298,7 @@ export function stripBedrockCacheControl<T extends MessageWithContent>(
       continue;
     }
 
-    const message = cloneMessageWithContent(originalMessage);
+    const message = shallowCloneMessage(originalMessage);
     updatedMessages[i] = message;
 
     message.content = (message.content as MessageContentComplex[]).filter(
@@ -317,85 +353,75 @@ export function addBedrockCacheControl<
       continue;
     }
 
-    const message = cloneMessageWithContent(originalMessage);
-    updatedMessages[i] = message;
+    let workingContent: MessageContentComplex[];
 
     if (hasArrayContent) {
-      message.content = (message.content as MessageContentComplex[]).filter(
-        (block) => !isCachePoint(block)
-      ) as typeof content;
+      workingContent = deepCloneContent(
+        content as MessageContentComplex[]
+      ).filter((block) => !isCachePoint(block));
 
-      for (
-        let j = 0;
-        j < (message.content as MessageContentComplex[]).length;
-        j++
-      ) {
-        const block = (message.content as MessageContentComplex[])[j] as Record<
-          string,
-          unknown
-        >;
+      for (let j = 0; j < workingContent.length; j++) {
+        const block = workingContent[j] as Record<string, unknown>;
         if ('cache_control' in block) {
           delete block.cache_control;
         }
       }
+    } else if (typeof content === 'string') {
+      workingContent = [{ type: ContentTypes.TEXT, text: content }];
+    } else {
+      workingContent = [];
     }
 
     if (messagesModified >= 2 || isToolMessage || isEmptyString) {
-      syncLcKwargsContent(message);
+      updatedMessages[i] = shallowCloneMessage(originalMessage);
+      (updatedMessages[i] as MessageWithContent).content = workingContent;
       continue;
     }
 
-    if (typeof message.content === 'string') {
-      message.content = [
-        { type: ContentTypes.TEXT, text: message.content },
-        { cachePoint: { type: 'default' } },
-      ] as MessageContentComplex[];
-      messagesModified++;
-      syncLcKwargsContent(message);
+    if (workingContent.length === 0) {
       continue;
     }
 
-    if (Array.isArray(message.content)) {
-      let hasCacheableContent = false;
-      for (const block of message.content) {
-        if (block.type === ContentTypes.TEXT) {
-          if (typeof block.text === 'string' && block.text !== '') {
-            hasCacheableContent = true;
-            break;
-          }
-        }
-      }
-
-      if (!hasCacheableContent) {
-        syncLcKwargsContent(message);
-        continue;
-      }
-
-      let inserted = false;
-      for (let j = message.content.length - 1; j >= 0; j--) {
-        const block = message.content[j] as MessageContentComplex;
-        const type = (block as { type?: string }).type;
-        if (type === ContentTypes.TEXT || type === 'text') {
-          const text = (block as { text?: string }).text;
-          if (text === '' || text === undefined) {
-            continue;
-          }
-          message.content.splice(j + 1, 0, {
-            cachePoint: { type: 'default' },
-          } as MessageContentComplex);
-          inserted = true;
+    let hasCacheableContent = false;
+    for (const block of workingContent) {
+      if (block.type === ContentTypes.TEXT) {
+        if (typeof block.text === 'string' && block.text !== '') {
+          hasCacheableContent = true;
           break;
         }
       }
-      if (!inserted) {
-        message.content.push({
-          cachePoint: { type: 'default' },
-        } as MessageContentComplex);
-      }
-      messagesModified++;
     }
 
-    syncLcKwargsContent(message);
+    if (!hasCacheableContent) {
+      updatedMessages[i] = shallowCloneMessage(originalMessage);
+      (updatedMessages[i] as MessageWithContent).content = workingContent;
+      continue;
+    }
+
+    let inserted = false;
+    for (let j = workingContent.length - 1; j >= 0; j--) {
+      const block = workingContent[j] as MessageContentComplex;
+      const type = (block as { type?: string }).type;
+      if (type === ContentTypes.TEXT || type === 'text') {
+        const text = (block as { text?: string }).text;
+        if (text === '' || text === undefined) {
+          continue;
+        }
+        workingContent.splice(j + 1, 0, {
+          cachePoint: { type: 'default' },
+        } as MessageContentComplex);
+        inserted = true;
+        break;
+      }
+    }
+    if (!inserted) {
+      workingContent.push({
+        cachePoint: { type: 'default' },
+      } as MessageContentComplex);
+    }
+
+    updatedMessages[i] = createNewMessage(originalMessage, workingContent);
+    messagesModified++;
   }
 
   return updatedMessages;
