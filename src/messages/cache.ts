@@ -26,15 +26,33 @@ function deepCloneContent<T extends string | MessageContentComplex[]>(
 /**
  * Creates a shallow clone of a message with deep-cloned content.
  * This ensures modifications to content don't affect the original message.
+ * Also handles LangChain's internal lc_kwargs to maintain consistency.
  */
 function cloneMessageWithContent<T extends MessageWithContent>(message: T): T {
   if (message.content === undefined) {
     return { ...message };
   }
-  return {
+
+  const clonedContent = deepCloneContent(message.content);
+  const cloned = {
     ...message,
-    content: deepCloneContent(message.content),
+    content: clonedContent,
   };
+
+  /**
+   * LangChain messages store internal state in lc_kwargs.
+   * We need to update it to match the cloned content to avoid
+   * serialization inconsistencies.
+   */
+  const lcKwargs = (message as Record<string, unknown>).lc_kwargs;
+  if (lcKwargs != null && typeof lcKwargs === 'object') {
+    (cloned as Record<string, unknown>).lc_kwargs = {
+      ...lcKwargs,
+      content: clonedContent,
+    };
+  }
+
+  return cloned;
 }
 
 /**
