@@ -31,10 +31,34 @@ function cloneMessageWithContent<T extends MessageWithContent>(message: T): T {
   if (message.content === undefined) {
     return { ...message };
   }
-  return {
+
+  const clonedContent = deepCloneContent(message.content);
+  const cloned = {
     ...message,
-    content: deepCloneContent(message.content),
+    content: clonedContent,
   };
+
+  /**
+   * LangChain messages store internal state in lc_kwargs.
+   * Clone it but don't sync content yet - that happens after all modifications.
+   */
+  const lcKwargs = (message as Record<string, unknown>).lc_kwargs;
+  if (lcKwargs != null && typeof lcKwargs === 'object') {
+    (cloned as Record<string, unknown>).lc_kwargs = { ...lcKwargs };
+  }
+
+  return cloned;
+}
+
+/**
+ * Syncs lc_kwargs.content with the message's content property.
+ * Call this after all modifications to ensure LangChain serialization works correctly.
+ */
+function syncLcKwargsContent<T extends MessageWithContent>(message: T): void {
+  const lcKwargs = (message as Record<string, unknown>).lc_kwargs;
+  if (lcKwargs != null && typeof lcKwargs === 'object') {
+    (lcKwargs as Record<string, unknown>).content = message.content;
+  }
 }
 
 /**
@@ -114,6 +138,7 @@ export function addCacheControl<T extends AnthropicMessage | BaseMessage>(
     }
 
     if (userMessagesModified >= 2 || !isUserMessage) {
+      syncLcKwargsContent(message);
       continue;
     }
 
@@ -138,6 +163,8 @@ export function addCacheControl<T extends AnthropicMessage | BaseMessage>(
         }
       }
     }
+
+    syncLcKwargsContent(message);
   }
 
   return updatedMessages;
@@ -314,6 +341,7 @@ export function addBedrockCacheControl<
     }
 
     if (messagesModified >= 2 || isToolMessage || isEmptyString) {
+      syncLcKwargsContent(message);
       continue;
     }
 
@@ -323,6 +351,7 @@ export function addBedrockCacheControl<
         { cachePoint: { type: 'default' } },
       ] as MessageContentComplex[];
       messagesModified++;
+      syncLcKwargsContent(message);
       continue;
     }
 
@@ -338,6 +367,7 @@ export function addBedrockCacheControl<
       }
 
       if (!hasCacheableContent) {
+        syncLcKwargsContent(message);
         continue;
       }
 
@@ -364,6 +394,8 @@ export function addBedrockCacheControl<
       }
       messagesModified++;
     }
+
+    syncLcKwargsContent(message);
   }
 
   return updatedMessages;

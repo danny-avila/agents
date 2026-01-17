@@ -1048,6 +1048,50 @@ describe('Immutability - addBedrockCacheControl does not mutate original message
     expect(anthropicFirstContent.some((b) => 'cachePoint' in b)).toBe(false);
     expect('cache_control' in anthropicFirstContent[0]).toBe(true);
   });
+
+  it('should keep lc_kwargs.content in sync with content for LangChain messages', () => {
+    type LangChainLikeMsg = TestMsg & {
+      lc_kwargs?: { content?: MessageContentComplex[] };
+    };
+
+    const messagesWithLcKwargs: LangChainLikeMsg[] = [
+      {
+        role: 'user',
+        content: [{ type: ContentTypes.TEXT, text: 'User message' }],
+        lc_kwargs: {
+          content: [{ type: ContentTypes.TEXT, text: 'User message' }],
+        },
+      },
+      {
+        role: 'assistant',
+        content: [{ type: ContentTypes.TEXT, text: 'Assistant response' }],
+        lc_kwargs: {
+          content: [{ type: ContentTypes.TEXT, text: 'Assistant response' }],
+        },
+      },
+    ];
+
+    const bedrockResult = addBedrockCacheControl(messagesWithLcKwargs);
+
+    const resultFirst = bedrockResult[0] as LangChainLikeMsg;
+    const resultSecond = bedrockResult[1] as LangChainLikeMsg;
+
+    expect(resultFirst.content).toEqual(resultFirst.lc_kwargs?.content);
+    expect(resultSecond.content).toEqual(resultSecond.lc_kwargs?.content);
+
+    const firstContent = resultFirst.content as MessageContentComplex[];
+    const firstLcContent = resultFirst.lc_kwargs
+      ?.content as MessageContentComplex[];
+    expect(firstContent.some((b) => 'cachePoint' in b)).toBe(true);
+    expect(firstLcContent.some((b) => 'cachePoint' in b)).toBe(true);
+
+    const originalFirst = messagesWithLcKwargs[0];
+    const originalContent = originalFirst.content as MessageContentComplex[];
+    const originalLcContent = originalFirst.lc_kwargs
+      ?.content as MessageContentComplex[];
+    expect(originalContent.some((b) => 'cachePoint' in b)).toBe(false);
+    expect(originalLcContent.some((b) => 'cachePoint' in b)).toBe(false);
+  });
 });
 
 describe('Multi-turn cache cleanup', () => {
