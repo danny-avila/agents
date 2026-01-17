@@ -24,8 +24,8 @@ function deepCloneContent<T extends string | MessageContentComplex[]>(
 }
 
 /**
- * Creates a shallow clone of a message with deep-cloned content.
- * This ensures modifications to content don't affect the original message.
+ * Clones a message with deep-cloned content.
+ * For LangChain messages, also syncs lc_kwargs.content.
  */
 function cloneMessageWithContent<T extends MessageWithContent>(message: T): T {
   if (message.content === undefined) {
@@ -36,28 +36,31 @@ function cloneMessageWithContent<T extends MessageWithContent>(message: T): T {
   const cloned = {
     ...message,
     content: clonedContent,
-  };
+  } as T;
 
-  /**
-   * LangChain messages store internal state in lc_kwargs.
-   * Clone it but don't sync content yet - that happens after all modifications.
-   */
-  const lcKwargs = (message as Record<string, unknown>).lc_kwargs;
-  if (lcKwargs != null && typeof lcKwargs === 'object') {
-    (cloned as Record<string, unknown>).lc_kwargs = { ...lcKwargs };
+  const lcKwargs = (cloned as Record<string, unknown>).lc_kwargs as
+    | Record<string, unknown>
+    | undefined;
+  if (lcKwargs != null) {
+    (cloned as Record<string, unknown>).lc_kwargs = {
+      ...lcKwargs,
+      content: clonedContent,
+    };
   }
 
   return cloned;
 }
 
 /**
- * Syncs lc_kwargs.content with the message's content property.
- * Call this after all modifications to ensure LangChain serialization works correctly.
+ * Syncs lc_kwargs.content with message.content after modifications.
+ * Call this after all content modifications are done.
  */
-function syncLcKwargsContent<T extends MessageWithContent>(message: T): void {
-  const lcKwargs = (message as Record<string, unknown>).lc_kwargs;
-  if (lcKwargs != null && typeof lcKwargs === 'object') {
-    (lcKwargs as Record<string, unknown>).content = message.content;
+function syncLcKwargs<T extends MessageWithContent>(message: T): void {
+  const lcKwargs = (message as Record<string, unknown>).lc_kwargs as
+    | Record<string, unknown>
+    | undefined;
+  if (lcKwargs != null) {
+    lcKwargs.content = message.content;
   }
 }
 
@@ -138,7 +141,7 @@ export function addCacheControl<T extends AnthropicMessage | BaseMessage>(
     }
 
     if (userMessagesModified >= 2 || !isUserMessage) {
-      syncLcKwargsContent(message);
+      syncLcKwargs(message);
       continue;
     }
 
@@ -164,7 +167,7 @@ export function addCacheControl<T extends AnthropicMessage | BaseMessage>(
       }
     }
 
-    syncLcKwargsContent(message);
+    syncLcKwargs(message);
   }
 
   return updatedMessages;
@@ -341,7 +344,7 @@ export function addBedrockCacheControl<
     }
 
     if (messagesModified >= 2 || isToolMessage || isEmptyString) {
-      syncLcKwargsContent(message);
+      syncLcKwargs(message);
       continue;
     }
 
@@ -351,7 +354,7 @@ export function addBedrockCacheControl<
         { cachePoint: { type: 'default' } },
       ] as MessageContentComplex[];
       messagesModified++;
-      syncLcKwargsContent(message);
+      syncLcKwargs(message);
       continue;
     }
 
@@ -367,7 +370,7 @@ export function addBedrockCacheControl<
       }
 
       if (!hasCacheableContent) {
-        syncLcKwargsContent(message);
+        syncLcKwargs(message);
         continue;
       }
 
@@ -395,7 +398,7 @@ export function addBedrockCacheControl<
       messagesModified++;
     }
 
-    syncLcKwargsContent(message);
+    syncLcKwargs(message);
   }
 
   return updatedMessages;
