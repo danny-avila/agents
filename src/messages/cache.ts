@@ -1,11 +1,4 @@
-import {
-  BaseMessage,
-  MessageContentComplex,
-  AIMessage,
-  HumanMessage,
-  SystemMessage,
-  ToolMessage,
-} from '@langchain/core/messages';
+import { BaseMessage, MessageContentComplex } from '@langchain/core/messages';
 import type { AnthropicMessage } from '@/types/messages';
 import type Anthropic from '@anthropic-ai/sdk';
 import { ContentTypes } from '@/common/enum';
@@ -30,73 +23,42 @@ function deepCloneContent<T extends string | MessageContentComplex[]>(
 }
 
 /**
- * Simple shallow clone with deep-cloned content.
- * Used for stripping cache control where we don't need proper LangChain instances.
+ * Clones a message with deep-cloned content, explicitly excluding LangChain
+ * serialization metadata to prevent coercion issues.
  */
-function shallowCloneMessage<T extends MessageWithContent>(message: T): T {
-  return {
-    ...message,
-    content: deepCloneContent(message.content ?? ''),
-  } as T;
-}
-
-/**
- * Creates a new LangChain message instance with the given content.
- * Required when adding cache points to ensure proper serialization.
- */
-function createNewMessage<T extends MessageWithContent>(
+function cloneMessage<T extends MessageWithContent>(
   message: T,
-  content: MessageContentComplex[]
+  content: string | MessageContentComplex[]
 ): T {
-  if ('getType' in message && typeof message.getType === 'function') {
-    const baseMsg = message as unknown as BaseMessage;
-    const msgType = baseMsg.getType();
+  const {
+    lc_kwargs: _lc_kwargs,
+    lc_serializable: _lc_serializable,
+    lc_namespace: _lc_namespace,
+    ...rest
+  } = message as T & {
+    lc_kwargs?: unknown;
+    lc_serializable?: unknown;
+    lc_namespace?: unknown;
+  };
 
-    const baseFields = {
-      content,
-      name: baseMsg.name,
-      additional_kwargs: { ...baseMsg.additional_kwargs },
-      response_metadata: { ...baseMsg.response_metadata },
-      id: baseMsg.id,
+  const cloned = { ...rest, content } as T;
+
+  // LangChain messages don't have a direct 'role' property - derive it from getType()
+  if (
+    'getType' in message &&
+    typeof message.getType === 'function' &&
+    !('role' in cloned)
+  ) {
+    const msgType = (message as unknown as BaseMessage).getType();
+    const roleMap: Record<string, string> = {
+      human: 'user',
+      ai: 'assistant',
+      system: 'system',
+      tool: 'tool',
     };
-
-    switch (msgType) {
-    case 'human':
-      return new HumanMessage(baseFields) as unknown as T;
-    case 'ai': {
-      const aiMsg = baseMsg as AIMessage;
-      return new AIMessage({
-        ...baseFields,
-        tool_calls: aiMsg.tool_calls ? [...aiMsg.tool_calls] : [],
-        invalid_tool_calls: aiMsg.invalid_tool_calls
-          ? [...aiMsg.invalid_tool_calls]
-          : [],
-        usage_metadata: aiMsg.usage_metadata,
-      }) as unknown as T;
-    }
-    case 'system':
-      return new SystemMessage(baseFields) as unknown as T;
-    case 'tool': {
-      const toolMsg = baseMsg as ToolMessage;
-      return new ToolMessage({
-        ...baseFields,
-        tool_call_id: toolMsg.tool_call_id,
-        status: toolMsg.status,
-        artifact: toolMsg.artifact,
-      }) as unknown as T;
-    }
-    default:
-      break;
-    }
+    (cloned as Record<string, unknown>).role = roleMap[msgType] || msgType;
   }
 
-  const cloned = { ...message, content } as T;
-  const lcKwargs = (cloned as Record<string, unknown>).lc_kwargs as
-    | Record<string, unknown>
-    | undefined;
-  if (lcKwargs != null) {
-    (cloned as Record<string, unknown>).lc_kwargs = { ...lcKwargs, content };
-  }
   return cloned;
 }
 
@@ -174,37 +136,28 @@ export function addCacheControl<T extends AnthropicMessage | BaseMessage>(
     }
 
     if (userMessagesModified >= 2 || !isUserMessage) {
-      updatedMessages[i] = shallowCloneMessage(
-        originalMessage as MessageWithContent
+      updatedMessages[i] = cloneMessage(
+        originalMessage as MessageWithContent,
+        workingContent
       ) as T;
-      (updatedMessages[i] as MessageWithContent).content = workingContent;
       continue;
     }
 
-    let cacheAdded = false;
     for (let j = workingContent.length - 1; j >= 0; j--) {
       const contentPart = workingContent[j];
       if ('type' in contentPart && contentPart.type === 'text') {
         (contentPart as Anthropic.TextBlockParam).cache_control = {
           type: 'ephemeral',
         };
-        cacheAdded = true;
         userMessagesModified++;
         break;
       }
     }
 
-    if (cacheAdded) {
-      updatedMessages[i] = createNewMessage(
-        originalMessage as MessageWithContent,
-        workingContent
-      ) as T;
-    } else {
-      updatedMessages[i] = shallowCloneMessage(
-        originalMessage as MessageWithContent
-      ) as T;
-      (updatedMessages[i] as MessageWithContent).content = workingContent;
-    }
+    updatedMessages[i] = cloneMessage(
+      originalMessage as MessageWithContent,
+      workingContent
+    ) as T;
   }
 
   return updatedMessages;
@@ -249,22 +202,14 @@ export function stripAnthropicCacheControl<T extends MessageWithContent>(
       continue;
     }
 
-    const message = shallowCloneMessage(originalMessage);
-    updatedMessages[i] = message;
-
-    for (
-      let j = 0;
-      j < (message.content as MessageContentComplex[]).length;
-      j++
-    ) {
-      const block = (message.content as MessageContentComplex[])[j] as Record<
-        string,
-        unknown
-      >;
+    const clonedContent = deepCloneContent(content);
+    for (let j = 0; j < clonedContent.length; j++) {
+      const block = clonedContent[j] as Record<string, unknown>;
       if ('cache_control' in block) {
         delete block.cache_control;
       }
     }
+    updatedMessages[i] = cloneMessage(originalMessage, clonedContent);
   }
 
   return updatedMessages;
@@ -302,12 +247,10 @@ export function stripBedrockCacheControl<T extends MessageWithContent>(
       continue;
     }
 
-    const message = shallowCloneMessage(originalMessage);
-    updatedMessages[i] = message;
-
-    message.content = (message.content as MessageContentComplex[]).filter(
+    const clonedContent = deepCloneContent(content).filter(
       (block) => !isCachePoint(block as MessageContentComplex)
-    ) as typeof content;
+    );
+    updatedMessages[i] = cloneMessage(originalMessage, clonedContent);
   }
 
   return updatedMessages;
@@ -377,8 +320,7 @@ export function addBedrockCacheControl<
     }
 
     if (messagesModified >= 2 || isToolMessage || isEmptyString) {
-      updatedMessages[i] = shallowCloneMessage(originalMessage);
-      (updatedMessages[i] as MessageWithContent).content = workingContent;
+      updatedMessages[i] = cloneMessage(originalMessage, workingContent);
       continue;
     }
 
@@ -397,8 +339,7 @@ export function addBedrockCacheControl<
     }
 
     if (!hasCacheableContent) {
-      updatedMessages[i] = shallowCloneMessage(originalMessage);
-      (updatedMessages[i] as MessageWithContent).content = workingContent;
+      updatedMessages[i] = cloneMessage(originalMessage, workingContent);
       continue;
     }
 
@@ -424,7 +365,7 @@ export function addBedrockCacheControl<
       } as MessageContentComplex);
     }
 
-    updatedMessages[i] = createNewMessage(originalMessage, workingContent);
+    updatedMessages[i] = cloneMessage(originalMessage, workingContent);
     messagesModified++;
   }
 

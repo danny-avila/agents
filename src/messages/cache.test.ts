@@ -921,7 +921,7 @@ describe('Immutability - addCacheControl does not mutate original messages', () 
     expect('cache_control' in originalFirstBlock).toBe(true);
   });
 
-  it('should keep lc_kwargs.content in sync with content for LangChain messages', () => {
+  it('should remove lc_kwargs to prevent serialization mismatch for LangChain messages', () => {
     type LangChainLikeMsg = TestMsg & {
       lc_kwargs?: { content?: MessageContentComplex[] };
     };
@@ -955,14 +955,11 @@ describe('Immutability - addCacheControl does not mutate original messages', () 
     const resultFirst = result[0] as LangChainLikeMsg;
     const resultThird = result[2] as LangChainLikeMsg;
 
-    expect(resultFirst.content).toEqual(resultFirst.lc_kwargs?.content);
-    expect(resultThird.content).toEqual(resultThird.lc_kwargs?.content);
+    expect(resultFirst.lc_kwargs).toBeUndefined();
+    expect(resultThird.lc_kwargs).toBeUndefined();
 
     const firstContent = resultFirst.content as MessageContentComplex[];
-    const firstLcContent = resultFirst.lc_kwargs
-      ?.content as MessageContentComplex[];
     expect('cache_control' in firstContent[0]).toBe(true);
-    expect('cache_control' in firstLcContent[0]).toBe(true);
 
     const originalFirst = messagesWithLcKwargs[0];
     const originalContent = originalFirst.content as MessageContentComplex[];
@@ -1100,7 +1097,7 @@ describe('Immutability - addBedrockCacheControl does not mutate original message
     expect('cache_control' in anthropicFirstContent[0]).toBe(true);
   });
 
-  it('should keep lc_kwargs.content in sync with content for LangChain messages', () => {
+  it('should remove lc_kwargs to prevent serialization mismatch for LangChain messages', () => {
     type LangChainLikeMsg = TestMsg & {
       lc_kwargs?: { content?: MessageContentComplex[] };
     };
@@ -1127,14 +1124,11 @@ describe('Immutability - addBedrockCacheControl does not mutate original message
     const resultFirst = bedrockResult[0] as LangChainLikeMsg;
     const resultSecond = bedrockResult[1] as LangChainLikeMsg;
 
-    expect(resultFirst.content).toEqual(resultFirst.lc_kwargs?.content);
-    expect(resultSecond.content).toEqual(resultSecond.lc_kwargs?.content);
+    expect(resultFirst.lc_kwargs).toBeUndefined();
+    expect(resultSecond.lc_kwargs).toBeUndefined();
 
     const firstContent = resultFirst.content as MessageContentComplex[];
-    const firstLcContent = resultFirst.lc_kwargs
-      ?.content as MessageContentComplex[];
     expect(firstContent.some((b) => 'cachePoint' in b)).toBe(true);
-    expect(firstLcContent.some((b) => 'cachePoint' in b)).toBe(true);
 
     const originalFirst = messagesWithLcKwargs[0];
     const originalContent = originalFirst.content as MessageContentComplex[];
