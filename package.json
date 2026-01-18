@@ -97,7 +97,7 @@
     "start:collab5": "node --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/collab_design_v5.ts",
     "start:dev": "node --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/main.ts",
     "supervised": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/supervised.ts --provider anthropic --name Jo --location \"New York, NY\"",
-    "test": "jest",
+    "test": "NODE_OPTIONS='--experimental-vm-modules' jest",
     "test:memory": "NODE_OPTIONS='--expose-gc' npx jest src/specs/title.memory-leak.test.ts",
     "test:all": "npm test -- --testPathIgnorePatterns=title.memory-leak.test.ts && npm run test:memory",
     "reinstall": "npm run clean && npm ci && rm -rf ./dist && npm run build",
