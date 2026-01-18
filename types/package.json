@@ -1,6 +1,6 @@
 {
   "name": "@librechat/agents-types",
-  "version": "3.0.774",
+  "version": "3.0.775",
   "description": "Type definitions for @librechat/agents",
   "repository": {
     "type": "git",
