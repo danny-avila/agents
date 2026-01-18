@@ -134,72 +134,76 @@ export function addCacheControl<T extends AnthropicMessage | BaseMessage>(
 
   for (let i = updatedMessages.length - 1; i >= 0; i--) {
     const originalMessage = updatedMessages[i];
+    const content = originalMessage.content;
     const isUserMessage =
       ('getType' in originalMessage && originalMessage.getType() === 'human') ||
       ('role' in originalMessage && originalMessage.role === 'user');
 
-    const hasArrayContent = Array.isArray(originalMessage.content);
+    const hasArrayContent = Array.isArray(content);
     const needsStripping =
       hasArrayContent &&
-      needsCacheStripping(originalMessage.content as MessageContentComplex[]);
+      needsCacheStripping(content as MessageContentComplex[]);
     const needsCacheAdd =
       userMessagesModified < 2 &&
       isUserMessage &&
-      (typeof originalMessage.content === 'string' || hasArrayContent);
+      (typeof content === 'string' || hasArrayContent);
 
     if (!needsStripping && !needsCacheAdd) {
       continue;
     }
 
-    const message = shallowCloneMessage(
-      originalMessage as MessageWithContent
-    ) as T;
-    updatedMessages[i] = message;
+    let workingContent: MessageContentComplex[];
 
     if (hasArrayContent) {
-      message.content = (message.content as MessageContentComplex[]).filter(
-        (block) => !isCachePoint(block as MessageContentComplex)
-      ) as typeof message.content;
+      workingContent = deepCloneContent(
+        content as MessageContentComplex[]
+      ).filter((block) => !isCachePoint(block as MessageContentComplex));
 
-      for (
-        let j = 0;
-        j < (message.content as MessageContentComplex[]).length;
-        j++
-      ) {
-        const block = (message.content as MessageContentComplex[])[j] as Record<
-          string,
-          unknown
-        >;
+      for (let j = 0; j < workingContent.length; j++) {
+        const block = workingContent[j] as Record<string, unknown>;
         if ('cache_control' in block) {
           delete block.cache_control;
         }
       }
+    } else if (typeof content === 'string') {
+      workingContent = [
+        { type: 'text', text: content },
+      ] as MessageContentComplex[];
+    } else {
+      workingContent = [];
     }
 
     if (userMessagesModified >= 2 || !isUserMessage) {
+      updatedMessages[i] = shallowCloneMessage(
+        originalMessage as MessageWithContent
+      ) as T;
+      (updatedMessages[i] as MessageWithContent).content = workingContent;
       continue;
     }
 
-    if (typeof message.content === 'string') {
-      message.content = [
-        {
-          type: 'text',
-          text: message.content,
-          cache_control: { type: 'ephemeral' },
-        },
-      ];
-      userMessagesModified++;
-    } else if (Array.isArray(message.content)) {
-      for (let j = message.content.length - 1; j >= 0; j--) {
-        const contentPart = message.content[j];
-        if ('type' in contentPart && contentPart.type === 'text') {
-          (contentPart as Anthropic.TextBlockParam).cache_control = {
-            type: 'ephemeral',
-          };
-          userMessagesModified++;
-          break;
-        }
+    let cacheAdded = false;
+    for (let j = workingContent.length - 1; j >= 0; j--) {
+      const contentPart = workingContent[j];
+      if ('type' in contentPart && contentPart.type === 'text') {
+        (contentPart as Anthropic.TextBlockParam).cache_control = {
+          type: 'ephemeral',
+        };
+        cacheAdded = true;
+        userMessagesModified++;
+        break;
       }
+    }
+
+    if (cacheAdded) {
+      updatedMessages[i] = createNewMessage(
+        originalMessage as MessageWithContent,
+        workingContent
+      ) as T;
+    } else {
+      updatedMessages[i] = shallowCloneMessage(
+        originalMessage as MessageWithContent
+      ) as T;
+      (updatedMessages[i] as MessageWithContent).content = workingContent;
     }
   }
 
