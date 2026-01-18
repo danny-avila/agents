@@ -920,6 +920,57 @@ describe('Immutability - addCacheControl does not mutate original messages', () 
 
     expect('cache_control' in originalFirstBlock).toBe(true);
   });
+
+  it('should keep lc_kwargs.content in sync with content for LangChain messages', () => {
+    type LangChainLikeMsg = TestMsg & {
+      lc_kwargs?: { content?: MessageContentComplex[] };
+    };
+
+    const messagesWithLcKwargs: LangChainLikeMsg[] = [
+      {
+        role: 'user',
+        content: [{ type: ContentTypes.TEXT, text: 'First user message' }],
+        lc_kwargs: {
+          content: [{ type: ContentTypes.TEXT, text: 'First user message' }],
+        },
+      },
+      {
+        role: 'assistant',
+        content: [{ type: ContentTypes.TEXT, text: 'Assistant response' }],
+        lc_kwargs: {
+          content: [{ type: ContentTypes.TEXT, text: 'Assistant response' }],
+        },
+      },
+      {
+        role: 'user',
+        content: [{ type: ContentTypes.TEXT, text: 'Second user message' }],
+        lc_kwargs: {
+          content: [{ type: ContentTypes.TEXT, text: 'Second user message' }],
+        },
+      },
+    ];
+
+    const result = addCacheControl(messagesWithLcKwargs as never);
+
+    const resultFirst = result[0] as LangChainLikeMsg;
+    const resultThird = result[2] as LangChainLikeMsg;
+
+    expect(resultFirst.content).toEqual(resultFirst.lc_kwargs?.content);
+    expect(resultThird.content).toEqual(resultThird.lc_kwargs?.content);
+
+    const firstContent = resultFirst.content as MessageContentComplex[];
+    const firstLcContent = resultFirst.lc_kwargs
+      ?.content as MessageContentComplex[];
+    expect('cache_control' in firstContent[0]).toBe(true);
+    expect('cache_control' in firstLcContent[0]).toBe(true);
+
+    const originalFirst = messagesWithLcKwargs[0];
+    const originalContent = originalFirst.content as MessageContentComplex[];
+    const originalLcContent = originalFirst.lc_kwargs
+      ?.content as MessageContentComplex[];
+    expect('cache_control' in originalContent[0]).toBe(false);
+    expect('cache_control' in originalLcContent[0]).toBe(false);
+  });
 });
 
 describe('Immutability - addBedrockCacheControl does not mutate original messages', () => {
