@@ -37,6 +37,7 @@ jobs:
       - name: Run tests
         run: npx jest --testPathIgnorePatterns=title.memory-leak.test.ts --testPathIgnorePatterns=llm.spec.ts --testPathIgnorePatterns=integration.test.ts
         env:
+          NODE_OPTIONS: '--experimental-vm-modules'
           NODE_ENV: test
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
