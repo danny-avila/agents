@@ -389,7 +389,10 @@ export function formatAnthropicArtifactContent(messages: BaseMessage[]): void {
   }
 }
 
-export function formatArtifactPayload(messages: BaseMessage[]): void {
+export function formatArtifactPayload(
+  messages: BaseMessage[],
+  isVisionModel: boolean = true
+): void {
   const lastMessageY = messages[messages.length - 1];
   if (!(lastMessageY instanceof ToolMessage)) return;
 
@@ -438,10 +441,24 @@ export function formatArtifactPayload(messages: BaseMessage[]): void {
         },
       ];
     }
-    aggregatedContent.push(...currentContent);
+    // Filter out image content from currentContent if model doesn't support vision
+    const filteredCurrentContent = isVisionModel
+      ? currentContent
+      : currentContent.filter(
+        (item: t.MessageContentComplex) => item.type !== 'image_url'
+      );
+    aggregatedContent.push(...filteredCurrentContent);
     msg.content =
       'Tool response is included in the next message as a Human message';
-    aggregatedContent.push(...msg.artifact.content);
+
+    // Filter out image artifacts if model doesn't support vision
+    const artifactContent = isVisionModel
+      ? msg.artifact.content
+      : msg.artifact.content.filter(
+        (item: t.MessageContentComplex) => item.type !== 'image_url'
+      );
+
+    aggregatedContent.push(...artifactContent);
   });
 
   // Add single HumanMessage with all aggregated content

@@ -306,12 +306,28 @@ export type ModelEndData =
   | (StreamEventData & { output: AIMessageChunk | undefined })
   | undefined;
 export type GraphTools = GenericTool[] | BindToolsInput[] | GoogleAIToolType[];
+/**
+ * Minimal type for model spec - only includes what we need for vision capability check
+ * Full type is in @librechat/data-provider, but we don't have that dependency
+ */
+export type ModelSpec = {
+  preset?: {
+    model?: string;
+  };
+  vision?: boolean;
+};
+
+export type ModelSpecsConfig = {
+  list: ModelSpec[];
+};
+
 export type StandardGraphInput = {
   runId?: string;
   signal?: AbortSignal;
   agents: AgentInputs[];
   tokenCounter?: TokenCounter;
   indexTokenCountMap?: Record<string, number>;
+  modelSpecs?: ModelSpecsConfig;
 };
 
 export type GraphEdge = {
