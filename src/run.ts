@@ -130,7 +130,6 @@ export class Run<_T extends t.BaseGraphState> {
       agents: [agentConfig],
       tokenCounter: this.tokenCounter,
       indexTokenCountMap: this.indexTokenCountMap,
-      modelSpecs: config.modelSpecs,
     });
     /** Propagate compile options from graph config */
     standardGraph.compileOptions = config.compileOptions;
@@ -149,7 +148,6 @@ export class Run<_T extends t.BaseGraphState> {
       edges,
       tokenCounter: this.tokenCounter,
       indexTokenCountMap: this.indexTokenCountMap,
-      modelSpecs: config.modelSpecs,
     });
 
     if (compileOptions != null) {

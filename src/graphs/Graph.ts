@@ -156,9 +156,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   agentContexts: Map<string, AgentContext> = new Map();
   /** Default agent ID to use */
   defaultAgentId: string;
-  /** Model specs configuration for capability checks (e.g., vision) */
-  modelSpecs?: t.ModelSpecsConfig;
-
   constructor({
     // parent-level graph inputs
     runId,
@@ -166,12 +163,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     agents,
     tokenCounter,
     indexTokenCountMap,
-    modelSpecs,
   }: t.StandardGraphInput) {
     super();
     this.runId = runId;
     this.signal = signal;
-    this.modelSpecs = modelSpecs;
 
     if (agents.length === 0) {
       throw new Error('At least one agent configuration is required');
@@ -188,42 +183,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     }
 
     this.defaultAgentId = agents[0].agentId;
-  }
-
-  /**
-   * Checks if a model supports vision capabilities based on modelSpecs configuration.
-   * This method ONLY uses modelSpecs - no hardcoded patterns.
-   * Returns false if modelSpecs is not available or model is not found.
-   */
-  private checkVisionCapability(modelName: string): boolean {
-    if (typeof modelName !== 'string' || modelName.length === 0) {
-      return false;
-    }
-    const modelSpecs = this.modelSpecs;
-    if (!modelSpecs || typeof modelSpecs !== 'object') {
-      return false;
-    }
-    const specList = modelSpecs.list;
-    if (!Array.isArray(specList) || specList.length === 0) {
-      return false;
-    }
-
-    // Find matching model spec by model name
-    const matchingSpec = specList.find((spec: t.ModelSpec) => {
-      const preset = spec.preset;
-      if (!preset) {
-        return false;
-      }
-      const specModel = preset.model;
-      if (typeof specModel !== 'string' || specModel.length === 0) {
-        return false;
-      }
-      // Match exact model name or if model name includes spec model
-      return specModel === modelName || modelName.includes(specModel);
-    });
-
-    // Return vision capability from modelSpecs, default to false if not found
-    return matchingSpec?.vision === true;
   }
 
   /* Init */
@@ -772,18 +731,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           agentContext.provider !== Providers.DEEPSEEK) ||
           isGoogleLike(agentContext.provider))
       ) {
-        // Check if model supports vision before sending image artifacts
-        const clientOptions = agentContext.clientOptions as
-          | { model?: string }
-          | undefined;
-        const modelName =
-          clientOptions && 'model' in clientOptions
-            ? (clientOptions.model ?? '')
-            : '';
-        // Default to false if model unknown to prevent sending images to non-vision models
-        const isVisionModel = modelName
-          ? this.checkVisionCapability(modelName)
-          : false;
+        // Use vision capability from agent configuration
+        const isVisionModel = agentContext.vision ?? false;
         formatArtifactPayload(finalMessages, isVisionModel);
       }
 

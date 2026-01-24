@@ -101,7 +101,6 @@ export type MultiAgentGraphConfig = {
   compileOptions?: g.CompileOptions;
   agents: g.AgentInputs[];
   edges: g.GraphEdge[];
-  modelSpecs?: g.ModelSpecsConfig;
 };
 
 export type StandardGraphConfig = Omit<
