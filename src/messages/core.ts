@@ -399,23 +399,16 @@ function isBase64ImageUrl(item: t.MessageContentComplex): boolean {
     return false;
   }
 
-  // Handle both string and object formats for image_url
   const itemWithImageUrl = item as { image_url?: string | { url?: string } };
-  const itemImageUrl = itemWithImageUrl.image_url;
+  const imageUrl = itemWithImageUrl.image_url;
 
-  if (typeof itemImageUrl === 'string') {
-    return itemImageUrl.startsWith('data:');
+  if (typeof imageUrl === 'string') {
+    return imageUrl.startsWith('data:');
   }
 
-  if (
-    itemImageUrl &&
-    typeof itemImageUrl === 'object' &&
-    'url' in itemImageUrl
-  ) {
-    const url = itemImageUrl.url;
-    if (typeof url === 'string') {
-      return url.startsWith('data:');
-    }
+  if (imageUrl && typeof imageUrl === 'object' && 'url' in imageUrl) {
+    const url = imageUrl.url;
+    return typeof url === 'string' && url.startsWith('data:');
   }
 
   return false;
@@ -473,8 +466,6 @@ export function formatArtifactPayload(
         },
       ];
     }
-    // Filter out base64 image content from currentContent if model doesn't support vision
-    // HTTP URLs are not filtered as they don't cause context overflow
     const filteredCurrentContent = isVisionModel
       ? currentContent
       : currentContent.filter(
@@ -484,8 +475,6 @@ export function formatArtifactPayload(
     msg.content =
       'Tool response is included in the next message as a Human message';
 
-    // Filter out base64 image artifacts if model doesn't support vision
-    // HTTP URLs are not filtered as they don't cause context overflow
     const artifactContent = isVisionModel
       ? msg.artifact.content
       : msg.artifact.content.filter(

@@ -731,9 +731,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           agentContext.provider !== Providers.DEEPSEEK) ||
           isGoogleLike(agentContext.provider))
       ) {
-        // Use vision capability from agent configuration
-        const isVisionModel = agentContext.vision ?? false;
-        formatArtifactPayload(finalMessages, isVisionModel);
+        formatArtifactPayload(finalMessages, agentContext.vision ?? false);
       }
 
       if (agentContext.provider === Providers.ANTHROPIC) {
