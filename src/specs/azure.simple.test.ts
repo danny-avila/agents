@@ -19,7 +19,6 @@ import { ContentTypes, GraphEvents, Providers, TitleMethod } from '@/common';
 import { ChatModelStreamHandler, createContentAggregator } from '@/stream';
 import { capitalizeFirstLetter } from './spec.utils';
 import { getLLMConfig } from '@/utils/llmConfig';
-import { getArgs } from '@/scripts/args';
 import { Run } from '@/run';
 
 // Auto-skip this suite if Azure env vars are not present
@@ -129,7 +128,6 @@ describeIfAzure(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
   });
 
   test(`${capitalizeFirstLetter(provider)}: should process a simple message, generate title`, async () => {
-    const { userName, location } = await getArgs();
     const llmConfig = getLLMConfig(provider);
     const customHandlers = setupCustomHandlers();
 
@@ -140,14 +138,13 @@ describeIfAzure(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
         llmConfig,
         tools: [new Calculator()],
         instructions:
-          'You are a friendly AI assistant. Always address the user by their name.',
-        additional_instructions: `The user's name is ${userName} and they are located in ${location}.`,
+          'You are a helpful AI assistant. Keep responses concise and friendly.',
       },
       returnContent: true,
       customHandlers,
     });
 
-    const userMessage = 'hi';
+    const userMessage = 'Hello, how are you today?';
     conversationHistory.push(new HumanMessage(userMessage));
 
     const inputs = {
@@ -201,7 +198,6 @@ describeIfAzure(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
   });
 
   test(`${capitalizeFirstLetter(provider)}: should generate title using completion method`, async () => {
-    const { userName, location } = await getArgs();
     const llmConfig = getLLMConfig(provider);
     const customHandlers = setupCustomHandlers();
 
@@ -212,14 +208,13 @@ describeIfAzure(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
         llmConfig,
         tools: [new Calculator()],
         instructions:
-          'You are a friendly AI assistant. Always address the user by their name.',
-        additional_instructions: `The user's name is ${userName} and they are located in ${location}.`,
+          'You are a helpful AI assistant. Keep responses concise and friendly.',
       },
       returnContent: true,
       customHandlers,
     });
 
-    const userMessage = 'What is the weather like today?';
+    const userMessage = 'What can you help me with today?';
     conversationHistory = [];
     conversationHistory.push(new HumanMessage(userMessage));
 
@@ -261,7 +256,6 @@ describeIfAzure(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
       'Last message:',
       runningHistory[runningHistory.length - 1].content
     );
-    const { userName, location } = await getArgs();
     const llmConfig = getLLMConfig(provider);
     const customHandlers = setupCustomHandlers();
 
@@ -272,15 +266,14 @@ describeIfAzure(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
         llmConfig,
         tools: [new Calculator()],
         instructions:
-          'You are a friendly AI assistant. Always address the user by their name.',
-        additional_instructions: `The user's name is ${userName} and they are located in ${location}.`,
+          'You are a helpful AI assistant. Keep responses concise and friendly.',
       },
       returnContent: true,
       customHandlers,
     });
 
     conversationHistory = runningHistory.slice();
-    conversationHistory.push(new HumanMessage('how are you?'));
+    conversationHistory.push(new HumanMessage('What else can you tell me?'));
 
     const inputs = {
       messages: conversationHistory,
