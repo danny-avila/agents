@@ -390,36 +390,29 @@ export function formatAnthropicArtifactContent(messages: BaseMessage[]): void {
 }
 
 /**
- * Checks if an image_url content item contains base64 data (not an HTTP URL).
- * Base64 data URLs start with "data:" and can cause context overflow.
- * HTTP URLs are just text and don't need filtering.
+ * Formats tool artifacts into HumanMessage content array.
+ *
+ * Aggregates artifact content from tool messages into a single HumanMessage.
+ * Note: Base64 image filtering is already done in ToolNode based on vision capability.
+ *
+ * @param messages - Array of messages, must end with a ToolMessage containing artifacts
  */
-function isBase64ImageUrl(item: t.MessageContentComplex): boolean {
-  if (item.type !== 'image_url') {
-    return false;
+export function formatArtifactPayload(messages: BaseMessage[]): void {
+  // Restore artifacts from additional_kwargs (where ToolNode stores them)
+  // This is necessary because coerceMessageLikeToMessage preserves additional_kwargs but not artifact property
+  for (const msg of messages) {
+    if (
+      msg instanceof ToolMessage &&
+      msg.additional_kwargs.artifact !== undefined
+    ) {
+      msg.artifact = msg.additional_kwargs.artifact;
+    }
   }
 
-  const itemWithImageUrl = item as { image_url?: string | { url?: string } };
-  const imageUrl = itemWithImageUrl.image_url;
-
-  if (typeof imageUrl === 'string') {
-    return imageUrl.startsWith('data:');
-  }
-
-  if (imageUrl && typeof imageUrl === 'object' && 'url' in imageUrl) {
-    const url = imageUrl.url;
-    return typeof url === 'string' && url.startsWith('data:');
-  }
-
-  return false;
-}
-
-export function formatArtifactPayload(
-  messages: BaseMessage[],
-  isVisionModel: boolean = true
-): void {
   const lastMessageY = messages[messages.length - 1];
-  if (!(lastMessageY instanceof ToolMessage)) return;
+  if (!(lastMessageY instanceof ToolMessage)) {
+    return;
+  }
 
   // Find the latest AIMessage with tool_calls that this tool message belongs to
   const latestAIParentIndex = findLastIndex(
@@ -431,19 +424,30 @@ export function formatArtifactPayload(
       false
   );
 
-  if (latestAIParentIndex === -1) return;
+  if (latestAIParentIndex === -1) {
+    return;
+  }
 
   // Check if any tool message after the AI message has array artifact content
-  const hasArtifactContent = messages.some(
-    (msg, i) =>
-      i > latestAIParentIndex &&
-      msg instanceof ToolMessage &&
+  const allToolMessagesAfterAI = messages
+    .slice(latestAIParentIndex + 1)
+    .filter((msg) => msg instanceof ToolMessage) as ToolMessage[];
+
+  const toolMessagesWithArtifacts = allToolMessagesAfterAI.filter((msg) => {
+    return (
       msg.artifact != null &&
       msg.artifact?.content != null &&
       Array.isArray(msg.artifact.content)
+    );
+  });
+
+  const hasArtifactContent = toolMessagesWithArtifacts.some((msg) =>
+    Array.isArray((msg as ToolMessage).artifact?.content)
   );
 
-  if (!hasArtifactContent) return;
+  if (!hasArtifactContent) {
+    return;
+  }
 
   // Collect all relevant tool messages and their artifacts
   const relevantMessages = messages
@@ -457,6 +461,7 @@ export function formatArtifactPayload(
     if (!Array.isArray(msg.artifact?.content)) {
       return;
     }
+
     let currentContent = msg.content;
     if (!Array.isArray(currentContent)) {
       currentContent = [
@@ -466,27 +471,19 @@ export function formatArtifactPayload(
         },
       ];
     }
-    const filteredCurrentContent = isVisionModel
-      ? currentContent
-      : currentContent.filter(
-        (item: t.MessageContentComplex) => !isBase64ImageUrl(item)
-      );
-    aggregatedContent.push(...filteredCurrentContent);
+
+    aggregatedContent.push(...currentContent);
     msg.content =
       'Tool response is included in the next message as a Human message';
 
-    const artifactContent = isVisionModel
-      ? msg.artifact.content
-      : msg.artifact.content.filter(
-        (item: t.MessageContentComplex) => !isBase64ImageUrl(item)
-      );
-
-    aggregatedContent.push(...artifactContent);
+    // Artifacts are already filtered by ToolNode based on vision capability
+    aggregatedContent.push(...msg.artifact.content);
   });
 
   // Add single HumanMessage with all aggregated content
   if (aggregatedContent.length > 0) {
-    messages.push(new HumanMessage({ content: aggregatedContent }));
+    const humanMessage = new HumanMessage({ content: aggregatedContent });
+    messages.push(humanMessage);
   }
 }
 

@@ -41,6 +41,8 @@ export type ToolNodeOptions = {
   toolRegistry?: LCToolRegistry;
   /** Reference to Graph's sessions map for automatic session injection */
   sessions?: ToolSessionMap;
+  /** Whether the agent supports vision capabilities (for artifact filtering) */
+  visionCapable?: boolean;
 };
 
 export type ToolNodeConstructorParams = ToolRefs & ToolNodeOptions;

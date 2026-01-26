@@ -151,7 +151,10 @@ export class AgentContext {
   tokenCalculationPromise?: Promise<void>;
   /** Format content blocks as strings (for legacy compatibility) */
   useLegacyContent: boolean = false;
-  /** Whether this agent supports vision capabilities (image processing) */
+  /**
+   * Whether this agent supports vision capabilities (image processing).
+   * Defaults to false if not explicitly set.
+   */
   vision?: boolean;
   /**
    * Handoff context when this agent receives control via handoff.

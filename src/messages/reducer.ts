@@ -14,8 +14,7 @@ export type Messages =
 
 /**
  * Prebuilt reducer that combines returned messages.
- * Can handle standard messages and special modifiers like {@link RemoveMessage}
- * instances.
+ * Can handle standard messages and special modifiers like {@link RemoveMessage} instances.
  */
 export function messagesStateReducer(
   left: Messages,
@@ -32,7 +31,7 @@ export function messagesStateReducer(
   );
   // assign missing ids
   for (const m of leftMessages) {
-    if (m.id === null || m.id === undefined) {
+    if (m.id == null) {
       m.id = v4();
       m.lc_kwargs.id = m.id;
     }
@@ -41,7 +40,7 @@ export function messagesStateReducer(
   let removeAllIdx: number | undefined;
   for (let i = 0; i < rightMessages.length; i += 1) {
     const m = rightMessages[i];
-    if (m.id === null || m.id === undefined) {
+    if (m.id == null) {
       m.id = v4();
       m.lc_kwargs.id = m.id;
     }
