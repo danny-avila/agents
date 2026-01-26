@@ -41,6 +41,8 @@ export type ToolNodeOptions = {
   toolRegistry?: LCToolRegistry;
   /** Reference to Graph's sessions map for automatic session injection */
   sessions?: ToolSessionMap;
+  /** Whether the agent supports vision capabilities (for artifact filtering) */
+  visionCapable?: boolean;
 };
 
 export type ToolNodeConstructorParams = ToolRefs & ToolNodeOptions;
@@ -282,6 +284,28 @@ export type CodeSessionContext = {
 export type CodeExecutionArtifact = {
   session_id?: string;
   files?: FileRefs;
+};
+
+/**
+ * MCP artifact structure as returned by MCP tools.
+ * Contains content array with images, text, and other media.
+ */
+export type MCPArtifact = {
+  content: Array<{
+    type: string;
+    text?: string;
+    data?: string;
+    mimeType?: string;
+    image_url?: string | { url: string; detail?: string };
+  }>;
+};
+
+/**
+ * Image URL content item in OpenAI format.
+ */
+export type ImageUrlContent = {
+  type: 'image_url';
+  image_url: string | { url: string; detail?: string };
 };
 
 /**

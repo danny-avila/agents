@@ -10,8 +10,8 @@ import {
   Command,
   StateGraph,
   Annotation,
-  messagesStateReducer,
 } from '@langchain/langgraph';
+import { messagesStateReducer } from '@/messages/reducer';
 import {
   Runnable,
   RunnableConfig,
@@ -156,7 +156,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   agentContexts: Map<string, AgentContext> = new Map();
   /** Default agent ID to use */
   defaultAgentId: string;
-
   constructor({
     // parent-level graph inputs
     runId,
@@ -461,6 +460,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         StandardGraph.handleToolCallErrorStatic(this, data, metadata),
       toolRegistry: agentContext?.toolRegistry,
       sessions: this.sessions,
+      visionCapable: agentContext?.vision ?? false,
     });
   }
 
@@ -572,6 +572,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       if (!model.stream) {
         throw new Error('Model does not support stream');
       }
+
       const stream = await model.stream(finalMessages, config);
       let finalChunk: AIMessageChunk | undefined;
       for await (const chunk of stream) {
@@ -658,6 +659,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       this.config = config;
 
       let messagesToUse = messages;
+
       if (
         !agentContext.pruneMessages &&
         agentContext.tokenCounter &&
@@ -721,13 +723,24 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
       const isLatestToolMessage = lastMessageY instanceof ToolMessage;
 
+      // Check if any ToolMessage in current turn has artifacts
+      // This is more robust than only checking if the last message is a ToolMessage
+      const hasToolMessagesWithArtifacts = finalMessages.some((msg) => {
+        if (msg._getType() !== 'tool') return false;
+        const toolMsg = msg as ToolMessage & { artifact?: t.MCPArtifact };
+        return (
+          toolMsg.artifact != null ||
+          toolMsg.additional_kwargs.artifact != null
+        );
+      });
+
       if (
         isLatestToolMessage &&
         agentContext.provider === Providers.ANTHROPIC
       ) {
         formatAnthropicArtifactContent(finalMessages);
       } else if (
-        isLatestToolMessage &&
+        hasToolMessagesWithArtifacts &&
         ((isOpenAILike(agentContext.provider) &&
           agentContext.provider !== Providers.DEEPSEEK) ||
           isGoogleLike(agentContext.provider))
@@ -849,6 +862,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         throw new Error('No result after model invocation');
       }
       agentContext.currentUsage = this.getUsageMetadata(result.messages?.[0]);
+
       this.cleanupSignalListener();
       return result;
     };

@@ -377,4 +377,6 @@ export interface AgentInputs {
    * Maps tool name to LCTool definition.
    */
   toolRegistry?: Map<string, LCTool>;
+  /** Whether this agent supports vision capabilities (image processing) */
+  vision?: boolean;
 }
