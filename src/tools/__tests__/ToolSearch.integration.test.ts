@@ -4,6 +4,9 @@
  * These tests hit the LIVE Code API and verify end-to-end search functionality.
  *
  * Run with: npm test -- ToolSearch.integration.test.ts
+ *
+ * Requires LIBRECHAT_CODE_API_KEY environment variable.
+ * Tests are skipped when the API key is not available.
  */
 import { config as dotenvConfig } from 'dotenv';
 dotenvConfig();
@@ -12,19 +15,17 @@ import { describe, it, expect, beforeAll } from '@jest/globals';
 import { createToolSearch } from '../ToolSearch';
 import { createToolSearchToolRegistry } from '@/test/mockTools';
 
-describe('ToolSearch - Live API Integration', () => {
+const apiKey = process.env.LIBRECHAT_CODE_API_KEY;
+const shouldSkip = apiKey == null || apiKey === '';
+
+const describeIfApiKey = shouldSkip ? describe.skip : describe;
+
+describeIfApiKey('ToolSearch - Live API Integration', () => {
   let searchTool: ReturnType<typeof createToolSearch>;
   const toolRegistry = createToolSearchToolRegistry();
 
   beforeAll(() => {
-    const apiKey = process.env.LIBRECHAT_CODE_API_KEY;
-    if (apiKey == null || apiKey === '') {
-      throw new Error(
-        'LIBRECHAT_CODE_API_KEY not set. Required for integration tests.'
-      );
-    }
-
-    searchTool = createToolSearch({ apiKey, toolRegistry });
+    searchTool = createToolSearch({ apiKey: apiKey!, toolRegistry });
   });
 
   it('searches for expense-related tools', async () => {
