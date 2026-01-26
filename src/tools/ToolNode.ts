@@ -68,9 +68,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     this.errorHandler = errorHandler;
     this.toolUsageCount = new Map<string, number>();
     this.toolRegistry = toolRegistry;
-    this.programmaticCache = undefined;
     this.sessions = sessions;
-    this.visionCapable = visionCapable ?? true;
+    this.visionCapable = visionCapable ?? false;
   }
 
   /**
@@ -105,6 +104,93 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
    */
   public getToolUsageCounts(): ReadonlyMap<string, number> {
     return new Map(this.toolUsageCount); // Return a copy
+  }
+
+  /**
+   * Checks if an image_url content item contains base64 data (not an HTTP URL).
+   * Base64 data URLs start with "data:" and can cause context overflow when sent to non-vision models.
+   */
+  private isBase64ImageUrl(item: unknown): boolean {
+    if (
+      typeof item !== 'object' ||
+      item === null ||
+      !('type' in item) ||
+      (item as { type: unknown }).type !== 'image_url'
+    ) {
+      return false;
+    }
+
+    const imageUrlItem = item as { image_url?: string | { url?: string } };
+    const imageUrl = imageUrlItem.image_url;
+
+    if (typeof imageUrl === 'string') {
+      return imageUrl.startsWith('data:');
+    }
+
+    if (typeof imageUrl === 'object' && imageUrl && 'url' in imageUrl) {
+      const url = imageUrl.url;
+      return typeof url === 'string' && url.startsWith('data:');
+    }
+
+    return false;
+  }
+
+  /**
+   * Processes MCP artifact content by:
+   * 1. Converting MCP image format to standard image_url format
+   * 2. Filtering base64 images if vision is disabled
+   */
+  private processArtifact(
+    artifact: unknown
+  ): { content: unknown[] } | undefined {
+    if (
+      artifact === null ||
+      artifact === undefined ||
+      typeof artifact !== 'object' ||
+      !('content' in artifact) ||
+      !Array.isArray((artifact as { content: unknown }).content)
+    ) {
+      return undefined;
+    }
+
+    const artifactObj = artifact as { content: unknown[] };
+
+    // Convert MCP format (type: 'image' with data:) to image_url format
+    artifactObj.content = artifactObj.content.map((item: unknown) => {
+      if (
+        typeof item === 'object' &&
+        item !== null &&
+        'type' in item &&
+        (item as { type: string }).type === 'image' &&
+        'data' in item
+      ) {
+        const imageItem = item as {
+          type: string;
+          data: string;
+          mimeType?: string;
+        };
+        const mimeType = imageItem.mimeType ?? 'image/png';
+        const dataUrl =
+          typeof imageItem.data === 'string' &&
+          imageItem.data.startsWith('http')
+            ? imageItem.data
+            : `data:${mimeType};base64,${imageItem.data}`;
+        return {
+          type: 'image_url',
+          image_url: { url: dataUrl },
+        };
+      }
+      return item;
+    });
+
+    // Filter base64 images if vision is disabled
+    if (!this.visionCapable) {
+      artifactObj.content = artifactObj.content.filter(
+        (item) => !this.isBase64ImageUrl(item)
+      );
+    }
+
+    return artifactObj;
   }
 
   /**
@@ -181,93 +267,6 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         }
       }
 
-      /**
-       * Checks if an image_url content item contains base64 data (not an HTTP URL).
-       * Base64 data URLs start with "data:" and can cause context overflow when sent to non-vision models.
-       */
-      const isBase64ImageUrl = (item: unknown): boolean => {
-        if (
-          typeof item !== 'object' ||
-          item === null ||
-          !('type' in item) ||
-          (item as { type: unknown }).type !== 'image_url'
-        ) {
-          return false;
-        }
-
-        const imageUrlItem = item as { image_url?: string | { url?: string } };
-        const imageUrl = imageUrlItem.image_url;
-
-        if (typeof imageUrl === 'string') {
-          return imageUrl.startsWith('data:');
-        }
-
-        if (typeof imageUrl === 'object' && imageUrl && 'url' in imageUrl) {
-          const url = imageUrl.url;
-          return typeof url === 'string' && url.startsWith('data:');
-        }
-
-        return false;
-      };
-
-      /**
-       * Processes MCP artifact content by:
-       * 1. Converting MCP image format to standard image_url format
-       * 2. Filtering base64 images if vision is disabled
-       */
-      const processArtifact = (
-        artifact: unknown
-      ): { content: unknown[] } | undefined => {
-        if (
-          artifact === null ||
-          artifact === undefined ||
-          typeof artifact !== 'object' ||
-          !('content' in artifact) ||
-          !Array.isArray((artifact as { content: unknown }).content)
-        ) {
-          return undefined;
-        }
-
-        const artifactObj = artifact as { content: unknown[] };
-
-        // Convert MCP format (type: 'image' with data:) to image_url format
-        artifactObj.content = artifactObj.content.map((item: unknown) => {
-          if (
-            typeof item === 'object' &&
-            item !== null &&
-            'type' in item &&
-            (item as { type: string }).type === 'image' &&
-            'data' in item
-          ) {
-            const imageItem = item as {
-              type: string;
-              data: string;
-              mimeType?: string;
-            };
-            const mimeType = imageItem.mimeType ?? 'image/png';
-            const dataUrl =
-              typeof imageItem.data === 'string' &&
-              imageItem.data.startsWith('http')
-                ? imageItem.data
-                : `data:${mimeType};base64,${imageItem.data}`;
-            return {
-              type: 'image_url',
-              image_url: { url: dataUrl },
-            };
-          }
-          return item;
-        });
-
-        // Filter base64 images if vision is disabled
-        if (!this.visionCapable) {
-          artifactObj.content = artifactObj.content.filter(
-            (item) => !isBase64ImageUrl(item)
-          );
-        }
-
-        return artifactObj;
-      };
-
       // Invoke tool (standard path for all tools)
       const output = await tool.invoke(invokeParams, config);
 
@@ -279,7 +278,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         output[1] !== undefined
       ) {
         const [content, artifact] = output;
-        const processedArtifact = processArtifact(artifact);
+        const processedArtifact = this.processArtifact(artifact);
 
         return new ToolMessage({
           status: 'success',

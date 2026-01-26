@@ -441,11 +441,7 @@ export function formatArtifactPayload(messages: BaseMessage[]): void {
     );
   });
 
-  const hasArtifactContent = toolMessagesWithArtifacts.some((msg) =>
-    Array.isArray((msg as ToolMessage).artifact?.content)
-  );
-
-  if (!hasArtifactContent) {
+  if (toolMessagesWithArtifacts.length === 0) {
     return;
   }
 

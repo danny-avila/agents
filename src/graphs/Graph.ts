@@ -722,53 +722,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
       const isLatestToolMessage = lastMessageY instanceof ToolMessage;
 
-      /**
-       * Determines if a provider supports artifact formatting (content array with artifacts).
-       * OpenAI-compatible providers and Google support this format.
-       * Anthropic uses a different artifact format handled separately.
-       */
-      const supportsArtifactFormatting = (
-        provider: Providers | string
-      ): boolean => {
-        // Anthropic uses its own artifact format (handled separately)
-        if (provider === Providers.ANTHROPIC) {
-          return false;
-        }
-
-        // Known providers that don't support artifact formatting
-        const nonArtifactProviders = new Set([
-          Providers.BEDROCK,
-          Providers.VERTEXAI,
-          'ollama',
-        ]);
-
-        if (nonArtifactProviders.has(provider as Providers)) {
-          return false;
-        }
-
-        // OpenAI-compatible providers (including custom endpoints)
-        if (isOpenAILike(provider) && provider !== Providers.DEEPSEEK) {
-          return true;
-        }
-
-        // Explicit OpenAI provider
-        if (provider === Providers.OPENAI) {
-          return true;
-        }
-
-        // Google providers
-        if (isGoogleLike(provider)) {
-          return true;
-        }
-
-        // Custom OpenAI-compatible endpoints (not in nonArtifactProviders and not explicitly handled)
-        return (
-          provider !== Providers.DEEPSEEK &&
-          !isOpenAILike(provider) &&
-          !isGoogleLike(provider)
-        );
-      };
-
       if (
         isLatestToolMessage &&
         agentContext.provider === Providers.ANTHROPIC
@@ -776,7 +729,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         formatAnthropicArtifactContent(finalMessages);
       } else if (
         isLatestToolMessage &&
-        supportsArtifactFormatting(agentContext.provider)
+        ((isOpenAILike(agentContext.provider) &&
+          agentContext.provider !== Providers.DEEPSEEK) ||
+          isGoogleLike(agentContext.provider))
       ) {
         formatArtifactPayload(finalMessages);
       }
