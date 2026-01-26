@@ -287,6 +287,28 @@ export type CodeExecutionArtifact = {
 };
 
 /**
+ * MCP artifact structure as returned by MCP tools.
+ * Contains content array with images, text, and other media.
+ */
+export type MCPArtifact = {
+  content: Array<{
+    type: string;
+    text?: string;
+    data?: string;
+    mimeType?: string;
+    image_url?: string | { url: string; detail?: string };
+  }>;
+};
+
+/**
+ * Image URL content item in OpenAI format.
+ */
+export type ImageUrlContent = {
+  type: 'image_url';
+  image_url: string | { url: string; detail?: string };
+};
+
+/**
  * Generic session context union type for different tool types.
  * Extend this as new tool session types are added.
  */

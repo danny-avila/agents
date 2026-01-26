@@ -115,12 +115,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       typeof item !== 'object' ||
       item === null ||
       !('type' in item) ||
-      (item as { type: unknown }).type !== 'image_url'
+      item.type !== 'image_url'
     ) {
       return false;
     }
 
-    const imageUrlItem = item as { image_url?: string | { url?: string } };
+    const imageUrlItem = item as t.ImageUrlContent;
     const imageUrl = imageUrlItem.image_url;
 
     if (typeof imageUrl === 'string') {
@@ -128,8 +128,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     }
 
     if (typeof imageUrl === 'object' && imageUrl && 'url' in imageUrl) {
-      const url = imageUrl.url;
-      return typeof url === 'string' && url.startsWith('data:');
+      return (
+        typeof imageUrl.url === 'string' && imageUrl.url.startsWith('data:')
+      );
     }
 
     return false;
@@ -140,43 +141,35 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
    * 1. Converting MCP image format to standard image_url format
    * 2. Filtering base64 images if vision is disabled
    */
-  private processArtifact(
-    artifact: unknown
-  ): { content: unknown[] } | undefined {
+  private processArtifact(artifact: unknown): t.MCPArtifact | undefined {
     if (
       artifact === null ||
       artifact === undefined ||
       typeof artifact !== 'object' ||
       !('content' in artifact) ||
-      !Array.isArray((artifact as { content: unknown }).content)
+      !Array.isArray(artifact.content)
     ) {
       return undefined;
     }
 
-    const artifactObj = artifact as { content: unknown[] };
+    const artifactObj = artifact as t.MCPArtifact;
 
     // Convert MCP format (type: 'image' with data:) to image_url format
-    artifactObj.content = artifactObj.content.map((item: unknown) => {
+    artifactObj.content = artifactObj.content.map((item) => {
       if (
         typeof item === 'object' &&
         item !== null &&
         'type' in item &&
-        (item as { type: string }).type === 'image' &&
+        item.type === 'image' &&
         'data' in item
       ) {
-        const imageItem = item as {
-          type: string;
-          data: string;
-          mimeType?: string;
-        };
-        const mimeType = imageItem.mimeType ?? 'image/png';
+        const mimeType = item.mimeType ?? 'image/png';
         const dataUrl =
-          typeof imageItem.data === 'string' &&
-          imageItem.data.startsWith('http')
-            ? imageItem.data
-            : `data:${mimeType};base64,${imageItem.data}`;
+          typeof item.data === 'string' && item.data.startsWith('http')
+            ? item.data
+            : `data:${mimeType};base64,${item.data}`;
         return {
-          type: 'image_url',
+          type: 'image_url' as const,
           image_url: { url: dataUrl },
         };
       }
@@ -200,10 +193,23 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     call: ToolCall,
     config: RunnableConfig
   ): Promise<BaseMessage | Command> {
-    const tool = this.toolMap.get(call.name);
+    let tool = this.toolMap.get(call.name);
+
+    // If tool not found and loadRuntimeTools is available, try loading it
+    if (tool === undefined && this.loadRuntimeTools) {
+      const { tools, toolMap } = this.loadRuntimeTools([call]);
+      this.toolMap = toolMap ?? new Map(tools.map((t) => [t.name, t]));
+      this.programmaticCache = undefined; // Invalidate cache on toolMap change
+      tool = this.toolMap.get(call.name);
+    }
+
     try {
       if (tool === undefined) {
-        throw new Error(`Tool "${call.name}" not found.`);
+        const availableTools = Array.from(this.toolMap.keys()).join(', ');
+        throw new Error(
+          `Tool "${call.name}" not found. Available tools: ${availableTools || 'none'}. ` +
+            'If this is a runtime tool, ensure loadRuntimeTools is properly configured.'
+        );
       }
       const turn = this.toolUsageCount.get(call.name) ?? 0;
       this.toolUsageCount.set(call.name, turn + 1);
@@ -280,7 +286,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         const [content, artifact] = output;
         const processedArtifact = this.processArtifact(artifact);
 
-        return new ToolMessage({
+        const toolMessage = new ToolMessage({
           status: 'success',
           name: tool.name,
           content:
@@ -290,11 +296,19 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             ? { artifact: processedArtifact }
             : {},
         });
+        return toolMessage;
       }
 
-      // Handle ToolMessage output
+      // Handle ToolMessage output (from tools with responseFormat: 'content_and_artifact')
       if (isBaseMessage(output) && output._getType() === 'tool') {
-        return output;
+        const toolMessage = output as ToolMessage;
+
+        // If ToolMessage already has artifact, ensure it's in additional_kwargs for formatArtifactPayload
+        if (toolMessage.artifact && !toolMessage.additional_kwargs.artifact) {
+          toolMessage.additional_kwargs.artifact = toolMessage.artifact;
+        }
+
+        return toolMessage;
       }
 
       // Handle Command output

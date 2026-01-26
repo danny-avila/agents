@@ -325,6 +325,30 @@ export function _convertMessagesToOpenAIParams(
               completionsApiContentBlockConverter
             );
           }
+          // Ensure image_url items are in correct format for OpenAI API
+          if ('type' in m && m.type === 'image_url') {
+            const imageItem = m as {
+                type: 'image_url';
+                image_url: string | { url: string; detail?: string };
+              };
+
+            // Normalize to OpenAI format: image_url must be an object with url property
+            const imageUrl = imageItem.image_url;
+            const normalizedUrl =
+                typeof imageUrl === 'string'
+                  ? { url: imageUrl }
+                  : { url: imageUrl.url, detail: imageUrl.detail };
+
+            return {
+              type: 'image_url' as const,
+              image_url: {
+                url: normalizedUrl.url,
+                ...(normalizedUrl.detail
+                  ? { detail: normalizedUrl.detail }
+                  : {}),
+              },
+            };
+          }
           return m;
         });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -734,16 +758,20 @@ export function _convertMessagesToOpenAIResponsesParams(
             };
           }
           if (item.type === 'image_url') {
+            // Normalize image_url to ensure correct format
+            const imageUrl = item.image_url;
+            const imageUrlValue =
+              typeof imageUrl === 'string'
+                ? imageUrl
+                : (imageUrl?.url ?? String(imageUrl));
+            const detailValue =
+              typeof imageUrl === 'string'
+                ? 'auto'
+                : (imageUrl?.detail ?? 'auto');
             return {
               type: 'input_image',
-              image_url:
-                typeof item.image_url === 'string'
-                  ? item.image_url
-                  : item.image_url.url,
-              detail:
-                typeof item.image_url === 'string'
-                  ? 'auto'
-                  : item.image_url.detail,
+              image_url: imageUrlValue,
+              detail: detailValue,
             };
           }
           if (
