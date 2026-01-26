@@ -1,5 +1,4 @@
 // src/tools/ToolSearch.ts
-import { z } from 'zod';
 import * as okapibm25Module from 'okapibm25';
 import { config } from 'dotenv';
 
@@ -40,20 +39,25 @@ const MAX_REGEX_COMPLEXITY = 5;
 /** Default search timeout in milliseconds */
 const SEARCH_TIMEOUT = 5000;
 
-/** Zod schema type for tool search parameters */
-type ToolSearchSchema = z.ZodObject<{
-  query: z.ZodDefault<z.ZodOptional<z.ZodString>>;
-  fields: z.ZodDefault<
-    z.ZodOptional<z.ZodArray<z.ZodEnum<['name', 'description', 'parameters']>>>
-  >;
-  max_results: z.ZodDefault<z.ZodOptional<z.ZodNumber>>;
-  mcp_server: z.ZodOptional<z.ZodUnion<[z.ZodString, z.ZodArray<z.ZodString>]>>;
-}>;
+/** JSON schema type for tool search parameters */
+interface ToolSearchSchema {
+  type: 'object';
+  properties: Record<string, unknown>;
+  required: string[];
+}
+
+/** Input params type for tool search */
+interface ToolSearchParams {
+  query?: string;
+  fields?: ('name' | 'description' | 'parameters')[];
+  max_results?: number;
+  mcp_server?: string | string[];
+}
 
 /**
- * Creates the Zod schema with dynamic query description based on mode.
+ * Creates the JSON schema with dynamic query description based on mode.
  * @param mode - The search mode determining query interpretation
- * @returns Zod schema for tool search parameters
+ * @returns JSON schema for tool search parameters
  */
 function createToolSearchSchema(mode: t.ToolSearchMode): ToolSearchSchema {
   const queryDescription =
@@ -61,33 +65,39 @@ function createToolSearchSchema(mode: t.ToolSearchMode): ToolSearchSchema {
       ? 'Search term to find in tool names and descriptions. Case-insensitive substring matching. Optional if mcp_server is provided.'
       : 'Regex pattern to search tool names and descriptions. Optional if mcp_server is provided.';
 
-  return z.object({
-    query: z
-      .string()
-      .max(MAX_PATTERN_LENGTH)
-      .optional()
-      .default('')
-      .describe(queryDescription),
-    fields: z
-      .array(z.enum(['name', 'description', 'parameters']))
-      .optional()
-      .default(['name', 'description'])
-      .describe('Which fields to search. Default: name and description'),
-    max_results: z
-      .number()
-      .int()
-      .min(1)
-      .max(50)
-      .optional()
-      .default(10)
-      .describe('Maximum number of matching tools to return'),
-    mcp_server: z
-      .union([z.string(), z.array(z.string())])
-      .optional()
-      .describe(
-        'Filter to tools from specific MCP server(s). Can be a single server name or array of names. If provided without a query, lists all tools from those servers.'
-      ),
-  });
+  return {
+    type: 'object',
+    properties: {
+      query: {
+        type: 'string',
+        maxLength: MAX_PATTERN_LENGTH,
+        default: '',
+        description: queryDescription,
+      },
+      fields: {
+        type: 'array',
+        items: { type: 'string', enum: ['name', 'description', 'parameters'] },
+        default: ['name', 'description'],
+        description: 'Which fields to search. Default: name and description',
+      },
+      max_results: {
+        type: 'integer',
+        minimum: 1,
+        maximum: 50,
+        default: 10,
+        description: 'Maximum number of matching tools to return',
+      },
+      mcp_server: {
+        oneOf: [
+          { type: 'string' },
+          { type: 'array', items: { type: 'string' } },
+        ],
+        description:
+          'Filter to tools from specific MCP server(s). Can be a single server name or array of names. If provided without a query, lists all tools from those servers.',
+      },
+    },
+    required: [],
+  };
 }
 
 /**
@@ -748,7 +758,7 @@ function formatServerListing(
  */
 function createToolSearch(
   initParams: t.ToolSearchParams = {}
-): DynamicStructuredTool<ReturnType<typeof createToolSearchSchema>> {
+): DynamicStructuredTool {
   const mode: t.ToolSearchMode = initParams.mode ?? 'code_interpreter';
   const defaultOnlyDeferred = initParams.onlyDeferred ?? true;
   const schema = createToolSearchSchema(mode);
@@ -802,10 +812,11 @@ Searches deferred tools by regex pattern.
 ${mcpNote}${toolsListSection}
 `.trim();
 
-  return tool<typeof schema>(
-    async (params, config) => {
+  return tool(
+    async (rawParams, config) => {
+      const params = rawParams as ToolSearchParams;
       const {
-        query,
+        query = '',
         fields = ['name', 'description'],
         max_results = 10,
         mcp_server,

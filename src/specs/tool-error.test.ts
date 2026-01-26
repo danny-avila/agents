@@ -1,4 +1,3 @@
-import { z } from 'zod';
 import { config } from 'dotenv';
 config();
 import { tool } from '@langchain/core/tools';
@@ -21,7 +20,13 @@ const errorTool = tool(
   {
     name: 'errorTool',
     description: 'A tool that always throws an error',
-    schema: z.object({ input: z.string().optional() }),
+    schema: {
+      type: 'object',
+      properties: {
+        input: { type: 'string' },
+      },
+      required: [],
+    },
   }
 );
 

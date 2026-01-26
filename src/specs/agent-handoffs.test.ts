@@ -1,5 +1,4 @@
 // src/specs/agent-handoffs.test.ts
-import { z } from 'zod';
 import { DynamicStructuredTool } from '@langchain/core/tools';
 import { HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type { ToolCall } from '@langchain/core/messages/tool';
@@ -708,7 +707,7 @@ describe('Agent Handoffs Tests', () => {
       const customTool = new DynamicStructuredTool({
         name: 'custom_tool',
         description: 'A custom tool',
-        schema: z.object({}),
+        schema: { type: 'object', properties: {}, required: [] },
         func: async (): Promise<string> => 'Tool result',
       });
 

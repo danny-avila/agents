@@ -1,4 +1,3 @@
-import { z } from 'zod';
 import { config } from 'dotenv';
 import fetch, { RequestInit } from 'node-fetch';
 import { HttpsProxyAgent } from 'https-proxy-agent';
@@ -21,25 +20,33 @@ const accessMessage =
 const emptyOutputMessage =
   'stdout: Empty. Ensure you\'re writing output explicitly.\n';
 
-const CodeExecutionToolSchema = z.object({
-  lang: z
-    .enum([
-      'py',
-      'js',
-      'ts',
-      'c',
-      'cpp',
-      'java',
-      'php',
-      'rs',
-      'go',
-      'd',
-      'f90',
-      'r',
-    ])
-    .describe('The programming language or runtime to execute the code in.'),
-  code: z.string()
-    .describe(`The complete, self-contained code to execute, without any truncation or minimization.
+const SUPPORTED_LANGUAGES = [
+  'py',
+  'js',
+  'ts',
+  'c',
+  'cpp',
+  'java',
+  'php',
+  'rs',
+  'go',
+  'd',
+  'f90',
+  'r',
+] as const;
+
+const CodeExecutionToolSchema = {
+  type: 'object',
+  properties: {
+    lang: {
+      type: 'string',
+      enum: SUPPORTED_LANGUAGES,
+      description:
+        'The programming language or runtime to execute the code in.',
+    },
+    code: {
+      type: 'string',
+      description: `The complete, self-contained code to execute, without any truncation or minimization.
 - The environment is stateless; variables and imports don't persist between executions.
 - Generated files from previous executions are automatically available in "/mnt/data/".
 - Files from previous executions are automatically available and can be modified in place.
@@ -50,21 +57,26 @@ const CodeExecutionToolSchema = z.object({
 - py: Matplotlib: Use \`plt.savefig()\` to save plots as files.
 - js: use the \`console\` or \`process\` methods for all outputs.
 - r: IMPORTANT: No X11 display available. ALL graphics MUST use Cairo library (library(Cairo)).
-- Other languages: use appropriate output functions.`),
-  args: z
-    .array(z.string())
-    .optional()
-    .describe(
-      'Additional arguments to execute the code with. This should only be used if the input code requires additional arguments to run.'
-    ),
-});
+- Other languages: use appropriate output functions.`,
+    },
+    args: {
+      type: 'array',
+      items: { type: 'string' },
+      description:
+        'Additional arguments to execute the code with. This should only be used if the input code requires additional arguments to run.',
+    },
+  },
+  required: ['lang', 'code'],
+} as const;
 
 const baseEndpoint = getCodeBaseURL();
 const EXEC_ENDPOINT = `${baseEndpoint}/exec`;
 
+type SupportedLanguage = (typeof SUPPORTED_LANGUAGES)[number];
+
 function createCodeExecutionTool(
   params: t.CodeExecutionToolParams = {}
-): DynamicStructuredTool<typeof CodeExecutionToolSchema> {
+): DynamicStructuredTool {
   const apiKey =
     params[EnvVar.CODE_API_KEY] ??
     params.apiKey ??
@@ -83,8 +95,13 @@ Usage:
 - NEVER use this tool to execute malicious code.
 `.trim();
 
-  return tool<typeof CodeExecutionToolSchema>(
-    async ({ lang, code, ...rest }, config) => {
+  return tool(
+    async (rawInput, config) => {
+      const { lang, code, ...rest } = rawInput as {
+        lang: SupportedLanguage;
+        code: string;
+        args?: string[];
+      };
       /**
        * Extract session context from config.toolCall (injected by ToolNode).
        * - session_id: For API to associate with previous session

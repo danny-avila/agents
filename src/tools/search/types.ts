@@ -1,4 +1,3 @@
-import { z } from 'zod';
 import type { Logger as WinstonLogger } from 'winston';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { BaseReranker } from './rerankers';
@@ -657,31 +656,8 @@ export type ProcessSourcesFields = {
   onGetHighlights: SearchToolConfig['onGetHighlights'];
 };
 
-export type SearchToolSchema = z.ZodObject<
-  {
-    query: z.ZodString;
-    date: z.ZodOptional<z.ZodNativeEnum<typeof DATE_RANGE>>;
-    country?: z.ZodOptional<z.ZodString>;
-    images: z.ZodOptional<z.ZodBoolean>;
-    videos: z.ZodOptional<z.ZodBoolean>;
-    news: z.ZodOptional<z.ZodBoolean>;
-  },
-  'strip',
-  z.ZodTypeAny,
-  {
-    query: string;
-    date?: DATE_RANGE;
-    country?: unknown;
-    images?: boolean;
-    videos?: boolean;
-    news?: boolean;
-  },
-  {
-    query: string;
-    date?: DATE_RANGE;
-    country?: unknown;
-    images?: boolean;
-    videos?: boolean;
-    news?: boolean;
-  }
->;
+export interface SearchToolSchema {
+  type: 'object';
+  properties: Record<string, unknown>;
+  required: string[];
+}

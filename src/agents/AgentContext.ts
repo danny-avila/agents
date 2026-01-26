@@ -1,6 +1,5 @@
 /* eslint-disable no-console */
 // src/agents/AgentContext.ts
-import { zodToJsonSchema } from 'zod-to-json-schema';
 import { SystemMessage } from '@langchain/core/messages';
 import { RunnableLambda } from '@langchain/core/runnables';
 import type {
@@ -12,6 +11,7 @@ import type { RunnableConfig, Runnable } from '@langchain/core/runnables';
 import type * as t from '@/types';
 import type { createPruneMessages } from '@/messages';
 import { ContentTypes, Providers } from '@/common';
+import { toJsonSchema } from '@/utils/schema';
 
 /**
  * Encapsulates agent-specific state that can vary between agents in a multi-agent system
@@ -479,15 +479,10 @@ export class AgentContext {
           genericTool.schema != null &&
           typeof genericTool.schema === 'object'
         ) {
-          const schema = genericTool.schema as {
-            describe: (desc: string) => unknown;
-          };
-          const describedSchema = schema.describe(
-            (genericTool.description as string) || ''
-          );
-          const jsonSchema = zodToJsonSchema(
-            describedSchema as Parameters<typeof zodToJsonSchema>[0],
-            (genericTool.name as string) || ''
+          const jsonSchema = toJsonSchema(
+            genericTool.schema,
+            (genericTool.name as string | undefined) ?? '',
+            (genericTool.description as string | undefined) ?? ''
           );
           toolTokens += tokenCounter(
             new SystemMessage(JSON.stringify(jsonSchema))
@@ -496,7 +491,6 @@ export class AgentContext {
       }
     }
 
-    // Add tool tokens to existing instruction tokens (which may already include system message tokens)
     this.instructionTokens += toolTokens;
   }
 
