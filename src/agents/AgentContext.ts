@@ -10,6 +10,7 @@ import type {
 import type { RunnableConfig, Runnable } from '@langchain/core/runnables';
 import type * as t from '@/types';
 import type { createPruneMessages } from '@/messages';
+import { createSchemaOnlyTools } from '@/tools/schema';
 import { ContentTypes, Providers } from '@/common';
 import { toJsonSchema } from '@/utils/schema';
 
@@ -571,40 +572,70 @@ export class AgentContext {
 
   /**
    * Gets tools that should be bound to the LLM.
-   * Includes:
+   * In event-driven mode (toolDefinitions present, tools empty), creates schema-only tools.
+   * Otherwise filters tool instances based on:
    * 1. Non-deferred tools with allowed_callers: ['direct']
    * 2. Discovered tools (from tool search)
    * @returns Array of tools to bind to model
    */
   getToolsForBinding(): t.GraphTools | undefined {
+    /** Event-driven mode: create schema-only tools from definitions */
+    if (this.toolDefinitions && this.toolDefinitions.length > 0) {
+      return this.getEventDrivenToolsForBinding();
+    }
+
+    /** Traditional mode: filter actual tool instances */
     if (!this.tools || !this.toolRegistry) {
       return this.tools;
     }
 
-    const toolsToInclude = this.tools.filter((tool) => {
+    return this.filterToolsForBinding(this.tools);
+  }
+
+  /** Creates schema-only tools from toolDefinitions for event-driven mode */
+  private getEventDrivenToolsForBinding(): t.GraphTools {
+    if (!this.toolDefinitions) {
+      return [];
+    }
+
+    const defsToInclude = this.toolDefinitions.filter((def) => {
+      const allowedCallers = def.allowed_callers ?? ['direct'];
+      if (!allowedCallers.includes('direct')) {
+        return false;
+      }
+      if (
+        def.defer_loading === true &&
+        !this.discoveredToolNames.has(def.name)
+      ) {
+        return false;
+      }
+      return true;
+    });
+
+    return createSchemaOnlyTools(defsToInclude) as t.GraphTools;
+  }
+
+  /** Filters tool instances for binding based on registry config */
+  private filterToolsForBinding(tools: t.GraphTools): t.GraphTools {
+    return tools.filter((tool) => {
       if (!('name' in tool)) {
-        return true; // No name, include by default
+        return true;
       }
 
       const toolDef = this.toolRegistry?.get(tool.name);
       if (!toolDef) {
-        return true; // Not in registry, include by default
+        return true;
       }
 
-      // Check if discovered (overrides defer_loading)
       if (this.discoveredToolNames.has(tool.name)) {
-        // Discovered tools must still have allowed_callers: ['direct']
         const allowedCallers = toolDef.allowed_callers ?? ['direct'];
         return allowedCallers.includes('direct');
       }
 
-      // Not discovered: must be direct-callable AND not deferred
       const allowedCallers = toolDef.allowed_callers ?? ['direct'];
       return (
         allowedCallers.includes('direct') && toolDef.defer_loading !== true
       );
     });
-
-    return toolsToInclude;
   }
 }
