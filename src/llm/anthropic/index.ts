@@ -179,17 +179,19 @@ export class CustomAnthropic extends ChatAnthropicMessages {
         );
       }
 
+      const maxTokens = Math.max(1, this.maxTokens ?? 4096);
       return {
         model: this.model,
         stop_sequences: options?.stop ?? this.stopSequences,
         stream: this.streaming,
-        max_tokens: this.maxTokens,
+        max_tokens: maxTokens,
         tools: this.formatStructuredToolToAnthropic(options?.tools),
         tool_choice,
         thinking: this.thinking,
         ...this.invocationKwargs,
       };
     }
+    const maxTokens = Math.max(1, this.maxTokens ?? 4096);
     return {
       model: this.model,
       temperature: this.temperature,
@@ -197,7 +199,7 @@ export class CustomAnthropic extends ChatAnthropicMessages {
       top_p: this.topP,
       stop_sequences: options?.stop ?? this.stopSequences,
       stream: this.streaming,
-      max_tokens: this.maxTokens,
+      max_tokens: maxTokens,
       tools: this.formatStructuredToolToAnthropic(options?.tools),
       tool_choice,
       thinking: this.thinking,
