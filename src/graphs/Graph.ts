@@ -659,16 +659,28 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }
 
       const toolsForBinding = agentContext.getToolsForBinding();
+
+      // Initialize model WITHOUT tools to allow system runnable to pipe correctly.
+      // For Bedrock specifically, when system message is piped AFTER tool binding,
+      // it creates a conflict where both "system" field and system message appear,
+      // causing "The additional field system conflicts with an existing field" error.
+      // By piping system runnable first, we ensure proper message ordering before tools are bound.
       let model =
         this.overrideModel ??
         this.initializeModel({
-          tools: toolsForBinding,
+          tools: [], // Empty array - tools will be bound after system runnable
           provider: agentContext.provider,
           clientOptions: agentContext.clientOptions,
         });
 
+      // Pipe system runnable BEFORE binding tools
       if (agentContext.systemRunnable) {
         model = agentContext.systemRunnable.pipe(model as Runnable);
+      }
+
+      // Bind tools AFTER system runnable is piped
+      if (toolsForBinding && toolsForBinding.length > 0) {
+        model = (model as t.ModelWithTools).bindTools(toolsForBinding);
       }
 
       if (agentContext.tokenCalculationPromise) {
