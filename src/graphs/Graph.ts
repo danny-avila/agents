@@ -659,27 +659,27 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }
 
       const toolsForBinding = agentContext.getToolsForBinding();
+      const hasTools = (toolsForBinding?.length ?? 0) > 0;
+      const isBedrock = agentContext.provider === Providers.BEDROCK;
+      // For Bedrock with tools: We need special handling to avoid "system conflicts" error
+      // Store system instructions to inject them later via CustomChatBedrockConverse
+      const skipSystemPipe = isBedrock && hasTools;
 
-      // Initialize model WITHOUT tools to allow system runnable to pipe correctly.
-      // For Bedrock specifically, when system message is piped AFTER tool binding,
-      // it creates a conflict where both "system" field and system message appear,
-      // causing "The additional field system conflicts with an existing field" error.
-      // By piping system runnable first, we ensure proper message ordering before tools are bound.
       let model =
         this.overrideModel ??
         this.initializeModel({
-          tools: [], // Empty array - tools will be bound after system runnable
+          tools: skipSystemPipe ? toolsForBinding : [], // Bedrock+tools: bind tools now
           provider: agentContext.provider,
           clientOptions: agentContext.clientOptions,
         });
 
-      // Pipe system runnable BEFORE binding tools
-      if (agentContext.systemRunnable) {
+      // Pipe system runnable (except Bedrock with tools)
+      if (!skipSystemPipe && agentContext.systemRunnable) {
         model = agentContext.systemRunnable.pipe(model as Runnable);
       }
 
-      // Bind tools AFTER system runnable is piped
-      if (toolsForBinding && toolsForBinding.length > 0) {
+      // Bind tools (except Bedrock with tools, already bound above)
+      if (!skipSystemPipe && hasTools) {
         model = (model as t.ModelWithTools).bindTools(toolsForBinding);
       }
 
