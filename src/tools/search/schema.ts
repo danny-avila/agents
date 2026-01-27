@@ -66,3 +66,17 @@ export const newsSchema = {
   type: 'boolean',
   description: 'Whether to also run a news search.',
 } as const;
+
+/** Combined web search tool schema with all properties */
+export const WebSearchToolSchema = {
+  type: 'object',
+  properties: {
+    query: querySchema,
+    date: dateSchema,
+    country: countrySchema,
+    images: imagesSchema,
+    videos: videosSchema,
+    news: newsSchema,
+  },
+  required: ['query'],
+} as const;

@@ -35,7 +35,7 @@ const SUPPORTED_LANGUAGES = [
   'r',
 ] as const;
 
-const CodeExecutionToolSchema = {
+export const CodeExecutionToolSchema = {
   type: 'object',
   properties: {
     lang: {

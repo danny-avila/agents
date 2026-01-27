@@ -1,6 +1,18 @@
 import { Tool } from '@langchain/core/tools';
 import * as math from 'mathjs';
 
+/** Calculator tool schema for structured input */
+export const CalculatorSchema = {
+  type: 'object',
+  properties: {
+    input: {
+      type: 'string',
+      description: 'A valid mathematical expression to evaluate',
+    },
+  },
+  required: ['input'],
+} as const;
+
 export class Calculator extends Tool {
   static lc_name(): string {
     return 'Calculator';
