@@ -139,7 +139,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   /**
    * Processes MCP artifact content by:
    * 1. Converting MCP image format to standard image_url format
-   * 2. Filtering base64 images if vision is disabled
+   * 2. Filtering images if vision is disabled
    */
   private processArtifact(artifact: unknown): t.MCPArtifact | undefined {
     if (
@@ -150,6 +150,16 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       !Array.isArray(artifact.content)
     ) {
       return undefined;
+    }
+
+    if (typeof this.visionCapable !== 'boolean') {
+      console.warn(
+        '[ToolNode] Invalid visionCapable value, defaulting to false',
+        {
+          visionCapable: this.visionCapable,
+        }
+      );
+      this.visionCapable = false;
     }
 
     const artifactObj = artifact as t.MCPArtifact;
@@ -176,11 +186,18 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       return item;
     });
 
-    // Filter base64 images if vision is disabled
     if (!this.visionCapable) {
-      artifactObj.content = artifactObj.content.filter(
-        (item) => !this.isBase64ImageUrl(item)
-      );
+      artifactObj.content = artifactObj.content.filter((item) => {
+        if (
+          item &&
+          typeof item === 'object' &&
+          'type' in item &&
+          item.type === 'image_url'
+        ) {
+          return false;
+        }
+        return true;
+      });
     }
 
     return artifactObj;
