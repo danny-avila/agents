@@ -19,6 +19,8 @@ export enum GraphEvents {
   ON_MESSAGE_DELTA = 'on_message_delta',
   /** [Custom] Reasoning Delta events for messages */
   ON_REASONING_DELTA = 'on_reasoning_delta',
+  /** [Custom] Request to execute tools - dispatched by ToolNode, handled by host */
+  ON_TOOL_EXECUTE = 'on_tool_execute',
 
   /* Official Events */
 

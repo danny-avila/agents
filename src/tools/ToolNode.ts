@@ -20,7 +20,8 @@ import type { BaseMessage, AIMessage } from '@langchain/core/messages';
 import type { StructuredToolInterface } from '@langchain/core/tools';
 import type * as t from '@/types';
 import { RunnableCallable } from '@/utils';
-import { Constants } from '@/common';
+import { safeDispatchCustomEvent } from '@/utils/events';
+import { Constants, GraphEvents } from '@/common';
 
 /**
  * Helper to check if a value is a Send object
@@ -44,6 +45,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private programmaticCache?: t.ProgrammaticCache;
   /** Reference to Graph's sessions map for automatic session injection */
   private sessions?: t.ToolSessionMap;
+  /** When true, dispatches ON_TOOL_EXECUTE events instead of invoking tools directly */
+  private eventDrivenMode: boolean = false;
+  /** Tool definitions for event-driven mode */
+  private toolDefinitions?: Map<string, t.LCTool>;
 
   constructor({
     tools,
@@ -56,6 +61,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     loadRuntimeTools,
     toolRegistry,
     sessions,
+    eventDrivenMode,
+    toolDefinitions,
   }: t.ToolNodeConstructorParams) {
     super({ name, tags, func: (input, config) => this.run(input, config) });
     this.toolMap = toolMap ?? new Map(tools.map((tool) => [tool.name, tool]));
@@ -66,6 +73,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     this.toolUsageCount = new Map<string, number>();
     this.toolRegistry = toolRegistry;
     this.sessions = sessions;
+    this.eventDrivenMode = eventDrivenMode ?? false;
+    this.toolDefinitions = toolDefinitions;
   }
 
   /**
@@ -243,11 +252,77 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     }
   }
 
+  /**
+   * Execute all tool calls via ON_TOOL_EXECUTE event dispatch.
+   * Used in event-driven mode where the host handles actual tool execution.
+   */
+  private async executeViaEvent(
+    toolCalls: ToolCall[],
+    config: RunnableConfig,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    input: any
+  ): Promise<T> {
+    const requests: t.ToolCallRequest[] = toolCalls.map((call) => {
+      const turn = this.toolUsageCount.get(call.name) ?? 0;
+      this.toolUsageCount.set(call.name, turn + 1);
+      return {
+        id: call.id!,
+        name: call.name,
+        args: call.args as Record<string, unknown>,
+        stepId: this.toolCallStepIds?.get(call.id!),
+        turn,
+      };
+    });
+
+    const results = await new Promise<t.ToolExecuteResult[]>(
+      (resolve, reject) => {
+        const request: t.ToolExecuteBatchRequest = {
+          toolCalls: requests,
+          userId: config.configurable?.user_id as string | undefined,
+          agentId: config.configurable?.agent_id as string | undefined,
+          resolve,
+          reject,
+        };
+
+        safeDispatchCustomEvent(GraphEvents.ON_TOOL_EXECUTE, request, config);
+      }
+    );
+
+    const outputs: ToolMessage[] = results.map((result) => {
+      const toolName =
+        requests.find((r) => r.id === result.toolCallId)?.name ?? 'unknown';
+
+      if (result.status === 'error') {
+        return new ToolMessage({
+          status: 'error',
+          content: `Error: ${result.errorMessage ?? 'Unknown error'}\n Please fix your mistakes.`,
+          name: toolName,
+          tool_call_id: result.toolCallId,
+        });
+      }
+
+      return new ToolMessage({
+        status: 'success',
+        content:
+          typeof result.content === 'string'
+            ? result.content
+            : JSON.stringify(result.content),
+        name: toolName,
+        tool_call_id: result.toolCallId,
+      });
+    });
+
+    return (Array.isArray(input) ? outputs : { messages: outputs }) as T;
+  }
+
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   protected async run(input: any, config: RunnableConfig): Promise<T> {
     let outputs: (BaseMessage | Command)[];
 
     if (this.isSendInput(input)) {
+      if (this.eventDrivenMode) {
+        return this.executeViaEvent([input.lg_tool_call], config, input);
+      }
       outputs = [await this.runTool(input.lg_tool_call, config)];
     } else {
       let messages: BaseMessage[];
@@ -289,21 +364,26 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         this.programmaticCache = undefined; // Invalidate cache on toolMap change
       }
 
+      const filteredCalls =
+        aiMessage.tool_calls?.filter((call) => {
+          /**
+           * Filter out:
+           * 1. Already processed tool calls (present in toolMessageIds)
+           * 2. Server tool calls (e.g., web_search with IDs starting with 'srvtoolu_')
+           *    which are executed by the provider's API and don't require invocation
+           */
+          return (
+            (call.id == null || !toolMessageIds.has(call.id)) &&
+            !(call.id?.startsWith('srvtoolu_') ?? false)
+          );
+        }) ?? [];
+
+      if (this.eventDrivenMode && filteredCalls.length > 0) {
+        return this.executeViaEvent(filteredCalls, config, input);
+      }
+
       outputs = await Promise.all(
-        aiMessage.tool_calls
-          ?.filter((call) => {
-            /**
-             * Filter out:
-             * 1. Already processed tool calls (present in toolMessageIds)
-             * 2. Server tool calls (e.g., web_search with IDs starting with 'srvtoolu_')
-             *    which are executed by the provider's API and don't require invocation
-             */
-            return (
-              (call.id == null || !toolMessageIds.has(call.id)) &&
-              !(call.id?.startsWith('srvtoolu_') ?? false)
-            );
-          })
-          .map((call) => this.runTool(call, config)) ?? []
+        filteredCalls.map((call) => this.runTool(call, config))
       );
     }
 

@@ -13,6 +13,8 @@ export * from './tools/Calculator';
 export * from './tools/CodeExecutor';
 export * from './tools/ProgrammaticToolCalling';
 export * from './tools/ToolSearch';
+export * from './tools/ToolNode';
+export * from './tools/createSchemaOnlyTool';
 export * from './tools/handlers';
 export * from './tools/search';
 

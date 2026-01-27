@@ -34,6 +34,7 @@ export class AgentContext {
       toolMap,
       toolEnd,
       toolRegistry,
+      toolDefinitions,
       instructions,
       additional_instructions,
       streamBuffer,
@@ -52,6 +53,7 @@ export class AgentContext {
       tools,
       toolMap,
       toolRegistry,
+      toolDefinitions,
       instructions,
       additionalInstructions: additional_instructions,
       reasoningKey,
@@ -118,6 +120,11 @@ export class AgentContext {
    * Used for tool search and programmatic tool calling.
    */
   toolRegistry?: t.LCToolRegistry;
+  /**
+   * Serializable tool definitions for event-driven execution.
+   * When provided, ToolNode operates in event-driven mode.
+   */
+  toolDefinitions?: t.LCTool[];
   /** Set of tool names discovered via tool search (to be loaded) */
   discoveredToolNames: Set<string> = new Set();
   /** Instructions for this agent */
@@ -171,6 +178,7 @@ export class AgentContext {
     tools,
     toolMap,
     toolRegistry,
+    toolDefinitions,
     instructions,
     additionalInstructions,
     reasoningKey,
@@ -188,6 +196,7 @@ export class AgentContext {
     tools?: t.GraphTools;
     toolMap?: t.ToolMap;
     toolRegistry?: t.LCToolRegistry;
+    toolDefinitions?: t.LCTool[];
     instructions?: string;
     additionalInstructions?: string;
     reasoningKey?: 'reasoning_content' | 'reasoning';
@@ -205,6 +214,7 @@ export class AgentContext {
     this.tools = tools;
     this.toolMap = toolMap;
     this.toolRegistry = toolRegistry;
+    this.toolDefinitions = toolDefinitions;
     this.instructions = instructions;
     this.additionalInstructions = additionalInstructions;
     if (reasoningKey) {
