@@ -319,8 +319,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             : JSON.stringify(result.content);
         toolMessage = new ToolMessage({
           status: 'success',
-          content: contentString,
           name: toolName,
+          content: contentString,
+          artifact: result.artifact,
           tool_call_id: result.toolCallId,
         });
       }
