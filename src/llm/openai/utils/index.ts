@@ -294,6 +294,36 @@ export interface ConvertMessagesOptions {
   includeReasoningDetails?: boolean;
   /** Convert reasoning_details to content blocks for Claude (requires content array format) */
   convertReasoningDetailsToContent?: boolean;
+  /**
+   * When false, image_url parts are stripped from all message content before sending.
+   * Prevents "model is not a multimodal model" / "No endpoints found that support image input" errors.
+   */
+  visionCapable?: boolean;
+}
+
+/** Placeholder text when image content is stripped for non-vision models */
+const IMAGE_OMITTED_PLACEHOLDER =
+  '(Image content omitted — model does not support vision)';
+
+function filterImagePartsIfNeeded(
+  content: string | unknown[],
+  visionCapable: boolean
+): string | unknown[] {
+  if (visionCapable) {
+    return content;
+  }
+  if (typeof content === 'string') {
+    return content;
+  }
+  const filtered = content.filter((m: unknown) => {
+    if (m && typeof m === 'object' && 'type' in m) {
+      return (m as { type: string }).type !== 'image_url';
+    }
+    return true;
+  });
+  return filtered.length > 0
+    ? filtered
+    : [{ type: 'text' as const, text: IMAGE_OMITTED_PLACEHOLDER }];
 }
 
 // Used in LangSmith, export is important here
@@ -302,6 +332,8 @@ export function _convertMessagesToOpenAIParams(
   model?: string,
   options?: ConvertMessagesOptions
 ): OpenAICompletionParam[] {
+  const visionCapable = options?.visionCapable ?? true;
+
   // TODO: Function messages do not support array content, fix cast
   return messages.flatMap((message) => {
     let role = messageToOpenAIRole(message);
@@ -311,7 +343,7 @@ export function _convertMessagesToOpenAIParams(
 
     let hasAnthropicThinkingBlock: boolean = false;
 
-    const content =
+    let content: string | unknown[] =
       typeof message.content === 'string'
         ? message.content
         : message.content.map((m) => {
@@ -351,6 +383,22 @@ export function _convertMessagesToOpenAIParams(
           }
           return m;
         });
+
+    content = filterImagePartsIfNeeded(content, visionCapable);
+    // OpenAI tool/output messages require string content
+    if (role === 'tool' && Array.isArray(content)) {
+      content =
+        content.length === 0
+          ? (IMAGE_OMITTED_PLACEHOLDER as unknown as string)
+          : content.length === 1 &&
+              typeof content[0] === 'object' &&
+              content[0] !== null &&
+              'type' in content[0] &&
+              (content[0] as { type: string }).type === 'text' &&
+              'text' in content[0]
+            ? ((content[0] as { text: string }).text as unknown as string)
+            : (JSON.stringify(content) as unknown as string);
+    }
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const completionParam: Record<string, any> = {
       role,
@@ -534,7 +582,8 @@ function _convertReasoningSummaryToOpenAIResponsesParams(
 export function _convertMessagesToOpenAIResponsesParams(
   messages: BaseMessage[],
   model?: string,
-  zdrEnabled?: boolean
+  zdrEnabled?: boolean,
+  visionCapable: boolean = true
 ): ResponsesInputItem[] {
   return messages.flatMap(
     (lcMsg): ResponsesInputItem | ResponsesInputItem[] => {
@@ -555,27 +604,53 @@ export function _convertMessagesToOpenAIResponsesParams(
 
       if (role === 'tool') {
         const toolMessage = lcMsg as ToolMessage;
+        let toolContent = toolMessage.content;
+        if (!visionCapable && Array.isArray(toolContent)) {
+          const filtered = toolContent.filter(
+            (i: unknown) =>
+              !(
+                i &&
+                typeof i === 'object' &&
+                'type' in i &&
+                (i as { type: string }).type === 'image_url'
+              )
+          );
+          toolContent =
+            filtered.length > 0 ? filtered : IMAGE_OMITTED_PLACEHOLDER;
+        }
 
         // Handle computer call output
         if (additional_kwargs.type === 'computer_call_output') {
+          if (!visionCapable) {
+            return {
+              type: 'function_call_output',
+              call_id: toolMessage.tool_call_id,
+              id: toolMessage.id?.startsWith('fc_')
+                ? toolMessage.id
+                : undefined,
+              output: IMAGE_OMITTED_PLACEHOLDER,
+            };
+          }
           const output = (() => {
-            if (typeof toolMessage.content === 'string') {
+            if (typeof toolContent === 'string') {
               return {
                 type: 'computer_screenshot' as const,
-                image_url: toolMessage.content,
+                image_url: toolContent,
               };
             }
 
-            if (Array.isArray(toolMessage.content)) {
-              const oaiScreenshot = toolMessage.content.find(
-                (i) => i.type === 'computer_screenshot'
-              ) as { type: 'computer_screenshot'; image_url: string };
+            if (Array.isArray(toolContent)) {
+              const oaiScreenshot = toolContent.find(
+                (i: { type?: string }) => i.type === 'computer_screenshot'
+              ) as
+                | { type: 'computer_screenshot'; image_url: string }
+                | undefined;
 
               if (oaiScreenshot) return oaiScreenshot;
 
-              const lcImage = toolMessage.content.find(
-                (i) => i.type === 'image_url'
-              ) as MessageContentImageUrl;
+              const lcImage = toolContent.find(
+                (i: { type?: string }) => i.type === 'image_url'
+              ) as MessageContentImageUrl | undefined;
 
               if (lcImage) {
                 return {
@@ -603,9 +678,9 @@ export function _convertMessagesToOpenAIResponsesParams(
           call_id: toolMessage.tool_call_id,
           id: toolMessage.id?.startsWith('fc_') ? toolMessage.id : undefined,
           output:
-            typeof toolMessage.content !== 'string'
-              ? JSON.stringify(toolMessage.content)
-              : toolMessage.content,
+            typeof toolContent !== 'string'
+              ? JSON.stringify(toolContent)
+              : toolContent,
         };
       }
 
@@ -758,6 +833,9 @@ export function _convertMessagesToOpenAIResponsesParams(
             };
           }
           if (item.type === 'image_url') {
+            if (!visionCapable) {
+              return [];
+            }
             // Normalize image_url to ensure correct format
             const imageUrl = item.image_url;
             const imageUrlValue =
@@ -784,8 +862,19 @@ export function _convertMessagesToOpenAIResponsesParams(
           return [];
         });
 
-        if (content.length > 0) {
-          messages.push({ type: 'message', role, content });
+        const finalContent =
+          content.length > 0
+            ? content
+            : !visionCapable
+              ? [
+                {
+                  type: 'input_text' as const,
+                  text: IMAGE_OMITTED_PLACEHOLDER,
+                },
+              ]
+              : content;
+        if (finalContent.length > 0) {
+          messages.push({ type: 'message', role, content: finalContent });
         }
         return messages;
       }

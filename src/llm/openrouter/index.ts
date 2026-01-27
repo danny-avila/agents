@@ -89,6 +89,7 @@ export class ChatOpenRouter extends ChatOpenAI {
       _convertMessagesToOpenAIParams(messages, this.model, {
         includeReasoningDetails: true,
         convertReasoningDetailsToContent: true,
+        visionCapable: this.visionCapable,
       });
 
     const params = {

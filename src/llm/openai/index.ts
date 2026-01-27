@@ -198,13 +198,19 @@ export class CustomAzureOpenAIClient extends AzureOpenAIClient {
 export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
   _lc_stream_delay?: number;
 
+  /** When false, image_url parts are stripped before sending (avoids non-multimodal API errors). */
+  protected visionCapable: boolean;
+
   constructor(
     fields?: t.ChatOpenAICallOptions & {
       _lc_stream_delay?: number;
+      vision?: boolean;
     } & t.OpenAIChatInput['modelKwargs']
   ) {
-    super(fields);
-    this._lc_stream_delay = fields?._lc_stream_delay;
+    const { vision, _lc_stream_delay, ...rest } = fields ?? {};
+    super(rest as typeof fields);
+    this._lc_stream_delay = _lc_stream_delay;
+    this.visionCapable = vision ?? true;
   }
 
   public get exposedClient(): CustomOpenAIClient {
@@ -286,7 +292,8 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
         input: _convertMessagesToOpenAIResponsesParams(
           messages,
           this.model,
-          this.zdrEnabled
+          this.zdrEnabled,
+          this.visionCapable
         ),
         stream: true,
       },
@@ -321,7 +328,9 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
     const messagesMapped: OpenAICompletionParam[] =
-      _convertMessagesToOpenAIParams(messages, this.model);
+      _convertMessagesToOpenAIParams(messages, this.model, {
+        visionCapable: this.visionCapable,
+      });
 
     const params = {
       ...this.invocationParams(options, {
@@ -458,9 +467,18 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
 export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
   _lc_stream_delay?: number;
 
-  constructor(fields?: t.AzureOpenAIInput & { _lc_stream_delay?: number }) {
-    super(fields);
-    this._lc_stream_delay = fields?._lc_stream_delay;
+  protected visionCapable: boolean;
+
+  constructor(
+    fields?: t.AzureOpenAIInput & {
+      _lc_stream_delay?: number;
+      vision?: boolean;
+    }
+  ) {
+    const { vision, _lc_stream_delay, ...rest } = fields ?? {};
+    super(rest as typeof fields);
+    this._lc_stream_delay = _lc_stream_delay;
+    this.visionCapable = vision ?? true;
   }
 
   public get exposedClient(): CustomOpenAIClient {
@@ -580,7 +598,8 @@ export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
         input: _convertMessagesToOpenAIResponsesParams(
           messages,
           this.model,
-          this.zdrEnabled
+          this.zdrEnabled,
+          this.visionCapable
         ),
         stream: true,
       },
@@ -610,6 +629,17 @@ export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
   }
 }
 export class ChatDeepSeek extends OriginalChatDeepSeek {
+  protected visionCapable: boolean;
+
+  constructor(
+    fields?: ConstructorParameters<typeof OriginalChatDeepSeek>[0] & {
+      vision?: boolean;
+    }
+  ) {
+    const { vision, ...rest } = fields ?? {};
+    super(rest as ConstructorParameters<typeof OriginalChatDeepSeek>[0]);
+    this.visionCapable = vision ?? true;
+  }
   public get exposedClient(): CustomOpenAIClient {
     return this.client;
   }
@@ -652,6 +682,7 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
     const messagesMapped: OpenAICompletionParam[] =
       _convertMessagesToOpenAIParams(messages, this.model, {
         includeReasoningContent: true,
+        visionCapable: this.visionCapable,
       });
 
     const params = {
@@ -792,15 +823,19 @@ export interface XAIUsageMetadata
 export class ChatXAI extends OriginalChatXAI {
   _lc_stream_delay?: number;
 
+  protected visionCapable: boolean;
+
   constructor(
     fields?: Partial<ChatXAIInput> & {
       configuration?: { baseURL?: string };
       clientConfig?: { baseURL?: string };
       _lc_stream_delay?: number;
+      vision?: boolean;
     }
   ) {
     super(fields);
     this._lc_stream_delay = fields?._lc_stream_delay;
+    this.visionCapable = fields?.vision ?? true;
     const customBaseURL =
       fields?.configuration?.baseURL ?? fields?.clientConfig?.baseURL;
     if (customBaseURL != null && customBaseURL) {
@@ -856,7 +891,9 @@ export class ChatXAI extends OriginalChatXAI {
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
     const messagesMapped: OpenAICompletionParam[] =
-      _convertMessagesToOpenAIParams(messages, this.model);
+      _convertMessagesToOpenAIParams(messages, this.model, {
+        visionCapable: this.visionCapable,
+      });
 
     const params = {
       ...this.invocationParams(options, {

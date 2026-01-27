@@ -460,7 +460,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         StandardGraph.handleToolCallErrorStatic(this, data, metadata),
       toolRegistry: agentContext?.toolRegistry,
       sessions: this.sessions,
-      visionCapable: agentContext?.vision ?? false,
     });
   }
 
@@ -638,12 +637,16 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }
 
       const toolsForBinding = agentContext.getToolsForBinding();
+      const clientOptionsWithVision = {
+        ...agentContext.clientOptions,
+        vision: agentContext.vision,
+      } as unknown as t.ClientOptions;
       let model =
         this.overrideModel ??
         this.initializeModel({
           tools: toolsForBinding,
           provider: agentContext.provider,
-          clientOptions: agentContext.clientOptions,
+          clientOptions: clientOptionsWithVision,
         });
 
       if (agentContext.systemRunnable) {
@@ -729,8 +732,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         if (msg._getType() !== 'tool') return false;
         const toolMsg = msg as ToolMessage & { artifact?: t.MCPArtifact };
         return (
-          toolMsg.artifact != null ||
-          toolMsg.additional_kwargs.artifact != null
+          toolMsg.artifact != null || toolMsg.additional_kwargs.artifact != null
         );
       });
 

@@ -44,8 +44,6 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private programmaticCache?: t.ProgrammaticCache;
   /** Reference to Graph's sessions map for automatic session injection */
   private sessions?: t.ToolSessionMap;
-  /** Whether the agent supports vision capabilities (for artifact filtering) */
-  private visionCapable: boolean;
 
   constructor({
     tools,
@@ -58,7 +56,6 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     loadRuntimeTools,
     toolRegistry,
     sessions,
-    visionCapable,
   }: t.ToolNodeConstructorParams) {
     super({ name, tags, func: (input, config) => this.run(input, config) });
     this.toolMap = toolMap ?? new Map(tools.map((tool) => [tool.name, tool]));
@@ -69,7 +66,6 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     this.toolUsageCount = new Map<string, number>();
     this.toolRegistry = toolRegistry;
     this.sessions = sessions;
-    this.visionCapable = visionCapable ?? false;
   }
 
   /**
@@ -107,39 +103,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   }
 
   /**
-   * Checks if an image_url content item contains base64 data (not an HTTP URL).
-   * Base64 data URLs start with "data:" and can cause context overflow when sent to non-vision models.
-   */
-  private isBase64ImageUrl(item: unknown): boolean {
-    if (
-      typeof item !== 'object' ||
-      item === null ||
-      !('type' in item) ||
-      item.type !== 'image_url'
-    ) {
-      return false;
-    }
-
-    const imageUrlItem = item as t.ImageUrlContent;
-    const imageUrl = imageUrlItem.image_url;
-
-    if (typeof imageUrl === 'string') {
-      return imageUrl.startsWith('data:');
-    }
-
-    if (typeof imageUrl === 'object' && imageUrl && 'url' in imageUrl) {
-      return (
-        typeof imageUrl.url === 'string' && imageUrl.url.startsWith('data:')
-      );
-    }
-
-    return false;
-  }
-
-  /**
-   * Processes MCP artifact content by:
-   * 1. Converting MCP image format to standard image_url format
-   * 2. Filtering images if vision is disabled
+   * Processes MCP artifact: normalizes MCP image format (type: 'image' with data:) to
+   * image_url format. Artifact is the second element of [content, artifact].
+   * Image parts are not filtered here; the LLM layer strips them when !visionCapable.
    */
   private processArtifact(artifact: unknown): t.MCPArtifact | undefined {
     if (
@@ -150,16 +116,6 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       !Array.isArray(artifact.content)
     ) {
       return undefined;
-    }
-
-    if (typeof this.visionCapable !== 'boolean') {
-      console.warn(
-        '[ToolNode] Invalid visionCapable value, defaulting to false',
-        {
-          visionCapable: this.visionCapable,
-        }
-      );
-      this.visionCapable = false;
     }
 
     const artifactObj = artifact as t.MCPArtifact;
@@ -185,20 +141,6 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       }
       return item;
     });
-
-    if (!this.visionCapable) {
-      artifactObj.content = artifactObj.content.filter((item) => {
-        if (
-          item &&
-          typeof item === 'object' &&
-          'type' in item &&
-          item.type === 'image_url'
-        ) {
-          return false;
-        }
-        return true;
-      });
-    }
 
     return artifactObj;
   }
