@@ -472,6 +472,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         sessions: this.sessions,
         eventDrivenMode: true,
         toolDefinitions: toolDefMap,
+        agentId: agentContext?.agentId,
       });
     }
 

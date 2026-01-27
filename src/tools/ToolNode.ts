@@ -49,6 +49,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private eventDrivenMode: boolean = false;
   /** Tool definitions for event-driven mode */
   private toolDefinitions?: Map<string, t.LCTool>;
+  /** Agent ID for event-driven mode */
+  private agentId?: string;
 
   constructor({
     tools,
@@ -63,6 +65,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     sessions,
     eventDrivenMode,
     toolDefinitions,
+    agentId,
   }: t.ToolNodeConstructorParams) {
     super({ name, tags, func: (input, config) => this.run(input, config) });
     this.toolMap = toolMap ?? new Map(tools.map((tool) => [tool.name, tool]));
@@ -75,6 +78,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     this.sessions = sessions;
     this.eventDrivenMode = eventDrivenMode ?? false;
     this.toolDefinitions = toolDefinitions;
+    this.agentId = agentId;
   }
 
   /**
@@ -279,7 +283,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         const request: t.ToolExecuteBatchRequest = {
           toolCalls: requests,
           userId: config.configurable?.user_id as string | undefined,
-          agentId: config.configurable?.agent_id as string | undefined,
+          agentId: this.agentId,
+          configurable: config.configurable as
+            | Record<string, unknown>
+            | undefined,
+          metadata: config.metadata as Record<string, unknown> | undefined,
           resolve,
           reject,
         };
@@ -289,27 +297,61 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     );
 
     const outputs: ToolMessage[] = results.map((result) => {
-      const toolName =
-        requests.find((r) => r.id === result.toolCallId)?.name ?? 'unknown';
+      const request = requests.find((r) => r.id === result.toolCallId);
+      const toolName = request?.name ?? 'unknown';
+      const stepId = this.toolCallStepIds?.get(result.toolCallId) ?? '';
+
+      let toolMessage: ToolMessage;
+      let contentString: string;
 
       if (result.status === 'error') {
-        return new ToolMessage({
+        contentString = `Error: ${result.errorMessage ?? 'Unknown error'}\n Please fix your mistakes.`;
+        toolMessage = new ToolMessage({
           status: 'error',
-          content: `Error: ${result.errorMessage ?? 'Unknown error'}\n Please fix your mistakes.`,
+          content: contentString,
+          name: toolName,
+          tool_call_id: result.toolCallId,
+        });
+      } else {
+        contentString =
+          typeof result.content === 'string'
+            ? result.content
+            : JSON.stringify(result.content);
+        toolMessage = new ToolMessage({
+          status: 'success',
+          content: contentString,
           name: toolName,
           tool_call_id: result.toolCallId,
         });
       }
 
-      return new ToolMessage({
-        status: 'success',
-        content:
-          typeof result.content === 'string'
-            ? result.content
-            : JSON.stringify(result.content),
+      const tool_call: t.ProcessedToolCall = {
+        args:
+          typeof request?.args === 'string'
+            ? request.args
+            : JSON.stringify(request?.args ?? {}),
         name: toolName,
-        tool_call_id: result.toolCallId,
-      });
+        id: result.toolCallId,
+        output: contentString,
+        progress: 1,
+      };
+
+      const runStepCompletedData = {
+        result: {
+          id: stepId,
+          index: request?.turn ?? 0,
+          type: 'tool_call' as const,
+          tool_call,
+        },
+      };
+
+      safeDispatchCustomEvent(
+        GraphEvents.ON_RUN_STEP_COMPLETED,
+        runStepCompletedData,
+        config
+      );
+
+      return toolMessage;
     });
 
     return (Array.isArray(input) ? outputs : { messages: outputs }) as T;

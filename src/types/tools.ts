@@ -45,6 +45,8 @@ export type ToolNodeOptions = {
   eventDrivenMode?: boolean;
   /** Tool definitions for event-driven mode (used for context, not invocation) */
   toolDefinitions?: Map<string, LCTool>;
+  /** Agent ID for event-driven mode (used to identify which agent's context to use) */
+  agentId?: string;
 };
 
 export type ToolNodeConstructorParams = ToolRefs & ToolNodeOptions;
@@ -159,6 +161,10 @@ export type ToolExecuteBatchRequest = {
   userId?: string;
   /** Agent ID for context */
   agentId?: string;
+  /** Runtime configurable from RunnableConfig (includes user, userMCPAuthMap, etc.) */
+  configurable?: Record<string, unknown>;
+  /** Runtime metadata from RunnableConfig (includes thread_id, run_id, provider, etc.) */
+  metadata?: Record<string, unknown>;
   /** Promise resolver - handler calls this with ALL results */
   resolve: (results: ToolExecuteResult[]) => void;
   /** Promise rejector - handler calls this on fatal error */
