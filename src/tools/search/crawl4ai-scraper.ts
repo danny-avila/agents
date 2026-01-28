@@ -49,6 +49,7 @@ export class Crawl4AIScraper implements t.BaseScraper {
     this.timeout = config.timeout ?? 10000;
     this.extractionStrategy = config.extractionStrategy;
     this.chunkingStrategy = config.chunkingStrategy;
+    this.fitStrategy = config.fitStrategy;
 
     // crawl4ai has ways to filter raw markdown,
     // by default, we'll assume a fit (pruning) strategy
