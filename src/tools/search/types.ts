@@ -114,6 +114,7 @@ export interface Crawl4AIScraperConfig {
   logger?: Logger;
   extractionStrategy?: string;
   chunkingStrategy?: string;
+  fitStrategy?: string;
 }
 
 export interface ScraperContentResult {
@@ -323,6 +324,7 @@ export interface SerperScrapeResponse {
   error?: string;
 }
 
+// TODO
 export interface Crawl4AIScrapeResponse {
   success: boolean;
   data?: {
@@ -335,6 +337,7 @@ export interface Crawl4AIScrapeResponse {
       url?: string;
       markdown?: {
         raw_markdown?: string;
+        fit_markdown?: string;
         markdown_with_citations?: string;
         references_markdown?: string;
       };

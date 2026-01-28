@@ -36,6 +36,7 @@ export class Crawl4AIScraper implements t.BaseScraper {
   private logger: t.Logger;
   private extractionStrategy?: string;
   private chunkingStrategy?: string;
+  private fitStrategy?: string;
 
   constructor(config: t.Crawl4AIScraperConfig = {}) {
     this.apiKey = config.apiKey ?? process.env.CRAWL4AI_API_KEY ?? '';
@@ -48,6 +49,11 @@ export class Crawl4AIScraper implements t.BaseScraper {
     this.timeout = config.timeout ?? 10000;
     this.extractionStrategy = config.extractionStrategy;
     this.chunkingStrategy = config.chunkingStrategy;
+
+    // crawl4ai has ways to filter raw markdown,
+    // by default, we'll assume a fit (pruning) strategy
+    // to process raw markdown before passing it back
+    this.fitStrategy = config.fitStrategy === "raw" ? "raw" : "fit"; 
 
     this.logger = config.logger || createDefaultLogger();
 
@@ -77,6 +83,7 @@ export class Crawl4AIScraper implements t.BaseScraper {
       const payload: Record<string, unknown> = {
         url,
         cache: '0', // Bypass cache by default
+        f: this.fitStrategy
       };
 
       // Build headers - only include Authorization if API key is provided
@@ -132,6 +139,11 @@ export class Crawl4AIScraper implements t.BaseScraper {
       response.data.results.length > 0
     ) {
       const result = response.data.results[0];
+
+      // If there's fit markdown from /crawl, try that first
+      if (result.markdown?.fit_markdown != null) {
+        return [result.markdown.fit_markdown, undefined]
+      }
 
       // Extract from markdown object (Crawl4AI /crawl structure)
       if (result.markdown?.raw_markdown != null) {
