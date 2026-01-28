@@ -2,13 +2,15 @@ import { tool, DynamicStructuredTool } from '@langchain/core/tools';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type * as t from './types';
 import {
-  DATE_RANGE,
-  querySchema,
-  dateSchema,
+  WebSearchToolDescription,
+  WebSearchToolName,
   countrySchema,
   imagesSchema,
   videosSchema,
+  querySchema,
+  dateSchema,
   newsSchema,
+  DATE_RANGE,
 } from './schema';
 import { createSearchAPI, createSourceProcessor } from './search';
 import { createSerperScraper } from './serper-scraper';
@@ -295,30 +297,8 @@ function createTool({
       return [output, { [Constants.WEB_SEARCH]: data }];
     },
     {
-      name: Constants.WEB_SEARCH,
-      description: `Real-time search. Results have required citation anchors.
-
-Note: Use ONCE per reply unless instructed otherwise.
-
-Anchors:
-- \\ue202turnXtypeY
-- X = turn idx, type = 'search' | 'news' | 'image' | 'ref', Y = item idx
-
-Special Markers:
-- \\ue203...\\ue204 — highlight start/end of cited text (for Standalone or Group citations)
-- \\ue200...\\ue201 — group block (e.g. \\ue200\\ue202turn0search1\\ue202turn0news2\\ue201)
-
-**CITE EVERY NON-OBVIOUS FACT/QUOTE:**
-Use anchor marker(s) immediately after the statement:
-- Standalone: "Pure functions produce same output. \\ue202turn0search0"
-- Standalone (multiple): "Today's News \\ue202turn0search0\\ue202turn0news0"
-- Highlight: "\\ue203Highlight text.\\ue204\\ue202turn0news1"
-- Group: "Sources. \\ue200\\ue202turn0search0\\ue202turn0news1\\ue201"
-- Group Highlight: "\\ue203Highlight for group.\\ue204 \\ue200\\ue202turn0search0\\ue202turn0news1\\ue201"
-- Image: "See photo \\ue202turn0image0."
-
-**NEVER use markdown links, [1], or footnotes. CITE ONLY with anchors provided.**
-`.trim(),
+      name: WebSearchToolName,
+      description: WebSearchToolDescription,
       schema: schema,
       responseFormat: Constants.CONTENT_AND_ARTIFACT,
     }
