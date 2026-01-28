@@ -324,7 +324,6 @@ export interface SerperScrapeResponse {
   error?: string;
 }
 
-// TODO
 export interface Crawl4AIScrapeResponse {
   success: boolean;
   data?: {
