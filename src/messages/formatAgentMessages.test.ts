@@ -478,8 +478,7 @@ describe('formatAgentMessages', () => {
               id: 'ts_1',
               name: 'tool_search',
               args: '{"query":"commits"}',
-              output:
-                '{"found": 1, "tools": [{"name": "list_commits_mcp_github"}]}',
+              output: '{"found": 1, "tools": [{"name": "list_commits_mcp_github"}]}',
             },
           },
         ],
@@ -635,7 +634,8 @@ describe('formatAgentMessages', () => {
           },
           {
             type: ContentTypes.TEXT,
-            [ContentTypes.TEXT]: 'Found the tool! Now I will list the commits.',
+            [ContentTypes.TEXT]:
+              'Found the tool! Now I will list the commits.',
             tool_call_ids: ['commits_1'],
           },
           {
