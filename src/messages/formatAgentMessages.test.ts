@@ -306,6 +306,153 @@ describe('formatAgentMessages', () => {
     ]);
   });
 
+  it('should dynamically discover tools from tool_search output and keep their tool calls', () => {
+    const tools = new Set(['tool_search', 'calculator']);
+    const payload = [
+      {
+        role: 'user',
+        content: 'Search for commits and list them',
+      },
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]: 'I\'ll search for tools first.',
+            tool_call_ids: ['ts_1'],
+          },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 'ts_1',
+              name: 'tool_search',
+              args: '{"query":"commits"}',
+              output: '{"found": 1, "tools": [{"name": "list_commits"}]}',
+            },
+          },
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]: 'Now listing commits.',
+            tool_call_ids: ['lc_1'],
+          },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 'lc_1',
+              name: 'list_commits',
+              args: '{"repo":"test"}',
+              output: '[{"sha":"abc123"}]',
+            },
+          },
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]: 'Here are the results.',
+          },
+        ],
+      },
+      {
+        role: 'user',
+        content: 'Thanks!',
+      },
+    ];
+
+    const result = formatAgentMessages(payload, undefined, tools);
+
+    /**
+     * Since tool_search discovered list_commits, both should be kept.
+     * The dynamic discovery adds list_commits to the valid tools set.
+     */
+    const toolMessages = result.messages.filter(
+      (m) => m._getType() === 'tool'
+    ) as ToolMessage[];
+    expect(toolMessages.length).toBe(2);
+
+    const toolNames = toolMessages.map((m) => m.name).sort();
+    expect(toolNames).toEqual(['list_commits', 'tool_search']);
+  });
+
+  it('should filter out tool calls not in set and not discovered by tool_search', () => {
+    const tools = new Set(['tool_search', 'calculator']);
+    const payload = [
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]: 'I\'ll call an unknown tool.',
+            tool_call_ids: ['uk_1'],
+          },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 'uk_1',
+              name: 'unknown_tool',
+              args: '{}',
+              output: 'result',
+            },
+          },
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]: 'Done.',
+          },
+        ],
+      },
+    ];
+
+    const result = formatAgentMessages(payload, undefined, tools);
+
+    /** unknown_tool should be filtered out since it's not in tools set and not discovered */
+    const toolMessages = result.messages.filter(
+      (m) => m._getType() === 'tool'
+    ) as ToolMessage[];
+    expect(toolMessages.length).toBe(0);
+  });
+
+  it('should keep all tool calls when all are in the tools set', () => {
+    const tools = new Set(['search', 'calculator']);
+    const payload = [
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]: 'Let me help.',
+            tool_call_ids: ['s1', 'c1'],
+          },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 's1',
+              name: 'search',
+              args: '{"q":"test"}',
+              output: 'Search results',
+            },
+          },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 'c1',
+              name: 'calculator',
+              args: '{"expr":"2+2"}',
+              output: '4',
+            },
+          },
+        ],
+      },
+    ];
+
+    const result = formatAgentMessages(payload, undefined, tools);
+
+    const toolMessages = result.messages.filter(
+      (m) => m._getType() === 'tool'
+    ) as ToolMessage[];
+    expect(toolMessages.length).toBe(2);
+    expect(toolMessages.map((m) => m.name).sort()).toEqual([
+      'calculator',
+      'search',
+    ]);
+  });
+
   it.skip('should not produce two consecutive assistant messages and format content correctly', () => {
     const payload = [
       { role: 'user', content: 'Hello' },
