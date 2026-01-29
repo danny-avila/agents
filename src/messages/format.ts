@@ -720,16 +720,18 @@ export const formatAgentMessages = (
     const startMessageIndex = messages.length;
 
     /**
-     * If tools set is provided, filter out invalid tool_calls from the content.
-     * Only remove tool_calls that reference tools not in the set - keep valid ones.
-     * Dynamically expand the set when tool_search results are encountered.
+     * If tools set is provided, process tool_calls:
+     * - Keep valid tool_calls (tools in the set or dynamically discovered)
+     * - Convert invalid tool_calls to string representation for context preservation
+     * - Dynamically expand the set when tool_search results are encountered
      */
     let processedMessage = message;
-    if (discoveredTools && discoveredTools.size > 0) {
+    if (discoveredTools) {
       const content = message.content;
       if (content && Array.isArray(content)) {
         const filteredContent: typeof content = [];
         const invalidToolCallIds = new Set<string>();
+        const invalidToolStrings: string[] = [];
 
         for (const part of content) {
           if (part.type !== ContentTypes.TOOL_CALL) {
@@ -775,13 +777,15 @@ export const formatAgentMessages = (
             /** Valid tool - keep it */
             filteredContent.push(part);
           } else {
-            /** Invalid tool - track its ID so we can remove tool_call_ids references */
+            /** Invalid tool - convert to string for context preservation */
             if (
               typeof part.tool_call.id === 'string' &&
               part.tool_call.id !== ''
             ) {
               invalidToolCallIds.add(part.tool_call.id);
             }
+            const output = part.tool_call.output ?? '';
+            invalidToolStrings.push(`Tool: ${toolName}, ${output}`);
           }
         }
 
@@ -802,8 +806,46 @@ export const formatAgentMessages = (
           }
         }
 
-        /** Use filtered content if we removed any invalid tools */
-        if (filteredContent.length !== content.length) {
+        /** Append invalid tool strings to the content for context preservation */
+        if (invalidToolStrings.length > 0) {
+          /** Find the last text part or create one */
+          let lastTextPartIndex = -1;
+          for (let j = filteredContent.length - 1; j >= 0; j--) {
+            if (filteredContent[j].type === ContentTypes.TEXT) {
+              lastTextPartIndex = j;
+              break;
+            }
+          }
+
+          const invalidToolText = invalidToolStrings.join('\n');
+          if (lastTextPartIndex >= 0) {
+            const lastTextPart = filteredContent[lastTextPartIndex] as {
+              type: string;
+              [ContentTypes.TEXT]?: string;
+              text?: string;
+            };
+            const existingText =
+              lastTextPart[ContentTypes.TEXT] ?? lastTextPart.text ?? '';
+            filteredContent[lastTextPartIndex] = {
+              ...lastTextPart,
+              [ContentTypes.TEXT]: existingText
+                ? `${existingText}\n${invalidToolText}`
+                : invalidToolText,
+            };
+          } else {
+            /** No text part exists, create one */
+            filteredContent.push({
+              type: ContentTypes.TEXT,
+              [ContentTypes.TEXT]: invalidToolText,
+            });
+          }
+        }
+
+        /** Use filtered content if we made any changes */
+        if (
+          filteredContent.length !== content.length ||
+          invalidToolStrings.length > 0
+        ) {
           processedMessage = { ...message, content: filteredContent };
         }
       }
