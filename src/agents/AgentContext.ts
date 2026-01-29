@@ -42,6 +42,7 @@ export class AgentContext {
       maxContextTokens,
       reasoningKey,
       useLegacyContent,
+      discoveredTools,
     } = agentConfig;
 
     const agentContext = new AgentContext({
@@ -62,6 +63,7 @@ export class AgentContext {
       instructionTokens: 0,
       tokenCounter,
       useLegacyContent,
+      discoveredTools,
     });
 
     if (tokenCounter) {
@@ -186,6 +188,7 @@ export class AgentContext {
     toolEnd,
     instructionTokens,
     useLegacyContent,
+    discoveredTools,
   }: {
     agentId: string;
     name?: string;
@@ -204,6 +207,7 @@ export class AgentContext {
     toolEnd?: boolean;
     instructionTokens?: number;
     useLegacyContent?: boolean;
+    discoveredTools?: string[];
   }) {
     this.agentId = agentId;
     this.name = name;
@@ -229,6 +233,12 @@ export class AgentContext {
     }
 
     this.useLegacyContent = useLegacyContent ?? false;
+
+    if (discoveredTools && discoveredTools.length > 0) {
+      for (const toolName of discoveredTools) {
+        this.discoveredToolNames.add(toolName);
+      }
+    }
   }
 
   /**

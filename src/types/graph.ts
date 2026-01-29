@@ -383,4 +383,10 @@ export interface AgentInputs {
    * ON_TOOL_EXECUTE events instead of invoking tools directly.
    */
   toolDefinitions?: LCTool[];
+  /**
+   * Tool names discovered from previous conversation history.
+   * These tools will be pre-marked as discovered so they're included
+   * in tool binding without requiring tool_search.
+   */
+  discoveredTools?: string[];
 }
