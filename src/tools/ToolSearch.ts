@@ -33,6 +33,49 @@ config();
 /** Maximum allowed regex pattern length */
 const MAX_PATTERN_LENGTH = 200;
 
+export const ToolSearchToolName = Constants.TOOL_SEARCH;
+
+export const ToolSearchToolDescription =
+  'Searches deferred tools using BM25 ranking. Multi-word queries supported. Use mcp_server param to filter by server.';
+
+export const ToolSearchToolSchema = {
+  type: 'object',
+  properties: {
+    query: {
+      type: 'string',
+      maxLength: MAX_PATTERN_LENGTH,
+      default: '',
+      description:
+        'Search term to find in tool names and descriptions. Case-insensitive substring matching. Optional if mcp_server is provided.',
+    },
+    fields: {
+      type: 'array',
+      items: { type: 'string', enum: ['name', 'description', 'parameters'] },
+      default: ['name', 'description'],
+      description: 'Which fields to search. Default: name and description',
+    },
+    max_results: {
+      type: 'integer',
+      minimum: 1,
+      maximum: 50,
+      default: 10,
+      description: 'Maximum number of matching tools to return',
+    },
+    mcp_server: {
+      oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }],
+      description:
+        'Filter to tools from specific MCP server(s). Can be a single server name or array of names. If provided without a query, lists all tools from those servers.',
+    },
+  },
+  required: [],
+} as const;
+
+export const ToolSearchToolDefinition = {
+  name: ToolSearchToolName,
+  description: ToolSearchToolDescription,
+  schema: ToolSearchToolSchema,
+} as const;
+
 /** Maximum allowed regex nesting depth */
 const MAX_REGEX_COMPLEXITY = 5;
 

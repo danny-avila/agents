@@ -32,7 +32,7 @@ const DEFAULT_TIMEOUT = 60000;
 // Schema
 // ============================================================================
 
-const ProgrammaticToolCallingSchema = {
+export const ProgrammaticToolCallingSchema = {
   type: 'object',
   properties: {
     code: {
@@ -78,6 +78,34 @@ Rules:
     },
   },
   required: ['code'],
+} as const;
+
+export const ProgrammaticToolCallingName = Constants.PROGRAMMATIC_TOOL_CALLING;
+
+export const ProgrammaticToolCallingDescription = `
+Run tools via Python code. Auto-wrapped in async context—just use \`await\` directly.
+
+CRITICAL - STATELESS: Each call is a fresh interpreter. Variables/imports do NOT persist.
+Complete your ENTIRE workflow in ONE call: fetch → process → save. No splitting across calls.
+
+Rules:
+- Everything in ONE code block—no state carries over between executions
+- Do NOT define \`async def main()\` or call \`asyncio.run()\`—just write code with await
+- Tools are pre-defined—DO NOT write function definitions
+- Only \`print()\` output returns; tool results are raw dicts/lists/strings
+- Generated files are automatically available in /mnt/data/ for subsequent executions
+- Tool names normalized: hyphens→underscores, keywords get \`_tool\` suffix
+
+When to use: loops, conditionals, parallel (\`asyncio.gather\`), multi-step pipelines.
+
+Example (complete pipeline):
+  data = await query_db(sql="..."); df = process(data); await save_to_sheet(data=df); print("Done")
+`.trim();
+
+export const ProgrammaticToolCallingDefinition = {
+  name: ProgrammaticToolCallingName,
+  description: ProgrammaticToolCallingDescription,
+  schema: ProgrammaticToolCallingSchema,
 } as const;
 
 // ============================================================================
