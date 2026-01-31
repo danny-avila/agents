@@ -21,7 +21,7 @@ import type {
 } from './types';
 import type { BindToolsInput } from '@langchain/core/language_models/chat_models';
 import type { BaseMessage, UsageMetadata } from '@langchain/core/messages';
-import type { ChatResult } from '@langchain/core/outputs';
+import type { ChatResult, ChatGeneration } from '@langchain/core/outputs';
 import type { ChatXAIInput } from '@langchain/xai';
 import type * as t from '@langchain/openai';
 import {
@@ -648,13 +648,12 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
       }
     );
 
-    const { completion_tokens, prompt_tokens, total_tokens } =
-      data.usage ?? {};
+    const { completion_tokens, prompt_tokens, total_tokens } = data.usage ?? {};
 
     const generations = [];
     for (const part of data.choices ?? []) {
       const text = part.message.content ?? '';
-      const generation: import('@langchain/core/outputs').ChatGeneration = {
+      const generation: ChatGeneration = {
         text: typeof text === 'string' ? text : '',
         message: this._convertResponseToMessage(part, data),
       };
@@ -696,7 +695,11 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
     if (rawToolCalls) {
       additional_kwargs.tool_calls = rawToolCalls;
     }
-    if ('reasoning_content' in message && message.reasoning_content) {
+    if (
+      'reasoning_content' in message &&
+      message.reasoning_content != null &&
+      message.reasoning_content !== ''
+    ) {
       additional_kwargs.reasoning_content = message.reasoning_content;
     }
 
@@ -907,7 +910,7 @@ export class ChatMoonshot extends ChatOpenAI {
     messages: BaseMessage[],
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun
-  ): Promise<import('@langchain/core/outputs').ChatResult> {
+  ): Promise<ChatResult> {
     const params = this.invocationParams(options);
 
     if (params.stream === true) {
@@ -927,13 +930,12 @@ export class ChatMoonshot extends ChatOpenAI {
       }
     );
 
-    const { completion_tokens, prompt_tokens, total_tokens } =
-      data.usage ?? {};
+    const { completion_tokens, prompt_tokens, total_tokens } = data.usage ?? {};
 
     const generations = [];
     for (const part of data.choices ?? []) {
       const text = part.message.content ?? '';
-      const generation: import('@langchain/core/outputs').ChatGeneration = {
+      const generation: ChatGeneration = {
         text: typeof text === 'string' ? text : '',
         message: this._convertResponseToMessage(part, data),
       };
@@ -973,7 +975,11 @@ export class ChatMoonshot extends ChatOpenAI {
     if (rawToolCalls) {
       additional_kwargs.tool_calls = rawToolCalls;
     }
-    if ('reasoning_content' in message && message.reasoning_content) {
+    if (
+      'reasoning_content' in message &&
+      message.reasoning_content != null &&
+      message.reasoning_content !== ''
+    ) {
       additional_kwargs.reasoning_content = message.reasoning_content;
     }
 
