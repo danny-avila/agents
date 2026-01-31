@@ -120,6 +120,16 @@ export const llmConfigs: Record<string, t.LLMConfig | undefined> = {
     streaming: true,
     streamUsage: true,
   },
+  [Providers.MOONSHOT]: {
+    provider: Providers.MOONSHOT,
+    model: 'kimi-k2.5',
+    streaming: true,
+    streamUsage: true,
+    configuration: {
+      apiKey: process.env.MOONSHOT_API_KEY,
+      baseURL: 'https://api.moonshot.ai/v1',
+    },
+  },
   [Providers.ANTHROPIC]: {
     provider: Providers.ANTHROPIC,
     model: 'claude-sonnet-4-5',

@@ -84,6 +84,7 @@ export enum Providers {
   DEEPSEEK = 'deepseek',
   OPENROUTER = 'openrouter',
   XAI = 'xai',
+  MOONSHOT = 'moonshot',
 }
 
 export enum GraphNodeKeys {
