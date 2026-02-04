@@ -29,25 +29,25 @@ const DEFAULT_MAX_ROUND_TRIPS = 20;
 const DEFAULT_TIMEOUT = 60000;
 
 // ============================================================================
-// Schema
+// Description Components (Single Source of Truth)
 // ============================================================================
 
-export const ProgrammaticToolCallingSchema = {
-  type: 'object',
-  properties: {
-    code: {
-      type: 'string',
-      minLength: 1,
-      description: `Python code that calls tools programmatically. Tools are available as async functions.
-
-CRITICAL - STATELESS EXECUTION:
+const STATELESS_WARNING = `CRITICAL - STATELESS EXECUTION:
 Each call is a fresh Python interpreter. Variables, imports, and data do NOT persist between calls.
 You MUST complete your entire workflow in ONE code block: query → process → output.
-DO NOT split work across multiple calls expecting to reuse variables.
+DO NOT split work across multiple calls expecting to reuse variables.`;
 
-Your code is auto-wrapped in async context. Just write logic with await—no boilerplate needed.
+const CORE_RULES = `Rules:
+- EVERYTHING in one call—no state persists between executions
+- Just write code with await—auto-wrapped in async context
+- DO NOT define async def main() or call asyncio.run()
+- Tools are pre-defined—DO NOT write function definitions
+- Only print() output returns to the model`;
 
-Example (Complete workflow in one call):
+const ADDITIONAL_RULES = `- Generated files are automatically available in /mnt/data/ for subsequent executions
+- Tool names normalized: hyphens→underscores, keywords get \`_tool\` suffix`;
+
+const EXAMPLES = `Example (Complete workflow in one call):
   # Query data
   data = await query_database(sql="SELECT * FROM users")
   # Process it
@@ -59,14 +59,29 @@ Example (Complete workflow in one call):
 
 Example (Parallel calls):
   sf, ny = await asyncio.gather(get_weather(city="SF"), get_weather(city="NY"))
-  print(f"SF: {sf}, NY: {ny}")
+  print(f"SF: {sf}, NY: {ny}")`;
 
-Rules:
-- EVERYTHING in one call—no state persists between executions
-- Just write code with await—auto-wrapped in async context
-- DO NOT define async def main() or call asyncio.run()
-- Tools are pre-defined—DO NOT write function definitions
-- Only print() output returns to the model`,
+// ============================================================================
+// Schema
+// ============================================================================
+
+const CODE_PARAM_DESCRIPTION = `Python code that calls tools programmatically. Tools are available as async functions.
+
+${STATELESS_WARNING}
+
+Your code is auto-wrapped in async context. Just write logic with await—no boilerplate needed.
+
+${EXAMPLES}
+
+${CORE_RULES}`;
+
+export const ProgrammaticToolCallingSchema = {
+  type: 'object',
+  properties: {
+    code: {
+      type: 'string',
+      minLength: 1,
+      description: CODE_PARAM_DESCRIPTION,
     },
     timeout: {
       type: 'integer',
@@ -85,21 +100,14 @@ export const ProgrammaticToolCallingName = Constants.PROGRAMMATIC_TOOL_CALLING;
 export const ProgrammaticToolCallingDescription = `
 Run tools via Python code. Auto-wrapped in async context—just use \`await\` directly.
 
-CRITICAL - STATELESS: Each call is a fresh interpreter. Variables/imports do NOT persist.
-Complete your ENTIRE workflow in ONE call: fetch → process → save. No splitting across calls.
+${STATELESS_WARNING}
 
-Rules:
-- Everything in ONE code block—no state carries over between executions
-- Do NOT define \`async def main()\` or call \`asyncio.run()\`—just write code with await
-- Tools are pre-defined—DO NOT write function definitions
-- Only \`print()\` output returns; tool results are raw dicts/lists/strings
-- Generated files are automatically available in /mnt/data/ for subsequent executions
-- Tool names normalized: hyphens→underscores, keywords get \`_tool\` suffix
+${CORE_RULES}
+${ADDITIONAL_RULES}
 
 When to use: loops, conditionals, parallel (\`asyncio.gather\`), multi-step pipelines.
 
-Example (complete pipeline):
-  data = await query_db(sql="..."); df = process(data); await save_to_sheet(data=df); print("Done")
+${EXAMPLES}
 `.trim();
 
 export const ProgrammaticToolCallingDefinition = {
@@ -624,26 +632,6 @@ export function createProgrammaticToolCallingTool(
   const debug = initParams.debug ?? process.env.PTC_DEBUG === 'true';
   const EXEC_ENDPOINT = `${baseUrl}/exec/programmatic`;
 
-  const description = `
-Run tools via Python code. Auto-wrapped in async context—just use \`await\` directly.
-
-CRITICAL - STATELESS: Each call is a fresh interpreter. Variables/imports do NOT persist.
-Complete your ENTIRE workflow in ONE call: fetch → process → save. No splitting across calls.
-
-Rules:
-- Everything in ONE code block—no state carries over between executions
-- Do NOT define \`async def main()\` or call \`asyncio.run()\`—just write code with await
-- Tools are pre-defined—DO NOT write function definitions
-- Only \`print()\` output returns; tool results are raw dicts/lists/strings
-- Generated files are automatically available in /mnt/data/ for subsequent executions
-- Tool names normalized: hyphens→underscores, keywords get \`_tool\` suffix
-
-When to use: loops, conditionals, parallel (\`asyncio.gather\`), multi-step pipelines.
-
-Example (complete pipeline):
-  data = await query_db(sql="..."); df = process(data); await save_to_sheet(data=df); print("Done")
-`.trim();
-
   return tool(
     async (rawParams, config) => {
       const params = rawParams as { code: string; timeout?: number };
@@ -777,7 +765,7 @@ Example (complete pipeline):
     },
     {
       name: Constants.PROGRAMMATIC_TOOL_CALLING,
-      description,
+      description: ProgrammaticToolCallingDescription,
       schema: ProgrammaticToolCallingSchema,
       responseFormat: Constants.CONTENT_AND_ARTIFACT,
     }
