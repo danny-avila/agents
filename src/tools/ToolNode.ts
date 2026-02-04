@@ -585,17 +585,16 @@ export function toolsCondition<T extends string>(
   toolNode: T,
   invokedToolIds?: Set<string>
 ): T | typeof END {
-  const message: AIMessage = Array.isArray(state)
-    ? state[state.length - 1]
-    : state.messages[state.messages.length - 1];
+  const messages = Array.isArray(state) ? state : state.messages;
+  const message = messages[messages.length - 1] as AIMessage | undefined;
 
   if (
+    message &&
     'tool_calls' in message &&
     (message.tool_calls?.length ?? 0) > 0 &&
     !areToolCallsInvoked(message, invokedToolIds)
   ) {
     return toolNode;
-  } else {
-    return END;
   }
+  return END;
 }

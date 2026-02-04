@@ -293,7 +293,7 @@ export function getMessagesWithinTokenLimit({
 
   if (assistantIndex === -1) {
     throw new Error(
-      'The payload is malformed. There is a thinking sequence but no "AI" messages to append thinking blocks to.'
+      'Context window exceeded: aggressive pruning removed all AI messages (likely due to an oversized tool response). Increase max context tokens or reduce tool output size.'
     );
   }
 
