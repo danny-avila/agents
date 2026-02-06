@@ -461,24 +461,60 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     if (eventDrivenMode) {
       const schemaTools = createSchemaOnlyTools(toolDefinitions);
       const toolDefMap = new Map(toolDefinitions.map((def) => [def.name, def]));
+      const graphTools = agentContext?.graphTools as
+        | t.GenericTool[]
+        | undefined;
+
+      const directToolNames = new Set<string>();
+      const allTools = [...schemaTools] as t.GenericTool[];
+      const allToolMap: t.ToolMap = new Map(
+        schemaTools.map((tool) => [tool.name, tool])
+      );
+
+      if (graphTools && graphTools.length > 0) {
+        for (const tool of graphTools) {
+          if ('name' in tool) {
+            allTools.push(tool);
+            allToolMap.set(tool.name, tool);
+            directToolNames.add(tool.name);
+          }
+        }
+      }
 
       return new CustomToolNode<t.BaseGraphState>({
-        tools: schemaTools as t.GenericTool[],
-        toolMap: new Map(schemaTools.map((tool) => [tool.name, tool])),
-        toolCallStepIds: this.toolCallStepIds,
-        errorHandler: (data, metadata) =>
-          StandardGraph.handleToolCallErrorStatic(this, data, metadata),
-        toolRegistry: agentContext?.toolRegistry,
-        sessions: this.sessions,
+        tools: allTools,
+        toolMap: allToolMap,
         eventDrivenMode: true,
+        sessions: this.sessions,
         toolDefinitions: toolDefMap,
         agentId: agentContext?.agentId,
+        toolCallStepIds: this.toolCallStepIds,
+        toolRegistry: agentContext?.toolRegistry,
+        directToolNames: directToolNames.size > 0 ? directToolNames : undefined,
+        errorHandler: (data, metadata) =>
+          StandardGraph.handleToolCallErrorStatic(this, data, metadata),
       });
     }
 
+    const graphTools = agentContext?.graphTools as t.GenericTool[] | undefined;
+    const baseTools = (currentTools as t.GenericTool[] | undefined) ?? [];
+    const allTraditionalTools =
+      graphTools && graphTools.length > 0
+        ? [...baseTools, ...graphTools]
+        : baseTools;
+    const traditionalToolMap =
+      graphTools && graphTools.length > 0
+        ? new Map([
+          ...(currentToolMap ?? new Map()),
+          ...graphTools
+            .filter((t): t is t.GenericTool & { name: string } => 'name' in t)
+            .map((t) => [t.name, t] as [string, t.GenericTool]),
+        ])
+        : currentToolMap;
+
     return new CustomToolNode<t.BaseGraphState>({
-      tools: (currentTools as t.GenericTool[] | undefined) ?? [],
-      toolMap: currentToolMap,
+      tools: allTraditionalTools,
+      toolMap: traditionalToolMap,
       toolCallStepIds: this.toolCallStepIds,
       errorHandler: (data, metadata) =>
         StandardGraph.handleToolCallErrorStatic(this, data, metadata),

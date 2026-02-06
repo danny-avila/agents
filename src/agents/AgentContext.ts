@@ -116,6 +116,8 @@ export class AgentContext {
   lastStreamCall?: number;
   /** Tools available to this agent */
   tools?: t.GraphTools;
+  /** Graph-managed tools (e.g., handoff tools created by MultiAgentGraph) that bypass event-driven dispatch */
+  graphTools?: t.GraphTools;
   /** Tool map for this agent */
   toolMap?: t.ToolMap;
   /**
@@ -595,17 +597,22 @@ export class AgentContext {
     }
 
     /** Traditional mode: filter actual tool instances */
-    if (!this.tools || !this.toolRegistry) {
-      return this.tools;
+    const filtered =
+      !this.tools || !this.toolRegistry
+        ? this.tools
+        : this.filterToolsForBinding(this.tools);
+
+    if (this.graphTools && this.graphTools.length > 0) {
+      return [...(filtered ?? []), ...this.graphTools];
     }
 
-    return this.filterToolsForBinding(this.tools);
+    return filtered;
   }
 
   /** Creates schema-only tools from toolDefinitions for event-driven mode */
   private getEventDrivenToolsForBinding(): t.GraphTools {
     if (!this.toolDefinitions) {
-      return [];
+      return this.graphTools ?? [];
     }
 
     const defsToInclude = this.toolDefinitions.filter((def) => {
@@ -622,7 +629,13 @@ export class AgentContext {
       return true;
     });
 
-    return createSchemaOnlyTools(defsToInclude) as t.GraphTools;
+    const schemaTools = createSchemaOnlyTools(defsToInclude) as t.GraphTools;
+
+    if (this.graphTools && this.graphTools.length > 0) {
+      return [...schemaTools, ...this.graphTools];
+    }
+
+    return schemaTools;
   }
 
   /** Filters tool instances for binding based on registry config */

@@ -255,11 +255,10 @@ export class MultiAgentGraph extends StandardGraph {
         );
       }
 
-      // Add handoff tools to the agent's existing tools
-      if (!agentContext.tools) {
-        agentContext.tools = [];
+      if (!agentContext.graphTools) {
+        agentContext.graphTools = [];
       }
-      agentContext.tools.push(...handoffTools);
+      agentContext.graphTools.push(...handoffTools);
     }
   }
 

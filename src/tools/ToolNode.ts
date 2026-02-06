@@ -47,10 +47,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private sessions?: t.ToolSessionMap;
   /** When true, dispatches ON_TOOL_EXECUTE events instead of invoking tools directly */
   private eventDrivenMode: boolean = false;
-  /** Tool definitions for event-driven mode */
-  private toolDefinitions?: Map<string, t.LCTool>;
   /** Agent ID for event-driven mode */
   private agentId?: string;
+  /** Tool names that bypass event dispatch and execute directly (e.g., graph-managed handoff tools) */
+  private directToolNames?: Set<string>;
 
   constructor({
     tools,
@@ -64,8 +64,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     toolRegistry,
     sessions,
     eventDrivenMode,
-    toolDefinitions,
     agentId,
+    directToolNames,
   }: t.ToolNodeConstructorParams) {
     super({ name, tags, func: (input, config) => this.run(input, config) });
     this.toolMap = toolMap ?? new Map(tools.map((tool) => [tool.name, tool]));
@@ -77,8 +77,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     this.toolRegistry = toolRegistry;
     this.sessions = sessions;
     this.eventDrivenMode = eventDrivenMode ?? false;
-    this.toolDefinitions = toolDefinitions;
     this.agentId = agentId;
+    this.directToolNames = directToolNames;
   }
 
   /**
@@ -257,15 +257,13 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   }
 
   /**
-   * Execute all tool calls via ON_TOOL_EXECUTE event dispatch.
-   * Used in event-driven mode where the host handles actual tool execution.
+   * Dispatches tool calls to the host via ON_TOOL_EXECUTE event and returns raw ToolMessages.
+   * Core logic for event-driven execution, separated from output shaping.
    */
-  private async executeViaEvent(
+  private async dispatchToolEvents(
     toolCalls: ToolCall[],
-    config: RunnableConfig,
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    input: any
-  ): Promise<T> {
+    config: RunnableConfig
+  ): Promise<ToolMessage[]> {
     const requests: t.ToolCallRequest[] = toolCalls.map((call) => {
       const turn = this.toolUsageCount.get(call.name) ?? 0;
       this.toolUsageCount.set(call.name, turn + 1);
@@ -296,7 +294,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       }
     );
 
-    const outputs: ToolMessage[] = results.map((result) => {
+    return results.map((result) => {
       const request = requests.find((r) => r.id === result.toolCallId);
       const toolName = request?.name ?? 'unknown';
       const stepId = this.toolCallStepIds?.get(result.toolCallId) ?? '';
@@ -354,7 +352,19 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
       return toolMessage;
     });
+  }
 
+  /**
+   * Execute all tool calls via ON_TOOL_EXECUTE event dispatch.
+   * Used in event-driven mode where the host handles actual tool execution.
+   */
+  private async executeViaEvent(
+    toolCalls: ToolCall[],
+    config: RunnableConfig,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    input: any
+  ): Promise<T> {
+    const outputs = await this.dispatchToolEvents(toolCalls, config);
     return (Array.isArray(input) ? outputs : { messages: outputs }) as T;
   }
 
@@ -363,7 +373,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     let outputs: (BaseMessage | Command)[];
 
     if (this.isSendInput(input)) {
-      if (this.eventDrivenMode) {
+      const isDirectTool = this.directToolNames?.has(input.lg_tool_call.name);
+      if (this.eventDrivenMode && isDirectTool !== true) {
         return this.executeViaEvent([input.lg_tool_call], config, input);
       }
       outputs = [await this.runTool(input.lg_tool_call, config)];
@@ -422,12 +433,35 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         }) ?? [];
 
       if (this.eventDrivenMode && filteredCalls.length > 0) {
-        return this.executeViaEvent(filteredCalls, config, input);
-      }
+        if (!this.directToolNames || this.directToolNames.size === 0) {
+          return this.executeViaEvent(filteredCalls, config, input);
+        }
 
-      outputs = await Promise.all(
-        filteredCalls.map((call) => this.runTool(call, config))
-      );
+        const directCalls = filteredCalls.filter((c) =>
+          this.directToolNames!.has(c.name)
+        );
+        const eventCalls = filteredCalls.filter(
+          (c) => !this.directToolNames!.has(c.name)
+        );
+
+        const directOutputs: (BaseMessage | Command)[] =
+          directCalls.length > 0
+            ? await Promise.all(
+              directCalls.map((call) => this.runTool(call, config))
+            )
+            : [];
+
+        const eventOutputs: ToolMessage[] =
+          eventCalls.length > 0
+            ? await this.dispatchToolEvents(eventCalls, config)
+            : [];
+
+        outputs = [...directOutputs, ...eventOutputs];
+      } else {
+        outputs = await Promise.all(
+          filteredCalls.map((call) => this.runTool(call, config))
+        );
+      }
     }
 
     if (!outputs.some(isCommand)) {

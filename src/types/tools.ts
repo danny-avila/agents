@@ -47,6 +47,8 @@ export type ToolNodeOptions = {
   toolDefinitions?: Map<string, LCTool>;
   /** Agent ID for event-driven mode (used to identify which agent's context to use) */
   agentId?: string;
+  /** Tool names that must be executed directly (via runTool) even in event-driven mode (e.g., graph-managed handoff tools) */
+  directToolNames?: Set<string>;
 };
 
 export type ToolNodeConstructorParams = ToolRefs & ToolNodeOptions;

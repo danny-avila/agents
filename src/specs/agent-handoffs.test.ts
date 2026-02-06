@@ -106,11 +106,11 @@ describe('Agent Handoffs Tests', () => {
         'agent_a'
       );
       expect(agentAContext).toBeDefined();
-      expect(agentAContext?.tools).toBeDefined();
+      expect(agentAContext?.graphTools).toBeDefined();
 
       // Check that handoff tool was created
       const handoffTool = findToolByName(
-        agentAContext?.tools,
+        agentAContext?.graphTools,
         `${Constants.LC_TRANSFER_TO_}agent_b`
       );
       expect(handoffTool).toBeDefined();
@@ -203,7 +203,7 @@ describe('Agent Handoffs Tests', () => {
       expect(agentBContext).toBeDefined();
 
       // Agent B should not have handoff tools (no outgoing edges)
-      const handoffTools = agentBContext?.tools?.filter((tool) => {
+      const handoffTools = agentBContext?.graphTools?.filter((tool) => {
         const name = getToolName(tool);
         return name?.startsWith(Constants.LC_TRANSFER_TO_) ?? false;
       });
@@ -244,14 +244,14 @@ describe('Agent Handoffs Tests', () => {
 
       // Agent A should have tool to transfer to B
       const agentAHandoffTool = findToolByName(
-        agentAContext?.tools,
+        agentAContext?.graphTools,
         `${Constants.LC_TRANSFER_TO_}agent_b`
       );
       expect(agentAHandoffTool).toBeDefined();
 
       // Agent B should have tool to transfer to A
       const agentBHandoffTool = findToolByName(
-        agentBContext?.tools,
+        agentBContext?.graphTools,
         `${Constants.LC_TRANSFER_TO_}agent_a`
       );
       expect(agentBHandoffTool).toBeDefined();
@@ -359,7 +359,7 @@ describe('Agent Handoffs Tests', () => {
       // Agent A should have tool to transfer to B
       expect(
         findToolByName(
-          agentAContext?.tools,
+          agentAContext?.graphTools,
           `${Constants.LC_TRANSFER_TO_}agent_b`
         )
       ).toBeDefined();
@@ -367,13 +367,13 @@ describe('Agent Handoffs Tests', () => {
       // Agent B should have tool to transfer to C
       expect(
         findToolByName(
-          agentBContext?.tools,
+          agentBContext?.graphTools,
           `${Constants.LC_TRANSFER_TO_}agent_c`
         )
       ).toBeDefined();
 
       // Agent C should have no handoff tools
-      const agentCHandoffTools = agentCContext?.tools?.filter((tool) => {
+      const agentCHandoffTools = agentCContext?.graphTools?.filter((tool) => {
         const name = getToolName(tool);
         return name?.startsWith(Constants.LC_TRANSFER_TO_) ?? false;
       });
@@ -419,7 +419,7 @@ describe('Agent Handoffs Tests', () => {
       expect(routerContext).toBeDefined();
 
       // Router should have 3 handoff tools
-      const handoffTools = routerContext?.tools?.filter((tool) => {
+      const handoffTools = routerContext?.graphTools?.filter((tool) => {
         const name = getToolName(tool);
         return name?.startsWith(Constants.LC_TRANSFER_TO_) ?? false;
       });
@@ -531,7 +531,7 @@ describe('Agent Handoffs Tests', () => {
         'agent_a'
       );
       const handoffTool = findToolByName(
-        agentAContext?.tools,
+        agentAContext?.graphTools,
         `${Constants.LC_TRANSFER_TO_}agent_b`
       );
 
@@ -562,7 +562,7 @@ describe('Agent Handoffs Tests', () => {
         'agent_a'
       );
       const handoffTool = findToolByName(
-        agentAContext?.tools,
+        agentAContext?.graphTools,
         `${Constants.LC_TRANSFER_TO_}agent_b`
       );
 
@@ -664,7 +664,7 @@ describe('Agent Handoffs Tests', () => {
       const agentAContext = (run.Graph as StandardGraph).agentContexts.get(
         'agent_a'
       );
-      const handoffTools = agentAContext?.tools?.filter((tool) => {
+      const handoffTools = agentAContext?.graphTools?.filter((tool) => {
         const name = getToolName(tool);
         return name?.startsWith(Constants.LC_TRANSFER_TO_) ?? false;
       });
@@ -734,14 +734,12 @@ describe('Agent Handoffs Tests', () => {
         'agent_a'
       );
 
-      // Agent A should have both custom tool and handoff tool
-      expect(agentAContext?.tools?.length).toBeGreaterThanOrEqual(2);
-
+      // Agent A should have custom tool in tools and handoff tool in graphTools
       expect(findToolByName(agentAContext?.tools, 'custom_tool')).toBeDefined();
 
       expect(
         findToolByName(
-          agentAContext?.tools,
+          agentAContext?.graphTools,
           `${Constants.LC_TRANSFER_TO_}agent_b`
         )
       ).toBeDefined();
@@ -845,7 +843,7 @@ describe('Agent Handoffs Tests', () => {
         'flight_assistant'
       );
       const handoffTool = findToolByName(
-        flightContext?.tools,
+        flightContext?.graphTools,
         `${Constants.LC_TRANSFER_TO_}hotel_assistant`
       );
 
@@ -875,7 +873,7 @@ describe('Agent Handoffs Tests', () => {
         'agent_with_underscores'
       );
       const handoffTool = findToolByName(
-        agentContext?.tools,
+        agentContext?.graphTools,
         `${Constants.LC_TRANSFER_TO_}AgentWithCamelCase`
       );
 
