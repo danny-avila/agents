@@ -159,6 +159,11 @@ export function modifyDeltaProperties(
     (obj as Partial<AIMessageChunk>).lc_kwargs &&
     Array.isArray(obj.lc_kwargs.content)
   ) {
+    if (provider === Providers.BEDROCK) {
+      obj.lc_kwargs.content = reduceBlocks(
+        obj.lc_kwargs.content as ContentBlock[]
+      );
+    }
     obj.lc_kwargs.content = modifyContent({
       provider,
       messageType,

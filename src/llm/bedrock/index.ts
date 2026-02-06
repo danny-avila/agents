@@ -1,26 +1,39 @@
 /**
- * Optimized ChatBedrockConverse wrapper that fixes contentBlockIndex conflicts
- * and adds support for latest @langchain/aws features:
+ * Optimized ChatBedrockConverse wrapper that fixes content block merging for
+ * streaming responses and adds support for latest @langchain/aws features:
  *
  * - Application Inference Profiles (PR #9129)
  * - Service Tiers (Priority/Standard/Flex) (PR #9785) - requires AWS SDK 3.966.0+
  *
- * Bedrock sends the same contentBlockIndex for both text and tool_use content blocks,
- * causing LangChain's merge logic to fail with "field[contentBlockIndex] already exists"
- * errors. This wrapper simply strips contentBlockIndex from response_metadata to avoid
- * the conflict.
+ * Bedrock's `@langchain/aws` library does not include an `index` property on content
+ * blocks (unlike Anthropic/OpenAI), which causes LangChain's `_mergeLists` to append
+ * each streaming chunk as a separate array entry instead of merging by index.
  *
- * The contentBlockIndex field is only used internally by Bedrock's streaming protocol
- * and isn't needed by application logic - the index field on tool_call_chunks serves
- * the purpose of tracking tool call ordering.
+ * This wrapper takes full ownership of the stream by directly interfacing with the
+ * AWS SDK client (`this.client`) and using custom handlers from `./utils/` that
+ * include `contentBlockIndex` in response_metadata for every delta type. It then
+ * promotes `contentBlockIndex` to an `index` property on each content block
+ * (mirroring Anthropic's pattern) and strips it from metadata to avoid
+ * `_mergeDicts` conflicts.
+ *
+ * When multiple content block types are present (e.g. reasoning + text), text deltas
+ * are promoted from strings to array form with `index` so they merge correctly once
+ * the accumulated content is already an array.
  */
 
 import { ChatBedrockConverse } from '@langchain/aws';
+import { ConverseStreamCommand } from '@aws-sdk/client-bedrock-runtime';
 import { AIMessageChunk } from '@langchain/core/messages';
 import { ChatGenerationChunk, ChatResult } from '@langchain/core/outputs';
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { ChatBedrockConverseInput } from '@langchain/aws';
 import type { BaseMessage } from '@langchain/core/messages';
+import {
+  convertToConverseMessages,
+  handleConverseStreamContentBlockStart,
+  handleConverseStreamContentBlockDelta,
+  handleConverseStreamMetadata,
+} from './utils';
 
 /**
  * Service tier type for Bedrock invocations.
@@ -126,7 +139,6 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
     options: this['ParsedCallOptions'] & CustomChatBedrockConverseCallOptions,
     runManager?: CallbackManagerForLLMRun
   ): Promise<ChatResult> {
-    // Temporarily swap model for applicationInferenceProfile support
     const originalModel = this.model;
     if (
       this.applicationInferenceProfile != null &&
@@ -138,75 +150,155 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
     try {
       return await super._generateNonStreaming(messages, options, runManager);
     } finally {
-      // Restore original model
       this.model = originalModel;
     }
   }
 
   /**
-   * Override _streamResponseChunks to:
-   * 1. Use applicationInferenceProfile as modelId (by temporarily swapping this.model)
-   * 2. Strip contentBlockIndex from response_metadata to prevent merge conflicts
+   * Own the stream end-to-end so we have direct access to every
+   * `contentBlockDelta.contentBlockIndex` from the AWS SDK.
    *
-   * Note: We delegate to super._streamResponseChunks() to preserve @langchain/aws's
-   * internal chunk handling which correctly preserves array content for reasoning blocks.
+   * This replaces the parent's implementation which strips contentBlockIndex
+   * from text and reasoning deltas, making it impossible to merge correctly.
    */
   override async *_streamResponseChunks(
     messages: BaseMessage[],
     options: this['ParsedCallOptions'] & CustomChatBedrockConverseCallOptions,
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
-    // Temporarily swap model for applicationInferenceProfile support
-    const originalModel = this.model;
-    if (
-      this.applicationInferenceProfile != null &&
-      this.applicationInferenceProfile !== ''
-    ) {
-      this.model = this.applicationInferenceProfile;
+    const { converseMessages, converseSystem } =
+      convertToConverseMessages(messages);
+    const params = this.invocationParams(options);
+
+    let { streamUsage } = this;
+    if ((options as Record<string, unknown>).streamUsage !== undefined) {
+      streamUsage = (options as Record<string, unknown>).streamUsage as boolean;
     }
 
-    try {
-      // Use parent's streaming logic which correctly handles reasoning content
-      const baseStream = super._streamResponseChunks(
-        messages,
-        options,
-        runManager
-      );
+    const modelId = this.getModelId();
 
-      for await (const chunk of baseStream) {
-        // Clean contentBlockIndex from response_metadata to prevent merge conflicts
-        yield this.cleanChunk(chunk);
+    const command = new ConverseStreamCommand({
+      modelId,
+      messages: converseMessages,
+      system: converseSystem,
+      ...(params as Record<string, unknown>),
+    });
+
+    const response = await this.client.send(command, {
+      abortSignal: options.signal,
+    });
+
+    if (!response.stream) {
+      return;
+    }
+
+    const seenBlockIndices = new Set<number>();
+
+    for await (const event of response.stream) {
+      if (event.contentBlockStart != null) {
+        const startChunk = handleConverseStreamContentBlockStart(
+          event.contentBlockStart
+        );
+        if (startChunk != null) {
+          const idx = event.contentBlockStart.contentBlockIndex;
+          if (idx != null) {
+            seenBlockIndices.add(idx);
+          }
+          yield this.enrichChunk(startChunk, seenBlockIndices);
+        }
+      } else if (event.contentBlockDelta != null) {
+        const deltaChunk = handleConverseStreamContentBlockDelta(
+          event.contentBlockDelta
+        );
+
+        const idx = event.contentBlockDelta.contentBlockIndex;
+        if (idx != null) {
+          seenBlockIndices.add(idx);
+        }
+
+        yield this.enrichChunk(deltaChunk, seenBlockIndices);
+
+        await runManager?.handleLLMNewToken(
+          deltaChunk.text,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          { chunk: deltaChunk }
+        );
+      } else if (event.metadata != null) {
+        yield handleConverseStreamMetadata(event.metadata, { streamUsage });
+      } else if (event.contentBlockStop != null) {
+        const stopIdx = event.contentBlockStop.contentBlockIndex;
+        if (stopIdx != null) {
+          seenBlockIndices.add(stopIdx);
+        }
+      } else {
+        yield new ChatGenerationChunk({
+          text: '',
+          message: new AIMessageChunk({
+            content: '',
+            response_metadata: event,
+          }),
+        });
       }
-    } finally {
-      // Restore original model
-      this.model = originalModel;
     }
   }
 
   /**
-   * Clean a chunk by removing contentBlockIndex from response_metadata.
+   * Inject `index` on content blocks for proper merge behaviour, then strip
+   * `contentBlockIndex` from response_metadata to prevent `_mergeDicts` conflicts.
+   *
+   * Text string content is promoted to array form only when the stream contains
+   * multiple content block indices (e.g. reasoning at index 0, text at index 1),
+   * ensuring text merges correctly with the already-array accumulated content.
    */
-  private cleanChunk(chunk: ChatGenerationChunk): ChatGenerationChunk {
+  private enrichChunk(
+    chunk: ChatGenerationChunk,
+    seenBlockIndices: Set<number>
+  ): ChatGenerationChunk {
     const message = chunk.message;
     if (!(message instanceof AIMessageChunk)) {
       return chunk;
     }
 
     const metadata = message.response_metadata as Record<string, unknown>;
-    const hasContentBlockIndex = this.hasContentBlockIndex(metadata);
-    if (!hasContentBlockIndex) {
+    const blockIndex = this.extractContentBlockIndex(metadata);
+    const hasMetadataIndex = blockIndex != null;
+
+    let content: AIMessageChunk['content'] = message.content;
+    let contentModified = false;
+
+    if (Array.isArray(content) && blockIndex != null) {
+      content = content.map((block) =>
+        typeof block === 'object' && !('index' in block)
+          ? { ...block, index: blockIndex }
+          : block
+      );
+      contentModified = true;
+    } else if (
+      typeof content === 'string' &&
+      content !== '' &&
+      blockIndex != null &&
+      seenBlockIndices.size > 1
+    ) {
+      content = [{ type: 'text', text: content, index: blockIndex }];
+      contentModified = true;
+    }
+
+    if (!contentModified && !hasMetadataIndex) {
       return chunk;
     }
 
-    const cleanedMetadata = this.removeContentBlockIndex(metadata) as Record<
-      string,
-      unknown
-    >;
+    const cleanedMetadata = hasMetadataIndex
+      ? (this.removeContentBlockIndex(metadata) as Record<string, unknown>)
+      : metadata;
 
     return new ChatGenerationChunk({
       text: chunk.text,
       message: new AIMessageChunk({
         ...message,
+        content,
         response_metadata: cleanedMetadata,
       }),
       generationInfo: chunk.generationInfo,
@@ -214,31 +306,21 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
   }
 
   /**
-   * Check if contentBlockIndex exists at any level in the object
+   * Extract `contentBlockIndex` from the top level of response_metadata.
+   * Our custom handlers always place it at the top level.
    */
-  private hasContentBlockIndex(obj: unknown): boolean {
-    if (obj === null || obj === undefined || typeof obj !== 'object') {
-      return false;
+  private extractContentBlockIndex(
+    metadata: Record<string, unknown>
+  ): number | undefined {
+    if (
+      'contentBlockIndex' in metadata &&
+      typeof metadata.contentBlockIndex === 'number'
+    ) {
+      return metadata.contentBlockIndex;
     }
-
-    if ('contentBlockIndex' in obj) {
-      return true;
-    }
-
-    for (const value of Object.values(obj)) {
-      if (typeof value === 'object' && value !== null) {
-        if (this.hasContentBlockIndex(value)) {
-          return true;
-        }
-      }
-    }
-
-    return false;
+    return undefined;
   }
 
-  /**
-   * Recursively remove contentBlockIndex from all levels of an object
-   */
   private removeContentBlockIndex(obj: unknown): unknown {
     if (obj === null || obj === undefined) {
       return obj;
