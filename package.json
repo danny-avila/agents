@@ -108,12 +108,14 @@
   },
   "overrides": {
     "@langchain/openai": "0.5.18",
+    "@anthropic-ai/sdk": "$@anthropic-ai/sdk",
     "@browserbasehq/stagehand": {
       "openai": "$openai"
     },
     "fast-xml-parser": "5.3.4"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.73.0",
     "@aws-sdk/client-bedrock-runtime": "^3.980.0",
     "@langchain/anthropic": "^0.3.26",
     "@langchain/aws": "^0.1.15",

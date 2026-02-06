@@ -28,6 +28,7 @@ import { tool } from '@langchain/core/tools';
 import { z } from 'zod';
 import { CustomAnthropic as ChatAnthropic } from './index';
 import { AnthropicMessageResponse, ChatAnthropicContentBlock } from './types';
+import { _convertMessagesToAnthropicPayload } from './utils/message_inputs';
 jest.setTimeout(120000);
 
 async function invoke(
@@ -1439,4 +1440,405 @@ test('Can handle google function calling blocks in content', async () => {
   ];
   const res = await chat.invoke(messages);
   expect(res.content.length).toBeGreaterThan(1);
+});
+
+const opus46Model = 'claude-opus-4-6';
+
+describe('Opus 4.6', () => {
+  describe('Adaptive thinking', () => {
+    test('invocationParams accepts adaptive thinking type', () => {
+      const model = new ChatAnthropic({
+        model: opus46Model,
+        apiKey: 'testing',
+        maxTokens: 4096,
+        thinking: { type: 'adaptive' },
+      });
+
+      const params = model.invocationParams({});
+
+      expect(params.thinking).toEqual({ type: 'adaptive' });
+    });
+
+    test('adaptive thinking disables temperature/topK/topP', () => {
+      const model = new ChatAnthropic({
+        model: opus46Model,
+        apiKey: 'testing',
+        maxTokens: 4096,
+        thinking: { type: 'adaptive' },
+      });
+
+      const params = model.invocationParams({});
+
+      expect(params.temperature).toBeUndefined();
+      expect(params.top_k).toBeUndefined();
+      expect(params.top_p).toBeUndefined();
+    });
+
+    test('adaptive thinking throws on non-default temperature', () => {
+      const model = new ChatAnthropic({
+        model: opus46Model,
+        temperature: 0.5,
+        apiKey: 'testing',
+        maxTokens: 4096,
+        thinking: { type: 'adaptive' },
+      });
+
+      expect(() => model.invocationParams({})).toThrow(
+        'temperature is not supported when thinking is enabled'
+      );
+    });
+
+    test('adaptive thinking invoke', async () => {
+      const model = new ChatAnthropic({
+        model: opus46Model,
+        maxTokens: 4096,
+        thinking: { type: 'adaptive' },
+      });
+
+      const result = await model.invoke('What is 15 * 23?');
+      expect(result.content).toBeDefined();
+
+      if (Array.isArray(result.content)) {
+        const textBlocks = (result.content as any[]).filter(
+          (b) => b.type === 'text'
+        );
+        expect(textBlocks.length).toBeGreaterThan(0);
+      } else {
+        expect(typeof result.content).toBe('string');
+        expect((result.content as string).length).toBeGreaterThan(0);
+      }
+    });
+
+    test('adaptive thinking multiturn round-trip', async () => {
+      const model = new ChatAnthropic({
+        model: opus46Model,
+        maxTokens: 4096,
+        thinking: { type: 'adaptive' },
+      });
+
+      const messages: BaseMessage[] = [new HumanMessage('Hello')];
+      const response1 = await model.invoke(messages);
+      messages.push(response1);
+      messages.push(new HumanMessage('What is 42 + 7?'));
+
+      const response2 = await model.invoke(messages);
+      expect(response2.content).toBeDefined();
+    });
+  });
+
+  describe('Effort parameter (outputConfig)', () => {
+    test('invocationParams passes outputConfig from constructor', () => {
+      const model = new ChatAnthropic({
+        model: opus46Model,
+        apiKey: 'testing',
+        maxTokens: 4096,
+        outputConfig: { effort: 'medium' },
+      });
+
+      const params = model.invocationParams({});
+
+      expect(params.output_config).toEqual({ effort: 'medium' });
+    });
+
+    test('invocationParams passes outputConfig from call options', () => {
+      const model = new ChatAnthropic({
+        model: opus46Model,
+        apiKey: 'testing',
+        maxTokens: 4096,
+      });
+
+      const params = model.invocationParams({
+        outputConfig: { effort: 'low' },
+      } as any);
+
+      expect(params.output_config).toEqual({ effort: 'low' });
+    });
+
+    test('call-option outputConfig overrides constructor outputConfig', () => {
+      const model = new ChatAnthropic({
+        model: opus46Model,
+        apiKey: 'testing',
+        maxTokens: 4096,
+        outputConfig: { effort: 'high' },
+      });
+
+      const params = model.invocationParams({
+        outputConfig: { effort: 'low' },
+      } as any);
+
+      expect(params.output_config).toEqual({ effort: 'low' });
+    });
+
+    test('effort max is accepted', () => {
+      const model = new ChatAnthropic({
+        model: opus46Model,
+        apiKey: 'testing',
+        maxTokens: 4096,
+        outputConfig: { effort: 'max' },
+      });
+
+      const params = model.invocationParams({});
+
+      expect(params.output_config).toEqual({ effort: 'max' });
+    });
+
+    test('output_config is undefined when not set', () => {
+      const model = new ChatAnthropic({
+        model: opus46Model,
+        apiKey: 'testing',
+        maxTokens: 4096,
+      });
+
+      const params = model.invocationParams({});
+
+      expect(params.output_config).toBeUndefined();
+    });
+
+    test.each(['low', 'medium', 'high'] as const)(
+      'invoke with %s effort',
+      async (effort) => {
+        const model = new ChatAnthropic({
+          model: opus46Model,
+          maxTokens: 4096,
+          thinking: { type: 'adaptive' },
+          outputConfig: { effort },
+        });
+
+        const result = await model.invoke('Say hello.');
+        expect(result.content).toBeDefined();
+      }
+    );
+
+    test.each(['low', 'medium', 'high'] as const)(
+      'stream with %s effort',
+      async (effort) => {
+        const model = new ChatAnthropic({
+          model: opus46Model,
+          maxTokens: 4096,
+          thinking: { type: 'adaptive' },
+          outputConfig: { effort },
+        });
+
+        let full: AIMessageChunk | undefined;
+        for await (const chunk of await model.stream('Say hello.')) {
+          full = full ? concat(full, chunk) : chunk;
+        }
+        expect(full).toBeInstanceOf(AIMessageChunk);
+        expect(full!.content).toBeDefined();
+      }
+    );
+
+    test('via call options', async () => {
+      const model = new ChatAnthropic({
+        model: opus46Model,
+        maxTokens: 4096,
+        thinking: { type: 'adaptive' },
+      });
+
+      const result = await model.invoke('Say hello.', {
+        outputConfig: { effort: 'low' },
+      } as any);
+      expect(result.content).toBeDefined();
+    });
+  });
+
+  describe('outputFormat to outputConfig.format migration', () => {
+    test('deprecated outputFormat on call options maps to output_config.format', () => {
+      const model = new ChatAnthropic({
+        model: opus46Model,
+        apiKey: 'testing',
+        maxTokens: 4096,
+      });
+
+      const params = model.invocationParams({
+        outputFormat: {
+          type: 'json_schema',
+          schema: { type: 'object' },
+        },
+      } as any);
+
+      expect(params.output_config).toEqual({
+        format: {
+          type: 'json_schema',
+          schema: { type: 'object' },
+        },
+      });
+    });
+
+    test('outputConfig.format takes precedence over deprecated outputFormat', () => {
+      const model = new ChatAnthropic({
+        model: opus46Model,
+        apiKey: 'testing',
+        maxTokens: 4096,
+      });
+
+      const params = model.invocationParams({
+        outputConfig: {
+          format: {
+            type: 'json_schema',
+            schema: { type: 'object', properties: { a: { type: 'string' } } },
+          },
+        },
+        outputFormat: {
+          type: 'json_schema',
+          schema: { type: 'object', properties: { b: { type: 'number' } } },
+        },
+      } as any);
+
+      expect(params.output_config?.format).toEqual({
+        type: 'json_schema',
+        schema: { type: 'object', properties: { a: { type: 'string' } } },
+      });
+    });
+
+    test('effort and format can be combined in outputConfig', () => {
+      const model = new ChatAnthropic({
+        model: opus46Model,
+        apiKey: 'testing',
+        maxTokens: 4096,
+        outputConfig: { effort: 'medium' },
+      });
+
+      const params = model.invocationParams({
+        outputFormat: {
+          type: 'json_schema',
+          schema: { type: 'object' },
+        },
+      } as any);
+
+      expect(params.output_config).toEqual({
+        effort: 'medium',
+        format: {
+          type: 'json_schema',
+          schema: { type: 'object' },
+        },
+      });
+    });
+  });
+
+  describe('Data residency (inferenceGeo)', () => {
+    test('invocationParams passes inferenceGeo from constructor', () => {
+      const model = new ChatAnthropic({
+        model: opus46Model,
+        apiKey: 'testing',
+        maxTokens: 4096,
+        inferenceGeo: 'us',
+      });
+
+      const params = model.invocationParams({});
+
+      expect(params.inference_geo).toBe('us');
+    });
+
+    test('invocationParams passes inferenceGeo from call options', () => {
+      const model = new ChatAnthropic({
+        model: opus46Model,
+        apiKey: 'testing',
+        maxTokens: 4096,
+      });
+
+      const params = model.invocationParams({
+        inferenceGeo: 'us',
+      } as any);
+
+      expect(params.inference_geo).toBe('us');
+    });
+
+    test('call-option inferenceGeo overrides constructor inferenceGeo', () => {
+      const model = new ChatAnthropic({
+        model: opus46Model,
+        apiKey: 'testing',
+        maxTokens: 4096,
+        inferenceGeo: 'eu',
+      });
+
+      const params = model.invocationParams({
+        inferenceGeo: 'us',
+      } as any);
+
+      expect(params.inference_geo).toBe('us');
+    });
+
+    test('inferenceGeo is undefined when not set', () => {
+      const model = new ChatAnthropic({
+        model: opus46Model,
+        apiKey: 'testing',
+        maxTokens: 4096,
+      });
+
+      const params = model.invocationParams({});
+
+      expect(params.inference_geo).toBeUndefined();
+    });
+
+    test('inferenceGeo accepted by API', async () => {
+      const model = new ChatAnthropic({
+        model: opus46Model,
+        maxTokens: 256,
+        inferenceGeo: 'us',
+      });
+
+      const result = await model.invoke('Say hello.');
+      expect(result.content).toBeDefined();
+    });
+  });
+
+  describe('Compaction API', () => {
+    test('context_management passed through invocationParams', () => {
+      const model = new ChatAnthropic({
+        model: opus46Model,
+        apiKey: 'testing',
+        maxTokens: 4096,
+        contextManagement: {
+          edits: [
+            {
+              type: 'compact_20260112',
+              trigger: { type: 'input_tokens', value: 50000 },
+            },
+          ],
+        },
+      });
+
+      const params = model.invocationParams({});
+
+      expect(params.context_management).toBeDefined();
+      expect(params.context_management.edits[0].type).toBe('compact_20260112');
+    });
+
+    test('Can properly format messages with compaction blocks', () => {
+      const messageHistory = [
+        new AIMessage({
+          content: [
+            {
+              type: 'compaction',
+              content:
+                'Summary: The user asked about building a web scraper...',
+            },
+            {
+              type: 'text',
+              text: 'Based on our conversation so far, let me continue...',
+            },
+          ],
+        }),
+      ];
+
+      const formattedMessages =
+        _convertMessagesToAnthropicPayload(messageHistory);
+
+      expect(formattedMessages.messages).toHaveLength(1);
+      expect(formattedMessages.messages[0].role).toBe('assistant');
+      expect(formattedMessages.messages[0].content).toHaveLength(2);
+
+      const [compactionBlock, textBlock] = formattedMessages.messages[0]
+        .content as any[];
+      expect(compactionBlock).toEqual({
+        type: 'compaction',
+        content: 'Summary: The user asked about building a web scraper...',
+      });
+      expect(textBlock).toEqual({
+        type: 'text',
+        text: 'Based on our conversation so far, let me continue...',
+      });
+    });
+  });
 });

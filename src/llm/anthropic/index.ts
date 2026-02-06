@@ -16,6 +16,7 @@ import type {
   AnthropicStreamUsage,
   AnthropicMessageStartEvent,
   AnthropicMessageDeltaEvent,
+  AnthropicOutputConfig,
 } from '@/llm/anthropic/types';
 import { _makeMessageChunkFromAnthropicEvent } from './utils/message_outputs';
 import { _convertMessagesToAnthropicPayload } from './utils/message_inputs';
@@ -39,6 +40,7 @@ function _documentsInParams(
         typeof block === 'object' &&
         block != null &&
         block.type === 'document' &&
+        block.citations != null &&
         typeof block.citations === 'object' &&
         block.citations.enabled
       ) {
@@ -52,7 +54,20 @@ function _documentsInParams(
 function _thinkingInParams(
   params: AnthropicMessageCreateParams | AnthropicStreamingMessageCreateParams
 ): boolean {
-  return !!(params.thinking && params.thinking.type === 'enabled');
+  return !!(
+    params.thinking &&
+    (params.thinking.type === 'enabled' || params.thinking.type === 'adaptive')
+  );
+}
+
+function _compactionInParams(
+  params: AnthropicMessageCreateParams | AnthropicStreamingMessageCreateParams
+): boolean {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const cm = (params as any).context_management;
+  return !!cm?.edits?.some(
+    (e: { type: string }) => e.type === 'compact_20260112'
+  );
 }
 
 function extractToken(
@@ -120,6 +135,10 @@ function cloneChunk(
 
 export type CustomAnthropicInput = AnthropicInput & {
   _lc_stream_delay?: number;
+  outputConfig?: AnthropicOutputConfig;
+  inferenceGeo?: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  contextManagement?: any;
 } & BaseChatModelParams;
 
 /**
@@ -136,11 +155,18 @@ export class CustomAnthropic extends ChatAnthropicMessages {
   private tools_in_params?: boolean;
   private emitted_usage?: boolean;
   top_k: number | undefined;
+  outputConfig?: AnthropicOutputConfig;
+  inferenceGeo?: string;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  contextManagement?: any;
   constructor(fields?: CustomAnthropicInput) {
     super(fields);
     this.resetTokenEvents();
     this.setDirectFields(fields);
     this._lc_stream_delay = fields?._lc_stream_delay ?? 25;
+    this.outputConfig = fields?.outputConfig;
+    this.inferenceGeo = fields?.inferenceGeo;
+    this.contextManagement = fields?.contextManagement;
   }
 
   static lc_name(): 'LibreChatAnthropic' {
@@ -163,7 +189,36 @@ export class CustomAnthropic extends ChatAnthropicMessages {
       | Anthropic.Messages.ToolChoiceTool
       | undefined = handleToolChoice(options?.tool_choice);
 
-    if (this.thinking.type === 'enabled') {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const callOptions = options as Record<string, any> | undefined;
+    const mergedOutputConfig: AnthropicOutputConfig | undefined = (():
+      | AnthropicOutputConfig
+      | undefined => {
+      const base = {
+        ...this.outputConfig,
+        ...callOptions?.outputConfig,
+      };
+      if (callOptions?.outputFormat && !base.format) {
+        base.format = callOptions.outputFormat;
+      }
+      return Object.keys(base).length > 0 ? base : undefined;
+    })();
+
+    const inferenceGeo = callOptions?.inferenceGeo ?? this.inferenceGeo;
+
+    const contextManagement = this.contextManagement;
+
+    const sharedParams = {
+      tools: this.formatStructuredToolToAnthropic(options?.tools),
+      tool_choice,
+      thinking: this.thinking,
+      ...(mergedOutputConfig ? { output_config: mergedOutputConfig } : {}),
+      ...(inferenceGeo ? { inference_geo: inferenceGeo } : {}),
+      ...(contextManagement ? { context_management: contextManagement } : {}),
+      ...this.invocationKwargs,
+    };
+
+    if (this.thinking.type === 'enabled' || this.thinking.type === 'adaptive') {
       if (this.top_k !== -1 && (this.top_k as number | undefined) != null) {
         throw new Error('topK is not supported when thinking is enabled');
       }
@@ -184,10 +239,7 @@ export class CustomAnthropic extends ChatAnthropicMessages {
         stop_sequences: options?.stop ?? this.stopSequences,
         stream: this.streaming,
         max_tokens: this.maxTokens,
-        tools: this.formatStructuredToolToAnthropic(options?.tools),
-        tool_choice,
-        thinking: this.thinking,
-        ...this.invocationKwargs,
+        ...sharedParams,
       };
     }
     return {
@@ -198,10 +250,7 @@ export class CustomAnthropic extends ChatAnthropicMessages {
       stop_sequences: options?.stop ?? this.stopSequences,
       stream: this.streaming,
       max_tokens: this.maxTokens,
-      tools: this.formatStructuredToolToAnthropic(options?.tools),
-      tool_choice,
-      thinking: this.thinking,
-      ...this.invocationKwargs,
+      ...sharedParams,
     };
   }
 
@@ -309,7 +358,8 @@ export class CustomAnthropic extends ChatAnthropicMessages {
     const coerceContentToString =
       !_toolsInParams(payload) &&
       !_documentsInParams(payload) &&
-      !_thinkingInParams(payload);
+      !_thinkingInParams(payload) &&
+      !_compactionInParams(payload);
 
     const stream = await this.createStreamWithRetry(payload, {
       headers: options.headers,
@@ -334,10 +384,13 @@ export class CustomAnthropic extends ChatAnthropicMessages {
         usageMetadata = this.getStreamUsage();
       }
 
-      const result = _makeMessageChunkFromAnthropicEvent(data, {
-        streamUsage: shouldStreamUsage,
-        coerceContentToString,
-      });
+      const result = _makeMessageChunkFromAnthropicEvent(
+        data as Anthropic.Beta.Messages.BetaRawMessageStreamEvent,
+        {
+          streamUsage: shouldStreamUsage,
+          coerceContentToString,
+        }
+      );
       if (!result) continue;
 
       const { chunk } = result;
