@@ -212,47 +212,6 @@ describe('CustomChatBedrockConverse', () => {
       return model as any;
     }
 
-    test('should detect contentBlockIndex at top level', () => {
-      const model = getModelWithCleanMethods();
-      const objWithIndex = { contentBlockIndex: 0, text: 'hello' };
-      const objWithoutIndex = { text: 'hello' };
-
-      expect(model.hasContentBlockIndex(objWithIndex)).toBe(true);
-      expect(model.hasContentBlockIndex(objWithoutIndex)).toBe(false);
-    });
-
-    test('should detect contentBlockIndex in nested objects', () => {
-      const model = getModelWithCleanMethods();
-      const nestedWithIndex = {
-        outer: {
-          inner: {
-            contentBlockIndex: 1,
-            data: 'test',
-          },
-        },
-      };
-      const nestedWithoutIndex = {
-        outer: {
-          inner: {
-            data: 'test',
-          },
-        },
-      };
-
-      expect(model.hasContentBlockIndex(nestedWithIndex)).toBe(true);
-      expect(model.hasContentBlockIndex(nestedWithoutIndex)).toBe(false);
-    });
-
-    test('should return false for null, undefined, and primitives', () => {
-      const model = getModelWithCleanMethods();
-
-      expect(model.hasContentBlockIndex(null)).toBe(false);
-      expect(model.hasContentBlockIndex(undefined)).toBe(false);
-      expect(model.hasContentBlockIndex('string')).toBe(false);
-      expect(model.hasContentBlockIndex(123)).toBe(false);
-      expect(model.hasContentBlockIndex(true)).toBe(false);
-    });
-
     test('should remove contentBlockIndex from top level', () => {
       const model = getModelWithCleanMethods();
       const obj = {

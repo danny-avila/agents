@@ -220,15 +220,12 @@ export function handleConverseStreamContentBlockDelta(
       bedrockReasoningDeltaToLangchainPartialReasoningBlock(
         contentBlockDelta.delta.reasoningContent
       );
-    // Extract the text for additional_kwargs.reasoning_content (for stream handler compatibility)
-    const reasoningText =
-      'reasoningText' in reasoningBlock
-        ? (reasoningBlock.reasoningText.text ??
-          reasoningBlock.reasoningText.signature ??
-          ('redactedContent' in reasoningBlock
-            ? reasoningBlock.redactedContent
-            : ''))
-        : '';
+    let reasoningText = '';
+    if ('reasoningText' in reasoningBlock) {
+      reasoningText = reasoningBlock.reasoningText.text ?? '';
+    } else if ('redactedContent' in reasoningBlock) {
+      reasoningText = reasoningBlock.redactedContent;
+    }
     return new ChatGenerationChunk({
       text: '',
       message: new AIMessageChunk({
