@@ -25,16 +25,7 @@ async function testStandardStreaming(): Promise<void> {
         return true;
       }
     ),
-    [GraphEvents.CHAT_MODEL_END]: {
-      handle: (
-        _event: string,
-        _data: t.StreamEventData,
-        metadata?: Record<string, unknown>
-      ): void => {
-        console.log('\n====== CHAT_MODEL_END METADATA ======');
-        console.dir(metadata, { depth: null });
-      },
-    },
+    [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(),
     [GraphEvents.CHAT_MODEL_START]: {
       handle: (
         _event: string,
@@ -158,9 +149,9 @@ async function testStandardStreaming(): Promise<void> {
     conversationHistory.push(...finalMessages);
     console.dir(conversationHistory, { depth: null });
   }
-  console.dir(finalContentParts, { depth: null });
+  // console.dir(finalContentParts, { depth: null });
   console.log('\n\n====================\n\n');
-  // console.dir(contentParts, { depth: null });
+  console.dir(contentParts, { depth: null });
 }
 
 process.on('unhandledRejection', (reason, promise) => {
