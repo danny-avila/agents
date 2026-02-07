@@ -411,6 +411,7 @@ hasToolCallChunks: ${hasToolCallChunks}
     ) {
       agentContext.currentTokenType = ContentTypes.TEXT;
       agentContext.tokenTypeSwitch = 'content';
+      agentContext.reasoningTransitionCount++;
     } else if (
       chunk.content != null &&
       typeof chunk.content === 'string' &&
@@ -465,7 +466,7 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       return;
     }
 
-    if (!contentParts[index]) {
+    if (!contentParts[index] && partType !== ContentTypes.TOOL_CALL) {
       contentParts[index] = { type: partType };
     }
 

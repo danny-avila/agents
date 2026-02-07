@@ -60,6 +60,7 @@ export type ToolEndEvent = {
   tool_call: ToolCall;
   /** The content index of the tool call */
   index: number;
+  type?: 'tool_call';
 };
 
 export type CodeEnvFile = {

@@ -314,7 +314,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     ) {
       keyList.push('reasoning');
     } else if (agentContext.tokenTypeSwitch === 'content') {
-      keyList.push('post-reasoning');
+      keyList.push(`post-reasoning-${agentContext.reasoningTransitionCount}`);
     }
 
     if (this.invokedToolIds != null && this.invokedToolIds.size > 0) {

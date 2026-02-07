@@ -142,6 +142,8 @@ export class AgentContext {
   lastToken?: string;
   /** Token type switch state */
   tokenTypeSwitch?: 'reasoning' | 'content';
+  /** Tracks how many reasoning→text transitions have occurred (ensures unique post-reasoning step keys) */
+  reasoningTransitionCount = 0;
   /** Current token type being processed */
   currentTokenType: ContentTypes.TEXT | ContentTypes.THINK | 'think_and_text' =
     ContentTypes.TEXT;
@@ -462,6 +464,7 @@ export class AgentContext {
     this.pruneMessages = undefined;
     this.lastStreamCall = undefined;
     this.tokenTypeSwitch = undefined;
+    this.reasoningTransitionCount = 0;
     this.currentTokenType = ContentTypes.TEXT;
     this.discoveredToolNames.clear();
     this.handoffContext = undefined;
