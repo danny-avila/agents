@@ -153,6 +153,11 @@ export type ToolCallRequest = {
   stepId?: string;
   /** Usage turn count for this tool */
   turn?: number;
+  /** Code execution session context for session continuity in event-driven mode */
+  codeSessionContext?: {
+    session_id: string;
+    files?: CodeEnvFile[];
+  };
 };
 
 /** Batch request containing ALL tool calls for a graph step */
@@ -335,7 +340,7 @@ export type CodeSessionContext = {
   /** Session ID from the code execution environment */
   session_id: string;
   /** Files generated in this session (for context/tracking) */
-  files: FileRefs;
+  files?: FileRefs;
   /** Timestamp of last update */
   lastUpdated: number;
 };

@@ -1110,46 +1110,51 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       toolName === Constants.PROGRAMMATIC_TOOL_CALLING
     ) {
       const artifact = output.artifact as t.CodeExecutionArtifact | undefined;
-      const newFiles = artifact?.files ?? [];
-      const hasNewFiles = newFiles.length > 0;
-
-      if (
-        hasNewFiles &&
-        artifact?.session_id != null &&
-        artifact.session_id !== ''
-      ) {
-        /**
-         * Stamp each new file with its source session_id.
-         * This enables files from different executions (parallel or sequential)
-         * to be tracked and passed to subsequent calls.
-         */
-        const filesWithSession: t.FileRefs = newFiles.map((file) => ({
-          ...file,
-          session_id: artifact.session_id,
-        }));
-
+      if (artifact?.session_id != null && artifact.session_id !== '') {
+        const newFiles = artifact.files ?? [];
         const existingSession = this.sessions.get(Constants.EXECUTE_CODE) as
           | t.CodeSessionContext
           | undefined;
         const existingFiles = existingSession?.files ?? [];
 
-        /**
-         * Merge files, preferring latest versions by name.
-         * If a file with the same name exists, replace it with the new version.
-         * This handles cases where files are edited/recreated in subsequent executions.
-         */
-        const newFileNames = new Set(filesWithSession.map((f) => f.name));
-        const filteredExisting = existingFiles.filter(
-          (f) => !newFileNames.has(f.name)
-        );
+        if (newFiles.length > 0) {
+          /**
+           * Stamp each new file with its source session_id.
+           * This enables files from different executions (parallel or sequential)
+           * to be tracked and passed to subsequent calls.
+           */
+          const filesWithSession: t.FileRefs = newFiles.map((file) => ({
+            ...file,
+            session_id: artifact.session_id,
+          }));
 
-        this.sessions.set(Constants.EXECUTE_CODE, {
-          /** Keep latest session_id for reference/fallback */
-          session_id: artifact.session_id,
-          /** Accumulated files with latest versions preferred */
-          files: [...filteredExisting, ...filesWithSession],
-          lastUpdated: Date.now(),
-        });
+          /**
+           * Merge files, preferring latest versions by name.
+           * If a file with the same name exists, replace it with the new version.
+           * This handles cases where files are edited/recreated in subsequent executions.
+           */
+          const newFileNames = new Set(filesWithSession.map((f) => f.name));
+          const filteredExisting = existingFiles.filter(
+            (f) => !newFileNames.has(f.name)
+          );
+
+          this.sessions.set(Constants.EXECUTE_CODE, {
+            session_id: artifact.session_id,
+            files: [...filteredExisting, ...filesWithSession],
+            lastUpdated: Date.now(),
+          });
+        } else {
+          /**
+           * Store session_id even without new files for session continuity.
+           * The CodeExecutor can fall back to the /files endpoint to discover
+           * session files not explicitly returned in the exec response.
+           */
+          this.sessions.set(Constants.EXECUTE_CODE, {
+            session_id: artifact.session_id,
+            files: existingFiles,
+            lastUpdated: Date.now(),
+          });
+        }
       }
     }
 
