@@ -33,6 +33,7 @@ const SUPPORTED_LANGUAGES = [
   'd',
   'f90',
   'r',
+  'bash',
 ] as const;
 
 export const CodeExecutionToolSchema = {
