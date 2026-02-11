@@ -364,6 +364,14 @@ export interface AgentInputs {
   tools?: GraphTools;
   provider: Providers;
   instructions?: string;
+  /**
+   * Static portion of instructions for Anthropic prompt cache splitting.
+   * When provided with promptCache=true, this text gets cache_control
+   * while the remaining dynamic content does not.
+   * This allows the static base to be cached and shared across all users,
+   * while dynamic context (e.g., user-specific data) is sent fresh.
+   */
+  staticInstructions?: string;
   streamBuffer?: number;
   maxContextTokens?: number;
   clientOptions?: ClientOptions;
