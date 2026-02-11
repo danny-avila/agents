@@ -60,6 +60,7 @@ import { getChatModelClass, manualToolStreamProviders } from '@/llm/providers';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
 import { ChatOpenAI, AzureChatOpenAI } from '@/llm/openai';
 import { safeDispatchCustomEvent } from '@/utils/events';
+import { createSchemaOnlyTools } from '@/tools/schema';
 import { AgentContext } from '@/agents/AgentContext';
 import { createFakeStreamingLLM } from '@/llm/fake';
 import { HandlerRegistry } from '@/events';
@@ -452,6 +453,28 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     currentToolMap?: t.ToolMap;
     agentContext?: AgentContext;
   }): CustomToolNode<t.BaseGraphState> | ToolNode<t.BaseGraphState> {
+    const toolDefinitions = agentContext?.toolDefinitions;
+    const eventDrivenMode =
+      toolDefinitions != null && toolDefinitions.length > 0;
+
+    if (eventDrivenMode) {
+      const schemaTools = createSchemaOnlyTools(toolDefinitions);
+      const toolDefMap = new Map(toolDefinitions.map((def) => [def.name, def]));
+
+      return new CustomToolNode<t.BaseGraphState>({
+        tools: schemaTools as t.GenericTool[],
+        toolMap: new Map(schemaTools.map((tool) => [tool.name, tool])),
+        toolCallStepIds: this.toolCallStepIds,
+        errorHandler: (data, metadata) =>
+          StandardGraph.handleToolCallErrorStatic(this, data, metadata),
+        toolRegistry: agentContext?.toolRegistry,
+        sessions: this.sessions,
+        eventDrivenMode: true,
+        toolDefinitions: toolDefMap,
+        agentId: agentContext?.agentId,
+      });
+    }
+
     return new CustomToolNode<t.BaseGraphState>({
       tools: (currentTools as t.GenericTool[] | undefined) ?? [],
       toolMap: currentToolMap,

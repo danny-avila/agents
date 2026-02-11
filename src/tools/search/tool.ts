@@ -1,4 +1,3 @@
-import { z } from 'zod';
 import { tool, DynamicStructuredTool } from '@langchain/core/tools';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type * as t from './types';
@@ -269,12 +268,13 @@ function createTool({
   search,
   onSearchResults: _onSearchResults,
 }: {
-  schema: t.SearchToolSchema;
+  schema: Record<string, unknown>;
   search: ReturnType<typeof createSearchProcessor>;
   onSearchResults: t.SearchToolConfig['onSearchResults'];
-}): DynamicStructuredTool<typeof schema> {
-  return tool<typeof schema>(
-    async (params, runnableConfig) => {
+}): DynamicStructuredTool {
+  return tool(
+    async (rawParams, runnableConfig) => {
+      const params = rawParams as SearchToolParams;
       const { query, date, country: _c, images, videos, news } = params;
       const country = typeof _c === 'string' && _c ? _c : undefined;
       const searchResult = await search({
@@ -353,9 +353,19 @@ Use anchor marker(s) immediately after the statement:
  * @param config - The search tool configuration
  * @returns A DynamicStructuredTool with a schema that depends on the searchProvider
  */
+/** Input params type for search tool */
+interface SearchToolParams {
+  query: string;
+  date?: DATE_RANGE;
+  country?: string;
+  images?: boolean;
+  videos?: boolean;
+  news?: boolean;
+}
+
 export const createSearchTool = (
   config: t.SearchToolConfig = {}
-): DynamicStructuredTool<typeof toolSchema> => {
+): DynamicStructuredTool => {
   const {
     searchProvider = 'serper',
     serperApiKey,
@@ -382,14 +392,7 @@ export const createSearchTool = (
 
   const logger = config.logger || createDefaultLogger();
 
-  const schemaObject: {
-    query: z.ZodString;
-    date: z.ZodOptional<z.ZodNativeEnum<typeof DATE_RANGE>>;
-    country?: z.ZodOptional<z.ZodString>;
-    images: z.ZodOptional<z.ZodBoolean>;
-    videos: z.ZodOptional<z.ZodBoolean>;
-    news: z.ZodOptional<z.ZodBoolean>;
-  } = {
+  const schemaProperties: Record<string, unknown> = {
     query: querySchema,
     date: dateSchema,
     images: imagesSchema,
@@ -398,10 +401,14 @@ export const createSearchTool = (
   };
 
   if (searchProvider === 'serper') {
-    schemaObject.country = countrySchema;
+    schemaProperties.country = countrySchema;
   }
 
-  const toolSchema = z.object(schemaObject);
+  const toolSchema = {
+    type: 'object',
+    properties: schemaProperties,
+    required: ['query'],
+  };
 
   const searchAPI = createSearchAPI({
     searchProvider,

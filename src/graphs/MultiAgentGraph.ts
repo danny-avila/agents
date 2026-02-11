@@ -1,4 +1,3 @@
-import { z } from 'zod';
 import { tool } from '@langchain/core/tools';
 import { PromptTemplate } from '@langchain/core/prompts';
 import {
@@ -292,7 +291,8 @@ export class MultiAgentGraph extends StandardGraph {
 
       tools.push(
         tool(
-          async (input: Record<string, unknown>, config) => {
+          async (rawInput, config) => {
+            const input = rawInput as Record<string, unknown>;
             const state = getCurrentTaskInput() as t.BaseGraphState;
             const toolCallId =
               (config as ToolRunnableConfig | undefined)?.toolCall?.id ??
@@ -343,13 +343,17 @@ export class MultiAgentGraph extends StandardGraph {
           {
             name: toolName,
             schema: hasHandoffInput
-              ? z.object({
-                [promptKey]: z
-                  .string()
-                  .optional()
-                  .describe(handoffInputDescription as string),
-              })
-              : z.object({}),
+              ? {
+                type: 'object',
+                properties: {
+                  [promptKey]: {
+                    type: 'string',
+                    description: handoffInputDescription as string,
+                  },
+                },
+                required: [],
+              }
+              : { type: 'object', properties: {}, required: [] },
             description: toolDescription,
           }
         )
@@ -371,7 +375,8 @@ export class MultiAgentGraph extends StandardGraph {
 
         tools.push(
           tool(
-            async (input: Record<string, unknown>, config) => {
+            async (rawInput, config) => {
+              const input = rawInput as Record<string, unknown>;
               const toolCallId =
                 (config as ToolRunnableConfig | undefined)?.toolCall?.id ??
                 'unknown';
@@ -470,13 +475,17 @@ export class MultiAgentGraph extends StandardGraph {
             {
               name: toolName,
               schema: hasHandoffInput
-                ? z.object({
-                  [promptKey]: z
-                    .string()
-                    .optional()
-                    .describe(handoffInputDescription as string),
-                })
-                : z.object({}),
+                ? {
+                  type: 'object',
+                  properties: {
+                    [promptKey]: {
+                      type: 'string',
+                      description: handoffInputDescription as string,
+                    },
+                  },
+                  required: [],
+                }
+                : { type: 'object', properties: {}, required: [] },
               description: toolDescription,
             }
           )

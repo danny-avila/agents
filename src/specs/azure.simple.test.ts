@@ -19,7 +19,6 @@ import { ContentTypes, GraphEvents, Providers, TitleMethod } from '@/common';
 import { ChatModelStreamHandler, createContentAggregator } from '@/stream';
 import { capitalizeFirstLetter } from './spec.utils';
 import { getLLMConfig } from '@/utils/llmConfig';
-import { getArgs } from '@/scripts/args';
 import { Run } from '@/run';
 
 // Auto-skip this suite if Azure env vars are not present
@@ -34,15 +33,24 @@ const hasAzure = requiredAzureEnv.every(
 );
 const describeIfAzure = hasAzure ? describe : describe.skip;
 
+const isContentFilterError = (error: unknown): boolean => {
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    message.includes('content management policy') ||
+    message.includes('content filtering')
+  );
+};
+
 const provider = Providers.AZURE;
+let contentFilterTriggered = false;
 describeIfAzure(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
   jest.setTimeout(30000);
   let run: Run<t.IState>;
-  let runningHistory: BaseMessage[];
   let collectedUsage: UsageMetadata[];
   let conversationHistory: BaseMessage[];
   let aggregateContent: t.ContentAggregator;
   let contentParts: t.MessageContentComplex[];
+  let runningHistory: BaseMessage[] | null = null;
 
   const config = {
     configurable: {
@@ -129,186 +137,217 @@ describeIfAzure(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
   });
 
   test(`${capitalizeFirstLetter(provider)}: should process a simple message, generate title`, async () => {
-    const { userName, location } = await getArgs();
-    const llmConfig = getLLMConfig(provider);
-    const customHandlers = setupCustomHandlers();
+    try {
+      const llmConfig = getLLMConfig(provider);
+      const customHandlers = setupCustomHandlers();
 
-    run = await Run.create<t.IState>({
-      runId: 'test-run-id',
-      graphConfig: {
-        type: 'standard',
-        llmConfig,
-        tools: [new Calculator()],
-        instructions:
-          'You are a friendly AI assistant. Always address the user by their name.',
-        additional_instructions: `The user's name is ${userName} and they are located in ${location}.`,
-      },
-      returnContent: true,
-      customHandlers,
-    });
+      run = await Run.create<t.IState>({
+        runId: 'test-run-id',
+        graphConfig: {
+          type: 'standard',
+          llmConfig,
+          tools: [new Calculator()],
+          instructions:
+            'You are a helpful AI assistant. Keep responses concise and friendly.',
+        },
+        returnContent: true,
+        customHandlers,
+      });
 
-    const userMessage = 'hi';
-    conversationHistory.push(new HumanMessage(userMessage));
+      const userMessage = 'Hello, how are you today?';
+      conversationHistory.push(new HumanMessage(userMessage));
 
-    const inputs = {
-      messages: conversationHistory,
-    };
+      const inputs = {
+        messages: conversationHistory,
+      };
 
-    const finalContentParts = await run.processStream(inputs, config);
-    expect(finalContentParts).toBeDefined();
-    const allTextParts = finalContentParts?.every(
-      (part) => part.type === ContentTypes.TEXT
-    );
-    expect(allTextParts).toBe(true);
-    expect(collectedUsage.length).toBeGreaterThan(0);
-    expect(collectedUsage[0].input_tokens).toBeGreaterThan(0);
-    expect(collectedUsage[0].output_tokens).toBeGreaterThan(0);
+      const finalContentParts = await run.processStream(inputs, config);
+      expect(finalContentParts).toBeDefined();
+      const allTextParts = finalContentParts?.every(
+        (part) => part.type === ContentTypes.TEXT
+      );
+      expect(allTextParts).toBe(true);
+      expect(collectedUsage.length).toBeGreaterThan(0);
+      expect(collectedUsage[0].input_tokens).toBeGreaterThan(0);
+      expect(collectedUsage[0].output_tokens).toBeGreaterThan(0);
 
-    const finalMessages = run.getRunMessages();
-    expect(finalMessages).toBeDefined();
-    conversationHistory.push(...(finalMessages ?? []));
-    expect(conversationHistory.length).toBeGreaterThan(1);
-    runningHistory = conversationHistory.slice();
+      const finalMessages = run.getRunMessages();
+      expect(finalMessages).toBeDefined();
+      conversationHistory.push(...(finalMessages ?? []));
+      expect(conversationHistory.length).toBeGreaterThan(1);
+      runningHistory = conversationHistory.slice();
 
-    expect(onMessageDeltaSpy).toHaveBeenCalled();
-    expect(onMessageDeltaSpy.mock.calls.length).toBeGreaterThan(1);
-    expect(onMessageDeltaSpy.mock.calls[0][3]).toBeDefined(); // Graph exists
+      expect(onMessageDeltaSpy).toHaveBeenCalled();
+      expect(onMessageDeltaSpy.mock.calls.length).toBeGreaterThan(1);
+      expect(onMessageDeltaSpy.mock.calls[0][3]).toBeDefined(); // Graph exists
 
-    expect(onRunStepSpy).toHaveBeenCalled();
-    expect(onRunStepSpy.mock.calls.length).toBeGreaterThan(0);
-    expect(onRunStepSpy.mock.calls[0][3]).toBeDefined(); // Graph exists
+      expect(onRunStepSpy).toHaveBeenCalled();
+      expect(onRunStepSpy.mock.calls.length).toBeGreaterThan(0);
+      expect(onRunStepSpy.mock.calls[0][3]).toBeDefined(); // Graph exists
 
-    const { handleLLMEnd, collected } = createMetadataAggregator();
-    const titleResult = await run.generateTitle({
-      provider,
-      inputText: userMessage,
-      titleMethod: TitleMethod.STRUCTURED,
-      contentParts,
-      clientOptions: llmConfig,
-      chainOptions: {
-        callbacks: [
-          {
-            handleLLMEnd,
-          },
-        ],
-      },
-    });
+      const { handleLLMEnd, collected } = createMetadataAggregator();
+      const titleResult = await run.generateTitle({
+        provider,
+        inputText: userMessage,
+        titleMethod: TitleMethod.STRUCTURED,
+        contentParts,
+        clientOptions: llmConfig,
+        chainOptions: {
+          callbacks: [
+            {
+              handleLLMEnd,
+            },
+          ],
+        },
+      });
 
-    expect(titleResult).toBeDefined();
-    expect(titleResult.title).toBeDefined();
-    expect(titleResult.language).toBeDefined();
-    expect(collected).toBeDefined();
+      expect(titleResult).toBeDefined();
+      expect(titleResult.title).toBeDefined();
+      expect(titleResult.language).toBeDefined();
+      expect(collected).toBeDefined();
+    } catch (error) {
+      if (isContentFilterError(error)) {
+        contentFilterTriggered = true;
+        console.warn('Skipping test: Azure content filter triggered');
+        return;
+      }
+      throw error;
+    }
   });
 
   test(`${capitalizeFirstLetter(provider)}: should generate title using completion method`, async () => {
-    const { userName, location } = await getArgs();
-    const llmConfig = getLLMConfig(provider);
-    const customHandlers = setupCustomHandlers();
+    if (contentFilterTriggered) {
+      console.warn(
+        'Skipping test: Azure content filter was triggered in previous test'
+      );
+      return;
+    }
+    try {
+      const llmConfig = getLLMConfig(provider);
+      const customHandlers = setupCustomHandlers();
 
-    run = await Run.create<t.IState>({
-      runId: 'test-run-id-completion',
-      graphConfig: {
-        type: 'standard',
-        llmConfig,
-        tools: [new Calculator()],
-        instructions:
-          'You are a friendly AI assistant. Always address the user by their name.',
-        additional_instructions: `The user's name is ${userName} and they are located in ${location}.`,
-      },
-      returnContent: true,
-      customHandlers,
-    });
+      run = await Run.create<t.IState>({
+        runId: 'test-run-id-completion',
+        graphConfig: {
+          type: 'standard',
+          llmConfig,
+          tools: [new Calculator()],
+          instructions:
+            'You are a helpful AI assistant. Keep responses concise and friendly.',
+        },
+        returnContent: true,
+        customHandlers,
+      });
 
-    const userMessage = 'What is the weather like today?';
-    conversationHistory = [];
-    conversationHistory.push(new HumanMessage(userMessage));
+      const userMessage = 'What can you help me with today?';
+      conversationHistory = [];
+      conversationHistory.push(new HumanMessage(userMessage));
 
-    const inputs = {
-      messages: conversationHistory,
-    };
+      const inputs = {
+        messages: conversationHistory,
+      };
 
-    const finalContentParts = await run.processStream(inputs, config);
-    expect(finalContentParts).toBeDefined();
+      const finalContentParts = await run.processStream(inputs, config);
+      expect(finalContentParts).toBeDefined();
 
-    const { handleLLMEnd, collected } = createMetadataAggregator();
-    const titleResult = await run.generateTitle({
-      provider,
-      inputText: userMessage,
-      titleMethod: TitleMethod.COMPLETION, // Using completion method
-      contentParts,
-      clientOptions: llmConfig,
-      chainOptions: {
-        callbacks: [
-          {
-            handleLLMEnd,
-          },
-        ],
-      },
-    });
+      const { handleLLMEnd, collected } = createMetadataAggregator();
+      const titleResult = await run.generateTitle({
+        provider,
+        inputText: userMessage,
+        titleMethod: TitleMethod.COMPLETION,
+        contentParts,
+        clientOptions: llmConfig,
+        chainOptions: {
+          callbacks: [
+            {
+              handleLLMEnd,
+            },
+          ],
+        },
+      });
 
-    expect(titleResult).toBeDefined();
-    expect(titleResult.title).toBeDefined();
-    expect(titleResult.title).not.toBe('');
-    // Completion method doesn't return language
-    expect(titleResult.language).toBeUndefined();
-    expect(collected).toBeDefined();
-    console.log(`Completion method generated title: "${titleResult.title}"`);
+      expect(titleResult).toBeDefined();
+      expect(titleResult.title).toBeDefined();
+      expect(titleResult.title).not.toBe('');
+      expect(titleResult.language).toBeUndefined();
+      expect(collected).toBeDefined();
+      console.log(`Completion method generated title: "${titleResult.title}"`);
+    } catch (error) {
+      if (isContentFilterError(error)) {
+        contentFilterTriggered = true;
+        console.warn('Skipping test: Azure content filter triggered');
+        return;
+      }
+      throw error;
+    }
   });
 
   test(`${capitalizeFirstLetter(provider)}: should follow-up`, async () => {
-    console.log('Previous conversation length:', runningHistory.length);
-    console.log(
-      'Last message:',
-      runningHistory[runningHistory.length - 1].content
-    );
-    const { userName, location } = await getArgs();
-    const llmConfig = getLLMConfig(provider);
-    const customHandlers = setupCustomHandlers();
+    if (contentFilterTriggered || runningHistory == null) {
+      console.warn(
+        'Skipping test: Azure content filter was triggered or no conversation history'
+      );
+      return;
+    }
+    try {
+      console.log('Previous conversation length:', runningHistory.length);
+      console.log(
+        'Last message:',
+        runningHistory[runningHistory.length - 1].content
+      );
+      const llmConfig = getLLMConfig(provider);
+      const customHandlers = setupCustomHandlers();
 
-    run = await Run.create<t.IState>({
-      runId: 'test-run-id',
-      graphConfig: {
-        type: 'standard',
-        llmConfig,
-        tools: [new Calculator()],
-        instructions:
-          'You are a friendly AI assistant. Always address the user by their name.',
-        additional_instructions: `The user's name is ${userName} and they are located in ${location}.`,
-      },
-      returnContent: true,
-      customHandlers,
-    });
+      run = await Run.create<t.IState>({
+        runId: 'test-run-id',
+        graphConfig: {
+          type: 'standard',
+          llmConfig,
+          tools: [new Calculator()],
+          instructions:
+            'You are a helpful AI assistant. Keep responses concise and friendly.',
+        },
+        returnContent: true,
+        customHandlers,
+      });
 
-    conversationHistory = runningHistory.slice();
-    conversationHistory.push(new HumanMessage('how are you?'));
+      conversationHistory = runningHistory.slice();
+      conversationHistory.push(new HumanMessage('What else can you tell me?'));
 
-    const inputs = {
-      messages: conversationHistory,
-    };
+      const inputs = {
+        messages: conversationHistory,
+      };
 
-    const finalContentParts = await run.processStream(inputs, config);
-    expect(finalContentParts).toBeDefined();
-    const allTextParts = finalContentParts?.every(
-      (part) => part.type === ContentTypes.TEXT
-    );
-    expect(allTextParts).toBe(true);
-    expect(collectedUsage.length).toBeGreaterThan(0);
-    expect(collectedUsage[0].input_tokens).toBeGreaterThan(0);
-    expect(collectedUsage[0].output_tokens).toBeGreaterThan(0);
+      const finalContentParts = await run.processStream(inputs, config);
+      expect(finalContentParts).toBeDefined();
+      const allTextParts = finalContentParts?.every(
+        (part) => part.type === ContentTypes.TEXT
+      );
+      expect(allTextParts).toBe(true);
+      expect(collectedUsage.length).toBeGreaterThan(0);
+      expect(collectedUsage[0].input_tokens).toBeGreaterThan(0);
+      expect(collectedUsage[0].output_tokens).toBeGreaterThan(0);
 
-    const finalMessages = run.getRunMessages();
-    expect(finalMessages).toBeDefined();
-    expect(finalMessages?.length).toBeGreaterThan(0);
-    console.log(
-      `${capitalizeFirstLetter(provider)} follow-up message:`,
-      finalMessages?.[finalMessages.length - 1]?.content
-    );
+      const finalMessages = run.getRunMessages();
+      expect(finalMessages).toBeDefined();
+      expect(finalMessages?.length).toBeGreaterThan(0);
+      console.log(
+        `${capitalizeFirstLetter(provider)} follow-up message:`,
+        finalMessages?.[finalMessages.length - 1]?.content
+      );
 
-    expect(onMessageDeltaSpy).toHaveBeenCalled();
-    expect(onMessageDeltaSpy.mock.calls.length).toBeGreaterThan(1);
+      expect(onMessageDeltaSpy).toHaveBeenCalled();
+      expect(onMessageDeltaSpy.mock.calls.length).toBeGreaterThan(1);
 
-    expect(onRunStepSpy).toHaveBeenCalled();
-    expect(onRunStepSpy.mock.calls.length).toBeGreaterThan(0);
+      expect(onRunStepSpy).toHaveBeenCalled();
+      expect(onRunStepSpy.mock.calls.length).toBeGreaterThan(0);
+    } catch (error) {
+      if (isContentFilterError(error)) {
+        console.warn('Skipping test: Azure content filter triggered');
+        return;
+      }
+      throw error;
+    }
   });
 
   test('should handle errors appropriately', async () => {

@@ -1,5 +1,3 @@
-import { z } from 'zod';
-
 export enum DATE_RANGE {
   PAST_HOUR = 'h',
   PAST_24_HOURS = 'd',
@@ -38,26 +36,33 @@ Examples:
 - "in" for India
 `.trim();
 
-export const querySchema = z.string().describe(DEFAULT_QUERY_DESCRIPTION);
-export const dateSchema = z
-  .nativeEnum(DATE_RANGE)
-  .optional()
-  .describe('Date range for search results.');
-export const countrySchema = z
-  .string()
-  .optional()
-  .describe(DEFAULT_COUNTRY_DESCRIPTION);
-export const imagesSchema = z
-  .boolean()
-  .optional()
-  .describe('Whether to also run an image search.');
+export const querySchema = {
+  type: 'string',
+  description: DEFAULT_QUERY_DESCRIPTION,
+} as const;
 
-export const videosSchema = z
-  .boolean()
-  .optional()
-  .describe('Whether to also run a video search.');
+export const dateSchema = {
+  type: 'string',
+  enum: Object.values(DATE_RANGE),
+  description: 'Date range for search results.',
+} as const;
 
-export const newsSchema = z
-  .boolean()
-  .optional()
-  .describe('Whether to also run a news search.');
+export const countrySchema = {
+  type: 'string',
+  description: DEFAULT_COUNTRY_DESCRIPTION,
+} as const;
+
+export const imagesSchema = {
+  type: 'boolean',
+  description: 'Whether to also run an image search.',
+} as const;
+
+export const videosSchema = {
+  type: 'boolean',
+  description: 'Whether to also run a video search.',
+} as const;
+
+export const newsSchema = {
+  type: 'boolean',
+  description: 'Whether to also run a news search.',
+} as const;

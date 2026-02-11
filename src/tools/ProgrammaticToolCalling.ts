@@ -1,5 +1,4 @@
 // src/tools/ProgrammaticToolCalling.ts
-import { z } from 'zod';
 import { config } from 'dotenv';
 import fetch, { RequestInit } from 'node-fetch';
 import { HttpsProxyAgent } from 'https-proxy-agent';
@@ -33,12 +32,13 @@ const DEFAULT_TIMEOUT = 60000;
 // Schema
 // ============================================================================
 
-const ProgrammaticToolCallingSchema = z.object({
-  code: z
-    .string()
-    .min(1)
-    .describe(
-      `Python code that calls tools programmatically. Tools are available as async functions.
+const ProgrammaticToolCallingSchema = {
+  type: 'object',
+  properties: {
+    code: {
+      type: 'string',
+      minLength: 1,
+      description: `Python code that calls tools programmatically. Tools are available as async functions.
 
 CRITICAL - STATELESS EXECUTION:
 Each call is a fresh Python interpreter. Variables, imports, and data do NOT persist between calls.
@@ -66,19 +66,19 @@ Rules:
 - Just write code with await—auto-wrapped in async context
 - DO NOT define async def main() or call asyncio.run()
 - Tools are pre-defined—DO NOT write function definitions
-- Only print() output returns to the model`
-    ),
-  timeout: z
-    .number()
-    .int()
-    .min(1000)
-    .max(300000)
-    .optional()
-    .default(DEFAULT_TIMEOUT)
-    .describe(
-      'Maximum execution time in milliseconds. Default: 60 seconds. Max: 5 minutes.'
-    ),
-});
+- Only print() output returns to the model`,
+    },
+    timeout: {
+      type: 'integer',
+      minimum: 1000,
+      maximum: 300000,
+      default: DEFAULT_TIMEOUT,
+      description:
+        'Maximum execution time in milliseconds. Default: 60 seconds. Max: 5 minutes.',
+    },
+  },
+  required: ['code'],
+} as const;
 
 // ============================================================================
 // Helper Functions
@@ -576,7 +576,7 @@ export function formatCompletedResponse(
  */
 export function createProgrammaticToolCallingTool(
   initParams: t.ProgrammaticToolCallingParams = {}
-): DynamicStructuredTool<typeof ProgrammaticToolCallingSchema> {
+): DynamicStructuredTool {
   const apiKey =
     (initParams[EnvVar.CODE_API_KEY] as string | undefined) ??
     initParams.apiKey ??
@@ -616,8 +616,9 @@ Example (complete pipeline):
   data = await query_db(sql="..."); df = process(data); await save_to_sheet(data=df); print("Done")
 `.trim();
 
-  return tool<typeof ProgrammaticToolCallingSchema>(
-    async (params, config) => {
+  return tool(
+    async (rawParams, config) => {
+      const params = rawParams as { code: string; timeout?: number };
       const { code, timeout = DEFAULT_TIMEOUT } = params;
 
       // Extra params injected by ToolNode (follows web_search pattern)

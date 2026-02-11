@@ -41,6 +41,12 @@ export type ToolNodeOptions = {
   toolRegistry?: LCToolRegistry;
   /** Reference to Graph's sessions map for automatic session injection */
   sessions?: ToolSessionMap;
+  /** When true, dispatches ON_TOOL_EXECUTE events instead of invoking tools directly */
+  eventDrivenMode?: boolean;
+  /** Tool definitions for event-driven mode (used for context, not invocation) */
+  toolDefinitions?: Map<string, LCTool>;
+  /** Agent ID for event-driven mode (used to identify which agent's context to use) */
+  agentId?: string;
 };
 
 export type ToolNodeConstructorParams = ToolRefs & ToolNodeOptions;
@@ -125,6 +131,58 @@ export type LCTool = {
    * Options: 'direct', 'code_execution'
    */
   allowed_callers?: AllowedCaller[];
+  /** Response format for the tool output */
+  responseFormat?: 'content' | 'content_and_artifact';
+  /** Server name for MCP tools */
+  serverName?: string;
+  /** Tool type classification */
+  toolType?: 'builtin' | 'mcp' | 'action';
+};
+
+/** Single tool call within a batch request for event-driven execution */
+export type ToolCallRequest = {
+  /** Tool call ID from the LLM */
+  id: string;
+  /** Tool name */
+  name: string;
+  /** Tool arguments */
+  args: Record<string, unknown>;
+  /** Step ID for tracking */
+  stepId?: string;
+  /** Usage turn count for this tool */
+  turn?: number;
+};
+
+/** Batch request containing ALL tool calls for a graph step */
+export type ToolExecuteBatchRequest = {
+  /** All tool calls from the AIMessage */
+  toolCalls: ToolCallRequest[];
+  /** User ID for context */
+  userId?: string;
+  /** Agent ID for context */
+  agentId?: string;
+  /** Runtime configurable from RunnableConfig (includes user, userMCPAuthMap, etc.) */
+  configurable?: Record<string, unknown>;
+  /** Runtime metadata from RunnableConfig (includes thread_id, run_id, provider, etc.) */
+  metadata?: Record<string, unknown>;
+  /** Promise resolver - handler calls this with ALL results */
+  resolve: (results: ToolExecuteResult[]) => void;
+  /** Promise rejector - handler calls this on fatal error */
+  reject: (error: Error) => void;
+};
+
+/** Result for a single tool call in event-driven execution */
+export type ToolExecuteResult = {
+  /** Matches ToolCallRequest.id */
+  toolCallId: string;
+  /** Tool output content */
+  content: string | unknown[];
+  /** Optional artifact (for content_and_artifact format) */
+  artifact?: unknown;
+  /** Execution status */
+  status: 'success' | 'error';
+  /** Error message if status is 'error' */
+  errorMessage?: string;
 };
 
 /** Map of tool names to tool definitions */

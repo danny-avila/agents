@@ -3,7 +3,6 @@
  * Shared mock tools for testing across all test scripts.
  * Centralizes tool definitions to follow DRY principles.
  */
-import { z } from 'zod';
 import { tool } from '@langchain/core/tools';
 import type { StructuredToolInterface } from '@langchain/core/tools';
 import type { LCTool, LCToolRegistry } from '@/types';
@@ -29,7 +28,7 @@ export function createGetTeamMembersTool(): StructuredToolInterface {
       name: 'get_team_members',
       description:
         'Get list of team members. Returns array of objects with id, name, and department fields.',
-      schema: z.object({}),
+      schema: { type: 'object', properties: {}, required: [] },
     }
   );
 }
@@ -59,7 +58,8 @@ export function createGetExpensesTool(): StructuredToolInterface {
   };
 
   return tool(
-    async ({ user_id }: { user_id: string }) => {
+    async (input) => {
+      const { user_id } = input as { user_id: string };
       await new Promise((resolve) => setTimeout(resolve, 30));
       return expenseData[user_id] ?? [];
     },
@@ -67,9 +67,16 @@ export function createGetExpensesTool(): StructuredToolInterface {
       name: 'get_expenses',
       description:
         'Get expense records for a user. Returns array of objects with amount and category fields.',
-      schema: z.object({
-        user_id: z.string().describe('The user ID to fetch expenses for'),
-      }),
+      schema: {
+        type: 'object',
+        properties: {
+          user_id: {
+            type: 'string',
+            description: 'The user ID to fetch expenses for',
+          },
+        },
+        required: ['user_id'],
+      },
     }
   );
 }
@@ -91,7 +98,8 @@ export function createGetWeatherTool(): StructuredToolInterface {
   };
 
   return tool(
-    async ({ city }: { city: string }) => {
+    async (input) => {
+      const { city } = input as { city: string };
       await new Promise((resolve) => setTimeout(resolve, 40));
       const weather = weatherData[city];
       if (!weather) {
@@ -103,9 +111,13 @@ export function createGetWeatherTool(): StructuredToolInterface {
       name: 'get_weather',
       description:
         'Get current weather for a city. Returns object with temperature (number) and condition (string) fields.',
-      schema: z.object({
-        city: z.string().describe('City name'),
-      }),
+      schema: {
+        type: 'object',
+        properties: {
+          city: { type: 'string', description: 'City name' },
+        },
+        required: ['city'],
+      },
     }
   );
 }
@@ -115,7 +127,8 @@ export function createGetWeatherTool(): StructuredToolInterface {
  */
 export function createCalculatorTool(): StructuredToolInterface {
   return tool(
-    async ({ expression }: { expression: string }) => {
+    async (input) => {
+      const { expression } = input as { expression: string };
       await new Promise((resolve) => setTimeout(resolve, 10));
       // Simple eval for demo (in production, use a proper math parser)
 
@@ -125,9 +138,16 @@ export function createCalculatorTool(): StructuredToolInterface {
     {
       name: 'calculator',
       description: 'Evaluate a mathematical expression',
-      schema: z.object({
-        expression: z.string().describe('Mathematical expression to evaluate'),
-      }),
+      schema: {
+        type: 'object',
+        properties: {
+          expression: {
+            type: 'string',
+            description: 'Mathematical expression to evaluate',
+          },
+        },
+        required: ['expression'],
+      },
     }
   );
 }

@@ -1,4 +1,3 @@
-import { z } from 'zod';
 import { ChatPromptTemplate } from '@langchain/core/prompts';
 import { RunnableLambda, RunnableSequence } from '@langchain/core/runnables';
 import type { Runnable, RunnableConfig } from '@langchain/core/runnables';
@@ -12,22 +11,33 @@ const defaultTitlePrompt = `Analyze this conversation and provide:
 
 {convo}`;
 
-const titleSchema = z.object({
-  title: z
-    .string()
-    .describe(
-      'A concise title for the conversation in 5 words or less, without punctuation or quotation'
-    ),
-});
+const titleSchema = {
+  type: 'object',
+  properties: {
+    title: {
+      type: 'string',
+      description:
+        'A concise title for the conversation in 5 words or less, without punctuation or quotation',
+    },
+  },
+  required: ['title'],
+} as const;
 
-const combinedSchema = z.object({
-  language: z.string().describe('The detected language of the conversation'),
-  title: z
-    .string()
-    .describe(
-      'A concise title for the conversation in 5 words or less, without punctuation or quotation'
-    ),
-});
+const combinedSchema = {
+  type: 'object',
+  properties: {
+    language: {
+      type: 'string',
+      description: 'The detected language of the conversation',
+    },
+    title: {
+      type: 'string',
+      description:
+        'A concise title for the conversation in 5 words or less, without punctuation or quotation',
+    },
+  },
+  required: ['language', 'title'],
+} as const;
 
 export const createTitleRunnable = async (
   model: t.ChatModelInstance,
@@ -54,7 +64,8 @@ export const createTitleRunnable = async (
       input: { convo: string },
       config?: Partial<RunnableConfig>
     ): Promise<{ title: string }> => {
-      return await titleOnlyInnerChain.invoke(input, config);
+      const result = await titleOnlyInnerChain.invoke(input, config);
+      return result as { title: string };
     },
   }).withConfig({ runName: 'TitleOnlyChain' });
 
@@ -64,7 +75,8 @@ export const createTitleRunnable = async (
       input: { convo: string },
       config?: Partial<RunnableConfig>
     ): Promise<{ language: string; title: string }> => {
-      return await combinedInnerChain.invoke(input, config);
+      const result = await combinedInnerChain.invoke(input, config);
+      return result as { language: string; title: string };
     },
   }).withConfig({ runName: 'TitleLanguageChain' });
 

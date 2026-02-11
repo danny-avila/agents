@@ -4,6 +4,9 @@
  * These tests hit the LIVE Code API and verify end-to-end functionality.
  *
  * Run with: npm test -- ProgrammaticToolCalling.integration.test.ts
+ *
+ * Requires LIBRECHAT_CODE_API_KEY environment variable.
+ * Tests are skipped when the API key is not available.
  */
 import { config as dotenvConfig } from 'dotenv';
 dotenvConfig();
@@ -19,19 +22,17 @@ import {
   createProgrammaticToolRegistry,
 } from '@/test/mockTools';
 
-describe('ProgrammaticToolCalling - Live API Integration', () => {
+const apiKey = process.env.LIBRECHAT_CODE_API_KEY;
+const shouldSkip = apiKey == null || apiKey === '';
+
+const describeIfApiKey = shouldSkip ? describe.skip : describe;
+
+describeIfApiKey('ProgrammaticToolCalling - Live API Integration', () => {
   let ptcTool: ReturnType<typeof createProgrammaticToolCallingTool>;
   let toolMap: t.ToolMap;
   let toolDefinitions: t.LCTool[];
 
   beforeAll(() => {
-    const apiKey = process.env.LIBRECHAT_CODE_API_KEY;
-    if (apiKey == null || apiKey === '') {
-      throw new Error(
-        'LIBRECHAT_CODE_API_KEY not set. Required for integration tests.'
-      );
-    }
-
     const tools = [
       createGetTeamMembersTool(),
       createGetExpensesTool(),
@@ -42,7 +43,7 @@ describe('ProgrammaticToolCalling - Live API Integration', () => {
     toolMap = new Map(tools.map((t) => [t.name, t]));
     toolDefinitions = Array.from(createProgrammaticToolRegistry().values());
 
-    ptcTool = createProgrammaticToolCallingTool({ apiKey });
+    ptcTool = createProgrammaticToolCallingTool({ apiKey: apiKey! });
   });
 
   it('executes simple single tool call', async () => {
