@@ -331,7 +331,7 @@ export function addBedrockCacheControl<
     let hasCacheableContent = false;
     for (const block of workingContent) {
       if (block.type === ContentTypes.TEXT) {
-        if (typeof block.text === 'string' && block.text !== '') {
+        if (typeof block.text === 'string' && block.text.trim() !== '') {
           hasCacheableContent = true;
           break;
         }
@@ -349,7 +349,7 @@ export function addBedrockCacheControl<
       const type = (block as { type?: string }).type;
       if (type === ContentTypes.TEXT || type === 'text') {
         const text = (block as { text?: string }).text;
-        if (text === '' || text === undefined) {
+        if (text === '' || text === undefined || text.trim() === '') {
           continue;
         }
         workingContent.splice(j + 1, 0, {

@@ -551,6 +551,47 @@ describe('addBedrockCacheControl (Bedrock cache checkpoints)', () => {
     });
     expect(secondLastContent[1]).toEqual({ cachePoint: { type: 'default' } });
   });
+
+  it('skips cachePoint on AI messages with only whitespace text and reasoning (tool-call scenario)', () => {
+    const messages = [
+      {
+        role: 'user',
+        content: [
+          {
+            type: ContentTypes.TEXT,
+            text: 'What can you tell me about this PR?',
+          },
+        ],
+      },
+      {
+        role: 'assistant',
+        content: [
+          { type: ContentTypes.TEXT, text: '\n\n' },
+          {
+            type: 'reasoning_content',
+            reasoningText: { text: 'Let me look into that.', signature: 'abc' },
+          },
+        ] as MessageContentComplex[],
+      },
+      {
+        role: 'user',
+        content: [{ type: ContentTypes.TEXT, text: 'tool result here' }],
+        getType: (): 'tool' => 'tool',
+      },
+    ];
+
+    const result = addBedrockCacheControl(
+      messages as Parameters<typeof addBedrockCacheControl>[0]
+    );
+    const aiContent = result[1].content as MessageContentComplex[];
+    const hasCachePoint = aiContent.some((b) => 'cachePoint' in b);
+    expect(hasCachePoint).toBe(false);
+
+    const userContent = result[0].content as MessageContentComplex[];
+    expect(userContent[userContent.length - 1]).toEqual({
+      cachePoint: { type: 'default' },
+    });
+  });
 });
 
 describe('stripAnthropicCacheControl', () => {
