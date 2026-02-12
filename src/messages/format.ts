@@ -288,7 +288,12 @@ function formatAssistantMessage(
   let hasReasoning = false;
 
   if (Array.isArray(message.content)) {
-    for (const part of message.content) {
+    for (const part of message.content as Array<
+      MessageContentComplex | undefined | null
+    >) {
+      if (part == null) {
+        continue;
+      }
       if (part.type === ContentTypes.TEXT && part.tool_call_ids) {
         /*
         If there's pending content, it needs to be aggregated as a single string to prepare for tool calls.
@@ -865,7 +870,6 @@ export const formatAgentMessages = (
     indexMapping[i] = resultIndices;
   }
 
-  // Update the token count map if it was provided
   if (indexTokenCountMap) {
     for (
       let originalIndex = 0;
@@ -875,24 +879,77 @@ export const formatAgentMessages = (
       const resultIndices = indexMapping[originalIndex] || [];
       const tokenCount = indexTokenCountMap[originalIndex];
 
-      if (tokenCount !== undefined) {
-        if (resultIndices.length === 1) {
-          // Simple 1:1 mapping
-          updatedIndexTokenCountMap[resultIndices[0]] = tokenCount;
-        } else if (resultIndices.length > 1) {
-          // If one message was split into multiple, distribute the token count
-          // This is a simplification - in reality, you might want a more sophisticated distribution
-          const countPerMessage = Math.floor(tokenCount / resultIndices.length);
-          resultIndices.forEach((resultIndex, idx) => {
-            if (idx === resultIndices.length - 1) {
-              // Give any remainder to the last message
-              updatedIndexTokenCountMap[resultIndex] =
-                tokenCount - countPerMessage * (resultIndices.length - 1);
-            } else {
-              updatedIndexTokenCountMap[resultIndex] = countPerMessage;
+      if (tokenCount === undefined) {
+        continue;
+      }
+
+      const msgCount = resultIndices.length;
+      if (msgCount === 1) {
+        updatedIndexTokenCountMap[resultIndices[0]] = tokenCount;
+        continue;
+      }
+
+      if (msgCount < 2) {
+        continue;
+      }
+
+      let totalLength = 0;
+      const lastIdx = msgCount - 1;
+      const lengths = new Array<number>(msgCount);
+      for (let k = 0; k < msgCount; k++) {
+        const msg = messages[resultIndices[k]];
+        const { content } = msg;
+        let len = 0;
+        if (typeof content === 'string') {
+          len = content.length;
+        } else if (Array.isArray(content)) {
+          for (const part of content as Array<
+            Record<string, unknown> | string | undefined
+          >) {
+            if (typeof part === 'string') {
+              len += part.length;
+            } else if (part != null && typeof part === 'object') {
+              const val = part.text ?? part.content;
+              if (typeof val === 'string') {
+                len += val.length;
+              }
             }
-          });
+          }
         }
+        const toolCalls = (msg as AIMessage).tool_calls;
+        if (Array.isArray(toolCalls)) {
+          for (const tc of toolCalls as Array<Record<string, unknown>>) {
+            if (typeof tc.name === 'string') {
+              len += tc.name.length;
+            }
+            const { args } = tc;
+            if (typeof args === 'string') {
+              len += args.length;
+            } else if (args != null) {
+              len += JSON.stringify(args).length;
+            }
+          }
+        }
+        lengths[k] = len;
+        totalLength += len;
+      }
+
+      if (totalLength === 0) {
+        const countPerMessage = Math.floor(tokenCount / msgCount);
+        for (let k = 0; k < lastIdx; k++) {
+          updatedIndexTokenCountMap[resultIndices[k]] = countPerMessage;
+        }
+        updatedIndexTokenCountMap[resultIndices[lastIdx]] =
+          tokenCount - countPerMessage * lastIdx;
+      } else {
+        let distributed = 0;
+        for (let k = 0; k < lastIdx; k++) {
+          const share = Math.floor((lengths[k] / totalLength) * tokenCount);
+          updatedIndexTokenCountMap[resultIndices[k]] = share;
+          distributed += share;
+        }
+        updatedIndexTokenCountMap[resultIndices[lastIdx]] =
+          tokenCount - distributed;
       }
     }
   }
