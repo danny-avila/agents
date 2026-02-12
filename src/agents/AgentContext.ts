@@ -42,6 +42,7 @@ export class AgentContext {
       maxContextTokens,
       reasoningKey,
       useLegacyContent,
+      vision,
       discoveredTools,
     } = agentConfig;
 
@@ -63,6 +64,7 @@ export class AgentContext {
       instructionTokens: 0,
       tokenCounter,
       useLegacyContent,
+      vision,
       discoveredTools,
     });
 
@@ -164,6 +166,11 @@ export class AgentContext {
   /** Format content blocks as strings (for legacy compatibility) */
   useLegacyContent: boolean = false;
   /**
+   * Whether this agent supports vision capabilities (image processing).
+   * Defaults to false if not explicitly set.
+   */
+  vision?: boolean;
+  /**
    * Handoff context when this agent receives control via handoff.
    * Contains source and parallel execution info for system message context.
    */
@@ -192,6 +199,7 @@ export class AgentContext {
     toolEnd,
     instructionTokens,
     useLegacyContent,
+    vision,
     discoveredTools,
   }: {
     agentId: string;
@@ -211,6 +219,7 @@ export class AgentContext {
     toolEnd?: boolean;
     instructionTokens?: number;
     useLegacyContent?: boolean;
+    vision?: boolean;
     discoveredTools?: string[];
   }) {
     this.agentId = agentId;
@@ -226,6 +235,7 @@ export class AgentContext {
     this.toolDefinitions = toolDefinitions;
     this.instructions = instructions;
     this.additionalInstructions = additionalInstructions;
+    this.vision = vision;
     if (reasoningKey) {
       this.reasoningKey = reasoningKey;
     }
