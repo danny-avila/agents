@@ -120,6 +120,16 @@ export const llmConfigs: Record<string, t.LLMConfig | undefined> = {
     streaming: true,
     streamUsage: true,
   },
+  [Providers.MOONSHOT]: {
+    provider: Providers.MOONSHOT,
+    model: 'kimi-k2.5',
+    streaming: true,
+    streamUsage: true,
+    configuration: {
+      apiKey: process.env.MOONSHOT_API_KEY,
+      baseURL: 'https://api.moonshot.ai/v1',
+    },
+  },
   [Providers.ANTHROPIC]: {
     provider: Providers.ANTHROPIC,
     model: 'claude-sonnet-4-5',
@@ -167,7 +177,8 @@ export const llmConfigs: Record<string, t.LLMConfig | undefined> = {
     // model: 'anthropic.claude-3-sonnet-20240229-v1:0',
     // model: 'us.anthropic.claude-3-5-sonnet-20241022-v2:0',
     // model: 'us.amazon.nova-pro-v1:0',
-    model: 'us.anthropic.claude-sonnet-4-20250514-v1:0',
+    // model: 'us.anthropic.claude-sonnet-4-20250514-v1:0',
+    model: 'us.anthropic.claude-sonnet-4-5-20250929-v1:0',
     // additionalModelRequestFields: { thinking: { type: 'enabled', budget_tokens: 2000 } },
     region: process.env.BEDROCK_AWS_REGION,
     credentials: {

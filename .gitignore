@@ -11,4 +11,5 @@ dist/
 .turbo
 google_auth.json
 credentials/**/*
+coverage/**/*
 .cursor/

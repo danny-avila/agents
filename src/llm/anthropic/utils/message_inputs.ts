@@ -24,8 +24,6 @@ import {
   AnthropicImageBlockParam,
   AnthropicMessageCreateParams,
   AnthropicTextBlockParam,
-  AnthropicToolResultBlockParam,
-  AnthropicToolUseBlockParam,
   AnthropicDocumentBlockParam,
   AnthropicThinkingBlockParam,
   AnthropicRedactedThinkingBlockParam,
@@ -33,6 +31,7 @@ import {
   AnthropicWebSearchToolResultBlockParam,
   isAnthropicImageBlockParam,
   AnthropicSearchResultBlockParam,
+  AnthropicCompactionBlockParam,
   AnthropicToolResponse,
 } from '../types';
 
@@ -494,7 +493,7 @@ function _formatContent(message: BaseMessage) {
         return block;
       } else if (contentPart.type === 'search_result') {
         const block: AnthropicSearchResultBlockParam = {
-          type: 'search_result' as const, // Explicitly setting the type as "search_result"
+          type: 'search_result' as const,
           title: contentPart.title,
           source: contentPart.source,
           ...('cache_control' in contentPart && contentPart.cache_control
@@ -504,6 +503,13 @@ function _formatContent(message: BaseMessage) {
             ? { citations: contentPart.citations }
             : {}),
           content: contentPart.content,
+        };
+        return block;
+      } else if (contentPart.type === 'compaction') {
+        const block: AnthropicCompactionBlockParam = {
+          type: 'compaction' as const,
+          content: contentPart.content,
+          ...(cacheControl ? { cache_control: cacheControl } : {}),
         };
         return block;
       } else if (
@@ -682,38 +688,15 @@ function mergeMessages(messages: AnthropicMessageCreateParams['messages']) {
   const result: AnthropicMessageCreateParams['messages'] = [];
   let currentMessage = messages[0];
 
+  type ContentBlocks = Exclude<
+    AnthropicMessageCreateParams['messages'][number]['content'],
+    string
+  >;
   const normalizeContent = (
-    content:
-      | string
-      | Array<
-          | AnthropicTextBlockParam
-          | AnthropicImageBlockParam
-          | AnthropicToolUseBlockParam
-          | AnthropicToolResultBlockParam
-          | AnthropicDocumentBlockParam
-          | AnthropicThinkingBlockParam
-          | AnthropicRedactedThinkingBlockParam
-          | AnthropicServerToolUseBlockParam
-          | AnthropicWebSearchToolResultBlockParam
-        >
-  ): Array<
-    | AnthropicTextBlockParam
-    | AnthropicImageBlockParam
-    | AnthropicToolUseBlockParam
-    | AnthropicToolResultBlockParam
-    | AnthropicDocumentBlockParam
-    | AnthropicThinkingBlockParam
-    | AnthropicRedactedThinkingBlockParam
-    | AnthropicServerToolUseBlockParam
-    | AnthropicWebSearchToolResultBlockParam
-  > => {
+    content: AnthropicMessageCreateParams['messages'][number]['content']
+  ): ContentBlocks => {
     if (typeof content === 'string') {
-      return [
-        {
-          type: 'text',
-          text: content,
-        },
-      ];
+      return [{ type: 'text', text: content }];
     }
     return content;
   };

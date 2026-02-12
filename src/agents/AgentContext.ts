@@ -43,6 +43,7 @@ export class AgentContext {
       reasoningKey,
       useLegacyContent,
       vision,
+      discoveredTools,
     } = agentConfig;
 
     const agentContext = new AgentContext({
@@ -64,6 +65,7 @@ export class AgentContext {
       tokenCounter,
       useLegacyContent,
       vision,
+      discoveredTools,
     });
 
     if (tokenCounter) {
@@ -116,6 +118,8 @@ export class AgentContext {
   lastStreamCall?: number;
   /** Tools available to this agent */
   tools?: t.GraphTools;
+  /** Graph-managed tools (e.g., handoff tools created by MultiAgentGraph) that bypass event-driven dispatch */
+  graphTools?: t.GraphTools;
   /** Tool map for this agent */
   toolMap?: t.ToolMap;
   /**
@@ -140,6 +144,8 @@ export class AgentContext {
   lastToken?: string;
   /** Token type switch state */
   tokenTypeSwitch?: 'reasoning' | 'content';
+  /** Tracks how many reasoning→text transitions have occurred (ensures unique post-reasoning step keys) */
+  reasoningTransitionCount = 0;
   /** Current token type being processed */
   currentTokenType: ContentTypes.TEXT | ContentTypes.THINK | 'think_and_text' =
     ContentTypes.TEXT;
@@ -194,6 +200,7 @@ export class AgentContext {
     instructionTokens,
     useLegacyContent,
     vision,
+    discoveredTools,
   }: {
     agentId: string;
     name?: string;
@@ -213,6 +220,7 @@ export class AgentContext {
     instructionTokens?: number;
     useLegacyContent?: boolean;
     vision?: boolean;
+    discoveredTools?: string[];
   }) {
     this.agentId = agentId;
     this.name = name;
@@ -239,6 +247,12 @@ export class AgentContext {
     }
 
     this.useLegacyContent = useLegacyContent ?? false;
+
+    if (discoveredTools && discoveredTools.length > 0) {
+      for (const toolName of discoveredTools) {
+        this.discoveredToolNames.add(toolName);
+      }
+    }
   }
 
   /**
@@ -460,6 +474,7 @@ export class AgentContext {
     this.pruneMessages = undefined;
     this.lastStreamCall = undefined;
     this.tokenTypeSwitch = undefined;
+    this.reasoningTransitionCount = 0;
     this.currentTokenType = ContentTypes.TEXT;
     this.discoveredToolNames.clear();
     this.handoffContext = undefined;
@@ -595,17 +610,22 @@ export class AgentContext {
     }
 
     /** Traditional mode: filter actual tool instances */
-    if (!this.tools || !this.toolRegistry) {
-      return this.tools;
+    const filtered =
+      !this.tools || !this.toolRegistry
+        ? this.tools
+        : this.filterToolsForBinding(this.tools);
+
+    if (this.graphTools && this.graphTools.length > 0) {
+      return [...(filtered ?? []), ...this.graphTools];
     }
 
-    return this.filterToolsForBinding(this.tools);
+    return filtered;
   }
 
   /** Creates schema-only tools from toolDefinitions for event-driven mode */
   private getEventDrivenToolsForBinding(): t.GraphTools {
     if (!this.toolDefinitions) {
-      return [];
+      return this.graphTools ?? [];
     }
 
     const defsToInclude = this.toolDefinitions.filter((def) => {
@@ -622,7 +642,13 @@ export class AgentContext {
       return true;
     });
 
-    return createSchemaOnlyTools(defsToInclude) as t.GraphTools;
+    const schemaTools = createSchemaOnlyTools(defsToInclude) as t.GraphTools;
+
+    if (this.graphTools && this.graphTools.length > 0) {
+      return [...schemaTools, ...this.graphTools];
+    }
+
+    return schemaTools;
   }
 
   /** Filters tool instances for binding based on registry config */

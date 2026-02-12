@@ -306,6 +306,375 @@ describe('formatAgentMessages', () => {
     ]);
   });
 
+  it('should dynamically discover tools from tool_search output and keep their tool calls', () => {
+    const tools = new Set(['tool_search', 'calculator']);
+    const payload = [
+      {
+        role: 'user',
+        content: 'Search for commits and list them',
+      },
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]: 'I\'ll search for tools first.',
+            tool_call_ids: ['ts_1'],
+          },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 'ts_1',
+              name: 'tool_search',
+              args: '{"query":"commits"}',
+              output: '{"found": 1, "tools": [{"name": "list_commits"}]}',
+            },
+          },
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]: 'Now listing commits.',
+            tool_call_ids: ['lc_1'],
+          },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 'lc_1',
+              name: 'list_commits',
+              args: '{"repo":"test"}',
+              output: '[{"sha":"abc123"}]',
+            },
+          },
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]: 'Here are the results.',
+          },
+        ],
+      },
+      {
+        role: 'user',
+        content: 'Thanks!',
+      },
+    ];
+
+    const result = formatAgentMessages(payload, undefined, tools);
+
+    /**
+     * Since tool_search discovered list_commits, both should be kept.
+     * The dynamic discovery adds list_commits to the valid tools set.
+     */
+    const toolMessages = result.messages.filter(
+      (m) => m._getType() === 'tool'
+    ) as ToolMessage[];
+    expect(toolMessages.length).toBe(2);
+
+    const toolNames = toolMessages.map((m) => m.name).sort();
+    expect(toolNames).toEqual(['list_commits', 'tool_search']);
+  });
+
+  it('should filter out tool calls not in set and not discovered by tool_search', () => {
+    const tools = new Set(['tool_search', 'calculator']);
+    const payload = [
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]: 'I\'ll call an unknown tool.',
+            tool_call_ids: ['uk_1'],
+          },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 'uk_1',
+              name: 'unknown_tool',
+              args: '{}',
+              output: 'result',
+            },
+          },
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]: 'Done.',
+          },
+        ],
+      },
+    ];
+
+    const result = formatAgentMessages(payload, undefined, tools);
+
+    /** unknown_tool should be filtered out since it's not in tools set and not discovered */
+    const toolMessages = result.messages.filter(
+      (m) => m._getType() === 'tool'
+    ) as ToolMessage[];
+    expect(toolMessages.length).toBe(0);
+  });
+
+  it('should keep all tool calls when all are in the tools set', () => {
+    const tools = new Set(['search', 'calculator']);
+    const payload = [
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]: 'Let me help.',
+            tool_call_ids: ['s1', 'c1'],
+          },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 's1',
+              name: 'search',
+              args: '{"q":"test"}',
+              output: 'Search results',
+            },
+          },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 'c1',
+              name: 'calculator',
+              args: '{"expr":"2+2"}',
+              output: '4',
+            },
+          },
+        ],
+      },
+    ];
+
+    const result = formatAgentMessages(payload, undefined, tools);
+
+    const toolMessages = result.messages.filter(
+      (m) => m._getType() === 'tool'
+    ) as ToolMessage[];
+    expect(toolMessages.length).toBe(2);
+    expect(toolMessages.map((m) => m.name).sort()).toEqual([
+      'calculator',
+      'search',
+    ]);
+  });
+
+  it('should preserve discovered tools across multiple assistant messages', () => {
+    /**
+     * This test verifies that once tool_search discovers a tool, it remains valid
+     * for all subsequent messages in the conversation, not just the current message.
+     */
+    const tools = new Set(['tool_search']);
+    const payload = [
+      {
+        role: 'user',
+        content: 'Find me a tool to list commits and use it',
+      },
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]: 'Let me search for that tool.',
+            tool_call_ids: ['ts_1'],
+          },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 'ts_1',
+              name: 'tool_search',
+              args: '{"query":"commits"}',
+              output:
+                '{"found": 1, "tools": [{"name": "list_commits_mcp_github"}]}',
+            },
+          },
+        ],
+      },
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]: 'Now using the discovered tool.',
+            tool_call_ids: ['lc_1'],
+          },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 'lc_1',
+              name: 'list_commits_mcp_github',
+              args: '{"repo":"test"}',
+              output: '[{"sha":"abc123","message":"Initial commit"}]',
+            },
+          },
+        ],
+      },
+      {
+        role: 'user',
+        content: 'Show me more commits',
+      },
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]: 'Fetching more commits.',
+            tool_call_ids: ['lc_2'],
+          },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 'lc_2',
+              name: 'list_commits_mcp_github',
+              args: '{"repo":"test","page":2}',
+              output: '[{"sha":"def456","message":"Second commit"}]',
+            },
+          },
+        ],
+      },
+    ];
+
+    const result = formatAgentMessages(payload, undefined, tools);
+
+    /** All three tool calls should be preserved as ToolMessages */
+    const toolMessages = result.messages.filter(
+      (m) => m._getType() === 'tool'
+    ) as ToolMessage[];
+
+    expect(toolMessages.length).toBe(3);
+    expect(toolMessages[0].name).toBe('tool_search');
+    expect(toolMessages[1].name).toBe('list_commits_mcp_github');
+    expect(toolMessages[2].name).toBe('list_commits_mcp_github');
+  });
+
+  it('should convert invalid tools to string while keeping valid tools as ToolMessages', () => {
+    /**
+     * This test documents the hybrid behavior:
+     * - Valid tools remain as proper AIMessage + ToolMessage structures
+     * - Invalid tools are converted to string and appended to text content
+     *   (preserving context without losing information)
+     */
+    const tools = new Set(['calculator']);
+    const payload = [
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]: 'I will use two tools.',
+            tool_call_ids: ['calc_1', 'unknown_1'],
+          },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 'calc_1',
+              name: 'calculator',
+              args: '{"expr":"2+2"}',
+              output: '4',
+            },
+          },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 'unknown_1',
+              name: 'some_unknown_tool',
+              args: '{"query":"test"}',
+              output: 'This is the result from unknown tool',
+            },
+          },
+        ],
+      },
+    ];
+
+    const result = formatAgentMessages(payload, undefined, tools);
+
+    /** Should have AIMessage + ToolMessage for calculator */
+    expect(result.messages.length).toBe(2);
+    expect(result.messages[0]).toBeInstanceOf(AIMessage);
+    expect(result.messages[1]).toBeInstanceOf(ToolMessage);
+
+    /** The valid tool should be kept */
+    expect((result.messages[0] as AIMessage).tool_calls).toHaveLength(1);
+    expect((result.messages[0] as AIMessage).tool_calls?.[0].name).toBe(
+      'calculator'
+    );
+    expect((result.messages[1] as ToolMessage).name).toBe('calculator');
+
+    /** The invalid tool should be converted to string in the content */
+    const aiContent = result.messages[0].content;
+    const aiContentStr =
+      typeof aiContent === 'string' ? aiContent : JSON.stringify(aiContent);
+    expect(aiContentStr).toContain('some_unknown_tool');
+    expect(aiContentStr).toContain('This is the result from unknown tool');
+  });
+
+  it('should simulate realistic deferred tools flow with tool_search', () => {
+    /**
+     * This test simulates the real-world use case:
+     * 1. Agent only has tool_search initially (deferred tools not in set)
+     * 2. User asks to do something that requires a deferred tool
+     * 3. Agent uses tool_search to discover the tool
+     * 4. Agent then uses the discovered tool
+     * 5. On subsequent conversation turns, both tool calls should be valid
+     */
+    const tools = new Set(['tool_search', 'execute_code']);
+    const payload = [
+      { role: 'user', content: 'List the recent commits from the repo' },
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]:
+              'I need to find a tool for listing commits. Let me search.',
+            tool_call_ids: ['search_1'],
+          },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 'search_1',
+              name: 'tool_search',
+              args: '{"query":"git commits list"}',
+              output:
+                '{\n  "found": 1,\n  "tools": [\n    {\n      "name": "list_commits_mcp_github",\n      "score": 0.95,\n      "matched_in": "name",\n      "snippet": "Lists commits from a GitHub repository"\n    }\n  ],\n  "total_searched": 50,\n  "query": "git commits list"\n}',
+            },
+          },
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]: 'Found the tool! Now I will list the commits.',
+            tool_call_ids: ['commits_1'],
+          },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 'commits_1',
+              name: 'list_commits_mcp_github',
+              args: '{"owner":"librechat","repo":"librechat"}',
+              output:
+                '[{"sha":"abc123","message":"feat: add deferred tools"},{"sha":"def456","message":"fix: tool loading"}]',
+            },
+          },
+        ],
+      },
+    ];
+
+    const result = formatAgentMessages(payload, undefined, tools);
+
+    /** Both tool_search and list_commits_mcp_github should be preserved */
+    const toolMessages = result.messages.filter(
+      (m) => m._getType() === 'tool'
+    ) as ToolMessage[];
+
+    expect(toolMessages.length).toBe(2);
+    expect(toolMessages[0].name).toBe('tool_search');
+    expect(toolMessages[1].name).toBe('list_commits_mcp_github');
+
+    /** The AI messages should have proper tool_calls */
+    const aiMessages = result.messages.filter(
+      (m) => m._getType() === 'ai'
+    ) as AIMessage[];
+
+    const toolCallNames = aiMessages.flatMap(
+      (m) => m.tool_calls?.map((tc) => tc.name) ?? []
+    );
+    expect(toolCallNames).toContain('tool_search');
+    expect(toolCallNames).toContain('list_commits_mcp_github');
+  });
+
   it.skip('should not produce two consecutive assistant messages and format content correctly', () => {
     const payload = [
       { role: 'user', content: 'Hello' },

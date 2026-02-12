@@ -26,6 +26,7 @@ import type { ChatXAIInput } from '@langchain/xai';
 import {
   AzureChatOpenAI,
   ChatDeepSeek,
+  ChatMoonshot,
   ChatOpenAI,
   ChatXAI,
 } from '@/llm/openai';
@@ -110,6 +111,7 @@ export type ProviderOptionsMap = {
   [Providers.OPENROUTER]: ChatOpenRouterCallOptions;
   [Providers.BEDROCK]: BedrockConverseClientOptions;
   [Providers.XAI]: XAIClientOptions;
+  [Providers.MOONSHOT]: OpenAIClientOptions;
 };
 
 export type ChatModelMap = {
@@ -124,6 +126,7 @@ export type ChatModelMap = {
   [Providers.OPENROUTER]: ChatOpenRouter;
   [Providers.BEDROCK]: CustomChatBedrockConverse;
   [Providers.GOOGLE]: CustomChatGoogleGenerativeAI;
+  [Providers.MOONSHOT]: ChatMoonshot;
 };
 
 export type ChatModelConstructorMap = {

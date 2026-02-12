@@ -33,6 +33,58 @@ config();
 /** Maximum allowed regex pattern length */
 const MAX_PATTERN_LENGTH = 200;
 
+export const ToolSearchToolName = Constants.TOOL_SEARCH;
+
+export const ToolSearchToolDescription =
+  'Searches deferred tools using BM25 ranking. Multi-word queries supported. Use mcp_server param to filter by server.';
+
+const QUERY_DESCRIPTION_LOCAL =
+  'Search term to find in tool names and descriptions. Case-insensitive substring matching. Optional if mcp_server is provided.';
+const QUERY_DESCRIPTION_REGEX =
+  'Regex pattern to search tool names and descriptions. Optional if mcp_server is provided.';
+const FIELDS_DESCRIPTION =
+  'Which fields to search. Default: name and description';
+const MAX_RESULTS_DESCRIPTION = 'Maximum number of matching tools to return';
+const DEFAULT_MAX_RESULTS = 5;
+const MCP_SERVER_DESCRIPTION =
+  'Filter to tools from specific MCP server(s). Can be a single server name or array of names. If provided without a query, lists all tools from those servers.';
+
+export const ToolSearchToolSchema = {
+  type: 'object',
+  properties: {
+    query: {
+      type: 'string',
+      maxLength: MAX_PATTERN_LENGTH,
+      default: '',
+      description: QUERY_DESCRIPTION_LOCAL,
+    },
+    fields: {
+      type: 'array',
+      items: { type: 'string', enum: ['name', 'description', 'parameters'] },
+      default: ['name', 'description'],
+      description: FIELDS_DESCRIPTION,
+    },
+    max_results: {
+      type: 'integer',
+      minimum: 1,
+      maximum: 50,
+      default: DEFAULT_MAX_RESULTS,
+      description: MAX_RESULTS_DESCRIPTION,
+    },
+    mcp_server: {
+      oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }],
+      description: MCP_SERVER_DESCRIPTION,
+    },
+  },
+  required: [],
+} as const;
+
+export const ToolSearchToolDefinition = {
+  name: ToolSearchToolName,
+  description: ToolSearchToolDescription,
+  schema: ToolSearchToolSchema,
+} as const;
+
 /** Maximum allowed regex nesting depth */
 const MAX_REGEX_COMPLEXITY = 5;
 
@@ -61,9 +113,7 @@ interface ToolSearchParams {
  */
 function createToolSearchSchema(mode: t.ToolSearchMode): ToolSearchSchema {
   const queryDescription =
-    mode === 'local'
-      ? 'Search term to find in tool names and descriptions. Case-insensitive substring matching. Optional if mcp_server is provided.'
-      : 'Regex pattern to search tool names and descriptions. Optional if mcp_server is provided.';
+    mode === 'local' ? QUERY_DESCRIPTION_LOCAL : QUERY_DESCRIPTION_REGEX;
 
   return {
     type: 'object',
@@ -78,22 +128,21 @@ function createToolSearchSchema(mode: t.ToolSearchMode): ToolSearchSchema {
         type: 'array',
         items: { type: 'string', enum: ['name', 'description', 'parameters'] },
         default: ['name', 'description'],
-        description: 'Which fields to search. Default: name and description',
+        description: FIELDS_DESCRIPTION,
       },
       max_results: {
         type: 'integer',
         minimum: 1,
         maximum: 50,
-        default: 10,
-        description: 'Maximum number of matching tools to return',
+        default: DEFAULT_MAX_RESULTS,
+        description: MAX_RESULTS_DESCRIPTION,
       },
       mcp_server: {
         oneOf: [
           { type: 'string' },
           { type: 'array', items: { type: 'string' } },
         ],
-        description:
-          'Filter to tools from specific MCP server(s). Can be a single server name or array of names. If provided without a query, lists all tools from those servers.',
+        description: MCP_SERVER_DESCRIPTION,
       },
     },
     required: [],
@@ -403,8 +452,9 @@ function findMatchedField(
 /**
  * Performs BM25-based search for better relevance ranking.
  * Uses Okapi BM25 algorithm for term frequency and document length normalization.
+ * If query is empty, returns all tools (up to maxResults) sorted alphabetically.
  * @param tools - Array of tool metadata to search
- * @param query - The search query
+ * @param query - The search query (empty returns all tools)
  * @param fields - Which fields to search
  * @param maxResults - Maximum results to return
  * @returns Search response with matching tools ranked by BM25 score
@@ -415,25 +465,36 @@ function performLocalSearch(
   fields: string[],
   maxResults: number
 ): t.ToolSearchResponse {
-  if (tools.length === 0 || !query.trim()) {
+  if (tools.length === 0) {
     return {
       tool_references: [],
+      total_tools_searched: 0,
+      pattern_used: query,
+    };
+  }
+
+  const queryTokens = tokenize(query);
+
+  if (queryTokens.length === 0) {
+    const allTools = tools
+      .slice()
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .slice(0, maxResults)
+      .map((tool) => ({
+        tool_name: tool.name,
+        match_score: 1.0,
+        matched_field: 'name',
+        snippet: tool.description.substring(0, 100) || tool.name,
+      }));
+
+    return {
+      tool_references: allTools,
       total_tools_searched: tools.length,
       pattern_used: query,
     };
   }
 
   const documents = tools.map((tool) => createToolDocument(tool, fields));
-  const queryTokens = tokenize(query);
-
-  if (queryTokens.length === 0) {
-    return {
-      tool_references: [],
-      total_tools_searched: tools.length,
-      pattern_used: query,
-    };
-  }
-
   const scores = BM25(documents, queryTokens, { k1: 1.5, b: 0.75 }) as number[];
 
   const maxScore = Math.max(...scores.filter((s) => s > 0), 1);
@@ -449,7 +510,6 @@ function performLocalSearch(
       );
       let normalizedScore = Math.min(scores[i] / maxScore, 1.0);
 
-      // Boost score for exact base name match
       const baseName = getBaseToolName(tools[i].name).toLowerCase();
       if (baseName === queryLower) {
         normalizedScore = 1.0;
@@ -588,16 +648,21 @@ function parseSearchResults(stdout: string): t.ToolSearchResponse {
 /**
  * Formats search results as structured JSON for efficient parsing.
  * @param searchResponse - The parsed search response
+ * @param nameFormat - Whether to show 'full' names (tool_mcp_server) or 'base' names (tool only)
  * @returns JSON string with search results
  */
-function formatSearchResults(searchResponse: t.ToolSearchResponse): string {
+function formatSearchResults(
+  searchResponse: t.ToolSearchResponse,
+  nameFormat: t.McpNameFormat = 'full'
+): string {
   const { tool_references, total_tools_searched, pattern_used } =
     searchResponse;
+  const useFullName = nameFormat === 'full';
 
   const output = {
     found: tool_references.length,
     tools: tool_references.map((ref) => ({
-      name: ref.tool_name,
+      name: useFullName ? ref.tool_name : getBaseToolName(ref.tool_name),
       score: Number(ref.match_score.toFixed(2)),
       matched_in: ref.matched_field,
       snippet: ref.snippet,
@@ -677,13 +742,16 @@ function getDeferredToolsListing(
  * NOTE: This is a PREVIEW only - tools are NOT discovered/loaded.
  * @param tools - Array of tool metadata from the server(s)
  * @param serverNames - The MCP server name(s)
+ * @param nameFormat - Whether to show 'full' names (tool_mcp_server) or 'base' names (tool only)
  * @returns JSON string showing all tools grouped by server
  */
 function formatServerListing(
   tools: t.ToolMetadata[],
-  serverNames: string | string[]
+  serverNames: string | string[],
+  nameFormat: t.McpNameFormat = 'full'
 ): string {
   const servers = Array.isArray(serverNames) ? serverNames : [serverNames];
+  const useFullName = nameFormat === 'full';
 
   if (tools.length === 0) {
     return JSON.stringify(
@@ -709,7 +777,7 @@ function formatServerListing(
       toolsByServer[server] = [];
     }
     toolsByServer[server].push({
-      name: getBaseToolName(tool.name),
+      name: useFullName ? tool.name : getBaseToolName(tool.name),
       description:
         tool.description.length > 100
           ? tool.description.substring(0, 97) + '...'
@@ -717,12 +785,16 @@ function formatServerListing(
     });
   }
 
+  const exampleToolName = useFullName
+    ? (tools[0]?.name ?? 'tool_name')
+    : getBaseToolName(tools[0]?.name ?? 'tool_name');
+
   const output = {
     listing_mode: true,
     servers,
     total_tools: tools.length,
     tools_by_server: toolsByServer,
-    hint: `To use a tool, search for it by name (e.g., query: "${getBaseToolName(tools[0]?.name ?? 'tool_name')}") to load it.`,
+    hint: `To use a tool, search for it by name (e.g., query: "${exampleToolName}") to load it.`,
   };
 
   return JSON.stringify(output, null, 2);
@@ -761,6 +833,7 @@ function createToolSearch(
 ): DynamicStructuredTool {
   const mode: t.ToolSearchMode = initParams.mode ?? 'code_interpreter';
   const defaultOnlyDeferred = initParams.onlyDeferred ?? true;
+  const mcpNameFormat: t.McpNameFormat = initParams.mcpNameFormat ?? 'full';
   const schema = createToolSearchSchema(mode);
 
   const apiKey: string =
@@ -818,7 +891,7 @@ ${mcpNote}${toolsListSection}
       const {
         query = '',
         fields = ['name', 'description'],
-        max_results = 10,
+        max_results = DEFAULT_MAX_RESULTS,
         mcp_server,
       } = params;
 
@@ -894,7 +967,8 @@ ${mcpNote}${toolsListSection}
       if (isServerListing) {
         const formattedOutput = formatServerListing(
           deferredTools,
-          serverFilters
+          serverFilters,
+          mcpNameFormat
         );
 
         return [
@@ -917,7 +991,10 @@ ${mcpNote}${toolsListSection}
           fields,
           max_results
         );
-        const formattedOutput = formatSearchResults(searchResponse);
+        const formattedOutput = formatSearchResults(
+          searchResponse,
+          mcpNameFormat
+        );
 
         return [
           formattedOutput,
@@ -993,7 +1070,7 @@ ${mcpNote}${toolsListSection}
         }
 
         const searchResponse = parseSearchResults(result.stdout);
-        const formattedOutput = `${warningMessage}${formatSearchResults(searchResponse)}`;
+        const formattedOutput = `${warningMessage}${formatSearchResults(searchResponse, mcpNameFormat)}`;
 
         return [
           formattedOutput,

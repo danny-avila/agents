@@ -66,3 +66,48 @@ export const newsSchema = {
   type: 'boolean',
   description: 'Whether to also run a news search.',
 } as const;
+
+/** Combined web search tool schema with all properties */
+export const WebSearchToolSchema = {
+  type: 'object',
+  properties: {
+    query: querySchema,
+    date: dateSchema,
+    country: countrySchema,
+    images: imagesSchema,
+    videos: videosSchema,
+    news: newsSchema,
+  },
+  required: ['query'],
+} as const;
+
+export const WebSearchToolName = 'web_search';
+
+export const WebSearchToolDescription = `Real-time search. Results have required citation anchors.
+
+Note: Use ONCE per reply unless instructed otherwise.
+
+Anchors:
+- \\ue202turnXtypeY
+- X = turn idx, type = 'search' | 'news' | 'image' | 'ref', Y = item idx
+
+Special Markers:
+- \\ue203...\\ue204 — highlight start/end of cited text (for Standalone or Group citations)
+- \\ue200...\\ue201 — group block (e.g. \\ue200\\ue202turn0search1\\ue202turn0news2\\ue201)
+
+**CITE EVERY NON-OBVIOUS FACT/QUOTE:**
+Use anchor marker(s) immediately after the statement:
+- Standalone: "Pure functions produce same output. \\ue202turn0search0"
+- Standalone (multiple): "Today's News \\ue202turn0search0\\ue202turn0news0"
+- Highlight: "\\ue203Highlight text.\\ue204\\ue202turn0news1"
+- Group: "Sources. \\ue200\\ue202turn0search0\\ue202turn0news1\\ue201"
+- Group Highlight: "\\ue203Highlight for group.\\ue204 \\ue200\\ue202turn0search0\\ue202turn0news1\\ue201"
+- Image: "See photo \\ue202turn0image0."
+
+**NEVER use markdown links, [1], or footnotes. CITE ONLY with anchors provided.**`;
+
+export const WebSearchToolDefinition = {
+  name: WebSearchToolName,
+  description: WebSearchToolDescription,
+  schema: WebSearchToolSchema,
+} as const;

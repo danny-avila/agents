@@ -313,7 +313,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     ) {
       keyList.push('reasoning');
     } else if (agentContext.tokenTypeSwitch === 'content') {
-      keyList.push('post-reasoning');
+      keyList.push(`post-reasoning-${agentContext.reasoningTransitionCount}`);
     }
 
     if (this.invokedToolIds != null && this.invokedToolIds.size > 0) {
@@ -460,24 +460,60 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     if (eventDrivenMode) {
       const schemaTools = createSchemaOnlyTools(toolDefinitions);
       const toolDefMap = new Map(toolDefinitions.map((def) => [def.name, def]));
+      const graphTools = agentContext?.graphTools as
+        | t.GenericTool[]
+        | undefined;
+
+      const directToolNames = new Set<string>();
+      const allTools = [...schemaTools] as t.GenericTool[];
+      const allToolMap: t.ToolMap = new Map(
+        schemaTools.map((tool) => [tool.name, tool])
+      );
+
+      if (graphTools && graphTools.length > 0) {
+        for (const tool of graphTools) {
+          if ('name' in tool) {
+            allTools.push(tool);
+            allToolMap.set(tool.name, tool);
+            directToolNames.add(tool.name);
+          }
+        }
+      }
 
       return new CustomToolNode<t.BaseGraphState>({
-        tools: schemaTools as t.GenericTool[],
-        toolMap: new Map(schemaTools.map((tool) => [tool.name, tool])),
-        toolCallStepIds: this.toolCallStepIds,
-        errorHandler: (data, metadata) =>
-          StandardGraph.handleToolCallErrorStatic(this, data, metadata),
-        toolRegistry: agentContext?.toolRegistry,
-        sessions: this.sessions,
+        tools: allTools,
+        toolMap: allToolMap,
         eventDrivenMode: true,
+        sessions: this.sessions,
         toolDefinitions: toolDefMap,
         agentId: agentContext?.agentId,
+        toolCallStepIds: this.toolCallStepIds,
+        toolRegistry: agentContext?.toolRegistry,
+        directToolNames: directToolNames.size > 0 ? directToolNames : undefined,
+        errorHandler: (data, metadata) =>
+          StandardGraph.handleToolCallErrorStatic(this, data, metadata),
       });
     }
 
+    const graphTools = agentContext?.graphTools as t.GenericTool[] | undefined;
+    const baseTools = (currentTools as t.GenericTool[] | undefined) ?? [];
+    const allTraditionalTools =
+      graphTools && graphTools.length > 0
+        ? [...baseTools, ...graphTools]
+        : baseTools;
+    const traditionalToolMap =
+      graphTools && graphTools.length > 0
+        ? new Map([
+          ...(currentToolMap ?? new Map()),
+          ...graphTools
+            .filter((t): t is t.GenericTool & { name: string } => 'name' in t)
+            .map((t) => [t.name, t] as [string, t.GenericTool]),
+        ])
+        : currentToolMap;
+
     return new CustomToolNode<t.BaseGraphState>({
-      tools: (currentTools as t.GenericTool[] | undefined) ?? [],
-      toolMap: currentToolMap,
+      tools: allTraditionalTools,
+      toolMap: traditionalToolMap,
       toolCallStepIds: this.toolCallStepIds,
       errorHandler: (data, metadata) =>
         StandardGraph.handleToolCallErrorStatic(this, data, metadata),
@@ -1090,46 +1126,51 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       toolName === Constants.PROGRAMMATIC_TOOL_CALLING
     ) {
       const artifact = output.artifact as t.CodeExecutionArtifact | undefined;
-      const newFiles = artifact?.files ?? [];
-      const hasNewFiles = newFiles.length > 0;
-
-      if (
-        hasNewFiles &&
-        artifact?.session_id != null &&
-        artifact.session_id !== ''
-      ) {
-        /**
-         * Stamp each new file with its source session_id.
-         * This enables files from different executions (parallel or sequential)
-         * to be tracked and passed to subsequent calls.
-         */
-        const filesWithSession: t.FileRefs = newFiles.map((file) => ({
-          ...file,
-          session_id: artifact.session_id,
-        }));
-
+      if (artifact?.session_id != null && artifact.session_id !== '') {
+        const newFiles = artifact.files ?? [];
         const existingSession = this.sessions.get(Constants.EXECUTE_CODE) as
           | t.CodeSessionContext
           | undefined;
         const existingFiles = existingSession?.files ?? [];
 
-        /**
-         * Merge files, preferring latest versions by name.
-         * If a file with the same name exists, replace it with the new version.
-         * This handles cases where files are edited/recreated in subsequent executions.
-         */
-        const newFileNames = new Set(filesWithSession.map((f) => f.name));
-        const filteredExisting = existingFiles.filter(
-          (f) => !newFileNames.has(f.name)
-        );
+        if (newFiles.length > 0) {
+          /**
+           * Stamp each new file with its source session_id.
+           * This enables files from different executions (parallel or sequential)
+           * to be tracked and passed to subsequent calls.
+           */
+          const filesWithSession: t.FileRefs = newFiles.map((file) => ({
+            ...file,
+            session_id: artifact.session_id,
+          }));
 
-        this.sessions.set(Constants.EXECUTE_CODE, {
-          /** Keep latest session_id for reference/fallback */
-          session_id: artifact.session_id,
-          /** Accumulated files with latest versions preferred */
-          files: [...filteredExisting, ...filesWithSession],
-          lastUpdated: Date.now(),
-        });
+          /**
+           * Merge files, preferring latest versions by name.
+           * If a file with the same name exists, replace it with the new version.
+           * This handles cases where files are edited/recreated in subsequent executions.
+           */
+          const newFileNames = new Set(filesWithSession.map((f) => f.name));
+          const filteredExisting = existingFiles.filter(
+            (f) => !newFileNames.has(f.name)
+          );
+
+          this.sessions.set(Constants.EXECUTE_CODE, {
+            session_id: artifact.session_id,
+            files: [...filteredExisting, ...filesWithSession],
+            lastUpdated: Date.now(),
+          });
+        } else {
+          /**
+           * Store session_id even without new files for session continuity.
+           * The CodeExecutor can fall back to the /files endpoint to discover
+           * session files not explicitly returned in the exec response.
+           */
+          this.sessions.set(Constants.EXECUTE_CODE, {
+            session_id: artifact.session_id,
+            files: existingFiles,
+            lastUpdated: Date.now(),
+          });
+        }
       }
     }
 

@@ -19,7 +19,7 @@ import type {
   TPayload,
   TMessage,
 } from '@/types';
-import { Providers, ContentTypes } from '@/common';
+import { Providers, ContentTypes, Constants } from '@/common';
 
 interface MediaMessageParams {
   message: {
@@ -297,7 +297,7 @@ function formatAssistantMessage(
         if (currentContent.length > 0) {
           let content = currentContent.reduce((acc, curr) => {
             if (curr.type === ContentTypes.TEXT) {
-              return `${acc}${curr[ContentTypes.TEXT] || ''}\n`;
+              return `${acc}${String(curr[ContentTypes.TEXT] ?? '')}\n`;
             }
             return acc;
           }, '');
@@ -384,7 +384,7 @@ function formatAssistantMessage(
     const content = currentContent
       .reduce((acc, curr) => {
         if (curr.type === ContentTypes.TEXT) {
-          return `${acc}${curr[ContentTypes.TEXT] || ''}\n`;
+          return `${acc}${String(curr[ContentTypes.TEXT] ?? '')}\n`;
         }
         return acc;
       }, '')
@@ -620,6 +620,48 @@ export const labelContentByAgent = (
   return result;
 };
 
+/** Extracts tool names from a tool_search output JSON string. */
+function extractToolNamesFromSearchOutput(output: string): string[] {
+  try {
+    const parsed: unknown = JSON.parse(output);
+    if (
+      typeof parsed === 'object' &&
+      parsed !== null &&
+      Array.isArray((parsed as Record<string, unknown>).tools)
+    ) {
+      return (
+        (parsed as Record<string, unknown>).tools as Array<{ name?: string }>
+      )
+        .map((t) => t.name)
+        .filter((name): name is string => typeof name === 'string');
+    }
+  } catch {
+    /** Output may have warnings prepended, try to find JSON within it */
+    const jsonMatch = output.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      try {
+        const parsed: unknown = JSON.parse(jsonMatch[0]);
+        if (
+          typeof parsed === 'object' &&
+          parsed !== null &&
+          Array.isArray((parsed as Record<string, unknown>).tools)
+        ) {
+          return (
+            (parsed as Record<string, unknown>).tools as Array<{
+              name?: string;
+            }>
+          )
+            .map((t) => t.name)
+            .filter((name): name is string => typeof name === 'string');
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+  return [];
+}
+
 /**
  * Formats an array of messages for LangChain, handling tool calls and creating ToolMessage instances.
  *
@@ -643,6 +685,13 @@ export const formatAgentMessages = (
   const updatedIndexTokenCountMap: Record<number, number> = {};
   // Keep track of the mapping from original payload indices to result indices
   const indexMapping: Record<number, number[] | undefined> = {};
+
+  /**
+   * Create a mutable copy of the tools set that can be expanded dynamically.
+   * When we encounter tool_search results, we add discovered tools to this set,
+   * making their subsequent tool calls valid.
+   */
+  const discoveredTools = tools ? new Set(tools) : undefined;
 
   // Process messages with tool conversion if tools set is provided
   for (let i = 0; i < payload.length; i++) {
@@ -670,96 +719,140 @@ export const formatAgentMessages = (
     // For assistant messages, track the starting index before processing
     const startMessageIndex = messages.length;
 
-    // If tools set is provided, we need to check if we need to convert tool messages to a string
-    if (tools) {
-      // First, check if this message contains tool calls
-      let hasToolCalls = false;
-      let hasInvalidTool = false;
-      const toolNames: string[] = [];
-
+    /**
+     * If tools set is provided, process tool_calls:
+     * - Keep valid tool_calls (tools in the set or dynamically discovered)
+     * - Convert invalid tool_calls to string representation for context preservation
+     * - Dynamically expand the set when tool_search results are encountered
+     */
+    let processedMessage = message;
+    if (discoveredTools) {
       const content = message.content;
       if (content && Array.isArray(content)) {
+        const filteredContent: typeof content = [];
+        const invalidToolCallIds = new Set<string>();
+        const invalidToolStrings: string[] = [];
+
         for (const part of content) {
-          if (part.type === ContentTypes.TOOL_CALL) {
-            hasToolCalls = true;
-            if (tools.size === 0) {
-              hasInvalidTool = true;
-              break;
-            }
-            // Protect against malformed tool call entries
+          if (part.type !== ContentTypes.TOOL_CALL) {
+            filteredContent.push(part);
+            continue;
+          }
+
+          /** Skip malformed tool_call entries */
+          if (
+            part.tool_call == null ||
+            part.tool_call.name == null ||
+            part.tool_call.name === ''
+          ) {
             if (
-              part.tool_call == null ||
-              part.tool_call.name == null ||
-              part.tool_call.name === ''
+              typeof part.tool_call?.id === 'string' &&
+              part.tool_call.id !== ''
             ) {
-              hasInvalidTool = true;
-              continue;
+              invalidToolCallIds.add(part.tool_call.id);
             }
-            const toolName = part.tool_call.name;
-            toolNames.push(toolName);
-            if (!tools.has(toolName)) {
-              hasInvalidTool = true;
+            continue;
+          }
+
+          const toolName = part.tool_call.name;
+
+          /**
+           * If this is a tool_search result with output, extract discovered tool names
+           * and add them to the discoveredTools set for subsequent validation.
+           */
+          if (
+            toolName === Constants.TOOL_SEARCH &&
+            typeof part.tool_call.output === 'string' &&
+            part.tool_call.output !== ''
+          ) {
+            const extracted = extractToolNamesFromSearchOutput(
+              part.tool_call.output
+            );
+            for (const name of extracted) {
+              discoveredTools.add(name);
             }
           }
+
+          if (discoveredTools.has(toolName)) {
+            /** Valid tool - keep it */
+            filteredContent.push(part);
+          } else {
+            /** Invalid tool - convert to string for context preservation */
+            if (
+              typeof part.tool_call.id === 'string' &&
+              part.tool_call.id !== ''
+            ) {
+              invalidToolCallIds.add(part.tool_call.id);
+            }
+            const output = part.tool_call.output ?? '';
+            invalidToolStrings.push(`Tool: ${toolName}, ${output}`);
+          }
         }
-      }
 
-      // If this message has tool calls and at least one is invalid, we need to convert it
-      if (hasToolCalls && hasInvalidTool) {
-        // We need to collect all related messages (this message and any subsequent tool messages)
-        const toolSequence: BaseMessage[] = [];
-        let sequenceEndIndex = i;
-
-        // Process the current assistant message to get the AIMessage with tool calls
-        const formattedMessages = formatAssistantMessage(message);
-        toolSequence.push(...formattedMessages);
-
-        // Look ahead for any subsequent assistant messages that might be part of this tool sequence
-        let j = i + 1;
-        while (j < payload.length && payload[j].role === 'assistant') {
-          // Check if this is a continuation of the tool sequence
-          let isToolResponse = false;
-          const content = payload[j].content;
-          if (content != null && Array.isArray(content)) {
-            for (const part of content) {
-              if (part.type === ContentTypes.TOOL_CALL) {
-                isToolResponse = true;
-                break;
+        /** Remove tool_call_ids references to invalid tools from text parts */
+        if (invalidToolCallIds.size > 0) {
+          for (const part of filteredContent) {
+            if (
+              part.type === ContentTypes.TEXT &&
+              Array.isArray(part.tool_call_ids)
+            ) {
+              part.tool_call_ids = part.tool_call_ids.filter(
+                (id: string) => !invalidToolCallIds.has(id)
+              );
+              if (part.tool_call_ids.length === 0) {
+                delete part.tool_call_ids;
               }
             }
           }
+        }
 
-          if (isToolResponse) {
-            // This is part of the tool sequence, add it
-            const nextMessages = formatAssistantMessage(payload[j]);
-            toolSequence.push(...nextMessages);
-            sequenceEndIndex = j;
-            j++;
+        /** Append invalid tool strings to the content for context preservation */
+        if (invalidToolStrings.length > 0) {
+          /** Find the last text part or create one */
+          let lastTextPartIndex = -1;
+          for (let j = filteredContent.length - 1; j >= 0; j--) {
+            if (filteredContent[j].type === ContentTypes.TEXT) {
+              lastTextPartIndex = j;
+              break;
+            }
+          }
+
+          const invalidToolText = invalidToolStrings.join('\n');
+          if (lastTextPartIndex >= 0) {
+            const lastTextPart = filteredContent[lastTextPartIndex] as {
+              type: string;
+              [ContentTypes.TEXT]?: string;
+              text?: string;
+            };
+            const existingText =
+              lastTextPart[ContentTypes.TEXT] ?? lastTextPart.text ?? '';
+            filteredContent[lastTextPartIndex] = {
+              ...lastTextPart,
+              [ContentTypes.TEXT]: existingText
+                ? `${existingText}\n${invalidToolText}`
+                : invalidToolText,
+            };
           } else {
-            // This is not part of the tool sequence, stop looking
-            break;
+            /** No text part exists, create one */
+            filteredContent.push({
+              type: ContentTypes.TEXT,
+              [ContentTypes.TEXT]: invalidToolText,
+            });
           }
         }
 
-        // Convert the sequence to a string
-        const bufferString = getBufferString(toolSequence);
-        messages.push(new AIMessage({ content: bufferString }));
-
-        // Skip the messages we've already processed
-        i = sequenceEndIndex;
-
-        // Update the index mapping for this sequence
-        const resultIndices = [messages.length - 1];
-        for (let k = i; k >= i && k <= sequenceEndIndex; k++) {
-          indexMapping[k] = resultIndices;
+        /** Use filtered content if we made any changes */
+        if (
+          filteredContent.length !== content.length ||
+          invalidToolStrings.length > 0
+        ) {
+          processedMessage = { ...message, content: filteredContent };
         }
-
-        continue;
       }
     }
 
     // Process the assistant message using the helper function
-    const formattedMessages = formatAssistantMessage(message);
+    const formattedMessages = formatAssistantMessage(processedMessage);
     messages.push(...formattedMessages);
 
     // Update the index mapping for this assistant message

@@ -1,5 +1,11 @@
 // src/specs/thinking-prune.test.ts
-import { HumanMessage, AIMessage, SystemMessage, BaseMessage, ToolMessage } from '@langchain/core/messages';
+import {
+  HumanMessage,
+  AIMessage,
+  SystemMessage,
+  BaseMessage,
+  ToolMessage,
+} from '@langchain/core/messages';
 import type * as t from '@/types';
 import { createPruneMessages } from '@/messages/prune';
 
@@ -7,7 +13,10 @@ import { createPruneMessages } from '@/messages/prune';
 const createTestTokenCounter = (): t.TokenCounter => {
   return (message: BaseMessage): number => {
     // Use type assertion to help TypeScript understand the type
-    const content = message.content as string | Array<t.MessageContentComplex | string> | undefined;
+    const content = message.content as
+      | string
+      | Array<t.MessageContentComplex | string>
+      | undefined;
 
     // Handle string content
     if (typeof content === 'string') {
@@ -61,7 +70,8 @@ describe('Prune Messages with Thinking Mode Tests', () => {
       content: [
         {
           type: 'thinking',
-          thinking: 'The user is asking me to read a file located at `/home/danny/LibreChat/gistfile1.txt` in chunks of 200 lines at a time, mentioning that the file has 5000 lines total. They want me to continue reading through the entire file without stopping.\n\nI\'ll need to use the text editor tool to view the file in chunks of 200 lines each. Since the file has 5000 lines, I\'ll need to view it in 25 chunks (5000 ÷ 200 = 25).\n\nI\'ll need to make multiple calls to the text editor with the `view` command, specifying different line ranges for each call.\n\nLet me plan out the approach:\n1. Start with lines 1-200\n2. Then 201-400\n3. Then 401-600\n4. And so on until I reach 4801-5000\n\nFor each call, I\'ll use the `view` command with the specific line range in the `view_range` parameter. I\'ll continue until I\'ve shown all 5000 lines as requested.',
+          thinking:
+            'The user is asking me to read a file located at `/home/danny/LibreChat/gistfile1.txt` in chunks of 200 lines at a time, mentioning that the file has 5000 lines total. They want me to continue reading through the entire file without stopping.\n\nI\'ll need to use the text editor tool to view the file in chunks of 200 lines each. Since the file has 5000 lines, I\'ll need to view it in 25 chunks (5000 ÷ 200 = 25).\n\nI\'ll need to make multiple calls to the text editor with the `view` command, specifying different line ranges for each call.\n\nLet me plan out the approach:\n1. Start with lines 1-200\n2. Then 201-400\n3. Then 401-600\n4. And so on until I reach 4801-5000\n\nFor each call, I\'ll use the `view` command with the specific line range in the `view_range` parameter. I\'ll continue until I\'ve shown all 5000 lines as requested.',
         },
         {
           type: 'text',
@@ -71,7 +81,8 @@ describe('Prune Messages with Thinking Mode Tests', () => {
           type: 'tool_use',
           id: 'toolu_01YApWuFsEQCuBFDgYXmcmeZ',
           name: 'text_editor_mcp_textEditor',
-          input: '{"command": "view", "path": "/home/danny/LibreChat/gistfile1.txt", "description": "Viewing lines 1-200 of the file", "view_range": [1,200]}',
+          input:
+            '{"command": "view", "path": "/home/danny/LibreChat/gistfile1.txt", "description": "Viewing lines 1-200 of the file", "view_range": [1,200]}',
         },
       ],
     });
@@ -97,7 +108,8 @@ describe('Prune Messages with Thinking Mode Tests', () => {
           type: 'tool_use',
           id: 'toolu_01VnyMQ4CvEd6zLDxxtTd6d4',
           name: 'text_editor_mcp_textEditor',
-          input: '{"command": "view", "path": "/home/danny/LibreChat/gistfile1.txt", "description": "Viewing lines 201-400 of the file", "view_range": [201,400]}',
+          input:
+            '{"command": "view", "path": "/home/danny/LibreChat/gistfile1.txt", "description": "Viewing lines 201-400 of the file", "view_range": [201,400]}',
         },
       ],
     });
@@ -123,7 +135,8 @@ describe('Prune Messages with Thinking Mode Tests', () => {
           type: 'tool_use',
           id: 'toolu_01TZKs4nnBc58BYXKz1Mw4fp',
           name: 'text_editor_mcp_textEditor',
-          input: '{"command": "view", "path": "/home/danny/LibreChat/gistfile1.txt", "description": "Viewing lines 401-600 of the file", "view_range": [401,600]}',
+          input:
+            '{"command": "view", "path": "/home/danny/LibreChat/gistfile1.txt", "description": "Viewing lines 401-600 of the file", "view_range": [401,600]}',
         },
       ],
     });
@@ -149,7 +162,8 @@ describe('Prune Messages with Thinking Mode Tests', () => {
           type: 'tool_use',
           id: 'toolu_01TZgBacNxjx1QNUpJg9hca5',
           name: 'text_editor_mcp_textEditor',
-          input: '{"command": "view", "path": "/home/danny/LibreChat/gistfile1.txt", "description": "Viewing lines 601-800 of the file", "view_range": [601,800]}',
+          input:
+            '{"command": "view", "path": "/home/danny/LibreChat/gistfile1.txt", "description": "Viewing lines 601-800 of the file", "view_range": [601,800]}',
         },
       ],
     });
@@ -180,7 +194,7 @@ describe('Prune Messages with Thinking Mode Tests', () => {
     // Create indexTokenCountMap based on the example provided
     const indexTokenCountMap = {
       '0': 617, // userMessage
-      '1': 52,  // assistantMessageWithThinking
+      '1': 52, // assistantMessageWithThinking
       '2': 4995, // toolResponseMessage1
       '3': 307, // assistantMessage2
       '4': 9359, // toolResponseMessage2
@@ -218,22 +232,34 @@ describe('Prune Messages with Thinking Mode Tests', () => {
     expect(result.context.length).toBeGreaterThan(0);
 
     // Find the first assistant message in the pruned context
-    const firstAssistantIndex = result.context.findIndex(msg => msg.getType() === 'ai');
+    const firstAssistantIndex = result.context.findIndex(
+      (msg) => msg.getType() === 'ai'
+    );
     expect(firstAssistantIndex).toBe(0);
 
     const firstAssistantMsg = result.context[firstAssistantIndex];
     expect(Array.isArray(firstAssistantMsg.content)).toBe(true);
 
     // Verify that the first assistant message has a thinking block
-    const hasThinkingBlock = (firstAssistantMsg.content as t.MessageContentComplex[]).some((item: t.MessageContentComplex) =>
-      typeof item === 'object' && item.type === 'thinking');
+    const hasThinkingBlock = (
+      firstAssistantMsg.content as t.MessageContentComplex[]
+    ).some(
+      (item: t.MessageContentComplex) =>
+        typeof item === 'object' && item.type === 'thinking'
+    );
     expect(hasThinkingBlock).toBe(true);
 
     // Verify that the thinking block is from the original assistant message
-    const thinkingBlock = (firstAssistantMsg.content as t.MessageContentComplex[]).find((item: t.MessageContentComplex) =>
-      typeof item === 'object' && item.type === 'thinking');
+    const thinkingBlock = (
+      firstAssistantMsg.content as t.MessageContentComplex[]
+    ).find(
+      (item: t.MessageContentComplex) =>
+        typeof item === 'object' && item.type === 'thinking'
+    );
     expect(thinkingBlock).toBeDefined();
-    expect((thinkingBlock as t.ThinkingContentText).thinking).toContain('The user is asking me to read a file');
+    expect((thinkingBlock as t.ThinkingContentText).thinking).toContain(
+      'The user is asking me to read a file'
+    );
   });
 
   it('should handle token recalculation when inserting thinking blocks', () => {
@@ -451,35 +477,49 @@ describe('Prune Messages with Thinking Mode Tests', () => {
     const result = pruneMessages({ messages });
 
     // Find assistant message with tool call and its corresponding tool message in the pruned context
-    const assistantIndex = result.context.findIndex(msg =>
-      msg.getType() === 'ai' &&
-      Array.isArray(msg.content) &&
-      msg.content.some(item => typeof item === 'object' && item.type === 'tool_use' && item.id === 'tool123')
+    const assistantIndex = result.context.findIndex(
+      (msg) =>
+        msg.getType() === 'ai' &&
+        Array.isArray(msg.content) &&
+        msg.content.some(
+          (item) =>
+            typeof item === 'object' &&
+            item.type === 'tool_use' &&
+            item.id === 'tool123'
+        )
     );
 
     // If the assistant message with tool call is in the context, its corresponding tool message should also be there
     if (assistantIndex !== -1) {
-      const toolIndex = result.context.findIndex(msg =>
-        msg.getType() === 'tool' &&
-        'tool_call_id' in msg &&
-        msg.tool_call_id === 'tool123'
+      const toolIndex = result.context.findIndex(
+        (msg) =>
+          msg.getType() === 'tool' &&
+          'tool_call_id' in msg &&
+          msg.tool_call_id === 'tool123'
       );
 
       expect(toolIndex).not.toBe(-1);
     }
 
     // If the tool message is in the context, its corresponding assistant message should also be there
-    const toolIndex = result.context.findIndex(msg =>
-      msg.getType() === 'tool' &&
-      'tool_call_id' in msg &&
-      msg.tool_call_id === 'tool123'
+    const toolIndex = result.context.findIndex(
+      (msg) =>
+        msg.getType() === 'tool' &&
+        'tool_call_id' in msg &&
+        msg.tool_call_id === 'tool123'
     );
 
     if (toolIndex !== -1) {
-      const assistantWithToolIndex = result.context.findIndex(msg =>
-        msg.getType() === 'ai' &&
-        Array.isArray(msg.content) &&
-        msg.content.some(item => typeof item === 'object' && item.type === 'tool_use' && item.id === 'tool123')
+      const assistantWithToolIndex = result.context.findIndex(
+        (msg) =>
+          msg.getType() === 'ai' &&
+          Array.isArray(msg.content) &&
+          msg.content.some(
+            (item) =>
+              typeof item === 'object' &&
+              item.type === 'tool_use' &&
+              item.id === 'tool123'
+          )
       );
 
       expect(assistantWithToolIndex).not.toBe(-1);
@@ -544,7 +584,9 @@ describe('Prune Messages with Thinking Mode Tests', () => {
     // Calculate token counts for each message
     const indexTokenCountMapWithoutSystem: Record<string, number> = {};
     for (let i = 0; i < messagesWithoutSystem.length; i++) {
-      indexTokenCountMapWithoutSystem[i] = tokenCounter(messagesWithoutSystem[i]);
+      indexTokenCountMapWithoutSystem[i] = tokenCounter(
+        messagesWithoutSystem[i]
+      );
     }
 
     // Create pruneMessages function with thinking mode enabled
@@ -557,24 +599,33 @@ describe('Prune Messages with Thinking Mode Tests', () => {
     });
 
     // Prune messages
-    const resultWithoutSystem = pruneMessagesWithoutSystem({ messages: messagesWithoutSystem });
+    const resultWithoutSystem = pruneMessagesWithoutSystem({
+      messages: messagesWithoutSystem,
+    });
 
     // Verify that the pruned context contains at least one message
     expect(resultWithoutSystem.context.length).toBeGreaterThan(0);
 
     // Find all assistant messages in the latest sequence (after the last human message)
-    const lastHumanIndex = resultWithoutSystem.context.map(msg => msg.getType()).lastIndexOf('human');
-    const assistantMessagesAfterLastHuman = resultWithoutSystem.context.slice(lastHumanIndex + 1)
-      .filter(msg => msg.getType() === 'ai');
+    const lastHumanIndex = resultWithoutSystem.context
+      .map((msg) => msg.getType())
+      .lastIndexOf('human');
+    const assistantMessagesAfterLastHuman = resultWithoutSystem.context
+      .slice(lastHumanIndex + 1)
+      .filter((msg) => msg.getType() === 'ai');
 
     // Verify that at least one assistant message exists in the latest sequence
     expect(assistantMessagesAfterLastHuman.length).toBeGreaterThan(0);
 
     // Verify that at least one of these assistant messages has a thinking block
-    const hasThinkingBlock = assistantMessagesAfterLastHuman.some(msg => {
+    const hasThinkingBlock = assistantMessagesAfterLastHuman.some((msg) => {
       const content = msg.content as t.MessageContentComplex[];
-      return Array.isArray(content) && content.some(item =>
-        typeof item === 'object' && item.type === 'thinking');
+      return (
+        Array.isArray(content) &&
+        content.some(
+          (item) => typeof item === 'object' && item.type === 'thinking'
+        )
+      );
     });
     expect(hasThinkingBlock).toBe(true);
 
@@ -604,26 +655,36 @@ describe('Prune Messages with Thinking Mode Tests', () => {
     });
 
     // Prune messages
-    const resultWithSystem = pruneMessagesWithSystem({ messages: messagesWithSystem });
+    const resultWithSystem = pruneMessagesWithSystem({
+      messages: messagesWithSystem,
+    });
 
     // Verify that the system message remains first
     expect(resultWithSystem.context.length).toBeGreaterThan(1);
     expect(resultWithSystem.context[0].getType()).toBe('system');
 
     // Find all assistant messages in the latest sequence (after the last human message)
-    const lastHumanIndexWithSystem = resultWithSystem.context.map(msg => msg.getType()).lastIndexOf('human');
-    const assistantMessagesAfterLastHumanWithSystem = resultWithSystem.context.slice(lastHumanIndexWithSystem + 1)
-      .filter(msg => msg.getType() === 'ai');
+    const lastHumanIndexWithSystem = resultWithSystem.context
+      .map((msg) => msg.getType())
+      .lastIndexOf('human');
+    const assistantMessagesAfterLastHumanWithSystem = resultWithSystem.context
+      .slice(lastHumanIndexWithSystem + 1)
+      .filter((msg) => msg.getType() === 'ai');
 
     // Verify that at least one assistant message exists in the latest sequence
     expect(assistantMessagesAfterLastHumanWithSystem.length).toBeGreaterThan(0);
 
     // Verify that at least one of these assistant messages has a thinking block
-    const hasThinkingBlockWithSystem = assistantMessagesAfterLastHumanWithSystem.some(msg => {
-      const content = msg.content as t.MessageContentComplex[];
-      return Array.isArray(content) && content.some(item =>
-        typeof item === 'object' && item.type === 'thinking');
-    });
+    const hasThinkingBlockWithSystem =
+      assistantMessagesAfterLastHumanWithSystem.some((msg) => {
+        const content = msg.content as t.MessageContentComplex[];
+        return (
+          Array.isArray(content) &&
+          content.some(
+            (item) => typeof item === 'object' && item.type === 'thinking'
+          )
+        );
+      });
     expect(hasThinkingBlockWithSystem).toBe(true);
   });
 
@@ -686,18 +747,78 @@ describe('Prune Messages with Thinking Mode Tests', () => {
     const result = pruneMessages({ messages });
 
     // Find the first assistant message in the pruned context
-    const firstAssistantIndex = result.context.findIndex(msg => msg.getType() === 'ai');
+    const firstAssistantIndex = result.context.findIndex(
+      (msg) => msg.getType() === 'ai'
+    );
     expect(firstAssistantIndex).not.toBe(-1);
 
     const firstAssistantMsg = result.context[firstAssistantIndex];
     expect(Array.isArray(firstAssistantMsg.content)).toBe(true);
 
     // Verify that the first assistant message has a thinking block
-    const thinkingBlock = (firstAssistantMsg.content as t.MessageContentComplex[]).find(item =>
-      typeof item === 'object' && item.type === 'thinking');
+    const thinkingBlock = (
+      firstAssistantMsg.content as t.MessageContentComplex[]
+    ).find((item) => typeof item === 'object' && item.type === 'thinking');
     expect(thinkingBlock).toBeDefined();
 
     // Verify that it's the newer thinking block
-    expect((thinkingBlock as t.ThinkingContentText).thinking).toContain('newer thinking block');
+    expect((thinkingBlock as t.ThinkingContentText).thinking).toContain(
+      'newer thinking block'
+    );
+  });
+
+  it('should throw descriptive error when aggressive pruning removes all AI messages', () => {
+    const tokenCounter = createTestTokenCounter();
+
+    const assistantMessageWithThinking = new AIMessage({
+      content: [
+        {
+          type: 'thinking',
+          thinking: 'This is a thinking block that will be pruned',
+        },
+        {
+          type: 'text',
+          text: 'Response with thinking',
+        },
+        {
+          type: 'tool_use',
+          id: 'tool123',
+          name: 'large_tool',
+          input: '{"query": "test"}',
+        },
+      ],
+    });
+
+    const largeToolResponse = new ToolMessage({
+      content: 'A'.repeat(10000),
+      tool_call_id: 'tool123',
+      name: 'large_tool',
+    });
+
+    const messages = [
+      new SystemMessage('System instruction'),
+      new HumanMessage('Hello'),
+      assistantMessageWithThinking,
+      largeToolResponse,
+    ];
+
+    const indexTokenCountMap: Record<string, number> = {
+      '0': 17,
+      '1': 5,
+      '2': 100,
+      '3': 10000,
+    };
+
+    const pruneMessages = createPruneMessages({
+      maxTokens: 50,
+      startIndex: 0,
+      tokenCounter,
+      indexTokenCountMap: { ...indexTokenCountMap },
+      thinkingEnabled: true,
+    });
+
+    expect(() => pruneMessages({ messages })).toThrow(
+      /Context window exceeded/
+    );
   });
 });

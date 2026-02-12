@@ -8,6 +8,7 @@ import type {
 import {
   AzureChatOpenAI,
   ChatDeepSeek,
+  ChatMoonshot,
   ChatOpenAI,
   ChatXAI,
 } from '@/llm/openai';
@@ -31,6 +32,7 @@ export const llmProviders: Partial<ChatModelConstructorMap> = {
   [Providers.BEDROCK]: CustomChatBedrockConverse,
   // [Providers.ANTHROPIC]: ChatAnthropic,
   [Providers.GOOGLE]: CustomChatGoogleGenerativeAI,
+  [Providers.MOONSHOT]: ChatMoonshot,
 };
 
 export const manualToolStreamProviders = new Set<Providers | string>([

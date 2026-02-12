@@ -426,8 +426,10 @@ describe('ToolSearch', () => {
     it('handles empty query gracefully', () => {
       const result = performLocalSearch(mockTools, '', ['name'], 10);
 
-      // BM25 correctly returns no results for empty queries (no terms to match)
-      expect(result.tool_references.length).toBe(0);
+      // Empty queries return all tools (up to maxResults) sorted alphabetically
+      expect(result.tool_references.length).toBe(
+        Math.min(mockTools.length, 10)
+      );
       expect(result.total_tools_searched).toBe(mockTools.length);
     });
 
@@ -923,8 +925,19 @@ describe('ToolSearch', () => {
       expect(parsed.hint).toContain('To use a tool, search for it by name');
     });
 
-    it('uses base tool name (without MCP suffix) in display', () => {
+    it('uses full tool name by default', () => {
       const result = formatServerListing(serverTools, 'weather-api');
+      const parsed = JSON.parse(result);
+
+      const toolNames = parsed.tools_by_server['weather-api'].map(
+        (t: { name: string }) => t.name
+      );
+      expect(toolNames).toContain('get_weather_mcp_weather-api');
+      expect(toolNames).not.toContain('get_weather');
+    });
+
+    it('uses base tool name when mcpNameFormat is "base"', () => {
+      const result = formatServerListing(serverTools, 'weather-api', 'base');
       const parsed = JSON.parse(result);
 
       const toolNames = parsed.tools_by_server['weather-api'].map(

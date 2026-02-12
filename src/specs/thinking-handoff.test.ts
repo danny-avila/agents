@@ -484,14 +484,14 @@ describe('Thinking-Enabled Agent Handoff Tests', () => {
 
       // Verify handoff tools exist
       expect(
-        routerContext?.tools?.find(
+        routerContext?.graphTools?.find(
           (tool) =>
             (tool as { name?: string }).name ===
             `${Constants.LC_TRANSFER_TO_}processor`
         )
       ).toBeDefined();
       expect(
-        processorContext?.tools?.find(
+        processorContext?.graphTools?.find(
           (tool) =>
             (tool as { name?: string }).name ===
             `${Constants.LC_TRANSFER_TO_}reviewer`

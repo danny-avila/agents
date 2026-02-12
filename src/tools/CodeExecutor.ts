@@ -33,9 +33,10 @@ const SUPPORTED_LANGUAGES = [
   'd',
   'f90',
   'r',
+  'bash',
 ] as const;
 
-const CodeExecutionToolSchema = {
+export const CodeExecutionToolSchema = {
   type: 'object',
   properties: {
     lang: {
@@ -74,6 +75,23 @@ const EXEC_ENDPOINT = `${baseEndpoint}/exec`;
 
 type SupportedLanguage = (typeof SUPPORTED_LANGUAGES)[number];
 
+export const CodeExecutionToolDescription = `
+Runs code and returns stdout/stderr output from a stateless execution environment, similar to running scripts in a command-line interface. Each execution is isolated and independent.
+
+Usage:
+- No network access available.
+- Generated files are automatically delivered; **DO NOT** provide download links.
+- NEVER use this tool to execute malicious code.
+`.trim();
+
+export const CodeExecutionToolName = Constants.EXECUTE_CODE;
+
+export const CodeExecutionToolDefinition = {
+  name: CodeExecutionToolName,
+  description: CodeExecutionToolDescription,
+  schema: CodeExecutionToolSchema,
+} as const;
+
 function createCodeExecutionTool(
   params: t.CodeExecutionToolParams = {}
 ): DynamicStructuredTool {
@@ -85,15 +103,6 @@ function createCodeExecutionTool(
   if (!apiKey) {
     throw new Error('No API key provided for code execution tool.');
   }
-
-  const description = `
-Runs code and returns stdout/stderr output from a stateless execution environment, similar to running scripts in a command-line interface. Each execution is isolated and independent.
-
-Usage:
-- No network access available.
-- Generated files are automatically delivered; **DO NOT** provide download links.
-- NEVER use this tool to execute malicious code.
-`.trim();
 
   return tool(
     async (rawInput, config) => {
@@ -229,8 +238,8 @@ Usage:
       }
     },
     {
-      name: Constants.EXECUTE_CODE,
-      description,
+      name: CodeExecutionToolName,
+      description: CodeExecutionToolDescription,
       schema: CodeExecutionToolSchema,
       responseFormat: Constants.CONTENT_AND_ARTIFACT,
     }

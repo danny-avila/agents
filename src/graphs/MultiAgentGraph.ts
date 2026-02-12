@@ -15,6 +15,7 @@ import {
   getCurrentTaskInput,
 } from '@langchain/langgraph';
 import { messagesStateReducer } from '@/messages/reducer';
+import type { LangGraphRunnableConfig } from '@langchain/langgraph';
 import type { BaseMessage, AIMessageChunk } from '@langchain/core/messages';
 import type { ToolRunnableConfig } from '@langchain/core/tools';
 import type * as t from '@/types';
@@ -255,11 +256,10 @@ export class MultiAgentGraph extends StandardGraph {
         );
       }
 
-      // Add handoff tools to the agent's existing tools
-      if (!agentContext.tools) {
-        agentContext.tools = [];
+      if (!agentContext.graphTools) {
+        agentContext.graphTools = [];
       }
-      agentContext.tools.push(...handoffTools);
+      agentContext.graphTools.push(...handoffTools);
     }
   }
 
@@ -746,7 +746,8 @@ export class MultiAgentGraph extends StandardGraph {
 
       /** Wrapper function that handles agentMessages channel, handoff reception, and conditional routing */
       const agentWrapper = async (
-        state: t.MultiAgentGraphState
+        state: t.MultiAgentGraphState,
+        config?: LangGraphRunnableConfig
       ): Promise<t.MultiAgentGraphState | Command> => {
         let result: t.MultiAgentGraphState;
 
@@ -818,7 +819,7 @@ export class MultiAgentGraph extends StandardGraph {
             ...state,
             messages: messagesForAgent,
           };
-          result = await agentSubgraph.invoke(transformedState);
+          result = await agentSubgraph.invoke(transformedState, config);
           result = {
             ...result,
             agentMessages: [],
@@ -864,14 +865,14 @@ export class MultiAgentGraph extends StandardGraph {
             ...state,
             messages: state.agentMessages,
           };
-          result = await agentSubgraph.invoke(transformedState);
+          result = await agentSubgraph.invoke(transformedState, config);
           result = {
             ...result,
             /** Clear agentMessages for next agent */
             agentMessages: [],
           };
         } else {
-          result = await agentSubgraph.invoke(state);
+          result = await agentSubgraph.invoke(state, config);
         }
 
         /** If agent has both handoff and direct edges, use Command for exclusive routing */

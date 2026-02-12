@@ -212,47 +212,6 @@ describe('CustomChatBedrockConverse', () => {
       return model as any;
     }
 
-    test('should detect contentBlockIndex at top level', () => {
-      const model = getModelWithCleanMethods();
-      const objWithIndex = { contentBlockIndex: 0, text: 'hello' };
-      const objWithoutIndex = { text: 'hello' };
-
-      expect(model.hasContentBlockIndex(objWithIndex)).toBe(true);
-      expect(model.hasContentBlockIndex(objWithoutIndex)).toBe(false);
-    });
-
-    test('should detect contentBlockIndex in nested objects', () => {
-      const model = getModelWithCleanMethods();
-      const nestedWithIndex = {
-        outer: {
-          inner: {
-            contentBlockIndex: 1,
-            data: 'test',
-          },
-        },
-      };
-      const nestedWithoutIndex = {
-        outer: {
-          inner: {
-            data: 'test',
-          },
-        },
-      };
-
-      expect(model.hasContentBlockIndex(nestedWithIndex)).toBe(true);
-      expect(model.hasContentBlockIndex(nestedWithoutIndex)).toBe(false);
-    });
-
-    test('should return false for null, undefined, and primitives', () => {
-      const model = getModelWithCleanMethods();
-
-      expect(model.hasContentBlockIndex(null)).toBe(false);
-      expect(model.hasContentBlockIndex(undefined)).toBe(false);
-      expect(model.hasContentBlockIndex('string')).toBe(false);
-      expect(model.hasContentBlockIndex(123)).toBe(false);
-      expect(model.hasContentBlockIndex(true)).toBe(false);
-    });
-
     test('should remove contentBlockIndex from top level', () => {
       const model = getModelWithCleanMethods();
       const obj = {
@@ -315,7 +274,7 @@ describe('CustomChatBedrockConverse', () => {
       expect(model.removeContentBlockIndex(undefined)).toBeUndefined();
     });
 
-    test('cleanChunk should remove contentBlockIndex from AIMessageChunk response_metadata', () => {
+    test('enrichChunk should strip contentBlockIndex from response_metadata', () => {
       const model = getModelWithCleanMethods();
 
       const chunkWithIndex = new ChatGenerationChunk({
@@ -329,18 +288,18 @@ describe('CustomChatBedrockConverse', () => {
         }),
       });
 
-      const cleaned = model.cleanChunk(chunkWithIndex);
+      const enriched = model.enrichChunk(chunkWithIndex, new Set([0]));
 
-      expect(cleaned.message.response_metadata).toEqual({
+      expect(enriched.message.response_metadata).toEqual({
         stopReason: null,
       });
       expect(
-        (cleaned.message.response_metadata as any).contentBlockIndex
+        (enriched.message.response_metadata as any).contentBlockIndex
       ).toBeUndefined();
-      expect(cleaned.text).toBe('Hello');
+      expect(enriched.text).toBe('Hello');
     });
 
-    test('cleanChunk should pass through chunks without contentBlockIndex unchanged', () => {
+    test('enrichChunk should pass through chunks without contentBlockIndex unchanged', () => {
       const model = getModelWithCleanMethods();
 
       const chunkWithoutIndex = new ChatGenerationChunk({
@@ -354,15 +313,89 @@ describe('CustomChatBedrockConverse', () => {
         }),
       });
 
-      const cleaned = model.cleanChunk(chunkWithoutIndex);
+      const enriched = model.enrichChunk(chunkWithoutIndex, new Set());
 
-      expect(cleaned.message.response_metadata).toEqual({
+      expect(enriched.message.response_metadata).toEqual({
         stopReason: 'end_turn',
         usage: { inputTokens: 10, outputTokens: 5 },
       });
     });
 
-    test('cleanChunk should handle deeply nested contentBlockIndex in response_metadata', () => {
+    test('enrichChunk should inject index on array content blocks', () => {
+      const model = getModelWithCleanMethods();
+
+      const chunkWithArrayContent = new ChatGenerationChunk({
+        text: '',
+        message: new AIMessageChunk({
+          content: [
+            {
+              type: 'reasoning_content',
+              reasoningText: { text: 'thinking...' },
+            },
+          ],
+          response_metadata: {
+            contentBlockIndex: 0,
+          },
+        }),
+      });
+
+      const enriched = model.enrichChunk(chunkWithArrayContent, new Set([0]));
+
+      expect(Array.isArray(enriched.message.content)).toBe(true);
+      const blocks = enriched.message.content as any[];
+      expect(blocks[0].index).toBe(0);
+      expect(blocks[0].type).toBe('reasoning_content');
+      expect(
+        (enriched.message.response_metadata as any).contentBlockIndex
+      ).toBeUndefined();
+    });
+
+    test('enrichChunk should promote text to array when multiple block indices seen', () => {
+      const model = getModelWithCleanMethods();
+
+      const textChunk = new ChatGenerationChunk({
+        text: 'Hello world',
+        message: new AIMessageChunk({
+          content: 'Hello world',
+          response_metadata: {
+            contentBlockIndex: 1,
+          },
+        }),
+      });
+
+      const enriched = model.enrichChunk(textChunk, new Set([0, 1]));
+
+      expect(Array.isArray(enriched.message.content)).toBe(true);
+      const blocks = enriched.message.content as any[];
+      expect(blocks).toHaveLength(1);
+      expect(blocks[0]).toEqual({
+        type: 'text',
+        text: 'Hello world',
+        index: 1,
+      });
+    });
+
+    test('enrichChunk should keep text as string when only one block index seen', () => {
+      const model = getModelWithCleanMethods();
+
+      const textChunk = new ChatGenerationChunk({
+        text: 'Hello',
+        message: new AIMessageChunk({
+          content: 'Hello',
+          response_metadata: {
+            contentBlockIndex: 0,
+            stopReason: null,
+          },
+        }),
+      });
+
+      const enriched = model.enrichChunk(textChunk, new Set([0]));
+
+      expect(typeof enriched.message.content).toBe('string');
+      expect(enriched.message.content).toBe('Hello');
+    });
+
+    test('enrichChunk should strip deeply nested contentBlockIndex from response_metadata', () => {
       const model = getModelWithCleanMethods();
 
       const chunkWithNestedIndex = new ChatGenerationChunk({
@@ -370,6 +403,7 @@ describe('CustomChatBedrockConverse', () => {
         message: new AIMessageChunk({
           content: 'Test',
           response_metadata: {
+            contentBlockIndex: 0,
             amazon: {
               bedrock: {
                 contentBlockIndex: 0,
@@ -381,9 +415,9 @@ describe('CustomChatBedrockConverse', () => {
         }),
       });
 
-      const cleaned = model.cleanChunk(chunkWithNestedIndex);
+      const enriched = model.enrichChunk(chunkWithNestedIndex, new Set([0]));
 
-      expect(cleaned.message.response_metadata).toEqual({
+      expect(enriched.message.response_metadata).toEqual({
         amazon: {
           bedrock: {
             trace: { something: 'value' },

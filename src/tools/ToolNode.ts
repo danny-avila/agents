@@ -47,10 +47,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private sessions?: t.ToolSessionMap;
   /** When true, dispatches ON_TOOL_EXECUTE events instead of invoking tools directly */
   private eventDrivenMode: boolean = false;
-  /** Tool definitions for event-driven mode */
-  private toolDefinitions?: Map<string, t.LCTool>;
   /** Agent ID for event-driven mode */
   private agentId?: string;
+  /** Tool names that bypass event dispatch and execute directly (e.g., graph-managed handoff tools) */
+  private directToolNames?: Set<string>;
 
   constructor({
     tools,
@@ -64,8 +64,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     toolRegistry,
     sessions,
     eventDrivenMode,
-    toolDefinitions,
     agentId,
+    directToolNames,
   }: t.ToolNodeConstructorParams) {
     super({ name, tags, func: (input, config) => this.run(input, config) });
     this.toolMap = toolMap ?? new Map(tools.map((tool) => [tool.name, tool]));
@@ -77,8 +77,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     this.toolRegistry = toolRegistry;
     this.sessions = sessions;
     this.eventDrivenMode = eventDrivenMode ?? false;
-    this.toolDefinitions = toolDefinitions;
     this.agentId = agentId;
+    this.directToolNames = directToolNames;
   }
 
   /**
@@ -217,6 +217,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
        * Each file uses its own session_id (supporting multi-session file tracking).
        * Both session_id and _injected_files are injected directly to invokeParams
        * (not inside args) so they bypass Zod schema validation and reach config.toolCall.
+       *
+       * session_id is always injected when available (even without tracked files)
+       * so the CodeExecutor can fall back to the /files endpoint for session continuity.
        */
       if (
         call.name === Constants.EXECUTE_CODE ||
@@ -225,23 +228,20 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         const codeSession = this.sessions?.get(Constants.EXECUTE_CODE) as
           | t.CodeSessionContext
           | undefined;
-        if (codeSession?.files != null && codeSession.files.length > 0) {
-          /**
-           * Convert tracked files to CodeEnvFile format for the API.
-           * Each file uses its own session_id (set when file was created).
-           * This supports files from multiple parallel/sequential executions.
-           */
-          const fileRefs: t.CodeEnvFile[] = codeSession.files.map((file) => ({
-            session_id: file.session_id ?? codeSession.session_id,
-            id: file.id,
-            name: file.name,
-          }));
-          /** Inject latest session_id and files - bypasses Zod, reaches config.toolCall */
+        if (codeSession?.session_id != null && codeSession.session_id !== '') {
           invokeParams = {
             ...invokeParams,
             session_id: codeSession.session_id,
-            _injected_files: fileRefs,
           };
+
+          if (codeSession.files != null && codeSession.files.length > 0) {
+            const fileRefs: t.CodeEnvFile[] = codeSession.files.map((file) => ({
+              session_id: file.session_id ?? codeSession.session_id,
+              id: file.id,
+              name: file.name,
+            }));
+            invokeParams._injected_files = fileRefs;
+          }
         }
       }
 
@@ -349,25 +349,127 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   }
 
   /**
-   * Execute all tool calls via ON_TOOL_EXECUTE event dispatch.
-   * Used in event-driven mode where the host handles actual tool execution.
+   * Builds code session context for injection into event-driven tool calls.
+   * Mirrors the session injection logic in runTool() for direct execution.
    */
-  private async executeViaEvent(
+  private getCodeSessionContext(): t.ToolCallRequest['codeSessionContext'] {
+    if (!this.sessions) {
+      return undefined;
+    }
+
+    const codeSession = this.sessions.get(Constants.EXECUTE_CODE) as
+      | t.CodeSessionContext
+      | undefined;
+    if (!codeSession) {
+      return undefined;
+    }
+
+    const context: NonNullable<t.ToolCallRequest['codeSessionContext']> = {
+      session_id: codeSession.session_id,
+    };
+
+    if (codeSession.files && codeSession.files.length > 0) {
+      context.files = codeSession.files.map((file) => ({
+        session_id: file.session_id ?? codeSession.session_id,
+        id: file.id,
+        name: file.name,
+      }));
+    }
+
+    return context;
+  }
+
+  /**
+   * Extracts code execution session context from tool results and stores in Graph.sessions.
+   * Mirrors the session storage logic in Graph.handleToolCallCompleted() for direct execution.
+   */
+  private storeCodeSessionFromResults(
+    results: t.ToolExecuteResult[],
+    requests: t.ToolCallRequest[]
+  ): void {
+    if (!this.sessions) {
+      return;
+    }
+
+    for (let i = 0; i < results.length; i++) {
+      const result = results[i];
+      if (result.status !== 'success' || result.artifact == null) {
+        continue;
+      }
+
+      const request = requests.find((r) => r.id === result.toolCallId);
+      if (
+        request?.name !== Constants.EXECUTE_CODE &&
+        request?.name !== Constants.PROGRAMMATIC_TOOL_CALLING
+      ) {
+        continue;
+      }
+
+      const artifact = result.artifact as t.CodeExecutionArtifact | undefined;
+      if (artifact?.session_id == null || artifact.session_id === '') {
+        continue;
+      }
+
+      const newFiles = artifact.files ?? [];
+      const existingSession = this.sessions.get(Constants.EXECUTE_CODE) as
+        | t.CodeSessionContext
+        | undefined;
+      const existingFiles = existingSession?.files ?? [];
+
+      if (newFiles.length > 0) {
+        const filesWithSession: t.FileRefs = newFiles.map((file) => ({
+          ...file,
+          session_id: artifact.session_id,
+        }));
+
+        const newFileNames = new Set(filesWithSession.map((f) => f.name));
+        const filteredExisting = existingFiles.filter(
+          (f) => !newFileNames.has(f.name)
+        );
+
+        this.sessions.set(Constants.EXECUTE_CODE, {
+          session_id: artifact.session_id,
+          files: [...filteredExisting, ...filesWithSession],
+          lastUpdated: Date.now(),
+        });
+      } else {
+        this.sessions.set(Constants.EXECUTE_CODE, {
+          session_id: artifact.session_id,
+          files: existingFiles,
+          lastUpdated: Date.now(),
+        });
+      }
+    }
+  }
+
+  /**
+   * Dispatches tool calls to the host via ON_TOOL_EXECUTE event and returns raw ToolMessages.
+   * Core logic for event-driven execution, separated from output shaping.
+   */
+  private async dispatchToolEvents(
     toolCalls: ToolCall[],
-    config: RunnableConfig,
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    input: any
-  ): Promise<T> {
+    config: RunnableConfig
+  ): Promise<ToolMessage[]> {
     const requests: t.ToolCallRequest[] = toolCalls.map((call) => {
       const turn = this.toolUsageCount.get(call.name) ?? 0;
       this.toolUsageCount.set(call.name, turn + 1);
-      return {
+
+      const request: t.ToolCallRequest = {
         id: call.id!,
         name: call.name,
         args: call.args as Record<string, unknown>,
         stepId: this.toolCallStepIds?.get(call.id!),
         turn,
       };
+
+      if (
+        call.name === Constants.EXECUTE_CODE ||
+        call.name === Constants.PROGRAMMATIC_TOOL_CALLING
+      ) {
+        request.codeSessionContext = this.getCodeSessionContext();
+      }
+
+      return request;
     });
 
     const results = await new Promise<t.ToolExecuteResult[]>(
@@ -388,7 +490,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       }
     );
 
-    const outputs: ToolMessage[] = results.map((result) => {
+    this.storeCodeSessionFromResults(results, requests);
+
+    return results.map((result) => {
       const request = requests.find((r) => r.id === result.toolCallId);
       const toolName = request?.name ?? 'unknown';
       const stepId = this.toolCallStepIds?.get(result.toolCallId) ?? '';
@@ -411,8 +515,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             : JSON.stringify(result.content);
         toolMessage = new ToolMessage({
           status: 'success',
-          content: contentString,
           name: toolName,
+          content: contentString,
+          artifact: result.artifact,
           tool_call_id: result.toolCallId,
         });
       }
@@ -445,7 +550,19 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
       return toolMessage;
     });
+  }
 
+  /**
+   * Execute all tool calls via ON_TOOL_EXECUTE event dispatch.
+   * Used in event-driven mode where the host handles actual tool execution.
+   */
+  private async executeViaEvent(
+    toolCalls: ToolCall[],
+    config: RunnableConfig,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    input: any
+  ): Promise<T> {
+    const outputs = await this.dispatchToolEvents(toolCalls, config);
     return (Array.isArray(input) ? outputs : { messages: outputs }) as T;
   }
 
@@ -454,7 +571,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     let outputs: (BaseMessage | Command)[];
 
     if (this.isSendInput(input)) {
-      if (this.eventDrivenMode) {
+      const isDirectTool = this.directToolNames?.has(input.lg_tool_call.name);
+      if (this.eventDrivenMode && isDirectTool !== true) {
         return this.executeViaEvent([input.lg_tool_call], config, input);
       }
       outputs = [await this.runTool(input.lg_tool_call, config)];
@@ -513,12 +631,35 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         }) ?? [];
 
       if (this.eventDrivenMode && filteredCalls.length > 0) {
-        return this.executeViaEvent(filteredCalls, config, input);
-      }
+        if (!this.directToolNames || this.directToolNames.size === 0) {
+          return this.executeViaEvent(filteredCalls, config, input);
+        }
 
-      outputs = await Promise.all(
-        filteredCalls.map((call) => this.runTool(call, config))
-      );
+        const directCalls = filteredCalls.filter((c) =>
+          this.directToolNames!.has(c.name)
+        );
+        const eventCalls = filteredCalls.filter(
+          (c) => !this.directToolNames!.has(c.name)
+        );
+
+        const directOutputs: (BaseMessage | Command)[] =
+          directCalls.length > 0
+            ? await Promise.all(
+              directCalls.map((call) => this.runTool(call, config))
+            )
+            : [];
+
+        const eventOutputs: ToolMessage[] =
+          eventCalls.length > 0
+            ? await this.dispatchToolEvents(eventCalls, config)
+            : [];
+
+        outputs = [...directOutputs, ...eventOutputs];
+      } else {
+        outputs = await Promise.all(
+          filteredCalls.map((call) => this.runTool(call, config))
+        );
+      }
     }
 
     if (!outputs.some(isCommand)) {
@@ -676,17 +817,16 @@ export function toolsCondition<T extends string>(
   toolNode: T,
   invokedToolIds?: Set<string>
 ): T | typeof END {
-  const message: AIMessage = Array.isArray(state)
-    ? state[state.length - 1]
-    : state.messages[state.messages.length - 1];
+  const messages = Array.isArray(state) ? state : state.messages;
+  const message = messages[messages.length - 1] as AIMessage | undefined;
 
   if (
+    message &&
     'tool_calls' in message &&
     (message.tool_calls?.length ?? 0) > 0 &&
     !areToolCallsInvoked(message, invokedToolIds)
   ) {
     return toolNode;
-  } else {
-    return END;
   }
+  return END;
 }
