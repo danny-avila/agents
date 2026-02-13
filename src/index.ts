@@ -8,6 +8,9 @@ export * from './messages';
 /* Graphs */
 export * from './graphs';
 
+/* Summarization */
+export * from './summarization';
+
 /* Tools */
 export * from './tools/Calculator';
 export * from './tools/CodeExecutor';
@@ -27,3 +30,4 @@ export type * from './types';
 
 /* LLM */
 export { CustomOpenAIClient } from './llm/openai';
+export { getChatModelClass } from './llm/providers';

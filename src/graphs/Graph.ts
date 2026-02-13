@@ -58,6 +58,8 @@ import {
 } from '@/utils';
 import { getChatModelClass, manualToolStreamProviders } from '@/llm/providers';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
+import { shouldTriggerSummarization } from '@/summarization';
+import { createSummarizeNode } from '@/summarization/node';
 import { ChatOpenAI, AzureChatOpenAI } from '@/llm/openai';
 import { safeDispatchCustomEvent } from '@/utils/events';
 import { createSchemaOnlyTools } from '@/tools/schema';
@@ -67,7 +69,7 @@ import { handleToolCalls } from '@/tools/handlers';
 import { ChatModelStreamHandler } from '@/stream';
 import { HandlerRegistry } from '@/events';
 
-const { AGENT, TOOLS } = GraphNodeKeys;
+const { AGENT, TOOLS, SUMMARIZE } = GraphNodeKeys;
 
 export abstract class Graph<
   T extends t.BaseGraphState = t.BaseGraphState,
@@ -245,6 +247,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       agentId = currentNode.substring(AGENT.length);
     } else if (currentNode.startsWith(TOOLS)) {
       agentId = currentNode.substring(TOOLS.length);
+    } else if (currentNode.startsWith(SUMMARIZE)) {
+      agentId = currentNode.substring(SUMMARIZE.length);
     }
 
     const agentContext = this.agentContexts.get(agentId ?? '');
@@ -779,13 +783,42 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         });
       }
       if (agentContext.pruneMessages) {
-        const { context, indexTokenCountMap } = agentContext.pruneMessages({
+        const {
+          context,
+          indexTokenCountMap,
+          messagesToRefine,
+          prePruneTotalTokens,
+          remainingContextTokens,
+        } = agentContext.pruneMessages({
           messages,
           usageMetadata: agentContext.currentUsage,
           // startOnMessageType: 'human',
         });
         agentContext.indexTokenCountMap = indexTokenCountMap;
         messagesToUse = context;
+
+        if (
+          agentContext.summarizationEnabled === true &&
+          !agentContext.hasSummary() &&
+          Array.isArray(messagesToRefine) &&
+          messagesToRefine.length > 0 &&
+          shouldTriggerSummarization({
+            trigger: agentContext.summarizationConfig?.trigger,
+            maxContextTokens: agentContext.maxContextTokens,
+            prePruneTotalTokens,
+            remainingContextTokens,
+            messagesToRefineCount: messagesToRefine.length,
+          })
+        ) {
+          return {
+            summarizationRequest: {
+              messagesToRefine,
+              context,
+              remainingContextTokens: remainingContextTokens ?? 0,
+              agentId: agentId || agentContext.agentId,
+            },
+          } as unknown as Partial<t.BaseGraphState>;
+        }
       }
 
       let finalMessages = messagesToUse;
@@ -1076,19 +1109,39 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
     const agentNode = `${AGENT}${agentId}` as const;
     const toolNode = `${TOOLS}${agentId}` as const;
+    const summarizeNode = `${SUMMARIZE}${agentId}` as const;
+
+    type AgentSubgraphState = {
+      messages: BaseMessage[];
+      summarizationRequest?: t.SummarizationNodeInput;
+    };
 
     const routeMessage = (
-      state: t.BaseGraphState,
+      state: AgentSubgraphState,
       config?: RunnableConfig
     ): string => {
       this.config = config;
-      return toolsCondition(state, toolNode, this.invokedToolIds);
+      if (state.summarizationRequest != null) {
+        return summarizeNode;
+      }
+      return toolsCondition(
+        state as t.BaseGraphState,
+        toolNode,
+        this.invokedToolIds
+      );
     };
 
     const StateAnnotation = Annotation.Root({
       messages: Annotation<BaseMessage[]>({
         reducer: messagesStateReducer,
         default: () => [],
+      }),
+      summarizationRequest: Annotation<t.SummarizationNodeInput | undefined>({
+        reducer: (
+          _: t.SummarizationNodeInput | undefined,
+          b: t.SummarizationNodeInput | undefined
+        ) => b,
+        default: () => undefined,
       }),
     });
 
@@ -1102,11 +1155,25 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           agentContext,
         })
       )
+      .addNode(
+        summarizeNode,
+        createSummarizeNode({
+          agentContext,
+          graph: {
+            contentData: this.contentData,
+            contentIndexMap: this.contentIndexMap,
+            config: this.config,
+            runId: this.runId,
+            isMultiAgent: this.isMultiAgentGraph(),
+          },
+          generateStepId: (stepKey: string) => this.generateStepId(stepKey),
+        })
+      )
       .addEdge(START, agentNode)
       .addConditionalEdges(agentNode, routeMessage)
+      .addEdge(summarizeNode, agentNode)
       .addEdge(toolNode, agentContext.toolEnd ? END : agentNode);
 
-    // Cast to unknown to avoid tight coupling to external types; options are opt-in
     return workflow.compile(this.compileOptions as unknown as never);
   }
 

@@ -14,6 +14,7 @@ import type {
   ExtendedMessageContent,
   MessageContentComplex,
   ReasoningContentText,
+  SummaryContentBlock,
   ToolCallContent,
   ToolCallPart,
   TPayload,
@@ -376,7 +377,8 @@ function formatAssistantMessage(
         continue;
       } else if (
         part.type === ContentTypes.ERROR ||
-        part.type === ContentTypes.AGENT_UPDATE
+        part.type === ContentTypes.AGENT_UPDATE ||
+        part.type === ContentTypes.SUMMARY
       ) {
         continue;
       } else {
@@ -403,6 +405,17 @@ function formatAssistantMessage(
   }
 
   return formattedMessages;
+}
+
+function getSourceMessageId(message: Partial<TMessage>): string | undefined {
+  const candidate =
+    (message as { messageId?: string }).messageId ??
+    (message as { id?: string }).id;
+  if (typeof candidate !== 'string') {
+    return undefined;
+  }
+  const normalized = candidate.trim();
+  return normalized.length > 0 ? normalized : undefined;
 }
 
 /**
@@ -667,6 +680,79 @@ function extractToolNamesFromSearchOutput(output: string): string[] {
   return [];
 }
 
+type SummaryBoundary = {
+  messageIndex: number;
+  contentIndex: number;
+  text: string;
+  tokenCount: number;
+};
+
+function getLatestSummaryBoundary(
+  payload: TPayload
+): SummaryBoundary | undefined {
+  let summaryBoundary: SummaryBoundary | undefined;
+
+  for (let i = 0; i < payload.length; i++) {
+    const message = payload[i];
+    if (!Array.isArray(message.content)) {
+      continue;
+    }
+
+    for (let j = 0; j < message.content.length; j++) {
+      const part = message.content[j];
+      if (part.type !== ContentTypes.SUMMARY) {
+        continue;
+      }
+
+      const summaryPart = part as Partial<SummaryContentBlock>;
+      const summaryText =
+        typeof summaryPart.text === 'string' ? summaryPart.text.trim() : '';
+      if (summaryText.length === 0) {
+        continue;
+      }
+
+      summaryBoundary = {
+        messageIndex: i,
+        contentIndex: j,
+        text: summaryText,
+        tokenCount:
+          typeof summaryPart.tokenCount === 'number' &&
+          Number.isFinite(summaryPart.tokenCount)
+            ? summaryPart.tokenCount
+            : 0,
+      };
+    }
+  }
+
+  return summaryBoundary;
+}
+
+function applySummaryBoundary(
+  message: Partial<TMessage>,
+  messageIndex: number,
+  summaryBoundary?: SummaryBoundary
+): Partial<TMessage> | null {
+  if (!summaryBoundary) {
+    return message;
+  }
+
+  if (messageIndex < summaryBoundary.messageIndex) {
+    return null;
+  }
+
+  if (
+    messageIndex !== summaryBoundary.messageIndex ||
+    !Array.isArray(message.content)
+  ) {
+    return message;
+  }
+
+  return {
+    ...message,
+    content: message.content.slice(summaryBoundary.contentIndex + 1),
+  };
+}
+
 /**
  * Formats an array of messages for LangChain, handling tool calls and creating ToolMessage instances.
  *
@@ -690,6 +776,14 @@ export const formatAgentMessages = (
   const updatedIndexTokenCountMap: Record<number, number> = {};
   // Keep track of the mapping from original payload indices to result indices
   const indexMapping: Record<number, number[] | undefined> = {};
+  const summaryBoundary = getLatestSummaryBoundary(payload);
+
+  if (summaryBoundary) {
+    messages.push(new SystemMessage(summaryBoundary.text));
+    if (indexTokenCountMap) {
+      updatedIndexTokenCountMap[0] = summaryBoundary.tokenCount;
+    }
+  }
 
   /**
    * Create a mutable copy of the tools set that can be expanded dynamically.
@@ -700,21 +794,37 @@ export const formatAgentMessages = (
 
   // Process messages with tool conversion if tools set is provided
   for (let i = 0; i < payload.length; i++) {
-    const message = payload[i];
+    const rawMessage = payload[i];
+    const sourceMessageId = getSourceMessageId(rawMessage);
+    let message = applySummaryBoundary(rawMessage, i, summaryBoundary);
+    if (!message) {
+      indexMapping[i] = [];
+      continue;
+    }
+
     // Q: Store the current length of messages to track where this payload message starts in the result?
     // const startIndex = messages.length;
     if (typeof message.content === 'string') {
-      message.content = [
-        { type: ContentTypes.TEXT, [ContentTypes.TEXT]: message.content },
-      ];
+      message = {
+        ...message,
+        content: [
+          { type: ContentTypes.TEXT, [ContentTypes.TEXT]: message.content },
+        ],
+      };
+    } else if (Array.isArray(message.content) && message.content.length === 0) {
+      indexMapping[i] = [];
+      continue;
     }
+
     if (message.role !== 'assistant') {
-      messages.push(
-        formatMessage({
-          message: message as MessageInput,
-          langChain: true,
-        }) as HumanMessage | AIMessage | SystemMessage
-      );
+      const formattedMessage = formatMessage({
+        message: message as MessageInput,
+        langChain: true,
+      }) as HumanMessage | AIMessage | SystemMessage;
+      if (sourceMessageId) {
+        formattedMessage.id = sourceMessageId;
+      }
+      messages.push(formattedMessage);
 
       // Update the index mapping for this message
       indexMapping[i] = [messages.length - 1];
@@ -858,6 +968,11 @@ export const formatAgentMessages = (
 
     // Process the assistant message using the helper function
     const formattedMessages = formatAssistantMessage(processedMessage);
+    if (sourceMessageId) {
+      for (const formattedMessage of formattedMessages) {
+        formattedMessage.id = sourceMessageId;
+      }
+    }
     messages.push(...formattedMessages);
 
     // Update the index mapping for this assistant message

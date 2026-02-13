@@ -23,6 +23,13 @@ import type { Providers, Callback, GraphNodeKeys } from '@/common';
 import type { StandardGraph, MultiAgentGraph } from '@/graphs';
 import type { ClientOptions } from '@/types/llm';
 import type {
+  SummarizationNodeInput,
+  SummarizeCompleteEvent,
+  SummarizationConfig,
+  SummarizeStartEvent,
+  SummarizeDeltaEvent,
+} from '@/types/summarize';
+import type {
   RunStep,
   RunStepDeltaEvent,
   MessageDeltaEvent,
@@ -82,6 +89,9 @@ export interface EventHandler {
       | RunStepDeltaEvent
       | MessageDeltaEvent
       | ReasoningDeltaEvent
+      | SummarizeStartEvent
+      | SummarizeDeltaEvent
+      | SummarizeCompleteEvent
       | { result: ToolEndEvent },
     metadata?: Record<string, unknown>,
     graph?: StandardGraph | MultiAgentGraph
@@ -144,22 +154,34 @@ export type CompiledMultiAgentWorkflow = CompiledStateGraph<
 export type CompiledAgentWorfklow = CompiledStateGraph<
   {
     messages: BaseMessage[];
+    summarizationRequest?: SummarizationNodeInput;
   },
   {
     messages?: BaseMessage[] | undefined;
+    summarizationRequest?: SummarizationNodeInput | undefined;
   },
-  '__start__' | `agent=${string}` | `tools=${string}`,
+  '__start__' | `agent=${string}` | `tools=${string}` | `summarize=${string}`,
   {
     messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
+    summarizationRequest: BinaryOperatorAggregate<
+      SummarizationNodeInput | undefined,
+      SummarizationNodeInput | undefined
+    >;
   },
   {
     messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
+    summarizationRequest: BinaryOperatorAggregate<
+      SummarizationNodeInput | undefined,
+      SummarizationNodeInput | undefined
+    >;
   },
   StateDefinition,
   {
     [x: `agent=${string}`]: Partial<BaseGraphState>;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     [x: `tools=${string}`]: any;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    [x: `summarize=${string}`]: any;
   }
 >;
 
@@ -389,4 +411,6 @@ export interface AgentInputs {
    * in tool binding without requiring tool_search.
    */
   discoveredTools?: string[];
+  summarizationEnabled?: boolean;
+  summarizationConfig?: SummarizationConfig;
 }

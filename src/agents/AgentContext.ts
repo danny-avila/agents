@@ -43,6 +43,8 @@ export class AgentContext {
       reasoningKey,
       useLegacyContent,
       discoveredTools,
+      summarizationEnabled,
+      summarizationConfig,
     } = agentConfig;
 
     const agentContext = new AgentContext({
@@ -64,6 +66,8 @@ export class AgentContext {
       tokenCounter,
       useLegacyContent,
       discoveredTools,
+      summarizationEnabled,
+      summarizationConfig,
     });
 
     if (tokenCounter) {
@@ -167,6 +171,14 @@ export class AgentContext {
   tokenCalculationPromise?: Promise<void>;
   /** Format content blocks as strings (for legacy compatibility) */
   useLegacyContent: boolean = false;
+  /** Enables graph-level summarization for this agent */
+  summarizationEnabled?: boolean;
+  /** Summarization runtime settings used by graph pruning hooks */
+  summarizationConfig?: t.SummarizationConfig;
+  /** Current summary text produced by the summarize node, integrated into system message */
+  private summaryText?: string;
+  /** Token count of the current summary (tracked for token accounting) */
+  private summaryTokenCount: number = 0;
   /**
    * Handoff context when this agent receives control via handoff.
    * Contains source and parallel execution info for system message context.
@@ -197,6 +209,8 @@ export class AgentContext {
     instructionTokens,
     useLegacyContent,
     discoveredTools,
+    summarizationEnabled,
+    summarizationConfig,
   }: {
     agentId: string;
     name?: string;
@@ -216,6 +230,8 @@ export class AgentContext {
     instructionTokens?: number;
     useLegacyContent?: boolean;
     discoveredTools?: string[];
+    summarizationEnabled?: boolean;
+    summarizationConfig?: t.SummarizationConfig;
   }) {
     this.agentId = agentId;
     this.name = name;
@@ -241,6 +257,8 @@ export class AgentContext {
     }
 
     this.useLegacyContent = useLegacyContent ?? false;
+    this.summarizationEnabled = summarizationEnabled;
+    this.summarizationConfig = summarizationConfig;
 
     if (discoveredTools && discoveredTools.length > 0) {
       for (const toolName of discoveredTools) {
@@ -369,6 +387,10 @@ export class AgentContext {
       parts.push(programmaticToolsDoc);
     }
 
+    if (this.summaryText != null && this.summaryText !== '') {
+      parts.push('## Conversation Summary\n\n' + this.summaryText);
+    }
+
     return parts.join('\n\n');
   }
 
@@ -472,6 +494,9 @@ export class AgentContext {
     this.currentTokenType = ContentTypes.TEXT;
     this.discoveredToolNames.clear();
     this.handoffContext = undefined;
+
+    this.summaryText = undefined;
+    this.summaryTokenCount = 0;
 
     if (this.tokenCounter) {
       this.initializeSystemRunnable();
@@ -608,6 +633,24 @@ export class AgentContext {
   clearHandoffContext(): void {
     if (this.handoffContext) {
       this.handoffContext = undefined;
+      this.systemRunnableStale = true;
+    }
+  }
+
+  setSummary(text: string, tokenCount: number): void {
+    this.summaryText = text;
+    this.summaryTokenCount = tokenCount;
+    this.systemRunnableStale = true;
+  }
+
+  hasSummary(): boolean {
+    return this.summaryText != null && this.summaryText !== '';
+  }
+
+  clearSummary(): void {
+    if (this.summaryText != null) {
+      this.summaryText = undefined;
+      this.summaryTokenCount = 0;
       this.systemRunnableStale = true;
     }
   }

@@ -80,6 +80,7 @@ export type RunStep = {
   index: number; // #new
   stepIndex?: number; // #new
   stepDetails: StepDetails;
+  summary?: SummaryContentBlock;
   usage?: null | object;
   // {
   // Define usage structure if it's ever non-null
@@ -258,11 +259,34 @@ export type MessageDeltaUpdate = {
 };
 export type ReasoningDeltaUpdate = { type: ContentTypes.THINK; think: string };
 
-export type ContentType = 'text' | 'image_url' | 'tool_call' | 'think' | string;
+export type ContentType =
+  | 'text'
+  | 'image_url'
+  | 'tool_call'
+  | 'think'
+  | 'summary'
+  | string;
 
 export type ReasoningContentText = {
   type: ContentTypes.THINK;
   think: string;
+};
+
+export type SummaryBoundary = {
+  messageId: string;
+  contentIndex: number;
+};
+
+export type SummaryContentBlock = {
+  type: ContentTypes.SUMMARY;
+  text: string;
+  tokenCount: number;
+  boundary?: SummaryBoundary;
+  summaryVersion?: number;
+  rangeHash?: string;
+  model?: string;
+  provider?: string;
+  createdAt?: string;
 };
 
 /** Vertex AI / Google Common - Reasoning Content Block Format */
@@ -328,6 +352,7 @@ export type ToolResultContent = {
 export type MessageContentComplex = (
   | ToolResultContent
   | ThinkingContentText
+  | SummaryContentBlock
   | AgentUpdate
   | ToolCallContent
   | ReasoningContentText
@@ -397,6 +422,13 @@ export type SplitStreamHandlers = Partial<{
   }) => void;
 }>;
 
+export type SummarizeDeltaData = {
+  id: string;
+  delta: {
+    summary: SummaryContentBlock;
+  };
+};
+
 export type ContentAggregator = ({
   event,
   data,
@@ -404,11 +436,12 @@ export type ContentAggregator = ({
   event: GraphEvents;
   data:
     | RunStep
+    | AgentUpdate
     | MessageDeltaEvent
+    | ReasoningDeltaEvent
     | RunStepDeltaEvent
-    | {
-        result: ToolEndEvent;
-      };
+    | SummarizeDeltaData
+    | { result: ToolEndEvent };
 }) => void;
 export type ContentAggregatorResult = {
   stepMap: Map<string, RunStep | undefined>;

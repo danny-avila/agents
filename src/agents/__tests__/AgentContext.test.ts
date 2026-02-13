@@ -395,6 +395,36 @@ describe('AgentContext', () => {
       expect(ctx.currentUsage).toBeUndefined();
     });
 
+    it('preserves summarization settings across resets', () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          summarizationEnabled: true,
+          summarizationConfig: {
+            provider: Providers.ANTHROPIC,
+            model: 'claude-sonnet-4-5',
+            prompt: 'Keep decisions and next steps concise.',
+            trigger: {
+              type: 'token_ratio',
+              value: 0.8,
+            },
+          },
+        },
+      });
+
+      ctx.reset();
+
+      expect(ctx.summarizationEnabled).toBe(true);
+      expect(ctx.summarizationConfig).toEqual({
+        provider: 'anthropic',
+        model: 'claude-sonnet-4-5',
+        prompt: 'Keep decisions and next steps concise.',
+        trigger: {
+          type: 'token_ratio',
+          value: 0.8,
+        },
+      });
+    });
+
     it('rebuilds indexTokenCountMap from base map after reset', async () => {
       const tokenCounter = jest.fn(() => 5);
       const ctx = createBasicContext({
@@ -821,6 +851,134 @@ describe('AgentContext', () => {
 
       // Now should match run 1
       expect(ctx.instructionTokens).toBe(run1Tokens);
+    });
+  });
+
+  describe('Summary Token Accounting', () => {
+    const charTokenCounter: t.TokenCounter = (msg) => {
+      const raw = msg.content;
+      if (typeof raw === 'string') return raw.length;
+      if (Array.isArray(raw)) {
+        let total = 0;
+        for (let i = 0; i < raw.length; i++) {
+          const item = raw[i] as unknown;
+          if (typeof item === 'string') {
+            total += item.length;
+          } else if (
+            typeof item === 'object' &&
+            item != null &&
+            'text' in item
+          ) {
+            const text = (item as Record<string, unknown>).text;
+            if (typeof text === 'string') total += text.length;
+          }
+        }
+        return total;
+      }
+      return 0;
+    };
+
+    it('setSummary increases instructionTokens and marks systemRunnable stale', () => {
+      const ctx = createBasicContext({
+        agentConfig: { instructions: 'Be helpful.' },
+        tokenCounter: charTokenCounter,
+      });
+
+      void ctx.systemRunnable;
+      const baseInstructionTokens = ctx.instructionTokens;
+      expect(baseInstructionTokens).toBeGreaterThan(0);
+
+      ctx.setSummary('User asked about math. Key results: 2+2=4, 3*5=15.', 50);
+      expect(ctx.hasSummary()).toBe(true);
+
+      void ctx.systemRunnable;
+      const postSummaryTokens = ctx.instructionTokens;
+      expect(postSummaryTokens).toBeGreaterThan(baseInstructionTokens);
+    });
+
+    it('summary text appears in rebuilt system message', () => {
+      const ctx = createBasicContext({
+        agentConfig: { instructions: 'Be helpful.' },
+        tokenCounter: charTokenCounter,
+      });
+
+      void ctx.systemRunnable;
+      ctx.setSummary('Prior context: user computed factorials.', 40);
+
+      const runnable = ctx.systemRunnable;
+      expect(runnable).toBeDefined();
+    });
+
+    it('clearSummary restores instructionTokens to pre-summary level', () => {
+      const ctx = createBasicContext({
+        agentConfig: { instructions: 'Be helpful.' },
+        tokenCounter: charTokenCounter,
+      });
+
+      void ctx.systemRunnable;
+      const baseTokens = ctx.instructionTokens;
+
+      ctx.setSummary('Summary of the conversation so far.', 35);
+      void ctx.systemRunnable;
+      const withSummaryTokens = ctx.instructionTokens;
+      expect(withSummaryTokens).toBeGreaterThan(baseTokens);
+
+      ctx.clearSummary();
+      void ctx.systemRunnable;
+      const afterClearTokens = ctx.instructionTokens;
+      expect(afterClearTokens).toBe(baseTokens);
+    });
+
+    it('reset clears summary and restores base token counts', () => {
+      const ctx = createBasicContext({
+        agentConfig: { instructions: 'Be helpful.' },
+        tokenCounter: charTokenCounter,
+        indexTokenCountMap: { '0': 10, '1': 20 },
+      });
+
+      void ctx.systemRunnable;
+      ctx.setSummary('Summary text.', 15);
+      void ctx.systemRunnable;
+      expect(ctx.hasSummary()).toBe(true);
+
+      ctx.reset();
+      expect(ctx.hasSummary()).toBe(false);
+
+      void ctx.systemRunnable;
+      const postResetTokens = ctx.instructionTokens;
+      expect(postResetTokens).toBeGreaterThan(0);
+    });
+
+    it('updateTokenMapWithInstructions adds instructionTokens (including summary) to index 0', () => {
+      const ctx = createBasicContext({
+        agentConfig: { instructions: 'Be helpful.' },
+        tokenCounter: charTokenCounter,
+      });
+
+      void ctx.systemRunnable;
+      ctx.setSummary('Summary of prior context with key facts.', 40);
+      void ctx.systemRunnable;
+
+      const instructionTokens = ctx.instructionTokens;
+      expect(instructionTokens).toBeGreaterThan(0);
+
+      const baseMap: Record<string, number> = { '0': 5, '1': 10 };
+      ctx.updateTokenMapWithInstructions(baseMap);
+
+      expect(ctx.indexTokenCountMap['0']).toBe(5 + instructionTokens);
+      expect(ctx.indexTokenCountMap['1']).toBe(10);
+    });
+
+    it('hasSummary returns false before setSummary and true after', () => {
+      const ctx = createBasicContext({
+        agentConfig: { instructions: 'Be helpful.' },
+      });
+
+      expect(ctx.hasSummary()).toBe(false);
+      ctx.setSummary('Some summary.', 10);
+      expect(ctx.hasSummary()).toBe(true);
+      ctx.clearSummary();
+      expect(ctx.hasSummary()).toBe(false);
     });
   });
 });

@@ -7,6 +7,7 @@ import type { StandardGraph } from '@/graphs';
 import type * as t from '@/types';
 import {
   ToolCallTypes,
+  GraphNodeKeys,
   ContentTypes,
   GraphEvents,
   StepTypes,
@@ -148,6 +149,12 @@ export class ChatModelStreamHandler implements t.EventHandler {
     if (!graph.config) {
       throw new Error('Config not found in graph');
     }
+
+    const currentNode = metadata?.langgraph_node as string | undefined;
+    if (currentNode?.startsWith(GraphNodeKeys.SUMMARIZE) === true) {
+      return;
+    }
+
     if (!data.chunk) {
       console.warn(`No chunk found in ${event} event`);
       return;
@@ -513,6 +520,8 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       };
 
       contentParts[index] = update;
+    } else if (partType === ContentTypes.SUMMARY) {
+      contentParts[index] = contentPart;
     } else if (
       partType === ContentTypes.IMAGE_URL &&
       'image_url' in contentPart
@@ -608,9 +617,22 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       | t.RunStep
       | t.AgentUpdate
       | t.MessageDeltaEvent
+      | t.ReasoningDeltaEvent
       | t.RunStepDeltaEvent
+      | t.SummarizeDeltaData
       | { result: t.ToolEndEvent };
   }): void => {
+    if (event === GraphEvents.ON_SUMMARIZE_DELTA) {
+      const deltaData = data as t.SummarizeDeltaData;
+      const runStep = stepMap.get(deltaData.id);
+      if (!runStep) {
+        console.warn('No run step found for summarize delta event');
+        return;
+      }
+      updateContent(runStep.index, deltaData.delta.summary);
+      return;
+    }
+
     if (event === GraphEvents.ON_RUN_STEP) {
       const runStep = data as t.RunStep;
       stepMap.set(runStep.id, runStep);
@@ -631,7 +653,10 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         contentMetaMap.set(runStep.index, existingMeta);
       }
 
-      // Store tool call IDs if present
+      if (runStep.summary != null) {
+        updateContent(runStep.index, runStep.summary);
+      }
+
       if (
         runStep.stepDetails.type === StepTypes.TOOL_CALLS &&
         runStep.stepDetails.tool_calls
