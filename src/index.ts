@@ -8,6 +8,9 @@ export * from './messages';
 /* Graphs */
 export * from './graphs';
 
+/* Summarization */
+export * from './summarization';
+
 /* Tools */
 export * from './tools/Calculator';
 export * from './tools/CodeExecutor';
@@ -33,3 +36,4 @@ export type {
   OpenRouterReasoningEffort,
   ChatOpenRouterCallOptions,
 } from './llm/openrouter';
+export { getChatModelClass } from './llm/providers';

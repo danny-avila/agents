@@ -1,6 +1,7 @@
 import {
   AIMessage,
   BaseMessage,
+  ToolMessage,
   UsageMetadata,
 } from '@langchain/core/messages';
 import type {
@@ -24,6 +25,142 @@ export type PruneMessagesParams = {
   usageMetadata?: Partial<UsageMetadata>;
   startType?: ReturnType<BaseMessage['getType']>;
 };
+
+function getToolCallIds(message: BaseMessage): Set<string> {
+  if (message.getType() !== 'ai') {
+    return new Set<string>();
+  }
+
+  const ids = new Set<string>();
+  const aiMessage = message as AIMessage;
+  for (const toolCall of aiMessage.tool_calls ?? []) {
+    if (typeof toolCall.id === 'string' && toolCall.id.length > 0) {
+      ids.add(toolCall.id);
+    }
+  }
+
+  if (Array.isArray(aiMessage.content)) {
+    for (const part of aiMessage.content) {
+      if (typeof part !== 'object') {
+        continue;
+      }
+      const record = part as { type?: unknown; id?: unknown };
+      if (
+        (record.type === 'tool_use' || record.type === 'tool_call') &&
+        typeof record.id === 'string' &&
+        record.id.length > 0
+      ) {
+        ids.add(record.id);
+      }
+    }
+  }
+
+  return ids;
+}
+
+function getToolResultId(message: BaseMessage): string | null {
+  if (message.getType() !== 'tool') {
+    return null;
+  }
+  const toolMessage = message as ToolMessage & {
+    tool_call_id?: unknown;
+    toolCallId?: unknown;
+  };
+  if (
+    typeof toolMessage.tool_call_id === 'string' &&
+    toolMessage.tool_call_id.length > 0
+  ) {
+    return toolMessage.tool_call_id;
+  }
+  if (
+    typeof toolMessage.toolCallId === 'string' &&
+    toolMessage.toolCallId.length > 0
+  ) {
+    return toolMessage.toolCallId;
+  }
+  return null;
+}
+
+function resolveTokenCountForMessage({
+  message,
+  allMessages,
+  tokenCounter,
+  indexTokenCountMap,
+}: {
+  message: BaseMessage;
+  allMessages: BaseMessage[];
+  tokenCounter: TokenCounter;
+  indexTokenCountMap: Record<string, number | undefined>;
+}): number {
+  const originalIndex = allMessages.findIndex(
+    (candidateMessage) => candidateMessage === message
+  );
+  if (originalIndex > -1 && indexTokenCountMap[originalIndex] != null) {
+    return indexTokenCountMap[originalIndex] as number;
+  }
+  return tokenCounter(message);
+}
+
+export function repairOrphanedToolMessages({
+  context,
+  allMessages,
+  tokenCounter,
+  indexTokenCountMap,
+}: {
+  context: BaseMessage[];
+  allMessages: BaseMessage[];
+  tokenCounter: TokenCounter;
+  indexTokenCountMap: Record<string, number | undefined>;
+}): {
+  context: BaseMessage[];
+  reclaimedTokens: number;
+  droppedOrphanCount: number;
+} {
+  const validToolCallIds = new Set<string>();
+  for (const message of context) {
+    for (const id of getToolCallIds(message)) {
+      validToolCallIds.add(id);
+    }
+  }
+
+  if (validToolCallIds.size === 0) {
+    return {
+      context,
+      reclaimedTokens: 0,
+      droppedOrphanCount: 0,
+    };
+  }
+
+  let reclaimedTokens = 0;
+  let droppedOrphanCount = 0;
+  const repairedContext: BaseMessage[] = [];
+  for (const message of context) {
+    if (message.getType() !== 'tool') {
+      repairedContext.push(message);
+      continue;
+    }
+
+    const toolResultId = getToolResultId(message);
+    if (toolResultId == null || !validToolCallIds.has(toolResultId)) {
+      droppedOrphanCount += 1;
+      reclaimedTokens += resolveTokenCountForMessage({
+        message,
+        allMessages,
+        tokenCounter,
+        indexTokenCountMap,
+      });
+      continue;
+    }
+
+    repairedContext.push(message);
+  }
+
+  return {
+    context: repairedContext,
+    reclaimedTokens,
+    droppedOrphanCount,
+  };
+}
 
 function isIndexInContext(
   arrayA: unknown[],
@@ -242,6 +379,10 @@ export function getMessagesWithinTokenLimit({
     messages.shift();
   }
 
+  if (messages.length > 0) {
+    prunedMemory.unshift(...messages);
+  }
+
   remainingContextTokens -= currentTokenCount;
   const result: PruningResult = {
     remainingContextTokens,
@@ -409,6 +550,9 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
   return function pruneMessages(params: PruneMessagesParams): {
     context: BaseMessage[];
     indexTokenCountMap: Record<string, number | undefined>;
+    messagesToRefine?: BaseMessage[];
+    prePruneTotalTokens?: number;
+    remainingContextTokens?: number;
   } {
     if (
       factoryParams.provider === Providers.OPENAI &&
@@ -535,10 +679,21 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
 
     lastTurnStartIndex = params.messages.length;
     if (lastCutOffIndex === 0 && totalTokens <= factoryParams.maxTokens) {
-      return { context: params.messages, indexTokenCountMap };
+      return {
+        context: params.messages,
+        indexTokenCountMap,
+        messagesToRefine: [],
+        prePruneTotalTokens: totalTokens,
+        remainingContextTokens: factoryParams.maxTokens - totalTokens,
+      };
     }
 
-    const { context, thinkingStartIndex } = getMessagesWithinTokenLimit({
+    const {
+      context: initialContext,
+      thinkingStartIndex,
+      messagesToRefine,
+      remainingContextTokens: initialRemainingContextTokens,
+    } = getMessagesWithinTokenLimit({
       maxContextTokens: factoryParams.maxTokens,
       messages: params.messages,
       indexTokenCountMap,
@@ -554,6 +709,22 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
           ? runThinkingStartIndex
           : undefined,
     });
+
+    const { context, reclaimedTokens } = repairOrphanedToolMessages({
+      context: initialContext,
+      allMessages: params.messages,
+      tokenCounter: factoryParams.tokenCounter,
+      indexTokenCountMap,
+    });
+
+    const remainingContextTokens = Math.max(
+      0,
+      Math.min(
+        factoryParams.maxTokens,
+        initialRemainingContextTokens + reclaimedTokens
+      )
+    );
+
     runThinkingStartIndex = thinkingStartIndex ?? -1;
     /** The index is the first value of `context`, index relative to `params.messages` */
     lastCutOffIndex = Math.max(
@@ -562,6 +733,12 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       0
     );
 
-    return { context, indexTokenCountMap };
+    return {
+      context,
+      indexTokenCountMap,
+      messagesToRefine,
+      prePruneTotalTokens: totalTokens,
+      remainingContextTokens,
+    };
   };
 }

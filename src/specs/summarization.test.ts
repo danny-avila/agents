@@ -1,0 +1,1416 @@
+/* eslint-disable no-console */
+/* eslint-disable @typescript-eslint/no-explicit-any */
+import { config } from 'dotenv';
+config();
+import { Calculator } from '@/tools/Calculator';
+import {
+  HumanMessage,
+  AIMessage,
+  SystemMessage,
+  BaseMessage,
+  UsageMetadata,
+} from '@langchain/core/messages';
+import type * as t from '@/types';
+import { ToolEndHandler, ModelEndHandler } from '@/events';
+import { ContentTypes, GraphEvents, Providers } from '@/common';
+import { ChatModelStreamHandler, createContentAggregator } from '@/stream';
+import { createTokenCounter } from '@/utils/tokens';
+import { getLLMConfig } from '@/utils/llmConfig';
+import { Run } from '@/run';
+import { formatAgentMessages } from '@/messages/format';
+import { FakeListChatModel } from '@langchain/core/utils/testing';
+import * as providers from '@/llm/providers';
+
+// ---------------------------------------------------------------------------
+// Shared test infrastructure
+// ---------------------------------------------------------------------------
+
+function createSpies(): {
+  onMessageDeltaSpy: jest.Mock;
+  onRunStepSpy: jest.Mock;
+  onSummarizeStartSpy: jest.Mock;
+  onSummarizeCompleteSpy: jest.Mock;
+  } {
+  return {
+    onMessageDeltaSpy: jest.fn(),
+    onRunStepSpy: jest.fn(),
+    onSummarizeStartSpy: jest.fn(),
+    onSummarizeCompleteSpy: jest.fn(),
+  };
+}
+
+function buildHandlers(
+  collectedUsage: UsageMetadata[],
+  aggregateContent: t.ContentAggregator,
+  spies: ReturnType<typeof createSpies>
+): Record<string | GraphEvents, t.EventHandler> {
+  return {
+    [GraphEvents.TOOL_END]: new ToolEndHandler(),
+    [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(collectedUsage),
+    [GraphEvents.CHAT_MODEL_STREAM]: new ChatModelStreamHandler(),
+    [GraphEvents.ON_RUN_STEP_COMPLETED]: {
+      handle: (
+        event: GraphEvents.ON_RUN_STEP_COMPLETED,
+        data: t.StreamEventData
+      ): void => {
+        aggregateContent({
+          event,
+          data: data as unknown as { result: t.ToolEndEvent },
+        });
+      },
+    },
+    [GraphEvents.ON_RUN_STEP]: {
+      handle: (
+        event: GraphEvents.ON_RUN_STEP,
+        data: t.StreamEventData,
+        metadata,
+        graph
+      ): void => {
+        spies.onRunStepSpy(event, data, metadata, graph);
+        aggregateContent({ event, data: data as t.RunStep });
+      },
+    },
+    [GraphEvents.ON_RUN_STEP_DELTA]: {
+      handle: (
+        event: GraphEvents.ON_RUN_STEP_DELTA,
+        data: t.StreamEventData
+      ): void => {
+        aggregateContent({ event, data: data as t.RunStepDeltaEvent });
+      },
+    },
+    [GraphEvents.ON_MESSAGE_DELTA]: {
+      handle: (
+        event: GraphEvents.ON_MESSAGE_DELTA,
+        data: t.StreamEventData,
+        metadata,
+        graph
+      ): void => {
+        spies.onMessageDeltaSpy(event, data, metadata, graph);
+        aggregateContent({ event, data: data as t.MessageDeltaEvent });
+      },
+    },
+    [GraphEvents.TOOL_START]: {
+      handle: (
+        _event: string,
+        _data: t.StreamEventData,
+        _metadata?: Record<string, unknown>
+      ): void => {},
+    },
+    [GraphEvents.ON_SUMMARIZE_START]: {
+      handle: (
+        _event: GraphEvents.ON_SUMMARIZE_START,
+        data: t.StreamEventData
+      ): void => {
+        spies.onSummarizeStartSpy(data);
+      },
+    },
+    [GraphEvents.ON_SUMMARIZE_COMPLETE]: {
+      handle: (
+        _event: GraphEvents.ON_SUMMARIZE_COMPLETE,
+        data: t.StreamEventData
+      ): void => {
+        spies.onSummarizeCompleteSpy(data);
+      },
+    },
+  };
+}
+
+async function createSummarizationRun(opts: {
+  agentProvider: Providers;
+  summarizationProvider: Providers;
+  summarizationModel?: string;
+  maxContextTokens: number;
+  instructions: string;
+  collectedUsage: UsageMetadata[];
+  aggregateContent: t.ContentAggregator;
+  spies: ReturnType<typeof createSpies>;
+  tokenCounter?: t.TokenCounter;
+  tools?: t.GraphTools;
+  indexTokenCountMap?: Record<string, number>;
+  llmConfigOverride?: Record<string, unknown>;
+}): Promise<Run<t.IState>> {
+  const llmConfig = {
+    ...getLLMConfig(opts.agentProvider),
+    ...opts.llmConfigOverride,
+  };
+  const tokenCounter = opts.tokenCounter ?? (await createTokenCounter());
+
+  return Run.create<t.IState>({
+    runId: `sum-e2e-${opts.agentProvider}-${Date.now()}`,
+    graphConfig: {
+      type: 'standard',
+      llmConfig,
+      tools: opts.tools ?? [new Calculator()],
+      instructions: opts.instructions,
+      maxContextTokens: opts.maxContextTokens,
+      summarizationEnabled: true,
+      summarizationConfig: {
+        enabled: true,
+        provider: opts.summarizationProvider,
+        model: opts.summarizationModel,
+      },
+    },
+    returnContent: true,
+    customHandlers: buildHandlers(
+      opts.collectedUsage,
+      opts.aggregateContent,
+      opts.spies
+    ),
+    tokenCounter,
+    indexTokenCountMap: opts.indexTokenCountMap,
+  });
+}
+
+async function runTurn(
+  state: { run: Run<t.IState>; conversationHistory: BaseMessage[] },
+  userMessage: string,
+  streamConfig: Record<string, unknown>
+): Promise<t.MessageContentComplex[] | undefined> {
+  state.conversationHistory.push(new HumanMessage(userMessage));
+  const result = await state.run.processStream(
+    { messages: state.conversationHistory },
+    streamConfig as any
+  );
+  const finalMessages = state.run.getRunMessages();
+  state.conversationHistory.push(...(finalMessages ?? []));
+  return result;
+}
+
+function assertSummarizationEvents(spies: ReturnType<typeof createSpies>): {
+  startPayload: t.SummarizeStartEvent;
+  completePayload: t.SummarizeCompleteEvent;
+} {
+  expect(spies.onSummarizeStartSpy).toHaveBeenCalled();
+  expect(spies.onSummarizeCompleteSpy).toHaveBeenCalled();
+
+  const startPayload = spies.onSummarizeStartSpy.mock
+    .calls[0][0] as t.SummarizeStartEvent;
+  expect(startPayload.agentId).toBeDefined();
+  expect(typeof startPayload.provider).toBe('string');
+  expect(startPayload.messagesToRefineCount).toBeGreaterThan(0);
+
+  const completePayload = spies.onSummarizeCompleteSpy.mock
+    .calls[0][0] as t.SummarizeCompleteEvent;
+  expect(completePayload.agentId).toBeDefined();
+  expect(completePayload.summary).toBeDefined();
+  expect(completePayload.summary.type).toBe(ContentTypes.SUMMARY);
+  expect(typeof completePayload.summary.text).toBe('string');
+  expect(completePayload.summary.text.length).toBeGreaterThan(10);
+  expect(completePayload.summary.tokenCount).toBeGreaterThan(0);
+  expect(completePayload.summary.provider).toBeDefined();
+  expect(completePayload.summary.createdAt).toBeDefined();
+
+  const startIdx = spies.onSummarizeStartSpy.mock.invocationCallOrder[0];
+  const completeIdx = spies.onSummarizeCompleteSpy.mock.invocationCallOrder[0];
+  expect(startIdx).toBeLessThan(completeIdx);
+
+  return { startPayload, completePayload };
+}
+
+function assertSummaryRunStep(
+  spies: ReturnType<typeof createSpies>,
+  summaryText: string
+): void {
+  const summaryRunSteps = spies.onRunStepSpy.mock.calls.filter(
+    (call) => (call[1] as any)?.summary != null
+  );
+  expect(summaryRunSteps.length).toBeGreaterThan(0);
+  const step = summaryRunSteps[0][1] as t.RunStep & {
+    summary: t.SummaryContentBlock;
+  };
+  expect(step.summary.type).toBe(ContentTypes.SUMMARY);
+  expect(step.summary.text).toBe(summaryText);
+  expect(step.id).toBeDefined();
+  expect(typeof step.stepIndex).toBe('number');
+}
+
+function buildIndexTokenCountMap(
+  messages: BaseMessage[],
+  tokenCounter: t.TokenCounter
+): Record<string, number> {
+  const map: Record<string, number> = {};
+  for (let i = 0; i < messages.length; i++) {
+    map[String(i)] = tokenCounter(messages[i]);
+  }
+  return map;
+}
+
+function logTurn(
+  label: string,
+  conversationHistory: BaseMessage[],
+  extra?: string
+): void {
+  console.log(
+    `  ${label} — ${conversationHistory.length} messages${extra != null && extra !== '' ? `, ${extra}` : ''}`
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Anthropic Summarization Tests
+// ---------------------------------------------------------------------------
+
+const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
+(hasAnthropic ? describe : describe.skip)('Anthropic Summarization E2E', () => {
+  jest.setTimeout(180_000);
+
+  const agentProvider = Providers.ANTHROPIC;
+  const streamConfig = {
+    configurable: { thread_id: 'anthropic-sum-e2e' },
+    streamMode: 'values',
+    version: 'v2' as const,
+  };
+
+  const MATH_TUTOR_INSTRUCTIONS = [
+    'You are an expert math tutor. You MUST use the calculator tool for ALL computations —',
+    'never compute in your head. Keep explanations concise (2-3 sentences max).',
+    'When summarizing prior work, list each calculation and its result.',
+  ].join(' ');
+
+  test('heavy multi-turn with tool calls triggers and survives summarization', async () => {
+    const spies = createSpies();
+    let collectedUsage: UsageMetadata[] = [];
+    const conversationHistory: BaseMessage[] = [];
+    const tokenCounter = await createTokenCounter();
+
+    const resetAggregator = (): {
+      contentParts: t.MessageContentComplex[];
+      aggregateContent: t.ContentAggregator;
+    } => {
+      collectedUsage = [];
+      const { contentParts: cp, aggregateContent: ac } =
+        createContentAggregator();
+      return {
+        contentParts: cp as t.MessageContentComplex[],
+        aggregateContent: ac,
+      };
+    };
+
+    const createRun = async (
+      maxTokens = 2000
+    ): Promise<{
+      run: Run<t.IState>;
+      contentParts: t.MessageContentComplex[];
+    }> => {
+      const { contentParts, aggregateContent } = resetAggregator();
+      const indexTokenCountMap = buildIndexTokenCountMap(
+        conversationHistory,
+        tokenCounter
+      );
+      const run = await createSummarizationRun({
+        agentProvider,
+        summarizationProvider: Providers.ANTHROPIC,
+        summarizationModel: 'claude-3-5-haiku-latest',
+        maxContextTokens: maxTokens,
+        instructions: MATH_TUTOR_INSTRUCTIONS,
+        collectedUsage,
+        aggregateContent,
+        spies,
+        tokenCounter,
+        indexTokenCountMap,
+      });
+      return { run, contentParts };
+    };
+
+    // Turn 1: greeting + simple calculation
+    let { run, contentParts } = await createRun();
+    await runTurn(
+      { run, conversationHistory },
+      'Hi! Let\'s do some math. What is 12345 * 6789? Use the calculator please.',
+      streamConfig
+    );
+    logTurn('T1', conversationHistory, `parts=${contentParts.length}`);
+
+    // Turn 2: compound calculation
+    ({ run, contentParts } = await createRun());
+    await runTurn(
+      { run, conversationHistory },
+      'Great. Now take that result and divide it by 137. Then multiply the quotient by 42. Show both steps. Use the calculator for each.',
+      streamConfig
+    );
+    logTurn('T2', conversationHistory, `parts=${contentParts.length}`);
+
+    // Turn 3: verbose question to inflate token count
+    ({ run, contentParts } = await createRun());
+    await runTurn(
+      { run, conversationHistory },
+      [
+        'I need you to compute the following sequence of operations step by step using the calculator:',
+        '1) Start with 9876543',
+        '2) Subtract 1234567 from it',
+        '3) Take the square root of the result',
+        'Please show each intermediate step with the calculator.',
+      ].join('\n'),
+      streamConfig
+    );
+    logTurn('T3', conversationHistory, `parts=${contentParts.length}`);
+
+    // Turn 4: even more to guarantee pruning threshold
+    ({ run, contentParts } = await createRun());
+    await runTurn(
+      { run, conversationHistory },
+      'Now calculate 2^20 using the calculator. Also, what is 1000000 / 7? Use calculator for both.',
+      streamConfig
+    );
+    logTurn('T4', conversationHistory, `parts=${contentParts.length}`);
+
+    // Turn 5: tighter context to force summarization if not already
+    ({ run, contentParts } = await createRun(1500));
+    await runTurn(
+      { run, conversationHistory },
+      'What is 355 / 113? Use the calculator. This should approximate pi.',
+      streamConfig
+    );
+    logTurn('T5', conversationHistory);
+
+    // Turn 6: if still no summarization, squeeze harder
+    if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
+      ({ run, contentParts } = await createRun(1000));
+      await runTurn(
+        { run, conversationHistory },
+        'Calculate 999 * 999 with the calculator. Also compute 123456789 % 97.',
+        streamConfig
+      );
+      logTurn('T6', conversationHistory);
+    }
+
+    console.log(
+      `  Summarize events — start: ${spies.onSummarizeStartSpy.mock.calls.length}, complete: ${spies.onSummarizeCompleteSpy.mock.calls.length}`
+    );
+
+    // Assert summarization fired correctly
+    const { startPayload, completePayload } = assertSummarizationEvents(spies);
+    assertSummaryRunStep(spies, completePayload.summary.text);
+
+    console.log(
+      `  Summary (${completePayload.summary.text.length} chars, ${completePayload.summary.tokenCount} tok): "${completePayload.summary.text.substring(0, 250)}…"`
+    );
+    console.log(
+      `  Start event — agent=${startPayload.agentId}, provider=${startPayload.provider}, refining=${startPayload.messagesToRefineCount} msgs`
+    );
+
+    // Token accounting: summary tokenCount must be reasonable
+    expect(completePayload.summary.tokenCount).toBeGreaterThan(10);
+    expect(completePayload.summary.tokenCount).toBeLessThan(2000);
+
+    // Token accounting: collectedUsage should have valid entries from post-summary model calls
+    const validUsageEntries = collectedUsage.filter(
+      (u: Partial<UsageMetadata>) =>
+        u.input_tokens != null && u.input_tokens > 0
+    );
+    expect(validUsageEntries.length).toBeGreaterThan(0);
+    const lastUsage = validUsageEntries[validUsageEntries.length - 1];
+    expect(lastUsage.output_tokens).toBeGreaterThan(0);
+    console.log(
+      `  Post-summary usage — input: ${lastUsage.input_tokens}, output: ${lastUsage.output_tokens}`
+    );
+
+    // Assert model still works after summarization
+    expect(spies.onMessageDeltaSpy).toHaveBeenCalled();
+
+    // Assert the summarize-start event never fires twice in the same run
+    // (hasSummary() guard should prevent re-triggering)
+    const startCallsForSameAgent = spies.onSummarizeStartSpy.mock.calls.filter(
+      (c) => (c[0] as t.SummarizeStartEvent).agentId === startPayload.agentId
+    );
+    expect(startCallsForSameAgent.length).toBe(1);
+  });
+
+  test('post-summary continuation over multiple turns preserves context', async () => {
+    const spies = createSpies();
+    let collectedUsage: UsageMetadata[] = [];
+    const conversationHistory: BaseMessage[] = [];
+    let latestContentParts: t.MessageContentComplex[] = [];
+    const tokenCounter = await createTokenCounter();
+
+    const createRun = async (maxTokens = 1200): Promise<Run<t.IState>> => {
+      collectedUsage = [];
+      const { contentParts, aggregateContent } = createContentAggregator();
+      latestContentParts = contentParts as t.MessageContentComplex[];
+      const indexTokenCountMap = buildIndexTokenCountMap(
+        conversationHistory,
+        tokenCounter
+      );
+      return createSummarizationRun({
+        agentProvider,
+        summarizationProvider: Providers.ANTHROPIC,
+        summarizationModel: 'claude-3-5-haiku-latest',
+        maxContextTokens: maxTokens,
+        instructions: MATH_TUTOR_INSTRUCTIONS,
+        collectedUsage,
+        aggregateContent,
+        spies,
+        tokenCounter,
+        indexTokenCountMap,
+      });
+    };
+
+    // Build up conversation fast with tight context
+    let run = await createRun(1200);
+    await runTurn(
+      { run, conversationHistory },
+      'What is 42 * 58? Calculator please.',
+      streamConfig
+    );
+
+    run = await createRun(1200);
+    await runTurn(
+      { run, conversationHistory },
+      'Now compute 2436 + 1337. Calculator.',
+      streamConfig
+    );
+
+    run = await createRun(1200);
+    await runTurn(
+      { run, conversationHistory },
+      'What is 3773 * 11? Calculator.',
+      streamConfig
+    );
+
+    run = await createRun(1000);
+    await runTurn(
+      { run, conversationHistory },
+      'Calculate 41503 - 12345 and then 29158 / 4. Show both with calculator.',
+      streamConfig
+    );
+
+    // By now summarization should have fired
+    if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
+      run = await createRun(800);
+      await runTurn(
+        { run, conversationHistory },
+        'What is 777 * 777? Calculator.',
+        streamConfig
+      );
+    }
+
+    console.log(
+      `  Pre-continuation: ${spies.onSummarizeCompleteSpy.mock.calls.length} summaries`
+    );
+    expect(spies.onSummarizeCompleteSpy).toHaveBeenCalled();
+    const completeSummary = (
+      spies.onSummarizeCompleteSpy.mock.calls[0][0] as t.SummarizeCompleteEvent
+    ).summary;
+    const summaryText = completeSummary.text;
+
+    // Token accounting: summary tokenCount bounds
+    expect(completeSummary.tokenCount).toBeGreaterThan(10);
+    expect(completeSummary.tokenCount).toBeLessThan(1200);
+
+    // Continue for 2 more turns AFTER summarization — model should remain coherent
+    run = await createRun(1200);
+    const postSumTurn1 = await runTurn(
+      { run, conversationHistory },
+      'What were all the numbers we computed so far? List them.',
+      streamConfig
+    );
+    expect(postSumTurn1).toBeDefined();
+    logTurn('Post-sum T1', conversationHistory);
+
+    run = await createRun(1200);
+    const postSumTurn2 = await runTurn(
+      { run, conversationHistory },
+      'Now compute the sum of 2436, 3773, and 41503 using the calculator.',
+      streamConfig
+    );
+    expect(postSumTurn2).toBeDefined();
+    logTurn('Post-sum T2', conversationHistory);
+
+    const hasPostSumCalculator = latestContentParts.some(
+      (p) =>
+        p.type === ContentTypes.TOOL_CALL &&
+        (p as t.ToolCallContent).tool_call?.name === 'calculator'
+    );
+    expect(hasPostSumCalculator).toBe(true);
+
+    // Model should still reference prior context from the summary
+    expect(spies.onMessageDeltaSpy).toHaveBeenCalled();
+    console.log(`  Summary text: "${summaryText.substring(0, 200)}…"`);
+    console.log(`  Final message count: ${conversationHistory.length}`);
+  });
+
+  test('cross-provider summarization: Anthropic agent with OpenAI summarizer', async () => {
+    const hasOpenAI = process.env.OPENAI_API_KEY != null;
+    if (!hasOpenAI) {
+      console.log('  Skipping cross-provider test (no OPENAI_API_KEY)');
+      return;
+    }
+
+    const spies = createSpies();
+    let collectedUsage: UsageMetadata[] = [];
+    const conversationHistory: BaseMessage[] = [];
+    const tokenCounter = await createTokenCounter();
+
+    const createRun = async (maxTokens = 1200): Promise<Run<t.IState>> => {
+      collectedUsage = [];
+      const { aggregateContent } = createContentAggregator();
+      const indexTokenCountMap = buildIndexTokenCountMap(
+        conversationHistory,
+        tokenCounter
+      );
+      return createSummarizationRun({
+        agentProvider: Providers.ANTHROPIC,
+        summarizationProvider: Providers.OPENAI,
+        summarizationModel: 'gpt-4.1-mini',
+        maxContextTokens: maxTokens,
+        instructions: MATH_TUTOR_INSTRUCTIONS,
+        collectedUsage,
+        aggregateContent,
+        spies,
+        tokenCounter,
+        indexTokenCountMap,
+      });
+    };
+
+    let run = await createRun();
+    await runTurn(
+      { run, conversationHistory },
+      'Compute 54321 * 12345 using calculator.',
+      streamConfig
+    );
+
+    run = await createRun();
+    await runTurn(
+      { run, conversationHistory },
+      'Now calculate 670592745 / 99991. Calculator.',
+      streamConfig
+    );
+
+    run = await createRun();
+    await runTurn(
+      { run, conversationHistory },
+      'What is sqrt(670592745)? Calculator.',
+      streamConfig
+    );
+
+    run = await createRun(900);
+    await runTurn(
+      { run, conversationHistory },
+      'Compute 2^32 with calculator. Then list everything we calculated.',
+      streamConfig
+    );
+
+    if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
+      run = await createRun(700);
+      await runTurn(
+        { run, conversationHistory },
+        'What is 13 * 17 * 19? Calculator.',
+        streamConfig
+      );
+    }
+
+    console.log(
+      `  Cross-provider summaries: ${spies.onSummarizeCompleteSpy.mock.calls.length}`
+    );
+
+    assertSummarizationEvents(spies);
+    const completePayload = spies.onSummarizeCompleteSpy.mock
+      .calls[0][0] as t.SummarizeCompleteEvent;
+
+    // The summary should have been generated by OpenAI even though agent is Anthropic
+    expect(completePayload.summary.provider).toBe(Providers.OPENAI);
+    expect(completePayload.summary.model).toBe('gpt-4.1-mini');
+    assertSummaryRunStep(spies, completePayload.summary.text);
+
+    // Token accounting: summary tokenCount bounds
+    expect(completePayload.summary.tokenCount).toBeGreaterThan(10);
+    expect(completePayload.summary.tokenCount).toBeLessThan(1200);
+
+    // Token accounting: collectedUsage from the post-summary model call
+    const validUsage = collectedUsage.filter(
+      (u: Partial<UsageMetadata>) =>
+        u.input_tokens != null && u.input_tokens > 0
+    );
+    expect(validUsage.length).toBeGreaterThan(0);
+
+    console.log(
+      `  Cross-provider summary (${completePayload.summary.text.length} chars): "${completePayload.summary.text.substring(0, 200)}…"`
+    );
+  });
+
+  test('extended thinking: multi-turn with reasoning triggers summarization and grounds token accounting', async () => {
+    const spies = createSpies();
+    let collectedUsage: UsageMetadata[] = [];
+    const conversationHistory: BaseMessage[] = [];
+    const tokenCounter = await createTokenCounter();
+
+    const resetAggregator = (): {
+      contentParts: t.MessageContentComplex[];
+      aggregateContent: t.ContentAggregator;
+    } => {
+      collectedUsage = [];
+      const { contentParts: cp, aggregateContent: ac } =
+        createContentAggregator();
+      return {
+        contentParts: cp as t.MessageContentComplex[],
+        aggregateContent: ac,
+      };
+    };
+
+    const createRun = async (
+      maxTokens = 2000
+    ): Promise<{
+      run: Run<t.IState>;
+      contentParts: t.MessageContentComplex[];
+    }> => {
+      const { contentParts, aggregateContent } = resetAggregator();
+      const indexTokenCountMap = buildIndexTokenCountMap(
+        conversationHistory,
+        tokenCounter
+      );
+      const run = await createSummarizationRun({
+        agentProvider,
+        summarizationProvider: Providers.ANTHROPIC,
+        summarizationModel: 'claude-3-5-haiku-latest',
+        maxContextTokens: maxTokens,
+        instructions: [
+          'You are a math reasoning tutor who thinks step by step.',
+          'You MUST use the calculator tool for ALL computations.',
+          'After each calculation, briefly explain the reasoning.',
+        ].join(' '),
+        collectedUsage,
+        aggregateContent,
+        spies,
+        tokenCounter,
+        indexTokenCountMap,
+        llmConfigOverride: {
+          model: 'claude-sonnet-4-5',
+          thinking: {
+            type: 'enabled',
+            budget_tokens: 4000,
+          },
+        },
+      });
+      return { run, contentParts };
+    };
+
+    // Turn 1: reasoning-heavy problem
+    let { run, contentParts } = await createRun();
+    await runTurn(
+      { run, conversationHistory },
+      'What is 7! (7 factorial)? Use the calculator. Think through the problem step by step.',
+      streamConfig
+    );
+    logTurn('T1-think', conversationHistory, `parts=${contentParts.length}`);
+
+    // Validate Turn 1 usage includes both input and output tokens
+    const t1Usage = collectedUsage.filter(
+      (u: Partial<UsageMetadata>) =>
+        u.input_tokens != null && u.input_tokens > 0
+    );
+    expect(t1Usage.length).toBeGreaterThan(0);
+    const t1Last = t1Usage[t1Usage.length - 1];
+    expect(t1Last.output_tokens).toBeGreaterThan(0);
+    console.log(
+      `  T1 usage — input: ${t1Last.input_tokens}, output: ${t1Last.output_tokens}` +
+        (t1Last.input_token_details?.cache_read != null
+          ? `, cache_read: ${t1Last.input_token_details.cache_read}`
+          : '')
+    );
+
+    // Turn 2: compound reasoning
+    ({ run, contentParts } = await createRun());
+    await runTurn(
+      { run, conversationHistory },
+      'Now take that result (5040) and compute its square root, then multiply by pi (use 3.14159). Calculator for each step.',
+      streamConfig
+    );
+    logTurn('T2-think', conversationHistory, `parts=${contentParts.length}`);
+
+    // Turn 3: more work to inflate context
+    ({ run, contentParts } = await createRun());
+    await runTurn(
+      { run, conversationHistory },
+      'Calculate the sum of the first 10 Fibonacci numbers using the calculator: 1+1+2+3+5+8+13+21+34+55. Then divide by 10.',
+      streamConfig
+    );
+    logTurn('T3-think', conversationHistory, `parts=${contentParts.length}`);
+
+    // Turn 4: tighter context to trigger summarization
+    ({ run, contentParts } = await createRun(1500));
+    await runTurn(
+      { run, conversationHistory },
+      'What is 2^10? Calculator. Also list all results from before.',
+      streamConfig
+    );
+    logTurn('T4-think', conversationHistory);
+
+    // Turn 5: squeeze harder if needed
+    if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
+      ({ run, contentParts } = await createRun(1000));
+      await runTurn(
+        { run, conversationHistory },
+        'Compute 999 * 999 with calculator.',
+        streamConfig
+      );
+      logTurn('T5-think', conversationHistory);
+    }
+
+    console.log(
+      `  Thinking summarize events — start: ${spies.onSummarizeStartSpy.mock.calls.length}, complete: ${spies.onSummarizeCompleteSpy.mock.calls.length}`
+    );
+
+    // Assert summarization fired
+    const { completePayload } = assertSummarizationEvents(spies);
+    assertSummaryRunStep(spies, completePayload.summary.text);
+
+    // Token accounting: summary tokenCount bounds
+    expect(completePayload.summary.tokenCount).toBeGreaterThan(10);
+    expect(completePayload.summary.tokenCount).toBeLessThan(2000);
+
+    // Token accounting: collectedUsage must have valid entries across all turns
+    const allValidUsage = collectedUsage.filter(
+      (u: Partial<UsageMetadata>) =>
+        u.input_tokens != null &&
+        u.input_tokens > 0 &&
+        u.output_tokens != null &&
+        u.output_tokens > 0
+    );
+    expect(allValidUsage.length).toBeGreaterThan(0);
+
+    // Validate that usage has reasonable token counts (thinking adds tokens)
+    const lastUsage = allValidUsage[allValidUsage.length - 1];
+    expect(lastUsage.input_tokens).toBeGreaterThan(0);
+    expect(lastUsage.output_tokens).toBeGreaterThan(0);
+
+    console.log(
+      `  Thinking usage samples: ${allValidUsage.length} valid entries`
+    );
+    console.log(
+      `  Last usage — input: ${lastUsage.input_tokens}, output: ${lastUsage.output_tokens}`
+    );
+    if (lastUsage.input_token_details?.cache_read != null) {
+      console.log(
+        `  Cache read: ${lastUsage.input_token_details.cache_read}, cache creation: ${lastUsage.input_token_details.cache_creation ?? 0}`
+      );
+    }
+
+    // Post-summary continuation should work with thinking enabled
+    ({ run } = await createRun(2000));
+    const postSumResult = await runTurn(
+      { run, conversationHistory },
+      'What is 100 / 4? Calculator please.',
+      streamConfig
+    );
+    expect(postSumResult).toBeDefined();
+    logTurn('Post-sum-think', conversationHistory);
+
+    // Post-summary usage must also be valid
+    const postSumUsage = collectedUsage.filter(
+      (u: Partial<UsageMetadata>) =>
+        u.input_tokens != null && u.input_tokens > 0
+    );
+    expect(postSumUsage.length).toBeGreaterThan(0);
+
+    console.log(
+      `  Thinking summary (${completePayload.summary.text.length} chars): "${completePayload.summary.text.substring(0, 250)}…"`
+    );
+    console.log(`  Final messages: ${conversationHistory.length}`);
+  });
+
+  test('count_tokens API: local tokenCounter vs Anthropic actual token count', async () => {
+    const Anthropic = (await import('@anthropic-ai/sdk')).default;
+    const client = new Anthropic();
+    const tokenCounter = await createTokenCounter();
+
+    const testMessages: Array<{
+      role: 'user' | 'assistant';
+      lcMessage: BaseMessage;
+      content: string;
+    }> = [
+      {
+        role: 'user',
+        lcMessage: new HumanMessage(
+          'What is 12345 * 6789? Please compute this using the calculator tool and explain the result.'
+        ),
+        content:
+          'What is 12345 * 6789? Please compute this using the calculator tool and explain the result.',
+      },
+      {
+        role: 'assistant',
+        lcMessage: new AIMessage(
+          'The result of 12345 multiplied by 6789 is 83,810,205. This is computed by multiplying each digit and carrying over.'
+        ),
+        content:
+          'The result of 12345 multiplied by 6789 is 83,810,205. This is computed by multiplying each digit and carrying over.',
+      },
+      {
+        role: 'user',
+        lcMessage: new HumanMessage(
+          'Now divide that by 137 and tell me the quotient.'
+        ),
+        content: 'Now divide that by 137 and tell me the quotient.',
+      },
+      {
+        role: 'assistant',
+        lcMessage: new AIMessage(
+          '83,810,205 divided by 137 equals approximately 611,752.59.'
+        ),
+        content: '83,810,205 divided by 137 equals approximately 611,752.59.',
+      },
+    ];
+
+    const systemPrompt =
+      'You are an expert math tutor. Use the calculator tool for ALL computations.';
+
+    const anthropicCount = await client.messages.countTokens({
+      model: 'claude-3-5-haiku-latest',
+      system: systemPrompt,
+      messages: testMessages.map((m) => ({ role: m.role, content: m.content })),
+    });
+
+    let localTotal = tokenCounter(new SystemMessage(systemPrompt));
+    for (const m of testMessages) {
+      localTotal += tokenCounter(m.lcMessage);
+    }
+
+    const anthropicTokens = anthropicCount.input_tokens;
+    const drift = Math.abs(anthropicTokens - localTotal);
+    const driftPct = (drift / anthropicTokens) * 100;
+
+    console.log(`  Anthropic count_tokens API: ${anthropicTokens} tokens`);
+    console.log(`  Local tiktoken estimate:    ${localTotal} tokens`);
+    console.log(`  Drift: ${drift} tokens (${driftPct.toFixed(1)}%)`);
+
+    expect(anthropicTokens).toBeGreaterThan(0);
+    expect(localTotal).toBeGreaterThan(0);
+    expect(driftPct).toBeLessThan(30);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Bedrock Summarization Tests
+// ---------------------------------------------------------------------------
+
+const requiredBedrockEnv = [
+  'BEDROCK_AWS_REGION',
+  'BEDROCK_AWS_ACCESS_KEY_ID',
+  'BEDROCK_AWS_SECRET_ACCESS_KEY',
+];
+const hasBedrock = requiredBedrockEnv.every((k) => process.env[k] != null);
+
+(hasBedrock ? describe : describe.skip)('Bedrock Summarization E2E', () => {
+  jest.setTimeout(180_000);
+
+  const agentProvider = Providers.BEDROCK;
+  const streamConfig = {
+    configurable: { thread_id: 'bedrock-sum-e2e' },
+    streamMode: 'values',
+    version: 'v2' as const,
+  };
+
+  test('multi-turn tool calls trigger summarization with Bedrock agent', async () => {
+    const spies = createSpies();
+    let collectedUsage: UsageMetadata[] = [];
+    const conversationHistory: BaseMessage[] = [];
+    const tokenCounter = await createTokenCounter();
+
+    const createRun = async (maxTokens = 1500): Promise<Run<t.IState>> => {
+      collectedUsage = [];
+      const { aggregateContent } = createContentAggregator();
+      const indexTokenCountMap = buildIndexTokenCountMap(
+        conversationHistory,
+        tokenCounter
+      );
+      return createSummarizationRun({
+        agentProvider,
+        summarizationProvider: Providers.BEDROCK,
+        maxContextTokens: maxTokens,
+        instructions:
+          'You are a precise math assistant. Use the calculator tool for every computation. Be brief.',
+        collectedUsage,
+        aggregateContent,
+        spies,
+        tokenCounter,
+        indexTokenCountMap,
+      });
+    };
+
+    let run = await createRun();
+    await runTurn(
+      { run, conversationHistory },
+      'Hello. Please compute 987 * 654 using the calculator.',
+      streamConfig
+    );
+    logTurn('T1', conversationHistory);
+
+    run = await createRun();
+    await runTurn(
+      { run, conversationHistory },
+      'Now divide 645498 by 123. Use calculator.',
+      streamConfig
+    );
+    logTurn('T2', conversationHistory);
+
+    run = await createRun();
+    await runTurn(
+      { run, conversationHistory },
+      'Compute sqrt(5248.764) with the calculator. Then multiply the result by 100.',
+      streamConfig
+    );
+    logTurn('T3', conversationHistory);
+
+    run = await createRun(1200);
+    await runTurn(
+      { run, conversationHistory },
+      'Calculate 2^16 and 3^10 using calculator for each.',
+      streamConfig
+    );
+    logTurn('T4', conversationHistory);
+
+    run = await createRun(1000);
+    await runTurn(
+      { run, conversationHistory },
+      'What is 59049 + 65536? Calculator. Also tell me what we calculated before.',
+      streamConfig
+    );
+    logTurn('T5', conversationHistory);
+
+    if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
+      run = await createRun(800);
+      await runTurn(
+        { run, conversationHistory },
+        'Calculate 111111 * 111111 with calculator.',
+        streamConfig
+      );
+      logTurn('T6', conversationHistory);
+    }
+
+    console.log(
+      `  Bedrock summarize events — start: ${spies.onSummarizeStartSpy.mock.calls.length}, complete: ${spies.onSummarizeCompleteSpy.mock.calls.length}`
+    );
+
+    const { completePayload } = assertSummarizationEvents(spies);
+    assertSummaryRunStep(spies, completePayload.summary.text);
+    expect(spies.onMessageDeltaSpy).toHaveBeenCalled();
+
+    // Token accounting: summary tokenCount bounds
+    expect(completePayload.summary.tokenCount).toBeGreaterThan(10);
+    expect(completePayload.summary.tokenCount).toBeLessThan(1500);
+
+    // Token accounting: collectedUsage from the post-summary model call
+    const validUsage = collectedUsage.filter(
+      (u: Partial<UsageMetadata>) =>
+        u.input_tokens != null && u.input_tokens > 0
+    );
+    expect(validUsage.length).toBeGreaterThan(0);
+    const lastUsage = validUsage[validUsage.length - 1];
+    expect(lastUsage.output_tokens).toBeGreaterThan(0);
+    console.log(
+      `  Bedrock post-summary usage — input: ${lastUsage.input_tokens}, output: ${lastUsage.output_tokens}`
+    );
+
+    console.log(
+      `  Bedrock summary: "${completePayload.summary.text.substring(0, 250)}…"`
+    );
+
+    // Post-summary turn should work cleanly
+    run = await createRun(1500);
+    const postSumResult = await runTurn(
+      { run, conversationHistory },
+      'Give me a brief list of all results we computed.',
+      streamConfig
+    );
+    expect(postSumResult).toBeDefined();
+    logTurn('Post-sum', conversationHistory);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// OpenAI Summarization Tests
+// ---------------------------------------------------------------------------
+
+const hasOpenAI = process.env.OPENAI_API_KEY != null;
+(hasOpenAI ? describe : describe.skip)('OpenAI Summarization E2E', () => {
+  jest.setTimeout(120_000);
+
+  const agentProvider = Providers.OPENAI;
+  const streamConfig = {
+    configurable: { thread_id: 'openai-sum-e2e' },
+    streamMode: 'values',
+    version: 'v2' as const,
+  };
+
+  test('multi-turn with calculator triggers summarization and continues', async () => {
+    const spies = createSpies();
+    let collectedUsage: UsageMetadata[] = [];
+    const conversationHistory: BaseMessage[] = [];
+    let latestContentParts: t.MessageContentComplex[] = [];
+    const tokenCounter = await createTokenCounter();
+
+    const createRun = async (maxTokens = 1200): Promise<Run<t.IState>> => {
+      collectedUsage = [];
+      const { contentParts, aggregateContent } = createContentAggregator();
+      latestContentParts = contentParts as t.MessageContentComplex[];
+      const indexTokenCountMap = buildIndexTokenCountMap(
+        conversationHistory,
+        tokenCounter
+      );
+      return createSummarizationRun({
+        agentProvider,
+        summarizationProvider: Providers.OPENAI,
+        summarizationModel: 'gpt-4.1-mini',
+        maxContextTokens: maxTokens,
+        instructions:
+          'You are a helpful math tutor. Use the calculator tool for ALL computations. Keep responses concise.',
+        collectedUsage,
+        aggregateContent,
+        spies,
+        tokenCounter,
+        indexTokenCountMap,
+      });
+    };
+
+    let run = await createRun();
+    await runTurn(
+      { run, conversationHistory },
+      'What is 1234 * 5678? Use the calculator.',
+      streamConfig
+    );
+    logTurn('T1', conversationHistory);
+
+    run = await createRun();
+    await runTurn(
+      { run, conversationHistory },
+      'Now calculate sqrt(7006652). Use the calculator.',
+      streamConfig
+    );
+    logTurn('T2', conversationHistory);
+
+    run = await createRun();
+    await runTurn(
+      { run, conversationHistory },
+      'Compute 99 * 101, then 2^15, using calculator for each.',
+      streamConfig
+    );
+    logTurn('T3', conversationHistory);
+
+    run = await createRun(1000);
+    await runTurn(
+      { run, conversationHistory },
+      'What is 314159 * 271828? Calculator please. Remind me of prior results too.',
+      streamConfig
+    );
+    logTurn('T4', conversationHistory);
+
+    if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
+      run = await createRun(800);
+      await runTurn(
+        { run, conversationHistory },
+        'Calculate 999999 / 7 with calculator.',
+        streamConfig
+      );
+      logTurn('T5', conversationHistory);
+    }
+
+    console.log(
+      `  OpenAI summarize events — start: ${spies.onSummarizeStartSpy.mock.calls.length}, complete: ${spies.onSummarizeCompleteSpy.mock.calls.length}`
+    );
+
+    const { completePayload } = assertSummarizationEvents(spies);
+    assertSummaryRunStep(spies, completePayload.summary.text);
+
+    // Token accounting: summary tokenCount bounds
+    expect(completePayload.summary.tokenCount).toBeGreaterThan(10);
+    expect(completePayload.summary.tokenCount).toBeLessThan(1200);
+
+    // Token accounting: collectedUsage from the post-summary model call
+    const validUsagePrePostSum = collectedUsage.filter(
+      (u: Partial<UsageMetadata>) =>
+        u.input_tokens != null && u.input_tokens > 0
+    );
+    expect(validUsagePrePostSum.length).toBeGreaterThan(0);
+
+    // Verify tool calls still work after summarization
+    run = await createRun(1500);
+    await runTurn(
+      { run, conversationHistory },
+      'One more: 123 + 456 + 789. Calculator.',
+      streamConfig
+    );
+    const hasPostSumCalc = latestContentParts.some(
+      (p) =>
+        p.type === ContentTypes.TOOL_CALL &&
+        (p as t.ToolCallContent).tool_call?.name === 'calculator'
+    );
+    expect(hasPostSumCalc).toBe(true);
+
+    // Token accounting: post-summary usage must have valid tokens
+    const postSumUsage = collectedUsage.filter(
+      (u: Partial<UsageMetadata>) =>
+        u.input_tokens != null && u.input_tokens > 0
+    );
+    expect(postSumUsage.length).toBeGreaterThan(0);
+    const lastUsage = postSumUsage[postSumUsage.length - 1];
+    expect(lastUsage.output_tokens).toBeGreaterThan(0);
+    console.log(
+      `  OpenAI post-summary usage — input: ${lastUsage.input_tokens}, output: ${lastUsage.output_tokens}`
+    );
+
+    expect(spies.onMessageDeltaSpy).toHaveBeenCalled();
+    console.log(
+      `  OpenAI summary: "${completePayload.summary.text.substring(0, 200)}…"`
+    );
+    console.log(`  Final messages: ${conversationHistory.length}`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cross-run lifecycle integration test (no API keys required)
+// ---------------------------------------------------------------------------
+
+describe('Cross-run summary lifecycle (no API keys)', () => {
+  jest.setTimeout(60_000);
+
+  const KNOWN_SUMMARY =
+    'User asked about math: 2+2=4 and 3*5=15. Key context preserved.';
+  const INSTRUCTIONS = 'You are a helpful math tutor. Be concise.';
+  const streamConfig = {
+    configurable: { thread_id: 'cross-run-lifecycle' },
+    streamMode: 'values',
+    version: 'v2' as const,
+  };
+
+  let getChatModelClassSpy: jest.SpyInstance;
+  const originalGetChatModelClass = providers.getChatModelClass;
+
+  beforeEach(() => {
+    getChatModelClassSpy = jest
+      .spyOn(providers, 'getChatModelClass')
+      .mockImplementation(((provider: Providers) => {
+        if (provider === Providers.OPENAI) {
+          return class extends FakeListChatModel {
+            constructor(_options: any) {
+              super({ responses: [KNOWN_SUMMARY] });
+            }
+          } as any;
+        }
+        return originalGetChatModelClass(provider);
+      }) as typeof providers.getChatModelClass);
+  });
+
+  afterEach(() => {
+    getChatModelClassSpy.mockRestore();
+  });
+
+  test('full lifecycle: summarize → formatAgentMessages → new Run with correct indexTokenCountMap', async () => {
+    const spies = createSpies();
+    const conversationHistory: BaseMessage[] = [];
+    const tokenCounter = await createTokenCounter();
+
+    const createRun = async (maxTokens: number): Promise<Run<t.IState>> => {
+      const { aggregateContent } = createContentAggregator();
+      const indexTokenCountMap = buildIndexTokenCountMap(
+        conversationHistory,
+        tokenCounter
+      );
+      const run = await Run.create<t.IState>({
+        runId: `cross-run-${Date.now()}`,
+        graphConfig: {
+          type: 'standard',
+          llmConfig: getLLMConfig(Providers.OPENAI),
+          instructions: INSTRUCTIONS,
+          maxContextTokens: maxTokens,
+          summarizationEnabled: true,
+          summarizationConfig: {
+            enabled: true,
+            provider: Providers.OPENAI,
+          },
+        },
+        returnContent: true,
+        customHandlers: {
+          [GraphEvents.ON_RUN_STEP]: {
+            handle: (_event: string, data: t.StreamEventData): void => {
+              spies.onRunStepSpy(_event, data);
+              aggregateContent({
+                event: GraphEvents.ON_RUN_STEP,
+                data: data as t.RunStep,
+              });
+            },
+          },
+          [GraphEvents.ON_SUMMARIZE_START]: {
+            handle: (_event: string, data: t.StreamEventData): void => {
+              spies.onSummarizeStartSpy(data);
+            },
+          },
+          [GraphEvents.ON_SUMMARIZE_COMPLETE]: {
+            handle: (_event: string, data: t.StreamEventData): void => {
+              spies.onSummarizeCompleteSpy(data);
+            },
+          },
+        },
+        tokenCounter,
+        indexTokenCountMap,
+      });
+      return run;
+    };
+
+    // --- Turn 1: longer exchange to build up token budget ---
+    let run = await createRun(4000);
+    run.Graph?.overrideTestModel(
+      [
+        'The answer to 2+2 is 4. This is a basic arithmetic operation involving the addition of two integers. Addition is one of the four fundamental operations in mathematics alongside subtraction, multiplication, and division.',
+      ],
+      1
+    );
+    await runTurn(
+      { run, conversationHistory },
+      'Hello! I have several math questions for you today. Let us start with the basics. What is 2+2? Please provide a detailed explanation of the arithmetic.',
+      streamConfig
+    );
+    logTurn('T1', conversationHistory);
+    expect(conversationHistory.length).toBeGreaterThanOrEqual(2);
+
+    // --- Turn 2: build up more conversation ---
+    run = await createRun(4000);
+    run.Graph?.overrideTestModel(
+      [
+        'The result of 3 multiplied by 5 is 15. Multiplication can be thought of as repeated addition: 3+3+3+3+3 equals 15. This is another fundamental arithmetic operation that forms the basis of more advanced mathematical concepts.',
+      ],
+      1
+    );
+    await runTurn(
+      { run, conversationHistory },
+      'Great explanation! Now let us move on to multiplication. Can you compute 3 times 5 and explain the concept of multiplication as repeated addition in detail?',
+      streamConfig
+    );
+    logTurn('T2', conversationHistory);
+    expect(conversationHistory.length).toBeGreaterThanOrEqual(4);
+
+    // --- Turn 3: very tight context to force pruning and summarization ---
+    run = await createRun(50);
+    run.Graph?.overrideTestModel(
+      ['Got it, continuing with the summary context.'],
+      1
+    );
+    await runTurn(
+      { run, conversationHistory },
+      'Now summarize everything we discussed.',
+      streamConfig
+    );
+    logTurn('T3', conversationHistory);
+
+    console.log(
+      `  Lifecycle events — start: ${spies.onSummarizeStartSpy.mock.calls.length}, complete: ${spies.onSummarizeCompleteSpy.mock.calls.length}`
+    );
+
+    // --- Assert summarization fired ---
+    expect(spies.onSummarizeStartSpy).toHaveBeenCalled();
+    expect(spies.onSummarizeCompleteSpy).toHaveBeenCalled();
+
+    const completePayload = spies.onSummarizeCompleteSpy.mock
+      .calls[0][0] as t.SummarizeCompleteEvent;
+    expect(completePayload.summary.text).toBe(KNOWN_SUMMARY);
+    expect(completePayload.summary.type).toBe(ContentTypes.SUMMARY);
+    expect(completePayload.summary.tokenCount).toBeGreaterThan(0);
+
+    const expectedTokenCount = tokenCounter(new SystemMessage(KNOWN_SUMMARY));
+    expect(completePayload.summary.tokenCount).toBe(expectedTokenCount);
+
+    const summaryBlock = completePayload.summary;
+
+    // --- Simulate cross-run persistence: build a TPayload as the host would store it ---
+    const persistedPayload: t.TPayload = [
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.SUMMARY,
+            text: summaryBlock.text,
+            tokenCount: summaryBlock.tokenCount,
+          } as any,
+        ],
+      },
+      {
+        role: 'user',
+        content: 'Now summarize everything we discussed so far.',
+      },
+      {
+        role: 'assistant',
+        content: 'Got it, continuing with the summary context.',
+      },
+    ];
+
+    const persistedTokenMap: Record<number, number> = {
+      0: summaryBlock.tokenCount,
+      1: tokenCounter(
+        new HumanMessage('Now summarize everything we discussed so far.')
+      ),
+      2: tokenCounter(
+        new AIMessage('Got it, continuing with the summary context.')
+      ),
+    };
+
+    // --- formatAgentMessages: convert persisted payload for next Run ---
+    const formatted = formatAgentMessages(persistedPayload, persistedTokenMap);
+
+    expect(formatted.messages[0].constructor.name).toBe('SystemMessage');
+    expect(formatted.messages[0].content).toBe(KNOWN_SUMMARY);
+    expect(formatted.indexTokenCountMap?.[0]).toBe(summaryBlock.tokenCount);
+
+    const formattedMap = (formatted.indexTokenCountMap || {}) as Record<
+      number,
+      number
+    >;
+    const formattedTotal = Object.values(formattedMap).reduce(
+      (sum: number, v: number) => sum + v,
+      0
+    );
+    const expectedTotal =
+      summaryBlock.tokenCount + persistedTokenMap[1] + persistedTokenMap[2];
+    expect(formattedTotal).toBe(expectedTotal);
+
+    console.log(
+      `  Formatted: ${formatted.messages.length} msgs, tokenMap total=${formattedTotal}, summary@0=${formatted.indexTokenCountMap?.[0]}`
+    );
+
+    // --- Turn 4: new Run with formatted messages and updated indexTokenCountMap ---
+    const formattedTokenMapAsStrings: Record<string, number> = {};
+    for (const [k, v] of Object.entries(formattedMap)) {
+      formattedTokenMapAsStrings[String(k)] = v as number;
+    }
+
+    const run4 = await Run.create<t.IState>({
+      runId: `cross-run-lifecycle-t4-${Date.now()}`,
+      graphConfig: {
+        type: 'standard',
+        llmConfig: getLLMConfig(Providers.OPENAI),
+        instructions: INSTRUCTIONS,
+        maxContextTokens: 2000,
+        summarizationEnabled: true,
+        summarizationConfig: {
+          enabled: true,
+          provider: Providers.OPENAI,
+        },
+      },
+      returnContent: true,
+      customHandlers: buildHandlers(
+        [],
+        createContentAggregator().aggregateContent,
+        createSpies()
+      ),
+      tokenCounter,
+      indexTokenCountMap: formattedTokenMapAsStrings,
+    });
+
+    run4.Graph?.overrideTestModel(['The square root of 16 is 4.'], 1);
+
+    const t4Messages = [
+      ...formatted.messages,
+      new HumanMessage('What is sqrt(16)?'),
+    ];
+    const result = await run4.processStream(
+      { messages: t4Messages },
+      streamConfig as any
+    );
+
+    expect(result).toBeDefined();
+
+    const t4RunMessages = run4.getRunMessages();
+    expect(t4RunMessages).toBeDefined();
+    expect(t4RunMessages!.length).toBeGreaterThan(0);
+
+    console.log(
+      `  Turn 4 produced ${t4RunMessages!.length} messages — lifecycle complete`
+    );
+  });
+});

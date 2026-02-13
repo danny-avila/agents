@@ -11,7 +11,10 @@ import {
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { UsageMetadata } from '@langchain/core/messages';
 import type * as t from '@/types';
-import { createPruneMessages } from '@/messages/prune';
+import {
+  repairOrphanedToolMessages,
+  createPruneMessages,
+} from '@/messages/prune';
 import { getLLMConfig } from '@/utils/llmConfig';
 import { Providers } from '@/common';
 import { Run } from '@/run';
@@ -410,6 +413,8 @@ describe('Prune Messages Tests', () => {
 
       expect(result.context.length).toBe(3);
       expect(result.context).toEqual(messages);
+      expect(result.messagesToRefine).toEqual([]);
+      expect(result.remainingContextTokens).toBeGreaterThan(0);
     });
 
     it('should prune messages when over token limit', () => {
@@ -445,6 +450,9 @@ describe('Prune Messages Tests', () => {
       expect(result.context[0]).toBe(messages[0]); // System message
       expect(result.context[1]).toBe(messages[3]); // Message 2
       expect(result.context[2]).toBe(messages[4]); // Response 2
+      expect(Array.isArray(result.messagesToRefine)).toBe(true);
+      expect(result.messagesToRefine?.length).toBe(2);
+      expect(typeof result.remainingContextTokens).toBe('number');
     });
 
     it('should respect startType parameter', () => {
@@ -533,6 +541,53 @@ describe('Prune Messages Tests', () => {
   });
 
   describe('Tool Message Handling', () => {
+    it('should drop orphan tool messages that no longer have matching AI tool calls', () => {
+      const tokenCounter = createTestTokenCounter();
+      const context = [
+        new SystemMessage('System instruction'),
+        new ToolMessage({
+          content: 'Orphan result',
+          tool_call_id: 'tool-orphan',
+        }),
+        new AIMessage({
+          content: [
+            { type: 'text', text: 'I will call a tool now' },
+            {
+              type: 'tool_use',
+              id: 'tool-valid',
+              name: 'read_file',
+              input: '{"path":"README.md"}',
+            },
+          ],
+        }),
+        new ToolMessage({
+          content: 'Valid result',
+          tool_call_id: 'tool-valid',
+        }),
+      ];
+
+      const indexTokenCountMap = {
+        0: tokenCounter(context[0]),
+        1: tokenCounter(context[1]),
+        2: tokenCounter(context[2]),
+        3: tokenCounter(context[3]),
+      };
+
+      const repaired = repairOrphanedToolMessages({
+        context,
+        allMessages: context,
+        tokenCounter,
+        indexTokenCountMap,
+      });
+
+      expect(repaired.context).toHaveLength(3);
+      expect(repaired.context[0]).toBe(context[0]);
+      expect(repaired.context[1]).toBe(context[2]);
+      expect(repaired.context[2]).toBe(context[3]);
+      expect(repaired.droppedOrphanCount).toBe(1);
+      expect(repaired.reclaimedTokens).toBe(indexTokenCountMap[1]);
+    });
+
     it('should ensure context does not start with a tool message by finding an AI message', () => {
       const tokenCounter = createTestTokenCounter();
       const messages = [
