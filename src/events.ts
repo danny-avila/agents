@@ -1,15 +1,15 @@
 /* eslint-disable no-console */
 // src/events.ts
 import type {
-  ToolMessage,
-  UsageMetadata,
   BaseMessageFields,
+  UsageMetadata,
+  ToolMessage,
 } from '@langchain/core/messages';
 import type { MultiAgentGraph, StandardGraph } from '@/graphs';
 import type { Logger } from 'winston';
 import type * as t from '@/types';
+import { Constants, GraphNodeKeys, Providers } from '@/common';
 import { handleToolCalls } from '@/tools/handlers';
-import { Constants, Providers } from '@/common';
 
 export class HandlerRegistry {
   private handlers: Map<string, t.EventHandler> = new Map();
@@ -40,6 +40,11 @@ export class ModelEndHandler implements t.EventHandler {
   ): Promise<void> {
     if (!graph || !metadata) {
       console.warn(`Graph or metadata not found in ${event} event`);
+      return;
+    }
+
+    const currentNode = metadata.langgraph_node as string | undefined;
+    if (currentNode?.startsWith(GraphNodeKeys.SUMMARIZE) === true) {
       return;
     }
 

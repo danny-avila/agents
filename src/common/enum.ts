@@ -21,6 +21,12 @@ export enum GraphEvents {
   ON_REASONING_DELTA = 'on_reasoning_delta',
   /** [Custom] Request to execute tools - dispatched by ToolNode, handled by host */
   ON_TOOL_EXECUTE = 'on_tool_execute',
+  /** [Custom] Emitted when the summarize node begins generating a summary */
+  ON_SUMMARIZE_START = 'on_summarize_start',
+  /** [Custom] Delta event carrying the completed summary content */
+  ON_SUMMARIZE_DELTA = 'on_summarize_delta',
+  /** [Custom] Emitted when the summarize node completes with the final summary */
+  ON_SUMMARIZE_COMPLETE = 'on_summarize_complete',
 
   /* Official Events */
 
@@ -90,6 +96,7 @@ export enum Providers {
 export enum GraphNodeKeys {
   TOOLS = 'tools=',
   AGENT = 'agent=',
+  SUMMARIZE = 'summarize=',
   ROUTER = 'router',
   PRE_TOOLS = 'pre_tools',
   POST_TOOLS = 'post_tools',
@@ -123,6 +130,8 @@ export enum ContentTypes {
   REASONING = 'reasoning',
   /** Multi-Agent Switch */
   AGENT_UPDATE = 'agent_update',
+  /** Framework-level conversation summary block */
+  SUMMARY = 'summary',
   /** Bedrock */
   REASONING_CONTENT = 'reasoning_content',
 }
