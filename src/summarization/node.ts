@@ -142,11 +142,35 @@ export function createSummarizeNode({
       if (agentContext.tokenCounter) {
         tokenCount = agentContext.tokenCounter(new SystemMessage(summaryText));
       }
-    } catch {
+    } catch (err) {
+      if (runnableConfig) {
+        const errorMessage =
+          err instanceof Error ? err.message : 'Summarization failed';
+        await safeDispatchCustomEvent(
+          GraphEvents.ON_SUMMARIZE_COMPLETE,
+          {
+            agentId: request.agentId,
+            summary: placeholderSummary,
+            error: errorMessage,
+          } satisfies t.SummarizeCompleteEvent,
+          runnableConfig
+        );
+      }
       return { summarizationRequest: undefined };
     }
 
     if (!summaryText) {
+      if (runnableConfig) {
+        await safeDispatchCustomEvent(
+          GraphEvents.ON_SUMMARIZE_COMPLETE,
+          {
+            agentId: request.agentId,
+            summary: placeholderSummary,
+            error: 'Summarization produced empty output',
+          } satisfies t.SummarizeCompleteEvent,
+          runnableConfig
+        );
+      }
       return { summarizationRequest: undefined };
     }
 
