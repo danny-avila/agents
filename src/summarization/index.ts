@@ -1,5 +1,17 @@
 import type { SummarizationTrigger } from '@/types';
 
+/**
+ * Determines whether summarization should be triggered based on the configured trigger
+ * and current context state.
+ *
+ * Default behavior (no trigger configured): returns `true` whenever messages were pruned.
+ * This is intentional — when an admin enables summarization without specifying a trigger,
+ * summarization fires on any context overflow that causes pruning.
+ *
+ * When a trigger IS configured but required runtime data is missing (e.g., maxContextTokens
+ * unavailable for a token_ratio trigger), returns `false` — we cannot evaluate the condition,
+ * so we do not fire.
+ */
 export function shouldTriggerSummarization(params: {
   trigger?: SummarizationTrigger;
   maxContextTokens?: number;
@@ -17,15 +29,20 @@ export function shouldTriggerSummarization(params: {
   if (messagesToRefineCount <= 0) {
     return false;
   }
+
+  // No trigger configured: default to always summarize when pruning occurs.
   if (!trigger || typeof trigger.type !== 'string') {
     return true;
   }
+
   const triggerValue =
     typeof trigger.value === 'number' && Number.isFinite(trigger.value)
       ? trigger.value
       : undefined;
+
+  // Trigger configured but value is invalid: cannot evaluate, do not fire.
   if (triggerValue == null) {
-    return true;
+    return false;
   }
 
   if (trigger.type === 'token_ratio') {
@@ -39,6 +56,8 @@ export function shouldTriggerSummarization(params: {
         : undefined;
     const effectiveRemainingContextTokens =
       prePruneRemainingContextTokens ?? remainingContextTokens;
+
+    // Required runtime data missing: cannot evaluate token_ratio, do not fire.
     if (
       maxContextTokens == null ||
       !Number.isFinite(maxContextTokens) ||
@@ -46,7 +65,7 @@ export function shouldTriggerSummarization(params: {
       effectiveRemainingContextTokens == null ||
       !Number.isFinite(effectiveRemainingContextTokens)
     ) {
-      return true;
+      return false;
     }
     const usedRatio = 1 - effectiveRemainingContextTokens / maxContextTokens;
     return usedRatio >= triggerValue;
@@ -63,11 +82,13 @@ export function shouldTriggerSummarization(params: {
         : undefined;
     const effectiveRemainingContextTokens =
       prePruneRemainingContextTokens ?? remainingContextTokens;
+
+    // Required runtime data missing: cannot evaluate remaining_tokens, do not fire.
     if (
       effectiveRemainingContextTokens == null ||
       !Number.isFinite(effectiveRemainingContextTokens)
     ) {
-      return true;
+      return false;
     }
     return effectiveRemainingContextTokens <= triggerValue;
   }
@@ -76,5 +97,6 @@ export function shouldTriggerSummarization(params: {
     return messagesToRefineCount >= triggerValue;
   }
 
-  return true;
+  // Unrecognized trigger type: cannot evaluate, do not fire.
+  return false;
 }
