@@ -53,4 +53,5 @@ export interface SummarizeDeltaEvent {
 export interface SummarizeCompleteEvent {
   agentId: string;
   summary: SummaryContentBlock;
+  error?: string;
 }
