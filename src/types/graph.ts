@@ -23,6 +23,13 @@ import type { Providers, Callback, GraphNodeKeys } from '@/common';
 import type { StandardGraph, MultiAgentGraph } from '@/graphs';
 import type { ClientOptions } from '@/types/llm';
 import type {
+  SummarizationNodeInput,
+  SummarizeCompleteEvent,
+  SummarizationConfig,
+  SummarizeStartEvent,
+  SummarizeDeltaEvent,
+} from '@/types/summarize';
+import type {
   RunStep,
   RunStepDeltaEvent,
   MessageDeltaEvent,
@@ -72,6 +79,15 @@ export type MultiAgentGraphState = BaseGraphState & {
 
 export type IState = BaseGraphState;
 
+export interface AgentLogEvent {
+  level: 'debug' | 'info' | 'warn' | 'error';
+  scope: 'prune' | 'summarize' | 'graph' | 'sanitize' | (string & {});
+  message: string;
+  data?: Record<string, unknown>;
+  runId?: string;
+  agentId?: string;
+}
+
 export interface EventHandler {
   handle(
     event: string,
@@ -82,6 +98,10 @@ export interface EventHandler {
       | RunStepDeltaEvent
       | MessageDeltaEvent
       | ReasoningDeltaEvent
+      | SummarizeStartEvent
+      | SummarizeDeltaEvent
+      | SummarizeCompleteEvent
+      | AgentLogEvent
       | { result: ToolEndEvent },
     metadata?: Record<string, unknown>,
     graph?: StandardGraph | MultiAgentGraph
@@ -144,22 +164,34 @@ export type CompiledMultiAgentWorkflow = CompiledStateGraph<
 export type CompiledAgentWorfklow = CompiledStateGraph<
   {
     messages: BaseMessage[];
+    summarizationRequest?: SummarizationNodeInput;
   },
   {
     messages?: BaseMessage[] | undefined;
+    summarizationRequest?: SummarizationNodeInput | undefined;
   },
-  '__start__' | `agent=${string}` | `tools=${string}`,
+  '__start__' | `agent=${string}` | `tools=${string}` | `summarize=${string}`,
   {
     messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
+    summarizationRequest: BinaryOperatorAggregate<
+      SummarizationNodeInput | undefined,
+      SummarizationNodeInput | undefined
+    >;
   },
   {
     messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
+    summarizationRequest: BinaryOperatorAggregate<
+      SummarizationNodeInput | undefined,
+      SummarizationNodeInput | undefined
+    >;
   },
   StateDefinition,
   {
     [x: `agent=${string}`]: Partial<BaseGraphState>;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     [x: `tools=${string}`]: any;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    [x: `summarize=${string}`]: any;
   }
 >;
 
@@ -314,6 +346,7 @@ export type StandardGraphInput = {
   agents: AgentInputs[];
   tokenCounter?: TokenCounter;
   indexTokenCountMap?: Record<string, number>;
+  calibrationRatio?: number;
 };
 
 export type GraphEdge = {
@@ -391,4 +424,28 @@ export interface AgentInputs {
    * in tool binding without requiring tool_search.
    */
   discoveredTools?: string[];
+  summarizationEnabled?: boolean;
+  summarizationConfig?: SummarizationConfig;
+  /** Cross-run summary from a previous run, forwarded from formatAgentMessages.
+   *  Injected into the system message via AgentContext.buildInstructionsString(). */
+  initialSummary?: { text: string; tokenCount: number };
+  contextPruningConfig?: ContextPruningConfig;
+  maxToolResultChars?: number;
+}
+
+export interface ContextPruningConfig {
+  enabled?: boolean;
+  keepLastAssistants?: number;
+  softTrimRatio?: number;
+  hardClearRatio?: number;
+  minPrunableToolChars?: number;
+  softTrim?: {
+    maxChars?: number;
+    headChars?: number;
+    tailChars?: number;
+  };
+  hardClear?: {
+    enabled?: boolean;
+    placeholder?: string;
+  };
 }

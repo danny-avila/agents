@@ -105,45 +105,6 @@ describe('ensureThinkingBlockInMessages', () => {
       );
     });
 
-    test('should not modify AI message when reasoning_content is not the first block (Bedrock whitespace artifact)', () => {
-      // Bedrock emits a "\n\n" text chunk before the thinking block,
-      // pushing reasoning_content to content[1] instead of content[0].
-      const messages = [
-        new HumanMessage({ content: 'Do something' }),
-        new AIMessage({
-          content: [
-            { type: 'text', text: '\n\n' },
-            {
-              type: ContentTypes.REASONING_CONTENT,
-              reasoningText: { text: 'Let me think about this' },
-            },
-            { type: 'text', text: 'Let me help!' },
-          ],
-          tool_calls: [
-            {
-              id: 'call_bedrock',
-              name: 'some_tool',
-              args: { x: 1 },
-              type: 'tool_call' as const,
-            },
-          ],
-        }),
-        new ToolMessage({
-          content: 'tool result',
-          tool_call_id: 'call_bedrock',
-        }),
-      ];
-
-      const result = ensureThinkingBlockInMessages(messages, Providers.BEDROCK);
-
-      expect(result).toHaveLength(3);
-      expect(result[0]).toBeInstanceOf(HumanMessage);
-      expect(result[1]).toBeInstanceOf(AIMessage);
-      expect(result[2]).toBeInstanceOf(ToolMessage);
-      // The AI message should be preserved, not converted to a HumanMessage
-      expect(result[1].content).toEqual(messages[1].content);
-    });
-
     test('should not convert follow-up tool calls in a thinking-enabled chain (Bedrock multi-step)', () => {
       // Bedrock reasoning models produce reasoning on the first AI response,
       // then subsequent tool calls in the same chain have content: "" with no
@@ -310,6 +271,45 @@ describe('ensureThinkingBlockInMessages', () => {
       // Index 3 should NOT be converted — index 1 has reasoning in additional_kwargs
       expect(result).toHaveLength(5);
       expect(result[3]).toBeInstanceOf(AIMessage);
+    });
+
+    test('should not modify AI message when reasoning_content is not the first block (Bedrock whitespace artifact)', () => {
+      // Bedrock emits a "\n\n" text chunk before the thinking block,
+      // pushing reasoning_content to content[1] instead of content[0].
+      const messages = [
+        new HumanMessage({ content: 'Do something' }),
+        new AIMessage({
+          content: [
+            { type: 'text', text: '\n\n' },
+            {
+              type: ContentTypes.REASONING_CONTENT,
+              reasoningText: { text: 'Let me think about this' },
+            },
+            { type: 'text', text: 'Let me help!' },
+          ],
+          tool_calls: [
+            {
+              id: 'call_bedrock',
+              name: 'some_tool',
+              args: { x: 1 },
+              type: 'tool_call' as const,
+            },
+          ],
+        }),
+        new ToolMessage({
+          content: 'tool result',
+          tool_call_id: 'call_bedrock',
+        }),
+      ];
+
+      const result = ensureThinkingBlockInMessages(messages, Providers.BEDROCK);
+
+      expect(result).toHaveLength(3);
+      expect(result[0]).toBeInstanceOf(HumanMessage);
+      expect(result[1]).toBeInstanceOf(AIMessage);
+      expect(result[2]).toBeInstanceOf(ToolMessage);
+      // The AI message should be preserved, not converted to a HumanMessage
+      expect(result[1].content).toEqual(messages[1].content);
     });
 
     test('should not modify AI message with reasoning block and tool calls', () => {

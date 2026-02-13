@@ -316,9 +316,13 @@ function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
     const contentBlocks: BedrockContentBlock[] = [];
 
     concatenatedBlocks.forEach((block) => {
-      if (block.type === 'text' && (block as { text?: string }).text !== '') {
+      if (block.type === 'text') {
+        const text = (block as { text?: string }).text ?? '';
+        // Skip completely empty text blocks (common in AI messages with tool_use blocks)
+        if (text === '') {
+          return;
+        }
         // Merge whitespace/newlines with previous text blocks to avoid validation errors.
-        const text = (block as { text: string }).text;
         const cleanedText = text.replace(/\n/g, '').trim();
         if (cleanedText === '') {
           if (contentBlocks.length > 0) {

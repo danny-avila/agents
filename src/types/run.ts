@@ -115,6 +115,15 @@ export type RunConfig = {
   returnContent?: boolean;
   tokenCounter?: TokenCounter;
   indexTokenCountMap?: Record<string, number>;
+  /**
+   * Calibration ratio from a previous run's contextMeta.
+   * Seeds the pruner's EMA so new messages are scaled immediately.
+   *
+   * Hosts should persist the value returned by `Run.getCalibrationRatio()`
+   * after each run and pass it back here on subsequent runs for the same
+   * conversation. Without this, the EMA resets to 1 on every new Run instance.
+   */
+  calibrationRatio?: number;
   /** Skip post-stream cleanup (clearHeavyState) — useful for tests that inspect graph state after processStream */
   skipCleanup?: boolean;
 };
@@ -124,6 +133,29 @@ export type ProvidedCallbacks =
   | undefined;
 
 export type TokenCounter = (message: BaseMessage) => number;
+
+/** Structured breakdown of how context token budget is consumed. */
+export type TokenBudgetBreakdown = {
+  /** Total context window budget (maxContextTokens). */
+  maxContextTokens: number;
+  /** Total instruction tokens (system + tools + summary). */
+  instructionTokens: number;
+  /** Tokens from the system message text alone. */
+  systemMessageTokens: number;
+  /** Tokens from tool schema definitions. */
+  toolSchemaTokens: number;
+  /** Tokens from the conversation summary. */
+  summaryTokens: number;
+  /** Number of registered tools. */
+  toolCount: number;
+  /** Number of messages in the conversation. */
+  messageCount: number;
+  /** Total tokens consumed by messages (excluding system). */
+  messageTokens: number;
+  /** Tokens available for messages after instructions. */
+  availableForMessages: number;
+};
+
 export type EventStreamOptions = {
   callbacks?: g.ClientCallbacks;
   keepContent?: boolean;
