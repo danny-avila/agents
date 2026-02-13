@@ -1,4 +1,8 @@
-import { HumanMessage, SystemMessage } from '@langchain/core/messages';
+import {
+  HumanMessage,
+  SystemMessage,
+  AIMessage,
+} from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
@@ -6,6 +10,68 @@ import { getChatModelClass } from '@/llm/providers';
 import { safeDispatchCustomEvent } from '@/utils/events';
 import { ContentTypes, GraphEvents, StepTypes, Providers } from '@/common';
 import type { AgentContext } from '@/agents/AgentContext';
+
+/**
+ * Formats a message for summarization input. Produces human-readable text instead of
+ * raw JSON for structured content like tool calls and tool results.
+ */
+function formatMessageForSummary(msg: BaseMessage): string {
+  const role = msg._getType();
+
+  // Tool result messages: format as "[tool_result: name] → content"
+  if (role === 'tool') {
+    const name = msg.name ?? 'unknown';
+    const content =
+      typeof msg.content === 'string'
+        ? msg.content
+        : JSON.stringify(msg.content);
+    return `[tool_result: ${name}] → ${content}`;
+  }
+
+  // AI messages with tool calls: extract text content and format tool calls readably
+  if (
+    role === 'ai' &&
+    msg instanceof AIMessage &&
+    msg.tool_calls &&
+    msg.tool_calls.length > 0
+  ) {
+    const parts: string[] = [];
+
+    // Extract any text content
+    if (typeof msg.content === 'string') {
+      if (msg.content.trim()) {
+        parts.push(msg.content.trim());
+      }
+    } else if (Array.isArray(msg.content)) {
+      for (const block of msg.content) {
+        if (
+          block != null &&
+          typeof block === 'object' &&
+          'type' in block &&
+          block.type === 'text' &&
+          'text' in block &&
+          typeof block.text === 'string' &&
+          block.text.trim()
+        ) {
+          parts.push(block.text.trim());
+        }
+      }
+    }
+
+    // Format each tool call readably
+    for (const tc of msg.tool_calls) {
+      const argsStr = tc.args ? JSON.stringify(tc.args) : '';
+      parts.push(`[tool_call: ${tc.name}(${argsStr})]`);
+    }
+
+    return `[${role}]: ${parts.join('\n')}`;
+  }
+
+  // All other messages: use content directly
+  const content =
+    typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
+  return `[${role}]: ${content}`;
+}
 
 export const DEFAULT_SUMMARIZATION_PROMPT =
   'You are a summarization assistant. Summarize the following conversation messages concisely, preserving key facts, decisions, and context needed to continue the conversation. Do not include preamble -- output only the summary.';
@@ -113,20 +179,34 @@ export function createSummarizeNode({
     const ChatModelClass = getChatModelClass(provider as Providers);
     const model = new ChatModelClass(clientOptions as never);
 
+    // Check for a prior summary in the kept context (injected by formatAgentMessages on cross-run).
+    // Without this, re-summarization would only cover newly pruned messages, losing all
+    // information from the previous summary.
+    let priorSummaryText = '';
+    if (request.context.length > 0) {
+      const firstContext = request.context[0];
+      if (firstContext._getType() === 'system') {
+        const text =
+          typeof firstContext.content === 'string'
+            ? firstContext.content
+            : JSON.stringify(firstContext.content);
+        if (text.trim().length > 0) {
+          priorSummaryText = text.trim();
+        }
+      }
+    }
+
     const messagesToRefineText = request.messagesToRefine
-      .map((msg) => {
-        const role = msg._getType();
-        const content =
-          typeof msg.content === 'string'
-            ? msg.content
-            : JSON.stringify(msg.content);
-        return `[${role}]: ${content}`;
-      })
+      .map(formatMessageForSummary)
       .join('\n');
+
+    const humanMessageText = priorSummaryText
+      ? `## Prior Summary\n\n${priorSummaryText}\n\n## New Messages to Incorporate\n\n${messagesToRefineText}`
+      : messagesToRefineText;
 
     const messages: BaseMessage[] = [
       new SystemMessage(promptText),
-      new HumanMessage(messagesToRefineText),
+      new HumanMessage(humanMessageText),
     ];
 
     let summaryText = '';
