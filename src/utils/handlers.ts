@@ -97,6 +97,24 @@ export function createHandlers(callbacks?: HandlerCallbacks): {
         callbacks?.onMessageDelta?.(event, data);
       },
     },
+
+    [GraphEvents.ON_SUMMARIZE_DELTA]: {
+      handle: (event: string, data: t.StreamEventData): void => {
+        aggregateContent({
+          event: event as GraphEvents,
+          data: data as t.SummarizeDeltaData,
+        });
+      },
+    },
+
+    [GraphEvents.ON_SUMMARIZE_COMPLETE]: {
+      handle: (event: string, data: t.StreamEventData): void => {
+        aggregateContent({
+          event: event as GraphEvents,
+          data: data as t.SummarizeCompleteEvent,
+        });
+      },
+    },
   };
 
   return {

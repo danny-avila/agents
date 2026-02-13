@@ -20,6 +20,7 @@ import { createTokenCounter, encodingForModel } from '@/utils/tokens';
 import { GraphEvents, Callback, TitleMethod } from '@/common';
 import { MultiAgentGraph } from '@/graphs/MultiAgentGraph';
 import { StandardGraph } from '@/graphs/Graph';
+import { initializeModel } from '@/llm/init';
 import { HandlerRegistry } from '@/events';
 import { isOpenAILike } from '@/utils/llm';
 import { isPresent } from '@/utils/misc';
@@ -42,10 +43,12 @@ export class Run<_T extends t.BaseGraphState> {
   private tokenCounter?: t.TokenCounter;
   private handlerRegistry?: HandlerRegistry;
   private indexTokenCountMap?: Record<string, number>;
+  calibrationRatio: number = 1;
   graphRunnable?: t.CompiledStateWorkflow;
   Graph: StandardGraph | MultiAgentGraph | undefined;
   returnContent: boolean = false;
   private skipCleanup: boolean = false;
+  private _streamResult: t.MessageContentComplex[] | undefined;
 
   private constructor(config: Partial<t.RunConfig>) {
     const runId = config.runId ?? '';
@@ -56,6 +59,9 @@ export class Run<_T extends t.BaseGraphState> {
     this.id = runId;
     this.tokenCounter = config.tokenCounter;
     this.indexTokenCountMap = config.indexTokenCountMap;
+    if (config.calibrationRatio != null && config.calibrationRatio > 0) {
+      this.calibrationRatio = config.calibrationRatio;
+    }
 
     const handlerRegistry = new HandlerRegistry();
 
@@ -133,6 +139,7 @@ export class Run<_T extends t.BaseGraphState> {
       agents: [agentConfig],
       tokenCounter: this.tokenCounter,
       indexTokenCountMap: this.indexTokenCountMap,
+      calibrationRatio: this.calibrationRatio,
     });
     /** Propagate compile options from graph config */
     standardGraph.compileOptions = config.compileOptions;
@@ -151,6 +158,7 @@ export class Run<_T extends t.BaseGraphState> {
       edges,
       tokenCounter: this.tokenCounter,
       indexTokenCountMap: this.indexTokenCountMap,
+      calibrationRatio: this.calibrationRatio,
     });
 
     if (compileOptions != null) {
@@ -185,6 +193,16 @@ export class Run<_T extends t.BaseGraphState> {
   }
 
   /**
+   * Returns the current calibration ratio (EMA of provider-vs-estimate token ratios).
+   * Hosts should persist this value and pass it back as `RunConfig.calibrationRatio`
+   * on the next run for the same conversation so the pruner starts with an accurate
+   * scaling factor instead of the default (1).
+   */
+  getCalibrationRatio(): number {
+    return this.calibrationRatio;
+  }
+
+  /**
    * Creates a custom event callback handler that intercepts custom events
    * and processes them through our handler registry instead of EventStreamCallbackHandler
    */
@@ -196,6 +214,16 @@ export class Run<_T extends t.BaseGraphState> {
       tags?: string[],
       metadata?: Record<string, unknown>
     ): Promise<void> => {
+      // ON_RUN_STEP is dispatched directly via handler registry in
+      // Graph.dispatchRunStep (primary, reliable path).  Skip the
+      // callback-based dispatch to prevent double handling.
+      if (
+        eventName === GraphEvents.ON_RUN_STEP &&
+        this.Graph != null &&
+        this.Graph.handlerDispatchedStepIds.has((data as t.RunStep).id)
+      ) {
+        return;
+      }
       const handler = this.handlerRegistry?.getHandler(eventName);
       if (handler && this.Graph) {
         return await handler.handle(
@@ -217,7 +245,10 @@ export class Run<_T extends t.BaseGraphState> {
 
   async processStream(
     inputs: t.IState,
-    config: Partial<RunnableConfig> & { version: 'v1' | 'v2'; run_id?: string },
+    callerConfig: Partial<RunnableConfig> & {
+      version: 'v1' | 'v2';
+      run_id?: string;
+    },
     streamOptions?: t.EventStreamOptions
   ): Promise<MessageContentComplex[] | undefined> {
     if (this.graphRunnable == null) {
@@ -230,6 +261,16 @@ export class Run<_T extends t.BaseGraphState> {
         'Graph not initialized. Make sure to use Run.create() to instantiate the Run.'
       );
     }
+
+    // Shallow-copy the config so cleanup at the end of the stream does not
+    // mutate the caller's object (e.g. setting configurable to undefined).
+    const config: Partial<RunnableConfig> & {
+      version: 'v1' | 'v2';
+      run_id?: string;
+    } = {
+      ...callerConfig,
+      configurable: { ...callerConfig.configurable },
+    };
 
     this.Graph.resetValues(streamOptions?.keepContent);
 
@@ -293,61 +334,68 @@ export class Run<_T extends t.BaseGraphState> {
       ignoreCustomEvent: true,
     });
 
-    for await (const event of stream) {
-      const { data, metadata, ...info } = event;
+    try {
+      for await (const event of stream) {
+        const { data, metadata, ...info } = event;
 
-      const eventName: t.EventName = info.event;
+        const eventName: t.EventName = info.event;
 
-      /** Skip custom events as they're handled by our callback */
-      if (eventName === GraphEvents.ON_CUSTOM_EVENT) {
-        continue;
-      }
-
-      const handler = this.handlerRegistry?.getHandler(eventName);
-      if (handler) {
-        await handler.handle(eventName, data, metadata, this.Graph);
-      }
-    }
-
-    /**
-     * Break the reference chain that keeps heavy data alive via
-     * LangGraph's internal `__pregel_scratchpad.currentTaskInput` →
-     * `@langchain/core` `RunTree.extra[lc:child_config]` →
-     * Node.js `AsyncLocalStorage` context captured by timers/promises.
-     *
-     * Without this, base64-encoded images/PDFs in message content remain
-     * reachable from lingering `Timeout` handles until GC runs.
-     */
-    if (!this.skipCleanup) {
-      if (
-        (config.configurable as Record<string, unknown> | undefined) != null
-      ) {
-        for (const key of Object.getOwnPropertySymbols(config.configurable)) {
-          const val = config.configurable[key as unknown as string] as
-            | Record<string, unknown>
-            | undefined;
-          if (
-            val != null &&
-            typeof val === 'object' &&
-            'currentTaskInput' in val
-          ) {
-            (val as Record<string, unknown>).currentTaskInput = undefined;
-          }
-          delete config.configurable[key as unknown as string];
+        /** Skip custom events as they're handled by our callback */
+        if (eventName === GraphEvents.ON_CUSTOM_EVENT) {
+          continue;
         }
-        config.configurable = undefined;
+
+        const handler = this.handlerRegistry?.getHandler(eventName);
+        if (handler) {
+          await handler.handle(eventName, data, metadata, this.Graph);
+        }
       }
-      config.callbacks = undefined;
+    } finally {
+      /**
+       * Break the reference chain that keeps heavy data alive via
+       * LangGraph's internal `__pregel_scratchpad.currentTaskInput` →
+       * `@langchain/core` `RunTree.extra[lc:child_config]` →
+       * Node.js `AsyncLocalStorage` context captured by timers/promises.
+       *
+       * Without this, base64-encoded images/PDFs in message content remain
+       * reachable from lingering `Timeout` handles until GC runs.
+       */
+      if (!this.skipCleanup) {
+        if (
+          (config.configurable as Record<string, unknown> | undefined) != null
+        ) {
+          for (const key of Object.getOwnPropertySymbols(config.configurable)) {
+            const val = config.configurable[key as unknown as string] as
+              | Record<string, unknown>
+              | undefined;
+            if (
+              val != null &&
+              typeof val === 'object' &&
+              'currentTaskInput' in val
+            ) {
+              (val as Record<string, unknown>).currentTaskInput = undefined;
+            }
+            delete config.configurable[key as unknown as string];
+          }
+          config.configurable = undefined;
+        }
+        config.callbacks = undefined;
+      }
+
+      const result = this.returnContent
+        ? this.Graph.getContentParts()
+        : undefined;
+
+      this.calibrationRatio = this.Graph.getCalibrationRatio();
+
+      if (!this.skipCleanup) {
+        this.Graph.clearHeavyState();
+      }
+
+      this._streamResult = result;
     }
 
-    const result = this.returnContent
-      ? this.Graph.getContentParts()
-      : undefined;
-
-    if (!this.skipCleanup) {
-      this.Graph.clearHeavyState();
-    }
-    return result;
+    return this._streamResult;
   }
 
   private createSystemCallback<K extends keyof t.ClientCallbacks>(
@@ -422,13 +470,11 @@ export class Run<_T extends t.BaseGraphState> {
       })
       .join('\n');
 
-    const model = this.Graph?.getNewModel({
+    const model = initializeModel({
       provider,
       clientOptions,
-    });
-    if (!model) {
-      return { language: '', title: '' };
-    }
+    }) as t.ChatModelInstance;
+
     if (
       isOpenAILike(provider) &&
       (model instanceof ChatOpenAI || model instanceof AzureChatOpenAI)

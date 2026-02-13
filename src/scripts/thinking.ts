@@ -79,7 +79,7 @@ async function testThinking(): Promise<void> {
   // Enable thinking with token budget
   const llmConfig = {
     ...baseLlmConfig,
-    model: 'claude-3-7-sonnet-latest',
+    model: 'claude-sonnet-4-5-20250929',
     thinking: { type: 'enabled', budget_tokens: 2000 },
   };
 
