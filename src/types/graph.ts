@@ -413,4 +413,7 @@ export interface AgentInputs {
   discoveredTools?: string[];
   summarizationEnabled?: boolean;
   summarizationConfig?: SummarizationConfig;
+  /** Cross-run summary from a previous run, forwarded from formatAgentMessages.
+   *  Injected into the system message via AgentContext.buildInstructionsString(). */
+  initialSummary?: { text: string; tokenCount: number };
 }

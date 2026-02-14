@@ -199,22 +199,11 @@ export function createSummarizeNode({
     const ChatModelClass = getChatModelClass(provider as Providers);
     const model = new ChatModelClass(clientOptions as never);
 
-    // Check for a prior summary in the kept context (injected by formatAgentMessages on cross-run).
-    // Without this, re-summarization would only cover newly pruned messages, losing all
-    // information from the previous summary.
-    let priorSummaryText = '';
-    if (request.context.length > 0) {
-      const firstContext = request.context[0];
-      if (firstContext._getType() === 'system') {
-        const text =
-          typeof firstContext.content === 'string'
-            ? firstContext.content
-            : JSON.stringify(firstContext.content);
-        if (text.trim().length > 0) {
-          priorSummaryText = text.trim();
-        }
-      }
-    }
+    // Check for a prior summary — either from a previous summarization within this run
+    // (stored in agentContext.summaryText) or from a cross-run summary that was forwarded
+    // via initialSummary → agentContext.setSummary(). Without this, re-summarization would
+    // only cover newly pruned messages, losing all information from the previous summary.
+    const priorSummaryText = agentContext.getSummaryText()?.trim() ?? '';
 
     const messagesToRefineText = request.messagesToRefine
       .map(formatMessageForSummary)
