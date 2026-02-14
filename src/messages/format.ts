@@ -700,7 +700,7 @@ function getLatestSummaryBoundary(
 
     for (let j = 0; j < message.content.length; j++) {
       const part = message.content[j];
-      if (part.type !== ContentTypes.SUMMARY) {
+      if (part == null || part.type !== ContentTypes.SUMMARY) {
         continue;
       }
 
@@ -768,6 +768,9 @@ export const formatAgentMessages = (
 ): {
   messages: Array<HumanMessage | AIMessage | SystemMessage | ToolMessage>;
   indexTokenCountMap?: Record<number, number>;
+  /** Cross-run summary extracted from the payload. Should be forwarded to the
+   *  agent run so it can be included in the system message via AgentContext. */
+  summary?: { text: string; tokenCount: number };
 } => {
   const messages: Array<
     HumanMessage | AIMessage | SystemMessage | ToolMessage
@@ -778,12 +781,10 @@ export const formatAgentMessages = (
   const indexMapping: Record<number, number[] | undefined> = {};
   const summaryBoundary = getLatestSummaryBoundary(payload);
 
-  if (summaryBoundary) {
-    messages.push(new SystemMessage(summaryBoundary.text));
-    if (indexTokenCountMap) {
-      updatedIndexTokenCountMap[0] = summaryBoundary.tokenCount;
-    }
-  }
+  // Summary metadata is returned to the caller so it can be forwarded to the
+  // agent run and included in the single system message via AgentContext.
+  // We intentionally do NOT create a SystemMessage here — that would conflict
+  // with the agent's own system message (instructions + summary combined).
 
   /**
    * Create a mutable copy of the tools set that can be expanded dynamically.
@@ -1073,6 +1074,9 @@ export const formatAgentMessages = (
     messages,
     indexTokenCountMap: indexTokenCountMap
       ? updatedIndexTokenCountMap
+      : undefined,
+    summary: summaryBoundary
+      ? { text: summaryBoundary.text, tokenCount: summaryBoundary.tokenCount }
       : undefined,
   };
 };

@@ -90,20 +90,20 @@ describe('formatAgentMessages', () => {
       3: 4,
     });
 
-    expect(result.messages).toHaveLength(3);
-    expect(result.messages[0]).toBeInstanceOf(SystemMessage);
-    expect(result.messages[0].content).toBe('Conversation summary');
-    expect(result.messages[1]).toBeInstanceOf(AIMessage);
-    expect(result.messages[2]).toBeInstanceOf(HumanMessage);
+    expect(result.messages).toHaveLength(2);
+    expect(result.summary).toBeDefined();
+    expect(result.summary!.text).toBe('Conversation summary');
+    expect(result.summary!.tokenCount).toBe(12);
+    expect(result.messages[0]).toBeInstanceOf(AIMessage);
+    expect(result.messages[1]).toBeInstanceOf(HumanMessage);
     expect(
-      (result.messages[1].content as MessageContentComplex[])[0]
+      (result.messages[0].content as MessageContentComplex[])[0]
     ).toMatchObject({
       type: ContentTypes.TEXT,
       text: 'Preserved tail',
     });
-    expect(result.indexTokenCountMap?.[0]).toBe(12);
-    expect(result.indexTokenCountMap?.[1]).toBe(18);
-    expect(result.indexTokenCountMap?.[2]).toBe(4);
+    expect(result.indexTokenCountMap?.[0]).toBe(18);
+    expect(result.indexTokenCountMap?.[1]).toBe(4);
   });
 
   it('should apply last-summary-wins when multiple summary blocks exist', () => {
@@ -127,12 +127,13 @@ describe('formatAgentMessages', () => {
 
     const result = formatAgentMessages(payload);
 
-    expect(result.messages).toHaveLength(2);
-    expect(result.messages[0]).toBeInstanceOf(SystemMessage);
-    expect(result.messages[0].content).toBe('Newest summary');
-    expect(result.messages[1]).toBeInstanceOf(AIMessage);
+    expect(result.messages).toHaveLength(1);
+    expect(result.summary).toBeDefined();
+    expect(result.summary!.text).toBe('Newest summary');
+    expect(result.summary!.tokenCount).toBe(9);
+    expect(result.messages[0]).toBeInstanceOf(AIMessage);
     expect(
-      (result.messages[1].content as MessageContentComplex[])[0]
+      (result.messages[0].content as MessageContentComplex[])[0]
     ).toMatchObject({
       type: ContentTypes.TEXT,
       text: 'Keep this part',
@@ -2641,21 +2642,20 @@ describe('formatAgentMessages', () => {
 
       const result = formatAgentMessages(payload, indexTokenCountMap);
 
-      expect(result.messages[0]).toBeInstanceOf(SystemMessage);
-      expect(result.messages[0].content).toBe(
+      expect(result.summary).toBeDefined();
+      expect(result.summary!.text).toBe(
         'This is a conversation summary capturing prior context.'
       );
-
-      expect(result.indexTokenCountMap?.[0]).toBe(25);
+      expect(result.summary!.tokenCount).toBe(25);
 
       const preBoundaryTokensPresent = Object.values(
         result.indexTokenCountMap || {}
       ).some((v) => v === 8 || v === 12);
       expect(preBoundaryTokensPresent).toBe(false);
 
-      const postBoundaryTotal = Object.entries(result.indexTokenCountMap || {})
-        .filter(([k]) => Number(k) > 0)
-        .reduce((sum, [, v]) => sum + v, 0);
+      const postBoundaryTotal = Object.values(
+        result.indexTokenCountMap || {}
+      ).reduce((sum, v) => sum + v, 0);
 
       expect(postBoundaryTotal).toBe(60 + 10 + 15);
     });
@@ -2708,14 +2708,15 @@ describe('formatAgentMessages', () => {
 
       const result = formatAgentMessages(payload, indexTokenCountMap);
 
-      expect(result.messages[0]).toBeInstanceOf(SystemMessage);
-      expect(result.indexTokenCountMap?.[0]).toBe(20);
+      expect(result.summary).toBeDefined();
+      expect(result.summary!.text).toBe('Summary of the conversation so far.');
+      expect(result.summary!.tokenCount).toBe(20);
 
       const totalTokens = Object.values(result.indexTokenCountMap || {}).reduce(
         (sum, count) => sum + count,
         0
       );
-      expect(totalTokens).toBe(20 + 80 + 6);
+      expect(totalTokens).toBe(80 + 6);
     });
 
     it('should produce correct maps across a simulated multi-run lifecycle', () => {
@@ -2748,17 +2749,15 @@ describe('formatAgentMessages', () => {
       const run2Map = { 0: 10, 1: 12, 2: 14, 3: 50 };
 
       const run2Result = formatAgentMessages(run2Payload, run2Map);
-      expect(run2Result.messages[0]).toBeInstanceOf(SystemMessage);
-      expect(run2Result.messages[0].content).toBe(
+      expect(run2Result.summary).toBeDefined();
+      expect(run2Result.summary!.text).toBe(
         'User asked basic arithmetic: 2+2=4, then 4*10=40.'
       );
-      expect(run2Result.indexTokenCountMap?.[0]).toBe(18);
+      expect(run2Result.summary!.tokenCount).toBe(18);
 
-      const run2TotalPostBoundary = Object.entries(
+      const run2TotalPostBoundary = Object.values(
         run2Result.indexTokenCountMap || {}
-      )
-        .filter(([k]) => Number(k) > 0)
-        .reduce((sum, [, v]) => sum + v, 0);
+      ).reduce((sum, v) => sum + v, 0);
       expect(run2TotalPostBoundary).toBe(0);
 
       const run3Payload: TPayload = [
@@ -2781,13 +2780,16 @@ describe('formatAgentMessages', () => {
       const run3Map = { 0: 18, 1: 15, 2: 20 };
 
       const run3Result = formatAgentMessages(run3Payload, run3Map);
-      expect(run3Result.messages[0]).toBeInstanceOf(SystemMessage);
-      expect(run3Result.indexTokenCountMap?.[0]).toBe(18);
+      expect(run3Result.summary).toBeDefined();
+      expect(run3Result.summary!.text).toBe(
+        'User asked basic arithmetic: 2+2=4, then 4*10=40.'
+      );
+      expect(run3Result.summary!.tokenCount).toBe(18);
 
       const run3Total = Object.values(
         run3Result.indexTokenCountMap || {}
       ).reduce((sum, count) => sum + count, 0);
-      expect(run3Total).toBe(18 + 15 + 20);
+      expect(run3Total).toBe(15 + 20);
     });
   });
 });
