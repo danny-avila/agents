@@ -179,6 +179,24 @@ export class AgentContext {
   private summaryText?: string;
   /** Token count of the current summary (tracked for token accounting) */
   private summaryTokenCount: number = 0;
+  /** Number of summarization cycles that have occurred for this agent context */
+  private _summaryVersion: number = 0;
+  /**
+   * Message count at the time summarization was last triggered.
+   * Used to prevent re-summarizing the same unchanged message set.
+   * Summarization is allowed to fire again only when new messages appear.
+   */
+  private _lastSummarizationMsgCount: number = 0;
+  /**
+   * Number of times summarization has fired during the current run.
+   * Used as a safety valve: after MAX_SUMMARIZATIONS_PER_RUN fires,
+   * summarization is suppressed for the remainder of the run.
+   * This prevents infinite agent→summarize→agent cycles when maxContextTokens
+   * is too tight for the model to complete tool-call rounds between summarizations.
+   */
+  private _summarizationCountThisRun: number = 0;
+  /** Maximum summarizations allowed per run before suppression kicks in. */
+  private static readonly MAX_SUMMARIZATIONS_PER_RUN = 3;
   /**
    * Handoff context when this agent receives control via handoff.
    * Contains source and parallel execution info for system message context.
@@ -497,6 +515,9 @@ export class AgentContext {
 
     this.summaryText = undefined;
     this.summaryTokenCount = 0;
+    this._summaryVersion = 0;
+    this._lastSummarizationMsgCount = 0;
+    this._summarizationCountThisRun = 0;
 
     if (this.tokenCounter) {
       this.initializeSystemRunnable();
@@ -640,11 +661,52 @@ export class AgentContext {
   setSummary(text: string, tokenCount: number): void {
     this.summaryText = text;
     this.summaryTokenCount = tokenCount;
+    this._summaryVersion += 1;
     this.systemRunnableStale = true;
   }
 
   hasSummary(): boolean {
     return this.summaryText != null && this.summaryText !== '';
+  }
+
+  get summaryVersion(): number {
+    return this._summaryVersion;
+  }
+
+  /**
+   * Returns true if summarization should be skipped for one of two reasons:
+   *
+   * 1. **Per-run cap reached**: After MAX_SUMMARIZATIONS_PER_RUN fires,
+   *    further summarizations are suppressed. This prevents infinite
+   *    agent→summarize→agent cycles when maxContextTokens is too tight
+   *    for the model to complete tool-call rounds between summarizations.
+   *    pruneMessages still drops old messages (just without a summary).
+   *
+   * 2. **Insufficient new messages**: A minimum growth of 4 messages is required
+   *    before re-triggering. This prevents tool call rounds (each adding 2
+   *    messages: AIMessage + ToolMessage) from immediately re-triggering
+   *    summarization, giving the model at least 2 tool-call rounds to work.
+   */
+  shouldSkipSummarization(currentMsgCount: number): boolean {
+    if (
+      this._summarizationCountThisRun >= AgentContext.MAX_SUMMARIZATIONS_PER_RUN
+    ) {
+      return true;
+    }
+    const MIN_MSG_GROWTH = 4;
+    return (
+      this._lastSummarizationMsgCount > 0 &&
+      currentMsgCount < this._lastSummarizationMsgCount + MIN_MSG_GROWTH
+    );
+  }
+
+  /**
+   * Records the message count at which summarization was triggered,
+   * so subsequent calls with the same count are suppressed.
+   */
+  markSummarizationTriggered(msgCount: number): void {
+    this._lastSummarizationMsgCount = msgCount;
+    this._summarizationCountThisRun++;
   }
 
   clearSummary(): void {

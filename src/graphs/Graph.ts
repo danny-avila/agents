@@ -828,9 +828,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
         if (
           agentContext.summarizationEnabled === true &&
-          !agentContext.hasSummary() &&
           Array.isArray(messagesToRefine) &&
           messagesToRefine.length > 0 &&
+          !agentContext.shouldSkipSummarization(messages.length) &&
           shouldTriggerSummarization({
             trigger: agentContext.summarizationConfig?.trigger,
             maxContextTokens: agentContext.maxContextTokens,
@@ -839,6 +839,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             messagesToRefineCount: messagesToRefine.length,
           })
         ) {
+          agentContext.markSummarizationTriggered(messages.length);
           return {
             summarizationRequest: {
               messagesToRefine,

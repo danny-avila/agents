@@ -5,11 +5,30 @@ import {
 } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { BaseMessage } from '@langchain/core/messages';
+import { createHash } from 'crypto';
 import type * as t from '@/types';
 import { getChatModelClass } from '@/llm/providers';
 import { safeDispatchCustomEvent } from '@/utils/events';
 import { ContentTypes, GraphEvents, StepTypes, Providers } from '@/common';
 import type { AgentContext } from '@/agents/AgentContext';
+
+/**
+ * Computes a short hash of the messages being summarized.
+ * Used for deduplication and debugging — if the same rangeHash appears on consecutive
+ * summaries, the same messages were re-summarized (likely a no-op).
+ */
+function computeRangeHash(messages: BaseMessage[]): string {
+  const hash = createHash('sha256');
+  for (const msg of messages) {
+    hash.update(msg._getType());
+    hash.update(
+      typeof msg.content === 'string'
+        ? msg.content
+        : JSON.stringify(msg.content)
+    );
+  }
+  return hash.digest('hex').slice(0, 16);
+}
 
 /**
  * Formats a message for summarization input. Produces human-readable text instead of
@@ -171,6 +190,7 @@ export function createSummarizeNode({
           provider: provider as string,
           model: modelName,
           messagesToRefineCount: request.messagesToRefine.length,
+          summaryVersion: agentContext.summaryVersion + 1,
         } satisfies t.SummarizeStartEvent,
         runnableConfig
       );
@@ -260,6 +280,12 @@ export function createSummarizeNode({
       type: ContentTypes.SUMMARY,
       text: summaryText,
       tokenCount,
+      summaryVersion: agentContext.summaryVersion,
+      rangeHash: computeRangeHash(request.messagesToRefine),
+      boundary: {
+        messageId: stepId,
+        contentIndex: runStep.index,
+      },
       model: modelName,
       provider: provider as string,
       createdAt: new Date().toISOString(),
