@@ -176,6 +176,8 @@ export class AgentContext {
     sourceAgentName: string;
     /** Names of sibling agents executing in parallel (empty if sequential) */
     parallelSiblings: string[];
+    /** Task-specific instructions passed through the handoff tool */
+    instructions?: string;
   };
 
   constructor({
@@ -380,7 +382,8 @@ export class AgentContext {
     if (!this.handoffContext) return '';
 
     const displayName = this.name ?? this.agentId;
-    const { sourceAgentName, parallelSiblings } = this.handoffContext;
+    const { sourceAgentName, parallelSiblings, instructions } =
+      this.handoffContext;
     const isParallel = parallelSiblings.length > 0;
 
     const lines: string[] = [];
@@ -396,6 +399,12 @@ export class AgentContext {
     lines.push(
       'Execute only tasks relevant to your role. Routing is already handled if requested, unless you can route further.'
     );
+
+    if (instructions != null && instructions !== '') {
+      lines.push('');
+      lines.push('## Task Instructions');
+      lines.push(instructions);
+    }
 
     return lines.join('\n');
   }
@@ -568,9 +577,14 @@ export class AgentContext {
    * Marks system runnable as stale to include handoff context in system message.
    * @param sourceAgentName - Name of the agent that transferred control
    * @param parallelSiblings - Names of other agents executing in parallel with this one
+   * @param instructions - Optional task instructions passed through the handoff tool
    */
-  setHandoffContext(sourceAgentName: string, parallelSiblings: string[]): void {
-    this.handoffContext = { sourceAgentName, parallelSiblings };
+  setHandoffContext(
+    sourceAgentName: string,
+    parallelSiblings: string[],
+    instructions?: string
+  ): void {
+    this.handoffContext = { sourceAgentName, parallelSiblings, instructions };
     this.systemRunnableStale = true;
   }
 

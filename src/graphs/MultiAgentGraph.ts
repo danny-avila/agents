@@ -773,30 +773,40 @@ export class MultiAgentGraph extends StandardGraph {
           /**
            * Set handoff context on the receiving agent.
            * Uses pre-computed graph position for depth and parallel info.
+           *
+           * Task instructions from the handoff are injected into the system
+           * prompt (via buildIdentityPreamble) rather than appended as a
+           * HumanMessage.  This avoids the "400 Unexpected role 'user' after
+           * role 'tool'" error that occurs when the router runs a non-handoff
+           * tool before handing off, leaving a ToolMessage as the last
+           * filtered message (see issue #54).
            */
           const agentContext = this.agentContexts.get(agentId);
+          const hasInstructions = instructions !== null && instructions !== '';
           if (
             agentContext &&
             sourceAgentName != null &&
             sourceAgentName !== ''
           ) {
-            agentContext.setHandoffContext(sourceAgentName, parallelSiblings);
+            agentContext.setHandoffContext(
+              sourceAgentName,
+              parallelSiblings,
+              hasInstructions ? instructions : undefined
+            );
           }
 
           /** Build messages for the receiving agent */
-          let messagesForAgent = filteredMessages;
+          const messagesForAgent = filteredMessages;
 
-          /** If there are instructions, inject them as a HumanMessage to ground the agent */
-          const hasInstructions = instructions !== null && instructions !== '';
-          if (hasInstructions) {
-            messagesForAgent = [
-              ...filteredMessages,
-              new HumanMessage(instructions),
-            ];
-          }
-
-          /** Update token map if we have a token counter */
+          /**
+           * Update token map to reflect the filtered message set.
+           * Instructions are now part of the system message (via handoff
+           * context), so we only need to rebuild the map for the filtered
+           * messages and let initializeSystemRunnable account for the
+           * updated system message tokens.
+           */
           if (agentContext?.tokenCounter && hasInstructions) {
+            agentContext.initializeSystemRunnable();
             const freshTokenMap: Record<string, number> = {};
             for (
               let i = 0;
@@ -808,10 +818,6 @@ export class MultiAgentGraph extends StandardGraph {
                 freshTokenMap[i] = tokenCount;
               }
             }
-            /** Add tokens for the instructions message */
-            const instructionsMsg = new HumanMessage(instructions);
-            freshTokenMap[messagesForAgent.length - 1] =
-              agentContext.tokenCounter(instructionsMsg);
             agentContext.updateTokenMapWithInstructions(freshTokenMap);
           }
 
