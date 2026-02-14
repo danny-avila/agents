@@ -45,6 +45,7 @@ export class AgentContext {
       discoveredTools,
       summarizationEnabled,
       summarizationConfig,
+      initialSummary,
     } = agentConfig;
 
     const agentContext = new AgentContext({
@@ -69,6 +70,12 @@ export class AgentContext {
       summarizationEnabled,
       summarizationConfig,
     });
+
+    // Restore cross-run summary before system runnable initialization so
+    // buildInstructionsString() includes the summary in the system message.
+    if (initialSummary?.text) {
+      agentContext.setSummary(initialSummary.text, initialSummary.tokenCount);
+    }
 
     if (tokenCounter) {
       // Initialize system runnable BEFORE async tool token calculation
@@ -667,6 +674,11 @@ export class AgentContext {
 
   hasSummary(): boolean {
     return this.summaryText != null && this.summaryText !== '';
+  }
+
+  /** Returns the current summary text, or undefined if no summary exists. */
+  getSummaryText(): string | undefined {
+    return this.summaryText;
   }
 
   get summaryVersion(): number {

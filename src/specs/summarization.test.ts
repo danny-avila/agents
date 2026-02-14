@@ -1345,9 +1345,13 @@ describe('Cross-run summary lifecycle (no API keys)', () => {
     // --- formatAgentMessages: convert persisted payload for next Run ---
     const formatted = formatAgentMessages(persistedPayload, persistedTokenMap);
 
-    expect(formatted.messages[0].constructor.name).toBe('SystemMessage');
-    expect(formatted.messages[0].content).toBe(KNOWN_SUMMARY);
-    expect(formatted.indexTokenCountMap?.[0]).toBe(summaryBlock.tokenCount);
+    // Summary is returned as metadata, NOT as a SystemMessage in the messages array.
+    // The caller forwards it to the run via initialSummary → AgentContext.setSummary().
+    expect(formatted.summary).toBeDefined();
+    expect(formatted.summary!.text).toBe(KNOWN_SUMMARY);
+    expect(formatted.summary!.tokenCount).toBe(summaryBlock.tokenCount);
+    // First message should NOT be a SystemMessage — only user/assistant messages remain.
+    expect(formatted.messages[0].constructor.name).not.toBe('SystemMessage');
 
     const formattedMap = (formatted.indexTokenCountMap || {}) as Record<
       number,
@@ -1357,12 +1361,12 @@ describe('Cross-run summary lifecycle (no API keys)', () => {
       (sum: number, v: number) => sum + v,
       0
     );
-    const expectedTotal =
-      summaryBlock.tokenCount + persistedTokenMap[1] + persistedTokenMap[2];
+    // Summary tokens no longer in the map — only user+assistant message tokens.
+    const expectedTotal = persistedTokenMap[1] + persistedTokenMap[2];
     expect(formattedTotal).toBe(expectedTotal);
 
     console.log(
-      `  Formatted: ${formatted.messages.length} msgs, tokenMap total=${formattedTotal}, summary@0=${formatted.indexTokenCountMap?.[0]}`
+      `  Formatted: ${formatted.messages.length} msgs, tokenMap total=${formattedTotal}, summary="${formatted.summary!.text.substring(0, 60)}..."`
     );
 
     // --- Turn 4: new Run with formatted messages and updated indexTokenCountMap ---
@@ -1383,6 +1387,7 @@ describe('Cross-run summary lifecycle (no API keys)', () => {
           enabled: true,
           provider: Providers.OPENAI,
         },
+        initialSummary: formatted.summary,
       },
       returnContent: true,
       customHandlers: buildHandlers(
