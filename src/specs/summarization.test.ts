@@ -407,12 +407,12 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
     // Assert model still works after summarization
     expect(spies.onMessageDeltaSpy).toHaveBeenCalled();
 
-    // Assert the summarize-start event never fires twice in the same run
-    // (hasSummary() guard should prevent re-triggering)
+    // Summarization may fire multiple times per run (no single-fire guard);
+    // the graph's recursionLimit prevents infinite loops.
     const startCallsForSameAgent = spies.onSummarizeStartSpy.mock.calls.filter(
       (c) => (c[0] as t.SummarizeStartEvent).agentId === startPayload.agentId
     );
-    expect(startCallsForSameAgent.length).toBe(1);
+    expect(startCallsForSameAgent.length).toBeGreaterThanOrEqual(1);
   });
 
   test('post-summary continuation over multiple turns preserves context', async () => {
@@ -1277,6 +1277,8 @@ describe('Cross-run summary lifecycle (no API keys)', () => {
     expect(conversationHistory.length).toBeGreaterThanOrEqual(4);
 
     // --- Turn 3: very tight context to force pruning and summarization ---
+    // Even with an extremely small budget, the message-count guard prevents
+    // infinite agent→summarize→agent loops on the same message set.
     run = await createRun(50);
     run.Graph?.overrideTestModel(
       ['Got it, continuing with the summary context.'],
@@ -1412,5 +1414,103 @@ describe('Cross-run summary lifecycle (no API keys)', () => {
     console.log(
       `  Turn 4 produced ${t4RunMessages!.length} messages — lifecycle complete`
     );
+  });
+
+  test('tight context edge case: maxContextTokens as low as 1 does not infinite-loop', async () => {
+    const spies = createSpies();
+    const conversationHistory: BaseMessage[] = [];
+    const tokenCounter = await createTokenCounter();
+
+    const createRun = async (maxTokens: number): Promise<Run<t.IState>> => {
+      const { aggregateContent } = createContentAggregator();
+      const indexTokenCountMap = buildIndexTokenCountMap(
+        conversationHistory,
+        tokenCounter
+      );
+      return Run.create<t.IState>({
+        runId: `tight-ctx-${Date.now()}`,
+        graphConfig: {
+          type: 'standard',
+          llmConfig: getLLMConfig(Providers.OPENAI),
+          instructions: INSTRUCTIONS,
+          maxContextTokens: maxTokens,
+          summarizationEnabled: true,
+          summarizationConfig: {
+            enabled: true,
+            provider: Providers.OPENAI,
+          },
+        },
+        returnContent: true,
+        customHandlers: {
+          [GraphEvents.ON_RUN_STEP]: {
+            handle: (_event: string, data: t.StreamEventData): void => {
+              spies.onRunStepSpy(_event, data);
+              aggregateContent({
+                event: GraphEvents.ON_RUN_STEP,
+                data: data as t.RunStep,
+              });
+            },
+          },
+          [GraphEvents.ON_SUMMARIZE_START]: {
+            handle: (_event: string, data: t.StreamEventData): void => {
+              spies.onSummarizeStartSpy(data);
+            },
+          },
+          [GraphEvents.ON_SUMMARIZE_COMPLETE]: {
+            handle: (_event: string, data: t.StreamEventData): void => {
+              spies.onSummarizeCompleteSpy(data);
+            },
+          },
+        },
+        tokenCounter,
+        indexTokenCountMap,
+      });
+    };
+
+    // Build a conversation first at normal context size
+    let run = await createRun(4000);
+    run.Graph?.overrideTestModel(
+      ['Sure, 2+2 is 4. Happy to help with more math questions.'],
+      1
+    );
+    await runTurn({ run, conversationHistory }, 'What is 2+2?', streamConfig);
+    expect(conversationHistory.length).toBeGreaterThanOrEqual(2);
+
+    // Now use absurdly tight context values — the guard must prevent infinite loops.
+    // Very small values may throw "empty_messages" (context too small for any message)
+    // which is fine — the point is we never hit GraphRecursionError.
+    for (const tightValue of [1, 10, 25, 50]) {
+      spies.onSummarizeStartSpy.mockClear();
+      spies.onSummarizeCompleteSpy.mockClear();
+
+      run = await createRun(tightValue);
+      run.Graph?.overrideTestModel(['OK, noted.'], 1);
+
+      let error: Error | undefined;
+      try {
+        await runTurn({ run, conversationHistory }, 'Continue.', streamConfig);
+      } catch (err) {
+        error = err as Error;
+      }
+
+      if (error) {
+        // Clean errors (empty_messages) are acceptable for tiny context windows.
+        // GraphRecursionError means we looped — that's the bug we're guarding against.
+        expect(error.message).not.toContain('Recursion limit');
+        console.log(
+          `  maxContextTokens=${tightValue}: clean error (${error.message.substring(0, 80)})`
+        );
+        // Remove the failed turn's user message from history so subsequent iterations work
+        conversationHistory.pop();
+      } else {
+        const startCalls = spies.onSummarizeStartSpy.mock.calls.length;
+        const completeCalls = spies.onSummarizeCompleteSpy.mock.calls.length;
+        console.log(
+          `  maxContextTokens=${tightValue}: ok, start=${startCalls}, complete=${completeCalls}, msgs=${conversationHistory.length}`
+        );
+        expect(startCalls).toBeGreaterThanOrEqual(1);
+        expect(completeCalls).toBe(startCalls);
+      }
+    }
   });
 });
