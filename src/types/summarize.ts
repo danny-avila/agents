@@ -41,6 +41,8 @@ export interface SummarizeStartEvent {
   provider: string;
   model?: string;
   messagesToRefineCount: number;
+  /** Which summarization cycle this is (1-based, increments each time summarization fires) */
+  summaryVersion: number;
 }
 
 export interface SummarizeDeltaEvent {
