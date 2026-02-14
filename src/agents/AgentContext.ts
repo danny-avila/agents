@@ -633,7 +633,7 @@ export class AgentContext {
     return filtered;
   }
 
-  /** Creates schema-only tools from toolDefinitions for event-driven mode */
+  /** Creates schema-only tools from toolDefinitions for event-driven mode, merged with native tools */
   private getEventDrivenToolsForBinding(): t.GraphTools {
     if (!this.toolDefinitions) {
       return this.graphTools ?? [];
@@ -655,11 +655,17 @@ export class AgentContext {
 
     const schemaTools = createSchemaOnlyTools(defsToInclude) as t.GraphTools;
 
+    const allTools = [...schemaTools];
+
     if (this.graphTools && this.graphTools.length > 0) {
-      return [...schemaTools, ...this.graphTools];
+      allTools.push(...this.graphTools);
     }
 
-    return schemaTools;
+    if (this.tools && this.tools.length > 0) {
+      allTools.push(...this.tools);
+    }
+
+    return allTools;
   }
 
   /** Filters tool instances for binding based on registry config */
