@@ -821,6 +821,112 @@ describe('Agent Handoffs Tests', () => {
     });
   });
 
+  describe('Tool Call Before Handoff (Issue #54)', () => {
+    it('should complete handoff when router calls a non-handoff tool in the same turn', async () => {
+      /**
+       * Reproduces the bug from issue #54:
+       * When a router calls a regular tool AND a handoff tool in the same turn,
+       * the filtered messages for the receiving agent end with a ToolMessage.
+       * Previously, instructions were appended as a HumanMessage (tool → user),
+       * which many APIs reject. The fix injects instructions into the last
+       * ToolMessage instead.
+       */
+      const customTool = new DynamicStructuredTool({
+        name: 'list_upload_sessions',
+        description: 'List available upload sessions',
+        schema: { type: 'object', properties: {}, required: [] },
+        func: async (): Promise<string> =>
+          JSON.stringify({ sessions: [{ id: 'sess_1', status: 'ready' }] }),
+      });
+
+      const agents: t.AgentInputs[] = [
+        {
+          ...createBasicAgent('router', 'You are a router'),
+          tools: [customTool],
+          toolMap: new Map([['list_upload_sessions', customTool]]) as t.ToolMap,
+        },
+        createBasicAgent('data_analyst', 'You are a data analyst'),
+      ];
+
+      const edges: t.GraphEdge[] = [
+        {
+          from: 'router',
+          to: 'data_analyst',
+          edgeType: 'handoff',
+          description: 'Transfer to data analyst',
+          prompt: 'Instructions for the analyst about what to analyze',
+          promptKey: 'instructions',
+        },
+      ];
+
+      const run = await Run.create(createTestConfig(agents, edges));
+
+      /**
+       * Simulate router calling list_upload_sessions AND handoff in the same turn.
+       * The first model response includes both tool calls.
+       * The second model response is the data_analyst's reply.
+       */
+      run.Graph?.overrideTestModel(
+        [
+          'Checking available sessions and transferring to analyst',
+          'Here is my analysis of the available sessions',
+        ],
+        10,
+        [
+          {
+            id: 'tool_call_1',
+            name: 'list_upload_sessions',
+            args: {},
+          } as ToolCall,
+          {
+            id: 'tool_call_2',
+            name: `${Constants.LC_TRANSFER_TO_}data_analyst`,
+            args: { instructions: 'Analyze the upload session data' },
+          } as ToolCall,
+        ]
+      );
+
+      const messages = [
+        new HumanMessage('Check my upload sessions and analyze them'),
+      ];
+
+      const config: Partial<RunnableConfig> & {
+        version: 'v1' | 'v2';
+        streamMode: string;
+      } = {
+        configurable: {
+          thread_id: 'test-tool-before-handoff-thread',
+        },
+        streamMode: 'values',
+        version: 'v2' as const,
+      };
+
+      /**
+       * This should complete without error. Before the fix, the receiving
+       * agent would get an invalid tool → user message sequence.
+       */
+      await run.processStream({ messages }, config);
+
+      const finalMessages = run.getRunMessages();
+      expect(finalMessages).toBeDefined();
+      expect(finalMessages!.length).toBeGreaterThan(1);
+
+      /** Verify that the handoff occurred */
+      const toolMessages = finalMessages!.filter(
+        (msg) => msg.getType() === 'tool'
+      ) as ToolMessage[];
+
+      const handoffMessage = toolMessages.find(
+        (msg) => msg.name === `${Constants.LC_TRANSFER_TO_}data_analyst`
+      );
+      expect(handoffMessage).toBeDefined();
+
+      /** Verify the flow completed (agent B responded) */
+      const aiMessages = finalMessages!.filter((msg) => msg.getType() === 'ai');
+      expect(aiMessages.length).toBeGreaterThanOrEqual(1);
+    });
+  });
+
   describe('Handoff Tool Naming', () => {
     it('should use correct naming convention for handoff tools', async () => {
       const agents: t.AgentInputs[] = [
