@@ -194,8 +194,6 @@ export class Run<_T extends t.BaseGraphState> {
       // ON_RUN_STEP is dispatched directly via handler registry in
       // Graph.dispatchRunStep (primary, reliable path).  Skip the
       // callback-based dispatch to prevent double handling.
-      // Other ON_RUN_STEP sources (e.g. summarize node) don't go
-      // through dispatchRunStep, so they still reach the handler here.
       if (
         eventName === GraphEvents.ON_RUN_STEP &&
         this.Graph != null &&

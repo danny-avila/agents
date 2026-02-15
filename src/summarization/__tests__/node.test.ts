@@ -36,6 +36,10 @@ function mockGraph(): {
   config: RunnableConfig;
   runId: string;
   isMultiAgent: boolean;
+  dispatchRunStep: (
+    runStep: t.RunStep,
+    config?: RunnableConfig
+  ) => Promise<void>;
   } {
   const contentData: t.RunStep[] = [];
   const contentIndexMap = new Map<string, number>();
@@ -45,6 +49,10 @@ function mockGraph(): {
     config: {} as RunnableConfig,
     runId: 'run_1',
     isMultiAgent: false,
+    dispatchRunStep: async (runStep: t.RunStep): Promise<void> => {
+      contentData.push(runStep);
+      contentIndexMap.set(runStep.id, runStep.index);
+    },
   };
 }
 
@@ -141,7 +149,8 @@ describe('createSummarizeNode', () => {
     );
 
     const eventNames = events.map((e) => e.event);
-    expect(eventNames).toContain(GraphEvents.ON_RUN_STEP);
+    // ON_RUN_STEP now goes through graph.dispatchRunStep, not safeDispatchCustomEvent
+    expect(graph.contentData.length).toBeGreaterThan(0);
     expect(eventNames).toContain(GraphEvents.ON_SUMMARIZE_START);
     expect(eventNames).toContain(GraphEvents.ON_SUMMARIZE_COMPLETE);
 

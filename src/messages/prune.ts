@@ -36,6 +36,12 @@ export type PruneMessagesFactoryParams = {
    * prepended later by `buildSystemRunnable`.
    */
   getInstructionTokens?: () => number;
+  /** Optional diagnostic log callback wired by the graph for observability. */
+  log?: (
+    level: 'debug' | 'info' | 'warn' | 'error',
+    message: string,
+    data?: Record<string, unknown>
+  ) => void;
 };
 export type PruneMessagesParams = {
   messages: BaseMessage[];
@@ -448,19 +454,34 @@ export function sanitizeOrphanToolBlocks(
 }
 
 /**
- * Truncates an oversized tool_use `input` field, preserving it as a valid JSON object.
- * The truncated result contains a `_truncated` key with a head-prefix of the
- * serialized original, plus a `_originalChars` field for visibility.
+ * Truncates an oversized tool_use `input` field using head+tail, preserving
+ * it as a valid JSON object. Head gets ~70%, tail gets ~30% so the model
+ * sees both the beginning (what was called) and end (closing structure/values).
+ * Falls back to head-only when the budget is too small for a meaningful tail.
  */
 function truncateToolInput(
   input: unknown,
   maxChars: number
 ): { _truncated: string; _originalChars: number } {
   const serialized = typeof input === 'string' ? input : JSON.stringify(input);
-  const head = serialized.slice(0, maxChars);
+  const indicator = `\n… [truncated: ${serialized.length} → ${maxChars} chars] …\n`;
+  const available = maxChars - indicator.length;
+
+  if (available < 100) {
+    return {
+      _truncated: serialized.slice(0, maxChars) + indicator.trimEnd(),
+      _originalChars: serialized.length,
+    };
+  }
+
+  const headSize = Math.ceil(available * 0.7);
+  const tailSize = available - headSize;
+
   return {
     _truncated:
-      head + `\n… [truncated: ${serialized.length} → ${maxChars} chars]`,
+      serialized.slice(0, headSize) +
+      indicator +
+      serialized.slice(serialized.length - tailSize),
     _originalChars: serialized.length,
   };
 }
@@ -1190,10 +1211,19 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       factoryParams.maxTokens - currentInstructionTokens
     );
 
+    // P1: Log budget computation
+    factoryParams.log?.('debug', 'Budget computed', {
+      maxTokens: factoryParams.maxTokens,
+      instructionTokens: currentInstructionTokens,
+      effectiveMax: effectiveMaxTokens,
+      messageCount: params.messages.length,
+      totalTokens,
+    });
+
     // Pre-flight truncation: truncate oversized tool results before pruning.
     // Uses effectiveMaxTokens (after instruction overhead) so thresholds reflect
     // the real budget available for messages.
-    preFlightTruncateToolResults({
+    const preFlightResultCount = preFlightTruncateToolResults({
       messages: params.messages,
       maxContextTokens: effectiveMaxTokens,
       indexTokenCountMap,
@@ -1201,12 +1231,19 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     });
 
     // Pre-flight truncation: truncate oversized tool_use inputs (args) in AI messages.
-    preFlightTruncateToolCallInputs({
+    const preFlightInputCount = preFlightTruncateToolCallInputs({
       messages: params.messages,
       maxContextTokens: effectiveMaxTokens,
       indexTokenCountMap,
       tokenCounter: factoryParams.tokenCounter,
     });
+
+    if (preFlightResultCount > 0 || preFlightInputCount > 0) {
+      factoryParams.log?.('debug', 'Pre-flight truncation applied', {
+        toolResultsTruncated: preFlightResultCount,
+        toolInputsTruncated: preFlightInputCount,
+      });
+    }
 
     // Position-based context pruning: degrade old tool results before the main prune.
     if (factoryParams.contextPruningConfig?.enabled === true) {
@@ -1222,9 +1259,18 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     // and context pruning may have reduced token counts for modified messages.
     // Without this, prePruneTotalTokens and early-return remainingContextTokens
     // would be stale (inflated), causing unnecessary summarization triggers.
+    const preTruncationTotalTokens = totalTokens;
     totalTokens = 0;
     for (let i = 0; i < params.messages.length; i++) {
       totalTokens += indexTokenCountMap[i] ?? 0;
+    }
+
+    if (totalTokens !== preTruncationTotalTokens) {
+      factoryParams.log?.('debug', 'Post-truncation token recount', {
+        before: preTruncationTotalTokens,
+        after: totalTokens,
+        saved: preTruncationTotalTokens - totalTokens,
+      });
     }
 
     lastTurnStartIndex = params.messages.length;
@@ -1276,6 +1322,20 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       indexTokenCountMap,
     });
 
+    // P2: Log pruning result with per-message type breakdown
+    const contextBreakdown = repairedContext.map((msg) => {
+      const type = msg.getType();
+      const name = type === 'tool' ? (msg.name ?? 'unknown') : '';
+      return name !== '' ? `${type}(${name})` : type;
+    });
+    factoryParams.log?.('debug', 'Pruning complete', {
+      contextLength: repairedContext.length,
+      contextTypes: contextBreakdown.join(', '),
+      messagesToRefineCount: messagesToRefine.length,
+      droppedOrphans: droppedMessages.length,
+      remainingTokens: initialRemainingContextTokens,
+    });
+
     let context = repairedContext;
     let reclaimedTokens = initialReclaimedTokens;
 
@@ -1290,33 +1350,58 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     // ---------------------------------------------------------------
     // Emergency truncation: if pruning produced an empty context but
     // messages exist, aggressively truncate all tool_call inputs and
-    // tool results to a minimal stub, then retry.  This handles the
-    // scenario where a single oversized tool_call (e.g. evaluate_script
-    // with thousands of chars of JavaScript) exceeds the available
-    // budget on its own, making the pruner give up entirely.
+    // tool results, then retry.  Budget is proportional to the
+    // effective token limit (~4 chars/token, spread across messages)
+    // with a floor of 200 chars so content is never completely blank.
+    // Uses head+tail so the model sees both what was called and the
+    // final outcome (e.g., return value at the end of a script eval).
     // ---------------------------------------------------------------
     if (
       context.length === 0 &&
       params.messages.length > 0 &&
       effectiveMaxTokens > 0
     ) {
-      // Aggressively truncate: tool result content and tool_call inputs
-      // are reduced to a minimal stub so the model knows what was called
-      // but the payload is removed.
-      const EMERGENCY_MAX_CHARS = 150;
+      // Proportional budget: divide effective budget across messages,
+      // convert to chars (~4 chars/token), floor at 200 chars.
+      const perMessageTokenBudget = Math.floor(
+        effectiveMaxTokens / Math.max(1, params.messages.length)
+      );
+      const emergencyMaxChars = Math.max(200, perMessageTokenBudget * 4);
+
+      // P3: Log emergency path entry
+      factoryParams.log?.(
+        'warn',
+        'Empty context, entering emergency truncation',
+        {
+          messageCount: params.messages.length,
+          effectiveMax: effectiveMaxTokens,
+          emergencyMaxChars,
+        }
+      );
+
+      let emergencyTruncatedCount = 0;
       for (let i = 0; i < params.messages.length; i++) {
         const message = params.messages[i];
-        // Truncate ToolMessage content
+        // Truncate ToolMessage content (uses head+tail via truncateToolResultContent)
         if (message.getType() === 'tool') {
           const content = message.content;
           if (
             typeof content === 'string' &&
-            content.length > EMERGENCY_MAX_CHARS
+            content.length > emergencyMaxChars
           ) {
-            (message as ToolMessage).content =
-              content.slice(0, EMERGENCY_MAX_CHARS) +
-              `\n… [emergency truncated: ${content.length} → ${EMERGENCY_MAX_CHARS} chars]`;
+            const beforeLen = content.length;
+            (message as ToolMessage).content = truncateToolResultContent(
+              content,
+              emergencyMaxChars
+            );
             indexTokenCountMap[i] = factoryParams.tokenCounter(message);
+            emergencyTruncatedCount++;
+            factoryParams.log?.('debug', 'Emergency truncated tool result', {
+              index: i,
+              toolName: message.name ?? 'unknown',
+              beforeChars: beforeLen,
+              afterChars: emergencyMaxChars,
+            });
           }
         }
         // Truncate AI message tool_call inputs
@@ -1334,7 +1419,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
                 typeof record.input === 'string'
                   ? record.input
                   : JSON.stringify(record.input);
-              return serialized.length > EMERGENCY_MAX_CHARS;
+              return serialized.length > emergencyMaxChars;
             }
             return false;
           });
@@ -1350,10 +1435,10 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
                   typeof record.input === 'string'
                     ? record.input
                     : JSON.stringify(record.input);
-                if (serialized.length > EMERGENCY_MAX_CHARS) {
+                if (serialized.length > emergencyMaxChars) {
                   return {
                     ...record,
-                    input: truncateToolInput(record.input, EMERGENCY_MAX_CHARS),
+                    input: truncateToolInput(record.input, emergencyMaxChars),
                   };
                 }
               }
@@ -1361,10 +1446,10 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
             });
             const newToolCalls = (aiMsg.tool_calls ?? []).map((tc) => {
               const serializedArgs = JSON.stringify(tc.args);
-              if (serializedArgs.length > EMERGENCY_MAX_CHARS) {
+              if (serializedArgs.length > emergencyMaxChars) {
                 return {
                   ...tc,
-                  args: truncateToolInput(tc.args, EMERGENCY_MAX_CHARS),
+                  args: truncateToolInput(tc.args, emergencyMaxChars),
                 };
               }
               return tc;
@@ -1377,9 +1462,18 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
             indexTokenCountMap[i] = factoryParams.tokenCounter(
               params.messages[i]
             );
+            emergencyTruncatedCount++;
+            factoryParams.log?.('debug', 'Emergency truncated tool input', {
+              index: i,
+            });
           }
         }
       }
+
+      factoryParams.log?.('info', 'Emergency truncation complete', {
+        truncatedCount: emergencyTruncatedCount,
+        emergencyMaxChars,
+      });
 
       // Retry pruning with the emergency-truncated messages
       const retryResult = getMessagesWithinTokenLimit({

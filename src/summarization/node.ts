@@ -9,7 +9,7 @@ import type { BaseMessage } from '@langchain/core/messages';
 import type { AgentContext } from '@/agents/AgentContext';
 import type * as t from '@/types';
 import { ContentTypes, GraphEvents, StepTypes, Providers } from '@/common';
-import { safeDispatchCustomEvent } from '@/utils/events';
+import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { getChatModelClass } from '@/llm/providers';
 import { createRemoveAllMessage } from '@/messages/reducer';
 
@@ -336,7 +336,9 @@ function splitMessagesByCharShare(
  * The explicit section structure ensures consistent, machine-parseable output
  * that survives multiple summarization cycles without information loss.
  */
-export const DEFAULT_SUMMARIZATION_PROMPT = `Create a structured context checkpoint summary of the conversation. This summary will replace the conversation messages, so it must capture everything needed to continue the work.
+export const DEFAULT_SUMMARIZATION_PROMPT = `Create a structured context checkpoint of the conversation state. This checkpoint replaces the conversation messages, so it must capture everything needed to continue the work.
+
+IMPORTANT: Write as a factual state log in third person. Do NOT write as a chatbot response. Do NOT use first person ("I"), second person ("you", "your"), emojis, or conversational phrases like "Let me", "Here's what", "Great news". This is a technical state record, not a message to the user.
 
 Use this exact format:
 
@@ -366,12 +368,13 @@ What should happen next, in priority order.
 Specific identifiers, names, error messages, URLs, and other details that must be preserved verbatim.
 
 Rules:
+- Write factual, third-person statements: "User requested X. Agent executed Y tool. Result: Z."
+- For each tool call, record: the tool name, key input parameters, and the outcome
 - Preserve exact identifiers, names, error messages, and key references — do NOT paraphrase them
-- Record each tool call outcome (success or failure with reason), not raw output
-- Do NOT reproduce tool output or long content verbatim
+- Do NOT reproduce tool output or long content verbatim — summarize the outcome
 - Use short declarative sentences
 - Omit empty sections
-- Output only the summary`;
+- Output only the checkpoint`;
 
 /**
  * Prompt for incremental summary updates when a prior summary exists.
@@ -379,20 +382,23 @@ Rules:
  * The rules ensure existing information is preserved while new information
  * is integrated into the correct sections.
  */
-export const DEFAULT_UPDATE_SUMMARIZATION_PROMPT = `Update the existing summary checkpoint with information from new conversation messages. Maintain the same structured format.
+export const DEFAULT_UPDATE_SUMMARIZATION_PROMPT = `Update the existing context checkpoint with information from new conversation messages. Maintain the same structured format.
+
+IMPORTANT: Write as a factual state log in third person. Do NOT write as a chatbot response. Do NOT use first person, second person, emojis, or conversational phrases. This is a technical state record, not a message to the user.
 
 Rules:
-- PRESERVE all existing information from the previous summary unless explicitly contradicted by new messages
+- PRESERVE all existing information from the previous checkpoint unless explicitly contradicted by new messages
 - ADD new progress, decisions, and context from the new messages
 - Move items from "In Progress" to "Done" when completed
 - Move items from "Blocked" to "In Progress" or "Done" as appropriate
 - Add new items to the appropriate sections
 - Update "Next Steps" to reflect current priorities
+- Write factual, third-person statements: "User requested X. Agent executed Y tool. Result: Z."
+- For each tool call, record: the tool name, key input parameters, and the outcome
 - Preserve exact identifiers, names, error messages, and key references — do NOT paraphrase them
-- Record each tool call outcome (success or failure with reason), not raw output
-- Do NOT reproduce tool output or long content verbatim
+- Do NOT reproduce tool output or long content verbatim — summarize the outcome
 - Omit empty sections
-- Output only the updated summary using the same format`;
+- Output only the updated checkpoint using the same format`;
 
 /**
  * Separates summarization-specific parameters (parts, minMessagesForSplit, etc.)
@@ -577,6 +583,10 @@ interface CreateSummarizeNodeParams {
     config?: RunnableConfig;
     runId?: string;
     isMultiAgent: boolean;
+    dispatchRunStep: (
+      runStep: t.RunStep,
+      config?: RunnableConfig
+    ) => Promise<void>;
   };
   generateStepId: (stepKey: string) => [string, number];
 }
@@ -679,16 +689,9 @@ export function createSummarizeNode({
       runStep.agentId = agentContext.agentId;
     }
 
-    graph.contentData.push(runStep);
-    graph.contentIndexMap.set(stepId, runStep.index);
+    await graph.dispatchRunStep(runStep, runnableConfig);
 
     if (runnableConfig) {
-      await safeDispatchCustomEvent(
-        GraphEvents.ON_RUN_STEP,
-        runStep,
-        runnableConfig
-      );
-
       await safeDispatchCustomEvent(
         GraphEvents.ON_SUMMARIZE_START,
         {
@@ -729,6 +732,26 @@ export function createSummarizeNode({
     const { parts, minMessagesForSplit } = summarizationParams;
     const messagesToRefine = request.messagesToRefine;
 
+    // S1: Log before summarization LLM call
+    const strategy =
+      parts > 1 && messagesToRefine.length >= Math.max(2, minMessagesForSplit)
+        ? 'multi_stage'
+        : 'single_pass';
+    emitAgentLog(
+      runnableConfig,
+      'info',
+      'summarize',
+      'Summarization starting',
+      {
+        strategy,
+        parts,
+        messagesToRefineCount: messagesToRefine.length,
+        hasPriorSummary: priorSummaryText !== '',
+        summaryVersion: agentContext.summaryVersion + 1,
+      },
+      { runId: graph.runId, agentId: request.agentId }
+    );
+
     // Tier 1: Full input, normal budget
     try {
       if (
@@ -758,6 +781,18 @@ export function createSummarizeNode({
         });
       }
     } catch {
+      // S2a: Log tier 1 failure, falling back to tier 2
+      emitAgentLog(
+        runnableConfig,
+        'warn',
+        'summarize',
+        'Tier 1 failed, falling back',
+        {
+          tier: 1,
+          fallback: 'single_pass_half_budget',
+        },
+        { runId: graph.runId, agentId: request.agentId }
+      );
       // Tier 2: Retry with single-pass, half character budget
       try {
         summaryText = await summarizeSinglePass({
@@ -771,6 +806,18 @@ export function createSummarizeNode({
           budgetChars: Math.floor(CHUNK_BUDGET_CHARS / 2),
         });
       } catch {
+        // S2b: Log tier 2 failure, falling back to tier 3
+        emitAgentLog(
+          runnableConfig,
+          'warn',
+          'summarize',
+          'Tier 2 failed, falling back',
+          {
+            tier: 2,
+            fallback: 'metadata_stub',
+          },
+          { runId: graph.runId, agentId: request.agentId }
+        );
         // Tier 3: Metadata stub — no LLM call, preserves tool names and message counts
         summaryText = generateMetadataStub(messagesToRefine);
       }
@@ -801,6 +848,21 @@ export function createSummarizeNode({
     }
 
     agentContext.setSummary(summaryText, tokenCount);
+
+    // S3: Log after summary persisted
+    emitAgentLog(
+      runnableConfig,
+      'info',
+      'summarize',
+      'Summary persisted',
+      {
+        tokenCount,
+        summaryVersion: agentContext.summaryVersion,
+        textLength: summaryText.length,
+        contextLength: request.context.length,
+      },
+      { runId: graph.runId, agentId: request.agentId }
+    );
 
     const summaryBlock: t.SummaryContentBlock = {
       type: ContentTypes.SUMMARY,
@@ -1005,6 +1067,19 @@ async function summarizeSinglePass({
   budgetChars,
 }: SummarizeParams & { budgetChars?: number }): Promise<string> {
   const formattedText = formatMessagesForSummarization(messages, budgetChars);
+
+  // S-SP: Log what the summarizer will see
+  const msgTypes = messages.map((m) => {
+    const t = m._getType();
+    return t === 'tool' ? `tool(${m.name ?? '?'})` : t;
+  });
+  emitAgentLog(config, 'debug', 'summarize', 'Single-pass input', {
+    messageCount: messages.length,
+    messageTypes: msgTypes.join(', '),
+    formattedChars: formattedText.length,
+    hasPriorSummary: priorSummaryText !== '',
+    priorSummaryChars: priorSummaryText.length,
+  });
 
   // Select the appropriate prompt: use the update variant when integrating
   // new messages into an existing summary, fresh prompt otherwise.

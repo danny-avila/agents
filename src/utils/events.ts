@@ -2,6 +2,8 @@
 // src/utils/events.ts
 import { dispatchCustomEvent } from '@langchain/core/callbacks/dispatch';
 import type { RunnableConfig } from '@langchain/core/runnables';
+import type { AgentLogEvent } from '@/types/graph';
+import { GraphEvents } from '@/common';
 
 /**
  * Safely dispatches a custom event and properly awaits it to avoid
@@ -29,4 +31,24 @@ export async function safeDispatchCustomEvent(
     // Log other errors
     console.error('Error dispatching custom event:', e);
   }
+}
+
+/**
+ * Fire-and-forget diagnostic log event.
+ * Zero-cost when no config is provided (no handler attached).
+ */
+export function emitAgentLog(
+  config: RunnableConfig | undefined,
+  level: AgentLogEvent['level'],
+  scope: AgentLogEvent['scope'],
+  message: string,
+  data?: Record<string, unknown>,
+  meta?: { runId?: string; agentId?: string }
+): void {
+  if (!config) return;
+  safeDispatchCustomEvent(
+    GraphEvents.ON_AGENT_LOG,
+    { level, scope, message, data, ...meta } satisfies AgentLogEvent,
+    config
+  );
 }

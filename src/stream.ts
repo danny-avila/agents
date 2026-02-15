@@ -626,6 +626,7 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       | t.ReasoningDeltaEvent
       | t.RunStepDeltaEvent
       | t.SummarizeDeltaData
+      | t.SummarizeCompleteEvent
       | { result: t.ToolEndEvent };
   }): void => {
     if (event === GraphEvents.ON_SUMMARIZE_DELTA) {
@@ -636,6 +637,24 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         return;
       }
       updateContent(runStep.index, deltaData.delta.summary);
+      return;
+    }
+
+    if (event === GraphEvents.ON_SUMMARIZE_COMPLETE) {
+      const completeData = data as t.SummarizeCompleteEvent;
+      const summary = completeData.summary;
+      if (!summary.boundary) {
+        return;
+      }
+      const runStep = stepMap.get(summary.boundary.messageId);
+      if (!runStep) {
+        return;
+      }
+      // Replace accumulated delta text with the authoritative final summary.
+      // Multi-stage summarization streams deltas from each chunk, which
+      // concatenate in updateContent.  This event carries only the correct
+      // final text from the last stage.
+      contentParts[runStep.index] = summary;
       return;
     }
 

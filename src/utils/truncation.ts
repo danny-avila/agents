@@ -34,12 +34,13 @@ export function calculateMaxToolResultChars(
 }
 
 /**
- * Truncates tool result content that exceeds `maxChars`.
- * Preserves newline boundaries where possible so the truncated output
- * remains structurally coherent (e.g., JSON or log output).
+ * Truncates tool result content that exceeds `maxChars` using a head+tail
+ * strategy. Keeps the beginning (structure/headers) and end (return value /
+ * conclusion) of the content so the model retains both the opening context
+ * and the final outcome.
  *
- * Strategy: keep the head of the content (most tool results start with
- * structure/headers), append a truncation indicator with the original size.
+ * Head gets ~70% of the budget, tail gets ~30%. Falls back to head-only
+ * when the budget is too small for a meaningful tail.
  *
  * @param content - The tool result string content.
  * @param maxChars - Maximum allowed characters.
@@ -53,17 +54,32 @@ export function truncateToolResultContent(
     return content;
   }
 
-  const indicator = `\n\n… [truncated: ${content.length} chars total, showing first ${maxChars} chars]`;
+  const indicator = `\n\n… [truncated: ${content.length} → ${maxChars} chars] …\n\n`;
   const available = maxChars - indicator.length;
   if (available <= 0) {
     return content.slice(0, maxChars);
   }
 
-  // Try to break at a newline boundary within the last 200 chars of the head
-  const head = content.slice(0, available);
-  const lastNewline = head.lastIndexOf('\n', available);
-  const breakPoint =
-    lastNewline > available - 200 && lastNewline > 0 ? lastNewline : available;
+  // When budget is too small for a meaningful tail, fall back to head-only
+  if (available < 200) {
+    return content.slice(0, available) + indicator.trimEnd();
+  }
 
-  return content.slice(0, breakPoint) + indicator;
+  const headSize = Math.ceil(available * 0.7);
+  const tailSize = available - headSize;
+
+  // Try to break at newline boundaries for cleaner output
+  let headEnd = headSize;
+  const headNewline = content.lastIndexOf('\n', headSize);
+  if (headNewline > headSize - 200 && headNewline > 0) {
+    headEnd = headNewline;
+  }
+
+  let tailStart = content.length - tailSize;
+  const tailNewline = content.indexOf('\n', tailStart);
+  if (tailNewline > 0 && tailNewline < tailStart + 200) {
+    tailStart = tailNewline + 1;
+  }
+
+  return content.slice(0, headEnd) + indicator + content.slice(tailStart);
 }

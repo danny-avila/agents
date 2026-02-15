@@ -79,6 +79,15 @@ export type MultiAgentGraphState = BaseGraphState & {
 
 export type IState = BaseGraphState;
 
+export interface AgentLogEvent {
+  level: 'debug' | 'info' | 'warn' | 'error';
+  scope: 'prune' | 'summarize' | 'graph' | 'sanitize' | (string & {});
+  message: string;
+  data?: Record<string, unknown>;
+  runId?: string;
+  agentId?: string;
+}
+
 export interface EventHandler {
   handle(
     event: string,
@@ -92,6 +101,7 @@ export interface EventHandler {
       | SummarizeStartEvent
       | SummarizeDeltaEvent
       | SummarizeCompleteEvent
+      | AgentLogEvent
       | { result: ToolEndEvent },
     metadata?: Record<string, unknown>,
     graph?: StandardGraph | MultiAgentGraph
