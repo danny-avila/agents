@@ -14,6 +14,7 @@ import type * as t from '@/types';
 import {
   repairOrphanedToolMessages,
   createPruneMessages,
+  preFlightTruncateToolCallInputs,
 } from '@/messages/prune';
 import { getLLMConfig } from '@/utils/llmConfig';
 import { Providers } from '@/common';
@@ -44,6 +45,14 @@ const createTestTokenCounter = (): t.TokenCounter => {
         } else if (typeof item === 'object') {
           if ('text' in item && typeof item.text === 'string') {
             totalLength += item.text.length;
+          }
+          // Count tool_use input fields (serialized args contribute to token count)
+          if ('input' in item && item.input != null) {
+            const input = item.input;
+            totalLength +=
+              typeof input === 'string'
+                ? input.length
+                : JSON.stringify(input).length;
           }
         }
       }
@@ -588,13 +597,168 @@ describe('Prune Messages Tests', () => {
       expect(repaired.reclaimedTokens).toBe(indexTokenCountMap[1]);
     });
 
+    it('should strip orphan tool_use blocks from AI messages when ToolMessages are not in context', () => {
+      const tokenCounter = createTestTokenCounter();
+      const context = [
+        new HumanMessage('Show me something cool'),
+        new AIMessage({
+          content: [
+            { type: 'text', text: 'Let me create an animation.' },
+            {
+              type: 'tool_use',
+              id: 'tool-navigate',
+              name: 'navigate_page',
+              input: '{"url":"about:blank"}',
+            },
+            {
+              type: 'tool_use',
+              id: 'tool-script',
+              name: 'evaluate_script',
+              input: '{"function":"' + 'x'.repeat(3000) + '"}',
+            },
+          ],
+          tool_calls: [
+            {
+              id: 'tool-navigate',
+              name: 'navigate_page',
+              args: { url: 'about:blank' },
+            },
+            {
+              id: 'tool-script',
+              name: 'evaluate_script',
+              args: { fn: 'x'.repeat(3000) },
+            },
+          ],
+        }),
+        // ToolMessages for both tool calls are NOT in context (pruned)
+      ];
+
+      const indexTokenCountMap = {
+        0: tokenCounter(context[0]),
+        1: tokenCounter(context[1]),
+      };
+
+      const repaired = repairOrphanedToolMessages({
+        context,
+        allMessages: context,
+        tokenCounter,
+        indexTokenCountMap,
+      });
+
+      // AI message should survive but with tool_use blocks stripped
+      expect(repaired.context).toHaveLength(2);
+      const repairedAI = repaired.context[1] as AIMessage;
+      expect(repairedAI.getType()).toBe('ai');
+
+      // Should only have the text block, no tool_use blocks
+      const content = repairedAI.content as Array<{ type: string }>;
+      expect(content).toHaveLength(1);
+      expect(content[0].type).toBe('text');
+
+      // tool_calls should be empty
+      expect(repairedAI.tool_calls ?? []).toHaveLength(0);
+
+      // Token savings from stripping the large tool_use blocks
+      expect(repaired.reclaimedTokens).toBeGreaterThan(0);
+    });
+
+    it('should drop AI message entirely when it has only tool_use blocks with no text', () => {
+      const tokenCounter = createTestTokenCounter();
+      const context = [
+        new HumanMessage('Do something'),
+        new AIMessage({
+          content: [
+            {
+              type: 'tool_use',
+              id: 'tool-only',
+              name: 'some_tool',
+              input: '{"query":"test"}',
+            },
+          ],
+          tool_calls: [
+            { id: 'tool-only', name: 'some_tool', args: { query: 'test' } },
+          ],
+        }),
+      ];
+
+      const indexTokenCountMap = {
+        0: tokenCounter(context[0]),
+        1: tokenCounter(context[1]),
+      };
+
+      const repaired = repairOrphanedToolMessages({
+        context,
+        allMessages: context,
+        tokenCounter,
+        indexTokenCountMap,
+      });
+
+      // AI message should be dropped since it had only tool_use blocks
+      expect(repaired.context).toHaveLength(1);
+      expect(repaired.context[0].getType()).toBe('human');
+      expect(repaired.droppedOrphanCount).toBe(1);
+    });
+
+    it('should keep tool_use blocks when their ToolMessages ARE in context', () => {
+      const tokenCounter = createTestTokenCounter();
+      const context = [
+        new HumanMessage('Do something'),
+        new AIMessage({
+          content: [
+            { type: 'text', text: 'Calling tool' },
+            {
+              type: 'tool_use',
+              id: 'tool-present',
+              name: 'read_file',
+              input: '{"path":"test.txt"}',
+            },
+          ],
+          tool_calls: [
+            {
+              id: 'tool-present',
+              name: 'read_file',
+              args: { path: 'test.txt' },
+            },
+          ],
+        }),
+        new ToolMessage({
+          content: 'File contents here',
+          tool_call_id: 'tool-present',
+        }),
+      ];
+
+      const indexTokenCountMap = {
+        0: tokenCounter(context[0]),
+        1: tokenCounter(context[1]),
+        2: tokenCounter(context[2]),
+      };
+
+      const repaired = repairOrphanedToolMessages({
+        context,
+        allMessages: context,
+        tokenCounter,
+        indexTokenCountMap,
+      });
+
+      // Nothing should change — all tool_use blocks have matching ToolMessages
+      expect(repaired.context).toHaveLength(3);
+      expect(repaired.reclaimedTokens).toBe(0);
+      expect(repaired.droppedOrphanCount).toBe(0);
+    });
+
     it('should ensure context does not start with a tool message by finding an AI message', () => {
       const tokenCounter = createTestTokenCounter();
       const messages = [
         new SystemMessage('System instruction'),
-        new AIMessage('AI message 1'),
+        new AIMessage({
+          content: [{ type: 'text', text: 'AI msg 1' }],
+          tool_calls: [{ id: 'tool1', name: 'read_file', args: { p: '1' } }],
+        }),
         new ToolMessage({ content: 'Tool result 1', tool_call_id: 'tool1' }),
-        new AIMessage('AI message 2'),
+        new AIMessage({
+          content: [{ type: 'text', text: 'AI msg 2' }],
+          tool_calls: [{ id: 'tool2', name: 'read_file', args: { p: '2' } }],
+        }),
         new ToolMessage({ content: 'Tool result 2', tool_call_id: 'tool2' }),
       ];
 
@@ -617,10 +781,10 @@ describe('Prune Messages Tests', () => {
       const result = pruneMessages({ messages });
 
       // The context should include the system message, AI message 2, and Tool result 2
-      // It should NOT start with Tool result 2 alone
+      // AI message 1 + Tool result 1 are pruned. Tool result 1 is orphaned (AI 1 pruned).
       expect(result.context.length).toBe(3);
       expect(result.context[0]).toBe(messages[0]); // System message
-      expect(result.context[1]).toBe(messages[3]); // AI message 2
+      expect(result.context[1].getType()).toBe('ai'); // AI message 2
       expect(result.context[2]).toBe(messages[4]); // Tool result 2
     });
 
@@ -632,6 +796,7 @@ describe('Prune Messages Tests', () => {
         new AIMessage('AI message 1'),
         new ToolMessage({ content: 'Tool result 1', tool_call_id: 'tool1' }),
         new HumanMessage('Human message 2'),
+        // Tool result 2 has no parent AI tool_call — this is an orphan
         new ToolMessage({ content: 'Tool result 2', tool_call_id: 'tool2' }),
       ];
 
@@ -654,12 +819,11 @@ describe('Prune Messages Tests', () => {
 
       const result = pruneMessages({ messages });
 
-      // The context should include the system message, Human message 2, and Tool result 2
-      // It should NOT start with Tool result 2 alone
-      expect(result.context.length).toBe(3);
+      // Tool result 2 is an orphan (no AI message with tool_call_id 'tool2' in context)
+      // so it gets dropped. Context is system + human message 2.
+      expect(result.context.length).toBe(2);
       expect(result.context[0]).toBe(messages[0]); // System message
       expect(result.context[1]).toBe(messages[4]); // Human message 2
-      expect(result.context[2]).toBe(messages[5]); // Tool result 2
     });
 
     it('should handle the case where a tool message is followed by an AI message', () => {
@@ -731,11 +895,20 @@ describe('Prune Messages Tests', () => {
       const messages = [
         new SystemMessage('System instruction'),
         new HumanMessage('Human message 1'),
-        new AIMessage('AI message 1 with tool use'),
+        new AIMessage({
+          content: [{ type: 'text', text: 'AI message 1' }],
+          tool_calls: [{ id: 'tool1', name: 'read_file', args: { path: 'a' } }],
+        }),
         new ToolMessage({ content: 'Tool result 1', tool_call_id: 'tool1' }),
-        new AIMessage('AI message 2 with tool use'),
+        new AIMessage({
+          content: [{ type: 'text', text: 'AI message 2' }],
+          tool_calls: [{ id: 'tool2', name: 'read_file', args: { path: 'b' } }],
+        }),
         new ToolMessage({ content: 'Tool result 2', tool_call_id: 'tool2' }),
-        new AIMessage('AI message 3 with tool use'),
+        new AIMessage({
+          content: [{ type: 'text', text: 'AI message 3' }],
+          tool_calls: [{ id: 'tool3', name: 'read_file', args: { path: 'c' } }],
+        }),
         new ToolMessage({ content: 'Tool result 3', tool_call_id: 'tool3' }),
       ];
 
@@ -759,12 +932,459 @@ describe('Prune Messages Tests', () => {
 
       const result = pruneMessages({ messages });
 
+      // AI messages 2 & 3 with their ToolMessages fit; AI1+Tool1 pruned; Tool1 is orphan (AI1 pruned)
       expect(result.context.length).toBe(5);
       expect(result.context[0]).toBe(messages[0]); // System message
-      expect(result.context[1]).toBe(messages[4]); // AI message 2 with tool use
+      expect(result.context[1].getType()).toBe('ai'); // AI message 2
       expect(result.context[2]).toBe(messages[5]); // Tool result 2
-      expect(result.context[3]).toBe(messages[6]); // AI message 3 with tool use
+      expect(result.context[3].getType()).toBe('ai'); // AI message 3
       expect(result.context[4]).toBe(messages[7]); // Tool result 3
+    });
+  });
+
+  describe('preFlightTruncateToolCallInputs', () => {
+    it('should truncate oversized tool_use input fields in AI messages', () => {
+      const tokenCounter = createTestTokenCounter();
+      const largeInput = '{"function":"' + 'x'.repeat(5000) + '"}';
+      const messages: BaseMessage[] = [
+        new HumanMessage('Run this script'),
+        new AIMessage({
+          content: [
+            { type: 'text', text: 'I will execute the script.' },
+            {
+              type: 'tool_use',
+              id: 'tool-exec',
+              name: 'evaluate_script',
+              input: largeInput,
+            },
+          ],
+          tool_calls: [
+            {
+              id: 'tool-exec',
+              name: 'evaluate_script',
+              args: { function: 'x'.repeat(5000) },
+            },
+          ],
+        }),
+        new ToolMessage({ content: 'Result: OK', tool_call_id: 'tool-exec' }),
+      ];
+
+      const indexTokenCountMap: Record<string, number | undefined> = {
+        0: tokenCounter(messages[0]),
+        1: tokenCounter(messages[1]),
+        2: tokenCounter(messages[2]),
+      };
+
+      const originalTokens = indexTokenCountMap[1] as number;
+      expect(originalTokens).toBeGreaterThan(5000); // Large input counted
+
+      // maxContextTokens: 1000 → maxInputChars = floor(1000 * 0.15) * 4 = 600
+      const truncated = preFlightTruncateToolCallInputs({
+        messages,
+        maxContextTokens: 1000,
+        indexTokenCountMap,
+        tokenCounter,
+      });
+
+      expect(truncated).toBe(1);
+      const newTokens = indexTokenCountMap[1] as number;
+      expect(newTokens).toBeLessThan(originalTokens);
+
+      // Verify the content block was truncated
+      const aiMsg = messages[1] as AIMessage;
+      const toolUseBlock = (
+        aiMsg.content as Array<Record<string, unknown>>
+      ).find((b) => b.type === 'tool_use');
+      expect(toolUseBlock).toBeDefined();
+      const truncatedInput = toolUseBlock!.input as {
+        _truncated: string;
+        _originalChars: number;
+      };
+      expect(truncatedInput._truncated).toContain('[truncated:');
+      expect(truncatedInput._originalChars).toBeGreaterThan(600);
+
+      // Verify tool_calls args were also truncated
+      expect(aiMsg.tool_calls).toBeDefined();
+      const tc = aiMsg.tool_calls![0];
+      expect(tc.args).toHaveProperty('_truncated');
+    });
+
+    it('should not truncate inputs that fit within the budget', () => {
+      const tokenCounter = createTestTokenCounter();
+      const messages: BaseMessage[] = [
+        new HumanMessage('Read a file'),
+        new AIMessage({
+          content: [
+            { type: 'text', text: 'Reading file.' },
+            {
+              type: 'tool_use',
+              id: 'tool-read',
+              name: 'read_file',
+              input: '{"path":"test.txt"}',
+            },
+          ],
+          tool_calls: [
+            { id: 'tool-read', name: 'read_file', args: { path: 'test.txt' } },
+          ],
+        }),
+      ];
+
+      const indexTokenCountMap: Record<string, number | undefined> = {
+        0: tokenCounter(messages[0]),
+        1: tokenCounter(messages[1]),
+      };
+
+      const originalTokens = indexTokenCountMap[1];
+
+      const truncated = preFlightTruncateToolCallInputs({
+        messages,
+        maxContextTokens: 1000,
+        indexTokenCountMap,
+        tokenCounter,
+      });
+
+      expect(truncated).toBe(0);
+      expect(indexTokenCountMap[1]).toBe(originalTokens);
+    });
+
+    it('should skip non-AI messages', () => {
+      const tokenCounter = createTestTokenCounter();
+      const messages: BaseMessage[] = [
+        new HumanMessage('Hello'),
+        new ToolMessage({ content: 'x'.repeat(5000), tool_call_id: 'tool-1' }),
+      ];
+
+      const indexTokenCountMap: Record<string, number | undefined> = {
+        0: tokenCounter(messages[0]),
+        1: tokenCounter(messages[1]),
+      };
+
+      const truncated = preFlightTruncateToolCallInputs({
+        messages,
+        maxContextTokens: 1000,
+        indexTokenCountMap,
+        tokenCounter,
+      });
+
+      // Should not touch ToolMessages (that's preFlightTruncateToolResults' job)
+      expect(truncated).toBe(0);
+    });
+  });
+
+  describe('Instruction token budget reservation (getInstructionTokens)', () => {
+    it('should reserve budget for instruction tokens when no system message is present', () => {
+      const tokenCounter = createTestTokenCounter();
+      // Agent flow: messages do NOT include a system message.
+      // The system message is prepended later by buildSystemRunnable.
+      const messages = [
+        new HumanMessage('Hello there'), // 11 chars
+        new AIMessage('Hi'), // 2 chars
+        new HumanMessage('How are you?'), // 12 chars
+        new AIMessage('Good'), // 4 chars
+      ];
+
+      const indexTokenCountMap: Record<string, number | undefined> = {};
+      for (let i = 0; i < messages.length; i++) {
+        indexTokenCountMap[i] = tokenCounter(messages[i]);
+      }
+
+      // Total message tokens: 11 + 2 + 12 + 4 = 29
+      // Instruction tokens: 20 (simulating system prompt overhead)
+      // Effective budget for messages: 50 - 20 = 30 → fits all 29 tokens
+      const pruneMessages = createPruneMessages({
+        maxTokens: 50,
+        startIndex: 0,
+        tokenCounter,
+        indexTokenCountMap,
+        getInstructionTokens: () => 20,
+      });
+
+      const result = pruneMessages({ messages });
+
+      // All messages should fit: 29 message tokens + 20 instruction = 49 ≤ 50
+      expect(result.context.length).toBe(4);
+      expect(result.context).toEqual(messages);
+      expect(result.messagesToRefine).toEqual([]);
+    });
+
+    it('should prune when messages + instruction tokens exceed budget', () => {
+      const tokenCounter = createTestTokenCounter();
+      const messages = [
+        new HumanMessage('Hello there'), // 11 chars
+        new AIMessage('Hi'), // 2 chars
+        new HumanMessage('How are you?'), // 12 chars
+        new AIMessage('Good'), // 4 chars
+      ];
+
+      const indexTokenCountMap: Record<string, number | undefined> = {};
+      for (let i = 0; i < messages.length; i++) {
+        indexTokenCountMap[i] = tokenCounter(messages[i]);
+      }
+
+      // Total message tokens: 29
+      // Instruction tokens: 25 (simulating large tool schema overhead)
+      // Effective budget: 40 - 25 = 15 → must prune older messages
+      const pruneMessages = createPruneMessages({
+        maxTokens: 40,
+        startIndex: 0,
+        tokenCounter,
+        indexTokenCountMap,
+        getInstructionTokens: () => 25,
+      });
+
+      const result = pruneMessages({ messages });
+
+      // Should prune older messages to fit within 15 available tokens.
+      // Working backwards: "Good" (4) + "How are you?" (12) = 16 > 15
+      // So only "Good" (4) fits, context starts on that AI message.
+      // But startType may require a human message...
+      // Actually with no startType and 3 tokens of overhead,
+      // available = 15 - 3 = 12: "Good" (4) fits, "How are you?" (12) → 4+12=16 > 12
+      // So only "Good" (4) fits.
+      expect(result.context.length).toBeLessThan(4);
+      expect(Array.isArray(result.messagesToRefine)).toBe(true);
+      expect(result.messagesToRefine!.length).toBeGreaterThan(0);
+    });
+
+    it('should correctly account for instruction tokens in early-return path', () => {
+      const tokenCounter = createTestTokenCounter();
+      const messages = [
+        new HumanMessage('Hi'), // 2 chars
+        new AIMessage('Hello'), // 5 chars
+      ];
+
+      const indexTokenCountMap: Record<string, number | undefined> = {};
+      for (let i = 0; i < messages.length; i++) {
+        indexTokenCountMap[i] = tokenCounter(messages[i]);
+      }
+
+      // Message tokens: 7
+      // Instruction tokens: 100 (simulating 26 MCP tools ~5000 chars)
+      // Budget: 50 → 7 + 100 = 107 > 50, so early-return should NOT fire
+      const pruneMessages = createPruneMessages({
+        maxTokens: 50,
+        startIndex: 0,
+        tokenCounter,
+        indexTokenCountMap,
+        getInstructionTokens: () => 100,
+      });
+
+      const result = pruneMessages({ messages });
+
+      // Even though messages alone (7) fit in 50, the instruction overhead (100)
+      // means pruning must occur.  With only 50 - 100 = -50 effective budget,
+      // nothing fits → all messages pruned.
+      expect(result.messagesToRefine!.length).toBeGreaterThan(0);
+    });
+
+    it('should not double-subtract when messages include a system message', () => {
+      const tokenCounter = createTestTokenCounter();
+      const messages = [
+        new SystemMessage('System'), // 6 chars
+        new HumanMessage('Hello there'), // 11 chars
+        new AIMessage('Hi'), // 2 chars
+      ];
+
+      const indexTokenCountMap: Record<string, number | undefined> = {};
+      for (let i = 0; i < messages.length; i++) {
+        indexTokenCountMap[i] = tokenCounter(messages[i]);
+      }
+
+      // When messages[0] IS a system message, getMessagesWithinTokenLimit uses
+      // indexTokenCountMap[0] (6) to subtract from budget, ignoring instructionTokens.
+      // getInstructionTokens is only used when no system message is at index 0.
+      const pruneMessages = createPruneMessages({
+        maxTokens: 30,
+        startIndex: 0,
+        tokenCounter,
+        indexTokenCountMap,
+        getInstructionTokens: () => 999, // Should be ignored for system message path
+      });
+
+      const result = pruneMessages({ messages });
+
+      // Budget: 30 - 6 (system) = 24 available.
+      // "Hi" (2) + "Hello there" (11) + 3 overhead = 16, fits in 24.
+      // All messages should be kept.
+      expect(result.context.length).toBe(3);
+      expect(result.context[0]).toBe(messages[0]); // System message preserved
+    });
+
+    it('index 0 should NOT be inflated when getInstructionTokens is provided', () => {
+      const tokenCounter = createTestTokenCounter();
+      const messages = [
+        new HumanMessage('Hello there'), // 11 chars
+        new AIMessage('Hi'), // 2 chars
+      ];
+
+      const indexTokenCountMap: Record<string, number | undefined> = {};
+      for (let i = 0; i < messages.length; i++) {
+        indexTokenCountMap[i] = tokenCounter(messages[i]);
+      }
+
+      const pruneMessages = createPruneMessages({
+        maxTokens: 50,
+        startIndex: 0,
+        tokenCounter,
+        indexTokenCountMap,
+        getInstructionTokens: () => 10,
+      });
+
+      // Before and after pruning, index 0 should remain 11 (the real token count)
+      expect(indexTokenCountMap[0]).toBe(11);
+      pruneMessages({ messages });
+      // The returned indexTokenCountMap should still have the real count at index 0
+      expect(indexTokenCountMap[0]).toBe(11);
+    });
+
+    it('pre-flight truncation uses effective budget after instruction overhead', () => {
+      const tokenCounter = createTestTokenCounter();
+      // Simulate the real scenario: AI message has a massive tool_call input
+      // (like the chrome-devtools evaluate_script with a 7000-char JS payload)
+      const hugeInput = 'x'.repeat(7000);
+      const messages = [
+        new HumanMessage('show me something'), // 17 chars
+        new AIMessage({
+          content: [
+            { type: 'text', text: 'Creating animation' },
+            {
+              type: 'tool_use',
+              id: 'tool_1',
+              name: 'evaluate_script',
+              input: { function: hugeInput },
+            },
+          ],
+          tool_calls: [
+            {
+              id: 'tool_1',
+              name: 'evaluate_script',
+              args: { function: hugeInput },
+              type: 'tool_call' as const,
+            },
+          ],
+        }),
+        new ToolMessage({ content: 'Script executed', tool_call_id: 'tool_1' }),
+      ];
+
+      const indexTokenCountMap: Record<string, number | undefined> = {};
+      for (let i = 0; i < messages.length; i++) {
+        indexTokenCountMap[i] = tokenCounter(messages[i]);
+      }
+
+      // Without instruction overhead: maxTokens=8000, truncation threshold would be
+      // Math.floor(8000*0.15)*4 = 4800 chars. The AI message would be ~4800+ tokens
+      // (truncated input) which exceeds the real available budget (3600).
+      //
+      // With instruction overhead: effectiveMax=3600, threshold =
+      // Math.floor(3600*0.15)*4 = 2160 chars. The AI message shrinks to ~2200 tokens
+      // which fits in the 3600 available budget.
+      const instructionTokens = 4400;
+      const pruneMessages = createPruneMessages({
+        maxTokens: 8000,
+        startIndex: 0,
+        tokenCounter,
+        indexTokenCountMap,
+        getInstructionTokens: () => instructionTokens,
+      });
+
+      const result = pruneMessages({ messages });
+
+      // The AI message should survive pruning (not be in messagesToRefine)
+      // because pre-flight truncation used the effective budget
+      const aiMessagesInContext = result.context.filter(
+        (m) => m.getType() === 'ai'
+      );
+      expect(aiMessagesInContext.length).toBe(1);
+      expect(result.context.length).toBe(3); // All 3 messages fit after truncation
+    });
+
+    it('emergency truncation recovers when initial prune produces empty context', () => {
+      const tokenCounter = createTestTokenCounter();
+      // Simulate post-summarization state: only 4 messages remain, but one
+      // has a huge tool_call input that exceeds available budget alone.
+      // With char-based counter, the AI message with 4000-char input is ~4000 tokens.
+      // Available budget: 5000 - 4500 = 500. Nothing fits on first pass.
+      const hugeInput = 'x'.repeat(4000);
+      const messages = [
+        new AIMessage({
+          content: [
+            { type: 'text', text: 'Running script' },
+            {
+              type: 'tool_use',
+              id: 'tool_1',
+              name: 'evaluate_script',
+              input: { function: hugeInput },
+            },
+          ],
+          tool_calls: [
+            {
+              id: 'tool_1',
+              name: 'evaluate_script',
+              args: { function: hugeInput },
+              type: 'tool_call' as const,
+            },
+          ],
+        }),
+        new ToolMessage({
+          content: 'Script ran successfully',
+          tool_call_id: 'tool_1',
+        }),
+        new HumanMessage('that looks great'),
+        new AIMessage('Thanks! Want more?'),
+      ];
+
+      const indexTokenCountMap: Record<string, number | undefined> = {};
+      for (let i = 0; i < messages.length; i++) {
+        indexTokenCountMap[i] = tokenCounter(messages[i]);
+      }
+
+      // Available budget is extremely tight: 500 tokens for messages.
+      // The AI message alone is ~4000+ tokens. Initial prune: nothing fits.
+      // Emergency truncation should reduce tool inputs to 150 chars,
+      // making the AI message fit.
+      const pruneMessages = createPruneMessages({
+        maxTokens: 5000,
+        startIndex: 0,
+        tokenCounter,
+        indexTokenCountMap,
+        getInstructionTokens: () => 4500,
+      });
+
+      const result = pruneMessages({ messages });
+
+      // Emergency truncation should have recovered — context is NOT empty
+      expect(result.context.length).toBeGreaterThan(0);
+      // At minimum, the newest messages should be present
+      const types = result.context.map((m) => m.getType());
+      expect(types).toContain('human');
+    });
+  });
+
+  describe('Empty messages guard', () => {
+    it('returns empty context without crashing when messages array is empty', () => {
+      const tokenCounter = createTestTokenCounter();
+      const pruneMessages = createPruneMessages({
+        maxTokens: 8000,
+        startIndex: 0,
+        tokenCounter,
+        indexTokenCountMap: {},
+        getInstructionTokens: () => 4000,
+      });
+
+      // Simulate post-summarization state where REMOVE_ALL left an empty messages array
+      const result = pruneMessages({
+        messages: [],
+        usageMetadata: {
+          input_tokens: 100,
+          output_tokens: 50,
+          total_tokens: 150,
+        } as UsageMetadata,
+      });
+
+      expect(result.context).toEqual([]);
+      expect(result.messagesToRefine).toEqual([]);
+      expect(result.prePruneTotalTokens).toBe(0);
+      expect(result.remainingContextTokens).toBe(8000);
     });
   });
 

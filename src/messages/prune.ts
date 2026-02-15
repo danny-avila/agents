@@ -27,6 +27,15 @@ export type PruneMessagesFactoryParams = {
   thinkingEnabled?: boolean;
   /** Context pruning configuration for position-based tool result degradation. */
   contextPruningConfig?: ContextPruningConfig;
+  /**
+   * Returns the current instruction-token overhead (system message + tool schemas + summary).
+   * Called on each prune invocation so the budget reflects dynamic changes
+   * (e.g. summary added between turns).  When messages don't include a leading
+   * SystemMessage, these tokens are subtracted from the available budget so
+   * the pruner correctly reserves space for the system prompt that will be
+   * prepended later by `buildSystemRunnable`.
+   */
+  getInstructionTokens?: () => number;
 };
 export type PruneMessagesParams = {
   messages: BaseMessage[];
@@ -138,6 +147,7 @@ export function repairOrphanedToolMessages({
   reclaimedTokens: number;
   droppedOrphanCount: number;
 } {
+  // Collect all tool_call IDs from AI messages in context
   const validToolCallIds = new Set<string>();
   for (const message of context) {
     for (const id of getToolCallIds(message)) {
@@ -145,33 +155,70 @@ export function repairOrphanedToolMessages({
     }
   }
 
-  if (validToolCallIds.size === 0) {
-    return {
-      context,
-      reclaimedTokens: 0,
-      droppedOrphanCount: 0,
-    };
+  // Collect all tool_result IDs from ToolMessages in context
+  const presentToolResultIds = new Set<string>();
+  for (const message of context) {
+    const resultId = getToolResultId(message);
+    if (resultId != null) {
+      presentToolResultIds.add(resultId);
+    }
   }
 
   let reclaimedTokens = 0;
   let droppedOrphanCount = 0;
   const repairedContext: BaseMessage[] = [];
+
   for (const message of context) {
-    if (message.getType() !== 'tool') {
+    // Drop orphan ToolMessages whose AI tool_call is not in context.
+    // This covers two cases: (a) AI messages exist but don't claim this tool_call_id,
+    // (b) no AI messages with tool_calls survived pruning at all.
+    if (message.getType() === 'tool') {
+      const toolResultId = getToolResultId(message);
+      if (toolResultId == null || !validToolCallIds.has(toolResultId)) {
+        droppedOrphanCount += 1;
+        reclaimedTokens += resolveTokenCountForMessage({
+          message,
+          allMessages,
+          tokenCounter,
+          indexTokenCountMap,
+        });
+        continue;
+      }
       repairedContext.push(message);
       continue;
     }
 
-    const toolResultId = getToolResultId(message);
-    if (toolResultId == null || !validToolCallIds.has(toolResultId)) {
-      droppedOrphanCount += 1;
-      reclaimedTokens += resolveTokenCountForMessage({
-        message,
-        allMessages,
-        tokenCounter,
-        indexTokenCountMap,
-      });
-      continue;
+    // Strip orphan tool_use blocks from AI messages whose ToolMessages are not in context.
+    // Providers like Anthropic/Bedrock require every tool_use to have a matching tool_result.
+    if (message.getType() === 'ai' && message instanceof AIMessage) {
+      const toolCallIds = getToolCallIds(message);
+      if (toolCallIds.size > 0) {
+        const hasOrphanToolCalls = Array.from(toolCallIds).some(
+          (id) => !presentToolResultIds.has(id)
+        );
+        if (hasOrphanToolCalls) {
+          const originalTokens = resolveTokenCountForMessage({
+            message,
+            allMessages,
+            tokenCounter,
+            indexTokenCountMap,
+          });
+          const stripped = stripOrphanToolUseBlocks(
+            message,
+            presentToolResultIds
+          );
+          if (stripped != null) {
+            const strippedTokens = tokenCounter(stripped);
+            reclaimedTokens += originalTokens - strippedTokens;
+            repairedContext.push(stripped);
+          } else {
+            // AI message had only tool_use blocks, nothing left after stripping
+            droppedOrphanCount += 1;
+            reclaimedTokens += originalTokens;
+          }
+          continue;
+        }
+      }
     }
 
     repairedContext.push(message);
@@ -181,6 +228,73 @@ export function repairOrphanedToolMessages({
     context: repairedContext,
     reclaimedTokens,
     droppedOrphanCount,
+  };
+}
+
+/**
+ * Strips tool_use content blocks and tool_calls entries from an AI message
+ * when their corresponding ToolMessages are not in the context.
+ * Returns null if the message has no content left after stripping.
+ */
+function stripOrphanToolUseBlocks(
+  message: AIMessage,
+  presentToolResultIds: Set<string>
+): AIMessage | null {
+  // Strip tool_calls array entries
+  const keptToolCalls = (message.tool_calls ?? []).filter(
+    (tc) => typeof tc.id === 'string' && presentToolResultIds.has(tc.id)
+  );
+
+  // Strip content blocks
+  let keptContent: MessageContentComplex[] | string;
+  if (Array.isArray(message.content)) {
+    const filtered = (message.content as MessageContentComplex[]).filter(
+      (block) => {
+        if (typeof block !== 'object') {
+          return true;
+        }
+        const record = block as { type?: unknown; id?: unknown };
+        if (
+          (record.type === 'tool_use' || record.type === 'tool_call') &&
+          typeof record.id === 'string'
+        ) {
+          return presentToolResultIds.has(record.id);
+        }
+        return true;
+      }
+    );
+
+    // If nothing left, return null
+    if (filtered.length === 0) {
+      return null;
+    }
+    keptContent = filtered;
+  } else {
+    keptContent = message.content;
+  }
+
+  return new AIMessage({
+    ...message,
+    content: keptContent,
+    tool_calls: keptToolCalls.length > 0 ? keptToolCalls : undefined,
+  });
+}
+
+/**
+ * Truncates an oversized tool_use `input` field, preserving it as a valid JSON object.
+ * The truncated result contains a `_truncated` key with a head-prefix of the
+ * serialized original, plus a `_originalChars` field for visibility.
+ */
+function truncateToolInput(
+  input: unknown,
+  maxChars: number
+): { _truncated: string; _originalChars: number } {
+  const serialized = typeof input === 'string' ? input : JSON.stringify(input);
+  const head = serialized.slice(0, maxChars);
+  return {
+    _truncated:
+      head + `\n… [truncated: ${serialized.length} → ${maxChars} chars]`,
+    _originalChars: serialized.length,
   };
 }
 
@@ -262,6 +376,7 @@ export function getMessagesWithinTokenLimit({
   tokenCounter,
   thinkingStartIndex: _thinkingStartIndex = -1,
   reasoningType = ContentTypes.THINKING,
+  instructionTokens: _instructionTokens = 0,
 }: {
   messages: BaseMessage[];
   maxContextTokens: number;
@@ -271,14 +386,24 @@ export function getMessagesWithinTokenLimit({
   tokenCounter: TokenCounter;
   thinkingStartIndex?: number;
   reasoningType?: ContentTypes.THINKING | ContentTypes.REASONING_CONTENT;
+  /**
+   * Token overhead for instructions (system message + tool schemas + summary)
+   * that are NOT included in `messages`.  When messages[0] is already a
+   * SystemMessage the budget is deducted from its indexTokenCountMap entry
+   * as before; otherwise this value is subtracted from the available budget.
+   */
+  instructionTokens?: number;
 }): PruningResult {
   // Every reply is primed with <|start|>assistant<|message|>, so we
   // start with 3 tokens for the label after all messages have been counted.
   let currentTokenCount = 3;
   const instructions =
     _messages[0]?.getType() === 'system' ? _messages[0] : undefined;
+  // When messages include a system message at index 0, use its token count
+  // from the map.  Otherwise fall back to the explicit instructionTokens
+  // parameter (system prompt prepended later by buildSystemRunnable).
   const instructionsTokenCount =
-    instructions != null ? (indexTokenCountMap[0] ?? 0) : 0;
+    instructions != null ? (indexTokenCountMap[0] ?? 0) : _instructionTokens;
   const initialContextTokens = maxContextTokens - instructionsTokenCount;
   let remainingContextTokens = initialContextTokens;
   let startType = _startType;
@@ -455,9 +580,10 @@ export function getMessagesWithinTokenLimit({
   }
 
   if (assistantIndex === -1) {
-    throw new Error(
-      'Context window exceeded: aggressive pruning removed all AI messages (likely due to an oversized tool response). Increase max context tokens or reduce tool output size.'
-    );
+    // No AI messages survived pruning — skip thinking block reattachment.
+    // The caller handles empty/insufficient context via overflow recovery.
+    result.context = context.reverse() as BaseMessage[];
+    return result;
   }
 
   thinkingStartIndex = originalLength - 1 - assistantIndex;
@@ -595,6 +721,98 @@ export function preFlightTruncateToolResults(params: {
   return truncatedCount;
 }
 
+/**
+ * Pre-flight truncation: truncates oversized `tool_use` input fields in AI messages.
+ *
+ * Tool call inputs (arguments) can be very large — e.g., code evaluation payloads from
+ * MCP tools like chrome-devtools. Since these tool calls have already been executed,
+ * the model only needs a summary of what was called, not the full arguments. Truncating
+ * them before pruning can prevent entire messages from being dropped.
+ *
+ * Uses 15% of the context window (in estimated characters, ~4 chars/token) as the
+ * per-input cap, capped at 200K chars.
+ *
+ * @returns The number of AI messages that had tool_use inputs truncated.
+ */
+export function preFlightTruncateToolCallInputs(params: {
+  messages: BaseMessage[];
+  maxContextTokens: number;
+  indexTokenCountMap: Record<string, number | undefined>;
+  tokenCounter: TokenCounter;
+}): number {
+  const { messages, maxContextTokens, indexTokenCountMap, tokenCounter } =
+    params;
+  const maxInputChars = Math.min(
+    Math.floor(maxContextTokens * 0.15) * 4,
+    200_000
+  );
+  let truncatedCount = 0;
+
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i];
+    if (message.getType() !== 'ai') {
+      continue;
+    }
+    if (!Array.isArray(message.content)) {
+      continue;
+    }
+
+    const originalContent = message.content as MessageContentComplex[];
+    const newContent = originalContent.map((block) => {
+      if (typeof block !== 'object') {
+        return block;
+      }
+      const record = block as Record<string, unknown>;
+      if (record.type !== 'tool_use' && record.type !== 'tool_call') {
+        return block;
+      }
+
+      const input = record.input;
+      if (input == null) {
+        return block;
+      }
+      const serialized =
+        typeof input === 'string' ? input : JSON.stringify(input);
+      if (serialized.length <= maxInputChars) {
+        return block;
+      }
+
+      return {
+        ...record,
+        input: truncateToolInput(input, maxInputChars),
+      };
+    });
+
+    // Check if any blocks were actually replaced
+    if (newContent.every((block, idx) => block === originalContent[idx])) {
+      continue;
+    }
+
+    // Also truncate the matching tool_calls[].args entries
+    const aiMsg = message as AIMessage;
+    const newToolCalls = (aiMsg.tool_calls ?? []).map((tc) => {
+      const serializedArgs = JSON.stringify(tc.args);
+      if (serializedArgs.length <= maxInputChars) {
+        return tc;
+      }
+      return {
+        ...tc,
+        args: truncateToolInput(tc.args, maxInputChars),
+      };
+    });
+
+    messages[i] = new AIMessage({
+      ...aiMsg,
+      content: newContent,
+      tool_calls: newToolCalls.length > 0 ? newToolCalls : undefined,
+    });
+    indexTokenCountMap[i] = tokenCounter(messages[i]);
+    truncatedCount++;
+  }
+
+  return truncatedCount;
+}
+
 type ThinkingBlocks = {
   thinking_blocks?: Array<{
     type: 'thinking';
@@ -619,6 +837,18 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     prePruneTotalTokens?: number;
     remainingContextTokens?: number;
   } {
+    // Guard: empty messages array (e.g. after REMOVE_ALL with empty context).
+    // Nothing to prune — return immediately to avoid out-of-bounds access.
+    if (params.messages.length === 0) {
+      return {
+        context: [],
+        indexTokenCountMap,
+        messagesToRefine: [],
+        prePruneTotalTokens: 0,
+        remainingContextTokens: factoryParams.maxTokens,
+      };
+    }
+
     if (
       factoryParams.provider === Providers.OPENAI &&
       factoryParams.thinkingEnabled === true
@@ -708,11 +938,13 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         params.lastCallUsage?.totalTokens ?? currentUsage.total_tokens;
 
       let totalIndexTokens = 0;
-      if (params.messages[0].getType() === 'system') {
+      const firstIsSystem =
+        params.messages.length > 0 && params.messages[0].getType() === 'system';
+      if (firstIsSystem) {
         totalIndexTokens += indexTokenCountMap[0] ?? 0;
       }
       for (let i = lastCutOffIndex; i < params.messages.length; i++) {
-        if (i === 0 && params.messages[0].getType() === 'system') {
+        if (i === 0 && firstIsSystem) {
           continue;
         }
         if (newOutputs.has(i)) {
@@ -732,14 +964,11 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         for (let i = lastCutOffIndex; i < params.messages.length; i++) {
           preCalibrationSnapshot[i] = indexTokenCountMap[i];
         }
-        if (params.messages[0].getType() === 'system') {
+        if (firstIsSystem) {
           preCalibrationSnapshot[0] = indexTokenCountMap[0];
         }
 
-        if (
-          params.messages[0].getType() === 'system' &&
-          lastCutOffIndex !== 0
-        ) {
+        if (firstIsSystem && lastCutOffIndex !== 0) {
           indexTokenCountMap[0] = Math.round(
             (indexTokenCountMap[0] ?? 0) * ratio
           );
@@ -773,12 +1002,33 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       }
     }
 
+    // Get instruction token overhead (system message + tool schemas + summary).
+    // This budget is reserved for content prepended after pruning by buildSystemRunnable.
+    // Computed BEFORE pre-flight truncation so the effective available budget can
+    // drive truncation thresholds — without this, truncation thresholds based on
+    // maxTokens are too generous and leave individual messages larger than the
+    // actual available budget.
+    const currentInstructionTokens =
+      factoryParams.getInstructionTokens?.() ?? 0;
+    const effectiveMaxTokens = Math.max(
+      0,
+      factoryParams.maxTokens - currentInstructionTokens
+    );
+
     // Pre-flight truncation: truncate oversized tool results before pruning.
-    // This runs after calibration so token counts are reasonably accurate,
-    // but before getMessagesWithinTokenLimit so pruning works with correct counts.
+    // Uses effectiveMaxTokens (after instruction overhead) so thresholds reflect
+    // the real budget available for messages.
     preFlightTruncateToolResults({
       messages: params.messages,
-      maxContextTokens: factoryParams.maxTokens,
+      maxContextTokens: effectiveMaxTokens,
+      indexTokenCountMap,
+      tokenCounter: factoryParams.tokenCounter,
+    });
+
+    // Pre-flight truncation: truncate oversized tool_use inputs (args) in AI messages.
+    preFlightTruncateToolCallInputs({
+      messages: params.messages,
+      maxContextTokens: effectiveMaxTokens,
       indexTokenCountMap,
       tokenCounter: factoryParams.tokenCounter,
     });
@@ -803,13 +1053,17 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     }
 
     lastTurnStartIndex = params.messages.length;
-    if (lastCutOffIndex === 0 && totalTokens <= factoryParams.maxTokens) {
+    if (
+      lastCutOffIndex === 0 &&
+      totalTokens + currentInstructionTokens <= factoryParams.maxTokens
+    ) {
       return {
         context: params.messages,
         indexTokenCountMap,
         messagesToRefine: [],
         prePruneTotalTokens: totalTokens,
-        remainingContextTokens: factoryParams.maxTokens - totalTokens,
+        remainingContextTokens:
+          factoryParams.maxTokens - totalTokens - currentInstructionTokens,
       };
     }
 
@@ -825,6 +1079,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       startType: params.startType,
       thinkingEnabled: factoryParams.thinkingEnabled,
       tokenCounter: factoryParams.tokenCounter,
+      instructionTokens: currentInstructionTokens,
       reasoningType:
         factoryParams.provider === Providers.BEDROCK
           ? ContentTypes.REASONING_CONTENT
@@ -835,12 +1090,137 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
           : undefined,
     });
 
-    const { context, reclaimedTokens } = repairOrphanedToolMessages({
+    let { context, reclaimedTokens } = repairOrphanedToolMessages({
       context: initialContext,
       allMessages: params.messages,
       tokenCounter: factoryParams.tokenCounter,
       indexTokenCountMap,
     });
+
+    // ---------------------------------------------------------------
+    // Emergency truncation: if pruning produced an empty context but
+    // messages exist, aggressively truncate all tool_call inputs and
+    // tool results to a minimal stub, then retry.  This handles the
+    // scenario where a single oversized tool_call (e.g. evaluate_script
+    // with thousands of chars of JavaScript) exceeds the available
+    // budget on its own, making the pruner give up entirely.
+    // ---------------------------------------------------------------
+    if (
+      context.length === 0 &&
+      params.messages.length > 0 &&
+      effectiveMaxTokens > 0
+    ) {
+      // Aggressively truncate: tool result content and tool_call inputs
+      // are reduced to a minimal stub so the model knows what was called
+      // but the payload is removed.
+      const EMERGENCY_MAX_CHARS = 150;
+      for (let i = 0; i < params.messages.length; i++) {
+        const message = params.messages[i];
+        // Truncate ToolMessage content
+        if (message.getType() === 'tool') {
+          const content = message.content;
+          if (
+            typeof content === 'string' &&
+            content.length > EMERGENCY_MAX_CHARS
+          ) {
+            (message as ToolMessage).content =
+              content.slice(0, EMERGENCY_MAX_CHARS) +
+              `\n… [emergency truncated: ${content.length} → ${EMERGENCY_MAX_CHARS} chars]`;
+            indexTokenCountMap[i] = factoryParams.tokenCounter(message);
+          }
+        }
+        // Truncate AI message tool_call inputs
+        if (message.getType() === 'ai' && Array.isArray(message.content)) {
+          const aiMsg = message as AIMessage;
+          const contentBlocks = aiMsg.content as MessageContentComplex[];
+          const needsTruncation = contentBlocks.some((block) => {
+            if (typeof block !== 'object') return false;
+            const record = block as Record<string, unknown>;
+            if (
+              (record.type === 'tool_use' || record.type === 'tool_call') &&
+              record.input != null
+            ) {
+              const serialized =
+                typeof record.input === 'string'
+                  ? record.input
+                  : JSON.stringify(record.input);
+              return serialized.length > EMERGENCY_MAX_CHARS;
+            }
+            return false;
+          });
+          if (needsTruncation) {
+            const newContent = contentBlocks.map((block) => {
+              if (typeof block !== 'object') return block;
+              const record = block as Record<string, unknown>;
+              if (
+                (record.type === 'tool_use' || record.type === 'tool_call') &&
+                record.input != null
+              ) {
+                const serialized =
+                  typeof record.input === 'string'
+                    ? record.input
+                    : JSON.stringify(record.input);
+                if (serialized.length > EMERGENCY_MAX_CHARS) {
+                  return {
+                    ...record,
+                    input: truncateToolInput(record.input, EMERGENCY_MAX_CHARS),
+                  };
+                }
+              }
+              return block;
+            });
+            const newToolCalls = (aiMsg.tool_calls ?? []).map((tc) => {
+              const serializedArgs = JSON.stringify(tc.args);
+              if (serializedArgs.length > EMERGENCY_MAX_CHARS) {
+                return {
+                  ...tc,
+                  args: truncateToolInput(tc.args, EMERGENCY_MAX_CHARS),
+                };
+              }
+              return tc;
+            });
+            params.messages[i] = new AIMessage({
+              ...aiMsg,
+              content: newContent,
+              tool_calls: newToolCalls.length > 0 ? newToolCalls : undefined,
+            });
+            indexTokenCountMap[i] = factoryParams.tokenCounter(
+              params.messages[i]
+            );
+          }
+        }
+      }
+
+      // Retry pruning with the emergency-truncated messages
+      const retryResult = getMessagesWithinTokenLimit({
+        maxContextTokens: factoryParams.maxTokens,
+        messages: params.messages,
+        indexTokenCountMap,
+        startType: params.startType,
+        thinkingEnabled: factoryParams.thinkingEnabled,
+        tokenCounter: factoryParams.tokenCounter,
+        instructionTokens: currentInstructionTokens,
+        reasoningType:
+          factoryParams.provider === Providers.BEDROCK
+            ? ContentTypes.REASONING_CONTENT
+            : ContentTypes.THINKING,
+        thinkingStartIndex:
+          factoryParams.thinkingEnabled === true
+            ? runThinkingStartIndex
+            : undefined,
+      });
+
+      const repaired = repairOrphanedToolMessages({
+        context: retryResult.context,
+        allMessages: params.messages,
+        tokenCounter: factoryParams.tokenCounter,
+        indexTokenCountMap,
+      });
+
+      context = repaired.context;
+      reclaimedTokens = repaired.reclaimedTokens;
+      messagesToRefine.push(...retryResult.messagesToRefine);
+    }
 
     const remainingContextTokens = Math.max(
       0,
