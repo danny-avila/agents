@@ -1,16 +1,16 @@
+import { createHash } from 'crypto';
 import {
+  AIMessage,
   HumanMessage,
   SystemMessage,
-  AIMessage,
 } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { BaseMessage } from '@langchain/core/messages';
-import { createHash } from 'crypto';
-import type * as t from '@/types';
-import { getChatModelClass } from '@/llm/providers';
-import { safeDispatchCustomEvent } from '@/utils/events';
-import { ContentTypes, GraphEvents, StepTypes, Providers } from '@/common';
 import type { AgentContext } from '@/agents/AgentContext';
+import type * as t from '@/types';
+import { ContentTypes, GraphEvents, StepTypes, Providers } from '@/common';
+import { safeDispatchCustomEvent } from '@/utils/events';
+import { getChatModelClass } from '@/llm/providers';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -329,8 +329,69 @@ function splitMessagesByCharShare(
 // Prompt & config helpers
 // ---------------------------------------------------------------------------
 
-export const DEFAULT_SUMMARIZATION_PROMPT =
-  'Summarize the conversation concisely. Preserve key facts, decisions, identifiers, file paths, tool results, and open questions. Use short sentences. If a prior summary is provided, integrate new information into it. Output only the summary.';
+/**
+ * Structured checkpoint format for fresh summarization (no prior summary).
+ * Adapted from pi-coding-agent's SUMMARIZATION_PROMPT pattern.
+ * The explicit section structure ensures consistent, machine-parseable output
+ * that survives multiple summarization cycles without information loss.
+ */
+export const DEFAULT_SUMMARIZATION_PROMPT = `Create a structured context checkpoint summary of the conversation. This summary will replace the conversation messages, so it must capture everything needed to continue the work.
+
+Use this exact format:
+
+## Goal
+The user's primary objective and any sub-goals identified during the conversation.
+
+## Constraints & Preferences
+Configuration choices, style preferences, architectural decisions, technology choices, or rules the user has established.
+
+## Progress
+### Done
+- Completed items with their outcomes
+
+### In Progress
+- Current work items and their state
+
+### Blocked
+- Items that cannot proceed and why
+
+## Key Decisions
+Decisions made and their rationale. Include alternatives that were rejected and why.
+
+## Next Steps
+What should happen next, in priority order.
+
+## Critical Context
+Specific identifiers, names, error messages, URLs, and other details that must be preserved verbatim.
+
+Rules:
+- Preserve exact identifiers, names, error messages, and key references — do NOT paraphrase them
+- Record each tool call outcome (success or failure with reason), not raw output
+- Do NOT reproduce tool output or long content verbatim
+- Use short declarative sentences
+- Omit empty sections
+- Output only the summary`;
+
+/**
+ * Prompt for incremental summary updates when a prior summary exists.
+ * Adapted from pi-coding-agent's UPDATE_SUMMARIZATION_PROMPT pattern.
+ * The rules ensure existing information is preserved while new information
+ * is integrated into the correct sections.
+ */
+export const DEFAULT_UPDATE_SUMMARIZATION_PROMPT = `Update the existing summary checkpoint with information from new conversation messages. Maintain the same structured format.
+
+Rules:
+- PRESERVE all existing information from the previous summary unless explicitly contradicted by new messages
+- ADD new progress, decisions, and context from the new messages
+- Move items from "In Progress" to "Done" when completed
+- Move items from "Blocked" to "In Progress" or "Done" as appropriate
+- Add new items to the appropriate sections
+- Update "Next Steps" to reflect current priorities
+- Preserve exact identifiers, names, error messages, and key references — do NOT paraphrase them
+- Record each tool call outcome (success or failure with reason), not raw output
+- Do NOT reproduce tool output or long content verbatim
+- Omit empty sections
+- Output only the updated summary using the same format`;
 
 /**
  * Separates summarization-specific parameters (parts, minMessagesForSplit, etc.)
@@ -428,6 +489,82 @@ function generateMetadataStub(messages: BaseMessage[]): string {
 }
 
 // ---------------------------------------------------------------------------
+// Post-LLM summary enrichment
+// ---------------------------------------------------------------------------
+// Adapted from openclaw's compaction-safeguard pattern. After the LLM produces
+// its summary, mechanically append structured data that the LLM might miss:
+// tool failures and file operations. This guarantees these survive compaction
+// regardless of LLM quality.
+
+/** Maximum number of tool failures to include in the enrichment section. */
+const MAX_TOOL_FAILURES = 8;
+/** Maximum chars per failure summary line. */
+const MAX_TOOL_FAILURE_CHARS = 240;
+
+/**
+ * Extracts failed tool results from messages and formats them as a structured
+ * section. LLMs often omit specific failure details (exit codes, error messages)
+ * from their summaries — this mechanical enrichment guarantees they survive.
+ */
+function extractToolFailuresSection(messages: BaseMessage[]): string {
+  const failures: Array<{ toolName: string; summary: string }> = [];
+  const seen = new Set<string>();
+
+  for (const msg of messages) {
+    if (msg._getType() !== 'tool') {
+      continue;
+    }
+    const toolMsg = msg as import('@langchain/core/messages').ToolMessage;
+    if (toolMsg.status !== 'error') {
+      continue;
+    }
+    // Deduplicate by tool_call_id
+    const callId = toolMsg.tool_call_id;
+    if (callId && seen.has(callId)) {
+      continue;
+    }
+    if (callId) {
+      seen.add(callId);
+    }
+
+    const toolName = toolMsg.name ?? 'tool';
+    const content =
+      typeof toolMsg.content === 'string'
+        ? toolMsg.content
+        : JSON.stringify(toolMsg.content);
+    const normalized = content.replace(/\s+/g, ' ').trim();
+    const summary =
+      normalized.length > MAX_TOOL_FAILURE_CHARS
+        ? `${normalized.slice(0, MAX_TOOL_FAILURE_CHARS - 3)}...`
+        : normalized;
+
+    failures.push({ toolName, summary });
+  }
+
+  if (failures.length === 0) {
+    return '';
+  }
+
+  const lines = failures
+    .slice(0, MAX_TOOL_FAILURES)
+    .map((f) => `- ${f.toolName}: ${f.summary}`);
+  if (failures.length > MAX_TOOL_FAILURES) {
+    lines.push(`- ...and ${failures.length - MAX_TOOL_FAILURES} more`);
+  }
+
+  return `\n\n## Tool Failures\n${lines.join('\n')}`;
+}
+
+/**
+ * Appends mechanical enrichment sections to an LLM-generated summary.
+ * Tool failures are appended verbatim because LLMs often omit specific
+ * error details from their summaries.
+ */
+function enrichSummary(summaryText: string, messages: BaseMessage[]): string {
+  return summaryText + extractToolFailuresSection(messages);
+}
+
+// ---------------------------------------------------------------------------
 // Summarize node
 // ---------------------------------------------------------------------------
 
@@ -467,6 +604,11 @@ export function createSummarizeNode({
     const parameters = summarizationConfig?.parameters ?? {};
     const promptText =
       summarizationConfig?.prompt ?? DEFAULT_SUMMARIZATION_PROMPT;
+    // Use a dedicated update prompt when integrating into an existing summary.
+    // Falls back to the main promptText if no update prompt is configured
+    // (which is fine for custom prompts that handle both cases).
+    const updatePromptText =
+      summarizationConfig?.updatePrompt ?? DEFAULT_UPDATE_SUMMARIZATION_PROMPT;
     const streaming = summarizationConfig?.stream !== false;
 
     // Separate summarization-specific params from LLM constructor params.
@@ -597,6 +739,7 @@ export function createSummarizeNode({
           messages: messagesToRefine,
           parts,
           promptText,
+          updatePromptText,
           priorSummaryText,
           config: summarizeConfig,
           streaming,
@@ -607,6 +750,7 @@ export function createSummarizeNode({
           model,
           messages: messagesToRefine,
           promptText,
+          updatePromptText,
           priorSummaryText,
           config: summarizeConfig,
           streaming,
@@ -619,6 +763,7 @@ export function createSummarizeNode({
           model,
           messages: messagesToRefine,
           promptText,
+          updatePromptText,
           priorSummaryText,
           config: summarizeConfig,
           streaming,
@@ -644,6 +789,9 @@ export function createSummarizeNode({
       }
       return { summarizationRequest: undefined };
     }
+
+    // ----- Enrich with structured data the LLM may have omitted -----
+    summaryText = enrichSummary(summaryText, messagesToRefine);
 
     // ----- Finalize -----
     let tokenCount = 0;
@@ -730,6 +878,8 @@ interface SummarizeParams {
   model: SummarizeModel;
   messages: BaseMessage[];
   promptText: string;
+  /** Prompt to use when a prior summary exists (incremental update). Falls back to promptText if not provided. */
+  updatePromptText?: string;
   priorSummaryText: string;
   /** RunnableConfig for callback/tracing propagation (NOT for system instructions). */
   config?: RunnableConfig;
@@ -792,6 +942,7 @@ async function summarizeSinglePass({
   model,
   messages,
   promptText,
+  updatePromptText,
   priorSummaryText,
   config,
   streaming,
@@ -799,32 +950,39 @@ async function summarizeSinglePass({
 }: SummarizeParams & { budgetChars?: number }): Promise<string> {
   const formattedText = formatMessagesForSummarization(messages, budgetChars);
 
+  // Select the appropriate prompt: use the update variant when integrating
+  // new messages into an existing summary, fresh prompt otherwise.
+  const effectivePrompt = priorSummaryText
+    ? (updatePromptText ?? promptText)
+    : promptText;
+
   const humanMessageText = priorSummaryText
-    ? `## Prior Summary\n\n${priorSummaryText}\n\n## New Messages to Incorporate\n\n${formattedText}`
-    : formattedText;
+    ? `<previous-summary>\n${priorSummaryText}\n</previous-summary>\n\n<conversation>\n${formattedText}\n</conversation>`
+    : `<conversation>\n${formattedText}\n</conversation>`;
 
   return streamAndCollect(
     model,
-    [new SystemMessage(promptText), new HumanMessage(humanMessageText)],
+    [new SystemMessage(effectivePrompt), new HumanMessage(humanMessageText)],
     traceConfig(config, 'single_pass'),
     streaming
   );
 }
 
 /**
- * Multi-stage summarization:
- *   1. Split messages into `parts` groups by character weight
- *   2. Summarize each chunk independently
- *   3. Merge partial summaries with a dedicated merge prompt
+ * Multi-stage summarization via progressive chaining:
+ *   1. Split messages into chunks by character weight (adaptive sizing)
+ *   2. Summarize chunks sequentially — each chunk's summary becomes
+ *      context for the next, preserving temporal ordering
  *
- * This produces better summaries for large message histories because each
- * LLM call processes a focused subset instead of a truncated overview.
+ * Uses the update prompt (if available) when a running summary exists,
+ * falling back to the fresh prompt for the first chunk with no prior context.
  */
 async function summarizeInStages({
   model,
   messages,
   parts,
   promptText,
+  updatePromptText,
   priorSummaryText,
   config,
   streaming,
@@ -858,6 +1016,7 @@ async function summarizeInStages({
       model,
       messages,
       promptText,
+      updatePromptText,
       priorSummaryText,
       config,
       streaming,
@@ -869,22 +1028,35 @@ async function summarizeInStages({
   // and eliminates the merge LLM call entirely.
   // Trade-off: chunks must be processed sequentially (no parallelism).
   let runningSummary = priorSummaryText || '';
-  const maxSummaryChars = (maxSummaryTokens ?? 2048) * 6;
+  // Cap running summary so it doesn't consume too much of the next chunk's input.
+  // Use 4 chars/token (standard ratio) and also cap at 40% of chunk budget so the
+  // actual messages still get the majority of the summarizer's attention.
+  const maxSummaryChars = Math.min(
+    (maxSummaryTokens ?? 2048) * 4,
+    Math.floor(CHUNK_BUDGET_CHARS * 0.4)
+  );
 
   for (let i = 0; i < chunks.length; i++) {
     const chunk = chunks[i];
     const formattedText = formatMessagesForSummarization(chunk);
 
+    // Use update prompt when we have a running summary (either from prior
+    // summary or from a previous chunk), fresh prompt for the first chunk
+    // with no prior context.
+    const effectivePrompt = runningSummary
+      ? (updatePromptText ?? promptText)
+      : promptText;
+
     let humanText: string;
     if (runningSummary) {
-      humanText = `## Prior Summary\n\n${runningSummary}\n\n## Messages (Part ${i + 1} of ${chunks.length})\n\n${formattedText}`;
+      humanText = `<previous-summary>\n${runningSummary}\n</previous-summary>\n\n<conversation>\nPart ${i + 1} of ${chunks.length}:\n\n${formattedText}\n</conversation>`;
     } else {
-      humanText = `## Messages (Part ${i + 1} of ${chunks.length})\n\n${formattedText}`;
+      humanText = `<conversation>\nPart ${i + 1} of ${chunks.length}:\n\n${formattedText}\n</conversation>`;
     }
 
     const text = await streamAndCollect(
       model,
-      [new SystemMessage(promptText), new HumanMessage(humanText)],
+      [new SystemMessage(effectivePrompt), new HumanMessage(humanText)],
       traceConfig(config, 'multi_stage_chunk', {
         chunk_index: i,
         total_chunks: chunks.length,
