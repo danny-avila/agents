@@ -15,9 +15,11 @@ import {
   repairOrphanedToolMessages,
   createPruneMessages,
   preFlightTruncateToolCallInputs,
+  sanitizeOrphanToolBlocks,
+  getMessagesWithinTokenLimit as realGetMessagesWithinTokenLimit,
 } from '@/messages/prune';
 import { getLLMConfig } from '@/utils/llmConfig';
-import { Providers } from '@/common';
+import { Providers, ContentTypes } from '@/common';
 import { Run } from '@/run';
 
 // Create a simple token counter for testing
@@ -1429,5 +1431,289 @@ describe('Prune Messages Tests', () => {
       expect(finalMessages).toBeDefined();
       expect(finalMessages?.length).toBeGreaterThan(0);
     });
+  });
+});
+
+describe('sanitizeOrphanToolBlocks', () => {
+  it('strips orphan tool_use blocks from AI messages with no matching ToolMessage', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('Hello'),
+      new AIMessage({
+        content: [
+          { type: 'text', text: 'Let me check.' },
+          { type: 'tool_use', id: 'tool_1', name: 'calc', input: { x: 1 } },
+        ],
+        tool_calls: [
+          { id: 'tool_1', name: 'calc', args: { x: 1 }, type: 'tool_call' },
+        ],
+      }),
+      // No ToolMessage for tool_1 — orphan
+    ];
+
+    const result = sanitizeOrphanToolBlocks(messages);
+    // The stripped AI message was the last message → dropped (incomplete tool call)
+    expect(result).toHaveLength(1);
+    expect(result[0].getType()).toBe('human');
+  });
+
+  it('drops orphan ToolMessages whose AI message is missing', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('Hello'),
+      new ToolMessage({
+        content: 'result',
+        tool_call_id: 'tool_orphan',
+        name: 'calc',
+      }),
+      new AIMessage('Some response'),
+    ];
+
+    const result = sanitizeOrphanToolBlocks(messages);
+    expect(result).toHaveLength(2); // HumanMessage + AIMessage, orphan ToolMessage dropped
+    expect(result[0].getType()).toBe('human');
+    expect(result[1].getType()).toBe('ai');
+  });
+
+  it('preserves correctly paired tool_use and ToolMessages', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('Compute 1+1'),
+      new AIMessage({
+        content: [
+          { type: 'text', text: 'Let me calculate.' },
+          { type: 'tool_use', id: 'tool_a', name: 'calc', input: { x: 1 } },
+        ],
+        tool_calls: [
+          { id: 'tool_a', name: 'calc', args: { x: 1 }, type: 'tool_call' },
+        ],
+      }),
+      new ToolMessage({
+        content: '2',
+        tool_call_id: 'tool_a',
+        name: 'calc',
+      }),
+      new AIMessage('The answer is 2.'),
+    ];
+
+    const result = sanitizeOrphanToolBlocks(messages);
+    expect(result).toHaveLength(4); // All messages preserved
+    expect(result.map((m) => m.getType())).toEqual([
+      'human',
+      'ai',
+      'tool',
+      'ai',
+    ]);
+  });
+
+  it('drops AI message entirely when it only contained orphan tool_use blocks', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('Do something'),
+      new AIMessage({
+        content: [{ type: 'tool_use', id: 'tool_x', name: 'run', input: {} }],
+        tool_calls: [
+          { id: 'tool_x', name: 'run', args: {}, type: 'tool_call' },
+        ],
+      }),
+      // No ToolMessage for tool_x
+    ];
+
+    const result = sanitizeOrphanToolBlocks(messages);
+    // The AI message had only tool_use blocks, stripping them leaves nothing → dropped
+    expect(result).toHaveLength(1);
+    expect(result[0].getType()).toBe('human');
+  });
+
+  it('keeps stripped AI message in the middle but drops stripped trailing AI', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('First question'),
+      new AIMessage({
+        content: [
+          { type: 'text', text: 'Let me use two tools.' },
+          { type: 'tool_use', id: 'tool_a', name: 'calc', input: { x: 1 } },
+          {
+            type: 'tool_use',
+            id: 'tool_orphan',
+            name: 'search',
+            input: { q: 'test' },
+          },
+        ],
+        tool_calls: [
+          { id: 'tool_a', name: 'calc', args: { x: 1 }, type: 'tool_call' },
+          {
+            id: 'tool_orphan',
+            name: 'search',
+            args: { q: 'test' },
+            type: 'tool_call',
+          },
+        ],
+      }),
+      new ToolMessage({
+        content: '42',
+        tool_call_id: 'tool_a',
+        name: 'calc',
+      }),
+      // No ToolMessage for tool_orphan, but conversation continues:
+      new AIMessage({
+        content: [{ type: 'text', text: 'Got the calc result.' }],
+        tool_calls: [
+          { id: 'tool_b', name: 'run', args: {}, type: 'tool_call' },
+        ],
+      }),
+      // tool_b is also orphan → stripped, and this AI is last → dropped
+    ];
+
+    const result = sanitizeOrphanToolBlocks(messages);
+    // message[1]: AI has tool_orphan stripped but tool_a kept → stays (middle, not trailing)
+    // message[3]: AI has tool_b stripped, is trailing → dropped
+    expect(result).toHaveLength(3); // HumanMessage, stripped AI (kept tool_a), ToolMessage
+    const ai = result[1] as AIMessage;
+    expect(ai.tool_calls).toHaveLength(1);
+    expect(ai.tool_calls![0].id).toBe('tool_a');
+    expect(result[2].getType()).toBe('tool');
+  });
+
+  it('keeps unmodified trailing AI message (no orphan tool_use)', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('Hello'),
+      new ToolMessage({
+        content: 'result',
+        tool_call_id: 'tool_orphan',
+        name: 'calc',
+      }),
+      new AIMessage('Final response without tool calls.'),
+    ];
+
+    const result = sanitizeOrphanToolBlocks(messages);
+    // orphan ToolMessage dropped, trailing AI kept (was not stripped)
+    expect(result).toHaveLength(2);
+    expect(result[0].getType()).toBe('human');
+    expect(result[1].getType()).toBe('ai');
+  });
+
+  it('handles plain objects (non-BaseMessage instances) via duck typing', () => {
+    // Simulate messages that have lost their class instances (LangGraph state serialization)
+    const plainMessages = [
+      { role: 'user', content: 'Hello', _type: 'human' },
+      {
+        role: 'assistant',
+        _type: 'ai',
+        content: [
+          { type: 'text', text: 'Let me check.' },
+          { type: 'tool_use', id: 'tool_1', name: 'calc', input: { x: 1 } },
+        ],
+        tool_calls: [
+          { id: 'tool_1', name: 'calc', args: { x: 1 }, type: 'tool_call' },
+        ],
+      },
+      // No ToolMessage for tool_1 — orphan
+    ] as unknown as BaseMessage[];
+
+    // Should not throw "getType is not a function"
+    const result = sanitizeOrphanToolBlocks(plainMessages);
+    // The stripped AI message was the last message → dropped (incomplete tool call)
+    expect(result).toHaveLength(1);
+  });
+});
+
+describe('prunedMemory ordering with thinking enabled', () => {
+  it('messagesToRefine preserves chronological order when thinking search pops multiple messages', () => {
+    const tokenCounter = createTestTokenCounter();
+    const messages: BaseMessage[] = [
+      new HumanMessage('Hello'),
+      new AIMessage({
+        content: [
+          {
+            type: ContentTypes.REASONING_CONTENT,
+            reasoningText: {
+              text: 'Thinking about navigation...',
+              signature: 'sig1',
+            },
+          },
+          { type: 'text', text: 'Navigating now.' },
+        ],
+        tool_calls: [
+          {
+            id: 'tc_nav',
+            name: 'navigate',
+            args: { url: 'about:blank' },
+            type: 'tool_call',
+          },
+        ],
+      }),
+      new ToolMessage({
+        content: 'Navigated to about:blank.',
+        tool_call_id: 'tc_nav',
+        name: 'navigate',
+      }),
+      new AIMessage({
+        content: [
+          {
+            type: ContentTypes.REASONING_CONTENT,
+            reasoningText: {
+              text: 'Now I will write code...',
+              signature: 'sig2',
+            },
+          },
+          { type: 'text', text: 'Running script.' },
+        ],
+        tool_calls: [
+          {
+            id: 'tc_eval',
+            name: 'evaluate',
+            args: { code: 'x'.repeat(5000) },
+            type: 'tool_call',
+          },
+        ],
+      }),
+      new ToolMessage({
+        content: 'y'.repeat(5000), // large tool result
+        tool_call_id: 'tc_eval',
+        name: 'evaluate',
+      }),
+    ];
+
+    const indexTokenCountMap: Record<string, number | undefined> = {};
+    for (let i = 0; i < messages.length; i++) {
+      indexTokenCountMap[i] = tokenCounter(messages[i]);
+    }
+
+    // Use a very tight budget so the backward iteration must prune messages
+    // The thinking search will cause the loop to `continue` past the large ToolMessage
+    const result = realGetMessagesWithinTokenLimit({
+      messages,
+      maxContextTokens: 200, // very tight
+      indexTokenCountMap,
+      thinkingEnabled: true,
+      tokenCounter,
+      reasoningType: ContentTypes.REASONING_CONTENT,
+    });
+
+    // The key assertion: messagesToRefine must be in chronological order.
+    // AI(evaluate) at index 3 must come BEFORE ToolMessage(evaluate) at index 4.
+    for (let i = 0; i < result.messagesToRefine.length - 1; i++) {
+      const current = result.messagesToRefine[i];
+      const next = result.messagesToRefine[i + 1];
+      // A ToolMessage should never come before its AI message
+      if (next.getType() === 'ai' && current.getType() === 'tool') {
+        const toolId = (current as ToolMessage).tool_call_id;
+        const aiToolIds = ((next as AIMessage).tool_calls ?? []).map(
+          (tc) => tc.id
+        );
+        expect(aiToolIds).not.toContain(toolId);
+      }
+    }
+
+    // Verify the specific ordering: if both AI(evaluate) and Tool(evaluate) are in
+    // messagesToRefine, AI must come first.
+    const evalAiIdx = result.messagesToRefine.findIndex(
+      (m) =>
+        m.getType() === 'ai' &&
+        ((m as AIMessage).tool_calls ?? []).some((tc) => tc.id === 'tc_eval')
+    );
+    const evalToolIdx = result.messagesToRefine.findIndex(
+      (m) =>
+        m.getType() === 'tool' && (m as ToolMessage).tool_call_id === 'tc_eval'
+    );
+    if (evalAiIdx >= 0 && evalToolIdx >= 0) {
+      expect(evalAiIdx).toBeLessThan(evalToolIdx);
+    }
   });
 });

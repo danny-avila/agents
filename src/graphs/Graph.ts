@@ -33,8 +33,9 @@ import {
   formatAnthropicArtifactContent,
   ensureThinkingBlockInMessages,
   convertMessagesToContent,
-  addBedrockCacheControl,
+  sanitizeOrphanToolBlocks,
   extractToolDiscoveries,
+  addBedrockCacheControl,
   modifyDeltaProperties,
   formatArtifactPayload,
   formatContentStrings,
@@ -970,6 +971,19 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           finalMessages,
           agentContext.provider
         );
+      }
+
+      // Safety net: strip orphan tool_use blocks (AI messages referencing
+      // tool results that are no longer in the context) and orphan
+      // ToolMessages.  This prevents Anthropic/Bedrock structural validation
+      // errors ("tool_use ids without tool_result") that can arise when
+      // summarization or message reconstruction produces an incomplete
+      // tool_call / tool_result sequence.
+      if (
+        agentContext.provider === Providers.ANTHROPIC ||
+        agentContext.provider === Providers.BEDROCK
+      ) {
+        finalMessages = sanitizeOrphanToolBlocks(finalMessages);
       }
 
       if (

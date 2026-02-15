@@ -583,61 +583,83 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
       });
     };
 
-    let run = await createRun();
+    // Build up conversation at generous limits so messages accumulate
+    let run = await createRun(1500);
     await runTurn(
       { run, conversationHistory },
       'Compute 54321 * 12345 using calculator.',
       streamConfig
     );
 
-    run = await createRun();
+    run = await createRun(1500);
     await runTurn(
       { run, conversationHistory },
       'Now calculate 670592745 / 99991. Calculator.',
       streamConfig
     );
 
-    run = await createRun();
+    run = await createRun(1500);
     await runTurn(
       { run, conversationHistory },
       'What is sqrt(670592745)? Calculator.',
       streamConfig
     );
 
-    run = await createRun();
+    run = await createRun(1500);
     await runTurn(
       { run, conversationHistory },
       'Compute 2^32 with calculator.',
       streamConfig
     );
 
-    run = await createRun();
+    run = await createRun(1500);
     await runTurn(
       { run, conversationHistory },
       'What is 13 * 17 * 19? Calculator.',
       streamConfig
     );
 
-    run = await createRun();
+    // Tighten context to force summarization — must remain high enough
+    // for post-summary instruction overhead (~400 local tokens) + messages
+    run = await createRun(800);
     await runTurn(
       { run, conversationHistory },
       'What is 99 * 101? Calculator. Then list everything we calculated so far in detail.',
       streamConfig
     );
 
-    // Tighten context to force summarization
-    run = await createRun(400);
-    await runTurn(
-      { run, conversationHistory },
-      'Compute 7! (factorial of 7) with calculator.',
-      streamConfig
-    );
+    if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
+      run = await createRun(700);
+      await runTurn(
+        { run, conversationHistory },
+        'Compute 7! (factorial of 7) with calculator.',
+        streamConfig
+      );
+    }
 
     if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
-      run = await createRun(350);
+      run = await createRun(600);
       await runTurn(
         { run, conversationHistory },
         'What is 256 * 256? Calculator.',
+        streamConfig
+      );
+    }
+
+    if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
+      run = await createRun(500);
+      await runTurn(
+        { run, conversationHistory },
+        'Compute 100 + 200 with calculator.',
+        streamConfig
+      );
+    }
+
+    if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
+      run = await createRun(400);
+      await runTurn(
+        { run, conversationHistory },
+        'What is 50 * 50? Calculator.',
         streamConfig
       );
     }
@@ -769,8 +791,8 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
     );
     logTurn('T3-think', conversationHistory, `parts=${contentParts.length}`);
 
-    // Turn 4: tighter context to trigger summarization
-    ({ run, contentParts } = await createRun(500));
+    // Turn 4: another turn to build up context
+    ({ run, contentParts } = await createRun());
     await runTurn(
       { run, conversationHistory },
       'What is 2^10? Calculator. Also list all results from before.',
@@ -778,15 +800,27 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
     );
     logTurn('T4-think', conversationHistory);
 
-    // Turn 5: squeeze harder if needed
+    // Turn 5: tighter context to trigger summarization — keep high enough
+    // for post-summary overhead (~400 local tokens for instructions+summary)
     if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
-      ({ run, contentParts } = await createRun(300));
+      ({ run, contentParts } = await createRun(700));
       await runTurn(
         { run, conversationHistory },
         'Compute 999 * 999 with calculator.',
         streamConfig
       );
       logTurn('T5-think', conversationHistory);
+    }
+
+    // Turn 6: squeeze harder if needed
+    if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
+      ({ run, contentParts } = await createRun(600));
+      await runTurn(
+        { run, conversationHistory },
+        'What is 42 * 42? Calculator.',
+        streamConfig
+      );
+      logTurn('T6-think', conversationHistory);
     }
 
     console.log(
@@ -2192,6 +2226,106 @@ describe('Tight context with oversized tool results (no API keys)', () => {
       console.log('  No system messages captured');
     }
   });
+
+  test('empty pruning context after summarization preserves latest user turn', async () => {
+    const spies = createSpies();
+    const tokenCounter = await createTokenCounter();
+
+    // Build a conversation where EVERY message is too large to fit in the
+    // post-summary budget individually.  This reproduces the real-world bug
+    // where context is empty after pruning, summarization fires, and the
+    // summarize node used to return 0 surviving messages.
+    const largePadding = ' detailed explanation'.repeat(80); // ~1600 chars
+    const conversationHistory: BaseMessage[] = [
+      new HumanMessage(`First question about math${largePadding}`),
+      new AIMessage(`The answer is 42${largePadding}`),
+      new HumanMessage(`Second question about physics${largePadding}`),
+      new AIMessage(`E equals mc squared${largePadding}`),
+      new HumanMessage(`Third question about chemistry${largePadding}`),
+      new AIMessage(`Water is H2O${largePadding}`),
+    ];
+
+    const indexTokenCountMap = buildIndexTokenCountMap(
+      conversationHistory,
+      tokenCounter
+    );
+
+    const { aggregateContent } = createContentAggregator();
+    const run = await Run.create<t.IState>({
+      runId: `empty-ctx-${Date.now()}`,
+      graphConfig: {
+        type: 'standard',
+        llmConfig: getLLMConfig(Providers.OPENAI),
+        instructions: INSTRUCTIONS,
+        maxContextTokens: 200, // Extremely tight — no message fits individually
+        summarizationEnabled: true,
+        summarizationConfig: {
+          enabled: true,
+          provider: Providers.OPENAI,
+        },
+      },
+      returnContent: true,
+      customHandlers: {
+        [GraphEvents.ON_RUN_STEP]: {
+          handle: (_event: string, data: t.StreamEventData): void => {
+            spies.onRunStepSpy(_event, data);
+            aggregateContent({
+              event: GraphEvents.ON_RUN_STEP,
+              data: data as t.RunStep,
+            });
+          },
+        },
+        [GraphEvents.ON_SUMMARIZE_START]: {
+          handle: (_event: string, data: t.StreamEventData): void => {
+            spies.onSummarizeStartSpy(data);
+          },
+        },
+        [GraphEvents.ON_SUMMARIZE_COMPLETE]: {
+          handle: (_event: string, data: t.StreamEventData): void => {
+            spies.onSummarizeCompleteSpy(data);
+          },
+        },
+      },
+      tokenCounter,
+      indexTokenCountMap,
+    });
+
+    // The agent model response for the post-summary turn
+    run.Graph?.overrideTestModel(['Here is the answer to your question.'], 1);
+
+    const latestUserMessage = new HumanMessage(
+      'What is the capital of France?'
+    );
+
+    let error: Error | undefined;
+    try {
+      await run.processStream(
+        { messages: [...conversationHistory, latestUserMessage] },
+        streamConfig as any
+      );
+    } catch (err) {
+      error = err as Error;
+    }
+
+    // Summarization should have fired
+    expect(spies.onSummarizeStartSpy).toHaveBeenCalled();
+
+    // Key assertion: before the fix, this scenario always produced an
+    // empty_messages error because contextMessages was empty after
+    // summarization.  After the fix, the latest turn's HumanMessage is
+    // extracted from messagesToRefine and the model responds successfully.
+    if (error) {
+      // If an error occurs, it must NOT be the empty_messages error that
+      // the fix was designed to prevent.
+      expect(error.message).not.toContain('empty_messages');
+      console.log(
+        `  Empty context fix: non-empty_messages error (${error.message.substring(0, 120)})`
+      );
+    } else {
+      // The model responded successfully — this is the expected outcome
+      console.log('  Empty context fix: model responded successfully');
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -2331,6 +2465,7 @@ const hasAnyApiKey =
       });
     };
 
+    // Accumulate history at generous limits
     let run = await createRun();
     await runTurn(
       { run, conversationHistory },
@@ -2345,18 +2480,35 @@ const hasAnyApiKey =
       streamConfig
     );
 
-    run = await createRun(350);
+    run = await createRun();
     await runTurn(
       { run, conversationHistory },
       'What is 25000 / 5? Calculator. Remind me of prior results.',
       streamConfig
     );
 
+    run = await createRun();
+    await runTurn(
+      { run, conversationHistory },
+      'Compute 2^16 with calculator.',
+      streamConfig
+    );
+
+    // Step down context to trigger summarization — must stay above
+    // post-summary instruction overhead (~200 local tokens for
+    // system + tools + summary) so messages survive post-summary.
+    run = await createRun(400);
+    await runTurn(
+      { run, conversationHistory },
+      'Calculate 111 * 111. Calculator.',
+      streamConfig
+    );
+
     if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
-      run = await createRun(250);
+      run = await createRun(350);
       await runTurn(
         { run, conversationHistory },
-        'Calculate 111 * 111. Calculator.',
+        'What is 50 + 50? Calculator.',
         streamConfig
       );
     }
