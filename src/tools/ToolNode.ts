@@ -20,6 +20,10 @@ import type { BaseMessage, AIMessage } from '@langchain/core/messages';
 import type { StructuredToolInterface } from '@langchain/core/tools';
 import type * as t from '@/types';
 import { RunnableCallable } from '@/utils';
+import {
+  calculateMaxToolResultChars,
+  truncateToolResultContent,
+} from '@/utils/truncation';
 import { safeDispatchCustomEvent } from '@/utils/events';
 import { Constants, GraphEvents } from '@/common';
 
@@ -53,6 +57,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private agentId?: string;
   /** Tool names that bypass event dispatch and execute directly (e.g., graph-managed handoff tools) */
   private directToolNames?: Set<string>;
+  /** Maximum characters allowed in a single tool result before truncation. */
+  private maxToolResultChars: number;
 
   constructor({
     tools,
@@ -68,6 +74,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     eventDrivenMode,
     agentId,
     directToolNames,
+    maxContextTokens,
+    maxToolResultChars,
   }: t.ToolNodeConstructorParams) {
     super({ name, tags, func: (input, config) => this.run(input, config) });
     this.toolMap = toolMap ?? new Map(tools.map((tool) => [tool.name, tool]));
@@ -81,6 +89,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     this.eventDrivenMode = eventDrivenMode ?? false;
     this.agentId = agentId;
     this.directToolNames = directToolNames;
+    this.maxToolResultChars =
+      maxToolResultChars ?? calculateMaxToolResultChars(maxContextTokens);
   }
 
   /**
@@ -201,10 +211,15 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       ) {
         return output;
       } else {
+        const rawContent =
+          typeof output === 'string' ? output : JSON.stringify(output);
         return new ToolMessage({
           status: 'success',
           name: tool.name,
-          content: typeof output === 'string' ? output : JSON.stringify(output),
+          content: truncateToolResultContent(
+            rawContent,
+            this.maxToolResultChars
+          ),
           tool_call_id: call.id!,
         });
       }
@@ -539,10 +554,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           tool_call_id: result.toolCallId,
         });
       } else {
-        contentString =
+        const rawContent =
           typeof result.content === 'string'
             ? result.content
             : JSON.stringify(result.content);
+        contentString = truncateToolResultContent(
+          rawContent,
+          this.maxToolResultChars
+        );
         toolMessage = new ToolMessage({
           status: 'success',
           name: toolName,

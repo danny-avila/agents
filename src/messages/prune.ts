@@ -10,6 +10,12 @@ import type {
   ReasoningContentText,
 } from '@/types/stream';
 import type { TokenCounter } from '@/types/run';
+import type { ContextPruningConfig } from '@/types/graph';
+import {
+  calculateMaxToolResultChars,
+  truncateToolResultContent,
+} from '@/utils/truncation';
+import { applyContextPruning } from './contextPruning';
 import { ContentTypes, Providers } from '@/common';
 
 export type PruneMessagesFactoryParams = {
@@ -19,11 +25,27 @@ export type PruneMessagesFactoryParams = {
   tokenCounter: TokenCounter;
   indexTokenCountMap: Record<string, number | undefined>;
   thinkingEnabled?: boolean;
+  /** Context pruning configuration for position-based tool result degradation. */
+  contextPruningConfig?: ContextPruningConfig;
 };
 export type PruneMessagesParams = {
   messages: BaseMessage[];
   usageMetadata?: Partial<UsageMetadata>;
   startType?: ReturnType<BaseMessage['getType']>;
+  /**
+   * Usage from the most recent LLM call only (not accumulated).
+   * When provided, calibration uses this instead of usageMetadata
+   * to avoid inflated ratios from N×cacheRead accumulation.
+   */
+  lastCallUsage?: {
+    totalTokens: number;
+  };
+  /**
+   * Whether the token data is fresh (from a just-completed LLM call).
+   * When false, provider calibration is skipped to avoid applying
+   * stale ratios.
+   */
+  totalTokensFresh?: boolean;
 };
 
 function getToolCallIds(message: BaseMessage): Set<string> {
@@ -530,6 +552,49 @@ export function checkValidNumber(value: unknown): value is number {
   return typeof value === 'number' && !isNaN(value) && value > 0;
 }
 
+/**
+ * Pre-flight truncation: truncates oversized ToolMessage content before the
+ * main backward-iteration pruning runs. Unlike the ingestion guard (which caps
+ * at tool-execution time), pre-flight truncation applies per-turn based on the
+ * current context window budget (which may have shrunk due to growing conversation).
+ *
+ * After truncation, recounts tokens via tokenCounter and updates indexTokenCountMap
+ * so subsequent pruning works with accurate counts.
+ *
+ * @returns The number of tool messages that were truncated.
+ */
+export function preFlightTruncateToolResults(params: {
+  messages: BaseMessage[];
+  maxContextTokens: number;
+  indexTokenCountMap: Record<string, number | undefined>;
+  tokenCounter: TokenCounter;
+}): number {
+  const { messages, maxContextTokens, indexTokenCountMap, tokenCounter } =
+    params;
+  const maxChars = calculateMaxToolResultChars(maxContextTokens);
+  let truncatedCount = 0;
+
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i];
+    if (message.getType() !== 'tool') {
+      continue;
+    }
+    const content = message.content;
+    if (typeof content !== 'string' || content.length <= maxChars) {
+      continue;
+    }
+
+    const truncated = truncateToolResultContent(content, maxChars);
+    // Mutate the message content in place (ToolMessage.content is writable)
+    (message as ToolMessage).content = truncated;
+    // Recount tokens for the modified message
+    indexTokenCountMap[i] = tokenCounter(message);
+    truncatedCount++;
+  }
+
+  return truncatedCount;
+}
+
 type ThinkingBlocks = {
   thinking_blocks?: Array<{
     type: 'thinking';
@@ -632,11 +697,16 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       }
     }
 
-    // If `currentUsage` is defined, we need to distribute the current total tokens to our `indexTokenCountMap`,
-    // We must distribute it in a weighted manner, so that the total token count is equal to `currentUsage.total_tokens`,
-    // relative the manually counted tokens in `indexTokenCountMap`.
-    // EDGE CASE: when the resulting context gets pruned, we should not distribute the usage for messages that are not in the context.
-    if (currentUsage) {
+    // Distribute the current total tokens to our `indexTokenCountMap` in a weighted manner,
+    // so that the total token count aligns with provider-reported usage.
+    // Uses lastCallUsage (single-call) when available to avoid inflated ratios from
+    // accumulated cacheRead across N tool-call round-trips.
+    // Gated on totalTokensFresh to avoid applying stale ratios.
+    if (currentUsage && params.totalTokensFresh !== false) {
+      // Prefer lastCallUsage (single-call, not accumulated) for calibration.
+      const calibrationTokens =
+        params.lastCallUsage?.totalTokens ?? currentUsage.total_tokens;
+
       let totalIndexTokens = 0;
       if (params.messages[0].getType() === 'system') {
         totalIndexTokens += indexTokenCountMap[0] ?? 0;
@@ -652,11 +722,20 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       }
 
       // Calculate ratio based only on messages that remain in the context
-      const ratio = currentUsage.total_tokens / totalIndexTokens;
+      const ratio = calibrationTokens / totalIndexTokens;
       const isRatioSafe = ratio >= 1 / 3 && ratio <= 2.5;
 
       // Apply the ratio adjustment only to messages at or after lastCutOffIndex, and only if the ratio is safe
       if (isRatioSafe) {
+        // Snapshot the map before calibration for sanity revert
+        const preCalibrationSnapshot: Record<string, number | undefined> = {};
+        for (let i = lastCutOffIndex; i < params.messages.length; i++) {
+          preCalibrationSnapshot[i] = indexTokenCountMap[i];
+        }
+        if (params.messages[0].getType() === 'system') {
+          preCalibrationSnapshot[0] = indexTokenCountMap[0];
+        }
+
         if (
           params.messages[0].getType() === 'system' &&
           lastCutOffIndex !== 0
@@ -674,7 +753,53 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
             (indexTokenCountMap[i] ?? 0) * ratio
           );
         }
+
+        // Post-calibration sanity check: verify calibrated sum is within 0.25×–3× of raw sum.
+        // If not, revert to pre-calibration values to prevent wildly incorrect pruning.
+        let calibratedSum = 0;
+        for (let i = lastCutOffIndex; i < params.messages.length; i++) {
+          if (!newOutputs.has(i)) {
+            calibratedSum += indexTokenCountMap[i] ?? 0;
+          }
+        }
+        const sanityRatio =
+          totalIndexTokens > 0 ? calibratedSum / totalIndexTokens : 1;
+        if (sanityRatio < 0.25 || sanityRatio > 3) {
+          // Revert — calibration produced unreasonable values
+          for (const [key, value] of Object.entries(preCalibrationSnapshot)) {
+            indexTokenCountMap[key] = value;
+          }
+        }
       }
+    }
+
+    // Pre-flight truncation: truncate oversized tool results before pruning.
+    // This runs after calibration so token counts are reasonably accurate,
+    // but before getMessagesWithinTokenLimit so pruning works with correct counts.
+    preFlightTruncateToolResults({
+      messages: params.messages,
+      maxContextTokens: factoryParams.maxTokens,
+      indexTokenCountMap,
+      tokenCounter: factoryParams.tokenCounter,
+    });
+
+    // Position-based context pruning: degrade old tool results before the main prune.
+    if (factoryParams.contextPruningConfig?.enabled === true) {
+      applyContextPruning({
+        messages: params.messages,
+        indexTokenCountMap,
+        tokenCounter: factoryParams.tokenCounter,
+        config: factoryParams.contextPruningConfig,
+      });
+    }
+
+    // Recalculate totalTokens from indexTokenCountMap after pre-flight truncation
+    // and context pruning may have reduced token counts for modified messages.
+    // Without this, prePruneTotalTokens and early-return remainingContextTokens
+    // would be stale (inflated), causing unnecessary summarization triggers.
+    totalTokens = 0;
+    for (let i = 0; i < params.messages.length; i++) {
+      totalTokens += indexTokenCountMap[i] ?? 0;
     }
 
     lastTurnStartIndex = params.messages.length;
