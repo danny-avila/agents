@@ -1390,6 +1390,98 @@ describe('Prune Messages Tests', () => {
     });
   });
 
+  describe('Dropped orphan ToolMessages appear in messagesToRefine', () => {
+    it('appends orphan ToolMessage (whose parent AI was pruned) to messagesToRefine for summarization', () => {
+      const tokenCounter = createTestTokenCounter();
+
+      // Build messages where the large AI(evaluate) won't fit in a tight budget,
+      // but its smaller ToolMessage(evaluate) does.  After backward iteration,
+      // the ToolMessage lands in context while its parent AI is in prunedMemory.
+      // repairOrphanedToolMessages then drops the orphan ToolMessage from context.
+      // The fix: that dropped ToolMessage must appear in messagesToRefine so
+      // summarization sees the tool result (otherwise summary says "in progress").
+      const messages: BaseMessage[] = [
+        new HumanMessage('Build me a solar system simulation'),
+        new AIMessage({
+          content: [
+            { type: 'text', text: 'I will write the code now.' },
+            {
+              type: 'tool_use',
+              id: 'tc_eval',
+              name: 'evaluate_script',
+              // Large input that consumes most of the budget
+              input: { code: 'x'.repeat(3000) },
+            },
+          ],
+          tool_calls: [
+            {
+              id: 'tc_eval',
+              name: 'evaluate_script',
+              args: { code: 'x'.repeat(3000) },
+              type: 'tool_call' as const,
+            },
+          ],
+        }),
+        new ToolMessage({
+          // Small result — fits in budget individually
+          content: 'Solar system simulation launched successfully!',
+          tool_call_id: 'tc_eval',
+          name: 'evaluate_script',
+        }),
+      ];
+
+      const indexTokenCountMap: Record<string, number | undefined> = {};
+      for (let i = 0; i < messages.length; i++) {
+        indexTokenCountMap[i] = tokenCounter(messages[i]);
+      }
+
+      // Budget is tight enough that the large AI message won't fit
+      // even after emergency truncation, but HumanMessage and ToolMessage
+      // individually can.  Budget must be low enough that proportional
+      // emergency truncation (budget / messages * 4 chars) still leaves
+      // the AI message too large to fit.
+      const pruneMessages = createPruneMessages({
+        maxTokens: 100,
+        startIndex: 0,
+        tokenCounter,
+        indexTokenCountMap,
+        getInstructionTokens: () => 0,
+      });
+
+      const result = pruneMessages({ messages });
+
+      // The orphan ToolMessage(evaluate) should NOT be in context
+      // (its parent AI was pruned away)
+      const contextToolMsgs = result.context.filter(
+        (m) => m.getType() === 'tool'
+      );
+      const orphanInContext = contextToolMsgs.some(
+        (m) => (m as ToolMessage).tool_call_id === 'tc_eval'
+      );
+      expect(orphanInContext).toBe(false);
+
+      // The key assertion: the dropped ToolMessage MUST appear in messagesToRefine
+      // so that summarization can see "Solar system simulation launched successfully!"
+      expect(result.messagesToRefine).toBeDefined();
+      const refineToolMsgs = result.messagesToRefine!.filter(
+        (m) => m.getType() === 'tool'
+      );
+      const toolInRefine = refineToolMsgs.some(
+        (m) => (m as ToolMessage).tool_call_id === 'tc_eval'
+      );
+      expect(toolInRefine).toBe(true);
+
+      // The parent AI message should also be in messagesToRefine (from prunedMemory)
+      const refineAiMsgs = result.messagesToRefine!.filter(
+        (m) => m.getType() === 'ai'
+      );
+      const aiInRefine = refineAiMsgs.some((m) =>
+        ((m as AIMessage).tool_calls ?? []).some((tc) => tc.id === 'tc_eval')
+      );
+      expect(aiInRefine).toBe(true);
+    });
+  });
+
   describe('Integration with Run', () => {
     it('should initialize Run with custom token counter and process messages', async () => {
       const provider = Providers.OPENAI;

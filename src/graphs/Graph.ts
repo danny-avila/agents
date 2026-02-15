@@ -51,22 +51,22 @@ import {
   StepTypes,
 } from '@/common';
 import {
+  isLikelyContextOverflowError,
+  calculateMaxToolResultChars,
+  truncateToolResultContent,
+  extractErrorMessage,
   resetIfNotEmpty,
   isOpenAILike,
   isGoogleLike,
   joinKeys,
   sleep,
-  extractErrorMessage,
-  isLikelyContextOverflowError,
-  calculateMaxToolResultChars,
-  truncateToolResultContent,
 } from '@/utils';
 import { getChatModelClass, manualToolStreamProviders } from '@/llm/providers';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
+import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { shouldTriggerSummarization } from '@/summarization';
 import { createSummarizeNode } from '@/summarization/node';
 import { ChatOpenAI, AzureChatOpenAI } from '@/llm/openai';
-import { safeDispatchCustomEvent } from '@/utils/events';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { AgentContext } from '@/agents/AgentContext';
 import { createFakeStreamingLLM } from '@/llm/fake';
@@ -884,6 +884,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           indexTokenCountMap: agentContext.indexTokenCountMap,
           contextPruningConfig: agentContext.contextPruningConfig,
           getInstructionTokens: () => agentContext.instructionTokens,
+          log: (level, message, data) => {
+            emitAgentLog(config, level, 'prune', message, data, {
+              runId: this.runId,
+              agentId,
+            });
+          },
         });
       }
       if (agentContext.pruneMessages) {
@@ -915,6 +921,18 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             messagesToRefineCount: messagesToRefine.length,
           })
         ) {
+          emitAgentLog(
+            config,
+            'info',
+            'graph',
+            'Summarization triggered',
+            {
+              messagesToRefineCount: messagesToRefine.length,
+              remainingContextTokens: remainingContextTokens ?? 0,
+              summaryVersion: agentContext.summaryVersion + 1,
+            },
+            { runId: this.runId, agentId }
+          );
           agentContext.markSummarizationTriggered(messages.length);
           return {
             summarizationRequest: {
@@ -1012,7 +1030,22 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         agentContext.provider === Providers.ANTHROPIC ||
         agentContext.provider === Providers.BEDROCK
       ) {
+        const beforeSanitize = finalMessages.length;
         finalMessages = sanitizeOrphanToolBlocks(finalMessages);
+        if (finalMessages.length !== beforeSanitize) {
+          emitAgentLog(
+            config,
+            'warn',
+            'sanitize',
+            'Orphan tool blocks removed',
+            {
+              before: beforeSanitize,
+              after: finalMessages.length,
+              dropped: beforeSanitize - finalMessages.length,
+            },
+            { runId: this.runId, agentId }
+          );
+        }
       }
 
       if (
@@ -1038,6 +1071,17 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
       if (finalMessages.length === 0) {
         const breakdown = agentContext.formatTokenBudgetBreakdown(messages);
+        emitAgentLog(
+          config,
+          'error',
+          'graph',
+          'Empty messages after pruning',
+          {
+            messageCount: messages.length,
+            breakdown,
+          },
+          { runId: this.runId, agentId }
+        );
         throw new Error(
           JSON.stringify({
             type: 'empty_messages',
@@ -1067,13 +1111,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             agentContext.canAttemptOverflowRecovery() === true
           ) {
             agentContext.incrementOverflowRecovery();
-            console.warn(
-              `[agentus] Context overflow detected (attempt ${agentContext['_overflowRecoveryAttempts']}). ${agentContext.formatTokenBudgetBreakdown(finalMessages)}`
-            );
-            // Apply emergency tool result truncation with increasing aggressiveness.
-            // Each retry uses a smaller fraction of the normal max chars.
             const attempt = agentContext['_overflowRecoveryAttempts'];
-            const aggressiveness = Math.pow(0.5, attempt); // 50% → 25% → 12.5%
+            const aggressiveness = Math.pow(0.5, attempt);
             const maxChars = Math.max(
               1000,
               Math.floor(
@@ -1081,6 +1120,23 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                   aggressiveness
               )
             );
+            emitAgentLog(
+              config,
+              'warn',
+              'graph',
+              'Overflow recovery attempt',
+              {
+                attempt,
+                aggressiveness,
+                maxChars,
+              },
+              { runId: this.runId, agentId }
+            );
+            console.warn(
+              `[agentus] Context overflow detected (attempt ${attempt}). ${agentContext.formatTokenBudgetBreakdown(finalMessages)}`
+            );
+            // Apply emergency tool result truncation with increasing aggressiveness.
+            // Each retry uses a smaller fraction of the normal max chars.
             let truncated = false;
             for (const msg of finalMessages) {
               if (msg.getType() !== 'tool') {
@@ -1321,6 +1377,32 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             config: this.config,
             runId: this.runId,
             isMultiAgent: this.isMultiAgentGraph(),
+            dispatchRunStep: async (runStep, nodeConfig) => {
+              this.contentData.push(runStep);
+              this.contentIndexMap.set(runStep.id, runStep.index);
+
+              const resolvedConfig = nodeConfig ?? this.config;
+              const handler = this.handlerRegistry?.getHandler(
+                GraphEvents.ON_RUN_STEP
+              );
+              if (handler) {
+                await handler.handle(
+                  GraphEvents.ON_RUN_STEP,
+                  runStep,
+                  resolvedConfig?.configurable,
+                  this
+                );
+                this.handlerDispatchedStepIds.add(runStep.id);
+              }
+
+              if (resolvedConfig) {
+                await safeDispatchCustomEvent(
+                  GraphEvents.ON_RUN_STEP,
+                  runStep,
+                  resolvedConfig
+                );
+              }
+            },
           },
           generateStepId: (stepKey: string) => this.generateStepId(stepKey),
         })

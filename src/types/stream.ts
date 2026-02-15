@@ -10,6 +10,7 @@ import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
 import type { LLMResult, Generation } from '@langchain/core/outputs';
 import type { AnthropicContentBlock } from '@/llm/anthropic/types';
 import type { Command } from '@langchain/langgraph';
+import type { SummarizeCompleteEvent } from '@/types/summarize';
 import type { ToolEndEvent } from '@/types/tools';
 import { StepTypes, ContentTypes, GraphEvents } from '@/common/enum';
 
@@ -441,6 +442,7 @@ export type ContentAggregator = ({
     | ReasoningDeltaEvent
     | RunStepDeltaEvent
     | SummarizeDeltaData
+    | SummarizeCompleteEvent
     | { result: ToolEndEvent };
 }) => void;
 export type ContentAggregatorResult = {

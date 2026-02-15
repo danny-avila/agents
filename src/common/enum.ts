@@ -27,6 +27,8 @@ export enum GraphEvents {
   ON_SUMMARIZE_DELTA = 'on_summarize_delta',
   /** [Custom] Emitted when the summarize node completes with the final summary */
   ON_SUMMARIZE_COMPLETE = 'on_summarize_complete',
+  /** [Custom] Diagnostic logging event for context management observability */
+  ON_AGENT_LOG = 'on_agent_log',
 
   /* Official Events */
 
