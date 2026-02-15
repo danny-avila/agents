@@ -146,6 +146,10 @@ export function repairOrphanedToolMessages({
   context: BaseMessage[];
   reclaimedTokens: number;
   droppedOrphanCount: number;
+  /** Messages removed from context during orphan repair.  These should be
+   *  appended to `messagesToRefine` so that summarization can still see them
+   *  (e.g. a ToolMessage whose parent AI was pruned). */
+  droppedMessages: BaseMessage[];
 } {
   // Collect all tool_call IDs from AI messages in context
   const validToolCallIds = new Set<string>();
@@ -167,6 +171,7 @@ export function repairOrphanedToolMessages({
   let reclaimedTokens = 0;
   let droppedOrphanCount = 0;
   const repairedContext: BaseMessage[] = [];
+  const droppedMessages: BaseMessage[] = [];
 
   for (const message of context) {
     // Drop orphan ToolMessages whose AI tool_call is not in context.
@@ -182,6 +187,7 @@ export function repairOrphanedToolMessages({
           tokenCounter,
           indexTokenCountMap,
         });
+        droppedMessages.push(message);
         continue;
       }
       repairedContext.push(message);
@@ -215,6 +221,7 @@ export function repairOrphanedToolMessages({
             // AI message had only tool_use blocks, nothing left after stripping
             droppedOrphanCount += 1;
             reclaimedTokens += originalTokens;
+            droppedMessages.push(message);
           }
           continue;
         }
@@ -228,6 +235,7 @@ export function repairOrphanedToolMessages({
     context: repairedContext,
     reclaimedTokens,
     droppedOrphanCount,
+    droppedMessages,
   };
 }
 
@@ -278,6 +286,165 @@ function stripOrphanToolUseBlocks(
     content: keptContent,
     tool_calls: keptToolCalls.length > 0 ? keptToolCalls : undefined,
   });
+}
+
+/**
+ * Lightweight structural cleanup: strips orphan tool_use blocks from AI messages
+ * and drops orphan ToolMessages whose AI counterpart is missing.
+ *
+ * Unlike `repairOrphanedToolMessages`, this does NOT track tokens — it is
+ * intended as a final safety net in Graph.ts right before model invocation
+ * to prevent Anthropic/Bedrock structural validation errors.
+ *
+ * Uses duck-typing instead of `getType()` because messages at this stage
+ * may be plain objects (from LangGraph state serialization) rather than
+ * proper BaseMessage class instances.
+ *
+ * Includes a fast-path: if every tool_call has a matching tool_result and
+ * vice-versa, the original array is returned immediately with zero allocation.
+ */
+export function sanitizeOrphanToolBlocks(
+  messages: BaseMessage[]
+): BaseMessage[] {
+  const allToolCallIds = new Set<string>();
+  const allToolResultIds = new Set<string>();
+
+  for (const msg of messages) {
+    const msgAny = msg as unknown as Record<string, unknown>;
+    const toolCalls = msgAny.tool_calls as Array<{ id?: string }> | undefined;
+    if (Array.isArray(toolCalls)) {
+      for (const tc of toolCalls) {
+        if (typeof tc.id === 'string' && tc.id.length > 0) {
+          allToolCallIds.add(tc.id);
+        }
+      }
+    }
+    if (Array.isArray(msgAny.content)) {
+      for (const block of msgAny.content as Array<Record<string, unknown>>) {
+        if (
+          typeof block === 'object' &&
+          (block.type === 'tool_use' || block.type === 'tool_call') &&
+          typeof block.id === 'string'
+        ) {
+          allToolCallIds.add(block.id);
+        }
+      }
+    }
+    const toolCallId = msgAny.tool_call_id as string | undefined;
+    if (typeof toolCallId === 'string' && toolCallId.length > 0) {
+      allToolResultIds.add(toolCallId);
+    }
+  }
+
+  // Fast-path: if every tool_call has a result and every result has a call,
+  // there are no orphans — return the original array immediately.
+  let hasOrphans = false;
+  for (const id of allToolCallIds) {
+    if (!allToolResultIds.has(id)) {
+      hasOrphans = true;
+      break;
+    }
+  }
+  if (!hasOrphans) {
+    for (const id of allToolResultIds) {
+      if (!allToolCallIds.has(id)) {
+        hasOrphans = true;
+        break;
+      }
+    }
+  }
+  if (!hasOrphans) {
+    return messages;
+  }
+
+  const result: BaseMessage[] = [];
+  // Track indices of AI messages that were modified (tool_use stripped).
+  const strippedAiIndices = new Set<number>();
+
+  for (const msg of messages) {
+    const msgAny = msg as unknown as Record<string, unknown>;
+    const msgType =
+      typeof (msg as { getType?: unknown }).getType === 'function'
+        ? msg.getType()
+        : ((msgAny.role as string | undefined) ??
+          (msgAny._type as string | undefined));
+
+    // Drop orphan ToolMessages whose AI tool_call is missing.
+    const toolCallId = msgAny.tool_call_id as string | undefined;
+    if (
+      (msgType === 'tool' || msg instanceof ToolMessage) &&
+      typeof toolCallId === 'string' &&
+      !allToolCallIds.has(toolCallId)
+    ) {
+      continue;
+    }
+
+    // Strip orphan tool_use blocks from AI messages.
+    const toolCalls = msgAny.tool_calls as Array<{ id?: string }> | undefined;
+    if (
+      (msgType === 'ai' ||
+        msgType === 'assistant' ||
+        msg instanceof AIMessage) &&
+      Array.isArray(toolCalls) &&
+      toolCalls.length > 0
+    ) {
+      const hasOrphanCalls = toolCalls.some(
+        (tc) => typeof tc.id === 'string' && !allToolResultIds.has(tc.id)
+      );
+      if (hasOrphanCalls) {
+        if (msg instanceof AIMessage) {
+          const stripped = stripOrphanToolUseBlocks(msg, allToolResultIds);
+          if (stripped != null) {
+            strippedAiIndices.add(result.length);
+            result.push(stripped);
+          }
+          continue;
+        }
+        // For plain objects, filter tool_calls and content in-place.
+        const keptToolCalls = toolCalls.filter(
+          (tc) => typeof tc.id === 'string' && allToolResultIds.has(tc.id)
+        );
+        const keptContent = Array.isArray(msgAny.content)
+          ? (msgAny.content as Array<Record<string, unknown>>).filter(
+            (block) => {
+              if (typeof block !== 'object') return true;
+              if (
+                (block.type === 'tool_use' || block.type === 'tool_call') &&
+                  typeof block.id === 'string'
+              ) {
+                return allToolResultIds.has(block.id);
+              }
+              return true;
+            }
+          )
+          : msgAny.content;
+        if (
+          keptToolCalls.length === 0 &&
+          Array.isArray(keptContent) &&
+          keptContent.length === 0
+        ) {
+          continue;
+        }
+        strippedAiIndices.add(result.length);
+        msgAny.tool_calls = keptToolCalls.length > 0 ? keptToolCalls : [];
+        msgAny.content = keptContent;
+        result.push(msg);
+        continue;
+      }
+    }
+
+    result.push(msg);
+  }
+
+  // If the conversation now ends with a stripped AI message (one whose
+  // tool_use was just removed — an incomplete tool call), drop it.
+  // Bedrock/Anthropic require the conversation to end with a user message,
+  // and a stripped AI message represents a dead-end exchange.
+  while (result.length > 0 && strippedAiIndices.has(result.length - 1)) {
+    result.pop();
+  }
+
+  return result;
 }
 
 /**
@@ -525,6 +692,14 @@ export function getMessagesWithinTokenLimit({
     context.push(_messages[0] as BaseMessage);
     messages.shift();
   }
+
+  // The backward iteration pushed messages in reverse chronological order
+  // (newest first).  Restore correct chronological order before prepending
+  // the remaining (older) messages so that messagesToRefine is always
+  // ordered oldest → newest.  Without this, callers that rely on
+  // messagesToRefine order (e.g. the summarization node extracting the
+  // latest turn) would see tool_use/tool_result pairs in the wrong order.
+  prunedMemory.reverse();
 
   if (messages.length > 0) {
     prunedMemory.unshift(...messages);
@@ -1090,12 +1265,27 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
           : undefined,
     });
 
-    let { context, reclaimedTokens } = repairOrphanedToolMessages({
+    const {
+      context: repairedContext,
+      reclaimedTokens: initialReclaimedTokens,
+      droppedMessages,
+    } = repairOrphanedToolMessages({
       context: initialContext,
       allMessages: params.messages,
       tokenCounter: factoryParams.tokenCounter,
       indexTokenCountMap,
     });
+
+    let context = repairedContext;
+    let reclaimedTokens = initialReclaimedTokens;
+
+    // Orphan repair may drop ToolMessages whose parent AI was pruned.
+    // Append them to messagesToRefine so summarization can still see the
+    // tool results (otherwise the summary says "in progress" for a tool
+    // call that already completed, causing the model to repeat it).
+    if (droppedMessages.length > 0) {
+      messagesToRefine.push(...droppedMessages);
+    }
 
     // ---------------------------------------------------------------
     // Emergency truncation: if pruning produced an empty context but
@@ -1220,6 +1410,9 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       context = repaired.context;
       reclaimedTokens = repaired.reclaimedTokens;
       messagesToRefine.push(...retryResult.messagesToRefine);
+      if (repaired.droppedMessages.length > 0) {
+        messagesToRefine.push(...repaired.droppedMessages);
+      }
     }
 
     const remainingContextTokens = Math.max(

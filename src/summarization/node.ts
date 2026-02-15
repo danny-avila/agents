@@ -846,7 +846,34 @@ export function createSummarizeNode({
     // After removal, the pruner's closure state (indices, token map) is
     // stale, so we rebuild the indexTokenCountMap for the surviving context
     // and setSummary() already nulls out the pruner for recreation.
-    const contextMessages = request.context;
+    let contextMessages = request.context;
+
+    // When pruning found that NO individual message fits in the available
+    // budget, context is empty and every message ended up in
+    // messagesToRefine.  After summarization the budget is freed up (summary
+    // replaces old messages), but the model still needs the current turn's
+    // messages to generate a response.  Extract the latest turn — starting
+    // from the last HumanMessage — so the model always has something to
+    // respond to.  Even if these messages are slightly over budget, the
+    // overflow recovery loop in Graph.ts will truncate tool results as needed.
+    if (contextMessages.length === 0 && request.messagesToRefine.length > 0) {
+      let lastHumanIdx = -1;
+      for (let i = request.messagesToRefine.length - 1; i >= 0; i--) {
+        if (request.messagesToRefine[i].getType() === 'human') {
+          lastHumanIdx = i;
+          break;
+        }
+      }
+      if (lastHumanIdx >= 0) {
+        contextMessages = request.messagesToRefine.slice(lastHumanIdx);
+      } else {
+        // No human message found — preserve at least the last message
+        contextMessages = [
+          request.messagesToRefine[request.messagesToRefine.length - 1],
+        ];
+      }
+    }
+
     if (contextMessages.length > 0 && agentContext.tokenCounter) {
       const newTokenMap: Record<string, number> = {};
       for (let i = 0; i < contextMessages.length; i++) {
