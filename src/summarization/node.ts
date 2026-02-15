@@ -54,6 +54,7 @@ const SUMMARIZATION_PARAM_KEYS = new Set([
   'parts',
   'minMessagesForSplit',
   'maxInputTokensForSinglePass',
+  'maxSummaryTokens',
 ]);
 
 const MERGE_PROMPT =
@@ -97,6 +98,26 @@ function truncate(text: string, maxLen: number): string {
 }
 
 /**
+ * Head+tail truncation: keeps the beginning and end of the text so the
+ * summarizer sees both the opening context and final outcome.
+ * Falls back to head-only `truncate()` when `maxLen` is too small for
+ * a meaningful head+tail split.
+ */
+function smartTruncate(text: string, maxLen: number): string {
+  if (text.length <= maxLen) {
+    return text;
+  }
+  const indicator = `… [truncated, ${text.length} chars total] …`;
+  const available = maxLen - indicator.length;
+  if (available <= 0) {
+    return truncate(text, maxLen);
+  }
+  const head = Math.ceil(available / 2);
+  const tail = Math.floor(available / 2);
+  return text.slice(0, head) + indicator + text.slice(text.length - tail);
+}
+
+/**
  * Formats tool call args for summarization. Produces a compact representation
  * instead of dumping raw JSON (which can be thousands of chars for code-heavy
  * tool calls like script evaluation or file writes).
@@ -126,7 +147,7 @@ function formatMessageForSummary(msg: BaseMessage): string {
       typeof msg.content === 'string'
         ? msg.content
         : JSON.stringify(msg.content);
-    return `[tool_result: ${name}] → ${truncate(content, LIMITS.toolResult)}`;
+    return `[tool_result: ${name}] → ${smartTruncate(content, LIMITS.toolResult)}`;
   }
 
   // AI messages with tool calls: extract text content and format tool calls readably
@@ -141,7 +162,7 @@ function formatMessageForSummary(msg: BaseMessage): string {
     // Extract any text content
     if (typeof msg.content === 'string') {
       if (msg.content.trim()) {
-        parts.push(truncate(msg.content.trim(), LIMITS.messageContent));
+        parts.push(smartTruncate(msg.content.trim(), LIMITS.messageContent));
       }
     } else if (Array.isArray(msg.content)) {
       for (const block of msg.content) {
@@ -153,7 +174,7 @@ function formatMessageForSummary(msg: BaseMessage): string {
           typeof block.text === 'string' &&
           block.text.trim()
         ) {
-          parts.push(truncate(block.text.trim(), LIMITS.messageContent));
+          parts.push(smartTruncate(block.text.trim(), LIMITS.messageContent));
         }
       }
     }
@@ -170,7 +191,7 @@ function formatMessageForSummary(msg: BaseMessage): string {
   // All other messages: use content directly, truncated
   const content =
     typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
-  return `[${role}]: ${truncate(content, LIMITS.messageContent)}`;
+  return `[${role}]: ${smartTruncate(content, LIMITS.messageContent)}`;
 }
 
 /**
@@ -274,11 +295,13 @@ function separateParameters(parameters: Record<string, unknown>): {
   summarizationParams: {
     parts: number;
     minMessagesForSplit: number;
+    maxSummaryTokens?: number;
   };
 } {
   const llmParams: Record<string, unknown> = {};
   let parts = DEFAULT_PARTS;
   let minMessagesForSplit = DEFAULT_MIN_MESSAGES_FOR_SPLIT;
+  let maxSummaryTokens: number | undefined;
 
   for (const [key, value] of Object.entries(parameters)) {
     if (SUMMARIZATION_PARAM_KEYS.has(key)) {
@@ -290,6 +313,12 @@ function separateParameters(parameters: Record<string, unknown>): {
         value >= 2
       ) {
         minMessagesForSplit = value;
+      } else if (
+        key === 'maxSummaryTokens' &&
+        typeof value === 'number' &&
+        value > 0
+      ) {
+        maxSummaryTokens = value;
       }
       // maxInputTokensForSinglePass: reserved for future use
     } else {
@@ -299,8 +328,56 @@ function separateParameters(parameters: Record<string, unknown>): {
 
   return {
     llmParams,
-    summarizationParams: { parts, minMessagesForSplit },
+    summarizationParams: { parts, minMessagesForSplit, maxSummaryTokens },
   };
+}
+
+// ---------------------------------------------------------------------------
+// Graceful degradation
+// ---------------------------------------------------------------------------
+
+/**
+ * Generates a structural metadata summary without making an LLM call.
+ * Used as a last-resort fallback when all summarization attempts fail.
+ * Preserves tool names and message counts so the agent retains basic context.
+ */
+function generateMetadataStub(messages: BaseMessage[]): string {
+  const counts: Record<string, number> = {};
+  const toolNames = new Set<string>();
+
+  for (const msg of messages) {
+    const role = msg._getType();
+    counts[role] = (counts[role] ?? 0) + 1;
+
+    if (role === 'tool' && msg.name != null && msg.name !== '') {
+      toolNames.add(msg.name);
+    }
+
+    if (
+      role === 'ai' &&
+      msg instanceof AIMessage &&
+      msg.tool_calls &&
+      msg.tool_calls.length > 0
+    ) {
+      for (const tc of msg.tool_calls) {
+        toolNames.add(tc.name);
+      }
+    }
+  }
+
+  const countParts = Object.entries(counts)
+    .map(([role, count]) => `${count} ${role}`)
+    .join(', ');
+
+  const lines = [
+    `[Metadata summary: ${messages.length} messages (${countParts})]`,
+  ];
+
+  if (toolNames.size > 0) {
+    lines.push(`[Tools used: ${Array.from(toolNames).join(', ')}]`);
+  }
+
+  return lines.join('\n');
 }
 
 // ---------------------------------------------------------------------------
@@ -359,6 +436,19 @@ export function createSummarizeNode({
     if (modelName != null && modelName !== '') {
       clientOptions.model = modelName;
       clientOptions.modelName = modelName;
+    }
+
+    // Apply maxSummaryTokens: parameter takes priority, then config, then default.
+    const DEFAULT_MAX_SUMMARY_TOKENS = 2048;
+    const effectiveMaxSummaryTokens =
+      summarizationParams.maxSummaryTokens ??
+      summarizationConfig?.maxSummaryTokens ??
+      DEFAULT_MAX_SUMMARY_TOKENS;
+
+    if (provider === Providers.GOOGLE || provider === Providers.VERTEXAI) {
+      clientOptions.maxOutputTokens = effectiveMaxSummaryTokens;
+    } else {
+      clientOptions.maxTokens = effectiveMaxSummaryTokens;
     }
 
     // The graph's RunnableConfig carries callbacks for tracing/observability.
@@ -444,12 +534,13 @@ export function createSummarizeNode({
       }
       : undefined;
 
-    // ----- Invoke: single-pass or multi-stage -----
+    // ----- Invoke: single-pass or multi-stage with graceful degradation -----
     let summaryText = '';
-    try {
-      const { parts, minMessagesForSplit } = summarizationParams;
-      const messagesToRefine = request.messagesToRefine;
+    const { parts, minMessagesForSplit } = summarizationParams;
+    const messagesToRefine = request.messagesToRefine;
 
+    // Tier 1: Full input, normal budget
+    try {
       if (
         parts > 1 &&
         messagesToRefine.length >= Math.max(2, minMessagesForSplit)
@@ -473,21 +564,22 @@ export function createSummarizeNode({
           streaming,
         });
       }
-    } catch (err) {
-      if (runnableConfig) {
-        const errorMessage =
-          err instanceof Error ? err.message : 'Summarization failed';
-        await safeDispatchCustomEvent(
-          GraphEvents.ON_SUMMARIZE_COMPLETE,
-          {
-            agentId: request.agentId,
-            summary: placeholderSummary,
-            error: errorMessage,
-          } satisfies t.SummarizeCompleteEvent,
-          runnableConfig
-        );
+    } catch {
+      // Tier 2: Retry with single-pass, half character budget
+      try {
+        summaryText = await summarizeSinglePass({
+          model,
+          messages: messagesToRefine,
+          promptText,
+          priorSummaryText,
+          config: summarizeConfig,
+          streaming,
+          budgetChars: Math.floor(CHUNK_BUDGET_CHARS / 2),
+        });
+      } catch {
+        // Tier 3: Metadata stub — no LLM call, preserves tool names and message counts
+        summaryText = generateMetadataStub(messagesToRefine);
       }
-      return { summarizationRequest: undefined };
     }
 
     if (!summaryText) {
@@ -655,8 +747,9 @@ async function summarizeSinglePass({
   priorSummaryText,
   config,
   streaming,
-}: SummarizeParams): Promise<string> {
-  const formattedText = formatMessagesForSummarization(messages);
+  budgetChars,
+}: SummarizeParams & { budgetChars?: number }): Promise<string> {
+  const formattedText = formatMessagesForSummarization(messages, budgetChars);
 
   const humanMessageText = priorSummaryText
     ? `## Prior Summary\n\n${priorSummaryText}\n\n## New Messages to Incorporate\n\n${formattedText}`

@@ -237,7 +237,7 @@ describe('createSummarizeNode', () => {
     );
   });
 
-  it('emits error ON_SUMMARIZE_COMPLETE when model throws', async () => {
+  it('produces metadata stub when all LLM attempts fail', async () => {
     const events = captureEvents();
 
     jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
@@ -250,7 +250,8 @@ describe('createSummarizeNode', () => {
       } as never
     );
 
-    const agentContext = mockAgentContext();
+    const setSummary = jest.fn();
+    const agentContext = mockAgentContext({ setSummary } as never);
     const graph = mockGraph();
     const node = createSummarizeNode({
       agentContext,
@@ -273,11 +274,64 @@ describe('createSummarizeNode', () => {
 
     expect(result).toEqual({ summarizationRequest: undefined });
 
+    // Tier 3 fallback: metadata stub is used as summary text
     const completeEvent = events.find(
       (e) => e.event === GraphEvents.ON_SUMMARIZE_COMPLETE
     );
-    expect((completeEvent?.data as t.SummarizeCompleteEvent).error).toBe(
-      'Model error'
+    expect(
+      (completeEvent?.data as t.SummarizeCompleteEvent).summary.text
+    ).toMatch(/^\[Metadata summary:/);
+    expect(
+      (completeEvent?.data as t.SummarizeCompleteEvent).error
+    ).toBeUndefined();
+  });
+
+  it('retries with reduced budget (tier 2) when first attempt fails', async () => {
+    captureEvents();
+
+    let callCount = 0;
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return {
+            invoke: jest.fn().mockImplementation(async () => {
+              callCount++;
+              if (callCount === 1) {
+                throw new Error('First attempt failed');
+              }
+              return { content: 'Recovered summary' };
+            }),
+          };
+        }
+      } as never
+    );
+
+    const setSummary = jest.fn();
+    const agentContext = mockAgentContext({ setSummary } as never);
+    const graph = mockGraph();
+    const node = createSummarizeNode({
+      agentContext,
+      graph,
+      generateStepId,
+    });
+
+    await node(
+      {
+        messages: [new HumanMessage('Hello')],
+        summarizationRequest: {
+          messagesToRefine: [new HumanMessage('Test message')],
+          context: [],
+          remainingContextTokens: 1000,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    // Should have recovered on tier 2
+    expect(setSummary).toHaveBeenCalledWith(
+      'Recovered summary',
+      expect.any(Number)
     );
   });
 

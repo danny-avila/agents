@@ -20,6 +20,8 @@ export type SummarizationConfig = {
   trigger?: SummarizationTrigger;
   /** When false, disables streaming for summarization LLM calls (uses invoke instead of stream). Defaults to true. */
   stream?: boolean;
+  /** Maximum output tokens for the summarization model. Defaults to 2048. */
+  maxSummaryTokens?: number;
 };
 
 export interface SummarizeResult {
