@@ -699,6 +699,60 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     }
   }
 
+  /**
+   * Attempts each fallback provider in order until one succeeds.
+   * Returns the result from the first successful invocation, or throws
+   * the last error if all fallbacks fail.
+   *
+   * @returns The invocation result, or undefined if no fallbacks were configured.
+   */
+  private async tryFallbackProviders({
+    fallbacks,
+    agentContext,
+    finalMessages,
+    config,
+    primaryError,
+  }: {
+    fallbacks: Array<{ provider: Providers; clientOptions?: t.ClientOptions }>;
+    agentContext: AgentContext;
+    finalMessages: BaseMessage[];
+    config?: RunnableConfig;
+    primaryError: unknown;
+  }): Promise<Partial<t.BaseGraphState> | undefined> {
+    let lastError: unknown = primaryError;
+    for (const fb of fallbacks) {
+      try {
+        let fbModel = this.getNewModel({
+          provider: fb.provider,
+          clientOptions: fb.clientOptions,
+        });
+        const bindableTools = agentContext.tools;
+        fbModel = (
+          !bindableTools || bindableTools.length === 0
+            ? fbModel
+            : fbModel.bindTools(bindableTools)
+        ) as t.ChatModelInstance;
+        const result = await this.attemptInvoke(
+          {
+            currentModel: fbModel,
+            finalMessages,
+            provider: fb.provider,
+            tools: agentContext.tools,
+          },
+          config
+        );
+        return result;
+      } catch (e) {
+        lastError = e;
+        continue;
+      }
+    }
+    if (lastError !== undefined) {
+      throw lastError;
+    }
+    return undefined;
+  }
+
   cleanupSignalListener(currentModel?: t.ChatModel): void {
     if (!this.signal) {
       return;
@@ -985,38 +1039,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             }
             if (!truncated) {
               // Nothing left to truncate — fall through to fallback providers
-              let lastError: unknown = primaryError;
-              for (const fb of fallbacks) {
-                try {
-                  let model = this.getNewModel({
-                    provider: fb.provider,
-                    clientOptions: fb.clientOptions,
-                  });
-                  const bindableTools = agentContext.tools;
-                  model = (
-                    !bindableTools || bindableTools.length === 0
-                      ? model
-                      : model.bindTools(bindableTools)
-                  ) as t.ChatModelInstance;
-                  result = await this.attemptInvoke(
-                    {
-                      currentModel: model,
-                      finalMessages,
-                      provider: fb.provider,
-                      tools: agentContext.tools,
-                    },
-                    config
-                  );
-                  lastError = undefined;
-                  break;
-                } catch (e) {
-                  lastError = e;
-                  continue;
-                }
-              }
-              if (lastError !== undefined) {
-                throw lastError;
-              }
+              result = await this.tryFallbackProviders({
+                fallbacks,
+                agentContext,
+                finalMessages,
+                config,
+                primaryError,
+              });
               break;
             }
             // Retry with truncated messages
@@ -1024,38 +1053,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           }
 
           // Not a context overflow error — try fallback providers
-          let lastError: unknown = primaryError;
-          for (const fb of fallbacks) {
-            try {
-              let model = this.getNewModel({
-                provider: fb.provider,
-                clientOptions: fb.clientOptions,
-              });
-              const bindableTools = agentContext.tools;
-              model = (
-                !bindableTools || bindableTools.length === 0
-                  ? model
-                  : model.bindTools(bindableTools)
-              ) as t.ChatModelInstance;
-              result = await this.attemptInvoke(
-                {
-                  currentModel: model,
-                  finalMessages,
-                  provider: fb.provider,
-                  tools: agentContext.tools,
-                },
-                config
-              );
-              lastError = undefined;
-              break;
-            } catch (e) {
-              lastError = e;
-              continue;
-            }
-          }
-          if (lastError !== undefined) {
-            throw lastError;
-          }
+          result = await this.tryFallbackProviders({
+            fallbacks,
+            agentContext,
+            finalMessages,
+            config,
+            primaryError,
+          });
           break;
         }
       }

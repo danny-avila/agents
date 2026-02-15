@@ -5,6 +5,7 @@ import { GraphEvents, Providers } from '@/common';
 import {
   createSummarizeNode,
   DEFAULT_SUMMARIZATION_PROMPT,
+  DEFAULT_UPDATE_SUMMARIZATION_PROMPT,
 } from '@/summarization/node';
 import * as providers from '@/llm/providers';
 import * as eventUtils from '@/utils/events';
@@ -440,5 +441,28 @@ describe('DEFAULT_SUMMARIZATION_PROMPT', () => {
   it('is exported and non-empty', () => {
     expect(typeof DEFAULT_SUMMARIZATION_PROMPT).toBe('string');
     expect(DEFAULT_SUMMARIZATION_PROMPT.length).toBeGreaterThan(0);
+  });
+
+  it('contains structured checkpoint sections', () => {
+    expect(DEFAULT_SUMMARIZATION_PROMPT).toContain('## Goal');
+    expect(DEFAULT_SUMMARIZATION_PROMPT).toContain('## Progress');
+    expect(DEFAULT_SUMMARIZATION_PROMPT).toContain('## Key Decisions');
+    expect(DEFAULT_SUMMARIZATION_PROMPT).toContain('## Next Steps');
+  });
+});
+
+describe('DEFAULT_UPDATE_SUMMARIZATION_PROMPT', () => {
+  it('is exported and non-empty', () => {
+    expect(typeof DEFAULT_UPDATE_SUMMARIZATION_PROMPT).toBe('string');
+    expect(DEFAULT_UPDATE_SUMMARIZATION_PROMPT.length).toBeGreaterThan(0);
+  });
+
+  it('instructs preservation of existing summary content', () => {
+    expect(DEFAULT_UPDATE_SUMMARIZATION_PROMPT).toMatch(/preserve/i);
+  });
+
+  it('instructs updating progress tracking', () => {
+    expect(DEFAULT_UPDATE_SUMMARIZATION_PROMPT).toMatch(/Done/);
+    expect(DEFAULT_UPDATE_SUMMARIZATION_PROMPT).toMatch(/In Progress/);
   });
 });
