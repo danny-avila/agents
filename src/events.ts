@@ -45,13 +45,14 @@ export class ModelEndHandler implements t.EventHandler {
     }
 
     const currentNode = metadata.langgraph_node as string | undefined;
-    if (currentNode?.startsWith(GraphNodeKeys.SUMMARIZE) === true) {
-      return;
-    }
-
     const usage = data?.output?.usage_metadata;
     if (usage != null && this.collectedUsage != null) {
       this.collectedUsage.push(usage);
+    }
+
+    // Summarize nodes: collect usage above, but skip tool call handling
+    if (currentNode?.startsWith(GraphNodeKeys.SUMMARIZE) === true) {
+      return;
     }
 
     if (metadata.ls_provider === 'FakeListChatModel') {
@@ -145,10 +146,8 @@ export class TestLLMStreamHandler implements t.EventHandler {
     const msg = isMessageChunk ? chunk.message : undefined;
     if (msg && msg.tool_call_chunks && msg.tool_call_chunks.length > 0) {
       console.log(msg.tool_call_chunks);
-    } else if (msg && msg.content) {
-      if (typeof msg.content === 'string') {
-        process.stdout.write(msg.content);
-      }
+    } else if (msg && typeof msg.content === 'string') {
+      process.stdout.write(msg.content);
     }
   }
 }
@@ -157,11 +156,11 @@ export class TestChatStreamHandler implements t.EventHandler {
   handle(event: string, data: t.StreamEventData | undefined): void {
     const chunk = data?.chunk;
     const isContentChunk = !!(chunk && 'content' in chunk);
-    const content = isContentChunk && chunk.content;
-
-    if (!content || !isContentChunk) {
+    if (!isContentChunk) {
       return;
     }
+
+    const content = chunk.content;
 
     if (chunk.tool_call_chunks && chunk.tool_call_chunks.length > 0) {
       console.dir(chunk.tool_call_chunks, { depth: null });
@@ -183,18 +182,14 @@ export class LLMStreamHandler implements t.EventHandler {
   ): void {
     const chunk = data?.chunk;
     const isMessageChunk = !!(chunk && 'message' in chunk);
-    const msg = isMessageChunk && chunk.message;
+    const msg = isMessageChunk ? chunk.message : undefined;
     if (metadata) {
       console.log(metadata);
     }
     if (msg && msg.tool_call_chunks && msg.tool_call_chunks.length > 0) {
       console.log(msg.tool_call_chunks);
-    } else if (msg && msg.content) {
-      if (typeof msg.content === 'string') {
-        // const text_delta = msg.content;
-        // dispatchCustomEvent(GraphEvents.CHAT_MODEL_STREAM, { chunk }, config);
-        process.stdout.write(msg.content);
-      }
+    } else if (msg && typeof msg.content === 'string') {
+      process.stdout.write(msg.content);
     }
   }
 }

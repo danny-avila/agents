@@ -7,7 +7,6 @@ import type { StandardGraph } from '@/graphs';
 import type * as t from '@/types';
 import {
   ToolCallTypes,
-  GraphNodeKeys,
   ContentTypes,
   GraphEvents,
   StepTypes,
@@ -18,6 +17,7 @@ import {
   handleToolCallChunks,
   handleToolCalls,
 } from '@/tools/handlers';
+import { handleSummarizeStream } from '@/summarization/stream';
 import { getMessageId } from '@/messages';
 
 /**
@@ -150,8 +150,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
       throw new Error('Config not found in graph');
     }
 
-    const currentNode = metadata?.langgraph_node as string | undefined;
-    if (currentNode?.startsWith(GraphNodeKeys.SUMMARIZE) === true) {
+    if (await handleSummarizeStream(data, metadata, graph)) {
       return;
     }
 
@@ -521,7 +520,14 @@ export function createContentAggregator(): t.ContentAggregatorResult {
 
       contentParts[index] = update;
     } else if (partType === ContentTypes.SUMMARY) {
-      contentParts[index] = contentPart;
+      const currentSummary = contentParts[index] as
+        | t.SummaryContentBlock
+        | undefined;
+      const incoming = contentPart as t.SummaryContentBlock;
+      contentParts[index] = {
+        ...incoming,
+        text: (currentSummary?.text ?? '') + incoming.text,
+      };
     } else if (
       partType === ContentTypes.IMAGE_URL &&
       'image_url' in contentPart
