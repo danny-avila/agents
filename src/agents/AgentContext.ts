@@ -151,6 +151,20 @@ export class AgentContext {
   /** Current token type being processed */
   currentTokenType: ContentTypes.TEXT | ContentTypes.THINK | 'think_and_text' =
     ContentTypes.TEXT;
+  /**
+   * State machine for detecting fragmented thinking tags in streaming content.
+   * States:
+   * - 'normal': Processing regular text, looking for opening tags
+   * - 'buffering_open': Accumulating potential opening tag (<think> or <thinking>)
+   * - 'thinking': Inside thinking block, processing thinking content
+   * - 'buffering_close': Accumulating potential closing tag (</think> or </thinking>)
+   */
+  thinkingState: 'normal' | 'buffering_open' | 'thinking' | 'buffering_close' =
+    'normal';
+  /** Buffer for accumulating potential thinking tags */
+  tagBuffer: string = '';
+  /** Current step ID for flushing buffer at stream end */
+  currentStepId?: string;
   /** Whether tools should end the workflow */
   toolEnd: boolean = false;
   /** Cached system runnable (created lazily) */

@@ -9,6 +9,7 @@ import type { MultiAgentGraph, StandardGraph } from '@/graphs';
 import type { Logger } from 'winston';
 import type * as t from '@/types';
 import { handleToolCalls } from '@/tools/handlers';
+import { flushThinkingBuffer } from '@/stream';
 import { Constants, Providers } from '@/common';
 
 export class HandlerRegistry {
@@ -43,6 +44,11 @@ export class ModelEndHandler implements t.EventHandler {
       return;
     }
 
+    const agentContext = graph.getAgentContext(metadata);
+
+    // Flush any remaining buffered content from thinking tag state machine
+    await flushThinkingBuffer(agentContext, graph as StandardGraph);
+
     const usage = data?.output?.usage_metadata;
     if (usage != null && this.collectedUsage != null) {
       this.collectedUsage.push(usage);
@@ -59,8 +65,6 @@ export class ModelEndHandler implements t.EventHandler {
       },
       { depth: null }
     );
-
-    const agentContext = graph.getAgentContext(metadata);
 
     if (
       agentContext.provider !== Providers.GOOGLE &&
