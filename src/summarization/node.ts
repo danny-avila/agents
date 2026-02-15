@@ -57,9 +57,6 @@ const SUMMARIZATION_PARAM_KEYS = new Set([
   'maxSummaryTokens',
 ]);
 
-const MERGE_PROMPT =
-  'Merge these partial summaries into one cohesive summary. De-duplicate overlapping information, preserve all unique details and identifiers, maintain chronological order. Output only the merged summary.';
-
 // ---------------------------------------------------------------------------
 // Hashing
 // ---------------------------------------------------------------------------
@@ -219,6 +216,56 @@ function formatMessagesForSummarization(
   });
 
   return trimmed.join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// Adaptive chunk sizing
+// ---------------------------------------------------------------------------
+
+/** Base chunk ratio — at normal message density, use 40% of budget per chunk. */
+const BASE_CHUNK_RATIO = 0.4;
+/** Minimum chunk ratio — at high message density, shrink to 15% of budget. */
+const MIN_CHUNK_RATIO = 0.15;
+/** Safety margin applied to estimated chunk sizes to account for token estimation inaccuracy. */
+const SAFETY_MARGIN = 1.2;
+
+/**
+ * Computes the minimum number of chunks needed based on content density.
+ * When average message size is large relative to the chunk budget, the chunk
+ * count increases proportionally. This prevents oversized chunks that would
+ * overflow the summarization model's context.
+ *
+ * @param messages - Messages to be chunked.
+ * @param totalCharWeight - Total character weight across all messages.
+ * @param chunkBudgetChars - Character budget per chunk (e.g., CHUNK_BUDGET_CHARS).
+ * @returns Minimum number of chunks to use.
+ */
+function computeAdaptiveChunkCount(params: {
+  messages: BaseMessage[];
+  totalCharWeight: number;
+  chunkBudgetChars: number;
+}): number {
+  const { messages, totalCharWeight, chunkBudgetChars } = params;
+  if (messages.length === 0 || chunkBudgetChars <= 0) {
+    return 1;
+  }
+
+  const avgMessageChars = totalCharWeight / messages.length;
+  const budgetFraction = avgMessageChars / chunkBudgetChars;
+
+  // Scale the per-chunk ratio down when messages are large.
+  // At budgetFraction >= 0.25, ratio starts decreasing from BASE toward MIN.
+  const effectiveRatio =
+    budgetFraction >= 0.25
+      ? Math.max(MIN_CHUNK_RATIO, BASE_CHUNK_RATIO * (1 - budgetFraction))
+      : BASE_CHUNK_RATIO;
+
+  const effectiveBudget = chunkBudgetChars * effectiveRatio;
+  const estimatedChunks = Math.ceil(
+    (totalCharWeight * SAFETY_MARGIN) / effectiveBudget
+  );
+
+  return Math.max(1, estimatedChunks);
 }
 
 // ---------------------------------------------------------------------------
@@ -553,6 +600,7 @@ export function createSummarizeNode({
           priorSummaryText,
           config: summarizeConfig,
           streaming,
+          maxSummaryTokens: effectiveMaxSummaryTokens,
         });
       } else {
         summaryText = await summarizeSinglePass({
@@ -780,8 +828,29 @@ async function summarizeInStages({
   priorSummaryText,
   config,
   streaming,
-}: SummarizeParams & { parts: number }): Promise<string> {
-  const chunks = splitMessagesByCharShare(messages, parts);
+  maxSummaryTokens,
+}: SummarizeParams & {
+  parts: number;
+  maxSummaryTokens?: number;
+}): Promise<string> {
+  // Compute total character weight for adaptive sizing.
+  const totalCharWeight = messages.reduce((sum, msg) => {
+    const content =
+      typeof msg.content === 'string'
+        ? msg.content
+        : JSON.stringify(msg.content);
+    return sum + content.length;
+  }, 0);
+
+  // The user-configured `parts` acts as a minimum; adaptive sizing may increase it.
+  const adaptiveParts = computeAdaptiveChunkCount({
+    messages,
+    totalCharWeight,
+    chunkBudgetChars: CHUNK_BUDGET_CHARS,
+  });
+  const effectiveParts = Math.max(parts, adaptiveParts);
+
+  const chunks = splitMessagesByCharShare(messages, effectiveParts);
 
   // If splitting didn't produce multiple chunks, fall back to single-pass
   if (chunks.length <= 1) {
@@ -795,19 +864,20 @@ async function summarizeInStages({
     });
   }
 
-  // Stage 1: Summarize each chunk independently.
-  // The prior summary is only included in the first chunk so the summarizer
-  // has continuity context without duplicating it across every chunk.
-  // When streaming is enabled, chunks produce native on_chat_model_stream events
-  // that flow through ChatModelStreamHandler → ON_SUMMARIZE_DELTA for real-time UX.
-  const partialSummaries: string[] = [];
+  // Progressive summary chaining: chunk N's summary becomes context for chunk N+1.
+  // This preserves temporal ordering better than independent summarization + merge,
+  // and eliminates the merge LLM call entirely.
+  // Trade-off: chunks must be processed sequentially (no parallelism).
+  let runningSummary = priorSummaryText || '';
+  const maxSummaryChars = (maxSummaryTokens ?? 2048) * 6;
+
   for (let i = 0; i < chunks.length; i++) {
     const chunk = chunks[i];
     const formattedText = formatMessagesForSummarization(chunk);
 
     let humanText: string;
-    if (i === 0 && priorSummaryText) {
-      humanText = `## Prior Summary\n\n${priorSummaryText}\n\n## Messages (Part ${i + 1} of ${chunks.length})\n\n${formattedText}`;
+    if (runningSummary) {
+      humanText = `## Prior Summary\n\n${runningSummary}\n\n## Messages (Part ${i + 1} of ${chunks.length})\n\n${formattedText}`;
     } else {
       humanText = `## Messages (Part ${i + 1} of ${chunks.length})\n\n${formattedText}`;
     }
@@ -823,24 +893,17 @@ async function summarizeInStages({
     );
 
     if (text) {
-      partialSummaries.push(text);
+      runningSummary = text;
+    }
+
+    // Guard: if running summary exceeds ~1.5× maxSummaryTokens (estimated via chars/4),
+    // truncate it before passing to the next chunk to prevent input growth.
+    if (runningSummary.length > maxSummaryChars) {
+      runningSummary =
+        runningSummary.slice(0, maxSummaryChars) +
+        '\n\n… [summary truncated to fit token budget]';
     }
   }
 
-  // If only one chunk produced output, return it directly
-  if (partialSummaries.length <= 1) {
-    return partialSummaries[0] ?? '';
-  }
-
-  // Stage 2: Merge partial summaries — this is the final call, so stream it.
-  const mergeInput = partialSummaries
-    .map((summary, i) => `## Part ${i + 1}\n\n${summary}`)
-    .join('\n\n');
-
-  return streamAndCollect(
-    model,
-    [new SystemMessage(MERGE_PROMPT), new HumanMessage(mergeInput)],
-    traceConfig(config, 'multi_stage_merge', { total_chunks: chunks.length }),
-    streaming
-  );
+  return runningSummary;
 }

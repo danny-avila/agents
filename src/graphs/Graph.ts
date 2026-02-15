@@ -55,6 +55,10 @@ import {
   isGoogleLike,
   joinKeys,
   sleep,
+  extractErrorMessage,
+  isLikelyContextOverflowError,
+  calculateMaxToolResultChars,
+  truncateToolResultContent,
 } from '@/utils';
 import { getChatModelClass, manualToolStreamProviders } from '@/llm/providers';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
@@ -526,6 +530,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         toolCallStepIds: this.toolCallStepIds,
         toolRegistry: agentContext?.toolRegistry,
         directToolNames: directToolNames.size > 0 ? directToolNames : undefined,
+        maxContextTokens: agentContext?.maxContextTokens,
+        maxToolResultChars: agentContext?.maxToolResultChars,
         errorHandler: (data, metadata) =>
           StandardGraph.handleToolCallErrorStatic(this, data, metadata),
       });
@@ -555,6 +561,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         StandardGraph.handleToolCallErrorStatic(this, data, metadata),
       toolRegistry: agentContext?.toolRegistry,
       sessions: this.sessions,
+      maxContextTokens: agentContext?.maxContextTokens,
+      maxToolResultChars: agentContext?.maxToolResultChars,
     });
   }
 
@@ -809,6 +817,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           maxTokens: agentContext.maxContextTokens,
           thinkingEnabled: isAnthropicWithThinking,
           indexTokenCountMap: agentContext.indexTokenCountMap,
+          contextPruningConfig: agentContext.contextPruningConfig,
         });
       }
       if (agentContext.pruneMessages) {
@@ -821,7 +830,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         } = agentContext.pruneMessages({
           messages,
           usageMetadata: agentContext.currentUsage,
-          // startOnMessageType: 'human',
+          lastCallUsage: agentContext.lastCallUsage,
+          totalTokensFresh: agentContext.totalTokensFresh,
         });
         agentContext.indexTokenCountMap = indexTokenCountMap;
         messagesToUse = context;
@@ -940,6 +950,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }
 
       agentContext.lastStreamCall = Date.now();
+      agentContext.markTokensStale();
 
       let result: Partial<t.BaseGraphState> | undefined;
       const fallbacks =
@@ -955,48 +966,126 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         );
       }
 
-      try {
-        result = await this.attemptInvoke(
-          {
-            currentModel: model,
-            finalMessages,
-            provider: agentContext.provider,
-            tools: agentContext.tools,
-          },
-          config
-        );
-      } catch (primaryError) {
-        let lastError: unknown = primaryError;
-        for (const fb of fallbacks) {
-          try {
-            let model = this.getNewModel({
-              provider: fb.provider,
-              clientOptions: fb.clientOptions,
-            });
-            const bindableTools = agentContext.tools;
-            model = (
-              !bindableTools || bindableTools.length === 0
-                ? model
-                : model.bindTools(bindableTools)
-            ) as t.ChatModelInstance;
-            result = await this.attemptInvoke(
-              {
-                currentModel: model,
-                finalMessages,
-                provider: fb.provider,
-                tools: agentContext.tools,
-              },
-              config
+      // Overflow recovery outer loop: if the provider rejects the prompt as too large,
+      // apply increasingly aggressive tool result truncation and retry.
+      for (;;) {
+        try {
+          result = await this.attemptInvoke(
+            {
+              currentModel: model,
+              finalMessages,
+              provider: agentContext.provider,
+              tools: agentContext.tools,
+            },
+            config
+          );
+          break; // Success — exit the recovery loop
+        } catch (primaryError) {
+          const errorMsg = extractErrorMessage(primaryError);
+          if (
+            isLikelyContextOverflowError(errorMsg) === true &&
+            agentContext.canAttemptOverflowRecovery() === true
+          ) {
+            agentContext.incrementOverflowRecovery();
+            // Apply emergency tool result truncation with increasing aggressiveness.
+            // Each retry uses a smaller fraction of the normal max chars.
+            const attempt = agentContext['_overflowRecoveryAttempts'];
+            const aggressiveness = Math.pow(0.5, attempt); // 50% → 25% → 12.5%
+            const maxChars = Math.max(
+              1000,
+              Math.floor(
+                calculateMaxToolResultChars(agentContext.maxContextTokens) *
+                  aggressiveness
+              )
             );
-            lastError = undefined;
-            break;
-          } catch (e) {
-            lastError = e;
+            let truncated = false;
+            for (const msg of finalMessages) {
+              if (msg.getType() !== 'tool') {
+                continue;
+              }
+              const content = msg.content;
+              if (typeof content === 'string' && content.length > maxChars) {
+                (msg as ToolMessage).content = truncateToolResultContent(
+                  content,
+                  maxChars
+                );
+                truncated = true;
+              }
+            }
+            if (!truncated) {
+              // Nothing left to truncate — fall through to fallback providers
+              let lastError: unknown = primaryError;
+              for (const fb of fallbacks) {
+                try {
+                  let model = this.getNewModel({
+                    provider: fb.provider,
+                    clientOptions: fb.clientOptions,
+                  });
+                  const bindableTools = agentContext.tools;
+                  model = (
+                    !bindableTools || bindableTools.length === 0
+                      ? model
+                      : model.bindTools(bindableTools)
+                  ) as t.ChatModelInstance;
+                  result = await this.attemptInvoke(
+                    {
+                      currentModel: model,
+                      finalMessages,
+                      provider: fb.provider,
+                      tools: agentContext.tools,
+                    },
+                    config
+                  );
+                  lastError = undefined;
+                  break;
+                } catch (e) {
+                  lastError = e;
+                  continue;
+                }
+              }
+              if (lastError !== undefined) {
+                throw lastError;
+              }
+              break;
+            }
+            // Retry with truncated messages
             continue;
           }
-        }
-        if (lastError !== undefined) {
-          throw lastError;
+
+          // Not a context overflow error — try fallback providers
+          let lastError: unknown = primaryError;
+          for (const fb of fallbacks) {
+            try {
+              let model = this.getNewModel({
+                provider: fb.provider,
+                clientOptions: fb.clientOptions,
+              });
+              const bindableTools = agentContext.tools;
+              model = (
+                !bindableTools || bindableTools.length === 0
+                  ? model
+                  : model.bindTools(bindableTools)
+              ) as t.ChatModelInstance;
+              result = await this.attemptInvoke(
+                {
+                  currentModel: model,
+                  finalMessages,
+                  provider: fb.provider,
+                  tools: agentContext.tools,
+                },
+                config
+              );
+              lastError = undefined;
+              break;
+            } catch (e) {
+              lastError = e;
+              continue;
+            }
+          }
+          if (lastError !== undefined) {
+            throw lastError;
+          }
+          break;
         }
       }
 
@@ -1126,6 +1215,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }
 
       agentContext.currentUsage = this.getUsageMetadata(result.messages?.[0]);
+      if (agentContext.currentUsage) {
+        agentContext.updateLastCallUsage(agentContext.currentUsage);
+      }
+      agentContext.resetOverflowRecovery();
       this.cleanupSignalListener();
       return result;
     };

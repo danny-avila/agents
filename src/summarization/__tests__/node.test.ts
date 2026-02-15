@@ -379,8 +379,7 @@ describe('createSummarizeNode', () => {
 
     const invokeResponses = [
       'Part 1 summary',
-      'Part 2 summary',
-      'Merged summary',
+      'Part 2 summary (with prior context)',
     ];
     let callIndex = 0;
 
@@ -426,13 +425,13 @@ describe('createSummarizeNode', () => {
       {} as RunnableConfig
     );
 
-    // Should have called invoke 3 times: 2 chunks + 1 merge
-    // (all fall back to invoke since model has no stream method)
+    // With progressive chaining, chunk 2's summary is the final result
+    // (chunk 1's summary is passed as prior context to chunk 2, no separate merge step)
     const completeEvent = events.find(
       (e) => e.event === GraphEvents.ON_SUMMARIZE_COMPLETE
     );
     expect((completeEvent?.data as t.SummarizeCompleteEvent).summary.text).toBe(
-      'Merged summary'
+      'Part 2 summary (with prior context)'
     );
   });
 });

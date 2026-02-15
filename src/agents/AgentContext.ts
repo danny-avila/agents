@@ -46,6 +46,10 @@ export class AgentContext {
       summarizationEnabled,
       summarizationConfig,
       initialSummary,
+      minReserveTokens,
+      contextPruningConfig,
+      overflowRecoveryConfig,
+      maxToolResultChars,
     } = agentConfig;
 
     const agentContext = new AgentContext({
@@ -69,11 +73,15 @@ export class AgentContext {
       discoveredTools,
       summarizationEnabled,
       summarizationConfig,
+      minReserveTokens,
+      contextPruningConfig,
+      overflowRecoveryConfig,
+      maxToolResultChars,
     });
 
     // Restore cross-run summary before system runnable initialization so
     // buildInstructionsString() includes the summary in the system message.
-    if (initialSummary?.text) {
+    if (initialSummary?.text != null && initialSummary.text !== '') {
       agentContext.setSummary(initialSummary.text, initialSummary.tokenCount);
     }
 
@@ -119,6 +127,41 @@ export class AgentContext {
   maxContextTokens?: number;
   /** Current usage metadata for this agent */
   currentUsage?: Partial<UsageMetadata>;
+  /**
+   * Usage from the most recent LLM call only (not accumulated).
+   * Used for accurate provider calibration in pruning.
+   */
+  lastCallUsage?: {
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+    cacheRead?: number;
+    cacheCreation?: number;
+  };
+  /**
+   * Whether totalTokens data is fresh (set true when provider usage arrives,
+   * false at the start of each turn before the LLM responds).
+   * Prevents stale token data from driving pruning/trigger decisions.
+   */
+  totalTokensFresh: boolean = false;
+  /**
+   * Absolute minimum tokens reserved for summarization output.
+   * Prevents misconfigured ratios from producing unusable summaries.
+   */
+  minReserveTokens: number = 0;
+  /** Context pruning configuration. */
+  contextPruningConfig?: t.ContextPruningConfig;
+  /** Overflow recovery configuration. */
+  overflowRecoveryConfig?: t.OverflowRecoveryConfig;
+  /**
+   * Maximum characters allowed in a single tool result before truncation.
+   * When provided, overrides the value computed from maxContextTokens.
+   */
+  maxToolResultChars?: number;
+  /** Number of overflow recovery attempts in the current turn. */
+  private _overflowRecoveryAttempts: number = 0;
+  /** Maximum overflow recovery attempts per turn. */
+  static readonly MAX_OVERFLOW_RECOVERY_ATTEMPTS = 3;
   /** Prune messages function configured for this agent */
   pruneMessages?: ReturnType<typeof createPruneMessages>;
   /** Token counter function for this agent */
@@ -236,6 +279,10 @@ export class AgentContext {
     discoveredTools,
     summarizationEnabled,
     summarizationConfig,
+    minReserveTokens,
+    contextPruningConfig,
+    overflowRecoveryConfig,
+    maxToolResultChars,
   }: {
     agentId: string;
     name?: string;
@@ -257,6 +304,10 @@ export class AgentContext {
     discoveredTools?: string[];
     summarizationEnabled?: boolean;
     summarizationConfig?: t.SummarizationConfig;
+    minReserveTokens?: number;
+    contextPruningConfig?: t.ContextPruningConfig;
+    overflowRecoveryConfig?: t.OverflowRecoveryConfig;
+    maxToolResultChars?: number;
   }) {
     this.agentId = agentId;
     this.name = name;
@@ -284,6 +335,10 @@ export class AgentContext {
     this.useLegacyContent = useLegacyContent ?? false;
     this.summarizationEnabled = summarizationEnabled;
     this.summarizationConfig = summarizationConfig;
+    this.minReserveTokens = minReserveTokens ?? 0;
+    this.contextPruningConfig = contextPruningConfig;
+    this.overflowRecoveryConfig = overflowRecoveryConfig;
+    this.maxToolResultChars = maxToolResultChars;
 
     if (discoveredTools && discoveredTools.length > 0) {
       for (const toolName of discoveredTools) {
@@ -525,6 +580,9 @@ export class AgentContext {
     this._summaryVersion = 0;
     this._lastSummarizationMsgCount = 0;
     this._summarizationCountThisRun = 0;
+    this.lastCallUsage = undefined;
+    this.totalTokensFresh = false;
+    this._overflowRecoveryAttempts = 0;
 
     if (this.tokenCounter) {
       this.initializeSystemRunnable();
@@ -727,6 +785,54 @@ export class AgentContext {
       this.summaryTokenCount = 0;
       this.systemRunnableStale = true;
     }
+  }
+
+  /**
+   * Updates the last-call usage with data from the most recent LLM response.
+   * Unlike `currentUsage` which accumulates, this captures only the single call.
+   */
+  updateLastCallUsage(usage: Partial<UsageMetadata>): void {
+    const baseInputTokens = Number(usage.input_tokens) || 0;
+    const cacheCreation =
+      Number(usage.input_token_details?.cache_creation) || 0;
+    const cacheRead = Number(usage.input_token_details?.cache_read) || 0;
+    const totalInputTokens = baseInputTokens + cacheCreation + cacheRead;
+    const outputTokens = Number(usage.output_tokens) || 0;
+
+    this.lastCallUsage = {
+      inputTokens: totalInputTokens,
+      outputTokens,
+      totalTokens: totalInputTokens + outputTokens,
+      cacheRead: cacheRead || undefined,
+      cacheCreation: cacheCreation || undefined,
+    };
+    this.totalTokensFresh = true;
+  }
+
+  /** Marks token data as stale before a new LLM call. */
+  markTokensStale(): void {
+    this.totalTokensFresh = false;
+  }
+
+  /** Whether an overflow recovery attempt can be made. */
+  canAttemptOverflowRecovery(): boolean {
+    const maxAttempts =
+      this.overflowRecoveryConfig?.maxAttempts ??
+      AgentContext.MAX_OVERFLOW_RECOVERY_ATTEMPTS;
+    return (
+      this.overflowRecoveryConfig?.enabled !== false &&
+      this._overflowRecoveryAttempts < maxAttempts
+    );
+  }
+
+  /** Increment the overflow recovery attempt counter. */
+  incrementOverflowRecovery(): void {
+    this._overflowRecoveryAttempts++;
+  }
+
+  /** Reset overflow recovery attempts after a successful call. */
+  resetOverflowRecovery(): void {
+    this._overflowRecoveryAttempts = 0;
   }
 
   /**

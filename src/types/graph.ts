@@ -416,4 +416,46 @@ export interface AgentInputs {
   /** Cross-run summary from a previous run, forwarded from formatAgentMessages.
    *  Injected into the system message via AgentContext.buildInstructionsString(). */
   initialSummary?: { text: string; tokenCount: number };
+  /**
+   * Absolute minimum tokens reserved for summarization output.
+   * Applied as: effectiveMax = min(maxContextTokens, base - max(minReserveTokens, base * ratio)).
+   * Prevents misconfigured ratios from producing unusable summaries on small models.
+   */
+  minReserveTokens?: number;
+  /** Context pruning configuration for position-based tool result degradation. */
+  contextPruningConfig?: ContextPruningConfig;
+  /** Overflow recovery configuration. */
+  overflowRecoveryConfig?: OverflowRecoveryConfig;
+  /**
+   * Maximum characters allowed in a single tool result before truncation.
+   * When provided, overrides the value computed from maxContextTokens.
+   */
+  maxToolResultChars?: number;
+}
+
+export interface ContextPruningConfig {
+  enabled?: boolean;
+  /** Number of recent assistant turns to protect from pruning. Default: 3 */
+  keepLastAssistants?: number;
+  /** Age ratio (0-1) at which soft-trim fires. Default: 0.3 */
+  softTrimRatio?: number;
+  /** Age ratio (0-1) at which hard-clear fires. Default: 0.5 */
+  hardClearRatio?: number;
+  /** Minimum tool result size (chars) before pruning applies. Default: 50000 */
+  minPrunableToolChars?: number;
+  softTrim?: {
+    maxChars?: number;
+    headChars?: number;
+    tailChars?: number;
+  };
+  hardClear?: {
+    enabled?: boolean;
+    placeholder?: string;
+  };
+}
+
+export interface OverflowRecoveryConfig {
+  enabled?: boolean;
+  /** Maximum recovery attempts before giving up. Default: 3 */
+  maxAttempts?: number;
 }
