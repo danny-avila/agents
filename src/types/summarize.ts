@@ -18,6 +18,8 @@ export type SummarizationConfig = {
   parameters?: Record<string, unknown>;
   prompt?: string;
   trigger?: SummarizationTrigger;
+  /** When false, disables streaming for summarization LLM calls (uses invoke instead of stream). Defaults to true. */
+  stream?: boolean;
 };
 
 export interface SummarizeResult {

@@ -57,7 +57,7 @@ const SUMMARIZATION_PARAM_KEYS = new Set([
 ]);
 
 const MERGE_PROMPT =
-  'Merge these partial summaries into a single cohesive summary. Preserve key facts, decisions, tool results, open questions, and any constraints. Do not include preamble -- output only the merged summary.';
+  'Merge these partial summaries into one cohesive summary. De-duplicate overlapping information, preserve all unique details and identifiers, maintain chronological order. Output only the merged summary.';
 
 // ---------------------------------------------------------------------------
 // Hashing
@@ -146,7 +146,6 @@ function formatMessageForSummary(msg: BaseMessage): string {
     } else if (Array.isArray(msg.content)) {
       for (const block of msg.content) {
         if (
-          block != null &&
           typeof block === 'object' &&
           'type' in block &&
           block.type === 'text' &&
@@ -263,7 +262,7 @@ function splitMessagesByCharShare(
 // ---------------------------------------------------------------------------
 
 export const DEFAULT_SUMMARIZATION_PROMPT =
-  'You are a summarization assistant. Summarize the following conversation messages concisely, preserving key facts, decisions, and context needed to continue the conversation. Do not include preamble -- output only the summary.';
+  'Summarize the conversation concisely. Preserve key facts, decisions, identifiers, file paths, tool results, and open questions. Use short sentences. If a prior summary is provided, integrate new information into it. Output only the summary.';
 
 /**
  * Separates summarization-specific parameters (parts, minMessagesForSplit, etc.)
@@ -344,6 +343,7 @@ export function createSummarizeNode({
     const parameters = summarizationConfig?.parameters ?? {};
     const promptText =
       summarizationConfig?.prompt ?? DEFAULT_SUMMARIZATION_PROMPT;
+    const streaming = summarizationConfig?.stream !== false;
 
     // Separate summarization-specific params from LLM constructor params.
     // This prevents keys like `parts`, `minMessagesForSplit` from being
@@ -354,7 +354,6 @@ export function createSummarizeNode({
     // The summarizer is its own agent: no tools, no system instructions
     // from the parent, just the summarization prompt.
     const clientOptions: Record<string, unknown> = {
-      disableStreaming: true,
       ...llmParams,
     };
     if (modelName != null && modelName !== '') {
@@ -431,6 +430,20 @@ export function createSummarizeNode({
     // this run or from a cross-run summary forwarded via initialSummary.
     const priorSummaryText = agentContext.getSummaryText()?.trim() ?? '';
 
+    // ----- Enrich config with summarization metadata for Langfuse tracing -----
+    // The strategies further add stage-specific metadata (single_pass, chunk, merge).
+    const summarizeConfig: RunnableConfig | undefined = config
+      ? {
+        ...config,
+        metadata: {
+          ...config.metadata,
+          agent_id: request.agentId,
+          summarization_provider: provider,
+          summarization_model: modelName,
+        },
+      }
+      : undefined;
+
     // ----- Invoke: single-pass or multi-stage -----
     let summaryText = '';
     try {
@@ -447,7 +460,8 @@ export function createSummarizeNode({
           parts,
           promptText,
           priorSummaryText,
-          config,
+          config: summarizeConfig,
+          streaming,
         });
       } else {
         summaryText = await summarizeSinglePass({
@@ -455,7 +469,8 @@ export function createSummarizeNode({
           messages: messagesToRefine,
           promptText,
           priorSummaryText,
-          config,
+          config: summarizeConfig,
+          streaming,
         });
       }
     } catch (err) {
@@ -516,16 +531,6 @@ export function createSummarizeNode({
     runStep.summary = summaryBlock;
 
     if (runnableConfig) {
-      const deltaEvent: t.SummarizeDeltaEvent = {
-        id: stepId,
-        delta: { summary: summaryBlock },
-      };
-      await safeDispatchCustomEvent(
-        GraphEvents.ON_SUMMARIZE_DELTA,
-        deltaEvent,
-        runnableConfig
-      );
-
       await safeDispatchCustomEvent(
         GraphEvents.ON_SUMMARIZE_COMPLETE,
         {
@@ -544,18 +549,52 @@ export function createSummarizeNode({
 // Summarization strategies
 // ---------------------------------------------------------------------------
 
-interface SummarizeParams {
-  model: {
-    invoke: (
-      messages: BaseMessage[],
-      config?: RunnableConfig
-    ) => Promise<{ content: string | object }>;
+/** Minimal model interface used by summarization strategies. */
+interface SummarizeModel {
+  invoke: (
+    messages: BaseMessage[],
+    config?: RunnableConfig
+  ) => Promise<{ content: string | object }>;
+  stream?: (
+    messages: BaseMessage[],
+    config?: RunnableConfig
+  ) => Promise<AsyncIterable<{ content: string | object }>>;
+}
+
+/**
+ * Wraps a RunnableConfig with summarization-specific metadata so that
+ * Langfuse (or other tracing) can distinguish summarization LLM calls
+ * from the main agent's calls.
+ */
+function traceConfig(
+  config: RunnableConfig | undefined,
+  stage: string,
+  extra?: Record<string, unknown>
+): RunnableConfig | undefined {
+  if (!config) {
+    return undefined;
+  }
+  return {
+    ...config,
+    runName: `summarization:${stage}`,
+    metadata: {
+      ...config.metadata,
+      ...extra,
+      summarization: true,
+      stage,
+    },
   };
+}
+
+interface SummarizeParams {
+  model: SummarizeModel;
   messages: BaseMessage[];
   promptText: string;
   priorSummaryText: string;
   /** RunnableConfig for callback/tracing propagation (NOT for system instructions). */
   config?: RunnableConfig;
+  /** When false, disables streaming (uses invoke instead of stream). Defaults to true. */
+  streaming?: boolean;
 }
 
 /**
@@ -571,6 +610,41 @@ function extractResponseText(response: { content: string | object }): string {
 }
 
 /**
+ * Streams an LLM call and collects the full response text.
+ * Uses `model.stream()` when available so that native `on_chat_model_stream`
+ * events flow through the graph to `ChatModelStreamHandler`, which handles
+ * dispatching `ON_SUMMARIZE_DELTA` events to the client.
+ * Falls back to `model.invoke()` when streaming isn't supported or is disabled.
+ *
+ * @param streaming - When false, forces invoke() even if model supports stream().
+ *   Defaults to true.
+ */
+async function streamAndCollect(
+  model: SummarizeModel,
+  messages: BaseMessage[],
+  config?: RunnableConfig,
+  streaming = true
+): Promise<string> {
+  if (!streaming || typeof model.stream !== 'function') {
+    const response = await model.invoke(messages, config);
+    return extractResponseText(response);
+  }
+
+  let fullText = '';
+  const stream = await model.stream(messages, config);
+  for await (const chunk of stream) {
+    const text =
+      typeof chunk.content === 'string'
+        ? chunk.content
+        : JSON.stringify(chunk.content);
+    if (text) {
+      fullText += text;
+    }
+  }
+  return fullText.trim();
+}
+
+/**
  * Single-pass summarization: formats all messages → one LLM call.
  * Used when `parts <= 1` or when the message count is below `minMessagesForSplit`.
  */
@@ -580,6 +654,7 @@ async function summarizeSinglePass({
   promptText,
   priorSummaryText,
   config,
+  streaming,
 }: SummarizeParams): Promise<string> {
   const formattedText = formatMessagesForSummarization(messages);
 
@@ -587,12 +662,12 @@ async function summarizeSinglePass({
     ? `## Prior Summary\n\n${priorSummaryText}\n\n## New Messages to Incorporate\n\n${formattedText}`
     : formattedText;
 
-  const response = await model.invoke(
+  return streamAndCollect(
+    model,
     [new SystemMessage(promptText), new HumanMessage(humanMessageText)],
-    config
+    traceConfig(config, 'single_pass'),
+    streaming
   );
-
-  return extractResponseText(response);
 }
 
 /**
@@ -611,6 +686,7 @@ async function summarizeInStages({
   promptText,
   priorSummaryText,
   config,
+  streaming,
 }: SummarizeParams & { parts: number }): Promise<string> {
   const chunks = splitMessagesByCharShare(messages, parts);
 
@@ -622,12 +698,15 @@ async function summarizeInStages({
       promptText,
       priorSummaryText,
       config,
+      streaming,
     });
   }
 
   // Stage 1: Summarize each chunk independently.
   // The prior summary is only included in the first chunk so the summarizer
   // has continuity context without duplicating it across every chunk.
+  // When streaming is enabled, chunks produce native on_chat_model_stream events
+  // that flow through ChatModelStreamHandler → ON_SUMMARIZE_DELTA for real-time UX.
   const partialSummaries: string[] = [];
   for (let i = 0; i < chunks.length; i++) {
     const chunk = chunks[i];
@@ -640,12 +719,16 @@ async function summarizeInStages({
       humanText = `## Messages (Part ${i + 1} of ${chunks.length})\n\n${formattedText}`;
     }
 
-    const response = await model.invoke(
+    const text = await streamAndCollect(
+      model,
       [new SystemMessage(promptText), new HumanMessage(humanText)],
-      config
+      traceConfig(config, 'multi_stage_chunk', {
+        chunk_index: i,
+        total_chunks: chunks.length,
+      }),
+      streaming
     );
 
-    const text = extractResponseText(response);
     if (text) {
       partialSummaries.push(text);
     }
@@ -656,15 +739,15 @@ async function summarizeInStages({
     return partialSummaries[0] ?? '';
   }
 
-  // Stage 2: Merge partial summaries into a single cohesive summary.
+  // Stage 2: Merge partial summaries — this is the final call, so stream it.
   const mergeInput = partialSummaries
     .map((summary, i) => `## Part ${i + 1}\n\n${summary}`)
     .join('\n\n');
 
-  const mergeResponse = await model.invoke(
+  return streamAndCollect(
+    model,
     [new SystemMessage(MERGE_PROMPT), new HumanMessage(mergeInput)],
-    config
+    traceConfig(config, 'multi_stage_merge', { total_chunks: chunks.length }),
+    streaming
   );
-
-  return extractResponseText(mergeResponse);
 }
