@@ -190,6 +190,19 @@ export class Run<_T extends t.BaseGraphState> {
       tags?: string[],
       metadata?: Record<string, unknown>
     ): Promise<void> => {
+
+      // ON_RUN_STEP is dispatched directly via handler registry in
+      // Graph.dispatchRunStep (primary, reliable path).  Skip the
+      // callback-based dispatch to prevent double handling.
+      // Other ON_RUN_STEP sources (e.g. summarize node) don't go
+      // through dispatchRunStep, so they still reach the handler here.
+      if (
+        eventName === GraphEvents.ON_RUN_STEP &&
+        this.Graph != null &&
+        this.Graph.handlerDispatchedStepIds.has((data as t.RunStep).id)
+      ) {
+        return;
+      }
       const handler = this.handlerRegistry?.getHandler(eventName);
       if (handler && this.Graph) {
         return await handler.handle(

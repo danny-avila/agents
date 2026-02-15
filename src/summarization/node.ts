@@ -11,6 +11,7 @@ import type * as t from '@/types';
 import { ContentTypes, GraphEvents, StepTypes, Providers } from '@/common';
 import { safeDispatchCustomEvent } from '@/utils/events';
 import { getChatModelClass } from '@/llm/providers';
+import { createRemoveAllMessage } from '@/messages/reducer';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -591,7 +592,7 @@ export function createSummarizeNode({
       summarizationRequest?: t.SummarizationNodeInput;
     },
     config?: RunnableConfig
-  ): Promise<{ summarizationRequest: undefined }> => {
+  ): Promise<{ summarizationRequest: undefined; messages?: BaseMessage[] }> => {
     const request = state.summarizationRequest;
     if (request == null) {
       return { summarizationRequest: undefined };
@@ -829,7 +830,35 @@ export function createSummarizeNode({
       );
     }
 
-    return { summarizationRequest: undefined };
+    // ----- Remove summarized messages from graph state -----
+    // The summarized messages (messagesToRefine) have been captured in the
+    // summary text.  Remove them from the inner subgraph's state so the
+    // next agent node prune pass works with a shorter, cleaner message list
+    // instead of re-pruning the same oversized history.
+    //
+    // Uses REMOVE_ALL_MESSAGES to replace the entire messages array with
+    // only the surviving context.  This is cleaner than individual
+    // RemoveMessage per summarized message because:
+    //   - No risk of ID mismatches or missing IDs
+    //   - The reducer handles REMOVE_ALL by discarding all left messages
+    //     and keeping only messages after the marker
+    //
+    // After removal, the pruner's closure state (indices, token map) is
+    // stale, so we rebuild the indexTokenCountMap for the surviving context
+    // and setSummary() already nulls out the pruner for recreation.
+    const contextMessages = request.context;
+    if (contextMessages.length > 0 && agentContext.tokenCounter) {
+      const newTokenMap: Record<string, number> = {};
+      for (let i = 0; i < contextMessages.length; i++) {
+        newTokenMap[i] = agentContext.tokenCounter(contextMessages[i]);
+      }
+      agentContext.rebuildTokenMapAfterSummarization(newTokenMap);
+    }
+
+    return {
+      summarizationRequest: undefined,
+      messages: [createRemoveAllMessage(), ...contextMessages],
+    };
   };
 }
 
@@ -969,13 +998,27 @@ async function summarizeSinglePass({
 }
 
 /**
+ * Instruction prepended to the fresh prompt for intra-cycle chunks (i > 0)
+ * so the LLM knows how to handle the `<context-from-earlier-messages>` section.
+ * Unlike the UPDATE prompt (which says "PRESERVE all existing information"),
+ * this instructs the LLM to produce a single cohesive summary that incorporates
+ * the earlier context without duplicating section headers.
+ */
+const CHUNK_CONTINUATION_PREFIX =
+  'A <context-from-earlier-messages> section is provided containing a summary of earlier parts of this same conversation that you have already processed. Incorporate this information alongside the new messages into a single comprehensive summary. Do NOT duplicate section headers — produce one unified summary covering all information.\n\n';
+
+/**
  * Multi-stage summarization via progressive chaining:
  *   1. Split messages into chunks by character weight (adaptive sizing)
  *   2. Summarize chunks sequentially — each chunk's summary becomes
  *      context for the next, preserving temporal ordering
  *
- * Uses the update prompt (if available) when a running summary exists,
- * falling back to the fresh prompt for the first chunk with no prior context.
+ * Prompt selection per chunk:
+ *   - Chunk 0 with cross-cycle prior summary: UPDATE prompt (preserve old summary,
+ *     integrate new messages)
+ *   - Chunk 0 without prior summary: FRESH prompt (create from scratch)
+ *   - Chunks 1+: FRESH prompt with a continuation prefix (incorporate running
+ *     summary as context, do NOT re-preserve verbatim — avoids section duplication)
  */
 async function summarizeInStages({
   model,
@@ -1040,16 +1083,33 @@ async function summarizeInStages({
     const chunk = chunks[i];
     const formattedText = formatMessagesForSummarization(chunk);
 
-    // Use update prompt when we have a running summary (either from prior
-    // summary or from a previous chunk), fresh prompt for the first chunk
-    // with no prior context.
-    const effectivePrompt = runningSummary
-      ? (updatePromptText ?? promptText)
-      : promptText;
+    // Chunk 0 with a cross-cycle prior summary: use the UPDATE prompt so the
+    // LLM integrates new messages into the existing summary.
+    // All other chunks (including chunk 0 with no prior): use the FRESH prompt
+    // so the LLM creates a NEW summary rather than re-preserving content
+    // verbatim — this prevents duplicate section headers (## Goal appearing
+    // twice, etc.) that occurred when the UPDATE prompt was used for every
+    // chunk with a running summary.
+    const isCrossRunUpdate = i === 0 && priorSummaryText !== '';
+    let effectivePrompt: string;
+    if (isCrossRunUpdate) {
+      effectivePrompt = updatePromptText ?? promptText;
+    } else if (i > 0 && runningSummary) {
+      // Intra-cycle continuation: prepend context instructions to fresh prompt
+      effectivePrompt = CHUNK_CONTINUATION_PREFIX + promptText;
+    } else {
+      effectivePrompt = promptText;
+    }
 
     let humanText: string;
     if (runningSummary) {
-      humanText = `<previous-summary>\n${runningSummary}\n</previous-summary>\n\n<conversation>\nPart ${i + 1} of ${chunks.length}:\n\n${formattedText}\n</conversation>`;
+      if (isCrossRunUpdate) {
+        // Cross-cycle: mark as previous summary for the UPDATE prompt
+        humanText = `<previous-summary>\n${runningSummary}\n</previous-summary>\n\n<conversation>\nPart ${i + 1} of ${chunks.length}:\n\n${formattedText}\n</conversation>`;
+      } else {
+        // Intra-cycle: frame as context to incorporate, not to preserve verbatim
+        humanText = `<context-from-earlier-messages>\n${runningSummary}\n</context-from-earlier-messages>\n\n<conversation>\nPart ${i + 1} of ${chunks.length}:\n\n${formattedText}\n</conversation>`;
+      }
     } else {
       humanText = `<conversation>\nPart ${i + 1} of ${chunks.length}:\n\n${formattedText}\n</conversation>`;
     }

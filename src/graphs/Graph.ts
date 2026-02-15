@@ -135,6 +135,12 @@ export abstract class Graph<
   stepKeyIds: Map<string, string[]> = new Map<string, string[]>();
   contentIndexMap: Map<string, number> = new Map();
   toolCallStepIds: Map<string, string> = new Map();
+  /**
+   * Step IDs that have been dispatched via handler registry directly
+   * (in dispatchRunStep).  Used by the custom event callback to skip
+   * duplicate dispatch through the LangGraph callback chain.
+   */
+  handlerDispatchedStepIds: Set<string> = new Set();
   signal?: AbortSignal;
   /** Set of invoked tool call IDs from non-message run steps completed mid-run, if any */
   invokedToolIds?: Set<string>;
@@ -206,6 +212,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
      * a stale reference on 2nd+ processStream calls.
      */
     this.toolCallStepIds.clear();
+    this.handlerDispatchedStepIds = resetIfNotEmpty(
+      this.handlerDispatchedStepIds,
+      new Set()
+    );
     this.messageIdsByStepKey = resetIfNotEmpty(
       this.messageIdsByStepKey,
       new Map()
@@ -843,6 +853,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           thinkingEnabled: isAnthropicWithThinking,
           indexTokenCountMap: agentContext.indexTokenCountMap,
           contextPruningConfig: agentContext.contextPruningConfig,
+          getInstructionTokens: () => agentContext.instructionTokens,
         });
       }
       if (agentContext.pruneMessages) {
@@ -983,10 +994,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         [];
 
       if (finalMessages.length === 0) {
+        const breakdown = agentContext.formatTokenBudgetBreakdown(messages);
         throw new Error(
           JSON.stringify({
             type: 'empty_messages',
-            info: 'Message pruning removed all messages as none fit in the context window. Please increase the context window size or make your message shorter.',
+            info: `Message pruning removed all messages as none fit in the context window. Please increase the context window size or make your message shorter.\n${breakdown}`,
           })
         );
       }
@@ -1012,6 +1024,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             agentContext.canAttemptOverflowRecovery() === true
           ) {
             agentContext.incrementOverflowRecovery();
+            console.warn(
+              `[agentus] Context overflow detected (attempt ${agentContext['_overflowRecoveryAttempts']}). ${agentContext.formatTokenBudgetBreakdown(finalMessages)}`
+            );
             // Apply emergency tool result truncation with increasing aggressiveness.
             // Each retry uses a smaller fraction of the normal max chars.
             const attempt = agentContext['_overflowRecoveryAttempts'];
@@ -1382,6 +1397,23 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
     this.contentData.push(runStep);
     this.contentIndexMap.set(stepId, runStep.index);
+
+    // Primary dispatch: handler registry (reliable, always works).
+    // This mirrors how handleToolCallCompleted dispatches ON_RUN_STEP_COMPLETED
+    // via the handler registry, ensuring the event always reaches the handler
+    // even when LangGraph's callback system drops the custom event.
+    const handler = this.handlerRegistry?.getHandler(GraphEvents.ON_RUN_STEP);
+    if (handler) {
+      await handler.handle(GraphEvents.ON_RUN_STEP, runStep, metadata, this);
+      this.handlerDispatchedStepIds.add(stepId);
+    }
+
+    // Secondary dispatch: custom event for LangGraph callback chain
+    // (tracing, Langfuse, external consumers).  May be silently dropped
+    // in some scenarios (stale run ID, subgraph callback propagation issues),
+    // but the primary dispatch above guarantees the event reaches the handler.
+    // The customEventCallback in run.ts skips events already dispatched above
+    // to prevent double handling.
     await safeDispatchCustomEvent(
       GraphEvents.ON_RUN_STEP,
       runStep,

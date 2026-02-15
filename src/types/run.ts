@@ -122,6 +122,29 @@ export type ProvidedCallbacks =
   | undefined;
 
 export type TokenCounter = (message: BaseMessage) => number;
+
+/** Structured breakdown of how context token budget is consumed. */
+export type TokenBudgetBreakdown = {
+  /** Total context window budget (maxContextTokens). */
+  maxContextTokens: number;
+  /** Total instruction tokens (system + tools + summary). */
+  instructionTokens: number;
+  /** Tokens from the system message text alone. */
+  systemMessageTokens: number;
+  /** Tokens from tool schema definitions. */
+  toolSchemaTokens: number;
+  /** Tokens from the conversation summary. */
+  summaryTokens: number;
+  /** Number of registered tools. */
+  toolCount: number;
+  /** Number of messages in the conversation. */
+  messageCount: number;
+  /** Total tokens consumed by messages (excluding system). */
+  messageTokens: number;
+  /** Tokens available for messages after instructions. */
+  availableForMessages: number;
+};
+
 export type EventStreamOptions = {
   callbacks?: g.ClientCallbacks;
   keepContent?: boolean;

@@ -166,8 +166,10 @@ export class AgentContext {
   pruneMessages?: ReturnType<typeof createPruneMessages>;
   /** Token counter function for this agent */
   tokenCounter?: t.TokenCounter;
-  /** Instructions/system message token count */
+  /** Instructions/system message token count (system + tools + summary) */
   instructionTokens: number = 0;
+  /** Token count for tool schemas only (subset of instructionTokens) */
+  toolSchemaTokens: number = 0;
   /** The amount of time that should pass before another consecutive API call */
   streamBuffer?: number;
   /** Last stream call timestamp for rate limiting */
@@ -562,6 +564,7 @@ export class AgentContext {
   reset(): void {
     this.instructionTokens = 0;
     this.systemMessageTokens = 0;
+    this.toolSchemaTokens = 0;
     this.cachedSystemRunnable = undefined;
     this.systemRunnableStale = true;
     this.lastToken = undefined;
@@ -603,23 +606,21 @@ export class AgentContext {
   }
 
   /**
-   * Update the token count map with instruction tokens
+   * Update the token count map from a base map.
+   *
+   * Previously this inflated index 0 with instructionTokens to indirectly
+   * reserve budget for the system prompt.  That approach was imprecise: with
+   * large tool-schema overhead (e.g. 26 MCP tools ~5 000 tokens) the first
+   * conversation message appeared enormous and was always pruned, while the
+   * real available budget was never explicitly computed.
+   *
+   * Now instruction tokens are passed to getMessagesWithinTokenLimit via
+   * the `getInstructionTokens` factory param so the pruner subtracts them
+   * from the budget directly.  The token map contains only real per-message
+   * token counts.
    */
   updateTokenMapWithInstructions(baseTokenMap: Record<string, number>): void {
-    if (this.instructionTokens > 0) {
-      // Shift all indices by the instruction token count
-      const shiftedMap: Record<string, number> = {};
-      for (const [key, value] of Object.entries(baseTokenMap)) {
-        const index = parseInt(key, 10);
-        if (!isNaN(index)) {
-          shiftedMap[String(index)] =
-            value + (index === 0 ? this.instructionTokens : 0);
-        }
-      }
-      this.indexTokenCountMap = shiftedMap;
-    } else {
-      this.indexTokenCountMap = { ...baseTokenMap };
-    }
+    this.indexTokenCountMap = { ...baseTokenMap };
   }
 
   /**
@@ -676,6 +677,7 @@ export class AgentContext {
       }
     }
 
+    this.toolSchemaTokens = toolTokens;
     this.instructionTokens += toolTokens;
   }
 
@@ -728,6 +730,22 @@ export class AgentContext {
     this.summaryTokenCount = tokenCount;
     this._summaryVersion += 1;
     this.systemRunnableStale = true;
+    // Force pruner recreation: after summarization, the summarize node removes
+    // summarized messages from graph state via RemoveMessage.  The old pruner's
+    // closure state (indexTokenCountMap indices, lastCutOffIndex, totalTokens)
+    // becomes stale once messages are removed.  Setting to undefined causes the
+    // agent node to create a fresh pruner with the rebuilt token map.
+    this.pruneMessages = undefined;
+  }
+
+  /**
+   * Replaces the indexTokenCountMap with a fresh map keyed to the surviving
+   * context messages after summarization.  Called by the summarize node after
+   * it emits RemoveMessage operations that shift message indices.
+   */
+  rebuildTokenMapAfterSummarization(newTokenMap: Record<string, number>): void {
+    this.indexTokenCountMap = newTokenMap;
+    this.baseIndexTokenCountMap = { ...newTokenMap };
   }
 
   hasSummary(): boolean {
@@ -785,6 +803,61 @@ export class AgentContext {
       this.summaryTokenCount = 0;
       this.systemRunnableStale = true;
     }
+  }
+
+  /**
+   * Returns a structured breakdown of how the context token budget is consumed.
+   * Useful for diagnostics when context overflow or pruning issues occur.
+   */
+  getTokenBudgetBreakdown(messages?: BaseMessage[]): t.TokenBudgetBreakdown {
+    const maxContextTokens = this.maxContextTokens ?? 0;
+    const toolCount =
+      (this.tools?.length ?? 0) + (this.toolDefinitions?.length ?? 0);
+    const messageCount = messages?.length ?? 0;
+
+    // Compute message tokens from the index map.
+    // Index 0 now contains the real first message token count (no longer
+    // inflated with instruction tokens), so we include all indices.
+    let messageTokens = 0;
+    if (messages != null) {
+      for (let i = 0; i < messages.length; i++) {
+        messageTokens +=
+          (this.indexTokenCountMap[i] as number | undefined) ?? 0;
+      }
+    }
+
+    const availableForMessages = Math.max(
+      0,
+      maxContextTokens - this.instructionTokens
+    );
+
+    return {
+      maxContextTokens,
+      instructionTokens: this.instructionTokens,
+      systemMessageTokens: this.systemMessageTokens,
+      toolSchemaTokens: this.toolSchemaTokens,
+      summaryTokens: this.summaryTokenCount,
+      toolCount,
+      messageCount,
+      messageTokens,
+      availableForMessages,
+    };
+  }
+
+  /**
+   * Returns a human-readable string of the token budget breakdown
+   * for inclusion in error messages and diagnostics.
+   */
+  formatTokenBudgetBreakdown(messages?: BaseMessage[]): string {
+    const b = this.getTokenBudgetBreakdown(messages);
+    const lines = [
+      'Token budget breakdown:',
+      `  maxContextTokens:    ${b.maxContextTokens}`,
+      `  instructionTokens:   ${b.instructionTokens} (system: ${b.systemMessageTokens}, tools: ${b.toolSchemaTokens} [${b.toolCount} tools], summary: ${b.summaryTokens})`,
+      `  messageTokens:       ${b.messageTokens} (${b.messageCount} messages)`,
+      `  availableForMessages: ${b.availableForMessages}`,
+    ];
+    return lines.join('\n');
   }
 
   /**

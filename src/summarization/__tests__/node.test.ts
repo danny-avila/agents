@@ -273,7 +273,11 @@ describe('createSummarizeNode', () => {
       {} as RunnableConfig
     );
 
-    expect(result).toEqual({ summarizationRequest: undefined });
+    expect(result.summarizationRequest).toBeUndefined();
+    // After summarization, REMOVE_ALL + surviving context is returned
+    expect(result.messages).toBeDefined();
+    expect(result.messages!.length).toBeGreaterThanOrEqual(1);
+    expect(result.messages![0]._getType()).toBe('remove');
 
     // Tier 3 fallback: metadata stub is used as summary text
     const completeEvent = events.find(
@@ -434,6 +438,204 @@ describe('createSummarizeNode', () => {
     expect((completeEvent?.data as t.SummarizeCompleteEvent).summary.text).toBe(
       'Part 2 summary (with prior context)'
     );
+  });
+
+  it('uses FRESH prompt for intra-cycle chunks, UPDATE prompt only for cross-cycle prior', async () => {
+    captureEvents();
+
+    // Capture what system messages are sent to the model for each chunk
+    const capturedSystemMessages: string[] = [];
+    const capturedHumanMessages: string[] = [];
+
+    const invokeResponses = [
+      '## Goal\nChunk 1 summary.',
+      '## Goal\nFinal comprehensive summary.',
+    ];
+    let callIndex = 0;
+
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return {
+            invoke: jest
+              .fn()
+              .mockImplementation(async (messages: unknown[]) => {
+                // Capture the system and human messages
+                for (const msg of messages as {
+                  _getType: () => string;
+                  content: string;
+                }[]) {
+                  if (msg._getType() === 'system') {
+                    capturedSystemMessages.push(
+                      typeof msg.content === 'string'
+                        ? msg.content
+                        : JSON.stringify(msg.content)
+                    );
+                  }
+                  if (msg._getType() === 'human') {
+                    capturedHumanMessages.push(
+                      typeof msg.content === 'string'
+                        ? msg.content
+                        : JSON.stringify(msg.content)
+                    );
+                  }
+                }
+                return { content: invokeResponses[callIndex++] || '' };
+              }),
+          };
+        }
+      } as never
+    );
+
+    const agentContext = mockAgentContext({
+      summarizationConfig: {
+        parameters: { parts: 2, minMessagesForSplit: 2 },
+      },
+    } as never);
+    const graph = mockGraph();
+    const node = createSummarizeNode({
+      agentContext,
+      graph,
+      generateStepId,
+    });
+
+    await node(
+      {
+        messages: [new HumanMessage('Hello')],
+        summarizationRequest: {
+          messagesToRefine: [
+            new HumanMessage('Message 1'),
+            new HumanMessage('Message 2'),
+            new HumanMessage('Message 3'),
+            new HumanMessage('Message 4'),
+          ],
+          context: [],
+          remainingContextTokens: 1000,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    // Two chunks means two invoke calls
+    expect(capturedSystemMessages.length).toBe(2);
+
+    // Chunk 1 (no prior summary): should use FRESH prompt (contains "Create a structured")
+    expect(capturedSystemMessages[0]).toContain('Create a structured');
+    // Should NOT use the UPDATE prompt (which says "PRESERVE")
+    expect(capturedSystemMessages[0]).not.toContain('PRESERVE');
+
+    // Chunk 2 (intra-cycle, has running summary from chunk 1): should use FRESH prompt
+    // with continuation prefix (NOT the UPDATE prompt)
+    expect(capturedSystemMessages[1]).toContain('Create a structured');
+    expect(capturedSystemMessages[1]).not.toContain('PRESERVE');
+    // Should have the continuation prefix instructing to incorporate context
+    expect(capturedSystemMessages[1]).toContain(
+      'context-from-earlier-messages'
+    );
+
+    // Human message for chunk 2 should use <context-from-earlier-messages> tag
+    // (NOT <previous-summary> which is reserved for cross-cycle updates)
+    expect(capturedHumanMessages[1]).toContain(
+      '<context-from-earlier-messages>'
+    );
+    expect(capturedHumanMessages[1]).not.toContain('<previous-summary>');
+  });
+
+  it('uses UPDATE prompt for chunk 0 when cross-cycle prior summary exists', async () => {
+    captureEvents();
+
+    const capturedSystemMessages: string[] = [];
+    const capturedHumanMessages: string[] = [];
+
+    const invokeResponses = [
+      '## Goal\nUpdated with chunk 1.',
+      '## Goal\nFinal with all context.',
+    ];
+    let callIndex = 0;
+
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return {
+            invoke: jest
+              .fn()
+              .mockImplementation(async (messages: unknown[]) => {
+                for (const msg of messages as {
+                  _getType: () => string;
+                  content: string;
+                }[]) {
+                  if (msg._getType() === 'system') {
+                    capturedSystemMessages.push(
+                      typeof msg.content === 'string'
+                        ? msg.content
+                        : JSON.stringify(msg.content)
+                    );
+                  }
+                  if (msg._getType() === 'human') {
+                    capturedHumanMessages.push(
+                      typeof msg.content === 'string'
+                        ? msg.content
+                        : JSON.stringify(msg.content)
+                    );
+                  }
+                }
+                return { content: invokeResponses[callIndex++] || '' };
+              }),
+          };
+        }
+      } as never
+    );
+
+    // Agent has a prior summary from a previous cycle
+    const agentContext = mockAgentContext({
+      summarizationConfig: {
+        parameters: { parts: 2, minMessagesForSplit: 2 },
+      },
+      getSummaryText: () => '## Goal\nPrior cycle summary content.',
+    } as never);
+    const graph = mockGraph();
+    const node = createSummarizeNode({
+      agentContext,
+      graph,
+      generateStepId,
+    });
+
+    await node(
+      {
+        messages: [new HumanMessage('Hello')],
+        summarizationRequest: {
+          messagesToRefine: [
+            new HumanMessage('Message 1'),
+            new HumanMessage('Message 2'),
+            new HumanMessage('Message 3'),
+            new HumanMessage('Message 4'),
+          ],
+          context: [],
+          remainingContextTokens: 1000,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    expect(capturedSystemMessages.length).toBe(2);
+
+    // Chunk 0 with cross-cycle prior: should use UPDATE prompt
+    expect(capturedSystemMessages[0]).toContain('PRESERVE');
+    // Human message should use <previous-summary> tag for cross-cycle
+    expect(capturedHumanMessages[0]).toContain('<previous-summary>');
+
+    // Chunk 1 (intra-cycle): should use FRESH prompt with continuation prefix
+    expect(capturedSystemMessages[1]).not.toContain('PRESERVE');
+    expect(capturedSystemMessages[1]).toContain(
+      'context-from-earlier-messages'
+    );
+    // Human message should use <context-from-earlier-messages> tag
+    expect(capturedHumanMessages[1]).toContain(
+      '<context-from-earlier-messages>'
+    );
+    expect(capturedHumanMessages[1]).not.toContain('<previous-summary>');
   });
 });
 

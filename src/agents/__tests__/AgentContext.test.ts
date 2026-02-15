@@ -641,7 +641,7 @@ describe('AgentContext', () => {
 
       // Simulate token map update (as done in fromConfig flow)
       ctx.updateTokenMapWithInstructions({ '0': 10, '1': 20 });
-      expect(ctx.indexTokenCountMap['0']).toBe(10 + turn1Tokens);
+      expect(ctx.indexTokenCountMap['0']).toBe(10);
       expect(ctx.indexTokenCountMap['1']).toBe(20);
 
       // ========== TURN 2: Tool search results come back ==========
@@ -704,8 +704,8 @@ describe('AgentContext', () => {
       const messageTokenCounts = { '0': 50, '1': 100, '2': 75 };
       ctx.updateTokenMapWithInstructions(messageTokenCounts);
 
-      // Verify token map: first message gets instruction tokens added
-      expect(ctx.indexTokenCountMap['0']).toBe(50 + initialSystemTokens);
+      // Verify token map: first message keeps its real token count (no inflation)
+      expect(ctx.indexTokenCountMap['0']).toBe(50);
       expect(ctx.indexTokenCountMap['1']).toBe(100);
       expect(ctx.indexTokenCountMap['2']).toBe(75);
 
@@ -738,7 +738,7 @@ describe('AgentContext', () => {
       const newMessageTokenCounts = { '0': 60, '1': 110 };
       ctx.updateTokenMapWithInstructions(newMessageTokenCounts);
 
-      expect(ctx.indexTokenCountMap['0']).toBe(60 + newSystemTokens);
+      expect(ctx.indexTokenCountMap['0']).toBe(60);
       expect(ctx.indexTokenCountMap['1']).toBe(110);
     });
 
@@ -949,7 +949,7 @@ describe('AgentContext', () => {
       expect(postResetTokens).toBeGreaterThan(0);
     });
 
-    it('updateTokenMapWithInstructions adds instructionTokens (including summary) to index 0', () => {
+    it('updateTokenMapWithInstructions copies base map without inflating index 0', () => {
       const ctx = createBasicContext({
         agentConfig: { instructions: 'Be helpful.' },
         tokenCounter: charTokenCounter,
@@ -965,7 +965,10 @@ describe('AgentContext', () => {
       const baseMap: Record<string, number> = { '0': 5, '1': 10 };
       ctx.updateTokenMapWithInstructions(baseMap);
 
-      expect(ctx.indexTokenCountMap['0']).toBe(5 + instructionTokens);
+      // Index 0 should contain the real message token count, NOT inflated
+      // with instruction tokens.  Instruction overhead is now handled by
+      // getInstructionTokens() in the pruning factory.
+      expect(ctx.indexTokenCountMap['0']).toBe(5);
       expect(ctx.indexTokenCountMap['1']).toBe(10);
     });
 

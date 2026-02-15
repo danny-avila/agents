@@ -767,7 +767,7 @@ describe('Prune Messages with Thinking Mode Tests', () => {
     );
   });
 
-  it('should throw descriptive error when aggressive pruning removes all AI messages', () => {
+  it('should gracefully degrade when aggressive pruning removes all AI messages', () => {
     const tokenCounter = createTestTokenCounter();
 
     const assistantMessageWithThinking = new AIMessage({
@@ -817,8 +817,10 @@ describe('Prune Messages with Thinking Mode Tests', () => {
       thinkingEnabled: true,
     });
 
-    expect(() => pruneMessages({ messages })).toThrow(
-      /Context window exceeded/
-    );
+    // Should not throw — gracefully degrades by skipping thinking block reattachment
+    expect(() => pruneMessages({ messages })).not.toThrow();
+    const result = pruneMessages({ messages });
+    // Context should contain at most the system message (no AI messages survived)
+    expect(result.context.length).toBeLessThanOrEqual(2);
   });
 });
