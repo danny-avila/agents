@@ -26,6 +26,7 @@ import { ConverseStreamCommand } from '@aws-sdk/client-bedrock-runtime';
 import { AIMessageChunk } from '@langchain/core/messages';
 import { ChatGenerationChunk, ChatResult } from '@langchain/core/outputs';
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
+import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ChatBedrockConverseInput } from '@langchain/aws';
 import type { BaseMessage } from '@langchain/core/messages';
 import {
@@ -101,6 +102,26 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
 
   static lc_name(): string {
     return 'LibreChatBedrockConverse';
+  }
+
+  /**
+   * Bedrock Converse API workaround for tools + system message conflict.
+   *
+   * When tools are bound, Bedrock's parent implementation extracts any SystemMessage
+   * from the input array and sends it as a separate 'system' field in the API request.
+   * However, this conflicts with the tool binding configuration, causing:
+   * "The additional field system conflicts with an existing field"
+   *
+   * We filter out SystemMessages from the input to prevent this. System instructions
+   * are still applied - they're either handled via the model's systemRunnable pipe
+   * (for non-tool cases) or bound during model initialization (for tool cases in Graph.ts).
+   */
+  async invoke(
+    input: BaseMessage[],
+    config?: RunnableConfig | undefined
+  ): Promise<AIMessageChunk> {
+    const processedInput = input.filter((msg) => msg.getType() !== 'system');
+    return super.invoke(processedInput, config);
   }
 
   /**
