@@ -34,6 +34,46 @@ export function calculateMaxToolResultChars(
 }
 
 /**
+ * Truncates a tool-call input (the arguments/payload of a tool_use block)
+ * using head+tail strategy. Returns an object with `_truncated` (the
+ * truncated string) and `_originalChars` (for diagnostics).
+ *
+ * Accepts any type — objects are JSON-serialized before truncation.
+ *
+ * @param input - The tool input (string, object, etc.).
+ * @param maxChars - Maximum allowed characters.
+ */
+export function truncateToolInput(
+  input: unknown,
+  maxChars: number
+): { _truncated: string; _originalChars: number } {
+  const serialized = typeof input === 'string' ? input : JSON.stringify(input);
+  if (serialized.length <= maxChars) {
+    return { _truncated: serialized, _originalChars: serialized.length };
+  }
+  const indicator = `\n… [truncated: ${serialized.length} → ${maxChars} chars] …\n`;
+  const available = maxChars - indicator.length;
+
+  if (available < 100) {
+    return {
+      _truncated: serialized.slice(0, maxChars) + indicator.trimEnd(),
+      _originalChars: serialized.length,
+    };
+  }
+
+  const headSize = Math.ceil(available * 0.7);
+  const tailSize = available - headSize;
+
+  return {
+    _truncated:
+      serialized.slice(0, headSize) +
+      indicator +
+      serialized.slice(serialized.length - tailSize),
+    _originalChars: serialized.length,
+  };
+}
+
+/**
  * Truncates tool result content that exceeds `maxChars` using a head+tail
  * strategy. Keeps the beginning (structure/headers) and end (return value /
  * conclusion) of the content so the model retains both the opening context
