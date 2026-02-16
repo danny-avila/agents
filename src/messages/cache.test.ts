@@ -1,3 +1,10 @@
+import {
+  AIMessage,
+  BaseMessage,
+  ToolMessage,
+  HumanMessage,
+  MessageContentComplex,
+} from '@langchain/core/messages';
 import type Anthropic from '@anthropic-ai/sdk';
 import type { AnthropicMessages } from '@/types/messages';
 import {
@@ -6,7 +13,6 @@ import {
   addBedrockCacheControl,
   addCacheControl,
 } from './cache';
-import { MessageContentComplex } from '@langchain/core/messages';
 import { ContentTypes } from '@/common/enum';
 
 describe('addCacheControl', () => {
@@ -1298,5 +1304,80 @@ describe('Multi-turn cache cleanup', () => {
     const firstContent = result[0].content as MessageContentComplex[];
 
     expect('cache_control' in firstContent[0]).toBe(false);
+  });
+});
+
+describe('LangChain message type preservation', () => {
+  it('should preserve instanceof for LangChain messages after addCacheControl', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage({ content: [{ type: 'text', text: 'Hello' }] }),
+      new AIMessage({
+        content: [{ type: 'text', text: 'Using a tool' }],
+        tool_calls: [
+          { id: 'call_1', name: 'test', args: {}, type: 'tool_call' as const },
+        ],
+      }),
+      new ToolMessage({ content: 'result', tool_call_id: 'call_1' }),
+      new HumanMessage({ content: [{ type: 'text', text: 'Thanks' }] }),
+      new AIMessage({ content: [{ type: 'text', text: 'No problem' }] }),
+    ];
+
+    const result = addCacheControl(messages);
+
+    expect(result[0]).toBeInstanceOf(HumanMessage);
+    expect(result[1]).toBeInstanceOf(AIMessage);
+    expect(result[2]).toBeInstanceOf(ToolMessage);
+    expect(result[3]).toBeInstanceOf(HumanMessage);
+    expect(result[4]).toBeInstanceOf(AIMessage);
+
+    // Verify tool_calls are preserved on the AIMessage
+    expect((result[1] as AIMessage).tool_calls).toHaveLength(1);
+    expect((result[1] as AIMessage).tool_calls![0].name).toBe('test');
+
+    // Verify tool_call_id is preserved on the ToolMessage
+    expect((result[2] as ToolMessage).tool_call_id).toBe('call_1');
+  });
+
+  it('should preserve instanceof for LangChain messages after addBedrockCacheControl', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage({ content: [{ type: 'text', text: 'Hello' }] }),
+      new AIMessage({
+        content: [
+          { type: 'text', text: '\n\n' },
+          { type: 'reasoning_content', reasoningText: { text: 'thinking...' } },
+          { type: 'text', text: 'Using a tool' },
+        ],
+        tool_calls: [
+          {
+            id: 'call_1',
+            name: 'navigate',
+            args: { url: 'test' },
+            type: 'tool_call' as const,
+          },
+        ],
+      }),
+      new ToolMessage({ content: 'navigated', tool_call_id: 'call_1' }),
+      new HumanMessage({ content: [{ type: 'text', text: 'Now what?' }] }),
+    ];
+
+    const result = addBedrockCacheControl(messages);
+
+    expect(result[0]).toBeInstanceOf(HumanMessage);
+    expect(result[1]).toBeInstanceOf(AIMessage);
+    expect(result[2]).toBeInstanceOf(ToolMessage);
+    expect(result[3]).toBeInstanceOf(HumanMessage);
+
+    // Verify reasoning content is preserved
+    const aiContent = (result[1] as AIMessage)
+      .content as MessageContentComplex[];
+    expect(
+      aiContent.some(
+        (c) => (c as { type: string }).type === 'reasoning_content'
+      )
+    ).toBe(true);
+
+    // Verify tool_calls are preserved
+    expect((result[1] as AIMessage).tool_calls).toHaveLength(1);
+    expect((result[1] as AIMessage).tool_calls![0].name).toBe('navigate');
   });
 });
