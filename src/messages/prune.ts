@@ -36,6 +36,12 @@ export type PruneMessagesFactoryParams = {
    * prepended later by `buildSystemRunnable`.
    */
   getInstructionTokens?: () => number;
+  /**
+   * Fraction of the effective token budget to reserve as headroom (0–1).
+   * When set, pruning triggers at `effectiveMax * (1 - reserveRatio)` instead of
+   * filling the context window to 100%.  Defaults to 0 (no reserve) when omitted.
+   */
+  reserveRatio?: number;
   /** Optional diagnostic log callback wired by the graph for observability. */
   log?: (
     level: 'debug' | 'info' | 'warn' | 'error',
@@ -1206,14 +1212,28 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     // actual available budget.
     const currentInstructionTokens =
       factoryParams.getInstructionTokens?.() ?? 0;
+
+    // Apply reserve ratio: reduce the budget ceiling so pruning triggers before
+    // the context fills to 100%.  This compensates for approximate token counting
+    // and gives the model headroom.  Defaults to 5% when not configured.
+    const DEFAULT_RESERVE_RATIO = 0.05;
+    const reserveRatio = factoryParams.reserveRatio ?? DEFAULT_RESERVE_RATIO;
+    const reserveTokens =
+      reserveRatio > 0 && reserveRatio < 1
+        ? Math.round(factoryParams.maxTokens * reserveRatio)
+        : 0;
+    const pruningBudget = factoryParams.maxTokens - reserveTokens;
+
     const effectiveMaxTokens = Math.max(
       0,
-      factoryParams.maxTokens - currentInstructionTokens
+      pruningBudget - currentInstructionTokens
     );
 
     // P1: Log budget computation
     factoryParams.log?.('debug', 'Budget computed', {
       maxTokens: factoryParams.maxTokens,
+      reserveTokens,
+      pruningBudget,
       instructionTokens: currentInstructionTokens,
       effectiveMax: effectiveMaxTokens,
       messageCount: params.messages.length,
@@ -1276,7 +1296,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     lastTurnStartIndex = params.messages.length;
     if (
       lastCutOffIndex === 0 &&
-      totalTokens + currentInstructionTokens <= factoryParams.maxTokens
+      totalTokens + currentInstructionTokens <= pruningBudget
     ) {
       return {
         context: params.messages,
@@ -1284,7 +1304,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         messagesToRefine: [],
         prePruneTotalTokens: totalTokens,
         remainingContextTokens:
-          factoryParams.maxTokens - totalTokens - currentInstructionTokens,
+          pruningBudget - totalTokens - currentInstructionTokens,
       };
     }
 
@@ -1294,7 +1314,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       messagesToRefine,
       remainingContextTokens: initialRemainingContextTokens,
     } = getMessagesWithinTokenLimit({
-      maxContextTokens: factoryParams.maxTokens,
+      maxContextTokens: pruningBudget,
       messages: params.messages,
       indexTokenCountMap,
       startType: params.startType,
@@ -1477,7 +1497,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
 
       // Retry pruning with the emergency-truncated messages
       const retryResult = getMessagesWithinTokenLimit({
-        maxContextTokens: factoryParams.maxTokens,
+        maxContextTokens: pruningBudget,
         messages: params.messages,
         indexTokenCountMap,
         startType: params.startType,
@@ -1511,10 +1531,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
 
     const remainingContextTokens = Math.max(
       0,
-      Math.min(
-        factoryParams.maxTokens,
-        initialRemainingContextTokens + reclaimedTokens
-      )
+      Math.min(pruningBudget, initialRemainingContextTokens + reclaimedTokens)
     );
 
     runThinkingStartIndex = thinkingStartIndex ?? -1;

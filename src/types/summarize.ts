@@ -24,6 +24,14 @@ export type SummarizationConfig = {
   stream?: boolean;
   /** Maximum output tokens for the summarization model. Defaults to 2048. */
   maxSummaryTokens?: number;
+  /**
+   * Fraction of the effective token budget to reserve as headroom (0–1).
+   * Pruning triggers when conversation tokens exceed `effectiveMax * (1 - reserveRatio)`,
+   * preventing the context from filling to 100% before pruning kicks in.
+   * This compensates for approximate token counting on non-OpenAI providers and
+   * gives the model breathing room. Defaults to 0.05 (5%).
+   */
+  reserveRatio?: number;
 };
 
 export interface SummarizeResult {

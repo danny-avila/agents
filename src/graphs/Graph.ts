@@ -854,6 +854,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           thinkingEnabled: isAnthropicWithThinking,
           indexTokenCountMap: agentContext.indexTokenCountMap,
           contextPruningConfig: agentContext.contextPruningConfig,
+          reserveRatio: agentContext.summarizationConfig?.reserveRatio,
           getInstructionTokens: () => agentContext.instructionTokens,
           log: (level, message, data) => {
             emitAgentLog(config, level, 'prune', message, data, {
