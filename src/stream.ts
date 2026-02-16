@@ -19,57 +19,6 @@ import {
 } from '@/tools/handlers';
 import { getMessageId } from '@/messages';
 
-/**
- * Parses content to extract thinking sections enclosed in <think> tags using string operations
- * @param content The content to parse
- * @returns An object with separated text and thinking content
- */
-function parseThinkingContent(content: string): {
-  text: string;
-  thinking: string;
-} {
-  // If no think tags, return the original content as text
-  if (!content.includes('<think>')) {
-    return { text: content, thinking: '' };
-  }
-
-  let textResult = '';
-  const thinkingResult: string[] = [];
-  let position = 0;
-
-  while (position < content.length) {
-    const thinkStart = content.indexOf('<think>', position);
-
-    if (thinkStart === -1) {
-      // No more think tags, add the rest and break
-      textResult += content.slice(position);
-      break;
-    }
-
-    // Add text before the think tag
-    textResult += content.slice(position, thinkStart);
-
-    const thinkEnd = content.indexOf('</think>', thinkStart);
-    if (thinkEnd === -1) {
-      // Malformed input, no closing tag
-      textResult += content.slice(thinkStart);
-      break;
-    }
-
-    // Add the thinking content
-    const thinkContent = content.slice(thinkStart + 7, thinkEnd);
-    thinkingResult.push(thinkContent);
-
-    // Move position to after the think tag
-    position = thinkEnd + 8; // 8 is the length of '</think>'
-  }
-
-  return {
-    text: textResult.trim(),
-    thinking: thinkingResult.join('\n').trim(),
-  };
-}
-
 function getNonEmptyValue(possibleValues: string[]): string | undefined {
   for (const value of possibleValues) {
     if (value && value.trim() !== '') {
@@ -77,6 +26,44 @@ function getNonEmptyValue(possibleValues: string[]): string | undefined {
     }
   }
   return undefined;
+}
+
+/**
+ * Flush any remaining buffered content from the thinking tag state machine.
+ * Called when the stream ends to ensure partial tags aren't lost.
+ */
+export async function flushThinkingBuffer(
+  agentContext: AgentContext,
+  graph: StandardGraph
+): Promise<void> {
+  if (!agentContext.tagBuffer || !agentContext.currentStepId) {
+    return;
+  }
+
+  const stepId = agentContext.currentStepId;
+
+  if (
+    agentContext.thinkingState === 'buffering_open' ||
+    agentContext.thinkingState === 'normal'
+  ) {
+    // Incomplete opening tag or normal state - flush as TEXT
+    await graph.dispatchMessageDelta(stepId, {
+      content: [{ type: ContentTypes.TEXT, text: agentContext.tagBuffer }],
+    });
+  } else if (
+    agentContext.thinkingState === 'buffering_close' ||
+    agentContext.thinkingState === 'thinking'
+  ) {
+    // Incomplete closing tag or thinking state - flush as THINK
+    await graph.dispatchReasoningDelta(stepId, {
+      content: [{ type: ContentTypes.THINK, think: agentContext.tagBuffer }],
+    });
+  }
+
+  // Reset buffer state
+  agentContext.tagBuffer = '';
+  agentContext.thinkingState = 'normal';
+  agentContext.currentStepId = undefined;
 }
 
 export function getChunkContent({
@@ -271,62 +258,186 @@ hasToolCallChunks: ${hasToolCallChunks}
     ) {
       return;
     } else if (typeof content === 'string') {
-      if (agentContext.currentTokenType === ContentTypes.TEXT) {
-        await graph.dispatchMessageDelta(stepId, {
-          content: [
-            {
-              type: ContentTypes.TEXT,
-              text: content,
-            },
-          ],
-        });
-      } else if (agentContext.currentTokenType === 'think_and_text') {
-        const { text, thinking } = parseThinkingContent(content);
-        if (thinking) {
-          await graph.dispatchReasoningDelta(stepId, {
-            content: [
-              {
-                type: ContentTypes.THINK,
-                think: thinking,
-              },
-            ],
-          });
-        }
-        if (text) {
-          agentContext.currentTokenType = ContentTypes.TEXT;
-          agentContext.tokenTypeSwitch = 'content';
-          const newStepKey = graph.getStepKey(metadata);
-          const message_id = getMessageId(newStepKey, graph) ?? '';
-          await graph.dispatchRunStep(
-            newStepKey,
-            {
-              type: StepTypes.MESSAGE_CREATION,
-              message_creation: {
-                message_id,
-              },
-            },
-            metadata
-          );
+      // State machine for detecting <thinking>/<think> tags in streamed fragments
+      // States: 'normal', 'buffering_open', 'thinking', 'buffering_close'
+      if (!agentContext.thinkingState) {
+        agentContext.thinkingState = 'normal';
+        agentContext.tagBuffer = '';
+      }
 
-          const newStepId = graph.getStepIdByKey(newStepKey);
-          await graph.dispatchMessageDelta(newStepId, {
-            content: [
-              {
-                type: ContentTypes.TEXT,
-                text: text,
-              },
-            ],
-          });
+      // Store stepId for potential buffer flush at stream end
+      agentContext.currentStepId = stepId;
+
+      let remaining = content;
+
+      while (remaining.length > 0) {
+        if (agentContext.thinkingState === 'normal') {
+          // Look for '<' to start buffering potential opening tag
+          const ltPos = remaining.indexOf('<');
+          if (ltPos === -1) {
+            // No '<', yield all as TEXT
+            await graph.dispatchMessageDelta(stepId, {
+              content: [{ type: ContentTypes.TEXT, text: remaining }],
+            });
+            remaining = '';
+          } else if (ltPos > 0) {
+            // Yield text before '<'
+            await graph.dispatchMessageDelta(stepId, {
+              content: [
+                { type: ContentTypes.TEXT, text: remaining.slice(0, ltPos) },
+              ],
+            });
+            remaining = remaining.slice(ltPos);
+          } else {
+            // Starts with '<', start buffering
+            agentContext.thinkingState = 'buffering_open';
+            agentContext.tagBuffer = remaining;
+            remaining = '';
+
+            // Check immediately if we have enough to decide
+            const bufLower = agentContext.tagBuffer.toLowerCase();
+            if (bufLower.startsWith('<thinking>')) {
+              agentContext.thinkingState = 'thinking';
+              agentContext.currentTokenType = ContentTypes.THINK;
+              remaining = agentContext.tagBuffer.slice(10);
+              agentContext.tagBuffer = '';
+            } else if (bufLower.startsWith('<think>')) {
+              agentContext.thinkingState = 'thinking';
+              agentContext.currentTokenType = ContentTypes.THINK;
+              remaining = agentContext.tagBuffer.slice(7);
+              agentContext.tagBuffer = '';
+            } else if (
+              !(
+                '<thinking>'.startsWith(bufLower) ||
+                '<think>'.startsWith(bufLower)
+              )
+            ) {
+              // Definitely not a thinking tag
+              await graph.dispatchMessageDelta(stepId, {
+                content: [
+                  { type: ContentTypes.TEXT, text: agentContext.tagBuffer },
+                ],
+              });
+              agentContext.tagBuffer = '';
+              agentContext.thinkingState = 'normal';
+            }
+            // else: partial match, keep buffering
+          }
+        } else if (agentContext.thinkingState === 'buffering_open') {
+          // Accumulating potential <thinking> tag
+          agentContext.tagBuffer += remaining;
+          remaining = '';
+
+          const bufLower = agentContext.tagBuffer.toLowerCase();
+          if (bufLower.startsWith('<thinking>')) {
+            agentContext.thinkingState = 'thinking';
+            agentContext.currentTokenType = ContentTypes.THINK;
+            remaining = agentContext.tagBuffer.slice(10);
+            agentContext.tagBuffer = '';
+          } else if (bufLower.startsWith('<think>')) {
+            agentContext.thinkingState = 'thinking';
+            agentContext.currentTokenType = ContentTypes.THINK;
+            remaining = agentContext.tagBuffer.slice(7);
+            agentContext.tagBuffer = '';
+          } else if (
+            '<thinking>'.startsWith(bufLower) ||
+            '<think>'.startsWith(bufLower)
+          ) {
+            // Still could be a tag, keep buffering
+          } else {
+            // Not a thinking tag, yield buffer and return to normal
+            await graph.dispatchMessageDelta(stepId, {
+              content: [
+                { type: ContentTypes.TEXT, text: agentContext.tagBuffer },
+              ],
+            });
+            agentContext.tagBuffer = '';
+            agentContext.thinkingState = 'normal';
+          }
+        } else if (agentContext.thinkingState === 'thinking') {
+          // In thinking mode, look for '<' to start buffering potential closing tag
+          const ltPos = remaining.indexOf('<');
+          if (ltPos === -1) {
+            // No '<', yield all as THINK
+            await graph.dispatchReasoningDelta(stepId, {
+              content: [{ type: ContentTypes.THINK, think: remaining }],
+            });
+            remaining = '';
+          } else if (ltPos > 0) {
+            // Yield thinking text before '<'
+            await graph.dispatchReasoningDelta(stepId, {
+              content: [
+                { type: ContentTypes.THINK, think: remaining.slice(0, ltPos) },
+              ],
+            });
+            remaining = remaining.slice(ltPos);
+          } else {
+            // Starts with '<', start buffering for closing tag
+            agentContext.thinkingState = 'buffering_close';
+            agentContext.tagBuffer = remaining;
+            remaining = '';
+
+            // Check immediately if we have enough to decide
+            const bufLower = agentContext.tagBuffer.toLowerCase();
+            if (bufLower.startsWith('</thinking>')) {
+              agentContext.thinkingState = 'normal';
+              agentContext.currentTokenType = ContentTypes.TEXT;
+              remaining = agentContext.tagBuffer.slice(11);
+              agentContext.tagBuffer = '';
+            } else if (bufLower.startsWith('</think>')) {
+              agentContext.thinkingState = 'normal';
+              agentContext.currentTokenType = ContentTypes.TEXT;
+              remaining = agentContext.tagBuffer.slice(8);
+              agentContext.tagBuffer = '';
+            } else if (
+              !(
+                '</thinking>'.startsWith(bufLower) ||
+                '</think>'.startsWith(bufLower)
+              )
+            ) {
+              // Definitely not a closing tag, yield as thinking
+              await graph.dispatchReasoningDelta(stepId, {
+                content: [
+                  { type: ContentTypes.THINK, think: agentContext.tagBuffer },
+                ],
+              });
+              agentContext.tagBuffer = '';
+              agentContext.thinkingState = 'thinking';
+            }
+            // else: partial match, keep buffering
+          }
+        } else {
+          // buffering_close: Accumulating potential </thinking> tag
+          agentContext.tagBuffer += remaining;
+          remaining = '';
+
+          const bufLower = agentContext.tagBuffer.toLowerCase();
+          if (bufLower.startsWith('</thinking>')) {
+            agentContext.thinkingState = 'normal';
+            agentContext.currentTokenType = ContentTypes.TEXT;
+            remaining = agentContext.tagBuffer.slice(11);
+            agentContext.tagBuffer = '';
+          } else if (bufLower.startsWith('</think>')) {
+            agentContext.thinkingState = 'normal';
+            agentContext.currentTokenType = ContentTypes.TEXT;
+            remaining = agentContext.tagBuffer.slice(8);
+            agentContext.tagBuffer = '';
+          } else if (
+            '</thinking>'.startsWith(bufLower) ||
+            '</think>'.startsWith(bufLower)
+          ) {
+            // Still could be a closing tag, keep buffering
+          } else {
+            // Not a closing tag, yield buffer as thinking and return to thinking mode
+            await graph.dispatchReasoningDelta(stepId, {
+              content: [
+                { type: ContentTypes.THINK, think: agentContext.tagBuffer },
+              ],
+            });
+            agentContext.tagBuffer = '';
+            agentContext.thinkingState = 'thinking';
+          }
         }
-      } else {
-        await graph.dispatchReasoningDelta(stepId, {
-          content: [
-            {
-              type: ContentTypes.THINK,
-              think: content,
-            },
-          ],
-        });
       }
     } else if (
       content.every((c) => c.type?.startsWith(ContentTypes.TEXT) ?? false)
