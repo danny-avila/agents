@@ -773,56 +773,40 @@ export class MultiAgentGraph extends StandardGraph {
           /**
            * Set handoff context on the receiving agent.
            * Uses pre-computed graph position for depth and parallel info.
+           *
+           * Task instructions from the handoff are injected into the system
+           * prompt (via buildIdentityPreamble) rather than appended as a
+           * HumanMessage.  This avoids the "400 Unexpected role 'user' after
+           * role 'tool'" error that occurs when the router runs a non-handoff
+           * tool before handing off, leaving a ToolMessage as the last
+           * filtered message (see issue #54).
            */
           const agentContext = this.agentContexts.get(agentId);
+          const hasInstructions = instructions !== null && instructions !== '';
           if (
             agentContext &&
             sourceAgentName != null &&
             sourceAgentName !== ''
           ) {
-            agentContext.setHandoffContext(sourceAgentName, parallelSiblings);
+            agentContext.setHandoffContext(
+              sourceAgentName,
+              parallelSiblings,
+              hasInstructions ? instructions : undefined
+            );
           }
 
           /** Build messages for the receiving agent */
-          let messagesForAgent = filteredMessages;
+          const messagesForAgent = filteredMessages;
 
           /**
-           * If there are instructions, inject them as a HumanMessage to
-           * ground the receiving agent.
-           *
-           * When the last filtered message is a ToolMessage (e.g. from a
-           * non-handoff tool the router called before handing off), a
-           * synthetic AIMessage is inserted first to satisfy the
-           * tool → assistant role ordering required by chat APIs.  Without
-           * this bridge, appending a HumanMessage directly after a
-           * ToolMessage causes "400 Unexpected role 'user' after role
-           * 'tool'" errors (see issue #54).
+           * Update token map to reflect the filtered message set.
+           * Instructions are now part of the system message (via handoff
+           * context), so we only need to rebuild the map for the filtered
+           * messages and let initializeSystemRunnable account for the
+           * updated system message tokens.
            */
-          const hasInstructions = instructions !== null && instructions !== '';
-          if (hasInstructions) {
-            const lastMsg =
-              filteredMessages.length > 0
-                ? filteredMessages[filteredMessages.length - 1]
-                : null;
-
-            if (lastMsg != null && lastMsg.getType() === 'tool') {
-              messagesForAgent = [
-                ...filteredMessages,
-                new AIMessage(
-                  `[Processed tool result and transferring to ${agentId}]`
-                ),
-                new HumanMessage(instructions),
-              ];
-            } else {
-              messagesForAgent = [
-                ...filteredMessages,
-                new HumanMessage(instructions),
-              ];
-            }
-          }
-
-          /** Update token map if we have a token counter */
           if (agentContext?.tokenCounter && hasInstructions) {
+            agentContext.initializeSystemRunnable();
             const freshTokenMap: Record<string, number> = {};
             for (
               let i = 0;
@@ -833,14 +817,6 @@ export class MultiAgentGraph extends StandardGraph {
               if (tokenCount !== undefined) {
                 freshTokenMap[i] = tokenCount;
               }
-            }
-            /** Add tokens for the bridge AIMessage + instructions HumanMessage */
-            for (
-              let i = filteredMessages.length;
-              i < messagesForAgent.length;
-              i++
-            ) {
-              freshTokenMap[i] = agentContext.tokenCounter(messagesForAgent[i]);
             }
             agentContext.updateTokenMapWithInstructions(freshTokenMap);
           }
