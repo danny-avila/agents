@@ -20,6 +20,8 @@ import type {
   TPayload,
   TMessage,
 } from '@/types';
+import type { RunnableConfig } from '@langchain/core/runnables';
+import { emitAgentLog } from '@/utils/events';
 import { Providers, ContentTypes, Constants } from '@/common';
 
 interface MediaMessageParams {
@@ -1119,11 +1121,13 @@ export function shiftIndexTokenCountMap(
  *
  * @param messages - Array of messages to process
  * @param provider - The provider being used (unused but kept for future compatibility)
+ * @param config - Optional RunnableConfig for structured agent logging
  * @returns The messages array with tool sequences converted to buffer strings if necessary
  */
 export function ensureThinkingBlockInMessages(
   messages: BaseMessage[],
-  _provider: Providers
+  _provider: Providers,
+  config?: RunnableConfig
 ): BaseMessage[] {
   if (messages.length === 0) {
     return messages;
@@ -1223,6 +1227,13 @@ export function ensureThinkingBlockInMessages(
       // Convert the sequence to a buffer string and wrap in a HumanMessage
       // This avoids the thinking block requirement which only applies to AI messages
       const bufferString = getBufferString(toolSequence);
+      emitAgentLog(
+        config,
+        'warn',
+        'format',
+        'ensureThinkingBlockInMessages: injecting [Previous agent context] HumanMessage' +
+          ` (${toolSequence.length} msgs at index ${i}, no thinking block in chain)`
+      );
       result.push(
         new HumanMessage({
           content: `[Previous agent context]\n${bufferString}`,
