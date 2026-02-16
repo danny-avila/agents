@@ -4,6 +4,12 @@ import { nanoid } from 'nanoid';
 import { concat } from '@langchain/core/utils/stream';
 import { ToolNode } from '@langchain/langgraph/prebuilt';
 import { ChatVertexAI } from '@langchain/google-vertexai';
+import { Runnable, RunnableConfig } from '@langchain/core/runnables';
+import {
+  AIMessage,
+  ToolMessage,
+  AIMessageChunk,
+} from '@langchain/core/messages';
 import {
   START,
   END,
@@ -11,23 +17,7 @@ import {
   Annotation,
   messagesStateReducer,
 } from '@langchain/langgraph';
-import {
-  Runnable,
-  RunnableConfig,
-  RunnableLambda,
-} from '@langchain/core/runnables';
-import {
-  AIMessage,
-  ToolMessage,
-  SystemMessage,
-  AIMessageChunk,
-} from '@langchain/core/messages';
-import type {
-  BaseMessageFields,
-  MessageContent,
-  UsageMetadata,
-  BaseMessage,
-} from '@langchain/core/messages';
+import type { UsageMetadata, BaseMessage, MessageContent } from '@langchain/core/messages';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
 import {
@@ -422,51 +412,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   }
 
   /* Graph */
-
-  createSystemRunnable({
-    provider,
-    clientOptions,
-    instructions,
-    additional_instructions,
-  }: {
-    provider?: Providers;
-    clientOptions?: t.ClientOptions;
-    instructions?: string;
-    additional_instructions?: string;
-  }): t.SystemRunnable | undefined {
-    let finalInstructions: string | BaseMessageFields | undefined =
-      instructions;
-    if (additional_instructions != null && additional_instructions !== '') {
-      finalInstructions =
-        finalInstructions != null && finalInstructions
-          ? `${finalInstructions}\n\n${additional_instructions}`
-          : additional_instructions;
-    }
-
-    if (
-      finalInstructions != null &&
-      finalInstructions &&
-      provider === Providers.ANTHROPIC &&
-      (clientOptions as t.AnthropicClientOptions).promptCache === true
-    ) {
-      finalInstructions = {
-        content: [
-          {
-            type: 'text',
-            text: instructions,
-            cache_control: { type: 'ephemeral' },
-          },
-        ],
-      };
-    }
-
-    if (finalInstructions != null && finalInstructions !== '') {
-      const systemMessage = new SystemMessage(finalInstructions);
-      return RunnableLambda.from((messages: BaseMessage[]) => {
-        return [systemMessage, ...messages];
-      }).withConfig({ runName: 'prompt' });
-    }
-  }
 
   initializeTools({
     currentTools,
