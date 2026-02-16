@@ -696,16 +696,28 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }
 
       const toolsForBinding = agentContext.getToolsForBinding();
+      const hasTools = (toolsForBinding?.length ?? 0) > 0;
+      const isBedrock = agentContext.provider === Providers.BEDROCK;
+      // For Bedrock with tools: We need special handling to avoid "system conflicts" error
+      // Store system instructions to inject them later via CustomChatBedrockConverse
+      const skipSystemPipe = isBedrock && hasTools;
+
       let model =
         this.overrideModel ??
         this.initializeModel({
-          tools: toolsForBinding,
+          tools: skipSystemPipe ? toolsForBinding : [], // Bedrock+tools: bind tools now
           provider: agentContext.provider,
           clientOptions: agentContext.clientOptions,
         });
 
-      if (agentContext.systemRunnable) {
+      // Pipe system runnable (except Bedrock with tools)
+      if (!skipSystemPipe && agentContext.systemRunnable) {
         model = agentContext.systemRunnable.pipe(model as Runnable);
+      }
+
+      // Bind tools (except Bedrock with tools, already bound above)
+      if (!skipSystemPipe && hasTools) {
+        model = (model as t.ModelWithTools).bindTools(toolsForBinding);
       }
 
       if (agentContext.tokenCalculationPromise) {
