@@ -17,6 +17,7 @@ import {
   RunnableLambda,
 } from '@langchain/core/runnables';
 import {
+  AIMessage,
   ToolMessage,
   SystemMessage,
   AIMessageChunk,
@@ -54,6 +55,7 @@ import {
   isLikelyContextOverflowError,
   calculateMaxToolResultChars,
   truncateToolResultContent,
+  truncateToolInput,
   extractErrorMessage,
   resetIfNotEmpty,
   isOpenAILike,
@@ -1107,20 +1109,90 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             console.warn(
               `[agentus] Context overflow detected (attempt ${attempt}). ${agentContext.formatTokenBudgetBreakdown(finalMessages)}`
             );
-            // Apply emergency tool result truncation with increasing aggressiveness.
-            // Each retry uses a smaller fraction of the normal max chars.
+            // Apply emergency truncation to both tool results and tool-call
+            // inputs with increasing aggressiveness per attempt.
             let truncated = false;
-            for (const msg of finalMessages) {
-              if (msg.getType() !== 'tool') {
+            for (let mi = 0; mi < finalMessages.length; mi++) {
+              const msg = finalMessages[mi];
+
+              // Truncate ToolMessage content (tool results)
+              if (msg.getType() === 'tool') {
+                const content = msg.content;
+                if (typeof content === 'string' && content.length > maxChars) {
+                  (msg as ToolMessage).content = truncateToolResultContent(
+                    content,
+                    maxChars
+                  );
+                  truncated = true;
+                }
                 continue;
               }
-              const content = msg.content;
-              if (typeof content === 'string' && content.length > maxChars) {
-                (msg as ToolMessage).content = truncateToolResultContent(
-                  content,
-                  maxChars
-                );
-                truncated = true;
+
+              // Truncate AI message tool_call inputs
+              if (msg.getType() === 'ai' && Array.isArray(msg.content)) {
+                const aiMsg = msg as AIMessage;
+                const contentBlocks =
+                  aiMsg.content as t.MessageContentComplex[];
+                const hasOversizedInput = contentBlocks.some((block) => {
+                  if (typeof block !== 'object') {
+                    return false;
+                  }
+                  const record = block as Record<string, unknown>;
+                  if (
+                    (record.type === 'tool_use' ||
+                      record.type === 'tool_call') &&
+                    record.input != null
+                  ) {
+                    const serialized =
+                      typeof record.input === 'string'
+                        ? record.input
+                        : JSON.stringify(record.input);
+                    return serialized.length > maxChars;
+                  }
+                  return false;
+                });
+                if (hasOversizedInput) {
+                  const newContent = contentBlocks.map((block) => {
+                    if (typeof block !== 'object') {
+                      return block;
+                    }
+                    const record = block as Record<string, unknown>;
+                    if (
+                      (record.type === 'tool_use' ||
+                        record.type === 'tool_call') &&
+                      record.input != null
+                    ) {
+                      const serialized =
+                        typeof record.input === 'string'
+                          ? record.input
+                          : JSON.stringify(record.input);
+                      if (serialized.length > maxChars) {
+                        return {
+                          ...record,
+                          input: truncateToolInput(record.input, maxChars),
+                        };
+                      }
+                    }
+                    return block;
+                  });
+                  const newToolCalls = (aiMsg.tool_calls ?? []).map((tc) => {
+                    const serializedArgs = JSON.stringify(tc.args);
+                    if (serializedArgs.length > maxChars) {
+                      return {
+                        ...tc,
+                        args: truncateToolInput(tc.args, maxChars),
+                      };
+                    }
+                    return tc;
+                  });
+                  finalMessages[mi] = new AIMessage({
+                    ...aiMsg,
+                    content: newContent,
+                    tool_calls:
+                      newToolCalls.length > 0 ? newToolCalls : undefined,
+                  });
+                  truncated = true;
+                }
               }
             }
             if (!truncated) {

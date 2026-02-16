@@ -14,6 +14,7 @@ import type { ContextPruningConfig } from '@/types/graph';
 import {
   calculateMaxToolResultChars,
   truncateToolResultContent,
+  truncateToolInput,
 } from '@/utils/truncation';
 import { applyContextPruning } from './contextPruning';
 import { ContentTypes, Providers } from '@/common';
@@ -465,33 +466,6 @@ export function sanitizeOrphanToolBlocks(
  * sees both the beginning (what was called) and end (closing structure/values).
  * Falls back to head-only when the budget is too small for a meaningful tail.
  */
-function truncateToolInput(
-  input: unknown,
-  maxChars: number
-): { _truncated: string; _originalChars: number } {
-  const serialized = typeof input === 'string' ? input : JSON.stringify(input);
-  const indicator = `\n… [truncated: ${serialized.length} → ${maxChars} chars] …\n`;
-  const available = maxChars - indicator.length;
-
-  if (available < 100) {
-    return {
-      _truncated: serialized.slice(0, maxChars) + indicator.trimEnd(),
-      _originalChars: serialized.length,
-    };
-  }
-
-  const headSize = Math.ceil(available * 0.7);
-  const tailSize = available - headSize;
-
-  return {
-    _truncated:
-      serialized.slice(0, headSize) +
-      indicator +
-      serialized.slice(serialized.length - tailSize),
-    _originalChars: serialized.length,
-  };
-}
-
 function isIndexInContext(
   arrayA: unknown[],
   arrayB: unknown[],
@@ -1399,9 +1373,20 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         }
       );
 
-      let emergencyTruncatedCount = 0;
+      // Clone the messages array so emergency truncation doesn't permanently
+      // mutate graph state.  The originals remain intact for future turns
+      // where more budget may be available.  Also snapshot indexTokenCountMap
+      // entries so the closure doesn't retain stale (too-small) counts for
+      // the original un-truncated messages on the next turn.
+      const emergencyMessages = [...params.messages];
+      const preEmergencyTokenCounts: Record<string, number | undefined> = {};
       for (let i = 0; i < params.messages.length; i++) {
-        const message = params.messages[i];
+        preEmergencyTokenCounts[i] = indexTokenCountMap[i];
+      }
+
+      let emergencyTruncatedCount = 0;
+      for (let i = 0; i < emergencyMessages.length; i++) {
+        const message = emergencyMessages[i];
         // Truncate ToolMessage content (uses head+tail via truncateToolResultContent)
         if (message.getType() === 'tool') {
           const content = message.content;
@@ -1410,11 +1395,17 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
             content.length > emergencyMaxChars
           ) {
             const beforeLen = content.length;
-            (message as ToolMessage).content = truncateToolResultContent(
-              content,
-              emergencyMaxChars
-            );
-            indexTokenCountMap[i] = factoryParams.tokenCounter(message);
+            // Clone the ToolMessage to avoid mutating the original in graph state
+            const cloned = new ToolMessage({
+              content: truncateToolResultContent(content, emergencyMaxChars),
+              tool_call_id: (message as ToolMessage).tool_call_id,
+              name: message.name,
+              id: message.id,
+              additional_kwargs: message.additional_kwargs,
+              response_metadata: message.response_metadata,
+            });
+            emergencyMessages[i] = cloned;
+            indexTokenCountMap[i] = factoryParams.tokenCounter(cloned);
             emergencyTruncatedCount++;
             factoryParams.log?.('debug', 'Emergency truncated tool result', {
               index: i,
@@ -1474,13 +1465,13 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
               }
               return tc;
             });
-            params.messages[i] = new AIMessage({
+            emergencyMessages[i] = new AIMessage({
               ...aiMsg,
               content: newContent,
               tool_calls: newToolCalls.length > 0 ? newToolCalls : undefined,
             });
             indexTokenCountMap[i] = factoryParams.tokenCounter(
-              params.messages[i]
+              emergencyMessages[i]
             );
             emergencyTruncatedCount++;
             factoryParams.log?.('debug', 'Emergency truncated tool input', {
@@ -1495,10 +1486,10 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         emergencyMaxChars,
       });
 
-      // Retry pruning with the emergency-truncated messages
+      // Retry pruning with the emergency-truncated (cloned) messages
       const retryResult = getMessagesWithinTokenLimit({
         maxContextTokens: pruningBudget,
-        messages: params.messages,
+        messages: emergencyMessages,
         indexTokenCountMap,
         startType: params.startType,
         thinkingEnabled: factoryParams.thinkingEnabled,
@@ -1516,7 +1507,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
 
       const repaired = repairOrphanedToolMessages({
         context: retryResult.context,
-        allMessages: params.messages,
+        allMessages: emergencyMessages,
         tokenCounter: factoryParams.tokenCounter,
         indexTokenCountMap,
       });
@@ -1526,6 +1517,14 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       messagesToRefine.push(...retryResult.messagesToRefine);
       if (repaired.droppedMessages.length > 0) {
         messagesToRefine.push(...repaired.droppedMessages);
+      }
+
+      // Restore the closure's indexTokenCountMap to pre-emergency values so the
+      // next turn counts old messages at their original (un-truncated) size.
+      // The emergency-truncated counts were only needed for this turn's
+      // getMessagesWithinTokenLimit retry.
+      for (const [key, value] of Object.entries(preEmergencyTokenCounts)) {
+        indexTokenCountMap[key] = value;
       }
     }
 
