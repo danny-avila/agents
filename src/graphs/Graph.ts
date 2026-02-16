@@ -1019,7 +1019,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       if (isAnthropicWithThinking) {
         finalMessages = ensureThinkingBlockInMessages(
           finalMessages,
-          agentContext.provider
+          agentContext.provider,
+          config
         );
       }
 
