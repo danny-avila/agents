@@ -452,6 +452,7 @@ describe('Prune Messages Tests', () => {
         startIndex: 0,
         tokenCounter,
         indexTokenCountMap,
+        reserveRatio: 0,
       });
 
       const result = pruneMessages({ messages });
@@ -817,6 +818,7 @@ describe('Prune Messages Tests', () => {
         startIndex: 0,
         tokenCounter,
         indexTokenCountMap: { ...indexTokenCountMap },
+        reserveRatio: 0,
       });
 
       const result = pruneMessages({ messages });
@@ -1098,6 +1100,7 @@ describe('Prune Messages Tests', () => {
         startIndex: 0,
         tokenCounter,
         indexTokenCountMap,
+        reserveRatio: 0,
         getInstructionTokens: () => 20,
       });
 
