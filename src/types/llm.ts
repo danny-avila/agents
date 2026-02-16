@@ -62,6 +62,7 @@ export type AnthropicClientOptions = AnthropicInput & {
 export type MistralAIClientOptions = ChatMistralAIInput;
 export type VertexAIClientOptions = ChatVertexAIInput & {
   includeThoughts?: boolean;
+  responseModalities?: ('TEXT' | 'IMAGE' | 'AUDIO')[];
 };
 export type BedrockAnthropicInput = ChatBedrockConverseInput & {
   additionalModelRequestFields?: ChatBedrockConverseInput['additionalModelRequestFields'] &
@@ -73,6 +74,7 @@ export type BedrockAnthropicClientOptions = BedrockAnthropicInput;
 export type GoogleClientOptions = GoogleGenerativeAIChatInput & {
   customHeaders?: RequestOptions['customHeaders'];
   thinkingConfig?: GeminiGenerationConfig['thinkingConfig'];
+  responseModalities?: ('TEXT' | 'IMAGE' | 'AUDIO')[];
 };
 export type DeepSeekClientOptions = ChatDeepSeekCallOptions;
 export type XAIClientOptions = ChatXAIInput;
