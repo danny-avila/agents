@@ -1011,7 +1011,12 @@ export function ensureThinkingBlockInMessages(
 
   while (i < messages.length) {
     const msg = messages[i];
-    const isAI = msg instanceof AIMessage || msg instanceof AIMessageChunk;
+    /** Detect AI messages by instanceof OR by role, in case cache-control cloning
+     produced a plain object that lost the LangChain prototype. */
+    const isAI =
+      msg instanceof AIMessage ||
+      msg instanceof AIMessageChunk ||
+      ('role' in msg && (msg as any).role === 'assistant');
 
     if (!isAI) {
       result.push(msg);
@@ -1025,30 +1030,58 @@ export function ensureThinkingBlockInMessages(
 
     // Check if the message has tool calls or tool_use content
     let hasToolUse = hasToolCalls ?? false;
-    let firstContentType: string | undefined;
+    let hasThinkingBlock = false;
 
     if (contentIsArray && aiMsg.content.length > 0) {
       const content = aiMsg.content as ExtendedMessageContent[];
-      firstContentType = content[0]?.type;
       hasToolUse =
         hasToolUse ||
         content.some((c) => typeof c === 'object' && c.type === 'tool_use');
+      // Check ALL content blocks for thinking/reasoning, not just [0].
+      // Bedrock may emit a whitespace text chunk before the thinking block,
+      // pushing the reasoning_content to index 1+.
+      hasThinkingBlock = content.some(
+        (c) =>
+          typeof c === 'object' &&
+          (c.type === ContentTypes.THINKING ||
+            c.type === ContentTypes.REASONING_CONTENT ||
+            c.type === ContentTypes.REASONING ||
+            c.type === 'redacted_thinking')
+      );
     }
 
-    // If message has tool use but no thinking block, convert to buffer string
+    // Bedrock also stores reasoning in additional_kwargs (may not be in content array)
     if (
-      hasToolUse &&
-      firstContentType !== ContentTypes.THINKING &&
-      firstContentType !== ContentTypes.REASONING_CONTENT &&
-      firstContentType !== ContentTypes.REASONING &&
-      firstContentType !== 'redacted_thinking'
+      !hasThinkingBlock &&
+      aiMsg.additional_kwargs.reasoning_content != null
     ) {
+      hasThinkingBlock = true;
+    }
+
+    // If message has tool use but no thinking block, check whether this is a
+    // continuation of a thinking-enabled agent's chain before converting.
+    // Bedrock reasoning models can produce multiple AI→Tool rounds after an
+    // initial reasoning response: the first AI message has reasoning_content,
+    // but follow-ups have content: "" with only tool_calls. These are the
+    // same agent's turn and must NOT be converted to HumanMessages.
+    if (hasToolUse && !hasThinkingBlock) {
+      // Walk backwards — if an earlier AI message in the same chain (before
+      // the nearest HumanMessage) has a thinking/reasoning block, this is a
+      // continuation of a thinking-enabled turn, not a non-thinking handoff.
+      if (chainHasThinkingBlock(messages, i)) {
+        result.push(msg);
+        i++;
+        continue;
+      }
+
       // Collect the AI message and any following tool messages
       const toolSequence: BaseMessage[] = [msg];
       let j = i + 1;
 
       // Look ahead for tool messages that belong to this AI message
-      while (j < messages.length && messages[j] instanceof ToolMessage) {
+      const isToolMsg = (m: BaseMessage): boolean =>
+        m instanceof ToolMessage || ('role' in m && (m as any).role === 'tool');
+      while (j < messages.length && isToolMsg(messages[j])) {
         toolSequence.push(messages[j]);
         j++;
       }
@@ -1072,4 +1105,67 @@ export function ensureThinkingBlockInMessages(
   }
 
   return result;
+}
+
+/**
+ * Walks backwards from `currentIndex` through the message array to check
+ * whether an earlier AI message in the same "chain" (no HumanMessage boundary)
+ * contains a thinking/reasoning block.
+ *
+ * A "chain" is a contiguous sequence of AI + Tool messages with no intervening
+ * HumanMessage. Bedrock reasoning models produce reasoning on the first AI
+ * response, then issue follow-up tool calls with `content: ""` and no
+ * reasoning block. These follow-ups are part of the same thinking-enabled
+ * turn and should not be converted.
+ */
+function chainHasThinkingBlock(
+  messages: BaseMessage[],
+  currentIndex: number
+): boolean {
+  for (let k = currentIndex - 1; k >= 0; k--) {
+    const prev = messages[k];
+
+    // HumanMessage = turn boundary — stop searching
+    if (
+      prev instanceof HumanMessage ||
+      ('role' in prev && (prev as any).role === 'user')
+    ) {
+      return false;
+    }
+
+    // Check AI messages for thinking/reasoning blocks
+    const isPrevAI =
+      prev instanceof AIMessage ||
+      prev instanceof AIMessageChunk ||
+      ('role' in prev && (prev as any).role === 'assistant');
+
+    if (isPrevAI) {
+      const prevAiMsg = prev as AIMessage | AIMessageChunk;
+
+      if (Array.isArray(prevAiMsg.content) && prevAiMsg.content.length > 0) {
+        const content = prevAiMsg.content as ExtendedMessageContent[];
+        if (
+          content.some(
+            (c) =>
+              typeof c === 'object' &&
+              (c.type === ContentTypes.THINKING ||
+                c.type === ContentTypes.REASONING_CONTENT ||
+                c.type === ContentTypes.REASONING ||
+                c.type === 'redacted_thinking')
+          )
+        ) {
+          return true;
+        }
+      }
+
+      // Bedrock also stores reasoning in additional_kwargs
+      if (prevAiMsg.additional_kwargs.reasoning_content != null) {
+        return true;
+      }
+    }
+
+    // ToolMessages are part of the chain — keep walking back
+  }
+
+  return false;
 }
