@@ -519,6 +519,12 @@ export class AgentContext {
     tokenCounter: t.TokenCounter
   ): Promise<void> {
     let toolTokens = 0;
+    // Track names to avoid double-counting when a tool appears in both
+    // this.tools (bound StructuredTool instances) and this.toolDefinitions
+    // (MCP / event-driven schemas).
+    const countedToolNames = new Set<string>();
+
+    // Count tokens for bound tools (StructuredTool instances with .schema)
     if (this.tools && this.tools.length > 0) {
       for (const tool of this.tools) {
         const genericTool = tool as Record<string, unknown>;
@@ -526,15 +532,36 @@ export class AgentContext {
           genericTool.schema != null &&
           typeof genericTool.schema === 'object'
         ) {
+          const toolName = (genericTool.name as string | undefined) ?? '';
           const jsonSchema = toJsonSchema(
             genericTool.schema,
-            (genericTool.name as string | undefined) ?? '',
+            toolName,
             (genericTool.description as string | undefined) ?? ''
           );
           toolTokens += tokenCounter(
             new SystemMessage(JSON.stringify(jsonSchema))
           );
+          if (toolName) {
+            countedToolNames.add(toolName);
+          }
         }
+      }
+    }
+
+    // Count tokens for tool definitions (MCP / event-driven tools).
+    // These are sent to the provider API as tool schemas alongside bound tools.
+    // Both can be populated simultaneously (graph tools + MCP tools).
+    if (this.toolDefinitions && this.toolDefinitions.length > 0) {
+      for (const def of this.toolDefinitions) {
+        if (countedToolNames.has(def.name)) {
+          continue; // Already counted via this.tools
+        }
+        const schema = {
+          name: def.name,
+          description: def.description ?? '',
+          parameters: def.parameters ?? {},
+        };
+        toolTokens += tokenCounter(new SystemMessage(JSON.stringify(schema)));
       }
     }
 
