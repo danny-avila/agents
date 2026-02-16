@@ -8,6 +8,9 @@ export * from './messages';
 /* Graphs */
 export * from './graphs';
 
+/* Citations */
+export * from './citations';
+
 /* Tools */
 export * from './tools/Calculator';
 export * from './tools/CodeExecutor';
