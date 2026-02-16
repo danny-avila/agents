@@ -147,7 +147,9 @@ export class CohereReranker extends BaseReranker {
       };
 
       const response = await axios.post<t.CohereRerankerResponse | undefined>(
-        'https://api.cohere.com/v2/rerank',
+        process.env.COHERE_URL == null || process.env.COHERE_URL === ''
+          ? 'https://api.cohere.com/v2/rerank'
+          : process.env.COHERE_URL,
         requestData,
         {
           headers: {
