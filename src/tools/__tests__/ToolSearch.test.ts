@@ -664,6 +664,11 @@ describe('ToolSearch', () => {
         name: 'get_weather_mcp_weather-api',
         description: 'Get weather',
         defer_loading: true,
+        parameters: {
+          type: 'object',
+          properties: { location: { type: 'string' } },
+          required: ['location'],
+        },
       });
       registry.set('get_forecast_mcp_weather-api', {
         name: 'get_forecast_mcp_weather-api',
@@ -674,6 +679,11 @@ describe('ToolSearch', () => {
         name: 'send_email_mcp_gmail',
         description: 'Send email',
         defer_loading: true,
+        parameters: {
+          type: 'object',
+          properties: { to: { type: 'string' }, body: { type: 'string' } },
+          required: ['to', 'body'],
+        },
       });
       registry.set('execute_code', {
         name: 'execute_code',
@@ -692,8 +702,10 @@ describe('ToolSearch', () => {
       const registry = createRegistry();
       const listing = getDeferredToolsListing(registry, true);
 
-      expect(listing).toContain('gmail: send_email');
-      expect(listing).toContain('weather-api: get_weather, get_forecast');
+      expect(listing).toContain('gmail: send_email(\u2026)');
+      expect(listing).toContain(
+        'weather-api: get_weather(\u2026), get_forecast'
+      );
       expect(listing).toContain('other: execute_code');
     });
 
@@ -713,6 +725,54 @@ describe('ToolSearch', () => {
 
       expect(listing).toContain('get_weather');
       expect(listing).not.toContain('get_weather_mcp_weather-api');
+    });
+
+    it('annotates tools with any params with ellipsis', () => {
+      const registry = createRegistry();
+      const listing = getDeferredToolsListing(registry, true);
+
+      // Tools with params get (…)
+      expect(listing).toContain('get_weather(\u2026)');
+      expect(listing).toContain('send_email(\u2026)');
+
+      // Tools without params stay clean
+      expect(listing).toContain('get_forecast');
+      expect(listing).not.toContain('get_forecast(\u2026)');
+      expect(listing).toContain('execute_code');
+      expect(listing).not.toContain('execute_code(\u2026)');
+    });
+
+    it('annotates tools with optional-only params', () => {
+      const registry: LCToolRegistry = new Map();
+      registry.set('list_items_mcp_api', {
+        name: 'list_items_mcp_api',
+        description: 'List items',
+        defer_loading: true,
+        parameters: {
+          type: 'object',
+          properties: { limit: { type: 'integer' } },
+          required: [],
+        },
+      });
+
+      const listing = getDeferredToolsListing(registry, true);
+      expect(listing).toBe('api: list_items(\u2026)');
+    });
+
+    it('does not annotate tools with empty properties', () => {
+      const registry: LCToolRegistry = new Map();
+      registry.set('ping_mcp_api', {
+        name: 'ping_mcp_api',
+        description: 'Ping',
+        defer_loading: true,
+        parameters: {
+          type: 'object',
+          properties: {},
+        },
+      });
+
+      const listing = getDeferredToolsListing(registry, true);
+      expect(listing).toBe('api: ping');
     });
 
     it('respects onlyDeferred flag', () => {

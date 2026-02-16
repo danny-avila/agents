@@ -688,8 +688,22 @@ function getBaseToolName(toolName: string): string {
 }
 
 /**
+ * Checks whether a tool has any defined parameters in its JSON schema.
+ * @param parameters - The tool's JSON schema parameters
+ * @returns true if the tool has at least one parameter property
+ */
+function hasParams(parameters?: t.JsonSchemaType): boolean {
+  return (
+    parameters?.properties != null &&
+    Object.keys(parameters.properties).length > 0
+  );
+}
+
+/**
  * Generates a compact listing of deferred tools grouped by server.
- * Format: "server: tool1, tool2, tool3"
+ * Format: "server: tool1, tool2(\u2026), tool3"
+ * Tools with parameters are annotated with (\u2026) to signal
+ * that the LLM should discover the schema via tool_search before calling.
  * Non-MCP tools are grouped under "other".
  * @param toolRegistry - The tool registry
  * @param onlyDeferred - Whether to only include deferred tools
@@ -713,11 +727,14 @@ function getDeferredToolsListing(
     const toolName = lcTool.name;
     const serverName = extractMcpServerName(toolName) ?? 'other';
     const baseName = getBaseToolName(toolName);
+    const displayName = hasParams(lcTool.parameters)
+      ? `${baseName}(\u2026)`
+      : baseName;
 
     if (!(serverName in toolsByServer)) {
       toolsByServer[serverName] = [];
     }
-    toolsByServer[serverName].push(baseName);
+    toolsByServer[serverName].push(displayName);
   }
 
   const serverNames = Object.keys(toolsByServer).sort((a, b) => {
@@ -862,7 +879,7 @@ function createToolSearch(
     deferredToolsListing.length > 0
       ? `
 
-Deferred tools (search to load):
+Deferred tools (search to load; \u2026 = has params, search first):
 ${deferredToolsListing}`
       : '';
 
