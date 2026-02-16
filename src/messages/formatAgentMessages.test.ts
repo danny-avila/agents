@@ -767,7 +767,7 @@ describe('formatAgentMessages', () => {
     expect(result.messages[1].content).toHaveLength(2);
   });
 
-  it('should skip THINK type content parts', () => {
+  it('should strip THINK content and join TEXT parts as string', () => {
     const payload = [
       {
         role: 'assistant',
@@ -1509,5 +1509,994 @@ describe('formatAgentMessages', () => {
     expect((result.messages[1] as ToolMessage).tool_call_id).toBe('tool_1');
     expect(result.messages[1].name).toBe('search');
     expect(result.messages[1].content).toBe('');
+  });
+
+  describe('proportional token distribution', () => {
+    it('should distribute tokens proportionally based on content length', () => {
+      const payload = [
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: ContentTypes.TEXT,
+              [ContentTypes.TEXT]: 'Short text',
+              tool_call_ids: ['tool_1'],
+            },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: {
+                id: 'tool_1',
+                name: 'search',
+                args: '{"query":"test"}',
+                output:
+                  'A much longer tool result that contains significantly more content than the original message text',
+              },
+            },
+          ],
+        },
+      ];
+
+      const indexTokenCountMap = { 0: 100 };
+      const result = formatAgentMessages(payload, indexTokenCountMap);
+
+      expect(result.messages).toHaveLength(2);
+      const aiTokens = result.indexTokenCountMap?.[0] ?? 0;
+      const toolTokens = result.indexTokenCountMap?.[1] ?? 0;
+      expect(aiTokens + toolTokens).toBe(100);
+      expect(toolTokens).toBeGreaterThan(aiTokens);
+    });
+
+    it('should give the vast majority of tokens to a large tool result vs tiny AI message', () => {
+      const bigOutput = 'x'.repeat(10000);
+      const payload = [
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: ContentTypes.TEXT,
+              [ContentTypes.TEXT]: 'ok',
+              tool_call_ids: ['tool_1'],
+            },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: {
+                id: 'tool_1',
+                name: 'snapshot',
+                args: '{}',
+                output: bigOutput,
+              },
+            },
+          ],
+        },
+      ];
+
+      const indexTokenCountMap = { 0: 5000 };
+      const result = formatAgentMessages(payload, indexTokenCountMap);
+
+      expect(result.messages).toHaveLength(2);
+      const aiTokens = result.indexTokenCountMap?.[0] ?? 0;
+      const toolTokens = result.indexTokenCountMap?.[1] ?? 0;
+      expect(aiTokens + toolTokens).toBe(5000);
+      expect(toolTokens).toBeGreaterThan(4900);
+      expect(aiTokens).toBeLessThan(100);
+    });
+
+    it('should fall back to even distribution when all content lengths are zero', () => {
+      const payload = [
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: ContentTypes.TEXT,
+              [ContentTypes.TEXT]: '',
+              tool_call_ids: ['tool_1'],
+            },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: {
+                id: 'tool_1',
+                name: 'noop',
+                args: '{}',
+                output: '',
+              },
+            },
+          ],
+        },
+      ];
+
+      const indexTokenCountMap = { 0: 20 };
+      const result = formatAgentMessages(payload, indexTokenCountMap);
+
+      expect(result.messages).toHaveLength(2);
+      const aiTokens = result.indexTokenCountMap?.[0] ?? 0;
+      const toolTokens = result.indexTokenCountMap?.[1] ?? 0;
+      expect(aiTokens + toolTokens).toBe(20);
+      expect(aiTokens).toBeGreaterThanOrEqual(0);
+      expect(toolTokens).toBeGreaterThanOrEqual(0);
+    });
+
+    it('should handle odd token counts without losing remainder', () => {
+      const payload = [
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: ContentTypes.TEXT,
+              [ContentTypes.TEXT]: 'abc',
+              tool_call_ids: ['tool_1', 'tool_2', 'tool_3'],
+            },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: {
+                id: 'tool_1',
+                name: 'a',
+                args: '{}',
+                output: 'abc',
+              },
+            },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: {
+                id: 'tool_2',
+                name: 'b',
+                args: '{}',
+                output: 'abc',
+              },
+            },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: {
+                id: 'tool_3',
+                name: 'c',
+                args: '{}',
+                output: 'abc',
+              },
+            },
+          ],
+        },
+      ];
+
+      const indexTokenCountMap = { 0: 7 };
+      const result = formatAgentMessages(payload, indexTokenCountMap);
+
+      expect(result.messages).toHaveLength(4);
+      const total = Object.values(result.indexTokenCountMap || {}).reduce(
+        (sum, v) => sum + v,
+        0
+      );
+      expect(total).toBe(7);
+      for (let i = 0; i < result.messages.length; i++) {
+        expect(result.indexTokenCountMap?.[i]).toBeGreaterThanOrEqual(0);
+      }
+    });
+
+    it('should never produce negative token counts', () => {
+      const payload = [
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: ContentTypes.TEXT,
+              [ContentTypes.TEXT]: 'a',
+              tool_call_ids: ['t1', 't2', 't3', 't4', 't5'],
+            },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: { id: 't1', name: 'x', args: '{}', output: 'b' },
+            },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: { id: 't2', name: 'x', args: '{}', output: 'c' },
+            },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: { id: 't3', name: 'x', args: '{}', output: 'd' },
+            },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: { id: 't4', name: 'x', args: '{}', output: 'e' },
+            },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: { id: 't5', name: 'x', args: '{}', output: 'f' },
+            },
+          ],
+        },
+      ];
+
+      const indexTokenCountMap = { 0: 3 };
+      const result = formatAgentMessages(payload, indexTokenCountMap);
+
+      const total = Object.values(result.indexTokenCountMap || {}).reduce(
+        (sum, v) => sum + v,
+        0
+      );
+      expect(total).toBe(3);
+      for (const val of Object.values(result.indexTokenCountMap || {})) {
+        expect(val).toBeGreaterThanOrEqual(0);
+      }
+    });
+
+    it('should handle single token budget distributed across many messages', () => {
+      const payload = [
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: ContentTypes.TEXT,
+              [ContentTypes.TEXT]: 'hello',
+              tool_call_ids: ['t1', 't2'],
+            },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: {
+                id: 't1',
+                name: 'a',
+                args: '{}',
+                output: 'result one',
+              },
+            },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: {
+                id: 't2',
+                name: 'b',
+                args: '{}',
+                output: 'result two',
+              },
+            },
+          ],
+        },
+      ];
+
+      const indexTokenCountMap = { 0: 1 };
+      const result = formatAgentMessages(payload, indexTokenCountMap);
+
+      const total = Object.values(result.indexTokenCountMap || {}).reduce(
+        (sum, v) => sum + v,
+        0
+      );
+      expect(total).toBe(1);
+      for (const val of Object.values(result.indexTokenCountMap || {})) {
+        expect(val).toBeGreaterThanOrEqual(0);
+      }
+    });
+
+    it('should handle zero token budget', () => {
+      const payload = [
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: ContentTypes.TEXT,
+              [ContentTypes.TEXT]: 'hello',
+              tool_call_ids: ['t1'],
+            },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: { id: 't1', name: 'a', args: '{}', output: 'world' },
+            },
+          ],
+        },
+      ];
+
+      const indexTokenCountMap = { 0: 0 };
+      const result = formatAgentMessages(payload, indexTokenCountMap);
+
+      const total = Object.values(result.indexTokenCountMap || {}).reduce(
+        (sum, v) => sum + v,
+        0
+      );
+      expect(total).toBe(0);
+    });
+
+    it('should distribute tokens proportionally with 5 tool calls of varying sizes', () => {
+      const payload = [
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: ContentTypes.TEXT,
+              [ContentTypes.TEXT]: 'I will perform multiple operations.',
+              tool_call_ids: ['t1', 't2', 't3', 't4', 't5'],
+            },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: {
+                id: 't1',
+                name: 'navigate',
+                args: '{"url":"https://example.com"}',
+                output: 'Navigated successfully.',
+              },
+            },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: {
+                id: 't2',
+                name: 'snapshot',
+                args: '{}',
+                output: 'x'.repeat(5000),
+              },
+            },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: {
+                id: 't3',
+                name: 'click',
+                args: '{"selector":"#btn"}',
+                output: 'Clicked.',
+              },
+            },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: {
+                id: 't4',
+                name: 'snapshot',
+                args: '{}',
+                output: 'y'.repeat(8000),
+              },
+            },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: {
+                id: 't5',
+                name: 'extract',
+                args: '{"selector":"h1"}',
+                output: 'Page Title',
+              },
+            },
+          ],
+        },
+      ];
+
+      const indexTokenCountMap = { 0: 3000 };
+      const result = formatAgentMessages(payload, indexTokenCountMap);
+
+      expect(result.messages).toHaveLength(6);
+
+      const total = Object.values(result.indexTokenCountMap || {}).reduce(
+        (sum, v) => sum + v,
+        0
+      );
+      expect(total).toBe(3000);
+
+      const snapshotIdx1 = 2;
+      const snapshotIdx2 = 4;
+      const bigSnapshotTokens =
+        (result.indexTokenCountMap?.[snapshotIdx1] ?? 0) +
+        (result.indexTokenCountMap?.[snapshotIdx2] ?? 0);
+      expect(bigSnapshotTokens).toBeGreaterThan(2500);
+
+      for (const val of Object.values(result.indexTokenCountMap || {})) {
+        expect(val).toBeGreaterThanOrEqual(0);
+      }
+    });
+
+    it('should handle HN-like payload: AI with 18 tool calls and large snapshot results', () => {
+      const smallOutput = 'Successfully navigated to page.';
+      const hugeSnapshot = 'uid=8_0 RootWebArea ' + 'x'.repeat(20000);
+
+      const toolCalls: Array<{
+        type: string;
+        tool_call: { id: string; name: string; args: string; output: string };
+      }> = [];
+      const toolCallIds: string[] = [];
+
+      for (let i = 0; i < 18; i++) {
+        const id = `tool_${i}`;
+        toolCallIds.push(id);
+        const isSnapshot = i % 3 === 1;
+        toolCalls.push({
+          type: ContentTypes.TOOL_CALL,
+          tool_call: {
+            id,
+            name: isSnapshot ? 'take_snapshot' : 'navigate_page',
+            args: isSnapshot ? '{}' : `{"url":"https://example.com/${i}"}`,
+            output: isSnapshot ? hugeSnapshot : smallOutput,
+          },
+        });
+      }
+
+      const payload = [
+        {
+          role: 'user',
+          content: 'Look up top 5 posts on HN',
+        },
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: ContentTypes.TEXT,
+              [ContentTypes.TEXT]: '',
+              tool_call_ids: toolCallIds,
+            },
+            ...toolCalls,
+          ],
+        },
+      ];
+
+      const indexTokenCountMap = { 0: 20, 1: 10000 };
+      const result = formatAgentMessages(payload, indexTokenCountMap);
+
+      expect(result.messages.length).toBeGreaterThan(2);
+
+      const total = Object.values(result.indexTokenCountMap || {}).reduce(
+        (sum, v) => sum + v,
+        0
+      );
+      expect(total).toBe(10020);
+
+      expect(result.indexTokenCountMap?.[0]).toBe(20);
+
+      let snapshotTokenTotal = 0;
+      let navTokenTotal = 0;
+      for (let i = 1; i < result.messages.length; i++) {
+        const tokens = result.indexTokenCountMap?.[i] ?? 0;
+        expect(tokens).toBeGreaterThanOrEqual(0);
+
+        if (result.messages[i] instanceof ToolMessage) {
+          const content = result.messages[i].content;
+          if (typeof content === 'string' && content.length > 1000) {
+            snapshotTokenTotal += tokens;
+          } else {
+            navTokenTotal += tokens;
+          }
+        }
+      }
+
+      expect(snapshotTokenTotal).toBeGreaterThan(navTokenTotal);
+    });
+
+    it('should complete proportional distribution within reasonable time for large payloads', () => {
+      const toolCalls: Array<{
+        type: string;
+        tool_call: { id: string; name: string; args: string; output: string };
+      }> = [];
+      const toolCallIds: string[] = [];
+
+      for (let i = 0; i < 50; i++) {
+        const id = `tool_${i}`;
+        toolCallIds.push(id);
+        toolCalls.push({
+          type: ContentTypes.TOOL_CALL,
+          tool_call: {
+            id,
+            name: `tool_${i}`,
+            args: JSON.stringify({ data: 'x'.repeat(100) }),
+            output: 'y'.repeat(Math.floor(Math.random() * 10000)),
+          },
+        });
+      }
+
+      const payload = [
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: ContentTypes.TEXT,
+              [ContentTypes.TEXT]: 'Processing...',
+              tool_call_ids: toolCallIds,
+            },
+            ...toolCalls,
+          ],
+        },
+      ];
+
+      const indexTokenCountMap = { 0: 50000 };
+
+      const start = performance.now();
+      const result = formatAgentMessages(payload, indexTokenCountMap);
+      const elapsed = performance.now() - start;
+
+      expect(elapsed).toBeLessThan(500);
+
+      const total = Object.values(result.indexTokenCountMap || {}).reduce(
+        (sum, v) => sum + v,
+        0
+      );
+      expect(total).toBe(50000);
+    });
+
+    it('should always preserve total token count across multiple original messages', () => {
+      const payload = [
+        { role: 'user', content: 'Hello' },
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: ContentTypes.TEXT,
+              [ContentTypes.TEXT]: 'Let me search.',
+              tool_call_ids: ['t1'],
+            },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: {
+                id: 't1',
+                name: 'search',
+                args: '{"q":"test"}',
+                output:
+                  'Found 10 results with detailed descriptions: ' +
+                  'z'.repeat(500),
+              },
+            },
+          ],
+        },
+        { role: 'user', content: 'Thanks' },
+        { role: 'assistant', content: 'You are welcome!' },
+      ];
+
+      const indexTokenCountMap = { 0: 5, 1: 200, 2: 3, 3: 8 };
+      const result = formatAgentMessages(payload, indexTokenCountMap);
+
+      const total = Object.values(result.indexTokenCountMap || {}).reduce(
+        (sum, v) => sum + v,
+        0
+      );
+      expect(total).toBe(216);
+
+      for (const val of Object.values(result.indexTokenCountMap || {})) {
+        expect(val).toBeGreaterThanOrEqual(0);
+        expect(Number.isInteger(val)).toBe(true);
+      }
+    });
+
+    it('should produce integer token counts (no floating point)', () => {
+      const payload = [
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: ContentTypes.TEXT,
+              [ContentTypes.TEXT]: 'abc',
+              tool_call_ids: ['t1', 't2', 't3'],
+            },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: { id: 't1', name: 'a', args: '{}', output: 'defgh' },
+            },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: { id: 't2', name: 'b', args: '{}', output: 'ij' },
+            },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: {
+                id: 't3',
+                name: 'c',
+                args: '{}',
+                output: 'klmnopqrst',
+              },
+            },
+          ],
+        },
+      ];
+
+      const indexTokenCountMap = { 0: 97 };
+      const result = formatAgentMessages(payload, indexTokenCountMap);
+
+      for (const val of Object.values(result.indexTokenCountMap || {})) {
+        expect(Number.isInteger(val)).toBe(true);
+      }
+
+      const total = Object.values(result.indexTokenCountMap || {}).reduce(
+        (sum, v) => sum + v,
+        0
+      );
+      expect(total).toBe(97);
+    });
+
+    it('should account for tool call args in content length calculation', () => {
+      const payload = [
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: ContentTypes.TEXT,
+              [ContentTypes.TEXT]: 'x',
+              tool_call_ids: ['t1', 't2'],
+            },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: {
+                id: 't1',
+                name: 'tiny_tool',
+                args: '{}',
+                output: 'small',
+              },
+            },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: {
+                id: 't2',
+                name: 'big_args_tool',
+                args: JSON.stringify({ data: 'a'.repeat(5000) }),
+                output: 'small',
+              },
+            },
+          ],
+        },
+      ];
+
+      const indexTokenCountMap = { 0: 1000 };
+      const result = formatAgentMessages(payload, indexTokenCountMap);
+
+      expect(result.messages).toHaveLength(3);
+
+      const total = Object.values(result.indexTokenCountMap || {}).reduce(
+        (sum, v) => sum + v,
+        0
+      );
+      expect(total).toBe(1000);
+
+      for (const val of Object.values(result.indexTokenCountMap || {})) {
+        expect(val).toBeGreaterThanOrEqual(0);
+      }
+    });
+
+    it('should not throw when indexTokenCountMap has undefined values for some indices', () => {
+      const payload = [
+        { role: 'user', content: 'Hello' },
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: ContentTypes.TEXT,
+              [ContentTypes.TEXT]: 'response',
+              tool_call_ids: ['t1'],
+            },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: {
+                id: 't1',
+                name: 'search',
+                args: '{}',
+                output: 'result',
+              },
+            },
+          ],
+        },
+      ];
+
+      const indexTokenCountMap: Record<number, number | undefined> = {
+        0: undefined,
+        1: 50,
+      };
+
+      expect(() => {
+        const result = formatAgentMessages(payload, indexTokenCountMap);
+        expect(result.indexTokenCountMap).toBeDefined();
+        const total = Object.values(result.indexTokenCountMap || {}).reduce(
+          (sum, v) => sum + v,
+          0
+        );
+        expect(total).toBe(50);
+      }).not.toThrow();
+    });
+
+    it('should not throw when indexTokenCountMap is sparse (missing indices)', () => {
+      const payload = [
+        { role: 'user', content: 'Hello' },
+        { role: 'assistant', content: 'World' },
+        { role: 'user', content: 'Bye' },
+      ];
+
+      const indexTokenCountMap = { 0: 5, 2: 3 };
+
+      expect(() => {
+        const result = formatAgentMessages(payload, indexTokenCountMap);
+        expect(result.indexTokenCountMap).toBeDefined();
+        expect(result.indexTokenCountMap?.[0]).toBe(5);
+        expect(result.indexTokenCountMap?.[2]).toBe(3);
+      }).not.toThrow();
+    });
+
+    it('should not throw when indexTokenCountMap has extra indices beyond payload', () => {
+      const payload = [{ role: 'user', content: 'Hello' }];
+
+      const indexTokenCountMap = { 0: 5, 1: 10, 2: 15, 99: 999 };
+
+      expect(() => {
+        const result = formatAgentMessages(payload, indexTokenCountMap);
+        expect(result.indexTokenCountMap?.[0]).toBe(5);
+      }).not.toThrow();
+    });
+
+    it('should not throw with empty payload and non-empty indexTokenCountMap', () => {
+      const payload: Array<{ role: string; content: string }> = [];
+      const indexTokenCountMap = { 0: 100 };
+
+      expect(() => {
+        const result = formatAgentMessages(payload, indexTokenCountMap);
+        expect(result.messages).toHaveLength(0);
+      }).not.toThrow();
+    });
+
+    it('should not throw when assistant message content is empty array', () => {
+      const payload = [
+        {
+          role: 'assistant',
+          content: [] as Array<{ type: string; text?: string }>,
+        },
+      ];
+
+      const indexTokenCountMap = { 0: 50 };
+
+      expect(() => {
+        formatAgentMessages(payload, indexTokenCountMap);
+      }).not.toThrow();
+    });
+
+    it('should not throw when tool call output is null or undefined', () => {
+      const payload = [
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: ContentTypes.TEXT,
+              [ContentTypes.TEXT]: 'calling tools',
+              tool_call_ids: ['t1', 't2'],
+            },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: {
+                id: 't1',
+                name: 'search',
+                args: '{}',
+                output: null as unknown as string,
+              },
+            },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: {
+                id: 't2',
+                name: 'fetch',
+                args: '{}',
+                output: undefined as unknown as string,
+              },
+            },
+          ],
+        },
+      ];
+
+      const indexTokenCountMap = { 0: 30 };
+
+      expect(() => {
+        const result = formatAgentMessages(payload, indexTokenCountMap);
+        const total = Object.values(result.indexTokenCountMap || {}).reduce(
+          (sum, v) => sum + v,
+          0
+        );
+        expect(total).toBe(30);
+      }).not.toThrow();
+    });
+
+    it('should not throw when tool call args are deeply nested objects', () => {
+      const deepArgs = { a: { b: { c: { d: { e: { f: 'deep' } } } } } };
+      const payload = [
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: ContentTypes.TEXT,
+              [ContentTypes.TEXT]: 'deep call',
+              tool_call_ids: ['t1'],
+            },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: {
+                id: 't1',
+                name: 'deep_tool',
+                args: JSON.stringify(deepArgs),
+                output: 'done',
+              },
+            },
+          ],
+        },
+      ];
+
+      const indexTokenCountMap = { 0: 100 };
+
+      expect(() => {
+        const result = formatAgentMessages(payload, indexTokenCountMap);
+        const total = Object.values(result.indexTokenCountMap || {}).reduce(
+          (sum, v) => sum + v,
+          0
+        );
+        expect(total).toBe(100);
+      }).not.toThrow();
+    });
+
+    it('should not throw when tool call args are not valid JSON strings', () => {
+      const payload = [
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: ContentTypes.TEXT,
+              [ContentTypes.TEXT]: 'bad args',
+              tool_call_ids: ['t1'],
+            },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: {
+                id: 't1',
+                name: 'tool',
+                args: '{not valid json!!!',
+                output: 'output',
+              },
+            },
+          ],
+        },
+      ];
+
+      const indexTokenCountMap = { 0: 40 };
+
+      expect(() => {
+        const result = formatAgentMessages(payload, indexTokenCountMap);
+        const total = Object.values(result.indexTokenCountMap || {}).reduce(
+          (sum, v) => sum + v,
+          0
+        );
+        expect(total).toBe(40);
+      }).not.toThrow();
+    });
+
+    it('should not throw when content array has mixed types including unexpected values', () => {
+      const payload = [
+        {
+          role: 'assistant',
+          content: [
+            { type: ContentTypes.TEXT, [ContentTypes.TEXT]: 'hello' },
+            null as unknown as { type: string },
+            undefined as unknown as { type: string },
+            { type: 'unknown_type', something: 'weird' },
+          ],
+        },
+      ];
+
+      const indexTokenCountMap = { 0: 25 };
+
+      expect(() => {
+        const result = formatAgentMessages(payload, indexTokenCountMap);
+        expect(result.indexTokenCountMap?.[0]).toBe(25);
+      }).not.toThrow();
+    });
+
+    it('should not throw when tool call has empty name and empty args', () => {
+      const payload = [
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: ContentTypes.TEXT,
+              [ContentTypes.TEXT]: 'test',
+              tool_call_ids: ['t1'],
+            },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: {
+                id: 't1',
+                name: '',
+                args: '',
+                output: 'some output',
+              },
+            },
+          ],
+        },
+      ];
+
+      const indexTokenCountMap = { 0: 50 };
+
+      expect(() => {
+        formatAgentMessages(payload, indexTokenCountMap);
+      }).not.toThrow();
+    });
+
+    it('should not throw when all content parts are filtered out (THINK + ERROR only)', () => {
+      const payload = [
+        {
+          role: 'assistant',
+          content: [
+            { type: ContentTypes.THINK, [ContentTypes.THINK]: 'thinking...' },
+            { type: ContentTypes.ERROR, [ContentTypes.ERROR]: 'error...' },
+          ],
+        },
+      ];
+
+      const indexTokenCountMap = { 0: 100 };
+
+      expect(() => {
+        const result = formatAgentMessages(payload, indexTokenCountMap);
+        expect(Object.keys(result.indexTokenCountMap || {}).length).toBe(0);
+      }).not.toThrow();
+    });
+
+    it('should not throw with very large token count values', () => {
+      const payload = [
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: ContentTypes.TEXT,
+              [ContentTypes.TEXT]: 'big tokens',
+              tool_call_ids: ['t1'],
+            },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: { id: 't1', name: 'a', args: '{}', output: 'b' },
+            },
+          ],
+        },
+      ];
+
+      const indexTokenCountMap = { 0: Number.MAX_SAFE_INTEGER };
+
+      expect(() => {
+        const result = formatAgentMessages(payload, indexTokenCountMap);
+        const total = Object.values(result.indexTokenCountMap || {}).reduce(
+          (sum, v) => sum + v,
+          0
+        );
+        expect(total).toBe(Number.MAX_SAFE_INTEGER);
+      }).not.toThrow();
+    });
+
+    it('should not throw when multiple payload messages expand and some have undefined token counts', () => {
+      const payload = [
+        { role: 'user', content: 'msg1' },
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: ContentTypes.TEXT,
+              [ContentTypes.TEXT]: 'response with tool',
+              tool_call_ids: ['t1'],
+            },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: {
+                id: 't1',
+                name: 'search',
+                args: '{}',
+                output: 'found',
+              },
+            },
+          ],
+        },
+        { role: 'user', content: 'msg2' },
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: ContentTypes.TEXT,
+              [ContentTypes.TEXT]: 'another response',
+              tool_call_ids: ['t2'],
+            },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: {
+                id: 't2',
+                name: 'fetch',
+                args: '{}',
+                output: 'data',
+              },
+            },
+          ],
+        },
+      ];
+
+      const indexTokenCountMap: Record<number, number | undefined> = {
+        0: 5,
+        1: undefined,
+        2: 3,
+        3: 80,
+      };
+
+      expect(() => {
+        const result = formatAgentMessages(payload, indexTokenCountMap);
+        expect(result.indexTokenCountMap).toBeDefined();
+        expect(result.indexTokenCountMap?.[0]).toBe(5);
+      }).not.toThrow();
+    });
   });
 });

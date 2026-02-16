@@ -4,6 +4,7 @@ import { CallbackHandler } from '@langfuse/langchain';
 import { PromptTemplate } from '@langchain/core/prompts';
 import { RunnableLambda } from '@langchain/core/runnables';
 import { AzureChatOpenAI, ChatOpenAI } from '@langchain/openai';
+import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
 import type {
   MessageContentComplex,
   BaseMessage,
@@ -240,9 +241,14 @@ export class Run<_T extends t.BaseGraphState> {
       ? this.getCallbacks(streamOptions.callbacks)
       : [];
 
-    config.callbacks = baseCallbacks.concat(streamCallbacks).concat({
+    const customHandler = BaseCallbackHandler.fromMethods({
       [Callback.CUSTOM_EVENT]: customEventCallback,
     });
+    customHandler.awaitHandlers = true;
+
+    config.callbacks = baseCallbacks
+      .concat(streamCallbacks)
+      .concat(customHandler);
 
     if (
       isPresent(process.env.LANGFUSE_SECRET_KEY) &&

@@ -1,4 +1,11 @@
-import { BaseMessage, MessageContentComplex } from '@langchain/core/messages';
+import {
+  AIMessage,
+  BaseMessage,
+  ToolMessage,
+  HumanMessage,
+  SystemMessage,
+  MessageContentComplex,
+} from '@langchain/core/messages';
 import type { AnthropicMessage } from '@/types/messages';
 import type Anthropic from '@anthropic-ai/sdk';
 import { ContentTypes } from '@/common/enum';
@@ -23,13 +30,45 @@ function deepCloneContent<T extends string | MessageContentComplex[]>(
 }
 
 /**
- * Clones a message with deep-cloned content, explicitly excluding LangChain
- * serialization metadata to prevent coercion issues.
+ * Clones a message with new content. For LangChain BaseMessage instances,
+ * constructs a proper class instance so that `instanceof` checks are preserved
+ * in downstream code (e.g., ensureThinkingBlockInMessages).
+ * For plain objects (AnthropicMessage), uses object spread.
  */
 function cloneMessage<T extends MessageWithContent>(
   message: T,
   content: string | MessageContentComplex[]
 ): T {
+  if (message instanceof BaseMessage) {
+    const baseParams = {
+      content,
+      additional_kwargs: { ...message.additional_kwargs },
+      response_metadata: { ...message.response_metadata },
+      id: message.id,
+      name: message.name,
+    };
+
+    const msgType = message.getType();
+    switch (msgType) {
+    case 'ai':
+      return new AIMessage({
+        ...baseParams,
+        tool_calls: (message as unknown as AIMessage).tool_calls,
+      }) as unknown as T;
+    case 'human':
+      return new HumanMessage(baseParams) as unknown as T;
+    case 'system':
+      return new SystemMessage(baseParams) as unknown as T;
+    case 'tool':
+      return new ToolMessage({
+        ...baseParams,
+        tool_call_id: (message as unknown as ToolMessage).tool_call_id,
+      }) as unknown as T;
+    default:
+      break;
+    }
+  }
+
   const {
     lc_kwargs: _lc_kwargs,
     lc_serializable: _lc_serializable,

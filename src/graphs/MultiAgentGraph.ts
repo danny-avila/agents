@@ -786,13 +786,39 @@ export class MultiAgentGraph extends StandardGraph {
           /** Build messages for the receiving agent */
           let messagesForAgent = filteredMessages;
 
-          /** If there are instructions, inject them as a HumanMessage to ground the agent */
+          /**
+           * If there are instructions, inject them as a HumanMessage to
+           * ground the receiving agent.
+           *
+           * When the last filtered message is a ToolMessage (e.g. from a
+           * non-handoff tool the router called before handing off), a
+           * synthetic AIMessage is inserted first to satisfy the
+           * tool → assistant role ordering required by chat APIs.  Without
+           * this bridge, appending a HumanMessage directly after a
+           * ToolMessage causes "400 Unexpected role 'user' after role
+           * 'tool'" errors (see issue #54).
+           */
           const hasInstructions = instructions !== null && instructions !== '';
           if (hasInstructions) {
-            messagesForAgent = [
-              ...filteredMessages,
-              new HumanMessage(instructions),
-            ];
+            const lastMsg =
+              filteredMessages.length > 0
+                ? filteredMessages[filteredMessages.length - 1]
+                : null;
+
+            if (lastMsg != null && lastMsg.getType() === 'tool') {
+              messagesForAgent = [
+                ...filteredMessages,
+                new AIMessage(
+                  `[Processed tool result and transferring to ${agentId}]`
+                ),
+                new HumanMessage(instructions),
+              ];
+            } else {
+              messagesForAgent = [
+                ...filteredMessages,
+                new HumanMessage(instructions),
+              ];
+            }
           }
 
           /** Update token map if we have a token counter */
@@ -808,10 +834,14 @@ export class MultiAgentGraph extends StandardGraph {
                 freshTokenMap[i] = tokenCount;
               }
             }
-            /** Add tokens for the instructions message */
-            const instructionsMsg = new HumanMessage(instructions);
-            freshTokenMap[messagesForAgent.length - 1] =
-              agentContext.tokenCounter(instructionsMsg);
+            /** Add tokens for the bridge AIMessage + instructions HumanMessage */
+            for (
+              let i = filteredMessages.length;
+              i < messagesForAgent.length;
+              i++
+            ) {
+              freshTokenMap[i] = agentContext.tokenCounter(messagesForAgent[i]);
+            }
             agentContext.updateTokenMapWithInstructions(freshTokenMap);
           }
 

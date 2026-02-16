@@ -7,10 +7,11 @@ describe('AgentContext', () => {
   type ContextOptions = {
     agentConfig?: Partial<t.AgentInputs>;
     tokenCounter?: t.TokenCounter;
+    indexTokenCountMap?: Record<string, number>;
   };
 
   const createBasicContext = (options: ContextOptions = {}): AgentContext => {
-    const { agentConfig = {}, tokenCounter } = options;
+    const { agentConfig = {}, tokenCounter, indexTokenCountMap } = options;
     return AgentContext.fromConfig(
       {
         agentId: 'test-agent',
@@ -18,7 +19,8 @@ describe('AgentContext', () => {
         instructions: 'Test instructions',
         ...agentConfig,
       },
-      tokenCounter
+      tokenCounter,
+      indexTokenCountMap
     );
   };
 
@@ -391,6 +393,23 @@ describe('AgentContext', () => {
       expect(ctx.instructionTokens).toBe(0);
       expect(ctx.indexTokenCountMap).toEqual({});
       expect(ctx.currentUsage).toBeUndefined();
+    });
+
+    it('rebuilds indexTokenCountMap from base map after reset', async () => {
+      const tokenCounter = jest.fn(() => 5);
+      const ctx = createBasicContext({
+        tokenCounter,
+        indexTokenCountMap: { '0': 10, '1': 20 },
+      });
+
+      await ctx.tokenCalculationPromise;
+      ctx.indexTokenCountMap = {};
+
+      ctx.reset();
+      await ctx.tokenCalculationPromise;
+
+      expect(ctx.indexTokenCountMap['1']).toBe(20);
+      expect(ctx.indexTokenCountMap['0'] ?? 0).toBeGreaterThanOrEqual(10);
     });
 
     it('forces rebuild on next systemRunnable access', () => {
@@ -780,8 +799,9 @@ describe('AgentContext', () => {
 
       // Verify state is cleared
       expect(ctx.discoveredToolNames.size).toBe(0);
-      expect(ctx.instructionTokens).toBe(0);
-      expect(ctx.indexTokenCountMap).toEqual({});
+      const resetTokens = ctx.instructionTokens;
+      expect(resetTokens).toBeGreaterThan(0);
+      expect(resetTokens).toBeLessThan(run1Tokens);
 
       // ========== RUN 2 ==========
       // Re-initialize (as fromConfig would do)
@@ -790,6 +810,7 @@ describe('AgentContext', () => {
       // System runnable should NOT include the previously discovered tool
       // (because discoveredToolNames was cleared)
       const run2Tokens = ctx.instructionTokens;
+      expect(run2Tokens).toBe(resetTokens);
 
       // Token count should be lower than run 1 (no discovered tool in system message)
       expect(run2Tokens).toBeLessThan(run1Tokens);

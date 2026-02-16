@@ -75,6 +75,7 @@ export class AgentContext {
       agentContext.initializeSystemRunnable();
 
       const tokenMap = indexTokenCountMap || {};
+      agentContext.baseIndexTokenCountMap = { ...tokenMap };
       agentContext.indexTokenCountMap = tokenMap;
       agentContext.tokenCalculationPromise = agentContext
         .calculateInstructionTokens(tokenCounter)
@@ -86,6 +87,7 @@ export class AgentContext {
           console.error('Error calculating instruction tokens:', err);
         });
     } else if (indexTokenCountMap) {
+      agentContext.baseIndexTokenCountMap = { ...indexTokenCountMap };
       agentContext.indexTokenCountMap = indexTokenCountMap;
     }
 
@@ -102,6 +104,8 @@ export class AgentContext {
   clientOptions?: t.ClientOptions;
   /** Token count map indexed by message position */
   indexTokenCountMap: Record<string, number | undefined> = {};
+  /** Canonical pre-run token map used to restore token accounting on reset */
+  baseIndexTokenCountMap: Record<string, number> = {};
   /** Maximum context tokens for this agent */
   maxContextTokens?: number;
   /** Current usage metadata for this agent */
@@ -469,7 +473,7 @@ export class AgentContext {
     this.cachedSystemRunnable = undefined;
     this.systemRunnableStale = true;
     this.lastToken = undefined;
-    this.indexTokenCountMap = {};
+    this.indexTokenCountMap = { ...this.baseIndexTokenCountMap };
     this.currentUsage = undefined;
     this.pruneMessages = undefined;
     this.lastStreamCall = undefined;
@@ -478,6 +482,23 @@ export class AgentContext {
     this.currentTokenType = ContentTypes.TEXT;
     this.discoveredToolNames.clear();
     this.handoffContext = undefined;
+
+    if (this.tokenCounter) {
+      this.initializeSystemRunnable();
+      const baseTokenMap = { ...this.baseIndexTokenCountMap };
+      this.indexTokenCountMap = baseTokenMap;
+      this.tokenCalculationPromise = this.calculateInstructionTokens(
+        this.tokenCounter
+      )
+        .then(() => {
+          this.updateTokenMapWithInstructions(baseTokenMap);
+        })
+        .catch((err) => {
+          console.error('Error calculating instruction tokens:', err);
+        });
+    } else {
+      this.tokenCalculationPromise = undefined;
+    }
   }
 
   /**
@@ -508,6 +529,12 @@ export class AgentContext {
     tokenCounter: t.TokenCounter
   ): Promise<void> {
     let toolTokens = 0;
+    // Track names to avoid double-counting when a tool appears in both
+    // this.tools (bound StructuredTool instances) and this.toolDefinitions
+    // (MCP / event-driven schemas).
+    const countedToolNames = new Set<string>();
+
+    // Count tokens for bound tools (StructuredTool instances with .schema)
     if (this.tools && this.tools.length > 0) {
       for (const tool of this.tools) {
         const genericTool = tool as Record<string, unknown>;
@@ -515,15 +542,36 @@ export class AgentContext {
           genericTool.schema != null &&
           typeof genericTool.schema === 'object'
         ) {
+          const toolName = (genericTool.name as string | undefined) ?? '';
           const jsonSchema = toJsonSchema(
             genericTool.schema,
-            (genericTool.name as string | undefined) ?? '',
+            toolName,
             (genericTool.description as string | undefined) ?? ''
           );
           toolTokens += tokenCounter(
             new SystemMessage(JSON.stringify(jsonSchema))
           );
+          if (toolName) {
+            countedToolNames.add(toolName);
+          }
         }
+      }
+    }
+
+    // Count tokens for tool definitions (MCP / event-driven tools).
+    // These are sent to the provider API as tool schemas alongside bound tools.
+    // Both can be populated simultaneously (graph tools + MCP tools).
+    if (this.toolDefinitions && this.toolDefinitions.length > 0) {
+      for (const def of this.toolDefinitions) {
+        if (countedToolNames.has(def.name)) {
+          continue; // Already counted via this.tools
+        }
+        const schema = {
+          name: def.name,
+          description: def.description ?? '',
+          parameters: def.parameters ?? {},
+        };
+        toolTokens += tokenCounter(new SystemMessage(JSON.stringify(schema)));
       }
     }
 
@@ -622,7 +670,7 @@ export class AgentContext {
     return filtered;
   }
 
-  /** Creates schema-only tools from toolDefinitions for event-driven mode */
+  /** Creates schema-only tools from toolDefinitions for event-driven mode, merged with native tools */
   private getEventDrivenToolsForBinding(): t.GraphTools {
     if (!this.toolDefinitions) {
       return this.graphTools ?? [];
@@ -644,11 +692,17 @@ export class AgentContext {
 
     const schemaTools = createSchemaOnlyTools(defsToInclude) as t.GraphTools;
 
+    const allTools = [...schemaTools];
+
     if (this.graphTools && this.graphTools.length > 0) {
-      return [...schemaTools, ...this.graphTools];
+      allTools.push(...this.graphTools);
     }
 
-    return schemaTools;
+    if (this.tools && this.tools.length > 0) {
+      allTools.push(...this.tools);
+    }
+
+    return allTools;
   }
 
   /** Filters tool instances for binding based on registry config */

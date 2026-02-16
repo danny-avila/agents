@@ -1,6 +1,6 @@
 {
   "name": "@librechat/agents",
-  "version": "3.1.39",
+  "version": "3.1.43",
   "main": "./dist/cjs/main.cjs",
   "module": "./dist/esm/main.mjs",
   "types": "./dist/types/index.d.ts",
@@ -132,7 +132,7 @@
     "@langfuse/otel": "^4.3.0",
     "@langfuse/tracing": "^4.3.0",
     "@opentelemetry/sdk-node": "^0.207.0",
-    "axios": "^1.12.1",
+    "axios": "^1.13.5",
     "cheerio": "^1.0.0",
     "dotenv": "^16.4.7",
     "https-proxy-agent": "^7.0.6",

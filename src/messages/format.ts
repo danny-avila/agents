@@ -288,7 +288,12 @@ function formatAssistantMessage(
   let hasReasoning = false;
 
   if (Array.isArray(message.content)) {
-    for (const part of message.content) {
+    for (const part of message.content as Array<
+      MessageContentComplex | undefined | null
+    >) {
+      if (part == null) {
+        continue;
+      }
       if (part.type === ContentTypes.TEXT && part.tool_call_ids) {
         /*
         If there's pending content, it needs to be aggregated as a single string to prepare for tool calls.
@@ -865,7 +870,6 @@ export const formatAgentMessages = (
     indexMapping[i] = resultIndices;
   }
 
-  // Update the token count map if it was provided
   if (indexTokenCountMap) {
     for (
       let originalIndex = 0;
@@ -875,24 +879,77 @@ export const formatAgentMessages = (
       const resultIndices = indexMapping[originalIndex] || [];
       const tokenCount = indexTokenCountMap[originalIndex];
 
-      if (tokenCount !== undefined) {
-        if (resultIndices.length === 1) {
-          // Simple 1:1 mapping
-          updatedIndexTokenCountMap[resultIndices[0]] = tokenCount;
-        } else if (resultIndices.length > 1) {
-          // If one message was split into multiple, distribute the token count
-          // This is a simplification - in reality, you might want a more sophisticated distribution
-          const countPerMessage = Math.floor(tokenCount / resultIndices.length);
-          resultIndices.forEach((resultIndex, idx) => {
-            if (idx === resultIndices.length - 1) {
-              // Give any remainder to the last message
-              updatedIndexTokenCountMap[resultIndex] =
-                tokenCount - countPerMessage * (resultIndices.length - 1);
-            } else {
-              updatedIndexTokenCountMap[resultIndex] = countPerMessage;
+      if (tokenCount === undefined) {
+        continue;
+      }
+
+      const msgCount = resultIndices.length;
+      if (msgCount === 1) {
+        updatedIndexTokenCountMap[resultIndices[0]] = tokenCount;
+        continue;
+      }
+
+      if (msgCount < 2) {
+        continue;
+      }
+
+      let totalLength = 0;
+      const lastIdx = msgCount - 1;
+      const lengths = new Array<number>(msgCount);
+      for (let k = 0; k < msgCount; k++) {
+        const msg = messages[resultIndices[k]];
+        const { content } = msg;
+        let len = 0;
+        if (typeof content === 'string') {
+          len = content.length;
+        } else if (Array.isArray(content)) {
+          for (const part of content as Array<
+            Record<string, unknown> | string | undefined
+          >) {
+            if (typeof part === 'string') {
+              len += part.length;
+            } else if (part != null && typeof part === 'object') {
+              const val = part.text ?? part.content;
+              if (typeof val === 'string') {
+                len += val.length;
+              }
             }
-          });
+          }
         }
+        const toolCalls = (msg as AIMessage).tool_calls;
+        if (Array.isArray(toolCalls)) {
+          for (const tc of toolCalls as Array<Record<string, unknown>>) {
+            if (typeof tc.name === 'string') {
+              len += tc.name.length;
+            }
+            const { args } = tc;
+            if (typeof args === 'string') {
+              len += args.length;
+            } else if (args != null) {
+              len += JSON.stringify(args).length;
+            }
+          }
+        }
+        lengths[k] = len;
+        totalLength += len;
+      }
+
+      if (totalLength === 0) {
+        const countPerMessage = Math.floor(tokenCount / msgCount);
+        for (let k = 0; k < lastIdx; k++) {
+          updatedIndexTokenCountMap[resultIndices[k]] = countPerMessage;
+        }
+        updatedIndexTokenCountMap[resultIndices[lastIdx]] =
+          tokenCount - countPerMessage * lastIdx;
+      } else {
+        let distributed = 0;
+        for (let k = 0; k < lastIdx; k++) {
+          const share = Math.floor((lengths[k] / totalLength) * tokenCount);
+          updatedIndexTokenCountMap[resultIndices[k]] = share;
+          distributed += share;
+        }
+        updatedIndexTokenCountMap[resultIndices[lastIdx]] =
+          tokenCount - distributed;
       }
     }
   }
@@ -954,7 +1011,12 @@ export function ensureThinkingBlockInMessages(
 
   while (i < messages.length) {
     const msg = messages[i];
-    const isAI = msg instanceof AIMessage || msg instanceof AIMessageChunk;
+    /** Detect AI messages by instanceof OR by role, in case cache-control cloning
+     produced a plain object that lost the LangChain prototype. */
+    const isAI =
+      msg instanceof AIMessage ||
+      msg instanceof AIMessageChunk ||
+      ('role' in msg && (msg as any).role === 'assistant');
 
     if (!isAI) {
       result.push(msg);
@@ -968,30 +1030,58 @@ export function ensureThinkingBlockInMessages(
 
     // Check if the message has tool calls or tool_use content
     let hasToolUse = hasToolCalls ?? false;
-    let firstContentType: string | undefined;
+    let hasThinkingBlock = false;
 
     if (contentIsArray && aiMsg.content.length > 0) {
       const content = aiMsg.content as ExtendedMessageContent[];
-      firstContentType = content[0]?.type;
       hasToolUse =
         hasToolUse ||
         content.some((c) => typeof c === 'object' && c.type === 'tool_use');
+      // Check ALL content blocks for thinking/reasoning, not just [0].
+      // Bedrock may emit a whitespace text chunk before the thinking block,
+      // pushing the reasoning_content to index 1+.
+      hasThinkingBlock = content.some(
+        (c) =>
+          typeof c === 'object' &&
+          (c.type === ContentTypes.THINKING ||
+            c.type === ContentTypes.REASONING_CONTENT ||
+            c.type === ContentTypes.REASONING ||
+            c.type === 'redacted_thinking')
+      );
     }
 
-    // If message has tool use but no thinking block, convert to buffer string
+    // Bedrock also stores reasoning in additional_kwargs (may not be in content array)
     if (
-      hasToolUse &&
-      firstContentType !== ContentTypes.THINKING &&
-      firstContentType !== ContentTypes.REASONING_CONTENT &&
-      firstContentType !== ContentTypes.REASONING &&
-      firstContentType !== 'redacted_thinking'
+      !hasThinkingBlock &&
+      aiMsg.additional_kwargs.reasoning_content != null
     ) {
+      hasThinkingBlock = true;
+    }
+
+    // If message has tool use but no thinking block, check whether this is a
+    // continuation of a thinking-enabled agent's chain before converting.
+    // Bedrock reasoning models can produce multiple AI→Tool rounds after an
+    // initial reasoning response: the first AI message has reasoning_content,
+    // but follow-ups have content: "" with only tool_calls. These are the
+    // same agent's turn and must NOT be converted to HumanMessages.
+    if (hasToolUse && !hasThinkingBlock) {
+      // Walk backwards — if an earlier AI message in the same chain (before
+      // the nearest HumanMessage) has a thinking/reasoning block, this is a
+      // continuation of a thinking-enabled turn, not a non-thinking handoff.
+      if (chainHasThinkingBlock(messages, i)) {
+        result.push(msg);
+        i++;
+        continue;
+      }
+
       // Collect the AI message and any following tool messages
       const toolSequence: BaseMessage[] = [msg];
       let j = i + 1;
 
       // Look ahead for tool messages that belong to this AI message
-      while (j < messages.length && messages[j] instanceof ToolMessage) {
+      const isToolMsg = (m: BaseMessage): boolean =>
+        m instanceof ToolMessage || ('role' in m && (m as any).role === 'tool');
+      while (j < messages.length && isToolMsg(messages[j])) {
         toolSequence.push(messages[j]);
         j++;
       }
@@ -1015,4 +1105,67 @@ export function ensureThinkingBlockInMessages(
   }
 
   return result;
+}
+
+/**
+ * Walks backwards from `currentIndex` through the message array to check
+ * whether an earlier AI message in the same "chain" (no HumanMessage boundary)
+ * contains a thinking/reasoning block.
+ *
+ * A "chain" is a contiguous sequence of AI + Tool messages with no intervening
+ * HumanMessage. Bedrock reasoning models produce reasoning on the first AI
+ * response, then issue follow-up tool calls with `content: ""` and no
+ * reasoning block. These follow-ups are part of the same thinking-enabled
+ * turn and should not be converted.
+ */
+function chainHasThinkingBlock(
+  messages: BaseMessage[],
+  currentIndex: number
+): boolean {
+  for (let k = currentIndex - 1; k >= 0; k--) {
+    const prev = messages[k];
+
+    // HumanMessage = turn boundary — stop searching
+    if (
+      prev instanceof HumanMessage ||
+      ('role' in prev && (prev as any).role === 'user')
+    ) {
+      return false;
+    }
+
+    // Check AI messages for thinking/reasoning blocks
+    const isPrevAI =
+      prev instanceof AIMessage ||
+      prev instanceof AIMessageChunk ||
+      ('role' in prev && (prev as any).role === 'assistant');
+
+    if (isPrevAI) {
+      const prevAiMsg = prev as AIMessage | AIMessageChunk;
+
+      if (Array.isArray(prevAiMsg.content) && prevAiMsg.content.length > 0) {
+        const content = prevAiMsg.content as ExtendedMessageContent[];
+        if (
+          content.some(
+            (c) =>
+              typeof c === 'object' &&
+              (c.type === ContentTypes.THINKING ||
+                c.type === ContentTypes.REASONING_CONTENT ||
+                c.type === ContentTypes.REASONING ||
+                c.type === 'redacted_thinking')
+          )
+        ) {
+          return true;
+        }
+      }
+
+      // Bedrock also stores reasoning in additional_kwargs
+      if (prevAiMsg.additional_kwargs.reasoning_content != null) {
+        return true;
+      }
+    }
+
+    // ToolMessages are part of the chain — keep walking back
+  }
+
+  return false;
 }

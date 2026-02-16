@@ -89,6 +89,213 @@ describe('ensureThinkingBlockInMessages', () => {
       );
     });
 
+    test('should not modify AI message when reasoning_content is not the first block (Bedrock whitespace artifact)', () => {
+      // Bedrock emits a "\n\n" text chunk before the thinking block,
+      // pushing reasoning_content to content[1] instead of content[0].
+      const messages = [
+        new HumanMessage({ content: 'Do something' }),
+        new AIMessage({
+          content: [
+            { type: 'text', text: '\n\n' },
+            {
+              type: ContentTypes.REASONING_CONTENT,
+              reasoningText: { text: 'Let me think about this' },
+            },
+            { type: 'text', text: 'Let me help!' },
+          ],
+          tool_calls: [
+            {
+              id: 'call_bedrock',
+              name: 'some_tool',
+              args: { x: 1 },
+              type: 'tool_call' as const,
+            },
+          ],
+        }),
+        new ToolMessage({
+          content: 'tool result',
+          tool_call_id: 'call_bedrock',
+        }),
+      ];
+
+      const result = ensureThinkingBlockInMessages(messages, Providers.BEDROCK);
+
+      expect(result).toHaveLength(3);
+      expect(result[0]).toBeInstanceOf(HumanMessage);
+      expect(result[1]).toBeInstanceOf(AIMessage);
+      expect(result[2]).toBeInstanceOf(ToolMessage);
+      // The AI message should be preserved, not converted to a HumanMessage
+      expect(result[1].content).toEqual(messages[1].content);
+    });
+
+    test('should not convert follow-up tool calls in a thinking-enabled chain (Bedrock multi-step)', () => {
+      // Bedrock reasoning models produce reasoning on the first AI response,
+      // then subsequent tool calls in the same chain have content: "" with no
+      // reasoning block. These should NOT be converted because the chain
+      // already has a thinking block upstream.
+      const messages = [
+        new HumanMessage({ content: 'show me something cool' }),
+        new AIMessage({
+          content: [
+            { type: 'text', text: '\n\n' },
+            {
+              type: ContentTypes.REASONING_CONTENT,
+              reasoningText: { text: 'Let me navigate to a page' },
+            },
+            { type: 'text', text: 'Let me whip up something fun!' },
+          ],
+          tool_calls: [
+            {
+              id: 'call_nav',
+              name: 'navigate_page',
+              args: { url: 'about:blank' },
+              type: 'tool_call' as const,
+            },
+          ],
+        }),
+        new ToolMessage({
+          content: 'Navigated to about:blank',
+          tool_call_id: 'call_nav',
+        }),
+        // Follow-up: content: "", tool calls, NO reasoning block
+        new AIMessage({
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_eval',
+              name: 'evaluate_script',
+              args: { script: 'document.title = "test"' },
+              type: 'tool_call' as const,
+            },
+          ],
+        }),
+        new ToolMessage({
+          content: 'Script executed',
+          tool_call_id: 'call_eval',
+        }),
+      ];
+
+      const result = ensureThinkingBlockInMessages(messages, Providers.BEDROCK);
+
+      // All 5 messages preserved — the follow-up AI message at index 3 is NOT converted
+      expect(result).toHaveLength(5);
+      expect(result[0]).toBeInstanceOf(HumanMessage);
+      expect(result[1]).toBeInstanceOf(AIMessage);
+      expect(result[2]).toBeInstanceOf(ToolMessage);
+      expect(result[3]).toBeInstanceOf(AIMessage);
+      expect(result[3].content).toBe('');
+      expect((result[3] as AIMessage).tool_calls).toHaveLength(1);
+      expect(result[4]).toBeInstanceOf(ToolMessage);
+    });
+
+    test('should not convert multiple follow-up tool calls in a long chain', () => {
+      // Three AI→Tool rounds: only the first has reasoning
+      const messages = [
+        new HumanMessage({ content: 'do stuff' }),
+        new AIMessage({
+          content: [
+            {
+              type: ContentTypes.REASONING_CONTENT,
+              reasoningText: { text: 'Planning...' },
+            },
+          ],
+          tool_calls: [
+            { id: 'c1', name: 'step1', args: {}, type: 'tool_call' as const },
+          ],
+        }),
+        new ToolMessage({ content: 'r1', tool_call_id: 'c1' }),
+        new AIMessage({
+          content: '',
+          tool_calls: [
+            { id: 'c2', name: 'step2', args: {}, type: 'tool_call' as const },
+          ],
+        }),
+        new ToolMessage({ content: 'r2', tool_call_id: 'c2' }),
+        new AIMessage({
+          content: '',
+          tool_calls: [
+            { id: 'c3', name: 'step3', args: {}, type: 'tool_call' as const },
+          ],
+        }),
+        new ToolMessage({ content: 'r3', tool_call_id: 'c3' }),
+      ];
+
+      const result = ensureThinkingBlockInMessages(messages, Providers.BEDROCK);
+
+      expect(result).toHaveLength(7);
+      expect(result[1]).toBeInstanceOf(AIMessage);
+      expect(result[3]).toBeInstanceOf(AIMessage);
+      expect(result[5]).toBeInstanceOf(AIMessage);
+    });
+
+    test('should still convert non-thinking agent tool calls after a human message boundary', () => {
+      // A chain with thinking, then a new human message, then a chain WITHOUT thinking
+      const messages = [
+        new HumanMessage({ content: 'first request' }),
+        new AIMessage({
+          content: [
+            {
+              type: ContentTypes.REASONING_CONTENT,
+              reasoningText: { text: 'Thinking...' },
+            },
+          ],
+          tool_calls: [
+            { id: 'c1', name: 'tool1', args: {}, type: 'tool_call' as const },
+          ],
+        }),
+        new ToolMessage({ content: 'r1', tool_call_id: 'c1' }),
+        new HumanMessage({ content: 'second request' }),
+        // This chain has NO thinking blocks — should be converted
+        new AIMessage({
+          content: 'Using a tool',
+          tool_calls: [
+            { id: 'c2', name: 'tool2', args: {}, type: 'tool_call' as const },
+          ],
+        }),
+        new ToolMessage({ content: 'r2', tool_call_id: 'c2' }),
+      ];
+
+      const result = ensureThinkingBlockInMessages(messages, Providers.BEDROCK);
+
+      // First chain preserved (3 msgs), human preserved, second chain converted (1 HumanMessage)
+      expect(result).toHaveLength(5);
+      expect(result[0]).toBeInstanceOf(HumanMessage);
+      expect(result[1]).toBeInstanceOf(AIMessage); // reasoning chain — kept
+      expect(result[2]).toBeInstanceOf(ToolMessage);
+      expect(result[3]).toBeInstanceOf(HumanMessage); // user message
+      expect(result[4]).toBeInstanceOf(HumanMessage); // converted — no thinking in this chain
+      expect(result[4].content).toContain('[Previous agent context]');
+    });
+
+    test('should detect thinking via additional_kwargs.reasoning_content in chain', () => {
+      const messages = [
+        new HumanMessage({ content: 'hello' }),
+        new AIMessage({
+          content: '',
+          additional_kwargs: {
+            reasoning_content: 'Some reasoning...',
+          },
+          tool_calls: [
+            { id: 'c1', name: 'tool1', args: {}, type: 'tool_call' as const },
+          ],
+        }),
+        new ToolMessage({ content: 'r1', tool_call_id: 'c1' }),
+        new AIMessage({
+          content: '',
+          tool_calls: [
+            { id: 'c2', name: 'tool2', args: {}, type: 'tool_call' as const },
+          ],
+        }),
+        new ToolMessage({ content: 'r2', tool_call_id: 'c2' }),
+      ];
+
+      const result = ensureThinkingBlockInMessages(messages, Providers.BEDROCK);
+
+      // Index 3 should NOT be converted — index 1 has reasoning in additional_kwargs
+      expect(result).toHaveLength(5);
+      expect(result[3]).toBeInstanceOf(AIMessage);
+    });
+
     test('should not modify AI message with reasoning block and tool calls', () => {
       const messages = [
         new HumanMessage({ content: 'Calculate something' }),
