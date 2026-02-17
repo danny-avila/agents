@@ -1210,6 +1210,27 @@ async function summarizeInStages({
   );
 
   for (let i = 0; i < chunks.length; i++) {
+    // Dispatch a synthetic spacing delta between stages so the client
+    // aggregates visual separation between chunk summaries.
+    if (i > 0 && stepId != null && stepId !== '' && config) {
+      safeDispatchCustomEvent(
+        GraphEvents.ON_SUMMARIZE_DELTA,
+        {
+          id: stepId,
+          delta: {
+            summary: {
+              type: ContentTypes.SUMMARY,
+              text: '\n\n',
+              tokenCount: 0,
+              provider: String(config.metadata?.summarization_provider ?? ''),
+              model: String(config.metadata?.summarization_model ?? ''),
+            },
+          },
+        } satisfies t.SummarizeDeltaEvent,
+        config
+      );
+    }
+
     const chunk = chunks[i];
     const formattedText = formatMessagesForSummarization(chunk);
 
