@@ -39,6 +39,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   toolCallStepIds?: Map<string, string>;
   errorHandler?: t.ToolNodeConstructorParams['errorHandler'];
   private toolUsageCount: Map<string, number>;
+  /** Maps toolCallId → turn captured in runTool, used by handleRunToolCompletions */
+  private toolCallTurns: Map<string, number> = new Map();
   /** Tool registry for filtering (lazy computation of programmatic maps) */
   private toolRegistry?: t.LCToolRegistry;
   /** Cached programmatic tools (computed once on first PTC call) */
@@ -129,6 +131,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       }
       const turn = this.toolUsageCount.get(call.name) ?? 0;
       this.toolUsageCount.set(call.name, turn + 1);
+      if (call.id != null && call.id !== '') {
+        this.toolCallTurns.set(call.id, turn);
+      }
       const args = call.args;
       const stepId = this.toolCallStepIds?.get(call.id!);
 
@@ -289,7 +294,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
   /**
    * Extracts code execution session context from tool results and stores in Graph.sessions.
-   * Mirrors the session storage logic in Graph.handleToolCallCompleted() for direct execution.
+   * Mirrors the session storage logic in handleRunToolCompletions for direct execution.
    */
   private storeCodeSessionFromResults(
     results: t.ToolExecuteResult[],
@@ -347,6 +352,115 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           lastUpdated: Date.now(),
         });
       }
+    }
+  }
+
+  /**
+   * Post-processes standard runTool outputs: dispatches ON_RUN_STEP_COMPLETED
+   * and stores code session context. Mirrors the completion handling in
+   * dispatchToolEvents for the event-driven path.
+   *
+   * By handling completions here in graph context (rather than in the
+   * stream consumer via ToolEndHandler), the race between the stream
+   * consumer and graph execution is eliminated.
+   */
+  private handleRunToolCompletions(
+    calls: ToolCall[],
+    outputs: (BaseMessage | Command)[],
+    config: RunnableConfig
+  ): void {
+    for (let i = 0; i < calls.length; i++) {
+      const call = calls[i];
+      const output = outputs[i];
+      const turn = this.toolCallTurns.get(call.id!) ?? 0;
+
+      if (isCommand(output)) {
+        continue;
+      }
+
+      const toolMessage = output as ToolMessage;
+      const toolCallId = call.id ?? '';
+
+      // Skip error ToolMessages when errorHandler already dispatched ON_RUN_STEP_COMPLETED
+      // via handleToolCallErrorStatic. Without this check, errors would be double-dispatched.
+      if (toolMessage.status === 'error' && this.errorHandler != null) {
+        continue;
+      }
+
+      // Store code session context from tool results
+      if (
+        this.sessions &&
+        (call.name === Constants.EXECUTE_CODE ||
+          call.name === Constants.PROGRAMMATIC_TOOL_CALLING)
+      ) {
+        const artifact = toolMessage.artifact as
+          | t.CodeExecutionArtifact
+          | undefined;
+        if (artifact?.session_id != null && artifact.session_id !== '') {
+          const newFiles = artifact.files ?? [];
+          const existingSession = this.sessions.get(Constants.EXECUTE_CODE) as
+            | t.CodeSessionContext
+            | undefined;
+          const existingFiles = existingSession?.files ?? [];
+
+          if (newFiles.length > 0) {
+            const filesWithSession: t.FileRefs = newFiles.map((file) => ({
+              ...file,
+              session_id: artifact.session_id,
+            }));
+            const newFileNames = new Set(filesWithSession.map((f) => f.name));
+            const filteredExisting = existingFiles.filter(
+              (f) => !newFileNames.has(f.name)
+            );
+            this.sessions.set(Constants.EXECUTE_CODE, {
+              session_id: artifact.session_id,
+              files: [...filteredExisting, ...filesWithSession],
+              lastUpdated: Date.now(),
+            });
+          } else {
+            this.sessions.set(Constants.EXECUTE_CODE, {
+              session_id: artifact.session_id,
+              files: existingFiles,
+              lastUpdated: Date.now(),
+            });
+          }
+        }
+      }
+
+      // Dispatch ON_RUN_STEP_COMPLETED via custom event (same path as dispatchToolEvents)
+      const stepId = this.toolCallStepIds?.get(toolCallId) ?? '';
+      if (!stepId) {
+        continue;
+      }
+
+      const contentString =
+        typeof toolMessage.content === 'string'
+          ? toolMessage.content
+          : JSON.stringify(toolMessage.content);
+
+      const tool_call: t.ProcessedToolCall = {
+        args:
+          typeof call.args === 'string'
+            ? (call.args as string)
+            : JSON.stringify((call.args as unknown) ?? {}),
+        name: call.name,
+        id: toolCallId,
+        output: contentString,
+        progress: 1,
+      };
+
+      safeDispatchCustomEvent(
+        GraphEvents.ON_RUN_STEP_COMPLETED,
+        {
+          result: {
+            id: stepId,
+            index: turn,
+            type: 'tool_call' as const,
+            tool_call,
+          },
+        },
+        config
+      );
     }
   }
 
@@ -492,6 +606,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         return this.executeViaEvent([input.lg_tool_call], config, input);
       }
       outputs = [await this.runTool(input.lg_tool_call, config)];
+      this.handleRunToolCompletions([input.lg_tool_call], outputs, config);
     } else {
       let messages: BaseMessage[];
       if (Array.isArray(input)) {
@@ -565,6 +680,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             )
             : [];
 
+        if (directCalls.length > 0 && directOutputs.length > 0) {
+          this.handleRunToolCompletions(directCalls, directOutputs, config);
+        }
+
         const eventOutputs: ToolMessage[] =
           eventCalls.length > 0
             ? await this.dispatchToolEvents(eventCalls, config)
@@ -575,6 +694,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         outputs = await Promise.all(
           filteredCalls.map((call) => this.runTool(call, config))
         );
+        this.handleRunToolCompletions(filteredCalls, outputs, config);
       }
     }
 

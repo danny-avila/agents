@@ -7,7 +7,6 @@ import { ChatVertexAI } from '@langchain/google-vertexai';
 import {
   START,
   END,
-  Command,
   StateGraph,
   Annotation,
   messagesStateReducer,
@@ -31,14 +30,6 @@ import type {
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
 import {
-  GraphNodeKeys,
-  ContentTypes,
-  GraphEvents,
-  Providers,
-  StepTypes,
-  Constants,
-} from '@/common';
-import {
   formatAnthropicArtifactContent,
   ensureThinkingBlockInMessages,
   convertMessagesToContent,
@@ -51,6 +42,13 @@ import {
   addCacheControl,
   getMessageId,
 } from '@/messages';
+import {
+  GraphNodeKeys,
+  ContentTypes,
+  GraphEvents,
+  Providers,
+  StepTypes,
+} from '@/common';
 import {
   resetIfNotEmpty,
   isOpenAILike,
@@ -65,8 +63,8 @@ import { safeDispatchCustomEvent } from '@/utils/events';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { AgentContext } from '@/agents/AgentContext';
 import { createFakeStreamingLLM } from '@/llm/fake';
-import { ChatModelStreamHandler } from '@/stream';
 import { handleToolCalls } from '@/tools/handlers';
+import { ChatModelStreamHandler } from '@/stream';
 import { HandlerRegistry } from '@/events';
 
 const { AGENT, TOOLS } = GraphNodeKeys;
@@ -119,12 +117,6 @@ export abstract class Graph<
     stepId: string,
     delta: t.ReasoningDelta
   ): Promise<void>;
-  abstract handleToolCallCompleted(
-    data: t.ToolEndData,
-    metadata?: Record<string, unknown>,
-    omitOutput?: boolean
-  ): Promise<void>;
-
   abstract createCallModel(
     agentId?: string,
     currentModel?: t.ChatModel
@@ -1233,124 +1225,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     return stepId;
   }
 
-  async handleToolCallCompleted(
-    data: t.ToolEndData,
-    metadata?: Record<string, unknown>,
-    omitOutput?: boolean
-  ): Promise<void> {
-    if (!this.config) {
-      throw new Error('No config provided');
-    }
-
-    if (!data.output) {
-      return;
-    }
-
-    const { input, output: _output } = data;
-    if ((_output as Command | undefined)?.lg_name === 'Command') {
-      return;
-    }
-    const output = _output as ToolMessage;
-    const { tool_call_id } = output;
-    const stepId = this.toolCallStepIds.get(tool_call_id) ?? '';
-    if (!stepId) {
-      throw new Error(`No stepId found for tool_call_id ${tool_call_id}`);
-    }
-
-    const runStep = this.getRunStep(stepId);
-    if (!runStep) {
-      throw new Error(`No run step found for stepId ${stepId}`);
-    }
-
-    /**
-     * Extract and store code execution session context from artifacts.
-     * Each file is stamped with its source session_id to support multi-session file tracking.
-     * When the same filename appears in a later execution, the newer version replaces the old.
-     */
-    const toolName = output.name;
-    if (
-      toolName === Constants.EXECUTE_CODE ||
-      toolName === Constants.PROGRAMMATIC_TOOL_CALLING
-    ) {
-      const artifact = output.artifact as t.CodeExecutionArtifact | undefined;
-      if (artifact?.session_id != null && artifact.session_id !== '') {
-        const newFiles = artifact.files ?? [];
-        const existingSession = this.sessions.get(Constants.EXECUTE_CODE) as
-          | t.CodeSessionContext
-          | undefined;
-        const existingFiles = existingSession?.files ?? [];
-
-        if (newFiles.length > 0) {
-          /**
-           * Stamp each new file with its source session_id.
-           * This enables files from different executions (parallel or sequential)
-           * to be tracked and passed to subsequent calls.
-           */
-          const filesWithSession: t.FileRefs = newFiles.map((file) => ({
-            ...file,
-            session_id: artifact.session_id,
-          }));
-
-          /**
-           * Merge files, preferring latest versions by name.
-           * If a file with the same name exists, replace it with the new version.
-           * This handles cases where files are edited/recreated in subsequent executions.
-           */
-          const newFileNames = new Set(filesWithSession.map((f) => f.name));
-          const filteredExisting = existingFiles.filter(
-            (f) => !newFileNames.has(f.name)
-          );
-
-          this.sessions.set(Constants.EXECUTE_CODE, {
-            session_id: artifact.session_id,
-            files: [...filteredExisting, ...filesWithSession],
-            lastUpdated: Date.now(),
-          });
-        } else {
-          /**
-           * Store session_id even without new files for session continuity.
-           * The CodeExecutor can fall back to the /files endpoint to discover
-           * session files not explicitly returned in the exec response.
-           */
-          this.sessions.set(Constants.EXECUTE_CODE, {
-            session_id: artifact.session_id,
-            files: existingFiles,
-            lastUpdated: Date.now(),
-          });
-        }
-      }
-    }
-
-    const dispatchedOutput =
-      typeof output.content === 'string'
-        ? output.content
-        : JSON.stringify(output.content);
-
-    const args = typeof input === 'string' ? input : input.input;
-    const tool_call = {
-      args: typeof args === 'string' ? args : JSON.stringify(args),
-      name: output.name ?? '',
-      id: output.tool_call_id,
-      output: omitOutput === true ? '' : dispatchedOutput,
-      progress: 1,
-    };
-
-    await this.handlerRegistry
-      ?.getHandler(GraphEvents.ON_RUN_STEP_COMPLETED)
-      ?.handle(
-        GraphEvents.ON_RUN_STEP_COMPLETED,
-        {
-          result: {
-            id: stepId,
-            index: runStep.index,
-            type: 'tool_call',
-            tool_call,
-          } as t.ToolCompleteEvent,
-        },
-        metadata,
-        this
-      );
-  }
   /**
    * Static version of handleToolCallError to avoid creating strong references
    * that prevent garbage collection

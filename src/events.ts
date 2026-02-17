@@ -1,9 +1,8 @@
 /* eslint-disable no-console */
 // src/events.ts
 import type {
-  ToolMessage,
-  UsageMetadata,
   BaseMessageFields,
+  UsageMetadata,
 } from '@langchain/core/messages';
 import type { MultiAgentGraph, StandardGraph } from '@/graphs';
 import type { Logger } from 'winston';
@@ -76,16 +75,19 @@ export class ModelEndHandler implements t.EventHandler {
 export class ToolEndHandler implements t.EventHandler {
   private callback?: t.ToolEndCallback;
   private logger?: Logger;
-  private omitOutput?: (name?: string) => boolean;
-  constructor(
-    callback?: t.ToolEndCallback,
-    logger?: Logger,
-    omitOutput?: (name?: string) => boolean
-  ) {
+  constructor(callback?: t.ToolEndCallback, logger?: Logger) {
     this.callback = callback;
     this.logger = logger;
-    this.omitOutput = omitOutput;
   }
+
+  /**
+   * Handles on_tool_end events from the for-await stream consumer.
+   *
+   * This handler is now purely a consumer callback — tool completion
+   * (ON_RUN_STEP_COMPLETED dispatch + session context storage) is handled
+   * in graph context by ToolNode directly, eliminating the race between
+   * the stream consumer and graph execution.
+   */
   async handle(
     event: string,
     data: t.StreamEventData | undefined,
@@ -119,11 +121,6 @@ export class ToolEndHandler implements t.EventHandler {
       if (this.callback) {
         await this.callback(toolEndData, metadata);
       }
-      await graph.handleToolCallCompleted(
-        { input: toolEndData.input, output: toolEndData.output },
-        metadata,
-        this.omitOutput?.((toolEndData.output as ToolMessage | undefined)?.name)
-      );
     } catch (error) {
       if (this.logger) {
         this.logger.error('Error handling tool_end event:', error);
