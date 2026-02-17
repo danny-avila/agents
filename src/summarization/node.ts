@@ -10,8 +10,8 @@ import type { AgentContext } from '@/agents/AgentContext';
 import type * as t from '@/types';
 import { ContentTypes, GraphEvents, StepTypes, Providers } from '@/common';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
-import { getChatModelClass } from '@/llm/providers';
 import { createRemoveAllMessage } from '@/messages/reducer';
+import { getChatModelClass } from '@/llm/providers';
 
 // ---------------------------------------------------------------------------
 // Constants
