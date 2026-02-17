@@ -84,6 +84,29 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   }
 
   /**
+   * Resolves a handoff tool call name that may be slightly wrong (e.g. LLM
+   * duplicated a suffix) to the actual direct tool name. When a match is found,
+   * we return a ToolMessage to the LLM with the correct name so it can call the
+   * right tool itself, instead of executing the handoff silently or dispatching
+   * via ON_TOOL_EXECUTE (where the host has no handoff tools).
+   */
+  private resolveHandoffToolName(callName: string): string | undefined {
+    if (
+      !callName.startsWith(Constants.LC_TRANSFER_TO_) ||
+      this.directToolNames == null ||
+      this.directToolNames.size === 0
+    ) {
+      return undefined;
+    }
+    const handoffDirect = Array.from(this.directToolNames).filter((d) =>
+      d.startsWith(Constants.LC_TRANSFER_TO_)
+    );
+    const prefixMatches = handoffDirect.filter((d) => callName.startsWith(d));
+    if (prefixMatches.length === 0) return undefined;
+    return prefixMatches.reduce((a, b) => (a.length >= b.length ? a : b));
+  }
+
+  /**
    * Returns cached programmatic tools, computing once on first access.
    * Single iteration builds both toolMap and toolDefs simultaneously.
    */
@@ -670,8 +693,28 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         const directCalls = filteredCalls.filter((c) =>
           this.directToolNames!.has(c.name)
         );
+        const handoffSentToEvent = filteredCalls.filter(
+          (c) =>
+            !this.directToolNames!.has(c.name) &&
+            c.name.startsWith(Constants.LC_TRANSFER_TO_)
+        );
+        const resolvedHandoffs: Array<{
+          call: ToolCall;
+          resolvedName: string;
+        }> = handoffSentToEvent
+          .map((c) => {
+            const resolved = this.resolveHandoffToolName(c.name);
+            return resolved != null
+              ? { call: c, resolvedName: resolved }
+              : null;
+          })
+          .filter(
+            (x): x is { call: ToolCall; resolvedName: string } => x !== null
+          );
         const eventCalls = filteredCalls.filter(
-          (c) => !this.directToolNames!.has(c.name)
+          (c) =>
+            !this.directToolNames!.has(c.name) &&
+            !resolvedHandoffs.some((r) => r.call === c)
         );
 
         const directOutputs: (BaseMessage | Command)[] =
@@ -681,8 +724,24 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             )
             : [];
 
+        const handoffCorrectionMessages: ToolMessage[] = resolvedHandoffs.map(
+          ({ call, resolvedName }) =>
+            new ToolMessage({
+              content: `The tool name you used does not match a registered handoff tool. You used: "${call.name}". The correct tool for this handoff is: "${resolvedName}". Please call that tool instead to transfer to the intended agent.`,
+              name: call.name,
+              tool_call_id: call.id ?? '',
+            })
+        );
+
         if (directCalls.length > 0 && directOutputs.length > 0) {
           this.handleRunToolCompletions(directCalls, directOutputs, config);
+        }
+        if (handoffCorrectionMessages.length > 0) {
+          this.handleRunToolCompletions(
+            resolvedHandoffs.map((r) => r.call),
+            handoffCorrectionMessages,
+            config
+          );
         }
 
         const eventOutputs: ToolMessage[] =
@@ -690,7 +749,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             ? await this.dispatchToolEvents(eventCalls, config)
             : [];
 
-        outputs = [...directOutputs, ...eventOutputs];
+        outputs = [
+          ...directOutputs,
+          ...handoffCorrectionMessages,
+          ...eventOutputs,
+        ];
       } else {
         outputs = await Promise.all(
           filteredCalls.map((call) => this.runTool(call, config))
