@@ -3,14 +3,11 @@
 import type {
   BaseMessageFields,
   UsageMetadata,
-  UsageMetadata,
-  ToolMessage,
 } from '@langchain/core/messages';
 import type { MultiAgentGraph, StandardGraph } from '@/graphs';
 import type { Logger } from 'winston';
 import type * as t from '@/types';
-import { Constants, GraphNodeKeys, Providers } from '@/common';
-import { handleToolCalls } from '@/tools/handlers';
+import { Constants } from '@/common';
 
 export class HandlerRegistry {
   private handlers: Map<string, t.EventHandler> = new Map();
@@ -44,39 +41,10 @@ export class ModelEndHandler implements t.EventHandler {
       return;
     }
 
-    const currentNode = metadata.langgraph_node as string | undefined;
     const usage = data?.output?.usage_metadata;
     if (usage != null && this.collectedUsage != null) {
       this.collectedUsage.push(usage);
     }
-
-    // Summarize nodes: collect usage above, but skip tool call handling
-    if (currentNode?.startsWith(GraphNodeKeys.SUMMARIZE) === true) {
-      return;
-    }
-
-    if (metadata.ls_provider === 'FakeListChatModel') {
-      return handleToolCalls(data?.output?.tool_calls, metadata, graph);
-    }
-
-    console.log(`====== ${event.toUpperCase()} ======`);
-    console.dir(
-      {
-        usage,
-      },
-      { depth: null }
-    );
-
-    const agentContext = graph.getAgentContext(metadata);
-
-    if (
-      agentContext.provider !== Providers.GOOGLE &&
-      agentContext.provider !== Providers.BEDROCK
-    ) {
-      return;
-    }
-
-    await handleToolCalls(data?.output?.tool_calls, metadata, graph);
   }
 }
 
