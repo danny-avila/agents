@@ -1053,7 +1053,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               { runId: this.runId, agentId }
             );
             console.warn(
-              `[agentus] Context overflow detected (attempt ${attempt}). ${agentContext.formatTokenBudgetBreakdown(finalMessages)}`
+              `[createCallModel] Context overflow detected (attempt ${attempt}). ${agentContext.formatTokenBudgetBreakdown(finalMessages)}`
             );
             // Apply emergency truncation to both tool results and tool-call
             // inputs with increasing aggressiveness per attempt.

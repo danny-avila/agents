@@ -498,7 +498,7 @@ function generateMetadataStub(messages: BaseMessage[]): string {
 // ---------------------------------------------------------------------------
 // Post-LLM summary enrichment
 // ---------------------------------------------------------------------------
-// Adapted from openclaw's compaction-safeguard pattern. After the LLM produces
+// After the LLM produces
 // its summary, mechanically append structured data that the LLM might miss:
 // tool failures and file operations. This guarantees these survive compaction
 // regardless of LLM quality.
