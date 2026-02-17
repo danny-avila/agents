@@ -2,8 +2,7 @@
  * Ingestion-time and pre-flight truncation utilities for tool results.
  *
  * Prevents oversized tool outputs from entering the message array and
- * consuming the entire context window. Inspired by openclaw's
- * session-tool-result-guard and tool-result-truncation patterns.
+ * consuming the entire context window.
  */
 
 /**

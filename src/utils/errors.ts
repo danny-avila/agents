@@ -5,8 +5,6 @@
  * exceeded the model's context window. Used by the overflow recovery loop
  * to decide whether to retry with truncation/compaction vs. propagating
  * the error.
- *
- * Ported from openclaw's pi-embedded-helpers/errors.ts patterns.
  */
 
 /**

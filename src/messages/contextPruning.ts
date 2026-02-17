@@ -1,8 +1,7 @@
 /**
  * Position-based context pruning for tool results.
  *
- * Adapted from openclaw's context-pruning/pruner.ts. Since agentus doesn't have
- * per-message timestamps, we use position-based age: the distance of a message
+ * Uses position-based age: the distance of a message
  * from the conversation end as a fraction of total messages.
  *
  * Two degradation levels:
