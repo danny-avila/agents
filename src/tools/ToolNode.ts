@@ -404,6 +404,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       const request = requests.find((r) => r.id === result.toolCallId);
       const toolName = request?.name ?? 'unknown';
       const stepId = this.toolCallStepIds?.get(result.toolCallId) ?? '';
+      if (!stepId) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[ToolNode] toolCallStepIds missing entry for toolCallId=${result.toolCallId} (tool=${toolName}). ` +
+            'This indicates a race between the stream consumer and graph execution. ' +
+            `Map size: ${this.toolCallStepIds?.size ?? 0}`
+        );
+      }
 
       let toolMessage: ToolMessage;
       let contentString: string;

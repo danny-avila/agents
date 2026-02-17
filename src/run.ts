@@ -190,12 +190,6 @@ export class Run<_T extends t.BaseGraphState> {
       tags?: string[],
       metadata?: Record<string, unknown>
     ): Promise<void> => {
-      if (
-        (data as t.StreamEventData)['emitted'] === true &&
-        eventName === GraphEvents.CHAT_MODEL_STREAM
-      ) {
-        return;
-      }
       const handler = this.handlerRegistry?.getHandler(eventName);
       if (handler && this.Graph) {
         return await handler.handle(

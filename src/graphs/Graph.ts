@@ -24,6 +24,7 @@ import {
 } from '@langchain/core/messages';
 import type {
   BaseMessageFields,
+  MessageContent,
   UsageMetadata,
   BaseMessage,
 } from '@langchain/core/messages';
@@ -42,12 +43,13 @@ import {
   ensureThinkingBlockInMessages,
   convertMessagesToContent,
   addBedrockCacheControl,
+  extractToolDiscoveries,
   modifyDeltaProperties,
   formatArtifactPayload,
   formatContentStrings,
   createPruneMessages,
   addCacheControl,
-  extractToolDiscoveries,
+  getMessageId,
 } from '@/messages';
 import {
   resetIfNotEmpty,
@@ -63,6 +65,8 @@ import { safeDispatchCustomEvent } from '@/utils/events';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { AgentContext } from '@/agents/AgentContext';
 import { createFakeStreamingLLM } from '@/llm/fake';
+import { ChatModelStreamHandler } from '@/stream';
+import { handleToolCalls } from '@/tools/handlers';
 import { HandlerRegistry } from '@/events';
 
 const { AGENT, TOOLS } = GraphNodeKeys;
@@ -197,7 +201,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       this.contentIndexMap = resetIfNotEmpty(this.contentIndexMap, new Map());
     }
     this.stepKeyIds = resetIfNotEmpty(this.stepKeyIds, new Map());
-    this.toolCallStepIds = resetIfNotEmpty(this.toolCallStepIds, new Map());
+    /**
+     * Clear in-place instead of replacing with a new Map to preserve the
+     * shared reference held by ToolNode (passed at construction time).
+     * Using resetIfNotEmpty would create a new Map, leaving ToolNode with
+     * a stale reference on 2nd+ processStream calls.
+     */
+    this.toolCallStepIds.clear();
     this.messageIdsByStepKey = resetIfNotEmpty(
       this.messageIdsByStepKey,
       new Map()
@@ -613,7 +623,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       currentModel,
       finalMessages,
       provider,
-      tools,
+      tools: _tools,
     }: {
       currentModel?: t.ChatModel;
       finalMessages: BaseMessage[];
@@ -627,23 +637,54 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       throw new Error('No model found');
     }
 
-    if ((tools?.length ?? 0) > 0 && manualToolStreamProviders.has(provider)) {
-      if (!model.stream) {
-        throw new Error('Model does not support stream');
-      }
+    if (model.stream) {
+      /**
+       * Process all model output through a local ChatModelStreamHandler in the
+       * graph execution context. Each chunk is awaited before the next one is
+       * consumed, so by the time the stream is exhausted every run step
+       * (MESSAGE_CREATION, TOOL_CALLS) has been created and toolCallStepIds is
+       * fully populated — the graph will not transition to ToolNode until this
+       * is done.
+       *
+       * This replaces the previous pattern where ChatModelStreamHandler lived
+       * in the for-await stream consumer (handler registry). That consumer
+       * runs concurrently with graph execution, so the graph could advance to
+       * ToolNode before the consumer had processed all events. By handling
+       * chunks here, inside the agent node, the race is eliminated.
+       *
+       * The for-await consumer no longer needs a ChatModelStreamHandler; its
+       * on_chat_model_stream events are simply ignored (no handler registered).
+       * The dispatched custom events (ON_RUN_STEP, ON_MESSAGE_DELTA, etc.)
+       * still reach the content aggregator and SSE handlers through the custom
+       * event callback in Run.createCustomEventCallback.
+       */
+      const metadata = config?.metadata as Record<string, unknown> | undefined;
+      const streamHandler = new ChatModelStreamHandler();
       const stream = await model.stream(finalMessages, config);
       let finalChunk: AIMessageChunk | undefined;
       for await (const chunk of stream) {
-        await safeDispatchCustomEvent(
+        await streamHandler.handle(
           GraphEvents.CHAT_MODEL_STREAM,
-          { chunk, emitted: true },
-          config
+          { chunk },
+          metadata,
+          this
         );
         finalChunk = finalChunk ? concat(finalChunk, chunk) : chunk;
       }
-      finalChunk = modifyDeltaProperties(provider, finalChunk);
+
+      if (manualToolStreamProviders.has(provider)) {
+        finalChunk = modifyDeltaProperties(provider, finalChunk);
+      }
+
+      if ((finalChunk?.tool_calls?.length ?? 0) > 0) {
+        finalChunk!.tool_calls = finalChunk!.tool_calls?.filter(
+          (tool_call: ToolCall) => !!tool_call.name
+        );
+      }
+
       return { messages: [finalChunk as AIMessageChunk] };
     } else {
+      /** Fallback for models without stream support. */
       const finalMessage = await model.invoke(finalMessages, config);
       if ((finalMessage.tool_calls?.length ?? 0) > 0) {
         finalMessage.tool_calls = finalMessage.tool_calls?.filter(
@@ -907,6 +948,128 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       if (!result) {
         throw new Error('No result after model invocation');
       }
+
+      /**
+       * Fallback: populate toolCallStepIds in the graph execution context.
+       *
+       * When model.stream() is available (the common case), attemptInvoke
+       * processes all chunks through a local ChatModelStreamHandler which
+       * creates run steps and populates toolCallStepIds before returning.
+       * The code below is a fallback for the rare case where model.stream
+       * is unavailable and model.invoke() was used instead.
+       *
+       * Text content is dispatched FIRST so that MESSAGE_CREATION is the
+       * current step when handleToolCalls runs. handleToolCalls then creates
+       * TOOL_CALLS on top of it. The dedup in getMessageId and
+       * toolCallStepIds.has makes this safe when attemptInvoke already
+       * handled everything — both paths become no-ops.
+       */
+      const responseMessage = result.messages?.[0];
+      const toolCalls = (responseMessage as AIMessageChunk | undefined)
+        ?.tool_calls;
+      const hasToolCalls = Array.isArray(toolCalls) && toolCalls.length > 0;
+
+      if (hasToolCalls) {
+        const metadata = config.metadata as Record<string, unknown>;
+        const stepKey = this.getStepKey(metadata);
+        const content = responseMessage?.content as MessageContent | undefined;
+        const hasTextContent =
+          content != null &&
+          (typeof content === 'string'
+            ? content !== ''
+            : Array.isArray(content) && content.length > 0);
+
+        /**
+         * Dispatch text content BEFORE creating TOOL_CALLS steps.
+         * getMessageId returns a new ID only on the first call for a step key;
+         * if the for-await consumer already claimed it, this is a no-op.
+         */
+        if (hasTextContent) {
+          const messageId = getMessageId(stepKey, this) ?? '';
+          if (messageId) {
+            await this.dispatchRunStep(
+              stepKey,
+              {
+                type: StepTypes.MESSAGE_CREATION,
+                message_creation: { message_id: messageId },
+              },
+              metadata
+            );
+            const stepId = this.getStepIdByKey(stepKey);
+            if (typeof content === 'string') {
+              await this.dispatchMessageDelta(stepId, {
+                content: [{ type: ContentTypes.TEXT, text: content }],
+              });
+            } else if (
+              Array.isArray(content) &&
+              content.every(
+                (c) =>
+                  typeof c === 'object' &&
+                  'type' in c &&
+                  typeof c.type === 'string' &&
+                  c.type.startsWith('text')
+              )
+            ) {
+              await this.dispatchMessageDelta(stepId, {
+                content: content as t.MessageDelta['content'],
+              });
+            }
+          }
+        }
+
+        await handleToolCalls(toolCalls as ToolCall[], metadata, this);
+      }
+
+      /**
+       * When streaming is disabled, on_chat_model_stream events are never
+       * emitted so ChatModelStreamHandler never fires. Dispatch the text
+       * content as MESSAGE_CREATION + MESSAGE_DELTA here.
+       */
+      const disableStreaming =
+        (agentContext.clientOptions as t.OpenAIClientOptions | undefined)
+          ?.disableStreaming === true;
+
+      if (
+        disableStreaming &&
+        !hasToolCalls &&
+        responseMessage != null &&
+        (responseMessage.content as MessageContent | undefined) != null
+      ) {
+        const metadata = config.metadata as Record<string, unknown>;
+        const stepKey = this.getStepKey(metadata);
+        const messageId = getMessageId(stepKey, this) ?? '';
+        if (messageId) {
+          await this.dispatchRunStep(
+            stepKey,
+            {
+              type: StepTypes.MESSAGE_CREATION,
+              message_creation: { message_id: messageId },
+            },
+            metadata
+          );
+        }
+        const stepId = this.getStepIdByKey(stepKey);
+        const content = responseMessage.content;
+        if (typeof content === 'string') {
+          await this.dispatchMessageDelta(stepId, {
+            content: [{ type: ContentTypes.TEXT, text: content }],
+          });
+        } else if (
+          Array.isArray(content) &&
+          content.every(
+            (c) =>
+              typeof c === 'object' &&
+              'type' in c &&
+              typeof c.type === 'string' &&
+              c.type.startsWith('text')
+          )
+        ) {
+          await this.dispatchMessageDelta(stepId, {
+            content: content as t.MessageDelta['content'],
+          });
+        }
+      }
+
       agentContext.currentUsage = this.getUsageMetadata(result.messages?.[0]);
       this.cleanupSignalListener();
       return result;
