@@ -767,6 +767,7 @@ export function createSummarizeNode({
           priorSummaryText,
           config: summarizeConfig,
           streaming,
+          stepId,
           maxSummaryTokens: effectiveMaxSummaryTokens,
         });
       } else {
@@ -778,6 +779,7 @@ export function createSummarizeNode({
           priorSummaryText,
           config: summarizeConfig,
           streaming,
+          stepId,
         });
       }
     } catch {
@@ -803,6 +805,7 @@ export function createSummarizeNode({
           priorSummaryText,
           config: summarizeConfig,
           streaming,
+          stepId,
           budgetChars: Math.floor(CHUNK_BUDGET_CHARS / 2),
         });
       } catch {
@@ -1003,6 +1006,8 @@ interface SummarizeParams {
   config?: RunnableConfig;
   /** When false, disables streaming (uses invoke instead of stream). Defaults to true. */
   streaming?: boolean;
+  /** Step ID for dispatching ON_SUMMARIZE_DELTA events during streaming. */
+  stepId?: string;
 }
 
 /**
@@ -1019,26 +1024,27 @@ function extractResponseText(response: { content: string | object }): string {
 
 /**
  * Streams an LLM call and collects the full response text.
- * Uses `model.stream()` when available so that native `on_chat_model_stream`
- * events flow through the graph to `ChatModelStreamHandler`, which handles
- * dispatching `ON_SUMMARIZE_DELTA` events to the client.
+ * Dispatches `ON_SUMMARIZE_DELTA` events directly for each chunk so the
+ * client can render streaming summarization output in real time.
  * Falls back to `model.invoke()` when streaming isn't supported or is disabled.
  *
  * @param streaming - When false, forces invoke() even if model supports stream().
  *   Defaults to true.
+ * @param stepId - Step ID for dispatching ON_SUMMARIZE_DELTA events.
  */
 async function streamAndCollect(
   model: SummarizeModel,
   messages: BaseMessage[],
   config?: RunnableConfig,
-  streaming = true
+  streaming = true,
+  stepId?: string
 ): Promise<string> {
   if (!streaming || typeof model.stream !== 'function') {
     const response = await model.invoke(messages, config);
     return extractResponseText(response);
   }
 
-  let fullText = '';
+  const chunks: string[] = [];
   const stream = await model.stream(messages, config);
   for await (const chunk of stream) {
     const text =
@@ -1046,10 +1052,28 @@ async function streamAndCollect(
         ? chunk.content
         : JSON.stringify(chunk.content);
     if (text) {
-      fullText += text;
+      chunks.push(text);
+      if (stepId != null && stepId !== '' && config) {
+        safeDispatchCustomEvent(
+          GraphEvents.ON_SUMMARIZE_DELTA,
+          {
+            id: stepId,
+            delta: {
+              summary: {
+                type: ContentTypes.SUMMARY,
+                text,
+                tokenCount: 0,
+                provider: String(config.metadata?.summarization_provider ?? ''),
+                model: String(config.metadata?.summarization_model ?? ''),
+              },
+            },
+          } satisfies t.SummarizeDeltaEvent,
+          config
+        );
+      }
     }
   }
-  return fullText.trim();
+  return chunks.join('').trim();
 }
 
 /**
@@ -1064,6 +1088,7 @@ async function summarizeSinglePass({
   priorSummaryText,
   config,
   streaming,
+  stepId,
   budgetChars,
 }: SummarizeParams & { budgetChars?: number }): Promise<string> {
   const formattedText = formatMessagesForSummarization(messages, budgetChars);
@@ -1095,7 +1120,8 @@ async function summarizeSinglePass({
     model,
     [new SystemMessage(effectivePrompt), new HumanMessage(humanMessageText)],
     traceConfig(config, 'single_pass'),
-    streaming
+    streaming,
+    stepId
   );
 }
 
@@ -1131,6 +1157,7 @@ async function summarizeInStages({
   priorSummaryText,
   config,
   streaming,
+  stepId,
   maxSummaryTokens,
 }: SummarizeParams & {
   parts: number;
@@ -1165,6 +1192,7 @@ async function summarizeInStages({
       priorSummaryText,
       config,
       streaming,
+      stepId,
     });
   }
 
@@ -1223,7 +1251,8 @@ async function summarizeInStages({
         chunk_index: i,
         total_chunks: chunks.length,
       }),
-      streaming
+      streaming,
+      stepId
     );
 
     if (text) {
