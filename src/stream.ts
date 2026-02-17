@@ -17,7 +17,6 @@ import {
   handleToolCallChunks,
   handleToolCalls,
 } from '@/tools/handlers';
-import { handleSummarizeStream } from '@/summarization/stream';
 import { getMessageId } from '@/messages';
 
 /**
@@ -148,10 +147,6 @@ export class ChatModelStreamHandler implements t.EventHandler {
     }
     if (!graph.config) {
       throw new Error('Config not found in graph');
-    }
-
-    if (await handleSummarizeStream(data, metadata, graph)) {
-      return;
     }
 
     if (!data.chunk) {
