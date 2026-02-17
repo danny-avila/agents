@@ -231,6 +231,14 @@ export class AgentContext {
   private summaryText?: string;
   /** Token count of the current summary (tracked for token accounting) */
   private summaryTokenCount: number = 0;
+  /**
+   * Durable summary that survives reset() calls. Set from initialSummary
+   * during fromConfig() and updated by setSummary() so that the latest
+   * summary (whether cross-run or intra-run) is always restored after
+   * processStream's resetValues() cycle.
+   */
+  private _durableSummaryText?: string;
+  private _durableSummaryTokenCount: number = 0;
   /** Number of summarization cycles that have occurred for this agent context */
   private _summaryVersion: number = 0;
   /**
@@ -578,9 +586,13 @@ export class AgentContext {
     this.discoveredToolNames.clear();
     this.handoffContext = undefined;
 
-    this.summaryText = undefined;
-    this.summaryTokenCount = 0;
-    this._summaryVersion = 0;
+    // Restore the durable summary (from initialSummary or the last
+    // summarization node output) so the system message retains conversation
+    // context across processStream resets.
+    this.summaryText = this._durableSummaryText;
+    this.summaryTokenCount = this._durableSummaryTokenCount;
+    // Reset per-run summarization counters but preserve the summary version
+    // so downstream consumers can still distinguish updated summaries.
     this._lastSummarizationMsgCount = 0;
     this._summarizationCountThisRun = 0;
     this.lastCallUsage = undefined;
@@ -728,6 +740,11 @@ export class AgentContext {
   setSummary(text: string, tokenCount: number): void {
     this.summaryText = text;
     this.summaryTokenCount = tokenCount;
+    // Persist to durable storage so the summary survives reset() calls.
+    // This covers both cross-run summaries (initialSummary) and intra-run
+    // summaries produced by the summarization node.
+    this._durableSummaryText = text;
+    this._durableSummaryTokenCount = tokenCount;
     this._summaryVersion += 1;
     this.systemRunnableStale = true;
     // Force pruner recreation: after summarization, the summarize node removes
@@ -801,6 +818,8 @@ export class AgentContext {
     if (this.summaryText != null) {
       this.summaryText = undefined;
       this.summaryTokenCount = 0;
+      this._durableSummaryText = undefined;
+      this._durableSummaryTokenCount = 0;
       this.systemRunnableStale = true;
     }
   }
