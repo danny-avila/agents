@@ -495,7 +495,16 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
       streamConfig
     );
 
-    // By now summarization should have fired
+    // By now summarization should have fired; if not, progressively tighten
+    // the context to force pruning (which triggers summarization).
+    if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
+      run = await createRun(350);
+      await runTurn(
+        { run, conversationHistory },
+        'What is 777 * 777? Calculator.',
+        streamConfig
+      );
+    }
     if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
       run = await createRun(300);
       await runTurn(

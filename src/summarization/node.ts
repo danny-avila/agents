@@ -35,14 +35,15 @@ const LIMITS = {
 } as const;
 
 /**
- * Total character budget for a single summarization chunk.
- * ~20K chars ≈ ~5K tokens, leaving room for the system prompt + prior summary
- * within a typical summarization model's context.
+ * Token budget for a single summarization chunk.
+ * When tokenCounter is available, actual token counts are used for
+ * chunking/splitting decisions. The char-based formatting budget is
+ * derived from this via a ~4:1 chars-per-token ratio.
  */
-const CHUNK_BUDGET_CHARS = 20_000;
+const CHUNK_BUDGET_TOKENS = 10_000;
 
-/** Default number of parts for multi-stage summarization. */
-const DEFAULT_PARTS = 2;
+/** Default number of parts for multi-stage summarization (1 = single-pass). */
+const DEFAULT_PARTS = 1;
 
 /** Minimum messages before multi-stage split is attempted. */
 const DEFAULT_MIN_MESSAGES_FOR_SPLIT = 4;
@@ -200,7 +201,7 @@ function formatMessageForSummary(msg: BaseMessage): string {
  */
 function formatMessagesForSummarization(
   messages: BaseMessage[],
-  budgetChars: number = CHUNK_BUDGET_CHARS
+  budgetChars: number = CHUNK_BUDGET_TOKENS * 4
 ): string {
   const formatted = messages.map(formatMessageForSummary);
 
@@ -232,27 +233,27 @@ const SAFETY_MARGIN = 1.2;
 
 /**
  * Computes the minimum number of chunks needed based on content density.
- * When average message size is large relative to the chunk budget, the chunk
- * count increases proportionally. This prevents oversized chunks that would
- * overflow the summarization model's context.
+ * When average message token weight is large relative to the chunk budget,
+ * the chunk count increases proportionally. This prevents oversized chunks
+ * that would overflow the summarization model's context.
  *
- * @param messages - Messages to be chunked.
- * @param totalCharWeight - Total character weight across all messages.
- * @param chunkBudgetChars - Character budget per chunk (e.g., CHUNK_BUDGET_CHARS).
+ * @param messageCount - Number of messages to be chunked.
+ * @param totalTokenWeight - Total token weight across all messages.
+ * @param chunkBudgetTokens - Token budget per chunk (e.g., CHUNK_BUDGET_TOKENS).
  * @returns Minimum number of chunks to use.
  */
 function computeAdaptiveChunkCount(params: {
-  messages: BaseMessage[];
-  totalCharWeight: number;
-  chunkBudgetChars: number;
+  messageCount: number;
+  totalTokenWeight: number;
+  chunkBudgetTokens: number;
 }): number {
-  const { messages, totalCharWeight, chunkBudgetChars } = params;
-  if (messages.length === 0 || chunkBudgetChars <= 0) {
+  const { messageCount, totalTokenWeight, chunkBudgetTokens } = params;
+  if (messageCount === 0 || chunkBudgetTokens <= 0) {
     return 1;
   }
 
-  const avgMessageChars = totalCharWeight / messages.length;
-  const budgetFraction = avgMessageChars / chunkBudgetChars;
+  const avgMessageTokens = totalTokenWeight / messageCount;
+  const budgetFraction = avgMessageTokens / chunkBudgetTokens;
 
   // Scale the per-chunk ratio down when messages are large.
   // At budgetFraction >= 0.25, ratio starts decreasing from BASE toward MIN.
@@ -261,9 +262,9 @@ function computeAdaptiveChunkCount(params: {
       ? Math.max(MIN_CHUNK_RATIO, BASE_CHUNK_RATIO * (1 - budgetFraction))
       : BASE_CHUNK_RATIO;
 
-  const effectiveBudget = chunkBudgetChars * effectiveRatio;
+  const effectiveBudget = chunkBudgetTokens * effectiveRatio;
   const estimatedChunks = Math.ceil(
-    (totalCharWeight * SAFETY_MARGIN) / effectiveBudget
+    (totalTokenWeight * SAFETY_MARGIN) / effectiveBudget
   );
 
   return Math.max(1, estimatedChunks);
@@ -274,26 +275,20 @@ function computeAdaptiveChunkCount(params: {
 // ---------------------------------------------------------------------------
 
 /**
- * Splits messages into `parts` groups of roughly equal token weight.
- * Uses character length as a proxy for tokens (sufficient for splitting).
+ * Splits messages into `parts` groups of roughly equal weight.
+ * Accepts pre-computed weights (token counts when available, char estimates
+ * otherwise) so the caller controls the weighting strategy.
  */
-function splitMessagesByCharShare(
+function splitMessagesByWeight(
   messages: BaseMessage[],
-  parts: number
+  parts: number,
+  weights: number[]
 ): BaseMessage[][] {
   if (messages.length === 0 || parts <= 1) {
     return [messages];
   }
   const normalizedParts = Math.min(parts, messages.length);
 
-  // Estimate character weight per message
-  const weights = messages.map((msg) => {
-    const content =
-      typeof msg.content === 'string'
-        ? msg.content
-        : JSON.stringify(msg.content);
-    return content.length;
-  });
   const totalWeight = weights.reduce((sum, w) => sum + w, 0);
   const targetWeight = totalWeight / normalizedParts;
 
@@ -769,6 +764,7 @@ export function createSummarizeNode({
           streaming,
           stepId,
           maxSummaryTokens: effectiveMaxSummaryTokens,
+          tokenCounter: agentContext.tokenCounter,
         });
       } else {
         summaryText = await summarizeSinglePass({
@@ -780,6 +776,7 @@ export function createSummarizeNode({
           config: summarizeConfig,
           streaming,
           stepId,
+          tokenCounter: agentContext.tokenCounter,
         });
       }
     } catch {
@@ -806,7 +803,8 @@ export function createSummarizeNode({
           config: summarizeConfig,
           streaming,
           stepId,
-          budgetChars: Math.floor(CHUNK_BUDGET_CHARS / 2),
+          budgetChars: Math.floor((CHUNK_BUDGET_TOKENS * 4) / 2),
+          tokenCounter: agentContext.tokenCounter,
         });
       } catch {
         // S2b: Log tier 2 failure, falling back to tier 3
@@ -1008,6 +1006,8 @@ interface SummarizeParams {
   streaming?: boolean;
   /** Step ID for dispatching ON_SUMMARIZE_DELTA events during streaming. */
   stepId?: string;
+  /** Token counter from the graph's agent context. When provided, enables accurate token-based budgeting for chunking decisions. */
+  tokenCounter?: (msg: BaseMessage) => number;
 }
 
 /**
@@ -1137,7 +1137,7 @@ const CHUNK_CONTINUATION_PREFIX =
 
 /**
  * Multi-stage summarization via progressive chaining:
- *   1. Split messages into chunks by character weight (adaptive sizing)
+ *   1. Split messages into chunks by token weight (adaptive sizing)
  *   2. Summarize chunks sequentially — each chunk's summary becomes
  *      context for the next, preserving temporal ordering
  *
@@ -1159,28 +1159,40 @@ async function summarizeInStages({
   streaming,
   stepId,
   maxSummaryTokens,
+  tokenCounter,
 }: SummarizeParams & {
   parts: number;
   maxSummaryTokens?: number;
 }): Promise<string> {
-  // Compute total character weight for adaptive sizing.
-  const totalCharWeight = messages.reduce((sum, msg) => {
+  // Compute per-message token weights for chunking decisions.
+  // When tokenCounter is available, uses accurate token counts;
+  // otherwise falls back to chars/4 estimate.
+  const weights = messages.map((msg) => {
+    if (tokenCounter) {
+      return tokenCounter(msg);
+    }
     const content =
       typeof msg.content === 'string'
         ? msg.content
         : JSON.stringify(msg.content);
-    return sum + content.length;
-  }, 0);
-
-  // The user-configured `parts` acts as a minimum; adaptive sizing may increase it.
-  const adaptiveParts = computeAdaptiveChunkCount({
-    messages,
-    totalCharWeight,
-    chunkBudgetChars: CHUNK_BUDGET_CHARS,
+    return Math.ceil(content.length / 4);
   });
-  const effectiveParts = Math.max(parts, adaptiveParts);
+  const totalTokenWeight = weights.reduce((sum, w) => sum + w, 0);
 
-  const chunks = splitMessagesByCharShare(messages, effectiveParts);
+  // Adaptive sizing only applies when multi-stage was explicitly requested
+  // (parts > 1). With the default parts = 1, this is bypassed entirely
+  // to preserve single-pass behavior.
+  let effectiveParts = parts;
+  if (parts > 1) {
+    const adaptiveParts = computeAdaptiveChunkCount({
+      messageCount: messages.length,
+      totalTokenWeight,
+      chunkBudgetTokens: CHUNK_BUDGET_TOKENS,
+    });
+    effectiveParts = Math.max(parts, adaptiveParts);
+  }
+
+  const chunks = splitMessagesByWeight(messages, effectiveParts, weights);
 
   // If splitting didn't produce multiple chunks, fall back to single-pass
   if (chunks.length <= 1) {
@@ -1206,7 +1218,7 @@ async function summarizeInStages({
   // actual messages still get the majority of the summarizer's attention.
   const maxSummaryChars = Math.min(
     (maxSummaryTokens ?? 2048) * 4,
-    Math.floor(CHUNK_BUDGET_CHARS * 0.4)
+    Math.floor(CHUNK_BUDGET_TOKENS * 4 * 0.4)
   );
 
   for (let i = 0; i < chunks.length; i++) {

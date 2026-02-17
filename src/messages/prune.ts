@@ -1215,11 +1215,14 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     });
 
     // Pre-flight truncation: truncate oversized tool results before pruning.
-    // Uses effectiveMaxTokens (after instruction overhead) so thresholds reflect
-    // the real budget available for messages.
+    // Uses the raw maxContextTokens (total context window) so the 30% threshold
+    // in calculateMaxToolResultChars reflects the model's capacity, not the
+    // post-deduction budget. Using effectiveMaxTokens here was overly aggressive
+    // for tight contexts — it could truncate small tool results and destroy
+    // information needed by post-LLM enrichment (e.g., error messages).
     const preFlightResultCount = preFlightTruncateToolResults({
       messages: params.messages,
-      maxContextTokens: effectiveMaxTokens,
+      maxContextTokens: factoryParams.maxTokens,
       indexTokenCountMap,
       tokenCounter: factoryParams.tokenCounter,
     });
@@ -1227,7 +1230,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     // Pre-flight truncation: truncate oversized tool_use inputs (args) in AI messages.
     const preFlightInputCount = preFlightTruncateToolCallInputs({
       messages: params.messages,
-      maxContextTokens: effectiveMaxTokens,
+      maxContextTokens: factoryParams.maxTokens,
       indexTokenCountMap,
       tokenCounter: factoryParams.tokenCounter,
     });
