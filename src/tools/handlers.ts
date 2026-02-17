@@ -4,7 +4,7 @@ import { nanoid } from 'nanoid';
 import { ToolMessage } from '@langchain/core/messages';
 import type { AnthropicWebSearchResultBlockParam } from '@/llm/anthropic/types';
 import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
-import type { MultiAgentGraph, StandardGraph } from '@/graphs';
+import type { Graph, MultiAgentGraph, StandardGraph } from '@/graphs';
 import type { AgentContext } from '@/agents/AgentContext';
 import type * as t from '@/types';
 import {
@@ -127,7 +127,7 @@ export async function handleToolCallChunks({
 export const handleToolCalls = async (
   toolCalls?: ToolCall[],
   metadata?: Record<string, unknown>,
-  graph?: StandardGraph | MultiAgentGraph
+  graph?: Graph | StandardGraph | MultiAgentGraph
 ): Promise<void> => {
   if (!graph || !metadata) {
     console.warn('Graph or metadata not found in `handleToolCalls`');

@@ -4,13 +4,7 @@ import { nanoid } from 'nanoid';
 import { concat } from '@langchain/core/utils/stream';
 import { ToolNode } from '@langchain/langgraph/prebuilt';
 import { ChatVertexAI } from '@langchain/google-vertexai';
-import {
-  START,
-  END,
-  Command,
-  StateGraph,
-  Annotation,
-} from '@langchain/langgraph';
+import { START, END, StateGraph, Annotation } from '@langchain/langgraph';
 import { messagesStateReducer } from '@/messages/reducer';
 import {
   Runnable,
@@ -24,31 +18,32 @@ import {
 } from '@langchain/core/messages';
 import type {
   BaseMessageFields,
+  MessageContent,
   UsageMetadata,
   BaseMessage,
 } from '@langchain/core/messages';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
 import {
-  GraphNodeKeys,
-  ContentTypes,
-  GraphEvents,
-  Providers,
-  StepTypes,
-  Constants,
-} from '@/common';
-import {
   formatAnthropicArtifactContent,
   ensureThinkingBlockInMessages,
   convertMessagesToContent,
   addBedrockCacheControl,
+  extractToolDiscoveries,
   modifyDeltaProperties,
   formatArtifactPayload,
   formatContentStrings,
   createPruneMessages,
   addCacheControl,
-  extractToolDiscoveries,
+  getMessageId,
 } from '@/messages';
+import {
+  GraphNodeKeys,
+  ContentTypes,
+  GraphEvents,
+  Providers,
+  StepTypes,
+} from '@/common';
 import {
   resetIfNotEmpty,
   isOpenAILike,
@@ -63,6 +58,8 @@ import { safeDispatchCustomEvent } from '@/utils/events';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { AgentContext } from '@/agents/AgentContext';
 import { createFakeStreamingLLM } from '@/llm/fake';
+import { handleToolCalls } from '@/tools/handlers';
+import { ChatModelStreamHandler } from '@/stream';
 import { HandlerRegistry } from '@/events';
 
 const { AGENT, TOOLS } = GraphNodeKeys;
@@ -115,12 +112,6 @@ export abstract class Graph<
     stepId: string,
     delta: t.ReasoningDelta
   ): Promise<void>;
-  abstract handleToolCallCompleted(
-    data: t.ToolEndData,
-    metadata?: Record<string, unknown>,
-    omitOutput?: boolean
-  ): Promise<void>;
-
   abstract createCallModel(
     agentId?: string,
     currentModel?: t.ChatModel
@@ -196,7 +187,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       this.contentIndexMap = resetIfNotEmpty(this.contentIndexMap, new Map());
     }
     this.stepKeyIds = resetIfNotEmpty(this.stepKeyIds, new Map());
-    this.toolCallStepIds = resetIfNotEmpty(this.toolCallStepIds, new Map());
+    /**
+     * Clear in-place instead of replacing with a new Map to preserve the
+     * shared reference held by ToolNode (passed at construction time).
+     * Using resetIfNotEmpty would create a new Map, leaving ToolNode with
+     * a stale reference on 2nd+ processStream calls.
+     */
+    this.toolCallStepIds.clear();
     this.messageIdsByStepKey = resetIfNotEmpty(
       this.messageIdsByStepKey,
       new Map()
@@ -612,7 +609,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       currentModel,
       finalMessages,
       provider,
-      tools,
+      tools: _tools,
     }: {
       currentModel?: t.ChatModel;
       finalMessages: BaseMessage[];
@@ -626,24 +623,60 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       throw new Error('No model found');
     }
 
-    if ((tools?.length ?? 0) > 0 && manualToolStreamProviders.has(provider)) {
+    if ((_tools?.length ?? 0) > 0 && manualToolStreamProviders.has(provider)) {
       if (!model.stream) {
         throw new Error('Model does not support stream');
       }
+    }
 
+    if (model.stream) {
+      /**
+       * Process all model output through a local ChatModelStreamHandler in the
+       * graph execution context. Each chunk is awaited before the next one is
+       * consumed, so by the time the stream is exhausted every run step
+       * (MESSAGE_CREATION, TOOL_CALLS) has been created and toolCallStepIds is
+       * fully populated — the graph will not transition to ToolNode until this
+       * is done.
+       *
+       * This replaces the previous pattern where ChatModelStreamHandler lived
+       * in the for-await stream consumer (handler registry). That consumer
+       * runs concurrently with graph execution, so the graph could advance to
+       * ToolNode before the consumer had processed all events. By handling
+       * chunks here, inside the agent node, the race is eliminated.
+       *
+       * The for-await consumer no longer needs a ChatModelStreamHandler; its
+       * on_chat_model_stream events are simply ignored (no handler registered).
+       * The dispatched custom events (ON_RUN_STEP, ON_MESSAGE_DELTA, etc.)
+       * still reach the content aggregator and SSE handlers through the custom
+       * event callback in Run.createCustomEventCallback.
+       */
+      const metadata = config?.metadata as Record<string, unknown> | undefined;
+      const streamHandler = new ChatModelStreamHandler();
       const stream = await model.stream(finalMessages, config);
       let finalChunk: AIMessageChunk | undefined;
       for await (const chunk of stream) {
-        await safeDispatchCustomEvent(
+        await streamHandler.handle(
           GraphEvents.CHAT_MODEL_STREAM,
-          { chunk, emitted: true },
-          config
+          { chunk },
+          metadata,
+          this
         );
         finalChunk = finalChunk ? concat(finalChunk, chunk) : chunk;
       }
-      finalChunk = modifyDeltaProperties(provider, finalChunk);
+
+      if (manualToolStreamProviders.has(provider)) {
+        finalChunk = modifyDeltaProperties(provider, finalChunk);
+      }
+
+      if ((finalChunk?.tool_calls?.length ?? 0) > 0) {
+        finalChunk!.tool_calls = finalChunk!.tool_calls?.filter(
+          (tool_call: ToolCall) => !!tool_call.name
+        );
+      }
+
       return { messages: [finalChunk as AIMessageChunk] };
     } else {
+      /** Fallback for models without stream support. */
       const finalMessage = await model.invoke(finalMessages, config);
       if ((finalMessage.tool_calls?.length ?? 0) > 0) {
         finalMessage.tool_calls = finalMessage.tool_calls?.filter(
@@ -922,6 +955,128 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       if (!result) {
         throw new Error('No result after model invocation');
       }
+
+      /**
+       * Fallback: populate toolCallStepIds in the graph execution context.
+       *
+       * When model.stream() is available (the common case), attemptInvoke
+       * processes all chunks through a local ChatModelStreamHandler which
+       * creates run steps and populates toolCallStepIds before returning.
+       * The code below is a fallback for the rare case where model.stream
+       * is unavailable and model.invoke() was used instead.
+       *
+       * Text content is dispatched FIRST so that MESSAGE_CREATION is the
+       * current step when handleToolCalls runs. handleToolCalls then creates
+       * TOOL_CALLS on top of it. The dedup in getMessageId and
+       * toolCallStepIds.has makes this safe when attemptInvoke already
+       * handled everything — both paths become no-ops.
+       */
+      const responseMessage = result.messages?.[0];
+      const toolCalls = (responseMessage as AIMessageChunk | undefined)
+        ?.tool_calls;
+      const hasToolCalls = Array.isArray(toolCalls) && toolCalls.length > 0;
+
+      if (hasToolCalls) {
+        const metadata = config.metadata as Record<string, unknown>;
+        const stepKey = this.getStepKey(metadata);
+        const content = responseMessage?.content as MessageContent | undefined;
+        const hasTextContent =
+          content != null &&
+          (typeof content === 'string'
+            ? content !== ''
+            : Array.isArray(content) && content.length > 0);
+
+        /**
+         * Dispatch text content BEFORE creating TOOL_CALLS steps.
+         * getMessageId returns a new ID only on the first call for a step key;
+         * if the for-await consumer already claimed it, this is a no-op.
+         */
+        if (hasTextContent) {
+          const messageId = getMessageId(stepKey, this) ?? '';
+          if (messageId) {
+            await this.dispatchRunStep(
+              stepKey,
+              {
+                type: StepTypes.MESSAGE_CREATION,
+                message_creation: { message_id: messageId },
+              },
+              metadata
+            );
+            const stepId = this.getStepIdByKey(stepKey);
+            if (typeof content === 'string') {
+              await this.dispatchMessageDelta(stepId, {
+                content: [{ type: ContentTypes.TEXT, text: content }],
+              });
+            } else if (
+              Array.isArray(content) &&
+              content.every(
+                (c) =>
+                  typeof c === 'object' &&
+                  'type' in c &&
+                  typeof c.type === 'string' &&
+                  c.type.startsWith('text')
+              )
+            ) {
+              await this.dispatchMessageDelta(stepId, {
+                content: content as t.MessageDelta['content'],
+              });
+            }
+          }
+        }
+
+        await handleToolCalls(toolCalls as ToolCall[], metadata, this);
+      }
+
+      /**
+       * When streaming is disabled, on_chat_model_stream events are never
+       * emitted so ChatModelStreamHandler never fires. Dispatch the text
+       * content as MESSAGE_CREATION + MESSAGE_DELTA here.
+       */
+      const disableStreaming =
+        (agentContext.clientOptions as t.OpenAIClientOptions | undefined)
+          ?.disableStreaming === true;
+
+      if (
+        disableStreaming &&
+        !hasToolCalls &&
+        responseMessage != null &&
+        (responseMessage.content as MessageContent | undefined) != null
+      ) {
+        const metadata = config.metadata as Record<string, unknown>;
+        const stepKey = this.getStepKey(metadata);
+        const messageId = getMessageId(stepKey, this) ?? '';
+        if (messageId) {
+          await this.dispatchRunStep(
+            stepKey,
+            {
+              type: StepTypes.MESSAGE_CREATION,
+              message_creation: { message_id: messageId },
+            },
+            metadata
+          );
+        }
+        const stepId = this.getStepIdByKey(stepKey);
+        const content = responseMessage.content;
+        if (typeof content === 'string') {
+          await this.dispatchMessageDelta(stepId, {
+            content: [{ type: ContentTypes.TEXT, text: content }],
+          });
+        } else if (
+          Array.isArray(content) &&
+          content.every(
+            (c) =>
+              typeof c === 'object' &&
+              'type' in c &&
+              typeof c.type === 'string' &&
+              c.type.startsWith('text')
+          )
+        ) {
+          await this.dispatchMessageDelta(stepId, {
+            content: content as t.MessageDelta['content'],
+          });
+        }
+      }
+
       agentContext.currentUsage = this.getUsageMetadata(result.messages?.[0]);
 
       this.cleanupSignalListener();
@@ -1086,124 +1241,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     return stepId;
   }
 
-  async handleToolCallCompleted(
-    data: t.ToolEndData,
-    metadata?: Record<string, unknown>,
-    omitOutput?: boolean
-  ): Promise<void> {
-    if (!this.config) {
-      throw new Error('No config provided');
-    }
-
-    if (!data.output) {
-      return;
-    }
-
-    const { input, output: _output } = data;
-    if ((_output as Command | undefined)?.lg_name === 'Command') {
-      return;
-    }
-    const output = _output as ToolMessage;
-    const { tool_call_id } = output;
-    const stepId = this.toolCallStepIds.get(tool_call_id) ?? '';
-    if (!stepId) {
-      throw new Error(`No stepId found for tool_call_id ${tool_call_id}`);
-    }
-
-    const runStep = this.getRunStep(stepId);
-    if (!runStep) {
-      throw new Error(`No run step found for stepId ${stepId}`);
-    }
-
-    /**
-     * Extract and store code execution session context from artifacts.
-     * Each file is stamped with its source session_id to support multi-session file tracking.
-     * When the same filename appears in a later execution, the newer version replaces the old.
-     */
-    const toolName = output.name;
-    if (
-      toolName === Constants.EXECUTE_CODE ||
-      toolName === Constants.PROGRAMMATIC_TOOL_CALLING
-    ) {
-      const artifact = output.artifact as t.CodeExecutionArtifact | undefined;
-      if (artifact?.session_id != null && artifact.session_id !== '') {
-        const newFiles = artifact.files ?? [];
-        const existingSession = this.sessions.get(Constants.EXECUTE_CODE) as
-          | t.CodeSessionContext
-          | undefined;
-        const existingFiles = existingSession?.files ?? [];
-
-        if (newFiles.length > 0) {
-          /**
-           * Stamp each new file with its source session_id.
-           * This enables files from different executions (parallel or sequential)
-           * to be tracked and passed to subsequent calls.
-           */
-          const filesWithSession: t.FileRefs = newFiles.map((file) => ({
-            ...file,
-            session_id: artifact.session_id,
-          }));
-
-          /**
-           * Merge files, preferring latest versions by name.
-           * If a file with the same name exists, replace it with the new version.
-           * This handles cases where files are edited/recreated in subsequent executions.
-           */
-          const newFileNames = new Set(filesWithSession.map((f) => f.name));
-          const filteredExisting = existingFiles.filter(
-            (f) => !newFileNames.has(f.name)
-          );
-
-          this.sessions.set(Constants.EXECUTE_CODE, {
-            session_id: artifact.session_id,
-            files: [...filteredExisting, ...filesWithSession],
-            lastUpdated: Date.now(),
-          });
-        } else {
-          /**
-           * Store session_id even without new files for session continuity.
-           * The CodeExecutor can fall back to the /files endpoint to discover
-           * session files not explicitly returned in the exec response.
-           */
-          this.sessions.set(Constants.EXECUTE_CODE, {
-            session_id: artifact.session_id,
-            files: existingFiles,
-            lastUpdated: Date.now(),
-          });
-        }
-      }
-    }
-
-    const dispatchedOutput =
-      typeof output.content === 'string'
-        ? output.content
-        : JSON.stringify(output.content);
-
-    const args = typeof input === 'string' ? input : input.input;
-    const tool_call = {
-      args: typeof args === 'string' ? args : JSON.stringify(args),
-      name: output.name ?? '',
-      id: output.tool_call_id,
-      output: omitOutput === true ? '' : dispatchedOutput,
-      progress: 1,
-    };
-
-    await this.handlerRegistry
-      ?.getHandler(GraphEvents.ON_RUN_STEP_COMPLETED)
-      ?.handle(
-        GraphEvents.ON_RUN_STEP_COMPLETED,
-        {
-          result: {
-            id: stepId,
-            index: runStep.index,
-            type: 'tool_call',
-            tool_call,
-          } as t.ToolCompleteEvent,
-        },
-        metadata,
-        this
-      );
-  }
   /**
    * Static version of handleToolCallError to avoid creating strong references
    * that prevent garbage collection

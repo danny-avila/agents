@@ -1006,6 +1006,21 @@ export function ensureThinkingBlockInMessages(
   messages: BaseMessage[],
   _provider: Providers
 ): BaseMessage[] {
+  if (messages.length === 0) {
+    return messages;
+  }
+
+  // If the last message is already a HumanMessage, there is no trailing tool
+  // sequence to convert — return early to preserve prompt caching and avoid
+  // redundant token overhead from re-processing the entire history.
+  const lastMsg = messages[messages.length - 1];
+  const lastIsHuman =
+    lastMsg instanceof HumanMessage ||
+    ('role' in lastMsg && (lastMsg as any).role === 'user');
+  if (lastIsHuman) {
+    return messages;
+  }
+
   const result: BaseMessage[] = [];
   let i = 0;
 

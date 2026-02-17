@@ -5,8 +5,8 @@ import { ToolCall } from '@langchain/core/messages/tool';
 import { HumanMessage, BaseMessage } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type * as t from '@/types';
-import { ChatModelStreamHandler, createContentAggregator } from '@/stream';
 import { ToolEndHandler, ModelEndHandler } from '@/events';
+import { createContentAggregator } from '@/stream';
 import { GraphEvents, Providers } from '@/common';
 import { getLLMConfig } from '@/utils/llmConfig';
 import { getArgs } from '@/scripts/args';
@@ -83,7 +83,6 @@ describe('Tool Error Handling Tests', () => {
   > => ({
     [GraphEvents.TOOL_END]: new ToolEndHandler(),
     [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(),
-    [GraphEvents.CHAT_MODEL_STREAM]: new ChatModelStreamHandler(),
     [GraphEvents.ON_RUN_STEP_COMPLETED]: {
       handle: (
         event: GraphEvents.ON_RUN_STEP_COMPLETED,

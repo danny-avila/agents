@@ -9,8 +9,8 @@ import {
 import type * as t from '@/types';
 import { ToolEndHandler, ModelEndHandler } from '@/events';
 import { ContentTypes, GraphEvents, Providers, TitleMethod } from '@/common';
-import { ChatModelStreamHandler, createContentAggregator } from '@/stream';
 import { capitalizeFirstLetter } from './spec.utils';
+import { createContentAggregator } from '@/stream';
 import { getLLMConfig } from '@/utils/llmConfig';
 import { getArgs } from '@/scripts/args';
 import { Run } from '@/run';
@@ -54,7 +54,6 @@ describeIf(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
   > => ({
     [GraphEvents.TOOL_END]: new ToolEndHandler(),
     [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(collectedUsage),
-    [GraphEvents.CHAT_MODEL_STREAM]: new ChatModelStreamHandler(),
   });
 
   test(`${capitalizeFirstLetter(provider)}: simple stream + title`, async () => {

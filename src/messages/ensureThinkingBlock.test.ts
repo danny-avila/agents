@@ -589,6 +589,68 @@ describe('ensureThinkingBlockInMessages', () => {
     });
   });
 
+  describe('fast exit when last message is HumanMessage', () => {
+    test('should return messages as-is when last message is a HumanMessage', () => {
+      const messages = [
+        new HumanMessage({ content: 'first request' }),
+        new AIMessage({
+          content: 'Using a tool',
+          tool_calls: [
+            { id: 'c1', name: 'tool1', args: {}, type: 'tool_call' as const },
+          ],
+        }),
+        new ToolMessage({ content: 'r1', tool_call_id: 'c1' }),
+        new HumanMessage({ content: 'second request' }),
+      ];
+
+      const result = ensureThinkingBlockInMessages(
+        messages,
+        Providers.ANTHROPIC
+      );
+
+      // Should return the exact same array reference — no processing done
+      expect(result).toBe(messages);
+      expect(result).toHaveLength(4);
+    });
+
+    test('should return messages as-is when only message is a HumanMessage', () => {
+      const messages = [new HumanMessage({ content: 'hello' })];
+
+      const result = ensureThinkingBlockInMessages(
+        messages,
+        Providers.ANTHROPIC
+      );
+
+      expect(result).toBe(messages);
+    });
+
+    test('should still process when last message is not a HumanMessage', () => {
+      const messages = [
+        new HumanMessage({ content: 'do something' }),
+        new AIMessage({
+          content: 'Using a tool',
+          tool_calls: [
+            { id: 'c1', name: 'tool1', args: {}, type: 'tool_call' as const },
+          ],
+        }),
+        new ToolMessage({ content: 'r1', tool_call_id: 'c1' }),
+      ];
+
+      const result = ensureThinkingBlockInMessages(
+        messages,
+        Providers.ANTHROPIC
+      );
+
+      // Should process — last message is ToolMessage, not HumanMessage
+      expect(result).not.toBe(messages);
+      expect(result).toHaveLength(2);
+      expect(result[0]).toBeInstanceOf(HumanMessage);
+      expect(result[0].content).toBe('do something');
+      expect(result[1]).toBeInstanceOf(HumanMessage);
+      expect(result[1].content).toContain('[Previous agent context]');
+    });
+  });
+
   describe('edge cases', () => {
     test('should handle empty messages array', () => {
       const messages: never[] = [];
