@@ -929,7 +929,7 @@ describe('AgentContext', () => {
       expect(afterClearTokens).toBe(baseTokens);
     });
 
-    it('reset clears summary and restores base token counts', () => {
+    it('reset preserves durable summary and maintains token counts', () => {
       const ctx = createBasicContext({
         agentConfig: { instructions: 'Be helpful.' },
         tokenCounter: charTokenCounter,
@@ -940,13 +940,18 @@ describe('AgentContext', () => {
       ctx.setSummary('Summary text.', 15);
       void ctx.systemRunnable;
       expect(ctx.hasSummary()).toBe(true);
+      const tokensWithSummary = ctx.instructionTokens;
 
       ctx.reset();
-      expect(ctx.hasSummary()).toBe(false);
+      // Summary should survive reset (durable cross-run state)
+      expect(ctx.hasSummary()).toBe(true);
+      expect(ctx.getSummaryText()).toBe('Summary text.');
 
       void ctx.systemRunnable;
       const postResetTokens = ctx.instructionTokens;
       expect(postResetTokens).toBeGreaterThan(0);
+      // Token count should be the same since summary is preserved
+      expect(postResetTokens).toBe(tokensWithSummary);
     });
 
     it('updateTokenMapWithInstructions copies base map without inflating index 0', () => {

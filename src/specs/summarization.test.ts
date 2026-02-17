@@ -1354,10 +1354,11 @@ describe('Cross-run summary lifecycle (no API keys)', () => {
     logTurn('T2', conversationHistory);
     expect(conversationHistory.length).toBeGreaterThanOrEqual(4);
 
-    // --- Turn 3: very tight context to force pruning and summarization ---
-    // Even with an extremely small budget, the message-count guard prevents
-    // infinite agent→summarize→agent loops on the same message set.
-    run = await createRun(50);
+    // --- Turn 3: tight context to force pruning and summarization ---
+    // Budget must be large enough to hold instructions + summary + at least
+    // one message after summarization fires (summary adds ~26 tokens to the
+    // system message, so 50 is too tight).
+    run = await createRun(150);
     run.Graph?.overrideTestModel(
       ['Got it, continuing with the summary context.'],
       1
@@ -2820,7 +2821,7 @@ describe('Multi-pass summarization correctness (no API keys)', () => {
     version: 'v2' as const,
   };
 
-  let getChatModelClassSpy: jest.SpyInstance;
+  let getChatModelClassSpy: jest.SpyInstance | undefined;
   const originalGetChatModelClass = providers.getChatModelClass;
 
   afterEach(() => {
