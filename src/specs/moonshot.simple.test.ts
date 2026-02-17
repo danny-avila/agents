@@ -11,8 +11,8 @@ import {
 import type * as t from '@/types';
 import { ToolEndHandler, ModelEndHandler } from '@/events';
 import { ContentTypes, GraphEvents, Providers } from '@/common';
-import { ChatModelStreamHandler, createContentAggregator } from '@/stream';
 import { capitalizeFirstLetter } from './spec.utils';
+import { createContentAggregator } from '@/stream';
 import { Run } from '@/run';
 
 const provider = Providers.MOONSHOT;
@@ -71,7 +71,6 @@ const skipTests = process.env.MOONSHOT_API_KEY == null;
     > => ({
       [GraphEvents.TOOL_END]: new ToolEndHandler(),
       [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(collectedUsage),
-      [GraphEvents.CHAT_MODEL_STREAM]: new ChatModelStreamHandler(),
       [GraphEvents.ON_RUN_STEP_COMPLETED]: {
         handle: (
           event: GraphEvents.ON_RUN_STEP_COMPLETED,

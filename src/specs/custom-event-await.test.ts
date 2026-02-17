@@ -1,8 +1,8 @@
 import { HumanMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
-import { ToolEndHandler, ModelEndHandler } from '@/events';
 import { ContentTypes, GraphEvents, Providers } from '@/common';
-import { ChatModelStreamHandler, createContentAggregator } from '@/stream';
+import { ToolEndHandler, ModelEndHandler } from '@/events';
+import { createContentAggregator } from '@/stream';
 import { Run } from '@/run';
 
 describe('Custom event handler awaitHandlers behavior', () => {
@@ -39,7 +39,6 @@ describe('Custom event handler awaitHandlers behavior', () => {
     const customHandlers: Record<string | GraphEvents, t.EventHandler> = {
       [GraphEvents.TOOL_END]: new ToolEndHandler(),
       [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(),
-      [GraphEvents.CHAT_MODEL_STREAM]: new ChatModelStreamHandler(),
       [GraphEvents.ON_RUN_STEP_COMPLETED]: {
         handle: (
           event: GraphEvents.ON_RUN_STEP_COMPLETED,
@@ -133,7 +132,6 @@ describe('Custom event handler awaitHandlers behavior', () => {
     const customHandlers: Record<string | GraphEvents, t.EventHandler> = {
       [GraphEvents.TOOL_END]: new ToolEndHandler(),
       [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(),
-      [GraphEvents.CHAT_MODEL_STREAM]: new ChatModelStreamHandler(),
       [GraphEvents.ON_RUN_STEP_COMPLETED]: {
         handle: (
           event: GraphEvents.ON_RUN_STEP_COMPLETED,

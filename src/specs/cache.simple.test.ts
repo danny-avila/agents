@@ -10,9 +10,9 @@ import {
   UsageMetadata,
 } from '@langchain/core/messages';
 import type * as t from '@/types';
-import { ChatModelStreamHandler, createContentAggregator } from '@/stream';
 import { ModelEndHandler, ToolEndHandler } from '@/events';
 import { capitalizeFirstLetter } from './spec.utils';
+import { createContentAggregator } from '@/stream';
 import { GraphEvents, Providers } from '@/common';
 import { getLLMConfig } from '@/utils/llmConfig';
 import { getArgs } from '@/scripts/args';
@@ -36,7 +36,6 @@ describe('Prompt Caching Integration Tests', () => {
     const customHandlers: Record<string | GraphEvents, t.EventHandler> = {
       [GraphEvents.TOOL_END]: new ToolEndHandler(),
       [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(collectedUsage),
-      [GraphEvents.CHAT_MODEL_STREAM]: new ChatModelStreamHandler(),
       [GraphEvents.ON_RUN_STEP_COMPLETED]: {
         handle: (
           event: GraphEvents.ON_RUN_STEP_COMPLETED,

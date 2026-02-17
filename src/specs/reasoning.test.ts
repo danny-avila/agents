@@ -10,8 +10,8 @@ import {
 } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type * as t from '@/types';
-import { ChatModelStreamHandler, createContentAggregator } from '@/stream';
 import { capitalizeFirstLetter } from './spec.utils';
+import { createContentAggregator } from '@/stream';
 import { GraphEvents, Providers } from '@/common';
 import { getLLMConfig } from '@/utils/llmConfig';
 import { getArgs } from '@/scripts/args';
@@ -97,7 +97,6 @@ describe(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
     string | GraphEvents,
     t.EventHandler
   > => ({
-    [GraphEvents.CHAT_MODEL_STREAM]: new ChatModelStreamHandler(),
     [GraphEvents.ON_RUN_STEP_COMPLETED]: {
       handle: (
         event: GraphEvents.ON_RUN_STEP_COMPLETED,
