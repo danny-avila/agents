@@ -4,13 +4,8 @@ import { nanoid } from 'nanoid';
 import { concat } from '@langchain/core/utils/stream';
 import { ToolNode } from '@langchain/langgraph/prebuilt';
 import { ChatVertexAI } from '@langchain/google-vertexai';
-import {
-  START,
-  END,
-  StateGraph,
-  Annotation,
-  messagesStateReducer,
-} from '@langchain/langgraph';
+import { START, END, StateGraph, Annotation } from '@langchain/langgraph';
+import { messagesStateReducer } from '@/messages/reducer';
 import {
   Runnable,
   RunnableConfig,
@@ -153,7 +148,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   agentContexts: Map<string, AgentContext> = new Map();
   /** Default agent ID to use */
   defaultAgentId: string;
-
   constructor({
     // parent-level graph inputs
     runId,
@@ -629,6 +623,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       throw new Error('No model found');
     }
 
+    if ((_tools?.length ?? 0) > 0 && manualToolStreamProviders.has(provider)) {
+      if (!model.stream) {
+        throw new Error('Model does not support stream');
+      }
+    }
+
     if (model.stream) {
       /**
        * Process all model output through a local ChatModelStreamHandler in the
@@ -729,12 +729,16 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }
 
       const toolsForBinding = agentContext.getToolsForBinding();
+      const clientOptionsWithVision = {
+        ...agentContext.clientOptions,
+        vision: agentContext.vision,
+      } as unknown as t.ClientOptions;
       let model =
         this.overrideModel ??
         this.initializeModel({
           tools: toolsForBinding,
           provider: agentContext.provider,
-          clientOptions: agentContext.clientOptions,
+          clientOptions: clientOptionsWithVision,
         });
 
       if (agentContext.systemRunnable) {
@@ -750,6 +754,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       this.config = config;
 
       let messagesToUse = messages;
+
       if (
         !agentContext.pruneMessages &&
         agentContext.tokenCounter &&
@@ -813,13 +818,23 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
       const isLatestToolMessage = lastMessageY instanceof ToolMessage;
 
+      // Check if any ToolMessage in current turn has artifacts
+      // This is more robust than only checking if the last message is a ToolMessage
+      const hasToolMessagesWithArtifacts = finalMessages.some((msg) => {
+        if (msg._getType() !== 'tool') return false;
+        const toolMsg = msg as ToolMessage & { artifact?: t.MCPArtifact };
+        return (
+          toolMsg.artifact != null || toolMsg.additional_kwargs.artifact != null
+        );
+      });
+
       if (
         isLatestToolMessage &&
         agentContext.provider === Providers.ANTHROPIC
       ) {
         formatAnthropicArtifactContent(finalMessages);
       } else if (
-        isLatestToolMessage &&
+        hasToolMessagesWithArtifacts &&
         ((isOpenAILike(agentContext.provider) &&
           agentContext.provider !== Providers.DEEPSEEK) ||
           isGoogleLike(agentContext.provider))
@@ -1063,6 +1078,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }
 
       agentContext.currentUsage = this.getUsageMetadata(result.messages?.[0]);
+
       this.cleanupSignalListener();
       return result;
     };
