@@ -192,7 +192,7 @@ async function testStandardStreaming(): Promise<void> {
   };
   if (provider === Providers.ANTHROPIC) {
     titleOptions.clientOptions = {
-      model: 'claude-3-5-haiku-latest',
+      model: 'claude-haiku-4-5',
     };
   }
   const titleResult = await run.generateTitle(titleOptions);

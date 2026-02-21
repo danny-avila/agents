@@ -173,7 +173,7 @@ describe(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
       contentParts,
       clientOptions: {
         ...llmConfig,
-        model: 'claude-3-5-haiku-latest',
+        model: 'claude-haiku-4-5',
       },
       chainOptions: {
         callbacks: [
@@ -229,7 +229,7 @@ describe(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
       contentParts,
       clientOptions: {
         ...llmConfig,
-        model: 'claude-3-5-haiku-latest',
+        model: 'claude-haiku-4-5',
       },
       chainOptions: {
         callbacks: [
