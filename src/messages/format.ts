@@ -371,7 +371,12 @@ function formatAssistantMessage(
             content: output != null ? output : '',
           })
         );
-      } else if (part.type === ContentTypes.THINK) {
+      } else if (
+        part.type === ContentTypes.THINK ||
+        part.type === ContentTypes.THINKING ||
+        part.type === ContentTypes.REASONING_CONTENT ||
+        part.type === 'redacted_thinking'
+      ) {
         hasReasoning = true;
         continue;
       } else if (
@@ -380,6 +385,12 @@ function formatAssistantMessage(
       ) {
         continue;
       } else {
+        if (
+          part.type === ContentTypes.TEXT &&
+          !String(part.text ?? '').trim()
+        ) {
+          continue;
+        }
         currentContent.push(part);
       }
     }
