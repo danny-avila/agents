@@ -2,8 +2,9 @@
  * Utility functions for converting Bedrock Converse responses to LangChain messages.
  * Ported from @langchain/aws common.js
  */
-import { AIMessage, AIMessageChunk } from '@langchain/core/messages';
 import { ChatGenerationChunk } from '@langchain/core/outputs';
+import { AIMessage, AIMessageChunk } from '@langchain/core/messages';
+import type { UsageMetadata } from '@langchain/core/messages';
 import type {
   BedrockMessage,
   ConverseResponse,
@@ -107,17 +108,38 @@ export function convertConverseMessageToLangChainMessage(
   }
 
   let tokenUsage:
-    | { input_tokens: number; output_tokens: number; total_tokens: number }
+    | {
+        input_tokens: number;
+        output_tokens: number;
+        total_tokens: number;
+        input_token_details?: {
+          cache_read: number;
+          cache_creation: number;
+        };
+      }
     | undefined;
   if (responseMetadata.usage != null) {
-    const input_tokens = responseMetadata.usage.inputTokens ?? 0;
-    const output_tokens = responseMetadata.usage.outputTokens ?? 0;
+    const usage = responseMetadata.usage as NonNullable<
+      typeof responseMetadata.usage
+    > & {
+      cacheReadInputTokens?: number;
+      cacheWriteInputTokens?: number;
+    };
+    const input_tokens = usage.inputTokens ?? 0;
+    const output_tokens = usage.outputTokens ?? 0;
+    const cacheRead = usage.cacheReadInputTokens;
+    const cacheWrite = usage.cacheWriteInputTokens;
     tokenUsage = {
       input_tokens,
       output_tokens,
-      total_tokens:
-        responseMetadata.usage.totalTokens ?? input_tokens + output_tokens,
+      total_tokens: usage.totalTokens ?? input_tokens + output_tokens,
     };
+    if (cacheRead != null || cacheWrite != null) {
+      tokenUsage.input_token_details = {
+        cache_read: cacheRead ?? 0,
+        cache_creation: cacheWrite ?? 0,
+      };
+    }
   }
 
   if (
@@ -285,19 +307,37 @@ export function handleConverseStreamMetadata(
   metadata: ConverseStreamMetadataEvent,
   extra: { streamUsage: boolean }
 ): ChatGenerationChunk {
-  const inputTokens = metadata.usage?.inputTokens ?? 0;
-  const outputTokens = metadata.usage?.outputTokens ?? 0;
-  const usage_metadata = {
+  const usage = metadata.usage as
+    | (NonNullable<ConverseStreamMetadataEvent['usage']> & {
+        cacheReadInputTokens?: number;
+        cacheWriteInputTokens?: number;
+      })
+    | undefined;
+  const inputTokens = usage?.inputTokens ?? 0;
+  const outputTokens = usage?.outputTokens ?? 0;
+  const cacheRead = usage?.cacheReadInputTokens;
+  const cacheWrite = usage?.cacheWriteInputTokens;
+
+  const usage_metadata: Record<string, unknown> = {
     input_tokens: inputTokens,
     output_tokens: outputTokens,
-    total_tokens: metadata.usage?.totalTokens ?? inputTokens + outputTokens,
+    total_tokens: usage?.totalTokens ?? inputTokens + outputTokens,
   };
+
+  if (cacheRead != null || cacheWrite != null) {
+    usage_metadata.input_token_details = {
+      cache_read: cacheRead ?? 0,
+      cache_creation: cacheWrite ?? 0,
+    };
+  }
 
   return new ChatGenerationChunk({
     text: '',
     message: new AIMessageChunk({
       content: '',
-      usage_metadata: extra.streamUsage ? usage_metadata : undefined,
+      usage_metadata: extra.streamUsage
+        ? (usage_metadata as UsageMetadata)
+        : undefined,
       response_metadata: {
         // Use the same key as returned from the Converse API
         metadata,
