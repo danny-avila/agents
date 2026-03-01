@@ -65,6 +65,12 @@ const chunker = {
   },
 };
 
+/** Maximum chars of scraped content passed to the chunker/reranker per source.
+ *  Overridable via SEARCH_MAX_CONTENT_LENGTH env var. */
+const DEFAULT_MAX_CONTENT_LENGTH = 50000;
+const MAX_CONTENT_LENGTH =
+  Number(process.env.SEARCH_MAX_CONTENT_LENGTH) || DEFAULT_MAX_CONTENT_LENGTH;
+
 function createSourceUpdateCallback(sourceMap: Map<string, t.ValidSource>) {
   return (link: string, update?: Partial<t.ValidSource>): void => {
     const source = sourceMap.get(link);
@@ -82,12 +88,14 @@ const getHighlights = async ({
   content,
   reranker,
   topResults = 5,
+  maxContentLength = MAX_CONTENT_LENGTH,
   logger,
 }: {
   content: string;
   query: string;
   reranker?: BaseReranker;
   topResults?: number;
+  maxContentLength?: number;
   logger?: t.Logger;
 }): Promise<t.Highlight[] | undefined> => {
   const logger_ = logger || createDefaultLogger();
@@ -102,7 +110,11 @@ const getHighlights = async ({
   }
 
   try {
-    const documents = await chunker.splitText(content);
+    const cappedContent =
+      content.length > maxContentLength
+        ? content.slice(0, maxContentLength)
+        : content;
+    const documents = await chunker.splitText(cappedContent);
     if (Array.isArray(documents)) {
       return await reranker.rerank(query, documents, topResults);
     } else {
@@ -445,6 +457,7 @@ export const createSourceProcessor = (
   }
   const {
     topResults = 5,
+    maxContentLength = MAX_CONTENT_LENGTH,
     // strategies = ['no_extraction'],
     // filterContent = true,
     reranker,
@@ -479,11 +492,15 @@ export const createSourceProcessor = (
               );
               if (response.success && response.data) {
                 const [content, references] = scraper.extractContent(response);
+                const cleanedContent = chunker.cleanText(content);
                 return {
                   url,
                   references,
                   attribution,
-                  content: chunker.cleanText(content),
+                  content:
+                    cleanedContent.length > maxContentLength
+                      ? cleanedContent.slice(0, maxContentLength)
+                      : cleanedContent,
                 } as t.ScrapeResult;
               } else {
                 logger_.error(
@@ -512,6 +529,7 @@ export const createSourceProcessor = (
                   query,
                   reranker,
                   content: result.content,
+                  maxContentLength,
                   logger: logger_,
                 });
                 if (onGetHighlights) {
