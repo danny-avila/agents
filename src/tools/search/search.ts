@@ -711,6 +711,7 @@ export const createSourceProcessor = (
 
       if (news && topStories.length > 0) {
         updateSourcesWithContent(topStories, sourceMap);
+        result.data.topStories = topStories.slice(0, numElements);
       }
 
       return result.data;
