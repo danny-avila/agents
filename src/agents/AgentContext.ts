@@ -37,6 +37,7 @@ export class AgentContext {
       toolRegistry,
       toolDefinitions,
       instructions,
+      staticInstructions,
       additional_instructions,
       streamBuffer,
       maxContextTokens,
@@ -57,6 +58,7 @@ export class AgentContext {
       toolRegistry,
       toolDefinitions,
       instructions,
+      staticInstructions,
       additionalInstructions: additional_instructions,
       reasoningKey,
       toolEnd,
@@ -138,6 +140,8 @@ export class AgentContext {
   discoveredToolNames: Set<string> = new Set();
   /** Instructions for this agent */
   instructions?: string;
+  /** Static portion of instructions for Anthropic prompt cache splitting */
+  staticInstructions?: string;
   /** Additional instructions for this agent */
   additionalInstructions?: string;
   /** Reasoning key for this agent */
@@ -191,6 +195,7 @@ export class AgentContext {
     toolRegistry,
     toolDefinitions,
     instructions,
+    staticInstructions,
     additionalInstructions,
     reasoningKey,
     toolEnd,
@@ -210,6 +215,7 @@ export class AgentContext {
     toolRegistry?: t.LCToolRegistry;
     toolDefinitions?: t.LCTool[];
     instructions?: string;
+    staticInstructions?: string;
     additionalInstructions?: string;
     reasoningKey?: 'reasoning_content' | 'reasoning';
     toolEnd?: boolean;
@@ -229,6 +235,7 @@ export class AgentContext {
     this.toolRegistry = toolRegistry;
     this.toolDefinitions = toolDefinitions;
     this.instructions = instructions;
+    this.staticInstructions = staticInstructions;
     this.additionalInstructions = additionalInstructions;
     if (reasoningKey) {
       this.reasoningKey = reasoningKey;
@@ -428,15 +435,41 @@ export class AgentContext {
         | t.AnthropicClientOptions
         | undefined;
       if (anthropicOptions?.promptCache === true) {
-        finalInstructions = {
-          content: [
-            {
-              type: 'text',
-              text: instructionsString,
-              cache_control: { type: 'ephemeral' },
-            },
-          ],
-        };
+        if (this.staticInstructions && this.staticInstructions.length >= 1024) {
+          // Multi-block: static part cached, dynamic part sent fresh
+          // Extract ONLY the dynamic portion to avoid sending static content twice
+          const dynamicContent = instructionsString
+            .replace(this.staticInstructions, '')
+            .trim();
+          finalInstructions = {
+            content: [
+              {
+                type: 'text',
+                text: this.staticInstructions,
+                cache_control: { type: 'ephemeral' },
+              },
+              ...(dynamicContent
+                ? [
+                  {
+                    type: 'text' as const,
+                    text: dynamicContent,
+                  },
+                ]
+                : []),
+            ],
+          };
+        } else {
+          // Original single-block behavior (backward-compatible)
+          finalInstructions = {
+            content: [
+              {
+                type: 'text',
+                text: instructionsString,
+                cache_control: { type: 'ephemeral' },
+              },
+            ],
+          };
+        }
       }
     }
 
