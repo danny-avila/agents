@@ -169,7 +169,7 @@
     "jest-util": "^30.2.0",
     "lint-staged": "^15.2.7",
     "prettier": "^3.6.2",
-    "rollup": "^4.34.6",
+    "rollup": "^4.59.0",
     "rollup-plugin-cleandir": "^2.0.0",
     "ts-jest": "^29.4.5",
     "ts-node": "^10.9.2",
