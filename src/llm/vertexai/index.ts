@@ -1,12 +1,81 @@
 import { ChatGoogle } from '@langchain/google-gauth';
 import { ChatConnection } from '@langchain/google-common';
 import type {
+  GeminiContent,
   GeminiRequest,
   GoogleAIModelRequestParams,
   GoogleAbstractedClient,
 } from '@langchain/google-common';
 import type { BaseMessage } from '@langchain/core/messages';
+import { isAIMessage } from '@langchain/core/messages';
 import type { GoogleThinkingConfig, VertexAIClientOptions } from '@/types';
+
+type AdditionalKwargs =
+  | undefined
+  | (BaseMessage['additional_kwargs'] & {
+      signatures?: Array<string | undefined>;
+    });
+
+/**
+ * Fixes thought signatures on functionCall parts in the formatted Gemini request.
+ *
+ * `@langchain/google-common` stores signatures as a flat array in
+ * `additional_kwargs.signatures` (one per response part) and re-attaches them
+ * by index only when `signatures.length === parts.length`. This fails when:
+ * - The API omits a signature (length mismatch)
+ * - Streaming chunks merge with different part counts
+ * - The signature for a functionCall part is an empty string
+ *
+ * This function correlates each "model" content block in the formatted request
+ * back to its originating AI message, then re-attaches non-empty signatures
+ * that the library failed to apply.
+ */
+function fixThoughtSignatures(
+  contents: GeminiContent[],
+  input: BaseMessage[]
+): void {
+  // Collect AI messages that have signatures, in order
+  const aiMessages = input.filter(
+    (msg) =>
+      isAIMessage(msg) &&
+      Array.isArray((msg.additional_kwargs as AdditionalKwargs)?.signatures) &&
+      (msg.additional_kwargs.signatures as string[]).length > 0
+  );
+
+  // Collect "model" content blocks from the formatted request, in order
+  const modelContents = contents.filter((c) => c.role === 'model');
+
+  // They should correspond 1:1 in order (both derived from the same input sequence)
+  const count = Math.min(aiMessages.length, modelContents.length);
+  for (let i = 0; i < count; i++) {
+    const msg = aiMessages[i];
+    const content = modelContents[i];
+    const signatures = (msg.additional_kwargs as AdditionalKwargs)?.signatures;
+
+    // Collect non-empty signatures that aren't already attached to any part
+    const attachedSignatures = new Set(
+      content.parts
+        .map((p) => p.thoughtSignature)
+        .filter((s): s is string => s != null && s !== '')
+    );
+    const availableSignatures = signatures?.filter(
+      (s) => s != null && s !== '' && !attachedSignatures.has(s)
+    );
+
+    // Assign available signatures to functionCall parts missing one, in order
+    let sigIdx = 0;
+    for (const part of content.parts) {
+      if (
+        'functionCall' in part &&
+        (part.thoughtSignature == null || part.thoughtSignature === '') &&
+        sigIdx < (availableSignatures?.length ?? 0)
+      ) {
+        part.thoughtSignature = availableSignatures?.[sigIdx];
+        sigIdx++;
+      }
+    }
+  }
+}
 
 class CustomChatConnection extends ChatConnection<VertexAIClientOptions> {
   thinkingConfig?: GoogleThinkingConfig;
@@ -28,7 +97,10 @@ class CustomChatConnection extends ChatConnection<VertexAIClientOptions> {
       }
       delete formattedData.generationConfig.thinkingConfig.thinkingBudget;
     }
-    if (this.thinkingConfig?.thinkingLevel) {
+    if (
+      this.thinkingConfig?.thinkingLevel != null &&
+      this.thinkingConfig.thinkingLevel !== ''
+    ) {
       formattedData.generationConfig ??= {};
       (
         formattedData.generationConfig as Record<string, unknown>
@@ -36,6 +108,15 @@ class CustomChatConnection extends ChatConnection<VertexAIClientOptions> {
         ...formattedData.generationConfig.thinkingConfig,
         thinkingLevel: this.thinkingConfig.thinkingLevel,
       };
+    }
+    if (formattedData.contents) {
+      fixThoughtSignatures(formattedData.contents, input);
+      // gemini-3.1+ models reject role="function"; convert to role="user"
+      for (const content of formattedData.contents) {
+        if (content.role === 'function') {
+          (content as { role: string }).role = 'user';
+        }
+      }
     }
     return formattedData;
   }
