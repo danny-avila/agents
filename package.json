@@ -132,6 +132,7 @@
     "@langfuse/otel": "^4.3.0",
     "@langfuse/tracing": "^4.3.0",
     "@opentelemetry/sdk-node": "^0.207.0",
+    "@scarf/scarf": "^1.4.0",
     "axios": "^1.13.5",
     "cheerio": "^1.0.0",
     "dotenv": "^16.4.7",
