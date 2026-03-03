@@ -27,6 +27,26 @@ const weatherTool = tool(async () => 'The weather is 80 degrees and sunny', {
 });
 
 describe.each(gemini3Models)(
+  'Vertex AI reasoning with thinkingLevel (%s)',
+  (modelName) => {
+    const model = new ChatVertexAI({
+      model: modelName,
+      location: 'global',
+      maxRetries: 2,
+      thinkingConfig: {
+        thinkingLevel: 'HIGH',
+        includeThoughts: true,
+      },
+    });
+
+    test('invoke with thinkingLevel produces a response', async () => {
+      const result = await model.invoke('What is 2+2? Think step by step.');
+      expect(result.content).toBeDefined();
+    });
+  }
+);
+
+describe.each(gemini3Models)(
   'Vertex AI tool calling with thought signatures (%s)',
   (modelName) => {
     const model = new ChatVertexAI({

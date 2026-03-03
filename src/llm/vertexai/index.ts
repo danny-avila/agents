@@ -431,18 +431,21 @@ export class ChatVertexAI extends ChatGoogle {
     }
     return params;
   }
-
   buildConnection(
-    fields: VertexAIClientOptions,
+    fields: VertexAIClientOptions | undefined,
     client: GoogleAbstractedClient
   ): void {
+    // Note: buildConnection is called from super() BEFORE this.thinkingConfig is set,
+    // so we must read thinkingConfig from `fields` directly.
+    const thinkingConfig = fields?.thinkingConfig ?? this.thinkingConfig;
+
     const connection = new CustomChatConnection(
       { ...fields, ...this },
       this.caller,
       client,
       false
     );
-    connection.thinkingConfig = this.thinkingConfig;
+    connection.thinkingConfig = thinkingConfig;
     this.connection = connection;
 
     const streamedConnection = new CustomChatConnection(
@@ -451,7 +454,7 @@ export class ChatVertexAI extends ChatGoogle {
       client,
       true
     );
-    streamedConnection.thinkingConfig = this.thinkingConfig;
+    streamedConnection.thinkingConfig = thinkingConfig;
     this.streamedConnection = streamedConnection;
   }
 }
