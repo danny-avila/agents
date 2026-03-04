@@ -353,6 +353,7 @@ export const createSearchTool = (
     searxngApiKey,
     rerankerType = 'cohere',
     topResults = 5,
+    maxContentLength,
     strategies = ['no_extraction'],
     filterContent = true,
     safeSearch = 1,
@@ -435,6 +436,7 @@ export const createSearchTool = (
     {
       reranker: selectedReranker,
       topResults,
+      maxContentLength,
       strategies,
       filterContent,
       logger,

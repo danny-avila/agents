@@ -85,6 +85,8 @@ export interface ScrapeResult {
 
 export interface ProcessSourcesConfig {
   topResults?: number;
+  /** Max chars of scraped content per source before chunking. Overridable via SEARCH_MAX_CONTENT_LENGTH. */
+  maxContentLength?: number;
   strategies?: string[];
   filterContent?: boolean;
   reranker?: BaseReranker;
