@@ -39,9 +39,15 @@ describe.each(gemini3Models)(
       },
     });
 
-    test('invoke with thinkingLevel produces a response', async () => {
+    test('invoke with thinkingLevel produces a response with reasoning tokens', async () => {
       const result = await model.invoke('What is 2+2? Think step by step.');
       expect(result.content).toBeDefined();
+      const reasoningTokens = (result.usage_metadata as Record<string, unknown>)
+        ?.output_token_details;
+      expect(reasoningTokens).toBeDefined();
+      expect(
+        (reasoningTokens as Record<string, number>)?.reasoning
+      ).toBeGreaterThan(0);
     });
   }
 );

@@ -102,11 +102,20 @@ class CustomChatConnection extends ChatConnection<VertexAIClientOptions> {
       this.thinkingConfig.thinkingLevel !== ''
     ) {
       formattedData.generationConfig ??= {};
+      // thinkingLevel and thinkingBudget cannot coexist — the API rejects the request.
+      // Remove thinkingBudget when thinkingLevel is set.
+      const { thinkingBudget: _, ...existingThinkingConfig } =
+        (formattedData.generationConfig.thinkingConfig as
+          | Record<string, unknown>
+          | undefined) ?? {};
       (
         formattedData.generationConfig as Record<string, unknown>
       ).thinkingConfig = {
-        ...formattedData.generationConfig.thinkingConfig,
+        ...existingThinkingConfig,
         thinkingLevel: this.thinkingConfig.thinkingLevel,
+        ...(this.thinkingConfig.includeThoughts != null && {
+          includeThoughts: this.thinkingConfig.includeThoughts,
+        }),
       };
     }
     if (formattedData.contents) {
