@@ -246,11 +246,13 @@ export class Run<_T extends t.BaseGraphState> {
       .concat(streamCallbacks)
       .concat(customHandler);
 
-    if (
+    let langfuseHandler: CallbackHandler | undefined;
+    const langfuseEnabled =
       isPresent(process.env.LANGFUSE_SECRET_KEY) &&
       isPresent(process.env.LANGFUSE_PUBLIC_KEY) &&
-      isPresent(process.env.LANGFUSE_BASE_URL)
-    ) {
+      isPresent(process.env.LANGFUSE_BASE_URL);
+
+    if (langfuseEnabled) {
       const userId = config.configurable?.user_id;
       const sessionId = config.configurable?.thread_id;
       const traceMetadata = {
@@ -259,14 +261,14 @@ export class Run<_T extends t.BaseGraphState> {
         agentId: config.configurable?.agent_id,
         agentName: config.configurable?.agent_name,
       };
-      const handler = new CallbackHandler({
+      langfuseHandler = new CallbackHandler({
         userId,
         sessionId,
         traceMetadata,
       });
       config.callbacks = (
         (config.callbacks as t.ProvidedCallbacks) ?? []
-      ).concat([handler]);
+      ).concat([langfuseHandler]);
     }
 
     if (!this.id) {
