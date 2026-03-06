@@ -309,6 +309,73 @@ export class Run<_T extends t.BaseGraphState> {
       }
     }
 
+    if (langfuseEnabled && langfuseHandler?.last_trace_id && this.Graph) {
+      const traceId = langfuseHandler.last_trace_id;
+
+      const lastUserMsg = [...inputs.messages]
+        .reverse()
+        .find((m) => m._getType() === 'human');
+      const rawContent = lastUserMsg?.content;
+      const cleanInput =
+        typeof rawContent === 'string'
+          ? rawContent
+          : Array.isArray(rawContent)
+            ? rawContent
+              .filter(
+                (c): c is { type: string; text: string } =>
+                  c != null &&
+                    typeof c === 'object' &&
+                    'type' in c &&
+                    c.type === 'text'
+              )
+              .map((c) => c.text)
+              .join('\n')
+            : undefined;
+
+      const contentParts = this.Graph.getContentParts() ?? [];
+      const outputSegments: string[] = [];
+      for (const part of contentParts) {
+        if (part == null) {
+          continue;
+        }
+        if (part.type === 'thinking' && 'thinking' in part && part.thinking) {
+          outputSegments.push(`Thought: "${part.thinking}"`);
+        } else if (part.type === 'text' && 'text' in part && part.text) {
+          outputSegments.push(part.text);
+        }
+      }
+      const cleanOutput =
+        outputSegments.length > 0 ? outputSegments.join('\n\n') : undefined;
+
+      if (cleanInput != null || cleanOutput != null) {
+        const baseUrl = process.env.LANGFUSE_BASE_URL!.replace(/\/+$/, '');
+        const credentials = btoa(
+          `${process.env.LANGFUSE_PUBLIC_KEY}:${process.env.LANGFUSE_SECRET_KEY}`
+        );
+        fetch(`${baseUrl}/api/public/ingestion`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Basic ${credentials}`,
+          },
+          body: JSON.stringify({
+            batch: [
+              {
+                type: 'trace-create',
+                id: crypto.randomUUID(),
+                timestamp: new Date().toISOString(),
+                body: {
+                  id: traceId,
+                  ...(cleanInput != null && { input: cleanInput }),
+                  ...(cleanOutput != null && { output: cleanOutput }),
+                },
+              },
+            ],
+          }),
+        }).catch(() => {});
+      }
+    }
+
     /**
      * Break the reference chain that keeps heavy data alive via
      * LangGraph's internal `__pregel_scratchpad.currentTaskInput` →
