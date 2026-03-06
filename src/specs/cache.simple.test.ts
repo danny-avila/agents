@@ -100,6 +100,7 @@ describe('Prompt Caching Integration Tests', () => {
           additional_instructions: `User: ${userName}, Location: ${location}`,
         },
         returnContent: true,
+        skipCleanup: true,
         customHandlers,
       });
 
@@ -145,6 +146,7 @@ describe('Prompt Caching Integration Tests', () => {
           additional_instructions: `User: ${userName}, Location: ${location}`,
         },
         returnContent: true,
+        skipCleanup: true,
         customHandlers,
       });
 
@@ -182,6 +184,7 @@ describe('Prompt Caching Integration Tests', () => {
             'You are a math assistant. Use the calculator tool for all calculations.',
         },
         returnContent: true,
+        skipCleanup: true,
         customHandlers,
       });
 
@@ -227,6 +230,7 @@ describe('Prompt Caching Integration Tests', () => {
           additional_instructions: `User: ${userName}, Location: ${location}`,
         },
         returnContent: true,
+        skipCleanup: true,
         customHandlers,
       });
 
@@ -271,6 +275,7 @@ describe('Prompt Caching Integration Tests', () => {
           additional_instructions: `User: ${userName}, Location: ${location}`,
         },
         returnContent: true,
+        skipCleanup: true,
         customHandlers,
       });
 
@@ -307,6 +312,7 @@ describe('Prompt Caching Integration Tests', () => {
             'You are a math assistant. Use the calculator tool for all calculations.',
         },
         returnContent: true,
+        skipCleanup: true,
         customHandlers,
       });
 
@@ -356,6 +362,7 @@ describe('Prompt Caching Integration Tests', () => {
           instructions: 'You are a helpful assistant.',
         },
         returnContent: true,
+        skipCleanup: true,
         customHandlers: handlers1,
       });
 
@@ -377,6 +384,7 @@ describe('Prompt Caching Integration Tests', () => {
           instructions: 'You are a helpful assistant.',
         },
         returnContent: true,
+        skipCleanup: true,
         customHandlers: handlers2,
       });
 

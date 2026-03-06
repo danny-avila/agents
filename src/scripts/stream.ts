@@ -89,6 +89,7 @@ async function testStandardStreaming(): Promise<void> {
       streamBuffer: 3000,
     },
     returnContent: true,
+    skipCleanup: true,
     customHandlers,
   });
 

@@ -158,6 +158,7 @@ async function testSequentialMultiAgent() {
     },
     customHandlers,
     returnContent: true,
+    skipCleanup: true,
   };
 
   try {

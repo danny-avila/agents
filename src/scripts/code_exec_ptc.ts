@@ -217,6 +217,7 @@ async function testProgrammaticToolCalling(): Promise<void> {
       ],
     },
     returnContent: true,
+    skipCleanup: true,
     customHandlers,
   });
 

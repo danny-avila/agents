@@ -27,3 +27,9 @@ export type * from './types';
 
 /* LLM */
 export { CustomOpenAIClient } from './llm/openai';
+export { ChatOpenRouter } from './llm/openrouter';
+export type {
+  OpenRouterReasoning,
+  OpenRouterReasoningEffort,
+  ChatOpenRouterCallOptions,
+} from './llm/openrouter';

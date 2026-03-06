@@ -66,6 +66,7 @@ describe('Agent Handoffs Tests', () => {
       edges,
     },
     returnContent: true,
+    skipCleanup: true,
   });
 
   const createBasicAgent = (

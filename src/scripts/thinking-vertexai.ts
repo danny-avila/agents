@@ -1,15 +1,10 @@
-// src/scripts/test-thinking.ts
+// src/scripts/thinking-vertexai.ts
 import { config } from 'dotenv';
 config();
-import {
-  HumanMessage,
-  SystemMessage,
-  BaseMessage,
-} from '@langchain/core/messages';
+import { HumanMessage, BaseMessage } from '@langchain/core/messages';
 import type { UsageMetadata } from '@langchain/core/messages';
 import * as t from '@/types';
 import { ChatModelStreamHandler, createContentAggregator } from '@/stream';
-import { createCodeExecutionTool } from '@/tools/CodeExecutor';
 import { ToolEndHandler, ModelEndHandler } from '@/events';
 import { GraphEvents, Providers } from '@/common';
 import { getLLMConfig } from '@/utils/llmConfig';
@@ -20,7 +15,7 @@ const conversationHistory: BaseMessage[] = [];
 let _contentParts: t.MessageContentComplex[] = [];
 const collectedUsage: UsageMetadata[] = [];
 
-async function testThinking(): Promise<void> {
+async function testVertexAIThinking(): Promise<void> {
   const { userName } = await getArgs();
   const instructions = `You are a helpful AI assistant for ${userName}. When answering questions, be thorough in your reasoning.`;
   const { contentParts, aggregateContent } = createContentAggregator();
@@ -69,26 +64,34 @@ async function testThinking(): Promise<void> {
         event: GraphEvents.ON_REASONING_DELTA,
         data: t.ReasoningDeltaEvent
       ) => {
+        console.log(
+          '[ON_REASONING_DELTA]',
+          JSON.stringify(data.delta.content?.[0]).slice(0, 100)
+        );
         aggregateContent({ event, data });
       },
     },
   };
 
-  const baseLlmConfig: t.LLMConfig = getLLMConfig(Providers.ANTHROPIC);
+  const baseLlmConfig = getLLMConfig(Providers.VERTEXAI);
 
-  // Enable thinking with token budget
   const llmConfig = {
     ...baseLlmConfig,
-    model: 'claude-3-7-sonnet-latest',
-    thinking: { type: 'enabled', budget_tokens: 2000 },
+    model: 'gemini-3-flash-preview',
+    location: 'global',
+    streaming: true,
+    streamUsage: true,
+    thinkingConfig: {
+      thinkingLevel: 'HIGH',
+      includeThoughts: true,
+    },
   };
 
   const run = await Run.create<t.IState>({
-    runId: 'test-thinking-id',
+    runId: 'test-vertexai-thinking-id',
     graphConfig: {
       instructions,
       type: 'standard',
-      tools: [createCodeExecutionTool()],
       llmConfig,
     },
     returnContent: true,
@@ -96,57 +99,50 @@ async function testThinking(): Promise<void> {
     customHandlers: customHandlers as t.RunConfig['customHandlers'],
   });
 
-  const config = {
+  const streamConfig = {
     configurable: {
-      thread_id: 'thinking-test-thread',
+      thread_id: 'vertexai-thinking-test-thread',
     },
     streamMode: 'values',
     version: 'v2' as const,
   };
 
   // Test 1: Regular thinking mode
-  console.log('\n\nTest 1: Regular thinking mode');
-  // const userMessage1 = `What would be the environmental and economic impacts if all cars globally were replaced by electric vehicles overnight?`;
-  const userMessage1 = `Please print 'hello world' in python`;
+  console.log('\n\nTest 1: Vertex AI thinking mode with thinkingLevel=HIGH');
+  const userMessage1 =
+    'How many r\'s are in the word "strawberry"? Think carefully.';
   conversationHistory.push(new HumanMessage(userMessage1));
 
-  console.log('Running first query with thinking enabled...');
+  console.log('Running first query with Vertex AI thinking enabled...');
   const firstInputs = { messages: [...conversationHistory] };
-  await run.processStream(firstInputs, config);
+  await run.processStream(firstInputs, streamConfig);
 
-  // Extract and display thinking blocks
+  // Extract and display results
   const finalMessages = run.getRunMessages();
+  console.log('\n\nFinal messages after Test 1:');
+  console.dir(finalMessages, { depth: null });
 
-  // Test 2: Try multi-turn conversation
-  console.log('\n\nTest 2: Multi-turn conversation with thinking enabled');
-  const userMessage2 = `Given your previous analysis, what would be the most significant technical challenges in making this transition?`;
+  // Test 2: Multi-turn conversation
+  console.log(
+    '\n\nTest 2: Multi-turn conversation with Vertex AI thinking enabled'
+  );
+  const userMessage2 =
+    'Now count the number of letters in "Mississippi". Explain step by step.';
   conversationHistory.push(new HumanMessage(userMessage2));
 
-  console.log('Running second query with thinking enabled...');
+  console.log('Running second query with Vertex AI thinking enabled...');
   const secondInputs = { messages: [...conversationHistory] };
-  await run.processStream(secondInputs, config);
+  await run.processStream(secondInputs, streamConfig);
 
-  // Display thinking blocks for second response
   const finalMessages2 = run.getRunMessages();
+  console.log('\n\nVertex AI thinking feature test completed!');
+  console.dir(finalMessages2, { depth: null });
 
-  // Test 3: Redacted thinking mode
-  console.log('\n\nTest 3: Redacted thinking mode');
-  const magicString =
-    'ANTHROPIC_MAGIC_STRING_TRIGGER_REDACTED_THINKING_46C9A13E193C177646C7398A98432ECCCE4C1253D5E2D82641AC0E52CC2876CB';
-  const userMessage3 = `${magicString}\n\nExplain how quantum computing works in simple terms.`;
+  console.log('\n\nContent parts:');
+  console.dir(_contentParts, { depth: null });
 
-  // Reset conversation for clean test
-  conversationHistory.length = 0;
-  conversationHistory.push(new HumanMessage(userMessage3));
-
-  console.log('Running query with redacted thinking...');
-  const thirdInputs = { messages: [...conversationHistory] };
-  await run.processStream(thirdInputs, config);
-
-  // Display redacted thinking blocks
-  const finalMessages3 = run.getRunMessages();
-  console.log('\n\nThinking feature test completed!');
-  console.dir(finalMessages3, { depth: null });
+  console.log('\n\nCollected usage:');
+  console.dir(collectedUsage, { depth: null });
 }
 
 process.on('unhandledRejection', (reason, promise) => {
@@ -162,7 +158,7 @@ process.on('uncaughtException', (err) => {
   console.error('Uncaught Exception:', err);
 });
 
-testThinking().catch((err) => {
+testVertexAIThinking().catch((err) => {
   console.error(err);
   console.log('Conversation history:');
   console.dir(conversationHistory, { depth: null });

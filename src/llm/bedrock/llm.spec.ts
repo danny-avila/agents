@@ -5,16 +5,24 @@ config();
 import { expect, test, describe, jest } from '@jest/globals';
 import {
   AIMessage,
-  AIMessageChunk,
+  ToolMessage,
   HumanMessage,
   SystemMessage,
-  ToolMessage,
+  AIMessageChunk,
 } from '@langchain/core/messages';
 import { concat } from '@langchain/core/utils/stream';
 import { ChatGenerationChunk } from '@langchain/core/outputs';
-import { BedrockRuntimeClient } from '@aws-sdk/client-bedrock-runtime';
+import {
+  BedrockRuntimeClient,
+  ConverseCommand,
+} from '@aws-sdk/client-bedrock-runtime';
+import type { ConverseResponse } from '@aws-sdk/client-bedrock-runtime';
+import {
+  convertConverseMessageToLangChainMessage,
+  handleConverseStreamMetadata,
+  convertToConverseMessages,
+} from './utils';
 import { CustomChatBedrockConverse, ServiceTierType } from './index';
-import { convertToConverseMessages } from './utils';
 
 jest.setTimeout(120000);
 
@@ -429,6 +437,164 @@ describe('CustomChatBedrockConverse', () => {
   });
 });
 
+describe('handleConverseStreamMetadata - cache token extraction', () => {
+  test('should extract cacheReadInputTokens and cacheWriteInputTokens into input_token_details', () => {
+    const metadata = {
+      usage: {
+        inputTokens: 13,
+        outputTokens: 5,
+        totalTokens: 10849,
+        cacheReadInputTokens: 10831,
+        cacheWriteInputTokens: 0,
+      },
+      metrics: { latencyMs: 1000 },
+    };
+
+    const chunk = handleConverseStreamMetadata(metadata, {
+      streamUsage: true,
+    });
+    const msg = chunk.message as AIMessageChunk;
+
+    expect(msg.usage_metadata).toEqual({
+      input_tokens: 13,
+      output_tokens: 5,
+      total_tokens: 10849,
+      input_token_details: {
+        cache_read: 10831,
+        cache_creation: 0,
+      },
+    });
+  });
+
+  test('should not include input_token_details when no cache tokens present', () => {
+    const metadata = {
+      usage: {
+        inputTokens: 100,
+        outputTokens: 50,
+        totalTokens: 150,
+      },
+      metrics: { latencyMs: 500 },
+    };
+
+    const chunk = handleConverseStreamMetadata(metadata, {
+      streamUsage: true,
+    });
+    const msg = chunk.message as AIMessageChunk;
+
+    expect(msg.usage_metadata).toEqual({
+      input_tokens: 100,
+      output_tokens: 50,
+      total_tokens: 150,
+    });
+    expect(msg.usage_metadata?.input_token_details).toBeUndefined();
+  });
+
+  test('should include input_token_details when only cacheWriteInputTokens is present', () => {
+    const metadata = {
+      usage: {
+        inputTokens: 50,
+        outputTokens: 10,
+        totalTokens: 10060,
+        cacheWriteInputTokens: 10000,
+      },
+      metrics: { latencyMs: 800 },
+    };
+
+    const chunk = handleConverseStreamMetadata(metadata, {
+      streamUsage: true,
+    });
+    const msg = chunk.message as AIMessageChunk;
+
+    expect(msg.usage_metadata?.input_token_details).toEqual({
+      cache_read: 0,
+      cache_creation: 10000,
+    });
+  });
+
+  test('should return undefined usage_metadata when streamUsage is false', () => {
+    const metadata = {
+      usage: {
+        inputTokens: 13,
+        outputTokens: 5,
+        totalTokens: 10849,
+        cacheReadInputTokens: 10831,
+        cacheWriteInputTokens: 0,
+      },
+      metrics: { latencyMs: 1000 },
+    };
+
+    const chunk = handleConverseStreamMetadata(metadata, {
+      streamUsage: false,
+    });
+    const msg = chunk.message as AIMessageChunk;
+
+    expect(msg.usage_metadata).toBeUndefined();
+  });
+});
+
+describe('convertConverseMessageToLangChainMessage - cache token extraction', () => {
+  const makeResponseMetadata = (
+    usage: Record<string, number>
+  ): Omit<ConverseResponse, 'output'> =>
+    ({
+      usage,
+      stopReason: 'end_turn',
+      metrics: undefined,
+      $metadata: { requestId: 'test-id' },
+    }) as unknown as Omit<ConverseResponse, 'output'>;
+
+  test('should extract cache tokens in non-streaming response', () => {
+    const message = {
+      role: 'assistant' as const,
+      content: [{ text: 'Hello!' }],
+    };
+
+    const result = convertConverseMessageToLangChainMessage(
+      message,
+      makeResponseMetadata({
+        inputTokens: 20,
+        outputTokens: 5,
+        totalTokens: 10856,
+        cacheReadInputTokens: 10831,
+        cacheWriteInputTokens: 0,
+      })
+    );
+
+    expect(result.usage_metadata).toEqual({
+      input_tokens: 20,
+      output_tokens: 5,
+      total_tokens: 10856,
+      input_token_details: {
+        cache_read: 10831,
+        cache_creation: 0,
+      },
+    });
+  });
+
+  test('should not include input_token_details when no cache tokens in non-streaming response', () => {
+    const message = {
+      role: 'assistant' as const,
+      content: [{ text: 'Hello!' }],
+    };
+
+    const result = convertConverseMessageToLangChainMessage(
+      message,
+      makeResponseMetadata({
+        inputTokens: 100,
+        outputTokens: 50,
+        totalTokens: 150,
+      })
+    );
+
+    expect(result.usage_metadata).toEqual({
+      input_tokens: 100,
+      output_tokens: 50,
+      total_tokens: 150,
+    });
+    expect(result.usage_metadata?.input_token_details).toBeUndefined();
+  });
+});
+
 describe('convertToConverseMessages', () => {
   test('should convert basic messages', () => {
     const { converseMessages, converseSystem } = convertToConverseMessages([
@@ -646,5 +812,68 @@ describe.skip('Integration tests', () => {
       );
       expect(reasoningBlocks.length).toBeGreaterThanOrEqual(0);
     }
+  });
+
+  test('cache tokens should populate input_token_details', async () => {
+    const client = new BedrockRuntimeClient({
+      region: integrationArgs.region,
+      credentials: integrationArgs.credentials,
+    });
+
+    // Large system prompt (>1024 tokens) to meet Bedrock's minimum cache threshold
+    const largeSystemPrompt = [
+      'You are an expert assistant.',
+      ...Array(200).fill(
+        'This is padding content to exceed the minimum token threshold for Bedrock prompt caching. '
+      ),
+      'When answering, be brief and direct.',
+    ].join(' ');
+
+    const systemBlocks = [
+      { text: largeSystemPrompt },
+      { cachePoint: { type: 'default' as const } },
+    ];
+
+    const converseArgs = {
+      modelId: 'us.anthropic.claude-sonnet-4-5-20250929-v1:0',
+      system: systemBlocks,
+      inferenceConfig: { maxTokens: 50 },
+    };
+
+    // Call 1: populate the cache (may be a write or read if already warm)
+    await client.send(
+      new ConverseCommand({
+        ...converseArgs,
+        messages: [{ role: 'user', content: [{ text: 'Say hello.' }] }],
+      })
+    );
+
+    // Call 2: should read from cache — this is the one we assert on
+    const response = await client.send(
+      new ConverseCommand({
+        ...converseArgs,
+        messages: [
+          { role: 'user', content: [{ text: 'Say hello.' }] },
+          { role: 'assistant', content: [{ text: 'Hello!' }] },
+          { role: 'user', content: [{ text: 'Say goodbye.' }] },
+        ],
+      })
+    );
+
+    // Feed raw response through convertConverseMessageToLangChainMessage
+    const result = convertConverseMessageToLangChainMessage(
+      response.output!.message!,
+      response
+    );
+
+    expect(result.usage_metadata).toBeDefined();
+    expect(result.usage_metadata!.input_tokens).toBeGreaterThan(0);
+    expect(result.usage_metadata!.output_tokens).toBeGreaterThan(0);
+
+    // Cache should have been populated by call 1, so call 2 should show cache reads
+    expect(result.usage_metadata!.input_token_details).toBeDefined();
+    expect(
+      result.usage_metadata!.input_token_details!.cache_read
+    ).toBeGreaterThan(0);
   });
 });

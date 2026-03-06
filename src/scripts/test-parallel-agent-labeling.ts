@@ -150,6 +150,7 @@ async function testParallelWithAgentLabeling() {
       },
       customHandlers,
       returnContent: true,
+      skipCleanup: true,
     };
 
     const run = await Run.create(runConfig);
@@ -291,6 +292,7 @@ async function testParallelWithAgentLabeling() {
       },
       customHandlers,
       returnContent: true,
+      skipCleanup: true,
     };
 
     const run2 = await Run.create(runConfig2);

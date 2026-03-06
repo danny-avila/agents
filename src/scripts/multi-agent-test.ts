@@ -141,6 +141,7 @@ async function testMultiAgentHandoff() {
     },
     customHandlers,
     returnContent: true,
+    skipCleanup: true,
   };
 
   try {

@@ -124,6 +124,7 @@ async function testSequentialMetadata() {
     },
     customHandlers,
     returnContent: true,
+    skipCleanup: true,
   };
 
   try {

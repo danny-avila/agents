@@ -110,6 +110,7 @@ async function testThinkingToThinkingHandoffBedrock() {
       },
       customHandlers,
       returnContent: true,
+      skipCleanup: true,
     };
   }
 

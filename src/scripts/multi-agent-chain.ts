@@ -258,6 +258,7 @@ async function testSequentialAgentChain() {
     },
     customHandlers,
     returnContent: true,
+    skipCleanup: true,
   };
 
   try {

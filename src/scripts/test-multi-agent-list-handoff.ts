@@ -183,6 +183,7 @@ async function testSupervisorListHandoff() {
       },
       customHandlers,
       returnContent: true,
+      skipCleanup: true,
     };
   }
 

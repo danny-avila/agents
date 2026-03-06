@@ -187,6 +187,7 @@ When delegating, provide clear instructions to each agent about what they should
     },
     customHandlers,
     returnContent: true,
+    skipCleanup: true,
   };
 
   try {

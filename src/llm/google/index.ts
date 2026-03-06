@@ -10,9 +10,8 @@ import type {
 } from '@google/generative-ai';
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { BaseMessage, UsageMetadata } from '@langchain/core/messages';
-import type { GeminiGenerationConfig } from '@langchain/google-common';
 import type { GeminiApiUsageMetadata, InputTokenDetails } from './types';
-import type { GoogleClientOptions } from '@/types';
+import type { GoogleClientOptions, GoogleThinkingConfig } from '@/types';
 import {
   convertResponseContentToChatGenerationChunk,
   convertBaseMessagesToContent,
@@ -20,7 +19,7 @@ import {
 } from './utils/common';
 
 export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
-  thinkingConfig?: GeminiGenerationConfig['thinkingConfig'];
+  thinkingConfig?: GoogleThinkingConfig;
 
   /**
    * Override to add gemini-3 model support for multimodal and function calling thought signatures

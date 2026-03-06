@@ -131,6 +131,7 @@ describe(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
         additional_instructions: `The user's name is ${userName} and they are located in ${location}.`,
       },
       returnContent: true,
+      skipCleanup: true,
       customHandlers,
     });
 
@@ -173,7 +174,7 @@ describe(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
       contentParts,
       clientOptions: {
         ...llmConfig,
-        model: 'claude-3-5-haiku-latest',
+        model: 'claude-haiku-4-5',
       },
       chainOptions: {
         callbacks: [
@@ -206,6 +207,7 @@ describe(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
         additional_instructions: `The user's name is ${userName} and they are located in ${location}.`,
       },
       returnContent: true,
+      skipCleanup: true,
       customHandlers,
     });
 
@@ -229,7 +231,7 @@ describe(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
       contentParts,
       clientOptions: {
         ...llmConfig,
-        model: 'claude-3-5-haiku-latest',
+        model: 'claude-haiku-4-5',
       },
       chainOptions: {
         callbacks: [
@@ -270,6 +272,7 @@ describe(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
         additional_instructions: `The user's name is ${userName} and they are located in ${location}.`,
       },
       returnContent: true,
+      skipCleanup: true,
       customHandlers,
     });
 
@@ -325,6 +328,7 @@ describe(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
         instructions: 'You are a helpful AI assistant.',
       },
       returnContent: true,
+      skipCleanup: true,
       customHandlers,
     });
 

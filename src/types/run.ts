@@ -115,6 +115,8 @@ export type RunConfig = {
   returnContent?: boolean;
   tokenCounter?: TokenCounter;
   indexTokenCountMap?: Record<string, number>;
+  /** Skip post-stream cleanup (clearHeavyState) — useful for tests that inspect graph state after processStream */
+  skipCleanup?: boolean;
 };
 
 export type ProvidedCallbacks =

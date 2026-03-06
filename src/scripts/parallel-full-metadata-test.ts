@@ -148,6 +148,7 @@ async function testFullMetadata() {
     },
     customHandlers,
     returnContent: true,
+    skipCleanup: true,
   };
 
   try {

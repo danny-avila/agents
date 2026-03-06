@@ -128,6 +128,7 @@ async function testSingleAgent() {
     },
     customHandlers,
     returnContent: true,
+    skipCleanup: true,
   };
 
   try {

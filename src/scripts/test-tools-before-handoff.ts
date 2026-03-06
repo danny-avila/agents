@@ -147,6 +147,7 @@ async function testToolsBeforeHandoff() {
       },
       customHandlers,
       returnContent: true,
+      skipCleanup: true,
     };
   }
 

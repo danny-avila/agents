@@ -11,7 +11,6 @@ import type {
   ClientOptions as OAIClientOptions,
 } from '@langchain/openai';
 import type { GoogleGenerativeAIChatInput } from '@langchain/google-genai';
-import type { GeminiGenerationConfig } from '@langchain/google-common';
 import type { ChatVertexAIInput } from '@langchain/google-vertexai';
 import type { ChatDeepSeekCallOptions } from '@langchain/deepseek';
 import type { ChatOpenRouterCallOptions } from '@/llm/openrouter';
@@ -55,6 +54,11 @@ export type AnthropicReasoning = {
   thinking?: ThinkingConfig | boolean;
   thinkingBudget?: number;
 };
+export type GoogleThinkingConfig = {
+  thinkingBudget?: number;
+  includeThoughts?: boolean;
+  thinkingLevel?: string;
+};
 export type OpenAIClientOptions = ChatOpenAIFields;
 export type AnthropicClientOptions = AnthropicInput & {
   promptCache?: boolean;
@@ -62,6 +66,7 @@ export type AnthropicClientOptions = AnthropicInput & {
 export type MistralAIClientOptions = ChatMistralAIInput;
 export type VertexAIClientOptions = ChatVertexAIInput & {
   includeThoughts?: boolean;
+  thinkingConfig?: GoogleThinkingConfig;
 };
 export type BedrockAnthropicInput = ChatBedrockConverseInput & {
   additionalModelRequestFields?: ChatBedrockConverseInput['additionalModelRequestFields'] &
@@ -72,7 +77,7 @@ export type BedrockConverseClientOptions = ChatBedrockConverseInput;
 export type BedrockAnthropicClientOptions = BedrockAnthropicInput;
 export type GoogleClientOptions = GoogleGenerativeAIChatInput & {
   customHeaders?: RequestOptions['customHeaders'];
-  thinkingConfig?: GeminiGenerationConfig['thinkingConfig'];
+  thinkingConfig?: GoogleThinkingConfig;
 };
 export type DeepSeekClientOptions = ChatDeepSeekCallOptions;
 export type XAIClientOptions = ChatXAIInput;

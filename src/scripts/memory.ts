@@ -17,19 +17,27 @@ const memoryKv: Record<string, string> = {};
 const setMemory = tool(
   async ({ key, value }) => {
     if (!/^[a-z_]+$/.test(key)) {
-      throw new Error('Key must only contain lowercase letters and underscores');
+      throw new Error(
+        'Key must only contain lowercase letters and underscores'
+      );
     }
-    
+
     memoryKv[key] = value;
-    
+
     return { ok: true };
   },
   {
     name: 'set_memory',
     description: 'Saves important data about the user into memory.',
     schema: z.object({
-      key: z.string().describe('The key of the memory value. Always use lowercase and underscores, no other characters.'),
-      value: z.string().describe('Value can be anything represented as a string')
+      key: z
+        .string()
+        .describe(
+          'The key of the memory value. Always use lowercase and underscores, no other characters.'
+        ),
+      value: z
+        .string()
+        .describe('Value can be anything represented as a string'),
     }),
   }
 );
@@ -48,10 +56,12 @@ async function testStandardStreaming(): Promise<void> {
         streaming: false,
       },
       tools: [setMemory],
-      instructions: 'You can use the `set_memory` tool to save important data about the user into memory. If there is nothing to note about the user specifically, respond with `nothing`.',
+      instructions:
+        'You can use the `set_memory` tool to save important data about the user into memory. If there is nothing to note about the user specifically, respond with `nothing`.',
       toolEnd: true,
     },
     returnContent: true,
+    skipCleanup: true,
   });
 
   const config = {

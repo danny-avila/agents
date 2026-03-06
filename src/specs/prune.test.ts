@@ -728,6 +728,7 @@ describe('Prune Messages Tests', () => {
           maxContextTokens: 1000,
         },
         returnContent: true,
+        skipCleanup: true,
         tokenCounter,
         indexTokenCountMap: {},
       });

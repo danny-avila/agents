@@ -56,7 +56,7 @@ export class RunnableCallable<I = unknown, O = unknown> extends Runnable<I, O> {
     runManager?: CallbackManagerForChainRun
   ): Promise<O> {
     return new Promise<O>((resolve, reject) => {
-      const childConfig = patchConfig(config, {
+      let childConfig: Partial<RunnableConfig> | null = patchConfig(config, {
         callbacks: runManager?.getChild(),
       });
       void AsyncLocalStorageProviderSingleton.runWithConfig(
@@ -64,8 +64,10 @@ export class RunnableCallable<I = unknown, O = unknown> extends Runnable<I, O> {
         async () => {
           try {
             const output = await this.func(input, childConfig);
+            childConfig = null;
             resolve(output);
           } catch (e) {
+            childConfig = null;
             reject(e);
           }
         }

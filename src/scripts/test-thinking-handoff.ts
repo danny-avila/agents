@@ -93,6 +93,7 @@ async function testThinkingHandoff() {
       },
       customHandlers,
       returnContent: true,
+      skipCleanup: true,
     };
   }
 

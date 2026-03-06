@@ -137,6 +137,7 @@ const skipTests = process.env.DEEPSEEK_API_KEY == null;
             'You are a helpful math assistant. Use the calculator tool to solve math problems.',
         },
         returnContent: true,
+        skipCleanup: true,
         customHandlers,
       });
 
@@ -197,6 +198,7 @@ const skipTests = process.env.DEEPSEEK_API_KEY == null;
             'You are a helpful math assistant. Use the calculator tool to solve math problems.',
         },
         returnContent: true,
+        skipCleanup: true,
         customHandlers,
       });
 
@@ -249,6 +251,7 @@ const skipTests = process.env.DEEPSEEK_API_KEY == null;
           instructions: 'You are a friendly AI assistant.',
         },
         returnContent: true,
+        skipCleanup: true,
         customHandlers,
       });
 

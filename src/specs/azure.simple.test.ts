@@ -1,6 +1,6 @@
 /* eslint-disable no-console */
 /* eslint-disable @typescript-eslint/no-explicit-any */
-// src/scripts/cli.test.ts
+// src/specs/azure.simple.test.ts
 import { config } from 'dotenv';
 config();
 import { Calculator } from '@/tools/Calculator';
@@ -21,7 +21,6 @@ import { createContentAggregator } from '@/stream';
 import { getLLMConfig } from '@/utils/llmConfig';
 import { Run } from '@/run';
 
-// Auto-skip this suite if Azure env vars are not present
 const requiredAzureEnv = [
   'AZURE_OPENAI_API_KEY',
   'AZURE_OPENAI_API_INSTANCE',
@@ -150,6 +149,7 @@ describeIfAzure(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
             'You are a helpful AI assistant. Keep responses concise and friendly.',
         },
         returnContent: true,
+        skipCleanup: true,
         customHandlers,
       });
 
@@ -235,6 +235,7 @@ describeIfAzure(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
             'You are a helpful AI assistant. Keep responses concise and friendly.',
         },
         returnContent: true,
+        skipCleanup: true,
         customHandlers,
       });
 
@@ -307,6 +308,7 @@ describeIfAzure(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
             'You are a helpful AI assistant. Keep responses concise and friendly.',
         },
         returnContent: true,
+        skipCleanup: true,
         customHandlers,
       });
 
@@ -349,8 +351,145 @@ describeIfAzure(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
     }
   });
 
+  test(`${capitalizeFirstLetter(provider)}: disableStreaming should not duplicate message content`, async () => {
+    if (contentFilterTriggered) {
+      console.warn(
+        'Skipping test: Azure content filter was triggered in previous test'
+      );
+      return;
+    }
+    try {
+      const llmConfig = getLLMConfig(provider);
+      const nonStreamingConfig: t.LLMConfig = {
+        ...llmConfig,
+        disableStreaming: true,
+      };
+
+      const messageDeltaPayloads: t.MessageDeltaEvent[] = [];
+      const localRunStepSpy = jest.fn();
+      const localAggregateContent = createContentAggregator();
+      const localContentParts =
+        localAggregateContent.contentParts as t.MessageContentComplex[];
+      const localAggregate = localAggregateContent.aggregateContent;
+
+      const customHandlers: Record<string | GraphEvents, t.EventHandler> = {
+        [GraphEvents.TOOL_END]: new ToolEndHandler(),
+        [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(collectedUsage),
+        [GraphEvents.ON_RUN_STEP_COMPLETED]: {
+          handle: (
+            event: GraphEvents.ON_RUN_STEP_COMPLETED,
+            data: t.StreamEventData
+          ): void => {
+            localAggregate({
+              event,
+              data: data as unknown as { result: t.ToolEndEvent },
+            });
+          },
+        },
+        [GraphEvents.ON_RUN_STEP]: {
+          handle: (
+            event: GraphEvents.ON_RUN_STEP,
+            data: t.StreamEventData,
+            metadata,
+            graph
+          ): void => {
+            localRunStepSpy(event, data, metadata, graph);
+            localAggregate({ event, data: data as t.RunStep });
+          },
+        },
+        [GraphEvents.ON_RUN_STEP_DELTA]: {
+          handle: (
+            event: GraphEvents.ON_RUN_STEP_DELTA,
+            data: t.StreamEventData
+          ): void => {
+            localAggregate({ event, data: data as t.RunStepDeltaEvent });
+          },
+        },
+        [GraphEvents.ON_MESSAGE_DELTA]: {
+          handle: (
+            event: GraphEvents.ON_MESSAGE_DELTA,
+            data: t.StreamEventData
+          ): void => {
+            messageDeltaPayloads.push(data as t.MessageDeltaEvent);
+            localAggregate({ event, data: data as t.MessageDeltaEvent });
+          },
+        },
+      };
+
+      run = await Run.create<t.IState>({
+        runId: 'azure-disable-streaming-dedup-test',
+        graphConfig: {
+          type: 'standard',
+          llmConfig: nonStreamingConfig,
+          tools: [],
+          instructions:
+            'You are a helpful AI assistant. Respond with exactly one sentence.',
+        },
+        returnContent: true,
+        skipCleanup: true,
+        customHandlers,
+      });
+
+      conversationHistory.push(new HumanMessage('Hello'));
+
+      const finalContentParts = await run.processStream(
+        { messages: conversationHistory },
+        config
+      );
+
+      expect(finalContentParts).toBeDefined();
+      expect(finalContentParts!.length).toBeGreaterThan(0);
+      expect(messageDeltaPayloads.length).toBeGreaterThan(0);
+
+      const allTextDeltas = messageDeltaPayloads
+        .flatMap((p) => p.delta.content ?? [])
+        .filter((c) => c.type === ContentTypes.TEXT)
+        .map((c) => ('text' in c ? c.text : ''));
+
+      const combinedText = allTextDeltas.join('');
+
+      /**
+       * When model.stream() is available (the common path even with
+       * disableStreaming), ChatModelStreamHandler already dispatches the full
+       * text as a single MESSAGE_DELTA. The disableStreaming fallback block in
+       * createCallModel must NOT dispatch the same content a second time.
+       *
+       * If the bug is present, the text is emitted twice and localContentParts
+       * will contain duplicated text.
+       */
+      const aggregatedText = localContentParts
+        .filter((p) => p.type === ContentTypes.TEXT)
+        .map((p) => ('text' in p ? p.text : ''))
+        .join('');
+
+      console.log('Message delta count:', messageDeltaPayloads.length);
+      console.log('Combined delta text length:', combinedText.length);
+      console.log('Aggregated text length:', aggregatedText.length);
+
+      /**
+       * Each delta payload contains the FULL text (non-streaming returns a
+       * single chunk). If the bug is present, we get >=2 identical payloads
+       * and the aggregated text will be 2x the actual response.
+       */
+      const uniqueTexts = [...new Set(allTextDeltas)];
+      expect(uniqueTexts.length).toBe(1);
+      expect(uniqueTexts[0].length).toBeGreaterThan(0);
+
+      const singleResponseText = uniqueTexts[0];
+      expect(aggregatedText).toBe(singleResponseText);
+      expect(combinedText).toBe(singleResponseText);
+
+      console.log('disableStreaming dedup test passed — no duplicate content');
+    } catch (error) {
+      if (isContentFilterError(error)) {
+        console.warn('Skipping test: Azure content filter triggered');
+        return;
+      }
+      throw error;
+    }
+  });
+
   test('should handle errors appropriately', async () => {
-    // Test error scenarios
     await expect(async () => {
       await run.processStream(
         {

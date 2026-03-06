@@ -91,6 +91,7 @@ async function testBedrockThinkingHandoff() {
       },
       customHandlers,
       returnContent: true,
+      skipCleanup: true,
     };
   }
 

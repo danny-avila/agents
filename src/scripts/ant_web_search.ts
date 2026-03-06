@@ -98,6 +98,7 @@ async function testStandardStreaming(): Promise<void> {
       // additional_instructions: `Always address the user by their name. The user's name is ${userName} and they are located in ${location}.`,
     },
     returnContent: true,
+    skipCleanup: true,
     customHandlers,
   });
 

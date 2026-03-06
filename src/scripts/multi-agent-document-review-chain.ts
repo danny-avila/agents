@@ -142,6 +142,7 @@ async function testDocumentReviewChain() {
     },
     customHandlers,
     returnContent: true,
+    skipCleanup: true,
   };
 
   try {

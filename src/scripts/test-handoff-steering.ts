@@ -134,6 +134,7 @@ When you receive a task, execute it thoroughly. Always identify yourself as the 
       graphConfig: { type: 'multi-agent', agents, edges },
       customHandlers,
       returnContent: true,
+      skipCleanup: true,
     });
 
     const streamConfig: Partial<RunnableConfig> & {
@@ -238,6 +239,7 @@ You must follow the exact format requested.`,
       graphConfig: { type: 'multi-agent', agents, edges },
       customHandlers,
       returnContent: true,
+      skipCleanup: true,
     });
 
     const streamConfig: Partial<RunnableConfig> & {
@@ -332,6 +334,7 @@ If asked about non-Italian food, politely redirect to Italian alternatives.`,
       graphConfig: { type: 'multi-agent', agents, edges },
       customHandlers,
       returnContent: true,
+      skipCleanup: true,
     });
 
     const streamConfig: Partial<RunnableConfig> & {

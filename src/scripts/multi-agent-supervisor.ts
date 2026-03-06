@@ -293,6 +293,7 @@ async function testSupervisorMultiAgent() {
       },
       customHandlers,
       returnContent: true,
+      skipCleanup: true,
     };
   }
 

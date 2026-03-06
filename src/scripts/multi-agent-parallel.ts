@@ -322,6 +322,7 @@ async function testParallelMultiAgent() {
     },
     customHandlers,
     returnContent: true,
+    skipCleanup: true,
   };
 
   try {

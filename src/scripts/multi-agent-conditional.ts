@@ -166,6 +166,7 @@ async function testConditionalMultiAgent() {
     },
     customHandlers,
     returnContent: true,
+    skipCleanup: true,
   };
 
   try {

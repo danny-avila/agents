@@ -1,6 +1,6 @@
 {
   "name": "@librechat/agents",
-  "version": "3.1.50",
+  "version": "3.1.55",
   "main": "./dist/cjs/main.cjs",
   "module": "./dist/esm/main.mjs",
   "types": "./dist/types/index.d.ts",
@@ -112,7 +112,9 @@
     "@browserbasehq/stagehand": {
       "openai": "$openai"
     },
-    "fast-xml-parser": "5.3.4"
+    "fast-xml-parser": "5.3.8",
+    "ajv": "6.14.0",
+    "minimatch": "3.1.4"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.73.0",
@@ -132,6 +134,7 @@
     "@langfuse/otel": "^4.3.0",
     "@langfuse/tracing": "^4.3.0",
     "@opentelemetry/sdk-node": "^0.207.0",
+    "@scarf/scarf": "^1.4.0",
     "axios": "^1.13.5",
     "cheerio": "^1.0.0",
     "dotenv": "^16.4.7",
@@ -168,7 +171,7 @@
     "jest-util": "^30.2.0",
     "lint-staged": "^15.2.7",
     "prettier": "^3.6.2",
-    "rollup": "^4.34.6",
+    "rollup": "^4.59.0",
     "rollup-plugin-cleandir": "^2.0.0",
     "ts-jest": "^29.4.5",
     "ts-node": "^10.9.2",

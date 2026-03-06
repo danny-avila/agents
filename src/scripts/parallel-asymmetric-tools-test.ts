@@ -182,6 +182,7 @@ async function testAsymmetricParallelTools() {
     },
     customHandlers,
     returnContent: true,
+    skipCleanup: true,
   };
 
   try {

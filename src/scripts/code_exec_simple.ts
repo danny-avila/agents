@@ -101,6 +101,7 @@ async function testCodeExecution(): Promise<void> {
       maxContextTokens: 8000,
     },
     returnContent: true,
+    skipCleanup: true,
     customHandlers,
     indexTokenCountMap,
     tokenCounter,

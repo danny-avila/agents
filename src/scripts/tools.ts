@@ -122,6 +122,7 @@ async function testStandardStreaming(): Promise<void> {
     },
     indexTokenCountMap: { 0: 35 },
     returnContent: true,
+    skipCleanup: true,
     customHandlers,
   });
 

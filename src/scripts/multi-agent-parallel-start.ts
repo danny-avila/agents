@@ -170,6 +170,7 @@ async function testParallelFromStart() {
     },
     customHandlers,
     returnContent: true,
+    skipCleanup: true,
   };
 
   try {

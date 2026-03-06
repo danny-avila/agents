@@ -127,6 +127,7 @@ async function testCodeExecution(): Promise<void> {
       additional_instructions: `The user's name is ${userName} and they are located in ${location}. The current date is ${currentDate}.`,
     },
     returnContent: true,
+    skipCleanup: true,
     customHandlers,
   });
 

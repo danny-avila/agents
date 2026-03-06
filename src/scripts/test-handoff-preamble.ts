@@ -151,6 +151,7 @@ IMPORTANT: You are the specialist - provide a complete, helpful response to the 
     },
     customHandlers,
     returnContent: true,
+    skipCleanup: true,
   };
 
   const run = await Run.create(runConfig);

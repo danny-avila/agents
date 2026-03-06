@@ -829,6 +829,190 @@ describe('formatAgentMessages', () => {
     );
   });
 
+  it('should strip reasoning_content blocks and join TEXT parts as string', () => {
+    const payload = [
+      {
+        role: 'assistant',
+        content: [
+          { type: ContentTypes.TEXT, [ContentTypes.TEXT]: '\n\n' },
+          {
+            type: ContentTypes.REASONING_CONTENT,
+            reasoningText: { text: 'Thinking deeply...', signature: 'sig123' },
+            index: 0,
+          },
+          { type: ContentTypes.TEXT, [ContentTypes.TEXT]: 'The answer is 42.' },
+        ],
+      },
+    ];
+
+    const result = formatAgentMessages(payload);
+
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0]).toBeInstanceOf(AIMessage);
+    expect(result.messages[0].content).toBe('The answer is 42.');
+    expect(JSON.stringify(result.messages[0].content)).not.toContain(
+      'reasoning_content'
+    );
+  });
+
+  it('should strip thinking blocks and join TEXT parts as string', () => {
+    const payload = [
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.THINKING,
+            thinking: 'Internal reasoning...',
+            signature: 'sig456',
+          },
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]: 'Here is my answer.',
+          },
+        ],
+      },
+    ];
+
+    const result = formatAgentMessages(payload);
+
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0]).toBeInstanceOf(AIMessage);
+    expect(result.messages[0].content).toBe('Here is my answer.');
+    expect(JSON.stringify(result.messages[0].content)).not.toContain(
+      'thinking'
+    );
+  });
+
+  it('should strip redacted_thinking blocks and join TEXT parts as string', () => {
+    const payload = [
+      {
+        role: 'assistant',
+        content: [
+          { type: 'redacted_thinking', data: 'REDACTED_SIGNATURE' },
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]: 'Here is my answer.',
+          },
+        ],
+      },
+    ];
+
+    const result = formatAgentMessages(payload);
+
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0]).toBeInstanceOf(AIMessage);
+    expect(result.messages[0].content).toBe('Here is my answer.');
+    expect(JSON.stringify(result.messages[0].content)).not.toContain(
+      'redacted_thinking'
+    );
+  });
+
+  it('should produce no AIMessage when only reasoning_content and whitespace text are present', () => {
+    const payload = [
+      {
+        role: 'assistant',
+        content: [
+          { type: ContentTypes.TEXT, [ContentTypes.TEXT]: '\n\n' },
+          {
+            type: ContentTypes.REASONING_CONTENT,
+            reasoningText: { text: 'Silent reasoning', signature: 'sig' },
+          },
+        ],
+      },
+    ];
+
+    const result = formatAgentMessages(payload);
+
+    expect(result.messages).toHaveLength(0);
+  });
+
+  it('should drop whitespace-only text parts from non-reasoning messages', () => {
+    const payload = [
+      {
+        role: 'assistant',
+        content: [
+          { type: ContentTypes.TEXT, [ContentTypes.TEXT]: '\n\n' },
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]: 'Actual content here.',
+          },
+          { type: ContentTypes.TEXT, [ContentTypes.TEXT]: '   ' },
+        ],
+      },
+    ];
+
+    const result = formatAgentMessages(payload);
+
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0]).toBeInstanceOf(AIMessage);
+    const content = result.messages[0].content;
+    expect(Array.isArray(content)).toBe(true);
+    expect(
+      (content as { type: string; text?: string }[]).every(
+        (p) => (p.text ?? '').trim() !== ''
+      )
+    ).toBe(true);
+  });
+
+  it('should preserve whitespace-only text that has tool_call_ids (common Bedrock pattern)', () => {
+    const payload = [
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]: '\n\n',
+            tool_call_ids: ['tc-1'],
+          },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 'tc-1',
+              name: 'search',
+              args: '{"query":"test"}',
+              output: 'Results here',
+            },
+          },
+        ],
+      },
+    ];
+
+    const result = formatAgentMessages(payload);
+
+    expect(result.messages).toHaveLength(2);
+    expect(result.messages[0]).toBeInstanceOf(AIMessage);
+    expect(result.messages[1]).toBeInstanceOf(ToolMessage);
+    expect((result.messages[0] as AIMessage).tool_calls).toHaveLength(1);
+    expect((result.messages[1] as ToolMessage).tool_call_id).toBe('tc-1');
+  });
+
+  it('should handle whitespace-only text without tool_call_ids before a tool call', () => {
+    const payload = [
+      {
+        role: 'assistant',
+        content: [
+          { type: ContentTypes.TEXT, [ContentTypes.TEXT]: '\n\n' },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 'tc-2',
+              name: 'search',
+              args: '{"query":"test"}',
+              output: 'Results here',
+            },
+          },
+        ],
+      },
+    ];
+
+    const result = formatAgentMessages(payload);
+
+    expect(result.messages).toHaveLength(2);
+    expect(result.messages[0]).toBeInstanceOf(AIMessage);
+    expect(result.messages[1]).toBeInstanceOf(ToolMessage);
+    expect((result.messages[0] as AIMessage).tool_calls).toHaveLength(1);
+  });
+
   it('should exclude ERROR type content parts', () => {
     const payload = [
       {

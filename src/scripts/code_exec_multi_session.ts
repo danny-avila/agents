@@ -73,6 +73,7 @@ When reading files, print their contents.
 Be concise in responses.`,
     },
     returnContent: true,
+    skipCleanup: true,
     customHandlers,
   });
 

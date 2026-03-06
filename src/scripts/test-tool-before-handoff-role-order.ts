@@ -173,6 +173,7 @@ Do NOT write a long response. Just call the tool and hand off.`,
     },
     customHandlers,
     returnContent: true,
+    skipCleanup: true,
   };
 
   const run = await Run.create(runConfig);

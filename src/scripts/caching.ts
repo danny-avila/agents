@@ -74,6 +74,7 @@ ${CACHED_TEXT}`;
       llmConfig,
     },
     returnContent: true,
+    skipCleanup: true,
     customHandlers,
   });
 

@@ -141,6 +141,7 @@ When writing Python code:
       additional_instructions: `User: ${userName}, Location: ${location}, Date: ${currentDate}.`,
     },
     returnContent: true,
+    skipCleanup: true,
     customHandlers,
   });
 

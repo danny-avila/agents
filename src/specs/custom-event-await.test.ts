@@ -89,6 +89,7 @@ describe('Custom event handler awaitHandlers behavior', () => {
         llmConfig,
       },
       returnContent: true,
+      skipCleanup: true,
       customHandlers,
     });
 
@@ -183,6 +184,7 @@ describe('Custom event handler awaitHandlers behavior', () => {
         llmConfig,
       },
       returnContent: true,
+      skipCleanup: true,
       customHandlers,
     });
 

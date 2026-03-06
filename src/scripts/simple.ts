@@ -141,6 +141,7 @@ async function testStandardStreaming(): Promise<void> {
       additional_instructions: `The user's name is ${userName} and they are located in ${location}.`,
     },
     returnContent: true,
+    skipCleanup: true,
     customHandlers,
   });
 
@@ -192,7 +193,7 @@ async function testStandardStreaming(): Promise<void> {
   };
   if (provider === Providers.ANTHROPIC) {
     titleOptions.clientOptions = {
-      model: 'claude-3-5-haiku-latest',
+      model: 'claude-haiku-4-5',
     };
   }
   const titleResult = await run.generateTitle(titleOptions);

@@ -222,6 +222,7 @@ async function testParallelWithTools() {
     },
     customHandlers,
     returnContent: true,
+    skipCleanup: true,
   };
 
   try {

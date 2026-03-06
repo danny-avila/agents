@@ -40,6 +40,7 @@ describe('Thinking-Enabled Agent Handoff Tests', () => {
       edges,
     },
     returnContent: true,
+    skipCleanup: true,
   });
 
   describe('OpenAI to Anthropic with Thinking', () => {

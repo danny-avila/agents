@@ -97,6 +97,7 @@ async function testStandardStreaming(): Promise<void> {
       instructions: 'You are a helpful AI research assistant.',
     },
     returnContent: true,
+    skipCleanup: true,
     customHandlers,
   });
 

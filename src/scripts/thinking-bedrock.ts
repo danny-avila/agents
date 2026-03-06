@@ -91,6 +91,7 @@ async function testBedrockThinking(): Promise<void> {
       llmConfig,
     },
     returnContent: true,
+    skipCleanup: true,
     customHandlers: customHandlers as t.RunConfig['customHandlers'],
   });
 

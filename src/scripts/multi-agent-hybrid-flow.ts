@@ -240,6 +240,7 @@ async function testHybridMultiAgent() {
         },
         customHandlers,
         returnContent: true,
+        skipCleanup: true,
       };
 
       // Create and execute a new run for this test

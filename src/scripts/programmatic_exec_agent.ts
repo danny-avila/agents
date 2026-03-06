@@ -138,6 +138,7 @@ async function main(): Promise<void> {
       ],
     },
     returnContent: true,
+    skipCleanup: true,
   });
 
   const config: Partial<RunnableConfig> & {
