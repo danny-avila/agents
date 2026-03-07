@@ -233,10 +233,7 @@ export class Run<_T extends t.BaseGraphState> {
           ? rawContent
             .filter(
               (c): c is { type: string; text: string } =>
-                c != null &&
-                  typeof c === 'object' &&
-                  'type' in c &&
-                  c.type === 'text'
+                typeof c === 'object' && 'type' in c && c.type === 'text'
             )
             .map((c) => c.text)
             .join('\n')
@@ -245,13 +242,19 @@ export class Run<_T extends t.BaseGraphState> {
     const contentParts = this.Graph?.getContentParts() ?? [];
     const outputSegments: string[] = [];
     for (const part of contentParts) {
-      if (part == null) {
-        continue;
-      }
-      if (part.type === 'thinking' && part.thinking) {
-        outputSegments.push(`Thought: "${part.thinking}"`);
-      } else if (part.type === 'text' && part.text) {
-        outputSegments.push(part.text);
+      const p = part as { type?: string; thinking?: string; text?: string };
+      if (
+        p.type === 'thinking' &&
+        typeof p.thinking === 'string' &&
+        p.thinking !== ''
+      ) {
+        outputSegments.push(`Thought: "${p.thinking}"`);
+      } else if (
+        p.type === 'text' &&
+        typeof p.text === 'string' &&
+        p.text !== ''
+      ) {
+        outputSegments.push(p.text);
       }
     }
     const cleanOutput =
@@ -286,6 +289,7 @@ export class Run<_T extends t.BaseGraphState> {
         ],
       }),
     }).catch((err: unknown) => {
+      // eslint-disable-next-line no-console
       console.debug(
         '[Langfuse] trace delta-update failed:',
         err instanceof Error ? err.message : err
@@ -391,7 +395,7 @@ export class Run<_T extends t.BaseGraphState> {
       }
     }
 
-    if (langfuseEnabled && langfuseHandler?.last_trace_id) {
+    if (langfuseEnabled && langfuseHandler?.last_trace_id != null) {
       this.updateLangfuseTrace(langfuseHandler, inputs);
     }
 
