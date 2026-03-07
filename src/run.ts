@@ -218,8 +218,7 @@ export class Run<_T extends t.BaseGraphState> {
    */
   private updateLangfuseTrace(
     handler: CallbackHandler,
-    inputs: t.IState,
-    agentName?: string
+    inputs: t.IState
   ): void {
     const traceId = handler.last_trace_id;
 
@@ -283,7 +282,6 @@ export class Run<_T extends t.BaseGraphState> {
             timestamp: new Date().toISOString(),
             body: {
               id: traceId,
-              ...(agentName != null && { name: agentName }),
               ...(cleanInput != null && { input: cleanInput }),
               ...(cleanOutput != null && { output: cleanOutput }),
             },
@@ -394,11 +392,7 @@ export class Run<_T extends t.BaseGraphState> {
     }
 
     if (langfuseEnabled && langfuseHandler?.last_trace_id != null) {
-      this.updateLangfuseTrace(
-        langfuseHandler,
-        inputs,
-        config.configurable.agent_name
-      );
+      this.updateLangfuseTrace(langfuseHandler, inputs);
     }
 
     /**
