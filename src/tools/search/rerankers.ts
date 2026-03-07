@@ -1,4 +1,4 @@
-import axios from 'axios';
+import axios, { isAxiosError } from 'axios';
 import type * as t from './types';
 import { createDefaultLogger } from './utils';
 
@@ -280,6 +280,16 @@ export class CustomReranker extends BaseReranker {
       }
     } catch (error) {
       this.logger.error('Error using custom reranker:', error);
+      if (isAxiosError(error) && error.response) {
+        this.logger.error(
+          'Custom reranker response status:',
+          error.response.status
+        );
+        this.logger.error(
+          'Custom reranker response data:',
+          JSON.stringify(error.response.data)
+        );
+      }
       return this.getDefaultRanking(documents, topK);
     }
   }
