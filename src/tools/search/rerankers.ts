@@ -49,7 +49,9 @@ export class JinaReranker extends BaseReranker {
     documents: string[],
     topK: number = 5
   ): Promise<t.Highlight[]> {
-    this.logger.debug(`Reranking ${documents.length} chunks with Jina using API URL: ${this.apiUrl}`);
+    this.logger.debug(
+      `Reranking ${documents.length} chunks with Jina using API URL: ${this.apiUrl}`
+    );
 
     try {
       if (this.apiKey == null || this.apiKey === '') {
@@ -181,6 +183,108 @@ export class CohereReranker extends BaseReranker {
   }
 }
 
+export class CustomReranker extends BaseReranker {
+  private apiUrl: string | undefined;
+  private model: string | undefined;
+
+  constructor({
+    apiUrl = process.env.CUSTOM_RERANKER_API_URL,
+    apiKey = process.env.CUSTOM_RERANKER_API_KEY,
+    model = process.env.CUSTOM_RERANKER_MODEL,
+    logger,
+  }: {
+    apiUrl?: string;
+    apiKey?: string;
+    model?: string;
+    logger?: t.Logger;
+  }) {
+    super(logger);
+    this.apiKey = apiKey;
+    this.apiUrl = apiUrl;
+    this.model = model;
+  }
+
+  async rerank(
+    query: string,
+    documents: string[],
+    topK: number = 5
+  ): Promise<t.Highlight[]> {
+    this.logger.debug(
+      `Reranking ${documents.length} chunks with custom reranker using API URL: ${this.apiUrl}`
+    );
+
+    if (this.apiUrl == null || this.apiUrl === '') {
+      this.logger.warn(
+        'CUSTOM_RERANKER_API_URL is not set. Using default ranking.'
+      );
+      return this.getDefaultRanking(documents, topK);
+    }
+
+    if (this.model == null || this.model === '') {
+      this.logger.warn(
+        'CUSTOM_RERANKER_MODEL is not set. Using default ranking.'
+      );
+      return this.getDefaultRanking(documents, topK);
+    }
+
+    try {
+      const requestData = {
+        model: this.model,
+        query: query,
+        top_n: topK,
+        documents: documents,
+        return_documents: true,
+      };
+
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+      };
+
+      if (this.apiKey != null && this.apiKey !== '') {
+        headers.Authorization = `Bearer ${this.apiKey}`;
+      }
+
+      const response = await axios.post<t.JinaRerankerResponse | undefined>(
+        this.apiUrl,
+        requestData,
+        { headers }
+      );
+
+      this.logger.debug('Custom Reranker API Model:', response.data?.model);
+      this.logger.debug('Custom Reranker API Usage:', response.data?.usage);
+
+      if (response.data && response.data.results.length) {
+        return response.data.results.map((result) => {
+          const docIndex = result.index;
+          const score = result.relevance_score;
+          let text = '';
+
+          if (result.document != null) {
+            const doc = result.document;
+            if (typeof doc === 'object' && 'text' in doc) {
+              text = doc.text;
+            } else if (typeof doc === 'string') {
+              text = doc;
+            }
+          } else {
+            text = documents[docIndex];
+          }
+
+          return { text, score };
+        });
+      } else {
+        this.logger.warn(
+          'Unexpected response format from custom reranker API. Using default ranking.'
+        );
+        return this.getDefaultRanking(documents, topK);
+      }
+    } catch (error) {
+      this.logger.error('Error using custom reranker:', error);
+      return this.getDefaultRanking(documents, topK);
+    }
+  }
+}
+
 export class InfinityReranker extends BaseReranker {
   constructor(logger?: t.Logger) {
     super(logger);
@@ -208,19 +312,42 @@ export const createReranker = (config: {
   jinaApiKey?: string;
   jinaApiUrl?: string;
   cohereApiKey?: string;
+  customRerankerApiUrl?: string;
+  customRerankerApiKey?: string;
+  customRerankerModel?: string;
   logger?: t.Logger;
 }): BaseReranker | undefined => {
-  const { rerankerType, jinaApiKey, jinaApiUrl, cohereApiKey, logger } = config;
+  const {
+    rerankerType,
+    jinaApiKey,
+    jinaApiUrl,
+    cohereApiKey,
+    customRerankerApiUrl,
+    customRerankerApiKey,
+    customRerankerModel,
+    logger,
+  } = config;
 
   // Create a default logger if none is provided
   const defaultLogger = logger || createDefaultLogger();
 
   switch (rerankerType.toLowerCase()) {
   case 'jina':
-    return new JinaReranker({ apiKey: jinaApiKey, apiUrl: jinaApiUrl, logger: defaultLogger });
+    return new JinaReranker({
+      apiKey: jinaApiKey,
+      apiUrl: jinaApiUrl,
+      logger: defaultLogger,
+    });
   case 'cohere':
     return new CohereReranker({
       apiKey: cohereApiKey,
+      logger: defaultLogger,
+    });
+  case 'custom':
+    return new CustomReranker({
+      apiUrl: customRerankerApiUrl,
+      apiKey: customRerankerApiKey,
+      model: customRerankerModel,
       logger: defaultLogger,
     });
   case 'infinity':
@@ -232,7 +359,11 @@ export const createReranker = (config: {
     defaultLogger.warn(
       `Unknown reranker type: ${rerankerType}. Defaulting to InfinityReranker.`
     );
-    return new JinaReranker({ apiKey: jinaApiKey, apiUrl: jinaApiUrl, logger: defaultLogger });
+    return new JinaReranker({
+      apiKey: jinaApiKey,
+      apiUrl: jinaApiUrl,
+      logger: defaultLogger,
+    });
   }
 };
 
