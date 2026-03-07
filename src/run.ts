@@ -288,13 +288,7 @@ export class Run<_T extends t.BaseGraphState> {
           },
         ],
       }),
-    }).catch((err: unknown) => {
-      // eslint-disable-next-line no-console
-      console.debug(
-        '[Langfuse] trace delta-update failed:',
-        err instanceof Error ? err.message : err
-      );
-    });
+    }).catch(() => {});
   }
 
   async processStream(
