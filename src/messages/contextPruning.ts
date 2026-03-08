@@ -13,13 +13,15 @@
  */
 
 import { ToolMessage, type BaseMessage } from '@langchain/core/messages';
-import type { TokenCounter } from '@/types/run';
 import type { ContextPruningConfig } from '@/types/graph';
+import type { TokenCounter } from '@/types/run';
 import type { ContextPruningSettings } from './contextPruningSettings';
 import { resolveContextPruningSettings } from './contextPruningSettings';
 
 /**
- * Checks if a message contains image content blocks (should not be pruned).
+ * Checks if a message contains image content blocks.
+ * Messages with images are skipped by position-based content degradation
+ * because images cannot be meaningfully soft-trimmed or replaced with placeholders.
  */
 function hasImageContent(message: BaseMessage): boolean {
   if (!Array.isArray(message.content)) {
