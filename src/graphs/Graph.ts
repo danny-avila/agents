@@ -17,7 +17,11 @@ import {
   Annotation,
   messagesStateReducer,
 } from '@langchain/langgraph';
-import type { UsageMetadata, BaseMessage, MessageContent } from '@langchain/core/messages';
+import type {
+  UsageMetadata,
+  BaseMessage,
+  MessageContent,
+} from '@langchain/core/messages';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
 import {
@@ -860,7 +864,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           agentContext.summarizationEnabled === true &&
           Array.isArray(messagesToRefine) &&
           messagesToRefine.length > 0 &&
-          !agentContext.shouldSkipSummarization(messages.length) &&
+          context.length > 0 &&
+          (remainingContextTokens == null || remainingContextTokens >= 0) &&
+          agentContext.shouldSkipSummarization(messages.length) === false &&
           shouldTriggerSummarization({
             trigger: agentContext.summarizationConfig?.trigger,
             maxContextTokens: agentContext.maxContextTokens,
@@ -890,6 +896,27 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               agentId: agentId || agentContext.agentId,
             },
           } as unknown as Partial<t.BaseGraphState>;
+        } else if (
+          agentContext.summarizationEnabled === true &&
+          Array.isArray(messagesToRefine) &&
+          messagesToRefine.length > 0 &&
+          (context.length === 0 ||
+            (remainingContextTokens != null && remainingContextTokens < 0))
+        ) {
+          emitAgentLog(
+            config,
+            'warn',
+            'graph',
+            'Summarization skipped — instructions exceed context budget',
+            {
+              contextLength: context.length,
+              messagesToRefineCount: messagesToRefine.length,
+              remainingContextTokens: remainingContextTokens ?? 0,
+              instructionTokens: agentContext.instructionTokens,
+              maxContextTokens: agentContext.maxContextTokens,
+            },
+            { runId: this.runId, agentId }
+          );
         }
       }
 
