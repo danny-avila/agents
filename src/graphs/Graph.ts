@@ -923,6 +923,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               remainingContextTokens: remainingContextTokens ?? 0,
               instructionTokens: agentContext.instructionTokens,
               maxContextTokens: agentContext.maxContextTokens,
+              breakdown: agentContext.formatTokenBudgetBreakdown(messages),
             },
             { runId: this.runId, agentId }
           );
