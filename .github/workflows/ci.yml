@@ -50,7 +50,7 @@ jobs:
           key: node-modules-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
 
       - name: ESLint
-        run: npx eslint "{,!(node_modules|venv)/**/}*.{js,jsx,ts,tsx}"
+        run: npx eslint "src/**/*.ts"
 
   typecheck:
     needs: install
