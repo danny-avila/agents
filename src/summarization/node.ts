@@ -12,6 +12,7 @@ import { ContentTypes, GraphEvents, StepTypes, Providers } from '@/common';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { createRemoveAllMessage } from '@/messages/reducer';
 import { getChatModelClass } from '@/llm/providers';
+import { getChunkContent } from '@/stream';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -622,12 +623,29 @@ export function createSummarizeNode({
     // passed to the ChatModel constructor where they don't belong.
     const { llmParams, summarizationParams } = separateParameters(parameters);
 
+    // When the summarization provider matches the agent's provider (self-summarize),
+    // reuse the agent's clientOptions as the base. This ensures provider-specific
+    // settings (region, credentials, endpoint, proxy, etc.) are inherited without
+    // requiring the caller to forward them explicitly.
+    const isSelfSummarize = provider === agentContext.provider;
+    const baseOptions =
+      isSelfSummarize && agentContext.clientOptions
+        ? { ...agentContext.clientOptions }
+        : {};
+
     // Build LLM constructor options — clean of any main agent context.
     // The summarizer is its own agent: no tools, no system instructions
     // from the parent, just the summarization prompt.
     const clientOptions: Record<string, unknown> = {
+      ...baseOptions,
       ...llmParams,
     };
+
+    // Strip agent-specific fields that don't apply to summarization.
+    delete clientOptions.tools;
+    delete clientOptions.streaming;
+    delete clientOptions.streamUsage;
+
     if (modelName != null && modelName !== '') {
       clientOptions.model = modelName;
       clientOptions.modelName = modelName;
@@ -765,6 +783,7 @@ export function createSummarizeNode({
           stepId,
           maxSummaryTokens: effectiveMaxSummaryTokens,
           tokenCounter: agentContext.tokenCounter,
+          provider: provider as Providers,
         });
       } else {
         summaryText = await summarizeSinglePass({
@@ -777,9 +796,10 @@ export function createSummarizeNode({
           streaming,
           stepId,
           tokenCounter: agentContext.tokenCounter,
+          provider: provider as Providers,
         });
       }
-    } catch {
+    } catch (err) {
       // S2a: Log tier 1 failure, falling back to tier 2
       emitAgentLog(
         runnableConfig,
@@ -789,6 +809,7 @@ export function createSummarizeNode({
         {
           tier: 1,
           fallback: 'single_pass_half_budget',
+          error: err instanceof Error ? err.message : String(err),
         },
         { runId: graph.runId, agentId: request.agentId }
       );
@@ -805,8 +826,9 @@ export function createSummarizeNode({
           stepId,
           budgetChars: Math.floor((CHUNK_BUDGET_TOKENS * 4) / 2),
           tokenCounter: agentContext.tokenCounter,
+          provider: provider as Providers,
         });
-      } catch {
+      } catch (err2) {
         // S2b: Log tier 2 failure, falling back to tier 3
         emitAgentLog(
           runnableConfig,
@@ -816,6 +838,7 @@ export function createSummarizeNode({
           {
             tier: 2,
             fallback: 'metadata_stub',
+            error: err2 instanceof Error ? err2.message : String(err2),
           },
           { runId: graph.runId, agentId: request.agentId }
         );
@@ -1008,6 +1031,10 @@ interface SummarizeParams {
   stepId?: string;
   /** Token counter from the graph's agent context. When provided, enables accurate token-based budgeting for chunking decisions. */
   tokenCounter?: (msg: BaseMessage) => number;
+  /** Provider for chunk content extraction (determines how reasoning tokens are handled). */
+  provider?: Providers;
+  /** Key used for reasoning content in additional_kwargs. */
+  reasoningKey?: 'reasoning_content' | 'reasoning';
 }
 
 /**
@@ -1015,11 +1042,36 @@ interface SummarizeParams {
  * structured content formats.
  */
 function extractResponseText(response: { content: string | object }): string {
-  return (
-    typeof response.content === 'string'
-      ? response.content
-      : JSON.stringify(response.content)
-  ).trim();
+  const { content } = response;
+  if (typeof content === 'string') {
+    return content.trim();
+  }
+  if (!Array.isArray(content)) {
+    return '';
+  }
+  const parts: string[] = [];
+  for (const block of content) {
+    if (typeof block === 'string') {
+      parts.push(block);
+      continue;
+    }
+    if (block == null || typeof block !== 'object') {
+      continue;
+    }
+    const rec = block as Record<string, unknown>;
+    // Skip reasoning/thinking blocks — only collect text output.
+    if (
+      rec.type === ContentTypes.THINKING ||
+      rec.type === ContentTypes.REASONING_CONTENT ||
+      rec.type === 'redacted_thinking'
+    ) {
+      continue;
+    }
+    if (rec.type === 'text' && typeof rec.text === 'string') {
+      parts.push(rec.text);
+    }
+  }
+  return parts.join('').trim();
 }
 
 /**
@@ -1037,43 +1089,68 @@ async function streamAndCollect(
   messages: BaseMessage[],
   config?: RunnableConfig,
   streaming = true,
-  stepId?: string
+  stepId?: string,
+  provider?: Providers,
+  reasoningKey: 'reasoning_content' | 'reasoning' = 'reasoning_content'
 ): Promise<string> {
   if (!streaming || typeof model.stream !== 'function') {
     const response = await model.invoke(messages, config);
     return extractResponseText(response);
   }
 
-  const chunks: string[] = [];
+  const textChunks: string[] = [];
   const stream = await model.stream(messages, config);
   for await (const chunk of stream) {
-    const text =
-      typeof chunk.content === 'string'
-        ? chunk.content
-        : JSON.stringify(chunk.content);
-    if (text) {
-      chunks.push(text);
-      if (stepId != null && stepId !== '' && config) {
-        safeDispatchCustomEvent(
-          GraphEvents.ON_SUMMARIZE_DELTA,
-          {
-            id: stepId,
-            delta: {
-              summary: {
-                type: ContentTypes.SUMMARY,
-                text,
-                tokenCount: 0,
-                provider: String(config.metadata?.summarization_provider ?? ''),
-                model: String(config.metadata?.summarization_model ?? ''),
-              },
+    const content = getChunkContent({
+      chunk: chunk as Parameters<typeof getChunkContent>[0]['chunk'],
+      provider,
+      reasoningKey,
+    });
+    const text = typeof content === 'string' ? content : '';
+    if (!text) {
+      continue;
+    }
+
+    // Detect reasoning: chunk has reasoning_content in additional_kwargs
+    // or content is an array with reasoning-type blocks.
+    const chunkAny = chunk as Parameters<typeof getChunkContent>[0]['chunk'];
+    const hasReasoningKwarg =
+      chunkAny?.additional_kwargs?.[reasoningKey] != null &&
+      chunkAny.additional_kwargs[reasoningKey] !== '';
+    const hasReasoningContent =
+      Array.isArray(chunkAny?.content) &&
+      chunkAny.content.length > 0 &&
+      (chunkAny.content[0]?.type === ContentTypes.THINKING ||
+        chunkAny.content[0]?.type === ContentTypes.REASONING_CONTENT);
+    const isReasoning = hasReasoningKwarg || hasReasoningContent;
+
+    // Only collect text (non-reasoning) chunks for the final summary.
+    if (!isReasoning) {
+      textChunks.push(text);
+    }
+
+    // Stream both reasoning and text to the client.
+    if (stepId != null && stepId !== '' && config) {
+      safeDispatchCustomEvent(
+        GraphEvents.ON_SUMMARIZE_DELTA,
+        {
+          id: stepId,
+          delta: {
+            summary: {
+              type: ContentTypes.SUMMARY,
+              text,
+              tokenCount: 0,
+              provider: String(config.metadata?.summarization_provider ?? ''),
+              model: String(config.metadata?.summarization_model ?? ''),
+              reasoning: isReasoning || undefined,
             },
-          } satisfies t.SummarizeDeltaEvent,
-          config
-        );
-      }
+          },
+        } satisfies t.SummarizeDeltaEvent,
+        config
+      );
     }
   }
-  return chunks.join('').trim();
+  return textChunks.join('').trim();
 }
 
 /**
@@ -1090,6 +1167,8 @@ async function summarizeSinglePass({
   streaming,
   stepId,
   budgetChars,
+  provider,
+  reasoningKey,
 }: SummarizeParams & { budgetChars?: number }): Promise<string> {
   const formattedText = formatMessagesForSummarization(messages, budgetChars);
 
@@ -1121,7 +1200,9 @@ async function summarizeSinglePass({
     [new SystemMessage(effectivePrompt), new HumanMessage(humanMessageText)],
     traceConfig(config, 'single_pass'),
     streaming,
-    stepId
+    stepId,
+    provider,
+    reasoningKey
   );
 }
 
@@ -1160,6 +1241,8 @@ async function summarizeInStages({
   stepId,
   maxSummaryTokens,
   tokenCounter,
+  provider,
+  reasoningKey,
 }: SummarizeParams & {
   parts: number;
   maxSummaryTokens?: number;
@@ -1205,6 +1288,8 @@ async function summarizeInStages({
       config,
       streaming,
       stepId,
+      provider,
+      reasoningKey,
     });
   }
 
@@ -1285,7 +1370,9 @@ async function summarizeInStages({
         total_chunks: chunks.length,
       }),
       streaming,
-      stepId
+      stepId,
+      provider,
+      reasoningKey
     );
 
     if (text) {

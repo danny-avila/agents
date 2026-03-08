@@ -288,6 +288,8 @@ export type SummaryContentBlock = {
   model?: string;
   provider?: string;
   createdAt?: string;
+  /** When true, this delta contains reasoning/thinking tokens, not summary text. */
+  reasoning?: boolean;
 };
 
 /** Vertex AI / Google Common - Reasoning Content Block Format */
