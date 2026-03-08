@@ -54,16 +54,14 @@ jobs:
       - name: Check for Google LLM changes
         id: google_changes
         run: |
-          # Find the last version commit (e.g., v3.0.40)
-          # Check changes since then (includes current version's commits)
-          LAST_VERSION=$(git log --oneline --grep="^v[0-9]" --max-count=1 --format="%H" 2>/dev/null || echo "")
-          if [ -z "$LAST_VERSION" ]; then
-            # No version commits found, check last 10 commits
+          # Find the previous version commit (skip=1 because HEAD is the current version commit)
+          PREV_VERSION=$(git log --grep="^v[0-9]" --skip=1 --max-count=1 --format="%H" 2>/dev/null || echo "")
+          if [ -z "$PREV_VERSION" ]; then
             BASE_REF="HEAD~10"
           else
-            BASE_REF="$LAST_VERSION"
+            BASE_REF="$PREV_VERSION"
           fi
-          
+
           if git diff --name-only $BASE_REF HEAD 2>/dev/null | grep -q "^src/llm/google/"; then
             echo "changed=true" >> $GITHUB_OUTPUT
           else
@@ -81,13 +79,13 @@ jobs:
       - name: Check for Anthropic LLM changes
         id: anthropic_changes
         run: |
-          LAST_VERSION=$(git log --oneline --grep="^v[0-9]" --max-count=1 --format="%H" 2>/dev/null || echo "")
-          if [ -z "$LAST_VERSION" ]; then
+          PREV_VERSION=$(git log --grep="^v[0-9]" --skip=1 --max-count=1 --format="%H" 2>/dev/null || echo "")
+          if [ -z "$PREV_VERSION" ]; then
             BASE_REF="HEAD~10"
           else
-            BASE_REF="$LAST_VERSION"
+            BASE_REF="$PREV_VERSION"
           fi
-          
+
           if git diff --name-only $BASE_REF HEAD 2>/dev/null | grep -q "^src/llm/anthropic/"; then
             echo "changed=true" >> $GITHUB_OUTPUT
           else
@@ -105,13 +103,13 @@ jobs:
       - name: Check for PTC changes
         id: ptc_changes
         run: |
-          LAST_VERSION=$(git log --oneline --grep="^v[0-9]" --max-count=1 --format="%H" 2>/dev/null || echo "")
-          if [ -z "$LAST_VERSION" ]; then
+          PREV_VERSION=$(git log --grep="^v[0-9]" --skip=1 --max-count=1 --format="%H" 2>/dev/null || echo "")
+          if [ -z "$PREV_VERSION" ]; then
             BASE_REF="HEAD~10"
           else
-            BASE_REF="$LAST_VERSION"
+            BASE_REF="$PREV_VERSION"
           fi
-          
+
           if git diff --name-only $BASE_REF HEAD 2>/dev/null | grep -qE "^src/tools/ProgrammaticToolCalling\.ts|^src/tools/ToolNode\.ts|^src/agents/AgentContext\.ts|^src/test/mockTools\.ts"; then
             echo "changed=true" >> $GITHUB_OUTPUT
           else
@@ -137,13 +135,13 @@ jobs:
       - name: Check for Tool Search changes
         id: tool_search_changes
         run: |
-          LAST_VERSION=$(git log --oneline --grep="^v[0-9]" --max-count=1 --format="%H" 2>/dev/null || echo "")
-          if [ -z "$LAST_VERSION" ]; then
+          PREV_VERSION=$(git log --grep="^v[0-9]" --skip=1 --max-count=1 --format="%H" 2>/dev/null || echo "")
+          if [ -z "$PREV_VERSION" ]; then
             BASE_REF="HEAD~10"
           else
-            BASE_REF="$LAST_VERSION"
+            BASE_REF="$PREV_VERSION"
           fi
-          
+
           if git diff --name-only $BASE_REF HEAD 2>/dev/null | grep -qE "^src/tools/ToolSearch\.ts|^src/tools/ToolNode\.ts|^src/agents/AgentContext\.ts|^src/test/mockTools\.ts"; then
             echo "changed=true" >> $GITHUB_OUTPUT
           else
