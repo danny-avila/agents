@@ -2,21 +2,23 @@
 import { config } from 'dotenv';
 config();
 import {
-  HumanMessage,
   AIMessage,
-  SystemMessage,
   BaseMessage,
   ToolMessage,
+  HumanMessage,
+  isBaseMessage,
+  SystemMessage,
+  AIMessageChunk,
 } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { UsageMetadata } from '@langchain/core/messages';
 import type * as t from '@/types';
 import {
-  repairOrphanedToolMessages,
-  createPruneMessages,
-  preFlightTruncateToolCallInputs,
-  sanitizeOrphanToolBlocks,
   getMessagesWithinTokenLimit as realGetMessagesWithinTokenLimit,
+  preFlightTruncateToolCallInputs,
+  repairOrphanedToolMessages,
+  sanitizeOrphanToolBlocks,
+  createPruneMessages,
 } from '@/messages/prune';
 import { getLLMConfig } from '@/utils/llmConfig';
 import { Providers, ContentTypes } from '@/common';
@@ -1684,6 +1686,118 @@ describe('sanitizeOrphanToolBlocks', () => {
     expect(result).toHaveLength(2);
     expect(result[0].getType()).toBe('human');
     expect(result[1].getType()).toBe('ai');
+  });
+
+  it('preserves BaseMessage prototype on stripped AIMessage instances', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('Hello'),
+      new AIMessage({
+        content: [
+          { type: 'text', text: 'Let me search and calculate.' },
+          {
+            type: 'tool_use',
+            id: 'tool_a',
+            name: 'search',
+            input: { q: 'test' },
+          },
+          { type: 'tool_use', id: 'tool_b', name: 'calc', input: { x: 1 } },
+        ],
+        tool_calls: [
+          {
+            id: 'tool_a',
+            name: 'search',
+            args: { q: 'test' },
+            type: 'tool_call' as const,
+          },
+          {
+            id: 'tool_b',
+            name: 'calc',
+            args: { x: 1 },
+            type: 'tool_call' as const,
+          },
+        ],
+      }),
+      new ToolMessage({ content: 'result', tool_call_id: 'tool_b' }),
+      // No ToolMessage for tool_a — orphan
+    ];
+
+    const result = sanitizeOrphanToolBlocks(messages);
+    // AI message should survive (tool_a stripped, tool_b kept)
+    expect(result).toHaveLength(3);
+
+    // Every output message must pass isBaseMessage and have getType()
+    for (const msg of result) {
+      expect(isBaseMessage(msg)).toBe(true);
+      expect(typeof msg.getType()).toBe('string');
+    }
+    expect(result[1].getType()).toBe('ai');
+    expect(result[1]).toBeInstanceOf(AIMessage);
+  });
+
+  it('preserves AIMessageChunk prototype on stripped messages', () => {
+    // Simulate what happens in real graph execution: model returns AIMessageChunk,
+    // state passes through LangGraph, sanitizeOrphanToolBlocks strips orphan server tools.
+    const chunk = new AIMessageChunk({
+      content: [
+        { type: 'text', text: 'Searching...' },
+        { type: 'tool_use', id: 'srvtoolu_1', name: 'web_search', input: '' },
+        { type: 'tool_use', id: 'toolu_2', name: 'calculator', input: '2+2' },
+      ],
+      tool_call_chunks: [
+        { id: 'srvtoolu_1', index: 0, name: 'web_search', args: '' },
+        { id: 'toolu_2', index: 2, name: 'calculator', args: '2+2' },
+      ],
+    });
+
+    const messages: BaseMessage[] = [
+      new HumanMessage('Search and calculate'),
+      chunk,
+      new ToolMessage({ content: '4', tool_call_id: 'toolu_2' }),
+      // No ToolMessage for srvtoolu_1 — server tool, orphan
+    ];
+
+    const result = sanitizeOrphanToolBlocks(messages);
+    expect(result).toHaveLength(3);
+
+    // The AIMessageChunk must retain its prototype so LangChain's
+    // coerceMessageLikeToMessage recognizes it as a BaseMessage.
+    const aiMsg = result[1];
+    expect(isBaseMessage(aiMsg)).toBe(true);
+    expect(typeof aiMsg.getType()).toBe('string');
+    expect(aiMsg.getType()).toBe('ai');
+  });
+
+  it('preserves prototype on plain-object messages with duck-typed patching', () => {
+    // Simulate deserialized messages that still have a prototype (e.g. from
+    // LangGraph subgraph state transfer) but aren't class instances.
+    const proto = { _getType: (): string => 'ai', getType: (): string => 'ai' };
+    const plainAi = Object.create(proto);
+    Object.assign(plainAi, {
+      role: 'assistant',
+      content: [
+        { type: 'text', text: 'checking' },
+        { type: 'tool_use', id: 'orphan_1', name: 'tool', input: {} },
+      ],
+      tool_calls: [
+        { id: 'orphan_1', name: 'tool', args: {}, type: 'tool_call' },
+      ],
+    });
+
+    const messages = [plainAi] as BaseMessage[];
+    sanitizeOrphanToolBlocks(messages);
+
+    // Stripped AI was trailing → dropped. But if we add a human after:
+    const messages2 = [
+      new HumanMessage('hi'),
+      plainAi,
+      new HumanMessage('follow up'),
+    ] as BaseMessage[];
+    const result2 = sanitizeOrphanToolBlocks(messages2);
+
+    // The patched message in the middle must still have _getType from proto
+    const middleMsg = result2[1];
+    expect(typeof middleMsg._getType).toBe('function');
+    expect(middleMsg._getType()).toBe('ai');
   });
 
   it('handles plain objects (non-BaseMessage instances) via duck typing', () => {

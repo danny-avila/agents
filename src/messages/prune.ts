@@ -330,7 +330,11 @@ export function sanitizeOrphanToolBlocks(
     const toolCalls = msgAny.tool_calls as Array<{ id?: string }> | undefined;
     if (Array.isArray(toolCalls)) {
       for (const tc of toolCalls) {
-        if (typeof tc.id === 'string' && tc.id.length > 0) {
+        if (
+          typeof tc.id === 'string' &&
+          tc.id.length > 0 &&
+          !tc.id.startsWith('srvtoolu_')
+        ) {
           allToolCallIds.add(tc.id);
         }
       }
@@ -340,7 +344,8 @@ export function sanitizeOrphanToolBlocks(
         if (
           typeof block === 'object' &&
           (block.type === 'tool_use' || block.type === 'tool_call') &&
-          typeof block.id === 'string'
+          typeof block.id === 'string' &&
+          !block.id.startsWith('srvtoolu_')
         ) {
           allToolCallIds.add(block.id);
         }
@@ -442,12 +447,13 @@ export function sanitizeOrphanToolBlocks(
           continue;
         }
         strippedAiIndices.add(result.length);
-        const patched = {
-          ...msgAny,
-          tool_calls: keptToolCalls.length > 0 ? keptToolCalls : [],
-          content: keptContent,
-        };
-        result.push(patched as unknown as BaseMessage);
+        const patched = Object.create(
+          Object.getPrototypeOf(msg),
+          Object.getOwnPropertyDescriptors(msg)
+        );
+        patched.tool_calls = keptToolCalls.length > 0 ? keptToolCalls : [];
+        patched.content = keptContent;
+        result.push(patched as BaseMessage);
         continue;
       }
     }
@@ -947,7 +953,7 @@ export function preFlightTruncateToolCallInputs(params: {
     }
 
     const originalContent = message.content as MessageContentComplex[];
-    let changed = false;
+    const state = { changed: false };
     const newContent = originalContent.map((block) => {
       if (typeof block !== 'object') {
         return block;
@@ -967,14 +973,14 @@ export function preFlightTruncateToolCallInputs(params: {
         return block;
       }
 
-      changed = true;
+      state.changed = true;
       return {
         ...record,
         input: truncateToolInput(input, maxInputChars),
       };
     });
 
-    if (!changed) {
+    if (!state.changed) {
       continue;
     }
 
