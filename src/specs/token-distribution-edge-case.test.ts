@@ -75,6 +75,7 @@ describe('Token Distribution Edge Case Tests', () => {
       startIndex: 0,
       tokenCounter,
       indexTokenCountMap: { ...indexTokenCountMap },
+      reserveRatio: 0,
     });
 
     // First call to establish lastCutOffIndex
@@ -230,6 +231,7 @@ describe('Token Distribution Edge Case Tests', () => {
       startIndex: 0,
       tokenCounter,
       indexTokenCountMap: { ...indexTokenCountMap },
+      reserveRatio: 0,
     });
 
     // First pruning operation

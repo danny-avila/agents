@@ -741,6 +741,7 @@ describe('Prune Messages with Thinking Mode Tests', () => {
       tokenCounter,
       indexTokenCountMap: { ...indexTokenCountMap },
       thinkingEnabled: true,
+      reserveRatio: 0,
     });
 
     // Prune messages

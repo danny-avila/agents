@@ -175,6 +175,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   /** Optional compile options passed into workflow.compile() */
   compileOptions?: t.CompileOptions | undefined;
   messages: BaseMessage[] = [];
+  /** Cached run messages preserved before clearHeavyState() so getRunMessages() works after cleanup. */
+  private cachedRunMessages?: BaseMessage[];
   runId: string | undefined;
   startIndex: number = 0;
   signal?: AbortSignal;
@@ -216,6 +218,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
   resetValues(keepContent?: boolean): void {
     this.messages = [];
+    this.cachedRunMessages = undefined;
     this.config = resetIfNotEmpty(this.config, undefined);
     if (keepContent !== true) {
       this.contentData = resetIfNotEmpty(this.contentData, []);
@@ -252,6 +255,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   }
 
   override clearHeavyState(): void {
+    // Cache run messages before clearing so getRunMessages() still works after cleanup.
+    this.cachedRunMessages = this.messages.slice(this.startIndex);
     super.clearHeavyState();
     this.messages = [];
     this.overrideModel = undefined;
@@ -377,6 +382,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   /* Misc.*/
 
   getRunMessages(): BaseMessage[] | undefined {
+    // If messages were cleared by clearHeavyState(), return the cached copy.
+    if (this.messages.length === 0 && this.cachedRunMessages != null) {
+      return this.cachedRunMessages;
+    }
     return this.messages.slice(this.startIndex);
   }
 

@@ -1276,20 +1276,22 @@ describe('Prune Messages Tests', () => {
         indexTokenCountMap[i] = tokenCounter(messages[i]);
       }
 
-      // Without instruction overhead: maxTokens=8000, truncation threshold would be
-      // Math.floor(8000*0.15)*4 = 4800 chars. The AI message would be ~4800+ tokens
-      // (truncated input) which exceeds the real available budget (3600).
+      // Pre-flight truncation uses maxTokens for the truncation threshold:
+      // Math.floor(8000*0.15)*4 = 4800 chars.  The AI message's tool_use
+      // input (~7015 chars) shrinks to ~4800 chars, giving an AI token
+      // count of ~4850.
       //
-      // With instruction overhead: effectiveMax=3600, threshold =
-      // Math.floor(3600*0.15)*4 = 2160 chars. The AI message shrinks to ~2200 tokens
-      // which fits in the 3600 available budget.
-      const instructionTokens = 4400;
+      // The effective pruning budget subtracts instruction overhead:
+      // effectiveMax = 8000 - 2000 = 6000, which is enough for all three
+      // messages (~4850 + 17 + 15 ≈ 4882).
+      const instructionTokens = 2000;
       const pruneMessages = createPruneMessages({
         maxTokens: 8000,
         startIndex: 0,
         tokenCounter,
         indexTokenCountMap,
         getInstructionTokens: () => instructionTokens,
+        reserveRatio: 0,
       });
 
       const result = pruneMessages({ messages });

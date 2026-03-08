@@ -196,7 +196,6 @@ export class Run<_T extends t.BaseGraphState> {
       tags?: string[],
       metadata?: Record<string, unknown>
     ): Promise<void> => {
-
       // ON_RUN_STEP is dispatched directly via handler registry in
       // Graph.dispatchRunStep (primary, reliable path).  Skip the
       // callback-based dispatch to prevent double handling.
@@ -228,7 +227,10 @@ export class Run<_T extends t.BaseGraphState> {
 
   async processStream(
     inputs: t.IState,
-    config: Partial<RunnableConfig> & { version: 'v1' | 'v2'; run_id?: string },
+    callerConfig: Partial<RunnableConfig> & {
+      version: 'v1' | 'v2';
+      run_id?: string;
+    },
     streamOptions?: t.EventStreamOptions
   ): Promise<MessageContentComplex[] | undefined> {
     if (this.graphRunnable == null) {
@@ -241,6 +243,16 @@ export class Run<_T extends t.BaseGraphState> {
         'Graph not initialized. Make sure to use Run.create() to instantiate the Run.'
       );
     }
+
+    // Shallow-copy the config so cleanup at the end of the stream does not
+    // mutate the caller's object (e.g. setting configurable to undefined).
+    const config: Partial<RunnableConfig> & {
+      version: 'v1' | 'v2';
+      run_id?: string;
+    } = {
+      ...callerConfig,
+      configurable: { ...callerConfig.configurable },
+    };
 
     this.Graph.resetValues(streamOptions?.keepContent);
 
