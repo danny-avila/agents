@@ -641,7 +641,7 @@ export function createContentAggregator(): t.ContentAggregatorResult {
     if (event === GraphEvents.ON_SUMMARIZE_COMPLETE) {
       const completeData = data as t.SummarizeCompleteEvent;
       const summary = completeData.summary;
-      if (!summary.boundary) {
+      if (!summary?.boundary) {
         return;
       }
       const runStep = stepMap.get(summary.boundary.messageId);

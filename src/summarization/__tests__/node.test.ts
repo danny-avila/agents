@@ -160,7 +160,7 @@ describe('createSummarizeNode', () => {
     );
     expect(
       (
-        (completeEvent?.data as t.SummarizeCompleteEvent).summary
+        (completeEvent?.data as t.SummarizeCompleteEvent).summary!
           .content?.[0] as { text: string } | undefined
       )?.text
     ).toBe('Test summary output');
@@ -297,7 +297,7 @@ describe('createSummarizeNode', () => {
     );
     expect(
       (
-        (completeEvent?.data as t.SummarizeCompleteEvent).summary
+        (completeEvent?.data as t.SummarizeCompleteEvent).summary!
           .content?.[0] as { text: string } | undefined
       )?.text
     ).toMatch(/^\[Metadata summary:/);
@@ -452,7 +452,7 @@ describe('createSummarizeNode', () => {
     );
     expect(
       (
-        (completeEvent?.data as t.SummarizeCompleteEvent).summary
+        (completeEvent?.data as t.SummarizeCompleteEvent).summary!
           .content?.[0] as { text: string } | undefined
       )?.text
     ).toBe('Part 2 summary (with prior context)');
