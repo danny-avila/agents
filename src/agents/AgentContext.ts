@@ -12,6 +12,7 @@ import type * as t from '@/types';
 import type { createPruneMessages } from '@/messages';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { ContentTypes, Providers } from '@/common';
+import { DEFAULT_RESERVE_RATIO } from '@/messages';
 import { toJsonSchema } from '@/utils/schema';
 
 /**
@@ -835,9 +836,10 @@ export class AgentContext {
       }
     }
 
+    const reserveTokens = Math.round(maxContextTokens * DEFAULT_RESERVE_RATIO);
     const availableForMessages = Math.max(
       0,
-      maxContextTokens - this.instructionTokens
+      maxContextTokens - reserveTokens - this.instructionTokens
     );
 
     return {

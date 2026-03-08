@@ -311,6 +311,11 @@ function splitMessagesByWeight(
   if (messages.length === 0 || parts <= 1) {
     return [messages];
   }
+  if (weights.length !== messages.length) {
+    throw new Error(
+      `splitMessagesByWeight: weights.length (${weights.length}) !== messages.length (${messages.length})`
+    );
+  }
   const normalizedParts = Math.min(parts, messages.length);
 
   const totalWeight = weights.reduce((sum, w) => sum + w, 0);
@@ -870,8 +875,8 @@ export function createSummarizeNode({
         await safeDispatchCustomEvent(
           GraphEvents.ON_SUMMARIZE_COMPLETE,
           {
+            id: stepId,
             agentId: request.agentId,
-            summary: placeholderSummary,
             error: 'Summarization produced empty output',
           } satisfies t.SummarizeCompleteEvent,
           runnableConfig
@@ -931,6 +936,7 @@ export function createSummarizeNode({
       await safeDispatchCustomEvent(
         GraphEvents.ON_SUMMARIZE_COMPLETE,
         {
+          id: stepId,
           agentId: request.agentId,
           summary: summaryBlock,
         } satisfies t.SummarizeCompleteEvent,
