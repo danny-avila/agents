@@ -632,6 +632,27 @@ export function createSummarizeNode({
       return { summarizationRequest: undefined };
     }
 
+    // ----- Budget check: skip if instructions alone exceed the context budget -----
+    // When this happens, summarization would only make things worse — the summary
+    // gets added to the system message, further increasing instruction overhead.
+    // Log clearly so the issue is visible in debug logs.
+    const maxCtx = agentContext.maxContextTokens ?? 0;
+    if (maxCtx > 0 && agentContext.instructionTokens >= maxCtx) {
+      emitAgentLog(
+        config,
+        'warn',
+        'summarize',
+        'Summarization skipped — instructions exceed context budget. Reduce the number of tools or increase maxContextTokens.',
+        {
+          instructionTokens: agentContext.instructionTokens,
+          maxContextTokens: maxCtx,
+          breakdown: agentContext.formatTokenBudgetBreakdown(),
+        },
+        { runId: graph.runId, agentId: request.agentId }
+      );
+      return { summarizationRequest: undefined };
+    }
+
     // ----- Resolve summarization config -----
     const summarizationConfig = agentContext.summarizationConfig;
     const provider = summarizationConfig?.provider ?? agentContext.provider;

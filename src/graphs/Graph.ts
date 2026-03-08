@@ -873,9 +873,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           agentContext.summarizationEnabled === true &&
           Array.isArray(messagesToRefine) &&
           messagesToRefine.length > 0 &&
-          context.length > 0 &&
-          (remainingContextTokens == null || remainingContextTokens >= 0) &&
-          agentContext.shouldSkipSummarization(messages.length) === false &&
+          !agentContext.shouldSkipSummarization(messages.length) &&
           shouldTriggerSummarization({
             trigger: agentContext.summarizationConfig?.trigger,
             maxContextTokens: agentContext.maxContextTokens,
@@ -905,28 +903,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               agentId: agentId || agentContext.agentId,
             },
           } as unknown as Partial<t.BaseGraphState>;
-        } else if (
-          agentContext.summarizationEnabled === true &&
-          Array.isArray(messagesToRefine) &&
-          messagesToRefine.length > 0 &&
-          (context.length === 0 ||
-            (remainingContextTokens != null && remainingContextTokens < 0))
-        ) {
-          emitAgentLog(
-            config,
-            'warn',
-            'graph',
-            'Summarization skipped — instructions exceed context budget',
-            {
-              contextLength: context.length,
-              messagesToRefineCount: messagesToRefine.length,
-              remainingContextTokens: remainingContextTokens ?? 0,
-              instructionTokens: agentContext.instructionTokens,
-              maxContextTokens: agentContext.maxContextTokens,
-              breakdown: agentContext.formatTokenBudgetBreakdown(messages),
-            },
-            { runId: this.runId, agentId }
-          );
         }
       }
 
@@ -1056,7 +1032,34 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         [];
 
       if (finalMessages.length === 0) {
+        const budgetBreakdown = agentContext.getTokenBudgetBreakdown(messages);
         const breakdown = agentContext.formatTokenBudgetBreakdown(messages);
+        const instructionsExceedBudget =
+          budgetBreakdown.instructionTokens > budgetBreakdown.maxContextTokens;
+
+        let guidance: string;
+        if (instructionsExceedBudget) {
+          const toolPct =
+            budgetBreakdown.toolSchemaTokens > 0
+              ? Math.round(
+                (budgetBreakdown.toolSchemaTokens /
+                    budgetBreakdown.instructionTokens) *
+                    100
+              )
+              : 0;
+          guidance =
+            toolPct > 50
+              ? `Tool definitions consume ${budgetBreakdown.toolSchemaTokens} tokens (${toolPct}% of instructions) across ${budgetBreakdown.toolCount} tools, exceeding maxContextTokens (${budgetBreakdown.maxContextTokens}). Reduce the number of tools or increase maxContextTokens.`
+              : `Instructions (${budgetBreakdown.instructionTokens} tokens) exceed maxContextTokens (${budgetBreakdown.maxContextTokens}). Increase maxContextTokens or shorten the system prompt.`;
+          if (agentContext.summarizationEnabled === true) {
+            guidance +=
+              ' Summarization was skipped because the summary would further increase the instruction overhead.';
+          }
+        } else {
+          guidance =
+            'Please increase the context window size or make your message shorter.';
+        }
+
         emitAgentLog(
           config,
           'error',
@@ -1064,6 +1067,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           'Empty messages after pruning',
           {
             messageCount: messages.length,
+            instructionsExceedBudget,
             breakdown,
           },
           { runId: this.runId, agentId }
@@ -1071,7 +1075,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         throw new Error(
           JSON.stringify({
             type: 'empty_messages',
-            info: `Message pruning removed all messages as none fit in the context window. Please increase the context window size or make your message shorter.\n${breakdown}`,
+            info: `Message pruning removed all messages as none fit in the context window. ${guidance}\n${breakdown}`,
           })
         );
       }
