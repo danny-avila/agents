@@ -686,3 +686,88 @@ describe('DEFAULT_UPDATE_SUMMARIZATION_PROMPT', () => {
     expect(DEFAULT_UPDATE_SUMMARIZATION_PROMPT).toMatch(/In Progress/);
   });
 });
+
+describe('budget check — instructions exceed context', () => {
+  it('skips summarization when instructionTokens >= maxContextTokens', async () => {
+    const events = captureEvents();
+    const agentContext = mockAgentContext({
+      maxContextTokens: 4000,
+      instructionTokens: 5000,
+      formatTokenBudgetBreakdown: () => 'mock breakdown',
+    });
+
+    const graph = mockGraph();
+    const summarizeNode = createSummarizeNode({
+      agentContext,
+      graph: graph as never,
+      generateStepId,
+    });
+
+    const result = await summarizeNode(
+      {
+        messages: [new HumanMessage('test')],
+        summarizationRequest: {
+          messagesToRefine: [new HumanMessage('test')],
+          context: [],
+          remainingContextTokens: -1000,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    expect(result.summarizationRequest).toBeUndefined();
+    expect(result.messages).toBeUndefined();
+
+    // No summarization events should have fired
+    const summarizeEvents = events.filter(
+      (e) =>
+        e.event === GraphEvents.ON_SUMMARIZE_START ||
+        e.event === GraphEvents.ON_SUMMARIZE_DELTA ||
+        e.event === GraphEvents.ON_SUMMARIZE_COMPLETE
+    );
+    expect(summarizeEvents).toHaveLength(0);
+  });
+
+  it('proceeds normally when instructionTokens < maxContextTokens', async () => {
+    captureEvents();
+
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return mockInvokeModel('Budget is fine summary');
+        }
+      } as never
+    );
+
+    const agentContext = mockAgentContext({
+      maxContextTokens: 8000,
+      instructionTokens: 2000,
+      formatTokenBudgetBreakdown: () => 'mock breakdown',
+    });
+
+    const graph = mockGraph();
+    const summarizeNode = createSummarizeNode({
+      agentContext,
+      graph: graph as never,
+      generateStepId,
+    });
+
+    const result = await summarizeNode(
+      {
+        messages: [new HumanMessage('context msg'), new HumanMessage('hello')],
+        summarizationRequest: {
+          messagesToRefine: [new HumanMessage('hello')],
+          context: [new HumanMessage('context msg')],
+          remainingContextTokens: 500,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    // Should have summarized — messages returned for state replacement
+    expect(result.messages).toBeDefined();
+    expect(result.messages!.length).toBeGreaterThan(0);
+  });
+});
