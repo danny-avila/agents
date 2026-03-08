@@ -46,7 +46,6 @@ export class AgentContext {
       summarizationEnabled,
       summarizationConfig,
       initialSummary,
-      minReserveTokens,
       contextPruningConfig,
       overflowRecoveryConfig,
       maxToolResultChars,
@@ -73,7 +72,6 @@ export class AgentContext {
       discoveredTools,
       summarizationEnabled,
       summarizationConfig,
-      minReserveTokens,
       contextPruningConfig,
       overflowRecoveryConfig,
       maxToolResultChars,
@@ -144,11 +142,6 @@ export class AgentContext {
    * Prevents stale token data from driving pruning/trigger decisions.
    */
   totalTokensFresh: boolean = false;
-  /**
-   * Absolute minimum tokens reserved for summarization output.
-   * Prevents misconfigured ratios from producing unusable summaries.
-   */
-  minReserveTokens: number = 0;
   /** Context pruning configuration. */
   contextPruningConfig?: t.ContextPruningConfig;
   /** Overflow recovery configuration. */
@@ -289,7 +282,6 @@ export class AgentContext {
     discoveredTools,
     summarizationEnabled,
     summarizationConfig,
-    minReserveTokens,
     contextPruningConfig,
     overflowRecoveryConfig,
     maxToolResultChars,
@@ -314,7 +306,6 @@ export class AgentContext {
     discoveredTools?: string[];
     summarizationEnabled?: boolean;
     summarizationConfig?: t.SummarizationConfig;
-    minReserveTokens?: number;
     contextPruningConfig?: t.ContextPruningConfig;
     overflowRecoveryConfig?: t.OverflowRecoveryConfig;
     maxToolResultChars?: number;
@@ -345,7 +336,6 @@ export class AgentContext {
     this.useLegacyContent = useLegacyContent ?? false;
     this.summarizationEnabled = summarizationEnabled;
     this.summarizationConfig = summarizationConfig;
-    this.minReserveTokens = minReserveTokens ?? 0;
     this.contextPruningConfig = contextPruningConfig;
     this.overflowRecoveryConfig = overflowRecoveryConfig;
     this.maxToolResultChars = maxToolResultChars;
@@ -917,9 +907,9 @@ export class AgentContext {
     );
   }
 
-  /** Increment the overflow recovery attempt counter. */
-  incrementOverflowRecovery(): void {
-    this._overflowRecoveryAttempts++;
+  /** Increment the overflow recovery attempt counter and return the new count. */
+  incrementOverflowRecovery(): number {
+    return ++this._overflowRecoveryAttempts;
   }
 
   /** Reset overflow recovery attempts after a successful call. */

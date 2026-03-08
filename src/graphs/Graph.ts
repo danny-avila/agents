@@ -1086,8 +1086,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             isLikelyContextOverflowError(errorMsg) === true &&
             agentContext.canAttemptOverflowRecovery() === true
           ) {
-            agentContext.incrementOverflowRecovery();
-            const attempt = agentContext['_overflowRecoveryAttempts'];
+            const attempt = agentContext.incrementOverflowRecovery();
             const aggressiveness = Math.pow(0.5, attempt);
             const maxChars = Math.max(
               1000,

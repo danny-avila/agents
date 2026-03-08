@@ -18,7 +18,7 @@ describe('createContentAggregator – SUMMARY accumulation', () => {
       },
       summary: {
         type: ContentTypes.SUMMARY,
-        text: '',
+        content: [],
         tokenCount: 0,
         provider: 'openai',
       },
@@ -32,10 +32,10 @@ describe('createContentAggregator – SUMMARY accumulation', () => {
 
     // The run step registration sets the initial placeholder
     expect(contentParts[0]).toEqual(
-      expect.objectContaining({ type: ContentTypes.SUMMARY, text: '' })
+      expect.objectContaining({ type: ContentTypes.SUMMARY, content: [] })
     );
 
-    // Send multiple deltas with text chunks
+    // Send multiple deltas with content chunks
     aggregateContent({
       event: GraphEvents.ON_SUMMARIZE_DELTA,
       data: {
@@ -43,7 +43,7 @@ describe('createContentAggregator – SUMMARY accumulation', () => {
         delta: {
           summary: {
             type: ContentTypes.SUMMARY,
-            text: 'Hello ',
+            content: [{ type: 'text', text: 'Hello ' }],
             tokenCount: 0,
             provider: 'openai',
           },
@@ -51,7 +51,9 @@ describe('createContentAggregator – SUMMARY accumulation', () => {
       } as t.SummarizeDeltaData,
     });
 
-    expect((contentParts[0] as t.SummaryContentBlock).text).toBe('Hello ');
+    const afterFirst = contentParts[0] as t.SummaryContentBlock;
+    expect(afterFirst.content).toHaveLength(1);
+    expect((afterFirst.content![0] as { text: string }).text).toBe('Hello ');
 
     aggregateContent({
       event: GraphEvents.ON_SUMMARIZE_DELTA,
@@ -60,7 +62,7 @@ describe('createContentAggregator – SUMMARY accumulation', () => {
         delta: {
           summary: {
             type: ContentTypes.SUMMARY,
-            text: 'world!',
+            content: [{ type: 'text', text: 'world!' }],
             tokenCount: 0,
             provider: 'openai',
           },
@@ -68,10 +70,11 @@ describe('createContentAggregator – SUMMARY accumulation', () => {
       } as t.SummarizeDeltaData,
     });
 
-    // Should accumulate, not replace
-    expect((contentParts[0] as t.SummaryContentBlock).text).toBe(
-      'Hello world!'
-    );
+    // Should accumulate content blocks, not replace
+    const afterSecond = contentParts[0] as t.SummaryContentBlock;
+    expect(afterSecond.content).toHaveLength(2);
+    expect((afterSecond.content![0] as { text: string }).text).toBe('Hello ');
+    expect((afterSecond.content![1] as { text: string }).text).toBe('world!');
   });
 
   it('preserves metadata fields from the latest delta', () => {
@@ -88,7 +91,7 @@ describe('createContentAggregator – SUMMARY accumulation', () => {
       },
       summary: {
         type: ContentTypes.SUMMARY,
-        text: '',
+        content: [],
         tokenCount: 0,
         provider: 'anthropic',
         model: 'claude-sonnet-4-5',
@@ -108,7 +111,7 @@ describe('createContentAggregator – SUMMARY accumulation', () => {
         delta: {
           summary: {
             type: ContentTypes.SUMMARY,
-            text: 'chunk',
+            content: [{ type: 'text', text: 'chunk' }],
             tokenCount: 0,
             provider: 'anthropic',
             model: 'claude-sonnet-4-5',
@@ -135,7 +138,7 @@ describe('createContentAggregator – SUMMARY accumulation', () => {
         delta: {
           summary: {
             type: ContentTypes.SUMMARY,
-            text: 'orphan',
+            content: [{ type: 'text', text: 'orphan' }],
             tokenCount: 0,
           },
         },

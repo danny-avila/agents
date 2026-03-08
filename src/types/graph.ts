@@ -426,12 +426,6 @@ export interface AgentInputs {
   /** Cross-run summary from a previous run, forwarded from formatAgentMessages.
    *  Injected into the system message via AgentContext.buildInstructionsString(). */
   initialSummary?: { text: string; tokenCount: number };
-  /**
-   * Absolute minimum tokens reserved for summarization output.
-   * Applied as: effectiveMax = min(maxContextTokens, base - max(minReserveTokens, base * ratio)).
-   * Prevents misconfigured ratios from producing unusable summaries on small models.
-   */
-  minReserveTokens?: number;
   /** Context pruning configuration for position-based tool result degradation. */
   contextPruningConfig?: ContextPruningConfig;
   /** Overflow recovery configuration. */

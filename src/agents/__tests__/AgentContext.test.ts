@@ -425,6 +425,35 @@ describe('AgentContext', () => {
       });
     });
 
+    it('shouldSkipSummarization returns true when per-run cap is reached', () => {
+      const ctx = createBasicContext({
+        agentConfig: { summarizationEnabled: true },
+      });
+      // Fire 3 summarizations (MAX_SUMMARIZATIONS_PER_RUN)
+      for (let i = 0; i < 3; i++) {
+        ctx.markSummarizationTriggered(i * 10);
+      }
+      expect(ctx.shouldSkipSummarization(30)).toBe(true);
+    });
+
+    it('shouldSkipSummarization returns true when fewer than 4 new messages added', () => {
+      const ctx = createBasicContext({
+        agentConfig: { summarizationEnabled: true },
+      });
+      ctx.markSummarizationTriggered(10);
+      // Only 2 new messages — should skip
+      expect(ctx.shouldSkipSummarization(12)).toBe(true);
+      // 4+ new messages — should allow
+      expect(ctx.shouldSkipSummarization(14)).toBe(false);
+    });
+
+    it('shouldSkipSummarization returns false when no prior summarization', () => {
+      const ctx = createBasicContext({
+        agentConfig: { summarizationEnabled: true },
+      });
+      expect(ctx.shouldSkipSummarization(5)).toBe(false);
+    });
+
     it('rebuilds indexTokenCountMap from base map after reset', async () => {
       const tokenCounter = jest.fn(() => 5);
       const ctx = createBasicContext({

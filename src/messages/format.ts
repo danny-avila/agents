@@ -717,13 +717,23 @@ function getLatestSummaryBoundary(
         continue;
       }
 
-      const summaryPart = part as Partial<SummaryContentBlock>;
-      const summaryText = (summaryPart.content ?? [])
+      const summaryPart = part as Partial<SummaryContentBlock> & {
+        text?: string;
+      };
+
+      // Try content array first (new format), then direct text (legacy format)
+      let summaryText = (summaryPart.content ?? [])
         .map((block) =>
           'text' in block ? (block as { text: string }).text : ''
         )
         .join('')
         .trim();
+
+      // Fallback: legacy format where text was a direct field on the block
+      if (summaryText.length === 0 && typeof summaryPart.text === 'string') {
+        summaryText = summaryPart.text.trim();
+      }
+
       if (summaryText.length === 0) {
         continue;
       }

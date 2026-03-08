@@ -1,4 +1,3 @@
-import { createHash } from 'crypto';
 import {
   AIMessage,
   HumanMessage,
@@ -61,35 +60,9 @@ const SUMMARIZATION_PARAM_KEYS = new Set([
 ]);
 
 // ---------------------------------------------------------------------------
-// Hashing
-// ---------------------------------------------------------------------------
-
-/**
- * Computes a short hash of the messages being summarized.
- * Used for deduplication and debugging — if the same rangeHash appears on consecutive
- * summaries, the same messages were re-summarized (likely a no-op).
- */
-function computeRangeHash(messages: BaseMessage[]): string {
-  const hash = createHash('sha256');
-  for (const msg of messages) {
-    hash.update(msg._getType());
-    hash.update(
-      typeof msg.content === 'string'
-        ? msg.content
-        : JSON.stringify(msg.content)
-    );
-  }
-  return hash.digest('hex').slice(0, 16);
-}
-
-// ---------------------------------------------------------------------------
 // Message formatting for summarization input
 // ---------------------------------------------------------------------------
 
-/**
- * Truncates a string to `maxLen` characters, appending an ellipsis indicator
- * with the original length so the summarizer knows content was cut.
- */
 /** Remove unpaired surrogates from the edges of a sliced string. */
 function stripBrokenSurrogates(s: string): string {
   let start = 0;
@@ -113,6 +86,10 @@ function stripBrokenSurrogates(s: string): string {
   return start === 0 && end === s.length ? s : s.slice(start, end);
 }
 
+/**
+ * Truncates a string to `maxLen` characters, appending an ellipsis indicator
+ * with the original length so the summarizer knows content was cut.
+ */
 function truncate(text: string, maxLen: number): string {
   if (text.length <= maxLen) {
     return text;
@@ -164,7 +141,7 @@ function formatToolArgs(args: Record<string, unknown> | undefined): string {
 }
 
 function formatMessageForSummary(msg: BaseMessage): string {
-  const role = msg._getType();
+  const role = msg.getType();
 
   // Tool result messages: format as "[tool_result: name] → content"
   if (role === 'tool') {
@@ -503,7 +480,7 @@ function generateMetadataStub(messages: BaseMessage[]): string {
   const toolNames = new Set<string>();
 
   for (const msg of messages) {
-    const role = msg._getType();
+    const role = msg.getType();
     counts[role] = (counts[role] ?? 0) + 1;
 
     if (role === 'tool' && msg.name != null && msg.name !== '') {
@@ -560,7 +537,7 @@ function extractToolFailuresSection(messages: BaseMessage[]): string {
   const seen = new Set<string>();
 
   for (const msg of messages) {
-    if (msg._getType() !== 'tool') {
+    if (msg.getType() !== 'tool') {
       continue;
     }
     const toolMsg = msg as import('@langchain/core/messages').ToolMessage;
@@ -939,7 +916,6 @@ export function createSummarizeNode({
       ],
       tokenCount,
       summaryVersion: agentContext.summaryVersion,
-      rangeHash: computeRangeHash(request.messagesToRefine),
       boundary: {
         messageId: stepId,
         contentIndex: runStep.index,
@@ -1245,7 +1221,7 @@ async function summarizeSinglePass({
 
   // S-SP: Log what the summarizer will see
   const msgTypes = messages.map((m) => {
-    const t = m._getType();
+    const t = m.getType();
     return t === 'tool' ? `tool(${m.name ?? '?'})` : t;
   });
   emitAgentLog(config, 'debug', 'summarize', 'Single-pass input', {

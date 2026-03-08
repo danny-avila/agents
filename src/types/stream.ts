@@ -284,7 +284,6 @@ export type SummaryContentBlock = {
   tokenCount?: number;
   boundary?: SummaryBoundary;
   summaryVersion?: number;
-  rangeHash?: string;
   model?: string;
   provider?: string;
   createdAt?: string;

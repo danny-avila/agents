@@ -149,17 +149,30 @@ export function applyContextPruning(params: {
 
     if (ageRatio >= settings.hardClearRatio && settings.hardClear.enabled) {
       // Hard-clear: replace with placeholder
-      (message as ToolMessage).content = settings.hardClear.placeholder;
-      indexTokenCountMap[i] = tokenCounter(message);
+      const cloned = new ToolMessage({
+        content: settings.hardClear.placeholder,
+        tool_call_id: (message as ToolMessage).tool_call_id,
+        name: message.name,
+        id: message.id,
+        additional_kwargs: message.additional_kwargs,
+        response_metadata: message.response_metadata,
+      });
+      messages[i] = cloned;
+      indexTokenCountMap[i] = tokenCounter(cloned);
       hardCleared++;
     } else if (ageRatio >= settings.softTrimRatio) {
       // Soft-trim: keep head + tail
       if (content.length > settings.softTrim.maxChars) {
-        (message as ToolMessage).content = softTrimContent(
-          content,
-          settings.softTrim
-        );
-        indexTokenCountMap[i] = tokenCounter(message);
+        const cloned = new ToolMessage({
+          content: softTrimContent(content, settings.softTrim),
+          tool_call_id: (message as ToolMessage).tool_call_id,
+          name: message.name,
+          id: message.id,
+          additional_kwargs: message.additional_kwargs,
+          response_metadata: message.response_metadata,
+        });
+        messages[i] = cloned;
+        indexTokenCountMap[i] = tokenCounter(cloned);
         softTrimmed++;
       }
     }

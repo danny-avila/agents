@@ -46,7 +46,7 @@ export function emitAgentLog(
   meta?: { runId?: string; agentId?: string }
 ): void {
   if (!config) return;
-  safeDispatchCustomEvent(
+  void safeDispatchCustomEvent(
     GraphEvents.ON_AGENT_LOG,
     { level, scope, message, data, ...meta } satisfies AgentLogEvent,
     config

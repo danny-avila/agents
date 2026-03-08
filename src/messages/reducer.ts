@@ -1,7 +1,6 @@
 import {
   BaseMessage,
-  MessageType,
-  HumanMessage,
+  RemoveMessage,
   BaseMessageLike,
   coerceMessageLikeToMessage,
 } from '@langchain/core/messages';
@@ -22,15 +21,12 @@ export const REMOVE_ALL_MESSAGES = '__remove_all__';
  * This works because the reducer checks for `getType() === 'remove'`
  * with `id === REMOVE_ALL_MESSAGES` and discards everything before it.
  *
- * NOTE: RemoveMessage from @langchain/core is not re-exported, so we
- * construct a compatible BaseMessage with the correct type/id contract.
+ * NOTE: Uses RemoveMessage from @langchain/core with a sentinel id so
+ * the reducer can distinguish a "remove-all" marker from a single-message
+ * removal.
  */
 export function createRemoveAllMessage(): BaseMessage {
-  const msg = new HumanMessage({ content: '', id: REMOVE_ALL_MESSAGES });
-  // Override _getType so the reducer recognises this as a removal marker.
-  // The reducer only inspects getType() and id — no other fields matter.
-  msg._getType = (): MessageType => 'remove';
-  return msg;
+  return new RemoveMessage({ id: REMOVE_ALL_MESSAGES });
 }
 
 export type Messages =
