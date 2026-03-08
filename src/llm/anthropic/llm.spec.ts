@@ -56,13 +56,13 @@ async function invoke(
 }
 
 // use this for tests involving "extended thinking"
-const extendedThinkingModelName = 'claude-3-7-sonnet-20250219';
+const extendedThinkingModelName = 'claude-sonnet-4-5-20250929';
 
 // use this for tests involving citations
 const citationsModelName = 'claude-sonnet-4-5-20250929';
 
 // use this for tests involving PDF documents
-const pdfModelName = 'claude-3-5-haiku-20241022';
+const pdfModelName = 'claude-haiku-4-5';
 
 // Use this model for all other tests
 const modelName = 'claude-3-haiku-20240307';
@@ -1401,7 +1401,7 @@ test('Test redacted thinking blocks multiturn streaming', async () => {
 
 test('Can handle google function calling blocks in content', async () => {
   const chat = new ChatAnthropic({
-    modelName: 'claude-3-7-sonnet-latest',
+    modelName: 'claude-sonnet-4-5-20250929',
     maxRetries: 0,
   });
   const toolCallId = 'tool_call_id';

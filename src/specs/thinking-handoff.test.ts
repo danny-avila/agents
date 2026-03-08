@@ -61,7 +61,7 @@ describe('Thinking-Enabled Agent Handoff Tests', () => {
           agentId: 'specialist',
           provider: Providers.ANTHROPIC,
           clientOptions: {
-            modelName: 'claude-3-7-sonnet-20250219',
+            modelName: 'claude-sonnet-4-5-20250929',
             apiKey: 'test-key',
             thinking: {
               type: 'enabled',
@@ -150,7 +150,7 @@ describe('Thinking-Enabled Agent Handoff Tests', () => {
           agentId: 'agent_b',
           provider: Providers.ANTHROPIC,
           clientOptions: {
-            modelName: 'claude-3-7-sonnet-20250219',
+            modelName: 'claude-sonnet-4-5-20250929',
             apiKey: 'test-key',
             thinking: {
               type: 'enabled',
@@ -195,7 +195,7 @@ describe('Thinking-Enabled Agent Handoff Tests', () => {
           provider: Providers.BEDROCK,
           clientOptions: {
             region: 'us-east-1',
-            model: 'anthropic.claude-3-5-haiku-20241022-v1:0',
+            model: 'us.anthropic.claude-haiku-4-5-20251001-v1:0',
             // No thinking config
           },
           instructions: 'You are a coordinator',
@@ -206,7 +206,7 @@ describe('Thinking-Enabled Agent Handoff Tests', () => {
           provider: Providers.BEDROCK,
           clientOptions: {
             region: 'us-east-1',
-            model: 'us.anthropic.claude-3-7-sonnet-20250219-v1:0',
+            model: 'us.anthropic.claude-sonnet-4-5-20250929-v1:0',
             additionalModelRequestFields: {
               thinking: {
                 type: 'enabled',
@@ -280,7 +280,7 @@ describe('Thinking-Enabled Agent Handoff Tests', () => {
           provider: Providers.BEDROCK,
           clientOptions: {
             region: 'us-east-1',
-            model: 'us.anthropic.claude-3-7-sonnet-20250219-v1:0',
+            model: 'us.anthropic.claude-sonnet-4-5-20250929-v1:0',
             additionalModelRequestFields: {
               thinking: {
                 type: 'enabled',
@@ -343,7 +343,7 @@ describe('Thinking-Enabled Agent Handoff Tests', () => {
           provider: Providers.BEDROCK,
           clientOptions: {
             region: 'us-east-1',
-            model: 'us.anthropic.claude-3-7-sonnet-20250219-v1:0',
+            model: 'us.anthropic.claude-sonnet-4-5-20250929-v1:0',
             additionalModelRequestFields: {
               thinking: {
                 type: 'enabled',
@@ -434,7 +434,7 @@ describe('Thinking-Enabled Agent Handoff Tests', () => {
           agentId: 'reviewer',
           provider: Providers.ANTHROPIC,
           clientOptions: {
-            modelName: 'claude-3-7-sonnet-20250219',
+            modelName: 'claude-sonnet-4-5-20250929',
             apiKey: 'test-key',
             thinking: {
               type: 'enabled',
@@ -508,7 +508,7 @@ describe('Thinking-Enabled Agent Handoff Tests', () => {
           agentId: 'agent_a',
           provider: Providers.ANTHROPIC,
           clientOptions: {
-            modelName: 'claude-3-7-sonnet-20250219',
+            modelName: 'claude-sonnet-4-5-20250929',
             apiKey: 'test-key',
             thinking: {
               type: 'enabled',
@@ -522,7 +522,7 @@ describe('Thinking-Enabled Agent Handoff Tests', () => {
           agentId: 'agent_b',
           provider: Providers.ANTHROPIC,
           clientOptions: {
-            modelName: 'claude-3-7-sonnet-20250219',
+            modelName: 'claude-sonnet-4-5-20250929',
             apiKey: 'test-key',
             thinking: {
               type: 'enabled',
@@ -587,7 +587,7 @@ describe('Thinking-Enabled Agent Handoff Tests', () => {
           agentId: 'agent_b',
           provider: Providers.ANTHROPIC,
           clientOptions: {
-            modelName: 'claude-3-7-sonnet-20250219',
+            modelName: 'claude-sonnet-4-5-20250929',
             apiKey: 'test-key',
             thinking: {
               type: 'enabled',

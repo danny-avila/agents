@@ -307,7 +307,7 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
       const run = await createSummarizationRun({
         agentProvider,
         summarizationProvider: Providers.ANTHROPIC,
-        summarizationModel: 'claude-3-5-haiku-latest',
+        summarizationModel: 'claude-haiku-4-5',
         maxContextTokens: maxTokens,
         instructions: MATH_TUTOR_INSTRUCTIONS,
         collectedUsage,
@@ -462,7 +462,7 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
       return createSummarizationRun({
         agentProvider,
         summarizationProvider: Providers.ANTHROPIC,
-        summarizationModel: 'claude-3-5-haiku-latest',
+        summarizationModel: 'claude-haiku-4-5',
         maxContextTokens: maxTokens,
         instructions: MATH_TUTOR_INSTRUCTIONS,
         collectedUsage,
@@ -742,7 +742,7 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
       const run = await createSummarizationRun({
         agentProvider,
         summarizationProvider: Providers.ANTHROPIC,
-        summarizationModel: 'claude-3-5-haiku-latest',
+        summarizationModel: 'claude-haiku-4-5',
         maxContextTokens: maxTokens,
         instructions: [
           'You are a math reasoning tutor who thinks step by step.',
@@ -947,7 +947,7 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
       'You are an expert math tutor. Use the calculator tool for ALL computations.';
 
     const anthropicCount = await client.messages.countTokens({
-      model: 'claude-3-5-haiku-latest',
+      model: 'claude-haiku-4-5',
       system: systemPrompt,
       messages: testMessages.map((m) => ({ role: m.role, content: m.content })),
     });
@@ -2364,9 +2364,7 @@ const hasAnyApiKey =
       : Providers.OPENAI;
   const summarizationProvider = agentProvider;
   const summarizationModel =
-    agentProvider === Providers.ANTHROPIC
-      ? 'claude-3-5-haiku-latest'
-      : 'gpt-4.1-mini';
+    agentProvider === Providers.ANTHROPIC ? 'claude-haiku-4-5' : 'gpt-4.1-mini';
 
   const streamConfig = {
     configurable: { thread_id: 'token-audit-e2e' },
