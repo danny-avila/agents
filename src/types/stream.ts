@@ -280,16 +280,14 @@ export type SummaryBoundary = {
 
 export type SummaryContentBlock = {
   type: ContentTypes.SUMMARY;
-  text: string;
-  tokenCount: number;
+  content?: MessageContentComplex[];
+  tokenCount?: number;
   boundary?: SummaryBoundary;
   summaryVersion?: number;
   rangeHash?: string;
   model?: string;
   provider?: string;
   createdAt?: string;
-  /** When true, this delta contains reasoning/thinking tokens, not summary text. */
-  reasoning?: boolean;
 };
 
 /** Vertex AI / Google Common - Reasoning Content Block Format */

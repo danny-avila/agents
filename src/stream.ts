@@ -521,7 +521,10 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       const incoming = contentPart as t.SummaryContentBlock;
       contentParts[index] = {
         ...incoming,
-        text: (currentSummary?.text ?? '') + incoming.text,
+        content: [
+          ...(currentSummary?.content ?? []),
+          ...(incoming.content ?? []),
+        ],
       };
     } else if (
       partType === ContentTypes.IMAGE_URL &&

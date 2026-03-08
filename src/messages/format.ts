@@ -712,14 +712,18 @@ function getLatestSummaryBoundary(
     }
 
     for (let j = 0; j < message.content.length; j++) {
-      const part = message.content[j];
+      const part = message.content[j] as MessageContentComplex | undefined;
       if (part == null || part.type !== ContentTypes.SUMMARY) {
         continue;
       }
 
       const summaryPart = part as Partial<SummaryContentBlock>;
-      const summaryText =
-        typeof summaryPart.text === 'string' ? summaryPart.text.trim() : '';
+      const summaryText = (summaryPart.content ?? [])
+        .map((block) =>
+          'text' in block ? (block as { text: string }).text : ''
+        )
+        .join('')
+        .trim();
       if (summaryText.length === 0) {
         continue;
       }
@@ -835,7 +839,7 @@ export const formatAgentMessages = (
         message: message as MessageInput,
         langChain: true,
       }) as HumanMessage | AIMessage | SystemMessage;
-      if (sourceMessageId) {
+      if (sourceMessageId != null && sourceMessageId !== '') {
         formattedMessage.id = sourceMessageId;
       }
       messages.push(formattedMessage);
@@ -857,7 +861,7 @@ export const formatAgentMessages = (
     let processedMessage = message;
     if (discoveredTools) {
       const content = message.content;
-      if (content && Array.isArray(content)) {
+      if (content != null && Array.isArray(content)) {
         const filteredContent: typeof content = [];
         const invalidToolCallIds = new Set<string>();
         const invalidToolStrings: string[] = [];
@@ -980,9 +984,8 @@ export const formatAgentMessages = (
       }
     }
 
-    // Process the assistant message using the helper function
     const formattedMessages = formatAssistantMessage(processedMessage);
-    if (sourceMessageId) {
+    if (sourceMessageId != null && sourceMessageId !== '') {
       for (const formattedMessage of formattedMessages) {
         formattedMessage.id = sourceMessageId;
       }

@@ -158,9 +158,12 @@ describe('createSummarizeNode', () => {
     const completeEvent = events.find(
       (e) => e.event === GraphEvents.ON_SUMMARIZE_COMPLETE
     );
-    expect((completeEvent?.data as t.SummarizeCompleteEvent).summary.text).toBe(
-      'Test summary output'
-    );
+    expect(
+      (
+        (completeEvent?.data as t.SummarizeCompleteEvent).summary
+          .content?.[0] as { text: string } | undefined
+      )?.text
+    ).toBe('Test summary output');
     expect(
       (completeEvent?.data as t.SummarizeCompleteEvent).error
     ).toBeUndefined();
@@ -293,7 +296,10 @@ describe('createSummarizeNode', () => {
       (e) => e.event === GraphEvents.ON_SUMMARIZE_COMPLETE
     );
     expect(
-      (completeEvent?.data as t.SummarizeCompleteEvent).summary.text
+      (
+        (completeEvent?.data as t.SummarizeCompleteEvent).summary
+          .content?.[0] as { text: string } | undefined
+      )?.text
     ).toMatch(/^\[Metadata summary:/);
     expect(
       (completeEvent?.data as t.SummarizeCompleteEvent).error
@@ -444,9 +450,12 @@ describe('createSummarizeNode', () => {
     const completeEvent = events.find(
       (e) => e.event === GraphEvents.ON_SUMMARIZE_COMPLETE
     );
-    expect((completeEvent?.data as t.SummarizeCompleteEvent).summary.text).toBe(
-      'Part 2 summary (with prior context)'
-    );
+    expect(
+      (
+        (completeEvent?.data as t.SummarizeCompleteEvent).summary
+          .content?.[0] as { text: string } | undefined
+      )?.text
+    ).toBe('Part 2 summary (with prior context)');
   });
 
   it('uses FRESH prompt for intra-cycle chunks, UPDATE prompt only for cross-cycle prior', async () => {

@@ -29,8 +29,19 @@ export async function handleSummarizeStream(
   }
 
   const chunk = data.chunk as Partial<AIMessageChunk>;
-  const text = typeof chunk.content === 'string' ? chunk.content : '';
-  if (!text) {
+  const raw = chunk.content;
+  if (raw == null || (typeof raw === 'string' && !raw)) {
+    return true;
+  }
+
+  const contentBlocks: t.MessageContentComplex[] =
+    typeof raw === 'string'
+      ? [{ type: ContentTypes.TEXT, text: raw } as t.MessageContentComplex]
+      : Array.isArray(raw)
+        ? (raw as t.MessageContentComplex[])
+        : [];
+
+  if (contentBlocks.length === 0) {
     return true;
   }
 
@@ -52,8 +63,7 @@ export async function handleSummarizeStream(
       delta: {
         summary: {
           type: ContentTypes.SUMMARY,
-          text,
-          tokenCount: 0,
+          content: contentBlocks,
           provider: String(metadata?.summarization_provider ?? ''),
           model: String(metadata?.summarization_model ?? ''),
         },

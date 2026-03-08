@@ -90,11 +90,35 @@ function computeRangeHash(messages: BaseMessage[]): string {
  * Truncates a string to `maxLen` characters, appending an ellipsis indicator
  * with the original length so the summarizer knows content was cut.
  */
+/** Remove unpaired surrogates from the edges of a sliced string. */
+function stripBrokenSurrogates(s: string): string {
+  let start = 0;
+  let end = s.length;
+  // Leading low surrogate (orphaned tail of a pair)
+  if (
+    end > 0 &&
+    s.charCodeAt(start) >= 0xdc00 &&
+    s.charCodeAt(start) <= 0xdfff
+  ) {
+    start++;
+  }
+  // Trailing high surrogate (orphaned head of a pair)
+  if (
+    end > start &&
+    s.charCodeAt(end - 1) >= 0xd800 &&
+    s.charCodeAt(end - 1) <= 0xdbff
+  ) {
+    end--;
+  }
+  return start === 0 && end === s.length ? s : s.slice(start, end);
+}
+
 function truncate(text: string, maxLen: number): string {
   if (text.length <= maxLen) {
     return text;
   }
-  return `${text.slice(0, maxLen)}… [truncated, ${text.length} chars total]`;
+  const sliced = stripBrokenSurrogates(text.slice(0, maxLen));
+  return `${sliced}… [truncated, ${text.length} chars total]`;
 }
 
 /**
@@ -114,7 +138,9 @@ function smartTruncate(text: string, maxLen: number): string {
   }
   const head = Math.ceil(available / 2);
   const tail = Math.floor(available / 2);
-  return text.slice(0, head) + indicator + text.slice(text.length - tail);
+  const headStr = stripBrokenSurrogates(text.slice(0, head));
+  const tailStr = stripBrokenSurrogates(text.slice(text.length - tail));
+  return headStr + indicator + tailStr;
 }
 
 /**
@@ -188,9 +214,29 @@ function formatMessageForSummary(msg: BaseMessage): string {
     return `[${role}]: ${parts.join('\n')}`;
   }
 
-  // All other messages: use content directly, truncated
-  const content =
-    typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
+  // All other messages: extract text content, skip reasoning/thinking blocks
+  let content: string;
+  if (typeof msg.content === 'string') {
+    content = msg.content;
+  } else if (Array.isArray(msg.content)) {
+    const textParts: string[] = [];
+    for (const block of msg.content) {
+      if (typeof block === 'string') {
+        textParts.push(block);
+      } else if (
+        typeof block === 'object' &&
+        'type' in block &&
+        block.type === 'text' &&
+        'text' in block &&
+        typeof block.text === 'string'
+      ) {
+        textParts.push(block.text);
+      }
+    }
+    content = textParts.join('\n');
+  } else {
+    content = '';
+  }
   return `[${role}]: ${smartTruncate(content, LIMITS.messageContent)}`;
 }
 
@@ -642,9 +688,6 @@ export function createSummarizeNode({
     };
 
     // Strip agent-specific fields that don't apply to summarization.
-    delete clientOptions.tools;
-    delete clientOptions.streaming;
-    delete clientOptions.streamUsage;
 
     if (modelName != null && modelName !== '') {
       clientOptions.model = modelName;
@@ -676,8 +719,6 @@ export function createSummarizeNode({
 
     const placeholderSummary: t.SummaryContentBlock = {
       type: ContentTypes.SUMMARY,
-      text: '',
-      tokenCount: 0,
       model: modelName,
       provider: provider as string,
     };
@@ -890,7 +931,12 @@ export function createSummarizeNode({
 
     const summaryBlock: t.SummaryContentBlock = {
       type: ContentTypes.SUMMARY,
-      text: summaryText,
+      content: [
+        {
+          type: ContentTypes.TEXT,
+          text: summaryText,
+        } as t.MessageContentComplex,
+      ],
       tokenCount,
       summaryVersion: agentContext.summaryVersion,
       rangeHash: computeRangeHash(request.messagesToRefine),
@@ -1098,22 +1144,28 @@ async function streamAndCollect(
     return extractResponseText(response);
   }
 
-  const textChunks: string[] = [];
+  const textBlocks: t.MessageContentComplex[] = [];
+  const reasoningBlocks: t.MessageContentComplex[] = [];
   const stream = await model.stream(messages, config);
   for await (const chunk of stream) {
-    const content = getChunkContent({
-      chunk: chunk as Parameters<typeof getChunkContent>[0]['chunk'],
+    const chunkAny = chunk as Parameters<typeof getChunkContent>[0]['chunk'];
+    const raw = getChunkContent({
+      chunk: chunkAny,
       provider,
       reasoningKey,
     });
-    const text = typeof content === 'string' ? content : '';
-    if (!text) {
+    if (raw == null || (typeof raw === 'string' && !raw)) {
       continue;
     }
 
+    // Normalize to MessageContentComplex[] — getChunkContent may return a string.
+    const contentBlocks: t.MessageContentComplex[] =
+      typeof raw === 'string'
+        ? [{ type: ContentTypes.TEXT, text: raw } as t.MessageContentComplex]
+        : raw;
+
     // Detect reasoning: chunk has reasoning_content in additional_kwargs
     // or content is an array with reasoning-type blocks.
-    const chunkAny = chunk as Parameters<typeof getChunkContent>[0]['chunk'];
     const hasReasoningKwarg =
       chunkAny?.additional_kwargs?.[reasoningKey] != null &&
       chunkAny.additional_kwargs[reasoningKey] !== '';
@@ -1124,9 +1176,14 @@ async function streamAndCollect(
         chunkAny.content[0]?.type === ContentTypes.REASONING_CONTENT);
     const isReasoning = hasReasoningKwarg || hasReasoningContent;
 
-    // Only collect text (non-reasoning) chunks for the final summary.
-    if (!isReasoning) {
-      textChunks.push(text);
+    if (isReasoning) {
+      for (const block of contentBlocks) {
+        reasoningBlocks.push(block);
+      }
+    } else {
+      for (const block of contentBlocks) {
+        textBlocks.push(block);
+      }
     }
 
     // Stream both reasoning and text to the client.
@@ -1138,11 +1195,9 @@ async function streamAndCollect(
           delta: {
             summary: {
               type: ContentTypes.SUMMARY,
-              text,
-              tokenCount: 0,
+              content: contentBlocks,
               provider: String(config.metadata?.summarization_provider ?? ''),
               model: String(config.metadata?.summarization_model ?? ''),
-              reasoning: isReasoning || undefined,
             },
           },
         } satisfies t.SummarizeDeltaEvent,
@@ -1150,7 +1205,23 @@ async function streamAndCollect(
       );
     }
   }
-  return textChunks.join('').trim();
+
+  let textResult = '';
+  for (let i = 0; i < textBlocks.length; i++) {
+    if ('text' in textBlocks[i]) {
+      textResult += (textBlocks[i] as { text: string }).text;
+    }
+  }
+  if (textResult.trim()) {
+    return textResult.trim();
+  }
+  let reasoningResult = '';
+  for (let i = 0; i < reasoningBlocks.length; i++) {
+    if ('text' in reasoningBlocks[i]) {
+      reasoningResult += (reasoningBlocks[i] as { text: string }).text;
+    }
+  }
+  return reasoningResult.trim();
 }
 
 /**
@@ -1317,8 +1388,12 @@ async function summarizeInStages({
           delta: {
             summary: {
               type: ContentTypes.SUMMARY,
-              text: '\n\n',
-              tokenCount: 0,
+              content: [
+                {
+                  type: ContentTypes.TEXT,
+                  text: '\n\n',
+                } as t.MessageContentComplex,
+              ],
               provider: String(config.metadata?.summarization_provider ?? ''),
               model: String(config.metadata?.summarization_model ?? ''),
             },
