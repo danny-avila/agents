@@ -1541,6 +1541,12 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         if (repaired.droppedMessages.length > 0) {
           messagesToRefine.push(...repaired.droppedMessages);
         }
+
+        factoryParams.log?.('debug', 'Emergency truncation retry result', {
+          contextLength: context.length,
+          messagesToRefineCount: messagesToRefine.length,
+          remainingTokens: retryResult.remainingContextTokens,
+        });
       } finally {
         // Restore the closure's indexTokenCountMap to pre-emergency values so the
         // next turn counts old messages at their original (un-truncated) size.

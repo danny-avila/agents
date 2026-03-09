@@ -924,10 +924,11 @@ export function createSummarizeNode({
       'summarize',
       'Summary persisted',
       {
-        tokenCount,
-        summaryVersion: agentContext.summaryVersion,
+        summaryTokens: tokenCount,
         textLength: summaryText.length,
         contextLength: request.context.length,
+        survivingMessages: request.context.length,
+        summaryVersion: agentContext.summaryVersion,
       },
       { runId: graph.runId, agentId: request.agentId }
     );
@@ -1251,16 +1252,27 @@ async function summarizeSinglePass({
     const t = m.getType();
     return t === 'tool' ? `tool(${m.name ?? '?'})` : t;
   });
-  emitAgentLog(config, 'debug', 'summarize', 'Single-pass input', {
-    messageCount: messages.length,
-    messageTypes: msgTypes.join(', '),
-    formattedChars: formattedText.length,
-    hasPriorSummary: priorSummaryText !== '',
-    priorSummaryChars: priorSummaryText.length,
-  });
+  emitAgentLog(
+    config,
+    'debug',
+    'summarize',
+    'Single-pass input',
+    {
+      messageCount: messages.length,
+      messageTypes: msgTypes.join(', '),
+      formattedChars: formattedText.length,
+      hasPriorSummary: priorSummaryText !== '',
+      priorSummaryChars: priorSummaryText.length,
+    },
+    {
+      runId: config?.metadata?.runId as string | undefined,
+      agentId: config?.metadata?.agent_id as string | undefined,
+    }
+  );
 
-  // Select the appropriate prompt: use the update variant when integrating
-  // new messages into an existing summary, fresh prompt otherwise.
+  /** Selected as the effective prompt: updated variant when integrating
+   * new messages into an existing summary, main prompt otherwise.
+   */
   const effectivePrompt = priorSummaryText
     ? (updatePromptText ?? promptText)
     : promptText;

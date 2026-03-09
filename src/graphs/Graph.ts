@@ -869,40 +869,63 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         agentContext.indexTokenCountMap = indexTokenCountMap;
         messagesToUse = context;
 
-        if (
+        const hasPrunedMessages =
           agentContext.summarizationEnabled === true &&
           Array.isArray(messagesToRefine) &&
-          messagesToRefine.length > 0 &&
-          !agentContext.shouldSkipSummarization(messages.length) &&
-          shouldTriggerSummarization({
-            trigger: agentContext.summarizationConfig?.trigger,
-            maxContextTokens: agentContext.maxContextTokens,
-            prePruneTotalTokens,
-            remainingContextTokens,
-            messagesToRefineCount: messagesToRefine.length,
-          })
-        ) {
-          emitAgentLog(
-            config,
-            'info',
-            'graph',
-            'Summarization triggered',
-            {
-              messagesToRefineCount: messagesToRefine.length,
-              remainingContextTokens: remainingContextTokens ?? 0,
-              summaryVersion: agentContext.summaryVersion + 1,
-            },
-            { runId: this.runId, agentId }
+          messagesToRefine.length > 0;
+
+        if (hasPrunedMessages) {
+          const shouldSkip = agentContext.shouldSkipSummarization(
+            messages.length
           );
-          agentContext.markSummarizationTriggered(messages.length);
-          return {
-            summarizationRequest: {
-              messagesToRefine,
-              context,
-              remainingContextTokens: remainingContextTokens ?? 0,
-              agentId: agentId || agentContext.agentId,
-            },
-          } as unknown as Partial<t.BaseGraphState>;
+          const triggerResult =
+            !shouldSkip &&
+            shouldTriggerSummarization({
+              trigger: agentContext.summarizationConfig?.trigger,
+              maxContextTokens: agentContext.maxContextTokens,
+              prePruneTotalTokens,
+              remainingContextTokens,
+              messagesToRefineCount: messagesToRefine.length,
+            });
+
+          if (triggerResult) {
+            emitAgentLog(
+              config,
+              'info',
+              'graph',
+              'Summarization triggered',
+              {
+                messagesToRefineCount: messagesToRefine.length,
+                remainingContextTokens: remainingContextTokens ?? 0,
+                summaryVersion: agentContext.summaryVersion + 1,
+              },
+              { runId: this.runId, agentId }
+            );
+            agentContext.markSummarizationTriggered(messages.length);
+            return {
+              summarizationRequest: {
+                messagesToRefine,
+                context,
+                remainingContextTokens: remainingContextTokens ?? 0,
+                agentId: agentId || agentContext.agentId,
+              },
+            } as unknown as Partial<t.BaseGraphState>;
+          }
+
+          if (shouldSkip) {
+            emitAgentLog(
+              config,
+              'debug',
+              'graph',
+              'Summarization skipped — insufficient new messages since last summary',
+              {
+                messageCount: messages.length,
+                messagesToRefineCount: messagesToRefine.length,
+                contextLength: context.length,
+              },
+              { runId: this.runId, agentId }
+            );
+          }
         }
       }
 
