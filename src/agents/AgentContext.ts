@@ -784,10 +784,11 @@ export class AgentContext {
    *    for the model to complete tool-call rounds between summarizations.
    *    pruneMessages still drops old messages (just without a summary).
    *
-   * 2. **Insufficient new messages**: A minimum growth of 4 messages is required
-   *    before re-triggering. This prevents tool call rounds (each adding 2
-   *    messages: AIMessage + ToolMessage) from immediately re-triggering
-   *    summarization, giving the model at least 2 tool-call rounds to work.
+   * 2. **Insufficient new messages**: A minimum growth threshold is required
+   *    before re-triggering. For tool-enabled agents, this is 8 messages
+   *    (~4 tool-call rounds), giving the model meaningful work time between
+   *    summarization cycles. For tool-free agents (pure chat), 4 messages
+   *    (~2 exchanges) is sufficient.
    */
   shouldSkipSummarization(currentMsgCount: number): boolean {
     if (
@@ -795,7 +796,10 @@ export class AgentContext {
     ) {
       return true;
     }
-    const MIN_MSG_GROWTH = 4;
+    const hasTools =
+      (this.tools != null && this.tools.length > 0) ||
+      (this.toolDefinitions != null && this.toolDefinitions.length > 0);
+    const MIN_MSG_GROWTH = hasTools ? 8 : 4;
     return (
       this._lastSummarizationMsgCount > 0 &&
       currentMsgCount < this._lastSummarizationMsgCount + MIN_MSG_GROWTH

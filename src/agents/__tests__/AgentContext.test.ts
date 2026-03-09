@@ -1071,5 +1071,36 @@ describe('AgentContext', () => {
       // Even with a low baseline, the per-run cap is hit
       expect(ctx.shouldSkipSummarization(100)).toBe(true);
     });
+
+    it('uses higher MIN_MSG_GROWTH (8) for tool-enabled agents', () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          tools: [createMockTool('calculator')] as t.GraphTools,
+        },
+      });
+
+      ctx.markSummarizationTriggered(20);
+      ctx.setSummary('Summary', 50);
+      ctx.rebuildTokenMapAfterSummarization({ 0: 10, 1: 20, 2: 15, 3: 25 });
+
+      // Baseline is 4. With tools, MIN_MSG_GROWTH = 8.
+      // Need count >= 4 + 8 = 12 to re-trigger.
+      expect(ctx.shouldSkipSummarization(4)).toBe(true); // same as baseline
+      expect(ctx.shouldSkipSummarization(8)).toBe(true); // would pass with MIN=4, not MIN=8
+      expect(ctx.shouldSkipSummarization(11)).toBe(true); // still not enough
+      expect(ctx.shouldSkipSummarization(12)).toBe(false); // 8 new messages — triggers
+    });
+
+    it('uses lower MIN_MSG_GROWTH (4) for tool-free agents', () => {
+      const ctx = createBasicContext(); // no tools
+
+      ctx.markSummarizationTriggered(20);
+      ctx.setSummary('Summary', 50);
+      ctx.rebuildTokenMapAfterSummarization({ 0: 10, 1: 20, 2: 15, 3: 25 });
+
+      // Baseline is 4. Without tools, MIN_MSG_GROWTH = 4.
+      expect(ctx.shouldSkipSummarization(7)).toBe(true);
+      expect(ctx.shouldSkipSummarization(8)).toBe(false); // 4 new messages — triggers
+    });
   });
 });

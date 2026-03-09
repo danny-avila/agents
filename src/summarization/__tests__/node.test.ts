@@ -541,12 +541,12 @@ describe('createSummarizeNode', () => {
     // Chunk 1 (no prior summary): should use FRESH prompt (contains "Create a structured")
     expect(capturedSystemMessages[0]).toContain('Create a structured');
     // Should NOT use the UPDATE prompt (which says "PRESERVE")
-    expect(capturedSystemMessages[0]).not.toContain('PRESERVE');
+    expect(capturedSystemMessages[0]).not.toContain('Merge new conversation');
 
     // Chunk 2 (intra-cycle, has running summary from chunk 1): should use FRESH prompt
     // with continuation prefix (NOT the UPDATE prompt)
     expect(capturedSystemMessages[1]).toContain('Create a structured');
-    expect(capturedSystemMessages[1]).not.toContain('PRESERVE');
+    expect(capturedSystemMessages[1]).not.toContain('Merge new conversation');
     // Should have the continuation prefix instructing to incorporate context
     expect(capturedSystemMessages[1]).toContain(
       'context-from-earlier-messages'
@@ -640,12 +640,12 @@ describe('createSummarizeNode', () => {
     expect(capturedSystemMessages.length).toBe(2);
 
     // Chunk 0 with cross-cycle prior: should use UPDATE prompt
-    expect(capturedSystemMessages[0]).toContain('PRESERVE');
+    expect(capturedSystemMessages[0]).toContain('Merge new conversation');
     // Human message should use <previous-summary> tag for cross-cycle
     expect(capturedHumanMessages[0]).toContain('<previous-summary>');
 
     // Chunk 1 (intra-cycle): should use FRESH prompt with continuation prefix
-    expect(capturedSystemMessages[1]).not.toContain('PRESERVE');
+    expect(capturedSystemMessages[1]).not.toContain('Merge new conversation');
     expect(capturedSystemMessages[1]).toContain(
       'context-from-earlier-messages'
     );

@@ -406,19 +406,20 @@ Rules:
  * The rules ensure existing information is preserved while new information
  * is integrated into the correct sections.
  */
-export const DEFAULT_UPDATE_SUMMARIZATION_PROMPT = `Update the existing context checkpoint with information from new conversation messages. Maintain the same structured format.
+export const DEFAULT_UPDATE_SUMMARIZATION_PROMPT = `Merge new conversation messages into the existing context checkpoint, producing a single consolidated replacement.
 
-IMPORTANT: Write as a factual state log in third person. Do NOT write as a chatbot response. Do NOT use first person, second person, emojis, or conversational phrases. This is a technical state record, not a message to the user.
+IMPORTANT: The output must be roughly the SAME LENGTH as the previous checkpoint. Compress older details to make room for new information — do not simply append. Prioritize recency: recent actions and results get more detail, older items get compressed to one-line summaries.
+
+Write as a factual state log in third person. Do NOT write as a chatbot response. Do NOT use first person, second person, emojis, or conversational phrases. This is a technical state record, not a message to the user.
 
 Rules:
-- PRESERVE all existing information from the previous checkpoint unless explicitly contradicted by new messages
-- ADD new progress, decisions, and context from the new messages
+- MERGE new progress into existing sections — do not duplicate section headers
+- COMPRESS older completed items into brief one-line entries to control length
 - Move items from "In Progress" to "Done" when completed
 - Move items from "Blocked" to "In Progress" or "Done" as appropriate
-- Add new items to the appropriate sections
 - Update "Next Steps" to reflect current priorities
 - Write factual, third-person statements: "User requested X. Agent executed Y tool. Result: Z."
-- For each tool call, record: the tool name, key input parameters, and the outcome
+- For each NEW tool call, record: the tool name, key input parameters, and the outcome
 - Preserve exact identifiers, names, error messages, and key references — do NOT paraphrase them
 - Do NOT reproduce tool output or long content verbatim — summarize the outcome
 - Omit empty sections
