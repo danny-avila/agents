@@ -1020,7 +1020,7 @@ describe('AgentContext', () => {
   });
 
   describe('shouldSkipSummarization — re-trigger after summary', () => {
-    it('allows re-summarization after setSummary resets the message count baseline', () => {
+    it('allows re-summarization after rebuildTokenMapAfterSummarization sets new baseline', () => {
       const ctx = createBasicContext();
 
       // First summarization triggers at message count 25
@@ -1030,14 +1030,32 @@ describe('AgentContext', () => {
       // Immediately after triggering, skip (no growth)
       expect(ctx.shouldSkipSummarization(25)).toBe(true);
 
-      // After summarization completes, graph state is reduced to 4 messages.
-      // setSummary resets the baseline so the growth check works correctly.
+      // After summarization completes:
+      // 1. setSummary persists the summary
       ctx.setSummary('Summary of conversation', 100);
 
-      // With reset baseline, even a small message count should allow re-trigger
-      // once MIN_MSG_GROWTH (4) is reached
-      expect(ctx.shouldSkipSummarization(4)).toBe(false);
-      expect(ctx.shouldSkipSummarization(5)).toBe(false);
+      // 2. rebuildTokenMapAfterSummarization sets the baseline to surviving context count
+      //    Simulate 4 surviving context messages
+      ctx.rebuildTokenMapAfterSummarization({ 0: 10, 1: 20, 2: 15, 3: 25 });
+
+      // Baseline is now 4 (surviving context count).
+      // Need MIN_MSG_GROWTH (4) new messages → count must reach 4 + 4 = 8
+      expect(ctx.shouldSkipSummarization(4)).toBe(true); // same as baseline
+      expect(ctx.shouldSkipSummarization(7)).toBe(true); // not enough growth
+      expect(ctx.shouldSkipSummarization(8)).toBe(false); // 4 new messages
+      expect(ctx.shouldSkipSummarization(10)).toBe(false); // plenty of growth
+    });
+
+    it('prevents immediate re-summarization of surviving context messages', () => {
+      const ctx = createBasicContext();
+
+      ctx.markSummarizationTriggered(20);
+      ctx.setSummary('Summary', 50);
+      ctx.rebuildTokenMapAfterSummarization({ 0: 100, 1: 200, 2: 150, 3: 250 });
+
+      // The 4 surviving context messages should NOT trigger re-summarization
+      // even if they all land in messagesToRefine due to a large tool result
+      expect(ctx.shouldSkipSummarization(4)).toBe(true);
     });
 
     it('still respects per-run cap after baseline reset', () => {
@@ -1047,9 +1065,10 @@ describe('AgentContext', () => {
       for (let i = 0; i < 3; i++) {
         ctx.markSummarizationTriggered(10 + i * 5);
         ctx.setSummary(`Summary ${i}`, 50);
+        ctx.rebuildTokenMapAfterSummarization({ 0: 10 });
       }
 
-      // Even though setSummary reset the baseline, the per-run cap is hit
+      // Even with a low baseline, the per-run cap is hit
       expect(ctx.shouldSkipSummarization(100)).toBe(true);
     });
   });

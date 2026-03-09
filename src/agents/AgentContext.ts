@@ -738,10 +738,6 @@ export class AgentContext {
     this._durableSummaryTokenCount = tokenCount;
     this._summaryVersion += 1;
     this.systemRunnableStale = true;
-    // Reset the message count baseline so the growth check in
-    // shouldSkipSummarization compares against the post-summarization
-    // state, not the pre-summarization high-water mark.
-    this._lastSummarizationMsgCount = 0;
     // Force pruner recreation: after summarization, the summarize node removes
     // summarized messages from graph state via RemoveMessage.  The old pruner's
     // closure state (indexTokenCountMap indices, lastCutOffIndex, totalTokens)
@@ -758,6 +754,12 @@ export class AgentContext {
   rebuildTokenMapAfterSummarization(newTokenMap: Record<string, number>): void {
     this.indexTokenCountMap = newTokenMap;
     this.baseIndexTokenCountMap = { ...newTokenMap };
+    // Set the message count baseline to the surviving context size so
+    // shouldSkipSummarization requires MIN_MSG_GROWTH new messages beyond
+    // the surviving context before re-triggering. Without this, the same
+    // context messages get immediately re-summarized if they still exceed
+    // the effective budget (e.g., a single large tool result).
+    this._lastSummarizationMsgCount = Object.keys(newTokenMap).length;
   }
 
   hasSummary(): boolean {

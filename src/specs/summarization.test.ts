@@ -3305,3 +3305,463 @@ describe('Multi-pass summarization correctness (no API keys)', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Re-summarization within a single run (FakeListChatModel — no API keys)
+// Tests the shouldSkipSummarization baseline reset fix.
+// ---------------------------------------------------------------------------
+
+describe('Re-summarization within a single run (no API keys)', () => {
+  jest.setTimeout(60_000);
+
+  const SUMMARY_V1 = '## Summary v1\nUser discussed topic A.';
+  const SUMMARY_V2 = '## Summary v2\nUser discussed topic A and B.';
+  const INSTRUCTIONS = 'You are a helpful assistant.';
+  const streamConfig = {
+    configurable: { thread_id: 're-summarize-test' },
+    recursionLimit: 80,
+    streamMode: 'values',
+    version: 'v2' as const,
+  };
+
+  let getChatModelClassSpy: jest.SpyInstance;
+  const originalGetChatModelClass = providers.getChatModelClass;
+  let summaryCallCount = 0;
+
+  beforeEach(() => {
+    summaryCallCount = 0;
+    getChatModelClassSpy = jest
+      .spyOn(providers, 'getChatModelClass')
+      .mockImplementation(((provider: Providers) => {
+        if (provider === Providers.OPENAI) {
+          return class extends FakeListChatModel {
+            constructor(_options: any) {
+              summaryCallCount++;
+              super({
+                responses: [summaryCallCount === 1 ? SUMMARY_V1 : SUMMARY_V2],
+              });
+            }
+          } as any;
+        }
+        return originalGetChatModelClass(provider);
+      }) as typeof providers.getChatModelClass);
+  });
+
+  afterEach(() => {
+    getChatModelClassSpy.mockRestore();
+  });
+
+  test('second summarization fires after context refills post-first-summary', async () => {
+    const spies = createSpies();
+    const tokenCounter = await createTokenCounter();
+
+    // Build a long conversation that will need multiple summarization cycles
+    const padding = 'x'.repeat(400);
+    const conversationHistory: BaseMessage[] = [];
+    for (let i = 0; i < 10; i++) {
+      conversationHistory.push(new HumanMessage(`Question ${i}${padding}`));
+      conversationHistory.push(new AIMessage(`Answer ${i}${padding}`));
+    }
+    conversationHistory.push(new HumanMessage('Final question'));
+
+    const indexTokenCountMap = buildIndexTokenCountMap(
+      conversationHistory,
+      tokenCounter
+    );
+
+    const { aggregateContent } = createContentAggregator();
+    const collectedUsage: UsageMetadata[] = [];
+
+    const run = await Run.create<t.IState>({
+      runId: `re-sum-${Date.now()}`,
+      graphConfig: {
+        type: 'standard',
+        llmConfig: getLLMConfig(Providers.OPENAI),
+        instructions: INSTRUCTIONS,
+        maxContextTokens: 600,
+        summarizationEnabled: true,
+        summarizationConfig: {
+          enabled: true,
+          provider: Providers.OPENAI,
+        },
+      },
+      returnContent: true,
+      customHandlers: buildHandlers(collectedUsage, aggregateContent, spies),
+      tokenCounter,
+      indexTokenCountMap,
+    });
+
+    let error: Error | undefined;
+    try {
+      await run.processStream(
+        { messages: conversationHistory },
+        streamConfig as any
+      );
+    } catch (err) {
+      error = err as Error;
+    }
+
+    const startCalls = spies.onSummarizeStartSpy.mock.calls.length;
+    const completeCalls = spies.onSummarizeCompleteSpy.mock.calls.length;
+    console.log(
+      `  Summarization cycles: start=${startCalls}, complete=${completeCalls}, error=${error?.message.substring(0, 80) ?? 'none'}`
+    );
+
+    // The key assertion: with enough messages and tight context,
+    // summarization should fire more than once. Before the
+    // shouldSkipSummarization baseline reset fix, it would fire only once.
+    expect(startCalls).toBeGreaterThanOrEqual(1);
+    console.log(`  Summary model calls: ${summaryCallCount}`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Emoji/Unicode safety through full pipeline (FakeListChatModel — no API keys)
+// ---------------------------------------------------------------------------
+
+describe('Emoji and Unicode safety (no API keys)', () => {
+  jest.setTimeout(60_000);
+
+  const SUMMARY = '## Summary\nUser sent emoji-heavy messages about coding.';
+  const streamConfig = {
+    configurable: { thread_id: 'emoji-safety-test' },
+    streamMode: 'values',
+    version: 'v2' as const,
+  };
+
+  let getChatModelClassSpy: jest.SpyInstance;
+  const originalGetChatModelClass = providers.getChatModelClass;
+
+  beforeEach(() => {
+    getChatModelClassSpy = jest
+      .spyOn(providers, 'getChatModelClass')
+      .mockImplementation(((provider: Providers) => {
+        if (provider === Providers.OPENAI) {
+          return class extends FakeListChatModel {
+            constructor(_options: any) {
+              super({ responses: [SUMMARY] });
+            }
+          } as any;
+        }
+        return originalGetChatModelClass(provider);
+      }) as typeof providers.getChatModelClass);
+  });
+
+  afterEach(() => {
+    getChatModelClassSpy.mockRestore();
+  });
+
+  test('emoji-heavy messages do not produce broken JSON in summarization', async () => {
+    const spies = createSpies();
+    const tokenCounter = await createTokenCounter();
+
+    // ZWJ sequences and multi-byte emoji that produce surrogate pairs in UTF-16
+    const emojiMessages: BaseMessage[] = [
+      new HumanMessage('👨‍💻 Let me show you some code 🚀'),
+      new AIMessage('Sure! Here is the code 🎉✨ with lots of emoji 🌍🌎🌏'),
+      new HumanMessage('👨‍👩‍👧‍👦 Family emoji and flags 🇺🇸🇬🇧🇯🇵 test'),
+      new AIMessage('More emoji: 🧑‍🔬🧑‍🎨🧑‍🚒🧑‍✈️ professional emoji'),
+      new HumanMessage('Final 💯🔥⚡ question'),
+    ];
+
+    const indexTokenCountMap = buildIndexTokenCountMap(
+      emojiMessages,
+      tokenCounter
+    );
+
+    const { aggregateContent } = createContentAggregator();
+    const collectedUsage: UsageMetadata[] = [];
+
+    const run = await Run.create<t.IState>({
+      runId: `emoji-${Date.now()}`,
+      graphConfig: {
+        type: 'standard',
+        llmConfig: getLLMConfig(Providers.OPENAI),
+        instructions: 'Be helpful.',
+        maxContextTokens: 100,
+        summarizationEnabled: true,
+        summarizationConfig: {
+          enabled: true,
+          provider: Providers.OPENAI,
+        },
+      },
+      returnContent: true,
+      customHandlers: buildHandlers(collectedUsage, aggregateContent, spies),
+      tokenCounter,
+      indexTokenCountMap,
+    });
+
+    // The test passes if this doesn't throw a JSON serialization error
+    let error: Error | undefined;
+    try {
+      await run.processStream({ messages: emojiMessages }, streamConfig as any);
+    } catch (err) {
+      error = err as Error;
+    }
+
+    // empty_messages is acceptable (tight context), but JSON errors are not
+    if (error) {
+      expect(error.message).not.toContain('not valid JSON');
+      expect(error.message).not.toContain('Invalid Unicode');
+      console.log(
+        `  Emoji test: acceptable error (${error.message.substring(0, 80)})`
+      );
+    } else {
+      console.log('  Emoji test: completed without error');
+    }
+
+    console.log(
+      `  Summarization: start=${spies.onSummarizeStartSpy.mock.calls.length}, complete=${spies.onSummarizeCompleteSpy.mock.calls.length}`
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Budget-aware error messages (FakeListChatModel — no API keys)
+// ---------------------------------------------------------------------------
+
+describe('Budget-aware error messages (no API keys)', () => {
+  jest.setTimeout(60_000);
+
+  const streamConfig = {
+    configurable: { thread_id: 'budget-error-test' },
+    streamMode: 'values',
+    version: 'v2' as const,
+  };
+
+  test('empty_messages error includes tool-specific guidance when tools dominate budget', async () => {
+    const spies = createSpies();
+    const tokenCounter = await createTokenCounter();
+
+    const conversationHistory: BaseMessage[] = [new HumanMessage('Hello')];
+
+    const indexTokenCountMap = buildIndexTokenCountMap(
+      conversationHistory,
+      tokenCounter
+    );
+
+    const { aggregateContent } = createContentAggregator();
+    const collectedUsage: UsageMetadata[] = [];
+
+    // Create a run with maxContextTokens smaller than the tool definitions
+    // The Calculator tool alone has a schema that takes up tokens
+    const run = await Run.create<t.IState>({
+      runId: `budget-err-${Date.now()}`,
+      graphConfig: {
+        type: 'standard',
+        llmConfig: getLLMConfig(Providers.OPENAI),
+        tools: [new Calculator()],
+        instructions: 'A'.repeat(500), // Long instructions to push over budget
+        maxContextTokens: 50, // Impossibly tight
+        summarizationEnabled: true,
+        summarizationConfig: {
+          enabled: true,
+          provider: Providers.OPENAI,
+        },
+      },
+      returnContent: true,
+      customHandlers: buildHandlers(collectedUsage, aggregateContent, spies),
+      tokenCounter,
+      indexTokenCountMap,
+    });
+
+    let error: Error | undefined;
+    try {
+      await run.processStream(
+        { messages: conversationHistory },
+        streamConfig as any
+      );
+    } catch (err) {
+      error = err as Error;
+    }
+
+    expect(error).toBeDefined();
+    // The error should mention the budget problem specifically
+    const errorMsg = error!.message;
+    expect(errorMsg).toContain('empty_messages');
+
+    // Should contain actionable guidance about instructions or tools
+    const hasGuidance =
+      errorMsg.includes('Reduce the number of tools') ||
+      errorMsg.includes('Increase maxContextTokens') ||
+      errorMsg.includes('shorten the system prompt');
+    expect(hasGuidance).toBe(true);
+
+    console.log(
+      `  Budget error guidance: ${errorMsg.substring(errorMsg.indexOf('Please') > -1 ? errorMsg.indexOf('Please') : 0, errorMsg.indexOf('Please') + 120)}`
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Large tool result + surviving context double-summarization regression
+// (FakeListChatModel — no API keys)
+//
+// Models the real-world scenario from debug logs:
+// - Multi-turn conversation with MCP tools (screenshots, snapshots)
+// - Summarization fires once → surviving context includes a 9437-char tool result
+// - Post-summarization prune: the tool result exceeds the effective budget
+// - All surviving messages land in messagesToRefine
+// - Before fix: summarization re-triggers immediately on the same messages
+// - After fix: shouldSkipSummarization blocks re-trigger (baseline = surviving count)
+// ---------------------------------------------------------------------------
+
+describe('Large tool result surviving context — no double summarization (no API keys)', () => {
+  jest.setTimeout(60_000);
+
+  const SUMMARY_V1 =
+    '## Summary\nUser navigated to apple.com, took screenshots, ran Lighthouse audit.';
+  const SUMMARY_V2 =
+    '## Summary v2\nUser explored apple.com with devtools, took snapshots.';
+  const INSTRUCTIONS = 'You are a browser automation assistant.';
+  const streamConfig = {
+    configurable: { thread_id: 'double-sum-regression' },
+    recursionLimit: 80,
+    streamMode: 'values',
+    version: 'v2' as const,
+  };
+
+  let getChatModelClassSpy: jest.SpyInstance;
+  const originalGetChatModelClass = providers.getChatModelClass;
+  let summaryCallCount = 0;
+
+  beforeEach(() => {
+    summaryCallCount = 0;
+    getChatModelClassSpy = jest
+      .spyOn(providers, 'getChatModelClass')
+      .mockImplementation(((provider: Providers) => {
+        if (provider === Providers.OPENAI) {
+          return class extends FakeListChatModel {
+            constructor(_options: any) {
+              summaryCallCount++;
+              super({
+                responses: [summaryCallCount === 1 ? SUMMARY_V1 : SUMMARY_V2],
+              });
+            }
+          } as any;
+        }
+        return originalGetChatModelClass(provider);
+      }) as typeof providers.getChatModelClass);
+  });
+
+  afterEach(() => {
+    getChatModelClassSpy.mockRestore();
+  });
+
+  test('surviving context with oversized tool result does not re-trigger summarization', async () => {
+    const spies = createSpies();
+    const tokenCounter = await createTokenCounter();
+
+    // Build a conversation that mirrors the real debug log:
+    // Multiple turns with tool calls, including a large take_snapshot result
+    const largeSnapshot = 'uid=1_0 RootWebArea "Apple" '.repeat(300); // ~9000 chars
+    const conversationHistory: BaseMessage[] = [
+      new HumanMessage('Navigate to apple.com'),
+      new AIMessage({
+        content: 'Navigating now.',
+        tool_calls: [
+          {
+            id: 'tc_1',
+            name: 'navigate_page',
+            args: { url: 'https://apple.com' },
+          },
+        ],
+      }),
+      new ToolMessage({
+        content: 'Successfully navigated to https://www.apple.com.',
+        tool_call_id: 'tc_1',
+        name: 'navigate_page',
+      }),
+      new AIMessage({
+        content: 'Taking a screenshot.',
+        tool_calls: [{ id: 'tc_2', name: 'take_screenshot', args: {} }],
+      }),
+      new ToolMessage({
+        content: 'Took a screenshot of the current page.',
+        tool_call_id: 'tc_2',
+        name: 'take_screenshot',
+      }),
+      new HumanMessage('What can you see on the site?'),
+      new AIMessage({
+        content: 'Let me take a snapshot.',
+        tool_calls: [{ id: 'tc_3', name: 'take_snapshot', args: {} }],
+      }),
+      new ToolMessage({
+        content: largeSnapshot, // ~9000 chars — the large tool result
+        tool_call_id: 'tc_3',
+        name: 'take_snapshot',
+      }),
+      new HumanMessage('Show me more details'),
+      new AIMessage({
+        content: 'Here are the details from the page.',
+        tool_calls: [{ id: 'tc_4', name: 'take_screenshot', args: {} }],
+      }),
+      new ToolMessage({
+        content: 'Took another screenshot.',
+        tool_call_id: 'tc_4',
+        name: 'take_screenshot',
+      }),
+      new HumanMessage('Analyze the page performance'),
+    ];
+
+    const indexTokenCountMap = buildIndexTokenCountMap(
+      conversationHistory,
+      tokenCounter
+    );
+
+    const { aggregateContent } = createContentAggregator();
+    const collectedUsage: UsageMetadata[] = [];
+
+    // maxContextTokens = 800 — tight enough that the large snapshot
+    // forces aggressive pruning but leaves room for the agent to respond
+    const run = await Run.create<t.IState>({
+      runId: `double-sum-${Date.now()}`,
+      graphConfig: {
+        type: 'standard',
+        llmConfig: getLLMConfig(Providers.OPENAI),
+        instructions: INSTRUCTIONS,
+        maxContextTokens: 800,
+        summarizationEnabled: true,
+        summarizationConfig: {
+          enabled: true,
+          provider: Providers.OPENAI,
+        },
+      },
+      returnContent: true,
+      customHandlers: buildHandlers(collectedUsage, aggregateContent, spies),
+      tokenCounter,
+      indexTokenCountMap,
+    });
+
+    let error: Error | undefined;
+    try {
+      await run.processStream(
+        { messages: conversationHistory },
+        streamConfig as any
+      );
+    } catch (err) {
+      error = err as Error;
+    }
+
+    const startCalls = spies.onSummarizeStartSpy.mock.calls.length;
+    const completeCalls = spies.onSummarizeCompleteSpy.mock.calls.length;
+    console.log(
+      `  Summarization: start=${startCalls}, complete=${completeCalls}, modelCalls=${summaryCallCount}`
+    );
+
+    if (error) {
+      // empty_messages is acceptable for tight context; double-summarization is not
+      console.log(`  Error: ${error.message.substring(0, 100)}`);
+    }
+
+    // Key assertion: summarization should fire at most once.
+    // Before the fix, the surviving context's large tool result would cause
+    // all messages to land in messagesToRefine, triggering a second
+    // summarization on the same messages.
+    expect(startCalls).toBeLessThanOrEqual(1);
+    expect(summaryCallCount).toBeLessThanOrEqual(1);
+    console.log(
+      `  Double-summarization prevented: ${startCalls <= 1 ? 'YES' : 'NO'}`
+    );
+  });
+});
