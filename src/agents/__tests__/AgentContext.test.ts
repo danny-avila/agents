@@ -1018,4 +1018,39 @@ describe('AgentContext', () => {
       expect(ctx.hasSummary()).toBe(false);
     });
   });
+
+  describe('shouldSkipSummarization — re-trigger after summary', () => {
+    it('allows re-summarization after setSummary resets the message count baseline', () => {
+      const ctx = createBasicContext();
+
+      // First summarization triggers at message count 25
+      expect(ctx.shouldSkipSummarization(25)).toBe(false);
+      ctx.markSummarizationTriggered(25);
+
+      // Immediately after triggering, skip (no growth)
+      expect(ctx.shouldSkipSummarization(25)).toBe(true);
+
+      // After summarization completes, graph state is reduced to 4 messages.
+      // setSummary resets the baseline so the growth check works correctly.
+      ctx.setSummary('Summary of conversation', 100);
+
+      // With reset baseline, even a small message count should allow re-trigger
+      // once MIN_MSG_GROWTH (4) is reached
+      expect(ctx.shouldSkipSummarization(4)).toBe(false);
+      expect(ctx.shouldSkipSummarization(5)).toBe(false);
+    });
+
+    it('still respects per-run cap after baseline reset', () => {
+      const ctx = createBasicContext();
+
+      // Exhaust the per-run cap (MAX_SUMMARIZATIONS_PER_RUN = 3)
+      for (let i = 0; i < 3; i++) {
+        ctx.markSummarizationTriggered(10 + i * 5);
+        ctx.setSummary(`Summary ${i}`, 50);
+      }
+
+      // Even though setSummary reset the baseline, the per-run cap is hit
+      expect(ctx.shouldSkipSummarization(100)).toBe(true);
+    });
+  });
 });
