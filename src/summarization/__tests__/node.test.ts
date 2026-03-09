@@ -771,3 +771,51 @@ describe('budget check — instructions exceed context', () => {
     expect(result.messages!.length).toBeGreaterThan(0);
   });
 });
+
+describe('emoji-heavy content does not break summarization', () => {
+  it('summarization completes without JSON errors on emoji-heavy messages', async () => {
+    captureEvents();
+
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return mockInvokeModel('Summary of emoji conversation');
+        }
+      } as never
+    );
+
+    const emojiContent = '👨‍💻 coding 🎉 party 🌍 world 🚀 rocket '.repeat(30);
+    const agentContext = mockAgentContext({
+      maxContextTokens: 8000,
+      instructionTokens: 100,
+      formatTokenBudgetBreakdown: () => 'mock breakdown',
+    });
+
+    const graph = mockGraph();
+    const summarizeNode = createSummarizeNode({
+      agentContext,
+      graph: graph as never,
+      generateStepId,
+    });
+
+    const result = await summarizeNode(
+      {
+        messages: [
+          new HumanMessage(emojiContent),
+          new HumanMessage('What happened?'),
+        ],
+        summarizationRequest: {
+          messagesToRefine: [new HumanMessage(emojiContent)],
+          context: [new HumanMessage('What happened?')],
+          remainingContextTokens: 500,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    // Should complete without throwing JSON serialization errors
+    expect(result.messages).toBeDefined();
+    expect(result.messages!.length).toBeGreaterThan(0);
+  });
+});
