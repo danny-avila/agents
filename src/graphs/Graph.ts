@@ -819,8 +819,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       if (
         !agentContext.pruneMessages &&
         agentContext.tokenCounter &&
-        agentContext.maxContextTokens != null &&
-        agentContext.indexTokenCountMap[0] != null
+        agentContext.maxContextTokens != null
       ) {
         const isAnthropicWithThinking =
           (agentContext.provider === Providers.ANTHROPIC &&
@@ -861,6 +860,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           messagesToRefine,
           prePruneTotalTokens,
           remainingContextTokens,
+          preFadingMessages,
         } = agentContext.pruneMessages({
           messages,
           usageMetadata: agentContext.currentUsage,
@@ -890,13 +890,19 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             });
 
           if (triggerResult) {
+            // Full compaction: pass the entire conversation to the summarizer.
+            // Use the pre-masking snapshot when observation masking ran so
+            // the summarizer sees full tool results.  After compaction the
+            // model starts fresh with only the summary — no surviving messages.
+            const allMessages = preFadingMessages ?? messages;
+
             emitAgentLog(
               config,
               'info',
               'graph',
               'Summarization triggered',
               {
-                messagesToRefineCount: messagesToRefine.length,
+                totalMessages: allMessages.length,
                 remainingContextTokens: remainingContextTokens ?? 0,
                 summaryVersion: agentContext.summaryVersion + 1,
               },
@@ -905,8 +911,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             agentContext.markSummarizationTriggered(messages.length);
             return {
               summarizationRequest: {
-                messagesToRefine,
-                context,
+                messagesToRefine: allMessages,
+                context: [],
                 remainingContextTokens: remainingContextTokens ?? 0,
                 agentId: agentId || agentContext.agentId,
               },
@@ -1055,7 +1061,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         (agentContext.clientOptions as t.LLMConfig | undefined)?.fallbacks ??
         [];
 
-      if (finalMessages.length === 0) {
+      // Post-compaction clean slate: messages are empty but the system
+      // runnable will inject the summary as a HumanMessage during invoke.
+      if (
+        finalMessages.length === 0 &&
+        !(agentContext.hasSummary() && !agentContext._isInitialSummary)
+      ) {
         const budgetBreakdown = agentContext.getTokenBudgetBreakdown(messages);
         const breakdown = agentContext.formatTokenBudgetBreakdown(messages);
         const instructionsExceedBudget =

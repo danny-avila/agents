@@ -1,6 +1,6 @@
 /* eslint-disable no-console */
 // src/agents/AgentContext.ts
-import { SystemMessage } from '@langchain/core/messages';
+import { HumanMessage, SystemMessage } from '@langchain/core/messages';
 import { RunnableLambda } from '@langchain/core/runnables';
 import type {
   UsageMetadata,
@@ -82,6 +82,7 @@ export class AgentContext {
     // buildInstructionsString() includes the summary in the system message.
     if (initialSummary?.text != null && initialSummary.text !== '') {
       agentContext.setSummary(initialSummary.text, initialSummary.tokenCount);
+      agentContext._isInitialSummary = true;
     }
 
     if (tokenCounter) {
@@ -225,6 +226,8 @@ export class AgentContext {
   private summaryText?: string;
   /** Token count of the current summary (tracked for token accounting) */
   private summaryTokenCount: number = 0;
+  /** True when the summary came from initialSummary (cross-run), false for mid-run compaction. */
+  _isInitialSummary: boolean = false;
   /**
    * Durable summary that survives reset() calls. Set from initialSummary
    * during fromConfig() and updated by setSummary() so that the latest
@@ -463,7 +466,14 @@ export class AgentContext {
       parts.push(programmaticToolsDoc);
     }
 
-    if (this.summaryText != null && this.summaryText !== '') {
+    // Cross-run summary: include in system prompt so the model has context
+    // from the prior run.  Mid-run summaries are injected as a HumanMessage
+    // on the post-compaction clean slate instead (see buildSystemRunnable).
+    if (
+      this._isInitialSummary &&
+      this.summaryText != null &&
+      this.summaryText !== ''
+    ) {
       parts.push('## Conversation Summary\n\n' + this.summaryText);
     }
 
@@ -511,7 +521,12 @@ export class AgentContext {
         RunnableConfig<Record<string, unknown>>
       >
     | undefined {
-    if (!instructionsString) {
+    const hasMidRunSummary =
+      !this._isInitialSummary &&
+      this.summaryText != null &&
+      this.summaryText !== '';
+
+    if (!instructionsString && !hasMidRunSummary) {
       // Remove previous tokens if we had a system message before
       this.instructionTokens -= this.systemMessageTokens;
       this.systemMessageTokens = 0;
@@ -538,17 +553,34 @@ export class AgentContext {
       }
     }
 
-    const systemMessage = new SystemMessage(finalInstructions);
+    const systemMessage = instructionsString
+      ? new SystemMessage(finalInstructions)
+      : undefined;
 
     // Update token counts (subtract old, add new)
     if (this.tokenCounter) {
       this.instructionTokens -= this.systemMessageTokens;
-      this.systemMessageTokens = this.tokenCounter(systemMessage);
+      this.systemMessageTokens = systemMessage
+        ? this.tokenCounter(systemMessage)
+        : 0;
       this.instructionTokens += this.systemMessageTokens;
     }
 
     return RunnableLambda.from((messages: BaseMessage[]) => {
-      return [systemMessage, ...messages];
+      const prefix: BaseMessage[] = systemMessage ? [systemMessage] : [];
+
+      // Post-compaction clean slate: inject the summary as a HumanMessage
+      // so the model picks up where it left off.  The summary competes for
+      // message budget rather than permanently reducing the instruction
+      // ceiling.
+      if (
+        this.summaryText != null &&
+        this.summaryText !== '' &&
+        messages.length === 0
+      ) {
+        return [...prefix, new HumanMessage(this.summaryText)];
+      }
+      return [...prefix, ...messages];
     }).withConfig({ runName: 'prompt' });
   }
 
@@ -726,6 +758,9 @@ export class AgentContext {
   setSummary(text: string, tokenCount: number): void {
     this.summaryText = text;
     this.summaryTokenCount = tokenCount;
+    // Mid-run compaction clears the initial-summary flag so the summary
+    // is injected as a HumanMessage (clean slate) instead of the system prompt.
+    this._isInitialSummary = false;
     // Persist to durable storage so the summary survives reset() calls.
     // This covers both cross-run summaries (initialSummary) and intra-run
     // summaries produced by the summarization node.
@@ -753,10 +788,6 @@ export class AgentContext {
     // shouldSkipSummarization can detect whether any new messages have
     // arrived since the last summary.
     this._lastSummarizationMsgCount = Object.keys(newTokenMap).length;
-  }
-
-  getSummaryEvents(): Map<string, { value: string; turn: string }> {
-    return this._summaryEvents;
   }
 
   setSummaryEvents(events: Map<string, { value: string; turn: string }>): void {

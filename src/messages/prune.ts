@@ -875,6 +875,86 @@ export function checkValidNumber(value: unknown): value is number {
 }
 
 /**
+ * Observation masking: replaces consumed ToolMessage content with tight
+ * head+tail truncations that serve as informative placeholders.
+ *
+ * A ToolMessage is "consumed" when a subsequent AI message exists that is NOT
+ * purely tool calls — meaning the model has already read and acted on the
+ * result. Unconsumed results (the latest tool outputs the model hasn't
+ * responded to yet) are left intact so the model can still use them.
+ *
+ * AI messages are never masked — they contain the model's own reasoning and
+ * conclusions, which is what prevents the model from repeating work after
+ * its tool results are masked.
+ *
+ * @returns The number of tool messages that were masked.
+ */
+export function maskConsumedToolResults(params: {
+  messages: BaseMessage[];
+  indexTokenCountMap: Record<string, number | undefined>;
+  tokenCounter: TokenCounter;
+  maxChars?: number;
+}): number {
+  const { messages, indexTokenCountMap, tokenCounter } = params;
+  const maxChars = params.maxChars ?? 300;
+  let maskedCount = 0;
+
+  // Build set of consumed tool message indices.
+  // Walk backwards: once we see an AI message with non-tool-call content,
+  // all ToolMessages before it are consumed.
+  let seenNonToolCallAI = false;
+  const consumed = new Set<number>();
+
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    const type = msg.getType();
+
+    if (type === 'ai') {
+      // Check if this AI message has substantive content (not just tool calls)
+      const hasText =
+        typeof msg.content === 'string'
+          ? msg.content.length > 0
+          : Array.isArray(msg.content) &&
+            msg.content.some(
+              (b) =>
+                typeof b === 'string' ||
+                (typeof b === 'object' &&
+                  (b as Record<string, unknown>).type === 'text' &&
+                  typeof (b as Record<string, unknown>).text === 'string' &&
+                  ((b as Record<string, unknown>).text as string).length > 0)
+            );
+      if (hasText) {
+        seenNonToolCallAI = true;
+      }
+    } else if (type === 'tool' && seenNonToolCallAI) {
+      consumed.add(i);
+    }
+  }
+
+  for (const i of consumed) {
+    const message = messages[i];
+    const content = message.content;
+    if (typeof content !== 'string' || content.length <= maxChars) {
+      continue;
+    }
+
+    const cloned = new ToolMessage({
+      content: truncateToolResultContent(content, maxChars),
+      tool_call_id: (message as ToolMessage).tool_call_id,
+      name: message.name,
+      id: message.id,
+      additional_kwargs: message.additional_kwargs,
+      response_metadata: message.response_metadata,
+    });
+    messages[i] = cloned;
+    indexTokenCountMap[i] = tokenCounter(cloned);
+    maskedCount++;
+  }
+
+  return maskedCount;
+}
+
+/**
  * Pre-flight truncation: truncates oversized ToolMessage content before the
  * main backward-iteration pruning runs. Unlike the ingestion guard (which caps
  * at tool-execution time), pre-flight truncation applies per-turn based on the
@@ -1056,6 +1136,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     prePruneTotalTokens?: number;
     remainingContextTokens?: number;
     contextPressure?: number;
+    preFadingMessages?: BaseMessage[];
   } {
     // Guard: empty messages array (e.g. after REMOVE_ALL with empty context).
     // Nothing to prune — return immediately to avoid out-of-bounds access.
@@ -1275,11 +1356,36 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     let preFlightResultCount = 0;
     let preFlightInputCount = 0;
 
-    // When summarization is enabled, skip context pressure fading entirely.
-    // Summarization replaces pruning as the primary context management
-    // strategy — the summarizer needs full un-truncated tool results to
-    // produce an accurate summary.  Fading only applies when summarization
-    // is disabled or unavailable.
+    // -----------------------------------------------------------------------
+    // Observation masking (summarization-enabled path, 80%+ pressure):
+    // Replace consumed ToolMessage content with tight head+tail placeholders.
+    // AI messages stay intact so the model can read its own prior reasoning
+    // and won't repeat work.  Snapshot messages first so the summarizer can
+    // still see the full originals when summarization eventually fires.
+    //
+    // TODO: Stage 2 (90%+) — extend masking to more recent consumed results,
+    // keeping only the last 1-2 tool results fully intact.
+    // -----------------------------------------------------------------------
+    let preFadingMessages: BaseMessage[] | undefined;
+    let observationsMasked = 0;
+
+    if (contextPressure >= 0.8 && factoryParams.summarizationEnabled === true) {
+      preFadingMessages = [...params.messages];
+      observationsMasked = maskConsumedToolResults({
+        messages: params.messages,
+        indexTokenCountMap,
+        tokenCounter: factoryParams.tokenCounter,
+      });
+      if (observationsMasked > 0) {
+        factoryParams.log?.('debug', 'Observation masking applied', {
+          contextPressure: Math.round(contextPressure * 100),
+          maskedCount: observationsMasked,
+        });
+      }
+    }
+
+    // When summarization is NOT enabled, apply progressive context pressure
+    // fading — lossy truncation of all tool results based on pressure bands.
     if (contextPressure >= 0.8 && factoryParams.summarizationEnabled !== true) {
       const pressureBands: [number, number][] = [
         [0.99, 0.05],
@@ -1399,6 +1505,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         remainingContextTokens:
           pruningBudget - totalTokens - currentInstructionTokens,
         contextPressure,
+        preFadingMessages,
       };
     }
 
@@ -1771,6 +1878,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       prePruneTotalTokens: totalTokens,
       remainingContextTokens,
       contextPressure,
+      preFadingMessages,
     };
   };
 }

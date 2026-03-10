@@ -905,12 +905,10 @@ export function createSummarizeNode({
     const { markdown: cleanSummary, events: parsedEvents } =
       parseEventsFromOutput(summaryText);
 
-    // Merge parsed events with existing events (new values overwrite old)
-    const existingEvents = agentContext.getSummaryEvents();
-    for (const [key, val] of parsedEvents) {
-      existingEvents.set(key, val);
-    }
-    agentContext.setSummaryEvents(existingEvents);
+    // Full compaction: the LLM sees the entire conversation and decides
+    // which events matter.  Replace events entirely rather than merging
+    // to prevent stale events from accumulating across compaction cycles.
+    agentContext.setSummaryEvents(parsedEvents);
 
     // Use the clean markdown (events stripped) as the summary text
     summaryText = cleanSummary;
@@ -972,61 +970,15 @@ export function createSummarizeNode({
       );
     }
 
-    // ----- Remove summarized messages from graph state -----
-    // The summarized messages (messagesToRefine) have been captured in the
-    // summary text.  Remove them from the inner subgraph's state so the
-    // next agent node prune pass works with a shorter, cleaner message list
-    // instead of re-pruning the same oversized history.
-    //
-    // Uses REMOVE_ALL_MESSAGES to replace the entire messages array with
-    // only the surviving context.  This is cleaner than individual
-    // RemoveMessage per summarized message because:
-    //   - No risk of ID mismatches or missing IDs
-    //   - The reducer handles REMOVE_ALL by discarding all left messages
-    //     and keeping only messages after the marker
-    //
-    // After removal, the pruner's closure state (indices, token map) is
-    // stale, so we rebuild the indexTokenCountMap for the surviving context
-    // and setSummary() already nulls out the pruner for recreation.
-    let contextMessages = request.context;
-
-    // When pruning found that NO individual message fits in the available
-    // budget, context is empty and every message ended up in
-    // messagesToRefine.  After summarization the budget is freed up (summary
-    // replaces old messages), but the model still needs the current turn's
-    // messages to generate a response.  Extract the latest turn, starting
-    // from the last HumanMessage, so the model always has something to
-    // respond to.  Even if these messages are slightly over budget, the
-    // overflow recovery loop in Graph.ts will truncate tool results as needed.
-    if (contextMessages.length === 0 && request.messagesToRefine.length > 0) {
-      let lastHumanIdx = -1;
-      for (let i = request.messagesToRefine.length - 1; i >= 0; i--) {
-        if (request.messagesToRefine[i].getType() === 'human') {
-          lastHumanIdx = i;
-          break;
-        }
-      }
-      if (lastHumanIdx >= 0) {
-        contextMessages = request.messagesToRefine.slice(lastHumanIdx);
-      } else {
-        // No human message found, preserve at least the last message
-        contextMessages = [
-          request.messagesToRefine[request.messagesToRefine.length - 1],
-        ];
-      }
-    }
-
-    if (contextMessages.length > 0 && agentContext.tokenCounter) {
-      const newTokenMap: Record<string, number> = {};
-      for (let i = 0; i < contextMessages.length; i++) {
-        newTokenMap[i] = agentContext.tokenCounter(contextMessages[i]);
-      }
-      agentContext.rebuildTokenMapAfterSummarization(newTokenMap);
-    }
+    // ----- Clean slate: remove all messages from graph state -----
+    // Full compaction: the entire conversation has been captured in the
+    // summary.  The model restarts with only the summary (injected as a
+    // user message by the agent node) — no surviving messages.
+    agentContext.rebuildTokenMapAfterSummarization({});
 
     return {
       summarizationRequest: undefined,
-      messages: [createRemoveAllMessage(), ...contextMessages],
+      messages: [createRemoveAllMessage()],
     };
   };
 }
