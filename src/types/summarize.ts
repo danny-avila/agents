@@ -16,22 +16,10 @@ export type SummarizationConfig = {
   model?: string;
   parameters?: Record<string, unknown>;
   prompt?: string;
-  /** Prompt used when updating an existing summary with new messages. Falls back to `prompt` if not set. */
   updatePrompt?: string;
   trigger?: SummarizationTrigger;
-  /** When false, disables streaming for summarization LLM calls (uses invoke instead of stream). Defaults to true. */
-  stream?: boolean;
-  /** Maximum output tokens for the summarization model. Defaults to 2048. */
   maxSummaryTokens?: number;
-  /** Maximum input tokens per summarization pass. Controls how much conversation context is formatted and sent to the summarizer. Defaults to 10000. */
-  maxInputTokens?: number;
-  /**
-   * Fraction of the effective token budget to reserve as headroom (0–1).
-   * Pruning triggers when conversation tokens exceed `effectiveMax * (1 - reserveRatio)`,
-   * preventing the context from filling to 100% before pruning kicks in.
-   * This compensates for approximate token counting on non-OpenAI providers and
-   * gives the model breathing room. Defaults to 0.05 (5%).
-   */
+  /** Fraction of the token budget reserved as headroom (0–1). Defaults to 0.05. */
   reserveRatio?: number;
 };
 
