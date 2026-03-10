@@ -327,21 +327,14 @@ describe('createSummarizeNode', () => {
     ).toBeUndefined();
   });
 
-  it('retries with reduced budget (tier 2) when first attempt fails', async () => {
+  it('falls back to metadata stub when primary LLM call fails', async () => {
     captureEvents();
 
-    let callCount = 0;
     jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
       class {
         constructor() {
           return {
-            invoke: jest.fn().mockImplementation(async () => {
-              callCount++;
-              if (callCount === 1) {
-                throw new Error('First attempt failed');
-              }
-              return { content: 'Recovered summary' };
-            }),
+            invoke: jest.fn().mockRejectedValue(new Error('LLM unavailable')),
           };
         }
       } as never
@@ -369,9 +362,8 @@ describe('createSummarizeNode', () => {
       {} as RunnableConfig
     );
 
-    // Should have recovered on tier 2
     expect(setSummary).toHaveBeenCalledWith(
-      'Recovered summary',
+      expect.stringContaining('[Metadata summary:'),
       expect.any(Number)
     );
   });
@@ -588,7 +580,7 @@ describe('budget check — instructions exceed context', () => {
     const events = captureEvents();
     const agentContext = createAgentContext({
       maxContextTokens: 4000,
-      instructionTokens: 5000,
+      systemMessageTokens: 5000,
       formatTokenBudgetBreakdown: () => 'mock breakdown',
     });
 
@@ -638,7 +630,7 @@ describe('budget check — instructions exceed context', () => {
 
     const agentContext = createAgentContext({
       maxContextTokens: 8000,
-      instructionTokens: 2000,
+      systemMessageTokens: 2000,
       formatTokenBudgetBreakdown: () => 'mock breakdown',
     });
 
@@ -683,7 +675,7 @@ describe('emoji-heavy content does not break summarization', () => {
     const emojiContent = '👨‍💻 coding 🎉 party 🌍 world 🚀 rocket '.repeat(30);
     const agentContext = createAgentContext({
       maxContextTokens: 8000,
-      instructionTokens: 100,
+      systemMessageTokens: 100,
       formatTokenBudgetBreakdown: () => 'mock breakdown',
     });
 
