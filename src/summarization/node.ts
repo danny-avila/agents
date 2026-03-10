@@ -306,7 +306,7 @@ function formatMessagesForSummarization(
     return formatted.join('\n');
   }
 
-  // Over budget — trim the longest messages proportionally,
+  // Over budget, trim the longest messages proportionally,
   // but weight recent messages higher to preserve their content.
   const weights = formatted.map((_, i) => {
     const position = messages.length > 1 ? i / (messages.length - 1) : 1;
@@ -341,58 +341,54 @@ function formatMessagesForSummarization(
  * The explicit section structure ensures consistent, machine-parseable output
  * that survives multiple summarization cycles without information loss.
  */
-export const DEFAULT_SUMMARIZATION_PROMPT = `Create a structured context checkpoint of the conversation state. This checkpoint replaces the conversation messages, so it must capture everything needed to continue the work.
+export const DEFAULT_SUMMARIZATION_PROMPT = `Hold on, before you continue I need you to write me a checkpoint of everything so far. Your context window is filling up and this checkpoint replaces the messages above, so capture everything you need to pick right back up.
 
-IMPORTANT: Write as a factual state log in third person. Do NOT write as a chatbot response. Do NOT use first person ("I"), second person ("you", "your"), emojis, or conversational phrases like "Let me", "Here's what", "Great news". This is a technical state record, not a message to the user.
+Don't second-guess or fact-check anything you did, your tool results reflect exactly what happened. Just record what you did and what you observed.
 
-Your output MUST contain two sections:
+Give me two sections: a markdown checkpoint, then an <events> XML block. Only the checkpoint, don't respond to me or continue the conversation.
 
-1. A markdown checkpoint (the human-readable summary)
-2. An <events> XML block containing structured key-value pairs for facts that must survive compression
-
-## Markdown Checkpoint Format
+## Checkpoint
 
 ## Goal
-The user's primary objective and any sub-goals identified during the conversation.
+What I asked you to do and any sub-goals you identified.
 
 ## Constraints & Preferences
-Configuration choices, style preferences, architectural decisions, technology choices, or rules the user has established.
+Any rules, preferences, or configuration I established.
 
 ## Progress
 ### Done
-- Completed items with their outcomes
+- What you completed and the outcomes
 
 ### In Progress
-- Current work items and their state
+- What you're currently working on
 
 ## Key Decisions
-Decisions made and their rationale.
+Decisions you made and why.
 
 ## Next Steps
-What should happen next, in priority order.
+What you need to do next, in priority order.
 
 ## Critical Context
-Specific identifiers, names, error messages, URLs, and other details that must be preserved verbatim.
+Exact identifiers, names, error messages, URLs, and details you need to preserve verbatim.
 
-## Events XML Block
+## Events
 
-After the markdown checkpoint, output an <events> block containing key facts as XML entries.
-These are structured data that must be preserved exactly across summarization cycles.
+After the markdown, give me an <events> block with key facts as XML entries. These persist exactly across checkpoints.
 
 <events>
 <event key="unique_key" turn="N">Exact value or short factual statement</event>
 </events>
 
-Use events for: URLs visited, file paths modified, specific values computed, error messages encountered, tool results that produced important data, configuration values set.
-Do NOT use events for: narrative, opinions, general progress (that goes in the markdown).
+Use events for: URLs you visited, file paths you modified, values you computed, error messages you encountered, important tool results, configuration you set.
+Don't use events for: narrative, opinions, or general progress, that goes in the markdown.
 
 Rules:
-- Write factual, third-person statements in the markdown sections
-- For each tool call, record: the tool name, key input parameters, and the outcome
-- Preserve exact identifiers, names, error messages, and key references — do NOT paraphrase them
-- Do NOT reproduce tool output or long content verbatim — summarize the outcome in markdown, capture key values in events
-- Use short declarative sentences
-- Omit empty sections`;
+- Record what you did and observed, don't judge or re-evaluate it
+- For each tool call: the tool name, key inputs, and the outcome
+- Preserve exact identifiers, names, errors, and references verbatim
+- Summarize tool output in markdown; capture key values in events
+- Short declarative sentences
+- Skip empty sections`;
 
 /**
  * Prompt for incremental summary updates when a prior summary exists.
@@ -400,30 +396,27 @@ Rules:
  * The rules ensure existing information is preserved while new information
  * is integrated into the correct sections.
  */
-export const DEFAULT_UPDATE_SUMMARIZATION_PROMPT = `Merge new conversation messages into the existing context checkpoint, producing a single consolidated replacement.
+export const DEFAULT_UPDATE_SUMMARIZATION_PROMPT = `Hold on again, update your checkpoint. Merge the new messages into your existing checkpoint and give me a single consolidated replacement.
 
-IMPORTANT: The output must be roughly the SAME LENGTH as the previous checkpoint. Compress older details to make room for new information — do not simply append. Prioritize recency: recent actions and results get more detail, older items get compressed to one-line summaries.
+Keep it roughly the same length as your last checkpoint. Compress older details to make room for what's new, don't just append. Give recent actions more detail, compress older items to one-liners.
 
-Write as a factual state log in third person. Do NOT write as a chatbot response. Do NOT use first person, second person, emojis, or conversational phrases. This is a technical state record, not a message to the user.
-
-Your output MUST contain both the updated markdown checkpoint AND an updated <events> block.
+Don't fact-check or second-guess anything, your tool results are ground truth. Only the checkpoint, don't respond to me or continue the conversation.
 
 For the <events> block:
-- KEEP all existing events from <prior-events> unless they are no longer relevant
-- ADD new events for facts discovered in the new messages
-- UPDATE event values if new information supersedes old values
-- Use the same format: <event key="unique_key" turn="N">value</event>
+- Keep all existing events from <prior-events> unless they're no longer relevant
+- Add new events for facts you discovered in the new messages
+- Update event values when new information supersedes old
+- Same format: <event key="unique_key" turn="N">value</event>
 
 Rules:
-- MERGE new progress into existing markdown sections — do not duplicate section headers
-- COMPRESS older completed items into brief one-line entries to control length
-- Move items from "In Progress" to "Done" when completed
+- Merge new progress into existing sections, don't duplicate headers
+- Compress older completed items into one-line entries
+- Move items from "In Progress" to "Done" when you completed them
 - Update "Next Steps" to reflect current priorities
-- Write factual, third-person statements: "User requested X. Agent executed Y tool. Result: Z."
-- For each NEW tool call, record: the tool name, key input parameters, and the outcome
-- Preserve exact identifiers, names, error messages, and key references — do NOT paraphrase them
-- Do NOT reproduce tool output or long content verbatim — summarize the outcome in markdown, capture key values in events
-- Omit empty sections`;
+- For each new tool call: the tool name, key inputs, and the outcome
+- Preserve exact identifiers, names, errors, and references verbatim
+- Summarize tool output in markdown; capture key values in events
+- Skip empty sections`;
 
 /**
  * Separates summarization-specific parameters (parts, minMessagesForSplit, etc.)
@@ -536,7 +529,7 @@ const MAX_TOOL_FAILURE_CHARS = 240;
 /**
  * Extracts failed tool results from messages and formats them as a structured
  * section. LLMs often omit specific failure details (exit codes, error messages)
- * from their summaries — this mechanical enrichment guarantees they survive.
+ * from their summaries, this mechanical enrichment guarantees they survive.
  */
 function extractToolFailuresSection(messages: BaseMessage[]): string {
   const failures: Array<{ toolName: string; summary: string }> = [];
@@ -634,7 +627,7 @@ export function createSummarizeNode({
     }
 
     // ----- Budget check: skip if instructions alone exceed the context budget -----
-    // When this happens, summarization would only make things worse — the summary
+    // When this happens, summarization would only make things worse, the summary
     // gets added to the system message, further increasing instruction overhead.
     // Log clearly so the issue is visible in debug logs.
     const maxCtx = agentContext.maxContextTokens ?? 0;
@@ -643,7 +636,7 @@ export function createSummarizeNode({
         config,
         'warn',
         'summarize',
-        'Summarization skipped — instructions exceed context budget. Reduce the number of tools or increase maxContextTokens.',
+        'Summarization skipped, instructions exceed context budget. Reduce the number of tools or increase maxContextTokens.',
         {
           instructionTokens: agentContext.instructionTokens,
           maxContextTokens: maxCtx,
@@ -685,7 +678,7 @@ export function createSummarizeNode({
         ? { ...agentContext.clientOptions }
         : {};
 
-    // Build LLM constructor options — clean of any main agent context.
+    // Build LLM constructor options, clean of any main agent context.
     // The summarizer is its own agent: no tools, no system instructions
     // from the parent, just the summarization prompt.
     const clientOptions: Record<string, unknown> = {
@@ -714,7 +707,7 @@ export function createSummarizeNode({
     }
 
     // The graph's RunnableConfig carries callbacks for tracing/observability.
-    // It does NOT carry system instructions, tools, or agent persona — those
+    // It does NOT carry system instructions, tools, or agent persona, those
     // are bound to the model instance or in the message array respectively.
     // We pass this to both event dispatch and model.invoke() for traceability.
     const runnableConfig = config ?? graph.config;
@@ -769,7 +762,7 @@ export function createSummarizeNode({
     const ChatModelClass = getChatModelClass(provider as Providers);
     const model = new ChatModelClass(clientOptions as never);
 
-    // Check for a prior summary — either from a previous summarization within
+    // Check for a prior summary, either from a previous summarization within
     // this run or from a cross-run summary forwarded via initialSummary.
     const priorSummaryText = agentContext.getSummaryText()?.trim() ?? '';
     const priorEventsXml = agentContext.formatEventsXml() || undefined;
@@ -816,9 +809,20 @@ export function createSummarizeNode({
     // Tier 1: Send raw conversation messages with the summarization instruction
     // appended as the final HumanMessage. This preserves the original message
     // format and enables cache hits on the system prompt + tool definitions.
+    // Bind the agent's tools so providers that require tool definitions when
+    // tool_use/tool_result blocks are present (e.g. Bedrock) accept the messages.
+    const tools = agentContext.getToolsForBinding();
+    const tier1Model =
+      tools != null &&
+      tools.length > 0 &&
+      typeof (model as t.ModelWithTools).bindTools === 'function'
+        ? ((model as t.ModelWithTools).bindTools(
+          tools
+        ) as unknown as SummarizeModel)
+        : model;
     try {
       summaryText = await summarizeWithCacheHit({
-        model,
+        model: tier1Model,
         messages: messagesToRefine,
         promptText,
         updatePromptText,
@@ -874,7 +878,7 @@ export function createSummarizeNode({
           },
           { runId: graph.runId, agentId: request.agentId }
         );
-        // Tier 3: Metadata stub — no LLM call, preserves tool names and message counts
+        // Tier 3: Metadata stub, no LLM call, preserves tool names and message counts
         summaryText = generateMetadataStub(messagesToRefine);
       }
     }
@@ -990,8 +994,8 @@ export function createSummarizeNode({
     // budget, context is empty and every message ended up in
     // messagesToRefine.  After summarization the budget is freed up (summary
     // replaces old messages), but the model still needs the current turn's
-    // messages to generate a response.  Extract the latest turn — starting
-    // from the last HumanMessage — so the model always has something to
+    // messages to generate a response.  Extract the latest turn, starting
+    // from the last HumanMessage, so the model always has something to
     // respond to.  Even if these messages are slightly over budget, the
     // overflow recovery loop in Graph.ts will truncate tool results as needed.
     if (contextMessages.length === 0 && request.messagesToRefine.length > 0) {
@@ -1005,7 +1009,7 @@ export function createSummarizeNode({
       if (lastHumanIdx >= 0) {
         contextMessages = request.messagesToRefine.slice(lastHumanIdx);
       } else {
-        // No human message found — preserve at least the last message
+        // No human message found, preserve at least the last message
         contextMessages = [
           request.messagesToRefine[request.messagesToRefine.length - 1],
         ];
@@ -1115,7 +1119,7 @@ function extractResponseText(response: { content: string | object }): string {
       continue;
     }
     const rec = block as Record<string, unknown>;
-    // Skip reasoning/thinking blocks — only collect text output.
+    // Skip reasoning/thinking blocks, only collect text output.
     if (
       rec.type === ContentTypes.THINKING ||
       rec.type === ContentTypes.REASONING_CONTENT ||
@@ -1168,7 +1172,7 @@ async function streamAndCollect(
       continue;
     }
 
-    // Normalize to MessageContentComplex[] — getChunkContent may return a string.
+    // Normalize to MessageContentComplex[], getChunkContent may return a string.
     const contentBlocks: t.MessageContentComplex[] =
       typeof raw === 'string'
         ? [{ type: ContentTypes.TEXT, text: raw } as t.MessageContentComplex]

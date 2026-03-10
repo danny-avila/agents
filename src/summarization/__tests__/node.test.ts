@@ -481,7 +481,9 @@ describe('createSummarizeNode', () => {
     expect(capturedMessages[0].content).toBe('Message 1');
     expect(capturedMessages[3].type).toBe('human');
     // The last message should contain the summarization prompt
-    expect(capturedMessages[3].content).toContain('Create a structured');
+    expect(capturedMessages[3].content).toContain(
+      'context window is filling up'
+    );
   });
 
   it('cache-hit path includes prior summary and events in the instruction message', async () => {
@@ -545,7 +547,7 @@ describe('createSummarizeNode', () => {
     // The last message should contain the update prompt (prior summary exists)
     const lastMsg = capturedMessages[capturedMessages.length - 1];
     expect(lastMsg.type).toBe('human');
-    expect(lastMsg.content).toContain('Merge new conversation');
+    expect(lastMsg.content).toContain('Merge the new messages');
     // Should include the prior summary
     expect(lastMsg.content).toContain('<previous-summary>');
     expect(lastMsg.content).toContain('Prior summary content');
@@ -578,7 +580,7 @@ describe('DEFAULT_UPDATE_SUMMARIZATION_PROMPT', () => {
 
   it('instructs merging new content', () => {
     expect(DEFAULT_UPDATE_SUMMARIZATION_PROMPT).toMatch(
-      /Merge new conversation/i
+      /Merge the new messages/i
     );
   });
 

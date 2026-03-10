@@ -244,16 +244,8 @@ export class AgentContext {
    * Summarization is allowed to fire again only when new messages appear.
    */
   private _lastSummarizationMsgCount: number = 0;
-  /**
-   * Number of times summarization has fired during the current run.
-   * Used as a safety valve: after MAX_SUMMARIZATIONS_PER_RUN fires,
-   * summarization is suppressed for the remainder of the run.
-   * This prevents infinite agent→summarize→agent cycles when maxContextTokens
-   * is too tight for the model to complete tool-call rounds between summarizations.
-   */
+  /** Number of times summarization has fired during the current run (diagnostic). */
   private _summarizationCountThisRun: number = 0;
-  /** Maximum summarizations allowed per run before suppression kicks in. */
-  private static readonly MAX_SUMMARIZATIONS_PER_RUN = 3;
   /**
    * Handoff context when this agent receives control via handoff.
    * Contains source and parallel execution info for system message context.
@@ -758,10 +750,8 @@ export class AgentContext {
     this.indexTokenCountMap = newTokenMap;
     this.baseIndexTokenCountMap = { ...newTokenMap };
     // Set the message count baseline to the surviving context size so
-    // shouldSkipSummarization requires MIN_MSG_GROWTH new messages beyond
-    // the surviving context before re-triggering. Without this, the same
-    // context messages get immediately re-summarized if they still exceed
-    // the effective budget (e.g., a single large tool result).
+    // shouldSkipSummarization can detect whether any new messages have
+    // arrived since the last summary.
     this._lastSummarizationMsgCount = Object.keys(newTokenMap).length;
   }
 
@@ -798,33 +788,15 @@ export class AgentContext {
   }
 
   /**
-   * Returns true if summarization should be skipped for one of two reasons:
-   *
-   * 1. **Per-run cap reached**: After MAX_SUMMARIZATIONS_PER_RUN fires,
-   *    further summarizations are suppressed. This prevents infinite
-   *    agent→summarize→agent cycles when maxContextTokens is too tight
-   *    for the model to complete tool-call rounds between summarizations.
-   *    pruneMessages still drops old messages (just without a summary).
-   *
-   * 2. **Insufficient new messages**: A minimum growth threshold is required
-   *    before re-triggering. For tool-enabled agents, this is 8 messages
-   *    (~4 tool-call rounds), giving the model meaningful work time between
-   *    summarization cycles. For tool-free agents (pure chat), 4 messages
-   *    (~2 exchanges) is sufficient.
+   * Returns true when the message count hasn't changed since the last
+   * summarization — re-summarizing would produce an identical result.
+   * Oversized individual messages are handled by fit-to-budget truncation
+   * in the pruner, which keeps them in context without triggering overflow.
    */
   shouldSkipSummarization(currentMsgCount: number): boolean {
-    if (
-      this._summarizationCountThisRun >= AgentContext.MAX_SUMMARIZATIONS_PER_RUN
-    ) {
-      return true;
-    }
-    const hasTools =
-      (this.tools != null && this.tools.length > 0) ||
-      (this.toolDefinitions != null && this.toolDefinitions.length > 0);
-    const MIN_MSG_GROWTH = hasTools ? 8 : 4;
     return (
       this._lastSummarizationMsgCount > 0 &&
-      currentMsgCount < this._lastSummarizationMsgCount + MIN_MSG_GROWTH
+      currentMsgCount <= this._lastSummarizationMsgCount
     );
   }
 

@@ -436,15 +436,15 @@ describe('AgentContext', () => {
       expect(ctx.shouldSkipSummarization(30)).toBe(true);
     });
 
-    it('shouldSkipSummarization returns true when fewer than 4 new messages added', () => {
+    it('shouldSkipSummarization returns true when no new messages since last summary', () => {
       const ctx = createBasicContext({
         agentConfig: { summarizationEnabled: true },
       });
       ctx.markSummarizationTriggered(10);
-      // Only 2 new messages — should skip
-      expect(ctx.shouldSkipSummarization(12)).toBe(true);
-      // 4+ new messages — should allow
-      expect(ctx.shouldSkipSummarization(14)).toBe(false);
+      // Same count — should skip (would produce identical summary)
+      expect(ctx.shouldSkipSummarization(10)).toBe(true);
+      // Any new message — should allow
+      expect(ctx.shouldSkipSummarization(11)).toBe(false);
     });
 
     it('shouldSkipSummarization returns false when no prior summarization', () => {

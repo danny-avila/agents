@@ -32,6 +32,14 @@ export type PruneMessagesFactoryParams = {
   /** Context pruning configuration for position-based tool result degradation. */
   contextPruningConfig?: ContextPruningConfig;
   /**
+   * When true, context pressure fading (pre-flight tool result truncation)
+   * is skipped.  Summarization replaces pruning as the primary context
+   * management strategy — the summarizer needs full un-truncated tool results
+   * to produce an accurate summary.  Hard pruning still runs as a fallback
+   * when summarization is skipped or capped.
+   */
+  summarizationEnabled?: boolean;
+  /**
    * Returns the current instruction-token overhead (system message + tool schemas + summary).
    * Called on each prune invocation so the budget reflects dynamic changes
    * (e.g. summary added between turns).  When messages don't include a leading
@@ -1047,6 +1055,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     messagesToRefine?: BaseMessage[];
     prePruneTotalTokens?: number;
     remainingContextTokens?: number;
+    contextPressure?: number;
   } {
     // Guard: empty messages array (e.g. after REMOVE_ALL with empty context).
     // Nothing to prune — return immediately to avoid out-of-bounds access.
@@ -1248,43 +1257,115 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       totalTokens,
     });
 
-    /* Pre-flight truncation: truncate oversized tool results before pruning.
-     * Uses effectiveMaxTokens (after instruction deduction) so tool results
-     * that exceed the actual available budget are truncated during normal
-     * pruning rather than surviving into emergency truncation. A minimum
-     * floor of 1024 prevents destroying small tool results in very tight contexts.
-     */
-    const preFlightBudget = Math.max(1024, effectiveMaxTokens);
-    const preFlightResultCount = preFlightTruncateToolResults({
-      indexTokenCountMap,
-      messages: params.messages,
-      maxContextTokens: preFlightBudget,
-      tokenCounter: factoryParams.tokenCounter,
-    });
+    // ---------------------------------------------------------------------------
+    // Progressive context fading — inspired by Claude Code's staged compaction.
+    // Below 80%: no modifications, tool results retain full size.
+    // Above 80%: graduated truncation with increasing aggression per pressure band.
+    // Recency weighting ensures older results fade first, newer results last.
+    //
+    // At the gentlest level, truncation preserves most content (head+tail).
+    // At the most aggressive level, the result is effectively a one-line placeholder.
+    //
+    //   80%: gentle — budget factor 1.0, oldest get light truncation
+    //   85%: moderate — budget factor 0.50, older results shrink significantly
+    //   90%: aggressive — budget factor 0.20, most results heavily truncated
+    //   99%: emergency — budget factor 0.05, effectively placeholders for old results
+    // ---------------------------------------------------------------------------
+    const contextPressure = pruningBudget > 0 ? totalTokens / pruningBudget : 0;
+    let preFlightResultCount = 0;
+    let preFlightInputCount = 0;
 
-    /** Pre-flight truncation: truncate oversized tool_use inputs (args) in AI messages. */
-    const preFlightInputCount = preFlightTruncateToolCallInputs({
-      indexTokenCountMap,
-      messages: params.messages,
-      maxContextTokens: preFlightBudget,
-      tokenCounter: factoryParams.tokenCounter,
-    });
+    // When summarization is enabled, skip context pressure fading entirely.
+    // Summarization replaces pruning as the primary context management
+    // strategy — the summarizer needs full un-truncated tool results to
+    // produce an accurate summary.  Fading only applies when summarization
+    // is disabled or unavailable.
+    if (contextPressure >= 0.8 && factoryParams.summarizationEnabled !== true) {
+      const pressureBands: [number, number][] = [
+        [0.99, 0.05],
+        [0.9, 0.2],
+        [0.85, 0.5],
+        [0.8, 1.0],
+      ];
+      const budgetFactor =
+        pressureBands.find(
+          ([threshold]) => contextPressure >= threshold
+        )?.[1] ?? 1.0;
 
-    if (preFlightResultCount > 0 || preFlightInputCount > 0) {
-      factoryParams.log?.('debug', 'Pre-flight truncation applied', {
-        toolResultsTruncated: preFlightResultCount,
-        toolInputsTruncated: preFlightInputCount,
+      const baseBudget = Math.max(
+        1024,
+        Math.floor(effectiveMaxTokens * budgetFactor)
+      );
+
+      preFlightResultCount = preFlightTruncateToolResults({
+        messages: params.messages,
+        maxContextTokens: baseBudget,
+        indexTokenCountMap,
+        tokenCounter: factoryParams.tokenCounter,
       });
-    }
 
+      preFlightInputCount = preFlightTruncateToolCallInputs({
+        messages: params.messages,
+        maxContextTokens: baseBudget,
+        indexTokenCountMap,
+        tokenCounter: factoryParams.tokenCounter,
+      });
+
+      if (preFlightResultCount > 0 || preFlightInputCount > 0) {
+        factoryParams.log?.('debug', 'Context pressure fading applied', {
+          contextPressure: Math.round(contextPressure * 100),
+          budgetFactor,
+          baseBudget,
+          toolResultsTruncated: preFlightResultCount,
+          toolInputsTruncated: preFlightInputCount,
+        });
+      }
+    }
     // Position-based context pruning: degrade old tool results before the main prune.
-    if (factoryParams.contextPruningConfig?.enabled === true) {
+    // Skipped when summarization is enabled for the same reason as context pressure fading.
+    if (
+      factoryParams.contextPruningConfig?.enabled === true &&
+      factoryParams.summarizationEnabled !== true
+    ) {
       applyContextPruning({
         messages: params.messages,
         indexTokenCountMap,
         tokenCounter: factoryParams.tokenCounter,
         config: factoryParams.contextPruningConfig,
       });
+    }
+
+    // Fit-to-budget: when summarization is enabled and individual messages
+    // exceed the effective budget, truncate them so every message can fit in
+    // a single context slot.  Without this, oversized tool results (e.g.
+    // take_snapshot at 9K chars) cause empty context → emergency truncation
+    // → immediate re-summarization after just one tool call.
+    //
+    // This is NOT the lossy position-based fading above — it only targets
+    // messages that individually exceed the budget, using the full effective
+    // budget as the cap (not a pressure-scaled fraction).
+    if (factoryParams.summarizationEnabled === true && effectiveMaxTokens > 0) {
+      preFlightResultCount = preFlightTruncateToolResults({
+        messages: params.messages,
+        maxContextTokens: effectiveMaxTokens,
+        indexTokenCountMap,
+        tokenCounter: factoryParams.tokenCounter,
+      });
+
+      preFlightInputCount = preFlightTruncateToolCallInputs({
+        messages: params.messages,
+        maxContextTokens: effectiveMaxTokens,
+        indexTokenCountMap,
+        tokenCounter: factoryParams.tokenCounter,
+      });
+
+      if (preFlightResultCount > 0 || preFlightInputCount > 0) {
+        factoryParams.log?.('debug', 'Fit-to-budget truncation applied', {
+          effectiveMaxTokens,
+          toolResultsTruncated: preFlightResultCount,
+          toolInputsTruncated: preFlightInputCount,
+        });
+      }
     }
 
     // Recalculate totalTokens from indexTokenCountMap after pre-flight truncation
@@ -1317,6 +1398,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         prePruneTotalTokens: totalTokens,
         remainingContextTokens:
           pruningBudget - totalTokens - currentInstructionTokens,
+        contextPressure,
       };
     }
 
@@ -1377,6 +1459,101 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     // call that already completed, causing the model to repeat it).
     if (droppedMessages.length > 0) {
       messagesToRefine.push(...droppedMessages);
+    }
+
+    // ---------------------------------------------------------------
+    // Fallback fading: when summarization skipped fading earlier and
+    // pruning still produced an empty context, apply lossy pressure-band
+    // fading and retry.  This is a last resort before emergency truncation
+    // — the summarizer already saw the full messages, so fading the
+    // surviving context for the LLM is acceptable.
+    // ---------------------------------------------------------------
+    if (
+      context.length === 0 &&
+      params.messages.length > 0 &&
+      effectiveMaxTokens > 0 &&
+      factoryParams.summarizationEnabled === true
+    ) {
+      const fadingBudget = Math.max(1024, effectiveMaxTokens);
+
+      factoryParams.log?.(
+        'debug',
+        'Fallback fading — empty context with summarization',
+        {
+          messageCount: params.messages.length,
+          effectiveMaxTokens,
+          fadingBudget,
+        }
+      );
+
+      const fadedMessages = [...params.messages];
+      const preFadingTokenCounts: Record<string, number | undefined> = {};
+      for (let i = 0; i < params.messages.length; i++) {
+        preFadingTokenCounts[i] = indexTokenCountMap[i];
+      }
+
+      preFlightTruncateToolResults({
+        messages: fadedMessages,
+        maxContextTokens: fadingBudget,
+        indexTokenCountMap,
+        tokenCounter: factoryParams.tokenCounter,
+      });
+      preFlightTruncateToolCallInputs({
+        messages: fadedMessages,
+        maxContextTokens: fadingBudget,
+        indexTokenCountMap,
+        tokenCounter: factoryParams.tokenCounter,
+      });
+
+      const fadingRetry = getMessagesWithinTokenLimit({
+        maxContextTokens: pruningBudget,
+        messages: fadedMessages,
+        indexTokenCountMap,
+        startType: params.startType,
+        thinkingEnabled: factoryParams.thinkingEnabled,
+        tokenCounter: factoryParams.tokenCounter,
+        instructionTokens: currentInstructionTokens,
+        reasoningType:
+          factoryParams.provider === Providers.BEDROCK
+            ? ContentTypes.REASONING_CONTENT
+            : ContentTypes.THINKING,
+        thinkingStartIndex:
+          factoryParams.thinkingEnabled === true
+            ? runThinkingStartIndex
+            : undefined,
+      });
+
+      const fadingRepaired = repairOrphanedToolMessages({
+        context: fadingRetry.context,
+        allMessages: fadedMessages,
+        tokenCounter: factoryParams.tokenCounter,
+        indexTokenCountMap,
+      });
+
+      if (fadingRepaired.context.length > 0) {
+        context = fadingRepaired.context;
+        reclaimedTokens = fadingRepaired.reclaimedTokens;
+        messagesToRefine.push(...fadingRetry.messagesToRefine);
+        if (fadingRepaired.droppedMessages.length > 0) {
+          messagesToRefine.push(...fadingRepaired.droppedMessages);
+        }
+
+        factoryParams.log?.('debug', 'Fallback fading recovered context', {
+          contextLength: context.length,
+          messagesToRefineCount: messagesToRefine.length,
+          remainingTokens: fadingRetry.remainingContextTokens,
+        });
+
+        // Restore token counts so next turn sees original sizes
+        for (const [key, value] of Object.entries(preFadingTokenCounts)) {
+          indexTokenCountMap[key] = value;
+        }
+      } else {
+        // Fading wasn't enough — restore and fall through to emergency
+        for (const [key, value] of Object.entries(preFadingTokenCounts)) {
+          indexTokenCountMap[key] = value;
+        }
+      }
     }
 
     // ---------------------------------------------------------------
@@ -1593,6 +1770,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       messagesToRefine,
       prePruneTotalTokens: totalTokens,
       remainingContextTokens,
+      contextPressure,
     };
   };
 }

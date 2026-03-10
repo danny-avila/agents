@@ -843,6 +843,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           thinkingEnabled: isAnthropicWithThinking,
           indexTokenCountMap: agentContext.indexTokenCountMap,
           contextPruningConfig: agentContext.contextPruningConfig,
+          summarizationEnabled: agentContext.summarizationEnabled,
           reserveRatio: agentContext.summarizationConfig?.reserveRatio,
           getInstructionTokens: () => agentContext.instructionTokens,
           log: (level, message, data) => {
@@ -917,7 +918,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               config,
               'debug',
               'graph',
-              'Summarization skipped — insufficient new messages since last summary',
+              'Summarization skipped — no new messages or per-run cap reached',
               {
                 messageCount: messages.length,
                 messagesToRefineCount: messagesToRefine.length,
