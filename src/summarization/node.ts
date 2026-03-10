@@ -86,7 +86,6 @@ const DEFAULT_MIN_MESSAGES_FOR_SPLIT = 4;
 const SUMMARIZATION_PARAM_KEYS = new Set([
   'parts',
   'minMessagesForSplit',
-  'maxInputTokensForSinglePass',
   'maxSummaryTokens',
 ]);
 

@@ -12,7 +12,6 @@ export type SummarizationTrigger = {
 };
 
 export type SummarizationConfig = {
-  enabled?: boolean;
   provider?: Providers;
   model?: string;
   parameters?: Record<string, unknown>;
