@@ -48,7 +48,6 @@ export class AgentContext {
       summarizationConfig,
       initialSummary,
       contextPruningConfig,
-      overflowRecoveryConfig,
       maxToolResultChars,
     } = agentConfig;
 
@@ -74,7 +73,6 @@ export class AgentContext {
       summarizationEnabled,
       summarizationConfig,
       contextPruningConfig,
-      overflowRecoveryConfig,
       maxToolResultChars,
     });
 
@@ -82,7 +80,7 @@ export class AgentContext {
     // buildInstructionsString() includes the summary in the system message.
     if (initialSummary?.text != null && initialSummary.text !== '') {
       agentContext.setSummary(initialSummary.text, initialSummary.tokenCount);
-      agentContext._isInitialSummary = true;
+      agentContext._summaryLocation = 'system_prompt';
     }
 
     if (tokenCounter) {
@@ -146,17 +144,7 @@ export class AgentContext {
   totalTokensFresh: boolean = false;
   /** Context pruning configuration. */
   contextPruningConfig?: t.ContextPruningConfig;
-  /** Overflow recovery configuration. */
-  overflowRecoveryConfig?: t.OverflowRecoveryConfig;
-  /**
-   * Maximum characters allowed in a single tool result before truncation.
-   * When provided, overrides the value computed from maxContextTokens.
-   */
   maxToolResultChars?: number;
-  /** Number of overflow recovery attempts in the current turn. */
-  private _overflowRecoveryAttempts: number = 0;
-  /** Maximum overflow recovery attempts per turn. */
-  static readonly MAX_OVERFLOW_RECOVERY_ATTEMPTS = 3;
   /** Prune messages function configured for this agent */
   pruneMessages?: ReturnType<typeof createPruneMessages>;
   /** Token counter function for this agent */
@@ -226,8 +214,13 @@ export class AgentContext {
   private summaryText?: string;
   /** Token count of the current summary (tracked for token accounting) */
   private summaryTokenCount: number = 0;
-  /** True when the summary came from initialSummary (cross-run), false for mid-run compaction. */
-  _isInitialSummary: boolean = false;
+  /**
+   * Where the summary should be injected:
+   * - `'system_prompt'`: cross-run summary, included in `buildInstructionsString`
+   * - `'user_message'`: mid-run compaction, injected as HumanMessage on clean slate
+   * - `'none'`: no summary present
+   */
+  private _summaryLocation: 'system_prompt' | 'user_message' | 'none' = 'none';
   /**
    * Durable summary that survives reset() calls. Set from initialSummary
    * during fromConfig() and updated by setSummary() so that the latest
@@ -279,7 +272,6 @@ export class AgentContext {
     summarizationEnabled,
     summarizationConfig,
     contextPruningConfig,
-    overflowRecoveryConfig,
     maxToolResultChars,
   }: {
     agentId: string;
@@ -303,7 +295,6 @@ export class AgentContext {
     summarizationEnabled?: boolean;
     summarizationConfig?: t.SummarizationConfig;
     contextPruningConfig?: t.ContextPruningConfig;
-    overflowRecoveryConfig?: t.OverflowRecoveryConfig;
     maxToolResultChars?: number;
   }) {
     this.agentId = agentId;
@@ -333,7 +324,6 @@ export class AgentContext {
     this.summarizationEnabled = summarizationEnabled;
     this.summarizationConfig = summarizationConfig;
     this.contextPruningConfig = contextPruningConfig;
-    this.overflowRecoveryConfig = overflowRecoveryConfig;
     this.maxToolResultChars = maxToolResultChars;
 
     if (discoveredTools && discoveredTools.length > 0) {
@@ -467,7 +457,7 @@ export class AgentContext {
     // from the prior run.  Mid-run summaries are injected as a HumanMessage
     // on the post-compaction clean slate instead (see buildSystemRunnable).
     if (
-      this._isInitialSummary &&
+      this._summaryLocation === 'system_prompt' &&
       this.summaryText != null &&
       this.summaryText !== ''
     ) {
@@ -519,7 +509,7 @@ export class AgentContext {
       >
     | undefined {
     const hasMidRunSummary =
-      !this._isInitialSummary &&
+      this._summaryLocation === 'user_message' &&
       this.summaryText != null &&
       this.summaryText !== '';
 
@@ -612,7 +602,6 @@ export class AgentContext {
     this._summarizationCountThisRun = 0;
     this.lastCallUsage = undefined;
     this.totalTokensFresh = false;
-    this._overflowRecoveryAttempts = 0;
 
     if (this.tokenCounter) {
       this.initializeSystemRunnable();
@@ -757,7 +746,7 @@ export class AgentContext {
     this.summaryTokenCount = tokenCount;
     // Mid-run compaction clears the initial-summary flag so the summary
     // is injected as a HumanMessage (clean slate) instead of the system prompt.
-    this._isInitialSummary = false;
+    this._summaryLocation = 'user_message';
     // Persist to durable storage so the summary survives reset() calls.
     // This covers both cross-run summaries (initialSummary) and intra-run
     // summaries produced by the summarization node.
@@ -791,7 +780,11 @@ export class AgentContext {
     return this.summaryText != null && this.summaryText !== '';
   }
 
-  /** Returns the current summary text, or undefined if no summary exists. */
+  /** True when a mid-run compaction summary is ready to be injected as a HumanMessage. */
+  hasPendingCompactionSummary(): boolean {
+    return this._summaryLocation === 'user_message' && this.hasSummary();
+  }
+
   getSummaryText(): string | undefined {
     return this.summaryText;
   }
@@ -828,6 +821,7 @@ export class AgentContext {
       this.summaryTokenCount = 0;
       this._durableSummaryText = undefined;
       this._durableSummaryTokenCount = 0;
+      this._summaryLocation = 'none';
       this.systemRunnableStale = true;
     }
   }
@@ -913,27 +907,6 @@ export class AgentContext {
   /** Marks token data as stale before a new LLM call. */
   markTokensStale(): void {
     this.totalTokensFresh = false;
-  }
-
-  /** Whether an overflow recovery attempt can be made. */
-  canAttemptOverflowRecovery(): boolean {
-    const maxAttempts =
-      this.overflowRecoveryConfig?.maxAttempts ??
-      AgentContext.MAX_OVERFLOW_RECOVERY_ATTEMPTS;
-    return (
-      this.overflowRecoveryConfig?.enabled !== false &&
-      this._overflowRecoveryAttempts < maxAttempts
-    );
-  }
-
-  /** Increment the overflow recovery attempt counter and return the new count. */
-  incrementOverflowRecovery(): number {
-    return ++this._overflowRecoveryAttempts;
-  }
-
-  /** Reset overflow recovery attempts after a successful call. */
-  resetOverflowRecovery(): void {
-    this._overflowRecoveryAttempts = 0;
   }
 
   /**

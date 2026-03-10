@@ -837,7 +837,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       // runnable will inject the summary as a HumanMessage during invoke.
       if (
         finalMessages.length === 0 &&
-        !(agentContext.hasSummary() && !agentContext._isInitialSummary)
+        !agentContext.hasPendingCompactionSummary()
       ) {
         const budgetBreakdown = agentContext.getTokenBudgetBreakdown(messages);
         const breakdown = agentContext.formatTokenBudgetBreakdown(messages);
@@ -1037,7 +1037,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       if (agentContext.currentUsage) {
         agentContext.updateLastCallUsage(agentContext.currentUsage);
       }
-      agentContext.resetOverflowRecovery();
       this.cleanupSignalListener();
       return result;
     };
