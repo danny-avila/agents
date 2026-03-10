@@ -11,16 +11,25 @@ import { GraphEvents, Providers } from '@/common';
 import { initializeModel } from '@/llm/init';
 
 /**
- * Context passed to `attemptInvoke` for stream event handling.
+ * Context passed to `attemptInvoke` for the default stream handler.
  * Matches the subset of Graph that `ChatModelStreamHandler.handle` needs.
  */
 export type InvokeContext = Parameters<ChatModelStreamHandler['handle']>[3];
 
 /**
+ * Per-chunk callback for custom stream processing.
+ * When provided, replaces the default `ChatModelStreamHandler`.
+ */
+export type OnChunk = (chunk: AIMessageChunk) => void | Promise<void>;
+
+/**
  * Invokes a chat model with the given messages, handling both streaming and
- * non-streaming paths.  Stream chunks are processed through a local
- * `ChatModelStreamHandler` so that run steps (MESSAGE_CREATION, TOOL_CALLS)
- * are fully populated before the graph transitions to the next node.
+ * non-streaming paths.
+ *
+ * By default, stream chunks are processed through a `ChatModelStreamHandler`
+ * that dispatches run steps (MESSAGE_CREATION, TOOL_CALLS) for the graph.
+ * Pass an `onChunk` callback to override this with custom chunk processing
+ * (e.g. summarization delta events).
  */
 export async function attemptInvoke(
   {
@@ -28,27 +37,37 @@ export async function attemptInvoke(
     messages,
     provider,
     context,
+    onChunk,
   }: {
     model: t.ChatModel;
     messages: BaseMessage[];
     provider: Providers;
     context?: InvokeContext;
+    onChunk?: OnChunk;
   },
   config?: RunnableConfig
 ): Promise<Partial<t.BaseGraphState>> {
   if (model.stream) {
-    const metadata = config?.metadata as Record<string, unknown> | undefined;
-    const streamHandler = new ChatModelStreamHandler();
     const stream = await model.stream(messages, config);
     let finalChunk: AIMessageChunk | undefined;
-    for await (const chunk of stream) {
-      await streamHandler.handle(
-        GraphEvents.CHAT_MODEL_STREAM,
-        { chunk },
-        metadata,
-        context
-      );
-      finalChunk = finalChunk ? concat(finalChunk, chunk) : chunk;
+
+    if (onChunk) {
+      for await (const chunk of stream) {
+        await onChunk(chunk);
+        finalChunk = finalChunk ? concat(finalChunk, chunk) : chunk;
+      }
+    } else {
+      const metadata = config?.metadata as Record<string, unknown> | undefined;
+      const streamHandler = new ChatModelStreamHandler();
+      for await (const chunk of stream) {
+        await streamHandler.handle(
+          GraphEvents.CHAT_MODEL_STREAM,
+          { chunk },
+          metadata,
+          context
+        );
+        finalChunk = finalChunk ? concat(finalChunk, chunk) : chunk;
+      }
     }
 
     if (manualToolStreamProviders.has(provider)) {
