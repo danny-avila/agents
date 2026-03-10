@@ -10,9 +10,9 @@ import type { OnChunk } from '@/llm/invoke';
 import type * as t from '@/types';
 import { ContentTypes, GraphEvents, StepTypes, Providers } from '@/common';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
+import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { createRemoveAllMessage } from '@/messages/reducer';
 import { getMaxOutputTokensKey } from '@/llm/request';
-import { attemptInvoke } from '@/llm/invoke';
 import { initializeModel } from '@/llm/init';
 import { getChunkContent } from '@/stream';
 
@@ -387,16 +387,60 @@ export function createSummarizeNode({
         provider: provider as Providers,
         reasoningKey: agentContext.reasoningKey,
       });
-    } catch (err) {
-      emitAgentLog(
-        runnableConfig,
-        'warn',
-        'summarize',
-        'Summarization LLM call failed, falling back to metadata stub',
-        { error: err instanceof Error ? err.message : String(err) },
-        { runId: graph.runId, agentId: request.agentId }
-      );
-      summaryText = generateMetadataStub(messagesToRefine);
+    } catch (primaryError) {
+      const fallbacks =
+        (clientOptions as unknown as t.LLMConfig | undefined)?.fallbacks ?? [];
+      if (fallbacks.length > 0) {
+        try {
+          const onChunk = createSummarizationChunkHandler({
+            stepId,
+            config: traceConfig(summarizeConfig, 'cache_hit_compaction'),
+            provider: provider as Providers,
+            reasoningKey: agentContext.reasoningKey,
+          });
+          const fbResult = await tryFallbackProviders({
+            fallbacks,
+            tools: agentContext.getToolsForBinding(),
+            messages: [
+              ...messagesToRefine,
+              new HumanMessage(
+                buildSummarizationInstruction(
+                  promptText,
+                  updatePromptText,
+                  priorSummaryText
+                )
+              ),
+            ],
+            config: traceConfig(summarizeConfig, 'cache_hit_compaction'),
+            primaryError,
+            onChunk,
+          });
+          const fbMsg = fbResult?.messages?.[0];
+          if (fbMsg) {
+            summaryText = extractResponseText(
+              fbMsg as { content: string | object }
+            );
+          }
+        } catch {
+          // Fallbacks exhausted
+        }
+      }
+      if (!summaryText) {
+        emitAgentLog(
+          runnableConfig,
+          'warn',
+          'summarize',
+          'Summarization failed, falling back to metadata stub',
+          {
+            error:
+              primaryError instanceof Error
+                ? primaryError.message
+                : String(primaryError),
+          },
+          { runId: graph.runId, agentId: request.agentId }
+        );
+        summaryText = generateMetadataStub(messagesToRefine);
+      }
     }
 
     if (!summaryText) {
@@ -513,6 +557,23 @@ function extractResponseText(response: { content: string | object }): string {
   return parts.join('').trim();
 }
 
+function buildSummarizationInstruction(
+  promptText: string,
+  updatePromptText: string | undefined,
+  priorSummaryText: string
+): string {
+  const effectivePrompt = priorSummaryText
+    ? (updatePromptText ?? promptText)
+    : promptText;
+  const parts = [effectivePrompt];
+  if (priorSummaryText) {
+    parts.push(
+      `\n\n<previous-summary>\n${priorSummaryText}\n</previous-summary>`
+    );
+  }
+  return parts.join('');
+}
+
 /** Creates an `onChunk` callback that dispatches `ON_SUMMARIZE_DELTA` events for streaming. */
 function createSummarizationChunkHandler({
   stepId,
@@ -598,21 +659,16 @@ async function summarizeWithCacheHit({
   provider: Providers;
   reasoningKey?: 'reasoning_content' | 'reasoning';
 }): Promise<string> {
-  const effectivePrompt = priorSummaryText
-    ? (updatePromptText ?? promptText)
-    : promptText;
-
-  const instructionParts = [effectivePrompt];
-  if (priorSummaryText) {
-    instructionParts.push(
-      `\n\n<previous-summary>\n${priorSummaryText}\n</previous-summary>`
-    );
-  }
+  const instruction = buildSummarizationInstruction(
+    promptText,
+    updatePromptText,
+    priorSummaryText
+  );
 
   const result = await attemptInvoke(
     {
       model,
-      messages: [...messages, new HumanMessage(instructionParts.join(''))],
+      messages: [...messages, new HumanMessage(instruction)],
       provider,
       onChunk: createSummarizationChunkHandler({
         stepId,

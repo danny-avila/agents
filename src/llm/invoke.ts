@@ -103,6 +103,7 @@ export async function tryFallbackProviders({
   config,
   primaryError,
   context,
+  onChunk,
 }: {
   fallbacks: Array<{ provider: Providers; clientOptions?: t.ClientOptions }>;
   tools?: t.GraphTools;
@@ -110,6 +111,7 @@ export async function tryFallbackProviders({
   config?: RunnableConfig;
   primaryError: unknown;
   context?: InvokeContext;
+  onChunk?: OnChunk;
 }): Promise<Partial<t.BaseGraphState> | undefined> {
   let lastError: unknown = primaryError;
   for (const fb of fallbacks) {
@@ -125,6 +127,7 @@ export async function tryFallbackProviders({
           messages,
           provider: fb.provider,
           context,
+          onChunk,
         },
         config
       );

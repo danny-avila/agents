@@ -383,7 +383,7 @@ describe('AgentContext', () => {
 
       ctx.markToolsAsDiscovered(['tool1']);
       void ctx.systemRunnable;
-      ctx.instructionTokens = 100;
+      ctx.systemMessageTokens = 100;
       ctx.indexTokenCountMap = { '0': 50 };
       ctx.currentUsage = { input_tokens: 100 };
 

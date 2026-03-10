@@ -149,10 +149,15 @@ export class AgentContext {
   pruneMessages?: ReturnType<typeof createPruneMessages>;
   /** Token counter function for this agent */
   tokenCounter?: t.TokenCounter;
-  /** Instructions/system message token count (system + tools + summary) */
-  instructionTokens: number = 0;
-  /** Token count for tool schemas only (subset of instructionTokens) */
+  /** Token count for the system message (instructions text). */
+  systemMessageTokens: number = 0;
+  /** Token count for tool schemas only. */
   toolSchemaTokens: number = 0;
+
+  /** Total instruction overhead: system message + tool schemas. */
+  get instructionTokens(): number {
+    return this.systemMessageTokens + this.toolSchemaTokens;
+  }
   /** The amount of time that should pass before another consecutive API call */
   streamBuffer?: number;
   /** Last stream call timestamp for rate limiting */
@@ -200,8 +205,6 @@ export class AgentContext {
   >;
   /** Whether system runnable needs rebuild (set when discovered tools change) */
   private systemRunnableStale: boolean = true;
-  /** Cached system message token count (separate from tool tokens) */
-  private systemMessageTokens: number = 0;
   /** Promise for token calculation initialization */
   tokenCalculationPromise?: Promise<void>;
   /** Format content blocks as strings (for legacy compatibility) */
@@ -317,7 +320,7 @@ export class AgentContext {
       this.toolEnd = toolEnd;
     }
     if (instructionTokens !== undefined) {
-      this.instructionTokens = instructionTokens;
+      this.systemMessageTokens = instructionTokens;
     }
 
     this.useLegacyContent = useLegacyContent ?? false;
@@ -514,8 +517,6 @@ export class AgentContext {
       this.summaryText !== '';
 
     if (!instructionsString && !hasMidRunSummary) {
-      // Remove previous tokens if we had a system message before
-      this.instructionTokens -= this.systemMessageTokens;
       this.systemMessageTokens = 0;
       return undefined;
     }
@@ -544,13 +545,10 @@ export class AgentContext {
       ? new SystemMessage(finalInstructions)
       : undefined;
 
-    // Update token counts (subtract old, add new)
     if (this.tokenCounter) {
-      this.instructionTokens -= this.systemMessageTokens;
       this.systemMessageTokens = systemMessage
         ? this.tokenCounter(systemMessage)
         : 0;
-      this.instructionTokens += this.systemMessageTokens;
     }
 
     return RunnableLambda.from((messages: BaseMessage[]) => {
@@ -575,7 +573,6 @@ export class AgentContext {
    * Reset context for a new run
    */
   reset(): void {
-    this.instructionTokens = 0;
     this.systemMessageTokens = 0;
     this.toolSchemaTokens = 0;
     this.cachedSystemRunnable = undefined;
@@ -694,7 +691,6 @@ export class AgentContext {
     }
 
     this.toolSchemaTokens = toolTokens;
-    this.instructionTokens += toolTokens;
   }
 
   /**
@@ -875,7 +871,8 @@ export class AgentContext {
     const lines = [
       'Token budget breakdown:',
       `  maxContextTokens:    ${b.maxContextTokens}`,
-      `  instructionTokens:   ${b.instructionTokens} (system: ${b.systemMessageTokens}, tools: ${b.toolSchemaTokens} [${b.toolCount} tools], summary: ${b.summaryTokens})`,
+      `  instructionTokens:   ${b.instructionTokens} (system: ${b.systemMessageTokens}, tools: ${b.toolSchemaTokens} [${b.toolCount} tools])`,
+      `  summaryTokens:       ${b.summaryTokens}`,
       `  messageTokens:       ${b.messageTokens} (${b.messageCount} messages)`,
       `  availableForMessages: ${b.availableForMessages}`,
     ];
