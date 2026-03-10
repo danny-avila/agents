@@ -69,13 +69,11 @@ After compaction, the message array is empty. On the next agent node turn:
 - The model reads the checkpoint as a user message and continues naturally — making tool calls or responding.
 - The summary competes for message budget rather than permanently reducing the instruction ceiling.
 
-### Summarization Tiers
+### Summarization Invocation
 
-1. **Tier 1 (cache-hit)**: Raw conversation messages sent with tools bound + summarization instruction as final HumanMessage. Benefits from cache hits on the system prompt + tool definitions prefix. Falls back to Tier 2 on failure.
+Raw conversation messages are sent to the LLM via `attemptInvoke` with the summarization instruction appended as the final HumanMessage. Tools are bound so providers that require tool definitions (e.g. Bedrock) accept the messages. This preserves the original message format and enables cache hits on the system prompt + tool definitions prefix.
 
-2. **Tier 2 (single-pass)**: Messages formatted as text in a `<conversation>` block, sent with a SystemMessage prompt + HumanMessage body. Half the character budget of Tier 1.
-
-3. **Tier 3 (metadata stub)**: No LLM call. Generates a mechanical summary listing tool names and message counts. Last resort.
+If the primary call fails, fallback providers are attempted (via `tryFallbackProviders`). If all providers fail, a metadata stub is generated mechanically — no LLM call, just tool names and message counts.
 
 ### Summarization Prompt
 
@@ -164,27 +162,26 @@ Masking uses `truncateToolResultContent` with a ~300 char limit, producing head+
 
 5. **No events XML** — with full compaction the LLM sees the entire conversation each time, making structured event extraction redundant with the checkpoint's markdown content.
 
+6. **Computed `instructionTokens`** — `instructionTokens` is a getter (`systemMessageTokens + toolSchemaTokens`), not a manually tracked value. This eliminates the category of bugs where instruction overhead gets out of sync from increments/decrements in multiple places.
+
 ---
 
 ## Configuration Reference
 
 ### `librechat.yaml` — `summarization` block
 
-| Field              | Type           | Default                    | Description                                                                                                                     |
-| ------------------ | -------------- | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| `enabled`          | `boolean`      | `true`                     | Top-level kill switch. Set `false` to disable summarization globally.                                                           |
-| `provider`         | `string`       | Agent's own provider       | LLM provider for the summarizer (e.g. `anthropic`, `bedrock`).                                                                  |
-| `model`            | `string`       | Agent's own model          | Model for summarization calls.                                                                                                  |
-| `parameters`       | `object`       | `{}`                       | Extra LLM constructor params (temperature, etc.). Also accepts `parts` and `minMessagesForSplit` for multi-stage summarization. |
-| `prompt`           | `string`       | Built-in checkpoint prompt | Custom prompt for initial summarization.                                                                                        |
-| `updatePrompt`     | `string`       | Built-in update prompt     | Custom prompt for re-compaction when a prior summary exists. Falls back to `prompt`.                                            |
-| `trigger`          | `object`       | Always on overflow         | When to fire summarization. See trigger types below.                                                                            |
-| `stream`           | `boolean`      | `true`                     | Whether to stream the summarizer's output. Set `false` to use invoke.                                                           |
-| `reserveRatio`     | `number (0-1)` | `0.05`                     | Fraction of token budget reserved as headroom. Pruning triggers at `budget * (1 - reserveRatio)`.                               |
-| `maxSummaryTokens` | `number`       | `2048`                     | Max output tokens for the summarization model.                                                                                  |
-| `maxInputTokens`   | `number`       | `baseContextTokens`        | Max input tokens per summarization pass. Controls how much conversation context is formatted for the summarizer.                |
-| `contextPruning`   | `object`       | disabled                   | Position-based context pruning (only applies when summarization is disabled).                                                   |
-| `overflowRecovery` | `object`       | disabled                   | Overflow recovery retry configuration.                                                                                          |
+| Field              | Type           | Default                    | Description                                                                            |
+| ------------------ | -------------- | -------------------------- | -------------------------------------------------------------------------------------- |
+| `enabled`          | `boolean`      | `true`                     | Top-level kill switch. Set `false` to disable summarization globally.                  |
+| `provider`         | `string`       | Agent's own provider       | LLM provider for the summarizer (e.g. `anthropic`, `bedrock`).                         |
+| `model`            | `string`       | Agent's own model          | Model for summarization calls.                                                         |
+| `parameters`       | `object`       | `{}`                       | Extra LLM constructor params (temperature, etc.). Also accepts `maxSummaryTokens`.     |
+| `prompt`           | `string`       | Built-in checkpoint prompt | Custom prompt for initial summarization.                                               |
+| `updatePrompt`     | `string`       | Built-in update prompt     | Custom prompt for re-compaction when a prior summary exists. Falls back to `prompt`.   |
+| `trigger`          | `object`       | Always on overflow         | When to fire summarization. See trigger types below.                                   |
+| `reserveRatio`     | `number (0-1)` | `0.05`                     | Fraction of token budget reserved as headroom. Pruning triggers at `budget * (1 - r)`. |
+| `maxSummaryTokens` | `number`       | `2048`                     | Max output tokens for the summarization model.                                         |
+| `contextPruning`   | `object`       | disabled                   | Position-based context pruning (only applies when summarization is disabled).          |
 
 ### Trigger types (`trigger` field)
 
@@ -195,7 +192,7 @@ Masking uses `truncateToolResultContent` with a ~300 char limit, producing head+
 | `messages_to_refine` | `number`  | Fire when `messagesToRefine.length >= value`                |
 | _(not set)_          | —         | Fire whenever pruning drops any messages (default)          |
 
-### `contextPruning` sub-config
+### `contextPruning` sub-config (summarization-disabled path only)
 
 | Field                  | Type            | Default | Description                                                 |
 | ---------------------- | --------------- | ------- | ----------------------------------------------------------- |
@@ -205,17 +202,8 @@ Masking uses `truncateToolResultContent` with a ~300 char limit, producing head+
 | `hardClearRatio`       | `number (0-1)`  | —       | Position threshold for full content replacement.            |
 | `minPrunableToolChars` | `number`        | —       | Minimum chars before a tool result is eligible for pruning. |
 
-### `overflowRecovery` sub-config
-
-| Field         | Type            | Default | Description                                                 |
-| ------------- | --------------- | ------- | ----------------------------------------------------------- |
-| `enabled`     | `boolean`       | `false` | Enable overflow recovery retry loop.                        |
-| `maxAttempts` | `number (1-10)` | —       | Max retry attempts when provider rejects oversized context. |
-
 ### `parameters` sub-fields (extracted before passing to LLM)
 
-| Field                 | Type     | Default | Description                                                        |
-| --------------------- | -------- | ------- | ------------------------------------------------------------------ |
-| `parts`               | `number` | `1`     | Number of stages for multi-stage summarization. `1` = single-pass. |
-| `minMessagesForSplit` | `number` | `4`     | Minimum messages before multi-stage split is applied.              |
-| `maxSummaryTokens`    | `number` | `2048`  | Can also be set here (same as top-level field).                    |
+| Field              | Type     | Default | Description                                     |
+| ------------------ | -------- | ------- | ----------------------------------------------- |
+| `maxSummaryTokens` | `number` | `2048`  | Can also be set here (same as top-level field). |
