@@ -38,3 +38,5 @@ export type {
 } from './llm/openrouter';
 export { getChatModelClass } from './llm/providers';
 export { initializeModel } from './llm/init';
+export { attemptInvoke, tryFallbackProviders } from './llm/invoke';
+export { isThinkingEnabled, getMaxOutputTokensKey } from './llm/request';

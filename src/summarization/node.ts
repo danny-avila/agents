@@ -10,6 +10,7 @@ import type * as t from '@/types';
 import { ContentTypes, GraphEvents, StepTypes, Providers } from '@/common';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { createRemoveAllMessage } from '@/messages/reducer';
+import { getMaxOutputTokensKey } from '@/llm/request';
 import { initializeModel } from '@/llm/init';
 import { getChunkContent } from '@/stream';
 
@@ -649,11 +650,8 @@ export function createSummarizeNode({
       summarizationConfig?.maxSummaryTokens ??
       DEFAULT_MAX_SUMMARY_TOKENS;
 
-    if (provider === Providers.GOOGLE || provider === Providers.VERTEXAI) {
-      clientOptions.maxOutputTokens = effectiveMaxSummaryTokens;
-    } else {
-      clientOptions.maxTokens = effectiveMaxSummaryTokens;
-    }
+    clientOptions[getMaxOutputTokensKey(provider as string)] =
+      effectiveMaxSummaryTokens;
 
     // The graph's RunnableConfig carries callbacks for tracing/observability.
     // It does NOT carry system instructions, tools, or agent persona, those
@@ -707,7 +705,6 @@ export function createSummarizeNode({
       );
     }
 
-    // ----- Create the summarizer model (fresh, isolated instance) -----
     const model = initializeModel({
       provider: provider as Providers,
       clientOptions: clientOptions as t.ClientOptions,

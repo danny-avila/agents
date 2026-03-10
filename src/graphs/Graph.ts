@@ -1,14 +1,9 @@
 /* eslint-disable no-console */
 // src/graphs/Graph.ts
 import { nanoid } from 'nanoid';
-import { concat } from '@langchain/core/utils/stream';
 import { ToolNode } from '@langchain/langgraph/prebuilt';
 import { Runnable, RunnableConfig } from '@langchain/core/runnables';
-import {
-  AIMessage,
-  ToolMessage,
-  AIMessageChunk,
-} from '@langchain/core/messages';
+import { ToolMessage, AIMessageChunk } from '@langchain/core/messages';
 import {
   START,
   END,
@@ -30,7 +25,6 @@ import {
   sanitizeOrphanToolBlocks,
   extractToolDiscoveries,
   addBedrockCacheControl,
-  modifyDeltaProperties,
   formatArtifactPayload,
   formatContentStrings,
   createPruneMessages,
@@ -45,18 +39,13 @@ import {
   StepTypes,
 } from '@/common';
 import {
-  isLikelyContextOverflowError,
-  calculateMaxToolResultChars,
-  truncateToolResultContent,
-  truncateToolInput,
-  extractErrorMessage,
   resetIfNotEmpty,
   isOpenAILike,
   isGoogleLike,
   joinKeys,
   sleep,
 } from '@/utils';
-import { manualToolStreamProviders } from '@/llm/providers';
+import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { shouldTriggerSummarization } from '@/summarization';
@@ -65,7 +54,7 @@ import { createSchemaOnlyTools } from '@/tools/schema';
 import { AgentContext } from '@/agents/AgentContext';
 import { createFakeStreamingLLM } from '@/llm/fake';
 import { handleToolCalls } from '@/tools/handlers';
-import { ChatModelStreamHandler } from '@/stream';
+import { isThinkingEnabled } from '@/llm/request';
 import { initializeModel } from '@/llm/init';
 import { HandlerRegistry } from '@/events';
 import { ChatOpenAI } from '@/llm/openai';
@@ -540,19 +529,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     });
   }
 
-  getNewModel({
-    provider,
-    clientOptions,
-  }: {
-    provider: Providers;
-    clientOptions?: t.ClientOptions;
-  }): t.ChatModelInstance {
-    return initializeModel({
-      provider,
-      clientOptions,
-    }) as unknown as t.ChatModelInstance;
-  }
-
   getUsageMetadata(
     finalMessage?: BaseMessage
   ): Partial<UsageMetadata> | undefined {
@@ -563,138 +539,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     ) {
       return finalMessage.usage_metadata as Partial<UsageMetadata>;
     }
-  }
-
-  /** Execute model invocation with streaming support */
-  private async attemptInvoke(
-    {
-      currentModel,
-      finalMessages,
-      provider,
-      tools: _tools,
-    }: {
-      currentModel?: t.ChatModel;
-      finalMessages: BaseMessage[];
-      provider: Providers;
-      tools?: t.GraphTools;
-    },
-    config?: RunnableConfig
-  ): Promise<Partial<t.BaseGraphState>> {
-    const model = this.overrideModel ?? currentModel;
-    if (!model) {
-      throw new Error('No model found');
-    }
-
-    if (model.stream) {
-      /**
-       * Process all model output through a local ChatModelStreamHandler in the
-       * graph execution context. Each chunk is awaited before the next one is
-       * consumed, so by the time the stream is exhausted every run step
-       * (MESSAGE_CREATION, TOOL_CALLS) has been created and toolCallStepIds is
-       * fully populated — the graph will not transition to ToolNode until this
-       * is done.
-       *
-       * This replaces the previous pattern where ChatModelStreamHandler lived
-       * in the for-await stream consumer (handler registry). That consumer
-       * runs concurrently with graph execution, so the graph could advance to
-       * ToolNode before the consumer had processed all events. By handling
-       * chunks here, inside the agent node, the race is eliminated.
-       *
-       * The for-await consumer no longer needs a ChatModelStreamHandler; its
-       * on_chat_model_stream events are simply ignored (no handler registered).
-       * The dispatched custom events (ON_RUN_STEP, ON_MESSAGE_DELTA, etc.)
-       * still reach the content aggregator and SSE handlers through the custom
-       * event callback in Run.createCustomEventCallback.
-       */
-      const metadata = config?.metadata as Record<string, unknown> | undefined;
-      const streamHandler = new ChatModelStreamHandler();
-      const stream = await model.stream(finalMessages, config);
-      let finalChunk: AIMessageChunk | undefined;
-      for await (const chunk of stream) {
-        await streamHandler.handle(
-          GraphEvents.CHAT_MODEL_STREAM,
-          { chunk },
-          metadata,
-          this
-        );
-        finalChunk = finalChunk ? concat(finalChunk, chunk) : chunk;
-      }
-
-      if (manualToolStreamProviders.has(provider)) {
-        finalChunk = modifyDeltaProperties(provider, finalChunk);
-      }
-
-      if ((finalChunk?.tool_calls?.length ?? 0) > 0) {
-        finalChunk!.tool_calls = finalChunk!.tool_calls?.filter(
-          (tool_call: ToolCall) => !!tool_call.name
-        );
-      }
-
-      return { messages: [finalChunk as AIMessageChunk] };
-    } else {
-      /** Fallback for models without stream support. */
-      const finalMessage = await model.invoke(finalMessages, config);
-      if ((finalMessage.tool_calls?.length ?? 0) > 0) {
-        finalMessage.tool_calls = finalMessage.tool_calls?.filter(
-          (tool_call: ToolCall) => !!tool_call.name
-        );
-      }
-      return { messages: [finalMessage] };
-    }
-  }
-
-  /**
-   * Attempts each fallback provider in order until one succeeds.
-   * Returns the result from the first successful invocation, or throws
-   * the last error if all fallbacks fail.
-   *
-   * @returns The invocation result, or undefined if no fallbacks were configured.
-   */
-  private async tryFallbackProviders({
-    fallbacks,
-    agentContext,
-    finalMessages,
-    config,
-    primaryError,
-  }: {
-    fallbacks: Array<{ provider: Providers; clientOptions?: t.ClientOptions }>;
-    agentContext: AgentContext;
-    finalMessages: BaseMessage[];
-    config?: RunnableConfig;
-    primaryError: unknown;
-  }): Promise<Partial<t.BaseGraphState> | undefined> {
-    let lastError: unknown = primaryError;
-    for (const fb of fallbacks) {
-      try {
-        let fbModel = this.getNewModel({
-          provider: fb.provider,
-          clientOptions: fb.clientOptions,
-        });
-        const bindableTools = agentContext.tools;
-        fbModel = (
-          !bindableTools || bindableTools.length === 0
-            ? fbModel
-            : fbModel.bindTools(bindableTools)
-        ) as t.ChatModelInstance;
-        const result = await this.attemptInvoke(
-          {
-            currentModel: fbModel,
-            finalMessages,
-            provider: fb.provider,
-            tools: agentContext.tools,
-          },
-          config
-        );
-        return result;
-      } catch (e) {
-        lastError = e;
-        continue;
-      }
-    }
-    if (lastError !== undefined) {
-      throw lastError;
-    }
-    return undefined;
   }
 
   cleanupSignalListener(currentModel?: t.ChatModel): void {
@@ -765,25 +609,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         agentContext.tokenCounter &&
         agentContext.maxContextTokens != null
       ) {
-        const isAnthropicWithThinking =
-          (agentContext.provider === Providers.ANTHROPIC &&
-            (agentContext.clientOptions as t.AnthropicClientOptions).thinking !=
-              null) ||
-          (agentContext.provider === Providers.BEDROCK &&
-            (agentContext.clientOptions as t.BedrockAnthropicInput)
-              .additionalModelRequestFields?.['thinking'] != null) ||
-          (agentContext.provider === Providers.OPENAI &&
-            (
-              (agentContext.clientOptions as t.OpenAIClientOptions).modelKwargs
-                ?.thinking as t.AnthropicClientOptions['thinking']
-            )?.type === 'enabled');
-
         agentContext.pruneMessages = createPruneMessages({
           startIndex: this.startIndex,
           provider: agentContext.provider,
           tokenCounter: agentContext.tokenCounter,
           maxTokens: agentContext.maxContextTokens,
-          thinkingEnabled: isAnthropicWithThinking,
+          thinkingEnabled: isThinkingEnabled(
+            agentContext.provider,
+            agentContext.clientOptions
+          ),
           indexTokenCountMap: agentContext.indexTokenCountMap,
           contextPruningConfig: agentContext.contextPruningConfig,
           summarizationEnabled: agentContext.summarizationEnabled,
@@ -940,15 +774,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
        * convert AI messages with tool calls to HumanMessages to avoid thinking block requirements.
        * This is required by Anthropic/Bedrock when thinking is enabled.
        */
-      const isAnthropicWithThinking =
-        (agentContext.provider === Providers.ANTHROPIC &&
-          (agentContext.clientOptions as t.AnthropicClientOptions).thinking !=
-            null) ||
-        (agentContext.provider === Providers.BEDROCK &&
-          (agentContext.clientOptions as t.BedrockAnthropicInput)
-            .additionalModelRequestFields?.['thinking'] != null);
-
-      if (isAnthropicWithThinking) {
+      if (
+        isThinkingEnabled(agentContext.provider, agentContext.clientOptions)
+      ) {
         finalMessages = ensureThinkingBlockInMessages(
           finalMessages,
           agentContext.provider,
@@ -1059,160 +887,25 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         );
       }
 
-      // Overflow recovery outer loop: if the provider rejects the prompt as too large,
-      // apply increasingly aggressive tool result truncation and retry.
-      for (;;) {
-        try {
-          result = await this.attemptInvoke(
-            {
-              currentModel: model,
-              finalMessages,
-              provider: agentContext.provider,
-              tools: agentContext.tools,
-            },
-            config
-          );
-          break; // Success — exit the recovery loop
-        } catch (primaryError) {
-          const errorMsg = extractErrorMessage(primaryError);
-          if (
-            isLikelyContextOverflowError(errorMsg) === true &&
-            agentContext.canAttemptOverflowRecovery() === true
-          ) {
-            const attempt = agentContext.incrementOverflowRecovery();
-            const aggressiveness = Math.pow(0.5, attempt);
-            const maxChars = Math.max(
-              1000,
-              Math.floor(
-                calculateMaxToolResultChars(agentContext.maxContextTokens) *
-                  aggressiveness
-              )
-            );
-            emitAgentLog(
-              config,
-              'warn',
-              'graph',
-              'Overflow recovery attempt',
-              {
-                attempt,
-                aggressiveness,
-                maxChars,
-              },
-              { runId: this.runId, agentId }
-            );
-            console.warn(
-              `[createCallModel] Context overflow detected (attempt ${attempt}). ${agentContext.formatTokenBudgetBreakdown(finalMessages)}`
-            );
-            // Apply emergency truncation to both tool results and tool-call
-            // inputs with increasing aggressiveness per attempt.
-            let truncated = false;
-            for (let mi = 0; mi < finalMessages.length; mi++) {
-              const msg = finalMessages[mi];
-
-              // Truncate ToolMessage content (tool results)
-              if (msg.getType() === 'tool') {
-                const content = msg.content;
-                if (typeof content === 'string' && content.length > maxChars) {
-                  (msg as ToolMessage).content = truncateToolResultContent(
-                    content,
-                    maxChars
-                  );
-                  truncated = true;
-                }
-                continue;
-              }
-
-              if (msg.getType() === 'ai' && Array.isArray(msg.content)) {
-                const aiMsg = msg as AIMessage;
-                const contentBlocks =
-                  aiMsg.content as t.MessageContentComplex[];
-                const hasOversizedInput = contentBlocks.some((block) => {
-                  if (typeof block !== 'object') {
-                    return false;
-                  }
-                  const record = block as Record<string, unknown>;
-                  if (
-                    (record.type === 'tool_use' ||
-                      record.type === 'tool_call') &&
-                    record.input != null
-                  ) {
-                    const serialized =
-                      typeof record.input === 'string'
-                        ? record.input
-                        : JSON.stringify(record.input);
-                    return serialized.length > maxChars;
-                  }
-                  return false;
-                });
-                if (hasOversizedInput) {
-                  const newContent = contentBlocks.map((block) => {
-                    if (typeof block !== 'object') {
-                      return block;
-                    }
-                    const record = block as Record<string, unknown>;
-                    if (
-                      (record.type === 'tool_use' ||
-                        record.type === 'tool_call') &&
-                      record.input != null
-                    ) {
-                      const serialized =
-                        typeof record.input === 'string'
-                          ? record.input
-                          : JSON.stringify(record.input);
-                      if (serialized.length > maxChars) {
-                        return {
-                          ...record,
-                          input: truncateToolInput(record.input, maxChars),
-                        };
-                      }
-                    }
-                    return block;
-                  });
-                  const newToolCalls = (aiMsg.tool_calls ?? []).map((tc) => {
-                    const serializedArgs = JSON.stringify(tc.args);
-                    if (serializedArgs.length > maxChars) {
-                      return {
-                        ...tc,
-                        args: truncateToolInput(tc.args, maxChars),
-                      };
-                    }
-                    return tc;
-                  });
-                  finalMessages[mi] = new AIMessage({
-                    ...aiMsg,
-                    content: newContent,
-                    tool_calls:
-                      newToolCalls.length > 0 ? newToolCalls : undefined,
-                  });
-                  truncated = true;
-                }
-              }
-            }
-            if (!truncated) {
-              // Nothing left to truncate — fall through to fallback providers
-              result = await this.tryFallbackProviders({
-                fallbacks,
-                agentContext,
-                finalMessages,
-                config,
-                primaryError,
-              });
-              break;
-            }
-            // Retry with truncated messages
-            continue;
-          }
-
-          // Not a context overflow error — try fallback providers
-          result = await this.tryFallbackProviders({
-            fallbacks,
-            agentContext,
-            finalMessages,
-            config,
-            primaryError,
-          });
-          break;
-        }
+      try {
+        result = await attemptInvoke(
+          {
+            model: (this.overrideModel ?? model) as t.ChatModel,
+            messages: finalMessages,
+            provider: agentContext.provider,
+            context: this,
+          },
+          config
+        );
+      } catch (primaryError) {
+        result = await tryFallbackProviders({
+          fallbacks,
+          tools: agentContext.tools,
+          messages: finalMessages,
+          config,
+          primaryError,
+          context: this,
+        });
       }
 
       if (!result) {

@@ -20,6 +20,7 @@ import { createTokenCounter, encodingForModel } from '@/utils/tokens';
 import { GraphEvents, Callback, TitleMethod } from '@/common';
 import { MultiAgentGraph } from '@/graphs/MultiAgentGraph';
 import { StandardGraph } from '@/graphs/Graph';
+import { initializeModel } from '@/llm/init';
 import { HandlerRegistry } from '@/events';
 import { isOpenAILike } from '@/utils/llm';
 import { isPresent } from '@/utils/misc';
@@ -445,13 +446,11 @@ export class Run<_T extends t.BaseGraphState> {
       })
       .join('\n');
 
-    const model = this.Graph?.getNewModel({
+    const model = initializeModel({
       provider,
       clientOptions,
-    });
-    if (!model) {
-      return { language: '', title: '' };
-    }
+    }) as t.ChatModelInstance;
+
     if (
       isOpenAILike(provider) &&
       (model instanceof ChatOpenAI || model instanceof AzureChatOpenAI)
