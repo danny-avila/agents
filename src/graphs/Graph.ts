@@ -3,7 +3,6 @@
 import { nanoid } from 'nanoid';
 import { concat } from '@langchain/core/utils/stream';
 import { ToolNode } from '@langchain/langgraph/prebuilt';
-import { ChatVertexAI } from '@langchain/google-vertexai';
 import { Runnable, RunnableConfig } from '@langchain/core/runnables';
 import {
   AIMessage,
@@ -57,18 +56,19 @@ import {
   joinKeys,
   sleep,
 } from '@/utils';
-import { getChatModelClass, manualToolStreamProviders } from '@/llm/providers';
+import { manualToolStreamProviders } from '@/llm/providers';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { shouldTriggerSummarization } from '@/summarization';
 import { createSummarizeNode } from '@/summarization/node';
-import { ChatOpenAI, AzureChatOpenAI } from '@/llm/openai';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { AgentContext } from '@/agents/AgentContext';
 import { createFakeStreamingLLM } from '@/llm/fake';
 import { handleToolCalls } from '@/tools/handlers';
 import { ChatModelStreamHandler } from '@/stream';
+import { initializeModel } from '@/llm/init';
 import { HandlerRegistry } from '@/events';
+import { ChatOpenAI } from '@/llm/openai';
 
 const { AGENT, TOOLS, SUMMARIZE } = GraphNodeKeys;
 
@@ -84,15 +84,6 @@ export abstract class Graph<
     currentTools?: t.GraphTools;
     currentToolMap?: t.ToolMap;
   }): CustomToolNode<T> | ToolNode<T>;
-  abstract initializeModel({
-    currentModel,
-    tools,
-    clientOptions,
-  }: {
-    currentModel?: t.ChatModel;
-    tools?: t.GraphTools;
-    clientOptions?: t.ClientOptions;
-  }): Runnable;
   abstract getRunMessages(): BaseMessage[] | undefined;
   abstract getContentParts(): t.MessageContentComplex[] | undefined;
   abstract generateStepId(stepKey: string): [string, number];
@@ -537,55 +528,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     });
   }
 
-  initializeModel({
-    provider,
-    tools,
-    clientOptions,
-  }: {
-    provider: Providers;
-    tools?: t.GraphTools;
-    clientOptions?: t.ClientOptions;
-  }): Runnable {
-    const ChatModelClass = getChatModelClass(provider);
-    const model = new ChatModelClass(clientOptions ?? {});
-
-    if (
-      isOpenAILike(provider) &&
-      (model instanceof ChatOpenAI || model instanceof AzureChatOpenAI)
-    ) {
-      model.temperature = (clientOptions as t.OpenAIClientOptions)
-        .temperature as number;
-      model.topP = (clientOptions as t.OpenAIClientOptions).topP as number;
-      model.frequencyPenalty = (clientOptions as t.OpenAIClientOptions)
-        .frequencyPenalty as number;
-      model.presencePenalty = (clientOptions as t.OpenAIClientOptions)
-        .presencePenalty as number;
-      model.n = (clientOptions as t.OpenAIClientOptions).n as number;
-    } else if (
-      provider === Providers.VERTEXAI &&
-      model instanceof ChatVertexAI
-    ) {
-      model.temperature = (clientOptions as t.VertexAIClientOptions)
-        .temperature as number;
-      model.topP = (clientOptions as t.VertexAIClientOptions).topP as number;
-      model.topK = (clientOptions as t.VertexAIClientOptions).topK as number;
-      model.topLogprobs = (clientOptions as t.VertexAIClientOptions)
-        .topLogprobs as number;
-      model.frequencyPenalty = (clientOptions as t.VertexAIClientOptions)
-        .frequencyPenalty as number;
-      model.presencePenalty = (clientOptions as t.VertexAIClientOptions)
-        .presencePenalty as number;
-      model.maxOutputTokens = (clientOptions as t.VertexAIClientOptions)
-        .maxOutputTokens as number;
-    }
-
-    if (!tools || tools.length === 0) {
-      return model as unknown as Runnable;
-    }
-
-    return (model as t.ModelWithTools).bindTools(tools);
-  }
-
   overrideTestModel(
     responses: string[],
     sleep?: number,
@@ -605,8 +547,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     provider: Providers;
     clientOptions?: t.ClientOptions;
   }): t.ChatModelInstance {
-    const ChatModelClass = getChatModelClass(provider);
-    return new ChatModelClass(clientOptions ?? {});
+    return initializeModel({
+      provider,
+      clientOptions,
+    }) as unknown as t.ChatModelInstance;
   }
 
   getUsageMetadata(
@@ -797,7 +741,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       const toolsForBinding = agentContext.getToolsForBinding();
       let model =
         this.overrideModel ??
-        this.initializeModel({
+        initializeModel({
           tools: toolsForBinding,
           provider: agentContext.provider,
           clientOptions: agentContext.clientOptions,
@@ -1178,7 +1122,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                 continue;
               }
 
-              // Truncate AI message tool_call inputs
               if (msg.getType() === 'ai' && Array.isArray(msg.content)) {
                 const aiMsg = msg as AIMessage;
                 const contentBlocks =

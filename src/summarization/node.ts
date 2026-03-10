@@ -10,7 +10,7 @@ import type * as t from '@/types';
 import { ContentTypes, GraphEvents, StepTypes, Providers } from '@/common';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { createRemoveAllMessage } from '@/messages/reducer';
-import { getChatModelClass } from '@/llm/providers';
+import { initializeModel } from '@/llm/init';
 import { getChunkContent } from '@/stream';
 
 // ---------------------------------------------------------------------------
@@ -708,8 +708,10 @@ export function createSummarizeNode({
     }
 
     // ----- Create the summarizer model (fresh, isolated instance) -----
-    const ChatModelClass = getChatModelClass(provider as Providers);
-    const model = new ChatModelClass(clientOptions as never);
+    const model = initializeModel({
+      provider: provider as Providers,
+      clientOptions: clientOptions as t.ClientOptions,
+    }) as unknown as SummarizeModel;
 
     // Check for a prior summary, either from a previous summarization within
     // this run or from a cross-run summary forwarded via initialSummary.
@@ -759,15 +761,11 @@ export function createSummarizeNode({
     // format and enables cache hits on the system prompt + tool definitions.
     // Bind the agent's tools so providers that require tool definitions when
     // tool_use/tool_result blocks are present (e.g. Bedrock) accept the messages.
-    const tools = agentContext.getToolsForBinding();
-    const tier1Model =
-      tools != null &&
-      tools.length > 0 &&
-      typeof (model as t.ModelWithTools).bindTools === 'function'
-        ? ((model as t.ModelWithTools).bindTools(
-          tools
-        ) as unknown as SummarizeModel)
-        : model;
+    const tier1Model = initializeModel({
+      provider: provider as Providers,
+      clientOptions: clientOptions as t.ClientOptions,
+      tools: agentContext.getToolsForBinding(),
+    }) as unknown as SummarizeModel;
     try {
       summaryText = await summarizeWithCacheHit({
         model: tier1Model,

@@ -37,3 +37,4 @@ export type {
   ChatOpenRouterCallOptions,
 } from './llm/openrouter';
 export { getChatModelClass } from './llm/providers';
+export { initializeModel } from './llm/init';
