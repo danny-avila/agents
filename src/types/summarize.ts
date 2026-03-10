@@ -24,6 +24,8 @@ export type SummarizationConfig = {
   stream?: boolean;
   /** Maximum output tokens for the summarization model. Defaults to 2048. */
   maxSummaryTokens?: number;
+  /** Maximum input tokens per summarization pass. Controls how much conversation context is formatted and sent to the summarizer. Defaults to 10000. */
+  maxInputTokens?: number;
   /**
    * Fraction of the effective token budget to reserve as headroom (0–1).
    * Pruning triggers when conversation tokens exceed `effectiveMax * (1 - reserveRatio)`,

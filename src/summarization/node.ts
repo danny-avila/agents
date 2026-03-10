@@ -18,21 +18,52 @@ import { getChunkContent } from '@/stream';
 // ---------------------------------------------------------------------------
 
 /**
- * Per-field character limits, differentiated by signal value for summarization.
- *
- * Tool args (code, config, JSON payloads) are low-signal — the summarizer
- * needs to know WHAT was called and roughly WHY, not the exact code.
- * Tool results and message content are high-signal — they carry the actual
- * information the conversation is about.
+ * Minimum per-field character limits. The adaptive budget system scales these
+ * up based on available budget and message count, but never below these floors.
  */
-const LIMITS = {
-  /** Tool call argument values (per key) — usually code/config, low signal */
+const MIN_LIMITS = {
   toolArg: 200,
-  /** Tool result content — actual data returned, high signal */
-  toolResult: 800,
-  /** User/assistant message content — conversational substance */
-  messageContent: 600,
+  toolResult: 400,
+  messageContent: 300,
 } as const;
+
+/**
+ * Computes adaptive per-field character limits based on the total budget
+ * and the number of messages. More budget per message = higher limits.
+ * Recent messages (higher index) get a larger share via recency weighting.
+ */
+function computeAdaptiveLimits(
+  budgetChars: number,
+  messageCount: number,
+  messageIndex: number
+): { toolArg: number; toolResult: number; messageContent: number } {
+  if (messageCount <= 0) {
+    return { ...MIN_LIMITS };
+  }
+
+  // Recency weight: messages in the last third get 2x, middle third 1x, first third 0.5x
+  const position = messageCount > 1 ? messageIndex / (messageCount - 1) : 1;
+  const recencyMultiplier = position > 0.66 ? 2.0 : position > 0.33 ? 1.0 : 0.5;
+
+  // Base per-message budget: divide total budget by weighted message count
+  // Average weight across all messages ≈ 1.17, so use messageCount directly
+  const perMessageBudget = Math.floor(
+    (budgetChars / messageCount) * recencyMultiplier
+  );
+
+  // Allocate: 60% to tool results (high signal), 30% to message content, 10% to tool args
+  return {
+    toolArg: Math.max(MIN_LIMITS.toolArg, Math.floor(perMessageBudget * 0.1)),
+    toolResult: Math.max(
+      MIN_LIMITS.toolResult,
+      Math.floor(perMessageBudget * 0.6)
+    ),
+    messageContent: Math.max(
+      MIN_LIMITS.messageContent,
+      Math.floor(perMessageBudget * 0.3)
+    ),
+  };
+}
 
 /**
  * Token budget for a single summarization chunk.
@@ -40,7 +71,7 @@ const LIMITS = {
  * chunking/splitting decisions. The char-based formatting budget is
  * derived from this via a ~4:1 chars-per-token ratio.
  */
-const CHUNK_BUDGET_TOKENS = 10_000;
+const DEFAULT_MAX_INPUT_TOKENS = 10_000;
 
 /** Default number of parts for multi-stage summarization (1 = single-pass). */
 const DEFAULT_PARTS = 1;
@@ -87,6 +118,35 @@ function stripBrokenSurrogates(s: string): string {
 }
 
 /**
+ * Parses <events> XML from the LLM's summarization output.
+ * Returns the parsed events map and the text with the <events> block removed.
+ */
+function parseEventsFromOutput(text: string): {
+  markdown: string;
+  events: Map<string, { value: string; turn: string }>;
+} {
+  const events = new Map<string, { value: string; turn: string }>();
+  const eventsRegex = /<events>([\s\S]*?)<\/events>/;
+  const match = text.match(eventsRegex);
+
+  if (match) {
+    const eventsBlock = match[1];
+    const eventRegex =
+      /<event\s+key="([^"]+)"\s+turn="([^"]*)">([\s\S]*?)<\/event>/g;
+    let eventMatch: RegExpExecArray | null;
+    while ((eventMatch = eventRegex.exec(eventsBlock)) !== null) {
+      events.set(eventMatch[1], {
+        value: eventMatch[3].trim(),
+        turn: eventMatch[2],
+      });
+    }
+  }
+
+  const markdown = text.replace(eventsRegex, '').trim();
+  return { markdown, events };
+}
+
+/**
  * Truncates a string to `maxLen` characters, appending an ellipsis indicator
  * with the original length so the summarizer knows content was cut.
  */
@@ -125,7 +185,10 @@ function smartTruncate(text: string, maxLen: number): string {
  * instead of dumping raw JSON (which can be thousands of chars for code-heavy
  * tool calls like script evaluation or file writes).
  */
-function formatToolArgs(args: Record<string, unknown> | undefined): string {
+function formatToolArgs(
+  args: Record<string, unknown> | undefined,
+  toolArgLimit: number = MIN_LIMITS.toolArg
+): string {
   if (!args || typeof args !== 'object') {
     return '';
   }
@@ -135,12 +198,15 @@ function formatToolArgs(args: Record<string, unknown> | undefined): string {
       continue;
     }
     const valueStr = typeof value === 'string' ? value : JSON.stringify(value);
-    parts.push(`${key}: ${truncate(valueStr, LIMITS.toolArg)}`);
+    parts.push(`${key}: ${truncate(valueStr, toolArgLimit)}`);
   }
   return parts.join(', ');
 }
 
-function formatMessageForSummary(msg: BaseMessage): string {
+function formatMessageForSummary(
+  msg: BaseMessage,
+  limits: ReturnType<typeof computeAdaptiveLimits>
+): string {
   const role = msg.getType();
 
   // Tool result messages: format as "[tool_result: name] → content"
@@ -150,7 +216,7 @@ function formatMessageForSummary(msg: BaseMessage): string {
       typeof msg.content === 'string'
         ? msg.content
         : JSON.stringify(msg.content);
-    return `[tool_result: ${name}] → ${smartTruncate(content, LIMITS.toolResult)}`;
+    return `[tool_result: ${name}] → ${smartTruncate(content, limits.toolResult)}`;
   }
 
   // AI messages with tool calls: extract text content and format tool calls readably
@@ -165,7 +231,7 @@ function formatMessageForSummary(msg: BaseMessage): string {
     // Extract any text content
     if (typeof msg.content === 'string') {
       if (msg.content.trim()) {
-        parts.push(smartTruncate(msg.content.trim(), LIMITS.messageContent));
+        parts.push(smartTruncate(msg.content.trim(), limits.messageContent));
       }
     } else if (Array.isArray(msg.content)) {
       for (const block of msg.content) {
@@ -177,14 +243,17 @@ function formatMessageForSummary(msg: BaseMessage): string {
           typeof block.text === 'string' &&
           block.text.trim()
         ) {
-          parts.push(smartTruncate(block.text.trim(), LIMITS.messageContent));
+          parts.push(smartTruncate(block.text.trim(), limits.messageContent));
         }
       }
     }
 
     // Format each tool call with truncated args
     for (const tc of msg.tool_calls) {
-      const argsStr = formatToolArgs(tc.args as Record<string, unknown>);
+      const argsStr = formatToolArgs(
+        tc.args as Record<string, unknown>,
+        limits.toolArg
+      );
       parts.push(`[tool_call: ${tc.name}(${argsStr})]`);
     }
 
@@ -214,7 +283,7 @@ function formatMessageForSummary(msg: BaseMessage): string {
   } else {
     content = '';
   }
-  return `[${role}]: ${smartTruncate(content, LIMITS.messageContent)}`;
+  return `[${role}]: ${smartTruncate(content, limits.messageContent)}`;
 }
 
 /**
@@ -225,20 +294,30 @@ function formatMessageForSummary(msg: BaseMessage): string {
  */
 function formatMessagesForSummarization(
   messages: BaseMessage[],
-  budgetChars: number = CHUNK_BUDGET_TOKENS * 4
+  budgetChars: number = DEFAULT_MAX_INPUT_TOKENS * 4
 ): string {
-  const formatted = messages.map(formatMessageForSummary);
+  const formatted = messages.map((msg, i) => {
+    const limits = computeAdaptiveLimits(budgetChars, messages.length, i);
+    return formatMessageForSummary(msg, limits);
+  });
 
   const totalChars = formatted.reduce((sum, s) => sum + s.length, 0);
   if (totalChars <= budgetChars) {
     return formatted.join('\n');
   }
 
-  // Over budget — trim the longest messages proportionally.
-  const ratio = budgetChars / totalChars;
-  const trimmed = formatted.map((text) => {
-    const allowance = Math.max(80, Math.floor(text.length * ratio));
-    return truncate(text, allowance);
+  // Over budget — trim the longest messages proportionally,
+  // but weight recent messages higher to preserve their content.
+  const weights = formatted.map((_, i) => {
+    const position = messages.length > 1 ? i / (messages.length - 1) : 1;
+    return position > 0.66 ? 2.0 : position > 0.33 ? 1.0 : 0.5;
+  });
+  const totalWeight = weights.reduce((a, b) => a + b, 0);
+
+  const trimmed = formatted.map((text, i) => {
+    const share = (weights[i] / totalWeight) * budgetChars;
+    const allowance = Math.max(80, Math.floor(share));
+    return text.length <= allowance ? text : truncate(text, allowance);
   });
 
   return trimmed.join('\n');
@@ -248,107 +327,9 @@ function formatMessagesForSummarization(
 // Adaptive chunk sizing
 // ---------------------------------------------------------------------------
 
-/** Base chunk ratio — at normal message density, use 40% of budget per chunk. */
-const BASE_CHUNK_RATIO = 0.4;
-/** Minimum chunk ratio — at high message density, shrink to 15% of budget. */
-const MIN_CHUNK_RATIO = 0.15;
-/** Safety margin applied to estimated chunk sizes to account for token estimation inaccuracy. */
-const SAFETY_MARGIN = 1.2;
-
-/**
- * Computes the minimum number of chunks needed based on content density.
- * When average message token weight is large relative to the chunk budget,
- * the chunk count increases proportionally. This prevents oversized chunks
- * that would overflow the summarization model's context.
- *
- * @param messageCount - Number of messages to be chunked.
- * @param totalTokenWeight - Total token weight across all messages.
- * @param chunkBudgetTokens - Token budget per chunk (e.g., CHUNK_BUDGET_TOKENS).
- * @returns Minimum number of chunks to use.
- */
-function computeAdaptiveChunkCount(params: {
-  messageCount: number;
-  totalTokenWeight: number;
-  chunkBudgetTokens: number;
-}): number {
-  const { messageCount, totalTokenWeight, chunkBudgetTokens } = params;
-  if (messageCount === 0 || chunkBudgetTokens <= 0) {
-    return 1;
-  }
-
-  const avgMessageTokens = totalTokenWeight / messageCount;
-  const budgetFraction = avgMessageTokens / chunkBudgetTokens;
-
-  // Scale the per-chunk ratio down when messages are large.
-  // At budgetFraction >= 0.25, ratio starts decreasing from BASE toward MIN.
-  const effectiveRatio =
-    budgetFraction >= 0.25
-      ? Math.max(MIN_CHUNK_RATIO, BASE_CHUNK_RATIO * (1 - budgetFraction))
-      : BASE_CHUNK_RATIO;
-
-  const effectiveBudget = chunkBudgetTokens * effectiveRatio;
-  const estimatedChunks = Math.ceil(
-    (totalTokenWeight * SAFETY_MARGIN) / effectiveBudget
-  );
-
-  return Math.max(1, estimatedChunks);
-}
-
 // ---------------------------------------------------------------------------
 // Multi-stage summarization
 // ---------------------------------------------------------------------------
-
-/**
- * Splits messages into `parts` groups of roughly equal weight.
- * Accepts pre-computed weights (token counts when available, char estimates
- * otherwise) so the caller controls the weighting strategy.
- */
-function splitMessagesByWeight(
-  messages: BaseMessage[],
-  parts: number,
-  weights: number[]
-): BaseMessage[][] {
-  if (messages.length === 0 || parts <= 1) {
-    return [messages];
-  }
-  if (weights.length !== messages.length) {
-    throw new Error(
-      `splitMessagesByWeight: weights.length (${weights.length}) !== messages.length (${messages.length})`
-    );
-  }
-  const normalizedParts = Math.min(parts, messages.length);
-
-  const totalWeight = weights.reduce((sum, w) => sum + w, 0);
-  const targetWeight = totalWeight / normalizedParts;
-
-  const chunks: BaseMessage[][] = [];
-  let currentChunk: BaseMessage[] = [];
-  let currentWeight = 0;
-
-  for (let i = 0; i < messages.length; i++) {
-    currentChunk.push(messages[i]);
-    currentWeight += weights[i];
-
-    // Break when we've reached target weight for this chunk,
-    // unless we're filling the last chunk (which gets the remainder).
-    if (
-      currentWeight >= targetWeight &&
-      chunks.length < normalizedParts - 1 &&
-      currentChunk.length > 0
-    ) {
-      chunks.push(currentChunk);
-      currentChunk = [];
-      currentWeight = 0;
-    }
-  }
-
-  // Push the last chunk (may be empty if messages divided evenly)
-  if (currentChunk.length > 0) {
-    chunks.push(currentChunk);
-  }
-
-  return chunks;
-}
 
 // ---------------------------------------------------------------------------
 // Prompt & config helpers
@@ -364,7 +345,12 @@ export const DEFAULT_SUMMARIZATION_PROMPT = `Create a structured context checkpo
 
 IMPORTANT: Write as a factual state log in third person. Do NOT write as a chatbot response. Do NOT use first person ("I"), second person ("you", "your"), emojis, or conversational phrases like "Let me", "Here's what", "Great news". This is a technical state record, not a message to the user.
 
-Use this exact format:
+Your output MUST contain two sections:
+
+1. A markdown checkpoint (the human-readable summary)
+2. An <events> XML block containing structured key-value pairs for facts that must survive compression
+
+## Markdown Checkpoint Format
 
 ## Goal
 The user's primary objective and any sub-goals identified during the conversation.
@@ -379,11 +365,8 @@ Configuration choices, style preferences, architectural decisions, technology ch
 ### In Progress
 - Current work items and their state
 
-### Blocked
-- Items that cannot proceed and why
-
 ## Key Decisions
-Decisions made and their rationale. Include alternatives that were rejected and why.
+Decisions made and their rationale.
 
 ## Next Steps
 What should happen next, in priority order.
@@ -391,14 +374,25 @@ What should happen next, in priority order.
 ## Critical Context
 Specific identifiers, names, error messages, URLs, and other details that must be preserved verbatim.
 
+## Events XML Block
+
+After the markdown checkpoint, output an <events> block containing key facts as XML entries.
+These are structured data that must be preserved exactly across summarization cycles.
+
+<events>
+<event key="unique_key" turn="N">Exact value or short factual statement</event>
+</events>
+
+Use events for: URLs visited, file paths modified, specific values computed, error messages encountered, tool results that produced important data, configuration values set.
+Do NOT use events for: narrative, opinions, general progress (that goes in the markdown).
+
 Rules:
-- Write factual, third-person statements: "User requested X. Agent executed Y tool. Result: Z."
+- Write factual, third-person statements in the markdown sections
 - For each tool call, record: the tool name, key input parameters, and the outcome
 - Preserve exact identifiers, names, error messages, and key references — do NOT paraphrase them
-- Do NOT reproduce tool output or long content verbatim — summarize the outcome
+- Do NOT reproduce tool output or long content verbatim — summarize the outcome in markdown, capture key values in events
 - Use short declarative sentences
-- Omit empty sections
-- Output only the checkpoint`;
+- Omit empty sections`;
 
 /**
  * Prompt for incremental summary updates when a prior summary exists.
@@ -412,18 +406,24 @@ IMPORTANT: The output must be roughly the SAME LENGTH as the previous checkpoint
 
 Write as a factual state log in third person. Do NOT write as a chatbot response. Do NOT use first person, second person, emojis, or conversational phrases. This is a technical state record, not a message to the user.
 
+Your output MUST contain both the updated markdown checkpoint AND an updated <events> block.
+
+For the <events> block:
+- KEEP all existing events from <prior-events> unless they are no longer relevant
+- ADD new events for facts discovered in the new messages
+- UPDATE event values if new information supersedes old values
+- Use the same format: <event key="unique_key" turn="N">value</event>
+
 Rules:
-- MERGE new progress into existing sections — do not duplicate section headers
+- MERGE new progress into existing markdown sections — do not duplicate section headers
 - COMPRESS older completed items into brief one-line entries to control length
 - Move items from "In Progress" to "Done" when completed
-- Move items from "Blocked" to "In Progress" or "Done" as appropriate
 - Update "Next Steps" to reflect current priorities
 - Write factual, third-person statements: "User requested X. Agent executed Y tool. Result: Z."
 - For each NEW tool call, record: the tool name, key input parameters, and the outcome
 - Preserve exact identifiers, names, error messages, and key references — do NOT paraphrase them
-- Do NOT reproduce tool output or long content verbatim — summarize the outcome
-- Omit empty sections
-- Output only the updated checkpoint using the same format`;
+- Do NOT reproduce tool output or long content verbatim — summarize the outcome in markdown, capture key values in events
+- Omit empty sections`;
 
 /**
  * Separates summarization-specific parameters (parts, minMessagesForSplit, etc.)
@@ -667,6 +667,8 @@ export function createSummarizeNode({
     const updatePromptText =
       summarizationConfig?.updatePrompt ?? DEFAULT_UPDATE_SUMMARIZATION_PROMPT;
     const streaming = summarizationConfig?.stream !== false;
+    const maxInputTokens =
+      summarizationConfig?.maxInputTokens ?? DEFAULT_MAX_INPUT_TOKENS;
 
     // Separate summarization-specific params from LLM constructor params.
     // This prevents keys like `parts`, `minMessagesForSplit` from being
@@ -770,6 +772,7 @@ export function createSummarizeNode({
     // Check for a prior summary — either from a previous summarization within
     // this run or from a cross-run summary forwarded via initialSummary.
     const priorSummaryText = agentContext.getSummaryText()?.trim() ?? '';
+    const priorEventsXml = agentContext.formatEventsXml() || undefined;
 
     // ----- Enrich config with summarization metadata for Langfuse tracing -----
     // The strategies further add stage-specific metadata (single_pass, chunk, merge).
@@ -810,40 +813,23 @@ export function createSummarizeNode({
       { runId: graph.runId, agentId: request.agentId }
     );
 
-    // Tier 1: Full input, normal budget
+    // Tier 1: Send raw conversation messages with the summarization instruction
+    // appended as the final HumanMessage. This preserves the original message
+    // format and enables cache hits on the system prompt + tool definitions.
     try {
-      if (
-        parts > 1 &&
-        messagesToRefine.length >= Math.max(2, minMessagesForSplit)
-      ) {
-        summaryText = await summarizeInStages({
-          model,
-          messages: messagesToRefine,
-          parts,
-          promptText,
-          updatePromptText,
-          priorSummaryText,
-          config: summarizeConfig,
-          streaming,
-          stepId,
-          maxSummaryTokens: effectiveMaxSummaryTokens,
-          tokenCounter: agentContext.tokenCounter,
-          provider: provider as Providers,
-        });
-      } else {
-        summaryText = await summarizeSinglePass({
-          model,
-          messages: messagesToRefine,
-          promptText,
-          updatePromptText,
-          priorSummaryText,
-          config: summarizeConfig,
-          streaming,
-          stepId,
-          tokenCounter: agentContext.tokenCounter,
-          provider: provider as Providers,
-        });
-      }
+      summaryText = await summarizeWithCacheHit({
+        model,
+        messages: messagesToRefine,
+        promptText,
+        updatePromptText,
+        priorSummaryText,
+        priorEventsXml,
+        config: summarizeConfig,
+        streaming,
+        stepId,
+        provider: provider as Providers,
+        reasoningKey: agentContext.reasoningKey,
+      });
     } catch (err) {
       // S2a: Log tier 1 failure, falling back to tier 2
       emitAgentLog(
@@ -869,9 +855,10 @@ export function createSummarizeNode({
           config: summarizeConfig,
           streaming,
           stepId,
-          budgetChars: Math.floor((CHUNK_BUDGET_TOKENS * 4) / 2),
+          budgetChars: Math.floor((maxInputTokens * 4) / 2),
           tokenCounter: agentContext.tokenCounter,
           provider: provider as Providers,
+          priorEventsXml,
         });
       } catch (err2) {
         // S2b: Log tier 2 failure, falling back to tier 3
@@ -909,6 +896,20 @@ export function createSummarizeNode({
 
     // ----- Enrich with structured data the LLM may have omitted -----
     summaryText = enrichSummary(summaryText, messagesToRefine);
+
+    // ----- Parse events from LLM output -----
+    const { markdown: cleanSummary, events: parsedEvents } =
+      parseEventsFromOutput(summaryText);
+
+    // Merge parsed events with existing events (new values overwrite old)
+    const existingEvents = agentContext.getSummaryEvents();
+    for (const [key, val] of parsedEvents) {
+      existingEvents.set(key, val);
+    }
+    agentContext.setSummaryEvents(existingEvents);
+
+    // Use the clean markdown (events stripped) as the summary text
+    summaryText = cleanSummary;
 
     // ----- Finalize -----
     let tokenCount = 0;
@@ -1086,6 +1087,10 @@ interface SummarizeParams {
   provider?: Providers;
   /** Key used for reasoning content in additional_kwargs. */
   reasoningKey?: 'reasoning_content' | 'reasoning';
+  /** XML string of prior events to inject when updating a summary. */
+  priorEventsXml?: string;
+  /** Maximum input tokens per summarization pass. */
+  maxInputTokens?: number;
 }
 
 /**
@@ -1230,6 +1235,62 @@ async function streamAndCollect(
 }
 
 /**
+ * Cache-friendly compaction: sends the raw conversation messages to the LLM
+ * with the summarization instruction appended as the final HumanMessage.
+ *
+ * Because the messages are in the same format (and same prefix) as the agent's
+ * last call, providers with prompt caching (Anthropic, Bedrock) get a cache hit
+ * on the system prompt + tool definitions. Only the instruction is new tokens.
+ *
+ * The messages have already been through the pruner's progressive truncation,
+ * so oversized tool results are already trimmed.
+ */
+async function summarizeWithCacheHit({
+  model,
+  messages,
+  promptText,
+  updatePromptText,
+  priorSummaryText,
+  priorEventsXml,
+  config,
+  streaming,
+  stepId,
+  provider,
+  reasoningKey,
+}: Omit<SummarizeParams, 'maxInputTokens'>): Promise<string> {
+  const effectivePrompt = priorSummaryText
+    ? (updatePromptText ?? promptText)
+    : promptText;
+
+  // Build the instruction as the final human message
+  const instructionParts = [effectivePrompt];
+  if (priorSummaryText) {
+    instructionParts.push(
+      `\n\n<previous-summary>\n${priorSummaryText}\n</previous-summary>`
+    );
+  }
+  if (priorEventsXml != null && priorEventsXml !== '') {
+    instructionParts.push(`\n\n${priorEventsXml}`);
+  }
+
+  // Pass the raw conversation messages with instruction appended
+  const messagesForLLM = [
+    ...messages,
+    new HumanMessage(instructionParts.join('')),
+  ];
+
+  return streamAndCollect(
+    model,
+    messagesForLLM,
+    traceConfig(config, 'cache_hit_compaction'),
+    streaming,
+    stepId,
+    provider,
+    reasoningKey
+  );
+}
+
+/**
  * Single-pass summarization: formats all messages → one LLM call.
  * Used when `parts <= 1` or when the message count is below `minMessagesForSplit`.
  */
@@ -1245,8 +1306,15 @@ async function summarizeSinglePass({
   budgetChars,
   provider,
   reasoningKey,
+  priorEventsXml,
+  maxInputTokens: passedMaxInputTokens,
 }: SummarizeParams & { budgetChars?: number }): Promise<string> {
-  const formattedText = formatMessagesForSummarization(messages, budgetChars);
+  const effectiveBudgetChars =
+    budgetChars ?? (passedMaxInputTokens ?? DEFAULT_MAX_INPUT_TOKENS) * 4;
+  const formattedText = formatMessagesForSummarization(
+    messages,
+    effectiveBudgetChars
+  );
 
   // S-SP: Log what the summarizer will see
   const msgTypes = messages.map((m) => {
@@ -1278,9 +1346,14 @@ async function summarizeSinglePass({
     ? (updatePromptText ?? promptText)
     : promptText;
 
-  const humanMessageText = priorSummaryText
-    ? `<previous-summary>\n${priorSummaryText}\n</previous-summary>\n\n<conversation>\n${formattedText}\n</conversation>`
-    : `<conversation>\n${formattedText}\n</conversation>`;
+  const summarySection = priorSummaryText
+    ? `<previous-summary>\n${priorSummaryText}\n</previous-summary>\n\n`
+    : '';
+  const eventsSection =
+    priorEventsXml != null && priorEventsXml !== ''
+      ? `\n\n${priorEventsXml}\n\n`
+      : '';
+  const humanMessageText = `${summarySection}${eventsSection}<conversation>\n${formattedText}\n</conversation>`;
 
   return streamAndCollect(
     model,
@@ -1291,193 +1364,4 @@ async function summarizeSinglePass({
     provider,
     reasoningKey
   );
-}
-
-/**
- * Instruction prepended to the fresh prompt for intra-cycle chunks (i > 0)
- * so the LLM knows how to handle the `<context-from-earlier-messages>` section.
- * Unlike the UPDATE prompt (which says "PRESERVE all existing information"),
- * this instructs the LLM to produce a single cohesive summary that incorporates
- * the earlier context without duplicating section headers.
- */
-const CHUNK_CONTINUATION_PREFIX =
-  'A <context-from-earlier-messages> section is provided containing a summary of earlier parts of this same conversation that you have already processed. Incorporate this information alongside the new messages into a single comprehensive summary. Do NOT duplicate section headers — produce one unified summary covering all information.\n\n';
-
-/**
- * Multi-stage summarization via progressive chaining:
- *   1. Split messages into chunks by token weight (adaptive sizing)
- *   2. Summarize chunks sequentially — each chunk's summary becomes
- *      context for the next, preserving temporal ordering
- *
- * Prompt selection per chunk:
- *   - Chunk 0 with cross-cycle prior summary: UPDATE prompt (preserve old summary,
- *     integrate new messages)
- *   - Chunk 0 without prior summary: FRESH prompt (create from scratch)
- *   - Chunks 1+: FRESH prompt with a continuation prefix (incorporate running
- *     summary as context, do NOT re-preserve verbatim — avoids section duplication)
- */
-async function summarizeInStages({
-  model,
-  messages,
-  parts,
-  promptText,
-  updatePromptText,
-  priorSummaryText,
-  config,
-  streaming,
-  stepId,
-  maxSummaryTokens,
-  tokenCounter,
-  provider,
-  reasoningKey,
-}: SummarizeParams & {
-  parts: number;
-  maxSummaryTokens?: number;
-}): Promise<string> {
-  // Compute per-message token weights for chunking decisions.
-  // When tokenCounter is available, uses accurate token counts;
-  // otherwise falls back to chars/4 estimate.
-  const weights = messages.map((msg) => {
-    if (tokenCounter) {
-      return tokenCounter(msg);
-    }
-    const content =
-      typeof msg.content === 'string'
-        ? msg.content
-        : JSON.stringify(msg.content);
-    return Math.ceil(content.length / 4);
-  });
-  const totalTokenWeight = weights.reduce((sum, w) => sum + w, 0);
-
-  // Adaptive sizing only applies when multi-stage was explicitly requested
-  // (parts > 1). With the default parts = 1, this is bypassed entirely
-  // to preserve single-pass behavior.
-  let effectiveParts = parts;
-  if (parts > 1) {
-    const adaptiveParts = computeAdaptiveChunkCount({
-      messageCount: messages.length,
-      totalTokenWeight,
-      chunkBudgetTokens: CHUNK_BUDGET_TOKENS,
-    });
-    effectiveParts = Math.max(parts, adaptiveParts);
-  }
-
-  const chunks = splitMessagesByWeight(messages, effectiveParts, weights);
-
-  // If splitting didn't produce multiple chunks, fall back to single-pass
-  if (chunks.length <= 1) {
-    return summarizeSinglePass({
-      model,
-      messages,
-      promptText,
-      updatePromptText,
-      priorSummaryText,
-      config,
-      streaming,
-      stepId,
-      provider,
-      reasoningKey,
-    });
-  }
-
-  // Progressive summary chaining: chunk N's summary becomes context for chunk N+1.
-  // This preserves temporal ordering better than independent summarization + merge,
-  // and eliminates the merge LLM call entirely.
-  // Trade-off: chunks must be processed sequentially (no parallelism).
-  let runningSummary = priorSummaryText || '';
-  // Cap running summary so it doesn't consume too much of the next chunk's input.
-  // Use 4 chars/token (standard ratio) and also cap at 40% of chunk budget so the
-  // actual messages still get the majority of the summarizer's attention.
-  const maxSummaryChars = Math.min(
-    (maxSummaryTokens ?? 2048) * 4,
-    Math.floor(CHUNK_BUDGET_TOKENS * 4 * 0.4)
-  );
-
-  for (let i = 0; i < chunks.length; i++) {
-    // Dispatch a synthetic spacing delta between stages so the client
-    // aggregates visual separation between chunk summaries.
-    if (i > 0 && stepId != null && stepId !== '' && config) {
-      safeDispatchCustomEvent(
-        GraphEvents.ON_SUMMARIZE_DELTA,
-        {
-          id: stepId,
-          delta: {
-            summary: {
-              type: ContentTypes.SUMMARY,
-              content: [
-                {
-                  type: ContentTypes.TEXT,
-                  text: '\n\n',
-                } as t.MessageContentComplex,
-              ],
-              provider: String(config.metadata?.summarization_provider ?? ''),
-              model: String(config.metadata?.summarization_model ?? ''),
-            },
-          },
-        } satisfies t.SummarizeDeltaEvent,
-        config
-      );
-    }
-
-    const chunk = chunks[i];
-    const formattedText = formatMessagesForSummarization(chunk);
-
-    // Chunk 0 with a cross-cycle prior summary: use the UPDATE prompt so the
-    // LLM integrates new messages into the existing summary.
-    // All other chunks (including chunk 0 with no prior): use the FRESH prompt
-    // so the LLM creates a NEW summary rather than re-preserving content
-    // verbatim — this prevents duplicate section headers (## Goal appearing
-    // twice, etc.) that occurred when the UPDATE prompt was used for every
-    // chunk with a running summary.
-    const isCrossRunUpdate = i === 0 && priorSummaryText !== '';
-    let effectivePrompt: string;
-    if (isCrossRunUpdate) {
-      effectivePrompt = updatePromptText ?? promptText;
-    } else if (i > 0 && runningSummary) {
-      // Intra-cycle continuation: prepend context instructions to fresh prompt
-      effectivePrompt = CHUNK_CONTINUATION_PREFIX + promptText;
-    } else {
-      effectivePrompt = promptText;
-    }
-
-    let humanText: string;
-    if (runningSummary) {
-      if (isCrossRunUpdate) {
-        // Cross-cycle: mark as previous summary for the UPDATE prompt
-        humanText = `<previous-summary>\n${runningSummary}\n</previous-summary>\n\n<conversation>\nPart ${i + 1} of ${chunks.length}:\n\n${formattedText}\n</conversation>`;
-      } else {
-        // Intra-cycle: frame as context to incorporate, not to preserve verbatim
-        humanText = `<context-from-earlier-messages>\n${runningSummary}\n</context-from-earlier-messages>\n\n<conversation>\nPart ${i + 1} of ${chunks.length}:\n\n${formattedText}\n</conversation>`;
-      }
-    } else {
-      humanText = `<conversation>\nPart ${i + 1} of ${chunks.length}:\n\n${formattedText}\n</conversation>`;
-    }
-
-    const text = await streamAndCollect(
-      model,
-      [new SystemMessage(effectivePrompt), new HumanMessage(humanText)],
-      traceConfig(config, 'multi_stage_chunk', {
-        chunk_index: i,
-        total_chunks: chunks.length,
-      }),
-      streaming,
-      stepId,
-      provider,
-      reasoningKey
-    );
-
-    if (text) {
-      runningSummary = text;
-    }
-
-    // Guard: if running summary exceeds ~1.5× maxSummaryTokens (estimated via chars/4),
-    // truncate it before passing to the next chunk to prevent input growth.
-    if (runningSummary.length > maxSummaryChars) {
-      runningSummary =
-        runningSummary.slice(0, maxSummaryChars) +
-        '\n\n… [summary truncated to fit token budget]';
-    }
-  }
-
-  return runningSummary;
 }

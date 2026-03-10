@@ -885,21 +885,36 @@ export function preFlightTruncateToolResults(params: {
 }): number {
   const { messages, maxContextTokens, indexTokenCountMap, tokenCounter } =
     params;
-  const maxChars = calculateMaxToolResultChars(maxContextTokens);
+  const baseMaxChars = calculateMaxToolResultChars(maxContextTokens);
   let truncatedCount = 0;
 
+  // Count tool messages for recency weighting
+  const toolIndices: number[] = [];
   for (let i = 0; i < messages.length; i++) {
+    if (messages[i].getType() === 'tool') {
+      toolIndices.push(i);
+    }
+  }
+
+  for (let t = 0; t < toolIndices.length; t++) {
+    const i = toolIndices[t];
     const message = messages[i];
-    if (message.getType() !== 'tool') {
+    const content = message.content;
+    if (typeof content !== 'string') {
       continue;
     }
-    const content = message.content;
-    if (typeof content !== 'string' || content.length <= maxChars) {
+
+    // Progressive recency: oldest tool results get 20% of budget,
+    // newest get 100%. Linear interpolation between.
+    const position = toolIndices.length > 1 ? t / (toolIndices.length - 1) : 1;
+    const recencyFactor = 0.2 + 0.8 * position;
+    const maxChars = Math.max(200, Math.floor(baseMaxChars * recencyFactor));
+
+    if (content.length <= maxChars) {
       continue;
     }
 
     const truncated = truncateToolResultContent(content, maxChars);
-    // Create a new ToolMessage to avoid mutating the original in graph state
     const cloned = new ToolMessage({
       content: truncated,
       tool_call_id: (message as ToolMessage).tool_call_id,

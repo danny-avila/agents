@@ -2228,7 +2228,7 @@ describe('Tight context with oversized tool results (no API keys)', () => {
       // the prior summary was passed to the summarizer.
       const usedUpdateOrContinuation = capturedSystemMessages.some(
         (msg: string) =>
-          msg.includes('PRESERVE') ||
+          msg.includes('Merge new conversation') ||
           msg.includes('Update the existing summary') ||
           msg.includes('context-from-earlier-messages')
       );

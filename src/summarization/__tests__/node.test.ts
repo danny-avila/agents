@@ -9,24 +9,45 @@ import {
 } from '@/summarization/node';
 import * as providers from '@/llm/providers';
 import * as eventUtils from '@/utils/events';
-import type { AgentContext } from '@/agents/AgentContext';
+import { AgentContext } from '@/agents/AgentContext';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Creates a mock AgentContext with sensible defaults. */
-function mockAgentContext(overrides: Partial<AgentContext> = {}): AgentContext {
-  return {
-    provider: Providers.OPENAI,
-    agentId: 'agent_0',
-    summaryVersion: 0,
-    tokenCounter: undefined,
-    summarizationConfig: undefined,
-    getSummaryText: () => undefined,
-    setSummary: jest.fn(),
-    ...overrides,
-  } as unknown as AgentContext;
+/** Creates a real AgentContext via fromConfig with sensible defaults.
+ *  Extra properties are assigned directly for test-specific overrides. */
+function createAgentContext(
+  overrides: Record<string, unknown> = {}
+): AgentContext {
+  const {
+    // AgentInputs fields
+    agentId = 'agent_0',
+    provider = Providers.OPENAI,
+    instructions = 'Test agent',
+    summarizationEnabled = true,
+    summarizationConfig,
+    maxContextTokens,
+    tools,
+    ...extra
+  } = overrides;
+
+  const ctx = AgentContext.fromConfig({
+    agentId: agentId as string,
+    provider: provider as Providers,
+    instructions: instructions as string,
+    summarizationEnabled: summarizationEnabled as boolean,
+    ...(summarizationConfig != null ? { summarizationConfig } : {}),
+    ...(maxContextTokens != null ? { maxContextTokens } : {}),
+    ...(tools != null ? { tools } : {}),
+  } as import('@/types').AgentInputs);
+
+  // Apply direct property overrides for test-specific internal state
+  for (const [key, value] of Object.entries(extra)) {
+    (ctx as unknown as Record<string, unknown>)[key] = value;
+  }
+
+  return ctx;
 }
 
 /** Creates a mock graph container for createSummarizeNode. */
@@ -124,7 +145,7 @@ describe('createSummarizeNode', () => {
       } as never
     );
 
-    const agentContext = mockAgentContext();
+    const agentContext = createAgentContext();
     const graph = mockGraph();
     const node = createSummarizeNode({
       agentContext,
@@ -181,7 +202,7 @@ describe('createSummarizeNode', () => {
     );
 
     const setSummary = jest.fn();
-    const agentContext = mockAgentContext({ setSummary } as never);
+    const agentContext = createAgentContext({ setSummary } as never);
     const graph = mockGraph();
     const node = createSummarizeNode({
       agentContext,
@@ -222,7 +243,7 @@ describe('createSummarizeNode', () => {
     );
 
     const setSummary = jest.fn();
-    const agentContext = mockAgentContext({ setSummary } as never);
+    const agentContext = createAgentContext({ setSummary } as never);
     const graph = mockGraph();
     const node = createSummarizeNode({
       agentContext,
@@ -264,7 +285,7 @@ describe('createSummarizeNode', () => {
     );
 
     const setSummary = jest.fn();
-    const agentContext = mockAgentContext({ setSummary } as never);
+    const agentContext = createAgentContext({ setSummary } as never);
     const graph = mockGraph();
     const node = createSummarizeNode({
       agentContext,
@@ -327,7 +348,7 @@ describe('createSummarizeNode', () => {
     );
 
     const setSummary = jest.fn();
-    const agentContext = mockAgentContext({ setSummary } as never);
+    const agentContext = createAgentContext({ setSummary } as never);
     const graph = mockGraph();
     const node = createSummarizeNode({
       agentContext,
@@ -367,7 +388,7 @@ describe('createSummarizeNode', () => {
     );
 
     const setSummary = jest.fn();
-    const agentContext = mockAgentContext({ setSummary } as never);
+    const agentContext = createAgentContext({ setSummary } as never);
     const graph = mockGraph();
     const node = createSummarizeNode({
       agentContext,
@@ -394,183 +415,10 @@ describe('createSummarizeNode', () => {
     );
   });
 
-  it('uses multi-stage when parts > 1 and enough messages', async () => {
-    const events = captureEvents();
-
-    const invokeResponses = [
-      'Part 1 summary',
-      'Part 2 summary (with prior context)',
-    ];
-    let callIndex = 0;
-
-    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
-      class {
-        constructor() {
-          return {
-            invoke: jest.fn().mockImplementation(async () => {
-              return { content: invokeResponses[callIndex++] || '' };
-            }),
-          };
-        }
-      } as never
-    );
-
-    const agentContext = mockAgentContext({
-      summarizationConfig: {
-        parameters: { parts: 2, minMessagesForSplit: 2 },
-      },
-    } as never);
-    const graph = mockGraph();
-    const node = createSummarizeNode({
-      agentContext,
-      graph,
-      generateStepId,
-    });
-
-    await node(
-      {
-        messages: [new HumanMessage('Hello')],
-        summarizationRequest: {
-          messagesToRefine: [
-            new HumanMessage('Message 1'),
-            new HumanMessage('Message 2'),
-            new HumanMessage('Message 3'),
-            new HumanMessage('Message 4'),
-          ],
-          context: [],
-          remainingContextTokens: 1000,
-          agentId: 'agent_0',
-        },
-      },
-      {} as RunnableConfig
-    );
-
-    // With progressive chaining, chunk 2's summary is the final result
-    // (chunk 1's summary is passed as prior context to chunk 2, no separate merge step)
-    const completeEvent = events.find(
-      (e) => e.event === GraphEvents.ON_SUMMARIZE_COMPLETE
-    );
-    expect(
-      (
-        (completeEvent?.data as t.SummarizeCompleteEvent).summary!
-          .content?.[0] as { text: string } | undefined
-      )?.text
-    ).toBe('Part 2 summary (with prior context)');
-  });
-
-  it('uses FRESH prompt for intra-cycle chunks, UPDATE prompt only for cross-cycle prior', async () => {
+  it('cache-hit path sends raw messages with instruction appended as final HumanMessage', async () => {
     captureEvents();
 
-    // Capture what system messages are sent to the model for each chunk
-    const capturedSystemMessages: string[] = [];
-    const capturedHumanMessages: string[] = [];
-
-    const invokeResponses = [
-      '## Goal\nChunk 1 summary.',
-      '## Goal\nFinal comprehensive summary.',
-    ];
-    let callIndex = 0;
-
-    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
-      class {
-        constructor() {
-          return {
-            invoke: jest
-              .fn()
-              .mockImplementation(async (messages: unknown[]) => {
-                // Capture the system and human messages
-                for (const msg of messages as {
-                  _getType: () => string;
-                  content: string;
-                }[]) {
-                  if (msg._getType() === 'system') {
-                    capturedSystemMessages.push(
-                      typeof msg.content === 'string'
-                        ? msg.content
-                        : JSON.stringify(msg.content)
-                    );
-                  }
-                  if (msg._getType() === 'human') {
-                    capturedHumanMessages.push(
-                      typeof msg.content === 'string'
-                        ? msg.content
-                        : JSON.stringify(msg.content)
-                    );
-                  }
-                }
-                return { content: invokeResponses[callIndex++] || '' };
-              }),
-          };
-        }
-      } as never
-    );
-
-    const agentContext = mockAgentContext({
-      summarizationConfig: {
-        parameters: { parts: 2, minMessagesForSplit: 2 },
-      },
-    } as never);
-    const graph = mockGraph();
-    const node = createSummarizeNode({
-      agentContext,
-      graph,
-      generateStepId,
-    });
-
-    await node(
-      {
-        messages: [new HumanMessage('Hello')],
-        summarizationRequest: {
-          messagesToRefine: [
-            new HumanMessage('Message 1'),
-            new HumanMessage('Message 2'),
-            new HumanMessage('Message 3'),
-            new HumanMessage('Message 4'),
-          ],
-          context: [],
-          remainingContextTokens: 1000,
-          agentId: 'agent_0',
-        },
-      },
-      {} as RunnableConfig
-    );
-
-    // Two chunks means two invoke calls
-    expect(capturedSystemMessages.length).toBe(2);
-
-    // Chunk 1 (no prior summary): should use FRESH prompt (contains "Create a structured")
-    expect(capturedSystemMessages[0]).toContain('Create a structured');
-    // Should NOT use the UPDATE prompt (which says "PRESERVE")
-    expect(capturedSystemMessages[0]).not.toContain('Merge new conversation');
-
-    // Chunk 2 (intra-cycle, has running summary from chunk 1): should use FRESH prompt
-    // with continuation prefix (NOT the UPDATE prompt)
-    expect(capturedSystemMessages[1]).toContain('Create a structured');
-    expect(capturedSystemMessages[1]).not.toContain('Merge new conversation');
-    // Should have the continuation prefix instructing to incorporate context
-    expect(capturedSystemMessages[1]).toContain(
-      'context-from-earlier-messages'
-    );
-
-    // Human message for chunk 2 should use <context-from-earlier-messages> tag
-    // (NOT <previous-summary> which is reserved for cross-cycle updates)
-    expect(capturedHumanMessages[1]).toContain(
-      '<context-from-earlier-messages>'
-    );
-    expect(capturedHumanMessages[1]).not.toContain('<previous-summary>');
-  });
-
-  it('uses UPDATE prompt for chunk 0 when cross-cycle prior summary exists', async () => {
-    captureEvents();
-
-    const capturedSystemMessages: string[] = [];
-    const capturedHumanMessages: string[] = [];
-
-    const invokeResponses = [
-      '## Goal\nUpdated with chunk 1.',
-      '## Goal\nFinal with all context.',
-    ];
-    let callIndex = 0;
+    const capturedMessages: Array<{ type: string; content: string }> = [];
 
     jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
       class {
@@ -580,42 +428,32 @@ describe('createSummarizeNode', () => {
               .fn()
               .mockImplementation(async (messages: unknown[]) => {
                 for (const msg of messages as {
-                  _getType: () => string;
-                  content: string;
+                  getType: () => string;
+                  content: string | unknown[];
                 }[]) {
-                  if (msg._getType() === 'system') {
-                    capturedSystemMessages.push(
+                  capturedMessages.push({
+                    type: msg.getType(),
+                    content:
                       typeof msg.content === 'string'
                         ? msg.content
-                        : JSON.stringify(msg.content)
-                    );
-                  }
-                  if (msg._getType() === 'human') {
-                    capturedHumanMessages.push(
-                      typeof msg.content === 'string'
-                        ? msg.content
-                        : JSON.stringify(msg.content)
-                    );
-                  }
+                        : JSON.stringify(msg.content),
+                  });
                 }
-                return { content: invokeResponses[callIndex++] || '' };
+                return {
+                  content:
+                    '## Goal\nTest goal\n\n<events>\n<event key="test" turn="0">value</event>\n</events>',
+                };
               }),
           };
         }
       } as never
     );
 
-    // Agent has a prior summary from a previous cycle
-    const agentContext = mockAgentContext({
-      summarizationConfig: {
-        parameters: { parts: 2, minMessagesForSplit: 2 },
-      },
-      getSummaryText: () => '## Goal\nPrior cycle summary content.',
-    } as never);
+    const agentContext = createAgentContext();
     const graph = mockGraph();
     const node = createSummarizeNode({
       agentContext,
-      graph,
+      graph: graph as never,
       generateStepId,
     });
 
@@ -627,7 +465,6 @@ describe('createSummarizeNode', () => {
             new HumanMessage('Message 1'),
             new HumanMessage('Message 2'),
             new HumanMessage('Message 3'),
-            new HumanMessage('Message 4'),
           ],
           context: [],
           remainingContextTokens: 1000,
@@ -637,23 +474,85 @@ describe('createSummarizeNode', () => {
       {} as RunnableConfig
     );
 
-    expect(capturedSystemMessages.length).toBe(2);
+    // The raw messages should be sent + instruction appended as the last HumanMessage
+    // messagesToRefine has 3 HumanMessages, instruction adds 1 more
+    expect(capturedMessages.length).toBe(4);
+    expect(capturedMessages[0].type).toBe('human');
+    expect(capturedMessages[0].content).toBe('Message 1');
+    expect(capturedMessages[3].type).toBe('human');
+    // The last message should contain the summarization prompt
+    expect(capturedMessages[3].content).toContain('Create a structured');
+  });
 
-    // Chunk 0 with cross-cycle prior: should use UPDATE prompt
-    expect(capturedSystemMessages[0]).toContain('Merge new conversation');
-    // Human message should use <previous-summary> tag for cross-cycle
-    expect(capturedHumanMessages[0]).toContain('<previous-summary>');
+  it('cache-hit path includes prior summary and events in the instruction message', async () => {
+    captureEvents();
 
-    // Chunk 1 (intra-cycle): should use FRESH prompt with continuation prefix
-    expect(capturedSystemMessages[1]).not.toContain('Merge new conversation');
-    expect(capturedSystemMessages[1]).toContain(
-      'context-from-earlier-messages'
+    const capturedMessages: Array<{ type: string; content: string }> = [];
+
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return {
+            invoke: jest
+              .fn()
+              .mockImplementation(async (messages: unknown[]) => {
+                for (const msg of messages as {
+                  getType: () => string;
+                  content: string | unknown[];
+                }[]) {
+                  capturedMessages.push({
+                    type: msg.getType(),
+                    content:
+                      typeof msg.content === 'string'
+                        ? msg.content
+                        : JSON.stringify(msg.content),
+                  });
+                }
+                return { content: '## Goal\nUpdated summary' };
+              }),
+          };
+        }
+      } as never
     );
-    // Human message should use <context-from-earlier-messages> tag
-    expect(capturedHumanMessages[1]).toContain(
-      '<context-from-earlier-messages>'
+
+    // Create context with a prior summary and events
+    const agentContext = createAgentContext();
+    agentContext.setSummary('## Goal\nPrior summary content.', 50);
+    agentContext.setSummaryEvents(
+      new Map([['url_visited', { value: 'https://apple.com', turn: '1' }]])
     );
-    expect(capturedHumanMessages[1]).not.toContain('<previous-summary>');
+
+    const graph = mockGraph();
+    const node = createSummarizeNode({
+      agentContext,
+      graph: graph as never,
+      generateStepId,
+    });
+
+    await node(
+      {
+        messages: [new HumanMessage('Hello')],
+        summarizationRequest: {
+          messagesToRefine: [new HumanMessage('New message')],
+          context: [],
+          remainingContextTokens: 1000,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    // The last message should contain the update prompt (prior summary exists)
+    const lastMsg = capturedMessages[capturedMessages.length - 1];
+    expect(lastMsg.type).toBe('human');
+    expect(lastMsg.content).toContain('Merge new conversation');
+    // Should include the prior summary
+    expect(lastMsg.content).toContain('<previous-summary>');
+    expect(lastMsg.content).toContain('Prior summary content');
+    // Should include the prior events
+    expect(lastMsg.content).toContain('<prior-events>');
+    expect(lastMsg.content).toContain('url_visited');
+    expect(lastMsg.content).toContain('https://apple.com');
   });
 });
 
@@ -677,8 +576,10 @@ describe('DEFAULT_UPDATE_SUMMARIZATION_PROMPT', () => {
     expect(DEFAULT_UPDATE_SUMMARIZATION_PROMPT.length).toBeGreaterThan(0);
   });
 
-  it('instructs preservation of existing summary content', () => {
-    expect(DEFAULT_UPDATE_SUMMARIZATION_PROMPT).toMatch(/preserve/i);
+  it('instructs merging new content', () => {
+    expect(DEFAULT_UPDATE_SUMMARIZATION_PROMPT).toMatch(
+      /Merge new conversation/i
+    );
   });
 
   it('instructs updating progress tracking', () => {
@@ -690,7 +591,7 @@ describe('DEFAULT_UPDATE_SUMMARIZATION_PROMPT', () => {
 describe('budget check — instructions exceed context', () => {
   it('skips summarization when instructionTokens >= maxContextTokens', async () => {
     const events = captureEvents();
-    const agentContext = mockAgentContext({
+    const agentContext = createAgentContext({
       maxContextTokens: 4000,
       instructionTokens: 5000,
       formatTokenBudgetBreakdown: () => 'mock breakdown',
@@ -740,7 +641,7 @@ describe('budget check — instructions exceed context', () => {
       } as never
     );
 
-    const agentContext = mockAgentContext({
+    const agentContext = createAgentContext({
       maxContextTokens: 8000,
       instructionTokens: 2000,
       formatTokenBudgetBreakdown: () => 'mock breakdown',
@@ -785,7 +686,7 @@ describe('emoji-heavy content does not break summarization', () => {
     );
 
     const emojiContent = '👨‍💻 coding 🎉 party 🌍 world 🚀 rocket '.repeat(30);
-    const agentContext = mockAgentContext({
+    const agentContext = createAgentContext({
       maxContextTokens: 8000,
       instructionTokens: 100,
       formatTokenBudgetBreakdown: () => 'mock breakdown',
