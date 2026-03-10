@@ -236,9 +236,6 @@ export class AgentContext {
    */
   private _durableSummaryText?: string;
   private _durableSummaryTokenCount: number = 0;
-  /** Structured events extracted from summarization output. Persists across cycles. */
-  private _summaryEvents: Map<string, { value: string; turn: string }> =
-    new Map();
   /** Number of summarization cycles that have occurred for this agent context */
   private _summaryVersion: number = 0;
   /**
@@ -788,21 +785,6 @@ export class AgentContext {
     // shouldSkipSummarization can detect whether any new messages have
     // arrived since the last summary.
     this._lastSummarizationMsgCount = Object.keys(newTokenMap).length;
-  }
-
-  setSummaryEvents(events: Map<string, { value: string; turn: string }>): void {
-    this._summaryEvents = events;
-  }
-
-  formatEventsXml(): string {
-    if (this._summaryEvents.size === 0) {
-      return '';
-    }
-    const entries: string[] = [];
-    for (const [key, { value, turn }] of this._summaryEvents) {
-      entries.push(`<event key="${key}" turn="${turn}">${value}</event>`);
-    }
-    return `<prior-events>\n${entries.join('\n')}\n</prior-events>`;
   }
 
   hasSummary(): boolean {

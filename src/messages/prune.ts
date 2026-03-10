@@ -1357,11 +1357,14 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     let preFlightInputCount = 0;
 
     // -----------------------------------------------------------------------
-    // Observation masking (summarization-enabled path, 80%+ pressure):
+    // Observation masking (80%+ pressure, both paths):
     // Replace consumed ToolMessage content with tight head+tail placeholders.
     // AI messages stay intact so the model can read its own prior reasoning
-    // and won't repeat work.  Snapshot messages first so the summarizer can
-    // still see the full originals when summarization eventually fires.
+    // and won't repeat work.  Unconsumed results (latest tool outputs the
+    // model hasn't acted on yet) stay full.
+    //
+    // When summarization is enabled, snapshot messages first so the
+    // summarizer can see the full originals when compaction fires.
     //
     // TODO: Stage 2 (90%+) — extend masking to more recent consumed results,
     // keeping only the last 1-2 tool results fully intact.
@@ -1369,8 +1372,10 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     let preFadingMessages: BaseMessage[] | undefined;
     let observationsMasked = 0;
 
-    if (contextPressure >= 0.8 && factoryParams.summarizationEnabled === true) {
-      preFadingMessages = [...params.messages];
+    if (contextPressure >= 0.8) {
+      if (factoryParams.summarizationEnabled === true) {
+        preFadingMessages = [...params.messages];
+      }
       observationsMasked = maskConsumedToolResults({
         messages: params.messages,
         indexTokenCountMap,
@@ -1384,8 +1389,9 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       }
     }
 
-    // When summarization is NOT enabled, apply progressive context pressure
-    // fading — lossy truncation of all tool results based on pressure bands.
+    // When summarization is NOT enabled, apply additional progressive context
+    // pressure fading on remaining oversized tool results (unconsumed ones
+    // that observation masking left intact).
     if (contextPressure >= 0.8 && factoryParams.summarizationEnabled !== true) {
       const pressureBands: [number, number][] = [
         [0.99, 0.05],

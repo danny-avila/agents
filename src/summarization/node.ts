@@ -118,35 +118,6 @@ function stripBrokenSurrogates(s: string): string {
 }
 
 /**
- * Parses <events> XML from the LLM's summarization output.
- * Returns the parsed events map and the text with the <events> block removed.
- */
-function parseEventsFromOutput(text: string): {
-  markdown: string;
-  events: Map<string, { value: string; turn: string }>;
-} {
-  const events = new Map<string, { value: string; turn: string }>();
-  const eventsRegex = /<events>([\s\S]*?)<\/events>/;
-  const match = text.match(eventsRegex);
-
-  if (match) {
-    const eventsBlock = match[1];
-    const eventRegex =
-      /<event\s+key="([^"]+)"\s+turn="([^"]*)">([\s\S]*?)<\/event>/g;
-    let eventMatch: RegExpExecArray | null;
-    while ((eventMatch = eventRegex.exec(eventsBlock)) !== null) {
-      events.set(eventMatch[1], {
-        value: eventMatch[3].trim(),
-        turn: eventMatch[2],
-      });
-    }
-  }
-
-  const markdown = text.replace(eventsRegex, '').trim();
-  return { markdown, events };
-}
-
-/**
  * Truncates a string to `maxLen` characters, appending an ellipsis indicator
  * with the original length so the summarizer knows content was cut.
  */
@@ -343,9 +314,7 @@ function formatMessagesForSummarization(
  */
 export const DEFAULT_SUMMARIZATION_PROMPT = `Hold on, before you continue I need you to write me a checkpoint of everything so far. Your context window is filling up and this checkpoint replaces the messages above, so capture everything you need to pick right back up.
 
-Don't second-guess or fact-check anything you did, your tool results reflect exactly what happened. Just record what you did and what you observed.
-
-Give me two sections: a markdown checkpoint, then an <events> XML block. Only the checkpoint, don't respond to me or continue the conversation.
+Don't second-guess or fact-check anything you did, your tool results reflect exactly what happened. Just record what you did and what you observed. Only the checkpoint, don't respond to me or continue the conversation.
 
 ## Checkpoint
 
@@ -371,22 +340,10 @@ What you need to do next, in priority order.
 ## Critical Context
 Exact identifiers, names, error messages, URLs, and details you need to preserve verbatim.
 
-## Events
-
-After the markdown, give me an <events> block with key facts as XML entries. These persist exactly across checkpoints.
-
-<events>
-<event key="unique_key" turn="N">Exact value or short factual statement</event>
-</events>
-
-Use events for: URLs you visited, file paths you modified, values you computed, error messages you encountered, important tool results, configuration you set.
-Don't use events for: narrative, opinions, or general progress, that goes in the markdown.
-
 Rules:
 - Record what you did and observed, don't judge or re-evaluate it
 - For each tool call: the tool name, key inputs, and the outcome
 - Preserve exact identifiers, names, errors, and references verbatim
-- Summarize tool output in markdown; capture key values in events
 - Short declarative sentences
 - Skip empty sections`;
 
@@ -402,12 +359,6 @@ Keep it roughly the same length as your last checkpoint. Compress older details 
 
 Don't fact-check or second-guess anything, your tool results are ground truth. Only the checkpoint, don't respond to me or continue the conversation.
 
-For the <events> block:
-- Keep all existing events from <prior-events> unless they're no longer relevant
-- Add new events for facts you discovered in the new messages
-- Update event values when new information supersedes old
-- Same format: <event key="unique_key" turn="N">value</event>
-
 Rules:
 - Merge new progress into existing sections, don't duplicate headers
 - Compress older completed items into one-line entries
@@ -415,7 +366,6 @@ Rules:
 - Update "Next Steps" to reflect current priorities
 - For each new tool call: the tool name, key inputs, and the outcome
 - Preserve exact identifiers, names, errors, and references verbatim
-- Summarize tool output in markdown; capture key values in events
 - Skip empty sections`;
 
 /**
@@ -765,7 +715,6 @@ export function createSummarizeNode({
     // Check for a prior summary, either from a previous summarization within
     // this run or from a cross-run summary forwarded via initialSummary.
     const priorSummaryText = agentContext.getSummaryText()?.trim() ?? '';
-    const priorEventsXml = agentContext.formatEventsXml() || undefined;
 
     // ----- Enrich config with summarization metadata for Langfuse tracing -----
     // The strategies further add stage-specific metadata (single_pass, chunk, merge).
@@ -827,7 +776,6 @@ export function createSummarizeNode({
         promptText,
         updatePromptText,
         priorSummaryText,
-        priorEventsXml,
         config: summarizeConfig,
         streaming,
         stepId,
@@ -862,7 +810,6 @@ export function createSummarizeNode({
           budgetChars: Math.floor((maxInputTokens * 4) / 2),
           tokenCounter: agentContext.tokenCounter,
           provider: provider as Providers,
-          priorEventsXml,
         });
       } catch (err2) {
         // S2b: Log tier 2 failure, falling back to tier 3
@@ -900,18 +847,6 @@ export function createSummarizeNode({
 
     // ----- Enrich with structured data the LLM may have omitted -----
     summaryText = enrichSummary(summaryText, messagesToRefine);
-
-    // ----- Parse events from LLM output -----
-    const { markdown: cleanSummary, events: parsedEvents } =
-      parseEventsFromOutput(summaryText);
-
-    // Full compaction: the LLM sees the entire conversation and decides
-    // which events matter.  Replace events entirely rather than merging
-    // to prevent stale events from accumulating across compaction cycles.
-    agentContext.setSummaryEvents(parsedEvents);
-
-    // Use the clean markdown (events stripped) as the summary text
-    summaryText = cleanSummary;
 
     // ----- Finalize -----
     let tokenCount = 0;
@@ -1043,8 +978,6 @@ interface SummarizeParams {
   provider?: Providers;
   /** Key used for reasoning content in additional_kwargs. */
   reasoningKey?: 'reasoning_content' | 'reasoning';
-  /** XML string of prior events to inject when updating a summary. */
-  priorEventsXml?: string;
   /** Maximum input tokens per summarization pass. */
   maxInputTokens?: number;
 }
@@ -1207,7 +1140,6 @@ async function summarizeWithCacheHit({
   promptText,
   updatePromptText,
   priorSummaryText,
-  priorEventsXml,
   config,
   streaming,
   stepId,
@@ -1224,9 +1156,6 @@ async function summarizeWithCacheHit({
     instructionParts.push(
       `\n\n<previous-summary>\n${priorSummaryText}\n</previous-summary>`
     );
-  }
-  if (priorEventsXml != null && priorEventsXml !== '') {
-    instructionParts.push(`\n\n${priorEventsXml}`);
   }
 
   // Pass the raw conversation messages with instruction appended
@@ -1262,7 +1191,6 @@ async function summarizeSinglePass({
   budgetChars,
   provider,
   reasoningKey,
-  priorEventsXml,
   maxInputTokens: passedMaxInputTokens,
 }: SummarizeParams & { budgetChars?: number }): Promise<string> {
   const effectiveBudgetChars =
@@ -1305,11 +1233,7 @@ async function summarizeSinglePass({
   const summarySection = priorSummaryText
     ? `<previous-summary>\n${priorSummaryText}\n</previous-summary>\n\n`
     : '';
-  const eventsSection =
-    priorEventsXml != null && priorEventsXml !== ''
-      ? `\n\n${priorEventsXml}\n\n`
-      : '';
-  const humanMessageText = `${summarySection}${eventsSection}<conversation>\n${formattedText}\n</conversation>`;
+  const humanMessageText = `${summarySection}<conversation>\n${formattedText}\n</conversation>`;
 
   return streamAndCollect(
     model,

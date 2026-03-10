@@ -517,12 +517,9 @@ describe('createSummarizeNode', () => {
       } as never
     );
 
-    // Create context with a prior summary and events
+    // Create context with a prior summary
     const agentContext = createAgentContext();
     agentContext.setSummary('## Goal\nPrior summary content.', 50);
-    agentContext.setSummaryEvents(
-      new Map([['url_visited', { value: 'https://apple.com', turn: '1' }]])
-    );
 
     const graph = mockGraph();
     const node = createSummarizeNode({
