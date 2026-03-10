@@ -425,25 +425,19 @@ describe('AgentContext', () => {
       });
     });
 
-    it('shouldSkipSummarization returns true when per-run cap is reached', () => {
-      const ctx = createBasicContext({
-        agentConfig: { summarizationEnabled: true },
-      });
-      // Fire 3 summarizations (MAX_SUMMARIZATIONS_PER_RUN)
-      for (let i = 0; i < 3; i++) {
-        ctx.markSummarizationTriggered(i * 10);
-      }
-      expect(ctx.shouldSkipSummarization(30)).toBe(true);
-    });
-
-    it('shouldSkipSummarization returns true when no new messages since last summary', () => {
+    it('shouldSkipSummarization returns true when message count unchanged', () => {
       const ctx = createBasicContext({
         agentConfig: { summarizationEnabled: true },
       });
       ctx.markSummarizationTriggered(10);
-      // Same count — should skip (would produce identical summary)
       expect(ctx.shouldSkipSummarization(10)).toBe(true);
-      // Any new message — should allow
+    });
+
+    it('shouldSkipSummarization returns false with any new messages', () => {
+      const ctx = createBasicContext({
+        agentConfig: { summarizationEnabled: true },
+      });
+      ctx.markSummarizationTriggered(10);
       expect(ctx.shouldSkipSummarization(11)).toBe(false);
     });
 
@@ -452,6 +446,17 @@ describe('AgentContext', () => {
         agentConfig: { summarizationEnabled: true },
       });
       expect(ctx.shouldSkipSummarization(5)).toBe(false);
+    });
+
+    it('shouldSkipSummarization allows unlimited summarizations per run', () => {
+      const ctx = createBasicContext({
+        agentConfig: { summarizationEnabled: true },
+      });
+      for (let i = 0; i < 10; i++) {
+        ctx.markSummarizationTriggered(i * 5);
+      }
+      // Even after 10 summarizations, new messages allow another
+      expect(ctx.shouldSkipSummarization(50)).toBe(false);
     });
 
     it('rebuilds indexTokenCountMap from base map after reset', async () => {
@@ -907,7 +912,7 @@ describe('AgentContext', () => {
       return 0;
     };
 
-    it('setSummary increases instructionTokens and marks systemRunnable stale', () => {
+    it('mid-run setSummary does NOT increase instructionTokens', () => {
       const ctx = createBasicContext({
         agentConfig: { instructions: 'Be helpful.' },
         tokenCounter: charTokenCounter,
@@ -917,12 +922,12 @@ describe('AgentContext', () => {
       const baseInstructionTokens = ctx.instructionTokens;
       expect(baseInstructionTokens).toBeGreaterThan(0);
 
+      // Mid-run summary (not initial) — should NOT go into system prompt
       ctx.setSummary('User asked about math. Key results: 2+2=4, 3*5=15.', 50);
       expect(ctx.hasSummary()).toBe(true);
 
       void ctx.systemRunnable;
-      const postSummaryTokens = ctx.instructionTokens;
-      expect(postSummaryTokens).toBeGreaterThan(baseInstructionTokens);
+      expect(ctx.instructionTokens).toBe(baseInstructionTokens);
     });
 
     it('summary text appears in rebuilt system message', () => {
@@ -938,7 +943,7 @@ describe('AgentContext', () => {
       expect(runnable).toBeDefined();
     });
 
-    it('clearSummary restores instructionTokens to pre-summary level', () => {
+    it('clearSummary keeps instructionTokens unchanged (mid-run summary not in system prompt)', () => {
       const ctx = createBasicContext({
         agentConfig: { instructions: 'Be helpful.' },
         tokenCounter: charTokenCounter,
@@ -949,13 +954,12 @@ describe('AgentContext', () => {
 
       ctx.setSummary('Summary of the conversation so far.', 35);
       void ctx.systemRunnable;
-      const withSummaryTokens = ctx.instructionTokens;
-      expect(withSummaryTokens).toBeGreaterThan(baseTokens);
+      // Mid-run summary not in instruction tokens
+      expect(ctx.instructionTokens).toBe(baseTokens);
 
       ctx.clearSummary();
       void ctx.systemRunnable;
-      const afterClearTokens = ctx.instructionTokens;
-      expect(afterClearTokens).toBe(baseTokens);
+      expect(ctx.instructionTokens).toBe(baseTokens);
     });
 
     it('reset preserves durable summary and maintains token counts', () => {
@@ -1020,87 +1024,36 @@ describe('AgentContext', () => {
   });
 
   describe('shouldSkipSummarization — re-trigger after summary', () => {
-    it('allows re-summarization after rebuildTokenMapAfterSummarization sets new baseline', () => {
+    it('allows re-summarization after rebuildTokenMapAfterSummarization resets baseline', () => {
       const ctx = createBasicContext();
 
-      // First summarization triggers at message count 25
       expect(ctx.shouldSkipSummarization(25)).toBe(false);
       ctx.markSummarizationTriggered(25);
 
-      // Immediately after triggering, skip (no growth)
+      // Same count — skip
       expect(ctx.shouldSkipSummarization(25)).toBe(true);
 
-      // After summarization completes:
-      // 1. setSummary persists the summary
       ctx.setSummary('Summary of conversation', 100);
+      // Full compaction: empty state, baseline resets to 0
+      ctx.rebuildTokenMapAfterSummarization({});
 
-      // 2. rebuildTokenMapAfterSummarization sets the baseline to surviving context count
-      //    Simulate 4 surviving context messages
-      ctx.rebuildTokenMapAfterSummarization({ 0: 10, 1: 20, 2: 15, 3: 25 });
-
-      // Baseline is now 4 (surviving context count).
-      // Need MIN_MSG_GROWTH (4) new messages → count must reach 4 + 4 = 8
-      expect(ctx.shouldSkipSummarization(4)).toBe(true); // same as baseline
-      expect(ctx.shouldSkipSummarization(7)).toBe(true); // not enough growth
-      expect(ctx.shouldSkipSummarization(8)).toBe(false); // 4 new messages
-      expect(ctx.shouldSkipSummarization(10)).toBe(false); // plenty of growth
+      // Baseline is 0 after full compaction. Guard `_lastSummarizationMsgCount > 0`
+      // is false, so all counts are allowed.
+      expect(ctx.shouldSkipSummarization(0)).toBe(false);
+      expect(ctx.shouldSkipSummarization(1)).toBe(false);
     });
 
-    it('prevents immediate re-summarization of surviving context messages', () => {
+    it('allows summarization after full compaction resets to empty state', () => {
       const ctx = createBasicContext();
 
       ctx.markSummarizationTriggered(20);
       ctx.setSummary('Summary', 50);
-      ctx.rebuildTokenMapAfterSummarization({ 0: 100, 1: 200, 2: 150, 3: 250 });
+      ctx.rebuildTokenMapAfterSummarization({});
 
-      // The 4 surviving context messages should NOT trigger re-summarization
-      // even if they all land in messagesToRefine due to a large tool result
-      expect(ctx.shouldSkipSummarization(4)).toBe(true);
-    });
-
-    it('still respects per-run cap after baseline reset', () => {
-      const ctx = createBasicContext();
-
-      // Exhaust the per-run cap (MAX_SUMMARIZATIONS_PER_RUN = 3)
-      for (let i = 0; i < 3; i++) {
-        ctx.markSummarizationTriggered(10 + i * 5);
-        ctx.setSummary(`Summary ${i}`, 50);
-        ctx.rebuildTokenMapAfterSummarization({ 0: 10 });
-      }
-
-      // Even with a low baseline, the per-run cap is hit
-      expect(ctx.shouldSkipSummarization(100)).toBe(true);
-    });
-
-    it('uses higher MIN_MSG_GROWTH (8) for tool-enabled agents', () => {
-      const ctx = createBasicContext({
-        agentConfig: {
-          tools: [createMockTool('calculator')] as t.GraphTools,
-        },
-      });
-
-      ctx.markSummarizationTriggered(20);
-      ctx.setSummary('Summary', 50);
-      ctx.rebuildTokenMapAfterSummarization({ 0: 10, 1: 20, 2: 15, 3: 25 });
-
-      // Baseline is 4. With tools, MIN_MSG_GROWTH = 8.
-      // Need count >= 4 + 8 = 12 to re-trigger.
-      expect(ctx.shouldSkipSummarization(4)).toBe(true); // same as baseline
-      expect(ctx.shouldSkipSummarization(8)).toBe(true); // would pass with MIN=4, not MIN=8
-      expect(ctx.shouldSkipSummarization(11)).toBe(true); // still not enough
-      expect(ctx.shouldSkipSummarization(12)).toBe(false); // 8 new messages — triggers
-    });
-
-    it('uses lower MIN_MSG_GROWTH (4) for tool-free agents', () => {
-      const ctx = createBasicContext(); // no tools
-
-      ctx.markSummarizationTriggered(20);
-      ctx.setSummary('Summary', 50);
-      ctx.rebuildTokenMapAfterSummarization({ 0: 10, 1: 20, 2: 15, 3: 25 });
-
-      // Baseline is 4. Without tools, MIN_MSG_GROWTH = 4.
-      expect(ctx.shouldSkipSummarization(7)).toBe(true);
-      expect(ctx.shouldSkipSummarization(8)).toBe(false); // 4 new messages — triggers
+      // Baseline is 0 after full compaction. The guard `_lastSummarizationMsgCount > 0`
+      // is false, so summarization is always allowed — the model starts fresh.
+      expect(ctx.shouldSkipSummarization(0)).toBe(false);
+      expect(ctx.shouldSkipSummarization(1)).toBe(false);
     });
   });
 });

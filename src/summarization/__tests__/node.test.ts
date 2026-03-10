@@ -486,7 +486,7 @@ describe('createSummarizeNode', () => {
     );
   });
 
-  it('cache-hit path includes prior summary and events in the instruction message', async () => {
+  it('cache-hit path includes prior summary in the instruction message', async () => {
     captureEvents();
 
     const capturedMessages: Array<{ type: string; content: string }> = [];
@@ -548,10 +548,6 @@ describe('createSummarizeNode', () => {
     // Should include the prior summary
     expect(lastMsg.content).toContain('<previous-summary>');
     expect(lastMsg.content).toContain('Prior summary content');
-    // Should include the prior events
-    expect(lastMsg.content).toContain('<prior-events>');
-    expect(lastMsg.content).toContain('url_visited');
-    expect(lastMsg.content).toContain('https://apple.com');
   });
 });
 

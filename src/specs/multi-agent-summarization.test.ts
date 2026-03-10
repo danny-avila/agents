@@ -146,7 +146,6 @@ describe('Multi-agent summarization', () => {
         maxContextTokens: 600,
         summarizationEnabled: true,
         summarizationConfig: {
-          enabled: true,
           provider: Providers.OPENAI,
         },
       },
@@ -240,7 +239,6 @@ describe('Multi-agent summarization', () => {
         maxContextTokens: 600,
         summarizationEnabled: true,
         summarizationConfig: {
-          enabled: true,
           provider: Providers.OPENAI,
         },
       },
@@ -252,7 +250,6 @@ describe('Multi-agent summarization', () => {
         maxContextTokens: 600,
         summarizationEnabled: true,
         summarizationConfig: {
-          enabled: true,
           provider: Providers.OPENAI,
         },
       },
@@ -340,7 +337,6 @@ describe('Multi-agent summarization', () => {
         maxContextTokens: 600,
         summarizationEnabled: true,
         summarizationConfig: {
-          enabled: true,
           provider: Providers.OPENAI,
         },
       },
@@ -352,7 +348,6 @@ describe('Multi-agent summarization', () => {
         maxContextTokens: 100_000,
         summarizationEnabled: true,
         summarizationConfig: {
-          enabled: true,
           provider: Providers.OPENAI,
         },
       },

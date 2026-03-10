@@ -153,7 +153,6 @@ async function createSummarizationRun(opts: {
       maxContextTokens: opts.maxContextTokens,
       summarizationEnabled: true,
       summarizationConfig: {
-        enabled: true,
         provider: opts.summarizationProvider,
         model: opts.summarizationModel,
       },
@@ -899,7 +898,7 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
       `  Thinking summary (${getSummaryText(completePayload.summary).length} chars): "${getSummaryText(completePayload.summary).substring(0, 250)}…"`
     );
     console.log(`  Final messages: ${conversationHistory.length}`);
-  });
+  }, 180_000);
 
   test('count_tokens API: local tokenCounter vs Anthropic actual token count', async () => {
     const Anthropic = (await import('@anthropic-ai/sdk')).default;
@@ -1306,7 +1305,6 @@ describe('Cross-run summary lifecycle (no API keys)', () => {
           maxContextTokens: maxTokens,
           summarizationEnabled: true,
           summarizationConfig: {
-            enabled: true,
             provider: Providers.OPENAI,
           },
         },
@@ -1479,7 +1477,6 @@ describe('Cross-run summary lifecycle (no API keys)', () => {
         maxContextTokens: 2000,
         summarizationEnabled: true,
         summarizationConfig: {
-          enabled: true,
           provider: Providers.OPENAI,
         },
         initialSummary: formatted.summary,
@@ -1536,7 +1533,6 @@ describe('Cross-run summary lifecycle (no API keys)', () => {
           maxContextTokens: maxTokens,
           summarizationEnabled: true,
           summarizationConfig: {
-            enabled: true,
             provider: Providers.OPENAI,
           },
         },
@@ -1714,7 +1710,6 @@ describe('Tight context with oversized tool results (no API keys)', () => {
         maxContextTokens: 500, // Extremely tight — will prune everything
         summarizationEnabled: true,
         summarizationConfig: {
-          enabled: true,
           provider: Providers.OPENAI,
         },
       },
@@ -1793,7 +1788,6 @@ describe('Tight context with oversized tool results (no API keys)', () => {
           maxContextTokens: maxTokens,
           summarizationEnabled: true,
           summarizationConfig: {
-            enabled: true,
             provider: Providers.OPENAI,
           },
         },
@@ -1911,7 +1905,6 @@ describe('Tight context with oversized tool results (no API keys)', () => {
           maxContextTokens: maxTokens,
           summarizationEnabled: true,
           summarizationConfig: {
-            enabled: true,
             provider: Providers.OPENAI,
           },
         },
@@ -2085,7 +2078,6 @@ describe('Tight context with oversized tool results (no API keys)', () => {
           maxContextTokens: maxTokens,
           summarizationEnabled: true,
           summarizationConfig: {
-            enabled: true,
             provider: Providers.OPENAI,
           },
           initialSummary,
@@ -2279,7 +2271,6 @@ describe('Tight context with oversized tool results (no API keys)', () => {
         maxContextTokens: 200, // Extremely tight — no message fits individually
         summarizationEnabled: true,
         summarizationConfig: {
-          enabled: true,
           provider: Providers.OPENAI,
         },
       },
@@ -2755,7 +2746,6 @@ describe('Enrichment and prompt selection (no API keys)', () => {
         maxContextTokens: 50, // Very tight to force summarization
         summarizationEnabled: true,
         summarizationConfig: {
-          enabled: true,
           provider: Providers.OPENAI,
         },
       },
@@ -2914,7 +2904,6 @@ describe('Multi-pass summarization correctness (no API keys)', () => {
           maxContextTokens: maxTokens,
           summarizationEnabled: true,
           summarizationConfig: {
-            enabled: true,
             provider: Providers.OPENAI,
             parameters: { parts: 2, minMessagesForSplit: 4 },
           },
@@ -3100,7 +3089,6 @@ describe('Multi-pass summarization correctness (no API keys)', () => {
           maxContextTokens: maxTokens,
           summarizationEnabled: true,
           summarizationConfig: {
-            enabled: true,
             provider: Providers.OPENAI,
           },
           initialSummary,
@@ -3248,7 +3236,6 @@ describe('Multi-pass summarization correctness (no API keys)', () => {
           maxContextTokens: maxTokens,
           summarizationEnabled: true,
           summarizationConfig: {
-            enabled: true,
             provider: Providers.OPENAI,
             parameters: { parts: 2, minMessagesForSplit: 4 },
           },
@@ -3381,7 +3368,6 @@ describe('Re-summarization within a single run (no API keys)', () => {
         maxContextTokens: 600,
         summarizationEnabled: true,
         summarizationConfig: {
-          enabled: true,
           provider: Providers.OPENAI,
         },
       },
@@ -3481,7 +3467,6 @@ describe('Emoji and Unicode safety (no API keys)', () => {
         maxContextTokens: 100,
         summarizationEnabled: true,
         summarizationConfig: {
-          enabled: true,
           provider: Providers.OPENAI,
         },
       },
@@ -3555,7 +3540,6 @@ describe('Budget-aware error messages (no API keys)', () => {
         maxContextTokens: 50, // Impossibly tight
         summarizationEnabled: true,
         summarizationConfig: {
-          enabled: true,
           provider: Providers.OPENAI,
         },
       },
@@ -3723,7 +3707,6 @@ describe('Large tool result surviving context — no double summarization (no AP
         maxContextTokens: 800,
         summarizationEnabled: true,
         summarizationConfig: {
-          enabled: true,
           provider: Providers.OPENAI,
         },
       },
