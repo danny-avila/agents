@@ -1,24 +1,23 @@
 import { Tokenizer } from 'ai-tokenizer';
-import * as o200k_base from 'ai-tokenizer/encoding/o200k_base';
-import * as claude from 'ai-tokenizer/encoding/claude';
 import type { BaseMessage } from '@langchain/core/messages';
 import { ContentTypes } from '@/common/enum';
 
 export type EncodingName = 'o200k_base' | 'claude';
 
-const encodingMap = {
-  o200k_base,
-  claude,
-} as const;
-
 const tokenizers: Partial<Record<EncodingName, Tokenizer>> = {};
 
-function getTokenizer(encoding: EncodingName = 'o200k_base'): Tokenizer {
+async function getTokenizer(
+  encoding: EncodingName = 'o200k_base'
+): Promise<Tokenizer> {
   const cached = tokenizers[encoding];
   if (cached) {
     return cached;
   }
-  const instance = new Tokenizer(encodingMap[encoding]);
+  const data =
+    encoding === 'claude'
+      ? await import('ai-tokenizer/encoding/claude')
+      : await import('ai-tokenizer/encoding/o200k_base');
+  const instance = new Tokenizer(data);
   tokenizers[encoding] = instance;
   return instance;
 }
@@ -90,12 +89,12 @@ export function getTokenCountForMessage(
 
 /**
  * Creates a token counter function using the specified encoding.
- * Kept async for backward compatibility with callers that await this function.
+ * Lazily loads the encoding data on first use via dynamic import.
  */
 export const createTokenCounter = async (
   encoding: EncodingName = 'o200k_base'
 ): Promise<(message: BaseMessage) => number> => {
-  const tok = getTokenizer(encoding);
+  const tok = await getTokenizer(encoding);
   const countTokens = (text: string): number => tok.count(text);
   return (message: BaseMessage): number =>
     getTokenCountForMessage(message, countTokens);
