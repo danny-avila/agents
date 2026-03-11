@@ -285,14 +285,13 @@ export function createSummarizeNode({
       clientOptions.modelName = modelName;
     }
 
-    const DEFAULT_MAX_SUMMARY_TOKENS = 2048;
     const effectiveMaxSummaryTokens =
-      paramMaxSummaryTokens ??
-      summarizationConfig?.maxSummaryTokens ??
-      DEFAULT_MAX_SUMMARY_TOKENS;
+      paramMaxSummaryTokens ?? summarizationConfig?.maxSummaryTokens;
 
-    clientOptions[getMaxOutputTokensKey(provider as string)] =
-      effectiveMaxSummaryTokens;
+    if (effectiveMaxSummaryTokens != null) {
+      clientOptions[getMaxOutputTokensKey(provider as string)] =
+        effectiveMaxSummaryTokens;
+    }
 
     const runnableConfig = config ?? graph.config;
 
@@ -414,6 +413,23 @@ export function createSummarizeNode({
         usePromptCache: isSelfSummarizeModel && hasPromptCache,
       });
     } catch (primaryError) {
+      emitAgentLog(
+        runnableConfig,
+        'error',
+        'summarize',
+        'Summarization LLM call failed',
+        {
+          error:
+            primaryError instanceof Error
+              ? primaryError.message
+              : String(primaryError),
+          provider: provider as string,
+          model: modelName,
+          messagesToRefineCount: messagesToRefine.length,
+        },
+        { runId: graph.runId, agentId: request.agentId }
+      );
+
       const fallbacks =
         (clientOptions as unknown as t.LLMConfig | undefined)?.fallbacks ?? [];
       if (fallbacks.length > 0) {

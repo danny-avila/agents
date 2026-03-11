@@ -43,7 +43,7 @@ export class Run<_T extends t.BaseGraphState> {
   private tokenCounter?: t.TokenCounter;
   private handlerRegistry?: HandlerRegistry;
   private indexTokenCountMap?: Record<string, number>;
-  private calibrationRatio?: number;
+  calibrationRatio: number = 1;
   graphRunnable?: t.CompiledStateWorkflow;
   Graph: StandardGraph | MultiAgentGraph | undefined;
   returnContent: boolean = false;
@@ -58,7 +58,9 @@ export class Run<_T extends t.BaseGraphState> {
     this.id = runId;
     this.tokenCounter = config.tokenCounter;
     this.indexTokenCountMap = config.indexTokenCountMap;
-    this.calibrationRatio = config.calibrationRatio;
+    if (config.calibrationRatio != null && config.calibrationRatio > 0) {
+      this.calibrationRatio = config.calibrationRatio;
+    }
 
     const handlerRegistry = new HandlerRegistry();
 
@@ -190,7 +192,7 @@ export class Run<_T extends t.BaseGraphState> {
   }
 
   getCalibrationRatio(): number {
-    return this.Graph?.getCalibrationRatio() ?? 1;
+    return this.calibrationRatio;
   }
 
   /**
@@ -376,9 +378,13 @@ export class Run<_T extends t.BaseGraphState> {
       ? this.Graph.getContentParts()
       : undefined;
 
+    const calibrationRatio = this.Graph.getCalibrationRatio();
+
     if (!this.skipCleanup) {
       this.Graph.clearHeavyState();
     }
+
+    this.calibrationRatio = calibrationRatio;
     return result;
   }
 

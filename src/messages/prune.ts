@@ -1245,12 +1245,15 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         outputTokensAssigned = true;
       } else {
         const rawCount = factoryParams.tokenCounter(message);
-        // Apply the running calibration ratio to new messages so they
-        // benefit from prior provider feedback, even on turns without
-        // usage_metadata.
-        indexTokenCountMap[i] = Math.round(rawCount * lastCalibrationRatio);
+        // When currentUsage is available, store the raw count — the
+        // calibration block below will scale all messages uniformly.
+        // Only apply the running EMA when there's no provider feedback
+        // this turn, so new messages still benefit from prior calibration.
         if (currentUsage) {
+          indexTokenCountMap[i] = rawCount;
           newOutputs.add(i);
+        } else {
+          indexTokenCountMap[i] = Math.round(rawCount * lastCalibrationRatio);
         }
         totalTokens += indexTokenCountMap[i] ?? 0;
       }

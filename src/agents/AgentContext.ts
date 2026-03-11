@@ -939,7 +939,7 @@ export class AgentContext {
     };
     this.totalTokensFresh = true;
 
-    if (totalInputTokens > 0 && !cacheRead) {
+    if (totalInputTokens > 0) {
       let messageTokens = 0;
       for (const val of Object.values(this.indexTokenCountMap)) {
         messageTokens += val ?? 0;
