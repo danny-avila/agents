@@ -165,9 +165,11 @@ describe('pruneMessages ratio-based token grounding', () => {
 
     const result = pruneMessages({ messages, usageMetadata });
 
-    const totalUsage = 50 + 40;
+    // Calibration uses input_tokens only (no output), minus instruction overhead (0 here).
+    // providerMessageTokens = input_tokens - instructionOverhead = 50 - 0 = 50
+    // ratio = providerMessageTokens / messageTokenSum = 50 / 60 = 0.833
     const originalTotal = 10 + 20 + 30;
-    const expectedRatio = totalUsage / originalTotal;
+    const expectedRatio = 50 / originalTotal;
 
     expect(result.indexTokenCountMap[0]).toBe(Math.round(10 * expectedRatio));
     expect(result.indexTokenCountMap[1]).toBe(Math.round(20 * expectedRatio));
@@ -252,6 +254,10 @@ describe('pruneMessages ratio-based token grounding', () => {
       indexTokenCountMap,
     });
 
+    // Anthropic: cache_read (15) + cache_creation (10) = 25 > input_tokens (30)?
+    // No, 25 < 30, so NOT additive. totalInput = 30.
+    // providerMessageTokens = 30 - 0 (no instruction overhead) = 30.
+    // ratio = 30 / 60 = 0.5 — safe (>= 1/3, <= 2.5).
     const usageMetadata: Partial<UsageMetadata> = {
       input_tokens: 30,
       output_tokens: 20,
@@ -261,9 +267,8 @@ describe('pruneMessages ratio-based token grounding', () => {
       },
     };
 
-    const totalUsage = 30 + 15 + 10 + 20;
     const originalTotal = 10 + 20 + 30;
-    const expectedRatio = totalUsage / originalTotal;
+    const expectedRatio = 30 / originalTotal;
 
     const result = pruneMessages({ messages, usageMetadata });
 
@@ -300,10 +305,12 @@ describe('pruneMessages ratio-based token grounding', () => {
     expect(result.indexTokenCountMap[1]).toBeDefined();
     expect(result.indexTokenCountMap[1] as number).toBeGreaterThan(0);
 
+    // index[1] is the AI response at startIndex — assigned output_tokens (25).
+    // Calibration: providerMessageTokens = input_tokens (20) - overhead (0) = 20.
+    // messageTokenSum = index[0] (15) + index[1] is newOutput so excluded = 15.
+    // ratio = 20 / 15 = 1.33 — safe.
     const preRatioIndex0 = 15;
-    const preRatioIndex1 = 25;
-    const totalUsage = 20 + 25;
-    const ratio = totalUsage / (preRatioIndex0 + preRatioIndex1);
+    const ratio = 20 / preRatioIndex0;
     const isRatioSafe = ratio >= 1 / 3 && ratio <= 2.5;
 
     if (isRatioSafe) {

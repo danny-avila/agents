@@ -912,7 +912,7 @@ describe('AgentContext', () => {
       return 0;
     };
 
-    it('mid-run setSummary does NOT increase instructionTokens', () => {
+    it('mid-run setSummary increases instructionTokens by the summary token count', () => {
       const ctx = createBasicContext({
         agentConfig: { instructions: 'Be helpful.' },
         tokenCounter: charTokenCounter,
@@ -922,12 +922,13 @@ describe('AgentContext', () => {
       const baseInstructionTokens = ctx.instructionTokens;
       expect(baseInstructionTokens).toBeGreaterThan(0);
 
-      // Mid-run summary (not initial) — should NOT go into system prompt
+      // Mid-run summary is injected as HumanMessage but still counts as
+      // instruction overhead so the pruner reserves budget for it.
       ctx.setSummary('User asked about math. Key results: 2+2=4, 3*5=15.', 50);
       expect(ctx.hasSummary()).toBe(true);
 
       void ctx.systemRunnable;
-      expect(ctx.instructionTokens).toBe(baseInstructionTokens);
+      expect(ctx.instructionTokens).toBe(baseInstructionTokens + 50);
     });
 
     it('summary text appears in rebuilt system message', () => {
@@ -943,7 +944,7 @@ describe('AgentContext', () => {
       expect(runnable).toBeDefined();
     });
 
-    it('clearSummary keeps instructionTokens unchanged (mid-run summary not in system prompt)', () => {
+    it('clearSummary removes summary overhead from instructionTokens', () => {
       const ctx = createBasicContext({
         agentConfig: { instructions: 'Be helpful.' },
         tokenCounter: charTokenCounter,
@@ -954,8 +955,7 @@ describe('AgentContext', () => {
 
       ctx.setSummary('Summary of the conversation so far.', 35);
       void ctx.systemRunnable;
-      // Mid-run summary not in instruction tokens
-      expect(ctx.instructionTokens).toBe(baseTokens);
+      expect(ctx.instructionTokens).toBe(baseTokens + 35);
 
       ctx.clearSummary();
       void ctx.systemRunnable;

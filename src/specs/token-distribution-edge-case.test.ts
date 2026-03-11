@@ -116,18 +116,17 @@ describe('Token Distribution Edge Case Tests', () => {
 
     expect(atLeastOnePrunedMessageUnchanged).toBe(true);
 
-    // Verify that the sum of tokens for messages in the context is close to the total_tokens from usageMetadata
-    // There might be small rounding differences or implementation details that affect the exact sum
+    // Calibration uses input_tokens (30) only (no output), minus instruction overhead (0).
+    // Context messages: indices 0, 3, 4 → sum 17+9+10=36. ratio = 30/36 = 0.83.
+    // Calibrated sum should approximate input_tokens (30).
     const totalContextTokens =
       (result.indexTokenCountMap[0] ?? 0) +
       (result.indexTokenCountMap[3] ?? 0) +
       (result.indexTokenCountMap[4] ?? 0);
     expect(totalContextTokens).toBeGreaterThan(0);
 
-    // The key thing we're testing is that the token distribution happens for messages in the context
-    // and that the sum is reasonably close to the expected total
-    const tokenDifference = Math.abs(totalContextTokens - 50);
-    expect(tokenDifference).toBeLessThan(20); // Allow for some difference due to implementation details
+    const tokenDifference = Math.abs(totalContextTokens - 30);
+    expect(tokenDifference).toBeLessThan(5);
   });
 
   it('should handle the case when all messages fit within the token limit', () => {
@@ -175,12 +174,12 @@ describe('Token Distribution Edge Case Tests', () => {
       usageMetadata,
     });
 
-    // Since all messages fit, all token counts should be adjusted
+    // Calibration uses input_tokens (20) only, minus instruction overhead (0).
+    // messageTokenSum = 17 + 9 + 10 = 36. ratio = 20/36 = 0.556. Safe.
     const initialTotalTokens =
       indexTokenCountMap[0] + indexTokenCountMap[1] + indexTokenCountMap[2];
-    const expectedRatio = 30 / initialTotalTokens;
+    const expectedRatio = 20 / initialTotalTokens;
 
-    // Check that all token counts were adjusted
     expect(result.indexTokenCountMap[0]).toBe(
       Math.round(indexTokenCountMap[0] * expectedRatio)
     );
@@ -191,12 +190,12 @@ describe('Token Distribution Edge Case Tests', () => {
       Math.round(indexTokenCountMap[2] * expectedRatio)
     );
 
-    // Verify that the sum of all tokens equals the total_tokens from usageMetadata
+    // Calibrated sum should approximate input_tokens (20)
     const totalTokens =
       (result.indexTokenCountMap[0] ?? 0) +
       (result.indexTokenCountMap[1] ?? 0) +
       (result.indexTokenCountMap[2] ?? 0);
-    expect(totalTokens).toBe(30);
+    expect(totalTokens).toBe(20);
   });
 
   it('should handle multiple pruning operations with token redistribution', () => {

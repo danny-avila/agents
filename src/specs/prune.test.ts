@@ -545,12 +545,13 @@ describe('Prune Messages Tests', () => {
       // The function should have updated the indexTokenCountMap based on the usage metadata
       expect(result.indexTokenCountMap).not.toEqual(indexTokenCountMap);
 
-      // The total of all values in indexTokenCountMap should equal the total_tokens from usageMetadata
+      // Calibration uses input_tokens (50) only — output_tokens are excluded from the ratio.
+      // The calibrated message sum should approximate input_tokens.
       const totalTokens = Object.values(result.indexTokenCountMap).reduce(
         (a = 0, b = 0) => a + b,
         0
       );
-      expect(totalTokens).toBe(75);
+      expect(totalTokens).toBe(50);
     });
   });
 
