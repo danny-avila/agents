@@ -11,6 +11,7 @@ import type { RunnableConfig, Runnable } from '@langchain/core/runnables';
 import type * as t from '@/types';
 import type { createPruneMessages } from '@/messages';
 import { createSchemaOnlyTools } from '@/tools/schema';
+import { addCacheControl } from '@/messages/cache';
 import { ContentTypes, Providers } from '@/common';
 import { DEFAULT_RESERVE_RATIO } from '@/messages';
 import { toJsonSchema } from '@/utils/schema';
@@ -528,11 +529,13 @@ export class AgentContext {
     let finalInstructions: string | BaseMessageFields = instructionsString;
 
     // Handle Anthropic prompt caching
+    let usePromptCache = false;
     if (this.provider === Providers.ANTHROPIC) {
       const anthropicOptions = this.clientOptions as
         | t.AnthropicClientOptions
         | undefined;
       if (anthropicOptions?.promptCache === true) {
+        usePromptCache = true;
         finalInstructions = {
           content: [
             {
@@ -558,18 +561,40 @@ export class AgentContext {
     return RunnableLambda.from((messages: BaseMessage[]) => {
       const prefix: BaseMessage[] = systemMessage ? [systemMessage] : [];
 
-      // Post-compaction clean slate: inject the summary as a HumanMessage
-      // so the model picks up where it left off.  The summary competes for
-      // message budget rather than permanently reducing the instruction
-      // ceiling.
-      if (
+      // Build the non-system portion (summary + conversation), then apply
+      // cache markers separately so addCacheControl doesn't strip the
+      // SystemMessage's own cache_control breakpoint set above.
+      const hasSummaryBody =
         this._summaryLocation === 'user_message' &&
         this.summaryText != null &&
-        this.summaryText !== ''
-      ) {
-        return [...prefix, new HumanMessage(this.summaryText), ...messages];
+        this.summaryText !== '';
+
+      let body: BaseMessage[];
+      if (hasSummaryBody) {
+        // When prompt caching is active, add cache_control directly to the
+        // summary HumanMessage.  This ensures caching works even on
+        // clean-slate calls where the summary is the only message
+        // (addCacheControl requires >= 2 messages to activate).
+        const summaryMsg = usePromptCache
+          ? new HumanMessage({
+            content: [
+              {
+                type: 'text',
+                text: this.summaryText as string,
+                cache_control: { type: 'ephemeral' },
+              },
+            ],
+          })
+          : new HumanMessage(this.summaryText as string);
+        body = [summaryMsg, ...messages];
+      } else {
+        body = messages;
       }
-      return [...prefix, ...messages];
+
+      if (usePromptCache && body.length >= 2) {
+        body = addCacheControl(body);
+      }
+      return [...prefix, ...body];
     }).withConfig({ runName: 'prompt' });
   }
 
@@ -918,25 +943,35 @@ export class AgentContext {
         messageTokens += val ?? 0;
       }
       const providerInstructionTokens = totalInputTokens - messageTokens;
+      if (providerInstructionTokens <= 0) {
+        return;
+      }
+
+      const gap = providerInstructionTokens - this.instructionTokens;
 
       if (!this._toolTokensCalibrated && this.toolSchemaTokens > 0) {
-        if (providerInstructionTokens > this.instructionTokens) {
-          this.toolSchemaTokens +=
-            providerInstructionTokens - this.instructionTokens;
-        }
+        // First calibration: adjust tool schema tokens to match provider.
+        this.toolSchemaTokens = Math.max(0, this.toolSchemaTokens + gap);
         this._toolTokensCalibrated = true;
-      } else if (
-        this._toolTokensCalibrated &&
-        this.summaryTokenCount > 0 &&
-        providerInstructionTokens > this.instructionTokens
-      ) {
-        // After tool calibration, any remaining instruction-token gap is
-        // likely from summary underestimation.  Adjust summary token count
-        // so getInstructionTokens() (and thus the pruner's budget) reflects
-        // the provider's actual overhead.
-        const gap = providerInstructionTokens - this.instructionTokens;
-        this.summaryTokenCount += gap;
-        this._durableSummaryTokenCount = this.summaryTokenCount;
+      } else if (this._toolTokensCalibrated && Math.abs(gap) > 0) {
+        // Subsequent calibrations: apply a dampened adjustment (30% of gap)
+        // to avoid oscillation.  The instruction overhead estimate is derived
+        // from provider_input - message_estimate, so it's sensitive to message
+        // token errors.  Full-gap swings cause wild oscillation when message
+        // calibration and instruction calibration correct in alternating turns.
+        const dampened = Math.round(gap * 0.3);
+        if (dampened === 0) {
+          return;
+        }
+        if (this.summaryTokenCount > 0) {
+          this.summaryTokenCount = Math.max(
+            0,
+            this.summaryTokenCount + dampened
+          );
+          this._durableSummaryTokenCount = this.summaryTokenCount;
+        } else {
+          this.toolSchemaTokens = Math.max(0, this.toolSchemaTokens + dampened);
+        }
       }
     }
   }

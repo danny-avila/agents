@@ -754,10 +754,17 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }
 
       if (agentContext.provider === Providers.ANTHROPIC) {
+        // When a system runnable exists, addCacheControl runs inside
+        // it where the full array (system + summary + messages) is
+        // visible.  Only apply it here as a fallback when there is no
+        // system runnable (rare — means no instructions and no summary).
         const anthropicOptions = agentContext.clientOptions as
           | t.AnthropicClientOptions
           | undefined;
-        if (anthropicOptions?.promptCache === true) {
+        if (
+          anthropicOptions?.promptCache === true &&
+          !agentContext.systemRunnable
+        ) {
           finalMessages = addCacheControl<BaseMessage>(finalMessages);
         }
       } else if (agentContext.provider === Providers.BEDROCK) {

@@ -13,6 +13,7 @@ import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { createRemoveAllMessage } from '@/messages/reducer';
 import { getMaxOutputTokensKey } from '@/llm/request';
+import { addCacheControl } from '@/messages/cache';
 import { initializeModel } from '@/llm/init';
 import { getChunkContent } from '@/stream';
 
@@ -356,15 +357,39 @@ export function createSummarizeNode({
     let summaryText = '';
     const messagesToRefine = request.messagesToRefine;
 
+    const isSelfSummarizeModel = provider === agentContext.provider;
+    const hasPromptCache =
+      isSelfSummarizeModel &&
+      (agentContext.clientOptions as Record<string, unknown> | undefined)
+        ?.promptCache === true;
+
+    // Count cache_control markers already present on the messages
+    let existingCacheMarkers = 0;
+    for (const msg of messagesToRefine) {
+      const c = msg.content;
+      if (Array.isArray(c)) {
+        for (const block of c as Array<Record<string, unknown>>) {
+          if (block.cache_control != null) {
+            existingCacheMarkers++;
+          }
+        }
+      }
+    }
+
     emitAgentLog(
       runnableConfig,
-      'info',
+      'debug',
       'summarize',
       'Summarization starting',
       {
         messagesToRefineCount: messagesToRefine.length,
         hasPriorSummary: priorSummaryText !== '',
         summaryVersion: agentContext.summaryVersion + 1,
+        isSelfSummarize: isSelfSummarizeModel,
+        hasPromptCache,
+        existingCacheMarkers,
+        provider: provider as string,
+        agentProvider: agentContext.provider,
       },
       { runId: graph.runId, agentId: request.agentId }
     );
@@ -386,6 +411,7 @@ export function createSummarizeNode({
         stepId,
         provider: provider as Providers,
         reasoningKey: agentContext.reasoningKey,
+        usePromptCache: isSelfSummarizeModel && hasPromptCache,
       });
     } catch (primaryError) {
       const fallbacks =
@@ -648,6 +674,7 @@ async function summarizeWithCacheHit({
   stepId,
   provider,
   reasoningKey,
+  usePromptCache,
 }: {
   model: t.ChatModel;
   messages: BaseMessage[];
@@ -658,6 +685,7 @@ async function summarizeWithCacheHit({
   stepId?: string;
   provider: Providers;
   reasoningKey?: 'reasoning_content' | 'reasoning';
+  usePromptCache?: boolean;
 }): Promise<string> {
   const instruction = buildSummarizationInstruction(
     promptText,
@@ -665,10 +693,19 @@ async function summarizeWithCacheHit({
     priorSummaryText
   );
 
+  // Apply cache markers to the full message array (conversation + instruction)
+  // so the summarizer benefits from the cached prefix established by the
+  // agent's prior calls.  The instruction HumanMessage becomes the last user
+  // message and gets a cache breakpoint, while earlier conversation messages
+  // form the cached prefix.
+  const fullMessages = [...messages, new HumanMessage(instruction)];
+  const invokeMessages =
+    usePromptCache === true ? addCacheControl(fullMessages) : fullMessages;
+
   const result = await attemptInvoke(
     {
       model,
-      messages: [...messages, new HumanMessage(instruction)],
+      messages: invokeMessages,
       provider,
       onChunk: createSummarizationChunkHandler({
         stepId,
