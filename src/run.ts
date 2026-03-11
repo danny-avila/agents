@@ -166,12 +166,11 @@ export class Run<_T extends t.BaseGraphState> {
   ): Promise<Run<T>> {
     /** Create tokenCounter if indexTokenCountMap is provided but tokenCounter is not */
     if (config.indexTokenCountMap && !config.tokenCounter) {
-      const firstAgent = (
-        config.graphConfig as Partial<t.StandardGraphConfig> | undefined
-      )?.agents?.[0];
-      const opts = firstAgent?.clientOptions as { model?: string } | undefined;
-      const encoding = encodingForModel(opts?.model ?? '');
-      config.tokenCounter = await createTokenCounter(encoding);
+      const gc = config.graphConfig;
+      const clientOpts =
+        'agents' in gc ? gc.agents[0]?.clientOptions : gc.clientOptions;
+      const model = (clientOpts as { model?: string } | undefined)?.model ?? '';
+      config.tokenCounter = await createTokenCounter(encodingForModel(model));
     }
     return new Run<T>(config);
   }

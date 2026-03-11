@@ -108,10 +108,12 @@ export const TokenEncoderManager = {
   },
 
   reset(): void {
-    // No-op: ai-tokenizer has no mutable state to reset.
+    for (const key of Object.keys(tokenizers)) {
+      delete tokenizers[key as EncodingName];
+    }
   },
 
   isInitialized(): boolean {
-    return true;
+    return Object.keys(tokenizers).length > 0;
   },
 };
