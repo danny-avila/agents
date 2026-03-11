@@ -25,8 +25,7 @@ async function testParallelFromStart() {
   console.log('Testing Parallel From Start Multi-Agent System...\n');
 
   // Set up content aggregator
-  const { contentParts, aggregateContent, contentMetadataMap } =
-    createContentAggregator();
+  const { contentParts, aggregateContent, stepMap } = createContentAggregator();
 
   // Define two agents - both have NO incoming edges, so they run in parallel from the start
   const agents: t.AgentInputs[] = [
@@ -253,8 +252,8 @@ async function testParallelFromStart() {
     console.log('Final content parts:', contentParts.length, 'parts');
     console.log('\n=== Content Parts (clean, no metadata) ===');
     console.dir(contentParts, { depth: null });
-    console.log('\n=== Content Metadata Map (separate from content) ===');
-    console.dir(Object.fromEntries(contentMetadataMap), { depth: null });
+    console.log('\n=== Step Map (separate from content) ===');
+    console.dir(Object.fromEntries(stepMap), { depth: null });
 
     await sleep(3000);
   } catch (error) {

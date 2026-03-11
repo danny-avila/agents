@@ -1,3 +1,4 @@
+// @ts-nocheck — example script; @/tools/example module does not exist in the current codebase
 // src/scripts/cli.ts
 import { config } from 'dotenv';
 config();

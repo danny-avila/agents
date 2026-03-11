@@ -9,13 +9,13 @@
  */
 import { config } from 'dotenv';
 config();
-import { HumanMessage } from '@langchain/core/messages';
-import type { AIMessageChunk } from '@langchain/core/messages';
 import { concat } from '@langchain/core/utils/stream';
+import { HumanMessage } from '@langchain/core/messages';
 import {
-  ConverseStreamCommand,
   BedrockRuntimeClient,
+  ConverseStreamCommand,
 } from '@aws-sdk/client-bedrock-runtime';
+import type { AIMessageChunk } from '@langchain/core/messages';
 import { CustomChatBedrockConverse } from '@/llm/bedrock';
 
 const region = process.env.BEDROCK_AWS_REGION ?? 'us-east-1';
@@ -62,12 +62,12 @@ async function rawSdkCall(): Promise<void> {
         console.log('\nSpecific cache fields:');
         console.log(
           '  cacheReadInputTokens:',
-          (event.metadata.usage as Record<string, unknown>)
+          (event.metadata.usage as unknown as Record<string, unknown>)
             ?.cacheReadInputTokens
         );
         console.log(
           '  cacheWriteInputTokens:',
-          (event.metadata.usage as Record<string, unknown>)
+          (event.metadata.usage as unknown as Record<string, unknown>)
             ?.cacheWriteInputTokens
         );
       }
@@ -98,12 +98,12 @@ async function rawSdkCall(): Promise<void> {
         console.log('\nSpecific cache fields:');
         console.log(
           '  cacheReadInputTokens:',
-          (event.metadata.usage as Record<string, unknown>)
+          (event.metadata.usage as unknown as Record<string, unknown>)
             ?.cacheReadInputTokens
         );
         console.log(
           '  cacheWriteInputTokens:',
-          (event.metadata.usage as Record<string, unknown>)
+          (event.metadata.usage as unknown as Record<string, unknown>)
             ?.cacheWriteInputTokens
         );
       }
@@ -177,17 +177,17 @@ async function wrapperStreamCallWithCachePoint(): Promise<void> {
         const chunk = handleConverseStreamMetadata(event.metadata, {
           streamUsage: true,
         });
+        const msg = chunk.message as AIMessageChunk;
         console.log(
           'handleConverseStreamMetadata output usage_metadata:',
-          JSON.stringify(chunk.message.usage_metadata)
+          JSON.stringify(msg.usage_metadata)
         );
 
-        const hasDetails =
-          chunk.message.usage_metadata?.input_token_details != null;
+        const hasDetails = msg.usage_metadata?.input_token_details != null;
         console.log(
           `Has input_token_details: ${hasDetails}`,
           hasDetails
-            ? JSON.stringify(chunk.message.usage_metadata!.input_token_details)
+            ? JSON.stringify(msg.usage_metadata!.input_token_details)
             : '(MISSING - BUG!)'
         );
       }
@@ -216,17 +216,17 @@ async function wrapperStreamCallWithCachePoint(): Promise<void> {
         const chunk = handleConverseStreamMetadata(event.metadata, {
           streamUsage: true,
         });
+        const msg = chunk.message as AIMessageChunk;
         console.log(
           'handleConverseStreamMetadata output usage_metadata:',
-          JSON.stringify(chunk.message.usage_metadata)
+          JSON.stringify(msg.usage_metadata)
         );
 
-        const hasDetails =
-          chunk.message.usage_metadata?.input_token_details != null;
+        const hasDetails = msg.usage_metadata?.input_token_details != null;
         console.log(
           `Has input_token_details: ${hasDetails}`,
           hasDetails
-            ? JSON.stringify(chunk.message.usage_metadata!.input_token_details)
+            ? JSON.stringify(msg.usage_metadata!.input_token_details)
             : '(MISSING - BUG!)'
         );
       }

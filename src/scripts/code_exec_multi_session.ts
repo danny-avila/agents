@@ -44,8 +44,8 @@ function printSessionContext(run: Run<t.IState>, label: string): void {
   }
 
   console.log(`  Latest session_id: ${session.session_id}`);
-  console.log(`  Files tracked: ${session.files.length}`);
-  for (const file of session.files) {
+  console.log(`  Files tracked: ${session.files?.length ?? 0}`);
+  for (const file of session.files ?? []) {
     console.log(`    - ${file.name} (session: ${file.session_id})`);
   }
 }
@@ -199,25 +199,20 @@ Tell me what version it shows.
     | undefined;
 
   if (finalSession) {
-    const uniqueSessionIds = new Set(
-      finalSession.files.map((f) => f.session_id)
-    );
-    console.log(`\nTotal files tracked: ${finalSession.files.length}`);
+    const files = finalSession.files ?? [];
+    const uniqueSessionIds = new Set(files.map((f) => f.session_id));
+    console.log(`\nTotal files tracked: ${files.length}`);
     console.log(`Unique session_ids: ${uniqueSessionIds.size}`);
     console.log('\nFiles:');
-    for (const file of finalSession.files) {
+    for (const file of files) {
       console.log(
         `  - ${file.name} (session: ${file.session_id?.slice(0, 20)}...)`
       );
     }
 
     // Verify expectations
-    const fileACount = finalSession.files.filter(
-      (f) => f.name === 'file_a.txt'
-    ).length;
-    const fileBCount = finalSession.files.filter(
-      (f) => f.name === 'file_b.txt'
-    ).length;
+    const fileACount = files.filter((f) => f.name === 'file_a.txt').length;
+    const fileBCount = files.filter((f) => f.name === 'file_b.txt').length;
 
     console.log('\n✓ Checks:');
     console.log(`  file_a.txt count: ${fileACount} (expected: 1, latest wins)`);

@@ -28,9 +28,8 @@ async function testToolsBeforeHandoff() {
 
   // Create custom handlers
   const customHandlers = {
-    [GraphEvents.TOOL_END]: new ToolEndHandler(undefined, (name?: string) => {
-      console.log(`\n✅ Tool completed: ${name}`);
-      return true;
+    [GraphEvents.TOOL_END]: new ToolEndHandler(async () => {
+      console.log('\n✅ Tool completed');
     }),
     [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(),
     [GraphEvents.CHAT_MODEL_STREAM]: new ChatModelStreamHandler(),

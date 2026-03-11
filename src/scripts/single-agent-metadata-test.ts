@@ -20,8 +20,7 @@ async function testSingleAgent() {
   console.log('Testing Single Agent with Metadata Logging...\n');
 
   // Set up content aggregator
-  const { contentParts, aggregateContent, contentMetadataMap } =
-    createContentAggregator();
+  const { contentParts, aggregateContent, stepMap } = createContentAggregator();
 
   const startTime = Date.now();
 
@@ -183,10 +182,8 @@ async function testSingleAgent() {
     console.log('Final content parts:', contentParts.length, 'parts');
     console.log('\n=== Content Parts (clean, no metadata) ===');
     console.dir(contentParts, { depth: null });
-    console.log(
-      '\n=== Content Metadata Map (should be empty for single-agent) ==='
-    );
-    console.dir(Object.fromEntries(contentMetadataMap), { depth: null });
+    console.log('\n=== Step Map (should be empty for single-agent) ===');
+    console.dir(Object.fromEntries(stepMap), { depth: null });
     console.log('====================================\n');
 
     await sleep(3000);

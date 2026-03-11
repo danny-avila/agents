@@ -18,13 +18,7 @@ async function testStandardStreaming(): Promise<void> {
   const { userName, location, provider, currentDate } = await getArgs();
   const { contentParts, aggregateContent } = createContentAggregator();
   const customHandlers = {
-    [GraphEvents.TOOL_END]: new ToolEndHandler(
-      undefined,
-      undefined,
-      (name?: string) => {
-        return true;
-      }
-    ),
+    [GraphEvents.TOOL_END]: new ToolEndHandler(),
     [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(),
     [GraphEvents.CHAT_MODEL_START]: {
       handle: (
