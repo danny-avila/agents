@@ -72,6 +72,7 @@ export type PruneMessagesParams = {
    */
   lastCallUsage?: {
     totalTokens: number;
+    inputTokens?: number;
   };
   /**
    * Whether the token data is fresh (from a just-completed LLM call).
@@ -530,9 +531,14 @@ export function calculateTotalTokens(
   const baseInputTokens = Number(usage.input_tokens) || 0;
   const cacheCreation = Number(usage.input_token_details?.cache_creation) || 0;
   const cacheRead = Number(usage.input_token_details?.cache_read) || 0;
-
-  const totalInputTokens = baseInputTokens + cacheCreation + cacheRead;
   const totalOutputTokens = Number(usage.output_tokens) || 0;
+  const cacheSum = cacheCreation + cacheRead;
+  // Anthropic: input_tokens excludes cache, cache_read can be much larger than input_tokens.
+  // OpenAI: input_tokens includes cache, cache_read is always <= input_tokens.
+  const cacheIsAdditive = cacheSum > 0 && cacheSum > baseInputTokens;
+  const totalInputTokens = cacheIsAdditive
+    ? baseInputTokens + cacheSum
+    : baseInputTokens;
 
   return {
     input_tokens: totalInputTokens,
@@ -1129,6 +1135,8 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     0
   ) as number;
   let runThinkingStartIndex = -1;
+  /** Running calibration ratio (EMA) — applied to new messages even without usage_metadata. */
+  let lastCalibrationRatio = 1;
   return function pruneMessages(params: PruneMessagesParams): {
     context: BaseMessage[];
     indexTokenCountMap: Record<string, number | undefined>;
@@ -1207,20 +1215,29 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       checkValidNumber(params.usageMetadata.output_tokens)
     ) {
       currentUsage = calculateTotalTokens(params.usageMetadata);
-      totalTokens = currentUsage.total_tokens;
     }
 
     const newOutputs = new Set<number>();
+    let outputTokensAssigned = false;
     for (let i = lastTurnStartIndex; i < params.messages.length; i++) {
       const message = params.messages[i];
-      if (
-        i === lastTurnStartIndex &&
-        indexTokenCountMap[i] === undefined &&
-        currentUsage
-      ) {
+      if (indexTokenCountMap[i] !== undefined) {
+        continue;
+      }
+
+      // Assign output_tokens to the first uncounted AI message — this is the
+      // model's response.  Previous code blindly targeted lastTurnStartIndex
+      // which could hit a pre-counted HumanMessage or miss the AI entirely.
+      if (!outputTokensAssigned && currentUsage && message.getType() === 'ai') {
         indexTokenCountMap[i] = currentUsage.output_tokens;
-      } else if (indexTokenCountMap[i] === undefined) {
-        indexTokenCountMap[i] = factoryParams.tokenCounter(message);
+        newOutputs.add(i);
+        outputTokensAssigned = true;
+      } else {
+        const rawCount = factoryParams.tokenCounter(message);
+        // Apply the running calibration ratio to new messages so they
+        // benefit from prior provider feedback, even on turns without
+        // usage_metadata.
+        indexTokenCountMap[i] = Math.round(rawCount * lastCalibrationRatio);
         if (currentUsage) {
           newOutputs.add(i);
         }
@@ -1234,9 +1251,9 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     // accumulated cacheRead across N tool-call round-trips.
     // Gated on totalTokensFresh to avoid applying stale ratios.
     if (currentUsage && params.totalTokensFresh !== false) {
-      // Prefer lastCallUsage (single-call, not accumulated) for calibration.
-      const calibrationTokens =
-        params.lastCallUsage?.totalTokens ?? currentUsage.total_tokens;
+      const instructionOverhead = factoryParams.getInstructionTokens?.() ?? 0;
+      const providerInputTokens =
+        params.lastCallUsage?.inputTokens ?? currentUsage.input_tokens;
 
       let totalIndexTokens = 0;
       const firstIsSystem =
@@ -1254,12 +1271,37 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         totalIndexTokens += indexTokenCountMap[i] ?? 0;
       }
 
-      // Calculate ratio based only on messages that remain in the context
-      const ratio = calibrationTokens / totalIndexTokens;
+      const ourTotal = instructionOverhead + totalIndexTokens;
+      const overallRatio = ourTotal > 0 ? providerInputTokens / ourTotal : 0;
+      const variancePct = Math.round((overallRatio - 1) * 100);
+
+      const providerMessageTokens = Math.max(
+        0,
+        providerInputTokens - instructionOverhead
+      );
+      const ratio =
+        totalIndexTokens > 0 ? providerMessageTokens / totalIndexTokens : 0;
       const isRatioSafe = ratio >= 1 / 3 && ratio <= 2.5;
 
-      // Apply the ratio adjustment only to messages at or after lastCutOffIndex, and only if the ratio is safe
+      factoryParams.log?.('debug', 'Token estimate variance', {
+        ourTotal,
+        providerInputTokens,
+        variance: `${variancePct > 0 ? '+' : ''}${variancePct}%`,
+        instructionOverhead,
+        messageEstimate: totalIndexTokens,
+        messageCalibrationRatio: Math.round(ratio * 100) / 100,
+        calibrationApplied: isRatioSafe,
+      });
+
       if (isRatioSafe) {
+        // Update running EMA: blend new ratio with prior (70/30).
+        // This smooths noise across turns and provides a useful default
+        // for turns where usage_metadata is absent.
+        lastCalibrationRatio =
+          lastCalibrationRatio === 1
+            ? ratio
+            : 0.7 * ratio + 0.3 * lastCalibrationRatio;
+
         // Snapshot the map before calibration for sanity revert
         const preCalibrationSnapshot: Record<string, number | undefined> = {};
         for (let i = lastCutOffIndex; i < params.messages.length; i++) {
@@ -1338,6 +1380,37 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       totalTokens,
     });
 
+    // When instructions alone consume the entire budget, no message can
+    // fit regardless of truncation.  Short-circuit: yield all messages for
+    // summarization and return an empty context so the Graph can route to
+    // the summarize node immediately instead of falling through to the
+    // emergency path that would reach the same outcome more expensively.
+    if (
+      effectiveMaxTokens === 0 &&
+      factoryParams.summarizationEnabled === true &&
+      params.messages.length > 0
+    ) {
+      factoryParams.log?.(
+        'warn',
+        'Instructions consume entire budget — yielding all messages for summarization',
+        {
+          instructionTokens: currentInstructionTokens,
+          pruningBudget,
+          messageCount: params.messages.length,
+        }
+      );
+
+      lastTurnStartIndex = params.messages.length;
+      return {
+        context: [],
+        indexTokenCountMap,
+        messagesToRefine: [...params.messages],
+        prePruneTotalTokens: totalTokens,
+        remainingContextTokens: 0,
+        contextPressure: pruningBudget > 0 ? totalTokens / pruningBudget : 0,
+      };
+    }
+
     // ---------------------------------------------------------------------------
     // Progressive context fading — inspired by Claude Code's staged compaction.
     // Below 80%: no modifications, tool results retain full size.
@@ -1352,6 +1425,14 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     //   90%: aggressive — budget factor 0.20, most results heavily truncated
     //   99%: emergency — budget factor 0.05, effectively placeholders for old results
     // ---------------------------------------------------------------------------
+    // Recompute totalTokens from indexTokenCountMap for accurate context pressure.
+    // The value from provider usage or initial closure sum may be stale — the
+    // calibration block above may have adjusted individual entries, and new
+    // messages may have been counted since.
+    totalTokens = 0;
+    for (let i = 0; i < params.messages.length; i++) {
+      totalTokens += indexTokenCountMap[i] ?? 0;
+    }
     const contextPressure = pruningBudget > 0 ? totalTokens / pruningBudget : 0;
     let preFlightResultCount = 0;
     let preFlightInputCount = 0;

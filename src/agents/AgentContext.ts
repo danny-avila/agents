@@ -153,10 +153,14 @@ export class AgentContext {
   systemMessageTokens: number = 0;
   /** Token count for tool schemas only. */
   toolSchemaTokens: number = 0;
+  /** Whether tool token calibration has been applied from provider usage data. */
+  private _toolTokensCalibrated: boolean = false;
 
-  /** Total instruction overhead: system message + tool schemas. */
+  /** Total instruction overhead: system message + tool schemas + pending summary. */
   get instructionTokens(): number {
-    return this.systemMessageTokens + this.toolSchemaTokens;
+    const summaryOverhead =
+      this._summaryLocation === 'user_message' ? this.summaryTokenCount : 0;
+    return this.systemMessageTokens + this.toolSchemaTokens + summaryOverhead;
   }
   /** The amount of time that should pass before another consecutive API call */
   streamBuffer?: number;
@@ -559,11 +563,11 @@ export class AgentContext {
       // message budget rather than permanently reducing the instruction
       // ceiling.
       if (
+        this._summaryLocation === 'user_message' &&
         this.summaryText != null &&
-        this.summaryText !== '' &&
-        messages.length === 0
+        this.summaryText !== ''
       ) {
-        return [...prefix, new HumanMessage(this.summaryText)];
+        return [...prefix, new HumanMessage(this.summaryText), ...messages];
       }
       return [...prefix, ...messages];
     }).withConfig({ runName: 'prompt' });
@@ -575,6 +579,7 @@ export class AgentContext {
   reset(): void {
     this.systemMessageTokens = 0;
     this.toolSchemaTokens = 0;
+    this._toolTokensCalibrated = false;
     this.cachedSystemRunnable = undefined;
     this.systemRunnableStale = true;
     this.lastToken = undefined;
@@ -644,12 +649,8 @@ export class AgentContext {
     tokenCounter: t.TokenCounter
   ): Promise<void> {
     let toolTokens = 0;
-    // Track names to avoid double-counting when a tool appears in both
-    // this.tools (bound StructuredTool instances) and this.toolDefinitions
-    // (MCP / event-driven schemas).
     const countedToolNames = new Set<string>();
 
-    // Count tokens for bound tools (StructuredTool instances with .schema)
     if (this.tools && this.tools.length > 0) {
       for (const tool of this.tools) {
         const genericTool = tool as Record<string, unknown>;
@@ -673,24 +674,30 @@ export class AgentContext {
       }
     }
 
-    // Count tokens for tool definitions (MCP / event-driven tools).
-    // These are sent to the provider API as tool schemas alongside bound tools.
-    // Both can be populated simultaneously (graph tools + MCP tools).
     if (this.toolDefinitions && this.toolDefinitions.length > 0) {
       for (const def of this.toolDefinitions) {
         if (countedToolNames.has(def.name)) {
-          continue; // Already counted via this.tools
+          continue;
         }
         const schema = {
-          name: def.name,
-          description: def.description ?? '',
-          parameters: def.parameters ?? {},
+          type: 'function',
+          function: {
+            name: def.name,
+            description: def.description ?? '',
+            parameters: def.parameters ?? {},
+          },
         };
         toolTokens += tokenCounter(new SystemMessage(JSON.stringify(schema)));
       }
     }
 
-    this.toolSchemaTokens = toolTokens;
+    const opts = this.clientOptions as t.OpenAIClientOptions | undefined;
+    const modelId = String(opts?.model ?? opts?.modelName ?? '');
+    const isAnthropic =
+      this.provider === Providers.ANTHROPIC ||
+      /anthropic|claude/i.test(modelId);
+    const toolTokenMultiplier = isAnthropic ? 2.6 : 1.4;
+    this.toolSchemaTokens = Math.ceil(toolTokens * toolTokenMultiplier);
   }
 
   /**
@@ -766,10 +773,10 @@ export class AgentContext {
   rebuildTokenMapAfterSummarization(newTokenMap: Record<string, number>): void {
     this.indexTokenCountMap = newTokenMap;
     this.baseIndexTokenCountMap = { ...newTokenMap };
-    // Set the message count baseline to the surviving context size so
-    // shouldSkipSummarization can detect whether any new messages have
-    // arrived since the last summary.
     this._lastSummarizationMsgCount = Object.keys(newTokenMap).length;
+    this.currentUsage = undefined;
+    this.lastCallUsage = undefined;
+    this.totalTokensFresh = false;
   }
 
   hasSummary(): boolean {
@@ -888,8 +895,13 @@ export class AgentContext {
     const cacheCreation =
       Number(usage.input_token_details?.cache_creation) || 0;
     const cacheRead = Number(usage.input_token_details?.cache_read) || 0;
-    const totalInputTokens = baseInputTokens + cacheCreation + cacheRead;
+
     const outputTokens = Number(usage.output_tokens) || 0;
+    const cacheSum = cacheCreation + cacheRead;
+    const cacheIsAdditive = cacheSum > 0 && cacheSum > baseInputTokens;
+    const totalInputTokens = cacheIsAdditive
+      ? baseInputTokens + cacheSum
+      : baseInputTokens;
 
     this.lastCallUsage = {
       inputTokens: totalInputTokens,
@@ -899,6 +911,34 @@ export class AgentContext {
       cacheCreation: cacheCreation || undefined,
     };
     this.totalTokensFresh = true;
+
+    if (totalInputTokens > 0 && !cacheRead) {
+      let messageTokens = 0;
+      for (const val of Object.values(this.indexTokenCountMap)) {
+        messageTokens += val ?? 0;
+      }
+      const providerInstructionTokens = totalInputTokens - messageTokens;
+
+      if (!this._toolTokensCalibrated && this.toolSchemaTokens > 0) {
+        if (providerInstructionTokens > this.instructionTokens) {
+          this.toolSchemaTokens +=
+            providerInstructionTokens - this.instructionTokens;
+        }
+        this._toolTokensCalibrated = true;
+      } else if (
+        this._toolTokensCalibrated &&
+        this.summaryTokenCount > 0 &&
+        providerInstructionTokens > this.instructionTokens
+      ) {
+        // After tool calibration, any remaining instruction-token gap is
+        // likely from summary underestimation.  Adjust summary token count
+        // so getInstructionTokens() (and thus the pruner's budget) reflects
+        // the provider's actual overhead.
+        const gap = providerInstructionTokens - this.instructionTokens;
+        this.summaryTokenCount += gap;
+        this._durableSummaryTokenCount = this.summaryTokenCount;
+      }
+    }
   }
 
   /** Marks token data as stale before a new LLM call. */

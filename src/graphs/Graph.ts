@@ -887,6 +887,28 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         );
       }
 
+      const messageTypes = finalMessages
+        .map((m, i) => {
+          const type = m.getType();
+          const name = type === 'tool' ? (m.name ?? '?') : '';
+          return `${i}:${name ? `${type}(${name})` : type}`;
+        })
+        .join(', ');
+      emitAgentLog(
+        config,
+        'debug',
+        'graph',
+        'Pre-invoke token map',
+        {
+          indexTokenCountMap: agentContext.indexTokenCountMap,
+          instructionTokens: agentContext.instructionTokens,
+          messageCount: finalMessages.length,
+          messageTypes,
+          hasPendingSummary: agentContext.hasPendingCompactionSummary(),
+        },
+        { runId: this.runId, agentId }
+      );
+
       try {
         result = await attemptInvoke(
           {
@@ -1036,6 +1058,20 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       agentContext.currentUsage = this.getUsageMetadata(result.messages?.[0]);
       if (agentContext.currentUsage) {
         agentContext.updateLastCallUsage(agentContext.currentUsage);
+        emitAgentLog(
+          config,
+          'debug',
+          'graph',
+          'LLM call usage',
+          {
+            ...agentContext.currentUsage,
+            instructionTokens: agentContext.instructionTokens,
+            systemMessageTokens: agentContext.systemMessageTokens,
+            toolSchemaTokens: agentContext.toolSchemaTokens,
+            messageCount: finalMessages.length,
+          },
+          { runId: this.runId, agentId }
+        );
       }
       this.cleanupSignalListener();
       return result;
