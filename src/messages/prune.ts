@@ -54,6 +54,12 @@ export type PruneMessagesFactoryParams = {
    * filling the context window to 100%.  Defaults to 5 % (0.05) when omitted.
    */
   reserveRatio?: number;
+  /**
+   * Initial calibration ratio from a previous run's persisted contextMeta.
+   * Seeds the running EMA so new messages are scaled immediately instead
+   * of waiting for the first provider response.  Ignored when <= 0.
+   */
+  calibrationRatio?: number;
   /** Optional diagnostic log callback wired by the graph for observability. */
   log?: (
     level: 'debug' | 'info' | 'warn' | 'error',
@@ -1136,7 +1142,10 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
   ) as number;
   let runThinkingStartIndex = -1;
   /** Running calibration ratio (EMA) — applied to new messages even without usage_metadata. */
-  let lastCalibrationRatio = 1;
+  let lastCalibrationRatio =
+    factoryParams.calibrationRatio != null && factoryParams.calibrationRatio > 0
+      ? factoryParams.calibrationRatio
+      : 1;
   return function pruneMessages(params: PruneMessagesParams): {
     context: BaseMessage[];
     indexTokenCountMap: Record<string, number | undefined>;
@@ -1145,6 +1154,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     remainingContextTokens?: number;
     contextPressure?: number;
     preFadingMessages?: BaseMessage[];
+    calibrationRatio?: number;
   } {
     // Guard: empty messages array (e.g. after REMOVE_ALL with empty context).
     // Nothing to prune — return immediately to avoid out-of-bounds access.
@@ -1155,6 +1165,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         messagesToRefine: [],
         prePruneTotalTokens: 0,
         remainingContextTokens: factoryParams.maxTokens,
+        calibrationRatio: lastCalibrationRatio,
       };
     }
 
@@ -1408,6 +1419,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         prePruneTotalTokens: totalTokens,
         remainingContextTokens: 0,
         contextPressure: pruningBudget > 0 ? totalTokens / pruningBudget : 0,
+        calibrationRatio: lastCalibrationRatio,
       };
     }
 
@@ -1593,6 +1605,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
           pruningBudget - totalTokens - currentInstructionTokens,
         contextPressure,
         preFadingMessages,
+        calibrationRatio: lastCalibrationRatio,
       };
     }
 
@@ -1966,6 +1979,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       remainingContextTokens,
       contextPressure,
       preFadingMessages,
+      calibrationRatio: lastCalibrationRatio,
     };
   };
 }

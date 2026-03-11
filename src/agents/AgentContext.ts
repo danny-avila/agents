@@ -156,6 +156,8 @@ export class AgentContext {
   toolSchemaTokens: number = 0;
   /** Whether tool token calibration has been applied from provider usage data. */
   private _toolTokensCalibrated: boolean = false;
+  /** Running calibration ratio from the pruner — persisted across runs via contextMeta. */
+  calibrationRatio: number = 1;
 
   /** Total instruction overhead: system message + tool schemas + pending summary. */
   get instructionTokens(): number {

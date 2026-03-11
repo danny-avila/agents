@@ -115,6 +115,11 @@ export type RunConfig = {
   returnContent?: boolean;
   tokenCounter?: TokenCounter;
   indexTokenCountMap?: Record<string, number>;
+  /**
+   * Calibration ratio from a previous run's contextMeta.
+   * Seeds the pruner's EMA so new messages are scaled immediately.
+   */
+  calibrationRatio?: number;
   /** Skip post-stream cleanup (clearHeavyState) — useful for tests that inspect graph state after processStream */
   skipCleanup?: boolean;
 };

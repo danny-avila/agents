@@ -172,6 +172,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     agents,
     tokenCounter,
     indexTokenCountMap,
+    calibrationRatio,
   }: t.StandardGraphInput) {
     super();
     this.runId = runId;
@@ -187,6 +188,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         tokenCounter,
         indexTokenCountMap
       );
+      if (calibrationRatio != null && calibrationRatio > 0) {
+        agentContext.calibrationRatio = calibrationRatio;
+      }
 
       this.agentContexts.set(agentConfig.agentId, agentContext);
     }
@@ -371,6 +375,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
   getContentParts(): t.MessageContentComplex[] | undefined {
     return convertMessagesToContent(this.messages.slice(this.startIndex));
+  }
+
+  getCalibrationRatio(): number {
+    const context = this.agentContexts.get(this.defaultAgentId);
+    return context?.calibrationRatio ?? 1;
   }
 
   /**
@@ -622,6 +631,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           contextPruningConfig: agentContext.contextPruningConfig,
           summarizationEnabled: agentContext.summarizationEnabled,
           reserveRatio: agentContext.summarizationConfig?.reserveRatio,
+          calibrationRatio: agentContext.calibrationRatio,
           getInstructionTokens: () => agentContext.instructionTokens,
           log: (level, message, data) => {
             emitAgentLog(config, level, 'prune', message, data, {
@@ -639,6 +649,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           prePruneTotalTokens,
           remainingContextTokens,
           preFadingMessages,
+          calibrationRatio,
         } = agentContext.pruneMessages({
           messages,
           usageMetadata: agentContext.currentUsage,
@@ -646,6 +657,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           totalTokensFresh: agentContext.totalTokensFresh,
         });
         agentContext.indexTokenCountMap = indexTokenCountMap;
+        if (calibrationRatio != null && calibrationRatio > 0) {
+          agentContext.calibrationRatio = calibrationRatio;
+        }
         messagesToUse = context;
 
         const hasPrunedMessages =

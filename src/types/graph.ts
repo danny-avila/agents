@@ -344,6 +344,7 @@ export type StandardGraphInput = {
   agents: AgentInputs[];
   tokenCounter?: TokenCounter;
   indexTokenCountMap?: Record<string, number>;
+  calibrationRatio?: number;
 };
 
 export type GraphEdge = {
