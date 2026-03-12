@@ -2903,10 +2903,10 @@ describe('Enrichment and prompt selection (no API keys)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Multi-pass summarization correctness (FakeListChatModel — no API keys)
+// Summarization deduplication and correctness (FakeListChatModel — no API keys)
 // ---------------------------------------------------------------------------
 
-describe('Multi-pass summarization correctness (no API keys)', () => {
+describe('Summarization deduplication correctness (no API keys)', () => {
   jest.setTimeout(60_000);
 
   const INSTRUCTIONS =
@@ -2926,7 +2926,7 @@ describe('Multi-pass summarization correctness (no API keys)', () => {
     }
   });
 
-  test('multi-pass does not produce duplicate section headers in summary', async () => {
+  test('summarization does not produce duplicate section headers', async () => {
     const spies = createSpies();
     const conversationHistory: BaseMessage[] = [];
     const tokenCounter = await createTokenCounter();
@@ -2995,7 +2995,7 @@ describe('Multi-pass summarization correctness (no API keys)', () => {
           summarizationEnabled: true,
           summarizationConfig: {
             provider: Providers.OPENAI,
-            parameters: { parts: 2, minMessagesForSplit: 4 },
+            parameters: {},
           },
         },
         returnContent: true,
@@ -3025,8 +3025,8 @@ describe('Multi-pass summarization correctness (no API keys)', () => {
       });
     };
 
-    // Build up enough conversation to trigger multi-pass summarization
-    // Need >= minMessagesForSplit (4) messages to be refined
+    // Build up enough conversation to trigger summarization
+    // Build enough conversation history to trigger summarization
     let run = await createRunHelper(4000);
     run.Graph?.overrideTestModel(
       ['The answer to 2+2 is 4. Basic addition.'],
@@ -3085,7 +3085,7 @@ describe('Multi-pass summarization correctness (no API keys)', () => {
     // Assert summarization fired
     const sumCount = spies.onSummarizeCompleteSpy.mock.calls.length;
     console.log(
-      `  Multi-pass dedup: ${sumCount} summarization(s), ${chunkCallCount} chunk LLM calls, ` +
+      `  Dedup: ${sumCount} summarization(s), ${chunkCallCount} chunk LLM calls, ` +
         `${capturedSystemMessages.length} system messages captured`
     );
 
@@ -3106,27 +3106,6 @@ describe('Multi-pass summarization correctness (no API keys)', () => {
 
     // tokenCount must be > 0 (tokenCounter is provided)
     expect(lastComplete.summary!.tokenCount).toBeGreaterThan(0);
-
-    // Verify prompt selection for multi-pass:
-    // If 2 chunk calls happened, chunk 2 should NOT have used UPDATE prompt
-    if (capturedSystemMessages.length >= 2) {
-      // Chunk 1 (no prior summary): should use FRESH prompt
-      expect(capturedSystemMessages[0]).toContain('Create a structured');
-      expect(capturedSystemMessages[0]).not.toContain('PRESERVE');
-
-      // Chunk 2 (intra-cycle): should use FRESH prompt with continuation prefix
-      expect(capturedSystemMessages[1]).toContain('Create a structured');
-      expect(capturedSystemMessages[1]).not.toContain('PRESERVE');
-      expect(capturedSystemMessages[1]).toContain(
-        'context-from-earlier-messages'
-      );
-
-      // Chunk 2 human message should use context tag, not previous-summary tag
-      expect(capturedHumanMessages[1]).toContain(
-        '<context-from-earlier-messages>'
-      );
-      expect(capturedHumanMessages[1]).not.toContain('<previous-summary>');
-    }
 
     console.log(
       `  Summary (${summaryText.length} chars, ${lastComplete.summary!.tokenCount} tokens):\n` +
@@ -3287,7 +3266,7 @@ describe('Multi-pass summarization correctness (no API keys)', () => {
     }
   });
 
-  test('conversation continues after multi-pass summarization', async () => {
+  test('conversation continues after summarization', async () => {
     const spies = createSpies();
     const conversationHistory: BaseMessage[] = [];
     const tokenCounter = await createTokenCounter();
@@ -3327,7 +3306,7 @@ describe('Multi-pass summarization correctness (no API keys)', () => {
           summarizationEnabled: true,
           summarizationConfig: {
             provider: Providers.OPENAI,
-            parameters: { parts: 2, minMessagesForSplit: 4 },
+            parameters: {},
           },
         },
         returnContent: true,
