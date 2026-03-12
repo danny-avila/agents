@@ -25,8 +25,9 @@ const config = {
   maxWorkers: '50%',
   maxConcurrency: 1,
   
-  // Optional: increase timeout for network requests
-  testTimeout: 30000,  // 30 seconds (default is 5 seconds)
+  // Timeout for tests — E2E summarization tests hit real APIs and need more time.
+  // Per-suite jest.setTimeout() calls can extend this further.
+  testTimeout: 60000,  // 60 seconds
   
   // Optional: run tests serially (one at a time) - uncomment if needed
   // runInBand: true,

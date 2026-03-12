@@ -293,7 +293,7 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
     };
 
     const createRun = async (
-      maxTokens = 2000
+      maxTokens = 4000
     ): Promise<{
       run: Run<t.IState>;
       contentParts: t.MessageContentComplex[];
@@ -361,7 +361,7 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
     logTurn('T4', conversationHistory, `parts=${contentParts.length}`);
 
     // Turn 5: tighter context to force summarization if not already
-    ({ run, contentParts } = await createRun(1500));
+    ({ run, contentParts } = await createRun(3500));
     await runTurn(
       { run, conversationHistory },
       'What is 355 / 113? Use the calculator. This should approximate pi.',
@@ -385,7 +385,7 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
           `indexTokenCountMap keys=${Object.keys(debugMap).length}`
       );
 
-      ({ run, contentParts } = await createRun(500));
+      ({ run, contentParts } = await createRun(3200));
       await runTurn(
         { run, conversationHistory },
         'Calculate 999 * 999 with the calculator. Also compute 123456789 % 97.',
@@ -396,7 +396,7 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
 
     // Turn 7: absolute minimum context if still nothing
     if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
-      ({ run, contentParts } = await createRun(200));
+      ({ run, contentParts } = await createRun(3100));
       await runTurn({ run, conversationHistory }, 'What is 1+1?', streamConfig);
       logTurn('T7', conversationHistory);
     }
@@ -450,7 +450,7 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
     let latestContentParts: t.MessageContentComplex[] = [];
     const tokenCounter = await createTokenCounter();
 
-    const createRun = async (maxTokens = 600): Promise<Run<t.IState>> => {
+    const createRun = async (maxTokens = 4000): Promise<Run<t.IState>> => {
       collectedUsage = [];
       const { contentParts, aggregateContent } = createContentAggregator();
       latestContentParts = contentParts as t.MessageContentComplex[];
@@ -472,50 +472,63 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
       });
     };
 
-    // Build up conversation fast with tight context
-    let run = await createRun(600);
+    // Build up conversation — generous budget so messages accumulate
+    let run = await createRun();
     await runTurn(
       { run, conversationHistory },
       'What is 42 * 58? Calculator please.',
       streamConfig
     );
 
-    run = await createRun(600);
+    run = await createRun();
     await runTurn(
       { run, conversationHistory },
       'Now compute 2436 + 1337. Calculator.',
       streamConfig
     );
 
-    run = await createRun(600);
+    run = await createRun();
     await runTurn(
       { run, conversationHistory },
       'What is 3773 * 11? Calculator.',
       streamConfig
     );
 
-    run = await createRun(500);
+    run = await createRun();
     await runTurn(
       { run, conversationHistory },
       'Calculate 41503 - 12345 and then 29158 / 4. Show both with calculator.',
       streamConfig
     );
 
-    // By now summarization should have fired; if not, progressively tighten
-    // the context to force pruning (which triggers summarization).
+    run = await createRun();
+    await runTurn(
+      { run, conversationHistory },
+      'What is 100 * 200? Calculator.',
+      streamConfig
+    );
+
+    // Progressively squeeze to force summarization
+    run = await createRun(3500);
+    await runTurn(
+      { run, conversationHistory },
+      'What is 777 * 777? Calculator. Also list everything.',
+      streamConfig
+    );
+
     if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
-      run = await createRun(350);
+      run = await createRun(3200);
       await runTurn(
         { run, conversationHistory },
-        'What is 777 * 777? Calculator.',
+        'Calculate 999 * 999 with calculator.',
         streamConfig
       );
     }
     if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
-      run = await createRun(300);
+      run = await createRun(3100);
       await runTurn(
         { run, conversationHistory },
-        'What is 777 * 777? Calculator.',
+        'What is 50 + 50? Calculator.',
         streamConfig
       );
     }
@@ -534,7 +547,7 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
     expect(completeSummary.tokenCount ?? 0).toBeLessThan(1200);
 
     // Continue for 2 more turns AFTER summarization — model should remain coherent
-    run = await createRun(600);
+    run = await createRun(4000);
     const postSumTurn1 = await runTurn(
       { run, conversationHistory },
       'What were all the numbers we computed so far? List them.',
@@ -543,7 +556,7 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
     expect(postSumTurn1).toBeDefined();
     logTurn('Post-sum T1', conversationHistory);
 
-    run = await createRun(600);
+    run = await createRun(4000);
     const postSumTurn2 = await runTurn(
       { run, conversationHistory },
       'Now compute the sum of 2436, 3773, and 41503 using the calculator.',
@@ -577,7 +590,7 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
     const conversationHistory: BaseMessage[] = [];
     const tokenCounter = await createTokenCounter();
 
-    const createRun = async (maxTokens = 600): Promise<Run<t.IState>> => {
+    const createRun = async (maxTokens = 4000): Promise<Run<t.IState>> => {
       collectedUsage = [];
       const { aggregateContent } = createContentAggregator();
       const indexTokenCountMap = buildIndexTokenCountMap(
@@ -599,35 +612,35 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
     };
 
     // Build up conversation at generous limits so messages accumulate
-    let run = await createRun(1500);
+    let run = await createRun(4000);
     await runTurn(
       { run, conversationHistory },
       'Compute 54321 * 12345 using calculator.',
       streamConfig
     );
 
-    run = await createRun(1500);
+    run = await createRun(4000);
     await runTurn(
       { run, conversationHistory },
       'Now calculate 670592745 / 99991. Calculator.',
       streamConfig
     );
 
-    run = await createRun(1500);
+    run = await createRun(4000);
     await runTurn(
       { run, conversationHistory },
       'What is sqrt(670592745)? Calculator.',
       streamConfig
     );
 
-    run = await createRun(1500);
+    run = await createRun(4000);
     await runTurn(
       { run, conversationHistory },
       'Compute 2^32 with calculator.',
       streamConfig
     );
 
-    run = await createRun(1500);
+    run = await createRun(4000);
     await runTurn(
       { run, conversationHistory },
       'What is 13 * 17 * 19? Calculator.',
@@ -635,8 +648,8 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
     );
 
     // Tighten context to force summarization — must remain high enough
-    // for post-summary instruction overhead (~400 local tokens) + messages
-    run = await createRun(800);
+    // for post-summary instruction overhead + tool schema tokens + messages
+    run = await createRun(3500);
     await runTurn(
       { run, conversationHistory },
       'What is 99 * 101? Calculator. Then list everything we calculated so far in detail.',
@@ -644,7 +657,7 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
     );
 
     if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
-      run = await createRun(700);
+      run = await createRun(3400);
       await runTurn(
         { run, conversationHistory },
         'Compute 7! (factorial of 7) with calculator.',
@@ -653,7 +666,7 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
     }
 
     if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
-      run = await createRun(600);
+      run = await createRun(3300);
       await runTurn(
         { run, conversationHistory },
         'What is 256 * 256? Calculator.',
@@ -662,7 +675,7 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
     }
 
     if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
-      run = await createRun(500);
+      run = await createRun(3200);
       await runTurn(
         { run, conversationHistory },
         'Compute 100 + 200 with calculator.',
@@ -671,7 +684,7 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
     }
 
     if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
-      run = await createRun(400);
+      run = await createRun(3100);
       await runTurn(
         { run, conversationHistory },
         'What is 50 * 50? Calculator.',
@@ -728,7 +741,7 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
     };
 
     const createRun = async (
-      maxTokens = 800
+      maxTokens = 4000
     ): Promise<{
       run: Run<t.IState>;
       contentParts: t.MessageContentComplex[];
@@ -816,9 +829,9 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
     logTurn('T4-think', conversationHistory);
 
     // Turn 5: tighter context to trigger summarization — keep high enough
-    // for post-summary overhead (~400 local tokens for instructions+summary)
+    // for tool-schema overhead + post-summary instruction tokens + messages
     if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
-      ({ run, contentParts } = await createRun(700));
+      ({ run, contentParts } = await createRun(3500));
       await runTurn(
         { run, conversationHistory },
         'Compute 999 * 999 with calculator.',
@@ -829,7 +842,7 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
 
     // Turn 6: squeeze harder if needed
     if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
-      ({ run, contentParts } = await createRun(600));
+      ({ run, contentParts } = await createRun(3200));
       await runTurn(
         { run, conversationHistory },
         'What is 42 * 42? Calculator.',
@@ -878,7 +891,7 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
     }
 
     // Post-summary continuation should work with thinking enabled
-    ({ run } = await createRun(800));
+    ({ run } = await createRun(4000));
     const postSumResult = await runTurn(
       { run, conversationHistory },
       'What is 100 / 4? Calculator please.',
@@ -997,7 +1010,7 @@ const hasBedrock = requiredBedrockEnv.every((k) => process.env[k] != null);
     const conversationHistory: BaseMessage[] = [];
     const tokenCounter = await createTokenCounter();
 
-    const createRun = async (maxTokens = 600): Promise<Run<t.IState>> => {
+    const createRun = async (maxTokens = 4000): Promise<Run<t.IState>> => {
       collectedUsage = [];
       const { aggregateContent } = createContentAggregator();
       const indexTokenCountMap = buildIndexTokenCountMap(
@@ -1042,7 +1055,7 @@ const hasBedrock = requiredBedrockEnv.every((k) => process.env[k] != null);
     );
     logTurn('T3', conversationHistory);
 
-    run = await createRun(500);
+    run = await createRun(3500);
     await runTurn(
       { run, conversationHistory },
       'Calculate 2^16 and 3^10 using calculator for each.',
@@ -1050,7 +1063,7 @@ const hasBedrock = requiredBedrockEnv.every((k) => process.env[k] != null);
     );
     logTurn('T4', conversationHistory);
 
-    run = await createRun(400);
+    run = await createRun(3200);
     await runTurn(
       { run, conversationHistory },
       'What is 59049 + 65536? Calculator. Also tell me what we calculated before.',
@@ -1059,7 +1072,7 @@ const hasBedrock = requiredBedrockEnv.every((k) => process.env[k] != null);
     logTurn('T5', conversationHistory);
 
     if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
-      run = await createRun(300);
+      run = await createRun(3000);
       await runTurn(
         { run, conversationHistory },
         'Calculate 111111 * 111111 with calculator.',
@@ -1097,7 +1110,7 @@ const hasBedrock = requiredBedrockEnv.every((k) => process.env[k] != null);
     );
 
     // Post-summary turn should work cleanly
-    run = await createRun(600);
+    run = await createRun(4000);
     const postSumResult = await runTurn(
       { run, conversationHistory },
       'Give me a brief list of all results we computed.',
@@ -1130,7 +1143,7 @@ const hasOpenAI = process.env.OPENAI_API_KEY != null;
     let latestContentParts: t.MessageContentComplex[] = [];
     const tokenCounter = await createTokenCounter();
 
-    const createRun = async (maxTokens = 500): Promise<Run<t.IState>> => {
+    const createRun = async (maxTokens = 2000): Promise<Run<t.IState>> => {
       collectedUsage = [];
       const { contentParts, aggregateContent } = createContentAggregator();
       latestContentParts = contentParts as t.MessageContentComplex[];
@@ -1177,22 +1190,50 @@ const hasOpenAI = process.env.OPENAI_API_KEY != null;
     );
     logTurn('T3', conversationHistory);
 
-    run = await createRun(400);
+    run = await createRun();
     await runTurn(
       { run, conversationHistory },
-      'What is 314159 * 271828? Calculator please. Remind me of prior results too.',
+      'What is 314159 * 271828? Calculator please.',
       streamConfig
     );
     logTurn('T4', conversationHistory);
 
+    run = await createRun();
+    await runTurn(
+      { run, conversationHistory },
+      'Compute 2^20 with calculator.',
+      streamConfig
+    );
+    logTurn('T5', conversationHistory);
+
+    // Squeeze hard — OpenAI tool-schema overhead is lower than Anthropic,
+    // so we need tighter budgets to force pruning + summarization.
+    run = await createRun(800);
+    await runTurn(
+      { run, conversationHistory },
+      'Calculate 999999 / 7 with calculator. Remind me of prior results too.',
+      streamConfig
+    );
+    logTurn('T6', conversationHistory);
+
     if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
-      run = await createRun(300);
+      run = await createRun(600);
       await runTurn(
         { run, conversationHistory },
-        'Calculate 999999 / 7 with calculator.',
+        'What is 50 + 50? Calculator.',
         streamConfig
       );
-      logTurn('T5', conversationHistory);
+      logTurn('T7', conversationHistory);
+    }
+
+    if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
+      run = await createRun(400);
+      await runTurn(
+        { run, conversationHistory },
+        'What is 1+1? Calculator.',
+        streamConfig
+      );
+      logTurn('T8', conversationHistory);
     }
 
     console.log(
@@ -1214,7 +1255,7 @@ const hasOpenAI = process.env.OPENAI_API_KEY != null;
     expect(validUsagePrePostSum.length).toBeGreaterThan(0);
 
     // Verify tool calls still work after summarization
-    run = await createRun(500);
+    run = await createRun(2000);
     await runTurn(
       { run, conversationHistory },
       'One more: 123 + 456 + 789. Calculator.',
@@ -2372,7 +2413,7 @@ const hasAnyApiKey =
     const conversationHistory: BaseMessage[] = [];
     const tokenCounter = await createTokenCounter();
 
-    const createRun = async (maxTokens = 600): Promise<Run<t.IState>> => {
+    const createRun = async (maxTokens = 4000): Promise<Run<t.IState>> => {
       collectedUsage = [];
       const { aggregateContent } = createContentAggregator();
       const indexTokenCountMap = buildIndexTokenCountMap(
@@ -2393,7 +2434,7 @@ const hasAnyApiKey =
       });
     };
 
-    // Run 3 turns
+    // Accumulate messages over 6 turns at generous budget
     let run = await createRun();
     await runTurn(
       { run, conversationHistory },
@@ -2408,19 +2449,43 @@ const hasAnyApiKey =
       streamConfig
     );
 
-    run = await createRun(400);
+    run = await createRun();
     await runTurn(
       { run, conversationHistory },
-      'What is 3436 / 4? Calculator. Also list everything.',
+      'What is 3436 / 4? Calculator.',
       streamConfig
     );
 
-    // Force summarization if not already triggered
-    if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
-      run = await createRun(300);
+    run = await createRun();
+    await runTurn(
+      { run, conversationHistory },
+      'Compute 999 * 2. Calculator.',
+      streamConfig
+    );
+
+    run = await createRun();
+    await runTurn(
+      { run, conversationHistory },
+      'What is 2^10? Calculator. Also list everything.',
+      streamConfig
+    );
+
+    run = await createRun();
+    await runTurn(
+      { run, conversationHistory },
+      'Calculate 355 / 113. Calculator.',
+      streamConfig
+    );
+
+    // Squeeze progressively to force summarization
+    for (const squeeze of [3500, 3200, 3100, 3000]) {
+      if (spies.onSummarizeStartSpy.mock.calls.length > 0) {
+        break;
+      }
+      run = await createRun(squeeze);
       await runTurn(
         { run, conversationHistory },
-        'Compute 999 * 2. Calculator.',
+        `What is ${squeeze} - 1000? Calculator.`,
         streamConfig
       );
     }
@@ -2452,7 +2517,7 @@ const hasAnyApiKey =
     const conversationHistory: BaseMessage[] = [];
     const tokenCounter = await createTokenCounter();
 
-    const createRun = async (maxTokens = 500): Promise<Run<t.IState>> => {
+    const createRun = async (maxTokens = 4000): Promise<Run<t.IState>> => {
       collectedUsage = [];
       const { aggregateContent } = createContentAggregator();
       const indexTokenCountMap = buildIndexTokenCountMap(
@@ -2473,7 +2538,7 @@ const hasAnyApiKey =
       });
     };
 
-    // Accumulate history at generous limits
+    // Accumulate history at generous limits (6 turns)
     let run = await createRun();
     await runTurn(
       { run, conversationHistory },
@@ -2502,21 +2567,29 @@ const hasAnyApiKey =
       streamConfig
     );
 
-    // Step down context to trigger summarization — must stay above
-    // post-summary instruction overhead (~200 local tokens for
-    // system + tools + summary) so messages survive post-summary.
-    run = await createRun(400);
+    run = await createRun();
     await runTurn(
       { run, conversationHistory },
-      'Calculate 111 * 111. Calculator.',
+      'What is 65536 + 5000? Calculator.',
       streamConfig
     );
 
-    if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
-      run = await createRun(350);
+    run = await createRun();
+    await runTurn(
+      { run, conversationHistory },
+      'Calculate 70536 / 7. Calculator.',
+      streamConfig
+    );
+
+    // Squeeze progressively to force summarization
+    for (const squeeze of [3500, 3200, 3100, 3000]) {
+      if (spies.onSummarizeStartSpy.mock.calls.length > 0) {
+        break;
+      }
+      run = await createRun(squeeze);
       await runTurn(
         { run, conversationHistory },
-        'What is 50 + 50? Calculator.',
+        `What is ${squeeze} - 1000? Calculator.`,
         streamConfig
       );
     }
@@ -2545,7 +2618,7 @@ const hasAnyApiKey =
     const conversationHistory: BaseMessage[] = [];
     const tokenCounter = await createTokenCounter();
 
-    const createRun = async (maxTokens = 800): Promise<Run<t.IState>> => {
+    const createRun = async (maxTokens = 4000): Promise<Run<t.IState>> => {
       collectedUsage = [];
       const { aggregateContent } = createContentAggregator();
       const indexTokenCountMap = buildIndexTokenCountMap(
@@ -2566,8 +2639,8 @@ const hasAnyApiKey =
       });
     };
 
-    // Build up conversation
-    let run = await createRun(800);
+    // Build up conversation (6 turns at generous budget)
+    let run = await createRun();
     await runTurn(
       { run, conversationHistory },
       'What is 12345 * 67? Calculator.',
@@ -2584,39 +2657,56 @@ const hasAnyApiKey =
     const preSumInputTokens =
       lastPreUsage?.input_tokens != null ? lastPreUsage.input_tokens : 0;
 
-    run = await createRun(800);
+    run = await createRun();
     await runTurn(
       { run, conversationHistory },
       'Now divide that by 13. Calculator. Also multiply by 7.',
       streamConfig
     );
 
-    run = await createRun(800);
+    run = await createRun();
     await runTurn(
       { run, conversationHistory },
-      'Compute 999 * 888. Calculator. List all prior results.',
+      'Compute 999 * 888. Calculator.',
       streamConfig
     );
 
-    // Force summarization
-    run = await createRun(350);
+    run = await createRun();
     await runTurn(
       { run, conversationHistory },
-      'What is 2+2? Calculator.',
+      'What is 2^10? Calculator.',
       streamConfig
     );
 
-    if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
-      run = await createRun(250);
+    run = await createRun();
+    await runTurn(
+      { run, conversationHistory },
+      'Calculate 1024 + 5000. Calculator. List all prior results.',
+      streamConfig
+    );
+
+    run = await createRun();
+    await runTurn(
+      { run, conversationHistory },
+      'What is 6024 * 3? Calculator.',
+      streamConfig
+    );
+
+    // Squeeze progressively to force summarization
+    for (const squeeze of [3500, 3200, 3100, 3000]) {
+      if (spies.onSummarizeStartSpy.mock.calls.length > 0) {
+        break;
+      }
+      run = await createRun(squeeze);
       await runTurn(
         { run, conversationHistory },
-        'Calculate 5+5. Calculator.',
+        `What is ${squeeze} - 1000? Calculator.`,
         streamConfig
       );
     }
 
     // Post-summary turn
-    run = await createRun(800);
+    run = await createRun(4000);
     await runTurn(
       { run, conversationHistory },
       'What is 10 + 10? Calculator.',

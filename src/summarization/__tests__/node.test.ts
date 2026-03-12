@@ -51,7 +51,9 @@ function createAgentContext(
 }
 
 /** Creates a mock graph container for createSummarizeNode. */
-function mockGraph(): {
+function mockGraph(
+  onStepCompleted?: (stepId: string, result: t.StepCompleted) => void
+): {
   contentData: t.RunStep[];
   contentIndexMap: Map<string, number>;
   config: RunnableConfig;
@@ -61,7 +63,12 @@ function mockGraph(): {
     runStep: t.RunStep,
     config?: RunnableConfig
   ) => Promise<void>;
-  } {
+  dispatchRunStepCompleted: (
+    stepId: string,
+    result: t.StepCompleted,
+    config?: RunnableConfig
+  ) => Promise<void>;
+} {
   const contentData: t.RunStep[] = [];
   const contentIndexMap = new Map<string, number>();
   return {
@@ -73,6 +80,12 @@ function mockGraph(): {
     dispatchRunStep: async (runStep: t.RunStep): Promise<void> => {
       contentData.push(runStep);
       contentIndexMap.set(runStep.id, runStep.index);
+    },
+    dispatchRunStepCompleted: async (
+      stepId: string,
+      result: t.StepCompleted
+    ): Promise<void> => {
+      onStepCompleted?.(stepId, result);
     },
   };
 }
@@ -146,7 +159,14 @@ describe('createSummarizeNode', () => {
     );
 
     const agentContext = createAgentContext();
-    const graph = mockGraph();
+    const graph = mockGraph((_stepId, result) => {
+      if (result.type === 'summary') {
+        events.push({
+          event: GraphEvents.ON_SUMMARIZE_COMPLETE,
+          data: { summary: result.summary },
+        });
+      }
+    });
     const node = createSummarizeNode({
       agentContext,
       graph,
@@ -286,7 +306,14 @@ describe('createSummarizeNode', () => {
 
     const setSummary = jest.fn();
     const agentContext = createAgentContext({ setSummary } as never);
-    const graph = mockGraph();
+    const graph = mockGraph((_stepId, result) => {
+      if (result.type === 'summary') {
+        events.push({
+          event: GraphEvents.ON_SUMMARIZE_COMPLETE,
+          data: { summary: result.summary },
+        });
+      }
+    });
     const node = createSummarizeNode({
       agentContext,
       graph,
