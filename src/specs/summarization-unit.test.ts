@@ -813,23 +813,3 @@ describe('pre-flight + enrichment interaction', () => {
     expect(errorContent.length).toBeGreaterThan(wouldTruncateMaxChars);
   });
 });
-
-// ---------------------------------------------------------------------------
-// DEFAULT_PARTS=1 behavior through the pruner integration
-// ---------------------------------------------------------------------------
-
-describe('single-pass summarization default', () => {
-  it('separateParameters returns parts=1 by default', () => {
-    // We can't import separateParameters directly (not exported),
-    // but we verify the default behavior: when no `parts` parameter
-    // is specified, the summarization config defaults to parts=1.
-    // This is tested indirectly through the multi-pass tests in
-    // summarization.test.ts which must explicitly set parts > 1.
-    // Here we verify the constant is correct by checking the module exports.
-    //
-    // The actual DEFAULT_PARTS=1 constant is verified by the fact that
-    // multi-pass tests explicitly pass `parts: 2` in their parameters,
-    // and all other tests use single-pass by default.
-    expect(true).toBe(true); // placeholder — behavior verified in E2E tests
-  });
-});
