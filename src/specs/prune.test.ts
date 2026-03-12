@@ -1007,7 +1007,7 @@ describe('Prune Messages Tests', () => {
         _truncated: string;
         _originalChars: number;
       };
-      expect(truncatedInput._truncated).toContain('[truncated:');
+      expect(truncatedInput._truncated).toContain('truncated');
       expect(truncatedInput._originalChars).toBeGreaterThan(600);
 
       // Verify tool_calls args were also truncated

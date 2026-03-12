@@ -84,7 +84,7 @@ describe('truncateToolResultContent', () => {
     expect(result.length).toBeLessThanOrEqual(510); // some slack for indicator
     expect(result).toContain('truncated');
     expect(result).toContain('1000'); // original length
-    expect(result).toContain('500'); // maxChars
+    expect(result).toContain('500'); // limit
     // Head preserved (starts with As)
     expect(result.startsWith('A')).toBe(true);
     // Tail preserved (ends with Cs)
@@ -98,9 +98,7 @@ describe('truncateToolResultContent', () => {
     const result = truncateToolResultContent(content, 235);
 
     expect(result).toContain('truncated');
-    // Head-only: starts with original content (all A's in the head slice)
     expect(result.startsWith('A')).toBe(true);
-    // Head-only: the slice is only 198 chars of A's, no B's from the tail
     expect(result).not.toMatch(/B/);
   });
 
@@ -115,8 +113,8 @@ describe('truncateToolResultContent', () => {
   it('preserves the truncation indicator format', () => {
     const content = 'x'.repeat(500);
     const result = truncateToolResultContent(content, 300);
-    // Format: [truncated: {original} → {maxChars} chars]
-    expect(result).toMatch(/\[truncated: 500 → 300 chars\]/);
+    // Format: [truncated: N chars exceeded M limit]
+    expect(result).toMatch(/\[truncated: 500 chars exceeded 300 limit\]/);
   });
 });
 
