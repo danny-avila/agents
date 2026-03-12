@@ -997,8 +997,12 @@ export function shiftIndexTokenCountMap(
   return shiftedMap;
 }
 
-/** Image content type constants for detection. */
-const IMAGE_TYPES = new Set(['image_url', 'image']);
+/** Block types that contain binary image data and must be preserved structurally. */
+const IMAGE_BLOCK_TYPES = new Set(['image_url', 'image']);
+
+/** Checks whether a BaseMessage is a tool-role message. */
+const isToolMessage = (m: BaseMessage): boolean =>
+  m instanceof ToolMessage || ('role' in m && (m as any).role === 'tool');
 
 /** Flushes accumulated text chunks into `parts` as a single text block. */
 function flushTextChunks(
@@ -1017,9 +1021,14 @@ function flushTextChunks(
 
 /**
  * Appends a single message's content to the running `textChunks` / `parts`
- * accumulators. Image blocks are flushed into `parts` as-is; everything else
- * is serialized to text so that binary data (base64 images) never becomes
- * text tokens.
+ * accumulators.  Image blocks are shallow-copied into `parts` as-is so that
+ * binary data (base64 images) never becomes text tokens.  All other block
+ * types are serialized to text — unrecognized types are JSON-serialized
+ * rather than silently dropped.
+ *
+ * When `content` is an array, tool_use blocks are already present in content
+ * so `tool_calls` is NOT additionally serialized (avoiding double output).
+ * `tool_calls` is only serialized when `content` is a plain string.
  */
 function appendMessageContent(
   msg: BaseMessage,
@@ -1043,23 +1052,30 @@ function appendMessageContent(
   }
 
   for (const block of content as ExtendedMessageContent[]) {
-    if (IMAGE_TYPES.has(block.type ?? '')) {
+    if (IMAGE_BLOCK_TYPES.has(block.type ?? '')) {
       flushTextChunks(textChunks, parts);
-      parts.push(block as unknown as MessageContentComplex);
+      parts.push({ ...block } as MessageContentComplex);
+      continue;
+    }
+
+    if (block.type === 'tool_use') {
+      textChunks.push(
+        `${role}: [tool_use] ${String(block.name ?? '')} ${JSON.stringify(block.input ?? {})}`
+      );
       continue;
     }
 
     const text = block.text ?? block.input;
     if (typeof text === 'string' && text) {
       textChunks.push(`${role}: ${text}`);
-    } else if (block.type === 'tool_use') {
-      textChunks.push(
-        `${role}: [tool_use] ${String(block.name ?? '')} ${JSON.stringify(block.input ?? {})}`
-      );
+      continue;
+    }
+
+    // Fallback: serialize unrecognized block types to preserve context
+    if (block.type != null && block.type !== '') {
+      textChunks.push(`${role}: [${block.type}] ${JSON.stringify(block)}`);
     }
   }
-
-  appendToolCalls(msg, role, textChunks);
 }
 
 function appendToolCalls(
@@ -1193,9 +1209,7 @@ export function ensureThinkingBlockInMessages(
       appendMessageContent(msg, 'AI', textChunks, parts);
 
       let j = i + 1;
-      const isToolMsg = (m: BaseMessage): boolean =>
-        m instanceof ToolMessage || ('role' in m && (m as any).role === 'tool');
-      while (j < messages.length && isToolMsg(messages[j])) {
+      while (j < messages.length && isToolMessage(messages[j])) {
         appendMessageContent(messages[j], 'Tool', textChunks, parts);
         j++;
       }
