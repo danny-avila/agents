@@ -875,7 +875,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           | t.OpenRouterClientOptions
           | undefined;
         if (openRouterOptions?.promptCache === true) {
-          finalMessages = addCacheControl<BaseMessage>(finalMessages);
+          const model = (agentContext.clientOptions as t.OpenAIClientOptions)?.model;
+          const isClaudeModel =
+            model?.includes('claude') === true ||
+            model?.includes('anthropic') === true;
+          if (isClaudeModel) {
+            finalMessages = addCacheControl<BaseMessage>(finalMessages);
+          }
         }
       }
 
