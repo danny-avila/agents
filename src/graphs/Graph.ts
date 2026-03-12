@@ -870,6 +870,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         if (bedrockOptions?.promptCache === true) {
           finalMessages = addBedrockCacheControl<BaseMessage>(finalMessages);
         }
+      } else if (agentContext.provider === Providers.OPENROUTER) {
+        const openRouterOptions = agentContext.clientOptions as
+          | t.OpenRouterClientOptions
+          | undefined;
+        if (openRouterOptions?.promptCache === true) {
+          finalMessages = addCacheControl<BaseMessage>(finalMessages);
+        }
       }
 
       /**
