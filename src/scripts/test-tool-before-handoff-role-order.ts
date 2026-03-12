@@ -42,10 +42,9 @@ async function testToolBeforeHandoffRoleOrder(): Promise<void> {
   let handoffOccurred = false;
 
   const customHandlers = {
-    [GraphEvents.TOOL_END]: new ToolEndHandler(undefined, (name?: string) => {
+    [GraphEvents.TOOL_END]: new ToolEndHandler(async () => {
       toolCallCount++;
-      console.log(`\n  Tool completed: ${name} (total: ${toolCallCount})`);
-      return true;
+      console.log(`\n  Tool completed (total: ${toolCallCount})`);
     }),
     [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(),
     [GraphEvents.CHAT_MODEL_STREAM]: new ChatModelStreamHandler(),

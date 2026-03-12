@@ -1,6 +1,33 @@
-import { Tiktoken } from 'js-tiktoken/lite';
+import { Tokenizer } from 'ai-tokenizer';
 import type { BaseMessage } from '@langchain/core/messages';
 import { ContentTypes } from '@/common/enum';
+
+export type EncodingName = 'o200k_base' | 'claude';
+
+const tokenizers: Partial<Record<EncodingName, Tokenizer>> = {};
+
+async function getTokenizer(
+  encoding: EncodingName = 'o200k_base'
+): Promise<Tokenizer> {
+  const cached = tokenizers[encoding];
+  if (cached) {
+    return cached;
+  }
+  const data =
+    encoding === 'claude'
+      ? await import('ai-tokenizer/encoding/claude')
+      : await import('ai-tokenizer/encoding/o200k_base');
+  const instance = new Tokenizer(data);
+  tokenizers[encoding] = instance;
+  return instance;
+}
+
+export function encodingForModel(model: string): EncodingName {
+  if (model.toLowerCase().includes('claude')) {
+    return 'claude';
+  }
+  return 'o200k_base';
+}
 
 export function getTokenCountForMessage(
   message: BaseMessage,
@@ -60,70 +87,32 @@ export function getTokenCountForMessage(
   return numTokens;
 }
 
-let encoderPromise: Promise<Tiktoken> | undefined;
-let tokenCounterPromise: Promise<(message: BaseMessage) => number> | undefined;
-
-async function getSharedEncoder(): Promise<Tiktoken> {
-  if (encoderPromise) {
-    return encoderPromise;
-  }
-  encoderPromise = (async (): Promise<Tiktoken> => {
-    const res = await fetch('https://tiktoken.pages.dev/js/o200k_base.json');
-    const o200k_base = await res.json();
-    return new Tiktoken(o200k_base);
-  })();
-  return encoderPromise;
-}
-
 /**
- * Creates a singleton token counter function that reuses the same encoder instance.
- * This avoids creating multiple function closures and prevents potential memory issues.
+ * Creates a token counter function using the specified encoding.
+ * Lazily loads the encoding data on first use via dynamic import.
  */
-export const createTokenCounter = async (): Promise<
-  (message: BaseMessage) => number
-> => {
-  if (tokenCounterPromise) {
-    return tokenCounterPromise;
-  }
-
-  tokenCounterPromise = (async (): Promise<
-    (message: BaseMessage) => number
-  > => {
-    const enc = await getSharedEncoder();
-    const countTokens = (text: string): number => enc.encode(text).length;
-    return (message: BaseMessage): number =>
-      getTokenCountForMessage(message, countTokens);
-  })();
-
-  return tokenCounterPromise;
+export const createTokenCounter = async (
+  encoding: EncodingName = 'o200k_base'
+): Promise<(message: BaseMessage) => number> => {
+  const tok = await getTokenizer(encoding);
+  const countTokens = (text: string): number => tok.count(text);
+  return (message: BaseMessage): number =>
+    getTokenCountForMessage(message, countTokens);
 };
 
-/**
- * Utility to manage the token encoder lifecycle explicitly.
- * Useful for applications that need fine-grained control over resource management.
- */
+/** Utility to manage the token encoder lifecycle explicitly. */
 export const TokenEncoderManager = {
-  /**
-   * Pre-initializes the encoder. This can be called during app startup
-   * to avoid lazy loading delays later.
-   */
   async initialize(): Promise<void> {
-    await getSharedEncoder();
+    // No-op: ai-tokenizer is synchronously initialized from bundled data.
   },
 
-  /**
-   * Clears the cached encoder and token counter.
-   * Useful for testing or when you need to force a fresh reload.
-   */
   reset(): void {
-    encoderPromise = undefined;
-    tokenCounterPromise = undefined;
+    for (const key of Object.keys(tokenizers)) {
+      delete tokenizers[key as EncodingName];
+    }
   },
 
-  /**
-   * Checks if the encoder has been initialized.
-   */
   isInitialized(): boolean {
-    return encoderPromise !== undefined;
+    return Object.keys(tokenizers).length > 0;
   },
 };

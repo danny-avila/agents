@@ -22,8 +22,7 @@ async function testSequentialMultiAgent() {
   console.log('Testing Sequential Multi-Agent System (A → B → C)...\n');
 
   // Set up content aggregator
-  const { contentParts, aggregateContent, contentMetadataMap } =
-    createContentAggregator();
+  const { contentParts, aggregateContent, stepMap } = createContentAggregator();
 
   // Define three simple agents
   const agents: t.AgentInputs[] = [
@@ -198,8 +197,8 @@ async function testSequentialMultiAgent() {
     console.log(`Total content parts: ${contentParts.length}`);
     console.log('\n=== Content Parts (clean, no metadata) ===');
     console.dir(contentParts, { depth: null });
-    console.log('\n=== Content Metadata Map (separate from content) ===');
-    console.dir(Object.fromEntries(contentMetadataMap), { depth: null });
+    console.log('\n=== Step Map (separate from content) ===');
+    console.dir(Object.fromEntries(stepMap), { depth: null });
 
     // Display the sequential responses
     const aiMessages = conversationHistory.filter(

@@ -1,4 +1,4 @@
-// src/scripts/cli.ts
+// src/scripts/image.ts
 import { config } from 'dotenv';
 config();
 import { HumanMessage, AIMessage, BaseMessage } from '@langchain/core/messages';
@@ -10,6 +10,7 @@ import {
   ModelEndHandler,
   createMetadataAggregator,
 } from '@/events';
+// @ts-expect-error — example module not in current codebase
 import { fetchRandomImageTool, fetchRandomImageURL } from '@/tools/example';
 import { getLLMConfig } from '@/utils/llmConfig';
 import { getArgs } from '@/scripts/args';

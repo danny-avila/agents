@@ -16,9 +16,9 @@ import {
   createCompletionTitleRunnable,
   createTitleRunnable,
 } from '@/utils/title';
+import { createTokenCounter, encodingForModel } from '@/utils/tokens';
 import { GraphEvents, Callback, TitleMethod } from '@/common';
 import { MultiAgentGraph } from '@/graphs/MultiAgentGraph';
-import { createTokenCounter } from '@/utils/tokens';
 import { StandardGraph } from '@/graphs/Graph';
 import { HandlerRegistry } from '@/events';
 import { isOpenAILike } from '@/utils/llm';
@@ -166,7 +166,11 @@ export class Run<_T extends t.BaseGraphState> {
   ): Promise<Run<T>> {
     /** Create tokenCounter if indexTokenCountMap is provided but tokenCounter is not */
     if (config.indexTokenCountMap && !config.tokenCounter) {
-      config.tokenCounter = await createTokenCounter();
+      const gc = config.graphConfig;
+      const clientOpts =
+        'agents' in gc ? gc.agents[0]?.clientOptions : gc.clientOptions;
+      const model = (clientOpts as { model?: string } | undefined)?.model ?? '';
+      config.tokenCounter = await createTokenCounter(encodingForModel(model));
     }
     return new Run<T>(config);
   }
