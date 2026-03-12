@@ -48,6 +48,7 @@ export class Run<_T extends t.BaseGraphState> {
   Graph: StandardGraph | MultiAgentGraph | undefined;
   returnContent: boolean = false;
   private skipCleanup: boolean = false;
+  private _streamResult: t.MessageContentComplex[] | undefined;
 
   private constructor(config: Partial<t.RunConfig>) {
     const runId = config.runId ?? '';
@@ -327,65 +328,68 @@ export class Run<_T extends t.BaseGraphState> {
       ignoreCustomEvent: true,
     });
 
-    for await (const event of stream) {
-      const { data, metadata, ...info } = event;
+    try {
+      for await (const event of stream) {
+        const { data, metadata, ...info } = event;
 
-      const eventName: t.EventName = info.event;
+        const eventName: t.EventName = info.event;
 
-      /** Skip custom events as they're handled by our callback */
-      if (eventName === GraphEvents.ON_CUSTOM_EVENT) {
-        continue;
-      }
-
-      const handler = this.handlerRegistry?.getHandler(eventName);
-      if (handler) {
-        await handler.handle(eventName, data, metadata, this.Graph);
-      }
-    }
-
-    /**
-     * Break the reference chain that keeps heavy data alive via
-     * LangGraph's internal `__pregel_scratchpad.currentTaskInput` →
-     * `@langchain/core` `RunTree.extra[lc:child_config]` →
-     * Node.js `AsyncLocalStorage` context captured by timers/promises.
-     *
-     * Without this, base64-encoded images/PDFs in message content remain
-     * reachable from lingering `Timeout` handles until GC runs.
-     */
-    if (!this.skipCleanup) {
-      if (
-        (config.configurable as Record<string, unknown> | undefined) != null
-      ) {
-        for (const key of Object.getOwnPropertySymbols(config.configurable)) {
-          const val = config.configurable[key as unknown as string] as
-            | Record<string, unknown>
-            | undefined;
-          if (
-            val != null &&
-            typeof val === 'object' &&
-            'currentTaskInput' in val
-          ) {
-            (val as Record<string, unknown>).currentTaskInput = undefined;
-          }
-          delete config.configurable[key as unknown as string];
+        /** Skip custom events as they're handled by our callback */
+        if (eventName === GraphEvents.ON_CUSTOM_EVENT) {
+          continue;
         }
-        config.configurable = undefined;
+
+        const handler = this.handlerRegistry?.getHandler(eventName);
+        if (handler) {
+          await handler.handle(eventName, data, metadata, this.Graph);
+        }
       }
-      config.callbacks = undefined;
+    } finally {
+      /**
+       * Break the reference chain that keeps heavy data alive via
+       * LangGraph's internal `__pregel_scratchpad.currentTaskInput` →
+       * `@langchain/core` `RunTree.extra[lc:child_config]` →
+       * Node.js `AsyncLocalStorage` context captured by timers/promises.
+       *
+       * Without this, base64-encoded images/PDFs in message content remain
+       * reachable from lingering `Timeout` handles until GC runs.
+       */
+      if (!this.skipCleanup) {
+        if (
+          (config.configurable as Record<string, unknown> | undefined) != null
+        ) {
+          for (const key of Object.getOwnPropertySymbols(config.configurable)) {
+            const val = config.configurable[key as unknown as string] as
+              | Record<string, unknown>
+              | undefined;
+            if (
+              val != null &&
+              typeof val === 'object' &&
+              'currentTaskInput' in val
+            ) {
+              (val as Record<string, unknown>).currentTaskInput = undefined;
+            }
+            delete config.configurable[key as unknown as string];
+          }
+          config.configurable = undefined;
+        }
+        config.callbacks = undefined;
+      }
+
+      const result = this.returnContent
+        ? this.Graph.getContentParts()
+        : undefined;
+
+      this.calibrationRatio = this.Graph.getCalibrationRatio();
+
+      if (!this.skipCleanup) {
+        this.Graph.clearHeavyState();
+      }
+
+      this._streamResult = result;
     }
 
-    const result = this.returnContent
-      ? this.Graph.getContentParts()
-      : undefined;
-
-    const calibrationRatio = this.Graph.getCalibrationRatio();
-
-    if (!this.skipCleanup) {
-      this.Graph.clearHeavyState();
-    }
-
-    this.calibrationRatio = calibrationRatio;
-    return result;
+    return this._streamResult;
   }
 
   private createSystemCallback<K extends keyof t.ClientCallbacks>(
