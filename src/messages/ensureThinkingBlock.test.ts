@@ -1,20 +1,17 @@
-import {
-  AIMessage,
-  HumanMessage,
-  ToolMessage,
-  getBufferString,
-} from '@langchain/core/messages';
+import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type { ExtendedMessageContent } from '@/types';
 import { ensureThinkingBlockInMessages } from './format';
 import { Providers, ContentTypes } from '@/common';
 
 /** Helper: extract concatenated text from a message's content (string or structured array). */
-function getTextContent(msg: { content: unknown }): string {
+function getTextContent(msg: {
+  content: string | ExtendedMessageContent[];
+}): string {
   if (typeof msg.content === 'string') {
     return msg.content;
   }
   if (Array.isArray(msg.content)) {
-    return (msg.content as Array<Record<string, unknown>>)
+    return (msg.content as ExtendedMessageContent[])
       .filter((b) => b.type === 'text')
       .map((b) => String(b.text ?? ''))
       .join('\n');
@@ -762,17 +759,15 @@ describe('ensureThinkingBlockInMessages', () => {
       'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk';
 
     /**
-     * Reproduces the exact scenario from the bug report:
-     * A 643KB PNG screenshot from an MCP tool, when serialized by getBufferString(),
-     * becomes ~857K characters of text (~214K tokens at ~4 chars/token).
-     * With the fix, the base64 data stays in a structured image block and
-     * never enters the text content.
+     * Reproduces the reported bug: a base64 image from an MCP tool, when
+     * serialized by the old getBufferString() path, would become text tokens.
+     * With the fix, the base64 data stays in a structured image block.
      */
-    test('should not serialize a large base64 image as text (reported 174x token amplification)', () => {
-      // Simulate a ~643KB PNG screenshot (857K base64 chars ≈ 214K tokens)
-      const LARGE_BASE64 = 'A'.repeat(857_000);
+    test('should not serialize base64 image as text (reported 174x token amplification)', () => {
+      const LARGE_BASE64 = 'A'.repeat(10_000);
 
-      const toolSequence = [
+      const messages = [
+        new HumanMessage({ content: 'Take a screenshot' }),
         new AIMessage({
           content: 'Taking a screenshot.',
           tool_calls: [
@@ -796,16 +791,6 @@ describe('ensureThinkingBlockInMessages', () => {
         }),
       ];
 
-      // Demonstrate the old behavior: getBufferString dumps the entire base64 as text
-      const oldBufferString = getBufferString(toolSequence);
-      expect(oldBufferString.length).toBeGreaterThan(857_000);
-      expect(oldBufferString).toContain(LARGE_BASE64);
-
-      // Now run through ensureThinkingBlockInMessages (no thinking block → conversion path)
-      const messages = [
-        new HumanMessage({ content: 'Take a screenshot' }),
-        ...toolSequence,
-      ];
       const result = ensureThinkingBlockInMessages(
         messages,
         Providers.ANTHROPIC
@@ -814,20 +799,18 @@ describe('ensureThinkingBlockInMessages', () => {
       expect(result).toHaveLength(2);
       expect(result[1]).toBeInstanceOf(HumanMessage);
 
-      const content = result[1].content as Array<Record<string, unknown>>;
+      const content = result[1].content as ExtendedMessageContent[];
       const textBlocks = content.filter((b) => b.type === 'text');
       const imageBlocks = content.filter((b) => b.type === 'image_url');
 
-      // Image preserved as structured block
       expect(imageBlocks).toHaveLength(1);
 
-      // Text blocks contain only the metadata — NOT the base64 payload
       const allText = textBlocks.map((b) => String(b.text ?? '')).join('\n');
       expect(allText).toContain('[Previous agent context]');
       expect(allText).toContain('Screenshot captured');
       expect(allText).not.toContain(LARGE_BASE64);
-      // Text is tiny compared to the 857K that getBufferString produced
-      expect(allText.length).toBeLessThan(1_000);
+      // Text must be orders of magnitude smaller than the image data
+      expect(allText.length).toBeLessThan(LARGE_BASE64.length / 10);
     });
 
     test('should preserve image_url blocks from ToolMessage instead of serializing as text', () => {
@@ -867,7 +850,7 @@ describe('ensureThinkingBlockInMessages', () => {
       expect(result[1]).toBeInstanceOf(HumanMessage);
 
       // Content should be an array with structured blocks
-      const content = result[1].content as Array<Record<string, unknown>>;
+      const content = result[1].content as ExtendedMessageContent[];
       expect(Array.isArray(content)).toBe(true);
 
       // Should have text block(s) and an image_url block
@@ -927,7 +910,7 @@ describe('ensureThinkingBlockInMessages', () => {
       );
 
       expect(result).toHaveLength(2);
-      const content = result[1].content as Array<Record<string, unknown>>;
+      const content = result[1].content as ExtendedMessageContent[];
       expect(Array.isArray(content)).toBe(true);
 
       const imageBlocks = content.filter((b) => b.type === 'image');
@@ -994,7 +977,7 @@ describe('ensureThinkingBlockInMessages', () => {
       );
 
       expect(result).toHaveLength(2);
-      const content = result[1].content as Array<Record<string, unknown>>;
+      const content = result[1].content as ExtendedMessageContent[];
       const imageBlocks = content.filter((b) => b.type === 'image_url');
       expect(imageBlocks).toHaveLength(2);
 
@@ -1032,13 +1015,168 @@ describe('ensureThinkingBlockInMessages', () => {
       );
 
       expect(result).toHaveLength(2);
-      const content = result[1].content as Array<Record<string, unknown>>;
+      const content = result[1].content as ExtendedMessageContent[];
       // When no images, should still be an array with a single text block
       expect(Array.isArray(content)).toBe(true);
       expect(content).toHaveLength(1);
       expect(content[0].type).toBe('text');
       expect(content[0].text).toContain('[Previous agent context]');
       expect(content[0].text).toContain('plain text result');
+    });
+
+    test('should not double-serialize when AIMessage has both content tool_use and tool_calls', () => {
+      const messages = [
+        new HumanMessage({ content: 'Search for something' }),
+        new AIMessage({
+          content: [
+            { type: 'text', text: 'Searching...' },
+            {
+              type: 'tool_use',
+              id: 'call_dual',
+              name: 'search',
+              input: { query: 'test' },
+            },
+          ],
+          tool_calls: [
+            {
+              id: 'call_dual',
+              name: 'search',
+              args: { query: 'test' },
+              type: 'tool_call' as const,
+            },
+          ],
+        }),
+        new ToolMessage({
+          content: 'Found 5 results',
+          tool_call_id: 'call_dual',
+        }),
+      ];
+
+      const result = ensureThinkingBlockInMessages(
+        messages,
+        Providers.ANTHROPIC
+      );
+
+      expect(result).toHaveLength(2);
+      const allText = getTextContent(result[1]);
+      // "search" tool call should appear exactly once, not twice
+      const matches = allText.match(/search/g) ?? [];
+      // Once in tool_use serialization, once in tool result — but NOT duplicated
+      // by both content[tool_use] and tool_calls paths
+      expect(matches.length).toBeLessThanOrEqual(3);
+      // Verify no "[tool_call]" label — array content path skips appendToolCalls
+      expect(allText).not.toContain('[tool_call]');
+      expect(allText).toContain('[tool_use]');
+    });
+
+    test('should serialize unrecognized block types instead of dropping them', () => {
+      const messages = [
+        new HumanMessage({ content: 'Fetch resource' }),
+        new AIMessage({
+          content: 'Fetching.',
+          tool_calls: [
+            {
+              id: 'call_res',
+              name: 'fetch_resource',
+              args: {},
+              type: 'tool_call' as const,
+            },
+          ],
+        }),
+        new ToolMessage({
+          content: [
+            { type: 'text', text: 'Resource fetched' },
+            {
+              type: 'resource',
+              resource: { uri: 'file:///data.csv', text: 'a,b,c' },
+            },
+          ],
+          tool_call_id: 'call_res',
+        }),
+      ];
+
+      const result = ensureThinkingBlockInMessages(
+        messages,
+        Providers.ANTHROPIC
+      );
+
+      expect(result).toHaveLength(2);
+      const allText = getTextContent(result[1]);
+      // The resource block should be serialized as text, not silently dropped
+      expect(allText).toContain('[resource]');
+      expect(allText).toContain('data.csv');
+    });
+
+    test('should preserve image blocks when provider is Bedrock', () => {
+      const messages = [
+        new HumanMessage({ content: 'Screenshot' }),
+        new AIMessage({
+          content: 'Taking screenshot.',
+          tool_calls: [
+            {
+              id: 'call_br',
+              name: 'screenshot',
+              args: {},
+              type: 'tool_call' as const,
+            },
+          ],
+        }),
+        new ToolMessage({
+          content: [
+            { type: 'text', text: 'Captured' },
+            {
+              type: 'image_url',
+              image_url: { url: `data:image/png;base64,${FAKE_BASE64}` },
+            },
+          ],
+          tool_call_id: 'call_br',
+        }),
+      ];
+
+      const result = ensureThinkingBlockInMessages(messages, Providers.BEDROCK);
+
+      expect(result).toHaveLength(2);
+      expect(result[1]).toBeInstanceOf(HumanMessage);
+      const content = result[1].content as ExtendedMessageContent[];
+      const imageBlocks = content.filter((b) => b.type === 'image_url');
+      expect(imageBlocks).toHaveLength(1);
+      const allText = getTextContent(result[1]);
+      expect(allText).not.toContain(FAKE_BASE64);
+    });
+
+    test('should shallow-copy image blocks to prevent aliasing', () => {
+      const originalImageBlock = {
+        type: 'image_url',
+        image_url: { url: `data:image/png;base64,${FAKE_BASE64}` },
+      };
+      const messages = [
+        new HumanMessage({ content: 'Screenshot' }),
+        new AIMessage({
+          content: 'Taking screenshot.',
+          tool_calls: [
+            {
+              id: 'call_alias',
+              name: 'screenshot',
+              args: {},
+              type: 'tool_call' as const,
+            },
+          ],
+        }),
+        new ToolMessage({
+          content: [{ type: 'text', text: 'Captured' }, originalImageBlock],
+          tool_call_id: 'call_alias',
+        }),
+      ];
+
+      const result = ensureThinkingBlockInMessages(
+        messages,
+        Providers.ANTHROPIC
+      );
+
+      const content = result[1].content as ExtendedMessageContent[];
+      const outputImageBlock = content.find((b) => b.type === 'image_url');
+      // Should be a different object reference (shallow copy)
+      expect(outputImageBlock).not.toBe(originalImageBlock);
     });
   });
 });
