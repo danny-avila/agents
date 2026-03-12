@@ -2,6 +2,7 @@ import {
   AIMessage,
   HumanMessage,
   SystemMessage,
+  UsageMetadata,
 } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { BaseMessage } from '@langchain/core/messages';
@@ -18,6 +19,14 @@ import { initializeModel } from '@/llm/init';
 import { getChunkContent } from '@/stream';
 
 const SUMMARIZATION_PARAM_KEYS = new Set(['maxSummaryTokens']);
+
+/**
+ * Token overhead of the XML wrapper + instruction text added around the
+ * summary at injection time in AgentContext.buildSystemRunnable:
+ * `<summary>\n${text}\n</summary>\n\nYour context window was compacted...`
+ * ~33 tokens on Anthropic, ~24-27 on OpenAI.  Using 33 as a safe ceiling.
+ */
+const SUMMARY_WRAPPER_OVERHEAD_TOKENS = 33;
 
 /** Structured checkpoint prompt for fresh summarization (no prior summary). */
 export const DEFAULT_SUMMARIZATION_PROMPT = `Hold on, before you continue I need you to write me a checkpoint of everything so far. Your context window is filling up and this checkpoint replaces the messages above, so capture everything you need to pick right back up.
@@ -359,6 +368,7 @@ export function createSummarizeNode({
       : undefined;
 
     let summaryText = '';
+    let summaryUsage: Partial<UsageMetadata> | undefined;
     const messagesToRefine = request.messagesToRefine;
 
     const isSelfSummarizeModel = provider === agentContext.provider;
@@ -390,7 +400,7 @@ export function createSummarizeNode({
     }) as t.ChatModel;
 
     try {
-      summaryText = await summarizeWithCacheHit({
+      const summarizeResult = await summarizeWithCacheHit({
         model: summarizationModel,
         messages: messagesToRefine,
         promptText,
@@ -402,6 +412,8 @@ export function createSummarizeNode({
         reasoningKey: agentContext.reasoningKey,
         usePromptCache: isSelfSummarizeModel && hasPromptCache,
       });
+      summaryText = summarizeResult.text;
+      summaryUsage = summarizeResult.usage;
     } catch (primaryError) {
       emitAgentLog(
         runnableConfig,
@@ -493,11 +505,20 @@ export function createSummarizeNode({
     summaryText = enrichSummary(summaryText, messagesToRefine);
 
     let tokenCount = 0;
-    if (agentContext.tokenCounter) {
-      tokenCount = agentContext.tokenCounter(new SystemMessage(summaryText));
+    const providerOutputTokens = Number(summaryUsage?.output_tokens) || 0;
+    if (providerOutputTokens > 0) {
+      tokenCount = providerOutputTokens + SUMMARY_WRAPPER_OVERHEAD_TOKENS;
+    } else if (agentContext.tokenCounter) {
+      tokenCount =
+        agentContext.tokenCounter(new SystemMessage(summaryText)) +
+        SUMMARY_WRAPPER_OVERHEAD_TOKENS;
     }
 
     agentContext.setSummary(summaryText, tokenCount);
+
+    if (summaryUsage) {
+      agentContext.updateLastCallUsage(summaryUsage);
+    }
 
     emitAgentLog(
       runnableConfig,
@@ -510,6 +531,14 @@ export function createSummarizeNode({
         contextLength: request.context.length,
         survivingMessages: request.context.length,
         summaryVersion: agentContext.summaryVersion,
+        ...(summaryUsage != null
+          ? {
+            input_tokens: summaryUsage.input_tokens,
+            output_tokens: summaryUsage.output_tokens,
+            cache_read: summaryUsage.input_token_details?.cache_read,
+            cache_creation: summaryUsage.input_token_details?.cache_creation,
+          }
+          : {}),
       },
       { runId: graph.runId, agentId: request.agentId }
     );
@@ -534,6 +563,15 @@ export function createSummarizeNode({
     };
 
     runStep.summary = summaryBlock;
+    if (summaryUsage) {
+      runStep.usage = {
+        prompt_tokens: Number(summaryUsage.input_tokens) || 0,
+        completion_tokens: Number(summaryUsage.output_tokens) || 0,
+        total_tokens:
+          (Number(summaryUsage.input_tokens) || 0) +
+          (Number(summaryUsage.output_tokens) || 0),
+      };
+    }
 
     await graph.dispatchRunStepCompleted(
       stepId,
@@ -698,7 +736,7 @@ async function summarizeWithCacheHit({
   provider: Providers;
   reasoningKey?: 'reasoning_content' | 'reasoning';
   usePromptCache?: boolean;
-}): Promise<string> {
+}): Promise<{ text: string; usage?: Partial<UsageMetadata> }> {
   const instruction = buildSummarizationInstruction(
     promptText,
     updatePromptText,
@@ -730,7 +768,11 @@ async function summarizeWithCacheHit({
   );
 
   const responseMsg = result.messages?.[0];
-  return responseMsg
+  const text = responseMsg
     ? extractResponseText(responseMsg as { content: string | object })
     : '';
+  const usage = (
+    responseMsg as { usage_metadata?: Partial<UsageMetadata> } | undefined
+  )?.usage_metadata;
+  return { text, usage };
 }
