@@ -17,8 +17,8 @@ import { DEFAULT_RESERVE_RATIO } from '@/messages';
 import { toJsonSchema } from '@/utils/schema';
 
 /**
- * Anthropic direct API wraps tool schemas in a structured format,
- * roughly 2.0× the raw JSON token count.
+ * Anthropic direct API wraps tool schemas in an XML-like structure,
+ * roughly 2.6× the raw JSON token count.
  */
 const ANTHROPIC_TOOL_TOKEN_MULTIPLIER = 2.6;
 
