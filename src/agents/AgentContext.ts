@@ -17,10 +17,16 @@ import { DEFAULT_RESERVE_RATIO } from '@/messages';
 import { toJsonSchema } from '@/utils/schema';
 
 /**
- * Anthropic wraps tool schemas in an XML-like structure with full parameter
- * descriptions, roughly 2.6× the raw JSON token count.
+ * Anthropic direct API wraps tool schemas in an XML-like structure with full
+ * parameter descriptions, roughly 2.6× the raw JSON token count.
  */
 const ANTHROPIC_TOOL_TOKEN_MULTIPLIER = 2.6;
+
+/**
+ * Bedrock uses the Anthropic model but a lighter tool encoding than the
+ * direct API, observed at ~1.6× the raw JSON token count.
+ */
+const BEDROCK_TOOL_TOKEN_MULTIPLIER = 1.6;
 
 /**
  * OpenAI and other providers use a lighter function-calling format,
@@ -741,22 +747,29 @@ export class AgentContext {
       }
     }
 
-    const opts = this.clientOptions as t.OpenAIClientOptions | undefined;
-    const modelId = String(opts?.model ?? opts?.modelName ?? '');
+    const isBedrock = this.provider === Providers.BEDROCK;
     const isAnthropic =
-      this.provider === Providers.ANTHROPIC ||
-      /anthropic|claude/i.test(modelId);
+      !isBedrock &&
+      (this.provider === Providers.ANTHROPIC ||
+        /anthropic|claude/i.test(
+          String(
+            (this.clientOptions as { model?: string } | undefined)?.model ?? ''
+          )
+        ));
     /**
      * Tool schemas are encoded differently by each provider before counting
-     * against the context window.  Anthropic wraps each tool in XML-like
-     * structure with parameter descriptions, roughly 2.6× the raw JSON token
-     * count.  OpenAI/others use a lighter function-calling format at ~1.4×.
+     * against the context window.  Anthropic direct API wraps each tool in
+     * XML-like structure (~2.6×), Bedrock uses a lighter encoding (~1.6×),
+     * and OpenAI/others use function-calling format (~1.4×).
      * These initial estimates are corrected by `updateLastCallUsage` once
      * real provider usage arrives.
      */
-    const toolTokenMultiplier = isAnthropic
-      ? ANTHROPIC_TOOL_TOKEN_MULTIPLIER
-      : DEFAULT_TOOL_TOKEN_MULTIPLIER;
+    let toolTokenMultiplier = DEFAULT_TOOL_TOKEN_MULTIPLIER;
+    if (isAnthropic) {
+      toolTokenMultiplier = ANTHROPIC_TOOL_TOKEN_MULTIPLIER;
+    } else if (isBedrock) {
+      toolTokenMultiplier = BEDROCK_TOOL_TOKEN_MULTIPLIER;
+    }
     this.toolSchemaTokens = Math.ceil(toolTokens * toolTokenMultiplier);
   }
 
