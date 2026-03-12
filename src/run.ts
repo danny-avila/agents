@@ -192,6 +192,12 @@ export class Run<_T extends t.BaseGraphState> {
     return this.Graph.getRunMessages();
   }
 
+  /**
+   * Returns the current calibration ratio (EMA of provider-vs-estimate token ratios).
+   * Hosts should persist this value and pass it back as `RunConfig.calibrationRatio`
+   * on the next run for the same conversation so the pruner starts with an accurate
+   * scaling factor instead of the default (1).
+   */
   getCalibrationRatio(): number {
     return this.calibrationRatio;
   }
