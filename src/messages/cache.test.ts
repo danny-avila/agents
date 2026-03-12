@@ -7,6 +7,7 @@ import {
 } from '@langchain/core/messages';
 import type Anthropic from '@anthropic-ai/sdk';
 import type { AnthropicMessages } from '@/types/messages';
+import { _convertMessagesToOpenAIParams } from '@/llm/openai/utils';
 import {
   stripAnthropicCacheControl,
   stripBedrockCacheControl,
@@ -1384,8 +1385,6 @@ describe('LangChain message type preservation', () => {
 
 describe('OpenRouter cache_control compatibility', () => {
   it('addCacheControl output preserves cache_control through OpenAI message conversion', () => {
-    const { _convertMessagesToOpenAIParams } = require('@/llm/openai/utils');
-
     const messages: BaseMessage[] = [
       new HumanMessage({
         content: [{ type: 'text', text: 'You are a helpful assistant.' }],
@@ -1406,8 +1405,8 @@ describe('OpenRouter cache_control compatibility', () => {
     expect(Array.isArray(firstUserParam.content)).toBe(true);
     expect(Array.isArray(lastUserParam.content)).toBe(true);
 
-    const firstBlock = (firstUserParam.content as Record<string, unknown>[])[0];
-    const lastBlock = (lastUserParam.content as Record<string, unknown>[])[0];
+    const firstBlock = (firstUserParam.content as Anthropic.TextBlockParam[])[0];
+    const lastBlock = (lastUserParam.content as Anthropic.TextBlockParam[])[0];
 
     expect(firstBlock).toHaveProperty('cache_control');
     expect(firstBlock.cache_control).toEqual({ type: 'ephemeral' });
