@@ -158,6 +158,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   /** Cached run messages preserved before clearHeavyState() so getRunMessages() works after cleanup. */
   private cachedRunMessages?: BaseMessage[];
   runId: string | undefined;
+  /**
+   * Boundary between historical messages (loaded from conversation state)
+   * and messages produced during the current run.  Set once in the state
+   * reducer when messages first arrive.  Used by `getRunMessages()` and
+   * multi-agent message filtering — NOT for pruner token counting (the
+   * pruner maintains its own `lastTurnStartIndex` in its closure).
+   */
   startIndex: number = 0;
   signal?: AbortSignal;
   /** Map of agent contexts by agent ID */
@@ -618,8 +625,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         agentContext.tokenCounter &&
         agentContext.maxContextTokens != null
       ) {
+        // After summarization the token map is empty — start from 0 so the
+        // pruner counts every message.  Otherwise use startIndex (entries
+        // below it are already counted in the map).
         agentContext.pruneMessages = createPruneMessages({
-          startIndex: this.startIndex,
+          startIndex:
+            agentContext.indexTokenCountMap[0] != null ? this.startIndex : 0,
           provider: agentContext.provider,
           tokenCounter: agentContext.tokenCounter,
           maxTokens: agentContext.maxContextTokens,
@@ -650,6 +661,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           remainingContextTokens,
           preFadingMessages,
           calibrationRatio,
+          resolvedInstructionOverhead,
         } = agentContext.pruneMessages({
           messages,
           usageMetadata: agentContext.currentUsage,
@@ -660,14 +672,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         if (calibrationRatio != null && calibrationRatio > 0) {
           agentContext.calibrationRatio = calibrationRatio;
         }
+        if (resolvedInstructionOverhead != null) {
+          agentContext.toolSchemaTokens = Math.max(
+            0,
+            resolvedInstructionOverhead -
+              (agentContext.instructionTokens - agentContext.toolSchemaTokens)
+          );
+        }
         messagesToUse = context;
-        agentContext.lastTotalMessageCount = messages.length;
-        const systemOffset =
-          context.length > 0 && context[0].getType() === 'system' ? 1 : 0;
-        agentContext.lastContextStartIndex = Math.max(
-          0,
-          messages.length - (context.length - systemOffset)
-        );
 
         const hasPrunedMessages =
           agentContext.summarizationEnabled === true &&
