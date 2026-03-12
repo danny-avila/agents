@@ -908,23 +908,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         );
       }
 
-      const messageTypes = finalMessages
-        .map((m, i) => {
-          const type = m.getType();
-          const name = type === 'tool' ? (m.name ?? '?') : '';
-          return `${i}:${name ? `${type}(${name})` : type}`;
-        })
-        .join(', ');
       emitAgentLog(
         config,
         'debug',
         'graph',
-        'Pre-invoke token map',
+        'Pre-invoke',
         {
-          indexTokenCountMap: agentContext.indexTokenCountMap,
           instructionTokens: agentContext.instructionTokens,
           messageCount: finalMessages.length,
-          messageTypes,
           hasPendingSummary: agentContext.hasPendingCompactionSummary(),
         },
         { runId: this.runId, agentId }

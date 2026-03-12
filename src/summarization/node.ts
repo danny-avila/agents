@@ -367,19 +367,6 @@ export function createSummarizeNode({
       (agentContext.clientOptions as Record<string, unknown> | undefined)
         ?.promptCache === true;
 
-    // Count cache_control markers already present on the messages
-    let existingCacheMarkers = 0;
-    for (const msg of messagesToRefine) {
-      const c = msg.content;
-      if (Array.isArray(c)) {
-        for (const block of c as Array<Record<string, unknown>>) {
-          if (block.cache_control != null) {
-            existingCacheMarkers++;
-          }
-        }
-      }
-    }
-
     emitAgentLog(
       runnableConfig,
       'debug',
@@ -391,9 +378,7 @@ export function createSummarizeNode({
         summaryVersion: agentContext.summaryVersion + 1,
         isSelfSummarize: isSelfSummarizeModel,
         hasPromptCache,
-        existingCacheMarkers,
         provider: provider as string,
-        agentProvider: agentContext.provider,
       },
       { runId: graph.runId, agentId: request.agentId }
     );
