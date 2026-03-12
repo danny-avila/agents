@@ -43,7 +43,7 @@ const CALIBRATION_EMA_NEW_WEIGHT = 0.7;
 const CALIBRATION_RATIO_MIN = 1 / 3;
 
 /** Maximum calibration ratio considered safe for application. */
-const CALIBRATION_RATIO_MAX = 2.5;
+const CALIBRATION_RATIO_MAX = 3;
 
 /** Minimum post-calibration sanity ratio (calibrated sum / raw sum). */
 const POST_CALIBRATION_SANITY_MIN = 0.25;
@@ -1337,6 +1337,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         messageEstimate: totalIndexTokens,
         messageCalibrationRatio: Math.round(ratio * 100) / 100,
         calibrationApplied: isRatioSafe,
+        runningEMA: Math.round(lastCalibrationRatio * 100) / 100,
       });
 
       if (isRatioSafe) {
