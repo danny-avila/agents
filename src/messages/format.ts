@@ -1026,9 +1026,9 @@ function flushTextChunks(
  * types are serialized to text — unrecognized types are JSON-serialized
  * rather than silently dropped.
  *
- * When `content` is an array, tool_use blocks are already present in content
- * so `tool_calls` is NOT additionally serialized (avoiding double output).
- * `tool_calls` is only serialized when `content` is a plain string.
+ * When `content` is an array containing tool_use blocks, `tool_calls` is NOT
+ * additionally serialized (avoiding double output).  `tool_calls` is used as
+ * a fallback when `content` is a plain string or an array with no tool_use.
  */
 function appendMessageContent(
   msg: BaseMessage,
@@ -1051,6 +1051,8 @@ function appendMessageContent(
     return;
   }
 
+  let hasToolUseBlock = false;
+
   for (const block of content as ExtendedMessageContent[]) {
     if (IMAGE_BLOCK_TYPES.has(block.type ?? '')) {
       flushTextChunks(textChunks, parts);
@@ -1059,6 +1061,7 @@ function appendMessageContent(
     }
 
     if (block.type === 'tool_use') {
+      hasToolUseBlock = true;
       textChunks.push(
         `${role}: [tool_use] ${String(block.name ?? '')} ${JSON.stringify(block.input ?? {})}`
       );
@@ -1075,6 +1078,12 @@ function appendMessageContent(
     if (block.type != null && block.type !== '') {
       textChunks.push(`${role}: [${block.type}] ${JSON.stringify(block)}`);
     }
+  }
+
+  // If content array had no tool_use blocks, fall back to tool_calls metadata
+  // (handles edge case: empty content array with tool_calls populated)
+  if (!hasToolUseBlock) {
+    appendToolCalls(msg, role, textChunks);
   }
 }
 
