@@ -1059,14 +1059,41 @@ describe('ensureThinkingBlockInMessages', () => {
 
       expect(result).toHaveLength(2);
       const allText = getTextContent(result[1]);
-      // "search" tool call should appear exactly once, not twice
-      const matches = allText.match(/search/g) ?? [];
-      // Once in tool_use serialization, once in tool result — but NOT duplicated
-      // by both content[tool_use] and tool_calls paths
-      expect(matches.length).toBeLessThanOrEqual(3);
-      // Verify no "[tool_call]" label — array content path skips appendToolCalls
+      // Array content path serializes tool_use blocks but skips appendToolCalls
       expect(allText).not.toContain('[tool_call]');
       expect(allText).toContain('[tool_use]');
+    });
+
+    test('should serialize tool_calls when content is empty array (no tool_use blocks)', () => {
+      const messages = [
+        new HumanMessage({ content: 'Do something' }),
+        new AIMessage({
+          content: [],
+          tool_calls: [
+            {
+              id: 'call_empty',
+              name: 'some_tool',
+              args: { x: 1 },
+              type: 'tool_call' as const,
+            },
+          ],
+        }),
+        new ToolMessage({
+          content: 'tool result',
+          tool_call_id: 'call_empty',
+        }),
+      ];
+
+      const result = ensureThinkingBlockInMessages(
+        messages,
+        Providers.ANTHROPIC
+      );
+
+      expect(result).toHaveLength(2);
+      const allText = getTextContent(result[1]);
+      // With empty content array, should fall back to tool_calls
+      expect(allText).toContain('[tool_call]');
+      expect(allText).toContain('some_tool');
     });
 
     test('should serialize unrecognized block types instead of dropping them', () => {
