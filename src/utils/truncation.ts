@@ -50,7 +50,7 @@ export function truncateToolInput(
   if (serialized.length <= maxChars) {
     return { _truncated: serialized, _originalChars: serialized.length };
   }
-  const indicator = `\n… [truncated: ${serialized.length} → ${maxChars} chars] …\n`;
+  const indicator = `\n… [truncated: ${serialized.length} chars exceeded ${maxChars} limit] …\n`;
   const available = maxChars - indicator.length;
 
   if (available < 100) {
@@ -93,7 +93,7 @@ export function truncateToolResultContent(
     return content;
   }
 
-  const indicator = `\n\n… [truncated: ${content.length} → ${maxChars} chars] …\n\n`;
+  const indicator = `\n\n… [truncated: ${content.length} chars exceeded ${maxChars} limit] …\n\n`;
   const available = maxChars - indicator.length;
   if (available <= 0) {
     return content.slice(0, maxChars);
