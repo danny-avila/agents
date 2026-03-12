@@ -661,6 +661,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           agentContext.calibrationRatio = calibrationRatio;
         }
         messagesToUse = context;
+        agentContext.lastTotalMessageCount = messages.length;
+        const systemOffset =
+          context.length > 0 && context[0].getType() === 'system' ? 1 : 0;
+        agentContext.lastContextStartIndex = Math.max(
+          0,
+          messages.length - (context.length - systemOffset)
+        );
 
         const hasPrunedMessages =
           agentContext.summarizationEnabled === true &&
@@ -1091,6 +1098,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   }
 
   createAgentNode(agentId: string): t.CompiledAgentWorfklow {
+    const getConfig = (): RunnableConfig | undefined => this.config;
     const agentContext = this.agentContexts.get(agentId);
     if (!agentContext) {
       throw new Error(`Agent context not found for agentId: ${agentId}`);
@@ -1151,7 +1159,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           graph: {
             contentData: this.contentData,
             contentIndexMap: this.contentIndexMap,
-            config: this.config,
+            get config() {
+              return getConfig();
+            },
             runId: this.runId,
             isMultiAgent: this.isMultiAgentGraph(),
             dispatchRunStep: async (runStep, nodeConfig) => {

@@ -22,6 +22,35 @@ import { ContentTypes, Providers } from '@/common';
 /** Default fraction of the token budget reserved as headroom (5 %). */
 export const DEFAULT_RESERVE_RATIO = 0.05;
 
+/** Context pressure at which observation masking and context fading activate. */
+const PRESSURE_THRESHOLD_MASKING = 0.8;
+
+/** Pressure band thresholds paired with budget factors for progressive context fading. */
+const PRESSURE_BANDS: [number, number][] = [
+  [0.99, 0.05],
+  [0.9, 0.2],
+  [0.85, 0.5],
+  [0.8, 1.0],
+];
+
+/** Maximum character length for masked (consumed) tool results. */
+const MASKED_RESULT_MAX_CHARS = 300;
+
+/** EMA weight for the new calibration ratio (complement is applied to prior). */
+const CALIBRATION_EMA_NEW_WEIGHT = 0.7;
+
+/** Minimum calibration ratio considered safe for application. */
+const CALIBRATION_RATIO_MIN = 1 / 3;
+
+/** Maximum calibration ratio considered safe for application. */
+const CALIBRATION_RATIO_MAX = 2.5;
+
+/** Minimum post-calibration sanity ratio (calibrated sum / raw sum). */
+const POST_CALIBRATION_SANITY_MIN = 0.25;
+
+/** Maximum post-calibration sanity ratio (calibrated sum / raw sum). */
+const POST_CALIBRATION_SANITY_MAX = 3;
+
 export type PruneMessagesFactoryParams = {
   provider?: Providers;
   maxTokens: number;
@@ -145,18 +174,16 @@ function getToolResultId(message: BaseMessage): string | null {
 
 function resolveTokenCountForMessage({
   message,
-  allMessages,
+  messageIndexMap,
   tokenCounter,
   indexTokenCountMap,
 }: {
   message: BaseMessage;
-  allMessages: BaseMessage[];
+  messageIndexMap: Map<BaseMessage, number>;
   tokenCounter: TokenCounter;
   indexTokenCountMap: Record<string, number | undefined>;
 }): number {
-  const originalIndex = allMessages.findIndex(
-    (candidateMessage) => candidateMessage === message
-  );
+  const originalIndex = messageIndexMap.get(message) ?? -1;
   if (originalIndex > -1 && indexTokenCountMap[originalIndex] != null) {
     return indexTokenCountMap[originalIndex] as number;
   }
@@ -182,6 +209,13 @@ export function repairOrphanedToolMessages({
    *  (e.g. a ToolMessage whose parent AI was pruned). */
   droppedMessages: BaseMessage[];
 } {
+  // Pre-build reverse lookup: message → index in allMessages (O(n) once
+  // instead of O(n) per resolveTokenCountForMessage call).
+  const messageIndexMap = new Map<BaseMessage, number>();
+  for (let i = 0; i < allMessages.length; i++) {
+    messageIndexMap.set(allMessages[i], i);
+  }
+
   // Collect all tool_call IDs and tool_result IDs from messages in context
   const validToolCallIds = new Set<string>();
   const presentToolResultIds = new Set<string>();
@@ -201,17 +235,14 @@ export function repairOrphanedToolMessages({
   const droppedMessages: BaseMessage[] = [];
 
   for (const message of context) {
-    // Drop orphan ToolMessages whose AI tool_call is not in context.
-    // This covers two cases: (a) AI messages exist but don't claim this tool_call_id,
-    // (b) no AI messages with tool_calls survived pruning at all.
     if (message.getType() === 'tool') {
       const toolResultId = getToolResultId(message);
       if (toolResultId == null || !validToolCallIds.has(toolResultId)) {
         droppedOrphanCount += 1;
         reclaimedTokens += resolveTokenCountForMessage({
           message,
-          allMessages,
           tokenCounter,
+          messageIndexMap,
           indexTokenCountMap,
         });
         droppedMessages.push(message);
@@ -221,8 +252,6 @@ export function repairOrphanedToolMessages({
       continue;
     }
 
-    // Strip orphan tool_use blocks from AI messages whose ToolMessages are not in context.
-    // Providers like Anthropic/Bedrock require every tool_use to have a matching tool_result.
     if (message.getType() === 'ai' && message instanceof AIMessage) {
       const toolCallIds = getToolCallIds(message);
       if (toolCallIds.size > 0) {
@@ -236,7 +265,7 @@ export function repairOrphanedToolMessages({
         if (hasOrphanToolCalls) {
           const originalTokens = resolveTokenCountForMessage({
             message,
-            allMessages,
+            messageIndexMap,
             tokenCounter,
             indexTokenCountMap,
           });
@@ -249,7 +278,6 @@ export function repairOrphanedToolMessages({
             reclaimedTokens += originalTokens - strippedTokens;
             repairedContext.push(stripped);
           } else {
-            // AI message had only tool_use blocks, nothing left after stripping
             droppedOrphanCount += 1;
             reclaimedTokens += originalTokens;
             droppedMessages.push(message);
@@ -345,6 +373,9 @@ export function sanitizeOrphanToolBlocks(
     const toolCalls = msgAny.tool_calls as Array<{ id?: string }> | undefined;
     if (Array.isArray(toolCalls)) {
       for (const tc of toolCalls) {
+        // Anthropic server tools (web_search, code_execution) use `srvtoolu_` prefixed IDs.
+        // These are executed server-side and never produce client-visible ToolMessages,
+        // so they must be excluded from orphan matching.
         if (
           typeof tc.id === 'string' &&
           tc.id.length > 0 &&
@@ -908,7 +939,7 @@ export function maskConsumedToolResults(params: {
   maxChars?: number;
 }): number {
   const { messages, indexTokenCountMap, tokenCounter } = params;
-  const maxChars = params.maxChars ?? 300;
+  const maxChars = params.maxChars ?? MASKED_RESULT_MAX_CHARS;
   let maskedCount = 0;
 
   // Build set of consumed tool message indices.
@@ -1295,7 +1326,8 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       );
       const ratio =
         totalIndexTokens > 0 ? providerMessageTokens / totalIndexTokens : 0;
-      const isRatioSafe = ratio >= 1 / 3 && ratio <= 2.5;
+      const isRatioSafe =
+        ratio >= CALIBRATION_RATIO_MIN && ratio <= CALIBRATION_RATIO_MAX;
 
       factoryParams.log?.('debug', 'Token estimate variance', {
         ourTotal,
@@ -1314,7 +1346,8 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         lastCalibrationRatio =
           lastCalibrationRatio === 1
             ? ratio
-            : 0.7 * ratio + 0.3 * lastCalibrationRatio;
+            : CALIBRATION_EMA_NEW_WEIGHT * ratio +
+              (1 - CALIBRATION_EMA_NEW_WEIGHT) * lastCalibrationRatio;
 
         // Snapshot the map before calibration for sanity revert
         const preCalibrationSnapshot: Record<string, number | undefined> = {};
@@ -1350,7 +1383,10 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         }
         const sanityRatio =
           totalIndexTokens > 0 ? calibratedSum / totalIndexTokens : 1;
-        if (sanityRatio < 0.25 || sanityRatio > 3) {
+        if (
+          sanityRatio < POST_CALIBRATION_SANITY_MIN ||
+          sanityRatio > POST_CALIBRATION_SANITY_MAX
+        ) {
           // Revert — calibration produced unreasonable values
           for (const [key, value] of Object.entries(preCalibrationSnapshot)) {
             indexTokenCountMap[key] = value;
@@ -1461,14 +1497,11 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     //
     // When summarization is enabled, snapshot messages first so the
     // summarizer can see the full originals when compaction fires.
-    //
-    // TODO: Stage 2 (90%+) — extend masking to more recent consumed results,
-    // keeping only the last 1-2 tool results fully intact.
     // -----------------------------------------------------------------------
     let preFadingMessages: BaseMessage[] | undefined;
     let observationsMasked = 0;
 
-    if (contextPressure >= 0.8) {
+    if (contextPressure >= PRESSURE_THRESHOLD_MASKING) {
       if (factoryParams.summarizationEnabled === true) {
         preFadingMessages = [...params.messages];
       }
@@ -1488,15 +1521,12 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     // When summarization is NOT enabled, apply additional progressive context
     // pressure fading on remaining oversized tool results (unconsumed ones
     // that observation masking left intact).
-    if (contextPressure >= 0.8 && factoryParams.summarizationEnabled !== true) {
-      const pressureBands: [number, number][] = [
-        [0.99, 0.05],
-        [0.9, 0.2],
-        [0.85, 0.5],
-        [0.8, 1.0],
-      ];
+    if (
+      contextPressure >= PRESSURE_THRESHOLD_MASKING &&
+      factoryParams.summarizationEnabled !== true
+    ) {
       const budgetFactor =
-        pressureBands.find(
+        PRESSURE_BANDS.find(
           ([threshold]) => contextPressure >= threshold
         )?.[1] ?? 1.0;
 

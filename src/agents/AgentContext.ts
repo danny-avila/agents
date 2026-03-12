@@ -17,6 +17,18 @@ import { DEFAULT_RESERVE_RATIO } from '@/messages';
 import { toJsonSchema } from '@/utils/schema';
 
 /**
+ * Anthropic wraps tool schemas in an XML-like structure with full parameter
+ * descriptions, roughly 2.6× the raw JSON token count.
+ */
+const ANTHROPIC_TOOL_TOKEN_MULTIPLIER = 2.6;
+
+/**
+ * OpenAI and other providers use a lighter function-calling format,
+ * roughly 1.4× the raw JSON token count.
+ */
+const DEFAULT_TOOL_TOKEN_MULTIPLIER = 1.4;
+
+/**
  * Encapsulates agent-specific state that can vary between agents in a multi-agent system
  */
 export class AgentContext {
@@ -158,6 +170,15 @@ export class AgentContext {
   private _toolTokensCalibrated: boolean = false;
   /** Running calibration ratio from the pruner — persisted across runs via contextMeta. */
   calibrationRatio: number = 1;
+  /**
+   * First index in `indexTokenCountMap` that is still in the active context.
+   * Entries below this index belong to pruned messages and must be excluded
+   * from calibration sums to avoid overcounting.  Updated by the graph after
+   * each pruning pass.
+   */
+  lastContextStartIndex: number = 0;
+  /** Total message count in the full (pre-pruned) array, used with lastContextStartIndex. */
+  lastTotalMessageCount: number = 0;
 
   /** Total instruction overhead: system message + tool schemas + pending summary. */
   get instructionTokens(): number {
@@ -725,7 +746,17 @@ export class AgentContext {
     const isAnthropic =
       this.provider === Providers.ANTHROPIC ||
       /anthropic|claude/i.test(modelId);
-    const toolTokenMultiplier = isAnthropic ? 2.6 : 1.4;
+    /**
+     * Tool schemas are encoded differently by each provider before counting
+     * against the context window.  Anthropic wraps each tool in XML-like
+     * structure with parameter descriptions, roughly 2.6× the raw JSON token
+     * count.  OpenAI/others use a lighter function-calling format at ~1.4×.
+     * These initial estimates are corrected by `updateLastCallUsage` once
+     * real provider usage arrives.
+     */
+    const toolTokenMultiplier = isAnthropic
+      ? ANTHROPIC_TOOL_TOKEN_MULTIPLIER
+      : DEFAULT_TOOL_TOKEN_MULTIPLIER;
     this.toolSchemaTokens = Math.ceil(toolTokens * toolTokenMultiplier);
   }
 
@@ -803,6 +834,8 @@ export class AgentContext {
     this.indexTokenCountMap = newTokenMap;
     this.baseIndexTokenCountMap = { ...newTokenMap };
     this._lastSummarizationMsgCount = Object.keys(newTokenMap).length;
+    this.lastContextStartIndex = 0;
+    this.lastTotalMessageCount = Object.keys(newTokenMap).length;
     this.currentUsage = undefined;
     this.lastCallUsage = undefined;
     this.totalTokensFresh = false;
@@ -943,8 +976,12 @@ export class AgentContext {
 
     if (totalInputTokens > 0) {
       let messageTokens = 0;
-      for (const val of Object.values(this.indexTokenCountMap)) {
-        messageTokens += val ?? 0;
+      const endIndex =
+        this.lastTotalMessageCount ||
+        Object.keys(this.indexTokenCountMap).length;
+      for (let i = this.lastContextStartIndex; i < endIndex; i++) {
+        messageTokens +=
+          (this.indexTokenCountMap[i] as number | undefined) ?? 0;
       }
       const providerInstructionTokens = totalInputTokens - messageTokens;
       if (providerInstructionTokens <= 0) {
