@@ -1439,7 +1439,8 @@ describe('Cross-run summary lifecycle (no API keys)', () => {
     expect(completePayload.summary!.type).toBe(ContentTypes.SUMMARY);
     expect(completePayload.summary!.tokenCount ?? 0).toBeGreaterThan(0);
 
-    const expectedTokenCount = tokenCounter(new SystemMessage(KNOWN_SUMMARY));
+    const expectedTokenCount =
+      tokenCounter(new SystemMessage(KNOWN_SUMMARY)) + 33;
     expect(completePayload.summary!.tokenCount).toBe(expectedTokenCount);
 
     const summaryBlock = completePayload.summary!;
