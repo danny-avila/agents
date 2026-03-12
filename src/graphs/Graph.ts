@@ -1189,6 +1189,31 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                 );
               }
             },
+            dispatchRunStepCompleted: async (
+              stepId: string,
+              result: t.StepCompleted,
+              nodeConfig?: RunnableConfig
+            ) => {
+              const resolvedConfig = nodeConfig ?? this.config;
+              const runStep = this.contentData.find((s) => s.id === stepId);
+              const handler = this.handlerRegistry?.getHandler(
+                GraphEvents.ON_RUN_STEP_COMPLETED
+              );
+              if (handler) {
+                await handler.handle(
+                  GraphEvents.ON_RUN_STEP_COMPLETED,
+                  {
+                    result: {
+                      ...result,
+                      id: stepId,
+                      index: runStep?.index ?? 0,
+                    },
+                  },
+                  resolvedConfig?.configurable,
+                  this
+                );
+              }
+            },
           },
           generateStepId: (stepKey: string) => this.generateStepId(stepKey),
         })

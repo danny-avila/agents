@@ -108,7 +108,12 @@ export interface RunStepDeltaEvent {
 
 export type StepDetails = MessageCreationDetails | ToolCallsDetails;
 
-export type StepCompleted = ToolCallCompleted;
+export type SummaryCompleted = {
+  type: 'summary';
+  summary: SummaryContentBlock;
+};
+
+export type StepCompleted = ToolCallCompleted | SummaryCompleted;
 
 export type MessageCreationDetails = {
   type: StepTypes.MESSAGE_CREATION;
@@ -166,6 +171,7 @@ export type ToolCallsDetails = {
 export type ToolCallDelta = {
   type: StepTypes;
   tool_calls?: ToolCallChunk[]; // #new
+  summary?: SummaryContentBlock;
 };
 
 export type AgentToolCall =

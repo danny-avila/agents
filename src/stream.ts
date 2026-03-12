@@ -768,24 +768,29 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         });
       }
     } else if (event === GraphEvents.ON_RUN_STEP_COMPLETED) {
-      const { result } = data as unknown as { result: t.ToolEndEvent };
+      const { result } = data as unknown as {
+        result:
+          | t.ToolEndEvent
+          | (t.SummaryCompleted & { id: string; index: number });
+      };
 
       const { id: stepId } = result;
 
       const runStep = stepMap.get(stepId);
       if (!runStep) {
-        console.warn(
-          'No run step or runId found for completed tool call event'
-        );
+        console.warn('No run step or runId found for completed step event');
         return;
       }
 
-      const contentPart: t.MessageContentComplex = {
-        type: ContentTypes.TOOL_CALL,
-        tool_call: result.tool_call,
-      };
-
-      updateContent(runStep.index, contentPart, true);
+      if (result.type === ContentTypes.SUMMARY && 'summary' in result) {
+        contentParts[runStep.index] = result.summary as t.MessageContentComplex;
+      } else if ('tool_call' in result) {
+        const contentPart: t.MessageContentComplex = {
+          type: ContentTypes.TOOL_CALL,
+          tool_call: (result as t.ToolEndEvent).tool_call,
+        };
+        updateContent(runStep.index, contentPart, true);
+      }
     }
   };
 

@@ -219,6 +219,11 @@ interface CreateSummarizeNodeParams {
       runStep: t.RunStep,
       config?: RunnableConfig
     ) => Promise<void>;
+    dispatchRunStepCompleted: (
+      stepId: string,
+      result: t.StepCompleted,
+      config?: RunnableConfig
+    ) => Promise<void>;
   };
   generateStepId: (stepKey: string) => [string, number];
 }
@@ -544,6 +549,12 @@ export function createSummarizeNode({
     };
 
     runStep.summary = summaryBlock;
+
+    await graph.dispatchRunStepCompleted(
+      stepId,
+      { type: 'summary', summary: summaryBlock } satisfies t.SummaryCompleted,
+      runnableConfig
+    );
 
     if (runnableConfig) {
       await safeDispatchCustomEvent(
