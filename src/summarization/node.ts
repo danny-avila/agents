@@ -105,65 +105,6 @@ function separateParameters(parameters: Record<string, unknown>): {
 }
 
 /**
- * Extracts usage metadata from an LLM response message, handling provider differences:
- * - Standard: `usage_metadata` directly on the message
- * - Bedrock: `response_metadata.metadata.usage` with camelCase keys
- * - Other: `response_metadata.usage`
- */
-function extractUsageFromMessage(
-  message:
-    | Partial<{ usage_metadata: unknown; response_metadata: unknown }>
-    | undefined
-): Partial<UsageMetadata> | undefined {
-  if (message == null) {
-    return undefined;
-  }
-
-  const usageMeta = message.usage_metadata as
-    | Partial<UsageMetadata>
-    | undefined;
-  if (usageMeta?.input_tokens != null || usageMeta?.output_tokens != null) {
-    return usageMeta;
-  }
-
-  const respMeta = message.response_metadata as
-    | Record<string, unknown>
-    | undefined;
-  if (respMeta == null) {
-    return undefined;
-  }
-
-  // Bedrock nests usage under response_metadata.metadata.usage with camelCase keys
-  const nested =
-    (respMeta.metadata as Record<string, unknown> | undefined)?.usage ??
-    respMeta.usage;
-  if (nested == null || typeof nested !== 'object') {
-    return undefined;
-  }
-
-  const raw = nested as Record<string, unknown>;
-  const inputTokens = Number(raw.inputTokens ?? raw.input_tokens) || undefined;
-  const outputTokens =
-    Number(raw.outputTokens ?? raw.output_tokens) || undefined;
-  if (inputTokens == null && outputTokens == null) {
-    return undefined;
-  }
-
-  return {
-    input_tokens: inputTokens,
-    output_tokens: outputTokens,
-    ...(raw.cacheReadInputTokens != null || raw.cacheWriteInputTokens != null
-      ? {
-        input_token_details: {
-          cache_read: Number(raw.cacheReadInputTokens) || undefined,
-          cache_creation: Number(raw.cacheWriteInputTokens) || undefined,
-        },
-      }
-      : {}),
-  } as Partial<UsageMetadata>;
-}
-
-/**
  * Generates a structural metadata summary without making an LLM call.
  * Used as a last-resort fallback when all summarization attempts fail.
  * Preserves tool names and message counts so the agent retains basic context.
@@ -470,6 +411,12 @@ export function createSummarizeNode({
         provider: provider as Providers,
         reasoningKey: agentContext.reasoningKey,
         usePromptCache: isSelfSummarizeModel && hasPromptCache,
+        log: (level, message, data) => {
+          emitAgentLog(runnableConfig, level, 'summarize', message, data, {
+            runId: graph.runId,
+            agentId: request.agentId,
+          });
+        },
       });
       summaryText = summarizeResult.text;
       summaryUsage = summarizeResult.usage;
@@ -574,10 +521,6 @@ export function createSummarizeNode({
     }
 
     agentContext.setSummary(summaryText, tokenCount);
-
-    if (summaryUsage) {
-      agentContext.updateLastCallUsage(summaryUsage);
-    }
 
     emitAgentLog(
       runnableConfig,
@@ -784,6 +727,7 @@ async function summarizeWithCacheHit({
   provider,
   reasoningKey,
   usePromptCache,
+  log,
 }: {
   model: t.ChatModel;
   messages: BaseMessage[];
@@ -795,6 +739,11 @@ async function summarizeWithCacheHit({
   provider: Providers;
   reasoningKey?: 'reasoning_content' | 'reasoning';
   usePromptCache?: boolean;
+  log?: (
+    level: 'debug' | 'info' | 'warn' | 'error',
+    message: string,
+    data?: Record<string, unknown>
+  ) => void;
 }): Promise<{ text: string; usage?: Partial<UsageMetadata> }> {
   const instruction = buildSummarizationInstruction(
     promptText,
@@ -830,6 +779,33 @@ async function summarizeWithCacheHit({
   const text = responseMsg
     ? extractResponseText(responseMsg as { content: string | object })
     : '';
-  const usage = extractUsageFromMessage(responseMsg);
+  let usage: Partial<UsageMetadata> | undefined;
+  let usageSource = 'none';
+  if (
+    responseMsg != null &&
+    'usage_metadata' in responseMsg &&
+    responseMsg.usage_metadata != null
+  ) {
+    usage = responseMsg.usage_metadata as Partial<UsageMetadata>;
+    usageSource = 'usage_metadata';
+  } else if (responseMsg != null) {
+    const respMeta = responseMsg.response_metadata as
+      | Record<string, unknown>
+      | undefined;
+    const raw = (respMeta?.metadata as Record<string, unknown> | undefined)
+      ?.usage as Record<string, unknown> | undefined;
+    if (raw != null) {
+      usage = {
+        input_tokens: Number(raw.inputTokens) || undefined,
+        output_tokens: Number(raw.outputTokens) || undefined,
+      } as Partial<UsageMetadata>;
+      usageSource = 'response_metadata';
+    }
+  }
+  log?.('debug', 'Summarization LLM usage', {
+    source: usageSource,
+    input_tokens: usage?.input_tokens,
+    output_tokens: usage?.output_tokens,
+  });
   return { text, usage };
 }
