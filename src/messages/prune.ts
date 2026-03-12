@@ -43,13 +43,13 @@ const CALIBRATION_EMA_NEW_WEIGHT = 0.7;
 const CALIBRATION_RATIO_MIN = 1 / 3;
 
 /** Maximum calibration ratio considered safe for application. */
-const CALIBRATION_RATIO_MAX = 3;
+const CALIBRATION_RATIO_MAX = 3.5;
 
 /** Minimum post-calibration sanity ratio (calibrated sum / raw sum). */
 const POST_CALIBRATION_SANITY_MIN = 0.25;
 
 /** Maximum post-calibration sanity ratio (calibrated sum / raw sum). */
-const POST_CALIBRATION_SANITY_MAX = 3;
+const POST_CALIBRATION_SANITY_MAX = 3.5;
 
 export type PruneMessagesFactoryParams = {
   provider?: Providers;
@@ -1180,6 +1180,11 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
   /** Best observed instruction overhead from a near-zero variance turn. */
   let bestInstructionOverhead: number | undefined;
   let bestVarianceAbs = Infinity;
+  /** Whether truncation/masking ran on the previous turn — if so, the provider
+   *  saw truncated content but the calibration block would compare against
+   *  pre-truncation estimates, producing wild ratios. */
+  let lastTurnHadTruncation = false;
+  let hasAppliedCalibration = false;
 
   return function pruneMessages(params: PruneMessagesParams): {
     context: BaseMessage[];
@@ -1301,16 +1306,24 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     // Uses lastCallUsage (single-call) when available to avoid inflated ratios from
     // accumulated cacheRead across N tool-call round-trips.
     // Gated on totalTokensFresh to avoid applying stale ratios.
-    if (currentUsage && params.totalTokensFresh !== false) {
+    const skipCalibration = lastTurnHadTruncation;
+    if (currentUsage && params.totalTokensFresh !== false && !skipCalibration) {
       const instructionOverhead = factoryParams.getInstructionTokens?.() ?? 0;
       const providerInputTokens =
         params.lastCallUsage?.inputTokens ?? currentUsage.input_tokens;
 
       let totalIndexTokens = 0;
+      let toolMsgTokens = 0;
+      let otherMsgTokens = 0;
+      let toolMsgCount = 0;
+      let otherMsgCount = 0;
       const firstIsSystem =
         params.messages.length > 0 && params.messages[0].getType() === 'system';
       if (firstIsSystem) {
-        totalIndexTokens += indexTokenCountMap[0] ?? 0;
+        const t = indexTokenCountMap[0] ?? 0;
+        totalIndexTokens += t;
+        otherMsgTokens += t;
+        otherMsgCount++;
       }
       for (let i = lastCutOffIndex; i < params.messages.length; i++) {
         if (i === 0 && firstIsSystem) {
@@ -1319,7 +1332,15 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         if (newOutputs.has(i)) {
           continue;
         }
-        totalIndexTokens += indexTokenCountMap[i] ?? 0;
+        const t = indexTokenCountMap[i] ?? 0;
+        totalIndexTokens += t;
+        if (params.messages[i]?.getType() === 'tool') {
+          toolMsgTokens += t;
+          toolMsgCount++;
+        } else {
+          otherMsgTokens += t;
+          otherMsgCount++;
+        }
       }
 
       const ourTotal = instructionOverhead + totalIndexTokens;
@@ -1333,7 +1354,8 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       const ratio =
         totalIndexTokens > 0 ? providerMessageTokens / totalIndexTokens : 0;
       const isRatioSafe =
-        ratio >= CALIBRATION_RATIO_MIN && ratio <= CALIBRATION_RATIO_MAX;
+        !hasAppliedCalibration ||
+        (ratio >= CALIBRATION_RATIO_MIN && ratio <= CALIBRATION_RATIO_MAX);
 
       // When variance is near zero and messages are calibrated, we have a
       // confident reading of the real instruction overhead.  Track the best
@@ -1350,26 +1372,36 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         );
       }
 
+      const msgCount = toolMsgCount + otherMsgCount;
+      const providerAvgPerMsg =
+        msgCount > 0 && providerMessageTokens > 0
+          ? Math.round(providerMessageTokens / msgCount)
+          : undefined;
+
       factoryParams.log?.('debug', 'Token estimate variance', {
         ourTotal,
         providerInputTokens,
         variance: `${variancePct > 0 ? '+' : ''}${variancePct}%`,
         instructionOverhead,
         messageEstimate: totalIndexTokens,
+        toolMsgEstimate: toolMsgTokens,
+        toolMsgCount,
+        otherMsgEstimate: otherMsgTokens,
+        otherMsgCount,
+        providerAvgPerMsg,
         messageCalibrationRatio: Math.round(ratio * 100) / 100,
         calibrationApplied: isRatioSafe,
         runningEMA: Math.round(lastCalibrationRatio * 100) / 100,
       });
 
       if (isRatioSafe) {
-        // Update running EMA: blend new ratio with prior (70/30).
-        // This smooths noise across turns and provides a useful default
-        // for turns where usage_metadata is absent.
-        lastCalibrationRatio =
-          lastCalibrationRatio === 1
-            ? ratio
-            : CALIBRATION_EMA_NEW_WEIGHT * ratio +
-              (1 - CALIBRATION_EMA_NEW_WEIGHT) * lastCalibrationRatio;
+        // First calibration: apply the full ratio directly.
+        // Subsequent: blend via EMA (70/30) to smooth noise.
+        lastCalibrationRatio = !hasAppliedCalibration
+          ? ratio
+          : CALIBRATION_EMA_NEW_WEIGHT * ratio +
+            (1 - CALIBRATION_EMA_NEW_WEIGHT) * lastCalibrationRatio;
+        hasAppliedCalibration = true;
 
         // Snapshot the map before calibration for sanity revert
         const preCalibrationSnapshot: Record<string, number | undefined> = {};
@@ -2019,6 +2051,11 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       0,
       Math.min(pruningBudget, initialRemainingContextTokens + reclaimedTokens)
     );
+
+    lastTurnHadTruncation =
+      observationsMasked > 0 ||
+      preFlightResultCount > 0 ||
+      preFlightInputCount > 0;
 
     runThinkingStartIndex = thinkingStartIndex ?? -1;
     /** The index is the first value of `context`, index relative to `params.messages` */
