@@ -51,6 +51,7 @@ import {
 } from '@/common';
 import {
   resetIfNotEmpty,
+  isAnthropicModel,
   isOpenAILike,
   isGoogleLike,
   joinKeys,
@@ -876,10 +877,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           | undefined;
         if (openRouterOptions?.promptCache === true) {
           const model = (agentContext.clientOptions as t.OpenAIClientOptions)?.model;
-          const isClaudeModel =
-            model?.includes('claude') === true ||
-            model?.includes('anthropic') === true;
-          if (isClaudeModel) {
+          if (isAnthropicModel(model)) {
             finalMessages = addCacheControl<BaseMessage>(finalMessages);
           }
         }
