@@ -6,7 +6,6 @@ import {
   BaseMessage,
   HumanMessage,
   SystemMessage,
-  getBufferString,
 } from '@langchain/core/messages';
 import type { MessageContentImageUrl } from '@langchain/core/messages';
 import type { ToolCall } from '@langchain/core/messages/tool';
@@ -998,6 +997,82 @@ export function shiftIndexTokenCountMap(
   return shiftedMap;
 }
 
+/** Image content type constants for detection. */
+const IMAGE_TYPES = new Set(['image_url', 'image']);
+
+/**
+ * Builds a structured content array from a tool-call sequence (AI message +
+ * following ToolMessages) for inclusion in a HumanMessage.
+ *
+ * Text and tool-call metadata are serialized to text blocks, but image content
+ * blocks are preserved as-is so that the API processes them as native images
+ * instead of as (enormous) base64 text strings.
+ */
+function buildToolSequenceContent(
+  toolSequence: BaseMessage[]
+): MessageContentComplex[] {
+  const parts: MessageContentComplex[] = [];
+  const textChunks: string[] = ['[Previous agent context]'];
+
+  const flushText = (): void => {
+    if (textChunks.length === 0) {
+      return;
+    }
+    parts.push({
+      type: ContentTypes.TEXT,
+      text: textChunks.join('\n'),
+    } as MessageContentComplex);
+    textChunks.length = 0;
+  };
+
+  for (const msg of toolSequence) {
+    const role =
+      msg instanceof HumanMessage
+        ? 'Human'
+        : msg instanceof ToolMessage
+          ? 'Tool'
+          : 'AI';
+
+    const { content } = msg;
+
+    if (typeof content === 'string') {
+      if (content) {
+        textChunks.push(`${role}: ${content}`);
+      }
+    } else if (Array.isArray(content)) {
+      for (const block of content as ExtendedMessageContent[]) {
+        if (IMAGE_TYPES.has(block.type ?? '')) {
+          flushText();
+          parts.push(block as unknown as MessageContentComplex);
+        } else {
+          const text = block.text ?? block.input;
+          if (typeof text === 'string' && text) {
+            textChunks.push(`${role}: ${text}`);
+          } else if (block.type === 'tool_use') {
+            textChunks.push(
+              `${role}: [tool_use] ${String(block.name ?? '')} ${JSON.stringify(block.input ?? {})}`
+            );
+          }
+        }
+      }
+    }
+
+    if (role === 'AI') {
+      const aiMsg = msg as AIMessage;
+      if (aiMsg.tool_calls && aiMsg.tool_calls.length > 0) {
+        for (const tc of aiMsg.tool_calls) {
+          textChunks.push(
+            `AI: [tool_call] ${tc.name}(${JSON.stringify(tc.args)})`
+          );
+        }
+      }
+    }
+  }
+
+  flushText();
+  return parts;
+}
+
 /**
  * Ensures compatibility when switching from a non-thinking agent to a thinking-enabled agent.
  * Converts AI messages with tool calls (that lack thinking/reasoning blocks) into buffer strings,
@@ -1112,14 +1187,12 @@ export function ensureThinkingBlockInMessages(
         j++;
       }
 
-      // Convert the sequence to a buffer string and wrap in a HumanMessage
-      // This avoids the thinking block requirement which only applies to AI messages
-      const bufferString = getBufferString(toolSequence);
-      result.push(
-        new HumanMessage({
-          content: `[Previous agent context]\n${bufferString}`,
-        })
-      );
+      // Convert the sequence to a HumanMessage, preserving structured content
+      // (especially images) to avoid serializing binary data as text tokens.
+      // getBufferString() would dump base64 image data as text, causing massive
+      // token amplification (e.g. 174× for a single screenshot).
+      const contentBlocks = buildToolSequenceContent(toolSequence);
+      result.push(new HumanMessage({ content: contentBlocks }));
 
       // Skip the messages we've processed
       i = j;
