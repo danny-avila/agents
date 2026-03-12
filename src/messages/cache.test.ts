@@ -7,6 +7,7 @@ import {
 } from '@langchain/core/messages';
 import type Anthropic from '@anthropic-ai/sdk';
 import type { AnthropicMessages } from '@/types/messages';
+import { _convertMessagesToOpenAIParams } from '@/llm/openai/utils';
 import {
   stripAnthropicCacheControl,
   stripBedrockCacheControl,
@@ -1379,5 +1380,61 @@ describe('LangChain message type preservation', () => {
     // Verify tool_calls are preserved
     expect((result[1] as AIMessage).tool_calls).toHaveLength(1);
     expect((result[1] as AIMessage).tool_calls![0].name).toBe('navigate');
+  });
+});
+
+describe('OpenRouter cache_control compatibility', () => {
+  it('addCacheControl output preserves cache_control through OpenAI message conversion', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage({
+        content: [{ type: 'text', text: 'You are a helpful assistant.' }],
+      }),
+      new AIMessage({ content: [{ type: 'text', text: 'Sure, how can I help?' }] }),
+      new HumanMessage({
+        content: [{ type: 'text', text: 'What is prompt caching?' }],
+      }),
+    ];
+
+    const cached = addCacheControl(messages);
+
+    const openAIParams = _convertMessagesToOpenAIParams(cached);
+
+    const firstUserParam = openAIParams[0];
+    const lastUserParam = openAIParams[2];
+
+    expect(Array.isArray(firstUserParam.content)).toBe(true);
+    expect(Array.isArray(lastUserParam.content)).toBe(true);
+
+    const firstBlock = (firstUserParam.content as Anthropic.TextBlockParam[])[0];
+    const lastBlock = (lastUserParam.content as Anthropic.TextBlockParam[])[0];
+
+    expect(firstBlock).toHaveProperty('cache_control');
+    expect(firstBlock.cache_control).toEqual({ type: 'ephemeral' });
+    expect(lastBlock).toHaveProperty('cache_control');
+    expect(lastBlock.cache_control).toEqual({ type: 'ephemeral' });
+  });
+
+  it('addCacheControl works with LangChain messages for OpenRouter Anthropic models', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage({ content: 'System prompt with large context' }),
+      new AIMessage({ content: 'I understand.' }),
+      new HumanMessage({ content: 'What triggered the collapse?' }),
+    ];
+
+    const result = addCacheControl(messages);
+
+    const firstContent = result[0].content as MessageContentComplex[];
+    const lastContent = result[2].content as MessageContentComplex[];
+
+    expect(firstContent[0]).toEqual({
+      type: 'text',
+      text: 'System prompt with large context',
+      cache_control: { type: 'ephemeral' },
+    });
+    expect(lastContent[0]).toEqual({
+      type: 'text',
+      text: 'What triggered the collapse?',
+      cache_control: { type: 'ephemeral' },
+    });
   });
 });
