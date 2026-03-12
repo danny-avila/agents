@@ -105,6 +105,65 @@ function separateParameters(parameters: Record<string, unknown>): {
 }
 
 /**
+ * Extracts usage metadata from an LLM response message, handling provider differences:
+ * - Standard: `usage_metadata` directly on the message
+ * - Bedrock: `response_metadata.metadata.usage` with camelCase keys
+ * - Other: `response_metadata.usage`
+ */
+function extractUsageFromMessage(
+  message:
+    | Partial<{ usage_metadata: unknown; response_metadata: unknown }>
+    | undefined
+): Partial<UsageMetadata> | undefined {
+  if (message == null) {
+    return undefined;
+  }
+
+  const usageMeta = message.usage_metadata as
+    | Partial<UsageMetadata>
+    | undefined;
+  if (usageMeta?.input_tokens != null || usageMeta?.output_tokens != null) {
+    return usageMeta;
+  }
+
+  const respMeta = message.response_metadata as
+    | Record<string, unknown>
+    | undefined;
+  if (respMeta == null) {
+    return undefined;
+  }
+
+  // Bedrock nests usage under response_metadata.metadata.usage with camelCase keys
+  const nested =
+    (respMeta.metadata as Record<string, unknown> | undefined)?.usage ??
+    respMeta.usage;
+  if (nested == null || typeof nested !== 'object') {
+    return undefined;
+  }
+
+  const raw = nested as Record<string, unknown>;
+  const inputTokens = Number(raw.inputTokens ?? raw.input_tokens) || undefined;
+  const outputTokens =
+    Number(raw.outputTokens ?? raw.output_tokens) || undefined;
+  if (inputTokens == null && outputTokens == null) {
+    return undefined;
+  }
+
+  return {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    ...(raw.cacheReadInputTokens != null || raw.cacheWriteInputTokens != null
+      ? {
+        input_token_details: {
+          cache_read: Number(raw.cacheReadInputTokens) || undefined,
+          cache_creation: Number(raw.cacheWriteInputTokens) || undefined,
+        },
+      }
+      : {}),
+  } as Partial<UsageMetadata>;
+}
+
+/**
  * Generates a structural metadata summary without making an LLM call.
  * Used as a last-resort fallback when all summarization attempts fail.
  * Preserves tool names and message counts so the agent retains basic context.
@@ -771,12 +830,6 @@ async function summarizeWithCacheHit({
   const text = responseMsg
     ? extractResponseText(responseMsg as { content: string | object })
     : '';
-  const msg = responseMsg as
-    | {
-        usage_metadata?: Partial<UsageMetadata>;
-        response_metadata?: { usage?: Partial<UsageMetadata> };
-      }
-    | undefined;
-  const usage = msg?.usage_metadata ?? msg?.response_metadata?.usage;
+  const usage = extractUsageFromMessage(responseMsg);
   return { text, usage };
 }
