@@ -118,6 +118,10 @@ export type RunConfig = {
   /**
    * Calibration ratio from a previous run's contextMeta.
    * Seeds the pruner's EMA so new messages are scaled immediately.
+   *
+   * Hosts should persist the value returned by `Run.getCalibrationRatio()`
+   * after each run and pass it back here on subsequent runs for the same
+   * conversation. Without this, the EMA resets to 1 on every new Run instance.
    */
   calibrationRatio?: number;
   /** Skip post-stream cleanup (clearHeavyState) — useful for tests that inspect graph state after processStream */
