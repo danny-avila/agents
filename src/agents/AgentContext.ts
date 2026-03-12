@@ -1008,12 +1008,11 @@ export class AgentContext {
         this.toolSchemaTokens = Math.max(0, this.toolSchemaTokens + gap);
         this._toolTokensCalibrated = true;
       } else if (this._toolTokensCalibrated && Math.abs(gap) > 0) {
-        // Subsequent calibrations: apply a dampened adjustment (30% of gap)
-        // to avoid oscillation.  The instruction overhead estimate is derived
-        // from provider_input - message_estimate, so it's sensitive to message
-        // token errors.  Full-gap swings cause wild oscillation when message
-        // calibration and instruction calibration correct in alternating turns.
-        const dampened = Math.round(gap * 0.3);
+        // When there are no messages (e.g. first call after summarization),
+        // the gap is purely tool schema + summary vs provider — no message
+        // estimation noise.  Apply the full gap for immediate convergence.
+        // Otherwise dampen to 30% to avoid oscillation from message token errors.
+        const dampened = messageTokens === 0 ? gap : Math.round(gap * 0.3);
         if (dampened === 0) {
           return;
         }
