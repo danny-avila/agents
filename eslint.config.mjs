@@ -93,6 +93,7 @@ export default defineConfig([globalIgnores([
         "@typescript-eslint/consistent-type-assertions": "error",
         "@typescript-eslint/explicit-function-return-type": "error",
         "@typescript-eslint/no-explicit-any": "error",
+        "no-nested-ternary": "warn",
         "@typescript-eslint/no-unnecessary-condition": "warn",
         "@typescript-eslint/strict-boolean-expressions": "warn",
     },
