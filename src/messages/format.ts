@@ -1026,12 +1026,12 @@ function buildToolSequenceContent(
   };
 
   for (const msg of toolSequence) {
-    const role =
-      msg instanceof HumanMessage
-        ? 'Human'
-        : msg instanceof ToolMessage
-          ? 'Tool'
-          : 'AI';
+    let role = 'AI';
+    if (msg instanceof HumanMessage) {
+      role = 'Human';
+    } else if (msg instanceof ToolMessage) {
+      role = 'Tool';
+    }
 
     const { content } = msg;
 
