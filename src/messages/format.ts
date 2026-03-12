@@ -1373,7 +1373,7 @@ export function ensureThinkingBlockInMessages(
         'warn',
         'format',
         'ensureThinkingBlockInMessages: injecting [Previous agent context] HumanMessage' +
-          ` (${toolSequence.length} msgs at index ${i}, no thinking block in chain)`
+          ` (${parts.length} msgs at index ${i}, no thinking block in chain)`
       );
       result.push(new HumanMessage({ content: parts }));
       i = j;
