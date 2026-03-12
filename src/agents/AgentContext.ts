@@ -573,21 +573,23 @@ export class AgentContext {
 
       let body: BaseMessage[];
       if (hasSummaryBody) {
-        // When prompt caching is active, add cache_control directly to the
-        // summary HumanMessage.  This ensures caching works even on
-        // clean-slate calls where the summary is the only message
-        // (addCacheControl requires >= 2 messages to activate).
+        const wrappedSummary =
+          '<summary>\n' +
+          (this.summaryText as string) +
+          '\n</summary>\n\n' +
+          'Your context window was compacted. This is your checkpoint, resume where you left off.';
+
         const summaryMsg = usePromptCache
           ? new HumanMessage({
             content: [
               {
                 type: 'text',
-                text: this.summaryText as string,
+                text: wrappedSummary,
                 cache_control: { type: 'ephemeral' },
               },
             ],
           })
-          : new HumanMessage(this.summaryText as string);
+          : new HumanMessage(wrappedSummary);
         body = [summaryMsg, ...messages];
       } else {
         body = messages;
