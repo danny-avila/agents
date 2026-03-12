@@ -683,7 +683,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             shouldTriggerSummarization({
               trigger: agentContext.summarizationConfig?.trigger,
               maxContextTokens: agentContext.maxContextTokens,
-              prePruneTotalTokens,
+              prePruneTotalTokens:
+                prePruneTotalTokens != null
+                  ? prePruneTotalTokens + agentContext.instructionTokens
+                  : undefined,
               remainingContextTokens,
               messagesToRefineCount: messagesToRefine.length,
             });
