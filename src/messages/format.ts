@@ -1000,77 +1000,83 @@ export function shiftIndexTokenCountMap(
 /** Image content type constants for detection. */
 const IMAGE_TYPES = new Set(['image_url', 'image']);
 
+/** Flushes accumulated text chunks into `parts` as a single text block. */
+function flushTextChunks(
+  textChunks: string[],
+  parts: MessageContentComplex[]
+): void {
+  if (textChunks.length === 0) {
+    return;
+  }
+  parts.push({
+    type: ContentTypes.TEXT,
+    text: textChunks.join('\n'),
+  } as MessageContentComplex);
+  textChunks.length = 0;
+}
+
 /**
- * Builds a structured content array from a tool-call sequence (AI message +
- * following ToolMessages) for inclusion in a HumanMessage.
- *
- * Text and tool-call metadata are serialized to text blocks, but image content
- * blocks are preserved as-is so that the API processes them as native images
- * instead of as (enormous) base64 text strings.
+ * Appends a single message's content to the running `textChunks` / `parts`
+ * accumulators. Image blocks are flushed into `parts` as-is; everything else
+ * is serialized to text so that binary data (base64 images) never becomes
+ * text tokens.
  */
-function buildToolSequenceContent(
-  toolSequence: BaseMessage[]
-): MessageContentComplex[] {
-  const parts: MessageContentComplex[] = [];
-  const textChunks: string[] = ['[Previous agent context]'];
+function appendMessageContent(
+  msg: BaseMessage,
+  role: string,
+  textChunks: string[],
+  parts: MessageContentComplex[]
+): void {
+  const { content } = msg;
 
-  const flushText = (): void => {
-    if (textChunks.length === 0) {
-      return;
+  if (typeof content === 'string') {
+    if (content) {
+      textChunks.push(`${role}: ${content}`);
     }
-    parts.push({
-      type: ContentTypes.TEXT,
-      text: textChunks.join('\n'),
-    } as MessageContentComplex);
-    textChunks.length = 0;
-  };
+    appendToolCalls(msg, role, textChunks);
+    return;
+  }
 
-  for (const msg of toolSequence) {
-    let role = 'AI';
-    if (msg instanceof HumanMessage) {
-      role = 'Human';
-    } else if (msg instanceof ToolMessage) {
-      role = 'Tool';
-    }
+  if (!Array.isArray(content)) {
+    appendToolCalls(msg, role, textChunks);
+    return;
+  }
 
-    const { content } = msg;
-
-    if (typeof content === 'string') {
-      if (content) {
-        textChunks.push(`${role}: ${content}`);
-      }
-    } else if (Array.isArray(content)) {
-      for (const block of content as ExtendedMessageContent[]) {
-        if (IMAGE_TYPES.has(block.type ?? '')) {
-          flushText();
-          parts.push(block as unknown as MessageContentComplex);
-        } else {
-          const text = block.text ?? block.input;
-          if (typeof text === 'string' && text) {
-            textChunks.push(`${role}: ${text}`);
-          } else if (block.type === 'tool_use') {
-            textChunks.push(
-              `${role}: [tool_use] ${String(block.name ?? '')} ${JSON.stringify(block.input ?? {})}`
-            );
-          }
-        }
-      }
+  for (const block of content as ExtendedMessageContent[]) {
+    if (IMAGE_TYPES.has(block.type ?? '')) {
+      flushTextChunks(textChunks, parts);
+      parts.push(block as unknown as MessageContentComplex);
+      continue;
     }
 
-    if (role === 'AI') {
-      const aiMsg = msg as AIMessage;
-      if (aiMsg.tool_calls && aiMsg.tool_calls.length > 0) {
-        for (const tc of aiMsg.tool_calls) {
-          textChunks.push(
-            `AI: [tool_call] ${tc.name}(${JSON.stringify(tc.args)})`
-          );
-        }
-      }
+    const text = block.text ?? block.input;
+    if (typeof text === 'string' && text) {
+      textChunks.push(`${role}: ${text}`);
+    } else if (block.type === 'tool_use') {
+      textChunks.push(
+        `${role}: [tool_use] ${String(block.name ?? '')} ${JSON.stringify(block.input ?? {})}`
+      );
     }
   }
 
-  flushText();
-  return parts;
+  appendToolCalls(msg, role, textChunks);
+}
+
+function appendToolCalls(
+  msg: BaseMessage,
+  role: string,
+  textChunks: string[]
+): void {
+  if (role !== 'AI') {
+    return;
+  }
+  const aiMsg = msg as AIMessage;
+  if (!aiMsg.tool_calls || aiMsg.tool_calls.length === 0) {
+    return;
+  }
+  for (const tc of aiMsg.tool_calls) {
+    textChunks.push(`AI: [tool_call] ${tc.name}(${JSON.stringify(tc.args)})`);
+  }
 }
 
 /**
@@ -1134,21 +1140,24 @@ export function ensureThinkingBlockInMessages(
     let hasThinkingBlock = false;
 
     if (contentIsArray && aiMsg.content.length > 0) {
-      const content = aiMsg.content as ExtendedMessageContent[];
-      hasToolUse =
-        hasToolUse ||
-        content.some((c) => typeof c === 'object' && c.type === 'tool_use');
-      // Check ALL content blocks for thinking/reasoning, not just [0].
-      // Bedrock may emit a whitespace text chunk before the thinking block,
-      // pushing the reasoning_content to index 1+.
-      hasThinkingBlock = content.some(
-        (c) =>
-          typeof c === 'object' &&
-          (c.type === ContentTypes.THINKING ||
-            c.type === ContentTypes.REASONING_CONTENT ||
-            c.type === ContentTypes.REASONING ||
-            c.type === 'redacted_thinking')
-      );
+      for (const c of aiMsg.content as ExtendedMessageContent[]) {
+        if (typeof c !== 'object') {
+          continue;
+        }
+        if (c.type === 'tool_use') {
+          hasToolUse = true;
+        } else if (
+          c.type === ContentTypes.THINKING ||
+          c.type === ContentTypes.REASONING_CONTENT ||
+          c.type === ContentTypes.REASONING ||
+          c.type === 'redacted_thinking'
+        ) {
+          hasThinkingBlock = true;
+        }
+        if (hasToolUse && hasThinkingBlock) {
+          break;
+        }
+      }
     }
 
     // Bedrock also stores reasoning in additional_kwargs (may not be in content array)
@@ -1175,26 +1184,24 @@ export function ensureThinkingBlockInMessages(
         continue;
       }
 
-      // Collect the AI message and any following tool messages
-      const toolSequence: BaseMessage[] = [msg];
-      let j = i + 1;
+      // Build structured content in a single pass over the AI + following
+      // ToolMessages — preserves image blocks as-is to avoid serializing
+      // binary data as text (which caused 174× token amplification).
+      const parts: MessageContentComplex[] = [];
+      const textChunks: string[] = ['[Previous agent context]'];
 
-      // Look ahead for tool messages that belong to this AI message
+      appendMessageContent(msg, 'AI', textChunks, parts);
+
+      let j = i + 1;
       const isToolMsg = (m: BaseMessage): boolean =>
         m instanceof ToolMessage || ('role' in m && (m as any).role === 'tool');
       while (j < messages.length && isToolMsg(messages[j])) {
-        toolSequence.push(messages[j]);
+        appendMessageContent(messages[j], 'Tool', textChunks, parts);
         j++;
       }
 
-      // Convert the sequence to a HumanMessage, preserving structured content
-      // (especially images) to avoid serializing binary data as text tokens.
-      // getBufferString() would dump base64 image data as text, causing massive
-      // token amplification (e.g. 174× for a single screenshot).
-      const contentBlocks = buildToolSequenceContent(toolSequence);
-      result.push(new HumanMessage({ content: contentBlocks }));
-
-      // Skip the messages we've processed
+      flushTextChunks(textChunks, parts);
+      result.push(new HumanMessage({ content: parts }));
       i = j;
     } else {
       // Keep the message as is
