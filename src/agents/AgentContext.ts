@@ -17,19 +17,19 @@ import { DEFAULT_RESERVE_RATIO } from '@/messages';
 import { toJsonSchema } from '@/utils/schema';
 
 /**
- * Anthropic direct API wraps tool schemas in an XML-like structure with full
- * parameter descriptions, roughly 2.6× the raw JSON token count.
+ * Anthropic direct API wraps tool schemas in a structured format,
+ * roughly 2.0× the raw JSON token count.
  */
 const ANTHROPIC_TOOL_TOKEN_MULTIPLIER = 2.6;
 
 /**
- * Bedrock uses the Anthropic model but a lighter tool encoding than the
- * direct API, observed at ~1.6× the raw JSON token count.
+ * Bedrock uses a lighter tool encoding than the direct Anthropic API,
+ * observed at ~1.6× the raw JSON token count.
  */
 const BEDROCK_TOOL_TOKEN_MULTIPLIER = 1.6;
 
 /**
- * OpenAI and other providers use a lighter function-calling format,
+ * OpenAI and other providers use function-calling format,
  * roughly 1.4× the raw JSON token count.
  */
 const DEFAULT_TOOL_TOKEN_MULTIPLIER = 1.4;
@@ -172,19 +172,8 @@ export class AgentContext {
   systemMessageTokens: number = 0;
   /** Token count for tool schemas only. */
   toolSchemaTokens: number = 0;
-  /** Whether tool token calibration has been applied from provider usage data. */
-  private _toolTokensCalibrated: boolean = false;
   /** Running calibration ratio from the pruner — persisted across runs via contextMeta. */
   calibrationRatio: number = 1;
-  /**
-   * First index in `indexTokenCountMap` that is still in the active context.
-   * Entries below this index belong to pruned messages and must be excluded
-   * from calibration sums to avoid overcounting.  Updated by the graph after
-   * each pruning pass.
-   */
-  lastContextStartIndex: number = 0;
-  /** Total message count in the full (pre-pruned) array, used with lastContextStartIndex. */
-  lastTotalMessageCount: number = 0;
 
   /** Total instruction overhead: system message + tool schemas + pending summary. */
   get instructionTokens(): number {
@@ -635,7 +624,6 @@ export class AgentContext {
   reset(): void {
     this.systemMessageTokens = 0;
     this.toolSchemaTokens = 0;
-    this._toolTokensCalibrated = false;
     this.cachedSystemRunnable = undefined;
     this.systemRunnableStale = true;
     this.lastToken = undefined;
@@ -756,14 +744,6 @@ export class AgentContext {
             (this.clientOptions as { model?: string } | undefined)?.model ?? ''
           )
         ));
-    /**
-     * Tool schemas are encoded differently by each provider before counting
-     * against the context window.  Anthropic direct API wraps each tool in
-     * XML-like structure (~2.6×), Bedrock uses a lighter encoding (~1.6×),
-     * and OpenAI/others use function-calling format (~1.4×).
-     * These initial estimates are corrected by `updateLastCallUsage` once
-     * real provider usage arrives.
-     */
     let toolTokenMultiplier = DEFAULT_TOOL_TOKEN_MULTIPLIER;
     if (isAnthropic) {
       toolTokenMultiplier = ANTHROPIC_TOOL_TOKEN_MULTIPLIER;
@@ -847,8 +827,6 @@ export class AgentContext {
     this.indexTokenCountMap = newTokenMap;
     this.baseIndexTokenCountMap = { ...newTokenMap };
     this._lastSummarizationMsgCount = Object.keys(newTokenMap).length;
-    this.lastContextStartIndex = 0;
-    this.lastTotalMessageCount = Object.keys(newTokenMap).length;
     this.currentUsage = undefined;
     this.lastCallUsage = undefined;
     this.totalTokensFresh = false;
@@ -986,47 +964,6 @@ export class AgentContext {
       cacheCreation: cacheCreation || undefined,
     };
     this.totalTokensFresh = true;
-
-    if (totalInputTokens > 0) {
-      let messageTokens = 0;
-      const endIndex =
-        this.lastTotalMessageCount ||
-        Object.keys(this.indexTokenCountMap).length;
-      for (let i = this.lastContextStartIndex; i < endIndex; i++) {
-        messageTokens +=
-          (this.indexTokenCountMap[i] as number | undefined) ?? 0;
-      }
-      const providerInstructionTokens = totalInputTokens - messageTokens;
-      if (providerInstructionTokens <= 0) {
-        return;
-      }
-
-      const gap = providerInstructionTokens - this.instructionTokens;
-
-      if (!this._toolTokensCalibrated && this.toolSchemaTokens > 0) {
-        // First calibration: adjust tool schema tokens to match provider.
-        this.toolSchemaTokens = Math.max(0, this.toolSchemaTokens + gap);
-        this._toolTokensCalibrated = true;
-      } else if (this._toolTokensCalibrated && Math.abs(gap) > 0) {
-        // When there are no messages (e.g. first call after summarization),
-        // the gap is purely tool schema + summary vs provider — no message
-        // estimation noise.  Apply the full gap for immediate convergence.
-        // Otherwise dampen to 30% to avoid oscillation from message token errors.
-        const dampened = messageTokens === 0 ? gap : Math.round(gap * 0.3);
-        if (dampened === 0) {
-          return;
-        }
-        if (this.summaryTokenCount > 0) {
-          this.summaryTokenCount = Math.max(
-            0,
-            this.summaryTokenCount + dampened
-          );
-          this._durableSummaryTokenCount = this.summaryTokenCount;
-        } else {
-          this.toolSchemaTokens = Math.max(0, this.toolSchemaTokens + dampened);
-        }
-      }
-    }
   }
 
   /** Marks token data as stale before a new LLM call. */

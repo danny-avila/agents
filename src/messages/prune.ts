@@ -1177,6 +1177,10 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     factoryParams.calibrationRatio != null && factoryParams.calibrationRatio > 0
       ? factoryParams.calibrationRatio
       : 1;
+  /** Best observed instruction overhead from a near-zero variance turn. */
+  let bestInstructionOverhead: number | undefined;
+  let bestVarianceAbs = Infinity;
+
   return function pruneMessages(params: PruneMessagesParams): {
     context: BaseMessage[];
     indexTokenCountMap: Record<string, number | undefined>;
@@ -1186,6 +1190,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     contextPressure?: number;
     preFadingMessages?: BaseMessage[];
     calibrationRatio?: number;
+    resolvedInstructionOverhead?: number;
   } {
     // Guard: empty messages array (e.g. after REMOVE_ALL with empty context).
     // Nothing to prune — return immediately to avoid out-of-bounds access.
@@ -1197,6 +1202,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         prePruneTotalTokens: 0,
         remainingContextTokens: factoryParams.maxTokens,
         calibrationRatio: lastCalibrationRatio,
+        resolvedInstructionOverhead: bestInstructionOverhead,
       };
     }
 
@@ -1329,6 +1335,21 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       const isRatioSafe =
         ratio >= CALIBRATION_RATIO_MIN && ratio <= CALIBRATION_RATIO_MAX;
 
+      // When variance is near zero and messages are calibrated, we have a
+      // confident reading of the real instruction overhead.  Track the best
+      // one so Graph can lock in toolSchemaTokens.
+      const absVariance = Math.abs(variancePct);
+      if (
+        isRatioSafe &&
+        absVariance < bestVarianceAbs &&
+        totalIndexTokens > 0
+      ) {
+        bestVarianceAbs = absVariance;
+        bestInstructionOverhead = Math.round(
+          providerInputTokens - totalIndexTokens * ratio
+        );
+      }
+
       factoryParams.log?.('debug', 'Token estimate variance', {
         ourTotal,
         providerInputTokens,
@@ -1460,6 +1481,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         remainingContextTokens: 0,
         contextPressure: pruningBudget > 0 ? totalTokens / pruningBudget : 0,
         calibrationRatio: lastCalibrationRatio,
+        resolvedInstructionOverhead: bestInstructionOverhead,
       };
     }
 
@@ -1640,6 +1662,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         contextPressure,
         preFadingMessages,
         calibrationRatio: lastCalibrationRatio,
+        resolvedInstructionOverhead: bestInstructionOverhead,
       };
     }
 
@@ -2014,6 +2037,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       contextPressure,
       preFadingMessages,
       calibrationRatio: lastCalibrationRatio,
+      resolvedInstructionOverhead: bestInstructionOverhead,
     };
   };
 }

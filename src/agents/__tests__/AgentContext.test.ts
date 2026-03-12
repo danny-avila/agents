@@ -1057,122 +1057,30 @@ describe('AgentContext', () => {
     });
   });
 
-  describe('updateLastCallUsage — calibration after pruning', () => {
-    it('only sums active context entries, not pruned messages', () => {
-      const ctx = createBasicContext({
-        agentConfig: {
-          instructions: 'Test',
-          tools: [
-            {
-              name: 'tool1',
-              description: 'A test tool',
-              invoke: jest.fn(),
-              schema: { type: 'object', properties: { a: { type: 'string' } } },
-            } as unknown as t.GenericTool,
-          ],
-        },
-      });
+  describe('updateLastCallUsage', () => {
+    it('records usage without modifying toolSchemaTokens', () => {
+      const ctx = createBasicContext();
+      ctx.toolSchemaTokens = 200;
 
-      // Simulate: 5 messages indexed, pruning kept only msgs 2-4
-      ctx.indexTokenCountMap = {
-        '0': 50,
-        '1': 60,
-        '2': 70,
-        '3': 80,
-        '4': 40,
-      };
-      ctx.lastContextStartIndex = 2;
-      ctx.lastTotalMessageCount = 5;
+      ctx.updateLastCallUsage({ input_tokens: 500, output_tokens: 30 });
 
-      // Force toolSchemaTokens to a known value so calibration gap is predictable
-      ctx.toolSchemaTokens = 100;
-      ctx.systemMessageTokens = 20;
-
-      // Provider reports input_tokens covering msgs 2+3+4 (190) + instructions (120)
-      ctx.updateLastCallUsage({
-        input_tokens: 310,
-        output_tokens: 30,
-      });
-
-      // messageTokens should be 70+80+40 = 190 (only active context)
-      // providerInstructionTokens = 310 - 190 = 120
-      // instructionTokens = systemMessageTokens(20) + toolSchemaTokens(100) = 120
-      // gap = 120 - 120 = 0 → no adjustment, but calibration DID run (didn't early-return)
-      // The key assertion: toolSchemaTokens should be calibrated, not left at initial value
-      // First calibration sets toolSchemaTokens = max(0, 100 + 0) = 100 (gap was 0)
       expect(ctx.lastCallUsage).toBeDefined();
-      expect(ctx.lastCallUsage!.inputTokens).toBe(310);
+      expect(ctx.lastCallUsage!.inputTokens).toBe(500);
+      expect(ctx.lastCallUsage!.outputTokens).toBe(30);
+      expect(ctx.toolSchemaTokens).toBe(200);
     });
 
-    it('would fail calibration without the fix (all entries summed)', () => {
+    it('handles additive cache tokens', () => {
       const ctx = createBasicContext();
-      ctx.indexTokenCountMap = {
-        '0': 50,
-        '1': 60,
-        '2': 70,
-        '3': 80,
-        '4': 40,
-      };
-      // Without setting lastContextStartIndex, defaults to 0 → sums all entries
-      // But lastTotalMessageCount defaults to 0, so fallback is Object.keys().length = 5
-      // This means: messageTokens = 50+60+70+80+40 = 300
-      ctx.lastContextStartIndex = 0;
-      ctx.lastTotalMessageCount = 5;
 
-      ctx.toolSchemaTokens = 100;
-      ctx.systemMessageTokens = 20;
-
-      // Provider says 200 input tokens, but messageTokens = 300 → negative instruction tokens
       ctx.updateLastCallUsage({
-        input_tokens: 200,
-        output_tokens: 30,
+        input_tokens: 5,
+        output_tokens: 100,
+        input_token_details: { cache_creation: 8000, cache_read: 0 },
       });
 
-      // providerInstructionTokens = 200 - 300 = -100 → early return, no calibration
-      // toolSchemaTokens stays at 100 (not calibrated)
-      expect(ctx.toolSchemaTokens).toBe(100);
-    });
-
-    it('calibrates correctly when only active context entries are summed', () => {
-      const ctx = createBasicContext();
-      ctx.indexTokenCountMap = {
-        '0': 50,
-        '1': 60,
-        '2': 70,
-        '3': 80,
-        '4': 40,
-      };
-      // Pruning kept msgs 2-4 only
-      ctx.lastContextStartIndex = 2;
-      ctx.lastTotalMessageCount = 5;
-
-      ctx.toolSchemaTokens = 100;
-      ctx.systemMessageTokens = 20;
-
-      // Provider says 200 input tokens
-      // Active messageTokens = 70+80+40 = 190
-      // providerInstructionTokens = 200 - 190 = 10
-      // instructionTokens = 20 + 100 = 120
-      // gap = 10 - 120 = -110
-      // First calibration: toolSchemaTokens = max(0, 100 + (-110)) = 0
-      ctx.updateLastCallUsage({
-        input_tokens: 200,
-        output_tokens: 30,
-      });
-
-      // Calibration ran and adjusted toolSchemaTokens
-      expect(ctx.toolSchemaTokens).toBe(0);
-    });
-
-    it('resets context tracking after rebuildTokenMapAfterSummarization', () => {
-      const ctx = createBasicContext();
-      ctx.lastContextStartIndex = 5;
-      ctx.lastTotalMessageCount = 10;
-
-      ctx.rebuildTokenMapAfterSummarization({ '0': 100, '1': 200 });
-
-      expect(ctx.lastContextStartIndex).toBe(0);
-      expect(ctx.lastTotalMessageCount).toBe(2);
+      // cache_creation (8000) > input_tokens (5) → additive
+      expect(ctx.lastCallUsage!.inputTokens).toBe(8005);
     });
   });
 });
