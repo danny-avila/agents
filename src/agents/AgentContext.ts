@@ -444,7 +444,7 @@ export class AgentContext {
         | t.OpenRouterClientOptions
         | undefined;
       if (openRouterOptions?.promptCache === true) {
-        const model = (this.clientOptions as t.OpenAIClientOptions)?.model;
+        const model = openRouterOptions?.model;
         if (isAnthropicModel(model)) {
           finalInstructions = {
             content: [
