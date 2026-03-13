@@ -36,23 +36,12 @@ const PRESSURE_BANDS: [number, number][] = [
 /** Maximum character length for masked (consumed) tool results. */
 const MASKED_RESULT_MAX_CHARS = 300;
 
-/** EMA weight for the new calibration ratio (complement is applied to prior).
- *  First calibration sets EMA directly; α only affects blending afterward.
- *  At 0.3 the half-life is ~2 turns — smooth enough to resist noise while
- *  still tracking real drift within 4-5 turns. */
-const CALIBRATION_EMA_NEW_WEIGHT = 0.3;
+/** Minimum cumulative calibration ratio — provider can't count fewer tokens
+ *  than our raw estimate (within reason). Prevents divide-by-zero edge cases. */
+const CALIBRATION_RATIO_MIN = 0.5;
 
-/** Minimum calibration ratio considered safe for application. */
-const CALIBRATION_RATIO_MIN = 1 / 3;
-
-/** Maximum calibration ratio considered safe for application. */
-const CALIBRATION_RATIO_MAX = 3.5;
-
-/** Minimum post-calibration sanity ratio (calibrated sum / raw sum). */
-const POST_CALIBRATION_SANITY_MIN = 0.25;
-
-/** Maximum post-calibration sanity ratio (calibrated sum / raw sum). */
-const POST_CALIBRATION_SANITY_MAX = 3.5;
+/** Maximum cumulative calibration ratio — sanity cap for the running ratio. */
+const CALIBRATION_RATIO_MAX = 5;
 
 export type PruneMessagesFactoryParams = {
   provider?: Providers;
@@ -1170,24 +1159,25 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
   const indexTokenCountMap = { ...factoryParams.indexTokenCountMap };
   let lastTurnStartIndex = factoryParams.startIndex;
   let lastCutOffIndex = 0;
-  let totalTokens = Object.values(indexTokenCountMap).reduce(
-    (a = 0, b = 0) => a + b,
-    0
-  ) as number;
+  let totalTokens = 0;
+  for (const key in indexTokenCountMap) {
+    totalTokens += indexTokenCountMap[key] ?? 0;
+  }
   let runThinkingStartIndex = -1;
-  /** Running calibration ratio (EMA) — applied to new messages even without usage_metadata. */
-  let lastCalibrationRatio =
+  /** Cumulative raw tiktoken tokens we've sent to the provider (messages only,
+   *  excludes instruction overhead and new outputs not yet seen by provider). */
+  let cumulativeRawSent = 0;
+  /** Cumulative provider-reported message tokens (providerInput - instructionOverhead). */
+  let cumulativeProviderReported = 0;
+  /** Stable calibration ratio = cumulativeProviderReported / cumulativeRawSent.
+   *  Converges monotonically as data accumulates. Falls back to seeded value. */
+  let calibrationRatio =
     factoryParams.calibrationRatio != null && factoryParams.calibrationRatio > 0
       ? factoryParams.calibrationRatio
       : 1;
   /** Best observed instruction overhead from a near-zero variance turn. */
   let bestInstructionOverhead: number | undefined;
   let bestVarianceAbs = Infinity;
-  /** Whether truncation/masking ran on the previous turn — if so, the provider
-   *  saw truncated content but the calibration block would compare against
-   *  pre-truncation estimates, producing wild ratios. */
-  let lastTurnHadTruncation = false;
-  let hasAppliedCalibration = false;
 
   return function pruneMessages(params: PruneMessagesParams): {
     context: BaseMessage[];
@@ -1209,7 +1199,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         messagesToRefine: [],
         prePruneTotalTokens: 0,
         remainingContextTokens: factoryParams.maxTokens,
-        calibrationRatio: lastCalibrationRatio,
+        calibrationRatio,
         resolvedInstructionOverhead: bestInstructionOverhead,
       };
     }
@@ -1289,33 +1279,28 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         newOutputs.add(i);
         outputTokensAssigned = true;
       } else {
-        const rawCount = factoryParams.tokenCounter(message);
-        // When currentUsage is available, store the raw count — the
-        // calibration block below will scale all messages uniformly.
-        // Only apply the running EMA when there's no provider feedback
-        // this turn, so new messages still benefit from prior calibration.
+        // Always store raw tiktoken count — the map stays in raw space.
+        // Budget decisions multiply by calibrationRatio on the fly.
+        indexTokenCountMap[i] = factoryParams.tokenCounter(message);
         if (currentUsage) {
-          indexTokenCountMap[i] = rawCount;
           newOutputs.add(i);
-        } else {
-          indexTokenCountMap[i] = Math.round(rawCount * lastCalibrationRatio);
         }
-        totalTokens += indexTokenCountMap[i] ?? 0;
       }
+      totalTokens += indexTokenCountMap[i] ?? 0;
     }
 
-    // Distribute the current total tokens to our `indexTokenCountMap` in a weighted manner,
-    // so that the total token count aligns with provider-reported usage.
-    // Uses lastCallUsage (single-call) when available to avoid inflated ratios from
-    // accumulated cacheRead across N tool-call round-trips.
-    // Gated on totalTokensFresh to avoid applying stale ratios.
-    const skipCalibration = lastTurnHadTruncation;
-    if (currentUsage && params.totalTokensFresh !== false && !skipCalibration) {
+    // Cumulative calibration: accumulate raw tiktoken tokens and provider-
+    // reported tokens across turns.  The ratio of the two running totals
+    // converges monotonically to the true provider multiplier — no EMA,
+    // no per-turn oscillation, no map mutation.
+    if (currentUsage && params.totalTokensFresh !== false) {
       const instructionOverhead = factoryParams.getInstructionTokens?.() ?? 0;
       const providerInputTokens =
         params.lastCallUsage?.inputTokens ?? currentUsage.input_tokens;
 
-      let totalIndexTokens = 0;
+      // Sum raw tiktoken counts for messages the provider saw (excludes
+      // new outputs from this turn — the provider hasn't seen them yet).
+      let rawSentThisTurn = 0;
       let toolMsgTokens = 0;
       let otherMsgTokens = 0;
       let toolMsgCount = 0;
@@ -1324,7 +1309,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         params.messages.length > 0 && params.messages[0].getType() === 'system';
       if (firstIsSystem) {
         const t = indexTokenCountMap[0] ?? 0;
-        totalIndexTokens += t;
+        rawSentThisTurn += t;
         otherMsgTokens += t;
         otherMsgCount++;
       }
@@ -1336,7 +1321,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
           continue;
         }
         const t = indexTokenCountMap[i] ?? 0;
-        totalIndexTokens += t;
+        rawSentThisTurn += t;
         if (params.messages[i]?.getType() === 'tool') {
           toolMsgTokens += t;
           toolMsgCount++;
@@ -1346,36 +1331,36 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         }
       }
 
-      const ourTotal = instructionOverhead + totalIndexTokens;
-      const overallRatio = ourTotal > 0 ? providerInputTokens / ourTotal : 0;
-      const variancePct = Math.round((overallRatio - 1) * 100);
-
       const providerMessageTokens = Math.max(
         0,
         providerInputTokens - instructionOverhead
       );
-      const ratio =
-        totalIndexTokens > 0 ? providerMessageTokens / totalIndexTokens : 0;
-      // First calibration uses looser bounds (no prior EMA to protect).
-      // Always reject ratio <= 0 — it would zero out the EMA permanently.
-      const isRatioSafe =
-        ratio > 0 &&
-        (!hasAppliedCalibration
-          ? ratio <= 10
-          : ratio >= CALIBRATION_RATIO_MIN && ratio <= CALIBRATION_RATIO_MAX);
 
-      // When variance is near zero and messages are calibrated, we have a
-      // confident reading of the real instruction overhead.  Track the best
-      // one so Graph can lock in toolSchemaTokens.
-      const absVariance = Math.abs(variancePct);
-      if (
-        isRatioSafe &&
-        absVariance < bestVarianceAbs &&
-        totalIndexTokens > 0
-      ) {
+      // Accumulate into running totals (only when we have real data)
+      if (rawSentThisTurn > 0 && providerMessageTokens > 0) {
+        cumulativeRawSent += rawSentThisTurn;
+        cumulativeProviderReported += providerMessageTokens;
+        const newRatio = cumulativeProviderReported / cumulativeRawSent;
+        calibrationRatio = Math.max(
+          CALIBRATION_RATIO_MIN,
+          Math.min(CALIBRATION_RATIO_MAX, newRatio)
+        );
+      }
+
+      // Variance: compare our calibrated estimate against provider total
+      const calibratedOurTotal =
+        instructionOverhead + rawSentThisTurn * calibrationRatio;
+      const overallRatio =
+        calibratedOurTotal > 0 ? providerInputTokens / calibratedOurTotal : 0;
+      const variancePct = Math.round((overallRatio - 1) * 100);
+
+      // Track best instruction overhead when variance is near zero
+      const absVariance = Math.abs(overallRatio - 1);
+      if (absVariance < bestVarianceAbs && rawSentThisTurn > 0) {
         bestVarianceAbs = absVariance;
-        bestInstructionOverhead = Math.round(
-          providerInputTokens - totalIndexTokens * ratio
+        bestInstructionOverhead = Math.max(
+          0,
+          Math.round(providerInputTokens - rawSentThisTurn * calibrationRatio)
         );
       }
 
@@ -1386,74 +1371,20 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
           : undefined;
 
       factoryParams.log?.('debug', 'Token estimate variance', {
-        ourTotal,
+        calibratedOurTotal: Math.round(calibratedOurTotal),
         providerInputTokens,
         variance: `${variancePct > 0 ? '+' : ''}${variancePct}%`,
         instructionOverhead,
-        messageEstimate: totalIndexTokens,
+        rawMessageEstimate: rawSentThisTurn,
         toolMsgEstimate: toolMsgTokens,
         toolMsgCount,
         otherMsgEstimate: otherMsgTokens,
         otherMsgCount,
         providerAvgPerMsg,
-        messageCalibrationRatio: Math.round(ratio * 100) / 100,
-        calibrationApplied: isRatioSafe,
-        runningEMA: Math.round(lastCalibrationRatio * 100) / 100,
+        calibrationRatio: Math.round(calibrationRatio * 100) / 100,
+        cumulativeRawSent,
+        cumulativeProviderReported,
       });
-
-      if (isRatioSafe) {
-        // First calibration: apply the full ratio directly.
-        // Subsequent: blend via EMA (70/30) to smooth noise.
-        lastCalibrationRatio = !hasAppliedCalibration
-          ? ratio
-          : CALIBRATION_EMA_NEW_WEIGHT * ratio +
-            (1 - CALIBRATION_EMA_NEW_WEIGHT) * lastCalibrationRatio;
-        hasAppliedCalibration = true;
-
-        // Snapshot the map before calibration for sanity revert
-        const preCalibrationSnapshot: Record<string, number | undefined> = {};
-        for (let i = lastCutOffIndex; i < params.messages.length; i++) {
-          preCalibrationSnapshot[i] = indexTokenCountMap[i];
-        }
-        if (firstIsSystem) {
-          preCalibrationSnapshot[0] = indexTokenCountMap[0];
-        }
-
-        if (firstIsSystem && lastCutOffIndex !== 0) {
-          indexTokenCountMap[0] = Math.round(
-            (indexTokenCountMap[0] ?? 0) * ratio
-          );
-        }
-
-        for (let i = lastCutOffIndex; i < params.messages.length; i++) {
-          if (newOutputs.has(i)) {
-            continue;
-          }
-          indexTokenCountMap[i] = Math.round(
-            (indexTokenCountMap[i] ?? 0) * ratio
-          );
-        }
-
-        // Post-calibration sanity check: verify calibrated sum is within 0.25×–3× of raw sum.
-        // If not, revert to pre-calibration values to prevent wildly incorrect pruning.
-        let calibratedSum = 0;
-        for (let i = lastCutOffIndex; i < params.messages.length; i++) {
-          if (!newOutputs.has(i)) {
-            calibratedSum += indexTokenCountMap[i] ?? 0;
-          }
-        }
-        const sanityRatio =
-          totalIndexTokens > 0 ? calibratedSum / totalIndexTokens : 1;
-        if (
-          sanityRatio < POST_CALIBRATION_SANITY_MIN ||
-          sanityRatio > POST_CALIBRATION_SANITY_MAX
-        ) {
-          // Revert — calibration produced unreasonable values
-          for (const [key, value] of Object.entries(preCalibrationSnapshot)) {
-            indexTokenCountMap[key] = value;
-          }
-        }
-      }
     }
 
     // Get instruction token overhead (system message + tool schemas + summary).
@@ -1480,6 +1411,9 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       pruningBudget - currentInstructionTokens
     );
 
+    // Calibrated total for budget decisions (raw × ratio)
+    let calibratedTotalTokens = Math.round(totalTokens * calibrationRatio);
+
     // P1: Log budget computation
     factoryParams.log?.('debug', 'Budget computed', {
       maxTokens: factoryParams.maxTokens,
@@ -1488,7 +1422,9 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       instructionTokens: currentInstructionTokens,
       effectiveMax: effectiveMaxTokens,
       messageCount: params.messages.length,
-      totalTokens,
+      rawTotalTokens: totalTokens,
+      calibratedTotalTokens,
+      calibrationRatio: Math.round(calibrationRatio * 100) / 100,
     });
 
     // When instructions alone consume the entire budget, no message can
@@ -1516,10 +1452,11 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         context: [],
         indexTokenCountMap,
         messagesToRefine: [...params.messages],
-        prePruneTotalTokens: totalTokens,
+        prePruneTotalTokens: calibratedTotalTokens,
         remainingContextTokens: 0,
-        contextPressure: pruningBudget > 0 ? totalTokens / pruningBudget : 0,
-        calibrationRatio: lastCalibrationRatio,
+        contextPressure:
+          pruningBudget > 0 ? calibratedTotalTokens / pruningBudget : 0,
+        calibrationRatio,
         resolvedInstructionOverhead: bestInstructionOverhead,
       };
     }
@@ -1538,15 +1475,15 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     //   90%: aggressive — budget factor 0.20, most results heavily truncated
     //   99%: emergency — budget factor 0.05, effectively placeholders for old results
     // ---------------------------------------------------------------------------
-    // Recompute totalTokens from indexTokenCountMap for accurate context pressure.
-    // The value from provider usage or initial closure sum may be stale — the
-    // calibration block above may have adjusted individual entries, and new
-    // messages may have been counted since.
+    // Recompute totalTokens from indexTokenCountMap (raw tiktoken values).
     totalTokens = 0;
     for (let i = 0; i < params.messages.length; i++) {
       totalTokens += indexTokenCountMap[i] ?? 0;
     }
-    const contextPressure = pruningBudget > 0 ? totalTokens / pruningBudget : 0;
+    // Update calibrated total after recount
+    calibratedTotalTokens = Math.round(totalTokens * calibrationRatio);
+    const contextPressure =
+      pruningBudget > 0 ? calibratedTotalTokens / pruningBudget : 0;
     let preFlightResultCount = 0;
     let preFlightInputCount = 0;
 
@@ -1573,6 +1510,13 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         tokenCounter: factoryParams.tokenCounter,
       });
       if (observationsMasked > 0) {
+        // Masking changed what the provider will see on the next call.
+        // The cumulative counters reflect pre-masking content sizes —
+        // reset them so the ratio recalibrates against post-masking reality.
+        // The current calibrationRatio (from pre-masking data) is preserved
+        // as the starting point; new data will refine it.
+        cumulativeRawSent = 0;
+        cumulativeProviderReported = 0;
         factoryParams.log?.('debug', 'Observation masking applied', {
           contextPressure: Math.round(contextPressure * 100),
           maskedCount: observationsMasked,
@@ -1644,39 +1588,48 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     // This is NOT the lossy position-based fading above — it only targets
     // messages that individually exceed the budget, using the full effective
     // budget as the cap (not a pressure-scaled fraction).
-    if (factoryParams.summarizationEnabled === true && effectiveMaxTokens > 0) {
+    // Fit-to-budget caps are in raw space (divide by ratio) so that after
+    // calibration the truncated results actually fit within the budget.
+    const rawSpaceEffectiveMax =
+      calibrationRatio > 0
+        ? Math.round(effectiveMaxTokens / calibrationRatio)
+        : effectiveMaxTokens;
+
+    if (
+      factoryParams.summarizationEnabled === true &&
+      rawSpaceEffectiveMax > 0
+    ) {
       preFlightResultCount = preFlightTruncateToolResults({
         messages: params.messages,
-        maxContextTokens: effectiveMaxTokens,
+        maxContextTokens: rawSpaceEffectiveMax,
         indexTokenCountMap,
         tokenCounter: factoryParams.tokenCounter,
       });
 
       preFlightInputCount = preFlightTruncateToolCallInputs({
         messages: params.messages,
-        maxContextTokens: effectiveMaxTokens,
+        maxContextTokens: rawSpaceEffectiveMax,
         indexTokenCountMap,
         tokenCounter: factoryParams.tokenCounter,
       });
 
       if (preFlightResultCount > 0 || preFlightInputCount > 0) {
         factoryParams.log?.('debug', 'Fit-to-budget truncation applied', {
-          effectiveMaxTokens,
+          rawSpaceEffectiveMax,
           toolResultsTruncated: preFlightResultCount,
           toolInputsTruncated: preFlightInputCount,
         });
       }
     }
 
-    // Recalculate totalTokens from indexTokenCountMap after pre-flight truncation
-    // and context pruning may have reduced token counts for modified messages.
-    // Without this, prePruneTotalTokens and early-return remainingContextTokens
-    // would be stale (inflated), causing unnecessary summarization triggers.
+    // Recalculate totalTokens (raw) after pre-flight truncation/masking.
     const preTruncationTotalTokens = totalTokens;
     totalTokens = 0;
     for (let i = 0; i < params.messages.length; i++) {
       totalTokens += indexTokenCountMap[i] ?? 0;
     }
+    // Recompute calibrated total after truncation
+    calibratedTotalTokens = Math.round(totalTokens * calibrationRatio);
 
     if (totalTokens !== preTruncationTotalTokens) {
       factoryParams.log?.('debug', 'Post-truncation token recount', {
@@ -1689,21 +1642,34 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     lastTurnStartIndex = params.messages.length;
     if (
       lastCutOffIndex === 0 &&
-      totalTokens + currentInstructionTokens <= pruningBudget
+      calibratedTotalTokens + currentInstructionTokens <= pruningBudget
     ) {
       return {
         context: params.messages,
         indexTokenCountMap,
         messagesToRefine: [],
-        prePruneTotalTokens: totalTokens,
+        prePruneTotalTokens: calibratedTotalTokens,
         remainingContextTokens:
-          pruningBudget - totalTokens - currentInstructionTokens,
+          pruningBudget - calibratedTotalTokens - currentInstructionTokens,
         contextPressure,
         preFadingMessages,
-        calibrationRatio: lastCalibrationRatio,
+        calibrationRatio,
         resolvedInstructionOverhead: bestInstructionOverhead,
       };
     }
+
+    // Scale the budget down to raw-token space so getMessagesWithinTokenLimit
+    // can compare raw map values against a raw budget — no map mutation needed.
+    const rawSpaceBudget =
+      calibrationRatio > 0
+        ? Math.round(pruningBudget / calibrationRatio)
+        : pruningBudget;
+
+    // Instruction tokens include the tool schema multiplier — scale to raw space
+    const rawSpaceInstructionTokens =
+      calibrationRatio > 0
+        ? Math.round(currentInstructionTokens / calibrationRatio)
+        : currentInstructionTokens;
 
     const {
       context: initialContext,
@@ -1711,13 +1677,13 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       messagesToRefine,
       remainingContextTokens: initialRemainingContextTokens,
     } = getMessagesWithinTokenLimit({
-      maxContextTokens: pruningBudget,
+      maxContextTokens: rawSpaceBudget,
       messages: params.messages,
       indexTokenCountMap,
       startType: params.startType,
       thinkingEnabled: factoryParams.thinkingEnabled,
       tokenCounter: factoryParams.tokenCounter,
-      instructionTokens: currentInstructionTokens,
+      instructionTokens: rawSpaceInstructionTokens,
       reasoningType:
         factoryParams.provider === Providers.BEDROCK
           ? ContentTypes.REASONING_CONTENT
@@ -2059,11 +2025,6 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       Math.min(pruningBudget, initialRemainingContextTokens + reclaimedTokens)
     );
 
-    lastTurnHadTruncation =
-      observationsMasked > 0 ||
-      preFlightResultCount > 0 ||
-      preFlightInputCount > 0;
-
     runThinkingStartIndex = thinkingStartIndex ?? -1;
     /** The index is the first value of `context`, index relative to `params.messages` */
     lastCutOffIndex = Math.max(
@@ -2076,11 +2037,11 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       context,
       indexTokenCountMap,
       messagesToRefine,
-      prePruneTotalTokens: totalTokens,
+      prePruneTotalTokens: calibratedTotalTokens,
       remainingContextTokens,
       contextPressure,
       preFadingMessages,
-      calibrationRatio: lastCalibrationRatio,
+      calibrationRatio,
       resolvedInstructionOverhead: bestInstructionOverhead,
     };
   };

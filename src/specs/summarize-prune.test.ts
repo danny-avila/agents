@@ -165,15 +165,14 @@ describe('pruneMessages ratio-based token grounding', () => {
 
     const result = pruneMessages({ messages, usageMetadata });
 
-    // Calibration uses input_tokens only (no output), minus instruction overhead (0 here).
-    // providerMessageTokens = input_tokens - instructionOverhead = 50 - 0 = 50
-    // ratio = providerMessageTokens / messageTokenSum = 50 / 60 = 0.833
+    // Map stays in raw tiktoken space — calibrationRatio captures the multiplier.
     const originalTotal = 10 + 20 + 30;
     const expectedRatio = 50 / originalTotal;
 
-    expect(result.indexTokenCountMap[0]).toBe(Math.round(10 * expectedRatio));
-    expect(result.indexTokenCountMap[1]).toBe(Math.round(20 * expectedRatio));
-    expect(result.indexTokenCountMap[2]).toBe(Math.round(30 * expectedRatio));
+    expect(result.indexTokenCountMap[0]).toBe(10);
+    expect(result.indexTokenCountMap[1]).toBe(20);
+    expect(result.indexTokenCountMap[2]).toBe(30);
+    expect(result.calibrationRatio).toBeCloseTo(expectedRatio, 2);
   });
 
   it('should NOT adjust when ratio falls outside safe bounds (< 1/3)', () => {
@@ -272,9 +271,11 @@ describe('pruneMessages ratio-based token grounding', () => {
 
     const result = pruneMessages({ messages, usageMetadata });
 
-    expect(result.indexTokenCountMap[0]).toBe(Math.round(10 * expectedRatio));
-    expect(result.indexTokenCountMap[1]).toBe(Math.round(20 * expectedRatio));
-    expect(result.indexTokenCountMap[2]).toBe(Math.round(30 * expectedRatio));
+    // Map stays raw — calibrationRatio captures the multiplier
+    expect(result.indexTokenCountMap[0]).toBe(10);
+    expect(result.indexTokenCountMap[1]).toBe(20);
+    expect(result.indexTokenCountMap[2]).toBe(30);
+    expect(result.calibrationRatio).toBeCloseTo(expectedRatio, 2);
   });
 
   it('should assign output_tokens to the first new message at startIndex', () => {
@@ -313,12 +314,10 @@ describe('pruneMessages ratio-based token grounding', () => {
     const ratio = 20 / preRatioIndex0;
     const isRatioSafe = ratio >= 1 / 3 && ratio <= 2.5;
 
+    // Map stays raw regardless of ratio safety
+    expect(result.indexTokenCountMap[0]).toBe(preRatioIndex0);
     if (isRatioSafe) {
-      expect(result.indexTokenCountMap[0]).toBe(
-        Math.round(preRatioIndex0 * ratio)
-      );
-    } else {
-      expect(result.indexTokenCountMap[0]).toBe(preRatioIndex0);
+      expect(result.calibrationRatio).toBeCloseTo(ratio, 1);
     }
   });
 

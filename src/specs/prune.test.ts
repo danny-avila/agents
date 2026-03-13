@@ -542,16 +542,16 @@ describe('Prune Messages Tests', () => {
         usageMetadata,
       });
 
-      // The function should have updated the indexTokenCountMap based on the usage metadata
-      expect(result.indexTokenCountMap).not.toEqual(indexTokenCountMap);
-
-      // Calibration uses input_tokens (50) only — output_tokens are excluded from the ratio.
-      // The calibrated message sum should approximate input_tokens.
-      const totalTokens = Object.values(result.indexTokenCountMap).reduce(
+      // Map stays in raw tiktoken space — calibrationRatio captures the multiplier.
+      // rawSum * calibrationRatio should approximate input_tokens (50).
+      const rawSum = Object.values(result.indexTokenCountMap).reduce(
         (a = 0, b = 0) => a + b,
         0
+      ) as number;
+      const calibratedEstimate = Math.round(
+        rawSum * (result.calibrationRatio ?? 1)
       );
-      expect(totalTokens).toBe(50);
+      expect(Math.abs(calibratedEstimate - 50)).toBeLessThanOrEqual(3);
     });
   });
 
