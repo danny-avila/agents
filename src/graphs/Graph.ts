@@ -827,16 +827,16 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         );
       }
 
-      // Safety net: strip orphan tool_use blocks (AI messages referencing
-      // tool results that are no longer in the context) and orphan
-      // ToolMessages.  This prevents Anthropic/Bedrock structural validation
-      // errors ("tool_use ids without tool_result") that can arise when
-      // summarization or message reconstruction produces an incomplete
-      // tool_call / tool_result sequence.
-      if (
-        agentContext.provider === Providers.ANTHROPIC ||
-        agentContext.provider === Providers.BEDROCK
-      ) {
+      // Safety net: strip orphan tool_use blocks.  The pruner's
+      // repairOrphanedToolMessages already handles orphans in the normal
+      // path, but post-pruning transformations (ensureThinkingBlockInMessages,
+      // legacy content formatting) can introduce new orphans.
+      // Skip when the pruner ran and no transformations modified messages.
+      const needsOrphanSanitize =
+        (agentContext.provider === Providers.ANTHROPIC ||
+          agentContext.provider === Providers.BEDROCK) &&
+        (!agentContext.pruneMessages || finalMessages !== messagesToUse);
+      if (needsOrphanSanitize) {
         const beforeSanitize = finalMessages.length;
         finalMessages = sanitizeOrphanToolBlocks(finalMessages);
         if (finalMessages.length !== beforeSanitize) {
