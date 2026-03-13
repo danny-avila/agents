@@ -36,8 +36,11 @@ const PRESSURE_BANDS: [number, number][] = [
 /** Maximum character length for masked (consumed) tool results. */
 const MASKED_RESULT_MAX_CHARS = 300;
 
-/** EMA weight for the new calibration ratio (complement is applied to prior). */
-const CALIBRATION_EMA_NEW_WEIGHT = 0.7;
+/** EMA weight for the new calibration ratio (complement is applied to prior).
+ *  First calibration sets EMA directly; α only affects blending afterward.
+ *  At 0.3 the half-life is ~2 turns — smooth enough to resist noise while
+ *  still tracking real drift within 4-5 turns. */
+const CALIBRATION_EMA_NEW_WEIGHT = 0.3;
 
 /** Minimum calibration ratio considered safe for application. */
 const CALIBRATION_RATIO_MIN = 1 / 3;
@@ -1353,9 +1356,13 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       );
       const ratio =
         totalIndexTokens > 0 ? providerMessageTokens / totalIndexTokens : 0;
+      // First calibration uses looser bounds (no prior EMA to protect).
+      // Always reject ratio <= 0 — it would zero out the EMA permanently.
       const isRatioSafe =
-        !hasAppliedCalibration ||
-        (ratio >= CALIBRATION_RATIO_MIN && ratio <= CALIBRATION_RATIO_MAX);
+        ratio > 0 &&
+        (!hasAppliedCalibration
+          ? ratio <= 10
+          : ratio >= CALIBRATION_RATIO_MIN && ratio <= CALIBRATION_RATIO_MAX);
 
       // When variance is near zero and messages are calibrated, we have a
       // confident reading of the real instruction overhead.  Track the best
