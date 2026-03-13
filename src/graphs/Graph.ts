@@ -881,7 +881,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           | t.OpenRouterClientOptions
           | undefined;
         if (openRouterOptions?.promptCache === true) {
-          const model = (agentContext.clientOptions as t.OpenAIClientOptions)?.model;
+          const model = (openRouterOptions as { model?: string }).model;
           if (isAnthropicModel(model)) {
             finalMessages = addCacheControl<BaseMessage>(finalMessages);
           }
