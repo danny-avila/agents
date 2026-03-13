@@ -13,6 +13,7 @@ import type { createPruneMessages } from '@/messages';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { ContentTypes, Providers } from '@/common';
 import { toJsonSchema } from '@/utils/schema';
+import { isAnthropicModel } from '@/utils';
 
 /**
  * Encapsulates agent-specific state that can vary between agents in a multi-agent system
@@ -437,6 +438,24 @@ export class AgentContext {
             },
           ],
         };
+      }
+    } else if (this.provider === Providers.OPENROUTER) {
+      const openRouterOptions = this.clientOptions as
+        | t.OpenRouterClientOptions
+        | undefined;
+      if (openRouterOptions?.promptCache === true) {
+        const model = openRouterOptions?.model;
+        if (isAnthropicModel(model)) {
+          finalInstructions = {
+            content: [
+              {
+                type: 'text',
+                text: instructionsString,
+                cache_control: { type: 'ephemeral' },
+              },
+            ],
+          };
+        }
       }
     }
 

@@ -16,6 +16,15 @@ export function isOpenAILike(provider?: string | Providers): boolean {
   ).includes(provider);
 }
 
+/** Checks if a model name refers to a Claude/Anthropic model (e.g. `anthropic/claude-sonnet-4`) */
+export function isAnthropicModel(model?: string): boolean {
+  const lowerModel = model?.toLowerCase();
+  return (
+    lowerModel?.includes('claude') === true ||
+    lowerModel?.includes('anthropic') === true
+  );
+}
+
 export function isGoogleLike(provider?: string | Providers): boolean {
   if (provider == null) {
     return false;

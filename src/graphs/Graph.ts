@@ -51,6 +51,7 @@ import {
 } from '@/common';
 import {
   resetIfNotEmpty,
+  isAnthropicModel,
   isOpenAILike,
   isGoogleLike,
   joinKeys,
@@ -451,21 +452,26 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           : additional_instructions;
     }
 
-    if (
-      finalInstructions != null &&
-      finalInstructions &&
-      provider === Providers.ANTHROPIC &&
-      (clientOptions as t.AnthropicClientOptions).promptCache === true
-    ) {
-      finalInstructions = {
-        content: [
-          {
-            type: 'text',
-            text: instructions,
-            cache_control: { type: 'ephemeral' },
-          },
-        ],
-      };
+    if (finalInstructions != null && finalInstructions) {
+      const isAnthropicDirect =
+        provider === Providers.ANTHROPIC &&
+        (clientOptions as t.AnthropicClientOptions).promptCache === true;
+      const isOpenRouterAnthropic =
+        provider === Providers.OPENROUTER &&
+        (clientOptions as t.OpenRouterClientOptions)?.promptCache === true &&
+        isAnthropicModel((clientOptions as t.OpenAIClientOptions)?.model);
+
+      if (isAnthropicDirect || isOpenRouterAnthropic) {
+        finalInstructions = {
+          content: [
+            {
+              type: 'text',
+              text: instructions,
+              cache_control: { type: 'ephemeral' },
+            },
+          ],
+        };
+      }
     }
 
     if (finalInstructions != null && finalInstructions !== '') {
@@ -869,6 +875,16 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           | undefined;
         if (bedrockOptions?.promptCache === true) {
           finalMessages = addBedrockCacheControl<BaseMessage>(finalMessages);
+        }
+      } else if (agentContext.provider === Providers.OPENROUTER) {
+        const openRouterOptions = agentContext.clientOptions as
+          | t.OpenRouterClientOptions
+          | undefined;
+        if (openRouterOptions?.promptCache === true) {
+          const model = (openRouterOptions as { model?: string }).model;
+          if (isAnthropicModel(model)) {
+            finalMessages = addCacheControl<BaseMessage>(finalMessages);
+          }
         }
       }
 

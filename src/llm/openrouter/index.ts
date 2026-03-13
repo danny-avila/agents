@@ -50,6 +50,7 @@ export interface ChatOpenRouterCallOptions
   include_reasoning?: boolean;
   reasoning?: OpenRouterReasoning;
   modelKwargs?: OpenAIChatInput['modelKwargs'];
+  promptCache?: boolean;
 }
 
 /** invocationParams return type extended with OpenRouter reasoning */

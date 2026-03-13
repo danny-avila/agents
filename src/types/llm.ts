@@ -81,6 +81,7 @@ export type GoogleClientOptions = GoogleGenerativeAIChatInput & {
 };
 export type DeepSeekClientOptions = ChatDeepSeekCallOptions;
 export type XAIClientOptions = ChatXAIInput;
+export type OpenRouterClientOptions = ChatOpenRouterCallOptions;
 
 export type ClientOptions =
   | OpenAIClientOptions
