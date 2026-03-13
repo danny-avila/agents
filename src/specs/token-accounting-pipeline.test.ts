@@ -139,13 +139,17 @@ describe('Token accounting pipeline — multi-turn calibration', () => {
       usageMetadata: { input_tokens: providerInput, output_tokens: 30 },
     });
 
-    // Calibrated sum should approximate providerInput, not providerInput + output
-    let calibratedSum = 0;
+    // Map stays in raw tiktoken space — calibrationRatio captures the multiplier.
+    // rawSum * calibrationRatio should approximate providerInput.
+    let rawSum = 0;
     for (let i = 0; i < messages.length; i++) {
-      calibratedSum += result.indexTokenCountMap[i] ?? 0;
+      rawSum += result.indexTokenCountMap[i] ?? 0;
     }
+    const calibratedEstimate = Math.round(
+      rawSum * (result.calibrationRatio ?? 1)
+    );
 
-    expect(Math.abs(calibratedSum - providerInput)).toBeLessThanOrEqual(
+    expect(Math.abs(calibratedEstimate - providerInput)).toBeLessThanOrEqual(
       messages.length
     );
   });
@@ -176,13 +180,12 @@ describe('Token accounting pipeline — multi-turn calibration', () => {
     // Index 1 should be assigned output_tokens
     expect(result.indexTokenCountMap[1]).toBe(10);
 
-    // Ratio = providerInput / messageSum(excluding newOutputs)
-    // messageSum = only index 0 (index 1 is newOutput)
+    // Map stays raw — index 0 keeps its original count.
+    // calibrationRatio captures providerInput / rawMessageSum.
     const index0Original = charCounter(messages[0]);
+    expect(result.indexTokenCountMap[0]).toBe(index0Original);
     const expectedRatio = 40 / index0Original;
-    expect(result.indexTokenCountMap[0]).toBe(
-      Math.round(index0Original * expectedRatio)
-    );
+    expect(result.calibrationRatio).toBeCloseTo(expectedRatio, 1);
   });
 
   it('unsafe ratio (< 1/3) prevents calibration — map stays unchanged', () => {
@@ -268,13 +271,12 @@ describe('Token accounting pipeline — multi-turn calibration', () => {
     });
 
     expect(turn1.indexTokenCountMap[1]).toBe(20);
-    // Calibration: ratio = 25 / index0_tokens (only non-newOutput)
+    // Map stays raw — calibrationRatio captures the multiplier
     const index0Original = charCounter(messages[0]);
+    expect(turn1.indexTokenCountMap[0]).toBe(index0Original);
     const turn1Ratio = 25 / index0Original;
-    if (turn1Ratio >= 1 / 3 && turn1Ratio <= 2.5) {
-      expect(turn1.indexTokenCountMap[0]).toBe(
-        Math.round(index0Original * turn1Ratio)
-      );
+    if (turn1Ratio >= 0.5 && turn1Ratio <= 5) {
+      expect(turn1.calibrationRatio).toBeCloseTo(turn1Ratio, 1);
     }
 
     // Turn 2: user sends message, model responds. Both new indices (2, 3) are unset.
@@ -751,9 +753,10 @@ describe('Token accounting pipeline — Anthropic vs OpenAI cache semantics', ()
       },
     });
 
-    // ratio = 110 / 100 = 1.1, safe
-    expect(result.indexTokenCountMap[0]).toBe(Math.round(50 * 1.1));
-    expect(result.indexTokenCountMap[1]).toBe(Math.round(50 * 1.1));
+    // Map stays raw — calibrationRatio = 110 / 100 = 1.1
+    expect(result.indexTokenCountMap[0]).toBe(50);
+    expect(result.indexTokenCountMap[1]).toBe(50);
+    expect(result.calibrationRatio).toBeCloseTo(1.1, 1);
   });
 
   it('OpenAI inclusive cache does NOT inflate calibration input', () => {
