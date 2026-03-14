@@ -88,6 +88,13 @@ export function getTokenCountForMessage(
 }
 
 /**
+ * Anthropic's API consistently reports ~10% more tokens than the local
+ * claude tokenizer due to internal message framing and content encoding.
+ * Verified empirically across content types via the count_tokens endpoint.
+ */
+const CLAUDE_TOKEN_CORRECTION = 1.1;
+
+/**
  * Creates a token counter function using the specified encoding.
  * Lazily loads the encoding data on first use via dynamic import.
  */
@@ -96,8 +103,11 @@ export const createTokenCounter = async (
 ): Promise<(message: BaseMessage) => number> => {
   const tok = await getTokenizer(encoding);
   const countTokens = (text: string): number => tok.count(text);
-  return (message: BaseMessage): number =>
-    getTokenCountForMessage(message, countTokens);
+  const isClaude = encoding === 'claude';
+  return (message: BaseMessage): number => {
+    const count = getTokenCountForMessage(message, countTokens);
+    return isClaude ? Math.ceil(count * CLAUDE_TOKEN_CORRECTION) : count;
+  };
 };
 
 /** Utility to manage the token encoder lifecycle explicitly. */
