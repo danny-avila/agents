@@ -201,14 +201,11 @@ export function repairOrphanedToolMessages({
    *  (e.g. a ToolMessage whose parent AI was pruned). */
   droppedMessages: BaseMessage[];
 } {
-  // Pre-build reverse lookup: message → index in allMessages (O(n) once
-  // instead of O(n) per resolveTokenCountForMessage call).
   const messageIndexMap = new Map<BaseMessage, number>();
   for (let i = 0; i < allMessages.length; i++) {
     messageIndexMap.set(allMessages[i], i);
   }
 
-  // Collect all tool_call IDs and tool_result IDs from messages in context
   const validToolCallIds = new Set<string>();
   const presentToolResultIds = new Set<string>();
   for (const message of context) {
@@ -299,12 +296,10 @@ function stripOrphanToolUseBlocks(
   message: AIMessage,
   presentToolResultIds: Set<string>
 ): AIMessage | null {
-  // Strip tool_calls array entries
   const keptToolCalls = (message.tool_calls ?? []).filter(
     (tc) => typeof tc.id === 'string' && presentToolResultIds.has(tc.id)
   );
 
-  // Strip content blocks
   let keptContent: MessageContentComplex[] | string;
   if (Array.isArray(message.content)) {
     const filtered = (message.content as MessageContentComplex[]).filter(
@@ -323,7 +318,6 @@ function stripOrphanToolUseBlocks(
       }
     );
 
-    // If nothing left, return null
     if (filtered.length === 0) {
       return null;
     }
@@ -395,8 +389,6 @@ export function sanitizeOrphanToolBlocks(
     }
   }
 
-  // Fast-path: if every tool_call has a result and every result has a call,
-  // there are no orphans — return the original array immediately.
   let hasOrphans = false;
   for (const id of allToolCallIds) {
     if (!allToolResultIds.has(id)) {
@@ -417,7 +409,6 @@ export function sanitizeOrphanToolBlocks(
   }
 
   const result: BaseMessage[] = [];
-  // Track indices of AI messages that were modified (tool_use stripped).
   const strippedAiIndices = new Set<number>();
 
   for (const msg of messages) {
@@ -428,7 +419,6 @@ export function sanitizeOrphanToolBlocks(
         : ((msgAny.role as string | undefined) ??
           (msgAny._type as string | undefined));
 
-    // Drop orphan ToolMessages whose AI tool_call is missing.
     const toolCallId = msgAny.tool_call_id as string | undefined;
     if (
       (msgType === 'tool' || msg instanceof ToolMessage) &&
@@ -438,7 +428,6 @@ export function sanitizeOrphanToolBlocks(
       continue;
     }
 
-    // Strip orphan tool_use blocks from AI messages.
     const toolCalls = msgAny.tool_calls as Array<{ id?: string }> | undefined;
     if (
       (msgType === 'ai' ||
@@ -459,7 +448,6 @@ export function sanitizeOrphanToolBlocks(
           }
           continue;
         }
-        // For plain objects, filter tool_calls and content in-place.
         const keptToolCalls = toolCalls.filter(
           (tc) => typeof tc.id === 'string' && allToolResultIds.has(tc.id)
         );
@@ -499,10 +487,8 @@ export function sanitizeOrphanToolBlocks(
     result.push(msg);
   }
 
-  // If the conversation now ends with a stripped AI message (one whose
-  // tool_use was just removed — an incomplete tool call), drop it.
-  // Bedrock/Anthropic require the conversation to end with a user message,
-  // and a stripped AI message represents a dead-end exchange.
+  // Bedrock/Anthropic require the conversation to end with a user message;
+  // a stripped AI message (tool_use removed) represents a dead-end exchange.
   while (result.length > 0 && strippedAiIndices.has(result.length - 1)) {
     result.pop();
   }
@@ -622,9 +608,6 @@ export function getMessagesWithinTokenLimit({
   let currentTokenCount = 3;
   const instructions =
     _messages[0]?.getType() === 'system' ? _messages[0] : undefined;
-  // When messages include a system message at index 0, use its token count
-  // from the map.  Otherwise fall back to the explicit instructionTokens
-  // parameter (system prompt prepended later by buildSystemRunnable).
   const instructionsTokenCount =
     instructions != null ? (indexTokenCountMap[0] ?? 0) : _instructionTokens;
   const initialContextTokens = maxContextTokens - instructionsTokenCount;
@@ -778,7 +761,6 @@ export function getMessagesWithinTokenLimit({
     (thinkingStartIndex > -1 &&
       isIndexInContext(_messages, context, thinkingStartIndex))
   ) {
-    // we reverse at this step to ensure the context is in the correct order for the model, and we need to work backwards
     result.context = context.reverse() as BaseMessage[];
     return result;
   }
@@ -795,9 +777,6 @@ export function getMessagesWithinTokenLimit({
     );
   }
 
-  // Since we have a thinking sequence, we need to find the last assistant message
-  // in the latest AI/tool sequence to add the thinking block that falls outside of the current context
-  // Latest messages are ordered first.
   let assistantIndex = -1;
   for (let i = 0; i < context.length; i++) {
     const currentMessage = context[i];
@@ -833,7 +812,6 @@ export function getMessagesWithinTokenLimit({
   }
 
   const thinkingMessage: AIMessage = context[assistantIndex] as AIMessage;
-  // now we need to an additional round of pruning but making the thinking block fit
   const newThinkingMessageTokenCount =
     (indexTokenCountMap[thinkingStartIndex] ?? 0) + thinkingTokenCount;
   remainingContextTokens = initialContextTokens - newThinkingMessageTokenCount;
@@ -973,11 +951,8 @@ export function maskConsumedToolResults(params: {
     return 0;
   }
 
-  // Reverse so oldest is at position 0, newest at the end — for recency weighting
   consumedIndices.reverse();
 
-  // Compute per-result character budgets.
-  // Convert raw token budget to chars (~4 chars/token), distribute by recency.
   const totalBudgetChars =
     params.availableRawBudget != null && params.availableRawBudget > 0
       ? params.availableRawBudget * 4
@@ -995,10 +970,8 @@ export function maskConsumedToolResults(params: {
 
     let maxChars: number;
     if (totalBudgetChars > 0) {
-      // Recency weight: oldest (c=0) gets 0.2, newest (c=count-1) gets 1.0
       const position = count > 1 ? c / (count - 1) : 1;
       const weight = 0.2 + 0.8 * position;
-      // Sum of all weights = 0.6 * count (for count > 1), or 1 (for count = 1)
       const totalWeight = count > 1 ? 0.6 * count : 1;
       const share = (weight / totalWeight) * totalBudgetChars;
       maxChars = Math.max(MASKED_RESULT_MAX_CHARS, Math.floor(share));
@@ -1048,7 +1021,6 @@ export function preFlightTruncateToolResults(params: {
   const baseMaxChars = calculateMaxToolResultChars(maxContextTokens);
   let truncatedCount = 0;
 
-  // Count tool messages for recency weighting
   const toolIndices: number[] = [];
   for (let i = 0; i < messages.length; i++) {
     if (messages[i].getType() === 'tool') {
@@ -1064,8 +1036,6 @@ export function preFlightTruncateToolResults(params: {
       continue;
     }
 
-    // Progressive recency: oldest tool results get 20% of budget,
-    // newest get 100%. Linear interpolation between.
     const position = toolIndices.length > 1 ? t / (toolIndices.length - 1) : 1;
     const recencyFactor = 0.2 + 0.8 * position;
     const maxChars = Math.max(200, Math.floor(baseMaxChars * recencyFactor));
@@ -1159,7 +1129,6 @@ export function preFlightTruncateToolCallInputs(params: {
       continue;
     }
 
-    // Also truncate the matching tool_calls[].args entries
     const aiMsg = message as AIMessage;
     const newToolCalls = (aiMsg.tool_calls ?? []).map((tc) => {
       const serializedArgs = JSON.stringify(tc.args);
@@ -1373,7 +1342,6 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         providerInputTokens - instructionOverhead
       );
 
-      // Accumulate into running totals (only when we have real data)
       if (rawSentThisTurn > 0 && providerMessageTokens > 0) {
         cumulativeRawSent += rawSentThisTurn;
         cumulativeProviderReported += providerMessageTokens;
@@ -1384,14 +1352,12 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         );
       }
 
-      // Variance: compare our calibrated estimate against provider total
       const calibratedOurTotal =
         instructionOverhead + rawSentThisTurn * calibrationRatio;
       const overallRatio =
         calibratedOurTotal > 0 ? providerInputTokens / calibratedOurTotal : 0;
       const variancePct = Math.round((overallRatio - 1) * 100);
 
-      // Track best instruction overhead when variance is near zero
       const absVariance = Math.abs(overallRatio - 1);
       if (absVariance < bestVarianceAbs && rawSentThisTurn > 0) {
         bestVarianceAbs = absVariance;
@@ -1424,18 +1390,12 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       });
     }
 
-    // Get instruction token overhead (system message + tool schemas + summary).
-    // This budget is reserved for content prepended after pruning by buildSystemRunnable.
-    // Computed BEFORE pre-flight truncation so the effective available budget can
-    // drive truncation thresholds — without this, truncation thresholds based on
-    // maxTokens are too generous and leave individual messages larger than the
-    // actual available budget.
+    // Computed BEFORE pre-flight truncation so the effective budget can drive
+    // truncation thresholds — without this, thresholds based on maxTokens are
+    // too generous and leave individual messages larger than the actual budget.
     const currentInstructionTokens =
       factoryParams.getInstructionTokens?.() ?? 0;
 
-    // Apply reserve ratio: reduce the budget ceiling so pruning triggers before
-    // the context fills to 100%.  This compensates for approximate token counting
-    // and gives the model headroom.  Defaults to 5% when not configured.
     const reserveRatio = factoryParams.reserveRatio ?? DEFAULT_RESERVE_RATIO;
     const reserveTokens =
       reserveRatio > 0 && reserveRatio < 1
@@ -1448,10 +1408,8 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       pruningBudget - currentInstructionTokens
     );
 
-    // Calibrated total for budget decisions (raw × ratio)
     let calibratedTotalTokens = Math.round(totalTokens * calibrationRatio);
 
-    // P1: Log budget computation
     factoryParams.log?.('debug', 'Budget computed', {
       maxTokens: factoryParams.maxTokens,
       reserveTokens,
@@ -1512,12 +1470,10 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     //   90%: aggressive — budget factor 0.20, most results heavily truncated
     //   99%: emergency — budget factor 0.05, effectively placeholders for old results
     // ---------------------------------------------------------------------------
-    // Recompute totalTokens from indexTokenCountMap (raw tiktoken values).
     totalTokens = 0;
     for (let i = 0; i < params.messages.length; i++) {
       totalTokens += indexTokenCountMap[i] ?? 0;
     }
-    // Update calibrated total after recount
     calibratedTotalTokens = Math.round(totalTokens * calibrationRatio);
     const contextPressure =
       pruningBudget > 0 ? calibratedTotalTokens / pruningBudget : 0;
@@ -1541,10 +1497,6 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       if (factoryParams.summarizationEnabled === true) {
         preFadingMessages = [...params.messages];
       }
-      // Compute how much raw token budget is available for consumed results.
-      // effectiveMaxTokens (in provider space) divided by calibrationRatio
-      // gives the raw-space message budget. This lets masking use the full
-      // remaining space rather than aggressively truncating to 300 chars.
       const rawMessageBudget =
         calibrationRatio > 0
           ? Math.floor(effectiveMaxTokens / calibrationRatio)
@@ -1570,9 +1522,6 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       }
     }
 
-    // When summarization is NOT enabled, apply additional progressive context
-    // pressure fading on remaining oversized tool results (unconsumed ones
-    // that observation masking left intact).
     if (
       contextPressure >= PRESSURE_THRESHOLD_MASKING &&
       factoryParams.summarizationEnabled !== true
@@ -1611,8 +1560,6 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         });
       }
     }
-    // Position-based context pruning: degrade old tool results before the main prune.
-    // Skipped when summarization is enabled for the same reason as context pressure fading.
     if (
       factoryParams.contextPruningConfig?.enabled === true &&
       factoryParams.summarizationEnabled !== true
@@ -1668,13 +1615,11 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       }
     }
 
-    // Recalculate totalTokens (raw) after pre-flight truncation/masking.
     const preTruncationTotalTokens = totalTokens;
     totalTokens = 0;
     for (let i = 0; i < params.messages.length; i++) {
       totalTokens += indexTokenCountMap[i] ?? 0;
     }
-    // Recompute calibrated total after truncation
     calibratedTotalTokens = Math.round(totalTokens * calibrationRatio);
 
     if (totalTokens !== preTruncationTotalTokens) {
@@ -1704,14 +1649,11 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       };
     }
 
-    // Scale the budget down to raw-token space so getMessagesWithinTokenLimit
-    // can compare raw map values against a raw budget — no map mutation needed.
     const rawSpaceBudget =
       calibrationRatio > 0
         ? Math.round(pruningBudget / calibrationRatio)
         : pruningBudget;
 
-    // Instruction tokens include the tool schema multiplier — scale to raw space
     const rawSpaceInstructionTokens =
       calibrationRatio > 0
         ? Math.round(currentInstructionTokens / calibrationRatio)
@@ -1751,7 +1693,6 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       indexTokenCountMap,
     });
 
-    // P2: Log pruning result with per-message type breakdown
     const contextBreakdown = repairedContext.map((msg) => {
       const type = msg.getType();
       const name = type === 'tool' ? (msg.name ?? 'unknown') : '';
@@ -1859,12 +1800,10 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
           remainingTokens: fadingRetry.remainingContextTokens,
         });
 
-        // Restore token counts so next turn sees original sizes
         for (const [key, value] of Object.entries(preFadingTokenCounts)) {
           indexTokenCountMap[key] = value;
         }
       } else {
-        // Fading wasn't enough — restore and fall through to emergency
         for (const [key, value] of Object.entries(preFadingTokenCounts)) {
           indexTokenCountMap[key] = value;
         }
@@ -1885,14 +1824,11 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       params.messages.length > 0 &&
       effectiveMaxTokens > 0
     ) {
-      // Proportional budget: divide effective budget across messages,
-      // convert to chars (~4 chars/token), floor at 200 chars.
       const perMessageTokenBudget = Math.floor(
         effectiveMaxTokens / Math.max(1, params.messages.length)
       );
       const emergencyMaxChars = Math.max(200, perMessageTokenBudget * 4);
 
-      // P3: Log emergency path entry
       factoryParams.log?.(
         'warn',
         'Empty context, entering emergency truncation',
@@ -1918,7 +1854,6 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         let emergencyTruncatedCount = 0;
         for (let i = 0; i < emergencyMessages.length; i++) {
           const message = emergencyMessages[i];
-          // Truncate ToolMessage content (uses head+tail via truncateToolResultContent)
           if (message.getType() === 'tool') {
             const content = message.content;
             if (
@@ -1926,7 +1861,6 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
               content.length > emergencyMaxChars
             ) {
               const beforeLen = content.length;
-              // Clone the ToolMessage to avoid mutating the original in graph state
               const cloned = new ToolMessage({
                 content: truncateToolResultContent(content, emergencyMaxChars),
                 tool_call_id: (message as ToolMessage).tool_call_id,
@@ -1946,7 +1880,6 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
               });
             }
           }
-          // Truncate AI message tool_call inputs
           if (message.getType() === 'ai' && Array.isArray(message.content)) {
             const aiMsg = message as AIMessage;
             const contentBlocks = aiMsg.content as MessageContentComplex[];
@@ -2017,7 +1950,6 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
           emergencyMaxChars,
         });
 
-        // Retry pruning with the emergency-truncated (cloned) messages
         const retryResult = getMessagesWithinTokenLimit({
           maxContextTokens: pruningBudget,
           messages: emergencyMessages,

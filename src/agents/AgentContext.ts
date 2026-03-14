@@ -1,5 +1,4 @@
 /* eslint-disable no-console */
-// src/agents/AgentContext.ts
 import { HumanMessage, SystemMessage } from '@langchain/core/messages';
 import { RunnableLambda } from '@langchain/core/runnables';
 import type {
@@ -98,17 +97,12 @@ export class AgentContext {
       maxToolResultChars,
     });
 
-    // Restore cross-run summary before system runnable initialization so
-    // buildInstructionsString() includes the summary in the system message.
     if (initialSummary?.text != null && initialSummary.text !== '') {
       agentContext.setSummary(initialSummary.text, initialSummary.tokenCount);
       agentContext._summaryLocation = 'system_prompt';
     }
 
     if (tokenCounter) {
-      // Initialize system runnable BEFORE async tool token calculation
-      // This ensures system message tokens are in instructionTokens before
-      // updateTokenMapWithInstructions is called
       agentContext.initializeSystemRunnable();
 
       const tokenMap = indexTokenCountMap || {};
@@ -117,7 +111,6 @@ export class AgentContext {
       agentContext.tokenCalculationPromise = agentContext
         .calculateInstructionTokens(tokenCounter)
         .then(() => {
-          // Update token map with instruction tokens (includes system + tool tokens)
           agentContext.updateTokenMapWithInstructions(tokenMap);
         })
         .catch((err) => {
@@ -383,7 +376,6 @@ export class AgentContext {
 
       if (!isCodeExecutionOnly) continue;
 
-      // Include if: not deferred OR deferred but discovered
       const isDeferred = toolDef.defer_loading === true;
       const isDiscovered = this.discoveredToolNames.has(name);
       if (!isDeferred || isDiscovered) {
@@ -426,12 +418,10 @@ export class AgentContext {
         RunnableConfig<Record<string, unknown>>
       >
     | undefined {
-    // Return cached if not stale
     if (!this.systemRunnableStale && this.cachedSystemRunnable !== undefined) {
       return this.cachedSystemRunnable;
     }
 
-    // Stale or first access - rebuild
     const instructionsString = this.buildInstructionsString();
     this.cachedSystemRunnable = this.buildSystemRunnable(instructionsString);
     this.systemRunnableStale = false;
@@ -457,18 +447,15 @@ export class AgentContext {
   private buildInstructionsString(): string {
     const parts: string[] = [];
 
-    /** Build agent identity and handoff context preamble */
     const identityPreamble = this.buildIdentityPreamble();
     if (identityPreamble) {
       parts.push(identityPreamble);
     }
 
-    /** Add main instructions */
     if (this.instructions != null && this.instructions !== '') {
       parts.push(this.instructions);
     }
 
-    /** Add additional instructions */
     if (
       this.additionalInstructions != null &&
       this.additionalInstructions !== ''
@@ -476,7 +463,6 @@ export class AgentContext {
       parts.push(this.additionalInstructions);
     }
 
-    /** Add programmatic tools documentation */
     const programmaticToolsDoc = this.buildProgrammaticOnlyToolsInstructions();
     if (programmaticToolsDoc) {
       parts.push(programmaticToolsDoc);
@@ -549,7 +535,6 @@ export class AgentContext {
 
     let finalInstructions: string | BaseMessageFields = instructionsString;
 
-    // Handle Anthropic prompt caching
     let usePromptCache = false;
     if (this.provider === Providers.ANTHROPIC) {
       const anthropicOptions = this.clientOptions as
@@ -640,13 +625,8 @@ export class AgentContext {
     this.discoveredToolNames.clear();
     this.handoffContext = undefined;
 
-    // Restore the durable summary (from initialSummary or the last
-    // summarization node output) so the system message retains conversation
-    // context across processStream resets.
     this.summaryText = this._durableSummaryText;
     this.summaryTokenCount = this._durableSummaryTokenCount;
-    // Reset per-run summarization counters but preserve the summary version
-    // so downstream consumers can still distinguish updated summaries.
     this._lastSummarizationMsgCount = 0;
     this._summarizationCountThisRun = 0;
     this.lastCallUsage = undefined;
@@ -806,9 +786,6 @@ export class AgentContext {
     // Mid-run compaction clears the initial-summary flag so the summary
     // is injected as a HumanMessage (clean slate) instead of the system prompt.
     this._summaryLocation = 'user_message';
-    // Persist to durable storage so the summary survives reset() calls.
-    // This covers both cross-run summaries (initialSummary) and intra-run
-    // summaries produced by the summarization node.
     this._durableSummaryText = text;
     this._durableSummaryTokenCount = tokenCount;
     this._summaryVersion += 1;
@@ -895,9 +872,6 @@ export class AgentContext {
       (this.tools?.length ?? 0) + (this.toolDefinitions?.length ?? 0);
     const messageCount = messages?.length ?? 0;
 
-    // Compute message tokens from the index map.
-    // Index 0 now contains the real first message token count (no longer
-    // inflated with instruction tokens), so we include all indices.
     let messageTokens = 0;
     if (messages != null) {
       for (let i = 0; i < messages.length; i++) {
@@ -1004,12 +978,10 @@ export class AgentContext {
    * @returns Array of tools to bind to model
    */
   getToolsForBinding(): t.GraphTools | undefined {
-    /** Event-driven mode: create schema-only tools from definitions */
     if (this.toolDefinitions && this.toolDefinitions.length > 0) {
       return this.getEventDrivenToolsForBinding();
     }
 
-    /** Traditional mode: filter actual tool instances */
     const filtered =
       !this.tools || !this.toolRegistry
         ? this.tools
