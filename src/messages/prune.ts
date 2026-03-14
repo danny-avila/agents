@@ -928,24 +928,27 @@ export function maskConsumedToolResults(params: {
   messages: BaseMessage[];
   indexTokenCountMap: Record<string, number | undefined>;
   tokenCounter: TokenCounter;
-  maxChars?: number;
+  /** Raw-space token budget available for all consumed tool results combined.
+   *  When provided, the budget is distributed across consumed results weighted
+   *  by recency (newest get the most, oldest get MASKED_RESULT_MAX_CHARS min).
+   *  When omitted, falls back to a flat MASKED_RESULT_MAX_CHARS per result. */
+  availableRawBudget?: number;
 }): number {
   const { messages, indexTokenCountMap, tokenCounter } = params;
-  const maxChars = params.maxChars ?? MASKED_RESULT_MAX_CHARS;
   let maskedCount = 0;
 
-  // Build set of consumed tool message indices.
-  // Walk backwards: once we see an AI message with non-tool-call content,
-  // all ToolMessages before it are consumed.
+  // Pass 1 (backward): identify consumed tool message indices.
+  // A ToolMessage is "consumed" once we've seen a subsequent AI message with
+  // substantive text content (not just tool calls).
+  // Collected in forward order (oldest first) for recency weighting.
   let seenNonToolCallAI = false;
-  const consumed = new Set<number>();
+  const consumedIndices: number[] = [];
 
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
     const type = msg.getType();
 
     if (type === 'ai') {
-      // Check if this AI message has substantive content (not just tool calls)
       const hasText =
         typeof msg.content === 'string'
           ? msg.content.length > 0
@@ -962,14 +965,48 @@ export function maskConsumedToolResults(params: {
         seenNonToolCallAI = true;
       }
     } else if (type === 'tool' && seenNonToolCallAI) {
-      consumed.add(i);
+      consumedIndices.push(i);
     }
   }
 
-  for (const i of consumed) {
+  if (consumedIndices.length === 0) {
+    return 0;
+  }
+
+  // Reverse so oldest is at position 0, newest at the end — for recency weighting
+  consumedIndices.reverse();
+
+  // Compute per-result character budgets.
+  // Convert raw token budget to chars (~4 chars/token), distribute by recency.
+  const totalBudgetChars =
+    params.availableRawBudget != null && params.availableRawBudget > 0
+      ? params.availableRawBudget * 4
+      : 0;
+
+  const count = consumedIndices.length;
+
+  for (let c = 0; c < count; c++) {
+    const i = consumedIndices[c];
     const message = messages[i];
     const content = message.content;
-    if (typeof content !== 'string' || content.length <= maxChars) {
+    if (typeof content !== 'string') {
+      continue;
+    }
+
+    let maxChars: number;
+    if (totalBudgetChars > 0) {
+      // Recency weight: oldest (c=0) gets 0.2, newest (c=count-1) gets 1.0
+      const position = count > 1 ? c / (count - 1) : 1;
+      const weight = 0.2 + 0.8 * position;
+      // Sum of all weights = 0.6 * count (for count > 1), or 1 (for count = 1)
+      const totalWeight = count > 1 ? 0.6 * count : 1;
+      const share = (weight / totalWeight) * totalBudgetChars;
+      maxChars = Math.max(MASKED_RESULT_MAX_CHARS, Math.floor(share));
+    } else {
+      maxChars = MASKED_RESULT_MAX_CHARS;
+    }
+
+    if (content.length <= maxChars) {
       continue;
     }
 
@@ -1504,10 +1541,19 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       if (factoryParams.summarizationEnabled === true) {
         preFadingMessages = [...params.messages];
       }
+      // Compute how much raw token budget is available for consumed results.
+      // effectiveMaxTokens (in provider space) divided by calibrationRatio
+      // gives the raw-space message budget. This lets masking use the full
+      // remaining space rather than aggressively truncating to 300 chars.
+      const rawMessageBudget =
+        calibrationRatio > 0
+          ? Math.floor(effectiveMaxTokens / calibrationRatio)
+          : effectiveMaxTokens;
       observationsMasked = maskConsumedToolResults({
         messages: params.messages,
         indexTokenCountMap,
         tokenCounter: factoryParams.tokenCounter,
+        availableRawBudget: rawMessageBudget,
       });
       if (observationsMasked > 0) {
         // Masking changed what the provider will see on the next call.

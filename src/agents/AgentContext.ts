@@ -17,10 +17,13 @@ import { DEFAULT_RESERVE_RATIO } from '@/messages';
 import { toJsonSchema } from '@/utils/schema';
 
 /**
- * Anthropic direct API wraps tool schemas in an XML-like structure,
- * roughly 2.6× the raw JSON token count.
+ * Anthropic direct API tool schema overhead.  Empirically tested via the
+ * count_tokens endpoint: 29 complex MCP tools cost ~5K API tokens vs
+ * ~4.8K raw tiktoken — a ~1.04× ratio.  Using 1.2× for a small safety
+ * margin.  (Previously 2.6× based on early testing with minimal tools
+ * where the fixed ~300-token tool-system preamble dominated.)
  */
-const ANTHROPIC_TOOL_TOKEN_MULTIPLIER = 2.6;
+const ANTHROPIC_TOOL_TOKEN_MULTIPLIER = 1.2;
 
 /**
  * Bedrock uses a lighter tool encoding than the direct Anthropic API,
