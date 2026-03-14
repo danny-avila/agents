@@ -1196,8 +1196,6 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     calibrationRatio?: number;
     resolvedInstructionOverhead?: number;
   } {
-    // Guard: empty messages array (e.g. after REMOVE_ALL with empty context).
-    // Nothing to prune — return immediately to avoid out-of-bounds access.
     if (params.messages.length === 0) {
       return {
         context: [],
