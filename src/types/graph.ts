@@ -300,6 +300,8 @@ export type PartMetadata = {
   status?: string;
   action?: boolean;
   output?: string;
+  auth?: string;
+  expires_at?: number;
 };
 
 export type ModelEndData =

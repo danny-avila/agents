@@ -164,6 +164,8 @@ export type ToolCallsDetails = {
 export type ToolCallDelta = {
   type: StepTypes;
   tool_calls?: ToolCallChunk[]; // #new
+  auth?: string;
+  expires_at?: number;
 };
 
 export type AgentToolCall =

@@ -576,6 +576,16 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         type: ToolCallTypes.TOOL_CALL,
       };
 
+      const auth =
+        contentPart.tool_call.auth ?? existingContent?.tool_call?.auth;
+      const expiresAt =
+        contentPart.tool_call.expires_at ??
+        existingContent?.tool_call?.expires_at;
+      if (auth != null) {
+        newToolCall.auth = auth;
+        newToolCall.expires_at = expiresAt;
+      }
+
       if (finalUpdate) {
         newToolCall.progress = 1;
         newToolCall.output = contentPart.tool_call.output;
@@ -713,6 +723,8 @@ export function createContentAggregator(): t.ContentAggregatorResult {
               args: toolCallDelta.args ?? '',
               name: toolCallDelta.name,
               id: toolCallId,
+              auth: runStepDelta.delta.auth,
+              expires_at: runStepDelta.delta.expires_at,
             },
           };
 
