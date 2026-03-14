@@ -1,5 +1,4 @@
 /* eslint-disable no-console */
-// src/graphs/Graph.ts
 import { nanoid } from 'nanoid';
 import { ToolNode } from '@langchain/langgraph/prebuilt';
 import { Runnable, RunnableConfig } from '@langchain/core/runnables';
@@ -173,7 +172,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   defaultAgentId: string;
 
   constructor({
-    // parent-level graph inputs
     runId,
     signal,
     agents,
@@ -246,7 +244,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   }
 
   override clearHeavyState(): void {
-    // Cache run messages before clearing so getRunMessages() still works after cleanup.
     this.cachedRunMessages = this.messages.slice(this.startIndex);
     super.clearHeavyState();
     this.messages = [];
@@ -373,7 +370,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   /* Misc.*/
 
   getRunMessages(): BaseMessage[] | undefined {
-    // If messages were cleared by clearHeavyState(), return the cached copy.
     if (this.messages.length === 0 && this.cachedRunMessages != null) {
       return this.cachedRunMessages;
     }
@@ -578,9 +574,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       state: t.BaseGraphState,
       config?: RunnableConfig
     ): Promise<Partial<t.BaseGraphState>> => {
-      /**
-       * Get agent context - it must exist by this point
-       */
       const agentContext = this.agentContexts.get(agentId);
       if (!agentContext) {
         throw new Error(`Agent context not found for agentId: ${agentId}`);
@@ -592,7 +585,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
       const { messages } = state;
 
-      // Extract tool discoveries from current turn only (similar to formatArtifactPayload pattern)
       const discoveredNames = extractToolDiscoveries(messages);
       if (discoveredNames.length > 0) {
         agentContext.markToolsAsDiscovered(discoveredNames);
@@ -625,9 +617,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         agentContext.tokenCounter &&
         agentContext.maxContextTokens != null
       ) {
-        // After summarization the token map is empty — start from 0 so the
-        // pruner counts every message.  Otherwise use startIndex (entries
-        // below it are already counted in the map).
         agentContext.pruneMessages = createPruneMessages({
           startIndex:
             agentContext.indexTokenCountMap[0] != null ? this.startIndex : 0,
@@ -790,10 +779,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }
 
       if (agentContext.provider === Providers.ANTHROPIC) {
-        // When a system runnable exists, addCacheControl runs inside
-        // it where the full array (system + summary + messages) is
-        // visible.  Only apply it here as a fallback when there is no
-        // system runnable (rare — means no instructions and no summary).
         const anthropicOptions = agentContext.clientOptions as
           | t.AnthropicClientOptions
           | undefined;
@@ -812,11 +797,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         }
       }
 
-      /**
-       * Handle edge case: when switching from a non-thinking agent to a thinking-enabled agent,
-       * convert AI messages with tool calls to HumanMessages to avoid thinking block requirements.
-       * This is required by Anthropic/Bedrock when thinking is enabled.
-       */
       if (
         isThinkingEnabled(agentContext.provider, agentContext.clientOptions)
       ) {
@@ -827,11 +807,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         );
       }
 
-      // Safety net: strip orphan tool_use blocks.  The pruner's
-      // repairOrphanedToolMessages already handles orphans in the normal
-      // path, but post-pruning transformations (ensureThinkingBlockInMessages,
-      // legacy content formatting) can introduce new orphans.
-      // Skip when the pruner ran and no transformations modified messages.
       const needsOrphanSanitize =
         (agentContext.provider === Providers.ANTHROPIC ||
           agentContext.provider === Providers.BEDROCK) &&
@@ -876,8 +851,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         (agentContext.clientOptions as t.LLMConfig | undefined)?.fallbacks ??
         [];
 
-      // Post-compaction clean slate: messages are empty but the system
-      // runnable will inject the summary as a HumanMessage during invoke.
       if (
         finalMessages.length === 0 &&
         !agentContext.hasPendingCompactionSummary()
@@ -1243,7 +1216,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   }
 
   createWorkflow(): t.CompiledStateWorkflow {
-    /** Use the default (first) agent for now */
     const agentNode = this.createAgentNode(this.defaultAgentId);
     const StateAnnotation = Annotation.Root({
       messages: Annotation<BaseMessage[]>({
@@ -1325,18 +1297,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       runStep.runId = runId;
     }
 
-    /**
-     * Extract agentId and parallelGroupId from metadata
-     * Only set agentId for MultiAgentGraph (so frontend knows when to show agent labels)
-     */
     if (metadata) {
       try {
         const agentContext = this.getAgentContext(metadata);
         if (this.isMultiAgentGraph() && agentContext.agentId) {
-          // Only include agentId for MultiAgentGraph - enables frontend to show agent labels
           runStep.agentId = agentContext.agentId;
-          // Set group ID if this agent is part of a parallel group
-          // Group IDs are incrementing numbers (1, 2, 3...) reflecting execution order
           const groupId = this.getParallelGroupIdForAgent(agentContext.agentId);
           if (groupId != null) {
             runStep.groupId = groupId;
