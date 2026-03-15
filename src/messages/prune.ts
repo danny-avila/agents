@@ -36,6 +36,9 @@ const PRESSURE_BANDS: [number, number][] = [
 /** Maximum character length for masked (consumed) tool results. */
 const MASKED_RESULT_MAX_CHARS = 300;
 
+/** Hard cap for the originalToolContent store (~2 MB estimated from char length). */
+const ORIGINAL_CONTENT_MAX_CHARS = 2_000_000;
+
 /** Minimum cumulative calibration ratio — provider can't count fewer tokens
  *  than our raw estimate (within reason). Prevents divide-by-zero edge cases. */
 const CALIBRATION_RATIO_MIN = 0.5;
@@ -911,6 +914,11 @@ export function maskConsumedToolResults(params: {
    *  by recency (newest get the most, oldest get MASKED_RESULT_MAX_CHARS min).
    *  When omitted, falls back to a flat MASKED_RESULT_MAX_CHARS per result. */
   availableRawBudget?: number;
+  /** When provided, original (pre-masking) content is stored here keyed by
+   *  message index — only for entries that actually get truncated. */
+  originalContentStore?: Map<number, string>;
+  /** Called after storing content with the char length of the stored entry. */
+  onContentStored?: (charLength: number) => void;
 }): number {
   const { messages, indexTokenCountMap, tokenCounter } = params;
   let maskedCount = 0;
@@ -981,6 +989,13 @@ export function maskConsumedToolResults(params: {
 
     if (content.length <= maxChars) {
       continue;
+    }
+
+    if (params.originalContentStore && !params.originalContentStore.has(i)) {
+      params.originalContentStore.set(i, content);
+      if (params.onContentStored) {
+        params.onContentStored(content.length);
+      }
     }
 
     const cloned = new ToolMessage({
@@ -1184,6 +1199,12 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
   /** Best observed instruction overhead from a near-zero variance turn. */
   let bestInstructionOverhead: number | undefined;
   let bestVarianceAbs = Infinity;
+  /** Original (pre-masking) tool result content keyed by message index.
+   *  Allows the summarizer to see full tool outputs even after masking
+   *  has truncated them in the live message array. Cleared when the
+   *  pruner is recreated after summarization. */
+  const originalToolContent = new Map<number, string>();
+  let originalToolContentSize = 0;
 
   return function pruneMessages(params: PruneMessagesParams): {
     context: BaseMessage[];
@@ -1192,7 +1213,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     prePruneTotalTokens?: number;
     remainingContextTokens?: number;
     contextPressure?: number;
-    preFadingMessages?: BaseMessage[];
+    originalToolContent?: Map<number, string>;
     calibrationRatio?: number;
     resolvedInstructionOverhead?: number;
   } {
@@ -1488,22 +1509,54 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     // When summarization is enabled, snapshot messages first so the
     // summarizer can see the full originals when compaction fires.
     // -----------------------------------------------------------------------
-    let preFadingMessages: BaseMessage[] | undefined;
     let observationsMasked = 0;
 
     if (contextPressure >= PRESSURE_THRESHOLD_MASKING) {
-      if (factoryParams.summarizationEnabled === true) {
-        preFadingMessages = [...params.messages];
-      }
       const rawMessageBudget =
         calibrationRatio > 0
           ? Math.floor(effectiveMaxTokens / calibrationRatio)
           : effectiveMaxTokens;
+      // When summarization is enabled, use half the reserve ratio as extra
+      // masking headroom — the LLM keeps more context while the summarizer
+      // gets full content from originalToolContent regardless. The remaining
+      // half of the reserve covers estimation errors.
+      const reserveHeadroom =
+        factoryParams.summarizationEnabled === true
+          ? Math.floor(
+            rawMessageBudget *
+                (factoryParams.reserveRatio ?? DEFAULT_RESERVE_RATIO) *
+                0.5
+          )
+          : 0;
       observationsMasked = maskConsumedToolResults({
         messages: params.messages,
         indexTokenCountMap,
         tokenCounter: factoryParams.tokenCounter,
-        availableRawBudget: rawMessageBudget,
+        availableRawBudget: rawMessageBudget + reserveHeadroom,
+        originalContentStore:
+          factoryParams.summarizationEnabled === true
+            ? originalToolContent
+            : undefined,
+        onContentStored:
+          factoryParams.summarizationEnabled === true
+            ? (charLen: number): void => {
+              originalToolContentSize += charLen;
+              while (
+                originalToolContentSize > ORIGINAL_CONTENT_MAX_CHARS &&
+                  originalToolContent.size > 0
+              ) {
+                const oldest = originalToolContent.keys().next();
+                if (oldest.done === true) {
+                  break;
+                }
+                const removed = originalToolContent.get(oldest.value);
+                if (removed != null) {
+                  originalToolContentSize -= removed.length;
+                }
+                originalToolContent.delete(oldest.value);
+              }
+            }
+            : undefined,
       });
       if (observationsMasked > 0) {
         // Masking changed what the provider will see on the next call.
@@ -1641,7 +1694,8 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         remainingContextTokens:
           pruningBudget - calibratedTotalTokens - currentInstructionTokens,
         contextPressure,
-        preFadingMessages,
+        originalToolContent:
+          originalToolContent.size > 0 ? originalToolContent : undefined,
         calibrationRatio,
         resolvedInstructionOverhead: bestInstructionOverhead,
       };
@@ -2016,7 +2070,8 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       prePruneTotalTokens: calibratedTotalTokens,
       remainingContextTokens,
       contextPressure,
-      preFadingMessages,
+      originalToolContent:
+        originalToolContent.size > 0 ? originalToolContent : undefined,
       calibrationRatio,
       resolvedInstructionOverhead: bestInstructionOverhead,
     };
