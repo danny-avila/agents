@@ -509,26 +509,14 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
     );
 
     // Progressively squeeze to force summarization
-    run = await createRun(3500);
-    await runTurn(
-      { run, conversationHistory },
-      'What is 777 * 777? Calculator. Also list everything.',
-      streamConfig
-    );
-
-    if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
-      run = await createRun(3200);
+    for (const squeeze of [3500, 3200, 3100, 3000, 2800, 2500, 2000]) {
+      if (spies.onSummarizeStartSpy.mock.calls.length > 0) {
+        break;
+      }
+      run = await createRun(squeeze);
       await runTurn(
         { run, conversationHistory },
-        'Calculate 999 * 999 with calculator.',
-        streamConfig
-      );
-    }
-    if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
-      run = await createRun(3100);
-      await runTurn(
-        { run, conversationHistory },
-        'What is 50 + 50? Calculator.',
+        `What is ${squeeze} * 2? Calculator.`,
         streamConfig
       );
     }
@@ -2479,7 +2467,7 @@ const hasAnyApiKey =
     );
 
     // Squeeze progressively to force summarization
-    for (const squeeze of [3500, 3200, 3100, 3000]) {
+    for (const squeeze of [3500, 3200, 3100, 3000, 2800, 2500, 2000]) {
       if (spies.onSummarizeStartSpy.mock.calls.length > 0) {
         break;
       }
@@ -2583,7 +2571,7 @@ const hasAnyApiKey =
     );
 
     // Squeeze progressively to force summarization
-    for (const squeeze of [3500, 3200, 3100, 3000]) {
+    for (const squeeze of [3500, 3200, 3100, 3000, 2800, 2500, 2000]) {
       if (spies.onSummarizeStartSpy.mock.calls.length > 0) {
         break;
       }
@@ -2694,7 +2682,7 @@ const hasAnyApiKey =
     );
 
     // Squeeze progressively to force summarization
-    for (const squeeze of [3500, 3200, 3100, 3000]) {
+    for (const squeeze of [3500, 3200, 3100, 3000, 2800, 2500, 2000]) {
       if (spies.onSummarizeStartSpy.mock.calls.length > 0) {
         break;
       }
