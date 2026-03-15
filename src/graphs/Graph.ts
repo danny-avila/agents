@@ -648,7 +648,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           messagesToRefine,
           prePruneTotalTokens,
           remainingContextTokens,
-          preFadingMessages,
+          originalToolContent,
           calibrationRatio,
           resolvedInstructionOverhead,
         } = agentContext.pruneMessages({
@@ -693,11 +693,23 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             });
 
           if (triggerResult) {
-            // Full compaction: pass the entire conversation to the summarizer.
-            // Use the pre-masking snapshot when observation masking ran so
-            // the summarizer sees full tool results.  After compaction the
-            // model starts fresh with only the summary — no surviving messages.
-            const allMessages = preFadingMessages ?? messages;
+            let allMessages = messages;
+            if (originalToolContent != null && originalToolContent.size > 0) {
+              allMessages = [...messages];
+              for (const [idx, content] of originalToolContent) {
+                const msg = allMessages[idx];
+                if (msg != null && msg instanceof ToolMessage) {
+                  allMessages[idx] = new ToolMessage({
+                    content,
+                    tool_call_id: msg.tool_call_id,
+                    name: msg.name,
+                    id: msg.id,
+                    additional_kwargs: msg.additional_kwargs,
+                    response_metadata: msg.response_metadata,
+                  });
+                }
+              }
+            }
 
             emitAgentLog(
               config,
