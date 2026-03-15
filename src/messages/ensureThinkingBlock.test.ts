@@ -539,19 +539,19 @@ describe('ensureThinkingBlockInMessages', () => {
         Providers.ANTHROPIC
       );
 
-      // Original message 1: HumanMessage (preserved)
-      // Original message 2: AIMessage without tools (preserved)
-      // Original message 3: HumanMessage (preserved)
-      // Original messages 4-5: AIMessage with tool + ToolMessage (converted to 1 HumanMessage)
-      // Original message 6: HumanMessage (preserved)
-      // Original message 7: AIMessage without tools (preserved)
-      expect(result).toHaveLength(6);
+      // Only the trailing sequence after the last HumanMessage is processed.
+      // The AI+Tool at indices 3-4 is history — preserved as-is.
+      // Last HumanMessage is at index 5 ("Third question").
+      // Index 6 (AIMessage without tools) is in the trailing sequence but has
+      // no tool calls, so it passes through.
+      expect(result).toHaveLength(7);
       expect(result[0]).toBeInstanceOf(HumanMessage);
       expect(result[1]).toBeInstanceOf(AIMessage);
       expect(result[2]).toBeInstanceOf(HumanMessage);
-      expect(result[3]).toBeInstanceOf(HumanMessage); // Converted
-      expect(result[4]).toBeInstanceOf(HumanMessage);
-      expect(result[5]).toBeInstanceOf(AIMessage);
+      expect(result[3]).toBeInstanceOf(AIMessage); // History — preserved
+      expect(result[4]).toBeInstanceOf(ToolMessage); // History — preserved
+      expect(result[5]).toBeInstanceOf(HumanMessage);
+      expect(result[6]).toBeInstanceOf(AIMessage);
     });
 
     test('should handle multiple tool-using sequences', () => {
@@ -595,16 +595,19 @@ describe('ensureThinkingBlockInMessages', () => {
         Providers.ANTHROPIC
       );
 
-      // Each tool sequence should be converted to a HumanMessage
-      expect(result).toHaveLength(4);
+      // Only the trailing sequence after the last HumanMessage is converted.
+      // First tool sequence (indices 1-2) is history — preserved.
+      // Last HumanMessage is at index 3 ("Do task 2").
+      // Trailing sequence (indices 4-5) is converted to 1 HumanMessage.
+      expect(result).toHaveLength(5);
       expect(result[0]).toBeInstanceOf(HumanMessage);
       expect(result[0].content).toBe('Do task 1');
-      expect(result[1]).toBeInstanceOf(HumanMessage);
-      expect(getTextContent(result[1])).toContain('Doing task 1');
-      expect(result[2]).toBeInstanceOf(HumanMessage);
-      expect(result[2].content).toBe('Do task 2');
+      expect(result[1]).toBeInstanceOf(AIMessage); // History — preserved
+      expect(result[2]).toBeInstanceOf(ToolMessage); // History — preserved
       expect(result[3]).toBeInstanceOf(HumanMessage);
-      expect(getTextContent(result[3])).toContain('Doing task 2');
+      expect(result[3].content).toBe('Do task 2');
+      expect(result[4]).toBeInstanceOf(HumanMessage); // Converted trailing sequence
+      expect(getTextContent(result[4])).toContain('Doing task 2');
     });
   });
 
