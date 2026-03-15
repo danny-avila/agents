@@ -1127,19 +1127,27 @@ export function ensureThinkingBlockInMessages(
     return messages;
   }
 
-  // If the last message is already a HumanMessage, there is no trailing tool
-  // sequence to convert — return early to preserve prompt caching and avoid
-  // redundant token overhead from re-processing the entire history.
-  const lastMsg = messages[messages.length - 1];
-  const lastIsHuman =
-    lastMsg instanceof HumanMessage ||
-    ('role' in lastMsg && (lastMsg as any).role === 'user');
-  if (lastIsHuman) {
+  // Find the last HumanMessage. Only the trailing sequence after it needs
+  // validation — earlier messages are history already accepted by the provider.
+  let lastHumanIndex = -1;
+  for (let k = messages.length - 1; k >= 0; k--) {
+    const m = messages[k];
+    if (
+      m instanceof HumanMessage ||
+      ('role' in m && (m as any).role === 'user')
+    ) {
+      lastHumanIndex = k;
+      break;
+    }
+  }
+
+  if (lastHumanIndex === messages.length - 1) {
     return messages;
   }
 
-  const result: BaseMessage[] = [];
-  let i = 0;
+  const result: BaseMessage[] =
+    lastHumanIndex >= 0 ? messages.slice(0, lastHumanIndex + 1) : [];
+  let i = lastHumanIndex + 1;
 
   while (i < messages.length) {
     const msg = messages[i];
