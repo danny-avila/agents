@@ -102,19 +102,6 @@ function cloneMessage<T extends MessageWithContent>(
 }
 
 /**
- * Checks if a message's content needs cache control stripping.
- * Returns true if content has cachePoint blocks or cache_control fields.
- */
-function needsCacheStripping(content: MessageContentComplex[]): boolean {
-  for (let i = 0; i < content.length; i++) {
-    const block = content[i];
-    if (isCachePoint(block)) return true;
-    if ('cache_control' in block) return true;
-  }
-  return false;
-}
-
-/**
  * Anthropic API: Adds cache control to the appropriate user messages in the payload.
  * Strips ALL existing cache control (both Anthropic and Bedrock formats) from all messages,
  * then adds fresh cache control to the last 2 user messages in a single backward pass.
@@ -139,58 +126,63 @@ export function addCacheControl<T extends AnthropicMessage | BaseMessage>(
     const isUserMessage =
       ('getType' in originalMessage && originalMessage.getType() === 'human') ||
       ('role' in originalMessage && originalMessage.role === 'user');
-
     const hasArrayContent = Array.isArray(content);
-    const needsStripping =
-      hasArrayContent &&
-      needsCacheStripping(content as MessageContentComplex[]);
     const needsCacheAdd =
       userMessagesModified < 2 &&
       isUserMessage &&
       (typeof content === 'string' || hasArrayContent);
 
-    if (!needsStripping && !needsCacheAdd) {
+    // Skip messages that don't need any work
+    if (!needsCacheAdd && !hasArrayContent) {
       continue;
     }
 
     let workingContent: MessageContentComplex[];
+    let modified = false;
 
     if (hasArrayContent) {
-      workingContent = deepCloneContent(
-        content as MessageContentComplex[]
-      ).filter((block) => !isCachePoint(block as MessageContentComplex));
-
-      for (let j = 0; j < workingContent.length; j++) {
-        const block = workingContent[j] as Record<string, unknown>;
-        if ('cache_control' in block) {
-          delete block.cache_control;
-        }
-      }
-    } else if (typeof content === 'string') {
-      workingContent = [
-        { type: 'text', text: content },
-      ] as MessageContentComplex[];
-    } else {
+      // Single pass: clone blocks, strip cache markers and cache points,
+      // find last text block index for cache insertion — all at once.
+      const src = content as MessageContentComplex[];
       workingContent = [];
-    }
+      let lastTextIndex = -1;
+      for (let j = 0; j < src.length; j++) {
+        const block = src[j];
+        if (isCachePoint(block)) {
+          modified = true;
+          continue; // skip cache point blocks
+        }
+        const cloned = { ...block };
+        if ('cache_control' in cloned) {
+          delete (cloned as Record<string, unknown>).cache_control;
+          modified = true;
+        }
+        if ('type' in cloned && cloned.type === 'text') {
+          lastTextIndex = workingContent.length;
+        }
+        workingContent.push(cloned as MessageContentComplex);
+      }
 
-    if (userMessagesModified >= 2 || !isUserMessage) {
-      updatedMessages[i] = cloneMessage(
-        originalMessage as MessageWithContent,
-        workingContent
-      ) as T;
-      continue;
-    }
+      if (!modified && !needsCacheAdd) {
+        continue; // nothing to strip and no cache to add
+      }
 
-    for (let j = workingContent.length - 1; j >= 0; j--) {
-      const contentPart = workingContent[j];
-      if ('type' in contentPart && contentPart.type === 'text') {
-        (contentPart as Anthropic.TextBlockParam).cache_control = {
+      // Add cache control to the last text block for user messages
+      if (needsCacheAdd && lastTextIndex >= 0) {
+        (
+          workingContent[lastTextIndex] as Anthropic.TextBlockParam
+        ).cache_control = {
           type: 'ephemeral',
         };
         userMessagesModified++;
-        break;
       }
+    } else if (typeof content === 'string' && needsCacheAdd) {
+      workingContent = [
+        { type: 'text', text: content, cache_control: { type: 'ephemeral' } },
+      ] as unknown as MessageContentComplex[];
+      userMessagesModified++;
+    } else {
+      continue;
     }
 
     updatedMessages[i] = cloneMessage(
@@ -325,9 +317,6 @@ export function addBedrockCacheControl<
 
     const content = originalMessage.content;
     const hasArrayContent = Array.isArray(content);
-    const needsStripping =
-      hasArrayContent &&
-      needsCacheStripping(content as MessageContentComplex[]);
     const isEmptyString = typeof content === 'string' && content === '';
     const needsCacheAdd =
       messagesModified < 2 &&
@@ -335,77 +324,63 @@ export function addBedrockCacheControl<
       !isEmptyString &&
       (typeof content === 'string' || hasArrayContent);
 
-    if (!needsStripping && !needsCacheAdd) {
+    if (!needsCacheAdd && !hasArrayContent) {
       continue;
     }
 
     let workingContent: MessageContentComplex[];
+    let modified = false;
 
     if (hasArrayContent) {
-      workingContent = deepCloneContent(
-        content as MessageContentComplex[]
-      ).filter((block) => !isCachePoint(block));
-
-      for (let j = 0; j < workingContent.length; j++) {
-        const block = workingContent[j] as Record<string, unknown>;
-        if ('cache_control' in block) {
-          delete block.cache_control;
-        }
-      }
-    } else if (typeof content === 'string') {
-      workingContent = [{ type: ContentTypes.TEXT, text: content }];
-    } else {
+      // Single pass: clone blocks, strip cache markers, find last
+      // non-empty text block for cache point insertion — all at once.
+      const src = content as MessageContentComplex[];
       workingContent = [];
-    }
-
-    if (messagesModified >= 2 || isToolMessage || isEmptyString) {
-      updatedMessages[i] = cloneMessage(originalMessage, workingContent);
-      continue;
-    }
-
-    if (workingContent.length === 0) {
-      continue;
-    }
-
-    let hasCacheableContent = false;
-    for (const block of workingContent) {
-      if (block.type === ContentTypes.TEXT) {
-        if (typeof block.text === 'string' && block.text.trim() !== '') {
-          hasCacheableContent = true;
-          break;
-        }
-      }
-    }
-
-    if (!hasCacheableContent) {
-      updatedMessages[i] = cloneMessage(originalMessage, workingContent);
-      continue;
-    }
-
-    let inserted = false;
-    for (let j = workingContent.length - 1; j >= 0; j--) {
-      const block = workingContent[j] as MessageContentComplex;
-      const type = (block as { type?: string }).type;
-      if (type === ContentTypes.TEXT || type === 'text') {
-        const text = (block as { text?: string }).text;
-        if (text === '' || text === undefined || text.trim() === '') {
+      let lastNonEmptyTextIndex = -1;
+      for (let j = 0; j < src.length; j++) {
+        const block = src[j];
+        if (isCachePoint(block)) {
+          modified = true;
           continue;
         }
-        workingContent.splice(j + 1, 0, {
+        const cloned = { ...block };
+        if ('cache_control' in cloned) {
+          delete (cloned as Record<string, unknown>).cache_control;
+          modified = true;
+        }
+        const type = (cloned as { type?: string }).type;
+        if (type === ContentTypes.TEXT || type === 'text') {
+          const text = (cloned as { text?: string }).text;
+          if (text != null && text.trim() !== '') {
+            lastNonEmptyTextIndex = workingContent.length;
+          }
+        }
+        workingContent.push(cloned as MessageContentComplex);
+      }
+
+      if (!modified && !needsCacheAdd) {
+        continue;
+      }
+
+      // Insert cache point after the last non-empty text block.
+      // Skip if no cacheable text content exists (whitespace-only messages).
+      if (needsCacheAdd && lastNonEmptyTextIndex >= 0) {
+        workingContent.splice(lastNonEmptyTextIndex + 1, 0, {
           cachePoint: { type: 'default' },
         } as MessageContentComplex);
-        inserted = true;
-        break;
+        messagesModified++;
       }
-    }
-    if (!inserted) {
-      workingContent.push({
-        cachePoint: { type: 'default' },
-      } as MessageContentComplex);
+    } else if (typeof content === 'string' && needsCacheAdd) {
+      workingContent = [
+        { type: ContentTypes.TEXT, text: content },
+        { cachePoint: { type: 'default' } } as MessageContentComplex,
+      ];
+      messagesModified++;
+    } else {
+      continue;
     }
 
     updatedMessages[i] = cloneMessage(originalMessage, workingContent);
-    messagesModified++;
   }
 
   return updatedMessages;

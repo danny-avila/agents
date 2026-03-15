@@ -7,8 +7,7 @@ import type {
 import type { MultiAgentGraph, StandardGraph } from '@/graphs';
 import type { Logger } from 'winston';
 import type * as t from '@/types';
-import { handleToolCalls } from '@/tools/handlers';
-import { Constants, Providers } from '@/common';
+import { Constants } from '@/common';
 
 export class HandlerRegistry {
   private handlers: Map<string, t.EventHandler> = new Map();
@@ -46,29 +45,6 @@ export class ModelEndHandler implements t.EventHandler {
     if (usage != null && this.collectedUsage != null) {
       this.collectedUsage.push(usage);
     }
-
-    if (metadata.ls_provider === 'FakeListChatModel') {
-      return handleToolCalls(data?.output?.tool_calls, metadata, graph);
-    }
-
-    console.log(`====== ${event.toUpperCase()} ======`);
-    console.dir(
-      {
-        usage,
-      },
-      { depth: null }
-    );
-
-    const agentContext = graph.getAgentContext(metadata);
-
-    if (
-      agentContext.provider !== Providers.GOOGLE &&
-      agentContext.provider !== Providers.BEDROCK
-    ) {
-      return;
-    }
-
-    await handleToolCalls(data?.output?.tool_calls, metadata, graph);
   }
 }
 
@@ -138,10 +114,8 @@ export class TestLLMStreamHandler implements t.EventHandler {
     const msg = isMessageChunk ? chunk.message : undefined;
     if (msg && msg.tool_call_chunks && msg.tool_call_chunks.length > 0) {
       console.log(msg.tool_call_chunks);
-    } else if (msg && msg.content) {
-      if (typeof msg.content === 'string') {
-        process.stdout.write(msg.content);
-      }
+    } else if (msg && typeof msg.content === 'string') {
+      process.stdout.write(msg.content);
     }
   }
 }
@@ -150,11 +124,11 @@ export class TestChatStreamHandler implements t.EventHandler {
   handle(event: string, data: t.StreamEventData | undefined): void {
     const chunk = data?.chunk;
     const isContentChunk = !!(chunk && 'content' in chunk);
-    const content = isContentChunk && chunk.content;
-
-    if (!content || !isContentChunk) {
+    if (!isContentChunk) {
       return;
     }
+
+    const content = chunk.content;
 
     if (chunk.tool_call_chunks && chunk.tool_call_chunks.length > 0) {
       console.dir(chunk.tool_call_chunks, { depth: null });
@@ -176,18 +150,14 @@ export class LLMStreamHandler implements t.EventHandler {
   ): void {
     const chunk = data?.chunk;
     const isMessageChunk = !!(chunk && 'message' in chunk);
-    const msg = isMessageChunk && chunk.message;
+    const msg = isMessageChunk ? chunk.message : undefined;
     if (metadata) {
       console.log(metadata);
     }
     if (msg && msg.tool_call_chunks && msg.tool_call_chunks.length > 0) {
       console.log(msg.tool_call_chunks);
-    } else if (msg && msg.content) {
-      if (typeof msg.content === 'string') {
-        // const text_delta = msg.content;
-        // dispatchCustomEvent(GraphEvents.CHAT_MODEL_STREAM, { chunk }, config);
-        process.stdout.write(msg.content);
-      }
+    } else if (msg && typeof msg.content === 'string') {
+      process.stdout.write(msg.content);
     }
   }
 }

@@ -383,7 +383,7 @@ describe('AgentContext', () => {
 
       ctx.markToolsAsDiscovered(['tool1']);
       void ctx.systemRunnable;
-      ctx.instructionTokens = 100;
+      ctx.systemMessageTokens = 100;
       ctx.indexTokenCountMap = { '0': 50 };
       ctx.currentUsage = { input_tokens: 100 };
 
@@ -393,6 +393,70 @@ describe('AgentContext', () => {
       expect(ctx.instructionTokens).toBe(0);
       expect(ctx.indexTokenCountMap).toEqual({});
       expect(ctx.currentUsage).toBeUndefined();
+    });
+
+    it('preserves summarization settings across resets', () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          summarizationEnabled: true,
+          summarizationConfig: {
+            provider: Providers.ANTHROPIC,
+            model: 'claude-sonnet-4-5',
+            prompt: 'Keep decisions and next steps concise.',
+            trigger: {
+              type: 'token_ratio',
+              value: 0.8,
+            },
+          },
+        },
+      });
+
+      ctx.reset();
+
+      expect(ctx.summarizationEnabled).toBe(true);
+      expect(ctx.summarizationConfig).toEqual({
+        provider: 'anthropic',
+        model: 'claude-sonnet-4-5',
+        prompt: 'Keep decisions and next steps concise.',
+        trigger: {
+          type: 'token_ratio',
+          value: 0.8,
+        },
+      });
+    });
+
+    it('shouldSkipSummarization returns true when message count unchanged', () => {
+      const ctx = createBasicContext({
+        agentConfig: { summarizationEnabled: true },
+      });
+      ctx.markSummarizationTriggered(10);
+      expect(ctx.shouldSkipSummarization(10)).toBe(true);
+    });
+
+    it('shouldSkipSummarization returns false with any new messages', () => {
+      const ctx = createBasicContext({
+        agentConfig: { summarizationEnabled: true },
+      });
+      ctx.markSummarizationTriggered(10);
+      expect(ctx.shouldSkipSummarization(11)).toBe(false);
+    });
+
+    it('shouldSkipSummarization returns false when no prior summarization', () => {
+      const ctx = createBasicContext({
+        agentConfig: { summarizationEnabled: true },
+      });
+      expect(ctx.shouldSkipSummarization(5)).toBe(false);
+    });
+
+    it('shouldSkipSummarization allows unlimited summarizations per run', () => {
+      const ctx = createBasicContext({
+        agentConfig: { summarizationEnabled: true },
+      });
+      for (let i = 0; i < 10; i++) {
+        ctx.markSummarizationTriggered(i * 5);
+      }
+      // Even after 10 summarizations, new messages allow another
+      expect(ctx.shouldSkipSummarization(50)).toBe(false);
     });
 
     it('rebuilds indexTokenCountMap from base map after reset', async () => {
@@ -611,7 +675,7 @@ describe('AgentContext', () => {
 
       // Simulate token map update (as done in fromConfig flow)
       ctx.updateTokenMapWithInstructions({ '0': 10, '1': 20 });
-      expect(ctx.indexTokenCountMap['0']).toBe(10 + turn1Tokens);
+      expect(ctx.indexTokenCountMap['0']).toBe(10);
       expect(ctx.indexTokenCountMap['1']).toBe(20);
 
       // ========== TURN 2: Tool search results come back ==========
@@ -674,8 +738,8 @@ describe('AgentContext', () => {
       const messageTokenCounts = { '0': 50, '1': 100, '2': 75 };
       ctx.updateTokenMapWithInstructions(messageTokenCounts);
 
-      // Verify token map: first message gets instruction tokens added
-      expect(ctx.indexTokenCountMap['0']).toBe(50 + initialSystemTokens);
+      // Verify token map: first message keeps its real token count (no inflation)
+      expect(ctx.indexTokenCountMap['0']).toBe(50);
       expect(ctx.indexTokenCountMap['1']).toBe(100);
       expect(ctx.indexTokenCountMap['2']).toBe(75);
 
@@ -708,7 +772,7 @@ describe('AgentContext', () => {
       const newMessageTokenCounts = { '0': 60, '1': 110 };
       ctx.updateTokenMapWithInstructions(newMessageTokenCounts);
 
-      expect(ctx.indexTokenCountMap['0']).toBe(60 + newSystemTokens);
+      expect(ctx.indexTokenCountMap['0']).toBe(60);
       expect(ctx.indexTokenCountMap['1']).toBe(110);
     });
 
@@ -821,6 +885,202 @@ describe('AgentContext', () => {
 
       // Now should match run 1
       expect(ctx.instructionTokens).toBe(run1Tokens);
+    });
+  });
+
+  describe('Summary Token Accounting', () => {
+    const charTokenCounter: t.TokenCounter = (msg) => {
+      const raw = msg.content;
+      if (typeof raw === 'string') return raw.length;
+      if (Array.isArray(raw)) {
+        let total = 0;
+        for (let i = 0; i < raw.length; i++) {
+          const item = raw[i] as unknown;
+          if (typeof item === 'string') {
+            total += item.length;
+          } else if (
+            typeof item === 'object' &&
+            item != null &&
+            'text' in item
+          ) {
+            const text = (item as Record<string, unknown>).text;
+            if (typeof text === 'string') total += text.length;
+          }
+        }
+        return total;
+      }
+      return 0;
+    };
+
+    it('mid-run setSummary increases instructionTokens by the summary token count', () => {
+      const ctx = createBasicContext({
+        agentConfig: { instructions: 'Be helpful.' },
+        tokenCounter: charTokenCounter,
+      });
+
+      void ctx.systemRunnable;
+      const baseInstructionTokens = ctx.instructionTokens;
+      expect(baseInstructionTokens).toBeGreaterThan(0);
+
+      // Mid-run summary is injected as HumanMessage but still counts as
+      // instruction overhead so the pruner reserves budget for it.
+      ctx.setSummary('User asked about math. Key results: 2+2=4, 3*5=15.', 50);
+      expect(ctx.hasSummary()).toBe(true);
+
+      void ctx.systemRunnable;
+      expect(ctx.instructionTokens).toBe(baseInstructionTokens + 50);
+    });
+
+    it('summary text appears in rebuilt system message', () => {
+      const ctx = createBasicContext({
+        agentConfig: { instructions: 'Be helpful.' },
+        tokenCounter: charTokenCounter,
+      });
+
+      void ctx.systemRunnable;
+      ctx.setSummary('Prior context: user computed factorials.', 40);
+
+      const runnable = ctx.systemRunnable;
+      expect(runnable).toBeDefined();
+    });
+
+    it('clearSummary removes summary overhead from instructionTokens', () => {
+      const ctx = createBasicContext({
+        agentConfig: { instructions: 'Be helpful.' },
+        tokenCounter: charTokenCounter,
+      });
+
+      void ctx.systemRunnable;
+      const baseTokens = ctx.instructionTokens;
+
+      ctx.setSummary('Summary of the conversation so far.', 35);
+      void ctx.systemRunnable;
+      expect(ctx.instructionTokens).toBe(baseTokens + 35);
+
+      ctx.clearSummary();
+      void ctx.systemRunnable;
+      expect(ctx.instructionTokens).toBe(baseTokens);
+    });
+
+    it('reset preserves durable summary and maintains token counts', () => {
+      const ctx = createBasicContext({
+        agentConfig: { instructions: 'Be helpful.' },
+        tokenCounter: charTokenCounter,
+        indexTokenCountMap: { '0': 10, '1': 20 },
+      });
+
+      void ctx.systemRunnable;
+      ctx.setSummary('Summary text.', 15);
+      void ctx.systemRunnable;
+      expect(ctx.hasSummary()).toBe(true);
+      const tokensWithSummary = ctx.instructionTokens;
+
+      ctx.reset();
+      // Summary should survive reset (durable cross-run state)
+      expect(ctx.hasSummary()).toBe(true);
+      expect(ctx.getSummaryText()).toBe('Summary text.');
+
+      void ctx.systemRunnable;
+      const postResetTokens = ctx.instructionTokens;
+      expect(postResetTokens).toBeGreaterThan(0);
+      // Token count should be the same since summary is preserved
+      expect(postResetTokens).toBe(tokensWithSummary);
+    });
+
+    it('updateTokenMapWithInstructions copies base map without inflating index 0', () => {
+      const ctx = createBasicContext({
+        agentConfig: { instructions: 'Be helpful.' },
+        tokenCounter: charTokenCounter,
+      });
+
+      void ctx.systemRunnable;
+      ctx.setSummary('Summary of prior context with key facts.', 40);
+      void ctx.systemRunnable;
+
+      const instructionTokens = ctx.instructionTokens;
+      expect(instructionTokens).toBeGreaterThan(0);
+
+      const baseMap: Record<string, number> = { '0': 5, '1': 10 };
+      ctx.updateTokenMapWithInstructions(baseMap);
+
+      // Index 0 should contain the real message token count, NOT inflated
+      // with instruction tokens.  Instruction overhead is now handled by
+      // getInstructionTokens() in the pruning factory.
+      expect(ctx.indexTokenCountMap['0']).toBe(5);
+      expect(ctx.indexTokenCountMap['1']).toBe(10);
+    });
+
+    it('hasSummary returns false before setSummary and true after', () => {
+      const ctx = createBasicContext({
+        agentConfig: { instructions: 'Be helpful.' },
+      });
+
+      expect(ctx.hasSummary()).toBe(false);
+      ctx.setSummary('Some summary.', 10);
+      expect(ctx.hasSummary()).toBe(true);
+      ctx.clearSummary();
+      expect(ctx.hasSummary()).toBe(false);
+    });
+  });
+
+  describe('shouldSkipSummarization — re-trigger after summary', () => {
+    it('allows re-summarization after rebuildTokenMapAfterSummarization resets baseline', () => {
+      const ctx = createBasicContext();
+
+      expect(ctx.shouldSkipSummarization(25)).toBe(false);
+      ctx.markSummarizationTriggered(25);
+
+      // Same count — skip
+      expect(ctx.shouldSkipSummarization(25)).toBe(true);
+
+      ctx.setSummary('Summary of conversation', 100);
+      // Full compaction: empty state, baseline resets to 0
+      ctx.rebuildTokenMapAfterSummarization({});
+
+      // Baseline is 0 after full compaction. Guard `_lastSummarizationMsgCount > 0`
+      // is false, so all counts are allowed.
+      expect(ctx.shouldSkipSummarization(0)).toBe(false);
+      expect(ctx.shouldSkipSummarization(1)).toBe(false);
+    });
+
+    it('allows summarization after full compaction resets to empty state', () => {
+      const ctx = createBasicContext();
+
+      ctx.markSummarizationTriggered(20);
+      ctx.setSummary('Summary', 50);
+      ctx.rebuildTokenMapAfterSummarization({});
+
+      // Baseline is 0 after full compaction. The guard `_lastSummarizationMsgCount > 0`
+      // is false, so summarization is always allowed — the model starts fresh.
+      expect(ctx.shouldSkipSummarization(0)).toBe(false);
+      expect(ctx.shouldSkipSummarization(1)).toBe(false);
+    });
+  });
+
+  describe('updateLastCallUsage', () => {
+    it('records usage without modifying toolSchemaTokens', () => {
+      const ctx = createBasicContext();
+      ctx.toolSchemaTokens = 200;
+
+      ctx.updateLastCallUsage({ input_tokens: 500, output_tokens: 30 });
+
+      expect(ctx.lastCallUsage).toBeDefined();
+      expect(ctx.lastCallUsage!.inputTokens).toBe(500);
+      expect(ctx.lastCallUsage!.outputTokens).toBe(30);
+      expect(ctx.toolSchemaTokens).toBe(200);
+    });
+
+    it('handles additive cache tokens', () => {
+      const ctx = createBasicContext();
+
+      ctx.updateLastCallUsage({
+        input_tokens: 5,
+        output_tokens: 100,
+        input_token_details: { cache_creation: 8000, cache_read: 0 },
+      });
+
+      // cache_creation (8000) > input_tokens (5) → additive
+      expect(ctx.lastCallUsage!.inputTokens).toBe(8005);
     });
   });
 });

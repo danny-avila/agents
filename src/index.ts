@@ -8,6 +8,9 @@ export * from './messages';
 /* Graphs */
 export * from './graphs';
 
+/* Summarization */
+export * from './summarization';
+
 /* Tools */
 export * from './tools/Calculator';
 export * from './tools/CodeExecutor';
@@ -33,3 +36,7 @@ export type {
   OpenRouterReasoningEffort,
   ChatOpenRouterCallOptions,
 } from './llm/openrouter';
+export { getChatModelClass } from './llm/providers';
+export { initializeModel } from './llm/init';
+export { attemptInvoke, tryFallbackProviders } from './llm/invoke';
+export { isThinkingEnabled, getMaxOutputTokensKey } from './llm/request';

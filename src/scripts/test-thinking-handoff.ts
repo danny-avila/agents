@@ -63,7 +63,7 @@ async function testThinkingHandoff() {
         agentId: 'code_reviewer',
         provider: Providers.ANTHROPIC,
         clientOptions: {
-          modelName: 'claude-3-7-sonnet-20250219',
+          modelName: 'claude-sonnet-4-5-20250929',
           apiKey: process.env.ANTHROPIC_API_KEY,
           thinking: {
             type: 'enabled',

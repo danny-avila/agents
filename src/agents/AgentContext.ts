@@ -1,6 +1,5 @@
 /* eslint-disable no-console */
-// src/agents/AgentContext.ts
-import { SystemMessage } from '@langchain/core/messages';
+import { HumanMessage, SystemMessage } from '@langchain/core/messages';
 import { RunnableLambda } from '@langchain/core/runnables';
 import type {
   UsageMetadata,
@@ -11,8 +10,30 @@ import type { RunnableConfig, Runnable } from '@langchain/core/runnables';
 import type * as t from '@/types';
 import type { createPruneMessages } from '@/messages';
 import { createSchemaOnlyTools } from '@/tools/schema';
+import { addCacheControl } from '@/messages/cache';
 import { ContentTypes, Providers } from '@/common';
+import { DEFAULT_RESERVE_RATIO } from '@/messages';
 import { toJsonSchema } from '@/utils/schema';
+
+/**
+ * Anthropic direct API tool schema overhead multiplier.
+ * Empirically calibrated against real MCP tool sets (29 tools).
+ * Accounts for Anthropic's internal XML-like tool encoding plus
+ * a ~300-token hidden tool-system preamble.
+ */
+const ANTHROPIC_TOOL_TOKEN_MULTIPLIER = 2.6;
+
+/**
+ * Bedrock uses a lighter tool encoding than the direct Anthropic API,
+ * observed at ~1.6× the raw JSON token count.
+ */
+const BEDROCK_TOOL_TOKEN_MULTIPLIER = 1.6;
+
+/**
+ * OpenAI and other providers use function-calling format,
+ * roughly 1.4× the raw JSON token count.
+ */
+const DEFAULT_TOOL_TOKEN_MULTIPLIER = 1.4;
 
 /**
  * Encapsulates agent-specific state that can vary between agents in a multi-agent system
@@ -43,6 +64,11 @@ export class AgentContext {
       reasoningKey,
       useLegacyContent,
       discoveredTools,
+      summarizationEnabled,
+      summarizationConfig,
+      initialSummary,
+      contextPruningConfig,
+      maxToolResultChars,
     } = agentConfig;
 
     const agentContext = new AgentContext({
@@ -64,12 +90,18 @@ export class AgentContext {
       tokenCounter,
       useLegacyContent,
       discoveredTools,
+      summarizationEnabled,
+      summarizationConfig,
+      contextPruningConfig,
+      maxToolResultChars,
     });
 
+    if (initialSummary?.text != null && initialSummary.text !== '') {
+      agentContext.setSummary(initialSummary.text, initialSummary.tokenCount);
+      agentContext._summaryLocation = 'system_prompt';
+    }
+
     if (tokenCounter) {
-      // Initialize system runnable BEFORE async tool token calculation
-      // This ensures system message tokens are in instructionTokens before
-      // updateTokenMapWithInstructions is called
       agentContext.initializeSystemRunnable();
 
       const tokenMap = indexTokenCountMap || {};
@@ -78,7 +110,6 @@ export class AgentContext {
       agentContext.tokenCalculationPromise = agentContext
         .calculateInstructionTokens(tokenCounter)
         .then(() => {
-          // Update token map with instruction tokens (includes system + tool tokens)
           agentContext.updateTokenMapWithInstructions(tokenMap);
         })
         .catch((err) => {
@@ -108,12 +139,43 @@ export class AgentContext {
   maxContextTokens?: number;
   /** Current usage metadata for this agent */
   currentUsage?: Partial<UsageMetadata>;
+  /**
+   * Usage from the most recent LLM call only (not accumulated).
+   * Used for accurate provider calibration in pruning.
+   */
+  lastCallUsage?: {
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+    cacheRead?: number;
+    cacheCreation?: number;
+  };
+  /**
+   * Whether totalTokens data is fresh (set true when provider usage arrives,
+   * false at the start of each turn before the LLM responds).
+   * Prevents stale token data from driving pruning/trigger decisions.
+   */
+  totalTokensFresh: boolean = false;
+  /** Context pruning configuration. */
+  contextPruningConfig?: t.ContextPruningConfig;
+  maxToolResultChars?: number;
   /** Prune messages function configured for this agent */
   pruneMessages?: ReturnType<typeof createPruneMessages>;
   /** Token counter function for this agent */
   tokenCounter?: t.TokenCounter;
-  /** Instructions/system message token count */
-  instructionTokens: number = 0;
+  /** Token count for the system message (instructions text). */
+  systemMessageTokens: number = 0;
+  /** Token count for tool schemas only. */
+  toolSchemaTokens: number = 0;
+  /** Running calibration ratio from the pruner — persisted across runs via contextMeta. */
+  calibrationRatio: number = 1;
+
+  /** Total instruction overhead: system message + tool schemas + pending summary. */
+  get instructionTokens(): number {
+    const summaryOverhead =
+      this._summaryLocation === 'user_message' ? this.summaryTokenCount : 0;
+    return this.systemMessageTokens + this.toolSchemaTokens + summaryOverhead;
+  }
   /** The amount of time that should pass before another consecutive API call */
   streamBuffer?: number;
   /** Last stream call timestamp for rate limiting */
@@ -161,12 +223,43 @@ export class AgentContext {
   >;
   /** Whether system runnable needs rebuild (set when discovered tools change) */
   private systemRunnableStale: boolean = true;
-  /** Cached system message token count (separate from tool tokens) */
-  private systemMessageTokens: number = 0;
   /** Promise for token calculation initialization */
   tokenCalculationPromise?: Promise<void>;
   /** Format content blocks as strings (for legacy compatibility) */
   useLegacyContent: boolean = false;
+  /** Enables graph-level summarization for this agent */
+  summarizationEnabled?: boolean;
+  /** Summarization runtime settings used by graph pruning hooks */
+  summarizationConfig?: t.SummarizationConfig;
+  /** Current summary text produced by the summarize node, integrated into system message */
+  private summaryText?: string;
+  /** Token count of the current summary (tracked for token accounting) */
+  private summaryTokenCount: number = 0;
+  /**
+   * Where the summary should be injected:
+   * - `'system_prompt'`: cross-run summary, included in `buildInstructionsString`
+   * - `'user_message'`: mid-run compaction, injected as HumanMessage on clean slate
+   * - `'none'`: no summary present
+   */
+  private _summaryLocation: 'system_prompt' | 'user_message' | 'none' = 'none';
+  /**
+   * Durable summary that survives reset() calls. Set from initialSummary
+   * during fromConfig() and updated by setSummary() so that the latest
+   * summary (whether cross-run or intra-run) is always restored after
+   * processStream's resetValues() cycle.
+   */
+  private _durableSummaryText?: string;
+  private _durableSummaryTokenCount: number = 0;
+  /** Number of summarization cycles that have occurred for this agent context */
+  private _summaryVersion: number = 0;
+  /**
+   * Message count at the time summarization was last triggered.
+   * Used to prevent re-summarizing the same unchanged message set.
+   * Summarization is allowed to fire again only when new messages appear.
+   */
+  private _lastSummarizationMsgCount: number = 0;
+  /** Number of times summarization has fired during the current run (diagnostic). */
+  private _summarizationCountThisRun: number = 0;
   /**
    * Handoff context when this agent receives control via handoff.
    * Contains source and parallel execution info for system message context.
@@ -197,6 +290,10 @@ export class AgentContext {
     instructionTokens,
     useLegacyContent,
     discoveredTools,
+    summarizationEnabled,
+    summarizationConfig,
+    contextPruningConfig,
+    maxToolResultChars,
   }: {
     agentId: string;
     name?: string;
@@ -216,6 +313,10 @@ export class AgentContext {
     instructionTokens?: number;
     useLegacyContent?: boolean;
     discoveredTools?: string[];
+    summarizationEnabled?: boolean;
+    summarizationConfig?: t.SummarizationConfig;
+    contextPruningConfig?: t.ContextPruningConfig;
+    maxToolResultChars?: number;
   }) {
     this.agentId = agentId;
     this.name = name;
@@ -237,10 +338,14 @@ export class AgentContext {
       this.toolEnd = toolEnd;
     }
     if (instructionTokens !== undefined) {
-      this.instructionTokens = instructionTokens;
+      this.systemMessageTokens = instructionTokens;
     }
 
     this.useLegacyContent = useLegacyContent ?? false;
+    this.summarizationEnabled = summarizationEnabled;
+    this.summarizationConfig = summarizationConfig;
+    this.contextPruningConfig = contextPruningConfig;
+    this.maxToolResultChars = maxToolResultChars;
 
     if (discoveredTools && discoveredTools.length > 0) {
       for (const toolName of discoveredTools) {
@@ -270,7 +375,6 @@ export class AgentContext {
 
       if (!isCodeExecutionOnly) continue;
 
-      // Include if: not deferred OR deferred but discovered
       const isDeferred = toolDef.defer_loading === true;
       const isDiscovered = this.discoveredToolNames.has(name);
       if (!isDeferred || isDiscovered) {
@@ -313,12 +417,10 @@ export class AgentContext {
         RunnableConfig<Record<string, unknown>>
       >
     | undefined {
-    // Return cached if not stale
     if (!this.systemRunnableStale && this.cachedSystemRunnable !== undefined) {
       return this.cachedSystemRunnable;
     }
 
-    // Stale or first access - rebuild
     const instructionsString = this.buildInstructionsString();
     this.cachedSystemRunnable = this.buildSystemRunnable(instructionsString);
     this.systemRunnableStale = false;
@@ -344,18 +446,15 @@ export class AgentContext {
   private buildInstructionsString(): string {
     const parts: string[] = [];
 
-    /** Build agent identity and handoff context preamble */
     const identityPreamble = this.buildIdentityPreamble();
     if (identityPreamble) {
       parts.push(identityPreamble);
     }
 
-    /** Add main instructions */
     if (this.instructions != null && this.instructions !== '') {
       parts.push(this.instructions);
     }
 
-    /** Add additional instructions */
     if (
       this.additionalInstructions != null &&
       this.additionalInstructions !== ''
@@ -363,10 +462,20 @@ export class AgentContext {
       parts.push(this.additionalInstructions);
     }
 
-    /** Add programmatic tools documentation */
     const programmaticToolsDoc = this.buildProgrammaticOnlyToolsInstructions();
     if (programmaticToolsDoc) {
       parts.push(programmaticToolsDoc);
+    }
+
+    // Cross-run summary: include in system prompt so the model has context
+    // from the prior run.  Mid-run summaries are injected as a HumanMessage
+    // on the post-compaction clean slate instead (see buildSystemRunnable).
+    if (
+      this._summaryLocation === 'system_prompt' &&
+      this.summaryText != null &&
+      this.summaryText !== ''
+    ) {
+      parts.push('## Conversation Summary\n\n' + this.summaryText);
     }
 
     return parts.join('\n\n');
@@ -413,21 +522,25 @@ export class AgentContext {
         RunnableConfig<Record<string, unknown>>
       >
     | undefined {
-    if (!instructionsString) {
-      // Remove previous tokens if we had a system message before
-      this.instructionTokens -= this.systemMessageTokens;
+    const hasMidRunSummary =
+      this._summaryLocation === 'user_message' &&
+      this.summaryText != null &&
+      this.summaryText !== '';
+
+    if (!instructionsString && !hasMidRunSummary) {
       this.systemMessageTokens = 0;
       return undefined;
     }
 
     let finalInstructions: string | BaseMessageFields = instructionsString;
 
-    // Handle Anthropic prompt caching
+    let usePromptCache = false;
     if (this.provider === Providers.ANTHROPIC) {
       const anthropicOptions = this.clientOptions as
         | t.AnthropicClientOptions
         | undefined;
       if (anthropicOptions?.promptCache === true) {
+        usePromptCache = true;
         finalInstructions = {
           content: [
             {
@@ -440,17 +553,55 @@ export class AgentContext {
       }
     }
 
-    const systemMessage = new SystemMessage(finalInstructions);
+    const systemMessage = instructionsString
+      ? new SystemMessage(finalInstructions)
+      : undefined;
 
-    // Update token counts (subtract old, add new)
     if (this.tokenCounter) {
-      this.instructionTokens -= this.systemMessageTokens;
-      this.systemMessageTokens = this.tokenCounter(systemMessage);
-      this.instructionTokens += this.systemMessageTokens;
+      this.systemMessageTokens = systemMessage
+        ? this.tokenCounter(systemMessage)
+        : 0;
     }
 
     return RunnableLambda.from((messages: BaseMessage[]) => {
-      return [systemMessage, ...messages];
+      const prefix: BaseMessage[] = systemMessage ? [systemMessage] : [];
+
+      // Build the non-system portion (summary + conversation), then apply
+      // cache markers separately so addCacheControl doesn't strip the
+      // SystemMessage's own cache_control breakpoint set above.
+      const hasSummaryBody =
+        this._summaryLocation === 'user_message' &&
+        this.summaryText != null &&
+        this.summaryText !== '';
+
+      let body: BaseMessage[];
+      if (hasSummaryBody) {
+        const wrappedSummary =
+          '<summary>\n' +
+          (this.summaryText as string) +
+          '\n</summary>\n\n' +
+          'Your context window was compacted. This is your checkpoint, resume where you left off.';
+
+        const summaryMsg = usePromptCache
+          ? new HumanMessage({
+            content: [
+              {
+                type: 'text',
+                text: wrappedSummary,
+                cache_control: { type: 'ephemeral' },
+              },
+            ],
+          })
+          : new HumanMessage(wrappedSummary);
+        body = [summaryMsg, ...messages];
+      } else {
+        body = messages;
+      }
+
+      if (usePromptCache && body.length >= 2) {
+        body = addCacheControl(body);
+      }
+      return [...prefix, ...body];
     }).withConfig({ runName: 'prompt' });
   }
 
@@ -458,8 +609,8 @@ export class AgentContext {
    * Reset context for a new run
    */
   reset(): void {
-    this.instructionTokens = 0;
     this.systemMessageTokens = 0;
+    this.toolSchemaTokens = 0;
     this.cachedSystemRunnable = undefined;
     this.systemRunnableStale = true;
     this.lastToken = undefined;
@@ -472,6 +623,13 @@ export class AgentContext {
     this.currentTokenType = ContentTypes.TEXT;
     this.discoveredToolNames.clear();
     this.handoffContext = undefined;
+
+    this.summaryText = this._durableSummaryText;
+    this.summaryTokenCount = this._durableSummaryTokenCount;
+    this._lastSummarizationMsgCount = 0;
+    this._summarizationCountThisRun = 0;
+    this.lastCallUsage = undefined;
+    this.totalTokensFresh = false;
 
     if (this.tokenCounter) {
       this.initializeSystemRunnable();
@@ -492,23 +650,21 @@ export class AgentContext {
   }
 
   /**
-   * Update the token count map with instruction tokens
+   * Update the token count map from a base map.
+   *
+   * Previously this inflated index 0 with instructionTokens to indirectly
+   * reserve budget for the system prompt.  That approach was imprecise: with
+   * large tool-schema overhead (e.g. 26 MCP tools ~5 000 tokens) the first
+   * conversation message appeared enormous and was always pruned, while the
+   * real available budget was never explicitly computed.
+   *
+   * Now instruction tokens are passed to getMessagesWithinTokenLimit via
+   * the `getInstructionTokens` factory param so the pruner subtracts them
+   * from the budget directly.  The token map contains only real per-message
+   * token counts.
    */
   updateTokenMapWithInstructions(baseTokenMap: Record<string, number>): void {
-    if (this.instructionTokens > 0) {
-      // Shift all indices by the instruction token count
-      const shiftedMap: Record<string, number> = {};
-      for (const [key, value] of Object.entries(baseTokenMap)) {
-        const index = parseInt(key, 10);
-        if (!isNaN(index)) {
-          shiftedMap[String(index)] =
-            value + (index === 0 ? this.instructionTokens : 0);
-        }
-      }
-      this.indexTokenCountMap = shiftedMap;
-    } else {
-      this.indexTokenCountMap = { ...baseTokenMap };
-    }
+    this.indexTokenCountMap = { ...baseTokenMap };
   }
 
   /**
@@ -519,12 +675,8 @@ export class AgentContext {
     tokenCounter: t.TokenCounter
   ): Promise<void> {
     let toolTokens = 0;
-    // Track names to avoid double-counting when a tool appears in both
-    // this.tools (bound StructuredTool instances) and this.toolDefinitions
-    // (MCP / event-driven schemas).
     const countedToolNames = new Set<string>();
 
-    // Count tokens for bound tools (StructuredTool instances with .schema)
     if (this.tools && this.tools.length > 0) {
       for (const tool of this.tools) {
         const genericTool = tool as Record<string, unknown>;
@@ -548,24 +700,39 @@ export class AgentContext {
       }
     }
 
-    // Count tokens for tool definitions (MCP / event-driven tools).
-    // These are sent to the provider API as tool schemas alongside bound tools.
-    // Both can be populated simultaneously (graph tools + MCP tools).
     if (this.toolDefinitions && this.toolDefinitions.length > 0) {
       for (const def of this.toolDefinitions) {
         if (countedToolNames.has(def.name)) {
-          continue; // Already counted via this.tools
+          continue;
         }
         const schema = {
-          name: def.name,
-          description: def.description ?? '',
-          parameters: def.parameters ?? {},
+          type: 'function',
+          function: {
+            name: def.name,
+            description: def.description ?? '',
+            parameters: def.parameters ?? {},
+          },
         };
         toolTokens += tokenCounter(new SystemMessage(JSON.stringify(schema)));
       }
     }
 
-    this.instructionTokens += toolTokens;
+    const isBedrock = this.provider === Providers.BEDROCK;
+    const isAnthropic =
+      !isBedrock &&
+      (this.provider === Providers.ANTHROPIC ||
+        /anthropic|claude/i.test(
+          String(
+            (this.clientOptions as { model?: string } | undefined)?.model ?? ''
+          )
+        ));
+    let toolTokenMultiplier = DEFAULT_TOOL_TOKEN_MULTIPLIER;
+    if (isAnthropic) {
+      toolTokenMultiplier = ANTHROPIC_TOOL_TOKEN_MULTIPLIER;
+    } else if (isBedrock) {
+      toolTokenMultiplier = BEDROCK_TOOL_TOKEN_MULTIPLIER;
+    }
+    this.toolSchemaTokens = Math.ceil(toolTokens * toolTokenMultiplier);
   }
 
   /**
@@ -612,6 +779,174 @@ export class AgentContext {
     }
   }
 
+  setSummary(text: string, tokenCount: number): void {
+    this.summaryText = text;
+    this.summaryTokenCount = tokenCount;
+    // Mid-run compaction clears the initial-summary flag so the summary
+    // is injected as a HumanMessage (clean slate) instead of the system prompt.
+    this._summaryLocation = 'user_message';
+    this._durableSummaryText = text;
+    this._durableSummaryTokenCount = tokenCount;
+    this._summaryVersion += 1;
+    this.systemRunnableStale = true;
+    // Force pruner recreation: after summarization, the summarize node removes
+    // summarized messages from graph state via RemoveMessage.  The old pruner's
+    // closure state (indexTokenCountMap indices, lastCutOffIndex, totalTokens)
+    // becomes stale once messages are removed.  Setting to undefined causes the
+    // agent node to create a fresh pruner with the rebuilt token map.
+    this.pruneMessages = undefined;
+  }
+
+  /**
+   * Replaces the indexTokenCountMap with a fresh map keyed to the surviving
+   * context messages after summarization.  Called by the summarize node after
+   * it emits RemoveMessage operations that shift message indices.
+   */
+  rebuildTokenMapAfterSummarization(newTokenMap: Record<string, number>): void {
+    this.indexTokenCountMap = newTokenMap;
+    this.baseIndexTokenCountMap = { ...newTokenMap };
+    this._lastSummarizationMsgCount = Object.keys(newTokenMap).length;
+    this.currentUsage = undefined;
+    this.lastCallUsage = undefined;
+    this.totalTokensFresh = false;
+  }
+
+  hasSummary(): boolean {
+    return this.summaryText != null && this.summaryText !== '';
+  }
+
+  /** True when a mid-run compaction summary is ready to be injected as a HumanMessage. */
+  hasPendingCompactionSummary(): boolean {
+    return this._summaryLocation === 'user_message' && this.hasSummary();
+  }
+
+  getSummaryText(): string | undefined {
+    return this.summaryText;
+  }
+
+  get summaryVersion(): number {
+    return this._summaryVersion;
+  }
+
+  /**
+   * Returns true when the message count hasn't changed since the last
+   * summarization — re-summarizing would produce an identical result.
+   * Oversized individual messages are handled by fit-to-budget truncation
+   * in the pruner, which keeps them in context without triggering overflow.
+   */
+  shouldSkipSummarization(currentMsgCount: number): boolean {
+    return (
+      this._lastSummarizationMsgCount > 0 &&
+      currentMsgCount <= this._lastSummarizationMsgCount
+    );
+  }
+
+  /**
+   * Records the message count at which summarization was triggered,
+   * so subsequent calls with the same count are suppressed.
+   */
+  markSummarizationTriggered(msgCount: number): void {
+    this._lastSummarizationMsgCount = msgCount;
+    this._summarizationCountThisRun++;
+  }
+
+  clearSummary(): void {
+    if (this.summaryText != null) {
+      this.summaryText = undefined;
+      this.summaryTokenCount = 0;
+      this._durableSummaryText = undefined;
+      this._durableSummaryTokenCount = 0;
+      this._summaryLocation = 'none';
+      this.systemRunnableStale = true;
+    }
+  }
+
+  /**
+   * Returns a structured breakdown of how the context token budget is consumed.
+   * Useful for diagnostics when context overflow or pruning issues occur.
+   */
+  getTokenBudgetBreakdown(messages?: BaseMessage[]): t.TokenBudgetBreakdown {
+    const maxContextTokens = this.maxContextTokens ?? 0;
+    const toolCount =
+      (this.tools?.length ?? 0) + (this.toolDefinitions?.length ?? 0);
+    const messageCount = messages?.length ?? 0;
+
+    let messageTokens = 0;
+    if (messages != null) {
+      for (let i = 0; i < messages.length; i++) {
+        messageTokens +=
+          (this.indexTokenCountMap[i] as number | undefined) ?? 0;
+      }
+    }
+
+    const reserveTokens = Math.round(maxContextTokens * DEFAULT_RESERVE_RATIO);
+    const availableForMessages = Math.max(
+      0,
+      maxContextTokens - reserveTokens - this.instructionTokens
+    );
+
+    return {
+      maxContextTokens,
+      instructionTokens: this.instructionTokens,
+      systemMessageTokens: this.systemMessageTokens,
+      toolSchemaTokens: this.toolSchemaTokens,
+      summaryTokens: this.summaryTokenCount,
+      toolCount,
+      messageCount,
+      messageTokens,
+      availableForMessages,
+    };
+  }
+
+  /**
+   * Returns a human-readable string of the token budget breakdown
+   * for inclusion in error messages and diagnostics.
+   */
+  formatTokenBudgetBreakdown(messages?: BaseMessage[]): string {
+    const b = this.getTokenBudgetBreakdown(messages);
+    const lines = [
+      'Token budget breakdown:',
+      `  maxContextTokens:    ${b.maxContextTokens}`,
+      `  instructionTokens:   ${b.instructionTokens} (system: ${b.systemMessageTokens}, tools: ${b.toolSchemaTokens} [${b.toolCount} tools])`,
+      `  summaryTokens:       ${b.summaryTokens}`,
+      `  messageTokens:       ${b.messageTokens} (${b.messageCount} messages)`,
+      `  availableForMessages: ${b.availableForMessages}`,
+    ];
+    return lines.join('\n');
+  }
+
+  /**
+   * Updates the last-call usage with data from the most recent LLM response.
+   * Unlike `currentUsage` which accumulates, this captures only the single call.
+   */
+  updateLastCallUsage(usage: Partial<UsageMetadata>): void {
+    const baseInputTokens = Number(usage.input_tokens) || 0;
+    const cacheCreation =
+      Number(usage.input_token_details?.cache_creation) || 0;
+    const cacheRead = Number(usage.input_token_details?.cache_read) || 0;
+
+    const outputTokens = Number(usage.output_tokens) || 0;
+    const cacheSum = cacheCreation + cacheRead;
+    const cacheIsAdditive = cacheSum > 0 && cacheSum > baseInputTokens;
+    const totalInputTokens = cacheIsAdditive
+      ? baseInputTokens + cacheSum
+      : baseInputTokens;
+
+    this.lastCallUsage = {
+      inputTokens: totalInputTokens,
+      outputTokens,
+      totalTokens: totalInputTokens + outputTokens,
+      cacheRead: cacheRead || undefined,
+      cacheCreation: cacheCreation || undefined,
+    };
+    this.totalTokensFresh = true;
+  }
+
+  /** Marks token data as stale before a new LLM call. */
+  markTokensStale(): void {
+    this.totalTokensFresh = false;
+  }
+
   /**
    * Marks tools as discovered via tool search.
    * Discovered tools will be included in the next model binding.
@@ -642,12 +977,10 @@ export class AgentContext {
    * @returns Array of tools to bind to model
    */
   getToolsForBinding(): t.GraphTools | undefined {
-    /** Event-driven mode: create schema-only tools from definitions */
     if (this.toolDefinitions && this.toolDefinitions.length > 0) {
       return this.getEventDrivenToolsForBinding();
     }
 
-    /** Traditional mode: filter actual tool instances */
     const filtered =
       !this.tools || !this.toolRegistry
         ? this.tools

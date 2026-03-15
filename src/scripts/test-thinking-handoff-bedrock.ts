@@ -56,7 +56,7 @@ async function testBedrockThinkingHandoff() {
         provider: Providers.BEDROCK,
         clientOptions: {
           region: process.env.BEDROCK_AWS_REGION || 'us-east-1',
-          model: 'us.anthropic.claude-3-7-sonnet-20250219-v1:0',
+          model: 'us.anthropic.claude-sonnet-4-5-20250929-v1:0',
           credentials: {
             accessKeyId: process.env.BEDROCK_AWS_ACCESS_KEY_ID!,
             secretAccessKey: process.env.BEDROCK_AWS_SECRET_ACCESS_KEY!,

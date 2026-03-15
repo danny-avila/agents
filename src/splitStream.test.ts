@@ -254,7 +254,8 @@ After code.`;
 
     const codeBlockPart = contentParts.find(
       (part) =>
-        part?.type === ContentTypes.TEXT && part.text.includes('```python')
+        part?.type === ContentTypes.TEXT &&
+        part.text.includes('```python') === true
     );
 
     expect(codeBlockPart).toBeDefined();
@@ -493,46 +494,51 @@ describe('SplitStreamHandler', () => {
 
     // Check that content before <think> was handled as regular text
     expect(
-      messageDeltaEvents.some((event) =>
-        (
-          event.delta.content?.[0] as t.MessageDeltaUpdate | undefined
-        )?.text.includes('Here\'s')
+      messageDeltaEvents.some(
+        (event) =>
+          (
+            event.delta.content?.[0] as t.MessageDeltaUpdate | undefined
+          )?.text.includes('Here\'s') === true
       )
     ).toBe(true);
 
     // Check that <think> tag was handled as reasoning
     expect(
-      reasoningDeltaEvents.some((event) =>
-        (
-          event.delta.content?.[0] as t.ReasoningDeltaUpdate | undefined
-        )?.think.includes('<think>')
+      reasoningDeltaEvents.some(
+        (event) =>
+          (
+            event.delta.content?.[0] as t.ReasoningDeltaUpdate | undefined
+          )?.think.includes('<think>') === true
       )
     ).toBe(true);
 
     // Check that content inside <think> tags was handled as reasoning
     expect(
-      reasoningDeltaEvents.some((event) =>
-        (
-          event.delta.content?.[0] as t.ReasoningDeltaUpdate | undefined
-        )?.think.includes('thinking')
+      reasoningDeltaEvents.some(
+        (event) =>
+          (
+            event.delta.content?.[0] as t.ReasoningDeltaUpdate | undefined
+          )?.think.includes('thinking') === true
       )
     ).toBe(true);
 
     // Check that </think> tag was handled as reasoning
     expect(
-      reasoningDeltaEvents.some((event) =>
-        (
-          event.delta.content?.[0] as t.ReasoningDeltaUpdate | undefined
-        )?.think.includes('</think>')
+      reasoningDeltaEvents.some(
+        (event) =>
+          (
+            event.delta.content?.[0] as t.ReasoningDeltaUpdate | undefined
+          )?.think.includes('</think>') === true
       )
     ).toBe(true);
 
     // Check that content after </think> was handled as regular text
     expect(
-      messageDeltaEvents.some((event) =>
-        (
-          event.delta.content?.[0] as t.MessageDeltaUpdate | undefined
-        )?.text.includes('Back')
+      messageDeltaEvents.some(
+        (event) =>
+          (
+            event.delta.content?.[0] as t.MessageDeltaUpdate | undefined
+          )?.text.includes('Back') === true
       )
     ).toBe(true);
   });
@@ -568,10 +574,11 @@ describe('SplitStreamHandler', () => {
 
     // Check that think tags inside code blocks were treated as regular text
     expect(
-      messageDeltaEvents.some((event) =>
-        (
-          event.delta.content?.[0] as t.MessageDeltaUpdate | undefined
-        )?.text.includes('Regular')
+      messageDeltaEvents.some(
+        (event) =>
+          (
+            event.delta.content?.[0] as t.MessageDeltaUpdate | undefined
+          )?.text.includes('Regular') === true
       )
     ).toBe(true);
 
@@ -622,10 +629,11 @@ describe('SplitStreamHandler', () => {
 
     // Check that content before <think> was handled as regular text
     expect(
-      messageDeltaEvents.some((event) =>
-        (
-          event.delta.content?.[0] as t.MessageDeltaUpdate | undefined
-        )?.text.includes('regular')
+      messageDeltaEvents.some(
+        (event) =>
+          (
+            event.delta.content?.[0] as t.MessageDeltaUpdate | undefined
+          )?.text.includes('regular') === true
       )
     ).toBe(true);
 
@@ -673,10 +681,11 @@ describe('SplitStreamHandler', () => {
 
     // Check that content after </think> was handled as regular text
     expect(
-      messageDeltaEvents.some((event) =>
-        (
-          event.delta.content?.[0] as t.MessageDeltaUpdate | undefined
-        )?.text.includes('Back')
+      messageDeltaEvents.some(
+        (event) =>
+          (
+            event.delta.content?.[0] as t.MessageDeltaUpdate | undefined
+          )?.text.includes('Back') === true
       )
     ).toBe(true);
 

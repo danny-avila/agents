@@ -49,6 +49,13 @@ export type ToolNodeOptions = {
   agentId?: string;
   /** Tool names that must be executed directly (via runTool) even in event-driven mode (e.g., graph-managed handoff tools) */
   directToolNames?: Set<string>;
+  /** Max context tokens for the agent — used to compute tool result truncation limits. */
+  maxContextTokens?: number;
+  /**
+   * Maximum characters allowed in a single tool result before truncation.
+   * When provided, takes precedence over the value computed from maxContextTokens.
+   */
+  maxToolResultChars?: number;
 };
 
 export type ToolNodeConstructorParams = ToolRefs & ToolNodeOptions;
