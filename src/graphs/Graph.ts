@@ -641,6 +641,19 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           },
         });
       }
+      // Anthropic artifact formatting merges image blocks into tool message
+      // content in place — safe to run before pruning so the token counter
+      // sees the full content.  OpenAI/Google path (formatArtifactPayload)
+      // adds a separate HumanMessage and must run after pruning to avoid
+      // the pruner dropping it and leaving dangling placeholder references.
+      const latestMsg = messages[messages.length - 1];
+      if (
+        latestMsg instanceof ToolMessage &&
+        agentContext.provider === Providers.ANTHROPIC
+      ) {
+        formatAnthropicArtifactContent(messages);
+      }
+
       if (agentContext.pruneMessages) {
         const {
           context,
@@ -774,15 +787,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         finalMessages[finalMessages.length - 2].content = '';
       }
 
-      const isLatestToolMessage = lastMessageY instanceof ToolMessage;
-
       if (
-        isLatestToolMessage &&
-        agentContext.provider === Providers.ANTHROPIC
-      ) {
-        formatAnthropicArtifactContent(finalMessages);
-      } else if (
-        isLatestToolMessage &&
+        lastMessageY instanceof ToolMessage &&
+        agentContext.provider !== Providers.ANTHROPIC &&
         ((isOpenAILike(agentContext.provider) &&
           agentContext.provider !== Providers.DEEPSEEK) ||
           isGoogleLike(agentContext.provider))
