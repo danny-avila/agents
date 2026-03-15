@@ -802,10 +802,26 @@ async function summarizeWithCacheHit({
       usageSource = 'response_metadata';
     }
   }
+  const cacheDetails = (
+    usage as
+      | {
+          input_token_details?: {
+            cache_read?: number;
+            cache_creation?: number;
+          };
+        }
+      | undefined
+  )?.input_token_details;
   log?.('debug', 'Summarization LLM usage', {
     source: usageSource,
     input_tokens: usage?.input_tokens,
     output_tokens: usage?.output_tokens,
+    ...(cacheDetails?.cache_read != null || cacheDetails?.cache_creation != null
+      ? {
+        'input_token_details.cache_read': cacheDetails.cache_read,
+        'input_token_details.cache_creation': cacheDetails.cache_creation,
+      }
+      : {}),
   });
   return { text, usage };
 }
