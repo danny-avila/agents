@@ -191,19 +191,18 @@ describe('Multi-agent summarization', () => {
       `  Summarization events: start=${startCalls.length}, complete=${completeCalls.length}`
     );
 
-    if (startCalls.length > 0) {
-      const startPayload = startCalls[0][0] as t.SummarizeStartEvent;
-      expect(startPayload.agentId).toBe('agent_a');
+    expect(startCalls.length).toBeGreaterThan(0);
+    const startPayload = startCalls[0][0] as t.SummarizeStartEvent;
+    expect(startPayload.agentId).toBe('agent_a');
 
-      const completePayload = completeCalls[0][0] as t.SummarizeCompleteEvent;
-      expect(completePayload.agentId).toBe('agent_a');
-      expect(completePayload.summary).toBeDefined();
-      const summaryText = getSummaryText(completePayload.summary);
-      expect(summaryText.length).toBeGreaterThan(0);
-      console.log(`  Agent A summary: "${summaryText.substring(0, 100)}"`);
-    }
+    expect(completeCalls.length).toBeGreaterThan(0);
+    const completePayload = completeCalls[0][0] as t.SummarizeCompleteEvent;
+    expect(completePayload.agentId).toBe('agent_a');
+    expect(completePayload.summary).toBeDefined();
+    const summaryText = getSummaryText(completePayload.summary);
+    expect(summaryText.length).toBeGreaterThan(0);
+    console.log(`  Agent A summary: "${summaryText.substring(0, 100)}"`);
 
-    // The run should complete without errors regardless of summarization
     const finalMessages = run.getRunMessages();
     expect(finalMessages).toBeDefined();
     console.log(`  Final messages: ${finalMessages?.length ?? 0}`);
@@ -293,19 +292,16 @@ describe('Multi-agent summarization', () => {
       console.log(`  Error (acceptable): ${error.message.substring(0, 100)}`);
     }
 
-    // Key assertion: if summarization events fired, they should have
-    // distinct agentId values (each agent summarizes independently)
-    if (starts.length >= 2) {
-      const agentIds = new Set(
-        starts.map(
-          (call: unknown[]) => (call[0] as t.SummarizeStartEvent).agentId
-        )
-      );
-      expect(agentIds.size).toBeGreaterThanOrEqual(2);
-      console.log(
-        `  Independent agents summarized: ${Array.from(agentIds).join(', ')}`
-      );
-    }
+    expect(starts.length).toBeGreaterThanOrEqual(2);
+    const agentIds = new Set(
+      starts.map(
+        (call: unknown[]) => (call[0] as t.SummarizeStartEvent).agentId
+      )
+    );
+    expect(agentIds.size).toBeGreaterThanOrEqual(2);
+    console.log(
+      `  Independent agents summarized: ${Array.from(agentIds).join(', ')}`
+    );
   });
 
   test('agent with large context does not summarize while tight agent does', async () => {
@@ -384,7 +380,7 @@ describe('Multi-agent summarization', () => {
       console.log(`  Error: ${error.message.substring(0, 100)}`);
     }
 
-    // If summarization fired, it should only be from the tight agent
+    expect(starts.length).toBeGreaterThan(0);
     for (const call of starts) {
       const payload = call[0] as t.SummarizeStartEvent;
       expect(payload.agentId).toBe('tight_agent');
