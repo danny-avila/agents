@@ -71,9 +71,16 @@ export function applyContextPruning(params: {
   indexTokenCountMap: Record<string, number | undefined>;
   tokenCounter: TokenCounter;
   config?: ContextPruningConfig;
+  resolvedSettings?: ContextPruningSettings;
 }): ContextPruningResult {
-  const { messages, indexTokenCountMap, tokenCounter, config } = params;
-  const settings = resolveContextPruningSettings(config);
+  const {
+    messages,
+    indexTokenCountMap,
+    tokenCounter,
+    config,
+    resolvedSettings,
+  } = params;
+  const settings = resolvedSettings ?? resolveContextPruningSettings(config);
 
   if (!settings.enabled || messages.length === 0) {
     return { softTrimmed: 0, hardCleared: 0 };

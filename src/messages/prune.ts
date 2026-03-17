@@ -16,8 +16,23 @@ import {
   truncateToolResultContent,
   truncateToolInput,
 } from '@/utils/truncation';
+import { resolveContextPruningSettings } from './contextPruningSettings';
 import { applyContextPruning } from './contextPruning';
 import { ContentTypes, Providers } from '@/common';
+
+/** Anthropic server tools (web_search, code_execution) use this ID prefix. */
+const ANTHROPIC_SERVER_TOOL_PREFIX = 'srvtoolu_';
+
+function sumTokenCounts(
+  tokenMap: Record<string, number | undefined>,
+  count: number
+): number {
+  let total = 0;
+  for (let i = 0; i < count; i++) {
+    total += tokenMap[i] ?? 0;
+  }
+  return total;
+}
 
 /** Default fraction of the token budget reserved as headroom (5 %). */
 export const DEFAULT_RESERVE_RATIO = 0.05;
@@ -362,13 +377,10 @@ export function sanitizeOrphanToolBlocks(
     const toolCalls = msgAny.tool_calls as Array<{ id?: string }> | undefined;
     if (Array.isArray(toolCalls)) {
       for (const tc of toolCalls) {
-        // Anthropic server tools (web_search, code_execution) use `srvtoolu_` prefixed IDs.
-        // These are executed server-side and never produce client-visible ToolMessages,
-        // so they must be excluded from orphan matching.
         if (
           typeof tc.id === 'string' &&
           tc.id.length > 0 &&
-          !tc.id.startsWith('srvtoolu_')
+          !tc.id.startsWith(ANTHROPIC_SERVER_TOOL_PREFIX)
         ) {
           allToolCallIds.add(tc.id);
         }
@@ -380,7 +392,7 @@ export function sanitizeOrphanToolBlocks(
           typeof block === 'object' &&
           (block.type === 'tool_use' || block.type === 'tool_call') &&
           typeof block.id === 'string' &&
-          !block.id.startsWith('srvtoolu_')
+          !block.id.startsWith(ANTHROPIC_SERVER_TOOL_PREFIX)
         ) {
           allToolCallIds.add(block.id);
         }
@@ -937,15 +949,15 @@ export function maskConsumedToolResults(params: {
     if (type === 'ai') {
       const hasText =
         typeof msg.content === 'string'
-          ? msg.content.length > 0
+          ? msg.content.trim().length > 0
           : Array.isArray(msg.content) &&
             msg.content.some(
               (b) =>
-                typeof b === 'string' ||
-                (typeof b === 'object' &&
-                  (b as Record<string, unknown>).type === 'text' &&
-                  typeof (b as Record<string, unknown>).text === 'string' &&
-                  ((b as Record<string, unknown>).text as string).length > 0)
+                typeof b === 'object' &&
+                (b as Record<string, unknown>).type === 'text' &&
+                typeof (b as Record<string, unknown>).text === 'string' &&
+                ((b as Record<string, unknown>).text as string).trim().length >
+                  0
             );
       if (hasText) {
         seenNonToolCallAI = true;
@@ -1136,7 +1148,7 @@ export function preFlightTruncateToolCallInputs(params: {
       state.changed = true;
       return {
         ...record,
-        input: truncateToolInput(input, maxInputChars),
+        input: truncateToolInput(serialized, maxInputChars),
       };
     });
 
@@ -1205,6 +1217,9 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
    *  pruner is recreated after summarization. */
   const originalToolContent = new Map<number, string>();
   let originalToolContentSize = 0;
+  const contextPruningSettings = resolveContextPruningSettings(
+    factoryParams.contextPruningConfig
+  );
 
   return function pruneMessages(params: PruneMessagesParams): {
     context: BaseMessage[];
@@ -1489,10 +1504,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     //   90%: aggressive — budget factor 0.20, most results heavily truncated
     //   99%: emergency — budget factor 0.05, effectively placeholders for old results
     // ---------------------------------------------------------------------------
-    totalTokens = 0;
-    for (let i = 0; i < params.messages.length; i++) {
-      totalTokens += indexTokenCountMap[i] ?? 0;
-    }
+    totalTokens = sumTokenCounts(indexTokenCountMap, params.messages.length);
     calibratedTotalTokens = Math.round(totalTokens * calibrationRatio);
     const contextPressure =
       pruningBudget > 0 ? calibratedTotalTokens / pruningBudget : 0;
@@ -1619,7 +1631,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         messages: params.messages,
         indexTokenCountMap,
         tokenCounter: factoryParams.tokenCounter,
-        config: factoryParams.contextPruningConfig,
+        resolvedSettings: contextPruningSettings,
       });
     }
 
@@ -1667,10 +1679,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     }
 
     const preTruncationTotalTokens = totalTokens;
-    totalTokens = 0;
-    for (let i = 0; i < params.messages.length; i++) {
-      totalTokens += indexTokenCountMap[i] ?? 0;
-    }
+    totalTokens = sumTokenCounts(indexTokenCountMap, params.messages.length);
     calibratedTotalTokens = Math.round(totalTokens * calibrationRatio);
 
     if (totalTokens !== preTruncationTotalTokens) {
