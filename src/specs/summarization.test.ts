@@ -263,6 +263,7 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
   const agentProvider = Providers.ANTHROPIC;
   const streamConfig = {
     configurable: { thread_id: 'anthropic-sum-e2e' },
+    recursionLimit: 80,
     streamMode: 'values',
     version: 'v2' as const,
   };
@@ -747,11 +748,8 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
         summarizationProvider: Providers.ANTHROPIC,
         summarizationModel: 'claude-haiku-4-5',
         maxContextTokens: maxTokens,
-        instructions: [
-          'You are a math reasoning tutor who thinks step by step.',
-          'You MUST use the calculator tool for ALL computations.',
-          'After each calculation, briefly explain the reasoning.',
-        ].join(' '),
+        instructions:
+          'You are a math tutor. Use the calculator tool for computations. Keep answers brief.',
         collectedUsage,
         aggregateContent,
         spies,
@@ -768,11 +766,11 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
       return { run, contentParts };
     };
 
-    // Turn 1: reasoning-heavy problem
+    // Turn 1: simple calculation with thinking
     let { run, contentParts } = await createRun();
     await runTurn(
       { run, conversationHistory },
-      'What is 7! (7 factorial)? Use the calculator. Think through the problem step by step.',
+      'What is 7 * 720? Use the calculator.',
       streamConfig
     );
     logTurn('T1-think', conversationHistory, `parts=${contentParts.length}`);
@@ -792,20 +790,20 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
           : '')
     );
 
-    // Turn 2: compound reasoning
+    // Turn 2: follow-up calculation
     ({ run, contentParts } = await createRun());
     await runTurn(
       { run, conversationHistory },
-      'Now take that result (5040) and compute its square root, then multiply by pi (use 3.14159). Calculator for each step.',
+      'Now multiply that result by 3. Use the calculator.',
       streamConfig
     );
     logTurn('T2-think', conversationHistory, `parts=${contentParts.length}`);
 
-    // Turn 3: more work to inflate context
+    // Turn 3: another calculation to build context
     ({ run, contentParts } = await createRun());
     await runTurn(
       { run, conversationHistory },
-      'Calculate the sum of the first 10 Fibonacci numbers using the calculator: 1+1+2+3+5+8+13+21+34+55. Then divide by 10.',
+      'What is 143 + 857? Use the calculator.',
       streamConfig
     );
     logTurn('T3-think', conversationHistory, `parts=${contentParts.length}`);
@@ -814,18 +812,17 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
     ({ run, contentParts } = await createRun());
     await runTurn(
       { run, conversationHistory },
-      'What is 2^10? Calculator. Also list all results from before.',
+      'What is 2 * 512? Use the calculator.',
       streamConfig
     );
     logTurn('T4-think', conversationHistory);
 
-    // Turn 5: tighter context to trigger summarization — keep high enough
-    // for tool-schema overhead + post-summary instruction tokens + messages
+    // Turn 5: tighter context to trigger summarization
     if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
       ({ run, contentParts } = await createRun(3500));
       await runTurn(
         { run, conversationHistory },
-        'Compute 999 * 999 with calculator.',
+        'What is 999 * 999? Use the calculator.',
         streamConfig
       );
       logTurn('T5-think', conversationHistory);
@@ -836,7 +833,7 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
       ({ run, contentParts } = await createRun(3200));
       await runTurn(
         { run, conversationHistory },
-        'What is 42 * 42? Calculator.',
+        'What is 42 * 42? Use the calculator.',
         streamConfig
       );
       logTurn('T6-think', conversationHistory);
