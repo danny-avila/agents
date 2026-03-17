@@ -5,7 +5,7 @@ import {
   UsageMetadata,
 } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
-import type { BaseMessage } from '@langchain/core/messages';
+import type { BaseMessage, ToolMessage } from '@langchain/core/messages';
 import type { AgentContext } from '@/agents/AgentContext';
 import type { OnChunk } from '@/llm/invoke';
 import type * as t from '@/types';
@@ -166,7 +166,7 @@ function extractToolFailuresSection(messages: BaseMessage[]): string {
     if (msg.getType() !== 'tool') {
       continue;
     }
-    const toolMsg = msg as import('@langchain/core/messages').ToolMessage;
+    const toolMsg = msg as ToolMessage;
     if (toolMsg.status !== 'error') {
       continue;
     }
@@ -471,8 +471,15 @@ export function createSummarizeNode({
               fbMsg as { content: string | object }
             );
           }
-        } catch {
-          // Fallbacks exhausted
+        } catch (fbErr) {
+          emitAgentLog(
+            runnableConfig,
+            'warn',
+            'summarize',
+            'Fallback providers also failed',
+            { error: fbErr instanceof Error ? fbErr.message : String(fbErr) },
+            { runId: graph.runId, agentId: request.agentId }
+          );
         }
       }
       if (!summaryText) {
