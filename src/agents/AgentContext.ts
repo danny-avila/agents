@@ -97,8 +97,10 @@ export class AgentContext {
     });
 
     if (initialSummary?.text != null && initialSummary.text !== '') {
-      agentContext.setSummary(initialSummary.text, initialSummary.tokenCount);
-      agentContext._summaryLocation = 'system_prompt';
+      agentContext.setInitialSummary(
+        initialSummary.text,
+        initialSummary.tokenCount
+      );
     }
 
     if (tokenCounter) {
@@ -782,19 +784,23 @@ export class AgentContext {
   setSummary(text: string, tokenCount: number): void {
     this.summaryText = text;
     this.summaryTokenCount = tokenCount;
-    // Mid-run compaction clears the initial-summary flag so the summary
-    // is injected as a HumanMessage (clean slate) instead of the system prompt.
     this._summaryLocation = 'user_message';
     this._durableSummaryText = text;
     this._durableSummaryTokenCount = tokenCount;
     this._summaryVersion += 1;
     this.systemRunnableStale = true;
-    // Force pruner recreation: after summarization, the summarize node removes
-    // summarized messages from graph state via RemoveMessage.  The old pruner's
-    // closure state (indexTokenCountMap indices, lastCutOffIndex, totalTokens)
-    // becomes stale once messages are removed.  Setting to undefined causes the
-    // agent node to create a fresh pruner with the rebuilt token map.
     this.pruneMessages = undefined;
+  }
+
+  /** Sets a cross-run summary that is injected into the system prompt. */
+  setInitialSummary(text: string, tokenCount: number): void {
+    this.summaryText = text;
+    this.summaryTokenCount = tokenCount;
+    this._summaryLocation = 'system_prompt';
+    this._durableSummaryText = text;
+    this._durableSummaryTokenCount = tokenCount;
+    this._summaryVersion += 1;
+    this.systemRunnableStale = true;
   }
 
   /**
