@@ -2,31 +2,9 @@ import axios from 'axios';
 import type * as t from './types';
 import { createDefaultLogger } from './utils';
 
-/**
- * Tavily scraper implementation
- * Uses the Tavily Extract API to scrape web pages
- *
- * Features:
- * - Extract content from up to 20 URLs in a single API call
- * - Supports basic and advanced extraction depths
- * - Returns raw content in markdown format
- * - Includes image extraction support
- *
- * @example
- * ```typescript
- * const scraper = createTavilyScraper({
- *   apiKey: 'your-tavily-api-key',
- *   extractDepth: 'basic',
- *   timeout: 60000
- * });
- *
- * const [url, response] = await scraper.scrapeUrl('https://example.com');
- * if (response.success) {
- *   const [content] = scraper.extractContent(response);
- *   console.log(content);
- * }
- * ```
- */
+const DEFAULT_TIMEOUT = 15000;
+const MAX_BATCH_SIZE = 20;
+
 export class TavilyScraper implements t.BaseScraper {
   private apiKey: string;
   private apiUrl: string;
@@ -37,50 +15,64 @@ export class TavilyScraper implements t.BaseScraper {
 
   constructor(config: t.TavilyScraperConfig = {}) {
     this.apiKey = config.apiKey ?? process.env.TAVILY_API_KEY ?? '';
-
     this.apiUrl =
       config.apiUrl ??
-      process.env.TAVILY_API_URL ??
+      process.env.TAVILY_EXTRACT_URL ??
       'https://api.tavily.com/extract';
-
-    this.timeout = config.timeout ?? 60000;
+    this.timeout = config.timeout ?? DEFAULT_TIMEOUT;
     this.extractDepth = config.extractDepth ?? 'basic';
     this.includeImages = config.includeImages ?? false;
-
     this.logger = config.logger || createDefaultLogger();
 
     if (!this.apiKey) {
       this.logger.warn('TAVILY_API_KEY is not set. Scraping will not work.');
     }
-
-    this.logger.debug(
-      `Tavily scraper initialized with API URL: ${this.apiUrl}`
-    );
   }
 
-  /**
-   * Scrape a single URL
-   * @param url URL to scrape
-   * @param options Scrape options
-   * @returns Scrape response
-   */
   async scrapeUrl(
     url: string,
     options: t.TavilyScrapeOptions = {}
   ): Promise<[string, t.TavilyScrapeResponse]> {
+    const results = await this.scrapeUrls([url], options);
+    return results[0];
+  }
+
+  /** Batch-scrape up to 20 URLs in a single Tavily Extract API call */
+  async scrapeUrls(
+    urls: string[],
+    options: t.TavilyScrapeOptions = {}
+  ): Promise<Array<[string, t.TavilyScrapeResponse]>> {
     if (!this.apiKey) {
-      return [
+      return urls.map((url) => [
         url,
-        {
-          success: false,
-          error: 'TAVILY_API_KEY is not set',
-        },
-      ];
+        { success: false, error: 'TAVILY_API_KEY is not set' },
+      ]);
     }
 
+    const batches: string[][] = [];
+    for (let i = 0; i < urls.length; i += MAX_BATCH_SIZE) {
+      batches.push(urls.slice(i, i + MAX_BATCH_SIZE));
+    }
+
+    const allResults: Array<[string, t.TavilyScrapeResponse]> = [];
+
+    for (const batch of batches) {
+      const batchResults = await this.extractBatch(batch, options);
+      for (const entry of batchResults) {
+        allResults.push(entry);
+      }
+    }
+
+    return allResults;
+  }
+
+  private async extractBatch(
+    urls: string[],
+    options: t.TavilyScrapeOptions = {}
+  ): Promise<Array<[string, t.TavilyScrapeResponse]>> {
     try {
       const payload = {
-        urls: [url],
+        urls,
         extract_depth: options.extractDepth ?? this.extractDepth,
         include_images: options.includeImages ?? this.includeImages,
       };
@@ -94,46 +86,48 @@ export class TavilyScraper implements t.BaseScraper {
       });
 
       const data = response.data;
-      const result = data.results?.[0];
+      const successMap = new Map<string, t.TavilyExtractResult>();
+      const failedMap = new Map<string, t.TavilyExtractResult>();
 
-      if (result && result.error == null) {
-        return [
-          url,
-          {
-            success: true,
-            data: {
-              raw_content: result.raw_content ?? '',
-              images: result.images ?? [],
-            },
-          },
-        ];
-      } else {
-        return [
-          url,
-          {
-            success: false,
-            error: result?.error ?? 'Unknown error from Tavily API',
-          },
-        ];
+      for (const result of data.results ?? []) {
+        successMap.set(result.url, result);
       }
+      for (const result of data.failed_results ?? []) {
+        failedMap.set(result.url, result);
+      }
+
+      return urls.map((url): [string, t.TavilyScrapeResponse] => {
+        const success = successMap.get(url);
+        if (success && success.error == null) {
+          return [
+            url,
+            {
+              success: true,
+              data: {
+                rawContent: success.raw_content ?? '',
+                images: success.images ?? [],
+              },
+            },
+          ];
+        }
+
+        const failed = failedMap.get(url);
+        const error = success?.error ?? failed?.error ?? 'URL not found in Tavily Extract response';
+        return [url, { success: false, error }];
+      });
     } catch (error) {
       const errorMessage =
         error instanceof Error ? error.message : String(error);
-      return [
+      return urls.map((url) => [
         url,
         {
           success: false,
           error: `Tavily Extract API request failed: ${errorMessage}`,
         },
-      ];
+      ]);
     }
   }
 
-  /**
-   * Extract content from scrape response
-   * @param response Scrape response
-   * @returns Extracted content or empty string if not available
-   */
   extractContent(
     response: t.TavilyScrapeResponse
   ): [string, undefined | t.References] {
@@ -141,16 +135,14 @@ export class TavilyScraper implements t.BaseScraper {
       return ['', undefined];
     }
 
-    const content = response.data.raw_content ?? '';
+    const content = response.data.rawContent ?? '';
     const images = response.data.images ?? [];
 
     const references: t.References | undefined =
       images.length > 0
         ? {
           links: [],
-          images: images.map((imageUrl) => ({
-            originalUrl: imageUrl,
-          })),
+          images: images.map((imageUrl) => ({ originalUrl: imageUrl })),
           videos: [],
         }
         : undefined;
@@ -158,11 +150,6 @@ export class TavilyScraper implements t.BaseScraper {
     return [content, references];
   }
 
-  /**
-   * Extract metadata from scrape response
-   * @param response Scrape response
-   * @returns Metadata object
-   */
   extractMetadata(
     response: t.TavilyScrapeResponse
   ): Record<string, string | number | boolean | null | undefined> {
@@ -176,11 +163,6 @@ export class TavilyScraper implements t.BaseScraper {
   }
 }
 
-/**
- * Create a Tavily scraper instance
- * @param config Scraper configuration
- * @returns Tavily scraper instance
- */
 export const createTavilyScraper = (
   config: t.TavilyScraperConfig = {}
 ): TavilyScraper => {
