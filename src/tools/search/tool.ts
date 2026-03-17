@@ -307,45 +307,12 @@ function createTool({
 }
 
 /**
- * Creates a search tool with a schema that dynamically includes the country field
- * only when the searchProvider is 'serper'.
+ * Creates a search tool with configurable search and scraper providers.
  *
- * Supports multiple scraper providers:
- * - Firecrawl (default): Full-featured web scraping with multiple formats
- * - Serper: Lightweight scraping using Serper's scrape API
- * - Tavily: AI-powered extraction with basic/advanced depth options
+ * Search providers: Serper (Google results), SearXNG (self-hosted meta-search), Tavily (AI-optimized).
+ * Scraper providers: Firecrawl (default, full-featured), Serper (lightweight), Tavily (batch extraction).
  *
- * Supports multiple search providers:
- * - Serper: Google search results via Serper API
- * - SearXNG: Self-hosted meta-search engine
- * - Tavily: AI-optimized search engine for LLMs
- *
- * @example
- * ```typescript
- * // Using Firecrawl scraper (default)
- * const searchTool = createSearchTool({
- *   searchProvider: 'serper',
- *   scraperProvider: 'firecrawl',
- *   firecrawlApiKey: 'your-firecrawl-key'
- * });
- *
- * // Using Serper scraper
- * const searchTool = createSearchTool({
- *   searchProvider: 'serper',
- *   scraperProvider: 'serper',
- *   serperApiKey: 'your-serper-key'
- * });
- *
- * // Using Tavily as both search and scraper provider
- * const searchTool = createSearchTool({
- *   searchProvider: 'tavily',
- *   scraperProvider: 'tavily',
- *   tavilyApiKey: 'your-tavily-key'
- * });
- * ```
- *
- * @param config - The search tool configuration
- * @returns A DynamicStructuredTool with a schema that depends on the searchProvider
+ * The country schema field is only exposed to the LLM when using Serper (Tavily does not support it).
  */
 /** Input params type for search tool */
 interface SearchToolParams {
@@ -366,7 +333,9 @@ export const createSearchTool = (
     searxngInstanceUrl,
     searxngApiKey,
     tavilyApiKey,
-    tavilyApiUrl,
+    tavilySearchUrl,
+    tavilyExtractUrl,
+    searchDepth,
     rerankerType = 'cohere',
     topResults = 5,
     strategies = ['no_extraction'],
@@ -397,7 +366,7 @@ export const createSearchTool = (
     news: newsSchema,
   };
 
-  if (searchProvider === 'serper' || searchProvider === 'tavily') {
+  if (searchProvider === 'serper') {
     schemaProperties.country = countrySchema;
   }
 
@@ -413,7 +382,8 @@ export const createSearchTool = (
     searxngInstanceUrl,
     searxngApiKey,
     tavilyApiKey,
-    tavilyApiUrl,
+    tavilySearchUrl,
+    searchDepth,
   });
 
   /** Create scraper based on scraperProvider */
@@ -430,7 +400,7 @@ export const createSearchTool = (
     scraperInstance = createTavilyScraper({
       ...tavilyScraperOptions,
       apiKey: tavilyApiKey ?? process.env.TAVILY_API_KEY,
-      apiUrl: tavilyApiUrl,
+      apiUrl: tavilyExtractUrl,
       timeout: scraperTimeout ?? tavilyScraperOptions?.timeout,
       logger,
     });
