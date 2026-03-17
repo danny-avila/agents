@@ -3,13 +3,7 @@ import { nanoid } from 'nanoid';
 import { ToolNode } from '@langchain/langgraph/prebuilt';
 import { Runnable, RunnableConfig } from '@langchain/core/runnables';
 import { ToolMessage, AIMessageChunk } from '@langchain/core/messages';
-import {
-  START,
-  END,
-  StateGraph,
-  Annotation,
-  messagesStateReducer,
-} from '@langchain/langgraph';
+import { START, END, StateGraph, Annotation } from '@langchain/langgraph';
 import type {
   UsageMetadata,
   BaseMessage,
@@ -44,6 +38,7 @@ import {
   joinKeys,
   sleep,
 } from '@/utils';
+import { messagesStateReducer } from '@/messages/reducer';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
@@ -662,11 +657,21 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           agentContext.calibrationRatio = calibrationRatio;
         }
         if (resolvedInstructionOverhead != null) {
-          agentContext.toolSchemaTokens = Math.max(
+          const nonToolOverhead =
+            agentContext.instructionTokens - agentContext.toolSchemaTokens;
+          const calibratedToolTokens = Math.max(
             0,
-            resolvedInstructionOverhead -
-              (agentContext.instructionTokens - agentContext.toolSchemaTokens)
+            resolvedInstructionOverhead - nonToolOverhead
           );
+          const currentToolTokens = agentContext.toolSchemaTokens;
+          const variance =
+            currentToolTokens > 0
+              ? Math.abs(calibratedToolTokens - currentToolTokens) /
+                currentToolTokens
+              : 1;
+          if (variance > 0.15) {
+            agentContext.toolSchemaTokens = calibratedToolTokens;
+          }
         }
         messagesToUse = context;
 

@@ -7,3 +7,4 @@ export * from './content';
 export * from './tools';
 export * from './contextPruning';
 export * from './contextPruningSettings';
+export * from './reducer';
