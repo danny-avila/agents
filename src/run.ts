@@ -262,12 +262,11 @@ export class Run<_T extends t.BaseGraphState> {
       );
     }
 
-    // Shallow-copy the config so cleanup at the end of the stream does not
-    // mutate the caller's object (e.g. setting configurable to undefined).
     const config: Partial<RunnableConfig> & {
       version: 'v1' | 'v2';
       run_id?: string;
     } = {
+      recursionLimit: 50,
       ...callerConfig,
       configurable: { ...callerConfig.configurable },
     };
