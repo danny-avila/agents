@@ -780,7 +780,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }
 
       if (lastMessageY instanceof ToolMessage) {
-        if (agentContext.provider === Providers.ANTHROPIC) {
+        if (
+          agentContext.provider === Providers.ANTHROPIC ||
+          agentContext.provider === Providers.BEDROCK
+        ) {
           formatAnthropicArtifactContent(finalMessages);
         } else if (
           (isOpenAILike(agentContext.provider) &&
@@ -1246,7 +1249,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     const workflow = new StateGraph(StateAnnotation)
       .addNode(this.defaultAgentId, agentNode, { ends: [END] })
       .addEdge(START, this.defaultAgentId)
-      .compile();
+      .compile(this.compileOptions as unknown as never);
 
     return workflow;
   }
