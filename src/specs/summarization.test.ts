@@ -733,7 +733,7 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
     };
 
     const createRun = async (
-      maxTokens = 4000
+      maxTokens = 3000
     ): Promise<{
       run: Run<t.IState>;
       contentParts: t.MessageContentComplex[];
@@ -819,7 +819,7 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
 
     // Turn 5: tighter context to trigger summarization
     if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
-      ({ run, contentParts } = await createRun(3500));
+      ({ run, contentParts } = await createRun(2500));
       await runTurn(
         { run, conversationHistory },
         'What is 999 * 999? Use the calculator.',
@@ -830,7 +830,7 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
 
     // Turn 6: squeeze harder if needed
     if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
-      ({ run, contentParts } = await createRun(3200));
+      ({ run, contentParts } = await createRun(2000));
       await runTurn(
         { run, conversationHistory },
         'What is 42 * 42? Use the calculator.',
