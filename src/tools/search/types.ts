@@ -68,7 +68,9 @@ export interface SearchConfig {
   searxngInstanceUrl?: string;
   searxngApiKey?: string;
   tavilyApiKey?: string;
-  tavilyApiUrl?: string;
+  tavilySearchUrl?: string;
+  tavilyExtractUrl?: string;
+  searchDepth?: 'basic' | 'advanced';
 }
 
 export type References = {
@@ -161,17 +163,12 @@ export interface CohereRerankerResponse {
 export type SafeSearchLevel = 0 | 1 | 2;
 
 export type Logger = WinstonLogger;
-export interface TavilyConfig {
-  tavilyApiKey?: string;
-  tavilyApiUrl?: string;
-  tavilyScraperOptions?: TavilyScraperConfig;
-}
 
 export interface SearchToolConfig
   extends SearchConfig,
     ProcessSourcesConfig,
-    FirecrawlConfig,
-    TavilyConfig {
+    FirecrawlConfig {
+  tavilyScraperOptions?: TavilyScraperConfig;
   logger?: Logger;
   safeSearch?: SafeSearchLevel;
   jinaApiKey?: string;
@@ -199,28 +196,26 @@ export type UsedReferences = {
   reference: MediaReference;
 }[];
 
+export type AnyScraperResponse =
+  | FirecrawlScrapeResponse
+  | SerperScrapeResponse
+  | TavilyScrapeResponse;
+
 /** Base Scraper Interface */
 export interface BaseScraper {
   scrapeUrl(
     url: string,
     options?: unknown
-  ): Promise<
-    [
-      string,
-      FirecrawlScrapeResponse | SerperScrapeResponse | TavilyScrapeResponse,
-    ]
-  >;
+  ): Promise<[string, AnyScraperResponse]>;
+  scrapeUrls?(
+    urls: string[],
+    options?: unknown
+  ): Promise<Array<[string, AnyScraperResponse]>>;
   extractContent(
-    response:
-      | FirecrawlScrapeResponse
-      | SerperScrapeResponse
-      | TavilyScrapeResponse
+    response: AnyScraperResponse
   ): [string, undefined | References];
   extractMetadata(
-    response:
-      | FirecrawlScrapeResponse
-      | SerperScrapeResponse
-      | TavilyScrapeResponse
+    response: AnyScraperResponse
   ):
     | ScrapeMetadata
     | Record<string, string | number | boolean | null | undefined>;
@@ -331,9 +326,24 @@ export interface SerperScrapeResponse {
 export interface TavilyScrapeResponse {
   success: boolean;
   data?: {
-    raw_content?: string;
+    rawContent?: string;
     images?: string[];
   };
+  error?: string;
+}
+
+export interface TavilySearchResult {
+  title?: string;
+  url?: string;
+  content?: string;
+  score?: number;
+  published_date?: string;
+}
+
+export interface TavilyExtractResult {
+  url: string;
+  raw_content?: string;
+  images?: string[];
   error?: string;
 }
 
