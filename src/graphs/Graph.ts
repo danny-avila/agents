@@ -804,7 +804,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         lastMessageY instanceof ToolMessage &&
         typeof lastMessageX.content === 'string'
       ) {
-        finalMessages[finalMessages.length - 2].content = '';
+        const trimmed = lastMessageX.content.trim();
+        finalMessages[finalMessages.length - 2].content =
+          trimmed.length > 0 ? [{ type: 'text' as const, text: trimmed }] : '';
       }
 
       if (lastMessageY instanceof ToolMessage) {
