@@ -96,6 +96,12 @@ export type PruneMessagesFactoryParams = {
    * of waiting for the first provider response.  Ignored when <= 0.
    */
   calibrationRatio?: number;
+  /**
+   * Seeded instruction overhead from a previous run's contextMeta.
+   * Used for budget computation on the first call before any provider
+   * observation is available. Ignored when tool count has changed.
+   */
+  seededInstructionOverhead?: number;
   /** Optional diagnostic log callback wired by the graph for observability. */
   log?: (
     level: 'debug' | 'info' | 'warn' | 'error',
@@ -1205,9 +1211,22 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     factoryParams.calibrationRatio != null && factoryParams.calibrationRatio > 0
       ? factoryParams.calibrationRatio
       : 1;
-  /** Best observed instruction overhead from a near-zero variance turn. */
-  let bestInstructionOverhead: number | undefined;
-  let bestVarianceAbs = Infinity;
+  /** Best observed instruction overhead from a near-zero variance turn.
+   *  Seeded from contextMeta when available so the first call's budget
+   *  uses a calibrated value instead of the local estimate. */
+  let bestInstructionOverhead: number | undefined =
+    factoryParams.seededInstructionOverhead != null &&
+    factoryParams.seededInstructionOverhead > 0
+      ? factoryParams.seededInstructionOverhead
+      : undefined;
+  let bestVarianceAbs = bestInstructionOverhead != null ? 0.5 : Infinity;
+  /** Local estimate at the time bestInstructionOverhead was observed.
+   *  Used to invalidate the cached overhead when instructions change
+   *  mid-run (e.g. tool discovery adds tools to the bound set). */
+  let bestInstructionEstimate: number | undefined =
+    bestInstructionOverhead != null
+      ? (factoryParams.getInstructionTokens?.() ?? undefined)
+      : undefined;
   /** Original (pre-masking) tool result content keyed by message index.
    *  Allows the summarizer to see full tool outputs even after masking
    *  has truncated them in the live message array. Cleared when the
@@ -1396,6 +1415,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
           0,
           Math.round(providerInputTokens - rawSentThisTurn * calibrationRatio)
         );
+        bestInstructionEstimate = factoryParams.getInstructionTokens?.() ?? 0;
       }
 
       const msgCount = toolMsgCount + otherMsgCount;
@@ -1424,8 +1444,20 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     // Computed BEFORE pre-flight truncation so the effective budget can drive
     // truncation thresholds — without this, thresholds based on maxTokens are
     // too generous and leave individual messages larger than the actual budget.
-    const currentInstructionTokens =
+    const estimatedInstructionTokens =
       factoryParams.getInstructionTokens?.() ?? 0;
+    const estimateStable =
+      bestInstructionEstimate != null &&
+      bestInstructionEstimate > 0 &&
+      Math.abs(estimatedInstructionTokens - bestInstructionEstimate) /
+        bestInstructionEstimate <
+        0.1;
+    const currentInstructionTokens =
+      bestInstructionOverhead != null &&
+      bestInstructionOverhead <= estimatedInstructionTokens &&
+      estimateStable
+        ? bestInstructionOverhead
+        : estimatedInstructionTokens;
 
     const reserveRatio = factoryParams.reserveRatio ?? DEFAULT_RESERVE_RATIO;
     const reserveTokens =
@@ -1446,6 +1478,8 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       reserveTokens,
       pruningBudget,
       instructionTokens: currentInstructionTokens,
+      estimatedInstructionTokens,
+      bestInstructionOverhead,
       effectiveMax: effectiveMaxTokens,
       messageCount: params.messages.length,
       rawTotalTokens: totalTokens,

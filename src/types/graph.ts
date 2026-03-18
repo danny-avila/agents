@@ -347,6 +347,7 @@ export type StandardGraphInput = {
   tokenCounter?: TokenCounter;
   indexTokenCountMap?: Record<string, number>;
   calibrationRatio?: number;
+  seededInstructionOverhead?: number;
 };
 
 export type GraphEdge = {

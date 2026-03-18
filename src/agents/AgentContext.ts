@@ -166,6 +166,8 @@ export class AgentContext {
   toolSchemaTokens: number = 0;
   /** Running calibration ratio from the pruner — persisted across runs via contextMeta. */
   calibrationRatio: number = 1;
+  /** Provider-observed instruction overhead from the pruner's best-variance turn. */
+  resolvedInstructionOverhead?: number;
 
   /** Total instruction overhead: system message + tool schemas + pending summary. */
   get instructionTokens(): number {

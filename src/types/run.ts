@@ -124,6 +124,9 @@ export type RunConfig = {
    * conversation. Without this, the EMA resets to 1 on every new Run instance.
    */
   calibrationRatio?: number;
+  /** Provider-observed instruction overhead from a previous run. Seeds the pruner
+   *  so the first call's budget uses a calibrated value. Ignored when tool count changed. */
+  seededInstructionOverhead?: number;
   /** Skip post-stream cleanup (clearHeavyState) — useful for tests that inspect graph state after processStream */
   skipCleanup?: boolean;
 };

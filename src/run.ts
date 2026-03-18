@@ -44,6 +44,7 @@ export class Run<_T extends t.BaseGraphState> {
   private handlerRegistry?: HandlerRegistry;
   private indexTokenCountMap?: Record<string, number>;
   calibrationRatio: number = 1;
+  private seededInstructionOverhead?: number;
   graphRunnable?: t.CompiledStateWorkflow;
   Graph: StandardGraph | MultiAgentGraph | undefined;
   returnContent: boolean = false;
@@ -62,6 +63,7 @@ export class Run<_T extends t.BaseGraphState> {
     if (config.calibrationRatio != null && config.calibrationRatio > 0) {
       this.calibrationRatio = config.calibrationRatio;
     }
+    this.seededInstructionOverhead = config.seededInstructionOverhead;
 
     const handlerRegistry = new HandlerRegistry();
 
@@ -140,6 +142,7 @@ export class Run<_T extends t.BaseGraphState> {
       tokenCounter: this.tokenCounter,
       indexTokenCountMap: this.indexTokenCountMap,
       calibrationRatio: this.calibrationRatio,
+      seededInstructionOverhead: this.seededInstructionOverhead,
     });
     /** Propagate compile options from graph config */
     standardGraph.compileOptions = config.compileOptions;
@@ -159,6 +162,7 @@ export class Run<_T extends t.BaseGraphState> {
       tokenCounter: this.tokenCounter,
       indexTokenCountMap: this.indexTokenCountMap,
       calibrationRatio: this.calibrationRatio,
+      seededInstructionOverhead: this.seededInstructionOverhead,
     });
 
     if (compileOptions != null) {
@@ -200,6 +204,14 @@ export class Run<_T extends t.BaseGraphState> {
    */
   getCalibrationRatio(): number {
     return this.calibrationRatio;
+  }
+
+  getResolvedInstructionOverhead(): number | undefined {
+    return this.Graph?.getResolvedInstructionOverhead();
+  }
+
+  getToolCount(): number {
+    return this.Graph?.getToolCount() ?? 0;
   }
 
   /**

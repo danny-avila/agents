@@ -169,6 +169,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   /** Default agent ID to use */
   defaultAgentId: string;
 
+  private seededInstructionOverhead?: number;
+
   constructor({
     runId,
     signal,
@@ -176,10 +178,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     tokenCounter,
     indexTokenCountMap,
     calibrationRatio,
+    seededInstructionOverhead,
   }: t.StandardGraphInput) {
     super();
     this.runId = runId;
     this.signal = signal;
+    this.seededInstructionOverhead = seededInstructionOverhead;
 
     if (agents.length === 0) {
       throw new Error('At least one agent configuration is required');
@@ -381,6 +385,18 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   getCalibrationRatio(): number {
     const context = this.agentContexts.get(this.defaultAgentId);
     return context?.calibrationRatio ?? 1;
+  }
+
+  getResolvedInstructionOverhead(): number | undefined {
+    const context = this.agentContexts.get(this.defaultAgentId);
+    return context?.resolvedInstructionOverhead;
+  }
+
+  getToolCount(): number {
+    const context = this.agentContexts.get(this.defaultAgentId);
+    return (
+      (context?.tools?.length ?? 0) + (context?.toolDefinitions?.length ?? 0)
+    );
   }
 
   /**
@@ -630,6 +646,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           summarizationEnabled: agentContext.summarizationEnabled,
           reserveRatio: agentContext.summarizationConfig?.reserveRatio,
           calibrationRatio: agentContext.calibrationRatio,
+          seededInstructionOverhead: this.seededInstructionOverhead,
           getInstructionTokens: () => agentContext.instructionTokens,
           log: (level, message, data) => {
             emitAgentLog(config, level, 'prune', message, data, {
@@ -660,6 +677,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           agentContext.calibrationRatio = calibrationRatio;
         }
         if (resolvedInstructionOverhead != null) {
+          agentContext.resolvedInstructionOverhead =
+            resolvedInstructionOverhead;
           const nonToolOverhead =
             agentContext.instructionTokens - agentContext.toolSchemaTokens;
           const calibratedToolTokens = Math.max(
