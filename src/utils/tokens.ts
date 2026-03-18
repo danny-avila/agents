@@ -49,7 +49,7 @@ export function extractImageDimensions(
     return null;
   }
 
-  const bytes = Uint8Array.from(atob(raw.slice(0, 80)), (c) => c.charCodeAt(0));
+  const bytes = new Uint8Array(Buffer.from(raw.slice(0, 80), 'base64'));
 
   if (bytes[0] === 0x89 && bytes[1] === 0x50) {
     // PNG: width at bytes 16-19, height at 20-23 (big-endian)
@@ -193,7 +193,9 @@ function estimateDocumentBlockTokens(
   // LangChain standard format: type='file', source_type, data/text/url, mime_type
   const sourceType = block.source_type as string | undefined;
   if (typeof sourceType === 'string') {
-    const mimeType = ((block.mime_type as string) ?? '').split(';')[0];
+    const mimeType = ((block.mime_type as string | undefined) ?? '').split(
+      ';'
+    )[0];
 
     if (sourceType === 'text' && typeof block.text === 'string') {
       return getTokenCount(block.text as string);

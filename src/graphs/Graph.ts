@@ -1259,6 +1259,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       .addEdge(summarizeNode, agentNode)
       .addEdge(toolNode, agentContext.toolEnd ? END : agentNode);
 
+    // LangGraph compile() types are overly strict for opt-in options
     return workflow.compile(this.compileOptions as unknown as never);
   }
 
@@ -1280,6 +1281,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     const workflow = new StateGraph(StateAnnotation)
       .addNode(this.defaultAgentId, agentNode, { ends: [END] })
       .addEdge(START, this.defaultAgentId)
+      // LangGraph compile() types are overly strict for opt-in options
       .compile(this.compileOptions as unknown as never);
 
     return workflow;
