@@ -17,11 +17,8 @@ import {
   truncateToolInput,
 } from '@/utils/truncation';
 import { resolveContextPruningSettings } from './contextPruningSettings';
+import { ContentTypes, Providers, Constants } from '@/common';
 import { applyContextPruning } from './contextPruning';
-import { ContentTypes, Providers } from '@/common';
-
-/** Anthropic server tools (web_search, code_execution) use this ID prefix. */
-const ANTHROPIC_SERVER_TOOL_PREFIX = 'srvtoolu_';
 
 function sumTokenCounts(
   tokenMap: Record<string, number | undefined>,
@@ -380,7 +377,7 @@ export function sanitizeOrphanToolBlocks(
         if (
           typeof tc.id === 'string' &&
           tc.id.length > 0 &&
-          !tc.id.startsWith(ANTHROPIC_SERVER_TOOL_PREFIX)
+          !tc.id.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX)
         ) {
           allToolCallIds.add(tc.id);
         }
@@ -392,7 +389,7 @@ export function sanitizeOrphanToolBlocks(
           typeof block === 'object' &&
           (block.type === 'tool_use' || block.type === 'tool_call') &&
           typeof block.id === 'string' &&
-          !block.id.startsWith(ANTHROPIC_SERVER_TOOL_PREFIX)
+          !block.id.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX)
         ) {
           allToolCallIds.add(block.id);
         }

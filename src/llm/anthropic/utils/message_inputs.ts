@@ -34,6 +34,7 @@ import {
   AnthropicCompactionBlockParam,
   AnthropicToolResponse,
 } from '../types';
+import { Constants } from '@/common';
 
 function _formatImage(imageUrl: string) {
   const parsed = parseBase64DataUrl({ dataUrl: imageUrl });
@@ -377,8 +378,7 @@ function _formatContent(message: BaseMessage) {
         const rawPart = contentPart as Record<string, unknown>;
         const id = rawPart.id as string;
 
-        // Only correct if this is definitely a server tool (ID starts with 'srvtoolu_')
-        if (id && id.startsWith('srvtoolu_')) {
+        if (id && id.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX)) {
           let input = rawPart.input;
 
           // Ensure input is an object
@@ -420,8 +420,10 @@ function _formatContent(message: BaseMessage) {
         const toolUseId = rawPart.tool_use_id as string;
         const content = rawPart.content;
 
-        // Only correct if this is definitely a server tool result (tool_use_id starts with 'srvtoolu_')
-        if (toolUseId && toolUseId.startsWith('srvtoolu_')) {
+        if (
+          toolUseId &&
+          toolUseId.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX)
+        ) {
           // Verify content is either an array (success) or error object
           const isValidContent =
             Array.isArray(content) ||

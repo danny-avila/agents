@@ -677,7 +677,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
            */
           return (
             (call.id == null || !toolMessageIds.has(call.id)) &&
-            !(call.id?.startsWith('srvtoolu_') ?? false)
+            !(
+              call.id?.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX) ??
+              false
+            )
           );
         }) ?? [];
 

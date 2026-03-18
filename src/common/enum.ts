@@ -180,6 +180,8 @@ export enum Constants {
   LC_TRANSFER_TO_ = 'lc_transfer_to_',
   /** Delimiter for MCP tools: toolName_mcp_serverName */
   MCP_DELIMITER = '_mcp_',
+  /** Anthropic server tool ID prefix (web_search, code_execution, etc.) */
+  ANTHROPIC_SERVER_TOOL_PREFIX = 'srvtoolu_',
 }
 
 export enum TitleMethod {

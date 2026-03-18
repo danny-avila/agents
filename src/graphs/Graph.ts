@@ -38,12 +38,12 @@ import {
   joinKeys,
   sleep,
 } from '@/utils';
-import { messagesStateReducer } from '@/messages/reducer';
-import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
+import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { shouldTriggerSummarization } from '@/summarization';
 import { createSummarizeNode } from '@/summarization/node';
+import { messagesStateReducer } from '@/messages/reducer';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { AgentContext } from '@/agents/AgentContext';
 import { createFakeStreamingLLM } from '@/llm/fake';
@@ -54,6 +54,9 @@ import { HandlerRegistry } from '@/events';
 import { ChatOpenAI } from '@/llm/openai';
 
 const { AGENT, TOOLS, SUMMARIZE } = GraphNodeKeys;
+
+/** Minimum relative variance before calibrated toolSchemaTokens overrides current value. */
+const CALIBRATION_VARIANCE_THRESHOLD = 0.15;
 
 export abstract class Graph<
   T extends t.BaseGraphState = t.BaseGraphState,
@@ -669,7 +672,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               ? Math.abs(calibratedToolTokens - currentToolTokens) /
                 currentToolTokens
               : 1;
-          if (variance > 0.15) {
+          if (variance > CALIBRATION_VARIANCE_THRESHOLD) {
             agentContext.toolSchemaTokens = calibratedToolTokens;
           }
         }
