@@ -382,10 +382,12 @@ export function formatAnthropicArtifactContent(messages: BaseMessage[]): void {
       msg instanceof ToolMessage &&
       toolCallIdSet.has(msg.tool_call_id) &&
       msg.artifact != null &&
-      Array.isArray(msg.artifact?.content) &&
-      Array.isArray(msg.content)
+      Array.isArray(msg.artifact?.content)
     ) {
-      msg.content = msg.content.concat(msg.artifact.content);
+      const base = Array.isArray(msg.content)
+        ? msg.content
+        : [{ type: 'text' as const, text: String(msg.content ?? '') }];
+      msg.content = base.concat(msg.artifact.content);
     }
   }
 }

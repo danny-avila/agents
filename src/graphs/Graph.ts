@@ -33,6 +33,7 @@ import {
 } from '@/common';
 import {
   resetIfNotEmpty,
+  isAnthropicLike,
   isOpenAILike,
   isGoogleLike,
   joinKeys,
@@ -792,6 +793,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           ? finalMessages[finalMessages.length - 1]
           : null;
 
+      const anthropicLike = isAnthropicLike(
+        agentContext.provider,
+        agentContext.clientOptions as { model?: string }
+      );
+
       if (
         agentContext.provider === Providers.BEDROCK &&
         lastMessageX instanceof AIMessageChunk &&
@@ -802,10 +808,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }
 
       if (lastMessageY instanceof ToolMessage) {
-        if (
-          agentContext.provider === Providers.ANTHROPIC ||
-          agentContext.provider === Providers.BEDROCK
-        ) {
+        if (anthropicLike) {
           formatAnthropicArtifactContent(finalMessages);
         } else if (
           (isOpenAILike(agentContext.provider) &&
@@ -850,8 +853,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       // sanitizeOrphanToolBlocks fast-paths to a Set diff check when no orphans exist,
       // so the cost is negligible and this acts as a safety net for Anthropic/Bedrock.
       const needsOrphanSanitize =
-        (agentContext.provider === Providers.ANTHROPIC ||
-          agentContext.provider === Providers.BEDROCK) &&
+        anthropicLike &&
         (!agentContext.pruneMessages || finalMessages !== messagesToUse);
       if (needsOrphanSanitize) {
         const beforeSanitize = finalMessages.length;

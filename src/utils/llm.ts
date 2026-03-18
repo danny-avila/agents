@@ -24,3 +24,15 @@ export function isGoogleLike(provider?: string | Providers): boolean {
     provider
   );
 }
+
+/** Returns true for native Anthropic or Bedrock running a Claude model. */
+export function isAnthropicLike(
+  provider?: string | Providers,
+  clientOptions?: { model?: string }
+): boolean {
+  if (provider === Providers.ANTHROPIC) return true;
+  if (provider === Providers.BEDROCK) {
+    return /claude/i.test(String(clientOptions?.model ?? ''));
+  }
+  return false;
+}
