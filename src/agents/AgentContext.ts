@@ -24,14 +24,9 @@ import { toJsonSchema } from '@/utils/schema';
 const ANTHROPIC_TOOL_TOKEN_MULTIPLIER = 2.6;
 
 /**
- * Bedrock uses a lighter tool encoding than the direct Anthropic API,
- * observed at ~1.6× the raw JSON token count.
- */
-const BEDROCK_TOOL_TOKEN_MULTIPLIER = 1.6;
-
-/**
- * OpenAI and other providers use function-calling format,
- * roughly 1.4× the raw JSON token count.
+ * Default tool schema overhead multiplier for all non-Anthropic providers.
+ * Covers OpenAI function-calling format, Bedrock, and other providers.
+ * Empirically calibrated at ~1.4× the raw JSON token count.
  */
 const DEFAULT_TOOL_TOKEN_MULTIPLIER = 1.4;
 
@@ -719,21 +714,17 @@ export class AgentContext {
       }
     }
 
-    const isBedrock = this.provider === Providers.BEDROCK;
     const isAnthropic =
-      !isBedrock &&
+      this.provider !== Providers.BEDROCK &&
       (this.provider === Providers.ANTHROPIC ||
         /anthropic|claude/i.test(
           String(
             (this.clientOptions as { model?: string } | undefined)?.model ?? ''
           )
         ));
-    let toolTokenMultiplier = DEFAULT_TOOL_TOKEN_MULTIPLIER;
-    if (isAnthropic) {
-      toolTokenMultiplier = ANTHROPIC_TOOL_TOKEN_MULTIPLIER;
-    } else if (isBedrock) {
-      toolTokenMultiplier = BEDROCK_TOOL_TOKEN_MULTIPLIER;
-    }
+    const toolTokenMultiplier = isAnthropic
+      ? ANTHROPIC_TOOL_TOKEN_MULTIPLIER
+      : DEFAULT_TOOL_TOKEN_MULTIPLIER;
     this.toolSchemaTokens = Math.ceil(toolTokens * toolTokenMultiplier);
   }
 
