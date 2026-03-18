@@ -647,7 +647,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           summarizationEnabled: agentContext.summarizationEnabled,
           reserveRatio: agentContext.summarizationConfig?.reserveRatio,
           calibrationRatio: agentContext.calibrationRatio,
-          seededInstructionOverhead: this.seededInstructionOverhead,
+          seededInstructionOverhead:
+            agentContext.resolvedInstructionOverhead ??
+            this.seededInstructionOverhead,
           getInstructionTokens: () => agentContext.instructionTokens,
           log: (level, message, data) => {
             emitAgentLog(config, level, 'prune', message, data, {
