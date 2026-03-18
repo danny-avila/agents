@@ -537,8 +537,7 @@ export function createSummarizeNode({
       {
         summaryTokens: tokenCount,
         textLength: summaryText.length,
-        contextLength: request.context.length,
-        survivingMessages: request.context.length,
+        messagesCompacted: request.messagesToRefine.length,
         summaryVersion: agentContext.summaryVersion,
         ...(summaryUsage != null
           ? {

@@ -181,7 +181,7 @@ describe('createSummarizeNode', () => {
             new HumanMessage('Hello'),
             new HumanMessage('World'),
           ],
-          context: [],
+
           remainingContextTokens: 1000,
           agentId: 'agent_0',
         },
@@ -235,7 +235,7 @@ describe('createSummarizeNode', () => {
         messages: [new HumanMessage('Hello')],
         summarizationRequest: {
           messagesToRefine: [new HumanMessage('Test message')],
-          context: [],
+
           remainingContextTokens: 1000,
           agentId: 'agent_0',
         },
@@ -276,7 +276,7 @@ describe('createSummarizeNode', () => {
         messages: [new HumanMessage('Hello')],
         summarizationRequest: {
           messagesToRefine: [new HumanMessage('Test message')],
-          context: [],
+
           remainingContextTokens: 1000,
           agentId: 'agent_0',
         },
@@ -325,7 +325,7 @@ describe('createSummarizeNode', () => {
         messages: [new HumanMessage('Hello')],
         summarizationRequest: {
           messagesToRefine: [new HumanMessage('Test')],
-          context: [],
+
           remainingContextTokens: 1000,
           agentId: 'agent_0',
         },
@@ -381,7 +381,7 @@ describe('createSummarizeNode', () => {
         messages: [new HumanMessage('Hello')],
         summarizationRequest: {
           messagesToRefine: [new HumanMessage('Test message')],
-          context: [],
+
           remainingContextTokens: 1000,
           agentId: 'agent_0',
         },
@@ -420,7 +420,7 @@ describe('createSummarizeNode', () => {
         messages: [new HumanMessage('Hello')],
         summarizationRequest: {
           messagesToRefine: [new HumanMessage('Test')],
-          context: [],
+
           remainingContextTokens: 1000,
           agentId: 'agent_0',
         },
@@ -485,7 +485,7 @@ describe('createSummarizeNode', () => {
             new HumanMessage('Message 2'),
             new HumanMessage('Message 3'),
           ],
-          context: [],
+
           remainingContextTokens: 1000,
           agentId: 'agent_0',
         },
@@ -552,7 +552,7 @@ describe('createSummarizeNode', () => {
         messages: [new HumanMessage('Hello')],
         summarizationRequest: {
           messagesToRefine: [new HumanMessage('New message')],
-          context: [],
+
           remainingContextTokens: 1000,
           agentId: 'agent_0',
         },
@@ -623,7 +623,7 @@ describe('budget check — instructions exceed context', () => {
         messages: [new HumanMessage('test')],
         summarizationRequest: {
           messagesToRefine: [new HumanMessage('test')],
-          context: [],
+
           remainingContextTokens: -1000,
           agentId: 'agent_0',
         },
@@ -673,7 +673,6 @@ describe('budget check — instructions exceed context', () => {
         messages: [new HumanMessage('context msg'), new HumanMessage('hello')],
         summarizationRequest: {
           messagesToRefine: [new HumanMessage('hello')],
-          context: [new HumanMessage('context msg')],
           remainingContextTokens: 500,
           agentId: 'agent_0',
         },
@@ -721,7 +720,6 @@ describe('emoji-heavy content does not break summarization', () => {
         ],
         summarizationRequest: {
           messagesToRefine: [new HumanMessage(emojiContent)],
-          context: [new HumanMessage('What happened?')],
           remainingContextTokens: 500,
           agentId: 'agent_0',
         },

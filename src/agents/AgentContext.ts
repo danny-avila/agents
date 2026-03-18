@@ -257,8 +257,6 @@ export class AgentContext {
    * Summarization is allowed to fire again only when new messages appear.
    */
   private _lastSummarizationMsgCount: number = 0;
-  /** Number of times summarization has fired during the current run (diagnostic). */
-  private _summarizationCountThisRun: number = 0;
   /**
    * Handoff context when this agent receives control via handoff.
    * Contains source and parallel execution info for system message context.
@@ -626,7 +624,6 @@ export class AgentContext {
     this.summaryText = this._durableSummaryText;
     this.summaryTokenCount = this._durableSummaryTokenCount;
     this._lastSummarizationMsgCount = 0;
-    this._summarizationCountThisRun = 0;
     this.lastCallUsage = undefined;
     this.totalTokensFresh = false;
 
@@ -846,7 +843,6 @@ export class AgentContext {
    */
   markSummarizationTriggered(msgCount: number): void {
     this._lastSummarizationMsgCount = msgCount;
-    this._summarizationCountThisRun++;
   }
 
   clearSummary(): void {

@@ -757,7 +757,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             return {
               summarizationRequest: {
                 messagesToRefine: allMessages,
-                context: [],
                 remainingContextTokens: remainingContextTokens ?? 0,
                 agentId: agentId || agentContext.agentId,
               },

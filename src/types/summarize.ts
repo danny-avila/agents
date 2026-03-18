@@ -28,13 +28,10 @@ export interface SummarizeResult {
   tokenCount: number;
   model?: string;
   provider?: string;
-  targetMessageId?: string;
-  targetContentIndex?: number;
 }
 
 export interface SummarizationNodeInput {
   messagesToRefine: BaseMessage[];
-  context: BaseMessage[];
   remainingContextTokens: number;
   agentId: string;
 }
