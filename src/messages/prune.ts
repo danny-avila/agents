@@ -96,12 +96,6 @@ export type PruneMessagesFactoryParams = {
    * of waiting for the first provider response.  Ignored when <= 0.
    */
   calibrationRatio?: number;
-  /**
-   * Seeded instruction overhead from a previous run's contextMeta.
-   * Used for budget computation on the first call before any provider
-   * observation is available. Ignored when tool count has changed.
-   */
-  seededInstructionOverhead?: number;
   /** Optional diagnostic log callback wired by the graph for observability. */
   log?: (
     level: 'debug' | 'info' | 'warn' | 'error',
@@ -1212,21 +1206,13 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       ? factoryParams.calibrationRatio
       : 1;
   /** Best observed instruction overhead from a near-zero variance turn.
-   *  Seeded from contextMeta when available so the first call's budget
-   *  uses a calibrated value instead of the local estimate. */
-  let bestInstructionOverhead: number | undefined =
-    factoryParams.seededInstructionOverhead != null &&
-    factoryParams.seededInstructionOverhead > 0
-      ? factoryParams.seededInstructionOverhead
-      : undefined;
-  let bestVarianceAbs = bestInstructionOverhead != null ? 0.5 : Infinity;
+   *  Self-seeds from provider observations within the run. */
+  let bestInstructionOverhead: number | undefined;
+  let bestVarianceAbs = Infinity;
   /** Local estimate at the time bestInstructionOverhead was observed.
    *  Used to invalidate the cached overhead when instructions change
    *  mid-run (e.g. tool discovery adds tools to the bound set). */
-  let bestInstructionEstimate: number | undefined =
-    bestInstructionOverhead != null
-      ? (factoryParams.getInstructionTokens?.() ?? undefined)
-      : undefined;
+  let bestInstructionEstimate: number | undefined;
   /** Original (pre-masking) tool result content keyed by message index.
    *  Allows the summarizer to see full tool outputs even after masking
    *  has truncated them in the live message array. Cleared when the
