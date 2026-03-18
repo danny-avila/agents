@@ -943,17 +943,19 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         );
       }
 
+      const invokeStart = Date.now();
+      const invokeMeta = { runId: this.runId, agentId };
       emitAgentLog(
         config,
         'debug',
         'graph',
-        'Pre-invoke',
+        'Invoking LLM',
         {
-          instructionTokens: agentContext.instructionTokens,
           messageCount: finalMessages.length,
-          hasPendingSummary: agentContext.hasPendingCompactionSummary(),
+          provider: agentContext.provider,
         },
-        { runId: this.runId, agentId }
+        invokeMeta,
+        { force: true }
       );
 
       try {
@@ -1102,6 +1104,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         }
       }
 
+      const invokeElapsed = ((Date.now() - invokeStart) / 1000).toFixed(2);
       agentContext.currentUsage = this.getUsageMetadata(result.messages?.[0]);
       if (agentContext.currentUsage) {
         agentContext.updateLastCallUsage(agentContext.currentUsage);
@@ -1109,15 +1112,29 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           config,
           'debug',
           'graph',
-          'LLM call usage',
+          `LLM call complete (${invokeElapsed}s)`,
           {
             ...agentContext.currentUsage,
+            elapsedSeconds: Number(invokeElapsed),
             instructionTokens: agentContext.instructionTokens,
-            systemMessageTokens: agentContext.systemMessageTokens,
             toolSchemaTokens: agentContext.toolSchemaTokens,
             messageCount: finalMessages.length,
           },
-          { runId: this.runId, agentId }
+          invokeMeta,
+          { force: true }
+        );
+      } else {
+        emitAgentLog(
+          config,
+          'debug',
+          'graph',
+          `LLM call complete (${invokeElapsed}s)`,
+          {
+            elapsedSeconds: Number(invokeElapsed),
+            messageCount: finalMessages.length,
+          },
+          invokeMeta,
+          { force: true }
         );
       }
       this.cleanupSignalListener();

@@ -1343,34 +1343,16 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       // Sum raw tiktoken counts for messages the provider saw (excludes
       // new outputs from this turn — the provider hasn't seen them yet).
       let rawSentThisTurn = 0;
-      let toolMsgTokens = 0;
-      let otherMsgTokens = 0;
-      let toolMsgCount = 0;
-      let otherMsgCount = 0;
       const firstIsSystem =
         params.messages.length > 0 && params.messages[0].getType() === 'system';
       if (firstIsSystem) {
-        const t = indexTokenCountMap[0] ?? 0;
-        rawSentThisTurn += t;
-        otherMsgTokens += t;
-        otherMsgCount++;
+        rawSentThisTurn += indexTokenCountMap[0] ?? 0;
       }
       for (let i = lastCutOffIndex; i < params.messages.length; i++) {
-        if (i === 0 && firstIsSystem) {
+        if ((i === 0 && firstIsSystem) || newOutputs.has(i)) {
           continue;
         }
-        if (newOutputs.has(i)) {
-          continue;
-        }
-        const t = indexTokenCountMap[i] ?? 0;
-        rawSentThisTurn += t;
-        if (params.messages[i]?.getType() === 'tool') {
-          toolMsgTokens += t;
-          toolMsgCount++;
-        } else {
-          otherMsgTokens += t;
-          otherMsgCount++;
-        }
+        rawSentThisTurn += indexTokenCountMap[i] ?? 0;
       }
 
       const providerMessageTokens = Math.max(
@@ -1404,24 +1386,12 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         bestInstructionEstimate = factoryParams.getInstructionTokens?.() ?? 0;
       }
 
-      const msgCount = toolMsgCount + otherMsgCount;
-      const providerAvgPerMsg =
-        msgCount > 0 && providerMessageTokens > 0
-          ? Math.round(providerMessageTokens / msgCount)
-          : undefined;
-
-      factoryParams.log?.('debug', 'Token estimate variance', {
-        calibratedOurTotal: Math.round(calibratedOurTotal),
+      factoryParams.log?.('debug', 'Calibration observed', {
         providerInputTokens,
+        calibratedEstimate: Math.round(calibratedOurTotal),
         variance: `${variancePct > 0 ? '+' : ''}${variancePct}%`,
-        instructionOverhead,
-        rawMessageEstimate: rawSentThisTurn,
-        toolMsgEstimate: toolMsgTokens,
-        toolMsgCount,
-        otherMsgEstimate: otherMsgTokens,
-        otherMsgCount,
-        providerAvgPerMsg,
         calibrationRatio: Math.round(calibrationRatio * 100) / 100,
+        instructionOverhead,
         cumulativeRawSent,
         cumulativeProviderReported,
       });
@@ -1459,16 +1429,12 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
 
     let calibratedTotalTokens = Math.round(totalTokens * calibrationRatio);
 
-    factoryParams.log?.('debug', 'Budget computed', {
+    factoryParams.log?.('debug', 'Budget', {
       maxTokens: factoryParams.maxTokens,
-      reserveTokens,
       pruningBudget,
-      instructionTokens: currentInstructionTokens,
-      estimatedInstructionTokens,
-      bestInstructionOverhead,
       effectiveMax: effectiveMaxTokens,
+      instructionTokens: currentInstructionTokens,
       messageCount: params.messages.length,
-      rawTotalTokens: totalTokens,
       calibratedTotalTokens,
       calibrationRatio: Math.round(calibrationRatio * 100) / 100,
     });
@@ -1588,17 +1554,8 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
             : undefined,
       });
       if (observationsMasked > 0) {
-        // Masking changed what the provider will see on the next call.
-        // The cumulative counters reflect pre-masking content sizes —
-        // reset them so the ratio recalibrates against post-masking reality.
-        // The current calibrationRatio (from pre-masking data) is preserved
-        // as the starting point; new data will refine it.
         cumulativeRawSent = 0;
         cumulativeProviderReported = 0;
-        factoryParams.log?.('debug', 'Observation masking applied', {
-          contextPressure: Math.round(contextPressure * 100),
-          maskedCount: observationsMasked,
-        });
       }
     }
 
@@ -1629,16 +1586,6 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         indexTokenCountMap,
         tokenCounter: factoryParams.tokenCounter,
       });
-
-      if (preFlightResultCount > 0 || preFlightInputCount > 0) {
-        factoryParams.log?.('debug', 'Context pressure fading applied', {
-          contextPressure: Math.round(contextPressure * 100),
-          budgetFactor,
-          baseBudget,
-          toolResultsTruncated: preFlightResultCount,
-          toolInputsTruncated: preFlightInputCount,
-        });
-      }
     }
     if (
       factoryParams.contextPruningConfig?.enabled === true &&
@@ -1685,25 +1632,27 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         indexTokenCountMap,
         tokenCounter: factoryParams.tokenCounter,
       });
-
-      if (preFlightResultCount > 0 || preFlightInputCount > 0) {
-        factoryParams.log?.('debug', 'Fit-to-budget truncation applied', {
-          rawSpaceEffectiveMax,
-          toolResultsTruncated: preFlightResultCount,
-          toolInputsTruncated: preFlightInputCount,
-        });
-      }
     }
 
     const preTruncationTotalTokens = totalTokens;
     totalTokens = sumTokenCounts(indexTokenCountMap, params.messages.length);
     calibratedTotalTokens = Math.round(totalTokens * calibrationRatio);
 
-    if (totalTokens !== preTruncationTotalTokens) {
-      factoryParams.log?.('debug', 'Post-truncation token recount', {
-        before: preTruncationTotalTokens,
-        after: totalTokens,
-        saved: preTruncationTotalTokens - totalTokens,
+    const anyAdjustment =
+      observationsMasked > 0 ||
+      preFlightResultCount > 0 ||
+      preFlightInputCount > 0 ||
+      totalTokens !== preTruncationTotalTokens;
+
+    if (anyAdjustment) {
+      factoryParams.log?.('debug', 'Context adjusted', {
+        contextPressure: Math.round(contextPressure * 100),
+        observationsMasked,
+        toolResultsTruncated: preFlightResultCount,
+        toolInputsTruncated: preFlightInputCount,
+        tokensBefore: preTruncationTotalTokens,
+        tokensAfter: totalTokens,
+        tokensSaved: preTruncationTotalTokens - totalTokens,
       });
     }
 
@@ -1938,7 +1887,6 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
               typeof content === 'string' &&
               content.length > emergencyMaxChars
             ) {
-              const beforeLen = content.length;
               const cloned = new ToolMessage({
                 content: truncateToolResultContent(content, emergencyMaxChars),
                 tool_call_id: (message as ToolMessage).tool_call_id,
@@ -1950,12 +1898,6 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
               emergencyMessages[i] = cloned;
               indexTokenCountMap[i] = factoryParams.tokenCounter(cloned);
               emergencyTruncatedCount++;
-              factoryParams.log?.('debug', 'Emergency truncated tool result', {
-                index: i,
-                toolName: message.name ?? 'unknown',
-                beforeChars: beforeLen,
-                afterChars: emergencyMaxChars,
-              });
             }
           }
           if (message.getType() === 'ai' && Array.isArray(message.content)) {
@@ -2016,9 +1958,6 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
                 emergencyMessages[i]
               );
               emergencyTruncatedCount++;
-              factoryParams.log?.('debug', 'Emergency truncated tool input', {
-                index: i,
-              });
             }
           }
         }

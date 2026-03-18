@@ -35,7 +35,9 @@ export async function safeDispatchCustomEvent(
 
 /**
  * Fire-and-forget diagnostic log event.
- * Zero-cost when no config is provided (no handler attached).
+ * Debug-level logs are gated behind AGENT_DEBUG_LOGGING=true to avoid
+ * overhead in production. Info/warn/error always flow through.
+ * Pass `force: true` to bypass the env-var gate (e.g. invoke timing).
  */
 export function emitAgentLog(
   config: RunnableConfig | undefined,
@@ -43,9 +45,16 @@ export function emitAgentLog(
   scope: AgentLogEvent['scope'],
   message: string,
   data?: Record<string, unknown>,
-  meta?: { runId?: string; agentId?: string }
+  meta?: { runId?: string; agentId?: string },
+  options?: { force?: boolean }
 ): void {
   if (!config) return;
+  if (
+    level === 'debug' &&
+    !(options?.force ?? false) &&
+    process.env.AGENT_DEBUG_LOGGING !== 'true'
+  )
+    return;
   void safeDispatchCustomEvent(
     GraphEvents.ON_AGENT_LOG,
     { level, scope, message, data, ...meta } satisfies AgentLogEvent,
