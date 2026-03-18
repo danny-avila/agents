@@ -59,11 +59,10 @@ const modifyContent = ({
     allowedTypesByProvider[provider] ?? allowedTypesByProvider.default;
   return content.map((item) => {
     if (
-      item &&
       typeof item === 'object' &&
+      item !== null &&
       'type' in item &&
-      item.type != null &&
-      item.type
+      typeof item.type === 'string'
     ) {
       let newType = item.type;
       if (newType.endsWith('_delta')) {
@@ -357,23 +356,21 @@ export function formatAnthropicArtifactContent(messages: BaseMessage[]): void {
   const latestAIParentIndex = findLastIndex(
     messages,
     (msg) =>
-      (msg instanceof AIMessageChunk &&
-        (msg.tool_calls?.length ?? 0) > 0 &&
-        msg.tool_calls?.some((tc) => tc.id === lastMessage.tool_call_id)) ??
-      false
+      msg instanceof AIMessageChunk &&
+      (msg.tool_calls?.length ?? 0) > 0 &&
+      (msg.tool_calls?.some((tc) => tc.id === lastMessage.tool_call_id) ??
+        false)
   );
 
   if (latestAIParentIndex === -1) return;
 
   // Check if any tool message after the AI message has array artifact content
-  const hasArtifactContent = messages.some(
-    (msg, i) =>
-      i > latestAIParentIndex &&
-      msg instanceof ToolMessage &&
-      msg.artifact != null &&
-      msg.artifact?.content != null &&
-      Array.isArray(msg.artifact.content)
-  );
+  const hasArtifactContent = messages.some((msg, i) => {
+    if (i <= latestAIParentIndex || !(msg instanceof ToolMessage)) return false;
+    const artifact = (msg as ToolMessage & { artifact?: t.MCPArtifact })
+      .artifact;
+    return artifact != null && Array.isArray(artifact.content);
+  });
 
   if (!hasArtifactContent) return;
 
@@ -383,78 +380,93 @@ export function formatAnthropicArtifactContent(messages: BaseMessage[]): void {
   for (let j = latestAIParentIndex + 1; j < messages.length; j++) {
     const msg = messages[j];
     if (
-      msg instanceof ToolMessage &&
-      toolCallIds.includes(msg.tool_call_id) &&
-      msg.artifact != null &&
-      Array.isArray(msg.artifact?.content) &&
-      Array.isArray(msg.content)
+      !(msg instanceof ToolMessage) ||
+      !toolCallIds.includes(msg.tool_call_id)
     ) {
-      msg.content = msg.content.concat(msg.artifact.content);
+      continue;
     }
+
+    const toolMsg = msg as ToolMessage & { artifact?: t.MCPArtifact };
+    const artifact = toolMsg.artifact;
+    if (
+      artifact == null ||
+      !Array.isArray(artifact.content) ||
+      !Array.isArray(msg.content)
+    ) {
+      continue;
+    }
+
+    msg.content = msg.content.concat(artifact.content);
   }
 }
 
+/**
+ * Formats tool artifacts by adding them directly to ToolMessage content.
+ *
+ * Similar to Anthropic's approach, artifacts are appended to ToolMessage.content
+ * as an array. This maintains proper role sequencing without requiring empty
+ * AIMessage or separate HumanMessage, which some strict APIs (e.g., Scaleway)
+ * do not accept.
+ *
+ * Note: Base64 image filtering is already done in ToolNode based on vision capability.
+ *
+ * @param messages - Array of messages containing ToolMessages with artifacts
+ */
 export function formatArtifactPayload(messages: BaseMessage[]): void {
-  const lastMessageY = messages[messages.length - 1];
-  if (!(lastMessageY instanceof ToolMessage)) return;
-
-  // Find the latest AIMessage with tool_calls that this tool message belongs to
-  const latestAIParentIndex = findLastIndex(
-    messages,
-    (msg) =>
-      (msg instanceof AIMessageChunk &&
-        (msg.tool_calls?.length ?? 0) > 0 &&
-        msg.tool_calls?.some((tc) => tc.id === lastMessageY.tool_call_id)) ??
-      false
-  );
-
-  if (latestAIParentIndex === -1) return;
-
-  // Check if any tool message after the AI message has array artifact content
-  const hasArtifactContent = messages.some(
-    (msg, i) =>
-      i > latestAIParentIndex &&
-      msg instanceof ToolMessage &&
-      msg.artifact != null &&
-      msg.artifact?.content != null &&
-      Array.isArray(msg.artifact.content)
-  );
-
-  if (!hasArtifactContent) return;
-
-  // Collect all relevant tool messages and their artifacts
-  const relevantMessages = messages
-    .slice(latestAIParentIndex + 1)
-    .filter((msg) => msg instanceof ToolMessage) as ToolMessage[];
-
-  // Aggregate all content and artifacts
-  const aggregatedContent: t.MessageContentComplex[] = [];
-
-  relevantMessages.forEach((msg) => {
-    if (!Array.isArray(msg.artifact?.content)) {
-      return;
+  // Restore artifacts from additional_kwargs (where ToolNode stores them)
+  // This is necessary because coerceMessageLikeToMessage preserves additional_kwargs but not artifact property
+  for (const msg of messages) {
+    if (msg._getType() === 'tool') {
+      const toolMsg = msg as ToolMessage & { artifact?: t.MCPArtifact };
+      const additionalKwargsArtifact = toolMsg.additional_kwargs.artifact as
+        | t.MCPArtifact
+        | undefined;
+      if (additionalKwargsArtifact != null) {
+        toolMsg.artifact = additionalKwargsArtifact;
+      }
     }
-    let currentContent = msg.content;
-    if (!Array.isArray(currentContent)) {
-      currentContent = [
-        {
-          type: 'text',
-          text: msg.content,
-        },
-      ];
-    }
-    aggregatedContent.push(...currentContent);
-    msg.content =
-      'Tool response is included in the next message as a Human message';
-    aggregatedContent.push(...msg.artifact.content);
-  });
+  }
 
-  // Add single HumanMessage with all aggregated content
-  if (aggregatedContent.length > 0) {
-    messages.push(new HumanMessage({ content: aggregatedContent }));
+  // Find all ToolMessages with artifacts
+  // Use _getType() instead of instanceof to handle messages that may have been coerced
+  const toolMessagesWithArtifacts = messages
+    .filter((msg) => msg._getType() === 'tool')
+    .map((msg) => msg as ToolMessage & { artifact?: t.MCPArtifact })
+    .filter((toolMsg) => {
+      const artifact = toolMsg.artifact;
+      return artifact != null && Array.isArray(artifact.content);
+    });
+
+  if (toolMessagesWithArtifacts.length === 0) {
+    return;
+  }
+
+  // Add artifacts directly to ToolMessage content (similar to Anthropic approach)
+  // This maintains proper role sequencing without requiring empty AIMessage or separate HumanMessage
+  for (const toolMsg of toolMessagesWithArtifacts) {
+    const artifact = toolMsg.artifact!;
+
+    // Convert ToolMessage content to array format if needed
+    const currentContent: t.MessageContentComplex[] = Array.isArray(
+      toolMsg.content
+    )
+      ? toolMsg.content
+      : [{ type: 'text', text: String(toolMsg.content) }];
+
+    // Append artifacts directly to ToolMessage content
+    // Artifacts are already filtered by ToolNode based on vision capability
+    toolMsg.content = [...currentContent, ...artifact.content];
   }
 }
 
+/**
+ * Finds the last index in an array that satisfies the predicate.
+ * Iterates backwards from the end of the array.
+ *
+ * @param array - Array to search
+ * @param predicate - Function to test each element
+ * @returns Index of the last matching element, or -1 if not found
+ */
 export function findLastIndex<T>(
   array: T[],
   predicate: (value: T) => boolean

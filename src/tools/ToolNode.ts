@@ -118,16 +118,72 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   }
 
   /**
+   * Processes MCP artifact: normalizes MCP image format (type: 'image' with data:) to
+   * image_url format. Artifact is the second element of [content, artifact].
+   * Image parts are not filtered here; the LLM layer strips them when !visionCapable.
+   */
+  private processArtifact(artifact: unknown): t.MCPArtifact | undefined {
+    if (
+      artifact === null ||
+      artifact === undefined ||
+      typeof artifact !== 'object' ||
+      !('content' in artifact) ||
+      !Array.isArray(artifact.content)
+    ) {
+      return undefined;
+    }
+
+    const artifactObj = artifact as t.MCPArtifact;
+
+    // Convert MCP format (type: 'image' with data:) to image_url format
+    artifactObj.content = artifactObj.content.map((item) => {
+      if (
+        typeof item === 'object' &&
+        item !== null &&
+        'type' in item &&
+        item.type === 'image' &&
+        'data' in item
+      ) {
+        const mimeType = item.mimeType ?? 'image/png';
+        const dataUrl =
+          typeof item.data === 'string' && item.data.startsWith('http')
+            ? item.data
+            : `data:${mimeType};base64,${item.data}`;
+        return {
+          type: 'image_url' as const,
+          image_url: { url: dataUrl },
+        };
+      }
+      return item;
+    });
+
+    return artifactObj;
+  }
+
+  /**
    * Runs a single tool call with error handling
    */
   protected async runTool(
     call: ToolCall,
     config: RunnableConfig
   ): Promise<BaseMessage | Command> {
-    const tool = this.toolMap.get(call.name);
+    let tool = this.toolMap.get(call.name);
+
+    // If tool not found and loadRuntimeTools is available, try loading it
+    if (tool === undefined && this.loadRuntimeTools) {
+      const { tools, toolMap } = this.loadRuntimeTools([call]);
+      this.toolMap = toolMap ?? new Map(tools.map((t) => [t.name, t]));
+      this.programmaticCache = undefined; // Invalidate cache on toolMap change
+      tool = this.toolMap.get(call.name);
+    }
+
     try {
       if (tool === undefined) {
-        throw new Error(`Tool "${call.name}" not found.`);
+        const availableTools = Array.from(this.toolMap.keys()).join(', ');
+        throw new Error(
+          `Tool "${call.name}" not found. Available tools: ${availableTools || 'none'}. ` +
+            'If this is a runtime tool, ensure loadRuntimeTools is properly configured.'
+        );
       }
       const turn = this.toolUsageCount.get(call.name) ?? 0;
       this.toolUsageCount.set(call.name, turn + 1);
@@ -194,20 +250,56 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         }
       }
 
+      // Invoke tool (standard path for all tools)
       const output = await tool.invoke(invokeParams, config);
+
+      // Handle MCP tuple [content, artifact]
       if (
-        (isBaseMessage(output) && output._getType() === 'tool') ||
-        isCommand(output)
+        Array.isArray(output) &&
+        output.length === 2 &&
+        output[1] !== null &&
+        output[1] !== undefined
       ) {
-        return output;
-      } else {
-        return new ToolMessage({
+        const [content, artifact] = output;
+        const processedArtifact = this.processArtifact(artifact);
+
+        const toolMessage = new ToolMessage({
           status: 'success',
           name: tool.name,
-          content: typeof output === 'string' ? output : JSON.stringify(output),
+          content:
+            typeof content === 'string' ? content : JSON.stringify(content),
           tool_call_id: call.id!,
+          additional_kwargs: processedArtifact
+            ? { artifact: processedArtifact }
+            : {},
         });
+        return toolMessage;
       }
+
+      // Handle ToolMessage output (from tools with responseFormat: 'content_and_artifact')
+      if (isBaseMessage(output) && output._getType() === 'tool') {
+        const toolMessage = output as ToolMessage;
+
+        // If ToolMessage already has artifact, ensure it's in additional_kwargs for formatArtifactPayload
+        if (toolMessage.artifact && !toolMessage.additional_kwargs.artifact) {
+          toolMessage.additional_kwargs.artifact = toolMessage.artifact;
+        }
+
+        return toolMessage;
+      }
+
+      // Handle Command output
+      if (isCommand(output)) {
+        return output;
+      }
+
+      // Default: create ToolMessage without artifact
+      return new ToolMessage({
+        status: 'success',
+        name: tool.name,
+        content: typeof output === 'string' ? output : JSON.stringify(output),
+        tool_call_id: call.id!,
+      });
     } catch (_e: unknown) {
       const e = _e as Error;
       if (!this.handleToolErrors) {

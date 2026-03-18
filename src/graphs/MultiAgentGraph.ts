@@ -13,8 +13,8 @@ import {
   StateGraph,
   Annotation,
   getCurrentTaskInput,
-  messagesStateReducer,
 } from '@langchain/langgraph';
+import { messagesStateReducer } from '@/messages/reducer';
 import type { LangGraphRunnableConfig } from '@langchain/langgraph';
 import type { BaseMessage, AIMessageChunk } from '@langchain/core/messages';
 import type { ToolRunnableConfig } from '@langchain/core/tools';
@@ -821,7 +821,9 @@ export class MultiAgentGraph extends StandardGraph {
             }
           }
 
-          /** Update token map if we have a token counter */
+          /**
+           * Update token map if we have a token counter
+           */
           if (agentContext?.tokenCounter && hasInstructions) {
             const freshTokenMap: Record<string, number> = {};
             for (
