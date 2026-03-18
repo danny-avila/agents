@@ -30,7 +30,21 @@ maxContextTokens (e.g. 8000)
   = effectiveMaxTokens (available for conversation messages)
 ```
 
-`contextPressure = totalMessageTokens / pruningBudget`
+`contextPressure = calibratedTotalTokens / pruningBudget`
+
+### Calibration
+
+Token counts from the local tokenizer (tiktoken) diverge from what providers actually count. The pruner maintains a **cumulative calibration ratio**:
+
+```
+calibrationRatio = cumulativeProviderReported / cumulativeRawSent
+```
+
+Updated each turn from `usageMetadata.input_tokens` returned by the provider. The ratio is persisted across runs via `contextMeta.calibrationRatio` so subsequent conversations start calibrated.
+
+All budget comparisons multiply raw counts by `calibrationRatio` to approximate provider space, while the `indexTokenCountMap` stays in raw-token space for stability.
+
+**Instruction overhead calibration**: The pruner also tracks `bestInstructionOverhead` — the best observed instruction token count from provider feedback. When the variance between the estimated and calibrated `toolSchemaTokens` exceeds 15% (`CALIBRATION_VARIANCE_THRESHOLD`), the calibrated value is applied to `AgentContext.toolSchemaTokens`. This corrects the local tool-schema estimate (which uses a static multiplier) against real provider behavior. After intra-run summarization, the calibrated overhead is preserved and seeded into the recreated pruner.
 
 ---
 
@@ -46,10 +60,7 @@ maxContextTokens (e.g. 8000)
 
 4. **Pruning split**: `getMessagesWithinTokenLimit` determines which messages fit (`context`) and which overflow (`messagesToRefine`). Messages are kept newest-first.
 
-5. **Summarization trigger**: If `messagesToRefine` is non-empty:
-   - `shouldSkipSummarization` only blocks when the message count hasn't changed since the last summary (prevents re-summarizing identical content).
-   - No per-run cap on summarization count.
-   - If triggered: **full compaction** fires.
+5. **Summarization trigger**: If `messagesToRefine` is non-empty, `shouldTriggerSummarization` evaluates the configured trigger (or defaults to "any pruned messages"). `shouldSkipSummarization` only blocks when the message count hasn't changed since the last summary (prevents re-summarizing identical content). If triggered: **full compaction** fires.
 
 ### Full Compaction
 
@@ -185,12 +196,12 @@ Masking uses `truncateToolResultContent` with a ~300 char limit, producing head+
 
 ### Trigger types (`trigger` field)
 
-| Type                 | Value     | Behavior                                                    |
-| -------------------- | --------- | ----------------------------------------------------------- |
-| `token_ratio`        | `0.0-1.0` | Fire when `prePruneTotalTokens / maxContextTokens >= value` |
-| `remaining_tokens`   | `number`  | Fire when `remainingContextTokens <= value`                 |
-| `messages_to_refine` | `number`  | Fire when `messagesToRefine.length >= value`                |
-| _(not set)_          | —         | Fire whenever pruning drops any messages (default)          |
+| Type                 | Value     | Behavior                                                                    |
+| -------------------- | --------- | --------------------------------------------------------------------------- |
+| `token_ratio`        | `0.0-1.0` | Fire when `1 - effectiveRemainingContextTokens / maxContextTokens >= value` |
+| `remaining_tokens`   | `number`  | Fire when `effectiveRemainingContextTokens <= value`                        |
+| `messages_to_refine` | `number`  | Fire when `messagesToRefine.length >= value`                                |
+| _(not set)_          | —         | Fire whenever pruning drops any messages (default)                          |
 
 ### `contextPruning` sub-config (summarization-disabled path only)
 
