@@ -378,7 +378,7 @@ describe('shouldTriggerSummarization', () => {
         shouldTriggerSummarization({
           trigger: { type: 'token_ratio', value: 0.8 },
           maxContextTokens: 1000,
-          prePruneTotalTokens: 900, // 90% used
+          prePruneContextTokens: 900, // 90% used
           messagesToRefineCount: 5,
         })
       ).toBe(true);
@@ -389,7 +389,7 @@ describe('shouldTriggerSummarization', () => {
         shouldTriggerSummarization({
           trigger: { type: 'token_ratio', value: 0.8 },
           maxContextTokens: 1000,
-          prePruneTotalTokens: 500, // 50% used
+          prePruneContextTokens: 500, // 50% used
           messagesToRefineCount: 5,
         })
       ).toBe(false);
@@ -400,7 +400,7 @@ describe('shouldTriggerSummarization', () => {
         shouldTriggerSummarization({
           trigger: { type: 'token_ratio', value: 0.8 },
           maxContextTokens: 1000,
-          prePruneTotalTokens: 800, // exactly 80%
+          prePruneContextTokens: 800, // exactly 80%
           messagesToRefineCount: 5,
         })
       ).toBe(true);
@@ -410,13 +410,13 @@ describe('shouldTriggerSummarization', () => {
       expect(
         shouldTriggerSummarization({
           trigger: { type: 'token_ratio', value: 0.8 },
-          prePruneTotalTokens: 900,
+          prePruneContextTokens: 900,
           messagesToRefineCount: 5,
         })
       ).toBe(false);
     });
 
-    it('falls back to remainingContextTokens when prePruneTotalTokens is missing', () => {
+    it('falls back to remainingContextTokens when prePruneContextTokens is missing', () => {
       expect(
         shouldTriggerSummarization({
           trigger: { type: 'token_ratio', value: 0.8 },
@@ -434,7 +434,7 @@ describe('shouldTriggerSummarization', () => {
         shouldTriggerSummarization({
           trigger: { type: 'remaining_tokens', value: 200 },
           maxContextTokens: 1000,
-          prePruneTotalTokens: 850, // remaining = 150
+          prePruneContextTokens: 850, // remaining = 150
           messagesToRefineCount: 3,
         })
       ).toBe(true);
@@ -445,7 +445,7 @@ describe('shouldTriggerSummarization', () => {
         shouldTriggerSummarization({
           trigger: { type: 'remaining_tokens', value: 200 },
           maxContextTokens: 1000,
-          prePruneTotalTokens: 500, // remaining = 500
+          prePruneContextTokens: 500, // remaining = 500
           messagesToRefineCount: 3,
         })
       ).toBe(false);
@@ -505,7 +505,7 @@ describe('shouldTriggerSummarization', () => {
         shouldTriggerSummarization({
           trigger: { type: 'token_ratio', value: NaN },
           maxContextTokens: 1000,
-          prePruneTotalTokens: 900,
+          prePruneContextTokens: 900,
           messagesToRefineCount: 5,
         })
       ).toBe(false);
@@ -765,6 +765,61 @@ describe('emergency truncation when pruning produces empty context', () => {
     const totalReturned =
       result.context.length + (result.messagesToRefine?.length ?? 0);
     expect(totalReturned).toBeGreaterThan(0);
+  });
+
+  it('recovers via emergency truncation after fallback fading when summarizationEnabled=true', () => {
+    const bigToolMsg = new ToolMessage({
+      content: 'y'.repeat(20_000),
+      tool_call_id: 'tc1',
+      name: 'huge_result',
+    });
+    const aiMsg = new AIMessage({
+      content: [
+        { type: 'text' as const, text: 'Running.' },
+        {
+          type: 'tool_use' as const,
+          id: 'tc1',
+          name: 'huge_result',
+          input: '{}',
+        },
+      ],
+      tool_calls: [{ id: 'tc1', name: 'huge_result', args: {} }],
+    });
+    const messages: BaseMessage[] = [
+      new HumanMessage('Do it'),
+      aiMsg,
+      bigToolMsg,
+      new AIMessage('Complete.'),
+      new HumanMessage('Status?'),
+    ];
+
+    const indexTokenCountMap: Record<string, number | undefined> = {};
+    for (let i = 0; i < messages.length; i++) {
+      indexTokenCountMap[i] = tokenCounter(messages[i]);
+    }
+
+    const pruneMessages = createPruneMessages({
+      provider: Providers.OPENAI,
+      maxTokens: 100,
+      startIndex: messages.length,
+      tokenCounter,
+      indexTokenCountMap,
+      summarizationEnabled: true,
+    });
+
+    const result = pruneMessages({ messages });
+
+    const totalReturned =
+      result.context.length + (result.messagesToRefine?.length ?? 0);
+    expect(totalReturned).toBeGreaterThan(0);
+
+    if (result.context.length > 0) {
+      const toolMsgs = result.context.filter((m) => m.getType() === 'tool');
+      for (const tm of toolMsgs) {
+        const content = typeof tm.content === 'string' ? tm.content : '';
+        expect(content.length).toBeLessThan(20_000);
+      }
+    }
   });
 });
 
