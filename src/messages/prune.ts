@@ -1161,7 +1161,7 @@ export function preFlightTruncateToolCallInputs(params: {
       }
       return {
         ...tc,
-        args: truncateToolInput(tc.args, maxInputChars),
+        args: truncateToolInput(serializedArgs, maxInputChars),
       };
     });
 
@@ -1222,7 +1222,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     context: BaseMessage[];
     indexTokenCountMap: Record<string, number | undefined>;
     messagesToRefine?: BaseMessage[];
-    prePruneTotalTokens?: number;
+    prePruneContextTokens?: number;
     remainingContextTokens?: number;
     contextPressure?: number;
     originalToolContent?: Map<number, string>;
@@ -1234,7 +1234,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         context: [],
         indexTokenCountMap,
         messagesToRefine: [],
-        prePruneTotalTokens: 0,
+        prePruneContextTokens: 0,
         remainingContextTokens: factoryParams.maxTokens,
         calibrationRatio,
         resolvedInstructionOverhead: bestInstructionOverhead,
@@ -1478,7 +1478,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         context: [],
         indexTokenCountMap,
         messagesToRefine: [...params.messages],
-        prePruneTotalTokens: calibratedTotalTokens,
+        prePruneContextTokens: calibratedTotalTokens,
         remainingContextTokens: 0,
         contextPressure:
           pruningBudget > 0 ? calibratedTotalTokens / pruningBudget : 0,
@@ -1696,7 +1696,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         context: params.messages,
         indexTokenCountMap,
         messagesToRefine: [],
-        prePruneTotalTokens: calibratedTotalTokens,
+        prePruneContextTokens: calibratedTotalTokens,
         remainingContextTokens:
           pruningBudget - calibratedTotalTokens - currentInstructionTokens,
         contextPressure,
@@ -1971,7 +1971,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
                   if (serialized.length > emergencyMaxChars) {
                     return {
                       ...record,
-                      input: truncateToolInput(record.input, emergencyMaxChars),
+                      input: truncateToolInput(serialized, emergencyMaxChars),
                     };
                   }
                 }
@@ -1982,7 +1982,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
                 if (serializedArgs.length > emergencyMaxChars) {
                   return {
                     ...tc,
-                    args: truncateToolInput(tc.args, emergencyMaxChars),
+                    args: truncateToolInput(serializedArgs, emergencyMaxChars),
                   };
                 }
                 return tc;
@@ -2073,7 +2073,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       context,
       indexTokenCountMap,
       messagesToRefine,
-      prePruneTotalTokens: calibratedTotalTokens,
+      prePruneContextTokens: calibratedTotalTokens,
       remainingContextTokens,
       contextPressure,
       originalToolContent:

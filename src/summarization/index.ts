@@ -15,14 +15,14 @@ import type { SummarizationTrigger } from '@/types';
 export function shouldTriggerSummarization(params: {
   trigger?: SummarizationTrigger;
   maxContextTokens?: number;
-  prePruneTotalTokens?: number;
+  prePruneContextTokens?: number;
   remainingContextTokens?: number;
   messagesToRefineCount: number;
 }): boolean {
   const {
     trigger,
     maxContextTokens,
-    prePruneTotalTokens,
+    prePruneContextTokens,
     remainingContextTokens,
     messagesToRefineCount,
   } = params;
@@ -50,9 +50,9 @@ export function shouldTriggerSummarization(params: {
       maxContextTokens != null &&
       Number.isFinite(maxContextTokens) &&
       maxContextTokens > 0 &&
-      prePruneTotalTokens != null &&
-      Number.isFinite(prePruneTotalTokens)
-        ? maxContextTokens - prePruneTotalTokens
+      prePruneContextTokens != null &&
+      Number.isFinite(prePruneContextTokens)
+        ? maxContextTokens - prePruneContextTokens
         : undefined;
     const effectiveRemainingContextTokens =
       prePruneRemainingContextTokens ?? remainingContextTokens;
@@ -76,9 +76,9 @@ export function shouldTriggerSummarization(params: {
       maxContextTokens != null &&
       Number.isFinite(maxContextTokens) &&
       maxContextTokens > 0 &&
-      prePruneTotalTokens != null &&
-      Number.isFinite(prePruneTotalTokens)
-        ? maxContextTokens - prePruneTotalTokens
+      prePruneContextTokens != null &&
+      Number.isFinite(prePruneContextTokens)
+        ? maxContextTokens - prePruneContextTokens
         : undefined;
     const effectiveRemainingContextTokens =
       prePruneRemainingContextTokens ?? remainingContextTokens;

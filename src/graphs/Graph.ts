@@ -644,7 +644,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           context,
           indexTokenCountMap,
           messagesToRefine,
-          prePruneTotalTokens,
+          prePruneContextTokens,
           remainingContextTokens,
           originalToolContent,
           calibrationRatio,
@@ -692,9 +692,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             shouldTriggerSummarization({
               trigger: agentContext.summarizationConfig?.trigger,
               maxContextTokens: agentContext.maxContextTokens,
-              prePruneTotalTokens:
-                prePruneTotalTokens != null
-                  ? prePruneTotalTokens + agentContext.instructionTokens
+              prePruneContextTokens:
+                prePruneContextTokens != null
+                  ? prePruneContextTokens + agentContext.instructionTokens
                   : undefined,
               remainingContextTokens,
               messagesToRefineCount: messagesToRefine.length,
@@ -826,6 +826,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         );
       }
 
+      // Intentionally broad: runs when the pruner wasn't used OR any post-pruning
+      // transform (addCacheControl, ensureThinkingBlock, etc.) reassigned finalMessages.
+      // sanitizeOrphanToolBlocks fast-paths to a Set diff check when no orphans exist,
+      // so the cost is negligible and this acts as a safety net for Anthropic/Bedrock.
       const needsOrphanSanitize =
         (agentContext.provider === Providers.ANTHROPIC ||
           agentContext.provider === Providers.BEDROCK) &&

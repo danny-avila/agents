@@ -1393,7 +1393,7 @@ describe('Prune Messages Tests', () => {
 
       expect(result.context).toEqual([]);
       expect(result.messagesToRefine).toEqual([]);
-      expect(result.prePruneTotalTokens).toBe(0);
+      expect(result.prePruneContextTokens).toBe(0);
       expect(result.remainingContextTokens).toBe(8000);
     });
   });

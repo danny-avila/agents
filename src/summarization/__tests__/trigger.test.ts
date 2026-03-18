@@ -5,7 +5,7 @@ describe('shouldTriggerSummarization', () => {
     const result = shouldTriggerSummarization({
       trigger: { type: 'token_ratio', value: 0.8 },
       maxContextTokens: 2500,
-      prePruneTotalTokens: 3200,
+      prePruneContextTokens: 3200,
       remainingContextTokens: 1200,
       messagesToRefineCount: 4,
     });
@@ -17,7 +17,7 @@ describe('shouldTriggerSummarization', () => {
     const result = shouldTriggerSummarization({
       trigger: { type: 'remaining_tokens', value: 500 },
       maxContextTokens: 2500,
-      prePruneTotalTokens: 2300,
+      prePruneContextTokens: 2300,
       remainingContextTokens: 1400,
       messagesToRefineCount: 2,
     });
@@ -40,7 +40,7 @@ describe('shouldTriggerSummarization', () => {
     const result = shouldTriggerSummarization({
       trigger: { type: 'token_ratio', value: 0.1 },
       maxContextTokens: 2500,
-      prePruneTotalTokens: 2400,
+      prePruneContextTokens: 2400,
       remainingContextTokens: 100,
       messagesToRefineCount: 0,
     });
