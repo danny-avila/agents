@@ -705,7 +705,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             if (originalToolContent != null && originalToolContent.size > 0) {
               allMessages = [...messages];
               for (const [idx, content] of originalToolContent) {
-                const msg = allMessages[idx];
+                const msg = allMessages[idx] as ToolMessage | undefined;
                 if (msg != null && msg instanceof ToolMessage) {
                   allMessages[idx] = new ToolMessage({
                     content,
