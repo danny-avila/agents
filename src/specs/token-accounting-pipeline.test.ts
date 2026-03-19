@@ -667,7 +667,7 @@ describe('Token accounting pipeline — end-to-end multi-turn with calibration',
 
     // Verify variance logs were emitted
     const varianceLogs = logs.filter(
-      (l) => l.message === 'Token estimate variance'
+      (l) => l.message === 'Calibration observed'
     );
     expect(varianceLogs.length).toBeGreaterThanOrEqual(4);
   });
