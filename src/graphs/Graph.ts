@@ -1156,13 +1156,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     const toolNode = `${TOOLS}${agentId}` as const;
     const summarizeNode = `${SUMMARIZE}${agentId}` as const;
 
-    type AgentSubgraphState = {
-      messages: BaseMessage[];
-      summarizationRequest?: t.SummarizationNodeInput;
-    };
-
     const routeMessage = (
-      state: AgentSubgraphState,
+      state: t.AgentSubgraphState,
       config?: RunnableConfig
     ): string => {
       this.config = config;
@@ -1272,8 +1267,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       .addEdge(summarizeNode, agentNode)
       .addEdge(toolNode, agentContext.toolEnd ? END : agentNode);
 
-    // LangGraph compile() types are overly strict for opt-in options
-    return workflow.compile(this.compileOptions as unknown as never);
+    return workflow.compile();
   }
 
   createWorkflow(): t.CompiledStateWorkflow {
