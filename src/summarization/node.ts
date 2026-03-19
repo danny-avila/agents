@@ -347,10 +347,18 @@ async function executeSummarizationWithFallback(params: {
   clientConfig: SummarizationClientConfig;
   summarizeConfig?: RunnableConfig;
   stepId: string;
+  usePromptCache: boolean;
   log: LogFn;
 }): Promise<{ text: string; usage?: Partial<UsageMetadata> }> {
-  const { agentContext, messages, clientConfig, summarizeConfig, stepId, log } =
-    params;
+  const {
+    agentContext,
+    messages,
+    clientConfig,
+    summarizeConfig,
+    stepId,
+    usePromptCache,
+    log,
+  } = params;
 
   const summarizationModel = initializeModel({
     provider: clientConfig.provider as Providers,
@@ -358,12 +366,6 @@ async function executeSummarizationWithFallback(params: {
     tools: agentContext.getToolsForBinding(),
   }) as t.ChatModel;
 
-  const isSelfSummarizeModel =
-    clientConfig.provider === (agentContext.provider as string);
-  const hasPromptCache =
-    isSelfSummarizeModel &&
-    (agentContext.clientOptions as Record<string, unknown> | undefined)
-      ?.promptCache === true;
   const priorSummaryText = agentContext.getSummaryText()?.trim() ?? '';
 
   let summaryText = '';
@@ -380,7 +382,7 @@ async function executeSummarizationWithFallback(params: {
       stepId,
       provider: clientConfig.provider as Providers,
       reasoningKey: agentContext.reasoningKey,
-      usePromptCache: isSelfSummarizeModel && hasPromptCache,
+      usePromptCache,
       log,
     });
     summaryText = result.text;
@@ -657,6 +659,7 @@ export function createSummarizeNode({
         clientConfig,
         summarizeConfig,
         stepId,
+        usePromptCache: isSelfSummarizeModel && hasPromptCache,
         log,
       });
 

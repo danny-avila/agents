@@ -166,14 +166,8 @@ export type CompiledMultiAgentWorkflow = CompiledStateGraph<
 >;
 
 export type CompiledAgentWorfklow = CompiledStateGraph<
-  {
-    messages: BaseMessage[];
-    summarizationRequest?: SummarizationNodeInput;
-  },
-  {
-    messages?: BaseMessage[] | undefined;
-    summarizationRequest?: SummarizationNodeInput | undefined;
-  },
+  AgentSubgraphState,
+  Partial<AgentSubgraphState>,
   '__start__' | `agent=${string}` | `tools=${string}` | `summarize=${string}`,
   {
     messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
