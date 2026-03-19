@@ -219,6 +219,295 @@ function enrichSummary(summaryText: string, messages: BaseMessage[]): string {
   return summaryText + extractToolFailuresSection(messages);
 }
 
+// ---------------------------------------------------------------------------
+// Extracted helpers for createSummarizeNode
+// ---------------------------------------------------------------------------
+
+interface SummarizationClientConfig {
+  provider: string;
+  modelName?: string;
+  clientOptions: Record<string, unknown>;
+  effectiveMaxSummaryTokens?: number;
+  promptText: string;
+  updatePromptText: string;
+}
+
+/** Assembles the summarization model's client options from agent and config. */
+function buildSummarizationClientConfig(
+  agentContext: AgentContext,
+  summarizationConfig?: t.SummarizationConfig
+): SummarizationClientConfig {
+  const provider = (summarizationConfig?.provider ??
+    agentContext.provider) as string;
+  const modelName = summarizationConfig?.model;
+  const parameters = summarizationConfig?.parameters ?? {};
+  const promptText =
+    summarizationConfig?.prompt ?? DEFAULT_SUMMARIZATION_PROMPT;
+  const updatePromptText =
+    summarizationConfig?.updatePrompt ?? DEFAULT_UPDATE_SUMMARIZATION_PROMPT;
+
+  const { llmParams, maxSummaryTokens: paramMaxSummaryTokens } =
+    separateParameters(parameters);
+
+  const isSelfSummarize = provider === (agentContext.provider as string);
+  const baseOptions =
+    isSelfSummarize && agentContext.clientOptions
+      ? { ...agentContext.clientOptions }
+      : {};
+
+  const clientOptions: Record<string, unknown> = {
+    ...baseOptions,
+    ...llmParams,
+  };
+
+  if (modelName != null && modelName !== '') {
+    clientOptions.model = modelName;
+    clientOptions.modelName = modelName;
+  }
+
+  const effectiveMaxSummaryTokens =
+    paramMaxSummaryTokens ?? summarizationConfig?.maxSummaryTokens;
+
+  if (effectiveMaxSummaryTokens != null) {
+    clientOptions[getMaxOutputTokensKey(provider)] = effectiveMaxSummaryTokens;
+  }
+
+  return {
+    provider,
+    modelName,
+    clientOptions,
+    effectiveMaxSummaryTokens,
+    promptText,
+    updatePromptText,
+  };
+}
+
+/** Computes the token count for a summary, preferring provider output tokens when available. */
+function computeSummaryTokenCount(
+  summaryText: string,
+  summaryUsage: Partial<UsageMetadata> | undefined,
+  tokenCounter?: (message: BaseMessage) => number
+): number {
+  const providerOutputTokens = Number(summaryUsage?.output_tokens) || 0;
+  if (providerOutputTokens > 0) {
+    return providerOutputTokens + SUMMARY_WRAPPER_OVERHEAD_TOKENS;
+  }
+  if (tokenCounter) {
+    return (
+      tokenCounter(new SystemMessage(summaryText)) +
+      SUMMARY_WRAPPER_OVERHEAD_TOKENS
+    );
+  }
+  return 0;
+}
+
+/** Constructs the SummaryContentBlock persisted in the run step and dispatched to events. */
+function buildSummaryBlock(params: {
+  summaryText: string;
+  tokenCount: number;
+  stepId: string;
+  stepIndex: number;
+  modelName?: string;
+  provider: string;
+  summaryVersion: number;
+}): t.SummaryContentBlock {
+  return {
+    type: ContentTypes.SUMMARY,
+    content: [
+      {
+        type: ContentTypes.TEXT,
+        text: params.summaryText,
+      } as t.MessageContentComplex,
+    ],
+    tokenCount: params.tokenCount,
+    summaryVersion: params.summaryVersion,
+    boundary: {
+      messageId: params.stepId,
+      contentIndex: params.stepIndex,
+    },
+    model: params.modelName,
+    provider: params.provider,
+    createdAt: new Date().toISOString(),
+  };
+}
+
+type LogFn = (
+  level: 'debug' | 'info' | 'warn' | 'error',
+  message: string,
+  data?: Record<string, unknown>
+) => void;
+
+/**
+ * Runs the summarization LLM call with primary + fallback providers,
+ * falling back to a metadata stub when all calls fail.
+ */
+async function executeSummarizationWithFallback(params: {
+  agentContext: AgentContext;
+  messages: BaseMessage[];
+  clientConfig: SummarizationClientConfig;
+  summarizeConfig?: RunnableConfig;
+  stepId: string;
+  log: LogFn;
+}): Promise<{ text: string; usage?: Partial<UsageMetadata> }> {
+  const { agentContext, messages, clientConfig, summarizeConfig, stepId, log } =
+    params;
+
+  const summarizationModel = initializeModel({
+    provider: clientConfig.provider as Providers,
+    clientOptions: clientConfig.clientOptions as t.ClientOptions,
+    tools: agentContext.getToolsForBinding(),
+  }) as t.ChatModel;
+
+  const isSelfSummarizeModel =
+    clientConfig.provider === (agentContext.provider as string);
+  const hasPromptCache =
+    isSelfSummarizeModel &&
+    (agentContext.clientOptions as Record<string, unknown> | undefined)
+      ?.promptCache === true;
+  const priorSummaryText = agentContext.getSummaryText()?.trim() ?? '';
+
+  let summaryText = '';
+  let summaryUsage: Partial<UsageMetadata> | undefined;
+
+  try {
+    const result = await summarizeWithCacheHit({
+      model: summarizationModel,
+      messages,
+      promptText: clientConfig.promptText,
+      updatePromptText: clientConfig.updatePromptText,
+      priorSummaryText,
+      config: summarizeConfig,
+      stepId,
+      provider: clientConfig.provider as Providers,
+      reasoningKey: agentContext.reasoningKey,
+      usePromptCache: isSelfSummarizeModel && hasPromptCache,
+      log,
+    });
+    summaryText = result.text;
+    summaryUsage = result.usage;
+  } catch (primaryError) {
+    log('error', 'Summarization LLM call failed', {
+      error:
+        primaryError instanceof Error
+          ? primaryError.message
+          : String(primaryError),
+      provider: clientConfig.provider,
+      model: clientConfig.modelName,
+      messagesToRefineCount: messages.length,
+    });
+
+    const fallbacks =
+      (clientConfig.clientOptions as unknown as t.LLMConfig | undefined)
+        ?.fallbacks ?? [];
+    if (fallbacks.length > 0) {
+      try {
+        const onChunk = createSummarizationChunkHandler({
+          stepId,
+          config: traceConfig(summarizeConfig, 'cache_hit_compaction'),
+          provider: clientConfig.provider as Providers,
+          reasoningKey: agentContext.reasoningKey,
+        });
+        const fbResult = await tryFallbackProviders({
+          fallbacks,
+          tools: agentContext.getToolsForBinding(),
+          messages: [
+            ...messages,
+            new HumanMessage(
+              buildSummarizationInstruction(
+                clientConfig.promptText,
+                clientConfig.updatePromptText,
+                priorSummaryText
+              )
+            ),
+          ],
+          config: traceConfig(summarizeConfig, 'cache_hit_compaction'),
+          primaryError,
+          onChunk,
+        });
+        const fbMsg = fbResult?.messages?.[0];
+        if (fbMsg) {
+          summaryText = extractResponseText(
+            fbMsg as { content: string | object }
+          );
+        }
+      } catch (fbErr) {
+        log('warn', 'Fallback providers also failed', {
+          error: fbErr instanceof Error ? fbErr.message : String(fbErr),
+        });
+      }
+    }
+    if (!summaryText) {
+      log('warn', 'Summarization failed, falling back to metadata stub', {
+        error:
+          primaryError instanceof Error
+            ? primaryError.message
+            : String(primaryError),
+      });
+      summaryText = generateMetadataStub(messages);
+    }
+  }
+
+  return { text: summaryText, usage: summaryUsage };
+}
+
+/** Dispatches run step completion, ON_SUMMARIZE_COMPLETE, and rebuilds token map. */
+async function dispatchCompletionEvents(params: {
+  graph: CreateSummarizeNodeParams['graph'];
+  runnableConfig?: RunnableConfig;
+  stepId: string;
+  summaryBlock: t.SummaryContentBlock;
+  agentContext: AgentContext;
+  runStep: t.RunStep;
+  summaryUsage?: Partial<UsageMetadata>;
+  agentId: string;
+}): Promise<void> {
+  const {
+    graph,
+    runnableConfig,
+    stepId,
+    summaryBlock,
+    agentContext,
+    runStep,
+    summaryUsage,
+    agentId,
+  } = params;
+
+  runStep.summary = summaryBlock;
+  if (summaryUsage) {
+    runStep.usage = {
+      prompt_tokens: Number(summaryUsage.input_tokens) || 0,
+      completion_tokens: Number(summaryUsage.output_tokens) || 0,
+      total_tokens:
+        (Number(summaryUsage.input_tokens) || 0) +
+        (Number(summaryUsage.output_tokens) || 0),
+    };
+  }
+
+  await graph.dispatchRunStepCompleted(
+    stepId,
+    { type: 'summary', summary: summaryBlock } satisfies t.SummaryCompleted,
+    runnableConfig
+  );
+
+  if (runnableConfig) {
+    await safeDispatchCustomEvent(
+      GraphEvents.ON_SUMMARIZE_COMPLETE,
+      {
+        id: stepId,
+        agentId,
+        summary: summaryBlock,
+      } satisfies t.SummarizeCompleteEvent,
+      runnableConfig
+    );
+  }
+
+  agentContext.rebuildTokenMapAfterSummarization({});
+}
+
+// ---------------------------------------------------------------------------
+// createSummarizeNode
+// ---------------------------------------------------------------------------
+
 interface CreateSummarizeNodeParams {
   agentContext: AgentContext;
   graph: {
@@ -274,41 +563,10 @@ export function createSummarizeNode({
       return { summarizationRequest: undefined };
     }
 
-    const summarizationConfig = agentContext.summarizationConfig;
-    const provider = summarizationConfig?.provider ?? agentContext.provider;
-    const modelName = summarizationConfig?.model;
-    const parameters = summarizationConfig?.parameters ?? {};
-    const promptText =
-      summarizationConfig?.prompt ?? DEFAULT_SUMMARIZATION_PROMPT;
-    const updatePromptText =
-      summarizationConfig?.updatePrompt ?? DEFAULT_UPDATE_SUMMARIZATION_PROMPT;
-
-    const { llmParams, maxSummaryTokens: paramMaxSummaryTokens } =
-      separateParameters(parameters);
-
-    const isSelfSummarize = provider === agentContext.provider;
-    const baseOptions =
-      isSelfSummarize && agentContext.clientOptions
-        ? { ...agentContext.clientOptions }
-        : {};
-
-    const clientOptions: Record<string, unknown> = {
-      ...baseOptions,
-      ...llmParams,
-    };
-
-    if (modelName != null && modelName !== '') {
-      clientOptions.model = modelName;
-      clientOptions.modelName = modelName;
-    }
-
-    const effectiveMaxSummaryTokens =
-      paramMaxSummaryTokens ?? summarizationConfig?.maxSummaryTokens;
-
-    if (effectiveMaxSummaryTokens != null) {
-      clientOptions[getMaxOutputTokensKey(provider as string)] =
-        effectiveMaxSummaryTokens;
-    }
+    const clientConfig = buildSummarizationClientConfig(
+      agentContext,
+      agentContext.summarizationConfig
+    );
 
     const runnableConfig = config ?? graph.config;
 
@@ -317,8 +575,8 @@ export function createSummarizeNode({
 
     const placeholderSummary: t.SummaryContentBlock = {
       type: ContentTypes.SUMMARY,
-      model: modelName,
-      provider: provider as string,
+      model: clientConfig.modelName,
+      provider: clientConfig.provider,
     };
 
     const runStep: t.RunStep = {
@@ -348,8 +606,8 @@ export function createSummarizeNode({
         GraphEvents.ON_SUMMARIZE_START,
         {
           agentId: request.agentId,
-          provider: provider as string,
-          model: modelName,
+          provider: clientConfig.provider,
+          model: clientConfig.modelName,
           messagesToRefineCount: request.messagesToRefine.length,
           summaryVersion: agentContext.summaryVersion + 1,
         } satisfies t.SummarizeStartEvent,
@@ -357,153 +615,53 @@ export function createSummarizeNode({
       );
     }
 
-    const priorSummaryText = agentContext.getSummaryText()?.trim() ?? '';
+    const isSelfSummarizeModel =
+      clientConfig.provider === (agentContext.provider as string);
+    const hasPromptCache =
+      isSelfSummarizeModel &&
+      (agentContext.clientOptions as Record<string, unknown> | undefined)
+        ?.promptCache === true;
+
+    const log: LogFn = (level, message, data) => {
+      emitAgentLog(runnableConfig, level, 'summarize', message, data, {
+        runId: graph.runId,
+        agentId: request.agentId,
+      });
+    };
+
+    log('debug', 'Summarization starting', {
+      messagesToRefineCount: request.messagesToRefine.length,
+      hasPriorSummary: (agentContext.getSummaryText()?.trim() ?? '') !== '',
+      summaryVersion: agentContext.summaryVersion + 1,
+      isSelfSummarize: isSelfSummarizeModel,
+      hasPromptCache,
+      provider: clientConfig.provider,
+    });
+
     const summarizeConfig: RunnableConfig | undefined = config
       ? {
         ...config,
         metadata: {
           ...config.metadata,
           agent_id: request.agentId,
-          summarization_provider: provider,
-          summarization_model: modelName,
+          summarization_provider: clientConfig.provider,
+          summarization_model: clientConfig.modelName,
         },
       }
       : undefined;
 
-    let summaryText = '';
-    let summaryUsage: Partial<UsageMetadata> | undefined;
-    const messagesToRefine = request.messagesToRefine;
-
-    const isSelfSummarizeModel = provider === agentContext.provider;
-    const hasPromptCache =
-      isSelfSummarizeModel &&
-      (agentContext.clientOptions as Record<string, unknown> | undefined)
-        ?.promptCache === true;
-
-    emitAgentLog(
-      runnableConfig,
-      'debug',
-      'summarize',
-      'Summarization starting',
-      {
-        messagesToRefineCount: messagesToRefine.length,
-        hasPriorSummary: priorSummaryText !== '',
-        summaryVersion: agentContext.summaryVersion + 1,
-        isSelfSummarize: isSelfSummarizeModel,
-        hasPromptCache,
-        provider: provider as string,
-      },
-      { runId: graph.runId, agentId: request.agentId }
-    );
-
-    const summarizationModel = initializeModel({
-      provider: provider as Providers,
-      clientOptions: clientOptions as t.ClientOptions,
-      tools: agentContext.getToolsForBinding(),
-    }) as t.ChatModel;
-
-    try {
-      const summarizeResult = await summarizeWithCacheHit({
-        model: summarizationModel,
-        messages: messagesToRefine,
-        promptText,
-        updatePromptText,
-        priorSummaryText,
-        config: summarizeConfig,
+    const { text: rawText, usage: summaryUsage } =
+      await executeSummarizationWithFallback({
+        agentContext,
+        messages: request.messagesToRefine,
+        clientConfig,
+        summarizeConfig,
         stepId,
-        provider: provider as Providers,
-        reasoningKey: agentContext.reasoningKey,
-        usePromptCache: isSelfSummarizeModel && hasPromptCache,
-        log: (level, message, data) => {
-          emitAgentLog(runnableConfig, level, 'summarize', message, data, {
-            runId: graph.runId,
-            agentId: request.agentId,
-          });
-        },
+        log,
       });
-      summaryText = summarizeResult.text;
-      summaryUsage = summarizeResult.usage;
-    } catch (primaryError) {
-      emitAgentLog(
-        runnableConfig,
-        'error',
-        'summarize',
-        'Summarization LLM call failed',
-        {
-          error:
-            primaryError instanceof Error
-              ? primaryError.message
-              : String(primaryError),
-          provider: provider as string,
-          model: modelName,
-          messagesToRefineCount: messagesToRefine.length,
-        },
-        { runId: graph.runId, agentId: request.agentId }
-      );
 
-      const fallbacks =
-        (clientOptions as unknown as t.LLMConfig | undefined)?.fallbacks ?? [];
-      if (fallbacks.length > 0) {
-        try {
-          const onChunk = createSummarizationChunkHandler({
-            stepId,
-            config: traceConfig(summarizeConfig, 'cache_hit_compaction'),
-            provider: provider as Providers,
-            reasoningKey: agentContext.reasoningKey,
-          });
-          const fbResult = await tryFallbackProviders({
-            fallbacks,
-            tools: agentContext.getToolsForBinding(),
-            messages: [
-              ...messagesToRefine,
-              new HumanMessage(
-                buildSummarizationInstruction(
-                  promptText,
-                  updatePromptText,
-                  priorSummaryText
-                )
-              ),
-            ],
-            config: traceConfig(summarizeConfig, 'cache_hit_compaction'),
-            primaryError,
-            onChunk,
-          });
-          const fbMsg = fbResult?.messages?.[0];
-          if (fbMsg) {
-            summaryText = extractResponseText(
-              fbMsg as { content: string | object }
-            );
-          }
-        } catch (fbErr) {
-          emitAgentLog(
-            runnableConfig,
-            'warn',
-            'summarize',
-            'Fallback providers also failed',
-            { error: fbErr instanceof Error ? fbErr.message : String(fbErr) },
-            { runId: graph.runId, agentId: request.agentId }
-          );
-        }
-      }
-      if (!summaryText) {
-        emitAgentLog(
-          runnableConfig,
-          'warn',
-          'summarize',
-          'Summarization failed, falling back to metadata stub',
-          {
-            error:
-              primaryError instanceof Error
-                ? primaryError.message
-                : String(primaryError),
-          },
-          { runId: graph.runId, agentId: request.agentId }
-        );
-        summaryText = generateMetadataStub(messagesToRefine);
-      }
-    }
-
-    if (!summaryText) {
+    if (!rawText) {
+      agentContext.markSummarizationTriggered(0);
       if (runnableConfig) {
         await safeDispatchCustomEvent(
           GraphEvents.ON_SUMMARIZE_COMPLETE,
@@ -518,91 +676,51 @@ export function createSummarizeNode({
       return { summarizationRequest: undefined };
     }
 
-    summaryText = enrichSummary(summaryText, messagesToRefine);
+    const summaryText = enrichSummary(rawText, request.messagesToRefine);
 
-    let tokenCount = 0;
-    const providerOutputTokens = Number(summaryUsage?.output_tokens) || 0;
-    if (providerOutputTokens > 0) {
-      tokenCount = providerOutputTokens + SUMMARY_WRAPPER_OVERHEAD_TOKENS;
-    } else if (agentContext.tokenCounter) {
-      tokenCount =
-        agentContext.tokenCounter(new SystemMessage(summaryText)) +
-        SUMMARY_WRAPPER_OVERHEAD_TOKENS;
-    }
+    const tokenCount = computeSummaryTokenCount(
+      summaryText,
+      summaryUsage,
+      agentContext.tokenCounter
+    );
 
     agentContext.setSummary(summaryText, tokenCount);
 
-    emitAgentLog(
-      runnableConfig,
-      'info',
-      'summarize',
-      'Summary persisted',
-      {
-        summaryTokens: tokenCount,
-        textLength: summaryText.length,
-        messagesCompacted: request.messagesToRefine.length,
-        summaryVersion: agentContext.summaryVersion,
-        ...(summaryUsage != null
-          ? {
-            input_tokens: summaryUsage.input_tokens,
-            output_tokens: summaryUsage.output_tokens,
-            cache_read: summaryUsage.input_token_details?.cache_read,
-            cache_creation: summaryUsage.input_token_details?.cache_creation,
-          }
-          : {}),
-      },
-      { runId: graph.runId, agentId: request.agentId }
-    );
-
-    const summaryBlock: t.SummaryContentBlock = {
-      type: ContentTypes.SUMMARY,
-      content: [
-        {
-          type: ContentTypes.TEXT,
-          text: summaryText,
-        } as t.MessageContentComplex,
-      ],
-      tokenCount,
+    log('info', 'Summary persisted', {
+      summaryTokens: tokenCount,
+      textLength: summaryText.length,
+      messagesCompacted: request.messagesToRefine.length,
       summaryVersion: agentContext.summaryVersion,
-      boundary: {
-        messageId: stepId,
-        contentIndex: runStep.index,
-      },
-      model: modelName,
-      provider: provider as string,
-      createdAt: new Date().toISOString(),
-    };
+      ...(summaryUsage != null
+        ? {
+          input_tokens: summaryUsage.input_tokens,
+          output_tokens: summaryUsage.output_tokens,
+          cache_read: summaryUsage.input_token_details?.cache_read,
+          cache_creation: summaryUsage.input_token_details?.cache_creation,
+        }
+        : {}),
+    });
 
-    runStep.summary = summaryBlock;
-    if (summaryUsage) {
-      runStep.usage = {
-        prompt_tokens: Number(summaryUsage.input_tokens) || 0,
-        completion_tokens: Number(summaryUsage.output_tokens) || 0,
-        total_tokens:
-          (Number(summaryUsage.input_tokens) || 0) +
-          (Number(summaryUsage.output_tokens) || 0),
-      };
-    }
-
-    await graph.dispatchRunStepCompleted(
+    const summaryBlock = buildSummaryBlock({
+      summaryText,
+      tokenCount,
       stepId,
-      { type: 'summary', summary: summaryBlock } satisfies t.SummaryCompleted,
-      runnableConfig
-    );
+      stepIndex: runStep.index,
+      modelName: clientConfig.modelName,
+      provider: clientConfig.provider,
+      summaryVersion: agentContext.summaryVersion,
+    });
 
-    if (runnableConfig) {
-      await safeDispatchCustomEvent(
-        GraphEvents.ON_SUMMARIZE_COMPLETE,
-        {
-          id: stepId,
-          agentId: request.agentId,
-          summary: summaryBlock,
-        } satisfies t.SummarizeCompleteEvent,
-        runnableConfig
-      );
-    }
-
-    agentContext.rebuildTokenMapAfterSummarization({});
+    await dispatchCompletionEvents({
+      graph,
+      runnableConfig,
+      stepId,
+      summaryBlock,
+      agentContext,
+      runStep,
+      summaryUsage,
+      agentId: request.agentId,
+    });
 
     return {
       summarizationRequest: undefined,
@@ -748,11 +866,7 @@ async function summarizeWithCacheHit({
   provider: Providers;
   reasoningKey?: 'reasoning_content' | 'reasoning';
   usePromptCache?: boolean;
-  log?: (
-    level: 'debug' | 'info' | 'warn' | 'error',
-    message: string,
-    data?: Record<string, unknown>
-  ) => void;
+  log?: LogFn;
 }): Promise<{ text: string; usage?: Partial<UsageMetadata> }> {
   const instruction = buildSummarizationInstruction(
     promptText,
@@ -760,11 +874,6 @@ async function summarizeWithCacheHit({
     priorSummaryText
   );
 
-  // Apply cache markers to the full message array (conversation + instruction)
-  // so the summarizer benefits from the cached prefix established by the
-  // agent's prior calls.  The instruction HumanMessage becomes the last user
-  // message and gets a cache breakpoint, while earlier conversation messages
-  // form the cached prefix.
   const fullMessages = [...messages, new HumanMessage(instruction)];
   const invokeMessages =
     usePromptCache === true ? addCacheControl(fullMessages) : fullMessages;
