@@ -73,6 +73,10 @@ export type BaseGraphState = {
   messages: BaseMessage[];
 };
 
+export type AgentSubgraphState = BaseGraphState & {
+  summarizationRequest?: SummarizationNodeInput;
+};
+
 export type MultiAgentGraphState = BaseGraphState & {
   agentMessages?: BaseMessage[];
 };

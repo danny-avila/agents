@@ -101,7 +101,10 @@ export abstract class Graph<
   abstract createCallModel(
     agentId?: string,
     currentModel?: t.ChatModel
-  ): (state: T, config?: RunnableConfig) => Promise<Partial<T>>;
+  ): (
+    state: t.AgentSubgraphState,
+    config?: RunnableConfig
+  ) => Promise<Partial<t.AgentSubgraphState>>;
   messageStepHasToolCalls: Map<string, boolean> = new Map();
   messageIdsByStepKey: Map<string, string> = new Map();
   prelimMessageIdsByStepKey: Map<string, string> = new Map();
@@ -582,9 +585,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
   createCallModel(agentId = 'default') {
     return async (
-      state: t.BaseGraphState,
+      state: t.AgentSubgraphState,
       config?: RunnableConfig
-    ): Promise<Partial<t.BaseGraphState>> => {
+    ): Promise<Partial<t.AgentSubgraphState>> => {
       const agentContext = this.agentContexts.get(agentId);
       if (!agentContext) {
         throw new Error(`Agent context not found for agentId: ${agentId}`);
@@ -753,7 +756,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                 remainingContextTokens: remainingContextTokens ?? 0,
                 agentId: agentId || agentContext.agentId,
               },
-            } as unknown as Partial<t.BaseGraphState>;
+            };
           }
 
           if (shouldSkip) {
