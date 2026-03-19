@@ -1970,7 +1970,8 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
           }
         }
 
-        factoryParams.log?.('info', 'Emergency truncation complete', {
+        factoryParams.log?.('info', 'Emergency truncation complete');
+        factoryParams.log?.('debug', 'Emergency truncation details', {
           truncatedCount: emergencyTruncatedCount,
           emergencyMaxChars,
         });

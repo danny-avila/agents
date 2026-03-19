@@ -689,7 +689,8 @@ export function createSummarizeNode({
 
     agentContext.setSummary(summaryText, tokenCount);
 
-    log('info', 'Summary persisted', {
+    log('info', 'Summary persisted');
+    log('debug', 'Summary details', {
       summaryTokens: tokenCount,
       textLength: summaryText.length,
       messagesCompacted: request.messagesToRefine.length,

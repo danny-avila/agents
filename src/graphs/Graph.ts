@@ -742,6 +742,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               'info',
               'graph',
               'Summarization triggered',
+              undefined,
+              { runId: this.runId, agentId }
+            );
+            emitAgentLog(
+              config,
+              'debug',
+              'graph',
+              'Summarization trigger details',
               {
                 totalMessages: allMessages.length,
                 remainingContextTokens: remainingContextTokens ?? 0,
