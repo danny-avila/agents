@@ -1143,6 +1143,8 @@ export function preFlightTruncateToolCallInputs(params: {
       }
 
       state.changed = true;
+      // Replaces original input with { _truncated, _originalChars } —
+      // safe because the tool call already executed in a prior turn.
       return {
         ...record,
         input: truncateToolInput(serialized, maxInputChars),
@@ -1159,6 +1161,8 @@ export function preFlightTruncateToolCallInputs(params: {
       if (serializedArgs.length <= maxInputChars) {
         return tc;
       }
+      // Replaces original args with { _truncated, _originalChars } —
+      // safe because the tool call already executed in a prior turn.
       return {
         ...tc,
         args: truncateToolInput(serializedArgs, maxInputChars),
@@ -1931,6 +1935,8 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
                       ? record.input
                       : JSON.stringify(record.input);
                   if (serialized.length > emergencyMaxChars) {
+                    // Replaces original input with { _truncated, _originalChars } —
+                    // safe because the tool call already executed in a prior turn.
                     return {
                       ...record,
                       input: truncateToolInput(serialized, emergencyMaxChars),
@@ -1942,6 +1948,8 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
               const newToolCalls = (aiMsg.tool_calls ?? []).map((tc) => {
                 const serializedArgs = JSON.stringify(tc.args);
                 if (serializedArgs.length > emergencyMaxChars) {
+                  // Replaces original args with { _truncated, _originalChars } —
+                  // safe because the tool call already executed in a prior turn.
                   return {
                     ...tc,
                     args: truncateToolInput(serializedArgs, emergencyMaxChars),
