@@ -1,14 +1,11 @@
 import {
   AIMessage,
+  ToolMessage,
   HumanMessage,
   SystemMessage,
 } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
-import type {
-  UsageMetadata,
-  BaseMessage,
-  ToolMessage,
-} from '@langchain/core/messages';
+import type { UsageMetadata, BaseMessage } from '@langchain/core/messages';
 import type { AgentContext } from '@/agents/AgentContext';
 import type { OnChunk } from '@/llm/invoke';
 import type * as t from '@/types';
@@ -217,6 +214,36 @@ function extractToolFailuresSection(messages: BaseMessage[]): string {
  */
 function enrichSummary(summaryText: string, messages: BaseMessage[]): string {
   return summaryText + extractToolFailuresSection(messages);
+}
+
+/**
+ * Restores pre-masking tool content onto the messages array using
+ * `pendingOriginalToolContent` stored on AgentContext. Only allocates
+ * a new array when there are entries to restore; otherwise returns the
+ * input reference unchanged.
+ */
+function restoreOriginalToolContent(
+  messages: BaseMessage[],
+  originalToolContent: Map<number, string> | undefined
+): BaseMessage[] {
+  if (originalToolContent == null || originalToolContent.size === 0) {
+    return messages;
+  }
+  const restored = [...messages];
+  for (const [idx, content] of originalToolContent) {
+    const msg = restored[idx];
+    if (msg instanceof ToolMessage) {
+      restored[idx] = new ToolMessage({
+        content,
+        tool_call_id: msg.tool_call_id,
+        name: msg.name,
+        id: msg.id,
+        additional_kwargs: msg.additional_kwargs,
+        response_metadata: msg.response_metadata,
+      });
+    }
+  }
+  return restored;
 }
 
 // ---------------------------------------------------------------------------
@@ -565,6 +592,12 @@ export function createSummarizeNode({
       return { summarizationRequest: undefined };
     }
 
+    const messagesToRefine = restoreOriginalToolContent(
+      state.messages,
+      agentContext.pendingOriginalToolContent
+    );
+    agentContext.pendingOriginalToolContent = undefined;
+
     const clientConfig = buildSummarizationClientConfig(
       agentContext,
       agentContext.summarizationConfig
@@ -610,7 +643,7 @@ export function createSummarizeNode({
           agentId: request.agentId,
           provider: clientConfig.provider,
           model: clientConfig.modelName,
-          messagesToRefineCount: request.messagesToRefine.length,
+          messagesToRefineCount: messagesToRefine.length,
           summaryVersion: agentContext.summaryVersion + 1,
         } satisfies t.SummarizeStartEvent,
         runnableConfig
@@ -632,7 +665,7 @@ export function createSummarizeNode({
     };
 
     log('debug', 'Summarization starting', {
-      messagesToRefineCount: request.messagesToRefine.length,
+      messagesToRefineCount: messagesToRefine.length,
       hasPriorSummary: (agentContext.getSummaryText()?.trim() ?? '') !== '',
       summaryVersion: agentContext.summaryVersion + 1,
       isSelfSummarize: isSelfSummarizeModel,
@@ -655,7 +688,7 @@ export function createSummarizeNode({
     const { text: rawText, usage: summaryUsage } =
       await executeSummarizationWithFallback({
         agentContext,
-        messages: request.messagesToRefine,
+        messages: messagesToRefine,
         clientConfig,
         summarizeConfig,
         stepId,
@@ -679,7 +712,7 @@ export function createSummarizeNode({
       return { summarizationRequest: undefined };
     }
 
-    const summaryText = enrichSummary(rawText, request.messagesToRefine);
+    const summaryText = enrichSummary(rawText, messagesToRefine);
 
     const tokenCount = computeSummaryTokenCount(
       summaryText,
@@ -693,7 +726,7 @@ export function createSummarizeNode({
     log('debug', 'Summary details', {
       summaryTokens: tokenCount,
       textLength: summaryText.length,
-      messagesCompacted: request.messagesToRefine.length,
+      messagesCompacted: messagesToRefine.length,
       summaryVersion: agentContext.summaryVersion,
       ...(summaryUsage != null
         ? {

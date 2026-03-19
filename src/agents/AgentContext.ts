@@ -168,6 +168,8 @@ export class AgentContext {
   calibrationRatio: number = 1;
   /** Provider-observed instruction overhead from the pruner's best-variance turn. */
   resolvedInstructionOverhead?: number;
+  /** Pre-masking tool content keyed by message index, consumed by the summarize node. */
+  pendingOriginalToolContent?: Map<number, string>;
 
   /** Total instruction overhead: system message + tool schemas + pending summary. */
   get instructionTokens(): number {

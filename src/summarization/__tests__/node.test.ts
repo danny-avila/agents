@@ -175,13 +175,8 @@ describe('createSummarizeNode', () => {
 
     await node(
       {
-        messages: [new HumanMessage('Hello')],
+        messages: [new HumanMessage('Hello'), new HumanMessage('World')],
         summarizationRequest: {
-          messagesToRefine: [
-            new HumanMessage('Hello'),
-            new HumanMessage('World'),
-          ],
-
           remainingContextTokens: 1000,
           agentId: 'agent_0',
         },
@@ -232,10 +227,8 @@ describe('createSummarizeNode', () => {
 
     await node(
       {
-        messages: [new HumanMessage('Hello')],
+        messages: [new HumanMessage('Test message')],
         summarizationRequest: {
-          messagesToRefine: [new HumanMessage('Test message')],
-
           remainingContextTokens: 1000,
           agentId: 'agent_0',
         },
@@ -273,10 +266,8 @@ describe('createSummarizeNode', () => {
 
     await node(
       {
-        messages: [new HumanMessage('Hello')],
+        messages: [new HumanMessage('Test message')],
         summarizationRequest: {
-          messagesToRefine: [new HumanMessage('Test message')],
-
           remainingContextTokens: 1000,
           agentId: 'agent_0',
         },
@@ -322,10 +313,8 @@ describe('createSummarizeNode', () => {
 
     const result = await node(
       {
-        messages: [new HumanMessage('Hello')],
+        messages: [new HumanMessage('Test')],
         summarizationRequest: {
-          messagesToRefine: [new HumanMessage('Test')],
-
           remainingContextTokens: 1000,
           agentId: 'agent_0',
         },
@@ -378,10 +367,8 @@ describe('createSummarizeNode', () => {
 
     await node(
       {
-        messages: [new HumanMessage('Hello')],
+        messages: [new HumanMessage('Test message')],
         summarizationRequest: {
-          messagesToRefine: [new HumanMessage('Test message')],
-
           remainingContextTokens: 1000,
           agentId: 'agent_0',
         },
@@ -417,10 +404,8 @@ describe('createSummarizeNode', () => {
 
     await node(
       {
-        messages: [new HumanMessage('Hello')],
+        messages: [new HumanMessage('Test')],
         summarizationRequest: {
-          messagesToRefine: [new HumanMessage('Test')],
-
           remainingContextTokens: 1000,
           agentId: 'agent_0',
         },
@@ -478,14 +463,12 @@ describe('createSummarizeNode', () => {
 
     await node(
       {
-        messages: [new HumanMessage('Hello')],
+        messages: [
+          new HumanMessage('Message 1'),
+          new HumanMessage('Message 2'),
+          new HumanMessage('Message 3'),
+        ],
         summarizationRequest: {
-          messagesToRefine: [
-            new HumanMessage('Message 1'),
-            new HumanMessage('Message 2'),
-            new HumanMessage('Message 3'),
-          ],
-
           remainingContextTokens: 1000,
           agentId: 'agent_0',
         },
@@ -549,10 +532,8 @@ describe('createSummarizeNode', () => {
 
     await node(
       {
-        messages: [new HumanMessage('Hello')],
+        messages: [new HumanMessage('New message')],
         summarizationRequest: {
-          messagesToRefine: [new HumanMessage('New message')],
-
           remainingContextTokens: 1000,
           agentId: 'agent_0',
         },
@@ -622,8 +603,6 @@ describe('budget check — instructions exceed context', () => {
       {
         messages: [new HumanMessage('test')],
         summarizationRequest: {
-          messagesToRefine: [new HumanMessage('test')],
-
           remainingContextTokens: -1000,
           agentId: 'agent_0',
         },
@@ -670,9 +649,8 @@ describe('budget check — instructions exceed context', () => {
 
     const result = await summarizeNode(
       {
-        messages: [new HumanMessage('context msg'), new HumanMessage('hello')],
+        messages: [new HumanMessage('hello')],
         summarizationRequest: {
-          messagesToRefine: [new HumanMessage('hello')],
           remainingContextTokens: 500,
           agentId: 'agent_0',
         },
@@ -714,12 +692,8 @@ describe('emoji-heavy content does not break summarization', () => {
 
     const result = await summarizeNode(
       {
-        messages: [
-          new HumanMessage(emojiContent),
-          new HumanMessage('What happened?'),
-        ],
+        messages: [new HumanMessage(emojiContent)],
         summarizationRequest: {
-          messagesToRefine: [new HumanMessage(emojiContent)],
           remainingContextTokens: 500,
           agentId: 'agent_0',
         },

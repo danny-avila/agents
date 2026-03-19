@@ -1,4 +1,3 @@
-import type { BaseMessage } from '@langchain/core/messages';
 import type { SummaryContentBlock } from '@/types/stream';
 import type { Providers } from '@/common';
 
@@ -31,7 +30,6 @@ export interface SummarizeResult {
 }
 
 export interface SummarizationNodeInput {
-  messagesToRefine: BaseMessage[];
   remainingContextTokens: number;
   agentId: string;
 }

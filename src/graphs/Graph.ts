@@ -719,22 +719,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             });
 
           if (triggerResult) {
-            let allMessages = messages;
             if (originalToolContent != null && originalToolContent.size > 0) {
-              allMessages = [...messages];
-              for (const [idx, content] of originalToolContent) {
-                const msg = allMessages[idx] as ToolMessage | undefined;
-                if (msg != null && msg instanceof ToolMessage) {
-                  allMessages[idx] = new ToolMessage({
-                    content,
-                    tool_call_id: msg.tool_call_id,
-                    name: msg.name,
-                    id: msg.id,
-                    additional_kwargs: msg.additional_kwargs,
-                    response_metadata: msg.response_metadata,
-                  });
-                }
-              }
+              agentContext.pendingOriginalToolContent = originalToolContent;
             }
 
             emitAgentLog(
@@ -751,7 +737,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               'graph',
               'Summarization trigger details',
               {
-                totalMessages: allMessages.length,
+                totalMessages: messages.length,
                 remainingContextTokens: remainingContextTokens ?? 0,
                 summaryVersion: agentContext.summaryVersion + 1,
               },
@@ -760,7 +746,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             agentContext.markSummarizationTriggered(messages.length);
             return {
               summarizationRequest: {
-                messagesToRefine: allMessages,
                 remainingContextTokens: remainingContextTokens ?? 0,
                 agentId: agentId || agentContext.agentId,
               },
