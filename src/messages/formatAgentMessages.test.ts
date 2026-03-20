@@ -102,7 +102,8 @@ describe('formatAgentMessages', () => {
       type: ContentTypes.TEXT,
       text: 'Preserved tail',
     });
-    expect(result.indexTokenCountMap?.[0]).toBe(18);
+    expect(result.indexTokenCountMap?.[0]).toBeLessThan(18);
+    expect(result.indexTokenCountMap?.[0]).toBeGreaterThan(0);
     expect(result.indexTokenCountMap?.[1]).toBe(4);
   });
 
@@ -2795,6 +2796,222 @@ describe('formatAgentMessages', () => {
     });
   });
 
+  describe('summary boundary token count adjustment', () => {
+    it('should proportion token count when thinking block is sliced off by boundary', () => {
+      const thinkingText = 'x'.repeat(1000);
+      const payload: TPayload = [
+        { role: 'user', content: 'Old question' },
+        {
+          role: 'assistant',
+          content: [
+            { type: ContentTypes.THINKING, thinking: thinkingText },
+            {
+              type: ContentTypes.SUMMARY,
+              text: 'Summary of conversation',
+              tokenCount: 15,
+            },
+            { type: ContentTypes.TEXT, text: 'Brief response after summary' },
+          ],
+        },
+        { role: 'user', content: 'Follow-up question' },
+      ];
+
+      const indexTokenCountMap = { 0: 5, 1: 1590, 2: 8 };
+      const result = formatAgentMessages(payload, indexTokenCountMap);
+
+      expect(result.summary).toBeDefined();
+      expect(result.summary!.text).toBe('Summary of conversation');
+
+      const boundaryMsgTokens = result.indexTokenCountMap?.[0];
+      expect(boundaryMsgTokens).toBeDefined();
+      expect(boundaryMsgTokens!).toBeLessThan(200);
+      expect(boundaryMsgTokens!).toBeGreaterThan(0);
+
+      expect(result.indexTokenCountMap?.[1]).toBe(8);
+    });
+
+    it('should proportion token count when thinking + tool_use are sliced off', () => {
+      const thinkingText = 'a'.repeat(800);
+      const toolInput = JSON.stringify({ data: 'b'.repeat(400) });
+      const payload: TPayload = [
+        {
+          role: 'assistant',
+          content: [
+            { type: ContentTypes.THINKING, thinking: thinkingText },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: {
+                id: 'tc1',
+                name: 'search',
+                args: toolInput,
+                output: 'result',
+              },
+            },
+            {
+              type: ContentTypes.SUMMARY,
+              text: 'Conversation summary after tool use',
+              tokenCount: 20,
+            },
+            { type: ContentTypes.TEXT, text: 'Short tail' },
+          ],
+        },
+      ];
+
+      const indexTokenCountMap = { 0: 2000 };
+      const result = formatAgentMessages(payload, indexTokenCountMap);
+
+      expect(result.summary).toBeDefined();
+
+      const totalOutputTokens = Object.values(
+        result.indexTokenCountMap || {}
+      ).reduce((sum, v) => sum + v, 0);
+
+      expect(totalOutputTokens).toBeLessThan(200);
+      expect(totalOutputTokens).toBeGreaterThan(0);
+    });
+
+    it('should roughly halve token count when content is evenly split around boundary', () => {
+      const payload: TPayload = [
+        {
+          role: 'assistant',
+          content: [
+            { type: ContentTypes.TEXT, text: 'a'.repeat(100) },
+            {
+              type: ContentTypes.SUMMARY,
+              text: 'Mid-conversation summary',
+              tokenCount: 10,
+            },
+            { type: ContentTypes.TEXT, text: 'b'.repeat(100) },
+          ],
+        },
+      ];
+
+      const indexTokenCountMap = { 0: 500 };
+      const result = formatAgentMessages(payload, indexTokenCountMap);
+
+      expect(result.summary).toBeDefined();
+
+      const adjustedTokens = result.indexTokenCountMap?.[0] ?? 0;
+      expect(adjustedTokens).toBeGreaterThan(150);
+      expect(adjustedTokens).toBeLessThan(350);
+    });
+
+    it('should still adjust when summary is the first content part (its own text is sliced off)', () => {
+      const payload: TPayload = [
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: ContentTypes.SUMMARY,
+              text: 'Summary at start',
+              tokenCount: 10,
+            },
+            { type: ContentTypes.TEXT, text: 'Everything after the summary' },
+          ],
+        },
+        { role: 'user', content: 'Next question' },
+      ];
+
+      const indexTokenCountMap = { 0: 300, 1: 10 };
+      const result = formatAgentMessages(payload, indexTokenCountMap);
+
+      expect(result.summary).toBeDefined();
+
+      const adjustedTokens = result.indexTokenCountMap?.[0] ?? 0;
+      expect(adjustedTokens).toBeLessThan(300);
+      expect(adjustedTokens).toBeGreaterThan(100);
+      expect(result.indexTokenCountMap?.[1]).toBe(10);
+    });
+
+    it('should account for tool_use input size in the char-length ratio', () => {
+      const hugeInput = JSON.stringify({ payload: 'z'.repeat(5000) });
+      const payload: TPayload = [
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: 'tool_use' as ContentTypes,
+              input: hugeInput,
+            } as unknown as MessageContentComplex,
+            {
+              type: ContentTypes.SUMMARY,
+              text: 'After heavy tool use',
+              tokenCount: 12,
+            },
+            { type: ContentTypes.TEXT, text: 'Tiny tail' },
+          ],
+        },
+      ];
+
+      const indexTokenCountMap = { 0: 3000 };
+      const result = formatAgentMessages(payload, indexTokenCountMap);
+
+      expect(result.summary).toBeDefined();
+
+      const adjustedTokens = result.indexTokenCountMap?.[0] ?? 0;
+      expect(adjustedTokens).toBeLessThan(100);
+      expect(adjustedTokens).toBeGreaterThan(0);
+    });
+
+    it('should handle multiple content parts after the boundary', () => {
+      const thinkingText = 'x'.repeat(2000);
+      const payload: TPayload = [
+        {
+          role: 'assistant',
+          content: [
+            { type: ContentTypes.THINKING, thinking: thinkingText },
+            {
+              type: ContentTypes.SUMMARY,
+              text: 'Conversation checkpoint',
+              tokenCount: 14,
+            },
+            { type: ContentTypes.TEXT, text: 'Part A of the tail' },
+            {
+              type: ContentTypes.TEXT,
+              text: 'Part B of the tail with more text',
+            },
+          ],
+        },
+        { role: 'user', content: 'Next message' },
+      ];
+
+      const indexTokenCountMap = { 0: 4000, 1: 6 };
+      const result = formatAgentMessages(payload, indexTokenCountMap);
+
+      expect(result.summary).toBeDefined();
+
+      const adjustedTokens = result.indexTokenCountMap?.[0] ?? 0;
+      expect(adjustedTokens).toBeLessThan(200);
+      expect(adjustedTokens).toBeGreaterThan(0);
+
+      expect(result.indexTokenCountMap?.[1]).toBe(6);
+    });
+
+    it('should produce integer token counts after proportional adjustment', () => {
+      const payload: TPayload = [
+        {
+          role: 'assistant',
+          content: [
+            { type: ContentTypes.THINKING, thinking: 'x'.repeat(333) },
+            {
+              type: ContentTypes.SUMMARY,
+              text: 'Summary',
+              tokenCount: 5,
+            },
+            { type: ContentTypes.TEXT, text: 'y'.repeat(77) },
+          ],
+        },
+      ];
+
+      const indexTokenCountMap = { 0: 997 };
+      const result = formatAgentMessages(payload, indexTokenCountMap);
+
+      const adjustedTokens = result.indexTokenCountMap?.[0];
+      expect(adjustedTokens).toBeDefined();
+      expect(Number.isInteger(adjustedTokens)).toBe(true);
+    });
+  });
+
   describe('cross-run summary token accounting', () => {
     it('should conserve tokens: summary boundary excludes pre-boundary messages from the map', () => {
       const payload: TPayload = [
@@ -2832,16 +3049,16 @@ describe('formatAgentMessages', () => {
       );
       expect(result.summary!.tokenCount).toBe(25);
 
-      const preBoundaryTokensPresent = Object.values(
-        result.indexTokenCountMap || {}
-      ).some((v) => v === 8 || v === 12);
-      expect(preBoundaryTokensPresent).toBe(false);
+      const outputKeys = Object.keys(result.indexTokenCountMap || {}).map(
+        Number
+      );
+      expect(outputKeys).toHaveLength(3);
 
-      const postBoundaryTotal = Object.values(
-        result.indexTokenCountMap || {}
-      ).reduce((sum, v) => sum + v, 0);
-
-      expect(postBoundaryTotal).toBe(60 + 10 + 15);
+      const boundaryMsgTokens = result.indexTokenCountMap?.[0] ?? 0;
+      expect(boundaryMsgTokens).toBeLessThan(60);
+      expect(boundaryMsgTokens).toBeGreaterThan(0);
+      expect(result.indexTokenCountMap?.[1]).toBe(10);
+      expect(result.indexTokenCountMap?.[2]).toBe(15);
     });
 
     it('should preserve summary token at index 0 when tool calls expand post-boundary messages', () => {

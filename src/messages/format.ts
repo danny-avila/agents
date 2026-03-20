@@ -779,6 +779,24 @@ function applySummaryBoundary(
   };
 }
 
+function contentPartCharLength(part: MessageContentComplex): number {
+  const record = part as Record<string, unknown>;
+  let len = 0;
+  if (typeof record.text === 'string') {
+    len += record.text.length;
+  }
+  if (typeof record.thinking === 'string') {
+    len += record.thinking.length;
+  }
+  const { input } = record;
+  if (typeof input === 'string') {
+    len += input.length;
+  } else if (input != null && typeof input === 'object') {
+    len += JSON.stringify(input).length;
+  }
+  return len;
+}
+
 /**
  * Formats an array of messages for LangChain, handling tool calls and creating ToolMessage instances.
  *
@@ -1018,10 +1036,37 @@ export const formatAgentMessages = (
       originalIndex++
     ) {
       const resultIndices = indexMapping[originalIndex] || [];
-      const tokenCount = indexTokenCountMap[originalIndex];
+      let tokenCount = indexTokenCountMap[originalIndex];
 
       if (tokenCount === undefined) {
         continue;
+      }
+
+      if (
+        summaryBoundary &&
+        originalIndex === summaryBoundary.messageIndex &&
+        Array.isArray(payload[originalIndex].content)
+      ) {
+        const content = payload[originalIndex]
+          .content as MessageContentComplex[];
+        const { contentIndex } = summaryBoundary;
+        if (contentIndex >= 0 && contentIndex < content.length - 1) {
+          let totalCharLen = 0;
+          let remainingCharLen = 0;
+          for (let p = 0; p < content.length; p++) {
+            const charLen = contentPartCharLength(content[p]);
+            totalCharLen += charLen;
+            if (p > contentIndex) {
+              remainingCharLen += charLen;
+            }
+          }
+          if (totalCharLen > 0) {
+            tokenCount = Math.max(
+              1,
+              Math.round(tokenCount * (remainingCharLen / totalCharLen))
+            );
+          }
+        }
       }
 
       const msgCount = resultIndices.length;
