@@ -1652,7 +1652,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       factoryParams.log?.('debug', 'Context adjusted', {
         contextPressure: Math.round(contextPressure * 100),
         observationsMasked,
-        toolResultsTruncated: preFlightResultCount,
+        toolOutputsTruncated: preFlightResultCount,
         toolInputsTruncated: preFlightInputCount,
         tokensBefore: preTruncationTotalTokens,
         tokensAfter: totalTokens,
