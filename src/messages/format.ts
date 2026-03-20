@@ -815,12 +815,28 @@ export const formatAgentMessages = (
   /** Cross-run summary extracted from the payload. Should be forwarded to the
    *  agent run so it can be included in the system message via AgentContext. */
   summary?: { text: string; tokenCount: number };
+  /** When a summary boundary sliced content from a message, the token count
+   *  was proportionally reduced. Returned so the caller can log it. */
+  boundaryTokenAdjustment?: {
+    original: number;
+    adjusted: number;
+    remainingChars: number;
+    totalChars: number;
+  };
 } => {
   const messages: Array<
     HumanMessage | AIMessage | SystemMessage | ToolMessage
   > = [];
   // If indexTokenCountMap is provided, create a new map to track the updated indices
   const updatedIndexTokenCountMap: Record<number, number> = {};
+  let boundaryTokenAdjustment:
+    | {
+        original: number;
+        adjusted: number;
+        remainingChars: number;
+        totalChars: number;
+      }
+    | undefined;
   // Keep track of the mapping from original payload indices to result indices
   const indexMapping: Record<number, number[] | undefined> = {};
   const summaryBoundary = getLatestSummaryBoundary(payload);
@@ -1061,10 +1077,17 @@ export const formatAgentMessages = (
             }
           }
           if (totalCharLen > 0) {
+            const original = tokenCount;
             tokenCount = Math.max(
               1,
               Math.round(tokenCount * (remainingCharLen / totalCharLen))
             );
+            boundaryTokenAdjustment = {
+              original,
+              adjusted: tokenCount,
+              remainingChars: remainingCharLen,
+              totalChars: totalCharLen,
+            };
           }
         }
       }
@@ -1148,6 +1171,7 @@ export const formatAgentMessages = (
     summary: summaryBoundary
       ? { text: summaryBoundary.text, tokenCount: summaryBoundary.tokenCount }
       : undefined,
+    boundaryTokenAdjustment,
   };
 };
 
