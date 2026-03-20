@@ -740,6 +740,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                 totalMessages: messages.length,
                 remainingContextTokens: remainingContextTokens ?? 0,
                 summaryVersion: agentContext.summaryVersion + 1,
+                toolSchemaTokens: agentContext.toolSchemaTokens,
+                instructionTokens: agentContext.instructionTokens,
+                systemMessageTokens: agentContext.systemMessageTokens,
               },
               { runId: this.runId, agentId }
             );
