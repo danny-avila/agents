@@ -52,7 +52,7 @@ Any rules, preferences, or configuration I established.
 Decisions you made and why.
 
 ## Next Steps
-What you need to do next, in priority order.
+Concrete task actions remaining, in priority order.
 
 ## Critical Context
 Exact identifiers, names, error messages, URLs, and details you need to preserve verbatim.
@@ -75,7 +75,7 @@ Rules:
 - Merge new progress into existing sections, don't duplicate headers
 - Compress older completed items into one-line entries
 - Move items from "In Progress" to "Done" when you completed them
-- Update "Next Steps" to reflect current priorities
+- Update "Next Steps" to reflect current task priorities.
 - For each new tool call: the tool name, key inputs, and the outcome
 - Preserve exact identifiers, names, errors, and references verbatim
 - Skip empty sections`;

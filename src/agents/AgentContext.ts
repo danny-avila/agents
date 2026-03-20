@@ -579,7 +579,7 @@ export class AgentContext {
           '<summary>\n' +
           (this.summaryText as string) +
           '\n</summary>\n\n' +
-          'Continue from the summary above. Do not repeat prior information or acknowledge this message to the user.';
+          'This is your own checkpoint: you wrote it to preserve context after compaction. Pick up where you left off based on the summary above. Do not repeat prior tasks, information or acknowledge this checkpoint message directly.';
 
         const summaryMsg = usePromptCache
           ? new HumanMessage({
