@@ -445,9 +445,6 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
   });
 
   test('post-summary continuation over multiple turns preserves context', async () => {
-    // Increased timeout: improved token accounting may need more squeeze
-    // iterations before summarization triggers.
-    jest.setTimeout(120_000);
     const spies = createSpies();
     let collectedUsage: UsageMetadata[] = [];
     const conversationHistory: BaseMessage[] = [];
@@ -568,7 +565,7 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
     expect(spies.onMessageDeltaSpy).toHaveBeenCalled();
     console.log(`  Summary text: "${summaryText.substring(0, 200)}…"`);
     console.log(`  Final message count: ${conversationHistory.length}`);
-  });
+  }, 180_000);
 
   test('cross-provider summarization: Anthropic agent with OpenAI summarizer', async () => {
     const hasOpenAI = process.env.OPENAI_API_KEY != null;
