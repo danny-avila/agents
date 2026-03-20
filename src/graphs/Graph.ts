@@ -1,31 +1,13 @@
 /* eslint-disable no-console */
-// src/graphs/Graph.ts
 import { nanoid } from 'nanoid';
-import { concat } from '@langchain/core/utils/stream';
 import { ToolNode } from '@langchain/langgraph/prebuilt';
-import { ChatVertexAI } from '@langchain/google-vertexai';
-import {
-  START,
-  END,
-  StateGraph,
-  Annotation,
-  messagesStateReducer,
-} from '@langchain/langgraph';
-import {
-  Runnable,
-  RunnableConfig,
-  RunnableLambda,
-} from '@langchain/core/runnables';
-import {
-  ToolMessage,
-  SystemMessage,
-  AIMessageChunk,
-} from '@langchain/core/messages';
+import { Runnable, RunnableConfig } from '@langchain/core/runnables';
+import { ToolMessage, AIMessageChunk } from '@langchain/core/messages';
+import { START, END, StateGraph, Annotation } from '@langchain/langgraph';
 import type {
-  BaseMessageFields,
-  MessageContent,
   UsageMetadata,
   BaseMessage,
+  MessageContent,
 } from '@langchain/core/messages';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
@@ -33,9 +15,9 @@ import {
   formatAnthropicArtifactContent,
   ensureThinkingBlockInMessages,
   convertMessagesToContent,
-  addBedrockCacheControl,
+  sanitizeOrphanToolBlocks,
   extractToolDiscoveries,
-  modifyDeltaProperties,
+  addBedrockCacheControl,
   formatArtifactPayload,
   formatContentStrings,
   createPruneMessages,
@@ -51,23 +33,31 @@ import {
 } from '@/common';
 import {
   resetIfNotEmpty,
+  isAnthropicLike,
   isOpenAILike,
   isGoogleLike,
   joinKeys,
   sleep,
 } from '@/utils';
-import { getChatModelClass, manualToolStreamProviders } from '@/llm/providers';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
-import { ChatOpenAI, AzureChatOpenAI } from '@/llm/openai';
-import { safeDispatchCustomEvent } from '@/utils/events';
+import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
+import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
+import { shouldTriggerSummarization } from '@/summarization';
+import { createSummarizeNode } from '@/summarization/node';
+import { messagesStateReducer } from '@/messages/reducer';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { AgentContext } from '@/agents/AgentContext';
 import { createFakeStreamingLLM } from '@/llm/fake';
 import { handleToolCalls } from '@/tools/handlers';
-import { ChatModelStreamHandler } from '@/stream';
+import { isThinkingEnabled } from '@/llm/request';
+import { initializeModel } from '@/llm/init';
 import { HandlerRegistry } from '@/events';
+import { ChatOpenAI } from '@/llm/openai';
 
-const { AGENT, TOOLS } = GraphNodeKeys;
+const { AGENT, TOOLS, SUMMARIZE } = GraphNodeKeys;
+
+/** Minimum relative variance before calibrated toolSchemaTokens overrides current value. */
+const CALIBRATION_VARIANCE_THRESHOLD = 0.15;
 
 export abstract class Graph<
   T extends t.BaseGraphState = t.BaseGraphState,
@@ -81,15 +71,6 @@ export abstract class Graph<
     currentTools?: t.GraphTools;
     currentToolMap?: t.ToolMap;
   }): CustomToolNode<T> | ToolNode<T>;
-  abstract initializeModel({
-    currentModel,
-    tools,
-    clientOptions,
-  }: {
-    currentModel?: t.ChatModel;
-    tools?: t.GraphTools;
-    clientOptions?: t.ClientOptions;
-  }): Runnable;
   abstract getRunMessages(): BaseMessage[] | undefined;
   abstract getContentParts(): t.MessageContentComplex[] | undefined;
   abstract generateStepId(stepKey: string): [string, number];
@@ -120,7 +101,10 @@ export abstract class Graph<
   abstract createCallModel(
     agentId?: string,
     currentModel?: t.ChatModel
-  ): (state: T, config?: RunnableConfig) => Promise<Partial<T>>;
+  ): (
+    state: t.AgentSubgraphState,
+    config?: RunnableConfig
+  ) => Promise<Partial<t.AgentSubgraphState>>;
   messageStepHasToolCalls: Map<string, boolean> = new Map();
   messageIdsByStepKey: Map<string, string> = new Map();
   prelimMessageIdsByStepKey: Map<string, string> = new Map();
@@ -129,6 +113,12 @@ export abstract class Graph<
   stepKeyIds: Map<string, string[]> = new Map<string, string[]>();
   contentIndexMap: Map<string, number> = new Map();
   toolCallStepIds: Map<string, string> = new Map();
+  /**
+   * Step IDs that have been dispatched via handler registry directly
+   * (in dispatchRunStep).  Used by the custom event callback to skip
+   * duplicate dispatch through the LangGraph callback chain.
+   */
+  handlerDispatchedStepIds: Set<string> = new Set();
   signal?: AbortSignal;
   /** Set of invoked tool call IDs from non-message run steps completed mid-run, if any */
   invokedToolIds?: Set<string>;
@@ -166,7 +156,16 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   /** Optional compile options passed into workflow.compile() */
   compileOptions?: t.CompileOptions | undefined;
   messages: BaseMessage[] = [];
+  /** Cached run messages preserved before clearHeavyState() so getRunMessages() works after cleanup. */
+  private cachedRunMessages?: BaseMessage[];
   runId: string | undefined;
+  /**
+   * Boundary between historical messages (loaded from conversation state)
+   * and messages produced during the current run.  Set once in the state
+   * reducer when messages first arrive.  Used by `getRunMessages()` and
+   * multi-agent message filtering — NOT for pruner token counting (the
+   * pruner maintains its own `lastTurnStartIndex` in its closure).
+   */
   startIndex: number = 0;
   signal?: AbortSignal;
   /** Map of agent contexts by agent ID */
@@ -175,12 +174,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   defaultAgentId: string;
 
   constructor({
-    // parent-level graph inputs
     runId,
     signal,
     agents,
     tokenCounter,
     indexTokenCountMap,
+    calibrationRatio,
   }: t.StandardGraphInput) {
     super();
     this.runId = runId;
@@ -196,6 +195,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         tokenCounter,
         indexTokenCountMap
       );
+      if (calibrationRatio != null && calibrationRatio > 0) {
+        agentContext.calibrationRatio = calibrationRatio;
+      }
 
       this.agentContexts.set(agentConfig.agentId, agentContext);
     }
@@ -207,6 +209,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
   resetValues(keepContent?: boolean): void {
     this.messages = [];
+    this.cachedRunMessages = undefined;
     this.config = resetIfNotEmpty(this.config, undefined);
     if (keepContent !== true) {
       this.contentData = resetIfNotEmpty(this.contentData, []);
@@ -220,6 +223,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
      * a stale reference on 2nd+ processStream calls.
      */
     this.toolCallStepIds.clear();
+    this.handlerDispatchedStepIds = resetIfNotEmpty(
+      this.handlerDispatchedStepIds,
+      new Set()
+    );
     this.messageIdsByStepKey = resetIfNotEmpty(
       this.messageIdsByStepKey,
       new Map()
@@ -239,6 +246,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   }
 
   override clearHeavyState(): void {
+    this.cachedRunMessages = this.messages.slice(this.startIndex);
     super.clearHeavyState();
     this.messages = [];
     this.overrideModel = undefined;
@@ -274,6 +282,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       agentId = currentNode.substring(AGENT.length);
     } else if (currentNode.startsWith(TOOLS)) {
       agentId = currentNode.substring(TOOLS.length);
+    } else if (currentNode.startsWith(SUMMARIZE)) {
+      agentId = currentNode.substring(SUMMARIZE.length);
     }
 
     const agentContext = this.agentContexts.get(agentId ?? '');
@@ -362,11 +372,31 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   /* Misc.*/
 
   getRunMessages(): BaseMessage[] | undefined {
+    if (this.messages.length === 0 && this.cachedRunMessages != null) {
+      return this.cachedRunMessages;
+    }
     return this.messages.slice(this.startIndex);
   }
 
   getContentParts(): t.MessageContentComplex[] | undefined {
     return convertMessagesToContent(this.messages.slice(this.startIndex));
+  }
+
+  getCalibrationRatio(): number {
+    const context = this.agentContexts.get(this.defaultAgentId);
+    return context?.calibrationRatio ?? 1;
+  }
+
+  getResolvedInstructionOverhead(): number | undefined {
+    const context = this.agentContexts.get(this.defaultAgentId);
+    return context?.resolvedInstructionOverhead;
+  }
+
+  getToolCount(): number {
+    const context = this.agentContexts.get(this.defaultAgentId);
+    return (
+      (context?.tools?.length ?? 0) + (context?.toolDefinitions?.length ?? 0)
+    );
   }
 
   /**
@@ -431,51 +461,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
   /* Graph */
 
-  createSystemRunnable({
-    provider,
-    clientOptions,
-    instructions,
-    additional_instructions,
-  }: {
-    provider?: Providers;
-    clientOptions?: t.ClientOptions;
-    instructions?: string;
-    additional_instructions?: string;
-  }): t.SystemRunnable | undefined {
-    let finalInstructions: string | BaseMessageFields | undefined =
-      instructions;
-    if (additional_instructions != null && additional_instructions !== '') {
-      finalInstructions =
-        finalInstructions != null && finalInstructions
-          ? `${finalInstructions}\n\n${additional_instructions}`
-          : additional_instructions;
-    }
-
-    if (
-      finalInstructions != null &&
-      finalInstructions &&
-      provider === Providers.ANTHROPIC &&
-      (clientOptions as t.AnthropicClientOptions).promptCache === true
-    ) {
-      finalInstructions = {
-        content: [
-          {
-            type: 'text',
-            text: instructions,
-            cache_control: { type: 'ephemeral' },
-          },
-        ],
-      };
-    }
-
-    if (finalInstructions != null && finalInstructions !== '') {
-      const systemMessage = new SystemMessage(finalInstructions);
-      return RunnableLambda.from((messages: BaseMessage[]) => {
-        return [systemMessage, ...messages];
-      }).withConfig({ runName: 'prompt' });
-    }
-  }
-
   initializeTools({
     currentTools,
     currentToolMap,
@@ -522,6 +507,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         toolCallStepIds: this.toolCallStepIds,
         toolRegistry: agentContext?.toolRegistry,
         directToolNames: directToolNames.size > 0 ? directToolNames : undefined,
+        maxContextTokens: agentContext?.maxContextTokens,
+        maxToolResultChars: agentContext?.maxToolResultChars,
         errorHandler: (data, metadata) =>
           StandardGraph.handleToolCallErrorStatic(this, data, metadata),
       });
@@ -551,56 +538,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         StandardGraph.handleToolCallErrorStatic(this, data, metadata),
       toolRegistry: agentContext?.toolRegistry,
       sessions: this.sessions,
+      maxContextTokens: agentContext?.maxContextTokens,
+      maxToolResultChars: agentContext?.maxToolResultChars,
     });
-  }
-
-  initializeModel({
-    provider,
-    tools,
-    clientOptions,
-  }: {
-    provider: Providers;
-    tools?: t.GraphTools;
-    clientOptions?: t.ClientOptions;
-  }): Runnable {
-    const ChatModelClass = getChatModelClass(provider);
-    const model = new ChatModelClass(clientOptions ?? {});
-
-    if (
-      isOpenAILike(provider) &&
-      (model instanceof ChatOpenAI || model instanceof AzureChatOpenAI)
-    ) {
-      model.temperature = (clientOptions as t.OpenAIClientOptions)
-        .temperature as number;
-      model.topP = (clientOptions as t.OpenAIClientOptions).topP as number;
-      model.frequencyPenalty = (clientOptions as t.OpenAIClientOptions)
-        .frequencyPenalty as number;
-      model.presencePenalty = (clientOptions as t.OpenAIClientOptions)
-        .presencePenalty as number;
-      model.n = (clientOptions as t.OpenAIClientOptions).n as number;
-    } else if (
-      provider === Providers.VERTEXAI &&
-      model instanceof ChatVertexAI
-    ) {
-      model.temperature = (clientOptions as t.VertexAIClientOptions)
-        .temperature as number;
-      model.topP = (clientOptions as t.VertexAIClientOptions).topP as number;
-      model.topK = (clientOptions as t.VertexAIClientOptions).topK as number;
-      model.topLogprobs = (clientOptions as t.VertexAIClientOptions)
-        .topLogprobs as number;
-      model.frequencyPenalty = (clientOptions as t.VertexAIClientOptions)
-        .frequencyPenalty as number;
-      model.presencePenalty = (clientOptions as t.VertexAIClientOptions)
-        .presencePenalty as number;
-      model.maxOutputTokens = (clientOptions as t.VertexAIClientOptions)
-        .maxOutputTokens as number;
-    }
-
-    if (!tools || tools.length === 0) {
-      return model as unknown as Runnable;
-    }
-
-    return (model as t.ModelWithTools).bindTools(tools);
   }
 
   overrideTestModel(
@@ -615,17 +555,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     });
   }
 
-  getNewModel({
-    provider,
-    clientOptions,
-  }: {
-    provider: Providers;
-    clientOptions?: t.ClientOptions;
-  }): t.ChatModelInstance {
-    const ChatModelClass = getChatModelClass(provider);
-    return new ChatModelClass(clientOptions ?? {});
-  }
-
   getUsageMetadata(
     finalMessage?: BaseMessage
   ): Partial<UsageMetadata> | undefined {
@@ -635,84 +564,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       finalMessage.usage_metadata != null
     ) {
       return finalMessage.usage_metadata as Partial<UsageMetadata>;
-    }
-  }
-
-  /** Execute model invocation with streaming support */
-  private async attemptInvoke(
-    {
-      currentModel,
-      finalMessages,
-      provider,
-      tools: _tools,
-    }: {
-      currentModel?: t.ChatModel;
-      finalMessages: BaseMessage[];
-      provider: Providers;
-      tools?: t.GraphTools;
-    },
-    config?: RunnableConfig
-  ): Promise<Partial<t.BaseGraphState>> {
-    const model = this.overrideModel ?? currentModel;
-    if (!model) {
-      throw new Error('No model found');
-    }
-
-    if (model.stream) {
-      /**
-       * Process all model output through a local ChatModelStreamHandler in the
-       * graph execution context. Each chunk is awaited before the next one is
-       * consumed, so by the time the stream is exhausted every run step
-       * (MESSAGE_CREATION, TOOL_CALLS) has been created and toolCallStepIds is
-       * fully populated — the graph will not transition to ToolNode until this
-       * is done.
-       *
-       * This replaces the previous pattern where ChatModelStreamHandler lived
-       * in the for-await stream consumer (handler registry). That consumer
-       * runs concurrently with graph execution, so the graph could advance to
-       * ToolNode before the consumer had processed all events. By handling
-       * chunks here, inside the agent node, the race is eliminated.
-       *
-       * The for-await consumer no longer needs a ChatModelStreamHandler; its
-       * on_chat_model_stream events are simply ignored (no handler registered).
-       * The dispatched custom events (ON_RUN_STEP, ON_MESSAGE_DELTA, etc.)
-       * still reach the content aggregator and SSE handlers through the custom
-       * event callback in Run.createCustomEventCallback.
-       */
-      const metadata = config?.metadata as Record<string, unknown> | undefined;
-      const streamHandler = new ChatModelStreamHandler();
-      const stream = await model.stream(finalMessages, config);
-      let finalChunk: AIMessageChunk | undefined;
-      for await (const chunk of stream) {
-        await streamHandler.handle(
-          GraphEvents.CHAT_MODEL_STREAM,
-          { chunk },
-          metadata,
-          this
-        );
-        finalChunk = finalChunk ? concat(finalChunk, chunk) : chunk;
-      }
-
-      if (manualToolStreamProviders.has(provider)) {
-        finalChunk = modifyDeltaProperties(provider, finalChunk);
-      }
-
-      if ((finalChunk?.tool_calls?.length ?? 0) > 0) {
-        finalChunk!.tool_calls = finalChunk!.tool_calls?.filter(
-          (tool_call: ToolCall) => !!tool_call.name
-        );
-      }
-
-      return { messages: [finalChunk as AIMessageChunk] };
-    } else {
-      /** Fallback for models without stream support. */
-      const finalMessage = await model.invoke(finalMessages, config);
-      if ((finalMessage.tool_calls?.length ?? 0) > 0) {
-        finalMessage.tool_calls = finalMessage.tool_calls?.filter(
-          (tool_call: ToolCall) => !!tool_call.name
-        );
-      }
-      return { messages: [finalMessage] };
     }
   }
 
@@ -734,12 +585,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
   createCallModel(agentId = 'default') {
     return async (
-      state: t.BaseGraphState,
+      state: t.AgentSubgraphState,
       config?: RunnableConfig
-    ): Promise<Partial<t.BaseGraphState>> => {
-      /**
-       * Get agent context - it must exist by this point
-       */
+    ): Promise<Partial<t.AgentSubgraphState>> => {
       const agentContext = this.agentContexts.get(agentId);
       if (!agentContext) {
         throw new Error(`Agent context not found for agentId: ${agentId}`);
@@ -751,7 +599,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
       const { messages } = state;
 
-      // Extract tool discoveries from current turn only (similar to formatArtifactPayload pattern)
       const discoveredNames = extractToolDiscoveries(messages);
       if (discoveredNames.length > 0) {
         agentContext.markToolsAsDiscovered(discoveredNames);
@@ -760,7 +607,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       const toolsForBinding = agentContext.getToolsForBinding();
       let model =
         this.overrideModel ??
-        this.initializeModel({
+        initializeModel({
           tools: toolsForBinding,
           provider: agentContext.provider,
           clientOptions: agentContext.clientOptions,
@@ -782,39 +629,147 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       if (
         !agentContext.pruneMessages &&
         agentContext.tokenCounter &&
-        agentContext.maxContextTokens != null &&
-        agentContext.indexTokenCountMap[0] != null
+        agentContext.maxContextTokens != null
       ) {
-        const isAnthropicWithThinking =
-          (agentContext.provider === Providers.ANTHROPIC &&
-            (agentContext.clientOptions as t.AnthropicClientOptions).thinking !=
-              null) ||
-          (agentContext.provider === Providers.BEDROCK &&
-            (agentContext.clientOptions as t.BedrockAnthropicInput)
-              .additionalModelRequestFields?.['thinking'] != null) ||
-          (agentContext.provider === Providers.OPENAI &&
-            (
-              (agentContext.clientOptions as t.OpenAIClientOptions).modelKwargs
-                ?.thinking as t.AnthropicClientOptions['thinking']
-            )?.type === 'enabled');
-
         agentContext.pruneMessages = createPruneMessages({
-          startIndex: this.startIndex,
+          startIndex:
+            agentContext.indexTokenCountMap[0] != null ? this.startIndex : 0,
           provider: agentContext.provider,
           tokenCounter: agentContext.tokenCounter,
           maxTokens: agentContext.maxContextTokens,
-          thinkingEnabled: isAnthropicWithThinking,
+          thinkingEnabled: isThinkingEnabled(
+            agentContext.provider,
+            agentContext.clientOptions
+          ),
           indexTokenCountMap: agentContext.indexTokenCountMap,
+          contextPruningConfig: agentContext.contextPruningConfig,
+          summarizationEnabled: agentContext.summarizationEnabled,
+          reserveRatio: agentContext.summarizationConfig?.reserveRatio,
+          calibrationRatio: agentContext.calibrationRatio,
+          getInstructionTokens: () => agentContext.instructionTokens,
+          log: (level, message, data) => {
+            emitAgentLog(config, level, 'prune', message, data, {
+              runId: this.runId,
+              agentId,
+            });
+          },
         });
       }
       if (agentContext.pruneMessages) {
-        const { context, indexTokenCountMap } = agentContext.pruneMessages({
+        const {
+          context,
+          indexTokenCountMap,
+          messagesToRefine,
+          prePruneContextTokens,
+          remainingContextTokens,
+          originalToolContent,
+          calibrationRatio,
+          resolvedInstructionOverhead,
+        } = agentContext.pruneMessages({
           messages,
           usageMetadata: agentContext.currentUsage,
-          // startOnMessageType: 'human',
+          lastCallUsage: agentContext.lastCallUsage,
+          totalTokensFresh: agentContext.totalTokensFresh,
         });
         agentContext.indexTokenCountMap = indexTokenCountMap;
+        if (calibrationRatio != null && calibrationRatio > 0) {
+          agentContext.calibrationRatio = calibrationRatio;
+        }
+        if (resolvedInstructionOverhead != null) {
+          agentContext.resolvedInstructionOverhead =
+            resolvedInstructionOverhead;
+          const nonToolOverhead =
+            agentContext.instructionTokens - agentContext.toolSchemaTokens;
+          const calibratedToolTokens = Math.max(
+            0,
+            resolvedInstructionOverhead - nonToolOverhead
+          );
+          const currentToolTokens = agentContext.toolSchemaTokens;
+          const variance =
+            currentToolTokens > 0
+              ? Math.abs(calibratedToolTokens - currentToolTokens) /
+                currentToolTokens
+              : 1;
+          if (variance > CALIBRATION_VARIANCE_THRESHOLD) {
+            agentContext.toolSchemaTokens = calibratedToolTokens;
+          }
+        }
         messagesToUse = context;
+
+        const hasPrunedMessages =
+          agentContext.summarizationEnabled === true &&
+          Array.isArray(messagesToRefine) &&
+          messagesToRefine.length > 0;
+
+        if (hasPrunedMessages) {
+          const shouldSkip = agentContext.shouldSkipSummarization(
+            messages.length
+          );
+          const triggerResult =
+            !shouldSkip &&
+            shouldTriggerSummarization({
+              trigger: agentContext.summarizationConfig?.trigger,
+              maxContextTokens: agentContext.maxContextTokens,
+              prePruneContextTokens:
+                prePruneContextTokens != null
+                  ? prePruneContextTokens + agentContext.instructionTokens
+                  : undefined,
+              remainingContextTokens,
+              messagesToRefineCount: messagesToRefine.length,
+            });
+
+          if (triggerResult) {
+            if (originalToolContent != null && originalToolContent.size > 0) {
+              agentContext.pendingOriginalToolContent = originalToolContent;
+            }
+
+            emitAgentLog(
+              config,
+              'info',
+              'graph',
+              'Summarization triggered',
+              undefined,
+              { runId: this.runId, agentId }
+            );
+            emitAgentLog(
+              config,
+              'debug',
+              'graph',
+              'Summarization trigger details',
+              {
+                totalMessages: messages.length,
+                remainingContextTokens: remainingContextTokens ?? 0,
+                summaryVersion: agentContext.summaryVersion + 1,
+                toolSchemaTokens: agentContext.toolSchemaTokens,
+                instructionTokens: agentContext.instructionTokens,
+                systemMessageTokens: agentContext.systemMessageTokens,
+              },
+              { runId: this.runId, agentId }
+            );
+            agentContext.markSummarizationTriggered(messages.length);
+            return {
+              summarizationRequest: {
+                remainingContextTokens: remainingContextTokens ?? 0,
+                agentId: agentId || agentContext.agentId,
+              },
+            };
+          }
+
+          if (shouldSkip) {
+            emitAgentLog(
+              config,
+              'debug',
+              'graph',
+              'Summarization skipped — no new messages or per-run cap reached',
+              {
+                messageCount: messages.length,
+                messagesToRefineCount: messagesToRefine.length,
+                contextLength: context.length,
+              },
+              { runId: this.runId, agentId }
+            );
+          }
+        }
       }
 
       let finalMessages = messagesToUse;
@@ -831,36 +786,42 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           ? finalMessages[finalMessages.length - 1]
           : null;
 
+      const anthropicLike = isAnthropicLike(
+        agentContext.provider,
+        agentContext.clientOptions as { model?: string }
+      );
+
       if (
         agentContext.provider === Providers.BEDROCK &&
         lastMessageX instanceof AIMessageChunk &&
         lastMessageY instanceof ToolMessage &&
         typeof lastMessageX.content === 'string'
       ) {
-        finalMessages[finalMessages.length - 2].content = '';
+        const trimmed = lastMessageX.content.trim();
+        finalMessages[finalMessages.length - 2].content =
+          trimmed.length > 0 ? [{ type: 'text' as const, text: trimmed }] : '';
       }
 
-      const isLatestToolMessage = lastMessageY instanceof ToolMessage;
-
-      if (
-        isLatestToolMessage &&
-        agentContext.provider === Providers.ANTHROPIC
-      ) {
-        formatAnthropicArtifactContent(finalMessages);
-      } else if (
-        isLatestToolMessage &&
-        ((isOpenAILike(agentContext.provider) &&
-          agentContext.provider !== Providers.DEEPSEEK) ||
-          isGoogleLike(agentContext.provider))
-      ) {
-        formatArtifactPayload(finalMessages);
+      if (lastMessageY instanceof ToolMessage) {
+        if (anthropicLike) {
+          formatAnthropicArtifactContent(finalMessages);
+        } else if (
+          (isOpenAILike(agentContext.provider) &&
+            agentContext.provider !== Providers.DEEPSEEK) ||
+          isGoogleLike(agentContext.provider)
+        ) {
+          formatArtifactPayload(finalMessages);
+        }
       }
 
       if (agentContext.provider === Providers.ANTHROPIC) {
         const anthropicOptions = agentContext.clientOptions as
           | t.AnthropicClientOptions
           | undefined;
-        if (anthropicOptions?.promptCache === true) {
+        if (
+          anthropicOptions?.promptCache === true &&
+          !agentContext.systemRunnable
+        ) {
           finalMessages = addCacheControl<BaseMessage>(finalMessages);
         }
       } else if (agentContext.provider === Providers.BEDROCK) {
@@ -872,24 +833,40 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         }
       }
 
-      /**
-       * Handle edge case: when switching from a non-thinking agent to a thinking-enabled agent,
-       * convert AI messages with tool calls to HumanMessages to avoid thinking block requirements.
-       * This is required by Anthropic/Bedrock when thinking is enabled.
-       */
-      const isAnthropicWithThinking =
-        (agentContext.provider === Providers.ANTHROPIC &&
-          (agentContext.clientOptions as t.AnthropicClientOptions).thinking !=
-            null) ||
-        (agentContext.provider === Providers.BEDROCK &&
-          (agentContext.clientOptions as t.BedrockAnthropicInput)
-            .additionalModelRequestFields?.['thinking'] != null);
-
-      if (isAnthropicWithThinking) {
+      if (
+        isThinkingEnabled(agentContext.provider, agentContext.clientOptions)
+      ) {
         finalMessages = ensureThinkingBlockInMessages(
           finalMessages,
-          agentContext.provider
+          agentContext.provider,
+          config
         );
+      }
+
+      // Intentionally broad: runs when the pruner wasn't used OR any post-pruning
+      // transform (addCacheControl, ensureThinkingBlock, etc.) reassigned finalMessages.
+      // sanitizeOrphanToolBlocks fast-paths to a Set diff check when no orphans exist,
+      // so the cost is negligible and this acts as a safety net for Anthropic/Bedrock.
+      const needsOrphanSanitize =
+        anthropicLike &&
+        (!agentContext.pruneMessages || finalMessages !== messagesToUse);
+      if (needsOrphanSanitize) {
+        const beforeSanitize = finalMessages.length;
+        finalMessages = sanitizeOrphanToolBlocks(finalMessages);
+        if (finalMessages.length !== beforeSanitize) {
+          emitAgentLog(
+            config,
+            'warn',
+            'sanitize',
+            'Orphan tool blocks removed',
+            {
+              before: beforeSanitize,
+              after: finalMessages.length,
+              dropped: beforeSanitize - finalMessages.length,
+            },
+            { runId: this.runId, agentId }
+          );
+        }
       }
 
       if (
@@ -906,64 +883,99 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }
 
       agentContext.lastStreamCall = Date.now();
+      agentContext.markTokensStale();
 
       let result: Partial<t.BaseGraphState> | undefined;
       const fallbacks =
         (agentContext.clientOptions as t.LLMConfig | undefined)?.fallbacks ??
         [];
 
-      if (finalMessages.length === 0) {
+      if (
+        finalMessages.length === 0 &&
+        !agentContext.hasPendingCompactionSummary()
+      ) {
+        const budgetBreakdown = agentContext.getTokenBudgetBreakdown(messages);
+        const breakdown = agentContext.formatTokenBudgetBreakdown(messages);
+        const instructionsExceedBudget =
+          budgetBreakdown.instructionTokens > budgetBreakdown.maxContextTokens;
+
+        let guidance: string;
+        if (instructionsExceedBudget) {
+          const toolPct =
+            budgetBreakdown.toolSchemaTokens > 0
+              ? Math.round(
+                (budgetBreakdown.toolSchemaTokens /
+                    budgetBreakdown.instructionTokens) *
+                    100
+              )
+              : 0;
+          guidance =
+            toolPct > 50
+              ? `Tool definitions consume ${budgetBreakdown.toolSchemaTokens} tokens (${toolPct}% of instructions) across ${budgetBreakdown.toolCount} tools, exceeding maxContextTokens (${budgetBreakdown.maxContextTokens}). Reduce the number of tools or increase maxContextTokens.`
+              : `Instructions (${budgetBreakdown.instructionTokens} tokens) exceed maxContextTokens (${budgetBreakdown.maxContextTokens}). Increase maxContextTokens or shorten the system prompt.`;
+          if (agentContext.summarizationEnabled === true) {
+            guidance +=
+              ' Summarization was skipped because the summary would further increase the instruction overhead.';
+          }
+        } else {
+          guidance =
+            'Please increase the context window size or make your message shorter.';
+        }
+
+        emitAgentLog(
+          config,
+          'error',
+          'graph',
+          'Empty messages after pruning',
+          {
+            messageCount: messages.length,
+            instructionsExceedBudget,
+            breakdown,
+          },
+          { runId: this.runId, agentId }
+        );
         throw new Error(
           JSON.stringify({
             type: 'empty_messages',
-            info: 'Message pruning removed all messages as none fit in the context window. Please increase the context window size or make your message shorter.',
+            info: `Message pruning removed all messages as none fit in the context window. ${guidance}\n${breakdown}`,
           })
         );
       }
 
+      const invokeStart = Date.now();
+      const invokeMeta = { runId: this.runId, agentId };
+      emitAgentLog(
+        config,
+        'debug',
+        'graph',
+        'Invoking LLM',
+        {
+          messageCount: finalMessages.length,
+          provider: agentContext.provider,
+        },
+        invokeMeta,
+        { force: true }
+      );
+
       try {
-        result = await this.attemptInvoke(
+        result = await attemptInvoke(
           {
-            currentModel: model,
-            finalMessages,
+            model: (this.overrideModel ?? model) as t.ChatModel,
+            messages: finalMessages,
             provider: agentContext.provider,
-            tools: agentContext.tools,
+            context: this,
           },
           config
         );
       } catch (primaryError) {
-        let lastError: unknown = primaryError;
-        for (const fb of fallbacks) {
-          try {
-            let model = this.getNewModel({
-              provider: fb.provider,
-              clientOptions: fb.clientOptions,
-            });
-            const bindableTools = agentContext.tools;
-            model = (
-              !bindableTools || bindableTools.length === 0
-                ? model
-                : model.bindTools(bindableTools)
-            ) as t.ChatModelInstance;
-            result = await this.attemptInvoke(
-              {
-                currentModel: model,
-                finalMessages,
-                provider: fb.provider,
-                tools: agentContext.tools,
-              },
-              config
-            );
-            lastError = undefined;
-            break;
-          } catch (e) {
-            lastError = e;
-            continue;
-          }
-        }
-        if (lastError !== undefined) {
-          throw lastError;
-        }
+        result = await tryFallbackProviders({
+          fallbacks,
+          tools: agentContext.tools,
+          messages: finalMessages,
+          config,
+          primaryError,
+          context: this,
+        });
       }
 
       if (!result) {
@@ -1091,13 +1103,46 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         }
       }
 
+      const invokeElapsed = ((Date.now() - invokeStart) / 1000).toFixed(2);
       agentContext.currentUsage = this.getUsageMetadata(result.messages?.[0]);
+      if (agentContext.currentUsage) {
+        agentContext.updateLastCallUsage(agentContext.currentUsage);
+        emitAgentLog(
+          config,
+          'debug',
+          'graph',
+          `LLM call complete (${invokeElapsed}s)`,
+          {
+            ...agentContext.currentUsage,
+            elapsedSeconds: Number(invokeElapsed),
+            instructionTokens: agentContext.instructionTokens,
+            toolSchemaTokens: agentContext.toolSchemaTokens,
+            messageCount: finalMessages.length,
+          },
+          invokeMeta,
+          { force: true }
+        );
+      } else {
+        emitAgentLog(
+          config,
+          'debug',
+          'graph',
+          `LLM call complete (${invokeElapsed}s)`,
+          {
+            elapsedSeconds: Number(invokeElapsed),
+            messageCount: finalMessages.length,
+          },
+          invokeMeta,
+          { force: true }
+        );
+      }
       this.cleanupSignalListener();
       return result;
     };
   }
 
   createAgentNode(agentId: string): t.CompiledAgentWorfklow {
+    const getConfig = (): RunnableConfig | undefined => this.config;
     const agentContext = this.agentContexts.get(agentId);
     if (!agentContext) {
       throw new Error(`Agent context not found for agentId: ${agentId}`);
@@ -1105,19 +1150,34 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
     const agentNode = `${AGENT}${agentId}` as const;
     const toolNode = `${TOOLS}${agentId}` as const;
+    const summarizeNode = `${SUMMARIZE}${agentId}` as const;
 
     const routeMessage = (
-      state: t.BaseGraphState,
+      state: t.AgentSubgraphState,
       config?: RunnableConfig
     ): string => {
       this.config = config;
-      return toolsCondition(state, toolNode, this.invokedToolIds);
+      if (state.summarizationRequest != null) {
+        return summarizeNode;
+      }
+      return toolsCondition(
+        state as t.BaseGraphState,
+        toolNode,
+        this.invokedToolIds
+      );
     };
 
     const StateAnnotation = Annotation.Root({
       messages: Annotation<BaseMessage[]>({
         reducer: messagesStateReducer,
         default: () => [],
+      }),
+      summarizationRequest: Annotation<t.SummarizationNodeInput | undefined>({
+        reducer: (
+          _: t.SummarizationNodeInput | undefined,
+          b: t.SummarizationNodeInput | undefined
+        ) => b,
+        default: () => undefined,
       }),
     });
 
@@ -1131,16 +1191,82 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           agentContext,
         })
       )
+      .addNode(
+        summarizeNode,
+        createSummarizeNode({
+          agentContext,
+          graph: {
+            contentData: this.contentData,
+            contentIndexMap: this.contentIndexMap,
+            get config() {
+              return getConfig();
+            },
+            runId: this.runId,
+            isMultiAgent: this.isMultiAgentGraph(),
+            dispatchRunStep: async (runStep, nodeConfig) => {
+              this.contentData.push(runStep);
+              this.contentIndexMap.set(runStep.id, runStep.index);
+
+              const resolvedConfig = nodeConfig ?? this.config;
+              const handler = this.handlerRegistry?.getHandler(
+                GraphEvents.ON_RUN_STEP
+              );
+              if (handler) {
+                await handler.handle(
+                  GraphEvents.ON_RUN_STEP,
+                  runStep,
+                  resolvedConfig?.configurable,
+                  this
+                );
+                this.handlerDispatchedStepIds.add(runStep.id);
+              }
+
+              if (resolvedConfig) {
+                await safeDispatchCustomEvent(
+                  GraphEvents.ON_RUN_STEP,
+                  runStep,
+                  resolvedConfig
+                );
+              }
+            },
+            dispatchRunStepCompleted: async (
+              stepId: string,
+              result: t.StepCompleted,
+              nodeConfig?: RunnableConfig
+            ) => {
+              const resolvedConfig = nodeConfig ?? this.config;
+              const runStep = this.contentData.find((s) => s.id === stepId);
+              const handler = this.handlerRegistry?.getHandler(
+                GraphEvents.ON_RUN_STEP_COMPLETED
+              );
+              if (handler) {
+                await handler.handle(
+                  GraphEvents.ON_RUN_STEP_COMPLETED,
+                  {
+                    result: {
+                      ...result,
+                      id: stepId,
+                      index: runStep?.index ?? 0,
+                    },
+                  },
+                  resolvedConfig?.configurable,
+                  this
+                );
+              }
+            },
+          },
+          generateStepId: (stepKey: string) => this.generateStepId(stepKey),
+        })
+      )
       .addEdge(START, agentNode)
       .addConditionalEdges(agentNode, routeMessage)
+      .addEdge(summarizeNode, agentNode)
       .addEdge(toolNode, agentContext.toolEnd ? END : agentNode);
 
-    // Cast to unknown to avoid tight coupling to external types; options are opt-in
-    return workflow.compile(this.compileOptions as unknown as never);
+    return workflow.compile();
   }
 
   createWorkflow(): t.CompiledStateWorkflow {
-    /** Use the default (first) agent for now */
     const agentNode = this.createAgentNode(this.defaultAgentId);
     const StateAnnotation = Annotation.Root({
       messages: Annotation<BaseMessage[]>({
@@ -1158,7 +1284,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     const workflow = new StateGraph(StateAnnotation)
       .addNode(this.defaultAgentId, agentNode, { ends: [END] })
       .addEdge(START, this.defaultAgentId)
-      .compile();
+      // LangGraph compile() types are overly strict for opt-in options
+      .compile(this.compileOptions as unknown as never);
 
     return workflow;
   }
@@ -1222,18 +1349,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       runStep.runId = runId;
     }
 
-    /**
-     * Extract agentId and parallelGroupId from metadata
-     * Only set agentId for MultiAgentGraph (so frontend knows when to show agent labels)
-     */
     if (metadata) {
       try {
         const agentContext = this.getAgentContext(metadata);
         if (this.isMultiAgentGraph() && agentContext.agentId) {
-          // Only include agentId for MultiAgentGraph - enables frontend to show agent labels
           runStep.agentId = agentContext.agentId;
-          // Set group ID if this agent is part of a parallel group
-          // Group IDs are incrementing numbers (1, 2, 3...) reflecting execution order
           const groupId = this.getParallelGroupIdForAgent(agentContext.agentId);
           if (groupId != null) {
             runStep.groupId = groupId;
@@ -1246,6 +1366,23 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
     this.contentData.push(runStep);
     this.contentIndexMap.set(stepId, runStep.index);
+
+    // Primary dispatch: handler registry (reliable, always works).
+    // This mirrors how handleToolCallCompleted dispatches ON_RUN_STEP_COMPLETED
+    // via the handler registry, ensuring the event always reaches the handler
+    // even when LangGraph's callback system drops the custom event.
+    const handler = this.handlerRegistry?.getHandler(GraphEvents.ON_RUN_STEP);
+    if (handler) {
+      await handler.handle(GraphEvents.ON_RUN_STEP, runStep, metadata, this);
+      this.handlerDispatchedStepIds.add(stepId);
+    }
+
+    // Secondary dispatch: custom event for LangGraph callback chain
+    // (tracing, Langfuse, external consumers).  May be silently dropped
+    // in some scenarios (stale run ID, subgraph callback propagation issues),
+    // but the primary dispatch above guarantees the event reaches the handler.
+    // The customEventCallback in run.ts skips events already dispatched above
+    // to prevent double handling.
     await safeDispatchCustomEvent(
       GraphEvents.ON_RUN_STEP,
       runStep,

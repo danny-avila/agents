@@ -9,7 +9,7 @@ import { Providers } from '@/common';
 
 async function testBedrockMerge(): Promise<void> {
   const model = new CustomChatBedrockConverse({
-    model: 'us.anthropic.claude-3-7-sonnet-20250219-v1:0',
+    model: 'us.anthropic.claude-sonnet-4-5-20250929-v1:0',
     region: process.env.BEDROCK_AWS_REGION,
     credentials: {
       accessKeyId: process.env.BEDROCK_AWS_ACCESS_KEY_ID!,

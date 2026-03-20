@@ -13,11 +13,14 @@ import type {
   ExtendedMessageContent,
   MessageContentComplex,
   ReasoningContentText,
+  SummaryContentBlock,
   ToolCallContent,
   ToolCallPart,
   TPayload,
   TMessage,
 } from '@/types';
+import type { RunnableConfig } from '@langchain/core/runnables';
+import { emitAgentLog } from '@/utils/events';
 import { Providers, ContentTypes, Constants } from '@/common';
 
 interface MediaMessageParams {
@@ -380,7 +383,8 @@ function formatAssistantMessage(
         continue;
       } else if (
         part.type === ContentTypes.ERROR ||
-        part.type === ContentTypes.AGENT_UPDATE
+        part.type === ContentTypes.AGENT_UPDATE ||
+        part.type === ContentTypes.SUMMARY
       ) {
         continue;
       } else {
@@ -413,6 +417,17 @@ function formatAssistantMessage(
   }
 
   return formattedMessages;
+}
+
+function getSourceMessageId(message: Partial<TMessage>): string | undefined {
+  const candidate =
+    (message as { messageId?: string }).messageId ??
+    (message as { id?: string }).id;
+  if (typeof candidate !== 'string') {
+    return undefined;
+  }
+  const normalized = candidate.trim();
+  return normalized.length > 0 ? normalized : undefined;
 }
 
 /**
@@ -677,6 +692,111 @@ function extractToolNamesFromSearchOutput(output: string): string[] {
   return [];
 }
 
+type SummaryBoundary = {
+  messageIndex: number;
+  contentIndex: number;
+  text: string;
+  tokenCount: number;
+};
+
+function getLatestSummaryBoundary(
+  payload: TPayload
+): SummaryBoundary | undefined {
+  let summaryBoundary: SummaryBoundary | undefined;
+
+  for (let i = 0; i < payload.length; i++) {
+    const message = payload[i];
+    if (!Array.isArray(message.content)) {
+      continue;
+    }
+
+    for (let j = 0; j < message.content.length; j++) {
+      const part = message.content[j] as MessageContentComplex | undefined;
+      if (part == null || part.type !== ContentTypes.SUMMARY) {
+        continue;
+      }
+
+      const summaryPart = part as Partial<SummaryContentBlock> & {
+        text?: string;
+      };
+
+      // Try content array first (new format), then direct text (legacy format)
+      let summaryText = (summaryPart.content ?? [])
+        .map((block) =>
+          'text' in block ? (block as { text: string }).text : ''
+        )
+        .join('')
+        .trim();
+
+      // Fallback: legacy format where text was a direct field on the block
+      if (summaryText.length === 0 && typeof summaryPart.text === 'string') {
+        summaryText = summaryPart.text.trim();
+      }
+
+      if (summaryText.length === 0) {
+        continue;
+      }
+
+      summaryBoundary = {
+        messageIndex: i,
+        contentIndex: j,
+        text: summaryText,
+        tokenCount:
+          typeof summaryPart.tokenCount === 'number' &&
+          Number.isFinite(summaryPart.tokenCount)
+            ? summaryPart.tokenCount
+            : 0,
+      };
+    }
+  }
+
+  return summaryBoundary;
+}
+
+function applySummaryBoundary(
+  message: Partial<TMessage>,
+  messageIndex: number,
+  summaryBoundary?: SummaryBoundary
+): Partial<TMessage> | null {
+  if (!summaryBoundary) {
+    return message;
+  }
+
+  if (messageIndex < summaryBoundary.messageIndex) {
+    return null;
+  }
+
+  if (
+    messageIndex !== summaryBoundary.messageIndex ||
+    !Array.isArray(message.content)
+  ) {
+    return message;
+  }
+
+  return {
+    ...message,
+    content: message.content.slice(summaryBoundary.contentIndex + 1),
+  };
+}
+
+function contentPartCharLength(part: MessageContentComplex): number {
+  const record = part as Record<string, unknown>;
+  let len = 0;
+  if (typeof record.text === 'string') {
+    len += record.text.length;
+  }
+  if (typeof record.thinking === 'string') {
+    len += record.thinking.length;
+  }
+  const { input } = record;
+  if (typeof input === 'string') {
+    len += input.length;
+  } else if (input != null && typeof input === 'object') {
+    len += JSON.stringify(input).length;
+  }
+  return len;
+}
+
 /**
  * Formats an array of messages for LangChain, handling tool calls and creating ToolMessage instances.
  *
@@ -692,14 +812,39 @@ export const formatAgentMessages = (
 ): {
   messages: Array<HumanMessage | AIMessage | SystemMessage | ToolMessage>;
   indexTokenCountMap?: Record<number, number>;
+  /** Cross-run summary extracted from the payload. Should be forwarded to the
+   *  agent run so it can be included in the system message via AgentContext. */
+  summary?: { text: string; tokenCount: number };
+  /** When a summary boundary sliced content from a message, the token count
+   *  was proportionally reduced. Returned so the caller can log it. */
+  boundaryTokenAdjustment?: {
+    original: number;
+    adjusted: number;
+    remainingChars: number;
+    totalChars: number;
+  };
 } => {
   const messages: Array<
     HumanMessage | AIMessage | SystemMessage | ToolMessage
   > = [];
   // If indexTokenCountMap is provided, create a new map to track the updated indices
   const updatedIndexTokenCountMap: Record<number, number> = {};
+  let boundaryTokenAdjustment:
+    | {
+        original: number;
+        adjusted: number;
+        remainingChars: number;
+        totalChars: number;
+      }
+    | undefined;
   // Keep track of the mapping from original payload indices to result indices
   const indexMapping: Record<number, number[] | undefined> = {};
+  const summaryBoundary = getLatestSummaryBoundary(payload);
+
+  // Summary metadata is returned to the caller so it can be forwarded to the
+  // agent run and included in the single system message via AgentContext.
+  // We intentionally do NOT create a SystemMessage here — that would conflict
+  // with the agent's own system message (instructions + summary combined).
 
   /**
    * Create a mutable copy of the tools set that can be expanded dynamically.
@@ -710,21 +855,37 @@ export const formatAgentMessages = (
 
   // Process messages with tool conversion if tools set is provided
   for (let i = 0; i < payload.length; i++) {
-    const message = payload[i];
+    const rawMessage = payload[i];
+    const sourceMessageId = getSourceMessageId(rawMessage);
+    let message = applySummaryBoundary(rawMessage, i, summaryBoundary);
+    if (!message) {
+      indexMapping[i] = [];
+      continue;
+    }
+
     // Q: Store the current length of messages to track where this payload message starts in the result?
     // const startIndex = messages.length;
     if (typeof message.content === 'string') {
-      message.content = [
-        { type: ContentTypes.TEXT, [ContentTypes.TEXT]: message.content },
-      ];
+      message = {
+        ...message,
+        content: [
+          { type: ContentTypes.TEXT, [ContentTypes.TEXT]: message.content },
+        ],
+      };
+    } else if (Array.isArray(message.content) && message.content.length === 0) {
+      indexMapping[i] = [];
+      continue;
     }
+
     if (message.role !== 'assistant') {
-      messages.push(
-        formatMessage({
-          message: message as MessageInput,
-          langChain: true,
-        }) as HumanMessage | AIMessage | SystemMessage
-      );
+      const formattedMessage = formatMessage({
+        message: message as MessageInput,
+        langChain: true,
+      }) as HumanMessage | AIMessage | SystemMessage;
+      if (sourceMessageId != null && sourceMessageId !== '') {
+        formattedMessage.id = sourceMessageId;
+      }
+      messages.push(formattedMessage);
 
       // Update the index mapping for this message
       indexMapping[i] = [messages.length - 1];
@@ -743,7 +904,7 @@ export const formatAgentMessages = (
     let processedMessage = message;
     if (discoveredTools) {
       const content = message.content;
-      if (content && Array.isArray(content)) {
+      if (content != null && Array.isArray(content)) {
         const filteredContent: typeof content = [];
         const invalidToolCallIds = new Set<string>();
         const invalidToolStrings: string[] = [];
@@ -866,8 +1027,12 @@ export const formatAgentMessages = (
       }
     }
 
-    // Process the assistant message using the helper function
     const formattedMessages = formatAssistantMessage(processedMessage);
+    if (sourceMessageId != null && sourceMessageId !== '') {
+      for (const formattedMessage of formattedMessages) {
+        formattedMessage.id = sourceMessageId;
+      }
+    }
     messages.push(...formattedMessages);
 
     // Update the index mapping for this assistant message
@@ -887,10 +1052,44 @@ export const formatAgentMessages = (
       originalIndex++
     ) {
       const resultIndices = indexMapping[originalIndex] || [];
-      const tokenCount = indexTokenCountMap[originalIndex];
+      let tokenCount = indexTokenCountMap[originalIndex];
 
       if (tokenCount === undefined) {
         continue;
+      }
+
+      if (
+        summaryBoundary &&
+        originalIndex === summaryBoundary.messageIndex &&
+        Array.isArray(payload[originalIndex].content)
+      ) {
+        const content = payload[originalIndex]
+          .content as MessageContentComplex[];
+        const { contentIndex } = summaryBoundary;
+        if (contentIndex >= 0 && contentIndex < content.length - 1) {
+          let totalCharLen = 0;
+          let remainingCharLen = 0;
+          for (let p = 0; p < content.length; p++) {
+            const charLen = contentPartCharLength(content[p]);
+            totalCharLen += charLen;
+            if (p > contentIndex) {
+              remainingCharLen += charLen;
+            }
+          }
+          if (totalCharLen > 0) {
+            const original = tokenCount;
+            tokenCount = Math.max(
+              1,
+              Math.round(tokenCount * (remainingCharLen / totalCharLen))
+            );
+            boundaryTokenAdjustment = {
+              original,
+              adjusted: tokenCount,
+              remainingChars: remainingCharLen,
+              totalChars: totalCharLen,
+            };
+          }
+        }
       }
 
       const msgCount = resultIndices.length;
@@ -969,6 +1168,10 @@ export const formatAgentMessages = (
     indexTokenCountMap: indexTokenCountMap
       ? updatedIndexTokenCountMap
       : undefined,
+    summary: summaryBoundary
+      ? { text: summaryBoundary.text, tokenCount: summaryBoundary.tokenCount }
+      : undefined,
+    boundaryTokenAdjustment,
   };
 };
 
@@ -1117,11 +1320,13 @@ function appendToolCalls(
  *
  * @param messages - Array of messages to process
  * @param provider - The provider being used (unused but kept for future compatibility)
+ * @param config - Optional RunnableConfig for structured agent logging
  * @returns The messages array with tool sequences converted to buffer strings if necessary
  */
 export function ensureThinkingBlockInMessages(
   messages: BaseMessage[],
-  _provider: Providers
+  _provider: Providers,
+  config?: RunnableConfig
 ): BaseMessage[] {
   if (messages.length === 0) {
     return messages;
@@ -1232,6 +1437,13 @@ export function ensureThinkingBlockInMessages(
       }
 
       flushTextChunks(textChunks, parts);
+      emitAgentLog(
+        config,
+        'warn',
+        'format',
+        'ensureThinkingBlockInMessages: injecting [Previous agent context] HumanMessage' +
+          ` (${parts.length} msgs at index ${i}, no thinking block in chain)`
+      );
       result.push(new HumanMessage({ content: parts }));
       i = j;
     } else {

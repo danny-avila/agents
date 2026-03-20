@@ -148,6 +148,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
     if (!graph.config) {
       throw new Error('Config not found in graph');
     }
+
     if (!data.chunk) {
       console.warn(`No chunk found in ${event} event`);
       return;
@@ -513,6 +514,18 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       };
 
       contentParts[index] = update;
+    } else if (partType === ContentTypes.SUMMARY) {
+      const currentSummary = contentParts[index] as
+        | t.SummaryContentBlock
+        | undefined;
+      const incoming = contentPart as t.SummaryContentBlock;
+      contentParts[index] = {
+        ...incoming,
+        content: [
+          ...(currentSummary?.content ?? []),
+          ...(incoming.content ?? []),
+        ],
+      };
     } else if (
       partType === ContentTypes.IMAGE_URL &&
       'image_url' in contentPart
@@ -618,9 +631,41 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       | t.RunStep
       | t.AgentUpdate
       | t.MessageDeltaEvent
+      | t.ReasoningDeltaEvent
       | t.RunStepDeltaEvent
+      | t.SummarizeDeltaData
+      | t.SummarizeCompleteEvent
       | { result: t.ToolEndEvent };
   }): void => {
+    if (event === GraphEvents.ON_SUMMARIZE_DELTA) {
+      const deltaData = data as t.SummarizeDeltaData;
+      const runStep = stepMap.get(deltaData.id);
+      if (!runStep) {
+        console.warn('No run step found for summarize delta event');
+        return;
+      }
+      updateContent(runStep.index, deltaData.delta.summary);
+      return;
+    }
+
+    if (event === GraphEvents.ON_SUMMARIZE_COMPLETE) {
+      const completeData = data as t.SummarizeCompleteEvent;
+      const summary = completeData.summary;
+      if (!summary?.boundary) {
+        return;
+      }
+      const runStep = stepMap.get(summary.boundary.messageId);
+      if (!runStep) {
+        return;
+      }
+      // Replace accumulated delta text with the authoritative final summary.
+      // Multi-stage summarization streams deltas from each chunk, which
+      // concatenate in updateContent.  This event carries only the correct
+      // final text from the last stage.
+      contentParts[runStep.index] = summary;
+      return;
+    }
+
     if (event === GraphEvents.ON_RUN_STEP) {
       const runStep = data as t.RunStep;
       stepMap.set(runStep.id, runStep);
@@ -641,7 +686,10 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         contentMetaMap.set(runStep.index, existingMeta);
       }
 
-      // Store tool call IDs if present
+      if (runStep.summary != null) {
+        updateContent(runStep.index, runStep.summary);
+      }
+
       if (
         runStep.stepDetails.type === StepTypes.TOOL_CALLS &&
         runStep.stepDetails.tool_calls
@@ -732,24 +780,29 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         });
       }
     } else if (event === GraphEvents.ON_RUN_STEP_COMPLETED) {
-      const { result } = data as unknown as { result: t.ToolEndEvent };
+      const { result } = data as unknown as {
+        result:
+          | t.ToolEndEvent
+          | (t.SummaryCompleted & { id: string; index: number });
+      };
 
       const { id: stepId } = result;
 
       const runStep = stepMap.get(stepId);
       if (!runStep) {
-        console.warn(
-          'No run step or runId found for completed tool call event'
-        );
+        console.warn('No run step or runId found for completed step event');
         return;
       }
 
-      const contentPart: t.MessageContentComplex = {
-        type: ContentTypes.TOOL_CALL,
-        tool_call: result.tool_call,
-      };
-
-      updateContent(runStep.index, contentPart, true);
+      if (result.type === ContentTypes.SUMMARY && 'summary' in result) {
+        contentParts[runStep.index] = result.summary as t.MessageContentComplex;
+      } else if ('tool_call' in result) {
+        const contentPart: t.MessageContentComplex = {
+          type: ContentTypes.TOOL_CALL,
+          tool_call: (result as t.ToolEndEvent).tool_call,
+        };
+        updateContent(runStep.index, contentPart, true);
+      }
     }
   };
 

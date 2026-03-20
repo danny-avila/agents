@@ -75,6 +75,7 @@ describe('Token Distribution Edge Case Tests', () => {
       startIndex: 0,
       tokenCounter,
       indexTokenCountMap: { ...indexTokenCountMap },
+      reserveRatio: 0,
     });
 
     // First call to establish lastCutOffIndex
@@ -115,18 +116,21 @@ describe('Token Distribution Edge Case Tests', () => {
 
     expect(atLeastOnePrunedMessageUnchanged).toBe(true);
 
-    // Verify that the sum of tokens for messages in the context is close to the total_tokens from usageMetadata
-    // There might be small rounding differences or implementation details that affect the exact sum
-    const totalContextTokens =
+    // Calibration uses input_tokens (30) only (no output), minus instruction overhead (0).
+    // Map stays in raw tiktoken space — calibrationRatio captures the multiplier.
+    // Context messages: indices 0, 3, 4 → raw sum unchanged.
+    // calibrationRatio × rawSum should approximate input_tokens (30).
+    const rawContextTokens =
       (result.indexTokenCountMap[0] ?? 0) +
       (result.indexTokenCountMap[3] ?? 0) +
       (result.indexTokenCountMap[4] ?? 0);
-    expect(totalContextTokens).toBeGreaterThan(0);
+    expect(rawContextTokens).toBeGreaterThan(0);
 
-    // The key thing we're testing is that the token distribution happens for messages in the context
-    // and that the sum is reasonably close to the expected total
-    const tokenDifference = Math.abs(totalContextTokens - 50);
-    expect(tokenDifference).toBeLessThan(20); // Allow for some difference due to implementation details
+    const calibratedTotal = Math.round(
+      rawContextTokens * (result.calibrationRatio ?? 1)
+    );
+    const tokenDifference = Math.abs(calibratedTotal - 30);
+    expect(tokenDifference).toBeLessThan(10);
   });
 
   it('should handle the case when all messages fit within the token limit', () => {
@@ -174,28 +178,22 @@ describe('Token Distribution Edge Case Tests', () => {
       usageMetadata,
     });
 
-    // Since all messages fit, all token counts should be adjusted
-    const initialTotalTokens =
-      indexTokenCountMap[0] + indexTokenCountMap[1] + indexTokenCountMap[2];
-    const expectedRatio = 30 / initialTotalTokens;
+    // Calibration uses input_tokens (20) only, minus instruction overhead (0).
+    // messageTokenSum = 17 + 9 + 10 = 36. ratio = 20/36 = 0.556. Safe.
+    // Map stays raw — calibrationRatio captures the multiplier
+    expect(result.indexTokenCountMap[0]).toBe(indexTokenCountMap[0]);
+    expect(result.indexTokenCountMap[1]).toBe(indexTokenCountMap[1]);
+    expect(result.indexTokenCountMap[2]).toBe(indexTokenCountMap[2]);
 
-    // Check that all token counts were adjusted
-    expect(result.indexTokenCountMap[0]).toBe(
-      Math.round(indexTokenCountMap[0] * expectedRatio)
-    );
-    expect(result.indexTokenCountMap[1]).toBe(
-      Math.round(indexTokenCountMap[1] * expectedRatio)
-    );
-    expect(result.indexTokenCountMap[2]).toBe(
-      Math.round(indexTokenCountMap[2] * expectedRatio)
-    );
-
-    // Verify that the sum of all tokens equals the total_tokens from usageMetadata
-    const totalTokens =
+    // rawSum × calibrationRatio should approximate input_tokens (20)
+    const rawTotal =
       (result.indexTokenCountMap[0] ?? 0) +
       (result.indexTokenCountMap[1] ?? 0) +
       (result.indexTokenCountMap[2] ?? 0);
-    expect(totalTokens).toBe(30);
+    const calibratedTotal = Math.round(
+      rawTotal * (result.calibrationRatio ?? 1)
+    );
+    expect(Math.abs(calibratedTotal - 20)).toBeLessThanOrEqual(3);
   });
 
   it('should handle multiple pruning operations with token redistribution', () => {
@@ -230,6 +228,7 @@ describe('Token Distribution Edge Case Tests', () => {
       startIndex: 0,
       tokenCounter,
       indexTokenCountMap: { ...indexTokenCountMap },
+      reserveRatio: 0,
     });
 
     // First pruning operation

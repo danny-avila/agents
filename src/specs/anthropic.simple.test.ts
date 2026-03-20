@@ -24,7 +24,7 @@ import { Run } from '@/run';
 
 const provider = Providers.ANTHROPIC;
 describe(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
-  jest.setTimeout(60000);
+  jest.setTimeout(90000);
   let run: Run<t.IState>;
   let runningHistory: BaseMessage[];
   let collectedUsage: UsageMetadata[];

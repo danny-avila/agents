@@ -1,4 +1,4 @@
-# Multi-Agent Patterns in Agentus
+# Multi-Agent Patterns
 
 This document explains the different multi-agent patterns supported by the `MultiAgentGraph` class.
 
