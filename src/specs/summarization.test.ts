@@ -442,7 +442,7 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
       (c) => (c[0] as t.SummarizeStartEvent).agentId === startPayload.agentId
     );
     expect(startCallsForSameAgent.length).toBeGreaterThanOrEqual(1);
-  });
+  }, 180_000);
 
   test('post-summary continuation over multiple turns preserves context', async () => {
     const spies = createSpies();
@@ -708,7 +708,7 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
     console.log(
       `  Cross-provider summary (${getSummaryText(completePayload.summary).length} chars): "${getSummaryText(completePayload.summary).substring(0, 200)}…"`
     );
-  });
+  }, 180_000);
 
   test('extended thinking: multi-turn with reasoning triggers summarization and grounds token accounting', async () => {
     const spies = createSpies();
@@ -965,7 +965,7 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
     expect(anthropicTokens).toBeGreaterThan(0);
     expect(localTotal).toBeGreaterThan(0);
     expect(driftPct).toBeLessThan(30);
-  });
+  }, 180_000);
 });
 
 // ---------------------------------------------------------------------------
@@ -1103,7 +1103,7 @@ const hasBedrock = requiredBedrockEnv.every((k) => process.env[k] != null);
     );
     expect(postSumResult).toBeDefined();
     logTurn('Post-sum', conversationHistory);
-  });
+  }, 180_000);
 });
 
 // ---------------------------------------------------------------------------
@@ -1270,7 +1270,7 @@ const hasOpenAI = process.env.OPENAI_API_KEY != null;
       `  OpenAI summary: "${getSummaryText(completePayload.summary).substring(0, 200)}…"`
     );
     console.log(`  Final messages: ${conversationHistory.length}`);
-  });
+  }, 120_000);
 });
 
 // ---------------------------------------------------------------------------
@@ -2495,7 +2495,7 @@ const hasAnyApiKey =
       `  Token audit: summary=${completePayload.summary!.tokenCount} tokens, ` +
         `usageEntries=${validUsage.length}`
     );
-  });
+  }, 180_000);
 
   test('summary tokenCount matches local token counter', async () => {
     const spies = createSpies();
@@ -2600,10 +2600,9 @@ const hasAnyApiKey =
     const variance =
       Math.abs(reportedTokenCount - localTokenCount) / localTokenCount;
     expect(variance).toBeLessThan(0.25);
-  });
+  }, 180_000);
 
   test('collectedUsage input_tokens decreases after summarization', async () => {
-    jest.setTimeout(120_000);
     const spies = createSpies();
     let collectedUsage: UsageMetadata[] = [];
     const conversationHistory: BaseMessage[] = [];
@@ -2731,7 +2730,7 @@ const hasAnyApiKey =
         `  Summarization fired: ${spies.onSummarizeCompleteSpy.mock.calls.length} times`
       );
     }
-  });
+  }, 180_000);
 });
 
 // ---------------------------------------------------------------------------
