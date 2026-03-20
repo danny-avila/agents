@@ -681,6 +681,24 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
       );
     }
 
+    if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
+      run = await createRun(3000);
+      await runTurn(
+        { run, conversationHistory },
+        'Compute 11 * 13 with calculator.',
+        streamConfig
+      );
+    }
+
+    if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
+      run = await createRun(2800);
+      await runTurn(
+        { run, conversationHistory },
+        'What is 9 * 9? Calculator.',
+        streamConfig
+      );
+    }
+
     console.log(
       `  Cross-provider summaries: ${spies.onSummarizeCompleteSpy.mock.calls.length}`
     );
