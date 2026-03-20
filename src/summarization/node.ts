@@ -31,7 +31,7 @@ const SUMMARY_WRAPPER_OVERHEAD_TOKENS = 33;
 /** Structured checkpoint prompt for fresh summarization (no prior summary). */
 export const DEFAULT_SUMMARIZATION_PROMPT = `Hold on, before you continue I need you to write me a checkpoint of everything so far. Your context window is filling up and this checkpoint replaces the messages above, so capture everything you need to pick right back up.
 
-Don't second-guess or fact-check anything you did, your tool results reflect exactly what happened. Just record what you did and what you observed. Only the checkpoint, don't respond to me or continue the conversation.
+Don't second-guess or fact-check anything you did, your tool results reflect exactly what happened. If a tool result appears truncated, that's just a display artifact from context management: the tool executed fully. Just record what you did and what you observed. Only the checkpoint, don't respond to me or continue the conversation.
 
 ## Checkpoint
 
@@ -69,7 +69,7 @@ export const DEFAULT_UPDATE_SUMMARIZATION_PROMPT = `Hold on again, update your c
 
 Keep it roughly the same length as your last checkpoint. Compress older details to make room for what's new, don't just append. Give recent actions more detail, compress older items to one-liners.
 
-Don't fact-check or second-guess anything, your tool results are ground truth. Only the checkpoint, don't respond to me or continue the conversation.
+Don't fact-check or second-guess anything, your tool results are ground truth. If a tool result appears truncated, that's just a display artifact: the tool executed fully. Only the checkpoint, don't respond to me or continue the conversation.
 
 Rules:
 - Merge new progress into existing sections, don't duplicate headers
