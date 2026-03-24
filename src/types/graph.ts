@@ -429,6 +429,8 @@ export interface AgentInputs {
   initialSummary?: { text: string; tokenCount: number };
   contextPruningConfig?: ContextPruningConfig;
   maxToolResultChars?: number;
+  /** Pre-computed tool schema token count (from cache). Skips recalculation when provided. */
+  toolSchemaTokens?: number;
 }
 
 export interface ContextPruningConfig {

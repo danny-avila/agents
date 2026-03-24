@@ -7,28 +7,18 @@ import type {
   BaseMessageFields,
 } from '@langchain/core/messages';
 import type { RunnableConfig, Runnable } from '@langchain/core/runnables';
-import type * as t from '@/types';
 import type { createPruneMessages } from '@/messages';
+import type * as t from '@/types';
+import {
+  ANTHROPIC_TOOL_TOKEN_MULTIPLIER,
+  DEFAULT_TOOL_TOKEN_MULTIPLIER,
+  ContentTypes,
+  Providers,
+} from '@/common';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { addCacheControl } from '@/messages/cache';
-import { ContentTypes, Providers } from '@/common';
 import { DEFAULT_RESERVE_RATIO } from '@/messages';
 import { toJsonSchema } from '@/utils/schema';
-
-/**
- * Anthropic direct API tool schema overhead multiplier.
- * Empirically calibrated against real MCP tool sets (29 tools).
- * Accounts for Anthropic's internal XML-like tool encoding plus
- * a ~300-token hidden tool-system preamble.
- */
-const ANTHROPIC_TOOL_TOKEN_MULTIPLIER = 2.6;
-
-/**
- * Default tool schema overhead multiplier for all non-Anthropic providers.
- * Covers OpenAI function-calling format, Bedrock, and other providers.
- * Empirically calibrated at ~1.4× the raw JSON token count.
- */
-const DEFAULT_TOOL_TOKEN_MULTIPLIER = 1.4;
 
 /**
  * Encapsulates agent-specific state that can vary between agents in a multi-agent system
@@ -64,6 +54,7 @@ export class AgentContext {
       initialSummary,
       contextPruningConfig,
       maxToolResultChars,
+      toolSchemaTokens,
     } = agentConfig;
 
     const agentContext = new AgentContext({
@@ -104,14 +95,22 @@ export class AgentContext {
       const tokenMap = indexTokenCountMap || {};
       agentContext.baseIndexTokenCountMap = { ...tokenMap };
       agentContext.indexTokenCountMap = tokenMap;
-      agentContext.tokenCalculationPromise = agentContext
-        .calculateInstructionTokens(tokenCounter)
-        .then(() => {
-          agentContext.updateTokenMapWithInstructions(tokenMap);
-        })
-        .catch((err) => {
-          console.error('Error calculating instruction tokens:', err);
-        });
+
+      if (toolSchemaTokens != null && toolSchemaTokens > 0) {
+        /** Use pre-computed (cached) tool schema tokens — skip calculateInstructionTokens */
+        agentContext.toolSchemaTokens = toolSchemaTokens;
+        agentContext.tokenCalculationPromise = Promise.resolve();
+        agentContext.updateTokenMapWithInstructions(tokenMap);
+      } else {
+        agentContext.tokenCalculationPromise = agentContext
+          .calculateInstructionTokens(tokenCounter)
+          .then(() => {
+            agentContext.updateTokenMapWithInstructions(tokenMap);
+          })
+          .catch((err) => {
+            console.error('Error calculating instruction tokens:', err);
+          });
+      }
     } else if (indexTokenCountMap) {
       agentContext.baseIndexTokenCountMap = { ...indexTokenCountMap };
       agentContext.indexTokenCountMap = indexTokenCountMap;
