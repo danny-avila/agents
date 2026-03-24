@@ -10,6 +10,7 @@ import type {
 } from '@google/generative-ai';
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { BaseMessage, UsageMetadata } from '@langchain/core/messages';
+import { isAIMessage } from '@langchain/core/messages';
 import type { GeminiApiUsageMetadata, InputTokenDetails } from './types';
 import type { GoogleClientOptions, GoogleThinkingConfig } from '@/types';
 import {
@@ -17,6 +18,76 @@ import {
   convertBaseMessagesToContent,
   mapGenerateContentResultToChatResult,
 } from './utils/common';
+
+type AdditionalKwargs =
+  | undefined
+  | (BaseMessage['additional_kwargs'] & {
+      signatures?: Array<string | undefined>;
+    });
+
+interface ContentPart {
+  thoughtSignature?: string;
+  functionCall?: unknown;
+  [key: string]: unknown;
+}
+
+interface Content {
+  role: string;
+  parts: ContentPart[];
+}
+
+/**
+ * Fixes thought signatures on functionCall parts in the formatted Gemini request.
+ *
+ * `@langchain/google-common` stores signatures as a flat array in
+ * `additional_kwargs.signatures` (one per response part) and re-attaches them
+ * by index only when `signatures.length === parts.length`. This fails when:
+ * - The API omits a signature (length mismatch)
+ * - Streaming chunks merge with different part counts
+ * - The signature for a functionCall part is an empty string
+ *
+ * This function correlates each "model" content block in the formatted request
+ * back to its originating AI message, then re-attaches non-empty signatures
+ * that the library failed to apply.
+ */
+function fixThoughtSignatures(contents: Content[], input: BaseMessage[]): void {
+  const aiMessages = input.filter(
+    (msg) =>
+      isAIMessage(msg) &&
+      Array.isArray((msg.additional_kwargs as AdditionalKwargs)?.signatures) &&
+      (msg.additional_kwargs.signatures as string[]).length > 0
+  );
+
+  const modelContents = contents.filter((c) => c.role === 'model');
+
+  const count = Math.min(aiMessages.length, modelContents.length);
+  for (let i = 0; i < count; i++) {
+    const msg = aiMessages[i];
+    const content = modelContents[i];
+    const signatures = (msg.additional_kwargs as AdditionalKwargs)?.signatures;
+
+    const attachedSignatures = new Set(
+      content.parts
+        .map((p) => p.thoughtSignature)
+        .filter((s): s is string => s != null && s !== '')
+    );
+    const availableSignatures = signatures?.filter(
+      (s) => s != null && s !== '' && !attachedSignatures.has(s)
+    );
+
+    let sigIdx = 0;
+    for (const part of content.parts) {
+      if (
+        'functionCall' in part &&
+        (part.thoughtSignature == null || part.thoughtSignature === '') &&
+        sigIdx < (availableSignatures?.length ?? 0)
+      ) {
+        part.thoughtSignature = availableSignatures?.[sigIdx];
+        sigIdx++;
+      }
+    }
+  }
+}
 
 export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
   thinkingConfig?: GoogleThinkingConfig;
@@ -212,6 +283,9 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
       this.client.systemInstruction = systemInstruction;
       actualPrompt = prompt.slice(1);
     }
+    if (actualPrompt) {
+      fixThoughtSignatures(actualPrompt as unknown as Content[], messages);
+    }
     const parameters = this.invocationParams(options);
     const request = {
       ...parameters,
@@ -265,6 +339,9 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
       /** @ts-ignore */
       this.client.systemInstruction = systemInstruction;
       actualPrompt = prompt.slice(1);
+    }
+    if (actualPrompt) {
+      fixThoughtSignatures(actualPrompt as unknown as Content[], messages);
     }
     const parameters = this.invocationParams(options);
     const request = {
