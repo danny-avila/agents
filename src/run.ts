@@ -305,9 +305,13 @@ export class Run<_T extends t.BaseGraphState> {
     ) {
       const userId = config.configurable?.user_id;
       const sessionId = config.configurable?.thread_id;
+      const primaryContext = this.Graph.agentContexts.get(
+        this.Graph.defaultAgentId
+      );
       const traceMetadata = {
         messageId: this.id,
         parentMessageId: config.configurable?.requestBody?.parentMessageId,
+        agentName: primaryContext?.name,
       };
       const handler = new CallbackHandler({
         userId,
@@ -453,8 +457,12 @@ export class Run<_T extends t.BaseGraphState> {
     ) {
       const userId = chainOptions.configurable?.user_id;
       const sessionId = chainOptions.configurable?.thread_id;
+      const titleContext = this.Graph?.agentContexts.get(
+        this.Graph.defaultAgentId
+      );
       const traceMetadata = {
         messageId: 'title-' + this.id,
+        agentName: titleContext?.name,
       };
       const handler = new CallbackHandler({
         userId,
