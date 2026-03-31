@@ -136,7 +136,7 @@
     "@opentelemetry/sdk-node": "^0.207.0",
     "@scarf/scarf": "^1.4.0",
     "ai-tokenizer": "^1.0.6",
-    "axios": "^1.13.5",
+    "axios": "1.13.6",
     "cheerio": "^1.0.0",
     "dotenv": "^16.4.7",
     "https-proxy-agent": "^7.0.6",
