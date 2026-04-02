@@ -131,10 +131,14 @@ function createCodeExecutionTool(
       /**
        * File injection priority:
        * 1. Use _injected_files from ToolNode (avoids /files endpoint race condition)
-       * 2. Fall back to fetching from /files endpoint if session_id provided but no injected files
+       * 2. Use params.files from tool creation (e.g., primeCodeFiles for first invocation)
+       * 3. Fall back to fetching from /files endpoint if session_id provided but no injected files
        */
       if (_injected_files && _injected_files.length > 0) {
         postData.files = _injected_files;
+      } else if (params.files && params.files.length > 0) {
+        /** Fallback: use files passed during tool creation (e.g., from primeCodeFiles) */
+        postData.files = params.files;
       } else if (session_id != null && session_id.length > 0) {
         /** Fallback: fetch from /files endpoint (may have race condition issues) */
         try {
