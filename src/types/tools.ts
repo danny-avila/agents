@@ -74,6 +74,7 @@ export type CodeExecutionToolParams =
   | {
       session_id?: string;
       user_id?: string;
+      entity_id?: string;
       apiKey?: string;
       files?: CodeEnvFile[];
       [EnvVar.CODE_API_KEY]?: string;

@@ -125,8 +125,23 @@ function createCodeExecutionTool(
         lang,
         code,
         ...rest,
-        ...params,
       };
+
+      // Forward safe params to exec payload (exclude secrets sent via headers)
+      if (params.session_id) {
+        postData.session_id = params.session_id;
+      }
+      if (params.user_id) {
+        postData.user_id = params.user_id;
+      }
+      if (params.files) {
+        postData.files = params.files;
+      }
+
+      // Forward entity_id for session lookup by entity in kubecoderun orchestrator
+      if (params.entity_id) {
+        postData.entity_id = params.entity_id;
+      }
 
       /**
        * File injection priority:
