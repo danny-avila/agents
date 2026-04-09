@@ -92,12 +92,15 @@ export class TavilyScraper implements t.BaseScraper {
         payload.format = this.format;
       }
 
+      const effectiveTimeout = options.timeout ?? this.timeout;
+      payload.timeout = Math.min(Math.max(effectiveTimeout / 1000, 1), 60);
+
       const response = await axios.post(this.apiUrl, payload, {
         headers: {
           Authorization: `Bearer ${this.apiKey}`,
           'Content-Type': 'application/json',
         },
-        timeout: options.timeout ?? this.timeout,
+        timeout: effectiveTimeout,
       });
 
       const data = response.data;

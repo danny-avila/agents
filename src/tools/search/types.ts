@@ -72,7 +72,6 @@ export interface TavilySearchOptions {
   excludeDomains?: string[];
   topic?: 'general' | 'news' | 'finance';
   timeRange?: 'day' | 'week' | 'month' | 'year' | 'd' | 'w' | 'm' | 'y';
-  days?: number;
   includeImageDescriptions?: boolean;
   includeFavicon?: boolean;
   chunksPerSource?: number;

@@ -498,9 +498,6 @@ const createTavilyAPI = (
       ) {
         payload.exclude_domains = options.excludeDomains;
       }
-      if (options?.days != null) {
-        payload.days = options.days;
-      }
       if (options?.includeImageDescriptions != null) {
         payload.include_image_descriptions = options.includeImageDescriptions;
       }
