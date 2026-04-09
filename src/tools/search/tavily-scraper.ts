@@ -12,6 +12,9 @@ export class TavilyScraper implements t.BaseScraper {
   private logger: t.Logger;
   private extractDepth: 'basic' | 'advanced';
   private includeImages: boolean;
+  private includeFavicon: boolean;
+  private chunksPerSource: number | undefined;
+  private format: 'markdown' | 'text' | undefined;
 
   constructor(config: t.TavilyScraperConfig = {}) {
     this.apiKey = config.apiKey ?? process.env.TAVILY_API_KEY ?? '';
@@ -22,6 +25,9 @@ export class TavilyScraper implements t.BaseScraper {
     this.timeout = config.timeout ?? DEFAULT_TIMEOUT;
     this.extractDepth = config.extractDepth ?? 'basic';
     this.includeImages = config.includeImages ?? false;
+    this.includeFavicon = config.includeFavicon ?? false;
+    this.chunksPerSource = config.chunksPerSource;
+    this.format = config.format;
     this.logger = config.logger || createDefaultLogger();
 
     if (!this.apiKey) {
@@ -37,7 +43,6 @@ export class TavilyScraper implements t.BaseScraper {
     return results[0];
   }
 
-  /** Batch-scrape up to 20 URLs in a single Tavily Extract API call */
   async scrapeUrls(
     urls: string[],
     options: t.TavilyScrapeOptions = {}
@@ -71,11 +76,21 @@ export class TavilyScraper implements t.BaseScraper {
     options: t.TavilyScrapeOptions = {}
   ): Promise<Array<[string, t.TavilyScrapeResponse]>> {
     try {
-      const payload = {
+      const payload: Record<string, unknown> = {
         urls,
         extract_depth: options.extractDepth ?? this.extractDepth,
         include_images: options.includeImages ?? this.includeImages,
       };
+
+      if (this.includeFavicon) {
+        payload.include_favicon = true;
+      }
+      if (this.chunksPerSource != null) {
+        payload.chunks_per_source = this.chunksPerSource;
+      }
+      if (this.format != null) {
+        payload.format = this.format;
+      }
 
       const response = await axios.post(this.apiUrl, payload, {
         headers: {
@@ -112,7 +127,10 @@ export class TavilyScraper implements t.BaseScraper {
         }
 
         const failed = failedMap.get(url);
-        const error = success?.error ?? failed?.error ?? 'URL not found in Tavily Extract response';
+        const error =
+          success?.error ??
+          failed?.error ??
+          'URL not found in Tavily Extract response';
         return [url, { success: false, error }];
       });
     } catch (error) {
