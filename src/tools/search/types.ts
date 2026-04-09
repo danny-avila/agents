@@ -62,6 +62,23 @@ export interface Source {
   date?: string;
 }
 
+export interface TavilySearchOptions {
+  searchDepth?: 'basic' | 'advanced' | 'fast' | 'ultra-fast';
+  maxResults?: number;
+  includeImages?: boolean;
+  includeAnswer?: boolean;
+  includeRawContent?: boolean;
+  includeDomains?: string[];
+  excludeDomains?: string[];
+  topic?: 'general' | 'news' | 'finance';
+  timeRange?: 'day' | 'week' | 'month' | 'year' | 'd' | 'w' | 'm' | 'y';
+  days?: number;
+  includeImageDescriptions?: boolean;
+  includeFavicon?: boolean;
+  chunksPerSource?: number;
+  timeout?: number;
+}
+
 export interface SearchConfig {
   searchProvider?: SearchProvider;
   serperApiKey?: string;
@@ -70,7 +87,7 @@ export interface SearchConfig {
   tavilyApiKey?: string;
   tavilySearchUrl?: string;
   tavilyExtractUrl?: string;
-  searchDepth?: 'basic' | 'advanced';
+  tavilySearchOptions?: TavilySearchOptions;
 }
 
 export type References = {
@@ -117,6 +134,9 @@ export interface TavilyScraperConfig {
   logger?: Logger;
   extractDepth?: 'basic' | 'advanced';
   includeImages?: boolean;
+  includeFavicon?: boolean;
+  chunksPerSource?: number;
+  format?: 'markdown' | 'text';
 }
 
 export interface ScraperContentResult {
@@ -163,7 +183,6 @@ export interface CohereRerankerResponse {
 export type SafeSearchLevel = 0 | 1 | 2;
 
 export type Logger = WinstonLogger;
-
 export interface SearchToolConfig
   extends SearchConfig,
     ProcessSourcesConfig,
@@ -328,6 +347,7 @@ export interface TavilyScrapeResponse {
   data?: {
     rawContent?: string;
     images?: string[];
+    favicon?: string;
   };
   error?: string;
 }

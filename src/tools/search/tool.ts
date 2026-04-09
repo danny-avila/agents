@@ -14,8 +14,8 @@ import {
 } from './schema';
 import { createSearchAPI, createSourceProcessor } from './search';
 import { createSerperScraper } from './serper-scraper';
-import { createFirecrawlScraper } from './firecrawl';
 import { createTavilyScraper } from './tavily-scraper';
+import { createFirecrawlScraper } from './firecrawl';
 import { expandHighlights } from './highlights';
 import { formatResultsForLLM } from './format';
 import { createDefaultLogger } from './utils';
@@ -335,7 +335,7 @@ export const createSearchTool = (
     tavilyApiKey,
     tavilySearchUrl,
     tavilyExtractUrl,
-    searchDepth,
+    tavilySearchOptions,
     rerankerType = 'cohere',
     topResults = 5,
     strategies = ['no_extraction'],
@@ -383,7 +383,7 @@ export const createSearchTool = (
     searxngApiKey,
     tavilyApiKey,
     tavilySearchUrl,
-    searchDepth,
+    tavilySearchOptions,
   });
 
   /** Create scraper based on scraperProvider */

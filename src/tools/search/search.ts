@@ -408,7 +408,6 @@ const createSearXNGAPI = (
   return { getSources };
 };
 
-/** Tavily does not support hourly granularity; 'h' is approximated as 'day' */
 const TAVILY_TIME_RANGE_MAP: Record<string, string> = {
   h: 'day',
   d: 'day',
@@ -430,15 +429,17 @@ const getHostname = (link: string): string => {
 const createTavilyAPI = (
   apiKey?: string,
   apiUrl?: string,
-  searchDepth: 'basic' | 'advanced' = 'advanced'
+  options?: t.TavilySearchOptions
 ): {
   getSources: (params: t.GetSourcesParams) => Promise<t.SearchResult>;
 } => {
   const config = {
     apiKey: apiKey ?? process.env.TAVILY_API_KEY,
     apiUrl:
-      apiUrl ?? process.env.TAVILY_SEARCH_URL ?? 'https://api.tavily.com/search',
-    timeout: DEFAULT_TAVILY_TIMEOUT,
+      apiUrl ??
+      process.env.TAVILY_SEARCH_URL ??
+      'https://api.tavily.com/search',
+    timeout: options?.timeout ?? DEFAULT_TAVILY_TIMEOUT,
   };
 
   if (config.apiKey == null || config.apiKey === '') {
@@ -457,29 +458,57 @@ const createTavilyAPI = (
     }
 
     try {
-      const timeRange = date != null ? TAVILY_TIME_RANGE_MAP[date] ?? 'day' : undefined;
-      const topic = news === true || type === 'news' ? 'news' : 'general';
+      const timeRange =
+        options?.timeRange ??
+        (date != null ? (TAVILY_TIME_RANGE_MAP[date] ?? 'day') : undefined);
+      const topic =
+        options?.topic ??
+        (news === true || type === 'news' ? 'news' : 'general');
+      const maxResults = options?.maxResults ?? numResults;
+      const searchDepth = options?.searchDepth ?? 'basic';
 
-      const payload: {
-        query: string;
-        search_depth: 'basic' | 'advanced';
-        topic: 'general' | 'news';
-        max_results: number;
-        time_range?: string;
-        include_images?: boolean;
-      } = {
+      const payload: Record<string, unknown> = {
         query,
         search_depth: searchDepth,
         topic,
-        max_results: Math.min(Math.max(1, numResults), 20),
+        max_results: Math.min(Math.max(1, maxResults), 20),
       };
 
       if (timeRange != null) {
         payload.time_range = timeRange;
       }
-
-      if (type === 'images') {
+      if (type === 'images' || options?.includeImages) {
         payload.include_images = true;
+      }
+      if (options?.includeAnswer != null) {
+        payload.include_answer = options.includeAnswer;
+      }
+      if (options?.includeRawContent != null) {
+        payload.include_raw_content = options.includeRawContent;
+      }
+      if (
+        options?.includeDomains != null &&
+        options.includeDomains.length > 0
+      ) {
+        payload.include_domains = options.includeDomains;
+      }
+      if (
+        options?.excludeDomains != null &&
+        options.excludeDomains.length > 0
+      ) {
+        payload.exclude_domains = options.excludeDomains;
+      }
+      if (options?.days != null) {
+        payload.days = options.days;
+      }
+      if (options?.includeImageDescriptions != null) {
+        payload.include_image_descriptions = options.includeImageDescriptions;
+      }
+      if (options?.includeFavicon != null) {
+        payload.include_favicon = options.includeFavicon;
+      }
+      if (options?.chunksPerSource != null) {
+        payload.chunks_per_source = options.chunksPerSource;
       }
 
       const response = await axios.post(config.apiUrl, payload, {
@@ -554,7 +583,7 @@ export const createSearchAPI = (
     searxngApiKey,
     tavilyApiKey,
     tavilySearchUrl,
-    searchDepth,
+    tavilySearchOptions,
   } = config;
 
   if (searchProvider.toLowerCase() === 'serper') {
@@ -562,7 +591,7 @@ export const createSearchAPI = (
   } else if (searchProvider.toLowerCase() === 'searxng') {
     return createSearXNGAPI(searxngInstanceUrl, searxngApiKey);
   } else if (searchProvider.toLowerCase() === 'tavily') {
-    return createTavilyAPI(tavilyApiKey, tavilySearchUrl, searchDepth);
+    return createTavilyAPI(tavilyApiKey, tavilySearchUrl, tavilySearchOptions);
   } else {
     throw new Error(
       `Invalid search provider: ${searchProvider}. Must be 'serper', 'searxng', or 'tavily'`
@@ -598,17 +627,25 @@ export const createSourceProcessor = (
     response: t.AnyScraperResponse
   ): t.ScrapeResult => {
     const rawMetadata = scraper.extractMetadata(response);
-    const metadata = Object.keys(rawMetadata).length > 0
-      ? rawMetadata as t.ScrapeMetadata
-      : undefined;
+    const metadata =
+      Object.keys(rawMetadata).length > 0
+        ? (rawMetadata as t.ScrapeMetadata)
+        : undefined;
     const attribution = getAttribution(url, metadata, logger_);
 
     if (response.success && response.data) {
       const [content, references] = scraper.extractContent(response);
-      return { url, references, attribution, content: chunker.cleanText(content) };
+      return {
+        url,
+        references,
+        attribution,
+        content: chunker.cleanText(content),
+      };
     }
 
-    logger_.error(`Error scraping ${url}: ${response.error ?? 'Unknown error'}`);
+    logger_.error(
+      `Error scraping ${url}: ${response.error ?? 'Unknown error'}`
+    );
     return { url, attribution, error: true, content: '' };
   };
 
@@ -656,15 +693,19 @@ export const createSourceProcessor = (
         } else {
           responses = await Promise.all(
             links.map((link) =>
-              scraper.scrapeUrl(link, {}).catch((error): [string, t.AnyScraperResponse] => {
-                logger_.error(`Error scraping ${link}:`, error);
-                return [link, { success: false, error: String(error) }];
-              })
+              scraper
+                .scrapeUrl(link, {})
+                .catch((error): [string, t.AnyScraperResponse] => {
+                  logger_.error(`Error scraping ${link}:`, error);
+                  return [link, { success: false, error: String(error) }];
+                })
             )
           );
         }
 
-        const results = responses.map(([url, response]) => processResponse(url, response));
+        const results = responses.map(([url, response]) =>
+          processResponse(url, response)
+        );
         const withHighlights = await Promise.all(
           results.map((result) => addHighlights(result, query, onGetHighlights))
         );
