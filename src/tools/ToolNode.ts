@@ -1,6 +1,8 @@
 import { ToolCall } from '@langchain/core/messages/tool';
 import {
   ToolMessage,
+  HumanMessage,
+  SystemMessage,
   isAIMessage,
   isBaseMessage,
 } from '@langchain/core/messages';
@@ -480,13 +482,42 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   }
 
   /**
-   * Dispatches tool calls to the host via ON_TOOL_EXECUTE event and returns raw ToolMessages.
+   * Converts InjectedMessage instances to LangChain BaseMessage objects.
+   * HumanMessage for role 'user', SystemMessage for role 'system'.
+   * Metadata (isMeta, source, skillName) stored in additional_kwargs.
+   */
+  private convertInjectedMessages(
+    messages: t.InjectedMessage[]
+  ): BaseMessage[] {
+    const converted: BaseMessage[] = [];
+    for (const msg of messages) {
+      const content =
+        typeof msg.content === 'string'
+          ? msg.content
+          : JSON.stringify(msg.content);
+      const additional_kwargs: Record<string, unknown> = {};
+      if (msg.isMeta != null) additional_kwargs.isMeta = msg.isMeta;
+      if (msg.source != null) additional_kwargs.source = msg.source;
+      if (msg.skillName != null) additional_kwargs.skillName = msg.skillName;
+
+      if (msg.role === 'user') {
+        converted.push(new HumanMessage({ content, additional_kwargs }));
+      } else {
+        converted.push(new SystemMessage({ content, additional_kwargs }));
+      }
+    }
+    return converted;
+  }
+
+  /**
+   * Dispatches tool calls to the host via ON_TOOL_EXECUTE event and returns raw ToolMessages
+   * plus any injected messages from tool results.
    * Core logic for event-driven execution, separated from output shaping.
    */
   private async dispatchToolEvents(
     toolCalls: ToolCall[],
     config: RunnableConfig
-  ): Promise<ToolMessage[]> {
+  ): Promise<{ toolMessages: ToolMessage[]; injected: BaseMessage[] }> {
     const requests: t.ToolCallRequest[] = toolCalls.map((call) => {
       const turn = this.toolUsageCount.get(call.name) ?? 0;
       this.toolUsageCount.set(call.name, turn + 1);
@@ -529,7 +560,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
     this.storeCodeSessionFromResults(results, requests);
 
-    return results.map((result) => {
+    const injected: BaseMessage[] = [];
+    const toolMessages: ToolMessage[] = [];
+
+    for (const result of results) {
+      if (result.injectedMessages && result.injectedMessages.length > 0) {
+        injected.push(...this.convertInjectedMessages(result.injectedMessages));
+      }
+
       const request = requests.find((r) => r.id === result.toolCallId);
       const toolName = request?.name ?? 'unknown';
       const stepId = this.toolCallStepIds?.get(result.toolCallId) ?? '';
@@ -597,13 +635,16 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         config
       );
 
-      return toolMessage;
-    });
+      toolMessages.push(toolMessage);
+    }
+
+    return { toolMessages, injected };
   }
 
   /**
    * Execute all tool calls via ON_TOOL_EXECUTE event dispatch.
    * Used in event-driven mode where the host handles actual tool execution.
+   * Injected messages from tool results are prepended before ToolMessages.
    */
   private async executeViaEvent(
     toolCalls: ToolCall[],
@@ -611,7 +652,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     input: any
   ): Promise<T> {
-    const outputs = await this.dispatchToolEvents(toolCalls, config);
+    const { toolMessages, injected } = await this.dispatchToolEvents(
+      toolCalls,
+      config
+    );
+    const outputs: BaseMessage[] = [...injected, ...toolMessages];
     return (Array.isArray(input) ? outputs : { messages: outputs }) as T;
   }
 
@@ -707,12 +752,19 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           this.handleRunToolCompletions(directCalls, directOutputs, config);
         }
 
-        const eventOutputs: ToolMessage[] =
+        const eventResult =
           eventCalls.length > 0
             ? await this.dispatchToolEvents(eventCalls, config)
-            : [];
+            : {
+              toolMessages: [] as ToolMessage[],
+              injected: [] as BaseMessage[],
+            };
 
-        outputs = [...directOutputs, ...eventOutputs];
+        outputs = [
+          ...directOutputs,
+          ...eventResult.injected,
+          ...eventResult.toolMessages,
+        ];
       } else {
         outputs = await Promise.all(
           filteredCalls.map((call) => this.runTool(call, config))

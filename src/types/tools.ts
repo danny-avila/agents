@@ -3,6 +3,7 @@ import type { StructuredToolInterface } from '@langchain/core/tools';
 import type { RunnableToolLike } from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type { ToolErrorData } from './stream';
+import type { InjectedMessage } from './skill';
 import { EnvVar } from '@/common';
 
 /** Replacement type for `import type { ToolCall } from '@langchain/core/messages/tool'` in order to have stringified args typed */
@@ -198,6 +199,12 @@ export type ToolExecuteResult = {
   status: 'success' | 'error';
   /** Error message if status is 'error' */
   errorMessage?: string;
+  /**
+   * Messages to inject into graph state before the ToolMessage for this call.
+   * The model sees injected content first, then the tool result.
+   * Generic mechanism — any tool execution handler can use this.
+   */
+  injectedMessages?: InjectedMessage[];
 };
 
 /** Map of tool names to tool definitions */
