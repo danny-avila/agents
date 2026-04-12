@@ -277,26 +277,6 @@ function fold(outcomes: readonly HookOutcome[]): AggregatedHookResult {
   return agg;
 }
 
-function collectOnceMatchersForRemoval(
-  outcomes: readonly HookOutcome[]
-): WideMatcher[] {
-  const successByMatcher = new Map<WideMatcher, boolean>();
-  for (const outcome of outcomes) {
-    if (outcome.matcher.once !== true) {
-      continue;
-    }
-    const prior = successByMatcher.get(outcome.matcher) ?? false;
-    successByMatcher.set(outcome.matcher, prior || outcome.error === null);
-  }
-  const removable: WideMatcher[] = [];
-  for (const [matcher, hasSuccess] of successByMatcher) {
-    if (hasSuccess) {
-      removable.push(matcher);
-    }
-  }
-  return removable;
-}
-
 /**
  * Fires every matcher registered against `input.hook_event_name`, folding
  * their results per `deny > ask > allow` precedence and accumulating
@@ -319,10 +299,13 @@ function collectOnceMatchersForRemoval(
  *
  * ## Timeouts and cancellation
  *
- * Each hook receives its own `AbortSignal` derived from (a) the caller's
- * parent signal and (b) a timeout from `matcher.timeout` (falling back to
- * `opts.timeoutMs`, default {@link DEFAULT_HOOK_TIMEOUT_MS}). The hook call
- * is raced against the signal, so even a hook that ignores the signal is
+ * Each matcher receives **one shared `AbortSignal`** derived from the
+ * caller's parent signal combined with `matcher.timeout` (falling back to
+ * `opts.timeoutMs`, default {@link DEFAULT_HOOK_TIMEOUT_MS}). Sharing the
+ * signal across hooks in a matcher collapses N timer allocations into
+ * one, which matters on the PreToolUse hot path where a matcher with
+ * several hooks fires on every tool call. Each hook call is raced
+ * against the shared signal, so even a hook that ignores the signal is
  * force-unblocked when the timeout fires. Timeout/abort errors are
  * swallowed into the aggregated result's `errors` array (non-fatal by
  * default).
@@ -333,18 +316,20 @@ function collectOnceMatchersForRemoval(
  * and the logger output. Use it for infrastructure hooks whose failures
  * should not pollute user-visible diagnostics.
  *
- * ## Once semantics and concurrency
+ * ## Once semantics — atomic at-most-once
  *
- * A matcher with `once: true` is removed from the registry after at least
- * one of its hooks completes without throwing. If every hook in the matcher
- * throws, the matcher is retained so the caller can retry.
+ * A matcher with `once: true` is removed from the registry **before any
+ * hook runs**, inside the synchronous prefix of `executeHooks` (between
+ * `getMatchers` and the first `await`). Because Node's event loop serialises
+ * sync work, two concurrent `executeHooks` calls can never both observe
+ * and dispatch the same `once` matcher — whichever call runs its sync
+ * prefix first consumes it, and the loser sees an empty bucket.
  *
- * **Removal is not atomic across concurrent `executeHooks` calls.** Two
- * calls that start before either has finished will each snapshot the
- * matcher list via `getMatchers`, both fire the matcher's hooks, and both
- * attempt removal. `once` therefore means "once per `executeHooks` call",
- * not "once globally across the registry". Use it only for idempotent
- * one-shot hooks.
+ * Trade-off: if every hook in a `once` matcher throws, the matcher is
+ * still gone. "Once" here means "at most one dispatch, ever", not "at
+ * most one successful execution with retry on failure". Hosts that need
+ * retry semantics should register a normal matcher and self-unregister
+ * via the `unregister` callback returned from `registry.register`.
  */
 export async function executeHooks(
   opts: ExecuteHooksOptions
@@ -369,10 +354,13 @@ export async function executeHooks(
     if (!matchesQuery(matcher.pattern, matchQuery)) {
       continue;
     }
+    if (matcher.once === true) {
+      registry.removeMatcher(event, matcher, sessionId);
+    }
     const perHookTimeout = matcher.timeout ?? timeoutMs;
+    const matcherSignal = combineSignals(signal, perHookTimeout);
     for (const hook of matcher.hooks) {
-      const hookSignal = combineSignals(signal, perHookTimeout);
-      tasks.push(runHook(hook, input, hookSignal, matcher));
+      tasks.push(runHook(hook, input, matcherSignal, matcher));
     }
   }
   if (tasks.length === 0) {
@@ -380,10 +368,6 @@ export async function executeHooks(
   }
 
   const outcomes = await Promise.all(tasks);
-  const toRemove = collectOnceMatchersForRemoval(outcomes);
-  for (const matcher of toRemove) {
-    registry.removeMatcher(event, matcher, sessionId);
-  }
   reportErrors(outcomes, event, logger);
   return fold(outcomes);
 }

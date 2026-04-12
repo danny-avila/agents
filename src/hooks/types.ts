@@ -308,14 +308,18 @@ export interface HookMatcher<E extends HookEvent = HookEvent> {
   /** Per-matcher timeout in ms. Defaults to the executor's batch timeout. */
   timeout?: number;
   /**
-   * Remove the matcher after its first successful invocation (at least one
-   * hook in the matcher returned without throwing).
+   * Atomically remove the matcher before its first dispatch.
    *
-   * **Not atomic under concurrent dispatch.** Two concurrent `executeHooks`
-   * calls for the same event will both observe the matcher in their
-   * respective snapshots, both fire its hooks, and both attempt removal;
-   * the hook will run once per concurrent call, not once globally. Use
-   * `once` for idempotent one-shot hooks only.
+   * `executeHooks` claims `once: true` matchers synchronously — between
+   * `getMatchers` and its first `await` — so two concurrent calls cannot
+   * both dispatch the same matcher. Whichever call runs its sync prefix
+   * first wins the matcher; the other sees an empty bucket.
+   *
+   * Semantics are "at most one dispatch, ever" — if every hook in the
+   * matcher throws, the matcher is still gone. Use `once` for
+   * fire-and-forget bootstrapping (registration, telemetry, setup). Hosts
+   * that need retry semantics should register a normal matcher and
+   * self-unregister via the callback returned from `registry.register`.
    */
   once?: boolean;
   /** Internal hooks are excluded from telemetry and non-fatal error logging. */

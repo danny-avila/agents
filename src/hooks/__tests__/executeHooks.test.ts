@@ -663,7 +663,7 @@ describe('executeHooks', () => {
       expect(calls).toBe(1);
     });
 
-    it('does not remove the matcher when every hook in it throws', async () => {
+    it('removes the matcher even when every hook in it throws (at-most-once dispatch)', async () => {
       const registry = new HookRegistry();
       const matcher: HookMatcher<'RunStart'> = {
         once: true,
@@ -680,7 +680,7 @@ describe('executeHooks', () => {
 
       const result = await executeHooks({ registry, input: runStartInput() });
       expect(result.errors).toHaveLength(2);
-      expect(registry.getMatchers('RunStart')).toHaveLength(1);
+      expect(registry.getMatchers('RunStart')).toHaveLength(0);
     });
 
     it('removes the matcher when at least one hook succeeds', async () => {
@@ -717,7 +717,7 @@ describe('executeHooks', () => {
       expect(registry.getMatchers('PreToolUse', 'run-1')).toHaveLength(0);
     });
 
-    it('documents the concurrent-dispatch race: once fires per concurrent call, not globally', async () => {
+    it('fires exactly once across concurrent executeHooks calls (atomic claim)', async () => {
       const registry = new HookRegistry();
       let calls = 0;
       const matcher: HookMatcher<'RunStart'> = {
@@ -734,9 +734,37 @@ describe('executeHooks', () => {
       await Promise.all([
         executeHooks({ registry, input: runStartInput() }),
         executeHooks({ registry, input: runStartInput() }),
+        executeHooks({ registry, input: runStartInput() }),
       ]);
 
-      expect(calls).toBe(2);
+      expect(calls).toBe(1);
+      expect(registry.getMatchers('RunStart')).toHaveLength(0);
+    });
+
+    it('fires exactly once across concurrent dispatch even when hooks are slow', async () => {
+      const registry = new HookRegistry();
+      let calls = 0;
+      const matcher: HookMatcher<'RunStart'> = {
+        once: true,
+        hooks: [
+          runStartHook(async (): Promise<RunStartHookOutput> => {
+            calls++;
+            await new Promise<void>((resolve): void => {
+              setTimeout(resolve, 10);
+            });
+            return emptyRunStartOutput;
+          }),
+        ],
+      };
+      registry.register('RunStart', matcher);
+
+      await Promise.all(
+        Array.from({ length: 8 }, () =>
+          executeHooks({ registry, input: runStartInput() })
+        )
+      );
+
+      expect(calls).toBe(1);
       expect(registry.getMatchers('RunStart')).toHaveLength(0);
     });
   });

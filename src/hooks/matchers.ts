@@ -12,41 +12,146 @@
  */
 export const MAX_PATTERN_LENGTH = 512;
 
+/**
+ * Upper bound on the compilation cache. Chosen to comfortably hold every
+ * distinct pattern a single multi-tenant run is likely to see (tools,
+ * agent types, basename filters) without growing without bound.
+ *
+ * Under hosts that register unique patterns per tenant, LRU eviction
+ * keeps the working set bounded — cold patterns are re-compiled on next
+ * use, which is the correct cost trade-off for long-running processes
+ * that must not leak memory.
+ */
+export const MAX_CACHE_SIZE = 256;
+
 interface CacheEntry {
   regex: RegExp | null;
 }
 
 /**
- * Module-level compilation cache. Patterns are compiled on first use and
- * reused on subsequent calls — keeping hot paths (every tool dispatch
- * filtering matchers) out of the regex compiler.
+ * Module-level LRU cache keyed by pattern string. Map iteration order is
+ * insertion order in ECMAScript, so refreshing an entry's position means
+ * "delete then re-set". On overflow we evict the first key (least
+ * recently used).
  *
  * Failed compiles are cached as `{ regex: null }` so a malformed pattern
- * does not re-enter the compiler on each call.
- *
- * A `Map` (not `Record`) is used so entries can be evicted in the future
- * without object-churn. The cache is unbounded for now; bounding it
- * requires a use-case that generates unbounded unique patterns, which is
- * not expected from current hook consumers — every pattern is baked into
- * a matcher registration and is reused across calls.
+ * does not re-enter the compiler — and so a tenant spamming bad patterns
+ * doesn't burn CPU on every call.
  */
 const patternCache: Map<string, CacheEntry> = new Map();
+
+function touchCacheEntry(pattern: string, entry: CacheEntry): void {
+  patternCache.delete(pattern);
+  patternCache.set(pattern, entry);
+}
+
+function setCacheEntry(pattern: string, entry: CacheEntry): void {
+  if (patternCache.size >= MAX_CACHE_SIZE) {
+    const oldestKey = patternCache.keys().next().value;
+    if (oldestKey !== undefined) {
+      patternCache.delete(oldestKey);
+    }
+  }
+  patternCache.set(pattern, entry);
+}
+
+/**
+ * Cheap syntactic detector for the most common catastrophic-backtracking
+ * shape: a quantified group that contains another quantifier (e.g.
+ * `(a+)+`, `(.*)*`, `(\w+)+$`). This is the "nested quantifier" class of
+ * ReDoS — runs in polynomial-or-worse time on adversarial inputs.
+ *
+ * The scan walks the pattern linearly, tracking parenthesis depth and
+ * whether the innermost group has seen a quantifier. When a group closes,
+ * if it contained a quantifier AND the closing paren is followed by a
+ * quantifier, the pattern is flagged.
+ *
+ * This is a heuristic, not a proof — it rejects many unsafe patterns
+ * and allows some that safe-regex libraries would flag. It is a floor,
+ * not a ceiling: hosts that accept user-supplied patterns must still
+ * validate upstream. The goal is to stop trivially bad patterns from
+ * reaching the compiler on a multi-tenant hot path.
+ */
+export function hasNestedQuantifier(pattern: string): boolean {
+  const quantifiedAtDepth: boolean[] = [];
+  let depth = 0;
+  let i = 0;
+  while (i < pattern.length) {
+    const ch = pattern[i];
+    if (ch === '\\') {
+      i += 2;
+      continue;
+    }
+    if (ch === '[') {
+      const end = findCharClassEnd(pattern, i);
+      i = end + 1;
+      continue;
+    }
+    if (ch === '(') {
+      depth++;
+      quantifiedAtDepth[depth] = false;
+      i++;
+      continue;
+    }
+    if (ch === ')') {
+      const innerHadQuantifier = quantifiedAtDepth[depth] === true;
+      depth--;
+      const next = pattern[i + 1];
+      if (
+        innerHadQuantifier &&
+        (next === '*' || next === '+' || next === '?' || next === '{')
+      ) {
+        return true;
+      }
+      i++;
+      continue;
+    }
+    if (ch === '*' || ch === '+' || ch === '?' || ch === '{') {
+      if (depth > 0) {
+        quantifiedAtDepth[depth] = true;
+      }
+    }
+    i++;
+  }
+  return false;
+}
+
+function findCharClassEnd(pattern: string, start: number): number {
+  let i = start + 1;
+  while (i < pattern.length) {
+    const ch = pattern[i];
+    if (ch === '\\') {
+      i += 2;
+      continue;
+    }
+    if (ch === ']') {
+      return i;
+    }
+    i++;
+  }
+  return pattern.length - 1;
+}
 
 function compile(pattern: string): RegExp | null {
   const cached = patternCache.get(pattern);
   if (cached !== undefined) {
+    touchCacheEntry(pattern, cached);
     return cached.regex;
   }
   if (pattern.length > MAX_PATTERN_LENGTH) {
-    patternCache.set(pattern, { regex: null });
+    setCacheEntry(pattern, { regex: null });
+    return null;
+  }
+  if (hasNestedQuantifier(pattern)) {
+    setCacheEntry(pattern, { regex: null });
     return null;
   }
   try {
     const regex = new RegExp(pattern);
-    patternCache.set(pattern, { regex });
+    setCacheEntry(pattern, { regex });
     return regex;
   } catch {
-    patternCache.set(pattern, { regex: null });
+    setCacheEntry(pattern, { regex: null });
     return null;
   }
 }
@@ -65,23 +170,26 @@ function compile(pattern: string): RegExp | null {
  *   matcher will simply never fire. This is intentional — it keeps
  *   query-based filtering out of event types where "query" has no meaning,
  *   and is documented on `HookMatcher.pattern`.
- * - Otherwise, the pattern is compiled once (via a module-level cache) and
- *   tested against the query. Patterns longer than {@link MAX_PATTERN_LENGTH}
- *   never compile and never match.
+ * - Otherwise, the pattern is compiled once (via a bounded LRU cache) and
+ *   tested against the query.
  * - Invalid regex patterns never throw — a failed compile is cached as
  *   "never matches" so a single malformed pattern cannot take out a whole
  *   `executeHooks` batch.
  *
- * ## Trust model for pattern authors
+ * ## ReDoS mitigations
  *
- * Patterns are compiled with `new RegExp(pattern)` without any runtime
- * sandbox, so catastrophic backtracking on a pathological pattern can
- * block the event loop. Hosts are expected to treat pattern registration
- * as a trusted-code operation: the design report (§3.8) routes
+ * Patterns compile through three cheap gates before reaching `new RegExp`:
+ *
+ * 1. {@link MAX_PATTERN_LENGTH} length cap rejects oversized inputs.
+ * 2. {@link hasNestedQuantifier} rejects the most common catastrophic-
+ *    backtracking shape (quantified group containing a quantifier).
+ * 3. Successful compiles are cached in a bounded LRU so repeated calls
+ *    never re-enter the regex compiler.
+ *
+ * These are a floor, not a ceiling. Hosts that accept user-supplied
+ * patterns should still validate upstream. The design report §3.8 routes
  * persistable hooks through a host-side compiler before they reach this
- * module. Patterns that originate from end-user input — for example, a
- * host that exposes hook configuration in an agent-editing UI — must be
- * length-bounded, validated, or run through a safe-regex check upstream.
+ * module.
  */
 export function matchesQuery(
   pattern: string | undefined,
@@ -103,4 +211,9 @@ export function matchesQuery(
 /** Clears the regex compilation cache. Intended for test isolation. */
 export function clearMatcherCache(): void {
   patternCache.clear();
+}
+
+/** Returns the current size of the compilation cache. Intended for tests. */
+export function getMatcherCacheSize(): number {
+  return patternCache.size;
 }
