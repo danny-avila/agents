@@ -531,7 +531,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               toolInput: entry.args,
               toolUseId: entry.call.id!,
               stepId: entry.stepId,
-              turn: this.toolUsageCount.get(entry.call.name),
+              turn: this.toolUsageCount.get(entry.call.name) ?? 0,
             },
             sessionId: runId,
             matchQuery: entry.call.name,
@@ -738,7 +738,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           toolName,
           request?.args ?? {},
           contentString,
-          config
+          config,
+          request?.turn
         );
 
         messageByCallId.set(result.toolCallId, toolMessage);
@@ -755,7 +756,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     toolName: string,
     args: Record<string, unknown>,
     output: string,
-    config: RunnableConfig
+    config: RunnableConfig,
+    turn?: number
   ): void {
     const stepId = this.toolCallStepIds?.get(toolCallId) ?? '';
     if (!stepId) {
@@ -772,7 +774,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       {
         result: {
           id: stepId,
-          index: this.toolUsageCount.get(toolName) ?? 0,
+          index: turn ?? this.toolUsageCount.get(toolName) ?? 0,
           type: 'tool_call' as const,
           tool_call: {
             args: JSON.stringify(args),

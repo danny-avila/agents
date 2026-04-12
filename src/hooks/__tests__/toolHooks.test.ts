@@ -382,6 +382,7 @@ describe('Tool-level hook integration (event-driven mode)', () => {
 
       const messages = run.Graph!.getRunMessages() ?? [];
       const toolMsg = messages.find((m) => m.getType() === 'tool');
+      expect(toolMsg).toBeDefined();
       if (toolMsg != null) {
         resolvedContent =
           typeof toolMsg.content === 'string'
