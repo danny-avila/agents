@@ -7,7 +7,11 @@
 // until the integration layer is in place.
 export { HookRegistry } from './HookRegistry';
 export { executeHooks, DEFAULT_HOOK_TIMEOUT_MS } from './executeHooks';
-export { matchesQuery } from './matchers';
+export {
+  matchesQuery,
+  clearMatcherCache,
+  MAX_PATTERN_LENGTH,
+} from './matchers';
 export { HOOK_EVENTS } from './types';
 export type {
   HookEvent,

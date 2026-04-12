@@ -1,4 +1,3 @@
-/* eslint-disable no-console */
 // src/hooks/executeHooks.ts
 import type { Logger } from 'winston';
 import type { HookRegistry } from './HookRegistry';
@@ -27,7 +26,7 @@ export interface ExecuteHooksOptions {
   input: HookInput;
   /** Scope lookup to this session (in addition to global matchers). */
   sessionId?: string;
-  /** Query string matched against each matcher's regex (tool name, etc.). */
+  /** Query string matched against each matcher's pattern (tool name, etc.). */
   matchQuery?: string;
   /** Parent AbortSignal — combined with per-hook timeout into the hook signal. */
   signal?: AbortSignal;
@@ -148,6 +147,7 @@ function reportErrors(
       logger.warn(message);
       continue;
     }
+    // eslint-disable-next-line no-console
     console.warn(message);
   }
 }
@@ -245,6 +245,16 @@ function applyUpdatedInput(
   agg.updatedInput = output.updatedInput;
 }
 
+function applyUpdatedOutput(
+  agg: AggregatedHookResult,
+  output: HookOutput
+): void {
+  if (!('updatedOutput' in output) || output.updatedOutput === undefined) {
+    return;
+  }
+  agg.updatedOutput = output.updatedOutput;
+}
+
 function fold(outcomes: readonly HookOutcome[]): AggregatedHookResult {
   const agg = freshResult();
   for (const outcome of outcomes) {
@@ -262,6 +272,7 @@ function fold(outcomes: readonly HookOutcome[]): AggregatedHookResult {
     applyStopFlag(agg, output);
     applyDecision(agg, output);
     applyUpdatedInput(agg, output);
+    applyUpdatedOutput(agg, output);
   }
   return agg;
 }
@@ -293,20 +304,28 @@ function collectOnceMatchersForRemoval(
  *
  * ## Parallelism and determinism
  *
- * All matching hooks fire simultaneously via `Promise.all`. Outputs are
- * folded in completion order, so a `PreToolUse` hook that returns
- * `updatedInput` in a multi-hook matcher will race with its siblings —
- * registration-time ordering is not respected. If the caller needs a
- * deterministic input rewrite, it must ensure only one hook per matcher
- * writes `updatedInput`.
+ * All matching hooks fire simultaneously and are awaited via `Promise.all`,
+ * which preserves input-array order in its returned results. The fold
+ * therefore iterates outcomes in **registration order** — outer loop over
+ * matchers as they sit in the registry (global first, then session), inner
+ * loop over each matcher's `hooks` array. Last-writer-wins fields
+ * (`updatedInput`, `updatedOutput`) are deterministic in that order, even
+ * though hooks may complete in arbitrary wall-clock order.
+ *
+ * Consumers that need a single authoritative rewrite should still scope
+ * `updatedInput`/`updatedOutput` to one hook per matcher to avoid subtle
+ * precedence bugs when matchers are added in a different order than
+ * expected.
  *
  * ## Timeouts and cancellation
  *
  * Each hook receives its own `AbortSignal` derived from (a) the caller's
  * parent signal and (b) a timeout from `matcher.timeout` (falling back to
- * `opts.timeoutMs`, default {@link DEFAULT_HOOK_TIMEOUT_MS}). When either
- * fires, the hook's signal aborts. Timeout/abort errors are swallowed into
- * the aggregated result's `errors` array (non-fatal by default).
+ * `opts.timeoutMs`, default {@link DEFAULT_HOOK_TIMEOUT_MS}). The hook call
+ * is raced against the signal, so even a hook that ignores the signal is
+ * force-unblocked when the timeout fires. Timeout/abort errors are
+ * swallowed into the aggregated result's `errors` array (non-fatal by
+ * default).
  *
  * ## Internal matchers
  *
@@ -314,11 +333,18 @@ function collectOnceMatchersForRemoval(
  * and the logger output. Use it for infrastructure hooks whose failures
  * should not pollute user-visible diagnostics.
  *
- * ## Once semantics
+ * ## Once semantics and concurrency
  *
  * A matcher with `once: true` is removed from the registry after at least
  * one of its hooks completes without throwing. If every hook in the matcher
  * throws, the matcher is retained so the caller can retry.
+ *
+ * **Removal is not atomic across concurrent `executeHooks` calls.** Two
+ * calls that start before either has finished will each snapshot the
+ * matcher list via `getMatchers`, both fire the matcher's hooks, and both
+ * attempt removal. `once` therefore means "once per `executeHooks` call",
+ * not "once globally across the registry". Use it only for idempotent
+ * one-shot hooks.
  */
 export async function executeHooks(
   opts: ExecuteHooksOptions
@@ -337,18 +363,20 @@ export async function executeHooks(
   if (matchers.length === 0) {
     return freshResult();
   }
-  const filtered = matchers.filter((m) => matchesQuery(m.matcher, matchQuery));
-  if (filtered.length === 0) {
-    return freshResult();
-  }
 
   const tasks: Promise<HookOutcome>[] = [];
-  for (const matcher of filtered) {
+  for (const matcher of matchers) {
+    if (!matchesQuery(matcher.pattern, matchQuery)) {
+      continue;
+    }
     const perHookTimeout = matcher.timeout ?? timeoutMs;
     for (const hook of matcher.hooks) {
       const hookSignal = combineSignals(signal, perHookTimeout);
       tasks.push(runHook(hook, input, hookSignal, matcher));
     }
+  }
+  if (tasks.length === 0) {
+    return freshResult();
   }
 
   const outcomes = await Promise.all(tasks);

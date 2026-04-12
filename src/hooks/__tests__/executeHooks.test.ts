@@ -122,7 +122,7 @@ describe('executeHooks', () => {
       const registry = new HookRegistry();
       let called = false;
       registry.register('PreToolUse', {
-        matcher: '^Edit$',
+        pattern: '^Edit$',
         hooks: [
           preToolHook(async (): Promise<PreToolUseHookOutput> => {
             called = true;
@@ -145,7 +145,7 @@ describe('executeHooks', () => {
       const registry = new HookRegistry();
       const calls: string[] = [];
       registry.register('PreToolUse', {
-        matcher: '^Bash$',
+        pattern: '^Bash$',
         hooks: [
           preToolHook(async (): Promise<PreToolUseHookOutput> => {
             calls.push('bash-only');
@@ -154,7 +154,7 @@ describe('executeHooks', () => {
         ],
       });
       registry.register('PreToolUse', {
-        matcher: 'Bash|Edit',
+        pattern: 'Bash|Edit',
         hooks: [
           preToolHook(async (): Promise<PreToolUseHookOutput> => {
             calls.push('bash-or-edit');
@@ -163,7 +163,7 @@ describe('executeHooks', () => {
         ],
       });
       registry.register('PreToolUse', {
-        matcher: '^Edit$',
+        pattern: '^Edit$',
         hooks: [
           preToolHook(async (): Promise<PreToolUseHookOutput> => {
             calls.push('edit-only');
@@ -400,13 +400,13 @@ describe('executeHooks', () => {
   });
 
   describe('updatedInput handling', () => {
-    it('last-writer-wins on updatedInput when multiple hooks set it', async () => {
+    it('last-writer-wins on updatedInput follows registration order', async () => {
       const registry = new HookRegistry();
       registry.register('PreToolUse', {
         hooks: [
           preToolHook(
             async (): Promise<PreToolUseHookOutput> => ({
-              updatedInput: { cmd: 'echo safe' },
+              updatedInput: { cmd: 'first' },
             })
           ),
         ],
@@ -415,7 +415,16 @@ describe('executeHooks', () => {
         hooks: [
           preToolHook(
             async (): Promise<PreToolUseHookOutput> => ({
-              updatedInput: { cmd: 'echo safer' },
+              updatedInput: { cmd: 'second' },
+            })
+          ),
+        ],
+      });
+      registry.register('PreToolUse', {
+        hooks: [
+          preToolHook(
+            async (): Promise<PreToolUseHookOutput> => ({
+              updatedInput: { cmd: 'third' },
             })
           ),
         ],
@@ -425,8 +434,93 @@ describe('executeHooks', () => {
         input: preToolUseInput('Bash'),
         matchQuery: 'Bash',
       });
-      expect(result.updatedInput).toBeDefined();
-      expect(result.updatedInput?.cmd).toBeDefined();
+      expect(result.updatedInput).toEqual({ cmd: 'third' });
+    });
+
+    it('last-writer-wins within a single matcher follows hook array order', async () => {
+      const registry = new HookRegistry();
+      registry.register('PreToolUse', {
+        hooks: [
+          preToolHook(
+            async (): Promise<PreToolUseHookOutput> => ({
+              updatedInput: { cmd: 'inner-first' },
+            })
+          ),
+          preToolHook(
+            async (): Promise<PreToolUseHookOutput> => ({
+              updatedInput: { cmd: 'inner-second' },
+            })
+          ),
+        ],
+      });
+      const result = await executeHooks({
+        registry,
+        input: preToolUseInput('Bash'),
+        matchQuery: 'Bash',
+      });
+      expect(result.updatedInput).toEqual({ cmd: 'inner-second' });
+    });
+  });
+
+  describe('updatedOutput handling', () => {
+    it('flows updatedOutput through the aggregated result', async () => {
+      const registry = new HookRegistry();
+      registry.register('PostToolUse', {
+        hooks: [
+          postToolHook(
+            async (): Promise<PostToolUseHookOutput> => ({
+              updatedOutput: 'redacted',
+            })
+          ),
+        ],
+      });
+      const result = await executeHooks({
+        registry,
+        input: postToolUseInput('Bash'),
+        matchQuery: 'Bash',
+      });
+      expect(result.updatedOutput).toBe('redacted');
+    });
+
+    it('last-writer-wins on updatedOutput follows registration order', async () => {
+      const registry = new HookRegistry();
+      registry.register('PostToolUse', {
+        hooks: [
+          postToolHook(
+            async (): Promise<PostToolUseHookOutput> => ({
+              updatedOutput: { tag: 'first' },
+            })
+          ),
+        ],
+      });
+      registry.register('PostToolUse', {
+        hooks: [
+          postToolHook(
+            async (): Promise<PostToolUseHookOutput> => ({
+              updatedOutput: { tag: 'second' },
+            })
+          ),
+        ],
+      });
+      const result = await executeHooks({
+        registry,
+        input: postToolUseInput('Bash'),
+        matchQuery: 'Bash',
+      });
+      expect(result.updatedOutput).toEqual({ tag: 'second' });
+    });
+
+    it('leaves updatedOutput undefined when no hook sets it', async () => {
+      const registry = new HookRegistry();
+      registry.register('PostToolUse', {
+        hooks: [postToolHook(async (): Promise<PostToolUseHookOutput> => ({}))],
+      });
+      const result = await executeHooks({
+        registry,
+        input: postToolUseInput('Bash'),
+        matchQuery: 'Bash',
+      });
+      expect(result.updatedOutput).toBeUndefined();
     });
   });
 
@@ -450,6 +544,57 @@ describe('executeHooks', () => {
       });
       expect(result.preventContinuation).toBe(true);
       expect(result.stopReason).toBe('budget exhausted');
+    });
+
+    it('keeps the first stopReason when multiple hooks set preventContinuation', async () => {
+      const registry = new HookRegistry();
+      registry.register('PostToolUse', {
+        hooks: [
+          postToolHook(
+            async (): Promise<PostToolUseHookOutput> => ({
+              preventContinuation: true,
+              stopReason: 'first writer',
+            })
+          ),
+        ],
+      });
+      registry.register('PostToolUse', {
+        hooks: [
+          postToolHook(
+            async (): Promise<PostToolUseHookOutput> => ({
+              preventContinuation: true,
+              stopReason: 'second writer',
+            })
+          ),
+        ],
+      });
+      const result = await executeHooks({
+        registry,
+        input: postToolUseInput('Bash'),
+        matchQuery: 'Bash',
+      });
+      expect(result.preventContinuation).toBe(true);
+      expect(result.stopReason).toBe('first writer');
+    });
+
+    it('sets preventContinuation even if only the flag, no reason, is present', async () => {
+      const registry = new HookRegistry();
+      registry.register('PostToolUse', {
+        hooks: [
+          postToolHook(
+            async (): Promise<PostToolUseHookOutput> => ({
+              preventContinuation: true,
+            })
+          ),
+        ],
+      });
+      const result = await executeHooks({
+        registry,
+        input: postToolUseInput('Bash'),
+        matchQuery: 'Bash',
+      });
+      expect(result.preventContinuation).toBe(true);
+      expect(result.stopReason).toBeUndefined();
     });
   });
 
@@ -571,6 +716,29 @@ describe('executeHooks', () => {
       });
       expect(registry.getMatchers('PreToolUse', 'run-1')).toHaveLength(0);
     });
+
+    it('documents the concurrent-dispatch race: once fires per concurrent call, not globally', async () => {
+      const registry = new HookRegistry();
+      let calls = 0;
+      const matcher: HookMatcher<'RunStart'> = {
+        once: true,
+        hooks: [
+          runStartHook(async (): Promise<RunStartHookOutput> => {
+            calls++;
+            return emptyRunStartOutput;
+          }),
+        ],
+      };
+      registry.register('RunStart', matcher);
+
+      await Promise.all([
+        executeHooks({ registry, input: runStartInput() }),
+        executeHooks({ registry, input: runStartInput() }),
+      ]);
+
+      expect(calls).toBe(2);
+      expect(registry.getMatchers('RunStart')).toHaveLength(0);
+    });
   });
 
   describe('timeout enforcement', () => {
@@ -602,15 +770,20 @@ describe('executeHooks', () => {
       expect(elapsed).toBeLessThan(400);
     });
 
-    it('surfaces a TimeoutError label when the signal times out without the hook listening', async () => {
+    it('times out hooks that ignore the signal and surfaces an abort-shaped error', async () => {
       const registry = new HookRegistry();
+      const pendingTimers: NodeJS.Timeout[] = [];
       registry.register('RunStart', {
         timeout: 15,
         hooks: [
           runStartHook(
             (): Promise<RunStartHookOutput> =>
               new Promise<RunStartHookOutput>((resolve): void => {
-                setTimeout((): void => resolve(emptyRunStartOutput), 500);
+                const id = setTimeout(
+                  (): void => resolve(emptyRunStartOutput),
+                  500
+                );
+                pendingTimers.push(id);
               })
           ),
         ],
@@ -620,7 +793,13 @@ describe('executeHooks', () => {
       const result = await executeHooks({ registry, input: runStartInput() });
       const elapsed = Date.now() - start;
 
+      for (const id of pendingTimers) {
+        clearTimeout(id);
+      }
       expect(result.errors).toHaveLength(1);
+      expect(result.errors[0]?.toLowerCase()).toMatch(
+        /timeout|timed out|abort/
+      );
       expect(elapsed).toBeLessThan(400);
     });
 

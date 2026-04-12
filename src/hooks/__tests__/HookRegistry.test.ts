@@ -16,7 +16,7 @@ const noopPost: HookCallback<
 
 function makePreToolUseMatcher(pattern?: string): HookMatcher<'PreToolUse'> {
   return {
-    matcher: pattern,
+    pattern,
     hooks: [noop],
   };
 }
@@ -183,7 +183,7 @@ describe('HookRegistry', () => {
       for (const sid of sessions) {
         const matchers = registry.getMatchers('PreToolUse', sid);
         expect(matchers).toHaveLength(1);
-        expect(matchers[0]?.matcher).toBe(sid);
+        expect(matchers[0]?.pattern).toBe(sid);
       }
     });
   });

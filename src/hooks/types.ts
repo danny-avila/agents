@@ -199,14 +199,23 @@ export interface PreToolUseHookOutput extends BaseHookOutput {
   /**
    * Replacement tool input. Merged into the pending tool call by the host.
    *
-   * WARNING: with multiple parallel hooks, the winner is non-deterministic
-   * (last writer wins in Promise.all resolution order). If deterministic
-   * replacement is required, register a single hook per matcher.
+   * When multiple hooks set `updatedInput` within a single `executeHooks`
+   * call, the last writer in registration order wins (outer loop: matcher
+   * registration order; inner loop: hook position within the matcher). The
+   * winner is deterministic — `Promise.all` preserves input-array order.
+   * Consumers that need a single authoritative rewrite should still scope
+   * `updatedInput` to one hook per matcher to avoid confusing precedence.
    */
   updatedInput?: Record<string, unknown>;
 }
 
 export interface PostToolUseHookOutput extends BaseHookOutput {
+  /**
+   * Replacement tool output. Flows through the aggregated result so the
+   * host can substitute it before appending the tool result message.
+   * Ordering semantics match `PreToolUseHookOutput.updatedInput`:
+   * last-writer-wins in registration order.
+   */
   updatedOutput?: unknown;
 }
 
@@ -280,13 +289,34 @@ export type HookCallback<E extends HookEvent = HookEvent> = (
  * types to the event the matcher is registered against.
  */
 export interface HookMatcher<E extends HookEvent = HookEvent> {
-  /** Regex matched against the event's primary query field (e.g. tool name). */
-  matcher?: string;
+  /**
+   * Regex pattern matched against the event's primary query string (e.g.
+   * the tool name for `PreToolUse`, the agent type for `SubagentStart`).
+   *
+   * Omitted or empty means "always match". For events that do not supply a
+   * query string (`RunStart`, `Stop`, etc.), only wildcard matchers fire —
+   * a non-empty pattern on such events will never match.
+   *
+   * Patterns are treated as trusted input: `executeHooks` compiles them
+   * with `new RegExp(pattern)` without any sandbox, and a pathological
+   * pattern can block the event loop. Host registration code is expected
+   * to validate or length-bound patterns that originate from user input.
+   */
+  pattern?: string;
   /** Callbacks that fire when the matcher hits. Executed in parallel. */
   hooks: HookCallback<E>[];
   /** Per-matcher timeout in ms. Defaults to the executor's batch timeout. */
   timeout?: number;
-  /** Remove the matcher after its first successful invocation. */
+  /**
+   * Remove the matcher after its first successful invocation (at least one
+   * hook in the matcher returned without throwing).
+   *
+   * **Not atomic under concurrent dispatch.** Two concurrent `executeHooks`
+   * calls for the same event will both observe the matcher in their
+   * respective snapshots, both fire its hooks, and both attempt removal;
+   * the hook will run once per concurrent call, not once globally. Use
+   * `once` for idempotent one-shot hooks only.
+   */
   once?: boolean;
   /** Internal hooks are excluded from telemetry and non-fatal error logging. */
   internal?: boolean;
@@ -315,17 +345,33 @@ export interface AggregatedHookResult {
   /**
    * Replacement tool input from a `PreToolUse` hook.
    *
-   * NOTE: parallel hooks resolve in non-deterministic order, so with more
-   * than one hook setting `updatedInput` the last writer wins by resolution
-   * order, not by registration order. Consumers that need determinism should
-   * ensure at most one hook per matcher writes `updatedInput`.
+   * Last-writer-wins in **registration order**: `executeHooks` uses
+   * `Promise.all`, which preserves input-array order, so the fold iterates
+   * outcomes in the same order they were pushed — outer loop over matchers
+   * as they sit in the registry, inner loop over each matcher's `hooks`
+   * array. The winner is therefore deterministic but may not match the
+   * order in which hooks actually completed. Consumers that want a single
+   * authoritative rewrite should still register one `updatedInput`-setting
+   * hook per matcher to avoid subtle precedence bugs.
    */
   updatedInput?: Record<string, unknown>;
+  /**
+   * Replacement tool output from a `PostToolUse` hook.
+   *
+   * Same last-writer-wins-in-registration-order semantics as
+   * `updatedInput`. Present only when at least one hook set it; `undefined`
+   * means "use the original tool output".
+   */
+  updatedOutput?: unknown;
   /** Accumulated `additionalContext` strings from every hook, in order. */
   additionalContexts: string[];
   /** True if any hook returned `preventContinuation`. */
   preventContinuation?: boolean;
-  /** Reason recorded alongside `preventContinuation`. */
+  /**
+   * Reason recorded alongside `preventContinuation`. First winner wins:
+   * once a hook sets both flags, later hooks that also set
+   * `preventContinuation` do not overwrite the reason.
+   */
   stopReason?: string;
   /** Error messages from hooks that threw; always present (possibly empty). */
   errors: string[];
