@@ -87,6 +87,79 @@ describe('Run-level hook integration', () => {
       expect(capturedPrompt).toBe('hello world');
     });
 
+    it('extracts prompt from multi-part content (text + non-text blocks)', async () => {
+      const registry = new HookRegistry();
+      let capturedPrompt = '';
+      const hook: HookCallback<'UserPromptSubmit'> = async (
+        input
+      ): Promise<UserPromptSubmitHookOutput> => {
+        capturedPrompt = input.prompt;
+        return {};
+      };
+      registry.register('UserPromptSubmit', { hooks: [hook] });
+
+      const run = await createRun(registry);
+      run.Graph!.overrideTestModel(['ok']);
+      const msg = new HumanMessage({
+        content: [
+          { type: 'text', text: 'hello' },
+          {
+            type: 'image_url',
+            image_url: { url: 'data:image/png;base64,...' },
+          },
+          { type: 'text', text: 'world' },
+        ],
+      });
+      await run.processStream({ messages: [msg] }, callerConfig);
+
+      expect(capturedPrompt).toBe('hello\nworld');
+    });
+
+    it('yields empty prompt for image-only content', async () => {
+      const registry = new HookRegistry();
+      let capturedPrompt: string | undefined;
+      const hook: HookCallback<'UserPromptSubmit'> = async (
+        input
+      ): Promise<UserPromptSubmitHookOutput> => {
+        capturedPrompt = input.prompt;
+        return {};
+      };
+      registry.register('UserPromptSubmit', { hooks: [hook] });
+
+      const run = await createRun(registry);
+      run.Graph!.overrideTestModel(['ok']);
+      const msg = new HumanMessage({
+        content: [
+          {
+            type: 'image_url',
+            image_url: { url: 'data:image/png;base64,...' },
+          },
+        ],
+      });
+      await run.processStream({ messages: [msg] }, callerConfig);
+
+      expect(capturedPrompt).toBe('');
+    });
+
+    it('fires with empty prompt when human message has no text blocks', async () => {
+      const registry = new HookRegistry();
+      let capturedPrompt: string | undefined;
+      const hook: HookCallback<'UserPromptSubmit'> = async (
+        input
+      ): Promise<UserPromptSubmitHookOutput> => {
+        capturedPrompt = input.prompt;
+        return {};
+      };
+      registry.register('UserPromptSubmit', { hooks: [hook] });
+
+      const run = await createRun(registry);
+      run.Graph!.overrideTestModel(['ok']);
+      const msg = new HumanMessage({ content: [] });
+      await run.processStream({ messages: [msg] }, callerConfig);
+
+      expect(capturedPrompt).toBe('');
+    });
+
     it('aborts the run when hook returns deny', async () => {
       const registry = new HookRegistry();
       let stopFired = false;
@@ -204,7 +277,8 @@ describe('Run-level hook integration', () => {
       }
 
       expect(thrownError).toBeDefined();
-      expect(capturedError).toBeTruthy();
+      expect(typeof capturedError).toBe('string');
+      expect(capturedError.length).toBeGreaterThan(0);
     });
   });
 

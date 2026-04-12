@@ -353,7 +353,7 @@ export class Run<_T extends t.BaseGraphState> {
         sessionId: this.id,
       });
 
-      const lastHuman = findLastHumanMessage(inputs.messages);
+      const lastHuman = findLastMessageOfType(inputs.messages, 'human');
       if (lastHuman != null) {
         const promptResult = await executeHooks({
           registry: this.hookRegistry,
@@ -363,6 +363,8 @@ export class Run<_T extends t.BaseGraphState> {
             threadId,
             agentId: this.Graph.defaultAgentId,
             prompt: extractPromptText(lastHuman),
+            // attachments: not yet wired — Phase 2 will extract
+            // non-text content blocks (images, files) from messages
           },
           sessionId: this.id,
         });
@@ -371,6 +373,7 @@ export class Run<_T extends t.BaseGraphState> {
           promptResult.decision === 'ask'
         ) {
           this.hookRegistry.clearSession(this.id);
+          config.callbacks = undefined;
           return undefined;
         }
       }
@@ -406,7 +409,7 @@ export class Run<_T extends t.BaseGraphState> {
         }
       }
 
-      if (this.hookRegistry != null) {
+      if (this.hookRegistry?.hasHookFor('Stop', this.id) === true) {
         await executeHooks({
           registry: this.hookRegistry,
           input: {
@@ -415,13 +418,15 @@ export class Run<_T extends t.BaseGraphState> {
             threadId,
             agentId: this.Graph.defaultAgentId,
             messages: this.Graph.getRunMessages() ?? inputs.messages,
-            stopHookActive: false,
+            stopHookActive: false, // will be true when stop is triggered by a hook (Phase 2)
           },
           sessionId: this.id,
+        }).catch(() => {
+          /* Stop hook errors must not masquerade as stream failures */
         });
       }
     } catch (err) {
-      if (this.hookRegistry != null) {
+      if (this.hookRegistry?.hasHookFor('StopFailure', this.id) === true) {
         const runMessages = this.Graph.getRunMessages() ?? [];
         await executeHooks({
           registry: this.hookRegistry,
@@ -431,7 +436,7 @@ export class Run<_T extends t.BaseGraphState> {
             threadId,
             agentId: this.Graph.defaultAgentId,
             error: err instanceof Error ? err.message : String(err),
-            lastAssistantMessage: findLastAssistantMessage(runMessages),
+            lastAssistantMessage: findLastMessageOfType(runMessages, 'ai'),
           },
           sessionId: this.id,
         }).catch(() => {
@@ -638,22 +643,12 @@ export class Run<_T extends t.BaseGraphState> {
   }
 }
 
-function findLastHumanMessage(
-  messages: BaseMessage[]
+function findLastMessageOfType(
+  messages: BaseMessage[],
+  type: string
 ): BaseMessage | undefined {
   for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].getType() === 'human') {
-      return messages[i];
-    }
-  }
-  return undefined;
-}
-
-function findLastAssistantMessage(
-  messages: BaseMessage[]
-): BaseMessage | undefined {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].getType() === 'ai') {
+    if (messages[i].getType() === type) {
       return messages[i];
     }
   }
@@ -665,23 +660,20 @@ function extractPromptText(message: BaseMessage): string {
   if (typeof content === 'string') {
     return content;
   }
-  if (Array.isArray(content)) {
-    return content
-      .filter(
-        (
-          block
-        ): block is {
-          type: 'text';
-          text: string;
-        } =>
-          typeof block === 'object' &&
-          'type' in block &&
-          block.type === 'text' &&
-          'text' in block &&
-          typeof block.text === 'string'
-      )
-      .map((block) => block.text)
-      .join('\n');
+  if (!Array.isArray(content)) {
+    return String(content);
   }
-  return String(content);
+  const parts: string[] = [];
+  for (const block of content) {
+    if (
+      typeof block === 'object' &&
+      'type' in block &&
+      block.type === 'text' &&
+      'text' in block &&
+      typeof block.text === 'string'
+    ) {
+      parts.push(block.text);
+    }
+  }
+  return parts.join('\n');
 }
