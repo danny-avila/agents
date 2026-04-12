@@ -1,21 +1,9 @@
 // src/tools/SkillTool.ts
-import { z } from 'zod';
 import { tool, DynamicStructuredTool } from '@langchain/core/tools';
+import { z } from 'zod';
 import { Constants } from '@/common';
 
 export const SkillToolName = Constants.SKILL_TOOL;
-
-export const SkillToolSchema = z.object({
-  skillName: z
-    .string()
-    .describe(
-      'The kebab-case identifier of the skill to invoke (e.g. "financial-analyzer", "meeting-notes"). Must match a name from the "Available Skills" section.'
-    ),
-  args: z
-    .string()
-    .optional()
-    .describe('Optional freeform arguments string passed to the skill.'),
-});
 
 export const SkillToolDescription = `Invoke a skill from the user's library. Skills provide domain-specific instructions loaded into the conversation context, and may also provide files accessible via available tools depending on the runtime environment.
 
@@ -30,26 +18,48 @@ WHAT HAPPENS:
 
 CONSTRAINTS:
 - Do not invoke a skill that is already active in this conversation.
-- Skill names come from the catalog only — do not guess names.`;
+- Skill names come from the catalog only. Do not guess names.`;
+
+/**
+ * JSON Schema for the SkillTool parameters.
+ * Single source of truth used by both SkillToolDefinition (LCTool registry)
+ * and createSkillTool() (DynamicStructuredTool instance).
+ */
+export const SkillToolSchema = {
+  type: 'object',
+  properties: {
+    skillName: {
+      type: 'string',
+      description:
+        'The kebab-case identifier of the skill to invoke (e.g. "financial-analyzer", "meeting-notes"). Must match a name from the "Available Skills" section.',
+    },
+    args: {
+      type: 'string',
+      description: 'Optional freeform arguments string passed to the skill.',
+    },
+  },
+  required: ['skillName'],
+} as const;
 
 export const SkillToolDefinition = {
   name: SkillToolName,
   description: SkillToolDescription,
-  parameters: {
-    type: 'object' as const,
-    properties: {
-      skillName: {
-        type: 'string' as const,
-        description: 'The kebab-case identifier of the skill to invoke.',
-      },
-      args: {
-        type: 'string' as const,
-        description: 'Optional freeform arguments string passed to the skill.',
-      },
-    },
-    required: ['skillName'] as const,
-  },
+  parameters: SkillToolSchema,
 } as const;
+
+/**
+ * Zod schema derived from SkillToolSchema for DynamicStructuredTool type inference.
+ * Kept internal to createSkillTool — the JSON Schema above is the canonical definition.
+ */
+const skillToolZodSchema = z.object({
+  skillName: z
+    .string()
+    .describe(SkillToolSchema.properties.skillName.description),
+  args: z
+    .string()
+    .optional()
+    .describe(SkillToolSchema.properties.args.description),
+});
 
 /** Creates the SkillTool DynamicStructuredTool instance for use in tool maps. */
 export function createSkillTool(): DynamicStructuredTool {
@@ -62,7 +72,7 @@ export function createSkillTool(): DynamicStructuredTool {
     {
       name: SkillToolName,
       description: SkillToolDescription,
-      schema: SkillToolSchema,
+      schema: skillToolZodSchema,
     }
   );
 }

@@ -72,7 +72,11 @@ describe('formatSkillCatalog', () => {
     });
     expect(result).toContain('## Available Skills');
     expect(result).toContain('- s0');
-    expect(result).not.toContain(':');
+    // Verify entry lines have no descriptions (names-only format)
+    const entryLines = result.split('\n').filter((l) => l.startsWith('- '));
+    for (const line of entryLines) {
+      expect(line).toMatch(/^- s\d+$/);
+    }
   });
 
   it('respects custom options', () => {

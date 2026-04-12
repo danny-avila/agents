@@ -485,25 +485,28 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
    * Converts InjectedMessage instances to LangChain BaseMessage objects.
    * HumanMessage for role 'user', SystemMessage for role 'system'.
    * Metadata (isMeta, source, skillName) stored in additional_kwargs.
+   *
+   * Array content (MessageContentComplex[]) is passed through directly since
+   * LangChain BaseMessage constructors natively accept structured content arrays.
    */
   private convertInjectedMessages(
     messages: t.InjectedMessage[]
   ): BaseMessage[] {
     const converted: BaseMessage[] = [];
     for (const msg of messages) {
-      const content =
-        typeof msg.content === 'string'
-          ? msg.content
-          : JSON.stringify(msg.content);
       const additional_kwargs: Record<string, unknown> = {};
       if (msg.isMeta != null) additional_kwargs.isMeta = msg.isMeta;
       if (msg.source != null) additional_kwargs.source = msg.source;
       if (msg.skillName != null) additional_kwargs.skillName = msg.skillName;
 
       if (msg.role === 'user') {
-        converted.push(new HumanMessage({ content, additional_kwargs }));
+        converted.push(
+          new HumanMessage({ content: msg.content, additional_kwargs })
+        );
       } else {
-        converted.push(new SystemMessage({ content, additional_kwargs }));
+        converted.push(
+          new SystemMessage({ content: msg.content, additional_kwargs })
+        );
       }
     }
     return converted;
@@ -644,7 +647,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   /**
    * Execute all tool calls via ON_TOOL_EXECUTE event dispatch.
    * Used in event-driven mode where the host handles actual tool execution.
-   * Injected messages from tool results are prepended before ToolMessages.
+   *
+   * Injected messages are placed AFTER ToolMessages to respect provider message
+   * ordering contracts (AIMessage tool_calls must be immediately followed by their
+   * ToolMessage results). The host's message formatter merges injected user messages
+   * with the preceding tool_result turn for providers that require strict alternation.
    */
   private async executeViaEvent(
     toolCalls: ToolCall[],
@@ -656,7 +663,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       toolCalls,
       config
     );
-    const outputs: BaseMessage[] = [...injected, ...toolMessages];
+    const outputs: BaseMessage[] = [...toolMessages, ...injected];
     return (Array.isArray(input) ? outputs : { messages: outputs }) as T;
   }
 
@@ -762,8 +769,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
         outputs = [
           ...directOutputs,
-          ...eventResult.injected,
           ...eventResult.toolMessages,
+          ...eventResult.injected,
         ];
       } else {
         outputs = await Promise.all(

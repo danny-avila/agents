@@ -23,7 +23,7 @@ export type SkillCatalogOptions = {
 
 /**
  * Formats a skill catalog for injection into agent context.
- * Uses a truncation ladder: full descriptions → proportional truncation → names-only.
+ * Uses a truncation ladder: full descriptions, proportional truncation, names-only.
  * Returns empty string for empty input.
  */
 export function formatSkillCatalog(
@@ -55,7 +55,8 @@ export function formatSkillCatalog(
   if (fullOutput.length <= budgetChars) return fullOutput;
 
   const headerLen = HEADER.length + 2;
-  const availableChars = budgetChars - headerLen;
+  const newlineChars = capped.length > 1 ? capped.length - 1 : 0;
+  const availableChars = budgetChars - headerLen - newlineChars;
   const perEntryOverhead = 4;
   const nameCharsTotal = capped.reduce(
     (sum, s) => sum + s.name.length + perEntryOverhead,
@@ -63,11 +64,19 @@ export function formatSkillCatalog(
   );
   const availableForDescs = availableChars - nameCharsTotal;
 
-  if (availableForDescs <= 0) return formatNamesOnly(capped);
+  if (availableForDescs <= 0) {
+    return formatEntries(
+      capped.map((s) => ({ name: s.name, description: '' }))
+    );
+  }
 
   const maxDescPerEntry = Math.floor(availableForDescs / capped.length);
 
-  if (maxDescPerEntry < minDescLength) return formatNamesOnly(capped);
+  if (maxDescPerEntry < minDescLength) {
+    return formatEntries(
+      capped.map((s) => ({ name: s.name, description: '' }))
+    );
+  }
 
   const truncated = capped.map((s) => ({
     name: s.name,
@@ -77,7 +86,9 @@ export function formatSkillCatalog(
         : s.description,
   }));
 
-  return formatEntries(truncated);
+  const result = formatEntries(truncated);
+  if (result.length <= budgetChars) return result;
+  return formatEntries(capped.map((s) => ({ name: s.name, description: '' })));
 }
 
 function formatEntries(
@@ -86,10 +97,5 @@ function formatEntries(
   const lines = entries.map((e) =>
     e.description ? `- ${e.name}: ${e.description}` : `- ${e.name}`
   );
-  return `${HEADER}\n\n${lines.join('\n')}`;
-}
-
-function formatNamesOnly(entries: { name: string }[]): string {
-  const lines = entries.map((e) => `- ${e.name}`);
   return `${HEADER}\n\n${lines.join('\n')}`;
 }
