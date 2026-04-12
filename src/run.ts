@@ -22,8 +22,10 @@ import { MultiAgentGraph } from '@/graphs/MultiAgentGraph';
 import { StandardGraph } from '@/graphs/Graph';
 import { initializeModel } from '@/llm/init';
 import { HandlerRegistry } from '@/events';
+import { executeHooks } from '@/hooks';
 import { isOpenAILike } from '@/utils/llm';
 import { isPresent } from '@/utils/misc';
+import type { HookRegistry } from '@/hooks';
 
 export const defaultOmitOptions = new Set([
   'stream',
@@ -42,6 +44,7 @@ export class Run<_T extends t.BaseGraphState> {
   id: string;
   private tokenCounter?: t.TokenCounter;
   private handlerRegistry?: HandlerRegistry;
+  private hookRegistry?: HookRegistry;
   private indexTokenCountMap?: Record<string, number>;
   calibrationRatio: number = 1;
   graphRunnable?: t.CompiledStateWorkflow;
@@ -74,6 +77,7 @@ export class Run<_T extends t.BaseGraphState> {
     }
 
     this.handlerRegistry = handlerRegistry;
+    this.hookRegistry = config.hooks;
 
     if (!config.graphConfig) {
       throw new Error('Graph config not provided');
@@ -84,6 +88,7 @@ export class Run<_T extends t.BaseGraphState> {
       this.graphRunnable = this.createMultiAgentGraph(config.graphConfig);
       if (this.Graph) {
         this.Graph.handlerRegistry = handlerRegistry;
+        this.Graph.hookRegistry = this.hookRegistry;
       }
     } else {
       /** Default to legacy graph for 'standard' or undefined type */
@@ -92,6 +97,7 @@ export class Run<_T extends t.BaseGraphState> {
         this.Graph.compileOptions =
           config.graphConfig.compileOptions ?? this.Graph.compileOptions;
         this.Graph.handlerRegistry = handlerRegistry;
+        this.Graph.hookRegistry = this.hookRegistry;
       }
     }
 
@@ -332,6 +338,47 @@ export class Run<_T extends t.BaseGraphState> {
       run_id: this.id,
     });
 
+    const threadId = config.configurable.thread_id as string | undefined;
+
+    if (this.hookRegistry != null) {
+      await executeHooks({
+        registry: this.hookRegistry,
+        input: {
+          hook_event_name: 'RunStart',
+          runId: this.id,
+          threadId,
+          agentId: this.Graph.defaultAgentId,
+          messages: inputs.messages,
+        },
+        sessionId: this.id,
+      });
+
+      const lastHuman = findLastMessageOfType(inputs.messages, 'human');
+      if (lastHuman != null) {
+        const promptResult = await executeHooks({
+          registry: this.hookRegistry,
+          input: {
+            hook_event_name: 'UserPromptSubmit',
+            runId: this.id,
+            threadId,
+            agentId: this.Graph.defaultAgentId,
+            prompt: extractPromptText(lastHuman),
+            // attachments: not yet wired — Phase 2 will extract
+            // non-text content blocks (images, files) from messages
+          },
+          sessionId: this.id,
+        });
+        if (
+          promptResult.decision === 'deny' ||
+          promptResult.decision === 'ask'
+        ) {
+          this.hookRegistry.clearSession(this.id);
+          config.callbacks = undefined;
+          return undefined;
+        }
+      }
+    }
+
     const stream = this.graphRunnable.streamEvents(inputs, config, {
       raiseError: true,
       /**
@@ -361,7 +408,45 @@ export class Run<_T extends t.BaseGraphState> {
           await handler.handle(eventName, data, metadata, this.Graph);
         }
       }
+
+      if (this.hookRegistry?.hasHookFor('Stop', this.id) === true) {
+        await executeHooks({
+          registry: this.hookRegistry,
+          input: {
+            hook_event_name: 'Stop',
+            runId: this.id,
+            threadId,
+            agentId: this.Graph.defaultAgentId,
+            messages: this.Graph.getRunMessages() ?? inputs.messages,
+            stopHookActive: false, // will be true when stop is triggered by a hook (Phase 2)
+          },
+          sessionId: this.id,
+        }).catch(() => {
+          /* Stop hook errors must not masquerade as stream failures */
+        });
+      }
+    } catch (err) {
+      if (this.hookRegistry?.hasHookFor('StopFailure', this.id) === true) {
+        const runMessages = this.Graph.getRunMessages() ?? [];
+        await executeHooks({
+          registry: this.hookRegistry,
+          input: {
+            hook_event_name: 'StopFailure',
+            runId: this.id,
+            threadId,
+            agentId: this.Graph.defaultAgentId,
+            error: err instanceof Error ? err.message : String(err),
+            lastAssistantMessage: findLastMessageOfType(runMessages, 'ai'),
+          },
+          sessionId: this.id,
+        }).catch(() => {
+          /* swallow hook errors — the original error must propagate */
+        });
+      }
+      throw err;
     } finally {
+      this.hookRegistry?.clearSession(this.id);
+
       /**
        * Break the reference chain that keeps heavy data alive via
        * LangGraph's internal `__pregel_scratchpad.currentTaskInput` →
@@ -556,4 +641,39 @@ export class Run<_T extends t.BaseGraphState> {
       );
     }
   }
+}
+
+function findLastMessageOfType(
+  messages: BaseMessage[],
+  type: string
+): BaseMessage | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].getType() === type) {
+      return messages[i];
+    }
+  }
+  return undefined;
+}
+
+function extractPromptText(message: BaseMessage): string {
+  const content = message.content;
+  if (typeof content === 'string') {
+    return content;
+  }
+  if (!Array.isArray(content)) {
+    return String(content);
+  }
+  const parts: string[] = [];
+  for (const block of content) {
+    if (
+      typeof block === 'object' &&
+      'type' in block &&
+      block.type === 'text' &&
+      'text' in block &&
+      typeof block.text === 'string'
+    ) {
+      parts.push(block.text);
+    }
+  }
+  return parts.join('\n');
 }
