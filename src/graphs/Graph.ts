@@ -509,6 +509,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         agentId: agentContext?.agentId,
         toolCallStepIds: this.toolCallStepIds,
         toolRegistry: agentContext?.toolRegistry,
+        hookRegistry: this.hookRegistry,
         directToolNames: directToolNames.size > 0 ? directToolNames : undefined,
         maxContextTokens: agentContext?.maxContextTokens,
         maxToolResultChars: agentContext?.maxToolResultChars,
@@ -537,6 +538,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       tools: allTraditionalTools,
       toolMap: traditionalToolMap,
       toolCallStepIds: this.toolCallStepIds,
+      hookRegistry: this.hookRegistry,
       errorHandler: (data, metadata) =>
         StandardGraph.handleToolCallErrorStatic(this, data, metadata),
       toolRegistry: agentContext?.toolRegistry,
