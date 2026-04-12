@@ -19,7 +19,7 @@ import type {
 import type { BaseMessage, AIMessage } from '@langchain/core/messages';
 import type { StructuredToolInterface } from '@langchain/core/tools';
 import type * as t from '@/types';
-import type { HookRegistry } from '@/hooks';
+import type { HookRegistry, AggregatedHookResult } from '@/hooks';
 import { RunnableCallable } from '@/utils';
 import {
   calculateMaxToolResultChars,
@@ -504,19 +504,18 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     const runId = (config.configurable?.run_id as string | undefined) ?? '';
     const threadId = config.configurable?.thread_id as string | undefined;
 
-    const preToolCalls = toolCalls.map((call) => {
-      const turn = this.toolUsageCount.get(call.name) ?? 0;
-      this.toolUsageCount.set(call.name, turn + 1);
-      return {
-        call,
-        turn,
-        stepId: this.toolCallStepIds?.get(call.id!) ?? '',
-        args: call.args as Record<string, unknown>,
-      };
-    });
+    const preToolCalls = toolCalls.map((call) => ({
+      call,
+      stepId: this.toolCallStepIds?.get(call.id!) ?? '',
+      args: call.args as Record<string, unknown>,
+    }));
 
-    const deniedMessages: ToolMessage[] = [];
-    const approved: typeof preToolCalls = [];
+    const messageByCallId = new Map<string, ToolMessage>();
+    const approvedEntries: typeof preToolCalls = [];
+    const emptyResult: AggregatedHookResult = {
+      additionalContexts: [],
+      errors: [],
+    };
 
     if (this.hookRegistry?.hasHookFor('PreToolUse', runId) === true) {
       const preResults = await Promise.all(
@@ -532,11 +531,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               toolInput: entry.args,
               toolUseId: entry.call.id!,
               stepId: entry.stepId,
-              turn: entry.turn,
+              turn: this.toolUsageCount.get(entry.call.name),
             },
             sessionId: runId,
             matchQuery: entry.call.name,
-          })
+          }).catch((): AggregatedHookResult => emptyResult)
         )
       );
 
@@ -547,13 +546,22 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           hookResult.decision === 'deny' || hookResult.decision === 'ask';
         if (isDenied) {
           const reason = hookResult.reason ?? 'Blocked by hook';
-          deniedMessages.push(
+          const contentString = `Blocked: ${reason}`;
+          messageByCallId.set(
+            entry.call.id!,
             new ToolMessage({
               status: 'error',
-              content: `Blocked: ${reason}`,
+              content: contentString,
               name: entry.call.name,
               tool_call_id: entry.call.id!,
             })
+          );
+          this.dispatchStepCompleted(
+            entry.call.id!,
+            entry.call.name,
+            entry.args,
+            contentString,
+            config
           );
           if (this.hookRegistry.hasHookFor('PermissionDenied', runId)) {
             executeHooks({
@@ -579,185 +587,204 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         if (hookResult.updatedInput != null) {
           entry.args = hookResult.updatedInput;
         }
-        approved.push(entry);
+        approvedEntries.push(entry);
       }
     } else {
-      approved.push(...preToolCalls);
+      approvedEntries.push(...preToolCalls);
     }
 
-    if (approved.length === 0) {
-      return deniedMessages;
-    }
+    if (approvedEntries.length > 0) {
+      const requests: t.ToolCallRequest[] = approvedEntries.map((entry) => {
+        const turn = this.toolUsageCount.get(entry.call.name) ?? 0;
+        this.toolUsageCount.set(entry.call.name, turn + 1);
 
-    const requests: t.ToolCallRequest[] = approved.map((entry) => {
-      const request: t.ToolCallRequest = {
-        id: entry.call.id!,
-        name: entry.call.name,
-        args: entry.args,
-        stepId: entry.stepId,
-        turn: entry.turn,
-      };
-
-      if (
-        entry.call.name === Constants.EXECUTE_CODE ||
-        entry.call.name === Constants.PROGRAMMATIC_TOOL_CALLING
-      ) {
-        request.codeSessionContext = this.getCodeSessionContext();
-      }
-
-      return request;
-    });
-
-    const results = await new Promise<t.ToolExecuteResult[]>(
-      (resolve, reject) => {
-        const request: t.ToolExecuteBatchRequest = {
-          toolCalls: requests,
-          userId: config.configurable?.user_id as string | undefined,
-          agentId: this.agentId,
-          configurable: config.configurable as
-            | Record<string, unknown>
-            | undefined,
-          metadata: config.metadata as Record<string, unknown> | undefined,
-          resolve,
-          reject,
+        const request: t.ToolCallRequest = {
+          id: entry.call.id!,
+          name: entry.call.name,
+          args: entry.args,
+          stepId: entry.stepId,
+          turn,
         };
 
-        safeDispatchCustomEvent(GraphEvents.ON_TOOL_EXECUTE, request, config);
-      }
-    );
-
-    this.storeCodeSessionFromResults(results, requests);
-
-    const hasPostHook =
-      this.hookRegistry?.hasHookFor('PostToolUse', runId) === true;
-    const hasFailureHook =
-      this.hookRegistry?.hasHookFor('PostToolUseFailure', runId) === true;
-
-    const executedMessages: ToolMessage[] = [];
-    for (const result of results) {
-      const request = requests.find((r) => r.id === result.toolCallId);
-      const toolName = request?.name ?? 'unknown';
-      const stepId = this.toolCallStepIds?.get(result.toolCallId) ?? '';
-      if (!stepId) {
-        // eslint-disable-next-line no-console
-        console.warn(
-          `[ToolNode] toolCallStepIds missing entry for toolCallId=${result.toolCallId} (tool=${toolName}). ` +
-            'This indicates a race between the stream consumer and graph execution. ' +
-            `Map size: ${this.toolCallStepIds?.size ?? 0}`
-        );
-      }
-
-      let contentString: string;
-
-      if (result.status === 'error') {
-        contentString = `Error: ${result.errorMessage ?? 'Unknown error'}\n Please fix your mistakes.`;
-
-        if (hasFailureHook) {
-          await executeHooks({
-            registry: this.hookRegistry!,
-            input: {
-              hook_event_name: 'PostToolUseFailure',
-              runId,
-              threadId,
-              agentId: this.agentId,
-              toolName,
-              toolInput: request?.args ?? {},
-              toolUseId: result.toolCallId,
-              error: result.errorMessage ?? 'Unknown error',
-              stepId,
-              turn: request?.turn,
-            },
-            sessionId: runId,
-            matchQuery: toolName,
-          }).catch(() => {
-            /* PostToolUseFailure is observational — swallow errors */
-          });
+        if (
+          entry.call.name === Constants.EXECUTE_CODE ||
+          entry.call.name === Constants.PROGRAMMATIC_TOOL_CALLING
+        ) {
+          request.codeSessionContext = this.getCodeSessionContext();
         }
-      } else {
-        const rawContent =
-          typeof result.content === 'string'
-            ? result.content
-            : JSON.stringify(result.content);
-        contentString = truncateToolResultContent(
-          rawContent,
-          this.maxToolResultChars
-        );
 
-        if (hasPostHook) {
-          const hookResult = await executeHooks({
-            registry: this.hookRegistry!,
-            input: {
-              hook_event_name: 'PostToolUse',
-              runId,
-              threadId,
-              agentId: this.agentId,
-              toolName,
-              toolInput: request?.args ?? {},
-              toolOutput: result.content,
-              toolUseId: result.toolCallId,
-              stepId,
-              turn: request?.turn,
-            },
-            sessionId: runId,
-            matchQuery: toolName,
-          }).catch((): undefined => undefined);
-          if (hookResult?.updatedOutput != null) {
-            const replaced =
-              typeof hookResult.updatedOutput === 'string'
-                ? hookResult.updatedOutput
-                : JSON.stringify(hookResult.updatedOutput);
-            contentString = truncateToolResultContent(
-              replaced,
-              this.maxToolResultChars
-            );
-          }
+        return request;
+      });
+
+      const requestMap = new Map(requests.map((r) => [r.id, r]));
+
+      const results = await new Promise<t.ToolExecuteResult[]>(
+        (resolve, reject) => {
+          const batchRequest: t.ToolExecuteBatchRequest = {
+            toolCalls: requests,
+            userId: config.configurable?.user_id as string | undefined,
+            agentId: this.agentId,
+            configurable: config.configurable as
+              | Record<string, unknown>
+              | undefined,
+            metadata: config.metadata as Record<string, unknown> | undefined,
+            resolve,
+            reject,
+          };
+
+          safeDispatchCustomEvent(
+            GraphEvents.ON_TOOL_EXECUTE,
+            batchRequest,
+            config
+          );
         }
-      }
+      );
 
-      const toolMessage =
-        result.status === 'error'
-          ? new ToolMessage({
+      this.storeCodeSessionFromResults(results, requests);
+
+      const hasPostHook =
+        this.hookRegistry?.hasHookFor('PostToolUse', runId) === true;
+      const hasFailureHook =
+        this.hookRegistry?.hasHookFor('PostToolUseFailure', runId) === true;
+
+      for (const result of results) {
+        const request = requestMap.get(result.toolCallId);
+        const toolName = request?.name ?? 'unknown';
+
+        let contentString: string;
+        let toolMessage: ToolMessage;
+
+        if (result.status === 'error') {
+          contentString = `Error: ${result.errorMessage ?? 'Unknown error'}\n Please fix your mistakes.`;
+          toolMessage = new ToolMessage({
             status: 'error',
             content: contentString,
             name: toolName,
             tool_call_id: result.toolCallId,
-          })
-          : new ToolMessage({
+          });
+
+          if (hasFailureHook) {
+            await executeHooks({
+              registry: this.hookRegistry!,
+              input: {
+                hook_event_name: 'PostToolUseFailure',
+                runId,
+                threadId,
+                agentId: this.agentId,
+                toolName,
+                toolInput: request?.args ?? {},
+                toolUseId: result.toolCallId,
+                error: result.errorMessage ?? 'Unknown error',
+                stepId: request?.stepId,
+                turn: request?.turn,
+              },
+              sessionId: runId,
+              matchQuery: toolName,
+            }).catch(() => {
+              /* PostToolUseFailure is observational — swallow errors */
+            });
+          }
+        } else {
+          const rawContent =
+            typeof result.content === 'string'
+              ? result.content
+              : JSON.stringify(result.content);
+          contentString = truncateToolResultContent(
+            rawContent,
+            this.maxToolResultChars
+          );
+
+          if (hasPostHook) {
+            const hookResult = await executeHooks({
+              registry: this.hookRegistry!,
+              input: {
+                hook_event_name: 'PostToolUse',
+                runId,
+                threadId,
+                agentId: this.agentId,
+                toolName,
+                toolInput: request?.args ?? {},
+                toolOutput: result.content,
+                toolUseId: result.toolCallId,
+                stepId: request?.stepId,
+                turn: request?.turn,
+              },
+              sessionId: runId,
+              matchQuery: toolName,
+            }).catch((): undefined => undefined);
+            if (hookResult?.updatedOutput != null) {
+              const replaced =
+                typeof hookResult.updatedOutput === 'string'
+                  ? hookResult.updatedOutput
+                  : JSON.stringify(hookResult.updatedOutput);
+              contentString = truncateToolResultContent(
+                replaced,
+                this.maxToolResultChars
+              );
+            }
+          }
+
+          toolMessage = new ToolMessage({
             status: 'success',
             name: toolName,
             content: contentString,
             artifact: result.artifact,
             tool_call_id: result.toolCallId,
           });
+        }
 
-      const tool_call: t.ProcessedToolCall = {
-        args:
-          typeof request?.args === 'string'
-            ? request.args
-            : JSON.stringify(request?.args ?? {}),
-        name: toolName,
-        id: result.toolCallId,
-        output: contentString,
-        progress: 1,
-      };
+        this.dispatchStepCompleted(
+          result.toolCallId,
+          toolName,
+          request?.args ?? {},
+          contentString,
+          config
+        );
 
-      safeDispatchCustomEvent(
-        GraphEvents.ON_RUN_STEP_COMPLETED,
-        {
-          result: {
-            id: stepId,
-            index: request?.turn ?? 0,
-            type: 'tool_call' as const,
-            tool_call,
-          },
-        },
-        config
-      );
-
-      executedMessages.push(toolMessage);
+        messageByCallId.set(result.toolCallId, toolMessage);
+      }
     }
 
-    return [...deniedMessages, ...executedMessages];
+    return toolCalls
+      .map((call) => messageByCallId.get(call.id!))
+      .filter((m): m is ToolMessage => m != null);
+  }
+
+  private dispatchStepCompleted(
+    toolCallId: string,
+    toolName: string,
+    args: Record<string, unknown>,
+    output: string,
+    config: RunnableConfig
+  ): void {
+    const stepId = this.toolCallStepIds?.get(toolCallId) ?? '';
+    if (!stepId) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[ToolNode] toolCallStepIds missing entry for toolCallId=${toolCallId} (tool=${toolName}). ` +
+          'This indicates a race between the stream consumer and graph execution. ' +
+          `Map size: ${this.toolCallStepIds?.size ?? 0}`
+      );
+    }
+
+    safeDispatchCustomEvent(
+      GraphEvents.ON_RUN_STEP_COMPLETED,
+      {
+        result: {
+          id: stepId,
+          index: this.toolUsageCount.get(toolName) ?? 0,
+          type: 'tool_call' as const,
+          tool_call: {
+            args: JSON.stringify(args),
+            name: toolName,
+            id: toolCallId,
+            output,
+            progress: 1,
+          } as t.ProcessedToolCall,
+        },
+      },
+      config
+    );
   }
 
   /**

@@ -289,6 +289,10 @@ describe('Tool-level hook integration (event-driven mode)', () => {
   describe('PermissionDenied', () => {
     it('fires after PreToolUse deny with the reason', async () => {
       const registry = new HookRegistry();
+      let pdResolve: () => void;
+      const pdDone = new Promise<void>((r) => {
+        pdResolve = r;
+      });
       let captured: PermissionDeniedHookInput | undefined;
       const denyHook: HookCallback<
         'PreToolUse'
@@ -300,6 +304,7 @@ describe('Tool-level hook integration (event-driven mode)', () => {
         input
       ): Promise<PermissionDeniedHookOutput> => {
         captured = input;
+        pdResolve();
         return {};
       };
       registry.register('PreToolUse', { hooks: [denyHook] });
@@ -312,7 +317,7 @@ describe('Tool-level hook integration (event-driven mode)', () => {
         callerConfig
       );
 
-      await new Promise<void>((r) => setTimeout(r, 50));
+      await pdDone;
       expect(captured).toBeDefined();
       expect(captured!.reason).toBe('security policy');
       expect(captured!.toolName).toBe('echo');
@@ -342,6 +347,49 @@ describe('Tool-level hook integration (event-driven mode)', () => {
       expect(captured!.hook_event_name).toBe('PostToolUse');
       expect(captured!.toolName).toBe('echo');
       expect(captured!.toolOutput).toBe('echo: hi');
+    });
+
+    it('updatedOutput replaces the ToolMessage content', async () => {
+      const registry = new HookRegistry();
+      const replaceHook: HookCallback<
+        'PostToolUse'
+      > = async (): Promise<PostToolUseHookOutput> => ({
+        updatedOutput: 'REDACTED',
+      });
+      registry.register('PostToolUse', { hooks: [replaceHook] });
+
+      let resolvedContent: string | undefined;
+      const captureHandler: t.EventHandler = {
+        handle: async (_event: string, rawData: unknown): Promise<void> => {
+          const data = rawData as t.ToolExecuteBatchRequest;
+          const results = data.toolCalls.map(
+            (tc: t.ToolCallRequest): t.ToolExecuteResult => ({
+              toolCallId: tc.id,
+              content: 'original secret output',
+              status: 'success' as const,
+            })
+          );
+          data.resolve(results);
+        },
+      };
+
+      const run = await createEventDrivenRun(registry, captureHandler);
+      run.Graph!.overrideTestModel(['calling echo'], 5, [makeToolCall()]);
+      await run.processStream(
+        { messages: [new HumanMessage('echo')] },
+        callerConfig
+      );
+
+      const messages = run.Graph!.getRunMessages() ?? [];
+      const toolMsg = messages.find((m) => m.getType() === 'tool');
+      if (toolMsg != null) {
+        resolvedContent =
+          typeof toolMsg.content === 'string'
+            ? toolMsg.content
+            : JSON.stringify(toolMsg.content);
+      }
+
+      expect(resolvedContent).toBe('REDACTED');
     });
   });
 
