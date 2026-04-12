@@ -11,6 +11,7 @@ import type * as s from '@/types/stream';
 import type * as e from '@/common/enum';
 import type * as g from '@/types/graph';
 import type * as l from '@/types/llm';
+import type { HookRegistry } from '@/hooks';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type ZodObjectAny = z.ZodObject<any, any, any, any>;
@@ -112,6 +113,17 @@ export type RunConfig = {
   runId: string;
   graphConfig: LegacyGraphConfig | StandardGraphConfig | MultiAgentGraphConfig;
   customHandlers?: Record<string, g.EventHandler>;
+  /**
+   * Pre-constructed hook registry for this run. Hooks fire at lifecycle
+   * points in `processStream` (RunStart, UserPromptSubmit, Stop,
+   * StopFailure) and — once the tool-hook PR lands — around tool calls.
+   *
+   * Pass `undefined` (the default) to skip all hook dispatch. When a
+   * registry is provided, the run attaches it to the `Graph` so internal
+   * nodes can fire hooks too, and clears the session in the `finally`
+   * block to prevent leaks.
+   */
+  hooks?: HookRegistry;
   returnContent?: boolean;
   tokenCounter?: TokenCounter;
   indexTokenCountMap?: Record<string, number>;
