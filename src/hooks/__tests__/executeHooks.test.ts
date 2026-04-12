@@ -1,6 +1,7 @@
 // src/hooks/__tests__/executeHooks.test.ts
 import { HookRegistry } from '../HookRegistry';
 import { executeHooks } from '../executeHooks';
+import { clearMatcherCache } from '../matchers';
 import type {
   HookCallback,
   HookMatcher,
@@ -96,6 +97,7 @@ describe('executeHooks', () => {
   let consoleWarnSpy: jest.SpyInstance;
 
   beforeEach(() => {
+    clearMatcherCache();
     consoleWarnSpy = jest
       .spyOn(console, 'warn')
       .mockImplementation((): void => {

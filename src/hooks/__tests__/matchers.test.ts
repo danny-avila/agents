@@ -171,6 +171,53 @@ describe('matchesQuery', () => {
       expect(hasNestedQuantifier('(\\+)+')).toBe(false);
       expect(hasNestedQuantifier('(a\\*)+')).toBe(false);
     });
+
+    describe('group-syntax prefixes are not misread as quantifiers', () => {
+      it('allows non-capturing groups with optional quantifier', () => {
+        expect(hasNestedQuantifier('(?:pre_)?tool_name')).toBe(false);
+        expect(hasNestedQuantifier('(?:ab)?')).toBe(false);
+      });
+
+      it('allows non-capturing groups with + or * quantifier', () => {
+        expect(hasNestedQuantifier('(?:Bash|Shell)+')).toBe(false);
+        expect(hasNestedQuantifier('(?:ab)*')).toBe(false);
+        expect(hasNestedQuantifier('(?:ab){2,5}')).toBe(false);
+      });
+
+      it('allows lookahead and negative lookahead', () => {
+        expect(hasNestedQuantifier('(?=foo)bar')).toBe(false);
+        expect(hasNestedQuantifier('(?!foo)bar')).toBe(false);
+        expect(hasNestedQuantifier('(?=\\w+)bar')).toBe(false);
+      });
+
+      it('allows lookbehind and negative lookbehind', () => {
+        expect(hasNestedQuantifier('(?<=\\s)\\w+')).toBe(false);
+        expect(hasNestedQuantifier('(?<!^)\\w+')).toBe(false);
+      });
+
+      it('allows named capture groups with trailing quantifier', () => {
+        expect(hasNestedQuantifier('(?<name>\\d+)')).toBe(false);
+        expect(hasNestedQuantifier('(?<digits>\\d)+')).toBe(false);
+      });
+    });
+
+    describe('risk propagation across non-capturing wrappers', () => {
+      it('flags (?:(a+))+ — outer quantifier over a wrapped quantified group', () => {
+        expect(hasNestedQuantifier('(?:(a+))+')).toBe(true);
+      });
+
+      it('flags (?:a+)+ — non-capturing group with internal quantifier', () => {
+        expect(hasNestedQuantifier('(?:a+)+')).toBe(true);
+      });
+
+      it('does not flag (?:(ab))+ — quantified wrapper, no inner quantifier', () => {
+        expect(hasNestedQuantifier('(?:(ab))+')).toBe(false);
+      });
+
+      it('flags ((ab)+)+ — multiply-wrapped but contains quantified subgroup', () => {
+        expect(hasNestedQuantifier('((ab)+)+')).toBe(true);
+      });
+    });
   });
 
   describe('ReDoS mitigation via matchesQuery', () => {

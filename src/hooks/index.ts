@@ -9,8 +9,6 @@ export { HookRegistry } from './HookRegistry';
 export { executeHooks, DEFAULT_HOOK_TIMEOUT_MS } from './executeHooks';
 export {
   matchesQuery,
-  clearMatcherCache,
-  getMatcherCacheSize,
   hasNestedQuantifier,
   MAX_PATTERN_LENGTH,
   MAX_CACHE_SIZE,

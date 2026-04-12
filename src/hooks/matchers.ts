@@ -40,7 +40,19 @@ interface CacheEntry {
  */
 const patternCache: Map<string, CacheEntry> = new Map();
 
+/**
+ * Threshold above which `touchCacheEntry` actually performs the LRU
+ * refresh. Below this watermark the cache has zero eviction pressure, so
+ * the delete+set on every hit would be pure overhead. Above it we refresh
+ * properly so hot patterns survive evictions. 75% of capacity is the
+ * standard sweet spot.
+ */
+const LRU_REFRESH_THRESHOLD = Math.floor((MAX_CACHE_SIZE * 3) / 4);
+
 function touchCacheEntry(pattern: string, entry: CacheEntry): void {
+  if (patternCache.size < LRU_REFRESH_THRESHOLD) {
+    return;
+  }
   patternCache.delete(pattern);
   patternCache.set(pattern, entry);
 }
@@ -55,26 +67,72 @@ function setCacheEntry(pattern: string, entry: CacheEntry): void {
   patternCache.set(pattern, entry);
 }
 
+interface QuantifierFrame {
+  hasBacktrackRisk: boolean;
+}
+
+function skipGroupSyntaxPrefix(pattern: string, start: number): number {
+  if (start >= pattern.length || pattern[start] !== '?') {
+    return start;
+  }
+  let i = start + 1;
+  if (i >= pattern.length) {
+    return i;
+  }
+  const modifier = pattern[i];
+  if (modifier === ':' || modifier === '=' || modifier === '!') {
+    return i + 1;
+  }
+  if (modifier !== '<') {
+    return i;
+  }
+  i++;
+  if (i < pattern.length && (pattern[i] === '=' || pattern[i] === '!')) {
+    return i + 1;
+  }
+  while (i < pattern.length && pattern[i] !== '>') {
+    i++;
+  }
+  if (i < pattern.length) {
+    i++;
+  }
+  return i;
+}
+
 /**
  * Cheap syntactic detector for the most common catastrophic-backtracking
  * shape: a quantified group that contains another quantifier (e.g.
- * `(a+)+`, `(.*)*`, `(\w+)+$`). This is the "nested quantifier" class of
- * ReDoS — runs in polynomial-or-worse time on adversarial inputs.
+ * `(a+)+`, `(.*)*`, `(\w+)+$`, `(?:(a+))+`). This is the "nested
+ * quantifier" class of ReDoS — runs in polynomial-or-worse time on
+ * adversarial inputs.
  *
- * The scan walks the pattern linearly, tracking parenthesis depth and
- * whether the innermost group has seen a quantifier. When a group closes,
- * if it contained a quantifier AND the closing paren is followed by a
- * quantifier, the pattern is flagged.
+ * The scan walks the pattern linearly using an explicit stack of group
+ * frames. For each group it tracks whether the group's contents include
+ * "backtrack risk" — meaning a direct quantifier OR a nested group that
+ * carries risk up. When a group closes with a trailing quantifier AND its
+ * frame carries backtrack risk, the pattern is flagged. Risk propagates
+ * to the enclosing frame when a child group closes (whether the child
+ * itself was quantified or not), so `(?:(a+))+` — equivalent to `(a+)+`
+ * — is flagged correctly even though the outer non-capturing wrapper is
+ * one level removed from the inner quantifier.
  *
- * This is a heuristic, not a proof — it rejects many unsafe patterns
- * and allows some that safe-regex libraries would flag. It is a floor,
- * not a ceiling: hosts that accept user-supplied patterns must still
- * validate upstream. The goal is to stop trivially bad patterns from
- * reaching the compiler on a multi-tenant hot path.
+ * ## Group-syntax prefixes
+ *
+ * Non-capturing groups (`(?:`), lookaheads (`(?=`, `(?!`), lookbehinds
+ * (`(?<=`, `(?<!`), and named groups (`(?<name>`) are skipped over at
+ * the `(` so their `?` is not misread as a quantifier. Without this,
+ * `(?:pre_)?tool_name` would be incorrectly rejected because the scanner
+ * would see the group-syntax `?` as a quantifier at depth 1.
+ *
+ * ## Heuristic, not a proof
+ *
+ * This catches the common forms but not all. Ambiguous-alternation ReDoS
+ * like `(a|a)+` is not detected. Pathologically long patterns are also
+ * caught by {@link MAX_PATTERN_LENGTH}. Hosts that accept user-supplied
+ * patterns must still validate upstream.
  */
 export function hasNestedQuantifier(pattern: string): boolean {
-  const quantifiedAtDepth: boolean[] = [];
-  let depth = 0;
+  const stack: QuantifierFrame[] = [];
   let i = 0;
   while (i < pattern.length) {
     const ch = pattern[i];
@@ -83,32 +141,35 @@ export function hasNestedQuantifier(pattern: string): boolean {
       continue;
     }
     if (ch === '[') {
-      const end = findCharClassEnd(pattern, i);
-      i = end + 1;
+      i = findCharClassEnd(pattern, i) + 1;
       continue;
     }
     if (ch === '(') {
-      depth++;
-      quantifiedAtDepth[depth] = false;
-      i++;
+      stack.push({ hasBacktrackRisk: false });
+      i = skipGroupSyntaxPrefix(pattern, i + 1);
       continue;
     }
     if (ch === ')') {
-      const innerHadQuantifier = quantifiedAtDepth[depth] === true;
-      depth--;
+      const frame = stack.pop();
+      if (frame === undefined) {
+        i++;
+        continue;
+      }
       const next = pattern[i + 1];
-      if (
-        innerHadQuantifier &&
-        (next === '*' || next === '+' || next === '?' || next === '{')
-      ) {
+      const isQuantifier =
+        next === '*' || next === '+' || next === '?' || next === '{';
+      if (isQuantifier && frame.hasBacktrackRisk) {
         return true;
+      }
+      if (stack.length > 0 && (frame.hasBacktrackRisk || isQuantifier)) {
+        stack[stack.length - 1].hasBacktrackRisk = true;
       }
       i++;
       continue;
     }
     if (ch === '*' || ch === '+' || ch === '?' || ch === '{') {
-      if (depth > 0) {
-        quantifiedAtDepth[depth] = true;
+      if (stack.length > 0) {
+        stack[stack.length - 1].hasBacktrackRisk = true;
       }
     }
     i++;
