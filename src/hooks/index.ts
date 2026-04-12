@@ -1,10 +1,9 @@
 // src/hooks/index.ts
 //
-// Phase 1 PR 1: this directory is purely additive and is NOT re-exported
-// from `src/index.ts`. The types and classes below are consumed internally
-// in subsequent PRs that wire the registry into `Run`, `Graph`, and
-// `ToolNode`. Leaving it unexported keeps the public API surface frozen
-// until the integration layer is in place.
+// Hook lifecycle system for `@librechat/agents`. Re-exported from
+// `src/index.ts` and consumed by `Run.processStream` (RunStart,
+// UserPromptSubmit, Stop, StopFailure) and — once the tool-hook PR
+// lands — by `ToolNode` (PreToolUse, PostToolUse, etc.).
 export { HookRegistry } from './HookRegistry';
 export { executeHooks, DEFAULT_HOOK_TIMEOUT_MS } from './executeHooks';
 export {

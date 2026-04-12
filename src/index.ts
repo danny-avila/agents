@@ -25,6 +25,9 @@ export * from './tools/search';
 export * from './common';
 export * from './utils';
 
+/* Hooks */
+export * from './hooks';
+
 /* Types */
 export type * from './types';
 
