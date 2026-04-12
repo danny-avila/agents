@@ -53,6 +53,7 @@ import { isThinkingEnabled } from '@/llm/request';
 import { initializeModel } from '@/llm/init';
 import { HandlerRegistry } from '@/events';
 import { ChatOpenAI } from '@/llm/openai';
+import type { HookRegistry } from '@/hooks';
 
 const { AGENT, TOOLS, SUMMARIZE } = GraphNodeKeys;
 
@@ -123,6 +124,7 @@ export abstract class Graph<
   /** Set of invoked tool call IDs from non-message run steps completed mid-run, if any */
   invokedToolIds?: Set<string>;
   handlerRegistry: HandlerRegistry | undefined;
+  hookRegistry: HookRegistry | undefined;
   /**
    * Tool session contexts for automatic state persistence across tool invocations.
    * Keyed by tool name (e.g., Constants.EXECUTE_CODE).
@@ -147,6 +149,7 @@ export abstract class Graph<
     this.prelimMessageIdsByStepKey = new Map();
     this.invokedToolIds = undefined;
     this.handlerRegistry = undefined;
+    this.hookRegistry = undefined;
     this.sessions.clear();
   }
 }
