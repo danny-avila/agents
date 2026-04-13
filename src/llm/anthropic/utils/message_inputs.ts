@@ -648,6 +648,23 @@ export function _convertMessagesToAnthropicPayload(
       throw new Error(`Message type "${message._getType()}" is not supported.`);
     }
     if (isAIMessage(message) && !!message.tool_calls?.length) {
+      const hasServerToolCalls = message.tool_calls.some(
+        (tc) =>
+          tc.id?.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX) ?? false
+      );
+      if (hasServerToolCalls) {
+        const contentTypes = Array.isArray(message.content)
+          ? (message.content as Array<{ type?: string }>).map(
+            (b) => b.type ?? '?'
+          )
+          : [`string(${(message.content as string).length})`];
+        console.warn(
+          '[server-tool-debug] AI message with srvtoolu_ calls:',
+          `contentIsString=${typeof message.content === 'string'}`,
+          `tool_calls=${message.tool_calls.length}`,
+          `contentTypes=${JSON.stringify(contentTypes)}`
+        );
+      }
       if (typeof message.content === 'string') {
         const clientToolCalls = message.tool_calls.filter(
           (tc) =>
@@ -656,11 +673,12 @@ export function _convertMessagesToAnthropicPayload(
             )
         );
         if (message.content === '') {
-          const callsToConvert =
-            clientToolCalls.length > 0 ? clientToolCalls : message.tool_calls;
           return {
             role,
-            content: callsToConvert.map(_convertLangChainToolCallToAnthropic),
+            content:
+              clientToolCalls.length > 0
+                ? clientToolCalls.map(_convertLangChainToolCallToAnthropic)
+                : [{ type: 'text' as const, text: ' ' }],
           };
         } else {
           return {
