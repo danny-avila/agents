@@ -192,7 +192,9 @@ export type ToolExecuteBatchRequest = {
  * will have these appended to state after the ToolMessage for this call.
  */
 export type InjectedMessage = {
-  /** 'user' for skill body injection, 'system' for context hints */
+  /** 'user' for skill body injection, 'system' for context hints.
+   *  Both are converted to HumanMessage at runtime; the original role
+   *  is preserved in additional_kwargs.role. */
   role: 'user' | 'system';
   /** Message content: string for simple text, array for complex multi-part content */
   content: string | MessageContentComplex[];

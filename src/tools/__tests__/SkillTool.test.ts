@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { tool } from '@langchain/core/tools';
-import { AIMessage, HumanMessage } from '@langchain/core/messages';
 import { describe, it, expect } from '@jest/globals';
+import { AIMessage, HumanMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import type { StructuredToolInterface } from '@langchain/core/tools';
 import type * as t from '@/types';
@@ -199,6 +199,7 @@ describe('SkillTool', () => {
       const second = messages[1] as HumanMessage;
       expect(second).toBeInstanceOf(HumanMessage);
       expect(second.content).toBe('Injected skill body content');
+      expect(second.additional_kwargs.role).toBe('user');
       expect(second.additional_kwargs.isMeta).toBe(true);
       expect(second.additional_kwargs.source).toBe('skill');
       expect(second.additional_kwargs.skillName).toBe('test-skill');
