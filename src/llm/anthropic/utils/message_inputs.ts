@@ -540,6 +540,15 @@ function _formatContent(message: BaseMessage) {
           contentPartCopy.type = 'tool_use';
         }
 
+        if (
+          contentPartCopy.type === 'tool_use' &&
+          'id' in contentPartCopy &&
+          typeof contentPartCopy.id === 'string' &&
+          contentPartCopy.id.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX)
+        ) {
+          contentPartCopy.type = 'server_tool_use';
+        }
+
         if ('input' in contentPartCopy) {
           // Anthropic tool use inputs should be valid objects, when applicable.
           if (typeof contentPartCopy.input === 'string') {
@@ -631,19 +640,26 @@ export function _convertMessagesToAnthropicPayload(
     }
     if (isAIMessage(message) && !!message.tool_calls?.length) {
       if (typeof message.content === 'string') {
+        const clientToolCalls = message.tool_calls.filter(
+          (tc) =>
+            !(
+              tc.id?.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX) ?? false
+            )
+        );
         if (message.content === '') {
           return {
             role,
-            content: message.tool_calls.map(
-              _convertLangChainToolCallToAnthropic
-            ),
+            content:
+              clientToolCalls.length > 0
+                ? clientToolCalls.map(_convertLangChainToolCallToAnthropic)
+                : [{ type: 'text' as const, text: '' }],
           };
         } else {
           return {
             role,
             content: [
-              { type: 'text', text: message.content },
-              ...message.tool_calls.map(_convertLangChainToolCallToAnthropic),
+              { type: 'text' as const, text: message.content },
+              ...clientToolCalls.map(_convertLangChainToolCallToAnthropic),
             ],
           };
         }
