@@ -88,7 +88,6 @@ export class Run<_T extends t.BaseGraphState> {
       this.graphRunnable = this.createMultiAgentGraph(config.graphConfig);
       if (this.Graph) {
         this.Graph.handlerRegistry = handlerRegistry;
-        this.Graph.hookRegistry = this.hookRegistry;
       }
     } else {
       /** Default to legacy graph for 'standard' or undefined type */
@@ -97,7 +96,6 @@ export class Run<_T extends t.BaseGraphState> {
         this.Graph.compileOptions =
           config.graphConfig.compileOptions ?? this.Graph.compileOptions;
         this.Graph.handlerRegistry = handlerRegistry;
-        this.Graph.hookRegistry = this.hookRegistry;
       }
     }
 
@@ -149,6 +147,7 @@ export class Run<_T extends t.BaseGraphState> {
     });
     /** Propagate compile options from graph config */
     standardGraph.compileOptions = config.compileOptions;
+    standardGraph.hookRegistry = this.hookRegistry;
     this.Graph = standardGraph;
     return standardGraph.createWorkflow();
   }
@@ -171,6 +170,7 @@ export class Run<_T extends t.BaseGraphState> {
       multiAgentGraph.compileOptions = compileOptions;
     }
 
+    multiAgentGraph.hookRegistry = this.hookRegistry;
     this.Graph = multiAgentGraph;
     return multiAgentGraph.createWorkflow();
   }
