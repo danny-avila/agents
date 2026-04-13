@@ -538,7 +538,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       tools: allTraditionalTools,
       toolMap: traditionalToolMap,
       toolCallStepIds: this.toolCallStepIds,
-      hookRegistry: this.hookRegistry,
       errorHandler: (data, metadata) =>
         StandardGraph.handleToolCallErrorStatic(this, data, metadata),
       toolRegistry: agentContext?.toolRegistry,

@@ -50,7 +50,11 @@ export type ToolNodeOptions = {
   agentId?: string;
   /** Tool names that must be executed directly (via runTool) even in event-driven mode (e.g., graph-managed handoff tools) */
   directToolNames?: Set<string>;
-  /** Hook registry for PreToolUse/PostToolUse lifecycle hooks */
+  /**
+   * Hook registry for PreToolUse/PostToolUse lifecycle hooks.
+   * Only fires for event-driven tool calls (`dispatchToolEvents`). Tools
+   * routed through `directToolNames` bypass hook dispatch entirely.
+   */
   hookRegistry?: HookRegistry;
   /** Max context tokens for the agent — used to compute tool result truncation limits. */
   maxContextTokens?: number;

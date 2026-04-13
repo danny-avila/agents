@@ -512,10 +512,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
     const messageByCallId = new Map<string, ToolMessage>();
     const approvedEntries: typeof preToolCalls = [];
-    const emptyResult: AggregatedHookResult = {
-      additionalContexts: [],
-      errors: [],
-    };
+    const HOOK_FALLBACK: AggregatedHookResult = Object.freeze({
+      additionalContexts: [] as string[],
+      errors: [] as string[],
+    });
 
     if (this.hookRegistry?.hasHookFor('PreToolUse', runId) === true) {
       const preResults = await Promise.all(
@@ -535,7 +535,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             },
             sessionId: runId,
             matchQuery: entry.call.name,
-          }).catch((): AggregatedHookResult => emptyResult)
+          }).catch((): AggregatedHookResult => HOOK_FALLBACK)
         )
       );
 

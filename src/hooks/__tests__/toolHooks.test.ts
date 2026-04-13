@@ -44,11 +44,13 @@ const echoToolDef: t.LCTool = {
   },
 };
 
-function makeToolCall(text = 'hello'): ToolCall {
+let callCounter = 0;
+
+function makeToolCall(text = 'hello', name = 'echo'): ToolCall {
   return {
-    name: 'echo',
+    name,
     args: { text },
-    id: `call_${Date.now()}`,
+    id: `call_${++callCounter}`,
     type: 'tool_call',
   };
 }
@@ -113,6 +115,9 @@ async function createEventDrivenRun(
 }
 
 describe('Tool-level hook integration (event-driven mode)', () => {
+  beforeEach(() => {
+    callCounter = 0;
+  });
   jest.setTimeout(15000);
 
   describe('PreToolUse', () => {
@@ -420,6 +425,164 @@ describe('Tool-level hook integration (event-driven mode)', () => {
       expect(captured!.hook_event_name).toBe('PostToolUseFailure');
       expect(captured!.toolName).toBe('echo');
       expect(captured!.error).toContain('failed deliberately');
+    });
+  });
+
+  describe('multi-call batch', () => {
+    const mathToolDef: t.LCTool = {
+      name: 'math',
+      description: 'Does math',
+      parameters: {
+        type: 'object' as const,
+        properties: { expr: { type: 'string' } },
+        required: ['expr'],
+      },
+    };
+
+    function createMultiToolRun(
+      hooks: HookRegistry,
+      runId = 'multi-run'
+    ): Promise<Run<t.IState>> {
+      const handler: t.EventHandler = {
+        handle: async (_event: string, rawData: unknown): Promise<void> => {
+          const data = rawData as t.ToolExecuteBatchRequest;
+          data.resolve(
+            data.toolCalls.map(
+              (tc: t.ToolCallRequest): t.ToolExecuteResult => ({
+                toolCallId: tc.id,
+                content: `${tc.name}: ok`,
+                status: 'success' as const,
+              })
+            )
+          );
+        },
+      };
+      return Run.create<t.IState>({
+        runId,
+        graphConfig: {
+          type: 'standard',
+          llmConfig,
+          toolDefinitions: [echoToolDef, mathToolDef],
+          instructions: 'Use tools.',
+        },
+        returnContent: true,
+        skipCleanup: true,
+        customHandlers: {
+          [GraphEvents.ON_TOOL_EXECUTE]: handler,
+          [GraphEvents.TOOL_END]: new ToolEndHandler(),
+          [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(),
+        },
+        hooks,
+      });
+    }
+
+    it('partial deny: denied call produces error, approved call executes, order preserved', async () => {
+      const registry = new HookRegistry();
+      const denyEcho: HookCallback<'PreToolUse'> = async (
+        input
+      ): Promise<PreToolUseHookOutput> =>
+        input.toolName === 'echo'
+          ? { decision: 'deny', reason: 'echo blocked' }
+          : {};
+      registry.register('PreToolUse', { hooks: [denyEcho] });
+
+      const echoCall = makeToolCall('hi', 'echo');
+      const mathCall = makeToolCall('1+1', 'math');
+      const run = await createMultiToolRun(registry);
+      run.Graph!.overrideTestModel(['calling tools'], 5, [echoCall, mathCall]);
+      await run.processStream(
+        { messages: [new HumanMessage('do both')] },
+        callerConfig
+      );
+
+      const messages = run.Graph!.getRunMessages() ?? [];
+      const toolMsgs = messages.filter((m) => m.getType() === 'tool');
+
+      expect(toolMsgs).toHaveLength(2);
+      const first = toolMsgs[0];
+      const second = toolMsgs[1];
+      expect(typeof first.content === 'string' && first.content).toContain(
+        'Blocked'
+      );
+      expect(typeof second.content === 'string' && second.content).toContain(
+        'math: ok'
+      );
+    });
+
+    it('all denied: no ON_TOOL_EXECUTE dispatch, all error messages', async () => {
+      const registry = new HookRegistry();
+      let handlerCalled = false;
+      const denyAll: HookCallback<
+        'PreToolUse'
+      > = async (): Promise<PreToolUseHookOutput> => ({
+        decision: 'deny',
+        reason: 'all blocked',
+      });
+      registry.register('PreToolUse', { hooks: [denyAll] });
+
+      const handler: t.EventHandler = {
+        handle: async (_event: string, rawData: unknown): Promise<void> => {
+          handlerCalled = true;
+          const data = rawData as t.ToolExecuteBatchRequest;
+          data.resolve([]);
+        },
+      };
+
+      const run = await Run.create<t.IState>({
+        runId: 'all-denied-run',
+        graphConfig: {
+          type: 'standard',
+          llmConfig,
+          toolDefinitions: [echoToolDef, mathToolDef],
+          instructions: 'Use tools.',
+        },
+        returnContent: true,
+        skipCleanup: true,
+        customHandlers: {
+          [GraphEvents.ON_TOOL_EXECUTE]: handler,
+          [GraphEvents.TOOL_END]: new ToolEndHandler(),
+          [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(),
+        },
+        hooks: registry,
+      });
+      run.Graph!.overrideTestModel(['calling tools'], 5, [
+        makeToolCall('a', 'echo'),
+        makeToolCall('b', 'math'),
+      ]);
+      await run.processStream(
+        { messages: [new HumanMessage('do both')] },
+        callerConfig
+      );
+
+      expect(handlerCalled).toBe(false);
+    });
+  });
+
+  describe('PostToolUse error resilience', () => {
+    it('PostToolUse hook errors are non-fatal — original output preserved', async () => {
+      const registry = new HookRegistry();
+      const throwingHook: HookCallback<
+        'PostToolUse'
+      > = async (): Promise<PostToolUseHookOutput> => {
+        throw new Error('post hook crash');
+      };
+      registry.register('PostToolUse', { hooks: [throwingHook] });
+
+      const run = await createEventDrivenRun(registry);
+      run.Graph!.overrideTestModel(['calling echo'], 5, [makeToolCall('hi')]);
+      await run.processStream(
+        { messages: [new HumanMessage('echo hi')] },
+        callerConfig
+      );
+
+      const messages = run.Graph!.getRunMessages() ?? [];
+      const toolMsg = messages.find((m) => m.getType() === 'tool');
+      expect(toolMsg).toBeDefined();
+      const content =
+        typeof toolMsg!.content === 'string'
+          ? toolMsg!.content
+          : JSON.stringify(toolMsg!.content);
+      expect(content).toContain('echo: hi');
     });
   });
 
