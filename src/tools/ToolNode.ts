@@ -164,7 +164,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       };
 
       // Inject runtime data for special tools (becomes available at config.toolCall)
-      if (call.name === Constants.PROGRAMMATIC_TOOL_CALLING) {
+      if (
+        call.name === Constants.PROGRAMMATIC_TOOL_CALLING ||
+        call.name === Constants.BASH_PROGRAMMATIC_TOOL_CALLING
+      ) {
         const { toolMap, toolDefs } = this.getProgrammaticTools();
         invokeParams = {
           ...invokeParams,

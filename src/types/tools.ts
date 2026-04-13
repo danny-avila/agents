@@ -352,6 +352,28 @@ export type ProgrammaticExecutionArtifact = {
   files?: FileRefs;
 };
 
+/** Parameters for creating a local bash execution tool */
+export type BashExecutionToolParams = {
+  /** Path to the bash executable. Default: 'bash' */
+  bashPath?: string;
+  /** Default timeout in milliseconds. Default: 30000 */
+  defaultTimeout?: number;
+  /** Working directory for command execution */
+  workDir?: string;
+};
+
+/** Parameters for creating a bash programmatic tool calling tool */
+export type BashProgrammaticToolCallingParams = {
+  /** Path to the bash executable. Default: 'bash' */
+  bashPath?: string;
+  /** Default timeout in milliseconds. Default: 60000 */
+  defaultTimeout?: number;
+  /** Working directory for script execution */
+  workDir?: string;
+  /** Enable debug logging (or set BASH_PTC_DEBUG=true) */
+  debug?: boolean;
+};
+
 /**
  * Initialization parameters for the PTC tool
  */
