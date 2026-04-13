@@ -35,7 +35,10 @@ export function formatSkillCatalog(
   const contextWindowTokens =
     opts?.contextWindowTokens ?? DEFAULT_CONTEXT_WINDOW_TOKENS;
   const budgetPercent = opts?.budgetPercent ?? DEFAULT_BUDGET_PERCENT;
-  const maxEntryChars = opts?.maxEntryChars ?? DEFAULT_MAX_ENTRY_CHARS;
+  const maxEntryChars = Math.max(
+    1,
+    opts?.maxEntryChars ?? DEFAULT_MAX_ENTRY_CHARS
+  );
   const minDescLength = opts?.minDescLength ?? DEFAULT_MIN_DESC_LENGTH;
   const charsPerToken = opts?.charsPerToken ?? DEFAULT_CHARS_PER_TOKEN;
 
@@ -105,7 +108,6 @@ function fitNamesOnly(
   const full = formatEntries(namesOnly);
   if (full.length <= budgetChars) return full;
 
-  // Trim entries from the end until the output fits
   for (let count = namesOnly.length - 1; count > 0; count--) {
     const trimmed = formatEntries(namesOnly.slice(0, count));
     if (trimmed.length <= budgetChars) return trimmed;

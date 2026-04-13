@@ -1,10 +1,6 @@
 import { z } from 'zod';
 import { tool } from '@langchain/core/tools';
-import {
-  AIMessage,
-  HumanMessage,
-  SystemMessage,
-} from '@langchain/core/messages';
+import { AIMessage, HumanMessage } from '@langchain/core/messages';
 import { describe, it, expect } from '@jest/globals';
 import type { BaseMessage } from '@langchain/core/messages';
 import type { StructuredToolInterface } from '@langchain/core/tools';
@@ -207,9 +203,11 @@ describe('SkillTool', () => {
       expect(second.additional_kwargs.source).toBe('skill');
       expect(second.additional_kwargs.skillName).toBe('test-skill');
 
-      const third = messages[2] as SystemMessage;
-      expect(third).toBeInstanceOf(SystemMessage);
+      // role: 'system' also becomes HumanMessage (avoids provider rejections)
+      const third = messages[2] as HumanMessage;
+      expect(third).toBeInstanceOf(HumanMessage);
       expect(third.content).toBe('System context hint');
+      expect(third.additional_kwargs.role).toBe('system');
       expect(third.additional_kwargs.source).toBe('system');
     });
 
@@ -413,6 +411,51 @@ describe('SkillTool', () => {
       expect(last).toBeInstanceOf(HumanMessage);
       expect(last.content).toBe('Skill body from event tool');
       expect(last.additional_kwargs.skillName).toBe('my-skill');
+    });
+
+    it('includes injected messages even when tool result has error status', async () => {
+      const toolNode = new ToolNode({
+        tools: [createDummyTool()],
+        eventDrivenMode: true,
+        agentId: 'test-agent',
+        toolCallStepIds: new Map([['call_err', 'step_err']]),
+      });
+
+      const aiMsg = new AIMessage({
+        content: '',
+        tool_calls: [{ id: 'call_err', name: 'dummy', args: { x: 'fail' } }],
+      });
+
+      mockEventDispatch([
+        {
+          toolCallId: 'call_err',
+          content: '',
+          status: 'error',
+          errorMessage: 'Skill not found',
+          injectedMessages: [
+            {
+              role: 'user',
+              content: 'Partial context before failure',
+              isMeta: true,
+              source: 'skill',
+              skillName: 'broken-skill',
+            },
+          ],
+        },
+      ]);
+
+      const result = await toolNode.invoke({ messages: [aiMsg] });
+      const messages = (result as { messages: BaseMessage[] }).messages;
+
+      expect(messages).toHaveLength(2);
+      // Error ToolMessage first
+      expect(messages[0]._getType()).toBe('tool');
+      expect(String(messages[0].content)).toContain('Skill not found');
+      // Injected message still included
+      const injected = messages[1] as HumanMessage;
+      expect(injected).toBeInstanceOf(HumanMessage);
+      expect(injected.content).toBe('Partial context before failure');
+      expect(injected.additional_kwargs.skillName).toBe('broken-skill');
     });
   });
 });

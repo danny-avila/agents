@@ -2,7 +2,6 @@ import { ToolCall } from '@langchain/core/messages/tool';
 import {
   ToolMessage,
   HumanMessage,
-  SystemMessage,
   isAIMessage,
   isBaseMessage,
 } from '@langchain/core/messages';
@@ -482,9 +481,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   }
 
   /**
-   * Converts InjectedMessage instances to LangChain BaseMessage objects.
-   * HumanMessage for role 'user', SystemMessage for role 'system'.
-   * Metadata (isMeta, source, skillName) stored in additional_kwargs.
+   * Converts InjectedMessage instances to LangChain HumanMessage objects.
+   * Both 'user' and 'system' roles become HumanMessage to avoid provider
+   * rejections (Anthropic/Google reject non-leading SystemMessages).
+   * The original role is preserved in additional_kwargs for downstream consumers.
    *
    * Array content (MessageContentComplex[]) is passed through directly since
    * LangChain BaseMessage constructors natively accept structured content arrays.
@@ -494,20 +494,16 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   ): BaseMessage[] {
     const converted: BaseMessage[] = [];
     for (const msg of messages) {
-      const additional_kwargs: Record<string, unknown> = {};
+      const additional_kwargs: Record<string, unknown> = {
+        role: msg.role,
+      };
       if (msg.isMeta != null) additional_kwargs.isMeta = msg.isMeta;
       if (msg.source != null) additional_kwargs.source = msg.source;
       if (msg.skillName != null) additional_kwargs.skillName = msg.skillName;
 
-      if (msg.role === 'user') {
-        converted.push(
-          new HumanMessage({ content: msg.content, additional_kwargs })
-        );
-      } else {
-        converted.push(
-          new SystemMessage({ content: msg.content, additional_kwargs })
-        );
-      }
+      converted.push(
+        new HumanMessage({ content: msg.content, additional_kwargs })
+      );
     }
     return converted;
   }
@@ -568,7 +564,17 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
     for (const result of results) {
       if (result.injectedMessages && result.injectedMessages.length > 0) {
-        injected.push(...this.convertInjectedMessages(result.injectedMessages));
+        try {
+          injected.push(
+            ...this.convertInjectedMessages(result.injectedMessages)
+          );
+        } catch (e) {
+          // eslint-disable-next-line no-console
+          console.warn(
+            `[ToolNode] Failed to convert injectedMessages for toolCallId=${result.toolCallId}:`,
+            e instanceof Error ? e.message : e
+          );
+        }
       }
 
       const request = requests.find((r) => r.id === result.toolCallId);
