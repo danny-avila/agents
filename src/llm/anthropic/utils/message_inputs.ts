@@ -603,7 +603,11 @@ function _formatContent(message: BaseMessage) {
         throw new Error('Unsupported message content format');
       }
     });
-    return contentBlocks.filter((block) => block !== null);
+    return contentBlocks.filter(
+      (block) =>
+        block !== null &&
+        !(block.type === 'text' && 'text' in block && block.text === '')
+    );
   }
 }
 
@@ -647,12 +651,11 @@ export function _convertMessagesToAnthropicPayload(
             )
         );
         if (message.content === '') {
+          const callsToConvert =
+            clientToolCalls.length > 0 ? clientToolCalls : message.tool_calls;
           return {
             role,
-            content:
-              clientToolCalls.length > 0
-                ? clientToolCalls.map(_convertLangChainToolCallToAnthropic)
-                : [{ type: 'text' as const, text: '' }],
+            content: callsToConvert.map(_convertLangChainToolCallToAnthropic),
           };
         } else {
           return {

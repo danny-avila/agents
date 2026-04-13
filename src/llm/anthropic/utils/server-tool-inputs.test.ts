@@ -204,7 +204,8 @@ describe('_convertMessagesToAnthropicPayload — server tool use (web search) mu
     const { messages } = _convertMessagesToAnthropicPayload(messageHistory);
     const assistantContent = messages[1].content as any[];
     expect(assistantContent).toHaveLength(1);
-    expect(assistantContent[0]).toEqual({ type: 'text', text: '' });
+    expect(assistantContent[0].type).toBe('tool_use');
+    expect(assistantContent[0].id).toBe('srvtoolu_1');
   });
 
   it('preserves regular tool_use blocks alongside corrected server tool blocks', () => {
@@ -279,5 +280,58 @@ describe('_convertMessagesToAnthropicPayload — server tool use (web search) mu
     expect(webSearchResult).toHaveLength(1);
     expect(regularToolUse).toHaveLength(1);
     expect(regularToolUse[0].id).toBe('toolu_calc');
+  });
+
+  it('filters out empty text blocks from array content', () => {
+    const messageHistory: BaseMessage[] = [
+      new HumanMessage('search for X'),
+      new AIMessage({
+        content: [
+          { type: 'text', text: '' },
+          {
+            type: 'server_tool_use',
+            id: 'srvtoolu_1',
+            name: 'web_search',
+            input: { query: 'X' },
+          },
+          {
+            type: 'web_search_tool_result',
+            tool_use_id: 'srvtoolu_1',
+            content: [
+              {
+                type: 'web_search_result',
+                url: 'https://example.com',
+                title: 'Result',
+                encrypted_content: 'abc',
+                page_age: '1d',
+              },
+            ],
+          },
+          { type: 'text', text: '' },
+          { type: 'text', text: 'Here are the results.' },
+        ],
+        tool_calls: [
+          {
+            id: 'srvtoolu_1',
+            name: 'web_search',
+            args: { query: 'X' },
+            type: 'tool_call',
+          },
+        ],
+      }),
+      new HumanMessage('follow up'),
+    ];
+
+    const { messages } = _convertMessagesToAnthropicPayload(messageHistory);
+    const assistantContent = messages[1].content as any[];
+
+    const emptyTextBlocks = assistantContent.filter(
+      (b: any) => b.type === 'text' && b.text === ''
+    );
+    expect(emptyTextBlocks).toHaveLength(0);
+
+    const textBlocks = assistantContent.filter((b: any) => b.type === 'text');
+    expect(textBlocks).toHaveLength(1);
+    expect(textBlocks[0].text).toBe('Here are the results.');
   });
 });
