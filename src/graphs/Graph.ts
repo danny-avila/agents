@@ -509,6 +509,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         agentId: agentContext?.agentId,
         toolCallStepIds: this.toolCallStepIds,
         toolRegistry: agentContext?.toolRegistry,
+        hookRegistry: this.hookRegistry,
         directToolNames: directToolNames.size > 0 ? directToolNames : undefined,
         maxContextTokens: agentContext?.maxContextTokens,
         maxToolResultChars: agentContext?.maxToolResultChars,

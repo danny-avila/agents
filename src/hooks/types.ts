@@ -71,6 +71,12 @@ export interface PreToolUseHookInput extends BaseHookInput {
   toolInput: Record<string, unknown>;
   toolUseId: string;
   stepId?: string;
+  /**
+   * Number of times this tool has been invoked in prior batches within the
+   * current run. Within a single batch of parallel calls, all calls to the
+   * same tool share the same turn value — per-call discrimination within a
+   * batch is not supported in v1.
+   */
   turn?: number;
 }
 
