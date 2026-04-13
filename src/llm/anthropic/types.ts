@@ -6,7 +6,7 @@ export type AnthropicMessageDeltaEvent = Anthropic.MessageDeltaEvent;
 export type AnthropicMessageStartEvent = Anthropic.MessageStartEvent;
 
 export type AnthropicToolResponse = {
-  type: 'tool_use';
+  type: 'tool_use' | 'server_tool_use';
   id: string;
   name: string;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
