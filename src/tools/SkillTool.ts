@@ -1,6 +1,4 @@
 // src/tools/SkillTool.ts
-import { z } from 'zod';
-import { tool, DynamicStructuredTool } from '@langchain/core/tools';
 import { Constants } from '@/common';
 
 export const SkillToolName = Constants.SKILL_TOOL;
@@ -46,33 +44,3 @@ export const SkillToolDefinition = {
   description: SkillToolDescription,
   parameters: SkillToolSchema,
 } as const;
-
-/**
- * Zod schema derived from SkillToolSchema for DynamicStructuredTool type inference.
- * Kept internal to createSkillTool — the JSON Schema above is the canonical definition.
- */
-const skillToolZodSchema = z.object({
-  skillName: z
-    .string()
-    .describe(SkillToolSchema.properties.skillName.description),
-  args: z
-    .string()
-    .optional()
-    .describe(SkillToolSchema.properties.args.description),
-});
-
-/** Creates the SkillTool DynamicStructuredTool instance for use in tool maps. */
-export function createSkillTool(): DynamicStructuredTool {
-  return tool(
-    async (): Promise<string> => {
-      throw new Error(
-        'SkillTool requires event-driven execution mode (ON_TOOL_EXECUTE). Direct invocation is not supported.'
-      );
-    },
-    {
-      name: SkillToolName,
-      description: SkillToolDescription,
-      schema: skillToolZodSchema,
-    }
-  );
-}
