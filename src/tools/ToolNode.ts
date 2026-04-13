@@ -1,6 +1,7 @@
 import { ToolCall } from '@langchain/core/messages/tool';
 import {
   ToolMessage,
+  HumanMessage,
   isAIMessage,
   isBaseMessage,
 } from '@langchain/core/messages';
@@ -496,11 +497,13 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
    * 2. Surviving calls are dispatched to the host via `ON_TOOL_EXECUTE`.
    * 3. **PostToolUse** / **PostToolUseFailure** fire per result. Post hooks
    *    can replace tool output via `updatedOutput`.
+   * 4. Injected messages from results are collected and returned alongside
+   *    ToolMessages (appended AFTER to respect provider ordering).
    */
   private async dispatchToolEvents(
     toolCalls: ToolCall[],
     config: RunnableConfig
-  ): Promise<ToolMessage[]> {
+  ): Promise<{ toolMessages: ToolMessage[]; injected: BaseMessage[] }> {
     const runId = (config.configurable?.run_id as string | undefined) ?? '';
     const threadId = config.configurable?.thread_id as string | undefined;
 
@@ -593,6 +596,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       approvedEntries.push(...preToolCalls);
     }
 
+    const injected: BaseMessage[] = [];
+
     if (approvedEntries.length > 0) {
       const requests: t.ToolCallRequest[] = approvedEntries.map((entry) => {
         const turn = this.toolUsageCount.get(entry.call.name) ?? 0;
@@ -648,6 +653,19 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         this.hookRegistry?.hasHookFor('PostToolUseFailure', runId) === true;
 
       for (const result of results) {
+        if (result.injectedMessages && result.injectedMessages.length > 0) {
+          try {
+            injected.push(
+              ...this.convertInjectedMessages(result.injectedMessages)
+            );
+          } catch (e) {
+            // eslint-disable-next-line no-console
+            console.warn(
+              `[ToolNode] Failed to convert injectedMessages for toolCallId=${result.toolCallId}:`,
+              e instanceof Error ? e.message : e
+            );
+          }
+        }
         const request = requestMap.get(result.toolCallId);
         const toolName = request?.name ?? 'unknown';
 
@@ -746,9 +764,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       }
     }
 
-    return toolCalls
+    const toolMessages = toolCalls
       .map((call) => messageByCallId.get(call.id!))
       .filter((m): m is ToolMessage => m != null);
+    return { toolMessages, injected };
   }
 
   private dispatchStepCompleted(
@@ -790,8 +809,35 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   }
 
   /**
+   * Converts InjectedMessage instances to LangChain HumanMessage objects.
+   * Both 'user' and 'system' roles become HumanMessage to avoid provider
+   * rejections (Anthropic/Google reject non-leading SystemMessages).
+   * The original role is preserved in additional_kwargs for downstream consumers.
+   */
+  private convertInjectedMessages(
+    messages: t.InjectedMessage[]
+  ): BaseMessage[] {
+    const converted: BaseMessage[] = [];
+    for (const msg of messages) {
+      const additional_kwargs: Record<string, unknown> = {
+        role: msg.role,
+      };
+      if (msg.isMeta != null) additional_kwargs.isMeta = msg.isMeta;
+      if (msg.source != null) additional_kwargs.source = msg.source;
+      if (msg.skillName != null) additional_kwargs.skillName = msg.skillName;
+
+      converted.push(
+        new HumanMessage({ content: msg.content, additional_kwargs })
+      );
+    }
+    return converted;
+  }
+
+  /**
    * Execute all tool calls via ON_TOOL_EXECUTE event dispatch.
-   * Used in event-driven mode where the host handles actual tool execution.
+   * Injected messages are placed AFTER ToolMessages to respect provider
+   * message ordering (AIMessage tool_calls must be immediately followed
+   * by their ToolMessage results).
    */
   private async executeViaEvent(
     toolCalls: ToolCall[],
@@ -799,7 +845,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     input: any
   ): Promise<T> {
-    const outputs = await this.dispatchToolEvents(toolCalls, config);
+    const { toolMessages, injected } = await this.dispatchToolEvents(
+      toolCalls,
+      config
+    );
+    const outputs: BaseMessage[] = [...toolMessages, ...injected];
     return (Array.isArray(input) ? outputs : { messages: outputs }) as T;
   }
 
@@ -895,12 +945,19 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           this.handleRunToolCompletions(directCalls, directOutputs, config);
         }
 
-        const eventOutputs: ToolMessage[] =
+        const eventResult =
           eventCalls.length > 0
             ? await this.dispatchToolEvents(eventCalls, config)
-            : [];
+            : {
+              toolMessages: [] as ToolMessage[],
+              injected: [] as BaseMessage[],
+            };
 
-        outputs = [...directOutputs, ...eventOutputs];
+        outputs = [
+          ...directOutputs,
+          ...eventResult.toolMessages,
+          ...eventResult.injected,
+        ];
       } else {
         outputs = await Promise.all(
           filteredCalls.map((call) => this.runTool(call, config))
