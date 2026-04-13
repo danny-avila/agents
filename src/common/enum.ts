@@ -182,6 +182,7 @@ export enum Constants {
   MCP_DELIMITER = '_mcp_',
   /** Anthropic server tool ID prefix (web_search, code_execution, etc.) */
   ANTHROPIC_SERVER_TOOL_PREFIX = 'srvtoolu_',
+  SKILL_TOOL = 'skill',
 }
 
 export enum TitleMethod {

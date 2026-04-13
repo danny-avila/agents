@@ -3,7 +3,7 @@ import type { StructuredToolInterface } from '@langchain/core/tools';
 import type { RunnableToolLike } from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type { HookRegistry } from '@/hooks';
-import type { ToolErrorData } from './stream';
+import type { MessageContentComplex, ToolErrorData } from './stream';
 import { EnvVar } from '@/common';
 
 /** Replacement type for `import type { ToolCall } from '@langchain/core/messages/tool'` in order to have stringified args typed */
@@ -193,6 +193,26 @@ export type ToolExecuteBatchRequest = {
   reject: (error: Error) => void;
 };
 
+/**
+ * A message injected into graph state by any tool execution handler.
+ * Generic mechanism: any tool returning `injectedMessages` in its `ToolExecuteResult`
+ * will have these appended to state after the ToolMessage for this call.
+ */
+export type InjectedMessage = {
+  /** 'user' for skill body injection, 'system' for context hints.
+   *  Both are converted to HumanMessage at runtime; the original role
+   *  is preserved in additional_kwargs.role. */
+  role: 'user' | 'system';
+  /** Message content: string for simple text, array for complex multi-part content */
+  content: string | MessageContentComplex[];
+  /** When true, the message is framework-internal: not shown in UI, not counted as a user turn */
+  isMeta?: boolean;
+  /** Origin tag for downstream consumers (UI, pruner, compaction) */
+  source?: 'skill' | 'hook' | 'system';
+  /** Only set when source is 'skill', for compaction preservation */
+  skillName?: string;
+};
+
 /** Result for a single tool call in event-driven execution */
 export type ToolExecuteResult = {
   /** Matches ToolCallRequest.id */
@@ -205,6 +225,13 @@ export type ToolExecuteResult = {
   status: 'success' | 'error';
   /** Error message if status is 'error' */
   errorMessage?: string;
+  /**
+   * Messages to inject into graph state after the ToolMessage for this call.
+   * Placed after tool results to respect provider message ordering (tool_call -> tool_result adjacency).
+   * The host's message formatter may merge injected user messages with the preceding tool_result turn.
+   * Generic mechanism: any tool execution handler can use this.
+   */
+  injectedMessages?: InjectedMessage[];
 };
 
 /** Map of tool names to tool definitions */
