@@ -501,12 +501,8 @@ describe('Tool-level hook integration (event-driven mode)', () => {
       expect(toolMsgs).toHaveLength(2);
       const first = toolMsgs[0];
       const second = toolMsgs[1];
-      expect(typeof first.content === 'string' && first.content).toContain(
-        'Blocked'
-      );
-      expect(typeof second.content === 'string' && second.content).toContain(
-        'math: ok'
-      );
+      expect(first.content).toContain('Blocked');
+      expect(second.content).toContain('math: ok');
     });
 
     it('all denied: no ON_TOOL_EXECUTE dispatch, all error messages', async () => {
