@@ -19,12 +19,14 @@ import type {
 import type { BaseMessage, AIMessage } from '@langchain/core/messages';
 import type { StructuredToolInterface } from '@langchain/core/tools';
 import type * as t from '@/types';
+import type { HookRegistry, AggregatedHookResult } from '@/hooks';
 import { RunnableCallable } from '@/utils';
 import {
   calculateMaxToolResultChars,
   truncateToolResultContent,
 } from '@/utils/truncation';
 import { safeDispatchCustomEvent } from '@/utils/events';
+import { executeHooks } from '@/hooks';
 import { Constants, GraphEvents } from '@/common';
 
 /**
@@ -59,6 +61,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private directToolNames?: Set<string>;
   /** Maximum characters allowed in a single tool result before truncation. */
   private maxToolResultChars: number;
+  /** Hook registry for PreToolUse/PostToolUse lifecycle hooks */
+  private hookRegistry?: HookRegistry;
 
   constructor({
     tools,
@@ -76,6 +80,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     directToolNames,
     maxContextTokens,
     maxToolResultChars,
+    hookRegistry,
   }: t.ToolNodeConstructorParams) {
     super({ name, tags, func: (input, config) => this.run(input, config) });
     this.toolMap = toolMap ?? new Map(tools.map((tool) => [tool.name, tool]));
@@ -91,6 +96,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     this.directToolNames = directToolNames;
     this.maxToolResultChars =
       maxToolResultChars ?? calculateMaxToolResultChars(maxContextTokens);
+    this.hookRegistry = hookRegistry;
   }
 
   /**
@@ -482,123 +488,305 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   /**
    * Dispatches tool calls to the host via ON_TOOL_EXECUTE event and returns raw ToolMessages.
    * Core logic for event-driven execution, separated from output shaping.
+   *
+   * Hook lifecycle (when `hookRegistry` is set):
+   * 1. **PreToolUse** fires per call in parallel before dispatch. Denied
+   *    calls produce error ToolMessages and fire **PermissionDenied**;
+   *    surviving calls proceed with optional `updatedInput`.
+   * 2. Surviving calls are dispatched to the host via `ON_TOOL_EXECUTE`.
+   * 3. **PostToolUse** / **PostToolUseFailure** fire per result. Post hooks
+   *    can replace tool output via `updatedOutput`.
    */
   private async dispatchToolEvents(
     toolCalls: ToolCall[],
     config: RunnableConfig
   ): Promise<ToolMessage[]> {
-    const requests: t.ToolCallRequest[] = toolCalls.map((call) => {
-      const turn = this.toolUsageCount.get(call.name) ?? 0;
-      this.toolUsageCount.set(call.name, turn + 1);
+    const runId = (config.configurable?.run_id as string | undefined) ?? '';
+    const threadId = config.configurable?.thread_id as string | undefined;
 
-      const request: t.ToolCallRequest = {
-        id: call.id!,
-        name: call.name,
-        args: call.args as Record<string, unknown>,
-        stepId: this.toolCallStepIds?.get(call.id!),
-        turn,
-      };
+    const preToolCalls = toolCalls.map((call) => ({
+      call,
+      stepId: this.toolCallStepIds?.get(call.id!) ?? '',
+      args: call.args as Record<string, unknown>,
+    }));
 
-      if (
-        call.name === Constants.EXECUTE_CODE ||
-        call.name === Constants.PROGRAMMATIC_TOOL_CALLING
-      ) {
-        request.codeSessionContext = this.getCodeSessionContext();
-      }
-
-      return request;
+    const messageByCallId = new Map<string, ToolMessage>();
+    const approvedEntries: typeof preToolCalls = [];
+    const HOOK_FALLBACK: AggregatedHookResult = Object.freeze({
+      additionalContexts: [] as string[],
+      errors: [] as string[],
     });
 
-    const results = await new Promise<t.ToolExecuteResult[]>(
-      (resolve, reject) => {
-        const request: t.ToolExecuteBatchRequest = {
-          toolCalls: requests,
-          userId: config.configurable?.user_id as string | undefined,
-          agentId: this.agentId,
-          configurable: config.configurable as
-            | Record<string, unknown>
-            | undefined,
-          metadata: config.metadata as Record<string, unknown> | undefined,
-          resolve,
-          reject,
-        };
-
-        safeDispatchCustomEvent(GraphEvents.ON_TOOL_EXECUTE, request, config);
-      }
-    );
-
-    this.storeCodeSessionFromResults(results, requests);
-
-    return results.map((result) => {
-      const request = requests.find((r) => r.id === result.toolCallId);
-      const toolName = request?.name ?? 'unknown';
-      const stepId = this.toolCallStepIds?.get(result.toolCallId) ?? '';
-      if (!stepId) {
-        // eslint-disable-next-line no-console
-        console.warn(
-          `[ToolNode] toolCallStepIds missing entry for toolCallId=${result.toolCallId} (tool=${toolName}). ` +
-            'This indicates a race between the stream consumer and graph execution. ' +
-            `Map size: ${this.toolCallStepIds?.size ?? 0}`
-        );
-      }
-
-      let toolMessage: ToolMessage;
-      let contentString: string;
-
-      if (result.status === 'error') {
-        contentString = `Error: ${result.errorMessage ?? 'Unknown error'}\n Please fix your mistakes.`;
-        toolMessage = new ToolMessage({
-          status: 'error',
-          content: contentString,
-          name: toolName,
-          tool_call_id: result.toolCallId,
-        });
-      } else {
-        const rawContent =
-          typeof result.content === 'string'
-            ? result.content
-            : JSON.stringify(result.content);
-        contentString = truncateToolResultContent(
-          rawContent,
-          this.maxToolResultChars
-        );
-        toolMessage = new ToolMessage({
-          status: 'success',
-          name: toolName,
-          content: contentString,
-          artifact: result.artifact,
-          tool_call_id: result.toolCallId,
-        });
-      }
-
-      const tool_call: t.ProcessedToolCall = {
-        args:
-          typeof request?.args === 'string'
-            ? request.args
-            : JSON.stringify(request?.args ?? {}),
-        name: toolName,
-        id: result.toolCallId,
-        output: contentString,
-        progress: 1,
-      };
-
-      const runStepCompletedData = {
-        result: {
-          id: stepId,
-          index: request?.turn ?? 0,
-          type: 'tool_call' as const,
-          tool_call,
-        },
-      };
-
-      safeDispatchCustomEvent(
-        GraphEvents.ON_RUN_STEP_COMPLETED,
-        runStepCompletedData,
-        config
+    if (this.hookRegistry?.hasHookFor('PreToolUse', runId) === true) {
+      const preResults = await Promise.all(
+        preToolCalls.map((entry) =>
+          executeHooks({
+            registry: this.hookRegistry!,
+            input: {
+              hook_event_name: 'PreToolUse',
+              runId,
+              threadId,
+              agentId: this.agentId,
+              toolName: entry.call.name,
+              toolInput: entry.args,
+              toolUseId: entry.call.id!,
+              stepId: entry.stepId,
+              turn: this.toolUsageCount.get(entry.call.name) ?? 0,
+            },
+            sessionId: runId,
+            matchQuery: entry.call.name,
+          }).catch((): AggregatedHookResult => HOOK_FALLBACK)
+        )
       );
 
-      return toolMessage;
-    });
+      for (let i = 0; i < preToolCalls.length; i++) {
+        const hookResult = preResults[i];
+        const entry = preToolCalls[i];
+        const isDenied =
+          hookResult.decision === 'deny' || hookResult.decision === 'ask';
+        if (isDenied) {
+          const reason = hookResult.reason ?? 'Blocked by hook';
+          const contentString = `Blocked: ${reason}`;
+          messageByCallId.set(
+            entry.call.id!,
+            new ToolMessage({
+              status: 'error',
+              content: contentString,
+              name: entry.call.name,
+              tool_call_id: entry.call.id!,
+            })
+          );
+          this.dispatchStepCompleted(
+            entry.call.id!,
+            entry.call.name,
+            entry.args,
+            contentString,
+            config
+          );
+          if (this.hookRegistry.hasHookFor('PermissionDenied', runId)) {
+            executeHooks({
+              registry: this.hookRegistry,
+              input: {
+                hook_event_name: 'PermissionDenied',
+                runId,
+                threadId,
+                agentId: this.agentId,
+                toolName: entry.call.name,
+                toolInput: entry.args,
+                toolUseId: entry.call.id!,
+                reason,
+              },
+              sessionId: runId,
+              matchQuery: entry.call.name,
+            }).catch(() => {
+              /* PermissionDenied is observational — swallow errors */
+            });
+          }
+          continue;
+        }
+        if (hookResult.updatedInput != null) {
+          entry.args = hookResult.updatedInput;
+        }
+        approvedEntries.push(entry);
+      }
+    } else {
+      approvedEntries.push(...preToolCalls);
+    }
+
+    if (approvedEntries.length > 0) {
+      const requests: t.ToolCallRequest[] = approvedEntries.map((entry) => {
+        const turn = this.toolUsageCount.get(entry.call.name) ?? 0;
+        this.toolUsageCount.set(entry.call.name, turn + 1);
+
+        const request: t.ToolCallRequest = {
+          id: entry.call.id!,
+          name: entry.call.name,
+          args: entry.args,
+          stepId: entry.stepId,
+          turn,
+        };
+
+        if (
+          entry.call.name === Constants.EXECUTE_CODE ||
+          entry.call.name === Constants.PROGRAMMATIC_TOOL_CALLING
+        ) {
+          request.codeSessionContext = this.getCodeSessionContext();
+        }
+
+        return request;
+      });
+
+      const requestMap = new Map(requests.map((r) => [r.id, r]));
+
+      const results = await new Promise<t.ToolExecuteResult[]>(
+        (resolve, reject) => {
+          const batchRequest: t.ToolExecuteBatchRequest = {
+            toolCalls: requests,
+            userId: config.configurable?.user_id as string | undefined,
+            agentId: this.agentId,
+            configurable: config.configurable as
+              | Record<string, unknown>
+              | undefined,
+            metadata: config.metadata as Record<string, unknown> | undefined,
+            resolve,
+            reject,
+          };
+
+          safeDispatchCustomEvent(
+            GraphEvents.ON_TOOL_EXECUTE,
+            batchRequest,
+            config
+          );
+        }
+      );
+
+      this.storeCodeSessionFromResults(results, requests);
+
+      const hasPostHook =
+        this.hookRegistry?.hasHookFor('PostToolUse', runId) === true;
+      const hasFailureHook =
+        this.hookRegistry?.hasHookFor('PostToolUseFailure', runId) === true;
+
+      for (const result of results) {
+        const request = requestMap.get(result.toolCallId);
+        const toolName = request?.name ?? 'unknown';
+
+        let contentString: string;
+        let toolMessage: ToolMessage;
+
+        if (result.status === 'error') {
+          contentString = `Error: ${result.errorMessage ?? 'Unknown error'}\n Please fix your mistakes.`;
+          toolMessage = new ToolMessage({
+            status: 'error',
+            content: contentString,
+            name: toolName,
+            tool_call_id: result.toolCallId,
+          });
+
+          if (hasFailureHook) {
+            await executeHooks({
+              registry: this.hookRegistry!,
+              input: {
+                hook_event_name: 'PostToolUseFailure',
+                runId,
+                threadId,
+                agentId: this.agentId,
+                toolName,
+                toolInput: request?.args ?? {},
+                toolUseId: result.toolCallId,
+                error: result.errorMessage ?? 'Unknown error',
+                stepId: request?.stepId,
+                turn: request?.turn,
+              },
+              sessionId: runId,
+              matchQuery: toolName,
+            }).catch(() => {
+              /* PostToolUseFailure is observational — swallow errors */
+            });
+          }
+        } else {
+          const rawContent =
+            typeof result.content === 'string'
+              ? result.content
+              : JSON.stringify(result.content);
+          contentString = truncateToolResultContent(
+            rawContent,
+            this.maxToolResultChars
+          );
+
+          if (hasPostHook) {
+            const hookResult = await executeHooks({
+              registry: this.hookRegistry!,
+              input: {
+                hook_event_name: 'PostToolUse',
+                runId,
+                threadId,
+                agentId: this.agentId,
+                toolName,
+                toolInput: request?.args ?? {},
+                toolOutput: result.content,
+                toolUseId: result.toolCallId,
+                stepId: request?.stepId,
+                turn: request?.turn,
+              },
+              sessionId: runId,
+              matchQuery: toolName,
+            }).catch((): undefined => undefined);
+            if (hookResult?.updatedOutput != null) {
+              const replaced =
+                typeof hookResult.updatedOutput === 'string'
+                  ? hookResult.updatedOutput
+                  : JSON.stringify(hookResult.updatedOutput);
+              contentString = truncateToolResultContent(
+                replaced,
+                this.maxToolResultChars
+              );
+            }
+          }
+
+          toolMessage = new ToolMessage({
+            status: 'success',
+            name: toolName,
+            content: contentString,
+            artifact: result.artifact,
+            tool_call_id: result.toolCallId,
+          });
+        }
+
+        this.dispatchStepCompleted(
+          result.toolCallId,
+          toolName,
+          request?.args ?? {},
+          contentString,
+          config,
+          request?.turn
+        );
+
+        messageByCallId.set(result.toolCallId, toolMessage);
+      }
+    }
+
+    return toolCalls
+      .map((call) => messageByCallId.get(call.id!))
+      .filter((m): m is ToolMessage => m != null);
+  }
+
+  private dispatchStepCompleted(
+    toolCallId: string,
+    toolName: string,
+    args: Record<string, unknown>,
+    output: string,
+    config: RunnableConfig,
+    turn?: number
+  ): void {
+    const stepId = this.toolCallStepIds?.get(toolCallId) ?? '';
+    if (!stepId) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[ToolNode] toolCallStepIds missing entry for toolCallId=${toolCallId} (tool=${toolName}). ` +
+          'This indicates a race between the stream consumer and graph execution. ' +
+          `Map size: ${this.toolCallStepIds?.size ?? 0}`
+      );
+    }
+
+    safeDispatchCustomEvent(
+      GraphEvents.ON_RUN_STEP_COMPLETED,
+      {
+        result: {
+          id: stepId,
+          index: turn ?? this.toolUsageCount.get(toolName) ?? 0,
+          type: 'tool_call' as const,
+          tool_call: {
+            args: JSON.stringify(args),
+            name: toolName,
+            id: toolCallId,
+            output,
+            progress: 1,
+          } as t.ProcessedToolCall,
+        },
+      },
+      config
+    );
   }
 
   /**

@@ -2,6 +2,7 @@
 import type { StructuredToolInterface } from '@langchain/core/tools';
 import type { RunnableToolLike } from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
+import type { HookRegistry } from '@/hooks';
 import type { ToolErrorData } from './stream';
 import { EnvVar } from '@/common';
 
@@ -49,6 +50,12 @@ export type ToolNodeOptions = {
   agentId?: string;
   /** Tool names that must be executed directly (via runTool) even in event-driven mode (e.g., graph-managed handoff tools) */
   directToolNames?: Set<string>;
+  /**
+   * Hook registry for PreToolUse/PostToolUse lifecycle hooks.
+   * Only fires for event-driven tool calls (`dispatchToolEvents`). Tools
+   * routed through `directToolNames` bypass hook dispatch entirely.
+   */
+  hookRegistry?: HookRegistry;
   /** Max context tokens for the agent — used to compute tool result truncation limits. */
   maxContextTokens?: number;
   /**
