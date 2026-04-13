@@ -65,17 +65,13 @@ export function formatSkillCatalog(
   const availableForDescs = availableChars - nameCharsTotal;
 
   if (availableForDescs <= 0) {
-    return formatEntries(
-      capped.map((s) => ({ name: s.name, description: '' }))
-    );
+    return fitNamesOnly(capped, budgetChars);
   }
 
   const maxDescPerEntry = Math.floor(availableForDescs / capped.length);
 
   if (maxDescPerEntry < minDescLength) {
-    return formatEntries(
-      capped.map((s) => ({ name: s.name, description: '' }))
-    );
+    return fitNamesOnly(capped, budgetChars);
   }
 
   const truncated = capped.map((s) => ({
@@ -88,7 +84,7 @@ export function formatSkillCatalog(
 
   const result = formatEntries(truncated);
   if (result.length <= budgetChars) return result;
-  return formatEntries(capped.map((s) => ({ name: s.name, description: '' })));
+  return fitNamesOnly(capped, budgetChars);
 }
 
 function formatEntries(
@@ -98,4 +94,21 @@ function formatEntries(
     e.description ? `- ${e.name}: ${e.description}` : `- ${e.name}`
   );
   return `${HEADER}\n\n${lines.join('\n')}`;
+}
+
+/** Names-only fallback that drops trailing entries if the list still exceeds budget. */
+function fitNamesOnly(
+  entries: { name: string }[],
+  budgetChars: number
+): string {
+  const namesOnly = entries.map((s) => ({ name: s.name, description: '' }));
+  const full = formatEntries(namesOnly);
+  if (full.length <= budgetChars) return full;
+
+  // Trim entries from the end until the output fits
+  for (let count = namesOnly.length - 1; count > 0; count--) {
+    const trimmed = formatEntries(namesOnly.slice(0, count));
+    if (trimmed.length <= budgetChars) return trimmed;
+  }
+  return '';
 }
