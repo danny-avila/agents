@@ -1,19 +1,25 @@
-import { createServer } from 'http';
-import { spawn } from 'child_process';
+import { config } from 'dotenv';
+import { getEnvironmentVariable } from '@langchain/core/utils/env';
 import { tool, DynamicStructuredTool } from '@langchain/core/tools';
-import type { Server } from 'http';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
-import { unwrapToolResponse } from './ProgrammaticToolCalling';
-import { Constants } from '@/common';
+import {
+  makeRequest,
+  executeTools,
+  fetchSessionFiles,
+  formatCompletedResponse,
+} from './ProgrammaticToolCalling';
+import { getCodeBaseURL } from './CodeExecutor';
+import { EnvVar, Constants } from '@/common';
+
+config();
 
 // ============================================================================
 // Constants
 // ============================================================================
 
+const DEFAULT_MAX_ROUND_TRIPS = 20;
 const DEFAULT_TIMEOUT = 60000;
-const emptyOutputMessage =
-  'stdout: Empty. Ensure you\'re writing output explicitly.\n';
 
 /** Bash reserved words that get `_tool` suffix when used as function names */
 const BASH_RESERVED = new Set([
@@ -55,11 +61,11 @@ const CORE_RULES = `Rules:
 - EVERYTHING in one call—no state persists between executions
 - Tools are pre-defined as bash functions—DO NOT redefine them
 - Each tool function accepts a JSON string argument
-- Only stdout output returns to the model—use echo/printf for all output
-- Use jq for JSON parsing if available`;
+- Only echo/printf output returns to the model
+- Generated files are automatically available in /mnt/data/ for subsequent executions`;
 
-const ADDITIONAL_RULES = `- Tool names normalized: hyphens→underscores, reserved words get \`_tool\` suffix
-- Requires curl for tool function calls`;
+const ADDITIONAL_RULES =
+  '- Tool names normalized: hyphens→underscores, reserved words get `_tool` suffix';
 
 const EXAMPLES = `Example (Complete workflow in one call):
   # Query data and process
@@ -157,165 +163,68 @@ export function normalizeToBashIdentifier(name: string): string {
 }
 
 /**
- * Generates a bash function for a tool that calls the local HTTP tool server.
- * The function accepts a JSON string argument and returns the tool output.
+ * Extracts tool names that are actually called in the bash code.
+ * Bash functions are invoked as commands (no parentheses), so we match
+ * the normalized name as a word boundary.
  */
-function generateToolFunction(toolDef: t.LCTool, port: number): string {
-  const bashName = normalizeToBashIdentifier(toolDef.name);
-  const escapedName = toolDef.name.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-  return `${bashName}() {
-  local __input="\${1:-{}}"
-  printf '{"name":"${escapedName}","input":%s}' "$__input" | \\
-    curl -s -X POST "http://127.0.0.1:${port}/tool_call" \\
-      -H "Content-Type: application/json" -d @-
-}`;
+export function extractUsedBashToolNames(
+  code: string,
+  toolNameMap: Map<string, string>
+): Set<string> {
+  const usedTools = new Set<string>();
+
+  for (const [bashName, originalName] of toolNameMap) {
+    const escapedName = bashName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const pattern = new RegExp(`\\b${escapedName}\\b`, 'g');
+
+    if (pattern.test(code)) {
+      usedTools.add(originalName);
+    }
+  }
+
+  return usedTools;
 }
 
 /**
- * Generates the full bash script with tool functions and user code.
+ * Filters tool definitions to only include tools actually used in the bash code.
  */
-function generateBashScript(
+export function filterBashToolsByUsage(
   toolDefs: t.LCTool[],
-  port: number,
-  code: string
-): string {
-  const header = '#!/usr/bin/env bash';
-  const curlCheck = `if ! command -v curl &>/dev/null; then
-  echo "Error: curl is required for tool function calls but was not found." >&2
-  exit 1
-fi`;
+  code: string,
+  debug = false
+): t.LCTool[] {
+  const toolNameMap = new Map<string, string>();
+  for (const def of toolDefs) {
+    const bashName = normalizeToBashIdentifier(def.name);
+    toolNameMap.set(bashName, def.name);
+  }
 
-  const portExport = `export __TOOL_PORT=${port}`;
-  const functions = toolDefs
-    .map((td) => generateToolFunction(td, port))
-    .join('\n\n');
+  const usedToolNames = extractUsedBashToolNames(code, toolNameMap);
 
-  return [
-    header,
-    '',
-    curlCheck,
-    '',
-    portExport,
-    '',
-    '# Tool functions',
-    functions,
-    '',
-    '# User code',
-    code,
-  ].join('\n');
-}
+  if (debug) {
+    // eslint-disable-next-line no-console
+    console.log(
+      `[BashPTC Debug] Tool filtering: found ${usedToolNames.size}/${toolDefs.length} tools in code`
+    );
+    if (usedToolNames.size > 0) {
+      // eslint-disable-next-line no-console
+      console.log(
+        `[BashPTC Debug] Matched tools: ${Array.from(usedToolNames).join(', ')}`
+      );
+    }
+  }
 
-/**
- * Starts a local HTTP server that handles tool invocation requests.
- * Binds to 127.0.0.1 on a random available port.
- */
-async function startToolServer(
-  toolMap: t.ToolMap
-): Promise<{ server: Server; port: number }> {
-  return new Promise((resolve, reject) => {
-    const server = createServer((req, res) => {
-      if (req.method !== 'POST' || req.url !== '/tool_call') {
-        res.writeHead(404);
-        res.end('Not found');
-        return;
-      }
+  if (usedToolNames.size === 0) {
+    if (debug) {
+      // eslint-disable-next-line no-console
+      console.log(
+        '[BashPTC Debug] No tools detected in code - sending all tools as fallback'
+      );
+    }
+    return toolDefs;
+  }
 
-      let body = '';
-      req.on('data', (chunk: Buffer) => {
-        body += chunk.toString();
-      });
-
-      req.on('end', () => {
-        void (async (): Promise<void> => {
-          try {
-            const parsed = JSON.parse(body) as {
-              name: string;
-              input: Record<string, unknown>;
-            };
-            const matchedTool = toolMap.get(parsed.name);
-
-            if (!matchedTool) {
-              res.writeHead(404);
-              res.end(
-                `Tool '${parsed.name}' not found. Available: ${Array.from(toolMap.keys()).join(', ')}`
-              );
-              return;
-            }
-
-            const result = await matchedTool.invoke(parsed.input, {
-              metadata: { [Constants.BASH_PROGRAMMATIC_TOOL_CALLING]: true },
-            });
-
-            const isMCPTool = matchedTool.mcp === true;
-            const unwrapped = unwrapToolResponse(result, isMCPTool);
-            const output =
-              typeof unwrapped === 'string'
-                ? unwrapped
-                : JSON.stringify(unwrapped);
-
-            res.writeHead(200, { 'Content-Type': 'text/plain' });
-            res.end(output);
-          } catch (error) {
-            res.writeHead(500);
-            res.end(`Tool execution error: ${(error as Error).message}`);
-          }
-        })();
-      });
-    });
-
-    server.on('error', reject);
-    server.listen(0, '127.0.0.1', () => {
-      const address = server.address();
-      if (address == null || typeof address === 'string') {
-        reject(new Error('Failed to get tool server port'));
-        return;
-      }
-      resolve({ server, port: address.port });
-    });
-  });
-}
-
-function closeServer(server: Server): Promise<void> {
-  return new Promise((resolve) => {
-    server.close(() => resolve());
-    setTimeout(resolve, 5000);
-  });
-}
-
-function executeBashScript(
-  script: string,
-  options: { bashPath: string; timeout: number; workDir?: string }
-): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
-  return new Promise((resolve, reject) => {
-    const proc = spawn(options.bashPath, ['-c', script], {
-      timeout: options.timeout,
-      cwd: options.workDir,
-      env: { ...process.env },
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-
-    let stdout = '';
-    let stderr = '';
-
-    proc.stdout.on('data', (data: Buffer) => {
-      stdout += data.toString();
-    });
-
-    proc.stderr.on('data', (data: Buffer) => {
-      stderr += data.toString();
-    });
-
-    proc.on('error', (err: Error) => {
-      reject(new Error(`Failed to start bash process: ${err.message}`));
-    });
-
-    proc.on('close', (code: number | null, signal: string | null) => {
-      if (signal != null) {
-        stderr += `\nProcess terminated by signal: ${signal}\n`;
-      }
-      resolve({ stdout, stderr, exitCode: code });
-    });
-  });
+  return toolDefs.filter((def) => usedToolNames.has(def.name));
 }
 
 // ============================================================================
@@ -325,30 +234,44 @@ function executeBashScript(
 /**
  * Creates a Bash Programmatic Tool Calling tool for multi-tool orchestration.
  *
- * This tool enables AI agents to write bash scripts that call multiple tools
- * as bash functions. A local HTTP server handles tool invocations via curl,
- * supporting loops, conditionals, pipelines, and parallel execution.
+ * This tool enables AI agents to write bash scripts that orchestrate multiple
+ * tool calls programmatically via the remote Code API, reducing LLM round-trips.
  *
  * The tool map must be provided at runtime via config.toolCall (injected by ToolNode).
- *
- * @param initParams - Configuration parameters (bashPath, timeout, workDir, debug)
- * @returns A LangChain DynamicStructuredTool for bash programmatic tool calling
  */
 export function createBashProgrammaticToolCallingTool(
   initParams: t.BashProgrammaticToolCallingParams = {}
 ): DynamicStructuredTool {
-  const bashPath = initParams.bashPath ?? 'bash';
-  const defaultTimeout = initParams.defaultTimeout ?? DEFAULT_TIMEOUT;
-  const workDir = initParams.workDir;
+  const apiKey =
+    (initParams[EnvVar.CODE_API_KEY] as string | undefined) ??
+    initParams.apiKey ??
+    getEnvironmentVariable(EnvVar.CODE_API_KEY) ??
+    '';
+
+  if (!apiKey) {
+    throw new Error(
+      'No API key provided for bash programmatic tool calling. ' +
+        'Set CODE_API_KEY environment variable or pass apiKey in initParams.'
+    );
+  }
+
+  const baseUrl = initParams.baseUrl ?? getCodeBaseURL();
+  const maxRoundTrips = initParams.maxRoundTrips ?? DEFAULT_MAX_ROUND_TRIPS;
+  const proxy = initParams.proxy ?? process.env.PROXY;
   const debug = initParams.debug ?? process.env.BASH_PTC_DEBUG === 'true';
+  const EXEC_ENDPOINT = `${baseUrl}/exec/programmatic`;
 
   return tool(
     async (rawParams, config) => {
       const params = rawParams as { code: string; timeout?: number };
-      const { code, timeout = defaultTimeout } = params;
+      const { code, timeout = DEFAULT_TIMEOUT } = params;
 
-      const { toolMap, toolDefs } = (config.toolCall ?? {}) as ToolCall &
-        Partial<t.ProgrammaticCache>;
+      const { toolMap, toolDefs, session_id, _injected_files } =
+        (config.toolCall ?? {}) as ToolCall &
+          Partial<t.ProgrammaticCache> & {
+            session_id?: string;
+            _injected_files?: t.CodeEnvFile[];
+          };
 
       if (toolMap == null || toolMap.size === 0) {
         throw new Error(
@@ -359,63 +282,116 @@ export function createBashProgrammaticToolCallingTool(
 
       if (toolDefs == null || toolDefs.length === 0) {
         throw new Error(
-          'No tool definitions provided. ' + 'Ensure ToolNode injects toolDefs.'
+          'No tool definitions provided. ' +
+            'Either pass tools in the input or ensure ToolNode injects toolDefs.'
         );
       }
 
-      const { server, port } = await startToolServer(toolMap);
+      let roundTrip = 0;
 
       try {
+        // ====================================================================
+        // Phase 1: Filter tools and make initial request
+        // ====================================================================
+
+        const effectiveTools = filterBashToolsByUsage(toolDefs, code, debug);
+
         if (debug) {
           // eslint-disable-next-line no-console
           console.log(
-            `[BashPTC Debug] Started tool server on port ${port} with ${toolMap.size} tools`
+            `[BashPTC Debug] Sending ${effectiveTools.length} tools to API ` +
+              `(filtered from ${toolDefs.length})`
           );
         }
 
-        const script = generateBashScript(toolDefs, port, code);
-
-        if (debug) {
-          // eslint-disable-next-line no-console
-          console.log(`[BashPTC Debug] Generated script:\n${script}`);
+        let files: t.CodeEnvFile[] | undefined;
+        if (_injected_files && _injected_files.length > 0) {
+          files = _injected_files;
+        } else if (session_id != null && session_id.length > 0) {
+          files = await fetchSessionFiles(baseUrl, apiKey, session_id, proxy);
         }
 
-        const { stdout, stderr, exitCode } = await executeBashScript(script, {
-          bashPath,
-          timeout,
-          workDir,
-        });
+        let response = await makeRequest(
+          EXEC_ENDPOINT,
+          apiKey,
+          {
+            lang: 'bash',
+            code,
+            tools: effectiveTools,
+            session_id,
+            timeout,
+            ...(files && files.length > 0 ? { files } : {}),
+          },
+          proxy
+        );
 
-        let formatted = '';
-        if (stdout) {
-          formatted += `stdout:\n${stdout}\n`;
-        } else {
-          formatted += emptyOutputMessage;
-        }
-        if (stderr) {
-          formatted += `stderr:\n${stderr}\n`;
-        }
-        if (exitCode !== 0 && exitCode !== null) {
-          formatted += `exit code: ${exitCode}\n`;
+        // ====================================================================
+        // Phase 2: Handle response loop
+        // ====================================================================
+
+        while (response.status === 'tool_call_required') {
+          roundTrip++;
+
+          if (roundTrip > maxRoundTrips) {
+            throw new Error(
+              `Exceeded maximum round trips (${maxRoundTrips}). ` +
+                'This may indicate an infinite loop, excessive tool calls, ' +
+                'or a logic error in your code.'
+            );
+          }
+
+          if (debug) {
+            // eslint-disable-next-line no-console
+            console.log(
+              `[BashPTC Debug] Round trip ${roundTrip}: ${response.tool_calls?.length ?? 0} tool(s) to execute`
+            );
+          }
+
+          const toolResults = await executeTools(
+            response.tool_calls ?? [],
+            toolMap
+          );
+
+          response = await makeRequest(
+            EXEC_ENDPOINT,
+            apiKey,
+            {
+              continuation_token: response.continuation_token,
+              tool_results: toolResults,
+            },
+            proxy
+          );
         }
 
-        return formatted.trim();
+        // ====================================================================
+        // Phase 3: Handle final state
+        // ====================================================================
+
+        if (response.status === 'completed') {
+          return formatCompletedResponse(response);
+        }
+
+        if (response.status === 'error') {
+          throw new Error(
+            `Execution error: ${response.error}` +
+              (response.stderr != null && response.stderr !== ''
+                ? `\n\nStderr:\n${response.stderr}`
+                : '')
+          );
+        }
+
+        throw new Error(`Unexpected response status: ${response.status}`);
       } catch (error) {
         throw new Error(
           `Bash programmatic execution failed: ${(error as Error).message}`
         );
-      } finally {
-        await closeServer(server);
-        if (debug) {
-          // eslint-disable-next-line no-console
-          console.log('[BashPTC Debug] Tool server stopped');
-        }
       }
     },
     {
       name: Constants.BASH_PROGRAMMATIC_TOOL_CALLING,
       description: BashProgrammaticToolCallingDescription,
       schema: BashProgrammaticToolCallingSchema,
+      responseFormat: Constants.CONTENT_AND_ARTIFACT,
     }
   );
 }
