@@ -85,6 +85,18 @@ describe('_convertMessagesToAnthropicPayload — server tool use (web search) mu
     expect(serverToolBlocks).toHaveLength(2);
     expect(searchResultBlocks).toHaveLength(2);
     expect(regularToolUseBlocks).toHaveLength(0);
+
+    // Verify blocks are clean (no extra streaming properties)
+    for (const b of serverToolBlocks) {
+      expect(Object.keys(b).sort()).toEqual(
+        ['id', 'input', 'name', 'type'].sort()
+      );
+    }
+    for (const b of searchResultBlocks) {
+      expect(Object.keys(b).sort()).toEqual(
+        ['content', 'tool_use_id', 'type'].sort()
+      );
+    }
   });
 
   it('corrects text-typed server tool blocks back to correct types', () => {

@@ -366,10 +366,76 @@ function _formatContent(message: BaseMessage) {
   } else {
     const contentBlocks = content.map((contentPart) => {
       /**
-       * Handle malformed blocks that have server tool fields mixed with text type.
-       * These can occur when server_tool_use blocks get mislabeled during aggregation.
-       * Correct their type ONLY if we can confirm it's a server tool by checking the ID prefix.
-       * Anthropic needs both server_tool_use and web_search_tool_result blocks for citations to work.
+       * Normalize server_tool_use blocks into a clean shape the API accepts.
+       * These blocks may arrive with the correct type (server_tool_use) or mislabeled
+       * as text/tool_use after chunk concatenation or state serialization.
+       * Regardless of current type, if the id starts with 'srvtoolu_' we rebuild
+       * a clean block with only the properties the API expects.
+       */
+      if (
+        'id' in contentPart &&
+        typeof (contentPart as Record<string, unknown>).id === 'string' &&
+        ((contentPart as Record<string, unknown>).id as string).startsWith(
+          Constants.ANTHROPIC_SERVER_TOOL_PREFIX
+        ) &&
+        'name' in contentPart
+      ) {
+        const rawPart = contentPart as Record<string, unknown>;
+        let input = rawPart.input;
+        if (typeof input === 'string') {
+          try {
+            input = JSON.parse(input);
+          } catch {
+            input = {};
+          }
+        }
+        const corrected: AnthropicServerToolUseBlockParam = {
+          type: 'server_tool_use',
+          id: rawPart.id as string,
+          name: (rawPart.name ?? 'web_search') as 'web_search',
+          input: (input ?? {}) as Record<string, unknown>,
+        };
+        return corrected;
+      }
+
+      /**
+       * Normalize web_search_tool_result blocks into a clean shape.
+       * Same rationale as above — the block may carry extra properties from
+       * streaming (input, index, etc.) that the API rejects. Rebuild cleanly.
+       */
+      if (
+        'tool_use_id' in contentPart &&
+        typeof (contentPart as Record<string, unknown>).tool_use_id ===
+          'string' &&
+        (
+          (contentPart as Record<string, unknown>).tool_use_id as string
+        ).startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX) &&
+        'content' in contentPart
+      ) {
+        const rawPart = contentPart as Record<string, unknown>;
+        const content = rawPart.content;
+        const isValidContent =
+          Array.isArray(content) ||
+          (content != null &&
+            typeof content === 'object' &&
+            'type' in content &&
+            (content as Record<string, unknown>).type ===
+              'web_search_tool_result_error');
+
+        if (isValidContent) {
+          const corrected: AnthropicWebSearchToolResultBlockParam = {
+            type: 'web_search_tool_result',
+            tool_use_id: rawPart.tool_use_id as string,
+            content:
+              content as AnthropicWebSearchToolResultBlockParam['content'],
+          };
+          return corrected;
+        }
+        return null;
+      }
+
+      /**
+       * Skip non-server malformed blocks that have tool fields mixed with text type.
        */
       if (
         'id' in contentPart &&
@@ -377,76 +443,13 @@ function _formatContent(message: BaseMessage) {
         'input' in contentPart &&
         contentPart.type === 'text'
       ) {
-        const rawPart = contentPart as Record<string, unknown>;
-        const id = rawPart.id as string;
-
-        if (id && id.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX)) {
-          let input = rawPart.input;
-
-          // Ensure input is an object
-          if (typeof input === 'string') {
-            try {
-              input = JSON.parse(input);
-            } catch {
-              input = {};
-            }
-          }
-
-          const corrected: AnthropicServerToolUseBlockParam = {
-            type: 'server_tool_use',
-            id,
-            name: 'web_search',
-            input: input as Record<string, unknown>,
-          };
-
-          return corrected;
-        }
-
-        // If it's not a server tool, skip it (return null to filter it out)
         return null;
       }
-
-      /**
-       * Handle malformed web_search_tool_result blocks marked as text.
-       * These have tool_use_id and nested content - fix their type instead of filtering.
-       * Only correct if we can confirm it's a web search result by checking the tool_use_id prefix.
-       *
-       * Handles both success results (array content) and error results (object with error_code).
-       */
       if (
         'tool_use_id' in contentPart &&
         'content' in contentPart &&
         contentPart.type === 'text'
       ) {
-        const rawPart = contentPart as Record<string, unknown>;
-        const toolUseId = rawPart.tool_use_id as string;
-        const content = rawPart.content;
-
-        if (
-          toolUseId &&
-          toolUseId.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX)
-        ) {
-          // Verify content is either an array (success) or error object
-          const isValidContent =
-            Array.isArray(content) ||
-            (content != null &&
-              typeof content === 'object' &&
-              'type' in content &&
-              (content as Record<string, unknown>).type ===
-                'web_search_tool_result_error');
-
-          if (isValidContent) {
-            const corrected: AnthropicWebSearchToolResultBlockParam = {
-              type: 'web_search_tool_result',
-              tool_use_id: toolUseId,
-              content:
-                content as AnthropicWebSearchToolResultBlockParam['content'],
-            };
-            return corrected;
-          }
-        }
-
-        // If it's not a recognized server tool result format, skip it (return null to filter it out)
         return null;
       }
 
