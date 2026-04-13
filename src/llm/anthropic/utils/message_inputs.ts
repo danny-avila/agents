@@ -696,9 +696,38 @@ export function _convertMessagesToAnthropicPayload(
     }
   });
   return {
-    messages: mergeMessages(formattedMessages),
+    messages: _fixServerToolBlocks(mergeMessages(formattedMessages)),
     system,
   } as AnthropicMessageCreateParams;
+}
+
+/**
+ * Final-pass sanitizer: corrects any `tool_use` blocks whose `id` starts with
+ * `srvtoolu_` back to `server_tool_use`. This runs on the fully-formatted
+ * messages array as a catch-all — regardless of which code-path produced the
+ * wrong type (chunk concatenation, state deserialization, etc.).
+ */
+function _fixServerToolBlocks(
+  messages: AnthropicMessageCreateParams['messages']
+): AnthropicMessageCreateParams['messages'] {
+  for (const msg of messages) {
+    if (msg.role !== 'assistant' || typeof msg.content === 'string') {
+      continue;
+    }
+    for (let i = 0; i < msg.content.length; i++) {
+      const block = msg.content[i];
+      if (
+        block.type === 'tool_use' &&
+        'id' in block &&
+        typeof block.id === 'string' &&
+        block.id.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX)
+      ) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (block as any).type = 'server_tool_use';
+      }
+    }
+  }
+  return messages;
 }
 
 function mergeMessages(messages: AnthropicMessageCreateParams['messages']) {

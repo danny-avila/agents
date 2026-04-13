@@ -204,7 +204,7 @@ describe('_convertMessagesToAnthropicPayload — server tool use (web search) mu
     const { messages } = _convertMessagesToAnthropicPayload(messageHistory);
     const assistantContent = messages[1].content as any[];
     expect(assistantContent).toHaveLength(1);
-    expect(assistantContent[0].type).toBe('tool_use');
+    expect(assistantContent[0].type).toBe('server_tool_use');
     expect(assistantContent[0].id).toBe('srvtoolu_1');
   });
 
