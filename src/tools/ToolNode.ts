@@ -342,7 +342,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         request?.name !== Constants.EXECUTE_CODE &&
         request?.name !== Constants.BASH_TOOL &&
         request?.name !== Constants.PROGRAMMATIC_TOOL_CALLING &&
-        request?.name !== Constants.BASH_PROGRAMMATIC_TOOL_CALLING
+        request?.name !== Constants.BASH_PROGRAMMATIC_TOOL_CALLING &&
+        request?.name !== Constants.SKILL_TOOL
       ) {
         continue;
       }
@@ -624,7 +625,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           entry.call.name === Constants.EXECUTE_CODE ||
           entry.call.name === Constants.BASH_TOOL ||
           entry.call.name === Constants.PROGRAMMATIC_TOOL_CALLING ||
-          entry.call.name === Constants.BASH_PROGRAMMATIC_TOOL_CALLING
+          entry.call.name === Constants.BASH_PROGRAMMATIC_TOOL_CALLING ||
+          entry.call.name === Constants.SKILL_TOOL
         ) {
           request.codeSessionContext = this.getCodeSessionContext();
         }
