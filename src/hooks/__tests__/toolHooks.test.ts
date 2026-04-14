@@ -236,6 +236,7 @@ describe('Tool-level hook integration (event-driven mode)', () => {
       );
 
       expect(stepCompletedData).toBeDefined();
+      expect(stepCompletedData!.type).toBe('tool_call');
       expect(stepCompletedData!.tool_call.name).toBe('echo');
       expect(stepCompletedData!.tool_call.id).toBe(tc.id);
       expect(stepCompletedData!.tool_call.output).toContain('Blocked:');
