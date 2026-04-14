@@ -37,6 +37,41 @@ function isSend(value: unknown): value is Send {
   return value instanceof Send;
 }
 
+/** Merges code execution session context into the sessions map. */
+function updateCodeSession(
+  sessions: t.ToolSessionMap,
+  sessionId: string,
+  files: t.FileRefs | undefined
+): void {
+  const newFiles = files ?? [];
+  const existingSession = sessions.get(Constants.EXECUTE_CODE) as
+    | t.CodeSessionContext
+    | undefined;
+  const existingFiles = existingSession?.files ?? [];
+
+  if (newFiles.length > 0) {
+    const filesWithSession: t.FileRefs = newFiles.map((file) => ({
+      ...file,
+      session_id: sessionId,
+    }));
+    const newFileNames = new Set(filesWithSession.map((f) => f.name));
+    const filteredExisting = existingFiles.filter(
+      (f) => !newFileNames.has(f.name)
+    );
+    sessions.set(Constants.EXECUTE_CODE, {
+      session_id: sessionId,
+      files: [...filteredExisting, ...filesWithSession],
+      lastUpdated: Date.now(),
+    });
+  } else {
+    sessions.set(Constants.EXECUTE_CODE, {
+      session_id: sessionId,
+      files: existingFiles,
+      lastUpdated: Date.now(),
+    });
+  }
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private toolMap: Map<string, StructuredToolInterface | RunnableToolLike>;
@@ -320,7 +355,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
    */
   private storeCodeSessionFromResults(
     results: t.ToolExecuteResult[],
-    requests: t.ToolCallRequest[]
+    requestMap: Map<string, t.ToolCallRequest>
   ): void {
     if (!this.sessions) {
       return;
@@ -332,8 +367,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         continue;
       }
 
-      const request = requests.find((r) => r.id === result.toolCallId);
-      if (!request?.name || (!CODE_EXECUTION_TOOLS.has(request.name) && request.name !== Constants.SKILL_TOOL)) {
+      const request = requestMap.get(result.toolCallId);
+      if (
+        !request?.name ||
+        (!CODE_EXECUTION_TOOLS.has(request.name) &&
+          request.name !== Constants.SKILL_TOOL)
+      ) {
         continue;
       }
 
@@ -342,35 +381,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         continue;
       }
 
-      const newFiles = artifact.files ?? [];
-      const existingSession = this.sessions.get(Constants.EXECUTE_CODE) as
-        | t.CodeSessionContext
-        | undefined;
-      const existingFiles = existingSession?.files ?? [];
-
-      if (newFiles.length > 0) {
-        const filesWithSession: t.FileRefs = newFiles.map((file) => ({
-          ...file,
-          session_id: artifact.session_id,
-        }));
-
-        const newFileNames = new Set(filesWithSession.map((f) => f.name));
-        const filteredExisting = existingFiles.filter(
-          (f) => !newFileNames.has(f.name)
-        );
-
-        this.sessions.set(Constants.EXECUTE_CODE, {
-          session_id: artifact.session_id,
-          files: [...filteredExisting, ...filesWithSession],
-          lastUpdated: Date.now(),
-        });
-      } else {
-        this.sessions.set(Constants.EXECUTE_CODE, {
-          session_id: artifact.session_id,
-          files: existingFiles,
-          lastUpdated: Date.now(),
-        });
-      }
+      updateCodeSession(this.sessions, artifact.session_id!, artifact.files);
     }
   }
 
@@ -406,39 +417,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         continue;
       }
 
-      // Store code session context from tool results
       if (this.sessions && CODE_EXECUTION_TOOLS.has(call.name)) {
         const artifact = toolMessage.artifact as
           | t.CodeExecutionArtifact
           | undefined;
         if (artifact?.session_id != null && artifact.session_id !== '') {
-          const newFiles = artifact.files ?? [];
-          const existingSession = this.sessions.get(Constants.EXECUTE_CODE) as
-            | t.CodeSessionContext
-            | undefined;
-          const existingFiles = existingSession?.files ?? [];
-
-          if (newFiles.length > 0) {
-            const filesWithSession: t.FileRefs = newFiles.map((file) => ({
-              ...file,
-              session_id: artifact.session_id,
-            }));
-            const newFileNames = new Set(filesWithSession.map((f) => f.name));
-            const filteredExisting = existingFiles.filter(
-              (f) => !newFileNames.has(f.name)
-            );
-            this.sessions.set(Constants.EXECUTE_CODE, {
-              session_id: artifact.session_id,
-              files: [...filteredExisting, ...filesWithSession],
-              lastUpdated: Date.now(),
-            });
-          } else {
-            this.sessions.set(Constants.EXECUTE_CODE, {
-              session_id: artifact.session_id,
-              files: existingFiles,
-              lastUpdated: Date.now(),
-            });
-          }
+          updateCodeSession(this.sessions, artifact.session_id, artifact.files);
         }
       }
 
@@ -604,7 +588,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           turn,
         };
 
-        if (CODE_EXECUTION_TOOLS.has(entry.call.name) || entry.call.name === Constants.SKILL_TOOL) {
+        if (
+          CODE_EXECUTION_TOOLS.has(entry.call.name) ||
+          entry.call.name === Constants.SKILL_TOOL
+        ) {
           request.codeSessionContext = this.getCodeSessionContext();
         }
 
@@ -635,7 +622,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         }
       );
 
-      this.storeCodeSessionFromResults(results, requests);
+      this.storeCodeSessionFromResults(results, requestMap);
 
       const hasPostHook =
         this.hookRegistry?.hasHookFor('PostToolUse', runId) === true;
