@@ -164,7 +164,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       };
 
       // Inject runtime data for special tools (becomes available at config.toolCall)
-      if (call.name === Constants.PROGRAMMATIC_TOOL_CALLING) {
+      if (
+        call.name === Constants.PROGRAMMATIC_TOOL_CALLING ||
+        call.name === Constants.BASH_PROGRAMMATIC_TOOL_CALLING
+      ) {
         const { toolMap, toolDefs } = this.getProgrammaticTools();
         invokeParams = {
           ...invokeParams,
@@ -189,7 +192,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
        */
       if (
         call.name === Constants.EXECUTE_CODE ||
-        call.name === Constants.PROGRAMMATIC_TOOL_CALLING
+        call.name === Constants.EXECUTE_BASH ||
+        call.name === Constants.PROGRAMMATIC_TOOL_CALLING ||
+        call.name === Constants.BASH_PROGRAMMATIC_TOOL_CALLING
       ) {
         const codeSession = this.sessions?.get(Constants.EXECUTE_CODE) as
           | t.CodeSessionContext
@@ -335,7 +340,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       const request = requests.find((r) => r.id === result.toolCallId);
       if (
         request?.name !== Constants.EXECUTE_CODE &&
-        request?.name !== Constants.PROGRAMMATIC_TOOL_CALLING
+        request?.name !== Constants.EXECUTE_BASH &&
+        request?.name !== Constants.PROGRAMMATIC_TOOL_CALLING &&
+        request?.name !== Constants.BASH_PROGRAMMATIC_TOOL_CALLING
       ) {
         continue;
       }
@@ -413,7 +420,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       if (
         this.sessions &&
         (call.name === Constants.EXECUTE_CODE ||
-          call.name === Constants.PROGRAMMATIC_TOOL_CALLING)
+          call.name === Constants.EXECUTE_BASH ||
+          call.name === Constants.PROGRAMMATIC_TOOL_CALLING ||
+          call.name === Constants.BASH_PROGRAMMATIC_TOOL_CALLING)
       ) {
         const artifact = toolMessage.artifact as
           | t.CodeExecutionArtifact
@@ -613,7 +622,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
         if (
           entry.call.name === Constants.EXECUTE_CODE ||
-          entry.call.name === Constants.PROGRAMMATIC_TOOL_CALLING
+          entry.call.name === Constants.EXECUTE_BASH ||
+          entry.call.name === Constants.PROGRAMMATIC_TOOL_CALLING ||
+          entry.call.name === Constants.BASH_PROGRAMMATIC_TOOL_CALLING
         ) {
           request.codeSessionContext = this.getCodeSessionContext();
         }
