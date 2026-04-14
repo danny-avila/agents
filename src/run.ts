@@ -99,6 +99,12 @@ export class Run<_T extends t.BaseGraphState> {
       }
     }
 
+    if (config.initialSessions && this.Graph) {
+      for (const [key, value] of config.initialSessions) {
+        this.Graph.sessions.set(key, value);
+      }
+    }
+
     this.returnContent = config.returnContent ?? false;
     this.skipCleanup = config.skipCleanup ?? false;
   }
