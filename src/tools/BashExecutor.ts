@@ -52,7 +52,7 @@ Usage:
 - NEVER use this tool to execute malicious commands.
 `.trim();
 
-export const BashExecutionToolName = Constants.EXECUTE_BASH;
+export const BashExecutionToolName = Constants.BASH_TOOL;
 
 export const BashExecutionToolDefinition = {
   name: BashExecutionToolName,
