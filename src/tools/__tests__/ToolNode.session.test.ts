@@ -216,7 +216,7 @@ describe('ToolNode code execution session management', () => {
         toolNode as unknown as {
           storeCodeSessionFromResults: (
             results: t.ToolExecuteResult[],
-            requests: t.ToolCallRequest[]
+            requestMap: Map<string, t.ToolCallRequest>
           ) => void;
         }
       ).storeCodeSessionFromResults.bind(toolNode);
@@ -233,7 +233,7 @@ describe('ToolNode code execution session management', () => {
             status: 'success',
           },
         ],
-        [{ id: 'tc1', name: Constants.EXECUTE_CODE, args: {} }]
+        new Map([['tc1', { id: 'tc1', name: Constants.EXECUTE_CODE, args: {} }]])
       );
 
       const stored = sessions.get(
@@ -265,7 +265,7 @@ describe('ToolNode code execution session management', () => {
         toolNode as unknown as {
           storeCodeSessionFromResults: (
             results: t.ToolExecuteResult[],
-            requests: t.ToolCallRequest[]
+            requestMap: Map<string, t.ToolCallRequest>
           ) => void;
         }
       ).storeCodeSessionFromResults.bind(toolNode);
@@ -279,7 +279,7 @@ describe('ToolNode code execution session management', () => {
             status: 'success',
           },
         ],
-        [{ id: 'tc2', name: Constants.EXECUTE_CODE, args: {} }]
+        new Map([['tc2', { id: 'tc2', name: Constants.EXECUTE_CODE, args: {} }]])
       );
 
       const stored = sessions.get(
@@ -312,7 +312,7 @@ describe('ToolNode code execution session management', () => {
         toolNode as unknown as {
           storeCodeSessionFromResults: (
             results: t.ToolExecuteResult[],
-            requests: t.ToolCallRequest[]
+            requestMap: Map<string, t.ToolCallRequest>
           ) => void;
         }
       ).storeCodeSessionFromResults.bind(toolNode);
@@ -329,7 +329,7 @@ describe('ToolNode code execution session management', () => {
             status: 'success',
           },
         ],
-        [{ id: 'tc3', name: Constants.EXECUTE_CODE, args: {} }]
+        new Map([['tc3', { id: 'tc3', name: Constants.EXECUTE_CODE, args: {} }]])
       );
 
       const stored = sessions.get(
@@ -365,7 +365,7 @@ describe('ToolNode code execution session management', () => {
         toolNode as unknown as {
           storeCodeSessionFromResults: (
             results: t.ToolExecuteResult[],
-            requests: t.ToolCallRequest[]
+            requestMap: Map<string, t.ToolCallRequest>
           ) => void;
         }
       ).storeCodeSessionFromResults.bind(toolNode);
@@ -379,7 +379,7 @@ describe('ToolNode code execution session management', () => {
             status: 'success',
           },
         ],
-        [{ id: 'tc4', name: Constants.EXECUTE_CODE, args: {} }]
+        new Map([['tc4', { id: 'tc4', name: Constants.EXECUTE_CODE, args: {} }]])
       );
 
       const stored = sessions.get(
@@ -404,7 +404,7 @@ describe('ToolNode code execution session management', () => {
         toolNode as unknown as {
           storeCodeSessionFromResults: (
             results: t.ToolExecuteResult[],
-            requests: t.ToolCallRequest[]
+            requestMap: Map<string, t.ToolCallRequest>
           ) => void;
         }
       ).storeCodeSessionFromResults.bind(toolNode);
@@ -418,7 +418,7 @@ describe('ToolNode code execution session management', () => {
             status: 'success',
           },
         ],
-        [{ id: 'tc5', name: 'web_search', args: {} }]
+        new Map([['tc5', { id: 'tc5', name: 'web_search', args: {} }]])
       );
 
       expect(sessions.has(Constants.EXECUTE_CODE)).toBe(false);
@@ -438,7 +438,7 @@ describe('ToolNode code execution session management', () => {
         toolNode as unknown as {
           storeCodeSessionFromResults: (
             results: t.ToolExecuteResult[],
-            requests: t.ToolCallRequest[]
+            requestMap: Map<string, t.ToolCallRequest>
           ) => void;
         }
       ).storeCodeSessionFromResults.bind(toolNode);
@@ -456,7 +456,7 @@ describe('ToolNode code execution session management', () => {
             errorMessage: 'execution failed',
           },
         ],
-        [{ id: 'tc6', name: Constants.EXECUTE_CODE, args: {} }]
+        new Map([['tc6', { id: 'tc6', name: Constants.EXECUTE_CODE, args: {} }]])
       );
 
       expect(sessions.has(Constants.EXECUTE_CODE)).toBe(false);
