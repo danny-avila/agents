@@ -183,7 +183,7 @@ export enum Constants {
   /** Anthropic server tool ID prefix (web_search, code_execution, etc.) */
   ANTHROPIC_SERVER_TOOL_PREFIX = 'srvtoolu_',
   SKILL_TOOL = 'skill',
-  EXECUTE_BASH = 'execute_bash',
+  BASH_TOOL = 'bash_tool',
   BASH_PROGRAMMATIC_TOOL_CALLING = 'run_tools_with_bash',
 }
 

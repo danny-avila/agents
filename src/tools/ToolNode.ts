@@ -192,7 +192,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
        */
       if (
         call.name === Constants.EXECUTE_CODE ||
-        call.name === Constants.EXECUTE_BASH ||
+        call.name === Constants.BASH_TOOL ||
         call.name === Constants.PROGRAMMATIC_TOOL_CALLING ||
         call.name === Constants.BASH_PROGRAMMATIC_TOOL_CALLING
       ) {
@@ -340,7 +340,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       const request = requests.find((r) => r.id === result.toolCallId);
       if (
         request?.name !== Constants.EXECUTE_CODE &&
-        request?.name !== Constants.EXECUTE_BASH &&
+        request?.name !== Constants.BASH_TOOL &&
         request?.name !== Constants.PROGRAMMATIC_TOOL_CALLING &&
         request?.name !== Constants.BASH_PROGRAMMATIC_TOOL_CALLING
       ) {
@@ -420,7 +420,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       if (
         this.sessions &&
         (call.name === Constants.EXECUTE_CODE ||
-          call.name === Constants.EXECUTE_BASH ||
+          call.name === Constants.BASH_TOOL ||
           call.name === Constants.PROGRAMMATIC_TOOL_CALLING ||
           call.name === Constants.BASH_PROGRAMMATIC_TOOL_CALLING)
       ) {
@@ -622,7 +622,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
         if (
           entry.call.name === Constants.EXECUTE_CODE ||
-          entry.call.name === Constants.EXECUTE_BASH ||
+          entry.call.name === Constants.BASH_TOOL ||
           entry.call.name === Constants.PROGRAMMATIC_TOOL_CALLING ||
           entry.call.name === Constants.BASH_PROGRAMMATIC_TOOL_CALLING
         ) {
