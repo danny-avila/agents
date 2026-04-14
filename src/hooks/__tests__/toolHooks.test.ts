@@ -185,6 +185,62 @@ describe('Tool-level hook integration (event-driven mode)', () => {
       expect(toolExecuted).toBe(false);
     });
 
+    it('deny dispatches ON_RUN_STEP_COMPLETED for the blocked call', async () => {
+      const registry = new HookRegistry();
+      const denyHook: HookCallback<
+        'PreToolUse'
+      > = async (): Promise<PreToolUseHookOutput> => ({
+        decision: 'deny',
+        reason: 'not allowed',
+      });
+      registry.register('PreToolUse', {
+        pattern: '^echo$',
+        hooks: [denyHook],
+      });
+
+      let stepCompletedData: t.ToolCompleteEvent | undefined;
+      const stepHandler: t.EventHandler = {
+        handle: async (_event: string, rawData: unknown): Promise<void> => {
+          const data = rawData as { result: t.ToolCompleteEvent };
+          stepCompletedData = data.result;
+        },
+      };
+
+      const toolHandler = createToolExecuteHandler();
+      const customHandlers: Record<string, t.EventHandler> = {
+        [GraphEvents.ON_TOOL_EXECUTE]: toolHandler,
+        [GraphEvents.TOOL_END]: new ToolEndHandler(),
+        [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(),
+        [GraphEvents.ON_RUN_STEP_COMPLETED]: stepHandler,
+      };
+
+      const tc = makeToolCall('hello');
+      const run = await Run.create<t.IState>({
+        runId: 'deny-step-run',
+        graphConfig: {
+          type: 'standard',
+          llmConfig,
+          toolDefinitions: [echoToolDef],
+          instructions: 'Use the echo tool when asked.',
+        },
+        returnContent: true,
+        skipCleanup: true,
+        customHandlers,
+        hooks: registry,
+      });
+
+      run.Graph!.overrideTestModel(['calling echo'], 5, [tc]);
+      await run.processStream(
+        { messages: [new HumanMessage('echo hello')] },
+        callerConfig
+      );
+
+      expect(stepCompletedData).toBeDefined();
+      expect(stepCompletedData!.tool_call.name).toBe('echo');
+      expect(stepCompletedData!.tool_call.id).toBe(tc.id);
+      expect(stepCompletedData!.tool_call.output).toContain('Blocked:');
+    });
+
     it('ask blocks tool execution in v1 (same as deny)', async () => {
       const registry = new HookRegistry();
       let toolExecuted = false;

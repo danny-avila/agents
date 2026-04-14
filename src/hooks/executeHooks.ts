@@ -349,6 +349,7 @@ export async function executeHooks(
     return freshResult();
   }
 
+  // --- SYNC CRITICAL SECTION: once-matcher removal must complete before any await ---
   const tasks: Promise<HookOutcome>[] = [];
   for (const matcher of matchers) {
     if (!matchesQuery(matcher.pattern, matchQuery)) {
@@ -363,6 +364,7 @@ export async function executeHooks(
       tasks.push(runHook(hook, input, matcherSignal, matcher));
     }
   }
+  // --- END SYNC CRITICAL SECTION ---
   if (tasks.length === 0) {
     return freshResult();
   }
