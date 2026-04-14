@@ -28,7 +28,7 @@ import {
 } from '@/utils/truncation';
 import { safeDispatchCustomEvent } from '@/utils/events';
 import { executeHooks } from '@/hooks';
-import { Constants, GraphEvents } from '@/common';
+import { Constants, GraphEvents, CODE_EXECUTION_TOOLS } from '@/common';
 
 /**
  * Helper to check if a value is a Send object
@@ -190,12 +190,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
        * session_id is always injected when available (even without tracked files)
        * so the CodeExecutor can fall back to the /files endpoint for session continuity.
        */
-      if (
-        call.name === Constants.EXECUTE_CODE ||
-        call.name === Constants.BASH_TOOL ||
-        call.name === Constants.PROGRAMMATIC_TOOL_CALLING ||
-        call.name === Constants.BASH_PROGRAMMATIC_TOOL_CALLING
-      ) {
+      if (CODE_EXECUTION_TOOLS.has(call.name)) {
         const codeSession = this.sessions?.get(Constants.EXECUTE_CODE) as
           | t.CodeSessionContext
           | undefined;
@@ -338,13 +333,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       }
 
       const request = requests.find((r) => r.id === result.toolCallId);
-      if (
-        request?.name !== Constants.EXECUTE_CODE &&
-        request?.name !== Constants.BASH_TOOL &&
-        request?.name !== Constants.PROGRAMMATIC_TOOL_CALLING &&
-        request?.name !== Constants.BASH_PROGRAMMATIC_TOOL_CALLING &&
-        request?.name !== Constants.SKILL_TOOL
-      ) {
+      if (!request?.name || (!CODE_EXECUTION_TOOLS.has(request.name) && request.name !== Constants.SKILL_TOOL)) {
         continue;
       }
 
@@ -418,13 +407,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       }
 
       // Store code session context from tool results
-      if (
-        this.sessions &&
-        (call.name === Constants.EXECUTE_CODE ||
-          call.name === Constants.BASH_TOOL ||
-          call.name === Constants.PROGRAMMATIC_TOOL_CALLING ||
-          call.name === Constants.BASH_PROGRAMMATIC_TOOL_CALLING)
-      ) {
+      if (this.sessions && CODE_EXECUTION_TOOLS.has(call.name)) {
         const artifact = toolMessage.artifact as
           | t.CodeExecutionArtifact
           | undefined;
@@ -621,13 +604,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           turn,
         };
 
-        if (
-          entry.call.name === Constants.EXECUTE_CODE ||
-          entry.call.name === Constants.BASH_TOOL ||
-          entry.call.name === Constants.PROGRAMMATIC_TOOL_CALLING ||
-          entry.call.name === Constants.BASH_PROGRAMMATIC_TOOL_CALLING ||
-          entry.call.name === Constants.SKILL_TOOL
-        ) {
+        if (CODE_EXECUTION_TOOLS.has(entry.call.name) || entry.call.name === Constants.SKILL_TOOL) {
           request.codeSessionContext = this.getCodeSessionContext();
         }
 
