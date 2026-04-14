@@ -797,12 +797,29 @@ function contentPartCharLength(part: MessageContentComplex): number {
   return len;
 }
 
+/** Extracts the skillName from a skill tool_call's args (string or object). */
+function extractSkillName(args: unknown): string | undefined {
+  let parsed: Record<string, unknown> | undefined;
+  if (typeof args === 'string') {
+    try {
+      parsed = JSON.parse(args) as Record<string, unknown>;
+    } catch {
+      /* malformed args — skip */
+    }
+  } else {
+    parsed = args as Record<string, unknown> | undefined;
+  }
+  const name = parsed?.skillName;
+  return typeof name === 'string' && name !== '' ? name : undefined;
+}
+
 /**
  * Formats an array of messages for LangChain, handling tool calls and creating ToolMessage instances.
  *
  * @param payload - The array of messages to format.
  * @param indexTokenCountMap - Optional map of message indices to token counts.
  * @param tools - Optional set of tool names that are allowed in the request.
+ * @param skills - Optional map of skill name to body for reconstructing skill HumanMessages.
  * @returns - Object containing formatted messages and updated indexTokenCountMap if provided.
  */
 export const formatAgentMessages = (
@@ -906,7 +923,7 @@ export const formatAgentMessages = (
      * - Dynamically expand the set when tool_search results are encountered
      */
     let processedMessage = message;
-    const pendingSkillBodies: string[] = [];
+    let pendingSkillNames: Set<string> | undefined;
     if (discoveredTools) {
       const content = message.content;
       if (content != null && Array.isArray(content)) {
@@ -954,29 +971,14 @@ export const formatAgentMessages = (
             }
           }
 
-          if (discoveredTools?.has(toolName)) {
-            /** Valid tool - keep it */
+          if (discoveredTools.has(toolName)) {
             filteredContent.push(part);
-            /** Collect invoked skill names for body reconstruction (only for allowed calls) */
             if (toolName === Constants.SKILL_TOOL && skills?.size) {
-              const rawArgs = part.tool_call.args;
-              const parsedArgs =
-                typeof rawArgs === 'string'
-                  ? (() => {
-                    try {
-                      return JSON.parse(rawArgs) as Record<string, unknown>;
-                    } catch {
-                      return {};
-                    }
-                  })()
-                  : rawArgs;
-              const sn = parsedArgs?.skillName;
-              if (typeof sn === 'string' && sn !== '') {
-                pendingSkillBodies.push(sn);
+              const skillName = extractSkillName(part.tool_call.args);
+              if (skillName) {
+                (pendingSkillNames ??= new Set()).add(skillName);
               }
             }
-          } else if (!discoveredTools) {
-            filteredContent.push(part);
           } else {
             /** Invalid tool - convert to string for context preservation */
             if (
@@ -1060,20 +1062,9 @@ export const formatAgentMessages = (
           if (part.type !== ContentTypes.TOOL_CALL || part.tool_call?.name !== Constants.SKILL_TOOL) {
             continue;
           }
-          const rawArgs = part.tool_call.args;
-          const parsedArgs =
-            typeof rawArgs === 'string'
-              ? (() => {
-                try {
-                  return JSON.parse(rawArgs) as Record<string, unknown>;
-                } catch {
-                  return {};
-                }
-              })()
-              : rawArgs;
-          const sn = parsedArgs?.skillName;
-          if (typeof sn === 'string' && sn !== '') {
-            pendingSkillBodies.push(sn);
+          const skillName = extractSkillName(part.tool_call.args);
+          if (skillName) {
+            (pendingSkillNames ??= new Set()).add(skillName);
           }
         }
       }
@@ -1087,27 +1078,29 @@ export const formatAgentMessages = (
     }
     messages.push(...formattedMessages);
 
-    /** Reconstruct HumanMessages for invoked skill bodies after their ToolMessages */
-    for (const skillName of pendingSkillBodies) {
-      const body = skills?.get(skillName);
-      if (body) {
-        messages.push(
-          new HumanMessage({
-            content: body,
-            additional_kwargs: {
-              role: 'user',
-              isMeta: true,
-              source: 'skill',
-              skillName,
-            },
-          })
-        );
+    // Capture index range BEFORE skill body injection so injected
+    // HumanMessages are excluded from the assistant's token distribution.
+    const endMessageIndex = messages.length;
+
+    if (pendingSkillNames?.size) {
+      for (const skillName of pendingSkillNames) {
+        const body = skills?.get(skillName);
+        if (body) {
+          messages.push(
+            new HumanMessage({
+              content: body,
+              additional_kwargs: {
+                role: 'user',
+                isMeta: true,
+                source: 'skill',
+                skillName,
+              },
+            })
+          );
+        }
       }
     }
 
-    // Update the index mapping for this assistant message
-    // Store all indices that were created from this original message
-    const endMessageIndex = messages.length;
     const resultIndices = [];
     for (let j = startMessageIndex; j < endMessageIndex; j++) {
       resultIndices.push(j);
