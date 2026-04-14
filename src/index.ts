@@ -14,7 +14,9 @@ export * from './summarization';
 /* Tools */
 export * from './tools/Calculator';
 export * from './tools/CodeExecutor';
+export * from './tools/BashExecutor';
 export * from './tools/ProgrammaticToolCalling';
+export * from './tools/BashProgrammaticToolCalling';
 export * from './tools/SkillTool';
 export * from './tools/skillCatalog';
 export * from './tools/ToolSearch';

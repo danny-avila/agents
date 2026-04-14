@@ -352,6 +352,12 @@ export type ProgrammaticExecutionArtifact = {
   files?: FileRefs;
 };
 
+/** Parameters for creating a bash execution tool (same API as CodeExecutor, bash-only) */
+export type BashExecutionToolParams = CodeExecutionToolParams;
+
+/** Parameters for creating a bash programmatic tool calling tool (same API as PTC, bash-only) */
+export type BashProgrammaticToolCallingParams = ProgrammaticToolCallingParams;
+
 /**
  * Initialization parameters for the PTC tool
  */
