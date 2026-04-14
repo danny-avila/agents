@@ -9,11 +9,10 @@ import * as events from '@/utils/events';
 import { ToolNode } from '../ToolNode';
 import { Constants } from '@/common';
 import {
-  SkillToolName,
-  SkillToolSchema,
   SkillToolDescription,
   SkillToolDefinition,
-  createSkillTool,
+  SkillToolSchema,
+  SkillToolName,
 } from '../SkillTool';
 
 describe('SkillTool', () => {
@@ -30,25 +29,6 @@ describe('SkillTool', () => {
 
     it('is an object type schema', () => {
       expect(SkillToolSchema.type).toBe('object');
-    });
-  });
-
-  describe('createSkillTool', () => {
-    it('throws on direct invocation', async () => {
-      const skillTool = createSkillTool();
-      await expect(skillTool.invoke({ skillName: 'test' })).rejects.toThrow(
-        'SkillTool requires event-driven execution mode (ON_TOOL_EXECUTE). Direct invocation is not supported.'
-      );
-    });
-
-    it('has correct name', () => {
-      const skillTool = createSkillTool();
-      expect(skillTool.name).toBe('skill');
-    });
-
-    it('validates skillName is required', async () => {
-      const skillTool = createSkillTool();
-      await expect(skillTool.invoke({})).rejects.toThrow();
     });
   });
 
