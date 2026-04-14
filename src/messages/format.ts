@@ -808,7 +808,11 @@ function contentPartCharLength(part: MessageContentComplex): number {
 export const formatAgentMessages = (
   payload: TPayload,
   indexTokenCountMap?: Record<number, number | undefined>,
-  tools?: Set<string>
+  tools?: Set<string>,
+  /** Pre-resolved skill bodies keyed by skill name. When present, HumanMessages
+   *  are reconstructed after skill ToolMessages to restore skill instructions
+   *  that were only in LangGraph state during the original run. */
+  skills?: Map<string, string>
 ): {
   messages: Array<HumanMessage | AIMessage | SystemMessage | ToolMessage>;
   indexTokenCountMap?: Record<number, number>;
@@ -902,6 +906,7 @@ export const formatAgentMessages = (
      * - Dynamically expand the set when tool_search results are encountered
      */
     let processedMessage = message;
+    const pendingSkillBodies: string[] = [];
     if (discoveredTools) {
       const content = message.content;
       if (content != null && Array.isArray(content)) {
@@ -949,8 +954,28 @@ export const formatAgentMessages = (
             }
           }
 
-          if (discoveredTools.has(toolName)) {
+          if (discoveredTools?.has(toolName)) {
             /** Valid tool - keep it */
+            filteredContent.push(part);
+            /** Collect invoked skill names for body reconstruction (only for allowed calls) */
+            if (toolName === Constants.SKILL_TOOL && skills?.size) {
+              const rawArgs = part.tool_call.args;
+              const parsedArgs =
+                typeof rawArgs === 'string'
+                  ? (() => {
+                    try {
+                      return JSON.parse(rawArgs) as Record<string, unknown>;
+                    } catch {
+                      return {};
+                    }
+                  })()
+                  : rawArgs;
+              const sn = parsedArgs?.skillName;
+              if (typeof sn === 'string' && sn !== '') {
+                pendingSkillBodies.push(sn);
+              }
+            }
+          } else if (!discoveredTools) {
             filteredContent.push(part);
           } else {
             /** Invalid tool - convert to string for context preservation */
@@ -1027,6 +1052,33 @@ export const formatAgentMessages = (
       }
     }
 
+    /** When tools filtering is off, still detect skill tool_calls for body reconstruction */
+    if (!discoveredTools && skills?.size) {
+      const content = processedMessage.content;
+      if (Array.isArray(content)) {
+        for (const part of content) {
+          if (part.type !== ContentTypes.TOOL_CALL || part.tool_call?.name !== Constants.SKILL_TOOL) {
+            continue;
+          }
+          const rawArgs = part.tool_call.args;
+          const parsedArgs =
+            typeof rawArgs === 'string'
+              ? (() => {
+                try {
+                  return JSON.parse(rawArgs) as Record<string, unknown>;
+                } catch {
+                  return {};
+                }
+              })()
+              : rawArgs;
+          const sn = parsedArgs?.skillName;
+          if (typeof sn === 'string' && sn !== '') {
+            pendingSkillBodies.push(sn);
+          }
+        }
+      }
+    }
+
     const formattedMessages = formatAssistantMessage(processedMessage);
     if (sourceMessageId != null && sourceMessageId !== '') {
       for (const formattedMessage of formattedMessages) {
@@ -1034,6 +1086,24 @@ export const formatAgentMessages = (
       }
     }
     messages.push(...formattedMessages);
+
+    /** Reconstruct HumanMessages for invoked skill bodies after their ToolMessages */
+    for (const skillName of pendingSkillBodies) {
+      const body = skills?.get(skillName);
+      if (body) {
+        messages.push(
+          new HumanMessage({
+            content: body,
+            additional_kwargs: {
+              role: 'user',
+              isMeta: true,
+              source: 'skill',
+              skillName,
+            },
+          })
+        );
+      }
+    }
 
     // Update the index mapping for this assistant message
     // Store all indices that were created from this original message
