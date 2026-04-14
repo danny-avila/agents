@@ -187,6 +187,14 @@ export enum Constants {
   BASH_PROGRAMMATIC_TOOL_CALLING = 'run_tools_with_bash',
 }
 
+/** Tool names that use the code execution environment (shared session, file tracking). */
+export const CODE_EXECUTION_TOOLS: ReadonlySet<string> = new Set([
+  Constants.EXECUTE_CODE,
+  Constants.BASH_TOOL,
+  Constants.PROGRAMMATIC_TOOL_CALLING,
+  Constants.BASH_PROGRAMMATIC_TOOL_CALLING,
+]);
+
 export enum TitleMethod {
   STRUCTURED = 'structured',
   FUNCTIONS = 'functions',
