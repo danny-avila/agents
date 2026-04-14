@@ -190,8 +190,19 @@ jobs:
         if: steps.check.outputs.skip != 'true'
         run: npm pack
 
+      - name: Determine publish tag
+        if: steps.check.outputs.skip != 'true'
+        id: publish_tag
+        run: |
+          PACKAGE_VERSION=$(node -p "require('./package.json').version")
+          if echo "$PACKAGE_VERSION" | grep -q "-"; then
+            echo "tag=dev" >> $GITHUB_OUTPUT
+          else
+            echo "tag=latest" >> $GITHUB_OUTPUT
+          fi
+
       - name: Publish
         if: steps.check.outputs.skip != 'true'
-        run: npm publish $(ls librechat-agents-*.tgz) --access public --provenance
+        run: npm publish $(ls librechat-agents-*.tgz) --access public --provenance --tag ${{ steps.publish_tag.outputs.tag }}
         env:
           NODE_ENV: production
