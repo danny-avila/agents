@@ -117,7 +117,8 @@ export type RunConfig = {
   /**
    * Pre-constructed hook registry for this run. Hooks fire at lifecycle
    * points in `processStream` (RunStart, UserPromptSubmit, Stop,
-   * StopFailure) and — once the tool-hook PR lands — around tool calls.
+   * StopFailure) and around tool calls (PreToolUse, PostToolUse,
+   * PostToolUseFailure, PermissionDenied).
    *
    * Pass `undefined` (the default) to skip all hook dispatch. When a
    * registry is provided, the run attaches it to the `Graph` so internal
