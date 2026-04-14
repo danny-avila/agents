@@ -11,6 +11,7 @@ import type * as s from '@/types/stream';
 import type * as e from '@/common/enum';
 import type * as g from '@/types/graph';
 import type * as l from '@/types/llm';
+import type { ToolSessionMap } from '@/types/tools';
 import type { HookRegistry } from '@/hooks';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -138,6 +139,12 @@ export type RunConfig = {
   calibrationRatio?: number;
   /** Skip post-stream cleanup (clearHeavyState) — useful for tests that inspect graph state after processStream */
   skipCleanup?: boolean;
+  /**
+   * Initial session state to seed the Graph's ToolSessionMap.
+   * Used to carry over code environment sessions from skill file priming
+   * at run start, so ToolNode can inject session_id + files into tool calls.
+   */
+  initialSessions?: ToolSessionMap;
 };
 
 export type ProvidedCallbacks =
