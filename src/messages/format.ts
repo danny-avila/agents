@@ -973,8 +973,12 @@ export const formatAgentMessages = (
 
           if (discoveredTools.has(toolName)) {
             filteredContent.push(part);
-            if (toolName === Constants.SKILL_TOOL && skills?.size) {
-              const skillName = extractSkillName(part.tool_call.args);
+            if (
+              toolName === Constants.SKILL_TOOL &&
+              skills?.size != null &&
+              skills.size > 0
+            ) {
+              const skillName = extractSkillName(part.tool_call.args) ?? '';
               if (skillName) {
                 (pendingSkillNames ??= new Set()).add(skillName);
               }
@@ -1055,14 +1059,17 @@ export const formatAgentMessages = (
     }
 
     /** When tools filtering is off, still detect skill tool_calls for body reconstruction */
-    if (!discoveredTools && skills?.size) {
+    if (!discoveredTools && skills?.size != null && skills.size > 0) {
       const content = processedMessage.content;
       if (Array.isArray(content)) {
         for (const part of content) {
-          if (part.type !== ContentTypes.TOOL_CALL || part.tool_call?.name !== Constants.SKILL_TOOL) {
+          if (
+            part.type !== ContentTypes.TOOL_CALL ||
+            part.tool_call?.name !== Constants.SKILL_TOOL
+          ) {
             continue;
           }
-          const skillName = extractSkillName(part.tool_call.args);
+          const skillName = extractSkillName(part.tool_call.args) ?? '';
           if (skillName) {
             (pendingSkillNames ??= new Set()).add(skillName);
           }
@@ -1082,9 +1089,9 @@ export const formatAgentMessages = (
     // HumanMessages are excluded from the assistant's token distribution.
     const endMessageIndex = messages.length;
 
-    if (pendingSkillNames?.size) {
+    if (pendingSkillNames?.size != null && pendingSkillNames.size > 0) {
       for (const skillName of pendingSkillNames) {
-        const body = skills?.get(skillName);
+        const body = skills?.get(skillName) ?? '';
         if (body) {
           messages.push(
             new HumanMessage({
