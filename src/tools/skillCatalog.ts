@@ -104,13 +104,23 @@ function fitNamesOnly(
   entries: { name: string }[],
   budgetChars: number
 ): string {
-  const namesOnly = entries.map((s) => ({ name: s.name, description: '' }));
-  const full = formatEntries(namesOnly);
-  if (full.length <= budgetChars) return full;
+  // Format: "HEADER\n\n- name1\n- name2\n..."
+  // Running sum avoids O(n²) repeated string construction.
+  const prefix = HEADER.length + 2; // "HEADER\n\n"
+  const entryOverhead = 2; // "- "
+  let total = prefix;
+  let fitCount = 0;
 
-  for (let count = namesOnly.length - 1; count > 0; count--) {
-    const trimmed = formatEntries(namesOnly.slice(0, count));
-    if (trimmed.length <= budgetChars) return trimmed;
+  for (let i = 0; i < entries.length; i++) {
+    const added = (i > 0 ? 1 : 0) + entryOverhead + entries[i].name.length;
+    if (total + added > budgetChars) break;
+    total += added;
+    fitCount = i + 1;
   }
-  return '';
+
+  if (fitCount === 0) return '';
+  const namesOnly = entries
+    .slice(0, fitCount)
+    .map((s) => ({ name: s.name, description: '' }));
+  return formatEntries(namesOnly);
 }
