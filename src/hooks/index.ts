@@ -2,8 +2,9 @@
 //
 // Hook lifecycle system for `@librechat/agents`. Re-exported from
 // `src/index.ts` and consumed by `Run.processStream` (RunStart,
-// UserPromptSubmit, Stop, StopFailure) and `ToolNode.dispatchToolEvents`
-// (PreToolUse, PostToolUse, PostToolUseFailure, PermissionDenied).
+// UserPromptSubmit, Stop, StopFailure), `ToolNode.dispatchToolEvents`
+// (PreToolUse, PostToolUse, PostToolUseFailure, PermissionDenied),
+// and `createSummarizeNode` (PreCompact, PostCompact).
 export { HookRegistry } from './HookRegistry';
 export { executeHooks, DEFAULT_HOOK_TIMEOUT_MS } from './executeHooks';
 export {

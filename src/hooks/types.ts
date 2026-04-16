@@ -139,12 +139,28 @@ export interface StopFailureHookInput extends BaseHookInput {
 export interface PreCompactHookInput extends BaseHookInput {
   hook_event_name: 'PreCompact';
   messagesBeforeCount: number;
-  trigger: 'threshold' | 'manual' | 'error';
+  /**
+   * What triggered compaction. Matches `SummarizationTrigger.type` from the
+   * agent's summarization config. `'default'` means no trigger was
+   * configured and compaction fired because messages were pruned.
+   */
+  trigger:
+    | 'token_ratio'
+    | 'remaining_tokens'
+    | 'messages_to_refine'
+    | 'default'
+    | (string & {});
 }
 
 export interface PostCompactHookInput extends BaseHookInput {
   hook_event_name: 'PostCompact';
   summary: string;
+  /**
+   * Number of messages remaining after compaction. The summarize node
+   * returns a `removeAll` signal that clears all messages from state;
+   * the summary itself is injected into the system prompt, not as a
+   * message. This is `0` at the point of hook dispatch.
+   */
   messagesAfterCount: number;
 }
 
