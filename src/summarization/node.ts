@@ -9,8 +9,10 @@ import type { UsageMetadata, BaseMessage } from '@langchain/core/messages';
 import type { AgentContext } from '@/agents/AgentContext';
 import type { OnChunk } from '@/llm/invoke';
 import type * as t from '@/types';
+import type { HookRegistry } from '@/hooks';
 import { ContentTypes, GraphEvents, StepTypes, Providers } from '@/common';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
+import { executeHooks } from '@/hooks';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { createRemoveAllMessage } from '@/messages/reducer';
 import { getMaxOutputTokensKey } from '@/llm/request';
@@ -530,6 +532,31 @@ async function dispatchCompletionEvents(params: {
     );
   }
 
+  const sessionId = graph.runId ?? '';
+  if (graph.hookRegistry?.hasHookFor('PostCompact', sessionId) === true) {
+    const firstBlock = summaryBlock.content?.[0];
+    const summaryText =
+      firstBlock != null &&
+      typeof firstBlock === 'object' &&
+      'text' in firstBlock &&
+      typeof firstBlock.text === 'string'
+        ? firstBlock.text
+        : '';
+    await executeHooks({
+      registry: graph.hookRegistry,
+      input: {
+        hook_event_name: 'PostCompact',
+        runId: sessionId,
+        agentId,
+        summary: summaryText,
+        messagesAfterCount: 0,
+      },
+      sessionId,
+    }).catch(() => {
+      /* PostCompact is observational — swallow errors */
+    });
+  }
+
   agentContext.rebuildTokenMapAfterSummarization({});
 }
 
@@ -545,6 +572,7 @@ interface CreateSummarizeNodeParams {
     config?: RunnableConfig;
     runId?: string;
     isMultiAgent: boolean;
+    hookRegistry?: HookRegistry;
     dispatchRunStep: (
       runStep: t.RunStep,
       config?: RunnableConfig
@@ -648,6 +676,23 @@ export function createSummarizeNode({
         } satisfies t.SummarizeStartEvent,
         runnableConfig
       );
+    }
+
+    const sessionId = graph.runId ?? '';
+    if (graph.hookRegistry?.hasHookFor('PreCompact', sessionId) === true) {
+      await executeHooks({
+        registry: graph.hookRegistry,
+        input: {
+          hook_event_name: 'PreCompact',
+          runId: sessionId,
+          agentId: request.agentId,
+          messagesBeforeCount: messagesToRefine.length,
+          trigger: agentContext.summarizationConfig?.trigger?.type ?? 'default',
+        },
+        sessionId,
+      }).catch(() => {
+        /* PreCompact is observational — swallow errors */
+      });
     }
 
     const isSelfSummarizeModel =
