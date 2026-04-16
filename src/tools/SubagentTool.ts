@@ -20,18 +20,22 @@ CONSTRAINTS:
 - subagent_type must match one of the available types listed below.
 - The subagent cannot see your conversation history.`;
 
+const DESCRIPTION_PROP_DESCRIPTION =
+  'Complete task description for the subagent. This is the ONLY information it receives — include all necessary context, requirements, and constraints.';
+
+const SUBAGENT_TYPE_PROP_DESCRIPTION =
+  'Which subagent type to delegate to. Must be one of the available types.';
+
 export const SubagentToolSchema = {
   type: 'object',
   properties: {
     description: {
       type: 'string',
-      description:
-        'Complete task description for the subagent. This is the ONLY information it receives — include all necessary context, requirements, and constraints.',
+      description: DESCRIPTION_PROP_DESCRIPTION,
     },
     subagent_type: {
       type: 'string',
-      description:
-        'Which subagent type to delegate to. Must be one of the available types.',
+      description: SUBAGENT_TYPE_PROP_DESCRIPTION,
     },
   },
   required: ['description', 'subagent_type'] as string[],
@@ -46,6 +50,7 @@ export const SubagentToolDefinition: LCTool = {
 /**
  * Build the name, schema, and description params for `tool()` from available configs.
  * Used by `Graph.createAgentNode()` when constructing the runtime tool instance.
+ * Extends `SubagentToolSchema` by populating `subagent_type.enum` dynamically.
  */
 export function buildSubagentToolParams(configs: SubagentConfig[]): {
   name: string;
@@ -64,13 +69,12 @@ export function buildSubagentToolParams(configs: SubagentConfig[]): {
       properties: {
         description: {
           type: 'string',
-          description:
-            'Complete task description for the subagent. This is the ONLY information it receives — include all necessary context, requirements, and constraints.',
+          description: DESCRIPTION_PROP_DESCRIPTION,
         },
         subagent_type: {
           type: 'string',
           enum: types,
-          description: `Which subagent type to delegate to. Available: ${types.join(', ')}.`,
+          description: `${SUBAGENT_TYPE_PROP_DESCRIPTION} Available: ${types.join(', ')}.`,
         },
       },
       required: ['description', 'subagent_type'],

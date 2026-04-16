@@ -165,9 +165,6 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
       callerConfig
     );
 
-    /** SubagentStop is fire-and-forget; give microtask time to settle */
-    await new Promise((resolve) => setTimeout(resolve, 100));
-
     expect(captured).toBeDefined();
     expect(captured!.hook_event_name).toBe('SubagentStop');
     expect(captured!.agentType).toBe('researcher');

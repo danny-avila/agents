@@ -9,6 +9,7 @@ import {
   SubagentExecutor,
   filterSubagentResult,
   resolveSubagentConfigs,
+  buildChildInputs,
 } from '../subagent';
 import type { StandardGraph } from '@/graphs/Graph';
 
@@ -175,6 +176,90 @@ describe('resolveSubagentConfigs', () => {
     const resolved = resolveSubagentConfigs([badConfig], parentContext);
     expect(resolved).toHaveLength(0);
   });
+
+  it('throws on duplicate subagent types', () => {
+    const parentContext = AgentContext.fromConfig(parentInputs);
+    const dup1 = makeConfig('researcher');
+    const dup2 = makeConfig('researcher');
+    expect(() => resolveSubagentConfigs([dup1, dup2], parentContext)).toThrow(
+      /Duplicate subagent type "researcher"/
+    );
+  });
+});
+
+describe('buildChildInputs', () => {
+  const parentAgentInputs: AgentInputs = {
+    agentId: 'parent',
+    provider: Providers.OPENAI,
+    clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test' },
+    instructions: 'parent',
+    maxContextTokens: 8000,
+    subagentConfigs: [{ type: 'researcher', name: 'R', description: 'd' }],
+    maxSubagentDepth: 3,
+  };
+
+  it('strips subagentConfigs and maxSubagentDepth when allowNested is false', () => {
+    const config: ResolvedSubagentConfig = {
+      type: 'researcher',
+      name: 'R',
+      description: 'd',
+      agentInputs: parentAgentInputs,
+    };
+    const result = buildChildInputs(config, 'child', 3);
+    expect(result.subagentConfigs).toBeUndefined();
+    expect(result.maxSubagentDepth).toBeUndefined();
+  });
+
+  it('decrements maxSubagentDepth when allowNested is true', () => {
+    const config: ResolvedSubagentConfig = {
+      type: 'researcher',
+      name: 'R',
+      description: 'd',
+      agentInputs: parentAgentInputs,
+      allowNested: true,
+    };
+    const result = buildChildInputs(config, 'child', 3);
+    expect(result.maxSubagentDepth).toBe(2);
+    expect(result.subagentConfigs).toEqual(parentAgentInputs.subagentConfigs);
+  });
+
+  it('clamps decremented depth to 0 (never negative)', () => {
+    const config: ResolvedSubagentConfig = {
+      type: 'researcher',
+      name: 'R',
+      description: 'd',
+      agentInputs: parentAgentInputs,
+      allowNested: true,
+    };
+    const result = buildChildInputs(config, 'child', 0);
+    expect(result.maxSubagentDepth).toBe(0);
+  });
+
+  it('always strips toolDefinitions (forces traditional mode)', () => {
+    const inputsWithToolDefs: AgentInputs = {
+      ...parentAgentInputs,
+      toolDefinitions: [{ name: 't', description: 'x' }],
+    };
+    const config: ResolvedSubagentConfig = {
+      type: 'researcher',
+      name: 'R',
+      description: 'd',
+      agentInputs: inputsWithToolDefs,
+    };
+    const result = buildChildInputs(config, 'child', 3);
+    expect(result.toolDefinitions).toBeUndefined();
+  });
+
+  it('overrides agentId with the passed childAgentId', () => {
+    const config: ResolvedSubagentConfig = {
+      type: 'researcher',
+      name: 'R',
+      description: 'd',
+      agentInputs: parentAgentInputs,
+    };
+    const result = buildChildInputs(config, 'my-child', 3);
+    expect(result.agentId).toBe('my-child');
+  });
 });
 
 describe('SubagentExecutor', () => {
@@ -244,8 +329,8 @@ describe('SubagentExecutor', () => {
     expect(result.messages).toEqual([]);
   });
 
-  it('returns error when depth exceeds maxDepth', async () => {
-    const executor = createExecutor({ depth: 2, maxDepth: 2 });
+  it('returns error when maxDepth is 0 (nesting budget exhausted)', async () => {
+    const executor = createExecutor({ maxDepth: 0 });
     const result = await executor.execute({
       description: 'Do something',
       subagentType: 'researcher',
@@ -285,6 +370,108 @@ describe('SubagentExecutor', () => {
     expect(result.content).toContain('Subagent error');
     expect(result.content).toContain('Graph recursion limit reached');
     expect(result.messages).toEqual([]);
+  });
+
+  it('truncates long error messages to 200 chars', async () => {
+    const executor = createExecutor();
+    const longMessage = 'x'.repeat(500);
+    mockStandardGraphError(new Error(longMessage));
+
+    const result = await executor.execute({
+      description: 'Do something',
+      subagentType: 'researcher',
+    });
+
+    expect(result.content.length).toBeLessThan(longMessage.length);
+    expect(result.content).toContain('...');
+    expect(result.content).toContain('Subagent error');
+  });
+
+  it('builds child with decremented maxSubagentDepth when allowNested=true', async () => {
+    const nestedConfig: ResolvedSubagentConfig = {
+      type: 'nested',
+      name: 'Nested',
+      description: 'allows nesting',
+      allowNested: true,
+      agentInputs: {
+        ...makeChildInputs('nested-child'),
+        subagentConfigs: [
+          {
+            type: 'nested',
+            name: 'Nested',
+            description: 'allows nesting',
+            allowNested: true,
+          },
+        ],
+        maxSubagentDepth: 3,
+      },
+    };
+
+    const executor = new SubagentExecutor({
+      configs: new Map([[nestedConfig.type, nestedConfig]]),
+      parentRunId: 'test-run',
+      parentAgentId: 'parent',
+      maxDepth: 3,
+    });
+
+    let observedChildInputs: AgentInputs | undefined;
+    const GraphModule =
+      jest.requireActual<typeof import('@/graphs/Graph')>('@/graphs/Graph');
+    graphSpy = jest
+      .spyOn(GraphModule, 'StandardGraph')
+      .mockImplementation(
+        (input: ConstructorParameters<typeof StandardGraph>[0]) => {
+          observedChildInputs = input.agents[0];
+          return {
+            createWorkflow: (): { invoke: jest.Mock } => ({
+              invoke: jest.fn().mockResolvedValue({
+                messages: [new AIMessage('nested done')],
+              }),
+            }),
+            clearHeavyState: jest.fn(),
+          } as unknown as StandardGraph;
+        }
+      );
+
+    await executor.execute({
+      description: 'nested task',
+      subagentType: 'nested',
+    });
+
+    expect(observedChildInputs).toBeDefined();
+    expect(observedChildInputs!.maxSubagentDepth).toBe(2);
+    expect(observedChildInputs!.subagentConfigs).toBeDefined();
+  });
+
+  it('strips subagentConfigs from child when allowNested is not set', async () => {
+    let observedChildInputs: AgentInputs | undefined;
+    const GraphModule =
+      jest.requireActual<typeof import('@/graphs/Graph')>('@/graphs/Graph');
+    graphSpy = jest
+      .spyOn(GraphModule, 'StandardGraph')
+      .mockImplementation(
+        (input: ConstructorParameters<typeof StandardGraph>[0]) => {
+          observedChildInputs = input.agents[0];
+          return {
+            createWorkflow: (): { invoke: jest.Mock } => ({
+              invoke: jest.fn().mockResolvedValue({
+                messages: [new AIMessage('done')],
+              }),
+            }),
+            clearHeavyState: jest.fn(),
+          } as unknown as StandardGraph;
+        }
+      );
+
+    const executor = createExecutor({ maxDepth: 3 });
+    await executor.execute({
+      description: 'task',
+      subagentType: 'researcher',
+    });
+
+    expect(observedChildInputs).toBeDefined();
+    expect(observedChildInputs!.subagentConfigs).toBeUndefined();
+    expect(observedChildInputs!.maxSubagentDepth).toBeUndefined();
   });
 
   describe('hooks', () => {
@@ -340,9 +527,6 @@ describe('SubagentExecutor', () => {
         description: 'Test task',
         subagentType: 'researcher',
       });
-
-      /** SubagentStop fires fire-and-forget; give microtask time to settle */
-      await new Promise((resolve) => setTimeout(resolve, 50));
 
       expect(capturedStop).toBeDefined();
       const input = capturedStop as Record<string, unknown>;

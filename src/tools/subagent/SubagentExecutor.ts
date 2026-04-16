@@ -1,19 +1,20 @@
 import { nanoid } from 'nanoid';
 import { HumanMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
-import type { AggregatedHookResult, HookRegistry } from '@/hooks';
 import type {
   AgentInputs,
   ResolvedSubagentConfig,
   SubagentConfig,
   TokenCounter,
 } from '@/types';
+import type { AggregatedHookResult, HookRegistry } from '@/hooks';
 import type { AgentContext } from '@/agents/AgentContext';
 import { StandardGraph } from '@/graphs/Graph';
 import { executeHooks } from '@/hooks';
 
 const DEFAULT_MAX_TURNS = 25;
 const RECURSION_MULTIPLIER = 3;
+const ERROR_MESSAGE_MAX_CHARS = 200;
 
 const HOOK_FALLBACK: AggregatedHookResult = Object.freeze({
   additionalContexts: [] as string[],
@@ -38,7 +39,7 @@ export type SubagentExecutorOptions = {
   parentRunId: string;
   parentAgentId?: string;
   tokenCounter?: TokenCounter;
-  depth?: number;
+  /** Remaining nesting budget. 0 or negative blocks execution. */
   maxDepth?: number;
 };
 
@@ -49,7 +50,6 @@ export class SubagentExecutor {
   private readonly parentRunId: string;
   private readonly parentAgentId?: string;
   private readonly tokenCounter?: TokenCounter;
-  private readonly depth: number;
   private readonly maxDepth: number;
 
   constructor(options: SubagentExecutorOptions) {
@@ -59,7 +59,6 @@ export class SubagentExecutor {
     this.parentRunId = options.parentRunId;
     this.parentAgentId = options.parentAgentId;
     this.tokenCounter = options.tokenCounter;
-    this.depth = options.depth ?? 0;
     this.maxDepth = options.maxDepth ?? 1;
   }
 
@@ -75,9 +74,9 @@ export class SubagentExecutor {
       };
     }
 
-    if (this.depth >= this.maxDepth) {
+    if (this.maxDepth <= 0) {
       return {
-        content: `Error: Maximum subagent nesting depth (${this.maxDepth}) exceeded.`,
+        content: 'Error: Maximum subagent nesting depth exceeded.',
         messages: [],
       };
     }
@@ -104,6 +103,11 @@ export class SubagentExecutor {
         matchQuery: subagentType,
       }).catch((): AggregatedHookResult => HOOK_FALLBACK);
 
+      /**
+       * `ask` is treated identically to `deny` in the subagent context:
+       * subagents are non-interactive, so there is no prompt path for `ask`.
+       * Both decisions block execution and return a "Blocked" tool result.
+       */
       if (hookResult.decision === 'deny' || hookResult.decision === 'ask') {
         return {
           content: `Blocked: ${hookResult.reason ?? 'Blocked by hook'}`,
@@ -112,7 +116,7 @@ export class SubagentExecutor {
       }
     }
 
-    const childInputs = buildChildInputs(config, childAgentId);
+    const childInputs = buildChildInputs(config, childAgentId, this.maxDepth);
     const childRunId = `${this.parentRunId}_sub_${nanoid(8)}`;
     const maxTurns = config.maxTurns ?? DEFAULT_MAX_TURNS;
 
@@ -134,10 +138,9 @@ export class SubagentExecutor {
         }
       );
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
       childGraph.clearHeavyState();
       return {
-        content: `Subagent error: ${message}`,
+        content: `Subagent error: ${truncateErrorMessage(error)}`,
         messages: [],
       };
     }
@@ -147,7 +150,13 @@ export class SubagentExecutor {
     if (
       this.hookRegistry?.hasHookFor('SubagentStop', this.parentRunId) === true
     ) {
-      executeHooks({
+      /**
+       * Awaited (not fire-and-forget) for deterministic test synchronization
+       * and consistency with PostCompact. The parent is already waiting on the
+       * tool result, so the small extra latency is acceptable. Errors are
+       * swallowed — SubagentStop is observational.
+       */
+      await executeHooks({
         registry: this.hookRegistry,
         input: {
           hook_event_name: 'SubagentStop',
@@ -208,13 +217,14 @@ export function filterSubagentResult(messages: BaseMessage[]): string {
 
 /**
  * Resolve self-spawn configs by filling in agentInputs from the parent context.
- * Returns configs with agentInputs guaranteed present.
+ * Returns configs with agentInputs guaranteed present. Throws on duplicate
+ * `type` values to prevent silent config shadowing.
  */
 export function resolveSubagentConfigs(
   configs: SubagentConfig[],
   parentContext: AgentContext
 ): ResolvedSubagentConfig[] {
-  return configs
+  const resolved = configs
     .map((config) => {
       if (config.agentInputs != null) {
         return config as ResolvedSubagentConfig;
@@ -228,12 +238,31 @@ export function resolveSubagentConfigs(
       } as ResolvedSubagentConfig;
     })
     .filter((c): c is ResolvedSubagentConfig => c != null);
+
+  const seenTypes = new Set<string>();
+  for (const config of resolved) {
+    if (seenTypes.has(config.type)) {
+      throw new Error(
+        `Duplicate subagent type "${config.type}". Each SubagentConfig must have a unique "type" field.`
+      );
+    }
+    seenTypes.add(config.type);
+  }
+
+  return resolved;
 }
 
-/** Build child AgentInputs from a resolved config, stripping nesting and event-driven fields. */
-function buildChildInputs(
+/**
+ * Build child AgentInputs from a resolved config, stripping nesting and
+ * event-driven fields. When `allowNested: true`, the child's
+ * `maxSubagentDepth` is decremented so that depth is consumed as the call
+ * chain deepens across graph boundaries — the parent's executor-level check
+ * alone cannot see into the child graph's separate executor.
+ */
+export function buildChildInputs(
   config: ResolvedSubagentConfig,
-  childAgentId: string
+  childAgentId: string,
+  parentMaxDepth: number
 ): AgentInputs {
   const { agentInputs } = config;
   const childInputs: AgentInputs = {
@@ -242,10 +271,20 @@ function buildChildInputs(
     toolDefinitions: undefined,
   };
 
-  if (config.allowNested !== true) {
+  if (config.allowNested === true) {
+    childInputs.maxSubagentDepth = Math.max(0, parentMaxDepth - 1);
+  } else {
     childInputs.subagentConfigs = undefined;
     childInputs.maxSubagentDepth = undefined;
   }
 
   return childInputs;
+}
+
+function truncateErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.length <= ERROR_MESSAGE_MAX_CHARS) {
+    return message;
+  }
+  return `${message.slice(0, ERROR_MESSAGE_MAX_CHARS)}...`;
 }

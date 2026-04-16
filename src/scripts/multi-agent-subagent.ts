@@ -48,7 +48,7 @@ async function testSubagentPrimitive() {
   console.log(`Provider: ${provider}`);
   console.log(`Model: ${modelName}\n`);
 
-  const { contentParts, aggregateContent } = createContentAggregator();
+  const { aggregateContent } = createContentAggregator();
 
   const parentAgent: t.AgentInputs = {
     agentId: 'supervisor',
@@ -188,14 +188,14 @@ Include brief explanations. Use clean, idiomatic code.`,
       const type = msg._getType();
       if (type === 'tool') {
         const name = 'name' in msg ? msg.name : 'unknown';
-        const content =
+        const rawContent =
           typeof msg.content === 'string'
-            ? msg.content.slice(0, 200)
-            : JSON.stringify(msg.content).slice(0, 200);
+            ? msg.content
+            : JSON.stringify(msg.content);
+        const content = rawContent.slice(0, 200);
+        const truncated = rawContent.length > 200 ? '...' : '';
         console.log(`[ToolMessage] name=${name}`);
-        console.log(
-          `  content: ${content}${(msg.content as string).length > 200 ? '...' : ''}\n`
-        );
+        console.log(`  content: ${content}${truncated}\n`);
       } else if (type === 'ai') {
         const content =
           typeof msg.content === 'string'

@@ -1176,15 +1176,20 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
         const subagentTool = tool(async (rawInput, config) => {
           const input = rawInput as {
-            description: string;
-            subagent_type: string;
+            description?: string;
+            subagent_type?: string;
           };
-          const threadId = config.configurable?.thread_id as
-            | string
-            | undefined;
+          const description =
+            typeof input.description === 'string' &&
+            input.description.trim().length > 0
+              ? input.description
+              : 'No task description provided';
+          const subagentType =
+            typeof input.subagent_type === 'string' ? input.subagent_type : '';
+          const threadId = config.configurable?.thread_id as string | undefined;
           const result = await executor.execute({
-            description: input.description,
-            subagentType: input.subagent_type,
+            description,
+            subagentType,
             threadId,
           });
           return result.content;
