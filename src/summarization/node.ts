@@ -685,7 +685,7 @@ export function createSummarizeNode({
     const sessionId = graph.runId ?? '';
     if (graph.hookRegistry?.hasHookFor('PreCompact', sessionId) === true) {
       const threadId = (
-        config?.configurable as Record<string, unknown> | undefined
+        runnableConfig?.configurable as Record<string, unknown> | undefined
       )?.thread_id as string | undefined;
       await executeHooks({
         registry: graph.hookRegistry,
