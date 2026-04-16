@@ -131,6 +131,8 @@ describe('Compaction hook integration', () => {
       expect(captured!.hook_event_name).toBe('PreCompact');
       expect(captured!.messagesBeforeCount).toBeGreaterThan(0);
       expect(captured!.runId).toBe('compact-run');
+      expect(captured!.trigger).toBe('default');
+      expect(captured!.agentId).toBeDefined();
     });
   });
 
@@ -153,20 +155,39 @@ describe('Compaction hook integration', () => {
 
       expect(captured).toBeDefined();
       expect(captured!.hook_event_name).toBe('PostCompact');
-      expect(captured!.summary.length).toBeGreaterThan(0);
+      expect(captured!.summary).toContain('Summary');
       expect(captured!.messagesAfterCount).toBe(0);
+      expect(captured!.agentId).toBeDefined();
     });
   });
 
   describe('error resilience', () => {
-    it('throwing hook does not crash compaction', async () => {
+    it('throwing PreCompact hook does not crash compaction', async () => {
       const registry = new HookRegistry();
       const throwingHook: HookCallback<
         'PreCompact'
       > = async (): Promise<PreCompactHookOutput> => {
-        throw new Error('hook crash');
+        throw new Error('pre hook crash');
       };
       registry.register('PreCompact', { hooks: [throwingHook] });
+
+      const run = await createCompactingRun(tokenCounter, registry);
+      run.Graph!.overrideTestModel(['Answer after compaction.']);
+      const inputs = buildConversation();
+
+      await expect(
+        run.processStream(inputs, callerConfig)
+      ).resolves.not.toThrow();
+    });
+
+    it('throwing PostCompact hook does not crash compaction', async () => {
+      const registry = new HookRegistry();
+      const throwingHook: HookCallback<
+        'PostCompact'
+      > = async (): Promise<PostCompactHookOutput> => {
+        throw new Error('post hook crash');
+      };
+      registry.register('PostCompact', { hooks: [throwingHook] });
 
       const run = await createCompactingRun(tokenCounter, registry);
       run.Graph!.overrideTestModel(['Answer after compaction.']);
