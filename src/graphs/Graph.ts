@@ -1207,6 +1207,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             },
             runId: this.runId,
             isMultiAgent: this.isMultiAgentGraph(),
+            hookRegistry: this.hookRegistry,
             dispatchRunStep: async (runStep, nodeConfig) => {
               this.contentData.push(runStep);
               this.contentIndexMap.set(runStep.id, runStep.index);

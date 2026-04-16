@@ -7,6 +7,7 @@ import {
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { UsageMetadata, BaseMessage } from '@langchain/core/messages';
 import type { AgentContext } from '@/agents/AgentContext';
+import type { HookRegistry } from '@/hooks';
 import type { OnChunk } from '@/llm/invoke';
 import type * as t from '@/types';
 import { ContentTypes, GraphEvents, StepTypes, Providers } from '@/common';
@@ -17,6 +18,7 @@ import { getMaxOutputTokensKey } from '@/llm/request';
 import { addCacheControl } from '@/messages/cache';
 import { initializeModel } from '@/llm/init';
 import { getChunkContent } from '@/stream';
+import { executeHooks } from '@/hooks';
 
 const SUMMARIZATION_PARAM_KEYS = new Set(['maxSummaryTokens']);
 
@@ -530,6 +532,35 @@ async function dispatchCompletionEvents(params: {
     );
   }
 
+  const sessionId = graph.runId ?? '';
+  if (graph.hookRegistry?.hasHookFor('PostCompact', sessionId) === true) {
+    const threadId = (
+      runnableConfig?.configurable as Record<string, unknown> | undefined
+    )?.thread_id as string | undefined;
+    const firstBlock = summaryBlock.content?.[0];
+    const summaryText =
+      firstBlock != null &&
+      typeof firstBlock === 'object' &&
+      'text' in firstBlock &&
+      typeof firstBlock.text === 'string'
+        ? firstBlock.text
+        : '';
+    await executeHooks({
+      registry: graph.hookRegistry,
+      input: {
+        hook_event_name: 'PostCompact',
+        runId: sessionId,
+        threadId,
+        agentId,
+        summary: summaryText,
+        messagesAfterCount: 0,
+      },
+      sessionId,
+    }).catch(() => {
+      /* PostCompact is observational — swallow errors */
+    });
+  }
+
   agentContext.rebuildTokenMapAfterSummarization({});
 }
 
@@ -545,6 +576,7 @@ interface CreateSummarizeNodeParams {
     config?: RunnableConfig;
     runId?: string;
     isMultiAgent: boolean;
+    hookRegistry?: HookRegistry;
     dispatchRunStep: (
       runStep: t.RunStep,
       config?: RunnableConfig
@@ -648,6 +680,27 @@ export function createSummarizeNode({
         } satisfies t.SummarizeStartEvent,
         runnableConfig
       );
+    }
+
+    const sessionId = graph.runId ?? '';
+    if (graph.hookRegistry?.hasHookFor('PreCompact', sessionId) === true) {
+      const threadId = (
+        runnableConfig?.configurable as Record<string, unknown> | undefined
+      )?.thread_id as string | undefined;
+      await executeHooks({
+        registry: graph.hookRegistry,
+        input: {
+          hook_event_name: 'PreCompact',
+          runId: sessionId,
+          threadId,
+          agentId: request.agentId,
+          messagesBeforeCount: messagesToRefine.length,
+          trigger: agentContext.summarizationConfig?.trigger?.type ?? 'default',
+        },
+        sessionId,
+      }).catch(() => {
+        /* PreCompact is observational — swallow errors */
+      });
     }
 
     const isSelfSummarizeModel =
