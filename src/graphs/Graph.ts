@@ -29,7 +29,6 @@ import {
   GraphNodeKeys,
   ContentTypes,
   GraphEvents,
-  Constants,
   Providers,
   StepTypes,
 } from '@/common';
@@ -42,6 +41,7 @@ import {
   sleep,
 } from '@/utils';
 import { SubagentExecutor, resolveSubagentConfigs } from '@/tools/subagent';
+import { buildSubagentToolParams } from '@/tools/SubagentTool';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
@@ -1170,52 +1170,30 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           hookRegistry: this.hookRegistry,
           parentRunId: this.runId ?? '',
           parentAgentId: agentContext.agentId,
+          tokenCounter: agentContext.tokenCounter,
           maxDepth: agentContext.maxSubagentDepth ?? 1,
         });
 
-        const types = resolvedConfigs.map((c) => c.type);
-        const typeDescriptions = resolvedConfigs
-          .map((c) => `- "${c.type}" (${c.name}): ${c.description}`)
-          .join('\n');
+        const subagentTool = tool(async (rawInput, config) => {
+          const input = rawInput as {
+            description: string;
+            subagent_type: string;
+          };
+          const threadId = config.configurable?.thread_id as
+            | string
+            | undefined;
+          const result = await executor.execute({
+            description: input.description,
+            subagentType: input.subagent_type,
+            threadId,
+          });
+          return result.content;
+        }, buildSubagentToolParams(resolvedConfigs));
 
-        const subagentTool = tool(
-          async (rawInput) => {
-            const input = rawInput as {
-              description: string;
-              subagent_type: string;
-            };
-            const result = await executor.execute({
-              description: input.description,
-              subagentType: input.subagent_type,
-            });
-            return result.content;
-          },
-          {
-            name: Constants.SUBAGENT,
-            schema: {
-              type: 'object',
-              properties: {
-                description: {
-                  type: 'string',
-                  description:
-                    'Complete task description for the subagent. This is the ONLY information it receives.',
-                },
-                subagent_type: {
-                  type: 'string',
-                  enum: types,
-                  description: `Which subagent type to delegate to. Available: ${types.join(', ')}.`,
-                },
-              },
-              required: ['description', 'subagent_type'],
-            },
-            description: `Delegate a task to a specialized subagent with isolated context. Only the final text result returns.\n\nAvailable types:\n${typeDescriptions}`,
-          }
-        );
-
-        agentContext.graphTools = [
-          ...((agentContext.graphTools as t.GenericTool[] | undefined) ?? []),
-          subagentTool as unknown as t.GenericTool,
-        ];
+        if (!agentContext.graphTools) {
+          agentContext.graphTools = [];
+        }
+        (agentContext.graphTools as t.GenericTool[]).push(subagentTool);
       }
     }
 

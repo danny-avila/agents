@@ -1,6 +1,6 @@
 import { Constants } from '@/common';
 import type { SubagentConfig } from '@/types';
-import type { LCTool } from '@/types/tools';
+import type { JsonSchemaType, LCTool } from '@/types/tools';
 
 export const SubagentToolName = Constants.SUBAGENT;
 
@@ -44,12 +44,14 @@ export const SubagentToolDefinition: LCTool = {
 };
 
 /**
- * Create a SubagentTool LCTool definition with dynamic enum and description
- * populated from the available subagent configs.
+ * Build the name, schema, and description params for `tool()` from available configs.
+ * Used by `Graph.createAgentNode()` when constructing the runtime tool instance.
  */
-export function createSubagentToolDefinition(
-  configs: SubagentConfig[]
-): LCTool {
+export function buildSubagentToolParams(configs: SubagentConfig[]): {
+  name: string;
+  schema: JsonSchemaType;
+  description: string;
+} {
   const types = configs.map((c) => c.type);
   const typeDescriptions = configs
     .map((c) => `- "${c.type}" (${c.name}): ${c.description}`)
@@ -57,8 +59,7 @@ export function createSubagentToolDefinition(
 
   return {
     name: SubagentToolName,
-    description: `${SubagentToolDescription}\n\nAvailable subagent types:\n${typeDescriptions}`,
-    parameters: {
+    schema: {
       type: 'object',
       properties: {
         description: {
@@ -74,5 +75,22 @@ export function createSubagentToolDefinition(
       },
       required: ['description', 'subagent_type'],
     },
+    description: `${SubagentToolDescription}\n\nAvailable types:\n${typeDescriptions}`,
+  };
+}
+
+/**
+ * Create a SubagentTool LCTool definition with dynamic enum and description
+ * populated from the available subagent configs.
+ * Used for the tool registry in event-driven mode.
+ */
+export function createSubagentToolDefinition(
+  configs: SubagentConfig[]
+): LCTool {
+  const params = buildSubagentToolParams(configs);
+  return {
+    name: params.name,
+    description: params.description,
+    parameters: params.schema,
   };
 }

@@ -6,6 +6,7 @@ import type {
   AgentInputs,
   ResolvedSubagentConfig,
   SubagentConfig,
+  TokenCounter,
 } from '@/types';
 import type { AgentContext } from '@/agents/AgentContext';
 import { StandardGraph } from '@/graphs/Graph';
@@ -22,6 +23,7 @@ const HOOK_FALLBACK: AggregatedHookResult = Object.freeze({
 export type SubagentExecuteParams = {
   description: string;
   subagentType: string;
+  threadId?: string;
 };
 
 export type SubagentExecuteResult = {
@@ -35,7 +37,7 @@ export type SubagentExecutorOptions = {
   hookRegistry?: HookRegistry;
   parentRunId: string;
   parentAgentId?: string;
-  parentThreadId?: string;
+  tokenCounter?: TokenCounter;
   depth?: number;
   maxDepth?: number;
 };
@@ -46,7 +48,7 @@ export class SubagentExecutor {
   private readonly hookRegistry?: HookRegistry;
   private readonly parentRunId: string;
   private readonly parentAgentId?: string;
-  private readonly parentThreadId?: string;
+  private readonly tokenCounter?: TokenCounter;
   private readonly depth: number;
   private readonly maxDepth: number;
 
@@ -56,13 +58,13 @@ export class SubagentExecutor {
     this.hookRegistry = options.hookRegistry;
     this.parentRunId = options.parentRunId;
     this.parentAgentId = options.parentAgentId;
-    this.parentThreadId = options.parentThreadId;
+    this.tokenCounter = options.tokenCounter;
     this.depth = options.depth ?? 0;
     this.maxDepth = options.maxDepth ?? 1;
   }
 
   async execute(params: SubagentExecuteParams): Promise<SubagentExecuteResult> {
-    const { description, subagentType } = params;
+    const { description, subagentType, threadId } = params;
     const config = this.configs.get(subagentType);
 
     if (!config) {
@@ -92,7 +94,7 @@ export class SubagentExecutor {
         input: {
           hook_event_name: 'SubagentStart',
           runId: this.parentRunId,
-          threadId: this.parentThreadId,
+          threadId,
           parentAgentId: this.parentAgentId,
           agentId: childAgentId,
           agentType: subagentType,
@@ -118,6 +120,7 @@ export class SubagentExecutor {
       runId: childRunId,
       signal: this.parentSignal,
       agents: [childInputs],
+      tokenCounter: this.tokenCounter,
     });
 
     let result: { messages: BaseMessage[] };
@@ -125,7 +128,10 @@ export class SubagentExecutor {
       const workflow = childGraph.createWorkflow();
       result = await workflow.invoke(
         { messages: [new HumanMessage(description)] },
-        { recursionLimit: maxTurns * RECURSION_MULTIPLIER }
+        {
+          recursionLimit: maxTurns * RECURSION_MULTIPLIER,
+          signal: this.parentSignal,
+        }
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -146,7 +152,7 @@ export class SubagentExecutor {
         input: {
           hook_event_name: 'SubagentStop',
           runId: this.parentRunId,
-          threadId: this.parentThreadId,
+          threadId,
           agentId: childAgentId,
           agentType: subagentType,
           messages: result.messages,
@@ -189,13 +195,7 @@ export function filterSubagentResult(messages: BaseMessage[]): string {
     for (const block of content) {
       if (typeof block === 'string') {
         textParts.push(block);
-      } else if (
-        typeof block === 'object' &&
-        block != null &&
-        'type' in block &&
-        block.type === 'text' &&
-        'text' in block
-      ) {
+      } else if ('type' in block && block.type === 'text' && 'text' in block) {
         textParts.push(block.text as string);
       }
     }
