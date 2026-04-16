@@ -131,6 +131,7 @@ describe('Compaction hook integration', () => {
       expect(captured!.hook_event_name).toBe('PreCompact');
       expect(captured!.messagesBeforeCount).toBeGreaterThan(0);
       expect(captured!.runId).toBe('compact-run');
+      expect(captured!.threadId).toBe('compact-test');
       expect(captured!.trigger).toBe('default');
       expect(captured!.agentId).toBeDefined();
     });
@@ -155,7 +156,8 @@ describe('Compaction hook integration', () => {
 
       expect(captured).toBeDefined();
       expect(captured!.hook_event_name).toBe('PostCompact');
-      expect(captured!.summary).toContain('Summary');
+      expect(captured!.threadId).toBe('compact-test');
+      expect(captured!.summary).toBe(SUMMARY_RESPONSE);
       expect(captured!.messagesAfterCount).toBe(0);
       expect(captured!.agentId).toBeDefined();
     });
