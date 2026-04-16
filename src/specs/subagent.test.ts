@@ -219,4 +219,87 @@ describe('Subagent Integration', () => {
     );
     expect(subagentTool).toBeDefined();
   });
+
+  it('should not create subagent tool when maxSubagentDepth is 0', async () => {
+    const agentWithZeroDepth: t.AgentInputs = {
+      ...createParentAgent(),
+      agentId: 'zero-depth',
+      maxSubagentDepth: 0,
+    };
+
+    const run = await Run.create<t.IState>({
+      runId: `zero-depth-${Date.now()}`,
+      graphConfig: {
+        type: 'standard',
+        agents: [agentWithZeroDepth],
+      },
+      returnContent: true,
+      skipCleanup: true,
+    });
+
+    const context = (run.Graph as StandardGraph).agentContexts.get(
+      'zero-depth'
+    );
+    const tools = context?.graphTools as t.GenericTool[] | undefined;
+    const subagentTool = tools?.find(
+      (t) => 'name' in t && t.name === Constants.SUBAGENT
+    );
+    expect(subagentTool).toBeUndefined();
+  });
+
+  it('should account for subagent tool schema in toolSchemaTokens', async () => {
+    /** Simple char-count tokenizer — deterministic, lets us assert presence. */
+    const tokenCounter: t.TokenCounter = (message) => {
+      const content = message.content;
+      if (typeof content === 'string') return content.length;
+      if (Array.isArray(content)) return JSON.stringify(content).length;
+      return JSON.stringify(content).length;
+    };
+
+    const agentWithSubagent = createParentAgent();
+    const runWith = await Run.create<t.IState>({
+      runId: `with-sub-${Date.now()}`,
+      graphConfig: {
+        type: 'standard',
+        agents: [agentWithSubagent],
+      },
+      tokenCounter,
+      returnContent: true,
+      skipCleanup: true,
+    });
+
+    const agentWithoutSubagent: t.AgentInputs = {
+      agentId: 'plain',
+      provider: Providers.OPENAI,
+      clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+      instructions:
+        'You are a supervisor. Delegate research tasks using the subagent tool.',
+      maxContextTokens: 8000,
+    };
+    const runWithout = await Run.create<t.IState>({
+      runId: `without-sub-${Date.now()}`,
+      graphConfig: {
+        type: 'standard',
+        agents: [agentWithoutSubagent],
+      },
+      tokenCounter,
+      returnContent: true,
+      skipCleanup: true,
+    });
+
+    const contextWith = (runWith.Graph as StandardGraph).agentContexts.get(
+      'parent'
+    );
+    const contextWithout = (
+      runWithout.Graph as StandardGraph
+    ).agentContexts.get('plain');
+
+    await contextWith?.tokenCalculationPromise;
+    await contextWithout?.tokenCalculationPromise;
+
+    /** Subagent tool schema is ~600 chars; expect measurable difference. */
+    expect(contextWith!.toolSchemaTokens).toBeGreaterThan(
+      contextWithout!.toolSchemaTokens
+    );
+  });
 });

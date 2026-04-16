@@ -686,8 +686,20 @@ export class AgentContext {
     let toolTokens = 0;
     const countedToolNames = new Set<string>();
 
-    if (this.tools && this.tools.length > 0) {
-      for (const tool of this.tools) {
+    /**
+     * Iterate both `tools` (user-provided instance tools) and `graphTools`
+     * (graph-managed tools like handoff + subagent). `graphTools` is often
+     * populated after `fromConfig()` kicks off the initial calculation, so
+     * callers that mutate `graphTools` must re-trigger this method to
+     * refresh `toolSchemaTokens`.
+     */
+    const instanceTools: t.GraphTools = [
+      ...((this.tools as t.GenericTool[] | undefined) ?? []),
+      ...((this.graphTools as t.GenericTool[] | undefined) ?? []),
+    ];
+
+    if (instanceTools.length > 0) {
+      for (const tool of instanceTools) {
         const genericTool = tool as Record<string, unknown>;
         if (
           genericTool.schema != null &&

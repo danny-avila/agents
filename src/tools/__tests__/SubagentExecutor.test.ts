@@ -382,9 +382,28 @@ describe('SubagentExecutor', () => {
       subagentType: 'researcher',
     });
 
-    expect(result.content.length).toBeLessThan(longMessage.length);
-    expect(result.content).toContain('...');
-    expect(result.content).toContain('Subagent error');
+    /**
+     * Expected composition: "Subagent error: " (16) + 200 truncated chars + "..." (3) = 219.
+     * Assert the exact envelope to catch regressions in the truncation constant.
+     */
+    const MAX_TRUNCATED_LENGTH = 'Subagent error: '.length + 200 + '...'.length;
+    expect(result.content.length).toBe(MAX_TRUNCATED_LENGTH);
+    expect(result.content.startsWith('Subagent error: ')).toBe(true);
+    expect(result.content.endsWith('...')).toBe(true);
+  });
+
+  it('does not truncate short error messages', async () => {
+    const executor = createExecutor();
+    const shortMessage = 'brief error detail';
+    mockStandardGraphError(new Error(shortMessage));
+
+    const result = await executor.execute({
+      description: 'Do something',
+      subagentType: 'researcher',
+    });
+
+    expect(result.content).toBe(`Subagent error: ${shortMessage}`);
+    expect(result.content.endsWith('...')).toBe(false);
   });
 
   it('builds child with decremented maxSubagentDepth when allowNested=true', async () => {

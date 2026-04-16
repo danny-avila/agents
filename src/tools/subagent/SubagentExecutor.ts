@@ -258,6 +258,14 @@ export function resolveSubagentConfigs(
  * `maxSubagentDepth` is decremented so that depth is consumed as the call
  * chain deepens across graph boundaries — the parent's executor-level check
  * alone cannot see into the child graph's separate executor.
+ *
+ * @remarks Advanced utility: exported primarily for testing and by
+ * {@link SubagentExecutor}. Host applications configuring subagents should
+ * not need to call this directly — it is invoked internally when a subagent
+ * tool is dispatched. The depth-countdown contract (parent's `maxDepth` in,
+ * child's decremented `maxSubagentDepth` on the returned inputs) is the
+ * mechanism that bounds nesting across graph boundaries; callers must
+ * respect it.
  */
 export function buildChildInputs(
   config: ResolvedSubagentConfig,

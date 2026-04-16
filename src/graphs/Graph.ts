@@ -1155,9 +1155,21 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       throw new Error(`Agent context not found for agentId: ${agentId}`);
     }
 
+    /**
+     * Depth countdown across graph boundaries: the parent's `maxSubagentDepth`
+     * becomes this executor's `maxDepth`. When the child graph is constructed,
+     * `buildChildInputs()` decrements `maxSubagentDepth` on the child's
+     * `AgentInputs` (only when `allowNested: true`; otherwise subagentConfigs
+     * are stripped entirely). The child graph's own `createAgentNode()` then
+     * reads the decremented value here and creates a narrower executor —
+     * recursion is bounded even though each graph has its own separate
+     * executor instance.
+     */
+    const effectiveSubagentDepth = agentContext.maxSubagentDepth ?? 1;
     if (
       agentContext.subagentConfigs != null &&
-      agentContext.subagentConfigs.length > 0
+      agentContext.subagentConfigs.length > 0 &&
+      effectiveSubagentDepth > 0
     ) {
       const resolvedConfigs = resolveSubagentConfigs(
         agentContext.subagentConfigs,
@@ -1171,7 +1183,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           parentRunId: this.runId ?? '',
           parentAgentId: agentContext.agentId,
           tokenCounter: agentContext.tokenCounter,
-          maxDepth: agentContext.maxSubagentDepth ?? 1,
+          maxDepth: effectiveSubagentDepth,
         });
 
         const subagentTool = tool(async (rawInput, config) => {
@@ -1199,6 +1211,30 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           agentContext.graphTools = [];
         }
         (agentContext.graphTools as t.GenericTool[]).push(subagentTool);
+
+        /**
+         * Refresh toolSchemaTokens to include the subagent tool's schema.
+         * `calculateInstructionTokens()` was kicked off in `fromConfig()`
+         * before graphTools was populated, so its result did not count this
+         * tool. Without this retrigger, token-budget/pruning logic
+         * underestimates prompt overhead.
+         */
+        if (agentContext.tokenCounter) {
+          const { tokenCounter, baseIndexTokenCountMap } = agentContext;
+          agentContext.tokenCalculationPromise = agentContext
+            .calculateInstructionTokens(tokenCounter)
+            .then(() => {
+              agentContext.updateTokenMapWithInstructions(
+                baseIndexTokenCountMap
+              );
+            })
+            .catch((err) => {
+              console.error(
+                'Error recalculating instruction tokens after subagent tool injection:',
+                err
+              );
+            });
+        }
       }
     }
 
