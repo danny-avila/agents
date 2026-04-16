@@ -1,5 +1,6 @@
 /* eslint-disable no-console */
 import { nanoid } from 'nanoid';
+import { tool } from '@langchain/core/tools';
 import { ToolNode } from '@langchain/langgraph/prebuilt';
 import { Runnable, RunnableConfig } from '@langchain/core/runnables';
 import { ToolMessage, AIMessageChunk } from '@langchain/core/messages';
@@ -28,6 +29,7 @@ import {
   GraphNodeKeys,
   ContentTypes,
   GraphEvents,
+  Constants,
   Providers,
   StepTypes,
 } from '@/common';
@@ -39,6 +41,7 @@ import {
   joinKeys,
   sleep,
 } from '@/utils';
+import { SubagentExecutor, resolveSubagentConfigs } from '@/tools/subagent';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
@@ -1150,6 +1153,70 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     const agentContext = this.agentContexts.get(agentId);
     if (!agentContext) {
       throw new Error(`Agent context not found for agentId: ${agentId}`);
+    }
+
+    if (
+      agentContext.subagentConfigs != null &&
+      agentContext.subagentConfigs.length > 0
+    ) {
+      const resolvedConfigs = resolveSubagentConfigs(
+        agentContext.subagentConfigs,
+        agentContext
+      );
+      if (resolvedConfigs.length > 0) {
+        const executor = new SubagentExecutor({
+          configs: new Map(resolvedConfigs.map((c) => [c.type, c])),
+          parentSignal: this.signal,
+          hookRegistry: this.hookRegistry,
+          parentRunId: this.runId ?? '',
+          parentAgentId: agentContext.agentId,
+          maxDepth: agentContext.maxSubagentDepth ?? 1,
+        });
+
+        const types = resolvedConfigs.map((c) => c.type);
+        const typeDescriptions = resolvedConfigs
+          .map((c) => `- "${c.type}" (${c.name}): ${c.description}`)
+          .join('\n');
+
+        const subagentTool = tool(
+          async (rawInput) => {
+            const input = rawInput as {
+              description: string;
+              subagent_type: string;
+            };
+            const result = await executor.execute({
+              description: input.description,
+              subagentType: input.subagent_type,
+            });
+            return result.content;
+          },
+          {
+            name: Constants.SUBAGENT,
+            schema: {
+              type: 'object',
+              properties: {
+                description: {
+                  type: 'string',
+                  description:
+                    'Complete task description for the subagent. This is the ONLY information it receives.',
+                },
+                subagent_type: {
+                  type: 'string',
+                  enum: types,
+                  description: `Which subagent type to delegate to. Available: ${types.join(', ')}.`,
+                },
+              },
+              required: ['description', 'subagent_type'],
+            },
+            description: `Delegate a task to a specialized subagent with isolated context. Only the final text result returns.\n\nAvailable types:\n${typeDescriptions}`,
+          }
+        );
+
+        agentContext.graphTools = [
+          ...((agentContext.graphTools as t.GenericTool[] | undefined) ?? []),
+          subagentTool as unknown as t.GenericTool,
+        ];
+      }
     }
 
     const agentNode = `${AGENT}${agentId}` as const;

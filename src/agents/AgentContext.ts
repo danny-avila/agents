@@ -55,6 +55,8 @@ export class AgentContext {
       contextPruningConfig,
       maxToolResultChars,
       toolSchemaTokens,
+      subagentConfigs,
+      maxSubagentDepth,
     } = agentConfig;
 
     const agentContext = new AgentContext({
@@ -81,6 +83,10 @@ export class AgentContext {
       contextPruningConfig,
       maxToolResultChars,
     });
+
+    agentContext._sourceInputs = agentConfig;
+    agentContext.subagentConfigs = subagentConfigs;
+    agentContext.maxSubagentDepth = maxSubagentDepth;
 
     if (initialSummary?.text != null && initialSummary.text !== '') {
       agentContext.setInitialSummary(
@@ -198,6 +204,12 @@ export class AgentContext {
   toolDefinitions?: t.LCTool[];
   /** Set of tool names discovered via tool search (to be loaded) */
   discoveredToolNames: Set<string> = new Set();
+  /** Original AgentInputs used to create this context — used for self-spawn subagent resolution. */
+  _sourceInputs?: t.AgentInputs;
+  /** Subagent configurations for hierarchical delegation. */
+  subagentConfigs?: t.SubagentConfig[];
+  /** Maximum subagent nesting depth. */
+  maxSubagentDepth?: number;
   /** Instructions for this agent */
   instructions?: string;
   /** Additional instructions for this agent */
