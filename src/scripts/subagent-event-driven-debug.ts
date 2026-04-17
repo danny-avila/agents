@@ -115,7 +115,7 @@ The subagent MUST use the calculator tool — never estimate.`,
       handle: (_event, rawData): void => {
         const d = rawData as t.SubagentUpdateEvent;
         console.log(
-          `[SUBAGENT ${d.phase}] [${d.subagentType}] ${d.label ?? ''}`
+          `[SUBAGENT ${d.phase}] [${d.subagentType}] tool_call_id=${d.parentToolCallId ?? '-'} ${d.label ?? ''}`
         );
       },
     },

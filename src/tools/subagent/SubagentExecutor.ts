@@ -32,6 +32,13 @@ export type SubagentExecuteParams = {
   description: string;
   subagentType: string;
   threadId?: string;
+  /**
+   * Parent-side `tool_call_id` of the `subagent` tool invocation that
+   * triggered this execution. Surfaced on {@link SubagentUpdateEvent} so
+   * hosts can correlate child updates back to the originating tool call
+   * without relying on event ordering heuristics.
+   */
+  parentToolCallId?: string;
 };
 
 export type SubagentExecuteResult = {
@@ -114,7 +121,7 @@ export class SubagentExecutor {
   }
 
   async execute(params: SubagentExecuteParams): Promise<SubagentExecuteResult> {
-    const { description, subagentType, threadId } = params;
+    const { description, subagentType, threadId, parentToolCallId } = params;
     const config = this.configs.get(subagentType);
 
     if (!config) {
@@ -169,11 +176,22 @@ export class SubagentExecutor {
 
     const parentRegistry = this.getParentHandlerRegistry();
     const forwardingEnabled = parentRegistry != null;
+    /**
+     * Keep `toolDefinitions` only when the host has actually wired an
+     * `ON_TOOL_EXECUTE` handler. `Run` always constructs a `HandlerRegistry`,
+     * so treating any registry as "forwarding enabled" would leak
+     * `toolDefinitions` into children whose hosts cannot execute them — the
+     * child's `ToolNode` batch promise would hang forever with no handler to
+     * resolve/reject. Gating on the tool-execute handler preserves the
+     * recoverable "no tools" path for registry-but-no-handler configs.
+     */
+    const hasToolExecuteHandler =
+      parentRegistry?.getHandler(GraphEvents.ON_TOOL_EXECUTE) != null;
     const childInputs = buildChildInputs(
       config,
       childAgentId,
       this.maxDepth,
-      /* keepToolDefinitions */ forwardingEnabled
+      /* keepToolDefinitions */ hasToolExecuteHandler
     );
     const childRunId = `${this.parentRunId}_sub_${nanoid(8)}`;
     const maxTurns = config.maxTurns ?? DEFAULT_MAX_TURNS;
@@ -192,6 +210,7 @@ export class SubagentExecutor {
         subagentType,
         subagentAgentId: childAgentId,
         childRunId,
+        parentToolCallId,
       })
       : undefined;
 
@@ -200,6 +219,7 @@ export class SubagentExecutor {
         childRunId,
         subagentType,
         subagentAgentId: childAgentId,
+        parentToolCallId,
         phase: 'start',
         label: `Subagent "${subagentType}" started`,
       });
@@ -245,6 +265,7 @@ export class SubagentExecutor {
           childRunId,
           subagentType,
           subagentAgentId: childAgentId,
+          parentToolCallId,
           phase: 'error',
           label: `Subagent "${subagentType}" errored: ${errorMessage}`,
           data: { message: errorMessage },
@@ -290,6 +311,7 @@ export class SubagentExecutor {
         childRunId,
         subagentType,
         subagentAgentId: childAgentId,
+        parentToolCallId,
         phase: 'stop',
         label: `Subagent "${subagentType}" finished`,
       });
@@ -311,6 +333,7 @@ export class SubagentExecutor {
       childRunId: string;
       subagentType: string;
       subagentAgentId: string;
+      parentToolCallId?: string;
       phase: SubagentUpdatePhase;
       data?: unknown;
       label?: string;
@@ -326,6 +349,7 @@ export class SubagentExecutor {
       subagentType: args.subagentType,
       subagentAgentId: args.subagentAgentId,
       parentAgentId: this.parentAgentId,
+      parentToolCallId: args.parentToolCallId,
       phase: args.phase,
       data: args.data,
       label: args.label,
@@ -356,6 +380,7 @@ export class SubagentExecutor {
     subagentType: string;
     subagentAgentId: string;
     childRunId: string;
+    parentToolCallId?: string;
   }): BaseCallbackHandler {
     const {
       parentRegistry,
@@ -363,6 +388,7 @@ export class SubagentExecutor {
       subagentType,
       subagentAgentId,
       childRunId,
+      parentToolCallId,
     } = args;
     const parentRunId = this.parentRunId;
     const parentAgentId = this.parentAgentId;
@@ -382,6 +408,7 @@ export class SubagentExecutor {
         subagentType,
         subagentAgentId,
         parentAgentId,
+        parentToolCallId,
         phase,
         data,
         label: summarizeEvent(eventName, data),

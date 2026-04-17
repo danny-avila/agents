@@ -1206,10 +1206,21 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           const subagentType =
             typeof input.subagent_type === 'string' ? input.subagent_type : '';
           const threadId = config.configurable?.thread_id as string | undefined;
+          /**
+           * When the tool is dispatched from an LLM's `tool_call`, LangChain
+           * threads the originating `ToolCall` onto the RunnableConfig as
+           * `config.toolCall`. Surfacing its id lets hosts correlate
+           * `SubagentUpdateEvent`s back to the parent's `tool_call_id`
+           * deterministically — no temporal heuristics needed.
+           */
+          const toolCall = (config as { toolCall?: { id?: string } }).toolCall;
+          const parentToolCallId =
+            typeof toolCall?.id === 'string' ? toolCall.id : undefined;
           const result = await executor.execute({
             description,
             subagentType,
             threadId,
+            parentToolCallId,
           });
           return result.content;
         }, buildSubagentToolParams(resolvedConfigs));

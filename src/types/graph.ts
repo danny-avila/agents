@@ -433,6 +433,13 @@ export interface SubagentUpdateEvent {
   runId: string;
   /** Child run ID (unique per subagent execution). */
   subagentRunId: string;
+  /**
+   * Parent-side `tool_call_id` for the `subagent` tool invocation that
+   * triggered this run. Stable for the duration of the child; lets hosts
+   * correlate updates deterministically instead of inferring by ordering.
+   * Omitted when the executor was invoked outside of a tool-call context.
+   */
+  parentToolCallId?: string;
   /** Subagent `type` identifier from the SubagentConfig. */
   subagentType: string;
   /** Child agent ID assigned to this subagent execution. */

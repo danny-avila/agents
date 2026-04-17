@@ -643,9 +643,13 @@ describe('SubagentExecutor', () => {
       expect(phases[phases.length - 1]).toBe('stop');
     });
 
-    it('keeps toolDefinitions on child when forwarding is enabled', async () => {
+    it('keeps toolDefinitions on child when registry has ON_TOOL_EXECUTE handler', async () => {
       const { HandlerRegistry: HR } = await import('@/events');
+      const { GraphEvents: GE } = await import('@/common');
       const registry = new HR();
+      registry.register(GE.ON_TOOL_EXECUTE, {
+        handle: (): void => {},
+      });
       let observedChildInputs: AgentInputs | undefined;
       const configWithDefs: ResolvedSubagentConfig = {
         type: 'researcher',
@@ -685,6 +689,82 @@ describe('SubagentExecutor', () => {
 
       expect(observedChildInputs?.toolDefinitions).toHaveLength(1);
       expect(observedChildInputs?.toolDefinitions?.[0]?.name).toBe('web');
+    });
+
+    it('strips toolDefinitions when registry is present but ON_TOOL_EXECUTE handler is absent', async () => {
+      const { HandlerRegistry: HR } = await import('@/events');
+      const registry = new HR();
+      let observedChildInputs: AgentInputs | undefined;
+      const configWithDefs: ResolvedSubagentConfig = {
+        type: 'researcher',
+        name: 'Research Specialist',
+        description: 'Researches topics',
+        agentInputs: {
+          agentId: 'researcher',
+          provider: Providers.OPENAI,
+          toolDefinitions: [
+            { name: 'web', description: 'search', parameters: {} },
+          ],
+        } as AgentInputs,
+      };
+
+      const executor = new SubagentExecutor({
+        configs: new Map([[configWithDefs.type, configWithDefs]]),
+        parentRunId: 'run',
+        parentAgentId: 'parent',
+        parentHandlerRegistry: registry,
+        createChildGraph: (input): StandardGraph => {
+          observedChildInputs = input.agents[0];
+          return {
+            createWorkflow: (): { invoke: jest.Mock } => ({
+              invoke: jest.fn().mockResolvedValue({
+                messages: [new AIMessage('ok')],
+              }),
+            }),
+            clearHeavyState: jest.fn(),
+          } as unknown as StandardGraph;
+        },
+      });
+
+      await executor.execute({
+        description: 'find weather',
+        subagentType: 'researcher',
+      });
+
+      expect(observedChildInputs?.toolDefinitions).toBeUndefined();
+    });
+
+    it('forwards parentToolCallId from execute params to SubagentUpdateEvent envelopes', async () => {
+      const { HandlerRegistry: HR } = await import('@/events');
+      const { GraphEvents: GE } = await import('@/common');
+      const events: unknown[] = [];
+      const registry = new HR();
+      registry.register(GE.ON_SUBAGENT_UPDATE, {
+        handle: (_event, data): void => {
+          events.push(data);
+        },
+      });
+
+      const { factory } = makeStubGraphFactory({
+        messages: [new AIMessage('done')],
+      });
+      const executor = createExecutor({
+        createChildGraph: factory,
+        parentHandlerRegistry: registry,
+      });
+
+      await executor.execute({
+        description: 'Task',
+        subagentType: 'researcher',
+        parentToolCallId: 'call_abc123',
+      });
+
+      expect(events.length).toBeGreaterThan(0);
+      for (const e of events) {
+        expect((e as { parentToolCallId?: string }).parentToolCallId).toBe(
+          'call_abc123'
+        );
+      }
     });
 
     it('still strips toolDefinitions when no parentHandlerRegistry is provided (legacy isolation)', async () => {
