@@ -115,6 +115,37 @@ describe('filterSubagentResult', () => {
     ];
     expect(filterSubagentResult(messages)).toBe('Final response');
   });
+
+  it('salvages text from an earlier AIMessage when the last has only tool_use', () => {
+    /**
+     * Scenario: subagent hit maxTurns mid-tool-call. The last AIMessage is
+     * pure tool_use with no text. Partial progress from an earlier turn
+     * should still be returned instead of "Task completed".
+     */
+    const messages: BaseMessage[] = [
+      new HumanMessage('task'),
+      new AIMessage({
+        content: [
+          { type: 'text', text: 'Let me search.' },
+          { type: 'tool_use', id: 'c1', name: 'search', input: {} },
+        ],
+      }),
+      new ToolMessage({ content: 'Paris.', tool_call_id: 'c1' }),
+      new AIMessage({
+        content: [{ type: 'tool_use', id: 'c2', name: 'search', input: {} }],
+      }),
+    ];
+    expect(filterSubagentResult(messages)).toBe('Let me search.');
+  });
+
+  it('salvages from earlier AIMessage when last has empty string content', () => {
+    const messages: BaseMessage[] = [
+      new AIMessage('Partial answer.'),
+      new ToolMessage({ content: 'tool out', tool_call_id: 'x' }),
+      new AIMessage(''),
+    ];
+    expect(filterSubagentResult(messages)).toBe('Partial answer.');
+  });
 });
 
 describe('resolveSubagentConfigs', () => {

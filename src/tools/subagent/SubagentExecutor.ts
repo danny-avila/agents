@@ -218,9 +218,14 @@ export class SubagentExecutor {
 }
 
 /**
- * Extract the last AI message's text content, stripping non-text blocks
- * (tool_use, thinking, redacted_thinking, tool_result).
- * Returns "Task completed" when no valid text content is found.
+ * Walk messages from last to first, returning the text content of the most
+ * recent AIMessage that has any. Non-text blocks (tool_use, thinking,
+ * redacted_thinking, tool_result) are stripped. If the last AIMessage is
+ * pure tool_use (e.g. the subagent hit `maxTurns` mid-tool-call), the walk
+ * continues to earlier AIMessages so partial progress is salvaged — this
+ * matches Claude Code's behavior in `agentToolUtils.finalizeAgentTool`.
+ * Returns "Task completed" only when no AIMessage in the history contains
+ * any text.
  */
 export function filterSubagentResult(messages: BaseMessage[]): string {
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -231,11 +236,12 @@ export function filterSubagentResult(messages: BaseMessage[]): string {
     const content = messages[i].content;
 
     if (typeof content === 'string') {
-      return content || 'Task completed';
+      if (content) return content;
+      continue;
     }
 
     if (!Array.isArray(content)) {
-      return 'Task completed';
+      continue;
     }
 
     const textParts: string[] = [];
@@ -247,7 +253,9 @@ export function filterSubagentResult(messages: BaseMessage[]): string {
       }
     }
 
-    return textParts.join('\n') || 'Task completed';
+    if (textParts.length > 0) {
+      return textParts.join('\n');
+    }
   }
 
   return 'Task completed';
