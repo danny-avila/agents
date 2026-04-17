@@ -2,7 +2,8 @@ import { describe, it, expect, beforeEach } from '@jest/globals';
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import { HookRegistry } from '@/hooks/HookRegistry';
-import { Providers } from '@/common';
+import { Providers, GraphEvents } from '@/common';
+import { HandlerRegistry } from '@/events';
 import { AgentContext } from '@/agents/AgentContext';
 import type { AgentInputs, ResolvedSubagentConfig } from '@/types';
 import {
@@ -10,6 +11,7 @@ import {
   filterSubagentResult,
   resolveSubagentConfigs,
   buildChildInputs,
+  summarizeEvent,
 } from '../subagent';
 import type { StandardGraph } from '@/graphs/Graph';
 
@@ -615,11 +617,9 @@ describe('SubagentExecutor', () => {
 
   describe('event forwarding', () => {
     it('emits start/stop ON_SUBAGENT_UPDATE envelopes when parentHandlerRegistry is provided', async () => {
-      const { HandlerRegistry: HR } = await import('@/events');
-      const { GraphEvents: GE } = await import('@/common');
       const events: unknown[] = [];
-      const registry = new HR();
-      registry.register(GE.ON_SUBAGENT_UPDATE, {
+      const registry = new HandlerRegistry();
+      registry.register(GraphEvents.ON_SUBAGENT_UPDATE, {
         handle: (_event, data): void => {
           events.push(data);
         },
@@ -644,10 +644,8 @@ describe('SubagentExecutor', () => {
     });
 
     it('keeps toolDefinitions on child when registry has ON_TOOL_EXECUTE handler', async () => {
-      const { HandlerRegistry: HR } = await import('@/events');
-      const { GraphEvents: GE } = await import('@/common');
-      const registry = new HR();
-      registry.register(GE.ON_TOOL_EXECUTE, {
+      const registry = new HandlerRegistry();
+      registry.register(GraphEvents.ON_TOOL_EXECUTE, {
         handle: (): void => {},
       });
       let observedChildInputs: AgentInputs | undefined;
@@ -692,8 +690,7 @@ describe('SubagentExecutor', () => {
     });
 
     it('strips toolDefinitions when registry is present but ON_TOOL_EXECUTE handler is absent', async () => {
-      const { HandlerRegistry: HR } = await import('@/events');
-      const registry = new HR();
+      const registry = new HandlerRegistry();
       let observedChildInputs: AgentInputs | undefined;
       const configWithDefs: ResolvedSubagentConfig = {
         type: 'researcher',
@@ -735,11 +732,9 @@ describe('SubagentExecutor', () => {
     });
 
     it('forwards parentToolCallId from execute params to SubagentUpdateEvent envelopes', async () => {
-      const { HandlerRegistry: HR } = await import('@/events');
-      const { GraphEvents: GE } = await import('@/common');
       const events: unknown[] = [];
-      const registry = new HR();
-      registry.register(GE.ON_SUBAGENT_UPDATE, {
+      const registry = new HandlerRegistry();
+      registry.register(GraphEvents.ON_SUBAGENT_UPDATE, {
         handle: (_event, data): void => {
           events.push(data);
         },
@@ -808,9 +803,8 @@ describe('SubagentExecutor', () => {
     });
 
     it('accepts parentHandlerRegistry as a lazy getter', async () => {
-      const { HandlerRegistry: HR } = await import('@/events');
-      const { GraphEvents: GE } = await import('@/common');
-      const lazyHolder: { registry?: InstanceType<typeof HR> } = {};
+      const lazyHolder: { registry?: InstanceType<typeof HandlerRegistry> } =
+        {};
       const events: unknown[] = [];
       const { factory } = makeStubGraphFactory({
         messages: [new AIMessage('done')],
@@ -820,8 +814,8 @@ describe('SubagentExecutor', () => {
         parentHandlerRegistry: () => lazyHolder.registry,
       });
 
-      lazyHolder.registry = new HR();
-      lazyHolder.registry.register(GE.ON_SUBAGENT_UPDATE, {
+      lazyHolder.registry = new HandlerRegistry();
+      lazyHolder.registry.register(GraphEvents.ON_SUBAGENT_UPDATE, {
         handle: (_event, data): void => {
           events.push(data);
         },
@@ -835,5 +829,275 @@ describe('SubagentExecutor', () => {
       expect(events.length).toBeGreaterThan(0);
       expect((events[0] as { phase: string }).phase).toBe('start');
     });
+
+    it('routes child ON_TOOL_EXECUTE dispatches through the parent registry', async () => {
+      /**
+       * Drives the forwarder callback the executor installs on the child's
+       * `workflow.invoke({ callbacks: [forwarder] })`. We capture that
+       * callback when the child workflow runs, then synthesize the same
+       * `handleCustomEvent` call that a real `ToolNode` would make when
+       * the child LLM emits a tool_call. If the forwarder routes correctly,
+       * the parent's `ON_TOOL_EXECUTE` handler receives the batch and
+       * resolves the promise with our canned results.
+       */
+
+      const parentToolHandler = jest.fn(
+        async (_event: string, rawData: unknown): Promise<void> => {
+          const req = rawData as {
+            toolCalls: Array<{ id: string; name: string }>;
+            resolve: (results: unknown[]) => void;
+          };
+          req.resolve(
+            req.toolCalls.map((tc) => ({
+              toolCallId: tc.id,
+              status: 'success',
+              content: `ran ${tc.name}`,
+            }))
+          );
+        }
+      );
+
+      const registry = new HandlerRegistry();
+      registry.register(GraphEvents.ON_TOOL_EXECUTE, {
+        handle: parentToolHandler,
+      });
+
+      let capturedInvokeOptions: unknown;
+      const factory: () => StandardGraph = (): StandardGraph =>
+        ({
+          createWorkflow: (): { invoke: jest.Mock } => ({
+            invoke: jest.fn().mockImplementation(async (_state, options) => {
+              capturedInvokeOptions = options;
+              return { messages: [new AIMessage('ok')] };
+            }),
+          }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph;
+
+      const executor = createExecutor({
+        createChildGraph: factory,
+        parentHandlerRegistry: registry,
+      });
+
+      await executor.execute({
+        description: 'Task',
+        subagentType: 'researcher',
+        parentToolCallId: 'call_parent_123',
+      });
+
+      const opts = capturedInvokeOptions as
+        | { callbacks?: unknown[] }
+        | undefined;
+      expect(opts?.callbacks).toBeDefined();
+      const forwarder = (opts?.callbacks ?? [])[0] as {
+        handleCustomEvent?: (
+          eventName: string,
+          data: unknown,
+          runId: string,
+          tags?: string[],
+          metadata?: Record<string, unknown>
+        ) => Promise<void> | void;
+      };
+      expect(typeof forwarder.handleCustomEvent).toBe('function');
+
+      /** Simulate the child's ToolNode emitting a real batch request. */
+      const resolvePromise = new Promise<
+        Array<{ toolCallId: string; status: string; content: string }>
+      >((resolve, reject) => {
+        const batchRequest = {
+          toolCalls: [{ id: 'call_child_xyz', name: 'calculator', args: {} }],
+          agentId: 'researcher',
+          resolve,
+          reject,
+        };
+        forwarder.handleCustomEvent?.(
+          GraphEvents.ON_TOOL_EXECUTE,
+          batchRequest,
+          'child-run-id'
+        );
+      });
+
+      const results = await resolvePromise;
+      expect(parentToolHandler).toHaveBeenCalledTimes(1);
+      expect(results).toEqual([
+        {
+          toolCallId: 'call_child_xyz',
+          status: 'success',
+          content: 'ran calculator',
+        },
+      ]);
+    });
+
+    it('does NOT forward ON_TOOL_EXECUTE when the parent registry has no handler (safe fallback)', async () => {
+      /**
+       * The executor strips `toolDefinitions` when the parent registry has
+       * no `ON_TOOL_EXECUTE` handler (see the companion strip-on-no-handler
+       * test). Defence-in-depth: if the LLM somehow still dispatches a tool
+       * call, the forwarder must not silently consume it without resolving;
+       * reject would be better than hang. This test confirms no handler
+       * is invoked on the parent side so it's clear a forwarded request
+       * would need separate treatment.
+       */
+
+      const registry = new HandlerRegistry();
+      /** Only ON_SUBAGENT_UPDATE registered — no ON_TOOL_EXECUTE. */
+      registry.register(GraphEvents.ON_SUBAGENT_UPDATE, { handle: jest.fn() });
+
+      let capturedInvokeOptions: unknown;
+      const factory: () => StandardGraph = (): StandardGraph =>
+        ({
+          createWorkflow: (): { invoke: jest.Mock } => ({
+            invoke: jest.fn().mockImplementation(async (_state, options) => {
+              capturedInvokeOptions = options;
+              return { messages: [new AIMessage('ok')] };
+            }),
+          }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph;
+
+      const executor = createExecutor({
+        createChildGraph: factory,
+        parentHandlerRegistry: registry,
+      });
+
+      await executor.execute({
+        description: 'Task',
+        subagentType: 'researcher',
+      });
+
+      const opts = capturedInvokeOptions as { callbacks?: unknown[] };
+      const forwarder = (opts.callbacks ?? [])[0] as {
+        handleCustomEvent?: (
+          eventName: string,
+          data: unknown
+        ) => Promise<void> | void;
+      };
+
+      let resolved = false;
+      const batchRequest = {
+        toolCalls: [{ id: 'call_x', name: 'calculator', args: {} }],
+        agentId: 'researcher',
+        resolve: (): void => {
+          resolved = true;
+        },
+        reject: (): void => {},
+      };
+      await forwarder.handleCustomEvent?.(
+        GraphEvents.ON_TOOL_EXECUTE,
+        batchRequest
+      );
+
+      /** No handler exists → nothing resolves the promise. This is the
+       *  state that justifies the `keepToolDefinitions` gate: without the
+       *  gate we'd deadlock here. The gate ensures the LLM never sees
+       *  tools in the first place, making this scenario unreachable in
+       *  practice — the test just documents the fallback. */
+      expect(resolved).toBe(false);
+    });
+
+    it('emits an `error` phase envelope when the child graph throws', async () => {
+      const events: unknown[] = [];
+      const registry = new HandlerRegistry();
+      registry.register(GraphEvents.ON_SUBAGENT_UPDATE, {
+        handle: (_event, data): void => {
+          events.push(data);
+        },
+      });
+
+      const executor = createExecutor({
+        createChildGraph: makeThrowingGraphFactory(
+          new Error('recursion limit')
+        ),
+        parentHandlerRegistry: registry,
+      });
+
+      const result = await executor.execute({
+        description: 'Task',
+        subagentType: 'researcher',
+        parentToolCallId: 'call_err',
+      });
+
+      expect(result.content).toContain('Subagent error: recursion limit');
+      const phases = events.map((e) => (e as { phase: string }).phase);
+      expect(phases).toContain('start');
+      expect(phases).toContain('error');
+      const errEvent = events.find(
+        (e) => (e as { phase: string }).phase === 'error'
+      ) as { data?: { message?: string }; parentToolCallId?: string };
+      expect(errEvent.data?.message).toContain('recursion limit');
+      expect(errEvent.parentToolCallId).toBe('call_err');
+    });
+  });
+});
+
+describe('summarizeEvent', () => {
+  it('labels a run step tool_calls stepDetails by tool name', () => {
+    const label = summarizeEvent(GraphEvents.ON_RUN_STEP, {
+      stepDetails: {
+        type: 'tool_calls',
+        tool_calls: [{ name: 'calculator', id: 'c1' }],
+      },
+    });
+    expect(label).toBe('Using tool: calculator');
+  });
+
+  it('joins multiple tool names on a single run step', () => {
+    const label = summarizeEvent(GraphEvents.ON_RUN_STEP, {
+      stepDetails: {
+        type: 'tool_calls',
+        tool_calls: [{ name: 'web' }, { name: 'calculator' }],
+      },
+    });
+    expect(label).toBe('Using tool: web, calculator');
+  });
+
+  it('falls back to "Planning tool call" when tool_calls is empty', () => {
+    const label = summarizeEvent(GraphEvents.ON_RUN_STEP, {
+      stepDetails: { type: 'tool_calls', tool_calls: [] },
+    });
+    expect(label).toBe('Planning tool call');
+  });
+
+  it('labels message_creation steps as "Thinking…"', () => {
+    const label = summarizeEvent(GraphEvents.ON_RUN_STEP, {
+      stepDetails: { type: 'message_creation' },
+    });
+    expect(label).toBe('Thinking…');
+  });
+
+  it('labels ON_TOOL_EXECUTE with the batch of tool names', () => {
+    const label = summarizeEvent(GraphEvents.ON_TOOL_EXECUTE, {
+      toolCalls: [{ name: 'web' }, { name: 'calculator' }],
+    });
+    expect(label).toBe('Calling web, calculator');
+  });
+
+  it('falls back to a generic "Calling tool" when toolCalls is empty', () => {
+    const label = summarizeEvent(GraphEvents.ON_TOOL_EXECUTE, {
+      toolCalls: [],
+    });
+    expect(label).toBe('Calling tool');
+  });
+
+  it('labels completed run steps by completed tool name', () => {
+    const label = summarizeEvent(GraphEvents.ON_RUN_STEP_COMPLETED, {
+      result: { type: 'tool_call', tool_call: { name: 'calculator' } },
+    });
+    expect(label).toBe('Tool calculator complete');
+  });
+
+  it('labels completed steps without a tool name as "Step complete"', () => {
+    const label = summarizeEvent(GraphEvents.ON_RUN_STEP_COMPLETED, {
+      result: { type: 'message_creation' },
+    });
+    expect(label).toBe('Step complete');
+  });
+
+  it('labels ON_MESSAGE_DELTA as "Streaming…"', () => {
+    expect(summarizeEvent(GraphEvents.ON_MESSAGE_DELTA, {})).toBe('Streaming…');
+  });
+
+  it('returns the event name for unknown events', () => {
+    expect(summarizeEvent('on_unknown_event', {})).toBe('on_unknown_event');
   });
 });

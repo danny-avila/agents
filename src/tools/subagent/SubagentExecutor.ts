@@ -10,6 +10,7 @@ import type {
   SubagentConfig,
   SubagentUpdateEvent,
   SubagentUpdatePhase,
+  ToolExecuteBatchRequest,
   TokenCounter,
 } from '@/types';
 import type { AggregatedHookResult, HookRegistry } from '@/hooks';
@@ -206,7 +207,6 @@ export class SubagentExecutor {
     const forwarder = forwardingEnabled
       ? this.createForwarderCallback({
         parentRegistry: parentRegistry!,
-        childGraph,
         subagentType,
         subagentAgentId: childAgentId,
         childRunId,
@@ -376,7 +376,6 @@ export class SubagentExecutor {
    */
   private createForwarderCallback(args: {
     parentRegistry: HandlerRegistry;
-    childGraph: StandardGraph;
     subagentType: string;
     subagentAgentId: string;
     childRunId: string;
@@ -384,7 +383,6 @@ export class SubagentExecutor {
   }): BaseCallbackHandler {
     const {
       parentRegistry,
-      childGraph: _childGraph,
       subagentType,
       subagentAgentId,
       childRunId,
@@ -433,7 +431,7 @@ export class SubagentExecutor {
           if (toolHandler) {
             await toolHandler.handle(
               GraphEvents.ON_TOOL_EXECUTE,
-              data as never
+              data as ToolExecuteBatchRequest
             );
           }
           /**
@@ -466,6 +464,16 @@ export class SubagentExecutor {
         }
       },
     });
+    /**
+     * `awaitHandlers = true` is required so the child's `ToolNode` actually
+     * blocks on the parent's `ON_TOOL_EXECUTE` handler until it resolves
+     * the batch request. The same flag applies to observational events
+     * (message_delta, run_step, …), which means a slow
+     * `ON_SUBAGENT_UPDATE` handler on the host serializes the child
+     * stream. If host-side latency becomes a concern, a future
+     * refinement could split operational and observational events into
+     * separate callback handlers with distinct await semantics.
+     */
     handler.awaitHandlers = true;
     return handler;
   }
@@ -476,7 +484,7 @@ export class SubagentExecutor {
  * Used to populate {@link SubagentUpdateEvent.label} so the host UI can show
  * a compact status ticker without parsing the raw payload.
  */
-function summarizeEvent(eventName: string, data: unknown): string {
+export function summarizeEvent(eventName: string, data: unknown): string {
   if (eventName === GraphEvents.ON_TOOL_EXECUTE) {
     const req = data as { toolCalls?: Array<{ name?: string }> };
     const names = (req.toolCalls ?? [])

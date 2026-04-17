@@ -18,7 +18,13 @@ import type {
 import type { RunnableConfig, Runnable } from '@langchain/core/runnables';
 import type { ChatGenerationChunk } from '@langchain/core/outputs';
 import type { GoogleAIToolType } from '@langchain/google-common';
-import type { ToolMap, ToolEndEvent, GenericTool, LCTool } from '@/types/tools';
+import type {
+  ToolMap,
+  ToolEndEvent,
+  GenericTool,
+  LCTool,
+  ToolExecuteBatchRequest,
+} from '@/types/tools';
 import type { Providers, Callback, GraphNodeKeys } from '@/common';
 import type { StandardGraph, MultiAgentGraph } from '@/graphs';
 import type { ClientOptions } from '@/types/llm';
@@ -107,6 +113,7 @@ export interface EventHandler {
       | SummarizeCompleteEvent
       | SubagentUpdateEvent
       | AgentLogEvent
+      | ToolExecuteBatchRequest
       | { result: ToolEndEvent },
     metadata?: Record<string, unknown>,
     graph?: StandardGraph | MultiAgentGraph

@@ -6,7 +6,7 @@ import type { BaseMessage } from '@langchain/core/messages';
 import { tool } from '@langchain/core/tools';
 import { z } from 'zod';
 import type * as t from '@/types';
-import { ChatModelStreamHandler, createContentAggregator } from '@/stream';
+import { ChatModelStreamHandler } from '@/stream';
 import { ToolEndHandler, ModelEndHandler } from '@/events';
 import { Providers, GraphEvents, Constants } from '@/common';
 import { Run } from '@/run';

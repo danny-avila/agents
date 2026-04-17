@@ -1209,9 +1209,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           /**
            * When the tool is dispatched from an LLM's `tool_call`, LangChain
            * threads the originating `ToolCall` onto the RunnableConfig as
-           * `config.toolCall`. Surfacing its id lets hosts correlate
-           * `SubagentUpdateEvent`s back to the parent's `tool_call_id`
-           * deterministically — no temporal heuristics needed.
+           * `config.toolCall` (see `ToolRunnableConfig` in
+           * `@langchain/core/tools` — internal but stable since ≥0.3.x).
+           * Surfacing its id lets hosts correlate `SubagentUpdateEvent`s
+           * back to the parent's `tool_call_id` deterministically — no
+           * temporal heuristics needed. If a future LangChain version
+           * changes the threading, the type-guarded read falls back to
+           * `undefined` and the correlation degrades gracefully.
            */
           const toolCall = (config as { toolCall?: { id?: string } }).toolCall;
           const parentToolCallId =
