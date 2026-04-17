@@ -283,6 +283,29 @@ describe('buildChildInputs', () => {
     expect(result.toolDefinitions).toBeUndefined();
   });
 
+  it('strips parent-run-scoped initialSummary and discoveredTools from child inputs', () => {
+    /**
+     * Codex P1: a child inheriting `initialSummary` or `discoveredTools` from
+     * the parent's shallow-spread AgentInputs leaks unrelated conversation
+     * context / prior tool-search state into an isolated subagent run,
+     * defeating the context-isolation contract. Both fields must be cleared.
+     */
+    const inputsWithRunContext: AgentInputs = {
+      ...parentAgentInputs,
+      initialSummary: { text: 'prior conversation summary', tokenCount: 42 },
+      discoveredTools: ['prior_tool_a', 'prior_tool_b'],
+    };
+    const config: ResolvedSubagentConfig = {
+      type: 'researcher',
+      name: 'R',
+      description: 'd',
+      agentInputs: inputsWithRunContext,
+    };
+    const result = buildChildInputs(config, 'child', 3);
+    expect(result.initialSummary).toBeUndefined();
+    expect(result.discoveredTools).toBeUndefined();
+  });
+
   it('overrides agentId with the passed childAgentId', () => {
     const config: ResolvedSubagentConfig = {
       type: 'researcher',

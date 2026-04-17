@@ -644,6 +644,17 @@ export function buildChildInputs(
     toolDefinitions: keepToolDefinitions
       ? agentInputs.toolDefinitions
       : undefined,
+    /**
+     * Subagents run in an isolated context by contract. Parent-run-scoped
+     * fields that would otherwise survive the shallow-spread clone — the
+     * cross-run conversation summary and the prior-turn tool-discovery
+     * set — are cleared here so the child starts fresh. Host applications
+     * that want a subagent to see parent context must thread it in
+     * explicitly (e.g. via the `description` argument to the subagent
+     * tool), not via inherited state.
+     */
+    initialSummary: undefined,
+    discoveredTools: undefined,
   };
 
   if (config.allowNested === true) {
