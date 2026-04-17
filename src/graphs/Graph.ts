@@ -1176,10 +1176,16 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         agentContext
       );
       if (resolvedConfigs.length > 0) {
+        const getParentHandlerRegistry = (): HandlerRegistry | undefined =>
+          this.handlerRegistry;
         const executor = new SubagentExecutor({
           configs: new Map(resolvedConfigs.map((c) => [c.type, c])),
           parentSignal: this.signal,
           hookRegistry: this.hookRegistry,
+          /** Lazy — Run wires the registry onto the graph AFTER
+           *  `createWorkflow()` runs, so a direct capture here would be
+           *  `undefined` at construction time. */
+          parentHandlerRegistry: getParentHandlerRegistry,
           parentRunId: this.runId ?? '',
           parentAgentId: agentContext.agentId,
           tokenCounter: agentContext.tokenCounter,
@@ -1200,10 +1206,25 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           const subagentType =
             typeof input.subagent_type === 'string' ? input.subagent_type : '';
           const threadId = config.configurable?.thread_id as string | undefined;
+          /**
+           * When the tool is dispatched from an LLM's `tool_call`, LangChain
+           * threads the originating `ToolCall` onto the RunnableConfig as
+           * `config.toolCall` (see `ToolRunnableConfig` in
+           * `@langchain/core/tools` — internal but stable since ≥0.3.x).
+           * Surfacing its id lets hosts correlate `SubagentUpdateEvent`s
+           * back to the parent's `tool_call_id` deterministically — no
+           * temporal heuristics needed. If a future LangChain version
+           * changes the threading, the type-guarded read falls back to
+           * `undefined` and the correlation degrades gracefully.
+           */
+          const toolCall = (config as { toolCall?: { id?: string } }).toolCall;
+          const parentToolCallId =
+            typeof toolCall?.id === 'string' ? toolCall.id : undefined;
           const result = await executor.execute({
             description,
             subagentType,
             threadId,
+            parentToolCallId,
           });
           return result.content;
         }, buildSubagentToolParams(resolvedConfigs));

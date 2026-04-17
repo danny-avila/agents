@@ -18,7 +18,13 @@ import type {
 import type { RunnableConfig, Runnable } from '@langchain/core/runnables';
 import type { ChatGenerationChunk } from '@langchain/core/outputs';
 import type { GoogleAIToolType } from '@langchain/google-common';
-import type { ToolMap, ToolEndEvent, GenericTool, LCTool } from '@/types/tools';
+import type {
+  ToolMap,
+  ToolEndEvent,
+  GenericTool,
+  LCTool,
+  ToolExecuteBatchRequest,
+} from '@/types/tools';
 import type { Providers, Callback, GraphNodeKeys } from '@/common';
 import type { StandardGraph, MultiAgentGraph } from '@/graphs';
 import type { ClientOptions } from '@/types/llm';
@@ -105,7 +111,9 @@ export interface EventHandler {
       | SummarizeStartEvent
       | SummarizeDeltaEvent
       | SummarizeCompleteEvent
+      | SubagentUpdateEvent
       | AgentLogEvent
+      | ToolExecuteBatchRequest
       | { result: ToolEndEvent },
     metadata?: Record<string, unknown>,
     graph?: StandardGraph | MultiAgentGraph
@@ -410,6 +418,50 @@ export type SubagentConfig = {
 export type ResolvedSubagentConfig = SubagentConfig & {
   agentInputs: AgentInputs;
 };
+
+/** Lifecycle phase carried on {@link SubagentUpdateEvent}. */
+export type SubagentUpdatePhase =
+  | 'start'
+  | 'run_step'
+  | 'run_step_delta'
+  | 'run_step_completed'
+  | 'message_delta'
+  | 'reasoning_delta'
+  | 'stop'
+  | 'error';
+
+/**
+ * Wrapper event emitted when a subagent's child graph dispatches activity.
+ * Lets hosts show subagent progress in a UI surface separate from the parent
+ * conversation without having to untangle events by agent ID.
+ */
+export interface SubagentUpdateEvent {
+  /** Parent run ID. */
+  runId: string;
+  /** Child run ID (unique per subagent execution). */
+  subagentRunId: string;
+  /**
+   * Parent-side `tool_call_id` for the `subagent` tool invocation that
+   * triggered this run. Stable for the duration of the child; lets hosts
+   * correlate updates deterministically instead of inferring by ordering.
+   * Omitted when the executor was invoked outside of a tool-call context.
+   */
+  parentToolCallId?: string;
+  /** Subagent `type` identifier from the SubagentConfig. */
+  subagentType: string;
+  /** Child agent ID assigned to this subagent execution. */
+  subagentAgentId: string;
+  /** Parent agent ID that spawned this subagent. */
+  parentAgentId?: string;
+  /** Lifecycle phase carried by this update. */
+  phase: SubagentUpdatePhase;
+  /** Underlying event payload (shape depends on phase). */
+  data?: unknown;
+  /** Short human-readable description. Hosts can render this directly. */
+  label?: string;
+  /** ISO timestamp for ordering / display. */
+  timestamp: string;
+}
 
 export interface AgentInputs {
   agentId: string;

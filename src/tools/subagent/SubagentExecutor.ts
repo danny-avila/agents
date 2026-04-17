@@ -1,16 +1,23 @@
 import { nanoid } from 'nanoid';
+import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
 import { HumanMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
+import type { Callbacks } from '@langchain/core/callbacks/manager';
 import type {
   AgentInputs,
   StandardGraphInput,
   ResolvedSubagentConfig,
   SubagentConfig,
+  SubagentUpdateEvent,
+  SubagentUpdatePhase,
+  ToolExecuteBatchRequest,
   TokenCounter,
 } from '@/types';
 import type { AggregatedHookResult, HookRegistry } from '@/hooks';
 import type { AgentContext } from '@/agents/AgentContext';
 import type { StandardGraph } from '@/graphs/Graph';
+import { GraphEvents, Callback } from '@/common';
+import type { HandlerRegistry } from '@/events';
 import { executeHooks } from '@/hooks';
 
 const DEFAULT_MAX_TURNS = 25;
@@ -26,6 +33,13 @@ export type SubagentExecuteParams = {
   description: string;
   subagentType: string;
   threadId?: string;
+  /**
+   * Parent-side `tool_call_id` of the `subagent` tool invocation that
+   * triggered this execution. Surfaced on {@link SubagentUpdateEvent} so
+   * hosts can correlate child updates back to the originating tool call
+   * without relying on event ordering heuristics.
+   */
+  parentToolCallId?: string;
 };
 
 export type SubagentExecuteResult = {
@@ -57,6 +71,19 @@ export type SubagentExecutorOptions = {
    * module dependency.
    */
   createChildGraph: ChildGraphFactory;
+  /**
+   * Parent's event handler registry. When provided, child-graph events are
+   * forwarded through this registry so hosts can:
+   *   (a) execute event-driven tools (`ON_TOOL_EXECUTE` routed to parent's handler),
+   *   (b) surface child activity to a UI via wrapped {@link GraphEvents.ON_SUBAGENT_UPDATE}.
+   * When omitted, the child runs fully isolated (legacy behavior).
+   *
+   * Can be a direct `HandlerRegistry` or a zero-arg getter — use the getter
+   * form when the registry is assigned to the graph AFTER the executor is
+   * constructed (the current `Run.create` flow sets `handlerRegistry`
+   * post-`createWorkflow`, so `createAgentNode` must capture lazily).
+   */
+  parentHandlerRegistry?: HandlerRegistry | (() => HandlerRegistry | undefined);
 };
 
 export class SubagentExecutor {
@@ -68,6 +95,9 @@ export class SubagentExecutor {
   private readonly tokenCounter?: TokenCounter;
   private readonly maxDepth: number;
   private readonly createChildGraph: ChildGraphFactory;
+  private readonly resolveParentHandlerRegistry?: () =>
+    | HandlerRegistry
+    | undefined;
 
   constructor(options: SubagentExecutorOptions) {
     this.configs = options.configs;
@@ -78,10 +108,21 @@ export class SubagentExecutor {
     this.tokenCounter = options.tokenCounter;
     this.maxDepth = options.maxDepth ?? 1;
     this.createChildGraph = options.createChildGraph;
+    const rawRegistry = options.parentHandlerRegistry;
+    if (typeof rawRegistry === 'function') {
+      this.resolveParentHandlerRegistry = rawRegistry;
+    } else if (rawRegistry != null) {
+      this.resolveParentHandlerRegistry = (): HandlerRegistry => rawRegistry;
+    }
+  }
+
+  /** Snapshot of the parent's registry at the moment a subagent is dispatched. */
+  private getParentHandlerRegistry(): HandlerRegistry | undefined {
+    return this.resolveParentHandlerRegistry?.();
   }
 
   async execute(params: SubagentExecuteParams): Promise<SubagentExecuteResult> {
-    const { description, subagentType, threadId } = params;
+    const { description, subagentType, threadId, parentToolCallId } = params;
     const config = this.configs.get(subagentType);
 
     if (!config) {
@@ -134,7 +175,25 @@ export class SubagentExecutor {
       }
     }
 
-    const childInputs = buildChildInputs(config, childAgentId, this.maxDepth);
+    const parentRegistry = this.getParentHandlerRegistry();
+    const forwardingEnabled = parentRegistry != null;
+    /**
+     * Keep `toolDefinitions` only when the host has actually wired an
+     * `ON_TOOL_EXECUTE` handler. `Run` always constructs a `HandlerRegistry`,
+     * so treating any registry as "forwarding enabled" would leak
+     * `toolDefinitions` into children whose hosts cannot execute them — the
+     * child's `ToolNode` batch promise would hang forever with no handler to
+     * resolve/reject. Gating on the tool-execute handler preserves the
+     * recoverable "no tools" path for registry-but-no-handler configs.
+     */
+    const hasToolExecuteHandler =
+      parentRegistry?.getHandler(GraphEvents.ON_TOOL_EXECUTE) != null;
+    const childInputs = buildChildInputs(
+      config,
+      childAgentId,
+      this.maxDepth,
+      /* keepToolDefinitions */ hasToolExecuteHandler
+    );
     const childRunId = `${this.parentRunId}_sub_${nanoid(8)}`;
     const maxTurns = config.maxTurns ?? DEFAULT_MAX_TURNS;
 
@@ -145,30 +204,54 @@ export class SubagentExecutor {
       tokenCounter: this.tokenCounter,
     });
 
+    const forwarder = forwardingEnabled
+      ? this.createForwarderCallback({
+        parentRegistry: parentRegistry!,
+        subagentType,
+        subagentAgentId: childAgentId,
+        childRunId,
+        parentToolCallId,
+      })
+      : undefined;
+
+    if (forwarder) {
+      await this.emitSubagentUpdate(parentRegistry!, {
+        childRunId,
+        subagentType,
+        subagentAgentId: childAgentId,
+        parentToolCallId,
+        phase: 'start',
+        label: `Subagent "${subagentType}" started`,
+      });
+    }
+
     let result: { messages: BaseMessage[] };
     try {
       const workflow = childGraph.createWorkflow();
       /**
-       * Detach the child invocation from the parent's callback chain.
-       * Without this, `streamEvents` in the parent's `Run.processStream`
-       * captures events from the child graph's LLM calls (e.g.
-       * `on_chat_model_stream` for the "researcher" agent) and delivers
-       * them to the parent's handlers. The parent then tries to resolve
-       * the child's agent ID in its own `agentContexts` map and throws
-       * "No agent context found for agent ID …". Setting `callbacks: []`
-       * overrides the inherited callbacks for this invoke; combined with
-       * the child's own empty `handlerRegistry`/`hookRegistry`, the child
-       * runs fully isolated.
+       * When `parentHandlerRegistry` is provided (forwarding mode), attach a
+       * lightweight callback that intercepts the child's `on_custom_event`
+       * dispatches and routes them to the parent's registry — either as
+       * operational events (ON_TOOL_EXECUTE) or wrapped ON_SUBAGENT_UPDATE
+       * envelopes. Native LangChain streaming events (on_chat_model_stream,
+       * etc.) still do NOT propagate to the parent's outer streamEvents
+       * iterator — the `callbacks` array REPLACES the inherited chain, so
+       * parent handlers won't receive child stream chunks and raise "No
+       * agent context found" lookups on the parent's agentContexts map.
+       *
+       * When no registry is provided (legacy isolation), `callbacks: []`
+       * fully detaches the child.
        *
        * `runName` gives the child a distinct LangSmith trace root (avoids
        * nested trace pollution).
        */
+      const callbacks: Callbacks = forwarder ? [forwarder] : [];
       result = await workflow.invoke(
         { messages: [new HumanMessage(description)] },
         {
           recursionLimit: maxTurns * RECURSION_MULTIPLIER,
           signal: this.parentSignal,
-          callbacks: [],
+          callbacks,
           runName: `subagent:${subagentType}`,
           configurable: {
             thread_id: childRunId,
@@ -176,9 +259,21 @@ export class SubagentExecutor {
         }
       );
     } catch (error) {
+      const errorMessage = truncateErrorMessage(error);
+      if (forwarder) {
+        await this.emitSubagentUpdate(parentRegistry!, {
+          childRunId,
+          subagentType,
+          subagentAgentId: childAgentId,
+          parentToolCallId,
+          phase: 'error',
+          label: `Subagent "${subagentType}" errored: ${errorMessage}`,
+          data: { message: errorMessage },
+        });
+      }
       childGraph.clearHeavyState();
       return {
-        content: `Subagent error: ${truncateErrorMessage(error)}`,
+        content: `Subagent error: ${errorMessage}`,
         messages: [],
       };
     }
@@ -211,10 +306,228 @@ export class SubagentExecutor {
       });
     }
 
+    if (forwarder) {
+      await this.emitSubagentUpdate(parentRegistry!, {
+        childRunId,
+        subagentType,
+        subagentAgentId: childAgentId,
+        parentToolCallId,
+        phase: 'stop',
+        label: `Subagent "${subagentType}" finished`,
+      });
+    }
+
     childGraph.clearHeavyState();
 
     return { content: filteredContent, messages: result.messages };
   }
+
+  /**
+   * Emits a single {@link GraphEvents.ON_SUBAGENT_UPDATE} envelope through the
+   * parent's handler registry. Silent no-op when no parent registry is set.
+   * Errors are swallowed — update events are observational.
+   */
+  private async emitSubagentUpdate(
+    parentRegistry: HandlerRegistry,
+    args: {
+      childRunId: string;
+      subagentType: string;
+      subagentAgentId: string;
+      parentToolCallId?: string;
+      phase: SubagentUpdatePhase;
+      data?: unknown;
+      label?: string;
+    }
+  ): Promise<void> {
+    const handler = parentRegistry.getHandler(GraphEvents.ON_SUBAGENT_UPDATE);
+    if (!handler) {
+      return;
+    }
+    const event: SubagentUpdateEvent = {
+      runId: this.parentRunId,
+      subagentRunId: args.childRunId,
+      subagentType: args.subagentType,
+      subagentAgentId: args.subagentAgentId,
+      parentAgentId: this.parentAgentId,
+      parentToolCallId: args.parentToolCallId,
+      phase: args.phase,
+      data: args.data,
+      label: args.label,
+      timestamp: new Date().toISOString(),
+    };
+    try {
+      await handler.handle(GraphEvents.ON_SUBAGENT_UPDATE, event);
+    } catch {
+      /* observational — swallow */
+    }
+  }
+
+  /**
+   * Builds a BaseCallbackHandler that intercepts the child graph's custom
+   * events. Routing rules:
+   *   - `ON_TOOL_EXECUTE` → forwarded as-is to the parent's ON_TOOL_EXECUTE
+   *     handler (so event-driven tools work identically for child and parent).
+   *   - `ON_RUN_STEP` / `ON_RUN_STEP_DELTA` / `ON_RUN_STEP_COMPLETED` /
+   *     `ON_MESSAGE_DELTA` / `ON_REASONING_DELTA` → wrapped in a
+   *     {@link GraphEvents.ON_SUBAGENT_UPDATE} envelope with a human-readable
+   *     label, delivered to the parent's subagent-update handler.
+   *   - Everything else → ignored (keeps parent's UI scoped to the events it
+   *     cares about; host apps can extend by registering more phases).
+   */
+  private createForwarderCallback(args: {
+    parentRegistry: HandlerRegistry;
+    subagentType: string;
+    subagentAgentId: string;
+    childRunId: string;
+    parentToolCallId?: string;
+  }): BaseCallbackHandler {
+    const {
+      parentRegistry,
+      subagentType,
+      subagentAgentId,
+      childRunId,
+      parentToolCallId,
+    } = args;
+    const parentRunId = this.parentRunId;
+    const parentAgentId = this.parentAgentId;
+
+    const wrap = async (
+      eventName: string,
+      phase: SubagentUpdatePhase,
+      data: unknown
+    ): Promise<void> => {
+      const handler = parentRegistry.getHandler(GraphEvents.ON_SUBAGENT_UPDATE);
+      if (!handler) {
+        return;
+      }
+      const event: SubagentUpdateEvent = {
+        runId: parentRunId,
+        subagentRunId: childRunId,
+        subagentType,
+        subagentAgentId,
+        parentAgentId,
+        parentToolCallId,
+        phase,
+        data,
+        label: summarizeEvent(eventName, data),
+        timestamp: new Date().toISOString(),
+      };
+      try {
+        await handler.handle(GraphEvents.ON_SUBAGENT_UPDATE, event);
+      } catch {
+        /* observational — swallow */
+      }
+    };
+
+    const handler = BaseCallbackHandler.fromMethods({
+      [Callback.CUSTOM_EVENT]: async (
+        eventName: string,
+        data: unknown
+      ): Promise<void> => {
+        if (eventName === GraphEvents.ON_TOOL_EXECUTE) {
+          const toolHandler = parentRegistry.getHandler(
+            GraphEvents.ON_TOOL_EXECUTE
+          );
+          if (toolHandler) {
+            await toolHandler.handle(
+              GraphEvents.ON_TOOL_EXECUTE,
+              data as ToolExecuteBatchRequest
+            );
+          }
+          /**
+           * We also surface a short notice in the subagent-update stream so
+           * the UI can show "calling <tool>" for each tool the child spawns.
+           */
+          await wrap(eventName, 'run_step', data);
+          return;
+        }
+
+        if (eventName === GraphEvents.ON_RUN_STEP) {
+          await wrap(eventName, 'run_step', data);
+          return;
+        }
+        if (eventName === GraphEvents.ON_RUN_STEP_DELTA) {
+          await wrap(eventName, 'run_step_delta', data);
+          return;
+        }
+        if (eventName === GraphEvents.ON_RUN_STEP_COMPLETED) {
+          await wrap(eventName, 'run_step_completed', data);
+          return;
+        }
+        if (eventName === GraphEvents.ON_MESSAGE_DELTA) {
+          await wrap(eventName, 'message_delta', data);
+          return;
+        }
+        if (eventName === GraphEvents.ON_REASONING_DELTA) {
+          await wrap(eventName, 'reasoning_delta', data);
+          return;
+        }
+      },
+    });
+    /**
+     * `awaitHandlers = true` is required so the child's `ToolNode` actually
+     * blocks on the parent's `ON_TOOL_EXECUTE` handler until it resolves
+     * the batch request. The same flag applies to observational events
+     * (message_delta, run_step, …), which means a slow
+     * `ON_SUBAGENT_UPDATE` handler on the host serializes the child
+     * stream. If host-side latency becomes a concern, a future
+     * refinement could split operational and observational events into
+     * separate callback handlers with distinct await semantics.
+     */
+    handler.awaitHandlers = true;
+    return handler;
+  }
+}
+
+/**
+ * Produces a short single-line label for an arbitrary forwarded child event.
+ * Used to populate {@link SubagentUpdateEvent.label} so the host UI can show
+ * a compact status ticker without parsing the raw payload.
+ */
+export function summarizeEvent(eventName: string, data: unknown): string {
+  if (eventName === GraphEvents.ON_TOOL_EXECUTE) {
+    const req = data as { toolCalls?: Array<{ name?: string }> };
+    const names = (req.toolCalls ?? [])
+      .map((c) => c.name)
+      .filter((n): n is string => typeof n === 'string');
+    return names.length > 0 ? `Calling ${names.join(', ')}` : 'Calling tool';
+  }
+  if (eventName === GraphEvents.ON_RUN_STEP) {
+    const step = data as {
+      type?: string;
+      stepDetails?: { type?: string; tool_calls?: Array<{ name?: string }> };
+    };
+    const detailType = step.stepDetails?.type ?? step.type ?? 'step';
+    if (detailType === 'tool_calls') {
+      const names = (step.stepDetails?.tool_calls ?? [])
+        .map((c) => c.name)
+        .filter((n): n is string => typeof n === 'string');
+      return names.length > 0
+        ? `Using tool: ${names.join(', ')}`
+        : 'Planning tool call';
+    }
+    if (detailType === 'message_creation') {
+      return 'Thinking…';
+    }
+    return `Step: ${detailType}`;
+  }
+  if (eventName === GraphEvents.ON_RUN_STEP_COMPLETED) {
+    const step = data as {
+      result?: {
+        type?: string;
+        tool_call?: { name?: string; output?: string };
+      };
+    };
+    const tool = step.result?.tool_call;
+    if (tool?.name != null && tool.name !== '') {
+      return `Tool ${tool.name} complete`;
+    }
+    return 'Step complete';
+  }
+  if (eventName === GraphEvents.ON_MESSAGE_DELTA) {
+    return 'Streaming…';
+  }
+  return eventName;
 }
 
 /**
@@ -300,10 +613,15 @@ export function resolveSubagentConfigs(
 
 /**
  * Build child AgentInputs from a resolved config, stripping nesting and
- * event-driven fields. When `allowNested: true`, the child's
+ * (optionally) event-driven fields. When `allowNested: true`, the child's
  * `maxSubagentDepth` is decremented so that depth is consumed as the call
  * chain deepens across graph boundaries — the parent's executor-level check
  * alone cannot see into the child graph's separate executor.
+ *
+ * When `keepToolDefinitions` is `true`, the child retains the parent's
+ * `toolDefinitions` so event-driven tools remain usable. This is only safe
+ * when the caller has wired a forwarder for `ON_TOOL_EXECUTE` to a
+ * registered handler — otherwise the child will hang on tool dispatch.
  *
  * @remarks Advanced utility: exported primarily for testing and by
  * {@link SubagentExecutor}. Host applications configuring subagents should
@@ -316,13 +634,27 @@ export function resolveSubagentConfigs(
 export function buildChildInputs(
   config: ResolvedSubagentConfig,
   childAgentId: string,
-  parentMaxDepth: number
+  parentMaxDepth: number,
+  keepToolDefinitions: boolean = false
 ): AgentInputs {
   const { agentInputs } = config;
   const childInputs: AgentInputs = {
     ...agentInputs,
     agentId: childAgentId,
-    toolDefinitions: undefined,
+    toolDefinitions: keepToolDefinitions
+      ? agentInputs.toolDefinitions
+      : undefined,
+    /**
+     * Subagents run in an isolated context by contract. Parent-run-scoped
+     * fields that would otherwise survive the shallow-spread clone — the
+     * cross-run conversation summary and the prior-turn tool-discovery
+     * set — are cleared here so the child starts fresh. Host applications
+     * that want a subagent to see parent context must thread it in
+     * explicitly (e.g. via the `description` argument to the subagent
+     * tool), not via inherited state.
+     */
+    initialSummary: undefined,
+    discoveredTools: undefined,
   };
 
   if (config.allowNested === true) {
