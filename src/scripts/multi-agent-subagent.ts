@@ -34,7 +34,7 @@ const provider = useAnthropic ? Providers.ANTHROPIC : Providers.OPENAI;
 const apiKey = useAnthropic
   ? process.env.ANTHROPIC_API_KEY
   : process.env.OPENAI_API_KEY;
-const modelName = useAnthropic ? 'claude-sonnet-4-20250514' : 'gpt-4.1';
+const modelName = useAnthropic ? 'claude-sonnet-4-20250514' : 'gpt-5.4';
 
 if (!apiKey) {
   console.error(
