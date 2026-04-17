@@ -4,7 +4,8 @@
 // `src/index.ts` and consumed by `Run.processStream` (RunStart,
 // UserPromptSubmit, Stop, StopFailure), `ToolNode.dispatchToolEvents`
 // (PreToolUse, PostToolUse, PostToolUseFailure, PermissionDenied),
-// and `createSummarizeNode` (PreCompact, PostCompact).
+// `createSummarizeNode` (PreCompact, PostCompact), and
+// `SubagentExecutor.execute` (SubagentStart, SubagentStop).
 export { HookRegistry } from './HookRegistry';
 export { executeHooks, DEFAULT_HOOK_TIMEOUT_MS } from './executeHooks';
 export {
