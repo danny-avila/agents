@@ -1120,6 +1120,28 @@ describe('summarizeEvent', () => {
     expect(summarizeEvent(GraphEvents.ON_MESSAGE_DELTA, {})).toBe('Streaming…');
   });
 
+  it('falls back to top-level `step.type` when `stepDetails` is absent', () => {
+    /**
+     * Covers the `step.stepDetails?.type ?? step.type ?? 'step'` chain
+     * when the payload uses the top-level form (no `stepDetails` wrapper).
+     * Exercises the second clause of the fallback so future changes to
+     * the resolution order fail fast.
+     */
+    expect(
+      summarizeEvent(GraphEvents.ON_RUN_STEP, { type: 'tool_calls' })
+    ).toBe('Planning tool call');
+    expect(
+      summarizeEvent(GraphEvents.ON_RUN_STEP, { type: 'message_creation' })
+    ).toBe('Thinking…');
+  });
+
+  it('falls back to "Step: step" when neither `stepDetails.type` nor `step.type` is present', () => {
+    /** Exercises the final `?? 'step'` default plus the generic
+     *  `Step: <detailType>` branch when a run step arrives with an
+     *  unrecognized shape. */
+    expect(summarizeEvent(GraphEvents.ON_RUN_STEP, {})).toBe('Step: step');
+  });
+
   it('returns the event name for unknown events', () => {
     expect(summarizeEvent('on_unknown_event', {})).toBe('on_unknown_event');
   });
