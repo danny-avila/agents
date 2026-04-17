@@ -148,11 +148,31 @@ export class SubagentExecutor {
     let result: { messages: BaseMessage[] };
     try {
       const workflow = childGraph.createWorkflow();
+      /**
+       * Detach the child invocation from the parent's callback chain.
+       * Without this, `streamEvents` in the parent's `Run.processStream`
+       * captures events from the child graph's LLM calls (e.g.
+       * `on_chat_model_stream` for the "researcher" agent) and delivers
+       * them to the parent's handlers. The parent then tries to resolve
+       * the child's agent ID in its own `agentContexts` map and throws
+       * "No agent context found for agent ID …". Setting `callbacks: []`
+       * overrides the inherited callbacks for this invoke; combined with
+       * the child's own empty `handlerRegistry`/`hookRegistry`, the child
+       * runs fully isolated.
+       *
+       * `runName` gives the child a distinct LangSmith trace root (avoids
+       * nested trace pollution).
+       */
       result = await workflow.invoke(
         { messages: [new HumanMessage(description)] },
         {
           recursionLimit: maxTurns * RECURSION_MULTIPLIER,
           signal: this.parentSignal,
+          callbacks: [],
+          runName: `subagent:${subagentType}`,
+          configurable: {
+            thread_id: childRunId,
+          },
         }
       );
     } catch (error) {
