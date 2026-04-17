@@ -612,4 +612,148 @@ describe('SubagentExecutor', () => {
       expect(result.messages).toEqual([]);
     });
   });
+
+  describe('event forwarding', () => {
+    it('emits start/stop ON_SUBAGENT_UPDATE envelopes when parentHandlerRegistry is provided', async () => {
+      const { HandlerRegistry: HR } = await import('@/events');
+      const { GraphEvents: GE } = await import('@/common');
+      const events: unknown[] = [];
+      const registry = new HR();
+      registry.register(GE.ON_SUBAGENT_UPDATE, {
+        handle: (_event, data): void => {
+          events.push(data);
+        },
+      });
+
+      const { factory } = makeStubGraphFactory({
+        messages: [new AIMessage('done')],
+      });
+      const executor = createExecutor({
+        createChildGraph: factory,
+        parentHandlerRegistry: registry,
+      });
+
+      await executor.execute({
+        description: 'Test task',
+        subagentType: 'researcher',
+      });
+
+      const phases = events.map((e) => (e as { phase: string }).phase);
+      expect(phases[0]).toBe('start');
+      expect(phases[phases.length - 1]).toBe('stop');
+    });
+
+    it('keeps toolDefinitions on child when forwarding is enabled', async () => {
+      const { HandlerRegistry: HR } = await import('@/events');
+      const registry = new HR();
+      let observedChildInputs: AgentInputs | undefined;
+      const configWithDefs: ResolvedSubagentConfig = {
+        type: 'researcher',
+        name: 'Research Specialist',
+        description: 'Researches topics',
+        agentInputs: {
+          agentId: 'researcher',
+          provider: Providers.OPENAI,
+          toolDefinitions: [
+            { name: 'web', description: 'search', parameters: {} },
+          ],
+        } as AgentInputs,
+      };
+
+      const executor = new SubagentExecutor({
+        configs: new Map([[configWithDefs.type, configWithDefs]]),
+        parentRunId: 'run',
+        parentAgentId: 'parent',
+        parentHandlerRegistry: registry,
+        createChildGraph: (input): StandardGraph => {
+          observedChildInputs = input.agents[0];
+          return {
+            createWorkflow: (): { invoke: jest.Mock } => ({
+              invoke: jest.fn().mockResolvedValue({
+                messages: [new AIMessage('ok')],
+              }),
+            }),
+            clearHeavyState: jest.fn(),
+          } as unknown as StandardGraph;
+        },
+      });
+
+      await executor.execute({
+        description: 'find weather',
+        subagentType: 'researcher',
+      });
+
+      expect(observedChildInputs?.toolDefinitions).toHaveLength(1);
+      expect(observedChildInputs?.toolDefinitions?.[0]?.name).toBe('web');
+    });
+
+    it('still strips toolDefinitions when no parentHandlerRegistry is provided (legacy isolation)', async () => {
+      let observedChildInputs: AgentInputs | undefined;
+      const configWithDefs: ResolvedSubagentConfig = {
+        type: 'researcher',
+        name: 'Research Specialist',
+        description: 'Researches topics',
+        agentInputs: {
+          agentId: 'researcher',
+          provider: Providers.OPENAI,
+          toolDefinitions: [
+            { name: 'web', description: 'search', parameters: {} },
+          ],
+        } as AgentInputs,
+      };
+
+      const executor = new SubagentExecutor({
+        configs: new Map([[configWithDefs.type, configWithDefs]]),
+        parentRunId: 'run',
+        parentAgentId: 'parent',
+        createChildGraph: (input): StandardGraph => {
+          observedChildInputs = input.agents[0];
+          return {
+            createWorkflow: (): { invoke: jest.Mock } => ({
+              invoke: jest.fn().mockResolvedValue({
+                messages: [new AIMessage('ok')],
+              }),
+            }),
+            clearHeavyState: jest.fn(),
+          } as unknown as StandardGraph;
+        },
+      });
+
+      await executor.execute({
+        description: 'find weather',
+        subagentType: 'researcher',
+      });
+
+      expect(observedChildInputs?.toolDefinitions).toBeUndefined();
+    });
+
+    it('accepts parentHandlerRegistry as a lazy getter', async () => {
+      const { HandlerRegistry: HR } = await import('@/events');
+      const { GraphEvents: GE } = await import('@/common');
+      const lazyHolder: { registry?: InstanceType<typeof HR> } = {};
+      const events: unknown[] = [];
+      const { factory } = makeStubGraphFactory({
+        messages: [new AIMessage('done')],
+      });
+      const executor = createExecutor({
+        createChildGraph: factory,
+        parentHandlerRegistry: () => lazyHolder.registry,
+      });
+
+      lazyHolder.registry = new HR();
+      lazyHolder.registry.register(GE.ON_SUBAGENT_UPDATE, {
+        handle: (_event, data): void => {
+          events.push(data);
+        },
+      });
+
+      await executor.execute({
+        description: 'Task',
+        subagentType: 'researcher',
+      });
+
+      expect(events.length).toBeGreaterThan(0);
+      expect((events[0] as { phase: string }).phase).toBe('start');
+    });
+  });
 });

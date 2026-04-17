@@ -1176,10 +1176,16 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         agentContext
       );
       if (resolvedConfigs.length > 0) {
+        const getParentHandlerRegistry = (): HandlerRegistry | undefined =>
+          this.handlerRegistry;
         const executor = new SubagentExecutor({
           configs: new Map(resolvedConfigs.map((c) => [c.type, c])),
           parentSignal: this.signal,
           hookRegistry: this.hookRegistry,
+          /** Lazy — Run wires the registry onto the graph AFTER
+           *  `createWorkflow()` runs, so a direct capture here would be
+           *  `undefined` at construction time. */
+          parentHandlerRegistry: getParentHandlerRegistry,
           parentRunId: this.runId ?? '',
           parentAgentId: agentContext.agentId,
           tokenCounter: agentContext.tokenCounter,

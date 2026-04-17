@@ -105,6 +105,7 @@ export interface EventHandler {
       | SummarizeStartEvent
       | SummarizeDeltaEvent
       | SummarizeCompleteEvent
+      | SubagentUpdateEvent
       | AgentLogEvent
       | { result: ToolEndEvent },
     metadata?: Record<string, unknown>,
@@ -410,6 +411,43 @@ export type SubagentConfig = {
 export type ResolvedSubagentConfig = SubagentConfig & {
   agentInputs: AgentInputs;
 };
+
+/** Lifecycle phase carried on {@link SubagentUpdateEvent}. */
+export type SubagentUpdatePhase =
+  | 'start'
+  | 'run_step'
+  | 'run_step_delta'
+  | 'run_step_completed'
+  | 'message_delta'
+  | 'reasoning_delta'
+  | 'stop'
+  | 'error';
+
+/**
+ * Wrapper event emitted when a subagent's child graph dispatches activity.
+ * Lets hosts show subagent progress in a UI surface separate from the parent
+ * conversation without having to untangle events by agent ID.
+ */
+export interface SubagentUpdateEvent {
+  /** Parent run ID. */
+  runId: string;
+  /** Child run ID (unique per subagent execution). */
+  subagentRunId: string;
+  /** Subagent `type` identifier from the SubagentConfig. */
+  subagentType: string;
+  /** Child agent ID assigned to this subagent execution. */
+  subagentAgentId: string;
+  /** Parent agent ID that spawned this subagent. */
+  parentAgentId?: string;
+  /** Lifecycle phase carried by this update. */
+  phase: SubagentUpdatePhase;
+  /** Underlying event payload (shape depends on phase). */
+  data?: unknown;
+  /** Short human-readable description. Hosts can render this directly. */
+  label?: string;
+  /** ISO timestamp for ordering / display. */
+  timestamp: string;
+}
 
 export interface AgentInputs {
   agentId: string;
