@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from '@jest/globals';
+import { describe, it, expect, beforeEach } from '@jest/globals';
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import { HookRegistry } from '@/hooks/HookRegistry';
@@ -265,6 +265,49 @@ describe('buildChildInputs', () => {
 describe('SubagentExecutor', () => {
   const config = makeConfig();
 
+  /**
+   * Build a stub `createChildGraph` factory that returns a minimal
+   * `StandardGraph`-shaped object whose `createWorkflow().invoke()`
+   * resolves to `invokeResult`. Avoids `jest.spyOn(StandardGraph)` so
+   * that SubagentExecutor does not need a runtime dep on the graphs
+   * module (circular-dep-safe).
+   */
+  function makeStubGraphFactory(
+    invokeResult: { messages: BaseMessage[] },
+    clearSpy?: jest.Mock
+  ): { factory: () => StandardGraph; clearHeavyState: jest.Mock } {
+    const mockClear = clearSpy ?? jest.fn();
+    const factory = (): StandardGraph =>
+      ({
+        createWorkflow: (): { invoke: jest.Mock } => ({
+          invoke: jest.fn().mockResolvedValue(invokeResult),
+        }),
+        clearHeavyState: mockClear,
+      }) as unknown as StandardGraph;
+    return { factory, clearHeavyState: mockClear };
+  }
+
+  function makeThrowingGraphFactory(error: Error): () => StandardGraph {
+    return (): StandardGraph =>
+      ({
+        createWorkflow: (): { invoke: jest.Mock } => ({
+          invoke: jest.fn().mockRejectedValue(error),
+        }),
+        clearHeavyState: jest.fn(),
+      }) as unknown as StandardGraph;
+  }
+
+  /** No-op factory for tests that never reach child graph construction. */
+  function makeNoopGraphFactory(): () => StandardGraph {
+    return (): StandardGraph =>
+      ({
+        createWorkflow: (): { invoke: jest.Mock } => ({
+          invoke: jest.fn().mockResolvedValue({ messages: [] }),
+        }),
+        clearHeavyState: jest.fn(),
+      }) as unknown as StandardGraph;
+  }
+
   function createExecutor(
     overrides: Partial<ConstructorParameters<typeof SubagentExecutor>[0]> = {}
   ): SubagentExecutor {
@@ -272,50 +315,10 @@ describe('SubagentExecutor', () => {
       configs: new Map([[config.type, config]]),
       parentRunId: 'test-run',
       parentAgentId: 'parent-agent',
+      createChildGraph: makeNoopGraphFactory(),
       ...overrides,
     });
   }
-
-  /** Spy handle for Graph module mock — set per test, restored in afterEach */
-  let graphSpy: jest.SpyInstance | undefined;
-
-  function mockStandardGraph(
-    invokeResult: { messages: BaseMessage[] },
-    clearSpy?: jest.Mock
-  ): { clearHeavyState: jest.Mock } {
-    const mockClear = clearSpy ?? jest.fn();
-    const GraphModule =
-      jest.requireActual<typeof import('@/graphs/Graph')>('@/graphs/Graph');
-    graphSpy = jest.spyOn(GraphModule, 'StandardGraph').mockImplementation(
-      () =>
-        ({
-          createWorkflow: (): { invoke: jest.Mock } => ({
-            invoke: jest.fn().mockResolvedValue(invokeResult),
-          }),
-          clearHeavyState: mockClear,
-        }) as unknown as StandardGraph
-    );
-    return { clearHeavyState: mockClear };
-  }
-
-  function mockStandardGraphError(error: Error): void {
-    const GraphModule =
-      jest.requireActual<typeof import('@/graphs/Graph')>('@/graphs/Graph');
-    graphSpy = jest.spyOn(GraphModule, 'StandardGraph').mockImplementation(
-      () =>
-        ({
-          createWorkflow: (): { invoke: jest.Mock } => ({
-            invoke: jest.fn().mockRejectedValue(error),
-          }),
-          clearHeavyState: jest.fn(),
-        }) as unknown as StandardGraph
-    );
-  }
-
-  afterEach(() => {
-    graphSpy?.mockRestore();
-    graphSpy = undefined;
-  });
 
   it('returns error for unknown subagent type', async () => {
     const executor = createExecutor();
@@ -340,13 +343,13 @@ describe('SubagentExecutor', () => {
   });
 
   it('executes child graph and returns filtered content', async () => {
-    const executor = createExecutor();
-    const { clearHeavyState } = mockStandardGraph({
+    const { factory, clearHeavyState } = makeStubGraphFactory({
       messages: [
         new HumanMessage('research this topic'),
         new AIMessage('Here is my research summary.'),
       ],
     });
+    const executor = createExecutor({ createChildGraph: factory });
 
     const result = await executor.execute({
       description: 'Research this topic',
@@ -359,8 +362,11 @@ describe('SubagentExecutor', () => {
   });
 
   it('returns error message when child graph throws', async () => {
-    const executor = createExecutor();
-    mockStandardGraphError(new Error('Graph recursion limit reached'));
+    const executor = createExecutor({
+      createChildGraph: makeThrowingGraphFactory(
+        new Error('Graph recursion limit reached')
+      ),
+    });
 
     const result = await executor.execute({
       description: 'Do something',
@@ -373,9 +379,10 @@ describe('SubagentExecutor', () => {
   });
 
   it('truncates long error messages to 200 chars', async () => {
-    const executor = createExecutor();
     const longMessage = 'x'.repeat(500);
-    mockStandardGraphError(new Error(longMessage));
+    const executor = createExecutor({
+      createChildGraph: makeThrowingGraphFactory(new Error(longMessage)),
+    });
 
     const result = await executor.execute({
       description: 'Do something',
@@ -393,9 +400,10 @@ describe('SubagentExecutor', () => {
   });
 
   it('does not truncate short error messages', async () => {
-    const executor = createExecutor();
     const shortMessage = 'brief error detail';
-    mockStandardGraphError(new Error(shortMessage));
+    const executor = createExecutor({
+      createChildGraph: makeThrowingGraphFactory(new Error(shortMessage)),
+    });
 
     const result = await executor.execute({
       description: 'Do something',
@@ -426,31 +434,24 @@ describe('SubagentExecutor', () => {
       },
     };
 
+    let observedChildInputs: AgentInputs | undefined;
     const executor = new SubagentExecutor({
       configs: new Map([[nestedConfig.type, nestedConfig]]),
       parentRunId: 'test-run',
       parentAgentId: 'parent',
       maxDepth: 3,
-    });
-
-    let observedChildInputs: AgentInputs | undefined;
-    const GraphModule =
-      jest.requireActual<typeof import('@/graphs/Graph')>('@/graphs/Graph');
-    graphSpy = jest
-      .spyOn(GraphModule, 'StandardGraph')
-      .mockImplementation(
-        (input: ConstructorParameters<typeof StandardGraph>[0]) => {
-          observedChildInputs = input.agents[0];
-          return {
-            createWorkflow: (): { invoke: jest.Mock } => ({
-              invoke: jest.fn().mockResolvedValue({
-                messages: [new AIMessage('nested done')],
-              }),
+      createChildGraph: (input): StandardGraph => {
+        observedChildInputs = input.agents[0];
+        return {
+          createWorkflow: (): { invoke: jest.Mock } => ({
+            invoke: jest.fn().mockResolvedValue({
+              messages: [new AIMessage('nested done')],
             }),
-            clearHeavyState: jest.fn(),
-          } as unknown as StandardGraph;
-        }
-      );
+          }),
+          clearHeavyState: jest.fn(),
+        } as unknown as StandardGraph;
+      },
+    });
 
     await executor.execute({
       description: 'nested task',
@@ -464,25 +465,21 @@ describe('SubagentExecutor', () => {
 
   it('strips subagentConfigs from child when allowNested is not set', async () => {
     let observedChildInputs: AgentInputs | undefined;
-    const GraphModule =
-      jest.requireActual<typeof import('@/graphs/Graph')>('@/graphs/Graph');
-    graphSpy = jest
-      .spyOn(GraphModule, 'StandardGraph')
-      .mockImplementation(
-        (input: ConstructorParameters<typeof StandardGraph>[0]) => {
-          observedChildInputs = input.agents[0];
-          return {
-            createWorkflow: (): { invoke: jest.Mock } => ({
-              invoke: jest.fn().mockResolvedValue({
-                messages: [new AIMessage('done')],
-              }),
+    const executor = createExecutor({
+      maxDepth: 3,
+      createChildGraph: (input): StandardGraph => {
+        observedChildInputs = input.agents[0];
+        return {
+          createWorkflow: (): { invoke: jest.Mock } => ({
+            invoke: jest.fn().mockResolvedValue({
+              messages: [new AIMessage('done')],
             }),
-            clearHeavyState: jest.fn(),
-          } as unknown as StandardGraph;
-        }
-      );
+          }),
+          clearHeavyState: jest.fn(),
+        } as unknown as StandardGraph;
+      },
+    });
 
-    const executor = createExecutor({ maxDepth: 3 });
     await executor.execute({
       description: 'task',
       subagentType: 'researcher',
@@ -513,8 +510,13 @@ describe('SubagentExecutor', () => {
         ],
       });
 
-      const executor = createExecutor({ hookRegistry: registry });
-      mockStandardGraph({ messages: [new AIMessage('done')] });
+      const { factory } = makeStubGraphFactory({
+        messages: [new AIMessage('done')],
+      });
+      const executor = createExecutor({
+        hookRegistry: registry,
+        createChildGraph: factory,
+      });
 
       await executor.execute({
         description: 'Test task',
@@ -539,8 +541,13 @@ describe('SubagentExecutor', () => {
         ],
       });
 
-      const executor = createExecutor({ hookRegistry: registry });
-      mockStandardGraph({ messages: [new AIMessage('done')] });
+      const { factory } = makeStubGraphFactory({
+        messages: [new AIMessage('done')],
+      });
+      const executor = createExecutor({
+        hookRegistry: registry,
+        createChildGraph: factory,
+      });
 
       await executor.execute({
         description: 'Test task',

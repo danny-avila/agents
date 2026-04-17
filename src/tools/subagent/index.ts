@@ -8,4 +8,5 @@ export type {
   SubagentExecuteParams,
   SubagentExecuteResult,
   SubagentExecutorOptions,
+  ChildGraphFactory,
 } from './SubagentExecutor';

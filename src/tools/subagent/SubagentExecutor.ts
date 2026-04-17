@@ -3,13 +3,14 @@ import { HumanMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import type {
   AgentInputs,
+  StandardGraphInput,
   ResolvedSubagentConfig,
   SubagentConfig,
   TokenCounter,
 } from '@/types';
 import type { AggregatedHookResult, HookRegistry } from '@/hooks';
 import type { AgentContext } from '@/agents/AgentContext';
-import { StandardGraph } from '@/graphs/Graph';
+import type { StandardGraph } from '@/graphs/Graph';
 import { executeHooks } from '@/hooks';
 
 const DEFAULT_MAX_TURNS = 25;
@@ -32,6 +33,15 @@ export type SubagentExecuteResult = {
   messages: BaseMessage[];
 };
 
+/**
+ * Factory that constructs a child graph for subagent execution. Injected
+ * rather than imported so that `SubagentExecutor` does not have a runtime
+ * dependency on `StandardGraph` — this avoids a circular dependency between
+ * `src/graphs/Graph.ts` and `src/tools/subagent/` that would otherwise break
+ * Rollup's chunking under `preserveModules`.
+ */
+export type ChildGraphFactory = (input: StandardGraphInput) => StandardGraph;
+
 export type SubagentExecutorOptions = {
   configs: Map<string, ResolvedSubagentConfig>;
   parentSignal?: AbortSignal;
@@ -41,6 +51,12 @@ export type SubagentExecutorOptions = {
   tokenCounter?: TokenCounter;
   /** Remaining nesting budget. 0 or negative blocks execution. */
   maxDepth?: number;
+  /**
+   * Factory for constructing the isolated child graph. Callers pass
+   * `(input) => new StandardGraph(input)` — injected to break a circular
+   * module dependency.
+   */
+  createChildGraph: ChildGraphFactory;
 };
 
 export class SubagentExecutor {
@@ -51,6 +67,7 @@ export class SubagentExecutor {
   private readonly parentAgentId?: string;
   private readonly tokenCounter?: TokenCounter;
   private readonly maxDepth: number;
+  private readonly createChildGraph: ChildGraphFactory;
 
   constructor(options: SubagentExecutorOptions) {
     this.configs = options.configs;
@@ -60,6 +77,7 @@ export class SubagentExecutor {
     this.parentAgentId = options.parentAgentId;
     this.tokenCounter = options.tokenCounter;
     this.maxDepth = options.maxDepth ?? 1;
+    this.createChildGraph = options.createChildGraph;
   }
 
   async execute(params: SubagentExecuteParams): Promise<SubagentExecuteResult> {
@@ -120,7 +138,7 @@ export class SubagentExecutor {
     const childRunId = `${this.parentRunId}_sub_${nanoid(8)}`;
     const maxTurns = config.maxTurns ?? DEFAULT_MAX_TURNS;
 
-    const childGraph = new StandardGraph({
+    const childGraph = this.createChildGraph({
       runId: childRunId,
       signal: this.parentSignal,
       agents: [childInputs],

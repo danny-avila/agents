@@ -1184,6 +1184,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           parentAgentId: agentContext.agentId,
           tokenCounter: agentContext.tokenCounter,
           maxDepth: effectiveSubagentDepth,
+          createChildGraph: (input): StandardGraph => new StandardGraph(input),
         });
 
         const subagentTool = tool(async (rawInput, config) => {
