@@ -463,6 +463,28 @@ describe('AgentContext', () => {
       ctx.markToolsAsDiscovered(['deferred']);
       expect(ctx.getTokenBudgetBreakdown().toolCount).toBe(1);
     });
+
+    it('toolSchemaTokens snapshot does not auto-update after markToolsAsDiscovered', async () => {
+      const toolDefinitions: t.LCTool[] = [
+        {
+          name: 'deferred',
+          description: 'Loaded via tool search',
+          parameters: { type: 'object', properties: {} },
+          defer_loading: true,
+        },
+      ];
+
+      const ctx = createBasicContext({
+        agentConfig: { toolDefinitions },
+        tokenCounter: mockTokenCounter,
+      });
+
+      await ctx.tokenCalculationPromise;
+      expect(ctx.toolSchemaTokens).toBe(0);
+
+      ctx.markToolsAsDiscovered(['deferred']);
+      expect(ctx.toolSchemaTokens).toBe(0);
+    });
   });
 
   describe('reset()', () => {

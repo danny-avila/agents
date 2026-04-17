@@ -664,7 +664,7 @@ export class AgentContext {
     this.indexTokenCountMap = { ...baseTokenMap };
   }
 
-  /** Tool definitions that get bound to the model (excludes deferred-and-undiscovered entries). */
+  /** Active tool definitions for token accounting (excludes deferred-and-undiscovered entries). */
   private getActiveToolDefinitions(): t.LCTool[] {
     if (!this.toolDefinitions) {
       return [];
@@ -869,6 +869,10 @@ export class AgentContext {
   /**
    * Returns a structured breakdown of how the context token budget is consumed.
    * Useful for diagnostics when context overflow or pruning issues occur.
+   *
+   * Note: `toolCount` reflects discoveries immediately, but `toolSchemaTokens`
+   * is a snapshot taken during `calculateInstructionTokens` and is not
+   * recomputed when `markToolsAsDiscovered` is called mid-run.
    */
   getTokenBudgetBreakdown(messages?: BaseMessage[]): t.TokenBudgetBreakdown {
     const maxContextTokens = this.maxContextTokens ?? 0;
