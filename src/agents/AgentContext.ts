@@ -664,6 +664,17 @@ export class AgentContext {
     this.indexTokenCountMap = { ...baseTokenMap };
   }
 
+  /** Tool definitions that get bound to the model (excludes deferred-and-undiscovered entries). */
+  private getActiveToolDefinitions(): t.LCTool[] {
+    if (!this.toolDefinitions) {
+      return [];
+    }
+    return this.toolDefinitions.filter(
+      (def) =>
+        def.defer_loading !== true || this.discoveredToolNames.has(def.name)
+    );
+  }
+
   /**
    * Calculate tool tokens and add to instruction tokens
    * Note: System message tokens are calculated during systemRunnable creation
@@ -697,21 +708,19 @@ export class AgentContext {
       }
     }
 
-    if (this.toolDefinitions && this.toolDefinitions.length > 0) {
-      for (const def of this.toolDefinitions) {
-        if (countedToolNames.has(def.name)) {
-          continue;
-        }
-        const schema = {
-          type: 'function',
-          function: {
-            name: def.name,
-            description: def.description ?? '',
-            parameters: def.parameters ?? {},
-          },
-        };
-        toolTokens += tokenCounter(new SystemMessage(JSON.stringify(schema)));
+    for (const def of this.getActiveToolDefinitions()) {
+      if (countedToolNames.has(def.name)) {
+        continue;
       }
+      const schema = {
+        type: 'function',
+        function: {
+          name: def.name,
+          description: def.description ?? '',
+          parameters: def.parameters ?? {},
+        },
+      };
+      toolTokens += tokenCounter(new SystemMessage(JSON.stringify(schema)));
     }
 
     const isAnthropic =
@@ -864,7 +873,7 @@ export class AgentContext {
   getTokenBudgetBreakdown(messages?: BaseMessage[]): t.TokenBudgetBreakdown {
     const maxContextTokens = this.maxContextTokens ?? 0;
     const toolCount =
-      (this.tools?.length ?? 0) + (this.toolDefinitions?.length ?? 0);
+      (this.tools?.length ?? 0) + this.getActiveToolDefinitions().length;
     const messageCount = messages?.length ?? 0;
 
     let messageTokens = 0;

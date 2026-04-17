@@ -375,6 +375,94 @@ describe('AgentContext', () => {
 
       expect(ctx.instructionTokens).toBeGreaterThan(initialTokens);
     });
+
+    it('excludes deferred-undiscovered toolDefinitions from toolSchemaTokens', async () => {
+      const activeDef: t.LCTool = {
+        name: 'active_tool',
+        description: 'Always loaded',
+        parameters: { type: 'object', properties: {} },
+      };
+      const deferredDef: t.LCTool = {
+        name: 'deferred_tool',
+        description: 'Loaded via tool search',
+        parameters: { type: 'object', properties: {} },
+        defer_loading: true,
+      };
+
+      const ctxBase = createBasicContext({
+        agentConfig: { toolDefinitions: [activeDef] },
+        tokenCounter: mockTokenCounter,
+      });
+      const ctxWithDeferred = createBasicContext({
+        agentConfig: { toolDefinitions: [activeDef, deferredDef] },
+        tokenCounter: mockTokenCounter,
+      });
+
+      await ctxBase.tokenCalculationPromise;
+      await ctxWithDeferred.tokenCalculationPromise;
+
+      expect(ctxWithDeferred.toolSchemaTokens).toBe(ctxBase.toolSchemaTokens);
+    });
+
+    it('includes deferred toolDefinitions once discovered via discoveredTools input', async () => {
+      const toolDefinitions: t.LCTool[] = [
+        {
+          name: 'deferred_tool',
+          description: 'Loaded via tool search',
+          parameters: { type: 'object', properties: {} },
+          defer_loading: true,
+        },
+      ];
+
+      const ctxUndiscovered = createBasicContext({
+        agentConfig: { toolDefinitions },
+        tokenCounter: mockTokenCounter,
+      });
+      const ctxDiscovered = createBasicContext({
+        agentConfig: { toolDefinitions, discoveredTools: ['deferred_tool'] },
+        tokenCounter: mockTokenCounter,
+      });
+
+      await ctxUndiscovered.tokenCalculationPromise;
+      await ctxDiscovered.tokenCalculationPromise;
+
+      expect(ctxUndiscovered.toolSchemaTokens).toBe(0);
+      expect(ctxDiscovered.toolSchemaTokens).toBeGreaterThan(0);
+    });
+
+    it('getTokenBudgetBreakdown toolCount excludes deferred-undiscovered toolDefinitions', () => {
+      const toolDefinitions: t.LCTool[] = [
+        {
+          name: 'active',
+          parameters: { type: 'object', properties: {} },
+        },
+        {
+          name: 'deferred',
+          defer_loading: true,
+          parameters: { type: 'object', properties: {} },
+        },
+      ];
+
+      const ctx = createBasicContext({ agentConfig: { toolDefinitions } });
+
+      expect(ctx.getTokenBudgetBreakdown().toolCount).toBe(1);
+    });
+
+    it('getTokenBudgetBreakdown toolCount reflects newly discovered deferred tools', () => {
+      const toolDefinitions: t.LCTool[] = [
+        {
+          name: 'deferred',
+          defer_loading: true,
+          parameters: { type: 'object', properties: {} },
+        },
+      ];
+
+      const ctx = createBasicContext({ agentConfig: { toolDefinitions } });
+
+      expect(ctx.getTokenBudgetBreakdown().toolCount).toBe(0);
+      ctx.markToolsAsDiscovered(['deferred']);
+      expect(ctx.getTokenBudgetBreakdown().toolCount).toBe(1);
+    });
   });
 
   describe('reset()', () => {
