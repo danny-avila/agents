@@ -388,6 +388,29 @@ export type MultiAgentGraphInput = StandardGraphInput & {
   edges: GraphEdge[];
 };
 
+/** Configuration for a subagent type that can be spawned by a parent agent. */
+export type SubagentConfig = {
+  /** Identifier used in the tool's `subagent_type` enum (e.g. 'researcher', 'coder'). */
+  type: string;
+  /** Human-readable display name. */
+  name: string;
+  /** What this subagent specializes in — shown to the LLM. */
+  description: string;
+  /** Full agent config for the child graph. Omit when `self` is true. */
+  agentInputs?: AgentInputs;
+  /** When true, reuse the parent's AgentInputs (context isolation without separate config). */
+  self?: boolean;
+  /** Max AGENT→TOOLS cycles before forced stop (default: 25). */
+  maxTurns?: number;
+  /** Allow this subagent to spawn its own subagents (default: false). */
+  allowNested?: boolean;
+};
+
+/** SubagentConfig with agentInputs guaranteed present (self-spawn resolved). */
+export type ResolvedSubagentConfig = SubagentConfig & {
+  agentInputs: AgentInputs;
+};
+
 export interface AgentInputs {
   agentId: string;
   /** Human-readable name for the agent (used in handoff context). Defaults to agentId if not provided. */
@@ -431,6 +454,10 @@ export interface AgentInputs {
   maxToolResultChars?: number;
   /** Pre-computed tool schema token count (from cache). Skips recalculation when provided. */
   toolSchemaTokens?: number;
+  /** Subagent configurations for hierarchical delegation. Each defines a child agent type. */
+  subagentConfigs?: SubagentConfig[];
+  /** Maximum subagent nesting depth. Default 1 means top-level agents can spawn subagents but subagents cannot nest further. */
+  maxSubagentDepth?: number;
 }
 
 export interface ContextPruningConfig {

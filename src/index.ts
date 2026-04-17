@@ -18,6 +18,8 @@ export * from './tools/BashExecutor';
 export * from './tools/ProgrammaticToolCalling';
 export * from './tools/BashProgrammaticToolCalling';
 export * from './tools/SkillTool';
+export * from './tools/SubagentTool';
+export * from './tools/subagent';
 export * from './tools/ReadFile';
 export * from './tools/skillCatalog';
 export * from './tools/ToolSearch';

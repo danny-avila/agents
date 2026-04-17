@@ -186,6 +186,7 @@ export enum Constants {
   READ_FILE = 'read_file',
   BASH_TOOL = 'bash_tool',
   BASH_PROGRAMMATIC_TOOL_CALLING = 'run_tools_with_bash',
+  SUBAGENT = 'subagent',
 }
 
 /** Tool names that use the code execution environment (shared session, file tracking). */
