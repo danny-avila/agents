@@ -27,6 +27,8 @@ export enum GraphEvents {
   ON_SUMMARIZE_DELTA = 'on_summarize_delta',
   /** [Custom] Emitted when the summarize node completes with the final summary */
   ON_SUMMARIZE_COMPLETE = 'on_summarize_complete',
+  /** [Custom] Progress update from a running subagent (wraps child-graph events so hosts can display activity separately from parent). */
+  ON_SUBAGENT_UPDATE = 'on_subagent_update',
   /** [Custom] Diagnostic logging event for context management observability */
   ON_AGENT_LOG = 'on_agent_log',
 

@@ -3,6 +3,7 @@ export {
   filterSubagentResult,
   resolveSubagentConfigs,
   buildChildInputs,
+  summarizeEvent,
 } from './SubagentExecutor';
 export type {
   SubagentExecuteParams,
