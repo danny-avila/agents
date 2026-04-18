@@ -365,6 +365,35 @@ type LogFn = (
 ) => void;
 
 /**
+ * Extracts an HTTP status code from a thrown LLM-provider error. Returns
+ * `undefined` for non-object values (including `null` or `undefined`, both
+ * valid `throw` targets in JS) so callers never dereference a nullish
+ * value.
+ */
+function extractHttpStatus(err: unknown): number | undefined {
+  if (err == null || typeof err !== 'object') {
+    return undefined;
+  }
+  const errRecord = err as Record<string, unknown>;
+  const direct = errRecord.status;
+  if (typeof direct === 'number') {
+    return direct;
+  }
+  const statusCode = errRecord.statusCode;
+  if (typeof statusCode === 'number') {
+    return statusCode;
+  }
+  const response = errRecord.response;
+  if (response != null && typeof response === 'object') {
+    const nested = (response as Record<string, unknown>).status;
+    if (typeof nested === 'number') {
+      return nested;
+    }
+  }
+  return undefined;
+}
+
+/**
  * Formats a provider-level error for logging. Returns both a human-readable
  * suffix (safe to include in the message string so it survives any host-side
  * formatter) and a structured metadata bag for rich log backends.
@@ -386,20 +415,51 @@ function describeProviderError(
     data.errorStack = err.stack;
   }
 
-  const errObj = err as {
-    status?: number;
-    statusCode?: number;
-    response?: { status?: number };
-  };
-  const status =
-    errObj.status ?? errObj.statusCode ?? errObj.response?.status;
-  const statusSuffix = typeof status === 'number' ? ` (HTTP ${status})` : '';
-  if (typeof status === 'number') {
+  const status = extractHttpStatus(err);
+  const statusSuffix = status != null ? ` (HTTP ${status})` : '';
+  if (status != null) {
     data.status = status;
   }
 
   return {
     suffix: `[${providerLabel}]${statusSuffix}: ${errMsg}`,
+    data,
+  };
+}
+
+/**
+ * Formats an exhausted-fallback error. `tryFallbackProviders` throws the
+ * last fallback provider's error, which may be from any of the configured
+ * fallbacks — not the primary — so we label the log with the list of
+ * fallback providers attempted rather than mis-attributing to the primary.
+ */
+function describeFallbackError(
+  err: unknown,
+  fallbacks: ReadonlyArray<{ provider: string | Providers }>
+): { suffix: string; data: Record<string, unknown> } {
+  const errMsg = err instanceof Error ? err.message : String(err);
+  const providerNames = fallbacks.map((f) => String(f.provider));
+  const label =
+    providerNames.length > 0
+      ? `fallbacks=[${providerNames.join(',')}]`
+      : 'no-fallbacks';
+
+  const data: Record<string, unknown> = {
+    fallbackProviders: providerNames,
+    fallbackCount: fallbacks.length,
+  };
+  if (err instanceof Error) {
+    data.errorName = err.name;
+    data.errorStack = err.stack;
+  }
+  const status = extractHttpStatus(err);
+  const statusSuffix = status != null ? ` (HTTP ${status})` : '';
+  if (status != null) {
+    data.status = status;
+  }
+
+  return {
+    suffix: `[${label}]${statusSuffix}: ${errMsg}`,
     data,
   };
 }
@@ -500,14 +560,9 @@ async function executeSummarizationWithFallback(params: {
           );
         }
       } catch (fbErr) {
-        const fbDescribed = describeProviderError(
-          fbErr,
-          clientConfig.provider,
-          clientConfig.modelName
-        );
+        const fbDescribed = describeFallbackError(fbErr, fallbacks);
         log('warn', `Fallback providers also failed ${fbDescribed.suffix}`, {
           ...fbDescribed.data,
-          fallbackCount: fallbacks.length,
         });
       }
     }
