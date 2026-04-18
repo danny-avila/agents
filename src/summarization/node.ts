@@ -440,10 +440,13 @@ function describeProviderError(
  */
 function describeFallbackError(
   err: unknown,
-  fallbacks: ReadonlyArray<unknown>
+  fallbacks: unknown
 ): { suffix: string; data: Record<string, unknown> } {
   const errMsg = err instanceof Error ? err.message : String(err);
-  const providerNames = fallbacks
+  const list: ReadonlyArray<unknown> = Array.isArray(fallbacks)
+    ? fallbacks
+    : [];
+  const providerNames = list
     .map((f) => {
       if (f == null || typeof f !== 'object') {
         return undefined;
@@ -459,7 +462,7 @@ function describeFallbackError(
 
   const data: Record<string, unknown> = {
     fallbackProviders: providerNames,
-    fallbackCount: fallbacks.length,
+    fallbackCount: list.length,
   };
   if (err instanceof Error) {
     data.errorName = err.name;
@@ -538,9 +541,10 @@ async function executeSummarizationWithFallback(params: {
       messagesToRefineCount: messages.length,
     });
 
-    const fallbacks =
-      (clientConfig.clientOptions as unknown as t.LLMConfig | undefined)
-        ?.fallbacks ?? [];
+    const rawFallbacks = (
+      clientConfig.clientOptions as unknown as t.LLMConfig | undefined
+    )?.fallbacks;
+    const fallbacks = Array.isArray(rawFallbacks) ? rawFallbacks : [];
     if (fallbacks.length > 0) {
       try {
         const onChunk = createSummarizationChunkHandler({
