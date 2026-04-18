@@ -432,13 +432,26 @@ function describeProviderError(
  * last fallback provider's error, which may be from any of the configured
  * fallbacks — not the primary — so we label the log with the list of
  * fallback providers attempted rather than mis-attributing to the primary.
+ *
+ * Entries in `fallbacks` are normally strongly typed, but we defend against
+ * malformed runtime config (null/undefined entries, missing `provider`
+ * field) so a recoverable summarization failure is never promoted to an
+ * uncaught exception from inside the logging path.
  */
 function describeFallbackError(
   err: unknown,
-  fallbacks: ReadonlyArray<{ provider: string | Providers }>
+  fallbacks: ReadonlyArray<unknown>
 ): { suffix: string; data: Record<string, unknown> } {
   const errMsg = err instanceof Error ? err.message : String(err);
-  const providerNames = fallbacks.map((f) => String(f.provider));
+  const providerNames = fallbacks
+    .map((f) => {
+      if (f == null || typeof f !== 'object') {
+        return undefined;
+      }
+      const raw = (f as { provider?: unknown }).provider;
+      return raw != null ? String(raw) : undefined;
+    })
+    .filter((p): p is string => typeof p === 'string');
   const label =
     providerNames.length > 0
       ? `fallbacks=[${providerNames.join(',')}]`
