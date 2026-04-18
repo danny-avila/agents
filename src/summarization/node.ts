@@ -389,18 +389,23 @@ async function executeSummarizationWithFallback(params: {
     log,
   } = params;
 
-  const summarizationModel = initializeModel({
-    provider: clientConfig.provider as Providers,
-    clientOptions: clientConfig.clientOptions as t.ClientOptions,
-    tools: agentContext.getToolsForBinding(),
-  }) as t.ChatModel;
-
   const priorSummaryText = agentContext.getSummaryText()?.trim() ?? '';
 
   let summaryText = '';
   let summaryUsage: Partial<UsageMetadata> | undefined;
 
   try {
+    /**
+     * Initialize inside the try so that a misconfigured provider
+     * (e.g. an unrecognized summarization.provider) surfaces through the
+     * `log('error', ...)` path below rather than bubbling up silently.
+     */
+    const summarizationModel = initializeModel({
+      provider: clientConfig.provider as Providers,
+      clientOptions: clientConfig.clientOptions as t.ClientOptions,
+      tools: agentContext.getToolsForBinding(),
+    }) as t.ChatModel;
+
     const result = await summarizeWithCacheHit({
       model: summarizationModel,
       messages,
