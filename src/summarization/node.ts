@@ -365,6 +365,46 @@ type LogFn = (
 ) => void;
 
 /**
+ * Formats a provider-level error for logging. Returns both a human-readable
+ * suffix (safe to include in the message string so it survives any host-side
+ * formatter) and a structured metadata bag for rich log backends.
+ */
+function describeProviderError(
+  err: unknown,
+  provider: string,
+  modelName?: string
+): { suffix: string; data: Record<string, unknown> } {
+  const providerLabel = `${provider}/${modelName ?? '(no-model)'}`;
+  const errMsg = err instanceof Error ? err.message : String(err);
+
+  const data: Record<string, unknown> = {
+    provider,
+    model: modelName,
+  };
+  if (err instanceof Error) {
+    data.errorName = err.name;
+    data.errorStack = err.stack;
+  }
+
+  const errObj = err as {
+    status?: number;
+    statusCode?: number;
+    response?: { status?: number };
+  };
+  const status =
+    errObj.status ?? errObj.statusCode ?? errObj.response?.status;
+  const statusSuffix = typeof status === 'number' ? ` (HTTP ${status})` : '';
+  if (typeof status === 'number') {
+    data.status = status;
+  }
+
+  return {
+    suffix: `[${providerLabel}]${statusSuffix}: ${errMsg}`,
+    data,
+  };
+}
+
+/**
  * Runs the summarization LLM call with primary + fallback providers,
  * falling back to a metadata stub when all calls fail.
  */
@@ -415,13 +455,13 @@ async function executeSummarizationWithFallback(params: {
     summaryText = result.text;
     summaryUsage = result.usage;
   } catch (primaryError) {
-    log('error', 'Summarization LLM call failed', {
-      error:
-        primaryError instanceof Error
-          ? primaryError.message
-          : String(primaryError),
-      provider: clientConfig.provider,
-      model: clientConfig.modelName,
+    const primaryDescribed = describeProviderError(
+      primaryError,
+      clientConfig.provider,
+      clientConfig.modelName
+    );
+    log('error', `Summarization LLM call failed ${primaryDescribed.suffix}`, {
+      ...primaryDescribed.data,
       messagesToRefineCount: messages.length,
     });
 
@@ -460,18 +500,26 @@ async function executeSummarizationWithFallback(params: {
           );
         }
       } catch (fbErr) {
-        log('warn', 'Fallback providers also failed', {
-          error: fbErr instanceof Error ? fbErr.message : String(fbErr),
+        const fbDescribed = describeProviderError(
+          fbErr,
+          clientConfig.provider,
+          clientConfig.modelName
+        );
+        log('warn', `Fallback providers also failed ${fbDescribed.suffix}`, {
+          ...fbDescribed.data,
+          fallbackCount: fallbacks.length,
         });
       }
     }
     if (!summaryText) {
-      log('warn', 'Summarization failed, falling back to metadata stub', {
-        error:
-          primaryError instanceof Error
-            ? primaryError.message
-            : String(primaryError),
-      });
+      log(
+        'warn',
+        `Summarization failed, falling back to metadata stub ${primaryDescribed.suffix}`,
+        {
+          ...primaryDescribed.data,
+          messagesToRefineCount: messages.length,
+        }
+      );
       summaryText = generateMetadataStub(messages);
     }
   }
