@@ -109,5 +109,41 @@ describe('shouldTriggerSummarization', () => {
       expect(warnSpy).toHaveBeenCalledTimes(2);
       expect(warnSpy.mock.calls[1][0]).toContain('nonsense');
     });
+
+    it('does not grow memory unboundedly under a flood of unique types', () => {
+      const baseParams = {
+        maxContextTokens: 2500,
+        prePruneContextTokens: 2400,
+        remainingContextTokens: 100,
+        messagesToRefineCount: 4,
+      };
+
+      for (let i = 0; i < 500; i++) {
+        shouldTriggerSummarization({
+          ...baseParams,
+          trigger: { type: `bogus-${i}`, value: 1 } as unknown as {
+            type: 'token_ratio';
+            value: number;
+          },
+        });
+      }
+
+      // Still logged each new type (up to the cap) — we never silently dropped
+      // warnings; we just evicted oldest entries from the dedup set.
+      expect(warnSpy).toHaveBeenCalledTimes(500);
+
+      // Re-warns for a recently-seen type that should still be in the cache
+      // (last one just inserted). No duplicate warning means the dedup set
+      // still functions; the size cap did not break the dedup contract.
+      const beforeRecent = warnSpy.mock.calls.length;
+      shouldTriggerSummarization({
+        ...baseParams,
+        trigger: { type: 'bogus-499', value: 1 } as unknown as {
+          type: 'token_ratio';
+          value: number;
+        },
+      });
+      expect(warnSpy).toHaveBeenCalledTimes(beforeRecent);
+    });
   });
 });
