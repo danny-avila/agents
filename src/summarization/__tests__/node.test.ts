@@ -343,6 +343,48 @@ describe('createSummarizeNode', () => {
     ).toBeUndefined();
   });
 
+  it('catches model initialization errors and falls back to metadata stub', async () => {
+    captureEvents();
+
+    /**
+     * Simulate the "Unsupported LLM provider" case — e.g. when a caller
+     * forwards an unrecognized provider name (custom-endpoint label) that
+     * getChatModelClass cannot resolve. Prior to the defense-in-depth fix,
+     * this error was thrown outside the try/catch in executeSummarizationWithFallback
+     * and bubbled up silently. Now it is caught and the metadata stub is used.
+     */
+    jest.spyOn(providers, 'getChatModelClass').mockImplementation(() => {
+      throw new Error('Unsupported LLM provider: Ollama');
+    });
+
+    const setSummary = jest.fn();
+    const agentContext = createAgentContext({ setSummary } as never);
+    const graph = mockGraph();
+    const node = createSummarizeNode({
+      agentContext,
+      graph,
+      generateStepId,
+    });
+
+    await expect(
+      node(
+        {
+          messages: [new HumanMessage('Test message')],
+          summarizationRequest: {
+            remainingContextTokens: 1000,
+            agentId: 'agent_0',
+          },
+        },
+        {} as RunnableConfig
+      )
+    ).resolves.not.toThrow();
+
+    expect(setSummary).toHaveBeenCalledWith(
+      expect.stringContaining('[Metadata summary:'),
+      expect.any(Number)
+    );
+  });
+
   it('falls back to metadata stub when primary LLM call fails', async () => {
     captureEvents();
 
