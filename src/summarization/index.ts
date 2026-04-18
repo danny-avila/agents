@@ -1,5 +1,34 @@
 import type { SummarizationTrigger } from '@/types';
 
+const VALID_TRIGGER_TYPES = [
+  'token_ratio',
+  'remaining_tokens',
+  'messages_to_refine',
+] as const;
+
+const warnedUnrecognizedTriggerTypes = new Set<string>();
+
+/**
+ * Warn (once per process, per unrecognized type) when the configured trigger
+ * type is something the runtime does not evaluate. Without this, a misconfigured
+ * `trigger.type` silently disables summarization with no visible signal.
+ */
+function warnUnrecognizedTriggerType(type: string): void {
+  if (warnedUnrecognizedTriggerTypes.has(type)) {
+    return;
+  }
+  warnedUnrecognizedTriggerTypes.add(type);
+  console.warn(
+    `[shouldTriggerSummarization] Unrecognized trigger.type: "${type}". ` +
+      `Summarization will not fire. Valid values: ${VALID_TRIGGER_TYPES.join(', ')}.`
+  );
+}
+
+/** For tests only. Resets the dedup set so warnings can be observed again. */
+export function _resetUnrecognizedTriggerWarnings(): void {
+  warnedUnrecognizedTriggerTypes.clear();
+}
+
 /**
  * Determines whether summarization should be triggered based on the configured trigger
  * and current context state.
@@ -98,5 +127,6 @@ export function shouldTriggerSummarization(params: {
   }
 
   // Unrecognized trigger type: cannot evaluate, do not fire.
+  warnUnrecognizedTriggerType(trigger.type);
   return false;
 }
