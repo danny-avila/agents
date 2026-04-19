@@ -365,6 +365,122 @@ type LogFn = (
 ) => void;
 
 /**
+ * Extracts an HTTP status code from a thrown LLM-provider error. Returns
+ * `undefined` for non-object values (including `null` or `undefined`, both
+ * valid `throw` targets in JS) so callers never dereference a nullish
+ * value.
+ */
+function extractHttpStatus(err: unknown): number | undefined {
+  if (err == null || typeof err !== 'object') {
+    return undefined;
+  }
+  const errRecord = err as Record<string, unknown>;
+  const direct = errRecord.status;
+  if (typeof direct === 'number') {
+    return direct;
+  }
+  const statusCode = errRecord.statusCode;
+  if (typeof statusCode === 'number') {
+    return statusCode;
+  }
+  const response = errRecord.response;
+  if (response != null && typeof response === 'object') {
+    const nested = (response as Record<string, unknown>).status;
+    if (typeof nested === 'number') {
+      return nested;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Formats a provider-level error for logging. Returns both a human-readable
+ * suffix (safe to include in the message string so it survives any host-side
+ * formatter) and a structured metadata bag for rich log backends.
+ */
+function describeProviderError(
+  err: unknown,
+  provider: string,
+  modelName?: string
+): { suffix: string; data: Record<string, unknown> } {
+  const providerLabel = `${provider}/${modelName ?? '(no-model)'}`;
+  const errMsg = err instanceof Error ? err.message : String(err);
+
+  const data: Record<string, unknown> = {
+    provider,
+    model: modelName,
+  };
+  if (err instanceof Error) {
+    data.errorName = err.name;
+    data.errorStack = err.stack;
+  }
+
+  const status = extractHttpStatus(err);
+  const statusSuffix = status != null ? ` (HTTP ${status})` : '';
+  if (status != null) {
+    data.status = status;
+  }
+
+  return {
+    suffix: `[${providerLabel}]${statusSuffix}: ${errMsg}`,
+    data,
+  };
+}
+
+/**
+ * Formats an exhausted-fallback error. `tryFallbackProviders` throws the
+ * last fallback provider's error, which may be from any of the configured
+ * fallbacks — not the primary — so we label the log with the list of
+ * fallback providers attempted rather than mis-attributing to the primary.
+ *
+ * Entries in `fallbacks` are normally strongly typed, but we defend against
+ * malformed runtime config (null/undefined entries, missing `provider`
+ * field) so a recoverable summarization failure is never promoted to an
+ * uncaught exception from inside the logging path.
+ */
+function describeFallbackError(
+  err: unknown,
+  fallbacks: unknown
+): { suffix: string; data: Record<string, unknown> } {
+  const errMsg = err instanceof Error ? err.message : String(err);
+  const list: ReadonlyArray<unknown> = Array.isArray(fallbacks)
+    ? fallbacks
+    : [];
+  const providerNames = list
+    .map((f) => {
+      if (f == null || typeof f !== 'object') {
+        return undefined;
+      }
+      const raw = (f as { provider?: unknown }).provider;
+      return raw != null ? String(raw) : undefined;
+    })
+    .filter((p): p is string => typeof p === 'string');
+  const label =
+    providerNames.length > 0
+      ? `fallbacks=[${providerNames.join(',')}]`
+      : 'no-fallbacks';
+
+  const data: Record<string, unknown> = {
+    fallbackProviders: providerNames,
+    fallbackCount: list.length,
+  };
+  if (err instanceof Error) {
+    data.errorName = err.name;
+    data.errorStack = err.stack;
+  }
+  const status = extractHttpStatus(err);
+  const statusSuffix = status != null ? ` (HTTP ${status})` : '';
+  if (status != null) {
+    data.status = status;
+  }
+
+  return {
+    suffix: `[${label}]${statusSuffix}: ${errMsg}`,
+    data,
+  };
+}
+
+/**
  * Runs the summarization LLM call with primary + fallback providers,
  * falling back to a metadata stub when all calls fail.
  */
@@ -415,19 +531,20 @@ async function executeSummarizationWithFallback(params: {
     summaryText = result.text;
     summaryUsage = result.usage;
   } catch (primaryError) {
-    log('error', 'Summarization LLM call failed', {
-      error:
-        primaryError instanceof Error
-          ? primaryError.message
-          : String(primaryError),
-      provider: clientConfig.provider,
-      model: clientConfig.modelName,
+    const primaryDescribed = describeProviderError(
+      primaryError,
+      clientConfig.provider,
+      clientConfig.modelName
+    );
+    log('error', `Summarization LLM call failed ${primaryDescribed.suffix}`, {
+      ...primaryDescribed.data,
       messagesToRefineCount: messages.length,
     });
 
-    const fallbacks =
-      (clientConfig.clientOptions as unknown as t.LLMConfig | undefined)
-        ?.fallbacks ?? [];
+    const rawFallbacks = (
+      clientConfig.clientOptions as unknown as t.LLMConfig | undefined
+    )?.fallbacks;
+    const fallbacks = Array.isArray(rawFallbacks) ? rawFallbacks : [];
     if (fallbacks.length > 0) {
       try {
         const onChunk = createSummarizationChunkHandler({
@@ -460,18 +577,21 @@ async function executeSummarizationWithFallback(params: {
           );
         }
       } catch (fbErr) {
-        log('warn', 'Fallback providers also failed', {
-          error: fbErr instanceof Error ? fbErr.message : String(fbErr),
+        const fbDescribed = describeFallbackError(fbErr, fallbacks);
+        log('warn', `Fallback providers also failed ${fbDescribed.suffix}`, {
+          ...fbDescribed.data,
         });
       }
     }
     if (!summaryText) {
-      log('warn', 'Summarization failed, falling back to metadata stub', {
-        error:
-          primaryError instanceof Error
-            ? primaryError.message
-            : String(primaryError),
-      });
+      log(
+        'warn',
+        `Summarization failed, falling back to metadata stub ${primaryDescribed.suffix}`,
+        {
+          ...primaryDescribed.data,
+          messagesToRefineCount: messages.length,
+        }
+      );
       summaryText = generateMetadataStub(messages);
     }
   }
