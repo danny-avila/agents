@@ -1,5 +1,51 @@
 import type { SummarizationTrigger } from '@/types';
 
+const VALID_TRIGGER_TYPES = [
+  'token_ratio',
+  'remaining_tokens',
+  'messages_to_refine',
+] as const;
+
+/**
+ * Upper bound on the dedup set for unrecognized trigger types. Bounds memory in
+ * case a caller threads dynamic/user-provided strings through `trigger.type`.
+ * Well above the handful of legit misconfigurations a process would ever see.
+ */
+const MAX_WARNED_TRIGGER_TYPES = 32;
+
+const warnedUnrecognizedTriggerTypes = new Set<string>();
+
+/**
+ * Warn (once per process, per unrecognized type) when the configured trigger
+ * type is something the runtime does not evaluate. Without this, a misconfigured
+ * `trigger.type` silently disables summarization with no visible signal.
+ *
+ * The dedup set is size-capped; on overflow we evict the oldest entry (Set
+ * preserves insertion order) so we keep bounded memory and still warn on
+ * recently-seen types.
+ */
+function warnUnrecognizedTriggerType(type: string): void {
+  if (warnedUnrecognizedTriggerTypes.has(type)) {
+    return;
+  }
+  if (warnedUnrecognizedTriggerTypes.size >= MAX_WARNED_TRIGGER_TYPES) {
+    const oldest = warnedUnrecognizedTriggerTypes.values().next().value;
+    if (oldest !== undefined) {
+      warnedUnrecognizedTriggerTypes.delete(oldest);
+    }
+  }
+  warnedUnrecognizedTriggerTypes.add(type);
+  console.warn(
+    `[shouldTriggerSummarization] Unrecognized trigger.type: "${type}". ` +
+      `Summarization will not fire. Valid values: ${VALID_TRIGGER_TYPES.join(', ')}.`
+  );
+}
+
+/** For tests only. Resets the dedup set so warnings can be observed again. */
+export function _resetUnrecognizedTriggerWarnings(): void {
+  warnedUnrecognizedTriggerTypes.clear();
+}
+
 /**
  * Determines whether summarization should be triggered based on the configured trigger
  * and current context state.
@@ -98,5 +144,6 @@ export function shouldTriggerSummarization(params: {
   }
 
   // Unrecognized trigger type: cannot evaluate, do not fire.
+  warnUnrecognizedTriggerType(trigger.type);
   return false;
 }
