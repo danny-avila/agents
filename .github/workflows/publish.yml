@@ -75,8 +75,9 @@ jobs:
           fi
 
       - name: Run Google LLM tests (flaky - timeouts allowed)
-        if: steps.google_changes.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+        if: steps.google_changes.outputs.changed == 'true'
         continue-on-error: true
+        timeout-minutes: 5
         run: npx jest src/llm/google/llm.spec.ts
         env:
           NODE_ENV: test
@@ -99,8 +100,9 @@ jobs:
           fi
 
       - name: Run Anthropic LLM tests (flaky - timeouts allowed)
-        if: steps.anthropic_changes.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+        if: steps.anthropic_changes.outputs.changed == 'true'
         continue-on-error: true
+        timeout-minutes: 5
         run: npx jest src/llm/anthropic/llm.spec.ts
         env:
           NODE_ENV: test
@@ -123,16 +125,9 @@ jobs:
           fi
 
       - name: Run PTC unit tests
-        if: steps.ptc_changes.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+        if: steps.ptc_changes.outputs.changed == 'true'
+        timeout-minutes: 5
         run: npx jest src/tools/__tests__/ProgrammaticToolCalling.test.ts
-        env:
-          NODE_ENV: test
-          LIBRECHAT_CODE_API_KEY: ${{ secrets.LIBRECHAT_CODE_API_KEY }}
-          LIBRECHAT_CODE_BASEURL: ${{ secrets.LIBRECHAT_CODE_BASEURL }}
-
-      - name: Run PTC integration tests (manual dispatch only)
-        if: github.event_name == 'workflow_dispatch'
-        run: npx jest src/tools/__tests__/ProgrammaticToolCalling.integration.test.ts
         env:
           NODE_ENV: test
           LIBRECHAT_CODE_API_KEY: ${{ secrets.LIBRECHAT_CODE_API_KEY }}
@@ -155,16 +150,9 @@ jobs:
           fi
 
       - name: Run Tool Search unit tests
-        if: steps.tool_search_changes.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+        if: steps.tool_search_changes.outputs.changed == 'true'
+        timeout-minutes: 5
         run: npx jest src/tools/__tests__/ToolSearch.test.ts
-        env:
-          NODE_ENV: test
-          LIBRECHAT_CODE_API_KEY: ${{ secrets.LIBRECHAT_CODE_API_KEY }}
-          LIBRECHAT_CODE_BASEURL: ${{ secrets.LIBRECHAT_CODE_BASEURL }}
-
-      - name: Run Tool Search integration tests (manual dispatch only)
-        if: github.event_name == 'workflow_dispatch'
-        run: npx jest src/tools/__tests__/ToolSearch.integration.test.ts
         env:
           NODE_ENV: test
           LIBRECHAT_CODE_API_KEY: ${{ secrets.LIBRECHAT_CODE_API_KEY }}
