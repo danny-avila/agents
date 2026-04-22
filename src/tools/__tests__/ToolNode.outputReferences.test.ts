@@ -1,8 +1,11 @@
 import { z } from 'zod';
 import { tool } from '@langchain/core/tools';
 import { AIMessage, ToolMessage } from '@langchain/core/messages';
-import { describe, it, expect } from '@jest/globals';
+import { describe, it, expect, jest, afterEach } from '@jest/globals';
 import type { StructuredToolInterface } from '@langchain/core/tools';
+import type * as t from '@/types';
+import * as events from '@/utils/events';
+import { HookRegistry } from '@/hooks';
 import { ToolNode } from '../ToolNode';
 import { TOOL_OUTPUT_REF_KEY } from '../toolOutputReferences';
 
@@ -73,7 +76,7 @@ describe('ToolNode tool output references', () => {
       ]);
 
       expect(msg.content).toBe('plain-output');
-      expect(node.getToolOutputRegistry()).toBeUndefined();
+      expect(node._unsafeGetToolOutputRegistry()).toBeUndefined();
     });
 
     it('does not substitute placeholders when disabled', async () => {
@@ -249,7 +252,7 @@ describe('ToolNode tool output references', () => {
 
       await invokeBatch(node, [{ id: 'c1', name: 'echo', command: 'x' }]);
 
-      const registry = node.getToolOutputRegistry();
+      const registry = node._unsafeGetToolOutputRegistry();
       expect(registry).toBeDefined();
       expect(registry!.get('tool0turn0')!.length).toBeLessThanOrEqual(40);
     });
@@ -272,7 +275,7 @@ describe('ToolNode tool output references', () => {
       await invokeBatch(node, [{ id: 'c2', name: 'echo', command: 'x' }]);
       await invokeBatch(node, [{ id: 'c3', name: 'echo', command: 'x' }]);
 
-      const registry = node.getToolOutputRegistry()!;
+      const registry = node._unsafeGetToolOutputRegistry()!;
       expect(registry.get('tool0turn0')).toBeUndefined();
       expect(registry.get('tool0turn1')).toBe('bbbbb');
       expect(registry.get('tool0turn2')).toBe('ccccc');
@@ -300,7 +303,318 @@ describe('ToolNode tool output references', () => {
       ]);
 
       expect((msg.content as string).startsWith('[ref:')).toBe(false);
-      expect(node.getToolOutputRegistry()!.get('tool0turn0')).toBeUndefined();
+      expect(
+        node._unsafeGetToolOutputRegistry()!.get('tool0turn0')
+      ).toBeUndefined();
+    });
+
+    it('resets the registry and turn counter when the runId changes', async () => {
+      const capturedArgs: string[] = [];
+      const t1 = createEchoTool({
+        capturedArgs,
+        outputs: ['from-run-A', 'from-run-B'],
+      });
+      const node = new ToolNode({
+        tools: [t1],
+        toolOutputReferences: { enabled: true },
+      });
+
+      const aiMsgA = aiMsgWithCalls([
+        { id: 'a1', name: 'echo', command: 'first' },
+      ]);
+      await node.invoke(
+        { messages: [aiMsgA] },
+        { configurable: { run_id: 'run-A' } }
+      );
+
+      const aiMsgB = aiMsgWithCalls([
+        {
+          id: 'b1',
+          name: 'echo',
+          command: 'echo {{tool0turn0}}',
+        },
+      ]);
+      const resultB = (await node.invoke(
+        { messages: [aiMsgB] },
+        { configurable: { run_id: 'run-B' } }
+      )) as { messages: ToolMessage[] };
+
+      expect(capturedArgs[1]).toBe('echo {{tool0turn0}}');
+      expect(resultB.messages[0].content).toContain('[ref: tool0turn0]');
+      expect(resultB.messages[0].content).toContain(
+        '[unresolved refs: tool0turn0]'
+      );
+    });
+  });
+
+  describe('event-driven dispatch path', () => {
+    afterEach(() => {
+      jest.restoreAllMocks();
+    });
+
+    function mockEventDispatch(mockResults: t.ToolExecuteResult[]): void {
+      jest
+        .spyOn(events, 'safeDispatchCustomEvent')
+        .mockImplementation(async (event, data) => {
+          if (event !== 'on_tool_execute') {
+            return;
+          }
+          const request = data as Record<string, unknown>;
+          if (typeof request.resolve === 'function') {
+            (request.resolve as (r: t.ToolExecuteResult[]) => void)(
+              mockResults
+            );
+          }
+        });
+    }
+
+    function createSchemaStub(name: string): StructuredToolInterface {
+      return tool(async () => 'unused', {
+        name,
+        description: 'schema-only stub; host executes via ON_TOOL_EXECUTE',
+        schema: z.object({ command: z.string() }),
+      }) as unknown as StructuredToolInterface;
+    }
+
+    it('annotates the output the host returns', async () => {
+      const node = new ToolNode({
+        tools: [createSchemaStub('echo')],
+        eventDrivenMode: true,
+        agentId: 'agent-x',
+        toolCallStepIds: new Map([['ec1', 'step_ec1']]),
+        toolOutputReferences: { enabled: true },
+      });
+
+      mockEventDispatch([
+        { toolCallId: 'ec1', content: 'host-output', status: 'success' },
+      ]);
+
+      const aiMsg = new AIMessage({
+        content: '',
+        tool_calls: [{ id: 'ec1', name: 'echo', args: { command: 'run' } }],
+      });
+      const result = (await node.invoke({ messages: [aiMsg] })) as {
+        messages: ToolMessage[];
+      };
+
+      expect(result.messages[0].content).toBe('[ref: tool0turn0]\nhost-output');
+      expect(node._unsafeGetToolOutputRegistry()!.get('tool0turn0')).toBe(
+        'host-output'
+      );
+    });
+
+    it('substitutes `{{…}}` in the request sent to the host', async () => {
+      const node = new ToolNode({
+        tools: [createSchemaStub('echo')],
+        eventDrivenMode: true,
+        agentId: 'agent-x',
+        toolCallStepIds: new Map([
+          ['ec1', 'step_ec1'],
+          ['ec2', 'step_ec2'],
+        ]),
+        toolOutputReferences: { enabled: true },
+      });
+
+      mockEventDispatch([
+        { toolCallId: 'ec1', content: 'FIRST', status: 'success' },
+      ]);
+      await node.invoke({
+        messages: [
+          new AIMessage({
+            content: '',
+            tool_calls: [{ id: 'ec1', name: 'echo', args: { command: 'a' } }],
+          }),
+        ],
+      });
+
+      jest.restoreAllMocks();
+      const capturedRequests: t.ToolCallRequest[] = [];
+      jest
+        .spyOn(events, 'safeDispatchCustomEvent')
+        .mockImplementation(async (event, data) => {
+          if (event !== 'on_tool_execute') {
+            return;
+          }
+          const batch = data as t.ToolExecuteBatchRequest;
+          for (const req of batch.toolCalls) {
+            capturedRequests.push(req);
+          }
+          batch.resolve([
+            { toolCallId: 'ec2', content: 'SECOND', status: 'success' },
+          ]);
+        });
+
+      await node.invoke({
+        messages: [
+          new AIMessage({
+            content: '',
+            tool_calls: [
+              {
+                id: 'ec2',
+                name: 'echo',
+                args: { command: 'see {{tool0turn0}}' },
+              },
+            ],
+          }),
+        ],
+      });
+
+      expect(capturedRequests).toHaveLength(1);
+      expect(capturedRequests[0].args).toEqual({ command: 'see FIRST' });
+    });
+
+    it('reports unresolved refs even when the host succeeds', async () => {
+      const node = new ToolNode({
+        tools: [createSchemaStub('echo')],
+        eventDrivenMode: true,
+        agentId: 'agent-x',
+        toolCallStepIds: new Map([['ec1', 'step_ec1']]),
+        toolOutputReferences: { enabled: true },
+      });
+
+      mockEventDispatch([
+        { toolCallId: 'ec1', content: 'done', status: 'success' },
+      ]);
+      const result = (await node.invoke({
+        messages: [
+          new AIMessage({
+            content: '',
+            tool_calls: [
+              {
+                id: 'ec1',
+                name: 'echo',
+                args: { command: 'see {{tool9turn9}}' },
+              },
+            ],
+          }),
+        ],
+      })) as { messages: ToolMessage[] };
+
+      expect(result.messages[0].content).toContain(
+        '[unresolved refs: tool9turn9]'
+      );
+    });
+
+    it('registers the post-hook output when PostToolUse replaces it', async () => {
+      const hooks = new HookRegistry();
+      hooks.register('PostToolUse', {
+        hooks: [
+          async (): Promise<{ updatedOutput: string }> => ({
+            updatedOutput: 'hooked-output',
+          }),
+        ],
+      });
+      const node = new ToolNode({
+        tools: [createSchemaStub('echo')],
+        eventDrivenMode: true,
+        agentId: 'agent-x',
+        toolCallStepIds: new Map([['ec1', 'step_ec1']]),
+        toolOutputReferences: { enabled: true },
+        hookRegistry: hooks,
+      });
+
+      mockEventDispatch([
+        { toolCallId: 'ec1', content: 'raw-output', status: 'success' },
+      ]);
+      const result = (await node.invoke(
+        {
+          messages: [
+            new AIMessage({
+              content: '',
+              tool_calls: [
+                { id: 'ec1', name: 'echo', args: { command: 'run' } },
+              ],
+            }),
+          ],
+        },
+        { configurable: { run_id: 'run-posthook' } }
+      )) as { messages: ToolMessage[] };
+
+      expect(result.messages[0].content).toBe(
+        '[ref: tool0turn0]\nhooked-output'
+      );
+      expect(node._unsafeGetToolOutputRegistry()!.get('tool0turn0')).toBe(
+        'hooked-output'
+      );
+    });
+
+    it('re-resolves placeholders when PreToolUse rewrites args', async () => {
+      const hooks = new HookRegistry();
+      hooks.register('PreToolUse', {
+        hooks: [
+          async (): Promise<{ updatedInput: { command: string } }> => ({
+            updatedInput: { command: 'rewritten {{tool0turn0}}' },
+          }),
+        ],
+      });
+      const node = new ToolNode({
+        tools: [createSchemaStub('echo')],
+        eventDrivenMode: true,
+        agentId: 'agent-x',
+        toolCallStepIds: new Map([
+          ['ec1', 'step_ec1'],
+          ['ec2', 'step_ec2'],
+        ]),
+        toolOutputReferences: { enabled: true },
+        hookRegistry: hooks,
+      });
+
+      mockEventDispatch([
+        { toolCallId: 'ec1', content: 'STORED', status: 'success' },
+      ]);
+      await node.invoke(
+        {
+          messages: [
+            new AIMessage({
+              content: '',
+              tool_calls: [
+                { id: 'ec1', name: 'echo', args: { command: 'first' } },
+              ],
+            }),
+          ],
+        },
+        { configurable: { run_id: 'run-hookresolve' } }
+      );
+
+      jest.restoreAllMocks();
+      const capturedRequests: t.ToolCallRequest[] = [];
+      jest
+        .spyOn(events, 'safeDispatchCustomEvent')
+        .mockImplementation(async (event, data) => {
+          if (event !== 'on_tool_execute') {
+            return;
+          }
+          const batch = data as t.ToolExecuteBatchRequest;
+          for (const req of batch.toolCalls) {
+            capturedRequests.push(req);
+          }
+          batch.resolve([
+            { toolCallId: 'ec2', content: 'done', status: 'success' },
+          ]);
+        });
+
+      await node.invoke(
+        {
+          messages: [
+            new AIMessage({
+              content: '',
+              tool_calls: [
+                {
+                  id: 'ec2',
+                  name: 'echo',
+                  args: { command: 'input-without-placeholder' },
+                },
+              ],
+            }),
+          ],
+        },
+        { configurable: { run_id: 'run-hookresolve' } }
+      );
+
+      expect(capturedRequests).toHaveLength(1);
+      expect(capturedRequests[0].args).toEqual({
+        command: 'rewritten STORED',
+      });
     });
   });
 });

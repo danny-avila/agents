@@ -118,6 +118,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private turnCounter: number = 0;
   /** Turn index for the batch currently being processed. */
   private currentTurn: number = 0;
+  /**
+   * Last observed runId from `config.configurable.run_id`. When a new
+   * run starts (e.g. a host reuses the same Run / compiled workflow
+   * across multiple `processStream` calls), we detect the runId change
+   * and clear the registry + turn counter so a stale `tool<i>turn<n>`
+   * from the previous run cannot be served to a new run's tool calls.
+   */
+  private lastRunId: string | undefined;
 
   constructor({
     tools,
@@ -162,8 +170,17 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     }
   }
 
-  /** Returns the run-scoped tool output registry, or `undefined` when disabled. */
-  public getToolOutputRegistry(): ToolOutputReferenceRegistry | undefined {
+  /**
+   * Returns the run-scoped tool output registry, or `undefined` when
+   * the feature is disabled.
+   *
+   * @internal Exposed for test observation only. Host code should rely
+   * on `{{tool<i>turn<n>}}` substitution at tool-invocation time and
+   * not mutate the registry directly.
+   */
+  public _unsafeGetToolOutputRegistry():
+    | ToolOutputReferenceRegistry
+    | undefined {
     return this.toolOutputRegistry;
   }
 
@@ -300,14 +317,31 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         const toolMsg = output as ToolMessage;
         if (
           toolMsg.status !== 'error' &&
-          (this.toolOutputRegistry != null || unresolvedRefs.length > 0) &&
-          typeof toolMsg.content === 'string'
+          (this.toolOutputRegistry != null || unresolvedRefs.length > 0)
         ) {
-          toolMsg.content = this.applyOutputReference(
-            toolMsg.content,
-            shouldRegister ? batchIndex : undefined,
-            unresolvedRefs
-          );
+          if (typeof toolMsg.content === 'string') {
+            toolMsg.content = this.applyOutputReference(
+              toolMsg.content,
+              shouldRegister ? batchIndex : undefined,
+              unresolvedRefs
+            );
+          } else if (shouldRegister) {
+            /**
+             * Known limitation: tools that return a `ToolMessage` with
+             * array-type content (multi-part content blocks such as
+             * text + image) are not registered under a reference key
+             * and therefore cannot be cited via `{{tool<i>turn<n>}}`.
+             * Registering would require deciding which block is
+             * canonical, which differs per tool. Keep the output
+             * un-annotated and log once so the absence of a ref is
+             * visible during debugging.
+             */
+            // eslint-disable-next-line no-console
+            console.warn(
+              `[ToolNode] Skipping tool output reference for "${call.name}" ` +
+                `(callId=${call.id ?? 'n/a'}): ToolMessage content is not a string.`
+            );
+          }
         }
         return toolMsg;
       }
@@ -671,7 +705,29 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           continue;
         }
         if (hookResult.updatedInput != null) {
-          entry.args = hookResult.updatedInput;
+          /**
+           * Re-resolve after PreToolUse replaces the input: a hook may
+           * introduce new `{{tool<i>turn<n>}}` placeholders (e.g., by
+           * copying user-supplied text) that the pre-hook pass never
+           * saw. Re-running the resolver on the hook-rewritten args
+           * keeps substitution and the unresolved-refs record in sync
+           * with what the tool will actually receive.
+           */
+          if (registry != null) {
+            const { resolved, unresolved } = registry.resolve(
+              hookResult.updatedInput
+            );
+            entry.args = resolved as Record<string, unknown>;
+            if (entry.call.id != null) {
+              if (unresolved.length > 0) {
+                unresolvedByCallId.set(entry.call.id, unresolved);
+              } else {
+                unresolvedByCallId.delete(entry.call.id);
+              }
+            }
+          } else {
+            entry.args = hookResult.updatedInput;
+          }
         }
         approvedEntries.push(entry);
       }
@@ -959,6 +1015,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   protected async run(input: any, config: RunnableConfig): Promise<T> {
     this.toolCallTurns.clear();
+    const incomingRunId = config.configurable?.run_id as string | undefined;
+    if (incomingRunId !== this.lastRunId) {
+      this.turnCounter = 0;
+      this.toolOutputRegistry?.clear();
+      this.lastRunId = incomingRunId;
+    }
     this.currentTurn = this.turnCounter++;
     let outputs: (BaseMessage | Command)[];
 
