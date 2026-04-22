@@ -308,6 +308,60 @@ describe('ToolNode tool output references', () => {
       ).toBeUndefined();
     });
 
+    it('surfaces unresolved refs on thrown-error ToolMessages', async () => {
+      const boom = tool(
+        async () => {
+          throw new Error('nope');
+        },
+        {
+          name: 'boom',
+          description: 'always errors',
+          schema: z.object({ command: z.string() }),
+        }
+      ) as unknown as StructuredToolInterface;
+
+      const node = new ToolNode({
+        tools: [boom],
+        toolOutputReferences: { enabled: true },
+      });
+
+      const [msg] = await invokeBatch(node, [
+        { id: 'c1', name: 'boom', command: 'see {{tool9turn9}}' },
+      ]);
+
+      expect(msg.content).toContain('Error: nope');
+      expect(msg.content).toContain('[unresolved refs: tool9turn9]');
+    });
+
+    it('surfaces unresolved refs on tool-returned error ToolMessages', async () => {
+      const errReturn = tool(
+        async () =>
+          new ToolMessage({
+            status: 'error',
+            content: 'handled failure',
+            name: 'errReturn',
+            tool_call_id: 'c1',
+          }),
+        {
+          name: 'errReturn',
+          description: 'returns error ToolMessage',
+          schema: z.object({ command: z.string() }),
+        }
+      ) as unknown as StructuredToolInterface;
+
+      const node = new ToolNode({
+        tools: [errReturn],
+        toolOutputReferences: { enabled: true },
+      });
+
+      const [msg] = await invokeBatch(node, [
+        { id: 'c1', name: 'errReturn', command: 'see {{tool9turn9}}' },
+      ]);
+
+      expect(msg.content).toContain('handled failure');
+      expect(msg.content).toContain('[unresolved refs: tool9turn9]');
+    });
+
     it('resets the registry and turn counter when the runId changes', async () => {
       const capturedArgs: string[] = [];
       const t1 = createEchoTool({
@@ -461,6 +515,44 @@ describe('ToolNode tool output references', () => {
 
       expect(capturedRequests).toHaveLength(1);
       expect(capturedRequests[0].args).toEqual({ command: 'see FIRST' });
+    });
+
+    it('surfaces unresolved refs on host-returned error results', async () => {
+      const node = new ToolNode({
+        tools: [createSchemaStub('echo')],
+        eventDrivenMode: true,
+        agentId: 'agent-x',
+        toolCallStepIds: new Map([['ec1', 'step_ec1']]),
+        toolOutputReferences: { enabled: true },
+      });
+
+      mockEventDispatch([
+        {
+          toolCallId: 'ec1',
+          content: '',
+          status: 'error',
+          errorMessage: 'host failure',
+        },
+      ]);
+      const result = (await node.invoke({
+        messages: [
+          new AIMessage({
+            content: '',
+            tool_calls: [
+              {
+                id: 'ec1',
+                name: 'echo',
+                args: { command: 'see {{tool9turn9}}' },
+              },
+            ],
+          }),
+        ],
+      })) as { messages: ToolMessage[] };
+
+      expect(result.messages[0].content).toContain('Error: host failure');
+      expect(result.messages[0].content).toContain(
+        '[unresolved refs: tool9turn9]'
+      );
     });
 
     it('reports unresolved refs even when the host succeeds', async () => {

@@ -205,6 +205,17 @@ describe('ToolOutputReferenceRegistry', () => {
       expect(parsed.data).toBe(1);
     });
 
+    it('places the injected _ref as the first key in the serialized JSON', () => {
+      const content = '{"a":1,"b":"x"}';
+      const annotated = annotateToolOutputWithReference(content, 'tool0turn0');
+      expect(annotated.indexOf('"_ref"')).toBe(1);
+      const annotatedFromNull = annotateToolOutputWithReference(
+        '{"_ref":null,"a":1}',
+        'tool0turn0'
+      );
+      expect(annotatedFromNull.indexOf('"_ref"')).toBe(1);
+    });
+
     it('falls back to the prefix when parsing fails', () => {
       const content = '{ not actually json';
       const annotated = annotateToolOutputWithReference(content, 'tool0turn0');

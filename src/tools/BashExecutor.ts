@@ -88,6 +88,16 @@ export function buildBashExecutionToolDescription(options?: {
 
 export const BashExecutionToolName = Constants.BASH_TOOL;
 
+/**
+ * Default bash tool definition using the base description.
+ *
+ * When `RunConfig.toolOutputReferences.enabled` is `true`, build a
+ * reference-aware description with
+ * {@link buildBashExecutionToolDescription}
+ * (`{ enableToolOutputReferences: true }`) and construct a custom
+ * definition using it — using this constant as-is leaves the LLM
+ * unaware of the `{{tool<i>turn<n>}}` syntax.
+ */
 export const BashExecutionToolDefinition = {
   name: BashExecutionToolName,
   description: BashExecutionToolDescription,

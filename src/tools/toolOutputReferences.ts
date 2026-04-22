@@ -300,15 +300,18 @@ function tryInjectRefIntoJsonObject(
   }
 
   /**
-   * Spread the tool output *first* so any existing `_ref: null`
-   * (treated as non-conflicting by the guard above) is overwritten by
-   * our injected key rather than the other way around. Without this
-   * ordering, the LLM would see `_ref: null` in the annotated content
-   * even though the output is registered.
+   * Drop any pre-existing `_ref` (the guard above already rejected
+   * real conflicts; what reaches here is either a null or a matching
+   * value) so we can place our injected key *first* in the serialized
+   * JSON. Leading-key placement means the LLM sees the reference
+   * identifier before it reads the payload, which matters for large
+   * objects where the tail might be truncated by downstream consumers.
    */
+  const { [TOOL_OUTPUT_REF_KEY]: _existing, ...rest } = obj;
+  void _existing;
   const injected: Record<string, unknown> = {
-    ...obj,
     [TOOL_OUTPUT_REF_KEY]: key,
+    ...rest,
   };
 
   const pretty = /^\{\s*\n/.test(content);

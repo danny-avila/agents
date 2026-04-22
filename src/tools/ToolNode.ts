@@ -126,6 +126,13 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
    * from the previous run cannot be served to a new run's tool calls.
    */
   private lastRunId: string | undefined;
+  /**
+   * Per-run memo of tool names we've already warned about for returning
+   * non-string `ToolMessage.content` (and thus being ineligible for the
+   * reference registry). Cleared on runId change so each run gets its
+   * own single log line per offending tool.
+   */
+  private warnedNonStringRefTools: Set<string> = new Set();
 
   constructor({
     tools,
@@ -232,6 +239,15 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     batchIndex?: number
   ): Promise<BaseMessage | Command> {
     const tool = this.toolMap.get(call.name);
+    const registry = this.toolOutputRegistry;
+    const shouldRegister = registry != null && batchIndex != null;
+    /**
+     * Hoisted outside the try so the catch branch can append
+     * `[unresolved refs: …]` to error messages — otherwise the LLM
+     * only sees a generic error when it references a bad key, losing
+     * the self-correction signal this feature is meant to provide.
+     */
+    let unresolvedRefs: string[] = [];
     try {
       if (tool === undefined) {
         throw new Error(`Tool "${call.name}" not found.`);
@@ -241,10 +257,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       if (call.id != null && call.id !== '') {
         this.toolCallTurns.set(call.id, turn);
       }
-      const registry = this.toolOutputRegistry;
-      const shouldRegister = registry != null && batchIndex != null;
       let args = call.args;
-      let unresolvedRefs: string[] = [];
       if (registry != null) {
         const { resolved, unresolved } = registry.resolve(args);
         args = resolved;
@@ -315,10 +328,26 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       }
       if (isBaseMessage(output) && output._getType() === 'tool') {
         const toolMsg = output as ToolMessage;
-        if (
-          toolMsg.status !== 'error' &&
-          (this.toolOutputRegistry != null || unresolvedRefs.length > 0)
-        ) {
+        const isError = toolMsg.status === 'error';
+        if (isError) {
+          /**
+           * Error ToolMessages bypass registration/annotation but must
+           * still carry the unresolved-refs hint so the LLM can
+           * self-correct when its reference key caused the failure.
+           */
+          if (
+            unresolvedRefs.length > 0 &&
+            typeof toolMsg.content === 'string'
+          ) {
+            toolMsg.content = this.applyOutputReference(
+              toolMsg.content,
+              undefined,
+              unresolvedRefs
+            );
+          }
+          return toolMsg;
+        }
+        if (this.toolOutputRegistry != null || unresolvedRefs.length > 0) {
           if (typeof toolMsg.content === 'string') {
             toolMsg.content = this.applyOutputReference(
               toolMsg.content,
@@ -332,15 +361,17 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
              * text + image) are not registered under a reference key
              * and therefore cannot be cited via `{{tool<i>turn<n>}}`.
              * Registering would require deciding which block is
-             * canonical, which differs per tool. Keep the output
-             * un-annotated and log once so the absence of a ref is
-             * visible during debugging.
+             * canonical, which differs per tool. Warn once per tool
+             * per run so repeated invocations don't flood the logs.
              */
-            // eslint-disable-next-line no-console
-            console.warn(
-              `[ToolNode] Skipping tool output reference for "${call.name}" ` +
-                `(callId=${call.id ?? 'n/a'}): ToolMessage content is not a string.`
-            );
+            if (!this.warnedNonStringRefTools.has(call.name)) {
+              this.warnedNonStringRefTools.add(call.name);
+              // eslint-disable-next-line no-console
+              console.warn(
+                `[ToolNode] Skipping tool output reference for "${call.name}": ` +
+                  'ToolMessage content is not a string (further occurrences for this tool in the same run are suppressed).'
+              );
+            }
           }
         }
         return toolMsg;
@@ -406,9 +437,17 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           });
         }
       }
+      let errorContent = `Error: ${e.message}\n Please fix your mistakes.`;
+      if (unresolvedRefs.length > 0) {
+        errorContent = this.applyOutputReference(
+          errorContent,
+          undefined,
+          unresolvedRefs
+        );
+      }
       return new ToolMessage({
         status: 'error',
-        content: `Error: ${e.message}\n Please fix your mistakes.`,
+        content: errorContent,
         name: call.name,
         tool_call_id: call.id ?? '',
       });
@@ -819,6 +858,19 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
         if (result.status === 'error') {
           contentString = `Error: ${result.errorMessage ?? 'Unknown error'}\n Please fix your mistakes.`;
+          /**
+           * Error results bypass registration/annotation but must still
+           * carry the unresolved-refs hint so the LLM can self-correct
+           * when its reference key caused the failure.
+           */
+          const unresolved = unresolvedByCallId.get(result.toolCallId) ?? [];
+          if (unresolved.length > 0) {
+            contentString = this.applyOutputReference(
+              contentString,
+              undefined,
+              unresolved
+            );
+          }
           toolMessage = new ToolMessage({
             status: 'error',
             content: contentString,
@@ -1019,6 +1071,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     if (incomingRunId !== this.lastRunId) {
       this.turnCounter = 0;
       this.toolOutputRegistry?.clear();
+      this.warnedNonStringRefTools.clear();
       this.lastRunId = incomingRunId;
     }
     this.currentTurn = this.turnCounter++;
