@@ -157,7 +157,6 @@ jobs:
         env:
           NODE_OPTIONS: '--experimental-vm-modules'
           NODE_ENV: test
-          LIBRECHAT_CODE_API_KEY: ${{ secrets.LIBRECHAT_CODE_API_KEY }}
           LIBRECHAT_CODE_BASEURL: ${{ secrets.LIBRECHAT_CODE_BASEURL }}
 
       - name: Check for Tool Search changes
@@ -175,5 +174,4 @@ jobs:
         env:
           NODE_OPTIONS: '--experimental-vm-modules'
           NODE_ENV: test
-          LIBRECHAT_CODE_API_KEY: ${{ secrets.LIBRECHAT_CODE_API_KEY }}
           LIBRECHAT_CODE_BASEURL: ${{ secrets.LIBRECHAT_CODE_BASEURL }}

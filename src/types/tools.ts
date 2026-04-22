@@ -4,7 +4,6 @@ import type { RunnableToolLike } from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type { HookRegistry } from '@/hooks';
 import type { MessageContentComplex, ToolErrorData } from './stream';
-import { EnvVar } from '@/common';
 
 /** Replacement type for `import type { ToolCall } from '@langchain/core/messages/tool'` in order to have stringified args typed */
 export type CustomToolCall = {
@@ -88,9 +87,7 @@ export type CodeExecutionToolParams =
   | {
       session_id?: string;
       user_id?: string;
-      apiKey?: string;
       files?: CodeEnvFile[];
-      [EnvVar.CODE_API_KEY]?: string;
     };
 
 export type FileRef = {
@@ -247,7 +244,6 @@ export type McpNameFormat = 'full' | 'base';
 
 /** Parameters for creating a Tool Search tool */
 export type ToolSearchParams = {
-  apiKey?: string;
   toolRegistry?: LCToolRegistry;
   onlyDeferred?: boolean;
   baseUrl?: string;
@@ -257,7 +253,6 @@ export type ToolSearchParams = {
   mcpServer?: string | string[];
   /** Format for MCP tool names: 'full' (tool_mcp_server) or 'base' (tool only). Default: 'full' */
   mcpNameFormat?: McpNameFormat;
-  [key: string]: unknown;
 };
 
 /** Simplified tool metadata for search purposes */
@@ -362,8 +357,6 @@ export type BashProgrammaticToolCallingParams = ProgrammaticToolCallingParams;
  * Initialization parameters for the PTC tool
  */
 export type ProgrammaticToolCallingParams = {
-  /** Code API key (or use CODE_API_KEY env var) */
-  apiKey?: string;
   /** Code API base URL (or use CODE_BASEURL env var) */
   baseUrl?: string;
   /** Safety limit for round-trips (default: 20) */
@@ -372,8 +365,6 @@ export type ProgrammaticToolCallingParams = {
   proxy?: string;
   /** Enable debug logging (or set PTC_DEBUG=true env var) */
   debug?: boolean;
-  /** Environment variable key for API key */
-  [key: string]: unknown;
 };
 
 // ============================================================================

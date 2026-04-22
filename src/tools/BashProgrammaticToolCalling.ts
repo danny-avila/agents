@@ -1,5 +1,4 @@
 import { config } from 'dotenv';
-import { getEnvironmentVariable } from '@langchain/core/utils/env';
 import { tool, DynamicStructuredTool } from '@langchain/core/tools';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
@@ -10,7 +9,7 @@ import {
   formatCompletedResponse,
 } from './ProgrammaticToolCalling';
 import { getCodeBaseURL } from './CodeExecutor';
-import { EnvVar, Constants } from '@/common';
+import { Constants } from '@/common';
 
 config();
 
@@ -242,19 +241,6 @@ export function filterBashToolsByUsage(
 export function createBashProgrammaticToolCallingTool(
   initParams: t.BashProgrammaticToolCallingParams = {}
 ): DynamicStructuredTool {
-  const apiKey =
-    (initParams[EnvVar.CODE_API_KEY] as string | undefined) ??
-    initParams.apiKey ??
-    getEnvironmentVariable(EnvVar.CODE_API_KEY) ??
-    '';
-
-  if (!apiKey) {
-    throw new Error(
-      'No API key provided for bash programmatic tool calling. ' +
-        'Set CODE_API_KEY environment variable or pass apiKey in initParams.'
-    );
-  }
-
   const baseUrl = initParams.baseUrl ?? getCodeBaseURL();
   const maxRoundTrips = initParams.maxRoundTrips ?? DEFAULT_MAX_ROUND_TRIPS;
   const proxy = initParams.proxy ?? process.env.PROXY;
@@ -308,12 +294,11 @@ export function createBashProgrammaticToolCallingTool(
         if (_injected_files && _injected_files.length > 0) {
           files = _injected_files;
         } else if (session_id != null && session_id.length > 0) {
-          files = await fetchSessionFiles(baseUrl, apiKey, session_id, proxy);
+          files = await fetchSessionFiles(baseUrl, session_id, proxy);
         }
 
         let response = await makeRequest(
           EXEC_ENDPOINT,
-          apiKey,
           {
             lang: 'bash',
             code,
@@ -354,7 +339,6 @@ export function createBashProgrammaticToolCallingTool(
 
           response = await makeRequest(
             EXEC_ENDPOINT,
-            apiKey,
             {
               continuation_token: response.continuation_token,
               tool_results: toolResults,
