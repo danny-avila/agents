@@ -29,6 +29,11 @@ import {
 import { safeDispatchCustomEvent } from '@/utils/events';
 import { executeHooks } from '@/hooks';
 import { Constants, GraphEvents, CODE_EXECUTION_TOOLS } from '@/common';
+import {
+  buildReferenceKey,
+  annotateToolOutputWithReference,
+  ToolOutputReferenceRegistry,
+} from './toolOutputReferences';
 
 /**
  * Helper to check if a value is a Send object
@@ -99,6 +104,20 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private maxToolResultChars: number;
   /** Hook registry for PreToolUse/PostToolUse lifecycle hooks */
   private hookRegistry?: HookRegistry;
+  /**
+   * Registry of tool outputs keyed by `tool<idx>turn<turn>` — populated
+   * only when `toolOutputReferences.enabled` is true. Shared across all
+   * batches within the life of this ToolNode.
+   */
+  private toolOutputRegistry?: ToolOutputReferenceRegistry;
+  /**
+   * Monotonic batch counter. Incremented once per `run()` invocation
+   * so every tool call in a batch shares the same `turn` index for its
+   * reference key. Zero-based, matches the `turn<N>` segment.
+   */
+  private turnCounter: number = 0;
+  /** Turn index for the batch currently being processed. */
+  private currentTurn: number = 0;
 
   constructor({
     tools,
@@ -117,6 +136,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     maxContextTokens,
     maxToolResultChars,
     hookRegistry,
+    toolOutputReferences,
   }: t.ToolNodeConstructorParams) {
     super({ name, tags, func: (input, config) => this.run(input, config) });
     this.toolMap = toolMap ?? new Map(tools.map((tool) => [tool.name, tool]));
@@ -133,6 +153,18 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     this.maxToolResultChars =
       maxToolResultChars ?? calculateMaxToolResultChars(maxContextTokens);
     this.hookRegistry = hookRegistry;
+    if (toolOutputReferences?.enabled === true) {
+      this.toolOutputRegistry = new ToolOutputReferenceRegistry({
+        maxOutputSize:
+          toolOutputReferences.maxOutputSize ?? this.maxToolResultChars,
+        maxTotalSize: toolOutputReferences.maxTotalSize,
+      });
+    }
+  }
+
+  /** Returns the run-scoped tool output registry, or `undefined` when disabled. */
+  public getToolOutputRegistry(): ToolOutputReferenceRegistry | undefined {
+    return this.toolOutputRegistry;
   }
 
   /**
@@ -170,11 +202,17 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   }
 
   /**
-   * Runs a single tool call with error handling
+   * Runs a single tool call with error handling.
+   *
+   * `batchIndex` is the tool's position within the current ToolNode
+   * batch and, together with `this.currentTurn`, forms the key used to
+   * register the output for future `{{tool<idx>turn<turn>}}`
+   * substitutions. Omit when no registration should occur.
    */
   protected async runTool(
     call: ToolCall,
-    config: RunnableConfig
+    config: RunnableConfig,
+    batchIndex?: number
   ): Promise<BaseMessage | Command> {
     const tool = this.toolMap.get(call.name);
     try {
@@ -186,7 +224,15 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       if (call.id != null && call.id !== '') {
         this.toolCallTurns.set(call.id, turn);
       }
-      const args = call.args;
+      const registry = this.toolOutputRegistry;
+      const shouldRegister = registry != null && batchIndex != null;
+      let args = call.args;
+      let unresolvedRefs: string[] = [];
+      if (registry != null) {
+        const { resolved, unresolved } = registry.resolve(args);
+        args = resolved;
+        unresolvedRefs = unresolved;
+      }
       const stepId = this.toolCallStepIds?.get(call.id!);
 
       // Build invoke params - LangChain extracts non-schema fields to config.toolCall
@@ -247,24 +293,41 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       }
 
       const output = await tool.invoke(invokeParams, config);
-      if (
-        (isBaseMessage(output) && output._getType() === 'tool') ||
-        isCommand(output)
-      ) {
+      if (isCommand(output)) {
         return output;
-      } else {
-        const rawContent =
-          typeof output === 'string' ? output : JSON.stringify(output);
-        return new ToolMessage({
-          status: 'success',
-          name: tool.name,
-          content: truncateToolResultContent(
-            rawContent,
-            this.maxToolResultChars
-          ),
-          tool_call_id: call.id!,
-        });
       }
+      if (isBaseMessage(output) && output._getType() === 'tool') {
+        const toolMsg = output as ToolMessage;
+        if (
+          toolMsg.status !== 'error' &&
+          (this.toolOutputRegistry != null || unresolvedRefs.length > 0) &&
+          typeof toolMsg.content === 'string'
+        ) {
+          toolMsg.content = this.applyOutputReference(
+            toolMsg.content,
+            shouldRegister ? batchIndex : undefined,
+            unresolvedRefs
+          );
+        }
+        return toolMsg;
+      }
+      const rawContent =
+        typeof output === 'string' ? output : JSON.stringify(output);
+      const truncated = truncateToolResultContent(
+        rawContent,
+        this.maxToolResultChars
+      );
+      const content = this.applyOutputReference(
+        truncated,
+        shouldRegister ? batchIndex : undefined,
+        unresolvedRefs
+      );
+      return new ToolMessage({
+        status: 'success',
+        name: tool.name,
+        content,
+        tool_call_id: call.id!,
+      });
     } catch (_e: unknown) {
       const e = _e as Error;
       if (!this.handleToolErrors) {
@@ -316,6 +379,34 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         tool_call_id: call.id ?? '',
       });
     }
+  }
+
+  /**
+   * Registers a successful tool output under its batch-scoped reference
+   * key (when the registry is enabled) and returns the annotated content
+   * the LLM will see. When `batchIndex` is undefined, the output is
+   * neither registered nor annotated — only any unresolved reference
+   * warnings are appended.
+   *
+   * The *stored* value is the truncated-but-unannotated content so that
+   * piping it into a later tool call via `{{tool<idx>turn<turn>}}`
+   * delivers pristine output (no `_ref` key, no `[ref: …]` prefix).
+   */
+  private applyOutputReference(
+    truncated: string,
+    batchIndex: number | undefined,
+    unresolved: string[]
+  ): string {
+    let content = truncated;
+    if (this.toolOutputRegistry != null && batchIndex != null) {
+      const key = buildReferenceKey(batchIndex, this.currentTurn);
+      this.toolOutputRegistry.set(key, truncated);
+      content = annotateToolOutputWithReference(truncated, key);
+    }
+    if (unresolved.length > 0) {
+      content += `\n[unresolved refs: ${unresolved.join(', ')}]`;
+    }
+    return content;
   }
 
   /**
@@ -479,16 +570,31 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
    */
   private async dispatchToolEvents(
     toolCalls: ToolCall[],
-    config: RunnableConfig
+    config: RunnableConfig,
+    batchIndices?: number[]
   ): Promise<{ toolMessages: ToolMessage[]; injected: BaseMessage[] }> {
     const runId = (config.configurable?.run_id as string | undefined) ?? '';
     const threadId = config.configurable?.thread_id as string | undefined;
+    const registry = this.toolOutputRegistry;
+    const unresolvedByCallId = new Map<string, string[]>();
 
-    const preToolCalls = toolCalls.map((call) => ({
-      call,
-      stepId: this.toolCallStepIds?.get(call.id!) ?? '',
-      args: call.args as Record<string, unknown>,
-    }));
+    const preToolCalls = toolCalls.map((call, i) => {
+      const originalArgs = call.args as Record<string, unknown>;
+      let resolvedArgs = originalArgs;
+      if (registry != null) {
+        const { resolved, unresolved } = registry.resolve(originalArgs);
+        resolvedArgs = resolved as Record<string, unknown>;
+        if (unresolved.length > 0 && call.id != null) {
+          unresolvedByCallId.set(call.id, unresolved);
+        }
+      }
+      return {
+        call,
+        stepId: this.toolCallStepIds?.get(call.id!) ?? '',
+        args: resolvedArgs,
+        batchIndex: batchIndices?.[i],
+      };
+    });
 
     const messageByCallId = new Map<string, ToolMessage>();
     const approvedEntries: typeof preToolCalls = [];
@@ -575,10 +681,16 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
     const injected: BaseMessage[] = [];
 
+    const batchIndexByCallId = new Map<string, number>();
+
     if (approvedEntries.length > 0) {
       const requests: t.ToolCallRequest[] = approvedEntries.map((entry) => {
         const turn = this.toolUsageCount.get(entry.call.name) ?? 0;
         this.toolUsageCount.set(entry.call.name, turn + 1);
+
+        if (entry.batchIndex != null && entry.call.id != null) {
+          batchIndexByCallId.set(entry.call.id, entry.batchIndex);
+        }
 
         const request: t.ToolCallRequest = {
           id: entry.call.id!,
@@ -719,6 +831,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             }
           }
 
+          const batchIndex = batchIndexByCallId.get(result.toolCallId);
+          const unresolved = unresolvedByCallId.get(result.toolCallId) ?? [];
+          contentString = this.applyOutputReference(
+            contentString,
+            batchIndex,
+            unresolved
+          );
+
           toolMessage = new ToolMessage({
             status: 'success',
             name: toolName,
@@ -815,16 +935,22 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
    * Injected messages are placed AFTER ToolMessages to respect provider
    * message ordering (AIMessage tool_calls must be immediately followed
    * by their ToolMessage results).
+   *
+   * `batchIndices` mirrors `toolCalls` and carries each call's position
+   * within the parent batch, which the registry uses to form reference
+   * keys. It's omitted when the registry is disabled.
    */
   private async executeViaEvent(
     toolCalls: ToolCall[],
     config: RunnableConfig,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    input: any
+    input: any,
+    batchIndices?: number[]
   ): Promise<T> {
     const { toolMessages, injected } = await this.dispatchToolEvents(
       toolCalls,
-      config
+      config,
+      batchIndices
     );
     const outputs: BaseMessage[] = [...toolMessages, ...injected];
     return (Array.isArray(input) ? outputs : { messages: outputs }) as T;
@@ -833,14 +959,15 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   protected async run(input: any, config: RunnableConfig): Promise<T> {
     this.toolCallTurns.clear();
+    this.currentTurn = this.turnCounter++;
     let outputs: (BaseMessage | Command)[];
 
     if (this.isSendInput(input)) {
       const isDirectTool = this.directToolNames?.has(input.lg_tool_call.name);
       if (this.eventDrivenMode && isDirectTool !== true) {
-        return this.executeViaEvent([input.lg_tool_call], config, input);
+        return this.executeViaEvent([input.lg_tool_call], config, input, [0]);
       }
-      outputs = [await this.runTool(input.lg_tool_call, config)];
+      outputs = [await this.runTool(input.lg_tool_call, config, 0)];
       this.handleRunToolCompletions([input.lg_tool_call], outputs, config);
     } else {
       let messages: BaseMessage[];
@@ -900,21 +1027,40 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         }) ?? [];
 
       if (this.eventDrivenMode && filteredCalls.length > 0) {
+        const filteredIndices = filteredCalls.map((_, idx) => idx);
+
         if (!this.directToolNames || this.directToolNames.size === 0) {
-          return this.executeViaEvent(filteredCalls, config, input);
+          return this.executeViaEvent(
+            filteredCalls,
+            config,
+            input,
+            filteredIndices
+          );
         }
 
-        const directCalls = filteredCalls.filter((c) =>
-          this.directToolNames!.has(c.name)
-        );
-        const eventCalls = filteredCalls.filter(
-          (c) => !this.directToolNames!.has(c.name)
-        );
+        const directEntries: Array<{ call: ToolCall; batchIndex: number }> = [];
+        const eventEntries: Array<{ call: ToolCall; batchIndex: number }> = [];
+        for (let i = 0; i < filteredCalls.length; i++) {
+          const call = filteredCalls[i];
+          const entry = { call, batchIndex: i };
+          if (this.directToolNames!.has(call.name)) {
+            directEntries.push(entry);
+          } else {
+            eventEntries.push(entry);
+          }
+        }
+
+        const directCalls = directEntries.map((e) => e.call);
+        const directIndices = directEntries.map((e) => e.batchIndex);
+        const eventCalls = eventEntries.map((e) => e.call);
+        const eventIndices = eventEntries.map((e) => e.batchIndex);
 
         const directOutputs: (BaseMessage | Command)[] =
           directCalls.length > 0
             ? await Promise.all(
-              directCalls.map((call) => this.runTool(call, config))
+              directCalls.map((call, i) =>
+                this.runTool(call, config, directIndices[i])
+              )
             )
             : [];
 
@@ -924,7 +1070,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
         const eventResult =
           eventCalls.length > 0
-            ? await this.dispatchToolEvents(eventCalls, config)
+            ? await this.dispatchToolEvents(eventCalls, config, eventIndices)
             : {
               toolMessages: [] as ToolMessage[],
               injected: [] as BaseMessage[],
@@ -937,7 +1083,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         ];
       } else {
         outputs = await Promise.all(
-          filteredCalls.map((call) => this.runTool(call, config))
+          filteredCalls.map((call, i) => this.runTool(call, config, i))
         );
         this.handleRunToolCompletions(filteredCalls, outputs, config);
       }

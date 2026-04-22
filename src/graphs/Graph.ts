@@ -129,6 +129,12 @@ export abstract class Graph<
   handlerRegistry: HandlerRegistry | undefined;
   hookRegistry: HookRegistry | undefined;
   /**
+   * Run-scoped config for the tool output reference registry. Threaded
+   * from `RunConfig.toolOutputReferences` down into every ToolNode this
+   * graph compiles.
+   */
+  toolOutputReferences: t.ToolOutputReferencesConfig | undefined;
+  /**
    * Tool session contexts for automatic state persistence across tool invocations.
    * Keyed by tool name (e.g., Constants.EXECUTE_CODE).
    * Currently supports code execution session tracking (session_id, files).
@@ -153,6 +159,7 @@ export abstract class Graph<
     this.invokedToolIds = undefined;
     this.handlerRegistry = undefined;
     this.hookRegistry = undefined;
+    this.toolOutputReferences = undefined;
     this.sessions.clear();
   }
 }
@@ -516,6 +523,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         directToolNames: directToolNames.size > 0 ? directToolNames : undefined,
         maxContextTokens: agentContext?.maxContextTokens,
         maxToolResultChars: agentContext?.maxToolResultChars,
+        toolOutputReferences: this.toolOutputReferences,
         errorHandler: (data, metadata) =>
           StandardGraph.handleToolCallErrorStatic(this, data, metadata),
       });
@@ -547,6 +555,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       sessions: this.sessions,
       maxContextTokens: agentContext?.maxContextTokens,
       maxToolResultChars: agentContext?.maxToolResultChars,
+      toolOutputReferences: this.toolOutputReferences,
     });
   }
 
