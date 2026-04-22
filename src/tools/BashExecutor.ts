@@ -49,7 +49,19 @@ Usage:
 - No network access available.
 - Generated files are automatically delivered; **DO NOT** provide download links.
 - NEVER use this tool to execute malicious commands.
+`.trim();
 
+/**
+ * Supplemental prompt documenting the tool-output reference feature.
+ *
+ * Hosts should append this (separated by a blank line) to the base
+ * {@link BashExecutionToolDescription} only when
+ * `RunConfig.toolOutputReferences.enabled` is `true`. When the feature
+ * is disabled, including this text would tell the LLM to emit
+ * `{{tool0turn0}}` placeholders that pass through unsubstituted and
+ * leak into the shell.
+ */
+export const BashToolOutputReferencesGuide = `
 Referencing previous tool outputs:
 - Every successful tool result is tagged with a reference key of the form \`tool<idx>turn<turn>\` (e.g., \`tool0turn0\`). The key appears either as a \`[ref: tool0turn0]\` prefix line or, when the output is a JSON object, as a \`_ref\` field on the object.
 - To pipe a previous tool output into this tool, embed the placeholder \`{{tool<idx>turn<turn>}}\` literally anywhere in the \`command\` string (or any string arg). It will be substituted with the stored output verbatim before the command runs.
@@ -57,6 +69,22 @@ Referencing previous tool outputs:
 - Example: \`echo '{{tool0turn0}}' | jq '.foo'\` takes the full output of the first tool from the first turn and pipes it into jq.
 - Unknown reference keys are left in place and surfaced as \`[unresolved refs: …]\` after the output.
 `.trim();
+
+/**
+ * Composes the bash tool description, optionally appending the
+ * tool-output references guide. Hosts that enable
+ * `RunConfig.toolOutputReferences` should pass `enableToolOutputReferences: true`
+ * when registering the tool so the LLM learns the `{{…}}` syntax it
+ * will actually be able to use.
+ */
+export function buildBashExecutionToolDescription(options?: {
+  enableToolOutputReferences?: boolean;
+}): string {
+  if (options?.enableToolOutputReferences === true) {
+    return `${BashExecutionToolDescription}\n\n${BashToolOutputReferencesGuide}`;
+  }
+  return BashExecutionToolDescription;
+}
 
 export const BashExecutionToolName = Constants.BASH_TOOL;
 
