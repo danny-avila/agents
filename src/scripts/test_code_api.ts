@@ -11,15 +11,9 @@ config();
 import fetch, { RequestInit } from 'node-fetch';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 
-const API_KEY = process.env.LIBRECHAT_CODE_API_KEY ?? '';
 const BASE_URL =
   process.env.LIBRECHAT_CODE_BASEURL ?? 'https://api.librechat.ai/v1';
 const PROXY = process.env.PROXY;
-
-if (!API_KEY) {
-  console.error('LIBRECHAT_CODE_API_KEY not set');
-  process.exit(1);
-}
 
 interface FileRef {
   id: string;
@@ -53,7 +47,6 @@ async function makeRequest(
     headers: {
       'Content-Type': 'application/json',
       'User-Agent': 'LibreChat/1.0',
-      'X-API-Key': API_KEY,
     },
   };
 

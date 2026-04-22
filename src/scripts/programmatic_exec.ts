@@ -94,15 +94,6 @@ async function main(): Promise<void> {
   console.log('==============================================');
   console.log('Demonstrating runtime toolMap injection\n');
 
-  const apiKey = process.env.LIBRECHAT_CODE_API_KEY;
-  if (!apiKey) {
-    console.error(
-      'Error: LIBRECHAT_CODE_API_KEY environment variable is not set.'
-    );
-    console.log('Please set it in your .env file or environment.');
-    process.exit(1);
-  }
-
   console.log('Creating mock tools...');
   const mockTools: StructuredToolInterface[] = [
     createGetTeamMembersTool(),
@@ -119,7 +110,7 @@ async function main(): Promise<void> {
   );
 
   console.log('\nCreating PTC tool (without toolMap)...');
-  const ptcTool = createProgrammaticToolCallingTool({ apiKey });
+  const ptcTool = createProgrammaticToolCallingTool();
   console.log('PTC tool created successfully!');
   console.log(
     'Note: toolMap will be passed at runtime with each invocation.\n'

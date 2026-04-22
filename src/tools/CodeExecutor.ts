@@ -95,15 +95,6 @@ export const CodeExecutionToolDefinition = {
 function createCodeExecutionTool(
   params: t.CodeExecutionToolParams = {}
 ): DynamicStructuredTool {
-  const apiKey =
-    params[EnvVar.CODE_API_KEY] ??
-    params.apiKey ??
-    getEnvironmentVariable(EnvVar.CODE_API_KEY) ??
-    '';
-  if (!apiKey) {
-    throw new Error('No API key provided for code execution tool.');
-  }
-
   return tool(
     async (rawInput, config) => {
       const { lang, code, ...rest } = rawInput as {
@@ -143,7 +134,6 @@ function createCodeExecutionTool(
             method: 'GET',
             headers: {
               'User-Agent': 'LibreChat/1.0',
-              'X-API-Key': apiKey,
             },
           };
 
@@ -185,7 +175,6 @@ function createCodeExecutionTool(
           headers: {
             'Content-Type': 'application/json',
             'User-Agent': 'LibreChat/1.0',
-            'X-API-Key': apiKey,
           },
           body: JSON.stringify(postData),
         };

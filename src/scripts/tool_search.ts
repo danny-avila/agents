@@ -66,15 +66,6 @@ async function main(): Promise<void> {
   console.log('================================');
   console.log('Demonstrating runtime tool registry injection\n');
 
-  const apiKey = process.env.LIBRECHAT_CODE_API_KEY;
-  if (!apiKey) {
-    console.error(
-      'Error: LIBRECHAT_CODE_API_KEY environment variable is not set.'
-    );
-    console.log('Please set it in your .env file or environment.');
-    process.exit(1);
-  }
-
   console.log('Creating sample tool registry...');
   const toolRegistry = createToolSearchToolRegistry();
   console.log(
@@ -82,7 +73,7 @@ async function main(): Promise<void> {
   );
 
   console.log('\nCreating Tool Search Regex tool WITH registry for testing...');
-  const searchTool = createToolSearch({ apiKey, toolRegistry });
+  const searchTool = createToolSearch({ toolRegistry });
   console.log('Tool created successfully!');
   console.log(
     'Note: In production, ToolNode injects toolRegistry via params when invoked through the graph.\n'

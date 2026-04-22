@@ -2,10 +2,9 @@ import { config } from 'dotenv';
 import fetch, { RequestInit } from 'node-fetch';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { tool, DynamicStructuredTool } from '@langchain/core/tools';
-import { getEnvironmentVariable } from '@langchain/core/utils/env';
 import type * as t from '@/types';
 import { imageExtRegex, getCodeBaseURL } from './CodeExecutor';
-import { EnvVar, Constants } from '@/common';
+import { Constants } from '@/common';
 
 config();
 
@@ -63,15 +62,6 @@ export const BashExecutionToolDefinition = {
 function createBashExecutionTool(
   params: t.BashExecutionToolParams = {}
 ): DynamicStructuredTool {
-  const apiKey =
-    params[EnvVar.CODE_API_KEY] ??
-    params.apiKey ??
-    getEnvironmentVariable(EnvVar.CODE_API_KEY) ??
-    '';
-  if (!apiKey) {
-    throw new Error('No API key provided for bash execution tool.');
-  }
-
   return tool(
     async (rawInput, config) => {
       const { command, ...rest } = rawInput as {
@@ -99,7 +89,6 @@ function createBashExecutionTool(
             method: 'GET',
             headers: {
               'User-Agent': 'LibreChat/1.0',
-              'X-API-Key': apiKey,
             },
           };
 
@@ -141,7 +130,6 @@ function createBashExecutionTool(
           headers: {
             'Content-Type': 'application/json',
             'User-Agent': 'LibreChat/1.0',
-            'X-API-Key': apiKey,
           },
           body: JSON.stringify(postData),
         };

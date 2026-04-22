@@ -3,10 +3,10 @@
  * Integration tests for Tool Search Regex.
  * These tests hit the LIVE Code API and verify end-to-end search functionality.
  *
- * Run with: npm test -- ToolSearch.integration.test.ts
+ * Run with: RUN_CODE_INTEGRATION_TESTS=1 npm test -- ToolSearch.integration.test.ts
  *
- * Requires LIBRECHAT_CODE_API_KEY environment variable.
- * Tests are skipped when the API key is not available.
+ * Opt-in via the `RUN_CODE_INTEGRATION_TESTS` environment variable —
+ * these tests hit a real sandbox so they don't run in CI by default.
  */
 import { config as dotenvConfig } from 'dotenv';
 dotenvConfig();
@@ -15,17 +15,16 @@ import { describe, it, expect, beforeAll } from '@jest/globals';
 import { createToolSearch } from '../ToolSearch';
 import { createToolSearchToolRegistry } from '@/test/mockTools';
 
-const apiKey = process.env.LIBRECHAT_CODE_API_KEY;
-const shouldSkip = apiKey == null || apiKey === '';
+const shouldSkip = process.env.RUN_CODE_INTEGRATION_TESTS !== '1';
 
-const describeIfApiKey = shouldSkip ? describe.skip : describe;
+const describeIfLive = shouldSkip ? describe.skip : describe;
 
-describeIfApiKey('ToolSearch - Live API Integration', () => {
+describeIfLive('ToolSearch - Live API Integration', () => {
   let searchTool: ReturnType<typeof createToolSearch>;
   const toolRegistry = createToolSearchToolRegistry();
 
   beforeAll(() => {
-    searchTool = createToolSearch({ apiKey: apiKey!, toolRegistry });
+    searchTool = createToolSearch({ toolRegistry });
   });
 
   it('searches for expense-related tools', async () => {

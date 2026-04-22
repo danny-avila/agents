@@ -685,7 +685,6 @@ for member in team:
       );
 
       ptcTool = createProgrammaticToolCallingTool({
-        apiKey: 'test-key',
         baseUrl: 'http://mock-api',
       });
     });
