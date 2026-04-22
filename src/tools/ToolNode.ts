@@ -1068,7 +1068,17 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   protected async run(input: any, config: RunnableConfig): Promise<T> {
     this.toolCallTurns.clear();
     const incomingRunId = config.configurable?.run_id as string | undefined;
-    if (incomingRunId !== this.lastRunId) {
+    /**
+     * Reset the registry and per-run counters when we cross into a new
+     * run. If `run_id` is missing we cannot distinguish "still the same
+     * run" from "a different caller reusing the same ToolNode", so we
+     * err on the side of isolation and clear on every batch — treating
+     * anonymous runs as if each batch were fresh. Production callers
+     * (anyone going through `Run`) always have a `run_id` set, so this
+     * only affects ToolNode being invoked directly without one.
+     */
+    const isNewRun = incomingRunId == null || incomingRunId !== this.lastRunId;
+    if (isNewRun) {
       this.turnCounter = 0;
       this.toolOutputRegistry?.clear();
       this.warnedNonStringRefTools.clear();

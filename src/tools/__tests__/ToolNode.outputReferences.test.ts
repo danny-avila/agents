@@ -52,12 +52,14 @@ function aiMsgWithCalls(
 
 async function invokeBatch(
   toolNode: ToolNode,
-  calls: Array<{ id: string; name: string; command: string }>
+  calls: Array<{ id: string; name: string; command: string }>,
+  runId: string = 'test-run'
 ): Promise<ToolMessage[]> {
   const aiMsg = aiMsgWithCalls(calls);
-  const result = (await toolNode.invoke({ messages: [aiMsg] })) as
-    | ToolMessage[]
-    | { messages: ToolMessage[] };
+  const result = (await toolNode.invoke(
+    { messages: [aiMsg] },
+    { configurable: { run_id: runId } }
+  )) as ToolMessage[] | { messages: ToolMessage[] };
   return Array.isArray(result) ? result : result.messages;
 }
 
@@ -362,6 +364,34 @@ describe('ToolNode tool output references', () => {
       expect(msg.content).toContain('[unresolved refs: tool9turn9]');
     });
 
+    it('clears state on every batch when run_id is absent (anonymous caller)', async () => {
+      const capturedArgs: string[] = [];
+      const t1 = createEchoTool({
+        capturedArgs,
+        outputs: ['first-anonymous', 'second-anonymous'],
+      });
+      const node = new ToolNode({
+        tools: [t1],
+        toolOutputReferences: { enabled: true },
+      });
+
+      await node.invoke({
+        messages: [aiMsgWithCalls([{ id: 'a1', name: 'echo', command: 'a' }])],
+      });
+      const result = (await node.invoke({
+        messages: [
+          aiMsgWithCalls([
+            { id: 'a2', name: 'echo', command: 'echo {{tool0turn0}}' },
+          ]),
+        ],
+      })) as { messages: ToolMessage[] };
+
+      expect(capturedArgs[1]).toBe('echo {{tool0turn0}}');
+      expect(result.messages[0].content).toContain(
+        '[unresolved refs: tool0turn0]'
+      );
+    });
+
     it('resets the registry and turn counter when the runId changes', async () => {
       const capturedArgs: string[] = [];
       const t1 = createEchoTool({
@@ -472,14 +502,17 @@ describe('ToolNode tool output references', () => {
       mockEventDispatch([
         { toolCallId: 'ec1', content: 'FIRST', status: 'success' },
       ]);
-      await node.invoke({
-        messages: [
-          new AIMessage({
-            content: '',
-            tool_calls: [{ id: 'ec1', name: 'echo', args: { command: 'a' } }],
-          }),
-        ],
-      });
+      await node.invoke(
+        {
+          messages: [
+            new AIMessage({
+              content: '',
+              tool_calls: [{ id: 'ec1', name: 'echo', args: { command: 'a' } }],
+            }),
+          ],
+        },
+        { configurable: { run_id: 'run-subst' } }
+      );
 
       jest.restoreAllMocks();
       const capturedRequests: t.ToolCallRequest[] = [];
@@ -498,20 +531,23 @@ describe('ToolNode tool output references', () => {
           ]);
         });
 
-      await node.invoke({
-        messages: [
-          new AIMessage({
-            content: '',
-            tool_calls: [
-              {
-                id: 'ec2',
-                name: 'echo',
-                args: { command: 'see {{tool0turn0}}' },
-              },
-            ],
-          }),
-        ],
-      });
+      await node.invoke(
+        {
+          messages: [
+            new AIMessage({
+              content: '',
+              tool_calls: [
+                {
+                  id: 'ec2',
+                  name: 'echo',
+                  args: { command: 'see {{tool0turn0}}' },
+                },
+              ],
+            }),
+          ],
+        },
+        { configurable: { run_id: 'run-subst' } }
+      );
 
       expect(capturedRequests).toHaveLength(1);
       expect(capturedRequests[0].args).toEqual({ command: 'see FIRST' });
