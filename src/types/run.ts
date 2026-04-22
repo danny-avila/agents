@@ -11,7 +11,7 @@ import type * as s from '@/types/stream';
 import type * as e from '@/common/enum';
 import type * as g from '@/types/graph';
 import type * as l from '@/types/llm';
-import type { ToolSessionMap } from '@/types/tools';
+import type { ToolSessionMap, ToolOutputReferencesConfig } from '@/types/tools';
 import type { HookRegistry } from '@/hooks';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -146,6 +146,14 @@ export type RunConfig = {
    * at run start, so ToolNode can inject session_id + files into tool calls.
    */
   initialSessions?: ToolSessionMap;
+  /**
+   * Run-scoped tool output reference configuration. When `enabled` is
+   * `true`, tool outputs are registered under stable keys
+   * (`tool<idx>turn<turn>`) and subsequent tool calls can pipe previous
+   * outputs into their arguments via `{{tool<idx>turn<turn>}}`
+   * placeholders. Disabled by default so existing runs are unaffected.
+   */
+  toolOutputReferences?: ToolOutputReferencesConfig;
 };
 
 export type ProvidedCallbacks =

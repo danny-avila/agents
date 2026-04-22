@@ -62,6 +62,12 @@ export type ToolNodeOptions = {
    * When provided, takes precedence over the value computed from maxContextTokens.
    */
   maxToolResultChars?: number;
+  /**
+   * Run-scoped tool output reference configuration. When `enabled` is
+   * `true`, ToolNode registers successful outputs and substitutes
+   * `{{tool<idx>turn<turn>}}` placeholders found in string args.
+   */
+  toolOutputReferences?: ToolOutputReferencesConfig;
 };
 
 export type ToolNodeConstructorParams = ToolRefs & ToolNodeOptions;
@@ -233,6 +239,35 @@ export type ToolExecuteResult = {
 
 /** Map of tool names to tool definitions */
 export type LCToolRegistry = Map<string, LCTool>;
+
+/**
+ * Run-scoped configuration for tool output references.
+ *
+ * When enabled, each successful tool result is registered under a stable
+ * key (`tool<idx>turn<turn>`). Later tool calls can pipe a previous
+ * output into their arguments by including the literal placeholder
+ * `{{tool<idx>turn<turn>}}` anywhere in a string argument; ToolNode
+ * substitutes it with the stored output immediately before invoking
+ * the tool.
+ *
+ * Size limits mirror the shape of `calculateMaxToolResultChars` so
+ * substituted content cannot exceed what the model has already seen.
+ */
+export type ToolOutputReferencesConfig = {
+  /** Enable the registry and placeholder substitution. Defaults to `false`. */
+  enabled?: boolean;
+  /**
+   * Maximum characters stored (and substituted) per registered output.
+   * Defaults to the ToolNode's `maxToolResultChars`.
+   */
+  maxOutputSize?: number;
+  /**
+   * Maximum total characters retained across all registered outputs for
+   * the run. When exceeded, the oldest registered outputs are evicted
+   * FIFO. Defaults to `calculateMaxTotalToolOutputSize(maxOutputSize)`.
+   */
+  maxTotalSize?: number;
+};
 
 export type ProgrammaticCache = { toolMap: ToolMap; toolDefs: LCTool[] };
 

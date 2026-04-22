@@ -1,0 +1,261 @@
+/**
+ * Tool output reference registry.
+ *
+ * When enabled via `RunConfig.toolOutputReferences.enabled`, ToolNode
+ * stores each successful tool output under a stable key
+ * (`tool<idx>turn<turn>`) where `idx` is the tool's position within a
+ * ToolNode batch and `turn` is the batch index within the run
+ * (incremented once per ToolNode invocation).
+ *
+ * Subsequent tool calls can pipe a previous output into their args by
+ * embedding `{{tool<idx>turn<turn>}}` inside any string argument;
+ * {@link ToolOutputReferenceRegistry.resolve} walks the args and
+ * substitutes the placeholders immediately before invocation.
+ *
+ * Outputs are stored without any annotation (the `_ref` key or the
+ * `[ref: ...]` prefix seen by the LLM is strictly a UX signal attached
+ * to `ToolMessage.content`). Keeping the registry pristine means
+ * downstream bash/jq piping does not see injected fields.
+ */
+
+import {
+  calculateMaxTotalToolOutputSize,
+  HARD_MAX_TOOL_RESULT_CHARS,
+} from '@/utils/truncation';
+
+/** Key shape produced by {@link buildReferenceKey}. */
+export const TOOL_OUTPUT_REF_PATTERN = /\{\{(tool\d+turn\d+)\}\}/g;
+
+/** Object key used when a parsed-object output has `_ref` injected. */
+export const TOOL_OUTPUT_REF_KEY = '_ref';
+
+/** Single-line prefix appended to non-object tool outputs so the LLM sees the reference key. */
+export function buildReferencePrefix(key: string): string {
+  return `[ref: ${key}]`;
+}
+
+/** Stable registry key for a tool output. */
+export function buildReferenceKey(toolIndex: number, turn: number): string {
+  return `tool${toolIndex}turn${turn}`;
+}
+
+export type ToolOutputReferenceRegistryOptions = {
+  /** Maximum characters stored per registered output. */
+  maxOutputSize?: number;
+  /** Maximum total characters retained across all registered outputs. */
+  maxTotalSize?: number;
+};
+
+type RegistryEntry = {
+  key: string;
+  value: string;
+};
+
+/**
+ * Result of resolving placeholders in tool args.
+ */
+export type ResolveResult<T> = {
+  /** Arguments with placeholders replaced. Same shape as the input. */
+  resolved: T;
+  /** Reference keys that were referenced but had no stored value. */
+  unresolved: string[];
+};
+
+/**
+ * Ordered map of reference-key → stored output with FIFO eviction when
+ * the aggregate size exceeds `maxTotalSize`.
+ *
+ * A single shared registry lives on the ToolNode for the duration of a
+ * run; it is not persisted across runs and is cleared when the graph's
+ * heavy state is cleared.
+ */
+export class ToolOutputReferenceRegistry {
+  private entries: Map<string, RegistryEntry> = new Map();
+  private totalSize: number = 0;
+  private readonly maxOutputSize: number;
+  private readonly maxTotalSize: number;
+
+  constructor(options: ToolOutputReferenceRegistryOptions = {}) {
+    const perOutput =
+      options.maxOutputSize != null && options.maxOutputSize > 0
+        ? options.maxOutputSize
+        : HARD_MAX_TOOL_RESULT_CHARS;
+    this.maxOutputSize = perOutput;
+    this.maxTotalSize =
+      options.maxTotalSize != null && options.maxTotalSize > 0
+        ? options.maxTotalSize
+        : calculateMaxTotalToolOutputSize(perOutput);
+  }
+
+  /** Registers (or replaces) the output stored under `key`. */
+  set(key: string, value: string): void {
+    const clipped =
+      value.length > this.maxOutputSize
+        ? value.slice(0, this.maxOutputSize)
+        : value;
+
+    const existing = this.entries.get(key);
+    if (existing) {
+      this.totalSize -= existing.value.length;
+      this.entries.delete(key);
+    }
+
+    this.entries.set(key, { key, value: clipped });
+    this.totalSize += clipped.length;
+    this.evictUntilWithinLimit();
+  }
+
+  /** Returns the stored value for `key`, or `undefined` if unknown. */
+  get(key: string): string | undefined {
+    return this.entries.get(key)?.value;
+  }
+
+  /** Current number of registered outputs. */
+  get size(): number {
+    return this.entries.size;
+  }
+
+  /** Maximum characters retained per output (post-clip). */
+  get perOutputLimit(): number {
+    return this.maxOutputSize;
+  }
+
+  /** Maximum total characters retained across the registry. */
+  get totalLimit(): number {
+    return this.maxTotalSize;
+  }
+
+  /** Drops all registered outputs. */
+  clear(): void {
+    this.entries.clear();
+    this.totalSize = 0;
+  }
+
+  /**
+   * Walks `args` and replaces every `{{tool<i>turn<n>}}` placeholder in
+   * string values with the stored output. Non-string values and object
+   * keys are left untouched. Unresolved references are left in-place and
+   * reported so the caller can surface them to the LLM.
+   */
+  resolve<T>(args: T): ResolveResult<T> {
+    const unresolved = new Set<string>();
+    const resolved = this.transform(args, unresolved) as T;
+    return { resolved, unresolved: Array.from(unresolved) };
+  }
+
+  private transform(value: unknown, unresolved: Set<string>): unknown {
+    if (typeof value === 'string') {
+      return this.replaceInString(value, unresolved);
+    }
+    if (Array.isArray(value)) {
+      return value.map((item) => this.transform(item, unresolved));
+    }
+    if (value !== null && typeof value === 'object') {
+      const source = value as Record<string, unknown>;
+      const next: Record<string, unknown> = {};
+      for (const [key, item] of Object.entries(source)) {
+        next[key] = this.transform(item, unresolved);
+      }
+      return next;
+    }
+    return value;
+  }
+
+  private replaceInString(input: string, unresolved: Set<string>): string {
+    if (input.indexOf('{{tool') === -1) {
+      return input;
+    }
+    return input.replace(TOOL_OUTPUT_REF_PATTERN, (match, key: string) => {
+      const stored = this.get(key);
+      if (stored == null) {
+        unresolved.add(key);
+        return match;
+      }
+      return stored;
+    });
+  }
+
+  private evictUntilWithinLimit(): void {
+    if (this.totalSize <= this.maxTotalSize) {
+      return;
+    }
+    for (const key of this.entries.keys()) {
+      if (this.totalSize <= this.maxTotalSize) {
+        return;
+      }
+      if (this.entries.size <= 1) {
+        return;
+      }
+      const entry = this.entries.get(key);
+      if (!entry) {
+        continue;
+      }
+      this.totalSize -= entry.value.length;
+      this.entries.delete(key);
+    }
+  }
+}
+
+/**
+ * Attempts to annotate `content` with its reference key so the LLM sees
+ * the key alongside the output.
+ *
+ * Behavior:
+ *  - If `content` parses as a plain (non-array, non-null) JSON object
+ *    and does not already have a conflicting `_ref` key, the key is
+ *    injected and the object re-serialized (compact or pretty,
+ *    matching the original layout).
+ *  - Otherwise (string output, JSON array/primitive, parse failure, or
+ *    `_ref` collision), a `[ref: <key>]\n` prefix line is prepended.
+ *
+ * The annotated string is what the LLM sees as `ToolMessage.content`.
+ * The *original* (un-annotated) value is what gets stored in the
+ * registry, so downstream piping remains pristine.
+ */
+export function annotateToolOutputWithReference(
+  content: string,
+  key: string
+): string {
+  const prefix = buildReferencePrefix(key);
+  const trimmed = content.trimStart();
+  if (trimmed.startsWith('{')) {
+    const annotated = tryInjectRefIntoJsonObject(content, key);
+    if (annotated != null) {
+      return annotated;
+    }
+  }
+  return `${prefix}\n${content}`;
+}
+
+function tryInjectRefIntoJsonObject(
+  content: string,
+  key: string
+): string | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    return null;
+  }
+
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return null;
+  }
+
+  const obj = parsed as Record<string, unknown>;
+  if (
+    TOOL_OUTPUT_REF_KEY in obj &&
+    obj[TOOL_OUTPUT_REF_KEY] !== key &&
+    obj[TOOL_OUTPUT_REF_KEY] != null
+  ) {
+    return null;
+  }
+
+  const injected: Record<string, unknown> = {
+    [TOOL_OUTPUT_REF_KEY]: key,
+    ...obj,
+  };
+
+  const pretty = /^\{\s*\n/.test(content);
+  return pretty ? JSON.stringify(injected, null, 2) : JSON.stringify(injected);
+}
