@@ -130,7 +130,6 @@ jobs:
         run: npx jest src/tools/__tests__/ProgrammaticToolCalling.test.ts
         env:
           NODE_ENV: test
-          LIBRECHAT_CODE_API_KEY: ${{ secrets.LIBRECHAT_CODE_API_KEY }}
           LIBRECHAT_CODE_BASEURL: ${{ secrets.LIBRECHAT_CODE_BASEURL }}
 
       - name: Check for Tool Search changes
@@ -155,7 +154,6 @@ jobs:
         run: npx jest src/tools/__tests__/ToolSearch.test.ts
         env:
           NODE_ENV: test
-          LIBRECHAT_CODE_API_KEY: ${{ secrets.LIBRECHAT_CODE_API_KEY }}
           LIBRECHAT_CODE_BASEURL: ${{ secrets.LIBRECHAT_CODE_BASEURL }}
 
       - name: Prune development dependencies
