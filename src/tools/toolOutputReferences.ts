@@ -86,11 +86,20 @@ export class ToolOutputReferenceRegistry {
       options.maxOutputSize != null && options.maxOutputSize > 0
         ? options.maxOutputSize
         : HARD_MAX_TOOL_RESULT_CHARS;
-    this.maxOutputSize = perOutput;
-    this.maxTotalSize =
+    const totalRaw =
       options.maxTotalSize != null && options.maxTotalSize > 0
         ? options.maxTotalSize
         : calculateMaxTotalToolOutputSize(perOutput);
+    this.maxTotalSize = totalRaw;
+    /**
+     * The per-output cap can never exceed the aggregate cap: if a
+     * single entry were allowed to be larger than `maxTotalSize`, the
+     * eviction loop would either blow the cap (to keep the entry) or
+     * self-evict a just-stored value. Clamping here turns
+     * `maxTotalSize` into a hard upper bound on *any* state the
+     * registry retains.
+     */
+    this.maxOutputSize = Math.min(perOutput, totalRaw);
   }
 
   /** Registers (or replaces) the output stored under `key`. */
@@ -197,9 +206,6 @@ export class ToolOutputReferenceRegistry {
       if (this.totalSize <= this.maxTotalSize) {
         return;
       }
-      if (this.entries.size <= 1) {
-        return;
-      }
       const entry = this.entries.get(key);
       if (entry == null) {
         continue;
@@ -293,9 +299,16 @@ function tryInjectRefIntoJsonObject(
     return null;
   }
 
+  /**
+   * Spread the tool output *first* so any existing `_ref: null`
+   * (treated as non-conflicting by the guard above) is overwritten by
+   * our injected key rather than the other way around. Without this
+   * ordering, the LLM would see `_ref: null` in the annotated content
+   * even though the output is registered.
+   */
   const injected: Record<string, unknown> = {
-    [TOOL_OUTPUT_REF_KEY]: key,
     ...obj,
+    [TOOL_OUTPUT_REF_KEY]: key,
   };
 
   const pretty = /^\{\s*\n/.test(content);

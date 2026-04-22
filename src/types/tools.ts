@@ -273,11 +273,11 @@ export type ToolOutputReferencesConfig = {
    */
   maxOutputSize?: number;
   /**
-   * Soft cap on total characters retained across all registered outputs
+   * Hard cap on total characters retained across all registered outputs
    * for the run. When exceeded, the oldest entries are evicted FIFO
-   * until the total is ≤ this cap OR only the most-recent entry
-   * remains (the just-stored output is never self-evicted, even if it
-   * alone exceeds the cap). Defaults to
+   * until the total fits. The effective per-output cap is
+   * `min(maxOutputSize, maxTotalSize)` so a single stored output can
+   * never exceed the aggregate bound. Defaults to
    * `calculateMaxTotalToolOutputSize(maxOutputSize)`.
    */
   maxTotalSize?: number;

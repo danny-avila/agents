@@ -70,6 +70,17 @@ describe('ToolOutputReferenceRegistry', () => {
       expect(reg.get('tool1turn0')).toBeUndefined();
       expect(reg.get('tool2turn0')).toBe('ccccccc');
     });
+
+    it('clamps the per-output cap to maxTotalSize so no entry exceeds the aggregate', () => {
+      const reg = new ToolOutputReferenceRegistry({
+        maxOutputSize: 1000,
+        maxTotalSize: 10,
+      });
+      reg.set('tool0turn0', 'x'.repeat(500));
+      const stored = reg.get('tool0turn0');
+      expect(stored).toBeDefined();
+      expect(stored!.length).toBeLessThanOrEqual(10);
+    });
   });
 
   describe('resolve', () => {
@@ -180,6 +191,14 @@ describe('ToolOutputReferenceRegistry', () => {
 
     it('injects when the existing _ref matches the target key', () => {
       const content = '{"_ref":"tool0turn0","data":1}';
+      const annotated = annotateToolOutputWithReference(content, 'tool0turn0');
+      const parsed = JSON.parse(annotated);
+      expect(parsed._ref).toBe('tool0turn0');
+      expect(parsed.data).toBe(1);
+    });
+
+    it('overwrites an existing _ref:null with the injected key', () => {
+      const content = '{"_ref":null,"data":1}';
       const annotated = annotateToolOutputWithReference(content, 'tool0turn0');
       const parsed = JSON.parse(annotated);
       expect(parsed._ref).toBe('tool0turn0');
