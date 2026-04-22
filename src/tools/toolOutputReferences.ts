@@ -23,13 +23,18 @@ import {
   HARD_MAX_TOOL_RESULT_CHARS,
 } from '@/utils/truncation';
 
-/** Key shape produced by {@link buildReferenceKey}. */
-export const TOOL_OUTPUT_REF_PATTERN = /\{\{(tool\d+turn\d+)\}\}/g;
+/**
+ * Non-global matcher for a single `{{tool<i>turn<n>}}` placeholder.
+ * Exported for consumers that want to detect references (e.g., syntax
+ * highlighting, docs). The stateful `g` variant lives inside the
+ * registry so nobody trips on `lastIndex`.
+ */
+export const TOOL_OUTPUT_REF_PATTERN = /\{\{(tool\d+turn\d+)\}\}/;
 
 /** Object key used when a parsed-object output has `_ref` injected. */
 export const TOOL_OUTPUT_REF_KEY = '_ref';
 
-/** Single-line prefix appended to non-object tool outputs so the LLM sees the reference key. */
+/** Single-line prefix prepended to non-object tool outputs so the LLM sees the reference key. */
 export function buildReferencePrefix(key: string): string {
   return `[ref: ${key}]`;
 }
@@ -44,11 +49,6 @@ export type ToolOutputReferenceRegistryOptions = {
   maxOutputSize?: number;
   /** Maximum total characters retained across all registered outputs. */
   maxTotalSize?: number;
-};
-
-type RegistryEntry = {
-  key: string;
-  value: string;
 };
 
 /**
@@ -70,10 +70,16 @@ export type ResolveResult<T> = {
  * heavy state is cleared.
  */
 export class ToolOutputReferenceRegistry {
-  private entries: Map<string, RegistryEntry> = new Map();
+  private entries: Map<string, string> = new Map();
   private totalSize: number = 0;
   private readonly maxOutputSize: number;
   private readonly maxTotalSize: number;
+  /**
+   * Local stateful matcher used only by `replaceInString`. Kept
+   * off-module so callers of the exported `TOOL_OUTPUT_REF_PATTERN`
+   * never see a stale `lastIndex`.
+   */
+  private static readonly PLACEHOLDER_MATCHER = /\{\{(tool\d+turn\d+)\}\}/g;
 
   constructor(options: ToolOutputReferenceRegistryOptions = {}) {
     const perOutput =
@@ -95,19 +101,19 @@ export class ToolOutputReferenceRegistry {
         : value;
 
     const existing = this.entries.get(key);
-    if (existing) {
-      this.totalSize -= existing.value.length;
+    if (existing != null) {
+      this.totalSize -= existing.length;
       this.entries.delete(key);
     }
 
-    this.entries.set(key, { key, value: clipped });
+    this.entries.set(key, clipped);
     this.totalSize += clipped.length;
     this.evictUntilWithinLimit();
   }
 
   /** Returns the stored value for `key`, or `undefined` if unknown. */
   get(key: string): string | undefined {
-    return this.entries.get(key)?.value;
+    return this.entries.get(key);
   }
 
   /** Current number of registered outputs. */
@@ -135,9 +141,14 @@ export class ToolOutputReferenceRegistry {
    * Walks `args` and replaces every `{{tool<i>turn<n>}}` placeholder in
    * string values with the stored output. Non-string values and object
    * keys are left untouched. Unresolved references are left in-place and
-   * reported so the caller can surface them to the LLM.
+   * reported so the caller can surface them to the LLM. When no
+   * placeholder appears anywhere in the serialized args, the original
+   * input is returned without walking the tree.
    */
   resolve<T>(args: T): ResolveResult<T> {
+    if (!hasAnyPlaceholder(args)) {
+      return { resolved: args, unresolved: [] };
+    }
     const unresolved = new Set<string>();
     const resolved = this.transform(args, unresolved) as T;
     return { resolved, unresolved: Array.from(unresolved) };
@@ -165,14 +176,17 @@ export class ToolOutputReferenceRegistry {
     if (input.indexOf('{{tool') === -1) {
       return input;
     }
-    return input.replace(TOOL_OUTPUT_REF_PATTERN, (match, key: string) => {
-      const stored = this.get(key);
-      if (stored == null) {
-        unresolved.add(key);
-        return match;
+    return input.replace(
+      ToolOutputReferenceRegistry.PLACEHOLDER_MATCHER,
+      (match, key: string) => {
+        const stored = this.get(key);
+        if (stored == null) {
+          unresolved.add(key);
+          return match;
+        }
+        return stored;
       }
-      return stored;
-    });
+    );
   }
 
   private evictUntilWithinLimit(): void {
@@ -187,13 +201,41 @@ export class ToolOutputReferenceRegistry {
         return;
       }
       const entry = this.entries.get(key);
-      if (!entry) {
+      if (entry == null) {
         continue;
       }
-      this.totalSize -= entry.value.length;
+      this.totalSize -= entry.length;
       this.entries.delete(key);
     }
   }
+}
+
+/**
+ * Cheap pre-check: returns true if any string value in `args` contains
+ * the `{{tool` substring. Lets `resolve()` skip the deep tree walk (and
+ * its object allocations) for the common case of plain args.
+ */
+function hasAnyPlaceholder(value: unknown): boolean {
+  if (typeof value === 'string') {
+    return value.indexOf('{{tool') !== -1;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      if (hasAnyPlaceholder(item)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  if (value !== null && typeof value === 'object') {
+    for (const item of Object.values(value as Record<string, unknown>)) {
+      if (hasAnyPlaceholder(item)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  return false;
 }
 
 /**

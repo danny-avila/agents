@@ -194,14 +194,17 @@ describe('ToolOutputReferenceRegistry', () => {
   });
 
   describe('TOOL_OUTPUT_REF_PATTERN', () => {
-    it('matches only braced tool<N>turn<M> tokens', () => {
-      TOOL_OUTPUT_REF_PATTERN.lastIndex = 0;
-      const matches = Array.from(
-        'prefix {{tool0turn0}} and {{tool12turn34}} but not tool0turn0'.matchAll(
-          TOOL_OUTPUT_REF_PATTERN
-        )
-      );
-      expect(matches.map((m) => m[1])).toEqual(['tool0turn0', 'tool12turn34']);
+    it('matches braced tool<N>turn<M> tokens and captures the key', () => {
+      const match = '{{tool0turn0}}'.match(TOOL_OUTPUT_REF_PATTERN);
+      expect(match?.[1]).toBe('tool0turn0');
+    });
+
+    it('rejects bare tool<N>turn<M> tokens without braces', () => {
+      expect(TOOL_OUTPUT_REF_PATTERN.test('tool0turn0')).toBe(false);
+    });
+
+    it('is non-global so callers cannot trip on stale lastIndex', () => {
+      expect(TOOL_OUTPUT_REF_PATTERN.flags).not.toContain('g');
     });
   });
 });

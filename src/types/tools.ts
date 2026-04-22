@@ -252,6 +252,17 @@ export type LCToolRegistry = Map<string, LCTool>;
  *
  * Size limits mirror the shape of `calculateMaxToolResultChars` so
  * substituted content cannot exceed what the model has already seen.
+ *
+ * Known limitations:
+ *  - Tools that return a `ToolMessage` with array-type content
+ *    (multi-part content blocks such as text + image) are not
+ *    registered and cannot be cited via `{{tool<i>turn<n>}}`. A
+ *    warning is logged so the missing reference is visible.
+ *  - When a `PostToolUse` hook replaces `ToolMessage.content`, the
+ *    *post-hook* content is what gets stored in the registry (and
+ *    what the model sees), so `{{…}}` substitutions deliver the
+ *    hooked output rather than the raw tool return. This matches the
+ *    hook's "authoritative" role for output shaping.
  */
 export type ToolOutputReferencesConfig = {
   /** Enable the registry and placeholder substitution. Defaults to `false`. */
@@ -262,9 +273,12 @@ export type ToolOutputReferencesConfig = {
    */
   maxOutputSize?: number;
   /**
-   * Maximum total characters retained across all registered outputs for
-   * the run. When exceeded, the oldest registered outputs are evicted
-   * FIFO. Defaults to `calculateMaxTotalToolOutputSize(maxOutputSize)`.
+   * Soft cap on total characters retained across all registered outputs
+   * for the run. When exceeded, the oldest entries are evicted FIFO
+   * until the total is ≤ this cap OR only the most-recent entry
+   * remains (the just-stored output is never self-evicted, even if it
+   * alone exceeds the cap). Defaults to
+   * `calculateMaxTotalToolOutputSize(maxOutputSize)`.
    */
   maxTotalSize?: number;
 };
