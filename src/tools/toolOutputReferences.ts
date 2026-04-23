@@ -389,39 +389,73 @@ function tryInjectRefIntoJsonObject(
   }
 
   const obj = parsed as Record<string, unknown>;
+  const injectingRef = key != null;
+  const injectingUnresolved = unresolved.length > 0;
+
+  /**
+   * Reject the JSON-injection path (fall back to prefix form) when
+   * either of our keys collides with real payload data:
+   *  - `_ref` collision: existing value is non-null and differs from
+   *    the key we're about to inject.
+   *  - `_unresolved_refs` collision: existing value is non-null and
+   *    is not a deep-equal match for the array we'd inject.
+   * This keeps us from silently overwriting legitimate tool output.
+   */
   if (
-    key != null &&
+    injectingRef &&
     TOOL_OUTPUT_REF_KEY in obj &&
     obj[TOOL_OUTPUT_REF_KEY] !== key &&
     obj[TOOL_OUTPUT_REF_KEY] != null
   ) {
     return null;
   }
+  if (
+    injectingUnresolved &&
+    TOOL_OUTPUT_UNRESOLVED_KEY in obj &&
+    obj[TOOL_OUTPUT_UNRESOLVED_KEY] != null &&
+    !arraysShallowEqual(obj[TOOL_OUTPUT_UNRESOLVED_KEY], unresolved)
+  ) {
+    return null;
+  }
 
   /**
-   * Drop any pre-existing `_ref` / `_unresolved_refs` (the guard
-   * above already rejected real `_ref` conflicts; any value that
-   * reaches here is either null or matching) so we can place our
-   * injected keys *first* in the serialized JSON. Leading-key
-   * placement means the LLM sees the reference identifier before
-   * it reads the payload.
+   * Only strip the framework-owned key we're actually injecting —
+   * leave everything else (including a pre-existing `_ref` on the
+   * unresolved-only path, or a pre-existing `_unresolved_refs` on a
+   * plain-annotation path) untouched so we annotate rather than
+   * mutate downstream payload data. Our injected keys land first in
+   * the serialized JSON so the LLM sees them before the body.
    */
-  const {
-    [TOOL_OUTPUT_REF_KEY]: _existingRef,
-    [TOOL_OUTPUT_UNRESOLVED_KEY]: _existingUnresolved,
-    ...rest
-  } = obj;
-  void _existingRef;
-  void _existingUnresolved;
+  const omitKeys = new Set<string>();
+  if (injectingRef) omitKeys.add(TOOL_OUTPUT_REF_KEY);
+  if (injectingUnresolved) omitKeys.add(TOOL_OUTPUT_UNRESOLVED_KEY);
+  const rest: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (!omitKeys.has(k)) {
+      rest[k] = v;
+    }
+  }
   const injected: Record<string, unknown> = {};
-  if (key != null) {
+  if (injectingRef) {
     injected[TOOL_OUTPUT_REF_KEY] = key;
   }
-  if (unresolved.length > 0) {
+  if (injectingUnresolved) {
     injected[TOOL_OUTPUT_UNRESOLVED_KEY] = unresolved;
   }
   Object.assign(injected, rest);
 
   const pretty = /^\{\s*\n/.test(content);
   return pretty ? JSON.stringify(injected, null, 2) : JSON.stringify(injected);
+}
+
+function arraysShallowEqual(a: unknown, b: readonly string[]): boolean {
+  if (!Array.isArray(a) || a.length !== b.length) {
+    return false;
+  }
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) {
+      return false;
+    }
+  }
+  return true;
 }

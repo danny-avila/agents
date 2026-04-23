@@ -271,6 +271,45 @@ describe('ToolOutputReferenceRegistry', () => {
         'plain'
       );
     });
+
+    it('preserves an existing _unresolved_refs payload when only injecting a ref key', () => {
+      const content = '{"data":1,"_unresolved_refs":["user-supplied"]}';
+      const annotated = annotateToolOutputWithReference(content, 'tool0turn0');
+      const parsed = JSON.parse(annotated);
+      expect(parsed._ref).toBe('tool0turn0');
+      expect(parsed._unresolved_refs).toEqual(['user-supplied']);
+      expect(parsed.data).toBe(1);
+    });
+
+    it('preserves an existing _ref payload on the unresolved-only path', () => {
+      const content = '{"data":1,"_ref":"preserved-value"}';
+      const annotated = annotateToolOutputWithReference(content, undefined, [
+        'tool9turn9',
+      ]);
+      const parsed = JSON.parse(annotated);
+      expect(parsed._ref).toBe('preserved-value');
+      expect(parsed._unresolved_refs).toEqual(['tool9turn9']);
+      expect(parsed.data).toBe(1);
+    });
+
+    it('falls back to the prefix when _unresolved_refs conflicts with a non-matching array', () => {
+      const content = '{"data":1,"_unresolved_refs":["legacy"]}';
+      const annotated = annotateToolOutputWithReference(content, 'tool0turn0', [
+        'tool9turn9',
+      ]);
+      expect(annotated.startsWith('[ref: tool0turn0]\n')).toBe(true);
+      expect(annotated).toContain('[unresolved refs: tool9turn9]');
+    });
+
+    it('accepts a deep-equal existing _unresolved_refs array', () => {
+      const content = '{"data":1,"_unresolved_refs":["tool9turn9"]}';
+      const annotated = annotateToolOutputWithReference(content, 'tool0turn0', [
+        'tool9turn9',
+      ]);
+      const parsed = JSON.parse(annotated);
+      expect(parsed._unresolved_refs).toEqual(['tool9turn9']);
+      expect(parsed._ref).toBe('tool0turn0');
+    });
   });
 
   describe('TOOL_OUTPUT_REF_PATTERN', () => {
