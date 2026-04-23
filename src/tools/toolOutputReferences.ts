@@ -24,7 +24,7 @@
 
 import {
   calculateMaxTotalToolOutputSize,
-  HARD_MAX_TOTAL_TOOL_OUTPUT_SIZE,
+  HARD_MAX_TOOL_RESULT_CHARS,
 } from '@/utils/truncation';
 
 /**
@@ -37,6 +37,14 @@ export const TOOL_OUTPUT_REF_PATTERN = /\{\{(tool\d+turn\d+)\}\}/;
 
 /** Object key used when a parsed-object output has `_ref` injected. */
 export const TOOL_OUTPUT_REF_KEY = '_ref';
+
+/**
+ * Object key used to carry unresolved reference warnings on a parsed-
+ * object output. Using a dedicated field instead of a trailing text
+ * line keeps the annotated `ToolMessage.content` parseable as JSON for
+ * downstream consumers that rely on the object shape.
+ */
+export const TOOL_OUTPUT_UNRESOLVED_KEY = '_unresolved_refs';
 
 /** Single-line prefix prepended to non-object tool outputs so the LLM sees the reference key. */
 export function buildReferencePrefix(key: string): string {
@@ -105,10 +113,19 @@ export class ToolOutputReferenceRegistry {
   private static readonly PLACEHOLDER_MATCHER = /\{\{(tool\d+turn\d+)\}\}/g;
 
   constructor(options: ToolOutputReferenceRegistryOptions = {}) {
+    /**
+     * Per-output default is the same ~400 KB budget as the standard
+     * tool-result truncation (`HARD_MAX_TOOL_RESULT_CHARS`). This
+     * keeps a single `{{…}}` substitution at a size that is safe to
+     * pass through typical shell `ARG_MAX` limits and matches what
+     * the LLM would otherwise have seen. Hosts that want larger per-
+     * output payloads (API consumers, long JSON streams) can raise
+     * the cap explicitly up to the 5 MB total budget.
+     */
     const perOutput =
       options.maxOutputSize != null && options.maxOutputSize > 0
         ? options.maxOutputSize
-        : HARD_MAX_TOTAL_TOOL_OUTPUT_SIZE;
+        : HARD_MAX_TOOL_RESULT_CHARS;
     const totalRaw =
       options.maxTotalSize != null && options.maxTotalSize > 0
         ? options.maxTotalSize
@@ -306,39 +323,59 @@ function hasAnyPlaceholder(value: unknown): boolean {
 }
 
 /**
- * Attempts to annotate `content` with its reference key so the LLM sees
- * the key alongside the output.
+ * Annotates `content` with a reference key and/or unresolved-ref
+ * warnings so the LLM sees both alongside the tool output.
  *
  * Behavior:
  *  - If `content` parses as a plain (non-array, non-null) JSON object
- *    and does not already have a conflicting `_ref` key, the key is
- *    injected and the object re-serialized (compact or pretty,
- *    matching the original layout).
- *  - Otherwise (string output, JSON array/primitive, parse failure, or
- *    `_ref` collision), a `[ref: <key>]\n` prefix line is prepended.
+ *    and the object does not already have a conflicting `_ref` key,
+ *    the reference key and (when present) `_unresolved_refs` array
+ *    are injected as object fields, preserving JSON validity for
+ *    downstream consumers that parse the output.
+ *  - Otherwise (string output, JSON array/primitive, parse failure,
+ *    or `_ref` collision), a `[ref: <key>]\n` prefix line is
+ *    prepended and unresolved refs are appended as a trailing
+ *    `[unresolved refs: …]` line.
  *
  * The annotated string is what the LLM sees as `ToolMessage.content`.
  * The *original* (un-annotated) value is what gets stored in the
  * registry, so downstream piping remains pristine.
+ *
+ * @param content     Raw (post-truncation) tool output.
+ * @param key         Reference key for this output, or undefined when
+ *                    there is nothing to register (errors etc.).
+ * @param unresolved  Reference keys that failed to resolve during
+ *                    argument substitution. Surfaced so the LLM can
+ *                    self-correct its next tool call.
  */
 export function annotateToolOutputWithReference(
   content: string,
-  key: string
+  key: string | undefined,
+  unresolved: string[] = []
 ): string {
-  const prefix = buildReferencePrefix(key);
+  const hasRefKey = key != null;
+  const hasUnresolved = unresolved.length > 0;
+  if (!hasRefKey && !hasUnresolved) {
+    return content;
+  }
   const trimmed = content.trimStart();
   if (trimmed.startsWith('{')) {
-    const annotated = tryInjectRefIntoJsonObject(content, key);
+    const annotated = tryInjectRefIntoJsonObject(content, key, unresolved);
     if (annotated != null) {
       return annotated;
     }
   }
-  return `${prefix}\n${content}`;
+  const prefix = hasRefKey ? `${buildReferencePrefix(key!)}\n` : '';
+  const trailer = hasUnresolved
+    ? `\n[unresolved refs: ${unresolved.join(', ')}]`
+    : '';
+  return `${prefix}${content}${trailer}`;
 }
 
 function tryInjectRefIntoJsonObject(
   content: string,
-  key: string
+  key: string | undefined,
+  unresolved: string[]
 ): string | null {
   let parsed: unknown;
   try {
@@ -353,6 +390,7 @@ function tryInjectRefIntoJsonObject(
 
   const obj = parsed as Record<string, unknown>;
   if (
+    key != null &&
     TOOL_OUTPUT_REF_KEY in obj &&
     obj[TOOL_OUTPUT_REF_KEY] !== key &&
     obj[TOOL_OUTPUT_REF_KEY] != null
@@ -361,19 +399,28 @@ function tryInjectRefIntoJsonObject(
   }
 
   /**
-   * Drop any pre-existing `_ref` (the guard above already rejected
-   * real conflicts; what reaches here is either a null or a matching
-   * value) so we can place our injected key *first* in the serialized
-   * JSON. Leading-key placement means the LLM sees the reference
-   * identifier before it reads the payload, which matters for large
-   * objects where the tail might be truncated by downstream consumers.
+   * Drop any pre-existing `_ref` / `_unresolved_refs` (the guard
+   * above already rejected real `_ref` conflicts; any value that
+   * reaches here is either null or matching) so we can place our
+   * injected keys *first* in the serialized JSON. Leading-key
+   * placement means the LLM sees the reference identifier before
+   * it reads the payload.
    */
-  const { [TOOL_OUTPUT_REF_KEY]: _existing, ...rest } = obj;
-  void _existing;
-  const injected: Record<string, unknown> = {
-    [TOOL_OUTPUT_REF_KEY]: key,
-    ...rest,
-  };
+  const {
+    [TOOL_OUTPUT_REF_KEY]: _existingRef,
+    [TOOL_OUTPUT_UNRESOLVED_KEY]: _existingUnresolved,
+    ...rest
+  } = obj;
+  void _existingRef;
+  void _existingUnresolved;
+  const injected: Record<string, unknown> = {};
+  if (key != null) {
+    injected[TOOL_OUTPUT_REF_KEY] = key;
+  }
+  if (unresolved.length > 0) {
+    injected[TOOL_OUTPUT_UNRESOLVED_KEY] = unresolved;
+  }
+  Object.assign(injected, rest);
 
   const pretty = /^\{\s*\n/.test(content);
   return pretty ? JSON.stringify(injected, null, 2) : JSON.stringify(injected);

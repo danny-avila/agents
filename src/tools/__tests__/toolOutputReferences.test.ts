@@ -221,6 +221,56 @@ describe('ToolOutputReferenceRegistry', () => {
       const annotated = annotateToolOutputWithReference(content, 'tool0turn0');
       expect(annotated).toBe(`[ref: tool0turn0]\n${content}`);
     });
+
+    it('carries unresolved refs as a JSON field on parseable objects', () => {
+      const content = '{"a":1}';
+      const annotated = annotateToolOutputWithReference(content, 'tool0turn0', [
+        'tool9turn9',
+        'tool7turn0',
+      ]);
+      const parsed = JSON.parse(annotated);
+      expect(parsed._ref).toBe('tool0turn0');
+      expect(parsed._unresolved_refs).toEqual(['tool9turn9', 'tool7turn0']);
+      expect(parsed.a).toBe(1);
+    });
+
+    it('appends unresolved refs as a trailer line on non-object content', () => {
+      const annotated = annotateToolOutputWithReference(
+        'plain text',
+        'tool0turn0',
+        ['tool9turn9']
+      );
+      expect(annotated).toBe(
+        '[ref: tool0turn0]\nplain text\n[unresolved refs: tool9turn9]'
+      );
+    });
+
+    it('supports unresolved-only annotation (no ref key)', () => {
+      const annotated = annotateToolOutputWithReference(
+        'error text',
+        undefined,
+        ['tool9turn9']
+      );
+      expect(annotated).toBe('error text\n[unresolved refs: tool9turn9]');
+    });
+
+    it('keeps JSON parseable for unresolved-only annotation on object content', () => {
+      const annotated = annotateToolOutputWithReference(
+        '{"error":"bad"}',
+        undefined,
+        ['tool9turn9']
+      );
+      const parsed = JSON.parse(annotated);
+      expect(parsed._unresolved_refs).toEqual(['tool9turn9']);
+      expect(parsed.error).toBe('bad');
+      expect(parsed._ref).toBeUndefined();
+    });
+
+    it('returns content unchanged when there is nothing to annotate', () => {
+      expect(annotateToolOutputWithReference('plain', undefined, [])).toBe(
+        'plain'
+      );
+    });
   });
 
   describe('TOOL_OUTPUT_REF_PATTERN', () => {

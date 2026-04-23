@@ -495,15 +495,17 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     refKey: string | undefined,
     unresolved: string[]
   ): string {
-    let content = llmContent;
     if (this.toolOutputRegistry != null && refKey != null) {
       this.toolOutputRegistry.set(refKey, registryContent);
-      content = annotateToolOutputWithReference(llmContent, refKey);
     }
-    if (unresolved.length > 0) {
-      content += `\n[unresolved refs: ${unresolved.join(', ')}]`;
-    }
-    return content;
+    /**
+     * `annotateToolOutputWithReference` handles both the ref-key and
+     * unresolved-refs cases together so JSON-object outputs stay
+     * parseable: unresolved refs land in an `_unresolved_refs` field
+     * instead of as a trailing text line that would break
+     * `JSON.parse` for downstream consumers.
+     */
+    return annotateToolOutputWithReference(llmContent, refKey, unresolved);
   }
 
   /**
