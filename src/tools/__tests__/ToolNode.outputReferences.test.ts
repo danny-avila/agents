@@ -7,7 +7,10 @@ import type * as t from '@/types';
 import * as events from '@/utils/events';
 import { HookRegistry } from '@/hooks';
 import { ToolNode } from '../ToolNode';
-import { TOOL_OUTPUT_REF_KEY } from '../toolOutputReferences';
+import {
+  ToolOutputReferenceRegistry,
+  TOOL_OUTPUT_REF_KEY,
+} from '../toolOutputReferences';
 
 /**
  * Captures the `command` arg each time the tool is invoked and returns
@@ -315,7 +318,10 @@ describe('ToolNode tool output references', () => {
 
       await new Promise<void>((resolve) => {
         const check = (): void => {
-          if (gates.A != null && gates.B != null) {
+          if (
+            Object.prototype.hasOwnProperty.call(gates, 'A') &&
+            Object.prototype.hasOwnProperty.call(gates, 'B')
+          ) {
             resolve();
           } else {
             setTimeout(check, 5);
@@ -491,6 +497,59 @@ describe('ToolNode tool output references', () => {
       expect(result.messages[0].content).toContain(
         '[unresolved refs: tool0turn0]'
       );
+    });
+
+    it('lets two ToolNodes sharing a registry resolve each other\'s refs', async () => {
+      const sharedRegistry = new ToolOutputReferenceRegistry();
+      const capturedA: string[] = [];
+      const capturedB: string[] = [];
+      const toolA = createEchoTool({
+        capturedArgs: capturedA,
+        outputs: ['agent-A-output'],
+        name: 'alpha',
+      });
+      const toolB = createEchoTool({
+        capturedArgs: capturedB,
+        outputs: ['agent-B-output'],
+        name: 'beta',
+      });
+
+      // Two independent ToolNodes (simulating one per agent in a
+      // multi-agent graph) sharing one registry instance.
+      const nodeA = new ToolNode({
+        tools: [toolA],
+        toolOutputRegistry: sharedRegistry,
+      });
+      const nodeB = new ToolNode({
+        tools: [toolB],
+        toolOutputRegistry: sharedRegistry,
+      });
+
+      await nodeA.invoke(
+        {
+          messages: [
+            aiMsgWithCalls([{ id: 'a1', name: 'alpha', command: 'first' }]),
+          ],
+        },
+        { configurable: { run_id: 'shared-run' } }
+      );
+
+      await nodeB.invoke(
+        {
+          messages: [
+            aiMsgWithCalls([
+              { id: 'b1', name: 'beta', command: 'see {{tool0turn0}}' },
+            ]),
+          ],
+        },
+        { configurable: { run_id: 'shared-run' } }
+      );
+
+      // nodeB resolved nodeA's tool0turn0 placeholder (cross-node),
+      // and its own output landed under the *next* turn (1), not 0.
+      expect(capturedB[0]).toBe('see agent-A-output');
+      expect(sharedRegistry.get('tool0turn0')).toBe('agent-A-output');
+      expect(sharedRegistry.get('tool0turn1')).toBe('agent-B-output');
     });
 
     it('resets the registry and turn counter when the runId changes', async () => {

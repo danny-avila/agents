@@ -79,6 +79,25 @@ export class ToolOutputReferenceRegistry {
   private readonly maxOutputSize: number;
   private readonly maxTotalSize: number;
   /**
+   * Monotonic batch counter shared across every ToolNode that holds
+   * this registry. Multi-agent graphs use one registry per run so
+   * turns are globally unique across agents — `tool0turn3` from agent
+   * B does not collide with `tool0turn3` from agent A.
+   */
+  private turnCounter: number = 0;
+  /**
+   * Last observed `run_id`. Drives the reset when we cross into a
+   * new run. Undefined when the feature is invoked without a
+   * `run_id`; in that case every call is treated as a fresh run.
+   */
+  private lastRunId: string | undefined;
+  /**
+   * Per-run memo of tool names we've already logged a non-string-
+   * content warning for. Cleared on every run change so each run
+   * emits at most one line per offending tool.
+   */
+  private warnedNonStringTools: Set<string> = new Set();
+  /**
    * Local stateful matcher used only by `replaceInString`. Kept
    * off-module so callers of the exported `TOOL_OUTPUT_REF_PATTERN`
    * never see a stale `lastIndex`.
@@ -148,6 +167,44 @@ export class ToolOutputReferenceRegistry {
   clear(): void {
     this.entries.clear();
     this.totalSize = 0;
+  }
+
+  /**
+   * Claims the next batch turn synchronously.
+   *
+   * Must be called once at the start of each ToolNode batch before
+   * any `await`, so concurrent invocations within the same run see
+   * distinct turn values (reads are effectively atomic by JS's
+   * single-threaded execution of the sync prefix).
+   *
+   * If `runId` differs from the last-seen value — or is missing —
+   * the registry, warn-set, and counter are cleared before claiming
+   * turn 0. Missing `runId` is treated as "always a new run" so
+   * anonymous callers never leak state across invocations.
+   */
+  nextTurn(runId: string | undefined): number {
+    if (runId == null || runId !== this.lastRunId) {
+      this.entries.clear();
+      this.totalSize = 0;
+      this.turnCounter = 0;
+      this.warnedNonStringTools.clear();
+      this.lastRunId = runId;
+    }
+    return this.turnCounter++;
+  }
+
+  /**
+   * Records that `toolName` has been warned about (returns `true`
+   * on the first call per run, `false` after). Used by ToolNode to
+   * emit one log line per offending tool per run when a
+   * `ToolMessage.content` isn't a string.
+   */
+  claimWarnOnce(toolName: string): boolean {
+    if (this.warnedNonStringTools.has(toolName)) {
+      return false;
+    }
+    this.warnedNonStringTools.add(toolName);
+    return true;
   }
 
   /**

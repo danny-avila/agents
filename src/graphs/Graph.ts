@@ -43,6 +43,7 @@ import {
 import { SubagentExecutor, resolveSubagentConfigs } from '@/tools/subagent';
 import { buildSubagentToolParams } from '@/tools/SubagentTool';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
+import { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { shouldTriggerSummarization } from '@/summarization';
@@ -135,6 +136,13 @@ export abstract class Graph<
    */
   toolOutputReferences: t.ToolOutputReferencesConfig | undefined;
   /**
+   * Shared registry instance used by every ToolNode compiled from this
+   * graph. Lazily constructed on first access so multi-agent graphs
+   * produce one registry per run (not one per agent), letting cross-
+   * agent `{{tool<i>turn<n>}}` substitutions resolve.
+   */
+  private _toolOutputRegistry?: ToolOutputReferenceRegistry;
+  /**
    * Tool session contexts for automatic state persistence across tool invocations.
    * Keyed by tool name (e.g., Constants.EXECUTE_CODE).
    * Currently supports code execution session tracking (session_id, files).
@@ -160,7 +168,29 @@ export abstract class Graph<
     this.handlerRegistry = undefined;
     this.hookRegistry = undefined;
     this.toolOutputReferences = undefined;
+    this._toolOutputRegistry = undefined;
     this.sessions.clear();
+  }
+
+  /**
+   * Returns the shared `ToolOutputReferenceRegistry` for this run,
+   * constructing it on first access. Returns `undefined` when the
+   * feature is disabled. All ToolNodes compiled from this graph share
+   * this single instance so cross-agent `{{…}}` references resolve.
+   */
+  protected getOrCreateToolOutputRegistry():
+    | ToolOutputReferenceRegistry
+    | undefined {
+    if (this.toolOutputReferences?.enabled !== true) {
+      return undefined;
+    }
+    if (this._toolOutputRegistry == null) {
+      this._toolOutputRegistry = new ToolOutputReferenceRegistry({
+        maxOutputSize: this.toolOutputReferences.maxOutputSize,
+        maxTotalSize: this.toolOutputReferences.maxTotalSize,
+      });
+    }
+    return this._toolOutputRegistry;
   }
 }
 
@@ -523,7 +553,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         directToolNames: directToolNames.size > 0 ? directToolNames : undefined,
         maxContextTokens: agentContext?.maxContextTokens,
         maxToolResultChars: agentContext?.maxToolResultChars,
-        toolOutputReferences: this.toolOutputReferences,
+        toolOutputRegistry: this.getOrCreateToolOutputRegistry(),
         errorHandler: (data, metadata) =>
           StandardGraph.handleToolCallErrorStatic(this, data, metadata),
       });
@@ -555,7 +585,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       sessions: this.sessions,
       maxContextTokens: agentContext?.maxContextTokens,
       maxToolResultChars: agentContext?.maxToolResultChars,
-      toolOutputReferences: this.toolOutputReferences,
+      toolOutputRegistry: this.getOrCreateToolOutputRegistry(),
     });
   }
 

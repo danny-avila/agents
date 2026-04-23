@@ -3,6 +3,7 @@ import type { StructuredToolInterface } from '@langchain/core/tools';
 import type { RunnableToolLike } from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type { HookRegistry } from '@/hooks';
+import type { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import type { MessageContentComplex, ToolErrorData } from './stream';
 
 /** Replacement type for `import type { ToolCall } from '@langchain/core/messages/tool'` in order to have stringified args typed */
@@ -66,8 +67,18 @@ export type ToolNodeOptions = {
    * Run-scoped tool output reference configuration. When `enabled` is
    * `true`, ToolNode registers successful outputs and substitutes
    * `{{tool<idx>turn<turn>}}` placeholders found in string args.
+   *
+   * Ignored when `toolOutputRegistry` is also provided (host-supplied
+   * registry wins).
    */
   toolOutputReferences?: ToolOutputReferencesConfig;
+  /**
+   * Pre-constructed registry instance shared across ToolNodes for the
+   * run. Graphs pass the same registry to every ToolNode they compile
+   * so cross-agent `{{tool<i>turn<n>}}` substitutions resolve. Takes
+   * precedence over `toolOutputReferences` when both are set.
+   */
+  toolOutputRegistry?: ToolOutputReferenceRegistry;
 };
 
 export type ToolNodeConstructorParams = ToolRefs & ToolNodeOptions;

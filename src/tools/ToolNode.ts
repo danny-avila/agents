@@ -105,34 +105,17 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   /** Hook registry for PreToolUse/PostToolUse lifecycle hooks */
   private hookRegistry?: HookRegistry;
   /**
-   * Registry of tool outputs keyed by `tool<idx>turn<turn>` — populated
-   * only when `toolOutputReferences.enabled` is true. Shared across all
-   * batches within the life of this ToolNode.
+   * Registry of tool outputs keyed by `tool<idx>turn<turn>`.
+   *
+   * Populated only when `toolOutputReferences.enabled` is true. The
+   * registry owns the run-scoped state (turn counter, last-seen runId,
+   * warn-once memo, stored outputs), so sharing a single instance
+   * across multiple ToolNodes in a run lets cross-agent `{{…}}`
+   * references resolve — which is why multi-agent graphs pass the
+   * *same* instance to every ToolNode they compile rather than each
+   * ToolNode building its own.
    */
   private toolOutputRegistry?: ToolOutputReferenceRegistry;
-  /**
-   * Monotonic batch counter. Incremented once per `run()` invocation
-   * so every tool call in a batch shares the same `turn` index for its
-   * reference key. Zero-based, matches the `turn<N>` segment.
-   */
-  private turnCounter: number = 0;
-  /** Turn index for the batch currently being processed. */
-  private currentTurn: number = 0;
-  /**
-   * Last observed runId from `config.configurable.run_id`. When a new
-   * run starts (e.g. a host reuses the same Run / compiled workflow
-   * across multiple `processStream` calls), we detect the runId change
-   * and clear the registry + turn counter so a stale `tool<i>turn<n>`
-   * from the previous run cannot be served to a new run's tool calls.
-   */
-  private lastRunId: string | undefined;
-  /**
-   * Per-run memo of tool names we've already warned about for returning
-   * non-string `ToolMessage.content` (and thus being ineligible for the
-   * reference registry). Cleared on runId change so each run gets its
-   * own single log line per offending tool.
-   */
-  private warnedNonStringRefTools: Set<string> = new Set();
 
   constructor({
     tools,
@@ -152,6 +135,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     maxToolResultChars,
     hookRegistry,
     toolOutputReferences,
+    toolOutputRegistry,
   }: t.ToolNodeConstructorParams) {
     super({ name, tags, func: (input, config) => this.run(input, config) });
     this.toolMap = toolMap ?? new Map(tools.map((tool) => [tool.name, tool]));
@@ -168,15 +152,20 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     this.maxToolResultChars =
       maxToolResultChars ?? calculateMaxToolResultChars(maxContextTokens);
     this.hookRegistry = hookRegistry;
-    if (toolOutputReferences?.enabled === true) {
-      /**
-       * Registry caps are intentionally *decoupled* from
-       * `maxToolResultChars`: the registry stores the raw untruncated
-       * output so a later `{{…}}` substitution pipes the full payload
-       * into the next tool, even when the LLM saw a truncated preview.
-       * Pass the caller's config through unchanged — the registry fills
-       * in its own 5 MB defaults.
-       */
+    /**
+     * Precedence: an explicitly passed `toolOutputRegistry` instance
+     * wins over a config object so a host (`Graph`) can share one
+     * registry across many ToolNodes. When only the config is
+     * provided (direct ToolNode usage), build a local registry so
+     * the feature still works without graph-level plumbing. Registry
+     * caps are intentionally decoupled from `maxToolResultChars`:
+     * the registry stores the raw untruncated output so a later
+     * `{{…}}` substitution pipes the full payload into the next
+     * tool, even when the LLM saw a truncated preview.
+     */
+    if (toolOutputRegistry != null) {
+      this.toolOutputRegistry = toolOutputRegistry;
+    } else if (toolOutputReferences?.enabled === true) {
       this.toolOutputRegistry = new ToolOutputReferenceRegistry({
         maxOutputSize: toolOutputReferences.maxOutputSize,
         maxTotalSize: toolOutputReferences.maxTotalSize,
@@ -385,10 +374,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
              * and therefore cannot be cited via `{{tool<i>turn<n>}}`.
              * Registering would require deciding which block is
              * canonical, which differs per tool. Warn once per tool
-             * per run so repeated invocations don't flood the logs.
+             * per run (memo lives on the registry so multi-agent
+             * graphs don't double-warn from each ToolNode).
              */
-            if (!this.warnedNonStringRefTools.has(call.name)) {
-              this.warnedNonStringRefTools.add(call.name);
+            if (this.toolOutputRegistry!.claimWarnOnce(call.name)) {
               // eslint-disable-next-line no-console
               console.warn(
                 `[ToolNode] Skipping tool output reference for "${call.name}": ` +
@@ -1115,33 +1104,18 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   protected async run(input: any, config: RunnableConfig): Promise<T> {
     this.toolCallTurns.clear();
+    /**
+     * Claim this batch's turn synchronously from the registry (or
+     * fall back to 0 when the feature is disabled). The registry
+     * handles run-crossing resets: when `run_id` changes — or is
+     * absent — it clears stored entries, warn memo, and its own
+     * counter before returning turn 0. Capturing `turn` in a local
+     * is essential: reading it back from shared state after the
+     * tool `await` would race when the same ToolNode is `invoke()`d
+     * concurrently.
+     */
     const incomingRunId = config.configurable?.run_id as string | undefined;
-    /**
-     * Reset the registry and per-run counters when we cross into a new
-     * run. If `run_id` is missing we cannot distinguish "still the same
-     * run" from "a different caller reusing the same ToolNode", so we
-     * err on the side of isolation and clear on every batch — treating
-     * anonymous runs as if each batch were fresh. Production callers
-     * (anyone going through `Run`) always have a `run_id` set, so this
-     * only affects ToolNode being invoked directly without one.
-     */
-    const isNewRun = incomingRunId == null || incomingRunId !== this.lastRunId;
-    if (isNewRun) {
-      this.turnCounter = 0;
-      this.toolOutputRegistry?.clear();
-      this.warnedNonStringRefTools.clear();
-      this.lastRunId = incomingRunId;
-    }
-    /**
-     * Capture this batch's turn value in a local and thread it down.
-     * Reading it from a mutable field after `await tool.invoke(...)`
-     * would race when the same ToolNode gets `invoke()`d concurrently
-     * — another invocation could overwrite the field before our
-     * registration runs. `this.currentTurn` is retained for external
-     * observability only; registration paths rely on the local `turn`.
-     */
-    const turn = this.turnCounter++;
-    this.currentTurn = turn;
+    const turn = this.toolOutputRegistry?.nextTurn(incomingRunId) ?? 0;
     let outputs: (BaseMessage | Command)[];
 
     if (this.isSendInput(input)) {
