@@ -274,7 +274,11 @@ describe('ToolNode tool output references', () => {
       );
 
       expect(capturedArgs[1]).toBe(`echo ${raw}`);
-      expect(node._unsafeGetToolOutputRegistry()!.get('tool0turn0')).toBe(raw);
+      expect(
+        node
+          ._unsafeGetToolOutputRegistry()!
+          .get('raw-preservation', 'tool0turn0')
+      ).toBe(raw);
     });
 
     it('uses each batch\'s own turn when ToolNode is invoked concurrently within a run', async () => {
@@ -345,8 +349,8 @@ describe('ToolNode tool output references', () => {
       expect(resB.messages[0].content).toContain('output-B');
 
       const registry = node._unsafeGetToolOutputRegistry()!;
-      expect(registry.get('tool0turn0')).toBe('output-A');
-      expect(registry.get('tool0turn1')).toBe('output-B');
+      expect(registry.get('concurrent-run', 'tool0turn0')).toBe('output-A');
+      expect(registry.get('concurrent-run', 'tool0turn1')).toBe('output-B');
     });
 
     it('clips registered outputs to maxOutputSize', async () => {
@@ -363,7 +367,9 @@ describe('ToolNode tool output references', () => {
 
       const registry = node._unsafeGetToolOutputRegistry();
       expect(registry).toBeDefined();
-      expect(registry!.get('tool0turn0')!.length).toBeLessThanOrEqual(40);
+      expect(
+        registry!.get('test-run', 'tool0turn0')!.length
+      ).toBeLessThanOrEqual(40);
     });
 
     it('honors maxTotalSize via FIFO eviction across batches', async () => {
@@ -385,9 +391,9 @@ describe('ToolNode tool output references', () => {
       await invokeBatch(node, [{ id: 'c3', name: 'echo', command: 'x' }]);
 
       const registry = node._unsafeGetToolOutputRegistry()!;
-      expect(registry.get('tool0turn0')).toBeUndefined();
-      expect(registry.get('tool0turn1')).toBe('bbbbb');
-      expect(registry.get('tool0turn2')).toBe('ccccc');
+      expect(registry.get('test-run', 'tool0turn0')).toBeUndefined();
+      expect(registry.get('test-run', 'tool0turn1')).toBe('bbbbb');
+      expect(registry.get('test-run', 'tool0turn2')).toBe('ccccc');
     });
 
     it('does not register error outputs', async () => {
@@ -413,7 +419,7 @@ describe('ToolNode tool output references', () => {
 
       expect((msg.content as string).startsWith('[ref:')).toBe(false);
       expect(
-        node._unsafeGetToolOutputRegistry()!.get('tool0turn0')
+        node._unsafeGetToolOutputRegistry()!.get('test-run', 'tool0turn0')
       ).toBeUndefined();
     });
 
@@ -469,6 +475,60 @@ describe('ToolNode tool output references', () => {
 
       expect(msg.content).toContain('handled failure');
       expect(msg.content).toContain('[unresolved refs: tool9turn9]');
+    });
+
+    it('isolates state between overlapping runs on the same ToolNode', async () => {
+      const sharedRegistry = new ToolOutputReferenceRegistry();
+      const capturedArgs: string[] = [];
+      const tl = createEchoTool({
+        capturedArgs,
+        outputs: ['out-A', 'out-B', 'resolved-in-B'],
+      });
+
+      const node = new ToolNode({
+        tools: [tl],
+        toolOutputRegistry: sharedRegistry,
+      });
+
+      // Run A records `tool0turn0` → 'out-A' in its bucket.
+      await node.invoke(
+        {
+          messages: [
+            aiMsgWithCalls([{ id: 'a1', name: 'echo', command: 'a' }]),
+          ],
+        },
+        { configurable: { run_id: 'run-A' } }
+      );
+      expect(sharedRegistry.get('run-A', 'tool0turn0')).toBe('out-A');
+
+      // Run B records `tool0turn0` → 'out-B' in its own bucket.
+      // Under the old global-reset design, starting run B would have
+      // wiped run A's registered output; with partitioning, A's
+      // bucket survives untouched.
+      await node.invoke(
+        {
+          messages: [
+            aiMsgWithCalls([{ id: 'b1', name: 'echo', command: 'b' }]),
+          ],
+        },
+        { configurable: { run_id: 'run-B' } }
+      );
+      expect(sharedRegistry.get('run-A', 'tool0turn0')).toBe('out-A');
+      expect(sharedRegistry.get('run-B', 'tool0turn0')).toBe('out-B');
+
+      // Run B's next batch resolves `{{tool0turn0}}` against its own
+      // partition (out-B), not run A's partition (out-A).
+      await node.invoke(
+        {
+          messages: [
+            aiMsgWithCalls([
+              { id: 'b2', name: 'echo', command: 'see {{tool0turn0}}' },
+            ]),
+          ],
+        },
+        { configurable: { run_id: 'run-B' } }
+      );
+      expect(capturedArgs[2]).toBe('see out-B');
     });
 
     it('clears state on every batch when run_id is absent (anonymous caller)', async () => {
@@ -548,8 +608,12 @@ describe('ToolNode tool output references', () => {
       // nodeB resolved nodeA's tool0turn0 placeholder (cross-node),
       // and its own output landed under the *next* turn (1), not 0.
       expect(capturedB[0]).toBe('see agent-A-output');
-      expect(sharedRegistry.get('tool0turn0')).toBe('agent-A-output');
-      expect(sharedRegistry.get('tool0turn1')).toBe('agent-B-output');
+      expect(sharedRegistry.get('shared-run', 'tool0turn0')).toBe(
+        'agent-A-output'
+      );
+      expect(sharedRegistry.get('shared-run', 'tool0turn1')).toBe(
+        'agent-B-output'
+      );
     });
 
     it('emits resolved args in ON_RUN_STEP_COMPLETED, not the template', async () => {
@@ -732,9 +796,9 @@ describe('ToolNode tool output references', () => {
       };
 
       expect(result.messages[0].content).toBe('[ref: tool0turn0]\nhost-output');
-      expect(node._unsafeGetToolOutputRegistry()!.get('tool0turn0')).toBe(
-        'host-output'
-      );
+      expect(
+        node._unsafeGetToolOutputRegistry()!.get(undefined, 'tool0turn0')
+      ).toBe('host-output');
     });
 
     it('substitutes `{{…}}` in the request sent to the host', async () => {
@@ -911,9 +975,69 @@ describe('ToolNode tool output references', () => {
       expect(result.messages[0].content).toBe(
         '[ref: tool0turn0]\nhooked-output'
       );
-      expect(node._unsafeGetToolOutputRegistry()!.get('tool0turn0')).toBe(
-        'hooked-output'
-      );
+      expect(
+        node._unsafeGetToolOutputRegistry()!.get('run-posthook', 'tool0turn0')
+      ).toBe('hooked-output');
+    });
+
+    it('aborts event dispatch when a direct tool throws with handleToolErrors=false', async () => {
+      const directBoom = tool(
+        async () => {
+          throw new Error('direct branch failed');
+        },
+        {
+          name: 'directBoom',
+          description: 'direct tool that throws',
+          schema: z.object({ command: z.string() }),
+        }
+      ) as unknown as StructuredToolInterface;
+      const eventStub = tool(async () => 'unused', {
+        name: 'eventTool',
+        description: 'schema-only stub',
+        schema: z.object({ command: z.string() }),
+      }) as unknown as StructuredToolInterface;
+
+      let hostCalled = false;
+      jest
+        .spyOn(events, 'safeDispatchCustomEvent')
+        .mockImplementation(async (event, data) => {
+          if (event === 'on_tool_execute') {
+            hostCalled = true;
+            (data as t.ToolExecuteBatchRequest).resolve([]);
+          }
+        });
+
+      const node = new ToolNode({
+        tools: [directBoom, eventStub],
+        eventDrivenMode: true,
+        handleToolErrors: false,
+        agentId: 'agent-failfast',
+        directToolNames: new Set(['directBoom']),
+        toolCallStepIds: new Map([
+          ['d1', 'step_d1'],
+          ['e1', 'step_e1'],
+        ]),
+        toolOutputReferences: { enabled: true },
+      });
+
+      await expect(
+        node.invoke(
+          {
+            messages: [
+              new AIMessage({
+                content: '',
+                tool_calls: [
+                  { id: 'd1', name: 'directBoom', args: { command: 'x' } },
+                  { id: 'e1', name: 'eventTool', args: { command: 'y' } },
+                ],
+              }),
+            ],
+          },
+          { configurable: { run_id: 'failfast-run' } }
+        )
+      ).rejects.toThrow('direct branch failed');
+
+      expect(hostCalled).toBe(false);
     });
 
     it('keeps same-turn refs isolated in the mixed direct+event path', async () => {

@@ -263,6 +263,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
      * the self-correction signal this feature is meant to provide.
      */
     let unresolvedRefs: string[] = [];
+    const runId = config.configurable?.run_id as string | undefined;
     try {
       if (tool === undefined) {
         throw new Error(`Tool "${call.name}" not found.`);
@@ -274,7 +275,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       }
       let args = call.args;
       if (registry != null) {
-        const { resolved, unresolved } = registry.resolve(args);
+        const { resolved, unresolved } = registry.resolve(runId, args);
         args = resolved;
         unresolvedRefs = unresolved;
         /**
@@ -372,6 +373,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             typeof toolMsg.content === 'string'
           ) {
             toolMsg.content = this.applyOutputReference(
+              runId,
               toolMsg.content,
               toolMsg.content,
               undefined,
@@ -388,6 +390,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               this.maxToolResultChars
             );
             toolMsg.content = this.applyOutputReference(
+              runId,
               llmContent,
               rawContent,
               refKey,
@@ -418,7 +421,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             }
             if (
               refKey != null &&
-              this.toolOutputRegistry!.claimWarnOnce(call.name)
+              this.toolOutputRegistry!.claimWarnOnce(runId, call.name)
             ) {
               // eslint-disable-next-line no-console
               console.warn(
@@ -437,6 +440,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         this.maxToolResultChars
       );
       const content = this.applyOutputReference(
+        runId,
         truncated,
         rawContent,
         refKey,
@@ -495,6 +499,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       let errorContent = `Error: ${e.message}\n Please fix your mistakes.`;
       if (unresolvedRefs.length > 0) {
         errorContent = this.applyOutputReference(
+          runId,
           errorContent,
           errorContent,
           undefined,
@@ -532,13 +537,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
    * the shared turn field.
    */
   private applyOutputReference(
+    runId: string | undefined,
     llmContent: string,
     registryContent: string,
     refKey: string | undefined,
     unresolved: string[]
   ): string {
     if (this.toolOutputRegistry != null && refKey != null) {
-      this.toolOutputRegistry.set(refKey, registryContent);
+      this.toolOutputRegistry.set(runId, refKey, registryContent);
     }
     /**
      * `annotateToolOutputWithReference` handles both the ref-key and
@@ -721,9 +727,20 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     toolCalls: ToolCall[],
     config: RunnableConfig,
     batchIndices?: number[],
-    turn?: number
+    turn?: number,
+    preResolvedArgs?: Map<
+      string,
+      { resolved: Record<string, unknown>; unresolved: string[] }
+    >
   ): Promise<{ toolMessages: ToolMessage[]; injected: BaseMessage[] }> {
     const runId = (config.configurable?.run_id as string | undefined) ?? '';
+    /**
+     * Registry-facing runId preserves `undefined` so the registry
+     * treats anonymous callers as fresh-per-batch instead of lumping
+     * them all under an empty-string bucket. Hooks and event payloads
+     * keep using the empty-string coerced `runId` for backward compat.
+     */
+    const registryRunId = config.configurable?.run_id as string | undefined;
     const threadId = config.configurable?.thread_id as string | undefined;
     const registry = this.toolOutputRegistry;
     const unresolvedByCallId = new Map<string, string[]>();
@@ -731,8 +748,25 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     const preToolCalls = toolCalls.map((call, i) => {
       const originalArgs = call.args as Record<string, unknown>;
       let resolvedArgs = originalArgs;
-      if (registry != null) {
-        const { resolved, unresolved } = registry.resolve(originalArgs);
+      /**
+       * When the caller provided a pre-resolved map (the mixed
+       * direct+event path snapshots event args synchronously before
+       * awaiting directs so they can't accidentally resolve
+       * same-turn direct outputs), use those entries verbatim instead
+       * of re-resolving against a registry that may have changed
+       * since the batch started.
+       */
+      const pre = call.id != null ? preResolvedArgs?.get(call.id) : undefined;
+      if (pre != null) {
+        resolvedArgs = pre.resolved;
+        if (pre.unresolved.length > 0 && call.id != null) {
+          unresolvedByCallId.set(call.id, pre.unresolved);
+        }
+      } else if (registry != null) {
+        const { resolved, unresolved } = registry.resolve(
+          registryRunId,
+          originalArgs
+        );
         resolvedArgs = resolved as Record<string, unknown>;
         if (unresolved.length > 0 && call.id != null) {
           unresolvedByCallId.set(call.id, unresolved);
@@ -831,6 +865,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
            */
           if (registry != null) {
             const { resolved, unresolved } = registry.resolve(
+              registryRunId,
               hookResult.updatedInput
             );
             entry.args = resolved as Record<string, unknown>;
@@ -943,6 +978,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           const unresolved = unresolvedByCallId.get(result.toolCallId) ?? [];
           if (unresolved.length > 0) {
             contentString = this.applyOutputReference(
+              registryRunId,
               contentString,
               contentString,
               undefined,
@@ -1027,6 +1063,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               ? buildReferenceKey(batchIndex, turn)
               : undefined;
           contentString = this.applyOutputReference(
+            registryRunId,
             contentString,
             registryRaw,
             refKey,
@@ -1272,45 +1309,61 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         const eventIndices = eventEntries.map((e) => e.batchIndex);
 
         /**
-         * Run direct and event branches in parallel so both sync
-         * prefixes — which include `registry.resolve(args)` for every
-         * call — complete against the *pre-batch* registry state
-         * before either branch's registrations run. Serializing them
-         * (directs first, then events) would let event-call args
-         * resolve same-turn direct outputs that just registered,
-         * making `{{tool<i>turn<n>}}` semantics mode-dependent. JS
-         * single-threaded execution guarantees no microtask
-         * (= no registration) runs between the two synchronous
-         * sync-prefix passes here.
+         * Snapshot the event calls' args against the *pre-batch*
+         * registry state synchronously, before any await runs. The
+         * directs are then awaited first (preserving fail-fast
+         * semantics — a thrown error in a direct tool, e.g. with
+         * `handleToolErrors=false` or a `GraphInterrupt`, aborts
+         * before we dispatch any event-driven tools to the host).
+         * Because the event args were captured pre-await, they stay
+         * isolated from same-turn direct outputs that register
+         * during the await.
          */
-        const directPromise: Promise<(BaseMessage | Command)[]> =
+        const preResolvedEventArgs = new Map<
+          string,
+          { resolved: Record<string, unknown>; unresolved: string[] }
+        >();
+        if (this.toolOutputRegistry != null) {
+          for (const entry of eventEntries) {
+            if (entry.call.id != null) {
+              const { resolved, unresolved } = this.toolOutputRegistry.resolve(
+                incomingRunId,
+                entry.call.args as Record<string, unknown>
+              );
+              preResolvedEventArgs.set(entry.call.id, {
+                resolved: resolved as Record<string, unknown>,
+                unresolved,
+              });
+            }
+          }
+        }
+
+        const directOutputs: (BaseMessage | Command)[] =
           directCalls.length > 0
-            ? Promise.all(
+            ? await Promise.all(
               directCalls.map((call, i) =>
                 this.runTool(call, config, directIndices[i], turn)
               )
             )
-            : Promise.resolve([]);
-
-        const eventPromise: Promise<{
-          toolMessages: ToolMessage[];
-          injected: BaseMessage[];
-        }> =
-          eventCalls.length > 0
-            ? this.dispatchToolEvents(eventCalls, config, eventIndices, turn)
-            : Promise.resolve({
-              toolMessages: [] as ToolMessage[],
-              injected: [] as BaseMessage[],
-            });
-
-        const [directOutputs, eventResult] = await Promise.all([
-          directPromise,
-          eventPromise,
-        ]);
+            : [];
 
         if (directCalls.length > 0 && directOutputs.length > 0) {
           this.handleRunToolCompletions(directCalls, directOutputs, config);
         }
+
+        const eventResult =
+          eventCalls.length > 0
+            ? await this.dispatchToolEvents(
+              eventCalls,
+              config,
+              eventIndices,
+              turn,
+              preResolvedEventArgs
+            )
+            : {
+              toolMessages: [] as ToolMessage[],
+              injected: [] as BaseMessage[],
+            };
 
         outputs = [
           ...directOutputs,

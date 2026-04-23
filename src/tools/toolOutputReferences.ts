@@ -61,6 +61,11 @@ export type ToolOutputReferenceRegistryOptions = {
   maxOutputSize?: number;
   /** Maximum total characters retained across all registered outputs. */
   maxTotalSize?: number;
+  /**
+   * Upper bound on the number of concurrently-tracked runs. When
+   * exceeded, the oldest run bucket is evicted (FIFO). Defaults to 32.
+   */
+  maxActiveRuns?: number;
 };
 
 /**
@@ -74,37 +79,48 @@ export type ResolveResult<T> = {
 };
 
 /**
- * Ordered map of reference-key → stored output with FIFO eviction when
- * the aggregate size exceeds `maxTotalSize`.
+ * Per-run state bucket held inside the registry. Each distinct
+ * `run_id` gets its own bucket so overlapping concurrent runs on a
+ * shared registry cannot leak outputs, turn counters, or warn-memos
+ * into one another.
+ */
+class RunStateBucket {
+  entries: Map<string, string> = new Map();
+  totalSize: number = 0;
+  turnCounter: number = 0;
+  warnedNonStringTools: Set<string> = new Set();
+}
+
+/**
+ * Anonymous (`run_id` absent) bucket key. Anonymous batches are
+ * treated as fresh runs on every invocation — see `nextTurn`.
+ */
+const ANON_RUN_KEY = '\0anon';
+
+/**
+ * Default upper bound on the number of concurrently-tracked runs per
+ * registry. When exceeded, the oldest run's bucket (by insertion
+ * order) is evicted. Keeps memory bounded when a ToolNode is reused
+ * across many runs without explicit `releaseRun` calls.
+ */
+const DEFAULT_MAX_ACTIVE_RUNS = 32;
+
+/**
+ * Ordered map of reference-key → stored output, partitioned by run so
+ * concurrent / interleaved runs sharing one registry cannot leak
+ * outputs between each other.
  *
- * A single shared registry lives on the ToolNode for the duration of a
- * run; it is not persisted across runs and is cleared when the graph's
- * heavy state is cleared.
+ * Each public method takes a `runId` which selects the run's bucket.
+ * Hosts typically get one registry per run via `Graph`, in which
+ * case only a single bucket is ever populated; the partitioning
+ * exists so the registry also behaves correctly when a single
+ * instance is reused directly.
  */
 export class ToolOutputReferenceRegistry {
-  private entries: Map<string, string> = new Map();
-  private totalSize: number = 0;
+  private runStates: Map<string, RunStateBucket> = new Map();
   private readonly maxOutputSize: number;
   private readonly maxTotalSize: number;
-  /**
-   * Monotonic batch counter shared across every ToolNode that holds
-   * this registry. Multi-agent graphs use one registry per run so
-   * turns are globally unique across agents — `tool0turn3` from agent
-   * B does not collide with `tool0turn3` from agent A.
-   */
-  private turnCounter: number = 0;
-  /**
-   * Last observed `run_id`. Drives the reset when we cross into a
-   * new run. Undefined when the feature is invoked without a
-   * `run_id`; in that case every call is treated as a fresh run.
-   */
-  private lastRunId: string | undefined;
-  /**
-   * Per-run memo of tool names we've already logged a non-string-
-   * content warning for. Cleared on every run change so each run
-   * emits at most one line per offending tool.
-   */
-  private warnedNonStringTools: Set<string> = new Set();
+  private readonly maxActiveRuns: number;
   /**
    * Local stateful matcher used only by `replaceInString`. Kept
    * off-module so callers of the exported `TOOL_OUTPUT_REF_PATTERN`
@@ -132,42 +148,69 @@ export class ToolOutputReferenceRegistry {
         : calculateMaxTotalToolOutputSize(perOutput);
     this.maxTotalSize = totalRaw;
     /**
-     * The per-output cap can never exceed the aggregate cap: if a
-     * single entry were allowed to be larger than `maxTotalSize`, the
-     * eviction loop would either blow the cap (to keep the entry) or
-     * self-evict a just-stored value. Clamping here turns
+     * The per-output cap can never exceed the per-run aggregate cap:
+     * if a single entry were allowed to be larger than `maxTotalSize`,
+     * the eviction loop would either blow the cap (to keep the entry)
+     * or self-evict a just-stored value. Clamping here turns
      * `maxTotalSize` into a hard upper bound on *any* state the
-     * registry retains.
+     * registry retains per run.
      */
     this.maxOutputSize = Math.min(perOutput, totalRaw);
+    this.maxActiveRuns =
+      options.maxActiveRuns != null && options.maxActiveRuns > 0
+        ? options.maxActiveRuns
+        : DEFAULT_MAX_ACTIVE_RUNS;
   }
 
-  /** Registers (or replaces) the output stored under `key`. */
-  set(key: string, value: string): void {
+  private keyFor(runId: string | undefined): string {
+    return runId ?? ANON_RUN_KEY;
+  }
+
+  private getOrCreate(runId: string | undefined): RunStateBucket {
+    const key = this.keyFor(runId);
+    let state = this.runStates.get(key);
+    if (state == null) {
+      state = new RunStateBucket();
+      this.runStates.set(key, state);
+      if (this.runStates.size > this.maxActiveRuns) {
+        const oldest = this.runStates.keys().next().value;
+        if (oldest != null && oldest !== key) {
+          this.runStates.delete(oldest);
+        }
+      }
+    }
+    return state;
+  }
+
+  /** Registers (or replaces) the output stored under `key` for `runId`. */
+  set(runId: string | undefined, key: string, value: string): void {
+    const bucket = this.getOrCreate(runId);
     const clipped =
       value.length > this.maxOutputSize
         ? value.slice(0, this.maxOutputSize)
         : value;
-
-    const existing = this.entries.get(key);
+    const existing = bucket.entries.get(key);
     if (existing != null) {
-      this.totalSize -= existing.length;
-      this.entries.delete(key);
+      bucket.totalSize -= existing.length;
+      bucket.entries.delete(key);
     }
-
-    this.entries.set(key, clipped);
-    this.totalSize += clipped.length;
-    this.evictUntilWithinLimit();
+    bucket.entries.set(key, clipped);
+    bucket.totalSize += clipped.length;
+    this.evictWithinBucket(bucket);
   }
 
-  /** Returns the stored value for `key`, or `undefined` if unknown. */
-  get(key: string): string | undefined {
-    return this.entries.get(key);
+  /** Returns the stored value for `key` in `runId`'s bucket, or `undefined`. */
+  get(runId: string | undefined, key: string): string | undefined {
+    return this.runStates.get(this.keyFor(runId))?.entries.get(key);
   }
 
-  /** Current number of registered outputs. */
+  /** Total number of registered outputs across every run bucket. */
   get size(): number {
-    return this.entries.size;
+    let n = 0;
+    for (const bucket of this.runStates.values()) {
+      n += bucket.entries.size;
+    }
+    return n;
   }
 
   /** Maximum characters retained per output (post-clip). */
@@ -175,98 +218,113 @@ export class ToolOutputReferenceRegistry {
     return this.maxOutputSize;
   }
 
-  /** Maximum total characters retained across the registry. */
+  /** Maximum total characters retained *per run*. */
   get totalLimit(): number {
     return this.maxTotalSize;
   }
 
-  /** Drops all registered outputs. */
+  /** Drops every run's state. */
   clear(): void {
-    this.entries.clear();
-    this.totalSize = 0;
+    this.runStates.clear();
   }
 
   /**
-   * Claims the next batch turn synchronously.
+   * Explicitly release `runId`'s state. Safe to call when a run has
+   * finished. Hosts sharing one registry across runs should call this
+   * to reclaim memory deterministically; otherwise LRU eviction kicks
+   * in when `maxActiveRuns` runs accumulate.
+   */
+  releaseRun(runId: string | undefined): void {
+    this.runStates.delete(this.keyFor(runId));
+  }
+
+  /**
+   * Claims the next batch turn synchronously from `runId`'s bucket.
    *
    * Must be called once at the start of each ToolNode batch before
    * any `await`, so concurrent invocations within the same run see
    * distinct turn values (reads are effectively atomic by JS's
    * single-threaded execution of the sync prefix).
    *
-   * If `runId` differs from the last-seen value — or is missing —
-   * the registry, warn-set, and counter are cleared before claiming
-   * turn 0. Missing `runId` is treated as "always a new run" so
-   * anonymous callers never leak state across invocations.
+   * If `runId` is missing the anonymous bucket is dropped and a
+   * fresh one created so each anonymous call behaves as its own run.
    */
   nextTurn(runId: string | undefined): number {
-    if (runId == null || runId !== this.lastRunId) {
-      this.entries.clear();
-      this.totalSize = 0;
-      this.turnCounter = 0;
-      this.warnedNonStringTools.clear();
-      this.lastRunId = runId;
+    if (runId == null) {
+      this.runStates.delete(ANON_RUN_KEY);
     }
-    return this.turnCounter++;
+    const bucket = this.getOrCreate(runId);
+    return bucket.turnCounter++;
   }
 
   /**
-   * Records that `toolName` has been warned about (returns `true`
-   * on the first call per run, `false` after). Used by ToolNode to
-   * emit one log line per offending tool per run when a
+   * Records that `toolName` has been warned about in `runId` (returns
+   * `true` on the first call per run, `false` after). Used by
+   * ToolNode to emit one log line per offending tool per run when a
    * `ToolMessage.content` isn't a string.
    */
-  claimWarnOnce(toolName: string): boolean {
-    if (this.warnedNonStringTools.has(toolName)) {
+  claimWarnOnce(runId: string | undefined, toolName: string): boolean {
+    const bucket = this.getOrCreate(runId);
+    if (bucket.warnedNonStringTools.has(toolName)) {
       return false;
     }
-    this.warnedNonStringTools.add(toolName);
+    bucket.warnedNonStringTools.add(toolName);
     return true;
   }
 
   /**
    * Walks `args` and replaces every `{{tool<i>turn<n>}}` placeholder in
-   * string values with the stored output. Non-string values and object
-   * keys are left untouched. Unresolved references are left in-place and
-   * reported so the caller can surface them to the LLM. When no
-   * placeholder appears anywhere in the serialized args, the original
-   * input is returned without walking the tree.
+   * string values with the stored output *from `runId`'s bucket*. Non-
+   * string values and object keys are left untouched. Unresolved
+   * references are left in-place and reported so the caller can
+   * surface them to the LLM. When no placeholder appears anywhere in
+   * the serialized args, the original input is returned without
+   * walking the tree.
    */
-  resolve<T>(args: T): ResolveResult<T> {
+  resolve<T>(runId: string | undefined, args: T): ResolveResult<T> {
     if (!hasAnyPlaceholder(args)) {
       return { resolved: args, unresolved: [] };
     }
+    const bucket = this.runStates.get(this.keyFor(runId));
     const unresolved = new Set<string>();
-    const resolved = this.transform(args, unresolved) as T;
+    const resolved = this.transform(bucket, args, unresolved) as T;
     return { resolved, unresolved: Array.from(unresolved) };
   }
 
-  private transform(value: unknown, unresolved: Set<string>): unknown {
+  private transform(
+    bucket: RunStateBucket | undefined,
+    value: unknown,
+    unresolved: Set<string>
+  ): unknown {
     if (typeof value === 'string') {
-      return this.replaceInString(value, unresolved);
+      return this.replaceInString(bucket, value, unresolved);
     }
     if (Array.isArray(value)) {
-      return value.map((item) => this.transform(item, unresolved));
+      return value.map((item) => this.transform(bucket, item, unresolved));
     }
     if (value !== null && typeof value === 'object') {
       const source = value as Record<string, unknown>;
       const next: Record<string, unknown> = {};
       for (const [key, item] of Object.entries(source)) {
-        next[key] = this.transform(item, unresolved);
+        next[key] = this.transform(bucket, item, unresolved);
       }
       return next;
     }
     return value;
   }
 
-  private replaceInString(input: string, unresolved: Set<string>): string {
+  private replaceInString(
+    bucket: RunStateBucket | undefined,
+    input: string,
+    unresolved: Set<string>
+  ): string {
     if (input.indexOf('{{tool') === -1) {
       return input;
     }
     return input.replace(
       ToolOutputReferenceRegistry.PLACEHOLDER_MATCHER,
       (match, key: string) => {
-        const stored = this.get(key);
+        const stored = bucket?.entries.get(key);
         if (stored == null) {
           unresolved.add(key);
           return match;
@@ -276,20 +334,20 @@ export class ToolOutputReferenceRegistry {
     );
   }
 
-  private evictUntilWithinLimit(): void {
-    if (this.totalSize <= this.maxTotalSize) {
+  private evictWithinBucket(bucket: RunStateBucket): void {
+    if (bucket.totalSize <= this.maxTotalSize) {
       return;
     }
-    for (const key of this.entries.keys()) {
-      if (this.totalSize <= this.maxTotalSize) {
+    for (const key of bucket.entries.keys()) {
+      if (bucket.totalSize <= this.maxTotalSize) {
         return;
       }
-      const entry = this.entries.get(key);
+      const entry = bucket.entries.get(key);
       if (entry == null) {
         continue;
       }
-      this.totalSize -= entry.length;
-      this.entries.delete(key);
+      bucket.totalSize -= entry.length;
+      bucket.entries.delete(key);
     }
   }
 }
