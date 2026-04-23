@@ -116,6 +116,16 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
    * ToolNode building its own.
    */
   private toolOutputRegistry?: ToolOutputReferenceRegistry;
+  /**
+   * Resolved (post-substitution) args keyed by `toolCallId` for the
+   * current `run()` batch. Populated in `runTool`/`dispatchToolEvents`
+   * right after `registry.resolve(args)` so downstream completion
+   * events (`ON_RUN_STEP_COMPLETED`) expose the args the tool
+   * *actually* ran with instead of the unresolved template. Cleared
+   * at the start of each batch.
+   */
+  private resolvedArgsByCallId: Map<string, Record<string, unknown>> =
+    new Map();
 
   constructor({
     tools,
@@ -267,6 +277,23 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         const { resolved, unresolved } = registry.resolve(args);
         args = resolved;
         unresolvedRefs = unresolved;
+        /**
+         * Expose the post-substitution args to downstream completion
+         * events so audit logs / host-side `ON_RUN_STEP_COMPLETED`
+         * handlers observe what actually ran, not the `{{…}}`
+         * template. Only string/object args are worth recording.
+         */
+        if (
+          call.id != null &&
+          call.id !== '' &&
+          resolved !== call.args &&
+          typeof resolved === 'object'
+        ) {
+          this.resolvedArgsByCallId.set(
+            call.id,
+            resolved as Record<string, unknown>
+          );
+        }
       }
       const stepId = this.toolCallStepIds?.get(call.id!);
 
@@ -366,18 +393,33 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               refKey,
               unresolvedRefs
             );
-          } else if (refKey != null) {
+          } else {
             /**
-             * Known limitation: tools that return a `ToolMessage` with
-             * array-type content (multi-part content blocks such as
-             * text + image) are not registered under a reference key
-             * and therefore cannot be cited via `{{tool<i>turn<n>}}`.
-             * Registering would require deciding which block is
-             * canonical, which differs per tool. Warn once per tool
-             * per run (memo lives on the registry so multi-agent
-             * graphs don't double-warn from each ToolNode).
+             * Non-string content (multi-part content blocks — text +
+             * image). Known limitation: we cannot register under a
+             * reference key because there's no canonical serialized
+             * form. Warn once per tool per run when the caller
+             * intended to register.
+             *
+             * Still surface unresolved-ref warnings so the LLM gets
+             * the self-correction signal that the string and error
+             * paths already emit. Prepended as a leading text block
+             * to keep the original content ordering intact.
              */
-            if (this.toolOutputRegistry!.claimWarnOnce(call.name)) {
+            if (unresolvedRefs.length > 0 && Array.isArray(toolMsg.content)) {
+              const warningBlock = {
+                type: 'text',
+                text: `[unresolved refs: ${unresolvedRefs.join(', ')}]`,
+              };
+              toolMsg.content = [
+                warningBlock,
+                ...toolMsg.content,
+              ] as typeof toolMsg.content;
+            }
+            if (
+              refKey != null &&
+              this.toolOutputRegistry!.claimWarnOnce(call.name)
+            ) {
               // eslint-disable-next-line no-console
               console.warn(
                 `[ToolNode] Skipping tool output reference for "${call.name}": ` +
@@ -627,11 +669,19 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           ? toolMessage.content
           : JSON.stringify(toolMessage.content);
 
+      /**
+       * Prefer the post-substitution args when a `{{…}}` placeholder
+       * was resolved in `runTool`. This keeps
+       * `ON_RUN_STEP_COMPLETED.tool_call.args` consistent with what
+       * the tool actually received rather than leaking the template.
+       */
+      const effectiveArgs =
+        this.resolvedArgsByCallId.get(toolCallId) ?? call.args;
       const tool_call: t.ProcessedToolCall = {
         args:
-          typeof call.args === 'string'
-            ? (call.args as string)
-            : JSON.stringify((call.args as unknown) ?? {}),
+          typeof effectiveArgs === 'string'
+            ? (effectiveArgs as string)
+            : JSON.stringify((effectiveArgs as unknown) ?? {}),
         name: call.name,
         id: toolCallId,
         output: contentString,
@@ -1106,6 +1156,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   protected async run(input: any, config: RunnableConfig): Promise<T> {
     this.toolCallTurns.clear();
+    this.resolvedArgsByCallId.clear();
     /**
      * Claim this batch's turn synchronously from the registry (or
      * fall back to 0 when the feature is disabled). The registry

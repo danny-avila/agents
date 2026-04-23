@@ -552,6 +552,96 @@ describe('ToolNode tool output references', () => {
       expect(sharedRegistry.get('tool0turn1')).toBe('agent-B-output');
     });
 
+    it('emits resolved args in ON_RUN_STEP_COMPLETED, not the template', async () => {
+      const capturedArgs: string[] = [];
+      const t1 = createEchoTool({
+        capturedArgs,
+        outputs: ['STORED', 'second'],
+      });
+      const stepCompletedArgs: string[] = [];
+      jest
+        .spyOn(events, 'safeDispatchCustomEvent')
+        .mockImplementation(async (event, data) => {
+          if (event === 'on_run_step_completed') {
+            const step = data as {
+              result: { tool_call: { args: string } };
+            };
+            stepCompletedArgs.push(step.result.tool_call.args);
+          }
+        });
+
+      const node = new ToolNode({
+        tools: [t1],
+        toolCallStepIds: new Map([
+          ['a1', 'step_a1'],
+          ['a2', 'step_a2'],
+        ]),
+        toolOutputReferences: { enabled: true },
+      });
+
+      await invokeBatch(
+        node,
+        [{ id: 'a1', name: 'echo', command: 'first' }],
+        'resolved-args'
+      );
+      await invokeBatch(
+        node,
+        [
+          {
+            id: 'a2',
+            name: 'echo',
+            command: 'echo {{tool0turn0}}',
+          },
+        ],
+        'resolved-args'
+      );
+
+      // Second step-completed event should reflect the post-
+      // substitution command, not the `{{…}}` template.
+      expect(stepCompletedArgs).toHaveLength(2);
+      expect(JSON.parse(stepCompletedArgs[1]).command).toBe('echo STORED');
+    });
+
+    it('prepends unresolved-refs warning to non-string ToolMessage content', async () => {
+      const complexTool = tool(
+        async () =>
+          new ToolMessage({
+            status: 'success',
+            content: [
+              { type: 'text', text: 'data' },
+              { type: 'image_url', image_url: { url: 'data:...' } },
+            ],
+            name: 'complex',
+            tool_call_id: 'c1',
+          }),
+        {
+          name: 'complex',
+          description: 'returns multi-part content',
+          schema: z.object({ command: z.string() }),
+        }
+      ) as unknown as StructuredToolInterface;
+
+      const node = new ToolNode({
+        tools: [complexTool],
+        toolOutputReferences: { enabled: true },
+      });
+
+      const [msg] = await invokeBatch(
+        node,
+        [{ id: 'c1', name: 'complex', command: 'see {{tool9turn9}}' }],
+        'non-string'
+      );
+
+      expect(Array.isArray(msg.content)).toBe(true);
+      const blocks = msg.content as Array<{ type: string; text?: string }>;
+      expect(blocks[0].type).toBe('text');
+      expect(blocks[0].text).toContain('[unresolved refs: tool9turn9]');
+      // Original blocks follow the warning.
+      expect(blocks[1].type).toBe('text');
+      expect(blocks[1].text).toBe('data');
+      expect(blocks[2].type).toBe('image_url');
+    });
+
     it('resets the registry and turn counter when the runId changes', async () => {
       const capturedArgs: string[] = [];
       const t1 = createEchoTool({
