@@ -125,16 +125,35 @@ function createCodeExecutionTool(
         lang,
         code,
         ...rest,
-        ...params,
       };
+
+      // Forward safe params to exec payload (exclude secrets sent via headers)
+      if (params.session_id) {
+        postData.session_id = params.session_id;
+      }
+      if (params.user_id) {
+        postData.user_id = params.user_id;
+      }
+      if (params.files) {
+        postData.files = params.files;
+      }
+
+      // Forward entity_id for session lookup by entity in kubecoderun orchestrator
+      if (params.entity_id) {
+        postData.entity_id = params.entity_id;
+      }
 
       /**
        * File injection priority:
        * 1. Use _injected_files from ToolNode (avoids /files endpoint race condition)
-       * 2. Fall back to fetching from /files endpoint if session_id provided but no injected files
+       * 2. Use params.files from tool creation (e.g., primeCodeFiles for first invocation)
+       * 3. Fall back to fetching from /files endpoint if session_id provided but no injected files
        */
       if (_injected_files && _injected_files.length > 0) {
         postData.files = _injected_files;
+      } else if (params.files && params.files.length > 0) {
+        /** Fallback: use files passed during tool creation (e.g., from primeCodeFiles) */
+        postData.files = params.files;
       } else if (session_id != null && session_id.length > 0) {
         /** Fallback: fetch from /files endpoint (may have race condition issues) */
         try {
