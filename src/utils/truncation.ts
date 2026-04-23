@@ -14,11 +14,13 @@ export const HARD_MAX_TOOL_RESULT_CHARS = 400_000;
 
 /**
  * Absolute hard cap on the aggregate size (characters) of all registered
- * tool outputs kept for `{{tool<i>turn<n>}}` substitution. Sized at 2×
- * the single-output cap so a run can keep a small working set without
- * letting the registry balloon unbounded.
+ * tool outputs kept for `{{tool<i>turn<n>}}` substitution. Set at 5 MB
+ * because the registry stores *raw, untruncated* tool output — full
+ * fidelity for piping into downstream bash/jq — so the budget needs
+ * enough headroom to keep a handful of large responses without
+ * ballooning unbounded.
  */
-export const HARD_MAX_TOTAL_TOOL_OUTPUT_SIZE = 800_000;
+export const HARD_MAX_TOTAL_TOOL_OUTPUT_SIZE = 5_000_000;
 
 /**
  * Computes the dynamic max tool result size based on the model's context window.

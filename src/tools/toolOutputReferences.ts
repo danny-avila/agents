@@ -12,15 +12,19 @@
  * {@link ToolOutputReferenceRegistry.resolve} walks the args and
  * substitutes the placeholders immediately before invocation.
  *
- * Outputs are stored without any annotation (the `_ref` key or the
- * `[ref: ...]` prefix seen by the LLM is strictly a UX signal attached
- * to `ToolMessage.content`). Keeping the registry pristine means
- * downstream bash/jq piping does not see injected fields.
+ * The registry stores the *raw, untruncated* tool output so a later
+ * `{{…}}` substitution pipes the full payload into the next tool —
+ * even when the LLM only saw a head+tail-truncated preview in
+ * `ToolMessage.content`. Outputs are stored without any annotation
+ * (the `_ref` key or the `[ref: ...]` prefix seen by the LLM is
+ * strictly a UX signal attached to `ToolMessage.content`). Keeping the
+ * registry pristine means downstream bash/jq piping receives the
+ * complete, verbatim output with no injected fields.
  */
 
 import {
   calculateMaxTotalToolOutputSize,
-  HARD_MAX_TOOL_RESULT_CHARS,
+  HARD_MAX_TOTAL_TOOL_OUTPUT_SIZE,
 } from '@/utils/truncation';
 
 /**
@@ -85,7 +89,7 @@ export class ToolOutputReferenceRegistry {
     const perOutput =
       options.maxOutputSize != null && options.maxOutputSize > 0
         ? options.maxOutputSize
-        : HARD_MAX_TOOL_RESULT_CHARS;
+        : HARD_MAX_TOTAL_TOOL_OUTPUT_SIZE;
     const totalRaw =
       options.maxTotalSize != null && options.maxTotalSize > 0
         ? options.maxTotalSize

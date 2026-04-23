@@ -242,6 +242,107 @@ describe('ToolNode tool output references', () => {
       expect(msg.content).toContain('[unresolved refs: tool9turn9]');
     });
 
+    it('stores the raw untruncated output in the registry, independent of the LLM-visible truncation', async () => {
+      const raw = 'X'.repeat(8_000);
+      const capturedArgs: string[] = [];
+      const t1 = createEchoTool({
+        capturedArgs,
+        outputs: [raw, 'second'],
+      });
+      const node = new ToolNode({
+        tools: [t1],
+        maxToolResultChars: 200,
+        toolOutputReferences: { enabled: true },
+      });
+
+      const [first] = await invokeBatch(
+        node,
+        [{ id: 'c1', name: 'echo', command: 'first' }],
+        'raw-preservation'
+      );
+
+      expect((first.content as string).length).toBeLessThan(raw.length);
+      expect(first.content).toContain('truncated');
+
+      await invokeBatch(
+        node,
+        [{ id: 'c2', name: 'echo', command: 'echo {{tool0turn0}}' }],
+        'raw-preservation'
+      );
+
+      expect(capturedArgs[1]).toBe(`echo ${raw}`);
+      expect(node._unsafeGetToolOutputRegistry()!.get('tool0turn0')).toBe(raw);
+    });
+
+    it('uses each batch\'s own turn when ToolNode is invoked concurrently within a run', async () => {
+      const gates: Record<string, () => void> = {};
+      const slowTool = tool(
+        async (input) => {
+          const args = input as { command: string };
+          await new Promise<void>((resolve) => {
+            gates[args.command] = resolve;
+          });
+          return `output-${args.command}`;
+        },
+        {
+          name: 'slow',
+          description: 'awaits a per-command gate',
+          schema: z.object({ command: z.string() }),
+        }
+      ) as unknown as StructuredToolInterface;
+
+      const node = new ToolNode({
+        tools: [slowTool],
+        toolOutputReferences: { enabled: true },
+      });
+
+      // Two batches of the SAME run, started concurrently — batch A
+      // captures turn 0 in its sync prefix, batch B captures turn 1.
+      // If the turn were read from shared state after the awaits, the
+      // reads would race and both batches would see the latest value.
+      const first = node.invoke(
+        {
+          messages: [aiMsgWithCalls([{ id: 'a', name: 'slow', command: 'A' }])],
+        },
+        { configurable: { run_id: 'concurrent-run' } }
+      );
+      const second = node.invoke(
+        {
+          messages: [aiMsgWithCalls([{ id: 'b', name: 'slow', command: 'B' }])],
+        },
+        { configurable: { run_id: 'concurrent-run' } }
+      );
+
+      await new Promise<void>((resolve) => {
+        const check = (): void => {
+          if (gates.A != null && gates.B != null) {
+            resolve();
+          } else {
+            setTimeout(check, 5);
+          }
+        };
+        check();
+      });
+      // Release B first (the later-scheduled batch), then A. Under the
+      // old code this would bake turn=1 into BOTH results because
+      // `currentTurn` was overwritten during B's sync prefix.
+      gates.B();
+      gates.A();
+
+      const [resA, resB] = (await Promise.all([first, second])) as Array<{
+        messages: ToolMessage[];
+      }>;
+
+      expect(resA.messages[0].content).toContain('[ref: tool0turn0]');
+      expect(resA.messages[0].content).toContain('output-A');
+      expect(resB.messages[0].content).toContain('[ref: tool0turn1]');
+      expect(resB.messages[0].content).toContain('output-B');
+
+      const registry = node._unsafeGetToolOutputRegistry()!;
+      expect(registry.get('tool0turn0')).toBe('output-A');
+      expect(registry.get('tool0turn1')).toBe('output-B');
+    });
+
     it('clips registered outputs to maxOutputSize', async () => {
       const t1 = createEchoTool({
         capturedArgs: [],

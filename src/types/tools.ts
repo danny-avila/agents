@@ -250,8 +250,11 @@ export type LCToolRegistry = Map<string, LCTool>;
  * substitutes it with the stored output immediately before invoking
  * the tool.
  *
- * Size limits mirror the shape of `calculateMaxToolResultChars` so
- * substituted content cannot exceed what the model has already seen.
+ * The registry stores the *raw, untruncated* tool output (subject to
+ * its own size caps) so a later substitution can pipe the full payload
+ * into the next tool even when the LLM only saw a head+tail-truncated
+ * preview in `ToolMessage.content`. Size limits are decoupled from the
+ * LLM-visible truncation budget and default to 5 MB total.
  *
  * Known limitations:
  *  - Tools that return a `ToolMessage` with array-type content
@@ -269,7 +272,9 @@ export type ToolOutputReferencesConfig = {
   enabled?: boolean;
   /**
    * Maximum characters stored (and substituted) per registered output.
-   * Defaults to the ToolNode's `maxToolResultChars`.
+   * Applied to the *raw* output before storage. Defaults to
+   * `HARD_MAX_TOTAL_TOOL_OUTPUT_SIZE` (5 MB), independent of the
+   * LLM-visible `maxToolResultChars` budget.
    */
   maxOutputSize?: number;
   /**
@@ -278,7 +283,7 @@ export type ToolOutputReferencesConfig = {
    * until the total fits. The effective per-output cap is
    * `min(maxOutputSize, maxTotalSize)` so a single stored output can
    * never exceed the aggregate bound. Defaults to
-   * `calculateMaxTotalToolOutputSize(maxOutputSize)`.
+   * `calculateMaxTotalToolOutputSize(maxOutputSize)` (5 MB).
    */
   maxTotalSize?: number;
 };

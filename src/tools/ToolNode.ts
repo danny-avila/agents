@@ -169,9 +169,16 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       maxToolResultChars ?? calculateMaxToolResultChars(maxContextTokens);
     this.hookRegistry = hookRegistry;
     if (toolOutputReferences?.enabled === true) {
+      /**
+       * Registry caps are intentionally *decoupled* from
+       * `maxToolResultChars`: the registry stores the raw untruncated
+       * output so a later `{{…}}` substitution pipes the full payload
+       * into the next tool, even when the LLM saw a truncated preview.
+       * Pass the caller's config through unchanged — the registry fills
+       * in its own 5 MB defaults.
+       */
       this.toolOutputRegistry = new ToolOutputReferenceRegistry({
-        maxOutputSize:
-          toolOutputReferences.maxOutputSize ?? this.maxToolResultChars,
+        maxOutputSize: toolOutputReferences.maxOutputSize,
         maxTotalSize: toolOutputReferences.maxTotalSize,
       });
     }
@@ -236,11 +243,20 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   protected async runTool(
     call: ToolCall,
     config: RunnableConfig,
-    batchIndex?: number
+    batchIndex?: number,
+    turn?: number
   ): Promise<BaseMessage | Command> {
     const tool = this.toolMap.get(call.name);
     const registry = this.toolOutputRegistry;
-    const shouldRegister = registry != null && batchIndex != null;
+    /**
+     * Precompute the reference key once per call — captured locally
+     * so concurrent `invoke()` calls on the same ToolNode cannot race
+     * on a shared turn field.
+     */
+    const refKey =
+      registry != null && batchIndex != null && turn != null
+        ? buildReferenceKey(batchIndex, turn)
+        : undefined;
     /**
      * Hoisted outside the try so the catch branch can append
      * `[unresolved refs: …]` to error messages — otherwise the LLM
@@ -341,6 +357,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           ) {
             toolMsg.content = this.applyOutputReference(
               toolMsg.content,
+              toolMsg.content,
               undefined,
               unresolvedRefs
             );
@@ -349,12 +366,18 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         }
         if (this.toolOutputRegistry != null || unresolvedRefs.length > 0) {
           if (typeof toolMsg.content === 'string') {
+            const rawContent = toolMsg.content;
+            const llmContent = truncateToolResultContent(
+              rawContent,
+              this.maxToolResultChars
+            );
             toolMsg.content = this.applyOutputReference(
-              toolMsg.content,
-              shouldRegister ? batchIndex : undefined,
+              llmContent,
+              rawContent,
+              refKey,
               unresolvedRefs
             );
-          } else if (shouldRegister) {
+          } else if (refKey != null) {
             /**
              * Known limitation: tools that return a `ToolMessage` with
              * array-type content (multi-part content blocks such as
@@ -384,7 +407,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       );
       const content = this.applyOutputReference(
         truncated,
-        shouldRegister ? batchIndex : undefined,
+        rawContent,
+        refKey,
         unresolvedRefs
       );
       return new ToolMessage({
@@ -441,6 +465,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       if (unresolvedRefs.length > 0) {
         errorContent = this.applyOutputReference(
           errorContent,
+          errorContent,
           undefined,
           unresolvedRefs
         );
@@ -455,26 +480,36 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   }
 
   /**
-   * Registers a successful tool output under its batch-scoped reference
-   * key (when the registry is enabled) and returns the annotated content
-   * the LLM will see. When `batchIndex` is undefined, the output is
-   * neither registered nor annotated — only any unresolved reference
-   * warnings are appended.
+   * Finalizes the LLM-visible content for a tool call and (when a
+   * `refKey` is provided) registers the full, raw output under that
+   * key.
    *
-   * The *stored* value is the truncated-but-unannotated content so that
-   * piping it into a later tool call via `{{tool<idx>turn<turn>}}`
-   * delivers pristine output (no `_ref` key, no `[ref: …]` prefix).
+   * @param llmContent  The content string the LLM will see. This is
+   *   the already-truncated, post-hook view; the annotation is
+   *   applied on top of it.
+   * @param registryContent  The full, untruncated output to store in
+   *   the registry so `{{tool<i>turn<n>}}` substitutions deliver the
+   *   complete payload. Ignored when `refKey` is undefined.
+   * @param refKey  Precomputed `tool<i>turn<n>` key, or undefined when
+   *   the output is not to be registered (errors, disabled feature,
+   *   unavailable batch/turn).
+   * @param unresolved  Placeholder keys that did not resolve; appended
+   *   as `[unresolved refs: …]` so the LLM can self-correct.
+   *
+   * `refKey` is passed in (rather than built from `this.currentTurn`)
+   * so parallel `invoke()` calls on the same ToolNode cannot race on
+   * the shared turn field.
    */
   private applyOutputReference(
-    truncated: string,
-    batchIndex: number | undefined,
+    llmContent: string,
+    registryContent: string,
+    refKey: string | undefined,
     unresolved: string[]
   ): string {
-    let content = truncated;
-    if (this.toolOutputRegistry != null && batchIndex != null) {
-      const key = buildReferenceKey(batchIndex, this.currentTurn);
-      this.toolOutputRegistry.set(key, truncated);
-      content = annotateToolOutputWithReference(truncated, key);
+    let content = llmContent;
+    if (this.toolOutputRegistry != null && refKey != null) {
+      this.toolOutputRegistry.set(refKey, registryContent);
+      content = annotateToolOutputWithReference(llmContent, refKey);
     }
     if (unresolved.length > 0) {
       content += `\n[unresolved refs: ${unresolved.join(', ')}]`;
@@ -644,7 +679,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private async dispatchToolEvents(
     toolCalls: ToolCall[],
     config: RunnableConfig,
-    batchIndices?: number[]
+    batchIndices?: number[],
+    turn?: number
   ): Promise<{ toolMessages: ToolMessage[]; injected: BaseMessage[] }> {
     const runId = (config.configurable?.run_id as string | undefined) ?? '';
     const threadId = config.configurable?.thread_id as string | undefined;
@@ -867,6 +903,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           if (unresolved.length > 0) {
             contentString = this.applyOutputReference(
               contentString,
+              contentString,
               undefined,
               unresolved
             );
@@ -900,12 +937,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             });
           }
         } else {
-          const rawContent =
+          let registryRaw =
             typeof result.content === 'string'
               ? result.content
               : JSON.stringify(result.content);
           contentString = truncateToolResultContent(
-            rawContent,
+            registryRaw,
             this.maxToolResultChars
           );
 
@@ -932,6 +969,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                 typeof hookResult.updatedOutput === 'string'
                   ? hookResult.updatedOutput
                   : JSON.stringify(hookResult.updatedOutput);
+              registryRaw = replaced;
               contentString = truncateToolResultContent(
                 replaced,
                 this.maxToolResultChars
@@ -941,9 +979,16 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
           const batchIndex = batchIndexByCallId.get(result.toolCallId);
           const unresolved = unresolvedByCallId.get(result.toolCallId) ?? [];
+          const refKey =
+            this.toolOutputRegistry != null &&
+            batchIndex != null &&
+            turn != null
+              ? buildReferenceKey(batchIndex, turn)
+              : undefined;
           contentString = this.applyOutputReference(
             contentString,
-            batchIndex,
+            registryRaw,
+            refKey,
             unresolved
           );
 
@@ -1045,20 +1090,23 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
    * by their ToolMessage results).
    *
    * `batchIndices` mirrors `toolCalls` and carries each call's position
-   * within the parent batch, which the registry uses to form reference
-   * keys. It's omitted when the registry is disabled.
+   * within the parent batch. `turn` is the per-`run()` batch index
+   * captured locally by the caller. Both are threaded so concurrent
+   * invocations cannot race on shared mutable state.
    */
   private async executeViaEvent(
     toolCalls: ToolCall[],
     config: RunnableConfig,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     input: any,
-    batchIndices?: number[]
+    batchIndices?: number[],
+    turn?: number
   ): Promise<T> {
     const { toolMessages, injected } = await this.dispatchToolEvents(
       toolCalls,
       config,
-      batchIndices
+      batchIndices,
+      turn
     );
     const outputs: BaseMessage[] = [...toolMessages, ...injected];
     return (Array.isArray(input) ? outputs : { messages: outputs }) as T;
@@ -1084,15 +1132,30 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       this.warnedNonStringRefTools.clear();
       this.lastRunId = incomingRunId;
     }
-    this.currentTurn = this.turnCounter++;
+    /**
+     * Capture this batch's turn value in a local and thread it down.
+     * Reading it from a mutable field after `await tool.invoke(...)`
+     * would race when the same ToolNode gets `invoke()`d concurrently
+     * — another invocation could overwrite the field before our
+     * registration runs. `this.currentTurn` is retained for external
+     * observability only; registration paths rely on the local `turn`.
+     */
+    const turn = this.turnCounter++;
+    this.currentTurn = turn;
     let outputs: (BaseMessage | Command)[];
 
     if (this.isSendInput(input)) {
       const isDirectTool = this.directToolNames?.has(input.lg_tool_call.name);
       if (this.eventDrivenMode && isDirectTool !== true) {
-        return this.executeViaEvent([input.lg_tool_call], config, input, [0]);
+        return this.executeViaEvent(
+          [input.lg_tool_call],
+          config,
+          input,
+          [0],
+          turn
+        );
       }
-      outputs = [await this.runTool(input.lg_tool_call, config, 0)];
+      outputs = [await this.runTool(input.lg_tool_call, config, 0, turn)];
       this.handleRunToolCompletions([input.lg_tool_call], outputs, config);
     } else {
       let messages: BaseMessage[];
@@ -1159,7 +1222,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             filteredCalls,
             config,
             input,
-            filteredIndices
+            filteredIndices,
+            turn
           );
         }
 
@@ -1184,7 +1248,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           directCalls.length > 0
             ? await Promise.all(
               directCalls.map((call, i) =>
-                this.runTool(call, config, directIndices[i])
+                this.runTool(call, config, directIndices[i], turn)
               )
             )
             : [];
@@ -1195,7 +1259,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
         const eventResult =
           eventCalls.length > 0
-            ? await this.dispatchToolEvents(eventCalls, config, eventIndices)
+            ? await this.dispatchToolEvents(
+              eventCalls,
+              config,
+              eventIndices,
+              turn
+            )
             : {
               toolMessages: [] as ToolMessage[],
               injected: [] as BaseMessage[],
@@ -1208,7 +1277,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         ];
       } else {
         outputs = await Promise.all(
-          filteredCalls.map((call, i) => this.runTool(call, config, i))
+          filteredCalls.map((call, i) => this.runTool(call, config, i, turn))
         );
         this.handleRunToolCompletions(filteredCalls, outputs, config);
       }
