@@ -916,6 +916,123 @@ describe('ToolNode tool output references', () => {
       );
     });
 
+    it('keeps same-turn refs isolated in the mixed direct+event path', async () => {
+      // Build a ToolNode with both a direct tool (via directToolNames)
+      // and an event-driven schema stub. Share one registry across
+      // both batches so refs only cross batch boundaries.
+      const sharedRegistry = new ToolOutputReferenceRegistry();
+
+      const directCapturedArgs: string[] = [];
+      const directTool = createEchoTool({
+        capturedArgs: directCapturedArgs,
+        outputs: ['direct-A-output', 'direct-B-output'],
+        name: 'directTool',
+      });
+      const eventStub = tool(async () => 'unused', {
+        name: 'eventTool',
+        description: 'schema-only stub',
+        schema: z.object({ command: z.string() }),
+      }) as unknown as StructuredToolInterface;
+
+      const hostCapturedArgs: Record<string, unknown>[] = [];
+      jest
+        .spyOn(events, 'safeDispatchCustomEvent')
+        .mockImplementation(async (event, data) => {
+          if (event !== 'on_tool_execute') {
+            return;
+          }
+          const batch = data as t.ToolExecuteBatchRequest;
+          for (const req of batch.toolCalls) {
+            hostCapturedArgs.push(req.args);
+          }
+          batch.resolve(
+            batch.toolCalls.map((req) => ({
+              toolCallId: req.id,
+              content: `event-${(req.args as { command: string }).command}`,
+              status: 'success' as const,
+            }))
+          );
+        });
+
+      const node = new ToolNode({
+        tools: [directTool, eventStub],
+        eventDrivenMode: true,
+        agentId: 'agent-mixed',
+        directToolNames: new Set(['directTool']),
+        toolCallStepIds: new Map([
+          ['d1', 'step_d1'],
+          ['e1', 'step_e1'],
+          ['d2', 'step_d2'],
+          ['e2', 'step_e2'],
+        ]),
+        toolOutputRegistry: sharedRegistry,
+      });
+
+      // Batch 1: mixed direct (index 0) + event (index 1). The event
+      // call attempts `{{tool0turn0}}` — which points at the direct
+      // call running *in the same batch*. Correct behavior: the
+      // placeholder stays unresolved (cross-batch only), and the
+      // event args received by the host must carry the literal
+      // template string plus the LLM-visible `[unresolved refs:…]`
+      // trailer.
+      await node.invoke(
+        {
+          messages: [
+            new AIMessage({
+              content: '',
+              tool_calls: [
+                {
+                  id: 'd1',
+                  name: 'directTool',
+                  args: { command: 'first' },
+                },
+                {
+                  id: 'e1',
+                  name: 'eventTool',
+                  args: { command: 'echo {{tool0turn0}}' },
+                },
+              ],
+            }),
+          ],
+        },
+        { configurable: { run_id: 'mixed-run' } }
+      );
+
+      expect(hostCapturedArgs).toHaveLength(1);
+      expect(hostCapturedArgs[0]).toEqual({
+        command: 'echo {{tool0turn0}}',
+      });
+
+      // Batch 2: ref across the boundary now resolves — direct's
+      // registered output from batch 1 (tool0turn0) is available.
+      await node.invoke(
+        {
+          messages: [
+            new AIMessage({
+              content: '',
+              tool_calls: [
+                {
+                  id: 'd2',
+                  name: 'directTool',
+                  args: { command: 'second' },
+                },
+                {
+                  id: 'e2',
+                  name: 'eventTool',
+                  args: { command: 'echo {{tool0turn0}}' },
+                },
+              ],
+            }),
+          ],
+        },
+        { configurable: { run_id: 'mixed-run' } }
+      );
+
+      expect(hostCapturedArgs[1]).toEqual({
+        command: 'echo direct-A-output',
+      });
+    });
+
     it('re-resolves placeholders when PreToolUse rewrites args', async () => {
       const hooks = new HookRegistry();
       hooks.register('PreToolUse', {

@@ -1271,31 +1271,46 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         const eventCalls = eventEntries.map((e) => e.call);
         const eventIndices = eventEntries.map((e) => e.batchIndex);
 
-        const directOutputs: (BaseMessage | Command)[] =
+        /**
+         * Run direct and event branches in parallel so both sync
+         * prefixes — which include `registry.resolve(args)` for every
+         * call — complete against the *pre-batch* registry state
+         * before either branch's registrations run. Serializing them
+         * (directs first, then events) would let event-call args
+         * resolve same-turn direct outputs that just registered,
+         * making `{{tool<i>turn<n>}}` semantics mode-dependent. JS
+         * single-threaded execution guarantees no microtask
+         * (= no registration) runs between the two synchronous
+         * sync-prefix passes here.
+         */
+        const directPromise: Promise<(BaseMessage | Command)[]> =
           directCalls.length > 0
-            ? await Promise.all(
+            ? Promise.all(
               directCalls.map((call, i) =>
                 this.runTool(call, config, directIndices[i], turn)
               )
             )
-            : [];
+            : Promise.resolve([]);
+
+        const eventPromise: Promise<{
+          toolMessages: ToolMessage[];
+          injected: BaseMessage[];
+        }> =
+          eventCalls.length > 0
+            ? this.dispatchToolEvents(eventCalls, config, eventIndices, turn)
+            : Promise.resolve({
+              toolMessages: [] as ToolMessage[],
+              injected: [] as BaseMessage[],
+            });
+
+        const [directOutputs, eventResult] = await Promise.all([
+          directPromise,
+          eventPromise,
+        ]);
 
         if (directCalls.length > 0 && directOutputs.length > 0) {
           this.handleRunToolCompletions(directCalls, directOutputs, config);
         }
-
-        const eventResult =
-          eventCalls.length > 0
-            ? await this.dispatchToolEvents(
-              eventCalls,
-              config,
-              eventIndices,
-              turn
-            )
-            : {
-              toolMessages: [] as ToolMessage[],
-              injected: [] as BaseMessage[],
-            };
 
         outputs = [
           ...directOutputs,
