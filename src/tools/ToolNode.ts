@@ -126,6 +126,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
    */
   private resolvedArgsByCallId: Map<string, Record<string, unknown>> =
     new Map();
+  /**
+   * Monotonic counter used to mint a unique scope id for anonymous
+   * batches (ones invoked without a `run_id` in
+   * `config.configurable`). Each such batch gets its own registry
+   * partition so concurrent anonymous invocations can't delete each
+   * other's in-flight state.
+   */
+  private anonBatchCounter: number = 0;
 
   constructor({
     tools,
@@ -243,7 +251,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     call: ToolCall,
     config: RunnableConfig,
     batchIndex?: number,
-    turn?: number
+    turn?: number,
+    batchScopeId?: string
   ): Promise<BaseMessage | Command> {
     const tool = this.toolMap.get(call.name);
     const registry = this.toolOutputRegistry;
@@ -263,7 +272,15 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
      * the self-correction signal this feature is meant to provide.
      */
     let unresolvedRefs: string[] = [];
-    const runId = config.configurable?.run_id as string | undefined;
+    /**
+     * Use the caller-provided `batchScopeId` when threaded from
+     * `run()` (so anonymous batches get their own unique scope).
+     * Fall back to the config's `run_id` when runTool is invoked
+     * from a context that doesn't thread it — that still preserves
+     * the runId-based partitioning for named runs.
+     */
+    const runId =
+      batchScopeId ?? (config.configurable?.run_id as string | undefined);
     try {
       if (tool === undefined) {
         throw new Error(`Tool "${call.name}" not found.`);
@@ -731,16 +748,19 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     preResolvedArgs?: Map<
       string,
       { resolved: Record<string, unknown>; unresolved: string[] }
-    >
+    >,
+    batchScopeId?: string
   ): Promise<{ toolMessages: ToolMessage[]; injected: BaseMessage[] }> {
     const runId = (config.configurable?.run_id as string | undefined) ?? '';
     /**
-     * Registry-facing runId preserves `undefined` so the registry
-     * treats anonymous callers as fresh-per-batch instead of lumping
-     * them all under an empty-string bucket. Hooks and event payloads
-     * keep using the empty-string coerced `runId` for backward compat.
+     * Registry-facing scope id — prefers the caller-threaded
+     * `batchScopeId` so anonymous batches target their own unique
+     * bucket and don't step on concurrent anonymous invocations.
+     * Hooks and event payloads keep using the empty-string coerced
+     * `runId` for backward compat.
      */
-    const registryRunId = config.configurable?.run_id as string | undefined;
+    const registryRunId =
+      batchScopeId ?? (config.configurable?.run_id as string | undefined);
     const threadId = config.configurable?.thread_id as string | undefined;
     const registry = this.toolOutputRegistry;
     const unresolvedByCallId = new Map<string, string[]>();
@@ -1178,13 +1198,16 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     input: any,
     batchIndices?: number[],
-    turn?: number
+    turn?: number,
+    batchScopeId?: string
   ): Promise<T> {
     const { toolMessages, injected } = await this.dispatchToolEvents(
       toolCalls,
       config,
       batchIndices,
-      turn
+      turn,
+      undefined,
+      batchScopeId
     );
     const outputs: BaseMessage[] = [...toolMessages, ...injected];
     return (Array.isArray(input) ? outputs : { messages: outputs }) as T;
@@ -1196,16 +1219,18 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     this.resolvedArgsByCallId.clear();
     /**
      * Claim this batch's turn synchronously from the registry (or
-     * fall back to 0 when the feature is disabled). The registry
-     * handles run-crossing resets: when `run_id` changes — or is
-     * absent — it clears stored entries, warn memo, and its own
-     * counter before returning turn 0. Capturing `turn` in a local
-     * is essential: reading it back from shared state after the
-     * tool `await` would race when the same ToolNode is `invoke()`d
-     * concurrently.
+     * fall back to 0 when the feature is disabled). The registry is
+     * partitioned by scope id so overlapping batches cannot
+     * overwrite each other's state even under a shared registry.
+     *
+     * For anonymous callers (no `run_id` in config), mint a unique
+     * per-batch scope id so two concurrent anonymous invocations
+     * don't target the same bucket. The scope is threaded down to
+     * every subsequent registry call on this batch.
      */
     const incomingRunId = config.configurable?.run_id as string | undefined;
-    const turn = this.toolOutputRegistry?.nextTurn(incomingRunId) ?? 0;
+    const batchScopeId = incomingRunId ?? `\0anon-${this.anonBatchCounter++}`;
+    const turn = this.toolOutputRegistry?.nextTurn(batchScopeId) ?? 0;
     let outputs: (BaseMessage | Command)[];
 
     if (this.isSendInput(input)) {
@@ -1216,10 +1241,13 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           config,
           input,
           [0],
-          turn
+          turn,
+          batchScopeId
         );
       }
-      outputs = [await this.runTool(input.lg_tool_call, config, 0, turn)];
+      outputs = [
+        await this.runTool(input.lg_tool_call, config, 0, turn, batchScopeId),
+      ];
       this.handleRunToolCompletions([input.lg_tool_call], outputs, config);
     } else {
       let messages: BaseMessage[];
@@ -1287,7 +1315,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             config,
             input,
             filteredIndices,
-            turn
+            turn,
+            batchScopeId
           );
         }
 
@@ -1327,7 +1356,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           for (const entry of eventEntries) {
             if (entry.call.id != null) {
               const { resolved, unresolved } = this.toolOutputRegistry.resolve(
-                incomingRunId,
+                batchScopeId,
                 entry.call.args as Record<string, unknown>
               );
               preResolvedEventArgs.set(entry.call.id, {
@@ -1342,7 +1371,13 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           directCalls.length > 0
             ? await Promise.all(
               directCalls.map((call, i) =>
-                this.runTool(call, config, directIndices[i], turn)
+                this.runTool(
+                  call,
+                  config,
+                  directIndices[i],
+                  turn,
+                  batchScopeId
+                )
               )
             )
             : [];
@@ -1358,7 +1393,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               config,
               eventIndices,
               turn,
-              preResolvedEventArgs
+              preResolvedEventArgs,
+              batchScopeId
             )
             : {
               toolMessages: [] as ToolMessage[],
@@ -1372,7 +1408,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         ];
       } else {
         outputs = await Promise.all(
-          filteredCalls.map((call, i) => this.runTool(call, config, i, turn))
+          filteredCalls.map((call, i) =>
+            this.runTool(call, config, i, turn, batchScopeId)
+          )
         );
         this.handleRunToolCompletions(filteredCalls, outputs, config);
       }

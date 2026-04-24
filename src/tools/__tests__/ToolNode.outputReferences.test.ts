@@ -531,6 +531,68 @@ describe('ToolNode tool output references', () => {
       expect(capturedArgs[2]).toBe('see out-B');
     });
 
+    it('gives concurrent anonymous invocations independent scopes', async () => {
+      const gates: Record<string, () => void> = {};
+      const slowTool = tool(
+        async (input) => {
+          const args = input as { command: string };
+          await new Promise<void>((resolve) => {
+            gates[args.command] = resolve;
+          });
+          return `out-${args.command}`;
+        },
+        {
+          name: 'slow',
+          description: 'awaits a per-command gate',
+          schema: z.object({ command: z.string() }),
+        }
+      ) as unknown as StructuredToolInterface;
+
+      const node = new ToolNode({
+        tools: [slowTool],
+        toolOutputReferences: { enabled: true },
+      });
+
+      // Two invocations without `run_id`, started concurrently. Before
+      // the unique-anon-scope fix, the second invocation's sync prefix
+      // would have deleted the shared anonymous bucket that the first
+      // invocation's tool was about to register into.
+      const first = node.invoke({
+        messages: [aiMsgWithCalls([{ id: 'a1', name: 'slow', command: 'A' }])],
+      });
+      const second = node.invoke({
+        messages: [aiMsgWithCalls([{ id: 'b1', name: 'slow', command: 'B' }])],
+      });
+
+      await new Promise<void>((resolve) => {
+        const check = (): void => {
+          if (
+            Object.prototype.hasOwnProperty.call(gates, 'A') &&
+            Object.prototype.hasOwnProperty.call(gates, 'B')
+          ) {
+            resolve();
+          } else {
+            setTimeout(check, 5);
+          }
+        };
+        check();
+      });
+      gates.B();
+      gates.A();
+
+      const [resA, resB] = (await Promise.all([first, second])) as Array<{
+        messages: ToolMessage[];
+      }>;
+
+      // Each invocation produces its own annotated output — neither's
+      // registered tool0turn0 was clobbered by the other's sync-prefix
+      // reset.
+      expect(resA.messages[0].content).toContain('[ref: tool0turn0]');
+      expect(resA.messages[0].content).toContain('out-A');
+      expect(resB.messages[0].content).toContain('[ref: tool0turn0]');
+      expect(resB.messages[0].content).toContain('out-B');
+    });
+
     it('clears state on every batch when run_id is absent (anonymous caller)', async () => {
       const capturedArgs: string[] = [];
       const t1 = createEchoTool({
@@ -791,13 +853,14 @@ describe('ToolNode tool output references', () => {
         content: '',
         tool_calls: [{ id: 'ec1', name: 'echo', args: { command: 'run' } }],
       });
-      const result = (await node.invoke({ messages: [aiMsg] })) as {
-        messages: ToolMessage[];
-      };
+      const result = (await node.invoke(
+        { messages: [aiMsg] },
+        { configurable: { run_id: 'run-host' } }
+      )) as { messages: ToolMessage[] };
 
       expect(result.messages[0].content).toBe('[ref: tool0turn0]\nhost-output');
       expect(
-        node._unsafeGetToolOutputRegistry()!.get(undefined, 'tool0turn0')
+        node._unsafeGetToolOutputRegistry()!.get('run-host', 'tool0turn0')
       ).toBe('host-output');
     });
 

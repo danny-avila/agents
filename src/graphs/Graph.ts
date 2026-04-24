@@ -168,6 +168,15 @@ export abstract class Graph<
     this.handlerRegistry = undefined;
     this.hookRegistry = undefined;
     this.toolOutputReferences = undefined;
+    /**
+     * ToolNodes compiled from this graph captured the registry
+     * instance at construction time, so simply dropping the Graph's
+     * own reference would leave their captured reference — and every
+     * stored `tool<i>turn<n>` entry, plus up to `maxTotalSize` of raw
+     * output — alive across subsequent `processStream()` calls. Wipe
+     * the registry's contents first so subsequent runs start fresh.
+     */
+    this._toolOutputRegistry?.clear();
     this._toolOutputRegistry = undefined;
     this.sessions.clear();
   }

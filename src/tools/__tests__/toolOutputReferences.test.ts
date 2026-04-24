@@ -42,6 +42,28 @@ describe('ToolOutputReferenceRegistry', () => {
     });
   });
 
+  describe('clear / releaseRun', () => {
+    it('clear() drops every run bucket', () => {
+      const reg = new ToolOutputReferenceRegistry();
+      reg.set('run-A', 'tool0turn0', 'A');
+      reg.set('run-B', 'tool0turn0', 'B');
+      expect(reg.size).toBe(2);
+      reg.clear();
+      expect(reg.size).toBe(0);
+      expect(reg.get('run-A', 'tool0turn0')).toBeUndefined();
+      expect(reg.get('run-B', 'tool0turn0')).toBeUndefined();
+    });
+
+    it('releaseRun() drops only the named run', () => {
+      const reg = new ToolOutputReferenceRegistry();
+      reg.set('run-A', 'tool0turn0', 'A');
+      reg.set('run-B', 'tool0turn0', 'B');
+      reg.releaseRun('run-A');
+      expect(reg.get('run-A', 'tool0turn0')).toBeUndefined();
+      expect(reg.get('run-B', 'tool0turn0')).toBe('B');
+    });
+  });
+
   describe('FIFO eviction', () => {
     it('evicts oldest entries when the aggregate cap is exceeded', () => {
       const reg = new ToolOutputReferenceRegistry({
