@@ -2039,6 +2039,139 @@ describe('thinking enabled — tail tool_use without a thinking block (issue #11
     expect(result.thinkingStartIndex).toBeUndefined();
   });
 
+  it('handles consecutive tool calls without any thinking block in the tail', () => {
+    const tokenCounter = createTestTokenCounter();
+    const messages: BaseMessage[] = [
+      new HumanMessage('do two things'),
+      new AIMessage({
+        content: [
+          {
+            type: 'tool_use',
+            id: 'tc_1',
+            name: 'tool_a',
+            input: { x: 1 },
+          },
+        ],
+        tool_calls: [
+          { id: 'tc_1', name: 'tool_a', args: { x: 1 }, type: 'tool_call' },
+        ],
+      }),
+      new ToolMessage({
+        content: 'result_a',
+        tool_call_id: 'tc_1',
+        name: 'tool_a',
+      }),
+      new AIMessage({
+        content: [
+          {
+            type: 'tool_use',
+            id: 'tc_2',
+            name: 'tool_b',
+            input: { y: 2 },
+          },
+        ],
+        tool_calls: [
+          { id: 'tc_2', name: 'tool_b', args: { y: 2 }, type: 'tool_call' },
+        ],
+      }),
+      new ToolMessage({
+        content: 'd'.repeat(6000),
+        tool_call_id: 'tc_2',
+        name: 'tool_b',
+      }),
+    ];
+
+    const indexTokenCountMap: Record<string, number | undefined> = {};
+    for (let i = 0; i < messages.length; i++) {
+      indexTokenCountMap[i] = tokenCounter(messages[i]);
+    }
+
+    expect(() =>
+      realGetMessagesWithinTokenLimit({
+        messages,
+        maxContextTokens: 200,
+        indexTokenCountMap,
+        thinkingEnabled: true,
+        tokenCounter,
+        reasoningType: ContentTypes.THINKING,
+      })
+    ).not.toThrow();
+
+    const result = realGetMessagesWithinTokenLimit({
+      messages,
+      maxContextTokens: 200,
+      indexTokenCountMap,
+      thinkingEnabled: true,
+      tokenCounter,
+      reasoningType: ContentTypes.THINKING,
+    });
+    expect(result.thinkingStartIndex).toBeUndefined();
+  });
+
+  it('does not throw via createPruneMessages when prior thinking carry-over precedes a no-thinking tail', () => {
+    const tokenCounter = createTestTokenCounter();
+    const firstTurn: BaseMessage[] = [
+      new HumanMessage('hi'),
+      new AIMessage({
+        content: [
+          {
+            type: ContentTypes.THINKING,
+            thinking: 'planning the response',
+            signature: 'sig-prior',
+          },
+          { type: 'text', text: 'hello back' },
+        ],
+      }),
+    ];
+
+    const indexTokenCountMap: Record<string, number | undefined> = {};
+    for (let i = 0; i < firstTurn.length; i++) {
+      indexTokenCountMap[i] = tokenCounter(firstTurn[i]);
+    }
+
+    const pruneMessages = createPruneMessages({
+      maxTokens: 1000,
+      startIndex: 0,
+      tokenCounter,
+      indexTokenCountMap,
+      thinkingEnabled: true,
+      reserveRatio: 0,
+    });
+
+    const firstResult = pruneMessages({ messages: firstTurn });
+    expect(firstResult.context.length).toBe(2);
+
+    const secondTurn: BaseMessage[] = [
+      ...firstTurn,
+      new HumanMessage('please read the doc'),
+      new AIMessage({
+        content: [
+          {
+            type: 'tool_use',
+            id: 'tc_get_doc',
+            name: 'get_doc_content',
+            input: { docId: 'abc' },
+          },
+        ],
+        tool_calls: [
+          {
+            id: 'tc_get_doc',
+            name: 'get_doc_content',
+            args: { docId: 'abc' },
+            type: 'tool_call',
+          },
+        ],
+      }),
+      new ToolMessage({
+        content: 'e'.repeat(8000),
+        tool_call_id: 'tc_get_doc',
+        name: 'get_doc_content',
+      }),
+    ];
+
+    expect(() => pruneMessages({ messages: secondTurn })).not.toThrow();
+  });
+
   it('still preserves the thinking block when the trailing AI message has one', () => {
     const tokenCounter = createTestTokenCounter();
     const messages: BaseMessage[] = [
