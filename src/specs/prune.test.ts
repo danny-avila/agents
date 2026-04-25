@@ -2193,11 +2193,13 @@ describe('thinking enabled — tail tool_use without a thinking block (issue #11
 
   it('integrates with ensureThinkingBlockInMessages so the API-bound payload stays valid', () => {
     // Models the full Graph.ts pipeline: pruner runs first, then
-    // ensureThinkingBlockInMessages on the pruned context. The pruner used to
-    // throw on the issue #115 tail; with the fix it passes the messages
-    // through to ensureThinkingBlockInMessages, which converts the orphan
-    // AI(tool_use)+Tool into a `[Previous agent context]` HumanMessage. The
-    // outgoing payload is then a sequence Anthropic accepts.
+    // ensureThinkingBlockInMessages on the pruned context. The pruner used
+    // to throw on the issue #115 tail; with the fix it returns the
+    // messages, and ensureThinkingBlockInMessages folds the orphan
+    // AI(tool_use)+Tool tail into a `[Previous agent context]`
+    // HumanMessage. The Tool size is tuned so the trailing sequence
+    // actually survives pruning — otherwise the assertions would be
+    // vacuous.
     const tokenCounter = createTestTokenCounter();
     const messages: BaseMessage[] = [
       new HumanMessage('please read this doc and tell me X'),
@@ -2220,7 +2222,7 @@ describe('thinking enabled — tail tool_use without a thinking block (issue #11
         ],
       }),
       new ToolMessage({
-        content: 'f'.repeat(8000),
+        content: 'f'.repeat(100),
         tool_call_id: 'tc_get_doc',
         name: 'get_doc_content',
       }),
@@ -2233,45 +2235,50 @@ describe('thinking enabled — tail tool_use without a thinking block (issue #11
 
     const pruneResult = realGetMessagesWithinTokenLimit({
       messages,
-      maxContextTokens: 200,
+      maxContextTokens: 300,
       indexTokenCountMap,
       thinkingEnabled: true,
       tokenCounter,
       reasoningType: ContentTypes.THINKING,
     });
 
+    expect(pruneResult.context.length).toBe(3);
+
     const finalMessages = ensureThinkingBlockInMessages(
       pruneResult.context,
       Providers.ANTHROPIC
     );
 
-    // ensureThinkingBlockInMessages folds the orphan AI(tool_use)+Tool tail
-    // into a synthetic HumanMessage; nothing in the outgoing payload is an
-    // AI tool_use without a thinking block, which is the API-level concern.
-    for (const m of finalMessages) {
+    // ensureThinkingBlockInMessages should fold the orphan AI(tool_use)+Tool
+    // into a synthetic HumanMessage carrying the `[Previous agent context]`
+    // marker, leaving no AI(tool_use) in the outgoing payload.
+    expect(finalMessages.length).toBe(2);
+    expect(finalMessages[0]).toBeInstanceOf(HumanMessage);
+    expect(finalMessages[1]).toBeInstanceOf(HumanMessage);
+
+    const folded = finalMessages[1] as HumanMessage;
+    const foldedContent = folded.content;
+    const foldedText = Array.isArray(foldedContent)
+      ? (foldedContent as t.ExtendedMessageContent[])
+        .filter((c) => typeof c === 'object' && c.type === 'text')
+        .map((c) => String(c.text ?? ''))
+        .join('\n')
+      : String(foldedContent);
+    expect(foldedText).toContain('[Previous agent context]');
+
+    const hasOrphanToolUse = finalMessages.some((m) => {
       if (m.getType() !== 'ai') {
-        continue;
+        return false;
       }
       const content = (m as AIMessage).content;
       if (!Array.isArray(content)) {
-        continue;
+        return false;
       }
-      const hasToolUse = content.some(
+      return content.some(
         (c) => typeof c === 'object' && c.type === 'tool_use'
       );
-      if (!hasToolUse) {
-        continue;
-      }
-      const hasThinking = content.some(
-        (c) =>
-          typeof c === 'object' &&
-          (c.type === ContentTypes.THINKING ||
-            c.type === ContentTypes.REASONING_CONTENT ||
-            c.type === ContentTypes.REASONING ||
-            c.type === 'redacted_thinking')
-      );
-      expect(hasThinking).toBe(true);
-    }
+    });
+    expect(hasOrphanToolUse).toBe(false);
   });
 
   it('still preserves the thinking block when the trailing AI message has one', () => {
