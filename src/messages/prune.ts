@@ -683,10 +683,17 @@ export function getMessagesWithinTokenLimit({
         ) as ThinkingContentText | undefined;
         thinkingStartIndex = thinkingBlock != null ? currentIndex : -1;
       }
-      /** False start, the latest message was not part of a multi-assistant/tool sequence of messages */
+      /**
+       * Exited the trailing assistant/tool sequence without finding a
+       * thinking block. Anthropic does not require Claude to emit a
+       * thinking block before every tool call, so the absence of one is
+       * a valid sequence — clear thinkingEndIndex so the pruner does not
+       * treat it as malformed.
+       */
       if (
         thinkingEndIndex > -1 &&
-        currentIndex === thinkingEndIndex - 1 &&
+        thinkingStartIndex < 0 &&
+        !thinkingBlock &&
         messageType !== 'ai' &&
         messageType !== 'tool'
       ) {
