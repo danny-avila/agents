@@ -21,6 +21,7 @@ import {
   createPruneMessages,
 } from '@/messages/prune';
 import { getLLMConfig } from '@/utils/llmConfig';
+import { ensureThinkingBlockInMessages } from '@/messages/format';
 import { Providers, ContentTypes } from '@/common';
 import { Run } from '@/run';
 
@@ -2170,6 +2171,89 @@ describe('thinking enabled — tail tool_use without a thinking block (issue #11
     ];
 
     expect(() => pruneMessages({ messages: secondTurn })).not.toThrow();
+  });
+
+  it('integrates with ensureThinkingBlockInMessages so the API-bound payload stays valid', () => {
+    // Models the full Graph.ts pipeline: pruner runs first, then
+    // ensureThinkingBlockInMessages on the pruned context. The pruner used to
+    // throw on the issue #115 tail; with the fix it passes the messages
+    // through to ensureThinkingBlockInMessages, which converts the orphan
+    // AI(tool_use)+Tool into a `[Previous agent context]` HumanMessage. The
+    // outgoing payload is then a sequence Anthropic accepts.
+    const tokenCounter = createTestTokenCounter();
+    const messages: BaseMessage[] = [
+      new HumanMessage('please read this doc and tell me X'),
+      new AIMessage({
+        content: [
+          {
+            type: 'tool_use',
+            id: 'tc_get_doc',
+            name: 'get_doc_content',
+            input: { docId: 'abc' },
+          },
+        ],
+        tool_calls: [
+          {
+            id: 'tc_get_doc',
+            name: 'get_doc_content',
+            args: { docId: 'abc' },
+            type: 'tool_call',
+          },
+        ],
+      }),
+      new ToolMessage({
+        content: 'f'.repeat(8000),
+        tool_call_id: 'tc_get_doc',
+        name: 'get_doc_content',
+      }),
+    ];
+
+    const indexTokenCountMap: Record<string, number | undefined> = {};
+    for (let i = 0; i < messages.length; i++) {
+      indexTokenCountMap[i] = tokenCounter(messages[i]);
+    }
+
+    const pruneResult = realGetMessagesWithinTokenLimit({
+      messages,
+      maxContextTokens: 200,
+      indexTokenCountMap,
+      thinkingEnabled: true,
+      tokenCounter,
+      reasoningType: ContentTypes.THINKING,
+    });
+
+    const finalMessages = ensureThinkingBlockInMessages(
+      pruneResult.context,
+      Providers.ANTHROPIC
+    );
+
+    // ensureThinkingBlockInMessages folds the orphan AI(tool_use)+Tool tail
+    // into a synthetic HumanMessage; nothing in the outgoing payload is an
+    // AI tool_use without a thinking block, which is the API-level concern.
+    for (const m of finalMessages) {
+      if (m.getType() !== 'ai') {
+        continue;
+      }
+      const content = (m as AIMessage).content;
+      if (!Array.isArray(content)) {
+        continue;
+      }
+      const hasToolUse = content.some(
+        (c) => typeof c === 'object' && c.type === 'tool_use'
+      );
+      if (!hasToolUse) {
+        continue;
+      }
+      const hasThinking = content.some(
+        (c) =>
+          typeof c === 'object' &&
+          (c.type === ContentTypes.THINKING ||
+            c.type === ContentTypes.REASONING_CONTENT ||
+            c.type === ContentTypes.REASONING ||
+            c.type === 'redacted_thinking')
+      );
+      expect(hasThinking).toBe(true);
+    }
   });
 
   it('still preserves the thinking block when the trailing AI message has one', () => {
