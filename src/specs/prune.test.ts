@@ -2087,17 +2087,6 @@ describe('thinking enabled — tail tool_use without a thinking block (issue #11
       indexTokenCountMap[i] = tokenCounter(messages[i]);
     }
 
-    expect(() =>
-      realGetMessagesWithinTokenLimit({
-        messages,
-        maxContextTokens: 200,
-        indexTokenCountMap,
-        thinkingEnabled: true,
-        tokenCounter,
-        reasoningType: ContentTypes.THINKING,
-      })
-    ).not.toThrow();
-
     const result = realGetMessagesWithinTokenLimit({
       messages,
       maxContextTokens: 200,
@@ -2109,10 +2098,16 @@ describe('thinking enabled — tail tool_use without a thinking block (issue #11
     expect(result.thinkingStartIndex).toBeUndefined();
   });
 
-  it('does not throw via createPruneMessages when prior thinking carry-over precedes a no-thinking tail', () => {
+  it('honors prior runThinkingStartIndex carry-over when the next call has a no-thinking tail', () => {
+    // First call's tight budget forces pruning, which makes the closure
+    // record the AI(thinking) message's index in runThinkingStartIndex.
+    // Second call's tail is AI(tool_use) without a thinking block; the
+    // pre-loaded thinkingBlock from the carry-over keeps the new guard
+    // dormant and the existing reattachment path runs. Verifies the fix
+    // doesn't disturb the carry-over interaction.
     const tokenCounter = createTestTokenCounter();
     const firstTurn: BaseMessage[] = [
-      new HumanMessage('hi'),
+      new HumanMessage('h'.repeat(120)),
       new AIMessage({
         content: [
           {
@@ -2120,7 +2115,7 @@ describe('thinking enabled — tail tool_use without a thinking block (issue #11
             thinking: 'planning the response',
             signature: 'sig-prior',
           },
-          { type: 'text', text: 'hello back' },
+          { type: 'text', text: 'hi' },
         ],
       }),
     ];
@@ -2131,7 +2126,7 @@ describe('thinking enabled — tail tool_use without a thinking block (issue #11
     }
 
     const pruneMessages = createPruneMessages({
-      maxTokens: 1000,
+      maxTokens: 68,
       startIndex: 0,
       tokenCounter,
       indexTokenCountMap,
@@ -2140,7 +2135,8 @@ describe('thinking enabled — tail tool_use without a thinking block (issue #11
     });
 
     const firstResult = pruneMessages({ messages: firstTurn });
-    expect(firstResult.context.length).toBe(2);
+    expect(firstResult.messagesToRefine?.length).toBeGreaterThan(0);
+    expect(firstResult.context.some((m) => m.getType() === 'ai')).toBe(true);
 
     const secondTurn: BaseMessage[] = [
       ...firstTurn,
@@ -2164,13 +2160,35 @@ describe('thinking enabled — tail tool_use without a thinking block (issue #11
         ],
       }),
       new ToolMessage({
-        content: 'e'.repeat(8000),
+        content: 'e'.repeat(40),
         tool_call_id: 'tc_get_doc',
         name: 'get_doc_content',
       }),
     ];
 
-    expect(() => pruneMessages({ messages: secondTurn })).not.toThrow();
+    let secondResult: ReturnType<typeof pruneMessages> | undefined;
+    expect(() => {
+      secondResult = pruneMessages({ messages: secondTurn });
+    }).not.toThrow();
+
+    // Carry-over reattachment: even though the trailing AI(tool_use) has
+    // no thinking block of its own, the closure's runThinkingStartIndex
+    // points at the prior AI(thinking) and that block gets prepended to
+    // the surviving AI message in context.
+    const trailingAi = secondResult!.context.find(
+      (m) =>
+        m.getType() === 'ai' &&
+        Array.isArray(m.content) &&
+        (m.content as t.ExtendedMessageContent[]).some(
+          (c) => typeof c === 'object' && c.type === 'tool_use'
+        )
+    );
+    expect(trailingAi).toBeDefined();
+    expect(
+      (trailingAi!.content as t.ExtendedMessageContent[]).some(
+        (c) => typeof c === 'object' && c.type === ContentTypes.THINKING
+      )
+    ).toBe(true);
   });
 
   it('integrates with ensureThinkingBlockInMessages so the API-bound payload stays valid', () => {
