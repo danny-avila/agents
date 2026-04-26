@@ -603,18 +603,25 @@ function arraysShallowEqual(a: unknown, b: readonly string[]): boolean {
 
 /**
  * Lazy projection that, given a registry and a runId, returns a new
- * `messages` array where each `ToolMessage` carrying a live `_refKey`
- * (and/or unresolved-ref metadata) has its `content` annotated for the
- * LLM. The original input array and its messages are never mutated.
+ * `messages` array where each `ToolMessage` carrying ref metadata is
+ * projected into a transient copy with annotated content (when the ref
+ * is live in the registry) and with the framework-owned `additional_
+ * kwargs` keys (`_refKey`, `_refScope`, `_unresolvedRefs`) stripped
+ * regardless of whether annotation applied. The original input array
+ * and its messages are never mutated.
  *
  * Annotation is gated on registry presence: a stale `_refKey` from a
  * prior run (e.g. one that survived in persisted history) silently
- * no-ops, exactly matching the "refs are run-scoped" mental model.
+ * no-ops on the *content* side. The strip-metadata side still runs so
+ * stale framework keys never leak onto the wire under any custom or
+ * future provider serializer that might transmit `additional_kwargs`.
  * `_unresolvedRefs` is always meaningful and is not gated.
  *
- * When neither a registry nor any ToolMessage in the batch carries
- * relevant metadata, the input array is returned unchanged (reference-
- * equal) so the common case is allocation-free.
+ * **Feature-disabled fast path:** when the host hasn't enabled the
+ * tool-output-reference feature, the registry is `undefined` and this
+ * function returns the input array reference-equal *without iterating
+ * a single message*. The loop is exclusive to the feature-enabled
+ * code path.
  */
 export function annotateMessagesForLLM(
   messages: BaseMessage[],
@@ -625,9 +632,8 @@ export function annotateMessagesForLLM(
 
   /**
    * Lazy-allocate the output array so the common case (no ToolMessage
-   * needs annotation — refs are stale or absent) returns the input
-   * reference-equal with zero allocations beyond the per-message
-   * predicate checks.
+   * carries framework metadata) returns the input reference-equal with
+   * zero allocations beyond the per-message predicate checks.
    */
   let out: BaseMessage[] | undefined;
   for (let i = 0; i < messages.length; i++) {
@@ -643,9 +649,13 @@ export function annotateMessagesForLLM(
      * provider call.
      */
     const meta = m.additional_kwargs as Record<string, unknown> | undefined;
+    const hasRefKey = meta != null && '_refKey' in meta;
+    const hasRefScope = meta != null && '_refScope' in meta;
+    const hasUnresolvedField = meta != null && '_unresolvedRefs' in meta;
+    if (!hasRefKey && !hasRefScope && !hasUnresolvedField) continue;
+
     const refKey = readRefKey(meta);
     const unresolved = readUnresolvedRefs(meta);
-    if (refKey == null && unresolved.length === 0) continue;
 
     /**
      * Prefer the message-stamped `_refScope` for the registry lookup.
@@ -658,30 +668,40 @@ export function annotateMessagesForLLM(
     const lookupScope = readRefScope(meta) ?? runId;
     const liveRef =
       refKey != null && registry.has(lookupScope, refKey) ? refKey : undefined;
-    if (liveRef == null && unresolved.length === 0) continue;
+    const annotates = liveRef != null || unresolved.length > 0;
 
     const tm = m as ToolMessage;
-    let projected: ToolMessage | undefined;
+    let nextContent: ToolMessage['content'] = tm.content;
 
-    if (typeof tm.content === 'string') {
-      projected = cloneToolMessageWithContent(
-        tm,
-        annotateToolOutputWithReference(tm.content, liveRef, unresolved)
+    if (annotates && typeof tm.content === 'string') {
+      nextContent = annotateToolOutputWithReference(
+        tm.content,
+        liveRef,
+        unresolved
       );
-    } else if (Array.isArray(tm.content) && unresolved.length > 0) {
+    } else if (
+      annotates &&
+      Array.isArray(tm.content) &&
+      unresolved.length > 0
+    ) {
       const warningBlock = {
         type: 'text' as const,
         text: `[unresolved refs: ${unresolved.join(', ')}]`,
       };
-      projected = cloneToolMessageWithContent(tm, [
+      nextContent = [
         warningBlock,
         ...tm.content,
-      ] as unknown as ToolMessage['content']);
+      ] as unknown as ToolMessage['content'];
     }
 
-    if (projected == null) continue;
+    /**
+     * Project unconditionally: even when no annotation applies (stale
+     * `_refKey` or non-annotatable content), `cloneToolMessageWithContent`
+     * runs `stripFrameworkRefMetadata` on `additional_kwargs` so the
+     * framework-owned keys never reach the wire.
+     */
     out ??= messages.slice();
-    out[i] = projected;
+    out[i] = cloneToolMessageWithContent(tm, nextContent);
   }
 
   return out ?? messages;

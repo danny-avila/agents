@@ -36,6 +36,32 @@ describe('annotateMessagesForLLM', () => {
     expect(out).toBe(messages);
   });
 
+  it('does not iterate any message when the feature is disabled (registry undefined)', () => {
+    /**
+     * Hard guarantee: when the host hasn't enabled
+     * `RunConfig.toolOutputReferences`, calling
+     * `annotateMessagesForLLM` must short-circuit at O(1) without
+     * touching a single ToolMessage. We assert by spying on
+     * `_getType` — the first per-message call inside the loop — and
+     * confirming it was never invoked.
+     */
+    const messages = [
+      makeToolMessage({ content: 'a' }),
+      makeToolMessage({ content: 'b' }),
+      makeToolMessage({
+        content: 'c',
+        additional_kwargs: { _refKey: 'tool0turn0' },
+      }),
+    ];
+    const spies = messages.map((m) => jest.spyOn(m, '_getType'));
+    const out = annotateMessagesForLLM(messages, undefined, undefined);
+    expect(out).toBe(messages);
+    for (const spy of spies) {
+      expect(spy).not.toHaveBeenCalled();
+      spy.mockRestore();
+    }
+  });
+
   it('returns the input array reference when no ToolMessage carries metadata', () => {
     const registry = new ToolOutputReferenceRegistry();
     registry.set('r1', 'tool0turn0', 'stored');
@@ -62,15 +88,26 @@ describe('annotateMessagesForLLM', () => {
     expect(out[0]).not.toBe(tm);
   });
 
-  it('skips annotation when _refKey is stale (not in the registry)', () => {
+  it('leaves content untouched but strips framework metadata when _refKey is stale', () => {
+    /**
+     * Stale `_refKey` (not in registry) doesn't trigger annotation,
+     * but the message still gets projected so framework keys are
+     * removed from `additional_kwargs` before the bytes leave for the
+     * provider. This protects against custom or future serializers
+     * that transmit `additional_kwargs`.
+     */
     const registry = new ToolOutputReferenceRegistry();
     const tm = makeToolMessage({
       content: 'output',
-      additional_kwargs: { _refKey: 'tool0turn0' },
+      additional_kwargs: { _refKey: 'tool0turn0', userField: 'preserved' },
     });
     const out = annotateMessagesForLLM([tm], registry, 'r1');
     expect(out[0].content).toBe('output');
-    expect(out[0]).toBe(tm);
+    expect(out[0]).not.toBe(tm);
+    const projectedKwargs = (out[0] as ToolMessage).additional_kwargs;
+    expect(projectedKwargs._refKey).toBeUndefined();
+    expect(projectedKwargs.userField).toBe('preserved');
+    expect(tm.additional_kwargs._refKey).toBe('tool0turn0');
   });
 
   it('always applies _unresolvedRefs even when there is no registry entry', () => {
@@ -232,7 +269,7 @@ describe('annotateMessagesForLLM', () => {
     expect(out[2]).not.toBe(tm);
   });
 
-  it('returns same array when only stale _refKey is present and no unresolvedRefs', () => {
+  it('projects (to strip metadata) but does not annotate when only stale _refKey is present', () => {
     const registry = new ToolOutputReferenceRegistry();
     registry.set('r1', 'tool1turn0', 'somethingelse');
     const tm = makeToolMessage({
@@ -240,6 +277,23 @@ describe('annotateMessagesForLLM', () => {
       additional_kwargs: { _refKey: 'tool0turn0' },
     });
     const messages = [tm];
+    const out = annotateMessagesForLLM(messages, registry, 'r1');
+    expect(out).not.toBe(messages);
+    expect(out[0].content).toBe('output');
+    expect((out[0] as ToolMessage).additional_kwargs._refKey).toBeUndefined();
+  });
+
+  it('returns the input array reference-equal when no ToolMessage carries any framework metadata', () => {
+    const registry = new ToolOutputReferenceRegistry();
+    registry.set('r1', 'tool0turn0', 'stored');
+    const messages = [
+      new HumanMessage('hi'),
+      makeToolMessage({
+        content: 'output',
+        additional_kwargs: { unrelated: 'value' },
+      }),
+      new AIMessage('answer'),
+    ];
     const out = annotateMessagesForLLM(messages, registry, 'r1');
     expect(out).toBe(messages);
   });
@@ -299,7 +353,8 @@ describe('annotateMessagesForLLM', () => {
      * `additional_kwargs._unresolvedRefs` is untyped at the LangChain
      * layer, so a persisted message could carry a string/object/null
      * by mistake. The transform must not crash the run on
-     * `.length` / `.join` — coerce to an empty list and proceed.
+     * `.length` / `.join` — coerce to an empty list, strip the
+     * malformed key, and proceed.
      */
     const registry = new ToolOutputReferenceRegistry();
     const tm = makeToolMessage({
@@ -310,7 +365,9 @@ describe('annotateMessagesForLLM', () => {
     });
     const out = annotateMessagesForLLM([tm], registry, 'r1');
     expect(out[0].content).toBe('output');
-    expect(out[0]).toBe(tm);
+    expect(
+      (out[0] as ToolMessage).additional_kwargs._unresolvedRefs
+    ).toBeUndefined();
   });
 
   it('filters non-string entries out of _unresolvedRefs', () => {
@@ -344,7 +401,7 @@ describe('annotateMessagesForLLM', () => {
     });
     const out = annotateMessagesForLLM([tm], registry, 'r1');
     expect(out[0].content).toBe('output');
-    expect(out[0]).toBe(tm);
+    expect((out[0] as ToolMessage).additional_kwargs._refKey).toBeUndefined();
   });
 
   it('treats stale _refKey but live unresolved as unresolved-only', () => {
