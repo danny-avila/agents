@@ -89,7 +89,26 @@ function isSend(value: unknown): value is Send {
   return value instanceof Send;
 }
 
-/** Merges code execution session context into the sessions map. */
+/**
+ * Merges code execution session context into the sessions map.
+ *
+ * The codeapi worker reports two distinct ids on a code-execution result:
+ *  - `artifact.session_id` (the `sessionId` arg here) is the EXEC session
+ *    — the sandbox VM that ran the code. It's transient and torn down
+ *    post-execution; subsequent calls cannot reuse it as a sandbox.
+ *  - `file.session_id` on each `artifact.files[i]` is the STORAGE
+ *    session — the file-server bucket prefix where the artifact actually
+ *    lives and is served from.
+ *
+ * Per-file `session_id` is preserved (not overwritten with the exec id)
+ * because `_injected_files` are looked up against the file-server's
+ * storage path on subsequent tool calls. Stomping the storage id with
+ * the exec id silently 404s every follow-up tool call within the same
+ * run — `cat /mnt/data/foo.txt` reports "No such file or directory"
+ * because the worker can't mount a file at a path the storage doesn't
+ * know about. Fall back to `sessionId` only when the per-file id is
+ * absent (older worker payloads).
+ */
 function updateCodeSession(
   sessions: t.ToolSessionMap,
   sessionId: string,
@@ -104,7 +123,7 @@ function updateCodeSession(
   if (newFiles.length > 0) {
     const filesWithSession: t.FileRefs = newFiles.map((file) => ({
       ...file,
-      session_id: sessionId,
+      session_id: file.session_id ?? sessionId,
     }));
     const newFileNames = new Set(filesWithSession.map((f) => f.name));
     const filteredExisting = existingFiles.filter(

@@ -472,6 +472,130 @@ describe('ToolNode code execution session management', () => {
 
       expect(sessions.has(Constants.EXECUTE_CODE)).toBe(false);
     });
+
+    it('preserves per-file storage session_id (not overwritten with the exec session_id)', () => {
+      /**
+       * Regression: the codeapi worker reports `artifact.session_id` (EXEC
+       * session — torn down post-run) and per-file `session_id` (STORAGE
+       * session where the file lives). Stomping the storage id with the
+       * exec id silently 404s every follow-up tool call within the same
+       * run because `_injected_files` carry the wrong path on the next
+       * `/exec`. The worker tries to mount `<exec_session>/<id>` against
+       * file-server, gets 404, mounts nothing — `cat /mnt/data/foo.txt`
+       * → "No such file or directory".
+       */
+      const sessions: t.ToolSessionMap = new Map();
+      const mockTool = createMockCodeTool({ capturedConfigs: [] });
+      const toolNode = new ToolNode({
+        tools: [mockTool],
+        sessions,
+        eventDrivenMode: true,
+      });
+      const storeMethod = (
+        toolNode as unknown as {
+          storeCodeSessionFromResults: (
+            results: t.ToolExecuteResult[],
+            requestMap: Map<string, t.ToolCallRequest>
+          ) => void;
+        }
+      ).storeCodeSessionFromResults.bind(toolNode);
+
+      storeMethod(
+        [
+          {
+            toolCallId: 'tc-storage',
+            content: 'output',
+            artifact: {
+              /* EXEC session — transient, torn down after this run */
+              session_id: 'exec-session-123',
+              files: [
+                /* STORAGE session — persistent file-server bucket prefix */
+                {
+                  id: 'f1',
+                  name: 'sentinel.txt',
+                  session_id: 'storage-session-A',
+                },
+                { id: 'f2', name: 'data.csv', session_id: 'storage-session-B' },
+              ],
+            },
+            status: 'success',
+          },
+        ],
+        new Map([
+          [
+            'tc-storage',
+            { id: 'tc-storage', name: Constants.EXECUTE_CODE, args: {} },
+          ],
+        ])
+      );
+
+      const stored = sessions.get(
+        Constants.EXECUTE_CODE
+      ) as t.CodeSessionContext;
+      /* The session-level id is the (latest) exec id — fine for tracking
+         "what session ran last" — but per-file storage ids must survive. */
+      expect(stored.session_id).toBe('exec-session-123');
+      expect(stored.files).toHaveLength(2);
+      expect(stored.files![0]).toEqual({
+        id: 'f1',
+        name: 'sentinel.txt',
+        session_id: 'storage-session-A',
+      });
+      expect(stored.files![1]).toEqual({
+        id: 'f2',
+        name: 'data.csv',
+        session_id: 'storage-session-B',
+      });
+    });
+
+    it('falls back to exec session_id only when per-file session_id is absent (older worker payloads)', () => {
+      const sessions: t.ToolSessionMap = new Map();
+      const mockTool = createMockCodeTool({ capturedConfigs: [] });
+      const toolNode = new ToolNode({
+        tools: [mockTool],
+        sessions,
+        eventDrivenMode: true,
+      });
+      const storeMethod = (
+        toolNode as unknown as {
+          storeCodeSessionFromResults: (
+            results: t.ToolExecuteResult[],
+            requestMap: Map<string, t.ToolCallRequest>
+          ) => void;
+        }
+      ).storeCodeSessionFromResults.bind(toolNode);
+
+      storeMethod(
+        [
+          {
+            toolCallId: 'tc-mixed',
+            content: 'output',
+            artifact: {
+              session_id: 'exec-mixed',
+              files: [
+                /* Mix: one file with storage id, one without (older payload). */
+                { id: 'f1', name: 'fresh.csv', session_id: 'storage-fresh' },
+                { id: 'f2', name: 'legacy.csv' },
+              ],
+            },
+            status: 'success',
+          },
+        ],
+        new Map([
+          [
+            'tc-mixed',
+            { id: 'tc-mixed', name: Constants.EXECUTE_CODE, args: {} },
+          ],
+        ])
+      );
+
+      const stored = sessions.get(
+        Constants.EXECUTE_CODE
+      ) as t.CodeSessionContext;
+      expect(stored.files![0].session_id).toBe('storage-fresh');
+      /* Fallback only when the per-file id is missing. */
+      expect(stored.files![1].session_id).toBe('exec-mixed');
+    });
   });
 
   describe('codeSessionContext emission gate (event-driven request building)', () => {
