@@ -25,6 +25,7 @@
 import {
   calculateMaxTotalToolOutputSize,
   HARD_MAX_TOOL_RESULT_CHARS,
+  HARD_MAX_TOTAL_TOOL_OUTPUT_SIZE,
 } from '@/utils/truncation';
 
 /**
@@ -142,9 +143,17 @@ export class ToolOutputReferenceRegistry {
       options.maxOutputSize != null && options.maxOutputSize > 0
         ? options.maxOutputSize
         : HARD_MAX_TOOL_RESULT_CHARS;
+    /**
+     * Clamp a caller-supplied `maxTotalSize` to
+     * `HARD_MAX_TOTAL_TOOL_OUTPUT_SIZE` (5 MB) so the documented
+     * absolute cap is enforced regardless of host config —
+     * `calculateMaxTotalToolOutputSize` already applies the same
+     * upper bound on its computed default, but the user-provided
+     * branch was bypassing it.
+     */
     const totalRaw =
       options.maxTotalSize != null && options.maxTotalSize > 0
-        ? options.maxTotalSize
+        ? Math.min(options.maxTotalSize, HARD_MAX_TOTAL_TOOL_OUTPUT_SIZE)
         : calculateMaxTotalToolOutputSize(perOutput);
     this.maxTotalSize = totalRaw;
     /**

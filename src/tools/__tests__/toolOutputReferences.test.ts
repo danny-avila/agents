@@ -103,6 +103,17 @@ describe('ToolOutputReferenceRegistry', () => {
       expect(stored).toBeDefined();
       expect(stored!.length).toBeLessThanOrEqual(10);
     });
+
+    it('clamps a caller-supplied maxTotalSize to the documented hard cap', () => {
+      // 50 MB requested; should be clamped to the 5 MB hard cap.
+      const reg = new ToolOutputReferenceRegistry({
+        maxTotalSize: 50_000_000,
+      });
+      // `totalLimit` getter exposes the effective post-clamp value.
+      expect(reg.totalLimit).toBeLessThanOrEqual(5_000_000);
+      // Per-output is also bound by the same effective total.
+      expect(reg.perOutputLimit).toBeLessThanOrEqual(5_000_000);
+    });
   });
 
   describe('resolve', () => {
