@@ -1391,12 +1391,23 @@ function appendToolCalls(
  * @param messages - Array of messages to process
  * @param provider - The provider being used (unused but kept for future compatibility)
  * @param config - Optional RunnableConfig for structured agent logging
+ * @param runStartIndex - Index in `messages` where the CURRENT run's own
+ *   appended AI/Tool messages begin (i.e. anything at this index or later
+ *   was just produced by this run's own iterations, not historical
+ *   context). When provided, AI messages at or after this index are
+ *   never converted to `[Previous agent context]` placeholders — Claude
+ *   can validly skip a thinking block before a tool_use (cf. PR #116),
+ *   so the agent's own in-run iterations must not be misclassified as
+ *   foreign history. Without the signal the function falls back to its
+ *   prior heuristic (`chainHasThinkingBlock`), preserving backward
+ *   compatibility for callers that don't yet pass the boundary.
  * @returns The messages array with tool sequences converted to buffer strings if necessary
  */
 export function ensureThinkingBlockInMessages(
   messages: BaseMessage[],
   _provider: Providers,
-  config?: RunnableConfig
+  config?: RunnableConfig,
+  runStartIndex?: number
 ): BaseMessage[] {
   if (messages.length === 0) {
     return messages;
@@ -1483,6 +1494,23 @@ export function ensureThinkingBlockInMessages(
     // but follow-ups have content: "" with only tool_calls. These are the
     // same agent's turn and must NOT be converted to HumanMessages.
     if (hasToolUse && !hasThinkingBlock) {
+      // Current-run boundary check: anything at or after `runStartIndex`
+      // is the current run's own work — preserve it. Claude is allowed
+      // to skip a thinking block before a tool_use (cf. PR #116 in the
+      // agents repo), so the agent's own first-iteration AI message can
+      // legitimately have tool_calls without reasoning. Converting it to
+      // a `[Previous agent context]` placeholder pollutes the next
+      // iteration's prompt — the LLM sees the placeholder, treats it as
+      // suspicious injected content, ignores its own real prior tool
+      // result, and re-runs the tool to verify (which then often fails
+      // because subsequent calls land in fresh sandboxes without the
+      // file). Skip the conversion when we know this is in-run.
+      if (runStartIndex !== undefined && i >= runStartIndex) {
+        result.push(msg);
+        i++;
+        continue;
+      }
+
       // Walk backwards — if an earlier AI message in the same chain (before
       // the nearest HumanMessage) has a thinking/reasoning block, this is a
       // continuation of a thinking-enabled turn, not a non-thinking handoff.

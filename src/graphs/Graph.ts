@@ -898,10 +898,21 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       if (
         isThinkingEnabled(agentContext.provider, agentContext.clientOptions)
       ) {
+        /**
+         * Pass `this.startIndex` so the function can distinguish CURRENT-run
+         * AI messages (the agent's own iterations — possibly without a
+         * leading thinking block, which Claude is allowed to skip) from
+         * historical context that genuinely needs the
+         * `[Previous agent context]` placeholder. Without this signal the
+         * function would convert the agent's own in-run tool_use messages,
+         * polluting the next iteration's prompt with a placeholder the
+         * model treats as suspicious injected content.
+         */
         finalMessages = ensureThinkingBlockInMessages(
           finalMessages,
           agentContext.provider,
-          config
+          config,
+          this.startIndex
         );
       }
 
