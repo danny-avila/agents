@@ -1,11 +1,12 @@
 import { z } from 'zod';
 import { tool } from '@langchain/core/tools';
 import { AIMessage } from '@langchain/core/messages';
-import { describe, it, expect } from '@jest/globals';
+import { describe, it, expect, jest, afterEach } from '@jest/globals';
 import type { StructuredToolInterface } from '@langchain/core/tools';
 import type * as t from '@/types';
 import { ToolNode } from '../ToolNode';
 import { Constants } from '@/common';
+import * as events from '@/utils/events';
 
 /**
  * Creates a mock execute_code tool that captures the toolCall config it receives.
@@ -233,7 +234,9 @@ describe('ToolNode code execution session management', () => {
             status: 'success',
           },
         ],
-        new Map([['tc1', { id: 'tc1', name: Constants.EXECUTE_CODE, args: {} }]])
+        new Map([
+          ['tc1', { id: 'tc1', name: Constants.EXECUTE_CODE, args: {} }],
+        ])
       );
 
       const stored = sessions.get(
@@ -279,7 +282,9 @@ describe('ToolNode code execution session management', () => {
             status: 'success',
           },
         ],
-        new Map([['tc2', { id: 'tc2', name: Constants.EXECUTE_CODE, args: {} }]])
+        new Map([
+          ['tc2', { id: 'tc2', name: Constants.EXECUTE_CODE, args: {} }],
+        ])
       );
 
       const stored = sessions.get(
@@ -329,7 +334,9 @@ describe('ToolNode code execution session management', () => {
             status: 'success',
           },
         ],
-        new Map([['tc3', { id: 'tc3', name: Constants.EXECUTE_CODE, args: {} }]])
+        new Map([
+          ['tc3', { id: 'tc3', name: Constants.EXECUTE_CODE, args: {} }],
+        ])
       );
 
       const stored = sessions.get(
@@ -379,7 +386,9 @@ describe('ToolNode code execution session management', () => {
             status: 'success',
           },
         ],
-        new Map([['tc4', { id: 'tc4', name: Constants.EXECUTE_CODE, args: {} }]])
+        new Map([
+          ['tc4', { id: 'tc4', name: Constants.EXECUTE_CODE, args: {} }],
+        ])
       );
 
       const stored = sessions.get(
@@ -456,10 +465,150 @@ describe('ToolNode code execution session management', () => {
             errorMessage: 'execution failed',
           },
         ],
-        new Map([['tc6', { id: 'tc6', name: Constants.EXECUTE_CODE, args: {} }]])
+        new Map([
+          ['tc6', { id: 'tc6', name: Constants.EXECUTE_CODE, args: {} }],
+        ])
       );
 
       expect(sessions.has(Constants.EXECUTE_CODE)).toBe(false);
+    });
+  });
+
+  describe('codeSessionContext emission gate (event-driven request building)', () => {
+    /**
+     * Captures the `ToolExecuteBatchRequest` dispatched on ON_TOOL_EXECUTE so
+     * we can assert which `request.name`s receive `codeSessionContext`. Returns
+     * the captured requests; resolves the dispatched event with empty results
+     * to let `dispatchToolEvents` complete.
+     */
+    function captureBatchRequests(): {
+      capturedRequests: t.ToolCallRequest[];
+      } {
+      const capturedRequests: t.ToolCallRequest[] = [];
+      jest
+        .spyOn(events, 'safeDispatchCustomEvent')
+        .mockImplementation(async (_event, data) => {
+          const batch = data as t.ToolExecuteBatchRequest;
+          if (Array.isArray(batch.toolCalls)) {
+            capturedRequests.push(...batch.toolCalls);
+          }
+          if (typeof batch.resolve === 'function') {
+            batch.resolve(
+              batch.toolCalls.map((tc) => ({
+                toolCallId: tc.id,
+                content: '',
+                status: 'success' as const,
+              }))
+            );
+          }
+        });
+      return { capturedRequests };
+    }
+
+    const createDummyTool = (name: string): StructuredToolInterface =>
+      tool(async () => 'ok', {
+        name,
+        description: 'dummy',
+        schema: z.object({ x: z.string().optional() }),
+      }) as unknown as StructuredToolInterface;
+
+    afterEach(() => {
+      jest.restoreAllMocks();
+    });
+
+    it('attaches codeSessionContext to read_file requests so the host can fall back to the code-env sandbox', async () => {
+      const sessions: t.ToolSessionMap = new Map();
+      sessions.set(Constants.EXECUTE_CODE, {
+        session_id: 'rf-session',
+        files: [{ id: 'rf1', name: 'data.csv', session_id: 'rf-session' }],
+        lastUpdated: Date.now(),
+      } satisfies t.CodeSessionContext);
+
+      const { capturedRequests } = captureBatchRequests();
+
+      const toolNode = new ToolNode({
+        tools: [createDummyTool(Constants.READ_FILE)],
+        sessions,
+        eventDrivenMode: true,
+        toolCallStepIds: new Map([['call_rf', 'step_rf']]),
+      });
+
+      const aiMsg = new AIMessage({
+        content: '',
+        tool_calls: [
+          {
+            id: 'call_rf',
+            name: Constants.READ_FILE,
+            args: { file_path: '/mnt/data/data.csv' },
+          },
+        ],
+      });
+
+      await toolNode.invoke({ messages: [aiMsg] });
+
+      expect(capturedRequests).toHaveLength(1);
+      expect(capturedRequests[0].name).toBe(Constants.READ_FILE);
+      expect(capturedRequests[0].codeSessionContext).toEqual({
+        session_id: 'rf-session',
+        files: [{ session_id: 'rf-session', id: 'rf1', name: 'data.csv' }],
+      });
+    });
+
+    it('does not attach codeSessionContext to read_file when no session exists yet', async () => {
+      const { capturedRequests } = captureBatchRequests();
+
+      const toolNode = new ToolNode({
+        tools: [createDummyTool(Constants.READ_FILE)],
+        sessions: new Map(),
+        eventDrivenMode: true,
+        toolCallStepIds: new Map([['call_rf2', 'step_rf2']]),
+      });
+
+      const aiMsg = new AIMessage({
+        content: '',
+        tool_calls: [
+          {
+            id: 'call_rf2',
+            name: Constants.READ_FILE,
+            args: { file_path: 'some-skill/notes.md' },
+          },
+        ],
+      });
+
+      await toolNode.invoke({ messages: [aiMsg] });
+
+      expect(capturedRequests).toHaveLength(1);
+      expect(capturedRequests[0].name).toBe(Constants.READ_FILE);
+      expect(capturedRequests[0].codeSessionContext).toBeUndefined();
+    });
+
+    it('does not attach codeSessionContext to unrelated tools', async () => {
+      const sessions: t.ToolSessionMap = new Map();
+      sessions.set(Constants.EXECUTE_CODE, {
+        session_id: 'unrelated-session',
+        files: [],
+        lastUpdated: Date.now(),
+      } satisfies t.CodeSessionContext);
+
+      const { capturedRequests } = captureBatchRequests();
+
+      const toolNode = new ToolNode({
+        tools: [createDummyTool('web_search')],
+        sessions,
+        eventDrivenMode: true,
+        toolCallStepIds: new Map([['call_ws', 'step_ws']]),
+      });
+
+      const aiMsg = new AIMessage({
+        content: '',
+        tool_calls: [{ id: 'call_ws', name: 'web_search', args: { x: 'q' } }],
+      });
+
+      await toolNode.invoke({ messages: [aiMsg] });
+
+      expect(capturedRequests).toHaveLength(1);
+      expect(capturedRequests[0].name).toBe('web_search');
+      expect(capturedRequests[0].codeSessionContext).toBeUndefined();
     });
   });
 });
