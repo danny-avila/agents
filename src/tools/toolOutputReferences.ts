@@ -691,6 +691,15 @@ export function annotateMessagesForLLM(
         type: 'text' as const,
         text: `[unresolved refs: ${unresolved.join(', ')}]`,
       };
+      /**
+       * `as unknown as ToolMessage['content']` is unavoidable here:
+       * LangChain's content union (`MessageContentComplex[] |
+       * DataContentBlock[] | string`) does not accept a freshly built
+       * mixed array literal even though the structural shape is valid
+       * at runtime. The double-cast is structurally safe — we
+       * preserve every block from `tm.content` and prepend a single
+       * `{ type: 'text', text }` block that all providers accept.
+       */
       nextContent = [
         warningBlock,
         ...tm.content,

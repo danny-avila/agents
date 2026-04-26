@@ -3,6 +3,7 @@ import { AIMessageChunk } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type { BaseMessage } from '@langchain/core/messages';
+import type { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import type * as t from '@/types';
 import { manualToolStreamProviders } from '@/llm/providers';
 import { annotateMessagesForLLM } from '@/tools/toolOutputReferences';
@@ -12,19 +13,34 @@ import { GraphEvents, Providers } from '@/common';
 import { initializeModel } from '@/llm/init';
 
 /**
- * Context passed to `attemptInvoke` for the default stream handler.
- * Matches the subset of Graph that `ChatModelStreamHandler.handle` needs.
+ * Context passed to `attemptInvoke`. Matches the subset of Graph that
+ * `ChatModelStreamHandler.handle` needs *plus* the explicit
+ * `getOrCreateToolOutputRegistry()` accessor that `attemptInvoke`
+ * itself calls to pull the run-scoped tool-output registry off the
+ * graph and project each relevant ToolMessage into a transient
+ * annotated copy before the provider call.
  *
- * `attemptInvoke` additionally calls `context?.getOrCreateToolOutputRegistry?.()`
- * (if defined) to pull the run-scoped tool output registry off the graph
- * so it can project each relevant `ToolMessage` into a transient
- * annotated copy right before sending to the provider — annotations
- * never persist back into graph state.
+ * The intersection is intentional: `Parameters<...>[3]` resolves
+ * indirectly through the stream handler's signature (which returns
+ * `StandardGraph` and already exposes the accessor since #117), but
+ * stating it explicitly here surfaces the contract at the call site —
+ * a developer reading `attemptInvoke` doesn't have to chase the
+ * upstream handler's parameter list to discover that
+ * `context?.getOrCreateToolOutputRegistry?.()` is a real thing.
+ *
+ * `NonNullable<...>` strips `undefined` from the upstream parameter
+ * type so the intersection doesn't collapse to `never` on the
+ * undefined branch; callers express optionality via `context?:
+ * InvokeContext` on the function signature instead.
  *
  * Callers without a registry (e.g. summarization) simply pass no
  * `context` and the transform safely no-ops.
  */
-export type InvokeContext = Parameters<ChatModelStreamHandler['handle']>[3];
+export type InvokeContext = NonNullable<
+  Parameters<ChatModelStreamHandler['handle']>[3]
+> & {
+  getOrCreateToolOutputRegistry?(): ToolOutputReferenceRegistry | undefined;
+};
 
 /**
  * Per-chunk callback for custom stream processing.

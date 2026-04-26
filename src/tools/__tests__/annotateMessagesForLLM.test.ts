@@ -12,12 +12,14 @@ function makeToolMessage(fields: {
   name?: string;
   tool_call_id?: string;
   status?: 'success' | 'error';
+  artifact?: unknown;
   additional_kwargs?: Record<string, unknown>;
 }): ToolMessage {
   return new ToolMessage({
     name: fields.name ?? 'echo',
     tool_call_id: fields.tool_call_id ?? 'tc1',
     status: fields.status ?? 'success',
+    artifact: fields.artifact,
     additional_kwargs: fields.additional_kwargs,
     content: fields.content,
   });
@@ -188,6 +190,31 @@ describe('annotateMessagesForLLM', () => {
     expect(blocks[1].type).toBe('text');
     expect(blocks[1].text).toBe('data');
     expect(blocks[2].type).toBe('image_url');
+  });
+
+  it('preserves artifact on the projected ToolMessage', () => {
+    /**
+     * Hosts attach `artifact` to ToolMessages via the
+     * `content_and_artifact` response format (e.g. code execution
+     * sessions, MCP tools that return structured side-data). The
+     * projection must round-trip the artifact untouched so downstream
+     * consumers (audit logs, code-session tracking) keep working.
+     */
+    const registry = new ToolOutputReferenceRegistry();
+    registry.set('r1', 'tool0turn0', 'raw');
+    const artifact = {
+      session_id: 'abc',
+      files: [{ id: 'f1', name: 'a.txt' }],
+    };
+    const tm = makeToolMessage({
+      content: 'output',
+      artifact,
+      additional_kwargs: { _refKey: 'tool0turn0' },
+    });
+    const out = annotateMessagesForLLM([tm], registry, 'r1');
+    const projected = out[0] as ToolMessage;
+    expect(projected.artifact).toBe(artifact);
+    expect(projected.content).toBe('[ref: tool0turn0]\noutput');
   });
 
   it('does not mutate the original ToolMessage instance or its content', () => {

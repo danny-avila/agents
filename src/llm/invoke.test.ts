@@ -28,10 +28,17 @@ type StubModel = {
   ) => AsyncGenerator<AIMessageChunk>;
 };
 
-function buildCapturingModel(): {
+type CapturingModel = {
   invokeMessages: BaseMessage[][];
   model: StubModel;
-  } {
+};
+
+type StreamingCapturingModel = {
+  streamMessages: BaseMessage[][];
+  model: StubModel;
+};
+
+function buildCapturingModel(): CapturingModel {
   const invokeMessages: BaseMessage[][] = [];
   const responseMsg = new AIMessage({ content: 'ok' });
   const model: StubModel = {
@@ -43,10 +50,7 @@ function buildCapturingModel(): {
   return { invokeMessages, model };
 }
 
-function buildStreamingCapturingModel(): {
-  streamMessages: BaseMessage[][];
-  model: StubModel;
-  } {
+function buildStreamingCapturingModel(): StreamingCapturingModel {
   const streamMessages: BaseMessage[][] = [];
   const model: StubModel = {
     stream: jest.fn(async function* (
