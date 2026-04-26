@@ -24,7 +24,6 @@
 
 import { ToolMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
-import type { ToolMessageRefMetadata } from '@/types/messages';
 import {
   calculateMaxTotalToolOutputSize,
   HARD_MAX_TOOL_RESULT_CHARS,
@@ -634,11 +633,18 @@ export function annotateMessagesForLLM(
   for (let i = 0; i < messages.length; i++) {
     const m = messages[i];
     if (m._getType() !== 'tool') continue;
-    const meta = m.additional_kwargs as
-      | (ToolMessageRefMetadata & Record<string, unknown>)
-      | undefined;
-    const refKey = meta?._refKey;
-    const unresolved = meta?._unresolvedRefs ?? [];
+    /**
+     * `additional_kwargs` is untyped at the LangChain layer
+     * (`Record<string, unknown>`), so persisted or client-supplied
+     * ToolMessages can carry arbitrary shapes under our framework
+     * keys. Treat them as untrusted input and coerce defensively
+     * before any array operation — a malformed field on a single
+     * hydrated message must not crash `attemptInvoke` before the
+     * provider call.
+     */
+    const meta = m.additional_kwargs as Record<string, unknown> | undefined;
+    const refKey = readRefKey(meta);
+    const unresolved = readUnresolvedRefs(meta);
     if (refKey == null && unresolved.length === 0) continue;
 
     /**
@@ -649,7 +655,7 @@ export function annotateMessagesForLLM(
      * recover. Falling back to `runId` keeps backward compatibility
      * with messages stamped before this field existed.
      */
-    const lookupScope = meta?._refScope ?? runId;
+    const lookupScope = readRefScope(meta) ?? runId;
     const liveRef =
       refKey != null && registry.has(lookupScope, refKey) ? refKey : undefined;
     if (liveRef == null && unresolved.length === 0) continue;
@@ -679,6 +685,50 @@ export function annotateMessagesForLLM(
   }
 
   return out ?? messages;
+}
+
+/**
+ * Reads `_refKey` defensively from untyped `additional_kwargs`. Returns
+ * undefined for non-string values so a malformed field cannot poison
+ * the registry lookup or downstream string operations.
+ */
+function readRefKey(
+  meta: Record<string, unknown> | undefined
+): string | undefined {
+  const v = meta?._refKey;
+  return typeof v === 'string' ? v : undefined;
+}
+
+/**
+ * Reads `_refScope` defensively from untyped `additional_kwargs`.
+ * Mirrors {@link readRefKey} — non-string scopes are dropped (the
+ * caller falls back to the run-derived scope) rather than passed into
+ * the registry as a malformed key.
+ */
+function readRefScope(
+  meta: Record<string, unknown> | undefined
+): string | undefined {
+  const v = meta?._refScope;
+  return typeof v === 'string' ? v : undefined;
+}
+
+/**
+ * Reads `_unresolvedRefs` defensively from untyped `additional_kwargs`.
+ * Returns an empty array for any non-array value, and filters out
+ * non-string entries from a real array. Without this guard, a hydrated
+ * ToolMessage carrying e.g. `_unresolvedRefs: 'tool0turn0'` would crash
+ * `attemptInvoke` on the eventual `.length` / `.join(...)` call.
+ */
+function readUnresolvedRefs(
+  meta: Record<string, unknown> | undefined
+): string[] {
+  const v = meta?._unresolvedRefs;
+  if (!Array.isArray(v)) return [];
+  const out: string[] = [];
+  for (const item of v) {
+    if (typeof item === 'string') out.push(item);
+  }
+  return out;
 }
 
 /**

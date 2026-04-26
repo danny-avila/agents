@@ -287,6 +287,60 @@ describe('annotateMessagesForLLM', () => {
     expect(out[0].content).toBe('[ref: tool0turn0]\noutput');
   });
 
+  it('coerces a non-array _unresolvedRefs to empty without throwing', () => {
+    /**
+     * Defensive against malformed hydrated messages:
+     * `additional_kwargs._unresolvedRefs` is untyped at the LangChain
+     * layer, so a persisted message could carry a string/object/null
+     * by mistake. The transform must not crash the run on
+     * `.length` / `.join` — coerce to an empty list and proceed.
+     */
+    const registry = new ToolOutputReferenceRegistry();
+    const tm = makeToolMessage({
+      content: 'output',
+      additional_kwargs: {
+        _unresolvedRefs: 'tool9turn9' as unknown as string[],
+      },
+    });
+    const out = annotateMessagesForLLM([tm], registry, 'r1');
+    expect(out[0].content).toBe('output');
+    expect(out[0]).toBe(tm);
+  });
+
+  it('filters non-string entries out of _unresolvedRefs', () => {
+    const registry = new ToolOutputReferenceRegistry();
+    const tm = makeToolMessage({
+      content: 'output',
+      additional_kwargs: {
+        _unresolvedRefs: [
+          'tool9turn9',
+          42,
+          null,
+          { not: 'a string' },
+          'tool8turn8',
+        ] as unknown as string[],
+      },
+    });
+    const out = annotateMessagesForLLM([tm], registry, 'r1');
+    expect(out[0].content).toBe(
+      'output\n[unresolved refs: tool9turn9, tool8turn8]'
+    );
+  });
+
+  it('ignores a non-string _refKey rather than poisoning the registry lookup', () => {
+    const registry = new ToolOutputReferenceRegistry();
+    registry.set('r1', 'tool0turn0', 'raw');
+    const tm = makeToolMessage({
+      content: 'output',
+      additional_kwargs: {
+        _refKey: { malformed: true } as unknown as string,
+      },
+    });
+    const out = annotateMessagesForLLM([tm], registry, 'r1');
+    expect(out[0].content).toBe('output');
+    expect(out[0]).toBe(tm);
+  });
+
   it('treats stale _refKey but live unresolved as unresolved-only', () => {
     const registry = new ToolOutputReferenceRegistry();
     const tm = makeToolMessage({
