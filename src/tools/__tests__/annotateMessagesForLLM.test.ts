@@ -140,7 +140,14 @@ describe('annotateMessagesForLLM', () => {
     expect(tm.additional_kwargs).toEqual(originalKwargs);
   });
 
-  it('strips ref metadata from the projected ToolMessage so annotation is not double-applied', () => {
+  it('passes original additional_kwargs through by reference on the projection', () => {
+    /**
+     * The projected ToolMessage shares its `additional_kwargs` with the
+     * original — LangChain's provider serializers don't transmit
+     * `additional_kwargs` to provider APIs, and the projected array
+     * never round-trips back into graph state, so a defensive clone
+     * here would be wasted work.
+     */
     const registry = new ToolOutputReferenceRegistry();
     registry.set('r1', 'tool0turn0', 'raw');
     const tm = makeToolMessage({
@@ -153,8 +160,7 @@ describe('annotateMessagesForLLM', () => {
     });
     const out = annotateMessagesForLLM([tm], registry, 'r1');
     const projected = out[0] as ToolMessage;
-    expect(projected.additional_kwargs._refKey).toBeUndefined();
-    expect(projected.additional_kwargs._unresolvedRefs).toBeUndefined();
+    expect(projected.additional_kwargs).toBe(tm.additional_kwargs);
     expect(projected.additional_kwargs.someOtherField).toBe('preserved');
   });
 

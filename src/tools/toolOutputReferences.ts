@@ -624,83 +624,78 @@ export function annotateMessagesForLLM(
 ): BaseMessage[] {
   if (registry == null) return messages;
 
-  const out = messages.map((m) => {
-    if (m._getType() !== 'tool') return m;
+  /**
+   * Lazy-allocate the output array so the common case (no ToolMessage
+   * needs annotation — refs are stale or absent) returns the input
+   * reference-equal with zero allocations beyond the per-message
+   * predicate checks.
+   */
+  let out: BaseMessage[] | undefined;
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    if (m._getType() !== 'tool') continue;
     const meta = m.additional_kwargs as
       | (ToolMessageRefMetadata & Record<string, unknown>)
       | undefined;
     const refKey = meta?._refKey;
     const unresolved = meta?._unresolvedRefs ?? [];
-    if (refKey == null && unresolved.length === 0) return m;
+    if (refKey == null && unresolved.length === 0) continue;
 
     const liveRef =
       refKey != null && registry.has(runId, refKey) ? refKey : undefined;
-
-    if (liveRef == null && unresolved.length === 0) return m;
+    if (liveRef == null && unresolved.length === 0) continue;
 
     const tm = m as ToolMessage;
-    const cleanedKwargs = stripRefMetadata(meta);
+    let projected: ToolMessage | undefined;
+
     if (typeof tm.content === 'string') {
-      const annotated = annotateToolOutputWithReference(
-        tm.content,
-        liveRef,
-        unresolved
-      );
-      return new ToolMessage({
+      projected = new ToolMessage({
         id: tm.id,
         name: tm.name,
         status: tm.status,
         artifact: tm.artifact,
         tool_call_id: tm.tool_call_id,
         response_metadata: tm.response_metadata,
-        additional_kwargs: cleanedKwargs,
-        content: annotated,
+        /**
+         * Pass the original `additional_kwargs` through by reference.
+         * LangChain's provider serializers do not transmit
+         * `additional_kwargs` to provider HTTP APIs, and the projected
+         * array is discarded after the request — so the metadata
+         * never reaches the wire and never round-trips back into
+         * graph state. Skipping a clone here avoids an O(n) walk plus
+         * a fresh object per annotated ToolMessage.
+         */
+        additional_kwargs: tm.additional_kwargs,
+        content: annotateToolOutputWithReference(
+          tm.content,
+          liveRef,
+          unresolved
+        ),
       });
-    }
-    if (Array.isArray(tm.content) && unresolved.length > 0) {
+    } else if (Array.isArray(tm.content) && unresolved.length > 0) {
       const warningBlock = {
         type: 'text' as const,
         text: `[unresolved refs: ${unresolved.join(', ')}]`,
       };
-      return new ToolMessage({
+      projected = new ToolMessage({
         id: tm.id,
         name: tm.name,
         status: tm.status,
         artifact: tm.artifact,
         tool_call_id: tm.tool_call_id,
         response_metadata: tm.response_metadata,
-        additional_kwargs: cleanedKwargs,
+        additional_kwargs: tm.additional_kwargs,
         content: [
           warningBlock,
           ...tm.content,
         ] as unknown as ToolMessage['content'],
       });
     }
-    return m;
-  });
 
-  for (let i = 0; i < out.length; i++) {
-    if (out[i] !== messages[i]) return out;
+    if (projected == null) continue;
+    out ??= messages.slice();
+    out[i] = projected;
   }
-  return messages;
-}
 
-/**
- * Returns a copy of `meta` with the framework-owned ref keys stripped.
- * Used by {@link annotateMessagesForLLM} so the projected ToolMessage
- * does not round-trip the metadata back into state with annotation
- * already applied. Returns `undefined` when no other keys remain.
- */
-function stripRefMetadata(
-  meta: (ToolMessageRefMetadata & Record<string, unknown>) | undefined
-): Record<string, unknown> | undefined {
-  if (meta == null) return undefined;
-  const rest: Record<string, unknown> = {};
-  let hasOther = false;
-  for (const [k, v] of Object.entries(meta)) {
-    if (k === '_refKey' || k === '_unresolvedRefs') continue;
-    rest[k] = v;
-    hasOther = true;
-  }
-  return hasOther ? rest : undefined;
+  return out ?? messages;
 }
