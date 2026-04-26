@@ -5,6 +5,7 @@ import type { ToolCall } from '@langchain/core/messages/tool';
 import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
 import { manualToolStreamProviders } from '@/llm/providers';
+import { annotateMessagesForLLM } from '@/tools/toolOutputReferences';
 import { modifyDeltaProperties } from '@/messages';
 import { ChatModelStreamHandler } from '@/stream';
 import { GraphEvents, Providers } from '@/common';
@@ -13,6 +14,15 @@ import { initializeModel } from '@/llm/init';
 /**
  * Context passed to `attemptInvoke` for the default stream handler.
  * Matches the subset of Graph that `ChatModelStreamHandler.handle` needs.
+ *
+ * `attemptInvoke` additionally calls `context?.getOrCreateToolOutputRegistry?.()`
+ * (if defined) to pull the run-scoped tool output registry off the graph
+ * so it can project each relevant `ToolMessage` into a transient
+ * annotated copy right before sending to the provider — annotations
+ * never persist back into graph state.
+ *
+ * Callers without a registry (e.g. summarization) simply pass no
+ * `context` and the transform safely no-ops.
  */
 export type InvokeContext = Parameters<ChatModelStreamHandler['handle']>[3];
 
@@ -47,8 +57,19 @@ export async function attemptInvoke(
   },
   config?: RunnableConfig
 ): Promise<Partial<t.BaseGraphState>> {
+  /**
+   * Pull the run-scoped tool output registry off the graph (when one
+   * exists) and project ToolMessages carrying ref metadata into a
+   * transient annotated copy. The original `messages` array stays
+   * untouched so the graph state never sees `[ref: …]` / `_ref`
+   * payload.
+   */
+  const registry = context?.getOrCreateToolOutputRegistry();
+  const runId = config?.configurable?.run_id as string | undefined;
+  const messagesForProvider = annotateMessagesForLLM(messages, registry, runId);
+
   if (model.stream) {
-    const stream = await model.stream(messages, config);
+    const stream = await model.stream(messagesForProvider, config);
     let finalChunk: AIMessageChunk | undefined;
 
     if (onChunk) {
@@ -83,7 +104,7 @@ export async function attemptInvoke(
     return { messages: [finalChunk as AIMessageChunk] };
   }
 
-  const finalMessage = await model.invoke(messages, config);
+  const finalMessage = await model.invoke(messagesForProvider, config);
   if ((finalMessage.tool_calls?.length ?? 0) > 0) {
     finalMessage.tool_calls = finalMessage.tool_calls?.filter(
       (tool_call: ToolCall) => !!tool_call.name

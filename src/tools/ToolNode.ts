@@ -36,7 +36,6 @@ import { executeHooks } from '@/hooks';
 import { Constants, GraphEvents, CODE_EXECUTION_TOOLS } from '@/common';
 import {
   buildReferenceKey,
-  annotateToolOutputWithReference,
   ToolOutputReferenceRegistry,
 } from '@/tools/toolOutputReferences';
 
@@ -429,21 +428,17 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         const isError = toolMsg.status === 'error';
         if (isError) {
           /**
-           * Error ToolMessages bypass registration/annotation but must
-           * still carry the unresolved-refs hint so the LLM can
-           * self-correct when its reference key caused the failure.
+           * Error ToolMessages bypass registration but still stamp the
+           * unresolved-refs hint into `additional_kwargs` so the lazy
+           * annotation transform surfaces it to the LLM, letting the
+           * model self-correct when its reference key caused the
+           * failure. Persisted `content` stays clean.
            */
-          if (
-            unresolvedRefs.length > 0 &&
-            typeof toolMsg.content === 'string'
-          ) {
-            toolMsg.content = this.applyOutputReference(
-              runId,
-              toolMsg.content,
-              toolMsg.content,
-              undefined,
-              unresolvedRefs
-            );
+          if (unresolvedRefs.length > 0) {
+            toolMsg.additional_kwargs = {
+              ...toolMsg.additional_kwargs,
+              _unresolvedRefs: unresolvedRefs,
+            };
           }
           return toolMsg;
         }
@@ -454,35 +449,35 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               rawContent,
               this.maxToolResultChars
             );
-            toolMsg.content = this.applyOutputReference(
+            toolMsg.content = llmContent;
+            const refMeta = this.recordOutputReference(
               runId,
-              llmContent,
               rawContent,
               refKey,
               unresolvedRefs
             );
+            if (refMeta != null) {
+              toolMsg.additional_kwargs = {
+                ...toolMsg.additional_kwargs,
+                ...refMeta,
+              };
+            }
           } else {
             /**
              * Non-string content (multi-part content blocks — text +
              * image). Known limitation: we cannot register under a
              * reference key because there's no canonical serialized
              * form. Warn once per tool per run when the caller
-             * intended to register.
-             *
-             * Still surface unresolved-ref warnings so the LLM gets
-             * the self-correction signal that the string and error
-             * paths already emit. Prepended as a leading text block
-             * to keep the original content ordering intact.
+             * intended to register. The unresolved-refs hint is still
+             * stamped as metadata; the lazy transform prepends a text
+             * block at request time so the LLM gets the self-correction
+             * signal.
              */
-            if (unresolvedRefs.length > 0 && Array.isArray(toolMsg.content)) {
-              const warningBlock = {
-                type: 'text',
-                text: `[unresolved refs: ${unresolvedRefs.join(', ')}]`,
+            if (unresolvedRefs.length > 0) {
+              toolMsg.additional_kwargs = {
+                ...toolMsg.additional_kwargs,
+                _unresolvedRefs: unresolvedRefs,
               };
-              toolMsg.content = [
-                warningBlock,
-                ...toolMsg.content,
-              ] as typeof toolMsg.content;
             }
             if (
               refKey != null &&
@@ -504,9 +499,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         rawContent,
         this.maxToolResultChars
       );
-      const content = this.applyOutputReference(
+      const refMeta = this.recordOutputReference(
         runId,
-        truncated,
         rawContent,
         refKey,
         unresolvedRefs
@@ -514,8 +508,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       return new ToolMessage({
         status: 'success',
         name: tool.name,
-        content,
+        content: truncated,
         tool_call_id: call.id!,
+        ...(refMeta != null && {
+          additional_kwargs: refMeta as Record<string, unknown>,
+        }),
       });
     } catch (_e: unknown) {
       const e = _e as Error;
@@ -561,64 +558,61 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           });
         }
       }
-      let errorContent = `Error: ${e.message}\n Please fix your mistakes.`;
-      if (unresolvedRefs.length > 0) {
-        errorContent = this.applyOutputReference(
-          runId,
-          errorContent,
-          errorContent,
-          undefined,
-          unresolvedRefs
-        );
-      }
+      const errorContent = `Error: ${e.message}\n Please fix your mistakes.`;
+      const refMeta =
+        unresolvedRefs.length > 0
+          ? this.recordOutputReference(
+            runId,
+            errorContent,
+            undefined,
+            unresolvedRefs
+          )
+          : undefined;
       return new ToolMessage({
         status: 'error',
         content: errorContent,
         name: call.name,
         tool_call_id: call.id ?? '',
+        ...(refMeta != null && {
+          additional_kwargs: refMeta as Record<string, unknown>,
+        }),
       });
     }
   }
 
   /**
-   * Finalizes the LLM-visible content for a tool call and (when a
-   * `refKey` is provided) registers the full, raw output under that
-   * key.
+   * Registers the full, raw output under `refKey` (when provided) and
+   * builds the per-message ref metadata stamped onto the resulting
+   * `ToolMessage.additional_kwargs`. The metadata is read at LLM-
+   * request time by `annotateMessagesForLLM` to produce a transient
+   * annotated copy of the message — the persisted `content` itself
+   * stays clean.
    *
-   * @param llmContent  The content string the LLM will see. This is
-   *   the already-truncated, post-hook view; the annotation is
-   *   applied on top of it.
    * @param registryContent  The full, untruncated output to store in
    *   the registry so `{{tool<i>turn<n>}}` substitutions deliver the
    *   complete payload. Ignored when `refKey` is undefined.
    * @param refKey  Precomputed `tool<i>turn<n>` key, or undefined when
    *   the output is not to be registered (errors, disabled feature,
    *   unavailable batch/turn).
-   * @param unresolved  Placeholder keys that did not resolve; appended
-   *   as `[unresolved refs: …]` so the LLM can self-correct.
-   *
-   * `refKey` is passed in (rather than built from `this.currentTurn`)
-   * so parallel `invoke()` calls on the same ToolNode cannot race on
-   * the shared turn field.
+   * @param unresolved  Placeholder keys that did not resolve; surfaced
+   *   to the LLM lazily so it can self-correct.
+   * @returns A `ToolMessageRefMetadata` object when there is anything
+   *   to stamp, otherwise `undefined`.
    */
-  private applyOutputReference(
+  private recordOutputReference(
     runId: string | undefined,
-    llmContent: string,
     registryContent: string,
     refKey: string | undefined,
     unresolved: string[]
-  ): string {
+  ): t.ToolMessageRefMetadata | undefined {
     if (this.toolOutputRegistry != null && refKey != null) {
       this.toolOutputRegistry.set(runId, refKey, registryContent);
     }
-    /**
-     * `annotateToolOutputWithReference` handles both the ref-key and
-     * unresolved-refs cases together so JSON-object outputs stay
-     * parseable: unresolved refs land in an `_unresolved_refs` field
-     * instead of as a trailing text line that would break
-     * `JSON.parse` for downstream consumers.
-     */
-    return annotateToolOutputWithReference(llmContent, refKey, unresolved);
+    if (refKey == null && unresolved.length === 0) return undefined;
+    const meta: t.ToolMessageRefMetadata = {};
+    if (refKey != null) meta._refKey = refKey;
+    if (unresolved.length > 0) meta._unresolvedRefs = unresolved;
+    return meta;
   }
 
   /**
@@ -1054,25 +1048,30 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         if (result.status === 'error') {
           contentString = `Error: ${result.errorMessage ?? 'Unknown error'}\n Please fix your mistakes.`;
           /**
-           * Error results bypass registration/annotation but must still
-           * carry the unresolved-refs hint so the LLM can self-correct
-           * when its reference key caused the failure.
+           * Error results bypass registration but stamp the
+           * unresolved-refs hint into `additional_kwargs` so the lazy
+           * annotation transform surfaces it to the LLM at request
+           * time, letting the model self-correct when its reference
+           * key caused the failure. Persisted `content` stays clean.
            */
           const unresolved = unresolvedByCallId.get(result.toolCallId) ?? [];
-          if (unresolved.length > 0) {
-            contentString = this.applyOutputReference(
-              registryRunId,
-              contentString,
-              contentString,
-              undefined,
-              unresolved
-            );
-          }
+          const errorRefMeta =
+            unresolved.length > 0
+              ? this.recordOutputReference(
+                registryRunId,
+                contentString,
+                undefined,
+                unresolved
+              )
+              : undefined;
           toolMessage = new ToolMessage({
             status: 'error',
             content: contentString,
             name: toolName,
             tool_call_id: result.toolCallId,
+            ...(errorRefMeta != null && {
+              additional_kwargs: errorRefMeta as Record<string, unknown>,
+            }),
           });
 
           if (hasFailureHook) {
@@ -1145,9 +1144,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             turn != null
               ? buildReferenceKey(batchIndex, turn)
               : undefined;
-          contentString = this.applyOutputReference(
+          const successRefMeta = this.recordOutputReference(
             registryRunId,
-            contentString,
             registryRaw,
             refKey,
             unresolved
@@ -1159,6 +1157,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             content: contentString,
             artifact: result.artifact,
             tool_call_id: result.toolCallId,
+            ...(successRefMeta != null && {
+              additional_kwargs: successRefMeta as Record<string, unknown>,
+            }),
           });
         }
 

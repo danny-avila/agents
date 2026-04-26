@@ -22,6 +22,9 @@
  * complete, verbatim output with no injected fields.
  */
 
+import { ToolMessage } from '@langchain/core/messages';
+import type { BaseMessage } from '@langchain/core/messages';
+import type { ToolMessageRefMetadata } from '@/types/messages';
 import {
   calculateMaxTotalToolOutputSize,
   HARD_MAX_TOOL_RESULT_CHARS,
@@ -241,6 +244,16 @@ export class ToolOutputReferenceRegistry {
   /** Returns the stored value for `key` in `runId`'s bucket, or `undefined`. */
   get(runId: string | undefined, key: string): string | undefined {
     return this.runStates.get(this.keyFor(runId))?.entries.get(key);
+  }
+
+  /**
+   * Returns `true` when `key` is currently stored in `runId`'s bucket.
+   * Used by {@link annotateMessagesForLLM} to gate transient annotation
+   * on whether the registry still owns the referenced output (a stale
+   * `_refKey` from a prior run silently no-ops here).
+   */
+  has(runId: string | undefined, key: string): boolean {
+    return this.runStates.get(this.keyFor(runId))?.entries.has(key) ?? false;
   }
 
   /** Total number of registered outputs across every run bucket. */
@@ -587,4 +600,107 @@ function arraysShallowEqual(a: unknown, b: readonly string[]): boolean {
     }
   }
   return true;
+}
+
+/**
+ * Lazy projection that, given a registry and a runId, returns a new
+ * `messages` array where each `ToolMessage` carrying a live `_refKey`
+ * (and/or unresolved-ref metadata) has its `content` annotated for the
+ * LLM. The original input array and its messages are never mutated.
+ *
+ * Annotation is gated on registry presence: a stale `_refKey` from a
+ * prior run (e.g. one that survived in persisted history) silently
+ * no-ops, exactly matching the "refs are run-scoped" mental model.
+ * `_unresolvedRefs` is always meaningful and is not gated.
+ *
+ * When neither a registry nor any ToolMessage in the batch carries
+ * relevant metadata, the input array is returned unchanged (reference-
+ * equal) so the common case is allocation-free.
+ */
+export function annotateMessagesForLLM(
+  messages: BaseMessage[],
+  registry: ToolOutputReferenceRegistry | undefined,
+  runId: string | undefined
+): BaseMessage[] {
+  if (registry == null) return messages;
+
+  const out = messages.map((m) => {
+    if (m._getType() !== 'tool') return m;
+    const meta = m.additional_kwargs as
+      | (ToolMessageRefMetadata & Record<string, unknown>)
+      | undefined;
+    const refKey = meta?._refKey;
+    const unresolved = meta?._unresolvedRefs ?? [];
+    if (refKey == null && unresolved.length === 0) return m;
+
+    const liveRef =
+      refKey != null && registry.has(runId, refKey) ? refKey : undefined;
+
+    if (liveRef == null && unresolved.length === 0) return m;
+
+    const tm = m as ToolMessage;
+    const cleanedKwargs = stripRefMetadata(meta);
+    if (typeof tm.content === 'string') {
+      const annotated = annotateToolOutputWithReference(
+        tm.content,
+        liveRef,
+        unresolved
+      );
+      return new ToolMessage({
+        id: tm.id,
+        name: tm.name,
+        status: tm.status,
+        artifact: tm.artifact,
+        tool_call_id: tm.tool_call_id,
+        response_metadata: tm.response_metadata,
+        additional_kwargs: cleanedKwargs,
+        content: annotated,
+      });
+    }
+    if (Array.isArray(tm.content) && unresolved.length > 0) {
+      const warningBlock = {
+        type: 'text' as const,
+        text: `[unresolved refs: ${unresolved.join(', ')}]`,
+      };
+      return new ToolMessage({
+        id: tm.id,
+        name: tm.name,
+        status: tm.status,
+        artifact: tm.artifact,
+        tool_call_id: tm.tool_call_id,
+        response_metadata: tm.response_metadata,
+        additional_kwargs: cleanedKwargs,
+        content: [
+          warningBlock,
+          ...tm.content,
+        ] as unknown as ToolMessage['content'],
+      });
+    }
+    return m;
+  });
+
+  for (let i = 0; i < out.length; i++) {
+    if (out[i] !== messages[i]) return out;
+  }
+  return messages;
+}
+
+/**
+ * Returns a copy of `meta` with the framework-owned ref keys stripped.
+ * Used by {@link annotateMessagesForLLM} so the projected ToolMessage
+ * does not round-trip the metadata back into state with annotation
+ * already applied. Returns `undefined` when no other keys remain.
+ */
+function stripRefMetadata(
+  meta: (ToolMessageRefMetadata & Record<string, unknown>) | undefined
+): Record<string, unknown> | undefined {
+  if (meta == null) return undefined;
+  const rest: Record<string, unknown> = {};
+  let hasOther = false;
+  for (const [k, v] of Object.entries(meta)) {
+    if (k === '_refKey' || k === '_unresolvedRefs') continue;
+    rest[k] = v;
+    hasOther = true;
+  }
+  return hasOther ? rest : undefined;
 }
