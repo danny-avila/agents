@@ -18,6 +18,10 @@ import { ToolOutputReferenceRegistry } from '../toolOutputReferences';
 function getRefKey(msg: ToolMessage): string | undefined {
   return (msg.additional_kwargs as { _refKey?: string } | undefined)?._refKey;
 }
+function getRefScope(msg: ToolMessage): string | undefined {
+  return (msg.additional_kwargs as { _refScope?: string } | undefined)
+    ?._refScope;
+}
 function getUnresolvedRefs(msg: ToolMessage): string[] {
   return (
     (msg.additional_kwargs as { _unresolvedRefs?: string[] } | undefined)
@@ -127,6 +131,13 @@ describe('ToolNode tool output references', () => {
 
       expect(msg.content).toBe('hello world');
       expect(getRefKey(msg)).toBe('tool0turn0');
+      /**
+       * `_refScope` is what lets `annotateMessagesForLLM` recover the
+       * registry bucket at request time without re-deriving it from
+       * `config.configurable.run_id` (which fails for anonymous
+       * batches). For named runs it equals the run_id.
+       */
+      expect(getRefScope(msg)).toBe('test-run');
       expect(getUnresolvedRefs(msg)).toEqual([]);
     });
 
@@ -611,6 +622,19 @@ describe('ToolNode tool output references', () => {
       expect(resA.messages[0].content).toBe('out-A');
       expect(getRefKey(resB.messages[0])).toBe('tool0turn0');
       expect(resB.messages[0].content).toBe('out-B');
+
+      /**
+       * Each anonymous invocation stamps a distinct synthetic
+       * `_refScope` so the lazy annotation transform can later look
+       * up the right registry bucket — `config.configurable.run_id`
+       * is undefined for both calls and would collapse them to the
+       * same `\0anon` bucket without this stamping.
+       */
+      const scopeA = getRefScope(resA.messages[0]);
+      const scopeB = getRefScope(resB.messages[0]);
+      expect(scopeA).toMatch(/^\0anon-\d+$/);
+      expect(scopeB).toMatch(/^\0anon-\d+$/);
+      expect(scopeA).not.toBe(scopeB);
     });
 
     it('clears state on every batch when run_id is absent (anonymous caller)', async () => {

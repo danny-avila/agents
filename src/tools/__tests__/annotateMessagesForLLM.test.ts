@@ -196,7 +196,13 @@ describe('annotateMessagesForLLM', () => {
     expect(tm.additional_kwargs._refScope).toBe('r1');
   });
 
-  it('drops additional_kwargs entirely when only framework keys were present', () => {
+  it('leaves additional_kwargs empty when stripping removed every framework key', () => {
+    /**
+     * `stripFrameworkRefMetadata` returns `undefined` when no non-
+     * framework keys remain, and the LangChain `ToolMessage`
+     * constructor normalizes that to `{}` — so the projected message
+     * exposes an empty object, not the original kwargs.
+     */
     const registry = new ToolOutputReferenceRegistry();
     registry.set('r1', 'tool0turn0', 'raw');
     const tm = makeToolMessage({
