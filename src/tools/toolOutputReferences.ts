@@ -642,16 +642,19 @@ export function annotateMessagesForLLM(
     /**
      * `additional_kwargs` is untyped at the LangChain layer
      * (`Record<string, unknown>`), so persisted or client-supplied
-     * ToolMessages can carry arbitrary shapes under our framework
-     * keys. Treat them as untrusted input and coerce defensively
-     * before any array operation — a malformed field on a single
-     * hydrated message must not crash `attemptInvoke` before the
-     * provider call.
+     * ToolMessages can carry arbitrary shapes — including primitives
+     * (a malformed serializer might write a string, or `null`).
+     * Guard with a runtime object check before the `in` probes
+     * because the `in` operator throws `TypeError` on primitives.
+     * A single malformed message must never crash the provider call
+     * path; skip its annotation/strip and continue.
      */
-    const meta = m.additional_kwargs as Record<string, unknown> | undefined;
-    const hasRefKey = meta != null && '_refKey' in meta;
-    const hasRefScope = meta != null && '_refScope' in meta;
-    const hasUnresolvedField = meta != null && '_unresolvedRefs' in meta;
+    const rawMeta = m.additional_kwargs as unknown;
+    if (rawMeta == null || typeof rawMeta !== 'object') continue;
+    const meta = rawMeta as Record<string, unknown>;
+    const hasRefKey = '_refKey' in meta;
+    const hasRefScope = '_refScope' in meta;
+    const hasUnresolvedField = '_unresolvedRefs' in meta;
     if (!hasRefKey && !hasRefScope && !hasUnresolvedField) continue;
 
     const refKey = readRefKey(meta);

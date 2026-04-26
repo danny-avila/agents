@@ -404,6 +404,39 @@ describe('annotateMessagesForLLM', () => {
     expect((out[0] as ToolMessage).additional_kwargs._refKey).toBeUndefined();
   });
 
+  it('skips a ToolMessage whose additional_kwargs is a primitive without throwing', () => {
+    /**
+     * The `in` operator throws `TypeError` on primitives, so without
+     * a runtime object guard, a hydrated ToolMessage carrying e.g.
+     * `additional_kwargs: 'not-an-object'` (from a buggy serializer)
+     * would crash `attemptInvoke` before the provider call. Verify
+     * we skip that message and process subsequent live-ref messages
+     * normally.
+     */
+    const registry = new ToolOutputReferenceRegistry();
+    registry.set('r1', 'tool0turn0', 'raw');
+
+    const malformed = new ToolMessage({
+      name: 'echo',
+      tool_call_id: 'mal',
+      status: 'success',
+      content: 'malformed-output',
+    });
+    /* Force a primitive past LangChain's typed setter via a cast. */
+    (malformed as unknown as { additional_kwargs: unknown }).additional_kwargs =
+      'not-an-object' as unknown;
+
+    const live = makeToolMessage({
+      content: 'live-output',
+      additional_kwargs: { _refKey: 'tool0turn0' },
+    });
+
+    const out = annotateMessagesForLLM([malformed, live], registry, 'r1');
+    /* Malformed message passes through unchanged; live ref still annotates. */
+    expect(out[0]).toBe(malformed);
+    expect(out[1].content).toBe('[ref: tool0turn0]\nlive-output');
+  });
+
   it('treats stale _refKey but live unresolved as unresolved-only', () => {
     const registry = new ToolOutputReferenceRegistry();
     const tm = makeToolMessage({
