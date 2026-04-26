@@ -114,6 +114,18 @@ describe('ToolOutputReferenceRegistry', () => {
       // Per-output is also bound by the same effective total.
       expect(reg.perOutputLimit).toBeLessThanOrEqual(5_000_000);
     });
+
+    it('evicts the oldest run bucket when maxActiveRuns is exceeded', () => {
+      const reg = new ToolOutputReferenceRegistry({ maxActiveRuns: 2 });
+      reg.set('run-A', 'tool0turn0', 'A');
+      reg.set('run-B', 'tool0turn0', 'B');
+      reg.set('run-C', 'tool0turn0', 'C');
+      // run-A was the oldest insertion; LRU evicted it when run-C
+      // pushed the bucket count above the cap.
+      expect(reg.get('run-A', 'tool0turn0')).toBeUndefined();
+      expect(reg.get('run-B', 'tool0turn0')).toBe('B');
+      expect(reg.get('run-C', 'tool0turn0')).toBe('C');
+    });
   });
 
   describe('resolve', () => {
@@ -183,6 +195,33 @@ describe('ToolOutputReferenceRegistry', () => {
         note: null,
       });
       expect(resolved).toEqual({ count: 3, enabled: true, note: null });
+    });
+  });
+
+  describe('snapshot', () => {
+    it('resolves against the captured state and ignores later mutations', () => {
+      const reg = new ToolOutputReferenceRegistry();
+      reg.set('r', 'tool0turn0', 'OLD');
+      const view = reg.snapshot('r');
+      // Mutate after taking the snapshot.
+      reg.set('r', 'tool0turn0', 'NEW');
+      reg.set('r', 'tool1turn0', 'LATER');
+      // Snapshot still resolves to the captured value and treats
+      // post-snapshot additions as unresolved.
+      expect(view.resolve('echo {{tool0turn0}}').resolved).toBe('echo OLD');
+      const { resolved, unresolved } = view.resolve('see {{tool1turn0}}');
+      expect(resolved).toBe('see {{tool1turn0}}');
+      expect(unresolved).toEqual(['tool1turn0']);
+    });
+
+    it('returns an isolated view per snapshot call', () => {
+      const reg = new ToolOutputReferenceRegistry();
+      reg.set('r', 'tool0turn0', 'A');
+      const view1 = reg.snapshot('r');
+      reg.set('r', 'tool0turn0', 'B');
+      const view2 = reg.snapshot('r');
+      expect(view1.resolve('{{tool0turn0}}').resolved).toBe('A');
+      expect(view2.resolve('{{tool0turn0}}').resolved).toBe('B');
     });
   });
 

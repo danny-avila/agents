@@ -80,6 +80,18 @@ export type ResolveResult<T> = {
 };
 
 /**
+ * Read-only view over a frozen registry snapshot. Returned by
+ * {@link ToolOutputReferenceRegistry.snapshot} for callers that need
+ * to resolve placeholders against the registry state at a specific
+ * point in time, ignoring any subsequent registrations.
+ */
+export interface ToolOutputResolveView {
+  resolve<T>(args: T): ResolveResult<T>;
+}
+
+const EMPTY_ENTRIES: ReadonlyMap<string, string> = new Map<string, string>();
+
+/**
  * Per-run state bucket held inside the registry. Each distinct
  * `run_id` gets its own bucket so overlapping concurrent runs on a
  * shared registry cannot leak outputs, turn counters, or warn-memos
@@ -295,27 +307,59 @@ export class ToolOutputReferenceRegistry {
       return { resolved: args, unresolved: [] };
     }
     const bucket = this.runStates.get(this.keyFor(runId));
+    return this.resolveAgainst(bucket?.entries ?? EMPTY_ENTRIES, args);
+  }
+
+  /**
+   * Captures a frozen snapshot of `runId`'s current entries and
+   * returns a view that resolves placeholders against *only* that
+   * snapshot. The snapshot is decoupled from the live registry, so
+   * subsequent `set()` calls (for example, same-turn direct outputs
+   * registering while an event branch is still in flight) are
+   * invisible to the snapshot's `resolve`. Used by the mixed
+   * direct+event dispatch path to preserve same-turn isolation when
+   * a `PreToolUse` hook rewrites event args after directs have
+   * completed.
+   */
+  snapshot(runId: string | undefined): ToolOutputResolveView {
+    const bucket = this.runStates.get(this.keyFor(runId));
+    const entries: ReadonlyMap<string, string> = bucket
+      ? new Map(bucket.entries)
+      : EMPTY_ENTRIES;
+    return {
+      resolve: <T>(args: T): ResolveResult<T> =>
+        this.resolveAgainst(entries, args),
+    };
+  }
+
+  private resolveAgainst<T>(
+    entries: ReadonlyMap<string, string>,
+    args: T
+  ): ResolveResult<T> {
+    if (!hasAnyPlaceholder(args)) {
+      return { resolved: args, unresolved: [] };
+    }
     const unresolved = new Set<string>();
-    const resolved = this.transform(bucket, args, unresolved) as T;
+    const resolved = this.transform(entries, args, unresolved) as T;
     return { resolved, unresolved: Array.from(unresolved) };
   }
 
   private transform(
-    bucket: RunStateBucket | undefined,
+    entries: ReadonlyMap<string, string>,
     value: unknown,
     unresolved: Set<string>
   ): unknown {
     if (typeof value === 'string') {
-      return this.replaceInString(bucket, value, unresolved);
+      return this.replaceInString(entries, value, unresolved);
     }
     if (Array.isArray(value)) {
-      return value.map((item) => this.transform(bucket, item, unresolved));
+      return value.map((item) => this.transform(entries, item, unresolved));
     }
     if (value !== null && typeof value === 'object') {
       const source = value as Record<string, unknown>;
       const next: Record<string, unknown> = {};
       for (const [key, item] of Object.entries(source)) {
-        next[key] = this.transform(bucket, item, unresolved);
+        next[key] = this.transform(entries, item, unresolved);
       }
       return next;
     }
@@ -323,7 +367,7 @@ export class ToolOutputReferenceRegistry {
   }
 
   private replaceInString(
-    bucket: RunStateBucket | undefined,
+    entries: ReadonlyMap<string, string>,
     input: string,
     unresolved: Set<string>
   ): string {
@@ -333,7 +377,7 @@ export class ToolOutputReferenceRegistry {
     return input.replace(
       ToolOutputReferenceRegistry.PLACEHOLDER_MATCHER,
       (match, key: string) => {
-        const stored = bucket?.entries.get(key);
+        const stored = entries.get(key);
         if (stored == null) {
           unresolved.add(key);
           return match;

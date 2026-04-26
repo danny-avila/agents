@@ -1103,6 +1103,99 @@ describe('ToolNode tool output references', () => {
       expect(hostCalled).toBe(false);
     });
 
+    it('isolates PreToolUse-injected refs from same-turn direct outputs in the mixed path', async () => {
+      // PreToolUse hook rewrites the event call's args to include
+      // `{{tool0turn0}}`. In the mixed direct+event path that
+      // placeholder must NOT resolve to the same-turn direct
+      // output that just registered — it should be reported as
+      // unresolved (matching cross-batch resolution semantics).
+      const directCapturedArgs: string[] = [];
+      const directTool = createEchoTool({
+        capturedArgs: directCapturedArgs,
+        outputs: ['direct-same-turn'],
+        name: 'directTool',
+      });
+      const eventStub = tool(async () => 'unused', {
+        name: 'eventTool',
+        description: 'schema-only stub',
+        schema: z.object({ command: z.string() }),
+      }) as unknown as StructuredToolInterface;
+
+      const hooks = new HookRegistry();
+      hooks.register('PreToolUse', {
+        pattern: 'eventTool',
+        hooks: [
+          async (): Promise<{ updatedInput: { command: string } }> => ({
+            updatedInput: { command: 'see {{tool0turn0}}' },
+          }),
+        ],
+      });
+
+      const hostCapturedArgs: Record<string, unknown>[] = [];
+      jest
+        .spyOn(events, 'safeDispatchCustomEvent')
+        .mockImplementation(async (event, data) => {
+          if (event !== 'on_tool_execute') {
+            return;
+          }
+          const batch = data as t.ToolExecuteBatchRequest;
+          for (const req of batch.toolCalls) {
+            hostCapturedArgs.push(req.args);
+          }
+          batch.resolve(
+            batch.toolCalls.map((req) => ({
+              toolCallId: req.id,
+              content: 'event-out',
+              status: 'success' as const,
+            }))
+          );
+        });
+
+      const node = new ToolNode({
+        tools: [directTool, eventStub],
+        eventDrivenMode: true,
+        agentId: 'agent-snap',
+        directToolNames: new Set(['directTool']),
+        toolCallStepIds: new Map([
+          ['d1', 'step_d1'],
+          ['e1', 'step_e1'],
+        ]),
+        hookRegistry: hooks,
+        toolOutputReferences: { enabled: true },
+      });
+
+      await node.invoke(
+        {
+          messages: [
+            new AIMessage({
+              content: '',
+              tool_calls: [
+                {
+                  id: 'd1',
+                  name: 'directTool',
+                  args: { command: 'first' },
+                },
+                {
+                  id: 'e1',
+                  name: 'eventTool',
+                  args: { command: 'orig' },
+                },
+              ],
+            }),
+          ],
+        },
+        { configurable: { run_id: 'snap-run' } }
+      );
+
+      // Hook injected `{{tool0turn0}}`. The direct tool registered
+      // `tool0turn0` in the same batch, but the snapshot was taken
+      // pre-direct so the placeholder must remain unresolved.
+      expect(hostCapturedArgs).toHaveLength(1);
+      expect(hostCapturedArgs[0]).toEqual({
+        command: 'see {{tool0turn0}}',
+      });
+    });
+
     it('keeps same-turn refs isolated in the mixed direct+event path', async () => {
       // Build a ToolNode with both a direct tool (via directToolNames)
       // and an event-driven schema stub. Share one registry across
