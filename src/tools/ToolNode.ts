@@ -19,8 +19,13 @@ import type {
 } from '@langchain/core/runnables';
 import type { BaseMessage, AIMessage } from '@langchain/core/messages';
 import type { StructuredToolInterface } from '@langchain/core/tools';
-import type * as t from '@/types';
+import type {
+  ToolOutputResolveView,
+  PreResolvedArgsMap,
+  ResolvedArgsByCallId,
+} from '@/tools/toolOutputReferences';
 import type { HookRegistry, AggregatedHookResult } from '@/hooks';
+import type * as t from '@/types';
 import { RunnableCallable } from '@/utils';
 import {
   calculateMaxToolResultChars,
@@ -34,7 +39,49 @@ import {
   annotateToolOutputWithReference,
   ToolOutputReferenceRegistry,
 } from '@/tools/toolOutputReferences';
-import type { ToolOutputResolveView } from '@/tools/toolOutputReferences';
+
+/**
+ * Per-call batch context for `runTool`. Bundles every optional
+ * batch-scoped value the method needs so the signature stays at
+ * three positional parameters even as new context fields are added.
+ */
+type RunToolBatchContext = {
+  /** Position of this call within the parent ToolNode batch. */
+  batchIndex?: number;
+  /** Batch turn shared across every call in the batch. */
+  turn?: number;
+  /** Registry partition scope (run id or anonymous batch id). */
+  batchScopeId?: string;
+  /** Batch-local sink for post-substitution args. */
+  resolvedArgsByCallId?: ResolvedArgsByCallId;
+};
+
+/**
+ * Per-batch context for `dispatchToolEvents` / `executeViaEvent`.
+ * Mirrors {@link RunToolBatchContext} for the event-driven path,
+ * with bulk indices and the snapshot/pre-resolved-args carriers
+ * used in the mixed direct+event flow.
+ */
+type DispatchBatchContext = {
+  /** Per-call batch indices, parallel to the `toolCalls` array. */
+  batchIndices?: number[];
+  /** Batch turn shared across every call in the batch. */
+  turn?: number;
+  /** Registry partition scope (run id or anonymous batch id). */
+  batchScopeId?: string;
+  /**
+   * Pre-resolved args keyed by `toolCallId`. Populated by the mixed
+   * path so event calls don't re-resolve against a registry that
+   * already contains same-turn direct outputs.
+   */
+  preResolvedArgs?: PreResolvedArgsMap;
+  /**
+   * Frozen pre-batch registry view used to re-resolve placeholders
+   * a `PreToolUse` hook injects via `updatedInput` — preserves the
+   * same-turn isolation guarantee for hook-rewritten args.
+   */
+  preBatchSnapshot?: ToolOutputResolveView;
+};
 
 /**
  * Helper to check if a value is a Send object
@@ -241,17 +288,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   protected async runTool(
     call: ToolCall,
     config: RunnableConfig,
-    batchIndex?: number,
-    turn?: number,
-    batchScopeId?: string,
-    /**
-     * Per-batch sink for resolved (post-substitution) args, keyed by
-     * `toolCallId`. Threaded as a local map (instead of instance
-     * state) so concurrent `run()` calls on the same ToolNode cannot
-     * race on a shared field — each batch has its own map.
-     */
-    resolvedArgsByCallId?: Map<string, Record<string, unknown>>
+    batchContext: RunToolBatchContext = {}
   ): Promise<BaseMessage | Command> {
+    const { batchIndex, turn, batchScopeId, resolvedArgsByCallId } =
+      batchContext;
     const tool = this.toolMap.get(call.name);
     const registry = this.toolOutputRegistry;
     /**
@@ -756,25 +796,15 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private async dispatchToolEvents(
     toolCalls: ToolCall[],
     config: RunnableConfig,
-    batchIndices?: number[],
-    turn?: number,
-    preResolvedArgs?: Map<
-      string,
-      { resolved: Record<string, unknown>; unresolved: string[] }
-    >,
-    batchScopeId?: string,
-    /**
-     * Frozen snapshot of the registry taken before any direct-branch
-     * registrations could land. Set by the mixed direct+event path so
-     * any `PreToolUse` hook that rewrites event args via
-     * `updatedInput` resolves new placeholders against the same
-     * pre-batch state — preserving same-turn isolation. When unset,
-     * re-resolution falls back to the live registry (correct for the
-     * pure-event path where no in-batch registrations have happened
-     * yet).
-     */
-    preBatchSnapshot?: ToolOutputResolveView
+    batchContext: DispatchBatchContext = {}
   ): Promise<{ toolMessages: ToolMessage[]; injected: BaseMessage[] }> {
+    const {
+      batchIndices,
+      turn,
+      batchScopeId,
+      preResolvedArgs,
+      preBatchSnapshot,
+    } = batchContext;
     const runId = (config.configurable?.run_id as string | undefined) ?? '';
     /**
      * Registry-facing scope id — prefers the caller-threaded
@@ -1231,18 +1261,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     config: RunnableConfig,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     input: any,
-    batchIndices?: number[],
-    turn?: number,
-    batchScopeId?: string
+    batchContext: DispatchBatchContext = {}
   ): Promise<T> {
     const { toolMessages, injected } = await this.dispatchToolEvents(
       toolCalls,
       config,
-      batchIndices,
-      turn,
-      undefined,
-      batchScopeId,
-      undefined
+      batchContext
     );
     const outputs: BaseMessage[] = [...toolMessages, ...injected];
     return (Array.isArray(input) ? outputs : { messages: outputs }) as T;
@@ -1276,24 +1300,19 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     if (this.isSendInput(input)) {
       const isDirectTool = this.directToolNames?.has(input.lg_tool_call.name);
       if (this.eventDrivenMode && isDirectTool !== true) {
-        return this.executeViaEvent(
-          [input.lg_tool_call],
-          config,
-          input,
-          [0],
-          turn,
-          batchScopeId
-        );
-      }
-      outputs = [
-        await this.runTool(
-          input.lg_tool_call,
-          config,
-          0,
+        return this.executeViaEvent([input.lg_tool_call], config, input, {
+          batchIndices: [0],
           turn,
           batchScopeId,
-          resolvedArgsByCallId
-        ),
+        });
+      }
+      outputs = [
+        await this.runTool(input.lg_tool_call, config, {
+          batchIndex: 0,
+          turn,
+          batchScopeId,
+          resolvedArgsByCallId,
+        }),
       ];
       this.handleRunToolCompletions(
         [input.lg_tool_call],
@@ -1362,14 +1381,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         const filteredIndices = filteredCalls.map((_, idx) => idx);
 
         if (!this.directToolNames || this.directToolNames.size === 0) {
-          return this.executeViaEvent(
-            filteredCalls,
-            config,
-            input,
-            filteredIndices,
+          return this.executeViaEvent(filteredCalls, config, input, {
+            batchIndices: filteredIndices,
             turn,
-            batchScopeId
-          );
+            batchScopeId,
+          });
         }
 
         const directEntries: Array<{ call: ToolCall; batchIndex: number }> = [];
@@ -1433,14 +1449,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           directCalls.length > 0
             ? await Promise.all(
               directCalls.map((call, i) =>
-                this.runTool(
-                  call,
-                  config,
-                  directIndices[i],
+                this.runTool(call, config, {
+                  batchIndex: directIndices[i],
                   turn,
                   batchScopeId,
-                  resolvedArgsByCallId
-                )
+                  resolvedArgsByCallId,
+                })
               )
             )
             : [];
@@ -1456,15 +1470,13 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
         const eventResult =
           eventCalls.length > 0
-            ? await this.dispatchToolEvents(
-              eventCalls,
-              config,
-              eventIndices,
+            ? await this.dispatchToolEvents(eventCalls, config, {
+              batchIndices: eventIndices,
               turn,
-              preResolvedEventArgs,
               batchScopeId,
-              preBatchSnapshot
-            )
+              preResolvedArgs: preResolvedEventArgs,
+              preBatchSnapshot,
+            })
             : {
               toolMessages: [] as ToolMessage[],
               injected: [] as BaseMessage[],
@@ -1478,14 +1490,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       } else {
         outputs = await Promise.all(
           filteredCalls.map((call, i) =>
-            this.runTool(
-              call,
-              config,
-              i,
+            this.runTool(call, config, {
+              batchIndex: i,
               turn,
               batchScopeId,
-              resolvedArgsByCallId
-            )
+              resolvedArgsByCallId,
+            })
           )
         );
         this.handleRunToolCompletions(

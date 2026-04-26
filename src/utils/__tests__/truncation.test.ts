@@ -4,7 +4,7 @@ import {
   HARD_MAX_TOTAL_TOOL_OUTPUT_SIZE,
   calculateMaxToolResultChars,
   calculateMaxTotalToolOutputSize,
-} from './truncation';
+} from '@/utils/truncation';
 
 describe('truncation helpers', () => {
   describe('calculateMaxToolResultChars', () => {

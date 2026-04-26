@@ -89,6 +89,24 @@ export interface ToolOutputResolveView {
   resolve<T>(args: T): ResolveResult<T>;
 }
 
+/**
+ * Pre-resolved arg map keyed by `toolCallId`. Used by the mixed
+ * direct+event dispatch path to feed event calls' resolved args
+ * (captured pre-batch) into the dispatcher without re-resolving
+ * against the now-stale live registry.
+ */
+export type PreResolvedArgsMap = Map<
+  string,
+  { resolved: Record<string, unknown>; unresolved: string[] }
+>;
+
+/**
+ * Per-call sink for resolved args, keyed by `toolCallId`. Threaded
+ * as a per-batch local map so concurrent `ToolNode.run()` calls do
+ * not race on shared sink state.
+ */
+export type ResolvedArgsByCallId = Map<string, Record<string, unknown>>;
+
 const EMPTY_ENTRIES: ReadonlyMap<string, string> = new Map<string, string>();
 
 /**

@@ -214,6 +214,14 @@ describe('ToolOutputReferenceRegistry', () => {
       expect(unresolved).toEqual(['tool1turn0']);
     });
 
+    it('returns an empty view for a runId with no bucket', () => {
+      const reg = new ToolOutputReferenceRegistry();
+      const view = reg.snapshot('never-touched');
+      const { resolved, unresolved } = view.resolve('see {{tool0turn0}}');
+      expect(resolved).toBe('see {{tool0turn0}}');
+      expect(unresolved).toEqual(['tool0turn0']);
+    });
+
     it('returns an isolated view per snapshot call', () => {
       const reg = new ToolOutputReferenceRegistry();
       reg.set('r', 'tool0turn0', 'A');
