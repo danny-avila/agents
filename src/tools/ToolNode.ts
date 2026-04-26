@@ -610,7 +610,19 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     }
     if (refKey == null && unresolved.length === 0) return undefined;
     const meta: t.ToolMessageRefMetadata = {};
-    if (refKey != null) meta._refKey = refKey;
+    if (refKey != null) {
+      meta._refKey = refKey;
+      /**
+       * Stamp the registry scope alongside the key so the lazy
+       * annotation transform can look up the right bucket. Anonymous
+       * invocations get a synthetic per-batch scope (`\0anon-<n>`)
+       * that `attemptInvoke` cannot derive from
+       * `config.configurable.run_id` — without this, anonymous-run
+       * refs would silently fail registry lookup and the LLM would
+       * never see `[ref: …]` markers for outputs that were registered.
+       */
+      if (runId != null) meta._refScope = runId;
+    }
     if (unresolved.length > 0) meta._unresolvedRefs = unresolved;
     return meta;
   }

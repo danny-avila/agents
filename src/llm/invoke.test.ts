@@ -235,6 +235,48 @@ describe('attemptInvoke applies lazy ref annotation', () => {
       'Error: bad ref\n[unresolved refs: tool9turn9]'
     );
   });
+
+  it('annotates refs registered under an anonymous-batch scope (no run_id)', async () => {
+    /**
+     * Regression: anonymous ToolNode invocations register refs under
+     * a synthetic per-batch scope (`\0anon-<n>`) that
+     * `config.configurable.run_id` cannot recover. The transform must
+     * read the message-stamped `_refScope` rather than relying on the
+     * config-derived runId, otherwise the registry lookup misses and
+     * the LLM never sees the `[ref: …]` marker.
+     */
+    const registry = new ToolOutputReferenceRegistry();
+    const anonScope = '\0anon-0';
+    registry.set(anonScope, 'tool0turn0', 'stored');
+
+    const context = {
+      getOrCreateToolOutputRegistry: () => registry,
+    } as unknown as Parameters<typeof attemptInvoke>[0]['context'];
+
+    const messages: BaseMessage[] = [
+      new ToolMessage({
+        name: 'echo',
+        tool_call_id: 'tc1',
+        status: 'success',
+        content: 'output',
+        additional_kwargs: {
+          _refKey: 'tool0turn0',
+          _refScope: anonScope,
+        },
+      }),
+    ];
+
+    const { invokeMessages, model } = buildCapturingModel();
+
+    await attemptInvoke({
+      model: model as t.ChatModel,
+      messages,
+      provider: Providers.ANTHROPIC,
+      context,
+    });
+
+    expect(invokeMessages[0][0].content).toBe('[ref: tool0turn0]\noutput');
+  });
 });
 
 describe('tryFallbackProviders applies the same lazy annotation transform', () => {

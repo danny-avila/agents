@@ -641,8 +641,17 @@ export function annotateMessagesForLLM(
     const unresolved = meta?._unresolvedRefs ?? [];
     if (refKey == null && unresolved.length === 0) continue;
 
+    /**
+     * Prefer the message-stamped `_refScope` for the registry lookup.
+     * For named runs it equals the current `runId`; for anonymous
+     * invocations it carries the per-batch synthetic scope minted by
+     * ToolNode (`\0anon-<n>`), which `runId` from config cannot
+     * recover. Falling back to `runId` keeps backward compatibility
+     * with messages stamped before this field existed.
+     */
+    const lookupScope = meta?._refScope ?? runId;
     const liveRef =
-      refKey != null && registry.has(runId, refKey) ? refKey : undefined;
+      refKey != null && registry.has(lookupScope, refKey) ? refKey : undefined;
     if (liveRef == null && unresolved.length === 0) continue;
 
     const tm = m as ToolMessage;

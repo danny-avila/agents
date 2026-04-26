@@ -16,6 +16,16 @@ export type AnthropicMessage = Anthropic.MessageParam;
 export interface ToolMessageRefMetadata {
   /** Key under which this message's untruncated output was registered. */
   _refKey?: string;
+  /**
+   * Registry bucket scope under which `_refKey` was stored. For named
+   * runs this equals `config.configurable.run_id`; for anonymous
+   * invocations (no `run_id`) ToolNode mints a per-batch synthetic
+   * scope (`\0anon-<n>`) so concurrent batches don't collide. Stamping
+   * the scope on the message itself lets `annotateMessagesForLLM`
+   * recover it without re-deriving from config — which is impossible
+   * for the anonymous case, since the scope is internal to ToolNode.
+   */
+  _refScope?: string;
   /** Placeholders the model used that could not be resolved this batch. */
   _unresolvedRefs?: string[];
 }

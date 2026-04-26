@@ -207,6 +207,39 @@ describe('annotateMessagesForLLM', () => {
     );
   });
 
+  it('uses _refScope for the registry lookup when present, ignoring runId', () => {
+    /**
+     * Anonymous ToolNode batches register under a synthetic scope
+     * (`\0anon-<n>`) that `config.configurable.run_id` cannot recover.
+     * The transform must follow the message-stamped `_refScope`
+     * instead of the config-derived runId.
+     */
+    const registry = new ToolOutputReferenceRegistry();
+    const anonScope = '\0anon-3';
+    registry.set(anonScope, 'tool0turn0', 'raw');
+
+    const tm = makeToolMessage({
+      content: 'output',
+      additional_kwargs: {
+        _refKey: 'tool0turn0',
+        _refScope: anonScope,
+      },
+    });
+    const out = annotateMessagesForLLM([tm], registry, undefined);
+    expect(out[0].content).toBe('[ref: tool0turn0]\noutput');
+  });
+
+  it('falls back to runId when _refScope is absent (legacy / pre-scope messages)', () => {
+    const registry = new ToolOutputReferenceRegistry();
+    registry.set('r1', 'tool0turn0', 'raw');
+    const tm = makeToolMessage({
+      content: 'output',
+      additional_kwargs: { _refKey: 'tool0turn0' },
+    });
+    const out = annotateMessagesForLLM([tm], registry, 'r1');
+    expect(out[0].content).toBe('[ref: tool0turn0]\noutput');
+  });
+
   it('treats stale _refKey but live unresolved as unresolved-only', () => {
     const registry = new ToolOutputReferenceRegistry();
     const tm = makeToolMessage({
