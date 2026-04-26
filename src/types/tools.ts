@@ -3,6 +3,7 @@ import type { StructuredToolInterface } from '@langchain/core/tools';
 import type { RunnableToolLike } from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type { HookRegistry } from '@/hooks';
+import type { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import type { MessageContentComplex, ToolErrorData } from './stream';
 
 /** Replacement type for `import type { ToolCall } from '@langchain/core/messages/tool'` in order to have stringified args typed */
@@ -62,6 +63,22 @@ export type ToolNodeOptions = {
    * When provided, takes precedence over the value computed from maxContextTokens.
    */
   maxToolResultChars?: number;
+  /**
+   * Run-scoped tool output reference configuration. When `enabled` is
+   * `true`, ToolNode registers successful outputs and substitutes
+   * `{{tool<idx>turn<turn>}}` placeholders found in string args.
+   *
+   * Ignored when `toolOutputRegistry` is also provided (host-supplied
+   * registry wins).
+   */
+  toolOutputReferences?: ToolOutputReferencesConfig;
+  /**
+   * Pre-constructed registry instance shared across ToolNodes for the
+   * run. Graphs pass the same registry to every ToolNode they compile
+   * so cross-agent `{{tool<i>turn<n>}}` substitutions resolve. Takes
+   * precedence over `toolOutputReferences` when both are set.
+   */
+  toolOutputRegistry?: ToolOutputReferenceRegistry;
 };
 
 export type ToolNodeConstructorParams = ToolRefs & ToolNodeOptions;
@@ -233,6 +250,60 @@ export type ToolExecuteResult = {
 
 /** Map of tool names to tool definitions */
 export type LCToolRegistry = Map<string, LCTool>;
+
+/**
+ * Run-scoped configuration for tool output references.
+ *
+ * When enabled, each successful tool result is registered under a stable
+ * key (`tool<idx>turn<turn>`). Later tool calls can pipe a previous
+ * output into their arguments by including the literal placeholder
+ * `{{tool<idx>turn<turn>}}` anywhere in a string argument; ToolNode
+ * substitutes it with the stored output immediately before invoking
+ * the tool.
+ *
+ * The registry stores the *raw, untruncated* tool output (subject to
+ * its own size caps) so a later substitution can pipe the full payload
+ * into the next tool even when the LLM only saw a head+tail-truncated
+ * preview in `ToolMessage.content`. Size limits are decoupled from the
+ * LLM-visible truncation budget and default to 5 MB total.
+ *
+ * Known limitations:
+ *  - Tools that return a `ToolMessage` with array-type content
+ *    (multi-part content blocks such as text + image) are not
+ *    registered and cannot be cited via `{{tool<i>turn<n>}}`. A
+ *    warning is logged so the missing reference is visible.
+ *  - When a `PostToolUse` hook replaces `ToolMessage.content`, the
+ *    *post-hook* content is what gets stored in the registry (and
+ *    what the model sees), so `{{…}}` substitutions deliver the
+ *    hooked output rather than the raw tool return. This matches the
+ *    hook's "authoritative" role for output shaping.
+ */
+export type ToolOutputReferencesConfig = {
+  /** Enable the registry and placeholder substitution. Defaults to `false`. */
+  enabled?: boolean;
+  /**
+   * Maximum characters stored (and substituted) per registered output.
+   * Applied to the *raw* output before storage. Defaults to
+   * `HARD_MAX_TOOL_RESULT_CHARS` (~400 KB) — matching the
+   * LLM-visible tool-result truncation budget, which is also a safe
+   * payload size for shell `ARG_MAX` limits when a `{{…}}` expansion
+   * gets piped into a bash `command`. Hosts that want to preserve
+   * fuller fidelity (for example for non-bash API consumers) can
+   * raise this up to `maxTotalSize` (defaults to 5 MB) — be aware
+   * that large single-output substitutions may exceed shell
+   * argument-size limits on typical Linux/macOS.
+   */
+  maxOutputSize?: number;
+  /**
+   * Hard cap on total characters retained across all registered outputs
+   * for the run. When exceeded, the oldest entries are evicted FIFO
+   * until the total fits. The effective per-output cap is
+   * `min(maxOutputSize, maxTotalSize)` so a single stored output can
+   * never exceed the aggregate bound. Defaults to
+   * `calculateMaxTotalToolOutputSize(maxOutputSize)` (5 MB).
+   */
+  maxTotalSize?: number;
+};
 
 export type ProgrammaticCache = { toolMap: ToolMap; toolDefs: LCTool[] };
 

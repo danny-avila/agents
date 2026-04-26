@@ -45,6 +45,7 @@ export class Run<_T extends t.BaseGraphState> {
   private tokenCounter?: t.TokenCounter;
   private handlerRegistry?: HandlerRegistry;
   private hookRegistry?: HookRegistry;
+  private toolOutputReferences?: t.ToolOutputReferencesConfig;
   private indexTokenCountMap?: Record<string, number>;
   calibrationRatio: number = 1;
   graphRunnable?: t.CompiledStateWorkflow;
@@ -78,6 +79,7 @@ export class Run<_T extends t.BaseGraphState> {
 
     this.handlerRegistry = handlerRegistry;
     this.hookRegistry = config.hooks;
+    this.toolOutputReferences = config.toolOutputReferences;
 
     if (!config.graphConfig) {
       throw new Error('Graph config not provided');
@@ -154,6 +156,7 @@ export class Run<_T extends t.BaseGraphState> {
     /** Propagate compile options from graph config */
     standardGraph.compileOptions = config.compileOptions;
     standardGraph.hookRegistry = this.hookRegistry;
+    standardGraph.toolOutputReferences = this.toolOutputReferences;
     this.Graph = standardGraph;
     return standardGraph.createWorkflow();
   }
@@ -177,6 +180,7 @@ export class Run<_T extends t.BaseGraphState> {
     }
 
     multiAgentGraph.hookRegistry = this.hookRegistry;
+    multiAgentGraph.toolOutputReferences = this.toolOutputReferences;
     this.Graph = multiAgentGraph;
     return multiAgentGraph.createWorkflow();
   }
