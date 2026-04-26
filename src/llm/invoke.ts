@@ -26,7 +26,10 @@ import { initializeModel } from '@/llm/init';
  * stating it explicitly here surfaces the contract at the call site —
  * a developer reading `attemptInvoke` doesn't have to chase the
  * upstream handler's parameter list to discover that
- * `context?.getOrCreateToolOutputRegistry?.()` is a real thing.
+ * `context?.getOrCreateToolOutputRegistry()` is a real thing. Single
+ * optional chain only — the method itself is required on the
+ * `StandardGraph` branch of the intersection, so the second `?.` is
+ * unnecessary at the call site.
  *
  * `NonNullable<...>` strips `undefined` from the upstream parameter
  * type so the intersection doesn't collapse to `never` on the
