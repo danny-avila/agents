@@ -7,10 +7,27 @@ import type * as t from '@/types';
 import * as events from '@/utils/events';
 import { HookRegistry } from '@/hooks';
 import { ToolNode } from '../ToolNode';
-import {
-  ToolOutputReferenceRegistry,
-  TOOL_OUTPUT_REF_KEY,
-} from '../toolOutputReferences';
+import { ToolOutputReferenceRegistry } from '../toolOutputReferences';
+
+/**
+ * Reads the lazy ref-metadata stamped onto a `ToolMessage` by ToolNode.
+ * The metadata replaces the durable `[ref: …]` content mutation that the
+ * earlier eager-annotation design used; the LLM-facing annotation is
+ * applied at request time by `annotateMessagesForLLM` instead.
+ */
+function getRefKey(msg: ToolMessage): string | undefined {
+  return (msg.additional_kwargs as { _refKey?: string } | undefined)?._refKey;
+}
+function getRefScope(msg: ToolMessage): string | undefined {
+  return (msg.additional_kwargs as { _refScope?: string } | undefined)
+    ?._refScope;
+}
+function getUnresolvedRefs(msg: ToolMessage): string[] {
+  return (
+    (msg.additional_kwargs as { _unresolvedRefs?: string[] } | undefined)
+      ?._unresolvedRefs ?? []
+  );
+}
 
 /**
  * Captures the `command` arg each time the tool is invoked and returns
@@ -98,7 +115,7 @@ describe('ToolNode tool output references', () => {
   });
 
   describe('enabled', () => {
-    it('annotates string outputs with a [ref: …] prefix line', async () => {
+    it('keeps string outputs clean and stamps the ref key as metadata', async () => {
       const t1 = createEchoTool({
         capturedArgs: [],
         outputs: ['hello world'],
@@ -112,10 +129,19 @@ describe('ToolNode tool output references', () => {
         { id: 'c1', name: 'echo', command: 'run' },
       ]);
 
-      expect(msg.content).toBe('[ref: tool0turn0]\nhello world');
+      expect(msg.content).toBe('hello world');
+      expect(getRefKey(msg)).toBe('tool0turn0');
+      /**
+       * `_refScope` is what lets `annotateMessagesForLLM` recover the
+       * registry bucket at request time without re-deriving it from
+       * `config.configurable.run_id` (which fails for anonymous
+       * batches). For named runs it equals the run_id.
+       */
+      expect(getRefScope(msg)).toBe('test-run');
+      expect(getUnresolvedRefs(msg)).toEqual([]);
     });
 
-    it('injects _ref into JSON-object string outputs', async () => {
+    it('keeps JSON-object string outputs unmodified and stamps ref metadata', async () => {
       const t1 = createEchoTool({
         capturedArgs: [],
         outputs: ['{"a":1,"b":"x"}'],
@@ -130,11 +156,13 @@ describe('ToolNode tool output references', () => {
       ]);
 
       const parsed = JSON.parse(msg.content as string);
-      expect(parsed[TOOL_OUTPUT_REF_KEY]).toBe('tool0turn0');
       expect(parsed.a).toBe(1);
+      expect(parsed.b).toBe('x');
+      expect(parsed._ref).toBeUndefined();
+      expect(getRefKey(msg)).toBe('tool0turn0');
     });
 
-    it('uses the [ref: …] prefix for JSON array outputs', async () => {
+    it('keeps JSON array outputs unmodified and stamps ref metadata', async () => {
       const t1 = createEchoTool({ capturedArgs: [], outputs: ['[1,2,3]'] });
       const node = new ToolNode({
         tools: [t1],
@@ -145,7 +173,8 @@ describe('ToolNode tool output references', () => {
         { id: 'c1', name: 'echo', command: 'run' },
       ]);
 
-      expect(msg.content).toBe('[ref: tool0turn0]\n[1,2,3]');
+      expect(msg.content).toBe('[1,2,3]');
+      expect(getRefKey(msg)).toBe('tool0turn0');
     });
 
     it('registers the un-annotated output for piping into later calls', async () => {
@@ -192,9 +221,9 @@ describe('ToolNode tool output references', () => {
         { id: 'b3c1', name: 'echo', command: '{{tool0turn1}}' },
       ]);
 
-      expect(m0.content).toContain('[ref: tool0turn0]');
-      expect(m1.content).toContain('[ref: tool0turn1]');
-      expect(m2.content).toContain('[ref: tool0turn2]');
+      expect(getRefKey(m0)).toBe('tool0turn0');
+      expect(getRefKey(m1)).toBe('tool0turn1');
+      expect(getRefKey(m2)).toBe('tool0turn2');
       expect(capturedArgs[2]).toBe('two');
     });
 
@@ -221,8 +250,8 @@ describe('ToolNode tool output references', () => {
         { id: 'c2', name: 'beta', command: 'b' },
       ]);
 
-      expect(messages[0].content).toContain('[ref: tool0turn0]');
-      expect(messages[1].content).toContain('[ref: tool1turn0]');
+      expect(getRefKey(messages[0])).toBe('tool0turn0');
+      expect(getRefKey(messages[1])).toBe('tool1turn0');
     });
 
     it('reports unresolved placeholders after the output', async () => {
@@ -242,7 +271,8 @@ describe('ToolNode tool output references', () => {
       ]);
 
       expect(capturedArgs[0]).toBe('see {{tool9turn9}}');
-      expect(msg.content).toContain('[unresolved refs: tool9turn9]');
+      expect(msg.content).toBe('done');
+      expect(getUnresolvedRefs(msg)).toEqual(['tool9turn9']);
     });
 
     it('stores the raw untruncated output in the registry, independent of the LLM-visible truncation', async () => {
@@ -343,10 +373,10 @@ describe('ToolNode tool output references', () => {
         messages: ToolMessage[];
       }>;
 
-      expect(resA.messages[0].content).toContain('[ref: tool0turn0]');
-      expect(resA.messages[0].content).toContain('output-A');
-      expect(resB.messages[0].content).toContain('[ref: tool0turn1]');
-      expect(resB.messages[0].content).toContain('output-B');
+      expect(getRefKey(resA.messages[0])).toBe('tool0turn0');
+      expect(resA.messages[0].content).toBe('output-A');
+      expect(getRefKey(resB.messages[0])).toBe('tool0turn1');
+      expect(resB.messages[0].content).toBe('output-B');
 
       const registry = node._unsafeGetToolOutputRegistry()!;
       expect(registry.get('concurrent-run', 'tool0turn0')).toBe('output-A');
@@ -417,7 +447,7 @@ describe('ToolNode tool output references', () => {
         { id: 'c1', name: 'boom', command: 'x' },
       ]);
 
-      expect((msg.content as string).startsWith('[ref:')).toBe(false);
+      expect(getRefKey(msg)).toBeUndefined();
       expect(
         node._unsafeGetToolOutputRegistry()!.get('test-run', 'tool0turn0')
       ).toBeUndefined();
@@ -445,7 +475,8 @@ describe('ToolNode tool output references', () => {
       ]);
 
       expect(msg.content).toContain('Error: nope');
-      expect(msg.content).toContain('[unresolved refs: tool9turn9]');
+      expect(msg.content as string).not.toContain('[unresolved refs:');
+      expect(getUnresolvedRefs(msg)).toEqual(['tool9turn9']);
     });
 
     it('surfaces unresolved refs on tool-returned error ToolMessages', async () => {
@@ -473,8 +504,8 @@ describe('ToolNode tool output references', () => {
         { id: 'c1', name: 'errReturn', command: 'see {{tool9turn9}}' },
       ]);
 
-      expect(msg.content).toContain('handled failure');
-      expect(msg.content).toContain('[unresolved refs: tool9turn9]');
+      expect(msg.content).toBe('handled failure');
+      expect(getUnresolvedRefs(msg)).toEqual(['tool9turn9']);
     });
 
     it('isolates state between overlapping runs on the same ToolNode', async () => {
@@ -584,13 +615,26 @@ describe('ToolNode tool output references', () => {
         messages: ToolMessage[];
       }>;
 
-      // Each invocation produces its own annotated output — neither's
+      // Each invocation stamps its own ref metadata — neither's
       // registered tool0turn0 was clobbered by the other's sync-prefix
       // reset.
-      expect(resA.messages[0].content).toContain('[ref: tool0turn0]');
-      expect(resA.messages[0].content).toContain('out-A');
-      expect(resB.messages[0].content).toContain('[ref: tool0turn0]');
-      expect(resB.messages[0].content).toContain('out-B');
+      expect(getRefKey(resA.messages[0])).toBe('tool0turn0');
+      expect(resA.messages[0].content).toBe('out-A');
+      expect(getRefKey(resB.messages[0])).toBe('tool0turn0');
+      expect(resB.messages[0].content).toBe('out-B');
+
+      /**
+       * Each anonymous invocation stamps a distinct synthetic
+       * `_refScope` so the lazy annotation transform can later look
+       * up the right registry bucket — `config.configurable.run_id`
+       * is undefined for both calls and would collapse them to the
+       * same `\0anon` bucket without this stamping.
+       */
+      const scopeA = getRefScope(resA.messages[0]);
+      const scopeB = getRefScope(resB.messages[0]);
+      expect(scopeA).toMatch(/^\0anon-\d+$/);
+      expect(scopeB).toMatch(/^\0anon-\d+$/);
+      expect(scopeA).not.toBe(scopeB);
     });
 
     it('clears state on every batch when run_id is absent (anonymous caller)', async () => {
@@ -616,9 +660,7 @@ describe('ToolNode tool output references', () => {
       })) as { messages: ToolMessage[] };
 
       expect(capturedArgs[1]).toBe('echo {{tool0turn0}}');
-      expect(result.messages[0].content).toContain(
-        '[unresolved refs: tool0turn0]'
-      );
+      expect(getUnresolvedRefs(result.messages[0])).toEqual(['tool0turn0']);
     });
 
     it('lets two ToolNodes sharing a registry resolve each other\'s refs', async () => {
@@ -728,7 +770,7 @@ describe('ToolNode tool output references', () => {
       expect(JSON.parse(stepCompletedArgs[1]).command).toBe('echo STORED');
     });
 
-    it('prepends unresolved-refs warning to non-string ToolMessage content', async () => {
+    it('records unresolved refs as metadata on non-string ToolMessage content (content untouched)', async () => {
       const complexTool = tool(
         async () =>
           new ToolMessage({
@@ -760,12 +802,13 @@ describe('ToolNode tool output references', () => {
 
       expect(Array.isArray(msg.content)).toBe(true);
       const blocks = msg.content as Array<{ type: string; text?: string }>;
+      // Multi-part content is untouched at storage time — the lazy
+      // transform handles the unresolved-refs warning at request time.
+      expect(blocks).toHaveLength(2);
       expect(blocks[0].type).toBe('text');
-      expect(blocks[0].text).toContain('[unresolved refs: tool9turn9]');
-      // Original blocks follow the warning.
-      expect(blocks[1].type).toBe('text');
-      expect(blocks[1].text).toBe('data');
-      expect(blocks[2].type).toBe('image_url');
+      expect(blocks[0].text).toBe('data');
+      expect(blocks[1].type).toBe('image_url');
+      expect(getUnresolvedRefs(msg)).toEqual(['tool9turn9']);
     });
 
     it('resets the registry and turn counter when the runId changes', async () => {
@@ -800,10 +843,9 @@ describe('ToolNode tool output references', () => {
       )) as { messages: ToolMessage[] };
 
       expect(capturedArgs[1]).toBe('echo {{tool0turn0}}');
-      expect(resultB.messages[0].content).toContain('[ref: tool0turn0]');
-      expect(resultB.messages[0].content).toContain(
-        '[unresolved refs: tool0turn0]'
-      );
+      expect(resultB.messages[0].content).toBe('from-run-B');
+      expect(getRefKey(resultB.messages[0])).toBe('tool0turn0');
+      expect(getUnresolvedRefs(resultB.messages[0])).toEqual(['tool0turn0']);
     });
   });
 
@@ -836,7 +878,7 @@ describe('ToolNode tool output references', () => {
       }) as unknown as StructuredToolInterface;
     }
 
-    it('annotates the output the host returns', async () => {
+    it('keeps host-returned output clean and stamps the ref key as metadata', async () => {
       const node = new ToolNode({
         tools: [createSchemaStub('echo')],
         eventDrivenMode: true,
@@ -858,7 +900,8 @@ describe('ToolNode tool output references', () => {
         { configurable: { run_id: 'run-host' } }
       )) as { messages: ToolMessage[] };
 
-      expect(result.messages[0].content).toBe('[ref: tool0turn0]\nhost-output');
+      expect(result.messages[0].content).toBe('host-output');
+      expect(getRefKey(result.messages[0])).toBe('tool0turn0');
       expect(
         node._unsafeGetToolOutputRegistry()!.get('run-host', 'tool0turn0')
       ).toBe('host-output');
@@ -963,9 +1006,10 @@ describe('ToolNode tool output references', () => {
       })) as { messages: ToolMessage[] };
 
       expect(result.messages[0].content).toContain('Error: host failure');
-      expect(result.messages[0].content).toContain(
-        '[unresolved refs: tool9turn9]'
+      expect(result.messages[0].content as string).not.toContain(
+        '[unresolved refs:'
       );
+      expect(getUnresolvedRefs(result.messages[0])).toEqual(['tool9turn9']);
     });
 
     it('reports unresolved refs even when the host succeeds', async () => {
@@ -995,9 +1039,8 @@ describe('ToolNode tool output references', () => {
         ],
       })) as { messages: ToolMessage[] };
 
-      expect(result.messages[0].content).toContain(
-        '[unresolved refs: tool9turn9]'
-      );
+      expect(result.messages[0].content).toBe('done');
+      expect(getUnresolvedRefs(result.messages[0])).toEqual(['tool9turn9']);
     });
 
     it('registers the post-hook output when PostToolUse replaces it', async () => {
@@ -1035,9 +1078,8 @@ describe('ToolNode tool output references', () => {
         { configurable: { run_id: 'run-posthook' } }
       )) as { messages: ToolMessage[] };
 
-      expect(result.messages[0].content).toBe(
-        '[ref: tool0turn0]\nhooked-output'
-      );
+      expect(result.messages[0].content).toBe('hooked-output');
+      expect(getRefKey(result.messages[0])).toBe('tool0turn0');
       expect(
         node._unsafeGetToolOutputRegistry()!.get('run-posthook', 'tool0turn0')
       ).toBe('hooked-output');
@@ -1252,9 +1294,10 @@ describe('ToolNode tool output references', () => {
       // call attempts `{{tool0turn0}}` — which points at the direct
       // call running *in the same batch*. Correct behavior: the
       // placeholder stays unresolved (cross-batch only), and the
-      // event args received by the host must carry the literal
-      // template string plus the LLM-visible `[unresolved refs:…]`
-      // trailer.
+      // event args received by the host carry the literal template
+      // string. The unresolved-refs hint is stamped into the resulting
+      // ToolMessage's `additional_kwargs._unresolvedRefs` so the lazy
+      // annotation transform surfaces it to the LLM at request time.
       await node.invoke(
         {
           messages: [

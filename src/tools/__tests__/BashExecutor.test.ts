@@ -27,6 +27,19 @@ describe('buildBashExecutionToolDescription', () => {
     expect(composed).toContain('{{tool<idx>turn<turn>}}');
   });
 
+  it('nudges the model toward heredoc when payloads may contain shell metacharacters', () => {
+    /**
+     * Real-world failure observed against ClickHouse + bash piping:
+     * the model emitted `echo '{{ref}}' | wc -c` and the substituted
+     * binary payload contained literal single quotes, breaking the
+     * shell. The model self-corrected to a heredoc on retry. Surface
+     * the heredoc pattern upfront so the round-trip isn't burned to
+     * rediscover it.
+     */
+    expect(BashToolOutputReferencesGuide).toContain('heredoc');
+    expect(BashToolOutputReferencesGuide).toContain('<< \'EOF\'');
+  });
+
   it('separates base and guide with a blank line', () => {
     const composed = buildBashExecutionToolDescription({
       enableToolOutputReferences: true,

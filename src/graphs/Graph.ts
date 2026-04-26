@@ -186,8 +186,15 @@ export abstract class Graph<
    * constructing it on first access. Returns `undefined` when the
    * feature is disabled. All ToolNodes compiled from this graph share
    * this single instance so cross-agent `{{…}}` references resolve.
+   *
+   * @internal Public so `attemptInvoke` can read it through the typed
+   * `InvokeContext` and project ToolMessages into LLM-facing annotated
+   * copies right before each provider call (see
+   * `annotateMessagesForLLM`). Host code should not call this directly
+   * — registry mutations outside the ToolNode lifecycle break the
+   * partitioning, eviction, and turn-counter invariants.
    */
-  protected getOrCreateToolOutputRegistry():
+  public getOrCreateToolOutputRegistry():
     | ToolOutputReferenceRegistry
     | undefined {
     if (this.toolOutputReferences?.enabled !== true) {

@@ -22,6 +22,8 @@
  * complete, verbatim output with no injected fields.
  */
 
+import { ToolMessage } from '@langchain/core/messages';
+import type { BaseMessage } from '@langchain/core/messages';
 import {
   calculateMaxTotalToolOutputSize,
   HARD_MAX_TOOL_RESULT_CHARS,
@@ -241,6 +243,16 @@ export class ToolOutputReferenceRegistry {
   /** Returns the stored value for `key` in `runId`'s bucket, or `undefined`. */
   get(runId: string | undefined, key: string): string | undefined {
     return this.runStates.get(this.keyFor(runId))?.entries.get(key);
+  }
+
+  /**
+   * Returns `true` when `key` is currently stored in `runId`'s bucket.
+   * Used by {@link annotateMessagesForLLM} to gate transient annotation
+   * on whether the registry still owns the referenced output (a stale
+   * `_refKey` from a prior run silently no-ops here).
+   */
+  has(runId: string | undefined, key: string): boolean {
+    return this.runStates.get(this.keyFor(runId))?.entries.has(key) ?? false;
   }
 
   /** Total number of registered outputs across every run bucket. */
@@ -587,4 +599,227 @@ function arraysShallowEqual(a: unknown, b: readonly string[]): boolean {
     }
   }
   return true;
+}
+
+/**
+ * Lazy projection that, given a registry and a runId, returns a new
+ * `messages` array where each `ToolMessage` carrying ref metadata is
+ * projected into a transient copy with annotated content (when the ref
+ * is live in the registry) and with the framework-owned `additional_
+ * kwargs` keys (`_refKey`, `_refScope`, `_unresolvedRefs`) stripped
+ * regardless of whether annotation applied. The original input array
+ * and its messages are never mutated.
+ *
+ * Annotation is gated on registry presence: a stale `_refKey` from a
+ * prior run (e.g. one that survived in persisted history) silently
+ * no-ops on the *content* side. The strip-metadata side still runs so
+ * stale framework keys never leak onto the wire under any custom or
+ * future provider serializer that might transmit `additional_kwargs`.
+ * `_unresolvedRefs` is always meaningful and is not gated.
+ *
+ * **Feature-disabled fast path:** when the host hasn't enabled the
+ * tool-output-reference feature, the registry is `undefined` and this
+ * function returns the input array reference-equal *without iterating
+ * a single message*. The loop is exclusive to the feature-enabled
+ * code path.
+ */
+export function annotateMessagesForLLM(
+  messages: BaseMessage[],
+  registry: ToolOutputReferenceRegistry | undefined,
+  runId: string | undefined
+): BaseMessage[] {
+  if (registry == null) return messages;
+
+  /**
+   * Lazy-allocate the output array so the common case (no ToolMessage
+   * carries framework metadata) returns the input reference-equal with
+   * zero allocations beyond the per-message predicate checks.
+   */
+  let out: BaseMessage[] | undefined;
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    if (m._getType() !== 'tool') continue;
+    /**
+     * `additional_kwargs` is untyped at the LangChain layer
+     * (`Record<string, unknown>`), so persisted or client-supplied
+     * ToolMessages can carry arbitrary shapes — including primitives
+     * (a malformed serializer might write a string, or `null`).
+     * Guard with a runtime object check before the `in` probes
+     * because the `in` operator throws `TypeError` on primitives.
+     * A single malformed message must never crash the provider call
+     * path; skip its annotation/strip and continue.
+     */
+    const rawMeta = m.additional_kwargs as unknown;
+    if (rawMeta == null || typeof rawMeta !== 'object') continue;
+    const meta = rawMeta as Record<string, unknown>;
+    const hasRefKey = '_refKey' in meta;
+    const hasRefScope = '_refScope' in meta;
+    const hasUnresolvedField = '_unresolvedRefs' in meta;
+    if (!hasRefKey && !hasRefScope && !hasUnresolvedField) continue;
+
+    const refKey = readRefKey(meta);
+    const unresolved = readUnresolvedRefs(meta);
+
+    /**
+     * Prefer the message-stamped `_refScope` for the registry lookup.
+     * For named runs it equals the current `runId`; for anonymous
+     * invocations it carries the per-batch synthetic scope minted by
+     * ToolNode (`\0anon-<n>`), which `runId` from config cannot
+     * recover. Falling back to `runId` keeps backward compatibility
+     * with messages stamped before this field existed.
+     */
+    const lookupScope = readRefScope(meta) ?? runId;
+    const liveRef =
+      refKey != null && registry.has(lookupScope, refKey) ? refKey : undefined;
+    const annotates = liveRef != null || unresolved.length > 0;
+
+    const tm = m as ToolMessage;
+    let nextContent: ToolMessage['content'] = tm.content;
+
+    if (annotates && typeof tm.content === 'string') {
+      nextContent = annotateToolOutputWithReference(
+        tm.content,
+        liveRef,
+        unresolved
+      );
+    } else if (
+      annotates &&
+      Array.isArray(tm.content) &&
+      unresolved.length > 0
+    ) {
+      const warningBlock = {
+        type: 'text' as const,
+        text: `[unresolved refs: ${unresolved.join(', ')}]`,
+      };
+      /**
+       * `as unknown as ToolMessage['content']` is unavoidable here:
+       * LangChain's content union (`MessageContentComplex[] |
+       * DataContentBlock[] | string`) does not accept a freshly built
+       * mixed array literal even though the structural shape is valid
+       * at runtime. The double-cast is structurally safe — we
+       * preserve every block from `tm.content` and prepend a single
+       * `{ type: 'text', text }` block that all providers accept.
+       */
+      nextContent = [
+        warningBlock,
+        ...tm.content,
+      ] as unknown as ToolMessage['content'];
+    }
+
+    /**
+     * Project unconditionally: even when no annotation applies (stale
+     * `_refKey` or non-annotatable content), `cloneToolMessageWithContent`
+     * runs `stripFrameworkRefMetadata` on `additional_kwargs` so the
+     * framework-owned keys never reach the wire.
+     */
+    out ??= messages.slice();
+    out[i] = cloneToolMessageWithContent(tm, nextContent);
+  }
+
+  return out ?? messages;
+}
+
+/**
+ * Reads `_refKey` defensively from untyped `additional_kwargs`. Returns
+ * undefined for non-string values so a malformed field cannot poison
+ * the registry lookup or downstream string operations.
+ */
+function readRefKey(
+  meta: Record<string, unknown> | undefined
+): string | undefined {
+  const v = meta?._refKey;
+  return typeof v === 'string' ? v : undefined;
+}
+
+/**
+ * Reads `_refScope` defensively from untyped `additional_kwargs`.
+ * Mirrors {@link readRefKey} — non-string scopes are dropped (the
+ * caller falls back to the run-derived scope) rather than passed into
+ * the registry as a malformed key.
+ */
+function readRefScope(
+  meta: Record<string, unknown> | undefined
+): string | undefined {
+  const v = meta?._refScope;
+  return typeof v === 'string' ? v : undefined;
+}
+
+/**
+ * Reads `_unresolvedRefs` defensively from untyped `additional_kwargs`.
+ * Returns an empty array for any non-array value, and filters out
+ * non-string entries from a real array. Without this guard, a hydrated
+ * ToolMessage carrying e.g. `_unresolvedRefs: 'tool0turn0'` would crash
+ * `attemptInvoke` on the eventual `.length` / `.join(...)` call.
+ */
+function readUnresolvedRefs(
+  meta: Record<string, unknown> | undefined
+): string[] {
+  const v = meta?._unresolvedRefs;
+  if (!Array.isArray(v)) return [];
+  const out: string[] = [];
+  for (const item of v) {
+    if (typeof item === 'string') out.push(item);
+  }
+  return out;
+}
+
+/**
+ * Builds a fresh `ToolMessage` that mirrors `tm`'s identity fields with
+ * the supplied `content`. Every `ToolMessage` field but `content` is
+ * carried over so the projection is structurally identical to the
+ * original from a LangChain serializer's perspective.
+ *
+ * `additional_kwargs` is rebuilt with the framework-owned ref keys
+ * stripped. Defensive: LangChain's standard provider serializers do not
+ * transmit `additional_kwargs` to provider HTTP APIs, but a custom
+ * adapter or future LangChain change could. Stripping keeps the
+ * implementation correct under any serializer behavior at the cost of a
+ * shallow object spread per annotated message.
+ */
+function cloneToolMessageWithContent(
+  tm: ToolMessage,
+  content: ToolMessage['content']
+): ToolMessage {
+  return new ToolMessage({
+    id: tm.id,
+    name: tm.name,
+    status: tm.status,
+    artifact: tm.artifact,
+    tool_call_id: tm.tool_call_id,
+    response_metadata: tm.response_metadata,
+    additional_kwargs: stripFrameworkRefMetadata(tm.additional_kwargs),
+    content,
+  });
+}
+
+/**
+ * Returns a copy of `kwargs` with `_refKey`, `_refScope`, and
+ * `_unresolvedRefs` removed. Returns the input reference-equal when
+ * none of those keys are present so the no-strip path stays cheap;
+ * returns `undefined` when stripping leaves the object empty so the
+ * caller can drop the field entirely.
+ */
+function stripFrameworkRefMetadata(
+  kwargs: Record<string, unknown> | undefined
+): Record<string, unknown> | undefined {
+  if (kwargs == null) return undefined;
+  if (
+    !('_refKey' in kwargs) &&
+    !('_refScope' in kwargs) &&
+    !('_unresolvedRefs' in kwargs)
+  ) {
+    return kwargs;
+  }
+  const { _refKey, _refScope, _unresolvedRefs, ...rest } = kwargs as Record<
+    string,
+    unknown
+  > & {
+    _refKey?: unknown;
+    _refScope?: unknown;
+    _unresolvedRefs?: unknown;
+  };
+  void _refKey;
+  void _refScope;
+  void _unresolvedRefs;
+  return Object.keys(rest).length === 0 ? undefined : rest;
 }

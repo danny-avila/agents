@@ -3,18 +3,47 @@ import { AIMessageChunk } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type { BaseMessage } from '@langchain/core/messages';
+import type { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import type * as t from '@/types';
 import { manualToolStreamProviders } from '@/llm/providers';
+import { annotateMessagesForLLM } from '@/tools/toolOutputReferences';
 import { modifyDeltaProperties } from '@/messages';
 import { ChatModelStreamHandler } from '@/stream';
 import { GraphEvents, Providers } from '@/common';
 import { initializeModel } from '@/llm/init';
 
 /**
- * Context passed to `attemptInvoke` for the default stream handler.
- * Matches the subset of Graph that `ChatModelStreamHandler.handle` needs.
+ * Context passed to `attemptInvoke`. Matches the subset of Graph that
+ * `ChatModelStreamHandler.handle` needs *plus* the explicit
+ * `getOrCreateToolOutputRegistry()` accessor that `attemptInvoke`
+ * itself calls to pull the run-scoped tool-output registry off the
+ * graph and project each relevant ToolMessage into a transient
+ * annotated copy before the provider call.
+ *
+ * The intersection is intentional: `Parameters<...>[3]` resolves
+ * indirectly through the stream handler's signature (which returns
+ * `StandardGraph` and already exposes the accessor since #117), but
+ * stating it explicitly here surfaces the contract at the call site —
+ * a developer reading `attemptInvoke` doesn't have to chase the
+ * upstream handler's parameter list to discover that
+ * `context?.getOrCreateToolOutputRegistry()` is a real thing. Single
+ * optional chain only — the method itself is required on the
+ * `StandardGraph` branch of the intersection, so the second `?.` is
+ * unnecessary at the call site.
+ *
+ * `NonNullable<...>` strips `undefined` from the upstream parameter
+ * type so the intersection doesn't collapse to `never` on the
+ * undefined branch; callers express optionality via `context?:
+ * InvokeContext` on the function signature instead.
+ *
+ * Callers without a registry (e.g. summarization) simply pass no
+ * `context` and the transform safely no-ops.
  */
-export type InvokeContext = Parameters<ChatModelStreamHandler['handle']>[3];
+export type InvokeContext = NonNullable<
+  Parameters<ChatModelStreamHandler['handle']>[3]
+> & {
+  getOrCreateToolOutputRegistry?(): ToolOutputReferenceRegistry | undefined;
+};
 
 /**
  * Per-chunk callback for custom stream processing.
@@ -47,8 +76,19 @@ export async function attemptInvoke(
   },
   config?: RunnableConfig
 ): Promise<Partial<t.BaseGraphState>> {
+  /**
+   * Pull the run-scoped tool output registry off the graph (when one
+   * exists) and project ToolMessages carrying ref metadata into a
+   * transient annotated copy. The original `messages` array stays
+   * untouched so the graph state never sees `[ref: …]` / `_ref`
+   * payload.
+   */
+  const registry = context?.getOrCreateToolOutputRegistry();
+  const runId = config?.configurable?.run_id as string | undefined;
+  const messagesForProvider = annotateMessagesForLLM(messages, registry, runId);
+
   if (model.stream) {
-    const stream = await model.stream(messages, config);
+    const stream = await model.stream(messagesForProvider, config);
     let finalChunk: AIMessageChunk | undefined;
 
     if (onChunk) {
@@ -83,7 +123,7 @@ export async function attemptInvoke(
     return { messages: [finalChunk as AIMessageChunk] };
   }
 
-  const finalMessage = await model.invoke(messages, config);
+  const finalMessage = await model.invoke(messagesForProvider, config);
   if ((finalMessage.tool_calls?.length ?? 0) > 0) {
     finalMessage.tool_calls = finalMessage.tool_calls?.filter(
       (tool_call: ToolCall) => !!tool_call.name
