@@ -996,9 +996,21 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           turn,
         };
 
+        /**
+         * Emit `codeSessionContext` for any tool whose host handler may need
+         * to reach into the code-execution sandbox:
+         *   - `CODE_EXECUTION_TOOLS` — direct executors that POST to /exec.
+         *   - `SKILL_TOOL` — skill files live alongside code-env state.
+         *   - `READ_FILE` — when the requested path is a code-env artifact
+         *     (e.g. `/mnt/data/...`) the host falls back to reading via the
+         *     same sandbox session; without the seeded `session_id` /
+         *     `_injected_files` here, that fallback can't see prior-turn
+         *     artifacts on the very first call of a turn.
+         */
         if (
           CODE_EXECUTION_TOOLS.has(entry.call.name) ||
-          entry.call.name === Constants.SKILL_TOOL
+          entry.call.name === Constants.SKILL_TOOL ||
+          entry.call.name === Constants.READ_FILE
         ) {
           request.codeSessionContext = this.getCodeSessionContext();
         }
