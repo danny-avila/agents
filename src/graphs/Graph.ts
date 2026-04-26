@@ -187,10 +187,12 @@ export abstract class Graph<
    * feature is disabled. All ToolNodes compiled from this graph share
    * this single instance so cross-agent `{{…}}` references resolve.
    *
-   * Public so `attemptInvoke` can read it through the typed
+   * @internal Public so `attemptInvoke` can read it through the typed
    * `InvokeContext` and project ToolMessages into LLM-facing annotated
    * copies right before each provider call (see
-   * `annotateMessagesForLLM`).
+   * `annotateMessagesForLLM`). Host code should not call this directly
+   * — registry mutations outside the ToolNode lifecycle break the
+   * partitioning, eviction, and turn-counter invariants.
    */
   public getOrCreateToolOutputRegistry():
     | ToolOutputReferenceRegistry

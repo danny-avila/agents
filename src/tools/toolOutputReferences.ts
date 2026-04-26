@@ -658,47 +658,19 @@ export function annotateMessagesForLLM(
     let projected: ToolMessage | undefined;
 
     if (typeof tm.content === 'string') {
-      projected = new ToolMessage({
-        id: tm.id,
-        name: tm.name,
-        status: tm.status,
-        artifact: tm.artifact,
-        tool_call_id: tm.tool_call_id,
-        response_metadata: tm.response_metadata,
-        /**
-         * Pass the original `additional_kwargs` through by reference.
-         * LangChain's provider serializers do not transmit
-         * `additional_kwargs` to provider HTTP APIs, and the projected
-         * array is discarded after the request — so the metadata
-         * never reaches the wire and never round-trips back into
-         * graph state. Skipping a clone here avoids an O(n) walk plus
-         * a fresh object per annotated ToolMessage.
-         */
-        additional_kwargs: tm.additional_kwargs,
-        content: annotateToolOutputWithReference(
-          tm.content,
-          liveRef,
-          unresolved
-        ),
-      });
+      projected = cloneToolMessageWithContent(
+        tm,
+        annotateToolOutputWithReference(tm.content, liveRef, unresolved)
+      );
     } else if (Array.isArray(tm.content) && unresolved.length > 0) {
       const warningBlock = {
         type: 'text' as const,
         text: `[unresolved refs: ${unresolved.join(', ')}]`,
       };
-      projected = new ToolMessage({
-        id: tm.id,
-        name: tm.name,
-        status: tm.status,
-        artifact: tm.artifact,
-        tool_call_id: tm.tool_call_id,
-        response_metadata: tm.response_metadata,
-        additional_kwargs: tm.additional_kwargs,
-        content: [
-          warningBlock,
-          ...tm.content,
-        ] as unknown as ToolMessage['content'],
-      });
+      projected = cloneToolMessageWithContent(tm, [
+        warningBlock,
+        ...tm.content,
+      ] as unknown as ToolMessage['content']);
     }
 
     if (projected == null) continue;
@@ -707,4 +679,65 @@ export function annotateMessagesForLLM(
   }
 
   return out ?? messages;
+}
+
+/**
+ * Builds a fresh `ToolMessage` that mirrors `tm`'s identity fields with
+ * the supplied `content`. Every `ToolMessage` field but `content` is
+ * carried over so the projection is structurally identical to the
+ * original from a LangChain serializer's perspective.
+ *
+ * `additional_kwargs` is rebuilt with the framework-owned ref keys
+ * stripped. Defensive: LangChain's standard provider serializers do not
+ * transmit `additional_kwargs` to provider HTTP APIs, but a custom
+ * adapter or future LangChain change could. Stripping keeps the
+ * implementation correct under any serializer behavior at the cost of a
+ * shallow object spread per annotated message.
+ */
+function cloneToolMessageWithContent(
+  tm: ToolMessage,
+  content: ToolMessage['content']
+): ToolMessage {
+  return new ToolMessage({
+    id: tm.id,
+    name: tm.name,
+    status: tm.status,
+    artifact: tm.artifact,
+    tool_call_id: tm.tool_call_id,
+    response_metadata: tm.response_metadata,
+    additional_kwargs: stripFrameworkRefMetadata(tm.additional_kwargs),
+    content,
+  });
+}
+
+/**
+ * Returns a copy of `kwargs` with `_refKey`, `_refScope`, and
+ * `_unresolvedRefs` removed. Returns the input reference-equal when
+ * none of those keys are present so the no-strip path stays cheap;
+ * returns `undefined` when stripping leaves the object empty so the
+ * caller can drop the field entirely.
+ */
+function stripFrameworkRefMetadata(
+  kwargs: Record<string, unknown> | undefined
+): Record<string, unknown> | undefined {
+  if (kwargs == null) return undefined;
+  if (
+    !('_refKey' in kwargs) &&
+    !('_refScope' in kwargs) &&
+    !('_unresolvedRefs' in kwargs)
+  ) {
+    return kwargs;
+  }
+  const { _refKey, _refScope, _unresolvedRefs, ...rest } = kwargs as Record<
+    string,
+    unknown
+  > & {
+    _refKey?: unknown;
+    _refScope?: unknown;
+    _unresolvedRefs?: unknown;
+  };
+  void _refKey;
+  void _refScope;
+  void _unresolvedRefs;
+  return Object.keys(rest).length === 0 ? undefined : rest;
 }

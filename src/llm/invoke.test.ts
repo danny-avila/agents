@@ -1,3 +1,5 @@
+import { z } from 'zod';
+import { tool } from '@langchain/core/tools';
 import {
   AIMessage,
   AIMessageChunk,
@@ -6,52 +8,54 @@ import {
 } from '@langchain/core/messages';
 import { describe, it, expect, jest } from '@jest/globals';
 import type { BaseMessage } from '@langchain/core/messages';
+import type { StructuredToolInterface } from '@langchain/core/tools';
 import type * as t from '@/types';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
+import { ToolNode } from '@/tools/ToolNode';
 import { Providers } from '@/common';
 
 /**
- * Minimal stub model that records what `messages` get passed into
- * `invoke`/`stream`. Extends `BaseChatModel` would pull in too much
- * surface for a focused invoke-path test, so we shape just the fields
- * `attemptInvoke` reads.
+ * Minimal stub model shape `attemptInvoke` reads. Either `invoke` or
+ * `stream` is populated depending on which path the test exercises;
+ * extending the real `BaseChatModel` would pull in too much surface.
  */
+type StubModel = {
+  invoke?: (messages: BaseMessage[], config?: unknown) => Promise<AIMessage>;
+  stream?: (
+    messages: BaseMessage[],
+    config?: unknown
+  ) => AsyncGenerator<AIMessageChunk>;
+};
+
 function buildCapturingModel(): {
   invokeMessages: BaseMessage[][];
-  streamMessages: BaseMessage[][];
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  model: any;
+  model: StubModel;
   } {
   const invokeMessages: BaseMessage[][] = [];
-  const streamMessages: BaseMessage[][] = [];
-
   const responseMsg = new AIMessage({ content: 'ok' });
-
-  const model = {
+  const model: StubModel = {
     invoke: jest.fn(async (messages: BaseMessage[]): Promise<AIMessage> => {
       invokeMessages.push(messages);
       return responseMsg;
     }),
-  } as Record<string, unknown>;
-
-  return { invokeMessages, streamMessages, model };
+  };
+  return { invokeMessages, model };
 }
 
 function buildStreamingCapturingModel(): {
   streamMessages: BaseMessage[][];
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  model: any;
+  model: StubModel;
   } {
   const streamMessages: BaseMessage[][] = [];
-  const model = {
+  const model: StubModel = {
     stream: jest.fn(async function* (
       messages: BaseMessage[]
     ): AsyncGenerator<AIMessageChunk> {
       streamMessages.push(messages);
       yield new AIMessageChunk({ content: 'ok' });
     }),
-  } as Record<string, unknown>;
+  };
   return { streamMessages, model };
 }
 
@@ -330,5 +334,109 @@ describe('tryFallbackProviders applies the same lazy annotation transform', () =
 
     jest.dontMock('@/llm/init');
     jest.resetModules();
+  });
+});
+
+describe('cross-run hydration through ToolNode + attemptInvoke', () => {
+  it('annotates run 2 refs but leaves hydrated run 1 ToolMessages untouched', async () => {
+    /**
+     * Smoke test for the headline scenario: ToolMessages produced in
+     * run 1 are persisted with clean content + `_refKey`/`_refScope`
+     * metadata. When those messages are hydrated into run 2's state
+     * and run 2 produces its own tool output, the annotation transform
+     * must (a) annotate run 2's fresh tool message because its
+     * `_refScope` is live in run 2's registry, and (b) leave run 1's
+     * tool message clean because run 1's scope is not in run 2's
+     * registry. Same `tool0turn0` key collides across runs without any
+     * confusion.
+     */
+    const echo = tool(async (input) => (input as { command: string }).command, {
+      name: 'echo',
+      description: 'echoes its command back',
+      schema: z.object({ command: z.string() }),
+    }) as unknown as StructuredToolInterface;
+
+    /* Run 1 */
+    const run1Node = new ToolNode({
+      tools: [echo],
+      toolOutputReferences: { enabled: true },
+    });
+    const run1Result = (await run1Node.invoke(
+      {
+        messages: [
+          new AIMessage({
+            content: '',
+            tool_calls: [
+              { id: 'r1c1', name: 'echo', args: { command: 'run-1-output' } },
+            ],
+          }),
+        ],
+      },
+      { configurable: { run_id: 'run-1' } }
+    )) as { messages: ToolMessage[] };
+
+    const run1ToolMsg = run1Result.messages[0];
+    expect(run1ToolMsg.content).toBe('run-1-output');
+    expect(run1ToolMsg.additional_kwargs._refKey).toBe('tool0turn0');
+    expect(run1ToolMsg.additional_kwargs._refScope).toBe('run-1');
+
+    /* Run 2 - fresh ToolNode and registry, simulating a new session */
+    const run2Node = new ToolNode({
+      tools: [echo],
+      toolOutputReferences: { enabled: true },
+    });
+    const run2Result = (await run2Node.invoke(
+      {
+        messages: [
+          new AIMessage({
+            content: '',
+            tool_calls: [
+              { id: 'r2c1', name: 'echo', args: { command: 'run-2-output' } },
+            ],
+          }),
+        ],
+      },
+      { configurable: { run_id: 'run-2' } }
+    )) as { messages: ToolMessage[] };
+
+    const run2ToolMsg = run2Result.messages[0];
+    expect(run2ToolMsg.content).toBe('run-2-output');
+    expect(run2ToolMsg.additional_kwargs._refKey).toBe('tool0turn0');
+    expect(run2ToolMsg.additional_kwargs._refScope).toBe('run-2');
+
+    /* Hydrate run 1's message + run 2's message into a single state */
+    const hydrated: BaseMessage[] = [
+      new HumanMessage('first request'),
+      run1ToolMsg,
+      new HumanMessage('second request'),
+      run2ToolMsg,
+    ];
+
+    /* attemptInvoke with run 2's registry */
+    const context = {
+      getOrCreateToolOutputRegistry: () =>
+        run2Node._unsafeGetToolOutputRegistry(),
+    } as unknown as Parameters<typeof attemptInvoke>[0]['context'];
+
+    const { invokeMessages, model } = buildCapturingModel();
+    await attemptInvoke(
+      {
+        model: model as t.ChatModel,
+        messages: hydrated,
+        provider: Providers.ANTHROPIC,
+        context,
+      },
+      { configurable: { run_id: 'run-2' } }
+    );
+
+    const sent = invokeMessages[0];
+    /* Run 1's hydrated tool message stays clean — its scope is stale */
+    expect(sent[1].content).toBe('run-1-output');
+    /* Run 2's tool message gets annotated — its scope is live */
+    expect(sent[3].content).toBe('[ref: tool0turn0]\nrun-2-output');
+
+    /* Persisted state is unchanged */
+    expect(hydrated[1].content).toBe('run-1-output');
+    expect(hydrated[3].content).toBe('run-2-output');
   });
 });

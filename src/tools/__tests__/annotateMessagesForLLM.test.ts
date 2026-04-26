@@ -4,6 +4,7 @@ import {
   annotateMessagesForLLM,
   ToolOutputReferenceRegistry,
   TOOL_OUTPUT_REF_KEY,
+  TOOL_OUTPUT_UNRESOLVED_KEY,
 } from '../toolOutputReferences';
 
 function makeToolMessage(fields: {
@@ -96,6 +97,32 @@ describe('annotateMessagesForLLM', () => {
     expect(parsed.b).toBe('x');
   });
 
+  it('injects both _ref and _unresolved_refs into JSON-object content', () => {
+    /**
+     * Combined path: when a ToolMessage carries both a live `_refKey`
+     * and unresolved-ref hints, JSON-object content should receive
+     * both `_ref` and `_unresolved_refs` fields rather than falling
+     * back to the prefix/trailer form. Exercises
+     * `annotateToolOutputWithReference`'s collision-detection logic
+     * through the projection entry point.
+     */
+    const registry = new ToolOutputReferenceRegistry();
+    registry.set('r1', 'tool0turn0', '{"a":1}');
+    const tm = makeToolMessage({
+      content: '{"a":1,"b":"x"}',
+      additional_kwargs: {
+        _refKey: 'tool0turn0',
+        _unresolvedRefs: ['tool9turn9'],
+      },
+    });
+    const out = annotateMessagesForLLM([tm], registry, 'r1');
+    const parsed = JSON.parse(out[0].content as string);
+    expect(parsed[TOOL_OUTPUT_REF_KEY]).toBe('tool0turn0');
+    expect(parsed[TOOL_OUTPUT_UNRESOLVED_KEY]).toEqual(['tool9turn9']);
+    expect(parsed.a).toBe(1);
+    expect(parsed.b).toBe('x');
+  });
+
   it('uses [ref: …] prefix for non-JSON string content', () => {
     const registry = new ToolOutputReferenceRegistry();
     registry.set('r1', 'tool0turn0', 'raw');
@@ -140,13 +167,13 @@ describe('annotateMessagesForLLM', () => {
     expect(tm.additional_kwargs).toEqual(originalKwargs);
   });
 
-  it('passes original additional_kwargs through by reference on the projection', () => {
+  it('strips framework ref metadata from the projected additional_kwargs but preserves other fields', () => {
     /**
-     * The projected ToolMessage shares its `additional_kwargs` with the
-     * original — LangChain's provider serializers don't transmit
-     * `additional_kwargs` to provider APIs, and the projected array
-     * never round-trips back into graph state, so a defensive clone
-     * here would be wasted work.
+     * Defensive: even though LangChain's standard provider serializers
+     * do not transmit `additional_kwargs`, a custom adapter or future
+     * LangChain change could. Strip our three framework-owned keys on
+     * the projection so the metadata never reaches the wire under any
+     * serializer behavior. Non-framework fields stay put.
      */
     const registry = new ToolOutputReferenceRegistry();
     registry.set('r1', 'tool0turn0', 'raw');
@@ -154,14 +181,34 @@ describe('annotateMessagesForLLM', () => {
       content: 'output',
       additional_kwargs: {
         _refKey: 'tool0turn0',
+        _refScope: 'r1',
         _unresolvedRefs: ['tool9turn9'],
         someOtherField: 'preserved',
       },
     });
     const out = annotateMessagesForLLM([tm], registry, 'r1');
     const projected = out[0] as ToolMessage;
-    expect(projected.additional_kwargs).toBe(tm.additional_kwargs);
+    expect(projected.additional_kwargs._refKey).toBeUndefined();
+    expect(projected.additional_kwargs._refScope).toBeUndefined();
+    expect(projected.additional_kwargs._unresolvedRefs).toBeUndefined();
     expect(projected.additional_kwargs.someOtherField).toBe('preserved');
+    expect(tm.additional_kwargs._refKey).toBe('tool0turn0');
+    expect(tm.additional_kwargs._refScope).toBe('r1');
+  });
+
+  it('drops additional_kwargs entirely when only framework keys were present', () => {
+    const registry = new ToolOutputReferenceRegistry();
+    registry.set('r1', 'tool0turn0', 'raw');
+    const tm = makeToolMessage({
+      content: 'output',
+      additional_kwargs: {
+        _refKey: 'tool0turn0',
+        _refScope: 'r1',
+      },
+    });
+    const out = annotateMessagesForLLM([tm], registry, 'r1');
+    const projected = out[0] as ToolMessage;
+    expect(projected.additional_kwargs).toEqual({});
   });
 
   it('passes through non-ToolMessages unchanged in the projected array', () => {
