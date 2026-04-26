@@ -696,17 +696,16 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
    * By handling completions here in graph context (rather than in the
    * stream consumer via ToolEndHandler), the race between the stream
    * consumer and graph execution is eliminated.
+   *
+   * @param resolvedArgsByCallId  Per-batch resolved-args sink populated
+   *   by `runTool`. Threaded as a local map (instead of instance state)
+   *   so concurrent batches cannot read each other's entries.
    */
   private handleRunToolCompletions(
     calls: ToolCall[],
     outputs: (BaseMessage | Command)[],
     config: RunnableConfig,
-    /**
-     * Per-batch resolved-args sink populated by `runTool`. Threaded
-     * as a local instead of an instance field so concurrent batches
-     * cannot read each other's state.
-     */
-    resolvedArgsByCallId?: Map<string, Record<string, unknown>>
+    resolvedArgsByCallId?: ResolvedArgsByCallId
   ): void {
     for (let i = 0; i < calls.length; i++) {
       const call = calls[i];
