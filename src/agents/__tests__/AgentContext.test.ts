@@ -464,6 +464,47 @@ describe('AgentContext', () => {
       expect(ctxDiscovered.toolSchemaTokens).toBeGreaterThan(0);
     });
 
+    it('does not filter instance tools in event-driven mode (matches getEventDrivenToolsForBinding)', async () => {
+      // In event-driven mode, getEventDrivenToolsForBinding appends
+      // `this.tools` UNFILTERED. Accounting must do the same — otherwise we
+      // under-count and risk exceeding the model's context budget.
+      const activeDef: t.LCTool = {
+        name: 'active_def',
+        description: 'Always loaded',
+        parameters: { type: 'object', properties: {} },
+      };
+      const nativeTool = createMockTool('native_tool');
+      // Registry marks the native tool as deferred-undiscovered. In the
+      // non-event-driven path this would exclude it; in event-driven mode
+      // it is still bound and must still be counted.
+      const toolRegistry: t.LCToolRegistry = new Map([
+        ['native_tool', { name: 'native_tool', defer_loading: true }],
+      ]);
+
+      const ctxWithoutNative = createBasicContext({
+        agentConfig: {
+          toolDefinitions: [activeDef],
+          toolRegistry,
+        },
+        tokenCounter: mockTokenCounter,
+      });
+      const ctxWithNative = createBasicContext({
+        agentConfig: {
+          toolDefinitions: [activeDef],
+          tools: [nativeTool],
+          toolRegistry,
+        },
+        tokenCounter: mockTokenCounter,
+      });
+
+      await ctxWithoutNative.tokenCalculationPromise;
+      await ctxWithNative.tokenCalculationPromise;
+
+      expect(ctxWithNative.toolSchemaTokens).toBeGreaterThan(
+        ctxWithoutNative.toolSchemaTokens
+      );
+    });
+
     it('includes deferred toolDefinitions once discovered via discoveredTools input', async () => {
       const toolDefinitions: t.LCTool[] = [
         {

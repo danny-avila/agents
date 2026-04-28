@@ -704,16 +704,23 @@ export class AgentContext {
      * callers that mutate `graphTools` must re-trigger this method to
      * refresh `toolSchemaTokens`.
      *
-     * Apply the same registry-based filter that `getToolsForBinding` uses on
-     * `this.tools` so accounting reflects what is actually bound: skip tools
-     * whose `allowed_callers` exclude `'direct'` and tools with
-     * `defer_loading: true` that haven't been discovered yet. Without this,
-     * `toolSchemaTokens` reports the worst-case ceiling (all registered
-     * tools) instead of the bound subset, which can trigger spurious
-     * `empty_messages` preflight rejections at low `maxContextTokens`.
+     * In the non-event-driven path, `getToolsForBinding` runs `this.tools`
+     * through `filterToolsForBinding` (skipping `defer_loading: true` tools
+     * not yet discovered, and tools whose `allowed_callers` exclude
+     * `'direct'`). Mirror that here so accounting reflects what is actually
+     * bound — without this, `toolSchemaTokens` reports the worst-case
+     * ceiling and can trigger spurious `empty_messages` preflight
+     * rejections at low `maxContextTokens`.
+     *
+     * In event-driven mode (`toolDefinitions` present), `getEventDriven-
+     * ToolsForBinding` appends `this.tools` unfiltered, so accounting must
+     * also leave them unfiltered to stay aligned. Deferred tools are
+     * instead represented through `toolDefinitions` and counted via
+     * `getActiveToolDefinitions()` below.
      */
+    const isEventDriven = (this.toolDefinitions?.length ?? 0) > 0;
     const filteredInstanceTools =
-      this.tools && this.toolRegistry
+      !isEventDriven && this.tools && this.toolRegistry
         ? this.filterToolsForBinding(this.tools)
         : (this.tools ?? []);
     const instanceTools: t.GraphTools = [
