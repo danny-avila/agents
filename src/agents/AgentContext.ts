@@ -703,9 +703,21 @@ export class AgentContext {
      * populated after `fromConfig()` kicks off the initial calculation, so
      * callers that mutate `graphTools` must re-trigger this method to
      * refresh `toolSchemaTokens`.
+     *
+     * Apply the same registry-based filter that `getToolsForBinding` uses on
+     * `this.tools` so accounting reflects what is actually bound: skip tools
+     * whose `allowed_callers` exclude `'direct'` and tools with
+     * `defer_loading: true` that haven't been discovered yet. Without this,
+     * `toolSchemaTokens` reports the worst-case ceiling (all registered
+     * tools) instead of the bound subset, which can trigger spurious
+     * `empty_messages` preflight rejections at low `maxContextTokens`.
      */
+    const filteredInstanceTools =
+      this.tools && this.toolRegistry
+        ? this.filterToolsForBinding(this.tools)
+        : (this.tools ?? []);
     const instanceTools: t.GraphTools = [
-      ...((this.tools as t.GenericTool[] | undefined) ?? []),
+      ...(filteredInstanceTools as t.GenericTool[]),
       ...((this.graphTools as t.GenericTool[] | undefined) ?? []),
     ];
 

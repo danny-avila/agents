@@ -404,6 +404,66 @@ describe('AgentContext', () => {
       expect(ctxWithDeferred.toolSchemaTokens).toBe(ctxBase.toolSchemaTokens);
     });
 
+    it('excludes deferred-undiscovered instance tools from toolSchemaTokens', async () => {
+      const activeTool = createMockTool('active_tool');
+      const deferredTool = createMockTool('deferred_tool');
+      const programmaticTool = createMockTool('programmatic_tool');
+      const toolRegistry: t.LCToolRegistry = new Map([
+        ['active_tool', { name: 'active_tool' }],
+        ['deferred_tool', { name: 'deferred_tool', defer_loading: true }],
+        [
+          'programmatic_tool',
+          {
+            name: 'programmatic_tool',
+            allowed_callers: ['code_execution'],
+          },
+        ],
+      ]);
+
+      const ctxBase = createBasicContext({
+        agentConfig: { tools: [activeTool], toolRegistry },
+        tokenCounter: mockTokenCounter,
+      });
+      const ctxWithExcluded = createBasicContext({
+        agentConfig: {
+          tools: [activeTool, deferredTool, programmaticTool],
+          toolRegistry,
+        },
+        tokenCounter: mockTokenCounter,
+      });
+
+      await ctxBase.tokenCalculationPromise;
+      await ctxWithExcluded.tokenCalculationPromise;
+
+      expect(ctxWithExcluded.toolSchemaTokens).toBe(ctxBase.toolSchemaTokens);
+    });
+
+    it('includes deferred instance tools once discovered via discoveredTools input', async () => {
+      const tools = [createMockTool('deferred_tool')];
+      const toolRegistry: t.LCToolRegistry = new Map([
+        ['deferred_tool', { name: 'deferred_tool', defer_loading: true }],
+      ]);
+
+      const ctxUndiscovered = createBasicContext({
+        agentConfig: { tools, toolRegistry },
+        tokenCounter: mockTokenCounter,
+      });
+      const ctxDiscovered = createBasicContext({
+        agentConfig: {
+          tools,
+          toolRegistry,
+          discoveredTools: ['deferred_tool'],
+        },
+        tokenCounter: mockTokenCounter,
+      });
+
+      await ctxUndiscovered.tokenCalculationPromise;
+      await ctxDiscovered.tokenCalculationPromise;
+
+      expect(ctxUndiscovered.toolSchemaTokens).toBe(0);
+      expect(ctxDiscovered.toolSchemaTokens).toBeGreaterThan(0);
+    });
+
     it('includes deferred toolDefinitions once discovered via discoveredTools input', async () => {
       const toolDefinitions: t.LCTool[] = [
         {
