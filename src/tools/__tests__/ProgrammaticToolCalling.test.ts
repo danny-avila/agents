@@ -664,6 +664,66 @@ for member in team:
       expect(output).toContain('chart.png');
       expect(output).toContain('Image is already displayed to the user');
     });
+
+    it('splits inherited inputs from generated outputs into distinct sections', () => {
+      const response: t.ProgrammaticExecutionResponse = {
+        status: 'completed',
+        stdout: 'analysis done\n',
+        stderr: '',
+        files: [
+          { id: 'g1', name: 'report.pdf' },
+          { id: 'i1', name: 'pptx/SKILL.md', inherited: true },
+          { id: 'i2', name: 'pptx/scripts/clean.py', inherited: true },
+          { id: 'g2', name: 'chart.png' },
+        ],
+        session_id: 'sess_abc123',
+      };
+
+      const [output, artifact] = formatCompletedResponse(response);
+
+      /* Generated section lists only outputs the run produced. */
+      const generatedIdx = output.indexOf('Generated files:');
+      const inheritedIdx = output.indexOf('Available files (inputs');
+      expect(generatedIdx).toBeGreaterThan(-1);
+      expect(inheritedIdx).toBeGreaterThan(generatedIdx);
+
+      /* Slice each section so we can assert membership without
+       * cross-talk between the two listings. */
+      const generatedSection = output.slice(generatedIdx, inheritedIdx);
+      const inheritedSection = output.slice(inheritedIdx);
+
+      expect(generatedSection).toContain('report.pdf');
+      expect(generatedSection).toContain('chart.png');
+      expect(generatedSection).not.toContain('SKILL.md');
+
+      expect(inheritedSection).toContain('pptx/SKILL.md');
+      expect(inheritedSection).toContain('pptx/scripts/clean.py');
+      expect(inheritedSection).toContain('Available as an input');
+
+      /* The artifact still carries every file so the host can still
+       * thread per-file ids through to subsequent calls. */
+      expect(artifact.files).toHaveLength(4);
+    });
+
+    it('omits the Generated files header when every entry is inherited', () => {
+      const response: t.ProgrammaticExecutionResponse = {
+        status: 'completed',
+        stdout: 'cat: ok\n',
+        stderr: '',
+        files: [
+          { id: 'i1', name: 'pptx/SKILL.md', inherited: true },
+          { id: 'i2', name: 'pptx/editing.md', inherited: true },
+        ],
+        session_id: 'sess_abc123',
+      };
+
+      const [output] = formatCompletedResponse(response);
+
+      expect(output).not.toContain('Generated files:');
+      expect(output).toContain('Available files (inputs');
+      expect(output).toContain('pptx/SKILL.md');
+      expect(output).toContain('pptx/editing.md');
+    });
   });
 
   describe('createProgrammaticToolCallingTool - Manual Invocation', () => {
