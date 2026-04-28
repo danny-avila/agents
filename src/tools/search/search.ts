@@ -408,6 +408,166 @@ const createSearXNGAPI = (
   return { getSources };
 };
 
+const TAVILY_TIME_RANGE_MAP: Record<string, string> = {
+  h: 'day',
+  d: 'day',
+  w: 'week',
+  m: 'month',
+  y: 'year',
+} as const;
+
+const DEFAULT_TAVILY_TIMEOUT = 15000;
+
+const getHostname = (link: string): string => {
+  try {
+    return new URL(link).hostname;
+  } catch {
+    return link;
+  }
+};
+
+const createTavilyAPI = (
+  apiKey?: string,
+  apiUrl?: string,
+  options?: t.TavilySearchOptions
+): {
+  getSources: (params: t.GetSourcesParams) => Promise<t.SearchResult>;
+} => {
+  const config = {
+    apiKey: apiKey ?? process.env.TAVILY_API_KEY,
+    apiUrl:
+      apiUrl ??
+      process.env.TAVILY_SEARCH_URL ??
+      'https://api.tavily.com/search',
+    timeout: options?.timeout ?? DEFAULT_TAVILY_TIMEOUT,
+  };
+
+  if (config.apiKey == null || config.apiKey === '') {
+    throw new Error('TAVILY_API_KEY is required for Tavily API');
+  }
+
+  const getSources = async ({
+    query,
+    date,
+    numResults = 8,
+    type,
+    news,
+  }: t.GetSourcesParams): Promise<t.SearchResult> => {
+    if (!query.trim()) {
+      return { success: false, error: 'Query cannot be empty' };
+    }
+
+    try {
+      const timeRange =
+        options?.timeRange ??
+        (date != null ? (TAVILY_TIME_RANGE_MAP[date] ?? 'day') : undefined);
+      const topic =
+        options?.topic ??
+        (news === true || type === 'news' ? 'news' : 'general');
+      const maxResults = options?.maxResults ?? numResults;
+      const searchDepth = options?.searchDepth ?? 'basic';
+
+      const payload: Record<string, unknown> = {
+        query,
+        search_depth: searchDepth,
+        topic,
+        max_results: Math.min(Math.max(1, maxResults), 20),
+      };
+
+      if (timeRange != null) {
+        payload.time_range = timeRange;
+      }
+      if (type === 'images' || options?.includeImages) {
+        payload.include_images = true;
+      }
+      if (options?.includeAnswer != null) {
+        payload.include_answer = options.includeAnswer;
+      }
+      if (options?.includeRawContent != null) {
+        payload.include_raw_content = options.includeRawContent;
+      }
+      if (
+        options?.includeDomains != null &&
+        options.includeDomains.length > 0
+      ) {
+        payload.include_domains = options.includeDomains;
+      }
+      if (
+        options?.excludeDomains != null &&
+        options.excludeDomains.length > 0
+      ) {
+        payload.exclude_domains = options.excludeDomains;
+      }
+      if (options?.includeImageDescriptions != null) {
+        payload.include_image_descriptions = options.includeImageDescriptions;
+      }
+      if (options?.includeFavicon != null) {
+        payload.include_favicon = options.includeFavicon;
+      }
+      if (options?.chunksPerSource != null) {
+        payload.chunks_per_source = options.chunksPerSource;
+      }
+
+      const response = await axios.post(config.apiUrl, payload, {
+        headers: {
+          Authorization: `Bearer ${config.apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: config.timeout,
+      });
+
+      const data = response.data;
+
+      const organicResults: t.OrganicResult[] = (data.results ?? []).map(
+        (result: t.TavilySearchResult) => ({
+          title: result.title ?? '',
+          link: result.url ?? '',
+          snippet: result.content ?? '',
+          date: result.published_date,
+        })
+      );
+
+      const imageResults: t.ImageResult[] = Array.isArray(data.images)
+        ? data.images.slice(0, 6).map((image: string, index: number) => ({
+          imageUrl: image,
+          position: index + 1,
+        }))
+        : [];
+
+      const newsResults: t.NewsResult[] =
+        topic === 'news'
+          ? organicResults.map((r) => ({
+            title: r.title,
+            link: r.link,
+            snippet: r.snippet,
+            date: r.date,
+            source: getHostname(r.link),
+          }))
+          : [];
+
+      const results: t.SearchResultData = {
+        organic: organicResults,
+        images: imageResults,
+        topStories: [],
+        videos: [],
+        news: newsResults,
+        relatedSearches: [],
+      };
+
+      return { success: true, data: results };
+    } catch (error) {
+      const errorMessage =
+        error instanceof Error ? error.message : String(error);
+      return {
+        success: false,
+        error: `Tavily API request failed: ${errorMessage}`,
+      };
+    }
+  };
+
+  return { getSources };
+};
+
 export const createSearchAPI = (
   config: t.SearchConfig
 ): {
@@ -418,15 +578,20 @@ export const createSearchAPI = (
     serperApiKey,
     searxngInstanceUrl,
     searxngApiKey,
+    tavilyApiKey,
+    tavilySearchUrl,
+    tavilySearchOptions,
   } = config;
 
   if (searchProvider.toLowerCase() === 'serper') {
     return createSerperAPI(serperApiKey);
   } else if (searchProvider.toLowerCase() === 'searxng') {
     return createSearXNGAPI(searxngInstanceUrl, searxngApiKey);
+  } else if (searchProvider.toLowerCase() === 'tavily') {
+    return createTavilyAPI(tavilyApiKey, tavilySearchUrl, tavilySearchOptions);
   } else {
     throw new Error(
-      `Invalid search provider: ${searchProvider}. Must be 'serper' or 'searxng'`
+      `Invalid search provider: ${searchProvider}. Must be 'serper', 'searxng', or 'tavily'`
     );
   }
 };
@@ -454,6 +619,58 @@ export const createSourceProcessor = (
   const logger_ = logger || createDefaultLogger();
   const scraper = scraperInstance;
 
+  const processResponse = (
+    url: string,
+    response: t.AnyScraperResponse
+  ): t.ScrapeResult => {
+    const rawMetadata = scraper.extractMetadata(response);
+    const metadata =
+      Object.keys(rawMetadata).length > 0
+        ? (rawMetadata as t.ScrapeMetadata)
+        : undefined;
+    const attribution = getAttribution(url, metadata, logger_);
+
+    if (response.success && response.data) {
+      const [content, references] = scraper.extractContent(response);
+      return {
+        url,
+        references,
+        attribution,
+        content: chunker.cleanText(content),
+      };
+    }
+
+    logger_.error(
+      `Error scraping ${url}: ${response.error ?? 'Unknown error'}`
+    );
+    return { url, attribution, error: true, content: '' };
+  };
+
+  const addHighlights = async (
+    result: t.ScrapeResult,
+    query: string,
+    onGetHighlights: t.SearchToolConfig['onGetHighlights']
+  ): Promise<t.ScrapeResult> => {
+    if (result.error != null) {
+      return result;
+    }
+    try {
+      const highlights = await getHighlights({
+        query,
+        reranker,
+        content: result.content,
+        logger: logger_,
+      });
+      if (onGetHighlights) {
+        onGetHighlights(result.url);
+      }
+      return { ...result, highlights };
+    } catch (error) {
+      logger_.error('Error processing scraped content:', error);
+      return result;
+    }
+  };
+
   const webScraper = {
     scrapeMany: async ({
       query,
@@ -465,80 +682,31 @@ export const createSourceProcessor = (
       onGetHighlights: t.SearchToolConfig['onGetHighlights'];
     }): Promise<Array<t.ScrapeResult>> => {
       logger_.debug(`Scraping ${links.length} links`);
-      const promises: Array<Promise<t.ScrapeResult>> = [];
       try {
-        for (let i = 0; i < links.length; i++) {
-          const currentLink = links[i];
-          const promise: Promise<t.ScrapeResult> = scraper
-            .scrapeUrl(currentLink, {})
-            .then(([url, response]) => {
-              const attribution = getAttribution(
-                url,
-                response.data?.metadata,
-                logger_
-              );
-              if (response.success && response.data) {
-                const [content, references] = scraper.extractContent(response);
-                return {
-                  url,
-                  references,
-                  attribution,
-                  content: chunker.cleanText(content),
-                } as t.ScrapeResult;
-              } else {
-                logger_.error(
-                  `Error scraping ${url}: ${response.error ?? 'Unknown error'}`
-                );
-              }
+        let responses: Array<[string, t.AnyScraperResponse]>;
 
-              return {
-                url,
-                attribution,
-                error: true,
-                content: '',
-              } as t.ScrapeResult;
-            })
-            .then(async (result) => {
-              try {
-                if (result.error != null) {
-                  logger_.error(
-                    `Error scraping ${result.url}: ${result.content}`
-                  );
-                  return {
-                    ...result,
-                  };
-                }
-                const highlights = await getHighlights({
-                  query,
-                  reranker,
-                  content: result.content,
-                  logger: logger_,
-                });
-                if (onGetHighlights) {
-                  onGetHighlights(result.url);
-                }
-                return {
-                  ...result,
-                  highlights,
-                };
-              } catch (error) {
-                logger_.error('Error processing scraped content:', error);
-                return {
-                  ...result,
-                };
-              }
-            })
-            .catch((error) => {
-              logger_.error(`Error scraping ${currentLink}:`, error);
-              return {
-                url: currentLink,
-                error: true,
-                content: '',
-              };
-            });
-          promises.push(promise);
+        if (scraper.scrapeUrls) {
+          responses = await scraper.scrapeUrls(links);
+        } else {
+          responses = await Promise.all(
+            links.map((link) =>
+              scraper
+                .scrapeUrl(link, {})
+                .catch((error): [string, t.AnyScraperResponse] => {
+                  logger_.error(`Error scraping ${link}:`, error);
+                  return [link, { success: false, error: String(error) }];
+                })
+            )
+          );
         }
-        return await Promise.all(promises);
+
+        const results = responses.map(([url, response]) =>
+          processResponse(url, response)
+        );
+        const withHighlights = await Promise.all(
+          results.map((result) => addHighlights(result, query, onGetHighlights))
+        );
+        return withHighlights;
       } catch (error) {
         logger_.error('Error in scrapeMany:', error);
         return [];
