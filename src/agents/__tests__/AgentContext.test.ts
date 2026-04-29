@@ -549,6 +549,36 @@ describe('AgentContext', () => {
       expect(ctx.getTokenBudgetBreakdown().toolCount).toBe(1);
     });
 
+    it('getTokenBudgetBreakdown toolCount excludes deferred-undiscovered instance tools', () => {
+      // Mirrors the toolDefinitions test for the instance-tools path so
+      // toolCount stays aligned with toolSchemaTokens (and with what
+      // getToolsForBinding actually emits) for non-event-driven runs.
+      const tools = [
+        createMockTool('active_tool'),
+        createMockTool('deferred_tool'),
+        createMockTool('programmatic_tool'),
+      ];
+      const toolRegistry: t.LCToolRegistry = new Map([
+        ['active_tool', { name: 'active_tool' }],
+        ['deferred_tool', { name: 'deferred_tool', defer_loading: true }],
+        [
+          'programmatic_tool',
+          {
+            name: 'programmatic_tool',
+            allowed_callers: ['code_execution'],
+          },
+        ],
+      ]);
+
+      const ctx = createBasicContext({
+        agentConfig: { tools, toolRegistry },
+      });
+
+      expect(ctx.getTokenBudgetBreakdown().toolCount).toBe(1);
+      ctx.markToolsAsDiscovered(['deferred_tool']);
+      expect(ctx.getTokenBudgetBreakdown().toolCount).toBe(2);
+    });
+
     it('getTokenBudgetBreakdown toolCount reflects newly discovered deferred tools', () => {
       const toolDefinitions: t.LCTool[] = [
         {

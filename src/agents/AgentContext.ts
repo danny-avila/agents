@@ -919,8 +919,16 @@ export class AgentContext {
    */
   getTokenBudgetBreakdown(messages?: BaseMessage[]): t.TokenBudgetBreakdown {
     const maxContextTokens = this.maxContextTokens ?? 0;
-    const toolCount =
-      (this.tools?.length ?? 0) + this.getActiveToolDefinitions().length;
+    /**
+     * Derive `toolCount` from `getToolsForBinding()` so the diagnostic stays
+     * aligned with what is actually bound to the model — and with what
+     * `calculateInstructionTokens` counts into `toolSchemaTokens`. Using raw
+     * `this.tools.length` would inflate the count whenever the registry
+     * marks instance tools as deferred-undiscovered or non-`'direct'`,
+     * producing the same misleading "N tools" diagnostic this fix is meant
+     * to eliminate.
+     */
+    const toolCount = this.getToolsForBinding()?.length ?? 0;
     const messageCount = messages?.length ?? 0;
 
     let messageTokens = 0;
