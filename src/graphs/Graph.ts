@@ -891,7 +891,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           | t.BedrockAnthropicClientOptions
           | undefined;
         if (bedrockOptions?.promptCache === true) {
-          finalMessages = addBedrockCacheControl<BaseMessage>(finalMessages);
+          finalMessages = addBedrockCacheControl<BaseMessage>(finalMessages, {
+            ttl: bedrockOptions.promptCacheTtl,
+          });
         }
       }
 

@@ -14,6 +14,12 @@ type MessageWithContent = {
   content?: string | MessageContentComplex[];
 };
 
+type BedrockPromptCacheTtl = '5m' | '1h';
+
+type BedrockCacheControlOptions = {
+  ttl?: BedrockPromptCacheTtl;
+};
+
 /**
  * Deep clones a message's content to prevent mutation of the original.
  */
@@ -201,6 +207,18 @@ function isCachePoint(block: MessageContentComplex): boolean {
   return 'cachePoint' in block && !('type' in block);
 }
 
+function createBedrockCachePoint(
+  ttl?: BedrockPromptCacheTtl
+): MessageContentComplex {
+  const cachePoint: { type: 'default'; ttl?: BedrockPromptCacheTtl } = {
+    type: 'default',
+  };
+  if (ttl != null) {
+    cachePoint.ttl = ttl;
+  }
+  return { cachePoint } as MessageContentComplex;
+}
+
 /**
  * Checks if a message's content has Anthropic cache_control fields.
  */
@@ -300,7 +318,7 @@ export function stripBedrockCacheControl<T extends MessageWithContent>(
  */
 export function addBedrockCacheControl<
   T extends Partial<BaseMessage> & MessageWithContent,
->(messages: T[]): T[] {
+>(messages: T[], options: BedrockCacheControlOptions = {}): T[] {
   if (!Array.isArray(messages) || messages.length < 2) {
     return messages;
   }
@@ -365,15 +383,17 @@ export function addBedrockCacheControl<
       // Insert cache point after the last non-empty text block.
       // Skip if no cacheable text content exists (whitespace-only messages).
       if (needsCacheAdd && lastNonEmptyTextIndex >= 0) {
-        workingContent.splice(lastNonEmptyTextIndex + 1, 0, {
-          cachePoint: { type: 'default' },
-        } as MessageContentComplex);
+        workingContent.splice(
+          lastNonEmptyTextIndex + 1,
+          0,
+          createBedrockCachePoint(options.ttl)
+        );
         messagesModified++;
       }
     } else if (typeof content === 'string' && needsCacheAdd) {
       workingContent = [
         { type: ContentTypes.TEXT, text: content },
-        { cachePoint: { type: 'default' } } as MessageContentComplex,
+        createBedrockCachePoint(options.ttl),
       ];
       messagesModified++;
     } else {
