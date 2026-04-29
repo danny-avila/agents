@@ -629,6 +629,19 @@ describe('AgentContext', () => {
       expect(ctx.getTokenBudgetBreakdown().toolCount).toBe(1);
     });
 
+    it('getTokenBudgetBreakdown toolCount includes graphTools', () => {
+      // graphTools (handoff/subagent) are bound to the model alongside
+      // instance tools. Now that toolCount derives from getToolsForBinding(),
+      // graphTools are reflected in the diagnostic just like they're
+      // counted in toolSchemaTokens. Locks in that alignment.
+      const ctx = createBasicContext({
+        agentConfig: { tools: [createMockTool('direct_tool')] },
+      });
+      ctx.graphTools = [createMockTool('handoff_tool')];
+
+      expect(ctx.getTokenBudgetBreakdown().toolCount).toBe(2);
+    });
+
     it('toolSchemaTokens snapshot does not auto-update after markToolsAsDiscovered', async () => {
       const toolDefinitions: t.LCTool[] = [
         {
