@@ -299,6 +299,26 @@ describe('addBedrockCacheControl (Bedrock cache checkpoints)', () => {
     expect(last[1]).toEqual({ cachePoint: { type: 'default' } });
   });
 
+  it('adds a 1-hour cachePoint TTL when configured', () => {
+    const messages: TestMsg[] = [
+      { role: 'user', content: 'Hello' },
+      { role: 'assistant', content: 'Hi' },
+    ];
+    const result = addBedrockCacheControl(messages, { ttl: '1h' });
+    const last = result[1].content as MessageContentComplex[];
+    expect(last[1]).toEqual({ cachePoint: { type: 'default', ttl: '1h' } });
+  });
+
+  it('keeps explicit 5-minute cachePoint TTL when configured', () => {
+    const messages: TestMsg[] = [
+      { role: 'user', content: 'Hello' },
+      { role: 'assistant', content: 'Hi' },
+    ];
+    const result = addBedrockCacheControl(messages, { ttl: '5m' });
+    const last = result[1].content as MessageContentComplex[];
+    expect(last[1]).toEqual({ cachePoint: { type: 'default', ttl: '5m' } });
+  });
+
   it('inserts cachePoint after the last text when multiple text blocks exist', () => {
     const messages: TestMsg[] = [
       {

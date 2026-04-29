@@ -16,6 +16,9 @@ import type {
   MessageContentReasoningBlock,
 } from '../types';
 
+type BedrockPromptCacheTtl = '5m' | '1h';
+type BedrockCachePointBlock = { type: 'default'; ttl?: BedrockPromptCacheTtl };
+
 /**
  * Convert a LangChain reasoning block to a Bedrock reasoning block.
  */
@@ -127,24 +130,30 @@ export function extractImageInfo(base64: string): BedrockContentBlock {
   };
 }
 
-/**
- * Check if a block has a cache point.
- */
-function isDefaultCachePoint(block: unknown): boolean {
+function getDefaultCachePoint(
+  block: unknown
+): BedrockCachePointBlock | undefined {
   if (typeof block !== 'object' || block === null) {
-    return false;
+    return undefined;
   }
   if (!('cachePoint' in block)) {
-    return false;
+    return undefined;
   }
   const cachePoint = (block as { cachePoint?: unknown }).cachePoint;
   if (typeof cachePoint !== 'object' || cachePoint === null) {
-    return false;
+    return undefined;
   }
   if (!('type' in cachePoint)) {
-    return false;
+    return undefined;
   }
-  return (cachePoint as { type?: string }).type === 'default';
+  if ((cachePoint as { type?: string }).type !== 'default') {
+    return undefined;
+  }
+
+  const ttl = (cachePoint as { ttl?: unknown }).ttl;
+  return ttl === '5m' || ttl === '1h'
+    ? { type: 'default', ttl }
+    : { type: 'default' };
 }
 
 /**
@@ -240,11 +249,10 @@ function convertLangChainContentBlockToConverseContentBlock({
     } as BedrockContentBlock;
   }
 
-  if (isDefaultCachePoint(block)) {
+  const cachePoint = getDefaultCachePoint(block);
+  if (cachePoint != null) {
     return {
-      cachePoint: {
-        type: 'default',
-      },
+      cachePoint,
     } as BedrockContentBlock;
   }
 
@@ -274,14 +282,14 @@ function convertSystemMessageToConverseMessage(
         contentBlocks.push({
           text: (block as { text: string }).text,
         });
-      } else if (isDefaultCachePoint(block)) {
-        contentBlocks.push({
-          cachePoint: {
-            type: 'default',
-          },
-        } as BedrockSystemContentBlock);
       } else {
-        break;
+        const cachePoint = getDefaultCachePoint(block);
+        if (cachePoint == null) {
+          break;
+        }
+        contentBlocks.push({
+          cachePoint,
+        } as BedrockSystemContentBlock);
       }
     }
     if (msg.content.length === contentBlocks.length) {
@@ -341,19 +349,19 @@ function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
             block as MessageContentReasoningBlock
           ),
         } as BedrockContentBlock);
-      } else if (isDefaultCachePoint(block)) {
-        contentBlocks.push({
-          cachePoint: {
-            type: 'default',
-          },
-        } as BedrockContentBlock);
       } else {
-        const blockValues = Object.fromEntries(
-          Object.entries(block).filter(([key]) => key !== 'type')
-        );
-        throw new Error(
-          `Unsupported content block type: ${block.type} with content of ${JSON.stringify(blockValues, null, 2)}`
-        );
+        const cachePoint = getDefaultCachePoint(block);
+        if (cachePoint == null) {
+          const blockValues = Object.fromEntries(
+            Object.entries(block).filter(([key]) => key !== 'type')
+          );
+          throw new Error(
+            `Unsupported content block type: ${block.type} with content of ${JSON.stringify(blockValues, null, 2)}`
+          );
+        }
+        contentBlocks.push({
+          cachePoint,
+        } as BedrockContentBlock);
       }
     });
 

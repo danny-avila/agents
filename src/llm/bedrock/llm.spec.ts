@@ -608,6 +608,39 @@ describe('convertToConverseMessages', () => {
     expect(converseMessages[0].content).toEqual([{ text: 'Hello!' }]);
   });
 
+  test('should preserve Bedrock cachePoint TTL on message content', () => {
+    const { converseMessages } = convertToConverseMessages([
+      new HumanMessage({
+        content: [
+          { type: 'text', text: 'Cache this prompt.' },
+          { cachePoint: { type: 'default', ttl: '1h' } },
+        ] as any,
+      }),
+    ]);
+
+    expect(converseMessages[0].content).toEqual([
+      { text: 'Cache this prompt.' },
+      { cachePoint: { type: 'default', ttl: '1h' } },
+    ]);
+  });
+
+  test('should preserve Bedrock cachePoint TTL on system content', () => {
+    const { converseSystem } = convertToConverseMessages([
+      new SystemMessage({
+        content: [
+          { type: 'text', text: 'Long-lived system prompt.' },
+          { cachePoint: { type: 'default', ttl: '1h' } },
+        ] as any,
+      }),
+      new HumanMessage('Hello!'),
+    ]);
+
+    expect(converseSystem).toEqual([
+      { text: 'Long-lived system prompt.' },
+      { cachePoint: { type: 'default', ttl: '1h' } },
+    ]);
+  });
+
   test('should handle standard v1 format with tool_call blocks (e.g., from Anthropic provider)', () => {
     const { converseMessages, converseSystem } = convertToConverseMessages([
       new SystemMessage("You're an advanced AI assistant."),

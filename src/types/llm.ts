@@ -86,8 +86,9 @@ export type BedrockAnthropicInput = ChatBedrockConverseInput & {
   additionalModelRequestFields?: ChatBedrockConverseInput['additionalModelRequestFields'] &
     AnthropicReasoning;
   promptCache?: boolean;
+  promptCacheTtl?: '5m' | '1h';
 };
-export type BedrockConverseClientOptions = ChatBedrockConverseInput;
+export type BedrockConverseClientOptions = BedrockAnthropicInput;
 export type BedrockAnthropicClientOptions = BedrockAnthropicInput;
 export type GoogleClientOptions = GoogleGenerativeAIChatInput & {
   customHeaders?: RequestOptions['customHeaders'];
