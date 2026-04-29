@@ -50,6 +50,7 @@ export interface ChatOpenRouterCallOptions
   include_reasoning?: boolean;
   reasoning?: OpenRouterReasoning;
   modelKwargs?: OpenAIChatInput['modelKwargs'];
+  promptCache?: boolean;
 }
 
 /** invocationParams return type extended with OpenRouter reasoning */
@@ -352,12 +353,18 @@ export class ChatOpenRouter extends ChatOpenAI {
       );
     }
     if (usage) {
+      const promptDetails = usage.prompt_tokens_details as
+        | (typeof usage.prompt_tokens_details & { cache_write_tokens?: number })
+        | undefined;
       const inputTokenDetails = {
-        ...(usage.prompt_tokens_details?.audio_tokens != null && {
-          audio: usage.prompt_tokens_details.audio_tokens,
+        ...(promptDetails?.audio_tokens != null && {
+          audio: promptDetails.audio_tokens,
         }),
-        ...(usage.prompt_tokens_details?.cached_tokens != null && {
-          cache_read: usage.prompt_tokens_details.cached_tokens,
+        ...(promptDetails?.cached_tokens != null && {
+          cache_read: promptDetails.cached_tokens,
+        }),
+        ...(promptDetails?.cache_write_tokens != null && {
+          cache_creation: promptDetails.cache_write_tokens,
         }),
       };
       const outputTokenDetails = {
