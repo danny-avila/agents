@@ -404,6 +404,141 @@ describe('AgentContext', () => {
       expect(ctxWithDeferred.toolSchemaTokens).toBe(ctxBase.toolSchemaTokens);
     });
 
+    it('excludes programmatic-only toolDefinitions from toolSchemaTokens', async () => {
+      // getEventDrivenToolsForBinding excludes definitions whose
+      // allowed_callers omit 'direct'. Accounting must mirror that — a
+      // programmatic-only definition is never bound to the model and
+      // shouldn't inflate toolSchemaTokens.
+      const activeDef: t.LCTool = {
+        name: 'active_tool',
+        description: 'Always loaded',
+        parameters: { type: 'object', properties: {} },
+      };
+      const programmaticDef: t.LCTool = {
+        name: 'programmatic_tool',
+        description: 'Only callable via code execution',
+        parameters: { type: 'object', properties: {} },
+        allowed_callers: ['code_execution'],
+      };
+
+      const ctxBase = createBasicContext({
+        agentConfig: { toolDefinitions: [activeDef] },
+        tokenCounter: mockTokenCounter,
+      });
+      const ctxWithProgrammatic = createBasicContext({
+        agentConfig: { toolDefinitions: [activeDef, programmaticDef] },
+        tokenCounter: mockTokenCounter,
+      });
+
+      await ctxBase.tokenCalculationPromise;
+      await ctxWithProgrammatic.tokenCalculationPromise;
+
+      expect(ctxWithProgrammatic.toolSchemaTokens).toBe(
+        ctxBase.toolSchemaTokens
+      );
+    });
+
+    it('excludes deferred-undiscovered instance tools from toolSchemaTokens', async () => {
+      const activeTool = createMockTool('active_tool');
+      const deferredTool = createMockTool('deferred_tool');
+      const programmaticTool = createMockTool('programmatic_tool');
+      const toolRegistry: t.LCToolRegistry = new Map([
+        ['active_tool', { name: 'active_tool' }],
+        ['deferred_tool', { name: 'deferred_tool', defer_loading: true }],
+        [
+          'programmatic_tool',
+          {
+            name: 'programmatic_tool',
+            allowed_callers: ['code_execution'],
+          },
+        ],
+      ]);
+
+      const ctxBase = createBasicContext({
+        agentConfig: { tools: [activeTool], toolRegistry },
+        tokenCounter: mockTokenCounter,
+      });
+      const ctxWithExcluded = createBasicContext({
+        agentConfig: {
+          tools: [activeTool, deferredTool, programmaticTool],
+          toolRegistry,
+        },
+        tokenCounter: mockTokenCounter,
+      });
+
+      await ctxBase.tokenCalculationPromise;
+      await ctxWithExcluded.tokenCalculationPromise;
+
+      expect(ctxWithExcluded.toolSchemaTokens).toBe(ctxBase.toolSchemaTokens);
+    });
+
+    it('includes deferred instance tools once discovered via discoveredTools input', async () => {
+      const tools = [createMockTool('deferred_tool')];
+      const toolRegistry: t.LCToolRegistry = new Map([
+        ['deferred_tool', { name: 'deferred_tool', defer_loading: true }],
+      ]);
+
+      const ctxUndiscovered = createBasicContext({
+        agentConfig: { tools, toolRegistry },
+        tokenCounter: mockTokenCounter,
+      });
+      const ctxDiscovered = createBasicContext({
+        agentConfig: {
+          tools,
+          toolRegistry,
+          discoveredTools: ['deferred_tool'],
+        },
+        tokenCounter: mockTokenCounter,
+      });
+
+      await ctxUndiscovered.tokenCalculationPromise;
+      await ctxDiscovered.tokenCalculationPromise;
+
+      expect(ctxUndiscovered.toolSchemaTokens).toBe(0);
+      expect(ctxDiscovered.toolSchemaTokens).toBeGreaterThan(0);
+    });
+
+    it('does not filter instance tools in event-driven mode (matches getEventDrivenToolsForBinding)', async () => {
+      // In event-driven mode, getEventDrivenToolsForBinding appends
+      // `this.tools` UNFILTERED. Accounting must do the same — otherwise we
+      // under-count and risk exceeding the model's context budget.
+      const activeDef: t.LCTool = {
+        name: 'active_def',
+        description: 'Always loaded',
+        parameters: { type: 'object', properties: {} },
+      };
+      const nativeTool = createMockTool('native_tool');
+      // Registry marks the native tool as deferred-undiscovered. In the
+      // non-event-driven path this would exclude it; in event-driven mode
+      // it is still bound and must still be counted.
+      const toolRegistry: t.LCToolRegistry = new Map([
+        ['native_tool', { name: 'native_tool', defer_loading: true }],
+      ]);
+
+      const ctxWithoutNative = createBasicContext({
+        agentConfig: {
+          toolDefinitions: [activeDef],
+          toolRegistry,
+        },
+        tokenCounter: mockTokenCounter,
+      });
+      const ctxWithNative = createBasicContext({
+        agentConfig: {
+          toolDefinitions: [activeDef],
+          tools: [nativeTool],
+          toolRegistry,
+        },
+        tokenCounter: mockTokenCounter,
+      });
+
+      await ctxWithoutNative.tokenCalculationPromise;
+      await ctxWithNative.tokenCalculationPromise;
+
+      expect(ctxWithNative.toolSchemaTokens).toBeGreaterThan(
+        ctxWithoutNative.toolSchemaTokens
+      );
+    });
+
     it('includes deferred toolDefinitions once discovered via discoveredTools input', async () => {
       const toolDefinitions: t.LCTool[] = [
         {
@@ -448,6 +583,36 @@ describe('AgentContext', () => {
       expect(ctx.getTokenBudgetBreakdown().toolCount).toBe(1);
     });
 
+    it('getTokenBudgetBreakdown toolCount excludes deferred-undiscovered instance tools', () => {
+      // Mirrors the toolDefinitions test for the instance-tools path so
+      // toolCount stays aligned with toolSchemaTokens (and with what
+      // getToolsForBinding actually emits) for non-event-driven runs.
+      const tools = [
+        createMockTool('active_tool'),
+        createMockTool('deferred_tool'),
+        createMockTool('programmatic_tool'),
+      ];
+      const toolRegistry: t.LCToolRegistry = new Map([
+        ['active_tool', { name: 'active_tool' }],
+        ['deferred_tool', { name: 'deferred_tool', defer_loading: true }],
+        [
+          'programmatic_tool',
+          {
+            name: 'programmatic_tool',
+            allowed_callers: ['code_execution'],
+          },
+        ],
+      ]);
+
+      const ctx = createBasicContext({
+        agentConfig: { tools, toolRegistry },
+      });
+
+      expect(ctx.getTokenBudgetBreakdown().toolCount).toBe(1);
+      ctx.markToolsAsDiscovered(['deferred_tool']);
+      expect(ctx.getTokenBudgetBreakdown().toolCount).toBe(2);
+    });
+
     it('getTokenBudgetBreakdown toolCount reflects newly discovered deferred tools', () => {
       const toolDefinitions: t.LCTool[] = [
         {
@@ -462,6 +627,19 @@ describe('AgentContext', () => {
       expect(ctx.getTokenBudgetBreakdown().toolCount).toBe(0);
       ctx.markToolsAsDiscovered(['deferred']);
       expect(ctx.getTokenBudgetBreakdown().toolCount).toBe(1);
+    });
+
+    it('getTokenBudgetBreakdown toolCount includes graphTools', () => {
+      // graphTools (handoff/subagent) are bound to the model alongside
+      // instance tools. Now that toolCount derives from getToolsForBinding(),
+      // graphTools are reflected in the diagnostic just like they're
+      // counted in toolSchemaTokens. Locks in that alignment.
+      const ctx = createBasicContext({
+        agentConfig: { tools: [createMockTool('direct_tool')] },
+      });
+      ctx.graphTools = [createMockTool('handoff_tool')];
+
+      expect(ctx.getTokenBudgetBreakdown().toolCount).toBe(2);
     });
 
     it('toolSchemaTokens snapshot does not auto-update after markToolsAsDiscovered', async () => {
