@@ -113,6 +113,15 @@ export type FileRef = {
   path?: string;
   /** Session ID this file belongs to (for multi-session file tracking) */
   session_id?: string;
+  /**
+   * `true` when the codeapi sandbox echoed this entry as an unchanged
+   * passthrough of an input the caller already owns (skill files,
+   * downloaded inputs whose hash matched the baseline, inherited
+   * `.dirkeep` markers). The tool-result formatter renders these as
+   * "Available files" rather than "Generated files" so the LLM doesn't
+   * conflate infrastructure inputs with newly-produced outputs.
+   */
+  inherited?: true;
 };
 
 export type FileRefs = FileRef[];
