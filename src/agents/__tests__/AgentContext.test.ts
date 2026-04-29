@@ -404,6 +404,40 @@ describe('AgentContext', () => {
       expect(ctxWithDeferred.toolSchemaTokens).toBe(ctxBase.toolSchemaTokens);
     });
 
+    it('excludes programmatic-only toolDefinitions from toolSchemaTokens', async () => {
+      // getEventDrivenToolsForBinding excludes definitions whose
+      // allowed_callers omit 'direct'. Accounting must mirror that — a
+      // programmatic-only definition is never bound to the model and
+      // shouldn't inflate toolSchemaTokens.
+      const activeDef: t.LCTool = {
+        name: 'active_tool',
+        description: 'Always loaded',
+        parameters: { type: 'object', properties: {} },
+      };
+      const programmaticDef: t.LCTool = {
+        name: 'programmatic_tool',
+        description: 'Only callable via code execution',
+        parameters: { type: 'object', properties: {} },
+        allowed_callers: ['code_execution'],
+      };
+
+      const ctxBase = createBasicContext({
+        agentConfig: { toolDefinitions: [activeDef] },
+        tokenCounter: mockTokenCounter,
+      });
+      const ctxWithProgrammatic = createBasicContext({
+        agentConfig: { toolDefinitions: [activeDef, programmaticDef] },
+        tokenCounter: mockTokenCounter,
+      });
+
+      await ctxBase.tokenCalculationPromise;
+      await ctxWithProgrammatic.tokenCalculationPromise;
+
+      expect(ctxWithProgrammatic.toolSchemaTokens).toBe(
+        ctxBase.toolSchemaTokens
+      );
+    });
+
     it('excludes deferred-undiscovered instance tools from toolSchemaTokens', async () => {
       const activeTool = createMockTool('active_tool');
       const deferredTool = createMockTool('deferred_tool');

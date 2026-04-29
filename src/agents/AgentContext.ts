@@ -681,10 +681,47 @@ export class AgentContext {
     if (!this.toolDefinitions) {
       return [];
     }
-    return this.toolDefinitions.filter(
-      (def) =>
+    /**
+     * Mirror `getEventDrivenToolsForBinding`'s gate: a definition is only
+     * bound to the model when its `allowed_callers` include `'direct'` and
+     * (if deferred) it has been discovered. Filtering by `defer_loading`
+     * alone left programmatic-only definitions counted in
+     * `toolSchemaTokens` even though they were never bound.
+     */
+    return this.toolDefinitions.filter((def) => {
+      const allowedCallers = def.allowed_callers ?? ['direct'];
+      if (!allowedCallers.includes('direct')) {
+        return false;
+      }
+      return (
         def.defer_loading !== true || this.discoveredToolNames.has(def.name)
-    );
+      );
+    });
+  }
+
+  /**
+   * Single source of truth for "which entries of `this.tools` should be
+   * treated as actually bound". Callers:
+   *   - `getToolsForBinding` (non-event-driven branch)
+   *   - `getEventDrivenToolsForBinding` (appends instance tools alongside
+   *     schema-only definitions)
+   *   - `calculateInstructionTokens` (counts schema bytes for accounting)
+   *
+   * In event-driven mode (`toolDefinitions` present) instance tools are
+   * appended unfiltered; outside event-driven mode they pass through
+   * `filterToolsForBinding`. Centralizing the decision here prevents the
+   * accounting/binding paths from drifting apart, which was the root
+   * cause of the original miscount.
+   */
+  private getEffectiveInstanceTools(): t.GraphTools | undefined {
+    if (!this.tools) {
+      return undefined;
+    }
+    const isEventDriven = (this.toolDefinitions?.length ?? 0) > 0;
+    if (isEventDriven || !this.toolRegistry) {
+      return this.tools;
+    }
+    return this.filterToolsForBinding(this.tools);
   }
 
   /**
@@ -704,27 +741,16 @@ export class AgentContext {
      * callers that mutate `graphTools` must re-trigger this method to
      * refresh `toolSchemaTokens`.
      *
-     * In the non-event-driven path, `getToolsForBinding` runs `this.tools`
-     * through `filterToolsForBinding` (skipping `defer_loading: true` tools
-     * not yet discovered, and tools whose `allowed_callers` exclude
-     * `'direct'`). Mirror that here so accounting reflects what is actually
-     * bound — without this, `toolSchemaTokens` reports the worst-case
-     * ceiling and can trigger spurious `empty_messages` preflight
-     * rejections at low `maxContextTokens`.
-     *
-     * In event-driven mode (`toolDefinitions` present), `getEventDriven-
-     * ToolsForBinding` appends `this.tools` unfiltered, so accounting must
-     * also leave them unfiltered to stay aligned. Deferred tools are
-     * instead represented through `toolDefinitions` and counted via
+     * Use `getEffectiveInstanceTools()` so accounting reflects exactly the
+     * subset that `getToolsForBinding` would emit — preventing the
+     * worst-case-ceiling miscount that triggered spurious `empty_messages`
+     * preflight rejections at low `maxContextTokens`. Deferred and
+     * non-`'direct'` `toolDefinitions` are excluded by
      * `getActiveToolDefinitions()` below.
      */
-    const isEventDriven = (this.toolDefinitions?.length ?? 0) > 0;
-    const filteredInstanceTools =
-      !isEventDriven && this.tools && this.toolRegistry
-        ? this.filterToolsForBinding(this.tools)
-        : (this.tools ?? []);
     const instanceTools: t.GraphTools = [
-      ...(filteredInstanceTools as t.GenericTool[]),
+      ...((this.getEffectiveInstanceTools() as t.GenericTool[] | undefined) ??
+        []),
       ...((this.graphTools as t.GenericTool[] | undefined) ?? []),
     ];
 
@@ -1041,10 +1067,7 @@ export class AgentContext {
       return this.getEventDrivenToolsForBinding();
     }
 
-    const filtered =
-      !this.tools || !this.toolRegistry
-        ? this.tools
-        : this.filterToolsForBinding(this.tools);
+    const filtered = this.getEffectiveInstanceTools();
 
     if (this.graphTools && this.graphTools.length > 0) {
       return [...(filtered ?? []), ...this.graphTools];
@@ -1059,21 +1082,9 @@ export class AgentContext {
       return this.graphTools ?? [];
     }
 
-    const defsToInclude = this.toolDefinitions.filter((def) => {
-      const allowedCallers = def.allowed_callers ?? ['direct'];
-      if (!allowedCallers.includes('direct')) {
-        return false;
-      }
-      if (
-        def.defer_loading === true &&
-        !this.discoveredToolNames.has(def.name)
-      ) {
-        return false;
-      }
-      return true;
-    });
-
-    const schemaTools = createSchemaOnlyTools(defsToInclude) as t.GraphTools;
+    const schemaTools = createSchemaOnlyTools(
+      this.getActiveToolDefinitions()
+    ) as t.GraphTools;
 
     const allTools = [...schemaTools];
 
@@ -1081,8 +1092,9 @@ export class AgentContext {
       allTools.push(...this.graphTools);
     }
 
-    if (this.tools && this.tools.length > 0) {
-      allTools.push(...this.tools);
+    const instanceTools = this.getEffectiveInstanceTools();
+    if (instanceTools && instanceTools.length > 0) {
+      allTools.push(...instanceTools);
     }
 
     return allTools;
