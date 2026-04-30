@@ -346,4 +346,81 @@ describe('_convertMessagesToAnthropicPayload — server tool use (web search) mu
     expect(textBlocks).toHaveLength(1);
     expect(textBlocks[0].text).toBe('Here are the results.');
   });
+
+  /**
+   * Regression for LibreChat discussion #12806.
+   *
+   * Anthropic web_search responses can include text blocks whose text is
+   * whitespace-only (e.g. ' ', '\n', '\t') alongside server_tool_use and
+   * web_search_tool_result blocks. On follow-up turns the API rejects these
+   * with: "messages: text content blocks must contain non-whitespace text".
+   *
+   * The empty-string check alone is insufficient — the filter must drop any
+   * text block whose trimmed content is empty.
+   */
+  it.each([
+    ['single space', ' '],
+    ['newline', '\n'],
+    ['tab', '\t'],
+    ['multiple spaces', '   '],
+    ['mixed whitespace', ' \n\t '],
+  ])(
+    'filters whitespace-only text blocks from array content (%s)',
+    (_label, whitespace) => {
+      const messageHistory: BaseMessage[] = [
+        new HumanMessage('search for X'),
+        new AIMessage({
+          content: [
+            { type: 'text', text: whitespace },
+            {
+              type: 'server_tool_use',
+              id: 'srvtoolu_1',
+              name: 'web_search',
+              input: { query: 'X' },
+            },
+            {
+              type: 'web_search_tool_result',
+              tool_use_id: 'srvtoolu_1',
+              content: [
+                {
+                  type: 'web_search_result',
+                  url: 'https://example.com',
+                  title: 'Result',
+                  encrypted_content: 'abc',
+                  page_age: '1d',
+                },
+              ],
+            },
+            { type: 'text', text: 'Here are the results.' },
+          ],
+          tool_calls: [
+            {
+              id: 'srvtoolu_1',
+              name: 'web_search',
+              args: { query: 'X' },
+              type: 'tool_call',
+            },
+          ],
+        }),
+        new HumanMessage('follow up'),
+      ];
+
+      const { messages } = _convertMessagesToAnthropicPayload(messageHistory);
+      const assistantContent = messages[1].content as any[];
+
+      const whitespaceTextBlocks = assistantContent.filter(
+        (b: any) =>
+          b.type === 'text' &&
+          typeof b.text === 'string' &&
+          b.text.trim() === ''
+      );
+      expect(whitespaceTextBlocks).toHaveLength(0);
+
+      const textBlocks = assistantContent.filter(
+        (b: any) => b.type === 'text'
+      );
+      expect(textBlocks).toHaveLength(1);
+      expect(textBlocks[0].text).toBe('Here are the results.');
+    }
+  );
 });
