@@ -611,7 +611,12 @@ function _formatContent(message: BaseMessage) {
     return contentBlocks.filter(
       (block) =>
         block !== null &&
-        !(block.type === 'text' && 'text' in block && block.text === '')
+        !(
+          block.type === 'text' &&
+          'text' in block &&
+          typeof block.text === 'string' &&
+          block.text.trim() === ''
+        )
     );
   }
 }
