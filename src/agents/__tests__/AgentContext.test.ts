@@ -178,6 +178,26 @@ describe('AgentContext', () => {
       expect(result[0].content).toBe('Dynamic only');
     });
 
+    it('keeps non-cache providers as plain system text with promptCache-like options', async () => {
+      const clientOptions: t.OpenAIClientOptions & { promptCache: true } = {
+        modelName: 'gpt-4o-mini',
+        promptCache: true,
+      };
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.OPENAI,
+          clientOptions,
+          instructions: 'Stable instructions',
+          additional_instructions: 'Dynamic instructions',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([]);
+      expect(result[0].content).toBe(
+        'Stable instructions\n\nDynamic instructions'
+      );
+    });
+
     it('preserves the Bedrock system cache point through message cache-control pass', async () => {
       const ctx = createBasicContext({
         agentConfig: {
