@@ -1,3 +1,4 @@
+import { AIMessage } from '@langchain/core/messages';
 import type { OpenAIChatInput } from '@langchain/openai';
 import type { ChatOpenRouterCallOptions } from '@/llm/openrouter';
 import type { CustomAnthropicInput } from '@/llm/anthropic';
@@ -34,6 +35,12 @@ type AzureReasoningModel = AzureChatOpenAI & {
 type OpenRouterFields = Partial<
   ChatOpenRouterCallOptions & Pick<OpenAIChatInput, 'model' | 'apiKey'>
 >;
+type CompletionDelegate = {
+  completionWithRetry: (request: { messages?: unknown }) => Promise<unknown>;
+};
+type CompletionBackedModel = {
+  completions: CompletionDelegate;
+};
 
 const baseAzureFields = {
   azureOpenAIApiKey: 'test-azure-key',
@@ -72,6 +79,13 @@ describe('custom chat model class smoke tests', () => {
     expect(model.getReasoningParams({ reasoning: { effort: 'high' } })).toEqual(
       { effort: 'high' }
     );
+    const params = model.invocationParams({ reasoningEffort: 'medium' }) as {
+      reasoning?: unknown;
+      reasoning_effort?: unknown;
+    };
+    expect(params.reasoning ?? { effort: params.reasoning_effort }).toEqual({
+      effort: 'low',
+    });
   });
 
   it('keeps Azure client customization and gates reasoning to reasoning models', () => {
@@ -140,6 +154,61 @@ describe('custom chat model class smoke tests', () => {
     expect(xai._lc_stream_delay).toBe(7);
     expect(xai.exposedClient).toBeInstanceOf(CustomOpenAIClient);
     expect(xaiRequestOptions.baseURL).toBe('https://xai.test/v1');
+  });
+
+  it('keeps Moonshot reasoning content in completion requests', async () => {
+    const moonshot = new ChatMoonshot({
+      model: 'moonshot-v1-8k',
+      apiKey: 'test-key',
+      streaming: false,
+    });
+    const completions = (moonshot as unknown as CompletionBackedModel)
+      .completions;
+    let requestMessages: unknown;
+
+    completions.completionWithRetry = async (request): Promise<unknown> => {
+      requestMessages = request.messages;
+      return {
+        id: 'chatcmpl-test',
+        object: 'chat.completion',
+        created: 0,
+        model: 'moonshot-v1-8k',
+        choices: [
+          {
+            index: 0,
+            finish_reason: 'stop',
+            message: {
+              role: 'assistant',
+              content: 'ok',
+            },
+          },
+        ],
+      };
+    };
+
+    await moonshot.invoke([
+      new AIMessage({
+        content: '',
+        additional_kwargs: { reasoning_content: 'kept-thinking' },
+        tool_calls: [
+          {
+            id: 'call_1',
+            name: 'lookup',
+            args: { q: 'test' },
+            type: 'tool_call',
+          },
+        ],
+      }),
+    ]);
+
+    expect(requestMessages).toEqual([
+      expect.objectContaining({
+        role: 'assistant',
+        content: '',
+        reasoning_content: 'kept-thinking',
+        tool_calls: expect.any(Array),
+      }),
+    ]);
   });
 
   it('keeps OpenRouter reasoning isolated from OpenAI reasoning_effort', () => {

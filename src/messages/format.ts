@@ -22,7 +22,7 @@ import type {
 import type { RunnableConfig } from '@langchain/core/runnables';
 import { emitAgentLog } from '@/utils/events';
 import { Providers, ContentTypes, Constants } from '@/common';
-import { toLangChainContent } from './langchain';
+import { toLangChainContent, toLangChainMessageFields } from './langchain';
 
 interface MediaMessageParams {
   message: {
@@ -211,10 +211,7 @@ export const formatMessage = ({
       return mediaMessage;
     }
 
-    return new HumanMessage({
-      ...mediaMessage,
-      content: toLangChainContent(mediaMessage.content),
-    });
+    return new HumanMessage(toLangChainMessageFields(mediaMessage));
   }
 
   if (!langChain) {
@@ -222,20 +219,11 @@ export const formatMessage = ({
   }
 
   if (role === 'user') {
-    return new HumanMessage({
-      ...formattedMessage,
-      content: toLangChainContent(formattedMessage.content),
-    });
+    return new HumanMessage(toLangChainMessageFields(formattedMessage));
   } else if (role === 'assistant') {
-    return new AIMessage({
-      ...formattedMessage,
-      content: toLangChainContent(formattedMessage.content),
-    });
+    return new AIMessage(toLangChainMessageFields(formattedMessage));
   } else {
-    return new SystemMessage({
-      ...formattedMessage,
-      content: toLangChainContent(formattedMessage.content),
-    });
+    return new SystemMessage(toLangChainMessageFields(formattedMessage));
   }
 };
 
