@@ -123,6 +123,22 @@ function stripAnthropicCacheControlFromBlocks(
   return { content: strippedContent, modified };
 }
 
+function sanitizeBedrockSystemMessage<T extends MessageWithContent>(
+  message: T
+): T {
+  const content = message.content;
+  if (!Array.isArray(content)) {
+    return message;
+  }
+
+  const stripped = stripAnthropicCacheControlFromBlocks(content);
+  if (!stripped.modified) {
+    return message;
+  }
+
+  return cloneMessage(message, stripped.content);
+}
+
 /**
  * Anthropic API: Adds cache control to the appropriate user messages in the payload.
  * Strips ALL existing cache control (both Anthropic and Bedrock formats) from all messages,
@@ -345,13 +361,7 @@ export function addBedrockCacheControl<
     const isSystemMessage =
       messageType === 'system' || messageRole === 'system';
     if (isSystemMessage) {
-      const systemContent = originalMessage.content;
-      if (Array.isArray(systemContent)) {
-        const stripped = stripAnthropicCacheControlFromBlocks(systemContent);
-        if (stripped.modified) {
-          updatedMessages[i] = cloneMessage(originalMessage, stripped.content);
-        }
-      }
+      updatedMessages[i] = sanitizeBedrockSystemMessage(originalMessage);
       continue;
     }
 
