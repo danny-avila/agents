@@ -136,6 +136,7 @@ async function createSummarizationRun(opts: {
   tools?: t.GraphTools;
   indexTokenCountMap?: Record<string, number>;
   llmConfigOverride?: Record<string, unknown>;
+  maxSummaryTokens?: number;
 }): Promise<Run<t.IState>> {
   const llmConfig = {
     ...getLLMConfig(opts.agentProvider),
@@ -155,6 +156,7 @@ async function createSummarizationRun(opts: {
       summarizationConfig: {
         provider: opts.summarizationProvider,
         model: opts.summarizationModel,
+        maxSummaryTokens: opts.maxSummaryTokens,
       },
     },
     returnContent: true,
@@ -240,6 +242,33 @@ function buildIndexTokenCountMap(
     map[String(i)] = tokenCounter(messages[i]);
   }
   return map;
+}
+
+function sumTokenCountMap(map: Record<string, number | undefined>): number {
+  let total = 0;
+  for (const key in map) {
+    total += map[key] ?? 0;
+  }
+  return total;
+}
+
+function createSeededTokenAuditHistory(): BaseMessage[] {
+  const details =
+    'Token audit context preserves index token counts, summary replacement, calibration data, and post-summary continuity. ' +
+    'Important retained values: alpha=1024, beta=2048, gamma=4096, checksum TOKEN-AUDIT-7F3. ' +
+    'The repeated detail intentionally exceeds a compact context budget. ';
+  const padding = details.repeat(8);
+
+  return [
+    new HumanMessage(
+      `Audit turn 1: establish the accounting scenario. ${padding}`
+    ),
+    new AIMessage(`Recorded turn 1 accounting notes. ${padding}`),
+    new HumanMessage(`Audit turn 2: add more retained details. ${padding}`),
+    new AIMessage(`Recorded turn 2 accounting notes. ${padding}`),
+    new HumanMessage(`Audit turn 3: preserve final identifiers. ${padding}`),
+    new AIMessage(`Recorded turn 3 accounting notes. ${padding}`),
+  ];
 }
 
 function logTurn(
@@ -2414,10 +2443,10 @@ const hasAnyApiKey =
   test('token count map is accurate after summarization cycle', async () => {
     const spies = createSpies();
     let collectedUsage: UsageMetadata[] = [];
-    const conversationHistory: BaseMessage[] = [];
+    const conversationHistory = createSeededTokenAuditHistory();
     const tokenCounter = await createTokenCounter();
 
-    const createRun = async (maxTokens = 4000): Promise<Run<t.IState>> => {
+    const createRun = async (maxTokens = 1200): Promise<Run<t.IState>> => {
       collectedUsage = [];
       const { aggregateContent } = createContentAggregator();
       const indexTokenCountMap = buildIndexTokenCountMap(
@@ -2429,80 +2458,44 @@ const hasAnyApiKey =
         summarizationProvider,
         summarizationModel,
         maxContextTokens: maxTokens,
-        instructions: INSTRUCTIONS,
+        instructions:
+          'You are a concise assistant. Preserve checkpoint context and answer in one short sentence.',
         collectedUsage,
         aggregateContent,
         spies,
         tokenCounter,
         indexTokenCountMap,
+        maxSummaryTokens: 300,
+        tools: [],
+        llmConfigOverride: {
+          maxTokens: 128,
+        },
       });
     };
 
-    // Accumulate messages over 6 turns at generous budget
-    let run = await createRun();
+    const originalMap = buildIndexTokenCountMap(
+      conversationHistory,
+      tokenCounter
+    );
+    const originalTokenTotal = sumTokenCountMap(originalMap);
+    expect(originalTokenTotal).toBeGreaterThan(1200);
+
+    const run = await createRun();
     await runTurn(
       { run, conversationHistory },
-      'What is 42 * 58? Calculator.',
+      'Acknowledge the preserved token audit context in one short sentence.',
       streamConfig
     );
 
-    run = await createRun();
-    await runTurn(
-      { run, conversationHistory },
-      'Now compute 2436 + 1000. Calculator.',
-      streamConfig
-    );
-
-    run = await createRun();
-    await runTurn(
-      { run, conversationHistory },
-      'What is 3436 / 4? Calculator.',
-      streamConfig
-    );
-
-    run = await createRun();
-    await runTurn(
-      { run, conversationHistory },
-      'Compute 999 * 2. Calculator.',
-      streamConfig
-    );
-
-    run = await createRun();
-    await runTurn(
-      { run, conversationHistory },
-      'What is 2^10? Calculator. Also list everything.',
-      streamConfig
-    );
-
-    run = await createRun();
-    await runTurn(
-      { run, conversationHistory },
-      'Calculate 355 / 113. Calculator.',
-      streamConfig
-    );
-
-    // Squeeze progressively to force summarization
-    for (const squeeze of [3500, 3200, 3100, 3000, 2800, 2500, 2000]) {
-      if (spies.onSummarizeStartSpy.mock.calls.length > 0) {
-        break;
-      }
-      run = await createRun(squeeze);
-      await runTurn(
-        { run, conversationHistory },
-        `What is ${squeeze} - 1000? Calculator.`,
-        streamConfig
-      );
-    }
-
-    // Verify summarization fired
     expect(spies.onSummarizeCompleteSpy).toHaveBeenCalled();
 
     const completePayload = spies.onSummarizeCompleteSpy.mock
       .calls[0][0] as t.SummarizeCompleteEvent;
-    expect(completePayload.summary!.tokenCount).toBeGreaterThan(10);
-    expect(completePayload.summary!.tokenCount).toBeLessThan(1500);
+    const summaryTokenCount = completePayload.summary!.tokenCount ?? 0;
+    expect(summaryTokenCount).toBeGreaterThan(10);
+    expect(summaryTokenCount).toBeLessThan(1500);
+    expect(summaryTokenCount).toBeLessThan(originalTokenTotal);
 
-    // Token accounting: collectedUsage should have valid entries
     const validUsage = collectedUsage.filter(
       (u: Partial<UsageMetadata>) =>
         u.input_tokens != null && u.input_tokens > 0
@@ -2510,8 +2503,8 @@ const hasAnyApiKey =
     expect(validUsage.length).toBeGreaterThan(0);
 
     console.log(
-      `  Token audit: summary=${completePayload.summary!.tokenCount} tokens, ` +
-        `usageEntries=${validUsage.length}`
+      `  Token audit: summary=${summaryTokenCount} tokens, ` +
+        `preTotal=${originalTokenTotal}, usageEntries=${validUsage.length}`
     );
   }, 180_000);
 
