@@ -97,10 +97,7 @@ class CustomChatConnection extends ChatConnection<VertexAIClientOptions> {
       }
       delete formattedData.generationConfig.thinkingConfig.thinkingBudget;
     }
-    if (
-      this.thinkingConfig?.thinkingLevel != null &&
-      this.thinkingConfig.thinkingLevel !== ''
-    ) {
+    if (this.thinkingConfig?.thinkingLevel != null) {
       formattedData.generationConfig ??= {};
       // thinkingLevel and thinkingBudget cannot coexist — the API rejects the request.
       // Remove thinkingBudget when thinkingLevel is set.

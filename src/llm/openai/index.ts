@@ -1,36 +1,25 @@
 import { AzureOpenAI as AzureOpenAIClient } from 'openai';
 import { ChatXAI as OriginalChatXAI } from '@langchain/xai';
 import { ChatGenerationChunk } from '@langchain/core/outputs';
-import { AIMessage, AIMessageChunk } from '@langchain/core/messages';
 import { ToolDefinition } from '@langchain/core/language_models/base';
-import { isLangChainTool } from '@langchain/core/utils/function_calling';
+import {
+  convertToOpenAITool,
+  isLangChainTool,
+} from '@langchain/core/utils/function_calling';
 import { ChatDeepSeek as OriginalChatDeepSeek } from '@langchain/deepseek';
 import { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import {
   getEndpoint,
   OpenAIClient,
-  formatToOpenAITool,
   ChatOpenAI as OriginalChatOpenAI,
   AzureChatOpenAI as OriginalAzureChatOpenAI,
 } from '@langchain/openai';
-import type {
-  OpenAIChatCallOptions,
-  OpenAIRoleEnum,
-  HeaderValue,
-  HeadersLike,
-} from './types';
+import type { HeaderValue, HeadersLike } from './types';
 import type { BindToolsInput } from '@langchain/core/language_models/chat_models';
-import type { BaseMessage, UsageMetadata } from '@langchain/core/messages';
-import type { ChatResult, ChatGeneration } from '@langchain/core/outputs';
+import type { BaseMessage } from '@langchain/core/messages';
 import type { ChatXAIInput } from '@langchain/xai';
 import type * as t from '@langchain/openai';
-import {
-  isReasoningModel,
-  _convertMessagesToOpenAIParams,
-  _convertMessagesToOpenAIResponsesParams,
-  _convertOpenAIResponsesDeltaToBaseMessageChunk,
-  type ResponseReturnStreamEvents,
-} from './utils';
+import { isReasoningModel } from './utils';
 import { sleep } from '@/utils';
 
 // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
@@ -79,10 +68,19 @@ export function normalizeHeaders(
   return Object.fromEntries(output.entries());
 }
 
-type OpenAICompletionParam =
-  OpenAIClient.Chat.Completions.ChatCompletionMessageParam;
-
 type OpenAICoreRequestOptions = OpenAIClient.RequestOptions;
+
+async function* delayStreamChunks<T>(
+  chunks: AsyncGenerator<T>,
+  delay?: number
+): AsyncGenerator<T> {
+  for await (const chunk of chunks) {
+    yield chunk;
+    if (delay != null) {
+      await sleep(delay);
+    }
+  }
+}
 
 function createAbortHandler(controller: AbortController): () => void {
   return function (): void {
@@ -113,12 +111,12 @@ export function _convertToOpenAITool(
   let toolDef: OpenAIClient.ChatCompletionTool | undefined;
 
   if (isLangChainTool(tool)) {
-    toolDef = formatToOpenAITool(tool);
+    toolDef = convertToOpenAITool(tool);
   } else {
     toolDef = tool as ToolDefinition;
   }
 
-  if (fields?.strict !== undefined) {
+  if (fields?.strict !== undefined && toolDef.type === 'function') {
     toolDef.function.strict = fields.strict;
   }
 
@@ -195,7 +193,6 @@ export class CustomAzureOpenAIClient extends AzureOpenAIClient {
   }
 }
 
-/** @ts-expect-error We are intentionally overriding `getReasoningParams` */
 export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
   _lc_stream_delay?: number;
 
@@ -214,7 +211,7 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
   static lc_name(): string {
     return 'LibreChatOpenAI';
   }
-  protected _getClientOptions(
+  _getClientOptions(
     options?: OpenAICoreRequestOptions
   ): OpenAICoreRequestOptions {
     if (!(this.client as OpenAIClient | undefined)) {
@@ -278,184 +275,13 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
-    if (!this._useResponseApi(options)) {
-      return yield* this._streamResponseChunks2(messages, options, runManager);
-    }
-    const streamIterable = await this.responseApiWithRetry(
-      {
-        ...this.invocationParams<'responses'>(options, { streaming: true }),
-        input: _convertMessagesToOpenAIResponsesParams(
-          messages,
-          this.model,
-          this.zdrEnabled
-        ),
-        stream: true,
-      },
-      options
+    yield* delayStreamChunks(
+      super._streamResponseChunks(messages, options, runManager),
+      this._lc_stream_delay
     );
-
-    for await (const data of streamIterable) {
-      const chunk = _convertOpenAIResponsesDeltaToBaseMessageChunk(
-        data as ResponseReturnStreamEvents
-      );
-      if (chunk == null) continue;
-      yield chunk;
-      if (this._lc_stream_delay != null) {
-        await sleep(this._lc_stream_delay);
-      }
-      await runManager?.handleLLMNewToken(
-        chunk.text || '',
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        { chunk }
-      );
-    }
-
-    return;
-  }
-
-  async *_streamResponseChunks2(
-    messages: BaseMessage[],
-    options: this['ParsedCallOptions'],
-    runManager?: CallbackManagerForLLMRun
-  ): AsyncGenerator<ChatGenerationChunk> {
-    const messagesMapped: OpenAICompletionParam[] =
-      _convertMessagesToOpenAIParams(messages, this.model);
-
-    const params = {
-      ...this.invocationParams(options, {
-        streaming: true,
-      }),
-      messages: messagesMapped,
-      stream: true as const,
-    };
-    let defaultRole: OpenAIRoleEnum | undefined;
-
-    const streamIterable = await this.completionWithRetry(params, options);
-    let usage: OpenAIClient.Completions.CompletionUsage | undefined;
-    for await (const data of streamIterable) {
-      const choice = data.choices[0] as
-        | Partial<OpenAIClient.Chat.Completions.ChatCompletionChunk.Choice>
-        | undefined;
-      if (data.usage) {
-        usage = data.usage;
-      }
-      if (!choice) {
-        continue;
-      }
-
-      const { delta } = choice;
-      if (!delta) {
-        continue;
-      }
-      const chunk = this._convertOpenAIDeltaToBaseMessageChunk(
-        delta,
-        data,
-        defaultRole
-      );
-      if ('reasoning_content' in delta) {
-        chunk.additional_kwargs.reasoning_content = delta.reasoning_content;
-      } else if ('reasoning' in delta) {
-        chunk.additional_kwargs.reasoning_content = delta.reasoning;
-      }
-      if ('provider_specific_fields' in delta) {
-        chunk.additional_kwargs.provider_specific_fields =
-          delta.provider_specific_fields;
-      }
-      defaultRole = delta.role ?? defaultRole;
-      const newTokenIndices = {
-        prompt: options.promptIndex ?? 0,
-        completion: choice.index ?? 0,
-      };
-      if (typeof chunk.content !== 'string') {
-        // eslint-disable-next-line no-console
-        console.log(
-          '[WARNING]: Received non-string content from OpenAI. This is currently not supported.'
-        );
-        continue;
-      }
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const generationInfo: Record<string, any> = { ...newTokenIndices };
-      if (choice.finish_reason != null) {
-        generationInfo.finish_reason = choice.finish_reason;
-        // Only include system fingerprint in the last chunk for now
-        // to avoid concatenation issues
-        generationInfo.system_fingerprint = data.system_fingerprint;
-        generationInfo.model_name = data.model;
-        generationInfo.service_tier = data.service_tier;
-      }
-      if (this.logprobs == true) {
-        generationInfo.logprobs = choice.logprobs;
-      }
-      const generationChunk = new ChatGenerationChunk({
-        message: chunk,
-        text: chunk.content,
-        generationInfo,
-      });
-      yield generationChunk;
-      if (this._lc_stream_delay != null) {
-        await sleep(this._lc_stream_delay);
-      }
-      await runManager?.handleLLMNewToken(
-        generationChunk.text || '',
-        newTokenIndices,
-        undefined,
-        undefined,
-        undefined,
-        { chunk: generationChunk }
-      );
-    }
-    if (usage) {
-      const inputTokenDetails = {
-        ...(usage.prompt_tokens_details?.audio_tokens != null && {
-          audio: usage.prompt_tokens_details.audio_tokens,
-        }),
-        ...(usage.prompt_tokens_details?.cached_tokens != null && {
-          cache_read: usage.prompt_tokens_details.cached_tokens,
-        }),
-      };
-      const outputTokenDetails = {
-        ...(usage.completion_tokens_details?.audio_tokens != null && {
-          audio: usage.completion_tokens_details.audio_tokens,
-        }),
-        ...(usage.completion_tokens_details?.reasoning_tokens != null && {
-          reasoning: usage.completion_tokens_details.reasoning_tokens,
-        }),
-      };
-      const generationChunk = new ChatGenerationChunk({
-        message: new AIMessageChunk({
-          content: '',
-          response_metadata: {
-            usage: { ...usage },
-          },
-          usage_metadata: {
-            input_tokens: usage.prompt_tokens,
-            output_tokens: usage.completion_tokens,
-            total_tokens: usage.total_tokens,
-            ...(Object.keys(inputTokenDetails).length > 0 && {
-              input_token_details: inputTokenDetails,
-            }),
-            ...(Object.keys(outputTokenDetails).length > 0 && {
-              output_token_details: outputTokenDetails,
-            }),
-          },
-        }),
-        text: '',
-      });
-      yield generationChunk;
-      if (this._lc_stream_delay != null) {
-        await sleep(this._lc_stream_delay);
-      }
-    }
-    if (options.signal?.aborted === true) {
-      throw new Error('AbortError');
-    }
   }
 }
 
-/** @ts-expect-error We are intentionally overriding `getReasoningParams` */
 export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
   _lc_stream_delay?: number;
 
@@ -505,7 +331,7 @@ export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
     return this.getReasoningParams(options);
   }
 
-  protected _getClientOptions(
+  _getClientOptions(
     options: OpenAICoreRequestOptions | undefined
   ): OpenAICoreRequestOptions {
     if (!(this.client as unknown as AzureOpenAIClient | undefined)) {
@@ -572,45 +398,24 @@ export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
-    if (!this._useResponseApi(options)) {
-      return yield* super._streamResponseChunks(messages, options, runManager);
-    }
-    const streamIterable = await this.responseApiWithRetry(
-      {
-        ...this.invocationParams<'responses'>(options, { streaming: true }),
-        input: _convertMessagesToOpenAIResponsesParams(
-          messages,
-          this.model,
-          this.zdrEnabled
-        ),
-        stream: true,
-      },
-      options
+    yield* delayStreamChunks(
+      super._streamResponseChunks(messages, options, runManager),
+      this._lc_stream_delay
     );
-
-    for await (const data of streamIterable) {
-      const chunk = _convertOpenAIResponsesDeltaToBaseMessageChunk(
-        data as ResponseReturnStreamEvents
-      );
-      if (chunk == null) continue;
-      yield chunk;
-      if (this._lc_stream_delay != null) {
-        await sleep(this._lc_stream_delay);
-      }
-      await runManager?.handleLLMNewToken(
-        chunk.text || '',
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        { chunk }
-      );
-    }
-
-    return;
   }
 }
 export class ChatDeepSeek extends OriginalChatDeepSeek {
+  _lc_stream_delay?: number;
+
+  constructor(
+    fields?: ConstructorParameters<typeof OriginalChatDeepSeek>[0] & {
+      _lc_stream_delay?: number;
+    }
+  ) {
+    super(fields);
+    this._lc_stream_delay = fields?._lc_stream_delay;
+  }
+
   public get exposedClient(): CustomOpenAIClient {
     return this.client;
   }
@@ -618,111 +423,7 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
     return 'LibreChatDeepSeek';
   }
 
-  protected _convertMessages(messages: BaseMessage[]): OpenAICompletionParam[] {
-    return _convertMessagesToOpenAIParams(messages, this.model, {
-      includeReasoningContent: true,
-    });
-  }
-
-  async _generate(
-    messages: BaseMessage[],
-    options: this['ParsedCallOptions'] | undefined,
-    runManager?: CallbackManagerForLLMRun
-  ): Promise<ChatResult> {
-    const params = this.invocationParams(options);
-
-    if (params.stream === true) {
-      return super._generate(messages, options ?? {}, runManager);
-    }
-
-    const messagesMapped = this._convertMessages(messages);
-    const data = await this.completionWithRetry(
-      {
-        ...params,
-        stream: false,
-        messages: messagesMapped,
-      },
-      {
-        signal: options?.signal,
-        ...options?.options,
-      }
-    );
-
-    const { completion_tokens, prompt_tokens, total_tokens } = data.usage ?? {};
-
-    const generations = [];
-    for (const part of data.choices ?? []) {
-      const text = part.message.content ?? '';
-      const generation: ChatGeneration = {
-        text: typeof text === 'string' ? text : '',
-        message: this._convertResponseToMessage(part, data),
-      };
-      generation.generationInfo = {
-        ...(part.finish_reason != null
-          ? { finish_reason: part.finish_reason }
-          : {}),
-        ...(part.logprobs ? { logprobs: part.logprobs } : {}),
-      };
-      generations.push(generation);
-    }
-
-    return {
-      generations,
-      llmOutput: {
-        tokenUsage: {
-          completionTokens: completion_tokens,
-          promptTokens: prompt_tokens,
-          totalTokens: total_tokens,
-        },
-      },
-    };
-  }
-
-  protected _convertResponseToMessage(
-    choice: OpenAIClient.Chat.Completions.ChatCompletion.Choice,
-    data: OpenAIClient.Chat.Completions.ChatCompletion
-  ): AIMessage {
-    const { message } = choice;
-    const rawToolCalls = message.tool_calls;
-    const toolCalls = rawToolCalls?.map((tc) => ({
-      id: tc.id,
-      name: tc.function.name,
-      args: JSON.parse(tc.function.arguments || '{}'),
-      type: 'tool_call' as const,
-    }));
-
-    const additional_kwargs: Record<string, unknown> = {};
-    if (rawToolCalls) {
-      additional_kwargs.tool_calls = rawToolCalls;
-    }
-    if (
-      'reasoning_content' in message &&
-      message.reasoning_content != null &&
-      message.reasoning_content !== ''
-    ) {
-      additional_kwargs.reasoning_content = message.reasoning_content;
-    }
-
-    return new AIMessage({
-      content: message.content ?? '',
-      tool_calls: toolCalls,
-      additional_kwargs,
-      usage_metadata: data.usage
-        ? {
-          input_tokens: data.usage.prompt_tokens,
-          output_tokens: data.usage.completion_tokens,
-          total_tokens: data.usage.total_tokens,
-        }
-        : undefined,
-      response_metadata: {
-        model_name: data.model,
-        system_fingerprint: data.system_fingerprint,
-        finish_reason: choice.finish_reason,
-      },
-    });
-  }
-
-  protected _getClientOptions(
+  _getClientOptions(
     options?: OpenAICoreRequestOptions
   ): OpenAICoreRequestOptions {
     if (!(this.client as OpenAIClient | undefined)) {
@@ -755,125 +456,10 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
-    const messagesMapped: OpenAICompletionParam[] =
-      _convertMessagesToOpenAIParams(messages, this.model, {
-        includeReasoningContent: true,
-      });
-
-    const params = {
-      ...this.invocationParams(options, {
-        streaming: true,
-      }),
-      messages: messagesMapped,
-      stream: true as const,
-    };
-    let defaultRole: OpenAIRoleEnum | undefined;
-
-    const streamIterable = await this.completionWithRetry(params, options);
-    let usage: OpenAIClient.Completions.CompletionUsage | undefined;
-    for await (const data of streamIterable) {
-      const choice = data.choices[0] as
-        | Partial<OpenAIClient.Chat.Completions.ChatCompletionChunk.Choice>
-        | undefined;
-      if (data.usage) {
-        usage = data.usage;
-      }
-      if (!choice) {
-        continue;
-      }
-
-      const { delta } = choice;
-      if (!delta) {
-        continue;
-      }
-      const chunk = this._convertOpenAIDeltaToBaseMessageChunk(
-        delta,
-        data,
-        defaultRole
-      );
-      if ('reasoning_content' in delta) {
-        chunk.additional_kwargs.reasoning_content = delta.reasoning_content;
-      }
-      defaultRole = delta.role ?? defaultRole;
-      const newTokenIndices = {
-        prompt: (options as OpenAIChatCallOptions).promptIndex ?? 0,
-        completion: choice.index ?? 0,
-      };
-      if (typeof chunk.content !== 'string') {
-        // eslint-disable-next-line no-console
-        console.log(
-          '[WARNING]: Received non-string content from OpenAI. This is currently not supported.'
-        );
-        continue;
-      }
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const generationInfo: Record<string, any> = { ...newTokenIndices };
-      if (choice.finish_reason != null) {
-        generationInfo.finish_reason = choice.finish_reason;
-        generationInfo.system_fingerprint = data.system_fingerprint;
-        generationInfo.model_name = data.model;
-        generationInfo.service_tier = data.service_tier;
-      }
-      if (this.logprobs == true) {
-        generationInfo.logprobs = choice.logprobs;
-      }
-      const generationChunk = new ChatGenerationChunk({
-        message: chunk,
-        text: chunk.content,
-        generationInfo,
-      });
-      yield generationChunk;
-      await runManager?.handleLLMNewToken(
-        generationChunk.text || '',
-        newTokenIndices,
-        undefined,
-        undefined,
-        undefined,
-        { chunk: generationChunk }
-      );
-    }
-    if (usage) {
-      const inputTokenDetails = {
-        ...(usage.prompt_tokens_details?.audio_tokens != null && {
-          audio: usage.prompt_tokens_details.audio_tokens,
-        }),
-        ...(usage.prompt_tokens_details?.cached_tokens != null && {
-          cache_read: usage.prompt_tokens_details.cached_tokens,
-        }),
-      };
-      const outputTokenDetails = {
-        ...(usage.completion_tokens_details?.audio_tokens != null && {
-          audio: usage.completion_tokens_details.audio_tokens,
-        }),
-        ...(usage.completion_tokens_details?.reasoning_tokens != null && {
-          reasoning: usage.completion_tokens_details.reasoning_tokens,
-        }),
-      };
-      const generationChunk = new ChatGenerationChunk({
-        message: new AIMessageChunk({
-          content: '',
-          response_metadata: {
-            usage: { ...usage },
-          },
-          usage_metadata: {
-            input_tokens: usage.prompt_tokens,
-            output_tokens: usage.completion_tokens,
-            total_tokens: usage.total_tokens,
-            ...(Object.keys(inputTokenDetails).length > 0 && {
-              input_token_details: inputTokenDetails,
-            }),
-            ...(Object.keys(outputTokenDetails).length > 0 && {
-              output_token_details: outputTokenDetails,
-            }),
-          },
-        }),
-        text: '',
-      });
-      yield generationChunk;
-    }
-    if (options.signal?.aborted === true) {
-      throw new Error('AbortError');
-    }
+    yield* delayStreamChunks(
+      super._streamResponseChunks(messages, options, runManager),
+      this._lc_stream_delay
+    );
   }
 }
 
@@ -898,240 +484,6 @@ export interface XAIUsageMetadata
 export class ChatMoonshot extends ChatOpenAI {
   static lc_name(): 'LibreChatMoonshot' {
     return 'LibreChatMoonshot';
-  }
-
-  protected _convertMessages(messages: BaseMessage[]): OpenAICompletionParam[] {
-    return _convertMessagesToOpenAIParams(messages, this.model, {
-      includeReasoningContent: true,
-    });
-  }
-
-  async _generate(
-    messages: BaseMessage[],
-    options: this['ParsedCallOptions'],
-    runManager?: CallbackManagerForLLMRun
-  ): Promise<ChatResult> {
-    const params = this.invocationParams(options);
-
-    if (params.stream === true) {
-      return super._generate(messages, options, runManager);
-    }
-
-    const messagesMapped = this._convertMessages(messages);
-    const data = await this.completionWithRetry(
-      {
-        ...params,
-        stream: false,
-        messages: messagesMapped,
-      },
-      {
-        signal: options.signal,
-        ...options.options,
-      }
-    );
-
-    const { completion_tokens, prompt_tokens, total_tokens } = data.usage ?? {};
-
-    const generations = [];
-    for (const part of data.choices ?? []) {
-      const text = part.message.content ?? '';
-      const generation: ChatGeneration = {
-        text: typeof text === 'string' ? text : '',
-        message: this._convertResponseToMessage(part, data),
-      };
-      generation.generationInfo = {
-        ...(part.finish_reason ? { finish_reason: part.finish_reason } : {}),
-        ...(part.logprobs ? { logprobs: part.logprobs } : {}),
-      };
-      generations.push(generation);
-    }
-
-    return {
-      generations,
-      llmOutput: {
-        tokenUsage: {
-          completionTokens: completion_tokens,
-          promptTokens: prompt_tokens,
-          totalTokens: total_tokens,
-        },
-      },
-    };
-  }
-
-  protected _convertResponseToMessage(
-    choice: OpenAIClient.Chat.Completions.ChatCompletion.Choice,
-    data: OpenAIClient.Chat.Completions.ChatCompletion
-  ): AIMessage {
-    const { message } = choice;
-    const rawToolCalls = message.tool_calls;
-    const toolCalls = rawToolCalls?.map((tc) => ({
-      id: tc.id,
-      name: tc.function.name,
-      args: JSON.parse(tc.function.arguments || '{}'),
-      type: 'tool_call' as const,
-    }));
-
-    const additional_kwargs: Record<string, unknown> = {};
-    if (rawToolCalls) {
-      additional_kwargs.tool_calls = rawToolCalls;
-    }
-    if (
-      'reasoning_content' in message &&
-      message.reasoning_content != null &&
-      message.reasoning_content !== ''
-    ) {
-      additional_kwargs.reasoning_content = message.reasoning_content;
-    }
-
-    return new AIMessage({
-      content: message.content ?? '',
-      tool_calls: toolCalls,
-      additional_kwargs,
-      usage_metadata: data.usage
-        ? {
-          input_tokens: data.usage.prompt_tokens,
-          output_tokens: data.usage.completion_tokens,
-          total_tokens: data.usage.total_tokens,
-        }
-        : undefined,
-      response_metadata: {
-        model_name: data.model,
-        system_fingerprint: data.system_fingerprint,
-        finish_reason: choice.finish_reason,
-      },
-    });
-  }
-
-  async *_streamResponseChunks(
-    messages: BaseMessage[],
-    options: this['ParsedCallOptions'],
-    runManager?: CallbackManagerForLLMRun
-  ): AsyncGenerator<ChatGenerationChunk> {
-    const messagesMapped: OpenAICompletionParam[] =
-      _convertMessagesToOpenAIParams(messages, this.model, {
-        includeReasoningContent: true,
-      });
-
-    const params = {
-      ...this.invocationParams(options, {
-        streaming: true,
-      }),
-      messages: messagesMapped,
-      stream: true as const,
-    };
-    let defaultRole: OpenAIRoleEnum | undefined;
-
-    const streamIterable = await this.completionWithRetry(params, options);
-    let usage: OpenAIClient.Completions.CompletionUsage | undefined;
-    for await (const data of streamIterable) {
-      const choice = data.choices[0] as
-        | Partial<OpenAIClient.Chat.Completions.ChatCompletionChunk.Choice>
-        | undefined;
-      if (data.usage) {
-        usage = data.usage;
-      }
-      if (!choice) {
-        continue;
-      }
-
-      const { delta } = choice;
-      if (!delta) {
-        continue;
-      }
-      const chunk = this._convertOpenAIDeltaToBaseMessageChunk(
-        delta,
-        data,
-        defaultRole
-      );
-      if ('reasoning_content' in delta) {
-        chunk.additional_kwargs.reasoning_content = delta.reasoning_content;
-      }
-      defaultRole = delta.role ?? defaultRole;
-      const newTokenIndices = {
-        prompt: (options as OpenAIChatCallOptions).promptIndex ?? 0,
-        completion: choice.index ?? 0,
-      };
-      if (typeof chunk.content !== 'string') {
-        // eslint-disable-next-line no-console
-        console.log(
-          '[WARNING]: Received non-string content from OpenAI. This is currently not supported.'
-        );
-        continue;
-      }
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const generationInfo: Record<string, any> = { ...newTokenIndices };
-      if (choice.finish_reason != null) {
-        generationInfo.finish_reason = choice.finish_reason;
-        generationInfo.system_fingerprint = data.system_fingerprint;
-        generationInfo.model_name = data.model;
-        generationInfo.service_tier = data.service_tier;
-      }
-      if (this.logprobs == true) {
-        generationInfo.logprobs = choice.logprobs;
-      }
-      const generationChunk = new ChatGenerationChunk({
-        message: chunk,
-        text: chunk.content,
-        generationInfo,
-      });
-      yield generationChunk;
-      if (this._lc_stream_delay != null) {
-        await sleep(this._lc_stream_delay);
-      }
-      await runManager?.handleLLMNewToken(
-        generationChunk.text || '',
-        newTokenIndices,
-        undefined,
-        undefined,
-        undefined,
-        { chunk: generationChunk }
-      );
-    }
-    if (usage) {
-      const inputTokenDetails = {
-        ...(usage.prompt_tokens_details?.audio_tokens != null && {
-          audio: usage.prompt_tokens_details.audio_tokens,
-        }),
-        ...(usage.prompt_tokens_details?.cached_tokens != null && {
-          cache_read: usage.prompt_tokens_details.cached_tokens,
-        }),
-      };
-      const outputTokenDetails = {
-        ...(usage.completion_tokens_details?.audio_tokens != null && {
-          audio: usage.completion_tokens_details.audio_tokens,
-        }),
-        ...(usage.completion_tokens_details?.reasoning_tokens != null && {
-          reasoning: usage.completion_tokens_details.reasoning_tokens,
-        }),
-      };
-      const generationChunk = new ChatGenerationChunk({
-        message: new AIMessageChunk({
-          content: '',
-          response_metadata: {
-            usage: { ...usage },
-          },
-          usage_metadata: {
-            input_tokens: usage.prompt_tokens,
-            output_tokens: usage.completion_tokens,
-            total_tokens: usage.total_tokens,
-            ...(Object.keys(inputTokenDetails).length > 0 && {
-              input_token_details: inputTokenDetails,
-            }),
-            ...(Object.keys(outputTokenDetails).length > 0 && {
-              output_token_details: outputTokenDetails,
-            }),
-          },
-        }),
-        text: '',
-      });
-      yield generationChunk;
-      if (this._lc_stream_delay != null) {
-        await sleep(this._lc_stream_delay);
-      }
-    }
-    if (options.signal?.aborted === true) {
-      throw new Error('AbortError');
-    }
   }
 }
 
@@ -1168,7 +520,7 @@ export class ChatXAI extends OriginalChatXAI {
     return this.client;
   }
 
-  protected _getClientOptions(
+  _getClientOptions(
     options?: OpenAICoreRequestOptions
   ): OpenAICoreRequestOptions {
     if (!(this.client as OpenAIClient | undefined)) {
@@ -1201,166 +553,9 @@ export class ChatXAI extends OriginalChatXAI {
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
-    const messagesMapped: OpenAICompletionParam[] =
-      _convertMessagesToOpenAIParams(messages, this.model);
-
-    const params = {
-      ...this.invocationParams(options, {
-        streaming: true,
-      }),
-      messages: messagesMapped,
-      stream: true as const,
-    };
-    let defaultRole: OpenAIRoleEnum | undefined;
-
-    const streamIterable = await this.completionWithRetry(params, options);
-    let usage: OpenAIClient.Completions.CompletionUsage | undefined;
-    for await (const data of streamIterable) {
-      const choice = data.choices[0] as
-        | Partial<OpenAIClient.Chat.Completions.ChatCompletionChunk.Choice>
-        | undefined;
-      if (data.usage) {
-        usage = data.usage;
-      }
-      if (!choice) {
-        continue;
-      }
-
-      const { delta } = choice;
-      if (!delta) {
-        continue;
-      }
-      const chunk = this._convertOpenAIDeltaToBaseMessageChunk(
-        delta,
-        data,
-        defaultRole
-      );
-      if (chunk.usage_metadata != null) {
-        chunk.usage_metadata = {
-          input_tokens:
-            (chunk.usage_metadata as Partial<UsageMetadata>).input_tokens ?? 0,
-          output_tokens:
-            (chunk.usage_metadata as Partial<UsageMetadata>).output_tokens ?? 0,
-          total_tokens:
-            (chunk.usage_metadata as Partial<UsageMetadata>).total_tokens ?? 0,
-        };
-      }
-      if ('reasoning_content' in delta) {
-        chunk.additional_kwargs.reasoning_content = delta.reasoning_content;
-      }
-      defaultRole = delta.role ?? defaultRole;
-      const newTokenIndices = {
-        prompt: (options as OpenAIChatCallOptions).promptIndex ?? 0,
-        completion: choice.index ?? 0,
-      };
-      if (typeof chunk.content !== 'string') {
-        // eslint-disable-next-line no-console
-        console.log(
-          '[WARNING]: Received non-string content from OpenAI. This is currently not supported.'
-        );
-        continue;
-      }
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const generationInfo: Record<string, any> = { ...newTokenIndices };
-      if (choice.finish_reason != null) {
-        generationInfo.finish_reason = choice.finish_reason;
-        // Only include system fingerprint in the last chunk for now
-        // to avoid concatenation issues
-        generationInfo.system_fingerprint = data.system_fingerprint;
-        generationInfo.model_name = data.model;
-        generationInfo.service_tier = data.service_tier;
-      }
-      if (this.logprobs == true) {
-        generationInfo.logprobs = choice.logprobs;
-      }
-      const generationChunk = new ChatGenerationChunk({
-        message: chunk,
-        text: chunk.content,
-        generationInfo,
-      });
-      yield generationChunk;
-      if (this._lc_stream_delay != null) {
-        await sleep(this._lc_stream_delay);
-      }
-      await runManager?.handleLLMNewToken(
-        generationChunk.text || '',
-        newTokenIndices,
-        undefined,
-        undefined,
-        undefined,
-        { chunk: generationChunk }
-      );
-    }
-    if (usage) {
-      // Type assertion for xAI-specific usage structure
-      const xaiUsage = usage as XAIUsageMetadata;
-      const inputTokenDetails = {
-        // Standard OpenAI fields
-        ...(usage.prompt_tokens_details?.audio_tokens != null && {
-          audio: usage.prompt_tokens_details.audio_tokens,
-        }),
-        ...(usage.prompt_tokens_details?.cached_tokens != null && {
-          cache_read: usage.prompt_tokens_details.cached_tokens,
-        }),
-        // Add xAI-specific prompt token details if they exist
-        ...(xaiUsage.prompt_tokens_details?.text_tokens != null && {
-          text: xaiUsage.prompt_tokens_details.text_tokens,
-        }),
-        ...(xaiUsage.prompt_tokens_details?.image_tokens != null && {
-          image: xaiUsage.prompt_tokens_details.image_tokens,
-        }),
-      };
-      const outputTokenDetails = {
-        // Standard OpenAI fields
-        ...(usage.completion_tokens_details?.audio_tokens != null && {
-          audio: usage.completion_tokens_details.audio_tokens,
-        }),
-        ...(usage.completion_tokens_details?.reasoning_tokens != null && {
-          reasoning: usage.completion_tokens_details.reasoning_tokens,
-        }),
-        // Add xAI-specific completion token details if they exist
-        ...(xaiUsage.completion_tokens_details?.accepted_prediction_tokens !=
-          null && {
-          accepted_prediction:
-            xaiUsage.completion_tokens_details.accepted_prediction_tokens,
-        }),
-        ...(xaiUsage.completion_tokens_details?.rejected_prediction_tokens !=
-          null && {
-          rejected_prediction:
-            xaiUsage.completion_tokens_details.rejected_prediction_tokens,
-        }),
-      };
-      const generationChunk = new ChatGenerationChunk({
-        message: new AIMessageChunk({
-          content: '',
-          response_metadata: {
-            usage: { ...usage },
-            // Include xAI-specific metadata if it exists
-            ...(xaiUsage.num_sources_used != null && {
-              num_sources_used: xaiUsage.num_sources_used,
-            }),
-          },
-          usage_metadata: {
-            input_tokens: usage.prompt_tokens,
-            output_tokens: usage.completion_tokens,
-            total_tokens: usage.total_tokens,
-            ...(Object.keys(inputTokenDetails).length > 0 && {
-              input_token_details: inputTokenDetails,
-            }),
-            ...(Object.keys(outputTokenDetails).length > 0 && {
-              output_token_details: outputTokenDetails,
-            }),
-          },
-        }),
-        text: '',
-      });
-      yield generationChunk;
-      if (this._lc_stream_delay != null) {
-        await sleep(this._lc_stream_delay);
-      }
-    }
-    if (options.signal?.aborted === true) {
-      throw new Error('AbortError');
-    }
+    yield* delayStreamChunks(
+      super._streamResponseChunks(messages, options, runManager),
+      this._lc_stream_delay
+    );
   }
 }

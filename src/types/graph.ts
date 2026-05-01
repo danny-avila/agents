@@ -1,14 +1,5 @@
 // src/types/graph.ts
-import type {
-  START,
-  StateType,
-  UpdateType,
-  StateGraph,
-  StateGraphArgs,
-  StateDefinition,
-  CompiledStateGraph,
-  BinaryOperatorAggregate,
-} from '@langchain/langgraph';
+import type { START, StateGraph, StateGraphArgs } from '@langchain/langgraph';
 import type { BindToolsInput } from '@langchain/core/language_models/chat_models';
 import type {
   BaseMessage,
@@ -129,76 +120,32 @@ export type Workflow<
   N extends string = string,
 > = StateGraph<T, U, N>;
 
+export type EventStreamCallbackHandlerInput = {
+  autoClose?: boolean;
+  includeNames?: string[];
+  includeTypes?: string[];
+  includeTags?: string[];
+  excludeNames?: string[];
+  excludeTypes?: string[];
+  excludeTags?: string[];
+  raiseError?: boolean;
+  ignoreCustomEvent?: boolean;
+};
+
 export type CompiledWorkflow<
-  T extends BaseGraphState = BaseGraphState,
-  U extends Partial<T> = Partial<T>,
-  N extends string = string,
-> = CompiledStateGraph<T, U, N>;
+  TInput extends BaseGraphState = BaseGraphState,
+  TOutput extends BaseGraphState = TInput,
+> = Omit<Runnable<TInput, unknown>, 'invoke'> & {
+  invoke(input: TInput, config?: RunnableConfig): Promise<TOutput>;
+};
 
-export type CompiledStateWorkflow = CompiledStateGraph<
-  StateType<{
-    messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
-  }>,
-  UpdateType<{
-    messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
-  }>,
-  string,
-  {
-    messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
-  },
-  {
-    messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
-  },
-  StateDefinition
->;
+export type CompiledStateWorkflow = CompiledWorkflow;
 
-export type CompiledMultiAgentWorkflow = CompiledStateGraph<
-  StateType<{
-    messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
-    agentMessages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
-  }>,
-  UpdateType<{
-    messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
-    agentMessages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
-  }>,
-  string,
-  {
-    messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
-    agentMessages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
-  },
-  {
-    messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
-    agentMessages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
-  },
-  StateDefinition
->;
+export type CompiledMultiAgentWorkflow = CompiledWorkflow<MultiAgentGraphState>;
 
-export type CompiledAgentWorfklow = CompiledStateGraph<
+export type CompiledAgentWorfklow = CompiledWorkflow<
   AgentSubgraphState,
-  Partial<AgentSubgraphState>,
-  '__start__' | `agent=${string}` | `tools=${string}` | `summarize=${string}`,
-  {
-    messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
-    summarizationRequest: BinaryOperatorAggregate<
-      SummarizationNodeInput | undefined,
-      SummarizationNodeInput | undefined
-    >;
-  },
-  {
-    messages: BinaryOperatorAggregate<BaseMessage[], BaseMessage[]>;
-    summarizationRequest: BinaryOperatorAggregate<
-      SummarizationNodeInput | undefined,
-      SummarizationNodeInput | undefined
-    >;
-  },
-  StateDefinition,
-  {
-    [x: `agent=${string}`]: Partial<BaseGraphState>;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    [x: `tools=${string}`]: any;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    [x: `summarize=${string}`]: any;
-  }
+  AgentSubgraphState
 >;
 
 export type SystemRunnable =
@@ -220,14 +167,6 @@ export type CompileOptions = {
   interruptBefore?: string[];
   interruptAfter?: string[];
 };
-
-export type EventStreamCallbackHandlerInput =
-  Parameters<CompiledWorkflow['streamEvents']>[2] extends Omit<
-    infer T,
-    'autoClose'
-  >
-    ? T
-    : never;
 
 export type StreamChunk =
   | (ChatGenerationChunk & {

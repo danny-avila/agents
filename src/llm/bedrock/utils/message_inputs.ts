@@ -298,7 +298,10 @@ function convertSystemMessageToConverseMessage(
  */
 function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
   // Check for v1 format from other providers (PR #9766 fix)
-  if (msg.response_metadata.output_version === 'v1') {
+  const responseMetadata = msg.response_metadata as
+    | { output_version?: string }
+    | undefined;
+  if (responseMetadata?.output_version === 'v1') {
     return convertFromV1ToChatBedrockConverseMessage(msg);
   }
 
@@ -392,7 +395,9 @@ function convertFromV1ToChatBedrockConverseMessage(
   };
 
   if (Array.isArray(msg.content)) {
-    for (const block of msg.content) {
+    for (const block of msg.content as Array<
+      MessageContentComplex | MessageContentReasoningBlock
+    >) {
       if (typeof block === 'string') {
         assistantMsg.content?.push({ text: block });
       } else if (block.type === 'text') {

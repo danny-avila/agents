@@ -399,12 +399,25 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   ): (string | number | undefined)[] {
     if (!metadata) return [];
 
+    const configurable = this.config?.configurable;
+    const runId =
+      (metadata.run_id as string | undefined) ??
+      (configurable?.run_id as string | undefined) ??
+      this.runId;
+    const threadId =
+      (metadata.thread_id as string | undefined) ??
+      (configurable?.thread_id as string | undefined) ??
+      runId;
+    const checkpointNs =
+      (metadata.checkpoint_ns as string | undefined) ??
+      (metadata.langgraph_checkpoint_ns as string | undefined) ??
+      '';
     const keyList = [
-      metadata.run_id as string,
-      metadata.thread_id as string,
+      runId,
+      threadId,
       metadata.langgraph_node as string,
       metadata.langgraph_step as number,
-      metadata.checkpoint_ns as string,
+      checkpointNs,
     ];
 
     const agentContext = this.getAgentContext(metadata);
@@ -1461,7 +1474,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }),
     });
     const workflow = new StateGraph(StateAnnotation)
-      .addNode(this.defaultAgentId, agentNode, { ends: [END] })
+      .addNode(
+        this.defaultAgentId,
+        agentNode as Runnable<
+          t.AgentSubgraphState,
+          Partial<t.AgentSubgraphState>
+        >,
+        { ends: [END] }
+      )
       .addEdge(START, this.defaultAgentId)
       // LangGraph compile() types are overly strict for opt-in options
       .compile(this.compileOptions as unknown as never);

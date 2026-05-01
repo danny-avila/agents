@@ -19,6 +19,7 @@ import {
 import { resolveContextPruningSettings } from './contextPruningSettings';
 import { ContentTypes, Providers, Constants } from '@/common';
 import { applyContextPruning } from './contextPruning';
+import { toLangChainContent } from './langchain';
 
 function sumTokenCounts(
   tokenMap: Record<string, number | undefined>,
@@ -343,7 +344,7 @@ function stripOrphanToolUseBlocks(
 
   return new AIMessage({
     ...message,
-    content: keptContent,
+    content: toLangChainContent(keptContent),
     tool_calls: keptToolCalls.length > 0 ? keptToolCalls : undefined,
   });
 }
@@ -542,7 +543,7 @@ function addThinkingBlock(
   content.unshift(thinkingBlock);
   return new AIMessage({
     ...message,
-    content,
+    content: toLangChainContent(content),
   });
 }
 
@@ -817,7 +818,7 @@ export function getMessagesWithinTokenLimit({
 
   thinkingStartIndex = originalLength - 1 - assistantIndex;
   const thinkingTokenCount = tokenCounter(
-    new AIMessage({ content: [thinkingBlock] })
+    new AIMessage({ content: toLangChainContent([thinkingBlock]) })
   );
   const newRemainingCount = remainingContextTokens - thinkingTokenCount;
   const newMessage = addThinkingBlock(
@@ -856,7 +857,7 @@ export function getMessagesWithinTokenLimit({
     }
   }
 
-  const firstMessage: AIMessage = newContext[newContext.length - 1];
+  const firstMessage = newContext[newContext.length - 1];
   const firstMessageType = newContext[newContext.length - 1].getType();
   if (firstMessageType === 'tool') {
     startType = ['ai', 'human'];
@@ -887,7 +888,10 @@ export function getMessagesWithinTokenLimit({
   }
 
   if (firstMessageType === 'ai') {
-    const newMessage = addThinkingBlock(firstMessage, thinkingBlock);
+    const newMessage = addThinkingBlock(
+      firstMessage as AIMessage,
+      thinkingBlock
+    );
     newContext[newContext.length - 1] = newMessage;
   } else {
     newContext.push(thinkingMessage);
@@ -1178,7 +1182,7 @@ export function preFlightTruncateToolCallInputs(params: {
 
     messages[i] = new AIMessage({
       ...aiMsg,
-      content: newContent,
+      content: toLangChainContent(newContent),
       tool_calls: newToolCalls.length > 0 ? newToolCalls : undefined,
     });
     indexTokenCountMap[i] = tokenCounter(messages[i]);
@@ -1290,7 +1294,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
 
           params.messages[i] = new AIMessage({
             ...message,
-            content: [thinkingBlock],
+            content: toLangChainContent([thinkingBlock]),
             additional_kwargs: {
               ...message.additional_kwargs,
               reasoning_content: undefined,
@@ -1966,7 +1970,7 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
               });
               emergencyMessages[i] = new AIMessage({
                 ...aiMsg,
-                content: newContent,
+                content: toLangChainContent(newContent),
                 tool_calls: newToolCalls.length > 0 ? newToolCalls : undefined,
               });
               indexTokenCountMap[i] = factoryParams.tokenCounter(

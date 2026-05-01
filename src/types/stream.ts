@@ -191,7 +191,7 @@ export interface ExtendedMessageContent {
   type?: string;
   text?: string;
   input?: string;
-  index?: number;
+  index?: string | number;
   id?: string;
   name?: string;
 }

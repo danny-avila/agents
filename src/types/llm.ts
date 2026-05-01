@@ -12,7 +12,7 @@ import type {
 } from '@langchain/openai';
 import type { GoogleGenerativeAIChatInput } from '@langchain/google-genai';
 import type { ChatVertexAIInput } from '@langchain/google-vertexai';
-import type { ChatDeepSeekCallOptions } from '@langchain/deepseek';
+import type { ChatDeepSeekInput } from '@langchain/deepseek';
 import type { ChatOpenRouterCallOptions } from '@/llm/openrouter';
 import type { ChatBedrockConverseInput } from '@langchain/aws';
 import type { ChatMistralAIInput } from '@langchain/mistralai';
@@ -70,7 +70,7 @@ export type AnthropicReasoning = {
 export type GoogleThinkingConfig = {
   thinkingBudget?: number;
   includeThoughts?: boolean;
-  thinkingLevel?: string;
+  thinkingLevel?: 'THINKING_LEVEL_UNSPECIFIED' | 'LOW' | 'MEDIUM' | 'HIGH';
 };
 export type OpenAIClientOptions = ChatOpenAIFields;
 export type AnthropicClientOptions = Omit<AnthropicInput, 'thinking'> & {
@@ -93,7 +93,7 @@ export type GoogleClientOptions = GoogleGenerativeAIChatInput & {
   customHeaders?: RequestOptions['customHeaders'];
   thinkingConfig?: GoogleThinkingConfig;
 };
-export type DeepSeekClientOptions = ChatDeepSeekCallOptions;
+export type DeepSeekClientOptions = Partial<ChatDeepSeekInput>;
 export type XAIClientOptions = ChatXAIInput;
 
 export type ClientOptions =

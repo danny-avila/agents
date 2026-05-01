@@ -50,9 +50,8 @@ ${CACHED_TEXT}`;
     },
   };
 
-  const baseLlmConfig: t.LLMConfig & t.AnthropicClientOptions = getLLMConfig(
-    Providers.ANTHROPIC
-  );
+  const baseLlmConfig = getLLMConfig(Providers.ANTHROPIC) as t.LLMConfig &
+    t.AnthropicClientOptions;
 
   if (baseLlmConfig.provider !== 'anthropic') {
     console.error(

@@ -88,13 +88,15 @@ function extractToken(
     chunk.content.length >= 1 &&
     'text' in chunk.content[0]
   ) {
-    return [chunk.content[0].text, 'content'];
+    const text = chunk.content[0].text;
+    return typeof text === 'string' ? [text, 'content'] : [undefined];
   } else if (
     Array.isArray(chunk.content) &&
     chunk.content.length >= 1 &&
     'thinking' in chunk.content[0]
   ) {
-    return [chunk.content[0].thinking, 'content'];
+    const thinking = chunk.content[0].thinking;
+    return typeof thinking === 'string' ? [thinking, 'content'] : [undefined];
   }
   return [undefined];
 }
