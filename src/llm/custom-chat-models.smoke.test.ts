@@ -27,6 +27,10 @@ type OpenAIRequestOptionsWithBaseURL = ReturnType<
 > & {
   baseURL?: string;
 };
+type OpenAIResponsesDelegate = {
+  client?: unknown;
+  _getClientOptions: (options?: OpenAIRequestOptions) => OpenAIRequestOptions;
+};
 type AnthropicCallOptions = Parameters<
   CustomAnthropic['invocationParams']
 >[0] & {
@@ -96,6 +100,38 @@ describe('custom chat model class smoke tests', () => {
     expect(params.reasoning ?? { effort: params.reasoning_effort }).toEqual({
       effort: 'low',
     });
+  });
+
+  it('keeps the custom OpenAI client on the Responses API path', () => {
+    const model = new ChatOpenAI({
+      model: 'gpt-5',
+      apiKey: 'test-key',
+      useResponsesApi: true,
+      maxTokens: 32,
+      reasoning: { effort: 'low' },
+    });
+
+    const params = model.invocationParams({
+      reasoningEffort: 'high',
+    }) as {
+      max_output_tokens?: number;
+      max_completion_tokens?: number;
+      reasoning?: unknown;
+    };
+    const responses = (
+      model as unknown as { responses: OpenAIResponsesDelegate }
+    ).responses;
+    const requestOptions = responses._getClientOptions({
+      headers: { 'x-smoke': 'responses' },
+    } as OpenAIRequestOptions);
+
+    expect(params.max_output_tokens).toBe(32);
+    expect(params.max_completion_tokens).toBeUndefined();
+    expect(params.reasoning).toEqual({ effort: 'low' });
+    expect(responses.client).toBeInstanceOf(CustomOpenAIClient);
+    expect(requestOptions?.headers).toEqual(
+      expect.objectContaining({ 'x-smoke': 'responses' })
+    );
   });
 
   it('keeps Azure client customization and gates reasoning to reasoning models', () => {
