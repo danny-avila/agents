@@ -92,6 +92,8 @@ type OpenAIClientConfig = NonNullable<
 type LibreChatOpenAIFields = t.ChatOpenAIFields & {
   _lc_stream_delay?: number;
   includeReasoningContent?: boolean;
+  includeReasoningDetails?: boolean;
+  convertReasoningDetailsToContent?: boolean;
 };
 type LibreChatAzureOpenAIFields = t.AzureOpenAIInput & {
   _lc_stream_delay?: number;
@@ -102,6 +104,7 @@ type ReasoningCallOptions = {
 };
 type OpenAIDeltaWithLibreChatFields = Record<string, unknown> & {
   reasoning?: unknown;
+  reasoning_details?: unknown;
   provider_specific_fields?: unknown;
 };
 type OpenAIClientOwner = {
@@ -165,6 +168,10 @@ function attachLibreChatDeltaFields(
   ) {
     chunk.additional_kwargs.reasoning_content = libreChatDelta.reasoning;
   }
+  if (libreChatDelta.reasoning_details != null) {
+    chunk.additional_kwargs.reasoning_details =
+      libreChatDelta.reasoning_details;
+  }
   if (libreChatDelta.provider_specific_fields != null) {
     chunk.additional_kwargs.provider_specific_fields =
       libreChatDelta.provider_specific_fields;
@@ -184,6 +191,9 @@ function attachLibreChatMessageFields(
     message.additional_kwargs.reasoning_content == null
   ) {
     message.additional_kwargs.reasoning_content = rawMessage.reasoning;
+  }
+  if (rawMessage.reasoning_details != null) {
+    message.additional_kwargs.reasoning_details = rawMessage.reasoning_details;
   }
   if (rawMessage.provider_specific_fields != null) {
     message.additional_kwargs.provider_specific_fields =
@@ -347,10 +357,15 @@ export class CustomAzureOpenAIClient extends AzureOpenAIClient {
 
 class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
   private includeReasoningContent?: boolean;
+  private includeReasoningDetails?: boolean;
+  private convertReasoningDetailsToContent?: boolean;
 
   constructor(fields?: LibreChatOpenAIFields) {
     super(fields);
     this.includeReasoningContent = fields?.includeReasoningContent;
+    this.includeReasoningDetails = fields?.includeReasoningDetails;
+    this.convertReasoningDetailsToContent =
+      fields?.convertReasoningDetailsToContent;
   }
 
   protected _getReasoningParams(
@@ -395,7 +410,10 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun
   ): Promise<ChatResult> {
-    if (this.includeReasoningContent !== true) {
+    if (
+      this.includeReasoningContent !== true &&
+      this.includeReasoningDetails !== true
+    ) {
       return super._generate(messages, options, runManager);
     }
 
@@ -405,7 +423,11 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
     const messagesMapped = _convertMessagesToOpenAIParams(
       messages,
       this.model,
-      { includeReasoningContent: true }
+      {
+        includeReasoningContent: this.includeReasoningContent,
+        includeReasoningDetails: this.includeReasoningDetails,
+        convertReasoningDetailsToContent: this.convertReasoningDetailsToContent,
+      }
     );
 
     if (params.stream === true) {
@@ -553,14 +575,19 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
-    if (this.includeReasoningContent !== true) {
+    if (
+      this.includeReasoningContent !== true &&
+      this.includeReasoningDetails !== true
+    ) {
       yield* super._streamResponseChunks(messages, options, runManager);
       return;
     }
 
     const messagesMapped: OpenAICompletionParam[] =
       _convertMessagesToOpenAIParams(messages, this.model, {
-        includeReasoningContent: true,
+        includeReasoningContent: this.includeReasoningContent,
+        includeReasoningDetails: this.includeReasoningDetails,
+        convertReasoningDetailsToContent: this.convertReasoningDetailsToContent,
       });
 
     const params = {

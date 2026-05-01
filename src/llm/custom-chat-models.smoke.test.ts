@@ -1,5 +1,5 @@
-import { AIMessage } from '@langchain/core/messages';
-import type { OpenAIChatInput } from '@langchain/openai';
+import { AIMessage, AIMessageChunk } from '@langchain/core/messages';
+import type { OpenAIChatInput, OpenAIClient } from '@langchain/openai';
 import type { ChatOpenRouterCallOptions } from '@/llm/openrouter';
 import type { CustomAnthropicInput } from '@/llm/anthropic';
 import type {
@@ -54,6 +54,44 @@ type CompletionDelegate = {
 };
 type CompletionBackedModel = {
   completions: CompletionDelegate;
+};
+type StreamingCompletionRequest = {
+  messages?: unknown;
+  stream?: boolean;
+};
+type StreamingCompletionDelegate = {
+  completionWithRetry: (
+    request: StreamingCompletionRequest
+  ) => Promise<
+    AsyncIterable<OpenAIClient.Chat.Completions.ChatCompletionChunk>
+  >;
+};
+type StreamingCompletionBackedModel = {
+  completions: StreamingCompletionDelegate;
+};
+type OpenRouterReasoningStreamDelta =
+  OpenAIClient.Chat.Completions.ChatCompletionChunk.Choice.Delta & {
+    reasoning_details?: Array<
+      | {
+          type: 'reasoning.text';
+          text?: string;
+          format?: string;
+          index?: number;
+        }
+      | {
+          type: 'reasoning.encrypted';
+          id?: string;
+          data?: string;
+          format?: string;
+          index?: number;
+        }
+    >;
+  };
+type OpenRouterReasoningStreamChoice = Omit<
+  OpenAIClient.Chat.Completions.ChatCompletionChunk.Choice,
+  'delta'
+> & {
+  delta: OpenRouterReasoningStreamDelta;
 };
 
 const baseAzureFields = {
@@ -270,6 +308,164 @@ describe('custom chat model class smoke tests', () => {
     expect(ChatOpenRouter.lc_name()).toBe('LibreChatOpenRouter');
     expect(params.reasoning).toEqual({ effort: 'xhigh', max_tokens: 2048 });
     expect(params.reasoning_effort).toBeUndefined();
+
+    const callParams = model.invocationParams({
+      reasoning: { effort: 'low', exclude: true },
+    } as ChatOpenRouterCallOptions);
+    expect(callParams.reasoning).toEqual({
+      effort: 'low',
+      max_tokens: 2048,
+      exclude: true,
+    });
+
+    const legacyModel = new ChatOpenRouter({
+      model: 'openrouter/test-model',
+      apiKey: 'test-key',
+      include_reasoning: true,
+    });
+    expect(legacyModel.invocationParams().reasoning).toEqual({
+      enabled: true,
+    });
+  });
+
+  it('keeps OpenRouter streaming reasoning details stable', async () => {
+    const model = new ChatOpenRouter({
+      model: 'anthropic/claude-sonnet-test',
+      apiKey: 'test-key',
+    });
+    const completions = (model as unknown as StreamingCompletionBackedModel)
+      .completions;
+    let requestMessages: unknown;
+    const createChunk = (
+      choice: OpenRouterReasoningStreamChoice
+    ): OpenAIClient.Chat.Completions.ChatCompletionChunk => ({
+      id: 'chatcmpl-openrouter-test',
+      object: 'chat.completion.chunk',
+      created: 0,
+      model: 'anthropic/claude-sonnet-test',
+      choices: [choice],
+    });
+
+    async function* streamChunks(): AsyncGenerator<OpenAIClient.Chat.Completions.ChatCompletionChunk> {
+      yield createChunk({
+        index: 0,
+        delta: {
+          role: 'assistant',
+          content: '',
+          reasoning_details: [
+            {
+              type: 'reasoning.text',
+              text: 'Think ',
+              format: 'text',
+              index: 0,
+            },
+          ],
+        },
+        finish_reason: null,
+      });
+      yield createChunk({
+        index: 0,
+        delta: {
+          content: 'answer',
+          reasoning_details: [
+            { type: 'reasoning.text', text: 'hard', index: 0 },
+            {
+              type: 'reasoning.encrypted',
+              id: 'sig_1',
+              data: 'encrypted',
+              format: 'anthropic',
+              index: 1,
+            },
+          ],
+        },
+        finish_reason: null,
+      });
+      yield createChunk({
+        index: 0,
+        delta: { content: '' },
+        finish_reason: 'stop',
+      });
+    }
+
+    completions.completionWithRetry = async (
+      request
+    ): Promise<
+      AsyncIterable<OpenAIClient.Chat.Completions.ChatCompletionChunk>
+    > => {
+      requestMessages = request.messages;
+      return streamChunks();
+    };
+
+    const chunks: AIMessageChunk[] = [];
+    const stream = await model.stream([
+      new AIMessage({
+        content: '',
+        additional_kwargs: {
+          reasoning_details: [
+            {
+              type: 'reasoning.text',
+              text: 'previous thought',
+              index: 0,
+            },
+            {
+              type: 'reasoning.encrypted',
+              id: 'prev_sig',
+              data: 'previous encrypted',
+              index: 1,
+            },
+          ],
+        },
+        tool_calls: [
+          {
+            id: 'call_1',
+            name: 'lookup',
+            args: { q: 'test' },
+            type: 'tool_call',
+          },
+        ],
+      }),
+    ]);
+    for await (const chunk of stream) {
+      chunks.push(chunk);
+    }
+
+    expect(requestMessages).toEqual([
+      expect.objectContaining({
+        role: 'assistant',
+        tool_calls: expect.any(Array),
+        content: [
+          expect.objectContaining({
+            type: 'thinking',
+            thinking: 'previous thought',
+          }),
+          expect.objectContaining({
+            type: 'redacted_thinking',
+            data: 'previous encrypted',
+            id: 'prev_sig',
+          }),
+        ],
+      }),
+    ]);
+    expect(chunks).toHaveLength(3);
+    expect(chunks[0].additional_kwargs.reasoning).toBe('Think ');
+    expect(chunks[0].additional_kwargs.reasoning_details).toBeUndefined();
+    expect(chunks[1].additional_kwargs.reasoning).toBe('hard');
+    expect(chunks[1].additional_kwargs.reasoning_details).toBeUndefined();
+    expect(chunks[2].additional_kwargs.reasoning_details).toEqual([
+      {
+        type: 'reasoning.text',
+        text: 'Think hard',
+        format: 'text',
+        index: 0,
+      },
+      {
+        type: 'reasoning.encrypted',
+        id: 'sig_1',
+        data: 'encrypted',
+        format: 'anthropic',
+        index: 1,
+      },
+    ]);
   });
 
   it('keeps Anthropic output, residency, compaction, and stream-delay options', () => {
