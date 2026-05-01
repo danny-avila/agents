@@ -9,12 +9,14 @@ import {
   HumanMessage,
   SystemMessage,
   AIMessageChunk,
+  type MessageContentComplex,
 } from '@langchain/core/messages';
 import { concat } from '@langchain/core/utils/stream';
 import { ChatGenerationChunk } from '@langchain/core/outputs';
 import {
   BedrockRuntimeClient,
   ConverseCommand,
+  ConverseStreamCommand,
 } from '@aws-sdk/client-bedrock-runtime';
 import type { ConverseResponse } from '@aws-sdk/client-bedrock-runtime';
 import {
@@ -34,6 +36,55 @@ const baseConstructorArgs = {
     accessKeyId: 'test-access-key',
   },
 };
+
+type ConverseContentBlock = NonNullable<
+  ReturnType<
+    typeof convertToConverseMessages
+  >['converseMessages'][number]['content']
+>[number];
+type BedrockVideoBlock = ConverseContentBlock & {
+  video: {
+    format?: string;
+    source?: { bytes?: Uint8Array; s3Location?: { uri?: string } };
+  };
+};
+type BedrockAudioBlock = ConverseContentBlock & {
+  audio: {
+    format?: string;
+    source?: { bytes?: Uint8Array; s3Location?: { uri?: string } };
+  };
+};
+type BedrockDocumentBlock = ConverseContentBlock & {
+  document: {
+    format?: string;
+    name?: string;
+  };
+};
+
+function expectVideoBlock(block: ConverseContentBlock): BedrockVideoBlock {
+  expect(block).toHaveProperty('video');
+  return block as BedrockVideoBlock;
+}
+
+function expectAudioBlock(block: ConverseContentBlock): BedrockAudioBlock {
+  expect(block).toHaveProperty('audio');
+  return block as BedrockAudioBlock;
+}
+
+function expectDocumentBlock(
+  block: ConverseContentBlock
+): BedrockDocumentBlock {
+  expect(block).toHaveProperty('document');
+  return block as BedrockDocumentBlock;
+}
+
+function humanMessageWithContent(
+  content: MessageContentComplex[]
+): HumanMessage {
+  return new HumanMessage({
+    content,
+  } as ConstructorParameters<typeof HumanMessage>[0]);
+}
 
 describe('CustomChatBedrockConverse', () => {
   describe('applicationInferenceProfile parameter', () => {
@@ -132,6 +183,59 @@ describe('CustomChatBedrockConverse', () => {
         input: { modelId: string };
       };
       expect(commandArg.input.modelId).toBe(
+        'anthropic.claude-3-haiku-20240307-v1:0'
+      );
+    });
+
+    test('should send applicationInferenceProfile as modelId in ConverseStreamCommand when provided', async () => {
+      const testArn =
+        'arn:aws:bedrock:eu-west-1:123456789012:application-inference-profile/test-profile';
+      const mockSend = jest
+        .fn<
+          (command: ConverseStreamCommand) => Promise<{
+            stream: AsyncIterable<{
+              contentBlockDelta: {
+                contentBlockIndex: number;
+                delta: { text: string };
+              };
+            }>;
+          }>
+        >()
+        .mockResolvedValue({
+          stream: (async function* streamChunks() {
+            yield {
+              contentBlockDelta: {
+                contentBlockIndex: 0,
+                delta: { text: 'Test response' },
+              },
+            };
+          })(),
+        });
+
+      const mockClient = {
+        send: mockSend,
+      } as unknown as BedrockRuntimeClient;
+
+      const model = new CustomChatBedrockConverse({
+        ...baseConstructorArgs,
+        model: 'anthropic.claude-3-haiku-20240307-v1:0',
+        applicationInferenceProfile: testArn,
+        client: mockClient,
+      });
+
+      let chunks = 0;
+      for await (const _chunk of await model.stream([
+        new HumanMessage('Hello'),
+      ])) {
+        chunks += 1;
+      }
+
+      expect(mockSend).toHaveBeenCalledTimes(1);
+      expect(chunks).toBe(1);
+      const commandArg = mockSend.mock.calls[0][0] as ConverseStreamCommand;
+      expect(commandArg).toBeInstanceOf(ConverseStreamCommand);
+      expect(commandArg.input.modelId).toBe(testArn);
+      expect(commandArg.input.modelId).not.toBe(
         'anthropic.claude-3-haiku-20240307-v1:0'
       );
     });
@@ -752,6 +856,244 @@ describe('convertToConverseMessages', () => {
     expect((toolResultMessage.content?.[1] as any).toolResult.toolUseId).toBe(
       'call_2'
     );
+  });
+
+  describe('video content block conversion', () => {
+    test('converts multimodal video block with base64 data', () => {
+      const videoData = btoa('fake-video-bytes');
+      const result = convertToConverseMessages([
+        humanMessageWithContent([
+          { type: 'text', text: 'Describe this video' },
+          {
+            type: 'video',
+            mimeType: 'video/mp4',
+            data: videoData,
+          } as MessageContentComplex,
+        ]),
+      ]);
+
+      const content = result.converseMessages[0].content!;
+      expect(content).toHaveLength(2);
+      expect(content[0]).toEqual({ text: 'Describe this video' });
+      const videoBlock = expectVideoBlock(content[1]);
+      expect(videoBlock.video.format).toBe('mp4');
+      expect(videoBlock.video.source?.bytes).toBeInstanceOf(Uint8Array);
+    });
+
+    test('converts multimodal video block with Uint8Array data', () => {
+      const videoBytes = new Uint8Array([1, 2, 3, 4]);
+      const result = convertToConverseMessages([
+        humanMessageWithContent([
+          {
+            type: 'video',
+            mimeType: 'video/webm',
+            data: videoBytes,
+          } as MessageContentComplex,
+        ]),
+      ]);
+
+      const content = result.converseMessages[0].content!;
+      const videoBlock = expectVideoBlock(content[0]);
+      expect(videoBlock.video.format).toBe('webm');
+      expect(videoBlock.video.source?.bytes).toBe(videoBytes);
+    });
+
+    test('passes through native Bedrock video block', () => {
+      const videoSource = {
+        bytes: new Uint8Array([1, 2, 3]),
+      };
+      const result = convertToConverseMessages([
+        humanMessageWithContent([
+          {
+            type: 'video',
+            video: {
+              format: 'mp4',
+              source: videoSource,
+            },
+          } as MessageContentComplex,
+        ]),
+      ]);
+
+      const content = result.converseMessages[0].content!;
+      const videoBlock = expectVideoBlock(content[0]);
+      expect(videoBlock.video.format).toBe('mp4');
+      expect(videoBlock.video.source).toBe(videoSource);
+    });
+
+    test('converts video block with S3 fileId', () => {
+      const result = convertToConverseMessages([
+        humanMessageWithContent([
+          {
+            type: 'video',
+            mimeType: 'video/mp4',
+            fileId: 's3://my-bucket/my-video.mp4',
+          } as MessageContentComplex,
+        ]),
+      ]);
+
+      const content = result.converseMessages[0].content!;
+      const videoBlock = expectVideoBlock(content[0]);
+      expect(videoBlock.video.format).toBe('mp4');
+      expect(videoBlock.video.source?.s3Location?.uri).toBe(
+        's3://my-bucket/my-video.mp4'
+      );
+    });
+  });
+
+  describe('audio content block conversion', () => {
+    test('converts multimodal audio block with base64 data', () => {
+      const audioData = btoa('fake-audio-bytes');
+      const result = convertToConverseMessages([
+        humanMessageWithContent([
+          { type: 'text', text: 'Transcribe this audio' },
+          {
+            type: 'audio',
+            mimeType: 'audio/mp3',
+            data: audioData,
+          } as MessageContentComplex,
+        ]),
+      ]);
+
+      const content = result.converseMessages[0].content!;
+      expect(content).toHaveLength(2);
+      expect(content[0]).toEqual({ text: 'Transcribe this audio' });
+      const audioBlock = expectAudioBlock(content[1]);
+      expect(audioBlock.audio.format).toBe('mp3');
+      expect(audioBlock.audio.source?.bytes).toBeInstanceOf(Uint8Array);
+    });
+
+    test('converts multimodal audio block with Uint8Array data', () => {
+      const audioBytes = new Uint8Array([1, 2, 3, 4]);
+      const result = convertToConverseMessages([
+        humanMessageWithContent([
+          {
+            type: 'audio',
+            mimeType: 'audio/wav',
+            data: audioBytes,
+          } as MessageContentComplex,
+        ]),
+      ]);
+
+      const content = result.converseMessages[0].content!;
+      const audioBlock = expectAudioBlock(content[0]);
+      expect(audioBlock.audio.format).toBe('wav');
+      expect(audioBlock.audio.source?.bytes).toBe(audioBytes);
+    });
+
+    test('passes through native Bedrock audio block', () => {
+      const audioSource = {
+        bytes: new Uint8Array([1, 2, 3]),
+      };
+      const result = convertToConverseMessages([
+        humanMessageWithContent([
+          {
+            type: 'audio',
+            audio: {
+              format: 'flac',
+              source: audioSource,
+            },
+          } as MessageContentComplex,
+        ]),
+      ]);
+
+      const content = result.converseMessages[0].content!;
+      const audioBlock = expectAudioBlock(content[0]);
+      expect(audioBlock.audio.format).toBe('flac');
+      expect(audioBlock.audio.source).toBe(audioSource);
+    });
+
+    test('converts audio block with S3 fileId', () => {
+      const result = convertToConverseMessages([
+        humanMessageWithContent([
+          {
+            type: 'audio',
+            mimeType: 'audio/mp3',
+            fileId: 's3://my-bucket/my-audio.mp3',
+          } as MessageContentComplex,
+        ]),
+      ]);
+
+      const content = result.converseMessages[0].content!;
+      const audioBlock = expectAudioBlock(content[0]);
+      expect(audioBlock.audio.format).toBe('mp3');
+      expect(audioBlock.audio.source?.s3Location?.uri).toBe(
+        's3://my-bucket/my-audio.mp3'
+      );
+    });
+  });
+
+  describe('document content block conversion', () => {
+    test('imputes placeholder filename when no name is provided', () => {
+      const pdfData = btoa('fake-pdf-bytes');
+      const result = convertToConverseMessages([
+        humanMessageWithContent([
+          {
+            type: 'file',
+            source_type: 'base64',
+            mime_type: 'application/pdf',
+            data: pdfData,
+          } as MessageContentComplex,
+        ]),
+      ]);
+
+      const content = result.converseMessages[0].content!;
+      expect(content).toHaveLength(1);
+      const documentBlock = expectDocumentBlock(content[0]);
+      expect(documentBlock.document.format).toBe('pdf');
+      expect(documentBlock.document.name).toBeDefined();
+      expect(typeof documentBlock.document.name).toBe('string');
+      expect(documentBlock.document.name?.length).toBe(12);
+    });
+
+    test('uses provided filename from metadata', () => {
+      const pdfData = btoa('fake-pdf-bytes');
+      const result = convertToConverseMessages([
+        humanMessageWithContent([
+          {
+            type: 'file',
+            source_type: 'base64',
+            mime_type: 'application/pdf',
+            data: pdfData,
+            metadata: { filename: 'my-report.pdf' },
+          } as MessageContentComplex,
+        ]),
+      ]);
+
+      const content = result.converseMessages[0].content!;
+      expect(expectDocumentBlock(content[0]).document.name).toBe(
+        'my-report.pdf'
+      );
+    });
+
+    test('generates unique placeholder filenames for multiple files', () => {
+      const pdfData = btoa('fake-pdf-bytes');
+      const result = convertToConverseMessages([
+        humanMessageWithContent([
+          {
+            type: 'file',
+            source_type: 'base64',
+            mime_type: 'application/pdf',
+            data: pdfData,
+          } as MessageContentComplex,
+          {
+            type: 'file',
+            source_type: 'base64',
+            mime_type: 'application/pdf',
+            data: pdfData,
+          } as MessageContentComplex,
+        ]),
+      ]);
+
+      const content = result.converseMessages[0].content!;
+      expect(content).toHaveLength(2);
+      const firstDocument = expectDocumentBlock(content[0]);
+      const secondDocument = expectDocumentBlock(content[1]);
+      expect(firstDocument.document.name).toBeDefined();
+      expect(secondDocument.document.name).toBeDefined();
+      expect(firstDocument.document.name).not.toBe(
+        secondDocument.document.name
+      );
+    });
   });
 });
 

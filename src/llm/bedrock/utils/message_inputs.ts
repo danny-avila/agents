@@ -5,10 +5,22 @@
 import {
   type BaseMessage,
   isAIMessage,
+  type Data,
   parseBase64DataUrl,
   parseMimeType,
   MessageContentComplex,
+  type StandardContentBlockConverter,
+  convertToProviderContentBlock,
+  isDataContentBlock,
 } from '@langchain/core/messages';
+import type {
+  AudioFormat,
+  AudioSource,
+  DocumentFormat,
+  DocumentSource,
+  VideoFormat,
+  VideoSource,
+} from '@aws-sdk/client-bedrock-runtime';
 import type {
   BedrockMessage,
   BedrockSystemContentBlock,
@@ -127,6 +139,258 @@ export function extractImageInfo(base64: string): BedrockContentBlock {
   };
 }
 
+type MediaContentBlock = MessageContentComplex & {
+  data?: string | Uint8Array;
+  url?: string;
+  fileId?: string;
+  mimeType?: string;
+};
+
+const mimeTypeToVideoFormat: Record<string, VideoFormat> = {
+  'video/flv': 'flv',
+  'video/mkv': 'mkv',
+  'video/mov': 'mov',
+  'video/mp4': 'mp4',
+  'video/mpeg': 'mpeg',
+  'video/mpg': 'mpg',
+  'video/three_gp': 'three_gp',
+  'video/webm': 'webm',
+  'video/wmv': 'wmv',
+};
+
+const mimeTypeToAudioFormat: Record<string, AudioFormat> = {
+  'audio/aac': 'aac',
+  'audio/flac': 'flac',
+  'audio/m4a': 'm4a',
+  'audio/mka': 'mka',
+  'audio/mkv': 'mkv',
+  'audio/mp3': 'mp3',
+  'audio/mp4': 'mp4',
+  'audio/mpeg': 'mpeg',
+  'audio/mpga': 'mpga',
+  'audio/ogg': 'ogg',
+  'audio/opus': 'opus',
+  'audio/pcm': 'pcm',
+  'audio/wav': 'wav',
+  'audio/webm': 'webm',
+  'audio/x-aac': 'x-aac',
+};
+
+const mimeTypeToDocumentFormat: Partial<Record<string, DocumentFormat>> = {
+  'text/csv': 'csv',
+  'application/msword': 'doc',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
+    'docx',
+  'text/html': 'html',
+  'text/markdown': 'md',
+  'application/pdf': 'pdf',
+  'text/plain': 'txt',
+  'application/vnd.ms-excel': 'xls',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
+};
+
+function base64ToBytes(data: string): Uint8Array {
+  return Uint8Array.from(atob(data), (char) => char.charCodeAt(0));
+}
+
+function getMediaFormat<T extends string>(
+  mimeType: string | undefined,
+  formatMap: Record<string, T>
+): T | undefined {
+  if (mimeType == null || mimeType === '') {
+    return undefined;
+  }
+  return formatMap[mimeType] ?? (parseMimeType(mimeType).subtype as T);
+}
+
+function resolveMediaSource(
+  block: MediaContentBlock
+): AudioSource | VideoSource {
+  if (typeof block.data === 'string') {
+    return { bytes: base64ToBytes(block.data) };
+  }
+  if (block.data instanceof Uint8Array) {
+    return { bytes: block.data };
+  }
+  if (typeof block.url === 'string') {
+    const parsedData = parseBase64DataUrl({
+      dataUrl: block.url,
+      asTypedArray: true,
+    });
+    if (parsedData != null) {
+      return { bytes: parsedData.data as Uint8Array };
+    }
+    throw new Error(
+      `Only base64 data URLs are supported for ${block.type} blocks with 'url' field with ChatBedrockConverse.`
+    );
+  }
+  if (typeof block.fileId === 'string') {
+    return { s3Location: { uri: block.fileId } };
+  }
+  throw new Error(
+    `${block.type} block must include one of: 'data' (base64 string or Uint8Array), 'url' (base64 data URL), or 'fileId' (S3 URI).`
+  );
+}
+
+function convertMultimodalVideoBlock(
+  block: MediaContentBlock
+): BedrockContentBlock {
+  return {
+    video: {
+      format: getMediaFormat(block.mimeType, mimeTypeToVideoFormat),
+      source: resolveMediaSource(block) as VideoSource,
+    },
+  } as BedrockContentBlock;
+}
+
+function convertMultimodalAudioBlock(
+  block: MediaContentBlock
+): BedrockContentBlock {
+  return {
+    audio: {
+      format: getMediaFormat(block.mimeType, mimeTypeToAudioFormat),
+      source: resolveMediaSource(block) as AudioSource,
+    },
+  } as BedrockContentBlock;
+}
+
+function getDocumentName(block: Data.StandardFileBlock): string {
+  return (
+    (block.metadata?.name as string | undefined) ??
+    (block.metadata?.filename as string | undefined) ??
+    (block.metadata?.title as string | undefined) ??
+    globalThis.crypto.randomUUID().replace(/-/g, '').slice(0, 12)
+  );
+}
+
+function getDocumentFormat(
+  mimeType: string | undefined
+): DocumentFormat | undefined {
+  if (mimeType == null || mimeType === '') {
+    return undefined;
+  }
+  const parsedMimeType = parseMimeType(mimeType);
+  const format =
+    mimeTypeToDocumentFormat[
+      `${parsedMimeType.type}/${parsedMimeType.subtype}`
+    ];
+  if (format === undefined) {
+    throw new Error(
+      `Unsupported file mime type: "${mimeType}" ChatBedrockConverse only supports ${Object.keys(
+        mimeTypeToDocumentFormat
+      ).join(', ')} formats.`
+    );
+  }
+  return format;
+}
+
+const standardContentBlockConverter: StandardContentBlockConverter<{
+  text: BedrockContentBlock;
+  image: BedrockContentBlock;
+  file: BedrockContentBlock;
+}> = {
+  providerName: 'ChatBedrockConverse',
+
+  fromStandardTextBlock(block: Data.StandardTextBlock): BedrockContentBlock {
+    return { text: block.text };
+  },
+
+  fromStandardImageBlock(block: Data.StandardImageBlock): BedrockContentBlock {
+    if (block.source_type === 'url') {
+      const parsedData = parseBase64DataUrl({
+        dataUrl: block.url,
+        asTypedArray: true,
+      });
+      if (parsedData == null) {
+        throw new Error(
+          [
+            'Only base64 data URLs are supported for image blocks with source type ',
+            'url',
+            ' with ChatBedrockConverse.',
+          ].join(String.fromCharCode(39))
+        );
+      }
+      return {
+        image: {
+          format: parseMimeType(parsedData.mime_type).subtype as
+            | 'gif'
+            | 'jpeg'
+            | 'png'
+            | 'webp',
+          source: { bytes: parsedData.data as Uint8Array },
+        },
+      };
+    }
+    if (block.source_type === 'base64') {
+      let format: 'gif' | 'jpeg' | 'png' | 'webp' | undefined;
+      if (block.mime_type != null && block.mime_type !== '') {
+        format = parseMimeType(block.mime_type).subtype as typeof format;
+      }
+      if (format != null && !['gif', 'jpeg', 'png', 'webp'].includes(format)) {
+        throw new Error(
+          `Unsupported image mime type: "${block.mime_type}" ChatBedrockConverse only supports "image/gif", "image/jpeg", "image/png", and "image/webp" formats.`
+        );
+      }
+      return {
+        image: {
+          format,
+          source: { bytes: base64ToBytes(block.data) },
+        },
+      };
+    }
+    throw new Error(
+      `Image source type '${block.source_type}' not supported with ChatBedrockConverse.`
+    );
+  },
+
+  fromStandardFileBlock(block: Data.StandardFileBlock): BedrockContentBlock {
+    const name = getDocumentName(block);
+    if (block.source_type === 'text') {
+      return {
+        document: {
+          name,
+          format: 'txt',
+          source: { bytes: new TextEncoder().encode(block.text) },
+        },
+      } as BedrockContentBlock;
+    }
+    if (block.source_type === 'url') {
+      const parsedData = parseBase64DataUrl({
+        dataUrl: block.url,
+        asTypedArray: true,
+      });
+      if (parsedData == null) {
+        throw new Error(
+          [
+            'Only base64 data URLs are supported for file blocks with source type ',
+            'url',
+            ' with ChatBedrockConverse.',
+          ].join(String.fromCharCode(39))
+        );
+      }
+      return {
+        document: {
+          name,
+          format: getDocumentFormat(parsedData.mime_type),
+          source: { bytes: parsedData.data as Uint8Array } as DocumentSource,
+        },
+      } as BedrockContentBlock;
+    }
+    if (block.source_type === 'base64') {
+      return {
+        document: {
+          name,
+          format: getDocumentFormat(block.mime_type),
+          source: { bytes: base64ToBytes(block.data) } as DocumentSource,
+        },
+      } as BedrockContentBlock;
+    }
+    throw new Error(
+      `File source type '${block.source_type}' not supported with ChatBedrockConverse.`
+    );
+  },
+};
+
 /**
  * Check if a block has a cache point.
  */
@@ -159,6 +423,10 @@ function convertLangChainContentBlockToConverseContentBlock({
 }): BedrockContentBlock {
   if (typeof block === 'string') {
     return { text: block };
+  }
+
+  if (isDataContentBlock(block)) {
+    return convertToProviderContentBlock(block, standardContentBlockConverter);
   }
 
   if (block.type === 'text') {
@@ -229,6 +497,32 @@ function convertLangChainContentBlockToConverseContentBlock({
         image: (block as { image: unknown }).image,
       } as BedrockContentBlock;
     }
+  }
+
+  if (
+    block.type === 'video' &&
+    (block as { video?: unknown }).video !== undefined
+  ) {
+    return {
+      video: (block as { video: unknown }).video,
+    } as BedrockContentBlock;
+  }
+
+  if (block.type === 'video') {
+    return convertMultimodalVideoBlock(block as MediaContentBlock);
+  }
+
+  if (
+    block.type === 'audio' &&
+    (block as { audio?: unknown }).audio !== undefined
+  ) {
+    return {
+      audio: (block as { audio: unknown }).audio,
+    } as BedrockContentBlock;
+  }
+
+  if (block.type === 'audio') {
+    return convertMultimodalAudioBlock(block as MediaContentBlock);
   }
 
   if (
@@ -544,11 +838,11 @@ export function convertToConverseMessages(messages: BaseMessage[]): {
   // Combine consecutive user tool result messages into a single message
   const combinedConverseMessages = converseMessages.reduce<BedrockMessage[]>(
     (acc, curr) => {
-      const lastMessage = acc[acc.length - 1];
-      if (lastMessage == null) {
+      if (acc.length === 0) {
         acc.push(curr);
         return acc;
       }
+      const lastMessage = acc[acc.length - 1];
       const lastHasToolResult =
         lastMessage.content?.some((c) => 'toolResult' in c) === true;
       const currHasToolResult =
