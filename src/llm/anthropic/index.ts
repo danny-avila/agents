@@ -17,11 +17,26 @@ import type {
   AnthropicMessageStartEvent,
   AnthropicMessageDeltaEvent,
   AnthropicOutputConfig,
+  AnthropicBeta,
+  ChatAnthropicToolType,
+  AnthropicMCPServerURLDefinition,
+  AnthropicContextManagementConfigParam,
 } from '@/llm/anthropic/types';
 import { _makeMessageChunkFromAnthropicEvent } from './utils/message_outputs';
 import { _convertMessagesToAnthropicPayload } from './utils/message_inputs';
 import { handleToolChoice } from './utils/tools';
 import { TextStream } from '@/llm/text';
+
+const ANTHROPIC_TOOL_BETAS: Partial<Record<string, AnthropicBeta>> = {
+  tool_search_tool_regex_20251119: 'advanced-tool-use-2025-11-20',
+  tool_search_tool_bm25_20251119: 'advanced-tool-use-2025-11-20',
+  memory_20250818: 'context-management-2025-06-27',
+  web_fetch_20250910: 'web-fetch-2025-09-10',
+  code_execution_20250825: 'code-execution-2025-08-25',
+  computer_20251124: 'computer-use-2025-11-24',
+  computer_20250124: 'computer-use-2025-01-24',
+  mcp_toolset: 'mcp-client-2025-11-20',
+};
 
 function _toolsInParams(
   params: AnthropicMessageCreateParams | AnthropicStreamingMessageCreateParams
@@ -31,18 +46,17 @@ function _toolsInParams(
 function _documentsInParams(
   params: AnthropicMessageCreateParams | AnthropicStreamingMessageCreateParams
 ): boolean {
-  for (const message of params.messages ?? []) {
+  for (const message of params.messages) {
     if (typeof message.content === 'string') {
       continue;
     }
-    for (const block of message.content ?? []) {
+    for (const block of message.content) {
       if (
         typeof block === 'object' &&
-        block != null &&
         block.type === 'document' &&
         block.citations != null &&
         typeof block.citations === 'object' &&
-        block.citations.enabled
+        block.citations.enabled === true
       ) {
         return true;
       }
@@ -61,13 +75,156 @@ function _thinkingInParams(
 }
 
 function _compactionInParams(
-  params: AnthropicMessageCreateParams | AnthropicStreamingMessageCreateParams
+  params: (
+    | AnthropicMessageCreateParams
+    | AnthropicStreamingMessageCreateParams
+  ) & {
+    context_management?: AnthropicContextManagementConfigParam;
+  }
 ): boolean {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const cm = (params as any).context_management;
-  return !!cm?.edits?.some(
-    (e: { type: string }) => e.type === 'compact_20260112'
+  return (
+    params.context_management?.edits?.some(
+      (edit) => edit.type === 'compact_20260112'
+    ) === true
   );
+}
+
+function isThinkingEnabled(thinking: Anthropic.ThinkingConfigParam): boolean {
+  return thinking.type === 'enabled' || thinking.type === 'adaptive';
+}
+
+function isOpus47Model(model?: string): boolean {
+  return model?.startsWith('claude-opus-4-7') === true;
+}
+
+function combineBetas(
+  ...betaGroups: (AnthropicBeta[] | undefined)[]
+): AnthropicBeta[] {
+  const betas = new Set<AnthropicBeta>();
+  for (const betaGroup of betaGroups) {
+    for (const beta of betaGroup ?? []) {
+      betas.add(beta);
+    }
+  }
+  return [...betas];
+}
+
+function getToolBetas(tools?: ChatAnthropicToolType[]): AnthropicBeta[] {
+  const betas = new Set<AnthropicBeta>();
+  for (const tool of tools ?? []) {
+    if (typeof tool !== 'object' || !('type' in tool)) {
+      continue;
+    }
+    const beta = ANTHROPIC_TOOL_BETAS[String(tool.type)];
+    if (beta != null) {
+      betas.add(beta);
+    }
+  }
+  return [...betas];
+}
+
+function getCompactionBetas(
+  contextManagement?: AnthropicContextManagementConfigParam
+): AnthropicBeta[] {
+  return contextManagement?.edits?.some(
+    (edit) => edit.type === 'compact_20260112'
+  ) === true
+    ? ['compact-2026-01-12']
+    : [];
+}
+
+function getTaskBudgetBetas(
+  model: string,
+  outputConfig?: AnthropicOutputConfig
+): AnthropicBeta[] {
+  return isOpus47Model(model) &&
+    outputConfig != null &&
+    'task_budget' in outputConfig &&
+    outputConfig.task_budget != null
+    ? ['task-budgets-2026-03-13']
+    : [];
+}
+
+function validateInvocationParamCompatibility({
+  model,
+  thinking,
+  topK,
+  topP,
+  temperature,
+}: {
+  model: string;
+  thinking: Anthropic.ThinkingConfigParam;
+  topK?: number;
+  topP?: number | null;
+  temperature?: number;
+}): void {
+  const opus47 = isOpus47Model(model);
+  if (opus47 && thinking.type === 'enabled') {
+    throw new Error(
+      'thinking.type="enabled" is not supported for claude-opus-4-7; use thinking.type="adaptive" instead'
+    );
+  }
+  if (opus47 && 'budget_tokens' in thinking) {
+    throw new Error(
+      'thinking.budget_tokens is not supported for claude-opus-4-7; use outputConfig.effort instead'
+    );
+  }
+  if (opus47) {
+    if (topK !== undefined) {
+      throw new Error(
+        'topK is not supported for claude-opus-4-7; omit topK/topP/temperature or use model prompting instead'
+      );
+    }
+    if (topP != null && topP !== 1) {
+      throw new Error(
+        'topP is not supported for claude-opus-4-7 when set to non-default values'
+      );
+    }
+    if (temperature !== undefined && temperature !== 1) {
+      throw new Error(
+        'temperature is not supported for claude-opus-4-7 when set to non-default values'
+      );
+    }
+  }
+  if (!isThinkingEnabled(thinking)) {
+    return;
+  }
+  if (topK !== undefined) {
+    throw new Error('topK is not supported when thinking is enabled');
+  }
+  if (topP != null) {
+    throw new Error('topP is not supported when thinking is enabled');
+  }
+  if (temperature !== undefined && temperature !== 1) {
+    throw new Error('temperature is not supported when thinking is enabled');
+  }
+}
+
+function getSamplingParams({
+  model,
+  thinking,
+  topK,
+  topP,
+  temperature,
+}: {
+  model: string;
+  thinking: Anthropic.ThinkingConfigParam;
+  topK?: number;
+  topP?: number | null;
+  temperature?: number;
+}): {
+  temperature?: number;
+  top_k?: number;
+  top_p?: number;
+} {
+  if (isThinkingEnabled(thinking) || isOpus47Model(model)) {
+    return {};
+  }
+  return {
+    ...(temperature !== undefined ? { temperature } : {}),
+    ...(topK !== undefined ? { top_k: topK } : {}),
+    ...(topP != null ? { top_p: topP } : {}),
+  };
 }
 
 function extractToken(
@@ -124,7 +281,11 @@ function cloneChunk(
         content: [Object.assign({}, content, { text })],
       })
     );
-  } else if (tokenType === 'content' && content.type?.startsWith('thinking')) {
+  } else if (
+    tokenType === 'content' &&
+    typeof content.type === 'string' &&
+    content.type.startsWith('thinking')
+  ) {
     return new AIMessageChunk(
       Object.assign({}, chunk, {
         content: [Object.assign({}, content, { thinking: text })],
@@ -139,9 +300,17 @@ export type CustomAnthropicInput = AnthropicInput & {
   _lc_stream_delay?: number;
   outputConfig?: AnthropicOutputConfig;
   inferenceGeo?: string;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  contextManagement?: any;
+  contextManagement?: AnthropicContextManagementConfigParam;
 } & BaseChatModelParams;
+
+type CustomAnthropicCallOptions = {
+  outputConfig?: AnthropicOutputConfig;
+  outputFormat?: Anthropic.Messages.JSONOutputFormat;
+  inferenceGeo?: string;
+  betas?: AnthropicBeta[];
+  container?: string;
+  mcp_servers?: AnthropicMCPServerURLDefinition[];
+};
 
 /**
  * A type representing additional parameters that can be passed to the
@@ -159,8 +328,7 @@ export class CustomAnthropic extends ChatAnthropicMessages {
   top_k: number | undefined;
   outputConfig?: AnthropicOutputConfig;
   inferenceGeo?: string;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  contextManagement?: any;
+  contextManagement?: AnthropicContextManagementConfigParam;
   constructor(fields?: CustomAnthropicInput) {
     super(fields);
     this.resetTokenEvents();
@@ -191,8 +359,7 @@ export class CustomAnthropic extends ChatAnthropicMessages {
       | Anthropic.Messages.ToolChoiceTool
       | undefined = handleToolChoice(options?.tool_choice);
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const callOptions = options as Record<string, any> | undefined;
+    const callOptions = options as CustomAnthropicCallOptions | undefined;
     const mergedOutputConfig: AnthropicOutputConfig | undefined = (():
       | AnthropicOutputConfig
       | undefined => {
@@ -209,49 +376,49 @@ export class CustomAnthropic extends ChatAnthropicMessages {
     const inferenceGeo = callOptions?.inferenceGeo ?? this.inferenceGeo;
 
     const contextManagement = this.contextManagement;
+    const toolBetas = getToolBetas(options?.tools);
+    const compactionBetas = getCompactionBetas(contextManagement);
+    const taskBudgetBetas = getTaskBudgetBetas(this.model, mergedOutputConfig);
+    const formattedTools = this.formatStructuredToolToAnthropic(options?.tools);
 
     const sharedParams = {
-      tools: this.formatStructuredToolToAnthropic(options?.tools),
+      tools: formattedTools,
       tool_choice,
       thinking: this.thinking,
-      ...(mergedOutputConfig ? { output_config: mergedOutputConfig } : {}),
-      ...(inferenceGeo ? { inference_geo: inferenceGeo } : {}),
-      ...(contextManagement ? { context_management: contextManagement } : {}),
+      context_management: contextManagement,
       ...this.invocationKwargs,
+      container: callOptions?.container,
+      betas: combineBetas(
+        this.betas,
+        callOptions?.betas,
+        toolBetas,
+        compactionBetas,
+        taskBudgetBetas
+      ),
+      output_config: mergedOutputConfig,
+      inference_geo: inferenceGeo,
+      mcp_servers: callOptions?.mcp_servers,
     };
+    validateInvocationParamCompatibility({
+      model: this.model,
+      thinking: this.thinking,
+      topK: this.top_k,
+      topP: this.topP,
+      temperature: this.temperature,
+    });
 
-    if (this.thinking.type === 'enabled' || this.thinking.type === 'adaptive') {
-      if (this.top_k !== -1 && (this.top_k as number | undefined) != null) {
-        throw new Error('topK is not supported when thinking is enabled');
-      }
-      if (this.topP !== -1 && (this.topP as number | undefined) != null) {
-        throw new Error('topP is not supported when thinking is enabled');
-      }
-      if (
-        this.temperature !== 1 &&
-        (this.temperature as number | undefined) != null
-      ) {
-        throw new Error(
-          'temperature is not supported when thinking is enabled'
-        );
-      }
-
-      return {
-        model: this.model,
-        stop_sequences: options?.stop ?? this.stopSequences,
-        stream: this.streaming,
-        max_tokens: this.maxTokens,
-        ...sharedParams,
-      };
-    }
     return {
       model: this.model,
-      temperature: this.temperature,
-      top_k: this.top_k,
-      top_p: this.topP,
       stop_sequences: options?.stop ?? this.stopSequences,
       stream: this.streaming,
       max_tokens: this.maxTokens,
+      ...getSamplingParams({
+        model: this.model,
+        thinking: this.thinking,
+        topK: this.top_k,
+        topP: this.topP,
+        temperature: this.temperature,
+      }),
       ...sharedParams,
     };
   }
@@ -365,9 +532,10 @@ export class CustomAnthropic extends ChatAnthropicMessages {
 
     const stream = await this.createStreamWithRetry(payload, {
       headers: options.headers,
+      signal: options.signal,
     });
 
-    const shouldStreamUsage = this.streamUsage ?? options.streamUsage;
+    const shouldStreamUsage = options.streamUsage ?? this.streamUsage;
 
     for await (const data of stream) {
       if (options.signal?.aborted === true) {

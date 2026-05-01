@@ -2,6 +2,10 @@ import { AIMessage } from '@langchain/core/messages';
 import type { OpenAIChatInput } from '@langchain/openai';
 import type { ChatOpenRouterCallOptions } from '@/llm/openrouter';
 import type { CustomAnthropicInput } from '@/llm/anthropic';
+import type {
+  ChatAnthropicToolType,
+  AnthropicMCPServerURLDefinition,
+} from '@/llm/anthropic/types';
 import {
   ChatXAI,
   ChatOpenAI,
@@ -26,8 +30,14 @@ type OpenAIRequestOptionsWithBaseURL = ReturnType<
 type AnthropicCallOptions = Parameters<
   CustomAnthropic['invocationParams']
 >[0] & {
-  outputConfig?: CustomAnthropicInput['outputConfig'];
+  outputConfig?: CustomAnthropicInput['outputConfig'] & {
+    task_budget?: { type: 'token_budget'; value: number };
+  };
   inferenceGeo?: CustomAnthropicInput['inferenceGeo'];
+  betas?: CustomAnthropicInput['betas'];
+  container?: string;
+  mcp_servers?: AnthropicMCPServerURLDefinition[];
+  tools?: ChatAnthropicToolType[];
 };
 type AzureReasoningModel = AzureChatOpenAI & {
   reasoning?: { effort: 'low' | 'high' };
@@ -255,6 +265,82 @@ describe('custom chat model class smoke tests', () => {
     expect(params.output_config).toEqual({ effort: 'low' });
     expect(params.inference_geo).toBe('eu');
     expect(params.context_management).toEqual(contextManagement);
+  });
+
+  it('keeps Anthropic beta, MCP, and container request wiring current', () => {
+    const contextManagement = {
+      edits: [
+        {
+          type: 'compact_20260112' as const,
+          trigger: { type: 'input_tokens' as const, value: 50000 },
+        },
+      ],
+    };
+    const mcpServers: AnthropicMCPServerURLDefinition[] = [
+      {
+        type: 'url',
+        url: 'https://example.com/mcp',
+        name: 'docs',
+      },
+    ];
+    const model = new CustomAnthropic({
+      model: 'claude-opus-4-7-test',
+      apiKey: 'test-key',
+      maxTokens: 4096,
+      contextManagement,
+      betas: ['model-beta'],
+    });
+
+    const params = model.invocationParams({
+      outputConfig: {
+        effort: 'low',
+        task_budget: { type: 'token_budget', value: 1024 },
+      },
+      betas: ['request-beta', 'model-beta'],
+      container: 'container_123',
+      mcp_servers: mcpServers,
+      tools: [
+        {
+          type: 'tool_search_tool_bm25_20251119',
+          name: 'search',
+        } as ChatAnthropicToolType,
+      ],
+    } as AnthropicCallOptions);
+
+    expect(params.betas).toEqual([
+      'model-beta',
+      'request-beta',
+      'advanced-tool-use-2025-11-20',
+      'compact-2026-01-12',
+      'task-budgets-2026-03-13',
+    ]);
+    expect(params.container).toBe('container_123');
+    expect(params.mcp_servers).toBe(mcpServers);
+    expect(params.temperature).toBeUndefined();
+    expect(params.top_k).toBeUndefined();
+    expect(params.top_p).toBeUndefined();
+  });
+
+  it('matches Anthropic Opus 4.7 sampling compatibility checks', () => {
+    const thinkingModel = new CustomAnthropic({
+      model: 'claude-opus-4-7-test',
+      apiKey: 'test-key',
+      maxTokens: 4096,
+      thinking: { type: 'enabled', budget_tokens: 1024 },
+    });
+    const topKModel = new CustomAnthropic({
+      model: 'claude-opus-4-7-test',
+      apiKey: 'test-key',
+      maxTokens: 4096,
+      topK: 5,
+    });
+
+    expect(() => thinkingModel.invocationParams()).toThrow(
+      'thinking.type="enabled" is not supported for claude-opus-4-7'
+    );
+    expect(() => topKModel.invocationParams()).toThrow(
+      'topK is not supported for claude-opus-4-7'
+    );
   });
 
   it('keeps Bedrock Converse application profiles and service tier passthroughs', () => {
