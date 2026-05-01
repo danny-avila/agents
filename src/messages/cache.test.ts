@@ -441,6 +441,70 @@ describe('addBedrockCacheControl (Bedrock cache checkpoints)', () => {
     expect(result[0].content).toEqual(systemContent);
   });
 
+  it('strips Anthropic cache_control from LangChain system messages without moving cache points', () => {
+    const systemContent = [
+      {
+        type: ContentTypes.TEXT,
+        text: 'Stable system text',
+        cache_control: { type: 'ephemeral' },
+      } as MessageContentComplex,
+      { cachePoint: { type: 'default' } },
+      {
+        type: ContentTypes.TEXT,
+        text: 'Dynamic system text',
+        cache_control: { type: 'ephemeral' },
+      } as MessageContentComplex,
+    ] as MessageContentComplex[];
+    const messages: BaseMessage[] = [
+      new SystemMessage({ content: systemContent }),
+      new HumanMessage('Hello'),
+      new AIMessage('Hi'),
+    ];
+
+    const result = addBedrockCacheControl(messages);
+
+    expect(result[0]).not.toBe(messages[0]);
+    expect(result[0].content).toEqual([
+      { type: ContentTypes.TEXT, text: 'Stable system text' },
+      { cachePoint: { type: 'default' } },
+      { type: ContentTypes.TEXT, text: 'Dynamic system text' },
+    ]);
+    expect(systemContent[0]).toHaveProperty('cache_control');
+    expect(systemContent[2]).toHaveProperty('cache_control');
+  });
+
+  it('strips Anthropic cache_control from serialized system messages without moving cache points', () => {
+    const systemContent = [
+      {
+        type: ContentTypes.TEXT,
+        text: 'Stable system text',
+        cache_control: { type: 'ephemeral' },
+      } as MessageContentComplex,
+      { cachePoint: { type: 'default' } },
+      {
+        type: ContentTypes.TEXT,
+        text: 'Dynamic system text',
+        cache_control: { type: 'ephemeral' },
+      } as MessageContentComplex,
+    ] as MessageContentComplex[];
+    const messages: TestMsg[] = [
+      { role: 'system', content: systemContent },
+      { role: 'user', content: 'Hello' },
+      { role: 'assistant', content: 'Hi' },
+    ];
+
+    const result = addBedrockCacheControl(messages);
+
+    expect(result[0]).not.toBe(messages[0]);
+    expect(result[0].content).toEqual([
+      { type: ContentTypes.TEXT, text: 'Stable system text' },
+      { cachePoint: { type: 'default' } },
+      { type: ContentTypes.TEXT, text: 'Dynamic system text' },
+    ]);
+    expect(systemContent[0]).toHaveProperty('cache_control');
+    expect(systemContent[2]).toHaveProperty('cache_control');
+  });
+
   it('skips serialized system messages while adding cache points to non-system turns', () => {
     const messages: TestMsg[] = [
       {

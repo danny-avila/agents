@@ -14,6 +14,10 @@ type MessageWithContent = {
   content?: string | MessageContentComplex[];
 };
 
+type MessageContentWithCacheControl = MessageContentComplex & {
+  cache_control?: unknown;
+};
+
 /**
  * Deep clones a message's content to prevent mutation of the original.
  */
@@ -99,6 +103,24 @@ function cloneMessage<T extends MessageWithContent>(
   }
 
   return cloned;
+}
+
+function stripAnthropicCacheControlFromBlocks(
+  content: MessageContentComplex[]
+): { content: MessageContentComplex[]; modified: boolean } {
+  let modified = false;
+  const strippedContent = content.map((block) => {
+    if (!('cache_control' in block)) {
+      return block;
+    }
+
+    const cloned: MessageContentWithCacheControl = { ...block };
+    delete cloned.cache_control;
+    modified = true;
+    return cloned;
+  });
+
+  return { content: strippedContent, modified };
 }
 
 /**
@@ -320,7 +342,16 @@ export function addBedrockCacheControl<
         ? originalMessage.role
         : undefined;
 
-    if (messageType === 'system' || messageRole === 'system') {
+    const isSystemMessage =
+      messageType === 'system' || messageRole === 'system';
+    if (isSystemMessage) {
+      const systemContent = originalMessage.content;
+      if (Array.isArray(systemContent)) {
+        const stripped = stripAnthropicCacheControlFromBlocks(systemContent);
+        if (stripped.modified) {
+          updatedMessages[i] = cloneMessage(originalMessage, stripped.content);
+        }
+      }
       continue;
     }
 
