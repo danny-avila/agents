@@ -1,9 +1,11 @@
-// src/agents/__tests__/AgentContext.anthropic.live.test.ts
+// src/agents/__tests__/AgentContext.bedrock.live.test.ts
 /**
- * Live Anthropic prompt-cache verification.
+ * Live Bedrock prompt-cache verification.
  *
  * Run with:
- * RUN_ANTHROPIC_PROMPT_CACHE_LIVE_TESTS=1 ANTHROPIC_API_KEY=... npm test -- AgentContext.anthropic.live.test.ts --runInBand
+ * RUN_BEDROCK_PROMPT_CACHE_LIVE_TESTS=1 BEDROCK_AWS_REGION=... BEDROCK_AWS_ACCESS_KEY_ID=... BEDROCK_AWS_SECRET_ACCESS_KEY=... npm test -- AgentContext.bedrock.live.test.ts --runInBand
+ *
+ * Standard AWS credential env vars or AWS_PROFILE can also be used.
  */
 import { config as dotenvConfig } from 'dotenv';
 dotenvConfig();
@@ -17,24 +19,42 @@ import { AgentContext } from '../AgentContext';
 import { GraphEvents, Providers } from '@/common';
 import { Run } from '@/run';
 
+const accessKeyId =
+  process.env.BEDROCK_AWS_ACCESS_KEY_ID ?? process.env.AWS_ACCESS_KEY_ID;
+const secretAccessKey =
+  process.env.BEDROCK_AWS_SECRET_ACCESS_KEY ??
+  process.env.AWS_SECRET_ACCESS_KEY;
+const sessionToken =
+  process.env.BEDROCK_AWS_SESSION_TOKEN ?? process.env.AWS_SESSION_TOKEN;
+const hasCredentialPair =
+  accessKeyId != null &&
+  accessKeyId !== '' &&
+  secretAccessKey != null &&
+  secretAccessKey !== '';
+const hasAmbientCredentials =
+  process.env.AWS_PROFILE != null ||
+  process.env.AWS_WEB_IDENTITY_TOKEN_FILE != null;
+
 const shouldRunLive =
-  process.env.RUN_ANTHROPIC_PROMPT_CACHE_LIVE_TESTS === '1' &&
-  process.env.ANTHROPIC_API_KEY != null &&
-  process.env.ANTHROPIC_API_KEY !== '';
+  process.env.RUN_BEDROCK_PROMPT_CACHE_LIVE_TESTS === '1' &&
+  (hasCredentialPair || hasAmbientCredentials);
 
 const describeIfLive = shouldRunLive ? describe : describe.skip;
 
-const modelName =
-  process.env.ANTHROPIC_PROMPT_CACHE_MODEL ?? 'claude-sonnet-4-5';
+const model =
+  process.env.BEDROCK_PROMPT_CACHE_MODEL ??
+  'us.anthropic.claude-sonnet-4-5-20250929-v1:0';
+const region =
+  process.env.BEDROCK_AWS_REGION ?? process.env.AWS_REGION ?? 'us-east-1';
 
 function buildStableInstructions(nonce: string): string {
   const records = Array.from(
     { length: 360 },
     (_, index) =>
-      `Stable cache record ${index}: nonce ${nonce}; keep this reference in the cacheable prefix and do not use it as the dynamic marker.`
+      `Stable Bedrock cache record ${index}: nonce ${nonce}; keep this reference in the cacheable prefix and do not use it as the dynamic marker.`
   );
   return [
-    'You are a prompt-cache verification assistant.',
+    'You are a Bedrock prompt-cache verification assistant.',
     'When asked for the dynamic marker, answer with only the marker value from the Dynamic Marker line.',
     ...records,
   ].join('\n');
@@ -43,23 +63,33 @@ function buildStableInstructions(nonce: string): string {
 function buildDynamicInstructions(marker: string): string {
   return [
     `Dynamic Marker: ${marker}`,
-    'The Dynamic Marker line is runtime context and must remain outside the cached prefix.',
+    'The Dynamic Marker line is runtime context and must remain after the Bedrock cache point.',
   ].join('\n');
 }
 
-function createClientOptions(): t.AnthropicClientOptions {
+function getCredentials():
+  | t.BedrockAnthropicClientOptions['credentials']
+  | undefined {
+  if (!hasCredentialPair) {
+    return undefined;
+  }
+
   return {
-    modelName,
-    temperature: 0,
+    accessKeyId,
+    secretAccessKey,
+    ...(sessionToken != null && sessionToken !== '' ? { sessionToken } : {}),
+  };
+}
+
+function createClientOptions(): t.BedrockAnthropicClientOptions {
+  return {
+    model,
+    region,
     maxTokens: 8,
     streaming: true,
     streamUsage: true,
     promptCache: true,
-    clientOptions: {
-      defaultHeaders: {
-        'anthropic-beta': 'prompt-caching-2024-07-31',
-      },
-    },
+    ...(getCredentials() != null ? { credentials: getCredentials() } : {}),
   };
 }
 
@@ -71,8 +101,8 @@ async function assertSystemPayloadShape({
   dynamicInstructions: string;
 }): Promise<void> {
   const ctx = AgentContext.fromConfig({
-    agentId: 'live-cache-shape-check',
-    provider: Providers.ANTHROPIC,
+    agentId: 'live-bedrock-cache-shape-check',
+    provider: Providers.BEDROCK,
     clientOptions: createClientOptions(),
     instructions: stableInstructions,
     additional_instructions: dynamicInstructions,
@@ -86,7 +116,9 @@ async function assertSystemPayloadShape({
     {
       type: 'text',
       text: stableInstructions,
-      cache_control: { type: 'ephemeral' },
+    },
+    {
+      cachePoint: { type: 'default' },
     },
     {
       type: 'text',
@@ -100,7 +132,7 @@ function latestUsage(
   label: string
 ): UsageMetadata {
   if (collectedUsage.length === 0) {
-    throw new Error(`Missing Anthropic usage metadata for ${label}`);
+    throw new Error(`Missing Bedrock usage metadata for ${label}`);
   }
   return collectedUsage[collectedUsage.length - 1];
 }
@@ -112,10 +144,6 @@ function collectText(parts: t.MessageContentComplex[] | undefined): string {
     }
     return text;
   }, '');
-}
-
-async function waitForCachePropagation(): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, 2000));
 }
 
 async function runLiveTurn({
@@ -138,7 +166,7 @@ async function runLiveTurn({
     graphConfig: {
       type: 'standard',
       llmConfig: {
-        provider: Providers.ANTHROPIC,
+        provider: Providers.BEDROCK,
         ...createClientOptions(),
       },
       instructions: stableInstructions,
@@ -172,9 +200,9 @@ async function runLiveTurn({
   };
 }
 
-describeIfLive('AgentContext Anthropic prompt cache live API', () => {
+describeIfLive('AgentContext Bedrock prompt cache live API', () => {
   it('caches only the stable system prefix while dynamic tail changes', async () => {
-    const nonce = `agent-cache-live-${Date.now()}`;
+    const nonce = `agent-bedrock-cache-live-${Date.now()}`;
     const stableInstructions = buildStableInstructions(nonce);
     const firstDynamicInstructions = buildDynamicInstructions('alpha');
     const secondDynamicInstructions = buildDynamicInstructions('bravo');
@@ -195,8 +223,6 @@ describeIfLive('AgentContext Anthropic prompt cache live API', () => {
     expect(first.usage.input_token_details?.cache_creation).toBeGreaterThan(0);
     expect(first.usage.input_token_details?.cache_read ?? 0).toBe(0);
 
-    await waitForCachePropagation();
-
     const second = await runLiveTurn({
       runId: `${nonce}-second`,
       threadId: `${nonce}-thread`,
@@ -206,5 +232,5 @@ describeIfLive('AgentContext Anthropic prompt cache live API', () => {
 
     expect(second.text.toLowerCase()).toContain('bravo');
     expect(second.usage.input_token_details?.cache_read).toBeGreaterThan(0);
-  }, 120_000);
+  }, 180_000);
 });
