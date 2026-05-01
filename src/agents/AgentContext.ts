@@ -20,6 +20,16 @@ import { addCacheControl } from '@/messages/cache';
 import { DEFAULT_RESERVE_RATIO } from '@/messages';
 import { toJsonSchema } from '@/utils/schema';
 
+type AgentSystemTextBlock = {
+  type: 'text';
+  text: string;
+  cache_control?: { type: 'ephemeral' };
+};
+
+type AgentSystemContentBlock =
+  | AgentSystemTextBlock
+  | { cachePoint: { type: 'default' } };
+
 /**
  * Encapsulates agent-specific state that can vary between agents in a multi-agent system
  */
@@ -249,7 +259,7 @@ export class AgentContext {
   private summaryTokenCount: number = 0;
   /**
    * Where the summary should be injected:
-   * - `'system_prompt'`: cross-run summary, included in `buildInstructionsString`
+   * - `'system_prompt'`: cross-run summary, included in the dynamic system tail
    * - `'user_message'`: mid-run compaction, injected as HumanMessage on clean slate
    * - `'none'`: no summary present
    */
@@ -417,7 +427,8 @@ export class AgentContext {
 
   /**
    * Gets the system runnable, creating it lazily if needed.
-   * Includes instructions, additional instructions, and programmatic-only tools documentation.
+   * Includes stable instructions, dynamic additional instructions, and
+   * programmatic-only tools documentation.
    * Only rebuilds when marked stale (via markToolsAsDiscovered).
    */
   get systemRunnable():
@@ -431,8 +442,10 @@ export class AgentContext {
       return this.cachedSystemRunnable;
     }
 
-    const instructionsString = this.buildInstructionsString();
-    this.cachedSystemRunnable = this.buildSystemRunnable(instructionsString);
+    this.cachedSystemRunnable = this.buildSystemRunnable({
+      stableInstructions: this.buildStableInstructionsString(),
+      dynamicInstructions: this.buildDynamicInstructionsString(),
+    });
     this.systemRunnableStale = false;
     return this.cachedSystemRunnable;
   }
@@ -443,17 +456,19 @@ export class AgentContext {
    */
   initializeSystemRunnable(): void {
     if (this.systemRunnableStale || this.cachedSystemRunnable === undefined) {
-      const instructionsString = this.buildInstructionsString();
-      this.cachedSystemRunnable = this.buildSystemRunnable(instructionsString);
+      this.cachedSystemRunnable = this.buildSystemRunnable({
+        stableInstructions: this.buildStableInstructionsString(),
+        dynamicInstructions: this.buildDynamicInstructionsString(),
+      });
       this.systemRunnableStale = false;
     }
   }
 
   /**
-   * Builds the raw instructions string (without creating SystemMessage).
+   * Builds the cacheable instructions string (without creating SystemMessage).
    * Includes agent identity preamble and handoff context when available.
    */
-  private buildInstructionsString(): string {
+  private buildStableInstructionsString(): string {
     const parts: string[] = [];
 
     const identityPreamble = this.buildIdentityPreamble();
@@ -465,6 +480,22 @@ export class AgentContext {
       parts.push(this.instructions);
     }
 
+    const programmaticToolsDoc = this.buildProgrammaticOnlyToolsInstructions();
+    if (programmaticToolsDoc) {
+      parts.push(programmaticToolsDoc);
+    }
+
+    return parts.join('\n\n');
+  }
+
+  /**
+   * Builds the dynamic system-tail string (without creating SystemMessage).
+   * Keep this out of prompt-cache-marked content so volatile context does not
+   * invalidate the stable prefix.
+   */
+  private buildDynamicInstructionsString(): string {
+    const parts: string[] = [];
+
     if (
       this.additionalInstructions != null &&
       this.additionalInstructions !== ''
@@ -472,14 +503,10 @@ export class AgentContext {
       parts.push(this.additionalInstructions);
     }
 
-    const programmaticToolsDoc = this.buildProgrammaticOnlyToolsInstructions();
-    if (programmaticToolsDoc) {
-      parts.push(programmaticToolsDoc);
-    }
-
-    // Cross-run summary: include in system prompt so the model has context
-    // from the prior run.  Mid-run summaries are injected as a HumanMessage
-    // on the post-compaction clean slate instead (see buildSystemRunnable).
+    // Cross-run summary: include in the system tail so the model has context
+    // from the prior run without invalidating the cacheable prefix. Mid-run
+    // summaries are injected as a HumanMessage on the post-compaction clean
+    // slate instead (see buildSystemRunnable).
     if (
       this._summaryLocation === 'system_prompt' &&
       this.summaryText != null &&
@@ -523,9 +550,13 @@ export class AgentContext {
    * Build system runnable from pre-built instructions string.
    * Only called when content has actually changed.
    */
-  private buildSystemRunnable(
-    instructionsString: string
-  ):
+  private buildSystemRunnable({
+    stableInstructions,
+    dynamicInstructions,
+  }: {
+    stableInstructions: string;
+    dynamicInstructions: string;
+  }):
     | Runnable<
         BaseMessage[],
         (BaseMessage | SystemMessage)[],
@@ -537,35 +568,17 @@ export class AgentContext {
       this.summaryText != null &&
       this.summaryText !== '';
 
-    if (!instructionsString && !hasMidRunSummary) {
+    if (!stableInstructions && !dynamicInstructions && !hasMidRunSummary) {
       this.systemMessageTokens = 0;
       return undefined;
     }
 
-    let finalInstructions: string | BaseMessageFields = instructionsString;
-
-    let usePromptCache = false;
-    if (this.provider === Providers.ANTHROPIC) {
-      const anthropicOptions = this.clientOptions as
-        | t.AnthropicClientOptions
-        | undefined;
-      if (anthropicOptions?.promptCache === true) {
-        usePromptCache = true;
-        finalInstructions = {
-          content: [
-            {
-              type: 'text',
-              text: instructionsString,
-              cache_control: { type: 'ephemeral' },
-            },
-          ],
-        };
-      }
-    }
-
-    const systemMessage = instructionsString
-      ? new SystemMessage(finalInstructions)
-      : undefined;
+    const usePromptCache = this.hasAnthropicPromptCache();
+    const systemMessage = this.buildSystemMessage({
+      stableInstructions,
+      dynamicInstructions,
+      usePromptCache,
+    });
 
     if (this.tokenCounter) {
       this.systemMessageTokens = systemMessage
@@ -613,6 +626,72 @@ export class AgentContext {
       }
       return [...prefix, ...body];
     }).withConfig({ runName: 'prompt' });
+  }
+
+  private hasAnthropicPromptCache(): boolean {
+    if (this.provider !== Providers.ANTHROPIC) {
+      return false;
+    }
+    const anthropicOptions = this.clientOptions as
+      | t.AnthropicClientOptions
+      | undefined;
+    return anthropicOptions?.promptCache === true;
+  }
+
+  private hasBedrockPromptCache(): boolean {
+    if (this.provider !== Providers.BEDROCK) {
+      return false;
+    }
+    const bedrockOptions = this.clientOptions as
+      | t.BedrockAnthropicClientOptions
+      | undefined;
+    return bedrockOptions?.promptCache === true;
+  }
+
+  private buildSystemMessage({
+    stableInstructions,
+    dynamicInstructions,
+    usePromptCache,
+  }: {
+    stableInstructions: string;
+    dynamicInstructions: string;
+    usePromptCache: boolean;
+  }): SystemMessage | undefined {
+    if (!stableInstructions && !dynamicInstructions) {
+      return undefined;
+    }
+
+    if (usePromptCache) {
+      const content: AgentSystemContentBlock[] = [];
+      if (stableInstructions) {
+        content.push({
+          type: 'text',
+          text: stableInstructions,
+          cache_control: { type: 'ephemeral' },
+        });
+      }
+      if (dynamicInstructions) {
+        content.push({ type: 'text', text: dynamicInstructions });
+      }
+      return new SystemMessage({ content } as BaseMessageFields);
+    }
+
+    if (this.hasBedrockPromptCache() && stableInstructions) {
+      const content: AgentSystemContentBlock[] = [
+        { type: 'text', text: stableInstructions },
+        { cachePoint: { type: 'default' } },
+      ];
+      if (dynamicInstructions) {
+        content.push({ type: 'text', text: dynamicInstructions });
+      }
+      return new SystemMessage({ content } as BaseMessageFields);
+    }
+
+    return new SystemMessage(
+      [stableInstructions, dynamicInstructions]
+        .filter((part) => part !== '')
+        .join('\n\n')
+    );
   }
 
   /**

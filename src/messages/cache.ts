@@ -14,6 +14,10 @@ type MessageWithContent = {
   content?: string | MessageContentComplex[];
 };
 
+type MessageContentWithCacheControl = MessageContentComplex & {
+  cache_control?: unknown;
+};
+
 /**
  * Deep clones a message's content to prevent mutation of the original.
  */
@@ -99,6 +103,40 @@ function cloneMessage<T extends MessageWithContent>(
   }
 
   return cloned;
+}
+
+function stripAnthropicCacheControlFromBlocks(
+  content: MessageContentComplex[]
+): { content: MessageContentComplex[]; modified: boolean } {
+  let modified = false;
+  const strippedContent = content.map((block) => {
+    if (!('cache_control' in block)) {
+      return block;
+    }
+
+    const cloned: MessageContentWithCacheControl = { ...block };
+    delete cloned.cache_control;
+    modified = true;
+    return cloned;
+  });
+
+  return { content: strippedContent, modified };
+}
+
+function sanitizeBedrockSystemMessage<T extends MessageWithContent>(
+  message: T
+): T {
+  const content = message.content;
+  if (!Array.isArray(content)) {
+    return message;
+  }
+
+  const stripped = stripAnthropicCacheControlFromBlocks(content);
+  if (!stripped.modified) {
+    return message;
+  }
+
+  return cloneMessage(message, stripped.content);
 }
 
 /**
@@ -310,11 +348,24 @@ export function addBedrockCacheControl<
 
   for (let i = updatedMessages.length - 1; i >= 0; i--) {
     const originalMessage = updatedMessages[i];
-    const isToolMessage =
+    const messageType =
       'getType' in originalMessage &&
-      typeof originalMessage.getType === 'function' &&
-      originalMessage.getType() === 'tool';
+      typeof originalMessage.getType === 'function'
+        ? originalMessage.getType()
+        : undefined;
+    const messageRole =
+      'role' in originalMessage && typeof originalMessage.role === 'string'
+        ? originalMessage.role
+        : undefined;
 
+    const isSystemMessage =
+      messageType === 'system' || messageRole === 'system';
+    if (isSystemMessage) {
+      updatedMessages[i] = sanitizeBedrockSystemMessage(originalMessage);
+      continue;
+    }
+
+    const isToolMessage = messageType === 'tool' || messageRole === 'tool';
     const content = originalMessage.content;
     const hasArrayContent = Array.isArray(content);
     const isEmptyString = typeof content === 'string' && content === '';

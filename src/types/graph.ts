@@ -471,10 +471,12 @@ export interface AgentInputs {
   toolMap?: ToolMap;
   tools?: GraphTools;
   provider: Providers;
+  /** Stable/cacheable system instructions. */
   instructions?: string;
   streamBuffer?: number;
   maxContextTokens?: number;
   clientOptions?: ClientOptions;
+  /** Dynamic system tail appended after stable instructions without provider cache markers. */
   additional_instructions?: string;
   reasoningKey?: 'reasoning_content' | 'reasoning';
   /** Format content blocks as strings (for legacy compatibility i.e. Ollama/Azure Serverless) */
@@ -500,7 +502,7 @@ export interface AgentInputs {
   summarizationEnabled?: boolean;
   summarizationConfig?: SummarizationConfig;
   /** Cross-run summary from a previous run, forwarded from formatAgentMessages.
-   *  Injected into the system message via AgentContext.buildInstructionsString(). */
+   *  Injected into the dynamic system tail via AgentContext. */
   initialSummary?: { text: string; tokenCount: number };
   contextPruningConfig?: ContextPruningConfig;
   maxToolResultChars?: number;
