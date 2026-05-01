@@ -22,6 +22,8 @@ import { formatAgentMessages } from '@/messages/format';
 import { FakeListChatModel } from '@langchain/core/utils/testing';
 import * as providers from '@/llm/providers';
 
+const SUMMARY_WRAPPER_OVERHEAD_TOKENS = 33;
+
 /** Extract plain text from a SummaryContentBlock's content array (test helper). */
 function getSummaryText(summary: t.SummaryContentBlock | undefined): string {
   if (!summary) return '';
@@ -1443,7 +1445,8 @@ describe('Cross-run summary lifecycle (no API keys)', () => {
     expect(completePayload.summary!.tokenCount ?? 0).toBeGreaterThan(0);
 
     const expectedTokenCount =
-      tokenCounter(new SystemMessage(KNOWN_SUMMARY)) + 33;
+      tokenCounter(new SystemMessage(KNOWN_SUMMARY)) +
+      SUMMARY_WRAPPER_OVERHEAD_TOKENS;
     expect(completePayload.summary!.tokenCount).toBe(expectedTokenCount);
 
     const summaryBlock = completePayload.summary!;
@@ -2605,8 +2608,9 @@ const hasAnyApiKey =
     const summaryText = getSummaryText(completePayload.summary);
     const reportedTokenCount = completePayload.summary!.tokenCount ?? 0;
 
-    // Count tokens locally using the same tokenizer
-    const localTokenCount = tokenCounter(new SystemMessage(summaryText));
+    const localTokenCount =
+      tokenCounter(new SystemMessage(summaryText)) +
+      SUMMARY_WRAPPER_OVERHEAD_TOKENS;
 
     console.log(
       `  Token match: reported=${reportedTokenCount}, local=${localTokenCount}`
