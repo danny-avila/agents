@@ -119,11 +119,14 @@ jobs:
         id: google_llm_tests
         if: steps.google_changes.outputs.changed == 'true'
         continue-on-error: true
-        run: npx jest src/llm/google/llm.spec.ts
+        run: npx jest src/llm/google/llm.spec.ts --runInBand
         env:
           NODE_OPTIONS: '--experimental-vm-modules'
           NODE_ENV: test
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          GOOGLE_TEST_CALL_GAP_MS: '1000'
+          GOOGLE_TEST_MAX_RETRIES: '2'
+          GOOGLE_TEST_MAX_RETRY_DELAY_MS: '50000'
 
       - name: Surface Google LLM soft failure
         if: always() && steps.google_changes.outputs.changed == 'true' && steps.google_llm_tests.outcome == 'failure'
@@ -134,7 +137,8 @@ jobs:
             echo ""
             echo "The Google LLM integration suite failed, but this job intentionally allows provider API failures."
             echo ""
-            echo "- Suite: \`npx jest src/llm/google/llm.spec.ts\`"
+            echo "- Suite: \`npx jest src/llm/google/llm.spec.ts --runInBand\`"
+            echo "- Active Gemini quotas: https://ai.dev/rate-limit"
             echo "- Logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           } >> "$GITHUB_STEP_SUMMARY"
 
