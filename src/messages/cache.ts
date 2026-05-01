@@ -50,22 +50,22 @@ function cloneMessage<T extends MessageWithContent>(
 
     const msgType = message.getType();
     switch (msgType) {
-      case 'ai':
-        return new AIMessage({
-          ...baseParams,
-          tool_calls: (message as unknown as AIMessage).tool_calls,
-        }) as unknown as T;
-      case 'human':
-        return new HumanMessage(baseParams) as unknown as T;
-      case 'system':
-        return new SystemMessage(baseParams) as unknown as T;
-      case 'tool':
-        return new ToolMessage({
-          ...baseParams,
-          tool_call_id: (message as unknown as ToolMessage).tool_call_id,
-        }) as unknown as T;
-      default:
-        break;
+    case 'ai':
+      return new AIMessage({
+        ...baseParams,
+        tool_calls: (message as unknown as AIMessage).tool_calls,
+      }) as unknown as T;
+    case 'human':
+      return new HumanMessage(baseParams) as unknown as T;
+    case 'system':
+      return new SystemMessage(baseParams) as unknown as T;
+    case 'tool':
+      return new ToolMessage({
+        ...baseParams,
+        tool_call_id: (message as unknown as ToolMessage).tool_call_id,
+      }) as unknown as T;
+    default:
+      break;
     }
   }
 
@@ -310,19 +310,21 @@ export function addBedrockCacheControl<
 
   for (let i = updatedMessages.length - 1; i >= 0; i--) {
     const originalMessage = updatedMessages[i];
-    const isToolMessage =
+    const messageType =
       'getType' in originalMessage &&
-      typeof originalMessage.getType === 'function' &&
-      originalMessage.getType() === 'tool';
-    const isSystemMessage =
-      'getType' in originalMessage &&
-      typeof originalMessage.getType === 'function' &&
-      originalMessage.getType() === 'system';
+      typeof originalMessage.getType === 'function'
+        ? originalMessage.getType()
+        : undefined;
+    const messageRole =
+      'role' in originalMessage && typeof originalMessage.role === 'string'
+        ? originalMessage.role
+        : undefined;
 
-    if (isSystemMessage) {
+    if (messageType === 'system' || messageRole === 'system') {
       continue;
     }
 
+    const isToolMessage = messageType === 'tool' || messageRole === 'tool';
     const content = originalMessage.content;
     const hasArrayContent = Array.isArray(content);
     const isEmptyString = typeof content === 'string' && content === '';

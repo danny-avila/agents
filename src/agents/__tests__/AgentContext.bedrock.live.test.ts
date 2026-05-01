@@ -10,14 +10,16 @@
 import { config as dotenvConfig } from 'dotenv';
 dotenvConfig();
 
-import { HumanMessage } from '@langchain/core/messages';
 import { describe, expect, it } from '@jest/globals';
-import type { UsageMetadata } from '@langchain/core/messages';
 import type * as t from '@/types';
-import { ModelEndHandler } from '@/events';
-import { AgentContext } from '../AgentContext';
-import { GraphEvents, Providers } from '@/common';
-import { Run } from '@/run';
+import { Providers } from '@/common';
+import {
+  runLiveTurn,
+  assertSystemPayloadShape,
+  buildDynamicInstructions,
+  buildStableInstructions,
+  waitForCachePropagation,
+} from './promptCacheLiveHelpers';
 
 const accessKeyId =
   process.env.BEDROCK_AWS_ACCESS_KEY_ID ?? process.env.AWS_ACCESS_KEY_ID;
@@ -46,26 +48,7 @@ const model =
   'us.anthropic.claude-sonnet-4-5-20250929-v1:0';
 const region =
   process.env.BEDROCK_AWS_REGION ?? process.env.AWS_REGION ?? 'us-east-1';
-
-function buildStableInstructions(nonce: string): string {
-  const records = Array.from(
-    { length: 360 },
-    (_, index) =>
-      `Stable Bedrock cache record ${index}: nonce ${nonce}; keep this reference in the cacheable prefix and do not use it as the dynamic marker.`
-  );
-  return [
-    'You are a Bedrock prompt-cache verification assistant.',
-    'When asked for the dynamic marker, answer with only the marker value from the Dynamic Marker line.',
-    ...records,
-  ].join('\n');
-}
-
-function buildDynamicInstructions(marker: string): string {
-  return [
-    `Dynamic Marker: ${marker}`,
-    'The Dynamic Marker line is runtime context and must remain after the Bedrock cache point.',
-  ].join('\n');
-}
+const providerLabel = 'Bedrock';
 
 function getCredentials():
   | t.BedrockAnthropicClientOptions['credentials']
@@ -82,6 +65,7 @@ function getCredentials():
 }
 
 function createClientOptions(): t.BedrockAnthropicClientOptions {
+  const credentials = getCredentials();
   return {
     model,
     region,
@@ -89,130 +73,54 @@ function createClientOptions(): t.BedrockAnthropicClientOptions {
     streaming: true,
     streamUsage: true,
     promptCache: true,
-    ...(getCredentials() != null ? { credentials: getCredentials() } : {}),
-  };
-}
-
-async function assertSystemPayloadShape({
-  stableInstructions,
-  dynamicInstructions,
-}: {
-  stableInstructions: string;
-  dynamicInstructions: string;
-}): Promise<void> {
-  const ctx = AgentContext.fromConfig({
-    agentId: 'live-bedrock-cache-shape-check',
-    provider: Providers.BEDROCK,
-    clientOptions: createClientOptions(),
-    instructions: stableInstructions,
-    additional_instructions: dynamicInstructions,
-  });
-
-  const messages = await ctx.systemRunnable!.invoke([
-    new HumanMessage('What is the dynamic marker?'),
-  ]);
-
-  expect(messages[0].content).toEqual([
-    {
-      type: 'text',
-      text: stableInstructions,
-    },
-    {
-      cachePoint: { type: 'default' },
-    },
-    {
-      type: 'text',
-      text: dynamicInstructions,
-    },
-  ]);
-}
-
-function latestUsage(
-  collectedUsage: UsageMetadata[],
-  label: string
-): UsageMetadata {
-  if (collectedUsage.length === 0) {
-    throw new Error(`Missing Bedrock usage metadata for ${label}`);
-  }
-  return collectedUsage[collectedUsage.length - 1];
-}
-
-function collectText(parts: t.MessageContentComplex[] | undefined): string {
-  return (parts ?? []).reduce((text, part) => {
-    if (part.type === 'text') {
-      return text + part.text;
-    }
-    return text;
-  }, '');
-}
-
-async function runLiveTurn({
-  runId,
-  threadId,
-  stableInstructions,
-  dynamicInstructions,
-}: {
-  runId: string;
-  threadId: string;
-  stableInstructions: string;
-  dynamicInstructions: string;
-}): Promise<{
-  text: string;
-  usage: UsageMetadata;
-}> {
-  const collectedUsage: UsageMetadata[] = [];
-  const run = await Run.create<t.IState>({
-    runId,
-    graphConfig: {
-      type: 'standard',
-      llmConfig: {
-        provider: Providers.BEDROCK,
-        ...createClientOptions(),
-      },
-      instructions: stableInstructions,
-      additional_instructions: dynamicInstructions,
-    },
-    returnContent: true,
-    skipCleanup: true,
-    customHandlers: {
-      [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(collectedUsage),
-    },
-  });
-
-  const config = {
-    configurable: { thread_id: threadId },
-    streamMode: 'values',
-    version: 'v2' as const,
-  };
-
-  const contentParts = await run.processStream(
-    {
-      messages: [
-        new HumanMessage('What is the dynamic marker? Reply with only it.'),
-      ],
-    },
-    config
-  );
-
-  return {
-    text: collectText(contentParts),
-    usage: latestUsage(collectedUsage, runId),
+    ...(credentials != null ? { credentials } : {}),
   };
 }
 
 describeIfLive('AgentContext Bedrock prompt cache live API', () => {
   it('caches only the stable system prefix while dynamic tail changes', async () => {
     const nonce = `agent-bedrock-cache-live-${Date.now()}`;
-    const stableInstructions = buildStableInstructions(nonce);
-    const firstDynamicInstructions = buildDynamicInstructions('alpha');
-    const secondDynamicInstructions = buildDynamicInstructions('bravo');
+    const clientOptions = createClientOptions();
+    const stableInstructions = buildStableInstructions({
+      nonce,
+      providerLabel,
+    });
+    const firstDynamicInstructions = buildDynamicInstructions({
+      marker: 'alpha',
+      tailDescription:
+        'The Dynamic Marker line is runtime context and must remain after the Bedrock cache point.',
+    });
+    const secondDynamicInstructions = buildDynamicInstructions({
+      marker: 'bravo',
+      tailDescription:
+        'The Dynamic Marker line is runtime context and must remain after the Bedrock cache point.',
+    });
 
     await assertSystemPayloadShape({
+      agentId: 'live-bedrock-cache-shape-check',
+      provider: Providers.BEDROCK,
+      clientOptions,
       stableInstructions,
       dynamicInstructions: firstDynamicInstructions,
+      expectedContent: [
+        {
+          type: 'text',
+          text: stableInstructions,
+        },
+        {
+          cachePoint: { type: 'default' },
+        },
+        {
+          type: 'text',
+          text: firstDynamicInstructions,
+        },
+      ],
     });
 
     const first = await runLiveTurn({
+      provider: Providers.BEDROCK,
+      providerLabel,
+      clientOptions,
       runId: `${nonce}-first`,
       threadId: `${nonce}-thread`,
       stableInstructions,
@@ -223,7 +131,12 @@ describeIfLive('AgentContext Bedrock prompt cache live API', () => {
     expect(first.usage.input_token_details?.cache_creation).toBeGreaterThan(0);
     expect(first.usage.input_token_details?.cache_read ?? 0).toBe(0);
 
+    await waitForCachePropagation();
+
     const second = await runLiveTurn({
+      provider: Providers.BEDROCK,
+      providerLabel,
+      clientOptions,
       runId: `${nonce}-second`,
       threadId: `${nonce}-thread`,
       stableInstructions,

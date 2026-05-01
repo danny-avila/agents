@@ -502,7 +502,7 @@ export interface AgentInputs {
   summarizationEnabled?: boolean;
   summarizationConfig?: SummarizationConfig;
   /** Cross-run summary from a previous run, forwarded from formatAgentMessages.
-   *  Injected into the system message via AgentContext.buildInstructionsString(). */
+   *  Injected into the dynamic system tail via AgentContext. */
   initialSummary?: { text: string; tokenCount: number };
   contextPruningConfig?: ContextPruningConfig;
   maxToolResultChars?: number;

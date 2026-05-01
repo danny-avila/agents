@@ -6,6 +6,10 @@ import { addBedrockCacheControl } from '@/messages/cache';
 import type * as t from '@/types';
 
 describe('AgentContext', () => {
+  type TestSystemContentBlock =
+    | { type: 'text'; text: string; cache_control?: { type: 'ephemeral' } }
+    | { cachePoint: { type: 'default' } };
+
   type ContextOptions = {
     agentConfig?: Partial<t.AgentInputs>;
     tokenCounter?: t.TokenCounter;
@@ -86,7 +90,7 @@ describe('AgentContext', () => {
       });
 
       const result = await ctx.systemRunnable!.invoke([]);
-      const content = result[0].content as Array<Record<string, unknown>>;
+      const content = result[0].content as TestSystemContentBlock[];
       expect(content).toHaveLength(2);
       expect(content[0]).toMatchObject({
         type: 'text',
@@ -97,6 +101,22 @@ describe('AgentContext', () => {
         type: 'text',
         text: 'Dynamic instructions',
       });
+    });
+
+    it('omits Anthropic cache control when only dynamic system text exists', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.ANTHROPIC,
+          clientOptions: { model: 'claude-3-5-sonnet', promptCache: true },
+          instructions: undefined,
+          additional_instructions: 'Dynamic only',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([]);
+      const content = result[0].content as TestSystemContentBlock[];
+      expect(content).toEqual([{ type: 'text', text: 'Dynamic only' }]);
+      expect(content[0]).not.toHaveProperty('cache_control');
     });
 
     it('keeps cross-run summaries in the dynamic Anthropic system tail', async () => {
@@ -110,7 +130,7 @@ describe('AgentContext', () => {
       ctx.setInitialSummary('Prior summary', 13);
 
       const result = await ctx.systemRunnable!.invoke([]);
-      const content = result[0].content as Array<Record<string, unknown>>;
+      const content = result[0].content as TestSystemContentBlock[];
       expect(content).toHaveLength(2);
       expect(content[0]).toHaveProperty('cache_control');
       expect(content[1]).toEqual({
@@ -133,12 +153,29 @@ describe('AgentContext', () => {
       });
 
       const result = await ctx.systemRunnable!.invoke([]);
-      const content = result[0].content as Array<Record<string, unknown>>;
+      const content = result[0].content as TestSystemContentBlock[];
       expect(content).toEqual([
         { type: 'text', text: 'Stable instructions' },
         { cachePoint: { type: 'default' } },
         { type: 'text', text: 'Dynamic instructions' },
       ]);
+    });
+
+    it('uses plain Bedrock system text when only dynamic system text exists', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.BEDROCK,
+          clientOptions: {
+            model: 'anthropic.claude-3-5-sonnet',
+            promptCache: true,
+          },
+          instructions: undefined,
+          additional_instructions: 'Dynamic only',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([]);
+      expect(result[0].content).toBe('Dynamic only');
     });
 
     it('preserves the Bedrock system cache point through message cache-control pass', async () => {

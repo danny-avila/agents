@@ -20,6 +20,16 @@ import { addCacheControl } from '@/messages/cache';
 import { DEFAULT_RESERVE_RATIO } from '@/messages';
 import { toJsonSchema } from '@/utils/schema';
 
+type AgentSystemTextBlock = {
+  type: 'text';
+  text: string;
+  cache_control?: { type: 'ephemeral' };
+};
+
+type AgentSystemContentBlock =
+  | AgentSystemTextBlock
+  | { cachePoint: { type: 'default' } };
+
 /**
  * Encapsulates agent-specific state that can vary between agents in a multi-agent system
  */
@@ -597,14 +607,14 @@ export class AgentContext {
 
         const summaryMsg = usePromptCache
           ? new HumanMessage({
-              content: [
-                {
-                  type: 'text',
-                  text: wrappedSummary,
-                  cache_control: { type: 'ephemeral' },
-                },
-              ],
-            })
+            content: [
+              {
+                type: 'text',
+                text: wrappedSummary,
+                cache_control: { type: 'ephemeral' },
+              },
+            ],
+          })
           : new HumanMessage(wrappedSummary);
         body = [summaryMsg, ...messages];
       } else {
@@ -652,7 +662,7 @@ export class AgentContext {
     }
 
     if (usePromptCache) {
-      const content: Array<Record<string, unknown>> = [];
+      const content: AgentSystemContentBlock[] = [];
       if (stableInstructions) {
         content.push({
           type: 'text',
@@ -667,7 +677,7 @@ export class AgentContext {
     }
 
     if (this.hasBedrockPromptCache() && stableInstructions) {
-      const content: Array<Record<string, unknown>> = [
+      const content: AgentSystemContentBlock[] = [
         { type: 'text', text: stableInstructions },
         { cachePoint: { type: 'default' } },
       ];

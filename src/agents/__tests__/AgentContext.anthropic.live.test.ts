@@ -8,14 +8,16 @@
 import { config as dotenvConfig } from 'dotenv';
 dotenvConfig();
 
-import { HumanMessage } from '@langchain/core/messages';
 import { describe, expect, it } from '@jest/globals';
-import type { UsageMetadata } from '@langchain/core/messages';
 import type * as t from '@/types';
-import { ModelEndHandler } from '@/events';
-import { AgentContext } from '../AgentContext';
-import { GraphEvents, Providers } from '@/common';
-import { Run } from '@/run';
+import { Providers } from '@/common';
+import {
+  runLiveTurn,
+  assertSystemPayloadShape,
+  buildDynamicInstructions,
+  buildStableInstructions,
+  waitForCachePropagation,
+} from './promptCacheLiveHelpers';
 
 const shouldRunLive =
   process.env.RUN_ANTHROPIC_PROMPT_CACHE_LIVE_TESTS === '1' &&
@@ -26,26 +28,7 @@ const describeIfLive = shouldRunLive ? describe : describe.skip;
 
 const modelName =
   process.env.ANTHROPIC_PROMPT_CACHE_MODEL ?? 'claude-sonnet-4-5';
-
-function buildStableInstructions(nonce: string): string {
-  const records = Array.from(
-    { length: 360 },
-    (_, index) =>
-      `Stable cache record ${index}: nonce ${nonce}; keep this reference in the cacheable prefix and do not use it as the dynamic marker.`
-  );
-  return [
-    'You are a prompt-cache verification assistant.',
-    'When asked for the dynamic marker, answer with only the marker value from the Dynamic Marker line.',
-    ...records,
-  ].join('\n');
-}
-
-function buildDynamicInstructions(marker: string): string {
-  return [
-    `Dynamic Marker: ${marker}`,
-    'The Dynamic Marker line is runtime context and must remain outside the cached prefix.',
-  ].join('\n');
-}
+const providerLabel = 'Anthropic';
 
 function createClientOptions(): t.AnthropicClientOptions {
   return {
@@ -63,128 +46,48 @@ function createClientOptions(): t.AnthropicClientOptions {
   };
 }
 
-async function assertSystemPayloadShape({
-  stableInstructions,
-  dynamicInstructions,
-}: {
-  stableInstructions: string;
-  dynamicInstructions: string;
-}): Promise<void> {
-  const ctx = AgentContext.fromConfig({
-    agentId: 'live-cache-shape-check',
-    provider: Providers.ANTHROPIC,
-    clientOptions: createClientOptions(),
-    instructions: stableInstructions,
-    additional_instructions: dynamicInstructions,
-  });
-
-  const messages = await ctx.systemRunnable!.invoke([
-    new HumanMessage('What is the dynamic marker?'),
-  ]);
-
-  expect(messages[0].content).toEqual([
-    {
-      type: 'text',
-      text: stableInstructions,
-      cache_control: { type: 'ephemeral' },
-    },
-    {
-      type: 'text',
-      text: dynamicInstructions,
-    },
-  ]);
-}
-
-function latestUsage(
-  collectedUsage: UsageMetadata[],
-  label: string
-): UsageMetadata {
-  if (collectedUsage.length === 0) {
-    throw new Error(`Missing Anthropic usage metadata for ${label}`);
-  }
-  return collectedUsage[collectedUsage.length - 1];
-}
-
-function collectText(parts: t.MessageContentComplex[] | undefined): string {
-  return (parts ?? []).reduce((text, part) => {
-    if (part.type === 'text') {
-      return text + part.text;
-    }
-    return text;
-  }, '');
-}
-
-async function waitForCachePropagation(): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, 2000));
-}
-
-async function runLiveTurn({
-  runId,
-  threadId,
-  stableInstructions,
-  dynamicInstructions,
-}: {
-  runId: string;
-  threadId: string;
-  stableInstructions: string;
-  dynamicInstructions: string;
-}): Promise<{
-  text: string;
-  usage: UsageMetadata;
-}> {
-  const collectedUsage: UsageMetadata[] = [];
-  const run = await Run.create<t.IState>({
-    runId,
-    graphConfig: {
-      type: 'standard',
-      llmConfig: {
-        provider: Providers.ANTHROPIC,
-        ...createClientOptions(),
-      },
-      instructions: stableInstructions,
-      additional_instructions: dynamicInstructions,
-    },
-    returnContent: true,
-    skipCleanup: true,
-    customHandlers: {
-      [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(collectedUsage),
-    },
-  });
-
-  const config = {
-    configurable: { thread_id: threadId },
-    streamMode: 'values',
-    version: 'v2' as const,
-  };
-
-  const contentParts = await run.processStream(
-    {
-      messages: [
-        new HumanMessage('What is the dynamic marker? Reply with only it.'),
-      ],
-    },
-    config
-  );
-
-  return {
-    text: collectText(contentParts),
-    usage: latestUsage(collectedUsage, runId),
-  };
-}
-
 describeIfLive('AgentContext Anthropic prompt cache live API', () => {
   it('caches only the stable system prefix while dynamic tail changes', async () => {
     const nonce = `agent-cache-live-${Date.now()}`;
-    const stableInstructions = buildStableInstructions(nonce);
-    const firstDynamicInstructions = buildDynamicInstructions('alpha');
-    const secondDynamicInstructions = buildDynamicInstructions('bravo');
+    const clientOptions = createClientOptions();
+    const stableInstructions = buildStableInstructions({
+      nonce,
+      providerLabel,
+    });
+    const firstDynamicInstructions = buildDynamicInstructions({
+      marker: 'alpha',
+      tailDescription:
+        'The Dynamic Marker line is runtime context and must remain outside the cached prefix.',
+    });
+    const secondDynamicInstructions = buildDynamicInstructions({
+      marker: 'bravo',
+      tailDescription:
+        'The Dynamic Marker line is runtime context and must remain outside the cached prefix.',
+    });
 
     await assertSystemPayloadShape({
+      agentId: 'live-cache-shape-check',
+      provider: Providers.ANTHROPIC,
+      clientOptions,
       stableInstructions,
       dynamicInstructions: firstDynamicInstructions,
+      expectedContent: [
+        {
+          type: 'text',
+          text: stableInstructions,
+          cache_control: { type: 'ephemeral' },
+        },
+        {
+          type: 'text',
+          text: firstDynamicInstructions,
+        },
+      ],
     });
 
     const first = await runLiveTurn({
+      provider: Providers.ANTHROPIC,
+      providerLabel,
+      clientOptions,
       runId: `${nonce}-first`,
       threadId: `${nonce}-thread`,
       stableInstructions,
@@ -198,6 +101,9 @@ describeIfLive('AgentContext Anthropic prompt cache live API', () => {
     await waitForCachePropagation();
 
     const second = await runLiveTurn({
+      provider: Providers.ANTHROPIC,
+      providerLabel,
+      clientOptions,
       runId: `${nonce}-second`,
       threadId: `${nonce}-thread`,
       stableInstructions,
