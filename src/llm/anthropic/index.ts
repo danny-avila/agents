@@ -440,11 +440,17 @@ export class CustomAnthropic extends ChatAnthropicMessages {
     if (!outputUsage) {
       return;
     }
+    const cacheCreationInputTokens =
+      inputUsage?.cache_creation_input_tokens ?? 0;
+    const cacheReadInputTokens = inputUsage?.cache_read_input_tokens ?? 0;
+    const inputTokens =
+      (inputUsage?.input_tokens ?? 0) +
+      cacheCreationInputTokens +
+      cacheReadInputTokens;
     const totalUsage: UsageMetadata = {
-      input_tokens: inputUsage?.input_tokens ?? 0,
+      input_tokens: inputTokens,
       output_tokens: outputUsage.output_tokens ?? 0,
-      total_tokens:
-        (inputUsage?.input_tokens ?? 0) + (outputUsage.output_tokens ?? 0),
+      total_tokens: inputTokens + (outputUsage.output_tokens ?? 0),
     };
 
     if (
@@ -452,8 +458,8 @@ export class CustomAnthropic extends ChatAnthropicMessages {
       inputUsage?.cache_read_input_tokens != null
     ) {
       totalUsage.input_token_details = {
-        cache_creation: inputUsage.cache_creation_input_tokens ?? 0,
-        cache_read: inputUsage.cache_read_input_tokens ?? 0,
+        cache_creation: cacheCreationInputTokens,
+        cache_read: cacheReadInputTokens,
       };
     }
 

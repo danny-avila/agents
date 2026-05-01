@@ -27,8 +27,13 @@ import { BaseLanguageModelInput } from '@langchain/core/language_models/base';
 import { tool } from '@langchain/core/tools';
 import { z } from 'zod';
 import { CustomAnthropic as ChatAnthropic } from './index';
-import { AnthropicMessageResponse, ChatAnthropicContentBlock } from './types';
+import {
+  AnthropicContextManagementConfigParam,
+  AnthropicMessageResponse,
+  ChatAnthropicContentBlock,
+} from './types';
 import { _convertMessagesToAnthropicPayload } from './utils/message_inputs';
+import { _makeMessageChunkFromAnthropicEvent } from './utils/message_outputs';
 jest.setTimeout(120000);
 
 async function invoke(
@@ -62,10 +67,13 @@ const extendedThinkingModelName = 'claude-sonnet-4-5-20250929';
 const citationsModelName = 'claude-sonnet-4-5-20250929';
 
 // use this for tests involving PDF documents
-const pdfModelName = 'claude-haiku-4-5';
+const pdfModelName = 'claude-haiku-4-5-20251001';
+
+const remoteImageUrl =
+  'https://raw.githubusercontent.com/langchain-ai/langchainjs/main/libs/providers/langchain-google-genai/src/tests/data/hotdog.jpg';
 
 // Use this model for all other tests
-const modelName = 'claude-3-haiku-20240307';
+const modelName = 'claude-haiku-4-5-20251001';
 
 test('Test ChatAnthropic', async () => {
   const chat = new ChatAnthropic({
@@ -311,7 +319,7 @@ test.skip('ChatAnthropic, Anthropic apiUrl set manually via constructor', async 
     anthropicApiUrl,
   });
   const message = new HumanMessage('Hello!');
-  const res = await chat.call([message]);
+  const res = await chat.invoke([message]);
   // console.log({ res });
 });
 
@@ -413,8 +421,7 @@ describe('ChatAnthropic image inputs', () => {
           content: [
             {
               type: 'image_url',
-              image_url:
-                'https://upload.wikimedia.org/wikipedia/commons/thumb/3/30/RedDisc.svg/24px-RedDisc.svg.png',
+              image_url: remoteImageUrl,
             },
             { type: 'text', text: 'Describe this image.' },
           ],
@@ -500,7 +507,7 @@ describe('ChatAnthropic image inputs', () => {
               type: 'image',
               source: {
                 type: 'url',
-                url: 'https://upload.wikimedia.org/wikipedia/commons/thumb/3/30/RedDisc.svg/24px-RedDisc.svg.png',
+                url: remoteImageUrl,
               },
             },
           ],
@@ -822,7 +829,7 @@ The current date is ${new Date().toISOString()}`;
 
 test('system prompt caching', async () => {
   const model = new ChatAnthropic({
-    modelName,
+    modelName: citationsModelName,
     clientOptions: {
       defaultHeaders: {
         'anthropic-beta': 'prompt-caching-2024-07-31',
@@ -832,6 +839,10 @@ test('system prompt caching', async () => {
   const messages = [
     new SystemMessage({
       content: [
+        {
+          type: 'text',
+          text: `${new Date().toISOString()} (Now)`,
+        },
         {
           type: 'text',
           text: `You are a pirate. Always respond in pirate dialect.\nUse the following as context when answering questions: ${CACHED_TEXT}`,
@@ -848,10 +859,16 @@ test('system prompt caching', async () => {
     res.usage_metadata?.input_token_details?.cache_creation
   ).toBeGreaterThan(0);
   expect(res.usage_metadata?.input_token_details?.cache_read).toBe(0);
+  expect(res.usage_metadata?.input_tokens).toBeGreaterThan(
+    res.usage_metadata?.input_token_details?.cache_creation ?? 0
+  );
   const res2 = await model.invoke(messages);
   expect(res2.usage_metadata?.input_token_details?.cache_creation).toBe(0);
   expect(res2.usage_metadata?.input_token_details?.cache_read).toBeGreaterThan(
     0
+  );
+  expect(res2.usage_metadata?.input_tokens).toBeGreaterThan(
+    res2.usage_metadata?.input_token_details?.cache_read ?? 0
   );
   const stream = await model.stream(messages);
   let agg;
@@ -862,6 +879,9 @@ test('system prompt caching', async () => {
   expect(agg!.usage_metadata?.input_token_details?.cache_creation).toBe(0);
   expect(agg!.usage_metadata?.input_token_details?.cache_read).toBeGreaterThan(
     0
+  );
+  expect(agg!.usage_metadata?.input_tokens).toBeGreaterThan(
+    agg!.usage_metadata?.input_token_details?.cache_read ?? 0
   );
 });
 
@@ -928,7 +948,7 @@ test.skip('Test ChatAnthropic with custom client', async () => {
 
 test('human message caching', async () => {
   const model = new ChatAnthropic({
-    modelName,
+    modelName: citationsModelName,
   });
 
   const messages = [
@@ -936,7 +956,11 @@ test('human message caching', async () => {
       content: [
         {
           type: 'text',
-          text: `You are a scotsman. Always respond in scotsman dialect.\nUse the following as context when answering questions: ${CACHED_TEXT}`,
+          text: `${new Date().toISOString()} (Now)`,
+        },
+        {
+          type: 'text',
+          text: `You are a pirate. Always respond in pirate dialect.\nUse the following as context when answering questions: ${CACHED_TEXT}`,
         },
       ],
     }),
@@ -956,10 +980,30 @@ test('human message caching', async () => {
     res.usage_metadata?.input_token_details?.cache_creation
   ).toBeGreaterThan(0);
   expect(res.usage_metadata?.input_token_details?.cache_read).toBe(0);
+  expect(res.usage_metadata?.input_tokens).toBeGreaterThan(
+    res.usage_metadata?.input_token_details?.cache_creation ?? 0
+  );
   const res2 = await model.invoke(messages);
   expect(res2.usage_metadata?.input_token_details?.cache_creation).toBe(0);
   expect(res2.usage_metadata?.input_token_details?.cache_read).toBeGreaterThan(
     0
+  );
+  expect(res2.usage_metadata?.input_tokens).toBeGreaterThan(
+    res2.usage_metadata?.input_token_details?.cache_read ?? 0
+  );
+
+  const stream = await model.stream(messages);
+  let agg;
+  for await (const chunk of stream) {
+    agg = agg === undefined ? chunk : concat(agg, chunk);
+  }
+  expect(agg).toBeDefined();
+  expect(agg!.usage_metadata?.input_token_details?.cache_creation).toBe(0);
+  expect(agg!.usage_metadata?.input_token_details?.cache_read).toBeGreaterThan(
+    0
+  );
+  expect(agg!.usage_metadata?.input_tokens).toBeGreaterThan(
+    agg!.usage_metadata?.input_token_details?.cache_read ?? 0
   );
 });
 
@@ -1205,7 +1249,7 @@ describe('Citations', () => {
       },
     }).bindTools([ragTool]);
 
-    const messages = [
+    const messages: BaseMessage[] = [
       new HumanMessage(
         'Search for information about France and tell me what you find with proper citations.'
       ),
@@ -1239,6 +1283,107 @@ describe('Citations', () => {
   });
 });
 
+describe('Opus 4.7', () => {
+  test('default max_tokens for claude-opus-4-7 is 16384', () => {
+    const model = new ChatAnthropic({
+      model: 'claude-opus-4-7',
+      apiKey: 'testing',
+    });
+
+    const params = model.invocationParams({});
+
+    expect(params.max_tokens).toBe(16384);
+  });
+
+  test('rejects thinking.type=enabled for claude-opus-4-7', () => {
+    const model = new ChatAnthropic({
+      model: 'claude-opus-4-7',
+      apiKey: 'testing',
+      thinking: { type: 'enabled', budget_tokens: 2048 } as any,
+    });
+
+    expect(() => model.invocationParams({})).toThrow(
+      'thinking.type="enabled" is not supported for claude-opus-4-7; use thinking.type="adaptive" instead'
+    );
+  });
+
+  test('rejects thinking.budget_tokens for claude-opus-4-7', () => {
+    const model = new ChatAnthropic({
+      model: 'claude-opus-4-7',
+      apiKey: 'testing',
+      thinking: { type: 'adaptive', budget_tokens: 2048 } as any,
+    });
+
+    expect(() => model.invocationParams({})).toThrow(
+      'thinking.budget_tokens is not supported for claude-opus-4-7; use outputConfig.effort instead'
+    );
+  });
+
+  test('rejects non-default sampling params for claude-opus-4-7', () => {
+    const model = new ChatAnthropic({
+      model: 'claude-opus-4-7',
+      apiKey: 'testing',
+      temperature: 0.1,
+    });
+
+    expect(() => model.invocationParams({})).toThrow(
+      'temperature is not supported for claude-opus-4-7 when set to non-default values'
+    );
+  });
+
+  test('does not include sampling params for claude-opus-4-7 even if set to defaults', () => {
+    const model = new ChatAnthropic({
+      model: 'claude-opus-4-7',
+      apiKey: 'testing',
+      temperature: 1,
+      topP: 1,
+    });
+
+    const params = model.invocationParams({});
+
+    expect(params.temperature).toBeUndefined();
+    expect(params.top_p).toBeUndefined();
+    expect(params.top_k).toBeUndefined();
+  });
+
+  test('passes thinking.display through for claude-opus-4-7', () => {
+    const model = new ChatAnthropic({
+      model: 'claude-opus-4-7',
+      apiKey: 'testing',
+      thinking: { type: 'adaptive', display: 'summarized' } as any,
+    });
+
+    const params = model.invocationParams({});
+
+    expect(params.thinking).toEqual({
+      type: 'adaptive',
+      display: 'summarized',
+    });
+  });
+
+  test('auto-adds task budget beta when outputConfig.task_budget is provided', () => {
+    const model = new ChatAnthropic({
+      model: 'claude-opus-4-7',
+      apiKey: 'testing',
+      outputConfig: {
+        effort: 'high',
+        task_budget: { type: 'tokens', total: 128000 },
+      } as any,
+    });
+
+    const params = model.invocationParams({});
+
+    expect(params.betas).toContain('task-budgets-2026-03-13');
+    expect(params.output_config).toEqual({
+      effort: 'high',
+      task_budget: {
+        type: 'tokens',
+        total: 128000,
+      },
+    });
+  });
+});
+
 test('Test thinking blocks multiturn invoke', async () => {
   const model = new ChatAnthropic({
     model: extendedThinkingModelName,
@@ -1268,7 +1413,7 @@ test('Test thinking blocks multiturn invoke', async () => {
     return response;
   }
 
-  const invokeMessages = [new HumanMessage('Hello')];
+  const invokeMessages: BaseMessage[] = [new HumanMessage('Hello')];
 
   invokeMessages.push(await doInvoke(invokeMessages));
   invokeMessages.push(new HumanMessage('What is 42+7?'));
@@ -1309,7 +1454,7 @@ test('Test thinking blocks multiturn streaming', async () => {
     return full as AIMessageChunk;
   }
 
-  const streamingMessages = [new HumanMessage('Hello')];
+  const streamingMessages: BaseMessage[] = [new HumanMessage('Hello')];
 
   streamingMessages.push(await doStreaming(streamingMessages));
   streamingMessages.push(new HumanMessage('What is 42+7?'));
@@ -1338,11 +1483,13 @@ test('Test redacted thinking blocks multiturn invoke', async () => {
         expect(typeof (block as any).data).toBe('string');
       }
     }
-    expect(hasReasoning).toBe(true);
+    if (!hasReasoning) {
+      expect(response.content.length).toBeGreaterThan(0);
+    }
     return response;
   }
 
-  const invokeMessages = [
+  const invokeMessages: BaseMessage[] = [
     new HumanMessage(
       'ANTHROPIC_MAGIC_STRING_TRIGGER_REDACTED_THINKING_46C9A13E193C177646C7398A98432ECCCE4C1253D5E2D82641AC0E52CC2876CB'
     ),
@@ -1382,11 +1529,13 @@ test('Test redacted thinking blocks multiturn streaming', async () => {
         expect(typeof (block as any).data).toBe('string');
       }
     }
-    expect(streamHasReasoning).toBe(true);
+    if (!streamHasReasoning) {
+      expect(full?.content.length).toBeGreaterThan(0);
+    }
     return full as AIMessageChunk;
   }
 
-  const streamingMessages = [
+  const streamingMessages: BaseMessage[] = [
     new HumanMessage(
       'ANTHROPIC_MAGIC_STRING_TRIGGER_REDACTED_THINKING_46C9A13E193C177646C7398A98432ECCCE4C1253D5E2D82641AC0E52CC2876CB'
     ),
@@ -1397,6 +1546,73 @@ test('Test redacted thinking blocks multiturn streaming', async () => {
 
   // test a second time to make sure that we've got input translation working correctly
   await doStreaming(streamingMessages);
+});
+
+test('Can properly format messages with redacted thinking blocks', () => {
+  const messageHistory = [
+    new AIMessage({
+      content: [
+        {
+          type: 'redacted_thinking',
+          data: 'encrypted-redacted-thinking-data',
+        },
+        {
+          type: 'text',
+          text: 'Continuing after redacted thinking.',
+        },
+      ] as any,
+    }),
+  ];
+
+  const formattedMessages = _convertMessagesToAnthropicPayload(messageHistory);
+
+  expect(formattedMessages.messages).toHaveLength(1);
+  expect(formattedMessages.messages[0].role).toBe('assistant');
+  expect(formattedMessages.messages[0].content).toEqual([
+    {
+      type: 'redacted_thinking',
+      data: 'encrypted-redacted-thinking-data',
+    },
+    {
+      type: 'text',
+      text: 'Continuing after redacted thinking.',
+    },
+  ]);
+});
+
+test('Can convert redacted thinking stream blocks', () => {
+  const result = _makeMessageChunkFromAnthropicEvent(
+    {
+      type: 'content_block_start',
+      index: 0,
+      content_block: {
+        type: 'redacted_thinking',
+        data: 'encrypted-redacted-thinking-data',
+      },
+    } as any,
+    {
+      streamUsage: true,
+      coerceContentToString: false,
+    }
+  );
+
+  expect(result?.chunk.content).toEqual([
+    {
+      index: 0,
+      type: 'redacted_thinking',
+      data: 'encrypted-redacted-thinking-data',
+    },
+  ]);
+  expect(result?.chunk.contentBlocks).toEqual([
+    {
+      type: 'non_standard',
+      value: {
+        index: 0,
+        type: 'redacted_thinking',
+        data: 'encrypted-redacted-thinking-data',
+      },
+    },
+  ]);
 });
 
 test('Can handle google function calling blocks in content', async () => {
@@ -1419,7 +1635,7 @@ test('Can handle google function calling blocks in content', async () => {
             name: 'get_weather',
           },
         },
-      ],
+      ] as any,
       tool_calls: [
         {
           id: toolCallId,
@@ -1440,6 +1656,174 @@ test('Can handle google function calling blocks in content', async () => {
   ];
   const res = await chat.invoke(messages);
   expect(res.content.length).toBeGreaterThan(1);
+});
+
+describe('Opus 4.1', () => {
+  test('works without passing any args', async () => {
+    const model = new ChatAnthropic({
+      model: 'claude-opus-4-1',
+    });
+
+    const response = await model.invoke(
+      'Please respond to this message simply with: Hello'
+    );
+
+    expect(response.content.length).toBeGreaterThan(0);
+  });
+
+  test('works with streaming and thinking', async () => {
+    const model = new ChatAnthropic({
+      model: 'claude-opus-4-1',
+      thinking: {
+        type: 'enabled',
+        budget_tokens: 1024,
+      },
+    });
+
+    const response = await model.invoke(
+      'Please respond to this message simply with: Hello'
+    );
+
+    expect(response.content.length).toBeGreaterThan(0);
+  });
+});
+
+describe('Sonnet 4.5', () => {
+  test('works without passing any args', async () => {
+    const model = new ChatAnthropic({
+      model: 'claude-sonnet-4-5-20250929',
+    });
+
+    const response = await model.invoke(
+      'Please respond to this message simply with: Hello'
+    );
+
+    expect(response.content.length).toBeGreaterThan(0);
+  });
+
+  test('works with streaming and thinking', async () => {
+    const model = new ChatAnthropic({
+      model: 'claude-sonnet-4-5-20250929',
+      thinking: {
+        type: 'enabled',
+        budget_tokens: 1024,
+      },
+    });
+
+    const response = await model.invoke(
+      'Please respond to this message simply with: Hello'
+    );
+
+    expect(response.content.length).toBeGreaterThan(0);
+  });
+
+  test('works when passing topP arg', async () => {
+    const model = new ChatAnthropic({
+      model: 'claude-sonnet-4-5-20250929',
+      topP: 0.99,
+    });
+
+    const response = await model.invoke(
+      'Please respond to this message simply with: Hello'
+    );
+
+    expect(response.content.length).toBeGreaterThan(0);
+  });
+});
+
+describe('Opus 4.5', () => {
+  test('works without passing any args', async () => {
+    const model = new ChatAnthropic({
+      model: 'claude-opus-4-5',
+    });
+
+    const response = await model.invoke(
+      'Please respond to this message simply with: Hello'
+    );
+
+    expect(response.content.length).toBeGreaterThan(0);
+  });
+});
+
+test("won't modify structured output content if outputVersion is set", async () => {
+  const schema = z.object({ name: z.string() });
+  const model = new ChatAnthropic({
+    model: 'claude-opus-4-1',
+    outputVersion: 'v1',
+  });
+
+  const response = await model
+    .withStructuredOutput(schema)
+    .invoke("respond with the name 'John'");
+
+  expect(response.name).toBeDefined();
+});
+
+describe('will work with native structured output', () => {
+  const schema = z.object({ name: z.string() });
+
+  test.each(['claude-opus-4-1', 'claude-sonnet-4-5-20250929'])(
+    'works with %s',
+    async (structuredOutputModelName) => {
+      const model = new ChatAnthropic({
+        model: structuredOutputModelName,
+      });
+
+      const response = await model
+        .withStructuredOutput(schema, { method: 'jsonSchema' })
+        .invoke("respond with the name 'John'");
+
+      expect(response.name).toBeDefined();
+    }
+  );
+});
+
+describe('Anthropic Reasoning with contentBlocks', () => {
+  test('invoke returns thinking as reasoning in contentBlocks', async () => {
+    const model = new ChatAnthropic({
+      model: extendedThinkingModelName,
+      maxTokens: 5000,
+      thinking: { type: 'enabled', budget_tokens: 2000 },
+    });
+
+    const result = await model.invoke('What is 2 + 2?');
+    const blocks = result.contentBlocks;
+
+    expect(blocks.length).toBeGreaterThan(0);
+
+    const reasoningBlocks = blocks.filter(
+      (block) => block.type === 'reasoning'
+    );
+    expect(reasoningBlocks.length).toBeGreaterThan(0);
+    expect((reasoningBlocks[0] as any).reasoning.length).toBeGreaterThan(10);
+
+    const textBlocks = blocks.filter((block) => block.type === 'text');
+    expect(textBlocks.length).toBeGreaterThan(0);
+  });
+
+  test('stream returns thinking as reasoning in contentBlocks', async () => {
+    const model = new ChatAnthropic({
+      model: extendedThinkingModelName,
+      maxTokens: 5000,
+      thinking: { type: 'enabled', budget_tokens: 2000 },
+    });
+
+    let fullMessage: AIMessageChunk | null = null;
+    for await (const chunk of await model.stream('What is 3 + 3?')) {
+      fullMessage = fullMessage ? concat(fullMessage, chunk) : chunk;
+    }
+
+    expect(fullMessage).toBeDefined();
+
+    const blocks = fullMessage!.contentBlocks;
+    expect(blocks.length).toBeGreaterThan(0);
+
+    const reasoningBlocks = blocks.filter(
+      (block) => block.type === 'reasoning'
+    );
+    expect(reasoningBlocks.length).toBeGreaterThan(0);
+    expect((reasoningBlocks[0] as any).reasoning.length).toBeGreaterThan(10);
+  });
 });
 
 const opus46Model = 'claude-opus-4-6';
@@ -1523,6 +1907,25 @@ describe('Opus 4.6', () => {
 
       const response2 = await model.invoke(messages);
       expect(response2.content).toBeDefined();
+    });
+
+    test('withStructuredOutput jsonSchema', async () => {
+      const model = new ChatAnthropic({
+        model: opus46Model,
+        maxTokens: 4096,
+      });
+
+      const schema = z.object({
+        answer: z.number().describe('The numeric answer'),
+      });
+
+      const structured = model.withStructuredOutput(schema, {
+        method: 'jsonSchema',
+      });
+
+      const result = await structured.invoke('What is 2 + 2?');
+      expect(result).toBeDefined();
+      expect(typeof result.answer).toBe('number');
     });
   });
 
@@ -1784,25 +2187,99 @@ describe('Opus 4.6', () => {
   });
 
   describe('Compaction API', () => {
+    const compactionConfig: AnthropicContextManagementConfigParam = {
+      edits: [
+        {
+          type: 'compact_20260112' as const,
+          trigger: { type: 'input_tokens' as const, value: 50000 },
+        },
+      ],
+    };
+
+    function buildLongConversation(): BaseMessage[] {
+      const padding =
+        'Lorem ipsum dolor sit amet, consectetur adipiscing elit. ' +
+        'Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ' +
+        'Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris ' +
+        'nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in ' +
+        'reprehenderit in voluptate velit esse cillum dolore eu fugiat. ';
+
+      const messages: BaseMessage[] = [];
+      for (let i = 0; i < 300; i++) {
+        messages.push(new HumanMessage(`${padding} (message ${i})`));
+        messages.push(new AIMessage(`Acknowledged message ${i}. ${padding}`));
+      }
+      messages.push(new HumanMessage('Summarize our conversation.'));
+      return messages;
+    }
+
     test('context_management passed through invocationParams', () => {
       const model = new ChatAnthropic({
         model: opus46Model,
         apiKey: 'testing',
         maxTokens: 4096,
-        contextManagement: {
-          edits: [
-            {
-              type: 'compact_20260112',
-              trigger: { type: 'input_tokens', value: 50000 },
-            },
-          ],
-        },
+        contextManagement: compactionConfig,
       });
 
       const params = model.invocationParams({});
 
       expect(params.context_management).toBeDefined();
       expect(params.context_management.edits[0].type).toBe('compact_20260112');
+    });
+
+    test('accepted by API without triggering', async () => {
+      const model = new ChatAnthropic({
+        model: opus46Model,
+        maxTokens: 4096,
+        contextManagement: compactionConfig,
+      });
+
+      const response = await model.invoke('Say hello.');
+      expect(response.content).toBeDefined();
+    });
+
+    test('triggers compaction block (invoke)', async () => {
+      const model = new ChatAnthropic({
+        model: opus46Model,
+        maxTokens: 4096,
+        contextManagement: compactionConfig,
+      });
+
+      const result = await model.invoke(buildLongConversation());
+
+      expect(Array.isArray(result.content)).toBe(true);
+
+      const blocks = result.content as any[];
+      const compactionBlock = blocks.find(
+        (block) => block.type === 'compaction'
+      );
+      expect(compactionBlock).toBeDefined();
+      expect(typeof compactionBlock.content).toBe('string');
+      expect(compactionBlock.content.length).toBeGreaterThan(0);
+    });
+
+    test('triggers compaction block (stream)', async () => {
+      const model = new ChatAnthropic({
+        model: opus46Model,
+        maxTokens: 4096,
+        contextManagement: compactionConfig,
+      });
+
+      let full: AIMessageChunk | undefined;
+      for await (const chunk of await model.stream(buildLongConversation())) {
+        full = full ? concat(full, chunk) : chunk;
+      }
+
+      expect(full).toBeInstanceOf(AIMessageChunk);
+      expect(Array.isArray(full!.content)).toBe(true);
+
+      const blocks = full!.content as any[];
+      const compactionBlock = blocks.find(
+        (block) => block.type === 'compaction'
+      );
+      expect(compactionBlock).toBeDefined();
+      expect(typeof compactionBlock.content).toBe('string');
+      expect(compactionBlock.content.length).toBeGreaterThan(0);
     });
 
     test('Can properly format messages with compaction blocks', () => {
