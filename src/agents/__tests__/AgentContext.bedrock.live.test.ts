@@ -12,7 +12,6 @@ dotenvConfig();
 
 import { describe, expect, it } from '@jest/globals';
 import type * as t from '@/types';
-import { Providers } from '@/common';
 import {
   runLiveTurn,
   assertSystemPayloadShape,
@@ -20,6 +19,7 @@ import {
   buildStableInstructions,
   waitForCachePropagation,
 } from './promptCacheLiveHelpers';
+import { Providers } from '@/common';
 
 const accessKeyId =
   process.env.BEDROCK_AWS_ACCESS_KEY_ID ?? process.env.AWS_ACCESS_KEY_ID;

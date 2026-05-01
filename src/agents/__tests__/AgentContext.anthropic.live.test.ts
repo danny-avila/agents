@@ -10,7 +10,6 @@ dotenvConfig();
 
 import { describe, expect, it } from '@jest/globals';
 import type * as t from '@/types';
-import { Providers } from '@/common';
 import {
   runLiveTurn,
   assertSystemPayloadShape,
@@ -18,6 +17,7 @@ import {
   buildStableInstructions,
   waitForCachePropagation,
 } from './promptCacheLiveHelpers';
+import { Providers } from '@/common';
 
 const shouldRunLive =
   process.env.RUN_ANTHROPIC_PROMPT_CACHE_LIVE_TESTS === '1' &&
