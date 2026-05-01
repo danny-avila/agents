@@ -50,22 +50,22 @@ function cloneMessage<T extends MessageWithContent>(
 
     const msgType = message.getType();
     switch (msgType) {
-    case 'ai':
-      return new AIMessage({
-        ...baseParams,
-        tool_calls: (message as unknown as AIMessage).tool_calls,
-      }) as unknown as T;
-    case 'human':
-      return new HumanMessage(baseParams) as unknown as T;
-    case 'system':
-      return new SystemMessage(baseParams) as unknown as T;
-    case 'tool':
-      return new ToolMessage({
-        ...baseParams,
-        tool_call_id: (message as unknown as ToolMessage).tool_call_id,
-      }) as unknown as T;
-    default:
-      break;
+      case 'ai':
+        return new AIMessage({
+          ...baseParams,
+          tool_calls: (message as unknown as AIMessage).tool_calls,
+        }) as unknown as T;
+      case 'human':
+        return new HumanMessage(baseParams) as unknown as T;
+      case 'system':
+        return new SystemMessage(baseParams) as unknown as T;
+      case 'tool':
+        return new ToolMessage({
+          ...baseParams,
+          tool_call_id: (message as unknown as ToolMessage).tool_call_id,
+        }) as unknown as T;
+      default:
+        break;
     }
   }
 
@@ -314,6 +314,14 @@ export function addBedrockCacheControl<
       'getType' in originalMessage &&
       typeof originalMessage.getType === 'function' &&
       originalMessage.getType() === 'tool';
+    const isSystemMessage =
+      'getType' in originalMessage &&
+      typeof originalMessage.getType === 'function' &&
+      originalMessage.getType() === 'system';
+
+    if (isSystemMessage) {
+      continue;
+    }
 
     const content = originalMessage.content;
     const hasArrayContent = Array.isArray(content);

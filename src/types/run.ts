@@ -75,7 +75,9 @@ export interface AgentStateChannels {
   messages: BaseMessage[];
   next: string;
   [key: string]: unknown;
+  /** Stable/cacheable system instructions. */
   instructions?: string;
+  /** Dynamic system tail appended after stable instructions. */
   additional_instructions?: string;
 }
 
