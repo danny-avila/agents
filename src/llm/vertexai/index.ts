@@ -97,10 +97,7 @@ class CustomChatConnection extends ChatConnection<VertexAIClientOptions> {
       }
       delete formattedData.generationConfig.thinkingConfig.thinkingBudget;
     }
-    if (
-      this.thinkingConfig?.thinkingLevel != null &&
-      this.thinkingConfig.thinkingLevel !== ''
-    ) {
+    if (this.thinkingConfig?.thinkingLevel != null) {
       formattedData.generationConfig ??= {};
       // thinkingLevel and thinkingBudget cannot coexist — the API rejects the request.
       // Remove thinkingBudget when thinkingLevel is set.
@@ -422,7 +419,16 @@ export class ChatVertexAI extends ChatGoogle {
     return 'LibreChatVertexAI';
   }
 
-  constructor(fields?: VertexAIClientOptions) {
+  constructor(model: string, fields?: Omit<VertexAIClientOptions, 'model'>);
+  constructor(fields?: VertexAIClientOptions);
+  constructor(
+    modelOrFields?: string | VertexAIClientOptions,
+    params?: Omit<VertexAIClientOptions, 'model'>
+  ) {
+    const fields =
+      typeof modelOrFields === 'string'
+        ? { ...(params ?? {}), model: modelOrFields }
+        : modelOrFields;
     const dynamicThinkingBudget = fields?.thinkingBudget === -1;
     super({
       ...fields,

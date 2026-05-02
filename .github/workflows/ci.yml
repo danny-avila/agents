@@ -3,6 +3,7 @@ name: CI
 on:
   pull_request:
     branches:
+      - dev
       - main
 
 concurrency:
@@ -116,13 +117,31 @@ jobs:
           fi
 
       - name: Run Google LLM tests (flaky - timeouts allowed)
+        id: google_llm_tests
         if: steps.google_changes.outputs.changed == 'true'
         continue-on-error: true
-        run: npx jest src/llm/google/llm.spec.ts
+        run: npx jest src/llm/google/llm.spec.ts --runInBand
         env:
           NODE_OPTIONS: '--experimental-vm-modules'
           NODE_ENV: test
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          GOOGLE_TEST_CALL_GAP_MS: '1000'
+          GOOGLE_TEST_MAX_RETRIES: '2'
+          GOOGLE_TEST_MAX_RETRY_DELAY_MS: '50000'
+
+      - name: Surface Google LLM soft failure
+        if: always() && steps.google_changes.outputs.changed == 'true' && steps.google_llm_tests.outcome == 'failure'
+        run: |
+          echo "::warning title=Soft-failed Google LLM tests::The Google LLM integration suite failed, but this workflow allows provider API failures. Inspect the test job logs before merging."
+          {
+            echo "### Soft-failed Google LLM tests"
+            echo ""
+            echo "The Google LLM integration suite failed, but this job intentionally allows provider API failures."
+            echo ""
+            echo "- Suite: \`npx jest src/llm/google/llm.spec.ts --runInBand\`"
+            echo "- Active Gemini quotas: https://ai.dev/rate-limit"
+            echo "- Logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Check for Anthropic LLM changes
         id: anthropic_changes
@@ -134,6 +153,7 @@ jobs:
           fi
 
       - name: Run Anthropic LLM tests (flaky - timeouts allowed)
+        id: anthropic_llm_tests
         if: steps.anthropic_changes.outputs.changed == 'true'
         continue-on-error: true
         run: npx jest src/llm/anthropic/llm.spec.ts
@@ -141,6 +161,19 @@ jobs:
           NODE_OPTIONS: '--experimental-vm-modules'
           NODE_ENV: test
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      - name: Surface Anthropic LLM soft failure
+        if: always() && steps.anthropic_changes.outputs.changed == 'true' && steps.anthropic_llm_tests.outcome == 'failure'
+        run: |
+          echo "::warning title=Soft-failed Anthropic LLM tests::The Anthropic LLM integration suite failed, but this workflow allows provider API failures. Inspect the test job logs before merging."
+          {
+            echo "### Soft-failed Anthropic LLM tests"
+            echo ""
+            echo "The Anthropic LLM integration suite failed, but this job intentionally allows provider API failures."
+            echo ""
+            echo "- Suite: \`npx jest src/llm/anthropic/llm.spec.ts\`"
+            echo "- Logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Check for PTC changes
         id: ptc_changes

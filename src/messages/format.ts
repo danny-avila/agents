@@ -22,6 +22,7 @@ import type {
 import type { RunnableConfig } from '@langchain/core/runnables';
 import { emitAgentLog } from '@/utils/events';
 import { Providers, ContentTypes, Constants } from '@/common';
+import { toLangChainContent, toLangChainMessageFields } from './langchain';
 
 interface MediaMessageParams {
   message: {
@@ -210,7 +211,7 @@ export const formatMessage = ({
       return mediaMessage;
     }
 
-    return new HumanMessage(mediaMessage);
+    return new HumanMessage(toLangChainMessageFields(mediaMessage));
   }
 
   if (!langChain) {
@@ -218,11 +219,11 @@ export const formatMessage = ({
   }
 
   if (role === 'user') {
-    return new HumanMessage(formattedMessage);
+    return new HumanMessage(toLangChainMessageFields(formattedMessage));
   } else if (role === 'assistant') {
-    return new AIMessage(formattedMessage);
+    return new AIMessage(toLangChainMessageFields(formattedMessage));
   } else {
-    return new SystemMessage(formattedMessage);
+    return new SystemMessage(toLangChainMessageFields(formattedMessage));
   }
 };
 
@@ -413,7 +414,9 @@ function formatAssistantMessage(
       formattedMessages.push(new AIMessage({ content }));
     }
   } else if (currentContent.length > 0) {
-    formattedMessages.push(new AIMessage({ content: currentContent }));
+    formattedMessages.push(
+      new AIMessage({ content: toLangChainContent(currentContent) })
+    );
   }
 
   return formattedMessages;
@@ -1542,7 +1545,7 @@ export function ensureThinkingBlockInMessages(
         'ensureThinkingBlockInMessages: injecting [Previous agent context] HumanMessage' +
           ` (${parts.length} msgs at index ${i}, no thinking block in chain)`
       );
-      result.push(new HumanMessage({ content: parts }));
+      result.push(new HumanMessage({ content: toLangChainContent(parts) }));
       i = j;
     } else {
       // Keep the message as is

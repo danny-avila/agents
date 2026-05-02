@@ -56,9 +56,7 @@ export const llmConfigs: Record<string, t.LLMConfig | undefined> = {
     provider: Providers.OPENROUTER,
     streaming: true,
     streamUsage: true,
-    // model: 'anthropic/claude-sonnet-4',
-    // model: 'moonshotai/kimi-k2-thinking',
-    model: 'google/gemini-3-pro-preview',
+    model: process.env.OPENROUTER_MODEL ?? 'openai/gpt-4o-mini',
     apiKey: process.env.OPENROUTER_API_KEY,
     configuration: {
       baseURL: process.env.OPENROUTER_BASE_URL,
@@ -66,9 +64,6 @@ export const llmConfigs: Record<string, t.LLMConfig | undefined> = {
         'HTTP-Referer': 'https://librechat.ai',
         'X-Title': 'LibreChat',
       },
-    },
-    reasoning: {
-      max_tokens: 8000,
     },
     modelKwargs: {
       max_tokens: 10000,

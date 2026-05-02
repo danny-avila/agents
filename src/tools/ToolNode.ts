@@ -33,6 +33,7 @@ import {
 } from '@/utils/truncation';
 import { safeDispatchCustomEvent } from '@/utils/events';
 import { executeHooks } from '@/hooks';
+import { toLangChainContent } from '@/messages/langchain';
 import { Constants, GraphEvents, CODE_EXECUTION_TOOLS } from '@/common';
 import {
   buildReferenceKey,
@@ -1282,7 +1283,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       if (msg.skillName != null) additional_kwargs.skillName = msg.skillName;
 
       converted.push(
-        new HumanMessage({ content: msg.content, additional_kwargs })
+        new HumanMessage({
+          content: toLangChainContent(msg.content),
+          additional_kwargs,
+        })
       );
     }
     return converted;

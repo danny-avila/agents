@@ -1,6 +1,6 @@
 import { config } from 'dotenv';
 config();
-import { test, describe, jest } from '@jest/globals';
+import { expect, test, describe, jest } from '@jest/globals';
 
 jest.setTimeout(90000);
 import {
@@ -24,6 +24,33 @@ const weatherTool = tool(async () => 'The weather is 80 degrees and sunny', {
   schema: z.object({
     location: z.string().describe('The city to get the weather for'),
   }),
+});
+
+describe('ChatVertexAI upstream compatibility', () => {
+  test('serialization uses the LibreChat constructor name on the Vertex namespace', () => {
+    const model = new ChatVertexAI();
+    expect(JSON.stringify(model)).toEqual(
+      '{"lc":1,"type":"constructor","id":["langchain","chat_models","vertexai","LibreChatVertexAI"],"kwargs":{"platform_type":"gcp"}}'
+    );
+  });
+
+  test('labels parameter support', () => {
+    expect(() => {
+      const model = new ChatVertexAI({
+        labels: {
+          team: 'test',
+          environment: 'development',
+        },
+      });
+      expect(model.platform).toEqual('gcp');
+    }).not.toThrow();
+  });
+
+  test('constructor overload supports model string', () => {
+    const model = new ChatVertexAI('gemini-1.5-pro');
+    expect(model.model).toEqual('gemini-1.5-pro');
+    expect(model.platform).toEqual('gcp');
+  });
 });
 
 describe.each(gemini3Models)(

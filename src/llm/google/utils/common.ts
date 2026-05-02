@@ -40,6 +40,7 @@ import {
   schemaToGenerativeAIParameters,
 } from './zod_to_genai_parameters';
 import { GoogleGenerativeAIToolType } from '../types';
+import { toLangChainContent } from '@/messages/langchain';
 
 export const _FUNCTION_CALL_THOUGHT_SIGNATURES_MAP_KEY =
   '__gemini_function_call_thought_signatures__';
@@ -575,30 +576,32 @@ export function convertResponseContentToChatGenerationChunk(
     }
     content = textParts.join('');
   } else if (candidateContent && Array.isArray(candidateContent.parts)) {
-    content = candidateContent.parts
-      .map((p) => {
-        if ('text' in p && 'thought' in p && p.thought === true) {
-          reasoningParts.push(p.text ?? '');
-          return undefined;
-        } else if ('text' in p) {
-          return {
-            type: 'text',
-            text: p.text,
-          };
-        } else if ('executableCode' in p) {
-          return {
-            type: 'executableCode',
-            executableCode: p.executableCode,
-          };
-        } else if ('codeExecutionResult' in p) {
-          return {
-            type: 'codeExecutionResult',
-            codeExecutionResult: p.codeExecutionResult,
-          };
-        }
-        return p;
-      })
-      .filter((p) => p !== undefined);
+    content = toLangChainContent(
+      candidateContent.parts
+        .map((p) => {
+          if ('text' in p && 'thought' in p && p.thought === true) {
+            reasoningParts.push(p.text ?? '');
+            return undefined;
+          } else if ('text' in p) {
+            return {
+              type: 'text',
+              text: p.text,
+            };
+          } else if ('executableCode' in p) {
+            return {
+              type: 'executableCode',
+              executableCode: p.executableCode,
+            };
+          } else if ('codeExecutionResult' in p) {
+            return {
+              type: 'codeExecutionResult',
+              codeExecutionResult: p.codeExecutionResult,
+            };
+          }
+          return p;
+        })
+        .filter((p) => p !== undefined)
+    );
   } else {
     // no content returned - likely due to abnormal stop reason, e.g. malformed function call
     content = [];
@@ -733,30 +736,32 @@ export function mapGenerateContentResultToChatResult(
     Array.isArray(candidateContent?.parts) &&
     candidateContent.parts.length > 0
   ) {
-    content = candidateContent.parts
-      .map((p) => {
-        if ('text' in p && 'thought' in p && p.thought === true) {
-          reasoningParts.push(p.text ?? '');
-          return undefined;
-        } else if ('text' in p) {
-          return {
-            type: 'text',
-            text: p.text,
-          };
-        } else if ('executableCode' in p) {
-          return {
-            type: 'executableCode',
-            executableCode: p.executableCode,
-          };
-        } else if ('codeExecutionResult' in p) {
-          return {
-            type: 'codeExecutionResult',
-            codeExecutionResult: p.codeExecutionResult,
-          };
-        }
-        return p;
-      })
-      .filter((p) => p !== undefined);
+    content = toLangChainContent(
+      candidateContent.parts
+        .map((p) => {
+          if ('text' in p && 'thought' in p && p.thought === true) {
+            reasoningParts.push(p.text ?? '');
+            return undefined;
+          } else if ('text' in p) {
+            return {
+              type: 'text',
+              text: p.text,
+            };
+          } else if ('executableCode' in p) {
+            return {
+              type: 'executableCode',
+              executableCode: p.executableCode,
+            };
+          } else if ('codeExecutionResult' in p) {
+            return {
+              type: 'codeExecutionResult',
+              codeExecutionResult: p.codeExecutionResult,
+            };
+          }
+          return p;
+        })
+        .filter((p) => p !== undefined)
+    );
   } else {
     content = [];
   }

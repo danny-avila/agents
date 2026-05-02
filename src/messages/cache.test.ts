@@ -4,8 +4,8 @@ import {
   HumanMessage,
   SystemMessage,
   ToolMessage,
-  MessageContentComplex,
 } from '@langchain/core/messages';
+import type { MessageContentComplex } from '@langchain/core/messages';
 import type Anthropic from '@anthropic-ai/sdk';
 import type { AnthropicMessages } from '@/types/messages';
 import {
@@ -14,6 +14,7 @@ import {
   addBedrockCacheControl,
   addCacheControl,
 } from './cache';
+import { toLangChainContent } from './langchain';
 import { ContentTypes } from '@/common/enum';
 
 describe('addCacheControl', () => {
@@ -412,7 +413,7 @@ describe('addBedrockCacheControl (Bedrock cache checkpoints)', () => {
       { type: ContentTypes.TEXT, text: 'Dynamic system text' },
     ] as MessageContentComplex[];
     const messages: BaseMessage[] = [
-      new SystemMessage({ content: systemContent }),
+      new SystemMessage({ content: toLangChainContent(systemContent) }),
       new HumanMessage('Hello'),
       new AIMessage('Hi'),
     ];
@@ -456,7 +457,7 @@ describe('addBedrockCacheControl (Bedrock cache checkpoints)', () => {
       } as MessageContentComplex,
     ] as MessageContentComplex[];
     const messages: BaseMessage[] = [
-      new SystemMessage({ content: systemContent }),
+      new SystemMessage({ content: toLangChainContent(systemContent) }),
       new HumanMessage('Hello'),
       new AIMessage('Hi'),
     ];

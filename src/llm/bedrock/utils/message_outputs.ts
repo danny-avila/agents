@@ -17,6 +17,7 @@ import type {
   MessageContentReasoningBlockReasoningTextPartial,
   MessageContentReasoningBlockRedacted,
 } from '../types';
+import { toLangChainContent } from '@/messages/langchain';
 
 /**
  * Convert a Bedrock reasoning block delta to a LangChain partial reasoning block.
@@ -251,7 +252,7 @@ export function handleConverseStreamContentBlockDelta(
     return new ChatGenerationChunk({
       text: '',
       message: new AIMessageChunk({
-        content: [reasoningBlock],
+        content: toLangChainContent([reasoningBlock]),
         additional_kwargs: {
           // Set reasoning_content for stream handler to detect reasoning mode
           reasoning_content: reasoningText,

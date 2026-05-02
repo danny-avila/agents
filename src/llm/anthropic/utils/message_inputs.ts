@@ -10,10 +10,8 @@ import {
   type AIMessage,
   type ToolMessage,
   isAIMessage,
+  type Data,
   type StandardContentBlockConverter,
-  type StandardTextBlock,
-  type StandardImageBlock,
-  type StandardFileBlock,
   MessageContentComplex,
   isDataContentBlock,
   convertToProviderContentBlock,
@@ -35,6 +33,19 @@ import {
   AnthropicToolResponse,
 } from '../types';
 import { Constants } from '@/common';
+
+type StandardTextBlock = Data.StandardTextBlock;
+type StandardImageBlock = Data.StandardImageBlock;
+type StandardFileBlock = Data.StandardFileBlock;
+type ImageUrlContentBlock = MessageContentComplex & {
+  image_url: string | { url: string };
+};
+type GoogleFunctionCallBlock = MessageContentComplex & {
+  functionCall: {
+    name: string;
+    args: Record<string, unknown>;
+  };
+};
 
 function _formatImage(imageUrl: string) {
   const parsed = parseBase64DataUrl({ dataUrl: imageUrl });
@@ -83,7 +94,7 @@ function _ensureMessageContents(
   messages: BaseMessage[]
 ): (SystemMessage | HumanMessage | AIMessage)[] {
   // Merge runs of human/tool messages into single human messages with content blocks.
-  const updatedMsgs = [];
+  const updatedMsgs: BaseMessage[] = [];
   for (const message of messages) {
     if (message._getType() === 'tool') {
       if (typeof message.content === 'string') {
@@ -134,7 +145,7 @@ function _ensureMessageContents(
       updatedMsgs.push(message);
     }
   }
-  return updatedMsgs;
+  return updatedMsgs as (SystemMessage | HumanMessage | AIMessage)[];
 }
 
 export function _convertLangChainToolCallToAnthropic(
@@ -364,7 +375,8 @@ function _formatContent(message: BaseMessage) {
   if (typeof content === 'string') {
     return content;
   } else {
-    const contentBlocks = content.map((contentPart) => {
+    const contentParts = content as MessageContentComplex[];
+    const contentBlocks = contentParts.map((contentPart) => {
       /**
        * Normalize server_tool_use blocks into a clean shape the API accepts.
        * These blocks may arrive with the correct type (server_tool_use) or mislabeled
@@ -465,10 +477,11 @@ function _formatContent(message: BaseMessage) {
 
       if (contentPart.type === 'image_url') {
         let source;
-        if (typeof contentPart.image_url === 'string') {
-          source = _formatImage(contentPart.image_url);
+        const imageUrl = (contentPart as ImageUrlContentBlock).image_url;
+        if (typeof imageUrl === 'string') {
+          source = _formatImage(imageUrl);
         } else {
-          source = _formatImage(contentPart.image_url.url);
+          source = _formatImage(imageUrl.url);
         }
         return {
           type: 'image' as const, // Explicitly setting the type as "image"
@@ -484,38 +497,42 @@ function _formatContent(message: BaseMessage) {
           ...(cacheControl ? { cache_control: cacheControl } : {}),
         };
       } else if (contentPart.type === 'thinking') {
+        const thinkingPart = contentPart as AnthropicThinkingBlockParam;
         const block: AnthropicThinkingBlockParam = {
           type: 'thinking' as const, // Explicitly setting the type as "thinking"
-          thinking: contentPart.thinking,
-          signature: contentPart.signature,
+          thinking: thinkingPart.thinking,
+          signature: thinkingPart.signature,
           ...(cacheControl ? { cache_control: cacheControl } : {}),
         };
         return block;
       } else if (contentPart.type === 'redacted_thinking') {
+        const redactedPart = contentPart as AnthropicRedactedThinkingBlockParam;
         const block: AnthropicRedactedThinkingBlockParam = {
           type: 'redacted_thinking' as const, // Explicitly setting the type as "redacted_thinking"
-          data: contentPart.data,
+          data: redactedPart.data,
           ...(cacheControl ? { cache_control: cacheControl } : {}),
         };
         return block;
       } else if (contentPart.type === 'search_result') {
+        const searchResultPart = contentPart as AnthropicSearchResultBlockParam;
         const block: AnthropicSearchResultBlockParam = {
           type: 'search_result' as const,
-          title: contentPart.title,
-          source: contentPart.source,
+          title: searchResultPart.title,
+          source: searchResultPart.source,
           ...('cache_control' in contentPart && contentPart.cache_control
             ? { cache_control: contentPart.cache_control }
             : {}),
           ...('citations' in contentPart && contentPart.citations
             ? { citations: contentPart.citations }
             : {}),
-          content: contentPart.content,
+          content: searchResultPart.content,
         };
         return block;
       } else if (contentPart.type === 'compaction') {
+        const compactionPart = contentPart as AnthropicCompactionBlockParam;
         const block: AnthropicCompactionBlockParam = {
           type: 'compaction' as const,
-          content: contentPart.content,
+          content: compactionPart.content,
           ...(cacheControl ? { cache_control: cacheControl } : {}),
         };
         return block;
@@ -585,12 +602,13 @@ function _formatContent(message: BaseMessage) {
         typeof contentPart.functionCall === 'object' &&
         isAIMessage(message)
       ) {
+        const functionCallPart = contentPart as GoogleFunctionCallBlock;
         const correspondingToolCall = message.tool_calls?.find(
-          (toolCall) => toolCall.name === contentPart.functionCall.name
+          (toolCall) => toolCall.name === functionCallPart.functionCall.name
         );
         if (!correspondingToolCall) {
           throw new Error(
-            `Could not find tool call for function call ${contentPart.functionCall.name}`
+            `Could not find tool call for function call ${functionCallPart.functionCall.name}`
           );
         }
         // Google GenAI models include a `functionCall` object inside content. We should ignore it as Anthropic will not support it.
@@ -598,7 +616,7 @@ function _formatContent(message: BaseMessage) {
           id: correspondingToolCall.id,
           type: 'tool_use',
           name: correspondingToolCall.name,
-          input: contentPart.functionCall.args,
+          input: functionCallPart.functionCall.args,
         };
       } else {
         console.error(

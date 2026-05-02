@@ -7,13 +7,13 @@ on:
   workflow_dispatch:
 
 permissions:
-  id-token: write  # Required for OIDC trusted publishing
+  id-token: write # Required for OIDC trusted publishing
   contents: read
 
 jobs:
   publish:
     runs-on: ubuntu-latest
-    environment: publish  # Must match npm trusted publisher config
+    environment: publish # Must match npm trusted publisher config
     steps:
       - uses: actions/checkout@v4
 
@@ -24,7 +24,7 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
 
       - name: Update npm for OIDC support
-        run: npm install -g npm@latest  # Must be 11.5.1+ for provenance
+        run: npm install -g npm@latest # Must be 11.5.1+ for provenance
 
       - name: Install dependencies
         run: npm ci
@@ -56,7 +56,7 @@ jobs:
           AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
           BEDROCK_AWS_ACCESS_KEY_ID: ${{ secrets.BEDROCK_AWS_ACCESS_KEY_ID }}
           BEDROCK_AWS_SECRET_ACCESS_KEY: ${{ secrets.BEDROCK_AWS_SECRET_ACCESS_KEY }}
-          
+
       - name: Check for Google LLM changes
         id: google_changes
         run: |
@@ -75,6 +75,7 @@ jobs:
           fi
 
       - name: Run Google LLM tests (flaky - timeouts allowed)
+        id: google_llm_tests
         if: steps.google_changes.outputs.changed == 'true'
         continue-on-error: true
         timeout-minutes: 5
@@ -82,6 +83,19 @@ jobs:
         env:
           NODE_ENV: test
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+
+      - name: Surface Google LLM soft failure
+        if: always() && steps.google_changes.outputs.changed == 'true' && steps.google_llm_tests.outcome == 'failure'
+        run: |
+          echo "::warning title=Soft-failed Google LLM tests::The Google LLM integration suite failed, but this workflow allows provider API failures. Inspect the publish job logs before releasing."
+          {
+            echo "### Soft-failed Google LLM tests"
+            echo ""
+            echo "The Google LLM integration suite failed, but this job intentionally allows provider API failures."
+            echo ""
+            echo "- Suite: \`npx jest src/llm/google/llm.spec.ts\`"
+            echo "- Logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Check for Anthropic LLM changes
         id: anthropic_changes
@@ -100,6 +114,7 @@ jobs:
           fi
 
       - name: Run Anthropic LLM tests (flaky - timeouts allowed)
+        id: anthropic_llm_tests
         if: steps.anthropic_changes.outputs.changed == 'true'
         continue-on-error: true
         timeout-minutes: 5
@@ -107,6 +122,19 @@ jobs:
         env:
           NODE_ENV: test
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      - name: Surface Anthropic LLM soft failure
+        if: always() && steps.anthropic_changes.outputs.changed == 'true' && steps.anthropic_llm_tests.outcome == 'failure'
+        run: |
+          echo "::warning title=Soft-failed Anthropic LLM tests::The Anthropic LLM integration suite failed, but this workflow allows provider API failures. Inspect the publish job logs before releasing."
+          {
+            echo "### Soft-failed Anthropic LLM tests"
+            echo ""
+            echo "The Anthropic LLM integration suite failed, but this job intentionally allows provider API failures."
+            echo ""
+            echo "- Suite: \`npx jest src/llm/anthropic/llm.spec.ts\`"
+            echo "- Logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Check for PTC changes
         id: ptc_changes

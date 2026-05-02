@@ -1,33 +1,12 @@
 import { ChatOpenAI } from '@/llm/openai';
-import { ChatGenerationChunk } from '@langchain/core/outputs';
-import { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
-import { AIMessageChunk as AIMessageChunkClass } from '@langchain/core/messages';
-import type {
-  FunctionMessageChunk,
-  SystemMessageChunk,
-  HumanMessageChunk,
-  ToolMessageChunk,
-  ChatMessageChunk,
-  AIMessageChunk,
-  BaseMessage,
-} from '@langchain/core/messages';
+import type { BaseMessage } from '@langchain/core/messages';
+import type { ChatGenerationChunk } from '@langchain/core/outputs';
+import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type {
   ChatOpenAICallOptions,
   OpenAIChatInput,
   OpenAIClient,
 } from '@langchain/openai';
-import { _convertMessagesToOpenAIParams } from '@/llm/openai/utils';
-
-type OpenAICompletionParam =
-  OpenAIClient.Chat.Completions.ChatCompletionMessageParam;
-
-type OpenAIRoleEnum =
-  | 'system'
-  | 'developer'
-  | 'assistant'
-  | 'user'
-  | 'function'
-  | 'tool';
 
 export type OpenRouterReasoningEffort =
   | 'xhigh'
@@ -52,6 +31,10 @@ export interface ChatOpenRouterCallOptions
   modelKwargs?: OpenAIChatInput['modelKwargs'];
 }
 
+export type ChatOpenRouterInput = Partial<
+  ChatOpenRouterCallOptions & OpenAIChatInput
+>;
+
 /** invocationParams return type extended with OpenRouter reasoning */
 export type OpenRouterInvocationParams = Omit<
   OpenAIClient.Chat.ChatCompletionCreateParams,
@@ -59,12 +42,68 @@ export type OpenRouterInvocationParams = Omit<
 > & {
   reasoning?: OpenRouterReasoning;
 };
+
+type InvocationParamsExtra = {
+  streaming?: boolean;
+};
+
+interface OpenRouterReasoningTextDetail {
+  type: 'reasoning.text';
+  text?: string;
+  format?: string;
+  index?: number;
+}
+
+interface OpenRouterReasoningEncryptedDetail {
+  type: 'reasoning.encrypted';
+  id?: string;
+  data?: string;
+  format?: string;
+  index?: number;
+}
+
+type OpenRouterReasoningDetail =
+  | OpenRouterReasoningTextDetail
+  | OpenRouterReasoningEncryptedDetail;
+
+function isReasoningTextDetail(
+  value: unknown
+): value is OpenRouterReasoningTextDetail {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'type' in value &&
+    value.type === 'reasoning.text'
+  );
+}
+
+function isReasoningEncryptedDetail(
+  value: unknown
+): value is OpenRouterReasoningEncryptedDetail {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'type' in value &&
+    value.type === 'reasoning.encrypted'
+  );
+}
+
+function getReasoningDetails(value: unknown): OpenRouterReasoningDetail[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.filter(
+    (detail): detail is OpenRouterReasoningDetail =>
+      isReasoningTextDetail(detail) || isReasoningEncryptedDetail(detail)
+  );
+}
+
 export class ChatOpenRouter extends ChatOpenAI {
   private openRouterReasoning?: OpenRouterReasoning;
   /** @deprecated Use `reasoning` object instead */
   private includeReasoning?: boolean;
 
-  constructor(_fields: Partial<ChatOpenRouterCallOptions>) {
+  constructor(_fields: ChatOpenRouterInput) {
     const {
       include_reasoning,
       reasoning: openRouterReasoning,
@@ -80,6 +119,8 @@ export class ChatOpenRouter extends ChatOpenAI {
     super({
       ...fields,
       modelKwargs: restModelKwargs,
+      includeReasoningDetails: true,
+      convertReasoningDetailsToContent: true,
     });
 
     // Merge reasoning config: modelKwargs.reasoning < constructor reasoning
@@ -101,21 +142,26 @@ export class ChatOpenRouter extends ChatOpenAI {
   // The parent's generic conditional return type cannot be widened in an override.
   override invocationParams(
     options?: this['ParsedCallOptions'],
-    extra?: { streaming?: boolean }
+    extra?: InvocationParamsExtra
   ): OpenRouterInvocationParams {
     type MutableParams = Omit<
       OpenAIClient.Chat.ChatCompletionCreateParams,
       'messages'
     > & { reasoning_effort?: string; reasoning?: OpenRouterReasoning };
 
-    const params = super.invocationParams(options, extra) as MutableParams;
+    const optionsWithDefaults = this._combineCallOptions(options);
+    const params = (
+      this._useResponsesApi(options)
+        ? this.responses.invocationParams(optionsWithDefaults)
+        : this.completions.invocationParams(optionsWithDefaults, extra)
+    ) as MutableParams;
 
     // Remove the OpenAI-native reasoning_effort that the parent sets;
     // OpenRouter uses a `reasoning` object instead
     delete params.reasoning_effort;
 
     // Build the OpenRouter reasoning config
-    const reasoning = this.buildOpenRouterReasoning(options);
+    const reasoning = this.buildOpenRouterReasoning(optionsWithDefaults);
     if (reasoning != null) {
       params.reasoning = reasoning;
     } else {
@@ -158,245 +204,76 @@ export class ChatOpenRouter extends ChatOpenAI {
 
     return reasoning;
   }
-  protected override _convertOpenAIDeltaToBaseMessageChunk(
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    delta: Record<string, any>,
-    rawResponse: OpenAIClient.ChatCompletionChunk,
-    defaultRole?:
-      | 'function'
-      | 'user'
-      | 'system'
-      | 'developer'
-      | 'assistant'
-      | 'tool'
-  ):
-    | AIMessageChunk
-    | HumanMessageChunk
-    | SystemMessageChunk
-    | FunctionMessageChunk
-    | ToolMessageChunk
-    | ChatMessageChunk {
-    const messageChunk = super._convertOpenAIDeltaToBaseMessageChunk(
-      delta,
-      rawResponse,
-      defaultRole
-    );
-    if (delta.reasoning != null) {
-      messageChunk.additional_kwargs.reasoning = delta.reasoning;
-    }
-    if (delta.reasoning_details != null) {
-      messageChunk.additional_kwargs.reasoning_details =
-        delta.reasoning_details;
-    }
-    return messageChunk;
-  }
 
-  async *_streamResponseChunks2(
+  override async *_streamResponseChunks(
     messages: BaseMessage[],
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
-    const messagesMapped: OpenAICompletionParam[] =
-      _convertMessagesToOpenAIParams(messages, this.model, {
-        includeReasoningDetails: true,
-        convertReasoningDetailsToContent: true,
-      });
+    const reasoningTextByIndex = new Map<
+      number,
+      OpenRouterReasoningTextDetail
+    >();
+    const reasoningEncryptedById = new Map<
+      string,
+      OpenRouterReasoningEncryptedDetail
+    >();
 
-    const params = {
-      ...this.invocationParams(options, {
-        streaming: true,
-      }),
-      messages: messagesMapped,
-      stream: true as const,
-    };
-    let defaultRole: OpenAIRoleEnum | undefined;
+    for await (const generationChunk of super._streamResponseChunks(
+      messages,
+      options,
+      runManager
+    )) {
+      let currentReasoningText = '';
+      const reasoningDetails = getReasoningDetails(
+        generationChunk.message.additional_kwargs.reasoning_details
+      );
 
-    const streamIterable = await this.completionWithRetry(params, options);
-    let usage: OpenAIClient.Completions.CompletionUsage | undefined;
-
-    // Store reasoning_details keyed by unique identifier to prevent incorrect merging
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const reasoningTextByIndex: Map<number, Record<string, any>> = new Map();
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const reasoningEncryptedById: Map<string, Record<string, any>> = new Map();
-
-    for await (const data of streamIterable) {
-      const choice = data.choices[0] as
-        | Partial<OpenAIClient.Chat.Completions.ChatCompletionChunk.Choice>
-        | undefined;
-      if (data.usage) {
-        usage = data.usage;
-      }
-      if (!choice) {
-        continue;
-      }
-
-      const { delta } = choice;
-      if (!delta) {
-        continue;
-      }
-
-      // Accumulate reasoning_details from each delta
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const deltaAny = delta as Record<string, any>;
-      // Extract current chunk's reasoning text for streaming (before accumulation)
-      let currentChunkReasoningText = '';
-      if (
-        deltaAny.reasoning_details != null &&
-        Array.isArray(deltaAny.reasoning_details)
-      ) {
-        for (const detail of deltaAny.reasoning_details) {
-          // For encrypted reasoning (thought signatures), store by ID - MUST be separate
-          if (detail.type === 'reasoning.encrypted' && detail.id) {
-            reasoningEncryptedById.set(detail.id, {
-              type: detail.type,
-              id: detail.id,
-              data: detail.data,
-              format: detail.format,
-              index: detail.index,
-            });
-          } else if (detail.type === 'reasoning.text') {
-            // Extract current chunk's text for streaming
-            currentChunkReasoningText += detail.text || '';
-            // For text reasoning, accumulate text by index for final message
-            const idx = detail.index ?? 0;
-            const existing = reasoningTextByIndex.get(idx);
-            if (existing) {
-              // Only append text, keep other fields from first entry
-              existing.text = (existing.text || '') + (detail.text || '');
-            } else {
-              reasoningTextByIndex.set(idx, {
-                type: detail.type,
-                text: detail.text || '',
-                format: detail.format,
-                index: idx,
-              });
-            }
+      for (const detail of reasoningDetails) {
+        if (detail.type === 'reasoning.text') {
+          currentReasoningText += detail.text ?? '';
+          const index = detail.index ?? 0;
+          const existing = reasoningTextByIndex.get(index);
+          if (existing != null) {
+            existing.text = `${existing.text ?? ''}${detail.text ?? ''}`;
+            continue;
           }
+          reasoningTextByIndex.set(index, {
+            ...detail,
+            text: detail.text ?? '',
+          });
+          continue;
+        }
+        if (detail.id != null) {
+          reasoningEncryptedById.set(detail.id, { ...detail });
         }
       }
 
-      const chunk = this._convertOpenAIDeltaToBaseMessageChunk(
-        delta,
-        data,
-        defaultRole
-      );
-
-      // For models that send reasoning_details (Gemini style) instead of reasoning (DeepSeek style),
-      // set the current chunk's reasoning text to additional_kwargs.reasoning for streaming
-      if (currentChunkReasoningText && !chunk.additional_kwargs.reasoning) {
-        chunk.additional_kwargs.reasoning = currentChunkReasoningText;
+      if (
+        currentReasoningText.length > 0 &&
+        generationChunk.message.additional_kwargs.reasoning == null
+      ) {
+        generationChunk.message.additional_kwargs.reasoning =
+          currentReasoningText;
       }
 
-      // IMPORTANT: Only set reasoning_details on the FINAL chunk to prevent
-      // LangChain's chunk concatenation from corrupting the array
-      // Check if this is the final chunk (has finish_reason)
-      if (choice.finish_reason != null) {
-        // Build properly structured reasoning_details array
-        // Text entries first (but we only need the encrypted ones for thought signatures)
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const finalReasoningDetails: Record<string, any>[] = [
+      if (generationChunk.generationInfo?.finish_reason != null) {
+        const finalReasoningDetails = [
           ...reasoningTextByIndex.values(),
           ...reasoningEncryptedById.values(),
         ];
-
         if (finalReasoningDetails.length > 0) {
-          chunk.additional_kwargs.reasoning_details = finalReasoningDetails;
+          generationChunk.message.additional_kwargs.reasoning_details =
+            finalReasoningDetails;
+        } else {
+          delete generationChunk.message.additional_kwargs.reasoning_details;
         }
-      } else {
-        // Clear reasoning_details from intermediate chunks to prevent concatenation issues
-        delete chunk.additional_kwargs.reasoning_details;
-      }
-
-      defaultRole = delta.role ?? defaultRole;
-      const newTokenIndices = {
-        prompt: options.promptIndex ?? 0,
-        completion: choice.index ?? 0,
-      };
-      if (typeof chunk.content !== 'string') {
-        // eslint-disable-next-line no-console
-        console.log(
-          '[WARNING]: Received non-string content from OpenAI. This is currently not supported.'
-        );
+        yield generationChunk;
         continue;
       }
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const generationInfo: Record<string, any> = { ...newTokenIndices };
-      if (choice.finish_reason != null) {
-        generationInfo.finish_reason = choice.finish_reason;
-        generationInfo.system_fingerprint = data.system_fingerprint;
-        generationInfo.model_name = data.model;
-        generationInfo.service_tier = data.service_tier;
-      }
-      if (this.logprobs == true) {
-        generationInfo.logprobs = choice.logprobs;
-      }
-      const generationChunk = new ChatGenerationChunk({
-        message: chunk,
-        text: chunk.content,
-        generationInfo,
-      });
+
+      delete generationChunk.message.additional_kwargs.reasoning_details;
       yield generationChunk;
-      if (this._lc_stream_delay != null) {
-        await new Promise((resolve) =>
-          setTimeout(resolve, this._lc_stream_delay)
-        );
-      }
-      await runManager?.handleLLMNewToken(
-        generationChunk.text || '',
-        newTokenIndices,
-        undefined,
-        undefined,
-        undefined,
-        { chunk: generationChunk }
-      );
-    }
-    if (usage) {
-      const inputTokenDetails = {
-        ...(usage.prompt_tokens_details?.audio_tokens != null && {
-          audio: usage.prompt_tokens_details.audio_tokens,
-        }),
-        ...(usage.prompt_tokens_details?.cached_tokens != null && {
-          cache_read: usage.prompt_tokens_details.cached_tokens,
-        }),
-      };
-      const outputTokenDetails = {
-        ...(usage.completion_tokens_details?.audio_tokens != null && {
-          audio: usage.completion_tokens_details.audio_tokens,
-        }),
-        ...(usage.completion_tokens_details?.reasoning_tokens != null && {
-          reasoning: usage.completion_tokens_details.reasoning_tokens,
-        }),
-      };
-      const generationChunk = new ChatGenerationChunk({
-        message: new AIMessageChunkClass({
-          content: '',
-          response_metadata: {
-            usage: { ...usage },
-          },
-          usage_metadata: {
-            input_tokens: usage.prompt_tokens,
-            output_tokens: usage.completion_tokens,
-            total_tokens: usage.total_tokens,
-            ...(Object.keys(inputTokenDetails).length > 0 && {
-              input_token_details: inputTokenDetails,
-            }),
-            ...(Object.keys(outputTokenDetails).length > 0 && {
-              output_token_details: outputTokenDetails,
-            }),
-          },
-        }),
-        text: '',
-      });
-      yield generationChunk;
-      if (this._lc_stream_delay != null) {
-        await new Promise((resolve) =>
-          setTimeout(resolve, this._lc_stream_delay)
-        );
-      }
-    }
-    if (options.signal?.aborted === true) {
-      throw new Error('AbortError');
     }
   }
 }

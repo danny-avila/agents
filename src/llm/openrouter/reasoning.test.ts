@@ -3,7 +3,8 @@ import type { OpenRouterReasoning, ChatOpenRouterCallOptions } from './index';
 import type { OpenAIChatInput } from '@langchain/openai';
 
 type CreateRouterOptions = Partial<
-  ChatOpenRouterCallOptions & Pick<OpenAIChatInput, 'model' | 'apiKey'>
+  ChatOpenRouterCallOptions &
+    Pick<OpenAIChatInput, 'model' | 'apiKey' | 'streamUsage'>
 >;
 
 function createRouter(overrides: CreateRouterOptions = {}): ChatOpenRouter {
@@ -95,6 +96,12 @@ describe('ChatOpenRouter reasoning handling', () => {
       const params = router.invocationParams();
       expect(params.reasoning).toBeUndefined();
       expect(params.reasoning_effort).toBeUndefined();
+    });
+
+    it('preserves streaming extras from parent invocation params', () => {
+      const router = createRouter({ streamUsage: true });
+      const params = router.invocationParams(undefined, { streaming: true });
+      expect(params.stream_options).toEqual({ include_usage: true });
     });
   });
 

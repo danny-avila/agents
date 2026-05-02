@@ -9,6 +9,7 @@ import {
 import type { AnthropicMessage } from '@/types/messages';
 import type Anthropic from '@anthropic-ai/sdk';
 import { ContentTypes } from '@/common/enum';
+import { toLangChainContent } from './langchain';
 
 type MessageWithContent = {
   content?: string | MessageContentComplex[];
@@ -45,7 +46,7 @@ function cloneMessage<T extends MessageWithContent>(
 ): T {
   if (message instanceof BaseMessage) {
     const baseParams = {
-      content,
+      content: toLangChainContent(content),
       additional_kwargs: { ...message.additional_kwargs },
       response_metadata: { ...message.response_metadata },
       id: message.id,
@@ -337,7 +338,7 @@ export function stripBedrockCacheControl<T extends MessageWithContent>(
  * @returns - A new array of message objects with cache points added.
  */
 export function addBedrockCacheControl<
-  T extends Partial<BaseMessage> & MessageWithContent,
+  T extends MessageWithContent & { getType?: () => string; role?: string },
 >(messages: T[]): T[] {
   if (!Array.isArray(messages) || messages.length < 2) {
     return messages;

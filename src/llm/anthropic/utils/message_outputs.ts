@@ -1,16 +1,47 @@
-/**
- * This util file contains functions for converting Anthropic messages to LangChain messages.
- */
-import Anthropic from '@anthropic-ai/sdk';
-import {
-  AIMessage,
-  AIMessageChunk,
-  UsageMetadata,
-} from '@langchain/core/messages';
+/** This util file contains functions for converting Anthropic messages to LangChain messages. */
+import { AIMessage, AIMessageChunk } from '@langchain/core/messages';
+
+import type Anthropic from '@anthropic-ai/sdk';
+import type { UsageMetadata } from '@langchain/core/messages';
 import type { ToolCallChunk } from '@langchain/core/messages/tool';
-import { ChatGeneration } from '@langchain/core/outputs';
+import type { ChatGeneration } from '@langchain/core/outputs';
+import type { MessageContentComplex } from '@/types';
+import type { AnthropicMessageResponse } from '../types';
+
+import { toLangChainContent } from '@/messages/langchain';
 import { extractToolCalls } from './output_parsers';
-import { AnthropicMessageResponse } from '../types';
+
+interface AnthropicUsageData {
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  cache_creation_input_tokens?: number | null;
+  cache_read_input_tokens?: number | null;
+}
+
+export function getAnthropicUsageMetadata(
+  usage: AnthropicUsageData | null | undefined
+): UsageMetadata | undefined {
+  if (usage == null) {
+    return undefined;
+  }
+
+  const cacheCreationInputTokens = usage.cache_creation_input_tokens ?? 0;
+  const cacheReadInputTokens = usage.cache_read_input_tokens ?? 0;
+  // Anthropic reports uncached input separately from cache creation/read tokens.
+  const inputTokens =
+    (usage.input_tokens ?? 0) + cacheCreationInputTokens + cacheReadInputTokens;
+  const outputTokens = usage.output_tokens ?? 0;
+
+  return {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    total_tokens: inputTokens + outputTokens,
+    input_token_details: {
+      cache_creation: cacheCreationInputTokens,
+      cache_read: cacheReadInputTokens,
+    },
+  };
+}
 
 function _isAnthropicCompactionBlock(
   block: unknown
@@ -32,34 +63,23 @@ export function _makeMessageChunkFromAnthropicEvent(
 ): {
   chunk: AIMessageChunk;
 } | null {
+  const responseMetadata = { model_provider: 'anthropic' };
   if (data.type === 'message_start') {
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     const { content, usage, ...additionalKwargs } = data.message;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const filteredAdditionalKwargs: Record<string, any> = {};
-    for (const [key, value] of Object.entries(additionalKwargs)) {
-      if (value !== undefined && value !== null) {
-        filteredAdditionalKwargs[key] = value;
-      }
-    }
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const { input_tokens, output_tokens, ...rest }: Record<string, any> =
-      usage ?? {};
-    const usageMetadata: UsageMetadata = {
-      input_tokens,
-      output_tokens,
-      total_tokens: input_tokens + output_tokens,
-      input_token_details: {
-        cache_creation: rest.cache_creation_input_tokens,
-        cache_read: rest.cache_read_input_tokens,
-      },
-    };
+    const {
+      input_tokens: _inputTokens,
+      output_tokens: _outputTokens,
+      ...rest
+    } = usage;
+    const usageMetadata = getAnthropicUsageMetadata(usage);
     return {
       chunk: new AIMessageChunk({
         content: fields.coerceContentToString ? '' : [],
-        additional_kwargs: filteredAdditionalKwargs,
+        additional_kwargs: additionalKwargs,
         usage_metadata: fields.streamUsage ? usageMetadata : undefined,
         response_metadata: {
+          ...responseMetadata,
           usage: {
             ...rest,
           },
@@ -68,20 +88,25 @@ export function _makeMessageChunkFromAnthropicEvent(
       }),
     };
   } else if (data.type === 'message_delta') {
+    const messageDeltaResponseMetadata = { ...responseMetadata };
+    if ('context_management' in data.delta) {
+      Object.assign(messageDeltaResponseMetadata, {
+        context_management: data.delta.context_management,
+      });
+    }
     const usageMetadata: UsageMetadata = {
       input_tokens: 0,
       output_tokens: data.usage.output_tokens,
       total_tokens: data.usage.output_tokens,
       input_token_details: {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        cache_creation: (data.usage as any).cache_creation_input_tokens,
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        cache_read: (data.usage as any).cache_read_input_tokens,
+        cache_creation: data.usage.cache_creation_input_tokens ?? undefined,
+        cache_read: data.usage.cache_read_input_tokens ?? undefined,
       },
     };
     return {
       chunk: new AIMessageChunk({
         content: fields.coerceContentToString ? '' : [],
+        response_metadata: messageDeltaResponseMetadata,
         additional_kwargs: { ...data.delta },
         usage_metadata: fields.streamUsage ? usageMetadata : undefined,
       }),
@@ -119,21 +144,21 @@ export function _makeMessageChunkFromAnthropicEvent(
     } else {
       toolCallChunks = [];
     }
+    const content = [
+      {
+        index: data.index,
+        ...data.content_block,
+        input:
+          contentBlock.type === 'server_tool_use' ||
+          contentBlock.type === 'tool_use'
+            ? ''
+            : undefined,
+      },
+    ];
     return {
       chunk: new AIMessageChunk({
-        content: fields.coerceContentToString
-          ? ''
-          : [
-            {
-              index: data.index,
-              ...data.content_block,
-              input:
-                  contentBlock.type === 'server_tool_use' ||
-                  contentBlock.type === 'tool_use'
-                    ? ''
-                    : undefined,
-            },
-          ],
+        content: fields.coerceContentToString ? '' : content,
+        response_metadata: responseMetadata,
         additional_kwargs: {},
         tool_call_chunks: toolCallChunks,
       }),
@@ -154,8 +179,7 @@ export function _makeMessageChunkFromAnthropicEvent(
         }),
       };
     } else {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const contentBlock: Record<string, any> = data.delta;
+      const contentBlock: Record<string, unknown> = { ...data.delta };
       if ('citation' in contentBlock) {
         contentBlock.citations = [contentBlock.citation];
         delete contentBlock.citation;
@@ -167,6 +191,7 @@ export function _makeMessageChunkFromAnthropicEvent(
         return {
           chunk: new AIMessageChunk({
             content: [{ index: data.index, ...contentBlock, type: 'thinking' }],
+            response_metadata: responseMetadata,
           }),
         };
       }
@@ -174,6 +199,7 @@ export function _makeMessageChunkFromAnthropicEvent(
       return {
         chunk: new AIMessageChunk({
           content: [{ index: data.index, ...contentBlock, type: 'text' }],
+          response_metadata: responseMetadata,
         }),
       };
     }
@@ -181,17 +207,17 @@ export function _makeMessageChunkFromAnthropicEvent(
     data.type === 'content_block_delta' &&
     data.delta.type === 'input_json_delta'
   ) {
+    const content = [
+      {
+        index: data.index,
+        input: data.delta.partial_json,
+        type: data.delta.type,
+      },
+    ];
     return {
       chunk: new AIMessageChunk({
-        content: fields.coerceContentToString
-          ? ''
-          : [
-            {
-              index: data.index,
-              input: data.delta.partial_json,
-              type: data.delta.type,
-            },
-          ],
+        content: fields.coerceContentToString ? '' : content,
+        response_metadata: responseMetadata,
         additional_kwargs: {},
         tool_call_chunks: [
           {
@@ -206,21 +232,19 @@ export function _makeMessageChunkFromAnthropicEvent(
     data.content_block.type === 'text'
   ) {
     const content = data.content_block.text;
-    if (content !== undefined) {
-      return {
-        chunk: new AIMessageChunk({
-          content: fields.coerceContentToString
-            ? content
-            : [
-              {
-                index: data.index,
-                ...data.content_block,
-              },
-            ],
-          additional_kwargs: {},
-        }),
-      };
-    }
+    const contentBlock = [
+      {
+        index: data.index,
+        ...data.content_block,
+      },
+    ];
+    return {
+      chunk: new AIMessageChunk({
+        content: fields.coerceContentToString ? content : contentBlock,
+        response_metadata: responseMetadata,
+        additional_kwargs: {},
+      }),
+    };
   } else if (
     data.type === 'content_block_start' &&
     data.content_block.type === 'redacted_thinking'
@@ -230,6 +254,7 @@ export function _makeMessageChunkFromAnthropicEvent(
         content: fields.coerceContentToString
           ? ''
           : [{ index: data.index, ...data.content_block }],
+        response_metadata: responseMetadata,
       }),
     };
   } else if (
@@ -242,6 +267,7 @@ export function _makeMessageChunkFromAnthropicEvent(
         content: fields.coerceContentToString
           ? content
           : [{ index: data.index, ...data.content_block }],
+        response_metadata: responseMetadata,
       }),
     };
   } else if (
@@ -253,23 +279,24 @@ export function _makeMessageChunkFromAnthropicEvent(
         content: fields.coerceContentToString
           ? ''
           : [{ index: data.index, ...data.content_block }],
+        response_metadata: responseMetadata,
       }),
     };
   } else if (
     data.type === 'content_block_delta' &&
     data.delta.type === 'compaction_delta'
   ) {
+    const content = [
+      {
+        index: data.index,
+        ...data.delta,
+        type: 'compaction',
+      },
+    ];
     return {
       chunk: new AIMessageChunk({
-        content: fields.coerceContentToString
-          ? ''
-          : [
-            {
-              index: data.index,
-              ...data.delta,
-              type: 'compaction',
-            },
-          ],
+        content: fields.coerceContentToString ? '' : content,
+        response_metadata: responseMetadata,
       }),
     };
   }
@@ -280,20 +307,12 @@ export function anthropicResponseToChatMessages(
   messages: AnthropicMessageResponse[],
   additionalKwargs: Record<string, unknown>
 ): ChatGeneration[] {
-  const usage: Record<string, number> | null | undefined =
-    additionalKwargs.usage as Record<string, number> | null | undefined;
-  const usageMetadata =
-    usage != null
-      ? {
-        input_tokens: usage.input_tokens ?? 0,
-        output_tokens: usage.output_tokens ?? 0,
-        total_tokens: (usage.input_tokens ?? 0) + (usage.output_tokens ?? 0),
-        input_token_details: {
-          cache_creation: usage.cache_creation_input_tokens,
-          cache_read: usage.cache_read_input_tokens,
-        },
-      }
-      : undefined;
+  const responseMetadata = {
+    ...additionalKwargs,
+    model_provider: 'anthropic',
+  };
+  const usage = additionalKwargs.usage as AnthropicUsageData | null | undefined;
+  const usageMetadata = getAnthropicUsageMetadata(usage);
   if (messages.length === 1 && messages[0].type === 'text') {
     return [
       {
@@ -302,7 +321,7 @@ export function anthropicResponseToChatMessages(
           content: messages[0].text,
           additional_kwargs: additionalKwargs,
           usage_metadata: usageMetadata,
-          response_metadata: additionalKwargs,
+          response_metadata: responseMetadata,
           id: additionalKwargs.id as string,
         }),
       },
@@ -313,12 +332,11 @@ export function anthropicResponseToChatMessages(
       {
         text: '',
         message: new AIMessage({
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          content: messages as any,
+          content: toLangChainContent(messages as MessageContentComplex[]),
           additional_kwargs: additionalKwargs,
           tool_calls: toolCalls,
           usage_metadata: usageMetadata,
-          response_metadata: additionalKwargs,
+          response_metadata: responseMetadata,
           id: additionalKwargs.id as string,
         }),
       },

@@ -27,7 +27,7 @@ import { AIMessageChunk } from '@langchain/core/messages';
 import { ChatGenerationChunk, ChatResult } from '@langchain/core/outputs';
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { ChatBedrockConverseInput } from '@langchain/aws';
-import type { BaseMessage } from '@langchain/core/messages';
+import type { BaseMessage, ResponseMetadata } from '@langchain/core/messages';
 import {
   convertToConverseMessages,
   handleConverseStreamContentBlockStart,
@@ -238,7 +238,7 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
           text: '',
           message: new AIMessageChunk({
             content: '',
-            response_metadata: event,
+            response_metadata: { ...event } as ResponseMetadata,
           }),
         });
       }
