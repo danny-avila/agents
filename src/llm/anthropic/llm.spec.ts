@@ -31,10 +31,11 @@ import type {
   MessageContentComplex,
 } from '@langchain/core/messages';
 import { toLangChainContent } from '@/messages/langchain';
-import { CustomAnthropic as ChatAnthropic } from './index';
+import { _documentsInParams, CustomAnthropic as ChatAnthropic } from './index';
 import type { CustomAnthropicCallOptions } from './index';
 import type {
   AnthropicContextManagementConfigParam,
+  AnthropicMessageCreateParams,
   AnthropicMessageResponse,
   AnthropicOutputConfig,
   AnthropicThinkingConfigParam,
@@ -688,6 +689,21 @@ test('Anthropic usage metadata includes cache input token buckets', () => {
       cache_read: 30,
     },
   });
+});
+
+test('document detection ignores null content placeholders', () => {
+  const params: AnthropicMessageCreateParams = {
+    model: modelName,
+    max_tokens: 16,
+    messages: [
+      {
+        role: 'user',
+        content: [null as never, { type: 'text', text: 'hello' }],
+      },
+    ],
+  };
+
+  expect(_documentsInParams(params)).toBe(false);
 });
 
 test('id is supplied when invoking', async () => {

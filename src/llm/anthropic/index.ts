@@ -45,7 +45,7 @@ function _toolsInParams(
 ): boolean {
   return !!(params.tools && params.tools.length > 0);
 }
-function _documentsInParams(
+export function _documentsInParams(
   params: AnthropicMessageCreateParams | AnthropicStreamingMessageCreateParams
 ): boolean {
   for (const message of params.messages) {
@@ -55,6 +55,7 @@ function _documentsInParams(
     for (const block of message.content) {
       if (
         typeof block === 'object' &&
+        block !== null &&
         block.type === 'document' &&
         block.citations != null &&
         typeof block.citations === 'object' &&
