@@ -52,7 +52,11 @@ export function _documentsInParams(
     if (typeof message.content === 'string') {
       continue;
     }
-    for (const block of message.content) {
+    for (const rawBlock of message.content) {
+      const block = rawBlock as {
+        type?: unknown;
+        citations?: { enabled?: unknown };
+      } | null;
       if (
         typeof block === 'object' &&
         block !== null &&
@@ -323,6 +327,13 @@ export type CustomAnthropicCallOptions = {
   mcp_servers?: AnthropicMCPServerURLDefinition[];
 };
 
+function delayInputChunk(delay?: number): Promise<void> | undefined {
+  if (delay == null || delay <= 0) {
+    return;
+  }
+  return new Promise((resolve) => setTimeout(resolve, delay));
+}
+
 type CustomAnthropicInvocationParams = {
   betas?: AnthropicBeta[];
   container?: string;
@@ -563,6 +574,26 @@ export class CustomAnthropic extends ChatAnthropicMessages {
 
       const { chunk } = result;
       const [token = '', tokenType] = extractToken(chunk);
+
+      if (tokenType === 'input' && token !== '') {
+        await delayInputChunk(this._lc_stream_delay);
+        const generationChunk = this.createGenerationChunk({
+          token,
+          chunk,
+          usageMetadata,
+          shouldStreamUsage,
+        });
+        yield generationChunk;
+        await runManager?.handleLLMNewToken(
+          token,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          { chunk: generationChunk }
+        );
+        continue;
+      }
 
       if (
         !tokenType ||
