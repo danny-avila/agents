@@ -147,7 +147,7 @@ function getTaskBudgetBetas(
     : [];
 }
 
-function isSetSamplingValue(value?: number | null): boolean {
+function isSetSamplingValue(value?: number | null): value is number {
   return value != null && value !== -1;
 }
 
