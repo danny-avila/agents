@@ -2004,6 +2004,24 @@ describe('Opus 4.6', () => {
       expect(params.top_p).toBeUndefined();
     });
 
+    test('adaptive thinking treats sampling sentinels as unset', () => {
+      const model = new ChatAnthropic({
+        model: opus46Model,
+        apiKey: 'testing',
+        maxTokens: 4096,
+        thinking: { type: 'adaptive' },
+      });
+      model.temperature = -1;
+      model.topP = -1;
+      model.top_k = -1;
+
+      const params = model.invocationParams({});
+
+      expect(params.temperature).toBeUndefined();
+      expect(params.top_k).toBeUndefined();
+      expect(params.top_p).toBeUndefined();
+    });
+
     test('adaptive thinking throws on non-default temperature', () => {
       const model = new ChatAnthropic({
         model: opus46Model,

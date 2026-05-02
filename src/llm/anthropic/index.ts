@@ -147,6 +147,14 @@ function getTaskBudgetBetas(
     : [];
 }
 
+function isSetSamplingValue(value?: number | null): boolean {
+  return value != null && value !== -1;
+}
+
+function isNonDefaultTemperature(value?: number): boolean {
+  return isSetSamplingValue(value) && value !== 1;
+}
+
 function validateInvocationParamCompatibility({
   model,
   thinking,
@@ -172,17 +180,17 @@ function validateInvocationParamCompatibility({
     );
   }
   if (opus47) {
-    if (topK !== undefined) {
+    if (isSetSamplingValue(topK)) {
       throw new Error(
         'topK is not supported for claude-opus-4-7; omit topK/topP/temperature or use model prompting instead'
       );
     }
-    if (topP != null && topP !== 1) {
+    if (isSetSamplingValue(topP) && topP !== 1) {
       throw new Error(
         'topP is not supported for claude-opus-4-7 when set to non-default values'
       );
     }
-    if (temperature !== undefined && temperature !== 1) {
+    if (isNonDefaultTemperature(temperature)) {
       throw new Error(
         'temperature is not supported for claude-opus-4-7 when set to non-default values'
       );
@@ -191,13 +199,13 @@ function validateInvocationParamCompatibility({
   if (!isThinkingEnabled(thinking)) {
     return;
   }
-  if (topK !== undefined) {
+  if (isSetSamplingValue(topK)) {
     throw new Error('topK is not supported when thinking is enabled');
   }
-  if (topP != null) {
+  if (isSetSamplingValue(topP)) {
     throw new Error('topP is not supported when thinking is enabled');
   }
-  if (temperature !== undefined && temperature !== 1) {
+  if (isNonDefaultTemperature(temperature)) {
     throw new Error('temperature is not supported when thinking is enabled');
   }
 }
@@ -223,9 +231,9 @@ function getSamplingParams({
     return {};
   }
   return {
-    ...(temperature !== undefined ? { temperature } : {}),
-    ...(topK !== undefined ? { top_k: topK } : {}),
-    ...(topP != null ? { top_p: topP } : {}),
+    ...(isSetSamplingValue(temperature) ? { temperature } : {}),
+    ...(isSetSamplingValue(topK) ? { top_k: topK } : {}),
+    ...(isSetSamplingValue(topP) ? { top_p: topP } : {}),
   };
 }
 
