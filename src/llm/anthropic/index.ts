@@ -13,7 +13,6 @@ import type { Anthropic } from '@anthropic-ai/sdk';
 import type {
   AnthropicMessageCreateParams,
   AnthropicStreamingMessageCreateParams,
-  AnthropicStreamUsage,
   AnthropicMessageStartEvent,
   AnthropicMessageDeltaEvent,
   AnthropicOutputConfig,
@@ -22,7 +21,10 @@ import type {
   AnthropicMCPServerURLDefinition,
   AnthropicContextManagementConfigParam,
 } from '@/llm/anthropic/types';
-import { _makeMessageChunkFromAnthropicEvent } from './utils/message_outputs';
+import {
+  _makeMessageChunkFromAnthropicEvent,
+  getAnthropicUsageMetadata,
+} from './utils/message_outputs';
 import { _convertMessagesToAnthropicPayload } from './utils/message_inputs';
 import { handleToolChoice } from './utils/tools';
 import { TextStream } from '@/llm/text';
@@ -433,41 +435,19 @@ export class CustomAnthropic extends ChatAnthropicMessages {
     if (this.emitted_usage === true) {
       return;
     }
-    const inputUsage = this.message_start?.message.usage as
-      | undefined
-      | AnthropicStreamUsage;
-    const outputUsage = this.message_delta?.usage as
-      | undefined
-      | Partial<AnthropicStreamUsage>;
+    const inputUsage = this.message_start?.message.usage;
+    const outputUsage = this.message_delta?.usage;
     if (!outputUsage) {
       return;
     }
-    const cacheCreationInputTokens =
-      inputUsage?.cache_creation_input_tokens ?? 0;
-    const cacheReadInputTokens = inputUsage?.cache_read_input_tokens ?? 0;
-    // Anthropic reports uncached input separately from cache creation/read tokens.
-    const inputTokens =
-      (inputUsage?.input_tokens ?? 0) +
-      cacheCreationInputTokens +
-      cacheReadInputTokens;
-    const totalUsage: UsageMetadata = {
-      input_tokens: inputTokens,
-      output_tokens: outputUsage.output_tokens ?? 0,
-      total_tokens: inputTokens + (outputUsage.output_tokens ?? 0),
-    };
-
-    if (
-      inputUsage?.cache_creation_input_tokens != null ||
-      inputUsage?.cache_read_input_tokens != null
-    ) {
-      totalUsage.input_token_details = {
-        cache_creation: cacheCreationInputTokens,
-        cache_read: cacheReadInputTokens,
-      };
-    }
 
     this.emitted_usage = true;
-    return totalUsage;
+    return getAnthropicUsageMetadata({
+      input_tokens: inputUsage?.input_tokens,
+      output_tokens: outputUsage.output_tokens,
+      cache_creation_input_tokens: inputUsage?.cache_creation_input_tokens,
+      cache_read_input_tokens: inputUsage?.cache_read_input_tokens,
+    });
   }
 
   resetTokenEvents(): void {
