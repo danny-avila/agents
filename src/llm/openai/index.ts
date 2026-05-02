@@ -112,6 +112,32 @@ type OpenAIClientOwner = {
   clientConfig: OpenAIClientConfig;
   timeout?: number;
 };
+type AbortableOpenAIClient = CustomOpenAIClient | CustomAzureOpenAIClient;
+type OpenAIClientDelegate = {
+  client?: AbortableOpenAIClient;
+  _getClientOptions(
+    options: OpenAICoreRequestOptions | undefined
+  ): OpenAICoreRequestOptions;
+};
+
+function getExposedOpenAIClient(
+  completions: OpenAIClientDelegate,
+  responses: OpenAIClientDelegate,
+  preferResponses: boolean
+): AbortableOpenAIClient {
+  const responsesClient = responses.client;
+  if (responsesClient?.abortHandler != null) {
+    return responsesClient;
+  }
+  const completionsClient = completions.client;
+  if (completionsClient?.abortHandler != null) {
+    return completionsClient;
+  }
+
+  const delegate = preferResponses ? responses : completions;
+  delegate._getClientOptions(undefined);
+  return delegate.client as AbortableOpenAIClient;
+}
 
 function getReasoningParams(
   baseReasoning: OpenAIClient.Reasoning | undefined,
@@ -899,8 +925,11 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
   }
 
   public get exposedClient(): CustomOpenAIClient {
-    this.completions._getClientOptions(undefined);
-    return this.completions.client as CustomOpenAIClient;
+    return getExposedOpenAIClient(
+      this.completions as OpenAIClientDelegate,
+      this.responses as OpenAIClientDelegate,
+      this._useResponsesApi(undefined)
+    ) as CustomOpenAIClient;
   }
   static lc_name(): string {
     return 'LibreChatOpenAI';
@@ -972,8 +1001,11 @@ export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
   }
 
   public get exposedClient(): CustomOpenAIClient {
-    this.completions._getClientOptions(undefined);
-    return this.completions.client as CustomOpenAIClient;
+    return getExposedOpenAIClient(
+      this.completions as OpenAIClientDelegate,
+      this.responses as OpenAIClientDelegate,
+      this._useResponsesApi(undefined)
+    ) as CustomOpenAIClient;
   }
   static lc_name(): 'LibreChatAzureOpenAI' {
     return 'LibreChatAzureOpenAI';

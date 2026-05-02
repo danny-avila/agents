@@ -167,6 +167,9 @@ describe('custom chat model class smoke tests', () => {
     expect(params.max_completion_tokens).toBeUndefined();
     expect(params.reasoning).toEqual({ effort: 'low' });
     expect(responses.client).toBeInstanceOf(CustomOpenAIClient);
+    const responsesClient = responses.client as CustomOpenAIClient;
+    responsesClient.abortHandler = (): void => undefined;
+    expect(model.exposedClient).toBe(responsesClient);
     expect(requestOptions?.headers).toEqual(
       expect.objectContaining({ 'x-smoke': 'responses' })
     );
@@ -187,6 +190,15 @@ describe('custom chat model class smoke tests', () => {
     expect(AzureChatOpenAI.lc_name()).toBe('LibreChatAzureOpenAI');
     expect(model._lc_stream_delay).toBe(4);
     expect(model.exposedClient).toBeInstanceOf(CustomAzureOpenAIClient);
+    const azureResponses = (
+      model as unknown as { responses: OpenAIResponsesDelegate }
+    ).responses;
+    azureResponses._getClientOptions(undefined);
+    expect(azureResponses.client).toBeInstanceOf(CustomAzureOpenAIClient);
+    const azureResponsesClient =
+      azureResponses.client as CustomAzureOpenAIClient;
+    azureResponsesClient.abortHandler = (): void => undefined;
+    expect(model.exposedClient).toBe(azureResponsesClient);
     expect(requestOptions.headers).toEqual(
       expect.objectContaining({
         'api-key': 'test-azure-key',
