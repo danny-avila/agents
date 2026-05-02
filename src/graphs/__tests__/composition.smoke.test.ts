@@ -18,6 +18,11 @@ const makeConfig = (threadId: string): RunnableConfig => ({
   },
 });
 
+const makeStreamConfig = (threadId: string): t.WorkflowValuesStreamConfig => ({
+  ...makeConfig(threadId),
+  streamMode: 'values' as const,
+});
+
 const getAiContents = (messages: t.BaseGraphState['messages']): string[] =>
   messages
     .filter((message) => message.getType() === 'ai')
@@ -48,6 +53,32 @@ describe('LangGraph composition smoke tests', () => {
     );
 
     expect(getAiContents(result.messages)).toEqual(['standard ok']);
+  });
+
+  it('streams values from the standard single-agent graph', async () => {
+    const graph = new StandardGraph({
+      runId: 'standard-stream-smoke',
+      agents: [makeAgent('agent')],
+    });
+    graph.overrideTestModel(['standard stream ok']);
+
+    const workflow = graph.createWorkflow();
+    const stream = (await workflow.stream(
+      { messages: [new HumanMessage('hello')] },
+      makeStreamConfig('standard-stream-smoke')
+    )) as AsyncIterable<t.BaseGraphState>;
+    const chunks: t.BaseGraphState[] = [];
+
+    for await (const chunk of stream) {
+      chunks.push(chunk);
+    }
+
+    expect(chunks.length).toBeGreaterThan(0);
+    expect(
+      chunks.some((chunk) =>
+        getAiContents(chunk.messages).includes('standard stream ok')
+      )
+    ).toBe(true);
   });
 
   it('compiles and invokes a multi-agent graph with one agent and no edges', async () => {

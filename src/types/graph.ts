@@ -120,18 +120,26 @@ export type Workflow<
   N extends string = string,
 > = StateGraph<T, U, N>;
 
-export type EventStreamCallbackHandlerInput = {
-  autoClose?: boolean;
-  includeNames?: string[];
-  includeTypes?: string[];
-  includeTags?: string[];
-  excludeNames?: string[];
-  excludeTypes?: string[];
-  excludeTags?: string[];
-  raiseError?: boolean;
-  ignoreCustomEvent?: boolean;
+type LangChainEventStreamCallbackHandlerInput = NonNullable<
+  Parameters<Runnable['streamEvents']>[2]
+>;
+
+export type EventStreamCallbackHandlerInput =
+  LangChainEventStreamCallbackHandlerInput & {
+    autoClose?: boolean;
+    raiseError?: boolean;
+    ignoreCustomEvent?: boolean;
+  };
+
+export type WorkflowValuesStreamConfig = RunnableConfig & {
+  streamMode: 'values';
 };
 
+/**
+ * LangGraph stream output is mode-dependent (`values`, `updates`, SSE, etc.).
+ * Keep the base Runnable stream output as unknown and narrow at callsites that
+ * choose a concrete streamMode.
+ */
 export type CompiledWorkflow<
   TInput extends BaseGraphState = BaseGraphState,
   TOutput extends BaseGraphState = TInput,
@@ -161,9 +169,7 @@ export type SystemRunnable =
  * These are intentionally untyped to avoid coupling to library internals.
  */
 export type CompileOptions = {
-  // A checkpointer instance (e.g., MemorySaver, SQL saver)
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  checkpointer?: any;
+  checkpointer?: unknown;
   interruptBefore?: string[];
   interruptAfter?: string[];
 };

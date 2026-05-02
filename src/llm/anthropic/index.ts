@@ -94,7 +94,7 @@ function isThinkingEnabled(thinking: Anthropic.ThinkingConfigParam): boolean {
 }
 
 function isOpus47Model(model?: string): boolean {
-  return model?.startsWith('claude-opus-4-7') === true;
+  return /^claude-opus-4-7(?:-|$)/.test(model ?? '');
 }
 
 function combineBetas(
@@ -303,7 +303,7 @@ export type CustomAnthropicInput = AnthropicInput & {
   contextManagement?: AnthropicContextManagementConfigParam;
 } & BaseChatModelParams;
 
-type CustomAnthropicCallOptions = {
+export type CustomAnthropicCallOptions = {
   outputConfig?: AnthropicOutputConfig;
   outputFormat?: Anthropic.Messages.JSONOutputFormat;
   inferenceGeo?: string;
@@ -312,12 +312,14 @@ type CustomAnthropicCallOptions = {
   mcp_servers?: AnthropicMCPServerURLDefinition[];
 };
 
-/**
- * A type representing additional parameters that can be passed to the
- * Anthropic API.
- */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type Kwargs = Record<string, any>;
+type CustomAnthropicInvocationParams = {
+  betas?: AnthropicBeta[];
+  container?: string;
+  context_management?: AnthropicContextManagementConfigParam;
+  inference_geo?: string;
+  mcp_servers?: AnthropicMCPServerURLDefinition[];
+  output_config?: AnthropicOutputConfig;
+};
 
 export class CustomAnthropic extends ChatAnthropicMessages {
   _lc_stream_delay: number;
@@ -347,12 +349,12 @@ export class CustomAnthropic extends ChatAnthropicMessages {
    * Get the parameters used to invoke the model
    */
   override invocationParams(
-    options?: this['ParsedCallOptions']
+    options?: this['ParsedCallOptions'] & CustomAnthropicCallOptions
   ): Omit<
     AnthropicMessageCreateParams | AnthropicStreamingMessageCreateParams,
     'messages'
   > &
-    Kwargs {
+    CustomAnthropicInvocationParams {
     const tool_choice:
       | Anthropic.Messages.ToolChoiceAuto
       | Anthropic.Messages.ToolChoiceAny
@@ -443,6 +445,7 @@ export class CustomAnthropic extends ChatAnthropicMessages {
     const cacheCreationInputTokens =
       inputUsage?.cache_creation_input_tokens ?? 0;
     const cacheReadInputTokens = inputUsage?.cache_read_input_tokens ?? 0;
+    // Anthropic reports uncached input separately from cache creation/read tokens.
     const inputTokens =
       (inputUsage?.input_tokens ?? 0) +
       cacheCreationInputTokens +

@@ -24,6 +24,7 @@ import {
   handleConverseStreamMetadata,
   convertToConverseMessages,
 } from './utils';
+import { toLangChainContent } from '@/messages/langchain';
 import { CustomChatBedrockConverse, ServiceTierType } from './index';
 
 jest.setTimeout(120000);
@@ -81,9 +82,7 @@ function expectDocumentBlock(
 function humanMessageWithContent(
   content: MessageContentComplex[]
 ): HumanMessage {
-  return new HumanMessage({
-    content,
-  } as ConstructorParameters<typeof HumanMessage>[0]);
+  return new HumanMessage({ content: toLangChainContent(content) });
 }
 
 describe('CustomChatBedrockConverse', () => {

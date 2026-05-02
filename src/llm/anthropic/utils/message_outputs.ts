@@ -1,16 +1,15 @@
-/**
- * This util file contains functions for converting Anthropic messages to LangChain messages.
- */
-import Anthropic from '@anthropic-ai/sdk';
-import {
-  AIMessage,
-  AIMessageChunk,
-  UsageMetadata,
-} from '@langchain/core/messages';
+/** This util file contains functions for converting Anthropic messages to LangChain messages. */
+import { AIMessage, AIMessageChunk } from '@langchain/core/messages';
+
+import type Anthropic from '@anthropic-ai/sdk';
+import type { UsageMetadata } from '@langchain/core/messages';
 import type { ToolCallChunk } from '@langchain/core/messages/tool';
-import { ChatGeneration } from '@langchain/core/outputs';
+import type { ChatGeneration } from '@langchain/core/outputs';
+import type { MessageContentComplex } from '@/types';
+import type { AnthropicMessageResponse } from '../types';
+
+import { toLangChainContent } from '@/messages/langchain';
 import { extractToolCalls } from './output_parsers';
-import { AnthropicMessageResponse } from '../types';
 
 interface AnthropicUsageData {
   input_tokens?: number | null;
@@ -19,7 +18,7 @@ interface AnthropicUsageData {
   cache_read_input_tokens?: number | null;
 }
 
-function getAnthropicUsageMetadata(
+export function getAnthropicUsageMetadata(
   usage: AnthropicUsageData | null | undefined
 ): UsageMetadata | undefined {
   if (usage == null) {
@@ -28,6 +27,7 @@ function getAnthropicUsageMetadata(
 
   const cacheCreationInputTokens = usage.cache_creation_input_tokens ?? 0;
   const cacheReadInputTokens = usage.cache_read_input_tokens ?? 0;
+  // Anthropic reports uncached input separately from cache creation/read tokens.
   const inputTokens =
     (usage.input_tokens ?? 0) + cacheCreationInputTokens + cacheReadInputTokens;
   const outputTokens = usage.output_tokens ?? 0;
@@ -99,10 +99,8 @@ export function _makeMessageChunkFromAnthropicEvent(
       output_tokens: data.usage.output_tokens,
       total_tokens: data.usage.output_tokens,
       input_token_details: {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        cache_creation: (data.usage as any).cache_creation_input_tokens,
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        cache_read: (data.usage as any).cache_read_input_tokens,
+        cache_creation: data.usage.cache_creation_input_tokens ?? undefined,
+        cache_read: data.usage.cache_read_input_tokens ?? undefined,
       },
     };
     return {
@@ -181,8 +179,7 @@ export function _makeMessageChunkFromAnthropicEvent(
         }),
       };
     } else {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const contentBlock: Record<string, any> = data.delta;
+      const contentBlock: Record<string, unknown> = { ...data.delta };
       if ('citation' in contentBlock) {
         contentBlock.citations = [contentBlock.citation];
         delete contentBlock.citation;
@@ -335,8 +332,7 @@ export function anthropicResponseToChatMessages(
       {
         text: '',
         message: new AIMessage({
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          content: messages as any,
+          content: toLangChainContent(messages as MessageContentComplex[]),
           additional_kwargs: additionalKwargs,
           tool_calls: toolCalls,
           usage_metadata: usageMetadata,
