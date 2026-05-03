@@ -408,8 +408,11 @@ export const createSearchTool = (
   } else if (scraperProvider === 'tavily') {
     scraperInstance = createTavilyScraper({
       ...tavilyScraperOptions,
-      apiKey: tavilyApiKey ?? process.env.TAVILY_API_KEY,
-      apiUrl: tavilyExtractUrl,
+      apiKey:
+        tavilyScraperOptions?.apiKey ??
+        tavilyApiKey ??
+        process.env.TAVILY_API_KEY,
+      apiUrl: tavilyScraperOptions?.apiUrl ?? tavilyExtractUrl,
       timeout: scraperTimeout ?? tavilyScraperOptions?.timeout,
       logger,
     });

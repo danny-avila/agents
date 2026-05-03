@@ -267,6 +267,64 @@ describe('Tavily search API', () => {
       safe_search: true,
     });
   });
+
+  it('preserves Tavily scraper connection overrides in the search tool', async () => {
+    mockedAxios.post
+      .mockResolvedValueOnce({
+        data: {
+          results: [
+            {
+              title: 'Example',
+              url: 'https://example.com',
+              content: 'Example summary',
+            },
+          ],
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          results: [
+            {
+              url: 'https://example.com',
+              raw_content: 'Extracted content',
+              images: [],
+            },
+          ],
+          failed_results: [],
+        },
+      });
+
+    const searchTool = createSearchTool({
+      searchProvider: 'tavily',
+      tavilyApiKey: 'search-key',
+      scraperProvider: 'tavily',
+      tavilyScraperOptions: {
+        apiKey: 'scraper-key',
+        apiUrl: 'https://proxy.example.com/extract',
+      },
+      rerankerType: 'none',
+      logger: mockLogger,
+    });
+
+    await searchTool.invoke({
+      query: 'example query',
+    });
+    const [, , searchConfig] = mockedAxios.post.mock.calls[0];
+    const [extractUrl, , extractConfig] = mockedAxios.post.mock.calls[1];
+
+    expect(mockedAxios.post).toHaveBeenCalledTimes(2);
+    expect(searchConfig).toMatchObject({
+      headers: {
+        Authorization: 'Bearer search-key',
+      },
+    });
+    expect(extractUrl).toBe('https://proxy.example.com/extract');
+    expect(extractConfig).toMatchObject({
+      headers: {
+        Authorization: 'Bearer scraper-key',
+      },
+    });
+  });
 });
 
 describe('TavilyScraper', () => {
