@@ -1,6 +1,7 @@
 import axios from 'axios';
 import { createSearchAPI } from './search';
 import { TavilyScraper, createTavilyScraper } from './tavily-scraper';
+import { createSearchTool } from './tool';
 import type * as t from './types';
 
 jest.mock('axios');
@@ -210,6 +211,35 @@ describe('Tavily search API', () => {
       query: 'example query',
       search_depth: 'advanced',
       chunks_per_source: 2,
+    });
+  });
+
+  it('uses explicit tool safe search config and skips Tavily video subqueries', async () => {
+    mockedAxios.post.mockResolvedValue({
+      data: {
+        results: [],
+      },
+    });
+
+    const searchTool = createSearchTool({
+      searchProvider: 'tavily',
+      tavilyApiKey: 'test-key',
+      scraperProvider: 'tavily',
+      rerankerType: 'none',
+      logger: mockLogger,
+      safeSearch: 2,
+    });
+
+    await searchTool.invoke({
+      query: 'example query',
+      videos: true,
+    });
+    const [, payload] = mockedAxios.post.mock.calls[0];
+
+    expect(mockedAxios.post).toHaveBeenCalledTimes(1);
+    expect(payload).toMatchObject({
+      query: 'example query',
+      safe_search: true,
     });
   });
 });

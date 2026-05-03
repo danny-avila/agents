@@ -179,11 +179,13 @@ async function executeParallelSearches({
 function createSearchProcessor({
   searchAPI,
   safeSearch,
+  supportsVideos,
   sourceProcessor,
   onGetHighlights,
   logger,
 }: {
   safeSearch: t.SearchToolConfig['safeSearch'];
+  supportsVideos: boolean;
   searchAPI: ReturnType<typeof createSearchAPI>;
   sourceProcessor: ReturnType<typeof createSourceProcessor>;
   onGetHighlights: t.SearchToolConfig['onGetHighlights'];
@@ -219,7 +221,7 @@ function createSearchProcessor({
         country,
         safeSearch,
         images,
-        videos,
+        videos: supportsVideos && videos,
         news,
         logger,
       });
@@ -357,6 +359,13 @@ export const createSearchTool = (
   } = config;
 
   const logger = config.logger || createDefaultLogger();
+  const effectiveTavilySearchOptions =
+    searchProvider === 'tavily' && config.safeSearch != null
+      ? {
+          safeSearch: config.safeSearch !== 0,
+          ...tavilySearchOptions,
+        }
+      : tavilySearchOptions;
 
   const schemaProperties: Record<string, unknown> = {
     query: querySchema,
@@ -383,7 +392,7 @@ export const createSearchTool = (
     searxngApiKey,
     tavilyApiKey,
     tavilySearchUrl,
-    tavilySearchOptions,
+    tavilySearchOptions: effectiveTavilySearchOptions,
   });
 
   /** Create scraper based on scraperProvider */
@@ -442,6 +451,7 @@ export const createSearchTool = (
   const search = createSearchProcessor({
     searchAPI,
     safeSearch,
+    supportsVideos: searchProvider !== 'tavily',
     sourceProcessor,
     onGetHighlights,
     logger,
