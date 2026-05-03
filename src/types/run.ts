@@ -153,7 +153,9 @@ export type RunConfig = {
    * `true`, tool outputs are registered under stable keys
    * (`tool<idx>turn<turn>`) and subsequent tool calls can pipe previous
    * outputs into their arguments via `{{tool<idx>turn<turn>}}`
-   * placeholders. Disabled by default so existing runs are unaffected.
+   * placeholders. The default reference content is the raw post-hook
+   * output for full-payload parser/piping tools. Disabled by default
+   * so existing runs are unaffected.
    */
   toolOutputReferences?: ToolOutputReferencesConfig;
 };

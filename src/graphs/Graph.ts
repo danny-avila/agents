@@ -172,9 +172,10 @@ export abstract class Graph<
      * ToolNodes compiled from this graph captured the registry
      * instance at construction time, so simply dropping the Graph's
      * own reference would leave their captured reference — and every
-     * stored `tool<i>turn<n>` entry, plus up to `maxTotalSize` of raw
-     * output — alive across subsequent `processStream()` calls. Wipe
-     * the registry's contents first so subsequent runs start fresh.
+     * stored `tool<i>turn<n>` entry, plus up to `maxTotalSize` of
+     * retained output — alive across subsequent `processStream()`
+     * calls. Wipe the registry's contents first so subsequent runs
+     * start fresh.
      */
     this._toolOutputRegistry?.clear();
     this._toolOutputRegistry = undefined;
@@ -582,6 +583,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         directToolNames: directToolNames.size > 0 ? directToolNames : undefined,
         maxContextTokens: agentContext?.maxContextTokens,
         maxToolResultChars: agentContext?.maxToolResultChars,
+        toolOutputReferences: this.toolOutputReferences,
         toolOutputRegistry: this.getOrCreateToolOutputRegistry(),
         errorHandler: (data, metadata) =>
           StandardGraph.handleToolCallErrorStatic(this, data, metadata),
@@ -614,6 +616,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       sessions: this.sessions,
       maxContextTokens: agentContext?.maxContextTokens,
       maxToolResultChars: agentContext?.maxToolResultChars,
+      toolOutputReferences: this.toolOutputReferences,
       toolOutputRegistry: this.getOrCreateToolOutputRegistry(),
     });
   }

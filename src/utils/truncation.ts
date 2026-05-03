@@ -14,11 +14,10 @@ export const HARD_MAX_TOOL_RESULT_CHARS = 400_000;
 
 /**
  * Absolute hard cap on the aggregate size (characters) of all registered
- * tool outputs kept for `{{tool<i>turn<n>}}` substitution. Set at 5 MB
- * because the registry stores *raw, untruncated* tool output — full
- * fidelity for piping into downstream bash/jq — so the budget needs
- * enough headroom to keep a handful of large responses without
- * ballooning unbounded.
+ * tool outputs kept for `{{tool<i>turn<n>}}` substitution. The
+ * registry can store full post-hook outputs for parser/piping use
+ * cases, so this cap prevents a run from retaining unbounded
+ * substitution payloads when hosts raise per-output limits.
  */
 export const HARD_MAX_TOTAL_TOOL_OUTPUT_SIZE = 5_000_000;
 

@@ -12,14 +12,14 @@
  * {@link ToolOutputReferenceRegistry.resolve} walks the args and
  * substitutes the placeholders immediately before invocation.
  *
- * The registry stores the *raw, untruncated* tool output so a later
- * `{{…}}` substitution pipes the full payload into the next tool —
- * even when the LLM only saw a head+tail-truncated preview in
- * `ToolMessage.content`. Outputs are stored without any annotation
- * (the `_ref` key or the `[ref: ...]` prefix seen by the LLM is
- * strictly a UX signal attached to `ToolMessage.content`). Keeping the
- * registry pristine means downstream bash/jq piping receives the
- * complete, verbatim output with no injected fields.
+ * ToolNode stores an un-annotated output snapshot in the registry.
+ * By default that snapshot is the full post-hook raw output (subject
+ * to registry caps) so parser/piping tools can consume complete
+ * payloads even when `ToolMessage.content` is truncated for the LLM.
+ * Hosts can set `RunConfig.toolOutputReferences.referenceContent` to
+ * `'visible'` when substitutions should use the LLM-visible content
+ * instead. The `_ref` key or `[ref: ...]` prefix seen by the LLM is
+ * strictly a UX signal attached to `ToolMessage.content`.
  */
 
 import { ToolMessage } from '@langchain/core/messages';
@@ -165,11 +165,9 @@ export class ToolOutputReferenceRegistry {
     /**
      * Per-output default is the same ~400 KB budget as the standard
      * tool-result truncation (`HARD_MAX_TOOL_RESULT_CHARS`). This
-     * keeps a single `{{…}}` substitution at a size that is safe to
-     * pass through typical shell `ARG_MAX` limits and matches what
-     * the LLM would otherwise have seen. Hosts that want larger per-
-     * output payloads (API consumers, long JSON streams) can raise
-     * the cap explicitly up to the 5 MB total budget.
+     * keeps a single `{{…}}` substitution at a size that is safer for
+     * typical shell `ARG_MAX` limits. Hosts that need larger parser
+     * inputs can raise the cap explicitly up to the 5 MB total budget.
      */
     const perOutput =
       options.maxOutputSize != null && options.maxOutputSize > 0
@@ -183,11 +181,11 @@ export class ToolOutputReferenceRegistry {
      * upper bound on its computed default, but the user-provided
      * branch was bypassing it.
      */
-    const totalRaw =
+    const totalLimit =
       options.maxTotalSize != null && options.maxTotalSize > 0
         ? Math.min(options.maxTotalSize, HARD_MAX_TOTAL_TOOL_OUTPUT_SIZE)
         : calculateMaxTotalToolOutputSize(perOutput);
-    this.maxTotalSize = totalRaw;
+    this.maxTotalSize = totalLimit;
     /**
      * The per-output cap can never exceed the per-run aggregate cap:
      * if a single entry were allowed to be larger than `maxTotalSize`,
@@ -196,7 +194,7 @@ export class ToolOutputReferenceRegistry {
      * `maxTotalSize` into a hard upper bound on *any* state the
      * registry retains per run.
      */
-    this.maxOutputSize = Math.min(perOutput, totalRaw);
+    this.maxOutputSize = Math.min(perOutput, totalLimit);
     this.maxActiveRuns =
       options.maxActiveRuns != null && options.maxActiveRuns > 0
         ? options.maxActiveRuns
