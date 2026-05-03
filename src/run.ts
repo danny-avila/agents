@@ -226,6 +226,117 @@ export class Run<_T extends t.BaseGraphState> {
     };
   }
 
+  /**
+   * Run RunStart + UserPromptSubmit hooks before the graph stream
+   * begins, accumulate any `additionalContext` strings into the input
+   * messages, and short-circuit when a hook signals the run should not
+   * proceed (deny / ask decision on the prompt, or `preventContinuation`
+   * on either hook). Mutates `stateInputs.messages` in place when
+   * appending injected context — safe because the host owns this array
+   * and `processStream` is the only consumer until LangGraph reads it.
+   *
+   * Returns `true` when the caller should bail with `undefined` (run
+   * was halted before any model call); returns `false` to proceed
+   * into the stream loop.
+   */
+  private async runPreStreamHooks(
+    stateInputs: t.IState,
+    threadId: string | undefined,
+    config: Partial<RunnableConfig>
+  ): Promise<boolean> {
+    const registry = this.hookRegistry;
+    if (registry == null || this.Graph == null) {
+      return false;
+    }
+
+    const preStreamContexts: string[] = [];
+
+    const runStartResult = await executeHooks({
+      registry,
+      input: {
+        hook_event_name: 'RunStart',
+        runId: this.id,
+        threadId,
+        agentId: this.Graph.defaultAgentId,
+        messages: stateInputs.messages,
+      },
+      sessionId: this.id,
+    });
+    for (const ctx of runStartResult.additionalContexts) {
+      preStreamContexts.push(ctx);
+    }
+    /**
+     * Honor `preventContinuation` from RunStart before the stream
+     * starts. Mid-flight halts (from tool/compact/subagent hooks)
+     * route through `HookRegistry.haltRun` and are polled by the
+     * stream loop in `processStream` — different mechanism, same
+     * intent.
+     */
+    if (runStartResult.preventContinuation === true) {
+      this._haltedReason = runStartResult.stopReason ?? 'preventContinuation';
+      registry.clearSession(this.id);
+      registry.clearHaltSignal();
+      config.callbacks = undefined;
+      return true;
+    }
+
+    const lastHuman = findLastMessageOfType(stateInputs.messages, 'human');
+    if (lastHuman != null) {
+      const promptResult = await executeHooks({
+        registry,
+        input: {
+          hook_event_name: 'UserPromptSubmit',
+          runId: this.id,
+          threadId,
+          agentId: this.Graph.defaultAgentId,
+          prompt: extractPromptText(lastHuman),
+          // attachments: not yet wired — Phase 2 will extract
+          // non-text content blocks (images, files) from messages
+        },
+        sessionId: this.id,
+      });
+      if (
+        promptResult.decision === 'deny' ||
+        promptResult.decision === 'ask' ||
+        promptResult.preventContinuation === true
+      ) {
+        if (promptResult.preventContinuation === true) {
+          this._haltedReason = promptResult.stopReason ?? 'preventContinuation';
+        }
+        registry.clearSession(this.id);
+        registry.clearHaltSignal();
+        config.callbacks = undefined;
+        return true;
+      }
+      for (const ctx of promptResult.additionalContexts) {
+        preStreamContexts.push(ctx);
+      }
+    }
+
+    if (preStreamContexts.length > 0) {
+      /**
+       * Wraps the joined hook contexts as a `HumanMessage` even though
+       * the intent is system-level guidance. Using a `SystemMessage`
+       * mid-conversation is rejected by Anthropic and Google providers
+       * (system messages must be the leading entry), so the LangChain
+       * convention — also used by `ToolNode.convertInjectedMessages`
+       * — is `HumanMessage` carrying `additional_kwargs.role` as a
+       * marker for hosts inspecting state. The model still sees a
+       * user-role message; the `role: 'system'` field is metadata
+       * only. Hosts that want a true system message should compose
+       * it into the agent's `instructions` config instead.
+       */
+      stateInputs.messages.push(
+        new HumanMessage({
+          content: preStreamContexts.join('\n\n'),
+          additional_kwargs: { role: 'system', source: 'hook' },
+        })
+      );
+    }
+
+    return false;
+  }
+
   static async create<T extends t.BaseGraphState>(
     config: t.RunConfig
   ): Promise<Run<T>> {
@@ -405,88 +516,13 @@ export class Run<_T extends t.BaseGraphState> {
     const threadId = config.configurable.thread_id as string | undefined;
 
     if (this.hookRegistry != null && stateInputs != null) {
-      /**
-       * Pre-stream lifecycle hooks may return `additionalContext` strings
-       * meant for the model. We collect them across RunStart and
-       * UserPromptSubmit, then mutate the input messages array to
-       * append a single consolidated `HumanMessage` so the very first
-       * model turn sees them. Mutating is safe: the host owns this
-       * array and `processStream` is the single consumer of it on the
-       * way into LangGraph.
-       */
-      const preStreamContexts: string[] = [];
-
-      const runStartResult = await executeHooks({
-        registry: this.hookRegistry,
-        input: {
-          hook_event_name: 'RunStart',
-          runId: this.id,
-          threadId,
-          agentId: this.Graph.defaultAgentId,
-          messages: stateInputs.messages,
-        },
-        sessionId: this.id,
-      });
-      for (const ctx of runStartResult.additionalContexts) {
-        preStreamContexts.push(ctx);
-      }
-      /**
-       * Honor `preventContinuation` from RunStart before the stream
-       * starts. Mirrors the existing UserPromptSubmit deny/ask early
-       * return — same intent (host wants the run to stop before any
-       * model call), different signal. We do NOT honor mid-flight
-       * `preventContinuation` from tool/compact hooks today; that would
-       * need a state-channel stop signal and is a follow-up scope.
-       */
-      if (runStartResult.preventContinuation === true) {
-        this._haltedReason = runStartResult.stopReason ?? 'preventContinuation';
-        this.hookRegistry.clearSession(this.id);
-        this.hookRegistry.clearHaltSignal();
-        config.callbacks = undefined;
+      const shouldHalt = await this.runPreStreamHooks(
+        stateInputs,
+        threadId,
+        config
+      );
+      if (shouldHalt) {
         return undefined;
-      }
-
-      const lastHuman = findLastMessageOfType(stateInputs.messages, 'human');
-      if (lastHuman != null) {
-        const promptResult = await executeHooks({
-          registry: this.hookRegistry,
-          input: {
-            hook_event_name: 'UserPromptSubmit',
-            runId: this.id,
-            threadId,
-            agentId: this.Graph.defaultAgentId,
-            prompt: extractPromptText(lastHuman),
-            // attachments: not yet wired — Phase 2 will extract
-            // non-text content blocks (images, files) from messages
-          },
-          sessionId: this.id,
-        });
-        if (
-          promptResult.decision === 'deny' ||
-          promptResult.decision === 'ask' ||
-          promptResult.preventContinuation === true
-        ) {
-          if (promptResult.preventContinuation === true) {
-            this._haltedReason =
-              promptResult.stopReason ?? 'preventContinuation';
-          }
-          this.hookRegistry.clearSession(this.id);
-          this.hookRegistry.clearHaltSignal();
-          config.callbacks = undefined;
-          return undefined;
-        }
-        for (const ctx of promptResult.additionalContexts) {
-          preStreamContexts.push(ctx);
-        }
-      }
-
-      if (preStreamContexts.length > 0) {
-        stateInputs.messages.push(
-          new HumanMessage({
-            content: preStreamContexts.join('\n\n'),
-            additional_kwargs: { role: 'system', source: 'hook' },
-          })
-        );
       }
     }
 
@@ -621,7 +657,19 @@ export class Run<_T extends t.BaseGraphState> {
       }
       throw err;
     } finally {
-      this.hookRegistry?.clearSession(this.id);
+      /**
+       * Preserve session-scoped hooks when the run paused on a HITL
+       * interrupt — the very next call will be `Run.resume()`, which
+       * needs the same policy hooks (e.g., the `PreToolUse` matcher
+       * that triggered the interrupt) to fire on the re-executed node
+       * and uphold the approval flow. Clearing here would leak the
+       * approval gate on resume. The session is cleared instead at
+       * natural completion, error, or hook-driven halt — every state
+       * where no resume is expected.
+       */
+      if (this._interrupt == null) {
+        this.hookRegistry?.clearSession(this.id);
+      }
       /**
        * Drop any halt signal raised mid-stream so a subsequent
        * `processStream` / `resume` on this registry starts with clean

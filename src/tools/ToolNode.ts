@@ -997,6 +997,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           toolInput: entry.args,
           toolUseId: entry.call.id!,
           stepId: entry.stepId,
+          /**
+           * Mirrors the `turn` value the executed-path push records, so
+           * batch hooks see uniform entry shapes regardless of whether
+           * the tool was blocked or executed. Read pre-increment, just
+           * like the executed path captures it before the usage counter
+           * advances.
+           */
+          turn: this.toolUsageCount.get(entry.call.name) ?? 0,
           status: 'error',
           error: contentString,
         });
@@ -1205,6 +1213,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               toolInput: entry.args,
               toolUseId: entry.call.id!,
               stepId: entry.stepId,
+              turn: this.toolUsageCount.get(entry.call.name) ?? 0,
               status: 'success',
               toolOutput: decision.responseText,
             });
@@ -1556,6 +1565,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     }
 
     if (batchAdditionalContexts.length > 0) {
+      /**
+       * `HumanMessage` carrying a metadata `role: 'system'` marker —
+       * see `convertInjectedMessages` for the wider rationale. Anthropic
+       * and Google reject mid-conversation `SystemMessage`s, so we use
+       * a user-role message and surface the system intent through
+       * `additional_kwargs` for hosts inspecting state. The model sees
+       * a user message; `role` is metadata only.
+       */
       injected.push(
         new HumanMessage({
           content: batchAdditionalContexts.join('\n\n'),

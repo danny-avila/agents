@@ -14,6 +14,20 @@ import type { HookEvent, HookMatcher } from './types';
 type MatcherBucket = Partial<Record<HookEvent, HookMatcher<HookEvent>[]>>;
 
 /**
+ * Snapshot of a halt request raised by a hook returning
+ * `preventContinuation: true`. The SDK's run loop polls for this between
+ * stream events and exits cleanly when set, skipping the `Stop` hook
+ * (the run is being halted, not naturally completing). One per registry
+ * instance — the first hook to halt wins; subsequent halts are ignored
+ * so the original reason isn't clobbered.
+ */
+export interface HookHaltSignal {
+  reason: string;
+  /** Event of the hook that triggered the halt (for diagnostics). */
+  source: HookEvent;
+}
+
+/**
  * Run-scoped storage for hook matchers with an additional layer for
  * session-scoped matchers that should be cleaned up between sessions.
  *
@@ -31,20 +45,6 @@ type MatcherBucket = Partial<Record<HookEvent, HookMatcher<HookEvent>[]>>;
  * Map mutates in place, keeping insertions O(1). This mirrors the reasoning
  * Claude Code documents at `utils/hooks/sessionHooks.ts:62`.
  */
-/**
- * Snapshot of a halt request raised by a hook returning
- * `preventContinuation: true`. The SDK's run loop polls for this between
- * stream events and exits cleanly when set, skipping the `Stop` hook
- * (the run is being halted, not naturally completing). One per registry
- * instance — the first hook to halt wins; subsequent halts are ignored
- * so the original reason isn't clobbered.
- */
-export interface HookHaltSignal {
-  reason: string;
-  /** Event of the hook that triggered the halt (for diagnostics). */
-  source: HookEvent;
-}
-
 export class HookRegistry {
   private readonly global: MatcherBucket = {};
   private readonly sessions: Map<string, MatcherBucket> = new Map();

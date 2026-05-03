@@ -1285,6 +1285,236 @@ describe('Codex review fixes', () => {
     jest.restoreAllMocks();
   });
 
+  it('preserves session-scoped hooks across HITL interrupt so the policy still fires on resume', async () => {
+    let dispatchCalls = 0;
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data) => {
+        if (event !== 'on_tool_execute') {
+          return;
+        }
+        dispatchCalls += 1;
+        const request = data as {
+          toolCalls: t.ToolCallRequest[];
+          resolve: (r: t.ToolExecuteResult[]) => void;
+        };
+        request.resolve(
+          request.toolCalls.map((c) => ({
+            toolCallId: c.id,
+            content: 'host-result',
+            status: 'success' as const,
+          }))
+        );
+      });
+
+    const registry = new HookRegistry();
+    let preCallCount = 0;
+    /**
+     * Register the policy hook against the runId via `registerSession`
+     * (mirrors how a host scopes per-run policy without leaking it to
+     * concurrent runs). The fix under test: this matcher MUST still be
+     * present when `Run.resume()` re-runs the node so the policy
+     * decision applies the second time too.
+     */
+    const runId = 'session-hook-preserve';
+    registry.registerSession(runId, 'PreToolUse', {
+      hooks: [
+        async (): Promise<PreToolUseHookOutput> => {
+          preCallCount += 1;
+          return { decision: 'ask', reason: 'session policy' };
+        },
+      ],
+    });
+
+    const node = new ToolNode({
+      tools: [createSchemaStub('echo')],
+      eventDrivenMode: true,
+      agentId: 'agent-x',
+      toolCallStepIds: new Map([['call_1', 'step_call_1']]),
+      hookRegistry: registry,
+      humanInTheLoop: { enabled: true },
+    });
+
+    const builder = new StateGraph(MessagesAnnotation)
+      .addNode(
+        'agent',
+        (): MessagesUpdate => ({
+          messages: [
+            new AIMessage({
+              content: '',
+              tool_calls: [
+                { id: 'call_1', name: 'echo', args: { command: 'x' } },
+              ],
+            }),
+          ],
+        })
+      )
+      .addNode('tools', node)
+      .addEdge(START, 'agent')
+      .addEdge('agent', 'tools')
+      .addEdge('tools', END);
+    const graph = builder.compile({ checkpointer: new MemorySaver() });
+
+    const { Run } = await import('@/run');
+    const run = await Run.create<t.IState>({
+      runId,
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'a',
+            provider: providers.OPENAI,
+            clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+          },
+        ],
+      },
+      hooks: registry,
+      humanInTheLoop: { enabled: true },
+    });
+    run.graphRunnable = graph as unknown as t.CompiledStateWorkflow;
+
+    const callerConfig = {
+      configurable: { thread_id: 'session-thread-1' },
+      version: 'v2' as const,
+    };
+
+    await run.processStream({ messages: [] }, callerConfig);
+
+    /** Interrupt fired; one hook invocation so far. Session matcher
+     * MUST still be present — the regression was that finally cleared
+     * it, leaving the resume to bypass the policy entirely. */
+    expect(run.getInterrupt()).toBeDefined();
+    expect(preCallCount).toBe(1);
+    expect(registry.hasHookFor('PreToolUse', runId)).toBe(true);
+    expect(dispatchCalls).toBe(0);
+
+    await run.resume([{ type: 'approve' }], callerConfig);
+
+    /** Hook fired AGAIN on resume — policy was actually applied a
+     * second time, not skipped. Tool then executed. */
+    expect(preCallCount).toBe(2);
+    expect(dispatchCalls).toBe(1);
+    /** After natural completion, session matchers ARE cleared so the
+     * next run on this registry starts clean. */
+    expect(registry.hasHookFor('PreToolUse', runId)).toBe(false);
+  });
+
+  it('mixed deny/ask/allow batch: deny short-circuits, allow runs immediately, ask interrupts; resume completes the asked tool', async () => {
+    const dispatchedToolNames: string[] = [];
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data) => {
+        if (event !== 'on_tool_execute') {
+          return;
+        }
+        const request = data as {
+          toolCalls: t.ToolCallRequest[];
+          resolve: (r: t.ToolExecuteResult[]) => void;
+        };
+        for (const c of request.toolCalls) {
+          dispatchedToolNames.push(c.name);
+        }
+        request.resolve(
+          request.toolCalls.map((c) => ({
+            toolCallId: c.id,
+            content: `ran:${c.name}`,
+            status: 'success' as const,
+          }))
+        );
+      });
+
+    /**
+     * Per-tool policy hook: tool_a denied, tool_b asks, tool_c allowed.
+     * The hook is registered without a pattern so it fires once per
+     * tool call and dispatches by tool name.
+     */
+    const registry = new HookRegistry();
+    registry.register('PreToolUse', {
+      hooks: [
+        async (input): Promise<PreToolUseHookOutput> => {
+          if (input.toolName === 'tool_a') {
+            return { decision: 'deny', reason: 'policy:a' };
+          }
+          if (input.toolName === 'tool_b') {
+            return { decision: 'ask', reason: 'policy:b-needs-review' };
+          }
+          return { decision: 'allow' };
+        },
+      ],
+    });
+
+    const node = new ToolNode({
+      tools: [
+        createSchemaStub('tool_a'),
+        createSchemaStub('tool_b'),
+        createSchemaStub('tool_c'),
+      ],
+      eventDrivenMode: true,
+      agentId: 'agent-x',
+      toolCallStepIds: new Map([
+        ['call_a', 'step_a'],
+        ['call_b', 'step_b'],
+        ['call_c', 'step_c'],
+      ]),
+      hookRegistry: registry,
+      humanInTheLoop: { enabled: true },
+    });
+
+    const graph = buildHITLGraph(node, [
+      { id: 'call_a', name: 'tool_a', args: { command: 'a' } },
+      { id: 'call_b', name: 'tool_b', args: { command: 'b' } },
+      { id: 'call_c', name: 'tool_c', args: { command: 'c' } },
+    ]);
+    const config = { configurable: { thread_id: 'mixed-thread' } };
+
+    const interrupted = await graph.invoke({ messages: [] }, config);
+    if (!isInterrupted<t.HumanInterruptPayload>(interrupted)) {
+      throw new Error('expected interrupt');
+    }
+    const payload = interrupted.__interrupt__[0].value!;
+    if (payload.type !== 'tool_approval') {
+      throw new Error('expected tool_approval payload');
+    }
+    /** Only tool_b appears in the interrupt — deny short-circuited
+     * locally, allow was queued for dispatch but never reached it
+     * because `interrupt()` threw inside the same node first. LangGraph
+     * rolls back the entire node's effects on throw, so no host event
+     * fires for any tool until after resume. This is the safe
+     * semantic: partial execution while a human is being asked would
+     * leak side effects ahead of approval. */
+    expect(payload.action_requests).toHaveLength(1);
+    expect(payload.action_requests[0].tool_call_id).toBe('call_b');
+    expect(dispatchedToolNames).toEqual([]);
+
+    const resumed = (await graph.invoke(
+      new Command({ resume: [{ type: 'approve' }] }),
+      config
+    )) as { messages: BaseMessage[] };
+
+    /**
+     * After resume, all three tools have ToolMessages: tool_a blocked
+     * (deny), tool_b ran (host approved), tool_c ran (allow). The
+     * ToolNode re-executed from scratch, so both tool_b and tool_c
+     * dispatch in this pass.
+     */
+    const toolMessages = resumed.messages.filter(
+      (m): m is ToolMessage => m._getType() === 'tool'
+    );
+    expect(toolMessages).toHaveLength(3);
+    const byId = new Map(toolMessages.map((m) => [m.tool_call_id, m]));
+    expect(byId.get('call_a')!.status).toBe('error');
+    expect(String(byId.get('call_a')!.content)).toContain('policy:a');
+    expect(byId.get('call_b')!.status).not.toBe('error');
+    expect(byId.get('call_b')!.content).toBe('ran:tool_b');
+    expect(byId.get('call_c')!.status).not.toBe('error');
+    expect(byId.get('call_c')!.content).toBe('ran:tool_c');
+    /** Both approved tools dispatched on resume; tool_a (deny) never did. */
+    expect(new Set(dispatchedToolNames)).toEqual(new Set(['tool_b', 'tool_c']));
+    expect(dispatchedToolNames).not.toContain('tool_a');
+  });
+
   it('fails closed when the host resume payload carries an unknown decision type', async () => {
     /** Spy MUST be reachable inside Promise.resolve handlers — must not run after mock is restored. */
     let dispatchCalls = 0;

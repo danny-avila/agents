@@ -61,6 +61,13 @@ export interface ToolApprovalReviewConfig {
  *     bypassing tool execution. Useful when the user wants to short-circuit
  *     a tool call with a hand-written answer (e.g., "don't actually run
  *     the search, just tell the model 'no relevant results'").
+ *
+ * Note on hook semantics: `respond` does NOT fire the per-tool
+ * `PostToolUse` hook (no real tool execution happened, so the
+ * "post-tool" semantic doesn't apply). It DOES appear in the
+ * `PostToolBatch` entry array with `status: 'success'` and the
+ * user-supplied text as `toolOutput`, so batch-level audit /
+ * convention hooks see the full set of outcomes.
  */
 export type ToolApprovalDecision =
   | { type: 'approve' }
