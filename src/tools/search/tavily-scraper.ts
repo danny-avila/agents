@@ -76,20 +76,23 @@ export class TavilyScraper implements t.BaseScraper {
     options: t.TavilyScrapeOptions = {}
   ): Promise<Array<[string, t.TavilyScrapeResponse]>> {
     try {
+      const includeFavicon = options.includeFavicon ?? this.includeFavicon;
+      const chunksPerSource = options.chunksPerSource ?? this.chunksPerSource;
+      const format = options.format ?? this.format;
       const payload: Record<string, unknown> = {
         urls,
         extract_depth: options.extractDepth ?? this.extractDepth,
         include_images: options.includeImages ?? this.includeImages,
       };
 
-      if (this.includeFavicon) {
+      if (includeFavicon) {
         payload.include_favicon = true;
       }
-      if (this.chunksPerSource != null) {
-        payload.chunks_per_source = this.chunksPerSource;
+      if (chunksPerSource != null) {
+        payload.chunks_per_source = chunksPerSource;
       }
-      if (this.format != null) {
-        payload.format = this.format;
+      if (format != null) {
+        payload.format = format;
       }
 
       const effectiveTimeout = options.timeout ?? this.timeout;
@@ -124,6 +127,7 @@ export class TavilyScraper implements t.BaseScraper {
               data: {
                 rawContent: success.raw_content ?? '',
                 images: success.images ?? [],
+                favicon: success.favicon,
               },
             },
           ];
@@ -162,10 +166,10 @@ export class TavilyScraper implements t.BaseScraper {
     const references: t.References | undefined =
       images.length > 0
         ? {
-          links: [],
-          images: images.map((imageUrl) => ({ originalUrl: imageUrl })),
-          videos: [],
-        }
+            links: [],
+            images: images.map((imageUrl) => ({ originalUrl: imageUrl })),
+            videos: [],
+          }
         : undefined;
 
     return [content, references];
@@ -178,9 +182,16 @@ export class TavilyScraper implements t.BaseScraper {
       return {};
     }
 
-    return {
+    const metadata: Record<
+      string,
+      string | number | boolean | null | undefined
+    > = {
       images_count: response.data.images?.length ?? 0,
     };
+    if (response.data.favicon != null) {
+      metadata.favicon = response.data.favicon;
+    }
+    return metadata;
   }
 }
 

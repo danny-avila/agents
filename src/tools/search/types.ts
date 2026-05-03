@@ -66,8 +66,8 @@ export interface TavilySearchOptions {
   searchDepth?: 'basic' | 'advanced' | 'fast' | 'ultra-fast';
   maxResults?: number;
   includeImages?: boolean;
-  includeAnswer?: boolean;
-  includeRawContent?: boolean;
+  includeAnswer?: boolean | 'basic' | 'advanced';
+  includeRawContent?: boolean | 'markdown' | 'text';
   includeDomains?: string[];
   excludeDomains?: string[];
   topic?: 'general' | 'news' | 'finance';
@@ -359,10 +359,24 @@ export interface TavilySearchResult {
   published_date?: string;
 }
 
+export type TavilyImageResult =
+  | string
+  | {
+      url?: string;
+      description?: string;
+    };
+
+export interface TavilySearchResponse {
+  answer?: string;
+  images?: TavilyImageResult[];
+  results?: TavilySearchResult[];
+}
+
 export interface TavilyExtractResult {
   url: string;
   raw_content?: string;
   images?: string[];
+  favicon?: string;
   error?: string;
 }
 

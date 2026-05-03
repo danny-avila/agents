@@ -508,13 +508,17 @@ const createTavilyAPI = (
         payload.chunks_per_source = options.chunksPerSource;
       }
 
-      const response = await axios.post(config.apiUrl, payload, {
-        headers: {
-          Authorization: `Bearer ${config.apiKey}`,
-          'Content-Type': 'application/json',
-        },
-        timeout: config.timeout,
-      });
+      const response = await axios.post<t.TavilySearchResponse>(
+        config.apiUrl,
+        payload,
+        {
+          headers: {
+            Authorization: `Bearer ${config.apiKey}`,
+            'Content-Type': 'application/json',
+          },
+          timeout: config.timeout,
+        }
+      );
 
       const data = response.data;
 
@@ -528,21 +532,32 @@ const createTavilyAPI = (
       );
 
       const imageResults: t.ImageResult[] = Array.isArray(data.images)
-        ? data.images.slice(0, 6).map((image: string, index: number) => ({
-          imageUrl: image,
-          position: index + 1,
-        }))
+        ? data.images
+            .slice(0, 6)
+            .reduce<t.ImageResult[]>((acc, image, index) => {
+              const imageUrl = typeof image === 'string' ? image : image.url;
+              if (imageUrl == null || imageUrl === '') {
+                return acc;
+              }
+              acc.push({
+                imageUrl,
+                title:
+                  typeof image === 'string' ? undefined : image.description,
+                position: index + 1,
+              });
+              return acc;
+            }, [])
         : [];
 
       const newsResults: t.NewsResult[] =
         topic === 'news'
           ? organicResults.map((r) => ({
-            title: r.title,
-            link: r.link,
-            snippet: r.snippet,
-            date: r.date,
-            source: getHostname(r.link),
-          }))
+              title: r.title,
+              link: r.link,
+              snippet: r.snippet,
+              date: r.date,
+              source: getHostname(r.link),
+            }))
           : [];
 
       const results: t.SearchResultData = {
@@ -551,6 +566,7 @@ const createTavilyAPI = (
         topStories: [],
         videos: [],
         news: newsResults,
+        answerBox: data.answer != null ? { snippet: data.answer } : undefined,
         relatedSearches: [],
       };
 
