@@ -1763,6 +1763,126 @@ describe('Codex review fixes', () => {
     expect(byCallId.get('call_c')!.toolOutput).toBe('ran:tool_c');
   });
 
+  it('mixed respond + reject in the same resume: dispatches once each, batch entries in toolCalls order', async () => {
+    const stepCompletedDispatches: string[] = [];
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data) => {
+        if (event === GraphEvents.ON_RUN_STEP_COMPLETED) {
+          const payload = data as {
+            result?: { tool_call?: { id?: string } };
+          };
+          const id = payload.result?.tool_call?.id;
+          if (id != null) {
+            stepCompletedDispatches.push(id);
+          }
+          return;
+        }
+        if (event !== 'on_tool_execute') {
+          return;
+        }
+        const request = data as {
+          toolCalls: t.ToolCallRequest[];
+          resolve: (r: t.ToolExecuteResult[]) => void;
+        };
+        request.resolve([]);
+      });
+
+    const registry = new HookRegistry();
+    /** Both tools `ask`; the resume picks `respond` for one and
+     * `reject` for the other. Exercises the timing interaction
+     * between respond's immediate dispatch and reject's deferred
+     * flush in the same resume pass. */
+    registry.register('PreToolUse', {
+      hooks: [
+        async (): Promise<PreToolUseHookOutput> => ({
+          decision: 'ask',
+          reason: 'review',
+        }),
+      ],
+    });
+    const batchSnapshots: PostToolBatchEntry[][] = [];
+    registry.register('PostToolBatch', {
+      hooks: [
+        async (input): Promise<PostToolBatchHookOutput> => {
+          batchSnapshots.push(
+            (input as PostToolBatchHookInput).entries.map((e) => ({ ...e }))
+          );
+          return {};
+        },
+      ],
+    });
+
+    const node = new ToolNode({
+      tools: [
+        createSchemaStub('respond_tool'),
+        createSchemaStub('reject_tool'),
+      ],
+      eventDrivenMode: true,
+      agentId: 'agent-x',
+      toolCallStepIds: new Map([
+        ['call_respond', 'step_respond'],
+        ['call_reject', 'step_reject'],
+      ]),
+      hookRegistry: registry,
+      humanInTheLoop: { enabled: true },
+    });
+
+    const graph = buildHITLGraph(node, [
+      { id: 'call_respond', name: 'respond_tool', args: { command: 'r' } },
+      { id: 'call_reject', name: 'reject_tool', args: { command: 'j' } },
+    ]);
+    const config = { configurable: { thread_id: 'mixed-respond-reject' } };
+
+    await graph.invoke({ messages: [] }, config);
+    /** First pass: interrupt fires before either dispatch path runs. */
+    expect(stepCompletedDispatches).toEqual([]);
+
+    const resumed = (await graph.invoke(
+      new Command({
+        resume: [
+          { type: 'respond', responseText: 'fake answer' },
+          { type: 'reject', reason: 'no thanks' },
+        ],
+      }),
+      config
+    )) as { messages: BaseMessage[] };
+
+    /** Each tool dispatched ON_RUN_STEP_COMPLETED exactly once on
+     * resume — respond via its immediate path, reject via the
+     * deferred flush. */
+    expect(
+      stepCompletedDispatches.filter((id) => id === 'call_respond')
+    ).toEqual(['call_respond']);
+    expect(
+      stepCompletedDispatches.filter((id) => id === 'call_reject')
+    ).toEqual(['call_reject']);
+
+    /** PostToolBatch fires once on the resume pass, with entries in
+     * the original toolCalls order (respond first, reject second)
+     * regardless of which dispatch path landed first into the Map. */
+    expect(batchSnapshots).toHaveLength(1);
+    expect(batchSnapshots[0].map((e) => e.toolUseId)).toEqual([
+      'call_respond',
+      'call_reject',
+    ]);
+    expect(batchSnapshots[0][0].status).toBe('success');
+    expect(batchSnapshots[0][0].toolOutput).toBe('fake answer');
+    expect(batchSnapshots[0][1].status).toBe('error');
+    expect(String(batchSnapshots[0][1].error)).toContain('no thanks');
+
+    /** ToolMessage state matches: success with response text, error with reason. */
+    const toolMessages = resumed.messages.filter(
+      (m): m is ToolMessage => m._getType() === 'tool'
+    );
+    expect(toolMessages).toHaveLength(2);
+    const byId = new Map(toolMessages.map((m) => [m.tool_call_id, m]));
+    expect(byId.get('call_respond')!.status).not.toBe('error');
+    expect(byId.get('call_respond')!.content).toBe('fake answer');
+    expect(byId.get('call_reject')!.status).toBe('error');
+    expect(String(byId.get('call_reject')!.content)).toContain('no thanks');
+  });
+
   it('PostToolBatch entries preserve toolCalls order even when first call is denied and second is approved', async () => {
     jest
       .spyOn(events, 'safeDispatchCustomEvent')

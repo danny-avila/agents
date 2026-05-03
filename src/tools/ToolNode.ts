@@ -1260,6 +1260,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               status: 'success',
               toolOutput: decision.responseText,
             });
+            /**
+             * Safe to dispatch immediately — unlike `blockEntry` which
+             * defers, `respond` only executes inside the decision-
+             * processing loop, which is reachable only AFTER
+             * `interrupt()` has returned (the resume pass). There is
+             * no risk of being rolled back by a subsequent throw, so
+             * no risk of a duplicate `ON_RUN_STEP_COMPLETED` event.
+             */
             this.dispatchStepCompleted(
               entry.call.id!,
               entry.call.name,
