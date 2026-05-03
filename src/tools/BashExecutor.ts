@@ -70,9 +70,10 @@ Usage:
 export const BashToolOutputReferencesGuide = `
 Referencing previous tool outputs:
 - Every successful tool result is tagged with a reference key of the form \`tool<idx>turn<turn>\` (e.g., \`tool0turn0\`). The key appears either as a \`[ref: tool0turn0]\` prefix line or, when the output is a JSON object, as a \`_ref\` field on the object.
-- To pipe a previous tool output into this tool, embed the placeholder \`{{tool<idx>turn<turn>}}\` literally anywhere in the \`command\` string (or any string arg). It will be substituted with the stored output verbatim before the command runs.
-- The substituted value is the original output string (no \`[ref: …]\` prefix, no \`_ref\` key), so it is safe to pipe directly into \`jq\`, \`grep\`, \`awk\`, etc.
-- Example (simple ASCII output): \`echo '{{tool0turn0}}' | jq '.foo'\` takes the full output of the first tool from the first turn and pipes it into jq.
+- To pipe a previous tool output into this tool, embed the placeholder \`{{tool<idx>turn<turn>}}\` literally anywhere in the \`command\` string (or any string arg). It will be substituted with the stored output before the command runs.
+- By default, the substituted value is the full post-hook output string (subject to registry size caps), even when the LLM-visible tool result was truncated. It excludes the \`[ref: …]\` prefix and \`_ref\` key so it can be piped directly into \`jq\`, \`grep\`, \`awk\`, etc.
+- If the host configured \`toolOutputReferences.referenceContent = "visible"\`, substitutions use the LLM-visible truncated content instead.
+- Example (simple ASCII output): \`echo '{{tool0turn0}}' | jq '.foo'\` takes the stored output of the first tool from the first turn and pipes it into jq.
 - For payloads that may contain quotes, parentheses, backticks, or arbitrary bytes (random/binary data, JSON with embedded quotes, multi-line strings), prefer a quoted-delimiter heredoc over \`echo '…'\`. The heredoc body is not interpreted by the shell, so substituted payloads pass through unchanged.
 - Heredoc example: \`wc -c << 'EOF'\\n{{tool0turn0}}\\nEOF\` (the quotes around \`'EOF'\` disable interpolation inside the body).
 - Unknown reference keys are left in place and surfaced as \`[unresolved refs: …]\` after the output.

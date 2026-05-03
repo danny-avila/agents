@@ -14,7 +14,7 @@ export type AnthropicMessage = Anthropic.MessageParam;
  * the metadata never leaks even if you forget to clean it.
  */
 export interface ToolMessageRefMetadata {
-  /** Key under which this message's untruncated output was registered. */
+  /** Key under which this message's selected output snapshot was registered. */
   _refKey?: string;
   /**
    * Registry bucket scope under which `_refKey` was stored. For named

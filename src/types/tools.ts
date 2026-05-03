@@ -260,6 +260,8 @@ export type ToolExecuteResult = {
 /** Map of tool names to tool definitions */
 export type LCToolRegistry = Map<string, LCTool>;
 
+export type ToolOutputReferenceContent = 'raw' | 'visible';
+
 /**
  * Run-scoped configuration for tool output references.
  *
@@ -270,11 +272,14 @@ export type LCToolRegistry = Map<string, LCTool>;
  * substitutes it with the stored output immediately before invoking
  * the tool.
  *
- * The registry stores the *raw, untruncated* tool output (subject to
- * its own size caps) so a later substitution can pipe the full payload
- * into the next tool even when the LLM only saw a head+tail-truncated
- * preview in `ToolMessage.content`. Size limits are decoupled from the
- * LLM-visible truncation budget and default to 5 MB total.
+ * By default, the registry stores the full post-hook output, subject
+ * to registry size caps but independent of `ToolMessage.content`
+ * truncation. This is the core parser/piping use case: downstream
+ * tools can consume complete JSON, CSV, logs, or command output even
+ * when the model only saw a truncated preview. Set
+ * `referenceContent: 'visible'` when a deployment wants substitutions
+ * to stay within the same data boundary as the LLM-visible tool
+ * message.
  *
  * Known limitations:
  *  - Tools that return a `ToolMessage` with array-type content
@@ -282,25 +287,35 @@ export type LCToolRegistry = Map<string, LCTool>;
  *    registered and cannot be cited via `{{tool<i>turn<n>}}`. A
  *    warning is logged so the missing reference is visible.
  *  - When a `PostToolUse` hook replaces `ToolMessage.content`, the
- *    *post-hook* content is what gets stored in the registry (and
- *    what the model sees), so `{{…}}` substitutions deliver the
- *    hooked output rather than the raw tool return. This matches the
- *    hook's "authoritative" role for output shaping.
+ *    *post-hook* content becomes the source for both the registry
+ *    snapshot and the model-visible message, so `{{…}}`
+ *    substitutions deliver the hooked output rather than the raw tool
+ *    return. In raw mode the full replacement is stored; in visible
+ *    mode the truncated visible replacement is stored.
  */
 export type ToolOutputReferencesConfig = {
   /** Enable the registry and placeholder substitution. Defaults to `false`. */
   enabled?: boolean;
   /**
+   * Which successful output snapshot is stored for later
+   * substitutions. Defaults to `'raw'` to preserve the feature's
+   * full-output parser/piping behavior.
+   *
+   * - `'raw'`: stores the full post-hook output, subject only to
+   *   registry size caps. Later `{{…}}` substitutions may include data
+   *   not present in truncated `ToolMessage.content`.
+   * - `'visible'`: stores the LLM-visible `ToolMessage.content` after
+   *   truncation, plus any additional registry clipping.
+   */
+  referenceContent?: ToolOutputReferenceContent;
+  /**
    * Maximum characters stored (and substituted) per registered output.
-   * Applied to the *raw* output before storage. Defaults to
-   * `HARD_MAX_TOOL_RESULT_CHARS` (~400 KB) — matching the
-   * LLM-visible tool-result truncation budget, which is also a safe
-   * payload size for shell `ARG_MAX` limits when a `{{…}}` expansion
-   * gets piped into a bash `command`. Hosts that want to preserve
-   * fuller fidelity (for example for non-bash API consumers) can
-   * raise this up to `maxTotalSize` (defaults to 5 MB) — be aware
-   * that large single-output substitutions may exceed shell
-   * argument-size limits on typical Linux/macOS.
+   * Applied to whichever snapshot `referenceContent` selects. Defaults
+   * to `HARD_MAX_TOOL_RESULT_CHARS` (~400 KB), keeping `{{…}}`
+   * expansion at a size that is safer for shell `ARG_MAX` limits.
+   * Hosts that need larger parser inputs can raise this up to
+   * `maxTotalSize`; be aware that large single-output substitutions
+   * may exceed shell argument-size limits on typical Linux/macOS.
    */
   maxOutputSize?: number;
   /**

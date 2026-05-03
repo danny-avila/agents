@@ -275,7 +275,7 @@ describe('ToolNode tool output references', () => {
       expect(getUnresolvedRefs(msg)).toEqual(['tool9turn9']);
     });
 
-    it('stores the raw untruncated output in the registry, independent of the LLM-visible truncation', async () => {
+    it('stores the raw untruncated output in the registry by default for downstream substitution', async () => {
       const raw = 'X'.repeat(8_000);
       const capturedArgs: string[] = [];
       const t1 = createEchoTool({
@@ -309,6 +309,45 @@ describe('ToolNode tool output references', () => {
           ._unsafeGetToolOutputRegistry()!
           .get('raw-preservation', 'tool0turn0')
       ).toBe(raw);
+    });
+
+    it('can store truncated LLM-visible output when referenceContent is visible', async () => {
+      const raw = 'X'.repeat(8_000);
+      const capturedArgs: string[] = [];
+      const t1 = createEchoTool({
+        capturedArgs,
+        outputs: [raw, 'second'],
+      });
+      const node = new ToolNode({
+        tools: [t1],
+        maxToolResultChars: 200,
+        toolOutputReferences: {
+          enabled: true,
+          referenceContent: 'visible',
+        },
+      });
+
+      const [first] = await invokeBatch(
+        node,
+        [{ id: 'c1', name: 'echo', command: 'first' }],
+        'visible-preservation'
+      );
+
+      expect((first.content as string).length).toBeLessThan(raw.length);
+      expect(first.content).toContain('truncated');
+
+      await invokeBatch(
+        node,
+        [{ id: 'c2', name: 'echo', command: 'echo {{tool0turn0}}' }],
+        'visible-preservation'
+      );
+
+      const stored = node
+        ._unsafeGetToolOutputRegistry()!
+        .get('visible-preservation', 'tool0turn0');
+      expect(stored).toBe(first.content);
+      expect(capturedArgs[1]).toBe(`echo ${stored}`);
+      expect(capturedArgs[1]).not.toBe(`echo ${raw}`);
     });
 
     it('uses each batch\'s own turn when ToolNode is invoked concurrently within a run', async () => {
@@ -971,6 +1010,159 @@ describe('ToolNode tool output references', () => {
 
       expect(capturedRequests).toHaveLength(1);
       expect(capturedRequests[0].args).toEqual({ command: 'see FIRST' });
+    });
+
+    it('stores raw untruncated host output by default for downstream substitution', async () => {
+      const raw = 'Y'.repeat(8_000);
+      const node = new ToolNode({
+        tools: [createSchemaStub('echo')],
+        eventDrivenMode: true,
+        agentId: 'agent-x',
+        maxToolResultChars: 200,
+        toolCallStepIds: new Map([
+          ['ec1', 'step_ec1'],
+          ['ec2', 'step_ec2'],
+        ]),
+        toolOutputReferences: { enabled: true },
+      });
+
+      mockEventDispatch([
+        { toolCallId: 'ec1', content: raw, status: 'success' },
+      ]);
+      const first = (await node.invoke(
+        {
+          messages: [
+            new AIMessage({
+              content: '',
+              tool_calls: [{ id: 'ec1', name: 'echo', args: { command: 'a' } }],
+            }),
+          ],
+        },
+        { configurable: { run_id: 'run-host-raw' } }
+      )) as { messages: ToolMessage[] };
+
+      const firstContent = first.messages[0].content as string;
+      expect(firstContent.length).toBeLessThan(raw.length);
+      expect(firstContent).toContain('truncated');
+
+      jest.restoreAllMocks();
+      const capturedRequests: t.ToolCallRequest[] = [];
+      jest
+        .spyOn(events, 'safeDispatchCustomEvent')
+        .mockImplementation(async (event, data) => {
+          if (event !== 'on_tool_execute') {
+            return;
+          }
+          const batch = data as t.ToolExecuteBatchRequest;
+          capturedRequests.push(...batch.toolCalls);
+          batch.resolve([
+            { toolCallId: 'ec2', content: 'SECOND', status: 'success' },
+          ]);
+        });
+
+      await node.invoke(
+        {
+          messages: [
+            new AIMessage({
+              content: '',
+              tool_calls: [
+                {
+                  id: 'ec2',
+                  name: 'echo',
+                  args: { command: 'see {{tool0turn0}}' },
+                },
+              ],
+            }),
+          ],
+        },
+        { configurable: { run_id: 'run-host-raw' } }
+      );
+
+      expect(
+        node._unsafeGetToolOutputRegistry()!.get('run-host-raw', 'tool0turn0')
+      ).toBe(raw);
+      expect(capturedRequests).toHaveLength(1);
+      expect(capturedRequests[0].args).toEqual({ command: `see ${raw}` });
+    });
+
+    it('can store truncated LLM-visible host output when referenceContent is visible', async () => {
+      const raw = 'Y'.repeat(8_000);
+      const node = new ToolNode({
+        tools: [createSchemaStub('echo')],
+        eventDrivenMode: true,
+        agentId: 'agent-x',
+        maxToolResultChars: 200,
+        toolCallStepIds: new Map([
+          ['ec1', 'step_ec1'],
+          ['ec2', 'step_ec2'],
+        ]),
+        toolOutputReferences: {
+          enabled: true,
+          referenceContent: 'visible',
+        },
+      });
+
+      mockEventDispatch([
+        { toolCallId: 'ec1', content: raw, status: 'success' },
+      ]);
+      const first = (await node.invoke(
+        {
+          messages: [
+            new AIMessage({
+              content: '',
+              tool_calls: [{ id: 'ec1', name: 'echo', args: { command: 'a' } }],
+            }),
+          ],
+        },
+        { configurable: { run_id: 'run-host-trunc' } }
+      )) as { messages: ToolMessage[] };
+
+      const firstContent = first.messages[0].content as string;
+      expect(firstContent.length).toBeLessThan(raw.length);
+      expect(firstContent).toContain('truncated');
+
+      jest.restoreAllMocks();
+      const capturedRequests: t.ToolCallRequest[] = [];
+      jest
+        .spyOn(events, 'safeDispatchCustomEvent')
+        .mockImplementation(async (event, data) => {
+          if (event !== 'on_tool_execute') {
+            return;
+          }
+          const batch = data as t.ToolExecuteBatchRequest;
+          capturedRequests.push(...batch.toolCalls);
+          batch.resolve([
+            { toolCallId: 'ec2', content: 'SECOND', status: 'success' },
+          ]);
+        });
+
+      await node.invoke(
+        {
+          messages: [
+            new AIMessage({
+              content: '',
+              tool_calls: [
+                {
+                  id: 'ec2',
+                  name: 'echo',
+                  args: { command: 'see {{tool0turn0}}' },
+                },
+              ],
+            }),
+          ],
+        },
+        { configurable: { run_id: 'run-host-trunc' } }
+      );
+
+      const stored = node
+        ._unsafeGetToolOutputRegistry()!
+        .get('run-host-trunc', 'tool0turn0');
+      expect(stored).toBe(firstContent);
+      expect(capturedRequests).toHaveLength(1);
+      expect(capturedRequests[0].args).toEqual({ command: `see ${stored}` });
+      expect(
+        (capturedRequests[0].args as { command: string }).command.length
+      ).toBeLessThan(raw.length);
     });
 
     it('surfaces unresolved refs on host-returned error results', async () => {

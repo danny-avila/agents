@@ -171,6 +171,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private maxToolResultChars: number;
   /** Hook registry for PreToolUse/PostToolUse lifecycle hooks */
   private hookRegistry?: HookRegistry;
+  /** Which output snapshot gets stored for later `{{…}}` substitutions. */
+  private toolOutputReferenceContent: t.ToolOutputReferenceContent = 'raw';
   /**
    * Registry of tool outputs keyed by `tool<idx>turn<turn>`.
    *
@@ -227,16 +229,17 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     this.maxToolResultChars =
       maxToolResultChars ?? calculateMaxToolResultChars(maxContextTokens);
     this.hookRegistry = hookRegistry;
+    this.toolOutputReferenceContent =
+      toolOutputReferences?.referenceContent ?? 'raw';
     /**
      * Precedence: an explicitly passed `toolOutputRegistry` instance
      * wins over a config object so a host (`Graph`) can share one
      * registry across many ToolNodes. When only the config is
      * provided (direct ToolNode usage), build a local registry so
-     * the feature still works without graph-level plumbing. Registry
-     * caps are intentionally decoupled from `maxToolResultChars`:
-     * the registry stores the raw untruncated output so a later
-     * `{{…}}` substitution pipes the full payload into the next
-     * tool, even when the LLM saw a truncated preview.
+     * the feature still works without graph-level plumbing. The
+     * registry retains whichever snapshot `referenceContent` selects:
+     * raw for full parser/piping inputs, or visible for stricter
+     * deployments that treat truncation as a data boundary.
      */
     if (toolOutputRegistry != null) {
       this.toolOutputRegistry = toolOutputRegistry;
@@ -260,6 +263,13 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     | ToolOutputReferenceRegistry
     | undefined {
     return this.toolOutputRegistry;
+  }
+
+  private getReferenceContent(raw: string, visible: string): string {
+    if (this.toolOutputReferenceContent === 'visible') {
+      return visible;
+    }
+    return raw;
   }
 
   /**
@@ -472,7 +482,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             toolMsg.content = llmContent;
             const refMeta = this.recordOutputReference(
               runId,
-              rawContent,
+              this.getReferenceContent(rawContent, llmContent),
               refKey,
               unresolvedRefs
             );
@@ -521,7 +531,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       );
       const refMeta = this.recordOutputReference(
         runId,
-        rawContent,
+        this.getReferenceContent(rawContent, truncated),
         refKey,
         unresolvedRefs
       );
@@ -601,16 +611,18 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   }
 
   /**
-   * Registers the full, raw output under `refKey` (when provided) and
+   * Registers the selected output snapshot under `refKey` (when provided) and
    * builds the per-message ref metadata stamped onto the resulting
    * `ToolMessage.additional_kwargs`. The metadata is read at LLM-
    * request time by `annotateMessagesForLLM` to produce a transient
    * annotated copy of the message — the persisted `content` itself
    * stays clean.
    *
-   * @param registryContent  The full, untruncated output to store in
-   *   the registry so `{{tool<i>turn<n>}}` substitutions deliver the
-   *   complete payload. Ignored when `refKey` is undefined.
+   * @param registryContent  The output snapshot to store in the
+   *   registry for `{{tool<i>turn<n>}}` substitutions. This is either
+   *   the full post-hook raw output or the LLM-visible content,
+   *   depending on `toolOutputReferences.referenceContent`. Ignored
+   *   when `refKey` is undefined.
    * @param refKey  Precomputed `tool<i>turn<n>` key, or undefined when
    *   the output is not to be registered (errors, disabled feature,
    *   unavailable batch/turn).
@@ -697,10 +709,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       }
 
       const request = requestMap.get(result.toolCallId);
+      const requestName = request?.name;
       if (
-        !request?.name ||
-        (!CODE_EXECUTION_TOOLS.has(request.name) &&
-          request.name !== Constants.SKILL_TOOL)
+        requestName == null ||
+        requestName === '' ||
+        (!CODE_EXECUTION_TOOLS.has(requestName) &&
+          requestName !== Constants.SKILL_TOOL)
       ) {
         continue;
       }
@@ -1140,13 +1154,17 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             });
           }
         } else {
-          let registryRaw =
+          let rawContent =
             typeof result.content === 'string'
               ? result.content
               : JSON.stringify(result.content);
           contentString = truncateToolResultContent(
-            registryRaw,
+            rawContent,
             this.maxToolResultChars
+          );
+          let registryContent = this.getReferenceContent(
+            rawContent,
+            contentString
           );
 
           if (hasPostHook) {
@@ -1172,10 +1190,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                 typeof hookResult.updatedOutput === 'string'
                   ? hookResult.updatedOutput
                   : JSON.stringify(hookResult.updatedOutput);
-              registryRaw = replaced;
               contentString = truncateToolResultContent(
                 replaced,
                 this.maxToolResultChars
+              );
+              rawContent = replaced;
+              registryContent = this.getReferenceContent(
+                rawContent,
+                contentString
               );
             }
           }
@@ -1190,7 +1212,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               : undefined;
           const successRefMeta = this.recordOutputReference(
             registryRunId,
-            registryRaw,
+            registryContent,
             refKey,
             unresolved
           );
