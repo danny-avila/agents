@@ -160,18 +160,36 @@ export interface AskUserQuestionResolution {
   answer: string;
 }
 
-/** Type guard narrowing a `HumanInterruptPayload` to the tool-approval variant. */
+/**
+ * Type guard narrowing an arbitrary value to a `ToolApprovalInterruptPayload`.
+ * Accepts `unknown` (not just `HumanInterruptPayload`) because hosts can
+ * raise custom interrupt payloads from custom nodes — `getInterrupt()`
+ * surfaces them as-is, and downstream code must validate the shape at
+ * runtime before reading variant-specific fields.
+ */
 export function isToolApprovalInterrupt(
-  payload: HumanInterruptPayload
+  payload: unknown
 ): payload is ToolApprovalInterruptPayload {
-  return payload.type === 'tool_approval';
+  return (
+    typeof payload === 'object' &&
+    payload !== null &&
+    (payload as { type?: unknown }).type === 'tool_approval'
+  );
 }
 
-/** Type guard narrowing a `HumanInterruptPayload` to the ask-user-question variant. */
+/**
+ * Type guard narrowing an arbitrary value to an
+ * `AskUserQuestionInterruptPayload`. Same `unknown`-tolerant contract
+ * as `isToolApprovalInterrupt`.
+ */
 export function isAskUserQuestionInterrupt(
-  payload: HumanInterruptPayload
+  payload: unknown
 ): payload is AskUserQuestionInterruptPayload {
-  return payload.type === 'ask_user_question';
+  return (
+    typeof payload === 'object' &&
+    payload !== null &&
+    (payload as { type?: unknown }).type === 'ask_user_question'
+  );
 }
 
 /**
@@ -208,12 +226,23 @@ export interface HumanInTheLoopConfig {
  * via `run.getInterrupt()`. Hosts persist this alongside their job
  * record so they can later call `Run.resume(decisions)` against a Run
  * compiled with the same `thread_id` / checkpointer.
+ *
+ * The `payload` type defaults to `HumanInterruptPayload` (the SDK's
+ * built-in `tool_approval` / `ask_user_question` discriminated union)
+ * for ergonomic narrowing in the common case. Hosts that raise custom
+ * interrupt payloads from custom graph nodes can pass the type
+ * parameter (`run.getInterrupt<MyCustom>()` or
+ * `RunInterruptResult<MyCustom>`) — the SDK does not validate the
+ * runtime shape, it just transports whatever the node passed to
+ * `interrupt()`. Use the `isToolApprovalInterrupt` /
+ * `isAskUserQuestionInterrupt` guards (which accept `unknown`) when
+ * the source of the interrupt isn't statically known.
  */
-export interface RunInterruptResult {
+export interface RunInterruptResult<TPayload = HumanInterruptPayload> {
   /** Stable id of the LangGraph interrupt (from `Interrupt.id`). */
   interruptId: string;
   /** `thread_id` the run was bound to — required to resume. */
   threadId?: string;
   /** Structured payload describing what needs human input. */
-  payload: HumanInterruptPayload;
+  payload: TPayload;
 }

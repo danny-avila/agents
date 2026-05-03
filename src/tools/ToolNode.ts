@@ -1220,11 +1220,47 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           resumeValue
         );
 
-        for (const { entry, reason: askReason } of askEntries) {
+        for (const {
+          entry,
+          reason: askReason,
+          allowedDecisions,
+        } of askEntries) {
           const decision = decisionByCallId.get(entry.call.id!) ?? {
             type: 'reject' as const,
             reason: 'No decision provided for tool approval',
           };
+
+          /**
+           * Enforce the per-tool `allowedDecisions` allowlist that the
+           * `PreToolUse` hook surfaced in `review_configs`. The host
+           * UI is supposed to honor this when collecting the user's
+           * decision, but the wire is untrusted: a buggy or hostile
+           * host could submit a decision type the policy explicitly
+           * forbids (e.g. `'edit'` when the hook restricted to
+           * `['approve', 'reject']`), bypassing argument-mutation /
+           * response-substitution safeguards. Read `decision.type`
+           * through a widened view so a typo doesn't slip past TS
+           * narrowing, and fail closed when the declared type isn't
+           * in the allowlist.
+           */
+          const declaredDecisionType = (decision as { type?: unknown }).type;
+          if (
+            allowedDecisions != null &&
+            (typeof declaredDecisionType !== 'string' ||
+              !allowedDecisions.includes(
+                declaredDecisionType as t.ToolApprovalDecisionType
+              ))
+          ) {
+            const offered =
+              typeof declaredDecisionType === 'string'
+                ? declaredDecisionType
+                : '<missing>';
+            blockEntry(
+              entry,
+              `Decision "${offered}" not in allowedDecisions [${allowedDecisions.join(', ')}] — failing closed`
+            );
+            continue;
+          }
 
           if (decision.type === 'reject') {
             blockEntry(

@@ -1486,6 +1486,234 @@ describe('Codex review fixes', () => {
     ]);
   });
 
+  it('enforces allowedDecisions on resume — host-submitted decision outside the allowlist is rejected', async () => {
+    const dispatchedToolNames: string[] = [];
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data) => {
+        if (event !== 'on_tool_execute') {
+          return;
+        }
+        const request = data as {
+          toolCalls: t.ToolCallRequest[];
+          resolve: (r: t.ToolExecuteResult[]) => void;
+        };
+        for (const c of request.toolCalls) {
+          dispatchedToolNames.push(c.name);
+        }
+        request.resolve(
+          request.toolCalls.map((c) => ({
+            toolCallId: c.id,
+            content: 'ran',
+            status: 'success' as const,
+          }))
+        );
+      });
+
+    /** Hook restricts to approve/reject only — edit/respond are
+     * forbidden. Even if a buggy or hostile host UI submits an
+     * `edit`, the SDK must fail closed instead of mutating the args
+     * and running the tool. */
+    const registry = new HookRegistry();
+    registry.register('PreToolUse', {
+      hooks: [
+        async (): Promise<PreToolUseHookOutput> => ({
+          decision: 'ask',
+          allowedDecisions: ['approve', 'reject'],
+        }),
+      ],
+    });
+
+    const node = new ToolNode({
+      tools: [createSchemaStub('echo')],
+      eventDrivenMode: true,
+      agentId: 'agent-x',
+      toolCallStepIds: new Map([['call_1', 'step_1']]),
+      hookRegistry: registry,
+      humanInTheLoop: { enabled: true },
+    });
+
+    const graph = buildHITLGraph(node, [
+      { id: 'call_1', name: 'echo', args: { command: 'original' } },
+    ]);
+    const config = { configurable: { thread_id: 'allowed-enforce' } };
+
+    await graph.invoke({ messages: [] }, config);
+
+    /** Submit `edit` — outside the advertised allowlist. */
+    const resumed = (await graph.invoke(
+      new Command({
+        resume: [{ type: 'edit', updatedInput: { command: 'malicious' } }],
+      }),
+      config
+    )) as { messages: BaseMessage[] };
+
+    const toolMessages = resumed.messages.filter(
+      (m): m is ToolMessage => m._getType() === 'tool'
+    );
+    expect(toolMessages).toHaveLength(1);
+    /** Tool was blocked; arg-mutation never reached the host. */
+    expect(toolMessages[0].status).toBe('error');
+    expect(String(toolMessages[0].content)).toContain(
+      'not in allowedDecisions'
+    );
+    expect(String(toolMessages[0].content)).toContain('approve');
+    expect(String(toolMessages[0].content)).toContain('reject');
+    expect(dispatchedToolNames).toEqual([]);
+  });
+
+  it('enforces allowedDecisions on resume — approved decision passes through when in the allowlist', async () => {
+    const dispatchedArgs: Array<Record<string, unknown>> = [];
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data) => {
+        if (event !== 'on_tool_execute') {
+          return;
+        }
+        const request = data as {
+          toolCalls: t.ToolCallRequest[];
+          resolve: (r: t.ToolExecuteResult[]) => void;
+        };
+        for (const c of request.toolCalls) {
+          dispatchedArgs.push(c.args);
+        }
+        request.resolve(
+          request.toolCalls.map((c) => ({
+            toolCallId: c.id,
+            content: 'ran',
+            status: 'success' as const,
+          }))
+        );
+      });
+
+    const registry = new HookRegistry();
+    registry.register('PreToolUse', {
+      hooks: [
+        async (): Promise<PreToolUseHookOutput> => ({
+          decision: 'ask',
+          allowedDecisions: ['approve', 'reject'],
+        }),
+      ],
+    });
+
+    const node = new ToolNode({
+      tools: [createSchemaStub('echo')],
+      eventDrivenMode: true,
+      agentId: 'agent-x',
+      toolCallStepIds: new Map([['call_1', 'step_1']]),
+      hookRegistry: registry,
+      humanInTheLoop: { enabled: true },
+    });
+
+    const graph = buildHITLGraph(node, [
+      { id: 'call_1', name: 'echo', args: { command: 'original' } },
+    ]);
+    const config = { configurable: { thread_id: 'allowed-pass' } };
+
+    await graph.invoke({ messages: [] }, config);
+
+    /** Submit `approve` — explicitly in the allowlist. */
+    await graph.invoke(new Command({ resume: [{ type: 'approve' }] }), config);
+
+    expect(dispatchedArgs).toEqual([{ command: 'original' }]);
+  });
+
+  it('getInterrupt<T>() returns the captured payload typed as the host-asserted shape', async () => {
+    /**
+     * Custom graph node raises an interrupt with a payload shape the
+     * SDK doesn't know about. `run.getInterrupt<MyCustomPayload>()`
+     * returns the payload typed as the host's assertion — the SDK
+     * doesn't validate, it just transports.
+     */
+    interface MyCustomPayload {
+      type: 'custom_review';
+      diff: string;
+      reviewerHints: string[];
+    }
+
+    const langgraph = await import('@langchain/langgraph');
+
+    const builder = new StateGraph(MessagesAnnotation)
+      .addNode('clarifier', () => {
+        langgraph.interrupt({
+          type: 'custom_review',
+          diff: '+ added line',
+          reviewerHints: ['check formatting'],
+        } satisfies MyCustomPayload);
+        return { messages: [] };
+      })
+      .addEdge(START, 'clarifier')
+      .addEdge('clarifier', END);
+    const graph = builder.compile({ checkpointer: new MemorySaver() });
+
+    const { Run } = await import('@/run');
+    const run = await Run.create<t.IState>({
+      runId: 'custom-interrupt',
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'a',
+            provider: providers.OPENAI,
+            clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+          },
+        ],
+      },
+      humanInTheLoop: { enabled: true },
+    });
+    run.graphRunnable = graph as unknown as t.CompiledStateWorkflow;
+
+    await run.processStream(
+      { messages: [] },
+      {
+        configurable: { thread_id: 'custom-interrupt-thread' },
+        version: 'v2',
+      }
+    );
+
+    const interrupt = run.getInterrupt<MyCustomPayload>();
+    expect(interrupt).toBeDefined();
+    expect(interrupt!.payload.type).toBe('custom_review');
+    expect(interrupt!.payload.diff).toBe('+ added line');
+    expect(interrupt!.payload.reviewerHints).toEqual(['check formatting']);
+  });
+
+  it('isToolApprovalInterrupt / isAskUserQuestionInterrupt narrow safely from `unknown` (defensive)', async () => {
+    const { isToolApprovalInterrupt, isAskUserQuestionInterrupt } =
+      await import('@/types/hitl');
+
+    /** The guards must accept arbitrary runtime values without throwing,
+     * since hosts can pass anything from custom interrupts. */
+    expect(isToolApprovalInterrupt(null as unknown)).toBe(false);
+    expect(isToolApprovalInterrupt(undefined as unknown)).toBe(false);
+    expect(isToolApprovalInterrupt('string' as unknown)).toBe(false);
+    expect(isToolApprovalInterrupt(42 as unknown)).toBe(false);
+    expect(isToolApprovalInterrupt({} as unknown)).toBe(false);
+    expect(isToolApprovalInterrupt({ type: 'something_else' } as unknown)).toBe(
+      false
+    );
+    expect(
+      isToolApprovalInterrupt({
+        type: 'tool_approval',
+        action_requests: [],
+        review_configs: [],
+      } as unknown)
+    ).toBe(true);
+
+    expect(isAskUserQuestionInterrupt(null as unknown)).toBe(false);
+    expect(
+      isAskUserQuestionInterrupt({ type: 'tool_approval' } as unknown)
+    ).toBe(false);
+    expect(
+      isAskUserQuestionInterrupt({
+        type: 'ask_user_question',
+        question: { question: 'why' },
+      } as unknown)
+    ).toBe(true);
+  });
+
   it('clears session hooks when the stream throws AFTER an interrupt is captured (stale interrupt)', async () => {
     jest
       .spyOn(events, 'safeDispatchCustomEvent')

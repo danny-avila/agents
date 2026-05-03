@@ -61,7 +61,14 @@ export class Run<_T extends t.BaseGraphState> {
   returnContent: boolean = false;
   private skipCleanup: boolean = false;
   private _streamResult: t.MessageContentComplex[] | undefined;
-  private _interrupt: t.RunInterruptResult | undefined;
+  /**
+   * Captured interrupt payload typed as `unknown` because the SDK
+   * does not validate the runtime shape — custom graph nodes can
+   * raise interrupts with arbitrary payloads (not just the SDK's
+   * `HumanInterruptPayload` union). The public `getInterrupt<T>()`
+   * lets callers assert the type they expect.
+   */
+  private _interrupt: t.RunInterruptResult<unknown> | undefined;
   private _haltedReason: string | undefined;
 
   private constructor(config: Partial<t.RunConfig>) {
@@ -595,17 +602,21 @@ export class Run<_T extends t.BaseGraphState> {
         }
 
         /**
-         * Detect HITL interrupts surfaced by LangGraph as a synthetic
-         * `__interrupt__` field on the streamed chunk. We capture the
-         * first interrupt's value (the SDK only raises one bundled
-         * `tool_approval` payload per ToolNode batch) and stash it for
-         * the host to read via `run.getInterrupt()` once the stream
-         * drains.
+         * Detect interrupts surfaced by LangGraph as a synthetic
+         * `__interrupt__` field on the streamed chunk and stash the
+         * first one for the host to read via `run.getInterrupt()`
+         * once the stream drains. Captured as `unknown` because the
+         * SDK does not validate the runtime payload shape — the
+         * built-in ToolNode raises a `HumanInterruptPayload`
+         * (`tool_approval` / `ask_user_question`), but custom nodes
+         * can pass any payload to `interrupt()`. Callers narrow with
+         * the `isToolApprovalInterrupt` / `isAskUserQuestionInterrupt`
+         * guards or assert via `getInterrupt<T>()`.
          */
         if (
           this._interrupt == null &&
           data.chunk != null &&
-          isInterrupted<t.HumanInterruptPayload>(data.chunk)
+          isInterrupted<unknown>(data.chunk)
         ) {
           const interrupts = data.chunk[INTERRUPT];
           if (interrupts.length > 0) {
@@ -766,7 +777,7 @@ export class Run<_T extends t.BaseGraphState> {
   }
 
   /**
-   * Returns the pending HITL interrupt captured during the most recent
+   * Returns the pending interrupt captured during the most recent
    * `processStream` (or `resume`) invocation. `undefined` when the run
    * either has not been streamed yet or completed without pausing.
    *
@@ -774,9 +785,22 @@ export class Run<_T extends t.BaseGraphState> {
    * whether the run is awaiting human input. Persist the returned
    * descriptor (alongside `thread_id` and the agent run config) so a
    * later `resume(decisions)` can rebuild the run.
+   *
+   * The default `TPayload` is the SDK's `HumanInterruptPayload` union
+   * (`tool_approval` / `ask_user_question`), suitable for the common
+   * case where interrupts come from the built-in ToolNode or
+   * `askUserQuestion()` helper. Hosts that raise custom interrupts
+   * from custom graph nodes pass their own type — the SDK does not
+   * validate the runtime shape, it just transports whatever the
+   * `interrupt()` call carried. When in doubt, narrow with the
+   * `isToolApprovalInterrupt` / `isAskUserQuestionInterrupt` type
+   * guards (which accept `unknown`) before reading variant-specific
+   * fields.
    */
-  getInterrupt(): t.RunInterruptResult | undefined {
-    return this._interrupt;
+  getInterrupt<TPayload = t.HumanInterruptPayload>():
+    | t.RunInterruptResult<TPayload>
+    | undefined {
+    return this._interrupt as t.RunInterruptResult<TPayload> | undefined;
   }
 
   /**
