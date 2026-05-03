@@ -1,6 +1,6 @@
 {
   "name": "@librechat/agents",
-  "version": "3.1.75-dev.0",
+  "version": "3.1.75-dev.1",
   "main": "./dist/cjs/main.cjs",
   "module": "./dist/esm/main.mjs",
   "types": "./dist/types/index.d.ts",
@@ -9,6 +9,66 @@
       "import": "./dist/esm/main.mjs",
       "require": "./dist/cjs/main.cjs",
       "types": "./dist/types/index.d.ts"
+    },
+    "./langchain": {
+      "import": "./dist/esm/langchain/index.mjs",
+      "require": "./dist/cjs/langchain/index.cjs",
+      "types": "./dist/types/langchain/index.d.ts"
+    },
+    "./langchain/language_models/chat_models": {
+      "import": "./dist/esm/langchain/language_models/chat_models.mjs",
+      "require": "./dist/cjs/langchain/language_models/chat_models.cjs",
+      "types": "./dist/types/langchain/language_models/chat_models.d.ts"
+    },
+    "./langchain/messages": {
+      "import": "./dist/esm/langchain/messages.mjs",
+      "require": "./dist/cjs/langchain/messages.cjs",
+      "types": "./dist/types/langchain/messages.d.ts"
+    },
+    "./langchain/messages/tool": {
+      "import": "./dist/esm/langchain/messages/tool.mjs",
+      "require": "./dist/cjs/langchain/messages/tool.cjs",
+      "types": "./dist/types/langchain/messages/tool.d.ts"
+    },
+    "./langchain/google-common": {
+      "import": "./dist/esm/langchain/google-common.mjs",
+      "require": "./dist/cjs/langchain/google-common.cjs",
+      "types": "./dist/types/langchain/google-common.d.ts"
+    },
+    "./langchain/openai": {
+      "import": "./dist/esm/langchain/openai.mjs",
+      "require": "./dist/cjs/langchain/openai.cjs",
+      "types": "./dist/types/langchain/openai.d.ts"
+    },
+    "./langchain/prompts": {
+      "import": "./dist/esm/langchain/prompts.mjs",
+      "require": "./dist/cjs/langchain/prompts.cjs",
+      "types": "./dist/types/langchain/prompts.d.ts"
+    },
+    "./langchain/runnables": {
+      "import": "./dist/esm/langchain/runnables.mjs",
+      "require": "./dist/cjs/langchain/runnables.cjs",
+      "types": "./dist/types/langchain/runnables.d.ts"
+    },
+    "./langchain/tools": {
+      "import": "./dist/esm/langchain/tools.mjs",
+      "require": "./dist/cjs/langchain/tools.cjs",
+      "types": "./dist/types/langchain/tools.d.ts"
+    },
+    "./langchain/utils/env": {
+      "import": "./dist/esm/langchain/utils/env.mjs",
+      "require": "./dist/cjs/langchain/utils/env.cjs",
+      "types": "./dist/types/langchain/utils/env.d.ts"
+    }
+  },
+  "typesVersions": {
+    "*": {
+      "langchain": [
+        "dist/types/langchain/index.d.ts"
+      ],
+      "langchain/*": [
+        "dist/types/langchain/*"
+      ]
     }
   },
   "type": "module",
@@ -116,7 +176,7 @@
     "@browserbasehq/stagehand": {
       "openai": "$openai"
     },
-    "fast-xml-parser": "5.5.7",
+    "fast-xml-parser": "5.7.2",
     "ajv": "6.14.0",
     "minimatch": "3.1.4"
   },
@@ -125,10 +185,12 @@
     "@aws-sdk/client-bedrock-runtime": "^3.1013.0",
     "@langchain/anthropic": "^1.3.28",
     "@langchain/aws": "^1.3.5",
-    "@langchain/core": "^1.1.42",
+    "@langchain/core": "1.1.44",
     "@langchain/deepseek": "^1.0.25",
-    "@langchain/google-genai": "^2.1.29",
-    "@langchain/google-vertexai": "^2.1.29",
+    "@langchain/google-common": "2.1.30",
+    "@langchain/google-gauth": "2.1.30",
+    "@langchain/google-genai": "2.1.30",
+    "@langchain/google-vertexai": "2.1.30",
     "@langchain/langgraph": "^1.2.9",
     "@langchain/mistralai": "^1.0.8",
     "@langchain/openai": "1.4.5",

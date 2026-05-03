@@ -38,6 +38,9 @@ export * from './hooks';
 /* Types */
 export type * from './types';
 
+/* LangChain compatibility facade */
+export * from './langchain';
+
 /* LLM */
 export { CustomOpenAIClient } from './llm/openai';
 export { ChatOpenRouter } from './llm/openrouter';
