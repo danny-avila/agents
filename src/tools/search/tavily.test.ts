@@ -296,6 +296,15 @@ describe('TavilyScraper', () => {
       });
       expect(scraper['timeout']).toBe(15000);
     });
+
+    it('defaults advanced extraction timeout to 30000ms', () => {
+      const scraper = new TavilyScraper({
+        apiKey: 'test-key',
+        extractDepth: 'advanced',
+        logger: mockLogger,
+      });
+      expect(scraper['timeout']).toBe(30000);
+    });
   });
 
   describe('scrapeUrl', () => {
@@ -399,7 +408,38 @@ describe('TavilyScraper', () => {
         extract_depth: 'advanced',
       });
       expect(payload).not.toHaveProperty('timeout');
-      expect(config).toMatchObject({ timeout: 15000 });
+      expect(config).toMatchObject({ timeout: 30000 });
+    });
+
+    it('uses the advanced default client timeout for per-call extract depth', async () => {
+      mockedAxios.post.mockResolvedValueOnce({
+        data: {
+          results: [
+            {
+              url: 'https://example.com',
+              raw_content: 'Content',
+              images: [],
+            },
+          ],
+          failed_results: [],
+        },
+      });
+
+      const scraper = createTavilyScraper({
+        apiKey: 'test-key',
+        logger: mockLogger,
+      });
+      await scraper.scrapeUrl('https://example.com', {
+        extractDepth: 'advanced',
+      });
+      const [, payload, config] = mockedAxios.post.mock.calls[0];
+
+      expect(payload).toMatchObject({
+        urls: ['https://example.com'],
+        extract_depth: 'advanced',
+      });
+      expect(payload).not.toHaveProperty('timeout');
+      expect(config).toMatchObject({ timeout: 30000 });
     });
 
     it('handles API failure gracefully', async () => {

@@ -2,8 +2,12 @@ import axios from 'axios';
 import type * as t from './types';
 import { createDefaultLogger } from './utils';
 
-const DEFAULT_TIMEOUT = 15000;
+const DEFAULT_BASIC_TIMEOUT = 15000;
+const DEFAULT_ADVANCED_TIMEOUT = 30000;
 const MAX_BATCH_SIZE = 20;
+
+const getDefaultTimeout = (extractDepth: 'basic' | 'advanced'): number =>
+  extractDepth === 'advanced' ? DEFAULT_ADVANCED_TIMEOUT : DEFAULT_BASIC_TIMEOUT;
 
 export class TavilyScraper implements t.BaseScraper {
   private apiKey: string;
@@ -22,9 +26,9 @@ export class TavilyScraper implements t.BaseScraper {
       config.apiUrl ??
       process.env.TAVILY_EXTRACT_URL ??
       'https://api.tavily.com/extract';
-    this.timeout = config.timeout ?? DEFAULT_TIMEOUT;
     this.payloadTimeout = config.timeout;
     this.extractDepth = config.extractDepth ?? 'basic';
+    this.timeout = config.timeout ?? getDefaultTimeout(this.extractDepth);
     this.includeImages = config.includeImages ?? false;
     this.includeFavicon = config.includeFavicon ?? false;
     this.format = config.format;
@@ -78,9 +82,10 @@ export class TavilyScraper implements t.BaseScraper {
     try {
       const includeFavicon = options.includeFavicon ?? this.includeFavicon;
       const format = options.format ?? this.format;
+      const extractDepth = options.extractDepth ?? this.extractDepth;
       const payload: Record<string, unknown> = {
         urls,
-        extract_depth: options.extractDepth ?? this.extractDepth,
+        extract_depth: extractDepth,
         include_images: options.includeImages ?? this.includeImages,
       };
 
@@ -91,7 +96,12 @@ export class TavilyScraper implements t.BaseScraper {
         payload.format = format;
       }
 
-      const effectiveTimeout = options.timeout ?? this.timeout;
+      const effectiveTimeout =
+        options.timeout ??
+        this.payloadTimeout ??
+        (options.extractDepth != null
+          ? getDefaultTimeout(extractDepth)
+          : this.timeout);
       const payloadTimeout = options.timeout ?? this.payloadTimeout;
       if (payloadTimeout != null) {
         payload.timeout = Math.min(Math.max(payloadTimeout / 1000, 1), 60);
