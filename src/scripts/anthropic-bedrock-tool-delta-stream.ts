@@ -151,7 +151,8 @@ async function testProvider(provider: ProviderUnderTest): Promise<void> {
               ? toolCall.args
               : functionArguments;
           const previousArgs = argsByIndex.get(index) ?? '';
-          argsByIndex.set(index, previousArgs + args);
+          const accumulatedArgs = previousArgs + args;
+          argsByIndex.set(index, accumulatedArgs);
           if (args !== '') {
             nonEmptyArgTimes.push(elapsed());
           }
@@ -161,7 +162,9 @@ async function testProvider(provider: ProviderUnderTest): Promise<void> {
               runStepDelta.id
             } index=${index} id=${toolCall.id ?? ''} name=${
               toolCall.name ?? toolCall.function?.name ?? ''
-            } args=${JSON.stringify(preview(args))}`
+            } args=${JSON.stringify(preview(args))} accumulated=${JSON.stringify(
+              preview(accumulatedArgs)
+            )}`
           );
         }
       },
