@@ -176,9 +176,10 @@
     "@browserbasehq/stagehand": {
       "openai": "$openai"
     },
-    "fast-xml-parser": "5.5.7",
+    "fast-xml-parser": "5.7.2",
     "ajv": "6.14.0",
-    "minimatch": "3.1.4"
+    "minimatch": "3.1.4",
+    "uuid": "$uuid"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.92.0",
@@ -210,7 +211,7 @@
     "nanoid": "^3.3.7",
     "okapibm25": "^1.4.1",
     "openai": "^6.35.0",
-    "uuid": "^11.1.1"
+    "uuid": "14.0.0"
   },
   "imports": {
     "@/*": "./src/*",
