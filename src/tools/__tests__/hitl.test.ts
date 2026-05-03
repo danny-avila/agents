@@ -1730,16 +1730,15 @@ describe('Codex review fixes', () => {
     expect(dispatchedToolNames).not.toContain('tool_a');
 
     /**
-     * PostToolBatch fires once per dispatch where any entries land. On
-     * the FIRST pass (interrupt), the batch hook fires with just
-     * tool_a (the only entry recorded before `interrupt()` threw); on
-     * resume, it fires again with all three entries reflecting the
-     * final outcomes. Assert the resume snapshot carries the correct
-     * status + content for each tool — this is what batch audit /
-     * convention hooks would observe.
+     * PostToolBatch is dispatched at the bottom of `dispatchToolEvents`,
+     * after tool execution. On the FIRST pass `interrupt()` throws
+     * before reaching that line, so PostToolBatch does NOT fire for
+     * the interrupted pass. Only the resume pass yields a snapshot —
+     * carrying all three entries with their final outcomes (tool_a
+     * blocked by deny, tool_b approved + ran, tool_c approved + ran).
      */
-    expect(batchSnapshots.length).toBeGreaterThanOrEqual(1);
-    const finalSnapshot = batchSnapshots[batchSnapshots.length - 1];
+    expect(batchSnapshots).toHaveLength(1);
+    const finalSnapshot = batchSnapshots[0];
     /**
      * Order assertion: entries must match the original toolCalls
      * sequence (`call_a`, `call_b`, `call_c`) regardless of when each
