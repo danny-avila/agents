@@ -1199,6 +1199,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           }),
           review_configs: askEntries.map(({ entry, allowedDecisions }) => ({
             action_name: entry.call.name,
+            tool_call_id: entry.call.id!,
             allowed_decisions: (allowedDecisions ?? [
               'approve',
               'reject',

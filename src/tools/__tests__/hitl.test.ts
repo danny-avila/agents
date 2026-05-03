@@ -169,6 +169,7 @@ describe('ToolNode HITL — `ask` decision raises interrupt() when humanInTheLoo
     expect(payload.review_configs).toEqual([
       {
         action_name: 'echo',
+        tool_call_id: 'call_1',
         allowed_decisions: ['approve', 'reject', 'edit', 'respond'],
       },
     ]);
@@ -1169,9 +1170,9 @@ describe('Mid-flight preventContinuation halts the run after the current step', 
       { configurable: { thread_id: 't-1' }, version: 'v2' }
     );
     /** RunStart preventContinuation is a pre-stream early return, but
-     * `processStream` should still have cleared the registry signal in
-     * its `finally` block so a subsequent call starts fresh. */
-    expect(registry.getHaltSignal()).toBeUndefined();
+     * `processStream` should still have cleared the registry signal
+     * for this run id so a subsequent call starts fresh. */
+    expect(registry.getHaltSignal('halt-clear-1')).toBeUndefined();
   });
 });
 
@@ -1275,8 +1276,11 @@ describe('Async fire-and-forget hooks ignore decision/context fields', () => {
       { configurable: { thread_id: 'async-2' } }
     );
 
-    /** preventContinuation was on an async output → ignored → no halt signal. */
-    expect(registry.getHaltSignal()).toBeUndefined();
+    /** preventContinuation was on an async output → ignored → no halt
+     * signal raised under any session id. The standalone graph here
+     * runs with `runId = ''` (no `config.configurable.run_id` set),
+     * so check that key explicitly. */
+    expect(registry.getHaltSignal('')).toBeUndefined();
   });
 });
 
@@ -1851,6 +1855,165 @@ describe('Codex review fixes', () => {
     expect(interrupt).toBeDefined();
     expect(interrupt!.payload).toBeNull();
     expect(stopFired).toBe(false);
+  });
+
+  it('halt signal raised by run A does not bleed into a concurrent run B sharing the same registry', async () => {
+    /**
+     * One registry, two runs. RunStart hook for run A raises
+     * preventContinuation; run B has no halt signal. Without
+     * per-session scoping, run B's stream-loop poll would see A's
+     * signal and silently terminate. With scoping, each run reads
+     * only its own halt entry.
+     */
+    const registry = new HookRegistry();
+    let runStartFires = 0;
+    registry.register('RunStart', {
+      hooks: [
+        async (input): Promise<RunStartHookOutput> => {
+          runStartFires += 1;
+          /** Halt only run A, not run B. */
+          if (input.runId === 'run-a') {
+            return {
+              preventContinuation: true,
+              stopReason: 'A halted',
+            };
+          }
+          return {};
+        },
+      ],
+    });
+
+    const { Run } = await import('@/run');
+    const { HumanMessage: HM } = await import('@langchain/core/messages');
+
+    /** No-op graph so we never hit the real model. */
+    const makeNoopGraph = (): t.CompiledStateWorkflow => {
+      const builder = new StateGraph(MessagesAnnotation)
+        .addNode('noop', (): MessagesUpdate => ({ messages: [] }))
+        .addEdge(START, 'noop')
+        .addEdge('noop', END);
+      return builder.compile() as unknown as t.CompiledStateWorkflow;
+    };
+
+    const makeRun = async (
+      runId: string
+    ): Promise<Awaited<ReturnType<typeof Run.create<t.IState>>>> => {
+      const r = await Run.create<t.IState>({
+        runId,
+        graphConfig: {
+          type: 'standard',
+          agents: [
+            {
+              agentId: 'a',
+              provider: providers.OPENAI,
+              clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+              instructions: 'noop',
+              maxContextTokens: 8000,
+            },
+          ],
+        },
+        hooks: registry,
+        humanInTheLoop: { enabled: false },
+      });
+      r.graphRunnable = makeNoopGraph();
+      return r;
+    };
+
+    const runA = await makeRun('run-a');
+    const runB = await makeRun('run-b');
+
+    /** Run A — its preventContinuation lands in the per-session halt
+     * map under key `'run-a'` and triggers a pre-stream early
+     * return. Note that the early-return path also clears its own
+     * halt signal in the same step, so run B can never observe it
+     * even momentarily. */
+    await runA.processStream(
+      { messages: [new HM('a')] },
+      { configurable: { thread_id: 'thread-a' }, version: 'v2' }
+    );
+    expect(runA.getHaltReason()).toBe('A halted');
+
+    /** Run B's signal must be undefined — A's halt is scoped to A's
+     * session id, and was cleared in A's pre-stream finally path. */
+    expect(registry.getHaltSignal('run-b')).toBeUndefined();
+    expect(registry.getHaltSignal('run-a')).toBeUndefined();
+
+    /** Run B — RunStart returns no halt, so processStream proceeds
+     * past the pre-stream gate, executes the no-op graph, and
+     * completes without halt. */
+    runStartFires = 0;
+    await runB.processStream(
+      { messages: [new HM('b')] },
+      { configurable: { thread_id: 'thread-b' }, version: 'v2' }
+    );
+    expect(runStartFires).toBe(1);
+    expect(runB.getHaltReason()).toBeUndefined();
+  });
+
+  it('review_configs entries carry tool_call_id so duplicate-tool batches map unambiguously', async () => {
+    mockEventDispatch([]);
+
+    const registry = new HookRegistry();
+    registry.register('PreToolUse', {
+      hooks: [
+        async (): Promise<PreToolUseHookOutput> => ({
+          decision: 'ask',
+          reason: 'review',
+        }),
+      ],
+    });
+
+    /** Same tool name called twice in one batch — by-position
+     * mapping breaks down for hosts that reorder; tool_call_id
+     * lets the UI map review_configs → action_requests directly. */
+    const node = new ToolNode({
+      tools: [createSchemaStub('echo')],
+      eventDrivenMode: true,
+      agentId: 'agent-x',
+      toolCallStepIds: new Map([
+        ['call_first', 'step_first'],
+        ['call_second', 'step_second'],
+      ]),
+      hookRegistry: registry,
+      humanInTheLoop: { enabled: true },
+    });
+
+    const graph = buildHITLGraph(node, [
+      { id: 'call_first', name: 'echo', args: { command: 'a' } },
+      { id: 'call_second', name: 'echo', args: { command: 'b' } },
+    ]);
+    const config = { configurable: { thread_id: 'duplicate-tool' } };
+
+    const interrupted = await graph.invoke({ messages: [] }, config);
+    if (!isInterrupted<t.HumanInterruptPayload>(interrupted)) {
+      throw new Error('expected interrupt');
+    }
+    const payload = interrupted.__interrupt__[0].value!;
+    if (payload.type !== 'tool_approval') {
+      throw new Error('expected tool_approval');
+    }
+
+    /** Each review_config carries its own tool_call_id matching the
+     * action_request at the same index. UI can build a Map keyed by
+     * tool_call_id rather than relying on positional order. */
+    expect(payload.review_configs).toEqual([
+      {
+        action_name: 'echo',
+        tool_call_id: 'call_first',
+        allowed_decisions: ['approve', 'reject', 'edit', 'respond'],
+      },
+      {
+        action_name: 'echo',
+        tool_call_id: 'call_second',
+        allowed_decisions: ['approve', 'reject', 'edit', 'respond'],
+      },
+    ]);
+    /** And the action_requests carry the same ids — pairing is
+     * always derivable from id even when names collide. */
+    expect(payload.action_requests.map((r) => r.tool_call_id)).toEqual([
+      'call_first',
+      'call_second',
+    ]);
   });
 
   it('clears session hooks when the stream throws AFTER an interrupt is captured (stale interrupt)', async () => {

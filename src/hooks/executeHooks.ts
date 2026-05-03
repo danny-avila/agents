@@ -399,18 +399,26 @@ export async function executeHooks(
    * Centralized `preventContinuation` propagation: when any hook (across
    * any callsite — RunStart, PreToolUse, PostToolBatch, SubagentStop,
    * etc.) returns `preventContinuation: true`, raise a halt signal on
-   * the registry. `Run.processStream` polls the signal between stream
-   * events and exits cleanly, skipping the `Stop` hook (since the run
-   * is being halted, not naturally completing).
+   * the registry scoped to the run's `sessionId`. `Run.processStream`
+   * polls the signal between stream events using its own id and exits
+   * cleanly, skipping the `Stop` hook (since the run is being halted,
+   * not naturally completing).
    *
-   * First-write-wins inside the registry — a halt already raised by an
-   * earlier hook is preserved so the original `reason` / `source` are
-   * not clobbered. Pre-stream callsites in `Run.processStream` still
-   * read `preventContinuation` directly off the result for an early
-   * return because they have not yet entered the stream loop.
+   * First-write-wins per session inside the registry — a halt already
+   * raised by an earlier hook in the same run is preserved so the
+   * original `reason` / `source` are not clobbered. Hooks fired
+   * without a `sessionId` cannot raise a halt (there's no run for the
+   * loop to poll under), which is fine: every in-tree callsite passes
+   * `sessionId: runId`. Pre-stream callsites in `Run.processStream`
+   * still read `preventContinuation` directly off the result for an
+   * early return because they have not yet entered the stream loop.
    */
-  if (aggregated.preventContinuation === true) {
-    registry.haltRun(aggregated.stopReason ?? 'preventContinuation', event);
+  if (aggregated.preventContinuation === true && sessionId !== undefined) {
+    registry.haltRun(
+      sessionId,
+      aggregated.stopReason ?? 'preventContinuation',
+      event
+    );
   }
   return aggregated;
 }

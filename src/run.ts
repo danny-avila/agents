@@ -257,10 +257,12 @@ export class Run<_T extends t.BaseGraphState> {
    *   - Sets `this._haltedReason` so callers (and the eventual host)
    *     can distinguish a hook-driven halt from a natural completion.
    *   - Calls `registry.clearSession(this.id)` and
-   *     `registry.clearHaltSignal()` because no resume is expected
-   *     from a pre-stream halt — the run never entered the graph, so
-   *     the session/halt state would otherwise leak to the next
-   *     `processStream` invocation on the same registry.
+   *     `registry.clearHaltSignal(this.id)` because no resume is
+   *     expected from a pre-stream halt — the run never entered the
+   *     graph, so the session/halt state for this run would otherwise
+   *     leak to the next `processStream` invocation on the same
+   *     registry. Other concurrent runs on the same registry are
+   *     untouched (halt signals are scoped per session id).
    *   - Sets `config.callbacks = undefined` to drop the callback
    *     references the caller built (langfuse handler, custom event
    *     handler, etc.) since they won't be exercised. Mirrors the
@@ -309,7 +311,7 @@ export class Run<_T extends t.BaseGraphState> {
     if (runStartResult.preventContinuation === true) {
       this._haltedReason = runStartResult.stopReason ?? 'preventContinuation';
       registry.clearSession(this.id);
-      registry.clearHaltSignal();
+      registry.clearHaltSignal(this.id);
       config.callbacks = undefined;
       return true;
     }
@@ -338,7 +340,7 @@ export class Run<_T extends t.BaseGraphState> {
           this._haltedReason = promptResult.stopReason ?? 'preventContinuation';
         }
         registry.clearSession(this.id);
-        registry.clearHaltSignal();
+        registry.clearHaltSignal(this.id);
         config.callbacks = undefined;
         return true;
       }
@@ -494,7 +496,7 @@ export class Run<_T extends t.BaseGraphState> {
     this.Graph.resetValues(streamOptions?.keepContent);
     this._interrupt = undefined;
     this._haltedReason = undefined;
-    this.hookRegistry?.clearHaltSignal();
+    this.hookRegistry?.clearHaltSignal(this.id);
 
     /** Custom event callback to intercept and handle custom events */
     const customEventCallback = this.createCustomEventCallback();
@@ -657,7 +659,7 @@ export class Run<_T extends t.BaseGraphState> {
          * This matches Claude Code's `continue: false` semantic where
          * the active operation finishes before halting takes effect.
          */
-        const haltSignal = this.hookRegistry?.getHaltSignal();
+        const haltSignal = this.hookRegistry?.getHaltSignal(this.id);
         if (haltSignal != null) {
           this._haltedReason = haltSignal.reason;
           break;
@@ -728,12 +730,14 @@ export class Run<_T extends t.BaseGraphState> {
         this.hookRegistry?.clearSession(this.id);
       }
       /**
-       * Drop any halt signal raised mid-stream so a subsequent
-       * `processStream` / `resume` on this registry starts with clean
-       * state. The Run captured `_haltedReason` already; the registry's
-       * shared signal would otherwise spuriously trip the next loop.
+       * Drop any halt signal raised mid-stream for this run so a
+       * subsequent `processStream` / `resume` starts with clean state.
+       * The Run captured `_haltedReason` already; the registry entry
+       * for this `sessionId` would otherwise spuriously trip the next
+       * loop. Other concurrent runs sharing this registry are
+       * unaffected — their entries live under their own session ids.
        */
-      this.hookRegistry?.clearHaltSignal();
+      this.hookRegistry?.clearHaltSignal(this.id);
 
       /**
        * Break the reference chain that keeps heavy data alive via

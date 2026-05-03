@@ -39,6 +39,14 @@ export type ToolApprovalDecisionType =
 export interface ToolApprovalReviewConfig {
   /** Tool name (matches the `name` field on the corresponding action_request). */
   action_name: string;
+  /**
+   * Stable id of the tool call this review_config applies to (matches
+   * the `tool_call_id` of the corresponding action_request). Lets a UI
+   * map review_configs → action_requests directly when a batch
+   * contains the same tool called more than once — by-position
+   * mapping breaks down with duplicates.
+   */
+  tool_call_id: string;
   /** Decisions the host UI is allowed to surface for this action. */
   allowed_decisions: ToolApprovalDecisionType[];
 }
