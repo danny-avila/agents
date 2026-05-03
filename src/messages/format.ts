@@ -7,7 +7,10 @@ import {
   HumanMessage,
   SystemMessage,
 } from '@langchain/core/messages';
-import type { MessageContentImageUrl } from '@langchain/core/messages';
+import type {
+  MessageContent,
+  MessageContentImageUrl,
+} from '@langchain/core/messages';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type {
   ExtendedMessageContent,
@@ -277,18 +280,86 @@ export const formatFromLangChain = (
   };
 };
 
+interface FormatAssistantMessageOptions {
+  preserveReasoningContent?: boolean;
+}
+
+interface FormatAgentMessagesOptions {
+  provider?: Providers;
+}
+
+function extractReasoningContent(
+  part: MessageContentComplex | undefined | null
+): string {
+  if (part == null || typeof part !== 'object') {
+    return '';
+  }
+  if (part.type === ContentTypes.THINK) {
+    const think = (part as ReasoningContentText).think;
+    return typeof think === 'string' ? think : '';
+  }
+  if (part.type === ContentTypes.THINKING) {
+    const thinking = (part as { thinking?: string }).thinking;
+    return typeof thinking === 'string' ? thinking : '';
+  }
+  if (part.type === ContentTypes.REASONING) {
+    const reasoning = (part as { reasoning?: string }).reasoning;
+    return typeof reasoning === 'string' ? reasoning : '';
+  }
+  if (part.type === ContentTypes.REASONING_CONTENT) {
+    const reasoningText = (part as { reasoningText?: { text?: string } })
+      .reasoningText;
+    return typeof reasoningText?.text === 'string' ? reasoningText.text : '';
+  }
+  return '';
+}
+
 /**
  * Helper function to format an assistant message
  * @param message The message to format
  * @returns Array of formatted messages
  */
 function formatAssistantMessage(
-  message: Partial<TMessage>
+  message: Partial<TMessage>,
+  options?: FormatAssistantMessageOptions
 ): Array<AIMessage | ToolMessage> {
   const formattedMessages: Array<AIMessage | ToolMessage> = [];
   let currentContent: MessageContentComplex[] = [];
   let lastAIMessage: AIMessage | null = null;
   let hasReasoning = false;
+  let pendingReasoningContent = '';
+  const shouldPreserveReasoningContent =
+    options?.preserveReasoningContent === true;
+
+  const takePendingReasoningContent = (): string | undefined => {
+    if (!shouldPreserveReasoningContent || !pendingReasoningContent) {
+      return undefined;
+    }
+    const reasoningContent = pendingReasoningContent;
+    pendingReasoningContent = '';
+    return reasoningContent;
+  };
+
+  const createAIMessage = (content: MessageContent): AIMessage => {
+    const reasoningContent = takePendingReasoningContent();
+    return new AIMessage({
+      content,
+      ...(reasoningContent != null && {
+        additional_kwargs: { reasoning_content: reasoningContent },
+      }),
+    });
+  };
+
+  const attachPendingReasoningContent = (aiMessage: AIMessage): void => {
+    const reasoningContent = takePendingReasoningContent();
+    if (reasoningContent == null) {
+      return;
+    }
+    aiMessage.additional_kwargs.reasoning_content =
+      typeof aiMessage.additional_kwargs.reasoning_content === 'string'
+        ? `${aiMessage.additional_kwargs.reasoning_content}${reasoningContent}`
+        : reasoningContent;
+  };
 
   if (Array.isArray(message.content)) {
     for (const part of message.content as Array<
@@ -311,15 +382,13 @@ function formatAssistantMessage(
           }, '');
           content =
             `${content}\n${part[ContentTypes.TEXT] ?? part.text ?? ''}`.trim();
-          lastAIMessage = new AIMessage({ content });
+          lastAIMessage = createAIMessage(content);
           formattedMessages.push(lastAIMessage);
           currentContent = [];
           continue;
         }
         // Create a new AIMessage with this text and prepare for tool calls
-        lastAIMessage = new AIMessage({
-          content: part.text != null ? part.text : '',
-        });
+        lastAIMessage = createAIMessage(part.text != null ? part.text : '');
         formattedMessages.push(lastAIMessage);
       } else if (part.type === ContentTypes.TOOL_CALL) {
         // Skip malformed tool call entries without tool_call property
@@ -344,8 +413,10 @@ function formatAssistantMessage(
 
         if (!lastAIMessage) {
           // "Heal" the payload by creating an AIMessage to precede the tool call
-          lastAIMessage = new AIMessage({ content: '' });
+          lastAIMessage = createAIMessage('');
           formattedMessages.push(lastAIMessage);
+        } else {
+          attachPendingReasoningContent(lastAIMessage);
         }
 
         const tool_call: ToolCallPart = _tool_call;
@@ -381,6 +452,7 @@ function formatAssistantMessage(
         part.type === 'redacted_thinking'
       ) {
         hasReasoning = true;
+        pendingReasoningContent += extractReasoningContent(part);
         continue;
       } else if (
         part.type === ContentTypes.ERROR ||
@@ -411,12 +483,10 @@ function formatAssistantMessage(
       .trim();
 
     if (content) {
-      formattedMessages.push(new AIMessage({ content }));
+      formattedMessages.push(createAIMessage(content));
     }
   } else if (currentContent.length > 0) {
-    formattedMessages.push(
-      new AIMessage({ content: toLangChainContent(currentContent) })
-    );
+    formattedMessages.push(createAIMessage(toLangChainContent(currentContent)));
   }
 
   return formattedMessages;
@@ -832,7 +902,8 @@ export const formatAgentMessages = (
   /** Pre-resolved skill bodies keyed by skill name. When present, HumanMessages
    *  are reconstructed after skill ToolMessages to restore skill instructions
    *  that were only in LangGraph state during the original run. */
-  skills?: Map<string, string>
+  skills?: Map<string, string>,
+  options?: FormatAgentMessagesOptions
 ): {
   messages: Array<HumanMessage | AIMessage | SystemMessage | ToolMessage>;
   indexTokenCountMap?: Record<number, number>;
@@ -1080,7 +1151,9 @@ export const formatAgentMessages = (
       }
     }
 
-    const formattedMessages = formatAssistantMessage(processedMessage);
+    const formattedMessages = formatAssistantMessage(processedMessage, {
+      preserveReasoningContent: options?.provider === Providers.DEEPSEEK,
+    });
     if (sourceMessageId != null && sourceMessageId !== '') {
       for (const formattedMessage of formattedMessages) {
         formattedMessage.id = sourceMessageId;
