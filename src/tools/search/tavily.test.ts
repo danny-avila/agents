@@ -113,6 +113,34 @@ describe('Tavily search API', () => {
     });
     expect(payload).not.toHaveProperty('country');
   });
+
+  it('omits safe search for unsupported Tavily search depths', async () => {
+    mockedAxios.post.mockResolvedValueOnce({
+      data: {
+        results: [],
+      },
+    });
+
+    const searchAPI = createSearchAPI({
+      searchProvider: 'tavily',
+      tavilyApiKey: 'test-key',
+      tavilySearchOptions: {
+        searchDepth: 'fast',
+      },
+    });
+
+    await searchAPI.getSources({
+      query: 'example query',
+      safeSearch: 2,
+    });
+    const [, payload] = mockedAxios.post.mock.calls[0];
+
+    expect(payload).toMatchObject({
+      query: 'example query',
+      search_depth: 'fast',
+    });
+    expect(payload).not.toHaveProperty('safe_search');
+  });
 });
 
 describe('TavilyScraper', () => {
