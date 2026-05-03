@@ -1,14 +1,14 @@
-// src/hooks/createToolPolicyHook.ts
-//
-// Declarative `PreToolUse` hook factory. Lets hosts express common
-// permission policies (allow / deny / ask lists + a global mode) without
-// hand-rolling matching, precedence, and decision logic per-host.
-//
-// Maps directly to the Claude Code Agent SDK permission vocabulary
-// (`allowed_tools` / `disallowed_tools` / `permissionMode`) so users of
-// either SDK can think in the same terms. See the README's HITL section
-// for the cross-walk and `docs/hooks-design-report.md` for the broader
-// hook system context.
+/**
+ * Declarative `PreToolUse` hook factory. Lets hosts express common
+ * permission policies (allow / deny / ask lists + a global mode) without
+ * hand-rolling matching, precedence, and decision logic per-host.
+ *
+ * Maps directly to the Claude Code Agent SDK permission vocabulary
+ * (`allowed_tools` / `disallowed_tools` / `permissionMode`) so users of
+ * either SDK can think in the same terms. See the README's HITL section
+ * for the cross-walk and `docs/hooks-design-report.md` for the broader
+ * hook system context.
+ */
 
 import type { HookCallback, PreToolUseHookOutput, ToolDecision } from './types';
 

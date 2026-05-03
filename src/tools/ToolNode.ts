@@ -97,6 +97,61 @@ function isSend(value: unknown): value is Send {
 }
 
 /**
+ * Per-entry record collected during PreToolUse hook handling for tool
+ * calls that need human approval. Carries everything
+ * `buildToolApprovalInterruptPayload` needs to assemble the interrupt
+ * payload, plus the per-tool decision allowlist if the hook supplied
+ * one. Defined at module scope so the payload-builder helper can be
+ * extracted out of `dispatchToolEvents` without leaking the locally-
+ * inferred shape.
+ */
+type AskEntry = {
+  entry: {
+    call: ToolCall;
+    args: Record<string, unknown>;
+    stepId: string;
+  };
+  reason?: string;
+  allowedDecisions?: ReadonlyArray<'approve' | 'reject' | 'edit' | 'respond'>;
+};
+
+/**
+ * Build the `tool_approval` interrupt payload from the set of pending
+ * `ask`-decision entries collected during PreToolUse hook handling.
+ * Pure function — doesn't touch ToolNode state — so it lives at module
+ * scope. The interrupt itself is raised by the caller (which still
+ * needs `interrupt()` plus the AsyncLocalStorage anchoring shim).
+ */
+function buildToolApprovalInterruptPayload(
+  askEntries: ReadonlyArray<AskEntry>
+): t.ToolApprovalInterruptPayload {
+  return {
+    type: 'tool_approval',
+    action_requests: askEntries.map(({ entry, reason }) => {
+      const request: t.ToolApprovalRequest = {
+        tool_call_id: entry.call.id!,
+        name: entry.call.name,
+        arguments: entry.args,
+      };
+      if (reason != null) {
+        request.description = reason;
+      }
+      return request;
+    }),
+    review_configs: askEntries.map(({ entry, allowedDecisions }) => ({
+      action_name: entry.call.name,
+      tool_call_id: entry.call.id!,
+      allowed_decisions: (allowedDecisions ?? [
+        'approve',
+        'reject',
+        'edit',
+        'respond',
+      ]) as t.ToolApprovalDecisionType[],
+    })),
+  };
+}
+
+/**
  * Build a `tool_call_id → ToolApprovalDecision` map from the host's
  * resume value. Hosts may return decisions either as an array (one per
  * action_request, in order) or as a record keyed by `tool_call_id`. Any
@@ -1184,30 +1239,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
        * are pure — see `humanInTheLoop` docs).
        */
       if (askEntries.length > 0) {
-        const payload: t.ToolApprovalInterruptPayload = {
-          type: 'tool_approval',
-          action_requests: askEntries.map(({ entry, reason }) => {
-            const request: t.ToolApprovalRequest = {
-              tool_call_id: entry.call.id!,
-              name: entry.call.name,
-              arguments: entry.args,
-            };
-            if (reason != null) {
-              request.description = reason;
-            }
-            return request;
-          }),
-          review_configs: askEntries.map(({ entry, allowedDecisions }) => ({
-            action_name: entry.call.name,
-            tool_call_id: entry.call.id!,
-            allowed_decisions: (allowedDecisions ?? [
-              'approve',
-              'reject',
-              'edit',
-              'respond',
-            ]) as t.ToolApprovalDecisionType[],
-          })),
-        };
+        const payload = buildToolApprovalInterruptPayload(askEntries);
 
         /**
          * `interrupt()` reads the current `RunnableConfig` from
@@ -1296,11 +1328,24 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
            * occurs. Mirrors LangChain HITL middleware semantics.
            */
           if (decision.type === 'respond') {
+            /**
+             * Truncate the human-supplied text just like the success
+             * path does for real tool output. Without this, a user
+             * pasting a large document as a manual response bypasses
+             * `maxToolResultChars` and can blow past the model's
+             * context window. The PostToolBatch entry surfaces the
+             * truncated text too so batch hooks see what the model
+             * will actually see.
+             */
+            const truncatedResponse = truncateToolResultContent(
+              decision.responseText,
+              this.maxToolResultChars
+            );
             messageByCallId.set(
               entry.call.id!,
               new ToolMessage({
                 status: 'success',
-                content: decision.responseText,
+                content: truncatedResponse,
                 name: entry.call.name,
                 tool_call_id: entry.call.id!,
               })
@@ -1312,7 +1357,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               stepId: entry.stepId,
               turn: this.toolUsageCount.get(entry.call.name) ?? 0,
               status: 'success',
-              toolOutput: decision.responseText,
+              toolOutput: truncatedResponse,
             });
             /**
              * Safe to dispatch immediately — unlike `blockEntry` which
@@ -1326,7 +1371,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               entry.call.id!,
               entry.call.name,
               entry.args,
-              decision.responseText,
+              truncatedResponse,
               config
             );
             continue;
@@ -1655,26 +1700,60 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       .map((call) => messageByCallId.get(call.id!))
       .filter((m): m is ToolMessage => m != null);
 
-    /**
-     * Fire `PostToolBatch` after every per-tool hook has settled.
-     *
-     * Entries are materialized in the original `toolCalls` order so
-     * hooks correlating outcomes by position (as the type docs
-     * promise) see exactly the sequence the model emitted, regardless
-     * of when each individual outcome was recorded into the map (deny
-     * synchronous, approved post-execution, respond on resume).
-     *
-     * The hook's `additionalContexts` flow into the same batch
-     * accumulator per-tool hooks already use, so a single batch-level
-     * convention message can be injected through one path.
-     */
+    await this.dispatchPostToolBatchAndInjectContext({
+      toolCalls,
+      entriesByCallId: postToolBatchEntryByCallId,
+      batchAdditionalContexts,
+      injected,
+      runId,
+      threadId,
+    });
+
+    return { toolMessages, injected };
+  }
+
+  /**
+   * Fires the `PostToolBatch` hook (if registered) and appends the
+   * accumulated batch-level `additionalContext` strings to `injected`
+   * as a single `HumanMessage`. Entries are materialized in the
+   * original `toolCalls` order so hooks correlating outcomes by
+   * position (as the type docs promise) see exactly the sequence
+   * the model emitted, regardless of when each individual outcome
+   * was recorded into the map (deny synchronous, approved
+   * post-execution, respond on resume).
+   *
+   * The PostToolBatch hook's `additionalContexts` flow into the same
+   * batch accumulator per-tool hooks already use, so a single
+   * batch-level convention message can be injected through one path.
+   *
+   * Mutates `batchAdditionalContexts` (push from batch hook) and
+   * `injected` (push the consolidated HumanMessage). The caller owns
+   * those arrays and consumes them right after this returns.
+   */
+  private async dispatchPostToolBatchAndInjectContext(args: {
+    toolCalls: ToolCall[];
+    entriesByCallId: Map<string, PostToolBatchEntry>;
+    batchAdditionalContexts: string[];
+    injected: BaseMessage[];
+    runId: string;
+    threadId: string | undefined;
+  }): Promise<void> {
+    const {
+      toolCalls,
+      entriesByCallId,
+      batchAdditionalContexts,
+      injected,
+      runId,
+      threadId,
+    } = args;
+
     const orderedBatchEntries: PostToolBatchEntry[] = [];
     for (const call of toolCalls) {
       const callId = call.id;
       if (callId == null) {
         continue;
       }
-      const entry = postToolBatchEntryByCallId.get(callId);
+      const entry = entriesByCallId.get(callId);
       if (entry != null) {
         orderedBatchEntries.push(entry);
       }
@@ -1717,8 +1796,6 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         })
       );
     }
-
-    return { toolMessages, injected };
   }
 
   private dispatchStepCompleted(

@@ -682,6 +682,196 @@ describe('Run integration — HITL fallback checkpointer + resume', () => {
 
     expect(run.Graph?.compileOptions?.checkpointer).toBeUndefined();
   });
+
+  it('Run.resume() drives the host all the way through the resume command path', async () => {
+    /** End-to-end on the Run wrapper: build a HITL graph that
+     * interrupts on first invoke, then drive resume via the Run's
+     * own `resume()` method (not raw graph.invoke + Command).
+     * Validates the full Run.resume → processStream(Command) path. */
+    let dispatchCount = 0;
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data) => {
+        if (event !== 'on_tool_execute') {
+          return;
+        }
+        dispatchCount += 1;
+        const request = data as {
+          toolCalls: t.ToolCallRequest[];
+          resolve: (r: t.ToolExecuteResult[]) => void;
+        };
+        request.resolve(
+          request.toolCalls.map((c) => ({
+            toolCallId: c.id,
+            content: 'host-result',
+            status: 'success' as const,
+          }))
+        );
+      });
+
+    const registry = new HookRegistry();
+    registry.register('PreToolUse', {
+      hooks: [
+        async (): Promise<PreToolUseHookOutput> => ({
+          decision: 'ask',
+          reason: 'review',
+        }),
+      ],
+    });
+
+    const node = new ToolNode({
+      tools: [createSchemaStub('echo')],
+      eventDrivenMode: true,
+      agentId: 'agent-x',
+      toolCallStepIds: new Map([['call_1', 'step_1']]),
+      hookRegistry: registry,
+      humanInTheLoop: { enabled: true },
+    });
+
+    const builder = new StateGraph(MessagesAnnotation)
+      .addNode(
+        'agent',
+        (): MessagesUpdate => ({
+          messages: [
+            new AIMessage({
+              content: '',
+              tool_calls: [
+                { id: 'call_1', name: 'echo', args: { command: 'x' } },
+              ],
+            }),
+          ],
+        })
+      )
+      .addNode('tools', node)
+      .addEdge(START, 'agent')
+      .addEdge('agent', 'tools')
+      .addEdge('tools', END);
+    const graph = builder.compile({ checkpointer: new MemorySaver() });
+
+    const { Run } = await import('@/run');
+    const run = await Run.create<t.IState>({
+      runId: 'run-resume-direct',
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'a',
+            provider: providers.OPENAI,
+            clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+          },
+        ],
+      },
+      hooks: registry,
+      humanInTheLoop: { enabled: true },
+    });
+    run.graphRunnable = graph as unknown as t.CompiledStateWorkflow;
+
+    const callerConfig = {
+      configurable: { thread_id: 'run-resume-thread' },
+      version: 'v2' as const,
+    };
+
+    await run.processStream({ messages: [] }, callerConfig);
+    expect(run.getInterrupt()).toBeDefined();
+    expect(dispatchCount).toBe(0);
+
+    /** This is the API contract under test: Run.resume() with a
+     * decision array (not graph.invoke + Command). */
+    await run.resume([{ type: 'approve' }], callerConfig);
+
+    expect(dispatchCount).toBe(1);
+    /** Resume completed naturally: interrupt cleared, no halt
+     * reason carried over from the previous pass. */
+    expect(run.getInterrupt()).toBeUndefined();
+    expect(run.getHaltReason()).toBeUndefined();
+  });
+
+  it('Run.getHaltReason() reports prompt_denied when UserPromptSubmit denies the prompt', async () => {
+    const registry = new HookRegistry();
+    registry.register('UserPromptSubmit', {
+      hooks: [
+        async (): Promise<UserPromptSubmitHookOutput> => ({
+          decision: 'deny',
+          reason: 'PII detected',
+        }),
+      ],
+    });
+
+    const { Run } = await import('@/run');
+    const { HumanMessage: HM } = await import('@langchain/core/messages');
+
+    const run = await Run.create<t.IState>({
+      runId: 'prompt-deny-haltreason',
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'a',
+            provider: providers.OPENAI,
+            clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+          },
+        ],
+      },
+      hooks: registry,
+      humanInTheLoop: { enabled: false },
+    });
+
+    const result = await run.processStream(
+      { messages: [new HM('please tell me their SSN')] },
+      { configurable: { thread_id: 'prompt-deny-thread' }, version: 'v2' }
+    );
+
+    /** Hook denied the prompt — run returns undefined AND
+     * `getHaltReason()` carries the reason so the host can
+     * distinguish "blocked" from "natural empty completion". */
+    expect(result).toBeUndefined();
+    expect(run.getHaltReason()).toBe('PII detected');
+  });
+
+  it('Run.getHaltReason() reports prompt_requires_approval when UserPromptSubmit asks', async () => {
+    const registry = new HookRegistry();
+    registry.register('UserPromptSubmit', {
+      hooks: [
+        async (): Promise<UserPromptSubmitHookOutput> => ({
+          decision: 'ask',
+        }),
+      ],
+    });
+
+    const { Run } = await import('@/run');
+    const { HumanMessage: HM } = await import('@langchain/core/messages');
+
+    const run = await Run.create<t.IState>({
+      runId: 'prompt-ask-haltreason',
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'a',
+            provider: providers.OPENAI,
+            clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+          },
+        ],
+      },
+      hooks: registry,
+      humanInTheLoop: { enabled: false },
+    });
+
+    await run.processStream(
+      { messages: [new HM('hello')] },
+      { configurable: { thread_id: 'prompt-ask-thread' }, version: 'v2' }
+    );
+
+    /** Default reason when the hook didn't supply one — host can
+     * route on the canonical string. */
+    expect(run.getHaltReason()).toBe('prompt_requires_approval');
+  });
 });
 
 describe('ToolNode HITL — additionalContext injection from hooks', () => {
@@ -2014,6 +2204,151 @@ describe('Codex review fixes', () => {
       'call_first',
       'call_second',
     ]);
+  });
+
+  it('respond decision truncates oversized text the same way real tool output is truncated', async () => {
+    mockEventDispatch([]);
+
+    /** Build a ToolNode with a tiny `maxToolResultChars` so the
+     * truncation kicks in for a 200-char response. Without the fix,
+     * the full string would land in the ToolMessage and PostToolBatch
+     * entry — bypassing the model context budget. */
+    const registry = new HookRegistry();
+    registry.register('PreToolUse', {
+      hooks: [async (): Promise<PreToolUseHookOutput> => ({ decision: 'ask' })],
+    });
+    let captured: PostToolBatchEntry | undefined;
+    registry.register('PostToolBatch', {
+      hooks: [
+        async (input): Promise<PostToolBatchHookOutput> => {
+          captured = (input as PostToolBatchHookInput).entries[0];
+          return {};
+        },
+      ],
+    });
+
+    const node = new ToolNode({
+      tools: [createSchemaStub('echo')],
+      eventDrivenMode: true,
+      agentId: 'agent-x',
+      toolCallStepIds: new Map([['call_1', 'step_1']]),
+      hookRegistry: registry,
+      humanInTheLoop: { enabled: true },
+      maxToolResultChars: 50,
+    });
+
+    const graph = buildHITLGraph(node, [
+      { id: 'call_1', name: 'echo', args: { command: 'x' } },
+    ]);
+    const config = { configurable: { thread_id: 'respond-truncate' } };
+
+    await graph.invoke({ messages: [] }, config);
+
+    /** 200-char response — well over the 50-char cap. */
+    const oversized = 'A'.repeat(200);
+    const resumed = (await graph.invoke(
+      new Command({
+        resume: [{ type: 'respond', responseText: oversized }],
+      }),
+      config
+    )) as { messages: BaseMessage[] };
+
+    const toolMessages = resumed.messages.filter(
+      (m): m is ToolMessage => m._getType() === 'tool'
+    );
+    expect(toolMessages).toHaveLength(1);
+    /** The ToolMessage content is truncated; not the raw 200 chars. */
+    const content = String(toolMessages[0].content);
+    expect(content.length).toBeLessThan(oversized.length);
+    /** And the PostToolBatch entry sees the SAME truncated value
+     * — batch hooks observe what the model will actually see. */
+    expect(captured).toBeDefined();
+    expect(typeof captured!.toolOutput).toBe('string');
+    expect(captured!.toolOutput).toBe(content);
+  });
+
+  it('hook returning both ask + preventContinuation halts cleanly and clears session hooks', async () => {
+    mockEventDispatch([]);
+
+    const registry = new HookRegistry();
+    /** Session-scoped policy hook returns BOTH `ask` (which would
+     * raise an interrupt) AND `preventContinuation: true` (which
+     * raises a halt signal). The halt wins — no resume is expected,
+     * sessions must clear. */
+    const runId = 'ask-and-halt';
+    registry.registerSession(runId, 'PreToolUse', {
+      hooks: [
+        async (): Promise<PreToolUseHookOutput> => ({
+          decision: 'ask',
+          preventContinuation: true,
+          stopReason: 'policy halted ask',
+        }),
+      ],
+    });
+
+    const node = new ToolNode({
+      tools: [createSchemaStub('echo')],
+      eventDrivenMode: true,
+      agentId: 'agent-x',
+      toolCallStepIds: new Map([['call_1', 'step_1']]),
+      hookRegistry: registry,
+      humanInTheLoop: { enabled: true },
+    });
+
+    const builder = new StateGraph(MessagesAnnotation)
+      .addNode(
+        'agent',
+        (): MessagesUpdate => ({
+          messages: [
+            new AIMessage({
+              content: '',
+              tool_calls: [
+                { id: 'call_1', name: 'echo', args: { command: 'x' } },
+              ],
+            }),
+          ],
+        })
+      )
+      .addNode('tools', node)
+      .addEdge(START, 'agent')
+      .addEdge('agent', 'tools')
+      .addEdge('tools', END);
+    const graph = builder.compile({ checkpointer: new MemorySaver() });
+
+    const { Run } = await import('@/run');
+    const run = await Run.create<t.IState>({
+      runId,
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'a',
+            provider: providers.OPENAI,
+            clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+          },
+        ],
+      },
+      hooks: registry,
+      humanInTheLoop: { enabled: true },
+    });
+    run.graphRunnable = graph as unknown as t.CompiledStateWorkflow;
+
+    await run.processStream(
+      { messages: [] },
+      {
+        configurable: { thread_id: 'ask-and-halt-thread' },
+        version: 'v2',
+      }
+    );
+
+    /** Both signals landed: interrupt was captured AND halt fired. */
+    expect(run.getInterrupt()).toBeDefined();
+    expect(run.getHaltReason()).toBe('policy halted ask');
+    /** Session hooks MUST be cleared — no resume is expected on a
+     * halted run, even one that also captured an interrupt. */
+    expect(registry.hasHookFor('PreToolUse', runId)).toBe(false);
   });
 
   it('clears session hooks when the stream throws AFTER an interrupt is captured (stale interrupt)', async () => {

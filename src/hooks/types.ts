@@ -246,31 +246,53 @@ export interface BaseHookOutput {
   /** Reason reported alongside `preventContinuation`. */
   stopReason?: string;
   /**
-   * Marks this hook output as fire-and-forget. When `true`, the SDK
-   * ignores every other field (decision, additionalContext, updatedInput,
-   * preventContinuation, etc.) — the agent already moved on, so a hook
-   * returning `async: true` cannot block, modify, or inject context. Use
-   * for pure side effects (logging, metrics, webhooks).
+   * Marks this hook output as fire-and-forget for INFLUENCE only.
+   * When `true`, the SDK skips every other field on this output —
+   * `decision`, `additionalContext`, `updatedInput`,
+   * `preventContinuation`, `allowedDecisions`, `updatedOutput` are
+   * all ignored. The hook's return value cannot block, modify, or
+   * inject context, so it's safe to use for pure side effects
+   * (logging, metrics, webhooks).
    *
-   * Mirrors Claude Code Agent SDK's `async` output. Background work
-   * inside the hook body still runs; the agent simply doesn't wait for
-   * its results to influence behavior.
+   * Important caveat: the hook's CALLBACK promise is still awaited
+   * by `executeHooks` (subject to the matcher's timeout and the
+   * default `DEFAULT_HOOK_TIMEOUT_MS`). The SDK does not
+   * speculatively detach hooks based on output shape, because the
+   * shape is only known after the promise resolves. For TRUE
+   * fire-and-forget where the agent doesn't wait at all, the hook
+   * body should detach its side effect itself and return
+   * immediately:
    *
    * @example
    * ```ts
    * async (input) => {
+   *   // Detach the slow work — the SDK awaits this hook's
+   *   // returned promise, which resolves immediately because we
+   *   // don't `await` the side effect.
    *   void sendToLoggingService(input).catch(console.error);
    *   return { async: true };
    * };
    * ```
+   *
+   * @example WRONG — the agent will block on the webhook
+   * ```ts
+   * async (input) => {
+   *   await sendToLoggingService(input);  // ← awaited, blocks
+   *   return { async: true };  // returning async:true doesn't undo the await
+   * };
+   * ```
+   *
+   * Mirrors Claude Code Agent SDK's `async` output, with the same
+   * "detach inside the hook body" pattern.
    */
   async?: boolean;
   /**
    * Optional advisory timeout in milliseconds for the background work
-   * kicked off by an `async: true` hook. The SDK does not enforce this
-   * — hosts read it from telemetry or wire their own AbortSignal — but
-   * the field is preserved on the wire so downstream observability can
-   * surface long-running side effects. Ignored unless `async` is true.
+   * a host has detached inside an `async: true` hook body. The SDK
+   * does not enforce this (the hook's own AbortSignal handling does)
+   * but the field is preserved on the wire so downstream
+   * observability can surface long-running side effects. Ignored
+   * unless `async` is true.
    */
   asyncTimeout?: number;
 }

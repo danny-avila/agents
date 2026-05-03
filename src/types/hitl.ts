@@ -1,13 +1,13 @@
-// src/types/hitl.ts
-//
-// First-class human-in-the-loop (HITL) types for `@librechat/agents`.
-// Surfaces the interrupt payload that `ToolNode` raises when a `PreToolUse`
-// hook returns `decision: 'ask'` and HITL is enabled on the run, plus the
-// resume-decision shape the host returns to continue or reject the tool.
-//
-// Mirrors the LangChain HITL middleware shape (action_requests /
-// review_configs) so hosts and clients can share rendering/UI semantics
-// across the langchain ecosystem.
+/**
+ * First-class human-in-the-loop (HITL) types for `@librechat/agents`.
+ * Surfaces the interrupt payload that `ToolNode` raises when a `PreToolUse`
+ * hook returns `decision: 'ask'` and HITL is enabled on the run, plus the
+ * resume-decision shape the host returns to continue or reject the tool.
+ *
+ * Mirrors the LangChain HITL middleware shape (action_requests /
+ * review_configs) so hosts and clients can share rendering/UI semantics
+ * across the langchain ecosystem.
+ */
 
 /** Per-tool approval request emitted inside an interrupt payload. */
 export interface ToolApprovalRequest {
@@ -91,6 +91,13 @@ export type ToolApprovalDecisionMap = Record<string, ToolApprovalDecision>;
  * narrow on `HumanInterruptPayload.type` to determine which payload
  * shape they're handling and which resume value to send back through
  * `Run.resume()`.
+ *
+ * Exported as a discrete type so downstream consumers (notably
+ * LibreChat's wire types in `librechat-data-provider`) can mirror
+ * the discriminator alongside their own host-side `PendingAction`
+ * record without re-declaring the union themselves. Internal SDK
+ * code narrows directly on the literal strings via the type guards
+ * below; this type alias is primarily an integration-layer contract.
  */
 export type HumanInterruptType = 'tool_approval' | 'ask_user_question';
 

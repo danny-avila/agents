@@ -336,8 +336,20 @@ export class Run<_T extends t.BaseGraphState> {
         promptResult.decision === 'ask' ||
         promptResult.preventContinuation === true
       ) {
+        /**
+         * Always set `_haltedReason` so the host can call
+         * `getHaltReason()` and distinguish a hook-blocked prompt
+         * from a natural empty-output completion. Three signals can
+         * land here, each with its own canonical reason string when
+         * the hook didn't supply one.
+         */
         if (promptResult.preventContinuation === true) {
           this._haltedReason = promptResult.stopReason ?? 'preventContinuation';
+        } else if (promptResult.decision === 'deny') {
+          this._haltedReason = promptResult.reason ?? 'prompt_denied';
+        } else {
+          this._haltedReason =
+            promptResult.reason ?? 'prompt_requires_approval';
         }
         registry.clearSession(this.id);
         registry.clearHaltSignal(this.id);
@@ -724,9 +736,16 @@ export class Run<_T extends t.BaseGraphState> {
        * approval gate on resume. The session is cleared instead at
        * natural completion, error (including errors that happen AFTER
        * an interrupt was captured — those interrupts are stale), or
-       * hook-driven halt — every state where no resume is expected.
+       * hook-driven halt (including hooks that returned BOTH `ask`
+       * and `preventContinuation` — the halt wins, no resume is
+       * expected, sessions must drop). Every state where no resume
+       * is expected clears.
        */
-      if (this._interrupt == null || streamThrew) {
+      if (
+        this._interrupt == null ||
+        this._haltedReason != null ||
+        streamThrew
+      ) {
         this.hookRegistry?.clearSession(this.id);
       }
       /**

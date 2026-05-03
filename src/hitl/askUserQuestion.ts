@@ -1,21 +1,21 @@
-// src/hitl/askUserQuestion.ts
-//
-// Typed convenience wrapper around LangGraph's `interrupt()` for the
-// `ask_user_question` interrupt category. Lets a custom graph node
-// (or a tool implementation) suspend execution to collect a free-form
-// answer from the human, without the host having to assemble the
-// interrupt payload by hand. The companion to `Run.resume(answer)` on
-// the host side.
-//
-// AsyncLocalStorage anchoring: this helper does NOT call
-// `runWithConfig` itself — it expects to be invoked from inside a
-// LangGraph node where the framework has already established the
-// runnable config. ToolNode is the one place in this codebase that
-// needs the manual `runWithConfig` shim, because its
-// `RunnableCallable.trace = false` skips the upstream tracing path
-// that normally sets up the AsyncLocalStorage frame; ordinary user
-// nodes (RunnableLambda, addNode callbacks) do not have that
-// constraint.
+/**
+ * Typed convenience wrapper around LangGraph's `interrupt()` for the
+ * `ask_user_question` interrupt category. Lets a custom graph node
+ * (or a tool implementation) suspend execution to collect a free-form
+ * answer from the human, without the host having to assemble the
+ * interrupt payload by hand. The companion to `Run.resume(answer)` on
+ * the host side.
+ *
+ * AsyncLocalStorage anchoring: this helper does NOT call
+ * `runWithConfig` itself — it expects to be invoked from inside a
+ * LangGraph node where the framework has already established the
+ * runnable config. ToolNode is the one place in this codebase that
+ * needs the manual `runWithConfig` shim, because its
+ * `RunnableCallable.trace = false` skips the upstream tracing path
+ * that normally sets up the AsyncLocalStorage frame; ordinary user
+ * nodes (RunnableLambda, addNode callbacks) do not have that
+ * constraint.
+ */
 
 import { interrupt } from '@langchain/langgraph';
 import type {
