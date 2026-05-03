@@ -832,6 +832,51 @@ describe('Run integration — HITL fallback checkpointer + resume', () => {
     expect(run.getHaltReason()).toBe('PII detected');
   });
 
+  it('Run.getHaltReason() falls back to canonical prompt_denied when deny carries no reason', async () => {
+    const registry = new HookRegistry();
+    registry.register('UserPromptSubmit', {
+      hooks: [
+        async (): Promise<UserPromptSubmitHookOutput> => ({
+          decision: 'deny',
+        }),
+      ],
+    });
+
+    const { Run } = await import('@/run');
+    const { HumanMessage: HM } = await import('@langchain/core/messages');
+
+    const run = await Run.create<t.IState>({
+      runId: 'prompt-deny-canonical',
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'a',
+            provider: providers.OPENAI,
+            clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+          },
+        ],
+      },
+      hooks: registry,
+      humanInTheLoop: { enabled: false },
+    });
+
+    await run.processStream(
+      { messages: [new HM('hello')] },
+      {
+        configurable: { thread_id: 'prompt-deny-canonical-thread' },
+        version: 'v2',
+      }
+    );
+
+    /** Hook returned `deny` without a reason — host gets the
+     * canonical 'prompt_denied' string so it can route on a stable
+     * discriminator. */
+    expect(run.getHaltReason()).toBe('prompt_denied');
+  });
+
   it('Run.getHaltReason() reports prompt_requires_approval when UserPromptSubmit asks', async () => {
     const registry = new HookRegistry();
     registry.register('UserPromptSubmit', {
@@ -2204,6 +2249,109 @@ describe('Codex review fixes', () => {
       'call_first',
       'call_second',
     ]);
+  });
+
+  it('malformed respond decision (missing responseText) is blocked, not crashed', async () => {
+    let dispatchCount = 0;
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data) => {
+        if (event !== 'on_tool_execute') {
+          return;
+        }
+        dispatchCount += 1;
+        const request = data as {
+          toolCalls: t.ToolCallRequest[];
+          resolve: (r: t.ToolExecuteResult[]) => void;
+        };
+        request.resolve([]);
+      });
+
+    const node = new ToolNode({
+      tools: [createSchemaStub('echo')],
+      eventDrivenMode: true,
+      agentId: 'agent-x',
+      toolCallStepIds: new Map([['call_1', 'step_1']]),
+      hookRegistry: makeHookRegistry('ask'),
+      humanInTheLoop: { enabled: true },
+    });
+
+    const graph = buildHITLGraph(node, [
+      { id: 'call_1', name: 'echo', args: { command: 'x' } },
+    ]);
+    const config = { configurable: { thread_id: 'respond-malformed' } };
+
+    await graph.invoke({ messages: [] }, config);
+
+    /** Submit a `respond` decision with NO responseText — wire shape
+     * the SDK can't honor. Must fail closed (blockEntry path), NOT
+     * crash truncateToolResultContent on `undefined.length`. */
+    const resumed = (await graph.invoke(
+      new Command({
+        resume: [{ type: 'respond' } as unknown as t.ToolApprovalDecision],
+      }),
+      config
+    )) as { messages: BaseMessage[] };
+
+    const toolMessages = resumed.messages.filter(
+      (m): m is ToolMessage => m._getType() === 'tool'
+    );
+    expect(toolMessages).toHaveLength(1);
+    expect(toolMessages[0].status).toBe('error');
+    expect(String(toolMessages[0].content)).toContain(
+      'missing string responseText'
+    );
+    expect(String(toolMessages[0].content)).toContain('<missing>');
+    /** Tool was never dispatched — fail-closed worked. */
+    expect(dispatchCount).toBe(0);
+  });
+
+  it('malformed respond decision (non-string responseText) is blocked, not crashed', async () => {
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async () => {
+        return;
+      });
+
+    const node = new ToolNode({
+      tools: [createSchemaStub('echo')],
+      eventDrivenMode: true,
+      agentId: 'agent-x',
+      toolCallStepIds: new Map([['call_1', 'step_1']]),
+      hookRegistry: makeHookRegistry('ask'),
+      humanInTheLoop: { enabled: true },
+    });
+
+    const graph = buildHITLGraph(node, [
+      { id: 'call_1', name: 'echo', args: { command: 'x' } },
+    ]);
+    const config = { configurable: { thread_id: 'respond-nonstring' } };
+
+    await graph.invoke({ messages: [] }, config);
+
+    /** `responseText: 42` — wire deserializer didn't enforce string;
+     * SDK must reject without crashing. */
+    const resumed = (await graph.invoke(
+      new Command({
+        resume: [
+          {
+            type: 'respond',
+            responseText: 42 as unknown as string,
+          },
+        ],
+      }),
+      config
+    )) as { messages: BaseMessage[] };
+
+    const toolMessages = resumed.messages.filter(
+      (m): m is ToolMessage => m._getType() === 'tool'
+    );
+    expect(toolMessages).toHaveLength(1);
+    expect(toolMessages[0].status).toBe('error');
+    expect(String(toolMessages[0].content)).toContain(
+      'missing string responseText'
+    );
+    expect(String(toolMessages[0].content)).toContain('number');
   });
 
   it('respond decision truncates oversized text the same way real tool output is truncated', async () => {

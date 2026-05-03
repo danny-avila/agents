@@ -1329,6 +1329,27 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
            */
           if (decision.type === 'respond') {
             /**
+             * Validate the wire shape before touching it: hosts
+             * deserialize resume payloads from untyped JSON, so a
+             * malformed `{ type: 'respond' }` (no `responseText`) or
+             * `{ type: 'respond', responseText: 42 }` would crash
+             * `truncateToolResultContent` (which calls
+             * `content.length`) and turn a fail-closed approval path
+             * into a hard run failure. Route bad shapes through
+             * `blockEntry` like any other unusable decision.
+             */
+            const responseText = (decision as { responseText?: unknown })
+              .responseText;
+            if (typeof responseText !== 'string') {
+              const offered =
+                responseText === undefined ? '<missing>' : typeof responseText;
+              blockEntry(
+                entry,
+                `Decision "respond" missing string responseText (got ${offered}) — failing closed`
+              );
+              continue;
+            }
+            /**
              * Truncate the human-supplied text just like the success
              * path does for real tool output. Without this, a user
              * pasting a large document as a manual response bypasses
@@ -1338,7 +1359,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
              * will actually see.
              */
             const truncatedResponse = truncateToolResultContent(
-              decision.responseText,
+              responseText,
               this.maxToolResultChars
             );
             messageByCallId.set(
