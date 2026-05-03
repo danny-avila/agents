@@ -24,6 +24,7 @@ import type { Runnable, RunnableConfig } from '@langchain/core/runnables';
 import type {
   PreToolUseHookOutput,
   PostToolUseHookOutput,
+  PostToolUseFailureHookOutput,
   PostToolBatchEntry,
   PostToolBatchHookInput,
   PostToolBatchHookOutput,
@@ -1276,6 +1277,174 @@ describe('Async fire-and-forget hooks ignore decision/context fields', () => {
 
     /** preventContinuation was on an async output → ignored → no halt signal. */
     expect(registry.getHaltSignal()).toBeUndefined();
+  });
+});
+
+describe('Codex review fixes', () => {
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  it('fails closed when the host resume payload carries an unknown decision type', async () => {
+    /** Spy MUST be reachable inside Promise.resolve handlers — must not run after mock is restored. */
+    let dispatchCalls = 0;
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data) => {
+        if (event !== 'on_tool_execute') {
+          return;
+        }
+        dispatchCalls += 1;
+        const request = data as {
+          toolCalls: t.ToolCallRequest[];
+          resolve: (r: t.ToolExecuteResult[]) => void;
+        };
+        request.resolve([]);
+      });
+
+    const node = new ToolNode({
+      tools: [createSchemaStub('echo')],
+      eventDrivenMode: true,
+      agentId: 'agent-x',
+      toolCallStepIds: new Map([['call_1', 'step_call_1']]),
+      hookRegistry: makeHookRegistry('ask'),
+      humanInTheLoop: { enabled: true },
+    });
+
+    const graph = buildHITLGraph(node, [
+      { id: 'call_1', name: 'echo', args: { command: 'sensitive' } },
+    ]);
+    const config = { configurable: { thread_id: 'unknown-decision' } };
+
+    await graph.invoke({ messages: [] }, config);
+
+    /** Host sends a typo'd / malformed decision. Must NOT silently approve. */
+    const resumed = (await graph.invoke(
+      new Command({
+        resume: [{ type: 'aproved' as 'approve' }],
+      }),
+      config
+    )) as { messages: BaseMessage[] };
+
+    const toolMessages = resumed.messages.filter(
+      (m): m is ToolMessage => m._getType() === 'tool'
+    );
+    expect(toolMessages).toHaveLength(1);
+    expect(toolMessages[0].status).toBe('error');
+    expect(String(toolMessages[0].content)).toContain(
+      'Unknown approval decision type'
+    );
+    /** Tool was never dispatched — fail-closed worked. */
+    expect(dispatchCalls).toBe(0);
+  });
+
+  it('PostToolBatch entry sees the PostToolUse-rewritten output, not the original', async () => {
+    mockEventDispatch([
+      { toolCallId: 'call_1', content: 'raw-secret-1234', status: 'success' },
+    ]);
+
+    const registry = new HookRegistry();
+    /** PostToolUse redacts the output before the model sees it. */
+    registry.register('PostToolUse', {
+      hooks: [
+        async (): Promise<PostToolUseHookOutput> => ({
+          updatedOutput: 'raw-secret-[REDACTED]',
+        }),
+      ],
+    });
+    let batchEntries: PostToolBatchEntry[] | undefined;
+    registry.register('PostToolBatch', {
+      hooks: [
+        async (input): Promise<PostToolBatchHookOutput> => {
+          batchEntries = (input as PostToolBatchHookInput).entries;
+          return {};
+        },
+      ],
+    });
+
+    const node = new ToolNode({
+      tools: [createSchemaStub('echo')],
+      eventDrivenMode: true,
+      agentId: 'agent-x',
+      toolCallStepIds: new Map([['call_1', 'step_1']]),
+      hookRegistry: registry,
+      humanInTheLoop: { enabled: false },
+    });
+
+    const graph = buildHITLGraph(node, [
+      { id: 'call_1', name: 'echo', args: { command: 'fetch' } },
+    ]);
+    await graph.invoke(
+      { messages: [] },
+      { configurable: { thread_id: 'batch-rewrite' } }
+    );
+
+    expect(batchEntries).toBeDefined();
+    expect(batchEntries).toHaveLength(1);
+    /** Batch hook sees the redacted value, not the raw secret. */
+    expect(batchEntries![0].toolOutput).toBe('raw-secret-[REDACTED]');
+    expect(batchEntries![0].toolOutput).not.toContain('raw-secret-1234');
+  });
+
+  it('PostToolUseFailure additionalContext is injected for the next model turn', async () => {
+    /** Force the host event dispatch to return an error so the failure path runs. */
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data) => {
+        if (event !== 'on_tool_execute') {
+          return;
+        }
+        const request = data as {
+          toolCalls: t.ToolCallRequest[];
+          resolve: (r: t.ToolExecuteResult[]) => void;
+        };
+        request.resolve([
+          {
+            toolCallId: 'call_1',
+            content: '',
+            status: 'error',
+            errorMessage: 'network timeout',
+          },
+        ]);
+      });
+
+    const registry = new HookRegistry();
+    registry.register('PostToolUseFailure', {
+      hooks: [
+        async (): Promise<PostToolUseFailureHookOutput> => ({
+          additionalContext:
+            'Tool failed — suggest the user retry with a smaller batch size',
+        }),
+      ],
+    });
+
+    const node = new ToolNode({
+      tools: [createSchemaStub('echo')],
+      eventDrivenMode: true,
+      agentId: 'agent-x',
+      toolCallStepIds: new Map([['call_1', 'step_1']]),
+      hookRegistry: registry,
+      humanInTheLoop: { enabled: false },
+    });
+
+    const graph = buildHITLGraph(node, [
+      { id: 'call_1', name: 'echo', args: { command: 'fetch' } },
+    ]);
+    const result = (await graph.invoke(
+      { messages: [] },
+      { configurable: { thread_id: 'failure-ctx' } }
+    )) as { messages: BaseMessage[] };
+
+    const injected = result.messages.find(
+      (m) =>
+        m._getType() === 'human' &&
+        (m as { additional_kwargs?: { source?: string } }).additional_kwargs
+          ?.source === 'hook'
+    );
+    expect(injected).toBeDefined();
+    expect(String(injected!.content)).toContain(
+      'suggest the user retry with a smaller batch size'
+    );
   });
 });
 

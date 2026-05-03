@@ -1220,8 +1220,39 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
           if (decision.type === 'edit') {
             applyInputOverride(entry, decision.updatedInput);
+            approvedEntries.push(entry);
+            continue;
           }
-          approvedEntries.push(entry);
+
+          /**
+           * Defensive type widening: hosts deserialize resume payloads
+           * from untyped JSON, so the `decision.type` value at runtime
+           * is whatever string the wire sent — not necessarily one of
+           * the four union variants TS knows about. We compare against
+           * the literal `'approve'` through a widened view so a typo
+           * or schema drift (`'aproved'`, `null`, `undefined`) hits the
+           * fail-closed branch below instead of silently approving the
+           * tool. Without this widening, TS narrows the union after the
+           * three earlier branches and treats `=== 'approve'` as
+           * trivially true.
+           */
+          const declaredType = (decision as { type?: unknown }).type;
+          if (declaredType === 'approve') {
+            approvedEntries.push(entry);
+            continue;
+          }
+
+          /**
+           * Unknown / missing decision type — fail closed. The whole
+           * point of an approval gate is that "no decision" or
+           * "garbled decision" deny by default.
+           */
+          const unknownType =
+            typeof declaredType === 'string' ? declaredType : '<missing>';
+          blockEntry(
+            entry,
+            `Unknown approval decision type "${unknownType}" — failing closed`
+          );
         }
       }
     } else {
@@ -1321,6 +1352,15 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
         let contentString: string;
         let toolMessage: ToolMessage;
+        /**
+         * Tracks the post-PostToolUse-hook output so the
+         * `PostToolBatch` entry below sees the final transformed value
+         * even when a hook replaced the original via `updatedOutput`.
+         * Lives at the loop-iteration scope so the success branch can
+         * mutate it; the error branch leaves it unset (and the batch
+         * entry uses `error` instead of `toolOutput` in that case).
+         */
+        let finalToolOutput: unknown = result.content;
 
         if (result.status === 'error') {
           contentString = `Error: ${result.errorMessage ?? 'Unknown error'}\n Please fix your mistakes.`;
@@ -1352,7 +1392,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           });
 
           if (hasFailureHook) {
-            await executeHooks({
+            const failureHookResult = await executeHooks({
               registry: this.hookRegistry!,
               input: {
                 hook_event_name: 'PostToolUseFailure',
@@ -1368,9 +1408,21 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               },
               sessionId: runId,
               matchQuery: toolName,
-            }).catch(() => {
-              /* PostToolUseFailure is observational — swallow errors */
-            });
+            }).catch((): undefined => undefined);
+            /**
+             * Collect `additionalContext` from failure hooks too. Without
+             * this, recovery guidance returned on tool errors (e.g.
+             * "if this tool errors with X, suggest Y to the user") is
+             * silently dropped even though the API surface advertises
+             * `additionalContext` for this event. PostToolUseFailure
+             * remains observational for errors thrown by the hook
+             * itself, but a successfully-returned result is honored.
+             */
+            if (failureHookResult != null) {
+              for (const ctx of failureHookResult.additionalContexts) {
+                batchAdditionalContexts.push(ctx);
+              }
+            }
           }
         } else {
           let registryRaw =
@@ -1415,6 +1467,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                 replaced,
                 this.maxToolResultChars
               );
+              finalToolOutput = hookResult.updatedOutput;
             }
           }
 
@@ -1463,7 +1516,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           status: result.status === 'error' ? 'error' : 'success',
           ...(result.status === 'error'
             ? { error: result.errorMessage ?? 'Unknown error' }
-            : { toolOutput: result.content }),
+            : { toolOutput: finalToolOutput }),
         });
 
         messageByCallId.set(result.toolCallId, toolMessage);
