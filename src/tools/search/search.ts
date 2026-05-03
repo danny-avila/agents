@@ -418,6 +418,34 @@ const TAVILY_TIME_RANGE_MAP: Record<string, string> = {
 
 const DEFAULT_TAVILY_TIMEOUT = 15000;
 
+const TAVILY_COUNTRY_ALIASES: Record<string, string> = {
+  uk: 'united kingdom',
+};
+
+const TAVILY_REGION_NAMES = new Intl.DisplayNames(['en'], {
+  type: 'region',
+});
+
+const normalizeTavilyCountry = (country?: string): string | undefined => {
+  const normalizedCountry = country?.trim().toLowerCase();
+  if (normalizedCountry == null || normalizedCountry === '') {
+    return undefined;
+  }
+
+  const countryAlias = TAVILY_COUNTRY_ALIASES[normalizedCountry];
+  if (countryAlias != null) {
+    return countryAlias;
+  }
+
+  if (/^[a-z]{2}$/.test(normalizedCountry)) {
+    return TAVILY_REGION_NAMES.of(
+      normalizedCountry.toUpperCase()
+    )?.toLowerCase();
+  }
+
+  return normalizedCountry;
+};
+
 const getHostname = (link: string): string => {
   try {
     return new URL(link).hostname;
@@ -478,9 +506,10 @@ const createTavilyAPI = (
       if (timeRange != null) {
         payload.time_range = timeRange;
       }
-      const normalizedCountry = country?.trim().toLowerCase();
-      if (normalizedCountry != null && normalizedCountry !== '') {
-        payload.country = normalizedCountry;
+      const tavilyCountry =
+        topic === 'general' ? normalizeTavilyCountry(country) : undefined;
+      if (tavilyCountry != null) {
+        payload.country = tavilyCountry;
       }
       if (type === 'images' || options?.includeImages) {
         payload.include_images = true;

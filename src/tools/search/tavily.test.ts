@@ -59,7 +59,7 @@ describe('Tavily search API', () => {
 
     expect(payload).toMatchObject({
       query: 'example query',
-      country: 'us',
+      country: 'united states',
       include_answer: 'advanced',
       include_raw_content: 'markdown',
       include_images: true,
@@ -82,6 +82,32 @@ describe('Tavily search API', () => {
       imageUrl: 'https://example.com/second.png',
       position: 2,
     });
+  });
+
+  it('omits country for Tavily news searches', async () => {
+    mockedAxios.post.mockResolvedValueOnce({
+      data: {
+        results: [],
+      },
+    });
+
+    const searchAPI = createSearchAPI({
+      searchProvider: 'tavily',
+      tavilyApiKey: 'test-key',
+    });
+
+    await searchAPI.getSources({
+      query: 'example query',
+      country: 'US',
+      news: true,
+    });
+    const [, payload] = mockedAxios.post.mock.calls[0];
+
+    expect(payload).toMatchObject({
+      query: 'example query',
+      topic: 'news',
+    });
+    expect(payload).not.toHaveProperty('country');
   });
 });
 
