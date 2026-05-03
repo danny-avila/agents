@@ -561,7 +561,7 @@ const createTavilyAPI = (
       if (options?.includeFavicon != null) {
         payload.include_favicon = options.includeFavicon;
       }
-      if (options?.chunksPerSource != null) {
+      if (options?.chunksPerSource != null && searchDepth === 'advanced') {
         payload.chunks_per_source = options.chunksPerSource;
       }
 

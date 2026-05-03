@@ -165,6 +165,53 @@ describe('Tavily search API', () => {
     });
     expect(payload).not.toHaveProperty('safe_search');
   });
+
+  it('only sends chunks per source for advanced Tavily searches', async () => {
+    mockedAxios.post.mockResolvedValue({
+      data: {
+        results: [],
+      },
+    });
+
+    const basicSearchAPI = createSearchAPI({
+      searchProvider: 'tavily',
+      tavilyApiKey: 'test-key',
+      tavilySearchOptions: {
+        chunksPerSource: 2,
+      },
+    });
+
+    await basicSearchAPI.getSources({
+      query: 'example query',
+    });
+    const [, basicPayload] = mockedAxios.post.mock.calls[0];
+
+    expect(basicPayload).toMatchObject({
+      query: 'example query',
+      search_depth: 'basic',
+    });
+    expect(basicPayload).not.toHaveProperty('chunks_per_source');
+
+    const advancedSearchAPI = createSearchAPI({
+      searchProvider: 'tavily',
+      tavilyApiKey: 'test-key',
+      tavilySearchOptions: {
+        searchDepth: 'advanced',
+        chunksPerSource: 2,
+      },
+    });
+
+    await advancedSearchAPI.getSources({
+      query: 'example query',
+    });
+    const [, advancedPayload] = mockedAxios.post.mock.calls[1];
+
+    expect(advancedPayload).toMatchObject({
+      query: 'example query',
+      search_depth: 'advanced',
+      chunks_per_source: 2,
+    });
+  });
 });
 
 describe('TavilyScraper', () => {
@@ -280,7 +327,6 @@ describe('TavilyScraper', () => {
       });
       await scraper.scrapeUrl('https://example.com', {
         includeFavicon: true,
-        chunksPerSource: 4,
         format: 'text',
         timeout: 2000,
       });
@@ -289,10 +335,10 @@ describe('TavilyScraper', () => {
       expect(payload).toMatchObject({
         urls: ['https://example.com'],
         include_favicon: true,
-        chunks_per_source: 4,
         format: 'text',
         timeout: 2,
       });
+      expect(payload).not.toHaveProperty('chunks_per_source');
       expect(config).toMatchObject({ timeout: 2000 });
     });
 

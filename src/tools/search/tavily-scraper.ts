@@ -14,7 +14,6 @@ export class TavilyScraper implements t.BaseScraper {
   private extractDepth: 'basic' | 'advanced';
   private includeImages: boolean;
   private includeFavicon: boolean;
-  private chunksPerSource: number | undefined;
   private format: 'markdown' | 'text' | undefined;
 
   constructor(config: t.TavilyScraperConfig = {}) {
@@ -28,7 +27,6 @@ export class TavilyScraper implements t.BaseScraper {
     this.extractDepth = config.extractDepth ?? 'basic';
     this.includeImages = config.includeImages ?? false;
     this.includeFavicon = config.includeFavicon ?? false;
-    this.chunksPerSource = config.chunksPerSource;
     this.format = config.format;
     this.logger = config.logger || createDefaultLogger();
 
@@ -79,7 +77,6 @@ export class TavilyScraper implements t.BaseScraper {
   ): Promise<Array<[string, t.TavilyScrapeResponse]>> {
     try {
       const includeFavicon = options.includeFavicon ?? this.includeFavicon;
-      const chunksPerSource = options.chunksPerSource ?? this.chunksPerSource;
       const format = options.format ?? this.format;
       const payload: Record<string, unknown> = {
         urls,
@@ -89,9 +86,6 @@ export class TavilyScraper implements t.BaseScraper {
 
       if (includeFavicon) {
         payload.include_favicon = true;
-      }
-      if (chunksPerSource != null) {
-        payload.chunks_per_source = chunksPerSource;
       }
       if (format != null) {
         payload.format = format;

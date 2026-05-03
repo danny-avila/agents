@@ -135,7 +135,6 @@ export interface TavilyScraperConfig {
   extractDepth?: 'basic' | 'advanced';
   includeImages?: boolean;
   includeFavicon?: boolean;
-  chunksPerSource?: number;
   format?: 'markdown' | 'text';
 }
 
