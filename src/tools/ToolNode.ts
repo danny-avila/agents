@@ -1229,6 +1229,16 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             type: 'reject' as const,
             reason: 'No decision provided for tool approval',
           };
+          /**
+           * Read `decision.type` through a widened view once: hosts
+           * deserialize resume payloads from untyped JSON, so the
+           * runtime value can be a typo, the wrong type, or missing
+           * entirely. Both the `allowedDecisions` enforcement
+           * immediately below and the unknown-type fallthrough at the
+           * end of this loop body share this single read so the
+           * fail-closed checks compare against the same source.
+           */
+          const declaredType = (decision as { type?: unknown }).type;
 
           /**
            * Enforce the per-tool `allowedDecisions` allowlist that the
@@ -1238,23 +1248,18 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
            * host could submit a decision type the policy explicitly
            * forbids (e.g. `'edit'` when the hook restricted to
            * `['approve', 'reject']`), bypassing argument-mutation /
-           * response-substitution safeguards. Read `decision.type`
-           * through a widened view so a typo doesn't slip past TS
-           * narrowing, and fail closed when the declared type isn't
-           * in the allowlist.
+           * response-substitution safeguards. Fail closed when the
+           * declared type isn't in the allowlist.
            */
-          const declaredDecisionType = (decision as { type?: unknown }).type;
           if (
             allowedDecisions != null &&
-            (typeof declaredDecisionType !== 'string' ||
+            (typeof declaredType !== 'string' ||
               !allowedDecisions.includes(
-                declaredDecisionType as t.ToolApprovalDecisionType
+                declaredType as t.ToolApprovalDecisionType
               ))
           ) {
             const offered =
-              typeof declaredDecisionType === 'string'
-                ? declaredDecisionType
-                : '<missing>';
+              typeof declaredType === 'string' ? declaredType : '<missing>';
             blockEntry(
               entry,
               `Decision "${offered}" not in allowedDecisions [${allowedDecisions.join(', ')}] — failing closed`
@@ -1325,14 +1330,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
            * from untyped JSON, so the `decision.type` value at runtime
            * is whatever string the wire sent — not necessarily one of
            * the four union variants TS knows about. We compare against
-           * the literal `'approve'` through a widened view so a typo
-           * or schema drift (`'aproved'`, `null`, `undefined`) hits the
-           * fail-closed branch below instead of silently approving the
-           * tool. Without this widening, TS narrows the union after the
-           * three earlier branches and treats `=== 'approve'` as
+           * the literal `'approve'` through the widened `declaredType`
+           * captured at the top of this iteration, so a typo or schema
+           * drift (`'aproved'`, `null`, `undefined`) hits the fail-
+           * closed branch below instead of silently approving the
+           * tool. Without this widening, TS narrows the union after
+           * the three earlier branches and treats `=== 'approve'` as
            * trivially true.
            */
-          const declaredType = (decision as { type?: unknown }).type;
           if (declaredType === 'approve') {
             approvedEntries.push(entry);
             continue;
