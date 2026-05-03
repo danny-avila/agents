@@ -139,6 +139,31 @@ describe('Tavily search API', () => {
     expect(payload).not.toHaveProperty('safe_search');
   });
 
+  it('omits ISO country mappings that Tavily does not support', async () => {
+    mockedAxios.post.mockResolvedValueOnce({
+      data: {
+        results: [],
+      },
+    });
+
+    const searchAPI = createSearchAPI({
+      searchProvider: 'tavily',
+      tavilyApiKey: 'test-key',
+    });
+
+    await searchAPI.getSources({
+      query: 'example query',
+      country: 'CD',
+    });
+    const [, payload] = mockedAxios.post.mock.calls[0];
+
+    expect(payload).toMatchObject({
+      query: 'example query',
+    });
+    expect(payload).not.toHaveProperty('country');
+    expect(payload).not.toHaveProperty('safe_search');
+  });
+
   it('omits safe search for unsupported Tavily search depths', async () => {
     mockedAxios.post.mockResolvedValueOnce({
       data: {
