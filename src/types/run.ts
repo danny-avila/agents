@@ -12,6 +12,7 @@ import type * as e from '@/common/enum';
 import type * as g from '@/types/graph';
 import type * as l from '@/types/llm';
 import type { ToolSessionMap, ToolOutputReferencesConfig } from '@/types/tools';
+import type { HumanInTheLoopConfig } from '@/types/hitl';
 import type { HookRegistry } from '@/hooks';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -156,6 +157,26 @@ export type RunConfig = {
    * placeholders. Disabled by default so existing runs are unaffected.
    */
   toolOutputReferences?: ToolOutputReferencesConfig;
+  /**
+   * Enables first-class human-in-the-loop (HITL) flow for this run.
+   *
+   * When `humanInTheLoop.enabled` is `true`:
+   *   - `PreToolUse` hooks returning `decision: 'ask'` raise a real
+   *     LangGraph `interrupt()` instead of being treated as a synchronous
+   *     deny. The graph pauses and the run exits cleanly.
+   *   - If `graphConfig.compileOptions.checkpointer` is missing, the SDK
+   *     installs an in-memory `MemorySaver` as a fallback so scripts and
+   *     tests can resume without external infrastructure. Production
+   *     hosts should always provide a durable checkpointer.
+   *   - Hosts inspect the pending interrupt via `run.getInterrupt()` and
+   *     continue with `Run.resume(decisions)` against a Run rebuilt with
+   *     the same `thread_id` and checkpointer.
+   *
+   * When `humanInTheLoop` is omitted or `enabled` is `false`, behavior is
+   * identical to today: `ask` decisions remain fail-closed and no
+   * checkpointer is implicitly attached.
+   */
+  humanInTheLoop?: HumanInTheLoopConfig;
 };
 
 export type ProvidedCallbacks =

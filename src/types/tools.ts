@@ -5,6 +5,7 @@ import type { ToolCall } from '@langchain/core/messages/tool';
 import type { HookRegistry } from '@/hooks';
 import type { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import type { MessageContentComplex, ToolErrorData } from './stream';
+import type { HumanInTheLoopConfig } from './hitl';
 
 /** Replacement type for `import type { ToolCall } from '@langchain/core/messages/tool'` in order to have stringified args typed */
 export type CustomToolCall = {
@@ -56,6 +57,14 @@ export type ToolNodeOptions = {
    * routed through `directToolNames` bypass hook dispatch entirely.
    */
   hookRegistry?: HookRegistry;
+  /**
+   * Run-scoped HITL config. When `enabled`, a `PreToolUse` hook returning
+   * `decision: 'ask'` raises a real LangGraph `interrupt()` carrying a
+   * `HumanInterruptPayload`; the host resumes with `Run.resume(decisions)`.
+   * When `undefined` or `enabled === false`, `ask` decisions are treated
+   * as a fail-closed deny exactly as in the pre-HITL behavior.
+   */
+  humanInTheLoop?: HumanInTheLoopConfig;
   /** Max context tokens for the agent — used to compute tool result truncation limits. */
   maxContextTokens?: number;
   /**

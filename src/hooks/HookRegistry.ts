@@ -31,9 +31,24 @@ type MatcherBucket = Partial<Record<HookEvent, HookMatcher<HookEvent>[]>>;
  * Map mutates in place, keeping insertions O(1). This mirrors the reasoning
  * Claude Code documents at `utils/hooks/sessionHooks.ts:62`.
  */
+/**
+ * Snapshot of a halt request raised by a hook returning
+ * `preventContinuation: true`. The SDK's run loop polls for this between
+ * stream events and exits cleanly when set, skipping the `Stop` hook
+ * (the run is being halted, not naturally completing). One per registry
+ * instance — the first hook to halt wins; subsequent halts are ignored
+ * so the original reason isn't clobbered.
+ */
+export interface HookHaltSignal {
+  reason: string;
+  /** Event of the hook that triggered the halt (for diagnostics). */
+  source: HookEvent;
+}
+
 export class HookRegistry {
   private readonly global: MatcherBucket = {};
   private readonly sessions: Map<string, MatcherBucket> = new Map();
+  private _haltSignal: HookHaltSignal | undefined;
 
   /**
    * Register a matcher for the lifetime of this registry (= one Run).
@@ -123,6 +138,41 @@ export class HookRegistry {
    */
   clearSession(sessionId: string): void {
     this.sessions.delete(sessionId);
+  }
+
+  /**
+   * Raise a halt signal that the SDK's run loop polls between stream
+   * events. First-write-wins: a halt already raised by an earlier hook
+   * is preserved so the original `reason` / `source` aren't overwritten.
+   *
+   * Called by the SDK after `executeHooks` returns an aggregate with
+   * `preventContinuation: true`. Hosts can also call it directly from
+   * inside a hook callback if they want to halt without going through
+   * the aggregated return value, but `preventContinuation` is the
+   * canonical path.
+   */
+  haltRun(reason: string, source: HookEvent): void {
+    if (this._haltSignal !== undefined) {
+      return;
+    }
+    this._haltSignal = { reason, source };
+  }
+
+  /**
+   * Returns the current halt signal, or `undefined` if no hook has
+   * raised one. Polled by `Run.processStream` after each stream event.
+   */
+  getHaltSignal(): HookHaltSignal | undefined {
+    return this._haltSignal;
+  }
+
+  /**
+   * Clears any pending halt signal. Called by `Run.processStream` in
+   * its `finally` block so a subsequent invocation of the same Run
+   * (e.g. resume) starts with a fresh halt state.
+   */
+  clearHaltSignal(): void {
+    this._haltSignal = undefined;
   }
 
   /** True if at least one matcher exists for `event` (global + session). */

@@ -15,6 +15,7 @@ export const HOOK_EVENTS = [
   'PreToolUse',
   'PostToolUse',
   'PostToolUseFailure',
+  'PostToolBatch',
   'PermissionDenied',
   'SubagentStart',
   'SubagentStop',
@@ -100,6 +101,42 @@ export interface PostToolUseFailureHookInput extends BaseHookInput {
   turn?: number;
 }
 
+/**
+ * Per-tool result snapshot included in a `PostToolBatch` event. Mirrors
+ * the data PostToolUse / PostToolUseFailure get individually, but the
+ * batch view lets a single hook see the whole set so it can inject one
+ * consolidated convention/audit message rather than N per-tool ones.
+ */
+export interface PostToolBatchEntry {
+  toolName: string;
+  toolInput: Record<string, unknown>;
+  toolUseId: string;
+  stepId?: string;
+  turn?: number;
+  /** Successful tool output, present only when `status === 'success'`. */
+  toolOutput?: unknown;
+  /** Error message, present only when `status === 'error'`. */
+  error?: string;
+  status: 'success' | 'error';
+}
+
+/**
+ * Fires once after every tool call in a single batch finishes (including
+ * any that were rejected via HITL). Lets a hook react to the batch as a
+ * whole — useful for "inject conventions once for the whole batch", batch
+ * audit logging, or coordinating cleanup that depends on knowing the full
+ * result set rather than streaming each tool's result independently.
+ *
+ * Order: fires AFTER all per-tool PostToolUse / PostToolUseFailure hooks
+ * for the same batch have completed, BEFORE the next model call. Pass an
+ * `additionalContext` to inject context for that next model turn.
+ */
+export interface PostToolBatchHookInput extends BaseHookInput {
+  hook_event_name: 'PostToolBatch';
+  /** All tool calls (and their outcomes) from this batch, in batch order. */
+  entries: PostToolBatchEntry[];
+}
+
 export interface PermissionDeniedHookInput extends BaseHookInput {
   hook_event_name: 'PermissionDenied';
   toolName: string;
@@ -171,6 +208,7 @@ export type HookInput =
   | PreToolUseHookInput
   | PostToolUseHookInput
   | PostToolUseFailureHookInput
+  | PostToolBatchHookInput
   | PermissionDeniedHookInput
   | SubagentStartHookInput
   | SubagentStopHookInput
@@ -186,6 +224,7 @@ export type HookInputByEvent = {
   PreToolUse: PreToolUseHookInput;
   PostToolUse: PostToolUseHookInput;
   PostToolUseFailure: PostToolUseFailureHookInput;
+  PostToolBatch: PostToolBatchHookInput;
   PermissionDenied: PermissionDeniedHookInput;
   SubagentStart: SubagentStartHookInput;
   SubagentStop: SubagentStopHookInput;
@@ -206,6 +245,34 @@ export interface BaseHookOutput {
   preventContinuation?: boolean;
   /** Reason reported alongside `preventContinuation`. */
   stopReason?: string;
+  /**
+   * Marks this hook output as fire-and-forget. When `true`, the SDK
+   * ignores every other field (decision, additionalContext, updatedInput,
+   * preventContinuation, etc.) — the agent already moved on, so a hook
+   * returning `async: true` cannot block, modify, or inject context. Use
+   * for pure side effects (logging, metrics, webhooks).
+   *
+   * Mirrors Claude Code Agent SDK's `async` output. Background work
+   * inside the hook body still runs; the agent simply doesn't wait for
+   * its results to influence behavior.
+   *
+   * @example
+   * ```ts
+   * async (input) => {
+   *   void sendToLoggingService(input).catch(console.error);
+   *   return { async: true };
+   * };
+   * ```
+   */
+  async?: boolean;
+  /**
+   * Optional advisory timeout in milliseconds for the background work
+   * kicked off by an `async: true` hook. The SDK does not enforce this
+   * — hosts read it from telemetry or wire their own AbortSignal — but
+   * the field is preserved on the wire so downstream observability can
+   * surface long-running side effects. Ignored unless `async` is true.
+   */
+  asyncTimeout?: number;
 }
 
 export type RunStartHookOutput = BaseHookOutput;
@@ -229,6 +296,19 @@ export interface PreToolUseHookOutput extends BaseHookOutput {
    * `updatedInput` to one hook per matcher to avoid confusing precedence.
    */
   updatedInput?: Record<string, unknown>;
+  /**
+   * Restricts which decisions the host UI is allowed to surface for this
+   * tool call when the hook returns `decision: 'ask'`. Pass to lock a
+   * tool down to a subset of `'approve' | 'reject' | 'edit' | 'respond'`
+   * — for example, `['approve', 'reject']` to forbid the user from
+   * editing the tool's args or substituting a custom response.
+   *
+   * The values flow into the resulting interrupt's
+   * `review_configs[i].allowed_decisions`. Omitting the field keeps the
+   * SDK default (all four decisions advertised). Last-writer-wins in
+   * registration order, same precedence rules as `updatedInput`.
+   */
+  allowedDecisions?: ReadonlyArray<'approve' | 'reject' | 'edit' | 'respond'>;
 }
 
 export interface PostToolUseHookOutput extends BaseHookOutput {
@@ -242,6 +322,8 @@ export interface PostToolUseHookOutput extends BaseHookOutput {
 }
 
 export type PostToolUseFailureHookOutput = BaseHookOutput;
+
+export type PostToolBatchHookOutput = BaseHookOutput;
 
 export type PermissionDeniedHookOutput = BaseHookOutput;
 
@@ -270,6 +352,7 @@ export type HookOutputByEvent = {
   PreToolUse: PreToolUseHookOutput;
   PostToolUse: PostToolUseHookOutput;
   PostToolUseFailure: PostToolUseFailureHookOutput;
+  PostToolBatch: PostToolBatchHookOutput;
   PermissionDenied: PermissionDeniedHookOutput;
   SubagentStart: SubagentStartHookOutput;
   SubagentStop: SubagentStopHookOutput;
@@ -286,6 +369,7 @@ export type HookOutput =
   | PreToolUseHookOutput
   | PostToolUseHookOutput
   | PostToolUseFailureHookOutput
+  | PostToolBatchHookOutput
   | PermissionDeniedHookOutput
   | SubagentStartHookOutput
   | SubagentStopHookOutput
@@ -381,6 +465,12 @@ export interface AggregatedHookResult {
    * hook per matcher to avoid subtle precedence bugs.
    */
   updatedInput?: Record<string, unknown>;
+  /**
+   * Restricted decision set from a `PreToolUse` hook. Same last-writer-wins
+   * semantics as `updatedInput`. Surfaces to the interrupt payload's
+   * `review_configs[i].allowed_decisions`.
+   */
+  allowedDecisions?: ReadonlyArray<'approve' | 'reject' | 'edit' | 'respond'>;
   /**
    * Replacement tool output from a `PostToolUse` hook.
    *

@@ -130,6 +130,13 @@ export abstract class Graph<
   handlerRegistry: HandlerRegistry | undefined;
   hookRegistry: HookRegistry | undefined;
   /**
+   * Run-scoped HITL configuration. When `humanInTheLoop?.enabled` is
+   * `true`, `ToolNode` raises a real `interrupt()` for `PreToolUse`
+   * `ask` decisions instead of treating them as a synchronous deny.
+   * Threaded from `RunConfig.humanInTheLoop`.
+   */
+  humanInTheLoop: t.HumanInTheLoopConfig | undefined;
+  /**
    * Run-scoped config for the tool output reference registry. Threaded
    * from `RunConfig.toolOutputReferences` down into every ToolNode this
    * graph compiles.
@@ -167,6 +174,7 @@ export abstract class Graph<
     this.invokedToolIds = undefined;
     this.handlerRegistry = undefined;
     this.hookRegistry = undefined;
+    this.humanInTheLoop = undefined;
     this.toolOutputReferences = undefined;
     /**
      * ToolNodes compiled from this graph captured the registry
@@ -579,6 +587,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         toolCallStepIds: this.toolCallStepIds,
         toolRegistry: agentContext?.toolRegistry,
         hookRegistry: this.hookRegistry,
+        humanInTheLoop: this.humanInTheLoop,
         directToolNames: directToolNames.size > 0 ? directToolNames : undefined,
         maxContextTokens: agentContext?.maxContextTokens,
         maxToolResultChars: agentContext?.maxToolResultChars,

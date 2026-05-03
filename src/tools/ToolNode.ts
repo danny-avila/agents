@@ -10,9 +10,11 @@ import {
   Send,
   Command,
   isCommand,
+  interrupt,
   isGraphInterrupt,
   MessagesAnnotation,
 } from '@langchain/langgraph';
+import { AsyncLocalStorageProviderSingleton } from '@langchain/core/singletons';
 import type {
   RunnableConfig,
   RunnableToolLike,
@@ -24,7 +26,11 @@ import type {
   PreResolvedArgsMap,
   ResolvedArgsByCallId,
 } from '@/tools/toolOutputReferences';
-import type { HookRegistry, AggregatedHookResult } from '@/hooks';
+import type {
+  HookRegistry,
+  AggregatedHookResult,
+  PostToolBatchEntry,
+} from '@/hooks';
 import type * as t from '@/types';
 import { RunnableCallable } from '@/utils';
 import {
@@ -88,6 +94,42 @@ type DispatchBatchContext = {
  */
 function isSend(value: unknown): value is Send {
   return value instanceof Send;
+}
+
+/**
+ * Build a `tool_call_id → ToolApprovalDecision` map from the host's
+ * resume value. Hosts may return decisions either as an array (one per
+ * action_request, in order) or as a record keyed by `tool_call_id`. Any
+ * unrecognized shape (or a decision missing for a given call id) is
+ * treated as "no decision" by callers — typically rejected so the run
+ * doesn't silently invoke a tool the human never approved.
+ */
+function normalizeApprovalDecisions(
+  callIds: string[],
+  resumeValue: t.ToolApprovalDecision[] | t.ToolApprovalDecisionMap | undefined
+): Map<string, t.ToolApprovalDecision> {
+  const map = new Map<string, t.ToolApprovalDecision>();
+  if (resumeValue == null) {
+    return map;
+  }
+  if (Array.isArray(resumeValue)) {
+    const limit = Math.min(callIds.length, resumeValue.length);
+    for (let i = 0; i < limit; i++) {
+      map.set(callIds[i], resumeValue[i]);
+    }
+    return map;
+  }
+  if (typeof resumeValue === 'object') {
+    for (const callId of callIds) {
+      const decision = (resumeValue as Partial<t.ToolApprovalDecisionMap>)[
+        callId
+      ];
+      if (decision !== undefined) {
+        map.set(callId, decision);
+      }
+    }
+  }
+  return map;
 }
 
 /**
@@ -172,6 +214,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   /** Hook registry for PreToolUse/PostToolUse lifecycle hooks */
   private hookRegistry?: HookRegistry;
   /**
+   * Run-scoped HITL config. When `enabled`, `ask` decisions from
+   * PreToolUse hooks raise a LangGraph `interrupt()` instead of being
+   * treated as fail-closed denies.
+   */
+  private humanInTheLoop?: t.HumanInTheLoopConfig;
+  /**
    * Registry of tool outputs keyed by `tool<idx>turn<turn>`.
    *
    * Populated only when `toolOutputReferences.enabled` is true. The
@@ -209,6 +257,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     maxContextTokens,
     maxToolResultChars,
     hookRegistry,
+    humanInTheLoop,
     toolOutputReferences,
     toolOutputRegistry,
   }: t.ToolNodeConstructorParams) {
@@ -227,6 +276,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     this.maxToolResultChars =
       maxToolResultChars ?? calculateMaxToolResultChars(maxContextTokens);
     this.hookRegistry = hookRegistry;
+    this.humanInTheLoop = humanInTheLoop;
     /**
      * Precedence: an explicitly passed `toolOutputRegistry` instance
      * wins over a config object so a host (`Graph`) can share one
@@ -881,16 +931,37 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
     const messageByCallId = new Map<string, ToolMessage>();
     const approvedEntries: typeof preToolCalls = [];
+    /**
+     * Batch-level accumulator for `additionalContext` strings returned
+     * by any PreToolUse / PostToolUse / PostToolUseFailure hook in this
+     * dispatch. We emit one consolidated `HumanMessage` after all tool
+     * results land so the next model turn sees the injected context
+     * exactly once, ordered after the ToolMessages.
+     */
+    const batchAdditionalContexts: string[] = [];
+    /**
+     * Batch-level outcome record. Captures every tool call's final
+     * result (success / error from the host, blocked from HITL reject,
+     * substituted from HITL respond) so a single `PostToolBatch` hook
+     * sees the whole set in batch order.
+     */
+    const postToolBatchEntries: PostToolBatchEntry[] = [];
     const HOOK_FALLBACK: AggregatedHookResult = Object.freeze({
       additionalContexts: [] as string[],
       errors: [] as string[],
     });
 
     if (this.hookRegistry?.hasHookFor('PreToolUse', runId) === true) {
+      /**
+       * Capture as a non-null local so the inner `blockEntry` closure
+       * doesn't lose narrowing on `this.hookRegistry` and we don't have
+       * to defensively `?.` it across every reference inside.
+       */
+      const hookRegistry = this.hookRegistry;
       const preResults = await Promise.all(
         preToolCalls.map((entry) =>
           executeHooks({
-            registry: this.hookRegistry!,
+            registry: hookRegistry,
             input: {
               hook_event_name: 'PreToolUse',
               runId,
@@ -908,88 +979,250 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         )
       );
 
+      type PendingEntry = (typeof preToolCalls)[number];
+
+      const blockEntry = (entry: PendingEntry, reason: string): void => {
+        const contentString = `Blocked: ${reason}`;
+        messageByCallId.set(
+          entry.call.id!,
+          new ToolMessage({
+            status: 'error',
+            content: contentString,
+            name: entry.call.name,
+            tool_call_id: entry.call.id!,
+          })
+        );
+        postToolBatchEntries.push({
+          toolName: entry.call.name,
+          toolInput: entry.args,
+          toolUseId: entry.call.id!,
+          stepId: entry.stepId,
+          status: 'error',
+          error: contentString,
+        });
+        this.dispatchStepCompleted(
+          entry.call.id!,
+          entry.call.name,
+          entry.args,
+          contentString,
+          config
+        );
+        if (hookRegistry.hasHookFor('PermissionDenied', runId)) {
+          executeHooks({
+            registry: hookRegistry,
+            input: {
+              hook_event_name: 'PermissionDenied',
+              runId,
+              threadId,
+              agentId: this.agentId,
+              toolName: entry.call.name,
+              toolInput: entry.args,
+              toolUseId: entry.call.id!,
+              reason,
+            },
+            sessionId: runId,
+            matchQuery: entry.call.name,
+          }).catch(() => {
+            /* PermissionDenied is observational — swallow errors */
+          });
+        }
+      };
+
+      /**
+       * Apply a hook-supplied or host-supplied input override to a pending
+       * entry, re-running the `{{tool<i>turn<n>}}` resolver so any new
+       * placeholders introduced by the override are substituted (and any
+       * formerly-unresolved refs cleared from the unresolved set).
+       *
+       * Mixed direct+event batches must use the pre-batch snapshot so a
+       * hook-introduced placeholder cannot accidentally resolve to a
+       * same-turn direct output that has just registered. Pure event
+       * batches don't have a snapshot and resolve against the live
+       * registry — safe because no event-side registrations have happened
+       * yet.
+       */
+      const applyInputOverride = (
+        entry: PendingEntry,
+        nextArgs: Record<string, unknown>
+      ): void => {
+        if (registry != null) {
+          const view: ToolOutputResolveView = preBatchSnapshot ?? {
+            resolve: <T>(args: T) => registry.resolve(registryRunId, args),
+          };
+          const { resolved, unresolved } = view.resolve(nextArgs);
+          entry.args = resolved as Record<string, unknown>;
+          if (entry.call.id != null) {
+            if (unresolved.length > 0) {
+              unresolvedByCallId.set(entry.call.id, unresolved);
+            } else {
+              unresolvedByCallId.delete(entry.call.id);
+            }
+          }
+          return;
+        }
+        entry.args = nextArgs;
+      };
+
+      const askEntries: Array<{
+        entry: PendingEntry;
+        reason?: string;
+        allowedDecisions?: ReadonlyArray<
+          'approve' | 'reject' | 'edit' | 'respond'
+        >;
+      }> = [];
+
       for (let i = 0; i < preToolCalls.length; i++) {
         const hookResult = preResults[i];
         const entry = preToolCalls[i];
-        const isDenied =
-          hookResult.decision === 'deny' || hookResult.decision === 'ask';
-        if (isDenied) {
-          const reason = hookResult.reason ?? 'Blocked by hook';
-          const contentString = `Blocked: ${reason}`;
-          messageByCallId.set(
-            entry.call.id!,
-            new ToolMessage({
-              status: 'error',
-              content: contentString,
-              name: entry.call.name,
-              tool_call_id: entry.call.id!,
-            })
-          );
-          this.dispatchStepCompleted(
-            entry.call.id!,
-            entry.call.name,
-            entry.args,
-            contentString,
-            config
-          );
-          if (this.hookRegistry.hasHookFor('PermissionDenied', runId)) {
-            executeHooks({
-              registry: this.hookRegistry,
-              input: {
-                hook_event_name: 'PermissionDenied',
-                runId,
-                threadId,
-                agentId: this.agentId,
-                toolName: entry.call.name,
-                toolInput: entry.args,
-                toolUseId: entry.call.id!,
-                reason,
-              },
-              sessionId: runId,
-              matchQuery: entry.call.name,
-            }).catch(() => {
-              /* PermissionDenied is observational — swallow errors */
-            });
-          }
+
+        for (const ctx of hookResult.additionalContexts) {
+          batchAdditionalContexts.push(ctx);
+        }
+
+        if (hookResult.decision === 'deny') {
+          blockEntry(entry, hookResult.reason ?? 'Blocked by hook');
           continue;
         }
-        if (hookResult.updatedInput != null) {
+
+        if (hookResult.decision === 'ask') {
           /**
-           * Re-resolve after PreToolUse replaces the input: a hook may
-           * introduce new `{{tool<i>turn<n>}}` placeholders (e.g., by
-           * copying user-supplied text) that the pre-hook pass never
-           * saw. Re-running the resolver on the hook-rewritten args
-           * keeps substitution and the unresolved-refs record in sync
-           * with what the tool will actually receive.
+           * HITL is on by default — only the explicit opt-out
+           * (`humanInTheLoop: { enabled: false }`) falls back to the
+           * pre-HITL fail-closed path where `ask` collapses into a
+           * blocked tool with an error `ToolMessage`. Otherwise the
+           * entry queues for a single batched `interrupt()` call below.
            */
-          if (registry != null) {
-            /**
-             * Mixed direct+event batches must use the pre-batch
-             * snapshot so a hook-introduced placeholder cannot
-             * accidentally resolve to a same-turn direct output that
-             * has just registered. Pure event batches don't have a
-             * snapshot and resolve against the live registry — safe
-             * because no event-side registrations have happened yet.
-             */
-            const view: ToolOutputResolveView = preBatchSnapshot ?? {
-              resolve: <T>(args: T) => registry.resolve(registryRunId, args),
-            };
-            const { resolved, unresolved } = view.resolve(
-              hookResult.updatedInput
-            );
-            entry.args = resolved as Record<string, unknown>;
-            if (entry.call.id != null) {
-              if (unresolved.length > 0) {
-                unresolvedByCallId.set(entry.call.id, unresolved);
-              } else {
-                unresolvedByCallId.delete(entry.call.id);
-              }
-            }
-          } else {
-            entry.args = hookResult.updatedInput;
+          if (this.humanInTheLoop?.enabled === false) {
+            blockEntry(entry, hookResult.reason ?? 'Blocked by hook');
+            continue;
           }
+          askEntries.push({
+            entry,
+            reason: hookResult.reason,
+            allowedDecisions: hookResult.allowedDecisions,
+          });
+          continue;
+        }
+
+        if (hookResult.updatedInput != null) {
+          applyInputOverride(entry, hookResult.updatedInput);
         }
         approvedEntries.push(entry);
+      }
+
+      /**
+       * If any entries asked for approval, raise a single LangGraph
+       * `interrupt()` carrying every pending request together. The host
+       * pauses, gathers human input, and resumes the run with one
+       * decision per request. On resume LangGraph re-executes this node
+       * from the start; `interrupt()` then returns the resume value
+       * instead of throwing, so the loop above re-runs and the same
+       * `askEntries` list is rebuilt deterministically (assuming hooks
+       * are pure — see `humanInTheLoop` docs).
+       */
+      if (askEntries.length > 0) {
+        const payload: t.ToolApprovalInterruptPayload = {
+          type: 'tool_approval',
+          action_requests: askEntries.map(({ entry, reason }) => {
+            const request: t.ToolApprovalRequest = {
+              tool_call_id: entry.call.id!,
+              name: entry.call.name,
+              arguments: entry.args,
+            };
+            if (reason != null) {
+              request.description = reason;
+            }
+            return request;
+          }),
+          review_configs: askEntries.map(({ entry, allowedDecisions }) => ({
+            action_name: entry.call.name,
+            allowed_decisions: (allowedDecisions ?? [
+              'approve',
+              'reject',
+              'edit',
+              'respond',
+            ]) as t.ToolApprovalDecisionType[],
+          })),
+        };
+
+        /**
+         * `interrupt()` reads the current `RunnableConfig` from
+         * AsyncLocalStorage, but our `RunnableCallable` sets
+         * `trace = false` for ToolNode (intentional — avoids LangSmith
+         * tracing per tool call). Without the trace path, the upstream
+         * `runWithConfig` frame is never established, so we re-anchor
+         * here using the node's own `config` — Pregel hands us a
+         * config that already carries every checkpoint/scratchpad key
+         * `interrupt()` needs to suspend and resume.
+         */
+        const resumeValue = AsyncLocalStorageProviderSingleton.runWithConfig(
+          config,
+          () =>
+            interrupt<
+              t.ToolApprovalInterruptPayload,
+              t.ToolApprovalDecision[] | t.ToolApprovalDecisionMap
+            >(payload)
+        );
+
+        const decisionByCallId = normalizeApprovalDecisions(
+          askEntries.map(({ entry }) => entry.call.id!),
+          resumeValue
+        );
+
+        for (const { entry, reason: askReason } of askEntries) {
+          const decision = decisionByCallId.get(entry.call.id!) ?? {
+            type: 'reject' as const,
+            reason: 'No decision provided for tool approval',
+          };
+
+          if (decision.type === 'reject') {
+            blockEntry(
+              entry,
+              decision.reason ?? askReason ?? 'Rejected by user'
+            );
+            continue;
+          }
+
+          /**
+           * `respond` short-circuits tool execution: the human supplies
+           * the result the model should see in place of running the
+           * tool. We emit a successful `ToolMessage` directly and skip
+           * dispatch — no host event fires, no real tool side effect
+           * occurs. Mirrors LangChain HITL middleware semantics.
+           */
+          if (decision.type === 'respond') {
+            messageByCallId.set(
+              entry.call.id!,
+              new ToolMessage({
+                status: 'success',
+                content: decision.responseText,
+                name: entry.call.name,
+                tool_call_id: entry.call.id!,
+              })
+            );
+            postToolBatchEntries.push({
+              toolName: entry.call.name,
+              toolInput: entry.args,
+              toolUseId: entry.call.id!,
+              stepId: entry.stepId,
+              status: 'success',
+              toolOutput: decision.responseText,
+            });
+            this.dispatchStepCompleted(
+              entry.call.id!,
+              entry.call.name,
+              entry.args,
+              decision.responseText,
+              config
+            );
+            continue;
+          }
+
+          if (decision.type === 'edit') {
+            applyInputOverride(entry, decision.updatedInput);
+          }
+          approvedEntries.push(entry);
+        }
       }
     } else {
       approvedEntries.push(...preToolCalls);
@@ -1167,6 +1400,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               sessionId: runId,
               matchQuery: toolName,
             }).catch((): undefined => undefined);
+            if (hookResult != null) {
+              for (const ctx of hookResult.additionalContexts) {
+                batchAdditionalContexts.push(ctx);
+              }
+            }
             if (hookResult?.updatedOutput != null) {
               const replaced =
                 typeof hookResult.updatedOutput === 'string'
@@ -1216,6 +1454,18 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           request?.turn
         );
 
+        postToolBatchEntries.push({
+          toolName,
+          toolInput: request?.args ?? {},
+          toolUseId: result.toolCallId,
+          stepId: request?.stepId,
+          turn: request?.turn,
+          status: result.status === 'error' ? 'error' : 'success',
+          ...(result.status === 'error'
+            ? { error: result.errorMessage ?? 'Unknown error' }
+            : { toolOutput: result.content }),
+        });
+
         messageByCallId.set(result.toolCallId, toolMessage);
       }
     }
@@ -1223,6 +1473,44 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     const toolMessages = toolCalls
       .map((call) => messageByCallId.get(call.id!))
       .filter((m): m is ToolMessage => m != null);
+
+    /**
+     * Fire `PostToolBatch` after every per-tool hook has settled. We
+     * collect its `additionalContexts` into the same batch accumulator
+     * so a host that wants to inject a single batch-level convention
+     * can do so via the same mechanism per-tool hooks already use.
+     */
+    if (
+      this.hookRegistry?.hasHookFor('PostToolBatch', runId) === true &&
+      postToolBatchEntries.length > 0
+    ) {
+      const batchHookResult = await executeHooks({
+        registry: this.hookRegistry,
+        input: {
+          hook_event_name: 'PostToolBatch',
+          runId,
+          threadId,
+          agentId: this.agentId,
+          entries: postToolBatchEntries,
+        },
+        sessionId: runId,
+      }).catch((): undefined => undefined);
+      if (batchHookResult != null) {
+        for (const ctx of batchHookResult.additionalContexts) {
+          batchAdditionalContexts.push(ctx);
+        }
+      }
+    }
+
+    if (batchAdditionalContexts.length > 0) {
+      injected.push(
+        new HumanMessage({
+          content: batchAdditionalContexts.join('\n\n'),
+          additional_kwargs: { role: 'system', source: 'hook' },
+        })
+      );
+    }
+
     return { toolMessages, injected };
   }
 

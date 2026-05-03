@@ -255,6 +255,19 @@ function applyUpdatedOutput(
   agg.updatedOutput = output.updatedOutput;
 }
 
+function applyAllowedDecisions(
+  agg: AggregatedHookResult,
+  output: HookOutput
+): void {
+  if (
+    !('allowedDecisions' in output) ||
+    output.allowedDecisions === undefined
+  ) {
+    return;
+  }
+  agg.allowedDecisions = output.allowedDecisions;
+}
+
 function fold(outcomes: readonly HookOutcome[]): AggregatedHookResult {
   const agg = freshResult();
   for (const outcome of outcomes) {
@@ -268,11 +281,21 @@ function fold(outcomes: readonly HookOutcome[]): AggregatedHookResult {
     if (output === null) {
       continue;
     }
+    /**
+     * Skip fire-and-forget outputs entirely: the agent has already
+     * moved on, so an async hook cannot influence the run. Background
+     * work inside the hook body still runs (we don't cancel it), it
+     * just doesn't fold into the aggregate result.
+     */
+    if (output.async === true) {
+      continue;
+    }
     applyContext(agg, output);
     applyStopFlag(agg, output);
     applyDecision(agg, output);
     applyUpdatedInput(agg, output);
     applyUpdatedOutput(agg, output);
+    applyAllowedDecisions(agg, output);
   }
   return agg;
 }
@@ -371,5 +394,23 @@ export async function executeHooks(
 
   const outcomes = await Promise.all(tasks);
   reportErrors(outcomes, event, logger);
-  return fold(outcomes);
+  const aggregated = fold(outcomes);
+  /**
+   * Centralized `preventContinuation` propagation: when any hook (across
+   * any callsite — RunStart, PreToolUse, PostToolBatch, SubagentStop,
+   * etc.) returns `preventContinuation: true`, raise a halt signal on
+   * the registry. `Run.processStream` polls the signal between stream
+   * events and exits cleanly, skipping the `Stop` hook (since the run
+   * is being halted, not naturally completing).
+   *
+   * First-write-wins inside the registry — a halt already raised by an
+   * earlier hook is preserved so the original `reason` / `source` are
+   * not clobbered. Pre-stream callsites in `Run.processStream` still
+   * read `preventContinuation` directly off the result for an early
+   * return because they have not yet entered the stream loop.
+   */
+  if (aggregated.preventContinuation === true) {
+    registry.haltRun(aggregated.stopReason ?? 'preventContinuation', event);
+  }
+  return aggregated;
 }
