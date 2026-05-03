@@ -1,11 +1,6 @@
-import { Stream } from '@anthropic-ai/sdk/core/streaming';
 import { AIMessageChunk, HumanMessage } from '@langchain/core/messages';
 
-import type {
-  AnthropicMessageStreamEvent,
-  AnthropicRequestOptions,
-  AnthropicStreamingMessageCreateParams,
-} from './types';
+import type { AnthropicMessageStreamEvent } from './types';
 
 import { CustomAnthropic } from './index';
 
@@ -18,35 +13,41 @@ type ToolArgStreamChunks = {
   contentInputs: string[];
   toolArgChunks: ToolArgChunk[];
 };
-
-class FakeStreamingAnthropic extends CustomAnthropic {
-  private readonly events: AnthropicMessageStreamEvent[];
-
-  constructor(events: AnthropicMessageStreamEvent[], streamDelay = 0) {
-    super({
-      apiKey: 'test-key',
-      model: 'claude-haiku-4-5-20251001',
-      streaming: true,
-      _lc_stream_delay: streamDelay,
-    });
-    this.events = events;
-  }
-
-  protected async createStreamWithRetry(
-    _request: AnthropicStreamingMessageCreateParams & Record<string, unknown>,
-    _options?: AnthropicRequestOptions
-  ): Promise<Stream<AnthropicMessageStreamEvent>> {
-    const events = this.events;
-    return new Stream<AnthropicMessageStreamEvent>(async function* () {
-      for (const event of events) {
-        yield event;
-      }
-    }, new AbortController());
-  }
-}
+type AnthropicEventStream = AsyncIterable<AnthropicMessageStreamEvent> & {
+  controller: AbortController;
+};
 
 function anthropicEvent(event: unknown): AnthropicMessageStreamEvent {
   return event as AnthropicMessageStreamEvent;
+}
+
+function createAnthropicEventStream(
+  events: AnthropicMessageStreamEvent[]
+): AnthropicEventStream {
+  return {
+    controller: new AbortController(),
+    async *[Symbol.asyncIterator](): AsyncGenerator<AnthropicMessageStreamEvent> {
+      for (const event of events) {
+        yield event;
+      }
+    },
+  };
+}
+
+function createFakeStreamingAnthropic(
+  events: AnthropicMessageStreamEvent[],
+  streamDelay = 0
+): CustomAnthropic {
+  const model = new CustomAnthropic({
+    apiKey: 'test-key',
+    model: 'claude-haiku-4-5-20251001',
+    streaming: true,
+    _lc_stream_delay: streamDelay,
+  });
+  Object.defineProperty(model, 'createStreamWithRetry', {
+    value: async () => createAnthropicEventStream(events),
+  });
+  return model;
 }
 
 function createToolArgEvents(
@@ -82,7 +83,7 @@ async function collectToolArgChunks(
   partialJsonChunks: string[],
   streamDelay = 0
 ): Promise<ToolArgStreamChunks> {
-  const model = new FakeStreamingAnthropic(
+  const model = createFakeStreamingAnthropic(
     createToolArgEvents(partialJsonChunks),
     streamDelay
   );
