@@ -1401,6 +1401,91 @@ describe('Codex review fixes', () => {
     expect(registry.hasHookFor('PreToolUse', runId)).toBe(false);
   });
 
+  it('denied tool in a deny+ask batch dispatches ON_RUN_STEP_COMPLETED exactly once across interrupt + resume', async () => {
+    const stepCompletedDispatches: string[] = [];
+    /** Spy on the underlying custom event dispatcher to capture every
+     * ON_RUN_STEP_COMPLETED event with its tool_call_id. Without the
+     * blockEntry deferral, this would record `call_a` twice for one
+     * logical denial (once before interrupt, once after resume
+     * re-execution). */
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data) => {
+        if (event === GraphEvents.ON_RUN_STEP_COMPLETED) {
+          const payload = data as {
+            result?: { tool_call?: { id?: string } };
+          };
+          const id = payload.result?.tool_call?.id;
+          if (id != null) {
+            stepCompletedDispatches.push(id);
+          }
+          return;
+        }
+        if (event !== 'on_tool_execute') {
+          return;
+        }
+        const request = data as {
+          toolCalls: t.ToolCallRequest[];
+          resolve: (r: t.ToolExecuteResult[]) => void;
+        };
+        request.resolve(
+          request.toolCalls.map((c) => ({
+            toolCallId: c.id,
+            content: `ran:${c.name}`,
+            status: 'success' as const,
+          }))
+        );
+      });
+
+    const registry = new HookRegistry();
+    registry.register('PreToolUse', {
+      hooks: [
+        async (input): Promise<PreToolUseHookOutput> => {
+          if (input.toolName === 'tool_a') {
+            return { decision: 'deny', reason: 'policy:a' };
+          }
+          return { decision: 'ask', reason: 'policy:b-needs-review' };
+        },
+      ],
+    });
+
+    const node = new ToolNode({
+      tools: [createSchemaStub('tool_a'), createSchemaStub('tool_b')],
+      eventDrivenMode: true,
+      agentId: 'agent-x',
+      toolCallStepIds: new Map([
+        ['call_a', 'step_a'],
+        ['call_b', 'step_b'],
+      ]),
+      hookRegistry: registry,
+      humanInTheLoop: { enabled: true },
+    });
+
+    const graph = buildHITLGraph(node, [
+      { id: 'call_a', name: 'tool_a', args: { command: 'a' } },
+      { id: 'call_b', name: 'tool_b', args: { command: 'b' } },
+    ]);
+    const config = { configurable: { thread_id: 'dedup-thread' } };
+
+    await graph.invoke({ messages: [] }, config);
+    /** First pass: interrupt() threw, so the deferred denial side
+     * effects were not flushed. Zero step-completed events for the
+     * denied tool yet. */
+    expect(stepCompletedDispatches.filter((id) => id === 'call_a')).toEqual([]);
+
+    await graph.invoke(new Command({ resume: [{ type: 'approve' }] }), config);
+
+    /** After resume: the denied tool dispatches exactly once (deferred
+     * flush on the resume re-execution); the approved tool dispatches
+     * once via the normal execution path. */
+    expect(stepCompletedDispatches.filter((id) => id === 'call_a')).toEqual([
+      'call_a',
+    ]);
+    expect(stepCompletedDispatches.filter((id) => id === 'call_b')).toEqual([
+      'call_b',
+    ]);
+  });
+
   it('clears session hooks when the stream throws AFTER an interrupt is captured (stale interrupt)', async () => {
     jest
       .spyOn(events, 'safeDispatchCustomEvent')
@@ -1655,6 +1740,20 @@ describe('Codex review fixes', () => {
      */
     expect(batchSnapshots.length).toBeGreaterThanOrEqual(1);
     const finalSnapshot = batchSnapshots[batchSnapshots.length - 1];
+    /**
+     * Order assertion: entries must match the original toolCalls
+     * sequence (`call_a`, `call_b`, `call_c`) regardless of when each
+     * outcome was recorded — `call_a` was denied synchronously in the
+     * hook loop, `call_b` was approved through the resume branch,
+     * `call_c` was approved+executed via the host event path. Hooks
+     * correlating outcomes by position (per the API doc) depend on
+     * this stability.
+     */
+    expect(finalSnapshot.map((e) => e.toolUseId)).toEqual([
+      'call_a',
+      'call_b',
+      'call_c',
+    ]);
     const byCallId = new Map(finalSnapshot.map((e) => [e.toolUseId, e]));
     expect(byCallId.size).toBe(3);
     expect(byCallId.get('call_a')!.status).toBe('error');
@@ -1663,6 +1762,98 @@ describe('Codex review fixes', () => {
     expect(byCallId.get('call_b')!.toolOutput).toBe('ran:tool_b');
     expect(byCallId.get('call_c')!.status).toBe('success');
     expect(byCallId.get('call_c')!.toolOutput).toBe('ran:tool_c');
+  });
+
+  it('PostToolBatch entries preserve toolCalls order even when first call is denied and second is approved', async () => {
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data) => {
+        if (event !== 'on_tool_execute') {
+          return;
+        }
+        const request = data as {
+          toolCalls: t.ToolCallRequest[];
+          resolve: (r: t.ToolExecuteResult[]) => void;
+        };
+        request.resolve(
+          request.toolCalls.map((c) => ({
+            toolCallId: c.id,
+            content: `ran:${c.name}`,
+            status: 'success' as const,
+          }))
+        );
+      });
+
+    /**
+     * Two different orderings to verify the asserted order really
+     * tracks the input — not just incidental ordering from one path
+     * landing first.
+     */
+    const cases: Array<{
+      thread: string;
+      input: Array<{ id: string; name: string; args: Record<string, unknown> }>;
+      expected: string[];
+    }> = [
+      {
+        thread: 'order-deny-first',
+        input: [
+          { id: 'call_first', name: 'denied_tool', args: { command: 'a' } },
+          { id: 'call_second', name: 'allowed_tool', args: { command: 'b' } },
+        ],
+        expected: ['call_first', 'call_second'],
+      },
+      {
+        thread: 'order-approve-first',
+        input: [
+          { id: 'call_first', name: 'allowed_tool', args: { command: 'a' } },
+          { id: 'call_second', name: 'denied_tool', args: { command: 'b' } },
+        ],
+        expected: ['call_first', 'call_second'],
+      },
+    ];
+
+    for (const { thread, input, expected } of cases) {
+      const registry = new HookRegistry();
+      registry.register('PreToolUse', {
+        hooks: [
+          async (hookInput): Promise<PreToolUseHookOutput> => {
+            if (hookInput.toolName === 'denied_tool') {
+              return { decision: 'deny', reason: 'no' };
+            }
+            return { decision: 'allow' };
+          },
+        ],
+      });
+      const captured: PostToolBatchEntry[] = [];
+      registry.register('PostToolBatch', {
+        hooks: [
+          async (i): Promise<PostToolBatchHookOutput> => {
+            captured.push(...(i as PostToolBatchHookInput).entries);
+            return {};
+          },
+        ],
+      });
+
+      const node = new ToolNode({
+        tools: [
+          createSchemaStub('denied_tool'),
+          createSchemaStub('allowed_tool'),
+        ],
+        eventDrivenMode: true,
+        agentId: 'agent-x',
+        toolCallStepIds: new Map(input.map((c) => [c.id, `step_${c.id}`])),
+        hookRegistry: registry,
+        humanInTheLoop: { enabled: false },
+      });
+
+      const graph = buildHITLGraph(node, input);
+      await graph.invoke(
+        { messages: [] },
+        { configurable: { thread_id: thread } }
+      );
+
+      expect(captured.map((e) => e.toolUseId)).toEqual(expected);
+    }
   });
 
   it('fails closed when the host resume payload carries an unknown decision type', async () => {

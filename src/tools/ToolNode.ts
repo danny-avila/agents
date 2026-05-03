@@ -940,12 +940,18 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
      */
     const batchAdditionalContexts: string[] = [];
     /**
-     * Batch-level outcome record. Captures every tool call's final
-     * result (success / error from the host, blocked from HITL reject,
-     * substituted from HITL respond) so a single `PostToolBatch` hook
-     * sees the whole set in batch order.
+     * Batch-level outcome record keyed by `tool_call_id`. Captures
+     * every tool call's final result (success / error from the host,
+     * blocked from HITL deny / reject, substituted from HITL respond)
+     * across the three call sites that touch it. We materialize the
+     * `PostToolBatch` entry array in `toolCalls` order at dispatch
+     * time so hooks correlating outcomes by position see exactly the
+     * same sequence the model emitted — independent of when each
+     * outcome was recorded (deny entries land synchronously in the
+     * hook loop, approved entries land after host execution, respond
+     * entries land in the resume branch).
      */
-    const postToolBatchEntries: PostToolBatchEntry[] = [];
+    const postToolBatchEntryByCallId = new Map<string, PostToolBatchEntry>();
     const HOOK_FALLBACK: AggregatedHookResult = Object.freeze({
       additionalContexts: [] as string[],
       errors: [] as string[],
@@ -981,6 +987,28 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
       type PendingEntry = (typeof preToolCalls)[number];
 
+      /**
+       * Side effects deferred from `blockEntry` until after any pending
+       * `interrupt()` resolves. Without deferral, a batch that mixes a
+       * `deny` decision with an `ask` decision would dispatch
+       * `ON_RUN_STEP_COMPLETED` for the denied tool on the FIRST node
+       * execution (before `interrupt()` throws), then dispatch the
+       * same event AGAIN on the resume re-execution — hosts would
+       * observe two completion events for one logical denial. By
+       * queueing the dispatch + PermissionDenied hook here and
+       * flushing after the interrupt block, we ensure each side effect
+       * fires exactly once: never on the first pass when interrupt
+       * throws (the flush is unreachable), once on resume / no-ask
+       * passes when control reaches the flush.
+       */
+      const deferredBlockedSideEffects: Array<{
+        callId: string;
+        toolName: string;
+        args: Record<string, unknown>;
+        contentString: string;
+        reason: string;
+      }> = [];
+
       const blockEntry = (entry: PendingEntry, reason: string): void => {
         const contentString = `Blocked: ${reason}`;
         messageByCallId.set(
@@ -992,7 +1020,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             tool_call_id: entry.call.id!,
           })
         );
-        postToolBatchEntries.push({
+        postToolBatchEntryByCallId.set(entry.call.id!, {
           toolName: entry.call.name,
           toolInput: entry.args,
           toolUseId: entry.call.id!,
@@ -1010,32 +1038,45 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           status: 'error',
           error: contentString,
         });
-        this.dispatchStepCompleted(
-          entry.call.id!,
-          entry.call.name,
-          entry.args,
+        deferredBlockedSideEffects.push({
+          callId: entry.call.id!,
+          toolName: entry.call.name,
+          args: entry.args,
           contentString,
-          config
-        );
-        if (hookRegistry.hasHookFor('PermissionDenied', runId)) {
-          executeHooks({
-            registry: hookRegistry,
-            input: {
-              hook_event_name: 'PermissionDenied',
-              runId,
-              threadId,
-              agentId: this.agentId,
-              toolName: entry.call.name,
-              toolInput: entry.args,
-              toolUseId: entry.call.id!,
-              reason,
-            },
-            sessionId: runId,
-            matchQuery: entry.call.name,
-          }).catch(() => {
-            /* PermissionDenied is observational — swallow errors */
-          });
+          reason,
+        });
+      };
+
+      const flushDeferredBlockedSideEffects = (): void => {
+        for (const item of deferredBlockedSideEffects) {
+          this.dispatchStepCompleted(
+            item.callId,
+            item.toolName,
+            item.args,
+            item.contentString,
+            config
+          );
+          if (hookRegistry.hasHookFor('PermissionDenied', runId)) {
+            executeHooks({
+              registry: hookRegistry,
+              input: {
+                hook_event_name: 'PermissionDenied',
+                runId,
+                threadId,
+                agentId: this.agentId,
+                toolName: item.toolName,
+                toolInput: item.args,
+                toolUseId: item.callId,
+                reason: item.reason,
+              },
+              sessionId: runId,
+              matchQuery: item.toolName,
+            }).catch(() => {
+              /* PermissionDenied is observational — swallow errors */
+            });
+          }
         }
+        deferredBlockedSideEffects.length = 0;
       };
 
       /**
@@ -1210,7 +1251,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                 tool_call_id: entry.call.id!,
               })
             );
-            postToolBatchEntries.push({
+            postToolBatchEntryByCallId.set(entry.call.id!, {
               toolName: entry.call.name,
               toolInput: entry.args,
               toolUseId: entry.call.id!,
@@ -1266,6 +1307,20 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           );
         }
       }
+
+      /**
+       * Flush deferred denial side effects exactly once. On the FIRST
+       * pass through a batch that contains an `ask`, `interrupt()`
+       * threw above and we never reach this line — so no
+       * `ON_RUN_STEP_COMPLETED` / `PermissionDenied` events fire
+       * for blocked tools yet. On resume the node re-executes from
+       * scratch, `blockEntry` re-queues the same entries, and the
+       * flush below dispatches them once. For batches without any
+       * `ask` (deny-only or empty), the flush still runs here and
+       * dispatches in the same relative position as the pre-deferral
+       * code did (after hook processing, before tool execution).
+       */
+      flushDeferredBlockedSideEffects();
     } else {
       approvedEntries.push(...preToolCalls);
     }
@@ -1518,7 +1573,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           request?.turn
         );
 
-        postToolBatchEntries.push({
+        postToolBatchEntryByCallId.set(result.toolCallId, {
           toolName,
           toolInput: request?.args ?? {},
           toolUseId: result.toolCallId,
@@ -1539,14 +1594,32 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       .filter((m): m is ToolMessage => m != null);
 
     /**
-     * Fire `PostToolBatch` after every per-tool hook has settled. We
-     * collect its `additionalContexts` into the same batch accumulator
-     * so a host that wants to inject a single batch-level convention
-     * can do so via the same mechanism per-tool hooks already use.
+     * Fire `PostToolBatch` after every per-tool hook has settled.
+     *
+     * Entries are materialized in the original `toolCalls` order so
+     * hooks correlating outcomes by position (as the type docs
+     * promise) see exactly the sequence the model emitted, regardless
+     * of when each individual outcome was recorded into the map (deny
+     * synchronous, approved post-execution, respond on resume).
+     *
+     * The hook's `additionalContexts` flow into the same batch
+     * accumulator per-tool hooks already use, so a single batch-level
+     * convention message can be injected through one path.
      */
+    const orderedBatchEntries: PostToolBatchEntry[] = [];
+    for (const call of toolCalls) {
+      const callId = call.id;
+      if (callId == null) {
+        continue;
+      }
+      const entry = postToolBatchEntryByCallId.get(callId);
+      if (entry != null) {
+        orderedBatchEntries.push(entry);
+      }
+    }
     if (
       this.hookRegistry?.hasHookFor('PostToolBatch', runId) === true &&
-      postToolBatchEntries.length > 0
+      orderedBatchEntries.length > 0
     ) {
       const batchHookResult = await executeHooks({
         registry: this.hookRegistry,
@@ -1555,7 +1628,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           runId,
           threadId,
           agentId: this.agentId,
-          entries: postToolBatchEntries,
+          entries: orderedBatchEntries,
         },
         sessionId: runId,
       }).catch((): undefined => undefined);
