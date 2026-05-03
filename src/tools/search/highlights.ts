@@ -240,7 +240,8 @@ export function expandHighlights(
         !result.highlights ||
         result.highlights.length === 0
       ) {
-        return result; // No modification needed
+        const { content: _content, ...resultWithoutContent } = result;
+        return resultWithoutContent as typeof result;
       }
 
       // Create a shallow copy with expanded highlights
