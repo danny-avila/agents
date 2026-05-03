@@ -998,11 +998,13 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           toolUseId: entry.call.id!,
           stepId: entry.stepId,
           /**
-           * Mirrors the `turn` value the executed-path push records, so
-           * batch hooks see uniform entry shapes regardless of whether
-           * the tool was blocked or executed. Read pre-increment, just
-           * like the executed path captures it before the usage counter
-           * advances.
+           * Records the pre-invocation turn count — the same value the
+           * executed path captures before incrementing `toolUsageCount`.
+           * For a blocked tool the counter is never incremented (no
+           * invocation happened), so this is always the count of prior
+           * successful invocations of this tool name in earlier batches.
+           * Surfaces in the `PostToolBatch` entry so batch hooks see
+           * a uniform shape regardless of outcome.
            */
           turn: this.toolUsageCount.get(entry.call.name) ?? 0,
           status: 'error',

@@ -231,13 +231,34 @@ export class Run<_T extends t.BaseGraphState> {
    * begins, accumulate any `additionalContext` strings into the input
    * messages, and short-circuit when a hook signals the run should not
    * proceed (deny / ask decision on the prompt, or `preventContinuation`
-   * on either hook). Mutates `stateInputs.messages` in place when
-   * appending injected context — safe because the host owns this array
-   * and `processStream` is the only consumer until LangGraph reads it.
+   * on either hook).
    *
    * Returns `true` when the caller should bail with `undefined` (run
    * was halted before any model call); returns `false` to proceed
    * into the stream loop.
+   *
+   * ## Side effects
+   *
+   * On the success path:
+   *   - Mutates `stateInputs.messages` in place to append a
+   *     consolidated `HumanMessage` carrying any hook
+   *     `additionalContext` strings. Safe because the host owns the
+   *     array and `processStream` is the only consumer until LangGraph
+   *     reads it.
+   *
+   * On the halt path (returning `true`):
+   *   - Sets `this._haltedReason` so callers (and the eventual host)
+   *     can distinguish a hook-driven halt from a natural completion.
+   *   - Calls `registry.clearSession(this.id)` and
+   *     `registry.clearHaltSignal()` because no resume is expected
+   *     from a pre-stream halt — the run never entered the graph, so
+   *     the session/halt state would otherwise leak to the next
+   *     `processStream` invocation on the same registry.
+   *   - Sets `config.callbacks = undefined` to drop the callback
+   *     references the caller built (langfuse handler, custom event
+   *     handler, etc.) since they won't be exercised. Mirrors the
+   *     equivalent cleanup the `processStream` `finally` block does
+   *     on the natural-completion path.
    */
   private async runPreStreamHooks(
     stateInputs: t.IState,
@@ -245,6 +266,12 @@ export class Run<_T extends t.BaseGraphState> {
     config: Partial<RunnableConfig>
   ): Promise<boolean> {
     const registry = this.hookRegistry;
+    /**
+     * Defensive guard: `processStream` already validated `this.Graph`
+     * before calling this helper, but TypeScript can't propagate that
+     * narrowing across method boundaries. The check keeps the body
+     * free of `this.Graph!` non-null assertions.
+     */
     if (registry == null || this.Graph == null) {
       return false;
     }
@@ -545,6 +572,17 @@ export class Run<_T extends t.BaseGraphState> {
       ignoreCustomEvent: true,
     });
 
+    /**
+     * Tracks whether the stream loop threw. Used by the `finally`
+     * block to decide whether to honor the interrupt-preservation
+     * guard for session hooks: a captured `_interrupt` is only
+     * meaningful if the stream completed cleanly. If the loop errored
+     * after stashing an interrupt (e.g. a downstream handler throws
+     * after the interrupt event landed), the interrupt is stale —
+     * preserving session hooks would leak them into the next run.
+     */
+    let streamThrew = false;
+
     try {
       for await (const event of stream) {
         const { data, metadata, ...info } = event;
@@ -638,6 +676,7 @@ export class Run<_T extends t.BaseGraphState> {
         });
       }
     } catch (err) {
+      streamThrew = true;
       if (this.hookRegistry?.hasHookFor('StopFailure', this.id) === true) {
         const runMessages = this.Graph.getRunMessages() ?? [];
         await executeHooks({
@@ -664,10 +703,11 @@ export class Run<_T extends t.BaseGraphState> {
        * that triggered the interrupt) to fire on the re-executed node
        * and uphold the approval flow. Clearing here would leak the
        * approval gate on resume. The session is cleared instead at
-       * natural completion, error, or hook-driven halt — every state
-       * where no resume is expected.
+       * natural completion, error (including errors that happen AFTER
+       * an interrupt was captured — those interrupts are stale), or
+       * hook-driven halt — every state where no resume is expected.
        */
-      if (this._interrupt == null) {
+      if (this._interrupt == null || streamThrew) {
         this.hookRegistry?.clearSession(this.id);
       }
       /**

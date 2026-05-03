@@ -34,7 +34,7 @@ import type {
 import type * as t from '@/types';
 import * as events from '@/utils/events';
 import { HookRegistry } from '@/hooks';
-import { Providers as providers } from '@/common';
+import { Providers as providers, GraphEvents } from '@/common';
 import { ToolNode } from '../ToolNode';
 
 /**
@@ -1401,6 +1401,120 @@ describe('Codex review fixes', () => {
     expect(registry.hasHookFor('PreToolUse', runId)).toBe(false);
   });
 
+  it('clears session hooks when the stream throws AFTER an interrupt is captured (stale interrupt)', async () => {
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async () => {
+        return;
+      });
+
+    const registry = new HookRegistry();
+    const runId = 'stream-error-after-interrupt';
+    registry.registerSession(runId, 'PreToolUse', {
+      hooks: [
+        async (): Promise<PreToolUseHookOutput> => ({
+          decision: 'ask',
+          reason: 'session policy',
+        }),
+      ],
+    });
+
+    const node = new ToolNode({
+      tools: [createSchemaStub('echo')],
+      eventDrivenMode: true,
+      agentId: 'agent-x',
+      toolCallStepIds: new Map([['call_1', 'step_call_1']]),
+      hookRegistry: registry,
+      humanInTheLoop: { enabled: true },
+    });
+
+    const builder = new StateGraph(MessagesAnnotation)
+      .addNode(
+        'agent',
+        (): MessagesUpdate => ({
+          messages: [
+            new AIMessage({
+              content: '',
+              tool_calls: [
+                { id: 'call_1', name: 'echo', args: { command: 'x' } },
+              ],
+            }),
+          ],
+        })
+      )
+      .addNode('tools', node)
+      .addEdge(START, 'agent')
+      .addEdge('agent', 'tools')
+      .addEdge('tools', END);
+    const graph = builder.compile({ checkpointer: new MemorySaver() });
+
+    const { Run } = await import('@/run');
+    /**
+     * Holder for forward-referencing the run inside the sentinel
+     * handler closure. The handler is constructed before `Run.create`
+     * runs (it's passed into `customHandlers`) but needs to read
+     * `run.getInterrupt()` at firing time.
+     */
+    const holder: {
+      run: Awaited<ReturnType<typeof Run.create<t.IState>>> | undefined;
+    } = { run: undefined };
+
+    /**
+     * Handler keyed to a chain-stream event that throws ONLY after the
+     * interrupt has been captured. The stream loop captures the
+     * interrupt on the chunk that carries `__interrupt__`, then
+     * dispatches to handlers in the same iteration — so the throw
+     * exits the loop with `_interrupt != null`. Without the
+     * `streamThrew` guard, the `finally` block would preserve session
+     * hooks on this stale interrupt.
+     */
+    const sentinelHandler = {
+      handle: async (): Promise<void> => {
+        if (holder.run?.getInterrupt() != null) {
+          throw new Error('post-interrupt handler failure');
+        }
+      },
+    };
+
+    holder.run = await Run.create<t.IState>({
+      runId,
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'a',
+            provider: providers.OPENAI,
+            clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+          },
+        ],
+      },
+      hooks: registry,
+      humanInTheLoop: { enabled: true },
+      customHandlers: {
+        [GraphEvents.CHAIN_STREAM]: sentinelHandler,
+        [GraphEvents.CHAIN_END]: sentinelHandler,
+      },
+    });
+    holder.run.graphRunnable = graph as unknown as t.CompiledStateWorkflow;
+
+    const callerConfig = {
+      configurable: { thread_id: 'stale-interrupt-thread' },
+      version: 'v2' as const,
+    };
+
+    await expect(
+      holder.run.processStream({ messages: [] }, callerConfig)
+    ).rejects.toThrow('post-interrupt handler failure');
+
+    /** Interrupt WAS captured on the run instance, but because the
+     * stream subsequently threw, session hooks must be cleared so the
+     * next run on this registry isn't poisoned by stale state. */
+    expect(holder.run.getInterrupt()).toBeDefined();
+    expect(registry.hasHookFor('PreToolUse', runId)).toBe(false);
+  });
+
   it('mixed deny/ask/allow batch: deny short-circuits, allow runs immediately, ask interrupts; resume completes the asked tool', async () => {
     const dispatchedToolNames: string[] = [];
     jest
@@ -1441,6 +1555,22 @@ describe('Codex review fixes', () => {
             return { decision: 'ask', reason: 'policy:b-needs-review' };
           }
           return { decision: 'allow' };
+        },
+      ],
+    });
+    /**
+     * Listen on PostToolBatch to verify the batch entry shape after
+     * resume reflects the final outcomes (deny + run + run), not
+     * stale state from the first pass.
+     */
+    const batchSnapshots: PostToolBatchEntry[][] = [];
+    registry.register('PostToolBatch', {
+      hooks: [
+        async (input): Promise<PostToolBatchHookOutput> => {
+          batchSnapshots.push(
+            (input as PostToolBatchHookInput).entries.map((e) => ({ ...e }))
+          );
+          return {};
         },
       ],
     });
@@ -1513,6 +1643,26 @@ describe('Codex review fixes', () => {
     /** Both approved tools dispatched on resume; tool_a (deny) never did. */
     expect(new Set(dispatchedToolNames)).toEqual(new Set(['tool_b', 'tool_c']));
     expect(dispatchedToolNames).not.toContain('tool_a');
+
+    /**
+     * PostToolBatch fires once per dispatch where any entries land. On
+     * the FIRST pass (interrupt), the batch hook fires with just
+     * tool_a (the only entry recorded before `interrupt()` threw); on
+     * resume, it fires again with all three entries reflecting the
+     * final outcomes. Assert the resume snapshot carries the correct
+     * status + content for each tool — this is what batch audit /
+     * convention hooks would observe.
+     */
+    expect(batchSnapshots.length).toBeGreaterThanOrEqual(1);
+    const finalSnapshot = batchSnapshots[batchSnapshots.length - 1];
+    const byCallId = new Map(finalSnapshot.map((e) => [e.toolUseId, e]));
+    expect(byCallId.size).toBe(3);
+    expect(byCallId.get('call_a')!.status).toBe('error');
+    expect(byCallId.get('call_a')!.error).toContain('policy:a');
+    expect(byCallId.get('call_b')!.status).toBe('success');
+    expect(byCallId.get('call_b')!.toolOutput).toBe('ran:tool_b');
+    expect(byCallId.get('call_c')!.status).toBe('success');
+    expect(byCallId.get('call_c')!.toolOutput).toBe('ran:tool_c');
   });
 
   it('fails closed when the host resume payload carries an unknown decision type', async () => {
