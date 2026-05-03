@@ -334,6 +334,36 @@ function delayInputChunk(delay?: number): Promise<void> | undefined {
   return new Promise((resolve) => setTimeout(resolve, delay));
 }
 
+const INPUT_DELTA_DELAY_CHAR_BUDGET = 128;
+
+type InputDeltaPacer = {
+  charsSinceDelay: number;
+  seenNonEmptyInput: boolean;
+};
+
+function shouldDelayInputChunk(
+  token: string,
+  delay: number | undefined,
+  pacer: InputDeltaPacer
+): boolean {
+  if (delay == null || delay <= 0 || token === '') {
+    return false;
+  }
+
+  if (!pacer.seenNonEmptyInput) {
+    pacer.seenNonEmptyInput = true;
+    return true;
+  }
+
+  pacer.charsSinceDelay += token.length;
+  if (pacer.charsSinceDelay < INPUT_DELTA_DELAY_CHAR_BUDGET) {
+    return false;
+  }
+
+  pacer.charsSinceDelay = 0;
+  return true;
+}
+
 type CustomAnthropicInvocationParams = {
   betas?: AnthropicBeta[];
   container?: string;
@@ -545,6 +575,10 @@ export class CustomAnthropic extends ChatAnthropicMessages {
     });
 
     const shouldStreamUsage = options.streamUsage ?? this.streamUsage;
+    const inputDeltaPacer: InputDeltaPacer = {
+      charsSinceDelay: 0,
+      seenNonEmptyInput: false,
+    };
 
     for await (const data of stream) {
       if (options.signal?.aborted === true) {
@@ -576,7 +610,11 @@ export class CustomAnthropic extends ChatAnthropicMessages {
       const [token = '', tokenType] = extractToken(chunk);
 
       if (tokenType === 'input' && token !== '') {
-        await delayInputChunk(this._lc_stream_delay);
+        if (
+          shouldDelayInputChunk(token, this._lc_stream_delay, inputDeltaPacer)
+        ) {
+          await delayInputChunk(this._lc_stream_delay);
+        }
         const generationChunk = this.createGenerationChunk({
           token,
           chunk,

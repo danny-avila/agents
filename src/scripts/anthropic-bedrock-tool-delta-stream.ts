@@ -12,6 +12,7 @@ import { getLLMConfig } from '@/utils/llmConfig';
 import { Run } from '@/run';
 
 type ProviderUnderTest = Providers.ANTHROPIC | Providers.BEDROCK;
+type ToolMode = 'structured' | 'definition';
 type ToolCallDeltaChunk = NonNullable<t.ToolCallDelta['tool_calls']>[number] & {
   function?: {
     name?: unknown;
@@ -20,6 +21,7 @@ type ToolCallDeltaChunk = NonNullable<t.ToolCallDelta['tool_calls']>[number] & {
 };
 
 const providerArgs = new Set(['anthropic', 'bedrock', 'both']);
+const mcpToolName = 'evaluate_script_mcp_chrome-devtools';
 const weatherSchema = {
   type: 'object',
   properties: {
@@ -38,6 +40,26 @@ const weatherSchema = {
   },
   required: ['city', 'unit', 'detail'],
 } as const;
+const evaluateScriptSchema: t.JsonSchemaType = {
+  type: 'object',
+  properties: {
+    function: {
+      type: 'string',
+      description:
+        'JavaScript function source to evaluate in the page context.',
+    },
+    args: {
+      type: 'array',
+      description: 'Arguments passed to the function.',
+      items: { type: 'string' },
+    },
+    reason: {
+      type: 'string',
+      description: 'Short reason this script is being evaluated.',
+    },
+  },
+  required: ['function', 'args', 'reason'],
+} as const;
 
 function getProviders(): ProviderUnderTest[] {
   const rawArg =
@@ -50,6 +72,15 @@ function getProviders(): ProviderUnderTest[] {
     return [Providers.BEDROCK];
   }
   return [Providers.ANTHROPIC, Providers.BEDROCK];
+}
+
+function getToolMode(): ToolMode {
+  const rawArg =
+    process.argv.find((arg) => arg.startsWith('--tool-mode='))?.split('=')[1] ??
+    process.argv.find(
+      (arg): arg is ToolMode => arg === 'structured' || arg === 'definition'
+    );
+  return rawArg === 'definition' ? 'definition' : 'structured';
 }
 
 function preview(value: string): string {
@@ -71,6 +102,18 @@ function createLookupWeatherTool(): StructuredToolInterface {
       schema: weatherSchema,
     }
   );
+}
+
+function createEvaluateScriptToolDefinition(): t.LCTool {
+  return {
+    name: mcpToolName,
+    description:
+      'Evaluate a JavaScript function in the active browser page and return the result.',
+    parameters: evaluateScriptSchema,
+    responseFormat: 'content_and_artifact',
+    serverName: 'chrome-devtools',
+    toolType: 'mcp',
+  };
 }
 
 function configureLLM(provider: ProviderUnderTest): t.LLMConfig {
@@ -101,6 +144,7 @@ function configureLLM(provider: ProviderUnderTest): t.LLMConfig {
 }
 
 async function testProvider(provider: ProviderUnderTest): Promise<void> {
+  const toolMode = getToolMode();
   const startedAt = performance.now();
   const nonEmptyArgTimes: number[] = [];
   const argsByIndex = new Map<number, string>();
@@ -113,6 +157,27 @@ async function testProvider(provider: ProviderUnderTest): Promise<void> {
   };
 
   const customHandlers: Record<string, t.EventHandler> = {
+    [GraphEvents.ON_TOOL_EXECUTE]: {
+      handle: (_event: string, data: t.StreamEventData): void => {
+        const batch = data as t.ToolExecuteBatchRequest;
+        console.log(
+          `[${provider}] +${elapsed()}ms on_tool_execute calls=${batch.toolCalls
+            .map((call) => call.name)
+            .join(',')}`
+        );
+        batch.resolve(
+          batch.toolCalls.map((call) => ({
+            toolCallId: call.id,
+            content: JSON.stringify({
+              status: 'ok',
+              received: call.args,
+              mode: toolMode,
+            }),
+            status: 'success',
+          }))
+        );
+      },
+    },
     [GraphEvents.ON_RUN_STEP]: {
       handle: (event: string, data: t.StreamEventData): void => {
         countEvent(event);
@@ -201,16 +266,31 @@ async function testProvider(provider: ProviderUnderTest): Promise<void> {
     },
   };
 
+  const graphConfig =
+    toolMode === 'definition'
+      ? {
+          type: 'standard' as const,
+          llmConfig: configureLLM(provider),
+          toolDefinitions: [createEvaluateScriptToolDefinition()],
+          instructions: `You are a test assistant. You must call ${mcpToolName} exactly once before answering.`,
+          maxContextTokens: 120000,
+        }
+      : {
+          type: 'standard' as const,
+          llmConfig: configureLLM(provider),
+          tools: [createLookupWeatherTool()],
+          instructions:
+            'You are a test assistant. You must call lookup_weather exactly once before answering.',
+          maxContextTokens: 120000,
+        };
+  const humanMessage =
+    toolMode === 'definition'
+      ? `Call ${mcpToolName} exactly once. Use a function that returns document.title, location.href, and the textContent of document.body.slice(0, 80). Include args as an empty array and explain that this checks visible page content.`
+      : 'Call lookup_weather exactly once for San Francisco, California. Use fahrenheit. In detail, ask for current conditions, wind, humidity, and a one sentence commute note.';
+
   const run = await Run.create<t.IState>({
     runId: `tool-delta-${provider}-${Date.now()}`,
-    graphConfig: {
-      type: 'standard',
-      llmConfig: configureLLM(provider),
-      tools: [createLookupWeatherTool()],
-      instructions:
-        'You are a test assistant. You must call lookup_weather exactly once before answering.',
-      maxContextTokens: 120000,
-    },
+    graphConfig,
     customHandlers,
     returnContent: true,
     skipCleanup: true,
@@ -218,11 +298,7 @@ async function testProvider(provider: ProviderUnderTest): Promise<void> {
 
   await run.processStream(
     {
-      messages: [
-        new HumanMessage(
-          'Call lookup_weather exactly once for San Francisco, California. Use fahrenheit. In detail, ask for current conditions, wind, humidity, and a one sentence commute note.'
-        ),
-      ],
+      messages: [new HumanMessage(humanMessage)],
     },
     {
       configurable: {
@@ -237,6 +313,7 @@ async function testProvider(provider: ProviderUnderTest): Promise<void> {
     .slice(1)
     .map((time, index) => time - nonEmptyArgTimes[index]);
   console.log(`\n[${provider}] summary`);
+  console.log('toolMode:', toolMode);
   console.log('eventCounts:', Object.fromEntries(eventCounts));
   console.log('argsByIndex:', Object.fromEntries(argsByIndex));
   console.log('messageDeltaInputFragments:', messageInputs);

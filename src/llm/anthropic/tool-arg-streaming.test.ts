@@ -166,4 +166,31 @@ describe('CustomAnthropic tool argument streaming', () => {
       jest.useRealTimers();
     }
   });
+
+  test('paces dense input_json_delta bursts without delaying every provider chunk', async () => {
+    jest.useFakeTimers();
+    try {
+      const rawChunks = Array.from({ length: 10 }, () => 'abcdefghij');
+      const collection = collectToolArgChunks(rawChunks, 20);
+      let settled = false;
+      collection.then(() => {
+        settled = true;
+      });
+
+      await Promise.resolve();
+      await jest.advanceTimersByTimeAsync(19);
+      expect(settled).toBe(false);
+
+      await jest.advanceTimersByTimeAsync(1);
+      const { toolArgChunks } = await collection;
+
+      expect(settled).toBe(true);
+      expect(toolArgChunks.map((chunk) => chunk.args)).toEqual([
+        '',
+        ...rawChunks,
+      ]);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
 });
