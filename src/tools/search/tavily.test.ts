@@ -54,12 +54,14 @@ describe('Tavily search API', () => {
     const result = await searchAPI.getSources({
       query: 'example query',
       country: 'US',
+      safeSearch: 2,
     });
     const [, payload] = mockedAxios.post.mock.calls[0];
 
     expect(payload).toMatchObject({
       query: 'example query',
       country: 'united states',
+      safe_search: true,
       include_answer: 'advanced',
       include_raw_content: 'markdown',
       include_images: true,
@@ -100,12 +102,14 @@ describe('Tavily search API', () => {
       query: 'example query',
       country: 'US',
       news: true,
+      safeSearch: 0,
     });
     const [, payload] = mockedAxios.post.mock.calls[0];
 
     expect(payload).toMatchObject({
       query: 'example query',
       topic: 'news',
+      safe_search: false,
     });
     expect(payload).not.toHaveProperty('country');
   });

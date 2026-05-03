@@ -478,6 +478,7 @@ const createTavilyAPI = (
     query,
     date,
     country,
+    safeSearch,
     numResults = 8,
     type,
     news,
@@ -501,6 +502,7 @@ const createTavilyAPI = (
         search_depth: searchDepth,
         topic,
         max_results: Math.min(Math.max(1, maxResults), 20),
+        safe_search: (safeSearch ?? 1) !== 0,
       };
 
       if (timeRange != null) {
