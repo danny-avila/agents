@@ -114,6 +114,30 @@ describe('Tavily search API', () => {
     expect(payload).not.toHaveProperty('country');
   });
 
+  it('maps ISO country codes to Tavily country enum values', async () => {
+    mockedAxios.post.mockResolvedValueOnce({
+      data: {
+        results: [],
+      },
+    });
+
+    const searchAPI = createSearchAPI({
+      searchProvider: 'tavily',
+      tavilyApiKey: 'test-key',
+    });
+
+    await searchAPI.getSources({
+      query: 'example query',
+      country: 'CZ',
+    });
+    const [, payload] = mockedAxios.post.mock.calls[0];
+
+    expect(payload).toMatchObject({
+      query: 'example query',
+      country: 'czech republic',
+    });
+  });
+
   it('omits safe search for unsupported Tavily search depths', async () => {
     mockedAxios.post.mockResolvedValueOnce({
       data: {
@@ -270,6 +294,36 @@ describe('TavilyScraper', () => {
         timeout: 2,
       });
       expect(config).toMatchObject({ timeout: 2000 });
+    });
+
+    it('omits extract timeout from the payload when using Tavily defaults', async () => {
+      mockedAxios.post.mockResolvedValueOnce({
+        data: {
+          results: [
+            {
+              url: 'https://example.com',
+              raw_content: 'Content',
+              images: [],
+            },
+          ],
+          failed_results: [],
+        },
+      });
+
+      const scraper = createTavilyScraper({
+        apiKey: 'test-key',
+        logger: mockLogger,
+        extractDepth: 'advanced',
+      });
+      await scraper.scrapeUrl('https://example.com');
+      const [, payload, config] = mockedAxios.post.mock.calls[0];
+
+      expect(payload).toMatchObject({
+        urls: ['https://example.com'],
+        extract_depth: 'advanced',
+      });
+      expect(payload).not.toHaveProperty('timeout');
+      expect(config).toMatchObject({ timeout: 15000 });
     });
 
     it('handles API failure gracefully', async () => {

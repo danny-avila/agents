@@ -9,6 +9,7 @@ export class TavilyScraper implements t.BaseScraper {
   private apiKey: string;
   private apiUrl: string;
   private timeout: number;
+  private payloadTimeout: number | undefined;
   private logger: t.Logger;
   private extractDepth: 'basic' | 'advanced';
   private includeImages: boolean;
@@ -23,6 +24,7 @@ export class TavilyScraper implements t.BaseScraper {
       process.env.TAVILY_EXTRACT_URL ??
       'https://api.tavily.com/extract';
     this.timeout = config.timeout ?? DEFAULT_TIMEOUT;
+    this.payloadTimeout = config.timeout;
     this.extractDepth = config.extractDepth ?? 'basic';
     this.includeImages = config.includeImages ?? false;
     this.includeFavicon = config.includeFavicon ?? false;
@@ -96,7 +98,10 @@ export class TavilyScraper implements t.BaseScraper {
       }
 
       const effectiveTimeout = options.timeout ?? this.timeout;
-      payload.timeout = Math.min(Math.max(effectiveTimeout / 1000, 1), 60);
+      const payloadTimeout = options.timeout ?? this.payloadTimeout;
+      if (payloadTimeout != null) {
+        payload.timeout = Math.min(Math.max(payloadTimeout / 1000, 1), 60);
+      }
 
       const response = await axios.post(this.apiUrl, payload, {
         headers: {

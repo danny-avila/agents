@@ -419,12 +419,27 @@ const TAVILY_TIME_RANGE_MAP: Record<string, string> = {
 const DEFAULT_TAVILY_TIMEOUT = 15000;
 
 const TAVILY_COUNTRY_ALIASES: Record<string, string> = {
+  ba: 'bosnia and herzegovina',
+  cg: 'congo',
+  cz: 'czech republic',
+  gb: 'united kingdom',
+  mm: 'myanmar',
+  tr: 'turkey',
+  tt: 'trinidad and tobago',
   uk: 'united kingdom',
 };
 
 const TAVILY_REGION_NAMES = new Intl.DisplayNames(['en'], {
   type: 'region',
 });
+
+const normalizeTavilyCountryName = (country: string): string =>
+  country
+    .toLowerCase()
+    .replace(/\s*\([^)]*\)/g, '')
+    .replace(/\s*&\s*/g, ' and ')
+    .normalize('NFD')
+    .replace(/\p{Diacritic}/gu, '');
 
 const normalizeTavilyCountry = (country?: string): string | undefined => {
   const normalizedCountry = country?.trim().toLowerCase();
@@ -438,12 +453,13 @@ const normalizeTavilyCountry = (country?: string): string | undefined => {
   }
 
   if (/^[a-z]{2}$/.test(normalizedCountry)) {
-    return TAVILY_REGION_NAMES.of(
-      normalizedCountry.toUpperCase()
-    )?.toLowerCase();
+    const regionName = TAVILY_REGION_NAMES.of(normalizedCountry.toUpperCase());
+    return regionName != null
+      ? normalizeTavilyCountryName(regionName)
+      : undefined;
   }
 
-  return normalizedCountry;
+  return normalizeTavilyCountryName(normalizedCountry);
 };
 
 const getHostname = (link: string): string => {
