@@ -494,7 +494,6 @@ const createTavilyAPI = (
     query,
     date,
     country,
-    safeSearch,
     numResults = 8,
     type,
     news,
@@ -520,8 +519,12 @@ const createTavilyAPI = (
         max_results: Math.min(Math.max(1, maxResults), 20),
       };
 
-      if (searchDepth !== 'fast' && searchDepth !== 'ultra-fast') {
-        payload.safe_search = (safeSearch ?? 1) !== 0;
+      if (
+        options?.safeSearch != null &&
+        searchDepth !== 'fast' &&
+        searchDepth !== 'ultra-fast'
+      ) {
+        payload.safe_search = options.safeSearch;
       }
       if (timeRange != null) {
         payload.time_range = timeRange;

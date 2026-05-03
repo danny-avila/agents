@@ -75,6 +75,7 @@ export interface TavilySearchOptions {
   includeImageDescriptions?: boolean;
   includeFavicon?: boolean;
   chunksPerSource?: number;
+  safeSearch?: boolean;
   timeout?: number;
 }
 
