@@ -621,14 +621,20 @@ export class Run<_T extends t.BaseGraphState> {
           const interrupts = data.chunk[INTERRUPT];
           if (interrupts.length > 0) {
             const first = interrupts[0];
-            const payload = first.value;
-            if (payload != null) {
-              this._interrupt = {
-                interruptId: first.id ?? '',
-                threadId,
-                payload,
-              };
-            }
+            /**
+             * Capture the interrupt unconditionally — `interrupt(null)`
+             * and `interrupt(undefined)` are valid pauses (a custom
+             * node may want to pause without metadata) and the host
+             * still needs to know the run is awaiting resume. Gating
+             * on `payload != null` would silently downgrade a paused
+             * run to "completed" and let the `Stop` hook fire,
+             * breaking host resume handling.
+             */
+            this._interrupt = {
+              interruptId: first.id ?? '',
+              threadId,
+              payload: first.value,
+            };
           }
         }
 

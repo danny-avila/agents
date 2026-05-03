@@ -1714,6 +1714,145 @@ describe('Codex review fixes', () => {
     ).toBe(true);
   });
 
+  it('hook returning ask + updatedInput rewrites args BEFORE the interrupt and BEFORE host execution', async () => {
+    const dispatchedArgs: Array<Record<string, unknown>> = [];
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data) => {
+        if (event !== 'on_tool_execute') {
+          return;
+        }
+        const request = data as {
+          toolCalls: t.ToolCallRequest[];
+          resolve: (r: t.ToolExecuteResult[]) => void;
+        };
+        for (const c of request.toolCalls) {
+          dispatchedArgs.push(c.args);
+        }
+        request.resolve(
+          request.toolCalls.map((c) => ({
+            toolCallId: c.id,
+            content: 'ran',
+            status: 'success' as const,
+          }))
+        );
+      });
+
+    /**
+     * Hook returns BOTH a sanitization rewrite AND `ask`. Real-world
+     * pattern: one matcher redacts secrets in the args, another
+     * matcher requires human approval. Both signals must apply.
+     */
+    const registry = new HookRegistry();
+    registry.register('PreToolUse', {
+      hooks: [
+        async (): Promise<PreToolUseHookOutput> => ({
+          decision: 'ask',
+          reason: 'review redacted args',
+          updatedInput: { command: 'redacted-command' },
+        }),
+      ],
+    });
+
+    const node = new ToolNode({
+      tools: [createSchemaStub('echo')],
+      eventDrivenMode: true,
+      agentId: 'agent-x',
+      toolCallStepIds: new Map([['call_1', 'step_1']]),
+      hookRegistry: registry,
+      humanInTheLoop: { enabled: true },
+    });
+
+    const graph = buildHITLGraph(node, [
+      { id: 'call_1', name: 'echo', args: { command: 'original-secret' } },
+    ]);
+    const config = { configurable: { thread_id: 'ask-with-update' } };
+
+    const interrupted = await graph.invoke({ messages: [] }, config);
+    if (!isInterrupted<t.HumanInterruptPayload>(interrupted)) {
+      throw new Error('expected interrupt');
+    }
+    const payload = interrupted.__interrupt__[0].value!;
+    if (payload.type !== 'tool_approval') {
+      throw new Error('expected tool_approval');
+    }
+    /** The interrupt payload surfaces the REWRITTEN args to the
+     * reviewer, not the original. Without the fix, the reviewer
+     * would see the secret. */
+    expect(payload.action_requests[0].arguments).toEqual({
+      command: 'redacted-command',
+    });
+
+    await graph.invoke(new Command({ resume: [{ type: 'approve' }] }), config);
+
+    /** And the host execution dispatches the rewritten args, not
+     * the original. Without the fix, the policy redaction would be
+     * silently dropped after approval. */
+    expect(dispatchedArgs).toEqual([{ command: 'redacted-command' }]);
+  });
+
+  it('captures interrupt even when payload is null (custom node calling interrupt(null))', async () => {
+    const langgraph = await import('@langchain/langgraph');
+
+    let stopFired = false;
+    const registry = new HookRegistry();
+    registry.register('Stop', {
+      hooks: [
+        async (): Promise<Record<string, never>> => {
+          stopFired = true;
+          return {};
+        },
+      ],
+    });
+
+    const builder = new StateGraph(MessagesAnnotation)
+      .addNode('pauser', () => {
+        /** Custom node pauses without payload — valid use case (the
+         * pause itself is the signal; no metadata needed). */
+        langgraph.interrupt(null);
+        return { messages: [] };
+      })
+      .addEdge(START, 'pauser')
+      .addEdge('pauser', END);
+    const graph = builder.compile({ checkpointer: new MemorySaver() });
+
+    const { Run } = await import('@/run');
+    const run = await Run.create<t.IState>({
+      runId: 'null-payload-interrupt',
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'a',
+            provider: providers.OPENAI,
+            clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+          },
+        ],
+      },
+      hooks: registry,
+      humanInTheLoop: { enabled: true },
+    });
+    run.graphRunnable = graph as unknown as t.CompiledStateWorkflow;
+
+    await run.processStream(
+      { messages: [] },
+      {
+        configurable: { thread_id: 'null-payload-thread' },
+        version: 'v2',
+      }
+    );
+
+    /** Run was paused, NOT completed — getInterrupt returns a result
+     * (with the null payload preserved) and the Stop hook does not
+     * fire. Without the fix, both inversions held. */
+    const interrupt = run.getInterrupt<unknown>();
+    expect(interrupt).toBeDefined();
+    expect(interrupt!.payload).toBeNull();
+    expect(stopFired).toBe(false);
+  });
+
   it('clears session hooks when the stream throws AFTER an interrupt is captured (stale interrupt)', async () => {
     jest
       .spyOn(events, 'safeDispatchCustomEvent')

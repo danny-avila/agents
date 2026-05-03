@@ -1147,6 +1147,18 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             blockEntry(entry, hookResult.reason ?? 'Blocked by hook');
             continue;
           }
+          /**
+           * Apply `updatedInput` BEFORE queuing into `askEntries` —
+           * a hook is allowed to return both a sanitization rewrite
+           * and an `ask` decision (e.g. one matcher redacts secrets,
+           * another matcher requires approval). Without this, the
+           * interrupt payload would surface the original args to the
+           * reviewer AND the post-approve execution would run with
+           * the original args, silently dropping the hook's rewrite.
+           */
+          if (hookResult.updatedInput != null) {
+            applyInputOverride(entry, hookResult.updatedInput);
+          }
           askEntries.push({
             entry,
             reason: hookResult.reason,
