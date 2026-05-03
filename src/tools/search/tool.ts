@@ -312,7 +312,7 @@ function createTool({
  * Search providers: Serper (Google results), SearXNG (self-hosted meta-search), Tavily (AI-optimized).
  * Scraper providers: Firecrawl (default, full-featured), Serper (lightweight), Tavily (batch extraction).
  *
- * The country schema field is only exposed to the LLM when using Serper (Tavily does not support it).
+ * The country schema field is exposed to the LLM for providers that support localized results.
  */
 /** Input params type for search tool */
 interface SearchToolParams {
@@ -366,7 +366,7 @@ export const createSearchTool = (
     news: newsSchema,
   };
 
-  if (searchProvider === 'serper') {
+  if (searchProvider === 'serper' || searchProvider === 'tavily') {
     schemaProperties.country = countrySchema;
   }
 

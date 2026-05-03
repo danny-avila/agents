@@ -449,6 +449,7 @@ const createTavilyAPI = (
   const getSources = async ({
     query,
     date,
+    country,
     numResults = 8,
     type,
     news,
@@ -476,6 +477,10 @@ const createTavilyAPI = (
 
       if (timeRange != null) {
         payload.time_range = timeRange;
+      }
+      const normalizedCountry = country?.trim().toLowerCase();
+      if (normalizedCountry != null && normalizedCountry !== '') {
+        payload.country = normalizedCountry;
       }
       if (type === 'images' || options?.includeImages) {
         payload.include_images = true;

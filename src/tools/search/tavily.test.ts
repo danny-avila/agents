@@ -51,11 +51,15 @@ describe('Tavily search API', () => {
       },
     });
 
-    const result = await searchAPI.getSources({ query: 'example query' });
+    const result = await searchAPI.getSources({
+      query: 'example query',
+      country: 'US',
+    });
     const [, payload] = mockedAxios.post.mock.calls[0];
 
     expect(payload).toMatchObject({
       query: 'example query',
+      country: 'us',
       include_answer: 'advanced',
       include_raw_content: 'markdown',
       include_images: true,
