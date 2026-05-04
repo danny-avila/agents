@@ -1,4 +1,8 @@
-import { AIMessage, AIMessageChunk } from '@langchain/core/messages';
+import {
+  AIMessage,
+  AIMessageChunk,
+  HumanMessage,
+} from '@langchain/core/messages';
 import type { OpenAIChatInput, OpenAIClient } from '@langchain/openai';
 import type { ChatOpenRouterCallOptions } from '@/llm/openrouter';
 import type { CustomAnthropicInput } from '@/llm/anthropic';
@@ -69,6 +73,29 @@ type StreamingCompletionDelegate = {
 type StreamingCompletionBackedModel = {
   completions: StreamingCompletionDelegate;
 };
+type OpenAIStreamEvent = {
+  event: string;
+  data?: unknown;
+};
+type OpenAIStreamItem =
+  | OpenAIClient.Chat.Completions.ChatCompletionChunk
+  | OpenAIStreamEvent;
+type MockableCompletionCreate = (
+  request: unknown,
+  options?: unknown
+) => Promise<
+  AsyncIterable<OpenAIStreamItem> | OpenAIClient.Chat.Completions.ChatCompletion
+>;
+type MockableCompletionClient = {
+  chat: {
+    completions: {
+      create: MockableCompletionCreate;
+    };
+  };
+};
+type MockableCompletionDelegate = OpenAIResponsesDelegate & {
+  client?: MockableCompletionClient;
+};
 type OpenRouterReasoningStreamDelta =
   OpenAIClient.Chat.Completions.ChatCompletionChunk.Choice.Delta & {
     reasoning_details?: Array<
@@ -93,6 +120,7 @@ type OpenRouterReasoningStreamChoice = Omit<
 > & {
   delta: OpenRouterReasoningStreamDelta;
 };
+type OpenAIStreamModel = ChatOpenAI | AzureChatOpenAI;
 
 const baseAzureFields = {
   azureOpenAIApiKey: 'test-azure-key',
@@ -108,6 +136,101 @@ const baseBedrockFields = {
     secretAccessKey: 'test-secret-key',
   },
 };
+
+const createOpenAIStreamChunk = (
+  content: string,
+  finishReason: OpenAIClient.Chat.Completions.ChatCompletionChunk.Choice['finish_reason'] = null
+): OpenAIClient.Chat.Completions.ChatCompletionChunk => ({
+  id: 'chatcmpl-hermes-test',
+  object: 'chat.completion.chunk',
+  created: 0,
+  model: 'hermes-agent',
+  choices: [
+    {
+      index: 0,
+      delta: { content },
+      finish_reason: finishReason,
+    },
+  ],
+});
+
+async function* createOpenAIStreamWithCustomEvents(): AsyncGenerator<OpenAIStreamItem> {
+  yield createOpenAIStreamChunk('Hello ');
+  yield {
+    event: 'hermes.tool.progress',
+    data: {
+      tool: 'execute_code',
+      toolCallId: 'call_1',
+      status: 'running',
+    },
+  };
+  yield {
+    event: 'hermes.tool.progress',
+    data: null,
+  };
+  yield {
+    event: 'message',
+    data: createOpenAIStreamChunk('world', 'stop'),
+  };
+}
+
+function mockCompletionStream(
+  model: OpenAIStreamModel
+): MockableCompletionCreate {
+  const completions = (
+    model as unknown as { completions: MockableCompletionDelegate }
+  ).completions;
+  completions._getClientOptions(undefined);
+  const client = completions.client;
+  if (client == null) {
+    throw new Error('Expected OpenAI completions client');
+  }
+
+  const createMock = jest.fn(async () =>
+    createOpenAIStreamWithCustomEvents()
+  ) as MockableCompletionCreate;
+  client.chat.completions.create = createMock;
+  return createMock;
+}
+
+function mockCompletion(
+  model: ChatOpenAI,
+  response: OpenAIClient.Chat.Completions.ChatCompletion
+): MockableCompletionCreate {
+  const completions = (
+    model as unknown as { completions: MockableCompletionDelegate }
+  ).completions;
+  completions._getClientOptions(undefined);
+  const client = completions.client;
+  if (client == null) {
+    throw new Error('Expected OpenAI completions client');
+  }
+
+  const createMock = jest.fn(async () => response) as MockableCompletionCreate;
+  client.chat.completions.create = createMock;
+  return createMock;
+}
+
+async function expectCustomSSEEventsSkipped(
+  model: OpenAIStreamModel
+): Promise<void> {
+  const createMock = mockCompletionStream(model);
+  const chunks: AIMessageChunk[] = [];
+  const stream = await model.stream([new HumanMessage('use a tool')]);
+  for await (const chunk of stream) {
+    chunks.push(chunk);
+  }
+
+  const text = chunks
+    .map((chunk) => (typeof chunk.content === 'string' ? chunk.content : ''))
+    .join('');
+  expect(chunks).toHaveLength(2);
+  expect(text).toBe('Hello world');
+  expect(createMock).toHaveBeenCalledWith(
+    expect.objectContaining({ stream: true }),
+    expect.any(Object)
+  );
+}
 
 describe('custom chat model class smoke tests', () => {
   it('keeps the custom OpenAI client, stream delay, and reasoning precedence', () => {
@@ -250,6 +373,57 @@ describe('custom chat model class smoke tests', () => {
     expect(xai._lc_stream_delay).toBe(7);
     expect(xai.exposedClient).toBeInstanceOf(CustomOpenAIClient);
     expect(xaiRequestOptions.baseURL).toBe('https://xai.test/v1');
+  });
+
+  it('skips custom OpenAI-compatible SSE events during OpenAI streaming', async () => {
+    await expectCustomSSEEventsSkipped(
+      new ChatOpenAI({
+        model: 'hermes-agent',
+        apiKey: 'test-key',
+        streaming: true,
+      })
+    );
+  });
+
+  it('skips custom OpenAI-compatible SSE events during Azure streaming', async () => {
+    await expectCustomSSEEventsSkipped(
+      new AzureChatOpenAI({
+        ...baseAzureFields,
+      })
+    );
+  });
+
+  it('passes non-streaming OpenAI completions through unchanged', async () => {
+    const model = new ChatOpenAI({
+      model: 'hermes-agent',
+      apiKey: 'test-key',
+    });
+    const createMock = mockCompletion(model, {
+      id: 'chatcmpl-nonstream-test',
+      object: 'chat.completion',
+      created: 0,
+      model: 'hermes-agent',
+      choices: [
+        {
+          index: 0,
+          finish_reason: 'stop',
+          logprobs: null,
+          message: {
+            role: 'assistant',
+            content: 'plain response',
+            refusal: null,
+          },
+        },
+      ],
+    });
+
+    const response = await model.invoke([new HumanMessage('no stream')]);
+
+    expect(response.content).toBe('plain response');
+    expect(createMock).toHaveBeenCalledWith(
+      expect.objectContaining({ stream: false }),
+      expect.any(Object)
+    );
   });
 
   it('keeps Moonshot reasoning content in completion requests', async () => {
