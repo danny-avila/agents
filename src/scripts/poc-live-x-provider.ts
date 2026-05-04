@@ -40,11 +40,17 @@ async function tryCall<T>(
   }
 }
 
+type SdkLikeError = {
+  status?: number | string;
+  statusCode?: number | string;
+  message?: string;
+};
+
 function describeError(error: unknown): string {
   if (error == null) return 'unknown';
-  const e = error as Record<string, unknown>;
+  const e = error as SdkLikeError;
   const status = e.status ?? e.statusCode ?? '?';
-  const messageRaw = (e.message as string | undefined) ?? String(error);
+  const messageRaw = e.message ?? String(error);
   const message =
     messageRaw.length > 800 ? messageRaw.slice(0, 800) + '…' : messageRaw;
   return `status=${status}\n  message=${message}`;

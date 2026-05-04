@@ -1,5 +1,9 @@
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
-import { _convertMessagesToOpenAIParams } from './index';
+import {
+  flattenAnthropicThinkingForOpenAI,
+  _convertMessagesToOpenAIParams,
+  _convertMessagesToOpenAIResponsesParams,
+} from './index';
 
 describe('_convertMessagesToOpenAIParams', () => {
   it('includes reasoning_content for assistant messages in tool-call context when requested', () => {
@@ -315,6 +319,203 @@ describe('_convertMessagesToOpenAIParams', () => {
           tool_calls: expect.any(Array),
         })
       );
+    });
+
+    it('defaults to flatten/drop when model is undefined', () => {
+      const messages = [
+        new AIMessage({
+          content: [
+            { type: 'thinking', thinking: 'reasoning', signature: 'sig' },
+            { type: 'redacted_thinking', data: 'opaque' },
+            { type: 'text', text: 'answer' },
+          ] as never,
+        }),
+      ];
+
+      const params = _convertMessagesToOpenAIParams(messages);
+
+      expect(params[0]).toEqual(
+        expect.objectContaining({
+          role: 'assistant',
+          content: [
+            { type: 'text', text: '<thinking>reasoning</thinking>' },
+            { type: 'text', text: 'answer' },
+          ],
+        })
+      );
+    });
+
+    it('preserves order across interleaved thinking, text, and redacted_thinking', () => {
+      const messages = [
+        new AIMessage({
+          content: [
+            { type: 'thinking', thinking: 'first', signature: 'sig1' },
+            { type: 'text', text: 'one' },
+            { type: 'redacted_thinking', data: 'opaque' },
+            { type: 'text', text: 'two' },
+            { type: 'thinking', thinking: '', signature: 'sig2' },
+            { type: 'text', text: 'three' },
+          ] as never,
+        }),
+      ];
+
+      const params = _convertMessagesToOpenAIParams(messages, 'gpt-5.4-mini');
+
+      expect(params[0]).toEqual(
+        expect.objectContaining({
+          role: 'assistant',
+          content: [
+            { type: 'text', text: '<thinking>first</thinking>' },
+            { type: 'text', text: 'one' },
+            { type: 'text', text: 'two' },
+            { type: 'text', text: 'three' },
+          ],
+        })
+      );
+    });
+  });
+
+  describe('flattenAnthropicThinkingForOpenAI', () => {
+    it('flattens thinking blocks for non-Claude targets', () => {
+      const out = flattenAnthropicThinkingForOpenAI(
+        [
+          new AIMessage({
+            content: [
+              { type: 'thinking', thinking: 'reason', signature: 'sig' },
+              { type: 'text', text: 'answer' },
+            ] as never,
+          }),
+        ],
+        'gpt-5.4-mini'
+      );
+
+      expect(out[0].content).toEqual([
+        { type: 'text', text: '<thinking>reason</thinking>' },
+        { type: 'text', text: 'answer' },
+      ]);
+    });
+
+    it('passes through unchanged for Claude targets', () => {
+      const original = [
+        new AIMessage({
+          content: [
+            { type: 'thinking', thinking: 'reason', signature: 'sig' },
+            { type: 'text', text: 'answer' },
+          ] as never,
+        }),
+      ];
+
+      const out = flattenAnthropicThinkingForOpenAI(
+        original,
+        'anthropic/claude-sonnet-4-5'
+      );
+
+      expect(out).toBe(original);
+    });
+
+    it('returns the same reference when no message has thinking blocks', () => {
+      const original = [
+        new HumanMessage('hi'),
+        new AIMessage({
+          content: [{ type: 'text', text: 'hello' }] as never,
+        }),
+      ];
+
+      const out = flattenAnthropicThinkingForOpenAI(original, 'gpt-5.4-mini');
+
+      expect(out).toBe(original);
+    });
+
+    it('preserves AIMessage tool_calls and additional_kwargs across the rewrite', () => {
+      const original = new AIMessage({
+        content: [
+          { type: 'thinking', thinking: 'thinking', signature: 'sig' },
+          { type: 'text', text: 'will call tool' },
+        ] as never,
+        tool_calls: [
+          { id: 'call_1', name: 'f', args: { x: 1 }, type: 'tool_call' },
+        ],
+        additional_kwargs: { reasoning_content: 'extra' },
+      });
+
+      const out = flattenAnthropicThinkingForOpenAI([original], 'gpt-5.4-mini');
+
+      expect(out[0]).not.toBe(original);
+      expect((out[0] as AIMessage).tool_calls).toEqual(original.tool_calls);
+      expect(out[0].additional_kwargs).toEqual({ reasoning_content: 'extra' });
+      expect(out[0].content).toEqual([
+        { type: 'text', text: '<thinking>thinking</thinking>' },
+        { type: 'text', text: 'will call tool' },
+      ]);
+    });
+
+    it('falls back to empty string content when filtering empties the array', () => {
+      const out = flattenAnthropicThinkingForOpenAI(
+        [
+          new AIMessage({
+            content: [
+              { type: 'thinking', thinking: '', signature: 'sig' },
+              { type: 'redacted_thinking', data: 'opaque' },
+            ] as never,
+          }),
+        ],
+        'gpt-5.4-mini'
+      );
+
+      expect(out[0].content).toBe('');
+    });
+  });
+
+  describe('_convertMessagesToOpenAIResponsesParams cross-provider thinking', () => {
+    it('flattens thinking blocks to <thinking> output_text for non-Claude targets', () => {
+      const messages = [
+        new HumanMessage('hi'),
+        new AIMessage({
+          content: [
+            { type: 'thinking', thinking: 'consider X', signature: 'sig' },
+            { type: 'text', text: 'answer' },
+          ] as never,
+        }),
+      ];
+
+      const params = _convertMessagesToOpenAIResponsesParams(messages, 'gpt-5');
+      const assistant = params.find(
+        (p) => 'role' in p && p.role === 'assistant'
+      ) as { content: unknown[] };
+
+      expect(assistant.content).toEqual([
+        {
+          type: 'output_text',
+          text: '<thinking>consider X</thinking>',
+          annotations: [],
+        },
+        {
+          type: 'output_text',
+          text: 'answer',
+          annotations: [],
+        },
+      ]);
+    });
+
+    it('drops empty thinking and redacted_thinking on the Responses path', () => {
+      const messages = [
+        new AIMessage({
+          content: [
+            { type: 'thinking', thinking: '', signature: 'sig' },
+            { type: 'redacted_thinking', data: 'opaque' },
+            { type: 'text', text: 'visible' },
+          ] as never,
+        }),
+      ];
+
+      const params = _convertMessagesToOpenAIResponsesParams(messages, 'gpt-5');
+      const assistant = params.find(
+        (p) => 'role' in p && p.role === 'assistant'
+      ) as { content: unknown[] };
+
+      expect(assistant.content).toEqual([
+        { type: 'output_text', text: 'visible', annotations: [] },
+      ]);
     });
   });
 });

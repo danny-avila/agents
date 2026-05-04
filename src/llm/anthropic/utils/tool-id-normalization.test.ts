@@ -74,6 +74,13 @@ describe('normalizeAnthropicToolCallId', () => {
   it('passes through undefined for the optional overload', () => {
     expect(normalizeAnthropicToolCallId(undefined)).toBeUndefined();
   });
+
+  it('handles empty string by producing a deterministic compliant output', () => {
+    const out = normalizeAnthropicToolCallId('');
+    expect(/^[a-zA-Z0-9_-]+$/.test(out)).toBe(true);
+    expect(out.length).toBeLessThanOrEqual(64);
+    expect(out).toBe(normalizeAnthropicToolCallId(''));
+  });
 });
 
 describe('_convertMessagesToAnthropicPayload — cross-provider ID normalization', () => {
