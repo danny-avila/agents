@@ -1343,13 +1343,13 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
     options.signal?.throwIfAborted();
     const params = this.invocationParams(options);
 
-    messages = flattenAnthropicThinkingForOpenAI(messages, this.model);
+    const normalized = flattenAnthropicThinkingForOpenAI(messages, this.model);
 
     if (params.stream === true) {
-      return super._generate(messages, options, runManager);
+      return super._generate(normalized, options, runManager);
     }
 
-    const messagesMapped = this._convertDeepSeekMessages(messages);
+    const messagesMapped = this._convertDeepSeekMessages(normalized);
     const response = await this.completionWithRetry(
       {
         ...params,
