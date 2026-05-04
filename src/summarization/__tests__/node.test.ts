@@ -1,4 +1,4 @@
-import { HumanMessage } from '@langchain/core/messages';
+import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type * as t from '@/types';
 import { GraphEvents, Providers } from '@/common';
@@ -16,7 +16,13 @@ import { AgentContext } from '@/agents/AgentContext';
 // ---------------------------------------------------------------------------
 
 /** Creates a real AgentContext via fromConfig with sensible defaults.
- *  Extra properties are assigned directly for test-specific overrides. */
+ *  Extra properties are assigned directly for test-specific overrides.
+ *
+ *  Defaults `retainRecent.turns` to `0` so that tests which use 1–2 message
+ *  states still exercise the LLM-call summarization path.  The recency-window
+ *  default of `2` turns would otherwise short-circuit summarization for those
+ *  inputs.  Tests that target recency-window behavior should pass an explicit
+ *  `summarizationConfig.retainRecent` value. */
 function createAgentContext(
   overrides: Record<string, unknown> = {}
 ): AgentContext {
@@ -32,12 +38,17 @@ function createAgentContext(
     ...extra
   } = overrides;
 
+  const effectiveSummarizationConfig =
+    summarizationConfig != null
+      ? summarizationConfig
+      : { retainRecent: { turns: 0 } };
+
   const ctx = AgentContext.fromConfig({
     agentId: agentId as string,
     provider: provider as Providers,
     instructions: instructions as string,
     summarizationEnabled: summarizationEnabled as boolean,
-    ...(summarizationConfig != null ? { summarizationConfig } : {}),
+    summarizationConfig: effectiveSummarizationConfig,
     ...(maxContextTokens != null ? { maxContextTokens } : {}),
     ...(tools != null ? { tools } : {}),
   } as import('@/types').AgentInputs);
@@ -703,6 +714,219 @@ describe('budget check — instructions exceed context', () => {
     // Should have summarized — messages returned for state replacement
     expect(result.messages).toBeDefined();
     expect(result.messages!.length).toBeGreaterThan(0);
+  });
+});
+
+describe('recency window — first-turn protection', () => {
+  it('skips the LLM call when only one turn exists (default turns: 2)', async () => {
+    const events = captureEvents();
+
+    const invokeMock = jest
+      .fn()
+      .mockResolvedValue({ content: 'should not be called' });
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return { invoke: invokeMock };
+        }
+      } as never
+    );
+
+    const setSummary = jest.fn();
+    const agentContext = createAgentContext({
+      summarizationConfig: {} /* defaults to retainRecent.turns = 2 */,
+      setSummary,
+    } as never);
+    const graph = mockGraph();
+    const summarizeNode = createSummarizeNode({
+      agentContext,
+      graph: graph as never,
+      generateStepId,
+    });
+
+    const largePayload = 'paste'.repeat(10_000);
+    const result = await summarizeNode(
+      {
+        messages: [new HumanMessage(largePayload)],
+        summarizationRequest: {
+          remainingContextTokens: 0,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    // No LLM call — first user message is preserved verbatim.
+    expect(invokeMock).not.toHaveBeenCalled();
+    expect(setSummary).not.toHaveBeenCalled();
+    // No state mutation — original messages stay.
+    expect(result.messages).toBeUndefined();
+    expect(result.summarizationRequest).toBeUndefined();
+    // No ON_SUMMARIZE_START emitted on the skip path.
+    const eventNames = events.map((e) => e.event);
+    expect(eventNames).not.toContain(GraphEvents.ON_SUMMARIZE_START);
+    expect(eventNames).not.toContain(GraphEvents.ON_SUMMARIZE_COMPLETE);
+  });
+
+  it('skips when a single-turn includes assistant + tool messages', async () => {
+    captureEvents();
+
+    const invokeMock = jest.fn().mockResolvedValue({ content: 'unused' });
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return { invoke: invokeMock };
+        }
+      } as never
+    );
+
+    const setSummary = jest.fn();
+    const agentContext = createAgentContext({
+      summarizationConfig: {},
+      setSummary,
+    } as never);
+    const graph = mockGraph();
+    const summarizeNode = createSummarizeNode({
+      agentContext,
+      graph: graph as never,
+      generateStepId,
+    });
+
+    const result = await summarizeNode(
+      {
+        messages: [
+          new HumanMessage('the first user prompt'),
+          new AIMessage({
+            content: '',
+            tool_calls: [{ id: 'c', name: 'search', args: {} }],
+          }),
+          new ToolMessage({
+            content: 'result',
+            tool_call_id: 'c',
+            name: 'search',
+          }),
+          new AIMessage('here is what i found'),
+        ],
+        summarizationRequest: {
+          remainingContextTokens: 0,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    expect(invokeMock).not.toHaveBeenCalled();
+    expect(setSummary).not.toHaveBeenCalled();
+    expect(result.messages).toBeUndefined();
+  });
+
+  it('still summarizes the head when older turns exist beyond the recency window', async () => {
+    captureEvents();
+
+    let capturedMessages: { type: string; content: unknown }[] = [];
+    const invokeMock = jest.fn().mockImplementation((messages: unknown) => {
+      capturedMessages = (
+        messages as Array<{ getType: () => string; content: unknown }>
+      ).map((m) => ({ type: m.getType(), content: m.content }));
+      return Promise.resolve({ content: 'Summary of older turns' });
+    });
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return { invoke: invokeMock };
+        }
+      } as never
+    );
+
+    const setSummary = jest.fn();
+    const agentContext = createAgentContext({
+      summarizationConfig: { retainRecent: { turns: 1 } },
+      setSummary,
+    } as never);
+    const graph = mockGraph();
+    const summarizeNode = createSummarizeNode({
+      agentContext,
+      graph: graph as never,
+      generateStepId,
+    });
+
+    const messages = [
+      new HumanMessage('turn 1 query'),
+      new AIMessage('turn 1 reply'),
+      new HumanMessage('turn 2 query'),
+      new AIMessage('turn 2 reply'),
+    ];
+    const result = await summarizeNode(
+      {
+        messages,
+        summarizationRequest: {
+          remainingContextTokens: 0,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    // Head (turn 1) summarized; tail (turn 2) preserved verbatim.
+    expect(setSummary).toHaveBeenCalledWith(
+      expect.stringContaining('Summary of older turns'),
+      expect.any(Number)
+    );
+    // Captured messages are the head + the appended summarization instruction.
+    // Head has 2 messages (turn 1) + 1 instruction = 3 total.
+    expect(capturedMessages).toHaveLength(3);
+    expect(capturedMessages[0]?.content).toBe('turn 1 query');
+    expect(capturedMessages[1]?.content).toBe('turn 1 reply');
+
+    // Returned messages: removeAll marker + tail.
+    expect(result.messages).toBeDefined();
+    expect(result.messages![0]?._getType()).toBe('remove');
+    expect(result.messages!.slice(1)).toHaveLength(2);
+    expect((result.messages![1] as HumanMessage).content).toBe('turn 2 query');
+    expect((result.messages![2] as AIMessage).content).toBe('turn 2 reply');
+  });
+
+  it('preserves the legacy "remove all, summary only" shape when retainRecent.turns is 0', async () => {
+    captureEvents();
+
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return mockInvokeModel('Legacy summary');
+        }
+      } as never
+    );
+
+    const setSummary = jest.fn();
+    const agentContext = createAgentContext({
+      summarizationConfig: { retainRecent: { turns: 0 } },
+      setSummary,
+    } as never);
+    const graph = mockGraph();
+    const summarizeNode = createSummarizeNode({
+      agentContext,
+      graph: graph as never,
+      generateStepId,
+    });
+
+    const result = await summarizeNode(
+      {
+        messages: [
+          new HumanMessage('only message'),
+          new AIMessage('only reply'),
+        ],
+        summarizationRequest: {
+          remainingContextTokens: 0,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    expect(setSummary).toHaveBeenCalled();
+    // Legacy: remove-all only, no tail re-injection.
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages![0]?._getType()).toBe('remove');
   });
 });
 

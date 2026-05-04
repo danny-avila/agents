@@ -14,6 +14,7 @@ import { ContentTypes, GraphEvents, StepTypes, Providers } from '@/common';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { createRemoveAllMessage } from '@/messages/reducer';
+import { splitAtRecencyBoundary } from '@/messages/recency';
 import { getMaxOutputTokensKey } from '@/llm/request';
 import { addCacheControl } from '@/messages/cache';
 import { initializeModel } from '@/llm/init';
@@ -21,6 +22,18 @@ import { getChunkContent } from '@/stream';
 import { executeHooks } from '@/hooks';
 
 const SUMMARIZATION_PARAM_KEYS = new Set(['maxSummaryTokens']);
+
+/**
+ * Default number of recent user-led turns preserved verbatim during
+ * compaction.  A turn begins at a HumanMessage and includes every
+ * following AIMessage and ToolMessage up to the next HumanMessage.
+ * The most recent turn is always retained regardless of this value;
+ * the default of `2` additionally keeps the prior exchange so the
+ * model has fresh context on what just happened.  Setting
+ * `retainRecent.turns` to `0` reverts to the legacy "summarize every
+ * message" behavior.
+ */
+const DEFAULT_RETAIN_RECENT_TURNS = 2;
 
 /**
  * Token overhead of the XML wrapper + instruction text added around the
@@ -749,18 +762,50 @@ export function createSummarizeNode({
       return { summarizationRequest: undefined };
     }
 
-    const messagesToRefine = restoreOriginalToolContent(
+    const restoredMessages = restoreOriginalToolContent(
       state.messages,
       agentContext.pendingOriginalToolContent
     );
     agentContext.pendingOriginalToolContent = undefined;
 
+    const runnableConfig = config ?? graph.config;
+
+    const retainRecent = agentContext.summarizationConfig?.retainRecent;
+    const { head: messagesToRefine, tail: messagesToRetain } =
+      splitAtRecencyBoundary(restoredMessages, {
+        turns: retainRecent?.turns ?? DEFAULT_RETAIN_RECENT_TURNS,
+        tokens: retainRecent?.tokens,
+        tokenCounter: agentContext.tokenCounter,
+      });
+
+    if (messagesToRefine.length === 0) {
+      /**
+       * Recency window covers the entire conversation — there is no
+       * older content to summarize.  Skipping prevents the model from
+       * destroying the user's most recent message (e.g. a large pasted
+       * payload on the first turn) by replacing it with a generic
+       * checkpoint summary.  Mark the trigger so the same unchanged
+       * state is not re-evaluated on the next prune cycle.
+       */
+      emitAgentLog(
+        config,
+        'debug',
+        'summarize',
+        'Summarization skipped — recency window retains all messages',
+        {
+          messagesRetained: messagesToRetain.length,
+          retainTurns: retainRecent?.turns ?? DEFAULT_RETAIN_RECENT_TURNS,
+        },
+        { runId: graph.runId, agentId: request.agentId }
+      );
+      agentContext.markSummarizationTriggered(state.messages.length);
+      return { summarizationRequest: undefined };
+    }
+
     const clientConfig = buildSummarizationClientConfig(
       agentContext,
       agentContext.summarizationConfig
     );
-
-    const runnableConfig = config ?? graph.config;
 
     const stepKey = `summarize-${request.agentId}`;
     const [stepId, stepIndex] = generateStepId(stepKey);
@@ -939,7 +984,10 @@ export function createSummarizeNode({
 
     return {
       summarizationRequest: undefined,
-      messages: [createRemoveAllMessage()],
+      messages:
+        messagesToRetain.length > 0
+          ? [createRemoveAllMessage(), ...messagesToRetain]
+          : [createRemoveAllMessage()],
     };
   };
 }
