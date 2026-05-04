@@ -417,15 +417,12 @@ export function _convertMessagesToOpenAIParams(
       role = 'developer';
     }
 
-    let hasAnthropicThinkingBlock: boolean = false;
-
     const filteredContent =
       typeof message.content === 'string'
         ? message.content
         : message.content
           .map((m) => {
             if ('type' in m && m.type === 'thinking') {
-              hasAnthropicThinkingBlock = true;
               if (isClaudeTarget) {
                 return m;
               }
@@ -439,7 +436,6 @@ export function _convertMessagesToOpenAIParams(
               };
             }
             if ('type' in m && m.type === 'redacted_thinking') {
-              hasAnthropicThinkingBlock = true;
               return isClaudeTarget ? m : null;
             }
             if (isDataContentBlock(m)) {
@@ -459,9 +455,7 @@ export function _convertMessagesToOpenAIParams(
      * the request still validates.
      */
     const content =
-      hasAnthropicThinkingBlock &&
-      Array.isArray(filteredContent) &&
-      filteredContent.length === 0
+      Array.isArray(filteredContent) && filteredContent.length === 0
         ? ''
         : filteredContent;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -483,7 +477,15 @@ export function _convertMessagesToOpenAIParams(
       completionParam.tool_calls = message.tool_calls.map(
         convertLangChainToolCallToOpenAI
       );
-      completionParam.content = hasAnthropicThinkingBlock ? content : '';
+      /**
+       * OpenAI's convention is for tool-call assistant messages to have empty
+       * content. Preserve the content array when non-empty — that covers
+       * pass-through thinking blocks for Claude targets AND
+       * `<thinking>...</thinking>` text blocks pre-flattened by the outer
+       * wrapper, which would otherwise be silently dropped on this turn.
+       */
+      completionParam.content =
+        Array.isArray(content) && content.length > 0 ? content : '';
       if (
         options?.includeReasoningDetails === true &&
         message.additional_kwargs.reasoning_details != null

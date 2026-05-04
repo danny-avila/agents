@@ -293,6 +293,59 @@ describe('_convertMessagesToOpenAIParams', () => {
       expect(params[0]).not.toHaveProperty('tool_calls');
     });
 
+    it('preserves pre-flattened <thinking> text on tool-call assistant messages', () => {
+      // Regression: when the outer wrapper has already flattened thinking
+      // blocks to text, _convertMessagesToOpenAIParams must not clear that
+      // text on tool-call messages just because no raw `thinking` block
+      // was detected. This is the path exercised by ChatMoonshot
+      // (includeReasoningContent=true) after the outer pre-processor runs.
+      const messages = [
+        new AIMessage({
+          content: [
+            { type: 'text', text: '<thinking>reason</thinking>' },
+            { type: 'text', text: 'I will look that up.' },
+          ],
+          tool_calls: [
+            { id: 'call_1', name: 'lookup', args: {}, type: 'tool_call' },
+          ],
+        }),
+      ];
+
+      const params = _convertMessagesToOpenAIParams(messages, 'gpt-5.4-mini');
+
+      expect(params[0]).toEqual(
+        expect.objectContaining({
+          role: 'assistant',
+          content: [
+            { type: 'text', text: '<thinking>reason</thinking>' },
+            { type: 'text', text: 'I will look that up.' },
+          ],
+          tool_calls: expect.any(Array),
+        })
+      );
+    });
+
+    it('clears string content on tool-call assistant messages (OpenAI convention)', () => {
+      const messages = [
+        new AIMessage({
+          content: 'I will look that up.',
+          tool_calls: [
+            { id: 'call_1', name: 'lookup', args: {}, type: 'tool_call' },
+          ],
+        }),
+      ];
+
+      const params = _convertMessagesToOpenAIParams(messages, 'gpt-5.4-mini');
+
+      expect(params[0]).toEqual(
+        expect.objectContaining({
+          role: 'assistant',
+          content: '',
+          tool_calls: expect.any(Array),
+        })
+      );
+    });
+
     it('emits empty content string when thinking-only message is fully dropped alongside tool_calls', () => {
       const messages = [
         new AIMessage({
