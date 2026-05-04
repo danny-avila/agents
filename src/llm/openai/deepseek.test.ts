@@ -207,8 +207,19 @@ describe('ChatDeepSeek', () => {
       ]
     );
     const chunks = [];
+    const callbackTokens: string[] = [];
 
-    for await (const chunk of await model.stream([new HumanMessage('hi')])) {
+    const stream = await model.stream([new HumanMessage('hi')], {
+      callbacks: [
+        {
+          handleLLMNewToken(token: string): void {
+            callbackTokens.push(token);
+          },
+        },
+      ],
+    });
+
+    for await (const chunk of stream) {
       chunks.push(chunk);
     }
 
@@ -220,6 +231,9 @@ describe('ChatDeepSeek', () => {
     );
 
     expect(streamedText).toBe('prefix visible');
+    expect(callbackTokens.join('')).toBe('prefix visible');
+    expect(callbackTokens.join('')).not.toContain('hidden');
+    expect(callbackTokens.join('')).not.toContain('think');
     expect(hasHiddenReasoning).toBe(true);
   });
 });

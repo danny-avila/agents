@@ -1404,8 +1404,7 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
   ): AsyncGenerator<ChatGenerationChunk> {
     const stream = this._streamResponseChunksFromReasoningMessages(
       messages,
-      options,
-      runManager
+      options
     );
     const thinkStartTag = '<think>';
     const thinkEndTag = '</think>';
@@ -1420,13 +1419,13 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
       const reasoningContent =
         chunk.message.additional_kwargs.reasoning_content;
       if (reasoningContent != null && reasoningContent !== '') {
-        yield chunk;
+        yield* this._yieldDeepSeekStreamChunk(chunk, runManager);
         continue;
       }
 
       const text = chunk.text;
       if (text === '') {
-        yield chunk;
+        yield* this._yieldDeepSeekStreamChunk(chunk, runManager);
         continue;
       }
 
@@ -1440,7 +1439,10 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
           tokensBuffer.substring(thinkIndex + thinkStartTag.length) || '';
 
         if (beforeThink !== '') {
-          yield this._createDeepSeekStreamChunk(chunk, beforeThink);
+          yield* this._yieldDeepSeekStreamChunk(
+            this._createDeepSeekStreamChunk(chunk, beforeThink),
+            runManager
+          );
         }
       }
 
@@ -1452,19 +1454,25 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
           thinkEndIndex + thinkEndTag.length
         );
 
-        yield this._createDeepSeekStreamChunk(
-          chunk,
-          '',
-          {
-            ...chunk.message.additional_kwargs,
-            reasoning_content: thoughtContent,
-          },
-          ''
+        yield* this._yieldDeepSeekStreamChunk(
+          this._createDeepSeekStreamChunk(
+            chunk,
+            '',
+            {
+              ...chunk.message.additional_kwargs,
+              reasoning_content: thoughtContent,
+            },
+            ''
+          ),
+          runManager
         );
 
         tokensBuffer = afterThink || '';
         if (tokensBuffer !== '') {
-          yield this._createDeepSeekStreamChunk(chunk, tokensBuffer);
+          yield* this._yieldDeepSeekStreamChunk(
+            this._createDeepSeekStreamChunk(chunk, tokensBuffer),
+            runManager
+          );
           tokensBuffer = '';
         }
       } else if (isThinking) {
@@ -1479,26 +1487,32 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
         if (splitIndex !== -1) {
           const safeToYield = tokensBuffer.substring(0, splitIndex);
           if (safeToYield !== '') {
-            yield this._createDeepSeekStreamChunk(
-              chunk,
-              '',
-              {
-                ...chunk.message.additional_kwargs,
-                reasoning_content: safeToYield,
-              },
-              ''
+            yield* this._yieldDeepSeekStreamChunk(
+              this._createDeepSeekStreamChunk(
+                chunk,
+                '',
+                {
+                  ...chunk.message.additional_kwargs,
+                  reasoning_content: safeToYield,
+                },
+                ''
+              ),
+              runManager
             );
           }
           tokensBuffer = tokensBuffer.substring(splitIndex);
         } else if (tokensBuffer !== '') {
-          yield this._createDeepSeekStreamChunk(
-            chunk,
-            '',
-            {
-              ...chunk.message.additional_kwargs,
-              reasoning_content: tokensBuffer,
-            },
-            ''
+          yield* this._yieldDeepSeekStreamChunk(
+            this._createDeepSeekStreamChunk(
+              chunk,
+              '',
+              {
+                ...chunk.message.additional_kwargs,
+                reasoning_content: tokensBuffer,
+              },
+              ''
+            ),
+            runManager
           );
           tokensBuffer = '';
         }
@@ -1514,11 +1528,17 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
         if (splitIndex !== -1) {
           const safeToYield = tokensBuffer.substring(0, splitIndex);
           if (safeToYield !== '') {
-            yield this._createDeepSeekStreamChunk(chunk, safeToYield);
+            yield* this._yieldDeepSeekStreamChunk(
+              this._createDeepSeekStreamChunk(chunk, safeToYield),
+              runManager
+            );
           }
           tokensBuffer = tokensBuffer.substring(splitIndex);
         } else if (tokensBuffer !== '') {
-          yield this._createDeepSeekStreamChunk(chunk, tokensBuffer);
+          yield* this._yieldDeepSeekStreamChunk(
+            this._createDeepSeekStreamChunk(chunk, tokensBuffer),
+            runManager
+          );
           tokensBuffer = '';
         }
       }
@@ -1529,30 +1549,35 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
     }
 
     if (isThinking) {
-      yield new ChatGenerationChunk({
-        message: new AIMessageChunk({
-          content: '',
-          additional_kwargs: {
-            reasoning_content: tokensBuffer,
-          },
+      yield* this._yieldDeepSeekStreamChunk(
+        new ChatGenerationChunk({
+          message: new AIMessageChunk({
+            content: '',
+            additional_kwargs: {
+              reasoning_content: tokensBuffer,
+            },
+          }),
+          text: '',
         }),
-        text: '',
-      });
+        runManager
+      );
       return;
     }
 
-    yield new ChatGenerationChunk({
-      message: new AIMessageChunk({
-        content: tokensBuffer,
+    yield* this._yieldDeepSeekStreamChunk(
+      new ChatGenerationChunk({
+        message: new AIMessageChunk({
+          content: tokensBuffer,
+        }),
+        text: tokensBuffer,
       }),
-      text: tokensBuffer,
-    });
+      runManager
+    );
   }
 
   protected async *_streamResponseChunksFromReasoningMessages(
     messages: BaseMessage[],
-    options: this['ParsedCallOptions'],
-    runManager?: CallbackManagerForLLMRun
+    options: this['ParsedCallOptions']
   ): AsyncGenerator<ChatGenerationChunk> {
     const params = {
       ...this.invocationParams(options, { streaming: true }),
@@ -1626,14 +1651,6 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
       });
 
       yield generationChunk;
-      await runManager?.handleLLMNewToken(
-        generationChunk.text,
-        newTokenIndices,
-        undefined,
-        undefined,
-        undefined,
-        { chunk: generationChunk }
-      );
     }
 
     if (usage != null) {
@@ -1648,20 +1665,13 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
           usage_metadata: usageMetadata,
         }),
         text: '',
-      });
-
-      yield generationChunk;
-      await runManager?.handleLLMNewToken(
-        generationChunk.text,
-        {
+        generationInfo: {
           prompt: 0,
           completion: 0,
         },
-        undefined,
-        undefined,
-        undefined,
-        { chunk: generationChunk }
-      );
+      });
+
+      yield generationChunk;
     }
 
     if (options.signal?.aborted === true) {
@@ -1688,6 +1698,34 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
       text,
       generationInfo: chunk.generationInfo,
     });
+  }
+
+  protected async *_yieldDeepSeekStreamChunk(
+    chunk: ChatGenerationChunk,
+    runManager?: CallbackManagerForLLMRun
+  ): AsyncGenerator<ChatGenerationChunk> {
+    yield chunk;
+    await runManager?.handleLLMNewToken(
+      chunk.text,
+      this._getDeepSeekTokenIndices(chunk),
+      undefined,
+      undefined,
+      undefined,
+      { chunk }
+    );
+  }
+
+  protected _getDeepSeekTokenIndices(
+    chunk: ChatGenerationChunk
+  ): { prompt: number; completion: number } | undefined {
+    const prompt = chunk.generationInfo?.prompt;
+    const completion = chunk.generationInfo?.completion;
+
+    if (typeof prompt === 'number' && typeof completion === 'number') {
+      return { prompt, completion };
+    }
+
+    return undefined;
   }
 }
 
