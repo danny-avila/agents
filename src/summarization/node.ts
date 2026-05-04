@@ -770,11 +770,22 @@ export function createSummarizeNode({
       return { summarizationRequest: undefined };
     }
 
+    /**
+     * Capture the original-tool-content map locally before doing the
+     * split.  We need it in three places: to restore the head for
+     * summarizer quality, to leave intact on the skip path (state is
+     * unchanged), and — critically — to carry forward the tail-relevant
+     * entries on the summarize-fired path.  Clearing it eagerly here
+     * would lose the originals for masked tool messages that the
+     * recency window keeps in the tail; a future summarization could
+     * then only summarize the masked stub instead of the full payload.
+     */
+    const originalPending = agentContext.pendingOriginalToolContent;
+
     const restoredMessages = restoreOriginalToolContent(
       state.messages,
-      agentContext.pendingOriginalToolContent
+      originalPending
     );
-    agentContext.pendingOriginalToolContent = undefined;
 
     const runnableConfig = config ?? graph.config;
 
@@ -1005,6 +1016,29 @@ export function createSummarizeNode({
       agentId: request.agentId,
       messagesAfterCount: messagesToRetain.length,
     });
+
+    /**
+     * Carry forward the original-content entries that correspond to the
+     * retained tail, reindexed for the post-removeAll state where tail
+     * messages start at index 0.  Without this, a future summarization
+     * that pulls these tail messages into its head would only see the
+     * masked stubs (since `setSummary` clears `pruneMessages`, and the
+     * fresh pruner at the next turn has no record of prior masks).
+     * Entries for indices < `tailStartIndex` belong to messages we just
+     * summarized — they are no longer reachable so they are dropped.
+     */
+    if (originalPending != null && originalPending.size > 0) {
+      const tailPending = new Map<number, string>();
+      for (const [idx, content] of originalPending) {
+        if (idx >= tailStartIndex) {
+          tailPending.set(idx - tailStartIndex, content);
+        }
+      }
+      agentContext.pendingOriginalToolContent =
+        tailPending.size > 0 ? tailPending : undefined;
+    } else {
+      agentContext.pendingOriginalToolContent = undefined;
+    }
 
     return {
       summarizationRequest: undefined,

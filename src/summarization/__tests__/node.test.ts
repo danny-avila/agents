@@ -986,6 +986,132 @@ describe('recency window — first-turn protection', () => {
     expect(tailToolMsg!.content).not.toContain('FULL_ORIGINAL_OUTPUT');
   });
 
+  it('preserves tail-relevant pendingOriginalToolContent entries (reindexed) for future summaries', async () => {
+    captureEvents();
+
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return mockInvokeModel('summary');
+        }
+      } as never
+    );
+
+    const setSummary = jest.fn();
+    const agentContext = createAgentContext({
+      summarizationConfig: { retainRecent: { turns: 1 } },
+      setSummary,
+    } as never);
+    // Original-content map covers BOTH a head index (1) and tail indices
+    // (3, 5).  Only the tail entries should survive, reindexed to the
+    // post-removeAll state where tail messages start at 0.
+    agentContext.pendingOriginalToolContent = new Map<number, string>([
+      [1, 'fullHead'], // belongs to summarized head — should be dropped
+      [3, 'fullTailA'], // tail position 3 → reindexed to 0
+      [5, 'fullTailB'], // tail position 5 → reindexed to 2
+    ]);
+
+    const graph = mockGraph();
+    const summarizeNode = createSummarizeNode({
+      agentContext,
+      graph: graph as never,
+      generateStepId,
+    });
+
+    const messages = [
+      new HumanMessage('turn 1 query'),
+      new AIMessage('turn 1 reply'), // idx 1
+      new HumanMessage('turn 2 query'), // idx 2 — tail starts here
+      new ToolMessage({
+        // idx 3
+        content: 'masked-stub-A',
+        tool_call_id: 'a',
+        name: 'search',
+      }),
+      new AIMessage('turn 2 reply'), // idx 4
+      new ToolMessage({
+        // idx 5
+        content: 'masked-stub-B',
+        tool_call_id: 'b',
+        name: 'search',
+      }),
+    ];
+
+    await summarizeNode(
+      {
+        messages,
+        summarizationRequest: {
+          remainingContextTokens: 0,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    // Summarize fired (we used a real summary text), so head index 1
+    // is gone.  Tail entries should remain, reindexed by subtracting
+    // tailStartIndex (=2): 3→1, 5→3.
+    const carryOver = agentContext.pendingOriginalToolContent;
+    expect(carryOver).toBeDefined();
+    expect(carryOver!.size).toBe(2);
+    expect(carryOver!.get(1)).toBe('fullTailA');
+    expect(carryOver!.get(3)).toBe('fullTailB');
+    expect(carryOver!.has(0)).toBe(false);
+    expect(carryOver!.has(5)).toBe(false);
+  });
+
+  it('does not clear pendingOriginalToolContent on the skip path (state unchanged)', async () => {
+    captureEvents();
+
+    const invokeMock = jest.fn();
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return { invoke: invokeMock };
+        }
+      } as never
+    );
+
+    const agentContext = createAgentContext({
+      summarizationConfig: { retainRecent: { turns: 2 } },
+    } as never);
+    const seededMap = new Map<number, string>([[1, 'preserved-original']]);
+    agentContext.pendingOriginalToolContent = seededMap;
+
+    const graph = mockGraph();
+    const summarizeNode = createSummarizeNode({
+      agentContext,
+      graph: graph as never,
+      generateStepId,
+    });
+
+    await summarizeNode(
+      {
+        messages: [
+          new HumanMessage('only turn'),
+          new ToolMessage({
+            content: 'masked',
+            tool_call_id: 'x',
+            name: 'search',
+          }),
+        ],
+        summarizationRequest: {
+          remainingContextTokens: 0,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    // No LLM call (skip path); pendingOriginalToolContent must still be
+    // available so a future summarization can restore the original.
+    expect(invokeMock).not.toHaveBeenCalled();
+    expect(agentContext.pendingOriginalToolContent).toBe(seededMap);
+    expect(agentContext.pendingOriginalToolContent!.get(1)).toBe(
+      'preserved-original'
+    );
+  });
+
   it('preserves the legacy "remove all, summary only" shape when retainRecent.turns is 0', async () => {
     captureEvents();
 
