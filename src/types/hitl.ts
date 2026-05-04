@@ -223,10 +223,39 @@ export function isAskUserQuestionInterrupt(
  * decisions are fail-closed (blocked with an error `ToolMessage`) and no
  * checkpointer is implicitly attached.
  *
- * Note on idempotency: when an interrupt fires, LangGraph re-runs the
- * interrupted node from the start on resume, which fires `PreToolUse`
- * hooks again. Hooks that produce side effects (logging, external calls)
- * will see two invocations per paused turn.
+ * ## Scope: event-driven tools only
+ *
+ * The interrupt path is wired into `ToolNode.dispatchToolEvents`, which
+ * runs when the agent uses event-driven tool dispatch (the path
+ * LibreChat and most production hosts take). Tools that execute via
+ * the direct path — i.e. tools listed in `directToolNames` (the
+ * graph-managed handoff and subagent tools) or tools on agents
+ * configured WITHOUT `eventDrivenMode` — bypass the hook system
+ * entirely. `PreToolUse` hooks do not fire for those tools and HITL
+ * approval does not gate them.
+ *
+ * Practical implications:
+ *   - LibreChat-style hosts using event-driven dispatch get the full
+ *     HITL surface across every tool the model calls.
+ *   - Hosts using `AgentInputs.tools` directly without event-driven
+ *     mode get policy enforcement for nothing — the hooks register
+ *     but never fire. Either switch to event-driven mode or accept
+ *     that direct tools are not approval-gated. This is documented
+ *     also on `ToolNodeOptions.hookRegistry`.
+ *   - Mixed direct + event batches (e.g. a handoff tool sharing an
+ *     LLM turn with a regular tool) currently re-execute the direct
+ *     half on resume, since LangGraph rolls back the entire ToolNode
+ *     on `interrupt()` throw. Hosts whose direct tools have side
+ *     effects (subagents that invoke models, handoffs that trigger
+ *     downstream work) should avoid mixing those tools into the same
+ *     batch as approval-gated event tools.
+ *
+ * ## Note on idempotency
+ *
+ * When an interrupt fires, LangGraph re-runs the interrupted node
+ * from the start on resume, which fires `PreToolUse` hooks again.
+ * Hooks that produce side effects (logging, external calls) will see
+ * two invocations per paused turn.
  */
 export interface HumanInTheLoopConfig {
   /**

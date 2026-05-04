@@ -58,11 +58,20 @@ export type ToolNodeOptions = {
    */
   hookRegistry?: HookRegistry;
   /**
-   * Run-scoped HITL config. When `enabled`, a `PreToolUse` hook returning
-   * `decision: 'ask'` raises a real LangGraph `interrupt()` carrying a
-   * `HumanInterruptPayload`; the host resumes with `Run.resume(decisions)`.
-   * When `undefined` or `enabled === false`, `ask` decisions are treated
-   * as a fail-closed deny exactly as in the pre-HITL behavior.
+   * Run-scoped HITL config. **HITL is on by default** — omitting this
+   * field (or passing `{ enabled: true }`) engages the interrupt path:
+   * a `PreToolUse` hook returning `decision: 'ask'` raises a real
+   * LangGraph `interrupt()` carrying a `HumanInterruptPayload`, and
+   * the host resumes with `Run.resume(decisions)`. Pass
+   * `{ enabled: false }` to opt out and restore the pre-HITL
+   * fail-closed behavior where `ask` collapses into a blocked
+   * `ToolMessage`.
+   *
+   * Mirrors `RunConfig.humanInTheLoop` (which is the canonical place
+   * to set this); the Graph threads it down to every ToolNode it
+   * compiles. Same caveat: the interrupt path is only wired into the
+   * event-driven dispatch (`dispatchToolEvents`), not into
+   * `directToolNames` execution — direct tools bypass HITL entirely.
    */
   humanInTheLoop?: HumanInTheLoopConfig;
   /** Max context tokens for the agent — used to compute tool result truncation limits. */

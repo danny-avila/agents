@@ -2251,6 +2251,161 @@ describe('Codex review fixes', () => {
     ]);
   });
 
+  it('malformed edit decision (missing updatedInput) is blocked, not approved with garbage args', async () => {
+    let dispatchCount = 0;
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data) => {
+        if (event !== 'on_tool_execute') {
+          return;
+        }
+        dispatchCount += 1;
+        const request = data as {
+          toolCalls: t.ToolCallRequest[];
+          resolve: (r: t.ToolExecuteResult[]) => void;
+        };
+        request.resolve([]);
+      });
+
+    const node = new ToolNode({
+      tools: [createSchemaStub('echo')],
+      eventDrivenMode: true,
+      agentId: 'agent-x',
+      toolCallStepIds: new Map([['call_1', 'step_1']]),
+      hookRegistry: makeHookRegistry('ask'),
+      humanInTheLoop: { enabled: true },
+    });
+
+    const graph = buildHITLGraph(node, [
+      { id: 'call_1', name: 'echo', args: { command: 'original' } },
+    ]);
+    const config = { configurable: { thread_id: 'edit-malformed' } };
+
+    await graph.invoke({ messages: [] }, config);
+
+    /** `{ type: 'edit' }` with no updatedInput — same trust-boundary
+     * issue as malformed respond. Must fail closed, NOT pass undefined
+     * into applyInputOverride and approve a tool with garbage args. */
+    const resumed = (await graph.invoke(
+      new Command({
+        resume: [{ type: 'edit' } as unknown as t.ToolApprovalDecision],
+      }),
+      config
+    )) as { messages: BaseMessage[] };
+
+    const toolMessages = resumed.messages.filter(
+      (m): m is ToolMessage => m._getType() === 'tool'
+    );
+    expect(toolMessages).toHaveLength(1);
+    expect(toolMessages[0].status).toBe('error');
+    expect(String(toolMessages[0].content)).toContain(
+      'missing object updatedInput'
+    );
+    expect(String(toolMessages[0].content)).toContain('<missing>');
+    expect(dispatchCount).toBe(0);
+  });
+
+  it('malformed edit decision (non-object updatedInput) is blocked', async () => {
+    let dispatchCount = 0;
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data) => {
+        if (event !== 'on_tool_execute') {
+          return;
+        }
+        dispatchCount += 1;
+        const request = data as {
+          toolCalls: t.ToolCallRequest[];
+          resolve: (r: t.ToolExecuteResult[]) => void;
+        };
+        request.resolve([]);
+      });
+
+    const node = new ToolNode({
+      tools: [createSchemaStub('echo')],
+      eventDrivenMode: true,
+      agentId: 'agent-x',
+      toolCallStepIds: new Map([['call_1', 'step_1']]),
+      hookRegistry: makeHookRegistry('ask'),
+      humanInTheLoop: { enabled: true },
+    });
+
+    const graph = buildHITLGraph(node, [
+      { id: 'call_1', name: 'echo', args: { command: 'original' } },
+    ]);
+    const config = { configurable: { thread_id: 'edit-nonobject' } };
+
+    await graph.invoke({ messages: [] }, config);
+
+    /** `updatedInput: 'string'` — wire deserializer didn't enforce
+     * object shape; SDK must reject. */
+    const resumed = (await graph.invoke(
+      new Command({
+        resume: [
+          {
+            type: 'edit',
+            updatedInput: 'not-an-object' as unknown as Record<string, unknown>,
+          },
+        ],
+      }),
+      config
+    )) as { messages: BaseMessage[] };
+
+    const toolMessages = resumed.messages.filter(
+      (m): m is ToolMessage => m._getType() === 'tool'
+    );
+    expect(toolMessages).toHaveLength(1);
+    expect(toolMessages[0].status).toBe('error');
+    expect(String(toolMessages[0].content)).toContain(
+      'missing object updatedInput'
+    );
+    expect(String(toolMessages[0].content)).toContain('string');
+    expect(dispatchCount).toBe(0);
+  });
+
+  it('malformed edit decision (array updatedInput) is blocked — arrays are objects but not plain records', async () => {
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async () => {
+        return;
+      });
+
+    const node = new ToolNode({
+      tools: [createSchemaStub('echo')],
+      eventDrivenMode: true,
+      agentId: 'agent-x',
+      toolCallStepIds: new Map([['call_1', 'step_1']]),
+      hookRegistry: makeHookRegistry('ask'),
+      humanInTheLoop: { enabled: true },
+    });
+
+    const graph = buildHITLGraph(node, [
+      { id: 'call_1', name: 'echo', args: { command: 'original' } },
+    ]);
+    const config = { configurable: { thread_id: 'edit-array' } };
+
+    await graph.invoke({ messages: [] }, config);
+
+    const resumed = (await graph.invoke(
+      new Command({
+        resume: [
+          {
+            type: 'edit',
+            updatedInput: [1, 2, 3] as unknown as Record<string, unknown>,
+          },
+        ],
+      }),
+      config
+    )) as { messages: BaseMessage[] };
+
+    const toolMessages = resumed.messages.filter(
+      (m): m is ToolMessage => m._getType() === 'tool'
+    );
+    expect(toolMessages).toHaveLength(1);
+    expect(toolMessages[0].status).toBe('error');
+    expect(String(toolMessages[0].content)).toContain('array');
+  });
+
   it('malformed respond decision (missing responseText) is blocked, not crashed', async () => {
     let dispatchCount = 0;
     jest

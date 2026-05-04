@@ -97,6 +97,26 @@ function isSend(value: unknown): value is Send {
 }
 
 /**
+ * Format a fail-closed diagnostic for malformed approval-decision
+ * fields. Hosts deserialize resume payloads from untyped JSON, so
+ * `responseText` and `updatedInput` can land here as anything; the
+ * blocking ToolMessage carries this string so the host can debug the
+ * exact wire shape that was rejected.
+ */
+function describeOfferedShape(value: unknown): string {
+  if (value === undefined) {
+    return '<missing>';
+  }
+  if (value === null) {
+    return 'null';
+  }
+  if (Array.isArray(value)) {
+    return 'array';
+  }
+  return typeof value;
+}
+
+/**
  * Per-entry record collected during PreToolUse hook handling for tool
  * calls that need human approval. Carries everything
  * `buildToolApprovalInterruptPayload` needs to assemble the interrupt
@@ -1341,11 +1361,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             const responseText = (decision as { responseText?: unknown })
               .responseText;
             if (typeof responseText !== 'string') {
-              const offered =
-                responseText === undefined ? '<missing>' : typeof responseText;
               blockEntry(
                 entry,
-                `Decision "respond" missing string responseText (got ${offered}) — failing closed`
+                `Decision "respond" missing string responseText (got ${describeOfferedShape(responseText)}) — failing closed`
               );
               continue;
             }
@@ -1399,7 +1417,32 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           }
 
           if (decision.type === 'edit') {
-            applyInputOverride(entry, decision.updatedInput);
+            /**
+             * Validate the wire shape before touching it: hosts
+             * deserialize resume payloads from untyped JSON, so a
+             * malformed `{ type: 'edit' }` (no `updatedInput`),
+             * `{ type: 'edit', updatedInput: 'string' }` (non-object),
+             * or `{ type: 'edit', updatedInput: [...] }` (array, not a
+             * plain object) would feed garbage into
+             * `applyInputOverride` and silently approve a tool with
+             * undefined / wrong-shape args. Same trust boundary as
+             * the `respond` validation above — fail closed via
+             * `blockEntry` with a diagnostic.
+             */
+            const updatedInput = (decision as { updatedInput?: unknown })
+              .updatedInput;
+            if (
+              updatedInput === null ||
+              typeof updatedInput !== 'object' ||
+              Array.isArray(updatedInput)
+            ) {
+              blockEntry(
+                entry,
+                `Decision "edit" missing object updatedInput (got ${describeOfferedShape(updatedInput)}) — failing closed`
+              );
+              continue;
+            }
+            applyInputOverride(entry, updatedInput as Record<string, unknown>);
             approvedEntries.push(entry);
             continue;
           }
