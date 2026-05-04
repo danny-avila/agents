@@ -297,6 +297,48 @@ describe('ChatDeepSeek', () => {
     expect(reasoningContent).toEqual(['hidden one', 'hidden two']);
   });
 
+  it('keeps cross-chunk multiple raw think fallback blocks hidden from content and callbacks', async () => {
+    const model = new CapturingChatDeepSeek(
+      {
+        apiKey: 'test-key',
+        model: 'deepseek-v4-pro',
+        streaming: true,
+      },
+      [
+        createContentChunk('before<think>hidden one</thi'),
+        createContentChunk('nk>visible<thi'),
+        createContentChunk('nk>hidden two</think>done'),
+      ]
+    );
+    const chunks = [];
+    const callbackTokens: string[] = [];
+
+    const stream = await model.stream([new HumanMessage('hi')], {
+      callbacks: [
+        {
+          handleLLMNewToken(token: string): void {
+            callbackTokens.push(token);
+          },
+        },
+      ],
+    });
+
+    for await (const chunk of stream) {
+      chunks.push(chunk);
+    }
+
+    const streamedText = chunks
+      .map((chunk) => (typeof chunk.content === 'string' ? chunk.content : ''))
+      .join('');
+    const reasoningContent = chunks
+      .map((chunk) => chunk.additional_kwargs.reasoning_content)
+      .filter((content): content is string => typeof content === 'string');
+
+    expect(streamedText).toBe('beforevisibledone');
+    expect(callbackTokens.join('')).toBe('beforevisibledone');
+    expect(reasoningContent).toEqual(['hidden one', 'hidden two']);
+  });
+
   it('emits trailing unfinished raw think fallback as reasoning content', async () => {
     const model = new CapturingChatDeepSeek(
       {
@@ -406,5 +448,32 @@ describe('ChatDeepSeek', () => {
     await expect(
       drainStream(model.streamChunksWithSignal(controller.signal))
     ).rejects.toThrow('AbortError');
+  });
+
+  it('throws AbortError when a DeepSeek stream is canceled mid-stream', async () => {
+    const controller = new AbortController();
+    const model = new CapturingChatDeepSeek(
+      {
+        apiKey: 'test-key',
+        model: 'deepseek-v4-pro',
+        streaming: true,
+      },
+      [createContentChunk('first '), createContentChunk('second')]
+    );
+    const stream = model.streamChunksWithSignal(controller.signal);
+    const iterator = stream[Symbol.asyncIterator]();
+
+    await expect(iterator.next()).resolves.toEqual(
+      expect.objectContaining({
+        done: false,
+        value: expect.objectContaining({
+          text: 'first ',
+        }),
+      })
+    );
+
+    controller.abort();
+
+    await expect(iterator.next()).rejects.toThrow('AbortError');
   });
 });
