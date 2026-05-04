@@ -401,9 +401,66 @@ export type LocalSandboxConfig = {
   };
 };
 
+/**
+ * Workspace boundary the local-coding tools clamp file operations to.
+ *
+ * `root` is the canonical "project directory" — every file tool that
+ * accepts a path resolves it relative to `root` and refuses to touch
+ * paths outside it (after symlink resolution). `additionalRoots` lets
+ * monorepos extend the boundary to sibling directories without
+ * disabling clamping entirely.
+ *
+ * `allowReadOutside` and `allowWriteOutside` are escape hatches that
+ * disable clamping for read- and write-shaped tools respectively.
+ * Most hosts shouldn't need them — prefer wiring
+ * `createWorkspacePolicyHook` if you want "ask the user" semantics
+ * via the existing PreToolUse / HITL machinery instead of an
+ * unconditional bypass.
+ */
+export type LocalWorkspaceConfig = {
+  /** Required. The canonical workspace root. */
+  root: string;
+  /**
+   * Sibling roots that also count as inside the workspace. Useful in
+   * monorepos where a project legitimately needs to reach a paired
+   * directory without disabling clamping.
+   */
+  additionalRoots?: readonly string[];
+  /** When true, disable the read-outside-workspace clamp. */
+  allowReadOutside?: boolean;
+  /** When true, disable the write-outside-workspace clamp. */
+  allowWriteOutside?: boolean;
+};
+
+/**
+ * Engine-agnostic execution seam. Default uses Node's
+ * `child_process.spawn` and `fs/promises`. A future engine (e.g.
+ * stateful remote sandbox) supplies its own `spawn` and `fs` and
+ * inherits every tool factory unchanged.
+ */
+export type LocalExecConfig = {
+  /** Pluggable spawn (for SSH, container, remote workers, etc.). */
+  spawn?: LocalSpawn;
+  /** Pluggable filesystem (for remote-workspace engines). */
+  fs?: import('@/tools/local/workspaceFS').WorkspaceFS;
+};
+
 export type LocalExecutionConfig = {
-  /** Working directory for local commands. Defaults to process.cwd(). */
+  /** Working directory for local commands. Defaults to process.cwd().
+   *  Back-compat shorthand for `workspace.root`. */
   cwd?: string;
+  /**
+   * Workspace boundary configuration. When omitted, the implementation
+   * derives `{ root: cwd ?? process.cwd() }` so existing call sites
+   * keep working.
+   */
+  workspace?: LocalWorkspaceConfig;
+  /**
+   * Execution seam (spawn + fs). When omitted, defaults to Node-host
+   * child_process and fs/promises. Same back-compat: a top-level
+   * `spawn` field is honoured if `exec.spawn` isn't set.
+   */
+  exec?: LocalExecConfig;
   /** Shell executable for bash-style tools. Defaults to `bash`. */
   shell?: string;
   /** Default timeout for local processes, in milliseconds. */

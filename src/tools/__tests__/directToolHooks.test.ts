@@ -91,7 +91,7 @@ describe('Direct-path lifecycle hooks (in-process tools)', () => {
     expect(permissionDenied).toHaveBeenCalledTimes(1);
   });
 
-  it('PreToolUse decision: ask is fail-closed for direct tools (matches HITL-disabled semantic)', async () => {
+  it('PreToolUse decision: ask is fail-closed when humanInTheLoop is disabled', async () => {
     const echo = createDirectTool('echo', () => 'EXECUTED');
 
     const registry = new HookRegistry();
@@ -109,7 +109,7 @@ describe('Direct-path lifecycle hooks (in-process tools)', () => {
       eventDrivenMode: true,
       hookRegistry: registry,
       directToolNames: new Set(['echo']),
-      humanInTheLoop: { enabled: true },
+      // humanInTheLoop intentionally not set — fail-closed.
     });
 
     const result = await node.invoke({

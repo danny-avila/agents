@@ -777,16 +777,20 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
    * single-call case:
    *   - `PreToolUse` returning `decision: 'deny'` synthesizes an error
    *     `ToolMessage` and fires `PermissionDenied` (observational).
-   *   - `PreToolUse` returning `decision: 'ask'` is fail-closed for
-   *     direct-path tools regardless of `humanInTheLoop.enabled`. The
-   *     event path uses LangGraph's `interrupt()` to suspend the
-   *     graph mid-batch; replicating that for in-process tools needs
-   *     a deeper restructuring of `runTool` (the call is currently
-   *     fully synchronous from the dispatcher's perspective). Until
-   *     that lands, returning `ask` for a direct tool collapses to a
-   *     deny — strict improvement over the prior behavior, where the
-   *     hook never ran at all. A one-time warning is emitted so hosts
-   *     that wired HITL UIs notice the limitation.
+   *   - `PreToolUse` returning `decision: 'ask'`:
+   *     • When `humanInTheLoop.enabled === true`: raises a real
+   *       `tool_approval` interrupt for this single tool call (the
+   *       same payload shape the event path produces). On resume:
+   *       `approve` runs the tool, `reject` blocks via
+   *       `blockDirectCall`, `respond` returns the host-supplied
+   *       `responseText` as a synthetic success ToolMessage,
+   *       `edit` re-runs with edited args. LangGraph re-enters
+   *       ToolNode.run from the start on resume; the hook fires
+   *       again and the resume value distinguishes "first ask" from
+   *       "second pass with decision".
+   *     • When HITL is off: collapses to a fail-closed deny (matches
+   *       the rest of the SDK's HITL-disabled default). One-time
+   *       warning logged so hosts notice the gap.
    *   - `PreToolUse.updatedInput` is applied to the call before
    *     `runTool` runs; placeholder resolution inside `runTool` is
    *     idempotent on already-resolved args.
@@ -859,51 +863,146 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       }).catch(() => undefined);
 
       if (preResult != null) {
-        let blockReason: string | undefined;
-        if (preResult.decision === 'deny') {
-          blockReason = preResult.reason ?? 'Blocked by hook';
-        } else if (preResult.decision === 'ask') {
-          blockReason = this.resolveAskDecisionForDirectTool(
-            preResult.reason,
-            call.name
-          );
-        }
-
-        if (blockReason != null) {
-          if (
-            hookRegistry.hasHookFor('PermissionDenied', runId) === true
-          ) {
-            executeHooks({
-              registry: hookRegistry,
-              input: {
-                hook_event_name: 'PermissionDenied',
-                runId,
-                threadId,
-                agentId: this.agentId,
-                toolName: call.name,
-                toolInput: resolvedArgs,
-                toolUseId: call.id ?? '',
-                reason: blockReason,
-              },
-              sessionId: runId,
-              matchQuery: call.name,
-            }).catch(() => {
-              /* observational */
-            });
-          }
-          return new ToolMessage({
-            status: 'error',
-            content: `Blocked: ${blockReason}`,
-            name: call.name,
-            tool_call_id: call.id ?? '',
-          });
-        }
-
+        // Apply any input rewrite first — `ask`-with-`updatedInput` is
+        // a valid combination (one matcher sanitises args, another asks
+        // for approval); the reviewer should see the sanitised args.
         if (preResult.updatedInput != null) {
           effectiveCall = {
             ...call,
             args: preResult.updatedInput as Record<string, unknown>,
           };
+        }
+
+        if (preResult.decision === 'deny') {
+          return this.blockDirectCall({
+            call,
+            resolvedArgs,
+            reason: preResult.reason ?? 'Blocked by hook',
+            hookRegistry,
+            runId,
+            threadId,
+          });
+        }
+
+        if (preResult.decision === 'ask') {
+          if (this.humanInTheLoop?.enabled !== true) {
+            // Fail-closed: no HITL UI configured, so we can't actually
+            // ask. Logged once via the existing helper.
+            const reason = this.resolveAskDecisionForDirectTool(
+              preResult.reason,
+              call.name
+            );
+            return this.blockDirectCall({
+              call,
+              resolvedArgs,
+              reason,
+              hookRegistry,
+              runId,
+              threadId,
+            });
+          }
+
+          // Raise a single-tool tool_approval interrupt. LangGraph
+          // throws on the first execution (host gets the interrupt)
+          // and returns the resume value on re-entry. Because direct
+          // tools re-enter the entire ToolNode.run on resume, the
+          // PreToolUse hook fires AGAIN — which is fine: the hook is
+          // expected to be deterministic, and the resume value is what
+          // distinguishes "first call asking" from "second call after
+          // approve/reject". We anchor `interrupt()` against the
+          // node's RunnableConfig the same way `dispatchToolEvents`
+          // does (ToolNode disables LangSmith tracing, so the
+          // AsyncLocalStorage frame must be re-established here).
+          const askEntry: AskEntry = {
+            entry: {
+              call: effectiveCall,
+              args: effectiveCall.args as Record<string, unknown>,
+              stepId,
+            },
+            reason: preResult.reason,
+            allowedDecisions: preResult.allowedDecisions,
+          };
+          const payload = buildToolApprovalInterruptPayload([askEntry]);
+          const resumeValue = AsyncLocalStorageProviderSingleton.runWithConfig(
+            config,
+            () =>
+              interrupt<
+                t.ToolApprovalInterruptPayload,
+                t.ToolApprovalDecision[] | t.ToolApprovalDecisionMap
+              >(payload)
+          );
+          const decisionByCallId = normalizeApprovalDecisions(
+            [call.id!],
+            resumeValue
+          );
+          const decision = decisionByCallId.get(call.id!) ?? {
+            type: 'reject' as const,
+            reason: 'No decision provided for tool approval',
+          };
+          const declaredType = (decision as { type?: unknown }).type;
+
+          if (
+            preResult.allowedDecisions != null &&
+            (typeof declaredType !== 'string' ||
+              !preResult.allowedDecisions.includes(
+                declaredType as t.ToolApprovalDecisionType
+              ))
+          ) {
+            return this.blockDirectCall({
+              call,
+              resolvedArgs,
+              reason: `Decision "${typeof declaredType === 'string' ? declaredType : '<missing>'}" not in allowedDecisions [${preResult.allowedDecisions.join(', ')}] — failing closed`,
+              hookRegistry,
+              runId,
+              threadId,
+            });
+          }
+
+          if (decision.type === 'reject') {
+            return this.blockDirectCall({
+              call,
+              resolvedArgs,
+              reason:
+                decision.reason ??
+                preResult.reason ??
+                'Rejected by user',
+              hookRegistry,
+              runId,
+              threadId,
+            });
+          }
+
+          if (decision.type === 'respond') {
+            const responseText = (decision as { responseText?: unknown })
+              .responseText;
+            if (typeof responseText !== 'string') {
+              return this.blockDirectCall({
+                call,
+                resolvedArgs,
+                reason: 'Approval payload `respond` was missing a string `responseText`',
+                hookRegistry,
+                runId,
+                threadId,
+              });
+            }
+            return new ToolMessage({
+              status: 'success',
+              content: responseText,
+              name: call.name,
+              tool_call_id: call.id ?? '',
+            });
+          }
+
+          if (decision.type === 'edit') {
+            const edited = (decision as {
+              args?: unknown;
+            }).args as Record<string, unknown> | undefined;
+            if (edited != null) {
+              effectiveCall = { ...call, args: edited };
+            }
+            // fall through to executing the (possibly edited) call
+          }
+          // 'approve' (or 'edit' after applying edits) → fall through
         }
       }
     }
@@ -979,29 +1078,69 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   }
 
   /**
-   * Direct-tool `ask` decisions are fail-closed today regardless of
-   * `humanInTheLoop.enabled` (see `runDirectToolWithLifecycleHooks`
-   * JSDoc). Logged once per process so HITL-enabled hosts notice the
-   * gap rather than silently observing denies.
+   * `ask` decisions on direct-path tools collapse to fail-closed deny
+   * only when `humanInTheLoop.enabled !== true` (i.e. there's no host
+   * UI configured to actually prompt the user). Logged once per process
+   * so the gap is visible. When HITL IS enabled, `ask` raises a real
+   * LangGraph `interrupt()` instead — see `runDirectToolWithLifecycleHooks`.
    */
   private askDirectWarningEmitted = false;
   private resolveAskDecisionForDirectTool(
     reason: string | undefined,
     toolName: string
   ): string {
-    if (
-      this.humanInTheLoop?.enabled === true &&
-      !this.askDirectWarningEmitted
-    ) {
+    if (!this.askDirectWarningEmitted) {
       this.askDirectWarningEmitted = true;
       // eslint-disable-next-line no-console
       console.warn(
-        `[ToolNode] PreToolUse returned 'ask' for direct-path tool "${toolName}". ` +
-          'Direct-path tools currently fail closed on ask decisions; HITL ' +
-          'interrupt support for direct tools is a follow-up.'
+        `[ToolNode] PreToolUse returned 'ask' for direct-path tool "${toolName}" but ` +
+          'humanInTheLoop is not enabled — failing closed. Set humanInTheLoop.enabled=true ' +
+          'to raise a tool_approval interrupt the host can resolve.'
       );
     }
     return reason ?? 'Blocked by hook';
+  }
+
+  /**
+   * Synthesize a Blocked ToolMessage AND fire `PermissionDenied`
+   * (observational) for a direct-path tool call. Centralised so the
+   * deny path looks identical whether the block came from `'deny'` or
+   * from a fail-closed/`'reject'`/policy-violation path.
+   */
+  private blockDirectCall(args: {
+    call: ToolCall;
+    resolvedArgs: Record<string, unknown>;
+    reason: string;
+    hookRegistry: HookRegistry;
+    runId: string;
+    threadId: string | undefined;
+  }): ToolMessage {
+    const { call, resolvedArgs, reason, hookRegistry, runId, threadId } = args;
+    if (hookRegistry.hasHookFor('PermissionDenied', runId) === true) {
+      executeHooks({
+        registry: hookRegistry,
+        input: {
+          hook_event_name: 'PermissionDenied',
+          runId,
+          threadId,
+          agentId: this.agentId,
+          toolName: call.name,
+          toolInput: resolvedArgs,
+          toolUseId: call.id ?? '',
+          reason,
+        },
+        sessionId: runId,
+        matchQuery: call.name,
+      }).catch(() => {
+        /* observational */
+      });
+    }
+    return new ToolMessage({
+      status: 'error',
+      content: `Blocked: ${reason}`,
+      name: call.name,
+      tool_call_id: call.id ?? '',
+    });
   }
 
   /**

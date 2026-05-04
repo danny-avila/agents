@@ -6,6 +6,8 @@ import { spawn } from 'child_process';
 import type { ChildProcess } from 'child_process';
 import type { SandboxRuntimeConfig } from '@anthropic-ai/sandbox-runtime';
 import { runBashAstChecks, bashAstFindingsToErrors } from './bashAst';
+import { nodeWorkspaceFS } from './workspaceFS';
+import type { WorkspaceFS } from './workspaceFS';
 import type * as t from '@/types';
 
 const DEFAULT_TIMEOUT_MS = 60000;
@@ -70,7 +72,91 @@ export function resolveLocalExecutionConfig(
 }
 
 export function getLocalCwd(config?: t.LocalExecutionConfig): string {
-  return resolve(config?.cwd ?? process.cwd());
+  return resolve(config?.workspace?.root ?? config?.cwd ?? process.cwd());
+}
+
+/**
+ * Resolves the effective workspace boundary: a list of absolute roots
+ * that file operations are allowed to touch. The first entry is always
+ * the canonical root (`getLocalCwd`); subsequent entries come from
+ * `workspace.additionalRoots` when provided.
+ *
+ * Returns plain absolute paths — callers symlink-resolve when they
+ * need realpath equality (see `resolveWorkspacePathSafe`).
+ */
+export function getWorkspaceRoots(
+  config?: t.LocalExecutionConfig
+): string[] {
+  const root = getLocalCwd(config);
+  const extras = config?.workspace?.additionalRoots ?? [];
+  if (extras.length === 0) return [root];
+  const seen = new Set<string>([root]);
+  const out: string[] = [root];
+  for (const extra of extras) {
+    const abs = resolve(extra);
+    if (!seen.has(abs)) {
+      seen.add(abs);
+      out.push(abs);
+    }
+  }
+  return out;
+}
+
+/**
+ * Pluggable spawn resolver. Honours `local.exec.spawn` first, falls
+ * back to the legacy top-level `local.spawn`, then to Node's
+ * `child_process.spawn`. Centralised so engine swapping is one knob.
+ */
+export function getSpawn(
+  config?: t.LocalExecutionConfig
+): t.LocalSpawn {
+  return (config?.exec?.spawn ?? config?.spawn ?? spawn) as t.LocalSpawn;
+}
+
+/**
+ * Pluggable filesystem resolver. Honours `local.exec.fs`, falls back
+ * to the Node-host implementation. A future remote engine supplies
+ * its own implementation here and inherits every file-touching tool.
+ */
+export function getWorkspaceFS(
+  config?: t.LocalExecutionConfig
+): WorkspaceFS {
+  return config?.exec?.fs ?? nodeWorkspaceFS;
+}
+
+/**
+ * Resolves the workspace boundary for *write* operations. Honours
+ * `workspace.allowWriteOutside` (and the deprecated
+ * `allowOutsideWorkspace`) by returning `null`, which the path-safety
+ * helpers interpret as "skip the write clamp".
+ */
+export function getWriteRoots(
+  config?: t.LocalExecutionConfig
+): string[] | null {
+  if (
+    config?.workspace?.allowWriteOutside === true ||
+    config?.allowOutsideWorkspace === true
+  ) {
+    return null;
+  }
+  return getWorkspaceRoots(config);
+}
+
+/**
+ * Resolves the workspace boundary for *read* operations. Honours
+ * `workspace.allowReadOutside` (and the deprecated
+ * `allowOutsideWorkspace`) by returning `null`.
+ */
+export function getReadRoots(
+  config?: t.LocalExecutionConfig
+): string[] | null {
+  if (
+    config?.workspace?.allowReadOutside === true ||
+    config?.allowOutsideWorkspace === true
+  ) {
+    return null;
+  }
+  return getWorkspaceRoots(config);
 }
 
 export function getLocalSessionId(config?: t.LocalExecutionConfig): string {
@@ -352,7 +438,7 @@ export async function spawnLocalProcess(
     spawnArgs = ['-lc', sandboxed];
   }
 
-  const launcher = config.spawn ?? spawn;
+  const launcher = getSpawn(config);
   return new Promise<SpawnResult>((resolveResult, reject) => {
     const child = launcher(spawnCommand, spawnArgs, {
       cwd,
@@ -639,24 +725,28 @@ export function shellQuote(value: string): string {
 
 export function resolveWorkspacePath(
   filePath: string,
-  config: t.LocalExecutionConfig = {}
+  config: t.LocalExecutionConfig = {},
+  intent: 'read' | 'write' = 'write'
 ): string {
   const cwd = getLocalCwd(config);
   const absolutePath = isAbsolute(filePath) ? resolve(filePath) : resolve(cwd, filePath);
 
-  if (config.allowOutsideWorkspace === true) {
+  const roots = intent === 'write' ? getWriteRoots(config) : getReadRoots(config);
+  if (roots == null) return absolutePath; // explicit allow-outside
+
+  if (absolutePath === cwd || isInsideAnyRoot(absolutePath, roots)) {
     return absolutePath;
   }
+  throw new Error(`Path is outside the local workspace: ${filePath}`);
+}
 
-  const relativePath = relative(cwd, absolutePath);
-  if (
-    absolutePath !== cwd &&
-    (relativePath.startsWith('..') || isAbsolute(relativePath))
-  ) {
-    throw new Error(`Path is outside the local workspace: ${filePath}`);
+function isInsideAnyRoot(absolutePath: string, roots: string[]): boolean {
+  for (const root of roots) {
+    if (absolutePath === root) return true;
+    const rel = relative(root, absolutePath);
+    if (!rel.startsWith('..') && !isAbsolute(rel)) return true;
   }
-
-  return absolutePath;
+  return false;
 }
 
 async function realpathOrSelf(absolutePath: string): Promise<string> {
@@ -701,23 +791,20 @@ async function realpathOfPathOrAncestor(absolutePath: string): Promise<string> {
  */
 export async function resolveWorkspacePathSafe(
   filePath: string,
-  config: t.LocalExecutionConfig = {}
+  config: t.LocalExecutionConfig = {},
+  intent: 'read' | 'write' = 'write'
 ): Promise<string> {
-  const lexical = resolveWorkspacePath(filePath, config);
-  if (config.allowOutsideWorkspace === true) {
+  const lexical = resolveWorkspacePath(filePath, config, intent);
+  const roots = intent === 'write' ? getWriteRoots(config) : getReadRoots(config);
+  if (roots == null) {
     return lexical;
   }
-  const cwd = getLocalCwd(config);
-  const realCwd = await realpathOrSelf(cwd);
+  const realRoots = await Promise.all(roots.map(realpathOrSelf));
   const realPath = await realpathOfPathOrAncestor(lexical);
-  if (realPath === realCwd) {
+  if (isInsideAnyRoot(realPath, realRoots)) {
     return lexical;
   }
-  const rel = relative(realCwd, realPath);
-  if (rel.startsWith('..') || isAbsolute(rel)) {
-    throw new Error(
-      `Path is outside the local workspace (symlink escape): ${filePath}`
-    );
-  }
-  return lexical;
+  throw new Error(
+    `Path is outside the local workspace (symlink escape): ${filePath}`
+  );
 }

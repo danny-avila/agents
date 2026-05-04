@@ -1,5 +1,6 @@
-import { readFile, rm, writeFile, stat, mkdir } from 'fs/promises';
 import { dirname } from 'path';
+import { nodeWorkspaceFS } from './workspaceFS';
+import type { WorkspaceFS } from './workspaceFS';
 import type * as t from '@/types';
 
 type Snapshot =
@@ -27,7 +28,10 @@ export class LocalFileCheckpointerImpl implements t.LocalFileCheckpointer {
   private snapshots = new Map<string, Snapshot>();
   private oversizePaths = new Set<string>();
 
-  constructor(private readonly maxBytesPerFile: number = 32 * 1024 * 1024) {}
+  constructor(
+    private readonly maxBytesPerFile: number = 32 * 1024 * 1024,
+    private readonly fs: WorkspaceFS = nodeWorkspaceFS
+  ) {}
 
   async captureBeforeWrite(absolutePath: string): Promise<void> {
     if (this.snapshots.has(absolutePath) || this.oversizePaths.has(absolutePath)) {
@@ -35,7 +39,7 @@ export class LocalFileCheckpointerImpl implements t.LocalFileCheckpointer {
     }
     let info;
     try {
-      info = await stat(absolutePath);
+      info = await this.fs.stat(absolutePath);
     } catch {
       this.snapshots.set(absolutePath, { kind: 'absent' });
       return;
@@ -47,7 +51,7 @@ export class LocalFileCheckpointerImpl implements t.LocalFileCheckpointer {
       this.oversizePaths.add(absolutePath);
       return;
     }
-    const content = await readFile(absolutePath);
+    const content = (await this.fs.readFile(absolutePath)) as Buffer;
     this.snapshots.set(absolutePath, { kind: 'present', content });
   }
 
@@ -55,13 +59,13 @@ export class LocalFileCheckpointerImpl implements t.LocalFileCheckpointer {
     let restored = 0;
     for (const [path, snapshot] of this.snapshots.entries()) {
       if (snapshot.kind === 'absent') {
-        await rm(path, { force: true });
+        await this.fs.unlink(path).catch(() => undefined);
         restored++;
         continue;
       }
       try {
-        await mkdir(dirname(path), { recursive: true });
-        await writeFile(path, snapshot.content);
+        await this.fs.mkdir(dirname(path), { recursive: true });
+        await this.fs.writeFile(path, snapshot.content);
         restored++;
       } catch {
         // Best-effort: ignore individual restore failures so the rest
@@ -78,10 +82,12 @@ export class LocalFileCheckpointerImpl implements t.LocalFileCheckpointer {
 
 /**
  * Convenience factory so callers don't have to reach for the impl
- * class directly.
+ * class directly. Accepts an optional `WorkspaceFS` so a host using a
+ * non-default engine (remote sandbox, in-memory test FS, etc.) can
+ * route the checkpointer through the same I/O.
  */
 export function createLocalFileCheckpointer(
-  options: { maxBytesPerFile?: number } = {}
+  options: { maxBytesPerFile?: number; fs?: WorkspaceFS } = {}
 ): t.LocalFileCheckpointer {
-  return new LocalFileCheckpointerImpl(options.maxBytesPerFile);
+  return new LocalFileCheckpointerImpl(options.maxBytesPerFile, options.fs);
 }

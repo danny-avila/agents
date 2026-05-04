@@ -1,5 +1,4 @@
 import { basename, dirname } from 'path';
-import { readdir, readFile, stat, writeFile, mkdir, open } from 'fs/promises';
 import { tool } from '@langchain/core/tools';
 import { createTwoFilesPatch } from 'diff';
 import type { DynamicStructuredTool } from '@langchain/core/tools';
@@ -13,6 +12,7 @@ import {
   createLocalProgrammaticToolCallingTool,
 } from './LocalProgrammaticToolCalling';
 import {
+  getWorkspaceFS,
   resolveWorkspacePathSafe,
   spawnLocalProcess,
   truncateLocalOutput,
@@ -265,10 +265,13 @@ function toolDefinition(
   };
 }
 
-async function looksBinary(path: string): Promise<boolean> {
+async function looksBinary(
+  path: string,
+  fs: import('./workspaceFS').WorkspaceFS
+): Promise<boolean> {
   let handle;
   try {
-    handle = await open(path, 'r');
+    handle = await fs.open(path, 'r');
     const sample = Buffer.alloc(BINARY_DETECTION_BYTES);
     const { bytesRead } = await handle.read(
       sample,
@@ -292,6 +295,7 @@ const DEFAULT_MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024;
 export function createLocalReadFileTool(
   config: t.LocalExecutionConfig = {}
 ): DynamicStructuredTool {
+  const fs = getWorkspaceFS(config);
   return tool(
     async (rawInput) => {
       const input = rawInput as {
@@ -299,8 +303,8 @@ export function createLocalReadFileTool(
         offset?: number;
         limit?: number;
       };
-      const path = await resolveWorkspacePathSafe(input.file_path, config);
-      const fileStat = await stat(path);
+      const path = await resolveWorkspacePathSafe(input.file_path, config, 'read');
+      const fileStat = await fs.stat(path);
       if (!fileStat.isFile()) {
         throw new Error(`Path is not a file: ${input.file_path}`);
       }
@@ -313,7 +317,7 @@ export function createLocalReadFileTool(
         return [stub, { path, bytes: fileStat.size, truncated: true }];
       }
 
-      if (await looksBinary(path)) {
+      if (await looksBinary(path, fs)) {
         const attachmentMode = config.attachReadAttachments ?? 'off';
         if (attachmentMode !== 'off') {
           const attachment = await classifyAttachment({
@@ -385,7 +389,7 @@ export function createLocalReadFileTool(
         }
       }
 
-      const content = await readFile(path, 'utf8');
+      const content = await fs.readFile(path, 'utf8');
       const result = lineWindow(content, input.offset, input.limit);
       return [
         result.truncated ? `${result.text}\n[truncated]` : result.text,
@@ -408,13 +412,14 @@ export function createLocalWriteFileTool(
   config: t.LocalExecutionConfig = {},
   checkpointer?: t.LocalFileCheckpointer
 ): DynamicStructuredTool {
+  const fs = getWorkspaceFS(config);
   return tool(
     async (rawInput) => {
       const input = rawInput as { file_path: string; content: string };
       if (config.readOnly === true) {
         throw new Error('write_file is blocked in read-only local mode.');
       }
-      const path = await resolveWorkspacePathSafe(input.file_path, config);
+      const path = await resolveWorkspacePathSafe(input.file_path, config, 'write');
       if (checkpointer != null) {
         await checkpointer.captureBeforeWrite(path);
       }
@@ -425,7 +430,7 @@ export function createLocalWriteFileTool(
         | { text: string; hasBom: false; newline: '\n' };
       let existed = false;
       try {
-        const raw = await readFile(path, 'utf8');
+        const raw = await fs.readFile(path, 'utf8');
         const decoded = decodeFile(raw);
         before = decoded.text;
         encoding = decoded;
@@ -434,9 +439,9 @@ export function createLocalWriteFileTool(
         existed = false;
       }
 
-      await mkdir(dirname(path), { recursive: true });
+      await fs.mkdir(dirname(path), { recursive: true });
       const finalText = encodeFile(input.content, encoding);
-      await writeFile(path, finalText, 'utf8');
+      await fs.writeFile(path, finalText, 'utf8');
 
       const syntax = await maybeRunSyntaxCheck(path, config);
 
@@ -482,6 +487,7 @@ export function createLocalEditFileTool(
   config: t.LocalExecutionConfig = {},
   checkpointer?: t.LocalFileCheckpointer
 ): DynamicStructuredTool {
+  const fs = getWorkspaceFS(config);
   return tool(
     async (rawInput) => {
       const input = rawInput as {
@@ -498,8 +504,8 @@ export function createLocalEditFileTool(
         throw new Error('edit_file requires old_text/new_text or edits[].');
       }
 
-      const path = await resolveWorkspacePathSafe(input.file_path, config);
-      const raw = await readFile(path, 'utf8');
+      const path = await resolveWorkspacePathSafe(input.file_path, config, 'write');
+      const raw = await fs.readFile(path, 'utf8');
       const encoding = decodeFile(raw);
       const original = encoding.text;
 
@@ -523,7 +529,7 @@ export function createLocalEditFileTool(
         await checkpointer.captureBeforeWrite(path);
       }
       const finalText = encodeFile(next, encoding);
-      await writeFile(path, finalText, 'utf8');
+      await fs.writeFile(path, finalText, 'utf8');
 
       const syntax = await maybeRunSyntaxCheck(path, config);
 
@@ -613,13 +619,16 @@ function globToRegExp(pattern: string): RegExp {
   return new RegExp(result);
 }
 
-async function* walkFiles(root: string): AsyncGenerator<string> {
+async function* walkFiles(
+  root: string,
+  fs: import('./workspaceFS').WorkspaceFS
+): AsyncGenerator<string> {
   const stack: string[] = [root];
   while (stack.length > 0) {
     const dir = stack.pop() as string;
     let entries;
     try {
-      entries = await readdir(dir, { withFileTypes: true });
+      entries = await fs.readdir(dir, { withFileTypes: true });
     } catch {
       continue;
     }
@@ -641,13 +650,14 @@ async function fallbackGrep(
   root: string,
   pattern: string,
   globFilter: string | undefined,
-  maxResults: number
+  maxResults: number,
+  fs: import('./workspaceFS').WorkspaceFS
 ): Promise<string[]> {
   const rx = new RegExp(pattern);
   const globRx =
     globFilter != null && globFilter !== '' ? globToRegExp(globFilter) : undefined;
   const matches: string[] = [];
-  for await (const file of walkFiles(root)) {
+  for await (const file of walkFiles(root, fs)) {
     if (globRx != null) {
       const rel = file.startsWith(root + '/') ? file.slice(root.length + 1) : file;
       if (!globRx.test(rel)) {
@@ -656,7 +666,7 @@ async function fallbackGrep(
     }
     let content;
     try {
-      content = await readFile(file, 'utf8');
+      content = await fs.readFile(file, 'utf8');
     } catch {
       continue;
     }
@@ -679,11 +689,12 @@ async function fallbackGrep(
 async function fallbackGlob(
   root: string,
   pattern: string,
-  maxResults: number
+  maxResults: number,
+  fs: import('./workspaceFS').WorkspaceFS
 ): Promise<string[]> {
   const rx = globToRegExp(pattern);
   const out: string[] = [];
-  for await (const file of walkFiles(root)) {
+  for await (const file of walkFiles(root, fs)) {
     const rel = file.startsWith(root + '/') ? file.slice(root.length + 1) : file;
     if (rx.test(rel)) {
       out.push(file);
@@ -698,6 +709,7 @@ async function fallbackGlob(
 export function createLocalGrepSearchTool(
   config: t.LocalExecutionConfig = {}
 ): DynamicStructuredTool {
+  const fs = getWorkspaceFS(config);
   return tool(
     async (rawInput) => {
       const input = rawInput as {
@@ -706,7 +718,7 @@ export function createLocalGrepSearchTool(
         glob?: string;
         max_results?: number;
       };
-      const target = await resolveWorkspacePathSafe(input.path ?? '.', config);
+      const target = await resolveWorkspacePathSafe(input.path ?? '.', config, 'read');
       const maxResults = Math.max(input.max_results ?? DEFAULT_MAX_RESULTS, 1);
 
       if (await isRipgrepAvailable(config)) {
@@ -736,7 +748,8 @@ export function createLocalGrepSearchTool(
         target,
         input.pattern,
         input.glob,
-        maxResults
+        maxResults,
+        fs
       );
       return [
         matches.length > 0 ? matches.join('\n') : 'No matches found.',
@@ -756,6 +769,7 @@ export function createLocalGrepSearchTool(
 export function createLocalGlobSearchTool(
   config: t.LocalExecutionConfig = {}
 ): DynamicStructuredTool {
+  const fs = getWorkspaceFS(config);
   return tool(
     async (rawInput) => {
       const input = rawInput as {
@@ -763,7 +777,7 @@ export function createLocalGlobSearchTool(
         path?: string;
         max_results?: number;
       };
-      const target = await resolveWorkspacePathSafe(input.path ?? '.', config);
+      const target = await resolveWorkspacePathSafe(input.path ?? '.', config, 'read');
       const maxResults = Math.max(input.max_results ?? DEFAULT_MAX_RESULTS, 1);
 
       if (await isRipgrepAvailable(config)) {
@@ -782,7 +796,7 @@ export function createLocalGlobSearchTool(
         ];
       }
 
-      const files = await fallbackGlob(target, input.pattern, maxResults);
+      const files = await fallbackGlob(target, input.pattern, maxResults, fs);
       return [
         files.length > 0 ? files.join('\n') : 'No files found.',
         { files, engine: 'node-fallback' },
@@ -801,11 +815,12 @@ export function createLocalGlobSearchTool(
 export function createLocalListDirectoryTool(
   config: t.LocalExecutionConfig = {}
 ): DynamicStructuredTool {
+  const fs = getWorkspaceFS(config);
   return tool(
     async (rawInput) => {
       const input = rawInput as { path?: string };
-      const path = await resolveWorkspacePathSafe(input.path ?? '.', config);
-      const entries = await readdir(path, { withFileTypes: true });
+      const path = await resolveWorkspacePathSafe(input.path ?? '.', config, 'read');
+      const entries = await fs.readdir(path, { withFileTypes: true });
       const output = entries
         .map((entry) => `${entry.isDirectory() ? 'dir ' : 'file'}\t${entry.name}`)
         .join('\n');
@@ -836,7 +851,9 @@ export function createLocalCodingTools(
 ): DynamicStructuredTool[] {
   const checkpointer =
     options.checkpointer ??
-    (config.fileCheckpointing === true ? createLocalFileCheckpointer() : undefined);
+    (config.fileCheckpointing === true
+      ? createLocalFileCheckpointer({ fs: config.exec?.fs })
+      : undefined);
   return [
     createLocalReadFileTool(config),
     createLocalWriteFileTool(config, checkpointer),
@@ -863,7 +880,9 @@ export function createLocalCodingToolBundle(
 ): LocalCodingToolBundle {
   const checkpointer =
     options.checkpointer ??
-    (config.fileCheckpointing === true ? createLocalFileCheckpointer() : undefined);
+    (config.fileCheckpointing === true
+      ? createLocalFileCheckpointer({ fs: config.exec?.fs })
+      : undefined);
   return {
     tools: createLocalCodingTools(config, { checkpointer }),
     checkpointer,
