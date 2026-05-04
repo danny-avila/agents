@@ -13,10 +13,13 @@ import type {
 } from '@langchain/core/messages';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type {
+  BedrockReasoningContentText,
   ExtendedMessageContent,
+  GoogleReasoningContentText,
   MessageContentComplex,
   ReasoningContentText,
   SummaryContentBlock,
+  ThinkingContentText,
   ToolCallContent,
   ToolCallPart,
   TPayload,
@@ -299,17 +302,16 @@ function extractReasoningContent(
     return typeof think === 'string' ? think : '';
   }
   if (part.type === ContentTypes.THINKING) {
-    const thinking = (part as { thinking?: string }).thinking;
+    const thinking = (part as ThinkingContentText).thinking;
     return typeof thinking === 'string' ? thinking : '';
   }
   if (part.type === ContentTypes.REASONING) {
-    const reasoning = (part as { reasoning?: string }).reasoning;
+    const reasoning = (part as GoogleReasoningContentText).reasoning;
     return typeof reasoning === 'string' ? reasoning : '';
   }
   if (part.type === ContentTypes.REASONING_CONTENT) {
-    const reasoningText = (part as { reasoningText?: { text?: string } })
-      .reasoningText;
-    return typeof reasoningText?.text === 'string' ? reasoningText.text : '';
+    const reasoningText = (part as BedrockReasoningContentText).reasoningText;
+    return typeof reasoningText.text === 'string' ? reasoningText.text : '';
   }
   return '';
 }
@@ -317,6 +319,7 @@ function extractReasoningContent(
 /**
  * Helper function to format an assistant message
  * @param message The message to format
+ * @param options Optional formatting options
  * @returns Array of formatted messages
  */
 function formatAssistantMessage(
@@ -448,6 +451,7 @@ function formatAssistantMessage(
       } else if (
         part.type === ContentTypes.THINK ||
         part.type === ContentTypes.THINKING ||
+        part.type === ContentTypes.REASONING ||
         part.type === ContentTypes.REASONING_CONTENT ||
         part.type === 'redacted_thinking'
       ) {

@@ -1035,6 +1035,103 @@ describe('formatAgentMessages', () => {
     );
   });
 
+  it('should preserve DeepSeek reasoning from supported hidden content blocks', () => {
+    const payload: TPayload = [
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.THINK,
+            [ContentTypes.THINK]: 'Think. ',
+          },
+          {
+            type: ContentTypes.THINKING,
+            thinking: 'Thinking. ',
+          },
+          {
+            type: ContentTypes.REASONING,
+            reasoning: 'Reasoning. ',
+          },
+          {
+            type: ContentTypes.REASONING_CONTENT,
+            reasoningText: { text: 'Reasoning content.' },
+          },
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]: 'Done.',
+          },
+        ],
+      },
+    ];
+
+    const result = formatAgentMessages(
+      payload,
+      undefined,
+      undefined,
+      undefined,
+      { provider: Providers.DEEPSEEK }
+    );
+
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0]).toBeInstanceOf(AIMessage);
+    expect(result.messages[0].content).toBe('Done.');
+    expect(
+      (result.messages[0] as AIMessage).additional_kwargs.reasoning_content
+    ).toBe('Think. Thinking. Reasoning. Reasoning content.');
+  });
+
+  it('should attach later DeepSeek reasoning to an existing tool-call assistant message', () => {
+    const payload: TPayload = [
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.THINK,
+            [ContentTypes.THINK]: 'Need calculator. ',
+          },
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]: 'Using calculator.',
+            tool_call_ids: ['call_1'],
+          },
+          {
+            type: ContentTypes.THINK,
+            [ContentTypes.THINK]: 'Preparing tool call.',
+          },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 'call_1',
+              name: 'calculator',
+              args: '{"input":"127 * 453"}',
+              output: '57531',
+            },
+          },
+        ],
+      },
+    ];
+
+    const result = formatAgentMessages(
+      payload,
+      undefined,
+      undefined,
+      undefined,
+      { provider: Providers.DEEPSEEK }
+    );
+
+    expect(result.messages).toHaveLength(2);
+    expect(result.messages[0]).toBeInstanceOf(AIMessage);
+    expect(result.messages[1]).toBeInstanceOf(ToolMessage);
+
+    const toolCallMessage = result.messages[0] as AIMessage;
+
+    expect(toolCallMessage.content).toBe('Using calculator.');
+    expect(toolCallMessage.tool_calls).toHaveLength(1);
+    expect(toolCallMessage.additional_kwargs.reasoning_content).toBe(
+      'Need calculator. Preparing tool call.'
+    );
+  });
+
   it('should strip thinking blocks and join TEXT parts as string', () => {
     const payload = [
       {
