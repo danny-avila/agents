@@ -141,6 +141,50 @@ type OpenAIChatCompletionRetry = (
   AsyncIterable<OpenAIChatCompletionStreamItem> | OpenAIChatCompletion
 >;
 
+function createUsageMetadata(
+  usage?: OpenAIClient.Completions.CompletionUsage
+): UsageMetadata {
+  const usageMetadata: UsageMetadata = {
+    input_tokens: usage?.prompt_tokens ?? 0,
+    output_tokens: usage?.completion_tokens ?? 0,
+    total_tokens: usage?.total_tokens ?? 0,
+  };
+
+  if (usage == null) {
+    return usageMetadata;
+  }
+
+  const inputTokenDetails: UsageMetadata['input_token_details'] = {};
+  const outputTokenDetails: UsageMetadata['output_token_details'] = {};
+  const audioInputTokens = usage.prompt_tokens_details?.audio_tokens;
+  const cachedInputTokens = usage.prompt_tokens_details?.cached_tokens;
+  const audioOutputTokens = usage.completion_tokens_details?.audio_tokens;
+  const reasoningOutputTokens =
+    usage.completion_tokens_details?.reasoning_tokens;
+
+  if (audioInputTokens != null) {
+    inputTokenDetails.audio = audioInputTokens;
+  }
+  if (cachedInputTokens != null) {
+    inputTokenDetails.cache_read = cachedInputTokens;
+  }
+  if (audioOutputTokens != null) {
+    outputTokenDetails.audio = audioOutputTokens;
+  }
+  if (reasoningOutputTokens != null) {
+    outputTokenDetails.reasoning = reasoningOutputTokens;
+  }
+
+  if (Object.keys(inputTokenDetails).length > 0) {
+    usageMetadata.input_token_details = inputTokenDetails;
+  }
+  if (Object.keys(outputTokenDetails).length > 0) {
+    usageMetadata.output_token_details = outputTokenDetails;
+  }
+
+  return usageMetadata;
+}
+
 function getExposedOpenAIClient(
   completions: OpenAIClientDelegate,
   responses: OpenAIClientDelegate,
@@ -1242,6 +1286,78 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
     return 'LibreChatDeepSeek';
   }
 
+  protected _convertDeepSeekMessages(
+    messages: BaseMessage[]
+  ): OpenAICompletionParam[] {
+    return _convertMessagesToOpenAIParams(messages, this.model, {
+      includeReasoningContent: true,
+    });
+  }
+
+  async _generate(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions'],
+    runManager?: CallbackManagerForLLMRun
+  ): Promise<ChatResult> {
+    const params = this.invocationParams(options);
+
+    if (params.stream === true) {
+      return super._generate(messages, options, runManager);
+    }
+
+    const messagesMapped = this._convertDeepSeekMessages(messages);
+    const response = await this.completionWithRetry(
+      {
+        ...params,
+        stream: false,
+        messages: messagesMapped,
+      },
+      {
+        signal: options.signal,
+        ...options.options,
+      }
+    );
+
+    const usageMetadata = createUsageMetadata(response.usage);
+
+    const generations: ChatGeneration[] = response.choices.map((part) => {
+      const text = part.message.content ?? '';
+      const generation: ChatGeneration = {
+        text,
+        message: this._convertCompletionsMessageToBaseMessage(
+          part.message,
+          response
+        ),
+      };
+      generation.generationInfo = {
+        finish_reason: part.finish_reason,
+        ...(part.logprobs != null ? { logprobs: part.logprobs } : {}),
+      };
+      if (isAIMessage(generation.message)) {
+        generation.message.usage_metadata = usageMetadata;
+      }
+      generation.message = new AIMessage(
+        Object.fromEntries(
+          Object.entries(generation.message).filter(
+            ([key]) => !key.startsWith('lc_')
+          )
+        )
+      );
+      return generation;
+    });
+
+    return {
+      generations,
+      llmOutput: {
+        tokenUsage: {
+          promptTokens: usageMetadata.input_tokens,
+          completionTokens: usageMetadata.output_tokens,
+          totalTokens: usageMetadata.total_tokens,
+        },
+      },
+    };
+  }
+
   _getClientOptions(
     options?: OpenAICoreRequestOptions
   ): OpenAICoreRequestOptions {
@@ -1276,9 +1392,302 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
     yield* delayStreamChunks(
-      super._streamResponseChunks(messages, options, runManager),
+      this._streamResponseChunksWithReasoning(messages, options, runManager),
       this._lc_stream_delay
     );
+  }
+
+  protected async *_streamResponseChunksWithReasoning(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions'],
+    runManager?: CallbackManagerForLLMRun
+  ): AsyncGenerator<ChatGenerationChunk> {
+    const stream = this._streamResponseChunksFromReasoningMessages(
+      messages,
+      options,
+      runManager
+    );
+    const thinkStartTag = '<think>';
+    const thinkEndTag = '</think>';
+    let tokensBuffer = '';
+    let isThinking = false;
+
+    for await (const chunk of stream) {
+      if (options.signal?.aborted === true) {
+        return;
+      }
+
+      const reasoningContent =
+        chunk.message.additional_kwargs.reasoning_content;
+      if (reasoningContent != null && reasoningContent !== '') {
+        yield chunk;
+        continue;
+      }
+
+      const text = chunk.text;
+      if (text === '') {
+        yield chunk;
+        continue;
+      }
+
+      tokensBuffer += text;
+
+      if (!isThinking && tokensBuffer.includes(thinkStartTag)) {
+        isThinking = true;
+        const thinkIndex = tokensBuffer.indexOf(thinkStartTag);
+        const beforeThink = tokensBuffer.substring(0, thinkIndex);
+        tokensBuffer =
+          tokensBuffer.substring(thinkIndex + thinkStartTag.length) || '';
+
+        if (beforeThink !== '') {
+          yield this._createDeepSeekStreamChunk(chunk, beforeThink);
+        }
+      }
+
+      if (isThinking && tokensBuffer.includes(thinkEndTag)) {
+        isThinking = false;
+        const thinkEndIndex = tokensBuffer.indexOf(thinkEndTag);
+        const thoughtContent = tokensBuffer.substring(0, thinkEndIndex);
+        const afterThink = tokensBuffer.substring(
+          thinkEndIndex + thinkEndTag.length
+        );
+
+        yield this._createDeepSeekStreamChunk(
+          chunk,
+          '',
+          {
+            ...chunk.message.additional_kwargs,
+            reasoning_content: thoughtContent,
+          },
+          ''
+        );
+
+        tokensBuffer = afterThink || '';
+        if (tokensBuffer !== '') {
+          yield this._createDeepSeekStreamChunk(chunk, tokensBuffer);
+          tokensBuffer = '';
+        }
+      } else if (isThinking) {
+        let splitIndex = -1;
+        for (let i = thinkEndTag.length - 1; i >= 1; i--) {
+          if (tokensBuffer.endsWith(thinkEndTag.substring(0, i))) {
+            splitIndex = tokensBuffer.length - i;
+            break;
+          }
+        }
+
+        if (splitIndex !== -1) {
+          const safeToYield = tokensBuffer.substring(0, splitIndex);
+          if (safeToYield !== '') {
+            yield this._createDeepSeekStreamChunk(
+              chunk,
+              '',
+              {
+                ...chunk.message.additional_kwargs,
+                reasoning_content: safeToYield,
+              },
+              ''
+            );
+          }
+          tokensBuffer = tokensBuffer.substring(splitIndex);
+        } else if (tokensBuffer !== '') {
+          yield this._createDeepSeekStreamChunk(
+            chunk,
+            '',
+            {
+              ...chunk.message.additional_kwargs,
+              reasoning_content: tokensBuffer,
+            },
+            ''
+          );
+          tokensBuffer = '';
+        }
+      } else {
+        let splitIndex = -1;
+        for (let i = thinkStartTag.length - 1; i >= 1; i--) {
+          if (tokensBuffer.endsWith(thinkStartTag.substring(0, i))) {
+            splitIndex = tokensBuffer.length - i;
+            break;
+          }
+        }
+
+        if (splitIndex !== -1) {
+          const safeToYield = tokensBuffer.substring(0, splitIndex);
+          if (safeToYield !== '') {
+            yield this._createDeepSeekStreamChunk(chunk, safeToYield);
+          }
+          tokensBuffer = tokensBuffer.substring(splitIndex);
+        } else if (tokensBuffer !== '') {
+          yield this._createDeepSeekStreamChunk(chunk, tokensBuffer);
+          tokensBuffer = '';
+        }
+      }
+    }
+
+    if (tokensBuffer === '') {
+      return;
+    }
+
+    if (isThinking) {
+      yield new ChatGenerationChunk({
+        message: new AIMessageChunk({
+          content: '',
+          additional_kwargs: {
+            reasoning_content: tokensBuffer,
+          },
+        }),
+        text: '',
+      });
+      return;
+    }
+
+    yield new ChatGenerationChunk({
+      message: new AIMessageChunk({
+        content: tokensBuffer,
+      }),
+      text: tokensBuffer,
+    });
+  }
+
+  protected async *_streamResponseChunksFromReasoningMessages(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions'],
+    runManager?: CallbackManagerForLLMRun
+  ): AsyncGenerator<ChatGenerationChunk> {
+    const params = {
+      ...this.invocationParams(options, { streaming: true }),
+      stream: true as const,
+    };
+    const messagesMapped = this._convertDeepSeekMessages(messages);
+    const streamIterable = await this.completionWithRetry(
+      {
+        ...params,
+        messages: messagesMapped,
+      },
+      {
+        signal: options.signal,
+        ...options.options,
+      }
+    );
+
+    let defaultRole:
+      | OpenAIClient.Chat.Completions.ChatCompletionRole
+      | undefined;
+    let usage: OpenAIClient.Completions.CompletionUsage | undefined;
+
+    for await (const data of streamIterable) {
+      if (options.signal?.aborted === true) {
+        return;
+      }
+
+      if (data.usage != null) {
+        usage = data.usage;
+      }
+
+      if (data.choices.length === 0) {
+        continue;
+      }
+
+      const choice = data.choices[0];
+      const { delta } = choice;
+      const messageChunk = this._convertCompletionsDeltaToBaseMessageChunk(
+        delta,
+        data,
+        defaultRole
+      );
+      defaultRole = delta.role ?? defaultRole;
+
+      if (typeof messageChunk.content !== 'string') {
+        continue;
+      }
+
+      const messageText = messageChunk.content;
+      const newTokenIndices = {
+        prompt: options.promptIndex ?? 0,
+        completion: choice.index,
+      };
+      const generationInfo = { ...newTokenIndices };
+      if (choice.finish_reason != null) {
+        Object.assign(generationInfo, {
+          finish_reason: choice.finish_reason,
+          system_fingerprint: data.system_fingerprint,
+          model_name: data.model,
+          service_tier: data.service_tier,
+        });
+      }
+      if (this.logprobs === true) {
+        Object.assign(generationInfo, { logprobs: choice.logprobs });
+      }
+
+      const generationChunk = new ChatGenerationChunk({
+        message: messageChunk,
+        text: messageText,
+        generationInfo,
+      });
+
+      yield generationChunk;
+      await runManager?.handleLLMNewToken(
+        generationChunk.text,
+        newTokenIndices,
+        undefined,
+        undefined,
+        undefined,
+        { chunk: generationChunk }
+      );
+    }
+
+    if (usage != null) {
+      const usageMetadata = createUsageMetadata(usage);
+
+      const generationChunk = new ChatGenerationChunk({
+        message: new AIMessageChunk({
+          content: '',
+          response_metadata: {
+            usage: { ...usage },
+          },
+          usage_metadata: usageMetadata,
+        }),
+        text: '',
+      });
+
+      yield generationChunk;
+      await runManager?.handleLLMNewToken(
+        generationChunk.text,
+        {
+          prompt: 0,
+          completion: 0,
+        },
+        undefined,
+        undefined,
+        undefined,
+        { chunk: generationChunk }
+      );
+    }
+
+    if (options.signal?.aborted === true) {
+      return;
+    }
+  }
+
+  protected _createDeepSeekStreamChunk(
+    chunk: ChatGenerationChunk,
+    content: string,
+    additionalKwargs?: AIMessageChunk['additional_kwargs'],
+    text = content
+  ): ChatGenerationChunk {
+    const message = chunk.message as AIMessageChunk;
+    return new ChatGenerationChunk({
+      message: new AIMessageChunk({
+        content,
+        additional_kwargs: additionalKwargs ?? message.additional_kwargs,
+        response_metadata: message.response_metadata,
+        tool_calls: message.tool_calls,
+        tool_call_chunks: message.tool_call_chunks,
+        id: message.id,
+      }),
+      text,
+      generationInfo: chunk.generationInfo,
+    });
   }
 }
 
