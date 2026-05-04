@@ -156,6 +156,8 @@ function createUsageMetadata(
 
   const inputTokenDetails: UsageMetadata['input_token_details'] = {};
   const outputTokenDetails: UsageMetadata['output_token_details'] = {};
+  let hasInputTokenDetails = false;
+  let hasOutputTokenDetails = false;
   const audioInputTokens = usage.prompt_tokens_details?.audio_tokens;
   const cachedInputTokens = usage.prompt_tokens_details?.cached_tokens;
   const audioOutputTokens = usage.completion_tokens_details?.audio_tokens;
@@ -164,21 +166,25 @@ function createUsageMetadata(
 
   if (audioInputTokens != null) {
     inputTokenDetails.audio = audioInputTokens;
+    hasInputTokenDetails = true;
   }
   if (cachedInputTokens != null) {
     inputTokenDetails.cache_read = cachedInputTokens;
+    hasInputTokenDetails = true;
   }
   if (audioOutputTokens != null) {
     outputTokenDetails.audio = audioOutputTokens;
+    hasOutputTokenDetails = true;
   }
   if (reasoningOutputTokens != null) {
     outputTokenDetails.reasoning = reasoningOutputTokens;
+    hasOutputTokenDetails = true;
   }
 
-  if (Object.keys(inputTokenDetails).length > 0) {
+  if (hasInputTokenDetails) {
     usageMetadata.input_token_details = inputTokenDetails;
   }
-  if (Object.keys(outputTokenDetails).length > 0) {
+  if (hasOutputTokenDetails) {
     usageMetadata.output_token_details = outputTokenDetails;
   }
 
@@ -1299,6 +1305,7 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun
   ): Promise<ChatResult> {
+    options.signal?.throwIfAborted();
     const params = this.invocationParams(options);
 
     if (params.stream === true) {
@@ -1397,6 +1404,7 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
     );
   }
 
+  /** Parses raw `<think>` fallback tags across chunks and emits sanitized DeepSeek stream chunks. */
   protected async *_streamResponseChunksWithReasoning(
     messages: BaseMessage[],
     options: this['ParsedCallOptions'],
@@ -1437,16 +1445,9 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
           if (thinkEndIndex !== -1) {
             const thoughtContent = tokensBuffer.substring(0, thinkEndIndex);
             if (thoughtContent !== '') {
-              yield* this._yieldDeepSeekStreamChunk(
-                this._createDeepSeekStreamChunk(
-                  chunk,
-                  '',
-                  {
-                    ...chunk.message.additional_kwargs,
-                    reasoning_content: thoughtContent,
-                  },
-                  ''
-                ),
+              yield* this._yieldDeepSeekReasoningText(
+                chunk,
+                thoughtContent,
                 runManager
               );
             }
@@ -1465,16 +1466,9 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
           if (splitIndex !== -1) {
             const safeToYield = tokensBuffer.substring(0, splitIndex);
             if (safeToYield !== '') {
-              yield* this._yieldDeepSeekStreamChunk(
-                this._createDeepSeekStreamChunk(
-                  chunk,
-                  '',
-                  {
-                    ...chunk.message.additional_kwargs,
-                    reasoning_content: safeToYield,
-                  },
-                  ''
-                ),
+              yield* this._yieldDeepSeekReasoningText(
+                chunk,
+                safeToYield,
                 runManager
               );
             }
@@ -1482,16 +1476,9 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
             break;
           }
 
-          yield* this._yieldDeepSeekStreamChunk(
-            this._createDeepSeekStreamChunk(
-              chunk,
-              '',
-              {
-                ...chunk.message.additional_kwargs,
-                reasoning_content: tokensBuffer,
-              },
-              ''
-            ),
+          yield* this._yieldDeepSeekReasoningText(
+            chunk,
+            tokensBuffer,
             runManager
           );
           tokensBuffer = '';
@@ -1681,7 +1668,21 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
     additionalKwargs?: AIMessageChunk['additional_kwargs'],
     text = content
   ): ChatGenerationChunk {
-    const message = chunk.message as AIMessageChunk;
+    if (!(chunk.message instanceof AIMessageChunk)) {
+      return new ChatGenerationChunk({
+        message: new AIMessageChunk({
+          content,
+          additional_kwargs:
+            additionalKwargs ?? chunk.message.additional_kwargs,
+          response_metadata: chunk.message.response_metadata,
+          id: chunk.message.id,
+        }),
+        text,
+        generationInfo: chunk.generationInfo,
+      });
+    }
+
+    const message = chunk.message;
     return new ChatGenerationChunk({
       message: new AIMessageChunk({
         content,
@@ -1694,6 +1695,32 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
       text,
       generationInfo: chunk.generationInfo,
     });
+  }
+
+  protected _createDeepSeekReasoningStreamChunk(
+    chunk: ChatGenerationChunk,
+    reasoningContent: string
+  ): ChatGenerationChunk {
+    return this._createDeepSeekStreamChunk(
+      chunk,
+      '',
+      {
+        ...chunk.message.additional_kwargs,
+        reasoning_content: reasoningContent,
+      },
+      ''
+    );
+  }
+
+  protected async *_yieldDeepSeekReasoningText(
+    chunk: ChatGenerationChunk,
+    reasoningContent: string,
+    runManager?: CallbackManagerForLLMRun
+  ): AsyncGenerator<ChatGenerationChunk> {
+    yield* this._yieldDeepSeekStreamChunk(
+      this._createDeepSeekReasoningStreamChunk(chunk, reasoningContent),
+      runManager
+    );
   }
 
   protected async *_yieldDeepSeekStreamChunk(

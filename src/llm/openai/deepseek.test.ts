@@ -1,6 +1,6 @@
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
-import type { BaseMessage } from '@langchain/core/messages';
 import type { ChatGenerationChunk } from '@langchain/core/outputs';
+import type { BaseMessage } from '@langchain/core/messages';
 import type { OpenAIClient } from '@langchain/openai';
 
 import { ChatDeepSeek } from './index';
@@ -21,7 +21,8 @@ class CapturingChatDeepSeek extends ChatDeepSeek {
 
   constructor(
     fields: ConstructorParameters<typeof ChatDeepSeek>[0],
-    private readonly streamChunks = createCompletionStreamChunks()
+    private readonly streamChunks = createCompletionStreamChunks(),
+    private readonly completion = createCompletion()
   ) {
     super(fields);
   }
@@ -44,7 +45,7 @@ class CapturingChatDeepSeek extends ChatDeepSeek {
       return createCompletionStream(this.streamChunks);
     }
 
-    return createCompletion();
+    return this.completion;
   }
 
   streamChunksWithSignal(
@@ -127,7 +128,13 @@ async function* createCompletionStream(
   }
 }
 
-function createCompletion(): OpenAIChatCompletion {
+function createCompletion(
+  usage: OpenAIClient.Completions.CompletionUsage = {
+    prompt_tokens: 1,
+    completion_tokens: 1,
+    total_tokens: 2,
+  }
+): OpenAIChatCompletion {
   return {
     id: 'chatcmpl-deepseek-test',
     object: 'chat.completion',
@@ -145,11 +152,7 @@ function createCompletion(): OpenAIChatCompletion {
         logprobs: null,
       },
     ],
-    usage: {
-      prompt_tokens: 1,
-      completion_tokens: 1,
-      total_tokens: 2,
-    },
+    usage,
   };
 }
 
@@ -292,6 +295,102 @@ describe('ChatDeepSeek', () => {
     expect(streamedText).toBe('beforevisibledone');
     expect(callbackTokens.join('')).toBe('beforevisibledone');
     expect(reasoningContent).toEqual(['hidden one', 'hidden two']);
+  });
+
+  it('emits trailing unfinished raw think fallback as reasoning content', async () => {
+    const model = new CapturingChatDeepSeek(
+      {
+        apiKey: 'test-key',
+        model: 'deepseek-v4-pro',
+        streaming: true,
+      },
+      [createContentChunk('<think>truncated')]
+    );
+    const chunks = [];
+    const callbackTokens: string[] = [];
+
+    const stream = await model.stream([new HumanMessage('hi')], {
+      callbacks: [
+        {
+          handleLLMNewToken(token: string): void {
+            callbackTokens.push(token);
+          },
+        },
+      ],
+    });
+
+    for await (const chunk of stream) {
+      chunks.push(chunk);
+    }
+
+    const streamedText = chunks
+      .map((chunk) => (typeof chunk.content === 'string' ? chunk.content : ''))
+      .join('');
+    const reasoningContent = chunks
+      .map((chunk) => chunk.additional_kwargs.reasoning_content)
+      .filter((content): content is string => typeof content === 'string');
+
+    expect(streamedText).toBe('');
+    expect(callbackTokens.join('')).toBe('');
+    expect(reasoningContent).toEqual(['truncated']);
+  });
+
+  it('preserves detailed usage metadata in non-streaming responses', async () => {
+    const model = new CapturingChatDeepSeek(
+      {
+        apiKey: 'test-key',
+        model: 'deepseek-v4-pro',
+        streaming: false,
+      },
+      createCompletionStreamChunks(),
+      createCompletion({
+        prompt_tokens: 11,
+        completion_tokens: 7,
+        total_tokens: 18,
+        prompt_tokens_details: {
+          audio_tokens: 2,
+          cached_tokens: 3,
+        },
+        completion_tokens_details: {
+          audio_tokens: 4,
+          reasoning_tokens: 5,
+        },
+      })
+    );
+
+    const response = await model.invoke([new HumanMessage('hi')]);
+
+    expect(response.usage_metadata).toEqual({
+      input_tokens: 11,
+      output_tokens: 7,
+      total_tokens: 18,
+      input_token_details: {
+        audio: 2,
+        cache_read: 3,
+      },
+      output_token_details: {
+        audio: 4,
+        reasoning: 5,
+      },
+    });
+  });
+
+  it('does not serialize non-streaming requests when aborted before generation', async () => {
+    const controller = new AbortController();
+    const model = new CapturingChatDeepSeek({
+      apiKey: 'test-key',
+      model: 'deepseek-v4-pro',
+      streaming: false,
+    });
+
+    controller.abort();
+
+    await expect(
+      model.invoke([new HumanMessage('hi')], {
+        signal: controller.signal,
+      })
+    ).rejects.toThrow();
+    expect(model.requests).toHaveLength(0);
   });
 
   it('throws AbortError when a DeepSeek stream is canceled', async () => {
