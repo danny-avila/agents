@@ -208,9 +208,17 @@ export function isAskUserQuestionInterrupt(
 }
 
 /**
- * Run-level configuration controlling HITL semantics. **HITL is enabled
- * by default** — the SDK assumes hosts want first-class human review
- * support unless they explicitly opt out. When enabled:
+ * Run-level configuration controlling HITL semantics. **HITL is OFF by
+ * default** for now — the SDK ships the interrupt machinery, but the
+ * default stays opt-in until host UIs (notably LibreChat) ship the
+ * approval-rendering affordances needed to surface interrupts to end
+ * users. Without that UI, an interrupt with no resolver looks like a
+ * hung tool-call card. Hosts opt in explicitly with
+ * `{ enabled: true }`. The intent is to flip this default to ON in a
+ * future minor once the consumer ecosystem is ready to render
+ * interrupts end-to-end.
+ *
+ * When enabled (`{ enabled: true }`):
  *
  *   - `PreToolUse` hooks returning `decision: 'ask'` raise a real
  *     LangGraph `interrupt()` instead of being treated as a synchronous
@@ -219,9 +227,11 @@ export function isAskUserQuestionInterrupt(
  *     run's compile options if the host did not provide one, since
  *     LangGraph requires a checkpointer to suspend and resume.
  *
- * Pass `{ enabled: false }` to fall back to the pre-HITL behavior: `ask`
- * decisions are fail-closed (blocked with an error `ToolMessage`) and no
- * checkpointer is implicitly attached.
+ * When disabled (the default — omitted, or `{ enabled: false }`):
+ * `ask` decisions are fail-closed (blocked with an error
+ * `ToolMessage`) and no checkpointer is implicitly attached. This
+ * matches the pre-HITL behavior so existing hosts upgrading the SDK
+ * see no change until they're ready to wire the resume UI.
  *
  * ## Scope: event-driven tools only
  *
@@ -259,8 +269,9 @@ export function isAskUserQuestionInterrupt(
  */
 export interface HumanInTheLoopConfig {
   /**
-   * Master switch. Defaults to `true` — omit the field to keep HITL on,
-   * or set `false` to opt out.
+   * Master switch. Defaults to `false` — omit the field (or pass
+   * `false`) to keep HITL off, or set `true` to opt in once the host
+   * UI is ready to render and resolve `tool_approval` interrupts.
    */
   enabled?: boolean;
 }

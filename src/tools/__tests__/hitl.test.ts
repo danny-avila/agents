@@ -450,7 +450,15 @@ describe('ToolNode HITL — opt-out (`humanInTheLoop: { enabled: false }`) is fa
     );
   });
 
-  it('raises an interrupt when `humanInTheLoop` is omitted (default-on)', async () => {
+  it('blocks the tool when `humanInTheLoop` is omitted (default-off)', async () => {
+    /**
+     * Default is OFF until host UIs (notably LibreChat) ship the
+     * approval-rendering affordances. With HITL omitted, an `ask`
+     * decision must collapse into a synchronous block — same fail-
+     * closed behavior as the explicit `{ enabled: false }` opt-out.
+     * This test guards against accidentally re-enabling the default-on
+     * path before the consumer ecosystem is ready.
+     */
     mockEventDispatch([
       { toolCallId: 'call_1', content: 'host-result', status: 'success' },
     ]);
@@ -459,8 +467,8 @@ describe('ToolNode HITL — opt-out (`humanInTheLoop: { enabled: false }`) is fa
       eventDrivenMode: true,
       agentId: 'agent-x',
       toolCallStepIds: new Map([['call_1', 'step_call_1']]),
-      hookRegistry: makeHookRegistry('ask', 'default-on'),
-      // humanInTheLoop intentionally omitted — should default to enabled
+      hookRegistry: makeHookRegistry('ask', 'default-off-blocks'),
+      // humanInTheLoop intentionally omitted — should default to disabled
     });
 
     const graph = buildHITLGraph(node, [
@@ -468,8 +476,17 @@ describe('ToolNode HITL — opt-out (`humanInTheLoop: { enabled: false }`) is fa
     ]);
     const config = { configurable: { thread_id: 'thread-hitl-default' } };
 
-    const interrupted = await graph.invoke({ messages: [] }, config);
-    expect(isInterrupted<t.HumanInterruptPayload>(interrupted)).toBe(true);
+    const out = (await graph.invoke({ messages: [] }, config)) as {
+      messages: BaseMessage[];
+    };
+    expect(isInterrupted<t.HumanInterruptPayload>(out)).toBe(false);
+    const toolMessages = out.messages.filter(
+      (m): m is ToolMessage => m._getType() === 'tool'
+    );
+    expect(toolMessages).toHaveLength(1);
+    expect(toolMessages[0].tool_call_id).toBe('call_1');
+    expect(toolMessages[0].status).toBe('error');
+    expect(String(toolMessages[0].content)).toContain('default-off-blocks');
   });
 });
 
@@ -574,7 +591,16 @@ describe('Run integration — HITL fallback checkpointer + resume', () => {
     jest.restoreAllMocks();
   });
 
-  it('Run.create installs a MemorySaver fallback by default (HITL on, no checkpointer provided)', async () => {
+  it('Run.create does NOT install a MemorySaver fallback by default (HITL is off until host UI ships)', async () => {
+    /**
+     * Default-off rationale: HITL ships the interrupt machinery but
+     * stays opt-in until host UIs (notably LibreChat) can render and
+     * resolve `tool_approval` interrupts. With HITL omitted, the SDK
+     * must NOT silently install a checkpointer — that would suggest
+     * the run can pause/resume when in fact the `ask` path will
+     * fail-closed. Plan of record: flip the default to ON in a future
+     * minor once the consumer ecosystem is ready.
+     */
     const { Run } = await import('@/run');
     const { Providers } = await import('@/common');
 
@@ -592,11 +618,10 @@ describe('Run integration — HITL fallback checkpointer + resume', () => {
           },
         ],
       },
-      // humanInTheLoop intentionally omitted — default is on
+      // humanInTheLoop intentionally omitted — default is OFF
     });
 
-    expect(run.Graph?.compileOptions?.checkpointer).toBeDefined();
-    expect(run.Graph?.compileOptions?.checkpointer).toBeInstanceOf(MemorySaver);
+    expect(run.Graph?.compileOptions?.checkpointer).toBeUndefined();
   });
 
   it('Run.create installs a MemorySaver fallback when HITL is explicitly enabled', async () => {
@@ -624,7 +649,7 @@ describe('Run integration — HITL fallback checkpointer + resume', () => {
     expect(run.Graph?.humanInTheLoop?.enabled).toBe(true);
   });
 
-  it('Run.create preserves a host-supplied checkpointer (default-on HITL keeps it intact)', async () => {
+  it('Run.create preserves a host-supplied checkpointer when HITL is explicitly enabled', async () => {
     const { Run } = await import('@/run');
     const { Providers } = await import('@/common');
 
@@ -644,6 +669,7 @@ describe('Run integration — HITL fallback checkpointer + resume', () => {
         ],
         compileOptions: { checkpointer: hostCheckpointer },
       },
+      humanInTheLoop: { enabled: true },
     });
 
     expect(run.Graph?.compileOptions?.checkpointer).toBe(hostCheckpointer);

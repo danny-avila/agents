@@ -160,13 +160,19 @@ export type RunConfig = {
   /**
    * First-class human-in-the-loop (HITL) flow for this run.
    *
-   * **HITL is on by default.** Omitting this field — or passing
-   * `{ enabled: true }` explicitly — engages every behavior below.
-   * Pass `{ enabled: false }` to opt out; that is the only way to
-   * restore the pre-HITL fail-closed semantics where `ask` decisions
-   * collapse into a synchronous deny.
+   * **HITL is OFF by default.** Omitting this field — or passing
+   * `{ enabled: false }` — keeps the pre-HITL fail-closed semantics
+   * where `ask` decisions collapse into a synchronous deny. Hosts opt
+   * in explicitly with `{ enabled: true }` once their UI can render
+   * and resolve `tool_approval` interrupts (otherwise the run just
+   * pauses with no resolver, which surfaces to end users as a hung
+   * tool-call card).
    *
-   * When enabled (the default):
+   * Plan of record: the default flips back to ON in a future minor
+   * once the consumer ecosystem (notably LibreChat) ships HITL UI
+   * end-to-end. See `HumanInTheLoopConfig` JSDoc.
+   *
+   * When enabled (`{ enabled: true }`):
    *   - `PreToolUse` hooks returning `decision: 'ask'` raise a real
    *     LangGraph `interrupt()` instead of being treated as a synchronous
    *     deny. The graph pauses and the run exits cleanly.
@@ -178,9 +184,9 @@ export type RunConfig = {
    *     continue with `Run.resume(decisions)` against a Run rebuilt with
    *     the same `thread_id` and checkpointer.
    *
-   * When opted out (`{ enabled: false }`): `ask` decisions remain
-   * fail-closed (blocked with an error `ToolMessage`) and no
-   * checkpointer is implicitly attached.
+   * When disabled (the default): `ask` decisions remain fail-closed
+   * (blocked with an error `ToolMessage`) and no checkpointer is
+   * implicitly attached.
    */
   humanInTheLoop?: HumanInTheLoopConfig;
 };

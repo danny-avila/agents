@@ -1212,13 +1212,16 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
         if (hookResult.decision === 'ask') {
           /**
-           * HITL is on by default — only the explicit opt-out
-           * (`humanInTheLoop: { enabled: false }`) falls back to the
-           * pre-HITL fail-closed path where `ask` collapses into a
-           * blocked tool with an error `ToolMessage`. Otherwise the
-           * entry queues for a single batched `interrupt()` call below.
+           * HITL is OFF by default — hosts must explicitly opt in via
+           * `humanInTheLoop: { enabled: true }` to engage the
+           * `interrupt()` path. When opted out (or omitted), `ask`
+           * collapses into the pre-HITL fail-closed path: a blocked
+           * tool with an error `ToolMessage`. The default stays
+           * conservative until host UIs are ready to render
+           * `tool_approval` interrupts; see `HumanInTheLoopConfig`
+           * JSDoc for the full rationale and the migration plan.
            */
-          if (this.humanInTheLoop?.enabled === false) {
+          if (this.humanInTheLoop?.enabled !== true) {
             blockEntry(entry, hookResult.reason ?? 'Blocked by hook');
             continue;
           }

@@ -58,14 +58,15 @@ export type ToolNodeOptions = {
    */
   hookRegistry?: HookRegistry;
   /**
-   * Run-scoped HITL config. **HITL is on by default** — omitting this
-   * field (or passing `{ enabled: true }`) engages the interrupt path:
-   * a `PreToolUse` hook returning `decision: 'ask'` raises a real
-   * LangGraph `interrupt()` carrying a `HumanInterruptPayload`, and
-   * the host resumes with `Run.resume(decisions)`. Pass
-   * `{ enabled: false }` to opt out and restore the pre-HITL
-   * fail-closed behavior where `ask` collapses into a blocked
-   * `ToolMessage`.
+   * Run-scoped HITL config. **HITL is OFF by default** — omitting this
+   * field (or passing `{ enabled: false }`) keeps the pre-HITL
+   * fail-closed behavior where a `PreToolUse` `ask` decision collapses
+   * into a blocked `ToolMessage`. Hosts opt in with
+   * `{ enabled: true }` once their UI can render and resolve a
+   * `tool_approval` interrupt; that engages the interrupt path where
+   * `ask` raises a real LangGraph `interrupt()` carrying a
+   * `HumanInterruptPayload` and the host resumes with
+   * `Run.resume(decisions)`.
    *
    * Mirrors `RunConfig.humanInTheLoop` (which is the canonical place
    * to set this); the Graph threads it down to every ToolNode it

@@ -207,21 +207,23 @@ export class Run<_T extends t.BaseGraphState> {
   }
 
   /**
-   * When HITL is enabled (the default) and the host did not supply a
-   * checkpointer, install an in-memory `MemorySaver` so `interrupt()`
-   * can persist checkpoints and `Command({ resume })` can rebuild state.
-   * The fallback is intentionally process-local: production hosts that
-   * need durable resumption across processes / restarts must provide
-   * their own checkpointer (Redis, Postgres, etc.) on
-   * `compileOptions.checkpointer`.
+   * When the host opted into HITL via `humanInTheLoop: { enabled: true }`
+   * and did not supply a checkpointer, install an in-memory `MemorySaver`
+   * so `interrupt()` can persist checkpoints and `Command({ resume })`
+   * can rebuild state. The fallback is intentionally process-local:
+   * production hosts that need durable resumption across processes /
+   * restarts must provide their own checkpointer (Redis, Postgres, etc.)
+   * on `compileOptions.checkpointer`.
    *
-   * No-op when the host opted out via `humanInTheLoop: { enabled: false }`
-   * or already supplied a checkpointer of their own.
+   * No-op when HITL is off (the default — omitted, or
+   * `{ enabled: false }`) or the host already supplied a checkpointer
+   * of their own. See `HumanInTheLoopConfig` JSDoc for the rationale
+   * behind the default-off stance.
    */
   private applyHITLCheckpointerFallback(
     compileOptions: t.CompileOptions | undefined
   ): t.CompileOptions | undefined {
-    if (this.humanInTheLoop?.enabled === false) {
+    if (this.humanInTheLoop?.enabled !== true) {
       return compileOptions;
     }
     if (compileOptions?.checkpointer != null) {
