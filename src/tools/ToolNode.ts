@@ -45,6 +45,10 @@ import {
   buildReferenceKey,
   ToolOutputReferenceRegistry,
 } from '@/tools/toolOutputReferences';
+import {
+  resolveLocalToolRegistry,
+  resolveLocalExecutionTools,
+} from '@/tools/local';
 
 /**
  * Per-call batch context for `runTool`. Bundles every optional
@@ -306,6 +310,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
    * ToolNode building its own.
    */
   private toolOutputRegistry?: ToolOutputReferenceRegistry;
+  /** Run-scoped selection for swapping remote code tools to local executors. */
+  private toolExecution?: t.ToolExecutionConfig;
   /**
    * Monotonic counter used to mint a unique scope id for anonymous
    * batches (ones invoked without a `run_id` in
@@ -335,6 +341,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     humanInTheLoop,
     toolOutputReferences,
     toolOutputRegistry,
+    toolExecution,
   }: t.ToolNodeConstructorParams) {
     super({ name, tags, func: (input, config) => this.run(input, config) });
     this.toolMap = toolMap ?? new Map(tools.map((tool) => [tool.name, tool]));
@@ -343,7 +350,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     this.loadRuntimeTools = loadRuntimeTools;
     this.errorHandler = errorHandler;
     this.toolUsageCount = new Map<string, number>();
-    this.toolRegistry = toolRegistry;
+    this.toolRegistry = resolveLocalToolRegistry({ toolRegistry, toolExecution });
     this.sessions = sessions;
     this.eventDrivenMode = eventDrivenMode ?? false;
     this.agentId = agentId;
@@ -352,6 +359,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       maxToolResultChars ?? calculateMaxToolResultChars(maxContextTokens);
     this.hookRegistry = hookRegistry;
     this.humanInTheLoop = humanInTheLoop;
+    this.toolExecution = toolExecution;
+    this.applyToolExecutionOverrides();
     /**
      * Precedence: an explicitly passed `toolOutputRegistry` instance
      * wins over a config object so a host (`Graph`) can share one
@@ -385,6 +394,31 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     | ToolOutputReferenceRegistry
     | undefined {
     return this.toolOutputRegistry;
+  }
+
+  /**
+   * Replaces known remote Code API tools with local-process tools when
+   * `RunConfig.toolExecution.engine === 'local'`. In event-driven mode those
+   * names are also marked direct so the SDK executes them locally instead of
+   * dispatching the batch to a host-side remote sandbox handler. When the
+   * local coding suite is enabled, this also injects file/search/edit tools.
+   */
+  private applyToolExecutionOverrides(): void {
+    const resolved = resolveLocalExecutionTools({
+      toolMap: this.toolMap,
+      toolExecution: this.toolExecution,
+    });
+
+    this.toolMap = resolved.toolMap;
+    if (resolved.directToolNames.size === 0) {
+      return;
+    }
+
+    this.directToolNames = new Set([
+      ...(this.directToolNames ?? new Set<string>()),
+      ...resolved.directToolNames,
+    ]);
+    this.programmaticCache = undefined;
   }
 
   /**
@@ -823,7 +857,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
       const request = requestMap.get(result.toolCallId);
       if (
-        !request?.name ||
+        request?.name == null ||
+        request.name === '' ||
         (!CODE_EXECUTION_TOOLS.has(request.name) &&
           request.name !== Constants.SKILL_TOOL)
       ) {
@@ -2043,6 +2078,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         );
         this.toolMap =
           toolMap ?? new Map(tools.map((tool) => [tool.name, tool]));
+        this.applyToolExecutionOverrides();
         this.programmaticCache = undefined; // Invalidate cache on toolMap change
       }
 

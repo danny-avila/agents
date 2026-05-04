@@ -212,11 +212,20 @@
     "openai": "^6.35.0",
     "uuid": "^11.1.1"
   },
+  "peerDependencies": {
+    "@anthropic-ai/sandbox-runtime": "^0.0.49"
+  },
+  "peerDependenciesMeta": {
+    "@anthropic-ai/sandbox-runtime": {
+      "optional": true
+    }
+  },
   "imports": {
     "@/*": "./src/*",
     "~/*": "./*"
   },
   "devDependencies": {
+    "@anthropic-ai/sandbox-runtime": "^0.0.49",
     "@anthropic-ai/vertex-sdk": "^0.12.0",
     "@eslint/compat": "^1.2.7",
     "@rollup/plugin-alias": "^5.1.0",

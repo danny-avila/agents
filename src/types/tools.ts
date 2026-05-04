@@ -98,6 +98,12 @@ export type ToolNodeOptions = {
    * precedence over `toolOutputReferences` when both are set.
    */
   toolOutputRegistry?: ToolOutputReferenceRegistry;
+  /**
+   * Selects where built-in code execution tools run. Defaults to the
+   * remote LibreChat Code API sandbox; `local` swaps those same tool names
+   * to process-based local executors at ToolNode construction time.
+   */
+  toolExecution?: ToolExecutionConfig;
 };
 
 export type ToolNodeConstructorParams = ToolRefs & ToolNodeOptions;
@@ -331,6 +337,70 @@ export type ToolOutputReferencesConfig = {
    * `calculateMaxTotalToolOutputSize(maxOutputSize)` (5 MB).
    */
   maxTotalSize?: number;
+};
+
+export type ToolExecutionEngine = 'sandbox' | 'local';
+
+export type LocalSandboxConfig = {
+  /**
+   * Enable Anthropic Sandbox Runtime wrapping for local process tools.
+   * Defaults to false; requires @anthropic-ai/sandbox-runtime to be installed.
+   */
+  enabled?: boolean;
+  /** Throw when native sandbox dependencies are unavailable. Defaults to false. */
+  failIfUnavailable?: boolean;
+  filesystem?: {
+    denyRead?: string[];
+    allowRead?: string[];
+    allowWrite?: string[];
+    denyWrite?: string[];
+    allowGitConfig?: boolean;
+  };
+  network?: {
+    allowedDomains?: string[];
+    deniedDomains?: string[];
+    allowUnixSockets?: string[];
+    allowAllUnixSockets?: boolean;
+    allowLocalBinding?: boolean;
+    allowMachLookup?: string[];
+  };
+};
+
+export type LocalExecutionConfig = {
+  /** Working directory for local commands. Defaults to process.cwd(). */
+  cwd?: string;
+  /** Shell executable for bash-style tools. Defaults to `bash`. */
+  shell?: string;
+  /** Default timeout for local processes, in milliseconds. */
+  timeoutMs?: number;
+  /** Maximum stdout/stderr characters surfaced to the model. */
+  maxOutputChars?: number;
+  /** Extra environment variables merged over process.env. */
+  env?: NodeJS.ProcessEnv;
+  /** Optional process sandboxing via @anthropic-ai/sandbox-runtime. */
+  sandbox?: LocalSandboxConfig;
+  /**
+   * When true, block obviously mutating shell commands before execution.
+   * Useful for read-only agent modes and dry-run workflows.
+   */
+  readOnly?: boolean;
+  /** Permit dangerous commands that the validator otherwise blocks. */
+  allowDangerousCommands?: boolean;
+  /** Permit file tools to resolve paths outside `cwd`. Defaults to false. */
+  allowOutsideWorkspace?: boolean;
+  /**
+   * Add the built-in local coding suite (`read_file`, `write_file`,
+   * `edit_file`, `grep_search`, `glob_search`, `list_directory`, plus local
+   * code/bash execution tools) when `engine` is `local`. Defaults to true.
+   */
+  includeCodingTools?: boolean;
+};
+
+export type ToolExecutionConfig = {
+  /** `sandbox` preserves the remote Code API behavior and is the default. */
+  engine?: ToolExecutionEngine;
+  /** Local process execution settings used when `engine` is `local`. */
+  local?: LocalExecutionConfig;
 };
 
 export type ProgrammaticCache = { toolMap: ToolMap; toolDefs: LCTool[] };

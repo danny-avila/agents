@@ -1,0 +1,135 @@
+import { tool } from '@langchain/core/tools';
+import type { DynamicStructuredTool } from '@langchain/core/tools';
+import type * as t from '@/types';
+import {
+  CodeExecutionToolName,
+  CodeExecutionToolSchema,
+} from '@/tools/CodeExecutor';
+import {
+  BashExecutionToolName,
+  BashExecutionToolSchema,
+  BashToolOutputReferencesGuide,
+} from '@/tools/BashExecutor';
+import {
+  executeLocalBash,
+  executeLocalCode,
+  getLocalCwd,
+  getLocalSessionId,
+  shellQuote,
+} from './LocalExecutionEngine';
+import { Constants } from '@/common';
+
+const emptyOutputMessage =
+  'stdout: Empty. Ensure you\'re writing output explicitly.\n';
+
+export const LocalCodeExecutionToolDescription = `
+Runs code on the local machine in the configured working directory. Unlike the remote Code API sandbox, this tool can see the local repository, installed runtimes, environment variables, and filesystem available to the host process.
+
+Usage:
+- The remote sandbox API remains the default; this description applies only when local execution mode is enabled.
+- Local commands can use the Anthropic sandbox runtime when local.sandbox.enabled=true and @anthropic-ai/sandbox-runtime is installed.
+- Commands execute in the local working directory and may modify local files.
+- Input code is already displayed to the user, so do not repeat it unless asked.
+- Output is not displayed unless you print it explicitly.
+`.trim();
+
+export const LocalBashExecutionToolDescription = `
+Runs bash commands on the local machine in the configured working directory. Unlike the remote Code API sandbox, this tool can see the local repository, installed tools, environment variables, and filesystem available to the host process.
+
+Usage:
+- The remote sandbox API remains the default; this description applies only when local execution mode is enabled.
+- Local commands can use the Anthropic sandbox runtime when local.sandbox.enabled=true and @anthropic-ai/sandbox-runtime is installed.
+- Commands execute in the local working directory and may modify local files.
+- Output is not displayed unless you print it explicitly.
+- Prefer project-native commands and inspect files before changing them.
+`.trim();
+
+function formatLocalOutput(
+  result: { stdout: string; stderr: string; exitCode: number | null; timedOut: boolean },
+  cwd: string
+): string {
+  let formatted = '';
+  if (result.stdout !== '') {
+    formatted += `stdout:\n${result.stdout}\n`;
+  } else {
+    formatted += emptyOutputMessage;
+  }
+
+  if (result.stderr !== '') {
+    formatted += `stderr:\n${result.stderr}\n`;
+  }
+
+  if (result.exitCode != null && result.exitCode !== 0) {
+    formatted += `exit_code: ${result.exitCode}\n`;
+  }
+
+  if (result.timedOut) {
+    formatted += 'timed_out: true\n';
+  }
+
+  formatted += `working_directory: ${cwd}`;
+  return formatted.trim();
+}
+
+export function createLocalCodeExecutionTool(
+  config: t.LocalExecutionConfig = {}
+): DynamicStructuredTool {
+  return tool(
+    async (rawInput) => {
+      const input = rawInput as {
+        lang: string;
+        code: string;
+        args?: string[];
+      };
+      const cwd = getLocalCwd(config);
+      const result = await executeLocalCode(input, config);
+      return [
+        formatLocalOutput(result, cwd),
+        {
+          session_id: getLocalSessionId(config),
+          files: [],
+        },
+      ];
+    },
+    {
+      name: CodeExecutionToolName,
+      description: LocalCodeExecutionToolDescription,
+      schema: CodeExecutionToolSchema,
+      responseFormat: Constants.CONTENT_AND_ARTIFACT,
+    }
+  );
+}
+
+export function createLocalBashExecutionTool(options?: {
+  config?: t.LocalExecutionConfig;
+  enableToolOutputReferences?: boolean;
+}): DynamicStructuredTool {
+  const config = options?.config ?? {};
+  return tool(
+    async (rawInput) => {
+      const input = rawInput as { command: string; args?: string[] };
+      const cwd = getLocalCwd(config);
+      const suffix =
+        input.args && input.args.length > 0
+          ? ` ${input.args.map(shellQuote).join(' ')}`
+          : '';
+      const result = await executeLocalBash(`${input.command}${suffix}`, config);
+      return [
+        formatLocalOutput(result, cwd),
+        {
+          session_id: getLocalSessionId(config),
+          files: [],
+        },
+      ];
+    },
+    {
+      name: BashExecutionToolName,
+      description:
+        options?.enableToolOutputReferences === true
+          ? `${LocalBashExecutionToolDescription}\n\n${BashToolOutputReferencesGuide}`
+          : LocalBashExecutionToolDescription,
+      schema: BashExecutionToolSchema,
+      responseFormat: Constants.CONTENT_AND_ARTIFACT,
+    }
+  );
+}

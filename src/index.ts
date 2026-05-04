@@ -26,6 +26,7 @@ export * from './tools/ToolSearch';
 export * from './tools/ToolNode';
 export * from './tools/schema';
 export * from './tools/handlers';
+export * from './tools/local';
 export * from './tools/search';
 
 /* Misc. */

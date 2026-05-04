@@ -53,6 +53,7 @@ import { createSchemaOnlyTools } from '@/tools/schema';
 import { AgentContext } from '@/agents/AgentContext';
 import { createFakeStreamingLLM } from '@/llm/fake';
 import { handleToolCalls } from '@/tools/handlers';
+import { resolveLocalToolsForBinding } from '@/tools/local';
 import { isThinkingEnabled } from '@/llm/request';
 import { initializeModel } from '@/llm/init';
 import { HandlerRegistry } from '@/events';
@@ -143,6 +144,11 @@ export abstract class Graph<
    */
   toolOutputReferences: t.ToolOutputReferencesConfig | undefined;
   /**
+   * Run-scoped execution backend for built-in code tools. Defaults to the
+   * remote Code API sandbox when unset.
+   */
+  toolExecution: t.ToolExecutionConfig | undefined;
+  /**
    * Shared registry instance used by every ToolNode compiled from this
    * graph. Lazily constructed on first access so multi-agent graphs
    * produce one registry per run (not one per agent), letting cross-
@@ -176,6 +182,7 @@ export abstract class Graph<
     this.hookRegistry = undefined;
     this.humanInTheLoop = undefined;
     this.toolOutputReferences = undefined;
+    this.toolExecution = undefined;
     /**
      * ToolNodes compiled from this graph captured the registry
      * instance at construction time, so simply dropping the Graph's
@@ -588,6 +595,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         toolRegistry: agentContext?.toolRegistry,
         hookRegistry: this.hookRegistry,
         humanInTheLoop: this.humanInTheLoop,
+        toolExecution: this.toolExecution,
         directToolNames: directToolNames.size > 0 ? directToolNames : undefined,
         maxContextTokens: agentContext?.maxContextTokens,
         maxToolResultChars: agentContext?.maxToolResultChars,
@@ -621,6 +629,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         StandardGraph.handleToolCallErrorStatic(this, data, metadata),
       toolRegistry: agentContext?.toolRegistry,
       sessions: this.sessions,
+      toolExecution: this.toolExecution,
       maxContextTokens: agentContext?.maxContextTokens,
       maxToolResultChars: agentContext?.maxToolResultChars,
       toolOutputRegistry: this.getOrCreateToolOutputRegistry(),
@@ -688,7 +697,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         agentContext.markToolsAsDiscovered(discoveredNames);
       }
 
-      const toolsForBinding = agentContext.getToolsForBinding();
+      const toolsForBinding = resolveLocalToolsForBinding({
+        tools: agentContext.getToolsForBinding(),
+        toolExecution: this.toolExecution,
+      });
       let model =
         this.overrideModel ??
         initializeModel({
