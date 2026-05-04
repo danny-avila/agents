@@ -455,6 +455,19 @@ async function runOurs(
     [GraphEvents.TOOL_END]: new ToolEndHandler(),
     [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(),
     [GraphEvents.CHAT_MODEL_STREAM]: new ChatModelStreamHandler(),
+    // ON_RUN_STEP must be forwarded too — without it the aggregator's
+    // `stepMap` is empty when ON_RUN_STEP_COMPLETED arrives and you
+    // get a "No run step or runId found for completed step event"
+    // warn for every tool call. The harness doesn't actually use the
+    // aggregated content, but feeding both events keeps logs clean.
+    [GraphEvents.ON_RUN_STEP]: {
+      handle: (
+        event: GraphEvents.ON_RUN_STEP,
+        data: t.StreamEventData
+      ): void => {
+        aggregateContent({ event, data: data as t.RunStep });
+      },
+    },
     [GraphEvents.ON_RUN_STEP_COMPLETED]: {
       handle: (
         event: GraphEvents.ON_RUN_STEP_COMPLETED,
