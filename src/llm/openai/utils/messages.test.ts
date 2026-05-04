@@ -557,6 +557,58 @@ describe('_convertMessagesToOpenAIParams', () => {
       expect(out[0]).toBeInstanceOf(AIMessage);
       expect(out[0].content).toBe('');
     });
+
+    it('preserves block order across interleaved thinking, text, and redacted_thinking', () => {
+      const out = flattenAnthropicThinkingForOpenAI(
+        [
+          new AIMessage({
+            content: [
+              { type: 'thinking', thinking: 'first', signature: 's1' },
+              { type: 'text', text: 'one' },
+              { type: 'redacted_thinking', data: 'opaque' },
+              { type: 'text', text: 'two' },
+              { type: 'thinking', thinking: '', signature: 's2' },
+              { type: 'text', text: 'three' },
+              { type: 'thinking', thinking: 'last', signature: 's3' },
+            ] as never,
+          }),
+        ],
+        'gpt-5.4-mini'
+      );
+
+      expect(out[0].content).toEqual([
+        { type: 'text', text: '<thinking>first</thinking>' },
+        { type: 'text', text: 'one' },
+        { type: 'text', text: 'two' },
+        { type: 'text', text: 'three' },
+        { type: 'text', text: '<thinking>last</thinking>' },
+      ]);
+    });
+
+    it('keeps untouched AI messages reference-equal when other AI messages in the array were rewritten', () => {
+      const unchanged = new AIMessage({
+        content: [
+          { type: 'text', text: 'just text' },
+          { type: 'text', text: 'no thinking here' },
+        ] as never,
+      });
+      const rewriteCandidate = new AIMessage({
+        content: [
+          { type: 'thinking', thinking: 'reason', signature: 'sig' },
+          { type: 'text', text: 'answer' },
+        ] as never,
+      });
+
+      const out = flattenAnthropicThinkingForOpenAI(
+        [unchanged, rewriteCandidate],
+        'gpt-5.4-mini'
+      );
+
+      // Sanity: outer array did mutate
+      expect(out[1]).not.toBe(rewriteCandidate);
+      // Critical: untouched AI message must be the same reference
+      expect(out[0]).toBe(unchanged);
+    });
   });
 
   describe('_convertMessagesToOpenAIResponsesParams cross-provider thinking', () => {

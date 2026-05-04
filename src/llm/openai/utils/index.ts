@@ -326,36 +326,36 @@ export function flattenAnthropicThinkingForOpenAI(
       return msg;
     }
     let blockChanged = false;
-    const rewritten = msg.content
-      .map((block) => {
-        if (
-          block != null &&
-          typeof block === 'object' &&
-          'type' in block &&
-          (block as { type?: string }).type === 'thinking'
-        ) {
-          blockChanged = true;
-          const thinking = (block as { thinking?: string }).thinking ?? '';
-          if (!thinking) {
-            return null;
-          }
-          return {
+    const rewritten = msg.content.flatMap((block) => {
+      if (
+        block != null &&
+        typeof block === 'object' &&
+        'type' in block &&
+        (block as { type?: string }).type === 'thinking'
+      ) {
+        blockChanged = true;
+        const thinking = (block as { thinking?: string }).thinking ?? '';
+        if (!thinking) {
+          return [];
+        }
+        return [
+          {
             type: 'text' as const,
             text: `<thinking>${thinking}</thinking>`,
-          };
-        }
-        if (
-          block != null &&
-          typeof block === 'object' &&
-          'type' in block &&
-          (block as { type?: string }).type === 'redacted_thinking'
-        ) {
-          blockChanged = true;
-          return null;
-        }
-        return block;
-      })
-      .filter(<T>(b: T | null): b is T => b !== null);
+          },
+        ];
+      }
+      if (
+        block != null &&
+        typeof block === 'object' &&
+        'type' in block &&
+        (block as { type?: string }).type === 'redacted_thinking'
+      ) {
+        blockChanged = true;
+        return [];
+      }
+      return [block];
+    });
     if (!blockChanged) {
       return msg;
     }
