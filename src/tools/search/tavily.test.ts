@@ -157,6 +157,44 @@ describe('Tavily search API', () => {
     expect(payload).not.toHaveProperty('safe_search');
   });
 
+  it('prioritizes request-level news mode over configured Tavily topic', async () => {
+    mockedAxios.post.mockResolvedValueOnce({
+      data: {
+        results: [
+          {
+            title: 'Market news',
+            url: 'https://example.com/news',
+            content: 'A news result',
+            published_date: '2026-01-03',
+          },
+        ],
+      },
+    });
+
+    const searchAPI = createSearchAPI({
+      searchProvider: 'tavily',
+      tavilyApiKey: 'test-key',
+      tavilySearchOptions: {
+        topic: 'finance',
+      },
+    });
+
+    const result = await searchAPI.getSources({
+      query: 'example query',
+      type: 'news',
+    });
+    const [, payload] = mockedAxios.post.mock.calls[0];
+
+    expect(payload).toMatchObject({
+      query: 'example query',
+      topic: 'news',
+    });
+    expect(result.data?.news?.[0]).toMatchObject({
+      title: 'Market news',
+      link: 'https://example.com/news',
+    });
+  });
+
   it('maps ISO country codes to Tavily country enum values', async () => {
     mockedAxios.post.mockResolvedValueOnce({
       data: {
@@ -308,6 +346,36 @@ describe('Tavily search API', () => {
     expect(payload).toMatchObject({
       query: 'example query',
       safe_search: true,
+    });
+  });
+
+  it('lets explicit tool safe search override Tavily option safe search', async () => {
+    mockedAxios.post.mockResolvedValue({
+      data: {
+        results: [],
+      },
+    });
+
+    const searchTool = createSearchTool({
+      searchProvider: 'tavily',
+      tavilyApiKey: 'test-key',
+      scraperProvider: 'tavily',
+      rerankerType: 'none',
+      logger: mockLogger,
+      safeSearch: 0,
+      tavilySearchOptions: {
+        safeSearch: true,
+      },
+    });
+
+    await searchTool.invoke({
+      query: 'example query',
+    });
+    const [, payload] = mockedAxios.post.mock.calls[0];
+
+    expect(payload).toMatchObject({
+      query: 'example query',
+      safe_search: false,
     });
   });
 

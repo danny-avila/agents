@@ -291,8 +291,9 @@ export const createTavilyAPI = (
         normalizeTavilyTimeRange(options?.timeRange) ??
         (date != null ? (normalizeTavilyTimeRange(date) ?? 'day') : undefined);
       const topic =
-        options?.topic ??
-        (news === true || type === 'news' ? 'news' : 'general');
+        news === true || type === 'news'
+          ? 'news'
+          : (options?.topic ?? 'general');
       const maxResults = options?.maxResults ?? numResults;
       const searchDepth = options?.searchDepth ?? 'basic';
 
