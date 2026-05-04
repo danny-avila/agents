@@ -12,6 +12,13 @@ import type * as t from '@/types';
 
 const DEFAULT_TIMEOUT_MS = 60000;
 const DEFAULT_MAX_OUTPUT_CHARS = 200000;
+/**
+ * Hard cap on total stdout+stderr bytes a child process can stream
+ * before we kill its process tree. Independent from `maxOutputChars`
+ * (which only affects what the *model* sees) — this is the OOM
+ * backstop. Configurable via `local.maxSpawnedBytes`.
+ */
+const DEFAULT_MAX_SPAWNED_BYTES = 50 * 1024 * 1024;
 const DEFAULT_LOCAL_SESSION_ID = 'local';
 const DEFAULT_SHELL = process.platform === 'win32' ? 'bash.exe' : 'bash';
 
@@ -430,6 +437,16 @@ export async function spawnLocalProcess(
   const cwd = getLocalCwd(config);
   const timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxOutputChars = config.maxOutputChars ?? DEFAULT_MAX_OUTPUT_CHARS;
+  // Streaming caps. Local tools execute arbitrary shell/code, so a noisy
+  // command (`yes`, `cat /dev/urandom | base64`, a verbose build) could
+  // accumulate gigabytes in memory before hitting the post-close cap.
+  // We bound in-memory per-stream and spill the rest to disk; we also
+  // hard-kill the child once total streamed bytes pass `maxSpawnedBytes`
+  // so a process producing unbounded output gets stopped instead of
+  // letting the host OOM.
+  const inMemoryCapBytes = maxOutputChars * 2;
+  const hardKillBytes =
+    config.maxSpawnedBytes ?? DEFAULT_MAX_SPAWNED_BYTES;
   const sandboxManager = await ensureSandbox(config, cwd);
   if (sandboxManager == null) {
     maybeWarnSandboxOff(config);
@@ -455,9 +472,54 @@ export async function spawnLocalProcess(
 
     let stdout = '';
     let stderr = '';
+    let totalSpawnedBytes = 0;
+    let overflowKilled = false;
+    let spillStream: import('fs').WriteStream | undefined;
+    let spillPath: string | undefined;
     let settled = false;
     let timedOut = false;
     let timeout: NodeJS.Timeout | undefined;
+
+    const ensureSpill = (): void => {
+      if (spillStream != null) return;
+      // Lazy-open the temp file the first time a stream's in-memory
+      // buffer overflows. Seed it with everything we've buffered so
+      // the file holds the FULL output (not just the post-cap tail).
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const fs = require('fs') as typeof import('fs');
+      spillPath = resolve(tmpdir(), `lc-local-output-${randomUUID()}.txt`);
+      spillStream = fs.createWriteStream(spillPath);
+      spillStream.write('===== stdout =====\n');
+      spillStream.write(stdout);
+      spillStream.write('\n===== stderr =====\n');
+      spillStream.write(stderr);
+      spillStream.write('\n===== overflow stream begins here =====\n');
+    };
+
+    const handleChunk = (
+      buf: Buffer,
+      kind: 'stdout' | 'stderr'
+    ): void => {
+      totalSpawnedBytes += buf.length;
+      if (totalSpawnedBytes > hardKillBytes && !overflowKilled) {
+        overflowKilled = true;
+        killProcessTree(child);
+        return;
+      }
+      const current = kind === 'stdout' ? stdout : stderr;
+      if (current.length < inMemoryCapBytes) {
+        const text = buf.toString('utf8');
+        if (kind === 'stdout') stdout += text;
+        else stderr += text;
+        if (current.length + text.length >= inMemoryCapBytes) {
+          ensureSpill();
+        }
+      } else {
+        ensureSpill();
+        spillStream!.write(`[${kind}] `);
+        spillStream!.write(buf);
+      }
+    };
 
     const finish = (result: SpawnResult): void => {
       if (settled) {
@@ -467,37 +529,25 @@ export async function spawnLocalProcess(
       if (timeout != null) {
         clearTimeout(timeout);
       }
-      const overflows =
-        result.stdout.length + result.stderr.length > maxOutputChars * 2;
-      const truncated = {
-        stdout: truncateLocalOutput(result.stdout, maxOutputChars),
-        stderr: truncateLocalOutput(result.stderr, maxOutputChars),
+      const finalize = (): void => {
+        const truncated = {
+          stdout: truncateLocalOutput(result.stdout, maxOutputChars),
+          stderr: truncateLocalOutput(result.stderr, maxOutputChars),
+        };
+        resolveResult({
+          ...result,
+          ...truncated,
+          ...(spillPath != null ? { fullOutputPath: spillPath } : {}),
+        });
       };
-      if (!overflows) {
-        resolveResult({ ...result, ...truncated });
+      if (spillStream == null) {
+        finalize();
         return;
       }
-      const tmpPath = resolve(
-        tmpdir(),
-        `lc-local-output-${randomUUID()}.txt`
-      );
-      const fullPayload =
-        '===== stdout =====\n' +
-        result.stdout +
-        '\n===== stderr =====\n' +
-        result.stderr +
-        '\n';
-      writeFile(tmpPath, fullPayload, 'utf8')
-        .then(() => {
-          resolveResult({
-            ...result,
-            ...truncated,
-            fullOutputPath: tmpPath,
-          });
-        })
-        .catch(() => {
-          resolveResult({ ...result, ...truncated });
-        });
+      // Wait for the temp file to flush before reporting the path.
+      // Otherwise the model sees `full_output_path: …` for a file
+      // that's still being written.
+      spillStream.end(() => finalize());
     };
 
     const fail = (error: Error): void => {
@@ -507,6 +557,9 @@ export async function spawnLocalProcess(
       settled = true;
       if (timeout != null) {
         clearTimeout(timeout);
+      }
+      if (spillStream != null) {
+        spillStream.end();
       }
       reject(error);
     };
@@ -519,11 +572,11 @@ export async function spawnLocalProcess(
     }
 
     child.stdout?.on('data', (chunk: Buffer) => {
-      stdout += chunk.toString('utf8');
+      handleChunk(chunk, 'stdout');
     });
 
     child.stderr?.on('data', (chunk: Buffer) => {
-      stderr += chunk.toString('utf8');
+      handleChunk(chunk, 'stderr');
     });
 
     child.on('error', fail);
@@ -552,8 +605,12 @@ export async function executeLocalBash(
  * do in `getRuntimeCommand`. Uses the standard `bash -c <code> --
  * arg0 arg1 …` form: the `--` becomes `$0`, then `args[0]` is `$1`
  * and so on. Same AST validation as the no-args path.
+ *
+ * Used by both the `execute_code`/`lang:'bash'` path AND the
+ * `bash_tool` factory so the schema's `args` contract works
+ * identically in both surfaces.
  */
-async function executeLocalBashWithArgs(
+export async function executeLocalBashWithArgs(
   command: string,
   args: readonly string[],
   config: t.LocalExecutionConfig = {}

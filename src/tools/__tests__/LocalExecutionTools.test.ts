@@ -817,3 +817,89 @@ describe('codex review fixes', () => {
     });
   });
 });
+
+describe('codex review fixes (round 2)', () => {
+  describe('streaming output cap (Codex P1)', () => {
+    const { spawnLocalProcess, _resetLocalEngineWarningsForTests: _ } = require('../local/LocalExecutionEngine');
+
+    it('hard-kills the child when total streamed bytes exceed maxSpawnedBytes', async () => {
+      // Cap at 64 KiB. `yes` would otherwise run unbounded.
+      const start = Date.now();
+      const result = await spawnLocalProcess('yes', [], {
+        timeoutMs: 30_000,
+        maxSpawnedBytes: 64 * 1024,
+        sandbox: { enabled: false },
+      });
+      const elapsed = Date.now() - start;
+      // Killed promptly (much sooner than the 30s timeout).
+      expect(elapsed).toBeLessThan(5000);
+      // Process was killed by the overflow guard, not by timeout.
+      expect(result.timedOut).toBe(false);
+      expect(result.exitCode).not.toBe(0);
+      // We DID see some output before the kill.
+      expect(result.stdout.length).toBeGreaterThan(0);
+    });
+
+    it('spills overflow to a temp file (full output recoverable post-cap)', async () => {
+      // Generate ~200 KiB of output with a 32 KiB inline cap → spill.
+      const result = await spawnLocalProcess(
+        'bash',
+        ['-c', 'head -c 200000 /dev/urandom | base64 | head -c 200000'],
+        {
+          timeoutMs: 10_000,
+          maxOutputChars: 8_000, // inline cap = 16 KiB; ~200 KiB → overflow
+          maxSpawnedBytes: 1024 * 1024, // 1 MiB hard cap
+          sandbox: { enabled: false },
+        }
+      );
+      expect(result.exitCode).toBe(0);
+      expect(result.fullOutputPath).toBeTruthy();
+      const fs = await import('fs/promises');
+      const spilled = await fs.readFile(result.fullOutputPath as string, 'utf8');
+      // The spill file holds more bytes than the in-memory truncation.
+      expect(spilled.length).toBeGreaterThan(result.stdout.length);
+    });
+
+    it('does not create a spill file for small outputs', async () => {
+      const result = await spawnLocalProcess('bash', ['-c', 'echo small'], {
+        timeoutMs: 5_000,
+        sandbox: { enabled: false },
+      });
+      expect(result.fullOutputPath).toBeUndefined();
+      expect(result.stdout.trim()).toBe('small');
+    });
+  });
+
+  describe('bash_tool args (Codex P2)', () => {
+    it('populates positional shell parameters from input.args', async () => {
+      const cwd = await createTempDir();
+      const bundle = createLocalCodingToolBundle({ cwd });
+      const bashTool = bundle.tools.find(
+        (tt) => tt.name === Constants.BASH_TOOL
+      );
+      const result = await bashTool!.invoke({
+        id: 'b1',
+        name: Constants.BASH_TOOL,
+        args: { command: 'echo "first=$1 second=$2"', args: ['hello', 'world'] },
+        type: 'tool_call',
+      });
+      const text = JSON.stringify(result);
+      expect(text).toContain('first=hello second=world');
+    });
+
+    it('still works when args is missing', async () => {
+      const cwd = await createTempDir();
+      const bundle = createLocalCodingToolBundle({ cwd });
+      const bashTool = bundle.tools.find(
+        (tt) => tt.name === Constants.BASH_TOOL
+      );
+      const result = await bashTool!.invoke({
+        id: 'b2',
+        name: Constants.BASH_TOOL,
+        args: { command: 'echo plain' },
+        type: 'tool_call',
+      });
+      expect(JSON.stringify(result)).toContain('plain');
+    });
+  });
+});

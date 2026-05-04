@@ -12,10 +12,10 @@ import {
 } from '@/tools/BashExecutor';
 import {
   executeLocalBash,
+  executeLocalBashWithArgs,
   executeLocalCode,
   getLocalCwd,
   getLocalSessionId,
-  shellQuote,
 } from './LocalExecutionEngine';
 import { Constants } from '@/common';
 
@@ -119,11 +119,16 @@ export function createLocalBashExecutionTool(options?: {
     async (rawInput) => {
       const input = rawInput as { command: string; args?: string[] };
       const cwd = getLocalCwd(config);
-      const suffix =
-        input.args && input.args.length > 0
-          ? ` ${input.args.map(shellQuote).join(' ')}`
-          : '';
-      const result = await executeLocalBash(`${input.command}${suffix}`, config);
+      // Use the standard `bash -lc <command> -- <args...>` form so
+      // `$1`, `$2`, … resolve correctly inside `command`. The
+      // previous implementation appended args literally to the
+      // command string (`${command} ${args.join(' ')}`), which
+      // doesn't populate positional parameters and silently broke
+      // shell snippets like `command: 'echo "$1"'`.
+      const result =
+        input.args != null && input.args.length > 0
+          ? await executeLocalBashWithArgs(input.command, input.args, config)
+          : await executeLocalBash(input.command, config);
       return [
         formatLocalOutput(result, cwd),
         {

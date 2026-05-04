@@ -474,6 +474,16 @@ export type LocalExecutionConfig = {
   timeoutMs?: number;
   /** Maximum stdout/stderr characters surfaced to the model. */
   maxOutputChars?: number;
+  /**
+   * Hard cap on total bytes a single child process can stream across
+   * stdout+stderr before its process tree is killed. Independent from
+   * `maxOutputChars` (which controls what the model sees); this is the
+   * OOM backstop for noisy / runaway commands (`yes`, `cat /dev/urandom`,
+   * a verbose build that loops). Defaults to 50 MiB. Set higher for
+   * legitimately large logs; setting to 0 disables the cap and risks
+   * an OOM crash on the host.
+   */
+  maxSpawnedBytes?: number;
   /** Extra environment variables merged over process.env. */
   env?: NodeJS.ProcessEnv;
   /** Optional process sandboxing via @anthropic-ai/sandbox-runtime. */
