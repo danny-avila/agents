@@ -52,9 +52,14 @@ export type ToolNodeOptions = {
   /** Tool names that must be executed directly (via runTool) even in event-driven mode (e.g., graph-managed handoff tools) */
   directToolNames?: Set<string>;
   /**
-   * Hook registry for PreToolUse/PostToolUse lifecycle hooks.
-   * Only fires for event-driven tool calls (`dispatchToolEvents`). Tools
-   * routed through `directToolNames` bypass hook dispatch entirely.
+   * Hook registry for PreToolUse/PostToolUse/PostToolUseFailure/
+   * PermissionDenied lifecycle hooks. Fires for **every** tool the
+   * ToolNode invokes — both event-dispatched tools (via
+   * `dispatchToolEvents`) and direct-path tools (via
+   * `runDirectToolWithLifecycleHooks`). The pre-existing limitation
+   * that direct-path tools "bypass hook dispatch entirely" was
+   * lifted in a follow-up to the HITL surface; both paths now route
+   * through the same hook lifecycle.
    */
   hookRegistry?: HookRegistry;
   /**
@@ -70,9 +75,11 @@ export type ToolNodeOptions = {
    *
    * Mirrors `RunConfig.humanInTheLoop` (which is the canonical place
    * to set this); the Graph threads it down to every ToolNode it
-   * compiles. Same caveat: the interrupt path is only wired into the
-   * event-driven dispatch (`dispatchToolEvents`), not into
-   * `directToolNames` execution — direct tools bypass HITL entirely.
+   * compiles. The interrupt path is wired into both the event
+   * dispatch (`dispatchToolEvents`) and the direct path
+   * (`runDirectToolWithLifecycleHooks`) — direct tools no longer
+   * bypass HITL. See `HumanInTheLoopConfig` for the resume re-execution
+   * contract that applies equally to both paths.
    */
   humanInTheLoop?: HumanInTheLoopConfig;
   /** Max context tokens for the agent — used to compute tool result truncation limits. */
