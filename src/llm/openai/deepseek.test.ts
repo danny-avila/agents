@@ -1,5 +1,6 @@
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
+import type { ChatGenerationChunk } from '@langchain/core/outputs';
 import type { OpenAIClient } from '@langchain/openai';
 
 import { ChatDeepSeek } from './index';
@@ -44,6 +45,14 @@ class CapturingChatDeepSeek extends ChatDeepSeek {
     }
 
     return createCompletion();
+  }
+
+  streamChunksWithSignal(
+    signal: AbortSignal
+  ): AsyncGenerator<ChatGenerationChunk> {
+    return this._streamResponseChunks([new HumanMessage('hi')], {
+      signal,
+    } as this['ParsedCallOptions']);
   }
 }
 
@@ -150,6 +159,12 @@ function getReasoningAssistantMessage(
   return request.messages[0] as ReasoningAssistantMessageParam;
 }
 
+async function drainStream(stream: AsyncIterable<unknown>): Promise<void> {
+  for await (const chunk of stream) {
+    void chunk;
+  }
+}
+
 describe('ChatDeepSeek', () => {
   it('passes reasoning_content back on same-run streaming tool continuations', async () => {
     const model = new CapturingChatDeepSeek({
@@ -235,5 +250,62 @@ describe('ChatDeepSeek', () => {
     expect(callbackTokens.join('')).not.toContain('hidden');
     expect(callbackTokens.join('')).not.toContain('think');
     expect(hasHiddenReasoning).toBe(true);
+  });
+
+  it('keeps multiple raw think fallback blocks hidden from content and callbacks', async () => {
+    const model = new CapturingChatDeepSeek(
+      {
+        apiKey: 'test-key',
+        model: 'deepseek-v4-pro',
+        streaming: true,
+      },
+      [
+        createContentChunk(
+          'before<think>hidden one</think>visible<think>hidden two</think>done'
+        ),
+      ]
+    );
+    const chunks = [];
+    const callbackTokens: string[] = [];
+
+    const stream = await model.stream([new HumanMessage('hi')], {
+      callbacks: [
+        {
+          handleLLMNewToken(token: string): void {
+            callbackTokens.push(token);
+          },
+        },
+      ],
+    });
+
+    for await (const chunk of stream) {
+      chunks.push(chunk);
+    }
+
+    const streamedText = chunks
+      .map((chunk) => (typeof chunk.content === 'string' ? chunk.content : ''))
+      .join('');
+    const reasoningContent = chunks
+      .map((chunk) => chunk.additional_kwargs.reasoning_content)
+      .filter((content): content is string => typeof content === 'string');
+
+    expect(streamedText).toBe('beforevisibledone');
+    expect(callbackTokens.join('')).toBe('beforevisibledone');
+    expect(reasoningContent).toEqual(['hidden one', 'hidden two']);
+  });
+
+  it('throws AbortError when a DeepSeek stream is canceled', async () => {
+    const controller = new AbortController();
+    const model = new CapturingChatDeepSeek({
+      apiKey: 'test-key',
+      model: 'deepseek-v4-pro',
+      streaming: true,
+    });
+
+    controller.abort();
+
+    await expect(
+      drainStream(model.streamChunksWithSignal(controller.signal))
+    ).rejects.toThrow('AbortError');
   });
 });

@@ -1413,7 +1413,7 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
 
     for await (const chunk of stream) {
       if (options.signal?.aborted === true) {
-        return;
+        throw new Error('AbortError');
       }
 
       const reasoningContent =
@@ -1431,77 +1431,57 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
 
       tokensBuffer += text;
 
-      if (!isThinking && tokensBuffer.includes(thinkStartTag)) {
-        isThinking = true;
-        const thinkIndex = tokensBuffer.indexOf(thinkStartTag);
-        const beforeThink = tokensBuffer.substring(0, thinkIndex);
-        tokensBuffer =
-          tokensBuffer.substring(thinkIndex + thinkStartTag.length) || '';
+      while (tokensBuffer !== '') {
+        if (isThinking) {
+          const thinkEndIndex = tokensBuffer.indexOf(thinkEndTag);
+          if (thinkEndIndex !== -1) {
+            const thoughtContent = tokensBuffer.substring(0, thinkEndIndex);
+            if (thoughtContent !== '') {
+              yield* this._yieldDeepSeekStreamChunk(
+                this._createDeepSeekStreamChunk(
+                  chunk,
+                  '',
+                  {
+                    ...chunk.message.additional_kwargs,
+                    reasoning_content: thoughtContent,
+                  },
+                  ''
+                ),
+                runManager
+              );
+            }
 
-        if (beforeThink !== '') {
-          yield* this._yieldDeepSeekStreamChunk(
-            this._createDeepSeekStreamChunk(chunk, beforeThink),
-            runManager
+            tokensBuffer = tokensBuffer.substring(
+              thinkEndIndex + thinkEndTag.length
+            );
+            isThinking = false;
+            continue;
+          }
+
+          const splitIndex = this._getDeepSeekPartialTagSplitIndex(
+            tokensBuffer,
+            thinkEndTag
           );
-        }
-      }
-
-      if (isThinking && tokensBuffer.includes(thinkEndTag)) {
-        isThinking = false;
-        const thinkEndIndex = tokensBuffer.indexOf(thinkEndTag);
-        const thoughtContent = tokensBuffer.substring(0, thinkEndIndex);
-        const afterThink = tokensBuffer.substring(
-          thinkEndIndex + thinkEndTag.length
-        );
-
-        yield* this._yieldDeepSeekStreamChunk(
-          this._createDeepSeekStreamChunk(
-            chunk,
-            '',
-            {
-              ...chunk.message.additional_kwargs,
-              reasoning_content: thoughtContent,
-            },
-            ''
-          ),
-          runManager
-        );
-
-        tokensBuffer = afterThink || '';
-        if (tokensBuffer !== '') {
-          yield* this._yieldDeepSeekStreamChunk(
-            this._createDeepSeekStreamChunk(chunk, tokensBuffer),
-            runManager
-          );
-          tokensBuffer = '';
-        }
-      } else if (isThinking) {
-        let splitIndex = -1;
-        for (let i = thinkEndTag.length - 1; i >= 1; i--) {
-          if (tokensBuffer.endsWith(thinkEndTag.substring(0, i))) {
-            splitIndex = tokensBuffer.length - i;
+          if (splitIndex !== -1) {
+            const safeToYield = tokensBuffer.substring(0, splitIndex);
+            if (safeToYield !== '') {
+              yield* this._yieldDeepSeekStreamChunk(
+                this._createDeepSeekStreamChunk(
+                  chunk,
+                  '',
+                  {
+                    ...chunk.message.additional_kwargs,
+                    reasoning_content: safeToYield,
+                  },
+                  ''
+                ),
+                runManager
+              );
+            }
+            tokensBuffer = tokensBuffer.substring(splitIndex);
             break;
           }
-        }
 
-        if (splitIndex !== -1) {
-          const safeToYield = tokensBuffer.substring(0, splitIndex);
-          if (safeToYield !== '') {
-            yield* this._yieldDeepSeekStreamChunk(
-              this._createDeepSeekStreamChunk(
-                chunk,
-                '',
-                {
-                  ...chunk.message.additional_kwargs,
-                  reasoning_content: safeToYield,
-                },
-                ''
-              ),
-              runManager
-            );
-          }
-          tokensBuffer = tokensBuffer.substring(splitIndex);
-        } else if (tokensBuffer !== '') {
           yield* this._yieldDeepSeekStreamChunk(
             this._createDeepSeekStreamChunk(
               chunk,
@@ -1515,16 +1495,30 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
             runManager
           );
           tokensBuffer = '';
-        }
-      } else {
-        let splitIndex = -1;
-        for (let i = thinkStartTag.length - 1; i >= 1; i--) {
-          if (tokensBuffer.endsWith(thinkStartTag.substring(0, i))) {
-            splitIndex = tokensBuffer.length - i;
-            break;
-          }
+          break;
         }
 
+        const thinkStartIndex = tokensBuffer.indexOf(thinkStartTag);
+        if (thinkStartIndex !== -1) {
+          const beforeThink = tokensBuffer.substring(0, thinkStartIndex);
+          if (beforeThink !== '') {
+            yield* this._yieldDeepSeekStreamChunk(
+              this._createDeepSeekStreamChunk(chunk, beforeThink),
+              runManager
+            );
+          }
+
+          tokensBuffer = tokensBuffer.substring(
+            thinkStartIndex + thinkStartTag.length
+          );
+          isThinking = true;
+          continue;
+        }
+
+        const splitIndex = this._getDeepSeekPartialTagSplitIndex(
+          tokensBuffer,
+          thinkStartTag
+        );
         if (splitIndex !== -1) {
           const safeToYield = tokensBuffer.substring(0, splitIndex);
           if (safeToYield !== '') {
@@ -1534,13 +1528,15 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
             );
           }
           tokensBuffer = tokensBuffer.substring(splitIndex);
-        } else if (tokensBuffer !== '') {
-          yield* this._yieldDeepSeekStreamChunk(
-            this._createDeepSeekStreamChunk(chunk, tokensBuffer),
-            runManager
-          );
-          tokensBuffer = '';
+          break;
         }
+
+        yield* this._yieldDeepSeekStreamChunk(
+          this._createDeepSeekStreamChunk(chunk, tokensBuffer),
+          runManager
+        );
+        tokensBuffer = '';
+        break;
       }
     }
 
@@ -1602,7 +1598,7 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
 
     for await (const data of streamIterable) {
       if (options.signal?.aborted === true) {
-        return;
+        throw new Error('AbortError');
       }
 
       if (data.usage != null) {
@@ -1675,7 +1671,7 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
     }
 
     if (options.signal?.aborted === true) {
-      return;
+      throw new Error('AbortError');
     }
   }
 
@@ -1726,6 +1722,19 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
     }
 
     return undefined;
+  }
+
+  protected _getDeepSeekPartialTagSplitIndex(
+    text: string,
+    tag: string
+  ): number {
+    for (let i = tag.length - 1; i >= 1; i--) {
+      if (text.endsWith(tag.substring(0, i))) {
+        return text.length - i;
+      }
+    }
+
+    return -1;
   }
 }
 
