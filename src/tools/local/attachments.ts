@@ -33,7 +33,7 @@
  *     refusal so the model isn't surprised.
  */
 
-import { readFile } from 'fs/promises';
+import { open, readFile } from 'fs/promises';
 
 /**
  * Magic-byte sniff for the small set of image/PDF formats we care
@@ -158,8 +158,20 @@ export async function classifyAttachment(args: {
     return { kind: 'text-or-unknown', bytes: 0 };
   }
 
-  const buffer = await readFile(args.path);
-  const mime = sniffMime(buffer);
+  // MIME sniffing only needs the first 12 bytes — read just the
+  // header so a 9 MB PNG (under the 10 MB read cap, over the 5 MB
+  // attachment cap) doesn't pull the whole buffer into memory before
+  // we discover it's oversize. Full read happens only when we're
+  // about to base64-embed.
+  const handle = await open(args.path, 'r');
+  const header = Buffer.alloc(12);
+  let mime: string | undefined;
+  try {
+    await handle.read(header, 0, 12, 0);
+    mime = sniffMime(header);
+  } finally {
+    await handle.close();
+  }
 
   if (mime == null) {
     return { kind: 'text-or-unknown', bytes: args.bytes };
@@ -188,6 +200,7 @@ export async function classifyAttachment(args: {
     };
   }
 
+  const buffer = await readFile(args.path);
   const base64 = buffer.toString('base64');
   const dataUrl = `data:${mime};base64,${base64}`;
 

@@ -81,6 +81,12 @@ async function probe(
   return probePromise;
 }
 
+/**
+ * Test-only reset hook. Clears the per-backend probe cache so tests
+ * can swap in mocked spawn backends and reprobe deterministically.
+ *
+ * @internal Not part of the public SDK surface.
+ */
 export function _resetSyntaxCheckProbeCacheForTests(): void {
   probeCacheByBackend = new WeakMap();
 }

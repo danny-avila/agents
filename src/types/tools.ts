@@ -453,8 +453,13 @@ export type LocalExecConfig = {
 };
 
 export type LocalExecutionConfig = {
-  /** Working directory for local commands. Defaults to process.cwd().
-   *  Back-compat shorthand for `workspace.root`. */
+  /**
+   * Working directory for local commands. Defaults to process.cwd().
+   * Back-compat shorthand for `workspace.root`.
+   *
+   * @deprecated Prefer `workspace.root`. Kept for backward
+   *   compatibility with pre-workspace configs.
+   */
   cwd?: string;
   /**
    * Workspace boundary configuration. When omitted, the implementation
@@ -495,7 +500,14 @@ export type LocalExecutionConfig = {
   readOnly?: boolean;
   /** Permit dangerous commands that the validator otherwise blocks. */
   allowDangerousCommands?: boolean;
-  /** Permit file tools to resolve paths outside `cwd`. Defaults to false. */
+  /**
+   * Permit file tools to resolve paths outside `cwd`. Defaults to false.
+   *
+   * @deprecated Prefer the granular
+   *   `workspace.allowReadOutside` / `workspace.allowWriteOutside`.
+   *   Kept for backward compatibility; setting either of the
+   *   workspace fields takes precedence over this flag.
+   */
   allowOutsideWorkspace?: boolean;
   /**
    * Add the built-in local coding suite (`read_file`, `write_file`,

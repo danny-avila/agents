@@ -32,14 +32,7 @@ config();
 import { spawn } from 'child_process';
 import { homedir, tmpdir } from 'os';
 import { join, resolve } from 'path';
-import {
-  cp,
-  mkdtemp,
-  readdir,
-  readFile,
-  rm,
-  writeFile,
-} from 'fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'fs/promises';
 import { performance } from 'perf_hooks';
 import { HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
@@ -849,7 +842,3 @@ main().catch((err) => {
   console.error(err);
   process.exit(1);
 });
-
-// Silence unused readdir import in some bundlers.
-void readdir;
-void cp;

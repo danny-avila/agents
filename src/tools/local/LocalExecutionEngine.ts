@@ -236,7 +236,11 @@ function maybeWarnSandboxOff(config: t.LocalExecutionConfig): void {
   );
 }
 
-/** Test-only reset hook for the sandbox-off warning latch. */
+/**
+ * Test-only reset hook for the sandbox-off warning latch.
+ *
+ * @internal Not part of the public SDK surface.
+ */
 export function _resetLocalEngineWarningsForTests(): void {
   sandboxOffWarned = false;
 }

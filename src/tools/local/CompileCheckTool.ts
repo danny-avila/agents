@@ -23,7 +23,7 @@
  * exit code is reported.
  */
 
-import { stat } from 'fs/promises';
+import { readFile, stat } from 'fs/promises';
 import { resolve } from 'path';
 import { tool } from '@langchain/core/tools';
 import type { DynamicStructuredTool } from '@langchain/core/tools';
@@ -87,8 +87,8 @@ async function detect(cwd: string): Promise<Detection> {
     };
   }
   if (await pathExists(resolve(cwd, 'package.json'))) {
-    const pkgRaw = await import('fs/promises').then((fs) =>
-      fs.readFile(resolve(cwd, 'package.json'), 'utf8').catch(() => '')
+    const pkgRaw = await readFile(resolve(cwd, 'package.json'), 'utf8').catch(
+      () => ''
     );
     if (pkgRaw.includes('"typescript"')) {
       return {
@@ -117,11 +117,10 @@ async function detect(cwd: string): Promise<Detection> {
     (await pathExists(resolve(cwd, 'setup.py'))) ||
     (await pathExists(resolve(cwd, 'setup.cfg')))
   ) {
-    const pyToml = await import('fs/promises').then((fs) =>
-      fs
-        .readFile(resolve(cwd, 'pyproject.toml'), 'utf8')
-        .catch(() => '')
-    );
+    const pyToml = await readFile(
+      resolve(cwd, 'pyproject.toml'),
+      'utf8'
+    ).catch(() => '');
     if (pyToml.includes('mypy')) {
       return {
         kind: 'python-mypy',

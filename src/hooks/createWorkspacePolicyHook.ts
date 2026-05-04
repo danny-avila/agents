@@ -263,17 +263,16 @@ export function createWorkspacePolicyHook(
     const realRoots = await getRealRoots();
     for (const p of paths) {
       const abs = isAbsolute(p) ? resolve(p) : resolve(root, p);
-      const lexicallyInside = isInsideAnyRoot(abs, allRoots);
+      // Realpath is the source of truth — it catches both the
+      // symlink-escape case (lexically-inside path that resolves
+      // outside) and the alternate-mount case (lexically-outside
+      // path that resolves back inside the workspace). The lexical
+      // check alone gives the wrong answer for either, so we don't
+      // bother computing it.
       const realInside = await isInsideAnyRootRealpath(abs, realRoots);
-      // Block if realpath escapes the workspace, EVEN IF the
-      // lexical path looks safe (the symlink-escape case).
       if (!realInside) {
         outside.push(p);
-        continue;
       }
-      // Lexically outside but realpath says inside? The path is on
-      // an alternate mount of the workspace — let it through.
-      void lexicallyInside;
     }
     if (outside.length === 0) return { decision: 'allow' };
 

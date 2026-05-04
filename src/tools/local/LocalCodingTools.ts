@@ -168,16 +168,65 @@ function lineWindow(
   offset?: number,
   limit?: number
 ): { text: string; truncated: boolean } {
-  const lines = content.split('\n');
   const start = Math.max((offset ?? 1) - 1, 0);
-  const end = limit != null && limit > 0 ? start + limit : lines.length;
-  const selected = lines.slice(start, end);
-  const numbered = selected
-    .map((line, index) => `${String(start + index + 1).padStart(6, ' ')}\t${line}`)
+  // Avoid splitting the whole file when the caller asked for a small
+  // window. For a 10 MB file with `offset: 1, limit: 10`, the prior
+  // `content.split('\n')` allocated millions of strings to throw all
+  // but 10 away. We walk newline indices directly: O(start + limit)
+  // instead of O(file). When `limit` is omitted, fall back to the
+  // simple split — it's the same amount of work either way.
+  if (limit == null || limit <= 0) {
+    const lines = content.split('\n');
+    const selected = lines.slice(start);
+    const numbered = selected
+      .map(
+        (line, index) =>
+          `${String(start + index + 1).padStart(6, ' ')}\t${line}`
+      )
+      .join('\n');
+    return {
+      text: truncateLocalOutput(numbered, MAX_READ_CHARS),
+      truncated: numbered.length > MAX_READ_CHARS,
+    };
+  }
+  // Walk to the start line by counting newlines.
+  let cursor = 0;
+  for (let i = 0; i < start; i++) {
+    const next = content.indexOf('\n', cursor);
+    if (next === -1) {
+      // File has fewer lines than `offset` — return empty window.
+      return { text: '', truncated: false };
+    }
+    cursor = next + 1;
+  }
+  // Collect up to `limit` lines from `cursor`.
+  const out: string[] = [];
+  let line = start + 1;
+  let pos = cursor;
+  let exhausted = true;
+  for (let k = 0; k < limit; k++) {
+    const next = content.indexOf('\n', pos);
+    if (next === -1) {
+      out.push(content.slice(pos));
+      break;
+    }
+    out.push(content.slice(pos, next));
+    pos = next + 1;
+    line++;
+    if (k === limit - 1 && pos < content.length) {
+      exhausted = false;
+    }
+  }
+  void line;
+  const numbered = out
+    .map(
+      (text, index) =>
+        `${String(start + index + 1).padStart(6, ' ')}\t${text}`
+    )
     .join('\n');
   return {
     text: truncateLocalOutput(numbered, MAX_READ_CHARS),
-    truncated: end < lines.length || numbered.length > MAX_READ_CHARS,
+    truncated: !exhausted || numbered.length > MAX_READ_CHARS,
   };
 }
 
@@ -613,12 +662,47 @@ async function isRipgrepAvailable(
 /**
  * Test-only reset hook. Clears the ripgrep-availability cache so
  * tests can swap in mocked spawn backends and reprobe deterministically.
+ *
+ * @internal Not part of the public SDK surface; the leading underscore
+ *   and `@internal` tag together signal that consumers should not call
+ *   this. Tests import it via the module path directly.
  */
 export function _resetRipgrepCacheForTests(): void {
   ripgrepAvailabilityByBackend = new WeakMap();
 }
 
-const SKIP_DIRS = new Set(['.git', 'node_modules']);
+// Skipped by the Node-fallback walker (used when ripgrep is
+// unavailable). Covers common build outputs, virtualenvs, and
+// caches so a `grep_search`/`glob_search` on a large monorepo or a
+// Python project with `.venv/` doesn't read every file under those
+// trees. ripgrep itself respects .gitignore so it doesn't need this
+// list. Audit follow-up from the comprehensive review (finding #3).
+const SKIP_DIRS = new Set([
+  '.git',
+  '.svn',
+  '.hg',
+  'node_modules',
+  '.next',
+  '.nuxt',
+  '.cache',
+  '.parcel-cache',
+  '.turbo',
+  'dist',
+  'build',
+  'out',
+  'target',
+  'vendor',
+  'coverage',
+  '.nyc_output',
+  '__pycache__',
+  '.venv',
+  'venv',
+  'env',
+  '.tox',
+  '.mypy_cache',
+  '.pytest_cache',
+  '.ruff_cache',
+]);
 
 function globToRegExp(pattern: string): RegExp {
   let result = '^';
