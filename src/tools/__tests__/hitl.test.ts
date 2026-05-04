@@ -2654,6 +2654,200 @@ describe('Codex review fixes', () => {
     expect(registry.hasHookFor('PreToolUse', runId)).toBe(false);
   });
 
+  it('preserves Graph sidecars across HITL interrupt + resume so tool completions keep their step ids', async () => {
+    /**
+     * Regression test for the cleanup-vs-resume bug: previously
+     * `processStream` always called `Graph.clearHeavyState()` in its
+     * `finally` block AND `Graph.resetValues()` on entry, even when
+     * pausing on a HITL interrupt. That wiped `toolCallStepIds`,
+     * `_toolOutputRegistry`, and `sessions` between pause and resume,
+     * so the resumed `ToolNode` could no longer find the original
+     * step id and dispatched `ON_RUN_STEP_COMPLETED` with an empty id
+     * — the host's stream consumer would then drop the result.
+     *
+     * The fix is two gated cleanups:
+     *   - `clearHeavyState` skipped when `_interrupt != null && _haltedReason == null && !streamThrew`
+     *   - `resetValues` skipped when entering processStream via `Command` (resume)
+     *
+     * To exercise the SDK Graph's actual sidecar state (not a private
+     * test ToolNode), this test wires the custom ToolNode to share
+     * the SDK Graph's `toolCallStepIds` Map by reference. After the
+     * interrupt fires AND after the resume completes, the
+     * pre-populated entry must still be present.
+     */
+    const dispatchedStepIds: string[] = [];
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data) => {
+        if (event === GraphEvents.ON_RUN_STEP_COMPLETED) {
+          const payload = data as { result?: { id?: string } };
+          if (payload.result?.id != null) {
+            dispatchedStepIds.push(payload.result.id);
+          }
+          return;
+        }
+        if (event !== 'on_tool_execute') {
+          return;
+        }
+        const request = data as {
+          toolCalls: t.ToolCallRequest[];
+          resolve: (r: t.ToolExecuteResult[]) => void;
+        };
+        request.resolve(
+          request.toolCalls.map((c) => ({
+            toolCallId: c.id,
+            content: 'host-result',
+            status: 'success' as const,
+          }))
+        );
+      });
+
+    const registry = new HookRegistry();
+    registry.register('PreToolUse', {
+      hooks: [
+        async (): Promise<PreToolUseHookOutput> => ({
+          decision: 'ask',
+          reason: 'review',
+        }),
+      ],
+    });
+
+    const { Run } = await import('@/run');
+    const run = await Run.create<t.IState>({
+      runId: 'sidecar-preserve',
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'a',
+            provider: providers.OPENAI,
+            clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+          },
+        ],
+      },
+      hooks: registry,
+      humanInTheLoop: { enabled: true },
+    });
+
+    /** Wire the test ToolNode to share the SDK Graph's
+     * `toolCallStepIds` Map by reference — this is how the real
+     * StandardGraph builds its inner ToolNode at Graph.ts:587. */
+    const toolNode = new ToolNode({
+      tools: [createSchemaStub('echo')],
+      eventDrivenMode: true,
+      agentId: 'a',
+      toolCallStepIds: run.Graph!.toolCallStepIds,
+      hookRegistry: registry,
+      humanInTheLoop: { enabled: true },
+    });
+
+    /** The agent node simulates `attemptInvoke`'s sidecar-population
+     * step: in a real run, the model invocation creates a run step
+     * and writes its id into `toolCallStepIds` before tools dispatch.
+     * Doing it here means the entry lands AFTER `processStream`'s
+     * `resetValues` (which fires once on entry) and BEFORE the
+     * ToolNode's hook + interrupt — exactly mirroring the production
+     * timing the cleanup gate has to preserve. */
+    const builder = new StateGraph(MessagesAnnotation)
+      .addNode('agent', (): MessagesUpdate => {
+        run.Graph!.toolCallStepIds.set('call_1', 'step_real_id');
+        return {
+          messages: [
+            new AIMessage({
+              content: '',
+              tool_calls: [
+                { id: 'call_1', name: 'echo', args: { command: 'x' } },
+              ],
+            }),
+          ],
+        };
+      })
+      .addNode('tools', toolNode)
+      .addEdge(START, 'agent')
+      .addEdge('agent', 'tools')
+      .addEdge('tools', END);
+    const graph = builder.compile({ checkpointer: new MemorySaver() });
+    run.graphRunnable = graph as unknown as t.CompiledStateWorkflow;
+
+    const callerConfig = {
+      configurable: { thread_id: 'sidecar-thread' },
+      version: 'v2' as const,
+    };
+
+    await run.processStream({ messages: [] }, callerConfig);
+
+    /** After interrupt: sidecar entry MUST still be present. Without
+     * the fix, `clearHeavyState` in the `finally` block would have
+     * wiped this map. */
+    expect(run.getInterrupt()).toBeDefined();
+    expect(run.Graph!.toolCallStepIds.has('call_1')).toBe(true);
+    expect(run.Graph!.toolCallStepIds.get('call_1')).toBe('step_real_id');
+
+    /** Resume: without the resetValues gate, this would also wipe
+     * the map at the START of the second processStream invocation. */
+    await run.resume([{ type: 'approve' }], callerConfig);
+
+    /** After resume completes naturally: dispatch fired with the real
+     * step id (not an empty string from a wiped map). Without either
+     * fix, `dispatchedStepIds` would contain `''`. */
+    expect(dispatchedStepIds).toContain('step_real_id');
+    expect(dispatchedStepIds).not.toContain('');
+    /** And clearHeavyState DID fire on the natural-completion side
+     * — sidecar map is now empty after the resume settled. */
+    expect(run.Graph!.toolCallStepIds.size).toBe(0);
+  });
+
+  it('clears Graph sidecars on natural completion when no interrupt was raised', async () => {
+    /** Negative case: when no interrupt fires, `clearHeavyState`
+     * MUST run as before. This pins the gate so a future change
+     * doesn't accidentally preserve sidecars on natural completion
+     * (memory leak across runs). */
+    mockEventDispatch([]);
+
+    const { Run } = await import('@/run');
+    const run = await Run.create<t.IState>({
+      runId: 'sidecar-clear-natural',
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'a',
+            provider: providers.OPENAI,
+            clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+          },
+        ],
+      },
+      humanInTheLoop: { enabled: false },
+    });
+
+    /** No-op graph — runs to completion without an interrupt. */
+    const builder = new StateGraph(MessagesAnnotation)
+      .addNode('noop', (): MessagesUpdate => ({ messages: [] }))
+      .addEdge(START, 'noop')
+      .addEdge('noop', END);
+    const graph = builder.compile();
+    run.graphRunnable = graph as unknown as t.CompiledStateWorkflow;
+
+    /** Stash an entry so we can verify clearHeavyState wiped it. */
+    run.Graph!.toolCallStepIds.set('stale_call', 'stale_step');
+
+    await run.processStream(
+      { messages: [] },
+      {
+        configurable: { thread_id: 'sidecar-clear-thread' },
+        version: 'v2',
+      }
+    );
+
+    /** No interrupt → clearHeavyState ran → sidecar wiped. */
+    expect(run.getInterrupt()).toBeUndefined();
+    expect(run.Graph!.toolCallStepIds.size).toBe(0);
+  });
+
   it('clears session hooks when the stream throws AFTER an interrupt is captured (stale interrupt)', async () => {
     jest
       .spyOn(events, 'safeDispatchCustomEvent')

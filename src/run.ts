@@ -505,7 +505,20 @@ export class Run<_T extends t.BaseGraphState> {
       configurable: { ...callerConfig.configurable },
     };
 
-    this.Graph.resetValues(streamOptions?.keepContent);
+    /**
+     * Skip `resetValues` on resume — we're continuing an in-flight
+     * run, not starting a fresh one. Resetting would wipe the
+     * sidecars (`toolCallStepIds`, `stepKeyIds`, accumulated
+     * `messages`, etc.) the resumed `ToolNode` needs to dispatch
+     * tool completions with the correct step ids and re-resolve
+     * `{{tool<i>turn<n>}}` references. Pairs with the
+     * `awaitingResume` gate on `clearHeavyState` in the `finally`
+     * block so the sidecars survive both ends of the interrupt
+     * boundary.
+     */
+    if (!isResume) {
+      this.Graph.resetValues(streamOptions?.keepContent);
+    }
     this._interrupt = undefined;
     this._haltedReason = undefined;
     this.hookRegistry?.clearHaltSignal(this.id);
@@ -795,7 +808,28 @@ export class Run<_T extends t.BaseGraphState> {
 
       this.calibrationRatio = this.Graph.getCalibrationRatio();
 
-      if (!this.skipCleanup) {
+      /**
+       * Skip `clearHeavyState()` when the run paused on a clean HITL
+       * interrupt awaiting resume — `Run.resume()` re-enters the same
+       * `ToolNode` instance and needs the sidecars `clearHeavyState`
+       * would wipe (`toolCallStepIds` for completion-event step ids,
+       * the `_toolOutputRegistry` for `{{tool<i>turn<n>}}`
+       * substitutions, `sessions` for code-env continuity, plus the
+       * `hookRegistry` and `humanInTheLoop` config the interrupt
+       * branch itself relies on). Without preservation, the resumed
+       * tool completion would dispatch `ON_RUN_STEP_COMPLETED` with
+       * an empty step id and downstream stream consumers would drop
+       * the result.
+       *
+       * The natural-completion / error / hook-driven-halt paths still
+       * clean up — `_haltedReason != null` or `streamThrew` mean no
+       * resume is expected. Cross-process resume (host rebuilds the
+       * Run from scratch) is a separate concern; see
+       * `HumanInTheLoopConfig` JSDoc.
+       */
+      const awaitingResume =
+        this._interrupt != null && this._haltedReason == null && !streamThrew;
+      if (!this.skipCleanup && !awaitingResume) {
         this.Graph.clearHeavyState();
       }
 
