@@ -298,6 +298,13 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private agentId?: string;
   /** Tool names that bypass event dispatch and execute directly (e.g., graph-managed handoff tools) */
   private directToolNames?: Set<string>;
+  /**
+   * File checkpointer extracted from the local coding tool bundle when
+   * `toolExecution.local.fileCheckpointing === true`. Exposed via
+   * {@link getFileCheckpointer}. Undefined when checkpointing is off
+   * or the local coding suite isn't bound to this node.
+   */
+  private fileCheckpointer?: t.LocalFileCheckpointer;
   /** Maximum characters allowed in a single tool result before truncation. */
   private maxToolResultChars: number;
   /** Hook registry for PreToolUse/PostToolUse lifecycle hooks */
@@ -420,6 +427,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     });
 
     this.toolMap = resolved.toolMap;
+    if (resolved.fileCheckpointer != null) {
+      this.fileCheckpointer = resolved.fileCheckpointer;
+    }
     if (resolved.directToolNames.size === 0) {
       return;
     }
@@ -429,6 +439,20 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       ...resolved.directToolNames,
     ]);
     this.programmaticCache = undefined;
+  }
+
+  /**
+   * Returns the per-Run file checkpointer when
+   * `toolExecution.local.fileCheckpointing === true`. Hosts call
+   * `rewind()` on the returned object to restore captured pre-write
+   * file contents — the standard "undo a tool batch" pattern. Returns
+   * undefined when checkpointing is disabled or the local coding suite
+   * isn't bound. Manual review (finding E): without this getter, the
+   * config flag was a silent no-op outside of direct
+   * `createLocalCodingToolBundle()` use.
+   */
+  getFileCheckpointer(): t.LocalFileCheckpointer | undefined {
+    return this.fileCheckpointer;
   }
 
   /**
@@ -595,6 +619,19 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           ...invokeParams,
           toolMap,
           toolDefs,
+          // Plumb the hook context into the programmatic-tool path so
+          // inner tool calls made via the in-process bridge can run
+          // through `PreToolUse` (deny / updatedInput) before reaching
+          // the underlying tool. Without this, `run_tools_with_code`
+          // bypassed every PreToolUse hook the host registered for
+          // the tools it dispatches — including HITL gates on
+          // `write_file` / `edit_file` (manual review finding A).
+          hookContext: {
+            registry: this.hookRegistry,
+            runId: (config.configurable?.run_id as string | undefined) ?? '',
+            threadId: config.configurable?.thread_id as string | undefined,
+            agentId: this.agentId,
+          },
         };
       } else if (call.name === Constants.TOOL_SEARCH) {
         invokeParams = {

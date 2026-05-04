@@ -17,6 +17,7 @@ import type * as t from '@/types';
 import { Constants } from '@/common';
 import { ToolNode } from '../ToolNode';
 import {
+  executeLocalBash,
   executeLocalCode,
   validateBashCommand,
   _resetLocalEngineWarningsForTests,
@@ -255,12 +256,32 @@ describe('local engine sandbox-off warning', () => {
   });
 
   it('warns once when running without sandbox', async () => {
-    await validateBashCommand('echo hi');
-    await validateBashCommand('echo bye');
+    // Real (non-internal) executions should warn; the internal
+    // `bash -n` syntax preflight inside validateBashCommand opts out
+    // (Codex P2 — otherwise the latch would flip on a probe and hide
+    // the warning when a genuinely-unsandboxed command later runs).
+    await executeLocalBash('echo hi');
+    await executeLocalBash('echo bye');
     const sandboxOffMessages = warnSpy.mock.calls.filter((call) =>
       String(call[0]).includes('without @anthropic-ai/sandbox-runtime')
     );
     expect(sandboxOffMessages).toHaveLength(1);
+  });
+
+  it('does NOT warn for internal probes when the run actually has sandbox enabled (Codex P2)', async () => {
+    // Pre-fix: validateBashCommand's bash -n preflight (which forces
+    // sandbox: false for itself, since you can't sandbox a syntax
+    // probe) would emit a misleading "sandbox is off" warning AND
+    // flip `sandboxOffWarned = true` even when the run had
+    // `sandbox.enabled: true` — hiding the warning when a real
+    // unsandboxed execution later happened. With the fix internal
+    // probes pass `{ internal: true }` to spawnLocalProcess and
+    // suppress both the message and the latch.
+    await validateBashCommand('echo hi', { sandbox: { enabled: true } });
+    const sandboxOffMessages = warnSpy.mock.calls.filter((call) =>
+      String(call[0]).includes('without @anthropic-ai/sandbox-runtime')
+    );
+    expect(sandboxOffMessages).toHaveLength(0);
   });
 });
 
@@ -1349,6 +1370,105 @@ describe('codex review fixes (round 6)', () => {
       });
       const text = JSON.stringify(result);
       expect(text).not.toContain('refused to run');
+    });
+  });
+});
+
+describe('comprehensive review (round 7) — manual finding C', () => {
+  describe('nested-shell destructive payload (manual #C)', () => {
+    it('blocks bash -lc "rm -rf $HOME"', async () => {
+      const result = await validateBashCommand('bash -lc "rm -rf $HOME"');
+      expect(result.valid).toBe(false);
+      expect(result.errors.join('\n')).toMatch(/destructive command pattern/);
+    });
+
+    it('blocks sh -c "chmod -R 777 /"', async () => {
+      const result = await validateBashCommand("sh -c 'chmod -R 777 /'");
+      expect(result.valid).toBe(false);
+      expect(result.errors.join('\n')).toMatch(/destructive command pattern/);
+    });
+
+    it('blocks eval "rm -rf /"', async () => {
+      const result = await validateBashCommand("eval 'rm -rf /'");
+      expect(result.valid).toBe(false);
+      expect(result.errors.join('\n')).toMatch(/destructive command pattern/);
+    });
+
+    it('still allows benign nested shell (echo)', async () => {
+      const result = await validateBashCommand('bash -lc "echo hello"');
+      expect(result.valid).toBe(true);
+    });
+  });
+});
+
+describe('comprehensive review (round 7) — manual finding D', () => {
+  describe('fallback grep DoS guardrails', () => {
+    it('rejects oversize patterns before compile', async () => {
+      const cwd = await createTempDir();
+      const bundle = createLocalCodingToolBundle({ cwd });
+      const grepTool = bundle.tools.find(
+        (tt) => tt.name === Constants.GREP_SEARCH
+      );
+      const result = await grepTool!.invoke({
+        id: 'g-long',
+        name: Constants.GREP_SEARCH,
+        // 2 KiB pattern — over the 1 KiB cap.
+        args: { pattern: 'a'.repeat(2048) },
+        type: 'tool_call',
+      });
+      const text = JSON.stringify(result);
+      // Either the rg path runs (and matches nothing on an empty
+      // dir) or — when rg is unavailable — the fallback rejects via
+      // FallbackGrepError. We only assert the fallback shape when
+      // it triggers.
+      if (text.includes('node-fallback')) {
+        expect(text).toContain('grep_search refused the pattern');
+        expect(text).toContain('exceeds');
+      }
+    });
+
+    it('rejects nested-quantifier patterns (catastrophic backtracking)', async () => {
+      const cwd = await createTempDir();
+      const bundle = createLocalCodingToolBundle({ cwd });
+      const grepTool = bundle.tools.find(
+        (tt) => tt.name === Constants.GREP_SEARCH
+      );
+      const result = await grepTool!.invoke({
+        id: 'g-evil',
+        name: Constants.GREP_SEARCH,
+        args: { pattern: '(a+)+$' },
+        type: 'tool_call',
+      });
+      const text = JSON.stringify(result);
+      if (text.includes('node-fallback')) {
+        expect(text).toContain('catastrophic backtracking');
+      }
+    });
+  });
+});
+
+describe('comprehensive review (round 7) — manual finding E', () => {
+  describe('fileCheckpointer exposed via ToolNode auto-bind path', () => {
+    it('Run/ToolNode-style bind makes the checkpointer reachable when fileCheckpointing is true', () => {
+      const node = new ToolNode({
+        tools: [],
+        toolExecution: {
+          engine: 'local',
+          local: { fileCheckpointing: true },
+        },
+      });
+      const cp = node.getFileCheckpointer();
+      expect(cp).toBeDefined();
+      expect(typeof cp?.captureBeforeWrite).toBe('function');
+      expect(typeof cp?.rewind).toBe('function');
+    });
+
+    it('returns undefined when fileCheckpointing is not enabled', () => {
+      const node = new ToolNode({
+        tools: [],
+        toolExecution: { engine: 'local' },
+      });
+      expect(node.getFileCheckpointer()).toBeUndefined();
     });
   });
 });

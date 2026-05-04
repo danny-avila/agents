@@ -69,11 +69,12 @@ async function probe(
   const entry = cacheFor(config);
   let probePromise = entry[cached];
   if (probePromise == null) {
-    probePromise = spawnLocalProcess(command, args, {
-      ...config,
-      timeoutMs: 5000,
-      sandbox: { enabled: false },
-    })
+    probePromise = spawnLocalProcess(
+      command,
+      args,
+      { ...config, timeoutMs: 5000, sandbox: { enabled: false } },
+      { internal: true }
+    )
       .then((result) => result != null && result.exitCode === 0)
       .catch(() => false);
     entry[cached] = probePromise;
@@ -95,11 +96,12 @@ const jsCheck: SyntaxChecker = async (path, config) => {
   if (!(await probe('node', ['--version'], 'hasNode', config))) {
     return { ok: true };
   }
-  const result = await spawnLocalProcess('node', ['--check', path], {
-    ...config,
-    timeoutMs: 5000,
-    sandbox: { enabled: false },
-  });
+  const result = await spawnLocalProcess(
+    'node',
+    ['--check', path],
+    { ...config, timeoutMs: 5000, sandbox: { enabled: false } },
+    { internal: true }
+  );
   if (result.exitCode === 0) return { ok: true };
   return {
     ok: false,
@@ -122,7 +124,8 @@ const pythonCheck: SyntaxChecker = async (path, config) => {
   const result = await spawnLocalProcess(
     'python3',
     ['-c', program, path],
-    { ...config, timeoutMs: 5000, sandbox: { enabled: false } }
+    { ...config, timeoutMs: 5000, sandbox: { enabled: false } },
+    { internal: true }
   );
   if (result.exitCode === 0) return { ok: true };
   return {
@@ -151,11 +154,12 @@ const bashCheck: SyntaxChecker = async (path, config) => {
   if (!(await probe('bash', ['--version'], 'hasBash', config))) {
     return { ok: true };
   }
-  const result = await spawnLocalProcess('bash', ['-n', path], {
-    ...config,
-    timeoutMs: 5000,
-    sandbox: { enabled: false },
-  });
+  const result = await spawnLocalProcess(
+    'bash',
+    ['-n', path],
+    { ...config, timeoutMs: 5000, sandbox: { enabled: false } },
+    { internal: true }
+  );
   if (result.exitCode === 0) return { ok: true };
   return {
     ok: false,

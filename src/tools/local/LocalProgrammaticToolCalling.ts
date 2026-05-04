@@ -5,6 +5,7 @@ import type { AddressInfo } from 'net';
 import type { IncomingMessage, ServerResponse } from 'http';
 import type { DynamicStructuredTool } from '@langchain/core/tools';
 import type * as t from '@/types';
+import { executeHooks } from '@/hooks';
 import {
   executeTools,
   filterToolsByUsage,
@@ -107,7 +108,69 @@ function writeJson(res: ServerResponse, status: number, value: unknown): void {
   res.end(JSON.stringify(value));
 }
 
-async function createToolBridge(toolMap: t.ToolMap): Promise<ToolBridge> {
+/**
+ * Run the host's `PreToolUse` hook chain for a single bridge call.
+ * Returns the (possibly rewritten) input and a `denyReason` if any
+ * matcher returned `decision: 'deny'` or `'ask'`. `'ask'` collapses
+ * to deny because the bridge can't raise a LangGraph interrupt from
+ * inside an HTTP handler — fail-closed matches the rest of the SDK
+ * when HITL is unavailable.
+ */
+/**
+ * Exported for tests so the deny / allow / updatedInput / ask
+ * branches can be exercised without standing up the full HTTP bridge.
+ *
+ * @internal
+ */
+export async function applyPreToolUseHooksForBridge(
+  hookContext: t.ProgrammaticHookContext,
+  toolName: string,
+  toolUseId: string,
+  toolInput: Record<string, unknown>
+): Promise<{ input: Record<string, unknown>; denyReason?: string }> {
+  if (hookContext.registry == null) {
+    return { input: toolInput };
+  }
+  const result = await executeHooks({
+    registry: hookContext.registry,
+    input: {
+      hook_event_name: 'PreToolUse',
+      runId: hookContext.runId,
+      threadId: hookContext.threadId,
+      agentId: hookContext.agentId,
+      toolName,
+      toolInput,
+      toolUseId,
+      stepId: '',
+      turn: 0,
+    },
+    sessionId: hookContext.runId,
+    matchQuery: toolName,
+  }).catch(() => undefined);
+  if (result == null) {
+    return { input: toolInput };
+  }
+  const nextInput =
+    result.updatedInput != null
+      ? (result.updatedInput as Record<string, unknown>)
+      : toolInput;
+  if (result.decision === 'deny' || result.decision === 'ask') {
+    return {
+      input: nextInput,
+      denyReason:
+        result.reason ??
+        (result.decision === 'ask'
+          ? `Tool "${toolName}" requires human approval; bridge cannot raise an interrupt — denying.`
+          : `Tool "${toolName}" denied by PreToolUse hook.`),
+    };
+  }
+  return { input: nextInput };
+}
+
+async function createToolBridge(
+  toolMap: t.ToolMap,
+  hookContext?: t.ProgrammaticHookContext
+): Promise<ToolBridge> {
   const token = randomBytes(32).toString('hex');
   const server = createServer((req, res) => {
     // `?mode=text` returns the already-serialized result as the body
@@ -160,12 +223,39 @@ async function createToolBridge(toolMap: t.ToolMap): Promise<ToolBridge> {
           return;
         }
 
+        const callId = body.id ?? `local_call_${randomUUID()}`;
+        let effectiveInput: Record<string, unknown> = body.input ?? {};
+        if (hookContext != null) {
+          const gate = await applyPreToolUseHooksForBridge(
+            hookContext,
+            body.name,
+            callId,
+            effectiveInput
+          );
+          if (gate.denyReason != null) {
+            const denyMsg = gate.denyReason;
+            if (isTextMode) {
+              res.writeHead(500, { 'Content-Type': 'text/plain' });
+              res.end(denyMsg);
+            } else {
+              writeJson(res, 500, {
+                call_id: callId,
+                result: null,
+                is_error: true,
+                error_message: denyMsg,
+              });
+            }
+            return;
+          }
+          effectiveInput = gate.input;
+        }
+
         const [result] = await executeTools(
           [
             {
-              id: body.id ?? `local_call_${randomUUID()}`,
+              id: callId,
               name: body.name,
-              input: body.input ?? {},
+              input: effectiveInput,
             },
           ],
           toolMap
@@ -406,7 +496,7 @@ async function runLocalProgrammaticTool(args: {
   localConfig: t.LocalExecutionConfig;
   runtime: LocalProgrammaticRuntime;
 }): Promise<[string, t.ProgrammaticExecutionArtifact]> {
-  const { toolMap, toolDefs } = getProgrammaticContext(args.config);
+  const { toolMap, toolDefs, hookContext } = getProgrammaticContext(args.config);
 
   if (toolMap == null || toolMap.size === 0) {
     throw new Error('No toolMap provided for local programmatic execution.');
@@ -421,7 +511,7 @@ async function runLocalProgrammaticTool(args: {
     args.params.code,
     args.runtime === 'bash' ? filterBashToolsByUsage : filterToolsByUsage
   );
-  const bridge = await createToolBridge(effectiveMap);
+  const bridge = await createToolBridge(effectiveMap, hookContext);
 
   try {
     const timeoutMs = args.params.timeout ?? args.localConfig.timeoutMs ?? DEFAULT_TIMEOUT;

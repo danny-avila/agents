@@ -58,6 +58,36 @@ const quotedDestructivePatterns: ReadonlyArray<RegExp> = [
   /\bchown\s+-R\s+[^;&|]+\s+(?:--\s+)?["'](?:\/|~|\$\{?HOME\}?|\.)["']/,
 ];
 
+/**
+ * Catches destructive operations smuggled inside a nested shell or
+ * `eval` call, e.g. `bash -lc "rm -rf $HOME"` — the outer command
+ * looks benign (`bash -lc "..."`) and the destructive `rm` lives
+ * inside the quoted payload that `stripQuotedContent` blanks out.
+ * Comprehensive review (manual finding C) flagged this as a real
+ * bypass of the otherwise-correct quote-strip-then-match approach.
+ *
+ * Run against the ORIGINAL command (quotes intact) so the inside of
+ * the nested-shell payload is visible. Conservative: matches only
+ * the same operation set as `dangerousCommandPatterns` (rm -rf,
+ * chmod -R 777, chown -R) when they appear inside a `<shell> -[l]?c
+ * "..."` or `eval "..."` payload.
+ */
+const NESTED_SHELL_PREFIX = '(?:(?:ba|z|da|k)?sh|eval)\\s+(?:-l?c\\s+)?';
+const nestedShellDestructivePatterns: ReadonlyArray<RegExp> = [
+  new RegExp(
+    NESTED_SHELL_PREFIX +
+      '["\'][^"\']*\\brm\\s+-[^\\s"\']*[rf][^\\s"\']*\\s+(?:--\\s+)?(?:\\/|~|\\$\\{?HOME\\}?|\\.)'
+  ),
+  new RegExp(
+    NESTED_SHELL_PREFIX +
+      '["\'][^"\']*\\bchmod\\s+-R\\s+(?:777|a\\+w)\\s+(?:--\\s+)?(?:\\/|~|\\$\\{?HOME\\}?|\\.)'
+  ),
+  new RegExp(
+    NESTED_SHELL_PREFIX +
+      '["\'][^"\']*\\bchown\\s+-R\\s+[^;&|]+\\s+(?:--\\s+)?(?:\\/|~|\\$\\{?HOME\\}?|\\.)'
+  ),
+];
+
 const mutatingCommandPattern =
   /\b(?:rm|mv|cp|touch|mkdir|rmdir|ln|truncate|tee|sed\s+-i|perl\s+-pi|python(?:3)?\s+-c|node\s+-e|npm\s+(?:install|ci|update|publish)|pnpm\s+(?:install|update|publish)|yarn\s+(?:install|add|publish)|git\s+(?:add|commit|checkout|switch|reset|clean|rebase|merge|push|pull|stash|tag|branch)|chmod|chown)\b|(?:^|[^<])>\s*[^&]|\bcat\s+[^|;&]*>\s*/;
 
@@ -347,6 +377,17 @@ export async function validateBashCommand(
           errors.push(
             'Command matches a destructive command pattern (quoted target).'
           );
+          blocked = true;
+          break;
+        }
+      }
+    }
+    if (!blocked) {
+      for (const pattern of nestedShellDestructivePatterns) {
+        if (pattern.test(command)) {
+          errors.push(
+            'Command matches a destructive command pattern (nested shell payload).'
+          );
           break;
         }
       }
@@ -370,11 +411,16 @@ export async function validateBashCommand(
   // host configures `local.shell` to a non-bash binary (or when the
   // runtime doesn't have bash installed at all but does have e.g. zsh).
   const syntaxShell = config.shell ?? DEFAULT_SHELL;
-  const syntax = await spawnLocalProcess(syntaxShell, ['-n', '-c', command], {
-    ...config,
-    timeoutMs: Math.min(config.timeoutMs ?? DEFAULT_TIMEOUT_MS, 5000),
-    sandbox: { enabled: false },
-  }).catch((error: Error): SpawnResult => ({
+  const syntax = await spawnLocalProcess(
+    syntaxShell,
+    ['-n', '-c', command],
+    {
+      ...config,
+      timeoutMs: Math.min(config.timeoutMs ?? DEFAULT_TIMEOUT_MS, 5000),
+      sandbox: { enabled: false },
+    },
+    { internal: true }
+  ).catch((error: Error): SpawnResult => ({
     stdout: '',
     stderr: error.message,
     exitCode: 1,
@@ -511,10 +557,29 @@ export function buildSandboxRuntimeConfig(
   };
 }
 
+/**
+ * Internal options for {@link spawnLocalProcess} that we don't want
+ * exposed on the public `LocalExecutionConfig` type.
+ *
+ * @internal
+ */
+export interface SpawnLocalProcessOptions {
+  /**
+   * When true, suppress the "sandbox is off" warning AND its latch
+   * for this spawn. Use for SDK-internal probes (`bash -n` syntax
+   * preflight, `rg --version`, etc.) that intentionally run with
+   * the sandbox forced off — the warning is noise for those, and
+   * letting the latch flip would hide the warning when a *real*
+   * unsandboxed execution happens later in the same process.
+   */
+  internal?: boolean;
+}
+
 export async function spawnLocalProcess(
   command: string,
   args: string[],
-  config: t.LocalExecutionConfig = {}
+  config: t.LocalExecutionConfig = {},
+  options?: SpawnLocalProcessOptions
 ): Promise<SpawnResult> {
   const cwd = getLocalCwd(config);
   const timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -530,7 +595,15 @@ export async function spawnLocalProcess(
   const hardKillBytes =
     config.maxSpawnedBytes ?? DEFAULT_MAX_SPAWNED_BYTES;
   const sandboxManager = await ensureSandbox(config, cwd);
-  if (sandboxManager == null) {
+  // Internal probes (validateBashCommand syntax preflight,
+  // isRipgrepAvailable, syntax-check probe cache priming) pass
+  // `internal: true` so they don't emit a misleading "sandbox is
+  // off" warning AND don't flip `sandboxOffWarned = true`. Without
+  // this Codex P2 path: a run with `sandbox.enabled: true` would
+  // see a false warning from the syntax preflight, and the latch
+  // flip would suppress the warning in a *later* truly-unsandboxed
+  // run — exactly the scenario operators need to see.
+  if (sandboxManager == null && options?.internal !== true) {
     maybeWarnSandboxOff(config);
   }
   let spawnCommand = command;

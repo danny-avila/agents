@@ -4,8 +4,9 @@ import {
   createLocalCodeExecutionTool,
 } from './LocalExecutionTools';
 import {
-  createLocalCodingTools,
+  createLocalCodingToolBundle,
   createLocalCodingToolDefinitions,
+  createLocalCodingTools,
 } from './LocalCodingTools';
 import {
   createLocalBashProgrammaticToolCallingTool,
@@ -16,6 +17,17 @@ import type * as t from '@/types';
 type ResolveLocalToolsResult = {
   toolMap: t.ToolMap;
   directToolNames: Set<string>;
+  /**
+   * Set when `local.fileCheckpointing === true` AND the auto-bind
+   * coding suite is in use. ToolNode stashes this on the node and
+   * exposes it via `getFileCheckpointer()` so the host can call
+   * `rewind()` after a failed batch. Manual review (finding E)
+   * flagged that the config flag was previously a no-op in the
+   * Run/ToolNode auto-bind path — only direct
+   * `createLocalCodingToolBundle()` callers could access the
+   * checkpointer.
+   */
+  fileCheckpointer?: t.LocalFileCheckpointer;
 };
 
 function shouldUseLocalExecution(config?: t.ToolExecutionConfig): boolean {
@@ -133,11 +145,27 @@ export function resolveLocalExecutionTools(args: {
 
   const localConfig = args.toolExecution?.local ?? {};
   const toolMap = new Map(args.toolMap);
+  let fileCheckpointer: t.LocalFileCheckpointer | undefined;
 
   if (shouldIncludeCodingTools(args.toolExecution)) {
-    for (const localTool of createLocalCodingTools(localConfig)) {
-      toolMap.set(localTool.name, localTool);
-      directToolNames.add(localTool.name);
+    // Use the bundle factory when fileCheckpointing is on so we can
+    // surface the checkpointer back to the caller — without this, the
+    // execution-path tools each captured into a checkpointer that was
+    // immediately discarded, making the public `fileCheckpointing`
+    // config flag a silent no-op outside of direct
+    // `createLocalCodingToolBundle()` use.
+    if (localConfig.fileCheckpointing === true) {
+      const bundle = createLocalCodingToolBundle(localConfig);
+      fileCheckpointer = bundle.checkpointer;
+      for (const localTool of bundle.tools) {
+        toolMap.set(localTool.name, localTool);
+        directToolNames.add(localTool.name);
+      }
+    } else {
+      for (const localTool of createLocalCodingTools(localConfig)) {
+        toolMap.set(localTool.name, localTool);
+        directToolNames.add(localTool.name);
+      }
     }
   }
 
@@ -155,5 +183,5 @@ export function resolveLocalExecutionTools(args: {
     directToolNames.add(name);
   }
 
-  return { toolMap, directToolNames };
+  return { toolMap, directToolNames, fileCheckpointer };
 }

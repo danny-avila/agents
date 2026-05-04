@@ -33,7 +33,8 @@
  *     refusal so the model isn't surprised.
  */
 
-import { open, readFile } from 'fs/promises';
+import { open as fsOpen, readFile as fsReadFile } from 'fs/promises';
+import type { WorkspaceFS } from './workspaceFS';
 
 /**
  * Magic-byte sniff for the small set of image/PDF formats we care
@@ -153,6 +154,15 @@ export async function classifyAttachment(args: {
   bytes: number;
   mode: AttachmentMode;
   maxBytes: number;
+  /**
+   * WorkspaceFS to route I/O through — defaults to host fs/promises
+   * for backward compat. Manual review (finding F): without this
+   * routing, custom/remote FS implementations could either fail to
+   * embed valid attachments or accidentally read a host path with
+   * the same absolute name (since `read_file` itself does go through
+   * the configured WorkspaceFS).
+   */
+  fs?: WorkspaceFS;
 }): Promise<Attachment> {
   if (args.bytes === 0) {
     return { kind: 'text-or-unknown', bytes: 0 };
@@ -163,6 +173,7 @@ export async function classifyAttachment(args: {
   // attachment cap) doesn't pull the whole buffer into memory before
   // we discover it's oversize. Full read happens only when we're
   // about to base64-embed.
+  const open = args.fs?.open ?? fsOpen;
   const handle = await open(args.path, 'r');
   const header = Buffer.alloc(12);
   let mime: string | undefined;
@@ -200,7 +211,8 @@ export async function classifyAttachment(args: {
     };
   }
 
-  const buffer = await readFile(args.path);
+  const readFile = args.fs?.readFile ?? fsReadFile;
+  const buffer = (await readFile(args.path)) as Buffer;
   const base64 = buffer.toString('base64');
   const dataUrl = `data:${mime};base64,${base64}`;
 

@@ -611,7 +611,25 @@ export type ToolExecutionConfig = {
   local?: LocalExecutionConfig;
 };
 
-export type ProgrammaticCache = { toolMap: ToolMap; toolDefs: LCTool[] };
+export type ProgrammaticCache = {
+  toolMap: ToolMap;
+  toolDefs: LCTool[];
+  /**
+   * Hook context plumbed through by ToolNode for the local
+   * programmatic-tool path so the in-process bridge can run
+   * `PreToolUse` hooks (deny / updatedInput) for inner tool calls.
+   * Not present for non-local (remote-engine) programmatic calling
+   * which dispatches inner tools through the host's own pipeline.
+   */
+  hookContext?: ProgrammaticHookContext;
+};
+
+export type ProgrammaticHookContext = {
+  registry: import('@/hooks').HookRegistry | undefined;
+  runId: string;
+  threadId?: string;
+  agentId?: string;
+};
 
 /** Search mode: code_interpreter uses external sandbox, local uses safe substring matching */
 export type ToolSearchMode = 'code_interpreter' | 'local';

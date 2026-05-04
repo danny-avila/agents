@@ -382,6 +382,10 @@ export function createLocalReadFileTool(
             mode: attachmentMode,
             maxBytes:
               config.maxAttachmentBytes ?? DEFAULT_MAX_ATTACHMENT_BYTES,
+            // Route through the configured WorkspaceFS so a custom
+            // engine sees the same path semantics as `read_file`
+            // itself (manual review finding F).
+            fs,
           });
           if (attachment.kind === 'image') {
             return [
@@ -647,11 +651,12 @@ async function isRipgrepAvailable(
   const backend = getSpawn(config);
   let probePromise = ripgrepAvailabilityByBackend.get(backend);
   if (probePromise == null) {
-    probePromise = spawnLocalProcess('rg', ['--version'], {
-      ...config,
-      timeoutMs: 5000,
-      sandbox: { enabled: false },
-    })
+    probePromise = spawnLocalProcess(
+      'rg',
+      ['--version'],
+      { ...config, timeoutMs: 5000, sandbox: { enabled: false } },
+      { internal: true }
+    )
       .then((probe) => probe != null && probe.exitCode === 0)
       .catch(() => false);
     ripgrepAvailabilityByBackend.set(backend, probePromise);
@@ -757,6 +762,70 @@ async function* walkFiles(
   }
 }
 
+/**
+ * Catastrophic-backtracking guardrails for the fallback grep path.
+ *
+ * Without ripgrep we run the model-supplied pattern through Node's
+ * `RegExp` engine, which uses a backtracking implementation. Patterns
+ * with nested unbounded quantifiers (`(a+)+`, `(.*)*`, etc.) can
+ * monopolise the event loop for arbitrary wall-clock time on
+ * pathological input, and `setTimeout` cannot interrupt a synchronous
+ * `RegExp.exec`. Manual review (finding D) flagged this as a real DoS.
+ *
+ * Mitigations applied here, in order of severity:
+ *   1. Cap pattern length so an obviously oversize regex is rejected
+ *      before compile.
+ *   2. Reject patterns that contain a nested unbounded quantifier of
+ *      the form `(...+|*)([+*]|{n,})` — the standard pathological
+ *      shape. Still a heuristic (not a full safety proof), but blocks
+ *      every common DoS construction we've seen in coding-agent logs.
+ *   3. Wall-clock budget for the overall search: each file's regex
+ *      pass is checked against a deadline; once exceeded the search
+ *      bails with a partial result. Doesn't interrupt a stuck
+ *      `exec()` call, but stops a slow pattern from making the whole
+ *      Run hang once the first hung file finishes.
+ *
+ * Hosts that need bulletproof regex safety should install `rg` —
+ * ripgrep uses RE2 internally and has no backtracking.
+ */
+const MAX_FALLBACK_PATTERN_LENGTH = 1024;
+const FALLBACK_GREP_BUDGET_MS = 5000;
+const NESTED_QUANTIFIER_RE = /\([^)]*[+*][^)]*\)\s*[+*?{]/;
+
+class FallbackGrepError extends Error {
+  readonly kind: 'pattern-too-long' | 'unsafe-pattern' | 'invalid-pattern';
+  constructor(
+    kind: 'pattern-too-long' | 'unsafe-pattern' | 'invalid-pattern',
+    message: string
+  ) {
+    super(message);
+    this.kind = kind;
+  }
+}
+
+function compileFallbackRegex(pattern: string): RegExp {
+  if (pattern.length > MAX_FALLBACK_PATTERN_LENGTH) {
+    throw new FallbackGrepError(
+      'pattern-too-long',
+      `Pattern exceeds ${MAX_FALLBACK_PATTERN_LENGTH}-char fallback cap (install ripgrep for unbounded patterns).`
+    );
+  }
+  if (NESTED_QUANTIFIER_RE.test(pattern)) {
+    throw new FallbackGrepError(
+      'unsafe-pattern',
+      'Pattern contains a nested unbounded quantifier (e.g. `(a+)+`) which can cause catastrophic backtracking in the Node fallback. Install ripgrep for RE2-safe matching.'
+    );
+  }
+  try {
+    return new RegExp(pattern);
+  } catch (e) {
+    throw new FallbackGrepError(
+      'invalid-pattern',
+      `Invalid regex: ${(e as Error).message}`
+    );
+  }
+}
+
 async function fallbackGrep(
   root: string,
   pattern: string,
@@ -764,11 +833,17 @@ async function fallbackGrep(
   maxResults: number,
   fs: import('./workspaceFS').WorkspaceFS
 ): Promise<string[]> {
-  const rx = new RegExp(pattern);
+  const rx = compileFallbackRegex(pattern);
+  const deadline = Date.now() + FALLBACK_GREP_BUDGET_MS;
   const globRx =
     globFilter != null && globFilter !== '' ? globToRegExp(globFilter) : undefined;
   const matches: string[] = [];
   for await (const file of walkFiles(root, fs)) {
+    if (Date.now() > deadline) {
+      // Wall-clock budget exceeded — return partial results rather
+      // than letting a slow pattern hang the Run.
+      return matches;
+    }
     if (globRx != null) {
       const rel = file.startsWith(root + '/') ? file.slice(root.length + 1) : file;
       if (!globRx.test(rel)) {
@@ -862,17 +937,32 @@ export function createLocalGrepSearchTool(
         return [output, { matches: lines.length, engine: 'ripgrep' }];
       }
 
-      const matches = await fallbackGrep(
-        target,
-        input.pattern,
-        input.glob,
-        maxResults,
-        fs
-      );
-      return [
-        matches.length > 0 ? matches.join('\n') : 'No matches found.',
-        { matches: matches.length, engine: 'node-fallback' },
-      ];
+      try {
+        const matches = await fallbackGrep(
+          target,
+          input.pattern,
+          input.glob,
+          maxResults,
+          fs
+        );
+        return [
+          matches.length > 0 ? matches.join('\n') : 'No matches found.',
+          { matches: matches.length, engine: 'node-fallback' },
+        ];
+      } catch (e) {
+        if (e instanceof FallbackGrepError) {
+          return [
+            `grep_search refused the pattern: ${e.message}`,
+            {
+              matches: 0,
+              engine: 'node-fallback',
+              error: e.message,
+              kind: e.kind,
+            },
+          ];
+        }
+        throw e;
+      }
     },
     {
       name: LocalGrepSearchToolName,
