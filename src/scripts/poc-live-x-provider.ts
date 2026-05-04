@@ -7,7 +7,7 @@
  * 2. Anthropic thinking block → OpenAI = ?
  * 3. Empty thinking block → OpenAI = ?
  *
- * Uses cheap models (claude-haiku-4-5, gpt-4o-mini) and minimal token budgets.
+ * Uses cheap models (claude-haiku-4-5, gpt-5.4-mini) and minimal token budgets.
  */
 
 import { config } from 'dotenv';
@@ -122,7 +122,7 @@ async function testOpenAIWithThinkingBlock(): Promise<void> {
   header('TEST 2: Anthropic thinking block replayed to OpenAI');
 
   const openai = new ChatOpenAI({
-    modelName: 'gpt-4o-mini',
+    modelName: 'gpt-5.4-mini',
     apiKey: OPENAI_KEY,
     maxTokens: 100,
   });
@@ -166,7 +166,7 @@ async function testOpenAIWithEmptyThinking(): Promise<void> {
   header('TEST 3: Empty thinking block replayed to OpenAI');
 
   const openai = new ChatOpenAI({
-    modelName: 'gpt-4o-mini',
+    modelName: 'gpt-5.4-mini',
     apiKey: OPENAI_KEY,
     maxTokens: 100,
   });

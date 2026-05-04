@@ -173,7 +173,7 @@ describe('_convertMessagesToOpenAIParams', () => {
         }),
       ];
 
-      const params = _convertMessagesToOpenAIParams(messages, 'gpt-4o-mini');
+      const params = _convertMessagesToOpenAIParams(messages, 'gpt-5.4-mini');
 
       expect(params[1]).toEqual(
         expect.objectContaining({
@@ -200,7 +200,7 @@ describe('_convertMessagesToOpenAIParams', () => {
         }),
       ];
 
-      const params = _convertMessagesToOpenAIParams(messages, 'gpt-4o-mini');
+      const params = _convertMessagesToOpenAIParams(messages, 'gpt-5.4-mini');
 
       expect(params[1]).toEqual(
         expect.objectContaining({
@@ -223,7 +223,7 @@ describe('_convertMessagesToOpenAIParams', () => {
         }),
       ];
 
-      const params = _convertMessagesToOpenAIParams(messages, 'gpt-4o-mini');
+      const params = _convertMessagesToOpenAIParams(messages, 'gpt-5.4-mini');
 
       expect(params[0]).toEqual(
         expect.objectContaining({
@@ -282,7 +282,7 @@ describe('_convertMessagesToOpenAIParams', () => {
         }),
       ];
 
-      const params = _convertMessagesToOpenAIParams(messages, 'gpt-4o-mini');
+      const params = _convertMessagesToOpenAIParams(messages, 'gpt-5.4-mini');
 
       expect(params[0]).toEqual(
         expect.objectContaining({
