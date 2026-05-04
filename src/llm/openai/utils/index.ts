@@ -303,6 +303,7 @@ export function _convertMessagesToOpenAIParams(
   model?: string,
   options?: ConvertMessagesOptions
 ): OpenAICompletionParam[] {
+  let hasReasoningToolCallContext = false;
   // TODO: Function messages do not support array content, fix cast
   return messages.flatMap((message) => {
     let role = messageToOpenAIRole(message);
@@ -333,6 +334,8 @@ export function _convertMessagesToOpenAIParams(
       role,
       content,
     };
+    let messageHasToolCalls = false;
+    let messageIsToolResult = false;
     if (message.name != null) {
       completionParam.name = message.name;
     }
@@ -341,17 +344,11 @@ export function _convertMessagesToOpenAIParams(
       completionParam.content = '';
     }
     if (isAIMessage(message) && !!message.tool_calls?.length) {
+      messageHasToolCalls = true;
       completionParam.tool_calls = message.tool_calls.map(
         convertLangChainToolCallToOpenAI
       );
       completionParam.content = hasAnthropicThinkingBlock ? content : '';
-      if (
-        options?.includeReasoningContent === true &&
-        message.additional_kwargs.reasoning_content != null
-      ) {
-        completionParam.reasoning_content =
-          message.additional_kwargs.reasoning_content;
-      }
       if (
         options?.includeReasoningDetails === true &&
         message.additional_kwargs.reasoning_details != null
@@ -399,14 +396,10 @@ export function _convertMessagesToOpenAIParams(
       }
     } else {
       if (message.additional_kwargs.tool_calls != null) {
+        messageHasToolCalls =
+          !Array.isArray(message.additional_kwargs.tool_calls) ||
+          message.additional_kwargs.tool_calls.length > 0;
         completionParam.tool_calls = message.additional_kwargs.tool_calls;
-        if (
-          options?.includeReasoningContent === true &&
-          message.additional_kwargs.reasoning_content != null
-        ) {
-          completionParam.reasoning_content =
-            message.additional_kwargs.reasoning_content;
-        }
         if (
           options?.includeReasoningDetails === true &&
           message.additional_kwargs.reasoning_details != null
@@ -454,8 +447,24 @@ export function _convertMessagesToOpenAIParams(
         }
       }
       if ((message as ToolMessage).tool_call_id != null) {
+        messageIsToolResult = true;
         completionParam.tool_call_id = (message as ToolMessage).tool_call_id;
       }
+    }
+
+    if (
+      options?.includeReasoningContent === true &&
+      isAIMessage(message) &&
+      (hasReasoningToolCallContext || messageHasToolCalls) &&
+      typeof message.additional_kwargs.reasoning_content === 'string' &&
+      message.additional_kwargs.reasoning_content !== ''
+    ) {
+      completionParam.reasoning_content =
+        message.additional_kwargs.reasoning_content;
+    }
+
+    if (messageHasToolCalls || messageIsToolResult) {
+      hasReasoningToolCallContext = true;
     }
 
     if (

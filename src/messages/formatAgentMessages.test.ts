@@ -6,7 +6,7 @@ import {
 } from '@langchain/core/messages';
 import type { MessageContentComplex, TPayload } from '@/types';
 import { formatAgentMessages } from './format';
-import { ContentTypes } from '@/common';
+import { ContentTypes, Providers } from '@/common';
 
 describe('formatAgentMessages', () => {
   it('should format simple user and AI messages', () => {
@@ -964,6 +964,171 @@ describe('formatAgentMessages', () => {
     expect(result.messages[0].content).toBe('The answer is 42.');
     expect(JSON.stringify(result.messages[0].content)).not.toContain(
       'reasoning_content'
+    );
+  });
+
+  it('should preserve hidden reasoning_content for DeepSeek assistant messages', () => {
+    const payload: TPayload = [
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.THINK,
+            [ContentTypes.THINK]: 'Need calculator.',
+          },
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]: 'Using calculator.',
+            tool_call_ids: ['call_1'],
+          },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 'call_1',
+              name: 'calculator',
+              args: '{"input":"127 * 453"}',
+              output: '57531',
+            },
+          },
+          {
+            type: ContentTypes.THINK,
+            [ContentTypes.THINK]: 'Calculator returned 57531.',
+          },
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]: '127 * 453 = 57531.',
+          },
+        ],
+      },
+    ];
+
+    const defaultResult = formatAgentMessages(payload);
+    expect(
+      (defaultResult.messages[0] as AIMessage).additional_kwargs
+        .reasoning_content
+    ).toBeUndefined();
+
+    const result = formatAgentMessages(
+      payload,
+      undefined,
+      undefined,
+      undefined,
+      { provider: Providers.DEEPSEEK }
+    );
+
+    expect(result.messages).toHaveLength(3);
+    expect(result.messages[0]).toBeInstanceOf(AIMessage);
+    expect(result.messages[1]).toBeInstanceOf(ToolMessage);
+    expect(result.messages[2]).toBeInstanceOf(AIMessage);
+
+    const toolCallMessage = result.messages[0] as AIMessage;
+    const finalMessage = result.messages[2] as AIMessage;
+
+    expect(toolCallMessage.content).toBe('Using calculator.');
+    expect(toolCallMessage.tool_calls).toHaveLength(1);
+    expect(toolCallMessage.additional_kwargs.reasoning_content).toBe(
+      'Need calculator.'
+    );
+    expect(finalMessage.content).toBe('127 * 453 = 57531.');
+    expect(finalMessage.additional_kwargs.reasoning_content).toBe(
+      'Calculator returned 57531.'
+    );
+  });
+
+  it('should preserve DeepSeek reasoning from supported hidden content blocks', () => {
+    const payload: TPayload = [
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.THINK,
+            [ContentTypes.THINK]: 'Think. ',
+          },
+          {
+            type: ContentTypes.THINKING,
+            thinking: 'Thinking. ',
+          },
+          {
+            type: ContentTypes.REASONING,
+            reasoning: 'Reasoning. ',
+          },
+          {
+            type: ContentTypes.REASONING_CONTENT,
+            reasoningText: { text: 'Reasoning content.' },
+          },
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]: 'Done.',
+          },
+        ],
+      },
+    ];
+
+    const result = formatAgentMessages(
+      payload,
+      undefined,
+      undefined,
+      undefined,
+      { provider: Providers.DEEPSEEK }
+    );
+
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0]).toBeInstanceOf(AIMessage);
+    expect(result.messages[0].content).toBe('Done.');
+    expect(
+      (result.messages[0] as AIMessage).additional_kwargs.reasoning_content
+    ).toBe('Think. Thinking. Reasoning. Reasoning content.');
+  });
+
+  it('should attach later DeepSeek reasoning to an existing tool-call assistant message', () => {
+    const payload: TPayload = [
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.THINK,
+            [ContentTypes.THINK]: 'Need calculator. ',
+          },
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]: 'Using calculator.',
+            tool_call_ids: ['call_1'],
+          },
+          {
+            type: ContentTypes.THINK,
+            [ContentTypes.THINK]: 'Preparing tool call.',
+          },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 'call_1',
+              name: 'calculator',
+              args: '{"input":"127 * 453"}',
+              output: '57531',
+            },
+          },
+        ],
+      },
+    ];
+
+    const result = formatAgentMessages(
+      payload,
+      undefined,
+      undefined,
+      undefined,
+      { provider: Providers.DEEPSEEK }
+    );
+
+    expect(result.messages).toHaveLength(2);
+    expect(result.messages[0]).toBeInstanceOf(AIMessage);
+    expect(result.messages[1]).toBeInstanceOf(ToolMessage);
+
+    const toolCallMessage = result.messages[0] as AIMessage;
+
+    expect(toolCallMessage.content).toBe('Using calculator.');
+    expect(toolCallMessage.tool_calls).toHaveLength(1);
+    expect(toolCallMessage.additional_kwargs.reasoning_content).toBe(
+      'Need calculator. Preparing tool call.'
     );
   });
 
