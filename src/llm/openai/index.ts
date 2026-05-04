@@ -98,9 +98,19 @@ type LibreChatOpenAIFields = t.ChatOpenAIFields & {
   includeReasoningContent?: boolean;
   includeReasoningDetails?: boolean;
   convertReasoningDetailsToContent?: boolean;
+  /**
+   * Override for the model-name heuristic used to detect Claude targets
+   * served via an OpenAI-shaped surface (e.g. OpenRouter's `anthropic/*`
+   * models). Set to `true` for aliased Claude deployments whose names lack
+   * the usual substrings; set to `false` to force flatten/drop on a
+   * Claude-named model that's actually a passthrough shim. When `undefined`,
+   * detection falls back to substring matching.
+   */
+  claudeBackend?: boolean;
 };
 type LibreChatAzureOpenAIFields = t.AzureOpenAIInput & {
   _lc_stream_delay?: number;
+  claudeBackend?: boolean;
 };
 type ReasoningCallOptions = {
   reasoning?: OpenAIClient.Reasoning;
@@ -521,6 +531,7 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
   private includeReasoningContent?: boolean;
   private includeReasoningDetails?: boolean;
   private convertReasoningDetailsToContent?: boolean;
+  protected _claudeBackend?: boolean;
 
   constructor(fields?: LibreChatOpenAIFields) {
     super(fields);
@@ -528,6 +539,7 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
     this.includeReasoningDetails = fields?.includeReasoningDetails;
     this.convertReasoningDetailsToContent =
       fields?.convertReasoningDetailsToContent;
+    this._claudeBackend = fields?.claudeBackend;
   }
 
   protected _getReasoningParams(
@@ -610,6 +622,7 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
         includeReasoningContent: this.includeReasoningContent,
         includeReasoningDetails: this.includeReasoningDetails,
         convertReasoningDetailsToContent: this.convertReasoningDetailsToContent,
+        claudeBackend: this._claudeBackend,
       }
     );
 
@@ -771,6 +784,7 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
         includeReasoningContent: this.includeReasoningContent,
         includeReasoningDetails: this.includeReasoningDetails,
         convertReasoningDetailsToContent: this.convertReasoningDetailsToContent,
+        claudeBackend: this._claudeBackend,
       });
 
     const params = {
@@ -1094,12 +1108,14 @@ function withLibreChatOpenAIFields(
 
 export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
   _lc_stream_delay?: number;
+  protected _claudeBackend?: boolean;
 
   constructor(
     fields?: LibreChatOpenAIFields & t.OpenAIChatInput['modelKwargs']
   ) {
     super(withLibreChatOpenAIFields(fields));
     this._lc_stream_delay = fields?._lc_stream_delay;
+    this._claudeBackend = fields?.claudeBackend;
   }
 
   public get exposedClient(): CustomOpenAIClient {
@@ -1162,7 +1178,9 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
     runManager?: CallbackManagerForLLMRun
   ): Promise<ChatResult> {
     return super._generate(
-      flattenAnthropicThinkingForOpenAI(messages, this.model),
+      flattenAnthropicThinkingForOpenAI(messages, this.model, {
+        claudeBackend: this._claudeBackend,
+      }),
       options,
       runManager
     );
@@ -1175,7 +1193,9 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
   ): AsyncGenerator<ChatGenerationChunk> {
     yield* delayStreamChunks(
       super._streamResponseChunks(
-        flattenAnthropicThinkingForOpenAI(messages, this.model),
+        flattenAnthropicThinkingForOpenAI(messages, this.model, {
+          claudeBackend: this._claudeBackend,
+        }),
         options,
         runManager
       ),
@@ -1186,12 +1206,14 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
 
 export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
   _lc_stream_delay?: number;
+  protected _claudeBackend?: boolean;
 
   constructor(fields?: LibreChatAzureOpenAIFields) {
     super(fields);
     this.completions = new LibreChatAzureOpenAICompletions(fields);
     this.responses = new LibreChatAzureOpenAIResponses(fields);
     this._lc_stream_delay = fields?._lc_stream_delay;
+    this._claudeBackend = fields?.claudeBackend;
   }
 
   public get exposedClient(): CustomOpenAIClient {
@@ -1288,7 +1310,9 @@ export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
     runManager?: CallbackManagerForLLMRun
   ): Promise<ChatResult> {
     return super._generate(
-      flattenAnthropicThinkingForOpenAI(messages, this.model),
+      flattenAnthropicThinkingForOpenAI(messages, this.model, {
+        claudeBackend: this._claudeBackend,
+      }),
       options,
       runManager
     );
@@ -1300,7 +1324,9 @@ export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
   ): AsyncGenerator<ChatGenerationChunk> {
     yield* delayStreamChunks(
       super._streamResponseChunks(
-        flattenAnthropicThinkingForOpenAI(messages, this.model),
+        flattenAnthropicThinkingForOpenAI(messages, this.model, {
+          claudeBackend: this._claudeBackend,
+        }),
         options,
         runManager
       ),

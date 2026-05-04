@@ -490,6 +490,46 @@ describe('_convertMessagesToOpenAIParams', () => {
       }
     );
 
+    it('respects claudeBackend=true for aliased Claude deployments without "claude" in the model name', () => {
+      const original = [
+        new AIMessage({
+          content: [
+            { type: 'thinking', thinking: 'reason', signature: 'sig' },
+            { type: 'redacted_thinking', data: 'opaque' },
+            { type: 'text', text: 'answer' },
+          ] as never,
+        }),
+      ];
+
+      const out = flattenAnthropicThinkingForOpenAI(
+        original,
+        'internal-gateway-llm-v3',
+        { claudeBackend: true }
+      );
+
+      expect(out).toBe(original);
+    });
+
+    it('respects claudeBackend=false even when the model name contains "claude"', () => {
+      const out = flattenAnthropicThinkingForOpenAI(
+        [
+          new AIMessage({
+            content: [
+              { type: 'thinking', thinking: 'reason', signature: 'sig' },
+              { type: 'text', text: 'answer' },
+            ] as never,
+          }),
+        ],
+        'claude-3-passthrough-shim',
+        { claudeBackend: false }
+      );
+
+      expect(out[0].content).toEqual([
+        { type: 'text', text: '<thinking>reason</thinking>' },
+        { type: 'text', text: 'answer' },
+      ]);
+    });
+
     it('returns the same reference when no message has thinking blocks', () => {
       const original = [
         new HumanMessage('hi'),

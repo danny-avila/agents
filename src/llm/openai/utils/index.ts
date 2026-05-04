@@ -306,6 +306,28 @@ export function isClaudeModel(model?: string): boolean {
 }
 
 /**
+ * Options for `flattenAnthropicThinkingForOpenAI` and the OpenAI converters.
+ *
+ * `claudeBackend` is an explicit override for the model-name heuristic in
+ * `isClaudeModel`: corporate gateways and self-hosted Claude deployments
+ * sometimes alias Claude under names without `claude`/`anthropic` substrings,
+ * which would otherwise be misclassified as non-Claude and have their
+ * `thinking` / `redacted_thinking` blocks rewritten or dropped — exactly the
+ * blocks Claude needs replayed unchanged for tool-call continuation. When
+ * provided, this flag wins over the heuristic in both directions.
+ */
+export interface ClaudeBackendOptions {
+  claudeBackend?: boolean;
+}
+
+function resolveClaudeTarget(
+  model: string | undefined,
+  options?: ClaudeBackendOptions
+): boolean {
+  return options?.claudeBackend ?? isClaudeModel(model);
+}
+
+/**
  * Pre-process LangChain messages before they reach an OpenAI-bound request.
  * Flattens Anthropic-style `thinking` content blocks into
  * `<thinking>...</thinking>` text, drops empty thinking blocks, and drops
@@ -317,9 +339,10 @@ export function isClaudeModel(model?: string): boolean {
  */
 export function flattenAnthropicThinkingForOpenAI(
   messages: BaseMessage[],
-  model?: string
+  model?: string,
+  options?: ClaudeBackendOptions
 ): BaseMessage[] {
-  if (isClaudeModel(model)) {
+  if (resolveClaudeTarget(model, options)) {
     return messages;
   }
   let mutated = false;
@@ -390,7 +413,7 @@ export function flattenAnthropicThinkingForOpenAI(
 }
 
 /** Options for converting messages to OpenAI params */
-export interface ConvertMessagesOptions {
+export interface ConvertMessagesOptions extends ClaudeBackendOptions {
   /** Include reasoning_content field for DeepSeek thinking mode with tool calls */
   includeReasoningContent?: boolean;
   /** Include reasoning_details field for OpenRouter/Gemini thinking mode with tool calls */
@@ -416,7 +439,7 @@ export function _convertMessagesToOpenAIParams(
    * redacted_thinking entirely (its payload is encrypted and useless to
    * a non-Anthropic model).
    */
-  const isClaudeTarget = isClaudeModel(model);
+  const isClaudeTarget = resolveClaudeTarget(model, options);
   // TODO: Function messages do not support array content, fix cast
   return messages.flatMap((message) => {
     let role = messageToOpenAIRole(message);
@@ -658,7 +681,8 @@ function _convertReasoningSummaryToOpenAIResponsesParams(
 export function _convertMessagesToOpenAIResponsesParams(
   messages: BaseMessage[],
   model?: string,
-  zdrEnabled?: boolean
+  zdrEnabled?: boolean,
+  options?: ClaudeBackendOptions
 ): ResponsesInputItem[] {
   /**
    * Same cross-provider rationale as `_convertMessagesToOpenAIParams`: flatten
@@ -666,7 +690,7 @@ export function _convertMessagesToOpenAIResponsesParams(
    * survives a handoff into the Responses API instead of being silently
    * dropped by the content `flatMap` below.
    */
-  const isClaudeTarget = isClaudeModel(model);
+  const isClaudeTarget = resolveClaudeTarget(model, options);
   return messages.flatMap(
     (lcMsg): ResponsesInputItem | ResponsesInputItem[] => {
       const additional_kwargs =
