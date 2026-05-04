@@ -886,6 +886,106 @@ describe('recency window — first-turn protection', () => {
     expect((result.messages![2] as AIMessage).content).toBe('turn 2 reply');
   });
 
+  it('keeps the masked tail content (does not re-inject restored tool payloads into state)', async () => {
+    captureEvents();
+
+    let summarizerSawRestored = false;
+    const invokeMock = jest.fn().mockImplementation((messages: unknown) => {
+      const arr = messages as Array<{
+        getType: () => string;
+        content: unknown;
+        tool_call_id?: string;
+      }>;
+      // Confirm the summarizer's input for the restored tool result has
+      // the FULL content, not the masked stub.
+      summarizerSawRestored = arr.some(
+        (m) =>
+          m.getType() === 'tool' &&
+          typeof m.content === 'string' &&
+          (m.content as string).includes('FULL_ORIGINAL_OUTPUT')
+      );
+      return Promise.resolve({ content: 'summary' });
+    });
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return { invoke: invokeMock };
+        }
+      } as never
+    );
+
+    const setSummary = jest.fn();
+    const agentContext = createAgentContext({
+      summarizationConfig: { retainRecent: { turns: 1 } },
+      setSummary,
+    } as never);
+    // Restoration map keyed by message index — applies to head (idx 2)
+    // AND to a tool message inside the retained tail (idx 5).  Only the
+    // head's restoration should leak into the summarizer; the tail must
+    // keep the masked content.
+    agentContext.pendingOriginalToolContent = new Map<number, string>([
+      [2, 'FULL_ORIGINAL_OUTPUT for head tool result'],
+      [5, 'FULL_ORIGINAL_OUTPUT for tail tool result — must NOT survive'],
+    ]);
+
+    const graph = mockGraph();
+    const summarizeNode = createSummarizeNode({
+      agentContext,
+      graph: graph as never,
+      generateStepId,
+    });
+
+    const headToolCall = new AIMessage({
+      content: '',
+      tool_calls: [{ id: 'h', name: 'search', args: {} }],
+    });
+    const headToolResult = new ToolMessage({
+      content: 'masked-head-stub',
+      tool_call_id: 'h',
+      name: 'search',
+    });
+    const tailToolCall = new AIMessage({
+      content: '',
+      tool_calls: [{ id: 't', name: 'search', args: {} }],
+    });
+    const tailToolResult = new ToolMessage({
+      content: 'masked-tail-stub',
+      tool_call_id: 't',
+      name: 'search',
+    });
+    const messages = [
+      new HumanMessage('turn 1 query'),
+      headToolCall,
+      headToolResult, // index 2 — restored for summarizer
+      new HumanMessage('turn 2 query'),
+      tailToolCall,
+      tailToolResult, // index 5 — must stay masked in returned tail
+    ];
+
+    const result = await summarizeNode(
+      {
+        messages,
+        summarizationRequest: {
+          remainingContextTokens: 0,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    // Summarizer saw the full restored head tool result.
+    expect(summarizerSawRestored).toBe(true);
+
+    // Returned tail must contain the MASKED tool result, not the restored one.
+    expect(result.messages).toBeDefined();
+    const tailToolMsg = result.messages!.find(
+      (m) => m._getType() === 'tool'
+    ) as ToolMessage | undefined;
+    expect(tailToolMsg).toBeDefined();
+    expect(tailToolMsg!.content).toBe('masked-tail-stub');
+    expect(tailToolMsg!.content).not.toContain('FULL_ORIGINAL_OUTPUT');
+  });
+
   it('preserves the legacy "remove all, summary only" shape when retainRecent.turns is 0', async () => {
     captureEvents();
 

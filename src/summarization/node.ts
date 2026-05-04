@@ -779,12 +779,27 @@ export function createSummarizeNode({
     const runnableConfig = config ?? graph.config;
 
     const retainRecent = agentContext.summarizationConfig?.retainRecent;
-    const { head: messagesToRefine, tail: messagesToRetain } =
-      splitAtRecencyBoundary(restoredMessages, {
+    const { head: messagesToRefine, tailStartIndex } = splitAtRecencyBoundary(
+      restoredMessages,
+      {
         turns: retainRecent?.turns ?? DEFAULT_RETAIN_RECENT_TURNS,
         tokens: retainRecent?.tokens,
         tokenCounter: agentContext.tokenCounter,
-      });
+      }
+    );
+    /**
+     * Use the *masked* messages for the retained tail so that any
+     * truncation prune applied to oversized ToolMessage content stays
+     * truncated in live state.  The summarizer above reads the restored
+     * (full-content) head for summary quality, but reinjecting restored
+     * tool payloads into state would defeat masking and bloat the
+     * checkpoint, forcing more expensive re-pruning on later turns.
+     * `restoreOriginalToolContent` returns an array with identical
+     * length and structure to `state.messages` (replacements only at
+     * specific indices), so the same tailStartIndex slices both arrays
+     * at the same turn boundary.
+     */
+    const messagesToRetain = state.messages.slice(tailStartIndex);
 
     if (messagesToRefine.length === 0) {
       /**
