@@ -20,6 +20,7 @@ import {
   extractToolDiscoveries,
   addBedrockCacheControl,
   formatArtifactPayload,
+  enforceOriginalContentCap,
   formatContentStrings,
   createPruneMessages,
   addCacheControl,
@@ -804,7 +805,35 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
           if (triggerResult) {
             if (originalToolContent != null && originalToolContent.size > 0) {
-              agentContext.pendingOriginalToolContent = originalToolContent;
+              /**
+               * Merge — never overwrite — the pruner's masking record
+               * into pendingOriginalToolContent.  Carry-over entries
+               * from a prior summarize (preserved by the recency
+               * window for masked tool messages still in the tail) and
+               * the current pruner's new entries are both keyed by
+               * indices in the current `state.messages`, so a key-wise
+               * union is correct.  Overwriting would discard the
+               * carry-over and reduce summary fidelity when those
+               * masked tail messages eventually move into the head.
+               */
+              if (agentContext.pendingOriginalToolContent == null) {
+                agentContext.pendingOriginalToolContent = originalToolContent;
+              } else {
+                for (const [idx, content] of originalToolContent) {
+                  agentContext.pendingOriginalToolContent.set(idx, content);
+                }
+                /**
+                 * Re-apply the per-store char cap after the union.  The
+                 * pruner enforces ORIGINAL_CONTENT_MAX_CHARS inside its
+                 * own map via the onContentStored callback, but a
+                 * key-wise merge with recency carry-over bypasses that
+                 * accounting and could let the merged map grow without
+                 * bound across long sessions.
+                 */
+                enforceOriginalContentCap(
+                  agentContext.pendingOriginalToolContent
+                );
+              }
             }
 
             emitAgentLog(

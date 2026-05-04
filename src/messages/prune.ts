@@ -50,7 +50,33 @@ const PRESSURE_BANDS: [number, number][] = [
 const MASKED_RESULT_MAX_CHARS = 300;
 
 /** Hard cap for the originalToolContent store (~2 MB estimated from char length). */
-const ORIGINAL_CONTENT_MAX_CHARS = 2_000_000;
+export const ORIGINAL_CONTENT_MAX_CHARS = 2_000_000;
+
+/**
+ * Evicts oldest entries from `map` (in Map-iteration / insertion order) until
+ * the cumulative char length of remaining values fits within
+ * `ORIGINAL_CONTENT_MAX_CHARS`.  Used by the recency-window carry-over merge
+ * path in Graph.ts to bound long-running session memory: the pruner enforces
+ * the cap inside its own `originalToolContent` map, but a key-wise union with
+ * recency carry-over bypasses that cap unless re-applied here.
+ */
+export function enforceOriginalContentCap(map: Map<number, string>): void {
+  let total = 0;
+  for (const v of map.values()) {
+    total += v.length;
+  }
+  while (total > ORIGINAL_CONTENT_MAX_CHARS && map.size > 0) {
+    const oldest = map.keys().next();
+    if (oldest.done === true) {
+      break;
+    }
+    const removed = map.get(oldest.value);
+    if (removed != null) {
+      total -= removed.length;
+    }
+    map.delete(oldest.value);
+  }
+}
 
 /** Minimum cumulative calibration ratio — provider can't count fewer tokens
  *  than our raw estimate (within reason). Prevents divide-by-zero edge cases. */

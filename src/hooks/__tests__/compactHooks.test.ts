@@ -58,7 +58,14 @@ function buildConversation(): t.IState {
 async function createCompactingRun(
   tokenCounter: t.TokenCounter,
   hooks?: HookRegistry,
-  runId = 'compact-run'
+  runId = 'compact-run',
+  /**
+   * Recency-window setting.  Defaults to `{ turns: 0 }` for these tests so
+   * the post-compaction state is the legacy "remove-all only" shape, which
+   * the original assertions were written against.  Tests that want to
+   * exercise the recency-window path should pass an explicit value.
+   */
+  retainRecent: { turns: number } = { turns: 0 }
 ): Promise<Run<t.IState>> {
   const conversation = buildConversation();
   const indexTokenCountMap: Record<string, number> = {};
@@ -79,6 +86,7 @@ async function createCompactingRun(
       summarizationEnabled: true,
       summarizationConfig: {
         provider: Providers.OPENAI,
+        retainRecent,
       },
     },
     returnContent: true,
@@ -138,7 +146,7 @@ describe('Compaction hook integration', () => {
   });
 
   describe('PostCompact', () => {
-    it('fires with summary text after compaction', async () => {
+    it('fires with summary text after compaction (legacy retainRecent.turns=0 shape)', async () => {
       const registry = new HookRegistry();
       let captured: PostCompactHookInput | undefined;
       const hook: HookCallback<'PostCompact'> = async (
@@ -160,6 +168,34 @@ describe('Compaction hook integration', () => {
       expect(captured!.summary).toBe(SUMMARY_RESPONSE);
       expect(captured!.messagesAfterCount).toBe(0);
       expect(captured!.agentId).toBeDefined();
+    });
+
+    it('reports the recency-tail length in messagesAfterCount when retainRecent.turns > 0', async () => {
+      const registry = new HookRegistry();
+      let captured: PostCompactHookInput | undefined;
+      const hook: HookCallback<'PostCompact'> = async (
+        input
+      ): Promise<PostCompactHookOutput> => {
+        captured = input;
+        return {};
+      };
+      registry.register('PostCompact', { hooks: [hook] });
+
+      const run = await createCompactingRun(
+        tokenCounter,
+        registry,
+        'compact-recency-run',
+        { turns: 2 }
+      );
+      run.Graph!.overrideTestModel(['Final answer after compaction.']);
+      const inputs = buildConversation();
+      await run.processStream(inputs, callerConfig);
+
+      expect(captured).toBeDefined();
+      expect(captured!.hook_event_name).toBe('PostCompact');
+      // buildConversation produces 20 user-led turns of [user, ai].  With
+      // retainRecent.turns=2, the tail is the last 2 turns = 4 messages.
+      expect(captured!.messagesAfterCount).toBe(4);
     });
   });
 

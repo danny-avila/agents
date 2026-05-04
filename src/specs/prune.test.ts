@@ -18,6 +18,8 @@ import {
   preFlightTruncateToolCallInputs,
   repairOrphanedToolMessages,
   sanitizeOrphanToolBlocks,
+  enforceOriginalContentCap,
+  ORIGINAL_CONTENT_MAX_CHARS,
   createPruneMessages,
 } from '@/messages/prune';
 import { getLLMConfig } from '@/utils/llmConfig';
@@ -1532,6 +1534,43 @@ describe('Prune Messages Tests', () => {
       const finalMessages = run.getRunMessages();
       expect(finalMessages).toBeDefined();
       expect(finalMessages?.length).toBeGreaterThan(0);
+    });
+  });
+
+  describe('enforceOriginalContentCap', () => {
+    it('is a no-op when total chars are below the cap', () => {
+      const map = new Map<number, string>([
+        [0, 'a'.repeat(100)],
+        [1, 'b'.repeat(200)],
+      ]);
+      enforceOriginalContentCap(map);
+      expect(map.size).toBe(2);
+      expect(map.get(0)?.length).toBe(100);
+      expect(map.get(1)?.length).toBe(200);
+    });
+
+    it('evicts oldest entries (by Map insertion order) until under the cap', () => {
+      const map = new Map<number, string>();
+      // Insert 4 entries totaling well over the cap, in insertion order
+      // 0, 1, 2, 3.  Each entry is roughly 700_000 chars (>1/3 of cap).
+      const big = 'x'.repeat(700_000);
+      map.set(0, big);
+      map.set(1, big);
+      map.set(2, big);
+      map.set(3, big);
+
+      // 4 * 700_000 = 2_800_000 > 2_000_000 cap.  Eviction should drop
+      // the oldest entry (key 0) — leaving 3 * 700_000 = 2_100_000 still
+      // > cap, so key 1 is also dropped — 2 * 700_000 = 1_400_000 ≤ cap.
+      enforceOriginalContentCap(map);
+      expect(map.has(0)).toBe(false);
+      expect(map.has(1)).toBe(false);
+      expect(map.has(2)).toBe(true);
+      expect(map.has(3)).toBe(true);
+    });
+
+    it('exposes the cap as a constant for callers', () => {
+      expect(ORIGINAL_CONTENT_MAX_CHARS).toBe(2_000_000);
     });
   });
 });
