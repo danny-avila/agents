@@ -17,6 +17,7 @@ import type * as t from '@/types';
 import { Constants } from '@/common';
 import { ToolNode } from '../ToolNode';
 import {
+  executeLocalCode,
   validateBashCommand,
   _resetLocalEngineWarningsForTests,
 } from '../local/LocalExecutionEngine';
@@ -704,5 +705,115 @@ describe('local search fallback', () => {
     const result = await grepTool!.invoke({ pattern: 'needle' });
     expect(String(result)).toContain('a.ts');
     expect(String(result)).toContain('needle');
+  });
+});
+
+describe('codex review fixes', () => {
+  describe('executeLocalCode bash args (Codex P2 #1)', () => {
+    it('passes input.args as positional shell parameters when lang is bash', async () => {
+      const cwd = await createTempDir();
+      const result = await executeLocalCode(
+        {
+          lang: 'bash',
+          // Echo every positional arg space-separated. With the bug,
+          // $@ is empty because args were dropped.
+          code: 'echo "args:$@"',
+          args: ['hello', 'world'],
+        },
+        { cwd }
+      );
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe('args:hello world');
+    });
+
+    it('still works when lang is bash and args is missing', async () => {
+      const cwd = await createTempDir();
+      const result = await executeLocalCode(
+        { lang: 'bash', code: 'echo plain' },
+        { cwd }
+      );
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe('plain');
+    });
+  });
+
+  describe('ripgrep cache backend scope (Codex P2 #2)', () => {
+    it('does not bleed an "rg available" verdict from one backend to another', async () => {
+      // Backend A: pretends rg works (returns a fake spawn whose
+      // process exits 0 on every call). The cache should record true
+      // for THIS backend.
+      const okBackend = jest.fn((cmd: string, _args: string[], _opts: unknown) => {
+        const ok = require('child_process').spawn('echo', [cmd]);
+        return ok;
+      }) as unknown as t.LocalSpawn;
+      // Backend B: pretends rg does not exist (returns a child that
+      // exits 127, the "command not found" code).
+      const missingBackend = jest.fn(
+        (_cmd: string, _args: string[], _opts: unknown) => {
+          const child = require('child_process').spawn(
+            'sh',
+            ['-c', 'exit 127']
+          );
+          return child;
+        }
+      ) as unknown as t.LocalSpawn;
+
+      _resetRipgrepCacheForTests();
+
+      // Build two bundles with distinct backends.
+      const cwdA = await createTempDir();
+      const cwdB = await createTempDir();
+      await fsWriteFile(join(cwdA, 'a.ts'), 'needle\n', 'utf8');
+      await fsWriteFile(join(cwdB, 'b.ts'), 'needle\n', 'utf8');
+
+      const bundleA = createLocalCodingToolBundle({
+        cwd: cwdA,
+        exec: { spawn: okBackend },
+      });
+      const bundleB = createLocalCodingToolBundle({
+        cwd: cwdB,
+        exec: { spawn: missingBackend },
+      });
+
+      // Run grep against A first — populates cache for A's backend.
+      await bundleA.tools.find((t_) => t_.name === 'grep_search')!.invoke({
+        pattern: 'needle',
+      });
+      // Run grep against B — must NOT see cached "true" from A's
+      // backend. With the bug, B would try to spawn rg, fail, and
+      // throw instead of falling back to the Node walker.
+      const bResult = await bundleB.tools
+        .find((t_) => t_.name === 'grep_search')!
+        .invoke({ pattern: 'needle' });
+      expect(String(bResult)).toContain('needle');
+    });
+  });
+
+  describe('additionalRoots resolved against workspace root (Codex P2 #3)', () => {
+    it('treats relative additionalRoots as siblings of root, not of process.cwd', async () => {
+      const parent = await createTempDir();
+      const fs = await import('fs/promises');
+      await fs.mkdir(join(parent, 'app'), { recursive: true });
+      await fs.mkdir(join(parent, 'shared'), { recursive: true });
+      await fsWriteFile(join(parent, 'shared/lib.ts'), 'X\n', 'utf8');
+
+      const bundle = createLocalCodingToolBundle({
+        workspace: {
+          root: join(parent, 'app'),
+          additionalRoots: ['../shared'],
+        },
+      });
+      const readTool = bundle.tools.find((t_) => t_.name === Constants.READ_FILE);
+      // Without the fix, '../shared/lib.ts' would resolve relative to
+      // process.cwd (this test runner), miss the boundary check, and
+      // throw "Path is outside the local workspace".
+      const result = await readTool!.invoke({
+        id: 'c',
+        name: Constants.READ_FILE,
+        args: { file_path: join(parent, 'shared/lib.ts') },
+        type: 'tool_call',
+      });
+      expect(JSON.stringify(result)).toContain('X');
+    });
   });
 });

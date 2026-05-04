@@ -160,7 +160,13 @@ export function createWorkspacePolicyHook(
   config: WorkspacePolicyConfig
 ): HookCallback<'PreToolUse'> {
   const root = resolve(config.root);
-  const additionalRoots = (config.additionalRoots ?? []).map((p) => resolve(p));
+  // Relative `additionalRoots` entries are anchored to `root` so a
+  // monorepo config like `additionalRoots: ['../shared']` resolves
+  // to a sibling of `root`, not of process.cwd. Matches
+  // `getWorkspaceRoots` in LocalExecutionEngine.
+  const additionalRoots = (config.additionalRoots ?? []).map((p) =>
+    isAbsolute(p) ? resolve(p) : resolve(root, p)
+  );
   const allRoots = [root, ...additionalRoots];
 
   const readPolicy: OutsideAccessPolicy = config.outsideRead ?? 'ask';

@@ -12,6 +12,7 @@ import {
   createLocalProgrammaticToolCallingTool,
 } from './LocalProgrammaticToolCalling';
 import {
+  getSpawn,
   getWorkspaceFS,
   resolveWorkspacePathSafe,
   spawnLocalProcess,
@@ -575,26 +576,46 @@ export function createLocalEditFileTool(
   );
 }
 
-let cachedRgAvailable: boolean | undefined;
+/**
+ * Ripgrep availability cache, keyed on the *effective execution
+ * backend* — whatever function `getSpawn(config)` returns. Without
+ * the backend key, a Run that probes `rg` over Node's
+ * `child_process.spawn` would poison subsequent Runs whose
+ * `local.exec.spawn` routes to a remote sandbox or container that
+ * doesn't have rg installed: the cached `true` would skip the probe,
+ * the rg invocation would throw, and the Node fallback wouldn't be
+ * reached. Per-backend caching avoids that without paying for a
+ * spawn-per-search.
+ */
+let ripgrepAvailabilityByBackend = new WeakMap<
+  t.LocalSpawn,
+  Promise<boolean>
+>();
 
 async function isRipgrepAvailable(
   config: t.LocalExecutionConfig
 ): Promise<boolean> {
-  if (cachedRgAvailable !== undefined) {
-    return cachedRgAvailable;
+  const backend = getSpawn(config);
+  let probePromise = ripgrepAvailabilityByBackend.get(backend);
+  if (probePromise == null) {
+    probePromise = spawnLocalProcess('rg', ['--version'], {
+      ...config,
+      timeoutMs: 5000,
+      sandbox: { enabled: false },
+    })
+      .then((probe) => probe != null && probe.exitCode === 0)
+      .catch(() => false);
+    ripgrepAvailabilityByBackend.set(backend, probePromise);
   }
-  const probe = await spawnLocalProcess('rg', ['--version'], {
-    ...config,
-    timeoutMs: 5000,
-    sandbox: { enabled: false },
-  }).catch(() => undefined);
-  cachedRgAvailable = probe != null && probe.exitCode === 0;
-  return cachedRgAvailable;
+  return probePromise;
 }
 
-/** Test-only reset hook for the ripgrep availability cache. */
+/**
+ * Test-only reset hook. Clears the ripgrep-availability cache so
+ * tests can swap in mocked spawn backends and reprobe deterministically.
+ */
 export function _resetRipgrepCacheForTests(): void {
-  cachedRgAvailable = undefined;
+  ripgrepAvailabilityByBackend = new WeakMap();
 }
 
 const SKIP_DIRS = new Set(['.git', 'node_modules']);

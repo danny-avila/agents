@@ -93,7 +93,13 @@ export function getWorkspaceRoots(
   const seen = new Set<string>([root]);
   const out: string[] = [root];
   for (const extra of extras) {
-    const abs = resolve(extra);
+    // Relative `additionalRoots` entries are anchored to the
+    // workspace root (so monorepo configs like
+    // `additionalRoots: ['../shared']` resolve to a sibling of
+    // `root` rather than to `process.cwd()/../shared`, which would
+    // mean something completely different on a server with a
+    // different cwd).
+    const abs = isAbsolute(extra) ? resolve(extra) : resolve(root, extra);
     if (!seen.has(abs)) {
       seen.add(abs);
       out.push(abs);
@@ -540,6 +546,30 @@ export async function executeLocalBash(
   return spawnLocalProcess(shell, ['-lc', command], config);
 }
 
+/**
+ * Variant of `executeLocalBash` that exposes `args` as positional
+ * shell parameters (`$1`, `$2`, …). Mirrors what the other runtimes
+ * do in `getRuntimeCommand`. Uses the standard `bash -c <code> --
+ * arg0 arg1 …` form: the `--` becomes `$0`, then `args[0]` is `$1`
+ * and so on. Same AST validation as the no-args path.
+ */
+async function executeLocalBashWithArgs(
+  command: string,
+  args: readonly string[],
+  config: t.LocalExecutionConfig = {}
+): Promise<SpawnResult> {
+  const validation = await validateBashCommand(command, config);
+  if (!validation.valid) {
+    throw new Error(validation.errors.join('\n'));
+  }
+  const shell = config.shell ?? DEFAULT_SHELL;
+  return spawnLocalProcess(
+    shell,
+    ['-lc', command, '--', ...args],
+    config
+  );
+}
+
 export async function executeLocalCode(
   input: {
     lang: string;
@@ -549,6 +579,13 @@ export async function executeLocalCode(
   config: t.LocalExecutionConfig = {}
 ): Promise<SpawnResult> {
   if (input.lang === 'bash') {
+    // Append `args` as positional parameters via the standard
+    // `bash -c <code> -- <args...>` form so `$1`, `$2`, … inside
+    // `code` resolve correctly. Honours the same args contract the
+    // other runtimes (py, js, …) already support.
+    if (input.args != null && input.args.length > 0) {
+      return executeLocalBashWithArgs(input.code, input.args, config);
+    }
     return executeLocalBash(input.code, config);
   }
 
