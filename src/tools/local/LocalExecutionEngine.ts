@@ -23,12 +23,17 @@ const DEFAULT_MAX_SPAWNED_BYTES = 50 * 1024 * 1024;
 const DEFAULT_LOCAL_SESSION_ID = 'local';
 const DEFAULT_SHELL = process.platform === 'win32' ? 'bash.exe' : 'bash';
 
+// `(?:--\s+)?` before each destructive-target alternation: GNU/BSD
+// utilities accept `--` as an end-of-options marker, so `rm -rf -- /`
+// is identical in effect to `rm -rf /` but pre-fix it slipped past
+// the guard because the regex required the path to follow option
+// flags directly. Codex P1 #20.
 const dangerousCommandPatterns: ReadonlyArray<RegExp> = [
-  /\brm\s+(?:-[^\s]*[rf][^\s]*\s+|-[^\s]*[r][^\s]*\s+-[^\s]*[f][^\s]*\s+)(?:\/|~|\$HOME|\.)\s*(?:$|[;&|])/,
+  /\brm\s+(?:-[^\s]*[rf][^\s]*\s+|-[^\s]*[r][^\s]*\s+-[^\s]*[f][^\s]*\s+)(?:--\s+)?(?:\/|~|\$HOME|\.)\s*(?:$|[;&|])/,
   /\b(?:mkfs|mkswap|fdisk|parted|diskutil)\b/,
   /\bdd\s+[^;&|]*\bof=\/dev\//,
-  /\bchmod\s+-R\s+(?:777|a\+w)\s+(?:\/|~|\$HOME|\.)\b/,
-  /\bchown\s+-R\s+[^;&|]+\s+(?:\/|~|\$HOME|\.)\b/,
+  /\bchmod\s+-R\s+(?:777|a\+w)\s+(?:--\s+)?(?:\/|~|\$HOME|\.)\b/,
+  /\bchown\s+-R\s+[^;&|]+\s+(?:--\s+)?(?:\/|~|\$HOME|\.)\b/,
   /:\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/,
 ];
 
@@ -48,9 +53,9 @@ const dangerousCommandPatterns: ReadonlyArray<RegExp> = [
  * the whole `rm -rf /` text), so it doesn't match here either.
  */
 const quotedDestructivePatterns: ReadonlyArray<RegExp> = [
-  /\brm\s+(?:-[^\s]*[rf][^\s]*\s+){1,3}["'](?:\/|~|\$\{?HOME\}?|\.)["']/,
-  /\bchmod\s+-R\s+(?:777|a\+w)\s+["'](?:\/|~|\$\{?HOME\}?|\.)["']/,
-  /\bchown\s+-R\s+[^;&|]+\s+["'](?:\/|~|\$\{?HOME\}?|\.)["']/,
+  /\brm\s+(?:-[^\s]*[rf][^\s]*\s+){1,3}(?:--\s+)?["'](?:\/|~|\$\{?HOME\}?|\.)["']/,
+  /\bchmod\s+-R\s+(?:777|a\+w)\s+(?:--\s+)?["'](?:\/|~|\$\{?HOME\}?|\.)["']/,
+  /\bchown\s+-R\s+[^;&|]+\s+(?:--\s+)?["'](?:\/|~|\$\{?HOME\}?|\.)["']/,
 ];
 
 const mutatingCommandPattern =

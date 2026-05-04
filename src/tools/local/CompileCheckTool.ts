@@ -32,6 +32,7 @@ import {
   getLocalCwd,
   spawnLocalProcess,
   truncateLocalOutput,
+  validateBashCommand,
 } from './LocalExecutionEngine';
 import { Constants } from '@/common';
 
@@ -176,6 +177,29 @@ export function createCompileCheckTool(
             kind: detection.kind,
             ran: false,
             reason: detection.reason,
+            cwd,
+          },
+        ];
+      }
+
+      // Codex P1 #21: route the resolved command through the same
+      // safety gates the rest of the local engine uses. Without this
+      // a host with `readOnly: true` (or relying on the destructive-
+      // command guard) could be bypassed by passing a `command`
+      // override to compile_check that performs writes/deletes.
+      // Auto-detected commands (tsc/cargo/etc.) pass these gates
+      // unchanged — the validation is only blocking for genuinely
+      // mutating overrides.
+      const validation = await validateBashCommand(detection.command, config);
+      if (!validation.valid) {
+        const explainer =
+          `compile_check refused to run \`${detection.command}\`: ${validation.errors.join('; ')}`;
+        return [
+          explainer,
+          {
+            kind: detection.kind,
+            ran: false,
+            reason: validation.errors.join('; '),
             cwd,
           },
         ];

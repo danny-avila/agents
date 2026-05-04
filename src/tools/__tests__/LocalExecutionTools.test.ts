@@ -1273,3 +1273,82 @@ describe('codex review fixes (round 5)', () => {
     });
   });
 });
+
+describe('codex review fixes (round 6)', () => {
+  describe('destructive guard handles `--` end-of-options (Codex P1 #20)', () => {
+    it('blocks rm -rf -- "/" (-- between flags and quoted target)', async () => {
+      const result = await validateBashCommand('rm -rf -- "/"');
+      expect(result.valid).toBe(false);
+      expect(result.errors.join('\n')).toContain('destructive command pattern');
+    });
+
+    it('blocks rm -rf -- / (-- between flags and bare target)', async () => {
+      const result = await validateBashCommand('rm -rf -- /');
+      expect(result.valid).toBe(false);
+      expect(result.errors.join('\n')).toContain('destructive command pattern');
+    });
+
+    it('blocks chmod -R 777 -- "/"', async () => {
+      const result = await validateBashCommand('chmod -R 777 -- "/"');
+      expect(result.valid).toBe(false);
+      expect(result.errors.join('\n')).toContain('destructive command pattern');
+    });
+
+    it('blocks rm -rf -- "$HOME"', async () => {
+      const result = await validateBashCommand('rm -rf -- "$HOME"');
+      expect(result.valid).toBe(false);
+      expect(result.errors.join('\n')).toContain('destructive command pattern');
+    });
+
+    it('still allows benign `--` usage (no destructive target)', async () => {
+      // `find` uses `--` to separate options from filenames; benign.
+      const result = await validateBashCommand('find . -- -name "*.ts"');
+      expect(result.valid).toBe(true);
+    });
+  });
+
+  describe('compile_check enforces validateBashCommand + readOnly (Codex P1 #21)', () => {
+    it('refuses a destructive command override (rm -rf "/")', async () => {
+      const cwd = await createTempDir();
+      const compile = createCompileCheckTool({ cwd });
+      const result = await compile.invoke({
+        id: 'cc1',
+        name: Constants.COMPILE_CHECK,
+        args: { command: 'rm -rf "/"' },
+        type: 'tool_call',
+      });
+      const text = JSON.stringify(result);
+      expect(text).toContain('compile_check refused to run');
+      expect(text).toContain('destructive command pattern');
+    });
+
+    it('refuses a mutating command override under readOnly: true', async () => {
+      const cwd = await createTempDir();
+      const compile = createCompileCheckTool({ cwd, readOnly: true });
+      const result = await compile.invoke({
+        id: 'cc2',
+        name: Constants.COMPILE_CHECK,
+        // `touch` is in mutatingCommandPattern — fine outside readOnly,
+        // blocked under readOnly.
+        args: { command: 'touch /tmp/lc-cc-should-not-create' },
+        type: 'tool_call',
+      });
+      const text = JSON.stringify(result);
+      expect(text).toContain('compile_check refused to run');
+      expect(text).toMatch(/read-only|mutate/i);
+    });
+
+    it('still allows benign override commands (echo)', async () => {
+      const cwd = await createTempDir();
+      const compile = createCompileCheckTool({ cwd });
+      const result = await compile.invoke({
+        id: 'cc3',
+        name: Constants.COMPILE_CHECK,
+        args: { command: 'echo hello' },
+        type: 'tool_call',
+      });
+      const text = JSON.stringify(result);
+      expect(text).not.toContain('refused to run');
+    });
+  });
+});
