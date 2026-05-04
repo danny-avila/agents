@@ -3,6 +3,7 @@ import {
   HumanMessage,
   ToolMessage,
   SystemMessage,
+  type BaseMessage,
 } from '@langchain/core/messages';
 import { splitAtRecencyBoundary } from '@/messages/recency';
 
@@ -157,6 +158,73 @@ describe('splitAtRecencyBoundary', () => {
       expect(result.tailTurnCount).toBe(2);
       expect(result.head).toEqual([]);
       expect(result.tail).toEqual(messages);
+    });
+  });
+
+  describe('linearity', () => {
+    it('calls tokenCounter once per message in visited turns (no quadratic recount)', () => {
+      // Build a long history: 200 turns × 10 messages = 2,000 messages.
+      // If the boundary search were quadratic in the number of turns,
+      // the call count would explode (e.g., 200 × 2,000 = 400,000).
+      // The disjoint-slice invariant guarantees one call per visited
+      // message, bounded by messages.length even with a generous turn
+      // budget that visits every turn.
+      const messages: BaseMessage[] = [];
+      const turnCount = 200;
+      const messagesPerTurn = 10;
+      for (let t = 0; t < turnCount; t++) {
+        messages.push(new HumanMessage(`turn ${t} query`));
+        for (let m = 1; m < messagesPerTurn; m++) {
+          messages.push(new AIMessage(`turn ${t} reply ${m}`));
+        }
+      }
+
+      let calls = 0;
+      const tokenCounter = (): number => {
+        calls += 1;
+        return 1;
+      };
+
+      // Generous tokens cap so the loop visits every turn.
+      // turnsCap also generous so the limit isn't hit early.
+      splitAtRecencyBoundary(messages, {
+        turns: 1_000_000,
+        tokens: 1_000_000,
+        tokenCounter,
+      });
+
+      // Strictly bounded by messages.length.  No message is counted
+      // twice, regardless of how many turns the splitter walks.
+      expect(calls).toBeLessThanOrEqual(messages.length);
+      expect(calls).toBe(messages.length);
+    });
+
+    it('stops counting once the tokens cap is exceeded (no scan past the boundary)', () => {
+      const messages: BaseMessage[] = [];
+      for (let t = 0; t < 50; t++) {
+        messages.push(new HumanMessage(`turn ${t}`));
+        messages.push(new AIMessage(`reply ${t}`));
+      }
+
+      let calls = 0;
+      const tokenCounter = (): number => {
+        calls += 1;
+        return 1; // 1 token per message → 100 tokens total
+      };
+
+      // Cap of 10 tokens lets us include the last 5 turns (10 messages)
+      // before the next turn's 2 tokens would overflow.
+      const result = splitAtRecencyBoundary(messages, {
+        turns: 1_000,
+        tokens: 10,
+        tokenCounter,
+      });
+
+      // Visited at most: 5 included turns × 2 messages + one over-budget
+      // turn × 2 messages (counted then rejected) = 12 messages.  Far
+      // less than the full 100.
+      expect(calls).toBeLessThanOrEqual(12);
+      expect(result.tailTurnCount).toBe(5);
     });
   });
 

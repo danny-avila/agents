@@ -104,9 +104,22 @@ export function splitAtRecencyBoundary(
   const trackTokens =
     tokensCap != null && Number.isFinite(tokensCap) && tokenCounter != null;
 
+  /**
+   * Token-counting strategy: each candidate turn `t` spans the half-open
+   * range `[turnStarts[t], turnStarts[t + 1])` (or `[turnStarts[t], messages.length)`
+   * for the most recent turn).  Successive iterations of the outer loop
+   * walk older turns one at a time and never revisit messages from a
+   * later turn — so each message contributes to `tokenCounter` at most
+   * once across the entire selection, making the boundary search
+   * `O(messages_in_visited_turns)` and bounded by `O(messages.length)`
+   * even before the `turnsCap` short-circuit applies.  The inner upper
+   * bound uses `turnStarts[t + 1]` (a value derived from immutable
+   * `turnStarts`) rather than the mutated `tailStartIndex` to make the
+   * disjoint-range invariant self-evident.
+   */
   let tailTokens = 0;
   if (trackTokens) {
-    for (let i = tailStartIndex; i < messages.length; i++) {
+    for (let i = lastTurnStart; i < messages.length; i++) {
       tailTokens += tokenCounter(messages[i] as BaseMessage);
     }
   }
@@ -116,10 +129,11 @@ export function splitAtRecencyBoundary(
       break;
     }
     const turnStart = turnStarts[t] as number;
+    const turnEnd = turnStarts[t + 1] as number;
 
     if (trackTokens) {
       let turnTokens = 0;
-      for (let i = turnStart; i < tailStartIndex; i++) {
+      for (let i = turnStart; i < turnEnd; i++) {
         turnTokens += tokenCounter(messages[i] as BaseMessage);
       }
       if (tailTokens + turnTokens > (tokensCap as number)) {
