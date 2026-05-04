@@ -16,20 +16,45 @@ describe('normalizeAnthropicToolCallId', () => {
     expect(normalizeAnthropicToolCallId('a-b_c-d')).toBe('a-b_c-d');
   });
 
-  it('replaces invalid characters with underscores', () => {
+  it('sanitizes invalid characters and appends a hash suffix', () => {
+    const out = normalizeAnthropicToolCallId(
+      'fc_67abc1234def567|call_abc123def456ghi789jkl0mnopqrs'
+    );
+    expect(/^[a-zA-Z0-9_-]+$/.test(out)).toBe(true);
+    expect(out.length).toBeLessThanOrEqual(64);
     expect(
-      normalizeAnthropicToolCallId(
-        'fc_67abc1234def567|call_abc123def456ghi789jkl0mnopqrs'
-      )
-    ).toBe('fc_67abc1234def567_call_abc123def456ghi789jkl0mnopqrs');
-    expect(normalizeAnthropicToolCallId('a.b@c#d')).toBe('a_b_c_d');
+      out.startsWith('fc_67abc1234def567_call_abc123def456ghi789jkl0mn')
+    ).toBe(true);
+    // Suffix is `_<10-hex-char hash>`
+    expect(out).toMatch(/_[0-9a-f]{10}$/);
   });
 
-  it('truncates IDs longer than 64 characters', () => {
+  it('produces compliant output for IDs of any length', () => {
     const long = 'fc_' + 'a'.repeat(80);
     const out = normalizeAnthropicToolCallId(long);
     expect(out).toHaveLength(64);
-    expect(out.startsWith('fc_aaa')).toBe(true);
+    expect(/^[a-zA-Z0-9_-]+$/.test(out)).toBe(true);
+  });
+
+  it('produces uniquely distinguishable outputs for IDs that share a 64-char prefix', () => {
+    const sharedPrefix = 'fc_' + 'a'.repeat(80);
+    const idA = sharedPrefix + '|call_unique_A';
+    const idB = sharedPrefix + '|call_unique_B';
+
+    const outA = normalizeAnthropicToolCallId(idA);
+    const outB = normalizeAnthropicToolCallId(idB);
+
+    expect(outA).not.toBe(outB);
+    expect(outA).toHaveLength(64);
+    expect(outB).toHaveLength(64);
+    expect(/^[a-zA-Z0-9_-]+$/.test(outA)).toBe(true);
+    expect(/^[a-zA-Z0-9_-]+$/.test(outB)).toBe(true);
+  });
+
+  it('disambiguates short IDs that sanitize to the same value', () => {
+    expect(normalizeAnthropicToolCallId('a|b')).not.toBe(
+      normalizeAnthropicToolCallId('a.b')
+    );
   });
 
   it('handles combined length and character violations', () => {

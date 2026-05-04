@@ -3,6 +3,7 @@
 /**
  * This util file contains functions for converting LangChain messages to Anthropic messages.
  */
+import { createHash } from 'node:crypto';
 import {
   type BaseMessage,
   type SystemMessage,
@@ -92,12 +93,20 @@ function _formatImage(imageUrl: string) {
 
 const ANTHROPIC_TOOL_USE_ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
 const ANTHROPIC_TOOL_USE_ID_MAX_LENGTH = 64;
+const ANTHROPIC_TOOL_USE_ID_HASH_LENGTH = 10;
 
 /**
  * Normalize a tool-call ID to satisfy Anthropic's `^[a-zA-Z0-9_-]+$` and 64-char
  * constraints. Pure and deterministic — same input always yields the same output,
  * so paired `tool_use.id` and `tool_result.tool_use_id` stay matched without
  * needing a session map. IDs that already comply pass through unchanged.
+ *
+ * For non-compliant inputs we sanitize then append a short SHA-256 prefix of
+ * the original ID to preserve uniqueness when truncation would otherwise
+ * collapse distinct IDs to the same value (e.g. two long Responses-style IDs
+ * sharing a 64-char prefix). The hash is computed against the raw input so
+ * inputs that differ only after the truncation cutoff still produce distinct
+ * outputs.
  */
 export function normalizeAnthropicToolCallId(id: string): string;
 export function normalizeAnthropicToolCallId(
@@ -115,9 +124,14 @@ export function normalizeAnthropicToolCallId(
   ) {
     return id;
   }
-  return id
-    .replace(/[^a-zA-Z0-9_-]/g, '_')
-    .slice(0, ANTHROPIC_TOOL_USE_ID_MAX_LENGTH);
+  const sanitized = id.replace(/[^a-zA-Z0-9_-]/g, '_');
+  const hash = createHash('sha256')
+    .update(id)
+    .digest('hex')
+    .slice(0, ANTHROPIC_TOOL_USE_ID_HASH_LENGTH);
+  const prefixMaxLength =
+    ANTHROPIC_TOOL_USE_ID_MAX_LENGTH - ANTHROPIC_TOOL_USE_ID_HASH_LENGTH - 1;
+  return `${sanitized.slice(0, prefixMaxLength)}_${hash}`;
 }
 
 function _ensureMessageContents(
