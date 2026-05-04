@@ -1018,6 +1018,17 @@ export function createSummarizeNode({
     });
 
     /**
+     * `dispatchCompletionEvents` calls `rebuildTokenMapAfterSummarization({})`
+     * which resets the dedupe baseline to 0 — correct under the legacy
+     * "remove-all only" shape where no messages survived, but stale once
+     * the recency window keeps a tail.  Realign the baseline to the
+     * surviving tail length so a subsequent prune cycle on the unchanged
+     * tail short-circuits via `shouldSkipSummarization` instead of
+     * looping back into another summarize call.
+     */
+    agentContext.markSummarizationTriggered(messagesToRetain.length);
+
+    /**
      * Carry forward the original-content entries that correspond to the
      * retained tail, reindexed for the post-removeAll state where tail
      * messages start at index 0.  Without this, a future summarization

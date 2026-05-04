@@ -1060,6 +1060,52 @@ describe('recency window — first-turn protection', () => {
     expect(carryOver!.has(5)).toBe(false);
   });
 
+  it('aligns the dedupe baseline with the surviving tail length after compaction', async () => {
+    captureEvents();
+
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return mockInvokeModel('summary');
+        }
+      } as never
+    );
+
+    const agentContext = createAgentContext({
+      summarizationConfig: { retainRecent: { turns: 1 } },
+    } as never);
+    const graph = mockGraph();
+    const summarizeNode = createSummarizeNode({
+      agentContext,
+      graph: graph as never,
+      generateStepId,
+    });
+
+    const messages = [
+      new HumanMessage('turn 1 query'),
+      new AIMessage('turn 1 reply'),
+      new HumanMessage('turn 2 query'),
+      new AIMessage('turn 2 reply'),
+    ];
+
+    await summarizeNode(
+      {
+        messages,
+        summarizationRequest: {
+          remainingContextTokens: 0,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    // Tail = last turn = 2 messages.  Baseline must equal that count
+    // so a follow-up prune call on the unchanged tail short-circuits
+    // via shouldSkipSummarization rather than re-triggering compaction.
+    expect(agentContext.shouldSkipSummarization(2)).toBe(true);
+    expect(agentContext.shouldSkipSummarization(3)).toBe(false);
+  });
+
   it('does not clear pendingOriginalToolContent on the skip path (state unchanged)', async () => {
     captureEvents();
 

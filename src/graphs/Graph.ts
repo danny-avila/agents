@@ -20,6 +20,7 @@ import {
   extractToolDiscoveries,
   addBedrockCacheControl,
   formatArtifactPayload,
+  enforceOriginalContentCap,
   formatContentStrings,
   createPruneMessages,
   addCacheControl,
@@ -821,6 +822,17 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                 for (const [idx, content] of originalToolContent) {
                   agentContext.pendingOriginalToolContent.set(idx, content);
                 }
+                /**
+                 * Re-apply the per-store char cap after the union.  The
+                 * pruner enforces ORIGINAL_CONTENT_MAX_CHARS inside its
+                 * own map via the onContentStored callback, but a
+                 * key-wise merge with recency carry-over bypasses that
+                 * accounting and could let the merged map grow without
+                 * bound across long sessions.
+                 */
+                enforceOriginalContentCap(
+                  agentContext.pendingOriginalToolContent
+                );
               }
             }
 
