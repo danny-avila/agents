@@ -1062,4 +1062,37 @@ for member in team:
       expect(results[1].result.result).toBe(5);
     });
   });
+
+  describe('bash bridge script does not require python3 (Codex P2 #19)', () => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { _createBashProgramForTests } = require('../local/LocalProgrammaticToolCalling');
+
+    it('uses curl as the primary HTTP helper with python3 only as fallback', () => {
+      const script: string = _createBashProgramForTests(
+        'echo hello',
+        [],
+        'http://127.0.0.1:9999/tool',
+        'test-token'
+      );
+      // Curl path must be present and gated by `command -v curl` so
+      // it's tried first on hosts that have it.
+      expect(script).toContain('command -v curl');
+      expect(script).toContain('curl -sS -X POST');
+      // Python3 must remain as a fallback (not removed).
+      expect(script).toContain('command -v python3');
+      expect(script).toContain('python3 - "$__LIBRECHAT_TOOL_BRIDGE"');
+      // Curl branch must come BEFORE python3 — bash `if/elif` order
+      // determines which helper is preferred. Pre-fix, python3 was
+      // unconditional and the bash bridge failed on python3-less
+      // hosts (minimal containers, some Windows setups).
+      expect(script.indexOf('command -v curl')).toBeLessThan(
+        script.indexOf('command -v python3')
+      );
+      // Curl uses the bridge's text-mode endpoint to skip JSON
+      // parsing on the bash side.
+      expect(script).toContain('?mode=text');
+      // Helpful error when neither helper is available.
+      expect(script).toContain('needs either curl or python3');
+    });
+  });
 });

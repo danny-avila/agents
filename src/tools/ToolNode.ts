@@ -25,6 +25,7 @@ import type {
   ToolOutputResolveView,
   PreResolvedArgsMap,
   ResolvedArgsByCallId,
+  ResolveResult,
 } from '@/tools/toolOutputReferences';
 import type {
   HookRegistry,
@@ -64,6 +65,15 @@ type RunToolBatchContext = {
   batchScopeId?: string;
   /** Batch-local sink for post-substitution args. */
   resolvedArgsByCallId?: ResolvedArgsByCallId;
+  /**
+   * Frozen pre-batch view of the tool-output registry. When supplied,
+   * `runTool` resolves `{{tool…turn…}}` placeholders against this
+   * snapshot instead of the live registry, so a slow `PreToolUse`
+   * hook on one direct call cannot cause a sibling's just-registered
+   * output to leak into this call's args mid-batch (Codex P1 #18 —
+   * `Promise.all`-induced ordering would otherwise be observable).
+   */
+  preBatchSnapshot?: ToolOutputResolveView;
 };
 
 /**
@@ -468,10 +478,35 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     config: RunnableConfig,
     batchContext: RunToolBatchContext = {}
   ): Promise<BaseMessage | Command> {
-    const { batchIndex, turn, batchScopeId, resolvedArgsByCallId } =
-      batchContext;
+    const {
+      batchIndex,
+      turn,
+      batchScopeId,
+      resolvedArgsByCallId,
+      preBatchSnapshot,
+    } = batchContext;
     const tool = this.toolMap.get(call.name);
     const registry = this.toolOutputRegistry;
+    /**
+     * Prefer the caller-provided snapshot when present — `run()`
+     * captures one synchronously per batch so direct-path placeholder
+     * resolution stays isolated from same-turn sibling outputs even
+     * when a slow `PreToolUse` hook lets siblings finish first.
+     * Falls back to the live registry for callers that didn't thread
+     * a snapshot (anonymous direct invokes, legacy paths).
+     */
+    type ResolveFn = <T>(
+      runIdArg: string | undefined,
+      args: T
+    ) => ResolveResult<T>;
+    let resolveFn: ResolveFn | undefined;
+    if (preBatchSnapshot != null) {
+      resolveFn = <T>(_runId: string | undefined, args: T): ResolveResult<T> =>
+        preBatchSnapshot.resolve(args);
+    } else if (registry != null) {
+      resolveFn = <T>(runIdArg: string | undefined, args: T): ResolveResult<T> =>
+        registry.resolve(runIdArg, args);
+    }
     /**
      * Precompute the reference key once per call — captured locally
      * so concurrent `invoke()` calls on the same ToolNode cannot race
@@ -514,8 +549,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         this.toolCallTurns.set(call.id, usageCount);
       }
       let args = call.args;
-      if (registry != null) {
-        const { resolved, unresolved } = registry.resolve(runId, args);
+      if (resolveFn != null) {
+        const { resolved, unresolved } = resolveFn(runId, args);
         args = resolved;
         unresolvedRefs = unresolved;
         /**
@@ -834,8 +869,15 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     const turn = this.toolUsageCount.get(call.name) ?? 0;
     const stepId = this.toolCallStepIds?.get(call.id ?? '') ?? '';
 
+    // Use the caller-threaded snapshot when available (P1 #18) so the
+    // value the PreToolUse hook observes matches the value the
+    // (later-awaited) `runTool` will actually run with — both are
+    // anchored to the pre-batch registry state.
     let resolvedArgs = call.args as Record<string, unknown>;
-    if (this.toolOutputRegistry != null) {
+    if (batchContext.preBatchSnapshot != null) {
+      const { resolved } = batchContext.preBatchSnapshot.resolve(call.args);
+      resolvedArgs = resolved as Record<string, unknown>;
+    } else if (this.toolOutputRegistry != null) {
       const { resolved } = this.toolOutputRegistry.resolve(
         registryRunId,
         call.args
@@ -2598,6 +2640,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                   turn,
                   batchScopeId,
                   resolvedArgsByCallId,
+                  preBatchSnapshot,
                 })
               )
             )
@@ -2632,6 +2675,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           ...eventResult.injected,
         ];
       } else {
+        // Same per-batch pre-snapshot as the mixed path, applied to
+        // the all-direct case so `Promise.all`-induced ordering can't
+        // leak a sibling's just-registered output into a sister
+        // call's args mid-await (Codex P1 #18).
+        const preBatchSnapshot =
+          this.toolOutputRegistry?.snapshot(batchScopeId);
         outputs = await Promise.all(
           filteredCalls.map((call, i) =>
             this.runDirectToolWithLifecycleHooks(call, config, {
@@ -2639,6 +2688,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               turn,
               batchScopeId,
               resolvedArgsByCallId,
+              preBatchSnapshot,
             })
           )
         );

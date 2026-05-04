@@ -110,8 +110,20 @@ function writeJson(res: ServerResponse, status: number, value: unknown): void {
 async function createToolBridge(toolMap: t.ToolMap): Promise<ToolBridge> {
   const token = randomBytes(32).toString('hex');
   const server = createServer((req, res) => {
-    if (req.method !== 'POST' || req.url !== '/tool') {
-      writeJson(res, 404, { error: 'Not found' });
+    // `?mode=text` returns the already-serialized result as the body
+    // (or the error message at non-2xx). Python/Node callers stay on
+    // JSON; bash callers using curl can avoid pulling in a JSON
+    // parser dependency (Codex P2 #19 — `python3` was a hard
+    // requirement for the bash bridge, breaking minimal containers).
+    const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+    const isTextMode = url.searchParams.get('mode') === 'text';
+    if (req.method !== 'POST' || url.pathname !== '/tool') {
+      if (isTextMode) {
+        res.writeHead(404, { 'Content-Type': 'text/plain' });
+        res.end('Not found');
+      } else {
+        writeJson(res, 404, { error: 'Not found' });
+      }
       return;
     }
 
@@ -121,19 +133,30 @@ async function createToolBridge(toolMap: t.ToolMap): Promise<ToolBridge> {
       typeof presentedToken !== 'string' ||
       !constantTimeEquals(presentedToken, token)
     ) {
-      writeJson(res, 401, { error: 'Unauthorized' });
+      if (isTextMode) {
+        res.writeHead(401, { 'Content-Type': 'text/plain' });
+        res.end('Unauthorized');
+      } else {
+        writeJson(res, 401, { error: 'Unauthorized' });
+      }
       return;
     }
 
     readRequestBody(req)
       .then(async (body) => {
         if (typeof body.name !== 'string' || body.name === '') {
-          writeJson(res, 400, {
-            call_id: body.id ?? 'invalid',
-            result: null,
-            is_error: true,
-            error_message: 'Tool request is missing a tool name.',
-          });
+          const message = 'Tool request is missing a tool name.';
+          if (isTextMode) {
+            res.writeHead(400, { 'Content-Type': 'text/plain' });
+            res.end(message);
+          } else {
+            writeJson(res, 400, {
+              call_id: body.id ?? 'invalid',
+              result: null,
+              is_error: true,
+              error_message: message,
+            });
+          }
           return;
         }
 
@@ -148,18 +171,37 @@ async function createToolBridge(toolMap: t.ToolMap): Promise<ToolBridge> {
           toolMap
         );
 
+        if (isTextMode) {
+          if (result.is_error === true) {
+            res.writeHead(500, { 'Content-Type': 'text/plain' });
+            res.end(result.error_message ?? `Tool ${body.name} failed`);
+          } else {
+            const value = toSerializable(result.result);
+            const text =
+              typeof value === 'string' ? value : JSON.stringify(value);
+            res.writeHead(200, { 'Content-Type': 'text/plain' });
+            res.end(text);
+          }
+          return;
+        }
+
         writeJson(res, 200, {
           ...result,
           result: toSerializable(result.result),
         });
       })
       .catch((error: Error) => {
-        writeJson(res, 500, {
-          call_id: 'error',
-          result: null,
-          is_error: true,
-          error_message: error.message,
-        });
+        if (isTextMode) {
+          res.writeHead(500, { 'Content-Type': 'text/plain' });
+          res.end(error.message);
+        } else {
+          writeJson(res, 500, {
+            call_id: 'error',
+            result: null,
+            is_error: true,
+            error_message: error.message,
+          });
+        }
       });
   });
 
@@ -237,6 +279,15 @@ asyncio.run(__librechat_main())
 `.trimStart();
 }
 
+export function _createBashProgramForTests(
+  code: string,
+  toolDefs: t.LCTool[],
+  bridgeUrl: string,
+  bridgeToken: string
+): string {
+  return createBashProgram(code, toolDefs, bridgeUrl, bridgeToken);
+}
+
 function createBashProgram(
   code: string,
   toolDefs: t.LCTool[],
@@ -261,10 +312,37 @@ __LIBRECHAT_TOOL_BRIDGE=${shellQuote(bridgeUrl)}
 __LIBRECHAT_TOOL_HEADER=${shellQuote(BRIDGE_AUTH_HEADER)}
 __LIBRECHAT_TOOL_TOKEN=${shellQuote(bridgeToken)}
 
+# Bridge call helper. Tries curl first (universally available, no
+# JSON parser needed thanks to the bridge's ?mode=text endpoint),
+# falls back to python3 for environments without curl. Codex P2 #19
+# flagged that the prior python3-only path broke minimal containers
+# (and Windows hosts without a python3 binary on PATH). Tool names
+# come from Constants.* and are always safe identifiers, so we can
+# splice them into JSON without an escape pass.
 __librechat_call_tool() {
   local tool_name="$1"
   local payload="$2"
-  python3 - "$__LIBRECHAT_TOOL_BRIDGE" "$tool_name" "$payload" "$__LIBRECHAT_TOOL_HEADER" "$__LIBRECHAT_TOOL_TOKEN" <<'PY'
+  if command -v curl >/dev/null 2>&1; then
+    local body="{\\"name\\":\\"$tool_name\\",\\"input\\":$payload}"
+    local response
+    local http_code
+    response=$(curl -sS -X POST \
+      -H "Content-Type: application/json" \
+      -H "$__LIBRECHAT_TOOL_HEADER: $__LIBRECHAT_TOOL_TOKEN" \
+      --data-binary "$body" \
+      -w '\\n__LIBRECHAT_HTTP_CODE_%{http_code}__' \
+      "$__LIBRECHAT_TOOL_BRIDGE?mode=text")
+    http_code=$(printf '%s' "$response" | sed -n 's/.*__LIBRECHAT_HTTP_CODE_\\([0-9][0-9]*\\)__$/\\1/p')
+    local body_only
+    body_only=$(printf '%s' "$response" | sed 's/__LIBRECHAT_HTTP_CODE_[0-9][0-9]*__$//')
+    if [ "$http_code" = "200" ]; then
+      printf '%s' "$body_only"
+      return 0
+    fi
+    printf '%s\\n' "$body_only" >&2
+    return 1
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 - "$__LIBRECHAT_TOOL_BRIDGE" "$tool_name" "$payload" "$__LIBRECHAT_TOOL_HEADER" "$__LIBRECHAT_TOOL_TOKEN" <<'PY'
 import json
 import sys
 import urllib.request
@@ -283,6 +361,10 @@ if isinstance(value, str):
 else:
   print(json.dumps(value))
 PY
+  else
+    printf 'librechat: tool bridge needs either curl or python3 on PATH\\n' >&2
+    return 1
+  fi
 }
 
 ${functions}
