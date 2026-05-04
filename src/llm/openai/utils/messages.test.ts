@@ -156,4 +156,141 @@ describe('_convertMessagesToOpenAIParams', () => {
       })
     );
   });
+
+  describe('cross-provider thinking block handling', () => {
+    it('flattens Anthropic thinking block to <thinking> text for OpenAI target', () => {
+      const messages = [
+        new HumanMessage('hi'),
+        new AIMessage({
+          content: [
+            {
+              type: 'thinking',
+              thinking: 'Reviewing whether 17 is prime.',
+              signature: 'sig_abc',
+            },
+            { type: 'text', text: 'Yes, 17 is prime.' },
+          ] as never,
+        }),
+      ];
+
+      const params = _convertMessagesToOpenAIParams(messages, 'gpt-4o-mini');
+
+      expect(params[1]).toEqual(
+        expect.objectContaining({
+          role: 'assistant',
+          content: [
+            {
+              type: 'text',
+              text: '<thinking>Reviewing whether 17 is prime.</thinking>',
+            },
+            { type: 'text', text: 'Yes, 17 is prime.' },
+          ],
+        })
+      );
+    });
+
+    it('drops empty thinking block before forwarding to OpenAI', () => {
+      const messages = [
+        new HumanMessage('hi'),
+        new AIMessage({
+          content: [
+            { type: 'thinking', thinking: '', signature: 'sig_empty' },
+            { type: 'text', text: 'response' },
+          ] as never,
+        }),
+      ];
+
+      const params = _convertMessagesToOpenAIParams(messages, 'gpt-4o-mini');
+
+      expect(params[1]).toEqual(
+        expect.objectContaining({
+          role: 'assistant',
+          content: [{ type: 'text', text: 'response' }],
+        })
+      );
+    });
+
+    it('drops redacted_thinking block for OpenAI target', () => {
+      const messages = [
+        new AIMessage({
+          content: [
+            {
+              type: 'redacted_thinking',
+              data: 'opaque-encrypted-blob',
+            },
+            { type: 'text', text: 'visible answer' },
+          ] as never,
+        }),
+      ];
+
+      const params = _convertMessagesToOpenAIParams(messages, 'gpt-4o-mini');
+
+      expect(params[0]).toEqual(
+        expect.objectContaining({
+          content: [{ type: 'text', text: 'visible answer' }],
+        })
+      );
+    });
+
+    it('preserves thinking block for Claude-via-OpenRouter target', () => {
+      const messages = [
+        new AIMessage({
+          content: [
+            {
+              type: 'thinking',
+              thinking: 'Considering options.',
+              signature: 'sig_x',
+            },
+            { type: 'text', text: 'Done.' },
+          ] as never,
+        }),
+      ];
+
+      const params = _convertMessagesToOpenAIParams(
+        messages,
+        'anthropic/claude-sonnet-4-5'
+      );
+
+      expect(params[0]).toEqual(
+        expect.objectContaining({
+          content: [
+            {
+              type: 'thinking',
+              thinking: 'Considering options.',
+              signature: 'sig_x',
+            },
+            { type: 'text', text: 'Done.' },
+          ],
+        })
+      );
+    });
+
+    it('emits empty content string when thinking-only message is fully dropped alongside tool_calls', () => {
+      const messages = [
+        new AIMessage({
+          content: [
+            { type: 'thinking', thinking: '', signature: 'sig' },
+          ] as never,
+          tool_calls: [
+            {
+              id: 'call_1',
+              name: 'noop',
+              args: {},
+              type: 'tool_call',
+            },
+          ],
+        }),
+      ];
+
+      const params = _convertMessagesToOpenAIParams(messages, 'gpt-4o-mini');
+
+      expect(params[0]).toEqual(
+        expect.objectContaining({
+          role: 'assistant',
+          content: '',
+          tool_calls: expect.any(Array),
+        })
+      );
+    });
+  });
 });

@@ -313,22 +313,52 @@ export function _convertMessagesToOpenAIParams(
 
     let hasAnthropicThinkingBlock: boolean = false;
 
+    /**
+     * When the target is Claude served via an OpenAI-shaped surface (e.g.
+     * OpenRouter), thinking and redacted_thinking blocks are valid input and
+     * must pass through verbatim. For native OpenAI, those block types are
+     * rejected with a 400 — flatten thinking to a `<thinking>...</thinking>`
+     * text block so the reasoning narrative remains in-band, drop empty
+     * thinking blocks (some providers reject empty content), and drop
+     * redacted_thinking entirely (its payload is encrypted and useless to
+     * a non-Anthropic model).
+     */
+    const isClaudeTarget =
+      model?.includes('claude') === true ||
+      model?.includes('anthropic') === true;
+
     const content =
       typeof message.content === 'string'
         ? message.content
-        : message.content.map((m) => {
-          if ('type' in m && m.type === 'thinking') {
-            hasAnthropicThinkingBlock = true;
+        : message.content
+          .map((m) => {
+            if ('type' in m && m.type === 'thinking') {
+              hasAnthropicThinkingBlock = true;
+              if (isClaudeTarget) {
+                return m;
+              }
+              const thinking = (m as { thinking?: string }).thinking ?? '';
+              if (!thinking) {
+                return null;
+              }
+              return {
+                type: 'text' as const,
+                text: `<thinking>${thinking}</thinking>`,
+              };
+            }
+            if ('type' in m && m.type === 'redacted_thinking') {
+              hasAnthropicThinkingBlock = true;
+              return isClaudeTarget ? m : null;
+            }
+            if (isDataContentBlock(m)) {
+              return convertToProviderContentBlock(
+                m,
+                completionsApiContentBlockConverter
+              );
+            }
             return m;
-          }
-          if (isDataContentBlock(m)) {
-            return convertToProviderContentBlock(
-              m,
-              completionsApiContentBlockConverter
-            );
-          }
-          return m;
-        });
+          })
+          .filter(<T>(m: T | null): m is T => m !== null);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const completionParam: Record<string, any> = {
       role,
@@ -348,7 +378,11 @@ export function _convertMessagesToOpenAIParams(
       completionParam.tool_calls = message.tool_calls.map(
         convertLangChainToolCallToOpenAI
       );
-      completionParam.content = hasAnthropicThinkingBlock ? content : '';
+      completionParam.content = hasAnthropicThinkingBlock
+        ? Array.isArray(content) && content.length === 0
+          ? ''
+          : content
+        : '';
       if (
         options?.includeReasoningDetails === true &&
         message.additional_kwargs.reasoning_details != null
