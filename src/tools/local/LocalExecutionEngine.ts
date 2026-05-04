@@ -30,6 +30,8 @@ type SpawnResult = {
   stderr: string;
   exitCode: number | null;
   timedOut: boolean;
+  /** Path to the full untruncated stdout/stderr when output exceeded `maxOutputChars`. */
+  fullOutputPath?: string;
 };
 
 type RuntimeCommand = {
@@ -373,11 +375,37 @@ export async function spawnLocalProcess(
       if (timeout != null) {
         clearTimeout(timeout);
       }
-      resolveResult({
-        ...result,
+      const overflows =
+        result.stdout.length + result.stderr.length > maxOutputChars * 2;
+      const truncated = {
         stdout: truncateLocalOutput(result.stdout, maxOutputChars),
         stderr: truncateLocalOutput(result.stderr, maxOutputChars),
-      });
+      };
+      if (!overflows) {
+        resolveResult({ ...result, ...truncated });
+        return;
+      }
+      const tmpPath = resolve(
+        tmpdir(),
+        `lc-local-output-${randomUUID()}.txt`
+      );
+      const fullPayload =
+        '===== stdout =====\n' +
+        result.stdout +
+        '\n===== stderr =====\n' +
+        result.stderr +
+        '\n';
+      writeFile(tmpPath, fullPayload, 'utf8')
+        .then(() => {
+          resolveResult({
+            ...result,
+            ...truncated,
+            fullOutputPath: tmpPath,
+          });
+        })
+        .catch(() => {
+          resolveResult({ ...result, ...truncated });
+        });
     };
 
     const fail = (error: Error): void => {

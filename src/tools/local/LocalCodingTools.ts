@@ -1,6 +1,7 @@
-import { dirname } from 'path';
+import { basename, dirname } from 'path';
 import { readdir, readFile, stat, writeFile, mkdir, open } from 'fs/promises';
 import { tool } from '@langchain/core/tools';
+import { createTwoFilesPatch } from 'diff';
 import type { DynamicStructuredTool } from '@langchain/core/tools';
 import type * as t from '@/types';
 import {
@@ -17,6 +18,8 @@ import {
   truncateLocalOutput,
 } from './LocalExecutionEngine';
 import { createLocalFileCheckpointer } from './FileCheckpointer';
+import { applyEdit, locateEdit } from './editStrategies';
+import { decodeFile, encodeFile } from './textEncoding';
 import { Constants } from '@/common';
 
 const MAX_READ_CHARS = 256000;
@@ -165,17 +168,27 @@ function lineWindow(
   };
 }
 
-function countOccurrences(content: string, needle: string): number {
-  if (needle === '') {
-    return 0;
+const MAX_DIFF_CHARS = 4000;
+
+function summariseDiff(
+  filePath: string,
+  before: string,
+  after: string
+): string {
+  if (before === after) {
+    return '(no textual changes)';
   }
-  let count = 0;
-  let index = content.indexOf(needle);
-  while (index !== -1) {
-    count++;
-    index = content.indexOf(needle, index + needle.length);
+  const name = basename(filePath);
+  const patch = createTwoFilesPatch(name, name, before, after, '', '', {
+    context: 3,
+  });
+  if (patch.length <= MAX_DIFF_CHARS) {
+    return patch;
   }
-  return count;
+  return (
+    patch.slice(0, MAX_DIFF_CHARS) +
+    `\n[... diff truncated, ${patch.length - MAX_DIFF_CHARS} more chars ...]`
+  );
 }
 
 function normalizeEdits(input: {
@@ -297,14 +310,49 @@ export function createLocalWriteFileTool(
       if (checkpointer != null) {
         await checkpointer.captureBeforeWrite(path);
       }
+
+      let before = '';
+      let encoding = { text: '', hasBom: false, newline: '\n' as const } as
+        | ReturnType<typeof decodeFile>
+        | { text: string; hasBom: false; newline: '\n' };
+      let existed = false;
+      try {
+        const raw = await readFile(path, 'utf8');
+        const decoded = decodeFile(raw);
+        before = decoded.text;
+        encoding = decoded;
+        existed = true;
+      } catch {
+        existed = false;
+      }
+
       await mkdir(dirname(path), { recursive: true });
-      await writeFile(path, input.content, 'utf8');
-      return [`Wrote ${input.content.length} characters to ${path}`, { path }];
+      const finalText = encodeFile(input.content, encoding);
+      await writeFile(path, finalText, 'utf8');
+
+      const diff = existed
+        ? summariseDiff(path, before, input.content)
+        : `(new file, ${input.content.length} chars)`;
+      const summary = existed
+        ? `Overwrote ${path} (${input.content.length} chars). Diff:\n${diff}`
+        : `Created ${path} (${input.content.length} chars).`;
+      return [
+        summary,
+        {
+          path,
+          bytes: finalText.length,
+          new_file: !existed,
+          newline: encoding.newline === '\r\n' ? 'CRLF' : 'LF',
+          had_bom: encoding.hasBom,
+        },
+      ];
     },
     {
       name: LocalWriteFileToolName,
       description:
-        'Create or overwrite a local text file in the configured working directory.',
+        'Create or overwrite a local text file in the configured working directory. ' +
+        'Preserves the existing BOM and line endings when overwriting; defaults to LF without BOM for new files. ' +
+        'Returns a unified diff of the changes when overwriting.',
       schema: LocalWriteFileToolSchema,
       responseFormat: Constants.CONTENT_AND_ARTIFACT,
     }
@@ -332,27 +380,53 @@ export function createLocalEditFileTool(
       }
 
       const path = await resolveWorkspacePathSafe(input.file_path, config);
-      const original = await readFile(path, 'utf8');
+      const raw = await readFile(path, 'utf8');
+      const encoding = decodeFile(raw);
+      const original = encoding.text;
+
       let next = original;
-      for (const edit of edits) {
-        const count = countOccurrences(next, edit.oldText);
-        if (count !== 1) {
+      const strategiesUsed: string[] = [];
+      for (let i = 0; i < edits.length; i++) {
+        const edit = edits[i];
+        const match = locateEdit(next, edit.oldText);
+        if (match == null) {
           throw new Error(
-            `Expected old_text to appear exactly once in ${input.file_path}, found ${count}.`
+            `Edit ${i + 1}/${edits.length}: could not locate old_text in ${input.file_path}. ` +
+              'Tried exact, line-trimmed, whitespace-normalized, and indentation-flexible matching. ' +
+              'Re-read the file and copy the literal lines.'
           );
         }
-        next = next.replace(edit.oldText, edit.newText);
+        strategiesUsed.push(match.strategy);
+        next = applyEdit(next, match, edit.newText);
       }
+
       if (checkpointer != null) {
         await checkpointer.captureBeforeWrite(path);
       }
-      await writeFile(path, next, 'utf8');
-      return [`Applied ${edits.length} edit(s) to ${path}`, { path }];
+      const finalText = encodeFile(next, encoding);
+      await writeFile(path, finalText, 'utf8');
+
+      const diff = summariseDiff(path, original, next);
+      const fuzzy = strategiesUsed.some((s) => s !== 'exact');
+      const summary =
+        `Applied ${edits.length} edit(s) to ${path}` +
+        (fuzzy ? ` (strategies: ${strategiesUsed.join(', ')})` : '') +
+        `. Diff:\n${diff}`;
+      return [
+        summary,
+        {
+          path,
+          edits: edits.length,
+          strategies: strategiesUsed,
+          newline: encoding.newline === '\r\n' ? 'CRLF' : 'LF',
+          had_bom: encoding.hasBom,
+        },
+      ];
     },
     {
       name: LocalEditFileToolName,
       description:
-        'Apply exact text replacements to a local file. Each old_text must match exactly once.',
+        'Apply exact text replacements to a local file. The matcher tries exact, line-trimmed, whitespace-normalized, and indentation-flexible strategies in order so common LLM whitespace mistakes are recoverable. Each old_text must still match exactly one location. Returns a unified diff of the changes.',
       schema: LocalEditFileToolSchema,
       responseFormat: Constants.CONTENT_AND_ARTIFACT,
     }

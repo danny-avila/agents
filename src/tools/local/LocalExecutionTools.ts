@@ -45,7 +45,13 @@ Usage:
 `.trim();
 
 function formatLocalOutput(
-  result: { stdout: string; stderr: string; exitCode: number | null; timedOut: boolean },
+  result: {
+    stdout: string;
+    stderr: string;
+    exitCode: number | null;
+    timedOut: boolean;
+    fullOutputPath?: string;
+  },
   cwd: string
 ): string {
   let formatted = '';
@@ -65,6 +71,10 @@ function formatLocalOutput(
 
   if (result.timedOut) {
     formatted += 'timed_out: true\n';
+  }
+
+  if (result.fullOutputPath != null) {
+    formatted += `full_output_path: ${result.fullOutputPath} (output exceeded the configured cap; use bash to inspect — the file holds the complete stdout/stderr)\n`;
   }
 
   formatted += `working_directory: ${cwd}`;

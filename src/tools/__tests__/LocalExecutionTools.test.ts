@@ -386,6 +386,102 @@ describe('local programmatic bridge auth', () => {
   });
 });
 
+describe('local edit fuzzy matching', () => {
+  it('falls back to line-trimmed when trailing whitespace differs', async () => {
+    const cwd = await createTempDir();
+    const file = join(cwd, 'a.ts');
+    // Real file has trailing whitespace on every line.
+    await fsWriteFile(
+      file,
+      'function greet(name: string) {  \n  return `Hello, ${name}!`;  \n}\n',
+      'utf8'
+    );
+
+    const bundle = createLocalCodingToolBundle({ cwd });
+    const editTool = bundle.tools.find((tt) => tt.name === 'edit_file');
+    const result = await editTool!.invoke({
+      file_path: 'a.ts',
+      // LLM emits a trailing-whitespace-stripped version.
+      old_text:
+        'function greet(name: string) {\n  return `Hello, ${name}!`;\n}',
+      new_text:
+        'function greet(name: string) {\n  return `Hi, ${name}!`;\n}',
+    });
+    expect(String(result)).toContain('strategies: line-trimmed');
+    const after = await fsReadFile(file, 'utf8');
+    expect(after).toContain('Hi, ${name}!');
+  });
+
+  it('falls back to indentation-flexible when LLM strips leading indent', async () => {
+    const cwd = await createTempDir();
+    const file = join(cwd, 'a.ts');
+    await fsWriteFile(
+      file,
+      'class Foo {\n    method() {\n        return 1;\n    }\n}\n',
+      'utf8'
+    );
+
+    const bundle = createLocalCodingToolBundle({ cwd });
+    const editTool = bundle.tools.find((tt) => tt.name === 'edit_file');
+    const result = await editTool!.invoke({
+      file_path: 'a.ts',
+      // LLM stripped the 4-space indent
+      old_text: 'method() {\n    return 1;\n}',
+      new_text: 'method() {\n    return 42;\n}',
+    });
+    expect(String(result)).toMatch(
+      /strategies: (indentation-flexible|whitespace-normalized)/
+    );
+    const after = await fsReadFile(file, 'utf8');
+    expect(after).toContain('return 42;');
+  });
+
+  it('returns a unified diff in the tool result', async () => {
+    const cwd = await createTempDir();
+    const file = join(cwd, 'a.txt');
+    await fsWriteFile(file, 'first\nsecond\nthird\n', 'utf8');
+    const bundle = createLocalCodingToolBundle({ cwd });
+    const editTool = bundle.tools.find((tt) => tt.name === 'edit_file');
+    const result = await editTool!.invoke({
+      file_path: 'a.txt',
+      old_text: 'second',
+      new_text: 'SECOND',
+    });
+    const text = String(result);
+    expect(text).toContain('Diff:');
+    expect(text).toContain('-second');
+    expect(text).toContain('+SECOND');
+  });
+
+  it('preserves CRLF line endings on edit', async () => {
+    const cwd = await createTempDir();
+    const file = join(cwd, 'a.txt');
+    await fsWriteFile(file, 'one\r\ntwo\r\nthree\r\n', 'utf8');
+    const bundle = createLocalCodingToolBundle({ cwd });
+    const editTool = bundle.tools.find((tt) => tt.name === 'edit_file');
+    await editTool!.invoke({
+      file_path: 'a.txt',
+      old_text: 'two',
+      new_text: 'TWO',
+    });
+    const raw = await fsReadFile(file, 'utf8');
+    expect(raw).toBe('one\r\nTWO\r\nthree\r\n');
+  });
+
+  it('preserves UTF-8 BOM on overwrite', async () => {
+    const cwd = await createTempDir();
+    const file = join(cwd, 'a.txt');
+    const BOM = '﻿';
+    await fsWriteFile(file, BOM + 'hello\n', 'utf8');
+    const bundle = createLocalCodingToolBundle({ cwd });
+    const writeTool = bundle.tools.find((tt) => tt.name === 'write_file');
+    await writeTool!.invoke({ file_path: 'a.txt', content: 'goodbye\n' });
+    const raw = await fsReadFile(file, 'utf8');
+    expect(raw.startsWith(BOM)).toBe(true);
+    expect(raw.slice(1)).toBe('goodbye\n');
+  });
+});
+
 describe('local search fallback', () => {
   beforeEach(() => {
     _resetRipgrepCacheForTests();
