@@ -196,10 +196,94 @@ async function testOpenAIWithEmptyThinking(): Promise<void> {
   }
 }
 
+// Test 4: collision case — two long IDs that share a 64-char prefix.
+// Without a hash suffix, both would normalize to the same value and Anthropic
+// would reject with "tool_use ids must be unique" (or mis-associate results).
+async function testAnthropicAcceptsCollidingIds(): Promise<void> {
+  header('TEST 4: Two long IDs sharing a 64-char prefix (collision case)');
+
+  const sharedPrefix = 'fc_' + 'a'.repeat(80);
+  const idA = sharedPrefix + '|call_uniqueA';
+  const idB = sharedPrefix + '|call_uniqueB';
+  console.log(`ID A length=${idA.length}, ID B length=${idB.length}`);
+  console.log(`Shared 80-char "a" prefix; differ only past index 90.`);
+
+  const claude = new CustomAnthropic({
+    modelName: 'claude-haiku-4-5',
+    apiKey: ANTHROPIC_KEY,
+    maxTokens: 100,
+  });
+
+  const tools = [
+    {
+      name: 'get_weather',
+      description: 'Get weather',
+      input_schema: {
+        type: 'object',
+        properties: { location: { type: 'string' } },
+        required: ['location'],
+      },
+    },
+  ];
+
+  const history = [
+    new HumanMessage('Weather in Tokyo and Osaka?'),
+    new AIMessage({
+      content: 'Looking up both.',
+      tool_calls: [
+        {
+          id: idA,
+          name: 'get_weather',
+          args: { location: 'Tokyo' },
+          type: 'tool_call',
+        },
+        {
+          id: idB,
+          name: 'get_weather',
+          args: { location: 'Osaka' },
+          type: 'tool_call',
+        },
+      ],
+    }),
+    new ToolMessage({
+      tool_call_id: idA,
+      content: '{"temp": 21, "unit": "C"}',
+    }),
+    new ToolMessage({
+      tool_call_id: idB,
+      content: '{"temp": 18, "unit": "C"}',
+    }),
+    new HumanMessage('Which is warmer?'),
+  ];
+
+  const result = await tryCall(async () => {
+    const stream = await claude.bindTools(tools).stream(history);
+    const chunks = [];
+    for await (const chunk of stream) chunks.push(chunk);
+    return chunks;
+  });
+  if (result.ok) {
+    console.log(
+      'Anthropic ACCEPTED both tool_use blocks — disambiguation works.'
+    );
+    const chunks = result.result as Array<{ content?: unknown }>;
+    const text = chunks
+      .map((c) =>
+        typeof c.content === 'string' ? c.content : JSON.stringify(c.content)
+      )
+      .join('');
+    console.log(`Response sample: ${text.slice(0, 200)}`);
+  } else {
+    console.log('Anthropic rejected:');
+    console.log(`  ${describeError(result.error)}`);
+  }
+}
+
 async function main(): Promise<void> {
   await testAnthropicRejectsResponsesId();
   await testOpenAIWithThinkingBlock();
   await testOpenAIWithEmptyThinking();
+  await testAnthropicAcceptsCollidingIds();
   console.log('\nDone.');
 }
 
