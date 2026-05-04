@@ -341,6 +341,41 @@ export type ToolOutputReferencesConfig = {
 
 export type ToolExecutionEngine = 'sandbox' | 'local';
 
+/**
+ * Records pre-write file contents so callers can rewind edits/writes
+ * made by the local engine. Implementations live in `src/tools/local`.
+ */
+export interface LocalFileCheckpointer {
+  /**
+   * Captures the current contents of `absolutePath` before a write or
+   * edit. Idempotent: capturing the same path twice keeps the first
+   * snapshot. Records "did not exist" so creates can be undone with
+   * deletion.
+   */
+  captureBeforeWrite(absolutePath: string): Promise<void>;
+  /** Restores all captured snapshots. Returns the number of files restored. */
+  rewind(): Promise<number>;
+  /** Returns paths that have been captured during this run. */
+  capturedPaths(): string[];
+}
+
+/**
+ * Pluggable process launcher used by the local execution engine. When
+ * provided, the engine calls this in place of `child_process.spawn`,
+ * letting callers route shell commands through SSH, containers, or
+ * remote runners without forking the engine. The implementation must
+ * return a `ChildProcess`-shaped value whose `stdout`/`stderr` streams
+ * emit `data` events and that resolves a `close` event when finished.
+ */
+export type LocalSpawn = (
+  command: string,
+  args: string[],
+  options: import('child_process').SpawnOptions
+) => import('child_process').ChildProcessWithoutNullStreams;
+
+/** Bash command-validation strictness for the local engine. */
+export type LocalBashAstMode = 'auto' | 'off' | 'strict';
+
 export type LocalSandboxConfig = {
   /**
    * Enable Anthropic Sandbox Runtime wrapping for local process tools.
@@ -394,6 +429,33 @@ export type LocalExecutionConfig = {
    * code/bash execution tools) when `engine` is `local`. Defaults to true.
    */
   includeCodingTools?: boolean;
+  /**
+   * Override the process launcher. When set, replaces
+   * `child_process.spawn` for every local tool invocation, allowing
+   * SSH/container delegation. Default: native spawn.
+   */
+  spawn?: LocalSpawn;
+  /**
+   * Tree-sitter-bash AST validation pass on bash commands.
+   * - `'off'` skips AST validation (regex + `bash -n` only — current behavior).
+   * - `'auto'` runs the AST validator when `tree-sitter` modules are
+   *   available; falls back silently otherwise.
+   * - `'strict'` requires the AST validator and fails closed when
+   *   parsing is unavailable or the command is too complex to verify.
+   * Default: `'off'` to preserve historical behavior.
+   */
+  bashAst?: LocalBashAstMode;
+  /**
+   * Enable per-Run file checkpointing for `edit_file` / `write_file` so
+   * callers can rewind file changes via `Run.rewindFiles()`. Defaults
+   * to false.
+   */
+  fileCheckpointing?: boolean;
+  /**
+   * Maximum bytes to read in `read_file` before returning a stub.
+   * Defaults to 10 MiB.
+   */
+  maxReadBytes?: number;
 };
 
 export type ToolExecutionConfig = {

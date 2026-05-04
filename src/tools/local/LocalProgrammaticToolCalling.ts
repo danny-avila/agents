@@ -1,4 +1,4 @@
-import { randomUUID } from 'crypto';
+import { randomBytes, randomUUID, timingSafeEqual } from 'crypto';
 import { createServer } from 'http';
 import { tool } from '@langchain/core/tools';
 import type { AddressInfo } from 'net';
@@ -45,6 +45,7 @@ const LocalProgrammaticToolCallingSchema = {
 
 type ToolBridge = {
   url: string;
+  token: string;
   close: () => Promise<void>;
 };
 
@@ -53,6 +54,17 @@ type ToolRequest = {
   name?: string;
   input?: Record<string, unknown>;
 };
+
+const BRIDGE_AUTH_HEADER = 'x-librechat-bridge-token';
+
+function constantTimeEquals(a: string, b: string): boolean {
+  const aBuf = Buffer.from(a, 'utf8');
+  const bBuf = Buffer.from(b, 'utf8');
+  if (aBuf.length !== bBuf.length) {
+    return false;
+  }
+  return timingSafeEqual(aBuf, bBuf);
+}
 
 type LocalProgrammaticRuntime = 'python' | 'bash';
 
@@ -96,9 +108,20 @@ function writeJson(res: ServerResponse, status: number, value: unknown): void {
 }
 
 async function createToolBridge(toolMap: t.ToolMap): Promise<ToolBridge> {
+  const token = randomBytes(32).toString('hex');
   const server = createServer((req, res) => {
     if (req.method !== 'POST' || req.url !== '/tool') {
       writeJson(res, 404, { error: 'Not found' });
+      return;
+    }
+
+    const presented = req.headers[BRIDGE_AUTH_HEADER];
+    const presentedToken = Array.isArray(presented) ? presented[0] : presented;
+    if (
+      typeof presentedToken !== 'string' ||
+      !constantTimeEquals(presentedToken, token)
+    ) {
+      writeJson(res, 401, { error: 'Unauthorized' });
       return;
     }
 
@@ -148,6 +171,7 @@ async function createToolBridge(toolMap: t.ToolMap): Promise<ToolBridge> {
   const address = server.address() as AddressInfo;
   return {
     url: `http://127.0.0.1:${address.port}/tool`,
+    token,
     close: () =>
       new Promise((resolve, reject) => {
         server.close((error) => (error ? reject(error) : resolve()));
@@ -165,7 +189,8 @@ function indent(code: string): string {
 function createPythonProgram(
   code: string,
   toolDefs: t.LCTool[],
-  bridgeUrl: string
+  bridgeUrl: string,
+  bridgeToken: string
 ): string {
   const functionDefs = toolDefs
     .map((def) => {
@@ -183,10 +208,14 @@ import json
 import urllib.request
 
 __LIBRECHAT_TOOL_BRIDGE = ${JSON.stringify(bridgeUrl)}
+__LIBRECHAT_TOOL_TOKEN = ${JSON.stringify(bridgeToken)}
 
 async def __librechat_call_tool(name, payload):
   body = json.dumps({"name": name, "input": payload}).encode("utf-8")
-  headers = {"Content-Type": "application/json"}
+  headers = {
+    "Content-Type": "application/json",
+    ${JSON.stringify(BRIDGE_AUTH_HEADER)}: __LIBRECHAT_TOOL_TOKEN,
+  }
 
   def request():
     req = urllib.request.Request(__LIBRECHAT_TOOL_BRIDGE, data=body, headers=headers, method="POST")
@@ -211,7 +240,8 @@ asyncio.run(__librechat_main())
 function createBashProgram(
   code: string,
   toolDefs: t.LCTool[],
-  bridgeUrl: string
+  bridgeUrl: string,
+  bridgeToken: string
 ): string {
   const functions = toolDefs
     .map((def) => {
@@ -228,18 +258,20 @@ function createBashProgram(
 
   return `
 __LIBRECHAT_TOOL_BRIDGE=${shellQuote(bridgeUrl)}
+__LIBRECHAT_TOOL_HEADER=${shellQuote(BRIDGE_AUTH_HEADER)}
+__LIBRECHAT_TOOL_TOKEN=${shellQuote(bridgeToken)}
 
 __librechat_call_tool() {
   local tool_name="$1"
   local payload="$2"
-  python3 - "$__LIBRECHAT_TOOL_BRIDGE" "$tool_name" "$payload" <<'PY'
+  python3 - "$__LIBRECHAT_TOOL_BRIDGE" "$tool_name" "$payload" "$__LIBRECHAT_TOOL_HEADER" "$__LIBRECHAT_TOOL_TOKEN" <<'PY'
 import json
 import sys
 import urllib.request
 
-url, name, payload = sys.argv[1], sys.argv[2], sys.argv[3]
+url, name, payload, header, token = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 body = json.dumps({"name": name, "input": json.loads(payload)}).encode("utf-8")
-req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json", header: token}, method="POST")
 with urllib.request.urlopen(req, timeout=300) as response:
   result = json.loads(response.read().decode("utf-8"))
 if result.get("is_error"):
@@ -314,13 +346,13 @@ async function runLocalProgrammaticTool(args: {
     const result =
       args.runtime === 'bash'
         ? await executeLocalBash(
-          createBashProgram(args.params.code, effectiveTools, bridge.url),
+          createBashProgram(args.params.code, effectiveTools, bridge.url, bridge.token),
           { ...args.localConfig, timeoutMs }
         )
         : await executeLocalCode(
           {
             lang: 'py',
-            code: createPythonProgram(args.params.code, effectiveTools, bridge.url),
+            code: createPythonProgram(args.params.code, effectiveTools, bridge.url, bridge.token),
           },
           { ...args.localConfig, timeoutMs }
         );

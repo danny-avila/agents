@@ -1,5 +1,5 @@
 import { dirname } from 'path';
-import { readdir, readFile, stat, writeFile, mkdir } from 'fs/promises';
+import { readdir, readFile, stat, writeFile, mkdir, open } from 'fs/promises';
 import { tool } from '@langchain/core/tools';
 import type { DynamicStructuredTool } from '@langchain/core/tools';
 import type * as t from '@/types';
@@ -12,14 +12,17 @@ import {
   createLocalProgrammaticToolCallingTool,
 } from './LocalProgrammaticToolCalling';
 import {
-  resolveWorkspacePath,
+  resolveWorkspacePathSafe,
   spawnLocalProcess,
   truncateLocalOutput,
 } from './LocalExecutionEngine';
+import { createLocalFileCheckpointer } from './FileCheckpointer';
 import { Constants } from '@/common';
 
 const MAX_READ_CHARS = 256000;
 const DEFAULT_MAX_RESULTS = 200;
+const DEFAULT_MAX_READ_BYTES = 10 * 1024 * 1024;
+const BINARY_DETECTION_BYTES = 8000;
 
 export const LocalWriteFileToolName = 'write_file';
 export const LocalEditFileToolName = 'edit_file';
@@ -212,6 +215,28 @@ function toolDefinition(
   };
 }
 
+async function looksBinary(path: string): Promise<boolean> {
+  let handle;
+  try {
+    handle = await open(path, 'r');
+    const sample = Buffer.alloc(BINARY_DETECTION_BYTES);
+    const { bytesRead } = await handle.read(
+      sample,
+      0,
+      BINARY_DETECTION_BYTES,
+      0
+    );
+    for (let i = 0; i < bytesRead; i++) {
+      if (sample[i] === 0) {
+        return true;
+      }
+    }
+    return false;
+  } finally {
+    await handle?.close();
+  }
+}
+
 export function createLocalReadFileTool(
   config: t.LocalExecutionConfig = {}
 ): DynamicStructuredTool {
@@ -222,10 +247,24 @@ export function createLocalReadFileTool(
         offset?: number;
         limit?: number;
       };
-      const path = resolveWorkspacePath(input.file_path, config);
+      const path = await resolveWorkspacePathSafe(input.file_path, config);
       const fileStat = await stat(path);
       if (!fileStat.isFile()) {
         throw new Error(`Path is not a file: ${input.file_path}`);
+      }
+      const maxBytes = Math.max(
+        config.maxReadBytes ?? DEFAULT_MAX_READ_BYTES,
+        1
+      );
+      if (fileStat.size > maxBytes) {
+        const stub = `File is ${fileStat.size} bytes, exceeds the ${maxBytes}-byte read cap. Read a slice via bash (e.g. head/sed) or raise local.maxReadBytes.`;
+        return [stub, { path, bytes: fileStat.size, truncated: true }];
+      }
+      if (await looksBinary(path)) {
+        return [
+          `Refusing to read binary file (${fileStat.size} bytes): ${path}`,
+          { path, bytes: fileStat.size, binary: true },
+        ];
       }
       const content = await readFile(path, 'utf8');
       const result = lineWindow(content, input.offset, input.limit);
@@ -245,7 +284,8 @@ export function createLocalReadFileTool(
 }
 
 export function createLocalWriteFileTool(
-  config: t.LocalExecutionConfig = {}
+  config: t.LocalExecutionConfig = {},
+  checkpointer?: t.LocalFileCheckpointer
 ): DynamicStructuredTool {
   return tool(
     async (rawInput) => {
@@ -253,7 +293,10 @@ export function createLocalWriteFileTool(
       if (config.readOnly === true) {
         throw new Error('write_file is blocked in read-only local mode.');
       }
-      const path = resolveWorkspacePath(input.file_path, config);
+      const path = await resolveWorkspacePathSafe(input.file_path, config);
+      if (checkpointer != null) {
+        await checkpointer.captureBeforeWrite(path);
+      }
       await mkdir(dirname(path), { recursive: true });
       await writeFile(path, input.content, 'utf8');
       return [`Wrote ${input.content.length} characters to ${path}`, { path }];
@@ -269,7 +312,8 @@ export function createLocalWriteFileTool(
 }
 
 export function createLocalEditFileTool(
-  config: t.LocalExecutionConfig = {}
+  config: t.LocalExecutionConfig = {},
+  checkpointer?: t.LocalFileCheckpointer
 ): DynamicStructuredTool {
   return tool(
     async (rawInput) => {
@@ -287,7 +331,7 @@ export function createLocalEditFileTool(
         throw new Error('edit_file requires old_text/new_text or edits[].');
       }
 
-      const path = resolveWorkspacePath(input.file_path, config);
+      const path = await resolveWorkspacePathSafe(input.file_path, config);
       const original = await readFile(path, 'utf8');
       let next = original;
       for (const edit of edits) {
@@ -298,6 +342,9 @@ export function createLocalEditFileTool(
           );
         }
         next = next.replace(edit.oldText, edit.newText);
+      }
+      if (checkpointer != null) {
+        await checkpointer.captureBeforeWrite(path);
       }
       await writeFile(path, next, 'utf8');
       return [`Applied ${edits.length} edit(s) to ${path}`, { path }];
@@ -312,6 +359,138 @@ export function createLocalEditFileTool(
   );
 }
 
+let cachedRgAvailable: boolean | undefined;
+
+async function isRipgrepAvailable(
+  config: t.LocalExecutionConfig
+): Promise<boolean> {
+  if (cachedRgAvailable !== undefined) {
+    return cachedRgAvailable;
+  }
+  const probe = await spawnLocalProcess('rg', ['--version'], {
+    ...config,
+    timeoutMs: 5000,
+    sandbox: { enabled: false },
+  }).catch(() => undefined);
+  cachedRgAvailable = probe != null && probe.exitCode === 0;
+  return cachedRgAvailable;
+}
+
+/** Test-only reset hook for the ripgrep availability cache. */
+export function _resetRipgrepCacheForTests(): void {
+  cachedRgAvailable = undefined;
+}
+
+const SKIP_DIRS = new Set(['.git', 'node_modules']);
+
+function globToRegExp(pattern: string): RegExp {
+  let result = '^';
+  for (let i = 0; i < pattern.length; i++) {
+    const c = pattern[i];
+    if (c === '*') {
+      if (pattern[i + 1] === '*') {
+        result += '.*';
+        i += 1;
+        if (pattern[i + 1] === '/') {
+          i += 1;
+        }
+      } else {
+        result += '[^/]*';
+      }
+    } else if (c === '?') {
+      result += '[^/]';
+    } else if ('.+^$|(){}[]\\'.includes(c)) {
+      result += '\\' + c;
+    } else {
+      result += c;
+    }
+  }
+  result += '$';
+  return new RegExp(result);
+}
+
+async function* walkFiles(root: string): AsyncGenerator<string> {
+  const stack: string[] = [root];
+  while (stack.length > 0) {
+    const dir = stack.pop() as string;
+    let entries;
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (entry.name.startsWith('.git') || SKIP_DIRS.has(entry.name)) {
+        continue;
+      }
+      const full = `${dir}/${entry.name}`;
+      if (entry.isDirectory()) {
+        stack.push(full);
+      } else if (entry.isFile()) {
+        yield full;
+      }
+    }
+  }
+}
+
+async function fallbackGrep(
+  root: string,
+  pattern: string,
+  globFilter: string | undefined,
+  maxResults: number
+): Promise<string[]> {
+  const rx = new RegExp(pattern);
+  const globRx =
+    globFilter != null && globFilter !== '' ? globToRegExp(globFilter) : undefined;
+  const matches: string[] = [];
+  for await (const file of walkFiles(root)) {
+    if (globRx != null) {
+      const rel = file.startsWith(root + '/') ? file.slice(root.length + 1) : file;
+      if (!globRx.test(rel)) {
+        continue;
+      }
+    }
+    let content;
+    try {
+      content = await readFile(file, 'utf8');
+    } catch {
+      continue;
+    }
+    if (content.includes('\0')) {
+      continue;
+    }
+    const lines = content.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      if (rx.test(lines[i])) {
+        matches.push(`${file}:${i + 1}:${lines[i]}`);
+        if (matches.length >= maxResults) {
+          return matches;
+        }
+      }
+    }
+  }
+  return matches;
+}
+
+async function fallbackGlob(
+  root: string,
+  pattern: string,
+  maxResults: number
+): Promise<string[]> {
+  const rx = globToRegExp(pattern);
+  const out: string[] = [];
+  for await (const file of walkFiles(root)) {
+    const rel = file.startsWith(root + '/') ? file.slice(root.length + 1) : file;
+    if (rx.test(rel)) {
+      out.push(file);
+      if (out.length >= maxResults) {
+        break;
+      }
+    }
+  }
+  return out;
+}
+
 export function createLocalGrepSearchTool(
   config: t.LocalExecutionConfig = {}
 ): DynamicStructuredTool {
@@ -323,32 +502,47 @@ export function createLocalGrepSearchTool(
         glob?: string;
         max_results?: number;
       };
-      const target = resolveWorkspacePath(input.path ?? '.', config);
+      const target = await resolveWorkspacePathSafe(input.path ?? '.', config);
       const maxResults = Math.max(input.max_results ?? DEFAULT_MAX_RESULTS, 1);
-      const args = [
-        '--line-number',
-        '--column',
-        '--hidden',
-        '--glob',
-        '!.git/**',
-        ...(input.glob != null && input.glob !== '' ? ['--glob', input.glob] : []),
-        input.pattern,
+
+      if (await isRipgrepAvailable(config)) {
+        const args = [
+          '--line-number',
+          '--column',
+          '--hidden',
+          '--glob',
+          '!.git/**',
+          ...(input.glob != null && input.glob !== '' ? ['--glob', input.glob] : []),
+          input.pattern,
+          target,
+        ];
+        const result = await spawnLocalProcess('rg', args, {
+          ...config,
+          timeoutMs: config.timeoutMs ?? 30000,
+        });
+        const lines = result.stdout.split('\n').filter(Boolean).slice(0, maxResults);
+        const output =
+          lines.length > 0
+            ? lines.join('\n')
+            : result.stderr.trim() || 'No matches found.';
+        return [output, { matches: lines.length, engine: 'ripgrep' }];
+      }
+
+      const matches = await fallbackGrep(
         target,
+        input.pattern,
+        input.glob,
+        maxResults
+      );
+      return [
+        matches.length > 0 ? matches.join('\n') : 'No matches found.',
+        { matches: matches.length, engine: 'node-fallback' },
       ];
-      const result = await spawnLocalProcess('rg', args, {
-        ...config,
-        timeoutMs: config.timeoutMs ?? 30000,
-      });
-      const lines = result.stdout.split('\n').filter(Boolean).slice(0, maxResults);
-      const output =
-        lines.length > 0
-          ? lines.join('\n')
-          : result.stderr.trim() || 'No matches found.';
-      return [output, { matches: lines.length }];
     },
     {
       name: LocalGrepSearchToolName,
-      description: 'Search local files with ripgrep and return matching lines.',
+      description:
+        'Search local files for a regex pattern (ripgrep when available, Node fallback otherwise).',
       schema: LocalGrepSearchToolSchema,
       responseFormat: Constants.CONTENT_AND_ARTIFACT,
     }
@@ -365,19 +559,35 @@ export function createLocalGlobSearchTool(
         path?: string;
         max_results?: number;
       };
-      const target = resolveWorkspacePath(input.path ?? '.', config);
+      const target = await resolveWorkspacePathSafe(input.path ?? '.', config);
       const maxResults = Math.max(input.max_results ?? DEFAULT_MAX_RESULTS, 1);
-      const result = await spawnLocalProcess(
-        'rg',
-        ['--files', '--hidden', '--glob', '!.git/**', '--glob', input.pattern, target],
-        { ...config, timeoutMs: config.timeoutMs ?? 30000 }
-      );
-      const lines = result.stdout.split('\n').filter(Boolean).slice(0, maxResults);
-      return [lines.length > 0 ? lines.join('\n') : 'No files found.', { files: lines }];
+
+      if (await isRipgrepAvailable(config)) {
+        const result = await spawnLocalProcess(
+          'rg',
+          ['--files', '--hidden', '--glob', '!.git/**', '--glob', input.pattern, target],
+          { ...config, timeoutMs: config.timeoutMs ?? 30000 }
+        );
+        const lines = result.stdout
+          .split('\n')
+          .filter(Boolean)
+          .slice(0, maxResults);
+        return [
+          lines.length > 0 ? lines.join('\n') : 'No files found.',
+          { files: lines, engine: 'ripgrep' },
+        ];
+      }
+
+      const files = await fallbackGlob(target, input.pattern, maxResults);
+      return [
+        files.length > 0 ? files.join('\n') : 'No files found.',
+        { files, engine: 'node-fallback' },
+      ];
     },
     {
       name: LocalGlobSearchToolName,
-      description: 'Find local files matching a glob pattern.',
+      description:
+        'Find local files matching a glob pattern (ripgrep when available, Node fallback otherwise).',
       schema: LocalGlobSearchToolSchema,
       responseFormat: Constants.CONTENT_AND_ARTIFACT,
     }
@@ -390,7 +600,7 @@ export function createLocalListDirectoryTool(
   return tool(
     async (rawInput) => {
       const input = rawInput as { path?: string };
-      const path = resolveWorkspacePath(input.path ?? '.', config);
+      const path = await resolveWorkspacePathSafe(input.path ?? '.', config);
       const entries = await readdir(path, { withFileTypes: true });
       const output = entries
         .map((entry) => `${entry.isDirectory() ? 'dir ' : 'file'}\t${entry.name}`)
@@ -406,13 +616,27 @@ export function createLocalListDirectoryTool(
   );
 }
 
+export type LocalCodingToolBundle = {
+  tools: DynamicStructuredTool[];
+  /**
+   * Present when `config.fileCheckpointing === true` or a `checkpointer`
+   * was passed in. Callers can call `rewind()` to restore captured
+   * pre-write contents.
+   */
+  checkpointer?: t.LocalFileCheckpointer;
+};
+
 export function createLocalCodingTools(
-  config: t.LocalExecutionConfig = {}
+  config: t.LocalExecutionConfig = {},
+  options: { checkpointer?: t.LocalFileCheckpointer } = {}
 ): DynamicStructuredTool[] {
+  const checkpointer =
+    options.checkpointer ??
+    (config.fileCheckpointing === true ? createLocalFileCheckpointer() : undefined);
   return [
     createLocalReadFileTool(config),
-    createLocalWriteFileTool(config),
-    createLocalEditFileTool(config),
+    createLocalWriteFileTool(config, checkpointer),
+    createLocalEditFileTool(config, checkpointer),
     createLocalGrepSearchTool(config),
     createLocalGlobSearchTool(config),
     createLocalListDirectoryTool(config),
@@ -421,6 +645,24 @@ export function createLocalCodingTools(
     createLocalProgrammaticToolCallingTool(config),
     createLocalBashProgrammaticToolCallingTool(config),
   ];
+}
+
+/**
+ * Variant of `createLocalCodingTools` that returns the bundle alongside
+ * the file checkpointer so callers can later call
+ * `bundle.checkpointer?.rewind()`.
+ */
+export function createLocalCodingToolBundle(
+  config: t.LocalExecutionConfig = {},
+  options: { checkpointer?: t.LocalFileCheckpointer } = {}
+): LocalCodingToolBundle {
+  const checkpointer =
+    options.checkpointer ??
+    (config.fileCheckpointing === true ? createLocalFileCheckpointer() : undefined);
+  return {
+    tools: createLocalCodingTools(config, { checkpointer }),
+    checkpointer,
+  };
 }
 
 export function createLocalCodingToolDefinitions(): t.LCTool[] {

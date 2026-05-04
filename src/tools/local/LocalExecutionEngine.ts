@@ -1,10 +1,11 @@
 import { tmpdir } from 'os';
 import { isAbsolute, relative, resolve } from 'path';
 import { createHash, randomUUID } from 'crypto';
-import { mkdir, rm, writeFile } from 'fs/promises';
+import { mkdir, realpath, rm, writeFile } from 'fs/promises';
 import { spawn } from 'child_process';
 import type { ChildProcess } from 'child_process';
 import type { SandboxRuntimeConfig } from '@anthropic-ai/sandbox-runtime';
+import { runBashAstChecks, bashAstFindingsToErrors } from './bashAst';
 import type * as t from '@/types';
 
 const DEFAULT_TIMEOUT_MS = 60000;
@@ -89,6 +90,27 @@ function loadSandboxRuntime(): Promise<SandboxRuntimeModule> {
 
 function shouldUseLocalSandbox(config: t.LocalExecutionConfig): boolean {
   return config.sandbox?.enabled === true;
+}
+
+let sandboxOffWarned = false;
+
+function maybeWarnSandboxOff(config: t.LocalExecutionConfig): void {
+  if (sandboxOffWarned || shouldUseLocalSandbox(config)) {
+    return;
+  }
+  sandboxOffWarned = true;
+  // eslint-disable-next-line no-console
+  console.warn(
+    '[@librechat/agents] Local execution engine is running without ' +
+      '@anthropic-ai/sandbox-runtime wrapping. The agent has full access to ' +
+      'the host filesystem and network. Set toolExecution.local.sandbox.enabled ' +
+      '= true to opt into process sandboxing.'
+  );
+}
+
+/** Test-only reset hook for the sandbox-off warning latch. */
+export function _resetLocalEngineWarningsForTests(): void {
+  sandboxOffWarned = false;
 }
 
 export function truncateLocalOutput(
@@ -178,6 +200,14 @@ export async function validateBashCommand(
         break;
       }
     }
+  }
+
+  const bashAstMode = config.bashAst ?? 'off';
+  if (bashAstMode !== 'off' && config.allowDangerousCommands !== true) {
+    const findings = runBashAstChecks(normalized, bashAstMode);
+    const split = bashAstFindingsToErrors(findings);
+    errors.push(...split.errors);
+    warnings.push(...split.warnings);
   }
 
   if (config.readOnly === true && mutatingCommandPattern.test(normalized)) {
@@ -307,6 +337,9 @@ export async function spawnLocalProcess(
   const timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxOutputChars = config.maxOutputChars ?? DEFAULT_MAX_OUTPUT_CHARS;
   const sandboxManager = await ensureSandbox(config, cwd);
+  if (sandboxManager == null) {
+    maybeWarnSandboxOff(config);
+  }
   let spawnCommand = command;
   let spawnArgs = args;
 
@@ -317,8 +350,9 @@ export async function spawnLocalProcess(
     spawnArgs = ['-lc', sandboxed];
   }
 
+  const launcher = config.spawn ?? spawn;
   return new Promise<SpawnResult>((resolveResult, reject) => {
-    const child = spawn(spawnCommand, spawnArgs, {
+    const child = launcher(spawnCommand, spawnArgs, {
       cwd,
       detached: process.platform !== 'win32',
       env: { ...process.env, ...(config.env ?? {}) },
@@ -364,11 +398,11 @@ export async function spawnLocalProcess(
       }, timeoutMs);
     }
 
-    child.stdout.on('data', (chunk: Buffer) => {
+    child.stdout?.on('data', (chunk: Buffer) => {
       stdout += chunk.toString('utf8');
     });
 
-    child.stderr.on('data', (chunk: Buffer) => {
+    child.stderr?.on('data', (chunk: Buffer) => {
       stderr += chunk.toString('utf8');
     });
 
@@ -595,4 +629,67 @@ export function resolveWorkspacePath(
   }
 
   return absolutePath;
+}
+
+async function realpathOrSelf(absolutePath: string): Promise<string> {
+  try {
+    return await realpath(absolutePath);
+  } catch {
+    return absolutePath;
+  }
+}
+
+/**
+ * Resolves the realpath of `absolutePath`, falling back to the nearest
+ * existing ancestor when the target itself does not yet exist (so the
+ * containment check still works for `write_file` to a brand-new path).
+ */
+async function realpathOfPathOrAncestor(absolutePath: string): Promise<string> {
+  let current = absolutePath;
+  let suffix = '';
+  // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+  while (true) {
+    try {
+      const real = await realpath(current);
+      return suffix === '' ? real : resolve(real, suffix);
+    } catch {
+      const parent = resolve(current, '..');
+      if (parent === current) {
+        return absolutePath;
+      }
+      const base = current.slice(parent.length + 1);
+      suffix = suffix === '' ? base : `${base}/${suffix}`;
+      current = parent;
+    }
+  }
+}
+
+/**
+ * Resolves a workspace path AND follows any symlinks before checking
+ * containment, so a symlink inside the workspace pointing outside is
+ * rejected even though the lexical path looks safe. Handles paths that
+ * don't yet exist (e.g. write_file targets) by realpath-resolving the
+ * nearest existing ancestor and re-attaching the unresolved suffix.
+ */
+export async function resolveWorkspacePathSafe(
+  filePath: string,
+  config: t.LocalExecutionConfig = {}
+): Promise<string> {
+  const lexical = resolveWorkspacePath(filePath, config);
+  if (config.allowOutsideWorkspace === true) {
+    return lexical;
+  }
+  const cwd = getLocalCwd(config);
+  const realCwd = await realpathOrSelf(cwd);
+  const realPath = await realpathOfPathOrAncestor(lexical);
+  if (realPath === realCwd) {
+    return lexical;
+  }
+  const rel = relative(realCwd, realPath);
+  if (rel.startsWith('..') || isAbsolute(rel)) {
+    throw new Error(
+      `Path is outside the local workspace (symlink escape): ${filePath}`
+    );
+  }
+  return lexical;
 }

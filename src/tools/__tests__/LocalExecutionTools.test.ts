@@ -2,16 +2,31 @@ import { z } from 'zod';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { spawnSync } from 'child_process';
-import { mkdtemp, rm } from 'fs/promises';
+import {
+  mkdtemp,
+  rm,
+  symlink,
+  writeFile as fsWriteFile,
+  readFile as fsReadFile,
+} from 'fs/promises';
 import { tool } from '@langchain/core/tools';
 import { AIMessage, ToolMessage } from '@langchain/core/messages';
-import { describe, it, expect, afterEach } from '@jest/globals';
+import { describe, it, expect, afterEach, beforeEach, jest } from '@jest/globals';
 import type { StructuredToolInterface } from '@langchain/core/tools';
 import type * as t from '@/types';
 import { Constants } from '@/common';
 import { ToolNode } from '../ToolNode';
-import { validateBashCommand } from '../local/LocalExecutionEngine';
+import {
+  validateBashCommand,
+  _resetLocalEngineWarningsForTests,
+} from '../local/LocalExecutionEngine';
 import { resolveLocalToolsForBinding } from '../local/resolveLocalExecutionTools';
+import {
+  createLocalCodingToolBundle,
+  _resetRipgrepCacheForTests,
+} from '../local/LocalCodingTools';
+import { runBashAstChecks } from '../local/bashAst';
+import { LocalFileCheckpointerImpl } from '../local/FileCheckpointer';
 
 const hasPython3 = spawnSync('python3', ['--version']).status === 0;
 
@@ -187,5 +202,207 @@ describe('local execution tools', () => {
 
     const [message] = messagesFromResult(result as { messages: ToolMessage[] });
     expect(String(message.content)).toContain('from bash ptc');
+  });
+});
+
+describe('local engine bashAst', () => {
+  it('flags command substitution in auto mode', () => {
+    const findings = runBashAstChecks('echo $(whoami)', 'auto');
+    expect(findings.some((f) => f.code === 'cmd-subst-dollar-paren')).toBe(true);
+  });
+
+  it('escalates command substitution to deny in strict mode', () => {
+    const findings = runBashAstChecks('echo $(whoami)', 'strict');
+    const subst = findings.find((f) => f.code === 'cmd-subst-dollar-paren');
+    expect(subst?.severity).toBe('deny');
+  });
+
+  it('always denies /proc/<pid>/environ access', () => {
+    const findings = runBashAstChecks('cat /proc/1/environ', 'auto');
+    expect(findings.some((f) => f.code === 'proc-environ-read' && f.severity === 'deny')).toBe(true);
+  });
+
+  it('never produces findings when off', () => {
+    const findings = runBashAstChecks('echo $(whoami)', 'off');
+    expect(findings).toHaveLength(0);
+  });
+
+  it('blocks bash commands with a deny finding via validateBashCommand', async () => {
+    const result = await validateBashCommand('cat /proc/1/environ', {
+      bashAst: 'auto',
+    });
+    expect(result.valid).toBe(false);
+    expect(result.errors.join('\n')).toContain('proc-environ-read');
+  });
+});
+
+describe('local engine sandbox-off warning', () => {
+  let warnSpy: jest.SpiedFunction<typeof console.warn>;
+
+  beforeEach(() => {
+    _resetLocalEngineWarningsForTests();
+    warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    warnSpy.mockRestore();
+  });
+
+  it('warns once when running without sandbox', async () => {
+    await validateBashCommand('echo hi');
+    await validateBashCommand('echo bye');
+    const sandboxOffMessages = warnSpy.mock.calls.filter((call) =>
+      String(call[0]).includes('without @anthropic-ai/sandbox-runtime')
+    );
+    expect(sandboxOffMessages).toHaveLength(1);
+  });
+});
+
+describe('LocalFileCheckpointer', () => {
+  it('snapshots and restores existing files', async () => {
+    const dir = await createTempDir();
+    const file = join(dir, 'a.txt');
+    await fsWriteFile(file, 'original', 'utf8');
+
+    const cp = new LocalFileCheckpointerImpl();
+    await cp.captureBeforeWrite(file);
+
+    await fsWriteFile(file, 'modified', 'utf8');
+    expect(await fsReadFile(file, 'utf8')).toBe('modified');
+
+    const restored = await cp.rewind();
+    expect(restored).toBe(1);
+    expect(await fsReadFile(file, 'utf8')).toBe('original');
+  });
+
+  it('deletes files that did not exist before the run', async () => {
+    const dir = await createTempDir();
+    const file = join(dir, 'new.txt');
+
+    const cp = new LocalFileCheckpointerImpl();
+    await cp.captureBeforeWrite(file);
+    await fsWriteFile(file, 'should-be-removed', 'utf8');
+
+    await cp.rewind();
+    await expect(fsReadFile(file, 'utf8')).rejects.toThrow();
+  });
+
+  it('rewinds tools created via createLocalCodingToolBundle', async () => {
+    const cwd = await createTempDir();
+    const bundle = createLocalCodingToolBundle({
+      cwd,
+      fileCheckpointing: true,
+    });
+    expect(bundle.checkpointer).toBeDefined();
+
+    const writeTool = bundle.tools.find((tool_) => tool_.name === 'write_file');
+    expect(writeTool).toBeDefined();
+    await writeTool!.invoke({ file_path: 'cp.txt', content: 'first' });
+    await writeTool!.invoke({ file_path: 'cp.txt', content: 'second' });
+
+    const restored = await bundle.checkpointer!.rewind();
+    expect(restored).toBe(1);
+    await expect(fsReadFile(join(cwd, 'cp.txt'), 'utf8')).rejects.toThrow();
+  });
+});
+
+describe('local read tool guards', () => {
+  it('refuses to read files containing NUL bytes', async () => {
+    const cwd = await createTempDir();
+    const binary = join(cwd, 'binary.bin');
+    await fsWriteFile(binary, Buffer.from([0x00, 0x01, 0x02]));
+
+    const bundle = createLocalCodingToolBundle({ cwd });
+    const readTool = bundle.tools.find((t_) => t_.name === Constants.READ_FILE);
+    const result = await readTool!.invoke({ file_path: 'binary.bin' });
+    expect(String(result)).toContain('binary file');
+  });
+
+  it('returns a stub instead of OOMing on huge files', async () => {
+    const cwd = await createTempDir();
+    const big = join(cwd, 'big.txt');
+    await fsWriteFile(big, 'x'.repeat(2048));
+
+    const bundle = createLocalCodingToolBundle({
+      cwd,
+      maxReadBytes: 1024,
+    });
+    const readTool = bundle.tools.find((t_) => t_.name === Constants.READ_FILE);
+    const result = await readTool!.invoke({ file_path: 'big.txt' });
+    expect(String(result)).toContain('exceeds the 1024-byte read cap');
+  });
+
+  it('rejects symlink escapes', async () => {
+    const cwd = await createTempDir();
+    const outside = await createTempDir();
+    const secret = join(outside, 'secret.txt');
+    await fsWriteFile(secret, 'top-secret', 'utf8');
+    await symlink(outside, join(cwd, 'escape'));
+
+    const bundle = createLocalCodingToolBundle({ cwd });
+    const readTool = bundle.tools.find((t_) => t_.name === Constants.READ_FILE);
+    await expect(
+      readTool!.invoke({ file_path: 'escape/secret.txt' })
+    ).rejects.toThrow(/symlink escape/);
+  });
+});
+
+describe('local programmatic bridge auth', () => {
+  it('rejects unauthenticated requests to the local bridge', async () => {
+    if (!hasPython3) {
+      return;
+    }
+    const cwd = await createTempDir();
+    const node = new ToolNode({
+      tools: [],
+      toolExecution: {
+        engine: 'local',
+        local: { cwd },
+      },
+    });
+
+    const result = await node.invoke({
+      messages: [
+        aiMessageWithToolCall(Constants.PROGRAMMATIC_TOOL_CALLING, {
+          lang: 'py',
+          code: [
+            'import os, json, urllib.request, urllib.error',
+            'url = os.environ["BRIDGE_PROBE_URL"] if "BRIDGE_PROBE_URL" in os.environ else __LIBRECHAT_TOOL_BRIDGE',
+            'body = json.dumps({"name":"read_file","input":{"file_path":"x"}}).encode("utf-8")',
+            'try:',
+            '  req = urllib.request.Request(url, data=body, headers={"Content-Type":"application/json"}, method="POST")',
+            '  urllib.request.urlopen(req, timeout=5)',
+            '  print("LEAK")',
+            'except urllib.error.HTTPError as e:',
+            '  print(f"AUTH={e.code}")',
+          ].join('\n'),
+        }),
+      ],
+    });
+
+    const [message] = messagesFromResult(result as { messages: ToolMessage[] });
+    expect(String(message.content)).toContain('AUTH=401');
+    expect(String(message.content)).not.toContain('LEAK');
+  });
+});
+
+describe('local search fallback', () => {
+  beforeEach(() => {
+    _resetRipgrepCacheForTests();
+  });
+
+  it('finds matches via the Node fallback when ripgrep is missing', async () => {
+    const cwd = await createTempDir();
+    await fsWriteFile(join(cwd, 'a.ts'), 'const needle = 42;\n', 'utf8');
+    await fsWriteFile(join(cwd, 'b.ts'), 'const haystack = 1;\n', 'utf8');
+
+    const bundle = createLocalCodingToolBundle({
+      cwd,
+      env: { PATH: '/nonexistent' },
+    });
+    const grepTool = bundle.tools.find((t_) => t_.name === 'grep_search');
+    const result = await grepTool!.invoke({ pattern: 'needle' });
+    expect(String(result)).toContain('a.ts');
+    expect(String(result)).toContain('needle');
   });
 });
