@@ -2,6 +2,7 @@ import axios from 'axios';
 import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
 import type * as t from './types';
 import { getAttribution, createDefaultLogger } from './utils';
+import { createTavilyAPI } from './tavily-search';
 import { BaseReranker } from './rerankers';
 
 const chunker = {
@@ -418,15 +419,20 @@ export const createSearchAPI = (
     serperApiKey,
     searxngInstanceUrl,
     searxngApiKey,
+    tavilyApiKey,
+    tavilySearchUrl,
+    tavilySearchOptions,
   } = config;
 
   if (searchProvider.toLowerCase() === 'serper') {
     return createSerperAPI(serperApiKey);
   } else if (searchProvider.toLowerCase() === 'searxng') {
     return createSearXNGAPI(searxngInstanceUrl, searxngApiKey);
+  } else if (searchProvider.toLowerCase() === 'tavily') {
+    return createTavilyAPI(tavilyApiKey, tavilySearchUrl, tavilySearchOptions);
   } else {
     throw new Error(
-      `Invalid search provider: ${searchProvider}. Must be 'serper' or 'searxng'`
+      `Invalid search provider: ${searchProvider}. Must be 'serper', 'searxng', or 'tavily'`
     );
   }
 };
@@ -454,6 +460,56 @@ export const createSourceProcessor = (
   const logger_ = logger || createDefaultLogger();
   const scraper = scraperInstance;
 
+  const processResponse = (
+    url: string,
+    response: t.AnyScraperResponse
+  ): t.ScrapeResult => {
+    const rawMetadata = scraper.extractMetadata(response);
+    const metadata =
+      Object.keys(rawMetadata).length > 0 ? rawMetadata : undefined;
+    const attribution = getAttribution(url, metadata, logger_);
+
+    if (response.success && response.data) {
+      const [content, references] = scraper.extractContent(response);
+      return {
+        url,
+        references,
+        attribution,
+        content: chunker.cleanText(content),
+      };
+    }
+
+    logger_.error(
+      `Error scraping ${url}: ${response.error ?? 'Unknown error'}`
+    );
+    return { url, attribution, error: true, content: '' };
+  };
+
+  const addHighlights = async (
+    result: t.ScrapeResult,
+    query: string,
+    onGetHighlights: t.SearchToolConfig['onGetHighlights']
+  ): Promise<t.ScrapeResult> => {
+    if (result.error != null) {
+      return result;
+    }
+    try {
+      const highlights = await getHighlights({
+        query,
+        reranker,
+        content: result.content,
+        logger: logger_,
+      });
+      if (onGetHighlights) {
+        onGetHighlights(result.url);
+      }
+      return { ...result, highlights };
+    } catch (error) {
+      logger_.error('Error processing scraped content:', error);
+      return result;
+    }
+  };
+
   const webScraper = {
     scrapeMany: async ({
       query,
@@ -465,80 +521,34 @@ export const createSourceProcessor = (
       onGetHighlights: t.SearchToolConfig['onGetHighlights'];
     }): Promise<Array<t.ScrapeResult>> => {
       logger_.debug(`Scraping ${links.length} links`);
-      const promises: Array<Promise<t.ScrapeResult>> = [];
       try {
-        for (let i = 0; i < links.length; i++) {
-          const currentLink = links[i];
-          const promise: Promise<t.ScrapeResult> = scraper
-            .scrapeUrl(currentLink, {})
-            .then(([url, response]) => {
-              const attribution = getAttribution(
-                url,
-                response.data?.metadata,
-                logger_
-              );
-              if (response.success && response.data) {
-                const [content, references] = scraper.extractContent(response);
-                return {
-                  url,
-                  references,
-                  attribution,
-                  content: chunker.cleanText(content),
-                } as t.ScrapeResult;
-              } else {
-                logger_.error(
-                  `Error scraping ${url}: ${response.error ?? 'Unknown error'}`
-                );
-              }
+        let responses: Array<[string, t.AnyScraperResponse]>;
 
-              return {
-                url,
-                attribution,
-                error: true,
-                content: '',
-              } as t.ScrapeResult;
-            })
-            .then(async (result) => {
-              try {
-                if (result.error != null) {
-                  logger_.error(
-                    `Error scraping ${result.url}: ${result.content}`
-                  );
-                  return {
-                    ...result,
-                  };
-                }
-                const highlights = await getHighlights({
-                  query,
-                  reranker,
-                  content: result.content,
-                  logger: logger_,
-                });
-                if (onGetHighlights) {
-                  onGetHighlights(result.url);
-                }
-                return {
-                  ...result,
-                  highlights,
-                };
-              } catch (error) {
-                logger_.error('Error processing scraped content:', error);
-                return {
-                  ...result,
-                };
-              }
-            })
-            .catch((error) => {
-              logger_.error(`Error scraping ${currentLink}:`, error);
-              return {
-                url: currentLink,
-                error: true,
-                content: '',
-              };
-            });
-          promises.push(promise);
+        if (scraper.scrapeUrls) {
+          responses = await scraper.scrapeUrls(links);
+        } else {
+          responses = await Promise.all(
+            links.map((link) =>
+              scraper
+                .scrapeUrl(link, {})
+                .catch((error): [string, t.AnyScraperResponse] => {
+                  logger_.error(`Error scraping ${link}:`, error);
+                  return [link, { success: false, error: String(error) }];
+                })
+            )
+          );
         }
-        return await Promise.all(promises);
+
+        const withHighlights = await Promise.all(
+          responses.map(([url, response]) =>
+            addHighlights(
+              processResponse(url, response),
+              query,
+              onGetHighlights
+            )
+          )
+        );
+        return withHighlights;
       } catch (error) {
         logger_.error('Error in scrapeMany:', error);
         return [];

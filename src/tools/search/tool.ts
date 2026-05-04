@@ -14,6 +14,7 @@ import {
 } from './schema';
 import { createSearchAPI, createSourceProcessor } from './search';
 import { createSerperScraper } from './serper-scraper';
+import { createTavilyScraper } from './tavily-scraper';
 import { createFirecrawlScraper } from './firecrawl';
 import { expandHighlights } from './highlights';
 import { formatResultsForLLM } from './format';
@@ -178,11 +179,13 @@ async function executeParallelSearches({
 function createSearchProcessor({
   searchAPI,
   safeSearch,
+  supportsVideos,
   sourceProcessor,
   onGetHighlights,
   logger,
 }: {
   safeSearch: t.SearchToolConfig['safeSearch'];
+  supportsVideos: boolean;
   searchAPI: ReturnType<typeof createSearchAPI>;
   sourceProcessor: ReturnType<typeof createSourceProcessor>;
   onGetHighlights: t.SearchToolConfig['onGetHighlights'];
@@ -218,7 +221,7 @@ function createSearchProcessor({
         country,
         safeSearch,
         images,
-        videos,
+        videos: supportsVideos && videos,
         news,
         logger,
       });
@@ -306,32 +309,12 @@ function createTool({
 }
 
 /**
- * Creates a search tool with a schema that dynamically includes the country field
- * only when the searchProvider is 'serper'.
+ * Creates a search tool with configurable search and scraper providers.
  *
- * Supports multiple scraper providers:
- * - Firecrawl (default): Full-featured web scraping with multiple formats
- * - Serper: Lightweight scraping using Serper's scrape API
+ * Search providers: Serper (Google results), SearXNG (self-hosted meta-search), Tavily (AI-optimized).
+ * Scraper providers: Firecrawl (default, full-featured), Serper (lightweight), Tavily (batch extraction).
  *
- * @example
- * ```typescript
- * // Using Firecrawl scraper (default)
- * const searchTool = createSearchTool({
- *   searchProvider: 'serper',
- *   scraperProvider: 'firecrawl',
- *   firecrawlApiKey: 'your-firecrawl-key'
- * });
- *
- * // Using Serper scraper
- * const searchTool = createSearchTool({
- *   searchProvider: 'serper',
- *   scraperProvider: 'serper',
- *   serperApiKey: 'your-serper-key'
- * });
- * ```
- *
- * @param config - The search tool configuration
- * @returns A DynamicStructuredTool with a schema that depends on the searchProvider
+ * The country schema field is exposed to the LLM for providers that support localized results.
  */
 /** Input params type for search tool */
 interface SearchToolParams {
@@ -351,6 +334,10 @@ export const createSearchTool = (
     serperApiKey,
     searxngInstanceUrl,
     searxngApiKey,
+    tavilyApiKey,
+    tavilySearchUrl,
+    tavilyExtractUrl,
+    tavilySearchOptions,
     rerankerType = 'cohere',
     topResults = 5,
     strategies = ['no_extraction'],
@@ -362,6 +349,7 @@ export const createSearchTool = (
     firecrawlVersion,
     firecrawlOptions,
     serperScraperOptions,
+    tavilyScraperOptions,
     scraperTimeout,
     jinaApiKey,
     jinaApiUrl,
@@ -371,6 +359,13 @@ export const createSearchTool = (
   } = config;
 
   const logger = config.logger || createDefaultLogger();
+  const effectiveTavilySearchOptions =
+    searchProvider === 'tavily' && config.safeSearch != null
+      ? {
+          ...tavilySearchOptions,
+          safeSearch: config.safeSearch !== 0,
+        }
+      : tavilySearchOptions;
 
   const schemaProperties: Record<string, unknown> = {
     query: querySchema,
@@ -380,7 +375,7 @@ export const createSearchTool = (
     news: newsSchema,
   };
 
-  if (searchProvider === 'serper') {
+  if (searchProvider === 'serper' || searchProvider === 'tavily') {
     schemaProperties.country = countrySchema;
   }
 
@@ -395,6 +390,9 @@ export const createSearchTool = (
     serperApiKey,
     searxngInstanceUrl,
     searxngApiKey,
+    tavilyApiKey,
+    tavilySearchUrl,
+    tavilySearchOptions: effectiveTavilySearchOptions,
   });
 
   /** Create scraper based on scraperProvider */
@@ -405,6 +403,17 @@ export const createSearchTool = (
       ...serperScraperOptions,
       apiKey: serperApiKey,
       timeout: scraperTimeout ?? serperScraperOptions?.timeout,
+      logger,
+    });
+  } else if (scraperProvider === 'tavily') {
+    scraperInstance = createTavilyScraper({
+      ...tavilyScraperOptions,
+      apiKey:
+        tavilyScraperOptions?.apiKey ??
+        tavilyApiKey ??
+        process.env.TAVILY_API_KEY,
+      apiUrl: tavilyScraperOptions?.apiUrl ?? tavilyExtractUrl,
+      timeout: scraperTimeout ?? tavilyScraperOptions?.timeout,
       logger,
     });
   } else {
@@ -445,6 +454,7 @@ export const createSearchTool = (
   const search = createSearchProcessor({
     searchAPI,
     safeSearch,
+    supportsVideos: searchProvider !== 'tavily',
     sourceProcessor,
     onGetHighlights,
     logger,
