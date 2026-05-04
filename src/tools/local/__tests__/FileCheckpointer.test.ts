@@ -1,6 +1,6 @@
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { mkdtemp, readFile, rm, stat, writeFile } from 'fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'fs/promises';
 import { describe, it, expect, beforeEach, afterEach } from '@jest/globals';
 import { LocalFileCheckpointerImpl } from '../FileCheckpointer';
 
@@ -104,12 +104,8 @@ describe('LocalFileCheckpointerImpl', () => {
   it('rewind of a captured file whose parent directory was removed recreates the directory', async () => {
     const subdir = join(dir, 'nested', 'deep');
     const file = join(subdir, 'x.txt');
-    await writeFile(file, 'kept', { encoding: 'utf8' }).catch(async () => {
-      // Parent dir might not exist; create it explicitly.
-      const fsp = await import('fs/promises');
-      await fsp.mkdir(subdir, { recursive: true });
-      await writeFile(file, 'kept');
-    });
+    await mkdir(subdir, { recursive: true });
+    await writeFile(file, 'kept');
     const cp = new LocalFileCheckpointerImpl();
 
     await cp.captureBeforeWrite(file);

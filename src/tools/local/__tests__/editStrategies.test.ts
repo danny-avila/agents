@@ -79,6 +79,23 @@ describe('editStrategies › locateEdit', () => {
     expect(m).toBeNull();
   });
 
+  it('rejects exact-strategy match when oldString appears more than once (ambiguous)', () => {
+    // The exact strategy explicitly returns null on >1 hit so an
+    // ambiguous edit can't silently pick the wrong span. Pinning
+    // because the audit-of-audit (follow-up F2) flagged that this
+    // boundary was claimed in the commit message but not actually
+    // covered by a test.
+    //
+    // (Whether the *looser* strategies — line-trimmed,
+    // whitespace-normalized, indentation-flexible — should also fail
+    // closed on multi-match is a separate design call: today they
+    // reject duplicate matches at their OWN granularity but the
+    // chain may then fall through to a strategy that picks one
+    // unambiguously. Out of scope for this test.)
+    const source = 'foo bar\nfoo bar\nbaz';
+    expect(locateEdit(source, 'foo bar')).toBeNull();
+  });
+
   it('returns null on empty oldString (no anchor to locate)', () => {
     const source = 'a\nb\n';
     const m = locateEdit(source, '');

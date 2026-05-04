@@ -201,7 +201,6 @@ function lineWindow(
   }
   // Collect up to `limit` lines from `cursor`.
   const out: string[] = [];
-  let line = start + 1;
   let pos = cursor;
   let exhausted = true;
   for (let k = 0; k < limit; k++) {
@@ -212,12 +211,10 @@ function lineWindow(
     }
     out.push(content.slice(pos, next));
     pos = next + 1;
-    line++;
     if (k === limit - 1 && pos < content.length) {
       exhausted = false;
     }
   }
-  void line;
   const numbered = out
     .map(
       (text, index) =>

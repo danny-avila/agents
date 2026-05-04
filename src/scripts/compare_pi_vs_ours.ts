@@ -676,9 +676,6 @@ function emptySide(): AggregatedSide {
 function avg(xs: number[]): number {
   return xs.length === 0 ? 0 : xs.reduce((a, b) => a + b, 0) / xs.length;
 }
-function sum(xs: number[]): number {
-  return xs.reduce((a, b) => a + b, 0);
-}
 
 async function runOnce(
   task: Task,
@@ -830,7 +827,6 @@ async function main(): Promise<void> {
   if (piPassed < piVerifies.length || oursPassed < oursVerifies.length) {
     process.exitCode = 1;
   }
-  void sum;
 }
 
 process.on('unhandledRejection', (reason) => {
