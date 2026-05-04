@@ -7,6 +7,7 @@ import {
   MemorySaver,
   isInterrupted,
   MessagesAnnotation,
+  Command,
 } from '@langchain/langgraph';
 import { AIMessage, ToolMessage } from '@langchain/core/messages';
 import { describe, it, expect, jest, afterEach } from '@jest/globals';
@@ -237,5 +238,137 @@ describe('direct-path HITL: resume scope', () => {
     expect(aSideEffect).toHaveBeenCalledTimes(2);
     expect(bSideEffect).toHaveBeenCalledTimes(1);
     expect(bHookInvocations).toBe(2);
+  });
+
+  describe('edit decision (Codex P1 #16)', () => {
+    it('applies decision.updatedInput (the documented field) to the executed tool args', async () => {
+      const receivedArgs: Array<Record<string, unknown>> = [];
+      const directTool = tool(
+        async (input) => {
+          receivedArgs.push(input as Record<string, unknown>);
+          return JSON.stringify(input);
+        },
+        {
+          name: 'echo',
+          description: 'records the args it actually executed with',
+          schema: z.object({ command: z.string() }),
+        }
+      ) as unknown as StructuredToolInterface;
+
+      // Pattern: hook ALWAYS asks. interrupt() throws on the first
+      // pass (sends the host the askEntry payload) and RETURNS the
+      // resume value on the second pass — the resume value is what
+      // actually carries the approve/edit/reject decision.
+      const registry = new HookRegistry();
+      registry.register('PreToolUse', {
+        hooks: [
+          async (): Promise<PreToolUseHookOutput> => ({
+            decision: 'ask',
+            allowedDecisions: ['approve', 'edit'],
+          }),
+        ],
+      });
+
+      const node = new ToolNode({
+        tools: [directTool],
+        eventDrivenMode: true,
+        hookRegistry: registry,
+        directToolNames: new Set(['echo']),
+        humanInTheLoop: { enabled: true },
+      });
+
+      const graph = buildGraph(node, [
+        { id: 'call_1', name: 'echo', args: { command: 'original' } },
+      ]);
+      const config = { configurable: { thread_id: 'thread-edit-1' } };
+
+      const first = await graph.invoke({ messages: [] }, config);
+      expect(isInterrupted<t.HumanInterruptPayload>(first)).toBe(true);
+      // Body did not run yet.
+      expect(receivedArgs).toEqual([]);
+
+      const second = await graph.invoke(
+        new Command({
+          resume: [
+            { type: 'edit', updatedInput: { command: 'edited-by-host' } },
+          ],
+        }),
+        config
+      );
+
+      // The whole point of the fix: the edited input flows through.
+      // Pre-fix the direct path read `decision.args` (wrong field) so
+      // updatedInput was silently dropped and the tool ran with
+      // `{ command: 'original' }`.
+      expect(receivedArgs).toHaveLength(1);
+      expect(receivedArgs[0]).toEqual({ command: 'edited-by-host' });
+
+      const messages = (second as { messages: ToolMessage[] }).messages;
+      const toolMsg = messages.find(
+        (m) => m instanceof ToolMessage
+      ) as ToolMessage;
+      expect(String(toolMsg.content)).toContain('edited-by-host');
+    });
+
+    it('fails closed when updatedInput is missing or wrong-shaped', async () => {
+      const directTool = tool(
+        async () => 'should-not-execute',
+        {
+          name: 'echo',
+          description: 'must not execute on malformed edit',
+          schema: z.object({ command: z.string().optional() }).passthrough(),
+        }
+      ) as unknown as StructuredToolInterface;
+
+      const registry = new HookRegistry();
+      registry.register('PreToolUse', {
+        hooks: [
+          async (): Promise<PreToolUseHookOutput> => ({
+            decision: 'ask',
+            allowedDecisions: ['approve', 'edit'],
+          }),
+        ],
+      });
+
+      const node = new ToolNode({
+        tools: [directTool],
+        eventDrivenMode: true,
+        hookRegistry: registry,
+        directToolNames: new Set(['echo']),
+        humanInTheLoop: { enabled: true },
+      });
+
+      const graph = buildGraph(node, [
+        { id: 'call_1', name: 'echo', args: { command: 'original' } },
+      ]);
+      const config = { configurable: { thread_id: 'thread-edit-2' } };
+
+      await graph.invoke({ messages: [] }, config);
+
+      // Send `{ type: 'edit' }` with no updatedInput at all (simulates
+      // a host that misnamed the field, e.g. used `args` like the old
+      // bug expected). Must fail closed instead of executing.
+      const second = await graph.invoke(
+        new Command({
+          resume: [
+            {
+              type: 'edit',
+              args: { command: 'this-field-name-is-wrong' },
+            } as unknown as t.ToolApprovalDecision,
+          ],
+        }),
+        config
+      );
+
+      const messages = (second as { messages: ToolMessage[] }).messages;
+      const toolMsg = messages.find(
+        (m) => m instanceof ToolMessage
+      ) as ToolMessage;
+      expect(toolMsg.status).toBe('error');
+      expect(String(toolMsg.content)).toContain(
+        'Decision "edit" missing object updatedInput'
+      );
+      expect(String(toolMsg.content)).not.toContain('should-not-execute');
+    });
   });
 });

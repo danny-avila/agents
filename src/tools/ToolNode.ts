@@ -994,13 +994,34 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           }
 
           if (decision.type === 'edit') {
-            const edited = (decision as {
-              args?: unknown;
-            }).args as Record<string, unknown> | undefined;
-            if (edited != null) {
-              effectiveCall = { ...call, args: edited };
+            // Mirror the event-driven path's validation
+            // (see `dispatchToolEvents`'s edit branch). The wire
+            // field is `updatedInput`, NOT `args` — hosts following
+            // the documented `ToolApprovalDecision` shape were
+            // silently ignored before, so the tool ran with the
+            // original (un-edited) arguments. Fail closed on
+            // malformed payloads instead of falling through with
+            // undefined args.
+            const updatedInput = (decision as { updatedInput?: unknown })
+              .updatedInput;
+            if (
+              updatedInput === null ||
+              typeof updatedInput !== 'object' ||
+              Array.isArray(updatedInput)
+            ) {
+              return new ToolMessage({
+                status: 'error',
+                content:
+                  'Decision "edit" missing object updatedInput — failing closed.',
+                name: call.name,
+                tool_call_id: call.id ?? '',
+              });
             }
-            // fall through to executing the (possibly edited) call
+            effectiveCall = {
+              ...call,
+              args: updatedInput as Record<string, unknown>,
+            };
+            // fall through to executing the edited call
           }
           // 'approve' (or 'edit' after applying edits) → fall through
         }
@@ -1063,6 +1084,23 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           typeof postResult.updatedOutput === 'string'
             ? postResult.updatedOutput
             : JSON.stringify(postResult.updatedOutput);
+        // Keep the tool-output registry in sync with what the model
+        // actually sees. Without this, `runTool` already registered
+        // the PRE-hook content under `_refKey`, and a later
+        // `{{tool<i>turn<n>}}` substitution would deliver the stale
+        // pre-hook bytes while the model (and downstream tools)
+        // observed the post-hook replacement. Read `_refKey` /
+        // `_refScope` straight off the message metadata that
+        // `recordOutputReference` stamped — no need to re-derive
+        // (and we couldn't, for anonymous-batch synthetic scopes).
+        const refMeta = output.additional_kwargs as
+          | t.ToolMessageRefMetadata
+          | undefined;
+        const refKey = refMeta?._refKey;
+        const refScope = refMeta?._refScope;
+        if (this.toolOutputRegistry != null && refKey != null) {
+          this.toolOutputRegistry.set(refScope, refKey, replaced);
+        }
         return new ToolMessage({
           status: output.status,
           name: output.name,
