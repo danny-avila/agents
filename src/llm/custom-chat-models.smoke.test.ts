@@ -1,4 +1,8 @@
-import { AIMessage, AIMessageChunk } from '@langchain/core/messages';
+import {
+  AIMessage,
+  AIMessageChunk,
+  HumanMessage,
+} from '@langchain/core/messages';
 import type { OpenAIChatInput, OpenAIClient } from '@langchain/openai';
 import type { ChatOpenRouterCallOptions } from '@/llm/openrouter';
 import type { CustomAnthropicInput } from '@/llm/anthropic';
@@ -68,6 +72,27 @@ type StreamingCompletionDelegate = {
 };
 type StreamingCompletionBackedModel = {
   completions: StreamingCompletionDelegate;
+};
+type OpenAIStreamEvent = {
+  event: string;
+  data?: unknown;
+};
+type OpenAIStreamItem =
+  | OpenAIClient.Chat.Completions.ChatCompletionChunk
+  | OpenAIStreamEvent;
+type MockableCompletionCreate = (
+  request: unknown,
+  options?: unknown
+) => Promise<AsyncIterable<OpenAIStreamItem>>;
+type MockableCompletionClient = {
+  chat: {
+    completions: {
+      create: MockableCompletionCreate;
+    };
+  };
+};
+type MockableCompletionDelegate = OpenAIResponsesDelegate & {
+  client?: MockableCompletionClient;
 };
 type OpenRouterReasoningStreamDelta =
   OpenAIClient.Chat.Completions.ChatCompletionChunk.Choice.Delta & {
@@ -250,6 +275,74 @@ describe('custom chat model class smoke tests', () => {
     expect(xai._lc_stream_delay).toBe(7);
     expect(xai.exposedClient).toBeInstanceOf(CustomOpenAIClient);
     expect(xaiRequestOptions.baseURL).toBe('https://xai.test/v1');
+  });
+
+  it('skips custom OpenAI-compatible SSE events during streaming', async () => {
+    const model = new ChatOpenAI({
+      model: 'hermes-agent',
+      apiKey: 'test-key',
+      streaming: true,
+    });
+    const completions = (
+      model as unknown as { completions: MockableCompletionDelegate }
+    ).completions;
+    completions._getClientOptions(undefined);
+    const client = completions.client;
+    if (client == null) {
+      throw new Error('Expected OpenAI completions client');
+    }
+
+    const createChunk = (
+      content: string,
+      finishReason: OpenAIClient.Chat.Completions.ChatCompletionChunk.Choice['finish_reason'] = null
+    ): OpenAIClient.Chat.Completions.ChatCompletionChunk => ({
+      id: 'chatcmpl-hermes-test',
+      object: 'chat.completion.chunk',
+      created: 0,
+      model: 'hermes-agent',
+      choices: [
+        {
+          index: 0,
+          delta: { content },
+          finish_reason: finishReason,
+        },
+      ],
+    });
+    async function* streamChunks(): AsyncGenerator<OpenAIStreamItem> {
+      yield createChunk('Hello ');
+      yield {
+        event: 'hermes.tool.progress',
+        data: {
+          tool: 'execute_code',
+          toolCallId: 'call_1',
+          status: 'running',
+        },
+      };
+      yield {
+        event: 'message',
+        data: createChunk('world', 'stop'),
+      };
+    }
+
+    const createMock = jest.fn(async () =>
+      streamChunks()
+    ) as MockableCompletionCreate;
+    client.chat.completions.create = createMock;
+
+    const chunks: AIMessageChunk[] = [];
+    const stream = await model.stream([new HumanMessage('use a tool')]);
+    for await (const chunk of stream) {
+      chunks.push(chunk);
+    }
+
+    const text = chunks
+      .map((chunk) => (typeof chunk.content === 'string' ? chunk.content : ''))
+      .join('');
+    expect(text).toBe('Hello world');
+    expect(createMock).toHaveBeenCalledWith(
+      expect.objectContaining({ stream: true }),
+      expect.any(Object)
+    );
   });
 
   it('keeps Moonshot reasoning content in completion requests', async () => {
