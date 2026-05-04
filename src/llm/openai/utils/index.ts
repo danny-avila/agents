@@ -291,11 +291,18 @@ const completionsApiContentBlockConverter: StandardContentBlockConverter<{
  * Heuristic for detecting Claude served via an OpenAI-shaped surface (e.g.
  * OpenRouter's `anthropic/claude-*` models). Used to decide whether thinking
  * blocks pass through verbatim or get flattened to text for the request body.
+ *
+ * The match is case-insensitive — provider configs in the wild ship IDs like
+ * `Anthropic/Claude-Sonnet-4.5` and `CLAUDE-3-5-SONNET`, and misclassifying
+ * any of them as non-Claude would silently drop signed thinking blocks that
+ * Claude needs replayed unchanged for tool-call continuation.
  */
 export function isClaudeModel(model?: string): boolean {
-  return (
-    model?.includes('claude') === true || model?.includes('anthropic') === true
-  );
+  if (model == null) {
+    return false;
+  }
+  const normalized = model.toLowerCase();
+  return normalized.includes('claude') || normalized.includes('anthropic');
 }
 
 /**

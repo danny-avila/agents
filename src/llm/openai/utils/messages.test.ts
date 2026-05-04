@@ -466,6 +466,30 @@ describe('_convertMessagesToOpenAIParams', () => {
       expect(out).toBe(original);
     });
 
+    it.each([
+      'Anthropic/Claude-Sonnet-4.5',
+      'CLAUDE-3-5-SONNET',
+      'Claude-Opus-4.1',
+      'ANTHROPIC/CLAUDE-HAIKU',
+    ])(
+      'detects Claude targets case-insensitively (%s) and preserves thinking blocks',
+      (model) => {
+        const original = [
+          new AIMessage({
+            content: [
+              { type: 'thinking', thinking: 'reason', signature: 'sig' },
+              { type: 'redacted_thinking', data: 'opaque' },
+              { type: 'text', text: 'answer' },
+            ] as never,
+          }),
+        ];
+
+        const out = flattenAnthropicThinkingForOpenAI(original, model);
+
+        expect(out).toBe(original);
+      }
+    );
+
     it('returns the same reference when no message has thinking blocks', () => {
       const original = [
         new HumanMessage('hi'),
