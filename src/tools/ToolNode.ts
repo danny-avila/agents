@@ -2457,7 +2457,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       } else {
         outputs = await Promise.all(
           filteredCalls.map((call, i) =>
-            this.runTool(call, config, {
+            this.runDirectToolWithLifecycleHooks(call, config, {
               batchIndex: i,
               turn,
               batchScopeId,
