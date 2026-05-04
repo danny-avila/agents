@@ -48,6 +48,7 @@
  */
 
 import { isAbsolute, relative, resolve } from 'path';
+import { Constants } from '@/common';
 import type {
   HookCallback,
   PreToolUseHookInput,
@@ -92,29 +93,32 @@ export type PathExtractor = (
 ) => readonly string[];
 
 const READ_TOOLS = new Set<string>([
-  'read_file',
-  'grep_search',
-  'glob_search',
-  'list_directory',
-  'compile_check',
+  Constants.READ_FILE,
+  Constants.GREP_SEARCH,
+  Constants.GLOB_SEARCH,
+  Constants.LIST_DIRECTORY,
+  Constants.COMPILE_CHECK,
 ]);
 
-const WRITE_TOOLS = new Set<string>(['write_file', 'edit_file']);
+const WRITE_TOOLS = new Set<string>([
+  Constants.WRITE_FILE,
+  Constants.EDIT_FILE,
+]);
 
 const DEFAULT_EXTRACTORS: Record<string, PathExtractor> = {
-  read_file: (i) =>
+  [Constants.READ_FILE]: (i) =>
     typeof i.file_path === 'string' ? [i.file_path] : [],
-  write_file: (i) =>
+  [Constants.WRITE_FILE]: (i) =>
     typeof i.file_path === 'string' ? [i.file_path] : [],
-  edit_file: (i) =>
+  [Constants.EDIT_FILE]: (i) =>
     typeof i.file_path === 'string' ? [i.file_path] : [],
-  grep_search: (i) =>
+  [Constants.GREP_SEARCH]: (i) =>
     typeof i.path === 'string' && i.path !== '' ? [i.path] : [],
-  glob_search: (i) =>
+  [Constants.GLOB_SEARCH]: (i) =>
     typeof i.path === 'string' && i.path !== '' ? [i.path] : [],
-  list_directory: (i) =>
+  [Constants.LIST_DIRECTORY]: (i) =>
     typeof i.path === 'string' && i.path !== '' ? [i.path] : [],
-  compile_check: () => [],
+  [Constants.COMPILE_CHECK]: () => [],
 };
 
 function isInsideAnyRoot(absolutePath: string, roots: string[]): boolean {

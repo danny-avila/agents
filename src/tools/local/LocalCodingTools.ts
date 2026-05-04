@@ -33,11 +33,17 @@ const DEFAULT_MAX_RESULTS = 200;
 const DEFAULT_MAX_READ_BYTES = 10 * 1024 * 1024;
 const BINARY_DETECTION_BYTES = 8000;
 
-export const LocalWriteFileToolName = 'write_file';
-export const LocalEditFileToolName = 'edit_file';
-export const LocalGrepSearchToolName = 'grep_search';
-export const LocalGlobSearchToolName = 'glob_search';
-export const LocalListDirectoryToolName = 'list_directory';
+/**
+ * Tool name aliases retained for back-compat with consumers that imported
+ * the per-file `Local*ToolName` constants. The canonical names live on
+ * `Constants.*` (see `src/common/enum.ts`); these aliases just point at
+ * them so a typo upstream gets caught at the type level.
+ */
+export const LocalWriteFileToolName = Constants.WRITE_FILE;
+export const LocalEditFileToolName = Constants.EDIT_FILE;
+export const LocalGrepSearchToolName = Constants.GREP_SEARCH;
+export const LocalGlobSearchToolName = Constants.GLOB_SEARCH;
+export const LocalListDirectoryToolName = Constants.LIST_DIRECTORY;
 
 export const LocalReadFileToolSchema: t.JsonSchemaType = {
   type: 'object',

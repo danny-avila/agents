@@ -35,7 +35,8 @@ import {
 } from './LocalExecutionEngine';
 import { Constants } from '@/common';
 
-export const CompileCheckToolName = 'compile_check';
+/** Back-compat alias; canonical name lives on `Constants.COMPILE_CHECK`. */
+export const CompileCheckToolName = Constants.COMPILE_CHECK;
 
 const CompileCheckSchema: t.JsonSchemaType = {
   type: 'object',
