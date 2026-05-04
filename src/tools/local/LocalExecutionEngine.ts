@@ -2,6 +2,7 @@ import { tmpdir } from 'os';
 import { isAbsolute, relative, resolve } from 'path';
 import { createHash, randomUUID } from 'crypto';
 import { mkdir, realpath, rm, writeFile } from 'fs/promises';
+import { createWriteStream } from 'fs';
 import { spawn } from 'child_process';
 import type { ChildProcess } from 'child_process';
 import type { SandboxRuntimeConfig } from '@anthropic-ai/sandbox-runtime';
@@ -530,10 +531,11 @@ export async function spawnLocalProcess(
       // Lazy-open the temp file the first time a stream's in-memory
       // buffer overflows. Seed it with everything we've buffered so
       // the file holds the FULL output (not just the post-cap tail).
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const fs = require('fs') as typeof import('fs');
+      // Uses the static `createWriteStream` import — `require('fs')`
+      // would throw `ReferenceError: require is not defined` in ESM
+      // consumers (this package ships both `dist/cjs` and `dist/esm`).
       spillPath = resolve(tmpdir(), `lc-local-output-${randomUUID()}.txt`);
-      spillStream = fs.createWriteStream(spillPath);
+      spillStream = createWriteStream(spillPath);
       spillStream.write('===== stdout =====\n');
       spillStream.write(stdout);
       spillStream.write('\n===== stderr =====\n');

@@ -1079,4 +1079,88 @@ describe('codex review fixes (round 5)', () => {
       expect(result.stdout.length).toBeGreaterThan(0);
     });
   });
+
+  describe('spill path is ESM-safe (Codex P1 #12)', () => {
+    // The spill path used to do `require('fs')` inside an ESM-shipped
+    // module — fine in CJS test runs, would throw `ReferenceError` in
+    // any ESM consumer that triggered the overflow path. Pin the
+    // happy path here; the static `createWriteStream` import means a
+    // ReferenceError would surface as a test failure regardless of
+    // which build runs the test.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { spawnLocalProcess } = require('../local/LocalExecutionEngine');
+
+    it('writes a spill file without a runtime require', async () => {
+      const result = await spawnLocalProcess(
+        'bash',
+        ['-c', 'head -c 40000 /dev/urandom | base64 | head -c 40000'],
+        {
+          timeoutMs: 10_000,
+          // tiny inline cap → guaranteed overflow → ensureSpill() runs
+          maxOutputChars: 4_000,
+          maxSpawnedBytes: 1024 * 1024,
+          sandbox: { enabled: false },
+        }
+      );
+      expect(result.exitCode).toBe(0);
+      expect(result.fullOutputPath).toBeTruthy();
+      const fs = await import('fs/promises');
+      const spilled = await fs.readFile(
+        result.fullOutputPath as string,
+        'utf8'
+      );
+      expect(spilled.length).toBeGreaterThan(result.stdout.length);
+    });
+  });
+
+  describe('glob_search surfaces ripgrep failures (Codex P2 #13)', () => {
+    it('returns an explicit error (not "No files found.") when rg exits non-zero', async () => {
+      _resetRipgrepCacheForTests();
+      // Inject a spawn backend that pretends rg exists for the
+      // availability probe but fails the actual `rg --files` call
+      // with exit 2 + stderr — the failure mode the codex comment
+      // flagged. Pre-fix, glob_search dropped exitCode/stderr on
+      // the floor and returned "No files found." regardless.
+      const realSpawn = (
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        require('child_process') as typeof import('child_process')
+      ).spawn;
+      const fakeRgBackend: t.LocalSpawn = ((
+        cmd: string,
+        args: string[],
+        opts: import('child_process').SpawnOptions
+      ) => {
+        if (cmd === 'rg' && args[0] === '--version') {
+          return realSpawn('sh', ['-c', 'exit 0'], opts);
+        }
+        if (cmd === 'rg') {
+          return realSpawn(
+            'sh',
+            ['-c', 'printf \'rg: bad glob target\\n\' >&2; exit 2'],
+            opts
+          );
+        }
+        return realSpawn(cmd, args, opts);
+      }) as unknown as t.LocalSpawn;
+
+      const cwd = await createTempDir();
+      const bundle = createLocalCodingToolBundle({
+        cwd,
+        exec: { spawn: fakeRgBackend },
+      });
+      const globTool = bundle.tools.find(
+        (tt) => tt.name === Constants.GLOB_SEARCH
+      );
+      const result = await globTool!.invoke({
+        id: 'g1',
+        name: Constants.GLOB_SEARCH,
+        args: { pattern: '**/*' },
+        type: 'tool_call',
+      });
+      const text = JSON.stringify(result);
+      expect(text).not.toContain('No files found.');
+      expect(text).toContain('glob_search failed');
+      expect(text).toContain('bad glob target');
+    });
+  });
 });

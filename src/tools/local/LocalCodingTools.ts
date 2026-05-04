@@ -820,6 +820,25 @@ export function createLocalGlobSearchTool(
           ['--files', '--hidden', '--glob', '!.git/**', '--glob', input.pattern, target],
           { ...config, timeoutMs: config.timeoutMs ?? 30000 }
         );
+        // rg --files exit codes:
+        //   0  → at least one file matched
+        //   1  → no files matched (clean — "No files found.")
+        //   2  → real error (bad glob, unreadable target, etc.)
+        // Without this branch, exit-2 errors used to silently map to
+        // "No files found." — the agent then treats a tooling failure
+        // as a real absence of matches.
+        if (result.timedOut || (result.exitCode != null && result.exitCode > 1)) {
+          const detail = result.stderr.trim() || `rg exited ${result.exitCode}`;
+          return [
+            `glob_search failed: ${detail}`,
+            {
+              files: [],
+              engine: 'ripgrep',
+              error: detail,
+              exitCode: result.exitCode,
+            },
+          ];
+        }
         const lines = result.stdout
           .split('\n')
           .filter(Boolean)
