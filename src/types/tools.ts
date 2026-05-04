@@ -477,6 +477,45 @@ export type LocalExecutionConfig = {
    * post-base64 token cost.
    */
   maxAttachmentBytes?: number;
+  /**
+   * Run a fast per-file syntax check after every successful
+   * `edit_file` / `write_file`. When the checker finds an error,
+   * the diagnostics are appended to the tool result so the model
+   * can self-correct without a separate read round-trip.
+   *
+   *   - `'off'` (default) : skip; current behavior.
+   *   - `'auto'`          : run the checker for known file types
+   *     when the corresponding tool is on PATH. Silently skip
+   *     otherwise.
+   *   - `'strict'`        : same as `'auto'`, plus fail the tool
+   *     call with the error so the model is forced to react. Use
+   *     when you don't trust the model to read a non-blocking
+   *     advisory.
+   *
+   * Built-in checkers: Node `node --check` for `.js/.mjs/.cjs`,
+   * Python `py_compile` for `.py`, `JSON.parse` for `.json`,
+   * `bash -n` for `.sh/.bash`. TypeScript falls back to `compile_check`
+   * (project-level) since per-file `.ts` syntax check requires the
+   * `typescript` package; the host can wire a per-file checker via
+   * `local.spawn` if desired.
+   */
+  postEditSyntaxCheck?: 'off' | 'auto' | 'strict';
+  /**
+   * Configuration for the `compile_check` tool. When `engine` is
+   * `local` and `includeCodingTools` is on, the SDK exposes a
+   * `compile_check` tool that runs the project's standard
+   * type/lint command (`tsc --noEmit`, `cargo check`, etc.).
+   */
+  compileCheck?: {
+    /**
+     * Override the auto-detected command. Runs verbatim from `cwd`
+     * via the local engine's standard spawn pipeline (sandbox / AST
+     * validation / output overflow all apply).
+     */
+    command?: string;
+    /** Default timeout for `compile_check`, in milliseconds. Defaults to 120s. */
+    timeoutMs?: number;
+  };
 };
 
 export type ToolExecutionConfig = {

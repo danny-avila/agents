@@ -25,6 +25,11 @@ import {
   createLocalCodingToolBundle,
   _resetRipgrepCacheForTests,
 } from '../local/LocalCodingTools';
+import {
+  runPostEditSyntaxCheck,
+  _resetSyntaxCheckProbeCacheForTests,
+} from '../local/syntaxCheck';
+import { createCompileCheckTool } from '../local/CompileCheckTool';
 import { runBashAstChecks } from '../local/bashAst';
 import { LocalFileCheckpointerImpl } from '../local/FileCheckpointer';
 
@@ -567,6 +572,117 @@ describe('local read attachments', () => {
     const readTool = bundle.tools.find((tt) => tt.name === Constants.READ_FILE);
     const result = await readTool!.invoke({ file_path: 'a.txt' });
     expect(String(result)).toContain('hello world');
+  });
+});
+
+describe('post-edit syntax check', () => {
+  beforeEach(() => {
+    _resetSyntaxCheckProbeCacheForTests();
+  });
+
+  it('flags broken JS via node --check', async () => {
+    const cwd = await createTempDir();
+    const file = join(cwd, 'broken.js');
+    await fsWriteFile(file, 'function (\n', 'utf8');
+    const outcome = await runPostEditSyntaxCheck(file, {});
+    expect(outcome).not.toBeNull();
+    expect(outcome!.ok).toBe(false);
+    if (outcome!.ok === false) {
+      expect(outcome!.checker).toBe('node --check');
+      expect(outcome!.output.length).toBeGreaterThan(0);
+    }
+  });
+
+  it('passes valid JS', async () => {
+    const cwd = await createTempDir();
+    const file = join(cwd, 'good.js');
+    await fsWriteFile(file, 'console.log(1)\n', 'utf8');
+    const outcome = await runPostEditSyntaxCheck(file, {});
+    expect(outcome?.ok).toBe(true);
+  });
+
+  it('flags broken JSON via JSON.parse', async () => {
+    const cwd = await createTempDir();
+    const file = join(cwd, 'broken.json');
+    await fsWriteFile(file, '{ "x": ', 'utf8');
+    const outcome = await runPostEditSyntaxCheck(file, {});
+    expect(outcome?.ok).toBe(false);
+    if (outcome!.ok === false) {
+      expect(outcome!.checker).toBe('JSON.parse');
+    }
+  });
+
+  it('returns null for unknown extensions', async () => {
+    const cwd = await createTempDir();
+    const file = join(cwd, 'random.xyz');
+    await fsWriteFile(file, 'whatever\n', 'utf8');
+    const outcome = await runPostEditSyntaxCheck(file, {});
+    expect(outcome).toBeNull();
+  });
+
+  it('write_file appends syntax-check warning when postEditSyntaxCheck=auto', async () => {
+    const cwd = await createTempDir();
+    const bundle = createLocalCodingToolBundle({
+      cwd,
+      postEditSyntaxCheck: 'auto',
+    });
+    const writeTool = bundle.tools.find((tt) => tt.name === 'write_file');
+    const message = (await writeTool!.invoke({
+      id: 'call_w',
+      name: 'write_file',
+      args: { file_path: 'broken.js', content: 'function (\n' },
+      type: 'tool_call',
+    })) as { content: string; artifact: { syntax_error?: string } };
+    expect(message.content).toContain('[syntax-check warning');
+    expect(message.artifact.syntax_error).toBe('node --check');
+  });
+
+  it('write_file in strict mode throws on syntax error', async () => {
+    const cwd = await createTempDir();
+    const bundle = createLocalCodingToolBundle({
+      cwd,
+      postEditSyntaxCheck: 'strict',
+    });
+    const writeTool = bundle.tools.find((tt) => tt.name === 'write_file');
+    await expect(
+      writeTool!.invoke({
+        id: 'call_w',
+        name: 'write_file',
+        args: { file_path: 'broken.js', content: 'function (\n' },
+        type: 'tool_call',
+      })
+    ).rejects.toThrow(/syntax check failed/);
+  });
+});
+
+describe('compile_check', () => {
+  it('reports "no recognised project marker" when there are none', async () => {
+    const cwd = await createTempDir();
+    const checkTool = createCompileCheckTool({ cwd });
+    const message = (await checkTool.invoke({
+      id: 'call_c',
+      name: 'compile_check',
+      args: {},
+      type: 'tool_call',
+    })) as { content: string; artifact: { ran: boolean; kind: string } };
+    expect(message.content).toContain('no recognised project marker');
+    expect(message.artifact.ran).toBe(false);
+    expect(message.artifact.kind).toBe('unknown');
+  });
+
+  it('honours an explicit command override and reports exit code', async () => {
+    const cwd = await createTempDir();
+    const checkTool = createCompileCheckTool({ cwd });
+    const message = (await checkTool.invoke({
+      id: 'call_c2',
+      name: 'compile_check',
+      args: { command: 'echo hello && false' },
+      type: 'tool_call',
+    })) as { content: string; artifact: { passed: boolean; exit_code: number | null } };
+    expect(message.content).toContain('FAILED');
+    expect(message.content).toContain('hello');
+    expect(message.artifact.passed).toBe(false);
+    expect(message.artifact.exit_code).not.toBe(0);
   });
 });
 

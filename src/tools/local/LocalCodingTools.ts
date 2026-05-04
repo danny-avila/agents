@@ -21,6 +21,11 @@ import { createLocalFileCheckpointer } from './FileCheckpointer';
 import { applyEdit, locateEdit } from './editStrategies';
 import { decodeFile, encodeFile } from './textEncoding';
 import { classifyAttachment, imageAttachmentContent } from './attachments';
+import { runPostEditSyntaxCheck } from './syntaxCheck';
+import {
+  createCompileCheckTool,
+  createCompileCheckToolDefinition,
+} from './CompileCheckTool';
 import { Constants } from '@/common';
 
 const MAX_READ_CHARS = 256000;
@@ -170,6 +175,37 @@ function lineWindow(
 }
 
 const MAX_DIFF_CHARS = 4000;
+
+type SyntaxRun =
+  | {
+      mode: 'auto' | 'strict';
+      outcome: import('./syntaxCheck').SyntaxCheckOutcome;
+    }
+  | undefined;
+
+async function maybeRunSyntaxCheck(
+  path: string,
+  config: t.LocalExecutionConfig
+): Promise<SyntaxRun> {
+  const mode = config.postEditSyntaxCheck ?? 'off';
+  if (mode === 'off') return undefined;
+  const outcome = await runPostEditSyntaxCheck(path, config);
+  if (outcome == null) return undefined;
+  return { mode, outcome };
+}
+
+function appendSyntaxCheckSummary(
+  base: string,
+  run: SyntaxRun
+): string {
+  if (run == null) return base;
+  if (run.outcome.ok) return base;
+  const banner =
+    run.mode === 'strict'
+      ? `\n\n[syntax-check FAILED via ${run.outcome.checker}]\n`
+      : `\n\n[syntax-check warning via ${run.outcome.checker}]\n`;
+  return `${base}${banner}${run.outcome.output}`;
+}
 
 function summariseDiff(
   filePath: string,
@@ -402,12 +438,20 @@ export function createLocalWriteFileTool(
       const finalText = encodeFile(input.content, encoding);
       await writeFile(path, finalText, 'utf8');
 
+      const syntax = await maybeRunSyntaxCheck(path, config);
+
       const diff = existed
         ? summariseDiff(path, before, input.content)
         : `(new file, ${input.content.length} chars)`;
-      const summary = existed
+      const baseSummary = existed
         ? `Overwrote ${path} (${input.content.length} chars). Diff:\n${diff}`
         : `Created ${path} (${input.content.length} chars).`;
+      const summary = appendSyntaxCheckSummary(baseSummary, syntax);
+      if (syntax?.outcome.ok === false && syntax.mode === 'strict') {
+        throw new Error(
+          `write_file syntax check failed (${syntax.outcome.checker}):\n${syntax.outcome.output}`
+        );
+      }
       return [
         summary,
         {
@@ -416,6 +460,9 @@ export function createLocalWriteFileTool(
           new_file: !existed,
           newline: encoding.newline === '\r\n' ? 'CRLF' : 'LF',
           had_bom: encoding.hasBom,
+          ...(syntax != null && syntax.outcome.ok === false
+            ? { syntax_error: syntax.outcome.checker }
+            : {}),
         },
       ];
     },
@@ -478,12 +525,20 @@ export function createLocalEditFileTool(
       const finalText = encodeFile(next, encoding);
       await writeFile(path, finalText, 'utf8');
 
+      const syntax = await maybeRunSyntaxCheck(path, config);
+
       const diff = summariseDiff(path, original, next);
       const fuzzy = strategiesUsed.some((s) => s !== 'exact');
-      const summary =
+      const baseSummary =
         `Applied ${edits.length} edit(s) to ${path}` +
         (fuzzy ? ` (strategies: ${strategiesUsed.join(', ')})` : '') +
         `. Diff:\n${diff}`;
+      const summary = appendSyntaxCheckSummary(baseSummary, syntax);
+      if (syntax?.outcome.ok === false && syntax.mode === 'strict') {
+        throw new Error(
+          `edit_file syntax check failed (${syntax.outcome.checker}):\n${syntax.outcome.output}`
+        );
+      }
       return [
         summary,
         {
@@ -492,6 +547,9 @@ export function createLocalEditFileTool(
           strategies: strategiesUsed,
           newline: encoding.newline === '\r\n' ? 'CRLF' : 'LF',
           had_bom: encoding.hasBom,
+          ...(syntax != null && syntax.outcome.ok === false
+            ? { syntax_error: syntax.outcome.checker }
+            : {}),
         },
       ];
     },
@@ -786,6 +844,7 @@ export function createLocalCodingTools(
     createLocalGrepSearchTool(config),
     createLocalGlobSearchTool(config),
     createLocalListDirectoryTool(config),
+    createCompileCheckTool(config),
     createLocalBashExecutionTool({ config }),
     createLocalCodeExecutionTool(config),
     createLocalProgrammaticToolCallingTool(config),
@@ -843,6 +902,7 @@ export function createLocalCodingToolDefinitions(): t.LCTool[] {
       'List files and directories in a local directory.',
       LocalListDirectoryToolSchema as t.JsonSchemaType
     ),
+    createCompileCheckToolDefinition(),
   ];
 }
 

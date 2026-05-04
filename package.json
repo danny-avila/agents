@@ -131,6 +131,7 @@
     "local:hooks": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/local_engine_hooks.ts --provider 'openAI' --name 'Jo' --location 'New York, NY'",
     "local:checkpointer": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/local_engine_checkpointer.ts --provider 'openAI' --name 'Jo' --location 'New York, NY'",
     "local:image": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/local_engine_image.ts --provider 'anthropic' --name 'Jo' --location 'New York, NY'",
+    "local:compile": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/local_engine_compile.ts --provider 'anthropic' --name 'Jo' --location 'New York, NY'",
     "programmatic_exec_agent": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/programmatic_exec_agent.ts --provider 'openAI' --name 'Jo' --location 'New York, NY'",
     "ant_web_search": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/ant_web_search.ts --name 'Jo' --location 'New York, NY'",
     "ant_web_search_edge_case": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/ant_web_search_edge_case.ts --name 'Jo' --location 'New York, NY'",
