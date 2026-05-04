@@ -34,7 +34,11 @@ import type { BindToolsInput } from '@langchain/core/language_models/chat_models
 import type { ChatGeneration, ChatResult } from '@langchain/core/outputs';
 import type { ChatXAIInput } from '@langchain/xai';
 import type * as t from '@langchain/openai';
-import { isReasoningModel, _convertMessagesToOpenAIParams } from './utils';
+import {
+  isReasoningModel,
+  flattenAnthropicThinkingForOpenAI,
+  _convertMessagesToOpenAIParams,
+} from './utils';
 import { sleep } from '@/utils';
 
 // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
@@ -589,12 +593,17 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun
   ): Promise<ChatResult> {
+    const normalizedMessages = flattenAnthropicThinkingForOpenAI(
+      messages,
+      this.model
+    );
     if (
       this.includeReasoningContent !== true &&
       this.includeReasoningDetails !== true
     ) {
-      return super._generate(messages, options, runManager);
+      return super._generate(normalizedMessages, options, runManager);
     }
+    messages = normalizedMessages;
 
     options.signal?.throwIfAborted();
     const usageMetadata: Partial<UsageMetadata> = {};
@@ -754,13 +763,22 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
+    const normalizedMessages = flattenAnthropicThinkingForOpenAI(
+      messages,
+      this.model
+    );
     if (
       this.includeReasoningContent !== true &&
       this.includeReasoningDetails !== true
     ) {
-      yield* super._streamResponseChunks(messages, options, runManager);
+      yield* super._streamResponseChunks(
+        normalizedMessages,
+        options,
+        runManager
+      );
       return;
     }
+    messages = normalizedMessages;
 
     const messagesMapped: OpenAICompletionParam[] =
       _convertMessagesToOpenAIParams(messages, this.model, {
