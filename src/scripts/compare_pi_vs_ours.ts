@@ -64,12 +64,25 @@ interface Task {
   description: string;
   /** Files seeded into the workspace before the run. */
   seed: Record<string, string>;
+  /** Optional binary files seeded into the workspace (key = path, value = bytes). */
+  seedBinary?: Record<string, Buffer>;
   /** Prompt sent to both agents. */
   prompt: string;
   /** Function that returns true if the workspace ended in the right state. */
   verify: (cwd: string) => Promise<{ ok: boolean; detail: string }>;
   /** Optional pre-run hook (e.g. symlink node_modules so `tsc` is available). */
   setup?: (cwd: string) => Promise<void>;
+  /**
+   * Optional setup specific to our local engine (extra `local.*` config knobs)
+   * — lets us toggle e.g. `attachReadAttachments` per-task without
+   *   making the default surface noisier than necessary.
+   */
+  oursLocalConfigOverrides?: Partial<t.LocalExecutionConfig>;
+  /**
+   * Some tasks aren't realistically supportable on one side. When set,
+   * skip the named runner and report N/A in the table.
+   */
+  skip?: 'pi' | 'ours';
 }
 
 interface ToolCallObservation {
@@ -196,6 +209,91 @@ const TASKS: Task[] = [
       const ok = cleaned && hasLog;
       return { ok, detail: ok ? '' : `actual:\n${text}` };
     },
+  },
+  {
+    name: 'T5 multi-file-rename',
+    description:
+      'Rename a function across three files. Tests how the agent finds + applies the rename.',
+    seed: {
+      'src/lib.ts':
+        'export function calc_total(a: number, b: number): number {\n' +
+        '  return a + b;\n' +
+        '}\n',
+      'src/index.ts':
+        'import { calc_total } from "./lib";\n' +
+        'console.log(calc_total(2, 3));\n',
+      'src/index.test.ts':
+        'import { calc_total } from "./lib";\n' +
+        'if (calc_total(1, 1) !== 2) throw new Error("fail");\n' +
+        'console.log("ok");\n',
+    },
+    prompt:
+      'Rename the exported function `calc_total` to `calculateTotal` across src/lib.ts, ' +
+      'src/index.ts, and src/index.test.ts. Update every reference. Reply "done" when finished.',
+    verify: async (cwd) => {
+      const lib = await readFile(join(cwd, 'src/lib.ts'), 'utf8').catch(() => '');
+      const idx = await readFile(join(cwd, 'src/index.ts'), 'utf8').catch(() => '');
+      const tst = await readFile(join(cwd, 'src/index.test.ts'), 'utf8').catch(
+        () => ''
+      );
+      const allRenamed =
+        /function\s+calculateTotal/.test(lib) &&
+        /calculateTotal\(/.test(idx) &&
+        /calculateTotal\(/.test(tst);
+      const noOldName =
+        !/calc_total/.test(lib) &&
+        !/calc_total/.test(idx) &&
+        !/calc_total/.test(tst);
+      const ok = allRenamed && noOldName;
+      return {
+        ok,
+        detail: ok
+          ? ''
+          : `lib:\n${lib}\nindex:\n${idx}\ntest:\n${tst}`,
+      };
+    },
+  },
+  {
+    name: 'T6 image-read-and-describe',
+    description:
+      'Reads a PNG and describes it. Ours embeds via attachReadAttachments + image_url block; pi has no equivalent and is skipped.',
+    seed: {},
+    setup: async (cwd) => {
+      const { copyFile } = await import('fs/promises');
+      // Use a real PNG (Anthropic refuses tiny 1x1 PNGs with "Could not
+      // process image"). Try a few well-known macOS app icons; fall back to
+      // any *.png we can find under /System.
+      const candidates = [
+        '/System/Library/CoreServices/Certificate Assistant.app/Contents/Resources/droppedImage.png',
+        '/System/Library/CoreServices/Certificate Assistant.app/Contents/Resources/shapeimage_1.png',
+        '/System/Library/CoreServices/BluetoothUIServer.app/Contents/Resources/handoff.png',
+      ];
+      for (const path of candidates) {
+        try {
+          await copyFile(path, join(cwd, 'sample.png'));
+          return;
+        } catch {
+          // try next
+        }
+      }
+      throw new Error('No system PNG available for T6 image task');
+    },
+    prompt:
+      'Read sample.png and briefly describe what the image shows. Reply with "done" at the end.',
+    verify: async (cwd) => {
+      // The verify step is soft — we just check the file is still on disk
+      // (the agent shouldn't have deleted it) and the script-level error
+      // tracking will fail this task if Anthropic refused the request.
+      const { stat } = await import('fs/promises');
+      try {
+        await stat(join(cwd, 'sample.png'));
+        return { ok: true, detail: '' };
+      } catch {
+        return { ok: false, detail: 'sample.png missing' };
+      }
+    },
+    oursLocalConfigOverrides: { attachReadAttachments: 'images-only' },
+    skip: 'pi',
   },
 ];
 
@@ -339,7 +437,11 @@ async function runPi(task: Task, cwd: string): Promise<RunOutcome> {
 /* Our local-engine runner                                             */
 /* ------------------------------------------------------------------ */
 
-async function runOurs(task: Task, cwd: string): Promise<RunOutcome> {
+async function runOurs(
+  task: Task,
+  cwd: string,
+  overrides: Partial<t.LocalExecutionConfig> = {}
+): Promise<RunOutcome> {
   const start = performance.now();
   const conversation: BaseMessage[] = [];
   const observedToolCalls: ToolCallObservation[] = [];
@@ -371,7 +473,10 @@ async function runOurs(task: Task, cwd: string): Promise<RunOutcome> {
     runId: `compare-${Date.now()}`,
     graphConfig: {
       type: 'standard',
-      llmConfig: { ...llmConfig, model: MODEL },
+      // NB: in the legacy path Run.createLegacyGraph rebuilds
+      // `clientOptions` from llmConfig (it ignores graphConfig.clientOptions),
+      // so promptCache lives here and not on a separate clientOptions field.
+      llmConfig: { ...llmConfig, model: MODEL, promptCache: true },
       instructions:
         'You are a coding assistant with local file tools. Use read_file, ' +
         'edit_file, write_file, bash. Be concise.',
@@ -382,6 +487,7 @@ async function runOurs(task: Task, cwd: string): Promise<RunOutcome> {
         cwd,
         postEditSyntaxCheck: 'auto',
         timeoutMs: 30_000,
+        ...overrides,
       },
     },
     returnContent: true,
@@ -467,6 +573,19 @@ async function runOurs(task: Task, cwd: string): Promise<RunOutcome> {
           : '';
   }
 
+  // Sonnet 4.5 pricing (USD per 1M tokens). Pi computes its own cost; we
+  // compute ours from the same per-turn breakdown so the cost columns are
+  // comparable. Source: anthropic.com/pricing as of model ship.
+  const PRICE_INPUT = 3.0 / 1_000_000;
+  const PRICE_OUTPUT = 15.0 / 1_000_000;
+  const PRICE_CACHE_WRITE = 3.75 / 1_000_000;
+  const PRICE_CACHE_READ = 0.3 / 1_000_000;
+  const cost =
+    inputTokens * PRICE_INPUT +
+    outputTokens * PRICE_OUTPUT +
+    cacheWriteTokens * PRICE_CACHE_WRITE +
+    cacheReadTokens * PRICE_CACHE_READ;
+
   return {
     toolCalls: observedToolCalls,
     wallMs: performance.now() - start,
@@ -474,7 +593,7 @@ async function runOurs(task: Task, cwd: string): Promise<RunOutcome> {
     outputTokens,
     cacheReadTokens,
     cacheWriteTokens,
-    cost: 0,
+    cost,
     finalAssistant: finalAssistant.slice(0, 500),
     errored,
     errorMessage,
@@ -486,9 +605,17 @@ async function runOurs(task: Task, cwd: string): Promise<RunOutcome> {
 /* ------------------------------------------------------------------ */
 
 async function setupWorkspace(task: Task): Promise<string> {
+  const { mkdir } = await import('fs/promises');
   const dir = await mkdtemp(join(tmpdir(), 'lc-compare-'));
-  for (const [name, content] of Object.entries(task.seed)) {
-    await writeFile(join(dir, name), content, 'utf8');
+  for (const [relPath, content] of Object.entries(task.seed)) {
+    const abs = join(dir, relPath);
+    await mkdir(join(abs, '..'), { recursive: true });
+    await writeFile(abs, content, 'utf8');
+  }
+  for (const [relPath, bytes] of Object.entries(task.seedBinary ?? {})) {
+    const abs = join(dir, relPath);
+    await mkdir(join(abs, '..'), { recursive: true });
+    await writeFile(abs, bytes);
   }
   if (task.setup != null) {
     await task.setup(dir);
@@ -521,95 +648,146 @@ function fmtMs(ms: number): string {
   return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`;
 }
 
+interface AggregatedSide {
+  outcomes: RunOutcome[];
+  verifies: boolean[];
+}
+function emptySide(): AggregatedSide {
+  return { outcomes: [], verifies: [] };
+}
+function avg(xs: number[]): number {
+  return xs.length === 0 ? 0 : xs.reduce((a, b) => a + b, 0) / xs.length;
+}
+function sum(xs: number[]): number {
+  return xs.reduce((a, b) => a + b, 0);
+}
+
+async function runOnce(
+  task: Task,
+  side: 'pi' | 'ours'
+): Promise<{ outcome: RunOutcome; verify: { ok: boolean; detail: string } } | null> {
+  if (task.skip === side) return null;
+  const cwd = await setupWorkspace(task);
+  const outcome =
+    side === 'pi'
+      ? await runPi(task, cwd)
+      : await runOurs(task, cwd, task.oursLocalConfigOverrides ?? {});
+  let verify = await task.verify(cwd);
+  if (outcome.errored) {
+    // Force-fail verify when the runner errored — otherwise a soft
+    // verify can mask a real provider rejection or a crash.
+    verify = {
+      ok: false,
+      detail: `runner errored: ${outcome.errorMessage ?? 'unknown'}`,
+    };
+  }
+  await rm(cwd, { recursive: true, force: true });
+  return { outcome, verify };
+}
+
 async function main(): Promise<void> {
+  const ITERS = Math.max(1, Number(process.env.COMPARE_ITERS ?? '1'));
   console.log(`pi binary: ${PI_BIN}`);
   console.log(`model:     ${MODEL}`);
   console.log(`provider:  ${PROVIDER}`);
+  console.log(`iters:     ${ITERS}`);
 
   const results: Array<{
     task: Task;
-    pi: RunOutcome;
-    piVerify: { ok: boolean; detail: string };
-    ours: RunOutcome;
-    oursVerify: { ok: boolean; detail: string };
+    pi: AggregatedSide;
+    ours: AggregatedSide;
   }> = [];
 
   for (const task of TASKS) {
     console.log(`\n========== ${task.name} ==========`);
     console.log(task.description);
 
-    // Run pi
-    const piCwd = await setupWorkspace(task);
-    console.log(`[pi] workspace=${piCwd}`);
-    const pi = await runPi(task, piCwd);
-    console.log(
-      `[pi] ${pi.errored ? 'ERROR' : 'ok'} ${fmtMs(pi.wallMs)} ${summariseToolCalls(pi.toolCalls)} ` +
-        `in=${pi.inputTokens} out=${pi.outputTokens} cacheR=${pi.cacheReadTokens} cacheW=${pi.cacheWriteTokens} $${pi.cost.toFixed(4)}`
-    );
-    if (pi.errored) console.log(`[pi] err: ${pi.errorMessage}`);
-    const piVerify = await task.verify(piCwd);
-    console.log(`[pi] verify: ${piVerify.ok ? '✔' : '✖'} ${piVerify.detail}`);
-    await rm(piCwd, { recursive: true, force: true });
+    const pi = emptySide();
+    const ours = emptySide();
 
-    // Run ours
-    const oursCwd = await setupWorkspace(task);
-    console.log(`[ours] workspace=${oursCwd}`);
-    const ours = await runOurs(task, oursCwd);
-    console.log(
-      `[ours] ${ours.errored ? 'ERROR' : 'ok'} ${fmtMs(ours.wallMs)} ${summariseToolCalls(ours.toolCalls)} ` +
-        `in=${ours.inputTokens} out=${ours.outputTokens} cacheR=${ours.cacheReadTokens} cacheW=${ours.cacheWriteTokens}`
-    );
-    if (ours.errored) console.log(`[ours] err: ${ours.errorMessage}`);
-    const oursVerify = await task.verify(oursCwd);
-    console.log(
-      `[ours] verify: ${oursVerify.ok ? '✔' : '✖'} ${oursVerify.detail}`
-    );
-    await rm(oursCwd, { recursive: true, force: true });
+    for (let i = 0; i < ITERS; i++) {
+      const tag = ITERS > 1 ? ` (iter ${i + 1}/${ITERS})` : '';
+      const piRes = await runOnce(task, 'pi');
+      if (piRes != null) {
+        pi.outcomes.push(piRes.outcome);
+        pi.verifies.push(piRes.verify.ok);
+        console.log(
+          `[pi]${tag} ${piRes.outcome.errored ? 'ERROR' : piRes.verify.ok ? 'ok' : 'fail'} ` +
+            `${fmtMs(piRes.outcome.wallMs)} ${summariseToolCalls(piRes.outcome.toolCalls)} ` +
+            `in=${piRes.outcome.inputTokens} out=${piRes.outcome.outputTokens} ` +
+            `cacheR=${piRes.outcome.cacheReadTokens} cacheW=${piRes.outcome.cacheWriteTokens} ` +
+            `$${piRes.outcome.cost.toFixed(4)}`
+        );
+        if (piRes.outcome.errored) console.log(`  err: ${piRes.outcome.errorMessage}`);
+      } else {
+        console.log(`[pi]${tag} (skipped)`);
+      }
 
-    results.push({ task, pi, piVerify, ours, oursVerify });
+      const oursRes = await runOnce(task, 'ours');
+      if (oursRes != null) {
+        ours.outcomes.push(oursRes.outcome);
+        ours.verifies.push(oursRes.verify.ok);
+        console.log(
+          `[ours]${tag} ${oursRes.outcome.errored ? 'ERROR' : oursRes.verify.ok ? 'ok' : 'fail'} ` +
+            `${fmtMs(oursRes.outcome.wallMs)} ${summariseToolCalls(oursRes.outcome.toolCalls)} ` +
+            `in=${oursRes.outcome.inputTokens} out=${oursRes.outcome.outputTokens} ` +
+            `cacheR=${oursRes.outcome.cacheReadTokens} cacheW=${oursRes.outcome.cacheWriteTokens}`
+        );
+        if (oursRes.outcome.errored) console.log(`  err: ${oursRes.outcome.errorMessage}`);
+      } else {
+        console.log(`[ours]${tag} (skipped)`);
+      }
+    }
+
+    results.push({ task, pi, ours });
   }
 
   /* Summary table ---------------------------------------------------- */
-  console.log('\n\n================ SUMMARY ================\n');
+  console.log('\n\n================ SUMMARY ================');
+  if (ITERS > 1) {
+    console.log(`(metrics are mean over ${ITERS} iterations)\n`);
+  } else {
+    console.log();
+  }
+
+  function fmtSide(side: AggregatedSide, key: keyof RunOutcome): string {
+    if (side.outcomes.length === 0) return 'N/A';
+    const vals = side.outcomes.map((o) => Number(o[key] ?? 0));
+    return Math.round(avg(vals)).toString();
+  }
+  function fmtSideMs(side: AggregatedSide): string {
+    if (side.outcomes.length === 0) return 'N/A';
+    return fmtMs(avg(side.outcomes.map((o) => o.wallMs)));
+  }
+  function fmtSideCalls(side: AggregatedSide): string {
+    if (side.outcomes.length === 0) return 'N/A';
+    return avg(side.outcomes.map((o) => o.toolCalls.length)).toFixed(1);
+  }
+  function fmtVerify(side: AggregatedSide): string {
+    if (side.verifies.length === 0) return 'N/A';
+    const passed = side.verifies.filter(Boolean).length;
+    return passed === side.verifies.length
+      ? '✔'
+      : `${passed}/${side.verifies.length}`;
+  }
+  function fmtCost(side: AggregatedSide): string {
+    if (side.outcomes.length === 0) return 'N/A';
+    const c = avg(side.outcomes.map((o) => o.cost));
+    return c === 0 ? '-' : `$${c.toFixed(4)}`;
+  }
+
   const cols: Array<[string, string, string, string]> = [
     ['task', 'metric', 'pi', 'ours'],
   ];
   for (const r of results) {
-    cols.push([r.task.name, 'verify', r.piVerify.ok ? '✔' : '✖', r.oursVerify.ok ? '✔' : '✖']);
-    cols.push([
-      '',
-      'wall',
-      fmtMs(r.pi.wallMs),
-      fmtMs(r.ours.wallMs),
-    ]);
-    cols.push([
-      '',
-      'tool calls',
-      String(r.pi.toolCalls.length),
-      String(r.ours.toolCalls.length),
-    ]);
-    // Anthropic's accounting: total billed input = input + cache_creation;
-    // cache_read is rebated. We display new+miss separately for fairness.
-    const piNew = r.pi.inputTokens + r.pi.cacheWriteTokens;
-    const oursNew = r.ours.inputTokens + r.ours.cacheWriteTokens;
-    cols.push([
-      '',
-      'input new',
-      String(piNew),
-      String(oursNew),
-    ]);
-    cols.push([
-      '',
-      'cache read',
-      String(r.pi.cacheReadTokens),
-      String(r.ours.cacheReadTokens),
-    ]);
-    cols.push([
-      '',
-      'output tok',
-      String(r.pi.outputTokens),
-      String(r.ours.outputTokens),
-    ]);
+    cols.push([r.task.name, 'verify', fmtVerify(r.pi), fmtVerify(r.ours)]);
+    cols.push(['', 'wall', fmtSideMs(r.pi), fmtSideMs(r.ours)]);
+    cols.push(['', 'tool calls', fmtSideCalls(r.pi), fmtSideCalls(r.ours)]);
+    cols.push(['', 'input new', fmtSide(r.pi, 'inputTokens'), fmtSide(r.ours, 'inputTokens')]);
+    cols.push(['', 'cache read', fmtSide(r.pi, 'cacheReadTokens'), fmtSide(r.ours, 'cacheReadTokens')]);
+    cols.push(['', 'cache write', fmtSide(r.pi, 'cacheWriteTokens'), fmtSide(r.ours, 'cacheWriteTokens')]);
+    cols.push(['', 'output tok', fmtSide(r.pi, 'outputTokens'), fmtSide(r.ours, 'outputTokens')]);
+    cols.push(['', 'cost', fmtCost(r.pi), fmtCost(r.ours)]);
   }
 
   const widths = [0, 0, 0, 0].map((_, i) =>
@@ -623,15 +801,18 @@ async function main(): Promise<void> {
     );
   }
 
-  // Confirm everywhere succeeded
-  const allOk =
-    results.every((r) => r.piVerify.ok) &&
-    results.every((r) => r.oursVerify.ok);
+  // Aggregate verify counts across all iters of all non-skipped tasks.
+  const piVerifies = results.flatMap((r) => r.pi.verifies);
+  const oursVerifies = results.flatMap((r) => r.ours.verifies);
+  const piPassed = piVerifies.filter(Boolean).length;
+  const oursPassed = oursVerifies.filter(Boolean).length;
   console.log(
-    `\nOverall: pi ${results.every((r) => r.piVerify.ok) ? 'all ✔' : 'some ✖'}, ` +
-      `ours ${results.every((r) => r.oursVerify.ok) ? 'all ✔' : 'some ✖'}.`
+    `\nOverall: pi ${piPassed}/${piVerifies.length}, ours ${oursPassed}/${oursVerifies.length}.`
   );
-  if (!allOk) process.exitCode = 1;
+  if (piPassed < piVerifies.length || oursPassed < oursVerifies.length) {
+    process.exitCode = 1;
+  }
+  void sum;
 }
 
 process.on('unhandledRejection', (reason) => {
