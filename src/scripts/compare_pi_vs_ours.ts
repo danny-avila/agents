@@ -536,7 +536,7 @@ async function runOurs(
         }
       }
       if (ai.usage_metadata != null) {
-        inputTokens += ai.usage_metadata.input_tokens ?? 0;
+        const reportedInput = ai.usage_metadata.input_tokens ?? 0;
         outputTokens += ai.usage_metadata.output_tokens ?? 0;
         const idu =
           (ai.usage_metadata as unknown as {
@@ -545,8 +545,20 @@ async function runOurs(
               cache_creation?: number;
             };
           }).input_token_details;
-        cacheReadTokens += idu?.cache_read ?? 0;
-        cacheWriteTokens += idu?.cache_creation ?? 0;
+        const cacheRead = idu?.cache_read ?? 0;
+        const cacheCreate = idu?.cache_creation ?? 0;
+        cacheReadTokens += cacheRead;
+        cacheWriteTokens += cacheCreate;
+        // The Anthropic adapter at src/llm/anthropic/utils/message_outputs.ts:31
+        // reports usage_metadata.input_tokens as the TOTAL prompt
+        // (input + cache_creation + cache_read), not just the uncached
+        // portion. Subtract cached fields so `inputTokens` here is
+        // apples-to-apples with pi's `input` field (uncached only).
+        const trulyUncached = Math.max(
+          0,
+          reportedInput - cacheRead - cacheCreate
+        );
+        inputTokens += trulyUncached;
       }
     }
     if (msg instanceof ToolMessage) {

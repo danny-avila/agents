@@ -24,6 +24,8 @@ import {
   createPruneMessages,
   addCacheControl,
   getMessageId,
+  makeIsDeferred,
+  partitionAndMarkAnthropicToolCache,
 } from '@/messages';
 import {
   GraphNodeKeys,
@@ -699,10 +701,37 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         agentContext.markToolsAsDiscovered(discoveredNames);
       }
 
-      const toolsForBinding = resolveLocalToolsForBinding({
+      const rawToolsForBinding = resolveLocalToolsForBinding({
         tools: agentContext.getToolsForBinding(),
         toolExecution: this.toolExecution,
       });
+
+      /**
+       * Anthropic prompt-cache breakpoint on the tool definitions.
+       *
+       * Without this, the (often static) tool inventory shows up as
+       * fresh input on every turn — measured at ~28k tokens/turn for
+       * the local engine's coding-tool bundle, dominating per-turn
+       * cost even when message-level caching is on.
+       *
+       * Strategy: partition tools into [static, deferred] and stamp
+       * `cache_control: ephemeral` on the last static tool.
+       * Discovered deferred tools that arrive across turns sit *after*
+       * the breakpoint and don't invalidate the prefix.
+       */
+      let toolsForBinding = rawToolsForBinding;
+      if (
+        agentContext.provider === Providers.ANTHROPIC &&
+        (agentContext.clientOptions as t.AnthropicClientOptions | undefined)
+          ?.promptCache === true
+      ) {
+        toolsForBinding =
+          partitionAndMarkAnthropicToolCache(
+            rawToolsForBinding,
+            makeIsDeferred(agentContext.toolDefinitions)
+          ) ?? rawToolsForBinding;
+      }
+
       let model =
         this.overrideModel ??
         initializeModel({

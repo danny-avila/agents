@@ -3,6 +3,7 @@ export * from './ids';
 export * from './prune';
 export * from './format';
 export * from './cache';
+export * from './anthropicToolCache';
 export * from './content';
 export * from './tools';
 export * from './contextPruning';
