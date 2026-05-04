@@ -265,6 +265,30 @@ describe('_convertMessagesToOpenAIParams', () => {
       );
     });
 
+    it('emits empty content string when thinking-only message is fully dropped (no tool_calls)', () => {
+      const messages = [
+        new AIMessage({
+          content: [
+            {
+              type: 'redacted_thinking',
+              data: 'opaque-encrypted-blob',
+            },
+            { type: 'thinking', thinking: '', signature: 'sig' },
+          ] as never,
+        }),
+      ];
+
+      const params = _convertMessagesToOpenAIParams(messages, 'gpt-5.4-mini');
+
+      expect(params[0]).toEqual(
+        expect.objectContaining({
+          role: 'assistant',
+          content: '',
+        })
+      );
+      expect(params[0]).not.toHaveProperty('tool_calls');
+    });
+
     it('emits empty content string when thinking-only message is fully dropped alongside tool_calls', () => {
       const messages = [
         new AIMessage({

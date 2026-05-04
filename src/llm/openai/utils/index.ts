@@ -327,7 +327,7 @@ export function _convertMessagesToOpenAIParams(
       model?.includes('claude') === true ||
       model?.includes('anthropic') === true;
 
-    const content =
+    const filteredContent =
       typeof message.content === 'string'
         ? message.content
         : message.content
@@ -359,6 +359,19 @@ export function _convertMessagesToOpenAIParams(
             return m;
           })
           .filter(<T>(m: T | null): m is T => m !== null);
+
+    /**
+     * Chat Completions requires assistant content arrays to contain at least
+     * one part — an empty array (which can result from filtering out
+     * thinking/redacted_thinking blocks) triggers a 400. Fall back to '' so
+     * the request still validates.
+     */
+    const content =
+      hasAnthropicThinkingBlock &&
+      Array.isArray(filteredContent) &&
+      filteredContent.length === 0
+        ? ''
+        : filteredContent;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const completionParam: Record<string, any> = {
       role,
@@ -378,11 +391,7 @@ export function _convertMessagesToOpenAIParams(
       completionParam.tool_calls = message.tool_calls.map(
         convertLangChainToolCallToOpenAI
       );
-      completionParam.content = hasAnthropicThinkingBlock
-        ? Array.isArray(content) && content.length === 0
-          ? ''
-          : content
-        : '';
+      completionParam.content = hasAnthropicThinkingBlock ? content : '';
       if (
         options?.includeReasoningDetails === true &&
         message.additional_kwargs.reasoning_details != null
