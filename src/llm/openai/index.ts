@@ -593,17 +593,12 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun
   ): Promise<ChatResult> {
-    const normalizedMessages = flattenAnthropicThinkingForOpenAI(
-      messages,
-      this.model
-    );
     if (
       this.includeReasoningContent !== true &&
       this.includeReasoningDetails !== true
     ) {
-      return super._generate(normalizedMessages, options, runManager);
+      return super._generate(messages, options, runManager);
     }
-    messages = normalizedMessages;
 
     options.signal?.throwIfAborted();
     const usageMetadata: Partial<UsageMetadata> = {};
@@ -763,22 +758,13 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
-    const normalizedMessages = flattenAnthropicThinkingForOpenAI(
-      messages,
-      this.model
-    );
     if (
       this.includeReasoningContent !== true &&
       this.includeReasoningDetails !== true
     ) {
-      yield* super._streamResponseChunks(
-        normalizedMessages,
-        options,
-        runManager
-      );
+      yield* super._streamResponseChunks(messages, options, runManager);
       return;
     }
-    messages = normalizedMessages;
 
     const messagesMapped: OpenAICompletionParam[] =
       _convertMessagesToOpenAIParams(messages, this.model, {
@@ -1170,13 +1156,29 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
     return this.getReasoningParams(options);
   }
 
+  async _generate(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions'],
+    runManager?: CallbackManagerForLLMRun
+  ): Promise<ChatResult> {
+    return super._generate(
+      flattenAnthropicThinkingForOpenAI(messages, this.model),
+      options,
+      runManager
+    );
+  }
+
   async *_streamResponseChunks(
     messages: BaseMessage[],
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
     yield* delayStreamChunks(
-      super._streamResponseChunks(messages, options, runManager),
+      super._streamResponseChunks(
+        flattenAnthropicThinkingForOpenAI(messages, this.model),
+        options,
+        runManager
+      ),
       this._lc_stream_delay
     );
   }
@@ -1280,13 +1282,28 @@ export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
     }
     return requestOptions;
   }
+  async _generate(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions'],
+    runManager?: CallbackManagerForLLMRun
+  ): Promise<ChatResult> {
+    return super._generate(
+      flattenAnthropicThinkingForOpenAI(messages, this.model),
+      options,
+      runManager
+    );
+  }
   async *_streamResponseChunks(
     messages: BaseMessage[],
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
     yield* delayStreamChunks(
-      super._streamResponseChunks(messages, options, runManager),
+      super._streamResponseChunks(
+        flattenAnthropicThinkingForOpenAI(messages, this.model),
+        options,
+        runManager
+      ),
       this._lc_stream_delay
     );
   }
@@ -1325,6 +1342,8 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
   ): Promise<ChatResult> {
     options.signal?.throwIfAborted();
     const params = this.invocationParams(options);
+
+    messages = flattenAnthropicThinkingForOpenAI(messages, this.model);
 
     if (params.stream === true) {
       return super._generate(messages, options, runManager);
@@ -1417,7 +1436,11 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
     yield* delayStreamChunks(
-      this._streamResponseChunksWithReasoning(messages, options, runManager),
+      this._streamResponseChunksWithReasoning(
+        flattenAnthropicThinkingForOpenAI(messages, this.model),
+        options,
+        runManager
+      ),
       this._lc_stream_delay
     );
   }
@@ -1877,13 +1900,29 @@ export class ChatXAI extends OriginalChatXAI {
     return requestOptions;
   }
 
+  async _generate(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions'],
+    runManager?: CallbackManagerForLLMRun
+  ): Promise<ChatResult> {
+    return super._generate(
+      flattenAnthropicThinkingForOpenAI(messages, this.model),
+      options,
+      runManager
+    );
+  }
+
   async *_streamResponseChunks(
     messages: BaseMessage[],
     options: this['ParsedCallOptions'],
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
     yield* delayStreamChunks(
-      super._streamResponseChunks(messages, options, runManager),
+      super._streamResponseChunks(
+        flattenAnthropicThinkingForOpenAI(messages, this.model),
+        options,
+        runManager
+      ),
       this._lc_stream_delay
     );
   }

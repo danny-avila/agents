@@ -317,7 +317,12 @@ export function flattenAnthropicThinkingForOpenAI(
   }
   let mutated = false;
   const out = messages.map((msg) => {
-    if (!Array.isArray(msg.content)) {
+    /**
+     * Thinking blocks only originate from AI messages. Skip non-AI types and
+     * messages with non-array content entirely so the rewrite work isn't
+     * spent producing values we'd then discard.
+     */
+    if (!isAIMessage(msg) || !Array.isArray(msg.content)) {
       return msg;
     }
     let blockChanged = false;
@@ -357,25 +362,22 @@ export function flattenAnthropicThinkingForOpenAI(
     mutated = true;
     const newContent: BaseMessage['content'] =
       rewritten.length === 0 ? '' : rewritten;
-    if (isAIMessage(msg)) {
-      return new AIMessage({
-        content: newContent,
-        additional_kwargs: msg.additional_kwargs,
-        response_metadata: msg.response_metadata,
-        ...(msg.name != null ? { name: msg.name } : {}),
-        ...(msg.id != null ? { id: msg.id } : {}),
-        ...(msg.tool_calls != null && msg.tool_calls.length > 0
-          ? { tool_calls: msg.tool_calls }
-          : {}),
-        ...(msg.invalid_tool_calls != null && msg.invalid_tool_calls.length > 0
-          ? { invalid_tool_calls: msg.invalid_tool_calls }
-          : {}),
-        ...(msg.usage_metadata != null
-          ? { usage_metadata: msg.usage_metadata }
-          : {}),
-      });
-    }
-    return msg;
+    return new AIMessage({
+      content: newContent,
+      additional_kwargs: msg.additional_kwargs,
+      response_metadata: msg.response_metadata,
+      ...(msg.name != null ? { name: msg.name } : {}),
+      ...(msg.id != null ? { id: msg.id } : {}),
+      ...(msg.tool_calls != null && msg.tool_calls.length > 0
+        ? { tool_calls: msg.tool_calls }
+        : {}),
+      ...(msg.invalid_tool_calls != null && msg.invalid_tool_calls.length > 0
+        ? { invalid_tool_calls: msg.invalid_tool_calls }
+        : {}),
+      ...(msg.usage_metadata != null
+        ? { usage_metadata: msg.usage_metadata }
+        : {}),
+    });
   });
   return mutated ? out : messages;
 }
@@ -774,53 +776,65 @@ export function _convertMessagesToOpenAIResponsesParams(
           ];
         }
 
+        const flattenedContent =
+          typeof content === 'string'
+            ? content
+            : content.flatMap((item) => {
+              if (item.type === 'text') {
+                const textItem = item as MessageContentComplex & {
+                    annotations?: unknown[];
+                  };
+                return {
+                  type: 'output_text',
+                  text: item.text,
+                  annotations: textItem.annotations ?? [],
+                };
+              }
+
+              if (item.type === 'output_text' || item.type === 'refusal') {
+                return item;
+              }
+
+              if (item.type === 'thinking') {
+                if (isClaudeTarget) {
+                  return item as ResponsesInputItem;
+                }
+                const thinkingText =
+                    (item as { thinking?: string }).thinking ?? '';
+                if (!thinkingText) {
+                  return [];
+                }
+                return {
+                  type: 'output_text',
+                  text: `<thinking>${thinkingText}</thinking>`,
+                  annotations: [],
+                };
+              }
+
+              if (item.type === 'redacted_thinking') {
+                return isClaudeTarget ? (item as ResponsesInputItem) : [];
+              }
+
+              return [];
+            });
+
+        /**
+         * Mirror the Chat Completions guard: if filtering reduced the assistant
+         * content to an empty array, fall back to '' so the request still
+         * validates against OpenAI's "at least one content part" requirement.
+         */
+        const assistantContent =
+          Array.isArray(flattenedContent) && flattenedContent.length === 0
+            ? ''
+            : flattenedContent;
+
         input.push({
           type: 'message',
           role: 'assistant',
           ...(lcMsg.id && !zdrEnabled && lcMsg.id.startsWith('msg_')
             ? { id: lcMsg.id }
             : {}),
-          content:
-            typeof content === 'string'
-              ? content
-              : content.flatMap((item) => {
-                if (item.type === 'text') {
-                  const textItem = item as MessageContentComplex & {
-                      annotations?: unknown[];
-                    };
-                  return {
-                    type: 'output_text',
-                    text: item.text,
-                    annotations: textItem.annotations ?? [],
-                  };
-                }
-
-                if (item.type === 'output_text' || item.type === 'refusal') {
-                  return item;
-                }
-
-                if (item.type === 'thinking') {
-                  if (isClaudeTarget) {
-                    return item as ResponsesInputItem;
-                  }
-                  const thinkingText =
-                      (item as { thinking?: string }).thinking ?? '';
-                  if (!thinkingText) {
-                    return [];
-                  }
-                  return {
-                    type: 'output_text',
-                    text: `<thinking>${thinkingText}</thinking>`,
-                    annotations: [],
-                  };
-                }
-
-                if (item.type === 'redacted_thinking') {
-                  return isClaudeTarget ? (item as ResponsesInputItem) : [];
-                }
-
-                return [];
-              }),
+          content: assistantContent,
         } as ResponsesInputItem);
 
         const functionCallIds = additional_kwargs[_FUNCTION_CALL_IDS_MAP_KEY];
