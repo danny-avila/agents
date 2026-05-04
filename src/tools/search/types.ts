@@ -210,7 +210,9 @@ export type SafeSearchLevel = 0 | 1 | 2;
 
 export type Logger = WinstonLogger;
 export interface SearchToolConfig
-  extends SearchConfig, ProcessSourcesConfig, FirecrawlConfig {
+  extends SearchConfig,
+    ProcessSourcesConfig,
+    FirecrawlConfig {
   tavilyScraperOptions?: TavilyScraperConfig;
   logger?: Logger;
   safeSearch?: SafeSearchLevel;

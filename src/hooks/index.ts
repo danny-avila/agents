@@ -7,6 +7,7 @@
 // `createSummarizeNode` (PreCompact, PostCompact), and
 // `SubagentExecutor.execute` (SubagentStart, SubagentStop).
 export { HookRegistry } from './HookRegistry';
+export type { HookHaltSignal } from './HookRegistry';
 export { executeHooks, DEFAULT_HOOK_TIMEOUT_MS } from './executeHooks';
 export {
   matchesQuery,
@@ -14,6 +15,8 @@ export {
   MAX_PATTERN_LENGTH,
   MAX_CACHE_SIZE,
 } from './matchers';
+export { createToolPolicyHook } from './createToolPolicyHook';
+export type { ToolPolicyMode, ToolPolicyConfig } from './createToolPolicyHook';
 export { HOOK_EVENTS } from './types';
 export type {
   HookEvent,
@@ -34,6 +37,8 @@ export type {
   PreToolUseHookInput,
   PostToolUseHookInput,
   PostToolUseFailureHookInput,
+  PostToolBatchHookInput,
+  PostToolBatchEntry,
   PermissionDeniedHookInput,
   SubagentStartHookInput,
   SubagentStopHookInput,
@@ -46,6 +51,7 @@ export type {
   PreToolUseHookOutput,
   PostToolUseHookOutput,
   PostToolUseFailureHookOutput,
+  PostToolBatchHookOutput,
   PermissionDeniedHookOutput,
   SubagentStartHookOutput,
   SubagentStopHookOutput,

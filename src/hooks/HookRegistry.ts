@@ -14,6 +14,20 @@ import type { HookEvent, HookMatcher } from './types';
 type MatcherBucket = Partial<Record<HookEvent, HookMatcher<HookEvent>[]>>;
 
 /**
+ * Snapshot of a halt request raised by a hook returning
+ * `preventContinuation: true`. The SDK's run loop polls for this between
+ * stream events and exits cleanly when set, skipping the `Stop` hook
+ * (the run is being halted, not naturally completing). One per registry
+ * instance — the first hook to halt wins; subsequent halts are ignored
+ * so the original reason isn't clobbered.
+ */
+export interface HookHaltSignal {
+  reason: string;
+  /** Event of the hook that triggered the halt (for diagnostics). */
+  source: HookEvent;
+}
+
+/**
  * Run-scoped storage for hook matchers with an additional layer for
  * session-scoped matchers that should be cleaned up between sessions.
  *
@@ -34,6 +48,18 @@ type MatcherBucket = Partial<Record<HookEvent, HookMatcher<HookEvent>[]>>;
 export class HookRegistry {
   private readonly global: MatcherBucket = {};
   private readonly sessions: Map<string, MatcherBucket> = new Map();
+  /**
+   * Per-session halt signals. Scoped by `sessionId` (= the run id the
+   * hook fired under) so a host that shares one registry across
+   * concurrent runs cannot leak `preventContinuation` from one run
+   * into another. Without scoping, a halt raised by run A's hook
+   * would trip run B's stream-loop poll on the next iteration —
+   * silently terminating an unrelated run.
+   *
+   * Map storage mirrors the reasoning above for session matchers:
+   * O(1) insertion in hot paths, no spread-on-write.
+   */
+  private readonly haltSignals: Map<string, HookHaltSignal> = new Map();
 
   /**
    * Register a matcher for the lifetime of this registry (= one Run).
@@ -123,6 +149,51 @@ export class HookRegistry {
    */
   clearSession(sessionId: string): void {
     this.sessions.delete(sessionId);
+  }
+
+  /**
+   * Raise a halt signal scoped to `sessionId` (= the run id the hook
+   * fired under). The SDK's run loop polls for this between stream
+   * events with the run's own id. First-write-wins per session: a
+   * halt already raised by an earlier hook in the same run is
+   * preserved so the original `reason` / `source` aren't overwritten.
+   *
+   * Per-session scoping is critical when hosts share one registry
+   * across concurrent runs (e.g. a global policy registered once and
+   * reused). Without it, a `preventContinuation` from run A would
+   * trip run B's stream-loop poll on the next iteration and silently
+   * terminate an unrelated run.
+   *
+   * Called by the SDK after `executeHooks` returns an aggregate with
+   * `preventContinuation: true`. Hosts can also call it directly from
+   * inside a hook callback if they want to halt without going through
+   * the aggregated return value, but `preventContinuation` is the
+   * canonical path.
+   */
+  haltRun(sessionId: string, reason: string, source: HookEvent): void {
+    if (this.haltSignals.has(sessionId)) {
+      return;
+    }
+    this.haltSignals.set(sessionId, { reason, source });
+  }
+
+  /**
+   * Returns the halt signal raised by hooks running under `sessionId`,
+   * or `undefined` if no hook in that run has halted. Polled by
+   * `Run.processStream` between stream events using the run's own id.
+   */
+  getHaltSignal(sessionId: string): HookHaltSignal | undefined {
+    return this.haltSignals.get(sessionId);
+  }
+
+  /**
+   * Clears the halt signal for `sessionId`. Called by
+   * `Run.processStream` in its `finally` block so a subsequent
+   * invocation of the same Run (e.g. resume) starts with a fresh
+   * halt state. No-op when no signal exists for that session.
+   */
+  clearHaltSignal(sessionId: string): void {
+    this.haltSignals.delete(sessionId);
   }
 
   /** True if at least one matcher exists for `event` (global + session). */

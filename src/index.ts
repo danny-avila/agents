@@ -35,11 +35,30 @@ export * from './utils';
 /* Hooks */
 export * from './hooks';
 
+/* HITL helpers */
+export * from './hitl';
+
 /* Types */
 export type * from './types';
 
 /* LangChain compatibility facade */
 export * from './langchain';
+
+/**
+ * HITL primitives re-exported from `@langchain/langgraph` so hosts that
+ * build durable checkpoint savers, dispatch `Command({ resume })`, or
+ * detect interrupts can do so against the same langgraph instance the
+ * SDK was compiled against — avoiding accidental dual-version drift.
+ */
+export {
+  Command,
+  INTERRUPT,
+  interrupt,
+  MemorySaver,
+  BaseCheckpointSaver,
+  isInterrupted,
+} from '@langchain/langgraph';
+export type { Interrupt } from '@langchain/langgraph';
 
 /* LLM */
 export { CustomOpenAIClient } from './llm/openai';

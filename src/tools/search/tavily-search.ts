@@ -227,22 +227,22 @@ const normalizeTavilyTimeRange = (
   timeRange?: t.TavilyTimeRangeInput
 ): t.TavilyTimeRange | undefined => {
   switch (timeRange) {
-    case 'h':
-    case 'd':
-      return 'day';
-    case 'w':
-      return 'week';
-    case 'm':
-      return 'month';
-    case 'y':
-      return 'year';
-    case 'day':
-    case 'week':
-    case 'month':
-    case 'year':
-      return timeRange;
-    default:
-      return undefined;
+  case 'h':
+  case 'd':
+    return 'day';
+  case 'w':
+    return 'week';
+  case 'm':
+    return 'month';
+  case 'y':
+    return 'year';
+  case 'day':
+  case 'week':
+  case 'month':
+  case 'year':
+    return timeRange;
+  default:
+    return undefined;
   }
 };
 
@@ -375,28 +375,28 @@ export const createTavilyAPI = (
 
       const imageResults: t.ImageResult[] = Array.isArray(data.images)
         ? data.images.slice(0, 6).reduce<t.ImageResult[]>((acc, image) => {
-            const imageUrl = typeof image === 'string' ? image : image.url;
-            if (imageUrl == null || imageUrl === '') {
-              return acc;
-            }
-            acc.push({
-              imageUrl,
-              title: typeof image === 'string' ? undefined : image.description,
-              position: acc.length + 1,
-            });
+          const imageUrl = typeof image === 'string' ? image : image.url;
+          if (imageUrl == null || imageUrl === '') {
             return acc;
-          }, [])
+          }
+          acc.push({
+            imageUrl,
+            title: typeof image === 'string' ? undefined : image.description,
+            position: acc.length + 1,
+          });
+          return acc;
+        }, [])
         : [];
 
       const newsResults: t.NewsResult[] =
         topic === 'news'
           ? organicResults.map((r) => ({
-              title: r.title,
-              link: r.link,
-              snippet: r.snippet,
-              date: r.date,
-              source: getHostname(r.link),
-            }))
+            title: r.title,
+            link: r.link,
+            snippet: r.snippet,
+            date: r.date,
+            source: getHostname(r.link),
+          }))
           : [];
 
       const results: t.SearchResultData = {

@@ -15,6 +15,7 @@ export const HOOK_EVENTS = [
   'PreToolUse',
   'PostToolUse',
   'PostToolUseFailure',
+  'PostToolBatch',
   'PermissionDenied',
   'SubagentStart',
   'SubagentStop',
@@ -100,6 +101,42 @@ export interface PostToolUseFailureHookInput extends BaseHookInput {
   turn?: number;
 }
 
+/**
+ * Per-tool result snapshot included in a `PostToolBatch` event. Mirrors
+ * the data PostToolUse / PostToolUseFailure get individually, but the
+ * batch view lets a single hook see the whole set so it can inject one
+ * consolidated convention/audit message rather than N per-tool ones.
+ */
+export interface PostToolBatchEntry {
+  toolName: string;
+  toolInput: Record<string, unknown>;
+  toolUseId: string;
+  stepId?: string;
+  turn?: number;
+  /** Successful tool output, present only when `status === 'success'`. */
+  toolOutput?: unknown;
+  /** Error message, present only when `status === 'error'`. */
+  error?: string;
+  status: 'success' | 'error';
+}
+
+/**
+ * Fires once after every tool call in a single batch finishes (including
+ * any that were rejected via HITL). Lets a hook react to the batch as a
+ * whole — useful for "inject conventions once for the whole batch", batch
+ * audit logging, or coordinating cleanup that depends on knowing the full
+ * result set rather than streaming each tool's result independently.
+ *
+ * Order: fires AFTER all per-tool PostToolUse / PostToolUseFailure hooks
+ * for the same batch have completed, BEFORE the next model call. Pass an
+ * `additionalContext` to inject context for that next model turn.
+ */
+export interface PostToolBatchHookInput extends BaseHookInput {
+  hook_event_name: 'PostToolBatch';
+  /** All tool calls (and their outcomes) from this batch, in batch order. */
+  entries: PostToolBatchEntry[];
+}
+
 export interface PermissionDeniedHookInput extends BaseHookInput {
   hook_event_name: 'PermissionDenied';
   toolName: string;
@@ -171,6 +208,7 @@ export type HookInput =
   | PreToolUseHookInput
   | PostToolUseHookInput
   | PostToolUseFailureHookInput
+  | PostToolBatchHookInput
   | PermissionDeniedHookInput
   | SubagentStartHookInput
   | SubagentStopHookInput
@@ -186,6 +224,7 @@ export type HookInputByEvent = {
   PreToolUse: PreToolUseHookInput;
   PostToolUse: PostToolUseHookInput;
   PostToolUseFailure: PostToolUseFailureHookInput;
+  PostToolBatch: PostToolBatchHookInput;
   PermissionDenied: PermissionDeniedHookInput;
   SubagentStart: SubagentStartHookInput;
   SubagentStop: SubagentStopHookInput;
@@ -206,6 +245,56 @@ export interface BaseHookOutput {
   preventContinuation?: boolean;
   /** Reason reported alongside `preventContinuation`. */
   stopReason?: string;
+  /**
+   * Marks this hook output as fire-and-forget for INFLUENCE only.
+   * When `true`, the SDK skips every other field on this output —
+   * `decision`, `additionalContext`, `updatedInput`,
+   * `preventContinuation`, `allowedDecisions`, `updatedOutput` are
+   * all ignored. The hook's return value cannot block, modify, or
+   * inject context, so it's safe to use for pure side effects
+   * (logging, metrics, webhooks).
+   *
+   * Important caveat: the hook's CALLBACK promise is still awaited
+   * by `executeHooks` (subject to the matcher's timeout and the
+   * default `DEFAULT_HOOK_TIMEOUT_MS`). The SDK does not
+   * speculatively detach hooks based on output shape, because the
+   * shape is only known after the promise resolves. For TRUE
+   * fire-and-forget where the agent doesn't wait at all, the hook
+   * body should detach its side effect itself and return
+   * immediately:
+   *
+   * @example
+   * ```ts
+   * async (input) => {
+   *   // Detach the slow work — the SDK awaits this hook's
+   *   // returned promise, which resolves immediately because we
+   *   // don't `await` the side effect.
+   *   void sendToLoggingService(input).catch(console.error);
+   *   return { async: true };
+   * };
+   * ```
+   *
+   * @example WRONG — the agent will block on the webhook
+   * ```ts
+   * async (input) => {
+   *   await sendToLoggingService(input);  // ← awaited, blocks
+   *   return { async: true };  // returning async:true doesn't undo the await
+   * };
+   * ```
+   *
+   * Mirrors Claude Code Agent SDK's `async` output, with the same
+   * "detach inside the hook body" pattern.
+   */
+  async?: boolean;
+  /**
+   * Optional advisory timeout in milliseconds for the background work
+   * a host has detached inside an `async: true` hook body. The SDK
+   * does not enforce this (the hook's own AbortSignal handling does)
+   * but the field is preserved on the wire so downstream
+   * observability can surface long-running side effects. Ignored
+   * unless `async` is true.
+   */
+  asyncTimeout?: number;
 }
 
 export type RunStartHookOutput = BaseHookOutput;
@@ -229,6 +318,19 @@ export interface PreToolUseHookOutput extends BaseHookOutput {
    * `updatedInput` to one hook per matcher to avoid confusing precedence.
    */
   updatedInput?: Record<string, unknown>;
+  /**
+   * Restricts which decisions the host UI is allowed to surface for this
+   * tool call when the hook returns `decision: 'ask'`. Pass to lock a
+   * tool down to a subset of `'approve' | 'reject' | 'edit' | 'respond'`
+   * — for example, `['approve', 'reject']` to forbid the user from
+   * editing the tool's args or substituting a custom response.
+   *
+   * The values flow into the resulting interrupt's
+   * `review_configs[i].allowed_decisions`. Omitting the field keeps the
+   * SDK default (all four decisions advertised). Last-writer-wins in
+   * registration order, same precedence rules as `updatedInput`.
+   */
+  allowedDecisions?: ReadonlyArray<'approve' | 'reject' | 'edit' | 'respond'>;
 }
 
 export interface PostToolUseHookOutput extends BaseHookOutput {
@@ -242,6 +344,8 @@ export interface PostToolUseHookOutput extends BaseHookOutput {
 }
 
 export type PostToolUseFailureHookOutput = BaseHookOutput;
+
+export type PostToolBatchHookOutput = BaseHookOutput;
 
 export type PermissionDeniedHookOutput = BaseHookOutput;
 
@@ -270,6 +374,7 @@ export type HookOutputByEvent = {
   PreToolUse: PreToolUseHookOutput;
   PostToolUse: PostToolUseHookOutput;
   PostToolUseFailure: PostToolUseFailureHookOutput;
+  PostToolBatch: PostToolBatchHookOutput;
   PermissionDenied: PermissionDeniedHookOutput;
   SubagentStart: SubagentStartHookOutput;
   SubagentStop: SubagentStopHookOutput;
@@ -286,6 +391,7 @@ export type HookOutput =
   | PreToolUseHookOutput
   | PostToolUseHookOutput
   | PostToolUseFailureHookOutput
+  | PostToolBatchHookOutput
   | PermissionDeniedHookOutput
   | SubagentStartHookOutput
   | SubagentStopHookOutput
@@ -381,6 +487,12 @@ export interface AggregatedHookResult {
    * hook per matcher to avoid subtle precedence bugs.
    */
   updatedInput?: Record<string, unknown>;
+  /**
+   * Restricted decision set from a `PreToolUse` hook. Same last-writer-wins
+   * semantics as `updatedInput`. Surfaces to the interrupt payload's
+   * `review_configs[i].allowed_decisions`.
+   */
+  allowedDecisions?: ReadonlyArray<'approve' | 'reject' | 'edit' | 'respond'>;
   /**
    * Replacement tool output from a `PostToolUse` hook.
    *

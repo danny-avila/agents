@@ -1,5 +1,6 @@
 // src/types/index.ts
 export * from './graph';
+export * from './hitl';
 export * from './llm';
 export * from './messages';
 export * from './run';

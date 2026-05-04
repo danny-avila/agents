@@ -204,10 +204,10 @@ export class TavilyScraper implements t.BaseScraper {
     const references: t.References | undefined =
       images.length > 0
         ? {
-            links: [],
-            images: images.map((imageUrl) => ({ originalUrl: imageUrl })),
-            videos: [],
-          }
+          links: [],
+          images: images.map((imageUrl) => ({ originalUrl: imageUrl })),
+          videos: [],
+        }
         : undefined;
 
     return [content, references];

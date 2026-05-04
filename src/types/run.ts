@@ -12,6 +12,7 @@ import type * as e from '@/common/enum';
 import type * as g from '@/types/graph';
 import type * as l from '@/types/llm';
 import type { ToolSessionMap, ToolOutputReferencesConfig } from '@/types/tools';
+import type { HumanInTheLoopConfig } from '@/types/hitl';
 import type { HookRegistry } from '@/hooks';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -156,6 +157,38 @@ export type RunConfig = {
    * placeholders. Disabled by default so existing runs are unaffected.
    */
   toolOutputReferences?: ToolOutputReferencesConfig;
+  /**
+   * First-class human-in-the-loop (HITL) flow for this run.
+   *
+   * **HITL is OFF by default.** Omitting this field — or passing
+   * `{ enabled: false }` — keeps the pre-HITL fail-closed semantics
+   * where `ask` decisions collapse into a synchronous deny. Hosts opt
+   * in explicitly with `{ enabled: true }` once their UI can render
+   * and resolve `tool_approval` interrupts (otherwise the run just
+   * pauses with no resolver, which surfaces to end users as a hung
+   * tool-call card).
+   *
+   * Plan of record: the default flips back to ON in a future minor
+   * once the consumer ecosystem (notably LibreChat) ships HITL UI
+   * end-to-end. See `HumanInTheLoopConfig` JSDoc.
+   *
+   * When enabled (`{ enabled: true }`):
+   *   - `PreToolUse` hooks returning `decision: 'ask'` raise a real
+   *     LangGraph `interrupt()` instead of being treated as a synchronous
+   *     deny. The graph pauses and the run exits cleanly.
+   *   - If `graphConfig.compileOptions.checkpointer` is missing, the SDK
+   *     installs an in-memory `MemorySaver` as a fallback so scripts and
+   *     tests can resume without external infrastructure. Production
+   *     hosts should always provide a durable checkpointer.
+   *   - Hosts inspect the pending interrupt via `run.getInterrupt()` and
+   *     continue with `Run.resume(decisions)` against a Run rebuilt with
+   *     the same `thread_id` and checkpointer.
+   *
+   * When disabled (the default): `ask` decisions remain fail-closed
+   * (blocked with an error `ToolMessage`) and no checkpointer is
+   * implicitly attached.
+   */
+  humanInTheLoop?: HumanInTheLoopConfig;
 };
 
 export type ProvidedCallbacks =

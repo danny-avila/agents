@@ -5,6 +5,7 @@ import type { ToolCall } from '@langchain/core/messages/tool';
 import type { HookRegistry } from '@/hooks';
 import type { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import type { MessageContentComplex, ToolErrorData } from './stream';
+import type { HumanInTheLoopConfig } from './hitl';
 
 /** Replacement type for `import type { ToolCall } from '@langchain/core/messages/tool'` in order to have stringified args typed */
 export type CustomToolCall = {
@@ -56,6 +57,24 @@ export type ToolNodeOptions = {
    * routed through `directToolNames` bypass hook dispatch entirely.
    */
   hookRegistry?: HookRegistry;
+  /**
+   * Run-scoped HITL config. **HITL is OFF by default** — omitting this
+   * field (or passing `{ enabled: false }`) keeps the pre-HITL
+   * fail-closed behavior where a `PreToolUse` `ask` decision collapses
+   * into a blocked `ToolMessage`. Hosts opt in with
+   * `{ enabled: true }` once their UI can render and resolve a
+   * `tool_approval` interrupt; that engages the interrupt path where
+   * `ask` raises a real LangGraph `interrupt()` carrying a
+   * `HumanInterruptPayload` and the host resumes with
+   * `Run.resume(decisions)`.
+   *
+   * Mirrors `RunConfig.humanInTheLoop` (which is the canonical place
+   * to set this); the Graph threads it down to every ToolNode it
+   * compiles. Same caveat: the interrupt path is only wired into the
+   * event-driven dispatch (`dispatchToolEvents`), not into
+   * `directToolNames` execution — direct tools bypass HITL entirely.
+   */
+  humanInTheLoop?: HumanInTheLoopConfig;
   /** Max context tokens for the agent — used to compute tool result truncation limits. */
   maxContextTokens?: number;
   /**

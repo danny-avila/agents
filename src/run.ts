@@ -4,6 +4,13 @@ import { CallbackHandler } from '@langfuse/langchain';
 import { PromptTemplate } from '@langchain/core/prompts';
 import { RunnableLambda } from '@langchain/core/runnables';
 import { AzureChatOpenAI, ChatOpenAI } from '@langchain/openai';
+import {
+  Command,
+  INTERRUPT,
+  MemorySaver,
+  isInterrupted,
+} from '@langchain/langgraph';
+import { HumanMessage } from '@langchain/core/messages';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
 import type {
   MessageContentComplex,
@@ -45,6 +52,7 @@ export class Run<_T extends t.BaseGraphState> {
   private tokenCounter?: t.TokenCounter;
   private handlerRegistry?: HandlerRegistry;
   private hookRegistry?: HookRegistry;
+  private humanInTheLoop?: t.HumanInTheLoopConfig;
   private toolOutputReferences?: t.ToolOutputReferencesConfig;
   private indexTokenCountMap?: Record<string, number>;
   calibrationRatio: number = 1;
@@ -53,6 +61,15 @@ export class Run<_T extends t.BaseGraphState> {
   returnContent: boolean = false;
   private skipCleanup: boolean = false;
   private _streamResult: t.MessageContentComplex[] | undefined;
+  /**
+   * Captured interrupt payload typed as `unknown` because the SDK
+   * does not validate the runtime shape — custom graph nodes can
+   * raise interrupts with arbitrary payloads (not just the SDK's
+   * `HumanInterruptPayload` union). The public `getInterrupt<T>()`
+   * lets callers assert the type they expect.
+   */
+  private _interrupt: t.RunInterruptResult<unknown> | undefined;
+  private _haltedReason: string | undefined;
 
   private constructor(config: Partial<t.RunConfig>) {
     const runId = config.runId ?? '';
@@ -79,6 +96,7 @@ export class Run<_T extends t.BaseGraphState> {
 
     this.handlerRegistry = handlerRegistry;
     this.hookRegistry = config.hooks;
+    this.humanInTheLoop = config.humanInTheLoop;
     this.toolOutputReferences = config.toolOutputReferences;
 
     if (!config.graphConfig) {
@@ -154,8 +172,11 @@ export class Run<_T extends t.BaseGraphState> {
       calibrationRatio: this.calibrationRatio,
     });
     /** Propagate compile options from graph config */
-    standardGraph.compileOptions = config.compileOptions;
+    standardGraph.compileOptions = this.applyHITLCheckpointerFallback(
+      config.compileOptions
+    );
     standardGraph.hookRegistry = this.hookRegistry;
+    standardGraph.humanInTheLoop = this.humanInTheLoop;
     standardGraph.toolOutputReferences = this.toolOutputReferences;
     this.Graph = standardGraph;
     return standardGraph.createWorkflow();
@@ -175,14 +196,195 @@ export class Run<_T extends t.BaseGraphState> {
       calibrationRatio: this.calibrationRatio,
     });
 
-    if (compileOptions != null) {
-      multiAgentGraph.compileOptions = compileOptions;
-    }
+    multiAgentGraph.compileOptions =
+      this.applyHITLCheckpointerFallback(compileOptions);
 
     multiAgentGraph.hookRegistry = this.hookRegistry;
+    multiAgentGraph.humanInTheLoop = this.humanInTheLoop;
     multiAgentGraph.toolOutputReferences = this.toolOutputReferences;
     this.Graph = multiAgentGraph;
     return multiAgentGraph.createWorkflow();
+  }
+
+  /**
+   * When the host opted into HITL via `humanInTheLoop: { enabled: true }`
+   * and did not supply a checkpointer, install an in-memory `MemorySaver`
+   * so `interrupt()` can persist checkpoints and `Command({ resume })`
+   * can rebuild state. The fallback is intentionally process-local:
+   * production hosts that need durable resumption across processes /
+   * restarts must provide their own checkpointer (Redis, Postgres, etc.)
+   * on `compileOptions.checkpointer`.
+   *
+   * No-op when HITL is off (the default — omitted, or
+   * `{ enabled: false }`) or the host already supplied a checkpointer
+   * of their own. See `HumanInTheLoopConfig` JSDoc for the rationale
+   * behind the default-off stance.
+   */
+  private applyHITLCheckpointerFallback(
+    compileOptions: t.CompileOptions | undefined
+  ): t.CompileOptions | undefined {
+    if (this.humanInTheLoop?.enabled !== true) {
+      return compileOptions;
+    }
+    if (compileOptions?.checkpointer != null) {
+      return compileOptions;
+    }
+    return {
+      ...(compileOptions ?? {}),
+      checkpointer: new MemorySaver(),
+    };
+  }
+
+  /**
+   * Run RunStart + UserPromptSubmit hooks before the graph stream
+   * begins, accumulate any `additionalContext` strings into the input
+   * messages, and short-circuit when a hook signals the run should not
+   * proceed (deny / ask decision on the prompt, or `preventContinuation`
+   * on either hook).
+   *
+   * Returns `true` when the caller should bail with `undefined` (run
+   * was halted before any model call); returns `false` to proceed
+   * into the stream loop.
+   *
+   * ## Side effects
+   *
+   * On the success path:
+   *   - Mutates `stateInputs.messages` in place to append a
+   *     consolidated `HumanMessage` carrying any hook
+   *     `additionalContext` strings. Safe because the host owns the
+   *     array and `processStream` is the only consumer until LangGraph
+   *     reads it.
+   *
+   * On the halt path (returning `true`):
+   *   - Sets `this._haltedReason` so callers (and the eventual host)
+   *     can distinguish a hook-driven halt from a natural completion.
+   *   - Calls `registry.clearSession(this.id)` and
+   *     `registry.clearHaltSignal(this.id)` because no resume is
+   *     expected from a pre-stream halt — the run never entered the
+   *     graph, so the session/halt state for this run would otherwise
+   *     leak to the next `processStream` invocation on the same
+   *     registry. Other concurrent runs on the same registry are
+   *     untouched (halt signals are scoped per session id).
+   *   - Sets `config.callbacks = undefined` to drop the callback
+   *     references the caller built (langfuse handler, custom event
+   *     handler, etc.) since they won't be exercised. Mirrors the
+   *     equivalent cleanup the `processStream` `finally` block does
+   *     on the natural-completion path.
+   */
+  private async runPreStreamHooks(
+    stateInputs: t.IState,
+    threadId: string | undefined,
+    config: Partial<RunnableConfig>
+  ): Promise<boolean> {
+    const registry = this.hookRegistry;
+    /**
+     * Defensive guard: `processStream` already validated `this.Graph`
+     * before calling this helper, but TypeScript can't propagate that
+     * narrowing across method boundaries. The check keeps the body
+     * free of `this.Graph!` non-null assertions.
+     */
+    if (registry == null || this.Graph == null) {
+      return false;
+    }
+
+    const preStreamContexts: string[] = [];
+
+    const runStartResult = await executeHooks({
+      registry,
+      input: {
+        hook_event_name: 'RunStart',
+        runId: this.id,
+        threadId,
+        agentId: this.Graph.defaultAgentId,
+        messages: stateInputs.messages,
+      },
+      sessionId: this.id,
+    });
+    for (const ctx of runStartResult.additionalContexts) {
+      preStreamContexts.push(ctx);
+    }
+    /**
+     * Honor `preventContinuation` from RunStart before the stream
+     * starts. Mid-flight halts (from tool/compact/subagent hooks)
+     * route through `HookRegistry.haltRun` and are polled by the
+     * stream loop in `processStream` — different mechanism, same
+     * intent.
+     */
+    if (runStartResult.preventContinuation === true) {
+      this._haltedReason = runStartResult.stopReason ?? 'preventContinuation';
+      registry.clearSession(this.id);
+      registry.clearHaltSignal(this.id);
+      config.callbacks = undefined;
+      return true;
+    }
+
+    const lastHuman = findLastMessageOfType(stateInputs.messages, 'human');
+    if (lastHuman != null) {
+      const promptResult = await executeHooks({
+        registry,
+        input: {
+          hook_event_name: 'UserPromptSubmit',
+          runId: this.id,
+          threadId,
+          agentId: this.Graph.defaultAgentId,
+          prompt: extractPromptText(lastHuman),
+          // attachments: not yet wired — Phase 2 will extract
+          // non-text content blocks (images, files) from messages
+        },
+        sessionId: this.id,
+      });
+      if (
+        promptResult.decision === 'deny' ||
+        promptResult.decision === 'ask' ||
+        promptResult.preventContinuation === true
+      ) {
+        /**
+         * Always set `_haltedReason` so the host can call
+         * `getHaltReason()` and distinguish a hook-blocked prompt
+         * from a natural empty-output completion. Three signals can
+         * land here, each with its own canonical reason string when
+         * the hook didn't supply one.
+         */
+        if (promptResult.preventContinuation === true) {
+          this._haltedReason = promptResult.stopReason ?? 'preventContinuation';
+        } else if (promptResult.decision === 'deny') {
+          this._haltedReason = promptResult.reason ?? 'prompt_denied';
+        } else {
+          this._haltedReason =
+            promptResult.reason ?? 'prompt_requires_approval';
+        }
+        registry.clearSession(this.id);
+        registry.clearHaltSignal(this.id);
+        config.callbacks = undefined;
+        return true;
+      }
+      for (const ctx of promptResult.additionalContexts) {
+        preStreamContexts.push(ctx);
+      }
+    }
+
+    if (preStreamContexts.length > 0) {
+      /**
+       * Wraps the joined hook contexts as a `HumanMessage` even though
+       * the intent is system-level guidance. Using a `SystemMessage`
+       * mid-conversation is rejected by Anthropic and Google providers
+       * (system messages must be the leading entry), so the LangChain
+       * convention — also used by `ToolNode.convertInjectedMessages`
+       * — is `HumanMessage` carrying `additional_kwargs.role` as a
+       * marker for hosts inspecting state. The model still sees a
+       * user-role message; the `role: 'system'` field is metadata
+       * only. Hosts that want a true system message should compose
+       * it into the agent's `instructions` config instead.
+       */
+      stateInputs.messages.push(
+        new HumanMessage({
+          content: preStreamContexts.join('\n\n'),
+          additional_kwargs: { role: 'system', source: 'hook' },
+        })
+      );
+    }
+
+    return false;
   }
 
   static async create<T extends t.BaseGraphState>(
@@ -268,7 +470,7 @@ export class Run<_T extends t.BaseGraphState> {
   }
 
   async processStream(
-    inputs: t.IState,
+    inputs: t.IState | Command,
     callerConfig: Partial<RunnableConfig> & {
       version: 'v1' | 'v2';
       run_id?: string;
@@ -286,6 +488,16 @@ export class Run<_T extends t.BaseGraphState> {
       );
     }
 
+    /**
+     * `Command` inputs (currently only `Command({ resume })`) are
+     * resume-mode invocations: LangGraph rebuilds graph state from the
+     * checkpointer, so we skip RunStart / UserPromptSubmit hooks (no
+     * new prompt to evaluate) and read run-state from the Graph wrapper
+     * instead of `inputs.messages`.
+     */
+    const isResume = inputs instanceof Command;
+    const stateInputs = isResume ? undefined : (inputs as t.IState);
+
     const config: Partial<RunnableConfig> & {
       version: 'v1' | 'v2';
       run_id?: string;
@@ -295,7 +507,23 @@ export class Run<_T extends t.BaseGraphState> {
       configurable: { ...callerConfig.configurable },
     };
 
-    this.Graph.resetValues(streamOptions?.keepContent);
+    /**
+     * Skip `resetValues` on resume — we're continuing an in-flight
+     * run, not starting a fresh one. Resetting would wipe the
+     * sidecars (`toolCallStepIds`, `stepKeyIds`, accumulated
+     * `messages`, etc.) the resumed `ToolNode` needs to dispatch
+     * tool completions with the correct step ids and re-resolve
+     * `{{tool<i>turn<n>}}` references. Pairs with the
+     * `awaitingResume` gate on `clearHeavyState` in the `finally`
+     * block so the sidecars survive both ends of the interrupt
+     * boundary.
+     */
+    if (!isResume) {
+      this.Graph.resetValues(streamOptions?.keepContent);
+    }
+    this._interrupt = undefined;
+    this._haltedReason = undefined;
+    this.hookRegistry?.clearHaltSignal(this.id);
 
     /** Custom event callback to intercept and handle custom events */
     const customEventCallback = this.createCustomEventCallback();
@@ -350,46 +578,24 @@ export class Run<_T extends t.BaseGraphState> {
 
     const threadId = config.configurable.thread_id as string | undefined;
 
-    if (this.hookRegistry != null) {
-      await executeHooks({
-        registry: this.hookRegistry,
-        input: {
-          hook_event_name: 'RunStart',
-          runId: this.id,
-          threadId,
-          agentId: this.Graph.defaultAgentId,
-          messages: inputs.messages,
-        },
-        sessionId: this.id,
-      });
-
-      const lastHuman = findLastMessageOfType(inputs.messages, 'human');
-      if (lastHuman != null) {
-        const promptResult = await executeHooks({
-          registry: this.hookRegistry,
-          input: {
-            hook_event_name: 'UserPromptSubmit',
-            runId: this.id,
-            threadId,
-            agentId: this.Graph.defaultAgentId,
-            prompt: extractPromptText(lastHuman),
-            // attachments: not yet wired — Phase 2 will extract
-            // non-text content blocks (images, files) from messages
-          },
-          sessionId: this.id,
-        });
-        if (
-          promptResult.decision === 'deny' ||
-          promptResult.decision === 'ask'
-        ) {
-          this.hookRegistry.clearSession(this.id);
-          config.callbacks = undefined;
-          return undefined;
-        }
+    if (this.hookRegistry != null && stateInputs != null) {
+      const shouldHalt = await this.runPreStreamHooks(
+        stateInputs,
+        threadId,
+        config
+      );
+      if (shouldHalt) {
+        return undefined;
       }
     }
 
-    const stream = this.graphRunnable.streamEvents(inputs, config, {
+    /**
+     * `streamEvents` accepts both state inputs and `Command` (resume) at
+     * runtime, but our `CompiledStateWorkflow` type narrows the first
+     * arg to `BaseGraphState`. Cast on the call so the resume path
+     * type-checks without widening the wrapper for every caller.
+     */
+    const stream = this.graphRunnable.streamEvents(inputs as t.IState, config, {
       raiseError: true,
       /**
        * Prevent EventStreamCallbackHandler from processing custom events.
@@ -402,6 +608,17 @@ export class Run<_T extends t.BaseGraphState> {
       ignoreCustomEvent: true,
     });
 
+    /**
+     * Tracks whether the stream loop threw. Used by the `finally`
+     * block to decide whether to honor the interrupt-preservation
+     * guard for session hooks: a captured `_interrupt` is only
+     * meaningful if the stream completed cleanly. If the loop errored
+     * after stashing an interrupt (e.g. a downstream handler throws
+     * after the interrupt event landed), the interrupt is stale —
+     * preserving session hooks would leak them into the next run.
+     */
+    let streamThrew = false;
+
     try {
       for await (const event of stream) {
         const { data, metadata, ...info } = event;
@@ -413,13 +630,81 @@ export class Run<_T extends t.BaseGraphState> {
           continue;
         }
 
+        /**
+         * Detect interrupts surfaced by LangGraph as a synthetic
+         * `__interrupt__` field on the streamed chunk and stash the
+         * first one for the host to read via `run.getInterrupt()`
+         * once the stream drains. Captured as `unknown` because the
+         * SDK does not validate the runtime payload shape — the
+         * built-in ToolNode raises a `HumanInterruptPayload`
+         * (`tool_approval` / `ask_user_question`), but custom nodes
+         * can pass any payload to `interrupt()`. Callers narrow with
+         * the `isToolApprovalInterrupt` / `isAskUserQuestionInterrupt`
+         * guards or assert via `getInterrupt<T>()`.
+         */
+        if (
+          this._interrupt == null &&
+          data.chunk != null &&
+          isInterrupted<unknown>(data.chunk)
+        ) {
+          const interrupts = data.chunk[INTERRUPT];
+          if (interrupts.length > 0) {
+            const first = interrupts[0];
+            /**
+             * Capture the interrupt unconditionally — `interrupt(null)`
+             * and `interrupt(undefined)` are valid pauses (a custom
+             * node may want to pause without metadata) and the host
+             * still needs to know the run is awaiting resume. Gating
+             * on `payload != null` would silently downgrade a paused
+             * run to "completed" and let the `Stop` hook fire,
+             * breaking host resume handling.
+             */
+            this._interrupt = {
+              interruptId: first.id ?? '',
+              threadId,
+              payload: first.value,
+            };
+          }
+        }
+
         const handler = this.handlerRegistry?.getHandler(eventName);
         if (handler) {
           await handler.handle(eventName, data, metadata, this.Graph);
         }
+
+        /**
+         * Mid-flight halt: any hook (PreToolUse, PostToolUse,
+         * PostToolBatch, SubagentStart/Stop, PreCompact, PostCompact)
+         * that returned `preventContinuation: true` raises a halt
+         * signal on the registry via `executeHooks`. We poll between
+         * stream events and break out as soon as one is set so the
+         * graph doesn't take another model turn after the halting
+         * operation completes.
+         *
+         * Limitation: the current step (in-flight model call, ongoing
+         * tool batch) is not aborted — only the next step is skipped.
+         * This matches Claude Code's `continue: false` semantic where
+         * the active operation finishes before halting takes effect.
+         */
+        const haltSignal = this.hookRegistry?.getHaltSignal(this.id);
+        if (haltSignal != null) {
+          this._haltedReason = haltSignal.reason;
+          break;
+        }
       }
 
-      if (this.hookRegistry?.hasHookFor('Stop', this.id) === true) {
+      /**
+       * Skip the Stop hook when the run paused on a HITL interrupt
+       * (still pending human input) or was halted by a hook (the host
+       * already chose to stop, so a Stop hook firing now would be
+       * misleading). The host fires Stop on the resumed-and-completed
+       * run instead.
+       */
+      if (
+        this._interrupt == null &&
+        this._haltedReason == null &&
+        this.hookRegistry?.hasHookFor('Stop', this.id) === true
+      ) {
         await executeHooks({
           registry: this.hookRegistry,
           input: {
@@ -427,7 +712,8 @@ export class Run<_T extends t.BaseGraphState> {
             runId: this.id,
             threadId,
             agentId: this.Graph.defaultAgentId,
-            messages: this.Graph.getRunMessages() ?? inputs.messages,
+            messages:
+              this.Graph.getRunMessages() ?? stateInputs?.messages ?? [],
             stopHookActive: false, // will be true when stop is triggered by a hook (Phase 2)
           },
           sessionId: this.id,
@@ -436,6 +722,7 @@ export class Run<_T extends t.BaseGraphState> {
         });
       }
     } catch (err) {
+      streamThrew = true;
       if (this.hookRegistry?.hasHookFor('StopFailure', this.id) === true) {
         const runMessages = this.Graph.getRunMessages() ?? [];
         await executeHooks({
@@ -455,7 +742,36 @@ export class Run<_T extends t.BaseGraphState> {
       }
       throw err;
     } finally {
-      this.hookRegistry?.clearSession(this.id);
+      /**
+       * Preserve session-scoped hooks when the run paused on a HITL
+       * interrupt — the very next call will be `Run.resume()`, which
+       * needs the same policy hooks (e.g., the `PreToolUse` matcher
+       * that triggered the interrupt) to fire on the re-executed node
+       * and uphold the approval flow. Clearing here would leak the
+       * approval gate on resume. The session is cleared instead at
+       * natural completion, error (including errors that happen AFTER
+       * an interrupt was captured — those interrupts are stale), or
+       * hook-driven halt (including hooks that returned BOTH `ask`
+       * and `preventContinuation` — the halt wins, no resume is
+       * expected, sessions must drop). Every state where no resume
+       * is expected clears.
+       */
+      if (
+        this._interrupt == null ||
+        this._haltedReason != null ||
+        streamThrew
+      ) {
+        this.hookRegistry?.clearSession(this.id);
+      }
+      /**
+       * Drop any halt signal raised mid-stream for this run so a
+       * subsequent `processStream` / `resume` starts with clean state.
+       * The Run captured `_haltedReason` already; the registry entry
+       * for this `sessionId` would otherwise spuriously trip the next
+       * loop. Other concurrent runs sharing this registry are
+       * unaffected — their entries live under their own session ids.
+       */
+      this.hookRegistry?.clearHaltSignal(this.id);
 
       /**
        * Break the reference chain that keeps heavy data alive via
@@ -494,7 +810,28 @@ export class Run<_T extends t.BaseGraphState> {
 
       this.calibrationRatio = this.Graph.getCalibrationRatio();
 
-      if (!this.skipCleanup) {
+      /**
+       * Skip `clearHeavyState()` when the run paused on a clean HITL
+       * interrupt awaiting resume — `Run.resume()` re-enters the same
+       * `ToolNode` instance and needs the sidecars `clearHeavyState`
+       * would wipe (`toolCallStepIds` for completion-event step ids,
+       * the `_toolOutputRegistry` for `{{tool<i>turn<n>}}`
+       * substitutions, `sessions` for code-env continuity, plus the
+       * `hookRegistry` and `humanInTheLoop` config the interrupt
+       * branch itself relies on). Without preservation, the resumed
+       * tool completion would dispatch `ON_RUN_STEP_COMPLETED` with
+       * an empty step id and downstream stream consumers would drop
+       * the result.
+       *
+       * The natural-completion / error / hook-driven-halt paths still
+       * clean up — `_haltedReason != null` or `streamThrew` mean no
+       * resume is expected. Cross-process resume (host rebuilds the
+       * Run from scratch) is a separate concern; see
+       * `HumanInTheLoopConfig` JSDoc.
+       */
+      const awaitingResume =
+        this._interrupt != null && this._haltedReason == null && !streamThrew;
+      if (!this.skipCleanup && !awaitingResume) {
         this.Graph.clearHeavyState();
       }
 
@@ -502,6 +839,78 @@ export class Run<_T extends t.BaseGraphState> {
     }
 
     return this._streamResult;
+  }
+
+  /**
+   * Returns the pending interrupt captured during the most recent
+   * `processStream` (or `resume`) invocation. `undefined` when the run
+   * either has not been streamed yet or completed without pausing.
+   *
+   * Hosts call this immediately after `processStream` returns to decide
+   * whether the run is awaiting human input. Persist the returned
+   * descriptor (alongside `thread_id` and the agent run config) so a
+   * later `resume(decisions)` can rebuild the run.
+   *
+   * The default `TPayload` is the SDK's `HumanInterruptPayload` union
+   * (`tool_approval` / `ask_user_question`), suitable for the common
+   * case where interrupts come from the built-in ToolNode or
+   * `askUserQuestion()` helper. Hosts that raise custom interrupts
+   * from custom graph nodes pass their own type — the SDK does not
+   * validate the runtime shape, it just transports whatever the
+   * `interrupt()` call carried. When in doubt, narrow with the
+   * `isToolApprovalInterrupt` / `isAskUserQuestionInterrupt` type
+   * guards (which accept `unknown`) before reading variant-specific
+   * fields.
+   */
+  getInterrupt<TPayload = t.HumanInterruptPayload>():
+    | t.RunInterruptResult<TPayload>
+    | undefined {
+    return this._interrupt as t.RunInterruptResult<TPayload> | undefined;
+  }
+
+  /**
+   * Returns the reason a hook halted the run via
+   * `preventContinuation: true`, or `undefined` if no hook halted.
+   *
+   * Hosts inspect this after `processStream` returns to distinguish a
+   * natural completion (`undefined`) from a hook-driven halt (a
+   * truthy string). Independent from `getInterrupt()` — a halted run
+   * has no interrupt; an interrupted run has no halt reason.
+   */
+  getHaltReason(): string | undefined {
+    return this._haltedReason;
+  }
+
+  /**
+   * Resume a paused HITL run with the value the user (or whatever
+   * decided the interrupt) supplied. The default `TResume` covers the
+   * `tool_approval` interrupt (the common case): an array of decisions
+   * in `action_requests` order, or a record keyed by `tool_call_id`.
+   *
+   * For other interrupt types (e.g., `ask_user_question` →
+   * `AskUserQuestionResolution`, or any custom interrupt a host raises
+   * from a custom node), pass the type parameter and the SDK forwards
+   * the value through unchanged. LangGraph delivers it as the return
+   * value of the original `interrupt()` call inside the paused node.
+   *
+   * The host MUST construct this Run with the same `thread_id` and the
+   * same checkpointer as the original paused run; LangGraph rebuilds
+   * graph state from the checkpoint and re-enters the interrupted node
+   * from the start.
+   */
+  async resume<TResume = t.ToolApprovalDecision[] | t.ToolApprovalDecisionMap>(
+    resumeValue: TResume,
+    callerConfig: Partial<RunnableConfig> & {
+      version: 'v1' | 'v2';
+      run_id?: string;
+    },
+    streamOptions?: t.EventStreamOptions
+  ): Promise<MessageContentComplex[] | undefined> {
+    return this.processStream(
+      new Command({ resume: resumeValue }),
+      callerConfig,
+      streamOptions
+    );
   }
 
   private createSystemCallback<K extends keyof t.ClientCallbacks>(

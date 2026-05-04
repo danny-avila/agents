@@ -10,9 +10,11 @@ import {
   Send,
   Command,
   isCommand,
+  interrupt,
   isGraphInterrupt,
   MessagesAnnotation,
 } from '@langchain/langgraph';
+import { AsyncLocalStorageProviderSingleton } from '@langchain/core/singletons';
 import type {
   RunnableConfig,
   RunnableToolLike,
@@ -24,7 +26,11 @@ import type {
   PreResolvedArgsMap,
   ResolvedArgsByCallId,
 } from '@/tools/toolOutputReferences';
-import type { HookRegistry, AggregatedHookResult } from '@/hooks';
+import type {
+  HookRegistry,
+  AggregatedHookResult,
+  PostToolBatchEntry,
+} from '@/hooks';
 import type * as t from '@/types';
 import { RunnableCallable } from '@/utils';
 import {
@@ -88,6 +94,117 @@ type DispatchBatchContext = {
  */
 function isSend(value: unknown): value is Send {
   return value instanceof Send;
+}
+
+/**
+ * Format a fail-closed diagnostic for malformed approval-decision
+ * fields. Hosts deserialize resume payloads from untyped JSON, so
+ * `responseText` and `updatedInput` can land here as anything; the
+ * blocking ToolMessage carries this string so the host can debug the
+ * exact wire shape that was rejected.
+ */
+function describeOfferedShape(value: unknown): string {
+  if (value === undefined) {
+    return '<missing>';
+  }
+  if (value === null) {
+    return 'null';
+  }
+  if (Array.isArray(value)) {
+    return 'array';
+  }
+  return typeof value;
+}
+
+/**
+ * Per-entry record collected during PreToolUse hook handling for tool
+ * calls that need human approval. Carries everything
+ * `buildToolApprovalInterruptPayload` needs to assemble the interrupt
+ * payload, plus the per-tool decision allowlist if the hook supplied
+ * one. Defined at module scope so the payload-builder helper can be
+ * extracted out of `dispatchToolEvents` without leaking the locally-
+ * inferred shape.
+ */
+type AskEntry = {
+  entry: {
+    call: ToolCall;
+    args: Record<string, unknown>;
+    stepId: string;
+  };
+  reason?: string;
+  allowedDecisions?: ReadonlyArray<'approve' | 'reject' | 'edit' | 'respond'>;
+};
+
+/**
+ * Build the `tool_approval` interrupt payload from the set of pending
+ * `ask`-decision entries collected during PreToolUse hook handling.
+ * Pure function — doesn't touch ToolNode state — so it lives at module
+ * scope. The interrupt itself is raised by the caller (which still
+ * needs `interrupt()` plus the AsyncLocalStorage anchoring shim).
+ */
+function buildToolApprovalInterruptPayload(
+  askEntries: ReadonlyArray<AskEntry>
+): t.ToolApprovalInterruptPayload {
+  return {
+    type: 'tool_approval',
+    action_requests: askEntries.map(({ entry, reason }) => {
+      const request: t.ToolApprovalRequest = {
+        tool_call_id: entry.call.id!,
+        name: entry.call.name,
+        arguments: entry.args,
+      };
+      if (reason != null) {
+        request.description = reason;
+      }
+      return request;
+    }),
+    review_configs: askEntries.map(({ entry, allowedDecisions }) => ({
+      action_name: entry.call.name,
+      tool_call_id: entry.call.id!,
+      allowed_decisions: (allowedDecisions ?? [
+        'approve',
+        'reject',
+        'edit',
+        'respond',
+      ]) as t.ToolApprovalDecisionType[],
+    })),
+  };
+}
+
+/**
+ * Build a `tool_call_id → ToolApprovalDecision` map from the host's
+ * resume value. Hosts may return decisions either as an array (one per
+ * action_request, in order) or as a record keyed by `tool_call_id`. Any
+ * unrecognized shape (or a decision missing for a given call id) is
+ * treated as "no decision" by callers — typically rejected so the run
+ * doesn't silently invoke a tool the human never approved.
+ */
+function normalizeApprovalDecisions(
+  callIds: string[],
+  resumeValue: t.ToolApprovalDecision[] | t.ToolApprovalDecisionMap | undefined
+): Map<string, t.ToolApprovalDecision> {
+  const map = new Map<string, t.ToolApprovalDecision>();
+  if (resumeValue == null) {
+    return map;
+  }
+  if (Array.isArray(resumeValue)) {
+    const limit = Math.min(callIds.length, resumeValue.length);
+    for (let i = 0; i < limit; i++) {
+      map.set(callIds[i], resumeValue[i]);
+    }
+    return map;
+  }
+  if (typeof resumeValue === 'object') {
+    for (const callId of callIds) {
+      const decision = (resumeValue as Partial<t.ToolApprovalDecisionMap>)[
+        callId
+      ];
+      if (decision !== undefined) {
+        map.set(callId, decision);
+      }
+    }
+  }
+  return map;
 }
 
 /**
@@ -172,6 +289,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   /** Hook registry for PreToolUse/PostToolUse lifecycle hooks */
   private hookRegistry?: HookRegistry;
   /**
+   * Run-scoped HITL config. When `enabled`, `ask` decisions from
+   * PreToolUse hooks raise a LangGraph `interrupt()` instead of being
+   * treated as fail-closed denies.
+   */
+  private humanInTheLoop?: t.HumanInTheLoopConfig;
+  /**
    * Registry of tool outputs keyed by `tool<idx>turn<turn>`.
    *
    * Populated only when `toolOutputReferences.enabled` is true. The
@@ -209,6 +332,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     maxContextTokens,
     maxToolResultChars,
     hookRegistry,
+    humanInTheLoop,
     toolOutputReferences,
     toolOutputRegistry,
   }: t.ToolNodeConstructorParams) {
@@ -227,6 +351,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     this.maxToolResultChars =
       maxToolResultChars ?? calculateMaxToolResultChars(maxContextTokens);
     this.hookRegistry = hookRegistry;
+    this.humanInTheLoop = humanInTheLoop;
     /**
      * Precedence: an explicitly passed `toolOutputRegistry` instance
      * wins over a config object so a host (`Graph`) can share one
@@ -881,16 +1006,43 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
     const messageByCallId = new Map<string, ToolMessage>();
     const approvedEntries: typeof preToolCalls = [];
+    /**
+     * Batch-level accumulator for `additionalContext` strings returned
+     * by any PreToolUse / PostToolUse / PostToolUseFailure hook in this
+     * dispatch. We emit one consolidated `HumanMessage` after all tool
+     * results land so the next model turn sees the injected context
+     * exactly once, ordered after the ToolMessages.
+     */
+    const batchAdditionalContexts: string[] = [];
+    /**
+     * Batch-level outcome record keyed by `tool_call_id`. Captures
+     * every tool call's final result (success / error from the host,
+     * blocked from HITL deny / reject, substituted from HITL respond)
+     * across the three call sites that touch it. We materialize the
+     * `PostToolBatch` entry array in `toolCalls` order at dispatch
+     * time so hooks correlating outcomes by position see exactly the
+     * same sequence the model emitted — independent of when each
+     * outcome was recorded (deny entries land synchronously in the
+     * hook loop, approved entries land after host execution, respond
+     * entries land in the resume branch).
+     */
+    const postToolBatchEntryByCallId = new Map<string, PostToolBatchEntry>();
     const HOOK_FALLBACK: AggregatedHookResult = Object.freeze({
       additionalContexts: [] as string[],
       errors: [] as string[],
     });
 
     if (this.hookRegistry?.hasHookFor('PreToolUse', runId) === true) {
+      /**
+       * Capture as a non-null local so the inner `blockEntry` closure
+       * doesn't lose narrowing on `this.hookRegistry` and we don't have
+       * to defensively `?.` it across every reference inside.
+       */
+      const hookRegistry = this.hookRegistry;
       const preResults = await Promise.all(
         preToolCalls.map((entry) =>
           executeHooks({
-            registry: this.hookRegistry!,
+            registry: hookRegistry,
             input: {
               hook_event_name: 'PreToolUse',
               runId,
@@ -908,89 +1060,441 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         )
       );
 
-      for (let i = 0; i < preToolCalls.length; i++) {
-        const hookResult = preResults[i];
-        const entry = preToolCalls[i];
-        const isDenied =
-          hookResult.decision === 'deny' || hookResult.decision === 'ask';
-        if (isDenied) {
-          const reason = hookResult.reason ?? 'Blocked by hook';
-          const contentString = `Blocked: ${reason}`;
-          messageByCallId.set(
-            entry.call.id!,
-            new ToolMessage({
-              status: 'error',
-              content: contentString,
-              name: entry.call.name,
-              tool_call_id: entry.call.id!,
-            })
-          );
+      type PendingEntry = (typeof preToolCalls)[number];
+
+      /**
+       * Side effects deferred from `blockEntry` until after any pending
+       * `interrupt()` resolves. Without deferral, a batch that mixes a
+       * `deny` decision with an `ask` decision would dispatch
+       * `ON_RUN_STEP_COMPLETED` for the denied tool on the FIRST node
+       * execution (before `interrupt()` throws), then dispatch the
+       * same event AGAIN on the resume re-execution — hosts would
+       * observe two completion events for one logical denial. By
+       * queueing the dispatch + PermissionDenied hook here and
+       * flushing after the interrupt block, we ensure each side effect
+       * fires exactly once: never on the first pass when interrupt
+       * throws (the flush is unreachable), once on resume / no-ask
+       * passes when control reaches the flush.
+       */
+      const deferredBlockedSideEffects: Array<{
+        callId: string;
+        toolName: string;
+        args: Record<string, unknown>;
+        contentString: string;
+        reason: string;
+      }> = [];
+
+      const blockEntry = (entry: PendingEntry, reason: string): void => {
+        const contentString = `Blocked: ${reason}`;
+        messageByCallId.set(
+          entry.call.id!,
+          new ToolMessage({
+            status: 'error',
+            content: contentString,
+            name: entry.call.name,
+            tool_call_id: entry.call.id!,
+          })
+        );
+        postToolBatchEntryByCallId.set(entry.call.id!, {
+          toolName: entry.call.name,
+          toolInput: entry.args,
+          toolUseId: entry.call.id!,
+          stepId: entry.stepId,
+          /**
+           * Records the pre-invocation turn count — the same value the
+           * executed path captures before incrementing `toolUsageCount`.
+           * For a blocked tool the counter is never incremented (no
+           * invocation happened), so this is always the count of prior
+           * successful invocations of this tool name in earlier batches.
+           * Surfaces in the `PostToolBatch` entry so batch hooks see
+           * a uniform shape regardless of outcome.
+           */
+          turn: this.toolUsageCount.get(entry.call.name) ?? 0,
+          status: 'error',
+          error: contentString,
+        });
+        deferredBlockedSideEffects.push({
+          callId: entry.call.id!,
+          toolName: entry.call.name,
+          args: entry.args,
+          contentString,
+          reason,
+        });
+      };
+
+      const flushDeferredBlockedSideEffects = (): void => {
+        for (const item of deferredBlockedSideEffects) {
           this.dispatchStepCompleted(
-            entry.call.id!,
-            entry.call.name,
-            entry.args,
-            contentString,
+            item.callId,
+            item.toolName,
+            item.args,
+            item.contentString,
             config
           );
-          if (this.hookRegistry.hasHookFor('PermissionDenied', runId)) {
+          if (hookRegistry.hasHookFor('PermissionDenied', runId)) {
             executeHooks({
-              registry: this.hookRegistry,
+              registry: hookRegistry,
               input: {
                 hook_event_name: 'PermissionDenied',
                 runId,
                 threadId,
                 agentId: this.agentId,
-                toolName: entry.call.name,
-                toolInput: entry.args,
-                toolUseId: entry.call.id!,
-                reason,
+                toolName: item.toolName,
+                toolInput: item.args,
+                toolUseId: item.callId,
+                reason: item.reason,
               },
               sessionId: runId,
-              matchQuery: entry.call.name,
+              matchQuery: item.toolName,
             }).catch(() => {
               /* PermissionDenied is observational — swallow errors */
             });
           }
+        }
+        deferredBlockedSideEffects.length = 0;
+      };
+
+      /**
+       * Apply a hook-supplied or host-supplied input override to a pending
+       * entry, re-running the `{{tool<i>turn<n>}}` resolver so any new
+       * placeholders introduced by the override are substituted (and any
+       * formerly-unresolved refs cleared from the unresolved set).
+       *
+       * Mixed direct+event batches must use the pre-batch snapshot so a
+       * hook-introduced placeholder cannot accidentally resolve to a
+       * same-turn direct output that has just registered. Pure event
+       * batches don't have a snapshot and resolve against the live
+       * registry — safe because no event-side registrations have happened
+       * yet.
+       */
+      const applyInputOverride = (
+        entry: PendingEntry,
+        nextArgs: Record<string, unknown>
+      ): void => {
+        if (registry != null) {
+          const view: ToolOutputResolveView = preBatchSnapshot ?? {
+            resolve: <T>(args: T) => registry.resolve(registryRunId, args),
+          };
+          const { resolved, unresolved } = view.resolve(nextArgs);
+          entry.args = resolved as Record<string, unknown>;
+          if (entry.call.id != null) {
+            if (unresolved.length > 0) {
+              unresolvedByCallId.set(entry.call.id, unresolved);
+            } else {
+              unresolvedByCallId.delete(entry.call.id);
+            }
+          }
+          return;
+        }
+        entry.args = nextArgs;
+      };
+
+      const askEntries: Array<{
+        entry: PendingEntry;
+        reason?: string;
+        allowedDecisions?: ReadonlyArray<
+          'approve' | 'reject' | 'edit' | 'respond'
+        >;
+      }> = [];
+
+      for (let i = 0; i < preToolCalls.length; i++) {
+        const hookResult = preResults[i];
+        const entry = preToolCalls[i];
+
+        for (const ctx of hookResult.additionalContexts) {
+          batchAdditionalContexts.push(ctx);
+        }
+
+        if (hookResult.decision === 'deny') {
+          blockEntry(entry, hookResult.reason ?? 'Blocked by hook');
           continue;
         }
-        if (hookResult.updatedInput != null) {
+
+        if (hookResult.decision === 'ask') {
           /**
-           * Re-resolve after PreToolUse replaces the input: a hook may
-           * introduce new `{{tool<i>turn<n>}}` placeholders (e.g., by
-           * copying user-supplied text) that the pre-hook pass never
-           * saw. Re-running the resolver on the hook-rewritten args
-           * keeps substitution and the unresolved-refs record in sync
-           * with what the tool will actually receive.
+           * HITL is OFF by default — hosts must explicitly opt in via
+           * `humanInTheLoop: { enabled: true }` to engage the
+           * `interrupt()` path. When opted out (or omitted), `ask`
+           * collapses into the pre-HITL fail-closed path: a blocked
+           * tool with an error `ToolMessage`. The default stays
+           * conservative until host UIs are ready to render
+           * `tool_approval` interrupts; see `HumanInTheLoopConfig`
+           * JSDoc for the full rationale and the migration plan.
            */
-          if (registry != null) {
-            /**
-             * Mixed direct+event batches must use the pre-batch
-             * snapshot so a hook-introduced placeholder cannot
-             * accidentally resolve to a same-turn direct output that
-             * has just registered. Pure event batches don't have a
-             * snapshot and resolve against the live registry — safe
-             * because no event-side registrations have happened yet.
-             */
-            const view: ToolOutputResolveView = preBatchSnapshot ?? {
-              resolve: <T>(args: T) => registry.resolve(registryRunId, args),
-            };
-            const { resolved, unresolved } = view.resolve(
-              hookResult.updatedInput
-            );
-            entry.args = resolved as Record<string, unknown>;
-            if (entry.call.id != null) {
-              if (unresolved.length > 0) {
-                unresolvedByCallId.set(entry.call.id, unresolved);
-              } else {
-                unresolvedByCallId.delete(entry.call.id);
-              }
-            }
-          } else {
-            entry.args = hookResult.updatedInput;
+          if (this.humanInTheLoop?.enabled !== true) {
+            blockEntry(entry, hookResult.reason ?? 'Blocked by hook');
+            continue;
           }
+          /**
+           * Apply `updatedInput` BEFORE queuing into `askEntries` —
+           * a hook is allowed to return both a sanitization rewrite
+           * and an `ask` decision (e.g. one matcher redacts secrets,
+           * another matcher requires approval). Without this, the
+           * interrupt payload would surface the original args to the
+           * reviewer AND the post-approve execution would run with
+           * the original args, silently dropping the hook's rewrite.
+           */
+          if (hookResult.updatedInput != null) {
+            applyInputOverride(entry, hookResult.updatedInput);
+          }
+          askEntries.push({
+            entry,
+            reason: hookResult.reason,
+            allowedDecisions: hookResult.allowedDecisions,
+          });
+          continue;
+        }
+
+        if (hookResult.updatedInput != null) {
+          applyInputOverride(entry, hookResult.updatedInput);
         }
         approvedEntries.push(entry);
       }
+
+      /**
+       * If any entries asked for approval, raise a single LangGraph
+       * `interrupt()` carrying every pending request together. The host
+       * pauses, gathers human input, and resumes the run with one
+       * decision per request. On resume LangGraph re-executes this node
+       * from the start; `interrupt()` then returns the resume value
+       * instead of throwing, so the loop above re-runs and the same
+       * `askEntries` list is rebuilt deterministically (assuming hooks
+       * are pure — see `humanInTheLoop` docs).
+       */
+      if (askEntries.length > 0) {
+        const payload = buildToolApprovalInterruptPayload(askEntries);
+
+        /**
+         * `interrupt()` reads the current `RunnableConfig` from
+         * AsyncLocalStorage, but our `RunnableCallable` sets
+         * `trace = false` for ToolNode (intentional — avoids LangSmith
+         * tracing per tool call). Without the trace path, the upstream
+         * `runWithConfig` frame is never established, so we re-anchor
+         * here using the node's own `config` — Pregel hands us a
+         * config that already carries every checkpoint/scratchpad key
+         * `interrupt()` needs to suspend and resume.
+         */
+        const resumeValue = AsyncLocalStorageProviderSingleton.runWithConfig(
+          config,
+          () =>
+            interrupt<
+              t.ToolApprovalInterruptPayload,
+              t.ToolApprovalDecision[] | t.ToolApprovalDecisionMap
+            >(payload)
+        );
+
+        const decisionByCallId = normalizeApprovalDecisions(
+          askEntries.map(({ entry }) => entry.call.id!),
+          resumeValue
+        );
+
+        for (const {
+          entry,
+          reason: askReason,
+          allowedDecisions,
+        } of askEntries) {
+          const decision = decisionByCallId.get(entry.call.id!) ?? {
+            type: 'reject' as const,
+            reason: 'No decision provided for tool approval',
+          };
+          /**
+           * Read `decision.type` through a widened view once: hosts
+           * deserialize resume payloads from untyped JSON, so the
+           * runtime value can be a typo, the wrong type, or missing
+           * entirely. Both the `allowedDecisions` enforcement
+           * immediately below and the unknown-type fallthrough at the
+           * end of this loop body share this single read so the
+           * fail-closed checks compare against the same source.
+           */
+          const declaredType = (decision as { type?: unknown }).type;
+
+          /**
+           * Enforce the per-tool `allowedDecisions` allowlist that the
+           * `PreToolUse` hook surfaced in `review_configs`. The host
+           * UI is supposed to honor this when collecting the user's
+           * decision, but the wire is untrusted: a buggy or hostile
+           * host could submit a decision type the policy explicitly
+           * forbids (e.g. `'edit'` when the hook restricted to
+           * `['approve', 'reject']`), bypassing argument-mutation /
+           * response-substitution safeguards. Fail closed when the
+           * declared type isn't in the allowlist.
+           */
+          if (
+            allowedDecisions != null &&
+            (typeof declaredType !== 'string' ||
+              !allowedDecisions.includes(
+                declaredType as t.ToolApprovalDecisionType
+              ))
+          ) {
+            const offered =
+              typeof declaredType === 'string' ? declaredType : '<missing>';
+            blockEntry(
+              entry,
+              `Decision "${offered}" not in allowedDecisions [${allowedDecisions.join(', ')}] — failing closed`
+            );
+            continue;
+          }
+
+          if (decision.type === 'reject') {
+            blockEntry(
+              entry,
+              decision.reason ?? askReason ?? 'Rejected by user'
+            );
+            continue;
+          }
+
+          /**
+           * `respond` short-circuits tool execution: the human supplies
+           * the result the model should see in place of running the
+           * tool. We emit a successful `ToolMessage` directly and skip
+           * dispatch — no host event fires, no real tool side effect
+           * occurs. Mirrors LangChain HITL middleware semantics.
+           */
+          if (decision.type === 'respond') {
+            /**
+             * Validate the wire shape before touching it: hosts
+             * deserialize resume payloads from untyped JSON, so a
+             * malformed `{ type: 'respond' }` (no `responseText`) or
+             * `{ type: 'respond', responseText: 42 }` would crash
+             * `truncateToolResultContent` (which calls
+             * `content.length`) and turn a fail-closed approval path
+             * into a hard run failure. Route bad shapes through
+             * `blockEntry` like any other unusable decision.
+             */
+            const responseText = (decision as { responseText?: unknown })
+              .responseText;
+            if (typeof responseText !== 'string') {
+              blockEntry(
+                entry,
+                `Decision "respond" missing string responseText (got ${describeOfferedShape(responseText)}) — failing closed`
+              );
+              continue;
+            }
+            /**
+             * Truncate the human-supplied text just like the success
+             * path does for real tool output. Without this, a user
+             * pasting a large document as a manual response bypasses
+             * `maxToolResultChars` and can blow past the model's
+             * context window. The PostToolBatch entry surfaces the
+             * truncated text too so batch hooks see what the model
+             * will actually see.
+             */
+            const truncatedResponse = truncateToolResultContent(
+              responseText,
+              this.maxToolResultChars
+            );
+            messageByCallId.set(
+              entry.call.id!,
+              new ToolMessage({
+                status: 'success',
+                content: truncatedResponse,
+                name: entry.call.name,
+                tool_call_id: entry.call.id!,
+              })
+            );
+            postToolBatchEntryByCallId.set(entry.call.id!, {
+              toolName: entry.call.name,
+              toolInput: entry.args,
+              toolUseId: entry.call.id!,
+              stepId: entry.stepId,
+              turn: this.toolUsageCount.get(entry.call.name) ?? 0,
+              status: 'success',
+              toolOutput: truncatedResponse,
+            });
+            /**
+             * Safe to dispatch immediately — unlike `blockEntry` which
+             * defers, `respond` only executes inside the decision-
+             * processing loop, which is reachable only AFTER
+             * `interrupt()` has returned (the resume pass). There is
+             * no risk of being rolled back by a subsequent throw, so
+             * no risk of a duplicate `ON_RUN_STEP_COMPLETED` event.
+             */
+            this.dispatchStepCompleted(
+              entry.call.id!,
+              entry.call.name,
+              entry.args,
+              truncatedResponse,
+              config
+            );
+            continue;
+          }
+
+          if (decision.type === 'edit') {
+            /**
+             * Validate the wire shape before touching it: hosts
+             * deserialize resume payloads from untyped JSON, so a
+             * malformed `{ type: 'edit' }` (no `updatedInput`),
+             * `{ type: 'edit', updatedInput: 'string' }` (non-object),
+             * or `{ type: 'edit', updatedInput: [...] }` (array, not a
+             * plain object) would feed garbage into
+             * `applyInputOverride` and silently approve a tool with
+             * undefined / wrong-shape args. Same trust boundary as
+             * the `respond` validation above — fail closed via
+             * `blockEntry` with a diagnostic.
+             */
+            const updatedInput = (decision as { updatedInput?: unknown })
+              .updatedInput;
+            if (
+              updatedInput === null ||
+              typeof updatedInput !== 'object' ||
+              Array.isArray(updatedInput)
+            ) {
+              blockEntry(
+                entry,
+                `Decision "edit" missing object updatedInput (got ${describeOfferedShape(updatedInput)}) — failing closed`
+              );
+              continue;
+            }
+            applyInputOverride(entry, updatedInput as Record<string, unknown>);
+            approvedEntries.push(entry);
+            continue;
+          }
+
+          /**
+           * Defensive type widening: hosts deserialize resume payloads
+           * from untyped JSON, so the `decision.type` value at runtime
+           * is whatever string the wire sent — not necessarily one of
+           * the four union variants TS knows about. We compare against
+           * the literal `'approve'` through the widened `declaredType`
+           * captured at the top of this iteration, so a typo or schema
+           * drift (`'aproved'`, `null`, `undefined`) hits the fail-
+           * closed branch below instead of silently approving the
+           * tool. Without this widening, TS narrows the union after
+           * the three earlier branches and treats `=== 'approve'` as
+           * trivially true.
+           */
+          if (declaredType === 'approve') {
+            approvedEntries.push(entry);
+            continue;
+          }
+
+          /**
+           * Unknown / missing decision type — fail closed. The whole
+           * point of an approval gate is that "no decision" or
+           * "garbled decision" deny by default.
+           */
+          const unknownType =
+            typeof declaredType === 'string' ? declaredType : '<missing>';
+          blockEntry(
+            entry,
+            `Unknown approval decision type "${unknownType}" — failing closed`
+          );
+        }
+      }
+
+      /**
+       * Flush deferred denial side effects exactly once. On the FIRST
+       * pass through a batch that contains an `ask`, `interrupt()`
+       * threw above and we never reach this line — so no
+       * `ON_RUN_STEP_COMPLETED` / `PermissionDenied` events fire
+       * for blocked tools yet. On resume the node re-executes from
+       * scratch, `blockEntry` re-queues the same entries, and the
+       * flush below dispatches them once. For batches without any
+       * `ask` (deny-only or empty), the flush still runs here and
+       * dispatches in the same relative position as the pre-deferral
+       * code did (after hook processing, before tool execution).
+       */
+      flushDeferredBlockedSideEffects();
     } else {
       approvedEntries.push(...preToolCalls);
     }
@@ -1088,6 +1592,15 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
         let contentString: string;
         let toolMessage: ToolMessage;
+        /**
+         * Tracks the post-PostToolUse-hook output so the
+         * `PostToolBatch` entry below sees the final transformed value
+         * even when a hook replaced the original via `updatedOutput`.
+         * Lives at the loop-iteration scope so the success branch can
+         * mutate it; the error branch leaves it unset (and the batch
+         * entry uses `error` instead of `toolOutput` in that case).
+         */
+        let finalToolOutput: unknown = result.content;
 
         if (result.status === 'error') {
           contentString = `Error: ${result.errorMessage ?? 'Unknown error'}\n Please fix your mistakes.`;
@@ -1119,7 +1632,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           });
 
           if (hasFailureHook) {
-            await executeHooks({
+            const failureHookResult = await executeHooks({
               registry: this.hookRegistry!,
               input: {
                 hook_event_name: 'PostToolUseFailure',
@@ -1135,9 +1648,21 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               },
               sessionId: runId,
               matchQuery: toolName,
-            }).catch(() => {
-              /* PostToolUseFailure is observational — swallow errors */
-            });
+            }).catch((): undefined => undefined);
+            /**
+             * Collect `additionalContext` from failure hooks too. Without
+             * this, recovery guidance returned on tool errors (e.g.
+             * "if this tool errors with X, suggest Y to the user") is
+             * silently dropped even though the API surface advertises
+             * `additionalContext` for this event. PostToolUseFailure
+             * remains observational for errors thrown by the hook
+             * itself, but a successfully-returned result is honored.
+             */
+            if (failureHookResult != null) {
+              for (const ctx of failureHookResult.additionalContexts) {
+                batchAdditionalContexts.push(ctx);
+              }
+            }
           }
         } else {
           let registryRaw =
@@ -1167,6 +1692,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               sessionId: runId,
               matchQuery: toolName,
             }).catch((): undefined => undefined);
+            if (hookResult != null) {
+              for (const ctx of hookResult.additionalContexts) {
+                batchAdditionalContexts.push(ctx);
+              }
+            }
             if (hookResult?.updatedOutput != null) {
               const replaced =
                 typeof hookResult.updatedOutput === 'string'
@@ -1177,6 +1707,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                 replaced,
                 this.maxToolResultChars
               );
+              finalToolOutput = hookResult.updatedOutput;
             }
           }
 
@@ -1216,6 +1747,18 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           request?.turn
         );
 
+        postToolBatchEntryByCallId.set(result.toolCallId, {
+          toolName,
+          toolInput: request?.args ?? {},
+          toolUseId: result.toolCallId,
+          stepId: request?.stepId,
+          turn: request?.turn,
+          status: result.status === 'error' ? 'error' : 'success',
+          ...(result.status === 'error'
+            ? { error: result.errorMessage ?? 'Unknown error' }
+            : { toolOutput: finalToolOutput }),
+        });
+
         messageByCallId.set(result.toolCallId, toolMessage);
       }
     }
@@ -1223,7 +1766,103 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     const toolMessages = toolCalls
       .map((call) => messageByCallId.get(call.id!))
       .filter((m): m is ToolMessage => m != null);
+
+    await this.dispatchPostToolBatchAndInjectContext({
+      toolCalls,
+      entriesByCallId: postToolBatchEntryByCallId,
+      batchAdditionalContexts,
+      injected,
+      runId,
+      threadId,
+    });
+
     return { toolMessages, injected };
+  }
+
+  /**
+   * Fires the `PostToolBatch` hook (if registered) and appends the
+   * accumulated batch-level `additionalContext` strings to `injected`
+   * as a single `HumanMessage`. Entries are materialized in the
+   * original `toolCalls` order so hooks correlating outcomes by
+   * position (as the type docs promise) see exactly the sequence
+   * the model emitted, regardless of when each individual outcome
+   * was recorded into the map (deny synchronous, approved
+   * post-execution, respond on resume).
+   *
+   * The PostToolBatch hook's `additionalContexts` flow into the same
+   * batch accumulator per-tool hooks already use, so a single
+   * batch-level convention message can be injected through one path.
+   *
+   * Mutates `batchAdditionalContexts` (push from batch hook) and
+   * `injected` (push the consolidated HumanMessage). The caller owns
+   * those arrays and consumes them right after this returns.
+   */
+  private async dispatchPostToolBatchAndInjectContext(args: {
+    toolCalls: ToolCall[];
+    entriesByCallId: Map<string, PostToolBatchEntry>;
+    batchAdditionalContexts: string[];
+    injected: BaseMessage[];
+    runId: string;
+    threadId: string | undefined;
+  }): Promise<void> {
+    const {
+      toolCalls,
+      entriesByCallId,
+      batchAdditionalContexts,
+      injected,
+      runId,
+      threadId,
+    } = args;
+
+    const orderedBatchEntries: PostToolBatchEntry[] = [];
+    for (const call of toolCalls) {
+      const callId = call.id;
+      if (callId == null) {
+        continue;
+      }
+      const entry = entriesByCallId.get(callId);
+      if (entry != null) {
+        orderedBatchEntries.push(entry);
+      }
+    }
+    if (
+      this.hookRegistry?.hasHookFor('PostToolBatch', runId) === true &&
+      orderedBatchEntries.length > 0
+    ) {
+      const batchHookResult = await executeHooks({
+        registry: this.hookRegistry,
+        input: {
+          hook_event_name: 'PostToolBatch',
+          runId,
+          threadId,
+          agentId: this.agentId,
+          entries: orderedBatchEntries,
+        },
+        sessionId: runId,
+      }).catch((): undefined => undefined);
+      if (batchHookResult != null) {
+        for (const ctx of batchHookResult.additionalContexts) {
+          batchAdditionalContexts.push(ctx);
+        }
+      }
+    }
+
+    if (batchAdditionalContexts.length > 0) {
+      /**
+       * `HumanMessage` carrying a metadata `role: 'system'` marker —
+       * see `convertInjectedMessages` for the wider rationale. Anthropic
+       * and Google reject mid-conversation `SystemMessage`s, so we use
+       * a user-role message and surface the system intent through
+       * `additional_kwargs` for hosts inspecting state. The model sees
+       * a user message; `role` is metadata only.
+       */
+      injected.push(
+        new HumanMessage({
+          content: batchAdditionalContexts.join('\n\n'),
+          additional_kwargs: { role: 'system', source: 'hook' },
+        })
+      );
+    }
   }
 
   private dispatchStepCompleted(

@@ -362,9 +362,9 @@ export const createSearchTool = (
   const effectiveTavilySearchOptions =
     searchProvider === 'tavily' && config.safeSearch != null
       ? {
-          ...tavilySearchOptions,
-          safeSearch: config.safeSearch !== 0,
-        }
+        ...tavilySearchOptions,
+        safeSearch: config.safeSearch !== 0,
+      }
       : tavilySearchOptions;
 
   const schemaProperties: Record<string, unknown> = {
