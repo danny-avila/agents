@@ -141,6 +141,56 @@ type OpenAIChatCompletionRetry = (
   AsyncIterable<OpenAIChatCompletionStreamItem> | OpenAIChatCompletion
 >;
 
+function createUsageMetadata(
+  usage?: OpenAIClient.Completions.CompletionUsage
+): UsageMetadata {
+  const usageMetadata: UsageMetadata = {
+    input_tokens: usage?.prompt_tokens ?? 0,
+    output_tokens: usage?.completion_tokens ?? 0,
+    total_tokens: usage?.total_tokens ?? 0,
+  };
+
+  if (usage == null) {
+    return usageMetadata;
+  }
+
+  const inputTokenDetails: UsageMetadata['input_token_details'] = {};
+  const outputTokenDetails: UsageMetadata['output_token_details'] = {};
+  let hasInputTokenDetails = false;
+  let hasOutputTokenDetails = false;
+  const audioInputTokens = usage.prompt_tokens_details?.audio_tokens;
+  const cachedInputTokens = usage.prompt_tokens_details?.cached_tokens;
+  const audioOutputTokens = usage.completion_tokens_details?.audio_tokens;
+  const reasoningOutputTokens =
+    usage.completion_tokens_details?.reasoning_tokens;
+
+  if (audioInputTokens != null) {
+    inputTokenDetails.audio = audioInputTokens;
+    hasInputTokenDetails = true;
+  }
+  if (cachedInputTokens != null) {
+    inputTokenDetails.cache_read = cachedInputTokens;
+    hasInputTokenDetails = true;
+  }
+  if (audioOutputTokens != null) {
+    outputTokenDetails.audio = audioOutputTokens;
+    hasOutputTokenDetails = true;
+  }
+  if (reasoningOutputTokens != null) {
+    outputTokenDetails.reasoning = reasoningOutputTokens;
+    hasOutputTokenDetails = true;
+  }
+
+  if (hasInputTokenDetails) {
+    usageMetadata.input_token_details = inputTokenDetails;
+  }
+  if (hasOutputTokenDetails) {
+    usageMetadata.output_token_details = outputTokenDetails;
+  }
+
+  return usageMetadata;
+}
+
 function getExposedOpenAIClient(
   completions: OpenAIClientDelegate,
   responses: OpenAIClientDelegate,
@@ -1242,6 +1292,79 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
     return 'LibreChatDeepSeek';
   }
 
+  protected _convertDeepSeekMessages(
+    messages: BaseMessage[]
+  ): OpenAICompletionParam[] {
+    return _convertMessagesToOpenAIParams(messages, this.model, {
+      includeReasoningContent: true,
+    });
+  }
+
+  async _generate(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions'],
+    runManager?: CallbackManagerForLLMRun
+  ): Promise<ChatResult> {
+    options.signal?.throwIfAborted();
+    const params = this.invocationParams(options);
+
+    if (params.stream === true) {
+      return super._generate(messages, options, runManager);
+    }
+
+    const messagesMapped = this._convertDeepSeekMessages(messages);
+    const response = await this.completionWithRetry(
+      {
+        ...params,
+        stream: false,
+        messages: messagesMapped,
+      },
+      {
+        signal: options.signal,
+        ...options.options,
+      }
+    );
+
+    const usageMetadata = createUsageMetadata(response.usage);
+
+    const generations: ChatGeneration[] = response.choices.map((part) => {
+      const text = part.message.content ?? '';
+      const generation: ChatGeneration = {
+        text,
+        message: this._convertCompletionsMessageToBaseMessage(
+          part.message,
+          response
+        ),
+      };
+      generation.generationInfo = {
+        finish_reason: part.finish_reason,
+        ...(part.logprobs != null ? { logprobs: part.logprobs } : {}),
+      };
+      if (isAIMessage(generation.message)) {
+        generation.message.usage_metadata = usageMetadata;
+      }
+      generation.message = new AIMessage(
+        Object.fromEntries(
+          Object.entries(generation.message).filter(
+            ([key]) => !key.startsWith('lc_')
+          )
+        )
+      );
+      return generation;
+    });
+
+    return {
+      generations,
+      llmOutput: {
+        tokenUsage: {
+          promptTokens: usageMetadata.input_tokens,
+          completionTokens: usageMetadata.output_tokens,
+          totalTokens: usageMetadata.total_tokens,
+        },
+      },
+    };
+  }
+
   _getClientOptions(
     options?: OpenAICoreRequestOptions
   ): OpenAICoreRequestOptions {
@@ -1276,9 +1399,369 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
     yield* delayStreamChunks(
-      super._streamResponseChunks(messages, options, runManager),
+      this._streamResponseChunksWithReasoning(messages, options, runManager),
       this._lc_stream_delay
     );
+  }
+
+  /** Parses raw `<think>` fallback tags across chunks and emits sanitized DeepSeek stream chunks. */
+  protected async *_streamResponseChunksWithReasoning(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions'],
+    runManager?: CallbackManagerForLLMRun
+  ): AsyncGenerator<ChatGenerationChunk> {
+    const stream = this._streamResponseChunksFromReasoningMessages(
+      messages,
+      options
+    );
+    const thinkStartTag = '<think>';
+    const thinkEndTag = '</think>';
+    let tokensBuffer = '';
+    let isThinking = false;
+
+    for await (const chunk of stream) {
+      if (options.signal?.aborted === true) {
+        throw new Error('AbortError');
+      }
+
+      const reasoningContent =
+        chunk.message.additional_kwargs.reasoning_content;
+      if (reasoningContent != null && reasoningContent !== '') {
+        yield* this._yieldDeepSeekStreamChunk(chunk, runManager);
+        continue;
+      }
+
+      const text = chunk.text;
+      if (text === '') {
+        yield* this._yieldDeepSeekStreamChunk(chunk, runManager);
+        continue;
+      }
+
+      tokensBuffer += text;
+
+      while (tokensBuffer !== '') {
+        if (isThinking) {
+          const thinkEndIndex = tokensBuffer.indexOf(thinkEndTag);
+          if (thinkEndIndex !== -1) {
+            const thoughtContent = tokensBuffer.substring(0, thinkEndIndex);
+            if (thoughtContent !== '') {
+              yield* this._yieldDeepSeekReasoningText(
+                chunk,
+                thoughtContent,
+                runManager
+              );
+            }
+
+            tokensBuffer = tokensBuffer.substring(
+              thinkEndIndex + thinkEndTag.length
+            );
+            isThinking = false;
+            continue;
+          }
+
+          const splitIndex = this._getDeepSeekPartialTagSplitIndex(
+            tokensBuffer,
+            thinkEndTag
+          );
+          if (splitIndex !== -1) {
+            const safeToYield = tokensBuffer.substring(0, splitIndex);
+            if (safeToYield !== '') {
+              yield* this._yieldDeepSeekReasoningText(
+                chunk,
+                safeToYield,
+                runManager
+              );
+            }
+            tokensBuffer = tokensBuffer.substring(splitIndex);
+            break;
+          }
+
+          yield* this._yieldDeepSeekReasoningText(
+            chunk,
+            tokensBuffer,
+            runManager
+          );
+          tokensBuffer = '';
+          break;
+        }
+
+        const thinkStartIndex = tokensBuffer.indexOf(thinkStartTag);
+        if (thinkStartIndex !== -1) {
+          const beforeThink = tokensBuffer.substring(0, thinkStartIndex);
+          if (beforeThink !== '') {
+            yield* this._yieldDeepSeekStreamChunk(
+              this._createDeepSeekStreamChunk(chunk, beforeThink),
+              runManager
+            );
+          }
+
+          tokensBuffer = tokensBuffer.substring(
+            thinkStartIndex + thinkStartTag.length
+          );
+          isThinking = true;
+          continue;
+        }
+
+        const splitIndex = this._getDeepSeekPartialTagSplitIndex(
+          tokensBuffer,
+          thinkStartTag
+        );
+        if (splitIndex !== -1) {
+          const safeToYield = tokensBuffer.substring(0, splitIndex);
+          if (safeToYield !== '') {
+            yield* this._yieldDeepSeekStreamChunk(
+              this._createDeepSeekStreamChunk(chunk, safeToYield),
+              runManager
+            );
+          }
+          tokensBuffer = tokensBuffer.substring(splitIndex);
+          break;
+        }
+
+        yield* this._yieldDeepSeekStreamChunk(
+          this._createDeepSeekStreamChunk(chunk, tokensBuffer),
+          runManager
+        );
+        tokensBuffer = '';
+        break;
+      }
+    }
+
+    if (tokensBuffer === '') {
+      return;
+    }
+
+    if (isThinking) {
+      yield* this._yieldDeepSeekStreamChunk(
+        new ChatGenerationChunk({
+          message: new AIMessageChunk({
+            content: '',
+            additional_kwargs: {
+              reasoning_content: tokensBuffer,
+            },
+          }),
+          text: '',
+        }),
+        runManager
+      );
+      return;
+    }
+
+    yield* this._yieldDeepSeekStreamChunk(
+      new ChatGenerationChunk({
+        message: new AIMessageChunk({
+          content: tokensBuffer,
+        }),
+        text: tokensBuffer,
+      }),
+      runManager
+    );
+  }
+
+  protected async *_streamResponseChunksFromReasoningMessages(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions']
+  ): AsyncGenerator<ChatGenerationChunk> {
+    const params = {
+      ...this.invocationParams(options, { streaming: true }),
+      stream: true as const,
+    };
+    const messagesMapped = this._convertDeepSeekMessages(messages);
+    const streamIterable = await this.completionWithRetry(
+      {
+        ...params,
+        messages: messagesMapped,
+      },
+      {
+        signal: options.signal,
+        ...options.options,
+      }
+    );
+
+    let defaultRole:
+      | OpenAIClient.Chat.Completions.ChatCompletionRole
+      | undefined;
+    let usage: OpenAIClient.Completions.CompletionUsage | undefined;
+
+    for await (const data of streamIterable) {
+      if (options.signal?.aborted === true) {
+        throw new Error('AbortError');
+      }
+
+      if (data.usage != null) {
+        usage = data.usage;
+      }
+
+      if (data.choices.length === 0) {
+        continue;
+      }
+
+      const choice = data.choices[0];
+      const { delta } = choice;
+      const messageChunk = this._convertCompletionsDeltaToBaseMessageChunk(
+        delta,
+        data,
+        defaultRole
+      );
+      defaultRole = delta.role ?? defaultRole;
+
+      if (typeof messageChunk.content !== 'string') {
+        continue;
+      }
+
+      const messageText = messageChunk.content;
+      const newTokenIndices = {
+        prompt: options.promptIndex ?? 0,
+        completion: choice.index,
+      };
+      const generationInfo = { ...newTokenIndices };
+      if (choice.finish_reason != null) {
+        Object.assign(generationInfo, {
+          finish_reason: choice.finish_reason,
+          system_fingerprint: data.system_fingerprint,
+          model_name: data.model,
+          service_tier: data.service_tier,
+        });
+      }
+      if (this.logprobs === true) {
+        Object.assign(generationInfo, { logprobs: choice.logprobs });
+      }
+
+      const generationChunk = new ChatGenerationChunk({
+        message: messageChunk,
+        text: messageText,
+        generationInfo,
+      });
+
+      yield generationChunk;
+    }
+
+    if (usage != null) {
+      const usageMetadata = createUsageMetadata(usage);
+
+      const generationChunk = new ChatGenerationChunk({
+        message: new AIMessageChunk({
+          content: '',
+          response_metadata: {
+            usage: { ...usage },
+          },
+          usage_metadata: usageMetadata,
+        }),
+        text: '',
+        generationInfo: {
+          prompt: 0,
+          completion: 0,
+        },
+      });
+
+      yield generationChunk;
+    }
+
+    if (options.signal?.aborted === true) {
+      throw new Error('AbortError');
+    }
+  }
+
+  protected _createDeepSeekStreamChunk(
+    chunk: ChatGenerationChunk,
+    content: string,
+    additionalKwargs?: AIMessageChunk['additional_kwargs'],
+    text = content
+  ): ChatGenerationChunk {
+    if (!(chunk.message instanceof AIMessageChunk)) {
+      return new ChatGenerationChunk({
+        message: new AIMessageChunk({
+          content,
+          additional_kwargs:
+            additionalKwargs ?? chunk.message.additional_kwargs,
+          response_metadata: chunk.message.response_metadata,
+          id: chunk.message.id,
+        }),
+        text,
+        generationInfo: chunk.generationInfo,
+      });
+    }
+
+    const message = chunk.message;
+    return new ChatGenerationChunk({
+      message: new AIMessageChunk({
+        content,
+        additional_kwargs: additionalKwargs ?? message.additional_kwargs,
+        response_metadata: message.response_metadata,
+        tool_calls: message.tool_calls,
+        tool_call_chunks: message.tool_call_chunks,
+        id: message.id,
+      }),
+      text,
+      generationInfo: chunk.generationInfo,
+    });
+  }
+
+  protected _createDeepSeekReasoningStreamChunk(
+    chunk: ChatGenerationChunk,
+    reasoningContent: string
+  ): ChatGenerationChunk {
+    return this._createDeepSeekStreamChunk(
+      chunk,
+      '',
+      {
+        ...chunk.message.additional_kwargs,
+        reasoning_content: reasoningContent,
+      },
+      ''
+    );
+  }
+
+  protected async *_yieldDeepSeekReasoningText(
+    chunk: ChatGenerationChunk,
+    reasoningContent: string,
+    runManager?: CallbackManagerForLLMRun
+  ): AsyncGenerator<ChatGenerationChunk> {
+    yield* this._yieldDeepSeekStreamChunk(
+      this._createDeepSeekReasoningStreamChunk(chunk, reasoningContent),
+      runManager
+    );
+  }
+
+  protected async *_yieldDeepSeekStreamChunk(
+    chunk: ChatGenerationChunk,
+    runManager?: CallbackManagerForLLMRun
+  ): AsyncGenerator<ChatGenerationChunk> {
+    yield chunk;
+    await runManager?.handleLLMNewToken(
+      chunk.text,
+      this._getDeepSeekTokenIndices(chunk),
+      undefined,
+      undefined,
+      undefined,
+      { chunk }
+    );
+  }
+
+  protected _getDeepSeekTokenIndices(
+    chunk: ChatGenerationChunk
+  ): { prompt: number; completion: number } | undefined {
+    const prompt = chunk.generationInfo?.prompt;
+    const completion = chunk.generationInfo?.completion;
+
+    if (typeof prompt === 'number' && typeof completion === 'number') {
+      return { prompt, completion };
+    }
+
+    return undefined;
+  }
+
+  protected _getDeepSeekPartialTagSplitIndex(
+    text: string,
+    tag: string
+  ): number {
+    for (let i = tag.length - 1; i >= 1; i--) {
+      if (text.endsWith(tag.substring(0, i))) {
+        return text.length - i;
+      }
+    }
+
+    return -1;
   }
 }
 
