@@ -546,7 +546,14 @@ export async function spawnLocalProcess(
       kind: 'stdout' | 'stderr'
     ): void => {
       totalSpawnedBytes += buf.length;
-      if (totalSpawnedBytes > hardKillBytes && !overflowKilled) {
+      // hardKillBytes <= 0 means "no cap" per the public config contract
+      // (see LocalExecutionConfig.maxSpawnedBytes). Skip the kill check
+      // entirely in that case so a single byte doesn't terminate the run.
+      if (
+        hardKillBytes > 0 &&
+        totalSpawnedBytes > hardKillBytes &&
+        !overflowKilled
+      ) {
         overflowKilled = true;
         killProcessTree(child);
         return;

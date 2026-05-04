@@ -1042,3 +1042,41 @@ describe('codex review fixes (round 4)', () => {
     });
   });
 });
+
+describe('codex review fixes (round 5)', () => {
+  describe('maxSpawnedBytes=0 disables the cap (Codex P2 #11)', () => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { spawnLocalProcess } = require('../local/LocalExecutionEngine');
+
+    it('does not kill on first byte when maxSpawnedBytes is 0', async () => {
+      // Without the fix, `totalSpawnedBytes > 0` triggers on the first
+      // byte and the process tree gets killed before `echo` can finish.
+      const result = await spawnLocalProcess('bash', ['-c', 'echo hello'], {
+        timeoutMs: 5_000,
+        maxSpawnedBytes: 0,
+        sandbox: { enabled: false },
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.timedOut).toBe(false);
+      expect(result.stdout.trim()).toBe('hello');
+    });
+
+    it('lets a moderately noisy command run to completion when cap is 0', async () => {
+      // Emit ~40 KiB. Default cap (50 MiB) would also let this through,
+      // but the explicit 0 must not flip into the kill path.
+      const result = await spawnLocalProcess(
+        'bash',
+        ['-c', 'head -c 40000 /dev/urandom | base64 | head -c 40000'],
+        {
+          timeoutMs: 10_000,
+          maxOutputChars: 200_000,
+          maxSpawnedBytes: 0,
+          sandbox: { enabled: false },
+        }
+      );
+      expect(result.exitCode).toBe(0);
+      expect(result.timedOut).toBe(false);
+      expect(result.stdout.length).toBeGreaterThan(0);
+    });
+  });
+});
