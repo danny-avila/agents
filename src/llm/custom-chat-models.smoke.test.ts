@@ -83,7 +83,9 @@ type OpenAIStreamItem =
 type MockableCompletionCreate = (
   request: unknown,
   options?: unknown
-) => Promise<AsyncIterable<OpenAIStreamItem>>;
+) => Promise<
+  AsyncIterable<OpenAIStreamItem> | OpenAIClient.Chat.Completions.ChatCompletion
+>;
 type MockableCompletionClient = {
   chat: {
     completions: {
@@ -187,6 +189,24 @@ function mockCompletionStream(
   const createMock = jest.fn(async () =>
     createOpenAIStreamWithCustomEvents()
   ) as MockableCompletionCreate;
+  client.chat.completions.create = createMock;
+  return createMock;
+}
+
+function mockCompletion(
+  model: ChatOpenAI,
+  response: OpenAIClient.Chat.Completions.ChatCompletion
+): MockableCompletionCreate {
+  const completions = (
+    model as unknown as { completions: MockableCompletionDelegate }
+  ).completions;
+  completions._getClientOptions(undefined);
+  const client = completions.client;
+  if (client == null) {
+    throw new Error('Expected OpenAI completions client');
+  }
+
+  const createMock = jest.fn(async () => response) as MockableCompletionCreate;
   client.chat.completions.create = createMock;
   return createMock;
 }
@@ -370,6 +390,39 @@ describe('custom chat model class smoke tests', () => {
       new AzureChatOpenAI({
         ...baseAzureFields,
       })
+    );
+  });
+
+  it('passes non-streaming OpenAI completions through unchanged', async () => {
+    const model = new ChatOpenAI({
+      model: 'hermes-agent',
+      apiKey: 'test-key',
+    });
+    const createMock = mockCompletion(model, {
+      id: 'chatcmpl-nonstream-test',
+      object: 'chat.completion',
+      created: 0,
+      model: 'hermes-agent',
+      choices: [
+        {
+          index: 0,
+          finish_reason: 'stop',
+          logprobs: null,
+          message: {
+            role: 'assistant',
+            content: 'plain response',
+            refusal: null,
+          },
+        },
+      ],
+    });
+
+    const response = await model.invoke([new HumanMessage('no stream')]);
+
+    expect(response.content).toBe('plain response');
+    expect(createMock).toHaveBeenCalledWith(
+      expect.objectContaining({ stream: false }),
+      expect.any(Object)
     );
   });
 
