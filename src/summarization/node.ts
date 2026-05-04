@@ -629,6 +629,13 @@ async function dispatchCompletionEvents(params: {
   runStep: t.RunStep;
   summaryUsage?: Partial<UsageMetadata>;
   agentId: string;
+  /**
+   * Number of messages preserved verbatim by the recency window after
+   * compaction.  Reported via the PostCompact hook payload so observers
+   * (metrics, cleanup) see the true post-compaction message count
+   * instead of always-zero.
+   */
+  messagesAfterCount: number;
 }): Promise<void> {
   const {
     graph,
@@ -639,6 +646,7 @@ async function dispatchCompletionEvents(params: {
     runStep,
     summaryUsage,
     agentId,
+    messagesAfterCount,
   } = params;
 
   runStep.summary = summaryBlock;
@@ -691,7 +699,7 @@ async function dispatchCompletionEvents(params: {
         threadId,
         agentId,
         summary: summaryText,
-        messagesAfterCount: 0,
+        messagesAfterCount,
       },
       sessionId,
     }).catch(() => {
@@ -980,6 +988,7 @@ export function createSummarizeNode({
       runStep,
       summaryUsage,
       agentId: request.agentId,
+      messagesAfterCount: messagesToRetain.length,
     });
 
     return {
