@@ -201,4 +201,41 @@ describe('createWorkspacePolicyHook', () => {
     );
     expect(out.decision).toBe('allow');
   });
+
+  describe('symlink-escape (Codex P1 #10)', () => {
+    it('rejects a symlink inside the workspace that points outside', async () => {
+      const fs = await import('fs/promises');
+      await fs.writeFile(join(extra, 'secret.txt'), 'top-secret\n');
+      await fs.symlink(
+        join(extra, 'secret.txt'),
+        join(workspace, 'escape')
+      );
+      const hook = createWorkspacePolicyHook({
+        root: workspace,
+        outsideRead: 'deny',
+      });
+      const out = await call(
+        hook,
+        makeInput('read_file', { file_path: 'escape' })
+      );
+      expect(out.decision).toBe('deny');
+      expect(out.reason).toContain('escape');
+    });
+
+    it('still allows a lexically-outside path that realpaths back inside (alternate mount via symlink)', async () => {
+      const fs = await import('fs/promises');
+      await fs.writeFile(join(workspace, 'file.ts'), 'export {};\n');
+      const altMount = join(extra, 'alt-mount');
+      await fs.symlink(workspace, altMount);
+      const hook = createWorkspacePolicyHook({
+        root: workspace,
+        outsideRead: 'deny',
+      });
+      const out = await call(
+        hook,
+        makeInput('read_file', { file_path: join(altMount, 'file.ts') })
+      );
+      expect(out.decision).toBe('allow');
+    });
+  });
 });

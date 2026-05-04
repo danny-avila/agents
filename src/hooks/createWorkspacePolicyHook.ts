@@ -48,6 +48,7 @@
  */
 
 import { isAbsolute, relative, resolve } from 'path';
+import { realpath } from 'fs/promises';
 import { Constants } from '@/common';
 import type {
   HookCallback,
@@ -130,6 +131,58 @@ function isInsideAnyRoot(absolutePath: string, roots: string[]): boolean {
   return false;
 }
 
+/**
+ * Symlink-aware variant: realpaths the candidate AND the roots before
+ * comparing. Without this, a symlink inside the workspace pointing
+ * outside (e.g. `workspace/link → /etc/passwd`) compares as
+ * "in-workspace" lexically, but actually grants the agent reach
+ * outside the boundary. Critical when this hook is the primary gate
+ * (i.e. the host opted into `workspace.allowReadOutside: true` /
+ * `allowWriteOutside: true` so the file tools' own clamp is off).
+ *
+ * Handles paths that don't yet exist (e.g. `write_file` to a brand
+ * new path) by walking up to the nearest existing ancestor and
+ * realpathing that, then re-attaching the unresolved suffix. Mirrors
+ * `resolveWorkspacePathSafe`'s approach in LocalExecutionEngine.
+ */
+async function realpathOrSelf(absolutePath: string): Promise<string> {
+  try {
+    return await realpath(absolutePath);
+  } catch {
+    return absolutePath;
+  }
+}
+
+async function realpathOfPathOrAncestor(
+  absolutePath: string
+): Promise<string> {
+  let current = absolutePath;
+  let suffix = '';
+  // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
+  while (true) {
+    try {
+      const real = await realpath(current);
+      return suffix === '' ? real : resolve(real, suffix);
+    } catch {
+      const parent = resolve(current, '..');
+      if (parent === current) {
+        return absolutePath;
+      }
+      const base = current.slice(parent.length + 1);
+      suffix = suffix === '' ? base : `${base}/${suffix}`;
+      current = parent;
+    }
+  }
+}
+
+async function isInsideAnyRootRealpath(
+  absolutePath: string,
+  realRoots: readonly string[]
+): Promise<boolean> {
+  const real = await realpathOfPathOrAncestor(absolutePath);
+  return isInsideAnyRoot(real, [...realRoots]);
+}
+
 function formatReason(
   template: string | undefined,
   toolName: string,
@@ -169,6 +222,17 @@ export function createWorkspacePolicyHook(
   );
   const allRoots = [root, ...additionalRoots];
 
+  // Pre-realpath the roots once at construction — these are stable
+  // per Run. The candidate paths get realpath'd lazily inside the
+  // hook callback. Cached so the per-call cost is just one realpath.
+  let realRootsPromise: Promise<string[]> | undefined;
+  const getRealRoots = (): Promise<string[]> => {
+    if (realRootsPromise == null) {
+      realRootsPromise = Promise.all(allRoots.map(realpathOrSelf));
+    }
+    return realRootsPromise;
+  };
+
   const readPolicy: OutsideAccessPolicy = config.outsideRead ?? 'ask';
   const writePolicy: OutsideAccessPolicy = config.outsideWrite ?? 'ask';
 
@@ -186,10 +250,30 @@ export function createWorkspacePolicyHook(
     );
     if (paths.length === 0) return { decision: 'allow' };
 
+    // Two-stage check:
+    //   1. Lexical fast path — anything that's lexically inside the
+    //      workspace AND doesn't get redirected by realpath stays
+    //      allow-able without paying the realpath cost on every call.
+    //   2. For paths that look outside lexically OR look inside but
+    //      may have been routed through a symlink, realpath both the
+    //      candidate and the roots and compare. This catches the
+    //      `workspace/link → /etc/passwd` escape that lexical-only
+    //      checks miss.
     const outside: string[] = [];
+    const realRoots = await getRealRoots();
     for (const p of paths) {
       const abs = isAbsolute(p) ? resolve(p) : resolve(root, p);
-      if (!isInsideAnyRoot(abs, allRoots)) outside.push(p);
+      const lexicallyInside = isInsideAnyRoot(abs, allRoots);
+      const realInside = await isInsideAnyRootRealpath(abs, realRoots);
+      // Block if realpath escapes the workspace, EVEN IF the
+      // lexical path looks safe (the symlink-escape case).
+      if (!realInside) {
+        outside.push(p);
+        continue;
+      }
+      // Lexically outside but realpath says inside? The path is on
+      // an alternate mount of the workspace — let it through.
+      void lexicallyInside;
     }
     if (outside.length === 0) return { decision: 'allow' };
 

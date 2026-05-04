@@ -31,6 +31,27 @@ const dangerousCommandPatterns: ReadonlyArray<RegExp> = [
   /:\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/,
 ];
 
+/**
+ * Companion patterns that look for destructive targets *inside*
+ * matching quote pairs. These are checked against the ORIGINAL
+ * command (not the post-quote-strip `normalized` form), because
+ * `stripQuotedContent` blanks the contents of quoted spans —
+ * which would otherwise let `rm -rf "/"` and friends slip past
+ * `dangerousCommandPatterns`.
+ *
+ * Kept as a separate list so we don't pay false-positive cost on
+ * benign uses like `echo "rm -rf /"` (the print case): each pattern
+ * here REQUIRES a quote *around the destructive path argument*, not
+ * just a quote *somewhere* in the command. `echo "rm -rf /"` has
+ * `/` outside of any quote-pair-around-the-path (the quotes wrap
+ * the whole `rm -rf /` text), so it doesn't match here either.
+ */
+const quotedDestructivePatterns: ReadonlyArray<RegExp> = [
+  /\brm\s+(?:-[^\s]*[rf][^\s]*\s+){1,3}["'](?:\/|~|\$\{?HOME\}?|\.)["']/,
+  /\bchmod\s+-R\s+(?:777|a\+w)\s+["'](?:\/|~|\$\{?HOME\}?|\.)["']/,
+  /\bchown\s+-R\s+[^;&|]+\s+["'](?:\/|~|\$\{?HOME\}?|\.)["']/,
+];
+
 const mutatingCommandPattern =
   /\b(?:rm|mv|cp|touch|mkdir|rmdir|ln|truncate|tee|sed\s+-i|perl\s+-pi|python(?:3)?\s+-c|node\s+-e|npm\s+(?:install|ci|update|publish)|pnpm\s+(?:install|update|publish)|yarn\s+(?:install|add|publish)|git\s+(?:add|commit|checkout|switch|reset|clean|rebase|merge|push|pull|stash|tag|branch)|chmod|chown)\b|(?:^|[^<])>\s*[^&]|\bcat\s+[^|;&]*>\s*/;
 
@@ -295,10 +316,29 @@ export async function validateBashCommand(
   }
 
   if (config.allowDangerousCommands !== true) {
+    let blocked = false;
+    // Strip-then-match for the bare-form patterns (avoids false
+    // positives where the destructive text is buried inside a
+    // string the user is just printing).
     for (const pattern of dangerousCommandPatterns) {
       if (pattern.test(normalized)) {
         errors.push('Command matches a destructive command pattern.');
+        blocked = true;
         break;
+      }
+    }
+    // Original-form pass for patterns that REQUIRE matching quote
+    // pairs around a destructive path. Without this, `rm -rf "/"`
+    // and `chmod -R 777 "/"` slip past the strip-then-match pass
+    // because their destructive target is inside quotes.
+    if (!blocked) {
+      for (const pattern of quotedDestructivePatterns) {
+        if (pattern.test(command)) {
+          errors.push(
+            'Command matches a destructive command pattern (quoted target).'
+          );
+          break;
+        }
       }
     }
   }

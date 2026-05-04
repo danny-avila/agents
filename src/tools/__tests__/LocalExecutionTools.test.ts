@@ -1001,3 +1001,44 @@ describe('codex review fixes (round 3)', () => {
     });
   });
 });
+
+describe('codex review fixes (round 4)', () => {
+  describe('quoted destructive targets (Codex P1 #9)', () => {
+    it('blocks rm -rf "/" (target inside double quotes)', async () => {
+      const result = await validateBashCommand('rm -rf "/"');
+      expect(result.valid).toBe(false);
+      expect(result.errors.join('\n')).toContain('destructive command pattern');
+    });
+
+    it('blocks rm -rf "$HOME" (env-quoted target)', async () => {
+      const result = await validateBashCommand('rm -rf "$HOME"');
+      expect(result.valid).toBe(false);
+      expect(result.errors.join('\n')).toContain('destructive command pattern');
+    });
+
+    it('blocks rm -rf \'/\' (target inside single quotes)', async () => {
+      const result = await validateBashCommand("rm -rf '/'");
+      expect(result.valid).toBe(false);
+      expect(result.errors.join('\n')).toContain('destructive command pattern');
+    });
+
+    it('blocks chmod -R 777 "/"', async () => {
+      const result = await validateBashCommand('chmod -R 777 "/"');
+      expect(result.valid).toBe(false);
+      expect(result.errors.join('\n')).toContain('destructive command pattern');
+    });
+
+    it('still blocks unquoted forms (no regression)', async () => {
+      const result = await validateBashCommand('rm -rf /');
+      expect(result.valid).toBe(false);
+    });
+
+    it('does not flag the print-only case echo "rm -rf /"', async () => {
+      // The destructive-target inside `echo "..."` is wrapped by the
+      // OUTER quotes only — there's no quote pair around the `/`
+      // itself — so the quoted-pattern pass should not match.
+      const result = await validateBashCommand('echo "rm -rf /"');
+      expect(result.valid).toBe(true);
+    });
+  });
+});
