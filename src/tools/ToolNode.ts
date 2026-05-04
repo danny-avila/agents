@@ -760,6 +760,251 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   }
 
   /**
+   * Runs a single in-process tool call with the same lifecycle hooks
+   * the event-dispatch path fires (`PreToolUse`, `PermissionDenied`,
+   * `PostToolUse`, `PostToolUseFailure`). Used for any tool whose
+   * implementation lives in the SDK process — i.e. every entry in
+   * `directToolNames` — so host-supplied policy hooks gate
+   * direct-invoked tools the same way they gate dispatched ones.
+   *
+   * Fast path: when the registry has none of the relevant events
+   * registered for this run, falls through to `runTool` with zero
+   * extra work. The hook list is also checked via
+   * `hasHookFor(event, runId)`, which performs the registry's own
+   * O(1) shortcut.
+   *
+   * Hook semantics intentionally mirror `dispatchToolEvents` for the
+   * single-call case:
+   *   - `PreToolUse` returning `decision: 'deny'` synthesizes an error
+   *     `ToolMessage` and fires `PermissionDenied` (observational).
+   *   - `PreToolUse` returning `decision: 'ask'` is fail-closed for
+   *     direct-path tools regardless of `humanInTheLoop.enabled`. The
+   *     event path uses LangGraph's `interrupt()` to suspend the
+   *     graph mid-batch; replicating that for in-process tools needs
+   *     a deeper restructuring of `runTool` (the call is currently
+   *     fully synchronous from the dispatcher's perspective). Until
+   *     that lands, returning `ask` for a direct tool collapses to a
+   *     deny — strict improvement over the prior behavior, where the
+   *     hook never ran at all. A one-time warning is emitted so hosts
+   *     that wired HITL UIs notice the limitation.
+   *   - `PreToolUse.updatedInput` is applied to the call before
+   *     `runTool` runs; placeholder resolution inside `runTool` is
+   *     idempotent on already-resolved args.
+   *   - `PostToolUse.updatedOutput` replaces the returned
+   *     `ToolMessage` content (preserving id/name/status).
+   *   - `PostToolUseFailure` fires when `runTool` returns a
+   *     `ToolMessage` whose `status === 'error'`. Observational only;
+   *     the error message stays the source of truth.
+   *
+   * `PostToolBatch` aggregation across direct + dispatched outcomes is
+   * a separate concern: `dispatchToolEvents` accumulates batch entries
+   * locally and fires `PostToolBatch` at the end of its scope. Wiring
+   * direct-call entries into that aggregation crosses the two paths'
+   * scopes and is left to a follow-up.
+   */
+  private async runDirectToolWithLifecycleHooks(
+    call: ToolCall,
+    config: RunnableConfig,
+    batchContext: RunToolBatchContext = {}
+  ): Promise<BaseMessage | Command> {
+    const runId = (config.configurable?.run_id as string | undefined) ?? '';
+    const hookRegistry = this.hookRegistry;
+    const hasPreHook =
+      hookRegistry?.hasHookFor('PreToolUse', runId) === true;
+    const hasPostHook =
+      hookRegistry?.hasHookFor('PostToolUse', runId) === true;
+    const hasFailureHook =
+      hookRegistry?.hasHookFor('PostToolUseFailure', runId) === true;
+
+    if (
+      hookRegistry == null ||
+      (!hasPreHook && !hasPostHook && !hasFailureHook)
+    ) {
+      return this.runTool(call, config, batchContext);
+    }
+
+    const threadId = config.configurable?.thread_id as string | undefined;
+    const registryRunId =
+      batchContext.batchScopeId ??
+      (config.configurable?.run_id as string | undefined);
+    const turn = this.toolUsageCount.get(call.name) ?? 0;
+    const stepId = this.toolCallStepIds?.get(call.id ?? '') ?? '';
+
+    let resolvedArgs = call.args as Record<string, unknown>;
+    if (this.toolOutputRegistry != null) {
+      const { resolved } = this.toolOutputRegistry.resolve(
+        registryRunId,
+        call.args
+      );
+      resolvedArgs = resolved as Record<string, unknown>;
+    }
+
+    let effectiveCall = call;
+    if (hasPreHook) {
+      const preResult = await executeHooks({
+        registry: hookRegistry,
+        input: {
+          hook_event_name: 'PreToolUse',
+          runId,
+          threadId,
+          agentId: this.agentId,
+          toolName: call.name,
+          toolInput: resolvedArgs,
+          toolUseId: call.id ?? '',
+          stepId,
+          turn,
+        },
+        sessionId: runId,
+        matchQuery: call.name,
+      }).catch(() => undefined);
+
+      if (preResult != null) {
+        let blockReason: string | undefined;
+        if (preResult.decision === 'deny') {
+          blockReason = preResult.reason ?? 'Blocked by hook';
+        } else if (preResult.decision === 'ask') {
+          blockReason = this.resolveAskDecisionForDirectTool(
+            preResult.reason,
+            call.name
+          );
+        }
+
+        if (blockReason != null) {
+          if (
+            hookRegistry.hasHookFor('PermissionDenied', runId) === true
+          ) {
+            executeHooks({
+              registry: hookRegistry,
+              input: {
+                hook_event_name: 'PermissionDenied',
+                runId,
+                threadId,
+                agentId: this.agentId,
+                toolName: call.name,
+                toolInput: resolvedArgs,
+                toolUseId: call.id ?? '',
+                reason: blockReason,
+              },
+              sessionId: runId,
+              matchQuery: call.name,
+            }).catch(() => {
+              /* observational */
+            });
+          }
+          return new ToolMessage({
+            status: 'error',
+            content: `Blocked: ${blockReason}`,
+            name: call.name,
+            tool_call_id: call.id ?? '',
+          });
+        }
+
+        if (preResult.updatedInput != null) {
+          effectiveCall = {
+            ...call,
+            args: preResult.updatedInput as Record<string, unknown>,
+          };
+        }
+      }
+    }
+
+    const output = await this.runTool(effectiveCall, config, batchContext);
+
+    if (!(output instanceof ToolMessage)) {
+      return output;
+    }
+
+    if (output.status === 'error' && hasFailureHook) {
+      executeHooks({
+        registry: hookRegistry,
+        input: {
+          hook_event_name: 'PostToolUseFailure',
+          runId,
+          threadId,
+          agentId: this.agentId,
+          toolName: call.name,
+          toolInput: effectiveCall.args as Record<string, unknown>,
+          toolUseId: call.id ?? '',
+          error:
+            typeof output.content === 'string'
+              ? output.content
+              : JSON.stringify(output.content),
+          stepId,
+          turn,
+        },
+        sessionId: runId,
+        matchQuery: call.name,
+      }).catch(() => {
+        /* observational */
+      });
+      return output;
+    }
+
+    if (output.status !== 'error' && hasPostHook) {
+      const postResult = await executeHooks({
+        registry: hookRegistry,
+        input: {
+          hook_event_name: 'PostToolUse',
+          runId,
+          threadId,
+          agentId: this.agentId,
+          toolName: call.name,
+          toolInput: effectiveCall.args as Record<string, unknown>,
+          toolOutput: output.content,
+          toolUseId: call.id ?? '',
+          stepId,
+          turn,
+        },
+        sessionId: runId,
+        matchQuery: call.name,
+      }).catch(() => undefined);
+
+      if (postResult?.updatedOutput != null) {
+        const replaced =
+          typeof postResult.updatedOutput === 'string'
+            ? postResult.updatedOutput
+            : JSON.stringify(postResult.updatedOutput);
+        return new ToolMessage({
+          status: output.status,
+          name: output.name,
+          content: replaced,
+          artifact: output.artifact,
+          tool_call_id: output.tool_call_id,
+          additional_kwargs: output.additional_kwargs,
+        });
+      }
+    }
+
+    return output;
+  }
+
+  /**
+   * Direct-tool `ask` decisions are fail-closed today regardless of
+   * `humanInTheLoop.enabled` (see `runDirectToolWithLifecycleHooks`
+   * JSDoc). Logged once per process so HITL-enabled hosts notice the
+   * gap rather than silently observing denies.
+   */
+  private askDirectWarningEmitted = false;
+  private resolveAskDecisionForDirectTool(
+    reason: string | undefined,
+    toolName: string
+  ): string {
+    if (
+      this.humanInTheLoop?.enabled === true &&
+      !this.askDirectWarningEmitted
+    ) {
+      this.askDirectWarningEmitted = true;
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[ToolNode] PreToolUse returned 'ask' for direct-path tool "${toolName}". ` +
+          'Direct-path tools currently fail closed on ask decisions; HITL ' +
+          'interrupt support for direct tools is a follow-up.'
+      );
+    }
+    return reason ?? 'Blocked by hook';
+  }
+
+  /**
    * Registers the full, raw output under `refKey` (when provided) and
    * builds the per-message ref metadata stamped onto the resulting
    * `ToolMessage.additional_kwargs`. The metadata is read at LLM-
@@ -2028,7 +2273,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         });
       }
       outputs = [
-        await this.runTool(input.lg_tool_call, config, {
+        await this.runDirectToolWithLifecycleHooks(input.lg_tool_call, config, {
           batchIndex: 0,
           turn,
           batchScopeId,
@@ -2171,7 +2416,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           directCalls.length > 0
             ? await Promise.all(
               directCalls.map((call, i) =>
-                this.runTool(call, config, {
+                this.runDirectToolWithLifecycleHooks(call, config, {
                   batchIndex: directIndices[i],
                   turn,
                   batchScopeId,
