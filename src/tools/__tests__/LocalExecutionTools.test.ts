@@ -1113,6 +1113,115 @@ describe('codex review fixes (round 5)', () => {
     });
   });
 
+  describe('sandbox config: loopback bridge access (Codex P1 #14)', () => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { buildSandboxRuntimeConfig } = require('../local/LocalExecutionEngine');
+
+    it('seeds allowedDomains with loopback hosts so the bridge works under sandbox', () => {
+      const cfg = buildSandboxRuntimeConfig({}, '/tmp/ws', () => []);
+      expect(cfg.network.allowedDomains).toEqual(
+        expect.arrayContaining(['127.0.0.1', 'localhost', '::1'])
+      );
+    });
+
+    it('keeps user-supplied allowedDomains and does not duplicate loopback', () => {
+      const cfg = buildSandboxRuntimeConfig(
+        { sandbox: { network: { allowedDomains: ['api.example.com', '127.0.0.1'] } } },
+        '/tmp/ws',
+        () => []
+      );
+      const occurrences = cfg.network.allowedDomains.filter(
+        (d: string) => d === '127.0.0.1'
+      ).length;
+      expect(occurrences).toBe(1);
+      expect(cfg.network.allowedDomains).toContain('api.example.com');
+    });
+
+    it('respects deniedDomains overriding the loopback seed', () => {
+      const cfg = buildSandboxRuntimeConfig(
+        { sandbox: { network: { deniedDomains: ['127.0.0.1'] } } },
+        '/tmp/ws',
+        () => []
+      );
+      expect(cfg.network.allowedDomains).not.toContain('127.0.0.1');
+      // The other loopback aliases still get seeded — the host opted
+      // out of just `127.0.0.1`, not all loopback.
+      expect(cfg.network.allowedDomains).toEqual(
+        expect.arrayContaining(['localhost', '::1'])
+      );
+    });
+  });
+
+  describe('sandbox allowWrite includes additionalRoots (Codex P2 #15)', () => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { buildSandboxRuntimeConfig } = require('../local/LocalExecutionEngine');
+
+    it('adds workspace.additionalRoots to allowWrite alongside cwd', () => {
+      const cfg = buildSandboxRuntimeConfig(
+        {
+          cwd: '/tmp/repo/app',
+          workspace: {
+            root: '/tmp/repo/app',
+            additionalRoots: ['/tmp/repo/shared'],
+          },
+        },
+        '/tmp/repo/app',
+        () => ['/tmp/runtime-default'],
+      );
+      expect(cfg.filesystem.allowWrite).toEqual(
+        expect.arrayContaining([
+          '/tmp/repo/app',
+          '/tmp/repo/shared',
+          '/tmp/runtime-default',
+        ])
+      );
+    });
+
+    it('resolves relative additionalRoots against the workspace root', () => {
+      const cfg = buildSandboxRuntimeConfig(
+        {
+          cwd: '/tmp/repo/app',
+          workspace: {
+            root: '/tmp/repo/app',
+            additionalRoots: ['../shared'],
+          },
+        },
+        '/tmp/repo/app',
+        () => [],
+      );
+      // ../shared anchored to root: /tmp/repo/app -> /tmp/repo/shared.
+      expect(cfg.filesystem.allowWrite).toContain('/tmp/repo/shared');
+    });
+
+    it('falls back to cwd-only when no additionalRoots are configured', () => {
+      const cfg = buildSandboxRuntimeConfig(
+        { cwd: '/tmp/ws' },
+        '/tmp/ws',
+        () => ['/tmp/runtime-default']
+      );
+      expect(cfg.filesystem.allowWrite).toEqual([
+        '/tmp/ws',
+        '/tmp/runtime-default',
+      ]);
+    });
+
+    it('honours an explicit allowWrite override (no auto-seeding)', () => {
+      const cfg = buildSandboxRuntimeConfig(
+        {
+          cwd: '/tmp/ws',
+          workspace: {
+            root: '/tmp/ws',
+            additionalRoots: ['/tmp/extra'],
+          },
+          sandbox: { filesystem: { allowWrite: ['/explicit/path'] } },
+        },
+        '/tmp/ws',
+        () => ['/tmp/runtime-default']
+      );
+      expect(cfg.filesystem.allowWrite).toEqual(['/explicit/path']);
+    });
+  });
+
   describe('glob_search surfaces ripgrep failures (Codex P2 #13)', () => {
     it('returns an explicit error (not "No files found.") when rg exits non-zero', async () => {
       _resetRipgrepCacheForTests();

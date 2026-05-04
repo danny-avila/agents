@@ -434,15 +434,42 @@ async function ensureSandbox(
   return runtime.SandboxManager;
 }
 
-function buildSandboxRuntimeConfig(
+/**
+ * Loopback addresses the in-process programmatic-tool bridge listens
+ * on (`LocalProgrammaticToolCalling.ts` binds 127.0.0.1). Sandboxed
+ * code launched by `run_tools_with_code` / `run_tools_with_bash` HTTPs
+ * back to that address — without the entries below, the bridge is
+ * silently blocked under sandbox.
+ */
+const BRIDGE_LOOPBACK_HOSTS = ['127.0.0.1', 'localhost', '::1'] as const;
+
+export function buildSandboxRuntimeConfig(
   config: t.LocalExecutionConfig,
   cwd: string,
   getDefaultWritePaths: () => string[]
 ): SandboxRuntimeConfig {
   const sandbox = config.sandbox;
+  // Seed allowedDomains with loopback so the programmatic-tool bridge
+  // works under sandbox. If the host explicitly denied a loopback
+  // entry via `deniedDomains`, respect that and skip seeding it.
+  const userAllowed = sandbox?.network?.allowedDomains ?? [];
+  const denied = new Set(sandbox?.network?.deniedDomains ?? []);
+  const seededLoopback = BRIDGE_LOOPBACK_HOSTS.filter(
+    (host) => !denied.has(host) && !userAllowed.includes(host)
+  );
+  const allowedDomains = [...seededLoopback, ...userAllowed];
+  // Mirror the file-tools workspace boundary: anything in
+  // `additionalRoots` counts as in-workspace, so sandboxed shell/code
+  // can write there too. Without this, file_tools can resolve a
+  // sibling-root path but `bash`/`execute_code` is denied write
+  // access — confusing divergence flagged in Codex P2 #15.
+  const workspaceWriteRoots =
+    config.workspace?.additionalRoots != null
+      ? getWorkspaceRoots(config)
+      : [cwd];
   return {
     network: {
-      allowedDomains: sandbox?.network?.allowedDomains ?? [],
+      allowedDomains,
       deniedDomains: sandbox?.network?.deniedDomains ?? [],
       ...(sandbox?.network?.allowUnixSockets != null && {
         allowUnixSockets: sandbox.network.allowUnixSockets,
@@ -461,7 +488,7 @@ function buildSandboxRuntimeConfig(
       denyRead: sandbox?.filesystem?.denyRead ?? [],
       allowRead: sandbox?.filesystem?.allowRead,
       allowWrite: sandbox?.filesystem?.allowWrite ?? [
-        cwd,
+        ...workspaceWriteRoots,
         ...getDefaultWritePaths(),
       ],
       denyWrite: sandbox?.filesystem?.denyWrite ?? [
