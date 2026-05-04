@@ -315,7 +315,12 @@ export async function validateBashCommand(
     errors.push('Command appears to mutate files or repository state in read-only local mode.');
   }
 
-  const syntax = await spawnLocalProcess(DEFAULT_SHELL, ['-n', '-c', command], {
+  // Use the same shell the actual execution path will use. Hard-coding
+  // DEFAULT_SHELL here would reject perfectly valid commands when the
+  // host configures `local.shell` to a non-bash binary (or when the
+  // runtime doesn't have bash installed at all but does have e.g. zsh).
+  const syntaxShell = config.shell ?? DEFAULT_SHELL;
+  const syntax = await spawnLocalProcess(syntaxShell, ['-n', '-c', command], {
     ...config,
     timeoutMs: Math.min(config.timeoutMs ?? DEFAULT_TIMEOUT_MS, 5000),
     sandbox: { enabled: false },

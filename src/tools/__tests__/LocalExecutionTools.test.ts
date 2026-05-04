@@ -903,3 +903,101 @@ describe('codex review fixes (round 2)', () => {
     });
   });
 });
+
+describe('codex review fixes (round 3)', () => {
+  describe('validateBashCommand honours configured shell (Codex P1 #6)', () => {
+    it('routes the -n preflight through `local.shell` when set', async () => {
+      // Spawn calls go through the config'd backend; intercept and
+      // assert which shell binary the syntax check picks.
+      const calls: string[] = [];
+      const intercept: t.LocalSpawn = ((
+        command: string,
+        args: string[],
+        opts: import('child_process').SpawnOptions
+      ) => {
+        calls.push(command);
+        // Fall through to a real spawn so the call resolves cleanly.
+        const { spawn: realSpawn } = require('child_process') as typeof import('child_process');
+        return realSpawn(command, args, opts);
+      }) as unknown as t.LocalSpawn;
+
+      const result = await validateBashCommand('echo ok', {
+        shell: '/bin/sh',
+        exec: { spawn: intercept },
+      });
+      expect(result.valid).toBe(true);
+      // The very first call is the syntax-check spawn; assert it used
+      // /bin/sh and not the DEFAULT_SHELL fallback.
+      expect(calls[0]).toBe('/bin/sh');
+    });
+  });
+
+  describe('syntax-check probe cache is backend-keyed (Codex P2 #7)', () => {
+    it('does not bleed an "rg/node/python available" verdict from one backend to another', async () => {
+      _resetSyntaxCheckProbeCacheForTests();
+
+      // Backend A: probes succeed (real spawn).
+      const realSpawn = (require('child_process') as typeof import('child_process')).spawn;
+      const okBackend: t.LocalSpawn = ((
+        cmd: string,
+        args: string[],
+        opts: import('child_process').SpawnOptions
+      ) => realSpawn(cmd, args, opts)) as unknown as t.LocalSpawn;
+      // Backend B: probes always fail with exit 127.
+      const missingBackend: t.LocalSpawn = ((
+        _cmd: string,
+        _args: string[],
+        opts: import('child_process').SpawnOptions
+      ) => realSpawn('sh', ['-c', 'exit 127'], opts)) as unknown as t.LocalSpawn;
+
+      const cwdA = await createTempDir();
+      const cwdB = await createTempDir();
+      // Write a broken JS file we want syntax-checked.
+      await fsWriteFile(join(cwdA, 'a.js'), 'function (\n', 'utf8');
+      await fsWriteFile(join(cwdB, 'b.js'), 'function (\n', 'utf8');
+
+      // Run on backend A — succeeds, populates A's probe cache for `node`.
+      const a = await runPostEditSyntaxCheck(join(cwdA, 'a.js'), {
+        cwd: cwdA,
+        exec: { spawn: okBackend },
+      });
+      expect(a?.ok).toBe(false);
+
+      // Run on backend B — must NOT see A's cached "node available".
+      // With the bug, B would assume `node` works (skipping the probe),
+      // try to run `node --check`, get exit 127 from the missingBackend,
+      // and return ok=false with a misleading checker.
+      // With the fix: B's own probe runs, sees node is missing on this
+      // backend, and skips the syntax check (returns ok=true).
+      const b = await runPostEditSyntaxCheck(join(cwdB, 'b.js'), {
+        cwd: cwdB,
+        exec: { spawn: missingBackend },
+      });
+      expect(b?.ok).toBe(true);
+    });
+  });
+
+  describe('grep passes pattern via -e (Codex P2 #8)', () => {
+    it('handles dash-prefixed patterns without rg interpreting them as flags', async () => {
+      const cwd = await createTempDir();
+      // File contains a literal "-foo" we want to find.
+      await fsWriteFile(
+        join(cwd, 'flags.txt'),
+        'before\n-foo bar\nafter\n',
+        'utf8'
+      );
+      const bundle = createLocalCodingToolBundle({ cwd });
+      const grepTool = bundle.tools.find((t_) => t_.name === 'grep_search');
+      const result = await grepTool!.invoke({
+        id: 'g1',
+        name: 'grep_search',
+        args: { pattern: '-foo' },
+        type: 'tool_call',
+      });
+      const text = JSON.stringify(result);
+      // Pre-fix, rg would parse "-foo" as a flag and bail out.
+      // Post-fix, "-foo" is matched and the line shows up.
+      expect(text).toContain('-foo bar');
+    });
+  });
+});

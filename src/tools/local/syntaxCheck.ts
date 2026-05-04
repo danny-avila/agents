@@ -19,7 +19,7 @@
 import { extname } from 'path';
 import { readFile } from 'fs/promises';
 import type * as t from '@/types';
-import { spawnLocalProcess } from './LocalExecutionEngine';
+import { getSpawn, spawnLocalProcess } from './LocalExecutionEngine';
 
 export type SyntaxCheckOutcome =
   | { ok: true }
@@ -30,35 +30,59 @@ export type SyntaxChecker = (
   config: t.LocalExecutionConfig
 ) => Promise<SyntaxCheckOutcome>;
 
-const cache = {
-  hasNode: undefined as boolean | undefined,
-  hasPython: undefined as boolean | undefined,
-  hasBash: undefined as boolean | undefined,
-};
+/**
+ * Per-backend availability cache for the post-edit syntax-check probe
+ * tools (node, python3, bash). Keyed on the *effective spawn backend*
+ * — see `getSpawn(config)` in LocalExecutionEngine — so a Run that
+ * probes node over Node's child_process can't poison a subsequent Run
+ * whose `local.exec.spawn` routes elsewhere (a remote sandbox might
+ * have python but not node, etc.).
+ *
+ * Mirrors the same fix that landed for the ripgrep cache in
+ * `LocalCodingTools.ts` after the first round of Codex review.
+ * WeakMap keying lets disposed backends GC their entry; the test
+ * reset hook re-creates the map.
+ */
+type ProbeKind = 'hasNode' | 'hasPython' | 'hasBash';
+type ProbeCache = Partial<Record<ProbeKind, Promise<boolean>>>;
+
+let probeCacheByBackend = new WeakMap<t.LocalSpawn, ProbeCache>();
+
+function cacheFor(
+  config: t.LocalExecutionConfig
+): ProbeCache {
+  const backend = getSpawn(config);
+  let entry = probeCacheByBackend.get(backend);
+  if (entry == null) {
+    entry = {};
+    probeCacheByBackend.set(backend, entry);
+  }
+  return entry;
+}
 
 async function probe(
   command: string,
   args: string[],
-  cached: keyof typeof cache,
+  cached: ProbeKind,
   config: t.LocalExecutionConfig
 ): Promise<boolean> {
-  if (cache[cached] !== undefined) {
-    return cache[cached] as boolean;
+  const entry = cacheFor(config);
+  let probePromise = entry[cached];
+  if (probePromise == null) {
+    probePromise = spawnLocalProcess(command, args, {
+      ...config,
+      timeoutMs: 5000,
+      sandbox: { enabled: false },
+    })
+      .then((result) => result != null && result.exitCode === 0)
+      .catch(() => false);
+    entry[cached] = probePromise;
   }
-  const result = await spawnLocalProcess(command, args, {
-    ...config,
-    timeoutMs: 5000,
-    sandbox: { enabled: false },
-  }).catch(() => undefined);
-  const ok = result != null && result.exitCode === 0;
-  cache[cached] = ok;
-  return ok;
+  return probePromise;
 }
 
 export function _resetSyntaxCheckProbeCacheForTests(): void {
-  cache.hasNode = undefined;
-  cache.hasPython = undefined;
-  cache.hasBash = undefined;
+  probeCacheByBackend = new WeakMap();
 }
 
 const jsCheck: SyntaxChecker = async (path, config) => {

@@ -749,6 +749,12 @@ export function createLocalGrepSearchTool(
       const maxResults = Math.max(input.max_results ?? DEFAULT_MAX_RESULTS, 1);
 
       if (await isRipgrepAvailable(config)) {
+        // Pass the pattern through `-e` so dash-prefixed patterns
+        // like `-foo` are treated as the search regex, not as a
+        // (probably-unknown) flag. `rg --help` explicitly requires
+        // `-e/--regexp` (or `--`) for that case. Same trick avoids
+        // any future flag-conflict if a user query happens to look
+        // like an rg long option.
         const args = [
           '--line-number',
           '--column',
@@ -756,6 +762,7 @@ export function createLocalGrepSearchTool(
           '--glob',
           '!.git/**',
           ...(input.glob != null && input.glob !== '' ? ['--glob', input.glob] : []),
+          '-e',
           input.pattern,
           target,
         ];
