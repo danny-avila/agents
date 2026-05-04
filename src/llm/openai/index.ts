@@ -1336,14 +1336,17 @@ export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
 }
 export class ChatDeepSeek extends OriginalChatDeepSeek {
   _lc_stream_delay?: number;
+  protected _claudeBackend?: boolean;
 
   constructor(
     fields?: ConstructorParameters<typeof OriginalChatDeepSeek>[0] & {
       _lc_stream_delay?: number;
+      claudeBackend?: boolean;
     }
   ) {
     super(fields);
     this._lc_stream_delay = fields?._lc_stream_delay;
+    this._claudeBackend = fields?.claudeBackend;
   }
 
   public get exposedClient(): CustomOpenAIClient {
@@ -1358,6 +1361,7 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
   ): OpenAICompletionParam[] {
     return _convertMessagesToOpenAIParams(messages, this.model, {
       includeReasoningContent: true,
+      claudeBackend: this._claudeBackend,
     });
   }
 
@@ -1369,7 +1373,9 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
     options.signal?.throwIfAborted();
     const params = this.invocationParams(options);
 
-    const normalized = flattenAnthropicThinkingForOpenAI(messages, this.model);
+    const normalized = flattenAnthropicThinkingForOpenAI(messages, this.model, {
+      claudeBackend: this._claudeBackend,
+    });
 
     if (params.stream === true) {
       return super._generate(normalized, options, runManager);
@@ -1463,7 +1469,9 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
   ): AsyncGenerator<ChatGenerationChunk> {
     yield* delayStreamChunks(
       this._streamResponseChunksWithReasoning(
-        flattenAnthropicThinkingForOpenAI(messages, this.model),
+        flattenAnthropicThinkingForOpenAI(messages, this.model, {
+          claudeBackend: this._claudeBackend,
+        }),
         options,
         runManager
       ),
@@ -1867,16 +1875,19 @@ export class ChatMoonshot extends ChatOpenAI {
 
 export class ChatXAI extends OriginalChatXAI {
   _lc_stream_delay?: number;
+  protected _claudeBackend?: boolean;
 
   constructor(
     fields?: Partial<ChatXAIInput> & {
       configuration?: { baseURL?: string };
       clientConfig?: { baseURL?: string };
       _lc_stream_delay?: number;
+      claudeBackend?: boolean;
     }
   ) {
     super(fields);
     this._lc_stream_delay = fields?._lc_stream_delay;
+    this._claudeBackend = fields?.claudeBackend;
     const customBaseURL =
       fields?.configuration?.baseURL ?? fields?.clientConfig?.baseURL;
     if (customBaseURL != null && customBaseURL) {
@@ -1932,7 +1943,9 @@ export class ChatXAI extends OriginalChatXAI {
     runManager?: CallbackManagerForLLMRun
   ): Promise<ChatResult> {
     return super._generate(
-      flattenAnthropicThinkingForOpenAI(messages, this.model),
+      flattenAnthropicThinkingForOpenAI(messages, this.model, {
+        claudeBackend: this._claudeBackend,
+      }),
       options,
       runManager
     );
@@ -1945,7 +1958,9 @@ export class ChatXAI extends OriginalChatXAI {
   ): AsyncGenerator<ChatGenerationChunk> {
     yield* delayStreamChunks(
       super._streamResponseChunks(
-        flattenAnthropicThinkingForOpenAI(messages, this.model),
+        flattenAnthropicThinkingForOpenAI(messages, this.model, {
+          claudeBackend: this._claudeBackend,
+        }),
         options,
         runManager
       ),
