@@ -62,6 +62,15 @@ export interface Source {
   date?: string;
 }
 
+export type TavilyTimeRange = 'day' | 'week' | 'month' | 'year';
+export type TavilyTimeRangeInput =
+  | TavilyTimeRange
+  | 'h'
+  | 'd'
+  | 'w'
+  | 'm'
+  | 'y';
+
 export interface TavilySearchOptions {
   searchDepth?: 'basic' | 'advanced' | 'fast' | 'ultra-fast';
   maxResults?: number;
@@ -71,12 +80,30 @@ export interface TavilySearchOptions {
   includeDomains?: string[];
   excludeDomains?: string[];
   topic?: 'general' | 'news' | 'finance';
-  timeRange?: 'day' | 'week' | 'month' | 'year' | 'd' | 'w' | 'm' | 'y';
+  timeRange?: TavilyTimeRangeInput;
   includeImageDescriptions?: boolean;
   includeFavicon?: boolean;
   chunksPerSource?: number;
   safeSearch?: boolean;
   timeout?: number;
+}
+
+export interface TavilySearchPayload {
+  query: string;
+  search_depth: NonNullable<TavilySearchOptions['searchDepth']>;
+  topic: NonNullable<TavilySearchOptions['topic']>;
+  max_results: number;
+  safe_search?: boolean;
+  time_range?: TavilyTimeRange;
+  country?: string;
+  include_images?: boolean;
+  include_answer?: NonNullable<TavilySearchOptions['includeAnswer']>;
+  include_raw_content?: NonNullable<TavilySearchOptions['includeRawContent']>;
+  include_domains?: string[];
+  exclude_domains?: string[];
+  include_image_descriptions?: boolean;
+  include_favicon?: boolean;
+  chunks_per_source?: number;
 }
 
 export interface SearchConfig {
@@ -183,9 +210,7 @@ export type SafeSearchLevel = 0 | 1 | 2;
 
 export type Logger = WinstonLogger;
 export interface SearchToolConfig
-  extends SearchConfig,
-    ProcessSourcesConfig,
-    FirecrawlConfig {
+  extends SearchConfig, ProcessSourcesConfig, FirecrawlConfig {
   tavilyScraperOptions?: TavilyScraperConfig;
   logger?: Logger;
   safeSearch?: SafeSearchLevel;
@@ -234,9 +259,7 @@ export interface BaseScraper {
   ): [string, undefined | References];
   extractMetadata(
     response: AnyScraperResponse
-  ):
-    | ScrapeMetadata
-    | Record<string, string | number | boolean | null | undefined>;
+  ): ScrapeMetadata | GenericScrapeMetadata;
 }
 
 /** Firecrawl */
@@ -253,6 +276,20 @@ export type SerperScrapeOptions = Omit<
 export type TavilyScrapeOptions = Omit<
   TavilyScraperConfig,
   'apiKey' | 'apiUrl' | 'logger'
+>;
+
+export interface TavilyExtractPayload {
+  urls: string[];
+  extract_depth: NonNullable<TavilyScraperConfig['extractDepth']>;
+  include_images: boolean;
+  include_favicon?: boolean;
+  format?: NonNullable<TavilyScraperConfig['format']>;
+  timeout?: number;
+}
+
+export type GenericScrapeMetadata = Record<
+  string,
+  string | number | boolean | null | undefined
 >;
 
 export interface ScrapeMetadata {

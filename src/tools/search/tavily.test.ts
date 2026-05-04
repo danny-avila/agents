@@ -1,8 +1,8 @@
 import axios from 'axios';
-import { createSearchAPI } from './search';
-import { TavilyScraper, createTavilyScraper } from './tavily-scraper';
-import { createSearchTool } from './tool';
 import type * as t from './types';
+import { TavilyScraper, createTavilyScraper } from './tavily-scraper';
+import { createSearchAPI } from './search';
+import { createSearchTool } from './tool';
 
 jest.mock('axios');
 const mockedAxios = axios as jest.Mocked<typeof axios>;
@@ -19,6 +19,44 @@ describe('Tavily search API', () => {
     jest.clearAllMocks();
   });
 
+  it('throws when Tavily API key is missing', () => {
+    expect(() =>
+      createSearchAPI({
+        searchProvider: 'tavily',
+        tavilyApiKey: '',
+      })
+    ).toThrow('TAVILY_API_KEY is required for Tavily API');
+  });
+
+  it('returns an error for empty Tavily search queries', async () => {
+    const searchAPI = createSearchAPI({
+      searchProvider: 'tavily',
+      tavilyApiKey: 'test-key',
+    });
+
+    const result = await searchAPI.getSources({ query: '   ' });
+
+    expect(result).toEqual({
+      success: false,
+      error: 'Query cannot be empty',
+    });
+    expect(mockedAxios.post).not.toHaveBeenCalled();
+  });
+
+  it('returns an error when the Tavily search request fails', async () => {
+    mockedAxios.post.mockRejectedValueOnce(new Error('Network error'));
+
+    const searchAPI = createSearchAPI({
+      searchProvider: 'tavily',
+      tavilyApiKey: 'test-key',
+    });
+
+    const result = await searchAPI.getSources({ query: 'example query' });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBe('Tavily API request failed: Network error');
+  });
+
   it('passes string-mode options and maps Tavily response fields', async () => {
     mockedAxios.post.mockResolvedValueOnce({
       data: {
@@ -27,6 +65,9 @@ describe('Tavily search API', () => {
           {
             url: 'https://example.com/image.png',
             description: 'Example image',
+          },
+          {
+            description: 'Skipped image',
           },
           'https://example.com/second.png',
         ],
@@ -50,6 +91,7 @@ describe('Tavily search API', () => {
         includeImages: true,
         includeImageDescriptions: true,
         safeSearch: true,
+        timeRange: 'd',
       },
     });
 
@@ -67,6 +109,7 @@ describe('Tavily search API', () => {
       include_raw_content: 'markdown',
       include_images: true,
       include_image_descriptions: true,
+      time_range: 'day',
     });
     expect(result.success).toBe(true);
     expect(result.data?.answerBox?.snippet).toBe('A concise answer.');
@@ -341,52 +384,88 @@ describe('TavilyScraper', () => {
       );
     });
 
-    it('uses TAVILY_EXTRACT_URL env var for apiUrl', () => {
+    it('uses TAVILY_EXTRACT_URL env var for apiUrl', async () => {
       const original = process.env.TAVILY_EXTRACT_URL;
-      process.env.TAVILY_EXTRACT_URL =
-        'https://custom-proxy.example.com/extract';
-      const scraper = new TavilyScraper({
-        apiKey: 'test-key',
-        logger: mockLogger,
-      });
-      expect(scraper['apiUrl']).toBe(
-        'https://custom-proxy.example.com/extract'
-      );
-      if (original !== undefined) {
-        process.env.TAVILY_EXTRACT_URL = original;
-      } else {
+      try {
+        process.env.TAVILY_EXTRACT_URL =
+          'https://custom-proxy.example.com/extract';
+        mockedAxios.post.mockResolvedValueOnce({
+          data: { results: [], failed_results: [] },
+        });
+        const scraper = new TavilyScraper({
+          apiKey: 'test-key',
+          logger: mockLogger,
+        });
+
+        await scraper.scrapeUrl('https://example.com');
+
+        expect(mockedAxios.post.mock.calls[0][0]).toBe(
+          'https://custom-proxy.example.com/extract'
+        );
+      } finally {
+        if (original !== undefined) {
+          process.env.TAVILY_EXTRACT_URL = original;
+        } else {
+          delete process.env.TAVILY_EXTRACT_URL;
+        }
+      }
+    });
+
+    it('defaults to https://api.tavily.com/extract', async () => {
+      const original = process.env.TAVILY_EXTRACT_URL;
+      try {
         delete process.env.TAVILY_EXTRACT_URL;
+        mockedAxios.post.mockResolvedValueOnce({
+          data: { results: [], failed_results: [] },
+        });
+        const scraper = new TavilyScraper({
+          apiKey: 'test-key',
+          logger: mockLogger,
+        });
+
+        await scraper.scrapeUrl('https://example.com');
+
+        expect(mockedAxios.post.mock.calls[0][0]).toBe(
+          'https://api.tavily.com/extract'
+        );
+      } finally {
+        if (original !== undefined) {
+          process.env.TAVILY_EXTRACT_URL = original;
+        }
       }
     });
 
-    it('defaults to https://api.tavily.com/extract', () => {
-      const original = process.env.TAVILY_EXTRACT_URL;
-      delete process.env.TAVILY_EXTRACT_URL;
+    it('defaults timeout to 15000ms', async () => {
+      mockedAxios.post.mockResolvedValueOnce({
+        data: { results: [], failed_results: [] },
+      });
       const scraper = new TavilyScraper({
         apiKey: 'test-key',
         logger: mockLogger,
       });
-      expect(scraper['apiUrl']).toBe('https://api.tavily.com/extract');
-      if (original !== undefined) {
-        process.env.TAVILY_EXTRACT_URL = original;
-      }
-    });
 
-    it('defaults timeout to 15000ms', () => {
-      const scraper = new TavilyScraper({
-        apiKey: 'test-key',
-        logger: mockLogger,
+      await scraper.scrapeUrl('https://example.com');
+
+      expect(mockedAxios.post.mock.calls[0][2]).toMatchObject({
+        timeout: 15000,
       });
-      expect(scraper['timeout']).toBe(15000);
     });
 
-    it('defaults advanced extraction timeout to 30000ms', () => {
+    it('defaults advanced extraction timeout to 30000ms', async () => {
+      mockedAxios.post.mockResolvedValueOnce({
+        data: { results: [], failed_results: [] },
+      });
       const scraper = new TavilyScraper({
         apiKey: 'test-key',
         extractDepth: 'advanced',
         logger: mockLogger,
       });
-      expect(scraper['timeout']).toBe(30000);
+
+      await scraper.scrapeUrl('https://example.com');
+
+      expect(mockedAxios.post.mock.calls[0][2]).toMatchObject({
+        timeout: 30000,
+      });
     });
   });
 
@@ -562,6 +641,33 @@ describe('TavilyScraper', () => {
       expect(url).toBe('https://example.com');
       expect(response.success).toBe(false);
       expect(response.error).toBe('Page is behind a paywall');
+    });
+
+    it('matches normalized URLs from Tavily Extract responses', async () => {
+      mockedAxios.post.mockResolvedValueOnce({
+        data: {
+          results: [
+            {
+              url: 'https://example.com/article',
+              raw_content: 'Content',
+              images: [],
+            },
+          ],
+          failed_results: [],
+        },
+      });
+
+      const scraper = createTavilyScraper({
+        apiKey: 'test-key',
+        logger: mockLogger,
+      });
+      const [url, response] = await scraper.scrapeUrl(
+        'https://example.com/article/'
+      );
+
+      expect(url).toBe('https://example.com/article/');
+      expect(response.success).toBe(true);
+      expect(response.data?.rawContent).toBe('Content');
     });
 
     it('returns descriptive error when URL not in results or failed_results', async () => {

@@ -7,7 +7,33 @@ const DEFAULT_ADVANCED_TIMEOUT = 30000;
 const MAX_BATCH_SIZE = 20;
 
 const getDefaultTimeout = (extractDepth: 'basic' | 'advanced'): number =>
-  extractDepth === 'advanced' ? DEFAULT_ADVANCED_TIMEOUT : DEFAULT_BASIC_TIMEOUT;
+  extractDepth === 'advanced'
+    ? DEFAULT_ADVANCED_TIMEOUT
+    : DEFAULT_BASIC_TIMEOUT;
+
+const normalizeUrlKey = (url: string): string => {
+  try {
+    const parsedUrl = new URL(url);
+    parsedUrl.hash = '';
+    if (parsedUrl.pathname.length > 1) {
+      parsedUrl.pathname = parsedUrl.pathname.replace(/\/+$/, '');
+    }
+    return parsedUrl.toString();
+  } catch {
+    return url;
+  }
+};
+
+const setUrlResult = (
+  map: Map<string, t.TavilyExtractResult>,
+  result: t.TavilyExtractResult
+): void => {
+  map.set(result.url, result);
+  const normalizedUrl = normalizeUrlKey(result.url);
+  if (!map.has(normalizedUrl)) {
+    map.set(normalizedUrl, result);
+  }
+};
 
 export class TavilyScraper implements t.BaseScraper {
   private apiKey: string;
@@ -67,9 +93,7 @@ export class TavilyScraper implements t.BaseScraper {
 
     for (const batch of batches) {
       const batchResults = await this.extractBatch(batch, options);
-      for (const entry of batchResults) {
-        allResults.push(entry);
-      }
+      allResults.push(...batchResults);
     }
 
     return allResults;
@@ -83,7 +107,7 @@ export class TavilyScraper implements t.BaseScraper {
       const includeFavicon = options.includeFavicon ?? this.includeFavicon;
       const format = options.format ?? this.format;
       const extractDepth = options.extractDepth ?? this.extractDepth;
-      const payload: Record<string, unknown> = {
+      const payload: t.TavilyExtractPayload = {
         urls,
         extract_depth: extractDepth,
         include_images: options.includeImages ?? this.includeImages,
@@ -107,7 +131,10 @@ export class TavilyScraper implements t.BaseScraper {
         payload.timeout = Math.min(Math.max(payloadTimeout / 1000, 1), 60);
       }
 
-      const response = await axios.post(this.apiUrl, payload, {
+      const response = await axios.post<{
+        results?: t.TavilyExtractResult[];
+        failed_results?: t.TavilyExtractResult[];
+      }>(this.apiUrl, payload, {
         headers: {
           Authorization: `Bearer ${this.apiKey}`,
           'Content-Type': 'application/json',
@@ -120,14 +147,15 @@ export class TavilyScraper implements t.BaseScraper {
       const failedMap = new Map<string, t.TavilyExtractResult>();
 
       for (const result of data.results ?? []) {
-        successMap.set(result.url, result);
+        setUrlResult(successMap, result);
       }
       for (const result of data.failed_results ?? []) {
-        failedMap.set(result.url, result);
+        setUrlResult(failedMap, result);
       }
 
       return urls.map((url): [string, t.TavilyScrapeResponse] => {
-        const success = successMap.get(url);
+        const success =
+          successMap.get(url) ?? successMap.get(normalizeUrlKey(url));
         if (success && success.error == null) {
           return [
             url,
@@ -142,7 +170,8 @@ export class TavilyScraper implements t.BaseScraper {
           ];
         }
 
-        const failed = failedMap.get(url);
+        const failed =
+          failedMap.get(url) ?? failedMap.get(normalizeUrlKey(url));
         const error =
           success?.error ??
           failed?.error ??
