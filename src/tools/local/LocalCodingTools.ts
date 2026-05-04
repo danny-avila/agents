@@ -20,6 +20,7 @@ import {
 import { createLocalFileCheckpointer } from './FileCheckpointer';
 import { applyEdit, locateEdit } from './editStrategies';
 import { decodeFile, encodeFile } from './textEncoding';
+import { classifyAttachment, imageAttachmentContent } from './attachments';
 import { Constants } from '@/common';
 
 const MAX_READ_CHARS = 256000;
@@ -250,6 +251,8 @@ async function looksBinary(path: string): Promise<boolean> {
   }
 }
 
+const DEFAULT_MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024;
+
 export function createLocalReadFileTool(
   config: t.LocalExecutionConfig = {}
 ): DynamicStructuredTool {
@@ -273,12 +276,79 @@ export function createLocalReadFileTool(
         const stub = `File is ${fileStat.size} bytes, exceeds the ${maxBytes}-byte read cap. Read a slice via bash (e.g. head/sed) or raise local.maxReadBytes.`;
         return [stub, { path, bytes: fileStat.size, truncated: true }];
       }
+
       if (await looksBinary(path)) {
-        return [
-          `Refusing to read binary file (${fileStat.size} bytes): ${path}`,
-          { path, bytes: fileStat.size, binary: true },
-        ];
+        const attachmentMode = config.attachReadAttachments ?? 'off';
+        if (attachmentMode !== 'off') {
+          const attachment = await classifyAttachment({
+            path,
+            bytes: fileStat.size,
+            mode: attachmentMode,
+            maxBytes:
+              config.maxAttachmentBytes ?? DEFAULT_MAX_ATTACHMENT_BYTES,
+          });
+          if (attachment.kind === 'image') {
+            return [
+              imageAttachmentContent(path, attachment),
+              {
+                path,
+                bytes: fileStat.size,
+                mime: attachment.mime,
+                attachment: 'image',
+              },
+            ];
+          }
+          if (attachment.kind === 'pdf') {
+            return [
+              [
+                {
+                  type: 'text',
+                  text: `Read ${path} (application/pdf, ${fileStat.size} bytes). PDF attached as base64 data URL; vision-capable models that accept PDF will render it.`,
+                },
+                {
+                  type: 'image_url',
+                  image_url: { url: attachment.dataUrl },
+                },
+              ],
+              {
+                path,
+                bytes: fileStat.size,
+                mime: attachment.mime,
+                attachment: 'pdf',
+              },
+            ];
+          }
+          if (attachment.kind === 'oversize') {
+            return [
+              `Refusing to embed ${attachment.mime} attachment (${attachment.bytes} bytes exceeds ${attachment.maxBytes}-byte cap).`,
+              {
+                path,
+                bytes: fileStat.size,
+                mime: attachment.mime,
+                attachment: 'oversize',
+              },
+            ];
+          }
+          if (attachment.kind === 'binary') {
+            return [
+              `Refusing to read binary file (${fileStat.size} bytes, ${attachment.mime}): ${path}`,
+              {
+                path,
+                bytes: fileStat.size,
+                mime: attachment.mime,
+                binary: true,
+              },
+            ];
+          }
+          // text-or-unknown falls through to the text-read path below.
+        } else {
+          return [
+            `Refusing to read binary file (${fileStat.size} bytes): ${path}`,
+            { path, bytes: fileStat.size, binary: true },
+          ];
+        }
       }
+
       const content = await readFile(path, 'utf8');
       const result = lineWindow(content, input.offset, input.limit);
       return [
@@ -289,7 +359,9 @@ export function createLocalReadFileTool(
     {
       name: Constants.READ_FILE,
       description:
-        'Read a local text file from the configured working directory with line numbers.',
+        'Read a local text file from the configured working directory with line numbers. ' +
+        'When `attachReadAttachments` is enabled (e.g. images-only), reading an image returns an ' +
+        '`image_url` content block so vision-capable models can see the file directly.',
       schema: LocalReadFileToolSchema,
       responseFormat: Constants.CONTENT_AND_ARTIFACT,
     }

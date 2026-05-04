@@ -482,6 +482,94 @@ describe('local edit fuzzy matching', () => {
   });
 });
 
+describe('local read attachments', () => {
+  // Smallest valid 1x1 PNG.
+  const tinyPng = Buffer.from(
+    '89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000a49444154789c63000100000005000165be7e6e0000000049454e44ae426082',
+    'hex'
+  );
+
+  it('returns binary stub by default', async () => {
+    const cwd = await createTempDir();
+    const file = join(cwd, 'tiny.png');
+    await fsWriteFile(file, tinyPng);
+    const bundle = createLocalCodingToolBundle({ cwd });
+    const readTool = bundle.tools.find((tt) => tt.name === Constants.READ_FILE);
+    const result = await readTool!.invoke({ file_path: 'tiny.png' });
+    expect(String(result)).toContain('binary file');
+  });
+
+  it('returns an image_url content block when attachReadAttachments=images-only', async () => {
+    const cwd = await createTempDir();
+    const file = join(cwd, 'tiny.png');
+    await fsWriteFile(file, tinyPng);
+
+    const bundle = createLocalCodingToolBundle({
+      cwd,
+      attachReadAttachments: 'images-only',
+    });
+    const readTool = bundle.tools.find((tt) => tt.name === Constants.READ_FILE);
+    // Invoking via a tool_call envelope (rather than raw args) is what
+    // makes the LangChain tool wrap the result as a ToolMessage with
+    // `.content` and `.artifact` populated.
+    const message = (await readTool!.invoke({
+      id: 'call_image',
+      name: Constants.READ_FILE,
+      args: { file_path: 'tiny.png' },
+      type: 'tool_call',
+    })) as { content: unknown; artifact: unknown };
+    expect(Array.isArray(message.content)).toBe(true);
+    const blocks = message.content as Array<{
+      type: string;
+      image_url?: { url: string };
+    }>;
+    const imageBlock = blocks.find((b) => b.type === 'image_url');
+    expect(imageBlock?.image_url?.url).toMatch(/^data:image\/png;base64,/);
+    expect(blocks.find((b) => b.type === 'text')).toBeDefined();
+    expect(message.artifact).toMatchObject({
+      mime: 'image/png',
+      attachment: 'image',
+    });
+  });
+
+  it('refuses oversize images even when embedding is on', async () => {
+    const cwd = await createTempDir();
+    const file = join(cwd, 'big.png');
+    // Forge a "PNG" larger than the cap. It will sniff as a generic
+    // binary; classifyAttachment returns 'binary' since file-type
+    // won't recognise the bytes — that's fine, we just want to
+    // verify the oversize gate is reachable. So instead, build a
+    // real big PNG by concatenating chunks with a fake IDAT.
+    // Easier: keep the tiny PNG header but pad to 200 bytes; cap to 100.
+    const padded = Buffer.concat([
+      tinyPng,
+      Buffer.alloc(200 - tinyPng.length, 0),
+    ]);
+    await fsWriteFile(file, padded);
+    const bundle = createLocalCodingToolBundle({
+      cwd,
+      attachReadAttachments: 'images-only',
+      maxAttachmentBytes: 100,
+    });
+    const readTool = bundle.tools.find((tt) => tt.name === Constants.READ_FILE);
+    const result = await readTool!.invoke({ file_path: 'big.png' });
+    expect(String(result)).toMatch(/Refusing to embed/);
+  });
+
+  it('still reads text files normally when embedding is on', async () => {
+    const cwd = await createTempDir();
+    const file = join(cwd, 'a.txt');
+    await fsWriteFile(file, 'hello world\n', 'utf8');
+    const bundle = createLocalCodingToolBundle({
+      cwd,
+      attachReadAttachments: 'images-only',
+    });
+    const readTool = bundle.tools.find((tt) => tt.name === Constants.READ_FILE);
+    const result = await readTool!.invoke({ file_path: 'a.txt' });
+    expect(String(result)).toContain('hello world');
+  });
+});
+
 describe('local search fallback', () => {
   beforeEach(() => {
     _resetRipgrepCacheForTests();

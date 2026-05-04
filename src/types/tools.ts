@@ -456,6 +456,27 @@ export type LocalExecutionConfig = {
    * Defaults to 10 MiB.
    */
   maxReadBytes?: number;
+  /**
+   * Controls whether `read_file` returns binary files as inline
+   * `MessageContentComplex[]` attachments (so vision-capable models
+   * see them) or as a textual stub.
+   *
+   *   - `'off'`        : never embed; current binary-stub behavior.
+   *   - `'images-only'`: embed images (png/jpeg/gif/webp) as
+   *     `image_url` blocks; other binaries get the stub.
+   *   - `'images-and-pdf'` : also embed PDFs as `image_url` data URLs
+   *     (Anthropic accepts these in tool_result; other providers may
+   *     degrade to JSON).
+   *
+   * Defaults to `'off'` to preserve current behavior.
+   */
+  attachReadAttachments?: 'off' | 'images-only' | 'images-and-pdf';
+  /**
+   * Maximum pre-encoding byte size to embed inline. Anything larger
+   * degrades to an `<oversize>` stub. Defaults to 5 MiB to bound the
+   * post-base64 token cost.
+   */
+  maxAttachmentBytes?: number;
 };
 
 export type ToolExecutionConfig = {
