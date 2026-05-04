@@ -29,11 +29,18 @@ export const fileExtRegex =
 
 export const getDomainName = (
   link: string,
-  metadata?: t.ScrapeMetadata,
+  metadata?: t.ScrapeMetadata | t.GenericScrapeMetadata,
   logger?: t.Logger
 ): string | undefined => {
   try {
-    const url = metadata?.sourceURL ?? metadata?.url ?? (link || '');
+    const sourceUrl = metadata?.sourceURL;
+    const metadataUrl = metadata?.url;
+    const url =
+      typeof sourceUrl === 'string'
+        ? sourceUrl
+        : typeof metadataUrl === 'string'
+          ? metadataUrl
+          : link || '';
     const domain = new URL(url).hostname.replace(/^www\./, '');
     if (domain) {
       return domain;
@@ -52,7 +59,7 @@ export const getDomainName = (
 
 export function getAttribution(
   link: string,
-  metadata?: t.ScrapeMetadata,
+  metadata?: t.ScrapeMetadata | t.GenericScrapeMetadata,
   logger?: t.Logger
 ): string | undefined {
   if (!metadata) return getDomainName(link, metadata, logger);
@@ -60,16 +67,17 @@ export function getAttribution(
   const twitterSite = metadata['twitter:site'];
   const twitterSiteFormatted =
     typeof twitterSite === 'string' ? twitterSite.replace(/^@/, '') : undefined;
+  const title = metadata.title;
 
   const possibleAttributions = [
     metadata.ogSiteName,
     metadata['og:site_name'],
-    metadata.title?.split('|').pop()?.trim(),
+    typeof title === 'string' ? title.split('|').pop()?.trim() : undefined,
     twitterSiteFormatted,
   ];
 
   const attribution = possibleAttributions.find(
-    (attr) => attr != null && typeof attr === 'string' && attr.trim() !== ''
+    (attr): attr is string => typeof attr === 'string' && attr.trim() !== ''
   );
   if (attribution != null) {
     return attribution;
