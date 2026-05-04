@@ -128,6 +128,18 @@ type OpenAIChatCompletionStreamItem =
       event: string;
       data?: unknown;
     };
+type OpenAIChatCompletionRequest =
+  | OpenAIClient.Chat.ChatCompletionCreateParamsStreaming
+  | OpenAIClient.Chat.ChatCompletionCreateParamsNonStreaming;
+type OpenAIChatCompletionResult =
+  | AsyncIterable<OpenAIChatCompletionChunk>
+  | OpenAIChatCompletion;
+type OpenAIChatCompletionRetry = (
+  request: OpenAIChatCompletionRequest,
+  requestOptions?: OpenAICoreRequestOptions
+) => Promise<
+  AsyncIterable<OpenAIChatCompletionStreamItem> | OpenAIChatCompletion
+>;
 
 function getExposedOpenAIClient(
   completions: OpenAIClientDelegate,
@@ -199,6 +211,7 @@ function isOpenAIChatCompletionChunk(
     return false;
   }
 
+  // Intentionally loose: downstream handlers already tolerate empty choices.
   const { choices } = value as { choices?: unknown };
   return Array.isArray(choices);
 }
@@ -228,6 +241,24 @@ async function* filterOpenAIChatCompletionStream(
     }
     yield chunk;
   }
+}
+
+async function completionWithFilteredOpenAIStream(
+  request: OpenAIChatCompletionRequest,
+  requestOptions: OpenAICoreRequestOptions | undefined,
+  completionWithRetry: OpenAIChatCompletionRetry
+): Promise<OpenAIChatCompletionResult> {
+  if (request.stream !== true) {
+    return (await completionWithRetry(
+      request,
+      requestOptions
+    )) as OpenAIChatCompletion;
+  }
+
+  const stream = await completionWithRetry(request, requestOptions);
+  return filterOpenAIChatCompletionStream(
+    stream as AsyncIterable<OpenAIChatCompletionStreamItem>
+  );
 }
 
 function attachLibreChatDeltaFields(
@@ -471,12 +502,11 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
       | OpenAIClient.Chat.ChatCompletionCreateParamsNonStreaming,
     requestOptions?: OpenAICoreRequestOptions
   ): Promise<AsyncIterable<OpenAIChatCompletionChunk> | OpenAIChatCompletion> {
-    if (request.stream === true) {
-      const stream = await super.completionWithRetry(request, requestOptions);
-      return filterOpenAIChatCompletionStream(stream);
-    }
-
-    return super.completionWithRetry(request, requestOptions);
+    return completionWithFilteredOpenAIStream(
+      request,
+      requestOptions,
+      super.completionWithRetry.bind(this) as OpenAIChatCompletionRetry
+    );
   }
 
   protected _convertCompletionsDeltaToBaseMessageChunk(
@@ -917,12 +947,11 @@ class LibreChatAzureOpenAICompletions extends OriginalAzureChatOpenAICompletions
       | OpenAIClient.Chat.ChatCompletionCreateParamsNonStreaming,
     requestOptions?: OpenAICoreRequestOptions
   ): Promise<AsyncIterable<OpenAIChatCompletionChunk> | OpenAIChatCompletion> {
-    if (request.stream === true) {
-      const stream = await super.completionWithRetry(request, requestOptions);
-      return filterOpenAIChatCompletionStream(stream);
-    }
-
-    return super.completionWithRetry(request, requestOptions);
+    return completionWithFilteredOpenAIStream(
+      request,
+      requestOptions,
+      super.completionWithRetry.bind(this) as OpenAIChatCompletionRetry
+    );
   }
 }
 

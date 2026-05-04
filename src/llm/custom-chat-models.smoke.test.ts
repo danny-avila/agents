@@ -118,6 +118,7 @@ type OpenRouterReasoningStreamChoice = Omit<
 > & {
   delta: OpenRouterReasoningStreamDelta;
 };
+type OpenAIStreamModel = ChatOpenAI | AzureChatOpenAI;
 
 const baseAzureFields = {
   azureOpenAIApiKey: 'test-azure-key',
@@ -133,6 +134,83 @@ const baseBedrockFields = {
     secretAccessKey: 'test-secret-key',
   },
 };
+
+const createOpenAIStreamChunk = (
+  content: string,
+  finishReason: OpenAIClient.Chat.Completions.ChatCompletionChunk.Choice['finish_reason'] = null
+): OpenAIClient.Chat.Completions.ChatCompletionChunk => ({
+  id: 'chatcmpl-hermes-test',
+  object: 'chat.completion.chunk',
+  created: 0,
+  model: 'hermes-agent',
+  choices: [
+    {
+      index: 0,
+      delta: { content },
+      finish_reason: finishReason,
+    },
+  ],
+});
+
+async function* createOpenAIStreamWithCustomEvents(): AsyncGenerator<OpenAIStreamItem> {
+  yield createOpenAIStreamChunk('Hello ');
+  yield {
+    event: 'hermes.tool.progress',
+    data: {
+      tool: 'execute_code',
+      toolCallId: 'call_1',
+      status: 'running',
+    },
+  };
+  yield {
+    event: 'hermes.tool.progress',
+    data: null,
+  };
+  yield {
+    event: 'message',
+    data: createOpenAIStreamChunk('world', 'stop'),
+  };
+}
+
+function mockCompletionStream(
+  model: OpenAIStreamModel
+): MockableCompletionCreate {
+  const completions = (
+    model as unknown as { completions: MockableCompletionDelegate }
+  ).completions;
+  completions._getClientOptions(undefined);
+  const client = completions.client;
+  if (client == null) {
+    throw new Error('Expected OpenAI completions client');
+  }
+
+  const createMock = jest.fn(async () =>
+    createOpenAIStreamWithCustomEvents()
+  ) as MockableCompletionCreate;
+  client.chat.completions.create = createMock;
+  return createMock;
+}
+
+async function expectCustomSSEEventsSkipped(
+  model: OpenAIStreamModel
+): Promise<void> {
+  const createMock = mockCompletionStream(model);
+  const chunks: AIMessageChunk[] = [];
+  const stream = await model.stream([new HumanMessage('use a tool')]);
+  for await (const chunk of stream) {
+    chunks.push(chunk);
+  }
+
+  const text = chunks
+    .map((chunk) => (typeof chunk.content === 'string' ? chunk.content : ''))
+    .join('');
+  expect(chunks).toHaveLength(2);
+  expect(text).toBe('Hello world');
+  expect(createMock).toHaveBeenCalledWith(
+    expect.objectContaining({ stream: true }),
+    expect.any(Object)
+  );
+}
 
 describe('custom chat model class smoke tests', () => {
   it('keeps the custom OpenAI client, stream delay, and reasoning precedence', () => {
@@ -277,71 +355,21 @@ describe('custom chat model class smoke tests', () => {
     expect(xaiRequestOptions.baseURL).toBe('https://xai.test/v1');
   });
 
-  it('skips custom OpenAI-compatible SSE events during streaming', async () => {
-    const model = new ChatOpenAI({
-      model: 'hermes-agent',
-      apiKey: 'test-key',
-      streaming: true,
-    });
-    const completions = (
-      model as unknown as { completions: MockableCompletionDelegate }
-    ).completions;
-    completions._getClientOptions(undefined);
-    const client = completions.client;
-    if (client == null) {
-      throw new Error('Expected OpenAI completions client');
-    }
+  it('skips custom OpenAI-compatible SSE events during OpenAI streaming', async () => {
+    await expectCustomSSEEventsSkipped(
+      new ChatOpenAI({
+        model: 'hermes-agent',
+        apiKey: 'test-key',
+        streaming: true,
+      })
+    );
+  });
 
-    const createChunk = (
-      content: string,
-      finishReason: OpenAIClient.Chat.Completions.ChatCompletionChunk.Choice['finish_reason'] = null
-    ): OpenAIClient.Chat.Completions.ChatCompletionChunk => ({
-      id: 'chatcmpl-hermes-test',
-      object: 'chat.completion.chunk',
-      created: 0,
-      model: 'hermes-agent',
-      choices: [
-        {
-          index: 0,
-          delta: { content },
-          finish_reason: finishReason,
-        },
-      ],
-    });
-    async function* streamChunks(): AsyncGenerator<OpenAIStreamItem> {
-      yield createChunk('Hello ');
-      yield {
-        event: 'hermes.tool.progress',
-        data: {
-          tool: 'execute_code',
-          toolCallId: 'call_1',
-          status: 'running',
-        },
-      };
-      yield {
-        event: 'message',
-        data: createChunk('world', 'stop'),
-      };
-    }
-
-    const createMock = jest.fn(async () =>
-      streamChunks()
-    ) as MockableCompletionCreate;
-    client.chat.completions.create = createMock;
-
-    const chunks: AIMessageChunk[] = [];
-    const stream = await model.stream([new HumanMessage('use a tool')]);
-    for await (const chunk of stream) {
-      chunks.push(chunk);
-    }
-
-    const text = chunks
-      .map((chunk) => (typeof chunk.content === 'string' ? chunk.content : ''))
-      .join('');
-    expect(text).toBe('Hello world');
-    expect(createMock).toHaveBeenCalledWith(
-      expect.objectContaining({ stream: true }),
-      expect.any(Object)
+  it('skips custom OpenAI-compatible SSE events during Azure streaming', async () => {
+    await expectCustomSSEEventsSkipped(
+      new AzureChatOpenAI({
+        ...baseAzureFields,
+      })
     );
   });
 
