@@ -213,17 +213,12 @@ export class TavilyScraper implements t.BaseScraper {
     return [content, references];
   }
 
-  extractMetadata(
-    response: t.TavilyScrapeResponse
-  ): Record<string, string | number | boolean | null | undefined> {
+  extractMetadata(response: t.TavilyScrapeResponse): t.GenericScrapeMetadata {
     if (!response.success || !response.data) {
       return {};
     }
 
-    const metadata: Record<
-      string,
-      string | number | boolean | null | undefined
-    > = {
+    const metadata: t.GenericScrapeMetadata = {
       images_count: response.data.images?.length ?? 0,
     };
     if (response.data.favicon != null) {
