@@ -2272,6 +2272,114 @@ describe('comprehensive review (round 14) — Codex P1 #37 + P2 #38/#40/#41', ()
     });
   });
 
+  describe('bash args validated against destructive-target patterns (Codex P1 [45])', () => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { executeLocalBashWithArgs } = require('../local/LocalExecutionEngine');
+
+    it('blocks `rm -rf "$1"` + args=["/"]', async () => {
+      await expect(
+        executeLocalBashWithArgs('rm -rf "$1"', ['/'], {
+          sandbox: { enabled: false },
+          timeoutMs: 5000,
+        })
+      ).rejects.toThrow(/destructive command pattern.*protected target/i);
+    });
+
+    it('blocks `chmod -R 777 "$1"` + args=["~/"]', async () => {
+      await expect(
+        executeLocalBashWithArgs('chmod -R 777 "$1"', ['~/'], {
+          sandbox: { enabled: false },
+          timeoutMs: 5000,
+        })
+      ).rejects.toThrow(/destructive command pattern.*protected target/i);
+    });
+
+    it('blocks `rm -rf "$@"` + args=["$HOME"]', async () => {
+      await expect(
+        executeLocalBashWithArgs('rm -rf "$@"', ['$HOME'], {
+          sandbox: { enabled: false },
+          timeoutMs: 5000,
+        })
+      ).rejects.toThrow(/destructive command pattern.*protected target/i);
+    });
+
+    it('allows benign positional arg use (echo + protected-shape arg)', async () => {
+      // `echo` is not in the destructive-op set so a "/" arg is fine.
+      const result = await executeLocalBashWithArgs('echo "$1"', ['/'], {
+        sandbox: { enabled: false },
+        timeoutMs: 5000,
+      });
+      expect(result.exitCode).toBe(0);
+    });
+
+    it('allows destructive op with non-protected args', async () => {
+      // `rm` of a clearly non-protected path inside a tmpdir is fine.
+      const cwd = await createTempDir();
+      const fsp = await import('fs/promises');
+      const f = join(cwd, 'goner.txt');
+      await fsp.writeFile(f, 'bye\n');
+      const result = await executeLocalBashWithArgs('rm -f "$1"', [f], {
+        cwd,
+        sandbox: { enabled: false },
+        timeoutMs: 5000,
+      });
+      expect(result.exitCode).toBe(0);
+    });
+  });
+
+  describe('direct-path additionalContext is marked as system metadata (Codex P2 [46])', () => {
+    it('attaches `additional_kwargs.role: "system"` to the materialized HumanMessage', async () => {
+      const { tool } = await import('@langchain/core/tools');
+      const { z } = await import('zod');
+      const { HookRegistry } = await import('@/hooks');
+      const { HumanMessage, AIMessage } = await import(
+        '@langchain/core/messages'
+      );
+
+      const echo = tool(async () => 'OK', {
+        name: 'echo',
+        description: 'noop',
+        schema: z.object({}).passthrough(),
+      });
+      const registry = new HookRegistry();
+      registry.register('PreToolUse', {
+        hooks: [
+          async () => ({
+            decision: 'allow',
+            additionalContext: 'POLICY: be careful',
+          }),
+        ],
+      });
+      const node = new ToolNode({
+        tools: [echo],
+        eventDrivenMode: true,
+        hookRegistry: registry,
+        directToolNames: new Set(['echo']),
+      });
+      const ai = new AIMessage({
+        content: '',
+        tool_calls: [{ id: 'c46', name: 'echo', args: {} }],
+      });
+      const result = (await node.invoke({ messages: [ai] })) as
+        | { messages: BaseMessage[] }
+        | BaseMessage[];
+      const messages = Array.isArray(result) ? result : result.messages;
+      const human = messages.find(
+        (m): m is InstanceType<typeof HumanMessage> =>
+          m instanceof HumanMessage &&
+          typeof m.content === 'string' &&
+          m.content.includes('POLICY')
+      );
+      expect(human).toBeDefined();
+      // The marker the event-driven path sets — direct path now
+      // matches it.
+      expect(human?.additional_kwargs).toMatchObject({
+        role: 'system',
+        source: 'hook',
+      });
+    });
+  });
+
   describe('resolveWorkspacePathSafe routes through WorkspaceFS.realpath (Codex P2 #38)', () => {
     it('honors a custom workspace fs realpath impl', async () => {
       // eslint-disable-next-line @typescript-eslint/no-require-imports

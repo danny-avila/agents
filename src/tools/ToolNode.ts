@@ -2692,6 +2692,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             sendOutput,
             new HumanMessage({
               content: directAdditionalContexts.join('\n\n'),
+              // Match the event-driven path's marker so hosts /
+              // model-side annotators treat this as system intent
+              // rather than ordinary user text. Codex P2 [46].
+              additional_kwargs: { role: 'system', source: 'hook' },
             }),
           ]
           : [sendOutput];
@@ -2875,7 +2879,16 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
         const directInjected: BaseMessage[] =
           directAdditionalContexts.length > 0
-            ? [new HumanMessage({ content: directAdditionalContexts.join('\n\n') })]
+            ? [
+              new HumanMessage({
+                content: directAdditionalContexts.join('\n\n'),
+                // System-role metadata to match the event-driven
+                // path so policy/recovery guidance is treated
+                // consistently regardless of whether the tool ran
+                // direct or dispatched. Codex P2 [46].
+                additional_kwargs: { role: 'system', source: 'hook' },
+              }),
+            ]
             : [];
         outputs = [
           ...directOutputs,
@@ -2917,6 +2930,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               ...toolOutputs,
               new HumanMessage({
                 content: directAdditionalContexts.join('\n\n'),
+                // Same system-role marker the event-driven path
+                // uses so direct vs dispatched is invisible to
+                // downstream consumers. Codex P2 [46].
+                additional_kwargs: { role: 'system', source: 'hook' },
               }),
             ]
             : toolOutputs;

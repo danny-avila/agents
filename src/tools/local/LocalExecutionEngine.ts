@@ -915,6 +915,28 @@ export async function executeLocalBash(
  * `bash_tool` factory so the schema's `args` contract works
  * identically in both surfaces.
  */
+/**
+ * Matches a single arg that, on its own, references a protected
+ * location (`/`, `~`, `$HOME`, `${HOME}`, `.`, with optional trailing
+ * slash or glob suffix). Used to spot the
+ * `command: 'rm -rf "$1"', args: ['/']` shape where the destructive
+ * target is moved into a positional arg to evade the command regex.
+ * Codex P1 [45].
+ */
+const PROTECTED_TARGET_ARG_RE =
+  /^(?:\/|~|\$\{?HOME\}?|\.)(?:\/?\*|\/)?$/;
+
+/**
+ * Mutating-op recognizer for the args check. Conservative: only the
+ * three operations the destructive-command guard already covers
+ * directly (`rm -rf …`, `chmod -R …`, `chown -R …`). Other shell
+ * builtins might mutate state (`mv`, `cp` over an existing file,
+ * etc.) but the destructive guard doesn't try to catch those today,
+ * so we don't widen here either.
+ */
+const DESTRUCTIVE_OP_IN_COMMAND_RE =
+  /\b(?:rm\s+-[^\s]*[rf]|chmod\s+-R|chown\s+-R)\b/;
+
 export async function executeLocalBashWithArgs(
   command: string,
   args: readonly string[],
@@ -923,6 +945,25 @@ export async function executeLocalBashWithArgs(
   const validation = await validateBashCommand(command, config);
   if (!validation.valid) {
     throw new Error(validation.errors.join('\n'));
+  }
+  // Per-arg protected-target check (Codex P1 [45]). The command
+  // regex can't see `$1`/`$@` substitutions at runtime — `command:
+  // 'rm -rf "$1"', args: ['/']` would expand to `rm -rf '/'` inside
+  // bash but the validator only saw `rm -rf "$1"` (no destructive
+  // target). Block when (a) the command contains a destructive op
+  // AND (b) at least one arg matches the protected-target shape.
+  // Skipped when allowDangerousCommands is true (host-opted-in).
+  if (
+    args.length > 0 &&
+    config.allowDangerousCommands !== true &&
+    DESTRUCTIVE_OP_IN_COMMAND_RE.test(command)
+  ) {
+    const offending = args.find((a) => PROTECTED_TARGET_ARG_RE.test(a));
+    if (offending !== undefined) {
+      throw new Error(
+        `Command matches a destructive command pattern (protected target "${offending}" passed via positional arg).`
+      );
+    }
   }
   const shell = config.shell ?? DEFAULT_SHELL;
   return spawnLocalProcess(
