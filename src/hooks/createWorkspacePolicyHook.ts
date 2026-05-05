@@ -125,8 +125,15 @@ const WRITE_TOOLS = new Set<string>([
  *     visible at extract time. Hosts that need bulletproof gating
  *     should pair this with a `bash_tool`-level policy.
  */
+// `["']?` slots before AND after the captured path cover quoted
+// forms like `cat "/etc/passwd"` and `--out='/tmp/x'`. Codex P1 #31
+// — the previous regex only matched unquoted tokens, so a model
+// could trivially bypass the workspace policy by quoting any
+// destination path. The path content character class still excludes
+// quotes/whitespace/shell-specials so we don't over-extract; that's
+// the defensive trade we want for fallback-grep style matching.
 const ABSOLUTE_PATH_TOKEN =
-  /(?:^|[\s=])(?:--[^\s=]+=)?(\/[^\s'"|;&<>()`]+|~\/[^\s'"|;&<>()`]+|\$\{?HOME\}?\/[^\s'"|;&<>()`]+)/g;
+  /(?:^|[\s=])(?:--[^\s=]+=)?["']?(\/[^\s'"|;&<>()`]+|~\/[^\s'"|;&<>()`]+|\$\{?HOME\}?\/[^\s'"|;&<>()`]+)["']?/g;
 function expandHomeRelative(token: string): string {
   // Expand ~/foo and $HOME/foo and ${HOME}/foo to absolute. The
   // workspace boundary check resolves non-absolute paths against the

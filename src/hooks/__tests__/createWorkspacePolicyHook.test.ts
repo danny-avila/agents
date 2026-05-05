@@ -309,5 +309,44 @@ describe('createWorkspacePolicyHook', () => {
       );
       expect(out.decision).toBe('allow');
     });
+
+    it('extracts paths wrapped in double quotes (Codex P1 #31)', async () => {
+      const hook = createWorkspacePolicyHook({
+        root: workspace,
+        outsideRead: 'deny',
+      });
+      const out = await call(
+        hook,
+        makeInput('compile_check', { command: 'cat "/etc/passwd"' })
+      );
+      expect(out.decision).toBe('deny');
+      expect(out.reason).toContain('/etc/passwd');
+    });
+
+    it('extracts paths wrapped in single quotes (Codex P1 #31)', async () => {
+      const hook = createWorkspacePolicyHook({
+        root: workspace,
+        outsideRead: 'deny',
+      });
+      const out = await call(
+        hook,
+        makeInput('compile_check', { command: 'cat \'/etc/passwd\'' })
+      );
+      expect(out.decision).toBe('deny');
+      expect(out.reason).toContain('/etc/passwd');
+    });
+
+    it('extracts quoted --flag="/path" tokens (Codex P1 #31)', async () => {
+      const hook = createWorkspacePolicyHook({
+        root: workspace,
+        outsideRead: 'deny',
+      });
+      const out = await call(
+        hook,
+        makeInput('compile_check', { command: 'tsc --out="/tmp/x"' })
+      );
+      expect(out.decision).toBe('deny');
+      expect(out.reason).toContain('/tmp/x');
+    });
   });
 });

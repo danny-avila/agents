@@ -296,6 +296,17 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private toolUsageCount: Map<string, number>;
   /** Maps toolCallId → turn captured in runTool, used by handleRunToolCompletions */
   private toolCallTurns: Map<string, number> = new Map();
+  /**
+   * `call.id → turn` map dedicated to the direct-path lifecycle so the
+   * turn assigned on first entry is REUSED on LangGraph resume.
+   * Distinct from `toolCallTurns` (which is cleared at the start of
+   * every `run()` to keep per-batch event-dispatch metadata fresh) —
+   * the direct path needs stability across re-entries triggered by
+   * `interrupt()` resumes (Codex P2 #30). Cleared with the rest of
+   * the per-Run state in `clearHeavyState`-equivalent flushes when
+   * the Run ends.
+   */
+  private directPathTurns: Map<string, number> = new Map();
   /** Tool registry for filtering (lazy computation of programmatic maps) */
   private toolRegistry?: t.LCToolRegistry;
   /** Cached programmatic tools (computed once on first PTC call) */
@@ -932,18 +943,43 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     const registryRunId =
       batchContext.batchScopeId ??
       (config.configurable?.run_id as string | undefined);
-    // Read AND increment synchronously, before any await. This pins
-    // the per-tool turn for both the PreToolUse hook AND the eventual
-    // runTool execution to the same value — without the increment
-    // here, parallel direct calls of the same tool in one
-    // Promise.all batch would all hand the hook the same stale
-    // counter and runTool would later read 0,1,2 inside an awaited
-    // continuation (Codex P2 #27). Threaded through batchContext so
-    // runTool skips its own increment.
-    const usageCount = this.toolUsageCount.get(call.name) ?? 0;
-    this.toolUsageCount.set(call.name, usageCount + 1);
-    if (call.id != null && call.id !== '') {
-      this.toolCallTurns.set(call.id, usageCount);
+    // Slot reservation, synchronous, before any await:
+    //   1. If this call.id already has a recorded turn (from a prior
+    //      entry that asked / interrupted), REUSE it. LangGraph
+    //      re-runs the entire ToolNode on resume, so the same call
+    //      can hit this code multiple times — incrementing on each
+    //      pass would push the eventual approved execution to
+    //      `turn=N` instead of `turn=0` (Codex P2 #30: the fix from
+    //      P2 #27 over-incremented across re-entries).
+    //   2. Otherwise reserve the next slot from the counter. Done
+    //      synchronously so concurrent same-tool calls in a single
+    //      Promise.all batch get distinct turns (the original P2 #27
+    //      requirement still holds).
+    // Net: turns are stable per call.id across interrupt/resume,
+    // unique per call within a batch.
+    let usageCount: number;
+    // Look in the resume-stable map first; fall back to the
+    // per-batch one. (`directPathTurns` is set on first entry and
+    // survives `run()`'s clear, so a resume sees the original
+    // assignment.)
+    const cachedTurn =
+      call.id != null && call.id !== ''
+        ? this.directPathTurns.get(call.id) ??
+          this.toolCallTurns.get(call.id)
+        : undefined;
+    if (cachedTurn != null) {
+      usageCount = cachedTurn;
+    } else {
+      usageCount = this.toolUsageCount.get(call.name) ?? 0;
+      this.toolUsageCount.set(call.name, usageCount + 1);
+      if (call.id != null && call.id !== '') {
+        this.toolCallTurns.set(call.id, usageCount);
+        // Dedicated direct-path map that SURVIVES `run()`'s
+        // toolCallTurns.clear() — so a re-entry triggered by
+        // LangGraph interrupt resume reuses this slot instead of
+        // re-incrementing. Codex P2 #30.
+        this.directPathTurns.set(call.id, usageCount);
+      }
     }
     const turn = usageCount;
     const stepId = this.toolCallStepIds?.get(call.id ?? '') ?? '';

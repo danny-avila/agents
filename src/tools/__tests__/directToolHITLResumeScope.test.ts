@@ -371,4 +371,67 @@ describe('direct-path HITL: resume scope', () => {
       expect(String(toolMsg.content)).not.toContain('should-not-execute');
     });
   });
+
+  describe('usage counter stability across resume (Codex P2 #30)', () => {
+    it('turn stays the same across an interrupt + resume — does not double-increment', async () => {
+      // Pre-fix the P2 #27 turn-race fix incremented before the
+      // hook fired, and never rolled back on `ask`. LangGraph
+      // re-runs ToolNode from the start on resume, so a single
+      // call that asks once before approval got turn=1 instead of
+      // turn=0. Now turns are cached per call.id and re-used on
+      // re-entry.
+      const observed: number[] = [];
+      const directTool = tool(
+        async (_, config) => {
+          const tc = (config as { toolCall?: { turn?: number } } | undefined)
+            ?.toolCall;
+          if (typeof tc?.turn === 'number') observed.push(tc.turn);
+          return 'EXECUTED';
+        },
+        {
+          name: 'echo',
+          description: 'records the turn it ran under',
+          schema: z.object({ command: z.string() }),
+        }
+      ) as unknown as StructuredToolInterface;
+
+      // Hook ALWAYS asks. The resume value is what unblocks.
+      const registry = new HookRegistry();
+      registry.register('PreToolUse', {
+        hooks: [
+          async (): Promise<PreToolUseHookOutput> => ({
+            decision: 'ask',
+            allowedDecisions: ['approve'],
+          }),
+        ],
+      });
+
+      const node = new ToolNode({
+        tools: [directTool],
+        eventDrivenMode: true,
+        hookRegistry: registry,
+        directToolNames: new Set(['echo']),
+        humanInTheLoop: { enabled: true },
+      });
+
+      const graph = buildGraph(node, [
+        { id: 'call_1', name: 'echo', args: { command: 'go' } },
+      ]);
+      const config = { configurable: { thread_id: 'thread-turn-stable' } };
+
+      const first = await graph.invoke({ messages: [] }, config);
+      expect(isInterrupted<t.HumanInterruptPayload>(first)).toBe(true);
+
+      await graph.invoke(
+        new Command({ resume: [{ type: 'approve' }] }),
+        config
+      );
+
+      // Body ran once. The turn it observed must be 0 (the slot
+      // assigned on the FIRST entry, reused on resume), not 1
+      // (which is what pre-fix produced because the second entry
+      // re-incremented).
+      expect(observed).toEqual([0]);
+    });
+  });
 });
