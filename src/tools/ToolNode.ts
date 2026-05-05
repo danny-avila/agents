@@ -239,10 +239,42 @@ function updateCodeSession(
   const existingFiles = existingSession?.files ?? [];
 
   if (newFiles.length > 0) {
-    const filesWithSession: t.FileRefs = newFiles.map((file) => ({
-      ...file,
-      session_id: file.session_id ?? sessionId,
-    }));
+    /**
+     * Carry forward fields from the prior entry that the worker response
+     * doesn't echo. Right now that's `entity_id` — codeapi echoes
+     * inherited input files in its response without the entity scope
+     * the caller sent in, so a same-name merge would silently drop the
+     * field. Subsequent execute calls would then inject those files
+     * without `entity_id`, codeapi falls back to the request-level
+     * (or userId-only) sessionKey, and the file 403s even though it's
+     * the same file the prior call just ran successfully.
+     *
+     * Index by `(session_id, id)` because that's the stable identity
+     * for a sandbox object (two distinct uploads can share a filename
+     * across sessions). Fall back to `name` only when the per-file id
+     * is absent on the prior entry — older payloads.
+     */
+    const priorByKey = new Map<string, t.FileRef>();
+    for (const f of existingFiles) {
+      const key =
+        f.id != null && f.session_id != null
+          ? `${f.session_id}\0${f.id}`
+          : `name:${f.name}`;
+      priorByKey.set(key, f);
+    }
+
+    const filesWithSession: t.FileRefs = newFiles.map((file) => {
+      const sid = file.session_id ?? sessionId;
+      const key = file.id != null ? `${sid}\0${file.id}` : `name:${file.name}`;
+      const prior = priorByKey.get(key) ?? priorByKey.get(`name:${file.name}`);
+      return {
+        ...file,
+        session_id: sid,
+        ...(file.entity_id == null && prior?.entity_id != null
+          ? { entity_id: prior.entity_id }
+          : {}),
+      };
+    });
     const newFileNames = new Set(filesWithSession.map((f) => f.name));
     const filteredExisting = existingFiles.filter(
       (f) => !newFileNames.has(f.name)
