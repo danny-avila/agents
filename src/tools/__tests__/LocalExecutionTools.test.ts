@@ -2174,6 +2174,33 @@ describe('comprehensive review (round 14) — Codex P1 #37 + P2 #38/#40/#41', ()
     });
   });
 
+  describe('destructive dot-glob targets (Codex P1 [47])', () => {
+    const cases: Array<[string, string]> = [
+      ['rm -rf $HOME/.*', 'dotfile glob under $HOME'],
+      ['rm -rf ~/.*', 'dotfile glob under ~'],
+      ['rm -rf ${HOME}/.*', 'dotfile glob under ${HOME}'],
+      ['rm -rf /.*', 'dotfile glob under root'],
+      ['rm -rf "$HOME/.*"', 'quoted dotfile glob under $HOME'],
+      ['chmod -R 777 ~/.*', 'chmod dotfile glob'],
+    ];
+    it.each(cases)('blocks %s (%s)', async (cmd) => {
+      const result = await validateBashCommand(cmd);
+      expect(result.valid).toBe(false);
+      expect(result.errors.join('\n')).toMatch(/destructive command pattern/);
+    });
+
+    it('blocks the positional-arg dot-glob form too', async () => {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { executeLocalBashWithArgs } = require('../local/LocalExecutionEngine');
+      await expect(
+        executeLocalBashWithArgs('rm -rf "$1"', ['/.*'], {
+          sandbox: { enabled: false },
+          timeoutMs: 5000,
+        })
+      ).rejects.toThrow(/destructive command pattern.*protected target/i);
+    });
+  });
+
   describe('fallbackGrep skip sentinels do not count as matches (Codex P2 [43])', () => {
     it('reports `matches: 0` when only oversize files are present', async () => {
       _resetRipgrepCacheForTests();

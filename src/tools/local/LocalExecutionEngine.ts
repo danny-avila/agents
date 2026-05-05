@@ -30,17 +30,21 @@ const DEFAULT_SHELL = process.platform === 'win32' ? 'bash.exe' : 'bash';
 // flags directly. Codex P1 #20.
 // `DESTRUCTIVE_TARGET` is the canonical "protected location" pattern:
 // matches `/`, `~`, `$HOME`, `${HOME}`, `.`, each optionally followed
-// by a trailing-slash and/or wildcard glob suffix. Round 14 (Codex
-// P1 [37]) added trailing-slash; round 15 (Codex P1 [42]) extends
-// to glob forms — `rm -rf $HOME/*`, `rm -rf ~/*`, `rm -rf ./*`,
-// `rm -rf .*` all delete the contents of the same protected
-// locations and were slipping past the bare-command guard. The
-// suffix matrix:
-//   ''   — `$HOME`
-//   '/'  — `$HOME/`
-//   '*'  — `$HOME*`  (glob expansion against the protected base)
-//   '/*' — `$HOME/*` (glob over its contents)
-const DESTRUCTIVE_TARGET = '(?:\\/|~|\\$\\{?HOME\\}?|\\.)(?:\\/?\\*|\\/)?';
+// by a trailing-slash and/or wildcard glob suffix. The suffix matrix:
+//   ''     — `$HOME`              (round 14)
+//   '/'    — `$HOME/`             (round 14, Codex P1 [37])
+//   '*'    — `$HOME*`             (round 15, Codex P1 [42])
+//   '/*'   — `$HOME/*`            (round 15, Codex P1 [42])
+//   '.*'   — `$HOME.*`            (round 17, Codex P1 [47])
+//   '/.*'  — `$HOME/.*`           (round 17, Codex P1 [47]) — the
+//            dot-glob form deletes all dotfiles under the protected
+//            root, just as destructive as `/*` but the prior matrix
+//            missed it.
+// Suffix expression: `(?:\/?\.?\*|\/)?` — one of:
+//   `\/?\.?\*` → `*`, `.*`, `/*`, `/.*`
+//   `\/`       → `/`
+//   (empty)    → bare base
+const DESTRUCTIVE_TARGET = '(?:\\/|~|\\$\\{?HOME\\}?|\\.)(?:\\/?\\.?\\*|\\/)?';
 
 const dangerousCommandPatterns: ReadonlyArray<RegExp> = [
   new RegExp(
@@ -918,13 +922,14 @@ export async function executeLocalBash(
 /**
  * Matches a single arg that, on its own, references a protected
  * location (`/`, `~`, `$HOME`, `${HOME}`, `.`, with optional trailing
- * slash or glob suffix). Used to spot the
+ * slash, wildcard, or dot-glob suffix). Used to spot the
  * `command: 'rm -rf "$1"', args: ['/']` shape where the destructive
  * target is moved into a positional arg to evade the command regex.
- * Codex P1 [45].
+ * Codex P1 [45], extended for dot-glob in Codex P1 [47] (mirrors the
+ * `DESTRUCTIVE_TARGET` suffix matrix exactly).
  */
 const PROTECTED_TARGET_ARG_RE =
-  /^(?:\/|~|\$\{?HOME\}?|\.)(?:\/?\*|\/)?$/;
+  /^(?:\/|~|\$\{?HOME\}?|\.)(?:\/?\.?\*|\/)?$/;
 
 /**
  * Mutating-op recognizer for the args check. Conservative: only the
