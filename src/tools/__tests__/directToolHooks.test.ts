@@ -371,4 +371,41 @@ describe('Direct-path lifecycle hooks (in-process tools)', () => {
       expect([...bodyTurns].sort()).toEqual([0, 1, 2]);
     }
   });
+
+  it('PreToolUse `additionalContext` is materialized as a HumanMessage in the direct path (Codex P2 #39)', async () => {
+    // Pre-fix the direct path called executeHooks but discarded
+    // additionalContexts — silently broke the documented hook API
+    // for hosts using policy/recovery guidance with local tools.
+    const echo = createDirectTool('echo', () => 'EXECUTED');
+
+    const registry = new HookRegistry();
+    registry.register('PreToolUse', {
+      hooks: [
+        async (): Promise<PreToolUseHookOutput> => ({
+          decision: 'allow',
+          additionalContext: 'POLICY-NOTE: writes here require approval next time',
+        }),
+      ],
+    });
+
+    const node = new ToolNode({
+      tools: [echo],
+      eventDrivenMode: true,
+      hookRegistry: registry,
+      directToolNames: new Set(['echo']),
+    });
+
+    const result = await node.invoke({
+      messages: [aiCall('call_ctx', 'echo', { command: 'hi' })],
+    });
+    const messages = toolMessages(result);
+    // ToolMessage for the echo call AND the materialized
+    // HumanMessage carrying the additionalContext.
+    const human = (messages as unknown as { content: unknown }[]).find(
+      (m) =>
+        typeof (m as { content: unknown }).content === 'string' &&
+        String((m as { content: string }).content).includes('POLICY-NOTE')
+    );
+    expect(human).toBeDefined();
+  });
 });

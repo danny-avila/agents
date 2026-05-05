@@ -28,12 +28,27 @@ const DEFAULT_SHELL = process.platform === 'win32' ? 'bash.exe' : 'bash';
 // is identical in effect to `rm -rf /` but pre-fix it slipped past
 // the guard because the regex required the path to follow option
 // flags directly. Codex P1 #20.
+// `DESTRUCTIVE_TARGET` is the canonical "protected location" pattern:
+// matches `/`, `~`, `$HOME`, `${HOME}`, `.`, each optionally followed
+// by a trailing slash. Codex P1 #37 — pre-fix the bare patterns
+// required the target to end at end-of-string or a shell separator,
+// missing common variants like `rm -rf $HOME/` or `rm -rf ~/`. The
+// same alternation is used by the quoted patterns so spelling
+// equivalences are kept consistent.
+const DESTRUCTIVE_TARGET = '(?:\\/|~|\\$\\{?HOME\\}?|\\.)\\/?';
+
 const dangerousCommandPatterns: ReadonlyArray<RegExp> = [
-  /\brm\s+(?:-[^\s]*[rf][^\s]*\s+|-[^\s]*[r][^\s]*\s+-[^\s]*[f][^\s]*\s+)(?:--\s+)?(?:\/|~|\$HOME|\.)\s*(?:$|[;&|])/,
+  new RegExp(
+    `\\brm\\s+(?:-[^\\s]*[rf][^\\s]*\\s+|-[^\\s]*[r][^\\s]*\\s+-[^\\s]*[f][^\\s]*\\s+)(?:--\\s+)?${DESTRUCTIVE_TARGET}\\s*(?:$|[;&|])`
+  ),
   /\b(?:mkfs|mkswap|fdisk|parted|diskutil)\b/,
   /\bdd\s+[^;&|]*\bof=\/dev\//,
-  /\bchmod\s+-R\s+(?:777|a\+w)\s+(?:--\s+)?(?:\/|~|\$HOME|\.)\b/,
-  /\bchown\s+-R\s+[^;&|]+\s+(?:--\s+)?(?:\/|~|\$HOME|\.)\b/,
+  new RegExp(
+    `\\bchmod\\s+-R\\s+(?:777|a\\+w)\\s+(?:--\\s+)?${DESTRUCTIVE_TARGET}(?:$|\\s|[;&|])`
+  ),
+  new RegExp(
+    `\\bchown\\s+-R\\s+[^;&|]+\\s+(?:--\\s+)?${DESTRUCTIVE_TARGET}(?:$|\\s|[;&|])`
+  ),
   /:\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/,
 ];
 
@@ -52,10 +67,19 @@ const dangerousCommandPatterns: ReadonlyArray<RegExp> = [
  * `/` outside of any quote-pair-around-the-path (the quotes wrap
  * the whole `rm -rf /` text), so it doesn't match here either.
  */
+// Quoted variant uses the same DESTRUCTIVE_TARGET (which accepts an
+// optional trailing slash) so `rm -rf "$HOME/"` and `rm -rf "~/"`
+// don't slip past. Codex P1 #37.
 const quotedDestructivePatterns: ReadonlyArray<RegExp> = [
-  /\brm\s+(?:-[^\s]*[rf][^\s]*\s+){1,3}(?:--\s+)?["'](?:\/|~|\$\{?HOME\}?|\.)["']/,
-  /\bchmod\s+-R\s+(?:777|a\+w)\s+(?:--\s+)?["'](?:\/|~|\$\{?HOME\}?|\.)["']/,
-  /\bchown\s+-R\s+[^;&|]+\s+(?:--\s+)?["'](?:\/|~|\$\{?HOME\}?|\.)["']/,
+  new RegExp(
+    `\\brm\\s+(?:-[^\\s]*[rf][^\\s]*\\s+){1,3}(?:--\\s+)?["']${DESTRUCTIVE_TARGET}["']`
+  ),
+  new RegExp(
+    `\\bchmod\\s+-R\\s+(?:777|a\\+w)\\s+(?:--\\s+)?["']${DESTRUCTIVE_TARGET}["']`
+  ),
+  new RegExp(
+    `\\bchown\\s+-R\\s+[^;&|]+\\s+(?:--\\s+)?["']${DESTRUCTIVE_TARGET}["']`
+  ),
 ];
 
 /**
@@ -1170,9 +1194,14 @@ function isInsideAnyRoot(absolutePath: string, roots: string[]): boolean {
   return false;
 }
 
-async function realpathOrSelf(absolutePath: string): Promise<string> {
+type RealpathFn = (p: string) => Promise<string>;
+
+async function realpathOrSelf(
+  absolutePath: string,
+  realpathImpl: RealpathFn = realpath
+): Promise<string> {
   try {
-    return await realpath(absolutePath);
+    return await realpathImpl(absolutePath);
   } catch {
     return absolutePath;
   }
@@ -1182,14 +1211,24 @@ async function realpathOrSelf(absolutePath: string): Promise<string> {
  * Resolves the realpath of `absolutePath`, falling back to the nearest
  * existing ancestor when the target itself does not yet exist (so the
  * containment check still works for `write_file` to a brand-new path).
+ *
+ * Codex P2 #38: takes the realpath impl as a parameter so callers
+ * can route through `WorkspaceFS.realpath` when a custom engine is
+ * configured. Pre-fix, host `fs/promises.realpath` would fail on a
+ * remote/in-memory FS path and silently fall back to lexical
+ * containment, leaving the symlink-escape clamp ineffective on
+ * non-default engines.
  */
-async function realpathOfPathOrAncestor(absolutePath: string): Promise<string> {
+async function realpathOfPathOrAncestor(
+  absolutePath: string,
+  realpathImpl: RealpathFn = realpath
+): Promise<string> {
   let current = absolutePath;
   let suffix = '';
   // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
   while (true) {
     try {
-      const real = await realpath(current);
+      const real = await realpathImpl(current);
       return suffix === '' ? real : resolve(real, suffix);
     } catch {
       const parent = resolve(current, '..');
@@ -1220,8 +1259,16 @@ export async function resolveWorkspacePathSafe(
   if (roots == null) {
     return lexical;
   }
-  const realRoots = await Promise.all(roots.map(realpathOrSelf));
-  const realPath = await realpathOfPathOrAncestor(lexical);
+  // Route realpath through the configured WorkspaceFS so a custom
+  // engine (in-memory, remote) gets the same symlink-escape clamp
+  // the host-fs path gets. Codex P2 #38: pre-fix the host realpath
+  // would fail on a non-default FS path and silently fall back to
+  // lexical containment, leaving the clamp ineffective.
+  const fsRealpath: RealpathFn = (p) => getWorkspaceFS(config).realpath(p);
+  const realRoots = await Promise.all(
+    roots.map((r) => realpathOrSelf(r, fsRealpath))
+  );
+  const realPath = await realpathOfPathOrAncestor(lexical, fsRealpath);
   if (isInsideAnyRoot(realPath, realRoots)) {
     return lexical;
   }

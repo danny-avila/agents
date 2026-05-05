@@ -84,6 +84,17 @@ type RunToolBatchContext = {
    * `runTool` skips its own counter increment.
    */
   usageCount?: number;
+  /**
+   * Per-batch sink for `additionalContext` strings returned by
+   * direct-path PreToolUse / PostToolUse / PostToolUseFailure hooks.
+   * The caller in `run()` materializes the accumulated strings as a
+   * `HumanMessage` appended to outputs so the next model turn sees
+   * them — same shape as the event-driven path's `injected[]`.
+   * Codex P2 #39: pre-fix the direct path called `executeHooks` and
+   * discarded `additionalContexts`, silently breaking the hook API
+   * contract for hosts relying on it for policy / recovery guidance.
+   */
+  additionalContextsSink?: string[];
 };
 
 /**
@@ -1033,6 +1044,18 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       }).catch(() => undefined);
 
       if (preResult != null) {
+        // Forward any additionalContext strings hooks returned into
+        // the per-batch sink so the caller materializes them as a
+        // HumanMessage for the next model turn — same shape as the
+        // event-driven path's `injected[]`. Codex P2 #39.
+        if (
+          batchContext.additionalContextsSink != null &&
+          preResult.additionalContexts.length > 0
+        ) {
+          batchContext.additionalContextsSink.push(
+            ...preResult.additionalContexts
+          );
+        }
         // Apply any input rewrite first — `ask`-with-`updatedInput` is
         // a valid combination (one matcher sanitises args, another asks
         // for approval); the reviewer should see the sanitised args.
@@ -1208,7 +1231,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     }
 
     if (output.status === 'error' && hasFailureHook) {
-      executeHooks({
+      // Await the failure hook (instead of fire-and-forget) so we
+      // can capture additionalContexts before returning. The hook is
+      // still observational w.r.t. the tool result itself — we don't
+      // mutate `output`, just plumb the contexts. Codex P2 #39.
+      const failureResult = await executeHooks({
         registry: hookRegistry,
         input: {
           hook_event_name: 'PostToolUseFailure',
@@ -1227,9 +1254,16 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         },
         sessionId: runId,
         matchQuery: call.name,
-      }).catch(() => {
-        /* observational */
-      });
+      }).catch(() => undefined);
+      if (
+        failureResult != null &&
+        batchContext.additionalContextsSink != null &&
+        failureResult.additionalContexts.length > 0
+      ) {
+        batchContext.additionalContextsSink.push(
+          ...failureResult.additionalContexts
+        );
+      }
       return output;
     }
 
@@ -1251,6 +1285,18 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         sessionId: runId,
         matchQuery: call.name,
       }).catch(() => undefined);
+
+      // Forward additionalContexts from the PostToolUse hook into
+      // the per-batch sink (Codex P2 #39).
+      if (
+        postResult != null &&
+        batchContext.additionalContextsSink != null &&
+        postResult.additionalContexts.length > 0
+      ) {
+        batchContext.additionalContextsSink.push(
+          ...postResult.additionalContexts
+        );
+      }
 
       if (postResult?.updatedOutput != null) {
         const replaced =
@@ -2762,6 +2808,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           }
         }
 
+        // Per-batch sink for direct-path hook additionalContexts
+        // (Codex P2 #39). Materialized as a HumanMessage at end-of-
+        // batch so the next model turn sees the injected context,
+        // matching the event path's `injected[]` shape.
+        const directAdditionalContexts: string[] = [];
         const directOutputs: (BaseMessage | Command)[] =
           directCalls.length > 0
             ? await Promise.all(
@@ -2772,6 +2823,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                   batchScopeId,
                   resolvedArgsByCallId,
                   preBatchSnapshot,
+                  additionalContextsSink: directAdditionalContexts,
                 })
               )
             )
@@ -2800,9 +2852,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               injected: [] as BaseMessage[],
             };
 
+        const directInjected: BaseMessage[] =
+          directAdditionalContexts.length > 0
+            ? [new HumanMessage({ content: directAdditionalContexts.join('\n\n') })]
+            : [];
         outputs = [
           ...directOutputs,
           ...eventResult.toolMessages,
+          ...directInjected,
           ...eventResult.injected,
         ];
       } else {
@@ -2812,7 +2869,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         // call's args mid-await (Codex P1 #18).
         const preBatchSnapshot =
           this.toolOutputRegistry?.snapshot(batchScopeId);
-        outputs = await Promise.all(
+        const directAdditionalContexts: string[] = [];
+        const toolOutputs = await Promise.all(
           filteredCalls.map((call, i) =>
             this.runDirectToolWithLifecycleHooks(call, config, {
               batchIndex: i,
@@ -2820,15 +2878,27 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               batchScopeId,
               resolvedArgsByCallId,
               preBatchSnapshot,
+              additionalContextsSink: directAdditionalContexts,
             })
           )
         );
         this.handleRunToolCompletions(
           filteredCalls,
-          outputs,
+          toolOutputs,
           config,
           resolvedArgsByCallId
         );
+        // Append accumulated additionalContexts as a single
+        // HumanMessage so the next model turn sees them. Codex P2 #39.
+        outputs =
+          directAdditionalContexts.length > 0
+            ? [
+              ...toolOutputs,
+              new HumanMessage({
+                content: directAdditionalContexts.join('\n\n'),
+              }),
+            ]
+            : toolOutputs;
       }
     }
 

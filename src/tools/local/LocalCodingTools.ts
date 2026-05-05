@@ -813,6 +813,12 @@ async function* walkFiles(
  */
 const MAX_FALLBACK_PATTERN_LENGTH = 1024;
 const FALLBACK_GREP_BUDGET_MS = 5000;
+// Per-file byte cap. Codex P2 #41 — without it, the whole-file
+// `readFile` + `split('\n')` for a multi-GB log is an unbounded
+// allocation that the wall-clock budget (checked between files)
+// can't interrupt. Hosts that need to grep large files should
+// install ripgrep.
+const FALLBACK_GREP_MAX_FILE_BYTES = 5 * 1024 * 1024;
 
 /**
  * Heuristic: walks `pattern` to find any `(<contents>)<quant>` where
@@ -910,6 +916,25 @@ async function fallbackGrep(
         continue;
       }
     }
+    // Skip files larger than the per-file cap and emit a sentinel
+    // line. Codex P2 #41: pre-fix `fs.readFile` then `.split('\n')`
+    // allocated the whole file + an array of every line, which a
+    // single multi-GB log could turn into an OOM even after the
+    // regex DoS guards. The wall-clock budget only checks BETWEEN
+    // files so it can't interrupt one pathological read.
+    let stat;
+    try {
+      stat = await fs.stat(file);
+    } catch {
+      continue;
+    }
+    if (stat.size > FALLBACK_GREP_MAX_FILE_BYTES) {
+      matches.push(
+        `${file}:0:[skipped: file > ${FALLBACK_GREP_MAX_FILE_BYTES} bytes; install ripgrep for unbounded grep]`
+      );
+      if (matches.length >= maxResults) return matches;
+      continue;
+    }
     let content;
     try {
       content = await fs.readFile(file, 'utf8');
@@ -919,6 +944,9 @@ async function fallbackGrep(
     if (content.includes('\0')) {
       continue;
     }
+    // Re-check the deadline AFTER the read — a slow disk on one
+    // file can blow the budget without us noticing.
+    if (Date.now() > deadline) return matches;
     const lines = content.split('\n');
     for (let i = 0; i < lines.length; i++) {
       if (rx.test(lines[i])) {

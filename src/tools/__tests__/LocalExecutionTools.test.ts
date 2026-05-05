@@ -2126,3 +2126,180 @@ describe('comprehensive review (round 12) — Codex P1 #36', () => {
     });
   });
 });
+
+describe('comprehensive review (round 14) — Codex P1 #37 + P2 #38/#40/#41', () => {
+  describe('destructive path normalization (Codex P1 #37)', () => {
+    const cases: Array<[string, string]> = [
+      ['rm -rf $HOME/', 'trailing slash on $HOME'],
+      ['rm -rf ~/', 'trailing slash on ~'],
+      ['rm -rf ${HOME}/', 'trailing slash on ${HOME}'],
+      ['rm -rf "$HOME/"', 'quoted $HOME with trailing slash'],
+      ['rm -rf "~/"', 'quoted ~ with trailing slash'],
+      ['rm -rf "${HOME}/"', 'quoted ${HOME} with trailing slash'],
+      ['chmod -R 777 ~/', 'chmod with trailing slash'],
+      ['chmod -R 777 "$HOME/"', 'quoted chmod with trailing slash'],
+    ];
+    it.each(cases)('blocks %s (%s)', async (cmd) => {
+      const result = await validateBashCommand(cmd);
+      expect(result.valid).toBe(false);
+      expect(result.errors.join('\n')).toMatch(/destructive command pattern/);
+    });
+
+    it('still allows benign trailing-slash commands', async () => {
+      const result = await validateBashCommand('ls $HOME/');
+      expect(result.valid).toBe(true);
+    });
+  });
+
+  describe('resolveWorkspacePathSafe routes through WorkspaceFS.realpath (Codex P2 #38)', () => {
+    it('honors a custom workspace fs realpath impl', async () => {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { resolveWorkspacePathSafe } = require('../local/LocalExecutionEngine');
+      const calls: string[] = [];
+      const fakeFs = {
+        readFile: async () => '',
+        writeFile: async () => undefined,
+        stat: async () => ({
+          isFile: () => true,
+          isDirectory: () => false,
+          size: 0,
+        }),
+        readdir: async () => [],
+        mkdir: async () => undefined,
+        // The custom realpath that the safe-path resolver MUST use.
+        // Returns paths unchanged so the lexical containment check
+        // succeeds for in-workspace targets.
+        realpath: async (p: string): Promise<string> => {
+          calls.push(p);
+          return p;
+        },
+        unlink: async () => undefined,
+        open: async () => {
+          throw new Error('not implemented');
+        },
+      };
+
+      await resolveWorkspacePathSafe('/virtual/ws/file.ts', {
+        cwd: '/virtual/ws',
+        workspace: { root: '/virtual/ws' },
+        exec: { fs: fakeFs as unknown as never },
+      });
+
+      // Must have called the WorkspaceFS realpath at least once
+      // (for either the root or the candidate path). Pre-fix the
+      // host fs/promises.realpath was used instead.
+      expect(calls.length).toBeGreaterThan(0);
+      expect(calls.every((p) => p.startsWith('/virtual/'))).toBe(true);
+    });
+  });
+
+  describe('syntax-check probe cache also keys on env (Codex P2 #40)', () => {
+    it('does not bleed `hasNode` verdict from one env to another on the same backend', async () => {
+      _resetSyntaxCheckProbeCacheForTests();
+      const realSpawn = (
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        require('child_process') as typeof import('child_process')
+      ).spawn;
+      const calls: Array<{ cmd: string; env?: NodeJS.ProcessEnv }> = [];
+      // Backend that returns `node --version` success ONLY when
+      // env.PATH includes 'with-node'. Mirrors P1 #34's shape.
+      const envSensitive: t.LocalSpawn = ((
+        cmd: string,
+        args: string[],
+        opts: import('child_process').SpawnOptions
+      ) => {
+        calls.push({ cmd, env: opts.env as NodeJS.ProcessEnv });
+        if (cmd === 'node' && args[0] === '--version') {
+          const env = (opts.env ?? {}) as NodeJS.ProcessEnv;
+          if (env.PATH?.includes('with-node') === true) {
+            return realSpawn('sh', ['-c', 'exit 0'], opts);
+          }
+          return realSpawn('sh', ['-c', 'exit 127'], opts);
+        }
+        // Run all other spawns through a no-op so we don't hit
+        // real node/python/bash on the host.
+        return realSpawn('sh', ['-c', 'exit 0'], opts);
+      }) as unknown as t.LocalSpawn;
+
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { runPostEditSyntaxCheck } = require('../local/syntaxCheck');
+      const cwd = await createTempDir();
+      const file = join(cwd, 'a.js');
+      await (await import('fs/promises')).writeFile(file, 'function (\n');
+
+      // Run A: env says node IS available — probe records `true`
+      // for (backend, envA).
+      await runPostEditSyntaxCheck(file, {
+        exec: { spawn: envSensitive },
+        env: { PATH: '/with-node' },
+      });
+
+      // Run B: env says node is NOT available. Pre-fix the cache
+      // would reuse the (backend) entry and try to actually
+      // syntax-check via the missing node. Now: separate cache slot
+      // for envB → its own probe → records `false` → skips check.
+      const probeCallsBefore = calls.filter(
+        (c) => c.cmd === 'node' && c.env?.PATH?.includes('without-node') === true
+      ).length;
+      await runPostEditSyntaxCheck(file, {
+        exec: { spawn: envSensitive },
+        env: { PATH: '/without-node' },
+      });
+      const probeCallsAfter = calls.filter(
+        (c) => c.cmd === 'node' && c.env?.PATH?.includes('without-node') === true
+      ).length;
+      // A fresh probe must have run for envB (count went up).
+      expect(probeCallsAfter).toBeGreaterThan(probeCallsBefore);
+    });
+  });
+
+  describe('fallbackGrep skips files larger than the per-file cap (Codex P2 #41)', () => {
+    it('emits a sentinel and continues instead of reading multi-MB files into memory', async () => {
+      _resetRipgrepCacheForTests();
+      const realSpawn = (
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        require('child_process') as typeof import('child_process')
+      ).spawn;
+      // Force the Node fallback by making rg unavailable.
+      const noRgBackend: t.LocalSpawn = ((
+        cmd: string,
+        args: string[],
+        opts: import('child_process').SpawnOptions
+      ) => {
+        if (cmd === 'rg') {
+          return realSpawn('sh', ['-c', 'exit 127'], opts);
+        }
+        return realSpawn(cmd, args, opts);
+      }) as unknown as t.LocalSpawn;
+
+      const cwd = await createTempDir();
+      const fsp = await import('fs/promises');
+      // Write a small file (matches the search) and a 6 MB file
+      // (over the 5 MB cap) — the fallback must skip the big one
+      // with a sentinel and still find the small-file match.
+      await fsp.writeFile(join(cwd, 'small.txt'), 'needle\n');
+      const big = Buffer.alloc(6 * 1024 * 1024, 'a');
+      await fsp.writeFile(join(cwd, 'big.txt'), big);
+
+      const bundle = createLocalCodingToolBundle({
+        cwd,
+        exec: { spawn: noRgBackend },
+      });
+      const grepTool = bundle.tools.find(
+        (tt) => tt.name === Constants.GREP_SEARCH
+      );
+      const result = await grepTool!.invoke({
+        id: 'g41',
+        name: Constants.GREP_SEARCH,
+        args: { pattern: 'needle' },
+        type: 'tool_call',
+      });
+      const text = JSON.stringify(result);
+      // Small-file match landed.
+      expect(text).toContain('needle');
+      // Big-file got the skip sentinel (didn't OOM, didn't read
+      // into memory).
+      expect(text).toContain('skipped');
+    });
+  });
+});

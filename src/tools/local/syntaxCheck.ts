@@ -49,16 +49,38 @@ export type SyntaxChecker = (
 type ProbeKind = 'hasNode' | 'hasPython' | 'hasBash';
 type ProbeCache = Partial<Record<ProbeKind, Promise<boolean>>>;
 
-let probeCacheByBackend = new WeakMap<t.LocalSpawn, ProbeCache>();
+// Per-backend × per-env cache. Codex P2 #40 — keying by spawn
+// backend alone misses env-driven availability changes (e.g. PATH
+// loses node between Runs that share the same backend). Same fix
+// shape as the ripgrep cache (Codex P1 #34).
+let probeCacheByBackend = new WeakMap<
+  t.LocalSpawn,
+  Map<string, ProbeCache>
+>();
+
+function envCacheKey(env: NodeJS.ProcessEnv | undefined): string {
+  if (env == null) return '';
+  const sorted: Record<string, string | undefined> = {};
+  for (const k of Object.keys(env).sort()) {
+    sorted[k] = env[k];
+  }
+  return JSON.stringify(sorted);
+}
 
 function cacheFor(
   config: t.LocalExecutionConfig
 ): ProbeCache {
   const backend = getSpawn(config);
-  let entry = probeCacheByBackend.get(backend);
+  let envMap = probeCacheByBackend.get(backend);
+  if (envMap == null) {
+    envMap = new Map();
+    probeCacheByBackend.set(backend, envMap);
+  }
+  const envKey = envCacheKey(config.env);
+  let entry = envMap.get(envKey);
   if (entry == null) {
     entry = {};
-    probeCacheByBackend.set(backend, entry);
+    envMap.set(envKey, entry);
   }
   return entry;
 }
