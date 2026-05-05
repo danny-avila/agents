@@ -348,5 +348,46 @@ describe('createWorkspacePolicyHook', () => {
       expect(out.decision).toBe('deny');
       expect(out.reason).toContain('/tmp/x');
     });
+
+    it('extracts ../ parent-traversal tokens (Codex P2 #35)', async () => {
+      // `../secrets.txt` resolves to `<parent-of-workspace>/secrets.txt`
+      // which is outside the workspace boundary. Pre-fix the regex
+      // ignored relative tokens entirely so this looked like an
+      // empty-extract → allow.
+      const hook = createWorkspacePolicyHook({
+        root: workspace,
+        outsideRead: 'deny',
+      });
+      const out = await call(
+        hook,
+        makeInput('compile_check', { command: 'cat ../secrets.txt' })
+      );
+      expect(out.decision).toBe('deny');
+      expect(out.reason).toContain('../secrets.txt');
+    });
+
+    it('extracts deeper traversal like ../../etc/foo (Codex P2 #35)', async () => {
+      const hook = createWorkspacePolicyHook({
+        root: workspace,
+        outsideRead: 'deny',
+      });
+      const out = await call(
+        hook,
+        makeInput('compile_check', { command: 'cat ../../etc/foo' })
+      );
+      expect(out.decision).toBe('deny');
+    });
+
+    it('does NOT trip on `./` or single-dot tokens (no false positives)', async () => {
+      const hook = createWorkspacePolicyHook({
+        root: workspace,
+        outsideRead: 'deny',
+      });
+      const out = await call(
+        hook,
+        makeInput('compile_check', { command: 'cd ./src && npx tsc' })
+      );
+      expect(out.decision).toBe('allow');
+    });
   });
 });

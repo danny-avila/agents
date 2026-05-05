@@ -637,16 +637,42 @@ export function createLocalEditFileTool(
  * reached. Per-backend caching avoids that without paying for a
  * spawn-per-search.
  */
+// Per-backend × per-env cache. Codex P1 #34 — keying by spawn
+// backend alone misses the case where two Runs share a backend but
+// vary `local.env` (especially PATH). Stale cache then claims `rg`
+// is available, the rg path runs, and the spawn fails with ENOENT
+// instead of falling back to the Node walker. The inner Map is
+// keyed by a stable JSON hash of the effective env so each unique
+// env gets its own probe.
 let ripgrepAvailabilityByBackend = new WeakMap<
   t.LocalSpawn,
-  Promise<boolean>
+  Map<string, Promise<boolean>>
 >();
+
+function envCacheKey(env: NodeJS.ProcessEnv | undefined): string {
+  // PATH is the only env entry that affects command lookup, but
+  // hashing the whole env keeps the key correct for hosts that
+  // vary anything else relevant. Stable JSON via sorted keys so
+  // {A:1,B:2} and {B:2,A:1} produce the same hash.
+  if (env == null) return '';
+  const sorted: Record<string, string | undefined> = {};
+  for (const k of Object.keys(env).sort()) {
+    sorted[k] = env[k];
+  }
+  return JSON.stringify(sorted);
+}
 
 async function isRipgrepAvailable(
   config: t.LocalExecutionConfig
 ): Promise<boolean> {
   const backend = getSpawn(config);
-  let probePromise = ripgrepAvailabilityByBackend.get(backend);
+  let envMap = ripgrepAvailabilityByBackend.get(backend);
+  if (envMap == null) {
+    envMap = new Map();
+    ripgrepAvailabilityByBackend.set(backend, envMap);
+  }
+  const envKey = envCacheKey(config.env);
+  let probePromise = envMap.get(envKey);
   if (probePromise == null) {
     probePromise = spawnLocalProcess(
       'rg',
@@ -656,7 +682,7 @@ async function isRipgrepAvailable(
     )
       .then((probe) => probe != null && probe.exitCode === 0)
       .catch(() => false);
-    ripgrepAvailabilityByBackend.set(backend, probePromise);
+    envMap.set(envKey, probePromise);
   }
   return probePromise;
 }

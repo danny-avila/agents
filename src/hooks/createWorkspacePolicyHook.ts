@@ -132,8 +132,19 @@ const WRITE_TOOLS = new Set<string>([
 // destination path. The path content character class still excludes
 // quotes/whitespace/shell-specials so we don't over-extract; that's
 // the defensive trade we want for fallback-grep style matching.
-const ABSOLUTE_PATH_TOKEN =
-  /(?:^|[\s=])(?:--[^\s=]+=)?["']?(\/[^\s'"|;&<>()`]+|~\/[^\s'"|;&<>()`]+|\$\{?HOME\}?\/[^\s'"|;&<>()`]+)["']?/g;
+//
+// The `\.\.(?:\/[^…]*)?` alternation covers parent-traversal forms
+// (`..`, `../secrets.txt`, `../foo/bar`). Without it, a model could
+// exfiltrate parent-directory files via `cat ../secrets` and the
+// hook would short-circuit to `allow` because the extractor saw no
+// "absolute" token. The boundary check at the call site resolves
+// non-absolute extracted tokens against `root`, so `../secrets`
+// becomes `<parent-of-workspace>/secrets` which the boundary then
+// correctly flags as outside. Codex P2 #35.
+const PATH_TOKEN =
+  /(?:^|[\s=])(?:--[^\s=]+=)?["']?(\/[^\s'"|;&<>()`]+|~\/[^\s'"|;&<>()`]+|\$\{?HOME\}?\/[^\s'"|;&<>()`]+|\.\.(?:\/[^\s'"|;&<>()`]*)?)["']?/g;
+// Back-compat alias kept for any downstream import.
+const ABSOLUTE_PATH_TOKEN = PATH_TOKEN;
 function expandHomeRelative(token: string): string {
   // Expand ~/foo and $HOME/foo and ${HOME}/foo to absolute. The
   // workspace boundary check resolves non-absolute paths against the

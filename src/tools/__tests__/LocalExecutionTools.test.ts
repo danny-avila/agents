@@ -1958,6 +1958,88 @@ describe('comprehensive review (round 10) — Codex P1 #28 / P2 #29', () => {
     }, 10_000);
   });
 
+  describe('ripgrep cache also keys on env (Codex P1 #34)', () => {
+    it('does not bleed an "rg available" verdict from one env to another on the same backend', async () => {
+      _resetRipgrepCacheForTests();
+      // Same backend instance for both Runs. Vary `local.env` between
+      // them — pre-fix the WeakMap cache was keyed on the spawn
+      // function alone, so the second Run inherited the first's
+      // verdict and tried to use rg under an env without it,
+      // failing with ENOENT.
+      const realSpawn = (
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        require('child_process') as typeof import('child_process')
+      ).spawn;
+
+      // Backend that returns success for `rg --version` ONLY when
+      // the spawned process's env has PATH=/with/rg, and 127
+      // otherwise. This is the structural shape of "rg is on PATH
+      // for env A but not env B".
+      const envSensitive: t.LocalSpawn = ((
+        cmd: string,
+        args: string[],
+        opts: import('child_process').SpawnOptions
+      ) => {
+        if (cmd === 'rg' && args[0] === '--version') {
+          const env = (opts.env ?? {}) as NodeJS.ProcessEnv;
+          if (env.PATH === '/with/rg') {
+            return realSpawn('sh', ['-c', 'exit 0'], opts);
+          }
+          return realSpawn('sh', ['-c', 'exit 127'], opts);
+        }
+        return realSpawn(cmd, args, opts);
+      }) as unknown as t.LocalSpawn;
+
+      const cwdA = await createTempDir();
+      const cwdB = await createTempDir();
+      await (await import('fs/promises')).writeFile(
+        join(cwdA, 'a.ts'),
+        'needle\n'
+      );
+      await (await import('fs/promises')).writeFile(
+        join(cwdB, 'b.ts'),
+        'needle\n'
+      );
+
+      // Run A: env says rg is available → cache records `true` for
+      // (backend, env-A).
+      const bundleA = createLocalCodingToolBundle({
+        cwd: cwdA,
+        exec: { spawn: envSensitive },
+        env: { PATH: '/with/rg' },
+      });
+      await bundleA.tools.find((t_) => t_.name === 'grep_search')!.invoke({
+        id: 'gA',
+        name: 'grep_search',
+        args: { pattern: 'needle' },
+        type: 'tool_call',
+      });
+
+      // Run B: same backend, DIFFERENT env (PATH excludes rg). Must
+      // run a fresh probe and fall back to the Node walker, NOT
+      // reuse Run A's cached "true". Pre-fix this would attempt to
+      // spawn rg with the wrong PATH and surface a tool failure.
+      const bundleB = createLocalCodingToolBundle({
+        cwd: cwdB,
+        exec: { spawn: envSensitive },
+        env: { PATH: '/without/rg' },
+      });
+      const bResult = await bundleB.tools
+        .find((t_) => t_.name === 'grep_search')!
+        .invoke({
+          id: 'gB',
+          name: 'grep_search',
+          args: { pattern: 'needle' },
+          type: 'tool_call',
+        });
+      const text = JSON.stringify(bResult);
+      // Result must show the match (Node fallback ran successfully)
+      // and indicate the fallback engine, not a ripgrep failure.
+      expect(text).toContain('needle');
+      expect(text).toContain('node-fallback');
+    });
+  });
+
   describe('compile-style runtimes honor local.shell (Codex P2 #29)', () => {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { executeLocalCode } = require('../local/LocalExecutionEngine');
