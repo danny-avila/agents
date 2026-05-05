@@ -50,6 +50,7 @@ function formatLocalOutput(
     stderr: string;
     exitCode: number | null;
     timedOut: boolean;
+    overflowKilled?: boolean;
     fullOutputPath?: string;
   },
   cwd: string
@@ -71,6 +72,16 @@ function formatLocalOutput(
 
   if (result.timedOut) {
     formatted += 'timed_out: true\n';
+  }
+
+  if (result.overflowKilled === true) {
+    // Surface the force-kill explicitly so the model treats this as a
+    // failure rather than misreading "exit_code: 137 + truncated
+    // stdout" as a normal completion. (Codex P1 — pre-fix the close
+    // handler swallowed the overflow flag and exitCode was null on
+    // signal-killed processes.)
+    formatted +=
+      'killed: true (output exceeded local.maxSpawnedBytes; process tree was terminated)\n';
   }
 
   if (result.fullOutputPath != null) {

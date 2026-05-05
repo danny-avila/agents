@@ -115,12 +115,10 @@ function writeJson(res: ServerResponse, status: number, value: unknown): void {
  * to deny because the bridge can't raise a LangGraph interrupt from
  * inside an HTTP handler — fail-closed matches the rest of the SDK
  * when HITL is unavailable.
- */
-/**
- * Exported for tests so the deny / allow / updatedInput / ask
- * branches can be exercised without standing up the full HTTP bridge.
  *
- * @internal
+ * @internal Exported for tests so the deny / allow / updatedInput /
+ *   ask branches can be exercised without standing up the full HTTP
+ *   bridge.
  */
 export async function applyPreToolUseHooksForBridge(
   hookContext: t.ProgrammaticHookContext,

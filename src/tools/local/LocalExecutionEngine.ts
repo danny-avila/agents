@@ -96,6 +96,15 @@ type SpawnResult = {
   stderr: string;
   exitCode: number | null;
   timedOut: boolean;
+  /**
+   * True when the process was force-killed because total streamed bytes
+   * exceeded `maxSpawnedBytes`. Distinct from `timedOut`. Without this
+   * flag, callers (`bash_tool`, `execute_code`, etc.) would see a
+   * SIGKILL'd process with `exitCode: null` and treat it as success
+   * (Codex P1 — runaway commands like `yes` or noisy builds silently
+   * looked successful even though their output was truncated).
+   */
+  overflowKilled?: boolean;
   /** Path to the full untruncated stdout/stderr when output exceeded `maxOutputChars`. */
   fullOutputPath?: string;
 };
@@ -784,7 +793,20 @@ export async function spawnLocalProcess(
     child.on('error', fail);
 
     child.on('close', (exitCode) => {
-      finish({ stdout, stderr, exitCode, timedOut });
+      // Force a non-zero exit when we killed the child for output
+      // overflow. Node hands us exitCode === null for signal-killed
+      // processes; without this synthesis, callers like bash_tool
+      // observe "exitCode: null + non-empty stdout" and treat the
+      // result as success despite the SIGKILL. (Codex P1.)
+      const finalExit =
+        overflowKilled && exitCode == null ? 137 : exitCode;
+      finish({
+        stdout,
+        stderr,
+        exitCode: finalExit,
+        timedOut,
+        ...(overflowKilled ? { overflowKilled: true } : {}),
+      });
     });
   });
 }

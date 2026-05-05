@@ -180,10 +180,20 @@ export function resolveLocalExecutionTools(args: {
     }
   }
 
+  // When the coding-tool bundle was already installed above, it
+  // already created `bash_tool` / `execute_code` / programmatic-tool
+  // variants. Skip re-creating them here — the audit-of-audit (manual
+  // finding #4) flagged that the original loop overwrote those bundle
+  // instances with fresh ones via `createLocalExecutionTool`, wasting
+  // work and (more importantly) replacing tools the bundle had
+  // already wired up with shared state. The CODE_EXECUTION_TOOLS
+  // loop is now only relevant when the host pre-bound a tool with
+  // one of these names (the `toolMap.has(name)` branch) and coding
+  // tools are off.
+  const includeCodingTools = shouldIncludeCodingTools(args.toolExecution);
   for (const name of CODE_EXECUTION_TOOLS) {
-    if (!toolMap.has(name) && !shouldIncludeCodingTools(args.toolExecution)) {
-      continue;
-    }
+    if (includeCodingTools) continue;
+    if (!toolMap.has(name)) continue;
 
     const localTool = createLocalExecutionTool(name, localConfig);
     if (localTool == null) {

@@ -196,9 +196,9 @@ export async function classifyAttachment(args: {
   const isPdf = wantsPdf && mime === 'application/pdf';
 
   if (!isImage && !isPdf) {
-    if (SUPPORTED_ATTACHMENT_MIMES.has(mime)) {
-      return { kind: 'binary', mime, bytes: args.bytes };
-    }
+    // Both branches returned identical values pre-fix (audit-of-audit
+    // finding #3). The SUPPORTED_ATTACHMENT_MIMES check was dead code —
+    // collapsing to a single return.
     return { kind: 'binary', mime, bytes: args.bytes };
   }
 

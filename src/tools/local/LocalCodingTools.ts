@@ -787,7 +787,44 @@ async function* walkFiles(
  */
 const MAX_FALLBACK_PATTERN_LENGTH = 1024;
 const FALLBACK_GREP_BUDGET_MS = 5000;
-const NESTED_QUANTIFIER_RE = /\([^)]*[+*][^)]*\)\s*[+*?{]/;
+
+/**
+ * Heuristic: walks `pattern` to find any `(<contents>)<quant>` where
+ * `<contents>` itself has an unbounded quantifier. Catches the
+ * classic `(a+)+` form AND the double-nested `((a+)+)` form (which a
+ * single-pass regex misses because `[^)]*` stops at the first inner
+ * close-paren). Misses sufficiently obfuscated cases — bulletproof
+ * ReDoS detection requires a real parser. The 5 s wall-clock budget
+ * is the hard backstop for anything this slip past.
+ */
+function hasNestedUnboundedQuantifier(pattern: string): boolean {
+  for (let i = 1; i < pattern.length - 1; i++) {
+    if (pattern[i] !== ')') continue;
+    if (pattern[i - 1] === '\\') continue;
+    const next = pattern[i + 1];
+    if (next !== '+' && next !== '*' && next !== '{') continue;
+    // Walk back to find the matching opening paren (respecting depth
+    // and `\(` escapes).
+    let depth = 1;
+    let j = i - 1;
+    while (j >= 0) {
+      const c = pattern[j];
+      const escaped = j > 0 && pattern[j - 1] === '\\';
+      if (!escaped) {
+        if (c === ')') depth++;
+        else if (c === '(') {
+          depth--;
+          if (depth === 0) break;
+        }
+      }
+      j--;
+    }
+    if (j < 0) continue;
+    const inner = pattern.slice(j + 1, i);
+    if (/(?<!\\)[+*]/.test(inner)) return true;
+  }
+  return false;
+}
 
 class FallbackGrepError extends Error {
   readonly kind: 'pattern-too-long' | 'unsafe-pattern' | 'invalid-pattern';
@@ -807,10 +844,10 @@ function compileFallbackRegex(pattern: string): RegExp {
       `Pattern exceeds ${MAX_FALLBACK_PATTERN_LENGTH}-char fallback cap (install ripgrep for unbounded patterns).`
     );
   }
-  if (NESTED_QUANTIFIER_RE.test(pattern)) {
+  if (hasNestedUnboundedQuantifier(pattern)) {
     throw new FallbackGrepError(
       'unsafe-pattern',
-      'Pattern contains a nested unbounded quantifier (e.g. `(a+)+`) which can cause catastrophic backtracking in the Node fallback. Install ripgrep for RE2-safe matching.'
+      'Pattern contains a nested unbounded quantifier (e.g. `(a+)+` or `((a+)+)`) which can cause catastrophic backtracking in the Node fallback. Install ripgrep for RE2-safe matching.'
     );
   }
   try {
