@@ -483,7 +483,14 @@ async function ensureSandbox(
     await runtime.SandboxManager.reset();
   }
 
-  await runtime.SandboxManager.initialize(runtimeConfig);
+  // Cast at the runtime boundary — our public `BuiltSandboxRuntimeConfig`
+  // is intentionally structural to keep the optional peer dep out of
+  // generated `.d.ts` (Codex P1 #22). It's a structural subset of the
+  // peer's `SandboxRuntimeConfig`, so the assignment is sound at the
+  // one site where the peer is actually loaded.
+  await runtime.SandboxManager.initialize(
+    runtimeConfig as unknown as SandboxRuntimeConfig
+  );
   sandboxInitialized = true;
   sandboxConfigKey = nextKey;
   return runtime.SandboxManager;
@@ -498,11 +505,43 @@ async function ensureSandbox(
  */
 const BRIDGE_LOOPBACK_HOSTS = ['127.0.0.1', 'localhost', '::1'] as const;
 
+/**
+ * Structural shape of the sandbox-runtime config we hand to
+ * `SandboxManager.initialize()`. Intentionally NOT typed as the peer
+ * `SandboxRuntimeConfig` from `@anthropic-ai/sandbox-runtime`: that
+ * package is an OPTIONAL peer dep, and exporting a function whose
+ * return type references it would make our generated `.d.ts` import
+ * a module the consumer may not have installed (Codex P1 #22 — type-
+ * checking would fail with `Cannot find module
+ * '@anthropic-ai/sandbox-runtime'` for any host that doesn't enable
+ * local sandboxing). The shape here is a structural subset; assignable
+ * to the real `SandboxRuntimeConfig` at the one runtime call site.
+ *
+ * @internal
+ */
+export interface BuiltSandboxRuntimeConfig {
+  network: {
+    allowedDomains: string[];
+    deniedDomains: string[];
+    allowUnixSockets?: string[];
+    allowAllUnixSockets?: boolean;
+    allowLocalBinding?: boolean;
+    allowMachLookup?: string[];
+  };
+  filesystem: {
+    denyRead: string[];
+    allowRead?: string[];
+    allowWrite: string[];
+    denyWrite: string[];
+    allowGitConfig?: boolean;
+  };
+}
+
 export function buildSandboxRuntimeConfig(
   config: t.LocalExecutionConfig,
   cwd: string,
   getDefaultWritePaths: () => string[]
-): SandboxRuntimeConfig {
+): BuiltSandboxRuntimeConfig {
   const sandbox = config.sandbox;
   // Seed allowedDomains with loopback so the programmatic-tool bridge
   // works under sandbox. If the host explicitly denied a loopback

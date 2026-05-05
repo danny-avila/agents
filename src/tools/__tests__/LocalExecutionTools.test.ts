@@ -1293,6 +1293,57 @@ describe('codex review fixes (round 5)', () => {
       expect(text).toContain('bad glob target');
     });
   });
+
+  describe('grep_search surfaces ripgrep failures (Codex P2 #23)', () => {
+    it('returns an explicit error (not "No matches found.") when rg exits non-zero', async () => {
+      _resetRipgrepCacheForTests();
+      // Same shape as the glob_search test above. Pre-fix the
+      // grep_search rg branch dropped exitCode and reported
+      // matches: 0 on a real rg error (codex flagged that
+      // glob_search had this fix but grep_search hadn't been
+      // updated to match).
+      const realSpawn = (
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        require('child_process') as typeof import('child_process')
+      ).spawn;
+      const fakeRgBackend: t.LocalSpawn = ((
+        cmd: string,
+        args: string[],
+        opts: import('child_process').SpawnOptions
+      ) => {
+        if (cmd === 'rg' && args[0] === '--version') {
+          return realSpawn('sh', ['-c', 'exit 0'], opts);
+        }
+        if (cmd === 'rg') {
+          return realSpawn(
+            'sh',
+            ['-c', 'printf \'rg: io error reading dir\\n\' >&2; exit 2'],
+            opts
+          );
+        }
+        return realSpawn(cmd, args, opts);
+      }) as unknown as t.LocalSpawn;
+
+      const cwd = await createTempDir();
+      const bundle = createLocalCodingToolBundle({
+        cwd,
+        exec: { spawn: fakeRgBackend },
+      });
+      const grepTool = bundle.tools.find(
+        (tt) => tt.name === Constants.GREP_SEARCH
+      );
+      const result = await grepTool!.invoke({
+        id: 'gr1',
+        name: Constants.GREP_SEARCH,
+        args: { pattern: 'needle' },
+        type: 'tool_call',
+      });
+      const text = JSON.stringify(result);
+      expect(text).not.toContain('No matches found.');
+      expect(text).toContain('grep_search failed');
+      expect(text).toContain('io error reading dir');
+    });
+  });
 });
 
 describe('codex review fixes (round 6)', () => {

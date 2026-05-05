@@ -926,6 +926,26 @@ export function createLocalGrepSearchTool(
           ...config,
           timeoutMs: config.timeoutMs ?? 30000,
         });
+        // ripgrep exit codes:
+        //   0  → at least one match
+        //   1  → no matches (clean — "No matches found.")
+        //   2  → real error (bad regex, unreadable target, etc.)
+        // Without this branch (Codex P2 #23 — same fix shape glob_search
+        // got from P2 #13), exit-2 errors silently mapped to
+        // `matches: 0`, so the agent treated tooling failures as a
+        // genuine absence of matches.
+        if (result.timedOut || (result.exitCode != null && result.exitCode > 1)) {
+          const detail = result.stderr.trim() || `rg exited ${result.exitCode}`;
+          return [
+            `grep_search failed: ${detail}`,
+            {
+              matches: 0,
+              engine: 'ripgrep',
+              error: detail,
+              exitCode: result.exitCode,
+            },
+          ];
+        }
         const lines = result.stdout.split('\n').filter(Boolean).slice(0, maxResults);
         const output =
           lines.length > 0
