@@ -52,9 +52,14 @@ export type ToolNodeOptions = {
   /** Tool names that must be executed directly (via runTool) even in event-driven mode (e.g., graph-managed handoff tools) */
   directToolNames?: Set<string>;
   /**
-   * Hook registry for PreToolUse/PostToolUse lifecycle hooks.
-   * Only fires for event-driven tool calls (`dispatchToolEvents`). Tools
-   * routed through `directToolNames` bypass hook dispatch entirely.
+   * Hook registry for PreToolUse/PostToolUse/PostToolUseFailure/
+   * PermissionDenied lifecycle hooks. Fires for **every** tool the
+   * ToolNode invokes — both event-dispatched tools (via
+   * `dispatchToolEvents`) and direct-path tools (via
+   * `runDirectToolWithLifecycleHooks`). The pre-existing limitation
+   * that direct-path tools "bypass hook dispatch entirely" was
+   * lifted in a follow-up to the HITL surface; both paths now route
+   * through the same hook lifecycle.
    */
   hookRegistry?: HookRegistry;
   /**
@@ -70,9 +75,11 @@ export type ToolNodeOptions = {
    *
    * Mirrors `RunConfig.humanInTheLoop` (which is the canonical place
    * to set this); the Graph threads it down to every ToolNode it
-   * compiles. Same caveat: the interrupt path is only wired into the
-   * event-driven dispatch (`dispatchToolEvents`), not into
-   * `directToolNames` execution — direct tools bypass HITL entirely.
+   * compiles. The interrupt path is wired into both the event
+   * dispatch (`dispatchToolEvents`) and the direct path
+   * (`runDirectToolWithLifecycleHooks`) — direct tools no longer
+   * bypass HITL. See `HumanInTheLoopConfig` for the resume re-execution
+   * contract that applies equally to both paths.
    */
   humanInTheLoop?: HumanInTheLoopConfig;
   /** Max context tokens for the agent — used to compute tool result truncation limits. */
@@ -98,6 +105,25 @@ export type ToolNodeOptions = {
    * precedence over `toolOutputReferences` when both are set.
    */
   toolOutputRegistry?: ToolOutputReferenceRegistry;
+  /**
+   * Selects where built-in code execution tools run. Defaults to the
+   * remote LibreChat Code API sandbox; `local` swaps those same tool names
+   * to process-based local executors at ToolNode construction time.
+   */
+  toolExecution?: ToolExecutionConfig;
+  /**
+   * Pre-constructed file checkpointer shared across every ToolNode in
+   * a Run so `Run.rewindFiles()` (and direct
+   * `Run.getFileCheckpointer()` callers) sees a single unified
+   * snapshot store. The Graph layer creates one per Run when
+   * `toolExecution.local.fileCheckpointing === true` and threads it
+   * to every ToolNode it compiles; without this shared instance,
+   * multi-agent graphs would each get their own private checkpointer
+   * and the host couldn't reach any of them. Wins over the
+   * auto-created bundle checkpointer in
+   * `resolveLocalExecutionTools`.
+   */
+  fileCheckpointer?: LocalFileCheckpointer;
 };
 
 export type ToolNodeConstructorParams = ToolRefs & ToolNodeOptions;
@@ -333,7 +359,317 @@ export type ToolOutputReferencesConfig = {
   maxTotalSize?: number;
 };
 
-export type ProgrammaticCache = { toolMap: ToolMap; toolDefs: LCTool[] };
+export type ToolExecutionEngine = 'sandbox' | 'local';
+
+/**
+ * Records pre-write file contents so callers can rewind edits/writes
+ * made by the local engine. Implementations live in `src/tools/local`.
+ */
+export interface LocalFileCheckpointer {
+  /**
+   * Captures the current contents of `absolutePath` before a write or
+   * edit. Idempotent: capturing the same path twice keeps the first
+   * snapshot. Records "did not exist" so creates can be undone with
+   * deletion.
+   */
+  captureBeforeWrite(absolutePath: string): Promise<void>;
+  /** Restores all captured snapshots. Returns the number of files restored. */
+  rewind(): Promise<number>;
+  /** Returns paths that have been captured during this run. */
+  capturedPaths(): string[];
+}
+
+/**
+ * Pluggable process launcher used by the local execution engine. When
+ * provided, the engine calls this in place of `child_process.spawn`,
+ * letting callers route shell commands through SSH, containers, or
+ * remote runners without forking the engine. The implementation must
+ * return a `ChildProcess`-shaped value whose `stdout`/`stderr` streams
+ * emit `data` events and that resolves a `close` event when finished.
+ */
+export type LocalSpawn = (
+  command: string,
+  args: string[],
+  options: import('child_process').SpawnOptions
+) => import('child_process').ChildProcessWithoutNullStreams;
+
+/** Bash command-validation strictness for the local engine. */
+export type LocalBashAstMode = 'auto' | 'off' | 'strict';
+
+export type LocalSandboxConfig = {
+  /**
+   * Enable Anthropic Sandbox Runtime wrapping for local process tools.
+   * Defaults to false; requires @anthropic-ai/sandbox-runtime to be installed.
+   */
+  enabled?: boolean;
+  /** Throw when native sandbox dependencies are unavailable. Defaults to false. */
+  failIfUnavailable?: boolean;
+  filesystem?: {
+    denyRead?: string[];
+    allowRead?: string[];
+    allowWrite?: string[];
+    denyWrite?: string[];
+    allowGitConfig?: boolean;
+  };
+  network?: {
+    allowedDomains?: string[];
+    deniedDomains?: string[];
+    allowUnixSockets?: string[];
+    allowAllUnixSockets?: boolean;
+    allowLocalBinding?: boolean;
+    allowMachLookup?: string[];
+  };
+};
+
+/**
+ * Workspace boundary the local-coding tools clamp file operations to.
+ *
+ * `root` is the canonical "project directory" — every file tool that
+ * accepts a path resolves it relative to `root` and refuses to touch
+ * paths outside it (after symlink resolution). `additionalRoots` lets
+ * monorepos extend the boundary to sibling directories without
+ * disabling clamping entirely.
+ *
+ * `allowReadOutside` and `allowWriteOutside` are escape hatches that
+ * disable clamping for read- and write-shaped tools respectively.
+ * Most hosts shouldn't need them — prefer wiring
+ * `createWorkspacePolicyHook` if you want "ask the user" semantics
+ * via the existing PreToolUse / HITL machinery instead of an
+ * unconditional bypass.
+ */
+export type LocalWorkspaceConfig = {
+  /** Required. The canonical workspace root. */
+  root: string;
+  /**
+   * Sibling roots that also count as inside the workspace. Useful in
+   * monorepos where a project legitimately needs to reach a paired
+   * directory without disabling clamping.
+   */
+  additionalRoots?: readonly string[];
+  /** When true, disable the read-outside-workspace clamp. */
+  allowReadOutside?: boolean;
+  /** When true, disable the write-outside-workspace clamp. */
+  allowWriteOutside?: boolean;
+};
+
+/**
+ * Engine-agnostic execution seam. Default uses Node's
+ * `child_process.spawn` and `fs/promises`. A future engine (e.g.
+ * stateful remote sandbox) supplies its own `spawn` and `fs` and
+ * inherits every tool factory unchanged.
+ *
+ * **Important — pair `spawn` and `fs` together.** Most file-touching
+ * surfaces in the local engine route through `getWorkspaceFS(config)`
+ * so a host can transparently swap in a remote/in-memory FS. A small
+ * set of helpers — currently the `execute_code` non-bash temp-file
+ * write (Codex P2 [48]) — still uses host `fs/promises` directly to
+ * stage source on disk before invoking the spawn. If you override
+ * `spawn` to point at a remote runtime (SSH, container, etc.) you
+ * MUST also override `fs` with the corresponding remote
+ * implementation; otherwise temp source files written to the host
+ * `/tmp` won't be visible to the remote interpreter and `py`/`js`/
+ * `ts`/etc. executions will fail. (Bash-style executions go through
+ * `executeLocalBash` which doesn't stage temp files, so they're
+ * unaffected.)
+ *
+ * Threat-model note: the regex-based command validators
+ * (`dangerousCommandPatterns`, `quotedDestructivePatterns`, etc.) and
+ * the workspace policy hook are documented as best-effort tripwires.
+ * The hard security boundary is `local.sandbox.enabled: true` (which
+ * wraps execution in `@anthropic-ai/sandbox-runtime`); for adversarial-
+ * model threat models, do NOT rely on the regex layer alone.
+ */
+export type LocalExecConfig = {
+  /** Pluggable spawn (for SSH, container, remote workers, etc.). */
+  spawn?: LocalSpawn;
+  /**
+   * Pluggable filesystem (for remote-workspace engines). Pair with
+   * `spawn` — see the type-level note above on why both should be
+   * overridden together for non-host engines.
+   */
+  fs?: import('@/tools/local/workspaceFS').WorkspaceFS;
+};
+
+export type LocalExecutionConfig = {
+  /**
+   * Working directory for local commands. Defaults to process.cwd().
+   * Back-compat shorthand for `workspace.root`.
+   *
+   * @deprecated Prefer `workspace.root`. Kept for backward
+   *   compatibility with pre-workspace configs.
+   */
+  cwd?: string;
+  /**
+   * Workspace boundary configuration. When omitted, the implementation
+   * derives `{ root: cwd ?? process.cwd() }` so existing call sites
+   * keep working.
+   */
+  workspace?: LocalWorkspaceConfig;
+  /**
+   * Execution seam (spawn + fs). When omitted, defaults to Node-host
+   * child_process and fs/promises. Same back-compat: a top-level
+   * `spawn` field is honoured if `exec.spawn` isn't set.
+   */
+  exec?: LocalExecConfig;
+  /** Shell executable for bash-style tools. Defaults to `bash`. */
+  shell?: string;
+  /** Default timeout for local processes, in milliseconds. */
+  timeoutMs?: number;
+  /** Maximum stdout/stderr characters surfaced to the model. */
+  maxOutputChars?: number;
+  /**
+   * Hard cap on total bytes a single child process can stream across
+   * stdout+stderr before its process tree is killed. Independent from
+   * `maxOutputChars` (which controls what the model sees); this is the
+   * OOM backstop for noisy / runaway commands (`yes`, `cat /dev/urandom`,
+   * a verbose build that loops). Defaults to 50 MiB. Set higher for
+   * legitimately large logs; setting to 0 disables the cap and risks
+   * an OOM crash on the host.
+   */
+  maxSpawnedBytes?: number;
+  /** Extra environment variables merged over process.env. */
+  env?: NodeJS.ProcessEnv;
+  /** Optional process sandboxing via @anthropic-ai/sandbox-runtime. */
+  sandbox?: LocalSandboxConfig;
+  /**
+   * When true, block obviously mutating shell commands before execution.
+   * Useful for read-only agent modes and dry-run workflows.
+   */
+  readOnly?: boolean;
+  /** Permit dangerous commands that the validator otherwise blocks. */
+  allowDangerousCommands?: boolean;
+  /**
+   * Permit file tools to resolve paths outside `cwd`. Defaults to false.
+   *
+   * @deprecated Prefer the granular
+   *   `workspace.allowReadOutside` / `workspace.allowWriteOutside`.
+   *   Kept for backward compatibility; setting either of the
+   *   workspace fields takes precedence over this flag.
+   */
+  allowOutsideWorkspace?: boolean;
+  /**
+   * Add the built-in local coding suite (`read_file`, `write_file`,
+   * `edit_file`, `grep_search`, `glob_search`, `list_directory`, plus local
+   * code/bash execution tools) when `engine` is `local`. Defaults to true.
+   */
+  includeCodingTools?: boolean;
+  /**
+   * Override the process launcher. When set, replaces
+   * `child_process.spawn` for every local tool invocation, allowing
+   * SSH/container delegation. Default: native spawn.
+   */
+  spawn?: LocalSpawn;
+  /**
+   * Tree-sitter-bash AST validation pass on bash commands.
+   * - `'off'` skips AST validation (regex + `bash -n` only — current behavior).
+   * - `'auto'` runs the AST validator when `tree-sitter` modules are
+   *   available; falls back silently otherwise.
+   * - `'strict'` requires the AST validator and fails closed when
+   *   parsing is unavailable or the command is too complex to verify.
+   * Default: `'off'` to preserve historical behavior.
+   */
+  bashAst?: LocalBashAstMode;
+  /**
+   * Enable per-Run file checkpointing for `edit_file` / `write_file`
+   * so callers can rewind file changes after a failed batch. When
+   * true and the run is constructed via `Run.create(...)`, the host
+   * can call `Run.rewindFiles()` (or `Run.getFileCheckpointer()` for
+   * the raw checkpointer). Defaults to false.
+   */
+  fileCheckpointing?: boolean;
+  /**
+   * Maximum bytes to read in `read_file` before returning a stub.
+   * Defaults to 10 MiB.
+   */
+  maxReadBytes?: number;
+  /**
+   * Controls whether `read_file` returns binary files as inline
+   * `MessageContentComplex[]` attachments (so vision-capable models
+   * see them) or as a textual stub.
+   *
+   *   - `'off'`        : never embed; current binary-stub behavior.
+   *   - `'images-only'`: embed images (png/jpeg/gif/webp) as
+   *     `image_url` blocks; other binaries get the stub.
+   *   - `'images-and-pdf'` : also embed PDFs as `image_url` data URLs
+   *     (Anthropic accepts these in tool_result; other providers may
+   *     degrade to JSON).
+   *
+   * Defaults to `'off'` to preserve current behavior.
+   */
+  attachReadAttachments?: 'off' | 'images-only' | 'images-and-pdf';
+  /**
+   * Maximum pre-encoding byte size to embed inline. Anything larger
+   * degrades to an `<oversize>` stub. Defaults to 5 MiB to bound the
+   * post-base64 token cost.
+   */
+  maxAttachmentBytes?: number;
+  /**
+   * Run a fast per-file syntax check after every successful
+   * `edit_file` / `write_file`. When the checker finds an error,
+   * the diagnostics are appended to the tool result so the model
+   * can self-correct without a separate read round-trip.
+   *
+   *   - `'off'` (default) : skip; current behavior.
+   *   - `'auto'`          : run the checker for known file types
+   *     when the corresponding tool is on PATH. Silently skip
+   *     otherwise.
+   *   - `'strict'`        : same as `'auto'`, plus fail the tool
+   *     call with the error so the model is forced to react. Use
+   *     when you don't trust the model to read a non-blocking
+   *     advisory.
+   *
+   * Built-in checkers: Node `node --check` for `.js/.mjs/.cjs`,
+   * Python `py_compile` for `.py`, `JSON.parse` for `.json`,
+   * `bash -n` for `.sh/.bash`. TypeScript falls back to `compile_check`
+   * (project-level) since per-file `.ts` syntax check requires the
+   * `typescript` package; the host can wire a per-file checker via
+   * `local.spawn` if desired.
+   */
+  postEditSyntaxCheck?: 'off' | 'auto' | 'strict';
+  /**
+   * Configuration for the `compile_check` tool. When `engine` is
+   * `local` and `includeCodingTools` is on, the SDK exposes a
+   * `compile_check` tool that runs the project's standard
+   * type/lint command (`tsc --noEmit`, `cargo check`, etc.).
+   */
+  compileCheck?: {
+    /**
+     * Override the auto-detected command. Runs verbatim from `cwd`
+     * via the local engine's standard spawn pipeline (sandbox / AST
+     * validation / output overflow all apply).
+     */
+    command?: string;
+    /** Default timeout for `compile_check`, in milliseconds. Defaults to 120s. */
+    timeoutMs?: number;
+  };
+};
+
+export type ToolExecutionConfig = {
+  /** `sandbox` preserves the remote Code API behavior and is the default. */
+  engine?: ToolExecutionEngine;
+  /** Local process execution settings used when `engine` is `local`. */
+  local?: LocalExecutionConfig;
+};
+
+export type ProgrammaticCache = {
+  toolMap: ToolMap;
+  toolDefs: LCTool[];
+  /**
+   * Hook context plumbed through by ToolNode for the local
+   * programmatic-tool path so the in-process bridge can run
+   * `PreToolUse` hooks (deny / updatedInput) for inner tool calls.
+   * Not present for non-local (remote-engine) programmatic calling
+   * which dispatches inner tools through the host's own pipeline.
+   */
+  hookContext?: ProgrammaticHookContext;
+};
+
+export type ProgrammaticHookContext = {
+  registry: import('@/hooks').HookRegistry | undefined;
+  runId: string;
+  threadId?: string;
+  agentId?: string;
+};
 
 /** Search mode: code_interpreter uses external sandbox, local uses safe substring matching */
 export type ToolSearchMode = 'code_interpreter' | 'local';

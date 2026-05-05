@@ -25,6 +25,8 @@ import {
   createPruneMessages,
   addCacheControl,
   getMessageId,
+  makeIsDeferred,
+  partitionAndMarkAnthropicToolCache,
 } from '@/messages';
 import {
   GraphNodeKeys,
@@ -54,6 +56,8 @@ import { createSchemaOnlyTools } from '@/tools/schema';
 import { AgentContext } from '@/agents/AgentContext';
 import { createFakeStreamingLLM } from '@/llm/fake';
 import { handleToolCalls } from '@/tools/handlers';
+import { resolveLocalToolsForBinding } from '@/tools/local';
+import { createLocalCodingToolBundle } from '@/tools/local/LocalCodingTools';
 import { isThinkingEnabled } from '@/llm/request';
 import { initializeModel } from '@/llm/init';
 import { HandlerRegistry } from '@/events';
@@ -144,6 +148,11 @@ export abstract class Graph<
    */
   toolOutputReferences: t.ToolOutputReferencesConfig | undefined;
   /**
+   * Run-scoped execution backend for built-in code tools. Defaults to the
+   * remote Code API sandbox when unset.
+   */
+  toolExecution: t.ToolExecutionConfig | undefined;
+  /**
    * Shared registry instance used by every ToolNode compiled from this
    * graph. Lazily constructed on first access so multi-agent graphs
    * produce one registry per run (not one per agent), letting cross-
@@ -177,6 +186,7 @@ export abstract class Graph<
     this.hookRegistry = undefined;
     this.humanInTheLoop = undefined;
     this.toolOutputReferences = undefined;
+    this.toolExecution = undefined;
     /**
      * ToolNodes compiled from this graph captured the registry
      * instance at construction time, so simply dropping the Graph's
@@ -187,7 +197,36 @@ export abstract class Graph<
      */
     this._toolOutputRegistry?.clear();
     this._toolOutputRegistry = undefined;
+    // NB: `_fileCheckpointer` is intentionally NOT cleared here.
+    // `Run.processStream()` calls `clearHeavyState()` in its
+    // finally block on natural-completion / error paths — exactly
+    // when the host is most likely to want `Run.rewindFiles()` (for
+    // rollback after a failed batch). Per-Run isolation is already
+    // automatic because each `Run.create()` constructs a brand-new
+    // Graph instance, so the next Run gets its own checkpointer
+    // without us needing to reset this field. Codex P1 #32: pre-fix
+    // the checkpointer was nulled before the caller could reach it.
+    // Flush each compiled ToolNode's direct-path turn cache so it
+    // doesn't leak across Runs (Codex P2 #33). The cache survives
+    // `run()` re-entry by design (resume-stable), but end-of-Run
+    // is the right point to reset it.
+    for (const node of this._compiledToolNodes) {
+      node.clearDirectPathTurns();
+    }
+    this._compiledToolNodes.clear();
     this.sessions.clear();
+  }
+
+  /**
+   * Subclass hook to register a freshly compiled ToolNode so
+   * `clearHeavyState` can flush its per-Run direct-path turn cache
+   * at end-of-Run. Internal — called from `initializeTools` in the
+   * concrete graph subclasses.
+   */
+  protected registerCompiledToolNode(node: {
+    clearDirectPathTurns(): void;
+  }): void {
+    this._compiledToolNodes.add(node);
   }
 
   /**
@@ -216,6 +255,56 @@ export abstract class Graph<
       });
     }
     return this._toolOutputRegistry;
+  }
+
+  /**
+   * Single per-Run file checkpointer shared across every ToolNode the
+   * graph compiles. Lazily constructed when
+   * `toolExecution.local.fileCheckpointing === true` so multi-agent
+   * graphs see ONE snapshot store, not one-per-agent. Returns
+   * undefined when checkpointing is disabled or the local engine
+   * isn't selected. Exposed via `Run.getFileCheckpointer()` /
+   * `Run.rewindFiles()`.
+   */
+  private _fileCheckpointer?: t.LocalFileCheckpointer;
+  /**
+   * ToolNodes compiled into this Graph's workflow. Tracked so
+   * `clearHeavyState()` can flush their per-Run direct-path turn
+   * cache (`directPathTurns`) at end-of-Run — that map intentionally
+   * survives `run()` re-entry (resume-stable per Codex P2 #30) but
+   * would otherwise grow linearly with tool calls and could collide
+   * across Runs if a provider reuses call ids (Codex P2 #33).
+   */
+  private _compiledToolNodes: Set<{
+    clearDirectPathTurns(): void;
+  }> = new Set();
+  public getOrCreateFileCheckpointer():
+    | t.LocalFileCheckpointer
+    | undefined {
+    // Return the cached instance unconditionally if one exists. The
+    // toolExecution check below decides whether to *create* a new
+    // one — `clearHeavyState` nulls `this.toolExecution` at end-of-
+    // Run, but we want post-Run `Run.rewindFiles()` to still resolve
+    // to the checkpointer that captured the writes. Codex P1 #32.
+    if (this._fileCheckpointer != null) {
+      return this._fileCheckpointer;
+    }
+    if (
+      this.toolExecution?.engine !== 'local' ||
+      this.toolExecution.local?.fileCheckpointing !== true
+    ) {
+      return undefined;
+    }
+    // Eagerly create via the bundle factory so the construction path
+    // matches the bundle-only callers (and future bundle-internal
+    // cleanup hooks fire). The bundle factory itself accepts a pre-
+    // supplied checkpointer when present, so re-injecting this one
+    // into every ToolNode is idempotent.
+    const bundle = createLocalCodingToolBundle(
+      this.toolExecution.local ?? {}
+    );
+    this._fileCheckpointer = bundle.checkpointer;
+    return this._fileCheckpointer;
   }
 }
 
@@ -578,7 +667,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         }
       }
 
-      return new CustomToolNode<t.BaseGraphState>({
+      const node = new CustomToolNode<t.BaseGraphState>({
         tools: allTools,
         toolMap: allToolMap,
         eventDrivenMode: true,
@@ -589,13 +678,17 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         toolRegistry: agentContext?.toolRegistry,
         hookRegistry: this.hookRegistry,
         humanInTheLoop: this.humanInTheLoop,
+        toolExecution: this.toolExecution,
         directToolNames: directToolNames.size > 0 ? directToolNames : undefined,
         maxContextTokens: agentContext?.maxContextTokens,
         maxToolResultChars: agentContext?.maxToolResultChars,
         toolOutputRegistry: this.getOrCreateToolOutputRegistry(),
-        errorHandler: (data, metadata) =>
+        fileCheckpointer: this.getOrCreateFileCheckpointer(),
+        errorHandler: (data, metadata): Promise<void> =>
           StandardGraph.handleToolCallErrorStatic(this, data, metadata),
       });
+      this.registerCompiledToolNode(node);
+      return node;
     }
 
     const graphTools = agentContext?.graphTools as t.GenericTool[] | undefined;
@@ -614,18 +707,24 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         ])
         : currentToolMap;
 
-    return new CustomToolNode<t.BaseGraphState>({
+    const node = new CustomToolNode<t.BaseGraphState>({
       tools: allTraditionalTools,
       toolMap: traditionalToolMap,
       toolCallStepIds: this.toolCallStepIds,
-      errorHandler: (data, metadata) =>
+      errorHandler: (data, metadata): Promise<void> =>
         StandardGraph.handleToolCallErrorStatic(this, data, metadata),
       toolRegistry: agentContext?.toolRegistry,
       sessions: this.sessions,
+      toolExecution: this.toolExecution,
+      hookRegistry: this.hookRegistry,
+      humanInTheLoop: this.humanInTheLoop,
       maxContextTokens: agentContext?.maxContextTokens,
       maxToolResultChars: agentContext?.maxToolResultChars,
       toolOutputRegistry: this.getOrCreateToolOutputRegistry(),
+      fileCheckpointer: this.getOrCreateFileCheckpointer(),
     });
+    this.registerCompiledToolNode(node);
+    return node;
   }
 
   overrideTestModel(
@@ -689,7 +788,37 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         agentContext.markToolsAsDiscovered(discoveredNames);
       }
 
-      const toolsForBinding = agentContext.getToolsForBinding();
+      const rawToolsForBinding = resolveLocalToolsForBinding({
+        tools: agentContext.getToolsForBinding(),
+        toolExecution: this.toolExecution,
+      });
+
+      /**
+       * Anthropic prompt-cache breakpoint on the tool definitions.
+       *
+       * Without this, the (often static) tool inventory shows up as
+       * fresh input on every turn — measured at ~28k tokens/turn for
+       * the local engine's coding-tool bundle, dominating per-turn
+       * cost even when message-level caching is on.
+       *
+       * Strategy: partition tools into [static, deferred] and stamp
+       * `cache_control: ephemeral` on the last static tool.
+       * Discovered deferred tools that arrive across turns sit *after*
+       * the breakpoint and don't invalidate the prefix.
+       */
+      let toolsForBinding = rawToolsForBinding;
+      if (
+        agentContext.provider === Providers.ANTHROPIC &&
+        (agentContext.clientOptions as t.AnthropicClientOptions | undefined)
+          ?.promptCache === true
+      ) {
+        toolsForBinding =
+          partitionAndMarkAnthropicToolCache(
+            rawToolsForBinding,
+            makeIsDeferred(agentContext.toolDefinitions)
+          ) ?? rawToolsForBinding;
+      }
+
       let model =
         this.overrideModel ??
         initializeModel({

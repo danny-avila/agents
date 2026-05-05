@@ -5,6 +5,10 @@ import { describe, it, expect, jest, afterEach } from '@jest/globals';
 import type { StructuredToolInterface } from '@langchain/core/tools';
 import type * as t from '@/types';
 import * as events from '@/utils/events';
+import type {
+  PostToolUseHookOutput,
+  PreToolUseHookOutput,
+} from '@/hooks';
 import { HookRegistry } from '@/hooks';
 import { ToolNode } from '../ToolNode';
 import { ToolOutputReferenceRegistry } from '../toolOutputReferences';
@@ -1433,6 +1437,116 @@ describe('ToolNode tool output references', () => {
       expect(capturedRequests[0].args).toEqual({
         command: 'rewritten STORED',
       });
+    });
+  });
+
+  describe('PostToolUse updatedOutput updates the registry (Codex P2 #17)', () => {
+    it('subsequent {{tool0turn0}} substitutions deliver the post-hook content, not the pre-hook content', async () => {
+      const capturedArgs: string[] = [];
+      const echoT = createEchoTool({
+        capturedArgs,
+        outputs: ['original-output', 'second-call-result'],
+      });
+
+      const registry = new HookRegistry();
+      registry.register('PostToolUse', {
+        hooks: [
+          // Replace the tool's content. Pre-fix the registry kept the
+          // pre-hook string ("original-output"), so a later
+          // {{tool0turn0}} substitution would deliver stale bytes.
+          async (): Promise<PostToolUseHookOutput> => ({
+            updatedOutput: 'redacted-by-hook',
+          }),
+        ],
+      });
+
+      const node = new ToolNode({
+        tools: [echoT],
+        toolOutputReferences: { enabled: true },
+        hookRegistry: registry,
+      });
+
+      const [first] = await invokeBatch(
+        node,
+        [{ id: 'c1', name: 'echo', command: 'first' }],
+        'run-posthook-ref'
+      );
+      // Sanity: the model sees the replaced content.
+      expect(first.content).toBe('redacted-by-hook');
+
+      // Second call references the first via {{tool0turn0}}. The
+      // tool's `command` arg should resolve to the post-hook content.
+      await invokeBatch(
+        node,
+        [{ id: 'c2', name: 'echo', command: 'value={{tool0turn0}}' }],
+        'run-posthook-ref'
+      );
+      expect(capturedArgs).toEqual(['first', 'value=redacted-by-hook']);
+      // Pre-fix: the second call would have seen 'value=original-output'
+      // because the registry was never updated after the post-hook.
+      expect(capturedArgs[1]).not.toContain('original-output');
+    });
+  });
+
+  describe('direct-batch snapshot isolation (Codex P1 #18)', () => {
+    it('does not let a slow PreToolUse hook on one call leak a sibling output into another call args', async () => {
+      // Two direct calls in a single batch:
+      //   c0: has a slow PreToolUse hook (await) + args containing
+      //       `{{tool1turn0}}` (a same-turn placeholder).
+      //   c1: no hook, returns 'sibling-output' instantly.
+      //
+      // Same-turn refs are intentionally isolated (the snapshot is
+      // taken pre-batch). Pre-fix, runTool's late re-resolve against
+      // the *live* registry meant c0 (waiting on its hook) saw c1's
+      // already-registered output and substituted it into its args
+      // — order-dependent leakage. With the snapshot, c0 sees the
+      // placeholder unresolved.
+      const capturedArgs: string[] = [];
+      const echoT = createEchoTool({
+        capturedArgs,
+        outputs: ['c0-output', 'sibling-output'],
+        name: 'echo',
+      });
+
+      const registry = new HookRegistry();
+      registry.register('PreToolUse', {
+        hooks: [
+          // Slow hook gates ONLY c0; c1 has no hook to wait on. The
+          // delay gives c1 time to finish and register its output
+          // before c0's `runTool` runs.
+          async (input): Promise<PreToolUseHookOutput> => {
+            const cmd = (input.toolInput as { command?: string }).command ?? '';
+            if (cmd.includes('{{tool1turn0}}')) {
+              await new Promise<void>((resolve) => setTimeout(resolve, 50));
+            }
+            return { decision: 'allow' };
+          },
+        ],
+      });
+
+      const node = new ToolNode({
+        tools: [echoT],
+        toolOutputReferences: { enabled: true },
+        hookRegistry: registry,
+      });
+
+      await invokeBatch(
+        node,
+        [
+          { id: 'c0', name: 'echo', command: 'leak={{tool1turn0}}' },
+          { id: 'c1', name: 'echo', command: 'instant' },
+        ],
+        'run-snapshot-iso'
+      );
+
+      // Pre-fix: capturedArgs[0] would have been 'leak=sibling-output'
+      // because c1 won the race and c0's late re-resolve picked it up.
+      // With the snapshot fix: same-turn isolation holds — the
+      // placeholder stays unresolved in c0's args (and an
+      // `[unresolved refs: …]` marker shows up downstream).
+      const c0Index = capturedArgs.findIndex((a) => a.startsWith('leak='));
+      expect(c0Index).toBeGreaterThanOrEqual(0);
+      expect(capturedArgs[c0Index]).not.toContain('sibling-output');
     });
   });
 });

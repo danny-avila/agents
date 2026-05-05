@@ -233,39 +233,68 @@ export function isAskUserQuestionInterrupt(
  * matches the pre-HITL behavior so existing hosts upgrading the SDK
  * see no change until they're ready to wire the resume UI.
  *
- * ## Scope: event-driven tools only
+ * ## Scope: every tool the ToolNode runs
  *
- * The interrupt path is wired into `ToolNode.dispatchToolEvents`, which
- * runs when the agent uses event-driven tool dispatch (the path
- * LibreChat and most production hosts take). Tools that execute via
- * the direct path — i.e. tools listed in `directToolNames` (the
- * graph-managed handoff and subagent tools) or tools on agents
- * configured WITHOUT `eventDrivenMode` — bypass the hook system
- * entirely. `PreToolUse` hooks do not fire for those tools and HITL
- * approval does not gate them.
+ * The interrupt path is wired into both `dispatchToolEvents` (the
+ * event-driven path) and `runDirectToolWithLifecycleHooks` (the
+ * direct path used by `directToolNames` entries — graph-managed
+ * handoff/subagent tools and every in-process `graphTool` instance).
+ * `PreToolUse` hooks fire for every tool the ToolNode invokes, and
+ * HITL approval gates every tool whose hook returns `'ask'` —
+ * regardless of whether the tool is dispatched as an event or
+ * invoked in-process. This convergence happened in two follow-up
+ * commits to the original HITL surface (see `Graph.ts` —
+ * `hookRegistry`/`humanInTheLoop` are passed in both
+ * event-driven and legacy branches; and `ToolNode.runDirectToolWithLifecycleHooks`
+ * — direct-path tools build their own single-tool `tool_approval`
+ * payload and raise `interrupt()` the same way the event path does).
  *
  * Practical implications:
- *   - LibreChat-style hosts using event-driven dispatch get the full
- *     HITL surface across every tool the model calls.
- *   - Hosts using `AgentInputs.tools` directly without event-driven
- *     mode get policy enforcement for nothing — the hooks register
- *     but never fire. Either switch to event-driven mode or accept
- *     that direct tools are not approval-gated. This is documented
- *     also on `ToolNodeOptions.hookRegistry`.
- *   - Mixed direct + event batches (e.g. a handoff tool sharing an
- *     LLM turn with a regular tool) currently re-execute the direct
- *     half on resume, since LangGraph rolls back the entire ToolNode
- *     on `interrupt()` throw. Hosts whose direct tools have side
- *     effects (subagents that invoke models, handoffs that trigger
- *     downstream work) should avoid mixing those tools into the same
- *     batch as approval-gated event tools.
+ *   - Every host gets the full HITL surface across every tool the
+ *     model calls — event-dispatched, direct, mixed.
+ *   - `createToolPolicyHook` and `createWorkspacePolicyHook` apply
+ *     uniformly. A hook can be registered without knowing or caring
+ *     which path the tool will take.
+ *   - Direct tools that the host opted into via `directToolNames` no
+ *     longer bypass policy. If you need a tool to skip the hook
+ *     surface entirely, omit it from any registered matcher.
+ *
+ * ## Resume re-execution: every tool in the interrupted batch
+ *
+ * LangGraph rolls back to the start of the interrupted node on
+ * resume. That means **every tool in the same batch as the one that
+ * interrupted re-runs from the top on the resume pass**, not just
+ * the interrupting tool, and not just the direct half (this used to
+ * be framed as a direct-tool-specific concern; it is not — it
+ * applies to event-dispatched siblings too). Practical contract:
+ *
+ *   - The body of the interrupting tool itself runs **once** total
+ *     (the first pass interrupted *before* the body, the resume pass
+ *     ran the body after the host's decision was applied).
+ *   - The body of any sibling tool that already executed in the
+ *     same batch before the interrupting tool runs **twice** — once
+ *     on the first pass, once on the resume pass.
+ *   - `PreToolUse` hooks fire **once per pass per tool**. A hook
+ *     that always returns `'ask'` will loop forever on resume; real
+ *     hooks should be deterministic w.r.t. inputs and use the
+ *     `'ask' → host approves → resume → hook returns 'allow'`
+ *     pattern, where the second-pass `allow` reflects the host
+ *     having recorded the approval (e.g., a session-scoped approved-
+ *     paths set keyed by `runId`).
+ *
+ * Consequence: any tool with side effects MUST be idempotent if
+ * there's any chance another tool in the same batch could trigger
+ * an interrupt. This applies equally to direct tools (handoffs,
+ * subagents) and to event tools.
  *
  * ## Note on idempotency
  *
- * When an interrupt fires, LangGraph re-runs the interrupted node
- * from the start on resume, which fires `PreToolUse` hooks again.
- * Hooks that produce side effects (logging, external calls) will see
- * two invocations per paused turn.
+ * Same root cause as the resume re-execution above: LangGraph
+ * re-runs the interrupted node from the start on resume, which
+ * fires `PreToolUse` hooks again. Hooks that produce side effects
+ * (logging, external calls) will see at least two invocations per
+ * paused turn — exactly two for the interrupting tool, possibly
+ * more across siblings.
  */
 export interface HumanInTheLoopConfig {
   /**

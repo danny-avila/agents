@@ -11,7 +11,11 @@ import type * as s from '@/types/stream';
 import type * as e from '@/common/enum';
 import type * as g from '@/types/graph';
 import type * as l from '@/types/llm';
-import type { ToolSessionMap, ToolOutputReferencesConfig } from '@/types/tools';
+import type {
+  ToolSessionMap,
+  ToolExecutionConfig,
+  ToolOutputReferencesConfig,
+} from '@/types/tools';
 import type { HumanInTheLoopConfig } from '@/types/hitl';
 import type { HookRegistry } from '@/hooks';
 
@@ -157,6 +161,13 @@ export type RunConfig = {
    * placeholders. Disabled by default so existing runs are unaffected.
    */
   toolOutputReferences?: ToolOutputReferencesConfig;
+  /**
+   * Selects the execution backend for built-in code tools. Omit this to keep
+   * the remote LibreChat Code API sandbox. Set `{ engine: 'local' }` to run
+   * code execution locally and auto-bind the local coding tool suite unless
+   * `local.includeCodingTools` is set to `false`.
+   */
+  toolExecution?: ToolExecutionConfig;
   /**
    * First-class human-in-the-loop (HITL) flow for this run.
    *

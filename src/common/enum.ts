@@ -189,6 +189,22 @@ export enum Constants {
   BASH_TOOL = 'bash_tool',
   BASH_PROGRAMMATIC_TOOL_CALLING = 'run_tools_with_bash',
   SUBAGENT = 'subagent',
+  /**
+   * Local-engine coding tool names. Promoted to `Constants.*` (rather
+   * than left as per-file `*ToolName` consts) so consumer UIs — most
+   * importantly LibreChat's `getToolIconType` map — can match against
+   * canonical strings instead of guessing. Existing matched names:
+   * `bash_tool`, `read_file`, `execute_code`, `run_tools_with_code`.
+   * The rest below are new and currently fall through to the generic
+   * tool icon; once LibreChat adds icons keyed on the same names, the
+   * wiring will work without an SDK change.
+   */
+  WRITE_FILE = 'write_file',
+  EDIT_FILE = 'edit_file',
+  GREP_SEARCH = 'grep_search',
+  GLOB_SEARCH = 'glob_search',
+  LIST_DIRECTORY = 'list_directory',
+  COMPILE_CHECK = 'compile_check',
 }
 
 /** Tool names that use the code execution environment (shared session, file tracking). */
@@ -198,6 +214,44 @@ export const CODE_EXECUTION_TOOLS: ReadonlySet<string> = new Set([
   Constants.PROGRAMMATIC_TOOL_CALLING,
   Constants.BASH_PROGRAMMATIC_TOOL_CALLING,
 ]);
+
+/**
+ * Canonical names of the local-engine-specific coding tools — the
+ * file/edit/search/typecheck surface that doesn't exist in the
+ * remote (sandbox-API) engine. Single source of truth; the per-tool
+ * factories, registry definitions, and `createWorkspacePolicyHook`
+ * default extractors all key off these.
+ *
+ * `read_file` is on this list (the existing ReadFile tool is
+ * remote-specific; the local engine's `read_file` is a parallel
+ * implementation that shares the canonical name so consumer UIs
+ * — most importantly LibreChat's `getToolIconType` — render both
+ * with the same icon).
+ */
+export const LOCAL_CODING_TOOL_NAMES: readonly string[] = [
+  Constants.READ_FILE,
+  Constants.WRITE_FILE,
+  Constants.EDIT_FILE,
+  Constants.GREP_SEARCH,
+  Constants.GLOB_SEARCH,
+  Constants.LIST_DIRECTORY,
+  Constants.COMPILE_CHECK,
+];
+
+/**
+ * Every tool name the local coding bundle (`createLocalCodingTools`)
+ * exposes — the local-specific tools above plus the bash/code/PTC
+ * pair that the local engine wraps around the existing factories.
+ * Tests pin against this so any addition/removal in the bundle is
+ * accompanied by a deliberate canonical-name update here.
+ */
+export const LOCAL_CODING_BUNDLE_NAMES: readonly string[] = [
+  ...LOCAL_CODING_TOOL_NAMES,
+  Constants.BASH_TOOL,
+  Constants.EXECUTE_CODE,
+  Constants.PROGRAMMATIC_TOOL_CALLING,
+  Constants.BASH_PROGRAMMATIC_TOOL_CALLING,
+];
 
 export enum TitleMethod {
   STRUCTURED = 'structured',

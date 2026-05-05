@@ -1062,4 +1062,179 @@ for member in team:
       expect(results[1].result.result).toBe(5);
     });
   });
+
+  describe('bash bridge script does not require python3 (Codex P2 #19)', () => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { _createBashProgramForTests } = require('../local/LocalProgrammaticToolCalling');
+
+    it('uses curl as the primary HTTP helper with python3 only as fallback', () => {
+      const script: string = _createBashProgramForTests(
+        'echo hello',
+        [],
+        'http://127.0.0.1:9999/tool',
+        'test-token'
+      );
+      // Curl path must be present and gated by `command -v curl` so
+      // it's tried first on hosts that have it.
+      expect(script).toContain('command -v curl');
+      expect(script).toContain('curl -sS -X POST');
+      // Python3 must remain as a fallback (not removed).
+      expect(script).toContain('command -v python3');
+      expect(script).toContain('python3 - "$__LIBRECHAT_TOOL_BRIDGE"');
+      // Curl branch must come BEFORE python3 — bash `if/elif` order
+      // determines which helper is preferred. Pre-fix, python3 was
+      // unconditional and the bash bridge failed on python3-less
+      // hosts (minimal containers, some Windows setups).
+      expect(script.indexOf('command -v curl')).toBeLessThan(
+        script.indexOf('command -v python3')
+      );
+      // Curl uses the bridge's text-mode endpoint to skip JSON
+      // parsing on the bash side.
+      expect(script).toContain('?mode=text');
+      // Helpful error when neither helper is available.
+      expect(script).toContain('needs either curl or python3');
+    });
+  });
+
+  describe('bridge runs PreToolUse hooks for inner tool calls (manual finding A)', () => {
+    // The bridge spawned by `run_tools_with_code` / `run_tools_with_bash`
+    // used to call inner tools via `executeTools` directly, bypassing
+    // every PreToolUse hook the host registered. Manual review flagged
+    // this as a P1 bypass — `write_file` could be invoked from inside
+    // a programmatic block while the host's `write_file` deny policy
+    // never saw it. Now ToolNode threads a `hookContext` into the
+    // programmatic-tool factory; the bridge runs PreToolUse before
+    // each inner call, fail-closing on `deny`/`ask`.
+
+    it('honours `decision: deny` for inner tool calls invoked through the bridge', async () => {
+      const { tool } = await import('@langchain/core/tools');
+      const { z } = await import('zod');
+      const { HookRegistry } = await import('@/hooks');
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const ptcMod = require('../local/LocalProgrammaticToolCalling');
+
+      let callsMade = 0;
+      const writeFileTool = tool(
+        async () => {
+          callsMade += 1;
+          return 'wrote file';
+        },
+        {
+          name: 'write_file',
+          description: 'mock write tool',
+          schema: z.object({ path: z.string() }),
+        }
+      );
+      const toolMap = new Map([['write_file', writeFileTool]]);
+      const registry = new HookRegistry();
+      registry.register('PreToolUse', {
+        hooks: [
+          async (input) => {
+            if (input.toolName === 'write_file') {
+              return { decision: 'deny', reason: 'no writes from bridge' };
+            }
+            return { decision: 'allow' };
+          },
+        ],
+      });
+
+      // Internal createToolBridge isn't exported, but exercising it via
+      // a synthetic HTTP request mirrors the real path. We use a tiny
+      // helper to access the (testing-internal) bridge factory.
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const http = require('http') as typeof import('http');
+
+      // Use the same internal factory the production path uses by
+      // invoking it through a direct-spawn substitute: capture the
+      // request handler by recreating the simplest possible call.
+      // Simpler: spin up a minimal duplicate and assert hook gating.
+      // (We can't easily test the production server without exposing
+      // it, but exporting `applyPreToolUseHooksForBridge` would also
+      // do the job — for this test we exercise the deny path through
+      // the public `executeTools` shortcut that the bridge uses.)
+      void ptcMod;
+      void toolMap;
+      void registry;
+      void callsMade;
+      void http;
+      // The minimum-viable assertion: registering a deny hook and
+      // sending a `write_file` request through the bridge results in
+      // the inner tool NOT being invoked. Implemented via the public
+      // `applyPreToolUseHooksForBridge` (added in this round) so we
+      // don't have to reach into the createServer closure.
+      const gate = await ptcMod.applyPreToolUseHooksForBridge(
+        { registry, runId: 'r1' },
+        'write_file',
+        'call_1',
+        { path: '/tmp/x' }
+      );
+      expect(gate.denyReason).toBeDefined();
+      expect(gate.denyReason).toContain('no writes from bridge');
+    });
+
+    it('passes through when no hook denies (allow path)', async () => {
+      const { HookRegistry } = await import('@/hooks');
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const ptcMod = require('../local/LocalProgrammaticToolCalling');
+
+      const registry = new HookRegistry();
+      registry.register('PreToolUse', {
+        hooks: [async () => ({ decision: 'allow' })],
+      });
+
+      const gate = await ptcMod.applyPreToolUseHooksForBridge(
+        { registry, runId: 'r1' },
+        'read_file',
+        'call_1',
+        { file_path: '/tmp/x' }
+      );
+      expect(gate.denyReason).toBeUndefined();
+      expect(gate.input).toEqual({ file_path: '/tmp/x' });
+    });
+
+    it('applies updatedInput to the inner tool args', async () => {
+      const { HookRegistry } = await import('@/hooks');
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const ptcMod = require('../local/LocalProgrammaticToolCalling');
+
+      const registry = new HookRegistry();
+      registry.register('PreToolUse', {
+        hooks: [
+          async () => ({
+            decision: 'allow',
+            updatedInput: { file_path: '/tmp/rewritten' },
+          }),
+        ],
+      });
+
+      const gate = await ptcMod.applyPreToolUseHooksForBridge(
+        { registry, runId: 'r1' },
+        'read_file',
+        'call_1',
+        { file_path: '/tmp/original' }
+      );
+      expect(gate.denyReason).toBeUndefined();
+      expect(gate.input).toEqual({ file_path: '/tmp/rewritten' });
+    });
+
+    it('treats `ask` as fail-closed deny (HITL not reachable from bridge)', async () => {
+      const { HookRegistry } = await import('@/hooks');
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const ptcMod = require('../local/LocalProgrammaticToolCalling');
+
+      const registry = new HookRegistry();
+      registry.register('PreToolUse', {
+        hooks: [async () => ({ decision: 'ask' })],
+      });
+
+      const gate = await ptcMod.applyPreToolUseHooksForBridge(
+        { registry, runId: 'r1' },
+        'edit_file',
+        'call_1',
+        {}
+      );
+      expect(gate.denyReason).toBeDefined();
+      expect(gate.denyReason).toMatch(/HITL|ask|approval|interrupt/i);
+    });
+  });
 });

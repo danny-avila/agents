@@ -17,6 +17,12 @@ export {
 } from './matchers';
 export { createToolPolicyHook } from './createToolPolicyHook';
 export type { ToolPolicyMode, ToolPolicyConfig } from './createToolPolicyHook';
+export { createWorkspacePolicyHook } from './createWorkspacePolicyHook';
+export type {
+  OutsideAccessPolicy,
+  WorkspacePolicyConfig,
+  PathExtractor,
+} from './createWorkspacePolicyHook';
 export { HOOK_EVENTS } from './types';
 export type {
   HookEvent,
