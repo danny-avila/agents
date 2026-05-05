@@ -2201,6 +2201,92 @@ describe('comprehensive review (round 14) — Codex P1 #37 + P2 #38/#40/#41', ()
     });
   });
 
+  describe('strict postEditSyntaxCheck reverts the write on failure (Codex P2 [49])', () => {
+    it('write_file: reverts the file contents to pre-write state when strict check fails', async () => {
+      const cwd = await createTempDir();
+      const fsp = await import('fs/promises');
+      const file = join(cwd, 'a.js');
+      await fsp.writeFile(file, '// good\nconsole.log("ok");\n');
+
+      const bundle = createLocalCodingToolBundle({
+        cwd,
+        postEditSyntaxCheck: 'strict',
+      });
+      const writeTool = bundle.tools.find(
+        (tt) => tt.name === Constants.WRITE_FILE
+      );
+      // Bad JS content (missing closing brace) — node --check will
+      // reject this and strict mode must throw AND restore the file.
+      await expect(
+        writeTool!.invoke({
+          id: 'wf-strict',
+          name: Constants.WRITE_FILE,
+          args: { file_path: file, content: 'function broken( {\n' },
+          type: 'tool_call',
+        })
+      ).rejects.toThrow(/syntax check failed.*reverted/i);
+      // Critical assertion: file on disk is restored to the
+      // pre-write content. Pre-fix it would still hold the broken
+      // content.
+      expect(await fsp.readFile(file, 'utf8')).toBe(
+        '// good\nconsole.log("ok");\n'
+      );
+    });
+
+    it('write_file: deletes a brand-new file when strict check fails on first write', async () => {
+      const cwd = await createTempDir();
+      const fsp = await import('fs/promises');
+      const file = join(cwd, 'never-existed.js');
+
+      const bundle = createLocalCodingToolBundle({
+        cwd,
+        postEditSyntaxCheck: 'strict',
+      });
+      const writeTool = bundle.tools.find(
+        (tt) => tt.name === Constants.WRITE_FILE
+      );
+      await expect(
+        writeTool!.invoke({
+          id: 'wf-strict-new',
+          name: Constants.WRITE_FILE,
+          args: { file_path: file, content: 'function broken( {\n' },
+          type: 'tool_call',
+        })
+      ).rejects.toThrow(/syntax check failed.*reverted/i);
+      // Brand-new file must be removed on revert.
+      await expect(fsp.stat(file)).rejects.toThrow();
+    });
+
+    it('edit_file: reverts to pre-edit content when strict check fails', async () => {
+      const cwd = await createTempDir();
+      const fsp = await import('fs/promises');
+      const file = join(cwd, 'b.js');
+      const original = 'function ok() { return 1; }\n';
+      await fsp.writeFile(file, original);
+
+      const bundle = createLocalCodingToolBundle({
+        cwd,
+        postEditSyntaxCheck: 'strict',
+      });
+      const editTool = bundle.tools.find(
+        (tt) => tt.name === Constants.EDIT_FILE
+      );
+      await expect(
+        editTool!.invoke({
+          id: 'ef-strict',
+          name: Constants.EDIT_FILE,
+          args: {
+            file_path: file,
+            old_text: 'return 1;',
+            new_text: 'return broken(',
+          },
+          type: 'tool_call',
+        })
+      ).rejects.toThrow(/syntax check failed.*reverted/i);
+      expect(await fsp.readFile(file, 'utf8')).toBe(original);
+    });
+  });
+
   describe('fallbackGrep skip sentinels do not count as matches (Codex P2 [43])', () => {
     it('reports `matches: 0` when only oversize files are present', async () => {
       _resetRipgrepCacheForTests();

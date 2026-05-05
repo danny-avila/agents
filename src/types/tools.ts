@@ -457,11 +457,36 @@ export type LocalWorkspaceConfig = {
  * `child_process.spawn` and `fs/promises`. A future engine (e.g.
  * stateful remote sandbox) supplies its own `spawn` and `fs` and
  * inherits every tool factory unchanged.
+ *
+ * **Important — pair `spawn` and `fs` together.** Most file-touching
+ * surfaces in the local engine route through `getWorkspaceFS(config)`
+ * so a host can transparently swap in a remote/in-memory FS. A small
+ * set of helpers — currently the `execute_code` non-bash temp-file
+ * write (Codex P2 [48]) — still uses host `fs/promises` directly to
+ * stage source on disk before invoking the spawn. If you override
+ * `spawn` to point at a remote runtime (SSH, container, etc.) you
+ * MUST also override `fs` with the corresponding remote
+ * implementation; otherwise temp source files written to the host
+ * `/tmp` won't be visible to the remote interpreter and `py`/`js`/
+ * `ts`/etc. executions will fail. (Bash-style executions go through
+ * `executeLocalBash` which doesn't stage temp files, so they're
+ * unaffected.)
+ *
+ * Threat-model note: the regex-based command validators
+ * (`dangerousCommandPatterns`, `quotedDestructivePatterns`, etc.) and
+ * the workspace policy hook are documented as best-effort tripwires.
+ * The hard security boundary is `local.sandbox.enabled: true` (which
+ * wraps execution in `@anthropic-ai/sandbox-runtime`); for adversarial-
+ * model threat models, do NOT rely on the regex layer alone.
  */
 export type LocalExecConfig = {
   /** Pluggable spawn (for SSH, container, remote workers, etc.). */
   spawn?: LocalSpawn;
-  /** Pluggable filesystem (for remote-workspace engines). */
+  /**
+   * Pluggable filesystem (for remote-workspace engines). Pair with
+   * `spawn` — see the type-level note above on why both should be
+   * overridden together for non-host engines.
+   */
   fs?: import('@/tools/local/workspaceFS').WorkspaceFS;
 };
 

@@ -260,6 +260,45 @@ function appendSyntaxCheckSummary(
   return `${base}${banner}${run.outcome.output}`;
 }
 
+/**
+ * Revert a write_file/edit_file mutation in `postEditSyntaxCheck:
+ * 'strict'` mode after the post-write syntax check failed. Strict
+ * mode advertises a safety gate, so leaving the corrupted file on
+ * disk + throwing is a half-broken contract — the model "reacts" to
+ * the error but the next call sees broken on-disk state. Codex P2
+ * [49]. Best-effort: a swallowed error here means the workspace is
+ * still in the bad post-write state, but we still throw the
+ * original syntax-check error so the caller knows.
+ *
+ * - If the file existed pre-write: restore the previous bytes with
+ *   the original encoding.
+ * - If the file is brand-new: unlink it.
+ */
+async function revertStrictWrite(
+  fs: import('./workspaceFS').WorkspaceFS,
+  path: string,
+  existed: boolean,
+  before: string,
+  encoding: { text: string; hasBom: boolean; newline: '\n' | '\r\n' }
+): Promise<void> {
+  try {
+    if (existed) {
+      // encodeFile uses encoding.{hasBom,newline} to restore the
+      // on-disk shape; the `text` field is overridden by the
+      // explicit `before` arg we pass in.
+      await fs.writeFile(
+        path,
+        encodeFile(before, { ...encoding, text: before }),
+        'utf8'
+      );
+    } else {
+      await fs.unlink(path);
+    }
+  } catch {
+    /* best-effort: caller still sees the original syntax error */
+  }
+}
+
 function summariseDiff(
   filePath: string,
   before: string,
@@ -510,8 +549,12 @@ export function createLocalWriteFileTool(
         : `Created ${path} (${input.content.length} chars).`;
       const summary = appendSyntaxCheckSummary(baseSummary, syntax);
       if (syntax?.outcome.ok === false && syntax.mode === 'strict') {
+        // Roll back the write so strict mode is an actual gate, not
+        // "fail the call AND leave the corrupted file on disk".
+        // Codex P2 [49].
+        await revertStrictWrite(fs, path, existed, before, encoding);
         throw new Error(
-          `write_file syntax check failed (${syntax.outcome.checker}):\n${syntax.outcome.output}`
+          `write_file syntax check failed (${syntax.outcome.checker}); reverted to pre-write state.\n${syntax.outcome.output}`
         );
       }
       return [
@@ -598,8 +641,12 @@ export function createLocalEditFileTool(
         `. Diff:\n${diff}`;
       const summary = appendSyntaxCheckSummary(baseSummary, syntax);
       if (syntax?.outcome.ok === false && syntax.mode === 'strict') {
+        // Restore the pre-edit bytes so strict mode is an actual
+        // gate (Codex P2 [49]). edit_file always operates on an
+        // existing file, so `existed = true` here.
+        await revertStrictWrite(fs, path, true, original, encoding);
         throw new Error(
-          `edit_file syntax check failed (${syntax.outcome.checker}):\n${syntax.outcome.output}`
+          `edit_file syntax check failed (${syntax.outcome.checker}); reverted to pre-edit state.\n${syntax.outcome.output}`
         );
       }
       return [
