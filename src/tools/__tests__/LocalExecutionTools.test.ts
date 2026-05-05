@@ -1882,3 +1882,68 @@ describe('comprehensive review (round 9) — Codex P1 (overflow-killed) + audit 
     });
   });
 });
+
+describe('comprehensive review (round 10) — Codex P1 #28 / P2 #29', () => {
+  describe('SIGKILL escalation defeats SIGTERM-trapping processes (Codex P1 #28)', () => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { spawnLocalProcess } = require('../local/LocalExecutionEngine');
+
+    it('escalates to SIGKILL when timeoutMs elapses and the child traps SIGTERM', async () => {
+      // Trap SIGTERM and loop forever. Pre-fix killProcessTree only
+      // sent SIGTERM, so the child kept running, `close` never
+      // fired, and the spawn promise hung past timeoutMs. Now SIGKILL
+      // escalation kicks in 2s after the SIGTERM and the child dies
+      // unconditionally.
+      const start = Date.now();
+      const result = await spawnLocalProcess(
+        'bash',
+        ['-c', "trap '' TERM; while true; do sleep 0.1; done"],
+        { timeoutMs: 1500, sandbox: { enabled: false } }
+      );
+      const elapsed = Date.now() - start;
+      // Sanity: the test has to actually have terminated. With the
+      // bug the promise hangs and Jest times out after 5s default.
+      // Generous upper bound: timeout (1.5s) + escalation (2s) +
+      // spawn overhead. Assert under 6s.
+      expect(elapsed).toBeLessThan(6000);
+      expect(result.timedOut).toBe(true);
+      // signal field is populated (SIGKILL after escalation, or
+      // possibly SIGTERM if the trap didn't take effect on a
+      // particular host).
+      expect(result.signal).toMatch(/^SIG/);
+    }, 10_000);
+  });
+
+  describe('compile-style runtimes honor local.shell (Codex P2 #29)', () => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { executeLocalCode } = require('../local/LocalExecutionEngine');
+
+    it('routes the rust runtime through `local.shell` instead of bare `bash`', async () => {
+      // Intercept spawn — assert the configured shell is used for
+      // the rs runtime, not hardcoded `bash`.
+      const realSpawn = (
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        require('child_process') as typeof import('child_process')
+      ).spawn;
+      const calls: string[] = [];
+      const intercept: t.LocalSpawn = ((
+        cmd: string,
+        args: string[],
+        opts: import('child_process').SpawnOptions
+      ) => {
+        calls.push(cmd);
+        // Don't actually try to compile rust — short-circuit via sh.
+        return realSpawn('sh', ['-c', 'exit 0'], opts);
+      }) as unknown as t.LocalSpawn;
+
+      await executeLocalCode(
+        { lang: 'rs', code: 'fn main() {}', args: [] },
+        { shell: '/bin/sh', exec: { spawn: intercept }, sandbox: { enabled: false } }
+      );
+
+      // The rust path's compile-and-run command should have been
+      // dispatched via `/bin/sh`, not `bash` / `bash.exe`.
+      expect(calls[0]).toBe('/bin/sh');
+    });
+  });
+});

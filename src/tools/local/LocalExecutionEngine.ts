@@ -923,7 +923,13 @@ export async function executeLocalCode(
   await mkdir(tempDir, { recursive: true });
 
   try {
-    const runtime = getRuntimeCommand(input.lang, tempDir, input.code, input.args);
+    const runtime = getRuntimeCommand(
+      input.lang,
+      tempDir,
+      input.code,
+      input.args,
+      config.shell
+    );
     if (runtime.source != null) {
       await writeFile(resolve(tempDir, runtime.fileName), runtime.source, 'utf8');
     }
@@ -937,9 +943,17 @@ function getRuntimeCommand(
   lang: string,
   tempDir: string,
   code: string,
-  args: string[] = []
+  args: string[] = [],
+  // Override for the shell used by compile-style runtimes (`rs`,
+  // `c`, `cpp`, `java`, `d`, `f90`). Threads `local.shell` so a host
+  // that doesn't have bash (or wants `/bin/sh` / zsh) can still
+  // execute these languages — Codex P2 #29: the bare-bash hardcode
+  // mirrored the same gap that Codex P1 #6 fixed for the syntax
+  // preflight, but had been missed for these runtime invocations.
+  shellOverride?: string
 ): RuntimeCommand {
   const fileFor = (name: string): string => resolve(tempDir, name);
+  const shell = shellOverride ?? configShell();
 
   switch (lang) {
   case 'py':
@@ -979,7 +993,7 @@ function getRuntimeCommand(
     };
   case 'rs':
     return {
-      command: configShell(),
+      command: shell,
       args: [
         '-lc',
         `rustc ${shellQuote(fileFor('main.rs'))} -o ${shellQuote(
@@ -991,7 +1005,7 @@ function getRuntimeCommand(
     };
   case 'c':
     return {
-      command: configShell(),
+      command: shell,
       args: [
         '-lc',
         `cc ${shellQuote(fileFor('main.c'))} -o ${shellQuote(
@@ -1003,7 +1017,7 @@ function getRuntimeCommand(
     };
   case 'cpp':
     return {
-      command: configShell(),
+      command: shell,
       args: [
         '-lc',
         `c++ ${shellQuote(fileFor('main.cpp'))} -o ${shellQuote(
@@ -1015,7 +1029,7 @@ function getRuntimeCommand(
     };
   case 'java':
     return {
-      command: configShell(),
+      command: shell,
       args: [
         '-lc',
         `javac ${shellQuote(fileFor('Main.java'))} && java -cp ${shellQuote(
@@ -1034,7 +1048,7 @@ function getRuntimeCommand(
     };
   case 'd':
     return {
-      command: configShell(),
+      command: shell,
       args: [
         '-lc',
         `dmd ${shellQuote(fileFor('main.d'))} -of=${shellQuote(
@@ -1046,7 +1060,7 @@ function getRuntimeCommand(
     };
   case 'f90':
     return {
-      command: configShell(),
+      command: shell,
       args: [
         '-lc',
         `gfortran ${shellQuote(fileFor('main.f90'))} -o ${shellQuote(
@@ -1065,10 +1079,19 @@ function configShell(): string {
   return process.platform === 'win32' ? 'bash.exe' : 'bash';
 }
 
-function killProcessTree(child: ChildProcess): void {
-  if (child.pid == null) {
-    return;
-  }
+/**
+ * How long after SIGTERM we wait before escalating to SIGKILL. A
+ * cooperative process gets a graceful chance to flush + clean up;
+ * a process that ignores or traps SIGTERM (`trap '' TERM`) gets
+ * killed unconditionally so timeoutMs / maxSpawnedBytes can't be
+ * defeated by a hostile script. Codex P1 #28 — pre-fix the spawn
+ * promise would never resolve in that case and the entire tool run
+ * would hang past the advertised timeout.
+ */
+const SIGKILL_ESCALATION_MS = 2000;
+
+function sigterm(child: ChildProcess): void {
+  if (child.pid == null) return;
   try {
     if (process.platform === 'win32') {
       child.kill('SIGTERM');
@@ -1078,6 +1101,34 @@ function killProcessTree(child: ChildProcess): void {
   } catch {
     child.kill('SIGTERM');
   }
+}
+
+function sigkill(child: ChildProcess): void {
+  if (child.pid == null) return;
+  if (child.exitCode != null || child.signalCode != null) return;
+  try {
+    if (process.platform === 'win32') {
+      child.kill('SIGKILL');
+      return;
+    }
+    process.kill(-child.pid, 'SIGKILL');
+  } catch {
+    try {
+      child.kill('SIGKILL');
+    } catch {
+      /* already dead */
+    }
+  }
+}
+
+function killProcessTree(child: ChildProcess): void {
+  sigterm(child);
+  // Escalate to SIGKILL if the child is still alive after the grace
+  // window. Use unref() so the timer doesn't keep the Node process
+  // alive past the parent's natural exit.
+  const escalation = setTimeout(() => sigkill(child), SIGKILL_ESCALATION_MS);
+  escalation.unref?.();
+  child.once('close', () => clearTimeout(escalation));
 }
 
 export function shellQuote(value: string): string {
