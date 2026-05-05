@@ -105,9 +105,48 @@ type SpawnResult = {
    * looked successful even though their output was truncated).
    */
   overflowKilled?: boolean;
+  /**
+   * Signal name (e.g. `'SIGKILL'`, `'SIGSEGV'`) when the process was
+   * terminated by a signal. Distinct from the overflow-kill path:
+   * this captures `kill -9 $$` from inside the script, native crashes,
+   * OS OOM killer, etc. Without this, signal-killed processes
+   * reported `exitCode: null` and looked like clean runs (Codex P2 —
+   * generalization of the overflow-kill fix). When present, the
+   * exitCode field is also synthesized to `128 + signum` per the
+   * POSIX convention so non-null-exit-code consumers see a failure.
+   */
+  signal?: string;
   /** Path to the full untruncated stdout/stderr when output exceeded `maxOutputChars`. */
   fullOutputPath?: string;
 };
+
+/**
+ * POSIX convention: `128 + signum` when a process is killed by a
+ * signal. Maps the common signals; unknown ones default to 1 so the
+ * caller still sees a non-zero (failed) exit. Only used when Node's
+ * `close` event reports `exitCode === null` (true signal kill).
+ */
+const SIGNAL_TO_EXIT_CODE: Record<string, number> = {
+  SIGHUP: 129,
+  SIGINT: 130,
+  SIGQUIT: 131,
+  SIGILL: 132,
+  SIGTRAP: 133,
+  SIGABRT: 134,
+  SIGBUS: 135,
+  SIGFPE: 136,
+  SIGKILL: 137,
+  SIGUSR1: 138,
+  SIGSEGV: 139,
+  SIGUSR2: 140,
+  SIGPIPE: 141,
+  SIGALRM: 142,
+  SIGTERM: 143,
+};
+function exitCodeForSignal(signal: string | null): number {
+  if (signal == null) return 1;
+  return SIGNAL_TO_EXIT_CODE[signal] ?? 1;
+}
 
 type RuntimeCommand = {
   command: string;
@@ -792,20 +831,30 @@ export async function spawnLocalProcess(
 
     child.on('error', fail);
 
-    child.on('close', (exitCode) => {
-      // Force a non-zero exit when we killed the child for output
-      // overflow. Node hands us exitCode === null for signal-killed
-      // processes; without this synthesis, callers like bash_tool
-      // observe "exitCode: null + non-empty stdout" and treat the
-      // result as success despite the SIGKILL. (Codex P1.)
-      const finalExit =
-        overflowKilled && exitCode == null ? 137 : exitCode;
+    child.on('close', (exitCode, signal) => {
+      // Synthesize a non-zero exit code whenever the process exited
+      // by signal — Node reports `exitCode: null` in that case and
+      // the formatter only prints non-null exit codes, so signal
+      // kills (overflow guard, `kill -9 $$` from inside the script,
+      // native crashes, OS OOM killer, …) would otherwise look like
+      // successful runs (Codex P1 + Codex P2). Overflow path keeps
+      // its 137 (SIGKILL) for compatibility; other signals map per
+      // POSIX `128 + signum`.
+      let finalExit: number | null = exitCode;
+      if (finalExit == null) {
+        if (overflowKilled) {
+          finalExit = 137;
+        } else if (signal != null) {
+          finalExit = exitCodeForSignal(signal);
+        }
+      }
       finish({
         stdout,
         stderr,
         exitCode: finalExit,
         timedOut,
         ...(overflowKilled ? { overflowKilled: true } : {}),
+        ...(signal != null ? { signal } : {}),
       });
     });
   });

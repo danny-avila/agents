@@ -1765,6 +1765,50 @@ describe('comprehensive review (round 9) — Codex P1 (overflow-killed) + audit 
     });
   });
 
+  describe('signal-killed processes report as failures (Codex P2 — generalizes the overflow fix)', () => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { spawnLocalProcess } = require('../local/LocalExecutionEngine');
+
+    it('synthesizes a non-zero exit code and surfaces the signal name on `kill -9 $$`', async () => {
+      // Script kills its own pgroup with SIGKILL. Pre-fix the close
+      // handler dropped the `signal` argument and kept exitCode=null,
+      // so this looked like a clean run.
+      const result = await spawnLocalProcess(
+        'bash',
+        ['-c', 'echo started; kill -9 $$'],
+        { timeoutMs: 5_000, sandbox: { enabled: false } }
+      );
+      // Node may report SIGKILL on the script process or the wrapper;
+      // either way exitCode must end up non-null and non-zero.
+      expect(result.exitCode).not.toBeNull();
+      expect(result.exitCode).not.toBe(0);
+      // Signal field is present and matches one of the expected
+      // POSIX kill signals.
+      expect(result.signal).toMatch(/^SIG/);
+    });
+
+    it('formatLocalOutput surfaces the signal kill', async () => {
+      const cwd = await createTempDir();
+      const bundle = createLocalCodingToolBundle({
+        cwd,
+        timeoutMs: 5_000,
+        sandbox: { enabled: false },
+      });
+      const bashTool = bundle.tools.find(
+        (tt) => tt.name === Constants.BASH_TOOL
+      );
+      const result = await bashTool!.invoke({
+        id: 'sig1',
+        name: Constants.BASH_TOOL,
+        args: { command: 'echo started; kill -9 $$' },
+        type: 'tool_call',
+      });
+      const text = JSON.stringify(result);
+      expect(text).toContain('killed: true');
+      expect(text).toMatch(/signal=SIG/);
+    });
+  });
+
   describe('fallback-grep nested-quantifier heuristic catches double-nested groups (audit #1)', () => {
     it('rejects `((a+)+)` (the textbook ReDoS pattern)', async () => {
       _resetRipgrepCacheForTests();

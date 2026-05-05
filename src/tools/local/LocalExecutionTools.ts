@@ -51,6 +51,7 @@ function formatLocalOutput(
     exitCode: number | null;
     timedOut: boolean;
     overflowKilled?: boolean;
+    signal?: string;
     fullOutputPath?: string;
   },
   cwd: string
@@ -82,6 +83,11 @@ function formatLocalOutput(
     // signal-killed processes.)
     formatted +=
       'killed: true (output exceeded local.maxSpawnedBytes; process tree was terminated)\n';
+  } else if (result.signal != null) {
+    // Generic signal kill: `kill -9 $$` from inside the script,
+    // native crash, OS OOM killer, etc. Codex P2 generalization of
+    // the overflow case.
+    formatted += `killed: true (signal=${result.signal})\n`;
   }
 
   if (result.fullOutputPath != null) {
