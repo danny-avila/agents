@@ -134,6 +134,15 @@ export function resolveLocalToolRegistry(args: {
 export function resolveLocalExecutionTools(args: {
   toolMap: t.ToolMap;
   toolExecution?: t.ToolExecutionConfig;
+  /**
+   * Caller-provided checkpointer that overrides the bundle's
+   * auto-created one. The Graph layer threads a single per-Run
+   * instance so every ToolNode it compiles shares one snapshot
+   * store — without that, a multi-agent graph would each get a
+   * private checkpointer and `Run.rewindFiles()` couldn't reach
+   * any of them.
+   */
+  fileCheckpointer?: t.LocalFileCheckpointer;
 }): ResolveLocalToolsResult {
   const directToolNames = new Set<string>();
   if (!shouldUseLocalExecution(args.toolExecution)) {
@@ -154,8 +163,10 @@ export function resolveLocalExecutionTools(args: {
     // immediately discarded, making the public `fileCheckpointing`
     // config flag a silent no-op outside of direct
     // `createLocalCodingToolBundle()` use.
-    if (localConfig.fileCheckpointing === true) {
-      const bundle = createLocalCodingToolBundle(localConfig);
+    if (localConfig.fileCheckpointing === true || args.fileCheckpointer != null) {
+      const bundle = createLocalCodingToolBundle(localConfig, {
+        checkpointer: args.fileCheckpointer,
+      });
       fileCheckpointer = bundle.checkpointer;
       for (const localTool of bundle.tools) {
         toolMap.set(localTool.name, localTool);

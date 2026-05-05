@@ -111,6 +111,19 @@ export type ToolNodeOptions = {
    * to process-based local executors at ToolNode construction time.
    */
   toolExecution?: ToolExecutionConfig;
+  /**
+   * Pre-constructed file checkpointer shared across every ToolNode in
+   * a Run so `Run.rewindFiles()` (and direct
+   * `Run.getFileCheckpointer()` callers) sees a single unified
+   * snapshot store. The Graph layer creates one per Run when
+   * `toolExecution.local.fileCheckpointing === true` and threads it
+   * to every ToolNode it compiles; without this shared instance,
+   * multi-agent graphs would each get their own private checkpointer
+   * and the host couldn't reach any of them. Wins over the
+   * auto-created bundle checkpointer in
+   * `resolveLocalExecutionTools`.
+   */
+  fileCheckpointer?: LocalFileCheckpointer;
 };
 
 export type ToolNodeConstructorParams = ToolRefs & ToolNodeOptions;
@@ -532,9 +545,11 @@ export type LocalExecutionConfig = {
    */
   bashAst?: LocalBashAstMode;
   /**
-   * Enable per-Run file checkpointing for `edit_file` / `write_file` so
-   * callers can rewind file changes via `Run.rewindFiles()`. Defaults
-   * to false.
+   * Enable per-Run file checkpointing for `edit_file` / `write_file`
+   * so callers can rewind file changes after a failed batch. When
+   * true and the run is constructed via `Run.create(...)`, the host
+   * can call `Run.rewindFiles()` (or `Run.getFileCheckpointer()` for
+   * the raw checkpointer). Defaults to false.
    */
   fileCheckpointing?: boolean;
   /**

@@ -56,6 +56,7 @@ import { AgentContext } from '@/agents/AgentContext';
 import { createFakeStreamingLLM } from '@/llm/fake';
 import { handleToolCalls } from '@/tools/handlers';
 import { resolveLocalToolsForBinding } from '@/tools/local';
+import { createLocalCodingToolBundle } from '@/tools/local/LocalCodingTools';
 import { isThinkingEnabled } from '@/llm/request';
 import { initializeModel } from '@/llm/init';
 import { HandlerRegistry } from '@/events';
@@ -195,6 +196,11 @@ export abstract class Graph<
      */
     this._toolOutputRegistry?.clear();
     this._toolOutputRegistry = undefined;
+    // Drop the per-Run file checkpointer so the next run starts with a
+    // fresh snapshot store. Previous-run snapshots are no longer
+    // reachable through Run.getFileCheckpointer() once cleared, so
+    // hosts that need to rewind must do so before the run completes.
+    this._fileCheckpointer = undefined;
     this.sessions.clear();
   }
 
@@ -224,6 +230,39 @@ export abstract class Graph<
       });
     }
     return this._toolOutputRegistry;
+  }
+
+  /**
+   * Single per-Run file checkpointer shared across every ToolNode the
+   * graph compiles. Lazily constructed when
+   * `toolExecution.local.fileCheckpointing === true` so multi-agent
+   * graphs see ONE snapshot store, not one-per-agent. Returns
+   * undefined when checkpointing is disabled or the local engine
+   * isn't selected. Exposed via `Run.getFileCheckpointer()` /
+   * `Run.rewindFiles()`.
+   */
+  private _fileCheckpointer?: t.LocalFileCheckpointer;
+  public getOrCreateFileCheckpointer():
+    | t.LocalFileCheckpointer
+    | undefined {
+    if (
+      this.toolExecution?.engine !== 'local' ||
+      this.toolExecution.local?.fileCheckpointing !== true
+    ) {
+      return undefined;
+    }
+    if (this._fileCheckpointer == null) {
+      // Eagerly create via the bundle factory so the construction
+      // path matches the bundle-only callers (and future
+      // bundle-internal cleanup hooks fire). The bundle factory
+      // itself accepts a pre-supplied checkpointer when present, so
+      // re-injecting this one into every ToolNode is idempotent.
+      const bundle = createLocalCodingToolBundle(
+        this.toolExecution.local ?? {}
+      );
+      this._fileCheckpointer = bundle.checkpointer;
+    }
+    return this._fileCheckpointer;
   }
 }
 
@@ -602,6 +641,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         maxContextTokens: agentContext?.maxContextTokens,
         maxToolResultChars: agentContext?.maxToolResultChars,
         toolOutputRegistry: this.getOrCreateToolOutputRegistry(),
+        fileCheckpointer: this.getOrCreateFileCheckpointer(),
         errorHandler: (data, metadata) =>
           StandardGraph.handleToolCallErrorStatic(this, data, metadata),
       });
@@ -637,6 +677,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       maxContextTokens: agentContext?.maxContextTokens,
       maxToolResultChars: agentContext?.maxToolResultChars,
       toolOutputRegistry: this.getOrCreateToolOutputRegistry(),
+      fileCheckpointer: this.getOrCreateFileCheckpointer(),
     });
   }
 

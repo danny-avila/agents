@@ -902,6 +902,33 @@ export class Run<_T extends t.BaseGraphState> {
    * graph state from the checkpoint and re-enters the interrupted node
    * from the start.
    */
+  /**
+   * Returns the per-Run file checkpointer when
+   * `toolExecution.local.fileCheckpointing === true` was set on the
+   * RunConfig. Hosts can capture extra paths or call `rewind()`
+   * directly. Returns undefined when checkpointing is disabled.
+   *
+   * Construction-time invariant: the checkpointer is shared across
+   * every ToolNode the graph compiles (single-agent and multi-agent),
+   * so a `rewind()` call here unwinds writes made by ANY agent in the
+   * run.
+   */
+  getFileCheckpointer(): t.LocalFileCheckpointer | undefined {
+    return this.Graph?.getOrCreateFileCheckpointer();
+  }
+
+  /**
+   * Convenience wrapper that calls `rewind()` on the per-Run file
+   * checkpointer. Restores every file the local engine snapshotted
+   * during this Run to its pre-write content (and deletes any path
+   * that didn't exist before being created). Returns the count of
+   * paths processed; returns 0 when checkpointing is disabled.
+   */
+  async rewindFiles(): Promise<number> {
+    const cp = this.getFileCheckpointer();
+    return cp == null ? 0 : cp.rewind();
+  }
+
   async resume<TResume = t.ToolApprovalDecision[] | t.ToolApprovalDecisionMap>(
     resumeValue: TResume,
     callerConfig: Partial<RunnableConfig> & {

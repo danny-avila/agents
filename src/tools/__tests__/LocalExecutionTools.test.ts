@@ -14,7 +14,7 @@ import { AIMessage, ToolMessage } from '@langchain/core/messages';
 import { describe, it, expect, afterEach, beforeEach, jest } from '@jest/globals';
 import type { StructuredToolInterface } from '@langchain/core/tools';
 import type * as t from '@/types';
-import { Constants } from '@/common';
+import { Constants, Providers } from '@/common';
 import { ToolNode } from '../ToolNode';
 import {
   executeLocalBash,
@@ -1469,6 +1469,65 @@ describe('comprehensive review (round 7) — manual finding E', () => {
         toolExecution: { engine: 'local' },
       });
       expect(node.getFileCheckpointer()).toBeUndefined();
+    });
+  });
+
+  describe('fileCheckpointer reachable through Run.getFileCheckpointer / Run.rewindFiles (audit-of-audit follow-up)', () => {
+    // The round-7 fix exposed `getFileCheckpointer()` on ToolNode but
+    // the normal `Run.create(...)` path constructs the ToolNode inline
+    // inside StandardGraph and dropped the reference, so the public
+    // `RunConfig.toolExecution.local.fileCheckpointing` flag was still
+    // a no-op for Run callers (only direct `new ToolNode(...)` users
+    // could reach it). Pin the round-trip: a Run constructed through
+    // the standard config path must surface the same checkpointer the
+    // graph wired into its ToolNode, and `Run.rewindFiles()` must
+    // restore captured paths.
+    it('exposes the checkpointer via Run.getFileCheckpointer + restores through Run.rewindFiles', async () => {
+      const { Run } = await import('@/run');
+      const fs = await import('fs/promises');
+      const cwd = await createTempDir();
+      const file = join(cwd, 'tracked.txt');
+      await fs.writeFile(file, 'before\n');
+
+      const run = await Run.create<t.IState>({
+        runId: 'run-checkpoint-roundtrip',
+        graphConfig: {
+          type: 'standard',
+          llmConfig: { provider: Providers.OPENAI, model: 'gpt-4o' },
+        },
+        toolExecution: {
+          engine: 'local',
+          local: { cwd, fileCheckpointing: true },
+        },
+      });
+
+      // Reachable straight off Run — used to be undefined here even
+      // when the config flag was true.
+      const cp = run.getFileCheckpointer();
+      expect(cp).toBeDefined();
+
+      // Capture, mutate, rewind via Run.rewindFiles() (the API the
+      // public JSDoc on `LocalExecutionConfig.fileCheckpointing`
+      // promises).
+      await cp!.captureBeforeWrite(file);
+      await fs.writeFile(file, 'mutated\n');
+      const restored = await run.rewindFiles();
+      expect(restored).toBeGreaterThanOrEqual(1);
+      expect(await fs.readFile(file, 'utf8')).toBe('before\n');
+    });
+
+    it('Run.rewindFiles returns 0 when fileCheckpointing is disabled', async () => {
+      const { Run } = await import('@/run');
+      const run = await Run.create<t.IState>({
+        runId: 'run-no-checkpoint',
+        graphConfig: {
+          type: 'standard',
+          llmConfig: { provider: Providers.OPENAI, model: 'gpt-4o' },
+        },
+        toolExecution: { engine: 'local' },
+      });
+      expect(run.getFileCheckpointer()).toBeUndefined();
+      expect(await run.rewindFiles()).toBe(0);
     });
   });
 });

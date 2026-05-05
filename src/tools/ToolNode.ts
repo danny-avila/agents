@@ -359,6 +359,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     toolOutputReferences,
     toolOutputRegistry,
     toolExecution,
+    fileCheckpointer,
   }: t.ToolNodeConstructorParams) {
     super({ name, tags, func: (input, config) => this.run(input, config) });
     this.toolMap = toolMap ?? new Map(tools.map((tool) => [tool.name, tool]));
@@ -377,6 +378,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     this.hookRegistry = hookRegistry;
     this.humanInTheLoop = humanInTheLoop;
     this.toolExecution = toolExecution;
+    // Caller-provided checkpointer wins. Graphs use this to share a
+    // single per-Run instance across every ToolNode they compile so
+    // `Run.rewindFiles()` reaches the same snapshot store regardless
+    // of which agent's tool batch ran. Falls through to the bundle's
+    // auto-created one when undefined (direct ToolNode construction).
+    this.fileCheckpointer = fileCheckpointer;
     this.applyToolExecutionOverrides();
     /**
      * Precedence: an explicitly passed `toolOutputRegistry` instance
@@ -424,6 +431,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     const resolved = resolveLocalExecutionTools({
       toolMap: this.toolMap,
       toolExecution: this.toolExecution,
+      fileCheckpointer: this.fileCheckpointer,
     });
 
     this.toolMap = resolved.toolMap;
