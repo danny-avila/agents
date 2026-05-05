@@ -23,17 +23,18 @@
  * exit code is reported.
  */
 
-import { readFile, stat } from 'fs/promises';
 import { resolve } from 'path';
 import { tool } from '@langchain/core/tools';
 import type { DynamicStructuredTool } from '@langchain/core/tools';
 import type * as t from '@/types';
 import {
   getLocalCwd,
+  getWorkspaceFS,
   spawnLocalProcess,
   truncateLocalOutput,
   validateBashCommand,
 } from './LocalExecutionEngine';
+import type { WorkspaceFS } from './workspaceFS';
 import { Constants } from '@/common';
 
 /** Back-compat alias; canonical name lives on `Constants.COMPILE_CHECK`. */
@@ -69,27 +70,31 @@ type Detection = {
   reason: string;
 };
 
-async function pathExists(p: string): Promise<boolean> {
+async function pathExists(fs: WorkspaceFS, p: string): Promise<boolean> {
   try {
-    await stat(p);
+    await fs.stat(p);
     return true;
   } catch {
     return false;
   }
 }
 
-async function detect(cwd: string): Promise<Detection> {
-  if (await pathExists(resolve(cwd, 'tsconfig.json'))) {
+// Probes for project markers via the configured WorkspaceFS so a Run
+// with `local.exec.fs` (in-memory or remote engine) detects the right
+// toolchain against the actual workspace — not the host filesystem.
+// Codex P1 #25.
+async function detect(cwd: string, fs: WorkspaceFS): Promise<Detection> {
+  if (await pathExists(fs, resolve(cwd, 'tsconfig.json'))) {
     return {
       kind: 'typescript',
       command: 'npx --no-install tsc --noEmit',
       reason: 'tsconfig.json present',
     };
   }
-  if (await pathExists(resolve(cwd, 'package.json'))) {
-    const pkgRaw = await readFile(resolve(cwd, 'package.json'), 'utf8').catch(
-      () => ''
-    );
+  if (await pathExists(fs, resolve(cwd, 'package.json'))) {
+    const pkgRaw = await fs
+      .readFile(resolve(cwd, 'package.json'), 'utf8')
+      .catch(() => '');
     if (pkgRaw.includes('"typescript"')) {
       return {
         kind: 'typescript',
@@ -98,14 +103,14 @@ async function detect(cwd: string): Promise<Detection> {
       };
     }
   }
-  if (await pathExists(resolve(cwd, 'Cargo.toml'))) {
+  if (await pathExists(fs, resolve(cwd, 'Cargo.toml'))) {
     return {
       kind: 'rust',
       command: 'cargo check --message-format=short',
       reason: 'Cargo.toml present',
     };
   }
-  if (await pathExists(resolve(cwd, 'go.mod'))) {
+  if (await pathExists(fs, resolve(cwd, 'go.mod'))) {
     return {
       kind: 'go',
       command: 'go vet ./...',
@@ -113,14 +118,13 @@ async function detect(cwd: string): Promise<Detection> {
     };
   }
   if (
-    (await pathExists(resolve(cwd, 'pyproject.toml'))) ||
-    (await pathExists(resolve(cwd, 'setup.py'))) ||
-    (await pathExists(resolve(cwd, 'setup.cfg')))
+    (await pathExists(fs, resolve(cwd, 'pyproject.toml'))) ||
+    (await pathExists(fs, resolve(cwd, 'setup.py'))) ||
+    (await pathExists(fs, resolve(cwd, 'setup.cfg')))
   ) {
-    const pyToml = await readFile(
-      resolve(cwd, 'pyproject.toml'),
-      'utf8'
-    ).catch(() => '');
+    const pyToml = await fs
+      .readFile(resolve(cwd, 'pyproject.toml'), 'utf8')
+      .catch(() => '');
     if (pyToml.includes('mypy')) {
       return {
         kind: 'python-mypy',
@@ -155,6 +159,7 @@ export function createCompileCheckTool(
         timeout_ms?: number;
       };
       const cwd = getLocalCwd(config);
+      const fs = getWorkspaceFS(config);
       const overrideCommand = input.command ?? config.compileCheck?.command;
       let detection: Detection;
       if (overrideCommand != null && overrideCommand.trim() !== '') {
@@ -164,7 +169,7 @@ export function createCompileCheckTool(
           reason: 'explicit override',
         };
       } else {
-        detection = await detect(cwd);
+        detection = await detect(cwd, fs);
       }
 
       if (detection.command === '') {

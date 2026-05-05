@@ -1582,3 +1582,137 @@ describe('comprehensive review (round 7) — manual finding E', () => {
     });
   });
 });
+
+describe('comprehensive review (round 8) — Codex P1 #24 / P1 #25', () => {
+  describe('JSON post-edit syntax check uses WorkspaceFS (Codex P1 #24)', () => {
+    it('routes the JSON read through `local.exec.fs` instead of host fs', async () => {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { runPostEditSyntaxCheck } = require('../local/syntaxCheck');
+
+      const reads: string[] = [];
+      // Custom WorkspaceFS that returns valid JSON for the path the
+      // syntax checker asks about. If the checker bypassed our fs and
+      // hit the host filesystem instead, `reads` would stay empty
+      // AND the validator would silently pass (host file doesn't
+      // exist → catch returns undefined → `ok: true`). The "ok: true"
+      // would be a FALSE pass, exactly the failure mode codex flagged.
+      const fakeFs = {
+        readFile: async (p: string, _enc?: 'utf8'): Promise<string> => {
+          reads.push(p);
+          return '{"valid": true}';
+        },
+        // unused stubs to satisfy the WorkspaceFS shape — never called
+        // by the JSON checker
+        writeFile: async () => undefined,
+        stat: async () => {
+          throw new Error('not implemented');
+        },
+        readdir: async () => [],
+        mkdir: async () => undefined,
+        realpath: async (p: string) => p,
+        unlink: async () => undefined,
+        open: async () => {
+          throw new Error('not implemented');
+        },
+      };
+
+      const ok = await runPostEditSyntaxCheck('/virtual/file.json', {
+        exec: { fs: fakeFs as unknown as never },
+      });
+      expect(ok?.ok).toBe(true);
+      expect(reads).toEqual(['/virtual/file.json']);
+    });
+
+    it('flags invalid JSON returned by the WorkspaceFS', async () => {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { runPostEditSyntaxCheck } = require('../local/syntaxCheck');
+      const fakeFs = {
+        readFile: async () => '{ invalid: json',
+        writeFile: async () => undefined,
+        stat: async () => {
+          throw new Error('not implemented');
+        },
+        readdir: async () => [],
+        mkdir: async () => undefined,
+        realpath: async (p: string) => p,
+        unlink: async () => undefined,
+        open: async () => {
+          throw new Error('not implemented');
+        },
+      };
+      const result = await runPostEditSyntaxCheck('/virtual/bad.json', {
+        exec: { fs: fakeFs as unknown as never },
+      });
+      expect(result?.ok).toBe(false);
+      expect(result?.checker).toBe('JSON.parse');
+    });
+  });
+
+  describe('compile_check detect uses WorkspaceFS (Codex P1 #25)', () => {
+    it('routes project-marker probes through `local.exec.fs`', async () => {
+      // Custom FS that pretends `tsconfig.json` exists at the cwd. If
+      // detect bypasses our fs and uses host fs/promises, the host
+      // path won't have a tsconfig.json and detection falls through
+      // to "unknown".
+      const stats: string[] = [];
+      const fakeFs = {
+        readFile: async () => '',
+        writeFile: async () => undefined,
+        stat: async (p: string) => {
+          stats.push(p);
+          if (p.endsWith('tsconfig.json')) {
+            return {
+              isFile: () => true,
+              isDirectory: () => false,
+              size: 0,
+            };
+          }
+          throw new Error('ENOENT');
+        },
+        readdir: async () => [],
+        mkdir: async () => undefined,
+        realpath: async (p: string) => p,
+        unlink: async () => undefined,
+        open: async () => {
+          throw new Error('not implemented');
+        },
+      };
+
+      const compile = createCompileCheckTool({
+        cwd: '/virtual/repo',
+        exec: { fs: fakeFs as unknown as never },
+      });
+      // Don't actually run anything — we only care that detect()
+      // saw the tsconfig and picked typescript. The validateBashCommand
+      // call inside the tool will still try to spawn, but we don't
+      // need to assert on its outcome; the artifact carries the
+      // detection result.
+      const result = await compile.invoke({
+        id: 'cc',
+        name: Constants.COMPILE_CHECK,
+        args: { command: 'echo skip-spawn' },
+        type: 'tool_call',
+      });
+      // Just confirm at least one stat was made through our fake fs
+      // (auto-detect path). Even with the explicit override we use
+      // here, the tool path doesn't run detect — but the cwd-init
+      // and validateBashCommand still go through the right fs.
+      // For the actual detect() invocation, drop the override:
+      void result;
+      const compile2 = createCompileCheckTool({
+        cwd: '/virtual/repo',
+        exec: { fs: fakeFs as unknown as never },
+      });
+      await compile2.invoke({
+        id: 'cc2',
+        name: Constants.COMPILE_CHECK,
+        args: {},
+        type: 'tool_call',
+      });
+      // The tsconfig probe and the package.json probe (if it gets
+      // there) happen BEFORE the spawn, so even if spawn fails the
+      // stats list captures what detect saw.
+      expect(stats.some((p) => p.endsWith('tsconfig.json'))).toBe(true);
+    });
+  });
+});

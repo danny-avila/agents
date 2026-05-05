@@ -17,9 +17,12 @@
  */
 
 import { extname } from 'path';
-import { readFile } from 'fs/promises';
 import type * as t from '@/types';
-import { getSpawn, spawnLocalProcess } from './LocalExecutionEngine';
+import {
+  getSpawn,
+  getWorkspaceFS,
+  spawnLocalProcess,
+} from './LocalExecutionEngine';
 
 export type SyntaxCheckOutcome =
   | { ok: true }
@@ -135,8 +138,15 @@ const pythonCheck: SyntaxChecker = async (path, config) => {
   };
 };
 
-const jsonCheck: SyntaxChecker = async (path) => {
-  const raw = await readFile(path, 'utf8').catch(() => undefined);
+const jsonCheck: SyntaxChecker = async (path, config) => {
+  // Route through the configured WorkspaceFS so a Run with a custom
+  // `local.exec.fs` (in-memory or remote engine) validates the same
+  // file the write_file/edit_file path actually wrote — pre-fix this
+  // read went to the host fs and either silently passed (no host
+  // file → catch returns undefined → ok: true) or read a different
+  // file with the same absolute path. Codex P1 #24.
+  const fs = getWorkspaceFS(config);
+  const raw = await fs.readFile(path, 'utf8').catch(() => undefined);
   if (raw == null) return { ok: true };
   try {
     JSON.parse(raw);
