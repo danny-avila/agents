@@ -1,6 +1,6 @@
 {
   "name": "@librechat/agents",
-  "version": "3.1.77",
+  "version": "3.1.78-dev.0",
   "main": "./dist/cjs/main.cjs",
   "module": "./dist/esm/main.mjs",
   "types": "./dist/types/index.d.ts",
@@ -211,7 +211,7 @@
     "@scarf/scarf": "^1.4.0",
     "@types/diff": "^7.0.2",
     "ai-tokenizer": "^1.0.6",
-    "axios": "^1.15.0",
+    "axios": "^1.16.0",
     "cheerio": "^1.0.0",
     "diff": "^9.0.0",
     "dotenv": "^16.4.7",
