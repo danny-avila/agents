@@ -892,23 +892,35 @@ function compileFallbackRegex(pattern: string): RegExp {
   }
 }
 
+/** Structured return so callers can count matches separately from
+ * diagnostic skip-sentinels (Codex P2 [43]). */
+type FallbackGrepResult = { matches: string[]; skipped: string[] };
+
 async function fallbackGrep(
   root: string,
   pattern: string,
   globFilter: string | undefined,
   maxResults: number,
   fs: import('./workspaceFS').WorkspaceFS
-): Promise<string[]> {
+): Promise<FallbackGrepResult> {
   const rx = compileFallbackRegex(pattern);
   const deadline = Date.now() + FALLBACK_GREP_BUDGET_MS;
   const globRx =
     globFilter != null && globFilter !== '' ? globToRegExp(globFilter) : undefined;
   const matches: string[] = [];
+  // Track skipped (oversize) files separately so they don't consume
+  // the maxResults budget. Codex P2 [43]: round 14's fix pushed skip
+  // sentinels into `matches`, so a directory of one oversize non-
+  // matching file falsely reported `matches: 1`, and enough
+  // oversize files could fill the budget before any real match was
+  // scanned. Now diagnostics are appended after real matches and
+  // independent of the budget.
+  const skippedDiagnostics: string[] = [];
   for await (const file of walkFiles(root, fs)) {
     if (Date.now() > deadline) {
       // Wall-clock budget exceeded — return partial results rather
       // than letting a slow pattern hang the Run.
-      return matches;
+      return { matches, skipped: skippedDiagnostics };
     }
     if (globRx != null) {
       const rel = file.startsWith(root + '/') ? file.slice(root.length + 1) : file;
@@ -916,12 +928,11 @@ async function fallbackGrep(
         continue;
       }
     }
-    // Skip files larger than the per-file cap and emit a sentinel
-    // line. Codex P2 #41: pre-fix `fs.readFile` then `.split('\n')`
-    // allocated the whole file + an array of every line, which a
-    // single multi-GB log could turn into an OOM even after the
-    // regex DoS guards. The wall-clock budget only checks BETWEEN
-    // files so it can't interrupt one pathological read.
+    // Skip files larger than the per-file cap and remember them as
+    // diagnostics (NOT as matches). Codex P2 [41]: pre-fix
+    // `fs.readFile` then `.split('\n')` allocated the whole file +
+    // an array of every line, which a single multi-GB log could
+    // turn into an OOM even after the regex DoS guards.
     let stat;
     try {
       stat = await fs.stat(file);
@@ -929,10 +940,9 @@ async function fallbackGrep(
       continue;
     }
     if (stat.size > FALLBACK_GREP_MAX_FILE_BYTES) {
-      matches.push(
+      skippedDiagnostics.push(
         `${file}:0:[skipped: file > ${FALLBACK_GREP_MAX_FILE_BYTES} bytes; install ripgrep for unbounded grep]`
       );
-      if (matches.length >= maxResults) return matches;
       continue;
     }
     let content;
@@ -946,18 +956,20 @@ async function fallbackGrep(
     }
     // Re-check the deadline AFTER the read — a slow disk on one
     // file can blow the budget without us noticing.
-    if (Date.now() > deadline) return matches;
+    if (Date.now() > deadline) {
+      return { matches, skipped: skippedDiagnostics };
+    }
     const lines = content.split('\n');
     for (let i = 0; i < lines.length; i++) {
       if (rx.test(lines[i])) {
         matches.push(`${file}:${i + 1}:${lines[i]}`);
         if (matches.length >= maxResults) {
-          return matches;
+          return { matches, skipped: skippedDiagnostics };
         }
       }
     }
   }
-  return matches;
+  return { matches, skipped: skippedDiagnostics };
 }
 
 async function fallbackGlob(
@@ -1046,16 +1058,29 @@ export function createLocalGrepSearchTool(
       }
 
       try {
-        const matches = await fallbackGrep(
+        const { matches, skipped } = await fallbackGrep(
           target,
           input.pattern,
           input.glob,
           maxResults,
           fs
         );
+        // Display: real matches first, skip diagnostics appended.
+        // Artifact count: ONLY real matches (Codex P2 [43] —
+        // skip sentinels used to inflate the count and the budget).
+        const display =
+          matches.length > 0
+            ? [...matches, ...skipped].join('\n')
+            : skipped.length > 0
+              ? skipped.join('\n')
+              : 'No matches found.';
         return [
-          matches.length > 0 ? matches.join('\n') : 'No matches found.',
-          { matches: matches.length, engine: 'node-fallback' },
+          display,
+          {
+            matches: matches.length,
+            skipped: skipped.length,
+            engine: 'node-fallback',
+          },
         ];
       } catch (e) {
         if (e instanceof FallbackGrepError) {

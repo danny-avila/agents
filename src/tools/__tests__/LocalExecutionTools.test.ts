@@ -11,6 +11,7 @@ import {
 } from 'fs/promises';
 import { tool } from '@langchain/core/tools';
 import { AIMessage, ToolMessage } from '@langchain/core/messages';
+import type { BaseMessage } from '@langchain/core/messages';
 import { describe, it, expect, afterEach, beforeEach, jest } from '@jest/globals';
 import type { StructuredToolInterface } from '@langchain/core/tools';
 import type * as t from '@/types';
@@ -2148,6 +2149,126 @@ describe('comprehensive review (round 14) — Codex P1 #37 + P2 #38/#40/#41', ()
     it('still allows benign trailing-slash commands', async () => {
       const result = await validateBashCommand('ls $HOME/');
       expect(result.valid).toBe(true);
+    });
+  });
+
+  describe('destructive wildcard targets (Codex P1 [42])', () => {
+    const cases: Array<[string, string]> = [
+      ['rm -rf $HOME/*', 'glob over $HOME contents'],
+      ['rm -rf ~/*', 'glob over ~ contents'],
+      ['rm -rf ${HOME}/*', 'glob over ${HOME} contents'],
+      ['rm -rf ./*', 'glob over current dir contents'],
+      ['rm -rf .*', 'dotfile glob in current dir'],
+      ['rm -rf $HOME*', 'prefix glob against $HOME base'],
+      ['chmod -R 777 ~/*', 'chmod with glob'],
+    ];
+    it.each(cases)('blocks %s (%s)', async (cmd) => {
+      const result = await validateBashCommand(cmd);
+      expect(result.valid).toBe(false);
+      expect(result.errors.join('\n')).toMatch(/destructive command pattern/);
+    });
+
+    it('does not flag benign glob commands (no rm/chmod/chown)', async () => {
+      const result = await validateBashCommand('ls $HOME/*');
+      expect(result.valid).toBe(true);
+    });
+  });
+
+  describe('fallbackGrep skip sentinels do not count as matches (Codex P2 [43])', () => {
+    it('reports `matches: 0` when only oversize files are present', async () => {
+      _resetRipgrepCacheForTests();
+      const realSpawn = (
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        require('child_process') as typeof import('child_process')
+      ).spawn;
+      const noRgBackend: t.LocalSpawn = ((
+        cmd: string,
+        args: string[],
+        opts: import('child_process').SpawnOptions
+      ) => {
+        if (cmd === 'rg') return realSpawn('sh', ['-c', 'exit 127'], opts);
+        return realSpawn(cmd, args, opts);
+      }) as unknown as t.LocalSpawn;
+
+      const cwd = await createTempDir();
+      const fsp = await import('fs/promises');
+      // Two oversize files, no real matches.
+      await fsp.writeFile(
+        join(cwd, 'big1.txt'),
+        Buffer.alloc(6 * 1024 * 1024, 'a')
+      );
+      await fsp.writeFile(
+        join(cwd, 'big2.txt'),
+        Buffer.alloc(6 * 1024 * 1024, 'a')
+      );
+
+      const bundle = createLocalCodingToolBundle({
+        cwd,
+        exec: { spawn: noRgBackend },
+      });
+      const grepTool = bundle.tools.find(
+        (tt) => tt.name === Constants.GREP_SEARCH
+      );
+      const result = await grepTool!.invoke({
+        id: 'g43',
+        name: Constants.GREP_SEARCH,
+        args: { pattern: 'needle' },
+        type: 'tool_call',
+      });
+      // Result is [text, artifact]; pull the artifact off the
+      // ToolMessage shape.
+      const text = JSON.stringify(result);
+      // Artifact shape: { matches: 0, skipped: 2, engine: 'node-fallback' }
+      expect(text).toContain('"matches":0');
+      expect(text).toContain('"skipped":2');
+    });
+  });
+
+  describe('Send-input direct path threads additionalContextsSink (Codex P2 [44])', () => {
+    it('materializes hook additionalContext as a HumanMessage on the Send branch', async () => {
+      // The Send-input branch dispatches a single direct tool. It
+      // had its own runDirectToolWithLifecycleHooks call site that
+      // didn't pass the sink, so PreToolUse additionalContext was
+      // dropped on this otherwise-supported input shape.
+      const { tool } = await import('@langchain/core/tools');
+      const { z } = await import('zod');
+      const { HookRegistry } = await import('@/hooks');
+      const { HumanMessage } = await import('@langchain/core/messages');
+
+      const echo = tool(async () => 'ECHO', {
+        name: 'echo',
+        description: 'send-input echo',
+        schema: z.object({}).passthrough(),
+      });
+      const registry = new HookRegistry();
+      registry.register('PreToolUse', {
+        hooks: [
+          async () => ({
+            decision: 'allow',
+            additionalContext: 'SEND-CTX: policy note via Send branch',
+          }),
+        ],
+      });
+
+      const node = new ToolNode({
+        tools: [echo],
+        eventDrivenMode: true,
+        hookRegistry: registry,
+        directToolNames: new Set(['echo']),
+      });
+      // Construct a Send-shaped input: { lg_tool_call: ToolCall }
+      const result = (await node.invoke({
+        lg_tool_call: { id: 'send_1', name: 'echo', args: {} },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as any)) as { messages: BaseMessage[] } | BaseMessage[];
+      const messages = Array.isArray(result) ? result : result.messages;
+      const found = messages.find(
+        (m) =>
+          m instanceof HumanMessage &&
+          typeof m.content === 'string' &&
+          m.content.includes('SEND-CTX')
+      );
+      expect(found).toBeDefined();
     });
   });
 

@@ -30,12 +30,17 @@ const DEFAULT_SHELL = process.platform === 'win32' ? 'bash.exe' : 'bash';
 // flags directly. Codex P1 #20.
 // `DESTRUCTIVE_TARGET` is the canonical "protected location" pattern:
 // matches `/`, `~`, `$HOME`, `${HOME}`, `.`, each optionally followed
-// by a trailing slash. Codex P1 #37 — pre-fix the bare patterns
-// required the target to end at end-of-string or a shell separator,
-// missing common variants like `rm -rf $HOME/` or `rm -rf ~/`. The
-// same alternation is used by the quoted patterns so spelling
-// equivalences are kept consistent.
-const DESTRUCTIVE_TARGET = '(?:\\/|~|\\$\\{?HOME\\}?|\\.)\\/?';
+// by a trailing-slash and/or wildcard glob suffix. Round 14 (Codex
+// P1 [37]) added trailing-slash; round 15 (Codex P1 [42]) extends
+// to glob forms — `rm -rf $HOME/*`, `rm -rf ~/*`, `rm -rf ./*`,
+// `rm -rf .*` all delete the contents of the same protected
+// locations and were slipping past the bare-command guard. The
+// suffix matrix:
+//   ''   — `$HOME`
+//   '/'  — `$HOME/`
+//   '*'  — `$HOME*`  (glob expansion against the protected base)
+//   '/*' — `$HOME/*` (glob over its contents)
+const DESTRUCTIVE_TARGET = '(?:\\/|~|\\$\\{?HOME\\}?|\\.)(?:\\/?\\*|\\/)?';
 
 const dangerousCommandPatterns: ReadonlyArray<RegExp> = [
   new RegExp(

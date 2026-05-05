@@ -2668,17 +2668,38 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           batchScopeId,
         });
       }
-      outputs = [
-        await this.runDirectToolWithLifecycleHooks(input.lg_tool_call, config, {
+      // Same per-batch sink the message-state branches use so
+      // direct-path PreToolUse/PostToolUse/Failure additionalContexts
+      // surface here too. Codex P2 [44] — round 14 added the sink to
+      // both message-state branches but missed this Send-input
+      // branch, so direct tools dispatched via Send (a supported
+      // input shape) still silently dropped hook context.
+      const directAdditionalContexts: string[] = [];
+      const sendOutput = await this.runDirectToolWithLifecycleHooks(
+        input.lg_tool_call,
+        config,
+        {
           batchIndex: 0,
           turn,
           batchScopeId,
           resolvedArgsByCallId,
-        }),
-      ];
+          additionalContextsSink: directAdditionalContexts,
+        }
+      );
+      outputs =
+        directAdditionalContexts.length > 0
+          ? [
+            sendOutput,
+            new HumanMessage({
+              content: directAdditionalContexts.join('\n\n'),
+            }),
+          ]
+          : [sendOutput];
       this.handleRunToolCompletions(
         [input.lg_tool_call],
-        outputs,
+        // Pass only the tool output to completion handling; the
+        // HumanMessage isn't a tool result.
+        [sendOutput],
         config,
         resolvedArgsByCallId
       );
