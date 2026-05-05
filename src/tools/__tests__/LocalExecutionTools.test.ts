@@ -2073,3 +2073,56 @@ describe('comprehensive review (round 10) — Codex P1 #28 / P2 #29', () => {
     });
   });
 });
+
+describe('comprehensive review (round 12) — Codex P1 #36', () => {
+  describe('granular workspace flags override the legacy allowOutsideWorkspace', () => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { getWriteRoots, getReadRoots } = require('../local/LocalExecutionEngine');
+
+    it('workspace.allowWriteOutside=false beats allowOutsideWorkspace=true (Codex P1 #36)', () => {
+      // Pre-fix the OR short-circuited on the legacy flag, returning
+      // null (skip clamp) even though the host explicitly tightened
+      // the granular flag during migration.
+      const roots = getWriteRoots({
+        cwd: '/tmp/ws',
+        workspace: { root: '/tmp/ws', allowWriteOutside: false },
+        allowOutsideWorkspace: true,
+      });
+      expect(roots).not.toBeNull();
+      expect(roots).toContain('/tmp/ws');
+    });
+
+    it('workspace.allowReadOutside=false beats allowOutsideWorkspace=true', () => {
+      const roots = getReadRoots({
+        cwd: '/tmp/ws',
+        workspace: { root: '/tmp/ws', allowReadOutside: false },
+        allowOutsideWorkspace: true,
+      });
+      expect(roots).not.toBeNull();
+      expect(roots).toContain('/tmp/ws');
+    });
+
+    it('workspace.allowWriteOutside=true still permits writes outside', () => {
+      const roots = getWriteRoots({
+        cwd: '/tmp/ws',
+        workspace: { root: '/tmp/ws', allowWriteOutside: true },
+      });
+      expect(roots).toBeNull();
+    });
+
+    it('legacy allowOutsideWorkspace=true still works when granular flag is unset', () => {
+      const roots = getWriteRoots({
+        cwd: '/tmp/ws',
+        workspace: { root: '/tmp/ws' },
+        allowOutsideWorkspace: true,
+      });
+      expect(roots).toBeNull();
+    });
+
+    it('default (no flags) returns the workspace boundary for both read and write', () => {
+      const cfg = { cwd: '/tmp/ws', workspace: { root: '/tmp/ws' } };
+      expect(getWriteRoots(cfg)).toEqual(['/tmp/ws']);
+      expect(getReadRoots(cfg)).toEqual(['/tmp/ws']);
+    });
+  });
+});
