@@ -433,5 +433,35 @@ describe('direct-path HITL: resume scope', () => {
       // re-incremented).
       expect(observed).toEqual([0]);
     });
+
+    it('clearDirectPathTurns() empties the per-Run cache (Codex P2 #33)', () => {
+      // The resume-stable map must be cleared at end-of-Run so it
+      // doesn't grow unbounded across long runs and doesn't return
+      // stale slots if a provider reuses call IDs across turns.
+      // Graph.clearHeavyState calls this on every compiled
+      // ToolNode; pin the method directly so a regression here
+      // doesn't slip past the integration boundary.
+      const echo = tool(async () => 'EXECUTED', {
+        name: 'echo',
+        description: 'noop',
+        schema: z.object({}).passthrough(),
+      }) as unknown as StructuredToolInterface;
+      const node = new ToolNode({
+        tools: [echo],
+        eventDrivenMode: true,
+        directToolNames: new Set(['echo']),
+      });
+      // Synthesise an entry by reaching into the private map via
+      // the internal accessor we just exposed. Use a simple
+      // call-shape trick: invoke and assert clearDirectPathTurns
+      // produces a no-op on a fresh map (sanity), then on a
+      // populated one it empties.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const internal = node as any;
+      internal.directPathTurns.set('call_x', 7);
+      expect(internal.directPathTurns.size).toBe(1);
+      node.clearDirectPathTurns();
+      expect(internal.directPathTurns.size).toBe(0);
+    });
   });
 });

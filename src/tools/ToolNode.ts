@@ -485,6 +485,19 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   }
 
   /**
+   * Flush the per-Run direct-path turn cache. Called by the Graph at
+   * end-of-Run via `clearHeavyState`. The map intentionally survives
+   * `run()` re-entry so an interrupt + resume reuses the original
+   * slot (Codex P2 #30), but it would otherwise grow linearly with
+   * tool calls and could collide across Runs if a provider reused
+   * call IDs (Codex P2 #33). Hosts can also call this directly if
+   * they reuse a ToolNode across batches outside of a Graph.
+   */
+  clearDirectPathTurns(): void {
+    this.directPathTurns.clear();
+  }
+
+  /**
    * Returns cached programmatic tools, computing once on first access.
    * Single iteration builds both toolMap and toolDefs simultaneously.
    */

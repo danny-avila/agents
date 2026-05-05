@@ -1580,6 +1580,50 @@ describe('comprehensive review (round 7) — manual finding E', () => {
       expect(run.getFileCheckpointer()).toBeUndefined();
       expect(await run.rewindFiles()).toBe(0);
     });
+
+    it('checkpointer survives Graph.clearHeavyState so post-completion rewind works (Codex P1 #32)', async () => {
+      // The original round-7 wiring nulled `_fileCheckpointer` in
+      // clearHeavyState — but processStream calls clearHeavyState
+      // in its finally block, so the host could never reach
+      // rewindFiles AFTER the run completed (which is exactly when
+      // rollback is most often needed). Pin that calling
+      // clearHeavyState directly DOES NOT drop the checkpointer.
+      const { Run } = await import('@/run');
+      const fs = await import('fs/promises');
+      const cwd = await createTempDir();
+      const file = join(cwd, 'after-completion.txt');
+      await fs.writeFile(file, 'pre-run\n');
+
+      const run = await Run.create<t.IState>({
+        runId: 'run-cp-survives-clear',
+        graphConfig: {
+          type: 'standard',
+          llmConfig: { provider: Providers.OPENAI, model: 'gpt-4o' },
+        },
+        toolExecution: {
+          engine: 'local',
+          local: { cwd, fileCheckpointing: true },
+        },
+      });
+      const cp = run.getFileCheckpointer();
+      expect(cp).toBeDefined();
+
+      await cp!.captureBeforeWrite(file);
+      await fs.writeFile(file, 'mutated-by-tool\n');
+
+      // Simulate end-of-run cleanup (what processStream's finally
+      // block does). Pre-fix this nulled the checkpointer.
+      run.Graph?.clearHeavyState();
+
+      // Same checkpointer instance must still be reachable AFTER
+      // clearHeavyState — that's the whole point of the fix.
+      expect(run.getFileCheckpointer()).toBe(cp);
+
+      // Host calls rewindFiles after processStream returned.
+      const restored = await run.rewindFiles();
+      expect(restored).toBeGreaterThanOrEqual(1);
+      expect(await fs.readFile(file, 'utf8')).toBe('pre-run\n');
+    });
   });
 });
 

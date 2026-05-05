@@ -196,12 +196,36 @@ export abstract class Graph<
      */
     this._toolOutputRegistry?.clear();
     this._toolOutputRegistry = undefined;
-    // Drop the per-Run file checkpointer so the next run starts with a
-    // fresh snapshot store. Previous-run snapshots are no longer
-    // reachable through Run.getFileCheckpointer() once cleared, so
-    // hosts that need to rewind must do so before the run completes.
-    this._fileCheckpointer = undefined;
+    // NB: `_fileCheckpointer` is intentionally NOT cleared here.
+    // `Run.processStream()` calls `clearHeavyState()` in its
+    // finally block on natural-completion / error paths — exactly
+    // when the host is most likely to want `Run.rewindFiles()` (for
+    // rollback after a failed batch). Per-Run isolation is already
+    // automatic because each `Run.create()` constructs a brand-new
+    // Graph instance, so the next Run gets its own checkpointer
+    // without us needing to reset this field. Codex P1 #32: pre-fix
+    // the checkpointer was nulled before the caller could reach it.
+    // Flush each compiled ToolNode's direct-path turn cache so it
+    // doesn't leak across Runs (Codex P2 #33). The cache survives
+    // `run()` re-entry by design (resume-stable), but end-of-Run
+    // is the right point to reset it.
+    for (const node of this._compiledToolNodes) {
+      node.clearDirectPathTurns();
+    }
+    this._compiledToolNodes.clear();
     this.sessions.clear();
+  }
+
+  /**
+   * Subclass hook to register a freshly compiled ToolNode so
+   * `clearHeavyState` can flush its per-Run direct-path turn cache
+   * at end-of-Run. Internal — called from `initializeTools` in the
+   * concrete graph subclasses.
+   */
+  protected registerCompiledToolNode(node: {
+    clearDirectPathTurns(): void;
+  }): void {
+    this._compiledToolNodes.add(node);
   }
 
   /**
@@ -242,26 +266,43 @@ export abstract class Graph<
    * `Run.rewindFiles()`.
    */
   private _fileCheckpointer?: t.LocalFileCheckpointer;
+  /**
+   * ToolNodes compiled into this Graph's workflow. Tracked so
+   * `clearHeavyState()` can flush their per-Run direct-path turn
+   * cache (`directPathTurns`) at end-of-Run — that map intentionally
+   * survives `run()` re-entry (resume-stable per Codex P2 #30) but
+   * would otherwise grow linearly with tool calls and could collide
+   * across Runs if a provider reuses call ids (Codex P2 #33).
+   */
+  private _compiledToolNodes: Set<{
+    clearDirectPathTurns(): void;
+  }> = new Set();
   public getOrCreateFileCheckpointer():
     | t.LocalFileCheckpointer
     | undefined {
+    // Return the cached instance unconditionally if one exists. The
+    // toolExecution check below decides whether to *create* a new
+    // one — `clearHeavyState` nulls `this.toolExecution` at end-of-
+    // Run, but we want post-Run `Run.rewindFiles()` to still resolve
+    // to the checkpointer that captured the writes. Codex P1 #32.
+    if (this._fileCheckpointer != null) {
+      return this._fileCheckpointer;
+    }
     if (
       this.toolExecution?.engine !== 'local' ||
       this.toolExecution.local?.fileCheckpointing !== true
     ) {
       return undefined;
     }
-    if (this._fileCheckpointer == null) {
-      // Eagerly create via the bundle factory so the construction
-      // path matches the bundle-only callers (and future
-      // bundle-internal cleanup hooks fire). The bundle factory
-      // itself accepts a pre-supplied checkpointer when present, so
-      // re-injecting this one into every ToolNode is idempotent.
-      const bundle = createLocalCodingToolBundle(
-        this.toolExecution.local ?? {}
-      );
-      this._fileCheckpointer = bundle.checkpointer;
-    }
+    // Eagerly create via the bundle factory so the construction path
+    // matches the bundle-only callers (and future bundle-internal
+    // cleanup hooks fire). The bundle factory itself accepts a pre-
+    // supplied checkpointer when present, so re-injecting this one
+    // into every ToolNode is idempotent.
+    const bundle = createLocalCodingToolBundle(
+      this.toolExecution.local ?? {}
+    );
+    this._fileCheckpointer = bundle.checkpointer;
     return this._fileCheckpointer;
   }
 }
@@ -625,7 +666,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         }
       }
 
-      return new CustomToolNode<t.BaseGraphState>({
+      const node = new CustomToolNode<t.BaseGraphState>({
         tools: allTools,
         toolMap: allToolMap,
         eventDrivenMode: true,
@@ -642,9 +683,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         maxToolResultChars: agentContext?.maxToolResultChars,
         toolOutputRegistry: this.getOrCreateToolOutputRegistry(),
         fileCheckpointer: this.getOrCreateFileCheckpointer(),
-        errorHandler: (data, metadata) =>
+        errorHandler: (data, metadata): Promise<void> =>
           StandardGraph.handleToolCallErrorStatic(this, data, metadata),
       });
+      this.registerCompiledToolNode(node);
+      return node;
     }
 
     const graphTools = agentContext?.graphTools as t.GenericTool[] | undefined;
@@ -663,11 +706,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         ])
         : currentToolMap;
 
-    return new CustomToolNode<t.BaseGraphState>({
+    const node = new CustomToolNode<t.BaseGraphState>({
       tools: allTraditionalTools,
       toolMap: traditionalToolMap,
       toolCallStepIds: this.toolCallStepIds,
-      errorHandler: (data, metadata) =>
+      errorHandler: (data, metadata): Promise<void> =>
         StandardGraph.handleToolCallErrorStatic(this, data, metadata),
       toolRegistry: agentContext?.toolRegistry,
       sessions: this.sessions,
@@ -679,6 +722,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       toolOutputRegistry: this.getOrCreateToolOutputRegistry(),
       fileCheckpointer: this.getOrCreateFileCheckpointer(),
     });
+    this.registerCompiledToolNode(node);
+    return node;
   }
 
   overrideTestModel(
