@@ -632,6 +632,178 @@ describe('ToolNode code execution session management', () => {
       });
     });
 
+    it('preserves per-file entity_id from the prior session when the response strips it', () => {
+      /**
+       * Round-trip regression: codeapi authorizes input files per-file
+       * via `entity_id`, but the worker response echoes `inherited: true`
+       * input files back to the caller without the entity scope they
+       * arrived under. Without this preservation, the same-name merge
+       * silently drops `entity_id` from the stored session, the next
+       * execute injects the file unscoped, and codeapi 403s — even
+       * though the file's bytes are still alive in the same storage
+       * session.
+       *
+       * Concretely: skill bundle uploaded under `entity_id=skill-123`,
+       * first execute runs successfully with all files entity-scoped,
+       * worker echoes them back with no `entity_id`, second execute
+       * loses authorization for every same-name file.
+       */
+      const sessions: t.ToolSessionMap = new Map();
+      sessions.set(Constants.EXECUTE_CODE, {
+        session_id: 'storage-A',
+        files: [
+          {
+            id: 'f1',
+            name: 'pptx/SKILL.md',
+            session_id: 'storage-A',
+            entity_id: 'skill-123',
+          },
+          {
+            id: 'f2',
+            name: 'pptx/pptxgenjs.md',
+            session_id: 'storage-A',
+            entity_id: 'skill-123',
+          },
+        ],
+        lastUpdated: Date.now(),
+      } satisfies t.CodeSessionContext);
+
+      const mockTool = createMockCodeTool({ capturedConfigs: [] });
+      const toolNode = new ToolNode({
+        tools: [mockTool],
+        sessions,
+        eventDrivenMode: true,
+      });
+      const storeMethod = (
+        toolNode as unknown as {
+          storeCodeSessionFromResults: (
+            results: t.ToolExecuteResult[],
+            requestMap: Map<string, t.ToolCallRequest>
+          ) => void;
+        }
+      ).storeCodeSessionFromResults.bind(toolNode);
+
+      storeMethod(
+        [
+          {
+            toolCallId: 'tc-roundtrip',
+            content: 'output',
+            artifact: {
+              session_id: 'exec-roundtrip',
+              files: [
+                /* Worker response: same files, no entity_id, marked inherited. */
+                {
+                  id: 'f1',
+                  name: 'pptx/SKILL.md',
+                  session_id: 'storage-A',
+                  inherited: true,
+                },
+                {
+                  id: 'f2',
+                  name: 'pptx/pptxgenjs.md',
+                  session_id: 'storage-A',
+                  inherited: true,
+                },
+              ],
+            },
+            status: 'success',
+          },
+        ],
+        new Map([
+          [
+            'tc-roundtrip',
+            { id: 'tc-roundtrip', name: Constants.EXECUTE_CODE, args: {} },
+          ],
+        ])
+      );
+
+      const stored = sessions.get(
+        Constants.EXECUTE_CODE
+      ) as t.CodeSessionContext;
+      expect(stored.files).toHaveLength(2);
+      expect(stored.files![0]).toEqual({
+        id: 'f1',
+        name: 'pptx/SKILL.md',
+        session_id: 'storage-A',
+        entity_id: 'skill-123',
+        inherited: true,
+      });
+      expect(stored.files![1]).toEqual({
+        id: 'f2',
+        name: 'pptx/pptxgenjs.md',
+        session_id: 'storage-A',
+        entity_id: 'skill-123',
+        inherited: true,
+      });
+    });
+
+    it('does not overwrite an entity_id the worker response explicitly sets', () => {
+      /* If the response ever DOES include entity_id (e.g. a future
+       * codeapi version that echoes it), the response value wins. The
+       * preservation logic only fills in when the response omits the
+       * field. */
+      const sessions: t.ToolSessionMap = new Map();
+      sessions.set(Constants.EXECUTE_CODE, {
+        session_id: 'storage-A',
+        files: [
+          {
+            id: 'f1',
+            name: 'demo/inputs.csv',
+            session_id: 'storage-A',
+            entity_id: 'skill-old',
+          },
+        ],
+        lastUpdated: Date.now(),
+      } satisfies t.CodeSessionContext);
+
+      const mockTool = createMockCodeTool({ capturedConfigs: [] });
+      const toolNode = new ToolNode({
+        tools: [mockTool],
+        sessions,
+        eventDrivenMode: true,
+      });
+      const storeMethod = (
+        toolNode as unknown as {
+          storeCodeSessionFromResults: (
+            results: t.ToolExecuteResult[],
+            requestMap: Map<string, t.ToolCallRequest>
+          ) => void;
+        }
+      ).storeCodeSessionFromResults.bind(toolNode);
+
+      storeMethod(
+        [
+          {
+            toolCallId: 'tc-explicit',
+            content: 'output',
+            artifact: {
+              session_id: 'exec-explicit',
+              files: [
+                {
+                  id: 'f1',
+                  name: 'demo/inputs.csv',
+                  session_id: 'storage-A',
+                  entity_id: 'skill-new',
+                },
+              ],
+            },
+            status: 'success',
+          },
+        ],
+        new Map([
+          [
+            'tc-explicit',
+            { id: 'tc-explicit', name: Constants.EXECUTE_CODE, args: {} },
+          ],
+        ])
+      );
+
+      const stored = sessions.get(
+        Constants.EXECUTE_CODE
+      ) as t.CodeSessionContext;
+      expect(stored.files![0].entity_id).toBe('skill-new');
+    });
+
     it('falls back to exec session_id only when per-file session_id is absent (older worker payloads)', () => {
       const sessions: t.ToolSessionMap = new Map();
       const mockTool = createMockCodeTool({ capturedConfigs: [] });
