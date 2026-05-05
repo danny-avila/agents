@@ -134,6 +134,49 @@ describe('ToolNode code execution session management', () => {
       expect(files[0].session_id).toBe('session-A');
       expect(files[1].session_id).toBe('session-B');
     });
+
+    it('forwards per-file entity_id for mixed-entity sessions', async () => {
+      const capturedConfigs: Record<string, unknown>[] = [];
+      const sessions: t.ToolSessionMap = new Map();
+      sessions.set(Constants.EXECUTE_CODE, {
+        session_id: 'session-A',
+        files: [
+          {
+            id: 'skill-file',
+            name: 'demo/SKILL.md',
+            session_id: 'session-A',
+            entity_id: 'skill-123',
+          },
+          {
+            id: 'user-file',
+            name: 'attachment.csv',
+            session_id: 'session-B',
+          },
+        ],
+        lastUpdated: Date.now(),
+      } satisfies t.CodeSessionContext);
+
+      const mockTool = createMockCodeTool({ capturedConfigs });
+      const toolNode = new ToolNode({ tools: [mockTool], sessions });
+
+      const aiMsg = createAIMessageWithCodeCall('call_5');
+      await toolNode.invoke({ messages: [aiMsg] });
+
+      const files = capturedConfigs[0]._injected_files as t.CodeEnvFile[];
+      expect(files).toEqual([
+        {
+          session_id: 'session-A',
+          id: 'skill-file',
+          name: 'demo/SKILL.md',
+          entity_id: 'skill-123',
+        },
+        {
+          session_id: 'session-B',
+          id: 'user-file',
+          name: 'attachment.csv',
+        },
+      ]);
+    });
   });
 
   describe('getCodeSessionContext (via dispatchToolEvents request building)', () => {
@@ -199,6 +242,47 @@ describe('ToolNode code execution session management', () => {
       ).getCodeSessionContext();
 
       expect(context).toBeUndefined();
+    });
+
+    it('forwards per-file entity_id to event-driven request context', () => {
+      const sessions: t.ToolSessionMap = new Map();
+      sessions.set(Constants.EXECUTE_CODE, {
+        session_id: 'evt-session',
+        files: [
+          {
+            id: 'sk1',
+            name: 'demo/SKILL.md',
+            session_id: 'evt-session',
+            entity_id: 'skill-abc',
+          },
+          { id: 'usr1', name: 'data.csv', session_id: 'evt-session' },
+        ],
+        lastUpdated: Date.now(),
+      } satisfies t.CodeSessionContext);
+
+      const mockTool = createMockCodeTool({ capturedConfigs: [] });
+      const toolNode = new ToolNode({
+        tools: [mockTool],
+        sessions,
+        eventDrivenMode: true,
+      });
+
+      const context = (
+        toolNode as unknown as { getCodeSessionContext: () => unknown }
+      ).getCodeSessionContext();
+
+      expect(context).toEqual({
+        session_id: 'evt-session',
+        files: [
+          {
+            session_id: 'evt-session',
+            id: 'sk1',
+            name: 'demo/SKILL.md',
+            entity_id: 'skill-abc',
+          },
+          { session_id: 'evt-session', id: 'usr1', name: 'data.csv' },
+        ],
+      });
     });
   });
 
