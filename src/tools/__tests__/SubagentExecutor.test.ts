@@ -546,6 +546,129 @@ describe('SubagentExecutor', () => {
     expect(observedChildInputs!.maxSubagentDepth).toBeUndefined();
   });
 
+  describe('parentConfigurable inheritance', () => {
+    /**
+     * Build a stub factory that captures the second argument to
+     * `workflow.invoke()` (the runnable config) so tests can assert on
+     * the `configurable` we forwarded to the child graph.
+     */
+    function makeCapturingGraphFactory(): {
+      factory: () => StandardGraph;
+      getInvokeConfig: () => Record<string, unknown> | undefined;
+    } {
+      let capturedConfig: Record<string, unknown> | undefined;
+      const factory = (): StandardGraph =>
+        ({
+          createWorkflow: (): { invoke: jest.Mock } => ({
+            invoke: jest
+              .fn()
+              .mockImplementation(
+                async (
+                  _input: unknown,
+                  config: Record<string, unknown>
+                ): Promise<{ messages: BaseMessage[] }> => {
+                  capturedConfig = config;
+                  return { messages: [new AIMessage('done')] };
+                }
+              ),
+          }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph;
+      return { factory, getInvokeConfig: () => capturedConfig };
+    }
+
+    it('forwards parentConfigurable into the child workflow.invoke configurable', async () => {
+      const { factory, getInvokeConfig } = makeCapturingGraphFactory();
+      const executor = createExecutor({ createChildGraph: factory });
+
+      await executor.execute({
+        description: 'task',
+        subagentType: 'researcher',
+        parentConfigurable: {
+          requestBody: { messageId: 'msg-123', conversationId: 'conv-456' },
+          user: { id: 'user_abc' },
+          user_id: 'user_abc',
+          userMCPAuthMap: { 'mcp-github': { token: 'abc' } },
+        },
+      });
+
+      const invokeConfig = getInvokeConfig();
+      expect(invokeConfig).toBeDefined();
+      const configurable = invokeConfig!.configurable as Record<string, unknown>;
+      expect(configurable.requestBody).toEqual({
+        messageId: 'msg-123',
+        conversationId: 'conv-456',
+      });
+      expect(configurable.user).toEqual({ id: 'user_abc' });
+      expect(configurable.user_id).toBe('user_abc');
+      expect(configurable.userMCPAuthMap).toEqual({
+        'mcp-github': { token: 'abc' },
+      });
+    });
+
+    it('overrides parent thread_id with the new childRunId', async () => {
+      const { factory, getInvokeConfig } = makeCapturingGraphFactory();
+      const executor = createExecutor({
+        createChildGraph: factory,
+        parentRunId: 'parent-run-xyz',
+      });
+
+      await executor.execute({
+        description: 'task',
+        subagentType: 'researcher',
+        parentConfigurable: { thread_id: 'parent-thread-should-be-dropped' },
+      });
+
+      const configurable = getInvokeConfig()!.configurable as Record<
+        string,
+        unknown
+      >;
+      expect(configurable.thread_id).not.toBe('parent-thread-should-be-dropped');
+      expect(configurable.thread_id as string).toMatch(/^parent-run-xyz_sub_/);
+    });
+
+    it('scrubs run-identity fields (run_id, parent_run_id) from inherited configurable', async () => {
+      const { factory, getInvokeConfig } = makeCapturingGraphFactory();
+      const executor = createExecutor({ createChildGraph: factory });
+
+      await executor.execute({
+        description: 'task',
+        subagentType: 'researcher',
+        parentConfigurable: {
+          run_id: 'parent-run-id',
+          parent_run_id: 'grandparent-run-id',
+          requestBody: { messageId: 'msg-1' },
+        },
+      });
+
+      const configurable = getInvokeConfig()!.configurable as Record<
+        string,
+        unknown
+      >;
+      expect(configurable.run_id).toBeUndefined();
+      expect(configurable.parent_run_id).toBeUndefined();
+      // Non-identity fields still pass through.
+      expect(configurable.requestBody).toEqual({ messageId: 'msg-1' });
+    });
+
+    it('does not require parentConfigurable (back-compat with hosts that omit it)', async () => {
+      const { factory, getInvokeConfig } = makeCapturingGraphFactory();
+      const executor = createExecutor({ createChildGraph: factory });
+
+      await executor.execute({
+        description: 'task',
+        subagentType: 'researcher',
+      });
+
+      const configurable = getInvokeConfig()!.configurable as Record<
+        string,
+        unknown
+      >;
+      // Only thread_id is set when no parent context is supplied.
+      expect(Object.keys(configurable)).toEqual(['thread_id']);
+    });
+  });
+
   describe('hooks', () => {
     let capturedStart: unknown;
     let capturedStop: unknown;

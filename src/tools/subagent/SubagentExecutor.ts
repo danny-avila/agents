@@ -40,6 +40,24 @@ export type SubagentExecuteParams = {
    * without relying on event ordering heuristics.
    */
   parentToolCallId?: string;
+  /**
+   * Snapshot of the parent invocation's `config.configurable` at the
+   * spawn-tool call site. Inherited into the child workflow's
+   * `configurable` so host-set fields (e.g. `requestBody`, `user`,
+   * `userMCPAuthMap`) propagate to subagent tool calls. Without this,
+   * the child runs with only `{ thread_id }` and any tool that reads
+   * host context from the configurable (e.g. MCP body-placeholder
+   * substitution, per-user connection lookup) sees a stripped view —
+   * even though the parent's `ON_TOOL_EXECUTE` handler runs in the
+   * same process.
+   *
+   * The executor scrubs run-identity fields (`thread_id`, `run_id`,
+   * `parent_run_id`) before forwarding so the child doesn't claim the
+   * parent's run identity. `thread_id` is then set to the new
+   * `childRunId`. Anything else the host put on parent's configurable
+   * is forwarded as-is — the SDK doesn't interpret host-defined keys.
+   */
+  parentConfigurable?: Record<string, unknown>;
 };
 
 export type SubagentExecuteResult = {
@@ -246,6 +264,19 @@ export class SubagentExecutor {
        * nested trace pollution).
        */
       const callbacks: Callbacks = forwarder ? [forwarder] : [];
+      /**
+       * Build the child's `configurable` by inheriting from the parent's
+       * snapshot (host-set fields like `requestBody` / `user` / etc.)
+       * with run-identity fields scrubbed and `thread_id` overridden to
+       * the new `childRunId`. See {@link SubagentExecuteParams.parentConfigurable}
+       * for the rationale.
+       */
+      const inheritedConfigurable: Record<string, unknown> = {
+        ...(params.parentConfigurable ?? {}),
+      };
+      delete inheritedConfigurable.thread_id;
+      delete inheritedConfigurable.run_id;
+      delete inheritedConfigurable.parent_run_id;
       result = await workflow.invoke(
         { messages: [new HumanMessage(description)] },
         {
@@ -254,6 +285,7 @@ export class SubagentExecutor {
           callbacks,
           runName: `subagent:${subagentType}`,
           configurable: {
+            ...inheritedConfigurable,
             thread_id: childRunId,
           },
         }
