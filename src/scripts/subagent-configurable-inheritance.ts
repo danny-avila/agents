@@ -42,27 +42,39 @@ const calculatorDef: t.LCTool = {
 type ConfigurableSnapshot = {
   agentId: string | undefined;
   configurable: Record<string, unknown> | undefined;
+  metadata: Record<string, unknown> | undefined;
 };
 
 async function main() {
   console.log('=== Subagent parentConfigurable inheritance — live ===\n');
 
+  // Parent has NO tools — it can only delegate via the math subagent.
+  // The math subagent has the calculator. This forces the spawn-subagent
+  // path so we can observe the subagent's `ON_TOOL_EXECUTE` dispatch.
+  const mathSubagentInputs: t.AgentInputs = {
+    agentId: 'math-worker',
+    provider: Providers.OPENAI,
+    clientOptions: { modelName: 'gpt-4o', apiKey },
+    instructions:
+      'You compute arithmetic. Always use the calculator tool — never estimate. Return the final numeric result as plain text.',
+    maxContextTokens: 8000,
+    toolDefinitions: [calculatorDef],
+  };
+
   const parentAgent: t.AgentInputs = {
     agentId: 'supervisor',
     provider: Providers.OPENAI,
-    clientOptions: { modelName: 'gpt-4o-mini', apiKey },
-    instructions: `You can spawn a "self" subagent in an isolated context.
-For any math task, spawn the "self" subagent and let it use the calculator.
-The subagent MUST use the calculator tool — never estimate.`,
+    clientOptions: { modelName: 'gpt-4o', apiKey },
+    instructions: `You delegate arithmetic to the "math" subagent. You have NO calculator yourself. For any math task, spawn the "math" subagent with the full task as its description, then echo the subagent's text result back to the user.`,
     maxContextTokens: 8000,
-    toolDefinitions: [calculatorDef],
+    // No toolDefinitions on the parent — only the subagent gets the calculator.
     subagentConfigs: [
       {
-        type: 'self',
-        self: true,
-        name: 'supervisor',
+        type: 'math',
+        name: 'math',
         description:
-          'Spawn a copy of this agent in an isolated context for a focused math subtask.',
+          'A focused arithmetic worker that uses the calculator tool to compute numerical results.',
+        agentInputs: mathSubagentInputs,
       },
     ],
   };
@@ -80,14 +92,16 @@ The subagent MUST use the calculator tool — never estimate.`,
         const snapshot: ConfigurableSnapshot = {
           agentId: data.agentId,
           configurable: data.configurable as Record<string, unknown> | undefined,
+          metadata: data.metadata as Record<string, unknown> | undefined,
         };
         const callsLabel = data.toolCalls.map((c) => c.name).join(',');
-        // For `self`-spawn the child inherits parent's agentId, so we can't
-        // distinguish by agentId alone. The child's thread_id is set by the
-        // SDK to `${parentRunId}_sub_<nanoid>` — that's a reliable marker.
-        const threadId = (data.configurable as { thread_id?: string } | undefined)
-          ?.thread_id;
-        const isSubagent = typeof threadId === 'string' && threadId.includes('_sub_');
+        // Parent and subagent have different agent IDs in this script
+        // (parent: 'supervisor', subagent: 'math-worker'). With a self-spawn
+        // subagent both would be the same; this script uses a non-self
+        // subagent precisely so we can distinguish reliably.
+        const isSubagent = data.agentId !== 'supervisor';
+        const metadataRunId = (data.metadata as { run_id?: string } | undefined)
+          ?.run_id;
         if (isSubagent) {
           subagentSnapshots.push(snapshot);
         } else {
@@ -95,6 +109,12 @@ The subagent MUST use the calculator tool — never estimate.`,
         }
         console.log(
           `[ON_TOOL_EXECUTE] origin=${isSubagent ? 'SUBAGENT' : 'PARENT'} agentId=${data.agentId} calls=${callsLabel}`
+        );
+        console.log(
+          `  metadata keys: ${Object.keys(data.metadata ?? {}).join(',') || '<none>'}`
+        );
+        console.log(
+          `  metadata.run_id="${metadataRunId ?? '<none>'}" configurable.run_id="${(data.configurable as { run_id?: string } | undefined)?.run_id ?? '<none>'}" configurable.thread_id="${(data.configurable as { thread_id?: string } | undefined)?.thread_id ?? '<none>'}"`
         );
         const results: t.ToolExecuteResult[] = data.toolCalls.map((call) => {
           const args = call.args as { expression?: string };
@@ -128,10 +148,14 @@ The subagent MUST use the calculator tool — never estimate.`,
     'Compute (42 * 58) + (13 ** 3). Use the self subagent, and have it use the calculator.'
   );
 
-  // Parent's outer configurable carries host-set fields. After the SDK
-  // change, these should propagate into the subagent's tool dispatches.
+  // Parent's outer configurable carries host-set fields AND explicit
+  // run-identity fields so we can verify whether LangGraph respects or
+  // overwrites parent's `run_id` / `parent_run_id` when we forward them
+  // into the child's `workflow.invoke`.
   const outerConfigurable = {
     thread_id: 'parent-thread-conv-xyz',
+    run_id: 'parent-run-id-001',
+    parent_run_id: 'grandparent-run-id-000',
     user_id: 'user_abc',
     user: { id: 'user_abc', email: 'a@b.c', role: 'USER' },
     requestBody: {
@@ -169,12 +193,17 @@ The subagent MUST use the calculator tool — never estimate.`,
     process.exit(2);
   }
 
-  const expectedKeys = ['user_id', 'user', 'requestBody', 'userMCPAuthMap'];
+  const expectedHostKeys = ['user_id', 'user', 'requestBody', 'userMCPAuthMap'];
   let allPassed = true;
   subagentSnapshots.forEach((snap, idx) => {
     const cfg = snap.configurable ?? {};
-    console.log(`\nSubagent dispatch #${idx + 1} (agentId=${snap.agentId}):`);
-    for (const key of expectedKeys) {
+    const meta = snap.metadata ?? {};
+    console.log(
+      `\nSubagent dispatch #${idx + 1} (agentId=${snap.agentId}, metadata.run_id=${(meta as { run_id?: string }).run_id ?? '-'}):`
+    );
+
+    // Host-set fields must propagate.
+    for (const key of expectedHostKeys) {
       const present = key in cfg;
       const value = cfg[key];
       console.log(
@@ -182,22 +211,37 @@ The subagent MUST use the calculator tool — never estimate.`,
       );
       if (!present) allPassed = false;
     }
-    const threadId = cfg.thread_id as string | undefined;
-    const overridden =
-      threadId !== undefined && threadId !== outerConfigurable.thread_id;
+
+    // Run-identity fields: with full inheritance we expect parent's
+    // values to flow through. LangGraph runtime MAY overwrite them at
+    // child-invoke time — the script logs what actually arrived so we
+    // can see empirically what propagates.
+    console.log(`  ⓘ thread_id observed: "${cfg.thread_id as string}" (parent's: "${outerConfigurable.thread_id}")`);
+    console.log(`  ⓘ run_id observed:    "${cfg.run_id as string}" (parent's: "${outerConfigurable.run_id}")`);
+    console.log(`  ⓘ parent_run_id observed: "${cfg.parent_run_id as string}" (parent's: "${outerConfigurable.parent_run_id}")`);
+
+    const threadInherited = cfg.thread_id === outerConfigurable.thread_id;
+    const runInherited = cfg.run_id === outerConfigurable.run_id;
+    const parentRunInherited =
+      cfg.parent_run_id === outerConfigurable.parent_run_id;
     console.log(
-      `  ${overridden ? '✅' : '❌'} thread_id overridden (got "${threadId}", parent's was "${outerConfigurable.thread_id}")`
+      `  ${threadInherited ? '✅' : '⚠️ '} thread_id inherited from parent: ${threadInherited}`
     );
-    if (!overridden) allPassed = false;
+    console.log(
+      `  ${runInherited ? '✅' : '⚠️ '} run_id inherited from parent: ${runInherited}`
+    );
+    console.log(
+      `  ${parentRunInherited ? '✅' : '⚠️ '} parent_run_id inherited from parent: ${parentRunInherited}`
+    );
   });
 
   if (allPassed) {
     console.log(
-      '\n✅ PASS: subagent ON_TOOL_EXECUTE saw parent host-set fields with thread_id overridden.'
+      '\n✅ Host-set fields propagate. (Run-identity inheritance is informational — see ⚠️ markers above for any LangGraph-runtime overwrites.)'
     );
     process.exit(0);
   } else {
-    console.log('\n❌ FAIL: at least one expected key was missing.');
+    console.log('\n❌ FAIL: at least one expected host-set key was missing.');
     process.exit(1);
   }
 }

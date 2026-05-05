@@ -606,7 +606,7 @@ describe('SubagentExecutor', () => {
       });
     });
 
-    it('overrides parent thread_id with the new childRunId', async () => {
+    it('inherits parent thread_id when supplied (subagent is part of same conversation)', async () => {
       const { factory, getInvokeConfig } = makeCapturingGraphFactory();
       const executor = createExecutor({
         createChildGraph: factory,
@@ -616,18 +616,38 @@ describe('SubagentExecutor', () => {
       await executor.execute({
         description: 'task',
         subagentType: 'researcher',
-        parentConfigurable: { thread_id: 'parent-thread-should-be-dropped' },
+        parentConfigurable: { thread_id: 'parent-thread-conv-abc' },
       });
 
       const configurable = getInvokeConfig()!.configurable as Record<
         string,
         unknown
       >;
-      expect(configurable.thread_id).not.toBe('parent-thread-should-be-dropped');
-      expect(configurable.thread_id as string).toMatch(/^parent-run-xyz_sub_/);
+      expect(configurable.thread_id).toBe('parent-thread-conv-abc');
     });
 
-    it('scrubs run-identity fields (run_id, parent_run_id) from inherited configurable', async () => {
+    it('falls back to childRunId for thread_id when parent did not supply one', async () => {
+      const { factory, getInvokeConfig } = makeCapturingGraphFactory();
+      const executor = createExecutor({
+        createChildGraph: factory,
+        parentRunId: 'parent-run-xyz',
+      });
+
+      await executor.execute({
+        description: 'task',
+        subagentType: 'researcher',
+        parentConfigurable: { user_id: 'user_abc' },
+      });
+
+      const configurable = getInvokeConfig()!.configurable as Record<
+        string,
+        unknown
+      >;
+      expect(configurable.thread_id as string).toMatch(/^parent-run-xyz_sub_/);
+      expect(configurable.user_id).toBe('user_abc');
+    });
+
+    it('forwards run-identity fields verbatim into the child invoke configurable', async () => {
       const { factory, getInvokeConfig } = makeCapturingGraphFactory();
       const executor = createExecutor({ createChildGraph: factory });
 
@@ -645,9 +665,14 @@ describe('SubagentExecutor', () => {
         string,
         unknown
       >;
-      expect(configurable.run_id).toBeUndefined();
-      expect(configurable.parent_run_id).toBeUndefined();
-      // Non-identity fields still pass through.
+      // The SDK forwards these fields as part of its inheritance contract.
+      // NOTE: the LangGraph runtime overwrites `configurable.run_id` at
+      // actual child-invoke time (verified empirically); this unit test
+      // only asserts what the SDK forwards into `workflow.invoke` — not
+      // what tools downstream observe. `parent_run_id` and other
+      // host-set keys do survive the runtime pass-through.
+      expect(configurable.run_id).toBe('parent-run-id');
+      expect(configurable.parent_run_id).toBe('grandparent-run-id');
       expect(configurable.requestBody).toEqual({ messageId: 'msg-1' });
     });
 
@@ -664,7 +689,7 @@ describe('SubagentExecutor', () => {
         string,
         unknown
       >;
-      // Only thread_id is set when no parent context is supplied.
+      // Only thread_id (childRunId fallback) is set when no parent context is supplied.
       expect(Object.keys(configurable)).toEqual(['thread_id']);
     });
   });

@@ -42,20 +42,31 @@ export type SubagentExecuteParams = {
   parentToolCallId?: string;
   /**
    * Snapshot of the parent invocation's `config.configurable` at the
-   * spawn-tool call site. Inherited into the child workflow's
-   * `configurable` so host-set fields (e.g. `requestBody`, `user`,
-   * `userMCPAuthMap`) propagate to subagent tool calls. Without this,
-   * the child runs with only `{ thread_id }` and any tool that reads
-   * host context from the configurable (e.g. MCP body-placeholder
-   * substitution, per-user connection lookup) sees a stripped view —
-   * even though the parent's `ON_TOOL_EXECUTE` handler runs in the
-   * same process.
+   * spawn-tool call site. Inherited verbatim into the child workflow's
+   * `configurable` so host-set fields (`requestBody`, `user`,
+   * `userMCPAuthMap`, etc.) propagate — fixing MCP body-placeholder
+   * substitution and per-user lookups for subagent tool calls.
    *
-   * The executor scrubs run-identity fields (`thread_id`, `run_id`,
-   * `parent_run_id`) before forwarding so the child doesn't claim the
-   * parent's run identity. `thread_id` is then set to the new
-   * `childRunId`. Anything else the host put on parent's configurable
-   * is forwarded as-is — the SDK doesn't interpret host-defined keys.
+   * Inheritance details (verified empirically against LangGraph):
+   *   - host-set keys propagate as-is into the child's tool dispatches;
+   *   - `thread_id` propagates (with `childRunId` as a fallback when
+   *     parent did not supply one) — matches the "subagent is part of
+   *     the same conversation" mental model and aligns with the
+   *     `sessionId: this.parentRunId` convention this executor already
+   *     uses for `SubagentStart` / `SubagentStop` hooks;
+   *   - `parent_run_id` propagates when the host put it on parent's
+   *     configurable;
+   *   - `run_id` is *overwritten by the LangGraph runtime* at child
+   *     invoke time regardless of what we forward — child's tool
+   *     dispatches see the child graph's runtime runId in
+   *     `configurable.run_id`, not the parent's. Hosts that need
+   *     parent-scoped run identity for downstream consumers should
+   *     plumb it via a host-defined key (e.g. `requestBody.messageId`),
+   *     not `run_id`.
+   *
+   * A future revision will likely make this inheritance configurable
+   * per spawn type — background / async subagents may want isolation
+   * rather than sharing parent's host context.
    */
   parentConfigurable?: Record<string, unknown>;
 };
@@ -265,18 +276,35 @@ export class SubagentExecutor {
        */
       const callbacks: Callbacks = forwarder ? [forwarder] : [];
       /**
-       * Build the child's `configurable` by inheriting from the parent's
-       * snapshot (host-set fields like `requestBody` / `user` / etc.)
-       * with run-identity fields scrubbed and `thread_id` overridden to
-       * the new `childRunId`. See {@link SubagentExecuteParams.parentConfigurable}
-       * for the rationale.
+       * Inherit the parent's `configurable` verbatim — host-set fields
+       * (`requestBody`, `user`, `userMCPAuthMap`, etc.) AND the run-
+       * identity fields (`run_id`, `parent_run_id`, `thread_id`) all
+       * propagate.
+       *
+       * Run-identity propagation is intentional and matches the
+       * convention this executor itself already uses for `SubagentStart`
+       * / `SubagentStop` hooks (`sessionId: this.parentRunId`): the
+       * subagent runs under the parent's session scope, not its own.
+       * Forwarding `run_id` / `parent_run_id` / `thread_id` makes
+       * `ToolNode`'s hook lookups (`hasHookFor(eventName, runId)`),
+       * `ToolOutputReferenceRegistry` keying, and trace lineage all
+       * resolve to the parent's session for tools dispatched from the
+       * subagent — so `PreToolUse` / `PostToolUse` hooks the host
+       * registered against the parent's run fire for subagent tool
+       * calls too. "Same run" matches the user-perceptual mental model.
+       *
+       * `thread_id` falls back to `childRunId` only when the parent
+       * didn't supply one (legacy behavior preserved for hosts that
+       * never set thread_id).
+       *
+       * NOTE: a future revision will likely make this configurable per
+       * spawn type — e.g. a background / async subagent that runs after
+       * the parent's run completes wants isolation, not inheritance.
+       * For now the inheritance path matches LibreChat's primary use
+       * case (synchronous subagents within a single user turn).
        */
-      const inheritedConfigurable: Record<string, unknown> = {
-        ...(params.parentConfigurable ?? {}),
-      };
-      delete inheritedConfigurable.thread_id;
-      delete inheritedConfigurable.run_id;
-      delete inheritedConfigurable.parent_run_id;
+      const inheritedConfigurable: Record<string, unknown> =
+        params.parentConfigurable ?? {};
       result = await workflow.invoke(
         { messages: [new HumanMessage(description)] },
         {
@@ -285,8 +313,8 @@ export class SubagentExecutor {
           callbacks,
           runName: `subagent:${subagentType}`,
           configurable: {
-            ...inheritedConfigurable,
             thread_id: childRunId,
+            ...inheritedConfigurable,
           },
         }
       );
