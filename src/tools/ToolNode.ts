@@ -74,6 +74,16 @@ type RunToolBatchContext = {
    * `Promise.all`-induced ordering would otherwise be observable).
    */
   preBatchSnapshot?: ToolOutputResolveView;
+  /**
+   * Pre-incremented per-tool usage counter. Set by
+   * `runDirectToolWithLifecycleHooks` so PreToolUse hooks observe
+   * the same `turn` the tool will actually execute under (Codex P2
+   * #27 — without this, parallel direct calls of the same tool in
+   * one Promise.all batch all read `turn=N` for the hook but
+   * actually executed as `turn=N`, `N+1`, `N+2`). When supplied,
+   * `runTool` skips its own counter increment.
+   */
+  usageCount?: number;
 };
 
 /**
@@ -574,12 +584,23 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
        * It is intentionally distinct from the outer `turn` parameter
        * (the batch turn used for ref keys); the latter is captured
        * before the try block when constructing `refKey`.
+       *
+       * Prefer the value `runDirectToolWithLifecycleHooks` already
+       * incremented (Codex P2 #27) — its hook wants the SAME turn
+       * the tool will execute under. When called from a path that
+       * doesn't pre-increment (event dispatch, the no-hooks
+       * shortcut), do the read+increment here.
        */
-      const usageCount = this.toolUsageCount.get(call.name) ?? 0;
-      this.toolUsageCount.set(call.name, usageCount + 1);
-      if (call.id != null && call.id !== '') {
-        this.toolCallTurns.set(call.id, usageCount);
-      }
+      const usageCount =
+        batchContext.usageCount ??
+        ((): number => {
+          const next = this.toolUsageCount.get(call.name) ?? 0;
+          this.toolUsageCount.set(call.name, next + 1);
+          if (call.id != null && call.id !== '') {
+            this.toolCallTurns.set(call.id, next);
+          }
+          return next;
+        })();
       let args = call.args;
       if (resolveFn != null) {
         const { resolved, unresolved } = resolveFn(runId, args);
@@ -911,7 +932,20 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     const registryRunId =
       batchContext.batchScopeId ??
       (config.configurable?.run_id as string | undefined);
-    const turn = this.toolUsageCount.get(call.name) ?? 0;
+    // Read AND increment synchronously, before any await. This pins
+    // the per-tool turn for both the PreToolUse hook AND the eventual
+    // runTool execution to the same value — without the increment
+    // here, parallel direct calls of the same tool in one
+    // Promise.all batch would all hand the hook the same stale
+    // counter and runTool would later read 0,1,2 inside an awaited
+    // continuation (Codex P2 #27). Threaded through batchContext so
+    // runTool skips its own increment.
+    const usageCount = this.toolUsageCount.get(call.name) ?? 0;
+    this.toolUsageCount.set(call.name, usageCount + 1);
+    if (call.id != null && call.id !== '') {
+      this.toolCallTurns.set(call.id, usageCount);
+    }
+    const turn = usageCount;
     const stepId = this.toolCallStepIds?.get(call.id ?? '') ?? '';
 
     // Use the caller-threaded snapshot when available (P1 #18) so the
@@ -1115,7 +1149,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       }
     }
 
-    const output = await this.runTool(effectiveCall, config, batchContext);
+    const output = await this.runTool(effectiveCall, config, {
+      ...batchContext,
+      usageCount,
+    });
 
     if (!(output instanceof ToolMessage)) {
       return output;

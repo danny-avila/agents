@@ -47,6 +47,7 @@
  *   // …with the hook installed and humanInTheLoop.enabled = true.
  */
 
+import { homedir } from 'os';
 import { isAbsolute, relative, resolve } from 'path';
 import { realpath } from 'fs/promises';
 import { Constants } from '@/common';
@@ -106,6 +107,47 @@ const WRITE_TOOLS = new Set<string>([
   Constants.EDIT_FILE,
 ]);
 
+/**
+ * Best-effort extractor for `compile_check` — pulls absolute and `~/`
+ * path tokens out of the `command` string so the workspace boundary
+ * sees them. Without this, a model could ship `command: 'cat
+ * /etc/passwd'` and the policy hook would short-circuit to `allow`
+ * (Codex P1 #26 — the prior `() => []` made the hook a no-op for
+ * compile_check). Conservative by design:
+ *
+ *   - Matches `/foo`, `~/foo`, `$HOME/foo`, `${HOME}/foo` followed by
+ *     non-shell-special chars. Stops at whitespace, quotes, redirect
+ *     operators, pipes, semicolons.
+ *   - Strips a leading `--flag=` so `--out=/etc/foo` extracts as
+ *     `/etc/foo` (the path the agent's actually trying to write).
+ *   - Misses relative paths (intended — those resolve under cwd
+ *     anyway), and shell-substituted paths whose final form isn't
+ *     visible at extract time. Hosts that need bulletproof gating
+ *     should pair this with a `bash_tool`-level policy.
+ */
+const ABSOLUTE_PATH_TOKEN =
+  /(?:^|[\s=])(?:--[^\s=]+=)?(\/[^\s'"|;&<>()`]+|~\/[^\s'"|;&<>()`]+|\$\{?HOME\}?\/[^\s'"|;&<>()`]+)/g;
+function expandHomeRelative(token: string): string {
+  // Expand ~/foo and $HOME/foo and ${HOME}/foo to absolute. The
+  // workspace boundary check resolves non-absolute paths against the
+  // workspace root, which would silently treat `~/secret` as
+  // `<workspace>/~/secret` — exactly the bypass the codex flagged.
+  const home = homedir();
+  if (token.startsWith('~/')) return `${home}/${token.slice(2)}`;
+  if (token.startsWith('${HOME}/')) return `${home}/${token.slice(8)}`;
+  if (token.startsWith('$HOME/')) return `${home}/${token.slice(6)}`;
+  return token;
+}
+function extractCompileCheckPaths(input: Record<string, unknown>): string[] {
+  const command = typeof input.command === 'string' ? input.command : '';
+  if (command === '') return [];
+  const out: string[] = [];
+  for (const match of command.matchAll(ABSOLUTE_PATH_TOKEN)) {
+    out.push(expandHomeRelative(match[1]));
+  }
+  return out;
+}
+
 const DEFAULT_EXTRACTORS: Record<string, PathExtractor> = {
   [Constants.READ_FILE]: (i) =>
     typeof i.file_path === 'string' ? [i.file_path] : [],
@@ -119,7 +161,7 @@ const DEFAULT_EXTRACTORS: Record<string, PathExtractor> = {
     typeof i.path === 'string' && i.path !== '' ? [i.path] : [],
   [Constants.LIST_DIRECTORY]: (i) =>
     typeof i.path === 'string' && i.path !== '' ? [i.path] : [],
-  [Constants.COMPILE_CHECK]: () => [],
+  [Constants.COMPILE_CHECK]: extractCompileCheckPaths,
 };
 
 function isInsideAnyRoot(absolutePath: string, roots: string[]): boolean {

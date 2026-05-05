@@ -238,4 +238,76 @@ describe('createWorkspacePolicyHook', () => {
       expect(out.decision).toBe('allow');
     });
   });
+
+  describe('compile_check command path extraction (Codex P1 #26)', () => {
+    it('extracts absolute paths from compile_check commands so the policy fires', async () => {
+      const hook = createWorkspacePolicyHook({
+        root: workspace,
+        outsideRead: 'deny',
+      });
+      const out = await call(
+        hook,
+        makeInput('compile_check', { command: 'cat /etc/passwd' })
+      );
+      expect(out.decision).toBe('deny');
+      expect(out.reason).toContain('/etc/passwd');
+    });
+
+    it('extracts paths from --flag=/path-style tokens', async () => {
+      // compile_check is in READ_TOOLS, so the policy uses outsideRead.
+      const hook = createWorkspacePolicyHook({
+        root: workspace,
+        outsideRead: 'deny',
+      });
+      const out = await call(
+        hook,
+        makeInput('compile_check', { command: 'tsc --out=/etc/foo' })
+      );
+      expect(out.decision).toBe('deny');
+      expect(out.reason).toContain('/etc/foo');
+    });
+
+    it('extracts ~/ and $HOME/ tokens', async () => {
+      const hook = createWorkspacePolicyHook({
+        root: workspace,
+        outsideRead: 'deny',
+      });
+      const tilde = await call(
+        hook,
+        makeInput('compile_check', { command: 'cat ~/secret' })
+      );
+      expect(tilde.decision).toBe('deny');
+      const homeVar = await call(
+        hook,
+        makeInput('compile_check', { command: 'cat $HOME/secret' })
+      );
+      expect(homeVar.decision).toBe('deny');
+    });
+
+    it('allows in-workspace absolute paths in the command', async () => {
+      const hook = createWorkspacePolicyHook({
+        root: workspace,
+        outsideRead: 'deny',
+      });
+      const out = await call(
+        hook,
+        makeInput('compile_check', {
+          command: `tsc --noEmit ${join(workspace, 'src/x.ts')}`,
+        })
+      );
+      expect(out.decision).toBe('allow');
+    });
+
+    it('allows commands with no absolute paths (relative-only auto-detect form)', async () => {
+      const hook = createWorkspacePolicyHook({
+        root: workspace,
+        outsideRead: 'deny',
+      });
+      const out = await call(
+        hook,
+        makeInput('compile_check', { command: 'npx tsc --noEmit' })
+      );
+      expect(out.decision).toBe('allow');
+    });
+  });
 });

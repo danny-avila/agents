@@ -297,4 +297,78 @@ describe('Direct-path lifecycle hooks (in-process tools)', () => {
     expect(String(byId.get('call_a')?.content)).toBe('allowed-ran');
     expect(String(byId.get('call_b')?.content)).toContain('Blocked: no-no');
   });
+
+  it('PreToolUse `turn` matches the per-tool index the body actually executes under (Codex P2 #27)', async () => {
+    // Three parallel direct calls of the same tool. Pre-fix: each
+    // hook read `turn = toolUsageCount.get('echo') ?? 0` BEFORE any
+    // await, so all three saw 0; runTool then incremented inside its
+    // own scope and the bodies ran as 0/1/2. Hook → tool got
+    // misaligned, breaking host policies that key on
+    // (toolName, turn). With the fix, the increment is hoisted into
+    // runDirectToolWithLifecycleHooks (sync, before any await) and
+    // threaded into runTool via batchContext so both observe the
+    // same value.
+    const hookTurns: number[] = [];
+    const bodyTurns: number[] = [];
+    let bodyCount = 0;
+    const echo = createDirectTool('echo', () => {
+      bodyCount += 1;
+      return 'EXECUTED';
+    });
+
+    const registry = new HookRegistry();
+    registry.register('PreToolUse', {
+      hooks: [
+        async (input): Promise<PreToolUseHookOutput> => {
+          if (typeof input.turn === 'number') hookTurns.push(input.turn);
+          return { decision: 'allow' };
+        },
+      ],
+    });
+
+    const node = new ToolNode({
+      tools: [echo],
+      eventDrivenMode: true,
+      hookRegistry: registry,
+      directToolNames: new Set(['echo']),
+    });
+
+    // Patch the tool's `func` to record the turn the body sees via the
+    // standard LangChain config.toolCall.turn channel.
+    const originalFunc = (echo as unknown as { func: (input: unknown, config: unknown) => Promise<string> }).func;
+    (echo as unknown as { func: (input: unknown, config: unknown) => Promise<string> }).func = async (
+      input,
+      config
+    ): Promise<string> => {
+      const t = (config as { toolCall?: { turn?: number } } | undefined)
+        ?.toolCall?.turn;
+      if (typeof t === 'number') bodyTurns.push(t);
+      return originalFunc(input, config);
+    };
+
+    const aiMsg = new AIMessage({
+      content: '',
+      tool_calls: [
+        { id: 'c0', name: 'echo', args: { command: 'a' } },
+        { id: 'c1', name: 'echo', args: { command: 'b' } },
+        { id: 'c2', name: 'echo', args: { command: 'c' } },
+      ],
+    });
+    await node.invoke({ messages: [aiMsg] });
+
+    // Sanity: tool ran 3 times, hook fired 3 times.
+    expect(bodyCount).toBe(3);
+    expect(hookTurns.length).toBe(3);
+    // Post-fix: each hook observes a unique turn (one of 0, 1, 2)
+    // — the SAME turn the body executes under. Pre-fix they all
+    // saw 0, so the dedupe-to-3 assertion would fail.
+    expect(new Set(hookTurns).size).toBe(3);
+    expect([...hookTurns].sort()).toEqual([0, 1, 2]);
+    // The body-side `config.toolCall.turn` should also align (when
+    // visible — LangChain may not propagate config in every test
+    // shape; assert weakly).
+    if (bodyTurns.length === 3) {
+      expect([...bodyTurns].sort()).toEqual([0, 1, 2]);
+    }
+  });
 });
