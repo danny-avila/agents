@@ -65,6 +65,13 @@ async function main(): Promise<void> {
     [GraphEvents.TOOL_END]: new ToolEndHandler(),
     [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(),
     [GraphEvents.CHAT_MODEL_STREAM]: new ChatModelStreamHandler(),
+    // Forward ON_RUN_STEP so the aggregator's stepMap is seeded
+    // before ON_RUN_STEP_COMPLETED arrives (issue #142).
+    [GraphEvents.ON_RUN_STEP]: {
+      handle: (event: GraphEvents.ON_RUN_STEP, data: t.StreamEventData): void => {
+        aggregateContent({ event, data: data as t.RunStep });
+      },
+    },
     [GraphEvents.ON_RUN_STEP_COMPLETED]: {
       handle: (
         event: GraphEvents.ON_RUN_STEP_COMPLETED,
