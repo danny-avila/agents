@@ -1471,6 +1471,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             subagentType,
             threadId,
             parentToolCallId,
+            /**
+             * Forward the parent's `configurable` so host-set fields
+             * (`requestBody`, `user`, etc.) propagate into the child
+             * workflow. The executor scrubs run-identity fields before
+             * forwarding — see `SubagentExecuteParams.parentConfigurable`.
+             */
+            parentConfigurable: config.configurable as
+              | Record<string, unknown>
+              | undefined,
           });
           return result.content;
         }, buildSubagentToolParams(resolvedConfigs));

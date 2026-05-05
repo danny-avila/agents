@@ -546,6 +546,154 @@ describe('SubagentExecutor', () => {
     expect(observedChildInputs!.maxSubagentDepth).toBeUndefined();
   });
 
+  describe('parentConfigurable inheritance', () => {
+    /**
+     * Build a stub factory that captures the second argument to
+     * `workflow.invoke()` (the runnable config) so tests can assert on
+     * the `configurable` we forwarded to the child graph.
+     */
+    function makeCapturingGraphFactory(): {
+      factory: () => StandardGraph;
+      getInvokeConfig: () => Record<string, unknown> | undefined;
+    } {
+      let capturedConfig: Record<string, unknown> | undefined;
+      const factory = (): StandardGraph =>
+        ({
+          createWorkflow: (): { invoke: jest.Mock } => ({
+            invoke: jest
+              .fn()
+              .mockImplementation(
+                async (
+                  _input: unknown,
+                  config: Record<string, unknown>
+                ): Promise<{ messages: BaseMessage[] }> => {
+                  capturedConfig = config;
+                  return { messages: [new AIMessage('done')] };
+                }
+              ),
+          }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph;
+      return { factory, getInvokeConfig: () => capturedConfig };
+    }
+
+    it('forwards parentConfigurable into the child workflow.invoke configurable', async () => {
+      const { factory, getInvokeConfig } = makeCapturingGraphFactory();
+      const executor = createExecutor({ createChildGraph: factory });
+
+      await executor.execute({
+        description: 'task',
+        subagentType: 'researcher',
+        parentConfigurable: {
+          requestBody: { messageId: 'msg-123', conversationId: 'conv-456' },
+          user: { id: 'user_abc' },
+          user_id: 'user_abc',
+          userMCPAuthMap: { 'mcp-github': { token: 'abc' } },
+        },
+      });
+
+      const invokeConfig = getInvokeConfig();
+      expect(invokeConfig).toBeDefined();
+      const configurable = invokeConfig!.configurable as Record<string, unknown>;
+      expect(configurable.requestBody).toEqual({
+        messageId: 'msg-123',
+        conversationId: 'conv-456',
+      });
+      expect(configurable.user).toEqual({ id: 'user_abc' });
+      expect(configurable.user_id).toBe('user_abc');
+      expect(configurable.userMCPAuthMap).toEqual({
+        'mcp-github': { token: 'abc' },
+      });
+    });
+
+    it('inherits parent thread_id when supplied (subagent is part of same conversation)', async () => {
+      const { factory, getInvokeConfig } = makeCapturingGraphFactory();
+      const executor = createExecutor({
+        createChildGraph: factory,
+        parentRunId: 'parent-run-xyz',
+      });
+
+      await executor.execute({
+        description: 'task',
+        subagentType: 'researcher',
+        parentConfigurable: { thread_id: 'parent-thread-conv-abc' },
+      });
+
+      const configurable = getInvokeConfig()!.configurable as Record<
+        string,
+        unknown
+      >;
+      expect(configurable.thread_id).toBe('parent-thread-conv-abc');
+    });
+
+    it('falls back to childRunId for thread_id when parent did not supply one', async () => {
+      const { factory, getInvokeConfig } = makeCapturingGraphFactory();
+      const executor = createExecutor({
+        createChildGraph: factory,
+        parentRunId: 'parent-run-xyz',
+      });
+
+      await executor.execute({
+        description: 'task',
+        subagentType: 'researcher',
+        parentConfigurable: { user_id: 'user_abc' },
+      });
+
+      const configurable = getInvokeConfig()!.configurable as Record<
+        string,
+        unknown
+      >;
+      expect(configurable.thread_id as string).toMatch(/^parent-run-xyz_sub_/);
+      expect(configurable.user_id).toBe('user_abc');
+    });
+
+    it('forwards run-identity fields verbatim into the child invoke configurable', async () => {
+      const { factory, getInvokeConfig } = makeCapturingGraphFactory();
+      const executor = createExecutor({ createChildGraph: factory });
+
+      await executor.execute({
+        description: 'task',
+        subagentType: 'researcher',
+        parentConfigurable: {
+          run_id: 'parent-run-id',
+          parent_run_id: 'grandparent-run-id',
+          requestBody: { messageId: 'msg-1' },
+        },
+      });
+
+      const configurable = getInvokeConfig()!.configurable as Record<
+        string,
+        unknown
+      >;
+      // The SDK forwards these fields as part of its inheritance contract.
+      // NOTE: the LangGraph runtime overwrites `configurable.run_id` at
+      // actual child-invoke time (verified empirically); this unit test
+      // only asserts what the SDK forwards into `workflow.invoke` — not
+      // what tools downstream observe. `parent_run_id` and other
+      // host-set keys do survive the runtime pass-through.
+      expect(configurable.run_id).toBe('parent-run-id');
+      expect(configurable.parent_run_id).toBe('grandparent-run-id');
+      expect(configurable.requestBody).toEqual({ messageId: 'msg-1' });
+    });
+
+    it('does not require parentConfigurable (back-compat with hosts that omit it)', async () => {
+      const { factory, getInvokeConfig } = makeCapturingGraphFactory();
+      const executor = createExecutor({ createChildGraph: factory });
+
+      await executor.execute({
+        description: 'task',
+        subagentType: 'researcher',
+      });
+
+      const configurable = getInvokeConfig()!.configurable as Record<
+        string,
+        unknown
+      >;
+      // Only thread_id (childRunId fallback) is set when no parent context is supplied.
+      expect(Object.keys(configurable)).toEqual(['thread_id']);
+    });
+  });
+
   describe('hooks', () => {
     let capturedStart: unknown;
     let capturedStop: unknown;
