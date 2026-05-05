@@ -116,6 +116,15 @@ export type CodeEnvFile = {
   id: string;
   name: string;
   session_id: string;
+  /**
+   * Identifier of the entity that owns this file's session (skill id,
+   * agent id, etc). Forwarded to codeapi so it can resolve the
+   * per-file sessionKey instead of falling back to a single
+   * request-level entity. Required when a single execute request
+   * references files uploaded under different entities (e.g. a skill
+   * file plus a user attachment in the same call).
+   */
+  entity_id?: string;
 };
 
 export type CodeExecutionToolParams =
@@ -132,6 +141,13 @@ export type FileRef = {
   path?: string;
   /** Session ID this file belongs to (for multi-session file tracking) */
   session_id?: string;
+  /**
+   * Entity that owns this file's session (skill id, agent id, etc).
+   * Carried on tracked session files so it can flow through to
+   * `_injected_files` when a subsequent execute references a mix of
+   * files uploaded under different entities.
+   */
+  entity_id?: string;
   /**
    * `true` when the codeapi sandbox echoed this entry as an unchanged
    * passthrough of an input the caller already owns (skill files,

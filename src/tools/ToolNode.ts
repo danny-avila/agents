@@ -558,6 +558,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               session_id: file.session_id ?? codeSession.session_id,
               id: file.id,
               name: file.name,
+              ...(file.entity_id != null ? { entity_id: file.entity_id } : {}),
             }));
             invokeParams._injected_files = fileRefs;
           }
@@ -797,6 +798,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         session_id: file.session_id ?? codeSession.session_id,
         id: file.id,
         name: file.name,
+        ...(file.entity_id != null ? { entity_id: file.entity_id } : {}),
       }));
     }
 
