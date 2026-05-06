@@ -428,7 +428,7 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
 
     // Turn 7: absolute minimum context if still nothing
     if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
-      ({ run, contentParts } = await createRun(3100));
+      ({ run, contentParts } = await createRun(2200));
       await runTurn({ run, conversationHistory }, 'What is 1+1?', streamConfig);
       logTurn('T7', conversationHistory);
     }
@@ -722,7 +722,7 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
     }
 
     if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
-      run = await createRun(2800);
+      run = await createRun(1000);
       await runTurn(
         { run, conversationHistory },
         'What is 9 * 9? Calculator.',
@@ -876,7 +876,7 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
 
     // Turn 6: squeeze harder if needed
     if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
-      ({ run, contentParts } = await createRun(2000));
+      ({ run, contentParts } = await createRun(1000));
       await runTurn(
         { run, conversationHistory },
         'What is 42 * 42? Use the calculator.',

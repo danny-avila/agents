@@ -36,8 +36,11 @@ import type { CustomAnthropicCallOptions } from './index';
 import type {
   AnthropicContextManagementConfigParam,
   AnthropicMessageCreateParams,
+  AnthropicMessageStreamEvent,
   AnthropicMessageResponse,
   AnthropicOutputConfig,
+  AnthropicRequestOptions,
+  AnthropicStreamingMessageCreateParams,
   AnthropicThinkingConfigParam,
   ChatAnthropicContentBlock,
 } from './types';
@@ -689,6 +692,287 @@ test('Anthropic usage metadata includes cache input token buckets', () => {
       cache_read: 30,
     },
   });
+});
+
+type AnthropicStreamEvent = Anthropic.Beta.Messages.BetaRawMessageStreamEvent;
+
+function createMockAnthropicStream(events: AnthropicStreamEvent[]) {
+  return {
+    controller: { abort: jest.fn() },
+    async *[Symbol.asyncIterator]() {
+      for (const event of events) {
+        yield event;
+      }
+    },
+  };
+}
+
+class MockStreamingAnthropic extends ChatAnthropic {
+  constructor(private readonly mockEvents: AnthropicStreamEvent[]) {
+    super({
+      modelName,
+      apiKey: 'test-key',
+      maxTokens: 10,
+      streamUsage: true,
+    });
+  }
+
+  protected override async createStreamWithRetry() {
+    return createMockAnthropicStream(this.mockEvents) as never;
+  }
+}
+
+class RecordingStreamingAnthropic extends ChatAnthropic {
+  messageStartOutputTokens = 0;
+  readonly messageDeltaOutputTokens: number[] = [];
+
+  protected override async createStreamWithRetry(
+    request: AnthropicStreamingMessageCreateParams,
+    options?: AnthropicRequestOptions
+  ) {
+    const stream = await super.createStreamWithRetry(request, options);
+    const recorder = this;
+
+    return {
+      controller: stream.controller,
+      async *[Symbol.asyncIterator](): AsyncGenerator<AnthropicMessageStreamEvent> {
+        for await (const event of stream) {
+          if (event.type === 'message_start') {
+            recorder.messageStartOutputTokens =
+              event.message.usage.output_tokens ??
+              recorder.messageStartOutputTokens;
+          } else if (event.type === 'message_delta') {
+            recorder.messageDeltaOutputTokens.push(event.usage.output_tokens);
+          }
+          yield event;
+        }
+      },
+    } as unknown as typeof stream;
+  }
+}
+
+test('Anthropic message_delta usage emits only output token totals', () => {
+  const event: AnthropicStreamEvent = {
+    type: 'message_delta',
+    context_management: null,
+    delta: {
+      container: null,
+      stop_details: null,
+      stop_reason: 'end_turn',
+      stop_sequence: null,
+    },
+    usage: {
+      input_tokens: 243,
+      output_tokens: 375,
+      cache_creation_input_tokens: 11,
+      cache_read_input_tokens: 13,
+      server_tool_use: null,
+      iterations: null,
+    },
+  };
+
+  const result = _makeMessageChunkFromAnthropicEvent(event, {
+    streamUsage: true,
+    coerceContentToString: true,
+  });
+
+  expect(result?.chunk.usage_metadata).toEqual({
+    input_tokens: 0,
+    output_tokens: 375,
+    total_tokens: 375,
+  });
+});
+
+test('Anthropic stream usage does not double-count cumulative input tokens', async () => {
+  const events: AnthropicStreamEvent[] = [
+    {
+      type: 'message_start',
+      message: {
+        id: 'msg_token_accounting',
+        container: null,
+        context_management: null,
+        content: [],
+        model: modelName,
+        role: 'assistant',
+        stop_details: null,
+        stop_reason: null,
+        stop_sequence: null,
+        type: 'message',
+        usage: {
+          cache_creation: null,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 0,
+          inference_geo: null,
+          input_tokens: 243,
+          iterations: null,
+          output_tokens: 0,
+          server_tool_use: null,
+          service_tier: null,
+          speed: null,
+        },
+      },
+    },
+    {
+      type: 'message_delta',
+      context_management: null,
+      delta: {
+        container: null,
+        stop_details: null,
+        stop_reason: 'end_turn',
+        stop_sequence: null,
+      },
+      usage: {
+        input_tokens: 243,
+        output_tokens: 375,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        server_tool_use: null,
+        iterations: null,
+      },
+    },
+    { type: 'message_stop' },
+  ];
+  const model = new MockStreamingAnthropic(events);
+
+  let full: AIMessageChunk | undefined;
+  for await (const chunk of await model.stream('hello')) {
+    full = !full ? chunk : concat(full, chunk);
+  }
+
+  expect(full?.usage_metadata).toEqual({
+    input_tokens: 243,
+    output_tokens: 375,
+    total_tokens: 618,
+    input_token_details: {
+      cache_creation: 0,
+      cache_read: 0,
+    },
+    output_token_details: {},
+  });
+});
+
+test('Anthropic stream usage handles multiple cumulative message_delta events', async () => {
+  const events: AnthropicStreamEvent[] = [
+    {
+      type: 'message_start',
+      message: {
+        id: 'msg_token_accounting_multi_delta',
+        container: null,
+        context_management: null,
+        content: [],
+        model: modelName,
+        role: 'assistant',
+        stop_details: null,
+        stop_reason: null,
+        stop_sequence: null,
+        type: 'message',
+        usage: {
+          cache_creation: null,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 0,
+          inference_geo: null,
+          input_tokens: 243,
+          iterations: null,
+          output_tokens: 0,
+          server_tool_use: null,
+          service_tier: null,
+          speed: null,
+        },
+      },
+    },
+    {
+      type: 'message_delta',
+      context_management: null,
+      delta: {
+        container: null,
+        stop_details: null,
+        stop_reason: null,
+        stop_sequence: null,
+      },
+      usage: {
+        input_tokens: 243,
+        output_tokens: 100,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        server_tool_use: null,
+        iterations: null,
+      },
+    },
+    {
+      type: 'message_delta',
+      context_management: null,
+      delta: {
+        container: null,
+        stop_details: null,
+        stop_reason: 'end_turn',
+        stop_sequence: null,
+      },
+      usage: {
+        input_tokens: 243,
+        output_tokens: 375,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        server_tool_use: null,
+        iterations: null,
+      },
+    },
+    { type: 'message_stop' },
+  ];
+  const model = new MockStreamingAnthropic(events);
+
+  let full: AIMessageChunk | undefined;
+  for await (const chunk of await model.stream('hello')) {
+    full = !full ? chunk : concat(full, chunk);
+  }
+
+  expect(full?.usage_metadata).toEqual({
+    input_tokens: 243,
+    output_tokens: 375,
+    total_tokens: 618,
+    input_token_details: {
+      cache_creation: 0,
+      cache_read: 0,
+    },
+    output_token_details: {},
+  });
+});
+
+test('Anthropic live stream usage matches raw cumulative output snapshots', async () => {
+  const model = new RecordingStreamingAnthropic({
+    modelName,
+    temperature: 0,
+    maxTokens: 500,
+    _lc_stream_delay: 0,
+  });
+
+  let full: AIMessageChunk | undefined;
+  const stream = await model.stream(
+    'Write exactly 18 numbered lines about reliable software telemetry. Each line should contain exactly seven words. Do not add an intro or outro.'
+  );
+  for await (const chunk of stream) {
+    full = !full ? chunk : concat(full, chunk);
+  }
+
+  expect(model.messageDeltaOutputTokens.length).toBeGreaterThan(0);
+  const rawOutputTokens =
+    model.messageDeltaOutputTokens[model.messageDeltaOutputTokens.length - 1];
+  expect(full?.usage_metadata?.output_tokens).toBe(
+    model.messageStartOutputTokens + rawOutputTokens
+  );
+  expect(full?.usage_metadata?.total_tokens).toBe(
+    (full?.usage_metadata?.input_tokens ?? 0) +
+      (full?.usage_metadata?.output_tokens ?? 0)
+  );
+
+  if (model.messageDeltaOutputTokens.length > 1) {
+    const summedOutputTokens = model.messageDeltaOutputTokens.reduce(
+      (sum, tokens) => sum + tokens,
+      0
+    );
+    expect(full?.usage_metadata?.output_tokens).toBeLessThan(
+      model.messageStartOutputTokens + summedOutputTokens
+    );
+  }
 });
 
 test('document detection ignores null content placeholders', () => {

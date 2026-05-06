@@ -98,10 +98,6 @@ export function _makeMessageChunkFromAnthropicEvent(
       input_tokens: 0,
       output_tokens: data.usage.output_tokens,
       total_tokens: data.usage.output_tokens,
-      input_token_details: {
-        cache_creation: data.usage.cache_creation_input_tokens ?? undefined,
-        cache_read: data.usage.cache_read_input_tokens ?? undefined,
-      },
     };
     return {
       chunk: new AIMessageChunk({

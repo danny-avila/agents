@@ -5,7 +5,6 @@ import { mkdir, realpath, rm, writeFile } from 'fs/promises';
 import { createWriteStream } from 'fs';
 import { spawn } from 'child_process';
 import type { ChildProcess } from 'child_process';
-import type { SandboxRuntimeConfig } from '@anthropic-ai/sandbox-runtime';
 import { runBashAstChecks, bashAstFindingsToErrors } from './bashAst';
 import { nodeWorkspaceFS } from './workspaceFS';
 import type { WorkspaceFS } from './workspaceFS';
@@ -188,8 +187,17 @@ type RuntimeCommand = {
   source?: string;
 };
 
-type SandboxRuntimeModule = typeof import('@anthropic-ai/sandbox-runtime');
-type SandboxManagerType = SandboxRuntimeModule['SandboxManager'];
+type SandboxManagerType = {
+  checkDependencies(): { errors: string[] };
+  initialize(config: BuiltSandboxRuntimeConfig): Promise<void>;
+  reset(): Promise<void>;
+  wrapWithSandbox(command: string): Promise<string>;
+};
+
+type SandboxRuntimeModule = {
+  getDefaultWritePaths(): string[];
+  SandboxManager: SandboxManagerType;
+};
 
 let sandboxConfigKey: string | undefined;
 let sandboxInitialized = false;
@@ -229,9 +237,7 @@ export function getLocalCwd(config?: t.LocalExecutionConfig): string {
  * Returns plain absolute paths — callers symlink-resolve when they
  * need realpath equality (see `resolveWorkspacePathSafe`).
  */
-export function getWorkspaceRoots(
-  config?: t.LocalExecutionConfig
-): string[] {
+export function getWorkspaceRoots(config?: t.LocalExecutionConfig): string[] {
   const root = getLocalCwd(config);
   const extras = config?.workspace?.additionalRoots ?? [];
   if (extras.length === 0) return [root];
@@ -258,9 +264,7 @@ export function getWorkspaceRoots(
  * back to the legacy top-level `local.spawn`, then to Node's
  * `child_process.spawn`. Centralised so engine swapping is one knob.
  */
-export function getSpawn(
-  config?: t.LocalExecutionConfig
-): t.LocalSpawn {
+export function getSpawn(config?: t.LocalExecutionConfig): t.LocalSpawn {
   return (config?.exec?.spawn ?? config?.spawn ?? spawn) as t.LocalSpawn;
 }
 
@@ -269,9 +273,7 @@ export function getSpawn(
  * to the Node-host implementation. A future remote engine supplies
  * its own implementation here and inherits every file-touching tool.
  */
-export function getWorkspaceFS(
-  config?: t.LocalExecutionConfig
-): WorkspaceFS {
+export function getWorkspaceFS(config?: t.LocalExecutionConfig): WorkspaceFS {
   return config?.exec?.fs ?? nodeWorkspaceFS;
 }
 
@@ -282,17 +284,17 @@ export function getWorkspaceFS(
  * helpers interpret as "skip the write clamp".
  */
 export function getWriteRoots(
-  config?: t.LocalExecutionConfig
+  config: t.LocalExecutionConfig = {}
 ): string[] | null {
   // Granular flag wins over the legacy one when explicitly set
   // (true OR false) — otherwise a host tightening access during
   // migration (`allowOutsideWorkspace: true, workspace.
   // allowWriteOutside: false`) would still get the loose behavior
   // because the legacy flag short-circuited the OR. Codex P1 #36.
-  const granular = config?.workspace?.allowWriteOutside;
+  const granular = config.workspace?.allowWriteOutside;
   if (granular === true) return null;
   if (granular === false) return getWorkspaceRoots(config);
-  if (config?.allowOutsideWorkspace === true) return null;
+  if (config.allowOutsideWorkspace === true) return null;
   return getWorkspaceRoots(config);
 }
 
@@ -302,14 +304,14 @@ export function getWriteRoots(
  * `allowOutsideWorkspace`) by returning `null`.
  */
 export function getReadRoots(
-  config?: t.LocalExecutionConfig
+  config: t.LocalExecutionConfig = {}
 ): string[] | null {
   // Same precedence as getWriteRoots: granular flag is authoritative
   // when set, legacy flag is the fallback. Codex P1 #36.
-  const granular = config?.workspace?.allowReadOutside;
+  const granular = config.workspace?.allowReadOutside;
   if (granular === true) return null;
   if (granular === false) return getWorkspaceRoots(config);
-  if (config?.allowOutsideWorkspace === true) return null;
+  if (config.allowOutsideWorkspace === true) return null;
   return getWorkspaceRoots(config);
 }
 
@@ -323,10 +325,13 @@ const missingSandboxRuntimeMessage = [
   'Local sandbox is enabled, but @anthropic-ai/sandbox-runtime is not installed.',
   'Install it with `npm install @anthropic-ai/sandbox-runtime`, or disable local sandboxing with `local.sandbox.enabled: false`.',
 ].join(' ');
+const sandboxRuntimePackage = '@anthropic-ai/sandbox-runtime';
 
 /** Lazy-loads the ESM-only sandbox runtime only when sandboxing is enabled. */
 function loadSandboxRuntime(): Promise<SandboxRuntimeModule> {
-  sandboxRuntimePromise ??= import('@anthropic-ai/sandbox-runtime');
+  sandboxRuntimePromise ??= import(
+    sandboxRuntimePackage
+  ) as Promise<SandboxRuntimeModule>;
   return sandboxRuntimePromise;
 }
 
@@ -487,7 +492,9 @@ export async function validateBashCommand(
   }
 
   if (config.readOnly === true && mutatingCommandPattern.test(normalized)) {
-    errors.push('Command appears to mutate files or repository state in read-only local mode.');
+    errors.push(
+      'Command appears to mutate files or repository state in read-only local mode.'
+    );
   }
 
   // Use the same shell the actual execution path will use. Hard-coding
@@ -504,12 +511,14 @@ export async function validateBashCommand(
       sandbox: { enabled: false },
     },
     { internal: true }
-  ).catch((error: Error): SpawnResult => ({
-    stdout: '',
-    stderr: error.message,
-    exitCode: 1,
-    timedOut: false,
-  }));
+  ).catch(
+    (error: Error): SpawnResult => ({
+      stdout: '',
+      stderr: error.message,
+      exitCode: 1,
+      timedOut: false,
+    })
+  );
 
   if (syntax.exitCode !== 0) {
     errors.push(
@@ -567,14 +576,7 @@ async function ensureSandbox(
     await runtime.SandboxManager.reset();
   }
 
-  // Cast at the runtime boundary — our public `BuiltSandboxRuntimeConfig`
-  // is intentionally structural to keep the optional peer dep out of
-  // generated `.d.ts` (Codex P1 #22). It's a structural subset of the
-  // peer's `SandboxRuntimeConfig`, so the assignment is sound at the
-  // one site where the peer is actually loaded.
-  await runtime.SandboxManager.initialize(
-    runtimeConfig as unknown as SandboxRuntimeConfig
-  );
+  await runtime.SandboxManager.initialize(runtimeConfig);
   sandboxInitialized = true;
   sandboxConfigKey = nextKey;
   return runtime.SandboxManager;
@@ -715,8 +717,7 @@ export async function spawnLocalProcess(
   // so a process producing unbounded output gets stopped instead of
   // letting the host OOM.
   const inMemoryCapBytes = maxOutputChars * 2;
-  const hardKillBytes =
-    config.maxSpawnedBytes ?? DEFAULT_MAX_SPAWNED_BYTES;
+  const hardKillBytes = config.maxSpawnedBytes ?? DEFAULT_MAX_SPAWNED_BYTES;
   const sandboxManager = await ensureSandbox(config, cwd);
   // Internal probes (validateBashCommand syntax preflight,
   // isRipgrepAvailable, syntax-check probe cache priming) pass
@@ -775,10 +776,7 @@ export async function spawnLocalProcess(
       spillStream.write('\n===== overflow stream begins here =====\n');
     };
 
-    const handleChunk = (
-      buf: Buffer,
-      kind: 'stdout' | 'stderr'
-    ): void => {
+    const handleChunk = (buf: Buffer, kind: 'stdout' | 'stderr'): void => {
       totalSpawnedBytes += buf.length;
       // hardKillBytes <= 0 means "no cap" per the public config contract
       // (see LocalExecutionConfig.maxSpawnedBytes). Skip the kill check
@@ -857,11 +855,11 @@ export async function spawnLocalProcess(
       }, timeoutMs);
     }
 
-    child.stdout?.on('data', (chunk: Buffer) => {
+    child.stdout.on('data', (chunk: Buffer) => {
       handleChunk(chunk, 'stdout');
     });
 
-    child.stderr?.on('data', (chunk: Buffer) => {
+    child.stderr.on('data', (chunk: Buffer) => {
       handleChunk(chunk, 'stderr');
     });
 
@@ -928,8 +926,7 @@ export async function executeLocalBash(
  * Codex P1 [45], extended for dot-glob in Codex P1 [47] (mirrors the
  * `DESTRUCTIVE_TARGET` suffix matrix exactly).
  */
-const PROTECTED_TARGET_ARG_RE =
-  /^(?:\/|~|\$\{?HOME\}?|\.)(?:\/?\.?\*|\/)?$/;
+const PROTECTED_TARGET_ARG_RE = /^(?:\/|~|\$\{?HOME\}?|\.)(?:\/?\.?\*|\/)?$/;
 
 /**
  * Mutating-op recognizer for the args check. Conservative: only the
@@ -971,11 +968,7 @@ export async function executeLocalBashWithArgs(
     }
   }
   const shell = config.shell ?? DEFAULT_SHELL;
-  return spawnLocalProcess(
-    shell,
-    ['-lc', command, '--', ...args],
-    config
-  );
+  return spawnLocalProcess(shell, ['-lc', command, '--', ...args], config);
 }
 
 export async function executeLocalCode(
@@ -1009,7 +1002,11 @@ export async function executeLocalCode(
       config.shell
     );
     if (runtime.source != null) {
-      await writeFile(resolve(tempDir, runtime.fileName), runtime.source, 'utf8');
+      await writeFile(
+        resolve(tempDir, runtime.fileName),
+        runtime.source,
+        'utf8'
+      );
     }
     return await spawnLocalProcess(runtime.command, runtime.args, config);
   } finally {
@@ -1205,7 +1202,7 @@ function killProcessTree(child: ChildProcess): void {
   // window. Use unref() so the timer doesn't keep the Node process
   // alive past the parent's natural exit.
   const escalation = setTimeout(() => sigkill(child), SIGKILL_ESCALATION_MS);
-  escalation.unref?.();
+  escalation.unref();
   child.once('close', () => clearTimeout(escalation));
 }
 
@@ -1225,9 +1222,12 @@ export function resolveWorkspacePath(
   intent: 'read' | 'write' = 'write'
 ): string {
   const cwd = getLocalCwd(config);
-  const absolutePath = isAbsolute(filePath) ? resolve(filePath) : resolve(cwd, filePath);
+  const absolutePath = isAbsolute(filePath)
+    ? resolve(filePath)
+    : resolve(cwd, filePath);
 
-  const roots = intent === 'write' ? getWriteRoots(config) : getReadRoots(config);
+  const roots =
+    intent === 'write' ? getWriteRoots(config) : getReadRoots(config);
   if (roots == null) return absolutePath; // explicit allow-outside
 
   if (absolutePath === cwd || isInsideAnyRoot(absolutePath, roots)) {
@@ -1306,7 +1306,8 @@ export async function resolveWorkspacePathSafe(
   intent: 'read' | 'write' = 'write'
 ): Promise<string> {
   const lexical = resolveWorkspacePath(filePath, config, intent);
-  const roots = intent === 'write' ? getWriteRoots(config) : getReadRoots(config);
+  const roots =
+    intent === 'write' ? getWriteRoots(config) : getReadRoots(config);
   if (roots == null) {
     return lexical;
   }

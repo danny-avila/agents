@@ -4,7 +4,6 @@ import { ChatGenerationChunk } from '@langchain/core/outputs';
 import type { BaseChatModelParams } from '@langchain/core/language_models/chat_models';
 import type {
   BaseMessage,
-  UsageMetadata,
   MessageContentComplex,
 } from '@langchain/core/messages';
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
@@ -13,18 +12,13 @@ import type { Anthropic } from '@anthropic-ai/sdk';
 import type {
   AnthropicMessageCreateParams,
   AnthropicStreamingMessageCreateParams,
-  AnthropicMessageStartEvent,
-  AnthropicMessageDeltaEvent,
   AnthropicOutputConfig,
   AnthropicBeta,
   ChatAnthropicToolType,
   AnthropicMCPServerURLDefinition,
   AnthropicContextManagementConfigParam,
 } from '@/llm/anthropic/types';
-import {
-  _makeMessageChunkFromAnthropicEvent,
-  getAnthropicUsageMetadata,
-} from './utils/message_outputs';
+import { _makeMessageChunkFromAnthropicEvent } from './utils/message_outputs';
 import { _convertMessagesToAnthropicPayload } from './utils/message_inputs';
 import { handleToolChoice } from './utils/tools';
 import { TextStream } from '@/llm/text';
@@ -53,13 +47,17 @@ export function _documentsInParams(
       continue;
     }
     for (const block of message.content) {
+      const maybeBlock: unknown = block;
       if (
-        typeof block === 'object' &&
-        block !== null &&
-        block.type === 'document' &&
-        block.citations != null &&
-        typeof block.citations === 'object' &&
-        block.citations.enabled === true
+        typeof maybeBlock === 'object' &&
+        maybeBlock !== null &&
+        'type' in maybeBlock &&
+        maybeBlock.type === 'document' &&
+        'citations' in maybeBlock &&
+        maybeBlock.citations != null &&
+        typeof maybeBlock.citations === 'object' &&
+        'enabled' in maybeBlock.citations &&
+        maybeBlock.citations.enabled === true
       ) {
         return true;
       }
@@ -307,6 +305,30 @@ function cloneChunk(
   return chunk;
 }
 
+function withIncrementalMessageDeltaUsage(
+  chunk: AIMessageChunk,
+  previousOutputTokens: number
+): { chunk: AIMessageChunk; outputTokens: number } {
+  const usage = chunk.usage_metadata;
+  if (usage == null) {
+    return { chunk, outputTokens: previousOutputTokens };
+  }
+
+  const outputTokens = Math.max(0, usage.output_tokens - previousOutputTokens);
+  return {
+    chunk: new AIMessageChunk(
+      Object.assign({}, chunk, {
+        usage_metadata: {
+          ...usage,
+          output_tokens: outputTokens,
+          total_tokens: usage.input_tokens + outputTokens,
+        },
+      })
+    ),
+    outputTokens: usage.output_tokens,
+  };
+}
+
 export type CustomAnthropicInput = AnthropicInput & {
   _lc_stream_delay?: number;
   outputConfig?: AnthropicOutputConfig;
@@ -334,10 +356,7 @@ type CustomAnthropicInvocationParams = {
 
 export class CustomAnthropic extends ChatAnthropicMessages {
   _lc_stream_delay: number;
-  private message_start: AnthropicMessageStartEvent | undefined;
-  private message_delta: AnthropicMessageDeltaEvent | undefined;
   private tools_in_params?: boolean;
-  private emitted_usage?: boolean;
   top_k: number | undefined;
   outputConfig?: AnthropicOutputConfig;
   inferenceGeo?: string;
@@ -436,33 +455,7 @@ export class CustomAnthropic extends ChatAnthropicMessages {
     };
   }
 
-  /**
-   * Get stream usage as returned by this client's API response.
-   * @returns The stream usage object.
-   */
-  getStreamUsage(): UsageMetadata | undefined {
-    if (this.emitted_usage === true) {
-      return;
-    }
-    const inputUsage = this.message_start?.message.usage;
-    const outputUsage = this.message_delta?.usage;
-    if (!outputUsage) {
-      return;
-    }
-
-    this.emitted_usage = true;
-    return getAnthropicUsageMetadata({
-      input_tokens: inputUsage?.input_tokens,
-      output_tokens: outputUsage.output_tokens,
-      cache_creation_input_tokens: inputUsage?.cache_creation_input_tokens,
-      cache_read_input_tokens: inputUsage?.cache_read_input_tokens,
-    });
-  }
-
   resetTokenEvents(): void {
-    this.message_start = undefined;
-    this.message_delta = undefined;
-    this.emitted_usage = undefined;
     this.tools_in_params = undefined;
   }
 
@@ -484,17 +477,13 @@ export class CustomAnthropic extends ChatAnthropicMessages {
   private createGenerationChunk({
     token,
     chunk,
-    usageMetadata,
     shouldStreamUsage,
   }: {
     token?: string;
     chunk: AIMessageChunk;
     shouldStreamUsage: boolean;
-    usageMetadata?: UsageMetadata;
   }): ChatGenerationChunk {
-    const usage_metadata = shouldStreamUsage
-      ? (usageMetadata ?? chunk.usage_metadata)
-      : undefined;
+    const usage_metadata = shouldStreamUsage ? chunk.usage_metadata : undefined;
     return new ChatGenerationChunk({
       message: new AIMessageChunk({
         // Just yield chunk as it is and tool_use will be concat by BaseChatModel._generateUncached().
@@ -534,22 +523,12 @@ export class CustomAnthropic extends ChatAnthropicMessages {
     });
 
     const shouldStreamUsage = options.streamUsage ?? this.streamUsage;
+    let messageDeltaOutputTokens = 0;
 
     for await (const data of stream) {
       if (options.signal?.aborted === true) {
         stream.controller.abort();
         throw new Error('AbortError: User aborted the request.');
-      }
-
-      if (data.type === 'message_start') {
-        this.message_start = data as AnthropicMessageStartEvent;
-      } else if (data.type === 'message_delta') {
-        this.message_delta = data as AnthropicMessageDeltaEvent;
-      }
-
-      let usageMetadata: UsageMetadata | undefined;
-      if (this.tools_in_params !== true && this.emitted_usage !== true) {
-        usageMetadata = this.getStreamUsage();
       }
 
       const result = _makeMessageChunkFromAnthropicEvent(
@@ -561,18 +540,25 @@ export class CustomAnthropic extends ChatAnthropicMessages {
       );
       if (!result) continue;
 
-      const { chunk } = result;
+      let { chunk } = result;
+      if (data.type === 'message_delta') {
+        const incremental = withIncrementalMessageDeltaUsage(
+          chunk,
+          messageDeltaOutputTokens
+        );
+        chunk = incremental.chunk;
+        messageDeltaOutputTokens = incremental.outputTokens;
+      }
       const [token = '', tokenType] = extractToken(chunk);
 
       if (
         !tokenType ||
         tokenType === 'input' ||
-        (token === '' && (usageMetadata != null || chunk.id != null))
+        (token === '' && (chunk.usage_metadata != null || chunk.id != null))
       ) {
         const generationChunk = this.createGenerationChunk({
           token,
           chunk,
-          usageMetadata,
           shouldStreamUsage,
         });
         yield generationChunk;
@@ -602,15 +588,20 @@ export class CustomAnthropic extends ChatAnthropicMessages {
             break;
           }
           const newChunk = cloneChunk(currentToken, tokenType, chunk);
+          const chunkForToken =
+            emittedUsage && newChunk.usage_metadata != null
+              ? new AIMessageChunk(
+                Object.assign({}, newChunk, { usage_metadata: undefined })
+              )
+              : newChunk;
 
           const generationChunk = this.createGenerationChunk({
             token: currentToken,
-            chunk: newChunk,
-            usageMetadata: emittedUsage ? undefined : usageMetadata,
+            chunk: chunkForToken,
             shouldStreamUsage,
           });
 
-          if (usageMetadata && !emittedUsage) {
+          if (newChunk.usage_metadata != null && !emittedUsage) {
             emittedUsage = true;
           }
           yield generationChunk;
