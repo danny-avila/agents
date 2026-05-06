@@ -252,12 +252,12 @@ export function createBashProgrammaticToolCallingTool(
       const params = rawParams as { code: string; timeout?: number };
       const { code, timeout = DEFAULT_TIMEOUT } = params;
 
-      const { toolMap, toolDefs, session_id, _injected_files } =
-        (config.toolCall ?? {}) as ToolCall &
-          Partial<t.ProgrammaticCache> & {
-            session_id?: string;
-            _injected_files?: t.CodeEnvFile[];
-          };
+      const toolCall = (config.toolCall ?? {}) as ToolCall &
+        Partial<t.ProgrammaticCache> & {
+          session_id?: string;
+          _injected_files?: t.CodeEnvFile[];
+        };
+      const { toolMap, toolDefs, session_id, _injected_files } = toolCall;
 
       if (toolMap == null || toolMap.size === 0) {
         throw new Error(

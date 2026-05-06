@@ -115,7 +115,7 @@ export function createLocalCodeExecutionTool(
         {
           session_id: getLocalSessionId(config),
           files: [],
-        },
+        } satisfies t.CodeExecutionArtifact,
       ];
     },
     {
@@ -151,7 +151,7 @@ export function createLocalBashExecutionTool(options?: {
         {
           session_id: getLocalSessionId(config),
           files: [],
-        },
+        } satisfies t.CodeExecutionArtifact,
       ];
     },
     {

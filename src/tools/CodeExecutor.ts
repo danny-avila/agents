@@ -135,8 +135,8 @@ function createCodeExecutionTool(
       };
       /**
        * Extract session context from config.toolCall (injected by ToolNode).
-       * - session_id: For API to associate with previous session
-       * - _injected_files: File refs to pass directly (avoids /files endpoint race condition)
+       * - session_id: associates with the previous run.
+       * - _injected_files: File refs to pass directly (avoids /files endpoint race condition).
        */
       const { session_id, _injected_files } = (config.toolCall ?? {}) as {
         session_id?: string;
@@ -153,7 +153,10 @@ function createCodeExecutionTool(
       /**
        * File injection priority:
        * 1. Use _injected_files from ToolNode (avoids /files endpoint race condition)
-       * 2. Fall back to fetching from /files endpoint if session_id provided but no injected files
+       * 2. Fall back to fetching from /files endpoint if session_id
+       *    provided but no injected files. The /files lookup still uses the
+       *    same id value — codeapi stores output files under the exec id as
+       *    their storage prefix, so the two values coincide here.
        */
       if (_injected_files && _injected_files.length > 0) {
         postData.files = _injected_files;
@@ -186,7 +189,10 @@ function createCodeExecutionTool(
               const id = nameParts.length > 1 ? nameParts[1].split('.')[0] : '';
 
               return {
-                session_id,
+                storage_session_id: session_id,
+                /* `/files` fallback returns code-output files belonging
+                 * to the user; tag them user-private. */
+                kind: 'user' as const,
                 id,
                 name: file.metadata['original-filename'],
               };
@@ -259,11 +265,16 @@ function createCodeExecutionTool(
             {
               session_id: result.session_id,
               files: result.files,
-            },
+            } satisfies t.CodeExecutionArtifact,
           ];
         }
 
-        return [formattedOutput.trim(), { session_id: result.session_id }];
+        return [
+          formattedOutput.trim(),
+          {
+            session_id: result.session_id,
+          } satisfies t.CodeExecutionArtifact,
+        ];
       } catch (error) {
         throw new Error(
           `Execution error:\n\n${(error as Error | undefined)?.message}`

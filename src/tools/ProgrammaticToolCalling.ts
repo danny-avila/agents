@@ -304,7 +304,10 @@ export async function fetchSessionFiles(
       const id = nameParts.length > 1 ? nameParts[1].split('.')[0] : '';
 
       return {
-        session_id: sessionId,
+        storage_session_id: sessionId,
+        /* `/files` fallback returns code-output files belonging to
+         * the user; tag them user-private. */
+        kind: 'user' as const,
         id,
         name: (file.metadata as Record<string, unknown>)[
           'original-filename'
@@ -588,7 +591,7 @@ export function formatCompletedResponse(
     {
       session_id: response.session_id,
       files: response.files,
-    },
+    } satisfies t.ProgrammaticExecutionArtifact,
   ];
 }
 
@@ -629,13 +632,13 @@ export function createProgrammaticToolCallingTool(
       const params = rawParams as { code: string; timeout?: number };
       const { code, timeout = DEFAULT_TIMEOUT } = params;
 
-      // Extra params injected by ToolNode (follows web_search pattern)
-      const { toolMap, toolDefs, session_id, _injected_files } =
-        (config.toolCall ?? {}) as ToolCall &
-          Partial<t.ProgrammaticCache> & {
-            session_id?: string;
-            _injected_files?: t.CodeEnvFile[];
-          };
+      // Extra params injected by ToolNode (follows web_search pattern).
+      const toolCall = (config.toolCall ?? {}) as ToolCall &
+        Partial<t.ProgrammaticCache> & {
+          session_id?: string;
+          _injected_files?: t.CodeEnvFile[];
+        };
+      const { toolMap, toolDefs, session_id, _injected_files } = toolCall;
 
       if (toolMap == null || toolMap.size === 0) {
         throw new Error(
@@ -671,7 +674,8 @@ export function createProgrammaticToolCallingTool(
         /**
          * File injection priority:
          * 1. Use _injected_files from ToolNode (avoids /files endpoint race condition)
-         * 2. Fall back to fetching from /files endpoint if session_id provided but no injected files
+         * 2. Fall back to fetching from /files endpoint if session_id
+         *    provided but no injected files.
          */
         let files: t.CodeEnvFile[] | undefined;
         if (_injected_files && _injected_files.length > 0) {

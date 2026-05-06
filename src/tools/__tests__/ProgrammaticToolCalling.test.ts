@@ -1064,8 +1064,11 @@ for member in team:
   });
 
   describe('bash bridge script does not require python3 (Codex P2 #19)', () => {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { _createBashProgramForTests } = require('../local/LocalProgrammaticToolCalling');
+    /* eslint-disable @typescript-eslint/no-require-imports */
+    const {
+      _createBashProgramForTests,
+    } = require('../local/LocalProgrammaticToolCalling');
+    /* eslint-enable @typescript-eslint/no-require-imports */
 
     it('uses curl as the primary HTTP helper with python3 only as fallback', () => {
       const script: string = _createBashProgramForTests(
@@ -1129,6 +1132,7 @@ for member in team:
       const registry = new HookRegistry();
       registry.register('PreToolUse', {
         hooks: [
+          // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
           async (input) => {
             if (input.toolName === 'write_file') {
               return { decision: 'deny', reason: 'no writes from bridge' };
@@ -1179,6 +1183,7 @@ for member in team:
 
       const registry = new HookRegistry();
       registry.register('PreToolUse', {
+        // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
         hooks: [async () => ({ decision: 'allow' })],
       });
 
@@ -1200,6 +1205,7 @@ for member in team:
       const registry = new HookRegistry();
       registry.register('PreToolUse', {
         hooks: [
+          // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
           async () => ({
             decision: 'allow',
             updatedInput: { file_path: '/tmp/rewritten' },
@@ -1224,6 +1230,7 @@ for member in team:
 
       const registry = new HookRegistry();
       registry.register('PreToolUse', {
+        // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
         hooks: [async () => ({ decision: 'ask' })],
       });
 

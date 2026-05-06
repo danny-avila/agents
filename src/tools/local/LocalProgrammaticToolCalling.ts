@@ -79,7 +79,9 @@ type LocalProgrammaticParams = {
 
 type ToolFilter = (toolDefs: t.LCTool[], code: string) => t.LCTool[];
 
-function resolveRuntime(params: LocalProgrammaticParams): LocalProgrammaticRuntime {
+function resolveRuntime(
+  params: LocalProgrammaticParams
+): LocalProgrammaticRuntime {
   const rawRuntime = params.lang ?? params.runtime ?? params.language ?? 'bash';
   return rawRuntime === 'py' || rawRuntime === 'python' ? 'python' : 'bash';
 }
@@ -494,13 +496,17 @@ async function runLocalProgrammaticTool(args: {
   localConfig: t.LocalExecutionConfig;
   runtime: LocalProgrammaticRuntime;
 }): Promise<[string, t.ProgrammaticExecutionArtifact]> {
-  const { toolMap, toolDefs, hookContext } = getProgrammaticContext(args.config);
+  const { toolMap, toolDefs, hookContext } = getProgrammaticContext(
+    args.config
+  );
 
   if (toolMap == null || toolMap.size === 0) {
     throw new Error('No toolMap provided for local programmatic execution.');
   }
   if (toolDefs == null || toolDefs.length === 0) {
-    throw new Error('No tool definitions provided for local programmatic execution.');
+    throw new Error(
+      'No tool definitions provided for local programmatic execution.'
+    );
   }
 
   const { effectiveTools, effectiveMap } = createEffectiveToolMap(
@@ -512,17 +518,28 @@ async function runLocalProgrammaticTool(args: {
   const bridge = await createToolBridge(effectiveMap, hookContext);
 
   try {
-    const timeoutMs = args.params.timeout ?? args.localConfig.timeoutMs ?? DEFAULT_TIMEOUT;
+    const timeoutMs =
+      args.params.timeout ?? args.localConfig.timeoutMs ?? DEFAULT_TIMEOUT;
     const result =
       args.runtime === 'bash'
         ? await executeLocalBash(
-          createBashProgram(args.params.code, effectiveTools, bridge.url, bridge.token),
+          createBashProgram(
+            args.params.code,
+            effectiveTools,
+            bridge.url,
+            bridge.token
+          ),
           { ...args.localConfig, timeoutMs }
         )
         : await executeLocalCode(
           {
             lang: 'py',
-            code: createPythonProgram(args.params.code, effectiveTools, bridge.url, bridge.token),
+            code: createPythonProgram(
+              args.params.code,
+              effectiveTools,
+              bridge.url,
+              bridge.token
+            ),
           },
           { ...args.localConfig, timeoutMs }
         );

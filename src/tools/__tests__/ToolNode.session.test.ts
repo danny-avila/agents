@@ -51,14 +51,22 @@ function createAIMessageWithCodeCall(callId: string): AIMessage {
 
 describe('ToolNode code execution session management', () => {
   describe('session injection via runTool (direct execution)', () => {
-    it('injects session_id and _injected_files when session has files', async () => {
+    it('injects session ids (both names) and _injected_files when session has files', async () => {
       const capturedConfigs: Record<string, unknown>[] = [];
       const sessions: t.ToolSessionMap = new Map();
       sessions.set(Constants.EXECUTE_CODE, {
         session_id: 'prev-session-abc',
         files: [
-          { id: 'file1', name: 'data.csv', session_id: 'prev-session-abc' },
-          { id: 'file2', name: 'chart.png', session_id: 'prev-session-abc' },
+          {
+            id: 'file1',
+            name: 'data.csv',
+            storage_session_id: 'prev-session-abc',
+          },
+          {
+            id: 'file2',
+            name: 'chart.png',
+            storage_session_id: 'prev-session-abc',
+          },
         ],
         lastUpdated: Date.now(),
       } satisfies t.CodeSessionContext);
@@ -70,14 +78,26 @@ describe('ToolNode code execution session management', () => {
       await toolNode.invoke({ messages: [aiMsg] });
 
       expect(capturedConfigs).toHaveLength(1);
+      /* Both names injected so pre- and post-rename consumers see the
+       * field they expect. */
       expect(capturedConfigs[0].session_id).toBe('prev-session-abc');
       expect(capturedConfigs[0]._injected_files).toEqual([
-        { session_id: 'prev-session-abc', id: 'file1', name: 'data.csv' },
-        { session_id: 'prev-session-abc', id: 'file2', name: 'chart.png' },
+        {
+          id: 'file1',
+          name: 'data.csv',
+          storage_session_id: 'prev-session-abc',
+          kind: 'user',
+        },
+        {
+          id: 'file2',
+          name: 'chart.png',
+          storage_session_id: 'prev-session-abc',
+          kind: 'user',
+        },
       ]);
     });
 
-    it('injects session_id even when session has no tracked files', async () => {
+    it('injects session ids even when session has no tracked files', async () => {
       const capturedConfigs: Record<string, unknown>[] = [];
       const sessions: t.ToolSessionMap = new Map();
       sessions.set(Constants.EXECUTE_CODE, {
@@ -112,14 +132,22 @@ describe('ToolNode code execution session management', () => {
       expect(capturedConfigs[0]._injected_files).toBeUndefined();
     });
 
-    it('preserves per-file session_id for multi-session files', async () => {
+    it('preserves per-file storage_session_id for multi-session files', async () => {
       const capturedConfigs: Record<string, unknown>[] = [];
       const sessions: t.ToolSessionMap = new Map();
       sessions.set(Constants.EXECUTE_CODE, {
         session_id: 'session-B',
         files: [
-          { id: 'f1', name: 'old.csv', session_id: 'session-A' },
-          { id: 'f2', name: 'new.png', session_id: 'session-B' },
+          {
+            id: 'f1',
+            name: 'old.csv',
+            storage_session_id: 'session-A',
+          },
+          {
+            id: 'f2',
+            name: 'new.png',
+            storage_session_id: 'session-B',
+          },
         ],
         lastUpdated: Date.now(),
       } satisfies t.CodeSessionContext);
@@ -131,26 +159,27 @@ describe('ToolNode code execution session management', () => {
       await toolNode.invoke({ messages: [aiMsg] });
 
       const files = capturedConfigs[0]._injected_files as t.CodeEnvFile[];
-      expect(files[0].session_id).toBe('session-A');
-      expect(files[1].session_id).toBe('session-B');
+      expect(files[0].storage_session_id).toBe('session-A');
+      expect(files[1].storage_session_id).toBe('session-B');
     });
 
-    it('forwards per-file entity_id for mixed-entity sessions', async () => {
+    it('forwards per-file kind and version for mixed-kind sessions', async () => {
       const capturedConfigs: Record<string, unknown>[] = [];
       const sessions: t.ToolSessionMap = new Map();
       sessions.set(Constants.EXECUTE_CODE, {
         session_id: 'session-A',
         files: [
           {
-            id: 'skill-file',
+            id: 'skill-123',
             name: 'demo/SKILL.md',
-            session_id: 'session-A',
-            entity_id: 'skill-123',
+            storage_session_id: 'session-A',
+            kind: 'skill',
+            version: 7,
           },
           {
             id: 'user-file',
             name: 'attachment.csv',
-            session_id: 'session-B',
+            storage_session_id: 'session-B',
           },
         ],
         lastUpdated: Date.now(),
@@ -165,15 +194,17 @@ describe('ToolNode code execution session management', () => {
       const files = capturedConfigs[0]._injected_files as t.CodeEnvFile[];
       expect(files).toEqual([
         {
-          session_id: 'session-A',
-          id: 'skill-file',
+          id: 'skill-123',
           name: 'demo/SKILL.md',
-          entity_id: 'skill-123',
+          storage_session_id: 'session-A',
+          kind: 'skill',
+          version: 7,
         },
         {
-          session_id: 'session-B',
           id: 'user-file',
           name: 'attachment.csv',
+          storage_session_id: 'session-B',
+          kind: 'user',
         },
       ]);
     });
@@ -184,7 +215,13 @@ describe('ToolNode code execution session management', () => {
       const sessions: t.ToolSessionMap = new Map();
       sessions.set(Constants.EXECUTE_CODE, {
         session_id: 'evt-session',
-        files: [{ id: 'ef1', name: 'out.parquet', session_id: 'evt-session' }],
+        files: [
+          {
+            id: 'ef1',
+            name: 'out.parquet',
+            storage_session_id: 'evt-session',
+          },
+        ],
         lastUpdated: Date.now(),
       } satisfies t.CodeSessionContext);
 
@@ -201,7 +238,14 @@ describe('ToolNode code execution session management', () => {
 
       expect(context).toEqual({
         session_id: 'evt-session',
-        files: [{ session_id: 'evt-session', id: 'ef1', name: 'out.parquet' }],
+        files: [
+          {
+            id: 'ef1',
+            name: 'out.parquet',
+            storage_session_id: 'evt-session',
+            kind: 'user',
+          },
+        ],
       });
     });
 
@@ -224,7 +268,9 @@ describe('ToolNode code execution session management', () => {
         toolNode as unknown as { getCodeSessionContext: () => unknown }
       ).getCodeSessionContext();
 
-      expect(context).toEqual({ session_id: 'evt-session-empty' });
+      expect(context).toEqual({
+        session_id: 'evt-session-empty',
+      });
     });
 
     it('returns undefined when no session exists', () => {
@@ -244,18 +290,23 @@ describe('ToolNode code execution session management', () => {
       expect(context).toBeUndefined();
     });
 
-    it('forwards per-file entity_id to event-driven request context', () => {
+    it('forwards per-file kind and version to event-driven request context', () => {
       const sessions: t.ToolSessionMap = new Map();
       sessions.set(Constants.EXECUTE_CODE, {
         session_id: 'evt-session',
         files: [
           {
-            id: 'sk1',
+            id: 'skill-abc',
             name: 'demo/SKILL.md',
-            session_id: 'evt-session',
-            entity_id: 'skill-abc',
+            storage_session_id: 'evt-session',
+            kind: 'skill',
+            version: 3,
           },
-          { id: 'usr1', name: 'data.csv', session_id: 'evt-session' },
+          {
+            id: 'usr1',
+            name: 'data.csv',
+            storage_session_id: 'evt-session',
+          },
         ],
         lastUpdated: Date.now(),
       } satisfies t.CodeSessionContext);
@@ -275,12 +326,18 @@ describe('ToolNode code execution session management', () => {
         session_id: 'evt-session',
         files: [
           {
-            session_id: 'evt-session',
-            id: 'sk1',
+            id: 'skill-abc',
             name: 'demo/SKILL.md',
-            entity_id: 'skill-abc',
+            storage_session_id: 'evt-session',
+            kind: 'skill',
+            version: 3,
           },
-          { session_id: 'evt-session', id: 'usr1', name: 'data.csv' },
+          {
+            id: 'usr1',
+            name: 'data.csv',
+            storage_session_id: 'evt-session',
+            kind: 'user',
+          },
         ],
       });
     });
@@ -333,7 +390,7 @@ describe('ToolNode code execution session management', () => {
         expect.objectContaining({
           id: 'f1',
           name: 'result.csv',
-          session_id: 'new-sess',
+          storage_session_id: 'new-sess',
         })
       );
     });
@@ -384,8 +441,8 @@ describe('ToolNode code execution session management', () => {
       sessions.set(Constants.EXECUTE_CODE, {
         session_id: 'old-sess',
         files: [
-          { id: 'f1', name: 'data.csv', session_id: 'old-sess' },
-          { id: 'f2', name: 'chart.png', session_id: 'old-sess' },
+          { id: 'f1', name: 'data.csv', storage_session_id: 'old-sess' },
+          { id: 'f2', name: 'chart.png', storage_session_id: 'old-sess' },
         ],
         lastUpdated: Date.now(),
       } satisfies t.CodeSessionContext);
@@ -430,18 +487,18 @@ describe('ToolNode code execution session management', () => {
       expect(stored.files).toHaveLength(2);
 
       const csvFile = stored.files!.find((f) => f.name === 'data.csv');
-      expect(csvFile!.session_id).toBe('old-sess');
+      expect(csvFile!.storage_session_id).toBe('old-sess');
 
       const chartFile = stored.files!.find((f) => f.name === 'chart.png');
       expect(chartFile!.id).toBe('f3');
-      expect(chartFile!.session_id).toBe('new-sess');
+      expect(chartFile!.storage_session_id).toBe('new-sess');
     });
 
     it('preserves existing files when new execution has no files', () => {
       const sessions: t.ToolSessionMap = new Map();
       sessions.set(Constants.EXECUTE_CODE, {
         session_id: 'old-sess',
-        files: [{ id: 'f1', name: 'data.csv', session_id: 'old-sess' }],
+        files: [{ id: 'f1', name: 'data.csv', storage_session_id: 'old-sess' }],
         lastUpdated: Date.now(),
       } satisfies t.CodeSessionContext);
 
@@ -507,7 +564,7 @@ describe('ToolNode code execution session management', () => {
           {
             toolCallId: 'tc5',
             content: 'search results',
-            artifact: { session_id: 'should-not-store' },
+            artifact: { storage_session_id: 'should-not-store' },
             status: 'success',
           },
         ],
@@ -597,9 +654,13 @@ describe('ToolNode code execution session management', () => {
                 {
                   id: 'f1',
                   name: 'sentinel.txt',
-                  session_id: 'storage-session-A',
+                  storage_session_id: 'storage-session-A',
                 },
-                { id: 'f2', name: 'data.csv', session_id: 'storage-session-B' },
+                {
+                  id: 'f2',
+                  name: 'data.csv',
+                  storage_session_id: 'storage-session-B',
+                },
               ],
             },
             status: 'success',
@@ -617,18 +678,20 @@ describe('ToolNode code execution session management', () => {
         Constants.EXECUTE_CODE
       ) as t.CodeSessionContext;
       /* The session-level id is the (latest) exec id — fine for tracking
-         "what session ran last" — but per-file storage ids must survive. */
+         "what session ran last" — but per-file storage ids must survive.
+         After the rename, both names appear at the top level (exec) and
+         on each file (storage). */
       expect(stored.session_id).toBe('exec-session-123');
       expect(stored.files).toHaveLength(2);
       expect(stored.files![0]).toEqual({
         id: 'f1',
         name: 'sentinel.txt',
-        session_id: 'storage-session-A',
+        storage_session_id: 'storage-session-A',
       });
       expect(stored.files![1]).toEqual({
         id: 'f2',
         name: 'data.csv',
-        session_id: 'storage-session-B',
+        storage_session_id: 'storage-session-B',
       });
     });
 
@@ -658,7 +721,11 @@ describe('ToolNode code execution session management', () => {
               session_id: 'exec-mixed',
               files: [
                 /* Mix: one file with storage id, one without (older payload). */
-                { id: 'f1', name: 'fresh.csv', session_id: 'storage-fresh' },
+                {
+                  id: 'f1',
+                  name: 'fresh.csv',
+                  storage_session_id: 'storage-fresh',
+                },
                 { id: 'f2', name: 'legacy.csv' },
               ],
             },
@@ -676,9 +743,10 @@ describe('ToolNode code execution session management', () => {
       const stored = sessions.get(
         Constants.EXECUTE_CODE
       ) as t.CodeSessionContext;
-      expect(stored.files![0].session_id).toBe('storage-fresh');
-      /* Fallback only when the per-file id is missing. */
-      expect(stored.files![1].session_id).toBe('exec-mixed');
+      expect(stored.files![0].storage_session_id).toBe('storage-fresh');
+      /* Fallback only when the per-file id is missing — the fallback
+       * value is the exec session id. */
+      expect(stored.files![1].storage_session_id).toBe('exec-mixed');
     });
   });
 
@@ -728,7 +796,13 @@ describe('ToolNode code execution session management', () => {
       const sessions: t.ToolSessionMap = new Map();
       sessions.set(Constants.EXECUTE_CODE, {
         session_id: 'rf-session',
-        files: [{ id: 'rf1', name: 'data.csv', session_id: 'rf-session' }],
+        files: [
+          {
+            id: 'rf1',
+            name: 'data.csv',
+            storage_session_id: 'rf-session',
+          },
+        ],
         lastUpdated: Date.now(),
       } satisfies t.CodeSessionContext);
 
@@ -758,7 +832,14 @@ describe('ToolNode code execution session management', () => {
       expect(capturedRequests[0].name).toBe(Constants.READ_FILE);
       expect(capturedRequests[0].codeSessionContext).toEqual({
         session_id: 'rf-session',
-        files: [{ session_id: 'rf-session', id: 'rf1', name: 'data.csv' }],
+        files: [
+          {
+            id: 'rf1',
+            name: 'data.csv',
+            storage_session_id: 'rf-session',
+            kind: 'user',
+          },
+        ],
       });
     });
 
