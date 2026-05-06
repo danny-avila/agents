@@ -219,6 +219,7 @@ export interface SearchToolConfig
   jinaApiKey?: string;
   jinaApiUrl?: string;
   cohereApiKey?: string;
+  cohereApiUrl?: string;
   rerankerType?: RerankerType;
   scraperProvider?: ScraperProvider;
   scraperTimeout?: number;
