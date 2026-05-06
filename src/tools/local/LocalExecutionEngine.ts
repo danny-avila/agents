@@ -284,14 +284,14 @@ export function getWorkspaceFS(config?: t.LocalExecutionConfig): WorkspaceFS {
  * helpers interpret as "skip the write clamp".
  */
 export function getWriteRoots(
-  config?: t.LocalExecutionConfig
+  config: t.LocalExecutionConfig = {}
 ): string[] | null {
   // Granular flag wins over the legacy one when explicitly set
   // (true OR false) — otherwise a host tightening access during
   // migration (`allowOutsideWorkspace: true, workspace.
   // allowWriteOutside: false`) would still get the loose behavior
   // because the legacy flag short-circuited the OR. Codex P1 #36.
-  const granular = config?.workspace?.allowWriteOutside;
+  const granular = config.workspace?.allowWriteOutside;
   if (granular === true) return null;
   if (granular === false) return getWorkspaceRoots(config);
   if (config.allowOutsideWorkspace === true) return null;
@@ -303,10 +303,12 @@ export function getWriteRoots(
  * `workspace.allowReadOutside` (and the deprecated
  * `allowOutsideWorkspace`) by returning `null`.
  */
-export function getReadRoots(config?: t.LocalExecutionConfig): string[] | null {
+export function getReadRoots(
+  config: t.LocalExecutionConfig = {}
+): string[] | null {
   // Same precedence as getWriteRoots: granular flag is authoritative
   // when set, legacy flag is the fallback. Codex P1 #36.
-  const granular = config?.workspace?.allowReadOutside;
+  const granular = config.workspace?.allowReadOutside;
   if (granular === true) return null;
   if (granular === false) return getWorkspaceRoots(config);
   if (config.allowOutsideWorkspace === true) return null;
