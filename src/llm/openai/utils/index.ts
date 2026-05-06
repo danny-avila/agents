@@ -287,8 +287,133 @@ const completionsApiContentBlockConverter: StandardContentBlockConverter<{
   },
 };
 
+/**
+ * Heuristic for detecting Claude served via an OpenAI-shaped surface (e.g.
+ * OpenRouter's `anthropic/claude-*` models). Used to decide whether thinking
+ * blocks pass through verbatim or get flattened to text for the request body.
+ *
+ * The match is case-insensitive — provider configs in the wild ship IDs like
+ * `Anthropic/Claude-Sonnet-4.5` and `CLAUDE-3-5-SONNET`, and misclassifying
+ * any of them as non-Claude would silently drop signed thinking blocks that
+ * Claude needs replayed unchanged for tool-call continuation.
+ */
+export function isClaudeModel(model?: string): boolean {
+  if (model == null) {
+    return false;
+  }
+  const normalized = model.toLowerCase();
+  return normalized.includes('claude') || normalized.includes('anthropic');
+}
+
+/**
+ * Options for `flattenAnthropicThinkingForOpenAI` and the OpenAI converters.
+ *
+ * `claudeBackend` is an explicit override for the model-name heuristic in
+ * `isClaudeModel`: corporate gateways and self-hosted Claude deployments
+ * sometimes alias Claude under names without `claude`/`anthropic` substrings,
+ * which would otherwise be misclassified as non-Claude and have their
+ * `thinking` / `redacted_thinking` blocks rewritten or dropped — exactly the
+ * blocks Claude needs replayed unchanged for tool-call continuation. When
+ * provided, this flag wins over the heuristic in both directions.
+ */
+export interface ClaudeBackendOptions {
+  claudeBackend?: boolean;
+}
+
+function resolveClaudeTarget(
+  model: string | undefined,
+  options?: ClaudeBackendOptions
+): boolean {
+  return options?.claudeBackend ?? isClaudeModel(model);
+}
+
+/**
+ * Pre-process LangChain messages before they reach an OpenAI-bound request.
+ * Flattens Anthropic-style `thinking` content blocks into
+ * `<thinking>...</thinking>` text, drops empty thinking blocks, and drops
+ * `redacted_thinking` blocks entirely — preserving the reasoning narrative
+ * as in-band context for non-Claude OpenAI targets while satisfying OpenAI's
+ * content schema. Returns the same array reference unchanged when no
+ * rewriting was needed (Claude target, no thinking blocks present, or
+ * non-array content throughout).
+ */
+export function flattenAnthropicThinkingForOpenAI(
+  messages: BaseMessage[],
+  model?: string,
+  options?: ClaudeBackendOptions
+): BaseMessage[] {
+  if (resolveClaudeTarget(model, options)) {
+    return messages;
+  }
+  let mutated = false;
+  const out = messages.map((msg) => {
+    /**
+     * Thinking blocks only originate from AI messages. Skip non-AI types and
+     * messages with non-array content entirely so the rewrite work isn't
+     * spent producing values we'd then discard.
+     */
+    if (!isAIMessage(msg) || !Array.isArray(msg.content)) {
+      return msg;
+    }
+    let blockChanged = false;
+    const rewritten = msg.content.flatMap((block) => {
+      if (
+        block != null &&
+        typeof block === 'object' &&
+        'type' in block &&
+        (block as { type?: string }).type === 'thinking'
+      ) {
+        blockChanged = true;
+        const thinking = (block as { thinking?: string }).thinking ?? '';
+        if (!thinking) {
+          return [];
+        }
+        return [
+          {
+            type: 'text' as const,
+            text: `<thinking>${thinking}</thinking>`,
+          },
+        ];
+      }
+      if (
+        block != null &&
+        typeof block === 'object' &&
+        'type' in block &&
+        (block as { type?: string }).type === 'redacted_thinking'
+      ) {
+        blockChanged = true;
+        return [];
+      }
+      return [block];
+    });
+    if (!blockChanged) {
+      return msg;
+    }
+    mutated = true;
+    const newContent: BaseMessage['content'] =
+      rewritten.length === 0 ? '' : rewritten;
+    return new AIMessage({
+      content: newContent,
+      additional_kwargs: msg.additional_kwargs,
+      response_metadata: msg.response_metadata,
+      ...(msg.name != null ? { name: msg.name } : {}),
+      ...(msg.id != null ? { id: msg.id } : {}),
+      ...(msg.tool_calls != null && msg.tool_calls.length > 0
+        ? { tool_calls: msg.tool_calls }
+        : {}),
+      ...(msg.invalid_tool_calls != null && msg.invalid_tool_calls.length > 0
+        ? { invalid_tool_calls: msg.invalid_tool_calls }
+        : {}),
+      ...(msg.usage_metadata != null
+        ? { usage_metadata: msg.usage_metadata }
+        : {}),
+    });
+  });
+  return mutated ? out : messages;
+}
+
 /** Options for converting messages to OpenAI params */
-export interface ConvertMessagesOptions {
+export interface ConvertMessagesOptions extends ClaudeBackendOptions {
   /** Include reasoning_content field for DeepSeek thinking mode with tool calls */
   includeReasoningContent?: boolean;
   /** Include reasoning_details field for OpenRouter/Gemini thinking mode with tool calls */
@@ -304,6 +429,17 @@ export function _convertMessagesToOpenAIParams(
   options?: ConvertMessagesOptions
 ): OpenAICompletionParam[] {
   let hasReasoningToolCallContext = false;
+  /**
+   * When the target is Claude served via an OpenAI-shaped surface (e.g.
+   * OpenRouter), thinking and redacted_thinking blocks are valid input and
+   * must pass through verbatim. For native OpenAI, those block types are
+   * rejected with a 400 — flatten thinking to a `<thinking>...</thinking>`
+   * text block so the reasoning narrative remains in-band, drop empty
+   * thinking blocks (some providers reject empty content), and drop
+   * redacted_thinking entirely (its payload is encrypted and useless to
+   * a non-Anthropic model).
+   */
+  const isClaudeTarget = resolveClaudeTarget(model, options);
   // TODO: Function messages do not support array content, fix cast
   return messages.flatMap((message) => {
     let role = messageToOpenAIRole(message);
@@ -311,24 +447,47 @@ export function _convertMessagesToOpenAIParams(
       role = 'developer';
     }
 
-    let hasAnthropicThinkingBlock: boolean = false;
-
-    const content =
+    const filteredContent =
       typeof message.content === 'string'
         ? message.content
-        : message.content.map((m) => {
-          if ('type' in m && m.type === 'thinking') {
-            hasAnthropicThinkingBlock = true;
+        : message.content
+          .map((m) => {
+            if ('type' in m && m.type === 'thinking') {
+              if (isClaudeTarget) {
+                return m;
+              }
+              const thinking = (m as { thinking?: string }).thinking ?? '';
+              if (!thinking) {
+                return null;
+              }
+              return {
+                type: 'text' as const,
+                text: `<thinking>${thinking}</thinking>`,
+              };
+            }
+            if ('type' in m && m.type === 'redacted_thinking') {
+              return isClaudeTarget ? m : null;
+            }
+            if (isDataContentBlock(m)) {
+              return convertToProviderContentBlock(
+                m,
+                completionsApiContentBlockConverter
+              );
+            }
             return m;
-          }
-          if (isDataContentBlock(m)) {
-            return convertToProviderContentBlock(
-              m,
-              completionsApiContentBlockConverter
-            );
-          }
-          return m;
-        });
+          })
+          .filter(<T>(m: T | null): m is T => m !== null);
+
+    /**
+     * Chat Completions requires assistant content arrays to contain at least
+     * one part — an empty array (which can result from filtering out
+     * thinking/redacted_thinking blocks) triggers a 400. Fall back to '' so
+     * the request still validates.
+     */
+    const content =
+      Array.isArray(filteredContent) && filteredContent.length === 0
+        ? ''
+        : filteredContent;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const completionParam: Record<string, any> = {
       role,
@@ -348,18 +507,23 @@ export function _convertMessagesToOpenAIParams(
       completionParam.tool_calls = message.tool_calls.map(
         convertLangChainToolCallToOpenAI
       );
-      completionParam.content = hasAnthropicThinkingBlock ? content : '';
+      /**
+       * OpenAI's convention is for tool-call assistant messages to have empty
+       * content. Preserve the content array when non-empty — that covers
+       * pass-through thinking blocks for Claude targets AND
+       * `<thinking>...</thinking>` text blocks pre-flattened by the outer
+       * wrapper, which would otherwise be silently dropped on this turn.
+       */
+      completionParam.content =
+        Array.isArray(content) && content.length > 0 ? content : '';
       if (
         options?.includeReasoningDetails === true &&
         message.additional_kwargs.reasoning_details != null
       ) {
         // For Claude via OpenRouter, convert reasoning_details to content blocks
-        const isClaudeModel =
-          model?.includes('claude') === true ||
-          model?.includes('anthropic') === true;
         if (
           options.convertReasoningDetailsToContent === true &&
-          isClaudeModel
+          isClaudeTarget
         ) {
           const reasoningDetails = message.additional_kwargs
             .reasoning_details as Record<string, unknown>[];
@@ -405,12 +569,9 @@ export function _convertMessagesToOpenAIParams(
           message.additional_kwargs.reasoning_details != null
         ) {
           // For Claude via OpenRouter, convert reasoning_details to content blocks
-          const isClaudeModel =
-            model?.includes('claude') === true ||
-            model?.includes('anthropic') === true;
           if (
             options.convertReasoningDetailsToContent === true &&
-            isClaudeModel
+            isClaudeTarget
           ) {
             const reasoningDetails = message.additional_kwargs
               .reasoning_details as Record<string, unknown>[];
@@ -520,8 +681,16 @@ function _convertReasoningSummaryToOpenAIResponsesParams(
 export function _convertMessagesToOpenAIResponsesParams(
   messages: BaseMessage[],
   model?: string,
-  zdrEnabled?: boolean
+  zdrEnabled?: boolean,
+  options?: ClaudeBackendOptions
 ): ResponsesInputItem[] {
+  /**
+   * Same cross-provider rationale as `_convertMessagesToOpenAIParams`: flatten
+   * thinking blocks to text for non-Claude targets so the reasoning narrative
+   * survives a handoff into the Responses API instead of being silently
+   * dropped by the content `flatMap` below.
+   */
+  const isClaudeTarget = resolveClaudeTarget(model, options);
   return messages.flatMap(
     (lcMsg): ResponsesInputItem | ResponsesInputItem[] => {
       const additional_kwargs =
@@ -640,33 +809,65 @@ export function _convertMessagesToOpenAIResponsesParams(
           ];
         }
 
+        const flattenedContent =
+          typeof content === 'string'
+            ? content
+            : content.flatMap((item) => {
+              if (item.type === 'text') {
+                const textItem = item as MessageContentComplex & {
+                    annotations?: unknown[];
+                  };
+                return {
+                  type: 'output_text',
+                  text: item.text,
+                  annotations: textItem.annotations ?? [],
+                };
+              }
+
+              if (item.type === 'output_text' || item.type === 'refusal') {
+                return item;
+              }
+
+              if (item.type === 'thinking') {
+                if (isClaudeTarget) {
+                  return item as ResponsesInputItem;
+                }
+                const thinkingText =
+                    (item as { thinking?: string }).thinking ?? '';
+                if (!thinkingText) {
+                  return [];
+                }
+                return {
+                  type: 'output_text',
+                  text: `<thinking>${thinkingText}</thinking>`,
+                  annotations: [],
+                };
+              }
+
+              if (item.type === 'redacted_thinking') {
+                return isClaudeTarget ? (item as ResponsesInputItem) : [];
+              }
+
+              return [];
+            });
+
+        /**
+         * Mirror the Chat Completions guard: if filtering reduced the assistant
+         * content to an empty array, fall back to '' so the request still
+         * validates against OpenAI's "at least one content part" requirement.
+         */
+        const assistantContent =
+          Array.isArray(flattenedContent) && flattenedContent.length === 0
+            ? ''
+            : flattenedContent;
+
         input.push({
           type: 'message',
           role: 'assistant',
           ...(lcMsg.id && !zdrEnabled && lcMsg.id.startsWith('msg_')
             ? { id: lcMsg.id }
             : {}),
-          content:
-            typeof content === 'string'
-              ? content
-              : content.flatMap((item) => {
-                if (item.type === 'text') {
-                  const textItem = item as MessageContentComplex & {
-                      annotations?: unknown[];
-                    };
-                  return {
-                    type: 'output_text',
-                    text: item.text,
-                    annotations: textItem.annotations ?? [],
-                  };
-                }
-
-                if (item.type === 'output_text' || item.type === 'refusal') {
-                  return item;
-                }
-
-                return [];
-              }),
+          content: assistantContent,
         } as ResponsesInputItem);
 
         const functionCallIds = additional_kwargs[_FUNCTION_CALL_IDS_MAP_KEY];
