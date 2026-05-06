@@ -691,6 +691,134 @@ test('Anthropic usage metadata includes cache input token buckets', () => {
   });
 });
 
+type AnthropicStreamEvent = Anthropic.Beta.Messages.BetaRawMessageStreamEvent;
+
+function createMockAnthropicStream(events: AnthropicStreamEvent[]) {
+  return {
+    controller: { abort: jest.fn() },
+    async *[Symbol.asyncIterator]() {
+      for (const event of events) {
+        yield event;
+      }
+    },
+  };
+}
+
+class MockStreamingAnthropic extends ChatAnthropic {
+  constructor(private readonly mockEvents: AnthropicStreamEvent[]) {
+    super({
+      modelName,
+      apiKey: 'test-key',
+      maxTokens: 10,
+      streamUsage: true,
+    });
+  }
+
+  protected override async createStreamWithRetry() {
+    return createMockAnthropicStream(this.mockEvents) as never;
+  }
+}
+
+test('Anthropic message_delta usage emits only output token totals', () => {
+  const event: AnthropicStreamEvent = {
+    type: 'message_delta',
+    context_management: null,
+    delta: {
+      container: null,
+      stop_details: null,
+      stop_reason: 'end_turn',
+      stop_sequence: null,
+    },
+    usage: {
+      input_tokens: 243,
+      output_tokens: 375,
+      cache_creation_input_tokens: 11,
+      cache_read_input_tokens: 13,
+      server_tool_use: null,
+      iterations: null,
+    },
+  };
+
+  const result = _makeMessageChunkFromAnthropicEvent(event, {
+    streamUsage: true,
+    coerceContentToString: true,
+  });
+
+  expect(result?.chunk.usage_metadata).toEqual({
+    input_tokens: 0,
+    output_tokens: 375,
+    total_tokens: 375,
+  });
+});
+
+test('Anthropic stream usage does not double-count cumulative input tokens', async () => {
+  const events: AnthropicStreamEvent[] = [
+    {
+      type: 'message_start',
+      message: {
+        id: 'msg_token_accounting',
+        container: null,
+        context_management: null,
+        content: [],
+        model: modelName,
+        role: 'assistant',
+        stop_details: null,
+        stop_reason: null,
+        stop_sequence: null,
+        type: 'message',
+        usage: {
+          cache_creation: null,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 0,
+          inference_geo: null,
+          input_tokens: 243,
+          iterations: null,
+          output_tokens: 0,
+          server_tool_use: null,
+          service_tier: null,
+          speed: null,
+        },
+      },
+    },
+    {
+      type: 'message_delta',
+      context_management: null,
+      delta: {
+        container: null,
+        stop_details: null,
+        stop_reason: 'end_turn',
+        stop_sequence: null,
+      },
+      usage: {
+        input_tokens: 243,
+        output_tokens: 375,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        server_tool_use: null,
+        iterations: null,
+      },
+    },
+    { type: 'message_stop' },
+  ];
+  const model = new MockStreamingAnthropic(events);
+
+  let full: AIMessageChunk | undefined;
+  for await (const chunk of await model.stream('hello')) {
+    full = !full ? chunk : concat(full, chunk);
+  }
+
+  expect(full?.usage_metadata).toEqual({
+    input_tokens: 243,
+    output_tokens: 375,
+    total_tokens: 618,
+    input_token_details: {
+      cache_creation: 0,
+      cache_read: 0,
+    },
+    output_token_details: {},
+  });
+});
+
 test('document detection ignores null content placeholders', () => {
   const params: AnthropicMessageCreateParams = {
     model: modelName,
