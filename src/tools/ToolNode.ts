@@ -249,22 +249,23 @@ function normalizeApprovalDecisions(
  *  - `artifact.session_id` (the `sessionId` arg here) is the EXEC session
  *    — the sandbox VM that ran the code. It's transient and torn down
  *    post-execution; subsequent calls cannot reuse it as a sandbox.
- *  - `file.session_id` on each `artifact.files[i]` is the STORAGE
+ *  - `file.storage_session_id` on each `artifact.files[i]` is the STORAGE
  *    session — the file-server bucket prefix where the artifact actually
  *    lives and is served from.
  *
- * Per-file `session_id` is preserved (not overwritten with the exec id)
- * because `_injected_files` are looked up against the file-server's
- * storage path on subsequent tool calls. Stomping the storage id with
- * the exec id silently 404s every follow-up tool call within the same
- * run — `cat /mnt/data/foo.txt` reports "No such file or directory"
- * because the worker can't mount a file at a path the storage doesn't
- * know about. Fall back to `sessionId` only when the per-file id is
- * absent (older worker payloads).
+ * Per-file `storage_session_id` is preserved (not overwritten with the
+ * exec id) because `_injected_files` are looked up against the
+ * file-server's storage path on subsequent tool calls. Stomping the
+ * storage id with the exec id silently 404s every follow-up tool call
+ * within the same run — `cat /mnt/data/foo.txt` reports "No such file
+ * or directory" because the worker can't mount a file at a path the
+ * storage doesn't know about. Fall back to the exec id only when the
+ * per-file id is absent (e.g. inline `content` files have no persistent
+ * storage location).
  */
 function updateCodeSession(
   sessions: t.ToolSessionMap,
-  sessionId: string,
+  execSessionId: string,
   files: t.FileRefs | undefined
 ): void {
   const newFiles = files ?? [];
@@ -276,20 +277,20 @@ function updateCodeSession(
   if (newFiles.length > 0) {
     const filesWithSession: t.FileRefs = newFiles.map((file) => ({
       ...file,
-      session_id: file.session_id ?? sessionId,
+      storage_session_id: file.storage_session_id ?? execSessionId,
     }));
     const newFileNames = new Set(filesWithSession.map((f) => f.name));
     const filteredExisting = existingFiles.filter(
       (f) => !newFileNames.has(f.name)
     );
     sessions.set(Constants.EXECUTE_CODE, {
-      session_id: sessionId,
+      session_id: execSessionId,
       files: [...filteredExisting, ...filesWithSession],
       lastUpdated: Date.now(),
     });
   } else {
     sessions.set(Constants.EXECUTE_CODE, {
-      session_id: sessionId,
+      session_id: execSessionId,
       files: existingFiles,
       lastUpdated: Date.now(),
     });
@@ -400,7 +401,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     this.loadRuntimeTools = loadRuntimeTools;
     this.errorHandler = errorHandler;
     this.toolUsageCount = new Map<string, number>();
-    this.toolRegistry = resolveLocalToolRegistry({ toolRegistry, toolExecution });
+    this.toolRegistry = resolveLocalToolRegistry({
+      toolRegistry,
+      toolExecution,
+    });
     this.sessions = sessions;
     this.eventDrivenMode = eventDrivenMode ?? false;
     this.agentId = agentId;
@@ -581,8 +585,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       resolveFn = <T>(_runId: string | undefined, args: T): ResolveResult<T> =>
         preBatchSnapshot.resolve(args);
     } else if (registry != null) {
-      resolveFn = <T>(runIdArg: string | undefined, args: T): ResolveResult<T> =>
-        registry.resolve(runIdArg, args);
+      resolveFn = <T>(
+        runIdArg: string | undefined,
+        args: T
+      ): ResolveResult<T> => registry.resolve(runIdArg, args);
     }
     /**
      * Precompute the reference key once per call — captured locally
@@ -717,19 +723,34 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         const codeSession = this.sessions?.get(Constants.EXECUTE_CODE) as
           | t.CodeSessionContext
           | undefined;
-        if (codeSession?.session_id != null && codeSession.session_id !== '') {
+        const execSessionId = codeSession?.session_id;
+        if (execSessionId != null && execSessionId !== '') {
           invokeParams = {
             ...invokeParams,
-            session_id: codeSession.session_id,
+            session_id: execSessionId,
           };
 
-          if (codeSession.files != null && codeSession.files.length > 0) {
-            const fileRefs: t.CodeEnvFile[] = codeSession.files.map((file) => ({
-              session_id: file.session_id ?? codeSession.session_id,
-              id: file.id,
-              name: file.name,
-              ...(file.entity_id != null ? { entity_id: file.entity_id } : {}),
-            }));
+          if (codeSession?.files != null && codeSession.files.length > 0) {
+            const fileRefs: t.CodeEnvFile[] = codeSession.files.map((file) => {
+              const ref: t.CodeEnvFile = {
+                id: file.id,
+                name: file.name,
+                /* Inline `content` files have no persistent storage
+                 * location; fall back to the execution session id for
+                 * those entries. */
+                storage_session_id: file.storage_session_id ?? execSessionId,
+                /* `kind` drives codeapi's sessionKey shape (per-skill
+                 * vs per-user vs per-agent). Default to 'user' when
+                 * not explicitly set — most ad-hoc files are user-
+                 * private; shared resources (skills/agents) populate
+                 * their kind upstream. */
+                kind: file.kind ?? 'user',
+              };
+              if (file.version != null) {
+                ref.version = file.version;
+              }
+              return ref;
+            });
             invokeParams._injected_files = fileRefs;
           }
         }
@@ -950,10 +971,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   ): Promise<BaseMessage | Command> {
     const runId = (config.configurable?.run_id as string | undefined) ?? '';
     const hookRegistry = this.hookRegistry;
-    const hasPreHook =
-      hookRegistry?.hasHookFor('PreToolUse', runId) === true;
-    const hasPostHook =
-      hookRegistry?.hasHookFor('PostToolUse', runId) === true;
+    const hasPreHook = hookRegistry?.hasHookFor('PreToolUse', runId) === true;
+    const hasPostHook = hookRegistry?.hasHookFor('PostToolUse', runId) === true;
     const hasFailureHook =
       hookRegistry?.hasHookFor('PostToolUseFailure', runId) === true;
 
@@ -989,8 +1008,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     // assignment.)
     const cachedTurn =
       call.id != null && call.id !== ''
-        ? this.directPathTurns.get(call.id) ??
-          this.toolCallTurns.get(call.id)
+        ? (this.directPathTurns.get(call.id) ?? this.toolCallTurns.get(call.id))
         : undefined;
     if (cachedTurn != null) {
       usageCount = cachedTurn;
@@ -1156,10 +1174,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             return this.blockDirectCall({
               call,
               resolvedArgs,
-              reason:
-                decision.reason ??
-                preResult.reason ??
-                'Rejected by user',
+              reason: decision.reason ?? preResult.reason ?? 'Rejected by user',
               hookRegistry,
               runId,
               threadId,
@@ -1173,7 +1188,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               return this.blockDirectCall({
                 call,
                 resolvedArgs,
-                reason: 'Approval payload `respond` was missing a string `responseText`',
+                reason:
+                  'Approval payload `respond` was missing a string `responseText`',
                 hookRegistry,
                 runId,
                 threadId,
@@ -1464,17 +1480,24 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       return undefined;
     }
 
+    const execSessionId = codeSession.session_id;
     const context: NonNullable<t.ToolCallRequest['codeSessionContext']> = {
-      session_id: codeSession.session_id,
+      session_id: execSessionId,
     };
 
     if (codeSession.files && codeSession.files.length > 0) {
-      context.files = codeSession.files.map((file) => ({
-        session_id: file.session_id ?? codeSession.session_id,
-        id: file.id,
-        name: file.name,
-        ...(file.entity_id != null ? { entity_id: file.entity_id } : {}),
-      }));
+      context.files = codeSession.files.map((file) => {
+        const ref: t.CodeEnvFile = {
+          id: file.id,
+          name: file.name,
+          storage_session_id: file.storage_session_id ?? execSessionId,
+          kind: file.kind ?? 'user',
+        };
+        if (file.version != null) {
+          ref.version = file.version;
+        }
+        return ref;
+      });
     }
 
     return context;
@@ -1509,11 +1532,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       }
 
       const artifact = result.artifact as t.CodeExecutionArtifact | undefined;
-      if (artifact?.session_id == null || artifact.session_id === '') {
+      const execSessionId = artifact?.session_id;
+      if (execSessionId == null || execSessionId === '') {
         continue;
       }
 
-      updateCodeSession(this.sessions, artifact.session_id!, artifact.files);
+      updateCodeSession(this.sessions, execSessionId, artifact?.files);
     }
   }
 
@@ -1558,8 +1582,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         const artifact = toolMessage.artifact as
           | t.CodeExecutionArtifact
           | undefined;
-        if (artifact?.session_id != null && artifact.session_id !== '') {
-          updateCodeSession(this.sessions, artifact.session_id, artifact.files);
+        const execSessionId = artifact?.session_id;
+        if (execSessionId != null && execSessionId !== '') {
+          updateCodeSession(this.sessions, execSessionId, artifact?.files);
         }
       }
 
