@@ -47,13 +47,17 @@ export function _documentsInParams(
       continue;
     }
     for (const block of message.content) {
+      const maybeBlock: unknown = block;
       if (
-        typeof block === 'object' &&
-        block !== null &&
-        block.type === 'document' &&
-        block.citations != null &&
-        typeof block.citations === 'object' &&
-        block.citations.enabled === true
+        typeof maybeBlock === 'object' &&
+        maybeBlock !== null &&
+        'type' in maybeBlock &&
+        maybeBlock.type === 'document' &&
+        'citations' in maybeBlock &&
+        maybeBlock.citations != null &&
+        typeof maybeBlock.citations === 'object' &&
+        'enabled' in maybeBlock.citations &&
+        maybeBlock.citations.enabled === true
       ) {
         return true;
       }
@@ -301,6 +305,30 @@ function cloneChunk(
   return chunk;
 }
 
+function withIncrementalMessageDeltaUsage(
+  chunk: AIMessageChunk,
+  previousOutputTokens: number
+): { chunk: AIMessageChunk; outputTokens: number } {
+  const usage = chunk.usage_metadata;
+  if (usage == null) {
+    return { chunk, outputTokens: previousOutputTokens };
+  }
+
+  const outputTokens = Math.max(0, usage.output_tokens - previousOutputTokens);
+  return {
+    chunk: new AIMessageChunk(
+      Object.assign({}, chunk, {
+        usage_metadata: {
+          ...usage,
+          output_tokens: outputTokens,
+          total_tokens: usage.input_tokens + outputTokens,
+        },
+      })
+    ),
+    outputTokens: usage.output_tokens,
+  };
+}
+
 export type CustomAnthropicInput = AnthropicInput & {
   _lc_stream_delay?: number;
   outputConfig?: AnthropicOutputConfig;
@@ -495,6 +523,7 @@ export class CustomAnthropic extends ChatAnthropicMessages {
     });
 
     const shouldStreamUsage = options.streamUsage ?? this.streamUsage;
+    let messageDeltaOutputTokens = 0;
 
     for await (const data of stream) {
       if (options.signal?.aborted === true) {
@@ -511,7 +540,15 @@ export class CustomAnthropic extends ChatAnthropicMessages {
       );
       if (!result) continue;
 
-      const { chunk } = result;
+      let { chunk } = result;
+      if (data.type === 'message_delta') {
+        const incremental = withIncrementalMessageDeltaUsage(
+          chunk,
+          messageDeltaOutputTokens
+        );
+        chunk = incremental.chunk;
+        messageDeltaOutputTokens = incremental.outputTokens;
+      }
       const [token = '', tokenType] = extractToken(chunk);
 
       if (
