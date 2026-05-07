@@ -163,7 +163,10 @@ function createBashExecutionTool(
               const id = nameParts.length > 1 ? nameParts[1].split('.')[0] : '';
 
               return {
-                session_id,
+                storage_session_id: session_id,
+                /* `/files` fallback returns code-output files belonging
+                 * to the user; tag them user-private. */
+                kind: 'user' as const,
                 id,
                 name: file.metadata['original-filename'],
               };
@@ -241,11 +244,16 @@ function createBashExecutionTool(
             {
               session_id: result.session_id,
               files: result.files,
-            },
+            } satisfies t.CodeExecutionArtifact,
           ];
         }
 
-        return [formattedOutput.trim(), { session_id: result.session_id }];
+        return [
+          formattedOutput.trim(),
+          {
+            session_id: result.session_id,
+          } satisfies t.CodeExecutionArtifact,
+        ];
       } catch (error) {
         throw new Error(
           `Execution error:\n\n${(error as Error | undefined)?.message}`

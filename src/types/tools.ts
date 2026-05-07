@@ -138,42 +138,90 @@ export type ToolEndEvent = {
   type?: 'tool_call';
 };
 
-export type CodeEnvFile = {
+/**
+ * Closed set of resource kinds for sandbox file caching. Defined as a
+ * `as const` tuple so the runtime list and the TypeScript union can't
+ * drift on future additions — adding a new kind to the tuple updates
+ * both at once.
+ *
+ * - `skill`: shared per skill identity. Cross-user-within-tenant
+ *   sharing. Codeapi sessionKey omits the user dimension. `version`
+ *   is required (skill's monotonic counter scopes cache per revision).
+ * - `agent`: shared per agent identity. Same sharing semantic as
+ *   skills.
+ * - `user`: user-private. Codeapi sessionKey is keyed by the
+ *   requesting user from auth context. Used for chat attachments
+ *   and code-output files.
+ */
+export const CODE_ENV_KINDS = ['skill', 'agent', 'user'] as const;
+export type CodeEnvKind = (typeof CODE_ENV_KINDS)[number];
+
+type CodeEnvFileBase = {
+  /**
+   * Resource identity. Semantics depend on `kind`:
+   *  - `skill`: skill `_id` (sessionKey-meaningful, cross-user shared).
+   *  - `agent`: agent id (sessionKey-meaningful, cross-user shared).
+   *  - `user`: informational only — codeapi derives sessionKey from
+   *    the auth-context user. Kept on the type for shape uniformity;
+   *    do not rely on it for routing.
+   */
   id: string;
   name: string;
-  session_id: string;
   /**
-   * Identifier of the entity that owns this file's session (skill id,
-   * agent id, etc). Forwarded to codeapi so it can resolve the
-   * per-file sessionKey instead of falling back to a single
-   * request-level entity. Required when a single execute request
-   * references files uploaded under different entities (e.g. a skill
-   * file plus a user attachment in the same call).
+   * Storage session — the long-lived bucket where this file's bytes
+   * live in object storage. Distinct from the (transient) execution
+   * session id that appears at the top level of an execute response;
+   * the two used to share the field name `session_id` and the
+   * conflation caused real bugs. See codeapi #1455 / agents #148.
    */
-  entity_id?: string;
+  storage_session_id: string;
 };
+
+/**
+ * `CodeEnvFile` is a discriminated union on `kind`. `version` is
+ * statically required for `kind: 'skill'` and statically forbidden
+ * for `agent` / `user` — the constraint holds at compile time on
+ * every consumer, not just on codeapi's runtime validator.
+ *
+ * Codeapi switches on `kind` to derive the sessionKey for cache
+ * scoping (`<tenant>:<kind>:<id>[:v:<version>]`). Cross-user sharing
+ * for `kind: 'skill'` / `'agent'` is a designed property of the
+ * kind switch.
+ */
+export type CodeEnvFile =
+  | (CodeEnvFileBase & { kind: 'skill'; version: number })
+  | (CodeEnvFileBase & { kind: 'agent' })
+  | (CodeEnvFileBase & { kind: 'user' });
 
 export type CodeExecutionToolParams =
   | undefined
   | {
+      /** Execution session — see `CodeSessionContext.session_id`. */
       session_id?: string;
       user_id?: string;
       files?: CodeEnvFile[];
     };
 
 export type FileRef = {
+  /**
+   * Resource identity. Semantics depend on `kind` (when present):
+   *  - `skill` / `agent`: shared resource id (sessionKey-meaningful).
+   *  - `user`: informational only — codeapi derives sessionKey from
+   *    the auth-context user. Do not rely on it for routing.
+   */
   id: string;
   name: string;
   path?: string;
-  /** Session ID this file belongs to (for multi-session file tracking) */
-  session_id?: string;
   /**
-   * Entity that owns this file's session (skill id, agent id, etc).
-   * Carried on tracked session files so it can flow through to
-   * `_injected_files` when a subsequent execute references a mix of
-   * files uploaded under different entities.
+   * Storage session this file lives in. See `CodeEnvFile.storage_session_id`
+   * for the full motivation.
    */
-  entity_id?: string;
+  storage_session_id?: string;
+  /** Resource kind — see `CodeEnvFile.kind`. */
+  kind?: CodeEnvKind;
+  /** Resource version — see `CodeEnvFile.version`. Only meaningful when
+   *  `kind === 'skill'`. */
+  version?: number;
   /**
    * `true` when the codeapi sandbox echoed this entry as an unchanged
    * passthrough of an input the caller already owns (skill files,
@@ -188,6 +236,11 @@ export type FileRef = {
 export type FileRefs = FileRef[];
 
 export type ExecuteResult = {
+  /**
+   * Execution session id — the (transient) sandbox run that produced
+   * this output. Distinct from per-file `storage_session_id` on the
+   * files array.
+   */
   session_id: string;
   stdout: string;
   stderr: string;
@@ -254,6 +307,7 @@ export type ToolCallRequest = {
   turn?: number;
   /** Code execution session context for session continuity in event-driven mode */
   codeSessionContext?: {
+    /** Execution session — see `CodeSessionContext.session_id`. */
     session_id: string;
     files?: CodeEnvFile[];
   };
@@ -775,6 +829,7 @@ export type PTCToolResult = {
  */
 export type ProgrammaticExecutionResponse = {
   status: 'tool_call_required' | 'completed' | 'error' | unknown;
+  /** Execution session — see `CodeSessionContext.session_id`. */
   session_id?: string;
 
   /** Present when status='tool_call_required' */
@@ -794,6 +849,7 @@ export type ProgrammaticExecutionResponse = {
  * Artifact returned by the PTC tool
  */
 export type ProgrammaticExecutionArtifact = {
+  /** Execution session — see `CodeSessionContext.session_id`. */
   session_id?: string;
   files?: FileRefs;
 };
@@ -827,7 +883,12 @@ export type ProgrammaticToolCallingParams = {
  * Stored in Graph.sessions and injected into subsequent tool invocations.
  */
 export type CodeSessionContext = {
-  /** Session ID from the code execution environment */
+  /**
+   * Execution session id — the (transient) sandbox run id. Used by
+   * ToolNode to thread session continuity into the next code-execution
+   * tool call. Distinct from per-file `storage_session_id` carried on
+   * `files`.
+   */
   session_id: string;
   /** Files generated in this session (for context/tracking) */
   files?: FileRefs;
@@ -840,6 +901,7 @@ export type CodeSessionContext = {
  * Used to extract session context after tool completion.
  */
 export type CodeExecutionArtifact = {
+  /** Execution session — see `CodeSessionContext.session_id`. */
   session_id?: string;
   files?: FileRefs;
 };
