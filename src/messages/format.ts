@@ -414,6 +414,13 @@ function formatAssistantMessage(
           continue;
         }
 
+        if (
+          typeof _tool_call.id === 'string' &&
+          _tool_call.id.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX)
+        ) {
+          continue;
+        }
+
         if (!lastAIMessage) {
           // "Heal" the payload by creating an AIMessage to precede the tool call
           lastAIMessage = createAIMessage('');
