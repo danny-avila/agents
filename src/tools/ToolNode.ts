@@ -263,6 +263,45 @@ function normalizeApprovalDecisions(
  * per-file id is absent (e.g. inline `content` files have no persistent
  * storage location).
  */
+/**
+ * Builds a `CodeEnvFile` ref from an arbitrary `FileRef`-like input,
+ * narrowing onto the discriminated union: `kind: 'skill'` requires
+ * `version`, other kinds forbid it.
+ *
+ * Defaults `kind` to `'user'` when unset — most ad-hoc files are
+ * user-private; shared resources (skills/agents) populate their kind
+ * upstream. A skill ref missing `version` falls back to `'user'` so
+ * the upstream contract bug surfaces as a degraded sessionKey rather
+ * than a runtime crash; primeSkillFiles is the only writer, and it
+ * always sets `version` — see LC packages/api/src/agents/skillFiles.ts.
+ */
+function toInjectedFileRef(
+  file: {
+    id: string;
+    name: string;
+    storage_session_id?: string;
+    kind?: t.CodeEnvKind;
+    version?: number;
+  },
+  execSessionId: string
+): t.CodeEnvFile {
+  const base = {
+    id: file.id,
+    name: file.name,
+    /* Inline `content` files have no persistent storage location;
+     * fall back to the execution session id for those entries. */
+    storage_session_id: file.storage_session_id ?? execSessionId,
+  };
+  const kind = file.kind ?? 'user';
+  if (kind === 'skill' && file.version != null) {
+    return { ...base, kind: 'skill', version: file.version };
+  }
+  if (kind === 'agent') {
+    return { ...base, kind: 'agent' };
+  }
+  return { ...base, kind: 'user' };
+}
+
 function updateCodeSession(
   sessions: t.ToolSessionMap,
   execSessionId: string,
@@ -731,27 +770,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           };
 
           if (codeSession?.files != null && codeSession.files.length > 0) {
-            const fileRefs: t.CodeEnvFile[] = codeSession.files.map((file) => {
-              const ref: t.CodeEnvFile = {
-                id: file.id,
-                name: file.name,
-                /* Inline `content` files have no persistent storage
-                 * location; fall back to the execution session id for
-                 * those entries. */
-                storage_session_id: file.storage_session_id ?? execSessionId,
-                /* `kind` drives codeapi's sessionKey shape (per-skill
-                 * vs per-user vs per-agent). Default to 'user' when
-                 * not explicitly set — most ad-hoc files are user-
-                 * private; shared resources (skills/agents) populate
-                 * their kind upstream. */
-                kind: file.kind ?? 'user',
-              };
-              if (file.version != null) {
-                ref.version = file.version;
-              }
-              return ref;
-            });
-            invokeParams._injected_files = fileRefs;
+            invokeParams._injected_files = codeSession.files.map((file) =>
+              toInjectedFileRef(file, execSessionId)
+            );
           }
         }
       }
@@ -1486,18 +1507,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     };
 
     if (codeSession.files && codeSession.files.length > 0) {
-      context.files = codeSession.files.map((file) => {
-        const ref: t.CodeEnvFile = {
-          id: file.id,
-          name: file.name,
-          storage_session_id: file.storage_session_id ?? execSessionId,
-          kind: file.kind ?? 'user',
-        };
-        if (file.version != null) {
-          ref.version = file.version;
-        }
-        return ref;
-      });
+      context.files = codeSession.files.map((file) =>
+        toInjectedFileRef(file, execSessionId)
+      );
     }
 
     return context;
