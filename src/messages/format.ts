@@ -285,6 +285,7 @@ export const formatFromLangChain = (
 
 interface FormatAssistantMessageOptions {
   preserveReasoningContent?: boolean;
+  provider?: Providers;
 }
 
 interface FormatAgentMessagesOptions {
@@ -316,6 +317,60 @@ function extractReasoningContent(
   return '';
 }
 
+type ServerToolInput = Exclude<NonNullable<ToolCallPart['args']>, string>;
+
+function parseServerToolInput(args: ToolCallPart['args']): ServerToolInput {
+  if (typeof args === 'string') {
+    try {
+      const parsed = JSON.parse(args) as unknown;
+      return parsed != null &&
+        typeof parsed === 'object' &&
+        !Array.isArray(parsed)
+        ? (parsed as ServerToolInput)
+        : {};
+    } catch {
+      return {};
+    }
+  }
+  return args != null && typeof args === 'object' ? args : {};
+}
+
+function getTextContent(part: MessageContentComplex): string {
+  const { text } = part as { text?: unknown };
+  return typeof text === 'string' ? text : '';
+}
+
+function hasMeaningfulAssistantContent(part: MessageContentComplex): boolean {
+  if (part.type === ContentTypes.TEXT) {
+    return getTextContent(part).trim().length > 0;
+  }
+  if (
+    part.type === ContentTypes.TOOL_CALL ||
+    part.type === ContentTypes.ERROR ||
+    part.type === ContentTypes.AGENT_UPDATE ||
+    part.type === ContentTypes.SUMMARY
+  ) {
+    return false;
+  }
+  if (
+    part.type === ContentTypes.THINK ||
+    part.type === ContentTypes.THINKING ||
+    part.type === ContentTypes.REASONING ||
+    part.type === ContentTypes.REASONING_CONTENT ||
+    part.type === 'redacted_thinking'
+  ) {
+    return extractReasoningContent(part).trim().length > 0;
+  }
+  return part.type != null && part.type !== '';
+}
+
+function getToolUseId(part: MessageContentComplex): string | undefined {
+  if (!('tool_use_id' in part) || typeof part.tool_use_id !== 'string') {
+    return undefined;
+  }
+  return part.tool_use_id;
+}
+
 /**
  * Helper function to format an assistant message
  * @param message The message to format
@@ -331,6 +386,8 @@ function formatAssistantMessage(
   let lastAIMessage: AIMessage | null = null;
   let hasReasoning = false;
   let pendingReasoningContent = '';
+  const emittedServerToolUseIds = new Set<string>();
+  const pendingServerToolUses = new Map<string, MessageContentComplex>();
   const shouldPreserveReasoningContent =
     options?.preserveReasoningContent === true;
 
@@ -364,12 +421,31 @@ function formatAssistantMessage(
         : reasoningContent;
   };
 
+  const flushPendingServerToolUse = (toolUseId: string): void => {
+    for (const [id, content] of pendingServerToolUses) {
+      pendingServerToolUses.delete(id);
+      if (id === toolUseId) {
+        currentContent.push(content);
+        emittedServerToolUseIds.add(id);
+        return;
+      }
+    }
+  };
+
   if (Array.isArray(message.content)) {
-    for (const part of message.content as Array<
+    const contentParts = message.content as Array<
       MessageContentComplex | undefined | null
-    >) {
+    >;
+
+    for (const part of contentParts) {
       if (part == null) {
         continue;
+      }
+      const toolUseId = getToolUseId(part);
+      if (toolUseId != null) {
+        flushPendingServerToolUse(toolUseId);
+      } else if (hasMeaningfulAssistantContent(part)) {
+        pendingServerToolUses.clear();
       }
       if (part.type === ContentTypes.TEXT && part.tool_call_ids) {
         /*
@@ -379,19 +455,18 @@ function formatAssistantMessage(
         if (currentContent.length > 0) {
           let content = currentContent.reduce((acc, curr) => {
             if (curr.type === ContentTypes.TEXT) {
-              return `${acc}${String(curr[ContentTypes.TEXT] ?? '')}\n`;
+              return `${acc}${getTextContent(curr)}\n`;
             }
             return acc;
           }, '');
-          content =
-            `${content}\n${part[ContentTypes.TEXT] ?? part.text ?? ''}`.trim();
+          content = `${content}\n${getTextContent(part)}`.trim();
           lastAIMessage = createAIMessage(content);
           formattedMessages.push(lastAIMessage);
           currentContent = [];
           continue;
         }
         // Create a new AIMessage with this text and prepare for tool calls
-        lastAIMessage = createAIMessage(part.text != null ? part.text : '');
+        lastAIMessage = createAIMessage(getTextContent(part));
         formattedMessages.push(lastAIMessage);
       } else if (part.type === ContentTypes.TOOL_CALL) {
         // Skip malformed tool call entries without tool_call property
@@ -411,6 +486,26 @@ function formatAssistantMessage(
           _tool_call.name == null ||
           (_tool_call.name === '' && (output == null || output === ''))
         ) {
+          continue;
+        }
+
+        if (
+          options?.provider === Providers.ANTHROPIC &&
+          typeof _tool_call.id === 'string' &&
+          _tool_call.id.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX)
+        ) {
+          if (
+            emittedServerToolUseIds.has(_tool_call.id) ||
+            pendingServerToolUses.has(_tool_call.id)
+          ) {
+            continue;
+          }
+          pendingServerToolUses.set(_tool_call.id, {
+            type: 'server_tool_use',
+            id: _tool_call.id,
+            name: _tool_call.name,
+            input: parseServerToolInput(_args),
+          } as MessageContentComplex);
           continue;
         }
 
@@ -465,26 +560,29 @@ function formatAssistantMessage(
       ) {
         continue;
       } else {
-        if (
-          part.type === ContentTypes.TEXT &&
-          !String(part.text ?? '').trim()
-        ) {
+        if (part.type === ContentTypes.TEXT && !getTextContent(part).trim()) {
           continue;
         }
         currentContent.push(part);
       }
     }
+    for (const content of pendingServerToolUses.values()) {
+      currentContent.push(content);
+    }
   }
 
   if (hasReasoning && currentContent.length > 0) {
-    const content = currentContent
-      .reduce((acc, curr) => {
-        if (curr.type === ContentTypes.TEXT) {
-          return `${acc}${String(curr[ContentTypes.TEXT] ?? '')}\n`;
-        }
-        return acc;
-      }, '')
-      .trim();
+    let content = '';
+    for (const part of currentContent) {
+      if (part.type !== ContentTypes.TEXT) {
+        formattedMessages.push(
+          createAIMessage(toLangChainContent(currentContent))
+        );
+        return formattedMessages;
+      }
+      content += `${getTextContent(part)}\n`;
+    }
+    content = content.trim();
 
     if (content) {
       formattedMessages.push(createAIMessage(content));
@@ -1157,6 +1255,7 @@ export const formatAgentMessages = (
 
     const formattedMessages = formatAssistantMessage(processedMessage, {
       preserveReasoningContent: options?.provider === Providers.DEEPSEEK,
+      provider: options?.provider,
     });
     if (sourceMessageId != null && sourceMessageId !== '') {
       for (const formattedMessage of formattedMessages) {

@@ -3,6 +3,14 @@ import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import { _convertMessagesToAnthropicPayload } from './message_inputs';
 
+type AnthropicTestBlock = {
+  id?: unknown;
+  type?: unknown;
+};
+
+const isServerToolId = (id: unknown): id is string =>
+  typeof id === 'string' && id.startsWith('srvtoolu_');
+
 describe('_convertMessagesToAnthropicPayload — server tool use (web search) multi-turn', () => {
   it('corrects tool_use blocks with srvtoolu_ IDs to server_tool_use', () => {
     const messageHistory: BaseMessage[] = [
@@ -78,9 +86,10 @@ describe('_convertMessagesToAnthropicPayload — server tool use (web search) mu
     const searchResultBlocks = assistantContent.filter(
       (b: any) => b.type === 'web_search_tool_result'
     );
-    const regularToolUseBlocks = assistantContent.filter(
-      (b: any) => b.type === 'tool_use' && b.id?.startsWith('srvtoolu_')
-    );
+    const regularToolUseBlocks = assistantContent.filter((block: unknown) => {
+      const b = block as AnthropicTestBlock;
+      return b.type === 'tool_use' && isServerToolId(b.id);
+    });
 
     expect(serverToolBlocks).toHaveLength(2);
     expect(searchResultBlocks).toHaveLength(2);
@@ -190,9 +199,10 @@ describe('_convertMessagesToAnthropicPayload — server tool use (web search) mu
     expect(toolUseBlocks).toHaveLength(1);
     expect(toolUseBlocks[0].id).toBe('toolu_regular');
 
-    const serverToolBlocks = assistantContent.filter((b: any) =>
-      b.id?.startsWith('srvtoolu_')
-    );
+    const serverToolBlocks = assistantContent.filter((block: unknown) => {
+      const b = block as AnthropicTestBlock;
+      return isServerToolId(b.id);
+    });
     expect(serverToolBlocks).toHaveLength(0);
   });
 
@@ -217,7 +227,80 @@ describe('_convertMessagesToAnthropicPayload — server tool use (web search) mu
     const assistantContent = messages[1].content as any[];
     expect(assistantContent).toHaveLength(1);
     expect(assistantContent[0].type).toBe('text');
-    expect(assistantContent[0].text).toBe(' ');
+    expect(assistantContent[0].text).toBe('_');
+    expect(assistantContent[0].text.trim()).toBe('_');
+  });
+
+  it('uses non-whitespace fallback content after filtering empty array text', () => {
+    const messageHistory: BaseMessage[] = [
+      new HumanMessage({
+        content: [
+          { type: 'text', text: ' ' },
+          { type: 'text', text: '\n' },
+        ],
+      }),
+    ];
+
+    const { messages } = _convertMessagesToAnthropicPayload(messageHistory);
+    expect(messages[0].content).toEqual([{ type: 'text', text: '_' }]);
+  });
+
+  it('uses non-whitespace fallback content for empty server tool result artifacts', () => {
+    const messageHistory: BaseMessage[] = [
+      new HumanMessage('search for X'),
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          {
+            id: 'srvtoolu_1',
+            name: 'web_search',
+            args: { query: 'X' },
+            type: 'tool_call',
+          },
+        ],
+      }),
+      new ToolMessage({
+        content: '',
+        tool_call_id: 'srvtoolu_1',
+      }),
+      new HumanMessage('follow up'),
+    ];
+
+    const { messages } = _convertMessagesToAnthropicPayload(messageHistory);
+
+    expect(messages[1].content).toEqual([{ type: 'text', text: '_' }]);
+    expect(messages[2].content).toEqual([{ type: 'text', text: '_' }]);
+  });
+
+  it('does not throw when a non-string ToolMessage has undefined content', () => {
+    const undefinedContentToolMessage = {
+      _getType: (): 'tool' => 'tool',
+      content: undefined,
+      tool_call_id: 'toolu_calc',
+    } as unknown as ToolMessage;
+    const messageHistory: BaseMessage[] = [
+      new HumanMessage('call the calculator'),
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          {
+            id: 'toolu_calc',
+            name: 'calculator',
+            args: { expr: '2+2' },
+            type: 'tool_call',
+          },
+        ],
+      }),
+      undefinedContentToolMessage,
+    ];
+
+    const { messages } = _convertMessagesToAnthropicPayload(messageHistory);
+    expect(messages[2].content).toEqual([
+      {
+        type: 'tool_result',
+        tool_use_id: 'toolu_calc',
+      },
+    ]);
   });
 
   it('preserves regular tool_use blocks alongside corrected server tool blocks', () => {
@@ -283,9 +366,10 @@ describe('_convertMessagesToAnthropicPayload — server tool use (web search) mu
     const webSearchResult = assistantContent.filter(
       (b: any) => b.type === 'web_search_tool_result'
     );
-    const regularToolUse = assistantContent.filter(
-      (b: any) => b.type === 'tool_use' && !b.id?.startsWith('srvtoolu_')
-    );
+    const regularToolUse = assistantContent.filter((block: unknown) => {
+      const b = block as AnthropicTestBlock;
+      return b.type === 'tool_use' && !isServerToolId(b.id);
+    });
 
     expect(serverToolUse).toHaveLength(1);
     expect(serverToolUse[0].id).toBe('srvtoolu_1');
@@ -416,9 +500,7 @@ describe('_convertMessagesToAnthropicPayload — server tool use (web search) mu
       );
       expect(whitespaceTextBlocks).toHaveLength(0);
 
-      const textBlocks = assistantContent.filter(
-        (b: any) => b.type === 'text'
-      );
+      const textBlocks = assistantContent.filter((b: any) => b.type === 'text');
       expect(textBlocks).toHaveLength(1);
       expect(textBlocks[0].text).toBe('Here are the results.');
     }

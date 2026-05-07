@@ -31,7 +31,13 @@ import type {
   MessageContentComplex,
 } from '@langchain/core/messages';
 import { toLangChainContent } from '@/messages/langchain';
+import { formatAgentMessages } from '@/messages/format';
+import { Constants, ContentTypes, GraphEvents, Providers } from '@/common';
 import { _documentsInParams, CustomAnthropic as ChatAnthropic } from './index';
+import { partitionAndMarkAnthropicToolCache } from '@/messages/anthropicToolCache';
+import { ChatModelStreamHandler, createContentAggregator } from '@/stream';
+import { ModelEndHandler, ToolEndHandler } from '@/events';
+import { Run } from '@/run';
 import type { CustomAnthropicCallOptions } from './index';
 import type {
   AnthropicContextManagementConfigParam,
@@ -44,6 +50,20 @@ import type {
   AnthropicThinkingConfigParam,
   ChatAnthropicContentBlock,
 } from './types';
+import type {
+  AnthropicClientOptions,
+  IState,
+  MessageContentComplex as LibreChatContentBlock,
+  MessageDeltaEvent,
+  ReasoningDeltaEvent,
+  RunConfig,
+  RunStep,
+  RunStepDeltaEvent,
+  SharedLLMConfig,
+  StreamEventData,
+  ToolEndEvent,
+  TPayload,
+} from '@/types';
 import { _convertMessagesToAnthropicPayload } from './utils/message_inputs';
 import {
   _makeMessageChunkFromAnthropicEvent,
@@ -89,6 +109,8 @@ const remoteImageUrl =
 
 // Use this model for all other tests
 const modelName = 'claude-haiku-4-5-20251001';
+const webSearchModelName =
+  process.env.ANTHROPIC_WEB_SEARCH_MODEL ?? 'claude-opus-4-7';
 
 type AnthropicThinkingResponseBlock = Anthropic.Messages.ThinkingBlock & {
   index?: number;
@@ -120,6 +142,12 @@ type CitationContentBlock = ContentBlock & {
 type CompactionContentBlock = ContentBlock & {
   type: 'compaction';
   content: string;
+};
+
+type AnthropicContentBlockWithId = ContentBlock & {
+  id?: unknown;
+  input?: unknown;
+  name?: unknown;
 };
 
 function getLangChainErrorCode(error: unknown): string | undefined {
@@ -201,6 +229,184 @@ function isCompactionBlock(
 
   const { content } = block as { content?: unknown };
   return typeof content === 'string';
+}
+
+function isServerToolUseBlock(
+  block: ContentBlock
+): block is AnthropicContentBlockWithId {
+  return (
+    block.type === 'server_tool_use' &&
+    typeof (block as AnthropicContentBlockWithId).id === 'string' &&
+    ((block as AnthropicContentBlockWithId).id as string).startsWith(
+      Constants.ANTHROPIC_SERVER_TOOL_PREFIX
+    )
+  );
+}
+
+function expectAnthropicPayloadContentIsNonEmpty(
+  payload: AnthropicMessageCreateParams
+): void {
+  for (const message of payload.messages) {
+    if (typeof message.content === 'string') {
+      expect(message.content.trim().length).toBeGreaterThan(0);
+      continue;
+    }
+
+    expect(message.content.length).toBeGreaterThan(0);
+    for (const block of message.content) {
+      if (block.type !== 'text') {
+        continue;
+      }
+      expect(block.text.trim().length).toBeGreaterThan(0);
+    }
+  }
+}
+
+function expectNoDanglingServerToolUses(
+  payload: AnthropicMessageCreateParams
+): void {
+  for (const message of payload.messages) {
+    if (typeof message.content === 'string') {
+      continue;
+    }
+
+    const serverToolResultIds = new Set(
+      message.content
+        .map((block) =>
+          'tool_use_id' in block &&
+          typeof block.tool_use_id === 'string' &&
+          block.tool_use_id.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX)
+            ? block.tool_use_id
+            : undefined
+        )
+        .filter((id): id is string => id != null)
+    );
+
+    for (const block of message.content) {
+      if (block.type !== 'server_tool_use') {
+        continue;
+      }
+      expect(serverToolResultIds.has(block.id)).toBe(true);
+    }
+  }
+}
+
+function getPromptCachedWebSearchTools(): Parameters<
+  ChatAnthropic['bindTools']
+>[0] {
+  const tools = partitionAndMarkAnthropicToolCache(
+    [
+      {
+        type: 'web_search_20250305',
+        name: 'web_search',
+        max_uses: 3,
+      },
+    ] as never,
+    () => false
+  );
+  return tools as Parameters<ChatAnthropic['bindTools']>[0];
+}
+
+function getWebSearchTool(): {
+  type: 'web_search_20250305';
+  name: 'web_search';
+  max_uses: number;
+} {
+  return {
+    type: 'web_search_20250305',
+    name: 'web_search',
+    max_uses: 3,
+  };
+}
+
+function getWebSearchLLMConfig(): AnthropicClientOptions & SharedLLMConfig {
+  return {
+    provider: Providers.ANTHROPIC,
+    model: webSearchModelName,
+    maxTokens: 1024,
+    promptCache: true,
+    streaming: true,
+    streamUsage: true,
+    thinking: { type: 'adaptive' },
+  } as AnthropicClientOptions & SharedLLMConfig;
+}
+
+async function createWebSearchRun({
+  runId,
+  customHandlers,
+}: {
+  runId: string;
+  customHandlers?: RunConfig['customHandlers'];
+}): Promise<Run<IState>> {
+  return await Run.create<IState>({
+    runId,
+    graphConfig: {
+      type: 'standard',
+      llmConfig: getWebSearchLLMConfig(),
+      tools: [getWebSearchTool()],
+      instructions:
+        'You are a concise assistant. Use web search when current facts are needed.',
+    },
+    returnContent: true,
+    skipCleanup: true,
+    customHandlers,
+  });
+}
+
+function createLibreChatContentHandlers(): {
+  aggregateContent: ReturnType<
+    typeof createContentAggregator
+  >['aggregateContent'];
+  contentParts: Array<LibreChatContentBlock | undefined>;
+  customHandlers: NonNullable<RunConfig['customHandlers']>;
+} {
+  const { contentParts, aggregateContent } = createContentAggregator();
+  const customHandlers = {
+    [GraphEvents.TOOL_END]: new ToolEndHandler(),
+    [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(),
+    [GraphEvents.CHAT_MODEL_STREAM]: new ChatModelStreamHandler(),
+    [GraphEvents.ON_RUN_STEP_COMPLETED]: {
+      handle: (
+        event: GraphEvents.ON_RUN_STEP_COMPLETED,
+        data: StreamEventData
+      ): void => {
+        aggregateContent({
+          event,
+          data: data as unknown as { result: ToolEndEvent },
+        });
+      },
+    },
+    [GraphEvents.ON_RUN_STEP]: {
+      handle: (event: GraphEvents.ON_RUN_STEP, data: StreamEventData): void => {
+        aggregateContent({ event, data: data as RunStep });
+      },
+    },
+    [GraphEvents.ON_RUN_STEP_DELTA]: {
+      handle: (
+        event: GraphEvents.ON_RUN_STEP_DELTA,
+        data: StreamEventData
+      ): void => {
+        aggregateContent({ event, data: data as RunStepDeltaEvent });
+      },
+    },
+    [GraphEvents.ON_MESSAGE_DELTA]: {
+      handle: (
+        event: GraphEvents.ON_MESSAGE_DELTA,
+        data: StreamEventData
+      ): void => {
+        aggregateContent({ event, data: data as MessageDeltaEvent });
+      },
+    },
+    [GraphEvents.ON_REASONING_DELTA]: {
+      handle: (
+        event: GraphEvents.ON_REASONING_DELTA,
+        data: StreamEventData
+      ): void => {
+        aggregateContent({ event, data: data as ReasoningDeltaEvent });
+      },
+    },
+  };
+  return { aggregateContent, contentParts, customHandlers };
 }
 
 test('Test ChatAnthropic', async () => {
@@ -1448,6 +1654,101 @@ test('human message caching', async () => {
   expect(agg!.usage_metadata?.input_tokens).toBeGreaterThan(
     agg!.usage_metadata?.input_token_details?.cache_read ?? 0
   );
+});
+
+describe('Anthropic web search live regressions', () => {
+  test('accepts prompt-cache markers on built-in web search tools', async () => {
+    const model = new ChatAnthropic({
+      model: webSearchModelName,
+      maxTokens: 1024,
+      thinking: { type: 'adaptive' },
+    });
+    const tools = getPromptCachedWebSearchTools();
+    const formattedTools = model.formatStructuredToolToAnthropic(tools);
+
+    expect(formattedTools?.[0]).toMatchObject({
+      type: 'web_search_20250305',
+      name: 'web_search',
+      cache_control: { type: 'ephemeral' },
+    });
+    expect(formattedTools?.[0]).not.toHaveProperty('extras');
+
+    const response = await model
+      .bindTools(tools)
+      .invoke([
+        new HumanMessage(
+          'Use web search once and answer with only the word: ok'
+        ),
+      ]);
+
+    expect(response.content.length).toBeGreaterThan(0);
+  });
+
+  test('replays LibreChat-persisted web search content across runs', async () => {
+    const threadId = `web-search-e2e-${Date.now()}`;
+    const firstPrompt =
+      'Use web search. Who is the lowest seed survived in 2026 NBA playoffs? Answer with only the team name.';
+    const followUpPrompt = "Who are 76ers' opponents in current series?";
+    const { contentParts: firstContentParts, customHandlers: firstHandlers } =
+      createLibreChatContentHandlers();
+    const firstRun = await createWebSearchRun({
+      runId: `${threadId}-turn-1`,
+      customHandlers: firstHandlers,
+    });
+    const runConfig = {
+      configurable: { provider: Providers.ANTHROPIC, thread_id: threadId },
+      streamMode: 'values',
+      version: 'v2' as const,
+    };
+
+    const firstRunContent = await firstRun.processStream(
+      { messages: [new HumanMessage(firstPrompt)] },
+      runConfig
+    );
+    const persistedAssistantContent = firstContentParts.filter(
+      (part): part is LibreChatContentBlock => part != null
+    );
+    const hasPersistedServerToolCall = persistedAssistantContent.some(
+      (part) =>
+        part.type === ContentTypes.TOOL_CALL &&
+        typeof part.tool_call?.id === 'string' &&
+        part.tool_call.id.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX)
+    );
+    const hasPersistedAnswerText = persistedAssistantContent.some(
+      (part) =>
+        part.type === ContentTypes.TEXT &&
+        typeof part.text === 'string' &&
+        part.text.trim().length > 0
+    );
+
+    expect(firstRunContent).toBeDefined();
+    expect(persistedAssistantContent.length).toBeGreaterThan(0);
+    expect(hasPersistedServerToolCall).toBe(true);
+    expect(hasPersistedAnswerText).toBe(true);
+
+    const persistedPayload: TPayload = [
+      { role: 'user', content: firstPrompt },
+      { role: 'assistant', content: persistedAssistantContent },
+      { role: 'user', content: followUpPrompt },
+    ];
+    const { messages } = formatAgentMessages(
+      persistedPayload,
+      undefined,
+      new Set(['web_search']),
+      undefined,
+      { provider: Providers.ANTHROPIC }
+    );
+    const anthropicPayload = _convertMessagesToAnthropicPayload(messages);
+    const secondRun = await createWebSearchRun({
+      runId: `${threadId}-turn-2`,
+    });
+
+    expectAnthropicPayloadContentIsNonEmpty(anthropicPayload);
+    expectNoDanglingServerToolUses(anthropicPayload);
+    await expect(
+      secondRun.processStream({ messages }, runConfig)
+    ).resolves.toBeDefined();
+  });
 });
 
 test('Can accept PDF documents', async () => {

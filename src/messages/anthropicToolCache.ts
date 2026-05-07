@@ -19,13 +19,73 @@
  * the breakpoint.
  *
  * LangChain's Anthropic adapter passes the marker through via
- * `tool.extras.cache_control` (`AnthropicToolExtrasSchema`), so we set
- * it as an `extras` field on a fresh wrapper around the tool — never
- * mutating the original tool instance, since callers may share them
+ * `tool.extras.cache_control` for custom tools, while Anthropic built-ins
+ * require direct `cache_control`. Either way, we stamp a fresh wrapper —
+ * never mutating the original tool instance, since callers may share them
  * across runs.
  */
 
 import type { GraphTools } from '@/types';
+
+const ANTHROPIC_BUILT_IN_TOOL_PREFIXES = [
+  'text_editor_',
+  'computer_',
+  'bash_',
+  'web_search_',
+  'web_fetch_',
+  'str_replace_editor_',
+  'str_replace_based_edit_tool_',
+  'code_execution_',
+  'memory_',
+  'tool_search_',
+  'mcp_toolset',
+] as const;
+
+const CACHE_CONTROL = { type: 'ephemeral' as const };
+
+type AnthropicToolCacheCandidate = {
+  name?: unknown;
+  type?: unknown;
+  extras?: Record<string, unknown>;
+  cache_control?: unknown;
+};
+
+function isAnthropicBuiltInTool(
+  tool: AnthropicToolCacheCandidate
+): tool is AnthropicToolCacheCandidate & { type: string } {
+  const { type } = tool;
+  return (
+    typeof type === 'string' &&
+    ANTHROPIC_BUILT_IN_TOOL_PREFIXES.some((prefix) => type.startsWith(prefix))
+  );
+}
+
+function hasCacheControl(tool: AnthropicToolCacheCandidate): boolean {
+  if (isAnthropicBuiltInTool(tool)) {
+    return tool.cache_control != null;
+  }
+  return tool.extras?.cache_control != null;
+}
+
+function markCacheControl(
+  tool: AnthropicToolCacheCandidate
+): AnthropicToolCacheCandidate {
+  const prototype = Object.getPrototypeOf(tool) ?? Object.prototype;
+  if (isAnthropicBuiltInTool(tool)) {
+    const wrapped = { ...tool };
+    delete wrapped.extras;
+    return Object.assign(Object.create(prototype), wrapped, {
+      cache_control: CACHE_CONTROL,
+    });
+  }
+
+  return Object.assign(Object.create(prototype), tool, {
+    extras: {
+      ...(tool.extras ?? {}),
+      cache_control: CACHE_CONTROL,
+    },
+  });
+}
 
 /**
  * Returns a callable that reports whether a given tool *name* is deferred
@@ -59,8 +119,8 @@ export function makeIsDeferred(
  *
  * The original tool instances are never mutated. The marked entry is a
  * shallow wrapper that preserves the prototype chain so downstream
- * `instanceof` checks still pass. `extras` is merged so any existing
- * `providerToolDefinition` / other extras the host attached are kept.
+ * `instanceof` checks still pass. For custom tools, `extras` is merged
+ * so any existing `providerToolDefinition` / other extras are kept.
  */
 export function partitionAndMarkAnthropicToolCache(
   tools: GraphTools | undefined,
@@ -87,30 +147,15 @@ export function partitionAndMarkAnthropicToolCache(
     return tools;
   }
 
-  const last = staticTools[staticTools.length - 1] as {
-    extras?: Record<string, unknown>;
-  };
+  const last = staticTools[
+    staticTools.length - 1
+  ] as AnthropicToolCacheCandidate;
   // Already marked? Don't double-clone.
-  if (
-    last.extras != null &&
-    'cache_control' in last.extras &&
-    (last.extras as { cache_control?: unknown }).cache_control != null
-  ) {
+  if (hasCacheControl(last)) {
     if (deferredTools.length === 0) return tools;
     return [...staticTools, ...deferredTools] as GraphTools;
   }
 
-  const wrapped = Object.assign(
-    Object.create(Object.getPrototypeOf(last) ?? Object.prototype),
-    last,
-    {
-      extras: {
-        ...((last.extras as Record<string, unknown> | undefined) ?? {}),
-        cache_control: { type: 'ephemeral' as const },
-      },
-    }
-  );
-
-  staticTools[staticTools.length - 1] = wrapped;
+  staticTools[staticTools.length - 1] = markCacheControl(last);
   return [...staticTools, ...deferredTools] as GraphTools;
 }

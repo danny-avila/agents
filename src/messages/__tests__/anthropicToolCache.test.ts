@@ -5,6 +5,7 @@ import {
   makeIsDeferred,
   partitionAndMarkAnthropicToolCache,
 } from '../anthropicToolCache';
+import { CustomAnthropic } from '@/llm/anthropic';
 
 function fakeTool(name: string): unknown {
   return tool(async () => 'ok', {
@@ -84,6 +85,51 @@ describe('partitionAndMarkAnthropicToolCache', () => {
     ) as Array<{ extras?: Record<string, unknown> }>;
     expect(out[0].extras?.providerToolDefinition).toEqual({ foo: 'bar' });
     expect(out[0].extras?.cache_control).toEqual({ type: 'ephemeral' });
+  });
+
+  it('stamps Anthropic built-in tools with direct cache_control', () => {
+    const webSearch = {
+      type: 'web_search_20250305',
+      name: 'web_search',
+      max_uses: 3,
+    };
+    const out = partitionAndMarkAnthropicToolCache(
+      [webSearch] as never,
+      () => false
+    ) as Array<{
+      cache_control?: { type: string };
+      extras?: { cache_control?: { type: string } };
+    }>;
+
+    expect(out[0]).not.toBe(webSearch);
+    expect(out[0].cache_control).toEqual({ type: 'ephemeral' });
+    expect(out[0].extras).toBeUndefined();
+  });
+
+  it('does not serialize extras on Anthropic built-in tools', () => {
+    const model = new CustomAnthropic({
+      model: 'claude-haiku-4-5',
+      apiKey: 'testing',
+    });
+    const webSearch = {
+      type: 'web_search_20250305',
+      name: 'web_search',
+      max_uses: 3,
+    };
+    const tools = partitionAndMarkAnthropicToolCache(
+      [webSearch] as never,
+      () => false
+    );
+    const formattedTools = model.formatStructuredToolToAnthropic(tools);
+    const formatted = formattedTools?.[0];
+
+    expect(formatted).toEqual({
+      type: 'web_search_20250305',
+      name: 'web_search',
+      max_uses: 3,
+      cache_control: { type: 'ephemeral' },
+    });
+    expect(formatted).not.toHaveProperty('extras');
   });
 
   it('is idempotent when re-marking a tool that already has the marker', () => {

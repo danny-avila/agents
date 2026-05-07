@@ -47,6 +47,8 @@ type GoogleFunctionCallBlock = MessageContentComplex & {
   };
 };
 
+const ANTHROPIC_EMPTY_TEXT_PLACEHOLDER = '_';
+
 function _formatImage(imageUrl: string) {
   const parsed = parseBase64DataUrl({ dataUrl: imageUrl });
   if (parsed) {
@@ -126,13 +128,15 @@ function _ensureMessageContents(
           );
         }
       } else {
+        const toolMessageContent = (
+          message as { content?: BaseMessage['content'] | null }
+        ).content;
         updatedMsgs.push(
           new HumanMessage({
             content: [
               {
                 type: 'tool_result',
-                // rare case: message.content could be undefined
-                ...(message.content != null
+                ...(toolMessageContent != null
                   ? { content: _formatContent(message) }
                   : {}),
                 tool_use_id: (message as ToolMessage).tool_call_id,
@@ -486,7 +490,7 @@ function _formatContent(message: BaseMessage) {
         return {
           type: 'image' as const, // Explicitly setting the type as "image"
           source,
-          ...(cacheControl ? { cache_control: cacheControl } : {}),
+          ...(cacheControl != null ? { cache_control: cacheControl } : {}),
         };
       } else if (isAnthropicImageBlockParam(contentPart)) {
         return contentPart;
@@ -494,7 +498,7 @@ function _formatContent(message: BaseMessage) {
         // PDF
         return {
           ...contentPart,
-          ...(cacheControl ? { cache_control: cacheControl } : {}),
+          ...(cacheControl != null ? { cache_control: cacheControl } : {}),
         };
       } else if (contentPart.type === 'thinking') {
         const thinkingPart = contentPart as AnthropicThinkingBlockParam;
@@ -502,7 +506,7 @@ function _formatContent(message: BaseMessage) {
           type: 'thinking' as const, // Explicitly setting the type as "thinking"
           thinking: thinkingPart.thinking,
           signature: thinkingPart.signature,
-          ...(cacheControl ? { cache_control: cacheControl } : {}),
+          ...(cacheControl != null ? { cache_control: cacheControl } : {}),
         };
         return block;
       } else if (contentPart.type === 'redacted_thinking') {
@@ -510,7 +514,7 @@ function _formatContent(message: BaseMessage) {
         const block: AnthropicRedactedThinkingBlockParam = {
           type: 'redacted_thinking' as const, // Explicitly setting the type as "redacted_thinking"
           data: redactedPart.data,
-          ...(cacheControl ? { cache_control: cacheControl } : {}),
+          ...(cacheControl != null ? { cache_control: cacheControl } : {}),
         };
         return block;
       } else if (contentPart.type === 'search_result') {
@@ -519,10 +523,11 @@ function _formatContent(message: BaseMessage) {
           type: 'search_result' as const,
           title: searchResultPart.title,
           source: searchResultPart.source,
-          ...('cache_control' in contentPart && contentPart.cache_control
+          ...('cache_control' in contentPart &&
+          contentPart.cache_control != null
             ? { cache_control: contentPart.cache_control }
             : {}),
-          ...('citations' in contentPart && contentPart.citations
+          ...('citations' in contentPart && contentPart.citations != null
             ? { citations: contentPart.citations }
             : {}),
           content: searchResultPart.content,
@@ -533,23 +538,23 @@ function _formatContent(message: BaseMessage) {
         const block: AnthropicCompactionBlockParam = {
           type: 'compaction' as const,
           content: compactionPart.content,
-          ...(cacheControl ? { cache_control: cacheControl } : {}),
+          ...(cacheControl != null ? { cache_control: cacheControl } : {}),
         };
         return block;
       } else if (
-        textTypes.find((t) => t === contentPart.type) &&
+        textTypes.some((t) => t === contentPart.type) &&
         'text' in contentPart
       ) {
         // Assuming contentPart is of type MessageContentText here
         return {
           type: 'text' as const, // Explicitly setting the type as "text"
           text: contentPart.text,
-          ...(cacheControl ? { cache_control: cacheControl } : {}),
-          ...('citations' in contentPart && contentPart.citations
+          ...(cacheControl != null ? { cache_control: cacheControl } : {}),
+          ...('citations' in contentPart && contentPart.citations != null
             ? { citations: contentPart.citations }
             : {}),
         };
-      } else if (toolTypes.find((t) => t === contentPart.type)) {
+      } else if (toolTypes.some((t) => t === contentPart.type)) {
         const contentPartCopy = { ...contentPart };
         if ('index' in contentPartCopy) {
           // Anthropic does not support passing the index field here, so we remove it.
@@ -593,12 +598,12 @@ function _formatContent(message: BaseMessage) {
         // TODO: Fix when SDK types are fixed
         return {
           ...contentPartCopy,
-          ...(cacheControl ? { cache_control: cacheControl } : {}),
+          ...(cacheControl != null ? { cache_control: cacheControl } : {}),
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
         } as any;
       } else if (
         'functionCall' in contentPart &&
-        contentPart.functionCall &&
+        contentPart.functionCall != null &&
         typeof contentPart.functionCall === 'object' &&
         isAIMessage(message)
       ) {
@@ -626,7 +631,7 @@ function _formatContent(message: BaseMessage) {
         throw new Error('Unsupported message content format');
       }
     });
-    return contentBlocks.filter(
+    const filteredContentBlocks = contentBlocks.filter(
       (block) =>
         block !== null &&
         !(
@@ -636,6 +641,9 @@ function _formatContent(message: BaseMessage) {
           block.text.trim() === ''
         )
     );
+    return filteredContentBlocks.length > 0
+      ? filteredContentBlocks
+      : [{ type: 'text' as const, text: ANTHROPIC_EMPTY_TEXT_PLACEHOLDER }];
   }
 }
 
@@ -670,9 +678,11 @@ export function _convertMessagesToAnthropicPayload(
     } else {
       throw new Error(`Message type "${message._getType()}" is not supported.`);
     }
-    if (isAIMessage(message) && !!message.tool_calls?.length) {
+    const isAI = isAIMessage(message);
+    const toolCalls = isAI ? (message.tool_calls ?? []) : [];
+    if (isAI && toolCalls.length > 0) {
       if (typeof message.content === 'string') {
-        const clientToolCalls = message.tool_calls.filter(
+        const clientToolCalls = toolCalls.filter(
           (tc) =>
             !(
               tc.id?.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX) ?? false
@@ -684,7 +694,12 @@ export function _convertMessagesToAnthropicPayload(
             content:
               clientToolCalls.length > 0
                 ? clientToolCalls.map(_convertLangChainToolCallToAnthropic)
-                : [{ type: 'text' as const, text: ' ' }],
+                : [
+                  {
+                    type: 'text' as const,
+                    text: ANTHROPIC_EMPTY_TEXT_PLACEHOLDER,
+                  },
+                ],
           };
         } else {
           return {
@@ -697,7 +712,7 @@ export function _convertMessagesToAnthropicPayload(
         }
       } else {
         const { content } = message;
-        const hasMismatchedToolCalls = !message.tool_calls.every(
+        const hasMismatchedToolCalls = !toolCalls.every(
           (toolCall) =>
             !!content.find(
               (contentPart) =>
@@ -731,7 +746,7 @@ export function _convertMessagesToAnthropicPayload(
 }
 
 function mergeMessages(messages: AnthropicMessageCreateParams['messages']) {
-  if (!messages || messages.length <= 1) {
+  if (messages.length <= 1) {
     return messages;
   }
 
