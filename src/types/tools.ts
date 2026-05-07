@@ -203,6 +203,12 @@ export type CodeExecutionToolParams =
     };
 
 export type FileRef = {
+  /**
+   * Resource identity. Semantics depend on `kind` (when present):
+   *  - `skill` / `agent`: shared resource id (sessionKey-meaningful).
+   *  - `user`: informational only — codeapi derives sessionKey from
+   *    the auth-context user. Do not rely on it for routing.
+   */
   id: string;
   name: string;
   path?: string;
@@ -213,7 +219,8 @@ export type FileRef = {
   storage_session_id?: string;
   /** Resource kind — see `CodeEnvFile.kind`. */
   kind?: CodeEnvKind;
-  /** Resource version — see `CodeEnvFile.version`. */
+  /** Resource version — see `CodeEnvFile.version`. Only meaningful when
+   *  `kind === 'skill'`. */
   version?: number;
   /**
    * `true` when the codeapi sandbox echoed this entry as an unchanged
