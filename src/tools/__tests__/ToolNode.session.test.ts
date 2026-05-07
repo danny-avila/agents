@@ -84,12 +84,20 @@ describe('ToolNode code execution session management', () => {
       expect(capturedConfigs[0]._injected_files).toEqual([
         {
           id: 'file1',
+          /* `resource_id` defaults to `id` (the storage uuid) when
+           * the input ref didn't supply it — informational for
+           * `kind: 'user'` since codeapi derives sessionKey from
+           * auth context. The real LC priming chain DOES supply
+           * resource_id explicitly; the default is a back-compat
+           * landing for inputs that haven't been updated. */
+          resource_id: 'file1',
           name: 'data.csv',
           storage_session_id: 'prev-session-abc',
           kind: 'user',
         },
         {
           id: 'file2',
+          resource_id: 'file2',
           name: 'chart.png',
           storage_session_id: 'prev-session-abc',
           kind: 'user',
@@ -195,6 +203,9 @@ describe('ToolNode code execution session management', () => {
       expect(files).toEqual([
         {
           id: 'skill-123',
+          /* Default fallback when input doesn't supply `resource_id`.
+           * Production LC sets it explicitly to the skill's `_id`. */
+          resource_id: 'skill-123',
           name: 'demo/SKILL.md',
           storage_session_id: 'session-A',
           kind: 'skill',
@@ -202,6 +213,7 @@ describe('ToolNode code execution session management', () => {
         },
         {
           id: 'user-file',
+          resource_id: 'user-file',
           name: 'attachment.csv',
           storage_session_id: 'session-B',
           kind: 'user',
@@ -241,6 +253,9 @@ describe('ToolNode code execution session management', () => {
         files: [
           {
             id: 'ef1',
+            /* `resource_id` defaults to `id` when input doesn't carry
+             * separate provenance — see toInjectedFileRef. */
+            resource_id: 'ef1',
             name: 'out.parquet',
             storage_session_id: 'evt-session',
             kind: 'user',
@@ -327,6 +342,8 @@ describe('ToolNode code execution session management', () => {
         files: [
           {
             id: 'skill-abc',
+            /* Default fallback when input doesn't supply `resource_id`. */
+            resource_id: 'skill-abc',
             name: 'demo/SKILL.md',
             storage_session_id: 'evt-session',
             kind: 'skill',
@@ -334,6 +351,7 @@ describe('ToolNode code execution session management', () => {
           },
           {
             id: 'usr1',
+            resource_id: 'usr1',
             name: 'data.csv',
             storage_session_id: 'evt-session',
             kind: 'user',
@@ -835,6 +853,9 @@ describe('ToolNode code execution session management', () => {
         files: [
           {
             id: 'rf1',
+            /* Default fallback for inputs that don't carry separate
+             * provenance — see toInjectedFileRef. */
+            resource_id: 'rf1',
             name: 'data.csv',
             storage_session_id: 'rf-session',
             kind: 'user',

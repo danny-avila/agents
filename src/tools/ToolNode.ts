@@ -274,10 +274,20 @@ function normalizeApprovalDecisions(
  * the upstream contract bug surfaces as a degraded sessionKey rather
  * than a runtime crash; primeSkillFiles is the only writer, and it
  * always sets `version` — see LC packages/api/src/agents/skillFiles.ts.
+ *
+ * `resource_id` carries the entity-that-owns-this-file's-session
+ * identity (skill `_id` etc.); falls back to `id` (the storage
+ * file_id) for inputs that haven't been updated to send the field
+ * explicitly. The fallback degrades sessionKey resolution on the
+ * codeapi side for shared kinds (it'll match the storage nanoid
+ * against a skill _id and 403) — but won't crash, so an unmigrated
+ * client still produces a diagnosable error instead of a stack
+ * trace.
  */
 function toInjectedFileRef(
   file: {
     id: string;
+    resource_id?: string;
     name: string;
     storage_session_id?: string;
     kind?: t.CodeEnvKind;
@@ -287,6 +297,7 @@ function toInjectedFileRef(
 ): t.CodeEnvFile {
   const base = {
     id: file.id,
+    resource_id: file.resource_id ?? file.id,
     name: file.name,
     /* Inline `content` files have no persistent storage location;
      * fall back to the execution session id for those entries. */

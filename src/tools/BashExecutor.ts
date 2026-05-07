@@ -168,6 +168,9 @@ function createBashExecutionTool(
                  * to the user; tag them user-private. */
                 kind: 'user' as const,
                 id,
+                /* `resource_id` informational for `kind: 'user'` —
+                 * codeapi derives sessionKey from auth context. */
+                resource_id: id,
                 name: file.metadata['original-filename'],
               };
             });
