@@ -158,14 +158,33 @@ export type CodeEnvKind = (typeof CODE_ENV_KINDS)[number];
 
 type CodeEnvFileBase = {
   /**
-   * Resource identity. Semantics depend on `kind`:
-   *  - `skill`: skill `_id` (sessionKey-meaningful, cross-user shared).
-   *  - `agent`: agent id (sessionKey-meaningful, cross-user shared).
-   *  - `user`: informational only — codeapi derives sessionKey from
-   *    the auth-context user. Kept on the type for shape uniformity;
-   *    do not rely on it for routing.
+   * **Storage file id** — the per-file uuid the file_server returns
+   * at upload time. Identifies the bytes at
+   * `<storage_session_id>/<id>` in the object bucket; used by the
+   * worker to fetch the file and by codeapi's auth layer for the
+   * upload-existence check.
+   *
+   * Distinct from `resource_id` below — that's the entity that owns
+   * this file's storage session (skill `_id`, agent id, etc.), used
+   * for sessionKey resolution. Conflating the two caused
+   * shared-kind authorization to fail because the sessionKey
+   * re-derivation used the storage nanoid where the resource id was
+   * required. See codeapi #1455 review.
    */
   id: string;
+  /**
+   * **Resource id** — the entity that owns this file's storage
+   * session. Skill `_id` for `kind: 'skill'`, agent id for `'agent'`,
+   * informational only for `'user'` (codeapi resolves user identity
+   * from auth context). Kept on the type for shape uniformity across
+   * kinds.
+   *
+   * Drives codeapi's `resolveSessionKey` switch — the sessionKey
+   * embeds this value (`<tenant>:<kind>:<resource_id>[:v:<version>]`)
+   * so cross-user-within-tenant sharing for shared kinds is a
+   * designed property of the kind switch.
+   */
+  resource_id: string;
   name: string;
   /**
    * Storage session — the long-lived bucket where this file's bytes
@@ -204,12 +223,17 @@ export type CodeExecutionToolParams =
 
 export type FileRef = {
   /**
-   * Resource identity. Semantics depend on `kind` (when present):
-   *  - `skill` / `agent`: shared resource id (sessionKey-meaningful).
-   *  - `user`: informational only — codeapi derives sessionKey from
-   *    the auth-context user. Do not rely on it for routing.
+   * Storage file id (the per-file uuid). See `CodeEnvFile.id` for
+   * the full motivation behind the storage-vs-resource split.
    */
   id: string;
+  /**
+   * Resource id — the entity that owns this file's storage session.
+   * Optional on `FileRef` (post-execute artifact refs may not carry
+   * resource provenance for outputs); required on `CodeEnvFile`
+   * (the input wire shape).
+   */
+  resource_id?: string;
   name: string;
   path?: string;
   /**

@@ -194,6 +194,11 @@ function createCodeExecutionTool(
                  * to the user; tag them user-private. */
                 kind: 'user' as const,
                 id,
+                /* `resource_id` is informational for `kind: 'user'`
+                 * (codeapi derives sessionKey from auth context); use
+                 * the same value as `id` since the `/files` fallback
+                 * doesn't carry separate provenance. */
+                resource_id: id,
                 name: file.metadata['original-filename'],
               };
             });
