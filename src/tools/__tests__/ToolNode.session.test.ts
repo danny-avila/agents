@@ -512,6 +512,188 @@ describe('ToolNode code execution session management', () => {
       expect(chartFile!.storage_session_id).toBe('new-sess');
     });
 
+    it('preserves prior kind/resource_id/version when worker echoes inherited file (skill 403 regression)', () => {
+      /**
+       * Regression for the codeapi `session_key_mismatch` 403 that
+       * fires on the second `/exec` after a successful skill prime.
+       *
+       * Worker `inherited: true` echoes carry only
+       * `(id, name, storage_session_id)` — the sandbox doesn't know
+       * the resource identity (`kind`, `resource_id`, `version`),
+       * which was signed at upload time. If `updateCodeSession`
+       * replaces the prior entry verbatim from the echo, the next
+       * `_injected_files` derivation reads `kind: undefined` and
+       * `toInjectedFileRef` falls back to `kind: 'user'` +
+       * `resource_id: file.id`. Codeapi then resolves
+       * `legacy:user:<authContext.userId>`, which doesn't match the
+       * cached `legacy:skill:<skillId>:v:<v>` set at upload, and
+       * authorization 403s.
+       *
+       * The merge must overlay the echo onto the prior entry by
+       * `(storage_session_id, id)` so identity survives.
+       */
+      const SKILL_ID = '69dcf561f37f717858d4d072';
+      const SKILL_VERSION = 59;
+      const STORAGE_SESSION = 'p28pbmz0ejTZ8MMEkObN8';
+      const FILE_ID = 'JqnzC4f6gpirzW0yq_obR';
+
+      const sessions: t.ToolSessionMap = new Map();
+      sessions.set(Constants.EXECUTE_CODE, {
+        session_id: STORAGE_SESSION,
+        files: [
+          {
+            id: FILE_ID,
+            resource_id: SKILL_ID,
+            name: 'pptx/editing.md',
+            storage_session_id: STORAGE_SESSION,
+            kind: 'skill',
+            version: SKILL_VERSION,
+          },
+        ],
+        lastUpdated: Date.now(),
+      } satisfies t.CodeSessionContext);
+
+      const mockTool = createMockCodeTool({ capturedConfigs: [] });
+      const toolNode = new ToolNode({
+        tools: [mockTool],
+        sessions,
+        eventDrivenMode: true,
+      });
+
+      const storeMethod = (
+        toolNode as unknown as {
+          storeCodeSessionFromResults: (
+            results: t.ToolExecuteResult[],
+            requestMap: Map<string, t.ToolCallRequest>
+          ) => void;
+        }
+      ).storeCodeSessionFromResults.bind(toolNode);
+
+      /* Worker echo shape — exactly what codeapi sends on
+       * `inherited: true` files. No kind, no resource_id, no version. */
+      storeMethod(
+        [
+          {
+            toolCallId: 'tc-skill-rerun',
+            content: 'output',
+            artifact: {
+              session_id: 'exec-sess-2',
+              files: [
+                {
+                  id: FILE_ID,
+                  name: 'pptx/editing.md',
+                  storage_session_id: STORAGE_SESSION,
+                  inherited: true,
+                } as unknown as t.FileRefs[number],
+              ],
+            },
+            status: 'success',
+          },
+        ],
+        new Map([
+          [
+            'tc-skill-rerun',
+            { id: 'tc-skill-rerun', name: Constants.EXECUTE_CODE, args: {} },
+          ],
+        ])
+      );
+
+      const stored = sessions.get(
+        Constants.EXECUTE_CODE
+      ) as t.CodeSessionContext;
+      const merged = stored.files!.find((f) => f.id === FILE_ID);
+      expect(merged).toBeDefined();
+      /* Identity preserved from prior entry: */
+      expect(merged!.kind).toBe('skill');
+      expect(merged!.resource_id).toBe(SKILL_ID);
+      expect((merged as { version?: number }).version).toBe(SKILL_VERSION);
+      /* Echo-owned fields propagated: */
+      expect((merged as { inherited?: boolean }).inherited).toBe(true);
+    });
+
+    it('uses fresh kind defaults for genuinely new files (no prior entry to merge from)', () => {
+      /**
+       * The merge keys on `(storage_session_id, id)`, not `name`.
+       * A file the worker emits for the first time (typical
+       * code-output / generated artifact) has no prior to inherit
+       * identity from — it lands as `kind: 'user'` via the standard
+       * fallback in `toInjectedFileRef`. Locks the contract that
+       * the merge doesn't accidentally re-tag user output as skill.
+       */
+      const sessions: t.ToolSessionMap = new Map();
+      sessions.set(Constants.EXECUTE_CODE, {
+        session_id: 'old-sess',
+        files: [
+          {
+            id: 'skill-f1',
+            resource_id: 'skill-id-1',
+            name: 'pptx/editing.md',
+            storage_session_id: 'skill-storage',
+            kind: 'skill',
+            version: 7,
+          },
+        ],
+        lastUpdated: Date.now(),
+      } satisfies t.CodeSessionContext);
+
+      const mockTool = createMockCodeTool({ capturedConfigs: [] });
+      const toolNode = new ToolNode({
+        tools: [mockTool],
+        sessions,
+        eventDrivenMode: true,
+      });
+
+      const storeMethod = (
+        toolNode as unknown as {
+          storeCodeSessionFromResults: (
+            results: t.ToolExecuteResult[],
+            requestMap: Map<string, t.ToolCallRequest>
+          ) => void;
+        }
+      ).storeCodeSessionFromResults.bind(toolNode);
+
+      storeMethod(
+        [
+          {
+            toolCallId: 'tc-output',
+            content: 'output',
+            artifact: {
+              session_id: 'output-sess',
+              files: [
+                {
+                  id: 'fresh-output-id',
+                  name: 'generated-chart.png',
+                  storage_session_id: 'output-sess',
+                } as unknown as t.FileRefs[number],
+              ],
+            },
+            status: 'success',
+          },
+        ],
+        new Map([
+          [
+            'tc-output',
+            { id: 'tc-output', name: Constants.EXECUTE_CODE, args: {} },
+          ],
+        ])
+      );
+
+      const stored = sessions.get(
+        Constants.EXECUTE_CODE
+      ) as t.CodeSessionContext;
+      const fresh = stored.files!.find((f) => f.id === 'fresh-output-id');
+      expect(fresh).toBeDefined();
+      /* No prior to inherit from — kind/resource_id/version absent
+       * on the entry; toInjectedFileRef will default kind to 'user'
+       * downstream. */
+      expect(fresh!.kind).toBeUndefined();
+      expect(fresh!.resource_id).toBeUndefined();
+      expect((fresh as { version?: number }).version).toBeUndefined();
+      /* Skill file untouched. */
+      const skillFile = stored.files!.find((f) => f.id === 'skill-f1');
+      expect(skillFile!.kind).toBe('skill');
+    });
+
     it('preserves existing files when new execution has no files', () => {
       const sessions: t.ToolSessionMap = new Map();
       sessions.set(Constants.EXECUTE_CODE, {

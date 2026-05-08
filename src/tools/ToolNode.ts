@@ -313,6 +313,21 @@ function toInjectedFileRef(
   return { ...base, kind: 'user' };
 }
 
+/**
+ * Stable identity key for a file ref: `(storage_session_id, id)`. Two
+ * files with the same `name` but different storage uuids are distinct
+ * (e.g. user re-uploaded `data.csv` after a fresh exec session). Used
+ * by the merge below to find the prior entry whose resource identity
+ * (`kind`, `resource_id`, `version`) must survive a worker echo that
+ * doesn't carry those fields.
+ */
+function fileIdentityKey(file: {
+  storage_session_id?: string;
+  id: string;
+}): string {
+  return `${file.storage_session_id ?? ''}\0${file.id}`;
+}
+
 function updateCodeSession(
   sessions: t.ToolSessionMap,
   execSessionId: string,
@@ -325,10 +340,41 @@ function updateCodeSession(
   const existingFiles = existingSession?.files ?? [];
 
   if (newFiles.length > 0) {
-    const filesWithSession: t.FileRefs = newFiles.map((file) => ({
-      ...file,
-      storage_session_id: file.storage_session_id ?? execSessionId,
-    }));
+    /**
+     * Worker `inherited: true` echoes carry only `(id, name,
+     * storage_session_id)` — they intentionally don't re-attest to
+     * the ownership identity (`kind`, `resource_id`, `version`)
+     * because the sandbox doesn't know it; that's signed at upload.
+     * Without this preservation, the next `_injected_files` derived
+     * from `CodeSessionContext.files` flips skill / agent files to
+     * `kind: 'user'` (toInjectedFileRef defaults), and codeapi 403s
+     * on `session_key_mismatch` because the cached sessionKey is
+     * `legacy:skill:<id>:v:<v>` but the request resolves
+     * `legacy:user:<authContext.userId>`.
+     *
+     * Merge by `(storage_session_id, id)` so the echo overlays only
+     * the fields it actually owns (the inherited flag, normalized
+     * name, etc.) and prior identity survives.
+     */
+    const existingByIdentity = new Map<string, t.FileRefs[number]>();
+    for (const f of existingFiles) {
+      existingByIdentity.set(fileIdentityKey(f), f);
+    }
+
+    const filesWithSession: t.FileRefs = newFiles.map((file) => {
+      const withSession = {
+        ...file,
+        storage_session_id: file.storage_session_id ?? execSessionId,
+      };
+      const prior = existingByIdentity.get(fileIdentityKey(withSession));
+      if (prior) {
+        /* prior first so its identity fields are defaults; new last
+         * so the echo can override anything it does carry (e.g. an
+         * updated `name` or future-proofed `kind` re-attestation). */
+        return { ...prior, ...withSession };
+      }
+      return withSession;
+    });
     const newFileNames = new Set(filesWithSession.map((f) => f.name));
     const filteredExisting = existingFiles.filter(
       (f) => !newFileNames.has(f.name)
