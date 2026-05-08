@@ -579,6 +579,7 @@ export class AgentContext {
 
     if (!stableInstructions && !dynamicInstructions && !hasMidRunSummary) {
       this.systemMessageTokens = 0;
+      this.dynamicInstructionTokens = 0;
       return undefined;
     }
 

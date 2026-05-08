@@ -682,6 +682,32 @@ describe('AgentContext', () => {
       );
     });
 
+    it('clears OpenRouter dynamic instruction tokens when no prompt remains', () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.OPENROUTER,
+          clientOptions: {
+            model: 'anthropic/claude-haiku-4.5',
+            promptCache: true,
+          },
+          instructions: undefined,
+        },
+        tokenCounter: mockTokenCounter,
+      });
+
+      ctx.setInitialSummary('Volatile summary', 8);
+      ctx.initializeSystemRunnable();
+      expect(ctx.dynamicInstructionTokens).toBeGreaterThan(0);
+
+      ctx.clearSummary();
+      ctx.initializeSystemRunnable();
+
+      expect(ctx.systemRunnable).toBeUndefined();
+      expect(ctx.systemMessageTokens).toBe(0);
+      expect(ctx.dynamicInstructionTokens).toBe(0);
+      expect(ctx.instructionTokens).toBe(0);
+    });
+
     it('excludes programmatic-only toolDefinitions from toolSchemaTokens', async () => {
       // getEventDrivenToolsForBinding excludes definitions whose
       // allowed_callers omit 'direct'. Accounting must mirror that — a
