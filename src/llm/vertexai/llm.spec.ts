@@ -76,6 +76,24 @@ describe.each(gemini3Models)(
         (reasoningTokens as Record<string, number>)?.reasoning
       ).toBeGreaterThan(0);
     });
+
+    test('stream: usage_metadata includes reasoning in output_tokens (issue LibreChat#13006)', async () => {
+      let finalChunk: AIMessageChunk | undefined;
+      for await (const chunk of await model.stream(
+        'What is 2+2? Think step by step.'
+      )) {
+        finalChunk = finalChunk ? finalChunk.concat(chunk) : chunk;
+      }
+      const usage = finalChunk?.usage_metadata;
+      expect(usage).toBeDefined();
+      const reasoning = (
+        usage as { output_token_details?: { reasoning?: number } }
+      )?.output_token_details?.reasoning;
+      expect(reasoning).toBeGreaterThan(0);
+      expect(usage!.total_tokens).toBe(
+        usage!.input_tokens + usage!.output_tokens
+      );
+    });
   }
 );
 
