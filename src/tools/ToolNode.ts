@@ -585,10 +585,19 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     return this.fileCheckpointer;
   }
 
-  private getRegisteredHandoffNames(): Iterable<string> {
-    return this.directToolNames != null && this.directToolNames.size > 0
-      ? this.directToolNames
-      : this.toolMap.keys();
+  private *getRegisteredHandoffNames(): IterableIterator<string> {
+    if (this.directToolNames != null) {
+      for (const toolName of this.directToolNames) {
+        yield toolName;
+      }
+    }
+
+    for (const toolName of this.toolMap.keys()) {
+      if (this.directToolNames?.has(toolName) === true) {
+        continue;
+      }
+      yield toolName;
+    }
   }
 
   private hasRegisteredHandoffTool(): boolean {

@@ -1,11 +1,12 @@
 // src/specs/agent-handoffs.test.ts
 import { DynamicStructuredTool } from '@langchain/core/tools';
-import { HumanMessage, ToolMessage } from '@langchain/core/messages';
+import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type * as t from '@/types';
 import { Providers, GraphEvents, Constants } from '@/common';
 import { StandardGraph } from '@/graphs/Graph';
+import { ToolNode } from '@/tools/ToolNode';
 import { Run } from '@/run';
 
 /**
@@ -1041,6 +1042,38 @@ describe('Agent Handoffs Tests', () => {
         .filter((msg) => msg.getType() === 'tool') as ToolMessage[];
       const wrongNameMessage = toolMessages.find(
         (msg) => msg.name === wrongName
+      );
+
+      expect(wrongNameMessage).toBeDefined();
+      expect(wrongNameMessage?.status).toBe('error');
+      expect(wrongNameMessage?.content).toContain(
+        `Did you mean "${correctName}"`
+      );
+    });
+
+    it('should include toolMap handoffs when direct tool names are present', async () => {
+      const correctName = `${Constants.LC_TRANSFER_TO_}data_analyst`;
+      const wrongName = `${correctName}_analyst`;
+      const handoffTool = new DynamicStructuredTool({
+        name: correctName,
+        description: 'Transfer to data analyst',
+        schema: { type: 'object', properties: {}, required: [] },
+        func: async (): Promise<string> => 'transferred',
+      }) as t.GenericTool;
+      const node = new ToolNode({
+        tools: [handoffTool],
+        directToolNames: new Set(['execute_code']),
+      });
+      const result = (await node.invoke({
+        messages: [
+          new AIMessage({
+            content: '',
+            tool_calls: [{ id: 'wrong_handoff', name: wrongName, args: {} }],
+          }),
+        ],
+      })) as { messages: ToolMessage[] };
+      const wrongNameMessage = result.messages.find(
+        (msg) => msg.tool_call_id === 'wrong_handoff'
       );
 
       expect(wrongNameMessage).toBeDefined();
