@@ -5,11 +5,7 @@ import { HttpsProxyAgent } from 'https-proxy-agent';
 import { tool, DynamicStructuredTool } from '@langchain/core/tools';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
-import {
-  emptyOutputMessage,
-  getCodeBaseURL,
-  renderExecutionFileSummary,
-} from './CodeExecutor';
+import { emptyOutputMessage, getCodeBaseURL } from './CodeExecutor';
 import { Constants } from '@/common';
 
 config();
@@ -532,6 +528,11 @@ export async function executeTools(
 
 /**
  * Formats the completed response for the agent.
+ *
+ * Output is stdout/stderr only — see `CodeExecutor.ts`. The
+ * artifact still carries every file so the host's session map
+ * stays in sync; the LLM doesn't see them in the tool result text.
+ *
  * @param response - The completed API response
  * @returns Tuple of [formatted string, artifact]
  */
@@ -549,8 +550,6 @@ export function formatCompletedResponse(
   if (response.stderr != null && response.stderr !== '') {
     formatted += `stderr:\n${response.stderr}\n`;
   }
-
-  formatted += renderExecutionFileSummary(response.files);
 
   return [
     formatted.trim(),

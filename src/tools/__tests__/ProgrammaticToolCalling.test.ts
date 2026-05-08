@@ -626,7 +626,13 @@ for member in team:
       expect(output).toContain('stderr:\nWarning: deprecated function');
     });
 
-    it('formats file information correctly', () => {
+    it('preserves files on the artifact but omits them from the LLM-facing output', () => {
+      /* The post-execution file summary was removed because it
+       * misled the model more than it helped — especially with
+       * bash, where models naturally `ls /mnt/data/` to discover
+       * available files. The artifact still carries every file
+       * so the host's session-tracking layer stays in sync;
+       * the LLM just doesn't see the prescriptive listing. */
       const response: t.ProgrammaticExecutionResponse = {
         status: 'completed',
         stdout: 'Generated report\n',
@@ -634,95 +640,26 @@ for member in team:
         files: [
           { id: '1', name: 'report.pdf' },
           { id: '2', name: 'data.csv' },
+          { id: 'i1', name: 'pptx/SKILL.md', inherited: true },
         ],
         session_id: 'sess_abc123',
       };
 
       const [output, artifact] = formatCompletedResponse(response);
 
-      expect(output).toContain('Generated files:');
-      expect(output).toContain('report.pdf');
-      expect(output).toContain('data.csv');
-      expect(artifact.files).toHaveLength(2);
-      expect(artifact.files).toEqual(response.files);
-    });
-
-    it('handles image files with special message', () => {
-      const response: t.ProgrammaticExecutionResponse = {
-        status: 'completed',
-        stdout: '',
-        stderr: '',
-        files: [
-          { id: '1', name: 'chart.png' },
-          { id: '2', name: 'photo.jpg' },
-        ],
-        session_id: 'sess_abc123',
-      };
-
-      const [output] = formatCompletedResponse(response);
-
-      expect(output).toContain('chart.png');
-      expect(output).toContain('Image is already displayed to the user');
-    });
-
-    it('splits inherited inputs from generated outputs into distinct sections', () => {
-      const response: t.ProgrammaticExecutionResponse = {
-        status: 'completed',
-        stdout: 'analysis done\n',
-        stderr: '',
-        files: [
-          { id: 'g1', name: 'report.pdf' },
-          { id: 'i1', name: 'pptx/SKILL.md', inherited: true },
-          { id: 'i2', name: 'pptx/scripts/clean.py', inherited: true },
-          { id: 'g2', name: 'chart.png' },
-        ],
-        session_id: 'sess_abc123',
-      };
-
-      const [output, artifact] = formatCompletedResponse(response);
-
-      /* Generated section lists only outputs the run produced. */
-      const generatedIdx = output.indexOf('Generated files:');
-      const inheritedIdx = output.indexOf('Available files (inputs');
-      expect(generatedIdx).toBeGreaterThan(-1);
-      expect(inheritedIdx).toBeGreaterThan(generatedIdx);
-
-      /* Slice each section so we can assert membership without
-       * cross-talk between the two listings. */
-      const generatedSection = output.slice(generatedIdx, inheritedIdx);
-      const inheritedSection = output.slice(inheritedIdx);
-
-      expect(generatedSection).toContain('report.pdf');
-      expect(generatedSection).toContain('chart.png');
-      expect(generatedSection).not.toContain('SKILL.md');
-
-      expect(inheritedSection).toContain('pptx/SKILL.md');
-      expect(inheritedSection).toContain('pptx/scripts/clean.py');
-      expect(inheritedSection).toContain('Available as an input');
-
-      /* The artifact still carries every file so the host can still
-       * thread per-file ids through to subsequent calls. */
-      expect(artifact.files).toHaveLength(4);
-    });
-
-    it('omits the Generated files header when every entry is inherited', () => {
-      const response: t.ProgrammaticExecutionResponse = {
-        status: 'completed',
-        stdout: 'cat: ok\n',
-        stderr: '',
-        files: [
-          { id: 'i1', name: 'pptx/SKILL.md', inherited: true },
-          { id: 'i2', name: 'pptx/editing.md', inherited: true },
-        ],
-        session_id: 'sess_abc123',
-      };
-
-      const [output] = formatCompletedResponse(response);
-
+      /* Tool result text is stdout/stderr only. */
+      expect(output).toContain('stdout:\nGenerated report');
       expect(output).not.toContain('Generated files:');
-      expect(output).toContain('Available files (inputs');
-      expect(output).toContain('pptx/SKILL.md');
-      expect(output).toContain('pptx/editing.md');
+      expect(output).not.toContain('Available files');
+      expect(output).not.toContain('report.pdf');
+      expect(output).not.toContain('SKILL.md');
+      expect(output).not.toContain('Image is already displayed');
+      expect(output).not.toContain('Available as an input');
+
+      /* Host-facing artifact still has every file with its
+       * `inherited` flag intact for session-context merging. */
+      expect(artifact.files).toHaveLength(3);
+      expect(artifact.files).toEqual(response.files);
     });
   });
 
@@ -922,7 +859,11 @@ for member in team:
       });
     });
 
-    it('formats response with files', () => {
+    it('passes files through on the artifact, never on the LLM-facing output', () => {
+      /* Output stays stdout/stderr-only regardless of file count or
+       * filename shape. The artifact is the sole sink for file refs;
+       * hosts thread them into `_injected_files` on subsequent
+       * tool calls via `storeCodeSessionFromResults`. */
       const response: t.ProgrammaticExecutionResponse = {
         status: 'completed',
         stdout: 'Report generated\n',
@@ -930,61 +871,21 @@ for member in team:
         files: [
           { id: '1', name: 'report.csv' },
           { id: '2', name: 'chart.png' },
-        ],
-        session_id: 'sess_xyz',
-      };
-
-      const [output, artifact] = formatCompletedResponse(response);
-
-      expect(output).toContain('Generated files:');
-      expect(output).toContain('report.csv');
-      expect(output).toContain('chart.png');
-      expect(output).toContain('File is already downloaded');
-      expect(output).toContain('Image is already displayed');
-      expect(artifact.files).toHaveLength(2);
-    });
-
-    it('handles multiple files with correct separators', () => {
-      const response: t.ProgrammaticExecutionResponse = {
-        status: 'completed',
-        stdout: 'Done\n',
-        stderr: '',
-        files: [
-          { id: '1', name: 'file1.txt' },
-          { id: '2', name: 'file2.txt' },
-        ],
-        session_id: 'sess_xyz',
-      };
-
-      const [output] = formatCompletedResponse(response);
-
-      // 2 files format: "- /mnt/data/file1.txt | ..., - /mnt/data/file2.txt | ..."
-      expect(output).toContain('file1.txt');
-      expect(output).toContain('file2.txt');
-      expect(output).toContain('- /mnt/data/file1.txt');
-      expect(output).toContain('- /mnt/data/file2.txt');
-    });
-
-    it('handles many files with newline separators', () => {
-      const response: t.ProgrammaticExecutionResponse = {
-        status: 'completed',
-        stdout: 'Done\n',
-        stderr: '',
-        files: [
-          { id: '1', name: 'file1.txt' },
-          { id: '2', name: 'file2.txt' },
           { id: '3', name: 'file3.txt' },
           { id: '4', name: 'file4.txt' },
         ],
         session_id: 'sess_xyz',
       };
 
-      const [output] = formatCompletedResponse(response);
+      const [output, artifact] = formatCompletedResponse(response);
 
-      // More than 3 files should use newline separators
-      expect(output).toContain('file1.txt');
-      expect(output).toContain('file4.txt');
-      expect(output.match(/,\n/g)?.length).toBeGreaterThanOrEqual(2);
+      expect(output).toBe('stdout:\nReport generated');
+      expect(output).not.toContain('report.csv');
+      expect(output).not.toContain('chart.png');
+      expect(output).not.toContain('/mnt/data/');
+
+      expect(artifact.files).toHaveLength(4);
+      expect(artifact.files).toEqual(response.files);
     });
   });
 

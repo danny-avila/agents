@@ -3,11 +3,7 @@ import fetch, { RequestInit } from 'node-fetch';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { tool, DynamicStructuredTool } from '@langchain/core/tools';
 import type * as t from '@/types';
-import {
-  emptyOutputMessage,
-  getCodeBaseURL,
-  renderExecutionFileSummary,
-} from './CodeExecutor';
+import { emptyOutputMessage, getCodeBaseURL } from './CodeExecutor';
 import { Constants } from '@/common';
 
 config();
@@ -159,6 +155,11 @@ function createBashExecutionTool(
         }
 
         const result: t.ExecuteResult = await response.json();
+        /* See `CodeExecutor.ts` — file listings were removed from the
+         * LLM-facing tool result. Bash especially benefits: models
+         * naturally `ls /mnt/data/` to discover what's available
+         * rather than relying on a prescriptive summary that
+         * misleads as often as it helps. */
         let formattedOutput = '';
         if (result.stdout) {
           formattedOutput += `stdout:\n${result.stdout}\n`;
@@ -166,7 +167,6 @@ function createBashExecutionTool(
           formattedOutput += emptyOutputMessage;
         }
         if (result.stderr) formattedOutput += `stderr:\n${result.stderr}\n`;
-        formattedOutput += renderExecutionFileSummary(result.files);
 
         const hasFiles = result.files != null && result.files.length > 0;
         return [
