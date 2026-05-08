@@ -229,6 +229,52 @@ describe('AgentContext', () => {
       expect(result[3].content).toBe('Second');
     });
 
+    it('keeps dynamic-only OpenRouter instructions as system text', async () => {
+      const tokenCounter = (msg: { content: unknown }): number => {
+        const content =
+          typeof msg.content === 'string'
+            ? msg.content
+            : JSON.stringify(msg.content);
+        return content.length;
+      };
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.OPENROUTER,
+          clientOptions: {
+            model: 'anthropic/claude-haiku-4.5',
+            promptCache: true,
+          },
+          instructions: undefined,
+          additional_instructions: 'Dynamic only',
+        },
+        tokenCounter,
+      });
+
+      ctx.initializeSystemRunnable();
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('First'),
+        new HumanMessage('Second'),
+      ]);
+      const firstContent = result[1].content as TestSystemContentBlock[];
+      const secondContent = result[2].content as TestSystemContentBlock[];
+
+      expect(result).toHaveLength(3);
+      expect(result[0].content).toBe('Dynamic only');
+      expect(firstContent[0]).toMatchObject({
+        type: 'text',
+        text: 'First',
+        cache_control: { type: 'ephemeral' },
+      });
+      expect(secondContent[0]).toMatchObject({
+        type: 'text',
+        text: 'Second',
+        cache_control: { type: 'ephemeral' },
+      });
+      expect(ctx.systemMessageTokens).toBeGreaterThan(0);
+      expect(ctx.dynamicInstructionTokens).toBe(0);
+      expect(ctx.instructionTokens).toBe(ctx.systemMessageTokens);
+    });
+
     it('does not cache OpenRouter body messages after dynamic instructions', async () => {
       const ctx = createBasicContext({
         agentConfig: {
@@ -690,7 +736,7 @@ describe('AgentContext', () => {
             model: 'anthropic/claude-haiku-4.5',
             promptCache: true,
           },
-          instructions: undefined,
+          instructions: 'Stable instructions',
         },
         tokenCounter: mockTokenCounter,
       });
@@ -699,6 +745,7 @@ describe('AgentContext', () => {
       ctx.initializeSystemRunnable();
       expect(ctx.dynamicInstructionTokens).toBeGreaterThan(0);
 
+      ctx.instructions = undefined;
       ctx.clearSummary();
       ctx.initializeSystemRunnable();
 

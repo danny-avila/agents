@@ -584,6 +584,10 @@ export class AgentContext {
     }
 
     const promptCacheProvider = this.getPromptCacheProvider();
+    const shouldMoveOpenRouterDynamicInstructions =
+      promptCacheProvider === Providers.OPENROUTER &&
+      stableInstructions !== '' &&
+      dynamicInstructions !== '';
     const systemMessage = this.buildSystemMessage({
       stableInstructions,
       dynamicInstructions,
@@ -595,7 +599,7 @@ export class AgentContext {
         ? this.tokenCounter(systemMessage)
         : 0;
       this.dynamicInstructionTokens =
-        promptCacheProvider === Providers.OPENROUTER && dynamicInstructions
+        shouldMoveOpenRouterDynamicInstructions
           ? this.tokenCounter(new HumanMessage(dynamicInstructions))
           : 0;
     }
@@ -643,11 +647,11 @@ export class AgentContext {
 
       const hasOpenRouterDynamicTail =
         promptCacheProvider === Providers.OPENROUTER &&
-        (dynamicInstructions !== '' || hasSummaryBody);
+        (shouldMoveOpenRouterDynamicInstructions || hasSummaryBody);
 
       if (
         promptCacheProvider === Providers.OPENROUTER &&
-        dynamicInstructions !== ''
+        shouldMoveOpenRouterDynamicInstructions
       ) {
         dynamicTail.unshift(new HumanMessage(dynamicInstructions));
       }
@@ -735,7 +739,7 @@ export class AgentContext {
 
     if (promptCacheProvider === Providers.OPENROUTER) {
       if (!stableInstructions) {
-        return undefined;
+        return new SystemMessage(dynamicInstructions);
       }
 
       return new SystemMessage({
