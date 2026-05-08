@@ -119,20 +119,31 @@ export class ChatOpenRouter extends ChatOpenAI {
     const { reasoning: mkReasoning, ...restModelKwargs } = modelKwargs as {
       reasoning?: OpenRouterReasoning;
     } & Record<string, unknown>;
+    const mergedReasoning =
+      mkReasoning != null || openRouterReasoning != null
+        ? {
+          ...mkReasoning,
+          ...openRouterReasoning,
+        }
+        : undefined;
+    const runtimeReasoning =
+      mergedReasoning ??
+      (include_reasoning === true ? { enabled: true } : undefined);
+    const parentModelKwargs =
+      runtimeReasoning == null
+        ? restModelKwargs
+        : { ...restModelKwargs, reasoning: runtimeReasoning };
 
     super({
       ...fields,
-      modelKwargs: restModelKwargs,
+      modelKwargs: parentModelKwargs,
       includeReasoningDetails: true,
       convertReasoningDetailsToContent: true,
     });
 
     // Merge reasoning config: modelKwargs.reasoning < constructor reasoning
-    if (mkReasoning != null || openRouterReasoning != null) {
-      this.openRouterReasoning = {
-        ...mkReasoning,
-        ...openRouterReasoning,
-      };
+    if (mergedReasoning != null) {
+      this.openRouterReasoning = mergedReasoning;
     }
 
     this.includeReasoning = include_reasoning;

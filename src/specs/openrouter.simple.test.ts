@@ -21,6 +21,11 @@ const hasOpenRouter = (process.env.OPENROUTER_API_KEY ?? '').trim() !== '';
 const describeIf = hasOpenRouter ? describe : describe.skip;
 
 const provider = Providers.OPENROUTER;
+const LIVE_MAX_TOKENS = 4096;
+const GEMINI_REASONING_MODEL = 'google/gemini-3.1-pro-preview';
+const ANTHROPIC_REASONING_MODEL = 'anthropic/claude-sonnet-4';
+const ANTHROPIC_LATEST_REASONING_MODEL = 'anthropic/claude-sonnet-4.6';
+
 describeIf(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
   jest.setTimeout(60000);
   let run: Run<t.IState>;
@@ -75,6 +80,7 @@ describeIf(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
     const llmConfig = {
       ...baseWithoutReasoning,
       model: opts.model,
+      maxTokens: LIVE_MAX_TOKENS,
       ...(opts.reasoning != null ? { reasoning: opts.reasoning } : {}),
     } as t.LLMConfig;
     const customHandlers = setupCustomHandlers();
@@ -178,7 +184,8 @@ describeIf(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
       baseLLMConfig as unknown as Record<string, unknown>;
     const llmConfig = {
       ...baseWithoutReasoning,
-      model: 'anthropic/claude-sonnet-4',
+      model: ANTHROPIC_REASONING_MODEL,
+      maxTokens: LIVE_MAX_TOKENS,
     } as t.LLMConfig;
     const customHandlers = setupCustomHandlers();
 
@@ -214,7 +221,7 @@ describeIf(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
 
   test(`${capitalizeFirstLetter(provider)}: Gemini 3 reasons by default (no config)`, async () => {
     await runReasoningTest({
-      model: 'google/gemini-3-pro-preview',
+      model: GEMINI_REASONING_MODEL,
       reasoning: undefined,
       threadId: 'or-gemini-default-1',
       runId: 'or-gemini-default-1',
@@ -223,7 +230,7 @@ describeIf(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
 
   test(`${capitalizeFirstLetter(provider)}: Gemini reasoning with max_tokens`, async () => {
     await runReasoningTest({
-      model: 'google/gemini-3-pro-preview',
+      model: GEMINI_REASONING_MODEL,
       reasoning: { max_tokens: 4000 },
       threadId: 'or-gemini-reasoning-1',
       runId: 'or-gemini-reasoning-1',
@@ -232,7 +239,7 @@ describeIf(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
 
   test(`${capitalizeFirstLetter(provider)}: Gemini reasoning with effort`, async () => {
     await runReasoningTest({
-      model: 'google/gemini-3-flash-preview',
+      model: GEMINI_REASONING_MODEL,
       reasoning: { effort: 'low' },
       threadId: 'or-gemini-effort-1',
       runId: 'or-gemini-effort-1',
@@ -241,7 +248,7 @@ describeIf(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
 
   test(`${capitalizeFirstLetter(provider)}: Anthropic reasoning with max_tokens`, async () => {
     await runReasoningTest({
-      model: 'anthropic/claude-sonnet-4',
+      model: ANTHROPIC_REASONING_MODEL,
       reasoning: { max_tokens: 4000 },
       threadId: 'or-anthropic-reasoning-1',
       runId: 'or-anthropic-reasoning-1',
@@ -250,16 +257,16 @@ describeIf(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
 
   test(`${capitalizeFirstLetter(provider)}: Anthropic sonnet-4 reasoning with effort`, async () => {
     await runReasoningTest({
-      model: 'anthropic/claude-sonnet-4',
+      model: ANTHROPIC_REASONING_MODEL,
       reasoning: { effort: 'medium' },
       threadId: 'or-anthropic-effort-s4-1',
       runId: 'or-anthropic-effort-s4-1',
     });
   });
 
-  test(`${capitalizeFirstLetter(provider)}: Anthropic sonnet-4-6 reasoning with effort`, async () => {
+  test(`${capitalizeFirstLetter(provider)}: Anthropic sonnet-4.6 reasoning with effort`, async () => {
     await runReasoningTest({
-      model: 'anthropic/claude-sonnet-4-6',
+      model: ANTHROPIC_LATEST_REASONING_MODEL,
       reasoning: { effort: 'medium' },
       threadId: 'or-anthropic-effort-s46-1',
       runId: 'or-anthropic-effort-s46-1',

@@ -7,6 +7,17 @@ type CreateRouterOptions = Partial<
     Pick<OpenAIChatInput, 'model' | 'apiKey' | 'streamUsage'>
 >;
 
+type RuntimeInvocationParams = {
+  reasoning?: OpenRouterReasoning;
+  reasoning_effort?: string;
+};
+
+class RuntimeInspectableChatOpenRouter extends ChatOpenRouter {
+  getRuntimeInvocationParams(): RuntimeInvocationParams {
+    return this.completions.invocationParams() as RuntimeInvocationParams;
+  }
+}
+
 function createRouter(overrides: CreateRouterOptions = {}): ChatOpenRouter {
   return new ChatOpenRouter({
     model: 'openrouter/test-model',
@@ -88,6 +99,28 @@ describe('ChatOpenRouter reasoning handling', () => {
     it('does NOT include reasoning_effort in params', () => {
       const router = createRouter({ reasoning: { effort: 'high' } });
       const params = router.invocationParams();
+      expect(params.reasoning_effort).toBeUndefined();
+    });
+
+    it('passes reasoning to the runtime completions delegate', () => {
+      const router = new RuntimeInspectableChatOpenRouter({
+        model: 'openrouter/test-model',
+        apiKey: 'test-key',
+        reasoning: { max_tokens: 1024 },
+      });
+      const params = router.getRuntimeInvocationParams();
+      expect(params.reasoning).toEqual({ max_tokens: 1024 });
+      expect(params.reasoning_effort).toBeUndefined();
+    });
+
+    it('passes legacy include_reasoning to the runtime completions delegate', () => {
+      const router = new RuntimeInspectableChatOpenRouter({
+        model: 'openrouter/test-model',
+        apiKey: 'test-key',
+        include_reasoning: true,
+      });
+      const params = router.getRuntimeInvocationParams();
+      expect(params.reasoning).toEqual({ enabled: true });
       expect(params.reasoning_effort).toBeUndefined();
     });
 
