@@ -313,14 +313,8 @@ function toInjectedFileRef(
   return { ...base, kind: 'user' };
 }
 
-/**
- * Stable identity key for a file ref: `(storage_session_id, id)`. Two
- * files with the same `name` but different storage uuids are distinct
- * (e.g. user re-uploaded `data.csv` after a fresh exec session). Used
- * by the merge below to find the prior entry whose resource identity
- * (`kind`, `resource_id`, `version`) must survive a worker echo that
- * doesn't carry those fields.
- */
+/* Stable file identity = `(storage_session_id, id)`. Same name in
+ * different storage sessions are distinct files. */
 function fileIdentityKey(file: {
   storage_session_id?: string;
   id: string;
@@ -339,58 +333,50 @@ function updateCodeSession(
     | undefined;
   const existingFiles = existingSession?.files ?? [];
 
-  if (newFiles.length > 0) {
-    /**
-     * Worker `inherited: true` echoes carry only `(id, name,
-     * storage_session_id)` — they intentionally don't re-attest to
-     * the ownership identity (`kind`, `resource_id`, `version`)
-     * because the sandbox doesn't know it; that's signed at upload.
-     * Without this preservation, the next `_injected_files` derived
-     * from `CodeSessionContext.files` flips skill / agent files to
-     * `kind: 'user'` (toInjectedFileRef defaults), and codeapi 403s
-     * on `session_key_mismatch` because the cached sessionKey is
-     * `legacy:skill:<id>:v:<v>` but the request resolves
-     * `legacy:user:<authContext.userId>`.
-     *
-     * Merge by `(storage_session_id, id)` so the echo overlays only
-     * the fields it actually owns (the inherited flag, normalized
-     * name, etc.) and prior identity survives.
-     */
-    const existingByIdentity = new Map<string, t.FileRefs[number]>();
-    for (const f of existingFiles) {
-      existingByIdentity.set(fileIdentityKey(f), f);
-    }
-
-    const filesWithSession: t.FileRefs = newFiles.map((file) => {
-      const withSession = {
-        ...file,
-        storage_session_id: file.storage_session_id ?? execSessionId,
-      };
-      const prior = existingByIdentity.get(fileIdentityKey(withSession));
-      if (prior) {
-        /* prior first so its identity fields are defaults; new last
-         * so the echo can override anything it does carry (e.g. an
-         * updated `name` or future-proofed `kind` re-attestation). */
-        return { ...prior, ...withSession };
-      }
-      return withSession;
-    });
-    const newFileNames = new Set(filesWithSession.map((f) => f.name));
-    const filteredExisting = existingFiles.filter(
-      (f) => !newFileNames.has(f.name)
-    );
-    sessions.set(Constants.EXECUTE_CODE, {
-      session_id: execSessionId,
-      files: [...filteredExisting, ...filesWithSession],
-      lastUpdated: Date.now(),
-    });
-  } else {
+  if (newFiles.length === 0) {
     sessions.set(Constants.EXECUTE_CODE, {
       session_id: execSessionId,
       files: existingFiles,
       lastUpdated: Date.now(),
     });
+    return;
   }
+
+  /* Worker echoes lack ownership identity (kind/resource_id/version) —
+   * sandbox doesn't re-attest; that's signed at upload. Merge by
+   * (storage_session_id, id) so prior identity survives the echo. */
+  const filesWithSession: t.FileRefs = [];
+  const newFileNames = new Set<string>();
+  const incomingByIdentity = new Map<string, number>();
+  for (const file of newFiles) {
+    const withSession = {
+      ...file,
+      storage_session_id: file.storage_session_id ?? execSessionId,
+    };
+    incomingByIdentity.set(
+      fileIdentityKey(withSession),
+      filesWithSession.length
+    );
+    newFileNames.add(withSession.name);
+    filesWithSession.push(withSession);
+  }
+
+  const filteredExisting: t.FileRefs = [];
+  for (const e of existingFiles) {
+    const idx = incomingByIdentity.get(fileIdentityKey(e));
+    if (idx !== undefined) {
+      filesWithSession[idx] = { ...e, ...filesWithSession[idx] };
+    }
+    if (!newFileNames.has(e.name)) {
+      filteredExisting.push(e);
+    }
+  }
+
+  sessions.set(Constants.EXECUTE_CODE, {
+    session_id: execSessionId,
+    files: [...filteredExisting, ...filesWithSession],
+    lastUpdated: Date.now(),
+  });
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
