@@ -70,6 +70,18 @@ const EXEC_ENDPOINT = `${baseEndpoint}/exec`;
 
 type SupportedLanguage = (typeof SUPPORTED_LANGUAGES)[number];
 
+export async function resolveCodeApiAuthHeaders(
+  authHeaders?: t.CodeApiAuthHeaders
+): Promise<t.CodeApiAuthHeaderMap> {
+  if (authHeaders == null) {
+    return {};
+  }
+  if (typeof authHeaders === 'function') {
+    return authHeaders();
+  }
+  return authHeaders;
+}
+
 export const CodeExecutionToolDescription = `
 Runs code and returns stdout/stderr output from a stateless execution environment, similar to running scripts in a command-line interface. Each execution is isolated and independent.
 
@@ -135,11 +147,15 @@ function createCodeExecutionTool(
       }
 
       try {
+        const authHeaders = await resolveCodeApiAuthHeaders(
+          params.authHeaders
+        );
         const fetchOptions: RequestInit = {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             'User-Agent': 'LibreChat/1.0',
+            ...authHeaders,
           },
           body: JSON.stringify(postData),
         };

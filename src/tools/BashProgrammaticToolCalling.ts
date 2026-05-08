@@ -312,7 +312,8 @@ export function createBashProgrammaticToolCallingTool(
             timeout,
             ...(files && files.length > 0 ? { files } : {}),
           },
-          proxy
+          proxy,
+          initParams.authHeaders
         );
 
         // ====================================================================
@@ -348,7 +349,8 @@ export function createBashProgrammaticToolCallingTool(
               continuation_token: response.continuation_token,
               tool_results: toolResults,
             },
-            proxy
+            proxy,
+            initParams.authHeaders
           );
         }
 

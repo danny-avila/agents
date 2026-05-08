@@ -219,7 +219,15 @@ export type CodeExecutionToolParams =
       session_id?: string;
       user_id?: string;
       files?: CodeEnvFile[];
+      /** Optional host-supplied Code API auth headers. */
+      authHeaders?: CodeApiAuthHeaders;
     };
+
+export type CodeApiAuthHeaderMap = Record<string, string>;
+
+export type CodeApiAuthHeaders =
+  | CodeApiAuthHeaderMap
+  | (() => CodeApiAuthHeaderMap | Promise<CodeApiAuthHeaderMap>);
 
 export type FileRef = {
   /**
@@ -896,6 +904,8 @@ export type ProgrammaticToolCallingParams = {
   proxy?: string;
   /** Enable debug logging (or set PTC_DEBUG=true env var) */
   debug?: boolean;
+  /** Optional host-supplied Code API auth headers. */
+  authHeaders?: CodeApiAuthHeaders;
 };
 
 // ============================================================================

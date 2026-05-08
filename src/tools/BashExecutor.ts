@@ -3,7 +3,11 @@ import fetch, { RequestInit } from 'node-fetch';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { tool, DynamicStructuredTool } from '@langchain/core/tools';
 import type * as t from '@/types';
-import { emptyOutputMessage, getCodeBaseURL } from './CodeExecutor';
+import {
+  emptyOutputMessage,
+  getCodeBaseURL,
+  resolveCodeApiAuthHeaders,
+} from './CodeExecutor';
 import { Constants } from '@/common';
 
 config();
@@ -137,11 +141,15 @@ function createBashExecutionTool(
       }
 
       try {
+        const authHeaders = await resolveCodeApiAuthHeaders(
+          params.authHeaders
+        );
         const fetchOptions: RequestInit = {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             'User-Agent': 'LibreChat/1.0',
+            ...authHeaders,
           },
           body: JSON.stringify(postData),
         };

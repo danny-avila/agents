@@ -5,7 +5,11 @@ import { HttpsProxyAgent } from 'https-proxy-agent';
 import { tool, DynamicStructuredTool } from '@langchain/core/tools';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
-import { emptyOutputMessage, getCodeBaseURL } from './CodeExecutor';
+import {
+  emptyOutputMessage,
+  getCodeBaseURL,
+  resolveCodeApiAuthHeaders,
+} from './CodeExecutor';
 import { Constants } from '@/common';
 
 config();
@@ -256,14 +260,17 @@ export function filterToolsByUsage(
 export async function fetchSessionFiles(
   baseUrl: string,
   sessionId: string,
-  proxy?: string
+  proxy?: string,
+  authHeaders?: t.CodeApiAuthHeaders
 ): Promise<t.CodeEnvFile[]> {
   try {
     const filesEndpoint = `${baseUrl}/files/${sessionId}?detail=full`;
+    const resolvedAuthHeaders = await resolveCodeApiAuthHeaders(authHeaders);
     const fetchOptions: RequestInit = {
       method: 'GET',
       headers: {
         'User-Agent': 'LibreChat/1.0',
+        ...resolvedAuthHeaders,
       },
     };
 
@@ -319,13 +326,16 @@ export async function fetchSessionFiles(
 export async function makeRequest(
   endpoint: string,
   body: Record<string, unknown>,
-  proxy?: string
+  proxy?: string,
+  authHeaders?: t.CodeApiAuthHeaders
 ): Promise<t.ProgrammaticExecutionResponse> {
+  const resolvedAuthHeaders = await resolveCodeApiAuthHeaders(authHeaders);
   const fetchOptions: RequestInit = {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'User-Agent': 'LibreChat/1.0',
+      ...resolvedAuthHeaders,
     },
     body: JSON.stringify(body),
   };
@@ -661,7 +671,8 @@ export function createProgrammaticToolCallingTool(
             timeout,
             ...(files && files.length > 0 ? { files } : {}),
           },
-          proxy
+          proxy,
+          initParams.authHeaders
         );
 
         // ====================================================================
@@ -697,7 +708,8 @@ export function createProgrammaticToolCallingTool(
               continuation_token: response.continuation_token,
               tool_results: toolResults,
             },
-            proxy
+            proxy,
+            initParams.authHeaders
           );
         }
 
