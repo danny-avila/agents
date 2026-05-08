@@ -151,6 +151,10 @@ const PYTHON_KEYWORDS = new Set([
   'yield',
 ]);
 
+export type FetchSessionFilesScope =
+  | { kind: 'skill'; id: string; version: number }
+  | { kind: 'agent' | 'user'; id: string; version?: never };
+
 /**
  * Normalizes a tool name to Python identifier format.
  * Must match the Code API's `normalizePythonFunctionName` exactly:
@@ -254,17 +258,27 @@ export function filterToolsByUsage(
  * Files are returned as CodeEnvFile references to be included in the request.
  * @param baseUrl - The base URL for the Code API
  * @param sessionId - The session ID to fetch files from
+ * @param scope - Resource scope used by CodeAPI to authorize the session
  * @param proxy - Optional HTTP proxy URL
  * @returns Array of CodeEnvFile references, or empty array if fetch fails
  */
 export async function fetchSessionFiles(
   baseUrl: string,
   sessionId: string,
+  scope: FetchSessionFilesScope,
   proxy?: string,
   authHeaders?: t.CodeApiAuthHeaders
 ): Promise<t.CodeEnvFile[]> {
   try {
-    const filesEndpoint = `${baseUrl}/files/${sessionId}?detail=full`;
+    const query = new URLSearchParams({
+      detail: 'full',
+      kind: scope.kind,
+      id: scope.id,
+    });
+    if (scope.kind === 'skill') {
+      query.set('version', String(scope.version));
+    }
+    const filesEndpoint = `${baseUrl}/files/${encodeURIComponent(sessionId)}?${query.toString()}`;
     const resolvedAuthHeaders = await resolveCodeApiAuthHeaders(authHeaders);
     const fetchOptions: RequestInit = {
       method: 'GET',
@@ -289,22 +303,41 @@ export async function fetchSessionFiles(
     }
 
     return files.map((file: Record<string, unknown>) => {
-      // Extract the ID from the file name (part after session ID prefix and before extension)
-      const nameParts = (file.name as string).split('/');
-      const id = nameParts.length > 1 ? nameParts[1].split('.')[0] : '';
+      const metadata = (file.metadata ?? {}) as Record<string, unknown>;
+      const rawName = typeof file.name === 'string' ? file.name : '';
+      const nameParts = rawName.split('/');
+      const fallbackId = nameParts.length > 1 ? nameParts[1].split('.')[0] : '';
+      const id =
+        typeof file.id === 'string' && file.id !== '' ? file.id : fallbackId;
+      const name =
+        typeof metadata['original-filename'] === 'string'
+          ? metadata['original-filename']
+          : rawName;
+      const storage_session_id =
+        typeof file.storage_session_id === 'string'
+          ? file.storage_session_id
+          : sessionId;
+      const resource_id =
+        typeof file.resource_id === 'string' && file.resource_id !== ''
+          ? file.resource_id
+          : scope.id;
 
+      if (scope.kind === 'skill') {
+        return {
+          storage_session_id,
+          kind: 'skill' as const,
+          id,
+          resource_id,
+          name,
+          version: scope.version,
+        };
+      }
       return {
-        storage_session_id: sessionId,
-        /* `/files` fallback returns code-output files belonging to
-         * the user; tag them user-private. */
-        kind: 'user' as const,
+        storage_session_id,
+        kind: scope.kind,
         id,
-        /* `resource_id` informational for `kind: 'user'` —
-         * codeapi derives sessionKey from auth context. */
-        resource_id: id,
-        name: (file.metadata as Record<string, unknown>)[
-          'original-filename'
-        ] as string,
+        resource_id,
+        name,
       };
     });
   } catch (error) {

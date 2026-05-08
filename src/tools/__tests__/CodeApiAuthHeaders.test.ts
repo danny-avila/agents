@@ -9,6 +9,7 @@ import {
 import { createBashExecutionTool } from '../BashExecutor';
 import {
   createProgrammaticToolCallingTool,
+  fetchSessionFiles,
   makeRequest,
 } from '../ProgrammaticToolCalling';
 import { createBashProgrammaticToolCallingTool } from '../BashProgrammaticToolCalling';
@@ -207,6 +208,39 @@ describe('CodeAPI auth header injection', () => {
       expect.objectContaining({
         headers: expect.objectContaining({
           Authorization: 'Bearer bash-ptc-token',
+        }),
+      })
+    );
+  });
+
+  it('fetches session files with the CodeAPI resource scope and auth headers', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse([
+        {
+          id: 'file-1',
+          resource_id: 'skill-1',
+          storage_session_id: 'session_123',
+          name: 'skill/file.txt',
+          kind: 'skill',
+          version: 7,
+        },
+      ])
+    );
+
+    const files = await fetchSessionFiles(
+      'https://code.example.com',
+      'session_123',
+      { kind: 'skill', id: 'skill-1', version: 7 },
+      undefined,
+      { Authorization: 'Bearer files-token' }
+    );
+
+    expect(files).toHaveLength(1);
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://code.example.com/files/session_123?detail=full&kind=skill&id=skill-1&version=7',
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          Authorization: 'Bearer files-token',
         }),
       })
     );
