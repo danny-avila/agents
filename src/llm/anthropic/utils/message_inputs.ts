@@ -3,6 +3,7 @@
 /**
  * This util file contains functions for converting LangChain messages to Anthropic messages.
  */
+import { createHash } from 'node:crypto';
 import {
   type BaseMessage,
   type SystemMessage,
@@ -10,10 +11,8 @@ import {
   type AIMessage,
   type ToolMessage,
   isAIMessage,
+  type Data,
   type StandardContentBlockConverter,
-  type StandardTextBlock,
-  type StandardImageBlock,
-  type StandardFileBlock,
   MessageContentComplex,
   isDataContentBlock,
   convertToProviderContentBlock,
@@ -35,6 +34,21 @@ import {
   AnthropicToolResponse,
 } from '../types';
 import { Constants } from '@/common';
+
+type StandardTextBlock = Data.StandardTextBlock;
+type StandardImageBlock = Data.StandardImageBlock;
+type StandardFileBlock = Data.StandardFileBlock;
+type ImageUrlContentBlock = MessageContentComplex & {
+  image_url: string | { url: string };
+};
+type GoogleFunctionCallBlock = MessageContentComplex & {
+  functionCall: {
+    name: string;
+    args: Record<string, unknown>;
+  };
+};
+
+const ANTHROPIC_EMPTY_TEXT_PLACEHOLDER = '_';
 
 function _formatImage(imageUrl: string) {
   const parsed = parseBase64DataUrl({ dataUrl: imageUrl });
@@ -79,11 +93,54 @@ function _formatImage(imageUrl: string) {
   );
 }
 
+const ANTHROPIC_TOOL_USE_ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
+const ANTHROPIC_TOOL_USE_ID_MAX_LENGTH = 64;
+const ANTHROPIC_TOOL_USE_ID_HASH_LENGTH = 10;
+
+/**
+ * Normalize a tool-call ID to satisfy Anthropic's `^[a-zA-Z0-9_-]+$` and 64-char
+ * constraints. Pure and deterministic — same input always yields the same output,
+ * so paired `tool_use.id` and `tool_result.tool_use_id` stay matched without
+ * needing a session map. IDs that already comply pass through unchanged.
+ *
+ * For non-compliant inputs we sanitize then append a short SHA-256 prefix of
+ * the original ID to preserve uniqueness when truncation would otherwise
+ * collapse distinct IDs to the same value (e.g. two long Responses-style IDs
+ * sharing a 64-char prefix). The hash is computed against the raw input so
+ * inputs that differ only after the truncation cutoff still produce distinct
+ * outputs.
+ */
+export function normalizeAnthropicToolCallId(id: string): string;
+export function normalizeAnthropicToolCallId(
+  id: string | undefined
+): string | undefined;
+export function normalizeAnthropicToolCallId(
+  id: string | undefined
+): string | undefined {
+  if (id == null) {
+    return id;
+  }
+  if (
+    id.length <= ANTHROPIC_TOOL_USE_ID_MAX_LENGTH &&
+    ANTHROPIC_TOOL_USE_ID_PATTERN.test(id)
+  ) {
+    return id;
+  }
+  const sanitized = id.replace(/[^a-zA-Z0-9_-]/g, '_');
+  const hash = createHash('sha256')
+    .update(id)
+    .digest('hex')
+    .slice(0, ANTHROPIC_TOOL_USE_ID_HASH_LENGTH);
+  const prefixMaxLength =
+    ANTHROPIC_TOOL_USE_ID_MAX_LENGTH - ANTHROPIC_TOOL_USE_ID_HASH_LENGTH - 1;
+  return `${sanitized.slice(0, prefixMaxLength)}_${hash}`;
+}
+
 function _ensureMessageContents(
   messages: BaseMessage[]
 ): (SystemMessage | HumanMessage | AIMessage)[] {
   // Merge runs of human/tool messages into single human messages with content blocks.
-  const updatedMsgs = [];
+  const updatedMsgs: BaseMessage[] = [];
   for (const message of messages) {
     if (message._getType() === 'tool') {
       if (typeof message.content === 'string') {
@@ -98,7 +155,9 @@ function _ensureMessageContents(
           (previousMessage.content as MessageContentComplex[]).push({
             type: 'tool_result',
             content: message.content,
-            tool_use_id: (message as ToolMessage).tool_call_id,
+            tool_use_id: normalizeAnthropicToolCallId(
+              (message as ToolMessage).tool_call_id
+            ),
           });
         } else {
           // If not, we create a new human message with the tool result.
@@ -108,23 +167,29 @@ function _ensureMessageContents(
                 {
                   type: 'tool_result',
                   content: message.content,
-                  tool_use_id: (message as ToolMessage).tool_call_id,
+                  tool_use_id: normalizeAnthropicToolCallId(
+                    (message as ToolMessage).tool_call_id
+                  ),
                 },
               ],
             })
           );
         }
       } else {
+        const toolMessageContent = (
+          message as { content?: BaseMessage['content'] | null }
+        ).content;
         updatedMsgs.push(
           new HumanMessage({
             content: [
               {
                 type: 'tool_result',
-                // rare case: message.content could be undefined
-                ...(message.content != null
+                ...(toolMessageContent != null
                   ? { content: _formatContent(message) }
                   : {}),
-                tool_use_id: (message as ToolMessage).tool_call_id,
+                tool_use_id: normalizeAnthropicToolCallId(
+                  (message as ToolMessage).tool_call_id
+                ),
               },
             ],
           })
@@ -134,7 +199,7 @@ function _ensureMessageContents(
       updatedMsgs.push(message);
     }
   }
-  return updatedMsgs;
+  return updatedMsgs as (SystemMessage | HumanMessage | AIMessage)[];
 }
 
 export function _convertLangChainToolCallToAnthropic(
@@ -143,9 +208,12 @@ export function _convertLangChainToolCallToAnthropic(
   if (toolCall.id === undefined) {
     throw new Error('Anthropic requires all tool calls to have an "id".');
   }
+  const isServerTool = toolCall.id.startsWith(
+    Constants.ANTHROPIC_SERVER_TOOL_PREFIX
+  );
   return {
-    type: 'tool_use',
-    id: toolCall.id,
+    type: isServerTool ? 'server_tool_use' : 'tool_use',
+    id: isServerTool ? toolCall.id : normalizeAnthropicToolCallId(toolCall.id),
     name: toolCall.name,
     input: toolCall.args,
   };
@@ -362,12 +430,79 @@ function _formatContent(message: BaseMessage) {
   if (typeof content === 'string') {
     return content;
   } else {
-    const contentBlocks = content.map((contentPart) => {
+    const contentParts = content as MessageContentComplex[];
+    const contentBlocks = contentParts.map((contentPart) => {
       /**
-       * Handle malformed blocks that have server tool fields mixed with text type.
-       * These can occur when server_tool_use blocks get mislabeled during aggregation.
-       * Correct their type ONLY if we can confirm it's a server tool by checking the ID prefix.
-       * Anthropic needs both server_tool_use and web_search_tool_result blocks for citations to work.
+       * Normalize server_tool_use blocks into a clean shape the API accepts.
+       * These blocks may arrive with the correct type (server_tool_use) or mislabeled
+       * as text/tool_use after chunk concatenation or state serialization.
+       * Regardless of current type, if the id starts with 'srvtoolu_' we rebuild
+       * a clean block with only the properties the API expects.
+       */
+      if (
+        'id' in contentPart &&
+        typeof (contentPart as Record<string, unknown>).id === 'string' &&
+        ((contentPart as Record<string, unknown>).id as string).startsWith(
+          Constants.ANTHROPIC_SERVER_TOOL_PREFIX
+        ) &&
+        'name' in contentPart
+      ) {
+        const rawPart = contentPart as Record<string, unknown>;
+        let input = rawPart.input;
+        if (typeof input === 'string') {
+          try {
+            input = JSON.parse(input);
+          } catch {
+            input = {};
+          }
+        }
+        const corrected: AnthropicServerToolUseBlockParam = {
+          type: 'server_tool_use',
+          id: rawPart.id as string,
+          name: (rawPart.name ?? 'web_search') as 'web_search',
+          input: (input ?? {}) as Record<string, unknown>,
+        };
+        return corrected;
+      }
+
+      /**
+       * Normalize web_search_tool_result blocks into a clean shape.
+       * Same rationale as above — the block may carry extra properties from
+       * streaming (input, index, etc.) that the API rejects. Rebuild cleanly.
+       */
+      if (
+        'tool_use_id' in contentPart &&
+        typeof (contentPart as Record<string, unknown>).tool_use_id ===
+          'string' &&
+        (
+          (contentPart as Record<string, unknown>).tool_use_id as string
+        ).startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX) &&
+        'content' in contentPart
+      ) {
+        const rawPart = contentPart as Record<string, unknown>;
+        const content = rawPart.content;
+        const isValidContent =
+          Array.isArray(content) ||
+          (content != null &&
+            typeof content === 'object' &&
+            'type' in content &&
+            (content as Record<string, unknown>).type ===
+              'web_search_tool_result_error');
+
+        if (isValidContent) {
+          const corrected: AnthropicWebSearchToolResultBlockParam = {
+            type: 'web_search_tool_result',
+            tool_use_id: rawPart.tool_use_id as string,
+            content:
+              content as AnthropicWebSearchToolResultBlockParam['content'],
+          };
+          return corrected;
+        }
+        return null;
+      }
+
+      /**
+       * Skip non-server malformed blocks that have tool fields mixed with text type.
        */
       if (
         'id' in contentPart &&
@@ -375,76 +510,13 @@ function _formatContent(message: BaseMessage) {
         'input' in contentPart &&
         contentPart.type === 'text'
       ) {
-        const rawPart = contentPart as Record<string, unknown>;
-        const id = rawPart.id as string;
-
-        if (id && id.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX)) {
-          let input = rawPart.input;
-
-          // Ensure input is an object
-          if (typeof input === 'string') {
-            try {
-              input = JSON.parse(input);
-            } catch {
-              input = {};
-            }
-          }
-
-          const corrected: AnthropicServerToolUseBlockParam = {
-            type: 'server_tool_use',
-            id,
-            name: 'web_search',
-            input: input as Record<string, unknown>,
-          };
-
-          return corrected;
-        }
-
-        // If it's not a server tool, skip it (return null to filter it out)
         return null;
       }
-
-      /**
-       * Handle malformed web_search_tool_result blocks marked as text.
-       * These have tool_use_id and nested content - fix their type instead of filtering.
-       * Only correct if we can confirm it's a web search result by checking the tool_use_id prefix.
-       *
-       * Handles both success results (array content) and error results (object with error_code).
-       */
       if (
         'tool_use_id' in contentPart &&
         'content' in contentPart &&
         contentPart.type === 'text'
       ) {
-        const rawPart = contentPart as Record<string, unknown>;
-        const toolUseId = rawPart.tool_use_id as string;
-        const content = rawPart.content;
-
-        if (
-          toolUseId &&
-          toolUseId.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX)
-        ) {
-          // Verify content is either an array (success) or error object
-          const isValidContent =
-            Array.isArray(content) ||
-            (content != null &&
-              typeof content === 'object' &&
-              'type' in content &&
-              (content as Record<string, unknown>).type ===
-                'web_search_tool_result_error');
-
-          if (isValidContent) {
-            const corrected: AnthropicWebSearchToolResultBlockParam = {
-              type: 'web_search_tool_result',
-              tool_use_id: toolUseId,
-              content:
-                content as AnthropicWebSearchToolResultBlockParam['content'],
-            };
-            return corrected;
-          }
-        }
-
-        // If it's not a recognized server tool result format, skip it (return null to filter it out)
         return null;
       }
 
@@ -460,15 +532,16 @@ function _formatContent(message: BaseMessage) {
 
       if (contentPart.type === 'image_url') {
         let source;
-        if (typeof contentPart.image_url === 'string') {
-          source = _formatImage(contentPart.image_url);
+        const imageUrl = (contentPart as ImageUrlContentBlock).image_url;
+        if (typeof imageUrl === 'string') {
+          source = _formatImage(imageUrl);
         } else {
-          source = _formatImage(contentPart.image_url.url);
+          source = _formatImage(imageUrl.url);
         }
         return {
           type: 'image' as const, // Explicitly setting the type as "image"
           source,
-          ...(cacheControl ? { cache_control: cacheControl } : {}),
+          ...(cacheControl != null ? { cache_control: cacheControl } : {}),
         };
       } else if (isAnthropicImageBlockParam(contentPart)) {
         return contentPart;
@@ -476,58 +549,63 @@ function _formatContent(message: BaseMessage) {
         // PDF
         return {
           ...contentPart,
-          ...(cacheControl ? { cache_control: cacheControl } : {}),
+          ...(cacheControl != null ? { cache_control: cacheControl } : {}),
         };
       } else if (contentPart.type === 'thinking') {
+        const thinkingPart = contentPart as AnthropicThinkingBlockParam;
         const block: AnthropicThinkingBlockParam = {
           type: 'thinking' as const, // Explicitly setting the type as "thinking"
-          thinking: contentPart.thinking,
-          signature: contentPart.signature,
-          ...(cacheControl ? { cache_control: cacheControl } : {}),
+          thinking: thinkingPart.thinking,
+          signature: thinkingPart.signature,
+          ...(cacheControl != null ? { cache_control: cacheControl } : {}),
         };
         return block;
       } else if (contentPart.type === 'redacted_thinking') {
+        const redactedPart = contentPart as AnthropicRedactedThinkingBlockParam;
         const block: AnthropicRedactedThinkingBlockParam = {
           type: 'redacted_thinking' as const, // Explicitly setting the type as "redacted_thinking"
-          data: contentPart.data,
-          ...(cacheControl ? { cache_control: cacheControl } : {}),
+          data: redactedPart.data,
+          ...(cacheControl != null ? { cache_control: cacheControl } : {}),
         };
         return block;
       } else if (contentPart.type === 'search_result') {
+        const searchResultPart = contentPart as AnthropicSearchResultBlockParam;
         const block: AnthropicSearchResultBlockParam = {
           type: 'search_result' as const,
-          title: contentPart.title,
-          source: contentPart.source,
-          ...('cache_control' in contentPart && contentPart.cache_control
+          title: searchResultPart.title,
+          source: searchResultPart.source,
+          ...('cache_control' in contentPart &&
+          contentPart.cache_control != null
             ? { cache_control: contentPart.cache_control }
             : {}),
-          ...('citations' in contentPart && contentPart.citations
+          ...('citations' in contentPart && contentPart.citations != null
             ? { citations: contentPart.citations }
             : {}),
-          content: contentPart.content,
+          content: searchResultPart.content,
         };
         return block;
       } else if (contentPart.type === 'compaction') {
+        const compactionPart = contentPart as AnthropicCompactionBlockParam;
         const block: AnthropicCompactionBlockParam = {
           type: 'compaction' as const,
-          content: contentPart.content,
-          ...(cacheControl ? { cache_control: cacheControl } : {}),
+          content: compactionPart.content,
+          ...(cacheControl != null ? { cache_control: cacheControl } : {}),
         };
         return block;
       } else if (
-        textTypes.find((t) => t === contentPart.type) &&
+        textTypes.some((t) => t === contentPart.type) &&
         'text' in contentPart
       ) {
         // Assuming contentPart is of type MessageContentText here
         return {
           type: 'text' as const, // Explicitly setting the type as "text"
           text: contentPart.text,
-          ...(cacheControl ? { cache_control: cacheControl } : {}),
-          ...('citations' in contentPart && contentPart.citations
+          ...(cacheControl != null ? { cache_control: cacheControl } : {}),
+          ...('citations' in contentPart && contentPart.citations != null
             ? { citations: contentPart.citations }
             : {}),
         };
-      } else if (toolTypes.find((t) => t === contentPart.type)) {
+      } else if (toolTypes.some((t) => t === contentPart.type)) {
         const contentPartCopy = { ...contentPart };
         if ('index' in contentPartCopy) {
           // Anthropic does not support passing the index field here, so we remove it.
@@ -538,6 +616,15 @@ function _formatContent(message: BaseMessage) {
           // `input_json_delta` type only represents yielding partial tool inputs
           // and is not a valid type for Anthropic messages.
           contentPartCopy.type = 'tool_use';
+        }
+
+        if (
+          contentPartCopy.type === 'tool_use' &&
+          'id' in contentPartCopy &&
+          typeof contentPartCopy.id === 'string' &&
+          contentPartCopy.id.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX)
+        ) {
+          contentPartCopy.type = 'server_tool_use';
         }
 
         if ('input' in contentPartCopy) {
@@ -562,21 +649,22 @@ function _formatContent(message: BaseMessage) {
         // TODO: Fix when SDK types are fixed
         return {
           ...contentPartCopy,
-          ...(cacheControl ? { cache_control: cacheControl } : {}),
+          ...(cacheControl != null ? { cache_control: cacheControl } : {}),
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
         } as any;
       } else if (
         'functionCall' in contentPart &&
-        contentPart.functionCall &&
+        contentPart.functionCall != null &&
         typeof contentPart.functionCall === 'object' &&
         isAIMessage(message)
       ) {
+        const functionCallPart = contentPart as GoogleFunctionCallBlock;
         const correspondingToolCall = message.tool_calls?.find(
-          (toolCall) => toolCall.name === contentPart.functionCall.name
+          (toolCall) => toolCall.name === functionCallPart.functionCall.name
         );
         if (!correspondingToolCall) {
           throw new Error(
-            `Could not find tool call for function call ${contentPart.functionCall.name}`
+            `Could not find tool call for function call ${functionCallPart.functionCall.name}`
           );
         }
         // Google GenAI models include a `functionCall` object inside content. We should ignore it as Anthropic will not support it.
@@ -584,7 +672,7 @@ function _formatContent(message: BaseMessage) {
           id: correspondingToolCall.id,
           type: 'tool_use',
           name: correspondingToolCall.name,
-          input: contentPart.functionCall.args,
+          input: functionCallPart.functionCall.args,
         };
       } else {
         console.error(
@@ -594,7 +682,19 @@ function _formatContent(message: BaseMessage) {
         throw new Error('Unsupported message content format');
       }
     });
-    return contentBlocks.filter((block) => block !== null);
+    const filteredContentBlocks = contentBlocks.filter(
+      (block) =>
+        block !== null &&
+        !(
+          block.type === 'text' &&
+          'text' in block &&
+          typeof block.text === 'string' &&
+          block.text.trim() === ''
+        )
+    );
+    return filteredContentBlocks.length > 0
+      ? filteredContentBlocks
+      : [{ type: 'text' as const, text: ANTHROPIC_EMPTY_TEXT_PLACEHOLDER }];
   }
 }
 
@@ -629,27 +729,41 @@ export function _convertMessagesToAnthropicPayload(
     } else {
       throw new Error(`Message type "${message._getType()}" is not supported.`);
     }
-    if (isAIMessage(message) && !!message.tool_calls?.length) {
+    const isAI = isAIMessage(message);
+    const toolCalls = isAI ? (message.tool_calls ?? []) : [];
+    if (isAI && toolCalls.length > 0) {
       if (typeof message.content === 'string') {
+        const clientToolCalls = toolCalls.filter(
+          (tc) =>
+            !(
+              tc.id?.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX) ?? false
+            )
+        );
         if (message.content === '') {
           return {
             role,
-            content: message.tool_calls.map(
-              _convertLangChainToolCallToAnthropic
-            ),
+            content:
+              clientToolCalls.length > 0
+                ? clientToolCalls.map(_convertLangChainToolCallToAnthropic)
+                : [
+                  {
+                    type: 'text' as const,
+                    text: ANTHROPIC_EMPTY_TEXT_PLACEHOLDER,
+                  },
+                ],
           };
         } else {
           return {
             role,
             content: [
-              { type: 'text', text: message.content },
-              ...message.tool_calls.map(_convertLangChainToolCallToAnthropic),
+              { type: 'text' as const, text: message.content },
+              ...clientToolCalls.map(_convertLangChainToolCallToAnthropic),
             ],
           };
         }
       } else {
         const { content } = message;
-        const hasMismatchedToolCalls = !message.tool_calls.every(
+        const hasMismatchedToolCalls = !toolCalls.every(
           (toolCall) =>
             !!content.find(
               (contentPart) =>
@@ -683,7 +797,7 @@ export function _convertMessagesToAnthropicPayload(
 }
 
 function mergeMessages(messages: AnthropicMessageCreateParams['messages']) {
-  if (!messages || messages.length <= 1) {
+  if (messages.length <= 1) {
     return messages;
   }
 

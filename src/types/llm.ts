@@ -12,7 +12,7 @@ import type {
 } from '@langchain/openai';
 import type { GoogleGenerativeAIChatInput } from '@langchain/google-genai';
 import type { ChatVertexAIInput } from '@langchain/google-vertexai';
-import type { ChatDeepSeekCallOptions } from '@langchain/deepseek';
+import type { ChatDeepSeekInput } from '@langchain/deepseek';
 import type { ChatOpenRouterCallOptions } from '@/llm/openrouter';
 import type { ChatBedrockConverseInput } from '@langchain/aws';
 import type { ChatMistralAIInput } from '@langchain/mistralai';
@@ -45,7 +45,20 @@ export type AzureClientOptions = Partial<OpenAIChatInput> &
   } & BaseChatModelParams & {
     configuration?: OAIClientOptions;
   };
-export type ThinkingConfig = AnthropicInput['thinking'];
+/**
+ * Controls whether Claude's reasoning content is returned in adaptive
+ * thinking responses. Added for Claude Opus 4.7, which omits thinking by
+ * default unless the caller opts in with `'summarized'`.
+ * @see https://platform.claude.com/docs/en/about-claude/models/whats-new-claude-4-7#thinking-content-omitted-by-default
+ */
+export type ThinkingDisplay = 'summarized' | 'omitted';
+export type ThinkingConfigAdaptive = {
+  type: 'adaptive';
+  display?: ThinkingDisplay;
+};
+export type ThinkingConfig =
+  | NonNullable<AnthropicInput['thinking']>
+  | ThinkingConfigAdaptive;
 export type ChatOpenAIToolType =
   | BindToolsInput
   | OpenAIClient.ChatCompletionTool;
@@ -57,10 +70,11 @@ export type AnthropicReasoning = {
 export type GoogleThinkingConfig = {
   thinkingBudget?: number;
   includeThoughts?: boolean;
-  thinkingLevel?: string;
+  thinkingLevel?: 'THINKING_LEVEL_UNSPECIFIED' | 'LOW' | 'MEDIUM' | 'HIGH';
 };
 export type OpenAIClientOptions = ChatOpenAIFields;
-export type AnthropicClientOptions = AnthropicInput & {
+export type AnthropicClientOptions = Omit<AnthropicInput, 'thinking'> & {
+  thinking?: ThinkingConfig;
   promptCache?: boolean;
 };
 export type MistralAIClientOptions = ChatMistralAIInput;
@@ -79,7 +93,7 @@ export type GoogleClientOptions = GoogleGenerativeAIChatInput & {
   customHeaders?: RequestOptions['customHeaders'];
   thinkingConfig?: GoogleThinkingConfig;
 };
-export type DeepSeekClientOptions = ChatDeepSeekCallOptions;
+export type DeepSeekClientOptions = Partial<ChatDeepSeekInput>;
 export type XAIClientOptions = ChatXAIInput;
 
 export type ClientOptions =

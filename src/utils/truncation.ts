@@ -13,6 +13,16 @@
 export const HARD_MAX_TOOL_RESULT_CHARS = 400_000;
 
 /**
+ * Absolute hard cap on the aggregate size (characters) of all registered
+ * tool outputs kept for `{{tool<i>turn<n>}}` substitution. Set at 5 MB
+ * because the registry stores *raw, untruncated* tool output — full
+ * fidelity for piping into downstream bash/jq — so the budget needs
+ * enough headroom to keep a handful of large responses without
+ * ballooning unbounded.
+ */
+export const HARD_MAX_TOTAL_TOOL_OUTPUT_SIZE = 5_000_000;
+
+/**
  * Computes the dynamic max tool result size based on the model's context window.
  * Uses 30% of the context window (in estimated characters, ~4 chars/token)
  * capped at HARD_MAX_TOOL_RESULT_CHARS.
@@ -30,6 +40,26 @@ export function calculateMaxToolResultChars(
     Math.floor(contextWindowTokens * 0.3) * 4,
     HARD_MAX_TOOL_RESULT_CHARS
   );
+}
+
+/**
+ * Computes the default aggregate size (characters) for the tool output
+ * reference registry based on the per-output budget. Mirrors
+ * `calculateMaxToolResultChars`'s shape: a multiple of the per-output
+ * cap, clamped to `HARD_MAX_TOTAL_TOOL_OUTPUT_SIZE`.
+ *
+ * @param maxOutputSize - Per-output maximum characters (e.g., the
+ *   ToolNode's `maxToolResultChars`). When omitted or non-positive,
+ *   falls back to the absolute total cap.
+ * @returns Maximum total characters retained across the registry.
+ */
+export function calculateMaxTotalToolOutputSize(
+  maxOutputSize?: number
+): number {
+  if (maxOutputSize == null || maxOutputSize <= 0) {
+    return HARD_MAX_TOTAL_TOOL_OUTPUT_SIZE;
+  }
+  return Math.min(maxOutputSize * 2, HARD_MAX_TOTAL_TOOL_OUTPUT_SIZE);
 }
 
 /**

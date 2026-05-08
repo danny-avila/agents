@@ -59,9 +59,48 @@ export class MultiAgentGraph extends StandardGraph {
   constructor(input: t.MultiAgentGraphInput) {
     super(input);
     this.edges = input.edges;
+    this.validateEdgeAgents();
     this.categorizeEdges();
     this.analyzeGraph();
     this.createHandoffTools();
+  }
+
+  /**
+   * Fails fast when an edge references an agent that is not in
+   * `agentContexts`. Without this check, the underlying LangGraph
+   * `StateGraph.compile()` would throw the opaque
+   * `Found edge ending at unknown node "<id>"` error after graph
+   * construction — far from the true root cause.
+   *
+   * This catches the common misuse of passing `edges` into a multi-agent
+   * config without also passing the corresponding sub-agent configs in
+   * `agents` (e.g. a host that forgot to pre-load handoff targets).
+   */
+  private validateEdgeAgents(): void {
+    const known = new Set(this.agentContexts.keys());
+    const unknown = new Set<string>();
+    for (const edge of this.edges) {
+      const participants = [
+        ...(Array.isArray(edge.from) ? edge.from : [edge.from]),
+        ...(Array.isArray(edge.to) ? edge.to : [edge.to]),
+      ];
+      for (const id of participants) {
+        if (typeof id === 'string' && !known.has(id)) {
+          unknown.add(id);
+        }
+      }
+    }
+    if (unknown.size === 0) {
+      return;
+    }
+    const missing = Array.from(unknown)
+      .map((id) => `"${id}"`)
+      .join(', ');
+    throw new Error(
+      `MultiAgentGraph: edges reference agent(s) not present in agents: [${missing}]. ` +
+        'Ensure every agent referenced by an edge is also included in the `agents` array, ' +
+        'or filter orphaned edges before constructing the graph.'
+    );
   }
 
   /**

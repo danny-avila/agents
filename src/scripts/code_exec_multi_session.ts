@@ -46,7 +46,7 @@ function printSessionContext(run: Run<t.IState>, label: string): void {
   console.log(`  Latest session_id: ${session.session_id}`);
   console.log(`  Files tracked: ${session.files?.length ?? 0}`);
   for (const file of session.files ?? []) {
-    console.log(`    - ${file.name} (session: ${file.session_id})`);
+    console.log(`    - ${file.name} (storage: ${file.storage_session_id})`);
   }
 }
 
@@ -200,13 +200,13 @@ Tell me what version it shows.
 
   if (finalSession) {
     const files = finalSession.files ?? [];
-    const uniqueSessionIds = new Set(files.map((f) => f.session_id));
+    const uniqueSessionIds = new Set(files.map((f) => f.storage_session_id));
     console.log(`\nTotal files tracked: ${files.length}`);
-    console.log(`Unique session_ids: ${uniqueSessionIds.size}`);
+    console.log(`Unique storage_session_ids: ${uniqueSessionIds.size}`);
     console.log('\nFiles:');
     for (const file of files) {
       console.log(
-        `  - ${file.name} (session: ${file.session_id?.slice(0, 20)}...)`
+        `  - ${file.name} (storage: ${file.storage_session_id?.slice(0, 20)}...)`
       );
     }
 

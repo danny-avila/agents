@@ -1,9 +1,15 @@
 // src/agents/__tests__/AgentContext.test.ts
+import { HumanMessage } from '@langchain/core/messages';
 import { AgentContext } from '../AgentContext';
 import { Providers } from '@/common';
+import { addBedrockCacheControl } from '@/messages/cache';
 import type * as t from '@/types';
 
 describe('AgentContext', () => {
+  type TestSystemContentBlock =
+    | { type: 'text'; text: string; cache_control?: { type: 'ephemeral' } }
+    | { cachePoint: { type: 'default' } };
+
   type ContextOptions = {
     agentConfig?: Partial<t.AgentInputs>;
     tokenCounter?: t.TokenCounter;
@@ -59,14 +65,161 @@ describe('AgentContext', () => {
       expect(ctx.systemRunnable).toBeUndefined();
     });
 
-    it('includes additional_instructions in system message', () => {
+    it('keeps additional_instructions after stable instructions', async () => {
       const ctx = createBasicContext({
         agentConfig: {
           instructions: 'Base instructions',
           additional_instructions: 'Additional instructions',
         },
       });
-      expect(ctx.systemRunnable).toBeDefined();
+
+      const result = await ctx.systemRunnable!.invoke([]);
+      expect(result[0].content).toBe(
+        'Base instructions\n\nAdditional instructions'
+      );
+    });
+
+    it('marks only stable system text for Anthropic prompt caching', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.ANTHROPIC,
+          clientOptions: { model: 'claude-3-5-sonnet', promptCache: true },
+          instructions: 'Stable instructions',
+          additional_instructions: 'Dynamic instructions',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([]);
+      const content = result[0].content as TestSystemContentBlock[];
+      expect(content).toHaveLength(2);
+      expect(content[0]).toMatchObject({
+        type: 'text',
+        text: 'Stable instructions',
+        cache_control: { type: 'ephemeral' },
+      });
+      expect(content[1]).toEqual({
+        type: 'text',
+        text: 'Dynamic instructions',
+      });
+    });
+
+    it('omits Anthropic cache control when only dynamic system text exists', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.ANTHROPIC,
+          clientOptions: { model: 'claude-3-5-sonnet', promptCache: true },
+          instructions: undefined,
+          additional_instructions: 'Dynamic only',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([]);
+      const content = result[0].content as TestSystemContentBlock[];
+      expect(content).toEqual([{ type: 'text', text: 'Dynamic only' }]);
+      expect(content[0]).not.toHaveProperty('cache_control');
+    });
+
+    it('keeps cross-run summaries in the dynamic Anthropic system tail', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.ANTHROPIC,
+          clientOptions: { model: 'claude-3-5-sonnet', promptCache: true },
+          instructions: 'Stable instructions',
+        },
+      });
+      ctx.setInitialSummary('Prior summary', 13);
+
+      const result = await ctx.systemRunnable!.invoke([]);
+      const content = result[0].content as TestSystemContentBlock[];
+      expect(content).toHaveLength(2);
+      expect(content[0]).toHaveProperty('cache_control');
+      expect(content[1]).toEqual({
+        type: 'text',
+        text: '## Conversation Summary\n\nPrior summary',
+      });
+    });
+
+    it('places the Bedrock cache point before dynamic system text', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.BEDROCK,
+          clientOptions: {
+            model: 'anthropic.claude-3-5-sonnet',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+          additional_instructions: 'Dynamic instructions',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([]);
+      const content = result[0].content as TestSystemContentBlock[];
+      expect(content).toEqual([
+        { type: 'text', text: 'Stable instructions' },
+        { cachePoint: { type: 'default' } },
+        { type: 'text', text: 'Dynamic instructions' },
+      ]);
+    });
+
+    it('uses plain Bedrock system text when only dynamic system text exists', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.BEDROCK,
+          clientOptions: {
+            model: 'anthropic.claude-3-5-sonnet',
+            promptCache: true,
+          },
+          instructions: undefined,
+          additional_instructions: 'Dynamic only',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([]);
+      expect(result[0].content).toBe('Dynamic only');
+    });
+
+    it('keeps non-cache providers as plain system text with promptCache-like options', async () => {
+      const clientOptions: t.OpenAIClientOptions & { promptCache: true } = {
+        modelName: 'gpt-4o-mini',
+        promptCache: true,
+      };
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.OPENAI,
+          clientOptions,
+          instructions: 'Stable instructions',
+          additional_instructions: 'Dynamic instructions',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([]);
+      expect(result[0].content).toBe(
+        'Stable instructions\n\nDynamic instructions'
+      );
+    });
+
+    it('preserves the Bedrock system cache point through message cache-control pass', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.BEDROCK,
+          clientOptions: {
+            model: 'anthropic.claude-3-5-sonnet',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+          additional_instructions: 'Dynamic instructions',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('Hello'),
+      ]);
+      const finalMessages = addBedrockCacheControl(result);
+      expect(finalMessages[0].content).toEqual([
+        { type: 'text', text: 'Stable instructions' },
+        { cachePoint: { type: 'default' } },
+        { type: 'text', text: 'Dynamic instructions' },
+      ]);
     });
   });
 
@@ -374,6 +527,294 @@ describe('AgentContext', () => {
       void ctx.systemRunnable;
 
       expect(ctx.instructionTokens).toBeGreaterThan(initialTokens);
+    });
+
+    it('excludes deferred-undiscovered toolDefinitions from toolSchemaTokens', async () => {
+      const activeDef: t.LCTool = {
+        name: 'active_tool',
+        description: 'Always loaded',
+        parameters: { type: 'object', properties: {} },
+      };
+      const deferredDef: t.LCTool = {
+        name: 'deferred_tool',
+        description: 'Loaded via tool search',
+        parameters: { type: 'object', properties: {} },
+        defer_loading: true,
+      };
+
+      const ctxBase = createBasicContext({
+        agentConfig: { toolDefinitions: [activeDef] },
+        tokenCounter: mockTokenCounter,
+      });
+      const ctxWithDeferred = createBasicContext({
+        agentConfig: { toolDefinitions: [activeDef, deferredDef] },
+        tokenCounter: mockTokenCounter,
+      });
+
+      await ctxBase.tokenCalculationPromise;
+      await ctxWithDeferred.tokenCalculationPromise;
+
+      expect(ctxWithDeferred.toolSchemaTokens).toBe(ctxBase.toolSchemaTokens);
+    });
+
+    it('excludes programmatic-only toolDefinitions from toolSchemaTokens', async () => {
+      // getEventDrivenToolsForBinding excludes definitions whose
+      // allowed_callers omit 'direct'. Accounting must mirror that — a
+      // programmatic-only definition is never bound to the model and
+      // shouldn't inflate toolSchemaTokens.
+      const activeDef: t.LCTool = {
+        name: 'active_tool',
+        description: 'Always loaded',
+        parameters: { type: 'object', properties: {} },
+      };
+      const programmaticDef: t.LCTool = {
+        name: 'programmatic_tool',
+        description: 'Only callable via code execution',
+        parameters: { type: 'object', properties: {} },
+        allowed_callers: ['code_execution'],
+      };
+
+      const ctxBase = createBasicContext({
+        agentConfig: { toolDefinitions: [activeDef] },
+        tokenCounter: mockTokenCounter,
+      });
+      const ctxWithProgrammatic = createBasicContext({
+        agentConfig: { toolDefinitions: [activeDef, programmaticDef] },
+        tokenCounter: mockTokenCounter,
+      });
+
+      await ctxBase.tokenCalculationPromise;
+      await ctxWithProgrammatic.tokenCalculationPromise;
+
+      expect(ctxWithProgrammatic.toolSchemaTokens).toBe(
+        ctxBase.toolSchemaTokens
+      );
+    });
+
+    it('excludes deferred-undiscovered instance tools from toolSchemaTokens', async () => {
+      const activeTool = createMockTool('active_tool');
+      const deferredTool = createMockTool('deferred_tool');
+      const programmaticTool = createMockTool('programmatic_tool');
+      const toolRegistry: t.LCToolRegistry = new Map([
+        ['active_tool', { name: 'active_tool' }],
+        ['deferred_tool', { name: 'deferred_tool', defer_loading: true }],
+        [
+          'programmatic_tool',
+          {
+            name: 'programmatic_tool',
+            allowed_callers: ['code_execution'],
+          },
+        ],
+      ]);
+
+      const ctxBase = createBasicContext({
+        agentConfig: { tools: [activeTool], toolRegistry },
+        tokenCounter: mockTokenCounter,
+      });
+      const ctxWithExcluded = createBasicContext({
+        agentConfig: {
+          tools: [activeTool, deferredTool, programmaticTool],
+          toolRegistry,
+        },
+        tokenCounter: mockTokenCounter,
+      });
+
+      await ctxBase.tokenCalculationPromise;
+      await ctxWithExcluded.tokenCalculationPromise;
+
+      expect(ctxWithExcluded.toolSchemaTokens).toBe(ctxBase.toolSchemaTokens);
+    });
+
+    it('includes deferred instance tools once discovered via discoveredTools input', async () => {
+      const tools = [createMockTool('deferred_tool')];
+      const toolRegistry: t.LCToolRegistry = new Map([
+        ['deferred_tool', { name: 'deferred_tool', defer_loading: true }],
+      ]);
+
+      const ctxUndiscovered = createBasicContext({
+        agentConfig: { tools, toolRegistry },
+        tokenCounter: mockTokenCounter,
+      });
+      const ctxDiscovered = createBasicContext({
+        agentConfig: {
+          tools,
+          toolRegistry,
+          discoveredTools: ['deferred_tool'],
+        },
+        tokenCounter: mockTokenCounter,
+      });
+
+      await ctxUndiscovered.tokenCalculationPromise;
+      await ctxDiscovered.tokenCalculationPromise;
+
+      expect(ctxUndiscovered.toolSchemaTokens).toBe(0);
+      expect(ctxDiscovered.toolSchemaTokens).toBeGreaterThan(0);
+    });
+
+    it('does not filter instance tools in event-driven mode (matches getEventDrivenToolsForBinding)', async () => {
+      // In event-driven mode, getEventDrivenToolsForBinding appends
+      // `this.tools` UNFILTERED. Accounting must do the same — otherwise we
+      // under-count and risk exceeding the model's context budget.
+      const activeDef: t.LCTool = {
+        name: 'active_def',
+        description: 'Always loaded',
+        parameters: { type: 'object', properties: {} },
+      };
+      const nativeTool = createMockTool('native_tool');
+      // Registry marks the native tool as deferred-undiscovered. In the
+      // non-event-driven path this would exclude it; in event-driven mode
+      // it is still bound and must still be counted.
+      const toolRegistry: t.LCToolRegistry = new Map([
+        ['native_tool', { name: 'native_tool', defer_loading: true }],
+      ]);
+
+      const ctxWithoutNative = createBasicContext({
+        agentConfig: {
+          toolDefinitions: [activeDef],
+          toolRegistry,
+        },
+        tokenCounter: mockTokenCounter,
+      });
+      const ctxWithNative = createBasicContext({
+        agentConfig: {
+          toolDefinitions: [activeDef],
+          tools: [nativeTool],
+          toolRegistry,
+        },
+        tokenCounter: mockTokenCounter,
+      });
+
+      await ctxWithoutNative.tokenCalculationPromise;
+      await ctxWithNative.tokenCalculationPromise;
+
+      expect(ctxWithNative.toolSchemaTokens).toBeGreaterThan(
+        ctxWithoutNative.toolSchemaTokens
+      );
+    });
+
+    it('includes deferred toolDefinitions once discovered via discoveredTools input', async () => {
+      const toolDefinitions: t.LCTool[] = [
+        {
+          name: 'deferred_tool',
+          description: 'Loaded via tool search',
+          parameters: { type: 'object', properties: {} },
+          defer_loading: true,
+        },
+      ];
+
+      const ctxUndiscovered = createBasicContext({
+        agentConfig: { toolDefinitions },
+        tokenCounter: mockTokenCounter,
+      });
+      const ctxDiscovered = createBasicContext({
+        agentConfig: { toolDefinitions, discoveredTools: ['deferred_tool'] },
+        tokenCounter: mockTokenCounter,
+      });
+
+      await ctxUndiscovered.tokenCalculationPromise;
+      await ctxDiscovered.tokenCalculationPromise;
+
+      expect(ctxUndiscovered.toolSchemaTokens).toBe(0);
+      expect(ctxDiscovered.toolSchemaTokens).toBeGreaterThan(0);
+    });
+
+    it('getTokenBudgetBreakdown toolCount excludes deferred-undiscovered toolDefinitions', () => {
+      const toolDefinitions: t.LCTool[] = [
+        {
+          name: 'active',
+          parameters: { type: 'object', properties: {} },
+        },
+        {
+          name: 'deferred',
+          defer_loading: true,
+          parameters: { type: 'object', properties: {} },
+        },
+      ];
+
+      const ctx = createBasicContext({ agentConfig: { toolDefinitions } });
+
+      expect(ctx.getTokenBudgetBreakdown().toolCount).toBe(1);
+    });
+
+    it('getTokenBudgetBreakdown toolCount excludes deferred-undiscovered instance tools', () => {
+      // Mirrors the toolDefinitions test for the instance-tools path so
+      // toolCount stays aligned with toolSchemaTokens (and with what
+      // getToolsForBinding actually emits) for non-event-driven runs.
+      const tools = [
+        createMockTool('active_tool'),
+        createMockTool('deferred_tool'),
+        createMockTool('programmatic_tool'),
+      ];
+      const toolRegistry: t.LCToolRegistry = new Map([
+        ['active_tool', { name: 'active_tool' }],
+        ['deferred_tool', { name: 'deferred_tool', defer_loading: true }],
+        [
+          'programmatic_tool',
+          {
+            name: 'programmatic_tool',
+            allowed_callers: ['code_execution'],
+          },
+        ],
+      ]);
+
+      const ctx = createBasicContext({
+        agentConfig: { tools, toolRegistry },
+      });
+
+      expect(ctx.getTokenBudgetBreakdown().toolCount).toBe(1);
+      ctx.markToolsAsDiscovered(['deferred_tool']);
+      expect(ctx.getTokenBudgetBreakdown().toolCount).toBe(2);
+    });
+
+    it('getTokenBudgetBreakdown toolCount reflects newly discovered deferred tools', () => {
+      const toolDefinitions: t.LCTool[] = [
+        {
+          name: 'deferred',
+          defer_loading: true,
+          parameters: { type: 'object', properties: {} },
+        },
+      ];
+
+      const ctx = createBasicContext({ agentConfig: { toolDefinitions } });
+
+      expect(ctx.getTokenBudgetBreakdown().toolCount).toBe(0);
+      ctx.markToolsAsDiscovered(['deferred']);
+      expect(ctx.getTokenBudgetBreakdown().toolCount).toBe(1);
+    });
+
+    it('getTokenBudgetBreakdown toolCount includes graphTools', () => {
+      // graphTools (handoff/subagent) are bound to the model alongside
+      // instance tools. Now that toolCount derives from getToolsForBinding(),
+      // graphTools are reflected in the diagnostic just like they're
+      // counted in toolSchemaTokens. Locks in that alignment.
+      const ctx = createBasicContext({
+        agentConfig: { tools: [createMockTool('direct_tool')] },
+      });
+      ctx.graphTools = [createMockTool('handoff_tool')];
+
+      expect(ctx.getTokenBudgetBreakdown().toolCount).toBe(2);
+    });
+
+    it('toolSchemaTokens snapshot does not auto-update after markToolsAsDiscovered', async () => {
+      const toolDefinitions: t.LCTool[] = [
+        {
+          name: 'deferred',
+          description: 'Loaded via tool search',
+          parameters: { type: 'object', properties: {} },
+          defer_loading: true,
+        },
+      ];
+
+      const ctx = createBasicContext({
+        agentConfig: { toolDefinitions },
+        tokenCounter: mockTokenCounter,
+      });
+
+      await ctx.tokenCalculationPromise;
+      expect(ctx.toolSchemaTokens).toBe(0);
+
+      ctx.markToolsAsDiscovered(['deferred']);
+      expect(ctx.toolSchemaTokens).toBe(0);
     });
   });
 

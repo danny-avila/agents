@@ -7,18 +7,33 @@ import {
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { UsageMetadata, BaseMessage } from '@langchain/core/messages';
 import type { AgentContext } from '@/agents/AgentContext';
+import type { HookRegistry } from '@/hooks';
 import type { OnChunk } from '@/llm/invoke';
 import type * as t from '@/types';
 import { ContentTypes, GraphEvents, StepTypes, Providers } from '@/common';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { createRemoveAllMessage } from '@/messages/reducer';
+import { splitAtRecencyBoundary } from '@/messages/recency';
 import { getMaxOutputTokensKey } from '@/llm/request';
 import { addCacheControl } from '@/messages/cache';
 import { initializeModel } from '@/llm/init';
 import { getChunkContent } from '@/stream';
+import { executeHooks } from '@/hooks';
 
 const SUMMARIZATION_PARAM_KEYS = new Set(['maxSummaryTokens']);
+
+/**
+ * Default number of recent user-led turns preserved verbatim during
+ * compaction.  A turn begins at a HumanMessage and includes every
+ * following AIMessage and ToolMessage up to the next HumanMessage.
+ * The most recent turn is always retained regardless of this value;
+ * the default of `2` additionally keeps the prior exchange so the
+ * model has fresh context on what just happened.  Setting
+ * `retainRecent.turns` to `0` reverts to the legacy "summarize every
+ * message" behavior.
+ */
+const DEFAULT_RETAIN_RECENT_TURNS = 2;
 
 /**
  * Token overhead of the XML wrapper + instruction text added around the
@@ -365,6 +380,122 @@ type LogFn = (
 ) => void;
 
 /**
+ * Extracts an HTTP status code from a thrown LLM-provider error. Returns
+ * `undefined` for non-object values (including `null` or `undefined`, both
+ * valid `throw` targets in JS) so callers never dereference a nullish
+ * value.
+ */
+function extractHttpStatus(err: unknown): number | undefined {
+  if (err == null || typeof err !== 'object') {
+    return undefined;
+  }
+  const errRecord = err as Record<string, unknown>;
+  const direct = errRecord.status;
+  if (typeof direct === 'number') {
+    return direct;
+  }
+  const statusCode = errRecord.statusCode;
+  if (typeof statusCode === 'number') {
+    return statusCode;
+  }
+  const response = errRecord.response;
+  if (response != null && typeof response === 'object') {
+    const nested = (response as Record<string, unknown>).status;
+    if (typeof nested === 'number') {
+      return nested;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Formats a provider-level error for logging. Returns both a human-readable
+ * suffix (safe to include in the message string so it survives any host-side
+ * formatter) and a structured metadata bag for rich log backends.
+ */
+function describeProviderError(
+  err: unknown,
+  provider: string,
+  modelName?: string
+): { suffix: string; data: Record<string, unknown> } {
+  const providerLabel = `${provider}/${modelName ?? '(no-model)'}`;
+  const errMsg = err instanceof Error ? err.message : String(err);
+
+  const data: Record<string, unknown> = {
+    provider,
+    model: modelName,
+  };
+  if (err instanceof Error) {
+    data.errorName = err.name;
+    data.errorStack = err.stack;
+  }
+
+  const status = extractHttpStatus(err);
+  const statusSuffix = status != null ? ` (HTTP ${status})` : '';
+  if (status != null) {
+    data.status = status;
+  }
+
+  return {
+    suffix: `[${providerLabel}]${statusSuffix}: ${errMsg}`,
+    data,
+  };
+}
+
+/**
+ * Formats an exhausted-fallback error. `tryFallbackProviders` throws the
+ * last fallback provider's error, which may be from any of the configured
+ * fallbacks — not the primary — so we label the log with the list of
+ * fallback providers attempted rather than mis-attributing to the primary.
+ *
+ * Entries in `fallbacks` are normally strongly typed, but we defend against
+ * malformed runtime config (null/undefined entries, missing `provider`
+ * field) so a recoverable summarization failure is never promoted to an
+ * uncaught exception from inside the logging path.
+ */
+function describeFallbackError(
+  err: unknown,
+  fallbacks: unknown
+): { suffix: string; data: Record<string, unknown> } {
+  const errMsg = err instanceof Error ? err.message : String(err);
+  const list: ReadonlyArray<unknown> = Array.isArray(fallbacks)
+    ? fallbacks
+    : [];
+  const providerNames = list
+    .map((f) => {
+      if (f == null || typeof f !== 'object') {
+        return undefined;
+      }
+      const raw = (f as { provider?: unknown }).provider;
+      return raw != null ? String(raw) : undefined;
+    })
+    .filter((p): p is string => typeof p === 'string');
+  const label =
+    providerNames.length > 0
+      ? `fallbacks=[${providerNames.join(',')}]`
+      : 'no-fallbacks';
+
+  const data: Record<string, unknown> = {
+    fallbackProviders: providerNames,
+    fallbackCount: list.length,
+  };
+  if (err instanceof Error) {
+    data.errorName = err.name;
+    data.errorStack = err.stack;
+  }
+  const status = extractHttpStatus(err);
+  const statusSuffix = status != null ? ` (HTTP ${status})` : '';
+  if (status != null) {
+    data.status = status;
+  }
+
+  return {
+    suffix: `[${label}]${statusSuffix}: ${errMsg}`,
+    data,
+  };
+}
+
+/**
  * Runs the summarization LLM call with primary + fallback providers,
  * falling back to a metadata stub when all calls fail.
  */
@@ -387,18 +518,23 @@ async function executeSummarizationWithFallback(params: {
     log,
   } = params;
 
-  const summarizationModel = initializeModel({
-    provider: clientConfig.provider as Providers,
-    clientOptions: clientConfig.clientOptions as t.ClientOptions,
-    tools: agentContext.getToolsForBinding(),
-  }) as t.ChatModel;
-
   const priorSummaryText = agentContext.getSummaryText()?.trim() ?? '';
 
   let summaryText = '';
   let summaryUsage: Partial<UsageMetadata> | undefined;
 
   try {
+    /**
+     * Initialize inside the try so that a misconfigured provider
+     * (e.g. an unrecognized summarization.provider) surfaces through the
+     * `log('error', ...)` path below rather than bubbling up silently.
+     */
+    const summarizationModel = initializeModel({
+      provider: clientConfig.provider as Providers,
+      clientOptions: clientConfig.clientOptions as t.ClientOptions,
+      tools: agentContext.getToolsForBinding(),
+    }) as t.ChatModel;
+
     const result = await summarizeWithCacheHit({
       model: summarizationModel,
       messages,
@@ -415,19 +551,20 @@ async function executeSummarizationWithFallback(params: {
     summaryText = result.text;
     summaryUsage = result.usage;
   } catch (primaryError) {
-    log('error', 'Summarization LLM call failed', {
-      error:
-        primaryError instanceof Error
-          ? primaryError.message
-          : String(primaryError),
-      provider: clientConfig.provider,
-      model: clientConfig.modelName,
+    const primaryDescribed = describeProviderError(
+      primaryError,
+      clientConfig.provider,
+      clientConfig.modelName
+    );
+    log('error', `Summarization LLM call failed ${primaryDescribed.suffix}`, {
+      ...primaryDescribed.data,
       messagesToRefineCount: messages.length,
     });
 
-    const fallbacks =
-      (clientConfig.clientOptions as unknown as t.LLMConfig | undefined)
-        ?.fallbacks ?? [];
+    const rawFallbacks = (
+      clientConfig.clientOptions as unknown as t.LLMConfig | undefined
+    )?.fallbacks;
+    const fallbacks = Array.isArray(rawFallbacks) ? rawFallbacks : [];
     if (fallbacks.length > 0) {
       try {
         const onChunk = createSummarizationChunkHandler({
@@ -460,18 +597,21 @@ async function executeSummarizationWithFallback(params: {
           );
         }
       } catch (fbErr) {
-        log('warn', 'Fallback providers also failed', {
-          error: fbErr instanceof Error ? fbErr.message : String(fbErr),
+        const fbDescribed = describeFallbackError(fbErr, fallbacks);
+        log('warn', `Fallback providers also failed ${fbDescribed.suffix}`, {
+          ...fbDescribed.data,
         });
       }
     }
     if (!summaryText) {
-      log('warn', 'Summarization failed, falling back to metadata stub', {
-        error:
-          primaryError instanceof Error
-            ? primaryError.message
-            : String(primaryError),
-      });
+      log(
+        'warn',
+        `Summarization failed, falling back to metadata stub ${primaryDescribed.suffix}`,
+        {
+          ...primaryDescribed.data,
+          messagesToRefineCount: messages.length,
+        }
+      );
       summaryText = generateMetadataStub(messages);
     }
   }
@@ -489,6 +629,13 @@ async function dispatchCompletionEvents(params: {
   runStep: t.RunStep;
   summaryUsage?: Partial<UsageMetadata>;
   agentId: string;
+  /**
+   * Number of messages preserved verbatim by the recency window after
+   * compaction.  Reported via the PostCompact hook payload so observers
+   * (metrics, cleanup) see the true post-compaction message count
+   * instead of always-zero.
+   */
+  messagesAfterCount: number;
 }): Promise<void> {
   const {
     graph,
@@ -499,6 +646,7 @@ async function dispatchCompletionEvents(params: {
     runStep,
     summaryUsage,
     agentId,
+    messagesAfterCount,
   } = params;
 
   runStep.summary = summaryBlock;
@@ -530,6 +678,35 @@ async function dispatchCompletionEvents(params: {
     );
   }
 
+  const sessionId = graph.runId ?? '';
+  if (graph.hookRegistry?.hasHookFor('PostCompact', sessionId) === true) {
+    const threadId = (
+      runnableConfig?.configurable as Record<string, unknown> | undefined
+    )?.thread_id as string | undefined;
+    const firstBlock = summaryBlock.content?.[0];
+    const summaryText =
+      firstBlock != null &&
+      typeof firstBlock === 'object' &&
+      'text' in firstBlock &&
+      typeof firstBlock.text === 'string'
+        ? firstBlock.text
+        : '';
+    await executeHooks({
+      registry: graph.hookRegistry,
+      input: {
+        hook_event_name: 'PostCompact',
+        runId: sessionId,
+        threadId,
+        agentId,
+        summary: summaryText,
+        messagesAfterCount,
+      },
+      sessionId,
+    }).catch(() => {
+      /* PostCompact is observational — swallow errors */
+    });
+  }
+
   agentContext.rebuildTokenMapAfterSummarization({});
 }
 
@@ -545,6 +722,7 @@ interface CreateSummarizeNodeParams {
     config?: RunnableConfig;
     runId?: string;
     isMultiAgent: boolean;
+    hookRegistry?: HookRegistry;
     dispatchRunStep: (
       runStep: t.RunStep,
       config?: RunnableConfig
@@ -592,18 +770,76 @@ export function createSummarizeNode({
       return { summarizationRequest: undefined };
     }
 
-    const messagesToRefine = restoreOriginalToolContent(
+    /**
+     * Capture the original-tool-content map locally before doing the
+     * split.  We need it in three places: to restore the head for
+     * summarizer quality, to leave intact on the skip path (state is
+     * unchanged), and — critically — to carry forward the tail-relevant
+     * entries on the summarize-fired path.  Clearing it eagerly here
+     * would lose the originals for masked tool messages that the
+     * recency window keeps in the tail; a future summarization could
+     * then only summarize the masked stub instead of the full payload.
+     */
+    const originalPending = agentContext.pendingOriginalToolContent;
+
+    const restoredMessages = restoreOriginalToolContent(
       state.messages,
-      agentContext.pendingOriginalToolContent
+      originalPending
     );
-    agentContext.pendingOriginalToolContent = undefined;
+
+    const runnableConfig = config ?? graph.config;
+
+    const retainRecent = agentContext.summarizationConfig?.retainRecent;
+    const { head: messagesToRefine, tailStartIndex } = splitAtRecencyBoundary(
+      restoredMessages,
+      {
+        turns: retainRecent?.turns ?? DEFAULT_RETAIN_RECENT_TURNS,
+        tokens: retainRecent?.tokens,
+        tokenCounter: agentContext.tokenCounter,
+      }
+    );
+    /**
+     * Use the *masked* messages for the retained tail so that any
+     * truncation prune applied to oversized ToolMessage content stays
+     * truncated in live state.  The summarizer above reads the restored
+     * (full-content) head for summary quality, but reinjecting restored
+     * tool payloads into state would defeat masking and bloat the
+     * checkpoint, forcing more expensive re-pruning on later turns.
+     * `restoreOriginalToolContent` returns an array with identical
+     * length and structure to `state.messages` (replacements only at
+     * specific indices), so the same tailStartIndex slices both arrays
+     * at the same turn boundary.
+     */
+    const messagesToRetain = state.messages.slice(tailStartIndex);
+
+    if (messagesToRefine.length === 0) {
+      /**
+       * Recency window covers the entire conversation — there is no
+       * older content to summarize.  Skipping prevents the model from
+       * destroying the user's most recent message (e.g. a large pasted
+       * payload on the first turn) by replacing it with a generic
+       * checkpoint summary.  Mark the trigger so the same unchanged
+       * state is not re-evaluated on the next prune cycle.
+       */
+      emitAgentLog(
+        config,
+        'debug',
+        'summarize',
+        'Summarization skipped — recency window retains all messages',
+        {
+          messagesRetained: messagesToRetain.length,
+          retainTurns: retainRecent?.turns ?? DEFAULT_RETAIN_RECENT_TURNS,
+        },
+        { runId: graph.runId, agentId: request.agentId }
+      );
+      agentContext.markSummarizationTriggered(state.messages.length);
+      return { summarizationRequest: undefined };
+    }
 
     const clientConfig = buildSummarizationClientConfig(
       agentContext,
       agentContext.summarizationConfig
     );
-
-    const runnableConfig = config ?? graph.config;
 
     const stepKey = `summarize-${request.agentId}`;
     const [stepId, stepIndex] = generateStepId(stepKey);
@@ -648,6 +884,27 @@ export function createSummarizeNode({
         } satisfies t.SummarizeStartEvent,
         runnableConfig
       );
+    }
+
+    const sessionId = graph.runId ?? '';
+    if (graph.hookRegistry?.hasHookFor('PreCompact', sessionId) === true) {
+      const threadId = (
+        runnableConfig?.configurable as Record<string, unknown> | undefined
+      )?.thread_id as string | undefined;
+      await executeHooks({
+        registry: graph.hookRegistry,
+        input: {
+          hook_event_name: 'PreCompact',
+          runId: sessionId,
+          threadId,
+          agentId: request.agentId,
+          messagesBeforeCount: messagesToRefine.length,
+          trigger: agentContext.summarizationConfig?.trigger?.type ?? 'default',
+        },
+        sessionId,
+      }).catch(() => {
+        /* PreCompact is observational — swallow errors */
+      });
     }
 
     const isSelfSummarizeModel =
@@ -757,11 +1014,49 @@ export function createSummarizeNode({
       runStep,
       summaryUsage,
       agentId: request.agentId,
+      messagesAfterCount: messagesToRetain.length,
     });
+
+    /**
+     * `dispatchCompletionEvents` calls `rebuildTokenMapAfterSummarization({})`
+     * which resets the dedupe baseline to 0 — correct under the legacy
+     * "remove-all only" shape where no messages survived, but stale once
+     * the recency window keeps a tail.  Realign the baseline to the
+     * surviving tail length so a subsequent prune cycle on the unchanged
+     * tail short-circuits via `shouldSkipSummarization` instead of
+     * looping back into another summarize call.
+     */
+    agentContext.markSummarizationTriggered(messagesToRetain.length);
+
+    /**
+     * Carry forward the original-content entries that correspond to the
+     * retained tail, reindexed for the post-removeAll state where tail
+     * messages start at index 0.  Without this, a future summarization
+     * that pulls these tail messages into its head would only see the
+     * masked stubs (since `setSummary` clears `pruneMessages`, and the
+     * fresh pruner at the next turn has no record of prior masks).
+     * Entries for indices < `tailStartIndex` belong to messages we just
+     * summarized — they are no longer reachable so they are dropped.
+     */
+    if (originalPending != null && originalPending.size > 0) {
+      const tailPending = new Map<number, string>();
+      for (const [idx, content] of originalPending) {
+        if (idx >= tailStartIndex) {
+          tailPending.set(idx - tailStartIndex, content);
+        }
+      }
+      agentContext.pendingOriginalToolContent =
+        tailPending.size > 0 ? tailPending : undefined;
+    } else {
+      agentContext.pendingOriginalToolContent = undefined;
+    }
 
     return {
       summarizationRequest: undefined,
-      messages: [createRemoveAllMessage()],
+      messages:
+        messagesToRetain.length > 0
+          ? [createRemoveAllMessage(), ...messagesToRetain]
+          : [createRemoveAllMessage()],
     };
   };
 }

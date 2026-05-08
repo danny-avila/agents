@@ -22,11 +22,10 @@ function getBM25Function(): BM25Fn {
 const BM25 = getBM25Function();
 import fetch, { RequestInit } from 'node-fetch';
 import { HttpsProxyAgent } from 'https-proxy-agent';
-import { getEnvironmentVariable } from '@langchain/core/utils/env';
 import { tool, DynamicStructuredTool } from '@langchain/core/tools';
 import type * as t from '@/types';
 import { getCodeBaseURL } from './CodeExecutor';
-import { EnvVar, Constants } from '@/common';
+import { Constants } from '@/common';
 
 config();
 
@@ -837,11 +836,11 @@ function formatServerListing(
  *
  * @example
  * // Option 1: Code interpreter mode (regex via sandbox)
- * const tool = createToolSearch({ apiKey, toolRegistry });
+ * const tool = createToolSearch({ toolRegistry });
  * await tool.invoke({ query: 'expense.*report' });
  *
  * @example
- * // Option 2: Local mode (safe substring search, no API key needed)
+ * // Option 2: Local mode (safe substring search)
  * const tool = createToolSearch({ mode: 'local', toolRegistry });
  * await tool.invoke({ query: 'expense' });
  */
@@ -852,20 +851,6 @@ function createToolSearch(
   const defaultOnlyDeferred = initParams.onlyDeferred ?? true;
   const mcpNameFormat: t.McpNameFormat = initParams.mcpNameFormat ?? 'full';
   const schema = createToolSearchSchema(mode);
-
-  const apiKey: string =
-    mode === 'code_interpreter'
-      ? ((initParams[EnvVar.CODE_API_KEY] as string | undefined) ??
-        initParams.apiKey ??
-        getEnvironmentVariable(EnvVar.CODE_API_KEY) ??
-        '')
-      : '';
-
-  if (mode === 'code_interpreter' && !apiKey) {
-    throw new Error(
-      'No API key provided for tool search in code_interpreter mode. Use mode: "local" to search without an API key.'
-    );
-  }
 
   const baseEndpoint = initParams.baseUrl ?? getCodeBaseURL();
   const EXEC_ENDPOINT = `${baseEndpoint}/exec`;
@@ -1052,7 +1037,6 @@ ${mcpNote}${toolsListSection}
           headers: {
             'Content-Type': 'application/json',
             'User-Agent': 'LibreChat/1.0',
-            'X-API-Key': apiKey,
           },
           body: JSON.stringify(postData),
         };

@@ -6,7 +6,8 @@ import {
 } from '@langchain/core/messages';
 import type { MessageContentComplex, TPayload } from '@/types';
 import { formatAgentMessages } from './format';
-import { ContentTypes } from '@/common';
+import { _convertMessagesToAnthropicPayload } from '@/llm/anthropic/utils/message_inputs';
+import { Constants, ContentTypes, Providers } from '@/common';
 
 describe('formatAgentMessages', () => {
   it('should format simple user and AI messages', () => {
@@ -181,6 +182,206 @@ describe('formatAgentMessages', () => {
     expect(result.messages[1]).toBeInstanceOf(ToolMessage);
     expect((result.messages[0] as AIMessage).tool_calls).toHaveLength(1);
     expect((result.messages[1] as ToolMessage).tool_call_id).toBe('123');
+  });
+
+  it('skips persisted Anthropic server tool calls from web search turns', () => {
+    const payload: TPayload = [
+      {
+        role: 'user',
+        content:
+          'who is the lowest seed survived in 2026 nba playoffs, only the team name, nothing else',
+      },
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: `${Constants.ANTHROPIC_SERVER_TOOL_PREFIX}web_search`,
+              name: 'web_search',
+              args: '{"query":"2026 NBA playoffs lowest seed survived"}',
+            },
+          },
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]: 'Philadelphia 76ers',
+          },
+        ],
+      },
+      {
+        role: 'user',
+        content: 'who are 76ers\' opponents in current series?',
+      },
+    ];
+
+    const result = formatAgentMessages(
+      payload,
+      undefined,
+      new Set(['web_search']),
+      undefined,
+      { provider: Providers.ANTHROPIC }
+    );
+
+    expect(result.messages).toHaveLength(3);
+    expect(result.messages[1]).toBeInstanceOf(AIMessage);
+    expect(
+      result.messages.some((message) => message instanceof ToolMessage)
+    ).toBe(false);
+    expect((result.messages[1] as AIMessage).tool_calls).toHaveLength(0);
+    expect(result.messages[1].content).toEqual([
+      {
+        type: ContentTypes.TEXT,
+        [ContentTypes.TEXT]: 'Philadelphia 76ers',
+      },
+    ]);
+  });
+
+  it('preserves paused Anthropic server tool calls without creating ToolMessages', () => {
+    const payload: TPayload = [
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: `${Constants.ANTHROPIC_SERVER_TOOL_PREFIX}paused`,
+              name: 'web_search',
+              args: '{"query":"latest Anthropic server tools"}',
+            },
+          },
+        ],
+      },
+    ];
+
+    const result = formatAgentMessages(
+      payload,
+      undefined,
+      new Set(['web_search']),
+      undefined,
+      { provider: Providers.ANTHROPIC }
+    );
+    const anthropicPayload = _convertMessagesToAnthropicPayload(
+      result.messages
+    );
+
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0]).toBeInstanceOf(AIMessage);
+    expect(result.messages.some((message) => message instanceof ToolMessage))
+      .toBe(false);
+    expect((result.messages[0] as AIMessage).tool_calls).toHaveLength(0);
+    expect(result.messages[0].content).toEqual([
+      {
+        type: 'server_tool_use',
+        id: `${Constants.ANTHROPIC_SERVER_TOOL_PREFIX}paused`,
+        name: 'web_search',
+        input: { query: 'latest Anthropic server tools' },
+      },
+    ]);
+    expect(anthropicPayload.messages[0].content).toEqual([
+      {
+        type: 'server_tool_use',
+        id: `${Constants.ANTHROPIC_SERVER_TOOL_PREFIX}paused`,
+        name: 'web_search',
+        input: { query: 'latest Anthropic server tools' },
+      },
+    ]);
+  });
+
+  it('keeps srvtoolu tool calls portable for non-Anthropic providers', () => {
+    const payload: TPayload = [
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: `${Constants.ANTHROPIC_SERVER_TOOL_PREFIX}paused`,
+              name: 'web_search',
+              args: '{"query":"latest Anthropic server tools"}',
+            },
+          },
+        ],
+      },
+    ];
+
+    const result = formatAgentMessages(
+      payload,
+      undefined,
+      new Set(['web_search']),
+      undefined,
+      { provider: Providers.OPENAI }
+    );
+
+    expect(result.messages).toHaveLength(2);
+    expect(result.messages[0]).toBeInstanceOf(AIMessage);
+    expect(result.messages[1]).toBeInstanceOf(ToolMessage);
+    expect(result.messages[0].content).toBe('');
+    expect((result.messages[0] as AIMessage).tool_calls).toEqual([
+      {
+        id: `${Constants.ANTHROPIC_SERVER_TOOL_PREFIX}paused`,
+        name: 'web_search',
+        args: { query: 'latest Anthropic server tools' },
+      },
+    ]);
+    expect((result.messages[1] as ToolMessage).tool_call_id).toBe(
+      `${Constants.ANTHROPIC_SERVER_TOOL_PREFIX}paused`
+    );
+  });
+
+  it('does not emit empty Anthropic payload content for persisted web search turns', () => {
+    const payload: TPayload = [
+      {
+        role: 'user',
+        content:
+          'who is the lowest seed survived in 2026 nba playoffs, only the team name, nothing else',
+      },
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: `${Constants.ANTHROPIC_SERVER_TOOL_PREFIX}web_search`,
+              name: 'web_search',
+              args: '{"query":"2026 NBA playoffs lowest seed survived"}',
+            },
+          },
+          {
+            type: ContentTypes.TEXT,
+            text: 'Philadelphia 76ers',
+          },
+        ],
+      },
+      {
+        role: 'user',
+        content: 'who are 76ers\' opponents in current series?',
+      },
+    ];
+
+    const { messages } = formatAgentMessages(
+      payload,
+      undefined,
+      new Set(['web_search']),
+      undefined,
+      { provider: Providers.ANTHROPIC }
+    );
+    const anthropicPayload = _convertMessagesToAnthropicPayload(messages);
+
+    expect(anthropicPayload.messages).toHaveLength(3);
+    for (const message of anthropicPayload.messages) {
+      expect(Array.isArray(message.content)).toBe(true);
+      const content = message.content as Array<{
+        text?: unknown;
+        type: string;
+      }>;
+      expect(content.length).toBeGreaterThan(0);
+      for (const block of content) {
+        if (block.type === ContentTypes.TEXT) {
+          expect(typeof block.text).toBe('string');
+          expect((block.text as string).trim().length).toBeGreaterThan(0);
+        }
+      }
+    }
   });
 
   it('should handle malformed tool call entries with missing tool_call property', () => {
@@ -964,6 +1165,171 @@ describe('formatAgentMessages', () => {
     expect(result.messages[0].content).toBe('The answer is 42.');
     expect(JSON.stringify(result.messages[0].content)).not.toContain(
       'reasoning_content'
+    );
+  });
+
+  it('should preserve hidden reasoning_content for DeepSeek assistant messages', () => {
+    const payload: TPayload = [
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.THINK,
+            [ContentTypes.THINK]: 'Need calculator.',
+          },
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]: 'Using calculator.',
+            tool_call_ids: ['call_1'],
+          },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 'call_1',
+              name: 'calculator',
+              args: '{"input":"127 * 453"}',
+              output: '57531',
+            },
+          },
+          {
+            type: ContentTypes.THINK,
+            [ContentTypes.THINK]: 'Calculator returned 57531.',
+          },
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]: '127 * 453 = 57531.',
+          },
+        ],
+      },
+    ];
+
+    const defaultResult = formatAgentMessages(payload);
+    expect(
+      (defaultResult.messages[0] as AIMessage).additional_kwargs
+        .reasoning_content
+    ).toBeUndefined();
+
+    const result = formatAgentMessages(
+      payload,
+      undefined,
+      undefined,
+      undefined,
+      { provider: Providers.DEEPSEEK }
+    );
+
+    expect(result.messages).toHaveLength(3);
+    expect(result.messages[0]).toBeInstanceOf(AIMessage);
+    expect(result.messages[1]).toBeInstanceOf(ToolMessage);
+    expect(result.messages[2]).toBeInstanceOf(AIMessage);
+
+    const toolCallMessage = result.messages[0] as AIMessage;
+    const finalMessage = result.messages[2] as AIMessage;
+
+    expect(toolCallMessage.content).toBe('Using calculator.');
+    expect(toolCallMessage.tool_calls).toHaveLength(1);
+    expect(toolCallMessage.additional_kwargs.reasoning_content).toBe(
+      'Need calculator.'
+    );
+    expect(finalMessage.content).toBe('127 * 453 = 57531.');
+    expect(finalMessage.additional_kwargs.reasoning_content).toBe(
+      'Calculator returned 57531.'
+    );
+  });
+
+  it('should preserve DeepSeek reasoning from supported hidden content blocks', () => {
+    const payload: TPayload = [
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.THINK,
+            [ContentTypes.THINK]: 'Think. ',
+          },
+          {
+            type: ContentTypes.THINKING,
+            thinking: 'Thinking. ',
+          },
+          {
+            type: ContentTypes.REASONING,
+            reasoning: 'Reasoning. ',
+          },
+          {
+            type: ContentTypes.REASONING_CONTENT,
+            reasoningText: { text: 'Reasoning content.' },
+          },
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]: 'Done.',
+          },
+        ],
+      },
+    ];
+
+    const result = formatAgentMessages(
+      payload,
+      undefined,
+      undefined,
+      undefined,
+      { provider: Providers.DEEPSEEK }
+    );
+
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0]).toBeInstanceOf(AIMessage);
+    expect(result.messages[0].content).toBe('Done.');
+    expect(
+      (result.messages[0] as AIMessage).additional_kwargs.reasoning_content
+    ).toBe('Think. Thinking. Reasoning. Reasoning content.');
+  });
+
+  it('should attach later DeepSeek reasoning to an existing tool-call assistant message', () => {
+    const payload: TPayload = [
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.THINK,
+            [ContentTypes.THINK]: 'Need calculator. ',
+          },
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]: 'Using calculator.',
+            tool_call_ids: ['call_1'],
+          },
+          {
+            type: ContentTypes.THINK,
+            [ContentTypes.THINK]: 'Preparing tool call.',
+          },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 'call_1',
+              name: 'calculator',
+              args: '{"input":"127 * 453"}',
+              output: '57531',
+            },
+          },
+        ],
+      },
+    ];
+
+    const result = formatAgentMessages(
+      payload,
+      undefined,
+      undefined,
+      undefined,
+      { provider: Providers.DEEPSEEK }
+    );
+
+    expect(result.messages).toHaveLength(2);
+    expect(result.messages[0]).toBeInstanceOf(AIMessage);
+    expect(result.messages[1]).toBeInstanceOf(ToolMessage);
+
+    const toolCallMessage = result.messages[0] as AIMessage;
+
+    expect(toolCallMessage.content).toBe('Using calculator.');
+    expect(toolCallMessage.tool_calls).toHaveLength(1);
+    expect(toolCallMessage.additional_kwargs.reasoning_content).toBe(
+      'Need calculator. Preparing tool call.'
     );
   });
 

@@ -1209,4 +1209,171 @@ describe('ensureThinkingBlockInMessages', () => {
       expect(outputImageBlock).not.toBe(originalImageBlock);
     });
   });
+
+  describe('runStartIndex (current-run boundary)', () => {
+    /**
+     * Claude is allowed to skip a thinking block before a tool_use (cf.
+     * PR #116). When the agent's own first iteration produces an
+     * `AI(tool_use, no thinking)`, the function would otherwise convert
+     * it to a `[Previous agent context]` HumanMessage — polluting the
+     * next iteration's prompt with text the model treats as suspicious
+     * injected content. The model then ignores its own real prior tool
+     * result and re-runs the tool to verify, often failing because the
+     * subsequent sandbox doesn't have the file.
+     *
+     * The `runStartIndex` parameter tells the function which messages
+     * are the agent's own in-run work: those at or after it must NEVER
+     * be converted, even if no thinking block appears in the chain.
+     */
+
+    test('preserves the agent first-iteration AI(tool_use) when its index is at runStartIndex', () => {
+      const messages = [
+        new HumanMessage({ content: 'fetch the data' }),
+        // No thinking block — Claude validly skipped it before tool_use
+        new AIMessage({
+          content: '',
+          tool_calls: [
+            { id: 'c1', name: 'fetch', args: {}, type: 'tool_call' as const },
+          ],
+        }),
+        new ToolMessage({ content: 'data', tool_call_id: 'c1' }),
+      ];
+
+      const result = ensureThinkingBlockInMessages(
+        messages,
+        Providers.BEDROCK,
+        undefined,
+        /* runStartIndex */ 1
+      );
+
+      // All 3 preserved — the AI at index 1 is the agent's own work
+      expect(result).toHaveLength(3);
+      expect(result[1]).toBeInstanceOf(AIMessage);
+      expect((result[1] as AIMessage).tool_calls).toHaveLength(1);
+      expect(result[2]).toBeInstanceOf(ToolMessage);
+      // No placeholder leaked in
+      expect(getTextContent(result[1])).not.toContain(
+        '[Previous agent context]'
+      );
+    });
+
+    test('preserves multiple in-run AI(tool_use) iterations without thinking blocks', () => {
+      const messages = [
+        new HumanMessage({ content: 'do work' }),
+        new AIMessage({
+          content: '',
+          tool_calls: [
+            { id: 'c1', name: 'step1', args: {}, type: 'tool_call' as const },
+          ],
+        }),
+        new ToolMessage({ content: 'r1', tool_call_id: 'c1' }),
+        new AIMessage({
+          content: '',
+          tool_calls: [
+            { id: 'c2', name: 'step2', args: {}, type: 'tool_call' as const },
+          ],
+        }),
+        new ToolMessage({ content: 'r2', tool_call_id: 'c2' }),
+      ];
+
+      const result = ensureThinkingBlockInMessages(
+        messages,
+        Providers.BEDROCK,
+        undefined,
+        /* runStartIndex */ 1
+      );
+
+      expect(result).toHaveLength(5);
+      expect(result[1]).toBeInstanceOf(AIMessage);
+      expect(result[3]).toBeInstanceOf(AIMessage);
+      // Neither AI was converted
+      expect(getTextContent(result[1])).not.toContain(
+        '[Previous agent context]'
+      );
+      expect(getTextContent(result[3])).not.toContain(
+        '[Previous agent context]'
+      );
+    });
+
+    test('still converts pre-runStartIndex history that lacks thinking blocks', () => {
+      // Real handoff scenario: a prior non-thinking agent's tool calls
+      // appear before this run started. They genuinely need the
+      // placeholder (the legacy reason this function exists).
+      const messages = [
+        new HumanMessage({ content: 'first request' }),
+        new AIMessage({
+          content: 'using tool',
+          tool_calls: [
+            { id: 'old', name: 'legacy', args: {}, type: 'tool_call' as const },
+          ],
+        }),
+        new ToolMessage({ content: 'old result', tool_call_id: 'old' }),
+        // Current run starts here — say after a handoff. Index >= 3 is
+        // the new agent's own work.
+      ];
+
+      const result = ensureThinkingBlockInMessages(
+        messages,
+        Providers.BEDROCK,
+        undefined,
+        /* runStartIndex */ 3
+      );
+
+      // The pre-run AI(tool_use)+Tool got converted to a placeholder
+      expect(result).toHaveLength(2);
+      expect(result[0]).toBeInstanceOf(HumanMessage);
+      expect(result[1]).toBeInstanceOf(HumanMessage);
+      expect(getTextContent(result[1])).toContain('[Previous agent context]');
+    });
+
+    test('falls back to chainHasThinkingBlock heuristic when runStartIndex is undefined (backward compat)', () => {
+      const messages = [
+        new HumanMessage({ content: 'do work' }),
+        // No reasoning + no runStartIndex hint → still gets converted
+        // (preserves the prior behavior for callers that haven't been
+        // updated to pass the boundary).
+        new AIMessage({
+          content: 'using tool',
+          tool_calls: [
+            { id: 'c1', name: 'tool', args: {}, type: 'tool_call' as const },
+          ],
+        }),
+        new ToolMessage({ content: 'r', tool_call_id: 'c1' }),
+      ];
+
+      const result = ensureThinkingBlockInMessages(messages, Providers.BEDROCK);
+
+      expect(result).toHaveLength(2);
+      expect(result[1]).toBeInstanceOf(HumanMessage);
+      expect(getTextContent(result[1])).toContain('[Previous agent context]');
+    });
+
+    test('runStartIndex of 0 is honored (whole array is the current run)', () => {
+      // Edge: a fresh run with no prior history at all. Everything is
+      // in-run and must be preserved even without thinking blocks.
+      const messages = [
+        new HumanMessage({ content: 'do work' }),
+        new AIMessage({
+          content: '',
+          tool_calls: [
+            { id: 'c1', name: 'tool', args: {}, type: 'tool_call' as const },
+          ],
+        }),
+        new ToolMessage({ content: 'r', tool_call_id: 'c1' }),
+      ];
+
+      const result = ensureThinkingBlockInMessages(
+        messages,
+        Providers.BEDROCK,
+        undefined,
+        /* runStartIndex */ 0
+      );
+
+      expect(result).toHaveLength(3);
+      expect(result[1]).toBeInstanceOf(AIMessage);
+      expect(getTextContent(result[1])).not.toContain(
+        '[Previous agent context]'
+      );
+    });
+  });
 });

@@ -3,10 +3,10 @@
  * Integration tests for Programmatic Tool Calling.
  * These tests hit the LIVE Code API and verify end-to-end functionality.
  *
- * Run with: npm test -- ProgrammaticToolCalling.integration.test.ts
+ * Run with: RUN_CODE_INTEGRATION_TESTS=1 npm test -- ProgrammaticToolCalling.integration.test.ts
  *
- * Requires LIBRECHAT_CODE_API_KEY environment variable.
- * Tests are skipped when the API key is not available.
+ * Opt-in via the `RUN_CODE_INTEGRATION_TESTS` environment variable —
+ * these tests hit a real sandbox so they don't run in CI by default.
  */
 import { config as dotenvConfig } from 'dotenv';
 dotenvConfig();
@@ -22,12 +22,11 @@ import {
   createProgrammaticToolRegistry,
 } from '@/test/mockTools';
 
-const apiKey = process.env.LIBRECHAT_CODE_API_KEY;
-const shouldSkip = apiKey == null || apiKey === '';
+const shouldSkip = process.env.RUN_CODE_INTEGRATION_TESTS !== '1';
 
-const describeIfApiKey = shouldSkip ? describe.skip : describe;
+const describeIfLive = shouldSkip ? describe.skip : describe;
 
-describeIfApiKey('ProgrammaticToolCalling - Live API Integration', () => {
+describeIfLive('ProgrammaticToolCalling - Live API Integration', () => {
   let ptcTool: ReturnType<typeof createProgrammaticToolCallingTool>;
   let toolMap: t.ToolMap;
   let toolDefinitions: t.LCTool[];
@@ -43,7 +42,7 @@ describeIfApiKey('ProgrammaticToolCalling - Live API Integration', () => {
     toolMap = new Map(tools.map((t) => [t.name, t]));
     toolDefinitions = Array.from(createProgrammaticToolRegistry().values());
 
-    ptcTool = createProgrammaticToolCallingTool({ apiKey: apiKey! });
+    ptcTool = createProgrammaticToolCallingTool();
   });
 
   it('executes simple single tool call', async () => {

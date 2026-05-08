@@ -9,6 +9,7 @@ import {
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
 import { Providers } from '@/common';
+import { toLangChainContent } from './langchain';
 
 export function getConverseOverrideMessage({
   userMessage,
@@ -41,7 +42,14 @@ User: ${userMessage[1]}
 const _allowedTypes = ['image_url', 'text', 'tool_use', 'tool_result'];
 const allowedTypesByProvider: Record<string, string[]> = {
   default: _allowedTypes,
-  [Providers.ANTHROPIC]: [..._allowedTypes, 'thinking', 'redacted_thinking'],
+  [Providers.ANTHROPIC]: [
+    ..._allowedTypes,
+    'thinking',
+    'redacted_thinking',
+    'server_tool_use',
+    'web_search_tool_result',
+    'web_search_result',
+  ],
   [Providers.BEDROCK]: [..._allowedTypes, 'reasoning_content'],
   [Providers.OPENAI]: _allowedTypes,
 };
@@ -146,14 +154,18 @@ export function modifyDeltaProperties(
     : '';
 
   if (provider === Providers.BEDROCK && Array.isArray(obj.content)) {
-    obj.content = reduceBlocks(obj.content as ContentBlock[]);
+    obj.content = toLangChainContent(
+      reduceBlocks(obj.content as ContentBlock[])
+    );
   }
   if (Array.isArray(obj.content)) {
-    obj.content = modifyContent({
-      provider,
-      messageType,
-      content: obj.content,
-    }) as t.MessageContentComplex[];
+    obj.content = toLangChainContent(
+      modifyContent({
+        provider,
+        messageType,
+        content: obj.content as t.ExtendedMessageContent[],
+      }) as t.MessageContentComplex[]
+    );
   }
   if (
     (obj as Partial<AIMessageChunk>).lc_kwargs &&
@@ -175,7 +187,7 @@ export function modifyDeltaProperties(
 
 export function formatAnthropicMessage(message: AIMessageChunk): AIMessage {
   if (!message.tool_calls || message.tool_calls.length === 0) {
-    return new AIMessage({ content: message.content });
+    return new AIMessage({ content: toLangChainContent(message.content) });
   }
 
   const toolCallMap = new Map(message.tool_calls.map((tc) => [tc.id, tc]));
@@ -262,7 +274,7 @@ export function formatAnthropicMessage(message: AIMessageChunk): AIMessage {
   );
 
   return new AIMessage({
-    content: formattedContent,
+    content: toLangChainContent(formattedContent),
     tool_calls: formattedToolCalls as ToolCall[],
     additional_kwargs: {
       ...message.additional_kwargs,
@@ -430,7 +442,9 @@ export function formatArtifactPayload(messages: BaseMessage[]): void {
   }
 
   if (aggregatedContent.length > 0) {
-    messages.push(new HumanMessage({ content: aggregatedContent }));
+    messages.push(
+      new HumanMessage({ content: toLangChainContent(aggregatedContent) })
+    );
   }
 }
 

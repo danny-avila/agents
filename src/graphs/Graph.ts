@@ -1,5 +1,6 @@
 /* eslint-disable no-console */
 import { nanoid } from 'nanoid';
+import { tool } from '@langchain/core/tools';
 import { ToolNode } from '@langchain/langgraph/prebuilt';
 import { Runnable, RunnableConfig } from '@langchain/core/runnables';
 import { ToolMessage, AIMessageChunk } from '@langchain/core/messages';
@@ -19,10 +20,13 @@ import {
   extractToolDiscoveries,
   addBedrockCacheControl,
   formatArtifactPayload,
+  enforceOriginalContentCap,
   formatContentStrings,
   createPruneMessages,
   addCacheControl,
   getMessageId,
+  makeIsDeferred,
+  partitionAndMarkAnthropicToolCache,
 } from '@/messages';
 import {
   GraphNodeKeys,
@@ -39,7 +43,10 @@ import {
   joinKeys,
   sleep,
 } from '@/utils';
+import { SubagentExecutor, resolveSubagentConfigs } from '@/tools/subagent';
+import { buildSubagentToolParams } from '@/tools/SubagentTool';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
+import { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { shouldTriggerSummarization } from '@/summarization';
@@ -49,10 +56,13 @@ import { createSchemaOnlyTools } from '@/tools/schema';
 import { AgentContext } from '@/agents/AgentContext';
 import { createFakeStreamingLLM } from '@/llm/fake';
 import { handleToolCalls } from '@/tools/handlers';
+import { resolveLocalToolsForBinding } from '@/tools/local';
+import { createLocalCodingToolBundle } from '@/tools/local/LocalCodingTools';
 import { isThinkingEnabled } from '@/llm/request';
 import { initializeModel } from '@/llm/init';
 import { HandlerRegistry } from '@/events';
 import { ChatOpenAI } from '@/llm/openai';
+import type { HookRegistry } from '@/hooks';
 
 const { AGENT, TOOLS, SUMMARIZE } = GraphNodeKeys;
 
@@ -123,6 +133,32 @@ export abstract class Graph<
   /** Set of invoked tool call IDs from non-message run steps completed mid-run, if any */
   invokedToolIds?: Set<string>;
   handlerRegistry: HandlerRegistry | undefined;
+  hookRegistry: HookRegistry | undefined;
+  /**
+   * Run-scoped HITL configuration. When `humanInTheLoop?.enabled` is
+   * `true`, `ToolNode` raises a real `interrupt()` for `PreToolUse`
+   * `ask` decisions instead of treating them as a synchronous deny.
+   * Threaded from `RunConfig.humanInTheLoop`.
+   */
+  humanInTheLoop: t.HumanInTheLoopConfig | undefined;
+  /**
+   * Run-scoped config for the tool output reference registry. Threaded
+   * from `RunConfig.toolOutputReferences` down into every ToolNode this
+   * graph compiles.
+   */
+  toolOutputReferences: t.ToolOutputReferencesConfig | undefined;
+  /**
+   * Run-scoped execution backend for built-in code tools. Defaults to the
+   * remote Code API sandbox when unset.
+   */
+  toolExecution: t.ToolExecutionConfig | undefined;
+  /**
+   * Shared registry instance used by every ToolNode compiled from this
+   * graph. Lazily constructed on first access so multi-agent graphs
+   * produce one registry per run (not one per agent), letting cross-
+   * agent `{{tool<i>turn<n>}}` substitutions resolve.
+   */
+  private _toolOutputRegistry?: ToolOutputReferenceRegistry;
   /**
    * Tool session contexts for automatic state persistence across tool invocations.
    * Keyed by tool name (e.g., Constants.EXECUTE_CODE).
@@ -147,7 +183,128 @@ export abstract class Graph<
     this.prelimMessageIdsByStepKey = new Map();
     this.invokedToolIds = undefined;
     this.handlerRegistry = undefined;
+    this.hookRegistry = undefined;
+    this.humanInTheLoop = undefined;
+    this.toolOutputReferences = undefined;
+    this.toolExecution = undefined;
+    /**
+     * ToolNodes compiled from this graph captured the registry
+     * instance at construction time, so simply dropping the Graph's
+     * own reference would leave their captured reference — and every
+     * stored `tool<i>turn<n>` entry, plus up to `maxTotalSize` of raw
+     * output — alive across subsequent `processStream()` calls. Wipe
+     * the registry's contents first so subsequent runs start fresh.
+     */
+    this._toolOutputRegistry?.clear();
+    this._toolOutputRegistry = undefined;
+    // NB: `_fileCheckpointer` is intentionally NOT cleared here.
+    // `Run.processStream()` calls `clearHeavyState()` in its
+    // finally block on natural-completion / error paths — exactly
+    // when the host is most likely to want `Run.rewindFiles()` (for
+    // rollback after a failed batch). Per-Run isolation is already
+    // automatic because each `Run.create()` constructs a brand-new
+    // Graph instance, so the next Run gets its own checkpointer
+    // without us needing to reset this field. Codex P1 #32: pre-fix
+    // the checkpointer was nulled before the caller could reach it.
+    // Flush each compiled ToolNode's direct-path turn cache so it
+    // doesn't leak across Runs (Codex P2 #33). The cache survives
+    // `run()` re-entry by design (resume-stable), but end-of-Run
+    // is the right point to reset it.
+    for (const node of this._compiledToolNodes) {
+      node.clearDirectPathTurns();
+    }
+    this._compiledToolNodes.clear();
     this.sessions.clear();
+  }
+
+  /**
+   * Subclass hook to register a freshly compiled ToolNode so
+   * `clearHeavyState` can flush its per-Run direct-path turn cache
+   * at end-of-Run. Internal — called from `initializeTools` in the
+   * concrete graph subclasses.
+   */
+  protected registerCompiledToolNode(node: {
+    clearDirectPathTurns(): void;
+  }): void {
+    this._compiledToolNodes.add(node);
+  }
+
+  /**
+   * Returns the shared `ToolOutputReferenceRegistry` for this run,
+   * constructing it on first access. Returns `undefined` when the
+   * feature is disabled. All ToolNodes compiled from this graph share
+   * this single instance so cross-agent `{{…}}` references resolve.
+   *
+   * @internal Public so `attemptInvoke` can read it through the typed
+   * `InvokeContext` and project ToolMessages into LLM-facing annotated
+   * copies right before each provider call (see
+   * `annotateMessagesForLLM`). Host code should not call this directly
+   * — registry mutations outside the ToolNode lifecycle break the
+   * partitioning, eviction, and turn-counter invariants.
+   */
+  public getOrCreateToolOutputRegistry():
+    | ToolOutputReferenceRegistry
+    | undefined {
+    if (this.toolOutputReferences?.enabled !== true) {
+      return undefined;
+    }
+    if (this._toolOutputRegistry == null) {
+      this._toolOutputRegistry = new ToolOutputReferenceRegistry({
+        maxOutputSize: this.toolOutputReferences.maxOutputSize,
+        maxTotalSize: this.toolOutputReferences.maxTotalSize,
+      });
+    }
+    return this._toolOutputRegistry;
+  }
+
+  /**
+   * Single per-Run file checkpointer shared across every ToolNode the
+   * graph compiles. Lazily constructed when
+   * `toolExecution.local.fileCheckpointing === true` so multi-agent
+   * graphs see ONE snapshot store, not one-per-agent. Returns
+   * undefined when checkpointing is disabled or the local engine
+   * isn't selected. Exposed via `Run.getFileCheckpointer()` /
+   * `Run.rewindFiles()`.
+   */
+  private _fileCheckpointer?: t.LocalFileCheckpointer;
+  /**
+   * ToolNodes compiled into this Graph's workflow. Tracked so
+   * `clearHeavyState()` can flush their per-Run direct-path turn
+   * cache (`directPathTurns`) at end-of-Run — that map intentionally
+   * survives `run()` re-entry (resume-stable per Codex P2 #30) but
+   * would otherwise grow linearly with tool calls and could collide
+   * across Runs if a provider reuses call ids (Codex P2 #33).
+   */
+  private _compiledToolNodes: Set<{
+    clearDirectPathTurns(): void;
+  }> = new Set();
+  public getOrCreateFileCheckpointer():
+    | t.LocalFileCheckpointer
+    | undefined {
+    // Return the cached instance unconditionally if one exists. The
+    // toolExecution check below decides whether to *create* a new
+    // one — `clearHeavyState` nulls `this.toolExecution` at end-of-
+    // Run, but we want post-Run `Run.rewindFiles()` to still resolve
+    // to the checkpointer that captured the writes. Codex P1 #32.
+    if (this._fileCheckpointer != null) {
+      return this._fileCheckpointer;
+    }
+    if (
+      this.toolExecution?.engine !== 'local' ||
+      this.toolExecution.local?.fileCheckpointing !== true
+    ) {
+      return undefined;
+    }
+    // Eagerly create via the bundle factory so the construction path
+    // matches the bundle-only callers (and future bundle-internal
+    // cleanup hooks fire). The bundle factory itself accepts a pre-
+    // supplied checkpointer when present, so re-injecting this one
+    // into every ToolNode is idempotent.
+    const bundle = createLocalCodingToolBundle(
+      this.toolExecution.local ?? {}
+    );
+    this._fileCheckpointer = bundle.checkpointer;
+    return this._fileCheckpointer;
   }
 }
 
@@ -340,12 +497,25 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   ): (string | number | undefined)[] {
     if (!metadata) return [];
 
+    const configurable = this.config?.configurable;
+    const runId =
+      (metadata.run_id as string | undefined) ??
+      (configurable?.run_id as string | undefined) ??
+      this.runId;
+    const threadId =
+      (metadata.thread_id as string | undefined) ??
+      (configurable?.thread_id as string | undefined) ??
+      runId;
+    const checkpointNs =
+      (metadata.checkpoint_ns as string | undefined) ??
+      (metadata.langgraph_checkpoint_ns as string | undefined) ??
+      '';
     const keyList = [
-      metadata.run_id as string,
-      metadata.thread_id as string,
+      runId,
+      threadId,
       metadata.langgraph_node as string,
       metadata.langgraph_step as number,
-      metadata.checkpoint_ns as string,
+      checkpointNs,
     ];
 
     const agentContext = this.getAgentContext(metadata);
@@ -497,7 +667,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         }
       }
 
-      return new CustomToolNode<t.BaseGraphState>({
+      const node = new CustomToolNode<t.BaseGraphState>({
         tools: allTools,
         toolMap: allToolMap,
         eventDrivenMode: true,
@@ -506,12 +676,19 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         agentId: agentContext?.agentId,
         toolCallStepIds: this.toolCallStepIds,
         toolRegistry: agentContext?.toolRegistry,
+        hookRegistry: this.hookRegistry,
+        humanInTheLoop: this.humanInTheLoop,
+        toolExecution: this.toolExecution,
         directToolNames: directToolNames.size > 0 ? directToolNames : undefined,
         maxContextTokens: agentContext?.maxContextTokens,
         maxToolResultChars: agentContext?.maxToolResultChars,
-        errorHandler: (data, metadata) =>
+        toolOutputRegistry: this.getOrCreateToolOutputRegistry(),
+        fileCheckpointer: this.getOrCreateFileCheckpointer(),
+        errorHandler: (data, metadata): Promise<void> =>
           StandardGraph.handleToolCallErrorStatic(this, data, metadata),
       });
+      this.registerCompiledToolNode(node);
+      return node;
     }
 
     const graphTools = agentContext?.graphTools as t.GenericTool[] | undefined;
@@ -530,17 +707,24 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         ])
         : currentToolMap;
 
-    return new CustomToolNode<t.BaseGraphState>({
+    const node = new CustomToolNode<t.BaseGraphState>({
       tools: allTraditionalTools,
       toolMap: traditionalToolMap,
       toolCallStepIds: this.toolCallStepIds,
-      errorHandler: (data, metadata) =>
+      errorHandler: (data, metadata): Promise<void> =>
         StandardGraph.handleToolCallErrorStatic(this, data, metadata),
       toolRegistry: agentContext?.toolRegistry,
       sessions: this.sessions,
+      toolExecution: this.toolExecution,
+      hookRegistry: this.hookRegistry,
+      humanInTheLoop: this.humanInTheLoop,
       maxContextTokens: agentContext?.maxContextTokens,
       maxToolResultChars: agentContext?.maxToolResultChars,
+      toolOutputRegistry: this.getOrCreateToolOutputRegistry(),
+      fileCheckpointer: this.getOrCreateFileCheckpointer(),
     });
+    this.registerCompiledToolNode(node);
+    return node;
   }
 
   overrideTestModel(
@@ -604,7 +788,37 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         agentContext.markToolsAsDiscovered(discoveredNames);
       }
 
-      const toolsForBinding = agentContext.getToolsForBinding();
+      const rawToolsForBinding = resolveLocalToolsForBinding({
+        tools: agentContext.getToolsForBinding(),
+        toolExecution: this.toolExecution,
+      });
+
+      /**
+       * Anthropic prompt-cache breakpoint on the tool definitions.
+       *
+       * Without this, the (often static) tool inventory shows up as
+       * fresh input on every turn — measured at ~28k tokens/turn for
+       * the local engine's coding-tool bundle, dominating per-turn
+       * cost even when message-level caching is on.
+       *
+       * Strategy: partition tools into [static, deferred] and stamp
+       * `cache_control: ephemeral` on the last static tool.
+       * Discovered deferred tools that arrive across turns sit *after*
+       * the breakpoint and don't invalidate the prefix.
+       */
+      let toolsForBinding = rawToolsForBinding;
+      if (
+        agentContext.provider === Providers.ANTHROPIC &&
+        (agentContext.clientOptions as t.AnthropicClientOptions | undefined)
+          ?.promptCache === true
+      ) {
+        toolsForBinding =
+          partitionAndMarkAnthropicToolCache(
+            rawToolsForBinding,
+            makeIsDeferred(agentContext.toolDefinitions)
+          ) ?? rawToolsForBinding;
+      }
+
       let model =
         this.overrideModel ??
         initializeModel({
@@ -720,7 +934,35 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
           if (triggerResult) {
             if (originalToolContent != null && originalToolContent.size > 0) {
-              agentContext.pendingOriginalToolContent = originalToolContent;
+              /**
+               * Merge — never overwrite — the pruner's masking record
+               * into pendingOriginalToolContent.  Carry-over entries
+               * from a prior summarize (preserved by the recency
+               * window for masked tool messages still in the tail) and
+               * the current pruner's new entries are both keyed by
+               * indices in the current `state.messages`, so a key-wise
+               * union is correct.  Overwriting would discard the
+               * carry-over and reduce summary fidelity when those
+               * masked tail messages eventually move into the head.
+               */
+              if (agentContext.pendingOriginalToolContent == null) {
+                agentContext.pendingOriginalToolContent = originalToolContent;
+              } else {
+                for (const [idx, content] of originalToolContent) {
+                  agentContext.pendingOriginalToolContent.set(idx, content);
+                }
+                /**
+                 * Re-apply the per-store char cap after the union.  The
+                 * pruner enforces ORIGINAL_CONTENT_MAX_CHARS inside its
+                 * own map via the onContentStored callback, but a
+                 * key-wise merge with recency carry-over bypasses that
+                 * accounting and could let the merged map grow without
+                 * bound across long sessions.
+                 */
+                enforceOriginalContentCap(
+                  agentContext.pendingOriginalToolContent
+                );
+              }
             }
 
             emitAgentLog(
@@ -843,10 +1085,21 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       if (
         isThinkingEnabled(agentContext.provider, agentContext.clientOptions)
       ) {
+        /**
+         * Pass `this.startIndex` so the function can distinguish CURRENT-run
+         * AI messages (the agent's own iterations — possibly without a
+         * leading thinking block, which Claude is allowed to skip) from
+         * historical context that genuinely needs the
+         * `[Previous agent context]` placeholder. Without this signal the
+         * function would convert the agent's own in-run tool_use messages,
+         * polluting the next iteration's prompt with a placeholder the
+         * model treats as suspicious injected content.
+         */
         finalMessages = ensureThinkingBlockInMessages(
           finalMessages,
           agentContext.provider,
-          config
+          config,
+          this.startIndex
         );
       }
 
@@ -1155,6 +1408,120 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       throw new Error(`Agent context not found for agentId: ${agentId}`);
     }
 
+    /**
+     * Depth countdown across graph boundaries: the parent's `maxSubagentDepth`
+     * becomes this executor's `maxDepth`. When the child graph is constructed,
+     * `buildChildInputs()` decrements `maxSubagentDepth` on the child's
+     * `AgentInputs` (only when `allowNested: true`; otherwise subagentConfigs
+     * are stripped entirely). The child graph's own `createAgentNode()` then
+     * reads the decremented value here and creates a narrower executor —
+     * recursion is bounded even though each graph has its own separate
+     * executor instance.
+     */
+    const effectiveSubagentDepth = agentContext.maxSubagentDepth ?? 1;
+    if (
+      agentContext.subagentConfigs != null &&
+      agentContext.subagentConfigs.length > 0 &&
+      effectiveSubagentDepth > 0
+    ) {
+      const resolvedConfigs = resolveSubagentConfigs(
+        agentContext.subagentConfigs,
+        agentContext
+      );
+      if (resolvedConfigs.length > 0) {
+        const getParentHandlerRegistry = (): HandlerRegistry | undefined =>
+          this.handlerRegistry;
+        const executor = new SubagentExecutor({
+          configs: new Map(resolvedConfigs.map((c) => [c.type, c])),
+          parentSignal: this.signal,
+          hookRegistry: this.hookRegistry,
+          /** Lazy — Run wires the registry onto the graph AFTER
+           *  `createWorkflow()` runs, so a direct capture here would be
+           *  `undefined` at construction time. */
+          parentHandlerRegistry: getParentHandlerRegistry,
+          parentRunId: this.runId ?? '',
+          parentAgentId: agentContext.agentId,
+          tokenCounter: agentContext.tokenCounter,
+          maxDepth: effectiveSubagentDepth,
+          createChildGraph: (input): StandardGraph => new StandardGraph(input),
+        });
+
+        const subagentTool = tool(async (rawInput, config) => {
+          const input = rawInput as {
+            description?: string;
+            subagent_type?: string;
+          };
+          const description =
+            typeof input.description === 'string' &&
+            input.description.trim().length > 0
+              ? input.description
+              : 'No task description provided';
+          const subagentType =
+            typeof input.subagent_type === 'string' ? input.subagent_type : '';
+          const threadId = config.configurable?.thread_id as string | undefined;
+          /**
+           * When the tool is dispatched from an LLM's `tool_call`, LangChain
+           * threads the originating `ToolCall` onto the RunnableConfig as
+           * `config.toolCall` (see `ToolRunnableConfig` in
+           * `@langchain/core/tools` — internal but stable since ≥0.3.x).
+           * Surfacing its id lets hosts correlate `SubagentUpdateEvent`s
+           * back to the parent's `tool_call_id` deterministically — no
+           * temporal heuristics needed. If a future LangChain version
+           * changes the threading, the type-guarded read falls back to
+           * `undefined` and the correlation degrades gracefully.
+           */
+          const toolCall = (config as { toolCall?: { id?: string } }).toolCall;
+          const parentToolCallId =
+            typeof toolCall?.id === 'string' ? toolCall.id : undefined;
+          const result = await executor.execute({
+            description,
+            subagentType,
+            threadId,
+            parentToolCallId,
+            /**
+             * Forward the parent's `configurable` so host-set fields
+             * (`requestBody`, `user`, etc.) propagate into the child
+             * workflow. The executor scrubs run-identity fields before
+             * forwarding — see `SubagentExecuteParams.parentConfigurable`.
+             */
+            parentConfigurable: config.configurable as
+              | Record<string, unknown>
+              | undefined,
+          });
+          return result.content;
+        }, buildSubagentToolParams(resolvedConfigs));
+
+        if (!agentContext.graphTools) {
+          agentContext.graphTools = [];
+        }
+        (agentContext.graphTools as t.GenericTool[]).push(subagentTool);
+
+        /**
+         * Refresh toolSchemaTokens to include the subagent tool's schema.
+         * `calculateInstructionTokens()` was kicked off in `fromConfig()`
+         * before graphTools was populated, so its result did not count this
+         * tool. Without this retrigger, token-budget/pruning logic
+         * underestimates prompt overhead.
+         */
+        if (agentContext.tokenCounter) {
+          const { tokenCounter, baseIndexTokenCountMap } = agentContext;
+          agentContext.tokenCalculationPromise = agentContext
+            .calculateInstructionTokens(tokenCounter)
+            .then(() => {
+              agentContext.updateTokenMapWithInstructions(
+                baseIndexTokenCountMap
+              );
+            })
+            .catch((err) => {
+              console.error(
+                'Error recalculating instruction tokens after subagent tool injection:',
+                err
+              );
+            });
+        }
+      }
+    }
+
     const agentNode = `${AGENT}${agentId}` as const;
     const toolNode = `${TOOLS}${agentId}` as const;
     const summarizeNode = `${SUMMARIZE}${agentId}` as const;
@@ -1210,6 +1577,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             },
             runId: this.runId,
             isMultiAgent: this.isMultiAgentGraph(),
+            hookRegistry: this.hookRegistry,
             dispatchRunStep: async (runStep, nodeConfig) => {
               this.contentData.push(runStep);
               this.contentIndexMap.set(runStep.id, runStep.index);
@@ -1289,7 +1657,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }),
     });
     const workflow = new StateGraph(StateAnnotation)
-      .addNode(this.defaultAgentId, agentNode, { ends: [END] })
+      .addNode(
+        this.defaultAgentId,
+        agentNode as Runnable<
+          t.AgentSubgraphState,
+          Partial<t.AgentSubgraphState>
+        >,
+        { ends: [END] }
+      )
       .addEdge(START, this.defaultAgentId)
       // LangGraph compile() types are overly strict for opt-in options
       .compile(this.compileOptions as unknown as never);

@@ -1,8 +1,8 @@
 import { config } from 'dotenv';
 config();
-import { test, jest } from '@jest/globals';
+import { beforeEach, test, jest } from '@jest/globals';
 
-jest.setTimeout(90000);
+jest.setTimeout(Number(process.env.GOOGLE_TEST_TIMEOUT_MS ?? 120000));
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import {
@@ -19,29 +19,177 @@ import {
 import { StructuredTool, tool } from '@langchain/core/tools';
 import { z } from 'zod/v3';
 import {
-  CodeExecutionTool,
   DynamicRetrievalMode,
   SchemaType as FunctionDeclarationSchemaType,
-  GoogleSearchRetrievalTool,
 } from '@google/generative-ai';
 import { concat } from '@langchain/core/utils/stream';
+import type {
+  CodeExecutionTool,
+  GoogleSearchRetrievalTool,
+} from '@google/generative-ai';
+import type { ContentBlock } from '@langchain/core/messages';
 import { CustomChatGoogleGenerativeAI as ChatGoogleGenerativeAI } from './index';
 import { _FUNCTION_CALL_THOUGHT_SIGNATURES_MAP_KEY } from './utils/common';
 
 // Save the original value of the 'LANGCHAIN_CALLBACKS_BACKGROUND' environment variable
 const originalBackground = process.env.LANGCHAIN_CALLBACKS_BACKGROUND;
 
+const GOOGLE_TEST_MAX_RETRIES = Number(
+  process.env.GOOGLE_TEST_MAX_RETRIES ?? 2
+);
+const GOOGLE_TEST_CALL_GAP_MS = Number(
+  process.env.GOOGLE_TEST_CALL_GAP_MS ?? 1000
+);
+const GOOGLE_TEST_MAX_RETRY_DELAY_MS = Number(
+  process.env.GOOGLE_TEST_MAX_RETRY_DELAY_MS ?? 50000
+);
+let lastGoogleTestCallAt = 0;
+
+const wait = async (ms: number): Promise<void> =>
+  new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+
+async function waitForGoogleTestSlot(): Promise<void> {
+  const waitMs = Math.max(
+    0,
+    lastGoogleTestCallAt + GOOGLE_TEST_CALL_GAP_MS - Date.now()
+  );
+  if (waitMs > 0) {
+    await wait(waitMs);
+  }
+  lastGoogleTestCallAt = Date.now();
+}
+
+const GOOGLE_NO_RETRY_STATUSES = new Set([
+  400, 401, 402, 403, 404, 405, 406, 407, 409,
+]);
+
+interface GoogleRetryInfoDetail {
+  '@type'?: string;
+  retryDelay?: string;
+}
+
+interface GoogleFetchErrorLike extends Error {
+  status?: number;
+  errorDetails?: GoogleRetryInfoDetail[];
+}
+
+interface ErrorWithCode extends Error {
+  code?: string;
+}
+
+function throwIfNonRetryableError(error: unknown): void {
+  if (!(error instanceof Error)) {
+    return;
+  }
+  if (
+    error.message.startsWith('Cancel') ||
+    error.message.startsWith('AbortError') ||
+    error.name === 'AbortError'
+  ) {
+    throw error;
+  }
+  const errorCode = (error as Partial<ErrorWithCode>).code;
+  if (errorCode === 'ECONNABORTED') {
+    throw error;
+  }
+}
+
+function getGoogleFetchError(error: unknown): GoogleFetchErrorLike | undefined {
+  if (!(error instanceof Error)) {
+    return undefined;
+  }
+  const possibleError = error as Partial<GoogleFetchErrorLike>;
+  if (
+    typeof possibleError.status !== 'number' &&
+    !Array.isArray(possibleError.errorDetails)
+  ) {
+    return undefined;
+  }
+  return possibleError as GoogleFetchErrorLike;
+}
+
+function parseGoogleRetryDelayMs(retryDelay: string): number | undefined {
+  const retryDelaySeconds = /^(\d+(?:\.\d+)?)s$/.exec(retryDelay)?.[1];
+  if (retryDelaySeconds === undefined) {
+    return undefined;
+  }
+  return Math.ceil(Number(retryDelaySeconds) * 1000);
+}
+
+function getGoogleRetryDelayMs(
+  error: GoogleFetchErrorLike
+): number | undefined {
+  const retryInfoDelay = error.errorDetails?.find(
+    (detail) => detail['@type'] === 'type.googleapis.com/google.rpc.RetryInfo'
+  )?.retryDelay;
+  if (retryInfoDelay !== undefined) {
+    return parseGoogleRetryDelayMs(retryInfoDelay);
+  }
+  const messageDelay = /Please retry in (\d+(?:\.\d+)?)s/.exec(
+    error.message
+  )?.[1];
+  if (messageDelay === undefined) {
+    return undefined;
+  }
+  return Math.ceil(Number(messageDelay) * 1000);
+}
+
+async function handleGoogleFailedAttempt(error: unknown): Promise<void> {
+  throwIfNonRetryableError(error);
+  const googleError = getGoogleFetchError(error);
+  if (googleError === undefined) {
+    return;
+  }
+  if (
+    googleError.status !== undefined &&
+    GOOGLE_NO_RETRY_STATUSES.has(googleError.status)
+  ) {
+    throw googleError;
+  }
+  if (googleError.status !== 429) {
+    return;
+  }
+  if (/\blimit:\s*0\b/.test(googleError.message)) {
+    throw googleError;
+  }
+  const retryDelayMs = getGoogleRetryDelayMs(googleError);
+  if (retryDelayMs === undefined) {
+    return;
+  }
+  await wait(Math.min(retryDelayMs, GOOGLE_TEST_MAX_RETRY_DELAY_MS));
+}
+
+function createGoogleModel(
+  fields: ConstructorParameters<typeof ChatGoogleGenerativeAI>[0]
+): ChatGoogleGenerativeAI {
+  return new ChatGoogleGenerativeAI({
+    ...fields,
+    maxRetries: GOOGLE_TEST_MAX_RETRIES,
+    onFailedAttempt: handleGoogleFailedAttempt,
+  });
+}
+
+beforeEach(async () => {
+  await waitForGoogleTestSlot();
+});
+
 const dummyToolResponse =
   "[{\"title\":\"Weather in New York City\",\"url\":\"https://www.weatherapi.com/\",\"content\":\"{'location': {'name': 'New York', 'region': 'New York', 'country': 'United States of America', 'lat': 40.71, 'lon': -74.01, 'tz_id': 'America/New_York', 'localtime_epoch': 1718659486, 'localtime': '2024-06-17 17:24'}, 'current': {'last_updated_epoch': 1718658900, 'last_updated': '2024-06-17 17:15', 'temp_c': 27.8, 'temp_f': 82.0, 'is_day': 1, 'condition': {'text': 'Partly cloudy', 'icon': '//cdn.weatherapi.com/weather/64x64/day/116.png', 'code': 1003}, 'wind_mph': 2.2, 'wind_kph': 3.6, 'wind_degree': 159, 'wind_dir': 'SSE', 'pressure_mb': 1021.0, 'pressure_in': 30.15, 'precip_mm': 0.0, 'precip_in': 0.0, 'humidity': 58, 'cloud': 25, 'feelslike_c': 29.0, 'feelslike_f': 84.2, 'windchill_c': 26.9, 'windchill_f': 80.5, 'heatindex_c': 27.9, 'heatindex_f': 82.2, 'dewpoint_c': 17.1, 'dewpoint_f': 62.8, 'vis_km': 16.0, 'vis_miles': 9.0, 'uv': 7.0, 'gust_mph': 18.3, 'gust_kph': 29.4}}\",\"score\":0.98192,\"raw_content\":null},{\"title\":\"New York, NY Monthly Weather | AccuWeather\",\"url\":\"https://www.accuweather.com/en/us/new-york/10021/june-weather/349727\",\"content\":\"Get the monthly weather forecast for New York, NY, including daily high/low, historical averages, to help you plan ahead.\",\"score\":0.97504,\"raw_content\":null}]";
 
 test('Test Google AI', async () => {
-  const model = new ChatGoogleGenerativeAI({ model: 'gemini-2.0-flash' });
+  const model = createGoogleModel({
+    model: 'gemini-2.0-flash',
+  });
   const res = await model.invoke('what is 1 + 1?');
   expect(res).toBeTruthy();
 });
 
 test('Test Google AI generation', async () => {
-  const model = new ChatGoogleGenerativeAI({ model: 'gemini-2.0-flash' });
+  const model = createGoogleModel({
+    model: 'gemini-2.0-flash',
+  });
   const res = await model.generate([
     [['human', 'Translate "I love programming" into Korean.']],
   ]);
@@ -49,7 +197,7 @@ test('Test Google AI generation', async () => {
 });
 
 test('Test Google AI generation with a stop sequence', async () => {
-  const model = new ChatGoogleGenerativeAI({
+  const model = createGoogleModel({
     model: 'gemini-2.0-flash',
     stopSequences: ['two', '2'],
   });
@@ -63,7 +211,9 @@ test('Test Google AI generation with a stop sequence', async () => {
 });
 
 test('Test Google AI generation with a system message', async () => {
-  const model = new ChatGoogleGenerativeAI({ model: 'gemini-2.0-flash' });
+  const model = createGoogleModel({
+    model: 'gemini-2.0-flash',
+  });
   const res = await model.generate([
     [
       ['system', 'You are an amazing translator.'],
@@ -77,7 +227,7 @@ test('Test Google AI multimodal generation', async () => {
   const imageData = (
     await fs.readFile(path.join(__dirname, '/data/hotdog.jpg'))
   ).toString('base64');
-  const model = new ChatGoogleGenerativeAI({
+  const model = createGoogleModel({
     model: 'gemini-2.0-flash',
   });
   const res = await model.invoke([
@@ -104,19 +254,19 @@ test('Test Google AI handleLLMNewToken callback', async () => {
   process.env.LANGCHAIN_CALLBACKS_BACKGROUND = 'false';
 
   try {
-    const model = new ChatGoogleGenerativeAI({ model: 'gemini-2.0-flash' });
+    const model = createGoogleModel({
+      model: 'gemini-2.0-flash',
+    });
     let tokens = '';
-    const res = await model.call(
-      [new HumanMessage('what is 1 + 1?')],
-      undefined,
-      [
+    const res = await model.invoke([new HumanMessage('what is 1 + 1?')], {
+      callbacks: [
         {
           handleLLMNewToken(token: string): void {
             tokens += token;
           },
         },
-      ]
-    );
+      ],
+    });
     const responseContent = typeof res.content === 'string' ? res.content : '';
     expect(tokens).toBe(responseContent);
   } finally {
@@ -132,7 +282,9 @@ test('Test Google AI handleLLMNewToken callback with streaming', async () => {
   process.env.LANGCHAIN_CALLBACKS_BACKGROUND = 'false';
 
   try {
-    const model = new ChatGoogleGenerativeAI({ model: 'gemini-2.0-flash' });
+    const model = createGoogleModel({
+      model: 'gemini-2.0-flash',
+    });
     let tokens = '';
     const res = await model.stream([new HumanMessage('what is 1 + 1?')], {
       callbacks: [
@@ -161,7 +313,7 @@ test('Test Google AI in streaming mode', async () => {
   process.env.LANGCHAIN_CALLBACKS_BACKGROUND = 'false';
 
   try {
-    const model = new ChatGoogleGenerativeAI({
+    const model = createGoogleModel({
       model: 'gemini-2.0-flash',
       streaming: true,
     });
@@ -198,10 +350,9 @@ test('Gemini can understand audio', async () => {
   const audioPath = path.join(__dirname, 'data/gettysburg10.wav');
   const audioMimeType = 'audio/wav';
 
-  const model = new ChatGoogleGenerativeAI({
+  const model = createGoogleModel({
     model: 'gemini-2.0-flash',
     temperature: 0,
-    maxRetries: 0,
   });
 
   const audioBase64 = await fileToBase64(audioPath);
@@ -272,7 +423,9 @@ const prompt = new HumanMessage(
 );
 
 test('ChatGoogleGenerativeAI can bind and invoke langchain tools', async () => {
-  const model = new ChatGoogleGenerativeAI({ model: 'gemini-2.5-flash' });
+  const model = createGoogleModel({
+    model: 'gemini-2.5-flash',
+  });
 
   const modelWithTools = model.bindTools([new FakeBrowserTool()]);
   const res = await modelWithTools.invoke([prompt]);
@@ -287,7 +440,7 @@ test('ChatGoogleGenerativeAI can bind and invoke langchain tools', async () => {
 });
 
 test('ChatGoogleGenerativeAI can bind and stream langchain tools', async () => {
-  const model = new ChatGoogleGenerativeAI({
+  const model = createGoogleModel({
     model: 'gemini-2.5-flash',
   });
 
@@ -315,9 +468,8 @@ test('ChatGoogleGenerativeAI can bind and stream langchain tools', async () => {
 });
 
 test('ChatGoogleGenerativeAI can handle streaming tool messages.', async () => {
-  const model = new ChatGoogleGenerativeAI({
+  const model = createGoogleModel({
     model: 'gemini-2.5-flash',
-    maxRetries: 1,
   });
 
   const browserTool = new FakeBrowserTool();
@@ -359,9 +511,8 @@ test('ChatGoogleGenerativeAI can handle streaming tool messages.', async () => {
 });
 
 test('ChatGoogleGenerativeAI can handle invoking tool messages.', async () => {
-  const model = new ChatGoogleGenerativeAI({
+  const model = createGoogleModel({
     model: 'gemini-2.5-flash',
-    maxRetries: 1,
   });
 
   const browserTool = new FakeBrowserTool();
@@ -393,7 +544,9 @@ test('ChatGoogleGenerativeAI can handle invoking tool messages.', async () => {
 });
 
 test('ChatGoogleGenerativeAI can bind and invoke genai tools', async () => {
-  const model = new ChatGoogleGenerativeAI({ model: 'gemini-2.5-flash' });
+  const model = createGoogleModel({
+    model: 'gemini-2.5-flash',
+  });
 
   const modelWithTools = model.bindTools([googleGenAITool]);
   const res = await modelWithTools.invoke([prompt]);
@@ -408,7 +561,9 @@ test('ChatGoogleGenerativeAI can bind and invoke genai tools', async () => {
 });
 
 test('ChatGoogleGenerativeAI can bindTools with langchain tools and invoke', async () => {
-  const model = new ChatGoogleGenerativeAI({ model: 'gemini-2.5-flash' });
+  const model = createGoogleModel({
+    model: 'gemini-2.5-flash',
+  });
 
   const modelWithTools = model.bindTools([new FakeBrowserTool()]);
   const res = await modelWithTools.invoke([prompt]);
@@ -423,7 +578,9 @@ test('ChatGoogleGenerativeAI can bindTools with langchain tools and invoke', asy
 });
 
 test('ChatGoogleGenerativeAI can bindTools with genai tools and invoke', async () => {
-  const model = new ChatGoogleGenerativeAI({ model: 'gemini-2.5-flash' });
+  const model = createGoogleModel({
+    model: 'gemini-2.5-flash',
+  });
 
   const modelWithTools = model.bindTools([googleGenAITool]);
   const res = await modelWithTools.invoke([prompt]);
@@ -438,7 +595,9 @@ test('ChatGoogleGenerativeAI can bindTools with genai tools and invoke', async (
 });
 
 test('ChatGoogleGenerativeAI can call withStructuredOutput langchain tools and invoke', async () => {
-  const model = new ChatGoogleGenerativeAI({ model: 'gemini-2.0-flash' });
+  const model = createGoogleModel({
+    model: 'gemini-2.0-flash',
+  });
 
   const modelWithTools = model.withStructuredOutput(
     z.object({
@@ -451,7 +610,9 @@ test('ChatGoogleGenerativeAI can call withStructuredOutput langchain tools and i
 });
 
 test('ChatGoogleGenerativeAI can call withStructuredOutput genai tools and invoke', async () => {
-  const model = new ChatGoogleGenerativeAI({ model: 'gemini-2.0-flash' });
+  const model = createGoogleModel({
+    model: 'gemini-2.0-flash',
+  });
 
   type GeminiTool = {
     url: string;
@@ -466,7 +627,7 @@ test('ChatGoogleGenerativeAI can call withStructuredOutput genai tools and invok
 });
 
 test('Stream token count usage_metadata', async () => {
-  const model = new ChatGoogleGenerativeAI({
+  const model = createGoogleModel({
     temperature: 0,
     model: 'gemini-2.0-flash',
     maxOutputTokens: 10,
@@ -497,10 +658,9 @@ describe('ChatGoogleGenerativeAI should count tokens correctly', () => {
     test.each(['gemini-2.5-flash', 'gemini-2.5-pro'])(
       'with %s',
       async (modelName) => {
-        const model = new ChatGoogleGenerativeAI({
+        const model = createGoogleModel({
           model: modelName,
           temperature: 0,
-          maxRetries: 0,
         });
         const res = await model.stream('Why is the sky blue? Be concise.');
         let full: AIMessageChunk | undefined;
@@ -516,7 +676,7 @@ describe('ChatGoogleGenerativeAI should count tokens correctly', () => {
 });
 
 test('streamUsage excludes token usage', async () => {
-  const model = new ChatGoogleGenerativeAI({
+  const model = createGoogleModel({
     temperature: 0,
     model: 'gemini-2.0-flash',
     streamUsage: false,
@@ -535,7 +695,7 @@ test('streamUsage excludes token usage', async () => {
 });
 
 test('Invoke token count usage_metadata', async () => {
-  const model = new ChatGoogleGenerativeAI({
+  const model = createGoogleModel({
     temperature: 0,
     model: 'gemini-2.0-flash',
     maxOutputTokens: 10,
@@ -553,7 +713,7 @@ test('Invoke token count usage_metadata', async () => {
 });
 
 test('Invoke with JSON mode', async () => {
-  const model = new ChatGoogleGenerativeAI({
+  const model = createGoogleModel({
     model: 'gemini-2.0-flash',
     temperature: 0,
     maxOutputTokens: 10,
@@ -572,7 +732,9 @@ test('Invoke with JSON mode', async () => {
 });
 
 test('Supports tool_choice', async () => {
-  const model = new ChatGoogleGenerativeAI({ model: 'gemini-2.0-flash' });
+  const model = createGoogleModel({
+    model: 'gemini-2.0-flash',
+  });
   const tools = [
     {
       name: 'get_weather',
@@ -600,16 +762,63 @@ test('Supports tool_choice', async () => {
   expect(response.tool_calls?.length).toBe(1);
 });
 
+describe('GoogleSearchRetrievalTool', () => {
+  test('Supports GoogleSearchRetrievalTool', async () => {
+    const searchRetrievalTool: GoogleSearchRetrievalTool = {
+      googleSearchRetrieval: {
+        dynamicRetrievalConfig: {
+          mode: DynamicRetrievalMode.MODE_DYNAMIC,
+          dynamicThreshold: 0.7,
+        },
+      },
+    };
+    const model = createGoogleModel({
+      model: 'gemini-1.5-pro',
+      temperature: 0,
+    }).bindTools([searchRetrievalTool]);
+
+    const result = await model.invoke('Who won the 2024 MLB World Series?');
+
+    expect(result.response_metadata?.groundingMetadata).toBeDefined();
+    expect(result.content as string).toContain('Dodgers');
+  });
+
+  test('Can stream GoogleSearchRetrievalTool', async () => {
+    const searchRetrievalTool: GoogleSearchRetrievalTool = {
+      googleSearchRetrieval: {
+        dynamicRetrievalConfig: {
+          mode: DynamicRetrievalMode.MODE_DYNAMIC,
+          dynamicThreshold: 0.7,
+        },
+      },
+    };
+    const model = createGoogleModel({
+      model: 'gemini-1.5-pro',
+      temperature: 0,
+    }).bindTools([searchRetrievalTool]);
+
+    const stream = await model.stream('Who won the 2024 MLB World Series?');
+    let finalMsg: AIMessageChunk | undefined;
+    for await (const msg of stream) {
+      finalMsg = finalMsg ? concat(finalMsg, msg) : msg;
+    }
+    if (!finalMsg) {
+      throw new Error('finalMsg is undefined');
+    }
+    expect(finalMsg.response_metadata?.groundingMetadata).toBeDefined();
+    expect(finalMsg.content as string).toContain('Dodgers');
+  });
+});
+
 describe('GoogleSearch (new API)', () => {
   test('Supports GoogleSearch tool', async () => {
     // New google_search tool for Gemini 2.0+ models
     const googleSearchTool = {
       googleSearch: {},
     };
-    const model = new ChatGoogleGenerativeAI({
+    const model = createGoogleModel({
       model: 'gemini-2.5-flash',
       temperature: 0,
-      maxRetries: 0,
     }).bindTools([googleSearchTool]);
 
     // Ask about something that requires current web data beyond training cutoff
@@ -636,10 +845,9 @@ describe('GoogleSearch (new API)', () => {
     const googleSearchTool = {
       googleSearch: {},
     };
-    const model = new ChatGoogleGenerativeAI({
+    const model = createGoogleModel({
       model: 'gemini-2.5-flash',
       temperature: 0,
-      maxRetries: 0,
     }).bindTools([googleSearchTool]);
 
     const stream = await model.stream(
@@ -674,10 +882,9 @@ describe('CodeExecutionTool', () => {
     const codeExecutionTool: CodeExecutionTool = {
       codeExecution: {}, // Simply pass an empty object to enable it.
     };
-    const model = new ChatGoogleGenerativeAI({
+    const model = createGoogleModel({
       model: 'gemini-2.5-flash',
       temperature: 0,
-      maxRetries: 0,
     }).bindTools([codeExecutionTool]);
 
     const result = await model.invoke(
@@ -707,10 +914,9 @@ describe('CodeExecutionTool', () => {
     const codeExecutionTool: CodeExecutionTool = {
       codeExecution: {}, // Simply pass an empty object to enable it.
     };
-    const model = new ChatGoogleGenerativeAI({
+    const model = createGoogleModel({
       model: 'gemini-2.5-flash',
       temperature: 0,
-      maxRetries: 0,
     }).bindTools([codeExecutionTool]);
 
     const codeResult = await model.invoke(
@@ -740,10 +946,9 @@ describe('CodeExecutionTool', () => {
     const codeExecutionTool: CodeExecutionTool = {
       codeExecution: {}, // Simply pass an empty object to enable it.
     };
-    const model = new ChatGoogleGenerativeAI({
+    const model = createGoogleModel({
       model: 'gemini-2.5-flash',
       temperature: 0,
-      maxRetries: 0,
     }).bindTools([codeExecutionTool]);
 
     const stream = await model.stream(
@@ -778,10 +983,9 @@ describe('CodeExecutionTool', () => {
 });
 
 test('pass pdf to request', async () => {
-  const model = new ChatGoogleGenerativeAI({
+  const model = createGoogleModel({
     model: 'gemini-2.0-flash-exp',
     temperature: 0,
-    maxRetries: 0,
   });
   const pdfPath = path.join(
     __dirname,
@@ -810,9 +1014,8 @@ test('pass pdf to request', async () => {
 });
 
 test('calling tool with no args should work', async () => {
-  const llm = new ChatGoogleGenerativeAI({
+  const llm = createGoogleModel({
     model: 'gemini-2.0-flash',
-    maxRetries: 0,
   });
   const sfWeatherTool = tool(
     async () => 'The weather is 80 degrees and sunny',
@@ -843,9 +1046,8 @@ test('calling tool with no args should work', async () => {
 });
 
 describe('tool calling with thought signatures', () => {
-  const model = new ChatGoogleGenerativeAI({
+  const model = createGoogleModel({
     model: 'gemini-3-pro-preview',
-    maxRetries: 0,
   });
   const weatherTool = tool(async () => 'The weather is 80 degrees and sunny', {
     name: 'weather',
@@ -921,14 +1123,94 @@ describe('tool calling with thought signatures', () => {
 });
 
 test('works with thinking config', async () => {
-  const model = new ChatGoogleGenerativeAI({
+  const model = createGoogleModel({
     model: 'gemini-3-pro-preview',
-    maxRetries: 0,
     thinkingConfig: {
       includeThoughts: true,
       thinkingBudget: 100,
     },
   });
-  const result = await model.invoke('What is the current weather in SF?');
+  const result = await model.invoke('What is 2+2?');
   expect(result.content).toBeDefined();
+
+  if (Array.isArray(result.content)) {
+    const thinkingBlocks = result.content.filter(
+      (block): block is ContentBlock =>
+        typeof block === 'object' &&
+        block !== null &&
+        'type' in block &&
+        block.type === 'thinking'
+    );
+    const textBlocks = result.content.filter(
+      (block): block is ContentBlock =>
+        typeof block === 'object' &&
+        block !== null &&
+        'type' in block &&
+        block.type === 'text'
+    );
+
+    expect(thinkingBlocks.length).toBeGreaterThan(0);
+
+    thinkingBlocks.forEach((block) => {
+      expect(block).toHaveProperty('thinking');
+      expect(typeof block.thinking).toBe('string');
+    });
+
+    textBlocks.forEach((block) => {
+      expect(block).toHaveProperty('text');
+      expect(typeof block.text).toBe('string');
+    });
+  }
+});
+
+describe('Google GenAI Reasoning with contentBlocks', () => {
+  test('invoke returns thinking as reasoning in contentBlocks', async () => {
+    const model = createGoogleModel({
+      model: 'gemini-3-pro-preview',
+      thinkingConfig: {
+        includeThoughts: true,
+        thinkingBudget: 100,
+      },
+    });
+
+    const result = await model.invoke('What is 2 + 2?');
+    const blocks = result.contentBlocks;
+
+    expect(blocks.length).toBeGreaterThan(0);
+
+    const reasoningBlocks = blocks.filter(
+      (block): block is ContentBlock.Reasoning => block.type === 'reasoning'
+    );
+    expect(reasoningBlocks.length).toBeGreaterThan(0);
+    expect(reasoningBlocks[0].reasoning.length).toBeGreaterThan(0);
+
+    const textBlocks = blocks.filter((block) => block.type === 'text');
+    expect(textBlocks.length).toBeGreaterThan(0);
+  });
+
+  test('stream returns thinking as reasoning in contentBlocks', async () => {
+    const model = createGoogleModel({
+      model: 'gemini-3-pro-preview',
+      thinkingConfig: {
+        includeThoughts: true,
+        thinkingBudget: 100,
+      },
+    });
+
+    let fullMessage: AIMessageChunk | null = null;
+    for await (const chunk of await model.stream('What is 3 + 3?')) {
+      fullMessage = fullMessage ? concat(fullMessage, chunk) : chunk;
+    }
+
+    expect(fullMessage).toBeDefined();
+
+    const blocks = fullMessage!.contentBlocks;
+    expect(blocks.length).toBeGreaterThan(0);
+
+    const reasoningBlocks = blocks.filter(
+      (block): block is ContentBlock.Reasoning => block.type === 'reasoning'
+    );
+    expect(reasoningBlocks.length).toBeGreaterThan(0);
+    expect(reasoningBlocks[0].reasoning.length).toBeGreaterThan(0);
+  });
 });

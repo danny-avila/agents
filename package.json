@@ -1,6 +1,6 @@
 {
   "name": "@librechat/agents",
-  "version": "3.1.62",
+  "version": "3.1.81",
   "main": "./dist/cjs/main.cjs",
   "module": "./dist/esm/main.mjs",
   "types": "./dist/types/index.d.ts",
@@ -9,6 +9,66 @@
       "import": "./dist/esm/main.mjs",
       "require": "./dist/cjs/main.cjs",
       "types": "./dist/types/index.d.ts"
+    },
+    "./langchain": {
+      "import": "./dist/esm/langchain/index.mjs",
+      "require": "./dist/cjs/langchain/index.cjs",
+      "types": "./dist/types/langchain/index.d.ts"
+    },
+    "./langchain/language_models/chat_models": {
+      "import": "./dist/esm/langchain/language_models/chat_models.mjs",
+      "require": "./dist/cjs/langchain/language_models/chat_models.cjs",
+      "types": "./dist/types/langchain/language_models/chat_models.d.ts"
+    },
+    "./langchain/messages": {
+      "import": "./dist/esm/langchain/messages.mjs",
+      "require": "./dist/cjs/langchain/messages.cjs",
+      "types": "./dist/types/langchain/messages.d.ts"
+    },
+    "./langchain/messages/tool": {
+      "import": "./dist/esm/langchain/messages/tool.mjs",
+      "require": "./dist/cjs/langchain/messages/tool.cjs",
+      "types": "./dist/types/langchain/messages/tool.d.ts"
+    },
+    "./langchain/google-common": {
+      "import": "./dist/esm/langchain/google-common.mjs",
+      "require": "./dist/cjs/langchain/google-common.cjs",
+      "types": "./dist/types/langchain/google-common.d.ts"
+    },
+    "./langchain/openai": {
+      "import": "./dist/esm/langchain/openai.mjs",
+      "require": "./dist/cjs/langchain/openai.cjs",
+      "types": "./dist/types/langchain/openai.d.ts"
+    },
+    "./langchain/prompts": {
+      "import": "./dist/esm/langchain/prompts.mjs",
+      "require": "./dist/cjs/langchain/prompts.cjs",
+      "types": "./dist/types/langchain/prompts.d.ts"
+    },
+    "./langchain/runnables": {
+      "import": "./dist/esm/langchain/runnables.mjs",
+      "require": "./dist/cjs/langchain/runnables.cjs",
+      "types": "./dist/types/langchain/runnables.d.ts"
+    },
+    "./langchain/tools": {
+      "import": "./dist/esm/langchain/tools.mjs",
+      "require": "./dist/cjs/langchain/tools.cjs",
+      "types": "./dist/types/langchain/tools.d.ts"
+    },
+    "./langchain/utils/env": {
+      "import": "./dist/esm/langchain/utils/env.mjs",
+      "require": "./dist/cjs/langchain/utils/env.cjs",
+      "types": "./dist/types/langchain/utils/env.d.ts"
+    }
+  },
+  "typesVersions": {
+    "*": {
+      "langchain": [
+        "dist/types/langchain/index.d.ts"
+      ],
+      "langchain/*": [
+        "dist/types/langchain/*"
+      ]
     }
   },
   "type": "module",
@@ -27,7 +87,7 @@
   ],
   "packageManager": "npm@10.5.2",
   "engines": {
-    "node": ">=14.0.0"
+    "node": ">=20.0.0"
   },
   "files": [
     "dist",
@@ -61,8 +121,19 @@
     "tool": "node --trace-warnings -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/tools.ts --provider 'bedrock' --name 'Jo' --location 'New York, NY'",
     "search": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/search.ts --provider 'bedrock' --name 'Jo' --location 'New York, NY'",
     "tool_search": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/tool_search.ts",
+    "subagent": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/multi-agent-subagent.ts",
+    "subagent:events": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/subagent-event-driven-debug.ts",
+    "subagent:tools": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/subagent-tools-debug.ts",
     "programmatic_exec": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/programmatic_exec.ts",
     "code_exec_ptc": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/code_exec_ptc.ts --provider 'openAI' --name 'Jo' --location 'New York, NY'",
+    "local": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/local_engine.ts --provider 'openAI' --name 'Jo' --location 'New York, NY'",
+    "local:ptc": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/local_engine_ptc.ts --provider 'openAI' --name 'Jo' --location 'New York, NY'",
+    "local:hooks": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/local_engine_hooks.ts --provider 'openAI' --name 'Jo' --location 'New York, NY'",
+    "local:checkpointer": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/local_engine_checkpointer.ts --provider 'openAI' --name 'Jo' --location 'New York, NY'",
+    "local:image": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/local_engine_image.ts --provider 'anthropic' --name 'Jo' --location 'New York, NY'",
+    "local:compile": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/local_engine_compile.ts --provider 'anthropic' --name 'Jo' --location 'New York, NY'",
+    "compare:pi": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/compare_pi_vs_ours.ts",
+    "local:workspace": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/local_engine_workspace.ts --provider 'anthropic' --name 'Jo' --location 'New York, NY'",
     "programmatic_exec_agent": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/programmatic_exec_agent.ts --provider 'openAI' --name 'Jo' --location 'New York, NY'",
     "ant_web_search": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/ant_web_search.ts --name 'Jo' --location 'New York, NY'",
     "ant_web_search_edge_case": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/ant_web_search_edge_case.ts --name 'Jo' --location 'New York, NY'",
@@ -77,6 +148,7 @@
     "multi-agent-chain": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/multi-agent-chain.ts",
     "multi-agent-sequence": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/multi-agent-sequence.ts",
     "multi-agent-conditional": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/multi-agent-conditional.ts",
+    "multi-agent-subagent": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/multi-agent-subagent.ts",
     "multi-agent-supervisor": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/multi-agent-supervisor.ts",
     "test-handoff-preamble": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/test-handoff-preamble.ts",
     "multi-agent-list-handoff": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/test-multi-agent-list-handoff.ts",
@@ -107,53 +179,72 @@
     "format": "prettier --write ."
   },
   "overrides": {
-    "@langchain/openai": "0.5.18",
+    "@langchain/openai": "1.4.5",
     "@anthropic-ai/sdk": "$@anthropic-ai/sdk",
     "@browserbasehq/stagehand": {
       "openai": "$openai"
     },
-    "fast-xml-parser": "5.5.7",
+    "@langchain/google-common": "$@langchain/google-common",
+    "@langchain/google-gauth": "$@langchain/google-gauth",
+    "@langchain/google-genai": "$@langchain/google-genai",
+    "@langchain/google-vertexai": "$@langchain/google-vertexai",
+    "uuid": "$uuid",
+    "fast-xml-parser": "5.7.2",
     "ajv": "6.14.0",
     "minimatch": "3.1.4"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.73.0",
+    "@anthropic-ai/sdk": "^0.92.0",
     "@aws-sdk/client-bedrock-runtime": "^3.1013.0",
-    "@langchain/anthropic": "^0.3.26",
-    "@langchain/aws": "^0.1.15",
-    "@langchain/core": "^0.3.80",
-    "@langchain/deepseek": "^0.0.2",
-    "@langchain/google-genai": "^0.2.18",
-    "@langchain/google-vertexai": "^0.2.18",
-    "@langchain/langgraph": "^0.4.9",
-    "@langchain/mistralai": "^0.2.1",
-    "@langchain/openai": "0.5.18",
-    "@langchain/textsplitters": "^0.1.0",
-    "@langchain/xai": "^0.0.3",
+    "@langchain/anthropic": "^1.3.28",
+    "@langchain/aws": "^1.3.5",
+    "@langchain/core": "1.1.44",
+    "@langchain/deepseek": "^1.0.25",
+    "@langchain/google-common": "2.1.28",
+    "@langchain/google-gauth": "2.1.28",
+    "@langchain/google-genai": "2.1.28",
+    "@langchain/google-vertexai": "2.1.28",
+    "@langchain/langgraph": "^1.2.9",
+    "@langchain/mistralai": "^1.0.8",
+    "@langchain/openai": "1.4.5",
+    "@langchain/textsplitters": "^1.0.1",
+    "@langchain/xai": "^1.3.17",
     "@langfuse/langchain": "^4.3.0",
     "@langfuse/otel": "^4.3.0",
     "@langfuse/tracing": "^4.3.0",
     "@opentelemetry/sdk-node": "^0.207.0",
     "@scarf/scarf": "^1.4.0",
+    "@types/diff": "^7.0.2",
     "ai-tokenizer": "^1.0.6",
-    "axios": "^1.13.5",
+    "axios": "^1.16.0",
     "cheerio": "^1.0.0",
+    "diff": "^9.0.0",
     "dotenv": "^16.4.7",
     "https-proxy-agent": "^7.0.6",
-    "mathjs": "^15.1.0",
+    "mathjs": "^15.2.0",
     "nanoid": "^3.3.7",
     "okapibm25": "^1.4.1",
-    "openai": "5.8.2"
+    "openai": "^6.35.0",
+    "uuid": "^11.1.1"
+  },
+  "peerDependencies": {
+    "@anthropic-ai/sandbox-runtime": "^0.0.49"
+  },
+  "peerDependenciesMeta": {
+    "@anthropic-ai/sandbox-runtime": {
+      "optional": true
+    }
   },
   "imports": {
     "@/*": "./src/*",
     "~/*": "./*"
   },
   "devDependencies": {
+    "@anthropic-ai/sandbox-runtime": "^0.0.49",
     "@anthropic-ai/vertex-sdk": "^0.12.0",
     "@eslint/compat": "^1.2.7",
     "@rollup/plugin-alias": "^5.1.0",
-    "@rollup/plugin-commonjs": "^28.0.3",
+    "@rollup/plugin-commonjs": "^29.0.2",
     "@rollup/plugin-json": "^6.1.0",
     "@rollup/plugin-node-resolve": "^15.2.3",
     "@rollup/plugin-typescript": "^12.1.2",
@@ -170,11 +261,11 @@
     "husky": "^9.1.7",
     "jest": "^30.2.0",
     "jest-util": "^30.2.0",
-    "lint-staged": "^15.2.7",
+    "lint-staged": "^16.4.0",
     "prettier": "^3.6.2",
     "rollup": "^4.59.0",
     "rollup-plugin-cleandir": "^2.0.0",
-    "ts-jest": "^29.4.5",
+    "ts-jest": "^29.4.6",
     "ts-node": "^10.9.2",
     "tsc-alias": "^1.8.10",
     "tsconfig-paths": "^4.2.0",

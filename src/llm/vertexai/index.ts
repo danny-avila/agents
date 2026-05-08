@@ -6,9 +6,47 @@ import type {
   GoogleAIModelRequestParams,
   GoogleAbstractedClient,
 } from '@langchain/google-common';
-import type { BaseMessage } from '@langchain/core/messages';
-import { isAIMessage } from '@langchain/core/messages';
+import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
+import type { BaseMessage, UsageMetadata } from '@langchain/core/messages';
+import { AIMessageChunk, isAIMessage } from '@langchain/core/messages';
+import type { ChatGenerationChunk } from '@langchain/core/outputs';
 import type { GoogleThinkingConfig, VertexAIClientOptions } from '@/types';
+
+/**
+ * `@langchain/google-common`'s `_streamResponseChunks` emits usage on TWO
+ * different paths within the same stream:
+ *
+ *   - Streaming chunks set `chunk.generationInfo.usage_metadata` via
+ *     `responseToUsageMetadata`, which correctly sums
+ *     `candidatesTokenCount + thoughtsTokenCount` and includes
+ *     `output_token_details.reasoning`.
+ *   - The trailing fallback chunk (emitted after the API stream exhausts)
+ *     attaches its own `chunk.message.usage_metadata` built inline as
+ *     `output_tokens = candidatesTokenCount` only — dropping
+ *     `thoughtsTokenCount` and `output_token_details` entirely.
+ *
+ * After `AIMessageChunk.concat`, only `message.usage_metadata` survives —
+ * which is the buggy fallback value. This breaks the documented
+ * `total_tokens === input_tokens + output_tokens` invariant and silently
+ * undercharges thinking models for reasoning tokens.
+ *
+ * The repair: track the last `generationInfo.usage_metadata` we see, and
+ * when the fallback chunk arrives with its buggy `message.usage_metadata`,
+ * replace it with the tracked good value. `CustomChatGoogleGenerativeAI`
+ * solves the same problem for the Google API path differently — by
+ * overriding `_convertToUsageMetadata`.
+ */
+export function repairStreamUsageMetadata(
+  current: UsageMetadata | undefined,
+  generationInfoUsage: UsageMetadata | undefined
+): UsageMetadata | undefined {
+  if (!current) return current;
+  if (!generationInfoUsage) return current;
+  if (generationInfoUsage.total_tokens !== current.total_tokens) return current;
+  if (generationInfoUsage.output_tokens <= current.output_tokens)
+    return current;
+  return generationInfoUsage;
+}
 
 type AdditionalKwargs =
   | undefined
@@ -27,50 +65,44 @@ type AdditionalKwargs =
  * - The signature for a functionCall part is an empty string
  *
  * This function correlates each "model" content block in the formatted request
- * back to its originating AI message, then re-attaches non-empty signatures
- * that the library failed to apply.
+ * back to its originating AI message by *position*, then re-attaches non-empty
+ * signatures that the library failed to apply. AI messages without signatures
+ * still consume their slot — filtering them out shifted later messages onto
+ * the wrong content block and dropped real signatures on the floor.
  */
-function fixThoughtSignatures(
+export function fixThoughtSignatures(
   contents: GeminiContent[],
   input: BaseMessage[]
 ): void {
-  // Collect AI messages that have signatures, in order
-  const aiMessages = input.filter(
-    (msg) =>
-      isAIMessage(msg) &&
-      Array.isArray((msg.additional_kwargs as AdditionalKwargs)?.signatures) &&
-      (msg.additional_kwargs.signatures as string[]).length > 0
-  );
-
-  // Collect "model" content blocks from the formatted request, in order
+  // All AI messages, in order — non-signature ones still consume positional
+  // slots so later messages line up with their model content blocks.
+  const aiMessages = input.filter(isAIMessage);
   const modelContents = contents.filter((c) => c.role === 'model');
 
-  // They should correspond 1:1 in order (both derived from the same input sequence)
   const count = Math.min(aiMessages.length, modelContents.length);
   for (let i = 0; i < count; i++) {
-    const msg = aiMessages[i];
-    const content = modelContents[i];
-    const signatures = (msg.additional_kwargs as AdditionalKwargs)?.signatures;
+    const signatures = (aiMessages[i].additional_kwargs as AdditionalKwargs)
+      ?.signatures;
+    if (!Array.isArray(signatures) || signatures.length === 0) continue;
 
-    // Collect non-empty signatures that aren't already attached to any part
+    const content = modelContents[i];
     const attachedSignatures = new Set(
       content.parts
         .map((p) => p.thoughtSignature)
         .filter((s): s is string => s != null && s !== '')
     );
-    const availableSignatures = signatures?.filter(
-      (s) => s != null && s !== '' && !attachedSignatures.has(s)
+    const availableSignatures = signatures.filter(
+      (s): s is string => s != null && s !== '' && !attachedSignatures.has(s)
     );
 
-    // Assign available signatures to functionCall parts missing one, in order
     let sigIdx = 0;
     for (const part of content.parts) {
       if (
         'functionCall' in part &&
         (part.thoughtSignature == null || part.thoughtSignature === '') &&
-        sigIdx < (availableSignatures?.length ?? 0)
+        sigIdx < availableSignatures.length
       ) {
-        part.thoughtSignature = availableSignatures?.[sigIdx];
+        part.thoughtSignature = availableSignatures[sigIdx];
         sigIdx++;
       }
     }
@@ -97,10 +129,7 @@ class CustomChatConnection extends ChatConnection<VertexAIClientOptions> {
       }
       delete formattedData.generationConfig.thinkingConfig.thinkingBudget;
     }
-    if (
-      this.thinkingConfig?.thinkingLevel != null &&
-      this.thinkingConfig.thinkingLevel !== ''
-    ) {
+    if (this.thinkingConfig?.thinkingLevel != null) {
       formattedData.generationConfig ??= {};
       // thinkingLevel and thinkingBudget cannot coexist — the API rejects the request.
       // Remove thinkingBudget when thinkingLevel is set.
@@ -422,7 +451,16 @@ export class ChatVertexAI extends ChatGoogle {
     return 'LibreChatVertexAI';
   }
 
-  constructor(fields?: VertexAIClientOptions) {
+  constructor(model: string, fields?: Omit<VertexAIClientOptions, 'model'>);
+  constructor(fields?: VertexAIClientOptions);
+  constructor(
+    modelOrFields?: string | VertexAIClientOptions,
+    params?: Omit<VertexAIClientOptions, 'model'>
+  ) {
+    const fields =
+      typeof modelOrFields === 'string'
+        ? { ...(params ?? {}), model: modelOrFields }
+        : modelOrFields;
     const dynamicThinkingBudget = fields?.thinkingBudget === -1;
     super({
       ...fields,
@@ -439,6 +477,35 @@ export class ChatVertexAI extends ChatGoogle {
       params.maxReasoningTokens = -1;
     }
     return params;
+  }
+  async *_streamResponseChunks(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions'],
+    runManager?: CallbackManagerForLLMRun
+  ): AsyncGenerator<ChatGenerationChunk> {
+    let lastGoodUsage: UsageMetadata | undefined;
+    for await (const chunk of super._streamResponseChunks(
+      messages,
+      options,
+      runManager
+    )) {
+      const genUsage = (
+        chunk.generationInfo as { usage_metadata?: UsageMetadata } | undefined
+      )?.usage_metadata;
+      if (genUsage) {
+        lastGoodUsage = genUsage;
+      }
+      if (chunk.message instanceof AIMessageChunk) {
+        const repaired = repairStreamUsageMetadata(
+          chunk.message.usage_metadata,
+          lastGoodUsage
+        );
+        if (repaired !== chunk.message.usage_metadata) {
+          chunk.message.usage_metadata = repaired;
+        }
+      }
+      yield chunk;
+    }
   }
   buildConnection(
     fields: VertexAIClientOptions | undefined,

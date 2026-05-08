@@ -9,9 +9,14 @@ import {
 import type { AnthropicMessage } from '@/types/messages';
 import type Anthropic from '@anthropic-ai/sdk';
 import { ContentTypes } from '@/common/enum';
+import { toLangChainContent } from './langchain';
 
 type MessageWithContent = {
   content?: string | MessageContentComplex[];
+};
+
+type MessageContentWithCacheControl = MessageContentComplex & {
+  cache_control?: unknown;
 };
 
 /**
@@ -41,7 +46,7 @@ function cloneMessage<T extends MessageWithContent>(
 ): T {
   if (message instanceof BaseMessage) {
     const baseParams = {
-      content,
+      content: toLangChainContent(content),
       additional_kwargs: { ...message.additional_kwargs },
       response_metadata: { ...message.response_metadata },
       id: message.id,
@@ -99,6 +104,40 @@ function cloneMessage<T extends MessageWithContent>(
   }
 
   return cloned;
+}
+
+function stripAnthropicCacheControlFromBlocks(
+  content: MessageContentComplex[]
+): { content: MessageContentComplex[]; modified: boolean } {
+  let modified = false;
+  const strippedContent = content.map((block) => {
+    if (!('cache_control' in block)) {
+      return block;
+    }
+
+    const cloned: MessageContentWithCacheControl = { ...block };
+    delete cloned.cache_control;
+    modified = true;
+    return cloned;
+  });
+
+  return { content: strippedContent, modified };
+}
+
+function sanitizeBedrockSystemMessage<T extends MessageWithContent>(
+  message: T
+): T {
+  const content = message.content;
+  if (!Array.isArray(content)) {
+    return message;
+  }
+
+  const stripped = stripAnthropicCacheControlFromBlocks(content);
+  if (!stripped.modified) {
+    return message;
+  }
+
+  return cloneMessage(message, stripped.content);
 }
 
 /**
@@ -299,7 +338,7 @@ export function stripBedrockCacheControl<T extends MessageWithContent>(
  * @returns - A new array of message objects with cache points added.
  */
 export function addBedrockCacheControl<
-  T extends Partial<BaseMessage> & MessageWithContent,
+  T extends MessageWithContent & { getType?: () => string; role?: string },
 >(messages: T[]): T[] {
   if (!Array.isArray(messages) || messages.length < 2) {
     return messages;
@@ -310,11 +349,24 @@ export function addBedrockCacheControl<
 
   for (let i = updatedMessages.length - 1; i >= 0; i--) {
     const originalMessage = updatedMessages[i];
-    const isToolMessage =
+    const messageType =
       'getType' in originalMessage &&
-      typeof originalMessage.getType === 'function' &&
-      originalMessage.getType() === 'tool';
+      typeof originalMessage.getType === 'function'
+        ? originalMessage.getType()
+        : undefined;
+    const messageRole =
+      'role' in originalMessage && typeof originalMessage.role === 'string'
+        ? originalMessage.role
+        : undefined;
 
+    const isSystemMessage =
+      messageType === 'system' || messageRole === 'system';
+    if (isSystemMessage) {
+      updatedMessages[i] = sanitizeBedrockSystemMessage(originalMessage);
+      continue;
+    }
+
+    const isToolMessage = messageType === 'tool' || messageRole === 'tool';
     const content = originalMessage.content;
     const hasArrayContent = Array.isArray(content);
     const isEmptyString = typeof content === 'string' && content === '';

@@ -1,6 +1,6 @@
 import { config } from 'dotenv';
 config();
-import { test, describe, jest } from '@jest/globals';
+import { expect, test, describe, jest } from '@jest/globals';
 
 jest.setTimeout(90000);
 import {
@@ -26,6 +26,33 @@ const weatherTool = tool(async () => 'The weather is 80 degrees and sunny', {
   }),
 });
 
+describe('ChatVertexAI upstream compatibility', () => {
+  test('serialization uses the LibreChat constructor name on the Vertex namespace', () => {
+    const model = new ChatVertexAI();
+    expect(JSON.stringify(model)).toEqual(
+      '{"lc":1,"type":"constructor","id":["langchain","chat_models","vertexai","LibreChatVertexAI"],"kwargs":{"platform_type":"gcp"}}'
+    );
+  });
+
+  test('labels parameter support', () => {
+    expect(() => {
+      const model = new ChatVertexAI({
+        labels: {
+          team: 'test',
+          environment: 'development',
+        },
+      });
+      expect(model.platform).toEqual('gcp');
+    }).not.toThrow();
+  });
+
+  test('constructor overload supports model string', () => {
+    const model = new ChatVertexAI('gemini-1.5-pro');
+    expect(model.model).toEqual('gemini-1.5-pro');
+    expect(model.platform).toEqual('gcp');
+  });
+});
+
 describe.each(gemini3Models)(
   'Vertex AI reasoning with thinkingLevel (%s)',
   (modelName) => {
@@ -48,6 +75,24 @@ describe.each(gemini3Models)(
       expect(
         (reasoningTokens as Record<string, number>)?.reasoning
       ).toBeGreaterThan(0);
+    });
+
+    test('stream: usage_metadata includes reasoning in output_tokens (issue LibreChat#13006)', async () => {
+      let finalChunk: AIMessageChunk | undefined;
+      for await (const chunk of await model.stream(
+        'What is 2+2? Think step by step.'
+      )) {
+        finalChunk = finalChunk ? finalChunk.concat(chunk) : chunk;
+      }
+      const usage = finalChunk?.usage_metadata;
+      expect(usage).toBeDefined();
+      const reasoning = (
+        usage as { output_token_details?: { reasoning?: number } }
+      )?.output_token_details?.reasoning;
+      expect(reasoning).toBeGreaterThan(0);
+      expect(usage!.total_tokens).toBe(
+        usage!.input_tokens + usage!.output_tokens
+      );
     });
   }
 );

@@ -7,28 +7,28 @@ import type {
   BaseMessageFields,
 } from '@langchain/core/messages';
 import type { RunnableConfig, Runnable } from '@langchain/core/runnables';
-import type * as t from '@/types';
 import type { createPruneMessages } from '@/messages';
+import type * as t from '@/types';
+import {
+  ANTHROPIC_TOOL_TOKEN_MULTIPLIER,
+  DEFAULT_TOOL_TOKEN_MULTIPLIER,
+  ContentTypes,
+  Providers,
+} from '@/common';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { addCacheControl } from '@/messages/cache';
-import { ContentTypes, Providers } from '@/common';
 import { DEFAULT_RESERVE_RATIO } from '@/messages';
 import { toJsonSchema } from '@/utils/schema';
 
-/**
- * Anthropic direct API tool schema overhead multiplier.
- * Empirically calibrated against real MCP tool sets (29 tools).
- * Accounts for Anthropic's internal XML-like tool encoding plus
- * a ~300-token hidden tool-system preamble.
- */
-const ANTHROPIC_TOOL_TOKEN_MULTIPLIER = 2.6;
+type AgentSystemTextBlock = {
+  type: 'text';
+  text: string;
+  cache_control?: { type: 'ephemeral' };
+};
 
-/**
- * Default tool schema overhead multiplier for all non-Anthropic providers.
- * Covers OpenAI function-calling format, Bedrock, and other providers.
- * Empirically calibrated at ~1.4× the raw JSON token count.
- */
-const DEFAULT_TOOL_TOKEN_MULTIPLIER = 1.4;
+type AgentSystemContentBlock =
+  | AgentSystemTextBlock
+  | { cachePoint: { type: 'default' } };
 
 /**
  * Encapsulates agent-specific state that can vary between agents in a multi-agent system
@@ -64,6 +64,9 @@ export class AgentContext {
       initialSummary,
       contextPruningConfig,
       maxToolResultChars,
+      toolSchemaTokens,
+      subagentConfigs,
+      maxSubagentDepth,
     } = agentConfig;
 
     const agentContext = new AgentContext({
@@ -91,6 +94,10 @@ export class AgentContext {
       maxToolResultChars,
     });
 
+    agentContext._sourceInputs = agentConfig;
+    agentContext.subagentConfigs = subagentConfigs;
+    agentContext.maxSubagentDepth = maxSubagentDepth;
+
     if (initialSummary?.text != null && initialSummary.text !== '') {
       agentContext.setInitialSummary(
         initialSummary.text,
@@ -104,14 +111,22 @@ export class AgentContext {
       const tokenMap = indexTokenCountMap || {};
       agentContext.baseIndexTokenCountMap = { ...tokenMap };
       agentContext.indexTokenCountMap = tokenMap;
-      agentContext.tokenCalculationPromise = agentContext
-        .calculateInstructionTokens(tokenCounter)
-        .then(() => {
-          agentContext.updateTokenMapWithInstructions(tokenMap);
-        })
-        .catch((err) => {
-          console.error('Error calculating instruction tokens:', err);
-        });
+
+      if (toolSchemaTokens != null && toolSchemaTokens > 0) {
+        /** Use pre-computed (cached) tool schema tokens — skip calculateInstructionTokens */
+        agentContext.toolSchemaTokens = toolSchemaTokens;
+        agentContext.tokenCalculationPromise = Promise.resolve();
+        agentContext.updateTokenMapWithInstructions(tokenMap);
+      } else {
+        agentContext.tokenCalculationPromise = agentContext
+          .calculateInstructionTokens(tokenCounter)
+          .then(() => {
+            agentContext.updateTokenMapWithInstructions(tokenMap);
+          })
+          .catch((err) => {
+            console.error('Error calculating instruction tokens:', err);
+          });
+      }
     } else if (indexTokenCountMap) {
       agentContext.baseIndexTokenCountMap = { ...indexTokenCountMap };
       agentContext.indexTokenCountMap = indexTokenCountMap;
@@ -199,6 +214,12 @@ export class AgentContext {
   toolDefinitions?: t.LCTool[];
   /** Set of tool names discovered via tool search (to be loaded) */
   discoveredToolNames: Set<string> = new Set();
+  /** Original AgentInputs used to create this context — used for self-spawn subagent resolution. */
+  _sourceInputs?: t.AgentInputs;
+  /** Subagent configurations for hierarchical delegation. */
+  subagentConfigs?: t.SubagentConfig[];
+  /** Maximum subagent nesting depth. */
+  maxSubagentDepth?: number;
   /** Instructions for this agent */
   instructions?: string;
   /** Additional instructions for this agent */
@@ -238,7 +259,7 @@ export class AgentContext {
   private summaryTokenCount: number = 0;
   /**
    * Where the summary should be injected:
-   * - `'system_prompt'`: cross-run summary, included in `buildInstructionsString`
+   * - `'system_prompt'`: cross-run summary, included in the dynamic system tail
    * - `'user_message'`: mid-run compaction, injected as HumanMessage on clean slate
    * - `'none'`: no summary present
    */
@@ -406,7 +427,8 @@ export class AgentContext {
 
   /**
    * Gets the system runnable, creating it lazily if needed.
-   * Includes instructions, additional instructions, and programmatic-only tools documentation.
+   * Includes stable instructions, dynamic additional instructions, and
+   * programmatic-only tools documentation.
    * Only rebuilds when marked stale (via markToolsAsDiscovered).
    */
   get systemRunnable():
@@ -420,8 +442,10 @@ export class AgentContext {
       return this.cachedSystemRunnable;
     }
 
-    const instructionsString = this.buildInstructionsString();
-    this.cachedSystemRunnable = this.buildSystemRunnable(instructionsString);
+    this.cachedSystemRunnable = this.buildSystemRunnable({
+      stableInstructions: this.buildStableInstructionsString(),
+      dynamicInstructions: this.buildDynamicInstructionsString(),
+    });
     this.systemRunnableStale = false;
     return this.cachedSystemRunnable;
   }
@@ -432,17 +456,19 @@ export class AgentContext {
    */
   initializeSystemRunnable(): void {
     if (this.systemRunnableStale || this.cachedSystemRunnable === undefined) {
-      const instructionsString = this.buildInstructionsString();
-      this.cachedSystemRunnable = this.buildSystemRunnable(instructionsString);
+      this.cachedSystemRunnable = this.buildSystemRunnable({
+        stableInstructions: this.buildStableInstructionsString(),
+        dynamicInstructions: this.buildDynamicInstructionsString(),
+      });
       this.systemRunnableStale = false;
     }
   }
 
   /**
-   * Builds the raw instructions string (without creating SystemMessage).
+   * Builds the cacheable instructions string (without creating SystemMessage).
    * Includes agent identity preamble and handoff context when available.
    */
-  private buildInstructionsString(): string {
+  private buildStableInstructionsString(): string {
     const parts: string[] = [];
 
     const identityPreamble = this.buildIdentityPreamble();
@@ -454,6 +480,22 @@ export class AgentContext {
       parts.push(this.instructions);
     }
 
+    const programmaticToolsDoc = this.buildProgrammaticOnlyToolsInstructions();
+    if (programmaticToolsDoc) {
+      parts.push(programmaticToolsDoc);
+    }
+
+    return parts.join('\n\n');
+  }
+
+  /**
+   * Builds the dynamic system-tail string (without creating SystemMessage).
+   * Keep this out of prompt-cache-marked content so volatile context does not
+   * invalidate the stable prefix.
+   */
+  private buildDynamicInstructionsString(): string {
+    const parts: string[] = [];
+
     if (
       this.additionalInstructions != null &&
       this.additionalInstructions !== ''
@@ -461,14 +503,10 @@ export class AgentContext {
       parts.push(this.additionalInstructions);
     }
 
-    const programmaticToolsDoc = this.buildProgrammaticOnlyToolsInstructions();
-    if (programmaticToolsDoc) {
-      parts.push(programmaticToolsDoc);
-    }
-
-    // Cross-run summary: include in system prompt so the model has context
-    // from the prior run.  Mid-run summaries are injected as a HumanMessage
-    // on the post-compaction clean slate instead (see buildSystemRunnable).
+    // Cross-run summary: include in the system tail so the model has context
+    // from the prior run without invalidating the cacheable prefix. Mid-run
+    // summaries are injected as a HumanMessage on the post-compaction clean
+    // slate instead (see buildSystemRunnable).
     if (
       this._summaryLocation === 'system_prompt' &&
       this.summaryText != null &&
@@ -512,9 +550,13 @@ export class AgentContext {
    * Build system runnable from pre-built instructions string.
    * Only called when content has actually changed.
    */
-  private buildSystemRunnable(
-    instructionsString: string
-  ):
+  private buildSystemRunnable({
+    stableInstructions,
+    dynamicInstructions,
+  }: {
+    stableInstructions: string;
+    dynamicInstructions: string;
+  }):
     | Runnable<
         BaseMessage[],
         (BaseMessage | SystemMessage)[],
@@ -526,35 +568,17 @@ export class AgentContext {
       this.summaryText != null &&
       this.summaryText !== '';
 
-    if (!instructionsString && !hasMidRunSummary) {
+    if (!stableInstructions && !dynamicInstructions && !hasMidRunSummary) {
       this.systemMessageTokens = 0;
       return undefined;
     }
 
-    let finalInstructions: string | BaseMessageFields = instructionsString;
-
-    let usePromptCache = false;
-    if (this.provider === Providers.ANTHROPIC) {
-      const anthropicOptions = this.clientOptions as
-        | t.AnthropicClientOptions
-        | undefined;
-      if (anthropicOptions?.promptCache === true) {
-        usePromptCache = true;
-        finalInstructions = {
-          content: [
-            {
-              type: 'text',
-              text: instructionsString,
-              cache_control: { type: 'ephemeral' },
-            },
-          ],
-        };
-      }
-    }
-
-    const systemMessage = instructionsString
-      ? new SystemMessage(finalInstructions)
-      : undefined;
+    const usePromptCache = this.hasAnthropicPromptCache();
+    const systemMessage = this.buildSystemMessage({
+      stableInstructions,
+      dynamicInstructions,
+      usePromptCache,
+    });
 
     if (this.tokenCounter) {
       this.systemMessageTokens = systemMessage
@@ -602,6 +626,72 @@ export class AgentContext {
       }
       return [...prefix, ...body];
     }).withConfig({ runName: 'prompt' });
+  }
+
+  private hasAnthropicPromptCache(): boolean {
+    if (this.provider !== Providers.ANTHROPIC) {
+      return false;
+    }
+    const anthropicOptions = this.clientOptions as
+      | t.AnthropicClientOptions
+      | undefined;
+    return anthropicOptions?.promptCache === true;
+  }
+
+  private hasBedrockPromptCache(): boolean {
+    if (this.provider !== Providers.BEDROCK) {
+      return false;
+    }
+    const bedrockOptions = this.clientOptions as
+      | t.BedrockAnthropicClientOptions
+      | undefined;
+    return bedrockOptions?.promptCache === true;
+  }
+
+  private buildSystemMessage({
+    stableInstructions,
+    dynamicInstructions,
+    usePromptCache,
+  }: {
+    stableInstructions: string;
+    dynamicInstructions: string;
+    usePromptCache: boolean;
+  }): SystemMessage | undefined {
+    if (!stableInstructions && !dynamicInstructions) {
+      return undefined;
+    }
+
+    if (usePromptCache) {
+      const content: AgentSystemContentBlock[] = [];
+      if (stableInstructions) {
+        content.push({
+          type: 'text',
+          text: stableInstructions,
+          cache_control: { type: 'ephemeral' },
+        });
+      }
+      if (dynamicInstructions) {
+        content.push({ type: 'text', text: dynamicInstructions });
+      }
+      return new SystemMessage({ content } as BaseMessageFields);
+    }
+
+    if (this.hasBedrockPromptCache() && stableInstructions) {
+      const content: AgentSystemContentBlock[] = [
+        { type: 'text', text: stableInstructions },
+        { cachePoint: { type: 'default' } },
+      ];
+      if (dynamicInstructions) {
+        content.push({ type: 'text', text: dynamicInstructions });
+      }
+      return new SystemMessage({ content } as BaseMessageFields);
+    }
+
+    return new SystemMessage(
+      [stableInstructions, dynamicInstructions]
+        .filter((part) => part !== '')
+        .join('\n\n')
+    );
   }
 
   /**
@@ -665,6 +755,54 @@ export class AgentContext {
     this.indexTokenCountMap = { ...baseTokenMap };
   }
 
+  /** Active tool definitions for token accounting (excludes deferred-and-undiscovered entries). */
+  private getActiveToolDefinitions(): t.LCTool[] {
+    if (!this.toolDefinitions) {
+      return [];
+    }
+    /**
+     * Mirror `getEventDrivenToolsForBinding`'s gate: a definition is only
+     * bound to the model when its `allowed_callers` include `'direct'` and
+     * (if deferred) it has been discovered. Filtering by `defer_loading`
+     * alone left programmatic-only definitions counted in
+     * `toolSchemaTokens` even though they were never bound.
+     */
+    return this.toolDefinitions.filter((def) => {
+      const allowedCallers = def.allowed_callers ?? ['direct'];
+      if (!allowedCallers.includes('direct')) {
+        return false;
+      }
+      return (
+        def.defer_loading !== true || this.discoveredToolNames.has(def.name)
+      );
+    });
+  }
+
+  /**
+   * Single source of truth for "which entries of `this.tools` should be
+   * treated as actually bound". Callers:
+   *   - `getToolsForBinding` (non-event-driven branch)
+   *   - `getEventDrivenToolsForBinding` (appends instance tools alongside
+   *     schema-only definitions)
+   *   - `calculateInstructionTokens` (counts schema bytes for accounting)
+   *
+   * In event-driven mode (`toolDefinitions` present) instance tools are
+   * appended unfiltered; outside event-driven mode they pass through
+   * `filterToolsForBinding`. Centralizing the decision here prevents the
+   * accounting/binding paths from drifting apart, which was the root
+   * cause of the original miscount.
+   */
+  private getEffectiveInstanceTools(): t.GraphTools | undefined {
+    if (!this.tools) {
+      return undefined;
+    }
+    const isEventDriven = (this.toolDefinitions?.length ?? 0) > 0;
+    if (isEventDriven || !this.toolRegistry) {
+      return this.tools;
+    }
+    return this.filterToolsForBinding(this.tools);
+  }
+
   /**
    * Calculate tool tokens and add to instruction tokens
    * Note: System message tokens are calculated during systemRunnable creation
@@ -675,8 +813,28 @@ export class AgentContext {
     let toolTokens = 0;
     const countedToolNames = new Set<string>();
 
-    if (this.tools && this.tools.length > 0) {
-      for (const tool of this.tools) {
+    /**
+     * Iterate both `tools` (user-provided instance tools) and `graphTools`
+     * (graph-managed tools like handoff + subagent). `graphTools` is often
+     * populated after `fromConfig()` kicks off the initial calculation, so
+     * callers that mutate `graphTools` must re-trigger this method to
+     * refresh `toolSchemaTokens`.
+     *
+     * Use `getEffectiveInstanceTools()` so accounting reflects exactly the
+     * subset that `getToolsForBinding` would emit — preventing the
+     * worst-case-ceiling miscount that triggered spurious `empty_messages`
+     * preflight rejections at low `maxContextTokens`. Deferred and
+     * non-`'direct'` `toolDefinitions` are excluded by
+     * `getActiveToolDefinitions()` below.
+     */
+    const instanceTools: t.GraphTools = [
+      ...((this.getEffectiveInstanceTools() as t.GenericTool[] | undefined) ??
+        []),
+      ...((this.graphTools as t.GenericTool[] | undefined) ?? []),
+    ];
+
+    if (instanceTools.length > 0) {
+      for (const tool of instanceTools) {
         const genericTool = tool as Record<string, unknown>;
         if (
           genericTool.schema != null &&
@@ -698,21 +856,19 @@ export class AgentContext {
       }
     }
 
-    if (this.toolDefinitions && this.toolDefinitions.length > 0) {
-      for (const def of this.toolDefinitions) {
-        if (countedToolNames.has(def.name)) {
-          continue;
-        }
-        const schema = {
-          type: 'function',
-          function: {
-            name: def.name,
-            description: def.description ?? '',
-            parameters: def.parameters ?? {},
-          },
-        };
-        toolTokens += tokenCounter(new SystemMessage(JSON.stringify(schema)));
+    for (const def of this.getActiveToolDefinitions()) {
+      if (countedToolNames.has(def.name)) {
+        continue;
       }
+      const schema = {
+        type: 'function',
+        function: {
+          name: def.name,
+          description: def.description ?? '',
+          parameters: def.parameters ?? {},
+        },
+      };
+      toolTokens += tokenCounter(new SystemMessage(JSON.stringify(schema)));
     }
 
     const isAnthropic =
@@ -861,11 +1017,23 @@ export class AgentContext {
   /**
    * Returns a structured breakdown of how the context token budget is consumed.
    * Useful for diagnostics when context overflow or pruning issues occur.
+   *
+   * Note: `toolCount` reflects discoveries immediately, but `toolSchemaTokens`
+   * is a snapshot taken during `calculateInstructionTokens` and is not
+   * recomputed when `markToolsAsDiscovered` is called mid-run.
    */
   getTokenBudgetBreakdown(messages?: BaseMessage[]): t.TokenBudgetBreakdown {
     const maxContextTokens = this.maxContextTokens ?? 0;
-    const toolCount =
-      (this.tools?.length ?? 0) + (this.toolDefinitions?.length ?? 0);
+    /**
+     * Derive `toolCount` from `getToolsForBinding()` so the diagnostic stays
+     * aligned with what is actually bound to the model — and with what
+     * `calculateInstructionTokens` counts into `toolSchemaTokens`. Using raw
+     * `this.tools.length` would inflate the count whenever the registry
+     * marks instance tools as deferred-undiscovered or non-`'direct'`,
+     * producing the same misleading "N tools" diagnostic this fix is meant
+     * to eliminate.
+     */
+    const toolCount = this.getToolsForBinding()?.length ?? 0;
     const messageCount = messages?.length ?? 0;
 
     let messageTokens = 0;
@@ -978,10 +1146,7 @@ export class AgentContext {
       return this.getEventDrivenToolsForBinding();
     }
 
-    const filtered =
-      !this.tools || !this.toolRegistry
-        ? this.tools
-        : this.filterToolsForBinding(this.tools);
+    const filtered = this.getEffectiveInstanceTools();
 
     if (this.graphTools && this.graphTools.length > 0) {
       return [...(filtered ?? []), ...this.graphTools];
@@ -996,21 +1161,9 @@ export class AgentContext {
       return this.graphTools ?? [];
     }
 
-    const defsToInclude = this.toolDefinitions.filter((def) => {
-      const allowedCallers = def.allowed_callers ?? ['direct'];
-      if (!allowedCallers.includes('direct')) {
-        return false;
-      }
-      if (
-        def.defer_loading === true &&
-        !this.discoveredToolNames.has(def.name)
-      ) {
-        return false;
-      }
-      return true;
-    });
-
-    const schemaTools = createSchemaOnlyTools(defsToInclude) as t.GraphTools;
+    const schemaTools = createSchemaOnlyTools(
+      this.getActiveToolDefinitions()
+    ) as t.GraphTools;
 
     const allTools = [...schemaTools];
 
@@ -1018,8 +1171,9 @@ export class AgentContext {
       allTools.push(...this.graphTools);
     }
 
-    if (this.tools && this.tools.length > 0) {
-      allTools.push(...this.tools);
+    const instanceTools = this.getEffectiveInstanceTools();
+    if (instanceTools && instanceTools.length > 0) {
+      allTools.push(...instanceTools);
     }
 
     return allTools;

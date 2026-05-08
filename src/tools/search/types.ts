@@ -3,8 +3,8 @@ import type { RunnableConfig } from '@langchain/core/runnables';
 import type { BaseReranker } from './rerankers';
 import { DATE_RANGE } from './schema';
 
-export type SearchProvider = 'serper' | 'searxng';
-export type ScraperProvider = 'firecrawl' | 'serper';
+export type SearchProvider = 'serper' | 'searxng' | 'tavily';
+export type ScraperProvider = 'firecrawl' | 'serper' | 'tavily';
 export type RerankerType = 'infinity' | 'jina' | 'cohere' | 'none';
 
 export interface Highlight {
@@ -62,11 +62,59 @@ export interface Source {
   date?: string;
 }
 
+export type TavilyTimeRange = 'day' | 'week' | 'month' | 'year';
+export type TavilyTimeRangeInput =
+  | TavilyTimeRange
+  | 'h'
+  | 'd'
+  | 'w'
+  | 'm'
+  | 'y';
+
+export interface TavilySearchOptions {
+  searchDepth?: 'basic' | 'advanced' | 'fast' | 'ultra-fast';
+  maxResults?: number;
+  includeImages?: boolean;
+  includeAnswer?: boolean | 'basic' | 'advanced';
+  includeRawContent?: boolean | 'markdown' | 'text';
+  includeDomains?: string[];
+  excludeDomains?: string[];
+  topic?: 'general' | 'news' | 'finance';
+  timeRange?: TavilyTimeRangeInput;
+  includeImageDescriptions?: boolean;
+  includeFavicon?: boolean;
+  chunksPerSource?: number;
+  safeSearch?: boolean;
+  timeout?: number;
+}
+
+export interface TavilySearchPayload {
+  query: string;
+  search_depth: NonNullable<TavilySearchOptions['searchDepth']>;
+  topic: NonNullable<TavilySearchOptions['topic']>;
+  max_results: number;
+  safe_search?: boolean;
+  time_range?: TavilyTimeRange;
+  country?: string;
+  include_images?: boolean;
+  include_answer?: NonNullable<TavilySearchOptions['includeAnswer']>;
+  include_raw_content?: NonNullable<TavilySearchOptions['includeRawContent']>;
+  include_domains?: string[];
+  exclude_domains?: string[];
+  include_image_descriptions?: boolean;
+  include_favicon?: boolean;
+  chunks_per_source?: number;
+}
+
 export interface SearchConfig {
   searchProvider?: SearchProvider;
   serperApiKey?: string;
   searxngInstanceUrl?: string;
   searxngApiKey?: string;
+  tavilyApiKey?: string;
+  tavilySearchUrl?: string;
+  tavilyExtractUrl?: string;
+  tavilySearchOptions?: TavilySearchOptions;
 }
 
 export type References = {
@@ -104,6 +152,17 @@ export interface SerperScraperConfig {
   timeout?: number;
   logger?: Logger;
   includeMarkdown?: boolean;
+}
+
+export interface TavilyScraperConfig {
+  apiKey?: string;
+  apiUrl?: string;
+  timeout?: number;
+  logger?: Logger;
+  extractDepth?: 'basic' | 'advanced';
+  includeImages?: boolean;
+  includeFavicon?: boolean;
+  format?: 'markdown' | 'text';
 }
 
 export interface ScraperContentResult {
@@ -154,6 +213,7 @@ export interface SearchToolConfig
   extends SearchConfig,
     ProcessSourcesConfig,
     FirecrawlConfig {
+  tavilyScraperOptions?: TavilyScraperConfig;
   logger?: Logger;
   safeSearch?: SafeSearchLevel;
   jinaApiKey?: string;
@@ -181,20 +241,27 @@ export type UsedReferences = {
   reference: MediaReference;
 }[];
 
+export type AnyScraperResponse =
+  | FirecrawlScrapeResponse
+  | SerperScrapeResponse
+  | TavilyScrapeResponse;
+
 /** Base Scraper Interface */
 export interface BaseScraper {
   scrapeUrl(
     url: string,
     options?: unknown
-  ): Promise<[string, FirecrawlScrapeResponse | SerperScrapeResponse]>;
+  ): Promise<[string, AnyScraperResponse]>;
+  scrapeUrls?(
+    urls: string[],
+    options?: unknown
+  ): Promise<Array<[string, AnyScraperResponse]>>;
   extractContent(
-    response: FirecrawlScrapeResponse | SerperScrapeResponse
+    response: AnyScraperResponse
   ): [string, undefined | References];
   extractMetadata(
-    response: FirecrawlScrapeResponse | SerperScrapeResponse
-  ):
-    | ScrapeMetadata
-    | Record<string, string | number | boolean | null | undefined>;
+    response: AnyScraperResponse
+  ): ScrapeMetadata | GenericScrapeMetadata;
 }
 
 /** Firecrawl */
@@ -206,6 +273,25 @@ export type FirecrawlScrapeOptions = Omit<
 export type SerperScrapeOptions = Omit<
   SerperScraperConfig,
   'apiKey' | 'apiUrl' | 'logger'
+>;
+
+export type TavilyScrapeOptions = Omit<
+  TavilyScraperConfig,
+  'apiKey' | 'apiUrl' | 'logger'
+>;
+
+export interface TavilyExtractPayload {
+  urls: string[];
+  extract_depth: NonNullable<TavilyScraperConfig['extractDepth']>;
+  include_images: boolean;
+  include_favicon?: boolean;
+  format?: NonNullable<TavilyScraperConfig['format']>;
+  timeout?: number;
+}
+
+export type GenericScrapeMetadata = Record<
+  string,
+  string | number | boolean | null | undefined
 >;
 
 export interface ScrapeMetadata {
@@ -291,6 +377,45 @@ export interface SerperScrapeResponse {
     metadata?: Record<string, string | number | boolean | null | undefined>;
     credits?: number;
   };
+  error?: string;
+}
+
+export interface TavilyScrapeResponse {
+  success: boolean;
+  data?: {
+    rawContent?: string;
+    images?: string[];
+    favicon?: string;
+  };
+  error?: string;
+}
+
+export interface TavilySearchResult {
+  title?: string;
+  url?: string;
+  content?: string;
+  score?: number;
+  published_date?: string;
+}
+
+export type TavilyImageResult =
+  | string
+  | {
+      url?: string;
+      description?: string;
+    };
+
+export interface TavilySearchResponse {
+  answer?: string;
+  images?: TavilyImageResult[];
+  results?: TavilySearchResult[];
+}
+
+export interface TavilyExtractResult {
+  url: string;
+  raw_content?: string;
+  images?: string[];
+  favicon?: string;
   error?: string;
 }
 

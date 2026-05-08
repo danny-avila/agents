@@ -376,6 +376,67 @@ describe(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
     );
   });
 
+  test(`${capitalizeFirstLetter(provider)}: follow-up after assistant message with only whitespace text content`, async () => {
+    /**
+     * Regression for LibreChat discussion #12806.
+     *
+     * The Anthropic API has two distinct rejection rules (verified against
+     * the live API):
+     *   1. Strict empty `text: ''`  → rejected anywhere
+     *      "messages: text content blocks must be non-empty"
+     *   2. Whitespace-only `text: ' '` / '\n' / '\t' → rejected when the
+     *      assistant message has no other accepted blocks (no tool blocks,
+     *      no non-whitespace text)
+     *      "messages: text content blocks must contain non-whitespace text"
+     *
+     * Anthropic responses for some prompts include a whitespace-only text
+     * block as the sole text content. Re-sending that history on a
+     * follow-up turn triggers rule 2.
+     *
+     * The wire-send filter in `_formatContent` must drop any text block
+     * whose trimmed content is empty. The previous filter used strict
+     * `text === ''` only, which caught rule 1 but not rule 2.
+     */
+    const llmConfig = getLLMConfig(provider);
+    const customHandlers1 = setupCustomHandlers();
+
+    const followUpRun = await Run.create<t.IState>({
+      runId: 'repro-12806-followup',
+      graphConfig: {
+        type: 'standard',
+        llmConfig,
+        instructions: 'You are a friendly AI assistant.',
+      },
+      returnContent: true,
+      skipCleanup: true,
+      customHandlers: customHandlers1,
+    });
+
+    // Build history with an assistant message whose entire content array
+    // is a single whitespace-only text block. This is the precise shape
+    // the API rejects under rule 2 above.
+    conversationHistory = [
+      new HumanMessage('hi'),
+      new (require('@langchain/core/messages').AIMessage)({
+        content: [{ type: 'text', text: ' ' }],
+      }),
+      new HumanMessage('please respond with a short greeting'),
+    ];
+
+    // With the fix: `_formatContent` drops the whitespace text block,
+    // the assistant content becomes an empty array, and the API accepts.
+    // Without the fix: the whitespace block is forwarded and the API
+    // rejects with "messages: text content blocks must contain non-whitespace text".
+    const finalContentParts = await followUpRun.processStream(
+      { messages: conversationHistory },
+      config
+    );
+    expect(finalContentParts).toBeDefined();
+    const finalMessages = followUpRun.getRunMessages();
+    expect(finalMessages).toBeDefined();
+    expect(finalMessages?.length).toBeGreaterThan(0);
+  });
+
   test('should handle errors appropriately', async () => {
     // Test error scenarios
     await expect(async () => {

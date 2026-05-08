@@ -2,25 +2,13 @@
 import { config } from 'dotenv';
 import fetch, { RequestInit } from 'node-fetch';
 import { HttpsProxyAgent } from 'https-proxy-agent';
-import { getEnvironmentVariable } from '@langchain/core/utils/env';
 import { tool, DynamicStructuredTool } from '@langchain/core/tools';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
-import { imageExtRegex, getCodeBaseURL } from './CodeExecutor';
-import { EnvVar, Constants } from '@/common';
+import { emptyOutputMessage, getCodeBaseURL } from './CodeExecutor';
+import { Constants } from '@/common';
 
 config();
-
-// ============================================================================
-// Constants
-// ============================================================================
-
-const imageMessage = 'Image is already displayed to the user';
-const otherMessage = 'File is already downloaded by the user';
-const accessMessage =
-  'Note: Files from previous executions are automatically available and can be modified.';
-const emptyOutputMessage =
-  'stdout: Empty. Ensure you\'re writing output explicitly.\n';
 
 /** Default max round-trips to prevent infinite loops */
 const DEFAULT_MAX_ROUND_TRIPS = 20;
@@ -261,14 +249,12 @@ export function filterToolsByUsage(
  * Fetches files from a previous session to make them available for the current execution.
  * Files are returned as CodeEnvFile references to be included in the request.
  * @param baseUrl - The base URL for the Code API
- * @param apiKey - The API key for authentication
  * @param sessionId - The session ID to fetch files from
  * @param proxy - Optional HTTP proxy URL
  * @returns Array of CodeEnvFile references, or empty array if fetch fails
  */
 export async function fetchSessionFiles(
   baseUrl: string,
-  apiKey: string,
   sessionId: string,
   proxy?: string
 ): Promise<t.CodeEnvFile[]> {
@@ -278,7 +264,6 @@ export async function fetchSessionFiles(
       method: 'GET',
       headers: {
         'User-Agent': 'LibreChat/1.0',
-        'X-API-Key': apiKey,
       },
     };
 
@@ -302,8 +287,14 @@ export async function fetchSessionFiles(
       const id = nameParts.length > 1 ? nameParts[1].split('.')[0] : '';
 
       return {
-        session_id: sessionId,
+        storage_session_id: sessionId,
+        /* `/files` fallback returns code-output files belonging to
+         * the user; tag them user-private. */
+        kind: 'user' as const,
         id,
+        /* `resource_id` informational for `kind: 'user'` —
+         * codeapi derives sessionKey from auth context. */
+        resource_id: id,
         name: (file.metadata as Record<string, unknown>)[
           'original-filename'
         ] as string,
@@ -321,14 +312,12 @@ export async function fetchSessionFiles(
 /**
  * Makes an HTTP request to the Code API.
  * @param endpoint - The API endpoint URL
- * @param apiKey - The API key for authentication
  * @param body - The request body
  * @param proxy - Optional HTTP proxy URL
  * @returns The parsed API response
  */
 export async function makeRequest(
   endpoint: string,
-  apiKey: string,
   body: Record<string, unknown>,
   proxy?: string
 ): Promise<t.ProgrammaticExecutionResponse> {
@@ -337,7 +326,6 @@ export async function makeRequest(
     headers: {
       'Content-Type': 'application/json',
       'User-Agent': 'LibreChat/1.0',
-      'X-API-Key': apiKey,
     },
     body: JSON.stringify(body),
   };
@@ -540,6 +528,11 @@ export async function executeTools(
 
 /**
  * Formats the completed response for the agent.
+ *
+ * Output is stdout/stderr only — see `CodeExecutor.ts`. The
+ * artifact still carries every file so the host's session map
+ * stays in sync; the LLM doesn't see them in the tool result text.
+ *
  * @param response - The completed API response
  * @returns Tuple of [formatted string, artifact]
  */
@@ -558,29 +551,12 @@ export function formatCompletedResponse(
     formatted += `stderr:\n${response.stderr}\n`;
   }
 
-  if (response.files && response.files.length > 0) {
-    formatted += 'Generated files:\n';
-
-    const fileCount = response.files.length;
-    for (let i = 0; i < fileCount; i++) {
-      const file = response.files[i];
-      const isImage = imageExtRegex.test(file.name);
-      formatted += `- /mnt/data/${file.name} | ${isImage ? imageMessage : otherMessage}`;
-
-      if (i < fileCount - 1) {
-        formatted += fileCount <= 3 ? ', ' : ',\n';
-      }
-    }
-
-    formatted += `\n\n${accessMessage}`;
-  }
-
   return [
     formatted.trim(),
     {
       session_id: response.session_id,
       files: response.files,
-    },
+    } satisfies t.ProgrammaticExecutionArtifact,
   ];
 }
 
@@ -596,14 +572,11 @@ export function formatCompletedResponse(
  *
  * The tool map must be provided at runtime via config.configurable.toolMap.
  *
- * @param params - Configuration parameters (apiKey, baseUrl, maxRoundTrips, proxy)
+ * @param params - Configuration parameters (baseUrl, maxRoundTrips, proxy)
  * @returns A LangChain DynamicStructuredTool for programmatic tool calling
  *
  * @example
- * const ptcTool = createProgrammaticToolCallingTool({
- *   apiKey: process.env.CODE_API_KEY,
- *   maxRoundTrips: 20
- * });
+ * const ptcTool = createProgrammaticToolCallingTool({ maxRoundTrips: 20 });
  *
  * const [output, artifact] = await ptcTool.invoke(
  *   { code, tools },
@@ -613,19 +586,6 @@ export function formatCompletedResponse(
 export function createProgrammaticToolCallingTool(
   initParams: t.ProgrammaticToolCallingParams = {}
 ): DynamicStructuredTool {
-  const apiKey =
-    (initParams[EnvVar.CODE_API_KEY] as string | undefined) ??
-    initParams.apiKey ??
-    getEnvironmentVariable(EnvVar.CODE_API_KEY) ??
-    '';
-
-  if (!apiKey) {
-    throw new Error(
-      'No API key provided for programmatic tool calling. ' +
-        'Set CODE_API_KEY environment variable or pass apiKey in initParams.'
-    );
-  }
-
   const baseUrl = initParams.baseUrl ?? getCodeBaseURL();
   const maxRoundTrips = initParams.maxRoundTrips ?? DEFAULT_MAX_ROUND_TRIPS;
   const proxy = initParams.proxy ?? process.env.PROXY;
@@ -637,13 +597,13 @@ export function createProgrammaticToolCallingTool(
       const params = rawParams as { code: string; timeout?: number };
       const { code, timeout = DEFAULT_TIMEOUT } = params;
 
-      // Extra params injected by ToolNode (follows web_search pattern)
-      const { toolMap, toolDefs, session_id, _injected_files } =
-        (config.toolCall ?? {}) as ToolCall &
-          Partial<t.ProgrammaticCache> & {
-            session_id?: string;
-            _injected_files?: t.CodeEnvFile[];
-          };
+      // Extra params injected by ToolNode (follows web_search pattern).
+      const toolCall = (config.toolCall ?? {}) as ToolCall &
+        Partial<t.ProgrammaticCache> & {
+          session_id?: string;
+          _injected_files?: t.CodeEnvFile[];
+        };
+      const { toolMap, toolDefs, session_id, _injected_files } = toolCall;
 
       if (toolMap == null || toolMap.size === 0) {
         throw new Error(
@@ -677,20 +637,23 @@ export function createProgrammaticToolCallingTool(
         }
 
         /**
-         * File injection priority:
-         * 1. Use _injected_files from ToolNode (avoids /files endpoint race condition)
-         * 2. Fall back to fetching from /files endpoint if session_id provided but no injected files
+         * File injection: `_injected_files` from ToolNode session
+         * context. The legacy `/files/<session_id>` HTTP fallback was
+         * removed (see `CodeExecutor.ts`) — codeapi's sessionAuth now
+         * requires kind/id query params unavailable at this point.
          */
         let files: t.CodeEnvFile[] | undefined;
         if (_injected_files && _injected_files.length > 0) {
           files = _injected_files;
         } else if (session_id != null && session_id.length > 0) {
-          files = await fetchSessionFiles(baseUrl, apiKey, session_id, proxy);
+          // eslint-disable-next-line no-console
+          console.debug(
+            `[ProgrammaticToolCalling] No injected files for session_id=${session_id} — exec will run without input files`
+          );
         }
 
         let response = await makeRequest(
           EXEC_ENDPOINT,
-          apiKey,
           {
             code,
             tools: effectiveTools,
@@ -730,7 +693,6 @@ export function createProgrammaticToolCallingTool(
 
           response = await makeRequest(
             EXEC_ENDPOINT,
-            apiKey,
             {
               continuation_token: response.continuation_token,
               tool_results: toolResults,

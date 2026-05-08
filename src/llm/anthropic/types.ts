@@ -1,12 +1,16 @@
 import Anthropic from '@anthropic-ai/sdk';
-import { BindToolsInput } from '@langchain/core/language_models/chat_models';
+
+import type { BindToolsInput } from '@langchain/core/language_models/chat_models';
+import type { AnthropicBeta } from '@anthropic-ai/sdk/resources';
+
+export type { AnthropicBeta };
 
 export type AnthropicStreamUsage = Anthropic.Usage;
 export type AnthropicMessageDeltaEvent = Anthropic.MessageDeltaEvent;
 export type AnthropicMessageStartEvent = Anthropic.MessageStartEvent;
 
 export type AnthropicToolResponse = {
-  type: 'tool_use';
+  type: 'tool_use' | 'server_tool_use';
   id: string;
   name: string;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -22,8 +26,12 @@ export type AnthropicMessageCreateParams =
 export type AnthropicStreamingMessageCreateParams =
   Anthropic.MessageCreateParamsStreaming;
 export type AnthropicThinkingConfigParam = Anthropic.ThinkingConfigParam;
+export type AnthropicContextManagementConfigParam =
+  Anthropic.Beta.BetaContextManagementConfig;
 export type AnthropicMessageStreamEvent = Anthropic.MessageStreamEvent;
 export type AnthropicRequestOptions = Anthropic.RequestOptions;
+export type AnthropicMCPServerURLDefinition =
+  Anthropic.Beta.Messages.BetaRequestMCPServerURLDefinition;
 export type AnthropicToolChoice =
   | {
       type: 'tool';

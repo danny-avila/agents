@@ -1,0 +1,195 @@
+import { config } from 'dotenv';
+import fetch, { RequestInit } from 'node-fetch';
+import { HttpsProxyAgent } from 'https-proxy-agent';
+import { tool, DynamicStructuredTool } from '@langchain/core/tools';
+import type * as t from '@/types';
+import { emptyOutputMessage, getCodeBaseURL } from './CodeExecutor';
+import { Constants } from '@/common';
+
+config();
+
+const baseEndpoint = getCodeBaseURL();
+const EXEC_ENDPOINT = `${baseEndpoint}/exec`;
+
+export const BashExecutionToolSchema = {
+  type: 'object',
+  properties: {
+    command: {
+      type: 'string',
+      description: `The bash command or script to execute.
+- The environment is stateless; variables and state don't persist between executions.
+- Generated files from previous executions are automatically available in "/mnt/data/".
+- Files from previous executions are automatically available and can be modified in place.
+- Input code **IS ALREADY** displayed to the user, so **DO NOT** repeat it in your response unless asked.
+- Output code **IS NOT** displayed to the user, so **DO** write all desired output explicitly.
+- IMPORTANT: You MUST explicitly print/output ALL results you want the user to see.
+- Use \`echo\`, \`printf\`, or \`cat\` for all outputs.`,
+    },
+    args: {
+      type: 'array',
+      items: { type: 'string' },
+      description:
+        'Additional arguments to execute the command with. This should only be used if the input command requires additional arguments to run.',
+    },
+  },
+  required: ['command'],
+} as const;
+
+export const BashExecutionToolDescription = `
+Runs bash commands and returns stdout/stderr output from a stateless execution environment, similar to running scripts in a command-line interface. Each execution is isolated and independent.
+
+Usage:
+- No network access available.
+- Generated files are automatically delivered; **DO NOT** provide download links.
+- NEVER use this tool to execute malicious commands.
+`.trim();
+
+/**
+ * Supplemental prompt documenting the tool-output reference feature.
+ *
+ * Hosts should append this (separated by a blank line) to the base
+ * {@link BashExecutionToolDescription} only when
+ * `RunConfig.toolOutputReferences.enabled` is `true`. When the feature
+ * is disabled, including this text would tell the LLM to emit
+ * `{{tool0turn0}}` placeholders that pass through unsubstituted and
+ * leak into the shell.
+ */
+export const BashToolOutputReferencesGuide = `
+Referencing previous tool outputs:
+- Every successful tool result is tagged with a reference key of the form \`tool<idx>turn<turn>\` (e.g., \`tool0turn0\`). The key appears either as a \`[ref: tool0turn0]\` prefix line or, when the output is a JSON object, as a \`_ref\` field on the object.
+- To pipe a previous tool output into this tool, embed the placeholder \`{{tool<idx>turn<turn>}}\` literally anywhere in the \`command\` string (or any string arg). It will be substituted with the stored output verbatim before the command runs.
+- The substituted value is the original output string (no \`[ref: …]\` prefix, no \`_ref\` key), so it is safe to pipe directly into \`jq\`, \`grep\`, \`awk\`, etc.
+- Example (simple ASCII output): \`echo '{{tool0turn0}}' | jq '.foo'\` takes the full output of the first tool from the first turn and pipes it into jq.
+- For payloads that may contain quotes, parentheses, backticks, or arbitrary bytes (random/binary data, JSON with embedded quotes, multi-line strings), prefer a quoted-delimiter heredoc over \`echo '…'\`. The heredoc body is not interpreted by the shell, so substituted payloads pass through unchanged.
+- Heredoc example: \`wc -c << 'EOF'\\n{{tool0turn0}}\\nEOF\` (the quotes around \`'EOF'\` disable interpolation inside the body).
+- Unknown reference keys are left in place and surfaced as \`[unresolved refs: …]\` after the output.
+`.trim();
+
+/**
+ * Composes the bash tool description, optionally appending the
+ * tool-output references guide. Hosts that enable
+ * `RunConfig.toolOutputReferences` should pass `enableToolOutputReferences: true`
+ * when registering the tool so the LLM learns the `{{…}}` syntax it
+ * will actually be able to use.
+ */
+export function buildBashExecutionToolDescription(options?: {
+  enableToolOutputReferences?: boolean;
+}): string {
+  if (options?.enableToolOutputReferences === true) {
+    return `${BashExecutionToolDescription}\n\n${BashToolOutputReferencesGuide}`;
+  }
+  return BashExecutionToolDescription;
+}
+
+export const BashExecutionToolName = Constants.BASH_TOOL;
+
+/**
+ * Default bash tool definition using the base description.
+ *
+ * When `RunConfig.toolOutputReferences.enabled` is `true`, build a
+ * reference-aware description with
+ * {@link buildBashExecutionToolDescription}
+ * (`{ enableToolOutputReferences: true }`) and construct a custom
+ * definition using it — using this constant as-is leaves the LLM
+ * unaware of the `{{tool<i>turn<n>}}` syntax.
+ */
+export const BashExecutionToolDefinition = {
+  name: BashExecutionToolName,
+  description: BashExecutionToolDescription,
+  schema: BashExecutionToolSchema,
+} as const;
+
+function createBashExecutionTool(
+  params: t.BashExecutionToolParams = {}
+): DynamicStructuredTool {
+  return tool(
+    async (rawInput, config) => {
+      const { command, ...rest } = rawInput as {
+        command: string;
+        args?: string[];
+      };
+      const { session_id, _injected_files } = (config.toolCall ?? {}) as {
+        session_id?: string;
+        _injected_files?: t.CodeEnvFile[];
+      };
+
+      const postData: Record<string, unknown> = {
+        lang: 'bash',
+        code: command,
+        ...rest,
+        ...params,
+      };
+
+      /* See `CodeExecutor.ts` for the rationale — `/files/<session_id>`
+       * HTTP fallback was removed because codeapi's sessionAuth requires
+       * kind/id query params unavailable at this point. */
+      if (_injected_files && _injected_files.length > 0) {
+        postData.files = _injected_files;
+      } else if (
+        session_id != null &&
+        session_id.length > 0 &&
+        !Array.isArray(postData.files)
+      ) {
+        // eslint-disable-next-line no-console
+        console.debug(
+          `[BashExecutor] No injected files for session_id=${session_id} — exec will run without input files`
+        );
+      }
+
+      try {
+        const fetchOptions: RequestInit = {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'User-Agent': 'LibreChat/1.0',
+          },
+          body: JSON.stringify(postData),
+        };
+
+        if (process.env.PROXY != null && process.env.PROXY !== '') {
+          fetchOptions.agent = new HttpsProxyAgent(process.env.PROXY);
+        }
+        const response = await fetch(EXEC_ENDPOINT, fetchOptions);
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`);
+        }
+
+        const result: t.ExecuteResult = await response.json();
+        /* See `CodeExecutor.ts` — file listings were removed from the
+         * LLM-facing tool result. Bash especially benefits: models
+         * naturally `ls /mnt/data/` to discover what's available
+         * rather than relying on a prescriptive summary that
+         * misleads as often as it helps. */
+        let formattedOutput = '';
+        if (result.stdout) {
+          formattedOutput += `stdout:\n${result.stdout}\n`;
+        } else {
+          formattedOutput += emptyOutputMessage;
+        }
+        if (result.stderr) formattedOutput += `stderr:\n${result.stderr}\n`;
+
+        const hasFiles = result.files != null && result.files.length > 0;
+        return [
+          formattedOutput.trim(),
+          (hasFiles
+            ? { session_id: result.session_id, files: result.files }
+            : {
+              session_id: result.session_id,
+            }) satisfies t.CodeExecutionArtifact,
+        ];
+      } catch (error) {
+        throw new Error(
+          `Execution error:\n\n${(error as Error | undefined)?.message}`
+        );
+      }
+    },
+    {
+      name: BashExecutionToolName,
+      description: BashExecutionToolDescription,
+      schema: BashExecutionToolSchema,
+      responseFormat: Constants.CONTENT_AND_ARTIFACT,
+    }
+  );
+}
+
+export { createBashExecutionTool };
