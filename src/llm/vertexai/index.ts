@@ -6,9 +6,34 @@ import type {
   GoogleAIModelRequestParams,
   GoogleAbstractedClient,
 } from '@langchain/google-common';
-import type { BaseMessage } from '@langchain/core/messages';
-import { isAIMessage } from '@langchain/core/messages';
+import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
+import type { BaseMessage, UsageMetadata } from '@langchain/core/messages';
+import { AIMessageChunk, isAIMessage } from '@langchain/core/messages';
+import type { ChatGenerationChunk } from '@langchain/core/outputs';
 import type { GoogleThinkingConfig, VertexAIClientOptions } from '@/types';
+
+/**
+ * `@langchain/google-common`'s `_streamResponseChunks` builds usage_metadata
+ * inline as `output_tokens = candidatesTokenCount` and drops
+ * `thoughtsTokenCount` entirely. For thinking models this undercounts the
+ * billed output by the reasoning tokens, breaking the documented
+ * `total_tokens === input_tokens + output_tokens` invariant. The non-stream
+ * `_generate` path uses `responseToUsageMetadata` and is correct.
+ *
+ * Reasoning is still surfaced in `output_token_details.reasoning`, so we
+ * fold it back into `output_tokens` when the gap is present. Mirrors what
+ * `CustomChatGoogleGenerativeAI` already does for the Google API path.
+ */
+export function repairStreamUsageMetadata(
+  usage: UsageMetadata | undefined
+): void {
+  if (!usage) return;
+  const reasoning = usage.output_token_details?.reasoning;
+  if (typeof reasoning !== 'number' || reasoning <= 0) return;
+  if (usage.total_tokens - usage.input_tokens > usage.output_tokens) {
+    usage.output_tokens += reasoning;
+  }
+}
 
 type AdditionalKwargs =
   | undefined
@@ -445,6 +470,22 @@ export class ChatVertexAI extends ChatGoogle {
       params.maxReasoningTokens = -1;
     }
     return params;
+  }
+  async *_streamResponseChunks(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions'],
+    runManager?: CallbackManagerForLLMRun
+  ): AsyncGenerator<ChatGenerationChunk> {
+    for await (const chunk of super._streamResponseChunks(
+      messages,
+      options,
+      runManager
+    )) {
+      if (chunk.message instanceof AIMessageChunk) {
+        repairStreamUsageMetadata(chunk.message.usage_metadata);
+      }
+      yield chunk;
+    }
   }
   buildConnection(
     fields: VertexAIClientOptions | undefined,
