@@ -108,6 +108,7 @@ function createBashExecutionTool(
 ): DynamicStructuredTool {
   return tool(
     async (rawInput, config) => {
+      const { authHeaders, ...executionParams } = params ?? {};
       const { command, ...rest } = rawInput as {
         command: string;
         args?: string[];
@@ -121,7 +122,7 @@ function createBashExecutionTool(
         lang: 'bash',
         code: command,
         ...rest,
-        ...params,
+        ...executionParams,
       };
 
       /* See `CodeExecutor.ts` for the rationale — `/files/<session_id>`
@@ -141,15 +142,14 @@ function createBashExecutionTool(
       }
 
       try {
-        const authHeaders = await resolveCodeApiAuthHeaders(
-          params.authHeaders
-        );
+        const resolvedAuthHeaders =
+          await resolveCodeApiAuthHeaders(authHeaders);
         const fetchOptions: RequestInit = {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             'User-Agent': 'LibreChat/1.0',
-            ...authHeaders,
+            ...resolvedAuthHeaders,
           },
           body: JSON.stringify(postData),
         };

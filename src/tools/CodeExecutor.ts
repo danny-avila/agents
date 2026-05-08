@@ -104,6 +104,7 @@ function createCodeExecutionTool(
 ): DynamicStructuredTool {
   return tool(
     async (rawInput, config) => {
+      const { authHeaders, ...executionParams } = params ?? {};
       const { lang, code, ...rest } = rawInput as {
         lang: SupportedLanguage;
         code: string;
@@ -123,7 +124,7 @@ function createCodeExecutionTool(
         lang,
         code,
         ...rest,
-        ...params,
+        ...executionParams,
       };
 
       /* File injection: `_injected_files` from ToolNode (set when host
@@ -147,15 +148,14 @@ function createCodeExecutionTool(
       }
 
       try {
-        const authHeaders = await resolveCodeApiAuthHeaders(
-          params.authHeaders
-        );
+        const resolvedAuthHeaders =
+          await resolveCodeApiAuthHeaders(authHeaders);
         const fetchOptions: RequestInit = {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             'User-Agent': 'LibreChat/1.0',
-            ...authHeaders,
+            ...resolvedAuthHeaders,
           },
           body: JSON.stringify(postData),
         };

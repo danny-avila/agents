@@ -1,5 +1,6 @@
 import fetch from 'node-fetch';
 import { beforeEach, describe, expect, it, jest } from '@jest/globals';
+import type { RequestInit } from 'node-fetch';
 import type * as t from '@/types';
 import {
   createCodeExecutionTool,
@@ -117,6 +118,9 @@ describe('CodeAPI auth header injection', () => {
         }),
       })
     );
+    expect(
+      JSON.parse((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string)
+    ).not.toHaveProperty('authHeaders');
   });
 
   it('forwards Authorization for bash execution', async () => {
@@ -137,6 +141,9 @@ describe('CodeAPI auth header injection', () => {
         }),
       })
     );
+    expect(
+      JSON.parse((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string)
+    ).not.toHaveProperty('authHeaders');
   });
 
   it('forwards Authorization on programmatic initial and continuation requests', async () => {
