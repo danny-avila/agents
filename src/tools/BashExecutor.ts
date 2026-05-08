@@ -133,54 +133,20 @@ function createBashExecutionTool(
         ...params,
       };
 
+      /* See `CodeExecutor.ts` for the rationale — `/files/<session_id>`
+       * HTTP fallback was removed because codeapi's sessionAuth requires
+       * kind/id query params unavailable at this point. */
       if (_injected_files && _injected_files.length > 0) {
         postData.files = _injected_files;
-      } else if (session_id != null && session_id.length > 0) {
-        try {
-          const filesEndpoint = `${baseEndpoint}/files/${session_id}?detail=full`;
-          const fetchOptions: RequestInit = {
-            method: 'GET',
-            headers: {
-              'User-Agent': 'LibreChat/1.0',
-            },
-          };
-
-          if (process.env.PROXY != null && process.env.PROXY !== '') {
-            fetchOptions.agent = new HttpsProxyAgent(process.env.PROXY);
-          }
-
-          const response = await fetch(filesEndpoint, fetchOptions);
-          if (!response.ok) {
-            throw new Error(
-              `Failed to fetch files for session: ${response.status}`
-            );
-          }
-
-          const files = await response.json();
-          if (Array.isArray(files) && files.length > 0) {
-            const fileReferences: t.CodeEnvFile[] = files.map((file) => {
-              const nameParts = file.name.split('/');
-              const id = nameParts.length > 1 ? nameParts[1].split('.')[0] : '';
-
-              return {
-                storage_session_id: session_id,
-                /* `/files` fallback returns code-output files belonging
-                 * to the user; tag them user-private. */
-                kind: 'user' as const,
-                id,
-                /* `resource_id` informational for `kind: 'user'` —
-                 * codeapi derives sessionKey from auth context. */
-                resource_id: id,
-                name: file.metadata['original-filename'],
-              };
-            });
-
-            postData.files = fileReferences;
-          }
-        } catch {
-          // eslint-disable-next-line no-console
-          console.warn(`Failed to fetch files for session: ${session_id}`);
-        }
+      } else if (
+        session_id != null &&
+        session_id.length > 0 &&
+        !Array.isArray(postData.files)
+      ) {
+        // eslint-disable-next-line no-console
+        console.debug(
+          `[BashExecutor] No injected files for session_id=${session_id} — exec will run without input files`
+        );
       }
 
       try {

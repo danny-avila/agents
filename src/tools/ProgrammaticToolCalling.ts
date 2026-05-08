@@ -675,16 +675,19 @@ export function createProgrammaticToolCallingTool(
         }
 
         /**
-         * File injection priority:
-         * 1. Use _injected_files from ToolNode (avoids /files endpoint race condition)
-         * 2. Fall back to fetching from /files endpoint if session_id
-         *    provided but no injected files.
+         * File injection: `_injected_files` from ToolNode session
+         * context. The legacy `/files/<session_id>` HTTP fallback was
+         * removed (see `CodeExecutor.ts`) — codeapi's sessionAuth now
+         * requires kind/id query params unavailable at this point.
          */
         let files: t.CodeEnvFile[] | undefined;
         if (_injected_files && _injected_files.length > 0) {
           files = _injected_files;
         } else if (session_id != null && session_id.length > 0) {
-          files = await fetchSessionFiles(baseUrl, session_id, proxy);
+          // eslint-disable-next-line no-console
+          console.debug(
+            `[ProgrammaticToolCalling] No injected files for session_id=${session_id} — exec will run without input files`
+          );
         }
 
         let response = await makeRequest(

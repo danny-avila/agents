@@ -5,7 +5,6 @@ import type * as t from '@/types';
 import {
   makeRequest,
   executeTools,
-  fetchSessionFiles,
   formatCompletedResponse,
 } from './ProgrammaticToolCalling';
 import { getCodeBaseURL } from './CodeExecutor';
@@ -290,11 +289,17 @@ export function createBashProgrammaticToolCallingTool(
           );
         }
 
+        /* `/files/<session_id>` HTTP fallback removed — codeapi's
+         * sessionAuth requires kind/id query params unavailable at
+         * this point. See `CodeExecutor.ts` for full rationale. */
         let files: t.CodeEnvFile[] | undefined;
         if (_injected_files && _injected_files.length > 0) {
           files = _injected_files;
         } else if (session_id != null && session_id.length > 0) {
-          files = await fetchSessionFiles(baseUrl, session_id, proxy);
+          // eslint-disable-next-line no-console
+          console.debug(
+            `[BashProgrammaticToolCalling] No injected files for session_id=${session_id} — exec will run without input files`
+          );
         }
 
         let response = await makeRequest(
