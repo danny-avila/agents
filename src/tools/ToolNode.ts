@@ -131,6 +131,10 @@ function isSend(value: unknown): value is Send {
   return value instanceof Send;
 }
 
+function isHandoffToolName(name: string): boolean {
+  return name.startsWith(Constants.LC_TRANSFER_TO_);
+}
+
 /**
  * Format a fail-closed diagnostic for malformed approval-decision
  * fields. Hosts deserialize resume payloads from untyped JSON, so
@@ -581,6 +585,61 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     return this.fileCheckpointer;
   }
 
+  private getRegisteredHandoffNames(): Iterable<string> {
+    return this.directToolNames != null && this.directToolNames.size > 0
+      ? this.directToolNames
+      : this.toolMap.keys();
+  }
+
+  private hasRegisteredHandoffTool(): boolean {
+    for (const toolName of this.getRegisteredHandoffNames()) {
+      if (isHandoffToolName(toolName)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private getHandoffToolNameSuggestion(callName: string): string | undefined {
+    if (!isHandoffToolName(callName)) {
+      return undefined;
+    }
+
+    let suggestion: string | undefined;
+    for (const toolName of this.getRegisteredHandoffNames()) {
+      if (
+        !isHandoffToolName(toolName) ||
+        toolName.length >= callName.length ||
+        !callName.startsWith(toolName)
+      ) {
+        continue;
+      }
+      if (suggestion == null || toolName.length > suggestion.length) {
+        suggestion = toolName;
+      }
+    }
+    return suggestion;
+  }
+
+  private shouldHandleUnknownHandoffLocally(callName: string): boolean {
+    return (
+      isHandoffToolName(callName) &&
+      !this.toolMap.has(callName) &&
+      this.hasRegisteredHandoffTool()
+    );
+  }
+
+  private getUnknownToolErrorMessage(callName: string): string {
+    const suggestion = this.getHandoffToolNameSuggestion(callName);
+    if (suggestion == null) {
+      return `Tool "${callName}" not found.`;
+    }
+    return (
+      `Tool "${callName}" not found. Did you mean "${suggestion}"? ` +
+      'Handoff tool names must match exactly.'
+    );
+  }
+
   /**
    * Flush the per-Run direct-path turn cache. Called by the Graph at
    * end-of-Run via `clearHeavyState`. The map intentionally survives
@@ -699,7 +758,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       batchScopeId ?? (config.configurable?.run_id as string | undefined);
     try {
       if (tool === undefined) {
-        throw new Error(`Tool "${call.name}" not found.`);
+        throw new Error(this.getUnknownToolErrorMessage(call.name));
       }
       /**
        * `usageCount` is the per-tool-name invocation index that
@@ -2742,8 +2801,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     let outputs: (BaseMessage | Command)[];
 
     if (this.isSendInput(input)) {
-      const isDirectTool = this.directToolNames?.has(input.lg_tool_call.name);
-      if (this.eventDrivenMode && isDirectTool !== true) {
+      const isLocalTool =
+        this.directToolNames?.has(input.lg_tool_call.name) === true ||
+        this.shouldHandleUnknownHandoffLocally(input.lg_tool_call.name);
+      if (this.eventDrivenMode && !isLocalTool) {
         return this.executeViaEvent([input.lg_tool_call], config, input, {
           batchIndices: [0],
           turn,
@@ -2849,8 +2910,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
       if (this.eventDrivenMode && filteredCalls.length > 0) {
         const filteredIndices = filteredCalls.map((_, idx) => idx);
+        const directToolNames = this.directToolNames;
 
-        if (!this.directToolNames || this.directToolNames.size === 0) {
+        if (directToolNames == null || directToolNames.size === 0) {
           return this.executeViaEvent(filteredCalls, config, input, {
             batchIndices: filteredIndices,
             turn,
@@ -2863,7 +2925,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         for (let i = 0; i < filteredCalls.length; i++) {
           const call = filteredCalls[i];
           const entry = { call, batchIndex: i };
-          if (this.directToolNames!.has(call.name)) {
+          if (
+            directToolNames.has(call.name) ||
+            this.shouldHandleUnknownHandoffLocally(call.name)
+          ) {
             directEntries.push(entry);
           } else {
             eventEntries.push(entry);

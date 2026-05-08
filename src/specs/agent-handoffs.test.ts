@@ -4,7 +4,7 @@ import { HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type * as t from '@/types';
-import { Providers, Constants } from '@/common';
+import { Providers, GraphEvents, Constants } from '@/common';
 import { StandardGraph } from '@/graphs/Graph';
 import { Run } from '@/run';
 
@@ -987,6 +987,165 @@ describe('Agent Handoffs Tests', () => {
       expect(handoffTool).toBeDefined();
       expect(getToolName(handoffTool!)).toBe(
         `${Constants.LC_TRANSFER_TO_}AgentWithCamelCase`
+      );
+    });
+
+    it('should return exact-name guidance for handoff names with extra suffixes', async () => {
+      const agents: t.AgentInputs[] = [
+        createBasicAgent('router', 'You are a router'),
+        createBasicAgent('data_analyst', 'You are a data analyst'),
+      ];
+
+      const edges: t.GraphEdge[] = [
+        {
+          from: 'router',
+          to: 'data_analyst',
+          edgeType: 'handoff',
+        },
+      ];
+
+      const run = await Run.create(createTestConfig(agents, edges));
+      const correctName = `${Constants.LC_TRANSFER_TO_}data_analyst`;
+      const wrongName = `${correctName}_analyst`;
+
+      run.Graph?.overrideTestModel(
+        ['Trying to transfer', 'Stopping after invalid tool name'],
+        10,
+        [
+          {
+            id: 'tool_call_wrong_handoff',
+            name: wrongName,
+            args: { instructions: 'Analyze the uploaded data' },
+          } as ToolCall,
+        ]
+      );
+
+      const config: Partial<RunnableConfig> & {
+        version: 'v1' | 'v2';
+        streamMode: string;
+      } = {
+        configurable: {
+          thread_id: 'test-wrong-handoff-name-thread',
+        },
+        streamMode: 'values',
+        version: 'v2' as const,
+      };
+
+      await run.processStream(
+        { messages: [new HumanMessage('Please analyze my data')] },
+        config
+      );
+
+      const toolMessages = run
+        .getRunMessages()!
+        .filter((msg) => msg.getType() === 'tool') as ToolMessage[];
+      const wrongNameMessage = toolMessages.find(
+        (msg) => msg.name === wrongName
+      );
+
+      expect(wrongNameMessage).toBeDefined();
+      expect(wrongNameMessage?.status).toBe('error');
+      expect(wrongNameMessage?.content).toContain(
+        `Did you mean "${correctName}"`
+      );
+    });
+
+    it('should not dispatch mistyped graph handoffs to event-driven tool hosts', async () => {
+      const executedToolNames: string[] = [];
+      const agents: t.AgentInputs[] = [
+        {
+          ...createBasicAgent('router', 'You are a router'),
+          toolDefinitions: [
+            {
+              name: 'lookup_sessions',
+              description: 'List upload sessions',
+              parameters: {
+                type: 'object',
+                properties: {},
+                required: [],
+              },
+            },
+          ],
+        },
+        createBasicAgent('data_analyst', 'You are a data analyst'),
+      ];
+
+      const edges: t.GraphEdge[] = [
+        {
+          from: 'router',
+          to: 'data_analyst',
+          edgeType: 'handoff',
+        },
+      ];
+
+      const run = await Run.create({
+        ...createTestConfig(agents, edges),
+        customHandlers: {
+          [GraphEvents.ON_TOOL_EXECUTE]: {
+            handle: (_event: string, data: t.StreamEventData): void => {
+              const batch = data as t.ToolExecuteBatchRequest;
+              executedToolNames.push(
+                ...batch.toolCalls.map((toolCall) => toolCall.name)
+              );
+              batch.resolve(
+                batch.toolCalls.map((toolCall) => ({
+                  toolCallId: toolCall.id,
+                  status: 'success' as const,
+                  content: `host result for ${toolCall.name}`,
+                }))
+              );
+            },
+          },
+        },
+      });
+      const correctName = `${Constants.LC_TRANSFER_TO_}data_analyst`;
+      const wrongName = `${correctName}_analyst`;
+
+      run.Graph?.overrideTestModel(
+        ['Checking sessions and transferring', 'Handled invalid transfer'],
+        10,
+        [
+          {
+            id: 'tool_call_lookup',
+            name: 'lookup_sessions',
+            args: {},
+          } as ToolCall,
+          {
+            id: 'tool_call_wrong_handoff',
+            name: wrongName,
+            args: { instructions: 'Analyze the upload session data' },
+          } as ToolCall,
+        ]
+      );
+
+      const config: Partial<RunnableConfig> & {
+        version: 'v1' | 'v2';
+        streamMode: string;
+      } = {
+        configurable: {
+          thread_id: 'test-event-wrong-handoff-name-thread',
+        },
+        streamMode: 'values',
+        version: 'v2' as const,
+      };
+
+      await run.processStream(
+        { messages: [new HumanMessage('Check my sessions and analyze them')] },
+        config
+      );
+
+      const toolMessages = run
+        .getRunMessages()!
+        .filter((msg) => msg.getType() === 'tool') as ToolMessage[];
+      const wrongNameMessage = toolMessages.find(
+        (msg) => msg.name === wrongName
+      );
+
+      expect(executedToolNames).toEqual(['lookup_sessions']);
+      expect(wrongNameMessage).toBeDefined();
+      expect(wrongNameMessage?.status).toBe('error');
+      expect(wrongNameMessage?.content).toContain(
+        `Did you mean "${correctName}"`
       );
     });
   });
