@@ -184,6 +184,11 @@
     "@browserbasehq/stagehand": {
       "openai": "$openai"
     },
+    "@langchain/google-common": "$@langchain/google-common",
+    "@langchain/google-gauth": "$@langchain/google-gauth",
+    "@langchain/google-genai": "$@langchain/google-genai",
+    "@langchain/google-vertexai": "$@langchain/google-vertexai",
+    "uuid": "$uuid",
     "fast-xml-parser": "5.7.2",
     "ajv": "6.14.0",
     "minimatch": "3.1.4"
@@ -195,10 +200,10 @@
     "@langchain/aws": "^1.3.5",
     "@langchain/core": "1.1.44",
     "@langchain/deepseek": "^1.0.25",
-    "@langchain/google-common": "2.1.30",
-    "@langchain/google-gauth": "2.1.30",
-    "@langchain/google-genai": "2.1.30",
-    "@langchain/google-vertexai": "2.1.30",
+    "@langchain/google-common": "2.1.28",
+    "@langchain/google-gauth": "2.1.28",
+    "@langchain/google-genai": "2.1.28",
+    "@langchain/google-vertexai": "2.1.28",
     "@langchain/langgraph": "^1.2.9",
     "@langchain/mistralai": "^1.0.8",
     "@langchain/openai": "1.4.5",
