@@ -2,9 +2,11 @@ import { config as loadEnv } from 'dotenv';
 import { HumanMessage, SystemMessage } from '@langchain/core/messages';
 import type { AIMessage, BaseMessage } from '@langchain/core/messages';
 import type { ClientOptions } from '@langchain/openai';
+import type { GraphTools } from '@/types';
 import type { ChatOpenRouterInput } from '@/llm/openrouter';
 import { addCacheControl } from '@/messages/cache';
 import { ChatOpenRouter } from '@/llm/openrouter';
+import { partitionAndMarkOpenRouterToolCache } from '@/llm/openrouter/toolCache';
 
 loadEnv({ path: process.env.DOTENV_CONFIG_PATH ?? '.env' });
 
@@ -19,6 +21,14 @@ type CacheUsage = {
   inputTokens: number;
   outputTokens: number;
   totalTokens: number;
+};
+
+type OpenRouterTool = {
+  type: 'function';
+  function: {
+    name: string;
+  };
+  cache_control?: { type: 'ephemeral' };
 };
 
 const DEFAULT_MODEL_CASES: ModelCase[] = [
@@ -50,6 +60,56 @@ function buildStableReference(): string {
     const section = index + 1;
     return `Section ${section}. ${paragraph} Verification key ${section}: OPENROUTER_PROMPT_CACHE_LIVE_REFERENCE_${section}.`;
   }).join('\n');
+}
+
+function buildStableToolDescription(): string {
+  const paragraph =
+    'Static OpenRouter tool contract for prompt cache validation. This tool description is stable across requests and intentionally verbose so provider-side prompt caching can write and then read a meaningful static tool-schema prefix while dynamic tools vary after the cache breakpoint.';
+
+  return Array.from({ length: 90 }, (_, index) => {
+    const section = index + 1;
+    return `Tool section ${section}. ${paragraph} Stable tool key ${section}: OPENROUTER_STATIC_TOOL_CACHE_REFERENCE_${section}.`;
+  }).join('\n');
+}
+
+function buildToolSet(attempt: number): GraphTools {
+  return [
+    {
+      type: 'function',
+      function: {
+        name: 'stable_reference_lookup',
+        description: buildStableToolDescription(),
+        parameters: {
+          type: 'object',
+          properties: {
+            query: {
+              type: 'string',
+              description: 'Stable lookup query.',
+            },
+          },
+          required: ['query'],
+          additionalProperties: false,
+        },
+      },
+    },
+    {
+      type: 'function',
+      function: {
+        name: `dynamic_runtime_tool_${attempt}`,
+        description: `Dynamic runtime tool ${attempt}; this varies between attempts and should sit after the cached static tool prefix.`,
+        parameters: {
+          type: 'object',
+          properties: {
+            value: {
+              type: 'string',
+            },
+          },
+          required: ['value'],
+          additionalProperties: false,
+        },
+      },
+    },
+  ] as GraphTools;
 }
 
 function buildMessages(model: string): BaseMessage[] {
@@ -149,6 +209,69 @@ async function runCase({ label, model }: ModelCase): Promise<CacheUsage[]> {
   return usages;
 }
 
+async function runStaticToolCase(): Promise<CacheUsage[]> {
+  const model = 'anthropic/claude-haiku-4.5';
+  const usages: CacheUsage[] = [];
+
+  log(`\nStatic tools through OpenRouter: ${model}`);
+
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    const llmInput: ChatOpenRouterInput & { configuration: ClientOptions } = {
+      model,
+      apiKey,
+      maxTokens: 12,
+      temperature: 0,
+      promptCache: true,
+      streamUsage: true,
+      configuration: {
+        baseURL,
+        defaultHeaders: {
+          'HTTP-Referer': 'https://librechat.ai',
+          'X-Title': 'LibreChat OpenRouter Prompt Cache Live Test',
+        },
+      },
+    };
+    const llm = new ChatOpenRouter(llmInput);
+    const tools = partitionAndMarkOpenRouterToolCache(
+      buildToolSet(attempt),
+      (name) => name.startsWith('dynamic_runtime_tool_')
+    ) as OpenRouterTool[];
+    const markedTool = tools.find((entry) => entry.cache_control != null);
+    if (markedTool?.function.name !== 'stable_reference_lookup') {
+      throw new Error('Static tool cache marker was not applied as expected');
+    }
+
+    const modelWithTools = llm.bindTools(tools);
+    const started = Date.now();
+    const response = (await modelWithTools.invoke([
+      new SystemMessage('Reply with exactly: cache live check ok.'),
+      new HumanMessage(
+        `Attempt ${attempt}. Do not call tools; only answer with the requested text.`
+      ),
+    ])) as AIMessage;
+    const usage = getCacheUsage(response);
+    usages.push(usage);
+
+    log(
+      [
+        `attempt=${attempt}`,
+        `ms=${Date.now() - started}`,
+        `input=${usage.inputTokens}`,
+        `output=${usage.outputTokens}`,
+        `write=${usage.cacheCreation}`,
+        `read=${usage.cacheRead}`,
+        `total=${usage.totalTokens}`,
+      ].join(' ')
+    );
+
+    if (hasCacheHit(usages)) {
+      return usages;
+    }
+  }
+
+  return usages;
+}
+
 async function main(): Promise<void> {
   const results: Array<ModelCase & { usages: CacheUsage[] }> = [];
 
@@ -156,6 +279,13 @@ async function main(): Promise<void> {
     const usages = await runCase(modelCase);
     results.push({ ...modelCase, usages });
   }
+
+  const staticToolUsages = await runStaticToolCase();
+  results.push({
+    label: 'Static tools',
+    model: 'anthropic/claude-haiku-4.5',
+    usages: staticToolUsages,
+  });
 
   const failures = results.filter(({ usages }) => {
     return !hasCacheActivity(usages) || !hasCacheHit(usages);

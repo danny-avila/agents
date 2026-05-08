@@ -62,6 +62,7 @@ import { isThinkingEnabled } from '@/llm/request';
 import { initializeModel } from '@/llm/init';
 import { HandlerRegistry } from '@/events';
 import { ChatOpenAI } from '@/llm/openai';
+import { partitionAndMarkOpenRouterToolCache } from '@/llm/openrouter/toolCache';
 import type { HookRegistry } from '@/hooks';
 
 const { AGENT, TOOLS, SUMMARIZE } = GraphNodeKeys;
@@ -817,6 +818,19 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             rawToolsForBinding,
             makeIsDeferred(agentContext.toolDefinitions)
           ) ?? rawToolsForBinding;
+      } else if (
+        agentContext.provider === Providers.OPENROUTER &&
+        (
+          agentContext.clientOptions as
+            | t.ProviderOptionsMap[Providers.OPENROUTER]
+            | undefined
+        )?.promptCache === true
+      ) {
+        toolsForBinding =
+          partitionAndMarkOpenRouterToolCache(
+            rawToolsForBinding,
+            makeIsDeferred(agentContext.toolDefinitions)
+          ) ?? rawToolsForBinding;
       }
 
       let model =
@@ -1077,7 +1091,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         const openRouterOptions = agentContext.clientOptions as
           | t.ProviderOptionsMap[Providers.OPENROUTER]
           | undefined;
-        if (openRouterOptions?.promptCache === true) {
+        if (
+          openRouterOptions?.promptCache === true &&
+          !agentContext.systemRunnable
+        ) {
           finalMessages = addCacheControl<BaseMessage>(finalMessages);
         }
       }

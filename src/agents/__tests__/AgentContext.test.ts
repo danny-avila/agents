@@ -198,6 +198,80 @@ describe('AgentContext', () => {
       );
     });
 
+    it('marks stable OpenRouter system text and moves dynamic instructions after it', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.OPENROUTER,
+          clientOptions: {
+            model: 'anthropic/claude-haiku-4.5',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+          additional_instructions: 'Dynamic instructions',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('Hello'),
+      ]);
+      const content = result[0].content as TestSystemContentBlock[];
+      expect(content).toEqual([
+        {
+          type: 'text',
+          text: 'Stable instructions',
+          cache_control: { type: 'ephemeral' },
+        },
+      ]);
+      expect(result[1]).toBeInstanceOf(HumanMessage);
+      expect(result[1].content).toBe('Dynamic instructions');
+      expect(result[2].content).toBe('Hello');
+    });
+
+    it('does not cache OpenRouter body messages after dynamic instructions', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.OPENROUTER,
+          clientOptions: {
+            model: 'google/gemini-2.5-flash',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+          additional_instructions: 'Dynamic instructions',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('First'),
+        new HumanMessage('Second'),
+      ]);
+
+      expect(result[1].content).toBe('Dynamic instructions');
+      expect(result[2].content).toBe('First');
+      expect(result[3].content).toBe('Second');
+    });
+
+    it('adds OpenRouter body cache points when there is no dynamic tail', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.OPENROUTER,
+          clientOptions: {
+            model: 'anthropic/claude-haiku-4.5',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('First'),
+        new HumanMessage('Second'),
+      ]);
+      const firstContent = result[1].content as TestSystemContentBlock[];
+      const secondContent = result[2].content as TestSystemContentBlock[];
+      expect(firstContent[0]).toHaveProperty('cache_control');
+      expect(secondContent[0]).toHaveProperty('cache_control');
+    });
+
     it('preserves the Bedrock system cache point through message cache-control pass', async () => {
       const ctx = createBasicContext({
         agentConfig: {

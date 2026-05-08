@@ -30,6 +30,8 @@ type AgentSystemContentBlock =
   | AgentSystemTextBlock
   | { cachePoint: { type: 'default' } };
 
+type PromptCacheProvider = Providers.ANTHROPIC | Providers.OPENROUTER;
+
 /**
  * Encapsulates agent-specific state that can vary between agents in a multi-agent system
  */
@@ -573,11 +575,11 @@ export class AgentContext {
       return undefined;
     }
 
-    const usePromptCache = this.hasAnthropicPromptCache();
+    const promptCacheProvider = this.getPromptCacheProvider();
     const systemMessage = this.buildSystemMessage({
       stableInstructions,
       dynamicInstructions,
-      usePromptCache,
+      promptCacheProvider,
     });
 
     if (this.tokenCounter) {
@@ -605,7 +607,7 @@ export class AgentContext {
           '\n</summary>\n\n' +
           'This is your own checkpoint: you wrote it to preserve context after compaction. Pick up where you left off based on the summary above. Do not repeat prior tasks, information or acknowledge this checkpoint message directly.';
 
-        const summaryMsg = usePromptCache
+        const summaryMsg = promptCacheProvider === Providers.ANTHROPIC
           ? new HumanMessage({
             content: [
               {
@@ -621,21 +623,48 @@ export class AgentContext {
         body = messages;
       }
 
-      if (usePromptCache && body.length >= 2) {
+      const hasOpenRouterDynamicTail =
+        promptCacheProvider === Providers.OPENROUTER &&
+        (dynamicInstructions !== '' || hasSummaryBody);
+
+      if (
+        promptCacheProvider === Providers.OPENROUTER &&
+        dynamicInstructions !== ''
+      ) {
+        body = [new HumanMessage(dynamicInstructions), ...body];
+      }
+
+      if (
+        promptCacheProvider != null &&
+        !hasOpenRouterDynamicTail &&
+        body.length >= 2
+      ) {
         body = addCacheControl(body);
       }
       return [...prefix, ...body];
     }).withConfig({ runName: 'prompt' });
   }
 
-  private hasAnthropicPromptCache(): boolean {
-    if (this.provider !== Providers.ANTHROPIC) {
-      return false;
+  private getPromptCacheProvider(): PromptCacheProvider | undefined {
+    if (this.provider === Providers.ANTHROPIC) {
+      const anthropicOptions = this.clientOptions as
+        | t.AnthropicClientOptions
+        | undefined;
+      return anthropicOptions?.promptCache === true
+        ? Providers.ANTHROPIC
+        : undefined;
     }
-    const anthropicOptions = this.clientOptions as
-      | t.AnthropicClientOptions
-      | undefined;
-    return anthropicOptions?.promptCache === true;
+
+    if (this.provider === Providers.OPENROUTER) {
+      const openRouterOptions = this.clientOptions as
+        | t.ProviderOptionsMap[Providers.OPENROUTER]
+        | undefined;
+      return openRouterOptions?.promptCache === true
+        ? Providers.OPENROUTER
+        : undefined;
+    }
+
+    return undefined;
   }
 
   private hasBedrockPromptCache(): boolean {
@@ -651,17 +680,17 @@ export class AgentContext {
   private buildSystemMessage({
     stableInstructions,
     dynamicInstructions,
-    usePromptCache,
+    promptCacheProvider,
   }: {
     stableInstructions: string;
     dynamicInstructions: string;
-    usePromptCache: boolean;
+    promptCacheProvider: PromptCacheProvider | undefined;
   }): SystemMessage | undefined {
     if (!stableInstructions && !dynamicInstructions) {
       return undefined;
     }
 
-    if (usePromptCache) {
+    if (promptCacheProvider === Providers.ANTHROPIC) {
       const content: AgentSystemContentBlock[] = [];
       if (stableInstructions) {
         content.push({
@@ -674,6 +703,22 @@ export class AgentContext {
         content.push({ type: 'text', text: dynamicInstructions });
       }
       return new SystemMessage({ content } as BaseMessageFields);
+    }
+
+    if (promptCacheProvider === Providers.OPENROUTER) {
+      if (!stableInstructions) {
+        return undefined;
+      }
+
+      return new SystemMessage({
+        content: [
+          {
+            type: 'text',
+            text: stableInstructions,
+            cache_control: { type: 'ephemeral' },
+          },
+        ],
+      } as BaseMessageFields);
     }
 
     if (this.hasBedrockPromptCache() && stableInstructions) {
