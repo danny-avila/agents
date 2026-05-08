@@ -65,50 +65,44 @@ type AdditionalKwargs =
  * - The signature for a functionCall part is an empty string
  *
  * This function correlates each "model" content block in the formatted request
- * back to its originating AI message, then re-attaches non-empty signatures
- * that the library failed to apply.
+ * back to its originating AI message by *position*, then re-attaches non-empty
+ * signatures that the library failed to apply. AI messages without signatures
+ * still consume their slot — filtering them out shifted later messages onto
+ * the wrong content block and dropped real signatures on the floor.
  */
-function fixThoughtSignatures(
+export function fixThoughtSignatures(
   contents: GeminiContent[],
   input: BaseMessage[]
 ): void {
-  // Collect AI messages that have signatures, in order
-  const aiMessages = input.filter(
-    (msg) =>
-      isAIMessage(msg) &&
-      Array.isArray((msg.additional_kwargs as AdditionalKwargs)?.signatures) &&
-      (msg.additional_kwargs.signatures as string[]).length > 0
-  );
-
-  // Collect "model" content blocks from the formatted request, in order
+  // All AI messages, in order — non-signature ones still consume positional
+  // slots so later messages line up with their model content blocks.
+  const aiMessages = input.filter(isAIMessage);
   const modelContents = contents.filter((c) => c.role === 'model');
 
-  // They should correspond 1:1 in order (both derived from the same input sequence)
   const count = Math.min(aiMessages.length, modelContents.length);
   for (let i = 0; i < count; i++) {
-    const msg = aiMessages[i];
-    const content = modelContents[i];
-    const signatures = (msg.additional_kwargs as AdditionalKwargs)?.signatures;
+    const signatures = (aiMessages[i].additional_kwargs as AdditionalKwargs)
+      ?.signatures;
+    if (!Array.isArray(signatures) || signatures.length === 0) continue;
 
-    // Collect non-empty signatures that aren't already attached to any part
+    const content = modelContents[i];
     const attachedSignatures = new Set(
       content.parts
         .map((p) => p.thoughtSignature)
         .filter((s): s is string => s != null && s !== '')
     );
-    const availableSignatures = signatures?.filter(
-      (s) => s != null && s !== '' && !attachedSignatures.has(s)
+    const availableSignatures = signatures.filter(
+      (s): s is string => s != null && s !== '' && !attachedSignatures.has(s)
     );
 
-    // Assign available signatures to functionCall parts missing one, in order
     let sigIdx = 0;
     for (const part of content.parts) {
       if (
         'functionCall' in part &&
         (part.thoughtSignature == null || part.thoughtSignature === '') &&
-        sigIdx < (availableSignatures?.length ?? 0)
+        sigIdx < availableSignatures.length
       ) {
-        part.thoughtSignature = availableSignatures?.[sigIdx];
+        part.thoughtSignature = availableSignatures[sigIdx];
         sigIdx++;
       }
     }
