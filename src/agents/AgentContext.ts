@@ -179,6 +179,8 @@ export class AgentContext {
   tokenCounter?: t.TokenCounter;
   /** Token count for the system message (instructions text). */
   systemMessageTokens: number = 0;
+  /** Token count for instruction text emitted outside the system message. */
+  dynamicInstructionTokens: number = 0;
   /** Token count for tool schemas only. */
   toolSchemaTokens: number = 0;
   /** Running calibration ratio from the pruner — persisted across runs via contextMeta. */
@@ -192,7 +194,12 @@ export class AgentContext {
   get instructionTokens(): number {
     const summaryOverhead =
       this._summaryLocation === 'user_message' ? this.summaryTokenCount : 0;
-    return this.systemMessageTokens + this.toolSchemaTokens + summaryOverhead;
+    return (
+      this.systemMessageTokens +
+      this.dynamicInstructionTokens +
+      this.toolSchemaTokens +
+      summaryOverhead
+    );
   }
   /** The amount of time that should pass before another consecutive API call */
   streamBuffer?: number;
@@ -586,6 +593,10 @@ export class AgentContext {
       this.systemMessageTokens = systemMessage
         ? this.tokenCounter(systemMessage)
         : 0;
+      this.dynamicInstructionTokens =
+        promptCacheProvider === Providers.OPENROUTER && dynamicInstructions
+          ? this.tokenCounter(new HumanMessage(dynamicInstructions))
+          : 0;
     }
 
     return RunnableLambda.from((messages: BaseMessage[]) => {
@@ -600,6 +611,7 @@ export class AgentContext {
         this.summaryText !== '';
 
       let body: BaseMessage[];
+      const dynamicTail: BaseMessage[] = [];
       if (hasSummaryBody) {
         const wrappedSummary =
           '<summary>\n' +
@@ -618,7 +630,12 @@ export class AgentContext {
             ],
           })
           : new HumanMessage(wrappedSummary);
-        body = [summaryMsg, ...messages];
+        if (promptCacheProvider === Providers.OPENROUTER) {
+          dynamicTail.push(summaryMsg);
+          body = messages;
+        } else {
+          body = [summaryMsg, ...messages];
+        }
       } else {
         body = messages;
       }
@@ -631,7 +648,17 @@ export class AgentContext {
         promptCacheProvider === Providers.OPENROUTER &&
         dynamicInstructions !== ''
       ) {
-        body = [new HumanMessage(dynamicInstructions), ...body];
+        dynamicTail.unshift(new HumanMessage(dynamicInstructions));
+      }
+
+      if (
+        promptCacheProvider === Providers.OPENROUTER &&
+        dynamicTail.length > 0
+      ) {
+        body =
+          body.length > 0
+            ? [body[0], ...dynamicTail, ...body.slice(1)]
+            : dynamicTail;
       }
 
       if (
@@ -744,6 +771,7 @@ export class AgentContext {
    */
   reset(): void {
     this.systemMessageTokens = 0;
+    this.dynamicInstructionTokens = 0;
     this.toolSchemaTokens = 0;
     this.cachedSystemRunnable = undefined;
     this.systemRunnableStale = true;
@@ -1099,6 +1127,7 @@ export class AgentContext {
       maxContextTokens,
       instructionTokens: this.instructionTokens,
       systemMessageTokens: this.systemMessageTokens,
+      dynamicInstructionTokens: this.dynamicInstructionTokens,
       toolSchemaTokens: this.toolSchemaTokens,
       summaryTokens: this.summaryTokenCount,
       toolCount,
@@ -1117,7 +1146,7 @@ export class AgentContext {
     const lines = [
       'Token budget breakdown:',
       `  maxContextTokens:    ${b.maxContextTokens}`,
-      `  instructionTokens:   ${b.instructionTokens} (system: ${b.systemMessageTokens}, tools: ${b.toolSchemaTokens} [${b.toolCount} tools])`,
+      `  instructionTokens:   ${b.instructionTokens} (system: ${b.systemMessageTokens}, dynamic: ${b.dynamicInstructionTokens}, tools: ${b.toolSchemaTokens} [${b.toolCount} tools])`,
       `  summaryTokens:       ${b.summaryTokens}`,
       `  messageTokens:       ${b.messageTokens} (${b.messageCount} messages)`,
       `  availableForMessages: ${b.availableForMessages}`,

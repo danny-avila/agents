@@ -216,6 +216,8 @@ export type TokenBudgetBreakdown = {
   instructionTokens: number;
   /** Tokens from the system message text alone. */
   systemMessageTokens: number;
+  /** Tokens from instruction text emitted outside the system message. */
+  dynamicInstructionTokens: number;
   /** Tokens from tool schema definitions. */
   toolSchemaTokens: number;
   /** Tokens from the conversation summary. */

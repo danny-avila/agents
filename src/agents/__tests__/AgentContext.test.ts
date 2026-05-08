@@ -198,7 +198,7 @@ describe('AgentContext', () => {
       );
     });
 
-    it('marks stable OpenRouter system text and moves dynamic instructions after it', async () => {
+    it('marks stable OpenRouter system text and keeps first user message stable', async () => {
       const ctx = createBasicContext({
         agentConfig: {
           provider: Providers.OPENROUTER,
@@ -213,6 +213,7 @@ describe('AgentContext', () => {
 
       const result = await ctx.systemRunnable!.invoke([
         new HumanMessage('Hello'),
+        new HumanMessage('Second'),
       ]);
       const content = result[0].content as TestSystemContentBlock[];
       expect(content).toEqual([
@@ -223,8 +224,9 @@ describe('AgentContext', () => {
         },
       ]);
       expect(result[1]).toBeInstanceOf(HumanMessage);
-      expect(result[1].content).toBe('Dynamic instructions');
-      expect(result[2].content).toBe('Hello');
+      expect(result[1].content).toBe('Hello');
+      expect(result[2].content).toBe('Dynamic instructions');
+      expect(result[3].content).toBe('Second');
     });
 
     it('does not cache OpenRouter body messages after dynamic instructions', async () => {
@@ -245,8 +247,8 @@ describe('AgentContext', () => {
         new HumanMessage('Second'),
       ]);
 
-      expect(result[1].content).toBe('Dynamic instructions');
-      expect(result[2].content).toBe('First');
+      expect(result[1].content).toBe('First');
+      expect(result[2].content).toBe('Dynamic instructions');
       expect(result[3].content).toBe('Second');
     });
 
@@ -270,6 +272,29 @@ describe('AgentContext', () => {
       const secondContent = result[2].content as TestSystemContentBlock[];
       expect(firstContent[0]).toHaveProperty('cache_control');
       expect(secondContent[0]).toHaveProperty('cache_control');
+    });
+
+    it('places OpenRouter user-message summaries after the first stable message', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.OPENROUTER,
+          clientOptions: {
+            model: 'anthropic/claude-haiku-4.5',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+        },
+      });
+      ctx.setSummary('Rotating summary', 7);
+
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('First'),
+        new HumanMessage('Second'),
+      ]);
+
+      expect(result[1].content).toBe('First');
+      expect(result[2].content).toContain('Rotating summary');
+      expect(result[3].content).toBe('Second');
     });
 
     it('preserves the Bedrock system cache point through message cache-control pass', async () => {
@@ -629,6 +654,32 @@ describe('AgentContext', () => {
       await ctxWithDeferred.tokenCalculationPromise;
 
       expect(ctxWithDeferred.toolSchemaTokens).toBe(ctxBase.toolSchemaTokens);
+    });
+
+    it('counts OpenRouter dynamic instructions outside the system message', () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.OPENROUTER,
+          clientOptions: {
+            model: 'anthropic/claude-haiku-4.5',
+            promptCache: true,
+          },
+          instructions: 'Stable',
+          additional_instructions: 'Dynamic tail',
+        },
+        tokenCounter: mockTokenCounter,
+      });
+
+      ctx.initializeSystemRunnable();
+
+      expect(ctx.systemMessageTokens).toBeGreaterThan(0);
+      expect(ctx.dynamicInstructionTokens).toBeGreaterThan(0);
+      expect(ctx.instructionTokens).toBe(
+        ctx.systemMessageTokens + ctx.dynamicInstructionTokens
+      );
+      expect(ctx.getTokenBudgetBreakdown().dynamicInstructionTokens).toBe(
+        ctx.dynamicInstructionTokens
+      );
     });
 
     it('excludes programmatic-only toolDefinitions from toolSchemaTokens', async () => {
