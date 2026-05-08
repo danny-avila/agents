@@ -155,6 +155,26 @@ export type FetchSessionFilesScope =
   | { kind: 'skill'; id: string; version: number }
   | { kind: 'agent' | 'user'; id: string; version?: never };
 
+function isFetchSessionFilesScope(
+  value: unknown
+): value is FetchSessionFilesScope {
+  if (value == null || typeof value !== 'object') {
+    return false;
+  }
+  const scope = value as { kind?: unknown; id?: unknown; version?: unknown };
+  if (
+    (scope.kind === 'agent' || scope.kind === 'user') &&
+    typeof scope.id === 'string'
+  ) {
+    return true;
+  }
+  return (
+    scope.kind === 'skill' &&
+    typeof scope.id === 'string' &&
+    typeof scope.version === 'number'
+  );
+}
+
 /**
  * Normalizes a tool name to Python identifier format.
  * Must match the Code API's `normalizePythonFunctionName` exactly:
@@ -265,18 +285,46 @@ export function filterToolsByUsage(
 export async function fetchSessionFiles(
   baseUrl: string,
   sessionId: string,
+  proxy?: string,
+  authHeaders?: t.CodeApiAuthHeaders
+): Promise<t.CodeEnvFile[]>;
+export async function fetchSessionFiles(
+  baseUrl: string,
+  sessionId: string,
   scope: FetchSessionFilesScope,
   proxy?: string,
   authHeaders?: t.CodeApiAuthHeaders
+): Promise<t.CodeEnvFile[]>;
+export async function fetchSessionFiles(
+  baseUrl: string,
+  sessionId: string,
+  scopeOrProxy?: FetchSessionFilesScope | string,
+  proxyOrAuthHeaders?: string | t.CodeApiAuthHeaders,
+  scopedAuthHeaders?: t.CodeApiAuthHeaders
 ): Promise<t.CodeEnvFile[]> {
   try {
-    const query = new URLSearchParams({
-      detail: 'full',
-      kind: scope.kind,
-      id: scope.id,
-    });
-    if (scope.kind === 'skill') {
-      query.set('version', String(scope.version));
+    const scope = isFetchSessionFilesScope(scopeOrProxy)
+      ? scopeOrProxy
+      : undefined;
+    const proxy =
+      scope == null
+        ? typeof scopeOrProxy === 'string'
+          ? scopeOrProxy
+          : undefined
+        : typeof proxyOrAuthHeaders === 'string'
+          ? proxyOrAuthHeaders
+          : undefined;
+    const authHeaders =
+      scope == null
+        ? (proxyOrAuthHeaders as t.CodeApiAuthHeaders | undefined)
+        : scopedAuthHeaders;
+    const query = new URLSearchParams({ detail: 'full' });
+    if (scope != null) {
+      query.set('kind', scope.kind);
+      query.set('id', scope.id);
+      if (scope.kind === 'skill') {
+        query.set('version', String(scope.version));
+      }
     }
     const filesEndpoint = `${baseUrl}/files/${encodeURIComponent(sessionId)}?${query.toString()}`;
     const resolvedAuthHeaders = await resolveCodeApiAuthHeaders(authHeaders);
@@ -320,9 +368,9 @@ export async function fetchSessionFiles(
       const resource_id =
         typeof file.resource_id === 'string' && file.resource_id !== ''
           ? file.resource_id
-          : scope.id;
+          : (scope?.id ?? id);
 
-      if (scope.kind === 'skill') {
+      if (scope?.kind === 'skill') {
         return {
           storage_session_id,
           kind: 'skill' as const,
@@ -332,11 +380,20 @@ export async function fetchSessionFiles(
           version: scope.version,
         };
       }
+      if (scope != null) {
+        return {
+          storage_session_id,
+          kind: scope.kind,
+          id,
+          resource_id,
+          name,
+        };
+      }
       return {
         storage_session_id,
-        kind: scope.kind,
+        kind: 'user' as const,
         id,
-        resource_id,
+        resource_id: id,
         name,
       };
     });

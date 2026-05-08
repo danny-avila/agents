@@ -245,4 +245,40 @@ describe('CodeAPI auth header injection', () => {
       })
     );
   });
+
+  it('preserves the legacy fetchSessionFiles proxy/auth argument order', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse([
+        {
+          name: 'session_123/file-1.txt',
+          metadata: { 'original-filename': 'file.txt' },
+        },
+      ])
+    );
+
+    const files = await fetchSessionFiles(
+      'https://code.example.com',
+      'session_123',
+      '',
+      { Authorization: 'Bearer legacy-files-token' }
+    );
+
+    expect(files).toEqual([
+      {
+        storage_session_id: 'session_123',
+        kind: 'user',
+        id: 'file-1',
+        resource_id: 'file-1',
+        name: 'file.txt',
+      },
+    ]);
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://code.example.com/files/session_123?detail=full',
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          Authorization: 'Bearer legacy-files-token',
+        }),
+      })
+    );
+  });
 });
