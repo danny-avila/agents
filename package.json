@@ -171,6 +171,7 @@
     "start:dev": "node --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/main.ts",
     "supervised": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/supervised.ts --provider anthropic --name Jo --location \"New York, NY\"",
     "test": "NODE_OPTIONS='--experimental-vm-modules' jest",
+    "test:live:handoffs": "RUN_HANDOFF_LIVE_TESTS=1 NODE_OPTIONS='--experimental-vm-modules' jest src/specs/agent-handoffs.live.test.ts --runInBand",
     "test:memory": "NODE_OPTIONS='--expose-gc' npx jest src/specs/title.memory-leak.test.ts",
     "test:all": "npm test -- --testPathIgnorePatterns=title.memory-leak.test.ts && npm run test:memory",
     "reinstall": "npm run clean && npm ci && rm -rf ./dist && npm run build",
