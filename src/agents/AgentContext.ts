@@ -615,66 +615,92 @@ export class AgentContext {
         this.summaryText != null &&
         this.summaryText !== '';
 
-      let body: BaseMessage[];
-      const dynamicTail: BaseMessage[] = [];
-      if (hasSummaryBody) {
-        const wrappedSummary =
-          '<summary>\n' +
-          (this.summaryText as string) +
-          '\n</summary>\n\n' +
-          'This is your own checkpoint: you wrote it to preserve context after compaction. Pick up where you left off based on the summary above. Do not repeat prior tasks, information or acknowledge this checkpoint message directly.';
-
-        const summaryMsg = promptCacheProvider === Providers.ANTHROPIC
-          ? new HumanMessage({
-            content: [
-              {
-                type: 'text',
-                text: wrappedSummary,
-                cache_control: { type: 'ephemeral' },
-              },
-            ],
-          })
-          : new HumanMessage(wrappedSummary);
-        if (promptCacheProvider === Providers.OPENROUTER) {
-          dynamicTail.push(summaryMsg);
-          body = messages;
-        } else {
-          body = [summaryMsg, ...messages];
-        }
-      } else {
-        body = messages;
-      }
-
-      const hasOpenRouterDynamicTail =
-        promptCacheProvider === Providers.OPENROUTER &&
-        (shouldMoveOpenRouterDynamicInstructions || hasSummaryBody);
-
-      if (
-        promptCacheProvider === Providers.OPENROUTER &&
-        shouldMoveOpenRouterDynamicInstructions
-      ) {
-        dynamicTail.unshift(new HumanMessage(dynamicInstructions));
-      }
-
-      if (
-        promptCacheProvider === Providers.OPENROUTER &&
-        dynamicTail.length > 0
-      ) {
-        body =
-          body.length > 0
-            ? [body[0], ...dynamicTail, ...body.slice(1)]
-            : dynamicTail;
-      }
+      const bodyWithSummary =
+        hasSummaryBody && promptCacheProvider !== Providers.OPENROUTER
+          ? [this.buildSummaryHumanMessage(promptCacheProvider), ...messages]
+          : messages;
+      const dynamicTail = this.buildOpenRouterDynamicTail({
+        dynamicInstructions,
+        hasSummaryBody,
+        promptCacheProvider,
+        shouldMoveOpenRouterDynamicInstructions,
+      });
+      let body = this.insertAfterFirstMessage(bodyWithSummary, dynamicTail);
 
       if (
         promptCacheProvider != null &&
-        !hasOpenRouterDynamicTail &&
+        dynamicTail.length === 0 &&
         body.length >= 2
       ) {
         body = addCacheControl(body);
       }
       return [...prefix, ...body];
     }).withConfig({ runName: 'prompt' });
+  }
+
+  private buildSummaryHumanMessage(
+    promptCacheProvider: PromptCacheProvider | undefined
+  ): HumanMessage {
+    const wrappedSummary =
+      '<summary>\n' +
+      (this.summaryText as string) +
+      '\n</summary>\n\n' +
+      'This is your own checkpoint: you wrote it to preserve context after compaction. Pick up where you left off based on the summary above. Do not repeat prior tasks, information or acknowledge this checkpoint message directly.';
+
+    if (promptCacheProvider !== Providers.ANTHROPIC) {
+      return new HumanMessage(wrappedSummary);
+    }
+
+    return new HumanMessage({
+      content: [
+        {
+          type: 'text',
+          text: wrappedSummary,
+          cache_control: { type: 'ephemeral' },
+        },
+      ],
+    });
+  }
+
+  private buildOpenRouterDynamicTail({
+    dynamicInstructions,
+    hasSummaryBody,
+    promptCacheProvider,
+    shouldMoveOpenRouterDynamicInstructions,
+  }: {
+    dynamicInstructions: string;
+    hasSummaryBody: boolean;
+    promptCacheProvider: PromptCacheProvider | undefined;
+    shouldMoveOpenRouterDynamicInstructions: boolean;
+  }): BaseMessage[] {
+    if (promptCacheProvider !== Providers.OPENROUTER) {
+      return [];
+    }
+
+    const dynamicTail = shouldMoveOpenRouterDynamicInstructions
+      ? [new HumanMessage(dynamicInstructions)]
+      : [];
+
+    if (!hasSummaryBody) {
+      return dynamicTail;
+    }
+
+    return [...dynamicTail, this.buildSummaryHumanMessage(promptCacheProvider)];
+  }
+
+  private insertAfterFirstMessage(
+    messages: BaseMessage[],
+    tail: BaseMessage[]
+  ): BaseMessage[] {
+    if (tail.length === 0) {
+      return messages;
+    }
+
+    if (messages.length === 0) {
+      return tail;
+    }
+
+    return [messages[0], ...tail, ...messages.slice(1)];
   }
 
   private getPromptCacheProvider(): PromptCacheProvider | undefined {
@@ -737,11 +763,14 @@ export class AgentContext {
       return new SystemMessage({ content } as BaseMessageFields);
     }
 
-    if (promptCacheProvider === Providers.OPENROUTER) {
-      if (!stableInstructions) {
-        return new SystemMessage(dynamicInstructions);
-      }
+    if (
+      promptCacheProvider === Providers.OPENROUTER &&
+      !stableInstructions
+    ) {
+      return new SystemMessage(dynamicInstructions);
+    }
 
+    if (promptCacheProvider === Providers.OPENROUTER) {
       return new SystemMessage({
         content: [
           {
