@@ -7,6 +7,7 @@ import type * as t from '@/types';
 import { Providers, GraphEvents, Constants } from '@/common';
 import { StandardGraph } from '@/graphs/Graph';
 import { ToolNode } from '@/tools/ToolNode';
+import * as events from '@/utils/events';
 import { Run } from '@/run';
 
 /**
@@ -1081,6 +1082,77 @@ describe('Agent Handoffs Tests', () => {
       expect(wrongNameMessage?.content).toContain(
         `Did you mean "${correctName}"`
       );
+    });
+
+    it('should keep event-driven unknown handoffs local without direct tool names', async () => {
+      const executedToolNames: string[] = [];
+      const correctName = `${Constants.LC_TRANSFER_TO_}data_analyst`;
+      const wrongName = `${correctName}_analyst`;
+      const lookupName = 'lookup_sessions';
+      const handoffTool = new DynamicStructuredTool({
+        name: correctName,
+        description: 'Transfer to data analyst',
+        schema: { type: 'object', properties: {}, required: [] },
+        func: async (): Promise<string> => 'transferred',
+      }) as t.GenericTool;
+      const lookupTool = new DynamicStructuredTool({
+        name: lookupName,
+        description: 'List upload sessions',
+        schema: { type: 'object', properties: {}, required: [] },
+        func: async (): Promise<string> => 'sessions',
+      }) as t.GenericTool;
+      const dispatchSpy = jest
+        .spyOn(events, 'safeDispatchCustomEvent')
+        .mockImplementation(async (event, data): Promise<void> => {
+          if (event !== GraphEvents.ON_TOOL_EXECUTE) {
+            return;
+          }
+          const batch = data as t.ToolExecuteBatchRequest;
+          executedToolNames.push(
+            ...batch.toolCalls.map((toolCall) => toolCall.name)
+          );
+          batch.resolve(
+            batch.toolCalls.map((toolCall) => ({
+              toolCallId: toolCall.id,
+              status: 'success' as const,
+              content: `host result for ${toolCall.name}`,
+            }))
+          );
+        });
+      const node = new ToolNode({
+        tools: [handoffTool, lookupTool],
+        eventDrivenMode: true,
+        toolCallStepIds: new Map([
+          ['lookup_call', 'step_lookup'],
+          ['wrong_handoff', 'step_wrong_handoff'],
+        ]),
+      });
+
+      try {
+        const result = (await node.invoke({
+          messages: [
+            new AIMessage({
+              content: '',
+              tool_calls: [
+                { id: 'lookup_call', name: lookupName, args: {} },
+                { id: 'wrong_handoff', name: wrongName, args: {} },
+              ],
+            }),
+          ],
+        })) as { messages: ToolMessage[] };
+        const wrongNameMessage = result.messages.find(
+          (msg) => msg.tool_call_id === 'wrong_handoff'
+        );
+
+        expect(executedToolNames).toEqual([lookupName]);
+        expect(wrongNameMessage).toBeDefined();
+        expect(wrongNameMessage?.status).toBe('error');
+        expect(wrongNameMessage?.content).toContain(
+          `Did you mean "${correctName}"`
+        );
+      } finally {
+        dispatchSpy.mockRestore();
+      }
     });
 
     it('should not dispatch mistyped graph handoffs to event-driven tool hosts', async () => {

@@ -630,12 +630,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     return suggestion;
   }
 
-  private shouldHandleUnknownHandoffLocally(callName: string): boolean {
-    return (
-      isHandoffToolName(callName) &&
-      !this.toolMap.has(callName) &&
-      this.hasRegisteredHandoffTool()
-    );
+  private shouldHandleUnknownHandoffLocally(
+    callName: string,
+    hasRegisteredHandoffTool?: boolean
+  ): boolean {
+    if (!isHandoffToolName(callName) || this.toolMap.has(callName)) {
+      return false;
+    }
+    return hasRegisteredHandoffTool ?? this.hasRegisteredHandoffTool();
   }
 
   private getUnknownToolErrorMessage(callName: string): string {
@@ -2918,16 +2920,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         }) ?? [];
 
       if (this.eventDrivenMode && filteredCalls.length > 0) {
-        const filteredIndices = filteredCalls.map((_, idx) => idx);
         const directToolNames = this.directToolNames;
-
-        if (directToolNames == null || directToolNames.size === 0) {
-          return this.executeViaEvent(filteredCalls, config, input, {
-            batchIndices: filteredIndices,
-            turn,
-            batchScopeId,
-          });
-        }
+        const hasRegisteredHandoffTool = this.hasRegisteredHandoffTool();
 
         const directEntries: Array<{ call: ToolCall; batchIndex: number }> = [];
         const eventEntries: Array<{ call: ToolCall; batchIndex: number }> = [];
@@ -2935,13 +2929,24 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           const call = filteredCalls[i];
           const entry = { call, batchIndex: i };
           if (
-            directToolNames.has(call.name) ||
-            this.shouldHandleUnknownHandoffLocally(call.name)
+            directToolNames?.has(call.name) === true ||
+            this.shouldHandleUnknownHandoffLocally(
+              call.name,
+              hasRegisteredHandoffTool
+            )
           ) {
             directEntries.push(entry);
           } else {
             eventEntries.push(entry);
           }
+        }
+
+        if (directEntries.length === 0) {
+          return this.executeViaEvent(filteredCalls, config, input, {
+            batchIndices: eventEntries.map((entry) => entry.batchIndex),
+            turn,
+            batchScopeId,
+          });
         }
 
         const directCalls = directEntries.map((e) => e.call);
