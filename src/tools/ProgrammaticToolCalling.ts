@@ -155,6 +155,18 @@ export type FetchSessionFilesScope =
   | { kind: 'skill'; id: string; version: number }
   | { kind: 'agent' | 'user'; id: string; version?: never };
 
+type CodeApiSessionFileWire = {
+  id?: unknown;
+  name?: unknown;
+  metadata?: unknown;
+  resource_id?: unknown;
+  storage_session_id?: unknown;
+};
+
+type CodeApiSessionFileMetadata = {
+  'original-filename'?: unknown;
+};
+
 function isFetchSessionFilesScope(
   value: unknown
 ): value is FetchSessionFilesScope {
@@ -173,6 +185,77 @@ function isFetchSessionFilesScope(
     typeof scope.id === 'string' &&
     typeof scope.version === 'number'
   );
+}
+
+function isCodeApiAuthHeaders(
+  value: string | t.CodeApiAuthHeaders | undefined
+): value is t.CodeApiAuthHeaders {
+  return value != null && typeof value !== 'string';
+}
+
+function isCodeApiSessionFileWire(
+  value: unknown
+): value is CodeApiSessionFileWire {
+  return value != null && typeof value === 'object';
+}
+
+function isCodeApiSessionFileMetadata(
+  value: unknown
+): value is CodeApiSessionFileMetadata {
+  return value != null && typeof value === 'object';
+}
+
+function normalizeSessionFile(
+  file: CodeApiSessionFileWire,
+  sessionId: string,
+  scope?: FetchSessionFilesScope
+): t.CodeEnvFile {
+  const metadata = isCodeApiSessionFileMetadata(file.metadata)
+    ? file.metadata
+    : undefined;
+  const rawName = typeof file.name === 'string' ? file.name : '';
+  const nameParts = rawName.split('/');
+  const fallbackId = nameParts.length > 1 ? nameParts[1].split('.')[0] : '';
+  const id =
+    typeof file.id === 'string' && file.id !== '' ? file.id : fallbackId;
+  const originalFilename = metadata?.['original-filename'];
+  const name =
+    typeof originalFilename === 'string' ? originalFilename : rawName;
+  const storage_session_id =
+    typeof file.storage_session_id === 'string'
+      ? file.storage_session_id
+      : sessionId;
+  const resource_id =
+    typeof file.resource_id === 'string' && file.resource_id !== ''
+      ? file.resource_id
+      : (scope?.id ?? id);
+
+  if (scope?.kind === 'skill') {
+    return {
+      storage_session_id,
+      kind: 'skill',
+      id,
+      resource_id,
+      name,
+      version: scope.version,
+    };
+  }
+  if (scope != null) {
+    return {
+      storage_session_id,
+      kind: scope.kind,
+      id,
+      resource_id,
+      name,
+    };
+  }
+  return {
+    storage_session_id,
+    kind: 'user',
+    id,
+    resource_id: id,
+    name,
+  };
 }
 
 /**
@@ -310,7 +393,9 @@ export async function fetchSessionFiles(
     let authHeaders: t.CodeApiAuthHeaders | undefined;
     if (scope == null) {
       proxy = typeof scopeOrProxy === 'string' ? scopeOrProxy : undefined;
-      authHeaders = proxyOrAuthHeaders as t.CodeApiAuthHeaders | undefined;
+      authHeaders = isCodeApiAuthHeaders(proxyOrAuthHeaders)
+        ? proxyOrAuthHeaders
+        : undefined;
     } else if (typeof proxyOrAuthHeaders === 'string') {
       proxy = proxyOrAuthHeaders;
       authHeaders = scopedAuthHeaders;
@@ -349,53 +434,9 @@ export async function fetchSessionFiles(
       return [];
     }
 
-    return files.map((file: Record<string, unknown>) => {
-      const metadata = (file.metadata ?? {}) as Record<string, unknown>;
-      const rawName = typeof file.name === 'string' ? file.name : '';
-      const nameParts = rawName.split('/');
-      const fallbackId = nameParts.length > 1 ? nameParts[1].split('.')[0] : '';
-      const id =
-        typeof file.id === 'string' && file.id !== '' ? file.id : fallbackId;
-      const name =
-        typeof metadata['original-filename'] === 'string'
-          ? metadata['original-filename']
-          : rawName;
-      const storage_session_id =
-        typeof file.storage_session_id === 'string'
-          ? file.storage_session_id
-          : sessionId;
-      const resource_id =
-        typeof file.resource_id === 'string' && file.resource_id !== ''
-          ? file.resource_id
-          : (scope?.id ?? id);
-
-      if (scope?.kind === 'skill') {
-        return {
-          storage_session_id,
-          kind: 'skill' as const,
-          id,
-          resource_id,
-          name,
-          version: scope.version,
-        };
-      }
-      if (scope != null) {
-        return {
-          storage_session_id,
-          kind: scope.kind,
-          id,
-          resource_id,
-          name,
-        };
-      }
-      return {
-        storage_session_id,
-        kind: 'user' as const,
-        id,
-        resource_id: id,
-        name,
-      };
-    });
+    return files
+      .filter(isCodeApiSessionFileWire)
+      .map((file) => normalizeSessionFile(file, sessionId, scope));
   } catch (error) {
     // eslint-disable-next-line no-console
     console.warn(
