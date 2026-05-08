@@ -246,6 +246,26 @@ describe('CodeAPI auth header injection', () => {
     );
   });
 
+  it('fetches scoped session files with auth headers and no proxy placeholder', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse([]));
+
+    await fetchSessionFiles(
+      'https://code.example.com',
+      'session_123',
+      { kind: 'skill', id: 'skill-1', version: 7 },
+      { Authorization: 'Bearer scoped-files-token' }
+    );
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://code.example.com/files/session_123?detail=full&kind=skill&id=skill-1&version=7',
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          Authorization: 'Bearer scoped-files-token',
+        }),
+      })
+    );
+  });
+
   it('preserves the legacy fetchSessionFiles proxy/auth argument order', async () => {
     fetchMock.mockResolvedValueOnce(
       jsonResponse([

@@ -292,7 +292,7 @@ export async function fetchSessionFiles(
   baseUrl: string,
   sessionId: string,
   scope: FetchSessionFilesScope,
-  proxy?: string,
+  proxyOrAuthHeaders?: string | t.CodeApiAuthHeaders,
   authHeaders?: t.CodeApiAuthHeaders
 ): Promise<t.CodeEnvFile[]>;
 export async function fetchSessionFiles(
@@ -306,18 +306,17 @@ export async function fetchSessionFiles(
     const scope = isFetchSessionFilesScope(scopeOrProxy)
       ? scopeOrProxy
       : undefined;
-    const proxy =
-      scope == null
-        ? typeof scopeOrProxy === 'string'
-          ? scopeOrProxy
-          : undefined
-        : typeof proxyOrAuthHeaders === 'string'
-          ? proxyOrAuthHeaders
-          : undefined;
-    const authHeaders =
-      scope == null
-        ? (proxyOrAuthHeaders as t.CodeApiAuthHeaders | undefined)
-        : scopedAuthHeaders;
+    let proxy: string | undefined;
+    let authHeaders: t.CodeApiAuthHeaders | undefined;
+    if (scope == null) {
+      proxy = typeof scopeOrProxy === 'string' ? scopeOrProxy : undefined;
+      authHeaders = proxyOrAuthHeaders as t.CodeApiAuthHeaders | undefined;
+    } else if (typeof proxyOrAuthHeaders === 'string') {
+      proxy = proxyOrAuthHeaders;
+      authHeaders = scopedAuthHeaders;
+    } else {
+      authHeaders = proxyOrAuthHeaders ?? scopedAuthHeaders;
+    }
     const query = new URLSearchParams({ detail: 'full' });
     if (scope != null) {
       query.set('kind', scope.kind);
