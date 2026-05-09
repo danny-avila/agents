@@ -1,7 +1,7 @@
 // src/agents/__tests__/AgentContext.test.ts
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import { AgentContext } from '../AgentContext';
-import { Providers } from '@/common';
+import { Constants, Providers } from '@/common';
 import { addBedrockCacheControl } from '@/messages/cache';
 import type * as t from '@/types';
 
@@ -606,7 +606,11 @@ describe('AgentContext', () => {
       ]);
 
       const ctx = createBasicContext({
-        agentConfig: { instructions: 'Base', toolRegistry },
+        agentConfig: {
+          instructions: 'Base',
+          toolDefinitions: [{ name: Constants.BASH_PROGRAMMATIC_TOOL_CALLING }],
+          toolRegistry,
+        },
       });
 
       const runnable = ctx.systemRunnable;
@@ -614,6 +618,32 @@ describe('AgentContext', () => {
       const result = await runnable!.invoke([]);
       expect(result[0].content).toContain('run_tools_with_bash');
       expect(result[0].content).not.toContain('run_tools_with_code');
+    });
+
+    it('uses Python PTC guidance when only run_tools_with_code is available', async () => {
+      const toolRegistry: t.LCToolRegistry = new Map([
+        [
+          'programmatic_tool',
+          {
+            name: 'programmatic_tool',
+            description: 'Only callable via code execution',
+            allowed_callers: ['code_execution'],
+          },
+        ],
+      ]);
+
+      const ctx = createBasicContext({
+        agentConfig: {
+          instructions: 'Base',
+          toolDefinitions: [{ name: Constants.PROGRAMMATIC_TOOL_CALLING }],
+          toolRegistry,
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([]);
+      expect(result[0].content).toContain('run_tools_with_code');
+      expect(result[0].content).toContain('Python code');
+      expect(result[0].content).not.toContain('run_tools_with_bash');
     });
 
     it('excludes direct-callable tools from programmatic section', () => {

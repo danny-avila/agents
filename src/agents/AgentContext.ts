@@ -13,6 +13,7 @@ import {
   ANTHROPIC_TOOL_TOKEN_MULTIPLIER,
   DEFAULT_TOOL_TOKEN_MULTIPLIER,
   ContentTypes,
+  Constants,
   Providers,
 } from '@/common';
 import { createSchemaOnlyTools } from '@/tools/schema';
@@ -389,7 +390,7 @@ export class AgentContext {
   /**
    * Builds instructions text for tools that are ONLY callable via programmatic code execution.
    * These tools cannot be called directly by the LLM but are available through the
-   * run_tools_with_bash tool.
+   * configured programmatic tool.
    *
    * Includes:
    * - Code_execution-only tools that are NOT deferred
@@ -416,6 +417,7 @@ export class AgentContext {
 
     if (programmaticOnlyTools.length === 0) return '';
 
+    const programmaticTool = this.getProgrammaticToolInstructionTarget();
     const toolDescriptions = programmaticOnlyTools
       .map((tool) => {
         let desc = `- **${tool.name}**`;
@@ -431,10 +433,37 @@ export class AgentContext {
 
     return (
       '\n\n## Programmatic-Only Tools\n\n' +
-      'The following tools are available exclusively through the `run_tools_with_bash` tool. ' +
-      'You cannot call these tools directly; instead, use `run_tools_with_bash` with bash code that invokes them.\n\n' +
+      `The following tools are available exclusively through the \`${programmaticTool.name}\` tool. ` +
+      `You cannot call these tools directly; instead, use \`${programmaticTool.name}\` with ${programmaticTool.language} code that invokes them.\n\n` +
       toolDescriptions
     );
+  }
+
+  private getProgrammaticToolInstructionTarget(): {
+    name: string;
+    language: 'bash' | 'Python';
+    } {
+    if (this.hasAvailableTool(Constants.BASH_PROGRAMMATIC_TOOL_CALLING)) {
+      return {
+        name: Constants.BASH_PROGRAMMATIC_TOOL_CALLING,
+        language: 'bash',
+      };
+    }
+
+    if (this.hasAvailableTool(Constants.PROGRAMMATIC_TOOL_CALLING)) {
+      return { name: Constants.PROGRAMMATIC_TOOL_CALLING, language: 'Python' };
+    }
+
+    return { name: Constants.BASH_PROGRAMMATIC_TOOL_CALLING, language: 'bash' };
+  }
+
+  private hasAvailableTool(name: string): boolean {
+    if (this.toolDefinitions?.some((tool) => tool.name === name)) return true;
+    if (this.tools?.some((tool) => 'name' in tool && tool.name === name)) {
+      return true;
+    }
+    if (this.toolMap?.has(name)) return true;
+    return this.toolRegistry?.has(name) === true;
   }
 
   /**
