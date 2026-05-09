@@ -41,6 +41,14 @@ function completedResponse(stdout = 'ok'): unknown {
   });
 }
 
+function errorResponse(status: number, body: string): unknown {
+  return {
+    ok: false,
+    status,
+    text: jest.fn(async () => body),
+  };
+}
+
 const toolDefs = [
   {
     name: 'lookup_user',
@@ -145,6 +153,15 @@ describe('CodeAPI auth header injection', () => {
     expect(
       JSON.parse((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string)
     ).not.toHaveProperty('authHeaders');
+  });
+
+  it('includes the CodeAPI endpoint and response body on direct execution failures', async () => {
+    fetchMock.mockResolvedValueOnce(errorResponse(404, 'Cannot POST /exec'));
+    const tool = createBashExecutionTool();
+
+    await expect(tool.invoke({ command: 'echo 1' })).rejects.toThrow(
+      /CodeAPI request failed: POST .*\/exec returned 404, body: Cannot POST \/exec/
+    );
   });
 
   it('forwards Authorization on programmatic initial and continuation requests', async () => {

@@ -5,6 +5,7 @@ import { tool, DynamicStructuredTool } from '@langchain/core/tools';
 import type * as t from '@/types';
 import {
   emptyOutputMessage,
+  buildCodeApiHttpErrorMessage,
   getCodeBaseURL,
   resolveCodeApiAuthHeaders,
 } from './CodeExecutor';
@@ -159,7 +160,9 @@ function createBashExecutionTool(
         }
         const response = await fetch(EXEC_ENDPOINT, fetchOptions);
         if (!response.ok) {
-          throw new Error(`HTTP error! status: ${response.status}`);
+          throw new Error(
+            await buildCodeApiHttpErrorMessage('POST', EXEC_ENDPOINT, response)
+          );
         }
 
         const result: t.ExecuteResult = await response.json();

@@ -6,6 +6,7 @@ import { tool, DynamicStructuredTool } from '@langchain/core/tools';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
 import {
+  buildCodeApiHttpErrorMessage,
   emptyOutputMessage,
   getCodeBaseURL,
   resolveCodeApiAuthHeaders,
@@ -426,7 +427,9 @@ export async function fetchSessionFiles(
 
     const response = await fetch(filesEndpoint, fetchOptions);
     if (!response.ok) {
-      throw new Error(`Failed to fetch files for session: ${response.status}`);
+      throw new Error(
+        await buildCodeApiHttpErrorMessage('GET', filesEndpoint, response)
+      );
     }
 
     const files = await response.json();
@@ -477,9 +480,8 @@ export async function makeRequest(
   const response = await fetch(endpoint, fetchOptions);
 
   if (!response.ok) {
-    const errorText = await response.text();
     throw new Error(
-      `HTTP error! status: ${response.status}, body: ${errorText}`
+      await buildCodeApiHttpErrorMessage('POST', endpoint, response)
     );
   }
 

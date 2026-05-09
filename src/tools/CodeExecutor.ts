@@ -82,6 +82,22 @@ export async function resolveCodeApiAuthHeaders(
   return authHeaders;
 }
 
+export async function buildCodeApiHttpErrorMessage(
+  method: string,
+  endpoint: string,
+  response: { status: number; text: () => Promise<string> }
+): Promise<string> {
+  let responseBody = '';
+  try {
+    responseBody = await response.text();
+  } catch {
+    responseBody = '';
+  }
+  const body = responseBody.trim();
+  const bodySuffix = body === '' ? '' : `, body: ${body.slice(0, 1000)}`;
+  return `CodeAPI request failed: ${method} ${endpoint} returned ${response.status}${bodySuffix}`;
+}
+
 export const CodeExecutionToolDescription = `
 Runs code and returns stdout/stderr output from a stateless execution environment, similar to running scripts in a command-line interface. Each execution is isolated and independent.
 
@@ -165,7 +181,9 @@ function createCodeExecutionTool(
         }
         const response = await fetch(EXEC_ENDPOINT, fetchOptions);
         if (!response.ok) {
-          throw new Error(`HTTP error! status: ${response.status}`);
+          throw new Error(
+            await buildCodeApiHttpErrorMessage('POST', EXEC_ENDPOINT, response)
+          );
         }
 
         const result: t.ExecuteResult = await response.json();
