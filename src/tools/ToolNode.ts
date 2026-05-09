@@ -844,10 +844,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           // Plumb the hook context into the programmatic-tool path so
           // inner tool calls made via the in-process bridge can run
           // through `PreToolUse` (deny / updatedInput) before reaching
-          // the underlying tool. Without this, `run_tools_with_code`
-          // bypassed every PreToolUse hook the host registered for
-          // the tools it dispatches — including HITL gates on
-          // `write_file` / `edit_file` (manual review finding A).
+          // the underlying tool. Without this, programmatic tool calls
+          // bypass every PreToolUse hook the host registered for the tools
+          // they dispatch — including HITL gates on `write_file` / `edit_file`.
           hookContext: {
             registry: this.hookRegistry,
             runId: (config.configurable?.run_id as string | undefined) ?? '',

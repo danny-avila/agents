@@ -593,7 +593,7 @@ describe('AgentContext', () => {
   });
 
   describe('buildProgrammaticOnlyToolsInstructions', () => {
-    it('includes code_execution-only tools in system message', () => {
+    it('includes code_execution-only tools in system message', async () => {
       const toolRegistry: t.LCToolRegistry = new Map([
         [
           'programmatic_tool',
@@ -611,6 +611,9 @@ describe('AgentContext', () => {
 
       const runnable = ctx.systemRunnable;
       expect(runnable).toBeDefined();
+      const result = await runnable!.invoke([]);
+      expect(result[0].content).toContain('run_tools_with_bash');
+      expect(result[0].content).not.toContain('run_tools_with_code');
     });
 
     it('excludes direct-callable tools from programmatic section', () => {

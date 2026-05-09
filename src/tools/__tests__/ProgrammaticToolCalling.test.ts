@@ -3,8 +3,9 @@
  * Unit tests for Programmatic Tool Calling.
  * Tests manual invocation with mock tools and Code API responses.
  */
-import { describe, it, expect, beforeEach } from '@jest/globals';
+import { describe, it, expect, jest, beforeEach } from '@jest/globals';
 import type * as t from '@/types';
+import { Constants } from '@/common';
 import {
   createProgrammaticToolCallingTool,
   formatCompletedResponse,
@@ -54,6 +55,35 @@ describe('ProgrammaticToolCalling', () => {
         temperature: 65,
         condition: 'Foggy',
       });
+    });
+
+    it('marks bash PTC inner tool invocations with bash metadata', async () => {
+      const invoke = jest.fn<
+        (_input: unknown, _config: unknown) => Promise<{ ok: boolean }>
+          >(async () => ({ ok: true }));
+      const customTool = {
+        name: 'custom_tool',
+        invoke,
+      } as unknown as t.GenericTool;
+      const customToolMap: t.ToolMap = new Map([['custom_tool', customTool]]);
+      const toolCalls: t.PTCToolCall[] = [
+        {
+          id: 'call_001',
+          name: 'custom_tool',
+          input: { value: 1 },
+        },
+      ];
+
+      await executeTools(
+        toolCalls,
+        customToolMap,
+        Constants.BASH_PROGRAMMATIC_TOOL_CALLING
+      );
+
+      expect(invoke).toHaveBeenCalledWith(
+        { value: 1 },
+        { metadata: { [Constants.BASH_PROGRAMMATIC_TOOL_CALLING]: true } }
+      );
     });
 
     it('executes multiple tools in parallel', async () => {

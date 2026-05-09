@@ -389,7 +389,7 @@ export class AgentContext {
   /**
    * Builds instructions text for tools that are ONLY callable via programmatic code execution.
    * These tools cannot be called directly by the LLM but are available through the
-   * run_tools_with_code tool.
+   * run_tools_with_bash tool.
    *
    * Includes:
    * - Code_execution-only tools that are NOT deferred
@@ -431,8 +431,8 @@ export class AgentContext {
 
     return (
       '\n\n## Programmatic-Only Tools\n\n' +
-      'The following tools are available exclusively through the `run_tools_with_code` tool. ' +
-      'You cannot call these tools directly; instead, use `run_tools_with_code` with Python code that invokes them.\n\n' +
+      'The following tools are available exclusively through the `run_tools_with_bash` tool. ' +
+      'You cannot call these tools directly; instead, use `run_tools_with_bash` with bash code that invokes them.\n\n' +
       toolDescriptions
     );
   }

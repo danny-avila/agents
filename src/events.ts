@@ -90,7 +90,10 @@ export class ToolEndHandler implements t.EventHandler {
         return;
       }
 
-      if (metadata[Constants.PROGRAMMATIC_TOOL_CALLING] === true) {
+      if (
+        metadata[Constants.PROGRAMMATIC_TOOL_CALLING] === true ||
+        metadata[Constants.BASH_PROGRAMMATIC_TOOL_CALLING] === true
+      ) {
         return;
       }
 

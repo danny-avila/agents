@@ -340,7 +340,8 @@ export function createBashProgrammaticToolCallingTool(
 
           const toolResults = await executeTools(
             response.tool_calls ?? [],
-            toolMap
+            toolMap,
+            Constants.BASH_PROGRAMMATIC_TOOL_CALLING
           );
 
           response = await makeRequest(

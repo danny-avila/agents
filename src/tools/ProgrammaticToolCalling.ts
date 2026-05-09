@@ -628,7 +628,8 @@ export function unwrapToolResponse(
  */
 export async function executeTools(
   toolCalls: t.PTCToolCall[],
-  toolMap: t.ToolMap
+  toolMap: t.ToolMap,
+  programmaticToolName = Constants.PROGRAMMATIC_TOOL_CALLING
 ): Promise<t.PTCToolResult[]> {
   const executions = toolCalls.map(async (call): Promise<t.PTCToolResult> => {
     const tool = toolMap.get(call.name);
@@ -644,7 +645,7 @@ export async function executeTools(
 
     try {
       const result = await tool.invoke(call.input, {
-        metadata: { [Constants.PROGRAMMATIC_TOOL_CALLING]: true },
+        metadata: { [programmaticToolName]: true },
       });
 
       const isMCPTool = tool.mcp === true;
