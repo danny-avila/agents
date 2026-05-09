@@ -240,6 +240,149 @@ function isCachePoint(block: MessageContentComplex): boolean {
   return 'cachePoint' in block && !('type' in block);
 }
 
+function getMessageRole(message: MessageWithContent): string | undefined {
+  if (message instanceof BaseMessage) {
+    return message.getType();
+  }
+  if ('role' in message && typeof message.role === 'string') {
+    return message.role;
+  }
+  return undefined;
+}
+
+function isCacheableConversationMessage(message: MessageWithContent): boolean {
+  const role = getMessageRole(message);
+  return (
+    role === 'human' || role === 'user' || role === 'ai' || role === 'assistant'
+  );
+}
+
+function isAssistantConversationMessage(message: MessageWithContent): boolean {
+  const role = getMessageRole(message);
+  return role === 'ai' || role === 'assistant';
+}
+
+function hasCacheMarker(message: MessageWithContent): boolean {
+  return (
+    Array.isArray(message.content) &&
+    message.content.some((block) => 'cache_control' in block)
+  );
+}
+
+function addCacheControlToRecentMessages<
+  T extends AnthropicMessage | BaseMessage,
+>(
+  messages: T[],
+  maxCachePoints: number,
+  canUseMessage: (message: MessageWithContent) => boolean
+): T[] {
+  if (
+    !Array.isArray(messages) ||
+    messages.length === 0 ||
+    maxCachePoints <= 0
+  ) {
+    return messages;
+  }
+
+  const updatedMessages: T[] = [...messages];
+  let cachePointsAdded = 0;
+
+  for (let i = updatedMessages.length - 1; i >= 0; i--) {
+    const originalMessage = updatedMessages[i];
+    const content = originalMessage.content;
+    const hasArrayContent = Array.isArray(content);
+    const canAddCache =
+      cachePointsAdded < maxCachePoints && canUseMessage(originalMessage);
+
+    if (!canAddCache && !hasArrayContent) {
+      continue;
+    }
+
+    let workingContent: MessageContentComplex[];
+    let modified = false;
+
+    if (hasArrayContent) {
+      const src = content as MessageContentComplex[];
+      workingContent = [];
+      let lastNonEmptyTextIndex = -1;
+
+      for (let j = 0; j < src.length; j++) {
+        const block = src[j];
+        if (isCachePoint(block)) {
+          modified = true;
+          continue;
+        }
+
+        const cloned = { ...block };
+        if ('cache_control' in cloned) {
+          delete (cloned as Record<string, unknown>).cache_control;
+          modified = true;
+        }
+
+        if ('type' in cloned && cloned.type === 'text') {
+          const text = (cloned as { text?: string }).text;
+          if (text != null && text.trim() !== '') {
+            lastNonEmptyTextIndex = workingContent.length;
+          }
+        }
+        workingContent.push(cloned as MessageContentComplex);
+      }
+
+      if (canAddCache && lastNonEmptyTextIndex >= 0) {
+        (
+          workingContent[lastNonEmptyTextIndex] as Anthropic.TextBlockParam
+        ).cache_control = {
+          type: 'ephemeral',
+        };
+        cachePointsAdded++;
+        modified = true;
+      }
+
+      if (!modified) {
+        continue;
+      }
+    } else if (
+      typeof content === 'string' &&
+      content.trim() !== '' &&
+      canAddCache
+    ) {
+      workingContent = [
+        { type: 'text', text: content, cache_control: { type: 'ephemeral' } },
+      ] as unknown as MessageContentComplex[];
+      cachePointsAdded++;
+    } else {
+      continue;
+    }
+
+    updatedMessages[i] = cloneMessage(
+      originalMessage as MessageWithContent,
+      workingContent
+    ) as T;
+  }
+
+  return updatedMessages;
+}
+
+export function addCacheControlToStablePrefixMessages<
+  T extends AnthropicMessage | BaseMessage,
+>(messages: T[], maxCachePoints: number): T[] {
+  const assistantMarked = addCacheControlToRecentMessages(
+    messages,
+    maxCachePoints,
+    isAssistantConversationMessage
+  );
+
+  if (assistantMarked.some(hasCacheMarker)) {
+    return assistantMarked;
+  }
+
+  return addCacheControlToRecentMessages(
+    messages,
+    maxCachePoints,
+    isCacheableConversationMessage
+  );
+}
+
 /**
  * Checks if a message's content has Anthropic cache_control fields.
  */

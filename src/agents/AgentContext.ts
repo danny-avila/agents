@@ -16,7 +16,10 @@ import {
   Providers,
 } from '@/common';
 import { createSchemaOnlyTools } from '@/tools/schema';
-import { addCacheControl } from '@/messages/cache';
+import {
+  addCacheControl,
+  addCacheControlToStablePrefixMessages,
+} from '@/messages/cache';
 import { DEFAULT_RESERVE_RATIO } from '@/messages';
 import { toJsonSchema } from '@/utils/schema';
 
@@ -584,24 +587,24 @@ export class AgentContext {
     }
 
     const promptCacheProvider = this.getPromptCacheProvider();
-    const shouldMoveOpenRouterDynamicInstructions =
-      promptCacheProvider === Providers.OPENROUTER &&
+    const shouldMoveDynamicInstructions =
+      promptCacheProvider != null &&
       stableInstructions !== '' &&
       dynamicInstructions !== '';
     const systemMessage = this.buildSystemMessage({
       stableInstructions,
       dynamicInstructions,
       promptCacheProvider,
+      shouldMoveDynamicInstructions,
     });
 
     if (this.tokenCounter) {
       this.systemMessageTokens = systemMessage
         ? this.tokenCounter(systemMessage)
         : 0;
-      this.dynamicInstructionTokens =
-        shouldMoveOpenRouterDynamicInstructions
-          ? this.tokenCounter(new HumanMessage(dynamicInstructions))
-          : 0;
+      this.dynamicInstructionTokens = shouldMoveDynamicInstructions
+        ? this.tokenCounter(new HumanMessage(dynamicInstructions))
+        : 0;
     }
 
     return RunnableLambda.from((messages: BaseMessage[]) => {
@@ -616,16 +619,20 @@ export class AgentContext {
         this.summaryText !== '';
 
       const bodyWithSummary =
-        hasSummaryBody && promptCacheProvider !== Providers.OPENROUTER
+        hasSummaryBody && promptCacheProvider == null
           ? [this.buildSummaryHumanMessage(promptCacheProvider), ...messages]
           : messages;
-      const dynamicTail = this.buildOpenRouterDynamicTail({
+      const dynamicTail = this.buildPromptCacheDynamicTail({
         dynamicInstructions,
         hasSummaryBody,
         promptCacheProvider,
-        shouldMoveOpenRouterDynamicInstructions,
+        shouldMoveDynamicInstructions,
       });
-      let body = this.insertAfterFirstMessage(bodyWithSummary, dynamicTail);
+      let body = this.buildBodyWithPromptCacheDynamicTail(
+        bodyWithSummary,
+        dynamicTail,
+        promptCacheProvider
+      );
 
       if (
         promptCacheProvider != null &&
@@ -662,22 +669,22 @@ export class AgentContext {
     });
   }
 
-  private buildOpenRouterDynamicTail({
+  private buildPromptCacheDynamicTail({
     dynamicInstructions,
     hasSummaryBody,
     promptCacheProvider,
-    shouldMoveOpenRouterDynamicInstructions,
+    shouldMoveDynamicInstructions,
   }: {
     dynamicInstructions: string;
     hasSummaryBody: boolean;
     promptCacheProvider: PromptCacheProvider | undefined;
-    shouldMoveOpenRouterDynamicInstructions: boolean;
+    shouldMoveDynamicInstructions: boolean;
   }): BaseMessage[] {
-    if (promptCacheProvider !== Providers.OPENROUTER) {
+    if (promptCacheProvider == null) {
       return [];
     }
 
-    const dynamicTail = shouldMoveOpenRouterDynamicInstructions
+    const dynamicTail = shouldMoveDynamicInstructions
       ? [new HumanMessage(dynamicInstructions)]
       : [];
 
@@ -685,22 +692,59 @@ export class AgentContext {
       return dynamicTail;
     }
 
-    return [...dynamicTail, this.buildSummaryHumanMessage(promptCacheProvider)];
+    return [...dynamicTail, this.buildSummaryHumanMessage(undefined)];
   }
 
-  private insertAfterFirstMessage(
+  private buildBodyWithPromptCacheDynamicTail(
     messages: BaseMessage[],
-    tail: BaseMessage[]
+    tail: BaseMessage[],
+    promptCacheProvider: PromptCacheProvider | undefined
   ): BaseMessage[] {
     if (tail.length === 0) {
       return messages;
     }
 
-    if (messages.length === 0) {
-      return tail;
+    const tailIndex = this.getPromptCacheDynamicTailIndex(
+      messages,
+      promptCacheProvider
+    );
+    const stablePrefix = messages.slice(0, tailIndex);
+    const trailingMessages = messages.slice(tailIndex);
+    const cacheablePrefix = this.addStablePromptCacheMarkers(stablePrefix);
+
+    return [...cacheablePrefix, ...tail, ...trailingMessages];
+  }
+
+  private getPromptCacheDynamicTailIndex(
+    messages: BaseMessage[],
+    promptCacheProvider: PromptCacheProvider | undefined
+  ): number {
+    const lastIndex = messages.length - 1;
+
+    if (lastIndex < 0) {
+      return 0;
     }
 
-    return [messages[0], ...tail, ...messages.slice(1)];
+    if (promptCacheProvider === Providers.OPENROUTER && messages.length === 1) {
+      return messages.length;
+    }
+
+    if (messages[lastIndex].getType() === 'human') {
+      return lastIndex;
+    }
+
+    return messages.length;
+  }
+
+  private addStablePromptCacheMarkers(messages: BaseMessage[]): BaseMessage[] {
+    if (messages.length <= 1) {
+      return messages;
+    }
+
+    return [
+      messages[0],
+      ...addCacheControlToStablePrefixMessages(messages.slice(1), 2),
+    ];
   }
 
   private getPromptCacheProvider(): PromptCacheProvider | undefined {
@@ -739,10 +783,12 @@ export class AgentContext {
     stableInstructions,
     dynamicInstructions,
     promptCacheProvider,
+    shouldMoveDynamicInstructions,
   }: {
     stableInstructions: string;
     dynamicInstructions: string;
     promptCacheProvider: PromptCacheProvider | undefined;
+    shouldMoveDynamicInstructions: boolean;
   }): SystemMessage | undefined {
     if (!stableInstructions && !dynamicInstructions) {
       return undefined;
@@ -757,16 +803,13 @@ export class AgentContext {
           cache_control: { type: 'ephemeral' },
         });
       }
-      if (dynamicInstructions) {
+      if (dynamicInstructions && !shouldMoveDynamicInstructions) {
         content.push({ type: 'text', text: dynamicInstructions });
       }
       return new SystemMessage({ content } as BaseMessageFields);
     }
 
-    if (
-      promptCacheProvider === Providers.OPENROUTER &&
-      !stableInstructions
-    ) {
+    if (promptCacheProvider === Providers.OPENROUTER && !stableInstructions) {
       return new SystemMessage(dynamicInstructions);
     }
 

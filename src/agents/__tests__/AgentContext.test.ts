@@ -1,5 +1,5 @@
 // src/agents/__tests__/AgentContext.test.ts
-import { HumanMessage } from '@langchain/core/messages';
+import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import { AgentContext } from '../AgentContext';
 import { Providers } from '@/common';
 import { addBedrockCacheControl } from '@/messages/cache';
@@ -79,7 +79,7 @@ describe('AgentContext', () => {
       );
     });
 
-    it('marks only stable system text for Anthropic prompt caching', async () => {
+    it('moves Anthropic dynamic instructions behind stable history', async () => {
       const ctx = createBasicContext({
         agentConfig: {
           provider: Providers.ANTHROPIC,
@@ -89,18 +89,39 @@ describe('AgentContext', () => {
         },
       });
 
-      const result = await ctx.systemRunnable!.invoke([]);
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('Hello'),
+        new HumanMessage('Second'),
+      ]);
       const content = result[0].content as TestSystemContentBlock[];
-      expect(content).toHaveLength(2);
-      expect(content[0]).toMatchObject({
-        type: 'text',
-        text: 'Stable instructions',
-        cache_control: { type: 'ephemeral' },
+      expect(content).toEqual([
+        {
+          type: 'text',
+          text: 'Stable instructions',
+          cache_control: { type: 'ephemeral' },
+        },
+      ]);
+      expect(result[1].content).toBe('Hello');
+      expect(result[2].content).toBe('Dynamic instructions');
+      expect(result[3].content).toBe('Second');
+    });
+
+    it('places Anthropic dynamic instructions before a single latest user prompt', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.ANTHROPIC,
+          clientOptions: { model: 'claude-3-5-sonnet', promptCache: true },
+          instructions: 'Stable instructions',
+          additional_instructions: 'Dynamic instructions',
+        },
       });
-      expect(content[1]).toEqual({
-        type: 'text',
-        text: 'Dynamic instructions',
-      });
+
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('Latest'),
+      ]);
+
+      expect(result[1].content).toBe('Dynamic instructions');
+      expect(result[2].content).toBe('Latest');
     });
 
     it('omits Anthropic cache control when only dynamic system text exists', async () => {
@@ -119,7 +140,7 @@ describe('AgentContext', () => {
       expect(content[0]).not.toHaveProperty('cache_control');
     });
 
-    it('keeps cross-run summaries in the dynamic Anthropic system tail', async () => {
+    it('keeps cross-run summaries in the dynamic Anthropic tail', async () => {
       const ctx = createBasicContext({
         agentConfig: {
           provider: Providers.ANTHROPIC,
@@ -131,12 +152,11 @@ describe('AgentContext', () => {
 
       const result = await ctx.systemRunnable!.invoke([]);
       const content = result[0].content as TestSystemContentBlock[];
-      expect(content).toHaveLength(2);
+      expect(content).toHaveLength(1);
       expect(content[0]).toHaveProperty('cache_control');
-      expect(content[1]).toEqual({
-        type: 'text',
-        text: '## Conversation Summary\n\nPrior summary',
-      });
+      expect(result[1].content).toBe(
+        '## Conversation Summary\n\nPrior summary'
+      );
     });
 
     it('places the Bedrock cache point before dynamic system text', async () => {
@@ -198,7 +218,7 @@ describe('AgentContext', () => {
       );
     });
 
-    it('marks stable OpenRouter system text and keeps first user message stable', async () => {
+    it('moves OpenRouter dynamic instructions behind stable history', async () => {
       const ctx = createBasicContext({
         agentConfig: {
           provider: Providers.OPENROUTER,
@@ -223,7 +243,6 @@ describe('AgentContext', () => {
           cache_control: { type: 'ephemeral' },
         },
       ]);
-      expect(result[1]).toBeInstanceOf(HumanMessage);
       expect(result[1].content).toBe('Hello');
       expect(result[2].content).toBe('Dynamic instructions');
       expect(result[3].content).toBe('Second');
@@ -298,12 +317,132 @@ describe('AgentContext', () => {
       expect(result[3].content).toBe('Second');
     });
 
-    it('adds OpenRouter body cache points when there is no dynamic tail', async () => {
+    it('keeps the first OpenRouter user message before single-turn dynamic instructions', async () => {
       const ctx = createBasicContext({
         agentConfig: {
           provider: Providers.OPENROUTER,
           clientOptions: {
             model: 'anthropic/claude-haiku-4.5',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+          additional_instructions: 'Dynamic instructions',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('Latest'),
+      ]);
+
+      expect(result[1].content).toBe('Latest');
+      expect(result[2].content).toBe('Dynamic instructions');
+    });
+
+    it('caches stable Anthropic history before dynamic instructions', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.ANTHROPIC,
+          clientOptions: {
+            model: 'claude-3-5-sonnet',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+          additional_instructions: 'Dynamic instructions',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('First'),
+        new AIMessage('Stable assistant history'),
+        new HumanMessage('Latest'),
+      ]);
+      const stableHistory = result[2].content as TestSystemContentBlock[];
+
+      expect(result[1].content).toBe('First');
+      expect(stableHistory[0]).toMatchObject({
+        type: 'text',
+        text: 'Stable assistant history',
+        cache_control: { type: 'ephemeral' },
+      });
+      expect(result[3].content).toBe('Dynamic instructions');
+      expect(result[4].content).toBe('Latest');
+    });
+
+    it('does not place Anthropic dynamic instructions between tool calls and results', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.ANTHROPIC,
+          clientOptions: {
+            model: 'claude-3-5-sonnet',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+          additional_instructions: 'Dynamic instructions',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('Use the tool'),
+        new AIMessage({
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_1',
+              name: 'calculator',
+              args: { expression: '2+2' },
+              type: 'tool_call',
+            },
+          ],
+        }),
+        new ToolMessage({
+          content: '4',
+          name: 'calculator',
+          tool_call_id: 'call_1',
+        }),
+      ]);
+
+      expect(result[1].content).toBe('Use the tool');
+      expect((result[2] as AIMessage).tool_calls?.[0]?.id).toBe('call_1');
+      expect(result[3].getType()).toBe('tool');
+      expect(result[4].content).toBe('Dynamic instructions');
+    });
+
+    it('caches stable OpenRouter history before dynamic instructions', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.OPENROUTER,
+          clientOptions: {
+            model: 'anthropic/claude-haiku-4.5',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+          additional_instructions: 'Dynamic instructions',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('First'),
+        new AIMessage('Stable assistant history'),
+        new HumanMessage('Latest'),
+      ]);
+      const stableHistory = result[2].content as TestSystemContentBlock[];
+
+      expect(result[1].content).toBe('First');
+      expect(stableHistory[0]).toMatchObject({
+        type: 'text',
+        text: 'Stable assistant history',
+        cache_control: { type: 'ephemeral' },
+      });
+      expect(result[3].content).toBe('Dynamic instructions');
+      expect(result[4].content).toBe('Latest');
+    });
+
+    it('adds OpenRouter body cache points when there is no dynamic tail', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.OPENROUTER,
+          clientOptions: {
+            model: 'google/gemini-3.1-pro-preview',
             promptCache: true,
           },
           instructions: 'Stable instructions',
@@ -325,7 +464,7 @@ describe('AgentContext', () => {
         agentConfig: {
           provider: Providers.OPENROUTER,
           clientOptions: {
-            model: 'anthropic/claude-haiku-4.5',
+            model: 'google/gemini-3.1-pro-preview',
             promptCache: true,
           },
           instructions: 'Stable instructions',
@@ -707,7 +846,7 @@ describe('AgentContext', () => {
         agentConfig: {
           provider: Providers.OPENROUTER,
           clientOptions: {
-            model: 'anthropic/claude-haiku-4.5',
+            model: 'google/gemini-3.1-pro-preview',
             promptCache: true,
           },
           instructions: 'Stable',
@@ -733,7 +872,7 @@ describe('AgentContext', () => {
         agentConfig: {
           provider: Providers.OPENROUTER,
           clientOptions: {
-            model: 'anthropic/claude-haiku-4.5',
+            model: 'google/gemini-3.1-pro-preview',
             promptCache: true,
           },
           instructions: 'Stable instructions',

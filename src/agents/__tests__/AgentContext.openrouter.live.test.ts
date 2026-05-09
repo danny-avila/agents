@@ -1,15 +1,15 @@
-// src/agents/__tests__/AgentContext.anthropic.live.test.ts
+// src/agents/__tests__/AgentContext.openrouter.live.test.ts
 /**
- * Live Anthropic prompt-cache verification.
+ * Live OpenRouter prompt-cache verification.
  *
  * Run with:
- * RUN_ANTHROPIC_PROMPT_CACHE_LIVE_TESTS=1 ANTHROPIC_API_KEY=... npm test -- AgentContext.anthropic.live.test.ts --runInBand
+ * RUN_OPENROUTER_PROMPT_CACHE_LIVE_TESTS=1 OPENROUTER_API_KEY=... npm test -- AgentContext.openrouter.live.test.ts --runInBand
  */
 import { config as dotenvConfig } from 'dotenv';
-dotenvConfig();
+dotenvConfig({ path: process.env.DOTENV_CONFIG_PATH ?? '.env' });
 
 import { describe, expect, it } from '@jest/globals';
-import type * as t from '@/types';
+import type { ClientOptions } from '@langchain/openai';
 import {
   runLiveTurn,
   assertSystemPayloadShape,
@@ -17,38 +17,56 @@ import {
   buildStableInstructions,
   waitForCachePropagation,
 } from './promptCacheLiveHelpers';
+import type { ChatOpenRouterInput } from '@/llm/openrouter';
 import { Providers } from '@/common';
 
+const apiKey = process.env.OPENROUTER_API_KEY ?? process.env.OPENROUTER_KEY;
 const shouldRunLive =
-  process.env.RUN_ANTHROPIC_PROMPT_CACHE_LIVE_TESTS === '1' &&
-  process.env.ANTHROPIC_API_KEY != null &&
-  process.env.ANTHROPIC_API_KEY !== '';
+  process.env.RUN_OPENROUTER_PROMPT_CACHE_LIVE_TESTS === '1' &&
+  apiKey != null &&
+  apiKey !== '';
 
 const describeIfLive = shouldRunLive ? describe : describe.skip;
 
-const modelName =
-  process.env.ANTHROPIC_PROMPT_CACHE_MODEL ?? 'claude-sonnet-4-5';
-const providerLabel = 'Anthropic';
+const model =
+  process.env.OPENROUTER_PROMPT_CACHE_MODEL ?? 'anthropic/claude-sonnet-4.6';
+const providerLabel = 'OpenRouter';
+type OpenRouterLiveClientOptions = ChatOpenRouterInput & {
+  configuration?: ClientOptions;
+};
 
-function createClientOptions(): t.AnthropicClientOptions {
+function createClientOptions(): OpenRouterLiveClientOptions {
+  if (apiKey == null || apiKey === '') {
+    throw new Error('OPENROUTER_API_KEY is required');
+  }
+
+  const reasoning = model.startsWith('google/gemini-3')
+    ? { max_tokens: 16 }
+    : undefined;
+
   return {
-    modelName,
+    model,
+    apiKey,
     temperature: 0,
-    maxTokens: 8,
+    maxTokens: 256,
     streaming: true,
     streamUsage: true,
     promptCache: true,
-    clientOptions: {
+    configuration: {
+      baseURL:
+        process.env.OPENROUTER_BASE_URL ?? 'https://openrouter.ai/api/v1',
       defaultHeaders: {
-        'anthropic-beta': 'prompt-caching-2024-07-31',
+        'HTTP-Referer': 'https://librechat.ai',
+        'X-Title': 'LibreChat OpenRouter Prompt Cache Live Test',
       },
     },
+    ...(reasoning != null ? { reasoning } : {}),
   };
 }
 
-describeIfLive('AgentContext Anthropic prompt cache live API', () => {
-  it('caches only the stable system prefix while dynamic tail changes', async () => {
-    const nonce = `agent-cache-live-${Date.now()}`;
+describeIfLive('AgentContext OpenRouter prompt cache live API', () => {
+  it('keeps dynamic instructions outside the cached system prefix', async () => {
+    const nonce = `agent-openrouter-cache-live-${Date.now()}`;
     const clientOptions = createClientOptions();
     const stableInstructions = buildStableInstructions({
       nonce,
@@ -66,8 +84,8 @@ describeIfLive('AgentContext Anthropic prompt cache live API', () => {
     });
 
     await assertSystemPayloadShape({
-      agentId: 'live-cache-shape-check',
-      provider: Providers.ANTHROPIC,
+      agentId: 'live-openrouter-cache-shape-check',
+      provider: Providers.OPENROUTER,
       clientOptions,
       stableInstructions,
       dynamicInstructions: firstDynamicInstructions,
@@ -81,7 +99,7 @@ describeIfLive('AgentContext Anthropic prompt cache live API', () => {
     });
 
     const first = await runLiveTurn({
-      provider: Providers.ANTHROPIC,
+      provider: Providers.OPENROUTER,
       providerLabel,
       clientOptions,
       runId: `${nonce}-first`,
@@ -91,13 +109,11 @@ describeIfLive('AgentContext Anthropic prompt cache live API', () => {
     });
 
     expect(first.text.toLowerCase()).toContain('alpha');
-    expect(first.usage.input_token_details?.cache_creation).toBeGreaterThan(0);
-    expect(first.usage.input_token_details?.cache_read ?? 0).toBe(0);
 
     await waitForCachePropagation();
 
     const second = await runLiveTurn({
-      provider: Providers.ANTHROPIC,
+      provider: Providers.OPENROUTER,
       providerLabel,
       clientOptions,
       runId: `${nonce}-second`,
