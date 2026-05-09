@@ -16,6 +16,8 @@ export type OpenRouterReasoningEffort =
   | 'minimal'
   | 'none';
 
+export type OpenRouterVerbosity = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+
 export interface OpenRouterReasoning {
   effort?: OpenRouterReasoningEffort;
   max_tokens?: number;
@@ -24,28 +26,49 @@ export interface OpenRouterReasoning {
 }
 
 export interface ChatOpenRouterCallOptions
-  extends Omit<ChatOpenAICallOptions, 'reasoning'> {
+  extends Omit<ChatOpenAICallOptions, 'reasoning' | 'verbosity'> {
   /** @deprecated Use `reasoning` object instead */
   include_reasoning?: boolean;
   reasoning?: OpenRouterReasoning;
+  verbosity?: OpenRouterVerbosity | null;
+  useResponsesApi?: boolean;
   modelKwargs?: OpenAIChatInput['modelKwargs'];
   promptCache?: boolean;
 }
 
 export type ChatOpenRouterInput = Partial<
-  ChatOpenRouterCallOptions & OpenAIChatInput
+  ChatOpenRouterCallOptions & Omit<OpenAIChatInput, 'verbosity'>
 >;
 
 /** invocationParams return type extended with OpenRouter reasoning */
 export type OpenRouterInvocationParams = Omit<
   OpenAIClient.Chat.ChatCompletionCreateParams,
-  'messages'
+  'messages' | 'verbosity'
 > & {
   reasoning?: OpenRouterReasoning;
+  text?: OpenRouterResponsesTextConfig;
+  verbosity?: OpenRouterVerbosity | null;
 };
 
 type InvocationParamsExtra = {
   streaming?: boolean;
+};
+
+type OpenRouterResponsesTextConfig = Omit<
+  NonNullable<OpenAIClient.Responses.ResponseCreateParams['text']>,
+  'verbosity'
+> & {
+  verbosity?: OpenRouterVerbosity | null;
+};
+
+type MutableParams = Omit<
+  OpenAIClient.Chat.ChatCompletionCreateParams,
+  'messages' | 'verbosity'
+> & {
+  reasoning_effort?: string;
+  reasoning?: OpenRouterReasoning;
+  verbosity?: OpenRouterVerbosity | null;
+  text?: OpenRouterResponsesTextConfig;
 };
 
 interface OpenRouterReasoningTextDetail {
@@ -99,8 +122,19 @@ function getReasoningDetails(value: unknown): OpenRouterReasoningDetail[] {
   );
 }
 
+function isOpenRouterVerbosity(value: unknown): value is OpenRouterVerbosity {
+  return (
+    value === 'low' ||
+    value === 'medium' ||
+    value === 'high' ||
+    value === 'xhigh' ||
+    value === 'max'
+  );
+}
+
 export class ChatOpenRouter extends ChatOpenAI {
   private openRouterReasoning?: OpenRouterReasoning;
+  private openRouterVerbosity?: OpenRouterVerbosity | null;
   /** @deprecated Use `reasoning` object instead */
   private includeReasoning?: boolean;
 
@@ -111,6 +145,7 @@ export class ChatOpenRouter extends ChatOpenAI {
     const {
       include_reasoning,
       reasoning: openRouterReasoning,
+      verbosity: openRouterVerbosity,
       modelKwargs = {},
       ...fields
     } = fieldsWithoutPromptCache;
@@ -145,6 +180,12 @@ export class ChatOpenRouter extends ChatOpenAI {
     if (mergedReasoning != null) {
       this.openRouterReasoning = mergedReasoning;
     }
+    if (
+      openRouterVerbosity === null ||
+      isOpenRouterVerbosity(openRouterVerbosity)
+    ) {
+      this.openRouterVerbosity = openRouterVerbosity;
+    }
 
     this.includeReasoning = include_reasoning;
   }
@@ -156,17 +197,14 @@ export class ChatOpenRouter extends ChatOpenAI {
   // effort levels ('xhigh' | 'none' | 'minimal') not in ReasoningEffort.
   // The parent's generic conditional return type cannot be widened in an override.
   override invocationParams(
-    options?: this['ParsedCallOptions'],
+    options?: this['ParsedCallOptions'] | ChatOpenRouterCallOptions,
     extra?: InvocationParamsExtra
   ): OpenRouterInvocationParams {
-    type MutableParams = Omit<
-      OpenAIClient.Chat.ChatCompletionCreateParams,
-      'messages'
-    > & { reasoning_effort?: string; reasoning?: OpenRouterReasoning };
-
-    const optionsWithDefaults = this._combineCallOptions(options);
+    const parsedOptions = options as this['ParsedCallOptions'] | undefined;
+    const optionsWithDefaults = this._combineCallOptions(parsedOptions);
+    const useResponsesApi = this._useResponsesApi(parsedOptions);
     const params = (
-      this._useResponsesApi(options)
+      useResponsesApi
         ? this.responses.invocationParams(optionsWithDefaults)
         : this.completions.invocationParams(optionsWithDefaults, extra)
     ) as MutableParams;
@@ -183,7 +221,44 @@ export class ChatOpenRouter extends ChatOpenAI {
       delete params.reasoning;
     }
 
+    this.applyOpenRouterVerbosity(params, optionsWithDefaults, useResponsesApi);
+
     return params;
+  }
+
+  private applyOpenRouterVerbosity(
+    params: MutableParams,
+    options: this['ParsedCallOptions'] | undefined,
+    useResponsesApi: boolean
+  ): void {
+    const verbosity = this.getOpenRouterVerbosity(options);
+    if (verbosity == null) {
+      return;
+    }
+    if (!useResponsesApi) {
+      params.verbosity = verbosity;
+      return;
+    }
+    params.text = {
+      ...params.text,
+      verbosity,
+    };
+  }
+
+  private getOpenRouterVerbosity(
+    options?: this['ParsedCallOptions']
+  ): OpenRouterVerbosity | undefined {
+    const callOptions = options as ChatOpenRouterCallOptions | undefined;
+    if (isOpenRouterVerbosity(callOptions?.verbosity)) {
+      return callOptions.verbosity;
+    }
+    if (isOpenRouterVerbosity(this.openRouterVerbosity)) {
+      return this.openRouterVerbosity;
+    }
+    if (isOpenRouterVerbosity(this.verbosity)) {
+      return this.verbosity;
+    }
+    return undefined;
   }
 
   private buildOpenRouterReasoning(

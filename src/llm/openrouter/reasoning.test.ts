@@ -1,5 +1,9 @@
 import { ChatOpenRouter } from './index';
-import type { OpenRouterReasoning, ChatOpenRouterCallOptions } from './index';
+import type {
+  ChatOpenRouterCallOptions,
+  OpenRouterInvocationParams,
+  OpenRouterReasoning,
+} from './index';
 import type { OpenAIChatInput } from '@langchain/openai';
 
 type CreateRouterOptions = Partial<
@@ -10,6 +14,7 @@ type CreateRouterOptions = Partial<
 type RuntimeInvocationParams = {
   reasoning?: OpenRouterReasoning;
   reasoning_effort?: string;
+  text?: OpenRouterInvocationParams['text'];
 };
 
 class RuntimeInspectableChatOpenRouter extends ChatOpenRouter {
@@ -135,6 +140,51 @@ describe('ChatOpenRouter reasoning handling', () => {
       const router = createRouter({ streamUsage: true });
       const params = router.invocationParams(undefined, { streaming: true });
       expect(params.stream_options).toEqual({ include_usage: true });
+    });
+
+    it('passes OpenRouter verbosity through Responses text config', () => {
+      const router = createRouter({
+        useResponsesApi: true,
+        verbosity: 'xhigh',
+      });
+      const params = router.invocationParams();
+      expect(params.text).toEqual(
+        expect.objectContaining({
+          verbosity: 'xhigh',
+        })
+      );
+    });
+
+    it('merges OpenRouter verbosity with existing Responses text config', () => {
+      const router = createRouter({
+        useResponsesApi: true,
+        verbosity: 'high',
+        modelKwargs: {
+          text: {
+            format: { type: 'text' },
+          },
+        },
+      });
+      const params = router.invocationParams();
+      expect(params.text).toEqual({
+        format: { type: 'text' },
+        verbosity: 'high',
+      });
+    });
+
+    it('lets call-level verbosity override constructor verbosity for Responses', () => {
+      const router = createRouter({
+        useResponsesApi: true,
+        verbosity: 'xhigh',
+      });
+      const params = router.invocationParams({
+        verbosity: 'low',
+      });
+      expect(params.text).toEqual(
+        expect.objectContaining({
+          verbosity: 'low',
+        })
+      );
     });
   });
 
