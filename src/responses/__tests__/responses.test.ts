@@ -53,6 +53,41 @@ describe('Responses-compatible adapters', () => {
     });
   });
 
+  it('streams reasoning text with official Responses event names', async () => {
+    const writes: string[] = [];
+    const tracker = createResponseTracker();
+    const handlers = createResponsesEventHandlers({
+      writer: { write: (data) => void writes.push(data) },
+      context: { responseId: 'resp_reasoning', model: 'agent', createdAt: 1 },
+      tracker,
+    });
+
+    await handlers[GraphEvents.ON_REASONING_DELTA].handle(
+      GraphEvents.ON_REASONING_DELTA,
+      {
+        id: 'reasoning',
+        delta: { content: [{ type: 'text', text: 'thinking' }] },
+      } as t.ReasoningDeltaEvent
+    );
+
+    const events = writes
+      .filter((data) => data.startsWith('data: '))
+      .map(
+        (data) =>
+          JSON.parse(data.slice(6)) as {
+            type: string;
+            delta?: string;
+          }
+      );
+    expect(events.map((event) => event.type)).toEqual([
+      'response.output_item.added',
+      'response.reasoning_text.delta',
+    ]);
+    expect(events[1]).toMatchObject({
+      delta: 'thinking',
+    });
+  });
+
   it('tracks partial usage metadata without NaN totals', async () => {
     const tracker = createResponseTracker();
     const handlers = createResponsesEventHandlers({
@@ -134,7 +169,7 @@ describe('Responses-compatible adapters', () => {
       {
         result: {
           id: 'step_1',
-          index: 0,
+          index: 7,
           type: 'tool_call',
           tool_call: {
             id: 'call_1',
@@ -183,7 +218,7 @@ describe('Responses-compatible adapters', () => {
     });
   });
 
-  it('keeps tool-call items stable when ids arrive after argument deltas', async () => {
+  it('keeps tool-call items stable when ids arrive and indexes differ', async () => {
     const writes: string[] = [];
     const tracker = createResponseTracker();
     const handlers = createResponsesEventHandlers({

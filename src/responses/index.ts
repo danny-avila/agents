@@ -145,7 +145,7 @@ function getToolCallIndex(
   return typeof toolCall.index === 'number' ? toolCall.index : fallbackIndex;
 }
 
-function getToolCallKey(
+function getToolCallPositionKey(
   stepId: string,
   toolCall: ResponseToolCallFragment,
   fallbackIndex: number
@@ -154,9 +154,36 @@ function getToolCallKey(
   if (stepId !== '') {
     return `${stepId}:${index}`;
   }
-  return toolCall.id != null && toolCall.id !== ''
-    ? toolCall.id
-    : `tool:${index}`;
+  return `tool:${index}`;
+}
+
+function getToolCallIdKey(
+  toolCall: ResponseToolCallFragment
+): string | undefined {
+  return toolCall.id != null && toolCall.id !== '' ? toolCall.id : undefined;
+}
+
+function getExistingFunctionCall(
+  config: ResponsesHandlerConfig,
+  idKey: string | undefined,
+  positionKey: string
+): ResponseFunctionCallItem | undefined {
+  return idKey == null
+    ? config.tracker.functionCalls.get(positionKey)
+    : (config.tracker.functionCalls.get(idKey) ??
+        config.tracker.functionCalls.get(positionKey));
+}
+
+function trackFunctionCallKeys(
+  config: ResponsesHandlerConfig,
+  item: ResponseFunctionCallItem,
+  idKey: string | undefined,
+  positionKey: string
+): void {
+  config.tracker.functionCalls.set(positionKey, item);
+  if (idKey != null) {
+    config.tracker.functionCalls.set(idKey, item);
+  }
 }
 
 function getToolCallName(toolCall: ResponseToolCallFragment): string {
@@ -180,12 +207,14 @@ async function ensureFunctionCall(
   toolCall: ResponseToolCallFragment,
   fallbackIndex: number
 ): Promise<ResponseFunctionCallItem> {
-  const key = getToolCallKey(stepId, toolCall, fallbackIndex);
-  const existing = config.tracker.functionCalls.get(key);
+  const positionKey = getToolCallPositionKey(stepId, toolCall, fallbackIndex);
+  const idKey = getToolCallIdKey(toolCall);
+  const existing = getExistingFunctionCall(config, idKey, positionKey);
   const name = getToolCallName(toolCall);
   if (existing) {
-    if (toolCall.id != null && toolCall.id !== '') {
-      existing.call_id = toolCall.id;
+    trackFunctionCallKeys(config, existing, idKey, positionKey);
+    if (idKey != null) {
+      existing.call_id = idKey;
     }
     if (name !== '') {
       existing.name = name;
@@ -195,12 +224,12 @@ async function ensureFunctionCall(
   const item: ResponseFunctionCallItem = {
     type: 'function_call',
     id: createItemId('fc'),
-    call_id: toolCall.id ?? key,
+    call_id: idKey ?? positionKey,
     name,
     arguments: '',
     status: 'in_progress',
   };
-  config.tracker.functionCalls.set(key, item);
+  trackFunctionCallKeys(config, item, idKey, positionKey);
   config.tracker.items.push(item);
   await writeResponseEvent(config.writer, {
     type: 'response.output_item.added',
@@ -405,7 +434,7 @@ export function createResponsesEventHandlers(
           }
           item.content[0].text += text;
           await writeResponseEvent(config.writer, {
-            type: 'response.reasoning.delta',
+            type: 'response.reasoning_text.delta',
             sequence_number: config.tracker.nextSequence(),
             item_id: item.id,
             output_index: config.tracker.items.indexOf(item),
@@ -494,7 +523,7 @@ export async function emitResponseCompleted(
   if (config.tracker.reasoning) {
     config.tracker.reasoning.status = 'completed';
   }
-  for (const item of config.tracker.functionCalls.values()) {
+  for (const item of new Set(config.tracker.functionCalls.values())) {
     item.status = 'completed';
   }
   await writeResponseEvent(config.writer, {
