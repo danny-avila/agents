@@ -434,15 +434,25 @@ function getSessionBranchTarget(
   return entry.parentId == null ? undefined : store.getEntry(entry.parentId);
 }
 
-function getPathAfterEntry(
-  path: SessionEntry[],
-  entryId: string | null
+function getAbandonedPathForBranch(
+  store: JsonlSessionStore,
+  previousLeafId: string | null,
+  targetLeafId: string | null
 ): SessionEntry[] {
-  if (entryId == null) {
-    return path;
+  const previousPath = store.getPath(previousLeafId ?? undefined);
+  if (previousPath.length === 0) {
+    return [];
   }
-  const index = path.findIndex((entry) => entry.id === entryId);
-  return index === -1 ? [] : path.slice(index + 1);
+  const targetPath = targetLeafId == null ? [] : store.getPath(targetLeafId);
+  const maxSharedLength = Math.min(previousPath.length, targetPath.length);
+  let sharedLength = 0;
+  while (
+    sharedLength < maxSharedLength &&
+    previousPath[sharedLength].id === targetPath[sharedLength].id
+  ) {
+    sharedLength++;
+  }
+  return previousPath.slice(sharedLength);
 }
 
 function createAgentInputFromGraphConfig(
@@ -870,7 +880,10 @@ export class AgentSession {
         ),
         returnContent: true,
         calibrationRatio: this.calibrationRatio,
-        customHandlers: handlerResult.handlers,
+        customHandlers: {
+          ...(this.runConfig.customHandlers ?? {}),
+          ...handlerResult.handlers,
+        },
       };
       const run = await Run.create<t.IState>(runConfig);
       let messages = inputMessages;
@@ -1044,8 +1057,9 @@ export class AgentSession {
         typeof summarizeAbandoned === 'object'
           ? summarizeAbandoned.instructions
           : undefined;
-      const abandonedPath = getPathAfterEntry(
-        store.getPath(previousLeafId ?? undefined),
+      const abandonedPath = getAbandonedPathForBranch(
+        store,
+        previousLeafId,
         leafId
       );
       const summary = await this.compactActivePath(
@@ -1194,7 +1208,10 @@ export class AgentSession {
         ),
         returnContent: true,
         calibrationRatio: this.calibrationRatio,
-        customHandlers: handlerResult.handlers,
+        customHandlers: {
+          ...(this.runConfig.customHandlers ?? {}),
+          ...handlerResult.handlers,
+        },
       });
       const content = await run.resume(resumeValue, callerConfig);
       const runMessages = run.getRunMessages() ?? [];

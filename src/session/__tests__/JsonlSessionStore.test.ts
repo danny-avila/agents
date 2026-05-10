@@ -12,6 +12,7 @@ import type { Checkpoint, CheckpointMetadata } from '@langchain/langgraph';
 import { JsonlSessionStore, createAgentSession } from '@/session';
 import { toJsonValue } from '@/session/messageSerialization';
 import * as providers from '@/llm/providers';
+import { GraphEvents } from '@/common';
 import type * as t from '@/types';
 import { Run } from '@/run';
 
@@ -455,6 +456,38 @@ describe('JsonlSessionStore', () => {
       'history',
       'fresh',
     ]);
+  });
+
+  it('preserves custom handlers outside the session event adapter set', async () => {
+    const mockRun = createMockRun('handled');
+    const capturedConfigs = mockRunCreate(mockRun);
+    const agentLogHandler: t.EventHandler = { handle: jest.fn() };
+    const messageDeltaHandler: t.EventHandler = { handle: jest.fn() };
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+      customHandlers: {
+        [GraphEvents.ON_AGENT_LOG]: agentLogHandler,
+        [GraphEvents.ON_MESSAGE_DELTA]: messageDeltaHandler,
+      },
+    });
+
+    await session.run('start');
+
+    expect(capturedConfigs[0].customHandlers?.[GraphEvents.ON_AGENT_LOG]).toBe(
+      agentLogHandler
+    );
+    expect(
+      capturedConfigs[0].customHandlers?.[GraphEvents.ON_MESSAGE_DELTA]
+    ).not.toBe(messageDeltaHandler);
   });
 
   it('shares a session-level LangGraph checkpointer for HITL resume', async () => {
@@ -952,5 +985,47 @@ describe('JsonlSessionStore', () => {
     expect(
       store?.getEntries().some((entry) => entry.type === 'compaction')
     ).toBe(true);
+  });
+
+  it('summarizes a sibling branch before switching branches', async () => {
+    mockSummarizer('summary of sibling branch');
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    const store = session.getSessionStore();
+    const first = await store?.appendMessage(new HumanMessage('first'));
+    const inactive = await store?.appendMessage(new AIMessage('inactive'));
+    await store?.branch(first?.id ?? '');
+    const activeSibling = await store?.appendMessage(new AIMessage('active'));
+
+    await session.branch(inactive?.id ?? '', {
+      position: 'at',
+      summarizeAbandoned: true,
+    });
+
+    const activePath = store?.getPath();
+    const summary = activePath?.at(-1);
+    expect(activePath?.map((entry) => entry.id)).toEqual([
+      first?.id,
+      inactive?.id,
+      summary?.id,
+    ]);
+    expect(summary).toMatchObject({
+      type: 'summary',
+      parentId: inactive?.id,
+      data: {
+        text: 'summary of sibling branch',
+        summarizedEntryIds: [activeSibling?.id],
+      },
+    });
   });
 });
