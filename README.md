@@ -46,6 +46,66 @@ const content = await run.processStream(
 );
 ```
 
+## Programmatic Sessions
+
+For scripts, CI, and programmatic integrations, use the session facade. It
+keeps a JSONL session tree by default, so runs can be resumed, cloned, forked,
+branched in place, compacted, and inspected later.
+
+```typescript
+import { Providers, createAgentSession } from '@librechat/agents';
+
+const session = await createAgentSession({
+  graphConfig: {
+    type: 'standard',
+    instructions: 'You are a concise coding assistant.',
+    llmConfig: {
+      provider: Providers.OPENAI,
+      model: 'gpt-4o-mini',
+      apiKey: process.env.OPENAI_API_KEY,
+    },
+  },
+});
+
+const result = await session.run('Summarize this repository.');
+console.log(result.text);
+console.log(session.sessionPath); // durable .jsonl session file
+```
+
+Sessions expose tree operations inspired by Pi-style workflows:
+
+```typescript
+const store = session.getSessionStore();
+const forkPoint = store?.getForkPoints()[0];
+
+if (forkPoint) {
+  const forked = await session.fork(forkPoint.id, { position: 'before' });
+  await forked.run('Try a different approach from here.');
+}
+
+const cloned = await session.clone();
+await cloned.compact({ instructions: 'Keep only implementation decisions.' });
+```
+
+`session.stream()` projects the SDK's existing graph events, and
+`session.compact()` uses the same summarization node, hooks, and provider
+logic as normal runs. JSONL is the durable journal; the graph remains the
+execution engine.
+
+OpenAI-compatible streaming helpers are available as experimental subpaths:
+
+```typescript
+import { composeEventHandlers } from '@librechat/agents';
+import { createOpenAIHandlers } from '@librechat/agents/openai';
+import { createResponsesEventHandlers } from '@librechat/agents/responses';
+
+const customHandlers = composeEventHandlers(
+  createOpenAIHandlers(openAIConfig),
+  createResponsesEventHandlers(responsesConfig),
+  hostHandlers
+);
+```
+
 ## Development
 
 ```bash

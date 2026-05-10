@@ -36,6 +36,9 @@ export * from './utils';
 /* Hooks */
 export * from './hooks';
 
+/* Programmatic sessions */
+export * from './session';
+
 /* HITL helpers */
 export * from './hitl';
 

@@ -1,0 +1,289 @@
+import { GraphEvents } from '@/common';
+import type * as t from '@/types';
+
+export interface ResponsesCompatibleWriter {
+  write(data: string): void | Promise<void>;
+}
+
+export type ResponseStatus =
+  | 'in_progress'
+  | 'completed'
+  | 'failed'
+  | 'incomplete';
+export type ItemStatus = 'in_progress' | 'incomplete' | 'completed';
+
+export interface ResponseContext {
+  responseId: string;
+  model: string;
+  createdAt: number;
+  previousResponseId?: string;
+  instructions?: string;
+}
+
+export interface ResponseOutputTextContent {
+  type: 'output_text';
+  text: string;
+  annotations: [];
+  logprobs: [];
+}
+
+export interface ResponseMessageItem {
+  type: 'message';
+  id: string;
+  role: 'assistant';
+  status: ItemStatus;
+  content: ResponseOutputTextContent[];
+}
+
+export interface ResponseFunctionCallItem {
+  type: 'function_call';
+  id: string;
+  call_id: string;
+  name: string;
+  arguments: string;
+  status: ItemStatus;
+}
+
+export interface ResponseReasoningItem {
+  type: 'reasoning';
+  id: string;
+  status: ItemStatus;
+  content: Array<{ type: 'reasoning_text'; text: string }>;
+  summary: [];
+}
+
+export type ResponseOutputItem =
+  | ResponseMessageItem
+  | ResponseFunctionCallItem
+  | ResponseReasoningItem;
+
+export interface ResponseObject {
+  id: string;
+  object: 'response';
+  created_at: number;
+  completed_at: number | null;
+  status: ResponseStatus;
+  model: string;
+  previous_response_id: string | null;
+  instructions: string | null;
+  output: ResponseOutputItem[];
+  error: { type: string; message: string; code?: string } | null;
+  usage: {
+    input_tokens: number;
+    output_tokens: number;
+    total_tokens: number;
+  } | null;
+}
+
+export interface ResponseEvent {
+  type: string;
+  sequence_number: number;
+  [key: string]: unknown;
+}
+
+export interface ResponseTracker {
+  sequenceNumber: number;
+  items: ResponseOutputItem[];
+  message: ResponseMessageItem | undefined;
+  reasoning: ResponseReasoningItem | undefined;
+  usage: {
+    inputTokens: number;
+    outputTokens: number;
+  };
+  nextSequence(): number;
+}
+
+export interface ResponsesHandlerConfig {
+  writer: ResponsesCompatibleWriter;
+  context: ResponseContext;
+  tracker: ResponseTracker;
+}
+
+let responseItemId = 0;
+
+function createItemId(prefix: string): string {
+  return `${prefix}_${Date.now().toString(36)}${(responseItemId++).toString(36)}`;
+}
+
+export function createResponseTracker(): ResponseTracker {
+  const tracker: ResponseTracker = {
+    sequenceNumber: 0,
+    items: [],
+    message: undefined,
+    reasoning: undefined,
+    usage: {
+      inputTokens: 0,
+      outputTokens: 0,
+    },
+    nextSequence: () => tracker.sequenceNumber++,
+  };
+  return tracker;
+}
+
+export function buildResponse(
+  context: ResponseContext,
+  tracker: ResponseTracker,
+  status: ResponseStatus = 'in_progress'
+): ResponseObject {
+  const completed = status === 'completed';
+  return {
+    id: context.responseId,
+    object: 'response',
+    created_at: context.createdAt,
+    completed_at: completed ? Math.floor(Date.now() / 1000) : null,
+    status,
+    model: context.model,
+    previous_response_id: context.previousResponseId ?? null,
+    instructions: context.instructions ?? null,
+    output: tracker.items,
+    error: null,
+    usage: completed
+      ? {
+        input_tokens: tracker.usage.inputTokens,
+        output_tokens: tracker.usage.outputTokens,
+        total_tokens: tracker.usage.inputTokens + tracker.usage.outputTokens,
+      }
+      : null,
+  };
+}
+
+export async function writeResponseEvent(
+  writer: ResponsesCompatibleWriter,
+  event: ResponseEvent
+): Promise<void> {
+  await writer.write(`event: ${event.type}\n`);
+  await writer.write(`data: ${JSON.stringify(event)}\n\n`);
+}
+
+export async function writeResponsesDone(
+  writer: ResponsesCompatibleWriter
+): Promise<void> {
+  await writer.write('data: [DONE]\n\n');
+}
+
+async function ensureMessage(
+  config: ResponsesHandlerConfig
+): Promise<ResponseMessageItem> {
+  if (config.tracker.message) {
+    return config.tracker.message;
+  }
+  const item: ResponseMessageItem = {
+    type: 'message',
+    id: createItemId('msg'),
+    role: 'assistant',
+    status: 'in_progress',
+    content: [{ type: 'output_text', text: '', annotations: [], logprobs: [] }],
+  };
+  config.tracker.message = item;
+  config.tracker.items.push(item);
+  await writeResponseEvent(config.writer, {
+    type: 'response.output_item.added',
+    sequence_number: config.tracker.nextSequence(),
+    output_index: config.tracker.items.length - 1,
+    item,
+  });
+  return item;
+}
+
+async function ensureReasoning(
+  config: ResponsesHandlerConfig
+): Promise<ResponseReasoningItem> {
+  if (config.tracker.reasoning) {
+    return config.tracker.reasoning;
+  }
+  const item: ResponseReasoningItem = {
+    type: 'reasoning',
+    id: createItemId('reason'),
+    status: 'in_progress',
+    content: [{ type: 'reasoning_text', text: '' }],
+    summary: [],
+  };
+  config.tracker.reasoning = item;
+  config.tracker.items.push(item);
+  await writeResponseEvent(config.writer, {
+    type: 'response.output_item.added',
+    sequence_number: config.tracker.nextSequence(),
+    output_index: config.tracker.items.length - 1,
+    item,
+  });
+  return item;
+}
+
+export function createResponsesEventHandlers(
+  config: ResponsesHandlerConfig
+): Record<string, t.EventHandler> {
+  return {
+    [GraphEvents.ON_MESSAGE_DELTA]: {
+      handle: async (_event, data): Promise<void> => {
+        const item = await ensureMessage(config);
+        for (const part of (data as t.MessageDeltaEvent).delta.content ?? []) {
+          if (!('text' in part) || typeof part.text !== 'string') {
+            continue;
+          }
+          item.content[0].text += part.text;
+          await writeResponseEvent(config.writer, {
+            type: 'response.output_text.delta',
+            sequence_number: config.tracker.nextSequence(),
+            item_id: item.id,
+            output_index: config.tracker.items.indexOf(item),
+            content_index: 0,
+            delta: part.text,
+          });
+        }
+      },
+    },
+    [GraphEvents.ON_REASONING_DELTA]: {
+      handle: async (_event, data): Promise<void> => {
+        const item = await ensureReasoning(config);
+        for (const part of (data as t.ReasoningDeltaEvent).delta.content ??
+          []) {
+          let text: string | undefined;
+          if ('think' in part && typeof part.think === 'string') {
+            text = part.think;
+          } else if ('text' in part && typeof part.text === 'string') {
+            text = part.text;
+          }
+          if (typeof text !== 'string') {
+            continue;
+          }
+          item.content[0].text += text;
+          await writeResponseEvent(config.writer, {
+            type: 'response.reasoning.delta',
+            sequence_number: config.tracker.nextSequence(),
+            item_id: item.id,
+            output_index: config.tracker.items.indexOf(item),
+            content_index: 0,
+            delta: text,
+          });
+        }
+      },
+    },
+    [GraphEvents.CHAT_MODEL_END]: {
+      handle: (_event, data): void => {
+        const usage = (data as t.ModelEndData)?.output?.usage_metadata;
+        if (!usage) {
+          return;
+        }
+        config.tracker.usage.inputTokens += usage.input_tokens;
+        config.tracker.usage.outputTokens += usage.output_tokens;
+      },
+    },
+  };
+}
+
+export async function emitResponseCompleted(
+  config: ResponsesHandlerConfig
+): Promise<void> {
+  if (config.tracker.message) {
+    config.tracker.message.status = 'completed';
+  }
+  if (config.tracker.reasoning) {
+    config.tracker.reasoning.status = 'completed';
+  }
+  await writeResponseEvent(config.writer, {
+    type: 'response.completed',
+    sequence_number: config.tracker.nextSequence(),
+    response: buildResponse(config.context, config.tracker, 'completed'),
+  });
+  await writeResponsesDone(config.writer);
+}

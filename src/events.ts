@@ -21,6 +21,35 @@ export class HandlerRegistry {
   }
 }
 
+export function composeEventHandlers(
+  ...handlerSets: Array<Record<string, t.EventHandler> | undefined>
+): Record<string, t.EventHandler> {
+  const composed: Partial<Record<string, t.EventHandler>> = {};
+
+  for (const handlerSet of handlerSets) {
+    if (!handlerSet) {
+      continue;
+    }
+    for (const [eventType, handler] of Object.entries(handlerSet)) {
+      const previous = composed[eventType];
+      if (previous === undefined) {
+        composed[eventType] = handler;
+        continue;
+      }
+      composed[eventType] = {
+        handle: async (
+          ...args: Parameters<t.EventHandler['handle']>
+        ): Promise<void> => {
+          await previous.handle(...args);
+          await handler.handle(...args);
+        },
+      };
+    }
+  }
+
+  return composed as Record<string, t.EventHandler>;
+}
+
 export class ModelEndHandler implements t.EventHandler {
   collectedUsage?: UsageMetadata[];
   constructor(collectedUsage?: UsageMetadata[]) {

@@ -1,0 +1,831 @@
+import { HumanMessage, BaseMessage } from '@langchain/core/messages';
+import type { RunnableConfig } from '@langchain/core/runnables';
+import type { HookRegistry } from '@/hooks';
+import type {
+  AgentSessionConfig,
+  AgentSessionInput,
+  AgentSessionRunOptions,
+  AgentSessionRunResult,
+  AgentSessionStream,
+  AgentSessionStreamEvent,
+  SessionBranchOptions,
+  SessionCompactOptions,
+  SessionEntry,
+  SessionForkOptions,
+} from './types';
+import type * as t from '@/types';
+import { AgentContext } from '@/agents/AgentContext';
+import { ContentTypes, GraphEvents } from '@/common';
+import { Run } from '@/run';
+import { createRunId, createSessionId } from './ids';
+import { deserializeMessage } from './messageSerialization';
+import { JsonlSessionStore } from './JsonlSessionStore';
+import { createRunHandlers } from './handlers';
+import { createSummarizeNode } from '@/summarization/node';
+
+function isBaseMessage(value: unknown): value is BaseMessage {
+  return (
+    value instanceof BaseMessage ||
+    (value != null &&
+      typeof value === 'object' &&
+      '_getType' in value &&
+      typeof (value as { _getType?: unknown })._getType === 'function')
+  );
+}
+
+function normalizeInput(input: AgentSessionInput): BaseMessage[] {
+  if (typeof input === 'string') {
+    return [new HumanMessage(input)];
+  }
+  if (Array.isArray(input)) {
+    return input;
+  }
+  if (isBaseMessage(input)) {
+    return [input];
+  }
+  return input.messages;
+}
+
+function contentToText(
+  content: Array<t.MessageContentComplex | undefined>
+): string {
+  const chunks: string[] = [];
+  for (const part of content) {
+    if (!part) {
+      continue;
+    }
+    if (part.type === ContentTypes.TEXT && typeof part.text === 'string') {
+      chunks.push(part.text);
+    }
+  }
+  return chunks.join('');
+}
+
+function normalizeConfig(config: AgentSessionConfig): {
+  runConfig: t.RunConfig;
+  cwd: string;
+  sessionPath?: string;
+  name?: string;
+  ephemeral?: boolean;
+} {
+  if ('runConfig' in config) {
+    return {
+      runConfig: config.runConfig,
+      cwd: config.cwd ?? process.cwd(),
+      sessionPath: config.sessionPath,
+      name: config.name,
+      ephemeral: config.ephemeral,
+    };
+  }
+  const {
+    cwd,
+    sessionPath,
+    name,
+    ephemeral,
+    sessionId: _sessionId,
+    ...runConfig
+  } = config;
+  return {
+    runConfig: {
+      ...runConfig,
+      runId: config.runId ?? createRunId(),
+    },
+    cwd: cwd ?? process.cwd(),
+    sessionPath,
+    name,
+    ephemeral,
+  };
+}
+
+async function createStore(params: {
+  cwd: string;
+  sessionPath?: string;
+  name?: string;
+  sessionId?: string;
+  ephemeral?: boolean;
+}): Promise<JsonlSessionStore | undefined> {
+  if (params.ephemeral === true) {
+    return undefined;
+  }
+  if (params.sessionPath != null && params.sessionPath !== '') {
+    return JsonlSessionStore.open(params.sessionPath).catch(() =>
+      JsonlSessionStore.create({
+        path: params.sessionPath,
+        cwd: params.cwd,
+        name: params.name,
+        sessionId: params.sessionId,
+      })
+    );
+  }
+  return JsonlSessionStore.create({
+    cwd: params.cwd,
+    name: params.name,
+    sessionId: params.sessionId,
+  });
+}
+
+type InitialSummary = NonNullable<t.AgentInputs['initialSummary']>;
+
+function mergeInitialSummary(
+  existing: InitialSummary | undefined,
+  sessionSummary: InitialSummary | undefined
+): InitialSummary | undefined {
+  if (!existing) {
+    return sessionSummary;
+  }
+  if (!sessionSummary) {
+    return existing;
+  }
+  if (existing.text === sessionSummary.text) {
+    return existing;
+  }
+  return {
+    text: `${existing.text}\n\n${sessionSummary.text}`,
+    tokenCount: existing.tokenCount + sessionSummary.tokenCount,
+  };
+}
+
+function applyInitialSummaryToAgent(
+  agent: t.AgentInputs,
+  initialSummary: InitialSummary | undefined
+): t.AgentInputs {
+  const merged = mergeInitialSummary(agent.initialSummary, initialSummary);
+  return merged ? { ...agent, initialSummary: merged } : agent;
+}
+
+function applyInitialSummaryToGraphConfig(
+  graphConfig: t.RunConfig['graphConfig'],
+  initialSummary: InitialSummary | undefined
+): t.RunConfig['graphConfig'] {
+  if (!initialSummary) {
+    return graphConfig;
+  }
+  if ('agents' in graphConfig) {
+    return {
+      ...graphConfig,
+      agents: graphConfig.agents.map((agent) =>
+        applyInitialSummaryToAgent(agent, initialSummary)
+      ),
+    };
+  }
+  return {
+    ...graphConfig,
+    initialSummary: mergeInitialSummary(
+      graphConfig.initialSummary,
+      initialSummary
+    ),
+  };
+}
+
+function createSessionRunState(entries: SessionEntry[]): {
+  messages: BaseMessage[];
+  initialSummary?: InitialSummary;
+} {
+  const messages: BaseMessage[] = [];
+  let initialSummary: InitialSummary | undefined;
+  for (const entry of entries) {
+    if (entry.type === 'summary') {
+      initialSummary = {
+        text: entry.data.text,
+        tokenCount: 0,
+      };
+      messages.length = 0;
+      continue;
+    }
+    if (entry.type === 'message') {
+      messages.push(deserializeMessage(entry.data.message));
+    }
+  }
+  return { messages, initialSummary };
+}
+
+function isMessageEntry(
+  entry: SessionEntry
+): entry is Extract<SessionEntry, { type: 'message' }> {
+  return entry.type === 'message';
+}
+
+function createAgentInputFromGraphConfig(
+  graphConfig: t.RunConfig['graphConfig'],
+  initialSummary: InitialSummary | undefined,
+  retainRecentTurns: number | undefined,
+  instructions: string | undefined
+): t.AgentInputs {
+  let agent: t.AgentInputs;
+  if ('agents' in graphConfig) {
+    if (graphConfig.agents.length === 0) {
+      throw new Error('Cannot compact a session with no agents');
+    }
+    agent = graphConfig.agents[0];
+  } else {
+    const {
+      type: _type,
+      llmConfig,
+      signal: _signal,
+      tools = [],
+      ...agentInputs
+    } = graphConfig;
+    const { provider, ...clientOptions } = llmConfig;
+    agent = {
+      ...agentInputs,
+      tools,
+      provider,
+      clientOptions,
+      agentId: 'default',
+    };
+  }
+  const summarizationConfig: t.SummarizationConfig = {
+    ...(agent.summarizationConfig ?? {}),
+    ...(instructions != null && instructions !== ''
+      ? { prompt: instructions }
+      : {}),
+    retainRecent: {
+      ...(agent.summarizationConfig?.retainRecent ?? {}),
+      ...(retainRecentTurns != null ? { turns: retainRecentTurns } : {}),
+    },
+  };
+  return {
+    ...applyInitialSummaryToAgent(agent, initialSummary),
+    summarizationEnabled: true,
+    summarizationConfig,
+  };
+}
+
+function createManualCompactGraph(params: {
+  runId: string;
+  customHandlers?: Record<string, t.EventHandler>;
+  hooks?: HookRegistry;
+}): {
+  graph: Parameters<typeof createSummarizeNode>[0]['graph'];
+  completedSummary?: t.SummaryContentBlock;
+} {
+  const contentData: t.RunStep[] = [];
+  const contentIndexMap = new Map<string, number>();
+  const result: {
+    graph: Parameters<typeof createSummarizeNode>[0]['graph'];
+    completedSummary?: t.SummaryContentBlock;
+  } = {
+    graph: {
+      contentData,
+      contentIndexMap,
+      runId: params.runId,
+      isMultiAgent: false,
+      hookRegistry: params.hooks,
+      dispatchRunStep: async (runStep): Promise<void> => {
+        contentData.push(runStep);
+        contentIndexMap.set(runStep.id, runStep.index);
+        await params.customHandlers?.[GraphEvents.ON_RUN_STEP]?.handle(
+          GraphEvents.ON_RUN_STEP,
+          runStep
+        );
+      },
+      dispatchRunStepCompleted: async (stepId, completed): Promise<void> => {
+        const runStep = contentData.find((step) => step.id === stepId);
+        const resultWithStep = {
+          ...completed,
+          id: stepId,
+          index: runStep?.index ?? 0,
+        };
+        if (completed.type === 'summary') {
+          result.completedSummary = completed.summary;
+        }
+        await params.customHandlers?.[
+          GraphEvents.ON_RUN_STEP_COMPLETED
+        ]?.handle(GraphEvents.ON_RUN_STEP_COMPLETED, {
+          result: resultWithStep,
+        } as unknown as Parameters<t.EventHandler['handle']>[1]);
+      },
+    },
+  };
+  return result;
+}
+
+function getSummaryText(summary: t.SummaryContentBlock | undefined): string {
+  const firstBlock = summary?.content?.[0];
+  return firstBlock != null &&
+    typeof firstBlock === 'object' &&
+    'text' in firstBlock &&
+    typeof firstBlock.text === 'string'
+    ? firstBlock.text
+    : '';
+}
+
+function filterRemoveMessages(messages: BaseMessage[]): BaseMessage[] {
+  return messages.filter((message) => message._getType() !== 'remove');
+}
+
+class LiveAgentSessionStream implements AgentSessionStream {
+  private resultPromise: Promise<AgentSessionRunResult> | undefined;
+  private readonly events: AgentSessionStreamEvent[] = [];
+  private readonly waiters: Array<{
+    resolve: (result: IteratorResult<AgentSessionStreamEvent>) => void;
+    reject: (error: unknown) => void;
+  }> = [];
+  private closed = false;
+  private failed = false;
+  private error: unknown;
+
+  setResultPromise(resultPromise: Promise<AgentSessionRunResult>): void {
+    this.resultPromise = resultPromise;
+  }
+
+  push(event: AgentSessionStreamEvent): void {
+    if (this.closed) {
+      return;
+    }
+    const waiter = this.waiters.shift();
+    if (waiter) {
+      waiter.resolve({ value: event, done: false });
+      return;
+    }
+    this.events.push(event);
+  }
+
+  complete(): void {
+    this.closed = true;
+    for (const waiter of this.waiters.splice(0)) {
+      waiter.resolve({
+        value: undefined as unknown as AgentSessionStreamEvent,
+        done: true,
+      });
+    }
+  }
+
+  fail(error: unknown): void {
+    this.error = error;
+    this.failed = true;
+    this.closed = true;
+    for (const waiter of this.waiters.splice(0)) {
+      waiter.reject(error);
+    }
+  }
+
+  private nextEvent(): Promise<IteratorResult<AgentSessionStreamEvent>> {
+    const event = this.events.shift();
+    if (event !== undefined) {
+      return Promise.resolve({ value: event, done: false });
+    }
+    if (this.failed) {
+      return Promise.reject(this.error);
+    }
+    if (this.closed) {
+      return Promise.resolve({
+        value: undefined as unknown as AgentSessionStreamEvent,
+        done: true,
+      });
+    }
+    return new Promise((resolve, reject) => {
+      this.waiters.push({ resolve, reject });
+    });
+  }
+
+  async *[Symbol.asyncIterator](): AsyncIterator<AgentSessionStreamEvent> {
+    for (;;) {
+      const next = await this.nextEvent();
+      if (next.done === true) {
+        return;
+      }
+      yield next.value;
+    }
+  }
+
+  async *toTextStream(): AsyncIterable<string> {
+    for await (const event of this) {
+      if (event.type !== 'message.delta' || event.data == null) {
+        continue;
+      }
+      const data = event.data;
+      if (typeof data === 'object' && !Array.isArray(data)) {
+        const delta = data.delta;
+        if (
+          delta != null &&
+          typeof delta === 'object' &&
+          !Array.isArray(delta)
+        ) {
+          const content = delta.content;
+          if (Array.isArray(content)) {
+            for (const part of content) {
+              if (
+                part != null &&
+                typeof part === 'object' &&
+                !Array.isArray(part) &&
+                typeof part.text === 'string'
+              ) {
+                yield part.text;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  finalResult(): Promise<AgentSessionRunResult> {
+    if (!this.resultPromise) {
+      return Promise.reject(new Error('Session stream has not started'));
+    }
+    return this.resultPromise;
+  }
+}
+
+export class AgentSession {
+  private runConfig: t.RunConfig;
+  private store: JsonlSessionStore | undefined;
+  private calibrationRatio: number | undefined;
+  cwd: string;
+  threadId: string;
+
+  private constructor(params: {
+    runConfig: t.RunConfig;
+    cwd: string;
+    threadId: string;
+    store?: JsonlSessionStore;
+  }) {
+    this.runConfig = params.runConfig;
+    this.cwd = params.cwd;
+    this.threadId = params.threadId;
+    this.store = params.store;
+  }
+
+  static async create(config: AgentSessionConfig): Promise<AgentSession> {
+    const normalized = normalizeConfig(config);
+    const explicitSessionId =
+      'sessionId' in config && typeof config.sessionId === 'string'
+        ? config.sessionId
+        : undefined;
+    const store = await createStore({
+      cwd: normalized.cwd,
+      sessionPath: normalized.sessionPath,
+      name: normalized.name,
+      sessionId: explicitSessionId,
+      ephemeral: normalized.ephemeral,
+    });
+    return new AgentSession({
+      runConfig: normalized.runConfig,
+      cwd: normalized.cwd,
+      threadId: store?.header.id ?? explicitSessionId ?? createSessionId(),
+      store,
+    });
+  }
+
+  get sessionPath(): string | undefined {
+    return this.store?.path;
+  }
+
+  getSessionStore(): JsonlSessionStore | undefined {
+    return this.store;
+  }
+
+  private async runInternal(
+    input: AgentSessionInput,
+    options: AgentSessionRunOptions = {},
+    onEvent?: (event: AgentSessionStreamEvent) => void
+  ): Promise<AgentSessionRunResult> {
+    const runId = options.runId ?? createRunId();
+    const threadId = options.threadId ?? this.threadId;
+    const inputMessages = normalizeInput(input);
+    let parentId = this.store?.getLeafEntry()?.id ?? null;
+    for (const message of inputMessages) {
+      const entry = await this.store?.appendMessage(message, parentId);
+      parentId = entry?.id ?? parentId;
+    }
+    await this.store?.appendRunEvent('run.started', undefined, {
+      runId,
+      threadId,
+    });
+
+    const handlerResult = createRunHandlers({
+      runId,
+      threadId,
+      userHandlers: this.runConfig.customHandlers,
+      onEvent,
+    });
+    const emitTerminalEvent = (
+      event: Omit<
+        AgentSessionStreamEvent,
+        'sequence' | 'runId' | 'threadId' | 'timestamp'
+      >
+    ): void => {
+      const streamEvent: AgentSessionStreamEvent = {
+        ...event,
+        sequence: handlerResult.events.length,
+        runId,
+        threadId,
+        timestamp: new Date().toISOString(),
+      };
+      handlerResult.events.push(streamEvent);
+      onEvent?.(streamEvent);
+    };
+    const sessionState = createSessionRunState(this.store?.getPath() ?? []);
+    try {
+      const runConfig: t.RunConfig = {
+        ...this.runConfig,
+        runId,
+        graphConfig: applyInitialSummaryToGraphConfig(
+          this.runConfig.graphConfig,
+          sessionState.initialSummary
+        ),
+        returnContent: true,
+        calibrationRatio: this.calibrationRatio,
+        customHandlers: handlerResult.handlers,
+      };
+      const run = await Run.create<t.IState>(runConfig);
+      const messages =
+        sessionState.messages.length > 0
+          ? sessionState.messages
+          : inputMessages;
+      const callerConfig: Partial<RunnableConfig> & { version: 'v1' | 'v2' } = {
+        recursionLimit: 50,
+        ...(options.config ?? {}),
+        configurable: {
+          ...(options.config?.configurable ?? {}),
+          thread_id: threadId,
+        },
+        version: options.config?.version ?? 'v2',
+      };
+      const content = await run.processStream(
+        { messages },
+        callerConfig,
+        options.streamOptions
+      );
+      const runMessages = run.getRunMessages() ?? [];
+      for (const message of runMessages) {
+        await this.store?.appendMessage(message);
+      }
+      this.calibrationRatio = run.getCalibrationRatio();
+      const interrupt = run.getInterrupt();
+      const haltedReason = run.getHaltReason();
+      if (interrupt) {
+        emitTerminalEvent({ type: 'run.interrupted' });
+        await this.store?.appendRunEvent('run.interrupted', interrupt, {
+          runId,
+          threadId,
+        });
+      } else if (haltedReason != null && haltedReason !== '') {
+        emitTerminalEvent({ type: 'run.halted', data: haltedReason });
+        await this.store?.appendRunEvent('run.halted', haltedReason, {
+          runId,
+          threadId,
+        });
+      } else {
+        emitTerminalEvent({ type: 'run.completed' });
+        await this.store?.appendRunEvent('run.completed', undefined, {
+          runId,
+          threadId,
+        });
+      }
+      const contentParts = (content ?? handlerResult.contentParts).filter(
+        (part): part is t.MessageContentComplex => part != null
+      );
+      return {
+        text: contentToText(contentParts),
+        content: contentParts,
+        messages: runMessages,
+        usage: handlerResult.usage,
+        steps: handlerResult.steps,
+        interrupt,
+        haltedReason,
+        runId,
+        threadId,
+      };
+    } catch (error) {
+      emitTerminalEvent({
+        type: 'run.failed',
+        data: error instanceof Error ? error.message : String(error),
+      });
+      await this.store?.appendRunEvent('run.failed', error, {
+        runId,
+        threadId,
+      });
+      throw error;
+    }
+  }
+
+  async run(
+    input: AgentSessionInput,
+    options: AgentSessionRunOptions = {}
+  ): Promise<AgentSessionRunResult> {
+    return this.runInternal(input, options);
+  }
+
+  stream(
+    input: AgentSessionInput,
+    options: AgentSessionRunOptions = {}
+  ): AgentSessionStream {
+    const stream = new LiveAgentSessionStream();
+    const resultPromise = this.runInternal(input, options, (event) => {
+      stream.push(event);
+    }).then(
+      (result) => {
+        stream.complete();
+        return result;
+      },
+      (error: unknown) => {
+        stream.fail(error);
+        throw error;
+      }
+    );
+    stream.setResultPromise(resultPromise);
+    return stream;
+  }
+
+  async resumeSession(pathOrId?: string): Promise<AgentSession> {
+    if (pathOrId == null || pathOrId === '') {
+      const sessions = await JsonlSessionStore.list(this.cwd);
+      if (sessions.length === 0) {
+        throw new Error(`No sessions found for ${this.cwd}`);
+      }
+      this.store = await JsonlSessionStore.open(sessions[0].path);
+      this.cwd = this.store.header.cwd;
+      this.threadId = this.store.header.id;
+      return this;
+    }
+    this.store = await JsonlSessionStore.open(pathOrId);
+    this.cwd = this.store.header.cwd;
+    this.threadId = this.store.header.id;
+    return this;
+  }
+
+  async clone(options: SessionForkOptions = {}): Promise<AgentSession> {
+    if (!this.store) {
+      throw new Error('Cannot clone an ephemeral session');
+    }
+    const store = await this.store.clone(options);
+    return new AgentSession({
+      runConfig: this.runConfig,
+      cwd: store.header.cwd,
+      threadId: store.header.id,
+      store,
+    });
+  }
+
+  async fork(
+    entryId: string,
+    options: SessionForkOptions = {}
+  ): Promise<AgentSession> {
+    if (!this.store) {
+      throw new Error('Cannot fork an ephemeral session');
+    }
+    const store = await this.store.fork(entryId, options);
+    return new AgentSession({
+      runConfig: this.runConfig,
+      cwd: store.header.cwd,
+      threadId: store.header.id,
+      store,
+    });
+  }
+
+  async branch(
+    entryId: string,
+    options: SessionBranchOptions = {}
+  ): Promise<void> {
+    if (!this.store) {
+      throw new Error('Cannot branch an ephemeral session');
+    }
+    const summarizeAbandoned = options.summarizeAbandoned;
+    if (summarizeAbandoned !== undefined && summarizeAbandoned !== false) {
+      const instructions =
+        typeof summarizeAbandoned === 'object'
+          ? summarizeAbandoned.instructions
+          : undefined;
+      await this.compact({ instructions, retainRecentTurns: 0 });
+    }
+    await this.store.branch(entryId, options);
+  }
+
+  async compact(options: SessionCompactOptions = {}): Promise<void> {
+    const store = this.store;
+    if (!store) {
+      throw new Error('Cannot compact an ephemeral session');
+    }
+    const activePath = store.getPath();
+    const sessionState = createSessionRunState(activePath);
+    const messageEntries = activePath.filter(isMessageEntry);
+    if (sessionState.messages.length === 0) {
+      return;
+    }
+    const compactRunId = createRunId();
+    const agentContext = AgentContext.fromConfig(
+      createAgentInputFromGraphConfig(
+        this.runConfig.graphConfig,
+        sessionState.initialSummary,
+        options.retainRecentTurns,
+        options.instructions
+      )
+    );
+    const graph = createManualCompactGraph({
+      runId: compactRunId,
+      customHandlers: this.runConfig.customHandlers,
+      hooks: this.runConfig.hooks,
+    });
+    const summarizeNode = createSummarizeNode({
+      agentContext,
+      graph: graph.graph,
+      generateStepId: (stepKey): [string, number] => [
+        `${stepKey}-${compactRunId}`,
+        graph.graph.contentData.length,
+      ],
+    });
+    const summarizedState = await summarizeNode(
+      {
+        messages: sessionState.messages,
+        summarizationRequest: {
+          remainingContextTokens: agentContext.maxContextTokens ?? 0,
+          agentId: agentContext.agentId,
+        },
+      },
+      {
+        configurable: { thread_id: this.threadId },
+        metadata: { run_id: compactRunId },
+      }
+    );
+    const completedSummaryText = getSummaryText(graph.completedSummary);
+    const contextSummaryText = agentContext.getSummaryText();
+    let summaryText = completedSummaryText;
+    if (summaryText === '' && contextSummaryText != null) {
+      summaryText = contextSummaryText;
+    }
+    if (summaryText === '') {
+      return;
+    }
+    const retainedMessages = filterRemoveMessages(
+      summarizedState.messages ?? []
+    );
+    const retainedEntryIds = messageEntries
+      .slice(-retainedMessages.length)
+      .map((entry) => entry.id);
+    const retainedEntryIdSet = new Set(retainedEntryIds);
+    const summarized = messageEntries.filter(
+      (entry) => !retainedEntryIdSet.has(entry.id)
+    );
+    const summary = await store.appendEntryForCompaction({
+      text: summaryText,
+      retainedEntryIds,
+      summarizedEntryIds: summarized.map((entry) => entry.id),
+      instructions: options.instructions,
+      parentId: null,
+    });
+    let parentId: string | null = summary.id;
+    for (const message of retainedMessages) {
+      const retainedMessage = await store.appendMessage(message, parentId);
+      parentId = retainedMessage.id;
+    }
+    await store.appendCompactionEntry({
+      summaryEntryId: summary.id,
+      retainedEntryIds,
+      summarizedEntryIds: summarized.map((entry) => entry.id),
+    });
+  }
+
+  async resumeInterrupt<TResume>(
+    resumeValue: TResume,
+    options: AgentSessionRunOptions = {}
+  ): Promise<AgentSessionRunResult> {
+    const runId = options.runId ?? createRunId();
+    const threadId = options.threadId ?? this.threadId;
+    const handlerResult = createRunHandlers({
+      runId,
+      threadId,
+      userHandlers: this.runConfig.customHandlers,
+    });
+    const run = await Run.create<t.IState>({
+      ...this.runConfig,
+      runId,
+      returnContent: true,
+      calibrationRatio: this.calibrationRatio,
+      customHandlers: handlerResult.handlers,
+    });
+    const content = await run.resume(resumeValue, {
+      ...(options.config ?? {}),
+      configurable: {
+        ...(options.config?.configurable ?? {}),
+        thread_id: threadId,
+      },
+      version: options.config?.version ?? 'v2',
+    });
+    const runMessages = run.getRunMessages() ?? [];
+    for (const message of runMessages) {
+      await this.store?.appendMessage(message);
+    }
+    const contentParts = (content ?? handlerResult.contentParts).filter(
+      (part): part is t.MessageContentComplex => part != null
+    );
+    return {
+      text: contentToText(contentParts),
+      content: contentParts,
+      messages: runMessages,
+      usage: handlerResult.usage,
+      steps: handlerResult.steps,
+      interrupt: run.getInterrupt(),
+      haltedReason: run.getHaltReason(),
+      runId,
+      threadId,
+    };
+  }
+}
+
+export function createAgentSession(
+  config: AgentSessionConfig
+): Promise<AgentSession> {
+  return AgentSession.create(config);
+}

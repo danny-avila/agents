@@ -10,6 +10,16 @@
       "require": "./dist/cjs/main.cjs",
       "types": "./dist/types/index.d.ts"
     },
+    "./openai": {
+      "import": "./dist/esm/openai/index.mjs",
+      "require": "./dist/cjs/openai/index.cjs",
+      "types": "./dist/types/openai/index.d.ts"
+    },
+    "./responses": {
+      "import": "./dist/esm/responses/index.mjs",
+      "require": "./dist/cjs/responses/index.cjs",
+      "types": "./dist/types/responses/index.d.ts"
+    },
     "./langchain": {
       "import": "./dist/esm/langchain/index.mjs",
       "require": "./dist/cjs/langchain/index.cjs",
@@ -68,6 +78,12 @@
       ],
       "langchain/*": [
         "dist/types/langchain/*"
+      ],
+      "openai": [
+        "dist/types/openai/index.d.ts"
+      ],
+      "responses": [
+        "dist/types/responses/index.d.ts"
       ]
     }
   },
@@ -133,6 +149,7 @@
     "local:image": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/local_engine_image.ts --provider 'anthropic' --name 'Jo' --location 'New York, NY'",
     "local:compile": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/local_engine_compile.ts --provider 'anthropic' --name 'Jo' --location 'New York, NY'",
     "compare:pi": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/compare_pi_vs_ours.ts",
+    "session:live": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/session_live.ts",
     "local:workspace": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/local_engine_workspace.ts --provider 'anthropic' --name 'Jo' --location 'New York, NY'",
     "programmatic_exec_agent": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/programmatic_exec_agent.ts --provider 'openAI' --name 'Jo' --location 'New York, NY'",
     "ant_web_search": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/ant_web_search.ts --name 'Jo' --location 'New York, NY'",
