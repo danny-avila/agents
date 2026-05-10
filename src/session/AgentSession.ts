@@ -434,6 +434,17 @@ function getSessionBranchTarget(
   return entry.parentId == null ? undefined : store.getEntry(entry.parentId);
 }
 
+function getPathAfterEntry(
+  path: SessionEntry[],
+  entryId: string | null
+): SessionEntry[] {
+  if (entryId == null) {
+    return path;
+  }
+  const index = path.findIndex((entry) => entry.id === entryId);
+  return index === -1 ? [] : path.slice(index + 1);
+}
+
 function createAgentInputFromGraphConfig(
   graphConfig: t.RunConfig['graphConfig'],
   initialSummary: InitialSummary | undefined,
@@ -1033,9 +1044,14 @@ export class AgentSession {
         typeof summarizeAbandoned === 'object'
           ? summarizeAbandoned.instructions
           : undefined;
+      const abandonedPath = getPathAfterEntry(
+        store.getPath(previousLeafId ?? undefined),
+        leafId
+      );
       const summary = await this.compactActivePath(
         { instructions, retainRecentTurns: 0 },
-        leafId
+        leafId,
+        abandonedPath
       );
       leafId = summary?.id ?? leafId;
     }
@@ -1055,13 +1071,14 @@ export class AgentSession {
 
   private async compactActivePath(
     options: SessionCompactOptions = {},
-    parentId: string | null
+    parentId: string | null,
+    path?: SessionEntry[]
   ): Promise<Extract<SessionEntry, { type: 'summary' }> | undefined> {
     const store = this.store;
     if (!store) {
       throw new Error('Cannot compact an ephemeral session');
     }
-    const activePath = store.getPath();
+    const activePath = path ?? store.getPath();
     const sessionState = createSessionRunState(activePath);
     const messageEntries = activePath.filter(isMessageEntry);
     if (sessionState.messages.length === 0) {

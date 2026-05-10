@@ -923,7 +923,9 @@ describe('JsonlSessionStore', () => {
     });
     const store = session.getSessionStore();
     const first = await store?.appendMessage(new HumanMessage('first'));
-    await store?.appendMessage(new AIMessage('abandoned answer'));
+    const abandoned = await store?.appendMessage(
+      new AIMessage('abandoned answer')
+    );
 
     await session.branch(first?.id ?? '', {
       position: 'at',
@@ -943,6 +945,7 @@ describe('JsonlSessionStore', () => {
       parentId: first?.id,
       data: {
         text: 'summary of abandoned branch',
+        summarizedEntryIds: [abandoned?.id],
         instructions: 'summarize abandoned branch',
       },
     });

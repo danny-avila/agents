@@ -31,8 +31,8 @@ function filterProdFiles(id) {
 export default {
   input: {
     main: './src/index.ts',
-    openai: './src/openai/index.ts',
-    responses: './src/responses/index.ts',
+    'openai/index': './src/openai/index.ts',
+    'responses/index': './src/responses/index.ts',
     'langchain/index': './src/langchain/index.ts',
     'langchain/google-common': './src/langchain/google-common.ts',
     'langchain/language_models/chat_models':
