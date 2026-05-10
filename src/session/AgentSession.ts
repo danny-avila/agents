@@ -112,16 +112,14 @@ function normalizeConfig(config: AgentSessionConfig): {
 }
 
 function isMissingSessionError(error: unknown): boolean {
-  if (!(error instanceof Error)) {
+  if (error == null || typeof error !== 'object') {
     return false;
   }
-  if (error.message.startsWith('Session not found:')) {
+  const candidate = error as { code?: string; message?: string };
+  if (candidate.code === 'ENOENT') {
     return true;
   }
-  if (!('code' in error)) {
-    return false;
-  }
-  return (error as { code?: string }).code === 'ENOENT';
+  return candidate.message?.startsWith('Session not found:') === true;
 }
 
 async function createStore(params: {
@@ -136,7 +134,7 @@ async function createStore(params: {
   }
   if (params.sessionPath != null && params.sessionPath !== '') {
     try {
-      return await JsonlSessionStore.open(params.sessionPath);
+      return await JsonlSessionStore.openPath(params.sessionPath);
     } catch (error) {
       if (!isMissingSessionError(error)) {
         throw error;

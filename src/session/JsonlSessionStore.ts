@@ -139,7 +139,12 @@ export class JsonlSessionStore {
 
   static async open(pathOrId: string): Promise<JsonlSessionStore> {
     const path = await JsonlSessionStore.resolvePath(pathOrId);
-    const raw = await readFile(path, 'utf8');
+    return JsonlSessionStore.openPath(path);
+  }
+
+  static async openPath(path: string): Promise<JsonlSessionStore> {
+    const resolved = resolve(path);
+    const raw = await readFile(resolved, 'utf8');
     const parsed = raw
       .split('\n')
       .map((line) => parseLine(line))
@@ -148,12 +153,12 @@ export class JsonlSessionStore {
       (line): line is SessionHeader => line.type === 'session'
     );
     if (!header) {
-      throw new Error(`Invalid session file: ${path}`);
+      throw new Error(`Invalid session file: ${resolved}`);
     }
     const entries = parsed.filter(
       (line): line is SessionEntry => line.type !== 'session'
     );
-    return new JsonlSessionStore({ path, header, entries });
+    return new JsonlSessionStore({ path: resolved, header, entries });
   }
 
   static async resolvePath(pathOrId: string): Promise<string> {
