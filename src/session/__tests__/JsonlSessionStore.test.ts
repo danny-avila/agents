@@ -7,6 +7,8 @@ import {
   RemoveMessage,
 } from '@langchain/core/messages';
 import { MemorySaver } from '@langchain/langgraph';
+import type { BaseMessage } from '@langchain/core/messages';
+import type { Checkpoint, CheckpointMetadata } from '@langchain/langgraph';
 import { JsonlSessionStore, createAgentSession } from '@/session';
 import { toJsonValue } from '@/session/messageSerialization';
 import * as providers from '@/llm/providers';
@@ -65,6 +67,41 @@ function getProcessedState(mockRun: MockRun): t.IState {
     throw new Error('Expected processStream to receive message state');
   }
   return input;
+}
+
+function getProcessedMessages(mockRun: MockRun): BaseMessage[] {
+  return getProcessedState(mockRun).messages;
+}
+
+async function putCheckpoint(params: {
+  checkpointer: MemorySaver;
+  threadId: string;
+  id: string;
+  checkpointNs?: string;
+}): Promise<void> {
+  const checkpoint: Checkpoint = {
+    v: 4,
+    id: params.id,
+    ts: new Date().toISOString(),
+    channel_values: {},
+    channel_versions: {},
+    versions_seen: {},
+  };
+  const metadata: CheckpointMetadata = {
+    source: 'loop',
+    step: 0,
+    parents: {},
+  };
+  await params.checkpointer.put(
+    {
+      configurable: {
+        thread_id: params.threadId,
+        checkpoint_ns: params.checkpointNs ?? '',
+      },
+    },
+    checkpoint,
+    metadata
+  );
 }
 
 function mockSummarizer(response: string): void {
@@ -253,6 +290,55 @@ describe('JsonlSessionStore', () => {
     expect(compaction.data.summaryEntryId).toBe(summary.id);
   });
 
+  it('records LangGraph checkpoint references without moving the active leaf', async () => {
+    const store = await JsonlSessionStore.create({
+      path: join(dir, 'checkpoints.jsonl'),
+      cwd: dir,
+    });
+    const message = await store.appendMessage(new HumanMessage('hello'));
+
+    const checkpoint = await store.appendCheckpoint({
+      source: 'run',
+      threadId: store.header.id,
+      runId: 'run_checkpoint',
+      checkpointId: 'checkpoint_1',
+      checkpointNs: '',
+    });
+
+    expect(checkpoint.data.provider).toBe('langgraph');
+    expect(store.getLeafEntry()?.id).toBe(message.id);
+    expect(store.getLatestCheckpoint(store.header.id)?.id).toBe(checkpoint.id);
+  });
+
+  it('treats reset checkpoints as latest checkpoint barriers', async () => {
+    const store = await JsonlSessionStore.create({
+      path: join(dir, 'checkpoint-reset.jsonl'),
+      cwd: dir,
+    });
+    await store.appendCheckpoint({
+      source: 'run',
+      threadId: store.header.id,
+      runId: 'run_before_reset',
+      checkpointId: 'checkpoint_before_reset',
+    });
+    await store.appendCheckpoint({
+      source: 'reset',
+      threadId: store.header.id,
+      reason: 'branch',
+    });
+
+    expect(store.getLatestCheckpoint(store.header.id)).toBeUndefined();
+
+    const checkpoint = await store.appendCheckpoint({
+      source: 'run',
+      threadId: store.header.id,
+      runId: 'run_after_reset',
+      checkpointId: 'checkpoint_after_reset',
+    });
+
+    expect(store.getLatestCheckpoint(store.header.id)?.id).toBe(checkpoint.id);
+  });
+
   it('preserves Error details in JSONL payloads', () => {
     const error = new Error('resume failed');
     const payload = toJsonValue(error);
@@ -371,7 +457,46 @@ describe('JsonlSessionStore', () => {
     ]);
   });
 
-  it('reuses a session-level checkpointer for HITL resume', async () => {
+  it('shares a session-level LangGraph checkpointer for HITL resume', async () => {
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      humanInTheLoop: { enabled: true },
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+
+    expect(session.getCheckpointer()).toBeInstanceOf(MemorySaver);
+  });
+
+  it('keeps stores and checkpointing optional for high-level sessions', async () => {
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      ephemeral: true,
+      checkpointing: false,
+      humanInTheLoop: { enabled: true },
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+
+    expect(session.getSessionStore()).toBeUndefined();
+    expect(session.getCheckpointer()).toBeUndefined();
+  });
+
+  it('reuses the session-level checkpointer across HITL resume', async () => {
     const mockRun = createMockRun('resumed');
     const capturedConfigs = mockRunCreate(mockRun);
     const session = await createAgentSession({
@@ -398,6 +523,304 @@ describe('JsonlSessionStore', () => {
     expect(capturedConfigs[1].graphConfig.compileOptions?.checkpointer).toBe(
       checkpointer
     );
+  });
+
+  it('preserves a caller-supplied session checkpointer', async () => {
+    const checkpointer = new MemorySaver();
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      checkpointing: { checkpointer },
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+
+    expect(session.getCheckpointer()).toBe(checkpointer);
+  });
+
+  it('injects the session checkpointer and replays JSONL history before checkpoints exist', async () => {
+    const checkpointer = new MemorySaver();
+    const mockRun = createMockRun('first output');
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      checkpointing: { checkpointer },
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    await session.getSessionStore()?.appendMessage(new HumanMessage('history'));
+
+    await session.run('next');
+
+    expect(capturedConfigs[0].graphConfig.compileOptions?.checkpointer).toBe(
+      checkpointer
+    );
+    expect(
+      getProcessedMessages(mockRun).map((message) => message.content)
+    ).toEqual(['history', 'next']);
+  });
+
+  it('uses only new input when LangGraph checkpoint state already exists', async () => {
+    const checkpointer = new MemorySaver();
+    const mockRun = createMockRun('checkpointed output');
+    mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      checkpointing: { checkpointer },
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    await session.getSessionStore()?.appendMessage(new HumanMessage('history'));
+    await putCheckpoint({
+      checkpointer,
+      threadId: session.threadId,
+      id: 'checkpoint_existing',
+    });
+
+    await session.run('fresh turn', { runId: 'run_checkpointed' });
+
+    const checkpoints = session
+      .getSessionStore()
+      ?.getCheckpoints(session.threadId);
+    expect(
+      getProcessedMessages(mockRun).map((message) => message.content)
+    ).toEqual(['fresh turn']);
+    expect(checkpoints?.at(-1)?.data).toMatchObject({
+      source: 'run',
+      runId: 'run_checkpointed',
+      checkpointId: 'checkpoint_existing',
+    });
+  });
+
+  it('replays JSONL history when the requested checkpoint namespace has no state', async () => {
+    const checkpointer = new MemorySaver();
+    const mockRun = createMockRun('namespace output');
+    mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      checkpointing: { checkpointer },
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    await session.getSessionStore()?.appendMessage(new HumanMessage('history'));
+    await putCheckpoint({
+      checkpointer,
+      threadId: session.threadId,
+      id: 'checkpoint_other_namespace',
+      checkpointNs: 'other',
+    });
+
+    await session.run('fresh turn', {
+      config: { configurable: { checkpoint_ns: 'requested' } },
+    });
+
+    expect(
+      getProcessedMessages(mockRun).map((message) => message.content)
+    ).toEqual(['history', 'fresh turn']);
+  });
+
+  it('looks up the latest checkpoint in the requested namespace', async () => {
+    const checkpointer = new MemorySaver();
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      checkpointing: { checkpointer },
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    await putCheckpoint({
+      checkpointer,
+      threadId: session.threadId,
+      id: 'checkpoint_requested_namespace',
+      checkpointNs: 'requested',
+    });
+
+    await expect(session.getLatestCheckpoint()).resolves.toBeUndefined();
+    await expect(
+      session.getLatestCheckpoint({ checkpointNs: 'requested' })
+    ).resolves.toMatchObject({
+      checkpointId: 'checkpoint_requested_namespace',
+      checkpointNs: 'requested',
+    });
+  });
+
+  it('resets stale checkpoint state when branching changes the active JSONL path', async () => {
+    const checkpointer = new MemorySaver();
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      checkpointing: { checkpointer },
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    const store = session.getSessionStore();
+    const first = await store?.appendMessage(new HumanMessage('first'));
+    await store?.appendMessage(new AIMessage('second'));
+    await putCheckpoint({
+      checkpointer,
+      threadId: session.threadId,
+      id: 'checkpoint_to_reset',
+    });
+
+    await session.branch(first?.id ?? '', { position: 'at' });
+
+    const tuple = await checkpointer.getTuple({
+      configurable: { thread_id: session.threadId },
+    });
+    expect(tuple).toBeUndefined();
+    expect(store?.getCheckpoints(session.threadId).at(-1)?.data).toMatchObject({
+      source: 'reset',
+      reason: 'branch',
+    });
+  });
+
+  it('keeps checkpoint state when branching to the active JSONL leaf', async () => {
+    const checkpointer = new MemorySaver();
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      checkpointing: { checkpointer },
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    const store = session.getSessionStore();
+    const active = await store?.appendMessage(new HumanMessage('current'));
+    await putCheckpoint({
+      checkpointer,
+      threadId: session.threadId,
+      id: 'checkpoint_to_keep',
+    });
+
+    await session.branch(active?.id ?? '', { position: 'at' });
+
+    const tuple = await checkpointer.getTuple({
+      configurable: { thread_id: session.threadId },
+    });
+    expect(tuple?.checkpoint.id).toBe('checkpoint_to_keep');
+    expect(
+      store
+        ?.getCheckpoints(session.threadId)
+        .some((checkpoint) => checkpoint.data.source === 'reset')
+    ).toBe(false);
+  });
+
+  it('resets overridden thread checkpoints when branching changes the active path', async () => {
+    const checkpointer = new MemorySaver();
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      checkpointing: { checkpointer },
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    const store = session.getSessionStore();
+    const first = await store?.appendMessage(new HumanMessage('first'));
+    await store?.appendMessage(new AIMessage('second'));
+    await putCheckpoint({
+      checkpointer,
+      threadId: 'thread_override',
+      id: 'checkpoint_override',
+    });
+    await store?.appendCheckpoint({
+      source: 'run',
+      threadId: 'thread_override',
+      runId: 'run_override',
+      checkpointId: 'checkpoint_override',
+    });
+
+    await session.branch(first?.id ?? '', { position: 'at' });
+
+    const tuple = await checkpointer.getTuple({
+      configurable: { thread_id: 'thread_override' },
+    });
+    const reset = store
+      ?.getCheckpoints('thread_override')
+      .find((checkpoint) => checkpoint.data.source === 'reset');
+    expect(tuple).toBeUndefined();
+    expect(reset?.data.reason).toBe('branch');
+  });
+
+  it('records run.failed when resumeInterrupt throws', async () => {
+    const mockRun = createMockRun('unused');
+    mockRun.resume.mockRejectedValue(new Error('resume failed'));
+    mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      humanInTheLoop: { enabled: true },
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+
+    await expect(
+      session.resumeInterrupt([{ type: 'approve' }], {
+        runId: 'run_resume_failure',
+      })
+    ).rejects.toThrow('resume failed');
+
+    const events = session
+      .getSessionStore()
+      ?.getEntries()
+      .filter((entry) => entry.type === 'run_event')
+      .map((entry) => entry.data.event);
+    expect(events).toEqual(['run.started', 'run.failed']);
   });
 
   it('compacts into a summary plus retained active path', async () => {

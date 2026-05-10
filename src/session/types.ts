@@ -20,6 +20,7 @@ export type SessionEntryType =
   | 'message'
   | 'summary'
   | 'compaction'
+  | 'checkpoint'
   | 'label'
   | 'run_event'
   | 'session_state';
@@ -81,6 +82,20 @@ export type SessionCompactionEntry = SessionEntryBase<
   }
 >;
 
+export type SessionCheckpointEntry = SessionEntryBase<
+  'checkpoint',
+  {
+    provider: 'langgraph';
+    source: 'run' | 'resume' | 'reset';
+    threadId: string;
+    runId?: string;
+    checkpointId?: string;
+    checkpointNs?: string;
+    parentCheckpointId?: string;
+    reason?: string;
+  }
+>;
+
 export type SessionLabelEntry = SessionEntryBase<
   'label',
   {
@@ -110,6 +125,7 @@ export type SessionEntry =
   | SessionMessageEntry
   | SessionSummaryEntry
   | SessionCompactionEntry
+  | SessionCheckpointEntry
   | SessionLabelEntry
   | SessionRunEventEntry
   | SessionStateEntry;
@@ -162,6 +178,20 @@ export interface AgentSessionUsage {
   inputTokens: number;
   outputTokens: number;
   totalTokens: number;
+}
+
+export interface AgentSessionCheckpointReference {
+  provider: 'langgraph';
+  threadId: string;
+  checkpointId?: string;
+  checkpointNs?: string;
+  parentCheckpointId?: string;
+}
+
+export interface AgentSessionCheckpointLookupOptions {
+  threadId?: string;
+  checkpointNs?: string;
+  config?: RunnableConfig;
 }
 
 export interface AgentSessionCheckpointingOptions {

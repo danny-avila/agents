@@ -1,11 +1,16 @@
 import { MemorySaver } from '@langchain/langgraph';
 import { HumanMessage, BaseMessage } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
-import type { BaseCheckpointSaver } from '@langchain/langgraph';
+import type {
+  BaseCheckpointSaver,
+  CheckpointTuple,
+} from '@langchain/langgraph';
 import type { HookRegistry } from '@/hooks';
 import type {
   AgentSessionConfig,
   AgentSessionCheckpointing,
+  AgentSessionCheckpointLookupOptions,
+  AgentSessionCheckpointReference,
   AgentSessionInput,
   AgentSessionRunOptions,
   AgentSessionRunResult,
@@ -208,6 +213,7 @@ function applyInitialSummaryToGraphConfig(
 }
 
 interface SessionCheckpointingState {
+  enabled: boolean;
   checkpointer?: BaseCheckpointSaver;
 }
 
@@ -238,21 +244,34 @@ function createCheckpointingState(
 ): SessionCheckpointingState {
   const graphCheckpointer = getGraphCheckpointer(runConfig.graphConfig);
   if (checkpointing === false) {
-    return { checkpointer: graphCheckpointer };
+    return {
+      enabled: false,
+      checkpointer: graphCheckpointer,
+    };
   }
   if (typeof checkpointing === 'object') {
     if (checkpointing.enabled === false) {
-      return { checkpointer: graphCheckpointer };
+      return {
+        enabled: false,
+        checkpointer: graphCheckpointer,
+      };
     }
     return {
+      enabled: true,
       checkpointer:
         checkpointing.checkpointer ?? graphCheckpointer ?? new MemorySaver(),
     };
   }
   if (checkpointing === true || runConfig.humanInTheLoop?.enabled === true) {
-    return { checkpointer: graphCheckpointer ?? new MemorySaver() };
+    return {
+      enabled: true,
+      checkpointer: graphCheckpointer ?? new MemorySaver(),
+    };
   }
-  return { checkpointer: graphCheckpointer };
+  return {
+    enabled: graphCheckpointer != null,
+    checkpointer: graphCheckpointer,
+  };
 }
 
 function applyCheckpointerToGraphConfig(
@@ -274,10 +293,21 @@ function applyCheckpointerToGraphConfig(
   };
 }
 
+function getConfigString(
+  config: RunnableConfig | undefined,
+  key: string
+): string | undefined {
+  const configurable = config?.configurable as
+    | Partial<Record<string, unknown>>
+    | undefined;
+  const value = configurable?.[key];
+  return typeof value === 'string' && value !== '' ? value : undefined;
+}
+
 function createCallerConfig(
   threadId: string,
   options: AgentSessionRunOptions
-): Partial<RunnableConfig> & { version: 'v1' | 'v2' } {
+): RunnableConfig & { version: 'v1' | 'v2' } {
   return {
     recursionLimit: 50,
     ...(options.config ?? {}),
@@ -286,6 +316,78 @@ function createCallerConfig(
       thread_id: threadId,
     },
     version: options.config?.version ?? 'v2',
+  };
+}
+
+function createCheckpointLookupConfig(config: RunnableConfig): RunnableConfig {
+  const threadId = getConfigString(config, 'thread_id');
+  if (threadId == null) {
+    return config;
+  }
+  const checkpointNs = getConfigString(config, 'checkpoint_ns') ?? '';
+  const checkpointId = getConfigString(config, 'checkpoint_id');
+  return {
+    configurable: {
+      ...config.configurable,
+      thread_id: threadId,
+      checkpoint_ns: checkpointNs,
+      ...(checkpointId != null ? { checkpoint_id: checkpointId } : {}),
+    },
+  };
+}
+
+function createLatestCheckpointLookupConfig(
+  config: RunnableConfig
+): RunnableConfig {
+  const lookup = createCheckpointLookupConfig(config);
+  const { checkpoint_id: _checkpointId, ...configurable } =
+    lookup.configurable ?? {};
+  return { configurable };
+}
+
+async function getLatestCheckpointTuple(
+  checkpointer: BaseCheckpointSaver | undefined,
+  config: RunnableConfig
+): Promise<CheckpointTuple | undefined> {
+  if (!checkpointer) {
+    return undefined;
+  }
+  const lookupConfig = createLatestCheckpointLookupConfig(config);
+  const tuple = await checkpointer.getTuple(lookupConfig);
+  if (tuple) {
+    return tuple;
+  }
+  for await (const checkpoint of checkpointer.list(lookupConfig, {
+    limit: 1,
+  })) {
+    return checkpoint;
+  }
+  return undefined;
+}
+
+async function getSelectedCheckpointTuple(
+  checkpointer: BaseCheckpointSaver | undefined,
+  config: RunnableConfig
+): Promise<CheckpointTuple | undefined> {
+  return checkpointer?.getTuple(createCheckpointLookupConfig(config));
+}
+
+function createCheckpointReference(params: {
+  threadId: string;
+  tuple: CheckpointTuple;
+}): AgentSessionCheckpointReference {
+  const checkpointNs =
+    getConfigString(params.tuple.config, 'checkpoint_ns') ?? '';
+  const parentCheckpointId = getConfigString(
+    params.tuple.parentConfig,
+    'checkpoint_id'
+  );
+  return {
+    provider: 'langgraph',
+    threadId: params.threadId,
+    checkpointId: params.tuple.checkpoint.id,
+    checkpointNs,
+    ...(parentCheckpointId != null ? { parentCheckpointId } : {}),
   };
 }
 
@@ -614,6 +716,92 @@ export class AgentSession {
     return this.checkpointing.checkpointer;
   }
 
+  async getLatestCheckpoint(
+    options: AgentSessionCheckpointLookupOptions = {}
+  ): Promise<AgentSessionCheckpointReference | undefined> {
+    const threadId = options.threadId ?? this.threadId;
+    const baseConfig = options.config ?? {};
+    const config = createCheckpointLookupConfig({
+      ...baseConfig,
+      configurable: {
+        ...(baseConfig.configurable ?? {}),
+        thread_id: threadId,
+        ...(options.checkpointNs != null
+          ? { checkpoint_ns: options.checkpointNs }
+          : {}),
+      },
+    });
+    const tuple = await getLatestCheckpointTuple(
+      this.checkpointing.checkpointer,
+      config
+    );
+    return tuple ? createCheckpointReference({ threadId, tuple }) : undefined;
+  }
+
+  private async hasCheckpointState(config: RunnableConfig): Promise<boolean> {
+    if (!this.checkpointing.enabled) {
+      return false;
+    }
+    const tuple = await getSelectedCheckpointTuple(
+      this.checkpointing.checkpointer,
+      config
+    );
+    return tuple != null;
+  }
+
+  private async recordCheckpoint(params: {
+    source: 'run' | 'resume';
+    runId: string;
+    threadId: string;
+    config: RunnableConfig;
+  }): Promise<void> {
+    if (!this.checkpointing.enabled) {
+      return;
+    }
+    const tuple = await getLatestCheckpointTuple(
+      this.checkpointing.checkpointer,
+      params.config
+    );
+    if (!tuple) {
+      return;
+    }
+    const reference = createCheckpointReference({
+      threadId: params.threadId,
+      tuple,
+    });
+    await this.store?.appendCheckpoint({
+      source: params.source,
+      runId: params.runId,
+      threadId: params.threadId,
+      checkpointId: reference.checkpointId,
+      checkpointNs: reference.checkpointNs,
+      parentCheckpointId: reference.parentCheckpointId,
+    });
+  }
+
+  private getCheckpointThreadIds(): string[] {
+    const threadIds = new Set<string>([this.threadId]);
+    for (const checkpoint of this.store?.getCheckpoints() ?? []) {
+      threadIds.add(checkpoint.data.threadId);
+    }
+    return [...threadIds];
+  }
+
+  private async resetCheckpointThreads(reason: string): Promise<void> {
+    const checkpointer = this.checkpointing.checkpointer;
+    if (!this.checkpointing.enabled || checkpointer == null) {
+      return;
+    }
+    for (const threadId of this.getCheckpointThreadIds()) {
+      await checkpointer.deleteThread(threadId);
+      await this.store?.appendCheckpoint({
+        source: 'reset',
+        threadId,
+        reason,
+      });
+    }
+  }
+
   private async runInternal(
     input: AgentSessionInput,
     options: AgentSessionRunOptions = {},
@@ -624,6 +812,7 @@ export class AgentSession {
     const normalizedInput = normalizeInput(input);
     const inputMessages = normalizedInput.messages;
     const callerConfig = createCallerConfig(threadId, options);
+    const useCheckpointState = await this.hasCheckpointState(callerConfig);
     let parentId = this.store?.getLeafEntry()?.id ?? null;
     for (const message of inputMessages) {
       const entry = await this.store?.appendMessage(message, parentId);
@@ -673,10 +862,10 @@ export class AgentSession {
         customHandlers: handlerResult.handlers,
       };
       const run = await Run.create<t.IState>(runConfig);
-      const messages =
-        sessionState.messages.length > 0
-          ? sessionState.messages
-          : inputMessages;
+      let messages = inputMessages;
+      if (!useCheckpointState && sessionState.messages.length > 0) {
+        messages = sessionState.messages;
+      }
       const content = await run.processStream(
         { ...normalizedInput.state, messages },
         callerConfig,
@@ -708,6 +897,12 @@ export class AgentSession {
           threadId,
         });
       }
+      await this.recordCheckpoint({
+        source: 'run',
+        runId,
+        threadId,
+        config: callerConfig,
+      });
       const contentParts = (content ?? handlerResult.contentParts).filter(
         (part): part is t.MessageContentComplex => part != null
       );
@@ -730,6 +925,12 @@ export class AgentSession {
       await this.store?.appendRunEvent('run.failed', error, {
         runId,
         threadId,
+      });
+      await this.recordCheckpoint({
+        source: 'run',
+        runId,
+        threadId,
+        config: callerConfig,
       });
       throw error;
     }
@@ -824,6 +1025,7 @@ export class AgentSession {
       entryId,
       options.position ?? 'at'
     );
+    const previousLeafId = store.getLeafEntry()?.id ?? null;
     let leafId = target?.id ?? null;
     const summarizeAbandoned = options.summarizeAbandoned;
     if (summarizeAbandoned !== undefined && summarizeAbandoned !== false) {
@@ -837,11 +1039,18 @@ export class AgentSession {
       );
       leafId = summary?.id ?? leafId;
     }
+    if (leafId === previousLeafId) {
+      return;
+    }
     await store.setLeaf(leafId);
+    await this.resetCheckpointThreads('branch');
   }
 
   async compact(options: SessionCompactOptions = {}): Promise<void> {
-    await this.compactActivePath(options, null);
+    const summary = await this.compactActivePath(options, null);
+    if (summary) {
+      await this.resetCheckpointThreads('compact');
+    }
   }
 
   private async compactActivePath(
@@ -945,42 +1154,88 @@ export class AgentSession {
     const runId = options.runId ?? createRunId();
     const threadId = options.threadId ?? this.threadId;
     const callerConfig = createCallerConfig(threadId, options);
+    await this.store?.appendRunEvent('run.started', undefined, {
+      runId,
+      threadId,
+    });
     const handlerResult = createRunHandlers({
       runId,
       threadId,
       userHandlers: this.runConfig.customHandlers,
     });
-    const run = await Run.create<t.IState>({
-      ...this.runConfig,
-      runId,
-      graphConfig: applyCheckpointerToGraphConfig(
-        this.runConfig.graphConfig,
-        this.checkpointing.checkpointer
-      ),
-      returnContent: true,
-      calibrationRatio: this.calibrationRatio,
-      customHandlers: handlerResult.handlers,
-    });
-    const content = await run.resume(resumeValue, callerConfig);
-    const runMessages = run.getRunMessages() ?? [];
-    for (const message of runMessages) {
-      await this.store?.appendMessage(message);
+    const sessionState = createSessionRunState(this.store?.getPath() ?? []);
+    try {
+      const run = await Run.create<t.IState>({
+        ...this.runConfig,
+        runId,
+        graphConfig: applyCheckpointerToGraphConfig(
+          applyInitialSummaryToGraphConfig(
+            this.runConfig.graphConfig,
+            sessionState.initialSummary
+          ),
+          this.checkpointing.checkpointer
+        ),
+        returnContent: true,
+        calibrationRatio: this.calibrationRatio,
+        customHandlers: handlerResult.handlers,
+      });
+      const content = await run.resume(resumeValue, callerConfig);
+      const runMessages = run.getRunMessages() ?? [];
+      for (const message of runMessages) {
+        await this.store?.appendMessage(message);
+      }
+      this.calibrationRatio = run.getCalibrationRatio();
+      const interrupt = run.getInterrupt();
+      const haltedReason = run.getHaltReason();
+      if (interrupt) {
+        await this.store?.appendRunEvent('run.interrupted', interrupt, {
+          runId,
+          threadId,
+        });
+      } else if (haltedReason != null && haltedReason !== '') {
+        await this.store?.appendRunEvent('run.halted', haltedReason, {
+          runId,
+          threadId,
+        });
+      } else {
+        await this.store?.appendRunEvent('run.completed', undefined, {
+          runId,
+          threadId,
+        });
+      }
+      await this.recordCheckpoint({
+        source: 'resume',
+        runId,
+        threadId,
+        config: callerConfig,
+      });
+      const contentParts = (content ?? handlerResult.contentParts).filter(
+        (part): part is t.MessageContentComplex => part != null
+      );
+      return {
+        text: contentToText(contentParts),
+        content: contentParts,
+        messages: runMessages,
+        usage: handlerResult.usage,
+        steps: handlerResult.steps,
+        interrupt,
+        haltedReason,
+        runId,
+        threadId,
+      };
+    } catch (error) {
+      await this.store?.appendRunEvent('run.failed', error, {
+        runId,
+        threadId,
+      });
+      await this.recordCheckpoint({
+        source: 'resume',
+        runId,
+        threadId,
+        config: callerConfig,
+      });
+      throw error;
     }
-    this.calibrationRatio = run.getCalibrationRatio();
-    const contentParts = (content ?? handlerResult.contentParts).filter(
-      (part): part is t.MessageContentComplex => part != null
-    );
-    return {
-      text: contentToText(contentParts),
-      content: contentParts,
-      messages: runMessages,
-      usage: handlerResult.usage,
-      steps: handlerResult.steps,
-      interrupt: run.getInterrupt(),
-      haltedReason: run.getHaltReason(),
-      runId,
-      threadId,
-    };
   }
 }
 

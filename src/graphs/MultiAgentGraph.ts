@@ -723,7 +723,7 @@ export class MultiAgentGraph extends StandardGraph {
     const StateAnnotation = Annotation.Root({
       messages: Annotation<BaseMessage[]>({
         reducer: (a, b) => {
-          if (!a.length) {
+          if (!this.messages.length) {
             this.startIndex = a.length + b.length;
           }
           const result = messagesStateReducer(a, b);

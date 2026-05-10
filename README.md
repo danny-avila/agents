@@ -56,6 +56,7 @@ branched in place, compacted, and inspected later.
 import { Providers, createAgentSession } from '@librechat/agents';
 
 const session = await createAgentSession({
+  checkpointing: true,
   graphConfig: {
     type: 'standard',
     instructions: 'You are a concise coding assistant.',
@@ -71,6 +72,14 @@ const result = await session.run('Summarize this repository.');
 console.log(result.text);
 console.log(session.sessionPath); // durable .jsonl session file
 ```
+
+When `checkpointing` is enabled, the session injects a shared LangGraph
+checkpointer into `compileOptions`, records checkpoint IDs in JSONL, and uses
+checkpoint state for later turns on the same `thread_id`. When HITL is enabled
+(`humanInTheLoop: { enabled: true }`), sessions also get a `MemorySaver` by
+default so `resumeInterrupt()` can reuse the same saver instead of relying on a
+per-run fallback. JSONL still owns portable replay, clone, fork, and audit
+records.
 
 Sessions expose tree operations inspired by Pi-style workflows:
 
