@@ -579,6 +579,42 @@ describe('JsonlSessionStore', () => {
     });
   });
 
+  it('keeps checkpoint state when branching to the active JSONL leaf', async () => {
+    const checkpointer = new MemorySaver();
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      checkpointing: { checkpointer },
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    const store = session.getSessionStore();
+    const active = await store?.appendMessage(new HumanMessage('current'));
+    await putCheckpoint({
+      checkpointer,
+      threadId: session.threadId,
+      id: 'checkpoint_to_keep',
+    });
+
+    await session.branch(active?.id ?? '', { position: 'at' });
+
+    const tuple = await checkpointer.getTuple({
+      configurable: { thread_id: session.threadId },
+    });
+    expect(tuple?.checkpoint.id).toBe('checkpoint_to_keep');
+    expect(
+      store
+        ?.getCheckpoints(session.threadId)
+        .some((checkpoint) => checkpoint.data.source === 'reset')
+    ).toBe(false);
+  });
+
   it('resets overridden thread checkpoints when branching changes the active path', async () => {
     const checkpointer = new MemorySaver();
     const session = await createAgentSession({

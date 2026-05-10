@@ -1021,6 +1021,7 @@ export class AgentSession {
       entryId,
       options.position ?? 'at'
     );
+    const previousLeafId = store.getLeafEntry()?.id ?? null;
     let leafId = target?.id ?? null;
     const summarizeAbandoned = options.summarizeAbandoned;
     if (summarizeAbandoned !== undefined && summarizeAbandoned !== false) {
@@ -1033,6 +1034,9 @@ export class AgentSession {
         leafId
       );
       leafId = summary?.id ?? leafId;
+    }
+    if (leafId === previousLeafId) {
+      return;
     }
     await store.setLeaf(leafId);
     await this.resetCheckpointThreads('branch');
