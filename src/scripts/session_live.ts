@@ -264,6 +264,7 @@ async function runSessionLifecycleSmoke(params: {
     cwd: process.cwd(),
     sessionPath: basePath,
     name: 'live-session-base',
+    checkpointing: true,
     graphConfig: {
       type: 'standard',
       llmConfig: params.llmConfig,
@@ -284,6 +285,20 @@ async function runSessionLifecycleSmoke(params: {
   logPass('standard session run', preview(firstText));
 
   const store = getStore(session);
+  const firstCheckpoint = await session.getLatestCheckpoint();
+  assertLive(
+    firstCheckpoint?.threadId === session.threadId,
+    'LangGraph checkpoint reference missing after run'
+  );
+  assertLive(
+    store.getCheckpoints(session.threadId).length > 0,
+    'JSONL checkpoint journal entry missing'
+  );
+  logPass(
+    'LangGraph checkpoint state',
+    firstCheckpoint.checkpointId ?? 'latest'
+  );
+
   const forkPoint = store.getForkPoints()[0];
   assertLive(forkPoint != null, 'no user fork point recorded');
   await store.setLabel(forkPoint.id, 'first user turn');
@@ -354,6 +369,12 @@ async function runSessionLifecycleSmoke(params: {
       typeof compactedMessages[0].content === 'string' &&
       compactedMessages[0].content.trim() !== '',
     'manual compaction summary not active'
+  );
+  assertLive(
+    branchStore
+      .getCheckpoints(session.threadId)
+      .some((entry) => entry.data.source === 'reset'),
+    'checkpoint reset entry missing after compact'
   );
   logPass('manual compact', `${compactedMessages.length} active messages`);
 

@@ -1,5 +1,6 @@
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { BaseMessage } from '@langchain/core/messages';
+import type { BaseCheckpointSaver } from '@langchain/langgraph';
 import type * as t from '@/types';
 
 export type JsonPrimitive = string | number | boolean | null;
@@ -19,6 +20,7 @@ export type SessionEntryType =
   | 'message'
   | 'summary'
   | 'compaction'
+  | 'checkpoint'
   | 'label'
   | 'run_event'
   | 'session_state';
@@ -80,6 +82,20 @@ export type SessionCompactionEntry = SessionEntryBase<
   }
 >;
 
+export type SessionCheckpointEntry = SessionEntryBase<
+  'checkpoint',
+  {
+    provider: 'langgraph';
+    source: 'run' | 'resume' | 'reset';
+    threadId: string;
+    runId?: string;
+    checkpointId?: string;
+    checkpointNs?: string;
+    parentCheckpointId?: string;
+    reason?: string;
+  }
+>;
+
 export type SessionLabelEntry = SessionEntryBase<
   'label',
   {
@@ -109,6 +125,7 @@ export type SessionEntry =
   | SessionMessageEntry
   | SessionSummaryEntry
   | SessionCompactionEntry
+  | SessionCheckpointEntry
   | SessionLabelEntry
   | SessionRunEventEntry
   | SessionStateEntry;
@@ -163,6 +180,23 @@ export interface AgentSessionUsage {
   totalTokens: number;
 }
 
+export interface AgentSessionCheckpointReference {
+  provider: 'langgraph';
+  threadId: string;
+  checkpointId?: string;
+  checkpointNs?: string;
+  parentCheckpointId?: string;
+}
+
+export interface AgentSessionCheckpointingOptions {
+  enabled?: boolean;
+  checkpointer?: BaseCheckpointSaver;
+}
+
+export type AgentSessionCheckpointing =
+  | boolean
+  | AgentSessionCheckpointingOptions;
+
 export type AgentSessionInput = string | BaseMessage | BaseMessage[] | t.IState;
 
 export interface AgentSessionRunOptions {
@@ -214,6 +248,7 @@ export type AgentSessionConfig =
       sessionId?: string;
       name?: string;
       ephemeral?: boolean;
+      checkpointing?: AgentSessionCheckpointing;
     }
   | ({
       runId?: string;
@@ -222,6 +257,7 @@ export type AgentSessionConfig =
       sessionId?: string;
       name?: string;
       ephemeral?: boolean;
+      checkpointing?: AgentSessionCheckpointing;
     } & Omit<t.RunConfig, 'runId'>);
 
 export interface CreateSessionFileOptions {

@@ -17,6 +17,7 @@ import type {
   SessionLabelEntry,
   SessionListItem,
   SessionMessageEntry,
+  SessionCheckpointEntry,
   SessionCompactionEntry,
   SessionRunEventEntry,
   SessionSummaryEntry,
@@ -403,6 +404,56 @@ export class JsonlSessionStore {
         summarizedEntryIds: params.summarizedEntryIds,
       },
     });
+  }
+
+  async appendCheckpoint(params: {
+    source: SessionCheckpointEntry['data']['source'];
+    threadId: string;
+    runId?: string;
+    checkpointId?: string;
+    checkpointNs?: string;
+    parentCheckpointId?: string;
+    reason?: string;
+  }): Promise<SessionCheckpointEntry> {
+    return this.appendEntry<SessionCheckpointEntry>({
+      type: 'checkpoint',
+      parentId: this.getLeafEntry()?.id ?? null,
+      data: {
+        provider: 'langgraph',
+        source: params.source,
+        threadId: params.threadId,
+        ...(params.runId != null && params.runId !== ''
+          ? { runId: params.runId }
+          : {}),
+        ...(params.checkpointId != null && params.checkpointId !== ''
+          ? { checkpointId: params.checkpointId }
+          : {}),
+        ...(params.checkpointNs != null
+          ? { checkpointNs: params.checkpointNs }
+          : {}),
+        ...(params.parentCheckpointId != null &&
+        params.parentCheckpointId !== ''
+          ? { parentCheckpointId: params.parentCheckpointId }
+          : {}),
+        ...(params.reason != null && params.reason !== ''
+          ? { reason: params.reason }
+          : {}),
+      },
+    });
+  }
+
+  getCheckpoints(threadId?: string): SessionCheckpointEntry[] {
+    return this.entries.filter(
+      (entry): entry is SessionCheckpointEntry =>
+        entry.type === 'checkpoint' &&
+        (threadId == null || entry.data.threadId === threadId)
+    );
+  }
+
+  getLatestCheckpoint(threadId?: string): SessionCheckpointEntry | undefined {
+    return [...this.getCheckpoints(threadId)]
+      .reverse()
+      .find((entry) => entry.data.source !== 'reset');
   }
 
   async branch(

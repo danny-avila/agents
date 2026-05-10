@@ -279,9 +279,7 @@ export abstract class Graph<
   private _compiledToolNodes: Set<{
     clearDirectPathTurns(): void;
   }> = new Set();
-  public getOrCreateFileCheckpointer():
-    | t.LocalFileCheckpointer
-    | undefined {
+  public getOrCreateFileCheckpointer(): t.LocalFileCheckpointer | undefined {
     // Return the cached instance unconditionally if one exists. The
     // toolExecution check below decides whether to *create* a new
     // one — `clearHeavyState` nulls `this.toolExecution` at end-of-
@@ -301,9 +299,7 @@ export abstract class Graph<
     // cleanup hooks fire). The bundle factory itself accepts a pre-
     // supplied checkpointer when present, so re-injecting this one
     // into every ToolNode is idempotent.
-    const bundle = createLocalCodingToolBundle(
-      this.toolExecution.local ?? {}
-    );
+    const bundle = createLocalCodingToolBundle(this.toolExecution.local ?? {});
     this._fileCheckpointer = bundle.checkpointer;
     return this._fileCheckpointer;
   }
@@ -1663,7 +1659,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     const StateAnnotation = Annotation.Root({
       messages: Annotation<BaseMessage[]>({
         reducer: (a, b) => {
-          if (!a.length) {
+          if (!this.messages.length) {
             this.startIndex = a.length + b.length;
           }
           const result = messagesStateReducer(a, b);

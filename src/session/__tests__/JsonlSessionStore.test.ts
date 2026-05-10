@@ -2,6 +2,7 @@ import { mkdtemp, rm } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { AIMessage, HumanMessage } from '@langchain/core/messages';
+import { MemorySaver } from '@langchain/langgraph';
 import { JsonlSessionStore, createAgentSession } from '@/session';
 import * as providers from '@/llm/providers';
 
@@ -121,6 +122,26 @@ describe('JsonlSessionStore', () => {
     expect(compaction.data.summaryEntryId).toBe(summary.id);
   });
 
+  it('records LangGraph checkpoint references without moving the active leaf', async () => {
+    const store = await JsonlSessionStore.create({
+      path: join(dir, 'checkpoints.jsonl'),
+      cwd: dir,
+    });
+    const message = await store.appendMessage(new HumanMessage('hello'));
+
+    const checkpoint = await store.appendCheckpoint({
+      source: 'run',
+      threadId: store.header.id,
+      runId: 'run_checkpoint',
+      checkpointId: 'checkpoint_1',
+      checkpointNs: '',
+    });
+
+    expect(checkpoint.data.provider).toBe('langgraph');
+    expect(store.getLeafEntry()?.id).toBe(message.id);
+    expect(store.getLatestCheckpoint(store.header.id)?.id).toBe(checkpoint.id);
+  });
+
   it('creates high-level sessions with a JSONL store by default', async () => {
     const session = await createAgentSession({
       cwd: dir,
@@ -137,6 +158,43 @@ describe('JsonlSessionStore', () => {
 
     expect(session.getSessionStore()?.header.cwd).toBe(dir);
     expect(session.sessionPath).toContain('.jsonl');
+  });
+
+  it('shares a session-level LangGraph checkpointer for HITL resume', async () => {
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      humanInTheLoop: { enabled: true },
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+
+    expect(session.getCheckpointer()).toBeInstanceOf(MemorySaver);
+  });
+
+  it('preserves a caller-supplied session checkpointer', async () => {
+    const checkpointer = new MemorySaver();
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      checkpointing: { checkpointer },
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+
+    expect(session.getCheckpointer()).toBe(checkpointer);
   });
 
   it('compacts into a summary plus retained active path', async () => {
