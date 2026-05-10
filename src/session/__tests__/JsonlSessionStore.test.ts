@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { AIMessage, HumanMessage } from '@langchain/core/messages';
@@ -112,6 +112,26 @@ describe('JsonlSessionStore', () => {
     ]);
   });
 
+  it('fails when creating a session file that already exists', async () => {
+    const path = join(dir, 'existing.jsonl');
+    await JsonlSessionStore.create({
+      path,
+      cwd: dir,
+      sessionId: 'session-a',
+    });
+
+    await expect(
+      JsonlSessionStore.create({
+        path,
+        cwd: dir,
+        sessionId: 'session-b',
+      })
+    ).rejects.toMatchObject({ code: 'EEXIST' });
+
+    const raw = await readFile(path, 'utf8');
+    expect(raw.match(/"type":"session"/g)).toHaveLength(1);
+  });
+
   it('branches in place without deleting abandoned children', async () => {
     const store = await JsonlSessionStore.create({
       path: join(dir, 'branch.jsonl'),
@@ -211,6 +231,29 @@ describe('JsonlSessionStore', () => {
 
     expect(session.getSessionStore()?.header.cwd).toBe(dir);
     expect(session.sessionPath).toContain('.jsonl');
+  });
+
+  it('surfaces invalid explicit session files instead of replacing them', async () => {
+    const sessionPath = join(dir, 'invalid.jsonl');
+    await writeFile(sessionPath, 'not jsonl\n', 'utf8');
+
+    await expect(
+      createAgentSession({
+        cwd: dir,
+        sessionPath,
+        runId: 'template-run',
+        graphConfig: {
+          type: 'standard',
+          llmConfig: {
+            provider: 'openAI' as never,
+            model: 'test-model',
+          },
+          instructions: 'test',
+        },
+      })
+    ).rejects.toThrow('Invalid session file');
+
+    expect(await readFile(sessionPath, 'utf8')).toBe('not jsonl\n');
   });
 
   it('preserves non-message state while applying session history', async () => {

@@ -111,6 +111,19 @@ function normalizeConfig(config: AgentSessionConfig): {
   };
 }
 
+function isMissingSessionError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  if (error.message.startsWith('Session not found:')) {
+    return true;
+  }
+  if (!('code' in error)) {
+    return false;
+  }
+  return (error as { code?: string }).code === 'ENOENT';
+}
+
 async function createStore(params: {
   cwd: string;
   sessionPath?: string;
@@ -122,14 +135,19 @@ async function createStore(params: {
     return undefined;
   }
   if (params.sessionPath != null && params.sessionPath !== '') {
-    return JsonlSessionStore.open(params.sessionPath).catch(() =>
-      JsonlSessionStore.create({
+    try {
+      return await JsonlSessionStore.open(params.sessionPath);
+    } catch (error) {
+      if (!isMissingSessionError(error)) {
+        throw error;
+      }
+      return JsonlSessionStore.create({
         path: params.sessionPath,
         cwd: params.cwd,
         name: params.name,
         sessionId: params.sessionId,
-      })
-    );
+      });
+    }
   }
   return JsonlSessionStore.create({
     cwd: params.cwd,

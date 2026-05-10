@@ -7,6 +7,7 @@ import {
   readFile,
   readdir,
   stat,
+  writeFile,
 } from 'fs/promises';
 import type {
   CreateSessionFileOptions,
@@ -128,7 +129,10 @@ export class JsonlSessionStore {
         : createSessionPath({ ...options, sessionId });
     const header = createHeader({ ...options, sessionId });
     await mkdir(dirname(path), { recursive: true });
-    await appendFile(path, `${JSON.stringify(header)}\n`, 'utf8');
+    await writeFile(path, `${JSON.stringify(header)}\n`, {
+      encoding: 'utf8',
+      flag: 'wx',
+    });
     return new JsonlSessionStore({ path, header, entries: [] });
   }
 
