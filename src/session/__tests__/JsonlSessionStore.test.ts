@@ -1,7 +1,11 @@
 import { mkdtemp, readFile, rm, writeFile } from 'fs/promises';
 import { dirname, join } from 'path';
 import { tmpdir } from 'os';
-import { AIMessage, HumanMessage } from '@langchain/core/messages';
+import {
+  AIMessage,
+  HumanMessage,
+  RemoveMessage,
+} from '@langchain/core/messages';
 import { MemorySaver } from '@langchain/langgraph';
 import type { BaseMessage } from '@langchain/core/messages';
 import type { Checkpoint, CheckpointMetadata } from '@langchain/langgraph';
@@ -147,6 +151,25 @@ describe('JsonlSessionStore', () => {
       'hello',
       'hi',
     ]);
+  });
+
+  it('round-trips remove messages in persisted sessions', async () => {
+    const path = join(dir, 'remove.jsonl');
+    const store = await JsonlSessionStore.create({ path, cwd: dir });
+
+    await store.appendMessage(
+      new HumanMessage({ id: 'message-a', content: 'a' })
+    );
+    await store.appendMessage(new RemoveMessage({ id: 'message-a' }));
+
+    const reopened = await JsonlSessionStore.open(path);
+    const messages = reopened.getMessages();
+
+    expect(messages.map((message) => message._getType())).toEqual([
+      'human',
+      'remove',
+    ]);
+    expect((messages[1] as RemoveMessage).id).toBe('message-a');
   });
 
   it('fails when creating a session file that already exists', async () => {

@@ -1,6 +1,7 @@
 import {
   AIMessage,
   HumanMessage,
+  RemoveMessage,
   SystemMessage,
   ToolMessage,
   BaseMessage,
@@ -140,6 +141,14 @@ export function deserializeMessage(
     return new ToolMessage({
       ...common,
       tool_call_id: serialized.toolCallId ?? '',
+    });
+  }
+  if (serialized.messageType === 'remove') {
+    return new RemoveMessage({
+      additional_kwargs: serialized.additionalKwargs,
+      response_metadata: serialized.responseMetadata,
+      id: serialized.id ?? '',
+      name: serialized.name,
     });
   }
   return new HumanMessage(common);
