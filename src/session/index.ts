@@ -8,6 +8,8 @@ export {
 } from './messageSerialization';
 export type {
   AgentSessionConfig,
+  AgentSessionCheckpointing,
+  AgentSessionCheckpointingOptions,
   AgentSessionHandlersResult,
   AgentSessionInput,
   AgentSessionRunOptions,
