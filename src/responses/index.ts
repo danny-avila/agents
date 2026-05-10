@@ -1,4 +1,5 @@
 import { GraphEvents } from '@/common';
+import type { UsageMetadata } from '@langchain/core/messages';
 import type * as t from '@/types';
 
 export interface ResponsesCompatibleWriter {
@@ -118,6 +119,10 @@ export function createResponseTracker(): ResponseTracker {
     nextSequence: () => tracker.sequenceNumber++,
   };
   return tracker;
+}
+
+function getTokenCount(value: number | null | undefined): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
 }
 
 export function buildResponse(
@@ -260,12 +265,14 @@ export function createResponsesEventHandlers(
     },
     [GraphEvents.CHAT_MODEL_END]: {
       handle: (_event, data): void => {
-        const usage = (data as t.ModelEndData)?.output?.usage_metadata;
+        const usage = (data as t.ModelEndData)?.output?.usage_metadata as
+          | Partial<UsageMetadata>
+          | undefined;
         if (!usage) {
           return;
         }
-        config.tracker.usage.inputTokens += usage.input_tokens;
-        config.tracker.usage.outputTokens += usage.output_tokens;
+        config.tracker.usage.inputTokens += getTokenCount(usage.input_tokens);
+        config.tracker.usage.outputTokens += getTokenCount(usage.output_tokens);
       },
     },
   };

@@ -52,4 +52,38 @@ describe('Responses-compatible adapters', () => {
       total_tokens: 9,
     });
   });
+
+  it('tracks partial usage metadata without NaN totals', async () => {
+    const tracker = createResponseTracker();
+    const handlers = createResponsesEventHandlers({
+      writer: { write: jest.fn() },
+      context: { responseId: 'resp_usage', model: 'agent', createdAt: 1 },
+      tracker,
+    });
+
+    await handlers[GraphEvents.CHAT_MODEL_END].handle(
+      GraphEvents.CHAT_MODEL_END,
+      {
+        output: { usage_metadata: { input_tokens: 2 } },
+      } as t.ModelEndData
+    );
+    await handlers[GraphEvents.CHAT_MODEL_END].handle(
+      GraphEvents.CHAT_MODEL_END,
+      {
+        output: { usage_metadata: { output_tokens: 4 } },
+      } as t.ModelEndData
+    );
+
+    expect(
+      buildResponse(
+        { responseId: 'resp_usage', model: 'agent', createdAt: 1 },
+        tracker,
+        'completed'
+      ).usage
+    ).toEqual({
+      input_tokens: 2,
+      output_tokens: 4,
+      total_tokens: 6,
+    });
+  });
 });
