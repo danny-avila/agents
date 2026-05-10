@@ -85,4 +85,31 @@ describe('createRunHandlers', () => {
 
     expect(calls).toEqual(['adapter', 'host']);
   });
+
+  it('accumulates partial usage metadata without corrupting totals', async () => {
+    jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const handlerResult = createRunHandlers({
+      runId: 'run_usage',
+      threadId: 'thread_usage',
+    });
+
+    await handlerResult.handlers[GraphEvents.CHAT_MODEL_END].handle(
+      GraphEvents.CHAT_MODEL_END,
+      {
+        output: { usage_metadata: { input_tokens: 4 } },
+      } as t.ModelEndData
+    );
+    await handlerResult.handlers[GraphEvents.CHAT_MODEL_END].handle(
+      GraphEvents.CHAT_MODEL_END,
+      {
+        output: { usage_metadata: { output_tokens: 6 } },
+      } as t.ModelEndData
+    );
+
+    expect(handlerResult.usage).toEqual({
+      inputTokens: 4,
+      outputTokens: 6,
+      totalTokens: 10,
+    });
+  });
 });

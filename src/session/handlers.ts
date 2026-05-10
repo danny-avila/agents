@@ -1,3 +1,4 @@
+import type { UsageMetadata } from '@langchain/core/messages';
 import { GraphEvents } from '@/common';
 import { ModelEndHandler, ToolEndHandler } from '@/events';
 import { ChatModelStreamHandler, createContentAggregator } from '@/stream';
@@ -28,16 +29,26 @@ function createEventFactory(params: {
   });
 }
 
+function getTokenCount(value: number | null | undefined): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+}
+
 function updateUsage(usage: AgentSessionUsage, data: t.ModelEndData): void {
-  const metadata = data?.output?.usage_metadata;
+  const metadata = data?.output?.usage_metadata as
+    | Partial<UsageMetadata>
+    | undefined;
   if (!metadata) {
     return;
   }
-  const inputTokens = metadata.input_tokens;
-  const outputTokens = metadata.output_tokens;
+  const inputTokens = getTokenCount(metadata.input_tokens);
+  const outputTokens = getTokenCount(metadata.output_tokens);
+  const totalTokens =
+    metadata.total_tokens == null
+      ? inputTokens + outputTokens
+      : getTokenCount(metadata.total_tokens);
   usage.inputTokens += inputTokens;
   usage.outputTokens += outputTokens;
-  usage.totalTokens += inputTokens + outputTokens;
+  usage.totalTokens += totalTokens;
 }
 
 async function callUserHandler(params: {
