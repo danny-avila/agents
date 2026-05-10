@@ -8,6 +8,7 @@ export {
 } from './messageSerialization';
 export type {
   AgentSessionConfig,
+  AgentSessionCheckpointLookupOptions,
   AgentSessionCheckpointReference,
   AgentSessionCheckpointing,
   AgentSessionCheckpointingOptions,
