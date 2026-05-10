@@ -1,5 +1,6 @@
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { BaseMessage } from '@langchain/core/messages';
+import type { BaseCheckpointSaver } from '@langchain/langgraph';
 import type * as t from '@/types';
 
 export type JsonPrimitive = string | number | boolean | null;
@@ -163,6 +164,15 @@ export interface AgentSessionUsage {
   totalTokens: number;
 }
 
+export interface AgentSessionCheckpointingOptions {
+  enabled?: boolean;
+  checkpointer?: BaseCheckpointSaver;
+}
+
+export type AgentSessionCheckpointing =
+  | boolean
+  | AgentSessionCheckpointingOptions;
+
 export type AgentSessionInput = string | BaseMessage | BaseMessage[] | t.IState;
 
 export interface AgentSessionRunOptions {
@@ -214,6 +224,7 @@ export type AgentSessionConfig =
       sessionId?: string;
       name?: string;
       ephemeral?: boolean;
+      checkpointing?: AgentSessionCheckpointing;
     }
   | ({
       runId?: string;
@@ -222,6 +233,7 @@ export type AgentSessionConfig =
       sessionId?: string;
       name?: string;
       ephemeral?: boolean;
+      checkpointing?: AgentSessionCheckpointing;
     } & Omit<t.RunConfig, 'runId'>);
 
 export interface CreateSessionFileOptions {

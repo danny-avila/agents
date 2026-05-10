@@ -2,6 +2,7 @@ import { mkdtemp, rm } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { AIMessage, HumanMessage } from '@langchain/core/messages';
+import { MemorySaver } from '@langchain/langgraph';
 import { JsonlSessionStore, createAgentSession } from '@/session';
 import { toJsonValue } from '@/session/messageSerialization';
 import * as providers from '@/llm/providers';
@@ -51,6 +52,15 @@ function mockRunCreate(mockRun: MockRun): t.RunConfig[] {
     return mockRun as unknown as Run<T>;
   }) as never);
   return capturedConfigs;
+}
+
+function getProcessedState(mockRun: MockRun): t.IState {
+  expect(mockRun.processStream).toHaveBeenCalled();
+  const input = mockRun.processStream.mock.calls[0][0];
+  if (!('messages' in input)) {
+    throw new Error('Expected processStream to receive message state');
+  }
+  return input;
 }
 
 function mockSummarizer(response: string): void {
@@ -201,6 +211,68 @@ describe('JsonlSessionStore', () => {
 
     expect(session.getSessionStore()?.header.cwd).toBe(dir);
     expect(session.sessionPath).toContain('.jsonl');
+  });
+
+  it('preserves non-message state while applying session history', async () => {
+    const mockRun = createMockRun('stateful output');
+    mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    await session.getSessionStore()?.appendMessage(new HumanMessage('history'));
+    const input: t.IState & { selectedAgent: string } = {
+      messages: [new HumanMessage('fresh')],
+      selectedAgent: 'subagent-a',
+    };
+
+    await session.run(input);
+
+    const processedState = getProcessedState(mockRun) as t.IState & {
+      selectedAgent?: string;
+    };
+    expect(processedState.selectedAgent).toBe('subagent-a');
+    expect(processedState.messages.map((message) => message.content)).toEqual([
+      'history',
+      'fresh',
+    ]);
+  });
+
+  it('reuses a session-level checkpointer for HITL resume', async () => {
+    const mockRun = createMockRun('resumed');
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      humanInTheLoop: { enabled: true },
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+
+    await session.run('start');
+    await session.resumeInterrupt([]);
+
+    const checkpointer =
+      capturedConfigs[0].graphConfig.compileOptions?.checkpointer;
+    expect(checkpointer).toBeInstanceOf(MemorySaver);
+    expect(session.getCheckpointer()).toBe(checkpointer);
+    expect(capturedConfigs[1].graphConfig.compileOptions?.checkpointer).toBe(
+      checkpointer
+    );
   });
 
   it('compacts into a summary plus retained active path', async () => {
