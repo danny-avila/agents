@@ -301,6 +301,21 @@ function isMessageEntry(
   return entry.type === 'message';
 }
 
+function getSessionBranchTarget(
+  store: JsonlSessionStore,
+  entryId: string,
+  position: 'before' | 'at'
+): SessionEntry | undefined {
+  const entry = store.getEntry(entryId);
+  if (!entry) {
+    throw new Error(`Entry not found: ${entryId}`);
+  }
+  if (position === 'at') {
+    return entry;
+  }
+  return entry.parentId == null ? undefined : store.getEntry(entry.parentId);
+}
+
 function createAgentInputFromGraphConfig(
   graphConfig: t.RunConfig['graphConfig'],
   initialSummary: InitialSummary | undefined,
@@ -784,21 +799,39 @@ export class AgentSession {
     entryId: string,
     options: SessionBranchOptions = {}
   ): Promise<void> {
-    if (!this.store) {
+    const store = this.store;
+    if (!store) {
       throw new Error('Cannot branch an ephemeral session');
     }
+    const target = getSessionBranchTarget(
+      store,
+      entryId,
+      options.position ?? 'at'
+    );
+    let leafId = target?.id ?? null;
     const summarizeAbandoned = options.summarizeAbandoned;
     if (summarizeAbandoned !== undefined && summarizeAbandoned !== false) {
       const instructions =
         typeof summarizeAbandoned === 'object'
           ? summarizeAbandoned.instructions
           : undefined;
-      await this.compact({ instructions, retainRecentTurns: 0 });
+      const summary = await this.compactActivePath(
+        { instructions, retainRecentTurns: 0 },
+        leafId
+      );
+      leafId = summary?.id ?? leafId;
     }
-    await this.store.branch(entryId, options);
+    await store.setLeaf(leafId);
   }
 
   async compact(options: SessionCompactOptions = {}): Promise<void> {
+    await this.compactActivePath(options, null);
+  }
+
+  private async compactActivePath(
+    options: SessionCompactOptions = {},
+    parentId: string | null
+  ): Promise<Extract<SessionEntry, { type: 'summary' }> | undefined> {
     const store = this.store;
     if (!store) {
       throw new Error('Cannot compact an ephemeral session');
@@ -807,7 +840,7 @@ export class AgentSession {
     const sessionState = createSessionRunState(activePath);
     const messageEntries = activePath.filter(isMessageEntry);
     if (sessionState.messages.length === 0) {
-      return;
+      return undefined;
     }
     const compactRunId = createRunId();
     const agentContext = AgentContext.fromConfig(
@@ -851,7 +884,7 @@ export class AgentSession {
       summaryText = contextSummaryText;
     }
     if (summaryText === '') {
-      return;
+      return undefined;
     }
     const retainedMessages = filterRemoveMessages(
       summarizedState.messages ?? []
@@ -871,18 +904,22 @@ export class AgentSession {
       retainedEntryIds,
       summarizedEntryIds: summarized.map((entry) => entry.id),
       instructions: options.instructions,
-      parentId: null,
+      parentId,
     });
-    let parentId: string | null = summary.id;
+    let retainedParentId: string | null = summary.id;
     for (const message of retainedMessages) {
-      const retainedMessage = await store.appendMessage(message, parentId);
-      parentId = retainedMessage.id;
+      const retainedMessage = await store.appendMessage(
+        message,
+        retainedParentId
+      );
+      retainedParentId = retainedMessage.id;
     }
     await store.appendCompactionEntry({
       summaryEntryId: summary.id,
       retainedEntryIds,
       summarizedEntryIds: summarized.map((entry) => entry.id),
     });
+    return summary;
   }
 
   async resumeInterrupt<TResume>(

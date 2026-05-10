@@ -384,17 +384,20 @@ describe('JsonlSessionStore', () => {
       },
     });
 
-    expect(store?.getLeafEntry()?.id).toBe(first?.id);
-    expect(
-      store
-        ?.getEntries()
-        .some(
-          (entry) =>
-            entry.type === 'summary' &&
-            entry.data.text === 'summary of abandoned branch' &&
-            entry.data.instructions === 'summarize abandoned branch'
-        )
-    ).toBe(true);
+    const activePath = store?.getPath();
+    const summary = activePath?.at(-1);
+    expect(activePath?.map((entry) => entry.id)).toEqual([
+      first?.id,
+      summary?.id,
+    ]);
+    expect(summary).toMatchObject({
+      type: 'summary',
+      parentId: first?.id,
+      data: {
+        text: 'summary of abandoned branch',
+        instructions: 'summarize abandoned branch',
+      },
+    });
     expect(
       store?.getEntries().some((entry) => entry.type === 'compaction')
     ).toBe(true);
