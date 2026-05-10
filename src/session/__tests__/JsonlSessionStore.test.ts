@@ -3,7 +3,55 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { AIMessage, HumanMessage } from '@langchain/core/messages';
 import { JsonlSessionStore, createAgentSession } from '@/session';
+import { toJsonValue } from '@/session/messageSerialization';
 import * as providers from '@/llm/providers';
+import type * as t from '@/types';
+import { Run } from '@/run';
+
+type MockRun = {
+  processStream: jest.MockedFunction<Run<t.IState>['processStream']>;
+  resume: jest.MockedFunction<Run<t.IState>['resume']>;
+  getRunMessages: jest.MockedFunction<Run<t.IState>['getRunMessages']>;
+  getCalibrationRatio: jest.MockedFunction<
+    Run<t.IState>['getCalibrationRatio']
+  >;
+  getInterrupt: jest.MockedFunction<Run<t.IState>['getInterrupt']>;
+  getHaltReason: jest.MockedFunction<Run<t.IState>['getHaltReason']>;
+};
+
+function createMockRun(outputText = 'ok'): MockRun {
+  return {
+    processStream: jest
+      .fn<
+        ReturnType<Run<t.IState>['processStream']>,
+        Parameters<Run<t.IState>['processStream']>
+      >()
+      .mockResolvedValue([{ type: 'text', text: outputText }]),
+    resume: jest
+      .fn<
+        ReturnType<Run<t.IState>['resume']>,
+        Parameters<Run<t.IState>['resume']>
+      >()
+      .mockResolvedValue([{ type: 'text', text: outputText }]),
+    getRunMessages: jest.fn(() => [new AIMessage(outputText)]),
+    getCalibrationRatio: jest.fn(() => 1),
+    getInterrupt: jest.fn(() => undefined),
+    getHaltReason: jest.fn(() => undefined),
+  };
+}
+
+function mockRunCreate(mockRun: MockRun): t.RunConfig[] {
+  const capturedConfigs: t.RunConfig[] = [];
+  jest.spyOn(Run, 'create').mockImplementation((async <
+    T extends t.BaseGraphState,
+  >(
+    config: t.RunConfig
+  ): Promise<Run<T>> => {
+    capturedConfigs.push(config);
+    return mockRun as unknown as Run<T>;
+  }) as never);
+  return capturedConfigs;
+}
 
 function mockSummarizer(response: string): void {
   jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
@@ -121,6 +169,22 @@ describe('JsonlSessionStore', () => {
     expect(compaction.data.summaryEntryId).toBe(summary.id);
   });
 
+  it('preserves Error details in JSONL payloads', () => {
+    const error = new Error('resume failed');
+    const payload = toJsonValue(error);
+
+    expect(payload).toMatchObject({
+      name: 'Error',
+      message: 'resume failed',
+    });
+    expect(
+      typeof payload === 'object' &&
+        payload != null &&
+        !Array.isArray(payload) &&
+        typeof payload.stack === 'string'
+    ).toBe(true);
+  });
+
   it('creates high-level sessions with a JSONL store by default', async () => {
     const session = await createAgentSession({
       cwd: dir,
@@ -167,6 +231,60 @@ describe('JsonlSessionStore', () => {
       'summary of old work',
       'recent',
     ]);
+  });
+
+  it('records no retained ids when compaction retains zero messages', async () => {
+    mockSummarizer('summary of everything');
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    const store = session.getSessionStore();
+    const user = await store?.appendMessage(new HumanMessage('old'));
+    const assistant = await store?.appendMessage(new AIMessage('old answer'));
+
+    await session.compact({ retainRecentTurns: 0 });
+
+    const summary = store
+      ?.getEntries()
+      .find((entry) => entry.type === 'summary');
+    const compaction = store
+      ?.getEntries()
+      .find((entry) => entry.type === 'compaction');
+    expect(summary?.data.retainedEntryIds).toEqual([]);
+    expect(summary?.data.summarizedEntryIds).toEqual([user?.id, assistant?.id]);
+    expect(compaction?.data.retainedEntryIds).toEqual([]);
+  });
+
+  it('carries calibration ratio forward after resumeInterrupt', async () => {
+    const mockRun = createMockRun('resumed');
+    mockRun.getCalibrationRatio.mockReturnValue(2);
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+
+    await session.resumeInterrupt([]);
+    await session.run('after resume');
+
+    expect(capturedConfigs[1].calibrationRatio).toBe(2);
   });
 
   it('summarizes an abandoned branch before switching in place', async () => {
