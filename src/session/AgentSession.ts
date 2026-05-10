@@ -757,17 +757,27 @@ export class AgentSession {
     });
   }
 
-  private async resetCheckpointThread(reason: string): Promise<void> {
+  private getCheckpointThreadIds(): string[] {
+    const threadIds = new Set<string>([this.threadId]);
+    for (const checkpoint of this.store?.getCheckpoints() ?? []) {
+      threadIds.add(checkpoint.data.threadId);
+    }
+    return [...threadIds];
+  }
+
+  private async resetCheckpointThreads(reason: string): Promise<void> {
     const checkpointer = this.checkpointing.checkpointer;
     if (!this.checkpointing.enabled || checkpointer == null) {
       return;
     }
-    await checkpointer.deleteThread(this.threadId);
-    await this.store?.appendCheckpoint({
-      source: 'reset',
-      threadId: this.threadId,
-      reason,
-    });
+    for (const threadId of this.getCheckpointThreadIds()) {
+      await checkpointer.deleteThread(threadId);
+      await this.store?.appendCheckpoint({
+        source: 'reset',
+        threadId,
+        reason,
+      });
+    }
   }
 
   private async runInternal(
@@ -1007,13 +1017,13 @@ export class AgentSession {
       leafId = summary?.id ?? leafId;
     }
     await store.setLeaf(leafId);
-    await this.resetCheckpointThread('branch');
+    await this.resetCheckpointThreads('branch');
   }
 
   async compact(options: SessionCompactOptions = {}): Promise<void> {
     const summary = await this.compactActivePath(options, null);
     if (summary) {
-      await this.resetCheckpointThread('compact');
+      await this.resetCheckpointThreads('compact');
     }
   }
 

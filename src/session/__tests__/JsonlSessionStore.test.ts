@@ -536,6 +536,48 @@ describe('JsonlSessionStore', () => {
     });
   });
 
+  it('resets overridden thread checkpoints when branching changes the active path', async () => {
+    const checkpointer = new MemorySaver();
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      checkpointing: { checkpointer },
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    const store = session.getSessionStore();
+    const first = await store?.appendMessage(new HumanMessage('first'));
+    await store?.appendMessage(new AIMessage('second'));
+    await putCheckpoint({
+      checkpointer,
+      threadId: 'thread_override',
+      id: 'checkpoint_override',
+    });
+    await store?.appendCheckpoint({
+      source: 'run',
+      threadId: 'thread_override',
+      runId: 'run_override',
+      checkpointId: 'checkpoint_override',
+    });
+
+    await session.branch(first?.id ?? '', { position: 'at' });
+
+    const tuple = await checkpointer.getTuple({
+      configurable: { thread_id: 'thread_override' },
+    });
+    const reset = store
+      ?.getCheckpoints('thread_override')
+      .find((checkpoint) => checkpoint.data.source === 'reset');
+    expect(tuple).toBeUndefined();
+    expect(reset?.data.reason).toBe('branch');
+  });
+
   it('records run.failed when resumeInterrupt throws', async () => {
     const mockRun = createMockRun('unused');
     mockRun.resume.mockRejectedValue(new Error('resume failed'));
