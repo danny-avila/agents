@@ -87,6 +87,7 @@ export interface ResponseTracker {
   items: ResponseOutputItem[];
   message: ResponseMessageItem | undefined;
   reasoning: ResponseReasoningItem | undefined;
+  functionCalls: Map<string, ResponseFunctionCallItem>;
   usage: {
     inputTokens: number;
     outputTokens: number;
@@ -112,6 +113,7 @@ export function createResponseTracker(): ResponseTracker {
     items: [],
     message: undefined,
     reasoning: undefined,
+    functionCalls: new Map(),
     usage: {
       inputTokens: 0,
       outputTokens: 0,
@@ -123,6 +125,149 @@ export function createResponseTracker(): ResponseTracker {
 
 function getTokenCount(value: number | null | undefined): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+}
+
+interface ResponseToolCallFragment {
+  index?: number;
+  id?: string;
+  name?: string;
+  args?: string | object;
+  function?: {
+    name?: string;
+    arguments?: string | object;
+  };
+}
+
+function getToolCallIndex(
+  toolCall: ResponseToolCallFragment,
+  fallbackIndex: number
+): number {
+  return typeof toolCall.index === 'number' ? toolCall.index : fallbackIndex;
+}
+
+function getToolCallKey(
+  stepId: string,
+  toolCall: ResponseToolCallFragment,
+  fallbackIndex: number
+): string {
+  if (toolCall.id != null && toolCall.id !== '') {
+    return toolCall.id;
+  }
+  return `${stepId}:${getToolCallIndex(toolCall, fallbackIndex)}`;
+}
+
+function getToolCallName(toolCall: ResponseToolCallFragment): string {
+  return toolCall.name ?? toolCall.function?.name ?? '';
+}
+
+function getToolCallArguments(toolCall: ResponseToolCallFragment): string {
+  const args = toolCall.args ?? toolCall.function?.arguments;
+  if (args == null) {
+    return '';
+  }
+  if (typeof args === 'string') {
+    return args;
+  }
+  return JSON.stringify(args);
+}
+
+async function ensureFunctionCall(
+  config: ResponsesHandlerConfig,
+  stepId: string,
+  toolCall: ResponseToolCallFragment,
+  fallbackIndex: number
+): Promise<ResponseFunctionCallItem> {
+  const key = getToolCallKey(stepId, toolCall, fallbackIndex);
+  const existing = config.tracker.functionCalls.get(key);
+  const name = getToolCallName(toolCall);
+  if (existing) {
+    if (name !== '') {
+      existing.name = name;
+    }
+    return existing;
+  }
+  const item: ResponseFunctionCallItem = {
+    type: 'function_call',
+    id: createItemId('fc'),
+    call_id: toolCall.id ?? key,
+    name,
+    arguments: '',
+    status: 'in_progress',
+  };
+  config.tracker.functionCalls.set(key, item);
+  config.tracker.items.push(item);
+  await writeResponseEvent(config.writer, {
+    type: 'response.output_item.added',
+    sequence_number: config.tracker.nextSequence(),
+    output_index: config.tracker.items.length - 1,
+    item,
+  });
+  return item;
+}
+
+async function emitFunctionCallArgumentsDelta(params: {
+  config: ResponsesHandlerConfig;
+  item: ResponseFunctionCallItem;
+  delta: string;
+}): Promise<void> {
+  if (params.delta === '') {
+    return;
+  }
+  params.item.arguments += params.delta;
+  await writeResponseEvent(params.config.writer, {
+    type: 'response.function_call_arguments.delta',
+    sequence_number: params.config.tracker.nextSequence(),
+    item_id: params.item.id,
+    output_index: params.config.tracker.items.indexOf(params.item),
+    call_id: params.item.call_id,
+    delta: params.delta,
+  });
+}
+
+async function completeFunctionCall(
+  config: ResponsesHandlerConfig,
+  stepId: string,
+  toolCall: ResponseToolCallFragment,
+  fallbackIndex: number
+): Promise<void> {
+  const item = await ensureFunctionCall(
+    config,
+    stepId,
+    toolCall,
+    fallbackIndex
+  );
+  if (item.status === 'completed') {
+    return;
+  }
+  const finalArguments = getToolCallArguments(toolCall);
+  if (
+    finalArguments !== '' &&
+    finalArguments !== item.arguments &&
+    finalArguments.startsWith(item.arguments)
+  ) {
+    await emitFunctionCallArgumentsDelta({
+      config,
+      item,
+      delta: finalArguments.slice(item.arguments.length),
+    });
+  } else if (finalArguments !== '') {
+    item.arguments = finalArguments;
+  }
+  await writeResponseEvent(config.writer, {
+    type: 'response.function_call_arguments.done',
+    sequence_number: config.tracker.nextSequence(),
+    item_id: item.id,
+    output_index: config.tracker.items.indexOf(item),
+    call_id: item.call_id,
+    arguments: item.arguments,
+  });
+  item.status = 'completed';
+  await writeResponseEvent(config.writer, {
+    type: 'response.output_item.done',
+    sequence_number: config.tracker.nextSequence(),
+    output_index: config.tracker.items.indexOf(item),
+    item,
+  });
 }
 
 export function buildResponse(
@@ -263,6 +408,60 @@ export function createResponsesEventHandlers(
         }
       },
     },
+    [GraphEvents.ON_RUN_STEP]: {
+      handle: async (_event, data): Promise<void> => {
+        const runStep = data as t.RunStep;
+        if (runStep.stepDetails.type !== 'tool_calls') {
+          return;
+        }
+        const toolCalls = runStep.stepDetails.tool_calls ?? [];
+        for (let index = 0; index < toolCalls.length; index++) {
+          await ensureFunctionCall(config, runStep.id, toolCalls[index], index);
+        }
+      },
+    },
+    [GraphEvents.ON_RUN_STEP_DELTA]: {
+      handle: async (_event, data): Promise<void> => {
+        const runStepDelta = data as t.RunStepDeltaEvent;
+        if (runStepDelta.delta.type !== 'tool_calls') {
+          return;
+        }
+        const toolCalls = runStepDelta.delta.tool_calls ?? [];
+        for (let index = 0; index < toolCalls.length; index++) {
+          const item = await ensureFunctionCall(
+            config,
+            runStepDelta.id,
+            toolCalls[index],
+            index
+          );
+          await emitFunctionCallArgumentsDelta({
+            config,
+            item,
+            delta: getToolCallArguments(toolCalls[index]),
+          });
+        }
+      },
+    },
+    [GraphEvents.ON_RUN_STEP_COMPLETED]: {
+      handle: async (_event, data): Promise<void> => {
+        const completed = data as {
+          result?: {
+            id?: string;
+            type?: string;
+            tool_call?: ResponseToolCallFragment;
+          };
+        };
+        if (!completed.result?.tool_call) {
+          return;
+        }
+        await completeFunctionCall(
+          config,
+          completed.result.id ?? '',
+          completed.result.tool_call,
+          0
+        );
+      },
+    },
     [GraphEvents.CHAT_MODEL_END]: {
       handle: (_event, data): void => {
         const usage = (data as t.ModelEndData)?.output?.usage_metadata as
@@ -286,6 +485,9 @@ export async function emitResponseCompleted(
   }
   if (config.tracker.reasoning) {
     config.tracker.reasoning.status = 'completed';
+  }
+  for (const item of config.tracker.functionCalls.values()) {
+    item.status = 'completed';
   }
   await writeResponseEvent(config.writer, {
     type: 'response.completed',

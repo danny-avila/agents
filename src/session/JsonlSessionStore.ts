@@ -1,4 +1,5 @@
 import { homedir } from 'os';
+import { createHash } from 'crypto';
 import { basename, dirname, isAbsolute, join, resolve } from 'path';
 import {
   access,
@@ -44,7 +45,7 @@ const DEFAULT_SESSION_ROOT = join(
 
 function sanitizeCwd(cwd: string): string {
   const normalized = resolve(cwd);
-  return `--${normalized.replace(/[^a-zA-Z0-9._-]/g, '-')}`;
+  return createHash('sha256').update(normalized).digest('hex');
 }
 
 function createSessionPath(options: CreateSessionFileOptions): string {

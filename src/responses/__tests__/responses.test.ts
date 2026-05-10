@@ -86,4 +86,83 @@ describe('Responses-compatible adapters', () => {
       total_tokens: 6,
     });
   });
+
+  it('streams function call items and argument events', async () => {
+    const writes: string[] = [];
+    const tracker = createResponseTracker();
+    const handlers = createResponsesEventHandlers({
+      writer: { write: (data) => void writes.push(data) },
+      context: { responseId: 'resp_tools', model: 'agent', createdAt: 1 },
+      tracker,
+    });
+
+    await handlers[GraphEvents.ON_RUN_STEP_DELTA].handle(
+      GraphEvents.ON_RUN_STEP_DELTA,
+      {
+        id: 'step_1',
+        delta: {
+          type: 'tool_calls',
+          tool_calls: [
+            {
+              index: 0,
+              id: 'call_1',
+              name: 'search',
+              args: '{"query"',
+            },
+          ],
+        },
+      } as t.RunStepDeltaEvent
+    );
+    await handlers[GraphEvents.ON_RUN_STEP_DELTA].handle(
+      GraphEvents.ON_RUN_STEP_DELTA,
+      {
+        id: 'step_1',
+        delta: {
+          type: 'tool_calls',
+          tool_calls: [
+            {
+              index: 0,
+              id: 'call_1',
+              args: ':"sessions"}',
+            },
+          ],
+        },
+      } as t.RunStepDeltaEvent
+    );
+    await handlers[GraphEvents.ON_RUN_STEP_COMPLETED].handle(
+      GraphEvents.ON_RUN_STEP_COMPLETED,
+      {
+        result: {
+          id: 'step_1',
+          index: 0,
+          type: 'tool_call',
+          tool_call: {
+            id: 'call_1',
+            name: 'search',
+            args: '{"query":"sessions"}',
+            output: 'ok',
+            progress: 1,
+          },
+        },
+      }
+    );
+
+    const events = writes
+      .filter((data) => data.startsWith('data: '))
+      .map((data) => JSON.parse(data.slice(6)) as { type: string });
+    expect(events.map((event) => event.type)).toEqual([
+      'response.output_item.added',
+      'response.function_call_arguments.delta',
+      'response.function_call_arguments.delta',
+      'response.function_call_arguments.done',
+      'response.output_item.done',
+    ]);
+    expect(tracker.items[0]).toMatchObject({
+      type: 'function_call',
+      call_id: 'call_1',
+      name: 'search',
+      arguments: '{"query":"sessions"}',
+      status: 'completed',
+    });
+  });
 });
