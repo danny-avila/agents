@@ -43,6 +43,41 @@ describe('OpenAI-compatible adapters', () => {
     expect(writes.at(-1)).toBe('data: [DONE]\n\n');
   });
 
+  it('uses tool_calls finish reason after streaming tool deltas', async () => {
+    const writes: string[] = [];
+    const tracker = createOpenAIStreamTracker();
+    const handlers = createOpenAIHandlers({
+      writer: { write: (data) => void writes.push(data) },
+      context: { requestId: 'chatcmpl_tools', model: 'agent', created: 1 },
+      tracker,
+    });
+
+    await handlers[GraphEvents.ON_RUN_STEP_DELTA].handle(
+      GraphEvents.ON_RUN_STEP_DELTA,
+      {
+        id: 'step_1',
+        delta: {
+          type: 'tool_calls',
+          tool_calls: [
+            {
+              index: 0,
+              id: 'call_1',
+              name: 'search',
+              args: '{"query":"sessions"}',
+            },
+          ],
+        },
+      } as t.RunStepDeltaEvent
+    );
+    await sendOpenAIFinalChunk({
+      writer: { write: (data) => void writes.push(data) },
+      context: { requestId: 'chatcmpl_tools', model: 'agent', created: 1 },
+      tracker,
+    });
+
+    expect(writes.at(-2)).toContain('"finish_reason":"tool_calls"');
+  });
+
   it('tracks partial usage metadata without NaN totals', async () => {
     const tracker = createOpenAIStreamTracker();
     const handlers = createOpenAIHandlers({

@@ -373,6 +373,34 @@ describe('JsonlSessionStore', () => {
     expect(await readFile(sessionPath, 'utf8')).toBe('not jsonl\n');
   });
 
+  it('creates an explicit session path without fuzzy matching existing sessions', async () => {
+    const existing = await JsonlSessionStore.create({
+      path: join(dir, 'matching-existing.jsonl'),
+      cwd: dir,
+      sessionId: 'explicit-target-existing',
+    });
+    await existing.appendMessage(new HumanMessage('existing history'));
+    const sessionPath = join(dir, 'explicit-target.jsonl');
+
+    const session = await createAgentSession({
+      cwd: dir,
+      sessionPath,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+
+    expect(session.sessionPath).toBe(sessionPath);
+    expect(session.getSessionStore()?.header.id).not.toBe(existing.header.id);
+    expect(session.getSessionStore()?.getMessages()).toEqual([]);
+  });
+
   it('preserves non-message state while applying session history', async () => {
     const mockRun = createMockRun('stateful output');
     mockRunCreate(mockRun);

@@ -167,12 +167,28 @@ export function createOpenAIHandlers(
           return;
         }
         for (const toolCall of delta.tool_calls ?? []) {
+          const index = toolCall.index ?? 0;
+          const current = config.tracker.toolCalls.get(index) ?? {
+            id: toolCall.id ?? '',
+            type: 'function' as const,
+            function: { name: '', arguments: '' },
+          };
+          if (toolCall.id != null && toolCall.id !== '') {
+            current.id = toolCall.id;
+          }
+          if (toolCall.name != null && toolCall.name !== '') {
+            current.function.name = toolCall.name;
+          }
+          if (toolCall.args != null && toolCall.args !== '') {
+            current.function.arguments += toolCall.args;
+          }
+          config.tracker.toolCalls.set(index, current);
           await writeOpenAISSE(
             config.writer,
             createChatCompletionChunk(config.context, {
               tool_calls: [
                 {
-                  index: toolCall.index ?? 0,
+                  index,
                   ...(toolCall.id != null && toolCall.id !== ''
                     ? { id: toolCall.id }
                     : {}),
@@ -211,8 +227,10 @@ export function createOpenAIHandlers(
 
 export async function sendOpenAIFinalChunk(
   config: OpenAIHandlerConfig,
-  finishReason: OpenAIChatCompletionChunkChoice['finish_reason'] = 'stop'
+  finishReason?: OpenAIChatCompletionChunkChoice['finish_reason']
 ): Promise<void> {
+  const resolvedFinishReason =
+    finishReason ?? (config.tracker.toolCalls.size > 0 ? 'tool_calls' : 'stop');
   const usage: OpenAICompletionUsage = {
     prompt_tokens: config.tracker.usage.promptTokens,
     completion_tokens: config.tracker.usage.completionTokens,
@@ -226,7 +244,7 @@ export async function sendOpenAIFinalChunk(
   }
   await writeOpenAISSE(
     config.writer,
-    createChatCompletionChunk(config.context, {}, finishReason, usage)
+    createChatCompletionChunk(config.context, {}, resolvedFinishReason, usage)
   );
   await writeOpenAISSE(config.writer, '[DONE]');
 }
