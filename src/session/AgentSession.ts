@@ -280,26 +280,72 @@ function getConfigString(
   return typeof value === 'string' && value !== '' ? value : undefined;
 }
 
+function createCallerConfig(
+  threadId: string,
+  options: AgentSessionRunOptions
+): RunnableConfig & { version: 'v1' | 'v2' } {
+  return {
+    recursionLimit: 50,
+    ...(options.config ?? {}),
+    configurable: {
+      ...(options.config?.configurable ?? {}),
+      thread_id: threadId,
+    },
+    version: options.config?.version ?? 'v2',
+  };
+}
+
+function createCheckpointLookupConfig(config: RunnableConfig): RunnableConfig {
+  const threadId = getConfigString(config, 'thread_id');
+  if (threadId == null) {
+    return config;
+  }
+  const checkpointNs = getConfigString(config, 'checkpoint_ns') ?? '';
+  const checkpointId = getConfigString(config, 'checkpoint_id');
+  return {
+    configurable: {
+      ...config.configurable,
+      thread_id: threadId,
+      checkpoint_ns: checkpointNs,
+      ...(checkpointId != null ? { checkpoint_id: checkpointId } : {}),
+    },
+  };
+}
+
+function createLatestCheckpointLookupConfig(
+  config: RunnableConfig
+): RunnableConfig {
+  const lookup = createCheckpointLookupConfig(config);
+  const { checkpoint_id: _checkpointId, ...configurable } =
+    lookup.configurable ?? {};
+  return { configurable };
+}
+
 async function getLatestCheckpointTuple(
   checkpointer: BaseCheckpointSaver | undefined,
-  threadId: string
+  config: RunnableConfig
 ): Promise<CheckpointTuple | undefined> {
   if (!checkpointer) {
     return undefined;
   }
-  const config: RunnableConfig = {
-    configurable: {
-      thread_id: threadId,
-    },
-  };
-  const tuple = await checkpointer.getTuple(config);
+  const lookupConfig = createLatestCheckpointLookupConfig(config);
+  const tuple = await checkpointer.getTuple(lookupConfig);
   if (tuple) {
     return tuple;
   }
-  for await (const checkpoint of checkpointer.list(config, { limit: 1 })) {
+  for await (const checkpoint of checkpointer.list(lookupConfig, {
+    limit: 1,
+  })) {
     return checkpoint;
   }
   return undefined;
+}
+
+async function getSelectedCheckpointTuple(
+  checkpointer: BaseCheckpointSaver | undefined,
+  config: RunnableConfig
+): Promise<CheckpointTuple | undefined> {
+  return checkpointer?.getTuple(createCheckpointLookupConfig(config));
 }
 
 function createCheckpointReference(params: {
@@ -634,22 +680,27 @@ export class AgentSession {
   async getLatestCheckpoint(): Promise<
     AgentSessionCheckpointReference | undefined
     > {
+    const config = createCheckpointLookupConfig({
+      configurable: {
+        thread_id: this.threadId,
+      },
+    });
     const tuple = await getLatestCheckpointTuple(
       this.checkpointing.checkpointer,
-      this.threadId
+      config
     );
     return tuple
       ? createCheckpointReference({ threadId: this.threadId, tuple })
       : undefined;
   }
 
-  private async hasCheckpointState(threadId: string): Promise<boolean> {
+  private async hasCheckpointState(config: RunnableConfig): Promise<boolean> {
     if (!this.checkpointing.enabled) {
       return false;
     }
-    const tuple = await getLatestCheckpointTuple(
+    const tuple = await getSelectedCheckpointTuple(
       this.checkpointing.checkpointer,
-      threadId
+      config
     );
     return tuple != null;
   }
@@ -658,13 +709,14 @@ export class AgentSession {
     source: 'run' | 'resume';
     runId: string;
     threadId: string;
+    config: RunnableConfig;
   }): Promise<void> {
     if (!this.checkpointing.enabled) {
       return;
     }
     const tuple = await getLatestCheckpointTuple(
       this.checkpointing.checkpointer,
-      params.threadId
+      params.config
     );
     if (!tuple) {
       return;
@@ -704,7 +756,8 @@ export class AgentSession {
     const runId = options.runId ?? createRunId();
     const threadId = options.threadId ?? this.threadId;
     const inputMessages = normalizeInput(input);
-    const useCheckpointState = await this.hasCheckpointState(threadId);
+    const callerConfig = createCallerConfig(threadId, options);
+    const useCheckpointState = await this.hasCheckpointState(callerConfig);
     let parentId = this.store?.getLeafEntry()?.id ?? null;
     for (const message of inputMessages) {
       const entry = await this.store?.appendMessage(message, parentId);
@@ -758,15 +811,6 @@ export class AgentSession {
       if (!useCheckpointState && sessionState.messages.length > 0) {
         messages = sessionState.messages;
       }
-      const callerConfig: Partial<RunnableConfig> & { version: 'v1' | 'v2' } = {
-        recursionLimit: 50,
-        ...(options.config ?? {}),
-        configurable: {
-          ...(options.config?.configurable ?? {}),
-          thread_id: threadId,
-        },
-        version: options.config?.version ?? 'v2',
-      };
       const content = await run.processStream(
         { messages },
         callerConfig,
@@ -798,7 +842,12 @@ export class AgentSession {
           threadId,
         });
       }
-      await this.recordCheckpoint({ source: 'run', runId, threadId });
+      await this.recordCheckpoint({
+        source: 'run',
+        runId,
+        threadId,
+        config: callerConfig,
+      });
       const contentParts = (content ?? handlerResult.contentParts).filter(
         (part): part is t.MessageContentComplex => part != null
       );
@@ -822,7 +871,12 @@ export class AgentSession {
         runId,
         threadId,
       });
-      await this.recordCheckpoint({ source: 'run', runId, threadId });
+      await this.recordCheckpoint({
+        source: 'run',
+        runId,
+        threadId,
+        config: callerConfig,
+      });
       throw error;
     }
   }
@@ -1013,6 +1067,7 @@ export class AgentSession {
   ): Promise<AgentSessionRunResult> {
     const runId = options.runId ?? createRunId();
     const threadId = options.threadId ?? this.threadId;
+    const callerConfig = createCallerConfig(threadId, options);
     await this.store?.appendRunEvent('run.started', undefined, {
       runId,
       threadId,
@@ -1023,65 +1078,77 @@ export class AgentSession {
       userHandlers: this.runConfig.customHandlers,
     });
     const sessionState = createSessionRunState(this.store?.getPath() ?? []);
-    const run = await Run.create<t.IState>({
-      ...this.runConfig,
-      runId,
-      graphConfig: applyCheckpointerToGraphConfig(
-        applyInitialSummaryToGraphConfig(
-          this.runConfig.graphConfig,
-          sessionState.initialSummary
+    try {
+      const run = await Run.create<t.IState>({
+        ...this.runConfig,
+        runId,
+        graphConfig: applyCheckpointerToGraphConfig(
+          applyInitialSummaryToGraphConfig(
+            this.runConfig.graphConfig,
+            sessionState.initialSummary
+          ),
+          this.checkpointing.checkpointer
         ),
-        this.checkpointing.checkpointer
-      ),
-      returnContent: true,
-      calibrationRatio: this.calibrationRatio,
-      customHandlers: handlerResult.handlers,
-    });
-    const content = await run.resume(resumeValue, {
-      ...(options.config ?? {}),
-      configurable: {
-        ...(options.config?.configurable ?? {}),
-        thread_id: threadId,
-      },
-      version: options.config?.version ?? 'v2',
-    });
-    const runMessages = run.getRunMessages() ?? [];
-    for (const message of runMessages) {
-      await this.store?.appendMessage(message);
+        returnContent: true,
+        calibrationRatio: this.calibrationRatio,
+        customHandlers: handlerResult.handlers,
+      });
+      const content = await run.resume(resumeValue, callerConfig);
+      const runMessages = run.getRunMessages() ?? [];
+      for (const message of runMessages) {
+        await this.store?.appendMessage(message);
+      }
+      const interrupt = run.getInterrupt();
+      const haltedReason = run.getHaltReason();
+      if (interrupt) {
+        await this.store?.appendRunEvent('run.interrupted', interrupt, {
+          runId,
+          threadId,
+        });
+      } else if (haltedReason != null && haltedReason !== '') {
+        await this.store?.appendRunEvent('run.halted', haltedReason, {
+          runId,
+          threadId,
+        });
+      } else {
+        await this.store?.appendRunEvent('run.completed', undefined, {
+          runId,
+          threadId,
+        });
+      }
+      await this.recordCheckpoint({
+        source: 'resume',
+        runId,
+        threadId,
+        config: callerConfig,
+      });
+      const contentParts = (content ?? handlerResult.contentParts).filter(
+        (part): part is t.MessageContentComplex => part != null
+      );
+      return {
+        text: contentToText(contentParts),
+        content: contentParts,
+        messages: runMessages,
+        usage: handlerResult.usage,
+        steps: handlerResult.steps,
+        interrupt,
+        haltedReason,
+        runId,
+        threadId,
+      };
+    } catch (error) {
+      await this.store?.appendRunEvent('run.failed', error, {
+        runId,
+        threadId,
+      });
+      await this.recordCheckpoint({
+        source: 'resume',
+        runId,
+        threadId,
+        config: callerConfig,
+      });
+      throw error;
     }
-    const interrupt = run.getInterrupt();
-    const haltedReason = run.getHaltReason();
-    if (interrupt) {
-      await this.store?.appendRunEvent('run.interrupted', interrupt, {
-        runId,
-        threadId,
-      });
-    } else if (haltedReason != null && haltedReason !== '') {
-      await this.store?.appendRunEvent('run.halted', haltedReason, {
-        runId,
-        threadId,
-      });
-    } else {
-      await this.store?.appendRunEvent('run.completed', undefined, {
-        runId,
-        threadId,
-      });
-    }
-    await this.recordCheckpoint({ source: 'resume', runId, threadId });
-    const contentParts = (content ?? handlerResult.contentParts).filter(
-      (part): part is t.MessageContentComplex => part != null
-    );
-    return {
-      text: contentToText(contentParts),
-      content: contentParts,
-      messages: runMessages,
-      usage: handlerResult.usage,
-      steps: handlerResult.steps,
-      interrupt,
-      haltedReason,
-      runId,
-      threadId,
-    };
   }
 }
 

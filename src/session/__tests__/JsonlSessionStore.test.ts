@@ -68,6 +68,7 @@ async function putCheckpoint(params: {
   checkpointer: MemorySaver;
   threadId: string;
   id: string;
+  checkpointNs?: string;
 }): Promise<void> {
   const checkpoint: Checkpoint = {
     v: 4,
@@ -86,7 +87,7 @@ async function putCheckpoint(params: {
     {
       configurable: {
         thread_id: params.threadId,
-        checkpoint_ns: '',
+        checkpoint_ns: params.checkpointNs ?? '',
       },
     },
     checkpoint,
@@ -353,6 +354,40 @@ describe('JsonlSessionStore', () => {
     });
   });
 
+  it('replays JSONL history when the requested checkpoint namespace has no state', async () => {
+    const checkpointer = new MemorySaver();
+    const mockRun = createMockRun('namespace output');
+    mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      checkpointing: { checkpointer },
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    await session.getSessionStore()?.appendMessage(new HumanMessage('history'));
+    await putCheckpoint({
+      checkpointer,
+      threadId: session.threadId,
+      id: 'checkpoint_other_namespace',
+      checkpointNs: 'other',
+    });
+
+    await session.run('fresh turn', {
+      config: { configurable: { checkpoint_ns: 'requested' } },
+    });
+
+    expect(
+      getProcessedMessages(mockRun).map((message) => message.content)
+    ).toEqual(['history', 'fresh turn']);
+  });
+
   it('resets stale checkpoint state when branching changes the active JSONL path', async () => {
     const checkpointer = new MemorySaver();
     const session = await createAgentSession({
@@ -387,6 +422,38 @@ describe('JsonlSessionStore', () => {
       source: 'reset',
       reason: 'branch',
     });
+  });
+
+  it('records run.failed when resumeInterrupt throws', async () => {
+    const mockRun = createMockRun('unused');
+    mockRun.resume.mockRejectedValue(new Error('resume failed'));
+    mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      humanInTheLoop: { enabled: true },
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+
+    await expect(
+      session.resumeInterrupt([{ type: 'approve' }], {
+        runId: 'run_resume_failure',
+      })
+    ).rejects.toThrow('resume failed');
+
+    const events = session
+      .getSessionStore()
+      ?.getEntries()
+      .filter((entry) => entry.type === 'run_event')
+      .map((entry) => entry.data.event);
+    expect(events).toEqual(['run.started', 'run.failed']);
   });
 
   it('compacts into a summary plus retained active path', async () => {
