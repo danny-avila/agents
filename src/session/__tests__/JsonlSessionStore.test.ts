@@ -3,8 +3,96 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { AIMessage, HumanMessage } from '@langchain/core/messages';
 import { MemorySaver } from '@langchain/langgraph';
+import type { BaseMessage } from '@langchain/core/messages';
+import type { Checkpoint, CheckpointMetadata } from '@langchain/langgraph';
 import { JsonlSessionStore, createAgentSession } from '@/session';
 import * as providers from '@/llm/providers';
+import type * as t from '@/types';
+import { Run } from '@/run';
+
+type MockRun = {
+  processStream: jest.MockedFunction<Run<t.IState>['processStream']>;
+  resume: jest.MockedFunction<Run<t.IState>['resume']>;
+  getRunMessages: jest.MockedFunction<Run<t.IState>['getRunMessages']>;
+  getCalibrationRatio: jest.MockedFunction<
+    Run<t.IState>['getCalibrationRatio']
+  >;
+  getInterrupt: jest.MockedFunction<Run<t.IState>['getInterrupt']>;
+  getHaltReason: jest.MockedFunction<Run<t.IState>['getHaltReason']>;
+};
+
+function createMockRun(outputText = 'ok'): MockRun {
+  return {
+    processStream: jest
+      .fn<
+        ReturnType<Run<t.IState>['processStream']>,
+        Parameters<Run<t.IState>['processStream']>
+      >()
+      .mockResolvedValue([{ type: 'text', text: outputText }]),
+    resume: jest
+      .fn<
+        ReturnType<Run<t.IState>['resume']>,
+        Parameters<Run<t.IState>['resume']>
+      >()
+      .mockResolvedValue([{ type: 'text', text: outputText }]),
+    getRunMessages: jest.fn(() => [new AIMessage(outputText)]),
+    getCalibrationRatio: jest.fn(() => 1),
+    getInterrupt: jest.fn(() => undefined),
+    getHaltReason: jest.fn(() => undefined),
+  };
+}
+
+function mockRunCreate(mockRun: MockRun): t.RunConfig[] {
+  const capturedConfigs: t.RunConfig[] = [];
+  jest.spyOn(Run, 'create').mockImplementation((async <
+    T extends t.BaseGraphState,
+  >(
+    config: t.RunConfig
+  ): Promise<Run<T>> => {
+    capturedConfigs.push(config);
+    return mockRun as unknown as Run<T>;
+  }) as never);
+  return capturedConfigs;
+}
+
+function getProcessedMessages(mockRun: MockRun): BaseMessage[] {
+  expect(mockRun.processStream).toHaveBeenCalled();
+  const input = mockRun.processStream.mock.calls[0][0];
+  if (!('messages' in input)) {
+    throw new Error('Expected processStream to receive message state');
+  }
+  return input.messages;
+}
+
+async function putCheckpoint(params: {
+  checkpointer: MemorySaver;
+  threadId: string;
+  id: string;
+}): Promise<void> {
+  const checkpoint: Checkpoint = {
+    v: 4,
+    id: params.id,
+    ts: new Date().toISOString(),
+    channel_values: {},
+    channel_versions: {},
+    versions_seen: {},
+  };
+  const metadata: CheckpointMetadata = {
+    source: 'loop',
+    step: 0,
+    parents: {},
+  };
+  await params.checkpointer.put(
+    {
+      configurable: {
+        thread_id: params.threadId,
+        checkpoint_ns: '',
+      },
+    },
+    checkpoint,
+    metadata
+  );
+}
 
 function mockSummarizer(response: string): void {
   jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
@@ -195,6 +283,110 @@ describe('JsonlSessionStore', () => {
     });
 
     expect(session.getCheckpointer()).toBe(checkpointer);
+  });
+
+  it('injects the session checkpointer and replays JSONL history before checkpoints exist', async () => {
+    const checkpointer = new MemorySaver();
+    const mockRun = createMockRun('first output');
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      checkpointing: { checkpointer },
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    await session.getSessionStore()?.appendMessage(new HumanMessage('history'));
+
+    await session.run('next');
+
+    expect(capturedConfigs[0].graphConfig.compileOptions?.checkpointer).toBe(
+      checkpointer
+    );
+    expect(
+      getProcessedMessages(mockRun).map((message) => message.content)
+    ).toEqual(['history', 'next']);
+  });
+
+  it('uses only new input when LangGraph checkpoint state already exists', async () => {
+    const checkpointer = new MemorySaver();
+    const mockRun = createMockRun('checkpointed output');
+    mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      checkpointing: { checkpointer },
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    await session.getSessionStore()?.appendMessage(new HumanMessage('history'));
+    await putCheckpoint({
+      checkpointer,
+      threadId: session.threadId,
+      id: 'checkpoint_existing',
+    });
+
+    await session.run('fresh turn', { runId: 'run_checkpointed' });
+
+    const checkpoints = session
+      .getSessionStore()
+      ?.getCheckpoints(session.threadId);
+    expect(
+      getProcessedMessages(mockRun).map((message) => message.content)
+    ).toEqual(['fresh turn']);
+    expect(checkpoints?.at(-1)?.data).toMatchObject({
+      source: 'run',
+      runId: 'run_checkpointed',
+      checkpointId: 'checkpoint_existing',
+    });
+  });
+
+  it('resets stale checkpoint state when branching changes the active JSONL path', async () => {
+    const checkpointer = new MemorySaver();
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      checkpointing: { checkpointer },
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    const store = session.getSessionStore();
+    const first = await store?.appendMessage(new HumanMessage('first'));
+    await store?.appendMessage(new AIMessage('second'));
+    await putCheckpoint({
+      checkpointer,
+      threadId: session.threadId,
+      id: 'checkpoint_to_reset',
+    });
+
+    await session.branch(first?.id ?? '', { position: 'at' });
+
+    const tuple = await checkpointer.getTuple({
+      configurable: { thread_id: session.threadId },
+    });
+    expect(tuple).toBeUndefined();
+    expect(store?.getCheckpoints(session.threadId).at(-1)?.data).toMatchObject({
+      source: 'reset',
+      reason: 'branch',
+    });
   });
 
   it('compacts into a summary plus retained active path', async () => {
