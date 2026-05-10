@@ -40,17 +40,24 @@ function isBaseMessage(value: unknown): value is BaseMessage {
   );
 }
 
-function normalizeInput(input: AgentSessionInput): BaseMessage[] {
+interface NormalizedSessionInput {
+  messages: BaseMessage[];
+  state: t.IState;
+}
+
+function normalizeInput(input: AgentSessionInput): NormalizedSessionInput {
   if (typeof input === 'string') {
-    return [new HumanMessage(input)];
+    const messages = [new HumanMessage(input)];
+    return { messages, state: { messages } };
   }
   if (Array.isArray(input)) {
-    return input;
+    return { messages: input, state: { messages: input } };
   }
   if (isBaseMessage(input)) {
-    return [input];
+    const messages = [input];
+    return { messages, state: { messages } };
   }
-  return input.messages;
+  return { messages: input.messages, state: input };
 }
 
 function contentToText(
@@ -755,7 +762,8 @@ export class AgentSession {
   ): Promise<AgentSessionRunResult> {
     const runId = options.runId ?? createRunId();
     const threadId = options.threadId ?? this.threadId;
-    const inputMessages = normalizeInput(input);
+    const normalizedInput = normalizeInput(input);
+    const inputMessages = normalizedInput.messages;
     const callerConfig = createCallerConfig(threadId, options);
     const useCheckpointState = await this.hasCheckpointState(callerConfig);
     let parentId = this.store?.getLeafEntry()?.id ?? null;
@@ -812,7 +820,7 @@ export class AgentSession {
         messages = sessionState.messages;
       }
       const content = await run.processStream(
-        { messages },
+        { ...normalizedInput.state, messages },
         callerConfig,
         options.streamOptions
       );

@@ -56,13 +56,17 @@ function mockRunCreate(mockRun: MockRun): t.RunConfig[] {
   return capturedConfigs;
 }
 
-function getProcessedMessages(mockRun: MockRun): BaseMessage[] {
+function getProcessedState(mockRun: MockRun): t.IState {
   expect(mockRun.processStream).toHaveBeenCalled();
   const input = mockRun.processStream.mock.calls[0][0];
   if (!('messages' in input)) {
     throw new Error('Expected processStream to receive message state');
   }
-  return input.messages;
+  return input;
+}
+
+function getProcessedMessages(mockRun: MockRun): BaseMessage[] {
+  return getProcessedState(mockRun).messages;
 }
 
 async function putCheckpoint(params: {
@@ -232,6 +236,35 @@ describe('JsonlSessionStore', () => {
     expect(store.getLatestCheckpoint(store.header.id)?.id).toBe(checkpoint.id);
   });
 
+  it('treats reset checkpoints as latest checkpoint barriers', async () => {
+    const store = await JsonlSessionStore.create({
+      path: join(dir, 'checkpoint-reset.jsonl'),
+      cwd: dir,
+    });
+    await store.appendCheckpoint({
+      source: 'run',
+      threadId: store.header.id,
+      runId: 'run_before_reset',
+      checkpointId: 'checkpoint_before_reset',
+    });
+    await store.appendCheckpoint({
+      source: 'reset',
+      threadId: store.header.id,
+      reason: 'branch',
+    });
+
+    expect(store.getLatestCheckpoint(store.header.id)).toBeUndefined();
+
+    const checkpoint = await store.appendCheckpoint({
+      source: 'run',
+      threadId: store.header.id,
+      runId: 'run_after_reset',
+      checkpointId: 'checkpoint_after_reset',
+    });
+
+    expect(store.getLatestCheckpoint(store.header.id)?.id).toBe(checkpoint.id);
+  });
+
   it('preserves Error details in JSONL payloads', () => {
     const error = new Error('resume failed');
     const payload = toJsonValue(error);
@@ -266,6 +299,39 @@ describe('JsonlSessionStore', () => {
     expect(session.sessionPath).toContain('.jsonl');
   });
 
+  it('preserves non-message state while applying session history', async () => {
+    const mockRun = createMockRun('stateful output');
+    mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    await session.getSessionStore()?.appendMessage(new HumanMessage('history'));
+    const input: t.IState & { selectedAgent: string } = {
+      messages: [new HumanMessage('fresh')],
+      selectedAgent: 'subagent-a',
+    };
+
+    await session.run(input);
+
+    const processedState = getProcessedState(mockRun) as t.IState & {
+      selectedAgent?: string;
+    };
+    expect(processedState.selectedAgent).toBe('subagent-a');
+    expect(processedState.messages.map((message) => message.content)).toEqual([
+      'history',
+      'fresh',
+    ]);
+  });
+
   it('shares a session-level LangGraph checkpointer for HITL resume', async () => {
     const session = await createAgentSession({
       cwd: dir,
@@ -282,6 +348,35 @@ describe('JsonlSessionStore', () => {
     });
 
     expect(session.getCheckpointer()).toBeInstanceOf(MemorySaver);
+  });
+
+  it('reuses the session-level checkpointer across HITL resume', async () => {
+    const mockRun = createMockRun('resumed');
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      humanInTheLoop: { enabled: true },
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+
+    await session.run('start');
+    await session.resumeInterrupt([]);
+
+    const checkpointer =
+      capturedConfigs[0].graphConfig.compileOptions?.checkpointer;
+    expect(checkpointer).toBeInstanceOf(MemorySaver);
+    expect(session.getCheckpointer()).toBe(checkpointer);
+    expect(capturedConfigs[1].graphConfig.compileOptions?.checkpointer).toBe(
+      checkpointer
+    );
   });
 
   it('preserves a caller-supplied session checkpointer', async () => {

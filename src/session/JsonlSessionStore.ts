@@ -451,9 +451,15 @@ export class JsonlSessionStore {
   }
 
   getLatestCheckpoint(threadId?: string): SessionCheckpointEntry | undefined {
-    return [...this.getCheckpoints(threadId)]
-      .reverse()
-      .find((entry) => entry.data.source !== 'reset');
+    const checkpoints = this.getCheckpoints(threadId);
+    for (let i = checkpoints.length - 1; i >= 0; i--) {
+      const checkpoint = checkpoints[i];
+      if (checkpoint.data.source === 'reset') {
+        return undefined;
+      }
+      return checkpoint;
+    }
+    return undefined;
   }
 
   async branch(
