@@ -1,4 +1,5 @@
 import { GraphEvents } from '@/common';
+import type { UsageMetadata } from '@langchain/core/messages';
 import type * as t from '@/types';
 
 export interface OpenAICompatibleWriter {
@@ -85,6 +86,10 @@ export function createOpenAIStreamTracker(): OpenAIStreamTracker {
       reasoningTokens: 0,
     },
   };
+}
+
+function getTokenCount(value: number | null | undefined): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
 }
 
 export function createChatCompletionChunk(
@@ -189,12 +194,16 @@ export function createOpenAIHandlers(
     },
     [GraphEvents.CHAT_MODEL_END]: {
       handle: (_event, data): void => {
-        const usage = (data as t.ModelEndData)?.output?.usage_metadata;
+        const usage = (data as t.ModelEndData)?.output?.usage_metadata as
+          | Partial<UsageMetadata>
+          | undefined;
         if (!usage) {
           return;
         }
-        config.tracker.usage.promptTokens += usage.input_tokens;
-        config.tracker.usage.completionTokens += usage.output_tokens;
+        config.tracker.usage.promptTokens += getTokenCount(usage.input_tokens);
+        config.tracker.usage.completionTokens += getTokenCount(
+          usage.output_tokens
+        );
       },
     },
   };

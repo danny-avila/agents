@@ -43,6 +43,31 @@ describe('OpenAI-compatible adapters', () => {
     expect(writes.at(-1)).toBe('data: [DONE]\n\n');
   });
 
+  it('tracks partial usage metadata without NaN totals', async () => {
+    const tracker = createOpenAIStreamTracker();
+    const handlers = createOpenAIHandlers({
+      writer: { write: jest.fn() },
+      context: { requestId: 'chatcmpl_usage', model: 'agent', created: 1 },
+      tracker,
+    });
+
+    await handlers[GraphEvents.CHAT_MODEL_END].handle(
+      GraphEvents.CHAT_MODEL_END,
+      {
+        output: { usage_metadata: { input_tokens: 3 } },
+      } as t.ModelEndData
+    );
+    await handlers[GraphEvents.CHAT_MODEL_END].handle(
+      GraphEvents.CHAT_MODEL_END,
+      {
+        output: { usage_metadata: { output_tokens: 5 } },
+      } as t.ModelEndData
+    );
+
+    expect(tracker.usage.promptTokens).toBe(3);
+    expect(tracker.usage.completionTokens).toBe(5);
+  });
+
   it('builds a chat completion chunk without transport dependencies', () => {
     expect(
       createChatCompletionChunk(
