@@ -150,10 +150,13 @@ function getToolCallKey(
   toolCall: ResponseToolCallFragment,
   fallbackIndex: number
 ): string {
-  if (toolCall.id != null && toolCall.id !== '') {
-    return toolCall.id;
+  const index = getToolCallIndex(toolCall, fallbackIndex);
+  if (stepId !== '') {
+    return `${stepId}:${index}`;
   }
-  return `${stepId}:${getToolCallIndex(toolCall, fallbackIndex)}`;
+  return toolCall.id != null && toolCall.id !== ''
+    ? toolCall.id
+    : `tool:${index}`;
 }
 
 function getToolCallName(toolCall: ResponseToolCallFragment): string {
@@ -181,6 +184,9 @@ async function ensureFunctionCall(
   const existing = config.tracker.functionCalls.get(key);
   const name = getToolCallName(toolCall);
   if (existing) {
+    if (toolCall.id != null && toolCall.id !== '') {
+      existing.call_id = toolCall.id;
+    }
     if (name !== '') {
       existing.name = name;
     }
@@ -259,6 +265,7 @@ async function completeFunctionCall(
     item_id: item.id,
     output_index: config.tracker.items.indexOf(item),
     call_id: item.call_id,
+    name: item.name,
     arguments: item.arguments,
   });
   item.status = 'completed';
@@ -447,6 +454,7 @@ export function createResponsesEventHandlers(
         const completed = data as {
           result?: {
             id?: string;
+            index?: number;
             type?: string;
             tool_call?: ResponseToolCallFragment;
           };
@@ -458,7 +466,7 @@ export function createResponsesEventHandlers(
           config,
           completed.result.id ?? '',
           completed.result.tool_call,
-          0
+          completed.result.index ?? 0
         );
       },
     },
