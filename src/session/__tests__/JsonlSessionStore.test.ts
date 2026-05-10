@@ -1,5 +1,5 @@
 import { mkdtemp, readFile, rm, writeFile } from 'fs/promises';
-import { join } from 'path';
+import { dirname, join } from 'path';
 import { tmpdir } from 'os';
 import { AIMessage, HumanMessage } from '@langchain/core/messages';
 import { MemorySaver } from '@langchain/langgraph';
@@ -167,6 +167,37 @@ describe('JsonlSessionStore', () => {
 
     const raw = await readFile(path, 'utf8');
     expect(raw.match(/"type":"session"/g)).toHaveLength(1);
+  });
+
+  it('keeps default session roots distinct for similar cwd strings', async () => {
+    const cwdA = join(dir, 'foo/bar');
+    const cwdB = join(dir, 'foo-bar');
+    const storeA = await JsonlSessionStore.create({
+      cwd: cwdA,
+      sessionId: 'cwd-a',
+    });
+    const storeB = await JsonlSessionStore.create({
+      cwd: cwdB,
+      sessionId: 'cwd-b',
+    });
+
+    try {
+      const [itemsA, itemsB] = await Promise.all([
+        JsonlSessionStore.list(cwdA),
+        JsonlSessionStore.list(cwdB),
+      ]);
+
+      expect(dirname(storeA.path)).not.toBe(dirname(storeB.path));
+      expect(itemsA.map((item) => item.id)).toContain('cwd-a');
+      expect(itemsA.map((item) => item.id)).not.toContain('cwd-b');
+      expect(itemsB.map((item) => item.id)).toContain('cwd-b');
+      expect(itemsB.map((item) => item.id)).not.toContain('cwd-a');
+    } finally {
+      await Promise.all([
+        rm(storeA.path, { force: true }),
+        rm(storeB.path, { force: true }),
+      ]);
+    }
   });
 
   it('branches in place without deleting abandoned children', async () => {
