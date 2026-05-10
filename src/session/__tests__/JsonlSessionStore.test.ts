@@ -6,6 +6,7 @@ import { MemorySaver } from '@langchain/langgraph';
 import type { BaseMessage } from '@langchain/core/messages';
 import type { Checkpoint, CheckpointMetadata } from '@langchain/langgraph';
 import { JsonlSessionStore, createAgentSession } from '@/session';
+import { toJsonValue } from '@/session/messageSerialization';
 import * as providers from '@/llm/providers';
 import type * as t from '@/types';
 import { Run } from '@/run';
@@ -229,6 +230,22 @@ describe('JsonlSessionStore', () => {
     expect(checkpoint.data.provider).toBe('langgraph');
     expect(store.getLeafEntry()?.id).toBe(message.id);
     expect(store.getLatestCheckpoint(store.header.id)?.id).toBe(checkpoint.id);
+  });
+
+  it('preserves Error details in JSONL payloads', () => {
+    const error = new Error('resume failed');
+    const payload = toJsonValue(error);
+
+    expect(payload).toMatchObject({
+      name: 'Error',
+      message: 'resume failed',
+    });
+    expect(
+      typeof payload === 'object' &&
+        payload != null &&
+        !Array.isArray(payload) &&
+        typeof payload.stack === 'string'
+    ).toBe(true);
   });
 
   it('creates high-level sessions with a JSONL store by default', async () => {
@@ -484,6 +501,60 @@ describe('JsonlSessionStore', () => {
       'summary of old work',
       'recent',
     ]);
+  });
+
+  it('records no retained ids when compaction retains zero messages', async () => {
+    mockSummarizer('summary of everything');
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    const store = session.getSessionStore();
+    const user = await store?.appendMessage(new HumanMessage('old'));
+    const assistant = await store?.appendMessage(new AIMessage('old answer'));
+
+    await session.compact({ retainRecentTurns: 0 });
+
+    const summary = store
+      ?.getEntries()
+      .find((entry) => entry.type === 'summary');
+    const compaction = store
+      ?.getEntries()
+      .find((entry) => entry.type === 'compaction');
+    expect(summary?.data.retainedEntryIds).toEqual([]);
+    expect(summary?.data.summarizedEntryIds).toEqual([user?.id, assistant?.id]);
+    expect(compaction?.data.retainedEntryIds).toEqual([]);
+  });
+
+  it('carries calibration ratio forward after resumeInterrupt', async () => {
+    const mockRun = createMockRun('resumed');
+    mockRun.getCalibrationRatio.mockReturnValue(2);
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+
+    await session.resumeInterrupt([]);
+    await session.run('after resume');
+
+    expect(capturedConfigs[1].calibrationRatio).toBe(2);
   });
 
   it('summarizes an abandoned branch before switching in place', async () => {

@@ -37,6 +37,24 @@ export function toJsonValue(value: unknown): JsonValue {
   if (Array.isArray(value)) {
     return value.map((item) => toJsonValue(item));
   }
+  if (value instanceof Error) {
+    const result: JsonObject = {
+      name: value.name,
+      message: value.message,
+    };
+    if (value.stack != null && value.stack !== '') {
+      result.stack = value.stack;
+    }
+    if ('cause' in value && typeof value.cause !== 'undefined') {
+      result.cause = toJsonValue(value.cause);
+    }
+    for (const [key, nested] of Object.entries(value)) {
+      if (typeof nested !== 'undefined') {
+        result[key] = toJsonValue(nested);
+      }
+    }
+    return result;
+  }
   if (value !== null && typeof value === 'object') {
     const result: JsonObject = {};
     for (const [key, nested] of Object.entries(value)) {

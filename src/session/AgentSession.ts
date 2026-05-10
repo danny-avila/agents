@@ -1034,9 +1034,12 @@ export class AgentSession {
     const retainedMessages = filterRemoveMessages(
       summarizedState.messages ?? []
     );
-    const retainedEntryIds = messageEntries
-      .slice(-retainedMessages.length)
-      .map((entry) => entry.id);
+    let retainedEntryIds: string[] = [];
+    if (retainedMessages.length > 0) {
+      retainedEntryIds = messageEntries
+        .slice(-retainedMessages.length)
+        .map((entry) => entry.id);
+    }
     const retainedEntryIdSet = new Set(retainedEntryIds);
     const summarized = messageEntries.filter(
       (entry) => !retainedEntryIdSet.has(entry.id)
@@ -1098,6 +1101,7 @@ export class AgentSession {
       for (const message of runMessages) {
         await this.store?.appendMessage(message);
       }
+      this.calibrationRatio = run.getCalibrationRatio();
       const interrupt = run.getInterrupt();
       const haltedReason = run.getHaltReason();
       if (interrupt) {
