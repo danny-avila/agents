@@ -188,6 +188,12 @@ export interface AgentSessionCheckpointReference {
   parentCheckpointId?: string;
 }
 
+export interface AgentSessionCheckpointLookupOptions {
+  threadId?: string;
+  checkpointNs?: string;
+  config?: RunnableConfig;
+}
+
 export interface AgentSessionCheckpointingOptions {
   enabled?: boolean;
   checkpointer?: BaseCheckpointSaver;

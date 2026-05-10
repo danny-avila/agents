@@ -9,6 +9,7 @@ import type { HookRegistry } from '@/hooks';
 import type {
   AgentSessionConfig,
   AgentSessionCheckpointing,
+  AgentSessionCheckpointLookupOptions,
   AgentSessionCheckpointReference,
   AgentSessionInput,
   AgentSessionRunOptions,
@@ -715,21 +716,26 @@ export class AgentSession {
     return this.checkpointing.checkpointer;
   }
 
-  async getLatestCheckpoint(): Promise<
-    AgentSessionCheckpointReference | undefined
-    > {
+  async getLatestCheckpoint(
+    options: AgentSessionCheckpointLookupOptions = {}
+  ): Promise<AgentSessionCheckpointReference | undefined> {
+    const threadId = options.threadId ?? this.threadId;
+    const baseConfig = options.config ?? {};
     const config = createCheckpointLookupConfig({
+      ...baseConfig,
       configurable: {
-        thread_id: this.threadId,
+        ...(baseConfig.configurable ?? {}),
+        thread_id: threadId,
+        ...(options.checkpointNs != null
+          ? { checkpoint_ns: options.checkpointNs }
+          : {}),
       },
     });
     const tuple = await getLatestCheckpointTuple(
       this.checkpointing.checkpointer,
       config
     );
-    return tuple
-      ? createCheckpointReference({ threadId: this.threadId, tuple })
-      : undefined;
+    return tuple ? createCheckpointReference({ threadId, tuple }) : undefined;
   }
 
   private async hasCheckpointState(config: RunnableConfig): Promise<boolean> {

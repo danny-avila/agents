@@ -452,6 +452,27 @@ describe('JsonlSessionStore', () => {
     expect(session.getCheckpointer()).toBeInstanceOf(MemorySaver);
   });
 
+  it('keeps stores and checkpointing optional for high-level sessions', async () => {
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      ephemeral: true,
+      checkpointing: false,
+      humanInTheLoop: { enabled: true },
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+
+    expect(session.getSessionStore()).toBeUndefined();
+    expect(session.getCheckpointer()).toBeUndefined();
+  });
+
   it('reuses the session-level checkpointer across HITL resume', async () => {
     const mockRun = createMockRun('resumed');
     const capturedConfigs = mockRunCreate(mockRun);
@@ -600,6 +621,37 @@ describe('JsonlSessionStore', () => {
     expect(
       getProcessedMessages(mockRun).map((message) => message.content)
     ).toEqual(['history', 'fresh turn']);
+  });
+
+  it('looks up the latest checkpoint in the requested namespace', async () => {
+    const checkpointer = new MemorySaver();
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      checkpointing: { checkpointer },
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    await putCheckpoint({
+      checkpointer,
+      threadId: session.threadId,
+      id: 'checkpoint_requested_namespace',
+      checkpointNs: 'requested',
+    });
+
+    await expect(session.getLatestCheckpoint()).resolves.toBeUndefined();
+    await expect(
+      session.getLatestCheckpoint({ checkpointNs: 'requested' })
+    ).resolves.toMatchObject({
+      checkpointId: 'checkpoint_requested_namespace',
+      checkpointNs: 'requested',
+    });
   });
 
   it('resets stale checkpoint state when branching changes the active JSONL path', async () => {
