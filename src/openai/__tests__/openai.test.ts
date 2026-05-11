@@ -78,6 +78,54 @@ describe('OpenAI-compatible adapters', () => {
     expect(writes.at(-2)).toContain('"finish_reason":"tool_calls"');
   });
 
+  it('streams completed tool-call run steps without deltas', async () => {
+    const writes: string[] = [];
+    const tracker = createOpenAIStreamTracker();
+    const handlers = createOpenAIHandlers({
+      writer: { write: (data) => void writes.push(data) },
+      context: {
+        requestId: 'chatcmpl_complete_tools',
+        model: 'agent',
+        created: 1,
+      },
+      tracker,
+    });
+
+    await handlers[GraphEvents.ON_RUN_STEP].handle(GraphEvents.ON_RUN_STEP, {
+      id: 'step_complete',
+      index: 2,
+      type: 'tool_calls',
+      stepDetails: {
+        type: 'tool_calls',
+        tool_calls: [
+          {
+            id: 'call_complete',
+            type: 'function',
+            function: {
+              name: 'search',
+              arguments: { query: 'sessions' },
+            },
+          },
+        ],
+      },
+    } as t.RunStep);
+    await sendOpenAIFinalChunk({
+      writer: { write: (data) => void writes.push(data) },
+      context: {
+        requestId: 'chatcmpl_complete_tools',
+        model: 'agent',
+        created: 1,
+      },
+      tracker,
+    });
+
+    expect(writes[0]).toContain('"tool_calls"');
+    expect(writes[0]).toContain('"id":"call_complete"');
+    expect(writes[0]).toContain('"name":"search"');
+    expect(writes[0]).toContain('"{\\"query\\":\\"sessions\\"}"');
+    expect(writes.at(-2)).toContain('"finish_reason":"tool_calls"');
+  });
+
   it('tracks partial usage metadata without NaN totals', async () => {
     const tracker = createOpenAIStreamTracker();
     const handlers = createOpenAIHandlers({

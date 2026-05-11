@@ -75,6 +75,17 @@ export interface OpenAIHandlerConfig {
   tracker: OpenAIStreamTracker;
 }
 
+interface OpenAIToolCallFragment {
+  index?: number;
+  id?: string;
+  name?: string;
+  args?: string | object;
+  function?: {
+    name?: string;
+    arguments?: string | object;
+  };
+}
+
 export function createOpenAIStreamTracker(): OpenAIStreamTracker {
   return {
     hasText: false,
@@ -90,6 +101,28 @@ export function createOpenAIStreamTracker(): OpenAIStreamTracker {
 
 function getTokenCount(value: number | null | undefined): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+}
+
+function getToolCallIndex(
+  toolCall: OpenAIToolCallFragment,
+  fallbackIndex: number
+): number {
+  return typeof toolCall.index === 'number' ? toolCall.index : fallbackIndex;
+}
+
+function getToolCallName(toolCall: OpenAIToolCallFragment): string {
+  return toolCall.name ?? toolCall.function?.name ?? '';
+}
+
+function getToolCallArguments(toolCall: OpenAIToolCallFragment): string {
+  const args = toolCall.args ?? toolCall.function?.arguments;
+  if (args == null) {
+    return '';
+  }
+  if (typeof args === 'string') {
+    return args;
+  }
+  return JSON.stringify(args);
 }
 
 export function createChatCompletionChunk(
@@ -134,6 +167,71 @@ function getTextParts(
   return text;
 }
 
+async function emitToolCallChunk(params: {
+  config: OpenAIHandlerConfig;
+  toolCall: OpenAIToolCallFragment;
+  fallbackIndex: number;
+  completed: boolean;
+}): Promise<void> {
+  const { config, toolCall, fallbackIndex, completed } = params;
+  const index = getToolCallIndex(toolCall, fallbackIndex);
+  const existing = config.tracker.toolCalls.get(index);
+  const current = existing ?? {
+    id: toolCall.id ?? '',
+    type: 'function' as const,
+    function: { name: '', arguments: '' },
+  };
+  const name = getToolCallName(toolCall);
+  const args = getToolCallArguments(toolCall);
+  const idChanged =
+    toolCall.id != null && toolCall.id !== '' && current.id !== toolCall.id;
+  const nameChanged = name !== '' && current.function.name !== name;
+  let argumentDelta = '';
+  if (completed) {
+    if (args !== '' && args !== current.function.arguments) {
+      argumentDelta = args.startsWith(current.function.arguments)
+        ? args.slice(current.function.arguments.length)
+        : args;
+      current.function.arguments = args;
+    }
+  } else if (args !== '') {
+    argumentDelta = args;
+    current.function.arguments += args;
+  }
+  if (toolCall.id != null && toolCall.id !== '') {
+    current.id = toolCall.id;
+  }
+  if (name !== '') {
+    current.function.name = name;
+  }
+  config.tracker.toolCalls.set(index, current);
+  if (!idChanged && !nameChanged && argumentDelta === '' && existing) {
+    return;
+  }
+  const functionDelta: { name?: string; arguments?: string } = {};
+  if (nameChanged || (!existing && current.function.name !== '')) {
+    functionDelta.name = current.function.name;
+  }
+  if (argumentDelta !== '') {
+    functionDelta.arguments = argumentDelta;
+  }
+  await writeOpenAISSE(
+    config.writer,
+    createChatCompletionChunk(config.context, {
+      tool_calls: [
+        {
+          index,
+          ...(current.id !== '' ? { id: current.id } : {}),
+          type: 'function',
+          ...(functionDelta.name != null || functionDelta.arguments != null
+            ? { function: functionDelta }
+            : {}),
+        },
+      ],
+    })
+  );
+}
+
 export function createOpenAIHandlers(
   config: OpenAIHandlerConfig
 ): Record<string, t.EventHandler> {
@@ -166,45 +264,31 @@ export function createOpenAIHandlers(
         if (delta.type !== 'tool_calls') {
           return;
         }
-        for (const toolCall of delta.tool_calls ?? []) {
-          const index = toolCall.index ?? 0;
-          const current = config.tracker.toolCalls.get(index) ?? {
-            id: toolCall.id ?? '',
-            type: 'function' as const,
-            function: { name: '', arguments: '' },
-          };
-          if (toolCall.id != null && toolCall.id !== '') {
-            current.id = toolCall.id;
-          }
-          if (toolCall.name != null && toolCall.name !== '') {
-            current.function.name = toolCall.name;
-          }
-          if (toolCall.args != null && toolCall.args !== '') {
-            current.function.arguments += toolCall.args;
-          }
-          config.tracker.toolCalls.set(index, current);
-          await writeOpenAISSE(
-            config.writer,
-            createChatCompletionChunk(config.context, {
-              tool_calls: [
-                {
-                  index,
-                  ...(toolCall.id != null && toolCall.id !== ''
-                    ? { id: toolCall.id }
-                    : {}),
-                  type: 'function',
-                  function: {
-                    ...(toolCall.name != null && toolCall.name !== ''
-                      ? { name: toolCall.name }
-                      : {}),
-                    ...(toolCall.args != null && toolCall.args !== ''
-                      ? { arguments: toolCall.args }
-                      : {}),
-                  },
-                },
-              ],
-            })
-          );
+        const toolCalls = delta.tool_calls ?? [];
+        for (let index = 0; index < toolCalls.length; index++) {
+          await emitToolCallChunk({
+            config,
+            toolCall: toolCalls[index],
+            fallbackIndex: index,
+            completed: false,
+          });
+        }
+      },
+    },
+    [GraphEvents.ON_RUN_STEP]: {
+      handle: async (_event, data): Promise<void> => {
+        const runStep = data as t.RunStep;
+        if (runStep.stepDetails.type !== 'tool_calls') {
+          return;
+        }
+        const toolCalls = runStep.stepDetails.tool_calls ?? [];
+        for (let index = 0; index < toolCalls.length; index++) {
+          await emitToolCallChunk({
+            config,
+            toolCall: toolCalls[index],
+            fallbackIndex: index,
+            completed: true,
+          });
         }
       },
     },
