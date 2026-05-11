@@ -428,7 +428,7 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
 
     // Turn 7: absolute minimum context if still nothing
     if (spies.onSummarizeStartSpy.mock.calls.length === 0) {
-      ({ run, contentParts } = await createRun(2200));
+      ({ run, contentParts } = await createRun(1200));
       await runTurn({ run, conversationHistory }, 'What is 1+1?', streamConfig);
       logTurn('T7', conversationHistory);
     }
