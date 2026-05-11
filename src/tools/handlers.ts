@@ -118,10 +118,14 @@ export async function handleToolCallChunks({
     );
   }
 
-  await graph.dispatchRunStepDelta(stepId, {
-    type: StepTypes.TOOL_CALLS,
-    tool_calls: toolCallChunks,
-  });
+  await graph.dispatchRunStepDelta(
+    stepId,
+    {
+      type: StepTypes.TOOL_CALLS,
+      tool_calls: toolCallChunks,
+    },
+    metadata
+  );
 }
 
 export const handleToolCalls = async (

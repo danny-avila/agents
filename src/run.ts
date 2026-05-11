@@ -47,6 +47,37 @@ export const defaultOmitOptions = new Set([
   'additionalModelRequestFields',
 ]);
 
+const CUSTOM_GRAPH_EVENTS = new Set<string>([
+  GraphEvents.ON_AGENT_UPDATE,
+  GraphEvents.ON_RUN_STEP,
+  GraphEvents.ON_RUN_STEP_DELTA,
+  GraphEvents.ON_RUN_STEP_COMPLETED,
+  GraphEvents.ON_MESSAGE_DELTA,
+  GraphEvents.ON_REASONING_DELTA,
+  GraphEvents.ON_TOOL_EXECUTE,
+  GraphEvents.ON_SUMMARIZE_START,
+  GraphEvents.ON_SUMMARIZE_DELTA,
+  GraphEvents.ON_SUMMARIZE_COMPLETE,
+  GraphEvents.ON_SUBAGENT_UPDATE,
+  GraphEvents.ON_AGENT_LOG,
+  GraphEvents.ON_CUSTOM_EVENT,
+]);
+
+const DIRECT_DISPATCHED_STEP_EVENTS = new Set<string>([
+  GraphEvents.ON_RUN_STEP,
+  GraphEvents.ON_RUN_STEP_DELTA,
+  GraphEvents.ON_MESSAGE_DELTA,
+  GraphEvents.ON_REASONING_DELTA,
+]);
+
+function getStepScopedEventId(data: unknown): string | undefined {
+  if (data == null || typeof data !== 'object') {
+    return undefined;
+  }
+  const candidate = data as { id?: unknown };
+  return typeof candidate.id === 'string' ? candidate.id : undefined;
+}
+
 export class Run<_T extends t.BaseGraphState> {
   id: string;
   private tokenCounter?: t.TokenCounter;
@@ -444,13 +475,15 @@ export class Run<_T extends t.BaseGraphState> {
       tags?: string[],
       metadata?: Record<string, unknown>
     ): Promise<void> => {
-      // ON_RUN_STEP is dispatched directly via handler registry in
-      // Graph.dispatchRunStep (primary, reliable path).  Skip the
-      // callback-based dispatch to prevent double handling.
+      // Step-scoped SDK events are dispatched directly via the handler
+      // registry first. Skip callback-based echoes to prevent double
+      // handling when LangGraph invokes custom callbacks more than once.
+      const stepScopedEventId = getStepScopedEventId(data);
       if (
-        eventName === GraphEvents.ON_RUN_STEP &&
+        DIRECT_DISPATCHED_STEP_EVENTS.has(eventName) &&
         this.Graph != null &&
-        this.Graph.handlerDispatchedStepIds.has((data as t.RunStep).id)
+        stepScopedEventId != null &&
+        this.Graph.hasHandlerDispatchedEvent(eventName, stepScopedEventId)
       ) {
         return;
       }
@@ -630,7 +663,7 @@ export class Run<_T extends t.BaseGraphState> {
         const eventName: t.EventName = info.event;
 
         /** Skip custom events as they're handled by our callback */
-        if (eventName === GraphEvents.ON_CUSTOM_EVENT) {
+        if (CUSTOM_GRAPH_EVENTS.has(eventName)) {
           continue;
         }
 

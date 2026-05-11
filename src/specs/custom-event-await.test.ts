@@ -22,6 +22,95 @@ describe('Custom event handler awaitHandlers behavior', () => {
     version: 'v2' as const,
   };
 
+  it('does not redispatch SDK custom events yielded by streamEvents', async () => {
+    const handledEvents: GraphEvents[] = [];
+    const customHandlers: Record<string | GraphEvents, t.EventHandler> = {
+      [GraphEvents.ON_MESSAGE_DELTA]: {
+        handle: (event: GraphEvents): void => {
+          handledEvents.push(event);
+        },
+      },
+    };
+
+    const run = await Run.create<t.IState>({
+      runId: 'test-custom-events-skip-stream-loop',
+      graphConfig: {
+        type: 'standard',
+        llmConfig,
+      },
+      skipCleanup: true,
+      customHandlers,
+    });
+
+    async function* streamEvents(): AsyncGenerator<t.StreamEvent> {
+      yield {
+        event: GraphEvents.ON_MESSAGE_DELTA,
+        name: 'custom-event',
+        run_id: 'custom-event-run',
+        metadata: {},
+        data: {},
+      };
+    }
+
+    run.graphRunnable = { streamEvents } as unknown as t.CompiledStateWorkflow;
+
+    await run.processStream({ messages: [new HumanMessage('hello')] }, config);
+
+    expect(handledEvents).toEqual([]);
+  });
+
+  it('dispatches message deltas through the graph handler registry', async () => {
+    const handledEvents: Array<{
+      data: t.MessageDeltaEvent;
+      metadata?: Record<string, unknown>;
+    }> = [];
+    const customHandlers: Record<string | GraphEvents, t.EventHandler> = {
+      [GraphEvents.ON_MESSAGE_DELTA]: {
+        handle: (_event, data, metadata): void => {
+          handledEvents.push({
+            data: data as t.MessageDeltaEvent,
+            metadata,
+          });
+        },
+      },
+    };
+
+    const run = await Run.create<t.IState>({
+      runId: 'test-message-delta-direct-dispatch',
+      graphConfig: {
+        type: 'standard',
+        llmConfig,
+      },
+      skipCleanup: true,
+      customHandlers,
+    });
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+
+    const metadata = { thread_id: 'thread_direct', langgraph_step: 1 };
+    run.Graph.config = { configurable: { thread_id: 'thread_direct' } };
+    await run.Graph.dispatchMessageDelta(
+      'step_direct',
+      {
+        content: [{ type: ContentTypes.TEXT, text: 'hello' }],
+      },
+      metadata
+    );
+
+    expect(handledEvents).toEqual([
+      {
+        data: {
+          id: 'step_direct',
+          delta: {
+            content: [{ type: ContentTypes.TEXT, text: 'hello' }],
+          },
+        },
+        metadata,
+      },
+    ]);
+  });
+
   it('should fully aggregate all content before processStream returns', async () => {
     const longResponse =
       'The quick brown fox jumps over the lazy dog and then runs across the field to find shelter from the rain';

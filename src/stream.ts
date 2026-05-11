@@ -273,25 +273,33 @@ hasToolCallChunks: ${hasToolCallChunks}
       return;
     } else if (typeof content === 'string') {
       if (agentContext.currentTokenType === ContentTypes.TEXT) {
-        await graph.dispatchMessageDelta(stepId, {
-          content: [
-            {
-              type: ContentTypes.TEXT,
-              text: content,
-            },
-          ],
-        });
+        await graph.dispatchMessageDelta(
+          stepId,
+          {
+            content: [
+              {
+                type: ContentTypes.TEXT,
+                text: content,
+              },
+            ],
+          },
+          metadata
+        );
       } else if (agentContext.currentTokenType === 'think_and_text') {
         const { text, thinking } = parseThinkingContent(content);
         if (thinking) {
-          await graph.dispatchReasoningDelta(stepId, {
-            content: [
-              {
-                type: ContentTypes.THINK,
-                think: thinking,
-              },
-            ],
-          });
+          await graph.dispatchReasoningDelta(
+            stepId,
+            {
+              content: [
+                {
+                  type: ContentTypes.THINK,
+                  think: thinking,
+                },
+              ],
+            },
+            metadata
+          );
         }
         if (text) {
           agentContext.currentTokenType = ContentTypes.TEXT;
@@ -310,31 +318,43 @@ hasToolCallChunks: ${hasToolCallChunks}
           );
 
           const newStepId = graph.getStepIdByKey(newStepKey);
-          await graph.dispatchMessageDelta(newStepId, {
-            content: [
-              {
-                type: ContentTypes.TEXT,
-                text: text,
-              },
-            ],
-          });
+          await graph.dispatchMessageDelta(
+            newStepId,
+            {
+              content: [
+                {
+                  type: ContentTypes.TEXT,
+                  text: text,
+                },
+              ],
+            },
+            metadata
+          );
         }
       } else {
-        await graph.dispatchReasoningDelta(stepId, {
-          content: [
-            {
-              type: ContentTypes.THINK,
-              think: content,
-            },
-          ],
-        });
+        await graph.dispatchReasoningDelta(
+          stepId,
+          {
+            content: [
+              {
+                type: ContentTypes.THINK,
+                think: content,
+              },
+            ],
+          },
+          metadata
+        );
       }
     } else if (
       content.every((c) => c.type?.startsWith(ContentTypes.TEXT) ?? false)
     ) {
-      await graph.dispatchMessageDelta(stepId, {
-        content,
-      });
+      await graph.dispatchMessageDelta(
+        stepId,
+        {
+          content,
+        },
+        metadata
+      );
     } else if (
       content.every(
         (c) =>
@@ -344,16 +364,21 @@ hasToolCallChunks: ${hasToolCallChunks}
           c.type === 'redacted_thinking'
       )
     ) {
-      await graph.dispatchReasoningDelta(stepId, {
-        content: content.map((c) => ({
-          type: ContentTypes.THINK,
-          think:
-            (c as t.ThinkingContentText).thinking ??
-            (c as Partial<t.GoogleReasoningContentText>).reasoning ??
-            (c as Partial<t.BedrockReasoningContentText>).reasoningText?.text ??
-            '',
-        })),
-      });
+      await graph.dispatchReasoningDelta(
+        stepId,
+        {
+          content: content.map((c) => ({
+            type: ContentTypes.THINK,
+            think:
+              (c as t.ThinkingContentText).thinking ??
+              (c as Partial<t.GoogleReasoningContentText>).reasoning ??
+              (c as Partial<t.BedrockReasoningContentText>).reasoningText
+                ?.text ??
+              '',
+          })),
+        },
+        metadata
+      );
     }
   }
   handleReasoning(

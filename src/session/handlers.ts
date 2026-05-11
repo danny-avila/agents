@@ -1,7 +1,7 @@
 import type { UsageMetadata } from '@langchain/core/messages';
 import { GraphEvents } from '@/common';
 import { ModelEndHandler, ToolEndHandler } from '@/events';
-import { ChatModelStreamHandler, createContentAggregator } from '@/stream';
+import { createContentAggregator } from '@/stream';
 import type * as t from '@/types';
 import type {
   AgentSessionHandlersResult,
@@ -92,7 +92,6 @@ export function createRunHandlers(params: {
     events.push(event);
     params.onEvent?.(event);
   };
-  const chatModelStreamHandler = new ChatModelStreamHandler();
   const toolEndHandler = new ToolEndHandler();
   const modelEndHandler = new ModelEndHandler();
 
@@ -101,12 +100,6 @@ export function createRunHandlers(params: {
   const handlers: Record<string, t.EventHandler> = {
     [GraphEvents.CHAT_MODEL_STREAM]: {
       handle: async (event, data, metadata, graph): Promise<void> => {
-        await chatModelStreamHandler.handle(
-          event,
-          data as t.StreamEventData,
-          metadata,
-          graph
-        );
         await callUserHandler({
           userHandlers: params.userHandlers,
           event,
