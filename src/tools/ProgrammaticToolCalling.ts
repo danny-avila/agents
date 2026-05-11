@@ -4,6 +4,7 @@ import fetch, { RequestInit } from 'node-fetch';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { tool, DynamicStructuredTool } from '@langchain/core/tools';
 import type { ToolCall } from '@langchain/core/messages/tool';
+import type { ProgrammaticToolCallingJsonSchema } from './ptcTimeout';
 import type * as t from '@/types';
 import {
   buildCodeApiHttpErrorMessage,
@@ -11,6 +12,11 @@ import {
   getCodeBaseURL,
   resolveCodeApiAuthHeaders,
 } from './CodeExecutor';
+import {
+  clampCodeApiRunTimeoutMs,
+  createCodeApiRunTimeoutSchema,
+  resolveCodeApiRunTimeoutMs,
+} from './ptcTimeout';
 import { Constants } from '@/common';
 
 config();
@@ -18,8 +24,7 @@ config();
 /** Default max round-trips to prevent infinite loops */
 const DEFAULT_MAX_ROUND_TRIPS = 20;
 
-/** Default execution timeout in milliseconds */
-const DEFAULT_TIMEOUT = 60000;
+const DEFAULT_RUN_TIMEOUT_MS = resolveCodeApiRunTimeoutMs();
 
 // ============================================================================
 // Description Components (Single Source of Truth)
@@ -35,7 +40,8 @@ const CORE_RULES = `Rules:
 - Just write code with await—auto-wrapped in async context
 - DO NOT define async def main() or call asyncio.run()
 - Tools are pre-defined—DO NOT write function definitions
-- Only print() output returns to the model`;
+- Only print() output returns to the model
+- timeout caps one sandbox run/replay iteration, not the total multi-round-trip workflow`;
 
 const ADDITIONAL_RULES = `- Generated files are automatically available in /mnt/data/ for subsequent executions
 - Tool names normalized: hyphens→underscores, keywords get \`_tool\` suffix`;
@@ -68,25 +74,25 @@ ${EXAMPLES}
 
 ${CORE_RULES}`;
 
-export const ProgrammaticToolCallingSchema = {
-  type: 'object',
-  properties: {
-    code: {
-      type: 'string',
-      minLength: 1,
-      description: CODE_PARAM_DESCRIPTION,
+export function createProgrammaticToolCallingSchema(
+  maxRunTimeoutMs = DEFAULT_RUN_TIMEOUT_MS
+): ProgrammaticToolCallingJsonSchema {
+  return {
+    type: 'object',
+    properties: {
+      code: {
+        type: 'string',
+        minLength: 1,
+        description: CODE_PARAM_DESCRIPTION,
+      },
+      timeout: createCodeApiRunTimeoutSchema(maxRunTimeoutMs),
     },
-    timeout: {
-      type: 'integer',
-      minimum: 1000,
-      maximum: 300000,
-      default: DEFAULT_TIMEOUT,
-      description:
-        'Maximum execution time in milliseconds. Default: 60 seconds. Max: 5 minutes.',
-    },
-  },
-  required: ['code'],
-} as const;
+    required: ['code'],
+  } as const;
+}
+
+export const ProgrammaticToolCallingSchema =
+  createProgrammaticToolCallingSchema();
 
 export const ProgrammaticToolCallingName = Constants.PROGRAMMATIC_TOOL_CALLING;
 
@@ -731,6 +737,7 @@ export function createProgrammaticToolCallingTool(
 ): DynamicStructuredTool {
   const baseUrl = initParams.baseUrl ?? getCodeBaseURL();
   const maxRoundTrips = initParams.maxRoundTrips ?? DEFAULT_MAX_ROUND_TRIPS;
+  const maxRunTimeoutMs = resolveCodeApiRunTimeoutMs(initParams.runTimeoutMs);
   const proxy = initParams.proxy ?? process.env.PROXY;
   const debug = initParams.debug ?? process.env.PTC_DEBUG === 'true';
   const EXEC_ENDPOINT = `${baseUrl}/exec/programmatic`;
@@ -738,7 +745,8 @@ export function createProgrammaticToolCallingTool(
   return tool(
     async (rawParams, config) => {
       const params = rawParams as { code: string; timeout?: number };
-      const { code, timeout = DEFAULT_TIMEOUT } = params;
+      const { code } = params;
+      const timeout = clampCodeApiRunTimeoutMs(params.timeout, maxRunTimeoutMs);
 
       // Extra params injected by ToolNode (follows web_search pattern).
       const toolCall = (config.toolCall ?? {}) as ToolCall &
@@ -873,7 +881,7 @@ export function createProgrammaticToolCallingTool(
     {
       name: Constants.PROGRAMMATIC_TOOL_CALLING,
       description: ProgrammaticToolCallingDescription,
-      schema: ProgrammaticToolCallingSchema,
+      schema: createProgrammaticToolCallingSchema(maxRunTimeoutMs),
       responseFormat: Constants.CONTENT_AND_ARTIFACT,
     }
   );

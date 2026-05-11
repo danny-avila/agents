@@ -900,6 +900,8 @@ export type ProgrammaticToolCallingParams = {
   baseUrl?: string;
   /** Safety limit for round-trips (default: 20) */
   maxRoundTrips?: number;
+  /** Maximum per-sandbox-run timeout for PTC's legacy `timeout` field. */
+  runTimeoutMs?: number;
   /** HTTP proxy URL */
   proxy?: string;
   /** Enable debug logging (or set PTC_DEBUG=true env var) */

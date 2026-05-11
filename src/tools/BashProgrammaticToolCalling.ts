@@ -1,6 +1,7 @@
 import { config } from 'dotenv';
 import { tool, DynamicStructuredTool } from '@langchain/core/tools';
 import type { ToolCall } from '@langchain/core/messages/tool';
+import type { ProgrammaticToolCallingJsonSchema } from './ptcTimeout';
 import type * as t from '@/types';
 import {
   makeRequest,
@@ -8,6 +9,11 @@ import {
   formatCompletedResponse,
 } from './ProgrammaticToolCalling';
 import { getCodeBaseURL } from './CodeExecutor';
+import {
+  clampCodeApiRunTimeoutMs,
+  createCodeApiRunTimeoutSchema,
+  resolveCodeApiRunTimeoutMs,
+} from './ptcTimeout';
 import { Constants } from '@/common';
 
 config();
@@ -17,7 +23,7 @@ config();
 // ============================================================================
 
 const DEFAULT_MAX_ROUND_TRIPS = 20;
-const DEFAULT_TIMEOUT = 60000;
+const DEFAULT_RUN_TIMEOUT_MS = resolveCodeApiRunTimeoutMs();
 
 /** Bash reserved words that get `_tool` suffix when used as function names */
 const BASH_RESERVED = new Set([
@@ -60,7 +66,8 @@ const CORE_RULES = `Rules:
 - Tools are pre-defined as bash functions—DO NOT redefine them
 - Each tool function accepts a JSON string argument
 - Only echo/printf output returns to the model
-- Generated files are automatically available in /mnt/data/ for subsequent executions`;
+- Generated files are automatically available in /mnt/data/ for subsequent executions
+- timeout caps one sandbox run/replay iteration, not the total multi-round-trip workflow`;
 
 const ADDITIONAL_RULES =
   '- Tool names normalized: hyphens→underscores, reserved words get `_tool` suffix';
@@ -92,25 +99,25 @@ ${CORE_RULES}`;
 // Schema
 // ============================================================================
 
-export const BashProgrammaticToolCallingSchema = {
-  type: 'object',
-  properties: {
-    code: {
-      type: 'string',
-      minLength: 1,
-      description: CODE_PARAM_DESCRIPTION,
+export function createBashProgrammaticToolCallingSchema(
+  maxRunTimeoutMs = DEFAULT_RUN_TIMEOUT_MS
+): ProgrammaticToolCallingJsonSchema {
+  return {
+    type: 'object',
+    properties: {
+      code: {
+        type: 'string',
+        minLength: 1,
+        description: CODE_PARAM_DESCRIPTION,
+      },
+      timeout: createCodeApiRunTimeoutSchema(maxRunTimeoutMs),
     },
-    timeout: {
-      type: 'integer',
-      minimum: 1000,
-      maximum: 300000,
-      default: DEFAULT_TIMEOUT,
-      description:
-        'Maximum execution time in milliseconds. Default: 60 seconds. Max: 5 minutes.',
-    },
-  },
-  required: ['code'],
-} as const;
+    required: ['code'],
+  } as const;
+}
+
+export const BashProgrammaticToolCallingSchema =
+  createBashProgrammaticToolCallingSchema();
 
 export const BashProgrammaticToolCallingName =
   Constants.BASH_PROGRAMMATIC_TOOL_CALLING;
@@ -242,6 +249,7 @@ export function createBashProgrammaticToolCallingTool(
 ): DynamicStructuredTool {
   const baseUrl = initParams.baseUrl ?? getCodeBaseURL();
   const maxRoundTrips = initParams.maxRoundTrips ?? DEFAULT_MAX_ROUND_TRIPS;
+  const maxRunTimeoutMs = resolveCodeApiRunTimeoutMs(initParams.runTimeoutMs);
   const proxy = initParams.proxy ?? process.env.PROXY;
   const debug = initParams.debug ?? process.env.BASH_PTC_DEBUG === 'true';
   const EXEC_ENDPOINT = `${baseUrl}/exec/programmatic`;
@@ -249,7 +257,8 @@ export function createBashProgrammaticToolCallingTool(
   return tool(
     async (rawParams, config) => {
       const params = rawParams as { code: string; timeout?: number };
-      const { code, timeout = DEFAULT_TIMEOUT } = params;
+      const { code } = params;
+      const timeout = clampCodeApiRunTimeoutMs(params.timeout, maxRunTimeoutMs);
 
       const toolCall = (config.toolCall ?? {}) as ToolCall &
         Partial<t.ProgrammaticCache> & {
@@ -382,7 +391,7 @@ export function createBashProgrammaticToolCallingTool(
     {
       name: Constants.BASH_PROGRAMMATIC_TOOL_CALLING,
       description: BashProgrammaticToolCallingDescription,
-      schema: BashProgrammaticToolCallingSchema,
+      schema: createBashProgrammaticToolCallingSchema(maxRunTimeoutMs),
       responseFormat: Constants.CONTENT_AND_ARTIFACT,
     }
   );

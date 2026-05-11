@@ -261,4 +261,5 @@ export enum TitleMethod {
 
 export enum EnvVar {
   CODE_BASEURL = 'LIBRECHAT_CODE_BASEURL',
+  CODE_API_RUN_TIMEOUT_MS = 'CODE_API_RUN_TIMEOUT_MS',
 }

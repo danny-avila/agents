@@ -13,6 +13,10 @@ import {
   makeRequest,
 } from '../ProgrammaticToolCalling';
 import { createBashProgrammaticToolCallingTool } from '../BashProgrammaticToolCalling';
+import {
+  clampCodeApiRunTimeoutMs,
+  createCodeApiRunTimeoutSchema,
+} from '../ptcTimeout';
 
 jest.mock('node-fetch', () => ({
   __esModule: true,
@@ -23,7 +27,16 @@ type FetchMock = jest.MockedFunction<
   (url: unknown, init?: unknown) => Promise<unknown>
 >;
 
+type CodeApiRequestBody = {
+  timeout?: number;
+};
+
 const fetchMock = fetch as unknown as FetchMock;
+
+function requestBodyAt(callIndex: number): CodeApiRequestBody {
+  const init = fetchMock.mock.calls[callIndex]?.[1] as RequestInit;
+  return JSON.parse(init.body as string) as CodeApiRequestBody;
+}
 
 function jsonResponse(body: unknown): unknown {
   return {
@@ -201,6 +214,56 @@ describe('CodeAPI auth header injection', () => {
         })
       );
     }
+  });
+
+  it('defaults programmatic timeout to the configured CodeAPI run cap', async () => {
+    const tool = createProgrammaticToolCallingTool({
+      runTimeoutMs: 15000,
+    });
+
+    await tool.invoke(
+      { code: 'result = await lookup_user()\nprint(result)' },
+      {
+        toolCall: {
+          name: 'programmatic_code_execution',
+          args: {},
+          toolMap: toolMap(),
+          toolDefs,
+        },
+      }
+    );
+
+    expect(requestBodyAt(0).timeout).toBe(15000);
+  });
+
+  it('defaults bash programmatic timeout to the configured CodeAPI run cap', async () => {
+    const tool = createBashProgrammaticToolCallingTool({
+      runTimeoutMs: 15000,
+    });
+
+    await tool.invoke(
+      { code: 'lookup_user "{}"' },
+      {
+        toolCall: {
+          name: 'bash_programmatic_code_execution',
+          args: {},
+          toolMap: toolMap(),
+          toolDefs,
+        },
+      }
+    );
+
+    expect(requestBodyAt(0).timeout).toBe(15000);
+  });
+
+  it('describes the PTC timeout as a single sandbox run cap', () => {
+    const schema = createCodeApiRunTimeoutSchema(15000);
+
+    expect(clampCodeApiRunTimeoutMs(60000, 15000)).toBe(15000);
+    expect(schema.default).toBe(15000);
+    expect(schema.maximum).toBe(15000);
+    expect(schema.description).toContain('one sandbox run');
+    expect(schema.description).toContain('not the total multi-round-trip');
   });
 
   it('forwards Authorization for bash programmatic requests', async () => {
