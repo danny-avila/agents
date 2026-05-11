@@ -1219,6 +1219,7 @@ export class AgentSession {
   ): Promise<AgentSessionRunResult> {
     const runId = options.runId ?? createRunId();
     const threadId = options.threadId ?? this.threadId;
+    const isSessionThread = threadId === this.threadId;
     const callerConfig = createCallerConfig(threadId, options);
     await this.store?.appendRunEvent('run.started', undefined, {
       runId,
@@ -1229,7 +1230,9 @@ export class AgentSession {
       threadId,
       userHandlers: this.runConfig.customHandlers,
     });
-    const sessionState = createSessionRunState(this.store?.getPath() ?? []);
+    const sessionState = createSessionRunState(
+      isSessionThread ? (this.store?.getPath() ?? []) : []
+    );
     try {
       const run = await Run.create<t.IState>({
         ...this.runConfig,
@@ -1250,8 +1253,10 @@ export class AgentSession {
       });
       const content = await run.resume(resumeValue, callerConfig);
       const runMessages = run.getRunMessages() ?? [];
-      for (const message of runMessages) {
-        await this.store?.appendMessage(message);
+      if (isSessionThread) {
+        for (const message of runMessages) {
+          await this.store?.appendMessage(message);
+        }
       }
       this.calibrationRatio = run.getCalibrationRatio();
       const interrupt = run.getInterrupt();

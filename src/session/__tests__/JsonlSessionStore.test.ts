@@ -666,6 +666,44 @@ describe('JsonlSessionStore', () => {
     ).toEqual(['history']);
   });
 
+  it('does not persist resumed override thread messages into the session path', async () => {
+    const checkpointer = new MemorySaver();
+    const mockRun = createMockRun('override resumed');
+    mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      checkpointing: { checkpointer },
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    await session.getSessionStore()?.appendMessage(new HumanMessage('history'));
+
+    await session.resumeInterrupt([], { threadId: 'thread_override' });
+
+    expect(mockRun.resume).toHaveBeenCalledWith(
+      [],
+      expect.objectContaining({
+        configurable: expect.objectContaining({
+          thread_id: 'thread_override',
+        }),
+      })
+    );
+    expect(
+      session
+        .getSessionStore()
+        ?.getPath()
+        .filter((entry) => entry.type === 'message')
+        .map((entry) => entry.data.message.content)
+    ).toEqual(['history']);
+  });
+
   it('uses only new input when LangGraph checkpoint state already exists', async () => {
     const checkpointer = new MemorySaver();
     const mockRun = createMockRun('checkpointed output');
