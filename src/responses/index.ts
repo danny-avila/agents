@@ -517,14 +517,17 @@ export function createResponsesEventHandlers(
 export async function emitResponseCompleted(
   config: ResponsesHandlerConfig
 ): Promise<void> {
-  if (config.tracker.message) {
-    config.tracker.message.status = 'completed';
-  }
-  if (config.tracker.reasoning) {
-    config.tracker.reasoning.status = 'completed';
-  }
-  for (const item of new Set(config.tracker.functionCalls.values())) {
+  for (const item of config.tracker.items) {
+    if (item.status === 'completed') {
+      continue;
+    }
     item.status = 'completed';
+    await writeResponseEvent(config.writer, {
+      type: 'response.output_item.done',
+      sequence_number: config.tracker.nextSequence(),
+      output_index: config.tracker.items.indexOf(item),
+      item,
+    });
   }
   await writeResponseEvent(config.writer, {
     type: 'response.completed',

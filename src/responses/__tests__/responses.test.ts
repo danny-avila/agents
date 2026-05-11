@@ -35,6 +35,72 @@ describe('Responses-compatible adapters', () => {
     expect(writes.at(-1)).toBe('data: [DONE]\n\n');
   });
 
+  it('emits output item completion events before response completion', async () => {
+    const writes: string[] = [];
+    const tracker = createResponseTracker();
+    const handlers = createResponsesEventHandlers({
+      writer: { write: (data) => void writes.push(data) },
+      context: { responseId: 'resp_done', model: 'agent', createdAt: 1 },
+      tracker,
+    });
+
+    await handlers[GraphEvents.ON_MESSAGE_DELTA].handle(
+      GraphEvents.ON_MESSAGE_DELTA,
+      {
+        id: 'msg',
+        delta: { content: [{ type: 'text', text: 'hello' }] },
+      } satisfies t.MessageDeltaEvent
+    );
+    await handlers[GraphEvents.ON_REASONING_DELTA].handle(
+      GraphEvents.ON_REASONING_DELTA,
+      {
+        id: 'reasoning',
+        delta: { content: [{ type: 'text', text: 'thinking' }] },
+      } as t.ReasoningDeltaEvent
+    );
+    await handlers[GraphEvents.ON_RUN_STEP_DELTA].handle(
+      GraphEvents.ON_RUN_STEP_DELTA,
+      {
+        id: 'step_1',
+        delta: {
+          type: 'tool_calls',
+          tool_calls: [{ index: 0, id: 'call_1', name: 'search' }],
+        },
+      } as t.RunStepDeltaEvent
+    );
+
+    await emitResponseCompleted({
+      writer: { write: (data) => void writes.push(data) },
+      context: { responseId: 'resp_done', model: 'agent', createdAt: 1 },
+      tracker,
+    });
+
+    const events = writes
+      .filter(
+        (data) => data.startsWith('data: ') && data !== 'data: [DONE]\n\n'
+      )
+      .map(
+        (data) =>
+          JSON.parse(data.slice(6)) as {
+            type: string;
+            output_index?: number;
+          }
+      );
+    const completedIndex = events.findIndex(
+      (event) => event.type === 'response.completed'
+    );
+    const doneEvents = events.filter(
+      (event) => event.type === 'response.output_item.done'
+    );
+    expect(doneEvents.map((event) => event.output_index)).toEqual([0, 1, 2]);
+    expect(
+      doneEvents.every(
+        (event) =>
+          events.indexOf(event) >= 0 && events.indexOf(event) < completedIndex
+      )
+    ).toBe(true);
+  });
+
   it('builds completed response usage from tracker state', () => {
     const tracker = createResponseTracker();
     tracker.usage.inputTokens = 2;
