@@ -61,6 +61,7 @@ export interface OpenAIChatCompletionChunk {
 export interface OpenAIStreamTracker {
   hasText: boolean;
   hasReasoning: boolean;
+  lastChunkKind?: 'text' | 'reasoning' | 'tool_call';
   toolCalls: Map<number, OpenAIToolCall>;
   usage: {
     promptTokens: number;
@@ -208,6 +209,7 @@ async function emitToolCallChunk(params: {
   if (name !== '') {
     current.function.name = name;
   }
+  config.tracker.lastChunkKind = 'tool_call';
   config.tracker.toolCalls.set(index, current);
   if (!idChanged && !nameChanged && argumentDelta === '' && existing) {
     return;
@@ -244,6 +246,7 @@ export function createOpenAIHandlers(
       handle: async (_event, data): Promise<void> => {
         for (const text of getTextParts(data as t.MessageDeltaEvent)) {
           config.tracker.hasText = true;
+          config.tracker.lastChunkKind = 'text';
           await writeOpenAISSE(
             config.writer,
             createChatCompletionChunk(config.context, { content: text })
@@ -255,6 +258,7 @@ export function createOpenAIHandlers(
       handle: async (_event, data): Promise<void> => {
         for (const text of getTextParts(data as t.ReasoningDeltaEvent)) {
           config.tracker.hasReasoning = true;
+          config.tracker.lastChunkKind = 'reasoning';
           await writeOpenAISSE(
             config.writer,
             createChatCompletionChunk(config.context, { reasoning: text })
@@ -319,7 +323,8 @@ export async function sendOpenAIFinalChunk(
   finishReason?: OpenAIChatCompletionChunkChoice['finish_reason']
 ): Promise<void> {
   const resolvedFinishReason =
-    finishReason ?? (config.tracker.toolCalls.size > 0 ? 'tool_calls' : 'stop');
+    finishReason ??
+    (config.tracker.lastChunkKind === 'tool_call' ? 'tool_calls' : 'stop');
   const usage: OpenAICompletionUsage = {
     prompt_tokens: config.tracker.usage.promptTokens,
     completion_tokens: config.tracker.usage.completionTokens,

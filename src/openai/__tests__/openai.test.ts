@@ -78,6 +78,41 @@ describe('OpenAI-compatible adapters', () => {
     expect(writes.at(-2)).toContain('"finish_reason":"tool_calls"');
   });
 
+  it('uses stop finish reason when assistant text follows tool calls', async () => {
+    const writes: string[] = [];
+    const tracker = createOpenAIStreamTracker();
+    const handlers = createOpenAIHandlers({
+      writer: { write: (data) => void writes.push(data) },
+      context: { requestId: 'chatcmpl_tools_done', model: 'agent', created: 1 },
+      tracker,
+    });
+
+    await handlers[GraphEvents.ON_RUN_STEP_DELTA].handle(
+      GraphEvents.ON_RUN_STEP_DELTA,
+      {
+        id: 'step_1',
+        delta: {
+          type: 'tool_calls',
+          tool_calls: [{ index: 0, id: 'call_1', name: 'search' }],
+        },
+      } as t.RunStepDeltaEvent
+    );
+    await handlers[GraphEvents.ON_MESSAGE_DELTA].handle(
+      GraphEvents.ON_MESSAGE_DELTA,
+      {
+        id: 'msg',
+        delta: { content: [{ type: 'text', text: 'done' }] },
+      } satisfies t.MessageDeltaEvent
+    );
+    await sendOpenAIFinalChunk({
+      writer: { write: (data) => void writes.push(data) },
+      context: { requestId: 'chatcmpl_tools_done', model: 'agent', created: 1 },
+      tracker,
+    });
+
+    expect(writes.at(-2)).toContain('"finish_reason":"stop"');
+  });
+
   it('streams completed tool-call run steps without deltas', async () => {
     const writes: string[] = [];
     const tracker = createOpenAIStreamTracker();

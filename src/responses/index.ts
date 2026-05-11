@@ -207,7 +207,7 @@ function findFunctionCallByStep(
     return undefined;
   }
   const index = typeof toolCall.index === 'number' ? toolCall.index : undefined;
-  if (index != null && items[index] != null) {
+  if (index != null) {
     return items[index];
   }
   const name = getToolCallName(toolCall);
@@ -284,10 +284,11 @@ async function ensureFunctionCall(
     stepId,
     toolCall
   );
+  const toolCallIndex = getToolCallIndex(toolCall, fallbackIndex);
   const name = getToolCallName(toolCall);
   if (existing) {
     trackFunctionCallKeys(config, existing, idKey, positionKey);
-    trackFunctionCallStep(config, stepId, existing, fallbackIndex);
+    trackFunctionCallStep(config, stepId, existing, toolCallIndex);
     if (idKey != null) {
       existing.call_id = idKey;
     }
@@ -305,7 +306,7 @@ async function ensureFunctionCall(
     status: 'in_progress',
   };
   trackFunctionCallKeys(config, item, idKey, positionKey);
-  trackFunctionCallStep(config, stepId, item, fallbackIndex);
+  trackFunctionCallStep(config, stepId, item, toolCallIndex);
   config.tracker.items.push(item);
   await writeResponseEvent(config.writer, {
     type: 'response.output_item.added',
