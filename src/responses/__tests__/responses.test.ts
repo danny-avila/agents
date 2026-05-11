@@ -138,6 +138,20 @@ describe('Responses-compatible adapters', () => {
           events.indexOf(event) >= 0 && events.indexOf(event) < completedIndex
       )
     ).toBe(true);
+    expect(events.map((event) => event.type)).toEqual([
+      'response.created',
+      'response.output_item.added',
+      'response.output_text.delta',
+      'response.output_item.added',
+      'response.reasoning_text.delta',
+      'response.output_item.added',
+      'response.output_text.done',
+      'response.output_item.done',
+      'response.reasoning_text.done',
+      'response.output_item.done',
+      'response.output_item.done',
+      'response.completed',
+    ]);
   });
 
   it('builds completed response usage from tracker state', () => {
@@ -410,6 +424,77 @@ describe('Responses-compatible adapters', () => {
     expect(tracker.items[0]).toMatchObject({
       type: 'function_call',
       call_id: 'call_1',
+      name: 'search',
+      arguments: '{"query":"sessions"}',
+      status: 'completed',
+    });
+  });
+
+  it('completes id-less tool calls using the tool-call position', async () => {
+    const writes: string[] = [];
+    const tracker = createResponseTracker();
+    const handlers = createResponsesEventHandlers({
+      writer: { write: (data) => void writes.push(data) },
+      context: {
+        responseId: 'resp_tools_no_id',
+        model: 'agent',
+        createdAt: 1,
+      },
+      tracker,
+    });
+
+    await handlers[GraphEvents.ON_RUN_STEP_DELTA].handle(
+      GraphEvents.ON_RUN_STEP_DELTA,
+      {
+        id: 'step_1',
+        delta: {
+          type: 'tool_calls',
+          tool_calls: [{ index: 0, name: 'search', args: '{"query"' }],
+        },
+      } as t.RunStepDeltaEvent
+    );
+    await handlers[GraphEvents.ON_RUN_STEP_COMPLETED].handle(
+      GraphEvents.ON_RUN_STEP_COMPLETED,
+      {
+        result: {
+          id: 'step_1',
+          index: 7,
+          type: 'tool_call',
+          tool_call: {
+            name: 'search',
+            args: '{"query":"sessions"}',
+            output: 'ok',
+            progress: 1,
+          },
+        },
+      }
+    );
+
+    const events = writes
+      .filter((data) => data.startsWith('data: '))
+      .map(
+        (data) =>
+          JSON.parse(data.slice(6)) as {
+            type: string;
+            call_id?: string;
+            arguments?: string;
+          }
+      );
+    expect(
+      events.filter((event) => event.type === 'response.output_item.added')
+    ).toHaveLength(1);
+    expect(
+      events.find(
+        (event) => event.type === 'response.function_call_arguments.done'
+      )
+    ).toMatchObject({
+      call_id: 'step_1:0',
+      arguments: '{"query":"sessions"}',
+    });
+    expect(tracker.items).toHaveLength(1);
+    expect(tracker.items[0]).toMatchObject({
+      type: 'function_call',
+      call_id: 'step_1:0',
       name: 'search',
       arguments: '{"query":"sessions"}',
       status: 'completed',
