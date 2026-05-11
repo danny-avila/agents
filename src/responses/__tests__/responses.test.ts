@@ -149,6 +149,7 @@ describe('Responses-compatible adapters', () => {
       'response.output_item.done',
       'response.reasoning_text.done',
       'response.output_item.done',
+      'response.function_call_arguments.done',
       'response.output_item.done',
       'response.completed',
     ]);
@@ -335,6 +336,78 @@ describe('Responses-compatible adapters', () => {
       call_id: 'call_1',
       name: 'search',
       arguments: '{"query":"sessions"}',
+      status: 'completed',
+    });
+  });
+
+  it('emits function call arguments done before closing unfinished tool items', async () => {
+    const writes: string[] = [];
+    const tracker = createResponseTracker();
+    const handlers = createResponsesEventHandlers({
+      writer: { write: (data) => void writes.push(data) },
+      context: {
+        responseId: 'resp_unfinished_tool',
+        model: 'agent',
+        createdAt: 1,
+      },
+      tracker,
+    });
+
+    await handlers[GraphEvents.ON_RUN_STEP_DELTA].handle(
+      GraphEvents.ON_RUN_STEP_DELTA,
+      {
+        id: 'step_1',
+        delta: {
+          type: 'tool_calls',
+          tool_calls: [
+            {
+              index: 0,
+              id: 'call_1',
+              name: 'search',
+              args: '{"query":"sessions"}',
+            },
+          ],
+        },
+      } as t.RunStepDeltaEvent
+    );
+
+    await emitResponseCompleted({
+      writer: { write: (data) => void writes.push(data) },
+      context: {
+        responseId: 'resp_unfinished_tool',
+        model: 'agent',
+        createdAt: 1,
+      },
+      tracker,
+    });
+
+    const events = writes
+      .filter(
+        (data) => data.startsWith('data: ') && data !== 'data: [DONE]\n\n'
+      )
+      .map(
+        (data) =>
+          JSON.parse(data.slice(6)) as {
+            type: string;
+            call_id?: string;
+            arguments?: string;
+          }
+      );
+    const argumentsDoneIndex = events.findIndex(
+      (event) => event.type === 'response.function_call_arguments.done'
+    );
+    const itemDoneIndex = events.findIndex(
+      (event) => event.type === 'response.output_item.done'
+    );
+
+    expect(argumentsDoneIndex).toBeGreaterThan(-1);
+    expect(itemDoneIndex).toBeGreaterThan(argumentsDoneIndex);
+    expect(events[argumentsDoneIndex]).toMatchObject({
+      call_id: 'call_1',
+      arguments: '{"query":"sessions"}',
+    });
+    expect(tracker.items[0]).toMatchObject({
+      type: 'function_call',
       status: 'completed',
     });
   });

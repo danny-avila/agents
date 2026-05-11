@@ -336,6 +336,21 @@ async function emitFunctionCallArgumentsDelta(params: {
   });
 }
 
+async function emitFunctionCallArgumentsDone(
+  config: ResponsesHandlerConfig,
+  item: ResponseFunctionCallItem
+): Promise<void> {
+  await writeResponseEvent(config.writer, {
+    type: 'response.function_call_arguments.done',
+    sequence_number: config.tracker.nextSequence(),
+    item_id: item.id,
+    output_index: config.tracker.items.indexOf(item),
+    call_id: item.call_id,
+    name: item.name,
+    arguments: item.arguments,
+  });
+}
+
 async function completeFunctionCall(
   config: ResponsesHandlerConfig,
   stepId: string,
@@ -373,15 +388,7 @@ async function completeFunctionCall(
   } else if (finalArguments !== '') {
     item.arguments = finalArguments;
   }
-  await writeResponseEvent(config.writer, {
-    type: 'response.function_call_arguments.done',
-    sequence_number: config.tracker.nextSequence(),
-    item_id: item.id,
-    output_index: config.tracker.items.indexOf(item),
-    call_id: item.call_id,
-    name: item.name,
-    arguments: item.arguments,
-  });
+  await emitFunctionCallArgumentsDone(config, item);
   item.status = 'completed';
   await writeResponseEvent(config.writer, {
     type: 'response.output_item.done',
@@ -650,6 +657,8 @@ export async function emitResponseCompleted(
     }
     if (item.type === 'message' || item.type === 'reasoning') {
       await emitOutputContentDone(config, item);
+    } else {
+      await emitFunctionCallArgumentsDone(config, item);
     }
     item.status = 'completed';
     await writeResponseEvent(config.writer, {
