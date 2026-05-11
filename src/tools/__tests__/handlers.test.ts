@@ -134,7 +134,8 @@ describe('handleToolCallChunks', () => {
     expect(graph.dispatchRunStepDelta).toHaveBeenCalledTimes(1);
     expect(graph.dispatchRunStepDelta).toHaveBeenCalledWith(
       'prev-step-id',
-      expect.objectContaining({ type: StepTypes.TOOL_CALLS })
+      expect.objectContaining({ type: StepTypes.TOOL_CALLS }),
+      defaultMetadata
     );
   });
 

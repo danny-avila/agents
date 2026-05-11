@@ -30,9 +30,48 @@ describe('Responses-compatible adapters', () => {
       tracker,
     });
 
+    expect(writes.join('')).toContain('response.created');
     expect(writes.join('')).toContain('response.output_text.delta');
     expect(writes.join('')).toContain('response.completed');
     expect(writes.at(-1)).toBe('data: [DONE]\n\n');
+  });
+
+  it('emits response.created before output item events once', async () => {
+    const writes: string[] = [];
+    const tracker = createResponseTracker();
+    const handlers = createResponsesEventHandlers({
+      writer: { write: (data) => void writes.push(data) },
+      context: { responseId: 'resp_created', model: 'agent', createdAt: 1 },
+      tracker,
+    });
+
+    await handlers[GraphEvents.ON_MESSAGE_DELTA].handle(
+      GraphEvents.ON_MESSAGE_DELTA,
+      {
+        id: 'msg',
+        delta: { content: [{ type: 'text', text: 'hello' }] },
+      } satisfies t.MessageDeltaEvent
+    );
+    await handlers[GraphEvents.ON_MESSAGE_DELTA].handle(
+      GraphEvents.ON_MESSAGE_DELTA,
+      {
+        id: 'msg',
+        delta: { content: [{ type: 'text', text: ' again' }] },
+      } satisfies t.MessageDeltaEvent
+    );
+
+    const events = writes
+      .filter((data) => data.startsWith('data: '))
+      .map((data) => JSON.parse(data.slice(6)) as { type: string });
+    expect(events[0].type).toBe('response.created');
+    expect(
+      events.filter((event) => event.type === 'response.created')
+    ).toHaveLength(1);
+    expect(
+      events.findIndex((event) => event.type === 'response.created')
+    ).toBeLessThan(
+      events.findIndex((event) => event.type === 'response.output_item.added')
+    );
   });
 
   it('emits output item completion events before response completion', async () => {
@@ -146,10 +185,11 @@ describe('Responses-compatible adapters', () => {
           }
       );
     expect(events.map((event) => event.type)).toEqual([
+      'response.created',
       'response.output_item.added',
       'response.reasoning_text.delta',
     ]);
-    expect(events[1]).toMatchObject({
+    expect(events[2]).toMatchObject({
       delta: 'thinking',
     });
   });
@@ -260,6 +300,7 @@ describe('Responses-compatible adapters', () => {
           }
       );
     expect(events.map((event) => event.type)).toEqual([
+      'response.created',
       'response.output_item.added',
       'response.function_call_arguments.delta',
       'response.function_call_arguments.delta',

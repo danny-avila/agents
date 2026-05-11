@@ -103,6 +103,10 @@ function getTokenCount(value: number | null | undefined): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0;
 }
 
+function getReasoningTokenCount(usage: Partial<UsageMetadata>): number {
+  return getTokenCount(usage.output_token_details?.reasoning);
+}
+
 function getToolCallIndex(
   toolCall: OpenAIToolCallFragment,
   fallbackIndex: number
@@ -304,6 +308,7 @@ export function createOpenAIHandlers(
         config.tracker.usage.completionTokens += getTokenCount(
           usage.output_tokens
         );
+        config.tracker.usage.reasoningTokens += getReasoningTokenCount(usage);
       },
     },
   };

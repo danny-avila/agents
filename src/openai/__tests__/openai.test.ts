@@ -151,6 +151,46 @@ describe('OpenAI-compatible adapters', () => {
     expect(tracker.usage.completionTokens).toBe(5);
   });
 
+  it('includes reasoning token usage in the final chunk', async () => {
+    const writes: string[] = [];
+    const tracker = createOpenAIStreamTracker();
+    const handlers = createOpenAIHandlers({
+      writer: { write: (data) => void writes.push(data) },
+      context: {
+        requestId: 'chatcmpl_reasoning_usage',
+        model: 'agent',
+        created: 1,
+      },
+      tracker,
+    });
+
+    await handlers[GraphEvents.CHAT_MODEL_END].handle(
+      GraphEvents.CHAT_MODEL_END,
+      {
+        output: {
+          usage_metadata: {
+            input_tokens: 3,
+            output_tokens: 5,
+            output_token_details: { reasoning: 2 },
+          },
+        },
+      } as t.ModelEndData
+    );
+    await sendOpenAIFinalChunk({
+      writer: { write: (data) => void writes.push(data) },
+      context: {
+        requestId: 'chatcmpl_reasoning_usage',
+        model: 'agent',
+        created: 1,
+      },
+      tracker,
+    });
+
+    expect(writes.at(-2)).toContain(
+      '"completion_tokens_details":{"reasoning_tokens":2}'
+    );
+  });
+
   it('builds a chat completion chunk without transport dependencies', () => {
     expect(
       createChatCompletionChunk(

@@ -88,6 +88,7 @@ export interface ResponseTracker {
   message: ResponseMessageItem | undefined;
   reasoning: ResponseReasoningItem | undefined;
   functionCalls: Map<string, ResponseFunctionCallItem>;
+  responseCreated: boolean;
   usage: {
     inputTokens: number;
     outputTokens: number;
@@ -114,6 +115,7 @@ export function createResponseTracker(): ResponseTracker {
     message: undefined,
     reasoning: undefined,
     functionCalls: new Map(),
+    responseCreated: false,
     usage: {
       inputTokens: 0,
       outputTokens: 0,
@@ -207,6 +209,7 @@ async function ensureFunctionCall(
   toolCall: ResponseToolCallFragment,
   fallbackIndex: number
 ): Promise<ResponseFunctionCallItem> {
+  await ensureResponseCreated(config);
   const positionKey = getToolCallPositionKey(stepId, toolCall, fallbackIndex);
   const idKey = getToolCallIdKey(toolCall);
   const existing = getExistingFunctionCall(config, idKey, positionKey);
@@ -347,9 +350,24 @@ export async function writeResponsesDone(
   await writer.write('data: [DONE]\n\n');
 }
 
+export async function ensureResponseCreated(
+  config: ResponsesHandlerConfig
+): Promise<void> {
+  if (config.tracker.responseCreated) {
+    return;
+  }
+  config.tracker.responseCreated = true;
+  await writeResponseEvent(config.writer, {
+    type: 'response.created',
+    sequence_number: config.tracker.nextSequence(),
+    response: buildResponse(config.context, config.tracker),
+  });
+}
+
 async function ensureMessage(
   config: ResponsesHandlerConfig
 ): Promise<ResponseMessageItem> {
+  await ensureResponseCreated(config);
   if (config.tracker.message) {
     return config.tracker.message;
   }
@@ -374,6 +392,7 @@ async function ensureMessage(
 async function ensureReasoning(
   config: ResponsesHandlerConfig
 ): Promise<ResponseReasoningItem> {
+  await ensureResponseCreated(config);
   if (config.tracker.reasoning) {
     return config.tracker.reasoning;
   }
@@ -517,6 +536,7 @@ export function createResponsesEventHandlers(
 export async function emitResponseCompleted(
   config: ResponsesHandlerConfig
 ): Promise<void> {
+  await ensureResponseCreated(config);
   for (const item of config.tracker.items) {
     if (item.status === 'completed') {
       continue;
