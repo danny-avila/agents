@@ -1074,10 +1074,11 @@ export class MultiAgentGraph extends StandardGraph {
              * to pass filtered messages + prompt to the destination agent
              */
             const filteredMessages = state.messages.slice(0, this.startIndex);
+            const promptMessage = new HumanMessage(promptText);
             return {
-              messages: [new HumanMessage(promptText)],
+              messages: [promptMessage],
               agentMessages: messagesStateReducer(filteredMessages, [
-                new HumanMessage(promptText),
+                promptMessage,
               ]),
             };
           }

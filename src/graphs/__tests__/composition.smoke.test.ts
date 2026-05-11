@@ -1,10 +1,16 @@
-import { HumanMessage } from '@langchain/core/messages';
-import type { ToolCall } from '@langchain/core/messages/tool';
+import { HumanMessage, getBufferString } from '@langchain/core/messages';
+import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { RunnableConfig } from '@langchain/core/runnables';
+import type { ChatGenerationChunk } from '@langchain/core/outputs';
+import type { ToolCall } from '@langchain/core/messages/tool';
+import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
 import { MultiAgentGraph } from '../MultiAgentGraph';
 import { Constants, Providers } from '@/common';
+import { FakeChatModel } from '@/llm/fake';
 import { StandardGraph } from '../Graph';
+
+const CHAIN_PROMPT_PREFIX = 'Previous context:\n';
 
 const makeAgent = (agentId: string): t.AgentInputs => ({
   agentId,
@@ -28,6 +34,36 @@ const getAiContents = (messages: t.BaseGraphState['messages']): string[] =>
     .filter((message) => message.getType() === 'ai')
     .map((message) => message.content)
     .filter((content): content is string => typeof content === 'string');
+
+const getChainPromptContent = (messages: BaseMessage[]): string => {
+  const promptMessage = messages.find(
+    (message) =>
+      message.getType() === 'human' &&
+      typeof message.content === 'string' &&
+      message.content.startsWith(CHAIN_PROMPT_PREFIX)
+  );
+  if (promptMessage == null || typeof promptMessage.content !== 'string') {
+    throw new Error('Expected chain prompt message');
+  }
+  return promptMessage.content;
+};
+
+class CapturingChatModel extends FakeChatModel {
+  readonly invocations: BaseMessage[][] = [];
+
+  constructor(responses: string[]) {
+    super({ responses });
+  }
+
+  override async *_streamResponseChunks(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions'],
+    runManager?: CallbackManagerForLLMRun
+  ): AsyncGenerator<ChatGenerationChunk> {
+    this.invocations.push(messages);
+    yield* super._streamResponseChunks(messages, options, runManager);
+  }
+}
 
 const expectCompiledWorkflow = (
   workflow: t.CompiledWorkflow | t.CompiledMultiAgentWorkflow
@@ -117,6 +153,52 @@ describe('LangGraph composition smoke tests', () => {
     );
 
     expect(getAiContents(result.messages)).toEqual(['from A', 'from B']);
+  });
+
+  it('does not duplicate excludeResults chain prompt history for downstream agents', async () => {
+    const model = new CapturingChatModel(['from A', 'from B', 'from C']);
+    const prompt = (messages: BaseMessage[], startIndex: number): string =>
+      `${CHAIN_PROMPT_PREFIX}${getBufferString(messages.slice(startIndex))}`;
+    const graph = new MultiAgentGraph({
+      runId: 'exclude-results-chain-smoke',
+      agents: [makeAgent('A'), makeAgent('B'), makeAgent('C')],
+      edges: [
+        {
+          from: 'A',
+          to: 'B',
+          edgeType: 'direct',
+          prompt,
+          excludeResults: true,
+        },
+        {
+          from: 'B',
+          to: 'C',
+          edgeType: 'direct',
+          prompt,
+          excludeResults: true,
+        },
+      ],
+    });
+    graph.overrideModel = model;
+
+    const result = await graph
+      .createWorkflow()
+      .invoke(
+        { messages: [new HumanMessage('start')] },
+        makeConfig('exclude-results-chain-smoke')
+      );
+
+    expect(getAiContents(result.messages)).toEqual([
+      'from A',
+      'from B',
+      'from C',
+    ]);
+    expect(model.invocations).toHaveLength(3);
+
+    const downstreamPrompt = getChainPromptContent(model.invocations[2]);
+    const previousPromptCount =
+      downstreamPrompt.match(/Human: Previous context:/g)?.length ?? 0;
+    expect(previousPromptCount).toBe(1);
   });
 
   it('compiles and invokes a handoff edge using graph-managed transfer tools', async () => {
