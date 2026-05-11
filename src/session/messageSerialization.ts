@@ -20,6 +20,8 @@ type MessageExtras = {
   response_metadata?: unknown;
 };
 
+const CIRCULAR_REFERENCE = '[Circular]';
+
 function isJsonPrimitive(
   value: unknown
 ): value is string | number | boolean | null {
@@ -31,14 +33,24 @@ function isJsonPrimitive(
   );
 }
 
-export function toJsonValue(value: unknown): JsonValue {
+function toJsonValueInternal(value: unknown, seen: WeakSet<object>): JsonValue {
   if (isJsonPrimitive(value)) {
     return Number.isNaN(value) ? null : value;
   }
   if (Array.isArray(value)) {
-    return value.map((item) => toJsonValue(item));
+    if (seen.has(value)) {
+      return CIRCULAR_REFERENCE;
+    }
+    seen.add(value);
+    const result = value.map((item) => toJsonValueInternal(item, seen));
+    seen.delete(value);
+    return result;
   }
   if (value instanceof Error) {
+    if (seen.has(value)) {
+      return CIRCULAR_REFERENCE;
+    }
+    seen.add(value);
     const result: JsonObject = {
       name: value.name,
       message: value.message,
@@ -47,25 +59,35 @@ export function toJsonValue(value: unknown): JsonValue {
       result.stack = value.stack;
     }
     if ('cause' in value && typeof value.cause !== 'undefined') {
-      result.cause = toJsonValue(value.cause);
+      result.cause = toJsonValueInternal(value.cause, seen);
     }
     for (const [key, nested] of Object.entries(value)) {
       if (typeof nested !== 'undefined') {
-        result[key] = toJsonValue(nested);
+        result[key] = toJsonValueInternal(nested, seen);
       }
     }
+    seen.delete(value);
     return result;
   }
   if (value !== null && typeof value === 'object') {
+    if (seen.has(value)) {
+      return CIRCULAR_REFERENCE;
+    }
+    seen.add(value);
     const result: JsonObject = {};
     for (const [key, nested] of Object.entries(value)) {
       if (typeof nested !== 'undefined') {
-        result[key] = toJsonValue(nested);
+        result[key] = toJsonValueInternal(nested, seen);
       }
     }
+    seen.delete(value);
     return result;
   }
   return String(value);
+}
+
+export function toJsonValue(value: unknown): JsonValue {
+  return toJsonValueInternal(value, new WeakSet<object>());
 }
 
 function toJsonObject(value: unknown): JsonObject | undefined {

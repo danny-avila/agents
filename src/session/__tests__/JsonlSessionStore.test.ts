@@ -356,6 +356,37 @@ describe('JsonlSessionStore', () => {
     ).toBe(true);
   });
 
+  it('replaces circular object references in JSONL payloads', () => {
+    interface CircularPayload {
+      label: string;
+      self?: CircularPayload;
+      child?: { parent?: CircularPayload };
+    }
+    const circular: CircularPayload = { label: 'root' };
+    circular.self = circular;
+    circular.child = { parent: circular };
+
+    expect(toJsonValue(circular)).toMatchObject({
+      label: 'root',
+      self: '[Circular]',
+      child: { parent: '[Circular]' },
+    });
+  });
+
+  it('replaces circular Error causes in JSONL payloads', () => {
+    const error = new Error('request failed');
+    Object.defineProperty(error, 'cause', {
+      value: error,
+      configurable: true,
+    });
+
+    expect(toJsonValue(error)).toMatchObject({
+      name: 'Error',
+      message: 'request failed',
+      cause: '[Circular]',
+    });
+  });
+
   it('creates high-level sessions with a JSONL store by default', async () => {
     const session = await createAgentSession({
       cwd: dir,
