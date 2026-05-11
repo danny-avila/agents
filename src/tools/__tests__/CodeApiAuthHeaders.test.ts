@@ -17,6 +17,10 @@ import {
   clampCodeApiRunTimeoutMs,
   createCodeApiRunTimeoutSchema,
 } from '../ptcTimeout';
+import {
+  createLocalProgrammaticToolCallingTool,
+  createLocalBashProgrammaticToolCallingTool,
+} from '../local/LocalProgrammaticToolCalling';
 
 jest.mock('node-fetch', () => ({
   __esModule: true,
@@ -31,11 +35,27 @@ type CodeApiRequestBody = {
   timeout?: number;
 };
 
+type TimeoutSchemaForTest = {
+  default: number;
+  maximum: number;
+  description: string;
+};
+
+type ToolSchemaForTest = {
+  properties: {
+    timeout: TimeoutSchemaForTest;
+  };
+};
+
 const fetchMock = fetch as unknown as FetchMock;
 
 function requestBodyAt(callIndex: number): CodeApiRequestBody {
   const init = fetchMock.mock.calls[callIndex]?.[1] as RequestInit;
   return JSON.parse(init.body as string) as CodeApiRequestBody;
+}
+
+function timeoutSchemaForTest(toolSchema: unknown): TimeoutSchemaForTest {
+  return (toolSchema as ToolSchemaForTest).properties.timeout;
 }
 
 function jsonResponse(body: unknown): unknown {
@@ -264,6 +284,26 @@ describe('CodeAPI auth header injection', () => {
     expect(schema.maximum).toBe(15000);
     expect(schema.description).toContain('one sandbox run');
     expect(schema.description).toContain('not the total multi-round-trip');
+  });
+
+  it('keeps local programmatic timeout schemas aligned with local execution defaults', () => {
+    const pythonTimeout = timeoutSchemaForTest(
+      createLocalProgrammaticToolCallingTool().schema
+    );
+    const bashTimeout = timeoutSchemaForTest(
+      createLocalBashProgrammaticToolCallingTool().schema
+    );
+    const configuredTimeout = timeoutSchemaForTest(
+      createLocalProgrammaticToolCallingTool({ timeoutMs: 120000 }).schema
+    );
+
+    expect(pythonTimeout.default).toBe(60000);
+    expect(pythonTimeout.maximum).toBe(300000);
+    expect(pythonTimeout.description).toContain('local execution time');
+    expect(bashTimeout.default).toBe(60000);
+    expect(bashTimeout.maximum).toBe(300000);
+    expect(configuredTimeout.default).toBe(120000);
+    expect(configuredTimeout.maximum).toBe(300000);
   });
 
   it('forwards Authorization for bash programmatic requests', async () => {

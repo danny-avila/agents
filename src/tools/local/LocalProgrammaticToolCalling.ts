@@ -30,19 +30,100 @@ import {
 import { Constants } from '@/common';
 
 const DEFAULT_TIMEOUT = 60000;
-const LocalProgrammaticToolCallingSchema = {
-  ...ProgrammaticToolCallingSchema,
-  properties: {
-    ...ProgrammaticToolCallingSchema.properties,
+const LOCAL_MIN_TIMEOUT = 1000;
+const LOCAL_MAX_TIMEOUT = 300000;
+
+type LocalTimeoutSchema = {
+  type: 'integer';
+  minimum: number;
+  maximum: number;
+  default: number;
+  description: string;
+};
+
+type LocalProgrammaticToolCallingJsonSchema = {
+  type: 'object';
+  properties: typeof ProgrammaticToolCallingSchema.properties & {
+    timeout: LocalTimeoutSchema;
     lang: {
-      type: 'string',
-      enum: ['py', 'python', 'bash', 'sh'],
-      default: 'bash',
-      description:
-        'Local engine runtime for orchestration code. Defaults to bash; use py/python for Python orchestration.',
+      type: 'string';
+      enum: readonly ['py', 'python', 'bash', 'sh'];
+      default: 'bash';
+      description: string;
+    };
+  };
+  required: readonly ['code'];
+};
+
+type LocalBashProgrammaticToolCallingJsonSchema = {
+  type: 'object';
+  properties: typeof BashProgrammaticToolCallingSchema.properties & {
+    timeout: LocalTimeoutSchema;
+  };
+  required: readonly ['code'];
+};
+
+function normalizeLocalTimeout(timeoutMs: number | undefined): number {
+  if (timeoutMs == null || !Number.isFinite(timeoutMs)) {
+    return DEFAULT_TIMEOUT;
+  }
+
+  return Math.max(LOCAL_MIN_TIMEOUT, Math.floor(timeoutMs));
+}
+
+function formatLocalTimeout(timeoutMs: number): string {
+  return timeoutMs % 1000 === 0
+    ? `${timeoutMs / 1000} seconds`
+    : `${timeoutMs} milliseconds`;
+}
+
+function createLocalTimeoutSchema(timeoutMs?: number): LocalTimeoutSchema {
+  const defaultTimeout = normalizeLocalTimeout(timeoutMs);
+  const maxTimeout = Math.max(LOCAL_MAX_TIMEOUT, defaultTimeout);
+  const formattedDefault = formatLocalTimeout(defaultTimeout);
+  const formattedMax = formatLocalTimeout(maxTimeout);
+
+  return {
+    type: 'integer',
+    minimum: LOCAL_MIN_TIMEOUT,
+    maximum: maxTimeout,
+    default: defaultTimeout,
+    description:
+      'Maximum local execution time in milliseconds. ' +
+      `Default: ${formattedDefault}. Max: ${formattedMax}.`,
+  };
+}
+
+function createLocalProgrammaticToolCallingSchema(
+  localConfig: t.LocalExecutionConfig = {}
+): LocalProgrammaticToolCallingJsonSchema {
+  return {
+    ...ProgrammaticToolCallingSchema,
+    properties: {
+      ...ProgrammaticToolCallingSchema.properties,
+      timeout: createLocalTimeoutSchema(localConfig.timeoutMs),
+      lang: {
+        type: 'string',
+        enum: ['py', 'python', 'bash', 'sh'],
+        default: 'bash',
+        description:
+          'Local engine runtime for orchestration code. Defaults to bash; use py/python for Python orchestration.',
+      },
     },
-  },
-} as const;
+  } as const;
+}
+
+function createLocalBashProgrammaticToolCallingSchema(
+  localConfig: t.LocalExecutionConfig = {}
+): LocalBashProgrammaticToolCallingJsonSchema {
+  return {
+    ...BashProgrammaticToolCallingSchema,
+    properties: {
+      ...BashProgrammaticToolCallingSchema.properties,
+      timeout: createLocalTimeoutSchema(localConfig.timeoutMs),
+    },
+  } as const;
+}
 
 type ToolBridge = {
   url: string;
@@ -582,7 +663,7 @@ export function createLocalProgrammaticToolCallingTool(
     {
       name: ProgrammaticToolCallingName,
       description: `${ProgrammaticToolCallingDescription}\n\nLocal engine: runs bash by default, or Python when \`lang\` is \`py\` or \`python\`, on the host machine and calls tools through an in-process localhost bridge.`,
-      schema: LocalProgrammaticToolCallingSchema,
+      schema: createLocalProgrammaticToolCallingSchema(localConfig),
       responseFormat: Constants.CONTENT_AND_ARTIFACT,
     }
   );
@@ -604,7 +685,7 @@ export function createLocalBashProgrammaticToolCallingTool(
     {
       name: Constants.BASH_PROGRAMMATIC_TOOL_CALLING,
       description: `${BashProgrammaticToolCallingDescription}\n\nLocal engine: runs this bash orchestration code on the host machine and calls tools through an in-process localhost bridge.`,
-      schema: BashProgrammaticToolCallingSchema,
+      schema: createLocalBashProgrammaticToolCallingSchema(localConfig),
       responseFormat: Constants.CONTENT_AND_ARTIFACT,
     }
   );
