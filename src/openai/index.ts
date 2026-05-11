@@ -209,11 +209,11 @@ async function emitToolCallChunk(params: {
   if (name !== '') {
     current.function.name = name;
   }
-  config.tracker.lastChunkKind = 'tool_call';
   config.tracker.toolCalls.set(index, current);
   if (!idChanged && !nameChanged && argumentDelta === '' && existing) {
     return;
   }
+  config.tracker.lastChunkKind = 'tool_call';
   const functionDelta: { name?: string; arguments?: string } = {};
   if (nameChanged || (!existing && current.function.name !== '')) {
     functionDelta.name = current.function.name;
