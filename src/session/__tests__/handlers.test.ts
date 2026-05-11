@@ -1,4 +1,4 @@
-import { GraphEvents, StepTypes } from '@/common';
+import { ContentTypes, GraphEvents, StepTypes } from '@/common';
 import { composeEventHandlers } from '@/events';
 import { createRunHandlers } from '@/session';
 import type { AgentSessionStreamEvent } from '@/session';
@@ -111,5 +111,51 @@ describe('createRunHandlers', () => {
       outputTokens: 6,
       totalTokens: 10,
     });
+  });
+
+  it('does not emit tool completion events for summary completions', async () => {
+    const liveEvents: AgentSessionStreamEvent[] = [];
+    const handlerResult = createRunHandlers({
+      runId: 'run_summary',
+      threadId: 'thread_summary',
+      onEvent: (event) => {
+        liveEvents.push(event);
+      },
+    });
+    const summary: t.SummaryContentBlock = {
+      type: ContentTypes.SUMMARY,
+      content: [{ type: ContentTypes.TEXT, text: 'summary text' }],
+      tokenCount: 4,
+    };
+
+    await handlerResult.handlers[GraphEvents.ON_RUN_STEP].handle(
+      GraphEvents.ON_RUN_STEP,
+      {
+        stepIndex: 0,
+        id: 'summary_step',
+        type: StepTypes.MESSAGE_CREATION,
+        index: 0,
+        stepDetails: {
+          type: StepTypes.MESSAGE_CREATION,
+          message_creation: { message_id: 'summary_step' },
+        },
+        summary,
+        usage: null,
+      } satisfies t.RunStep
+    );
+    await handlerResult.handlers[GraphEvents.ON_RUN_STEP_COMPLETED].handle(
+      GraphEvents.ON_RUN_STEP_COMPLETED,
+      {
+        result: {
+          id: 'summary_step',
+          index: 0,
+          type: 'summary',
+          summary,
+        },
+      }
+    );
+
+    expect(liveEvents.map((event) => event.type)).toEqual(['run.started']);
+    expect(handlerResult.contentParts[0]).toBe(summary);
   });
 });

@@ -11,6 +11,16 @@ import type {
 import { createTimestamp } from './ids';
 import { toJsonValue } from './messageSerialization';
 
+type CompletedRunStepResult =
+  | t.ToolEndEvent
+  | (t.SummaryCompleted & { id: string; index: number });
+
+function isToolCompletion(
+  result: CompletedRunStepResult
+): result is t.ToolEndEvent {
+  return 'tool_call' in result;
+}
+
 function createEventFactory(params: {
   runId: string;
   threadId: string;
@@ -178,16 +188,14 @@ export function createRunHandlers(params: {
     },
     [GraphEvents.ON_RUN_STEP_COMPLETED]: {
       handle: async (event, data, metadata, graph): Promise<void> => {
-        const completed = data as unknown as {
-          result:
-            | t.ToolEndEvent
-            | (t.SummaryCompleted & { id: string; index: number });
-        };
+        const completed = data as unknown as { result: CompletedRunStepResult };
         aggregateContent({
           event: GraphEvents.ON_RUN_STEP_COMPLETED,
           data: completed as { result: t.ToolEndEvent },
         });
-        emitEvent(createEvent('tool.completed', completed));
+        if (isToolCompletion(completed.result)) {
+          emitEvent(createEvent('tool.completed', completed));
+        }
         await callUserHandler({
           userHandlers: params.userHandlers,
           event,
