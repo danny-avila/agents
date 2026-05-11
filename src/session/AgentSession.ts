@@ -215,6 +215,7 @@ function applyInitialSummaryToGraphConfig(
 interface SessionCheckpointingState {
   enabled: boolean;
   checkpointer?: BaseCheckpointSaver;
+  disableGraphCheckpointer?: boolean;
 }
 
 function isCheckpointSaver(value: unknown): value is BaseCheckpointSaver {
@@ -246,14 +247,14 @@ function createCheckpointingState(
   if (checkpointing === false) {
     return {
       enabled: false,
-      checkpointer: graphCheckpointer,
+      disableGraphCheckpointer: true,
     };
   }
   if (typeof checkpointing === 'object') {
     if (checkpointing.enabled === false) {
       return {
         enabled: false,
-        checkpointer: graphCheckpointer,
+        disableGraphCheckpointer: true,
       };
     }
     return {
@@ -274,6 +275,20 @@ function createCheckpointingState(
   };
 }
 
+function removeCheckpointerFromGraphConfig(
+  graphConfig: t.RunConfig['graphConfig']
+): t.RunConfig['graphConfig'] {
+  if (graphConfig.compileOptions?.checkpointer == null) {
+    return graphConfig;
+  }
+  const { checkpointer: _checkpointer, ...compileOptions } =
+    graphConfig.compileOptions;
+  return {
+    ...graphConfig,
+    compileOptions,
+  };
+}
+
 function applyCheckpointerToGraphConfig(
   graphConfig: t.RunConfig['graphConfig'],
   checkpointer: BaseCheckpointSaver | undefined
@@ -291,6 +306,19 @@ function applyCheckpointerToGraphConfig(
       checkpointer,
     },
   };
+}
+
+function applyCheckpointingToGraphConfig(
+  graphConfig: t.RunConfig['graphConfig'],
+  checkpointing: SessionCheckpointingState
+): t.RunConfig['graphConfig'] {
+  if (checkpointing.disableGraphCheckpointer === true) {
+    return removeCheckpointerFromGraphConfig(graphConfig);
+  }
+  return applyCheckpointerToGraphConfig(
+    graphConfig,
+    checkpointing.checkpointer
+  );
 }
 
 function getConfigString(
@@ -830,14 +858,17 @@ export class AgentSession {
   ): Promise<AgentSessionRunResult> {
     const runId = options.runId ?? createRunId();
     const threadId = options.threadId ?? this.threadId;
+    const isSessionThread = threadId === this.threadId;
     const normalizedInput = normalizeInput(input);
     const inputMessages = normalizedInput.messages;
     const callerConfig = createCallerConfig(threadId, options);
     const useCheckpointState = await this.hasCheckpointState(callerConfig);
     let parentId = this.store?.getLeafEntry()?.id ?? null;
-    for (const message of inputMessages) {
-      const entry = await this.store?.appendMessage(message, parentId);
-      parentId = entry?.id ?? parentId;
+    if (isSessionThread) {
+      for (const message of inputMessages) {
+        const entry = await this.store?.appendMessage(message, parentId);
+        parentId = entry?.id ?? parentId;
+      }
     }
     await this.store?.appendRunEvent('run.started', undefined, {
       runId,
@@ -866,17 +897,19 @@ export class AgentSession {
       handlerResult.events.push(streamEvent);
       onEvent?.(streamEvent);
     };
-    const sessionState = createSessionRunState(this.store?.getPath() ?? []);
+    const sessionState = createSessionRunState(
+      isSessionThread ? (this.store?.getPath() ?? []) : []
+    );
     try {
       const runConfig: t.RunConfig = {
         ...this.runConfig,
         runId,
-        graphConfig: applyCheckpointerToGraphConfig(
+        graphConfig: applyCheckpointingToGraphConfig(
           applyInitialSummaryToGraphConfig(
             this.runConfig.graphConfig,
             sessionState.initialSummary
           ),
-          this.checkpointing.checkpointer
+          this.checkpointing
         ),
         returnContent: true,
         calibrationRatio: this.calibrationRatio,
@@ -896,8 +929,10 @@ export class AgentSession {
         options.streamOptions
       );
       const runMessages = run.getRunMessages() ?? [];
-      for (const message of runMessages) {
-        await this.store?.appendMessage(message);
+      if (isSessionThread) {
+        for (const message of runMessages) {
+          await this.store?.appendMessage(message);
+        }
       }
       this.calibrationRatio = run.getCalibrationRatio();
       const interrupt = run.getInterrupt();
@@ -1199,12 +1234,12 @@ export class AgentSession {
       const run = await Run.create<t.IState>({
         ...this.runConfig,
         runId,
-        graphConfig: applyCheckpointerToGraphConfig(
+        graphConfig: applyCheckpointingToGraphConfig(
           applyInitialSummaryToGraphConfig(
             this.runConfig.graphConfig,
             sessionState.initialSummary
           ),
-          this.checkpointing.checkpointer
+          this.checkpointing
         ),
         returnContent: true,
         calibrationRatio: this.calibrationRatio,

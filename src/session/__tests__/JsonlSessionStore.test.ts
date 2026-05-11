@@ -529,6 +529,33 @@ describe('JsonlSessionStore', () => {
     expect(session.getCheckpointer()).toBeUndefined();
   });
 
+  it('removes graph checkpointers when checkpointing is disabled', async () => {
+    const graphCheckpointer = new MemorySaver();
+    const mockRun = createMockRun('disabled');
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      checkpointing: false,
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+        compileOptions: { checkpointer: graphCheckpointer },
+      },
+    });
+
+    await session.run('start');
+
+    expect(session.getCheckpointer()).toBeUndefined();
+    expect(
+      capturedConfigs[0].graphConfig.compileOptions?.checkpointer
+    ).toBeUndefined();
+  });
+
   it('reuses the session-level checkpointer across HITL resume', async () => {
     const mockRun = createMockRun('resumed');
     const capturedConfigs = mockRunCreate(mockRun);
@@ -604,6 +631,39 @@ describe('JsonlSessionStore', () => {
     expect(
       getProcessedMessages(mockRun).map((message) => message.content)
     ).toEqual(['history', 'next']);
+  });
+
+  it('does not replay session history when overriding thread id without checkpoint state', async () => {
+    const checkpointer = new MemorySaver();
+    const mockRun = createMockRun('override output');
+    mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      checkpointing: { checkpointer },
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    await session.getSessionStore()?.appendMessage(new HumanMessage('history'));
+
+    await session.run('fresh turn', { threadId: 'thread_override' });
+
+    expect(
+      getProcessedMessages(mockRun).map((message) => message.content)
+    ).toEqual(['fresh turn']);
+    expect(
+      session
+        .getSessionStore()
+        ?.getPath()
+        .filter((entry) => entry.type === 'message')
+        .map((entry) => entry.data.message.content)
+    ).toEqual(['history']);
   });
 
   it('uses only new input when LangGraph checkpoint state already exists', async () => {
