@@ -26,7 +26,11 @@ type AgentLangfuseHandlerParams = LangfuseHandlerParams & {
   langfuse?: t.LangfuseConfig;
 };
 
-type RequiredLangfuseConfig = Required<t.LangfuseConfig>;
+type ResolvedLangfuseConfig = t.LangfuseConfig & {
+  enabled: true;
+  publicKey: string;
+  secretKey: string;
+};
 
 function getModelName(serialized: Serialized): string {
   const serializedRecord = serialized as unknown as Record<string, unknown>;
@@ -117,7 +121,7 @@ export class LangfuseAgentCallbackHandler extends BaseCallbackHandler {
     userId,
     sessionId,
     traceMetadata,
-  }: LangfuseHandlerParams & { langfuse: Required<t.LangfuseConfig> }) {
+  }: LangfuseHandlerParams & { langfuse: ResolvedLangfuseConfig }) {
     super();
     this.userId = userId;
     this.sessionId = sessionId;
@@ -125,7 +129,7 @@ export class LangfuseAgentCallbackHandler extends BaseCallbackHandler {
     this.processor = new LangfuseSpanProcessor({
       publicKey: langfuse.publicKey,
       secretKey: langfuse.secretKey,
-      baseUrl: langfuse.baseUrl,
+      ...(isPresent(langfuse.baseUrl) ? { baseUrl: langfuse.baseUrl } : {}),
       environment:
         process.env.LANGFUSE_TRACING_ENVIRONMENT ??
         process.env.NODE_ENV ??
@@ -289,12 +293,11 @@ export class LangfuseAgentCallbackHandler extends BaseCallbackHandler {
 
 function hasRequiredLangfuseConfig(
   langfuse?: t.LangfuseConfig
-): langfuse is RequiredLangfuseConfig {
+): langfuse is ResolvedLangfuseConfig {
   return (
     langfuse?.enabled === true &&
     isPresent(langfuse.publicKey) &&
-    isPresent(langfuse.secretKey) &&
-    isPresent(langfuse.baseUrl)
+    isPresent(langfuse.secretKey)
   );
 }
 
