@@ -98,6 +98,7 @@
   "scripts": {
     "prepare": "node husky-setup.js",
     "prepublishOnly": "npm run build",
+    "security:hygiene": "node config/check-supply-chain-hygiene.mjs",
     "build": "NODE_ENV=production rollup -c && tsc -p tsconfig.build.json",
     "build:dev": "rollup -c",
     "start": "node dist/esm/main.js",

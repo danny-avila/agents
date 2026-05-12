@@ -7,27 +7,35 @@ on:
   workflow_dispatch:
 
 permissions:
-  id-token: write # Required for OIDC trusted publishing
   contents: read
 
 jobs:
-  publish:
+  build:
     runs-on: ubuntu-latest
-    environment: publish # Must match npm trusted publisher config
+    permissions:
+      contents: read
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+      tag: ${{ steps.publish_tag.outputs.tag }}
+    env:
+      NPM_CONFIG_IGNORE_SCRIPTS: 'true'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Use Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '20.x'
           registry-url: 'https://registry.npmjs.org'
 
-      - name: Update npm for OIDC support
-        run: npm install -g npm@latest # Must be 11.5.1+ for provenance
+      - name: Supply-chain hygiene
+        run: npm run security:hygiene
+
+      - name: Use pinned npm with OIDC support
+        run: npm install -g npm@11.5.1 --ignore-scripts
 
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: ESLint
         run: npx eslint "src/**/*.ts"
@@ -41,151 +49,10 @@ jobs:
           NODE_ENV: production
 
       - name: Run tests
-        run: npx jest --testPathIgnorePatterns=title.memory-leak.test.ts --testPathIgnorePatterns=llm.spec.ts --testPathIgnorePatterns=integration.test.ts
+        run: npx jest --runInBand --testPathIgnorePatterns=title.memory-leak.test.ts --testPathIgnorePatterns=llm.spec.ts --testPathIgnorePatterns=integration.test.ts --testPathIgnorePatterns=simple.test.ts --testPathIgnorePatterns=live.test.ts
         env:
           NODE_OPTIONS: '--experimental-vm-modules'
           NODE_ENV: test
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-          AZURE_MODEL_NAME: ${{ secrets.AZURE_MODEL_NAME }}
-          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
-          AZURE_OPENAI_API_VERSION: ${{ secrets.AZURE_OPENAI_API_VERSION }}
-          AZURE_OPENAI_API_INSTANCE: ${{ secrets.AZURE_OPENAI_API_INSTANCE }}
-          AZURE_OPENAI_API_DEPLOYMENT: ${{ secrets.AZURE_OPENAI_API_DEPLOYMENT }}
-          AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
-          BEDROCK_AWS_ACCESS_KEY_ID: ${{ secrets.BEDROCK_AWS_ACCESS_KEY_ID }}
-          BEDROCK_AWS_SECRET_ACCESS_KEY: ${{ secrets.BEDROCK_AWS_SECRET_ACCESS_KEY }}
-
-      - name: Check for Google LLM changes
-        id: google_changes
-        run: |
-          # Find the previous version commit (skip=1 because HEAD is the current version commit)
-          PREV_VERSION=$(git log --grep="^v[0-9]" --skip=1 --max-count=1 --format="%H" 2>/dev/null || echo "")
-          if [ -z "$PREV_VERSION" ]; then
-            BASE_REF="HEAD~10"
-          else
-            BASE_REF="$PREV_VERSION"
-          fi
-
-          if git diff --name-only $BASE_REF HEAD 2>/dev/null | grep -q "^src/llm/google/"; then
-            echo "changed=true" >> $GITHUB_OUTPUT
-          else
-            echo "changed=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Run Google LLM tests (flaky - timeouts allowed)
-        id: google_llm_tests
-        if: steps.google_changes.outputs.changed == 'true'
-        continue-on-error: true
-        timeout-minutes: 5
-        run: npx jest src/llm/google/llm.spec.ts
-        env:
-          NODE_ENV: test
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-
-      - name: Surface Google LLM soft failure
-        if: always() && steps.google_changes.outputs.changed == 'true' && steps.google_llm_tests.outcome == 'failure'
-        run: |
-          echo "::warning title=Soft-failed Google LLM tests::The Google LLM integration suite failed, but this workflow allows provider API failures. Inspect the publish job logs before releasing."
-          {
-            echo "### Soft-failed Google LLM tests"
-            echo ""
-            echo "The Google LLM integration suite failed, but this job intentionally allows provider API failures."
-            echo ""
-            echo "- Suite: \`npx jest src/llm/google/llm.spec.ts\`"
-            echo "- Logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Check for Anthropic LLM changes
-        id: anthropic_changes
-        run: |
-          PREV_VERSION=$(git log --grep="^v[0-9]" --skip=1 --max-count=1 --format="%H" 2>/dev/null || echo "")
-          if [ -z "$PREV_VERSION" ]; then
-            BASE_REF="HEAD~10"
-          else
-            BASE_REF="$PREV_VERSION"
-          fi
-
-          if git diff --name-only $BASE_REF HEAD 2>/dev/null | grep -q "^src/llm/anthropic/"; then
-            echo "changed=true" >> $GITHUB_OUTPUT
-          else
-            echo "changed=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Run Anthropic LLM tests (flaky - timeouts allowed)
-        id: anthropic_llm_tests
-        if: steps.anthropic_changes.outputs.changed == 'true'
-        continue-on-error: true
-        timeout-minutes: 5
-        run: npx jest src/llm/anthropic/llm.spec.ts
-        env:
-          NODE_ENV: test
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-
-      - name: Surface Anthropic LLM soft failure
-        if: always() && steps.anthropic_changes.outputs.changed == 'true' && steps.anthropic_llm_tests.outcome == 'failure'
-        run: |
-          echo "::warning title=Soft-failed Anthropic LLM tests::The Anthropic LLM integration suite failed, but this workflow allows provider API failures. Inspect the publish job logs before releasing."
-          {
-            echo "### Soft-failed Anthropic LLM tests"
-            echo ""
-            echo "The Anthropic LLM integration suite failed, but this job intentionally allows provider API failures."
-            echo ""
-            echo "- Suite: \`npx jest src/llm/anthropic/llm.spec.ts\`"
-            echo "- Logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Check for PTC changes
-        id: ptc_changes
-        run: |
-          PREV_VERSION=$(git log --grep="^v[0-9]" --skip=1 --max-count=1 --format="%H" 2>/dev/null || echo "")
-          if [ -z "$PREV_VERSION" ]; then
-            BASE_REF="HEAD~10"
-          else
-            BASE_REF="$PREV_VERSION"
-          fi
-
-          if git diff --name-only $BASE_REF HEAD 2>/dev/null | grep -qE "^src/tools/ProgrammaticToolCalling\.ts|^src/tools/ToolNode\.ts|^src/agents/AgentContext\.ts|^src/test/mockTools\.ts"; then
-            echo "changed=true" >> $GITHUB_OUTPUT
-          else
-            echo "changed=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Run PTC unit tests
-        if: steps.ptc_changes.outputs.changed == 'true'
-        timeout-minutes: 5
-        run: npx jest src/tools/__tests__/ProgrammaticToolCalling.test.ts
-        env:
-          NODE_ENV: test
-          LIBRECHAT_CODE_BASEURL: ${{ secrets.LIBRECHAT_CODE_BASEURL }}
-
-      - name: Check for Tool Search changes
-        id: tool_search_changes
-        run: |
-          PREV_VERSION=$(git log --grep="^v[0-9]" --skip=1 --max-count=1 --format="%H" 2>/dev/null || echo "")
-          if [ -z "$PREV_VERSION" ]; then
-            BASE_REF="HEAD~10"
-          else
-            BASE_REF="$PREV_VERSION"
-          fi
-
-          if git diff --name-only $BASE_REF HEAD 2>/dev/null | grep -qE "^src/tools/ToolSearch\.ts|^src/tools/ToolNode\.ts|^src/agents/AgentContext\.ts|^src/test/mockTools\.ts"; then
-            echo "changed=true" >> $GITHUB_OUTPUT
-          else
-            echo "changed=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Run Tool Search unit tests
-        if: steps.tool_search_changes.outputs.changed == 'true'
-        timeout-minutes: 5
-        run: npx jest src/tools/__tests__/ToolSearch.test.ts
-        env:
-          NODE_ENV: test
-          LIBRECHAT_CODE_BASEURL: ${{ secrets.LIBRECHAT_CODE_BASEURL }}
-
-      - name: Prune development dependencies
-        run: npm prune --production
 
       - name: Check version change
         id: check
@@ -200,9 +67,17 @@ jobs:
             echo "skip=false" >> $GITHUB_OUTPUT
           fi
 
+      - name: Sanitize package manifest
+        if: steps.check.outputs.skip != 'true'
+        run: node config/sanitize-package-for-publish.mjs
+
       - name: Pack package
         if: steps.check.outputs.skip != 'true'
-        run: npm pack
+        run: npm pack --ignore-scripts
+
+      - name: Validate package artifact
+        if: steps.check.outputs.skip != 'true'
+        run: node config/validate-package-tarball.mjs librechat-agents-*.tgz
 
       - name: Determine publish tag
         if: steps.check.outputs.skip != 'true'
@@ -215,8 +90,41 @@ jobs:
             echo "tag=latest" >> $GITHUB_OUTPUT
           fi
 
-      - name: Publish
+      - name: Upload package artifact
         if: steps.check.outputs.skip != 'true'
-        run: npm publish $(ls librechat-agents-*.tgz) --access public --provenance --tag ${{ steps.publish_tag.outputs.tag }}
-        env:
-          NODE_ENV: production
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: npm-package
+          path: librechat-agents-*.tgz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: needs.build.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    environment: publish
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    env:
+      NODE_ENV: production
+      NPM_CONFIG_IGNORE_SCRIPTS: 'true'
+    steps:
+      - name: Use Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20.x'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Use pinned npm with OIDC support
+        run: npm install -g npm@11.5.1 --ignore-scripts
+
+      - name: Download package artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: npm-package
+          path: .
+
+      - name: Publish
+        run: npm publish librechat-agents-*.tgz --access public --provenance --ignore-scripts --tag ${{ needs.build.outputs.tag }}

@@ -14,41 +14,54 @@ permissions:
   contents: read
 
 jobs:
-  install:
+  supply-chain-hygiene:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20.x'
+
+      - name: Supply-chain hygiene
+        run: npm run security:hygiene
+
+  install:
+    needs: supply-chain-hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '20.x'
 
       - name: Cache node_modules
         id: cache-node-modules
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: node_modules
-          key: node-modules-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          key: node-modules-v2-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
 
       - name: Install dependencies
         if: steps.cache-node-modules.outputs.cache-hit != 'true'
-        run: npm ci
+        run: npm ci --ignore-scripts
 
   lint:
     needs: install
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '20.x'
 
       - name: Restore node_modules
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: node_modules
-          key: node-modules-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          key: node-modules-v2-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
 
       - name: ESLint
         run: npx eslint "src/**/*.ts"
@@ -57,17 +70,17 @@ jobs:
     needs: install
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '20.x'
 
       - name: Restore node_modules
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: node_modules
-          key: node-modules-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          key: node-modules-v2-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
 
       - name: TypeScript type-check
         run: npx tsc --noEmit
@@ -76,36 +89,25 @@ jobs:
     needs: install
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '20.x'
 
       - name: Restore node_modules
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: node_modules
-          key: node-modules-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          key: node-modules-v2-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
 
       - name: Run tests
-        run: npx jest --maxWorkers=50% --testPathIgnorePatterns=title.memory-leak.test.ts --testPathIgnorePatterns=llm.spec.ts --testPathIgnorePatterns=integration.test.ts
+        run: npx jest --runInBand --testPathIgnorePatterns=title.memory-leak.test.ts --testPathIgnorePatterns=llm.spec.ts --testPathIgnorePatterns=integration.test.ts --testPathIgnorePatterns=simple.test.ts --testPathIgnorePatterns=live.test.ts
         env:
           NODE_OPTIONS: '--experimental-vm-modules'
           NODE_ENV: test
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-          AZURE_MODEL_NAME: ${{ secrets.AZURE_MODEL_NAME }}
-          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
-          AZURE_OPENAI_API_VERSION: ${{ secrets.AZURE_OPENAI_API_VERSION }}
-          AZURE_OPENAI_API_INSTANCE: ${{ secrets.AZURE_OPENAI_API_INSTANCE }}
-          AZURE_OPENAI_API_DEPLOYMENT: ${{ secrets.AZURE_OPENAI_API_DEPLOYMENT }}
-          AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
-          BEDROCK_AWS_ACCESS_KEY_ID: ${{ secrets.BEDROCK_AWS_ACCESS_KEY_ID }}
-          BEDROCK_AWS_SECRET_ACCESS_KEY: ${{ secrets.BEDROCK_AWS_SECRET_ACCESS_KEY }}
 
       - name: Check for Google LLM changes
         id: google_changes
@@ -118,7 +120,7 @@ jobs:
 
       - name: Run Google LLM tests (flaky - timeouts allowed)
         id: google_llm_tests
-        if: steps.google_changes.outputs.changed == 'true'
+        if: steps.google_changes.outputs.changed == 'true' && github.event.pull_request.head.repo.full_name == github.repository
         continue-on-error: true
         run: npx jest src/llm/google/llm.spec.ts --runInBand
         env:
@@ -154,7 +156,7 @@ jobs:
 
       - name: Run Anthropic LLM tests (flaky - timeouts allowed)
         id: anthropic_llm_tests
-        if: steps.anthropic_changes.outputs.changed == 'true'
+        if: steps.anthropic_changes.outputs.changed == 'true' && github.event.pull_request.head.repo.full_name == github.repository
         continue-on-error: true
         run: npx jest src/llm/anthropic/llm.spec.ts
         env:
@@ -190,7 +192,6 @@ jobs:
         env:
           NODE_OPTIONS: '--experimental-vm-modules'
           NODE_ENV: test
-          LIBRECHAT_CODE_BASEURL: ${{ secrets.LIBRECHAT_CODE_BASEURL }}
 
       - name: Check for Tool Search changes
         id: tool_search_changes
@@ -207,4 +208,3 @@ jobs:
         env:
           NODE_OPTIONS: '--experimental-vm-modules'
           NODE_ENV: test
-          LIBRECHAT_CODE_BASEURL: ${{ secrets.LIBRECHAT_CODE_BASEURL }}
