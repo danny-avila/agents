@@ -1150,6 +1150,9 @@ export class Run<_T extends t.BaseGraphState> {
         messageId: 'title-' + this.id,
         agentName: titleContext?.name,
       };
+      const hasExplicitLangfuse =
+        this.Graph != null &&
+        hasExplicitLangfuseConfig(this.Graph.agentContexts.values());
       if (titleContext?.langfuse != null) {
         titleLangfuseHandler = createLangfuseHandler({
           langfuse: titleContext.langfuse,
@@ -1157,7 +1160,7 @@ export class Run<_T extends t.BaseGraphState> {
           sessionId,
           traceMetadata,
         });
-      } else if (hasLangfuseEnvConfig()) {
+      } else if (hasLangfuseEnvConfig() && !hasExplicitLangfuse) {
         titleLangfuseHandler = createLegacyLangfuseHandler({
           userId,
           sessionId,
