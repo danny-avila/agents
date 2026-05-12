@@ -408,6 +408,13 @@ export interface SubagentUpdateEvent {
   timestamp: string;
 }
 
+export interface LangfuseConfig {
+  enabled?: boolean;
+  publicKey?: string;
+  secretKey?: string;
+  baseUrl?: string;
+}
+
 export interface AgentInputs {
   agentId: string;
   /** Human-readable name for the agent (used in handoff context). Defaults to agentId if not provided. */
@@ -421,6 +428,8 @@ export interface AgentInputs {
   streamBuffer?: number;
   maxContextTokens?: number;
   clientOptions?: ClientOptions;
+  /** Per-agent Langfuse tracing configuration. */
+  langfuse?: LangfuseConfig;
   /** Dynamic system tail appended after stable instructions without provider cache markers. */
   additional_instructions?: string;
   reasoningKey?: 'reasoning_content' | 'reasoning';

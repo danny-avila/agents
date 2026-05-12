@@ -10,7 +10,10 @@ const MockedCallbackHandler = CallbackHandler as jest.MockedClass<
   typeof CallbackHandler
 >;
 
-async function createTestRun(agentName?: string): Promise<Run<never>> {
+async function createTestRun(
+  agentName?: string,
+  agentOverrides: Record<string, unknown> = {}
+): Promise<Run<never>> {
   const run = await Run.create({
     runId: 'test-run-id',
     graphConfig: {
@@ -22,6 +25,7 @@ async function createTestRun(agentName?: string): Promise<Run<never>> {
           provider: Providers.OPENAI,
           clientOptions: { model: 'gpt-4' },
           tools: [],
+          ...agentOverrides,
         },
       ],
     },
@@ -81,6 +85,20 @@ describe('Langfuse trace metadata includes agentName', () => {
   it('does not create CallbackHandler when Langfuse env vars are missing', async () => {
     delete process.env.LANGFUSE_SECRET_KEY;
     const run = await createTestRun('MAIA');
+    await run.processStream(
+      { messages: [] },
+      { configurable: { thread_id: 't1', user_id: 'u1' }, version: 'v2' }
+    );
+
+    expect(MockedCallbackHandler).not.toHaveBeenCalled();
+  });
+
+  it('does not create the legacy CallbackHandler when explicit agent config is supplied', async () => {
+    const run = await createTestRun('DWAINE', {
+      langfuse: {
+        enabled: false,
+      },
+    });
     await run.processStream(
       { messages: [] },
       { configurable: { thread_id: 't1', user_id: 'u1' }, version: 'v2' }
