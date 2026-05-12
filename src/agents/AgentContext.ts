@@ -758,8 +758,13 @@ export class AgentContext {
       return messages.length;
     }
 
-    if (messages[lastIndex].getType() === 'human') {
-      return lastIndex;
+    for (let index = lastIndex; index >= 0; index--) {
+      if (messages[index].getType() === 'human') {
+        if (promptCacheProvider === Providers.OPENROUTER && index === 0) {
+          return 1;
+        }
+        return index;
+      }
     }
 
     return messages.length;

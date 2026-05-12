@@ -368,7 +368,7 @@ describe('AgentContext', () => {
       expect(result[4].content).toBe('Latest');
     });
 
-    it('does not place Anthropic dynamic instructions between tool calls and results', async () => {
+    it('keeps Anthropic dynamic instructions attached to the latest user turn during tool follow-up', async () => {
       const ctx = createBasicContext({
         agentConfig: {
           provider: Providers.ANTHROPIC,
@@ -401,10 +401,115 @@ describe('AgentContext', () => {
         }),
       ]);
 
-      expect(result[1].content).toBe('Use the tool');
-      expect((result[2] as AIMessage).tool_calls?.[0]?.id).toBe('call_1');
-      expect(result[3].getType()).toBe('tool');
-      expect(result[4].content).toBe('Dynamic instructions');
+      expect(result[1].content).toBe('Dynamic instructions');
+      expect(result[2].content).toBe('Use the tool');
+      expect((result[3] as AIMessage).tool_calls?.[0]?.id).toBe('call_1');
+      expect(result[4].getType()).toBe('tool');
+    });
+
+    it('keeps Anthropic stable history cacheable before dynamic tool-follow-up context', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.ANTHROPIC,
+          clientOptions: {
+            model: 'claude-3-5-sonnet',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+          additional_instructions: 'Dynamic instructions',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('Earlier'),
+        new AIMessage('Earlier assistant response'),
+        new HumanMessage('Use the tool'),
+        new AIMessage({
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_1',
+              name: 'calculator',
+              args: { expression: '2+2' },
+              type: 'tool_call',
+            },
+          ],
+        }),
+        new ToolMessage({
+          content: '4',
+          name: 'calculator',
+          tool_call_id: 'call_1',
+        }),
+      ]);
+      const stableAssistant = result[2].content as TestSystemContentBlock[];
+
+      expect(result[1].content).toBe('Earlier');
+      expect(stableAssistant[0]).toMatchObject({
+        type: 'text',
+        text: 'Earlier assistant response',
+        cache_control: { type: 'ephemeral' },
+      });
+      expect(result[3].content).toBe('Dynamic instructions');
+      expect(result[4].content).toBe('Use the tool');
+      expect((result[5] as AIMessage).tool_calls?.[0]?.id).toBe('call_1');
+      expect(result[6].getType()).toBe('tool');
+    });
+
+    it('keeps Anthropic dynamic context on latest no-tool turn after mixed prior turns', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.ANTHROPIC,
+          clientOptions: {
+            model: 'claude-3-5-sonnet',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+          additional_instructions: 'Dynamic instructions',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('First turn, no tools'),
+        new AIMessage('First assistant response'),
+        new HumanMessage('Use the tool'),
+        new AIMessage({
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_1',
+              name: 'calculator',
+              args: { expression: '2+2' },
+              type: 'tool_call',
+            },
+          ],
+        }),
+        new ToolMessage({
+          content: '4',
+          name: 'calculator',
+          tool_call_id: 'call_1',
+        }),
+        new AIMessage('4'),
+        new HumanMessage('Now answer without tools'),
+      ]);
+      const firstAssistant = result[2].content as TestSystemContentBlock[];
+      const toolAnswer = result[6].content as TestSystemContentBlock[];
+
+      expect(result[1].content).toBe('First turn, no tools');
+      expect(firstAssistant[0]).toMatchObject({
+        type: 'text',
+        text: 'First assistant response',
+        cache_control: { type: 'ephemeral' },
+      });
+      expect(result[3].content).toBe('Use the tool');
+      expect((result[4] as AIMessage).tool_calls?.[0]?.id).toBe('call_1');
+      expect(result[5].getType()).toBe('tool');
+      expect(toolAnswer[0]).toMatchObject({
+        type: 'text',
+        text: '4',
+        cache_control: { type: 'ephemeral' },
+      });
+      expect(result[7].content).toBe('Dynamic instructions');
+      expect(result[8].content).toBe('Now answer without tools');
     });
 
     it('caches stable OpenRouter history before dynamic instructions', async () => {
@@ -435,6 +540,150 @@ describe('AgentContext', () => {
       });
       expect(result[3].content).toBe('Dynamic instructions');
       expect(result[4].content).toBe('Latest');
+    });
+
+    it('keeps OpenRouter opening user message before dynamic tool-follow-up context', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.OPENROUTER,
+          clientOptions: {
+            model: 'anthropic/claude-haiku-4.5',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+          additional_instructions: 'Dynamic instructions',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('Use the tool'),
+        new AIMessage({
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_1',
+              name: 'calculator',
+              args: { expression: '2+2' },
+              type: 'tool_call',
+            },
+          ],
+        }),
+        new ToolMessage({
+          content: '4',
+          name: 'calculator',
+          tool_call_id: 'call_1',
+        }),
+      ]);
+
+      expect(result[1].content).toBe('Use the tool');
+      expect(result[2].content).toBe('Dynamic instructions');
+      expect((result[3] as AIMessage).tool_calls?.[0]?.id).toBe('call_1');
+      expect(result[4].getType()).toBe('tool');
+    });
+
+    it('keeps OpenRouter stable history cacheable before dynamic tool-follow-up context', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.OPENROUTER,
+          clientOptions: {
+            model: 'anthropic/claude-haiku-4.5',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+          additional_instructions: 'Dynamic instructions',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('Earlier'),
+        new AIMessage('Earlier assistant response'),
+        new HumanMessage('Use the tool'),
+        new AIMessage({
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_1',
+              name: 'calculator',
+              args: { expression: '2+2' },
+              type: 'tool_call',
+            },
+          ],
+        }),
+        new ToolMessage({
+          content: '4',
+          name: 'calculator',
+          tool_call_id: 'call_1',
+        }),
+      ]);
+      const stableAssistant = result[2].content as TestSystemContentBlock[];
+
+      expect(result[1].content).toBe('Earlier');
+      expect(stableAssistant[0]).toMatchObject({
+        type: 'text',
+        text: 'Earlier assistant response',
+        cache_control: { type: 'ephemeral' },
+      });
+      expect(result[3].content).toBe('Dynamic instructions');
+      expect(result[4].content).toBe('Use the tool');
+      expect((result[5] as AIMessage).tool_calls?.[0]?.id).toBe('call_1');
+      expect(result[6].getType()).toBe('tool');
+    });
+
+    it('keeps OpenRouter dynamic context on latest no-tool turn after mixed prior turns', async () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.OPENROUTER,
+          clientOptions: {
+            model: 'anthropic/claude-haiku-4.5',
+            promptCache: true,
+          },
+          instructions: 'Stable instructions',
+          additional_instructions: 'Dynamic instructions',
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([
+        new HumanMessage('First turn, no tools'),
+        new AIMessage('First assistant response'),
+        new HumanMessage('Use the tool'),
+        new AIMessage({
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_1',
+              name: 'calculator',
+              args: { expression: '2+2' },
+              type: 'tool_call',
+            },
+          ],
+        }),
+        new ToolMessage({
+          content: '4',
+          name: 'calculator',
+          tool_call_id: 'call_1',
+        }),
+        new AIMessage('4'),
+        new HumanMessage('Now answer without tools'),
+      ]);
+      const firstAssistant = result[2].content as TestSystemContentBlock[];
+      const toolAnswer = result[6].content as TestSystemContentBlock[];
+
+      expect(result[1].content).toBe('First turn, no tools');
+      expect(firstAssistant[0]).toMatchObject({
+        type: 'text',
+        text: 'First assistant response',
+        cache_control: { type: 'ephemeral' },
+      });
+      expect(result[3].content).toBe('Use the tool');
+      expect((result[4] as AIMessage).tool_calls?.[0]?.id).toBe('call_1');
+      expect(result[5].getType()).toBe('tool');
+      expect(toolAnswer[0]).toMatchObject({
+        type: 'text',
+        text: '4',
+        cache_control: { type: 'ephemeral' },
+      });
+      expect(result[7].content).toBe('Dynamic instructions');
+      expect(result[8].content).toBe('Now answer without tools');
     });
 
     it('adds OpenRouter body cache points when there is no dynamic tail', async () => {
