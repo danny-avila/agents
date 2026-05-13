@@ -153,6 +153,32 @@ describe('validateBashCommandHardFloor', () => {
     expect(validateBashCommandHardFloor('echo "rm -rf /"').valid).toBe(true);
   });
 
+  it('does NOT trip on deny patterns inside shell comments (Codex P2 round-2)', () => {
+    // Pre-fix the hard-floor AST scan ran on raw command text, so a
+    // comment like `# cat /proc/self/environ` triggered the proc-environ
+    // deny check even though bash never executes commented text.
+    expect(
+      validateBashCommandHardFloor('echo ok # cat /proc/self/environ').valid
+    ).toBe(true);
+    expect(
+      validateBashCommandHardFloor(
+        'ls -la\n# todo: investigate /proc/self/environ\necho done'
+      ).valid
+    ).toBe(true);
+  });
+
+  it('still trips on deny patterns inside quoted strings (not comments)', () => {
+    // `echo "cat /proc/self/environ"` — the path lives inside a
+    // double-quoted string that bash WILL evaluate. The hard floor
+    // remains aggressive here (the deny patterns are narrow enough
+    // that legitimate workloads don't reference them as literals).
+    // This is the defense-in-depth posture, distinct from the
+    // comment case above.
+    expect(
+      validateBashCommandHardFloor('echo "cat /proc/self/environ"').valid
+    ).toBe(false);
+  });
+
   it('does NOT trip on plain command substitution (only opt-in flags that)', () => {
     expect(validateBashCommandHardFloor('echo "$(date)"').valid).toBe(true);
     expect(validateBashCommandHardFloor('echo $(whoami)').valid).toBe(true);

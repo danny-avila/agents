@@ -78,11 +78,57 @@ const mutatingCommandPattern =
   /\b(?:rm|mv|cp|touch|mkdir|rmdir|ln|truncate|tee|sed\s+-i|perl\s+-pi|python(?:3)?\s+-c|node\s+-e|npm\s+(?:install|ci|update|publish)|pnpm\s+(?:install|update|publish)|yarn\s+(?:install|add|publish)|git\s+(?:add|commit|checkout|switch|reset|clean|rebase|merge|push|pull|stash|tag|branch)|chmod|chown)\b|(?:^|[^<])>\s*[^&]|\bcat\s+[^|;&]*>\s*/;
 
 /**
+ * Strips `# …` shell comments (outside quoted spans) to a `\n` while
+ * preserving quoted content as-is. Used by `validateBashCommandHardFloor`
+ * so the deny-only AST scan doesn't false-positive on text that bash
+ * would skip — e.g. `echo ok # cat /proc/self/environ`. Differs from
+ * `stripQuotedContent` (which BLANKS quotes too); we want to preserve
+ * nested-shell payloads so the deny patterns still see their contents.
+ */
+export function stripComments(command: string): string {
+  let output = '';
+  let quote: '"' | '\'' | '`' | undefined;
+  let escaped = false;
+  for (let i = 0; i < command.length; i++) {
+    const char = command[i];
+    if (escaped) {
+      escaped = false;
+      output += char;
+      continue;
+    }
+    if (char === '\\') {
+      escaped = true;
+      output += char;
+      continue;
+    }
+    if (quote != null) {
+      if (char === quote) quote = undefined;
+      output += char;
+      continue;
+    }
+    if (char === '"' || char === '\'' || char === '`') {
+      quote = char;
+      output += char;
+      continue;
+    }
+    if (char === '#') {
+      while (i < command.length && command[i] !== '\n') {
+        i++;
+      }
+      output += '\n';
+      continue;
+    }
+    output += char;
+  }
+  return output;
+}
+
+/**
  * Strips the contents of quoted spans (`"…"`, `'…'`, `` `…` ``) and
- * comments to `\n`-normalized whitespace so the regex set above can
- * be applied against the "structural" form of the command without
- * being fooled by quoted literals. Exported for use by the
- * higher-level validator wrapper.
+ * comments to `\n`-normalized whitespace so the destructive regex set
+ * can be applied against the "structural" form of the command without
+ * being fooled by quoted literals. Exported for the higher-level
+ * validator wrapper.
  */
 export function stripQuotedContent(command: string): string {
   let output = '';
@@ -301,28 +347,39 @@ export function validateBashCommandHardFloor(
   // IFS, hex escape, eval/exec) — they're too noisy for an always-on
   // floor.
   //
-  // Scan an "effective command" assembled from the raw command +
-  // every positional arg (rather than the quote-stripped `normalized`
-  // form). Two bypass classes that the original `runBashAstChecks(
-  // normalized, …)` call missed (Codex P1):
+  // Scan an "effective command" assembled from the comment-stripped
+  // command + every positional arg (rather than the quote-stripped
+  // `normalized` form). Three bypass classes the original
+  // `runBashAstChecks(normalized, …)` call missed:
   //
-  //   1. Nested-shell payloads: `bash -lc 'cat /proc/self/environ'` —
-  //      `stripQuotedContent` blanks the inner payload to whitespace,
-  //      so `/proc/self/environ` disappeared before the AST scan ever
-  //      ran. Scanning the original command text catches it.
+  //   1. Nested-shell payloads (Codex P1): `bash -lc 'cat
+  //      /proc/self/environ'` — `stripQuotedContent` blanks the inner
+  //      payload to whitespace, so `/proc/self/environ` disappeared
+  //      before the AST scan ran. Scanning the original (quotes
+  //      intact) command text catches it.
   //
-  //   2. Positional-arg exfil: `command: 'cat "$1"', args:
-  //      ['/proc/self/environ']` — the command body never references
-  //      the path. Appending args to the scanned string catches it.
+  //   2. Positional-arg exfil (Codex P1): `command: 'cat "$1"',
+  //      args: ['/proc/self/environ']` — the command body never
+  //      references the path. Appending args to the scanned string
+  //      catches it.
+  //
+  //   3. Comment false-positive (Codex P2): `echo ok # cat
+  //      /proc/self/environ` would trip the deny pattern even though
+  //      bash never executes commented text. `stripComments` blanks
+  //      `#…\n` runs (outside quoted spans) so commented mentions
+  //      pass through.
   //
   // False-positive tradeoff: `echo "discussing /proc/self/environ"`
-  // now trips the floor. Acceptable — the deny patterns are narrow
+  // (the path mentioned inside a string literal that bash WILL pass
+  // to echo) still trips. Acceptable — the deny patterns are narrow
   // enough that legitimate workloads basically never include them
   // even as literal strings, and the cost of refusing such a print is
-  // negligible. This is the defense-in-depth posture the floor was
-  // always meant to take.
+  // negligible.
+  const stripped = stripComments(command);
   const effectiveCommand =
-    args != null && args.length > 0 ? `${command} ${args.join(' ')}` : command;
+    args != null && args.length > 0
+      ? `${stripped} ${args.join(' ')}`
+      : stripped;
   const findings = runBashAstChecks(effectiveCommand, 'auto');
   for (const finding of findings) {
     if (finding.severity === 'deny') {
