@@ -52,6 +52,12 @@ const quotedDestructivePatterns: ReadonlyArray<RegExp> = [
   new RegExp(
     `\\bchown\\s+-R\\s+[^;&|]+\\s+(?:--\\s+)?["']${DESTRUCTIVE_TARGET}["']`
   ),
+  // `dd` with a quoted device target — companion to the unquoted
+  // `dd … of=/dev/…` pattern in `dangerousCommandPatterns`. Pre-fix,
+  // `dd if=/dev/zero of='/dev/sda'` slipped past the dd guard because
+  // `stripQuotedContent` blanked the quoted path before the unquoted
+  // regex could match (Codex P1 round-7).
+  /\bdd\s+[^;&|]*\bof=["']\/dev\//,
 ];
 
 const NESTED_SHELL_PREFIX = '(?:(?:ba|z|da|k)?sh|eval)\\s+(?:-l?c\\s+)?';

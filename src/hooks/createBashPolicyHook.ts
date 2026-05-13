@@ -95,12 +95,35 @@ const DEFAULT_TOOL_NAMES: readonly string[] = [Constants.BASH_TOOL];
  * widens `toolNames` to include `EXECUTE_CODE` still gets matching.
  */
 function extractCommand(
-  toolInput: Record<string, unknown>
+  toolInput: Record<string, unknown>,
+  toolName: string
 ): string | undefined {
-  if (typeof toolInput.command === 'string') return toolInput.command;
-  if (typeof toolInput.code === 'string' && toolInput.lang === 'bash') {
-    return toolInput.code;
+  if (toolName === Constants.BASH_TOOL) {
+    return typeof toolInput.command === 'string'
+      ? toolInput.command
+      : undefined;
   }
+  if (toolName === Constants.BASH_PROGRAMMATIC_TOOL_CALLING) {
+    // `run_tools_with_bash` schema is `{ code, timeout? }` — no
+    // `lang` field. Pre-fix the `lang === 'bash'` branch never
+    // fired, so policy evaluation fell through `command == null`
+    // and returned `allow` for every call (Codex P1 round-7).
+    return typeof toolInput.code === 'string' ? toolInput.code : undefined;
+  }
+  if (toolName === Constants.EXECUTE_CODE) {
+    // `execute_code` is multi-language; only extract when the call
+    // is bash so a host that widens `toolNames` doesn't evaluate
+    // Python/etc. code against bash rules.
+    if (typeof toolInput.code === 'string' && toolInput.lang === 'bash') {
+      return toolInput.code;
+    }
+    return undefined;
+  }
+  // Generic fallback for any other tool the host has declared as
+  // bash-shaped via `toolNames`. Prefer `command`, fall through to
+  // `code`.
+  if (typeof toolInput.command === 'string') return toolInput.command;
+  if (typeof toolInput.code === 'string') return toolInput.code;
   return undefined;
 }
 
@@ -316,7 +339,7 @@ export function createBashPolicyHook(
   return async (input: PreToolUseHookInput): Promise<PreToolUseHookOutput> => {
     if (!toolNames.has(input.toolName)) return { decision: 'allow' };
 
-    const command = extractCommand(input.toolInput);
+    const command = extractCommand(input.toolInput, input.toolName);
     if (command == null || command === '') return { decision: 'allow' };
 
     const trimmed = command.trim();

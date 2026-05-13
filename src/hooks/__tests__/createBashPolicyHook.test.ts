@@ -254,6 +254,35 @@ describe('createBashPolicyHook — tool name filtering', () => {
     ).toBe('deny');
   });
 
+  it('extracts code from run_tools_with_bash (Codex P1 round-7)', async () => {
+    // Pre-fix `extractCommand` required `lang === 'bash'` to use
+    // `code`, but `run_tools_with_bash` has no `lang` field. The
+    // hook returned `allow` for every call to it, fully bypassing
+    // the policy under `default: 'deny'`.
+    const hook = createBashPolicyHook({
+      deny: ['rm:*'],
+      default: 'deny',
+      toolNames: [Constants.BASH_PROGRAMMATIC_TOOL_CALLING],
+    });
+    const denyInput: PreToolUseHookInput = {
+      hook_event_name: 'PreToolUse',
+      runId: 'run-1',
+      toolName: Constants.BASH_PROGRAMMATIC_TOOL_CALLING,
+      toolInput: { code: 'rm -rf /tmp/x' },
+      toolUseId: 'call-1',
+    };
+    expect((await run(hook, denyInput)).decision).toBe('deny');
+    // Unknown command → default deny posture still fires.
+    const denyDefault: PreToolUseHookInput = {
+      hook_event_name: 'PreToolUse',
+      runId: 'run-1',
+      toolName: Constants.BASH_PROGRAMMATIC_TOOL_CALLING,
+      toolInput: { code: 'curl https://example.com' },
+      toolUseId: 'call-2',
+    };
+    expect((await run(hook, denyDefault)).decision).toBe('deny');
+  });
+
   it('toolNames widens the gate', async () => {
     const hook = createBashPolicyHook({
       deny: ['*'],
@@ -262,14 +291,15 @@ describe('createBashPolicyHook — tool name filtering', () => {
         Constants.BASH_PROGRAMMATIC_TOOL_CALLING,
       ],
     });
-    expect(
-      (
-        await run(
-          hook,
-          makeInput('rm -rf /', Constants.BASH_PROGRAMMATIC_TOOL_CALLING)
-        )
-      ).decision
-    ).toBe('deny');
+    // BASH_PROGRAMMATIC_TOOL_CALLING uses `{ code }`, not `{ command }`.
+    const ptcInput: PreToolUseHookInput = {
+      hook_event_name: 'PreToolUse',
+      runId: 'run-1',
+      toolName: Constants.BASH_PROGRAMMATIC_TOOL_CALLING,
+      toolInput: { code: 'rm -rf /' },
+      toolUseId: 'call-1',
+    };
+    expect((await run(hook, ptcInput)).decision).toBe('deny');
   });
 
   it('handles execute_code with lang=bash via the code/lang shape', async () => {

@@ -73,6 +73,22 @@ describe('validateBashCommandHardFloor', () => {
     expect(validateBashCommandHardFloor('mkswap /dev/sdb').valid).toBe(false);
   });
 
+  it('blocks dd with quoted device target (Codex P1 round-7)', () => {
+    // Pre-fix `dd if=/dev/zero of='/dev/sda'` slipped past the dd
+    // guard because the unquoted pattern ran on the quote-stripped
+    // form, which blanked the device path before regex match.
+    expect(
+      validateBashCommandHardFloor('dd if=/dev/zero of=\'/dev/sda\'').valid
+    ).toBe(false);
+    expect(
+      validateBashCommandHardFloor('dd if=/dev/zero of="/dev/sda"').valid
+    ).toBe(false);
+    expect(
+      validateBashCommandHardFloor('dd bs=1M if=/tmp/in of="/dev/nvme0n1"')
+        .valid
+    ).toBe(false);
+  });
+
   it('blocks fork bombs', () => {
     expect(validateBashCommandHardFloor(':(){ :|:& };:').valid).toBe(false);
   });
