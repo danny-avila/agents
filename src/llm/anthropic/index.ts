@@ -21,7 +21,17 @@ import type {
 import { _makeMessageChunkFromAnthropicEvent } from './utils/message_outputs';
 import { _convertMessagesToAnthropicPayload } from './utils/message_inputs';
 import { handleToolChoice } from './utils/tools';
-import { TextStream } from '@/llm/text';
+
+const DEFAULT_STREAM_DELAY = 12;
+const MAX_STREAM_DELAY = 20;
+const CATCH_UP_BUFFERED_CHARS = 300;
+const PARTIAL_CATCH_UP_BUFFERED_CHARS = 150;
+const PARTIAL_CATCH_UP_DELAY = 5;
+const IDLE_TOKEN_SMOOTHING_BUDGET = 80;
+const STREAM_CHUNK_MIN_SIZE = 4;
+const STREAM_BOUNDARIES = new Set([' ', '.', ',', '!', '?', ';', ':']);
+
+type StreamTokenType = 'string' | 'input' | 'content';
 
 const ANTHROPIC_TOOL_BETAS: Partial<Record<string, AnthropicBeta>> = {
   tool_search_tool_regex_20251119: 'advanced-tool-use-2025-11-20',
@@ -236,9 +246,104 @@ function getSamplingParams({
   };
 }
 
+function findStreamChunkBoundary(text: string, minSize: number): number {
+  if (minSize >= text.length) {
+    return text.length;
+  }
+
+  for (let position = minSize; position < text.length; position++) {
+    if (STREAM_BOUNDARIES.has(text[position])) {
+      return position + 1;
+    }
+  }
+
+  return text.length;
+}
+
+function splitStreamToken(text: string): string[] {
+  const chunks: string[] = [];
+  let currentIndex = 0;
+
+  while (currentIndex < text.length) {
+    const remainingText = text.slice(currentIndex);
+    const chunkSize = findStreamChunkBoundary(
+      remainingText,
+      STREAM_CHUNK_MIN_SIZE
+    );
+    chunks.push(text.slice(currentIndex, currentIndex + chunkSize));
+    currentIndex += chunkSize;
+  }
+
+  return chunks;
+}
+
+function getAdaptiveStreamDelay({
+  baseDelay,
+  bufferedTextLength,
+  hasEmittedText,
+}: {
+  baseDelay: number;
+  bufferedTextLength: number;
+  hasEmittedText: boolean;
+}): number {
+  if (!hasEmittedText || baseDelay <= 0) {
+    return 0;
+  }
+  if (bufferedTextLength >= CATCH_UP_BUFFERED_CHARS) {
+    return 0;
+  }
+  const cappedDelay = Math.min(baseDelay, MAX_STREAM_DELAY);
+  if (bufferedTextLength >= PARTIAL_CATCH_UP_BUFFERED_CHARS) {
+    return Math.min(cappedDelay, PARTIAL_CATCH_UP_DELAY);
+  }
+  return cappedDelay;
+}
+
+function getCadencedStreamDelay({
+  targetDelay,
+  lastVisibleTextAt,
+  now,
+}: {
+  targetDelay: number;
+  lastVisibleTextAt?: number;
+  now: number;
+}): number {
+  if (targetDelay <= 0 || lastVisibleTextAt == null) {
+    return 0;
+  }
+  return Math.max(0, targetDelay - (now - lastVisibleTextAt));
+}
+
+async function waitForStreamDelay(
+  delay: number,
+  signal?: AbortSignal
+): Promise<void> {
+  if (delay <= 0 || isSignalAborted(signal)) {
+    return;
+  }
+  await new Promise<void>((resolve) => {
+    const timeoutRef: { current?: ReturnType<typeof setTimeout> } = {};
+    const onAbort = (): void => {
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+      }
+      resolve();
+    };
+    timeoutRef.current = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, delay);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+function isSignalAborted(signal?: AbortSignal): boolean {
+  return signal?.aborted === true;
+}
+
 function extractToken(
   chunk: AIMessageChunk
-): [string, 'string' | 'input' | 'content'] | [undefined] {
+): [string, StreamTokenType] | [undefined] {
   if (typeof chunk.content === 'string') {
     return [chunk.content, 'string'];
   } else if (
@@ -269,7 +374,7 @@ function extractToken(
 
 function cloneChunk(
   text: string,
-  tokenType: string,
+  tokenType: StreamTokenType,
   chunk: AIMessageChunk
 ): AIMessageChunk {
   if (tokenType === 'string') {
@@ -278,20 +383,19 @@ function cloneChunk(
     return chunk;
   }
   const content = chunk.content[0] as MessageContentComplex;
-  if (tokenType === 'content' && content.type === 'text') {
+  if (content.type === 'text') {
     return new AIMessageChunk(
       Object.assign({}, chunk, {
         content: [Object.assign({}, content, { text })],
       })
     );
-  } else if (tokenType === 'content' && content.type === 'text_delta') {
+  } else if (content.type === 'text_delta') {
     return new AIMessageChunk(
       Object.assign({}, chunk, {
         content: [Object.assign({}, content, { text })],
       })
     );
   } else if (
-    tokenType === 'content' &&
     typeof content.type === 'string' &&
     content.type.startsWith('thinking')
   ) {
@@ -354,6 +458,14 @@ type CustomAnthropicInvocationParams = {
   output_config?: AnthropicOutputConfig;
 };
 
+type QueuedGenerationChunk = {
+  chunk: ChatGenerationChunk;
+  token: string;
+  smooth: boolean;
+  textLength: number;
+  targetDelay?: number;
+};
+
 export class CustomAnthropic extends ChatAnthropicMessages {
   _lc_stream_delay: number;
   private tools_in_params?: boolean;
@@ -365,7 +477,10 @@ export class CustomAnthropic extends ChatAnthropicMessages {
     super(fields);
     this.resetTokenEvents();
     this.setDirectFields(fields);
-    this._lc_stream_delay = fields?._lc_stream_delay ?? 25;
+    this._lc_stream_delay = Math.max(
+      0,
+      fields?._lc_stream_delay ?? DEFAULT_STREAM_DELAY
+    );
     this.outputConfig = fields?.outputConfig;
     this.inferenceGeo = fields?.inferenceGeo;
     this.contextManagement = fields?.contextManagement;
@@ -524,102 +639,245 @@ export class CustomAnthropic extends ChatAnthropicMessages {
 
     const shouldStreamUsage = options.streamUsage ?? this.streamUsage;
     let messageDeltaOutputTokens = 0;
+    const queuedChunks: QueuedGenerationChunk[] = [];
+    const producerState: {
+      done: boolean;
+      error?: unknown;
+    } = { done: false };
+    let queuedChunkIndex = 0;
+    let bufferedTextLength = 0;
+    let notifyConsumer: (() => void) | undefined;
 
-    for await (const data of stream) {
-      if (options.signal?.aborted === true) {
-        stream.controller.abort();
-        throw new Error('AbortError: User aborted the request.');
-      }
+    const notify = (): void => {
+      notifyConsumer?.();
+      notifyConsumer = undefined;
+    };
 
-      const result = _makeMessageChunkFromAnthropicEvent(
-        data as Anthropic.Beta.Messages.BetaRawMessageStreamEvent,
-        {
-          streamUsage: shouldStreamUsage,
-          coerceContentToString,
-        }
-      );
-      if (!result) continue;
+    const hasQueuedChunks = (): boolean =>
+      queuedChunkIndex < queuedChunks.length;
 
-      let { chunk } = result;
-      if (data.type === 'message_delta') {
-        const incremental = withIncrementalMessageDeltaUsage(
-          chunk,
-          messageDeltaOutputTokens
-        );
-        chunk = incremental.chunk;
-        messageDeltaOutputTokens = incremental.outputTokens;
-      }
-      const [token = '', tokenType] = extractToken(chunk);
-
+    const waitForNextChunk = async (): Promise<void> => {
       if (
-        !tokenType ||
-        tokenType === 'input' ||
-        (token === '' && (chunk.usage_metadata != null || chunk.id != null))
+        hasQueuedChunks() ||
+        producerState.done ||
+        producerState.error != null
       ) {
-        const generationChunk = this.createGenerationChunk({
+        return;
+      }
+      await new Promise<void>((resolve) => {
+        notifyConsumer = resolve;
+      });
+    };
+
+    const dequeue = (): QueuedGenerationChunk | undefined => {
+      if (!hasQueuedChunks()) {
+        return undefined;
+      }
+      const queuedChunk = queuedChunks[queuedChunkIndex];
+      queuedChunkIndex++;
+      if (
+        queuedChunkIndex > 128 &&
+        queuedChunkIndex * 2 >= queuedChunks.length
+      ) {
+        queuedChunks.splice(0, queuedChunkIndex);
+        queuedChunkIndex = 0;
+      }
+      return queuedChunk;
+    };
+
+    const enqueue = (queuedChunk: QueuedGenerationChunk): void => {
+      queuedChunks.push(queuedChunk);
+      if (queuedChunk.smooth) {
+        bufferedTextLength += queuedChunk.textLength;
+      }
+      notify();
+    };
+
+    const enqueueChunk = ({
+      token,
+      chunk,
+      smooth,
+      targetDelay,
+    }: {
+      token: string;
+      chunk: AIMessageChunk;
+      smooth: boolean;
+      targetDelay?: number;
+    }): void => {
+      enqueue({
+        token,
+        smooth,
+        targetDelay,
+        textLength: smooth ? token.length : 0,
+        chunk: this.createGenerationChunk({
           token,
           chunk,
           shouldStreamUsage,
-        });
-        yield generationChunk;
-        await runManager?.handleLLMNewToken(
-          token,
-          undefined,
-          undefined,
-          undefined,
-          undefined,
-          { chunk: generationChunk }
-        );
-        continue;
-      }
-
-      const textStream = new TextStream(token, {
-        delay: this._lc_stream_delay,
-        firstWordChunk: true,
-        minChunkSize: 4,
-        maxChunkSize: 8,
+        }),
       });
+    };
 
-      const generator = textStream.generateText(options.signal);
-      try {
-        let emittedUsage = false;
-        for await (const currentToken of generator) {
-          if ((options.signal as AbortSignal | undefined)?.aborted === true) {
-            break;
-          }
-          const newChunk = cloneChunk(currentToken, tokenType, chunk);
-          const chunkForToken =
-            emittedUsage && newChunk.usage_metadata != null
-              ? new AIMessageChunk(
-                Object.assign({}, newChunk, { usage_metadata: undefined })
-              )
-              : newChunk;
-
-          const generationChunk = this.createGenerationChunk({
-            token: currentToken,
-            chunk: chunkForToken,
-            shouldStreamUsage,
-          });
-
-          if (newChunk.usage_metadata != null && !emittedUsage) {
-            emittedUsage = true;
-          }
-          yield generationChunk;
-
-          await runManager?.handleLLMNewToken(
-            currentToken,
-            undefined,
-            undefined,
-            undefined,
-            undefined,
-            { chunk: generationChunk }
-          );
-        }
-      } finally {
-        await generator.return();
+    const enqueueTextChunks = (
+      token: string,
+      tokenType: StreamTokenType,
+      chunk: AIMessageChunk
+    ): void => {
+      if (this._lc_stream_delay <= 0) {
+        enqueueChunk({ token, chunk, smooth: false });
+        return;
       }
-    }
 
-    this.resetTokenEvents();
+      const tokenChunks = splitStreamToken(token);
+      if (tokenChunks.length <= 1) {
+        enqueueChunk({ token, chunk, smooth: false });
+        return;
+      }
+
+      const caughtUp = !hasQueuedChunks() && bufferedTextLength === 0;
+      const idleTargetDelay = caughtUp
+        ? Math.min(
+          this._lc_stream_delay,
+          Math.ceil(
+            IDLE_TOKEN_SMOOTHING_BUDGET / Math.max(1, tokenChunks.length - 1)
+          )
+        )
+        : undefined;
+
+      let emittedUsage = false;
+      for (const currentToken of tokenChunks) {
+        const newChunk = cloneChunk(currentToken, tokenType, chunk);
+        const chunkForToken =
+          emittedUsage && newChunk.usage_metadata != null
+            ? new AIMessageChunk(
+              Object.assign({}, newChunk, { usage_metadata: undefined })
+            )
+            : newChunk;
+
+        enqueueChunk({
+          token: currentToken,
+          chunk: chunkForToken,
+          smooth: true,
+          targetDelay: idleTargetDelay,
+        });
+
+        if (newChunk.usage_metadata != null && !emittedUsage) {
+          emittedUsage = true;
+        }
+      }
+    };
+
+    const producer = (async (): Promise<void> => {
+      try {
+        for await (const data of stream) {
+          if (isSignalAborted(options.signal)) {
+            stream.controller.abort();
+            throw new Error('AbortError: User aborted the request.');
+          }
+
+          const result = _makeMessageChunkFromAnthropicEvent(
+            data as Anthropic.Beta.Messages.BetaRawMessageStreamEvent,
+            {
+              streamUsage: shouldStreamUsage,
+              coerceContentToString,
+            }
+          );
+          if (!result) {
+            continue;
+          }
+
+          let { chunk } = result;
+          if (data.type === 'message_delta') {
+            const incremental = withIncrementalMessageDeltaUsage(
+              chunk,
+              messageDeltaOutputTokens
+            );
+            chunk = incremental.chunk;
+            messageDeltaOutputTokens = incremental.outputTokens;
+          }
+
+          const [token = '', tokenType] = extractToken(chunk);
+          if (
+            !tokenType ||
+            tokenType === 'input' ||
+            (token === '' && (chunk.usage_metadata != null || chunk.id != null))
+          ) {
+            enqueueChunk({ token, chunk, smooth: false });
+            continue;
+          }
+
+          enqueueTextChunks(token, tokenType, chunk);
+        }
+      } catch (error) {
+        producerState.error = error;
+      } finally {
+        producerState.done = true;
+        notify();
+      }
+    })();
+
+    let hasEmittedText = false;
+    let lastVisibleTextAt: number | undefined;
+    let keepStreaming = true;
+    try {
+      while (keepStreaming) {
+        if (isSignalAborted(options.signal)) {
+          stream.controller.abort();
+          throw new Error('AbortError: User aborted the request.');
+        }
+
+        await waitForNextChunk();
+        const queuedChunk = dequeue();
+
+        if (!queuedChunk) {
+          if (producerState.error != null) {
+            throw producerState.error;
+          }
+          if (producerState.done) {
+            keepStreaming = false;
+          }
+          continue;
+        }
+
+        if (queuedChunk.smooth) {
+          bufferedTextLength -= queuedChunk.textLength;
+          await waitForStreamDelay(
+            getCadencedStreamDelay({
+              targetDelay:
+                queuedChunk.targetDelay ??
+                getAdaptiveStreamDelay({
+                  baseDelay: this._lc_stream_delay,
+                  bufferedTextLength,
+                  hasEmittedText,
+                }),
+              lastVisibleTextAt,
+              now: Date.now(),
+            }),
+            options.signal
+          );
+          if (isSignalAborted(options.signal)) {
+            stream.controller.abort();
+            throw new Error('AbortError: User aborted the request.');
+          }
+          hasEmittedText = true;
+          lastVisibleTextAt = Date.now();
+        }
+
+        yield queuedChunk.chunk;
+        await runManager?.handleLLMNewToken(
+          queuedChunk.token,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          { chunk: queuedChunk.chunk }
+        );
+      }
+    } finally {
+      if (!producerState.done) {
+        stream.controller.abort();
+      }
+      await producer;
+      this.resetTokenEvents();
+    }
   }
 }

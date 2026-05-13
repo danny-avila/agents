@@ -711,8 +711,7 @@ describe('custom chat model class smoke tests', () => {
     }
 
     const usageChunk = chunks.find(
-      (chunk) =>
-        chunk.usage_metadata?.input_token_details?.cache_creation === 5
+      (chunk) => chunk.usage_metadata?.input_token_details?.cache_creation === 5
     );
     expect(usageChunk?.usage_metadata).toEqual({
       input_tokens: 11,
@@ -748,6 +747,10 @@ describe('custom chat model class smoke tests', () => {
       contextManagement,
       _lc_stream_delay: 8,
     });
+    const defaultModel = new CustomAnthropic({
+      model: 'claude-sonnet-4-5-20250929',
+      apiKey: 'test-key',
+    });
 
     const params = model.invocationParams({
       outputConfig: { effort: 'low' },
@@ -756,6 +759,7 @@ describe('custom chat model class smoke tests', () => {
 
     expect(CustomAnthropic.lc_name()).toBe('LibreChatAnthropic');
     expect(model._lc_stream_delay).toBe(8);
+    expect(defaultModel._lc_stream_delay).toBe(12);
     expect(params.output_config).toEqual({ effort: 'low' });
     expect(params.inference_geo).toBe('eu');
     expect(params.context_management).toEqual(contextManagement);
