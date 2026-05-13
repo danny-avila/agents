@@ -123,6 +123,76 @@ describe('OpenAI-compatible adapters', () => {
     expect(writes.at(-2)).toContain('"finish_reason":"stop"');
   });
 
+  it('scopes tool-call argument state by run step', async () => {
+    const writes: string[] = [];
+    const tracker = createOpenAIStreamTracker();
+    const handlers = createOpenAIHandlers({
+      writer: { write: (data) => void writes.push(data) },
+      context: { requestId: 'chatcmpl_step_tools', model: 'agent', created: 1 },
+      tracker,
+    });
+
+    await handlers[GraphEvents.ON_RUN_STEP_DELTA].handle(
+      GraphEvents.ON_RUN_STEP_DELTA,
+      {
+        id: 'step_1',
+        delta: {
+          type: 'tool_calls',
+          tool_calls: [
+            {
+              index: 0,
+              id: 'call_1',
+              name: 'search',
+              args: '{"query":"first"}',
+            },
+          ],
+        },
+      } as t.RunStepDeltaEvent
+    );
+    await handlers[GraphEvents.ON_RUN_STEP_DELTA].handle(
+      GraphEvents.ON_RUN_STEP_DELTA,
+      {
+        id: 'step_2',
+        delta: {
+          type: 'tool_calls',
+          tool_calls: [
+            {
+              index: 0,
+              id: 'call_2',
+              name: 'search',
+              args: '{"query":"second"}',
+            },
+          ],
+        },
+      } as t.RunStepDeltaEvent
+    );
+
+    const toolCallDeltas = writes
+      .map(
+        (data) =>
+          JSON.parse(data.slice(6)) as {
+            choices: Array<{
+              delta: {
+                tool_calls?: Array<{
+                  id?: string;
+                  function?: { name?: string; arguments?: string };
+                }>;
+              };
+            }>;
+          }
+      )
+      .flatMap((chunk) => chunk.choices[0].delta.tool_calls ?? []);
+
+    expect(toolCallDeltas).toHaveLength(2);
+    expect(toolCallDeltas[1]).toMatchObject({
+      id: 'call_2',
+      function: { name: 'search', arguments: '{"query":"second"}' },
+    });
+    expect(tracker.toolCalls.get(0)?.function.arguments).toBe(
+      '{"query":"second"}'
+    );
+  });
+
   it('streams completed tool-call run steps without deltas', async () => {
     const writes: string[] = [];
     const tracker = createOpenAIStreamTracker();

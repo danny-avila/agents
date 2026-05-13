@@ -63,6 +63,7 @@ export interface OpenAIStreamTracker {
   hasReasoning: boolean;
   lastChunkKind?: 'text' | 'reasoning' | 'tool_call';
   toolCalls: Map<number, OpenAIToolCall>;
+  toolCallsByStep?: Map<string, Map<number, OpenAIToolCall>>;
   usage: {
     promptTokens: number;
     completionTokens: number;
@@ -92,6 +93,7 @@ export function createOpenAIStreamTracker(): OpenAIStreamTracker {
     hasText: false,
     hasReasoning: false,
     toolCalls: new Map(),
+    toolCallsByStep: new Map(),
     usage: {
       promptTokens: 0,
       completionTokens: 0,
@@ -128,6 +130,21 @@ function getToolCallArguments(toolCall: OpenAIToolCallFragment): string {
     return args;
   }
   return JSON.stringify(args);
+}
+
+function getStepToolCalls(
+  tracker: OpenAIStreamTracker,
+  stepId: string
+): Map<number, OpenAIToolCall> {
+  const toolCallsByStep = tracker.toolCallsByStep ?? new Map();
+  tracker.toolCallsByStep = toolCallsByStep;
+  const existing = toolCallsByStep.get(stepId);
+  if (existing != null) {
+    return existing;
+  }
+  const stepToolCalls = new Map<number, OpenAIToolCall>();
+  toolCallsByStep.set(stepId, stepToolCalls);
+  return stepToolCalls;
 }
 
 export function createChatCompletionChunk(
@@ -174,13 +191,15 @@ function getTextParts(
 
 async function emitToolCallChunk(params: {
   config: OpenAIHandlerConfig;
+  stepId: string;
   toolCall: OpenAIToolCallFragment;
   fallbackIndex: number;
   completed: boolean;
 }): Promise<void> {
-  const { config, toolCall, fallbackIndex, completed } = params;
+  const { config, stepId, toolCall, fallbackIndex, completed } = params;
   const index = getToolCallIndex(toolCall, fallbackIndex);
-  const existing = config.tracker.toolCalls.get(index);
+  const stepToolCalls = getStepToolCalls(config.tracker, stepId);
+  const existing = stepToolCalls.get(index);
   const current = existing ?? {
     id: toolCall.id ?? '',
     type: 'function' as const,
@@ -209,6 +228,7 @@ async function emitToolCallChunk(params: {
   if (name !== '') {
     current.function.name = name;
   }
+  stepToolCalls.set(index, current);
   config.tracker.toolCalls.set(index, current);
   if (!idChanged && !nameChanged && argumentDelta === '' && existing) {
     return;
@@ -268,7 +288,8 @@ export function createOpenAIHandlers(
     },
     [GraphEvents.ON_RUN_STEP_DELTA]: {
       handle: async (_event, data): Promise<void> => {
-        const delta = (data as t.RunStepDeltaEvent).delta;
+        const runStepDelta = data as t.RunStepDeltaEvent;
+        const delta = runStepDelta.delta;
         if (delta.type !== 'tool_calls') {
           return;
         }
@@ -276,6 +297,7 @@ export function createOpenAIHandlers(
         for (let index = 0; index < toolCalls.length; index++) {
           await emitToolCallChunk({
             config,
+            stepId: runStepDelta.id,
             toolCall: toolCalls[index],
             fallbackIndex: index,
             completed: false,
@@ -293,6 +315,7 @@ export function createOpenAIHandlers(
         for (let index = 0; index < toolCalls.length; index++) {
           await emitToolCallChunk({
             config,
+            stepId: runStep.id,
             toolCall: toolCalls[index],
             fallbackIndex: index,
             completed: true,
