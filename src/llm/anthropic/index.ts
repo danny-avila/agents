@@ -28,6 +28,8 @@ const CATCH_UP_BUFFERED_CHARS = 300;
 const PARTIAL_CATCH_UP_BUFFERED_CHARS = 150;
 const PARTIAL_CATCH_UP_DELAY = 5;
 const IDLE_TOKEN_SMOOTHING_BUDGET = 80;
+const MAX_STREAM_QUEUE_CHUNKS = 256;
+const MAX_STREAM_QUEUE_TEXT_CHARS = 8192;
 const STREAM_CHUNK_MIN_SIZE = 4;
 const STREAM_BOUNDARIES = new Set([' ', '.', ',', '!', '?', ';', ':']);
 
@@ -647,14 +649,27 @@ export class CustomAnthropic extends ChatAnthropicMessages {
     let queuedChunkIndex = 0;
     let bufferedTextLength = 0;
     let notifyConsumer: (() => void) | undefined;
+    let notifyProducer: (() => void) | undefined;
 
-    const notify = (): void => {
+    const notifyConsumerForChunk = (): void => {
       notifyConsumer?.();
       notifyConsumer = undefined;
     };
 
+    const notifyProducerForSpace = (): void => {
+      notifyProducer?.();
+      notifyProducer = undefined;
+    };
+
     const hasQueuedChunks = (): boolean =>
       queuedChunkIndex < queuedChunks.length;
+
+    const getQueuedChunkCount = (): number =>
+      queuedChunks.length - queuedChunkIndex;
+
+    const isQueueAtCapacity = (): boolean =>
+      getQueuedChunkCount() >= MAX_STREAM_QUEUE_CHUNKS ||
+      bufferedTextLength >= MAX_STREAM_QUEUE_TEXT_CHARS;
 
     const waitForNextChunk = async (): Promise<void> => {
       if (
@@ -667,6 +682,27 @@ export class CustomAnthropic extends ChatAnthropicMessages {
       await new Promise<void>((resolve) => {
         notifyConsumer = resolve;
       });
+    };
+
+    const waitForQueueSpace = async (): Promise<void> => {
+      while (isQueueAtCapacity() && !isSignalAborted(options.signal)) {
+        await new Promise<void>((resolve) => {
+          const signal = options.signal;
+          const onAbort = (): void => {
+            signal?.removeEventListener('abort', onAbort);
+            resolve();
+          };
+          const onSpace = (): void => {
+            signal?.removeEventListener('abort', onAbort);
+            resolve();
+          };
+          notifyProducer = onSpace;
+          signal?.addEventListener('abort', onAbort, { once: true });
+          if (isSignalAborted(signal)) {
+            onAbort();
+          }
+        });
+      }
     };
 
     const dequeue = (): QueuedGenerationChunk | undefined => {
@@ -685,15 +721,22 @@ export class CustomAnthropic extends ChatAnthropicMessages {
       return queuedChunk;
     };
 
-    const enqueue = (queuedChunk: QueuedGenerationChunk): void => {
+    const enqueue = async (
+      queuedChunk: QueuedGenerationChunk
+    ): Promise<void> => {
+      await waitForQueueSpace();
+      if (isSignalAborted(options.signal)) {
+        stream.controller.abort();
+        throw new Error('AbortError: User aborted the request.');
+      }
       queuedChunks.push(queuedChunk);
       if (queuedChunk.smooth) {
         bufferedTextLength += queuedChunk.textLength;
       }
-      notify();
+      notifyConsumerForChunk();
     };
 
-    const enqueueChunk = ({
+    const enqueueChunk = async ({
       token,
       chunk,
       smooth,
@@ -703,8 +746,8 @@ export class CustomAnthropic extends ChatAnthropicMessages {
       chunk: AIMessageChunk;
       smooth: boolean;
       targetDelay?: number;
-    }): void => {
-      enqueue({
+    }): Promise<void> => {
+      await enqueue({
         token,
         smooth,
         targetDelay,
@@ -721,16 +764,14 @@ export class CustomAnthropic extends ChatAnthropicMessages {
       token: string,
       tokenType: StreamTokenType,
       chunk: AIMessageChunk
-    ): void => {
+    ): Promise<void> => {
       if (this._lc_stream_delay <= 0) {
-        enqueueChunk({ token, chunk, smooth: false });
-        return;
+        return enqueueChunk({ token, chunk, smooth: false });
       }
 
       const tokenChunks = splitStreamToken(token);
       if (tokenChunks.length <= 1) {
-        enqueueChunk({ token, chunk, smooth: false });
-        return;
+        return enqueueChunk({ token, chunk, smooth: false });
       }
 
       const caughtUp = !hasQueuedChunks() && bufferedTextLength === 0;
@@ -744,7 +785,8 @@ export class CustomAnthropic extends ChatAnthropicMessages {
         : undefined;
 
       let emittedUsage = false;
-      for (const currentToken of tokenChunks) {
+      return tokenChunks.reduce(async (previous, currentToken) => {
+        await previous;
         const newChunk = cloneChunk(currentToken, tokenType, chunk);
         const chunkForToken =
           emittedUsage && newChunk.usage_metadata != null
@@ -753,7 +795,7 @@ export class CustomAnthropic extends ChatAnthropicMessages {
             )
             : newChunk;
 
-        enqueueChunk({
+        await enqueueChunk({
           token: currentToken,
           chunk: chunkForToken,
           smooth: true,
@@ -763,7 +805,7 @@ export class CustomAnthropic extends ChatAnthropicMessages {
         if (newChunk.usage_metadata != null && !emittedUsage) {
           emittedUsage = true;
         }
-      }
+      }, Promise.resolve());
     };
 
     const producer = (async (): Promise<void> => {
@@ -801,17 +843,17 @@ export class CustomAnthropic extends ChatAnthropicMessages {
             tokenType === 'input' ||
             (token === '' && (chunk.usage_metadata != null || chunk.id != null))
           ) {
-            enqueueChunk({ token, chunk, smooth: false });
+            await enqueueChunk({ token, chunk, smooth: false });
             continue;
           }
 
-          enqueueTextChunks(token, tokenType, chunk);
+          await enqueueTextChunks(token, tokenType, chunk);
         }
       } catch (error) {
         producerState.error = error;
       } finally {
         producerState.done = true;
-        notify();
+        notifyConsumerForChunk();
       }
     })();
 
@@ -839,7 +881,11 @@ export class CustomAnthropic extends ChatAnthropicMessages {
         }
 
         if (queuedChunk.smooth) {
-          bufferedTextLength -= queuedChunk.textLength;
+          bufferedTextLength = Math.max(
+            0,
+            bufferedTextLength - queuedChunk.textLength
+          );
+          notifyProducerForSpace();
           await waitForStreamDelay(
             getCadencedStreamDelay({
               targetDelay:
@@ -860,6 +906,8 @@ export class CustomAnthropic extends ChatAnthropicMessages {
           }
           hasEmittedText = true;
           lastVisibleTextAt = Date.now();
+        } else {
+          notifyProducerForSpace();
         }
 
         yield queuedChunk.chunk;
@@ -875,6 +923,7 @@ export class CustomAnthropic extends ChatAnthropicMessages {
     } finally {
       if (!producerState.done) {
         stream.controller.abort();
+        notifyProducerForSpace();
       }
       await producer;
       this.resetTokenEvents();
