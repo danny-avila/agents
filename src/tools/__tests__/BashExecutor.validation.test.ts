@@ -167,6 +167,36 @@ describe('validateBashCommandHardFloor', () => {
     ).toBe(true);
   });
 
+  it('does NOT mis-strip deny patterns past `${var#prefix}` expansion (Codex P1 round-5)', () => {
+    // Pre-fix `stripComments` treated every unquoted `#` as a comment
+    // start, so `${x#1}` truncated the rest of the command — letting
+    // a subsequent `/proc/self/environ` read slip past the hard floor.
+    // Now `#` inside `${…}` is recognized as the parameter-expansion
+    // operator and the scan continues past it.
+    const result = validateBashCommandHardFloor(
+      'x=1; echo ${x#1}; cat /proc/self/environ'
+    );
+    expect(result.valid).toBe(false);
+    expect(result.errors.join('\n')).toContain('proc-environ-read');
+
+    // Also catches the `##` (greedy prefix removal) variant.
+    const greedy = validateBashCommandHardFloor(
+      'x=foo; echo ${x##*foo}; cat /proc/1/environ'
+    );
+    expect(greedy.valid).toBe(false);
+  });
+
+  it('does NOT treat mid-word `#` as a comment start', () => {
+    // `cat#foo` is one word and the `#` is literal text bash passes
+    // to `cat` (which would fail, but isn't a comment). Verify the
+    // hard floor still sees text after such a `#`.
+    const result = validateBashCommandHardFloor(
+      'echo cat#hello; cat /proc/self/environ'
+    );
+    expect(result.valid).toBe(false);
+    expect(result.errors.join('\n')).toContain('proc-environ-read');
+  });
+
   it('still trips on deny patterns inside quoted strings (not comments)', () => {
     // `echo "cat /proc/self/environ"` — the path lives inside a
     // double-quoted string that bash WILL evaluate. The hard floor

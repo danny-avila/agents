@@ -81,44 +81,106 @@ const mutatingCommandPattern =
  * Strips `# …` shell comments (outside quoted spans) to a `\n` while
  * preserving quoted content as-is. Used by `validateBashCommandHardFloor`
  * so the deny-only AST scan doesn't false-positive on text that bash
- * would skip — e.g. `echo ok # cat /proc/self/environ`. Differs from
- * `stripQuotedContent` (which BLANKS quotes too); we want to preserve
- * nested-shell payloads so the deny patterns still see their contents.
+ * would skip — e.g. `echo ok # cat /proc/self/environ`.
+ *
+ * Bash's `#` rule is narrower than "anywhere outside quotes":
+ *
+ *   - `#` is a comment marker only when it begins a word (i.e., at
+ *     start-of-input or after whitespace / a shell separator).
+ *     `cat#foo` is one word and the `#` is literal text bash passes
+ *     to `cat`.
+ *
+ *   - Inside `${…}` parameter expansion, `#` is an OPERATOR
+ *     (`${var#prefix}`, `${var##prefix}`), not a comment. Pre-fix
+ *     this case bypassed the hard-floor exfil guard: a command like
+ *     `x=1; echo ${x#1}; cat /proc/self/environ` got truncated at
+ *     `${x#1}`, so the `/proc/self/environ` read never reached the
+ *     deny scan (Codex P1 round-5).
+ *
+ * Other parenthesized contexts (`$(…)`, plain `(…)` subshells) are
+ * not tracked — `#` rules inside them follow the same word-boundary
+ * gate at the top level. A pattern in a comment INSIDE `$(…)` would
+ * false-positive against the deny scan; acceptable for the hard
+ * floor's defense-in-depth posture.
  */
 export function stripComments(command: string): string {
   let output = '';
   let quote: '"' | '\'' | '`' | undefined;
   let escaped = false;
+  let braceDepth = 0;
+  let prevChar: string | undefined;
   for (let i = 0; i < command.length; i++) {
     const char = command[i];
     if (escaped) {
       escaped = false;
       output += char;
+      prevChar = char;
       continue;
     }
     if (char === '\\') {
       escaped = true;
       output += char;
+      prevChar = char;
       continue;
     }
     if (quote != null) {
       if (char === quote) quote = undefined;
       output += char;
+      prevChar = char;
       continue;
     }
     if (char === '"' || char === '\'' || char === '`') {
       quote = char;
       output += char;
+      prevChar = char;
+      continue;
+    }
+    // Track `${…}` parameter-expansion depth. Bash uses `#` inside as
+    // an expansion operator, not a comment start.
+    if (char === '$' && i + 1 < command.length && command[i + 1] === '{') {
+      output += '$';
+      output += '{';
+      i++;
+      braceDepth++;
+      prevChar = '{';
+      continue;
+    }
+    if (braceDepth > 0) {
+      if (char === '{') braceDepth++;
+      else if (char === '}') braceDepth--;
+      output += char;
+      prevChar = char;
       continue;
     }
     if (char === '#') {
-      while (i < command.length && command[i] !== '\n') {
-        i++;
+      // Bash treats `#` as a comment marker only when it begins a
+      // word — at start-of-input or after whitespace / a shell
+      // separator. `cat#foo` is one word; `cat #foo` is `cat` plus
+      // a comment.
+      const atWordBoundary =
+        prevChar === undefined ||
+        prevChar === ' ' ||
+        prevChar === '\t' ||
+        prevChar === '\n' ||
+        prevChar === '\r' ||
+        prevChar === ';' ||
+        prevChar === '&' ||
+        prevChar === '|' ||
+        prevChar === '<' ||
+        prevChar === '>' ||
+        prevChar === '(' ||
+        prevChar === '{';
+      if (atWordBoundary) {
+        while (i < command.length && command[i] !== '\n') {
+          i++;
+        }
+        output += '\n';
+        prevChar = '\n';
+        continue;
       }
-      output += '\n';
-      continue;
     }
     output += char;
+    prevChar = char;
   }
   return output;
 }
