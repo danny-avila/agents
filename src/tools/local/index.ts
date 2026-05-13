@@ -7,6 +7,7 @@ export * from './LocalProgrammaticToolCalling';
 export * from './resolveLocalExecutionTools';
 export * from './attachments';
 export * from './bashAst';
+export * from './bashValidation';
 export * from './editStrategies';
 export * from './syntaxCheck';
 export * from './textEncoding';

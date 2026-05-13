@@ -23,6 +23,11 @@ export type {
   WorkspacePolicyConfig,
   PathExtractor,
 } from './createWorkspacePolicyHook';
+export { createBashPolicyHook } from './createBashPolicyHook';
+export type {
+  BashPolicyConfig,
+  BashPolicyDecision,
+} from './createBashPolicyHook';
 export { HOOK_EVENTS } from './types';
 export type {
   HookEvent,

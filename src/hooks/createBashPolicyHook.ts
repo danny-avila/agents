@@ -1,0 +1,275 @@
+/**
+ * Declarative `PreToolUse` hook factory for the bash execution tools
+ * (`bash_tool` by default; `toolNames` to widen). Mirrors the shape
+ * of {@link createWorkspacePolicyHook} for file paths and
+ * {@link createToolPolicyHook} for tool names — same `allow` / `deny`
+ * / `ask` vocabulary, same HITL integration via the existing
+ * `PreToolUse` `'ask'` flow.
+ *
+ * Pattern DSL (matched against the bash `command` argument, after a
+ * leading-whitespace trim):
+ *
+ *   - `"<cmd>"`            — exact match on the trimmed command,
+ *                            e.g. `"npm test"` matches only `npm test`.
+ *   - `"<prefix>:*"`       — prefix match on the command, e.g.
+ *                            `"git:*"` matches `git status`, `git push`,
+ *                            `git log -1`. `"git push:*"` matches
+ *                            `git push`, `git push origin main`, …
+ *   - `"*"`                — match anything. Useful only inside
+ *                            `default` (`default: 'allow'` is similar to
+ *                            an empty policy; `default: 'deny'` plus an
+ *                            explicit `allow` list gives a pure allowlist).
+ *
+ * Patterns are case-sensitive. Quoting and shell-substitution are NOT
+ * normalized — `"git:*"` matches `git push`, but not `"git" push` or
+ * `git\push`. Hosts that want bulletproof matching should pair this
+ * hook with the always-on hard floor in the executor itself.
+ *
+ * Evaluation order (mirrors Claude Code's permission flow):
+ *
+ *   1. `deny` rule match → `'deny'`.
+ *   2. `ask` rule match → `'ask'`.
+ *   3. `allow` rule match → `'allow'`.
+ *   4. `default` decision (defaults to `'allow'` so an empty policy
+ *      is a no-op).
+ *
+ * The hook only fires for tool calls whose name is in `toolNames`
+ * (defaults to `[BASH_TOOL]`). Calls to any other tool short-circuit
+ * to `'allow'` so the host can combine this hook with
+ * `createWorkspacePolicyHook` / `createToolPolicyHook` on the same
+ * registry without cross-talk.
+ */
+
+import { Constants } from '@/common';
+import type {
+  HookCallback,
+  PreToolUseHookInput,
+  PreToolUseHookOutput,
+  ToolDecision,
+} from './types';
+
+export type BashPolicyDecision = 'allow' | 'ask' | 'deny';
+
+export interface BashPolicyConfig {
+  /** Patterns that auto-allow without prompting. */
+  allow?: readonly string[];
+  /** Patterns that block outright. Wins over `ask` and `allow`. */
+  deny?: readonly string[];
+  /**
+   * Patterns that trigger human approval. Collapses to `'deny'`
+   * when the host has HITL disabled (matching the rest of the SDK).
+   */
+  ask?: readonly string[];
+  /**
+   * Decision for commands that match none of the rules. Defaults to
+   * `'allow'` so an empty policy is a no-op. Set to `'ask'` or
+   * `'deny'` for stricter postures (allowlist-only).
+   */
+  default?: BashPolicyDecision;
+  /**
+   * Tool names this hook gates. Defaults to `[BASH_TOOL]`. Set to
+   * `[BASH_TOOL, BASH_PROGRAMMATIC_TOOL_CALLING]` to also gate the
+   * PTC-bash flow. Calls to tools not in this set short-circuit to
+   * `'allow'`.
+   */
+  toolNames?: readonly string[];
+  /**
+   * Optional reason template attached to `ask`/`deny` decisions.
+   * Supports `{tool}`, `{command}`, `{pattern}` substitution.
+   */
+  reason?: string;
+}
+
+const DEFAULT_TOOL_NAMES: readonly string[] = [Constants.BASH_TOOL];
+
+/**
+ * Extract the bash command string from a tool-call input shape. The
+ * `bash_tool` schema has `{ command: string, args?: string[] }`; the
+ * legacy `execute_code` schema with `lang: 'bash'` uses
+ * `{ lang, code, args? }`. Both forms are handled so a host that
+ * widens `toolNames` to include `EXECUTE_CODE` still gets matching.
+ */
+function extractCommand(
+  toolInput: Record<string, unknown>
+): string | undefined {
+  if (typeof toolInput.command === 'string') return toolInput.command;
+  if (typeof toolInput.code === 'string' && toolInput.lang === 'bash') {
+    return toolInput.code;
+  }
+  return undefined;
+}
+
+type CompiledMatcher = {
+  source: string;
+  test: (command: string) => boolean;
+};
+
+/**
+ * Compile a single DSL pattern. Three forms:
+ *   - `*`         → matches anything.
+ *   - `<x>:*`     → prefix match; trims trailing `:*` and matches
+ *                   when the trimmed command starts with the prefix.
+ *                   Boundary-aware: `"git:*"` does NOT match `gitlab
+ *                   clone`, because the next char after `git` must be
+ *                   whitespace, end-of-string, or a shell separator.
+ *   - `<x>`       — exact match on the trimmed command (after collapsing
+ *                   inner whitespace runs).
+ */
+function compilePattern(pattern: string): CompiledMatcher {
+  const source = pattern;
+  if (pattern === '*') {
+    return { source, test: () => true };
+  }
+  if (pattern.endsWith(':*')) {
+    const prefix = pattern.slice(0, -2);
+    return {
+      source,
+      test: (command: string): boolean => {
+        if (!command.startsWith(prefix)) return false;
+        if (command.length === prefix.length) return true;
+        const next = command.charAt(prefix.length);
+        // Boundary chars: whitespace or shell-statement separators.
+        return /[\s;&|<>]/.test(next);
+      },
+    };
+  }
+  const exact = pattern.replace(/\s+/g, ' ').trim();
+  return {
+    source,
+    test: (command: string): boolean =>
+      command.replace(/\s+/g, ' ').trim() === exact,
+  };
+}
+
+function compileMatchers(
+  patterns: readonly string[] | undefined
+): CompiledMatcher[] {
+  if (patterns == null || patterns.length === 0) return [];
+  return patterns.map(compilePattern);
+}
+
+function firstMatch(
+  command: string,
+  matchers: readonly CompiledMatcher[]
+): CompiledMatcher | undefined {
+  for (const m of matchers) {
+    if (m.test(command)) return m;
+  }
+  return undefined;
+}
+
+function formatReason(
+  template: string | undefined,
+  toolName: string,
+  command: string,
+  pattern: string | undefined
+): string | undefined {
+  if (template == null) return undefined;
+  return template
+    .replace(/\{tool\}/g, toolName)
+    .replace(/\{command\}/g, command)
+    .replace(/\{pattern\}/g, pattern ?? '');
+}
+
+/**
+ * Build a `PreToolUse` hook callback that gates bash command
+ * invocations against the configured allow / deny / ask DSL.
+ *
+ * Example — pure allowlist (everything else is denied):
+ *
+ * ```ts
+ * registry.register('PreToolUse', {
+ *   hooks: [
+ *     createBashPolicyHook({
+ *       allow: ['git status', 'git diff:*', 'npm test', 'ls:*'],
+ *       default: 'deny',
+ *     }),
+ *   ],
+ * });
+ * ```
+ *
+ * Example — ask-on-mutation, allow read-only by default:
+ *
+ * ```ts
+ * createBashPolicyHook({
+ *   ask: ['git push:*', 'npm publish:*', 'rm:*'],
+ *   default: 'allow',
+ * });
+ * ```
+ *
+ * Composes with `createWorkspacePolicyHook` and `createToolPolicyHook`
+ * on the same registry — `executeHooks` precedence (`deny > ask >
+ * allow`) sorts out which decision wins per call.
+ */
+export function createBashPolicyHook(
+  config: BashPolicyConfig
+): HookCallback<'PreToolUse'> {
+  const denyMatchers = compileMatchers(config.deny);
+  const askMatchers = compileMatchers(config.ask);
+  const allowMatchers = compileMatchers(config.allow);
+  const defaultDecision: BashPolicyDecision = config.default ?? 'allow';
+  const toolNames = new Set<string>(config.toolNames ?? DEFAULT_TOOL_NAMES);
+  const reasonTemplate = config.reason;
+
+  return async (input: PreToolUseHookInput): Promise<PreToolUseHookOutput> => {
+    if (!toolNames.has(input.toolName)) return { decision: 'allow' };
+
+    const command = extractCommand(input.toolInput);
+    if (command == null || command === '') return { decision: 'allow' };
+
+    const trimmed = command.trim();
+
+    const denyHit = firstMatch(trimmed, denyMatchers);
+    if (denyHit != null) {
+      return buildDecision(
+        'deny',
+        input.toolName,
+        command,
+        denyHit,
+        reasonTemplate
+      );
+    }
+    const askHit = firstMatch(trimmed, askMatchers);
+    if (askHit != null) {
+      return buildDecision(
+        'ask',
+        input.toolName,
+        command,
+        askHit,
+        reasonTemplate
+      );
+    }
+    const allowHit = firstMatch(trimmed, allowMatchers);
+    if (allowHit != null) {
+      return { decision: 'allow' };
+    }
+    if (defaultDecision === 'allow') {
+      return { decision: 'allow' };
+    }
+    return buildDecision(
+      defaultDecision,
+      input.toolName,
+      command,
+      undefined,
+      reasonTemplate
+    );
+  };
+}
+
+function buildDecision(
+  decision: ToolDecision,
+  toolName: string,
+  command: string,
+  match: CompiledMatcher | undefined,
+  reasonTemplate: string | undefined
+): PreToolUseHookOutput {
+  const reason = formatReason(reasonTemplate, toolName, command, match?.source);
+  const baseAllowed =
+    decision === 'ask'
+      ? { allowedDecisions: ['approve', 'reject'] as const }
+      : {};
+  if (reason != null) {
+    return { decision, reason, ...baseAllowed };
+  }
+  return { decision, ...baseAllowed };
+}
