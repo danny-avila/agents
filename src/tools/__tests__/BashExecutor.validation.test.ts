@@ -94,6 +94,44 @@ describe('validateBashCommandHardFloor', () => {
     expect(result.errors.join('\n')).toContain('zsh-builtin-zmodload');
   });
 
+  it('blocks /proc/<pid>/environ inside nested-shell payloads (Codex P1 #1)', () => {
+    // Pre-fix `stripQuotedContent` blanked the inner payload to
+    // whitespace before the AST scan, so the deny check never saw
+    // `/proc/self/environ`. Verify both single- and double-quoted forms.
+    const single = validateBashCommandHardFloor(
+      'bash -lc \'cat /proc/self/environ\''
+    );
+    expect(single.valid).toBe(false);
+    expect(single.errors.join('\n')).toContain('proc-environ-read');
+
+    const double = validateBashCommandHardFloor(
+      'sh -c "cat /proc/self/environ"'
+    );
+    expect(double.valid).toBe(false);
+    expect(double.errors.join('\n')).toContain('proc-environ-read');
+
+    const evalForm = validateBashCommandHardFloor('eval "cat /proc/1/environ"');
+    expect(evalForm.valid).toBe(false);
+    expect(evalForm.errors.join('\n')).toContain('proc-environ-read');
+  });
+
+  it('blocks /proc/<pid>/environ smuggled via positional arg (Codex P1 #2)', () => {
+    // Pre-fix `findOffendingArg` only ran when the command matched
+    // `rm/chmod/chown`, so a benign-looking `cat "$1"` with the
+    // sensitive path in args silently slipped through.
+    const result = validateBashCommandHardFloor('cat "$1"', [
+      '/proc/self/environ',
+    ]);
+    expect(result.valid).toBe(false);
+    expect(result.errors.join('\n')).toContain('proc-environ-read');
+
+    const numbered = validateBashCommandHardFloor('cat "$2"', [
+      'ignored',
+      '/proc/1/environ',
+    ]);
+    expect(numbered.valid).toBe(false);
+  });
+
   it('blocks source-from-unbound-variable', () => {
     expect(validateBashCommandHardFloor('source $REMOTE_SCRIPT').valid).toBe(
       false

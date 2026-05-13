@@ -300,7 +300,30 @@ export function validateBashCommandHardFloor(
   // zsh privileged builtins. Skip the warn-severity ones (cmd subst,
   // IFS, hex escape, eval/exec) — they're too noisy for an always-on
   // floor.
-  const findings = runBashAstChecks(normalized, 'auto');
+  //
+  // Scan an "effective command" assembled from the raw command +
+  // every positional arg (rather than the quote-stripped `normalized`
+  // form). Two bypass classes that the original `runBashAstChecks(
+  // normalized, …)` call missed (Codex P1):
+  //
+  //   1. Nested-shell payloads: `bash -lc 'cat /proc/self/environ'` —
+  //      `stripQuotedContent` blanks the inner payload to whitespace,
+  //      so `/proc/self/environ` disappeared before the AST scan ever
+  //      ran. Scanning the original command text catches it.
+  //
+  //   2. Positional-arg exfil: `command: 'cat "$1"', args:
+  //      ['/proc/self/environ']` — the command body never references
+  //      the path. Appending args to the scanned string catches it.
+  //
+  // False-positive tradeoff: `echo "discussing /proc/self/environ"`
+  // now trips the floor. Acceptable — the deny patterns are narrow
+  // enough that legitimate workloads basically never include them
+  // even as literal strings, and the cost of refusing such a print is
+  // negligible. This is the defense-in-depth posture the floor was
+  // always meant to take.
+  const effectiveCommand =
+    args != null && args.length > 0 ? `${command} ${args.join(' ')}` : command;
+  const findings = runBashAstChecks(effectiveCommand, 'auto');
   for (const finding of findings) {
     if (finding.severity === 'deny') {
       errors.push(`[bashAst:${finding.code}] ${finding.message}`);
