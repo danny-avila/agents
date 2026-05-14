@@ -193,6 +193,14 @@ function containsShellSeparator(command: string): boolean {
     // double quotes — only single quotes suppress it.
     if (char === '`') return true;
     if (char === '$' && i + 1 < command.length && command[i + 1] === '(') {
+      // `$((expr))` is arithmetic expansion, NOT command substitution
+      // — bash evaluates `expr` as an integer expression and never
+      // runs it as a command. Pre-fix the scan flagged any `$(` as a
+      // separator, so benign uses like `git commit -m "$((1+1))"`
+      // were denied under allowlist policies (Codex P2 round-10).
+      if (i + 2 < command.length && command[i + 2] === '(') {
+        continue;
+      }
       return true;
     }
     // Other separators are literal text inside double quotes; only

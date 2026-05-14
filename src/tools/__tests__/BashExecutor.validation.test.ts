@@ -193,6 +193,23 @@ describe('validateBashCommandHardFloor', () => {
     expect(validateBashCommandHardFloor('eval \'rm -rf /\'').valid).toBe(false);
   });
 
+  it('blocks destructive commands hidden after a mid-word # (Codex P1 round-10)', () => {
+    // Pre-fix `stripQuotedContent` treated every unquoted `#` as a
+    // comment start, blanking the trailing `; rm -rf /` from the
+    // destructive-pattern regex. Bash treats `#` as a comment only
+    // at word boundaries, so `foo#bar` keeps `#` literal and `; rm
+    // -rf /` is still an executed command.
+    const result = validateBashCommandHardFloor('echo foo#bar; rm -rf /');
+    expect(result.valid).toBe(false);
+    expect(result.errors.join('\n')).toContain('destructive');
+
+    // Same shape with `${var#prefix}` parameter expansion in front.
+    const withParamExpansion = validateBashCommandHardFloor(
+      'x=foo; echo ${x#1}; rm -rf /'
+    );
+    expect(withParamExpansion.valid).toBe(false);
+  });
+
   it('does NOT trip on commands that merely print destructive strings', () => {
     expect(validateBashCommandHardFloor('echo "rm -rf /"').valid).toBe(true);
   });

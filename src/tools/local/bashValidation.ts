@@ -84,6 +84,32 @@ const mutatingCommandPattern =
   /\b(?:rm|mv|cp|touch|mkdir|rmdir|ln|truncate|tee|sed\s+-i|perl\s+-pi|python(?:3)?\s+-c|node\s+-e|npm\s+(?:install|ci|update|publish)|pnpm\s+(?:install|update|publish)|yarn\s+(?:install|add|publish)|git\s+(?:add|commit|checkout|switch|reset|clean|rebase|merge|push|pull|stash|tag|branch)|chmod|chown)\b|(?:^|[^<])>\s*[^&]|\bcat\s+[^|;&]*>\s*/;
 
 /**
+ * Bash treats `#` as a comment marker only when it begins a word —
+ * at start-of-input or after whitespace / a shell separator. `cat#foo`
+ * is one word and the `#` is literal text; `cat #foo` is `cat` plus
+ * a comment. Both `stripComments` and `stripQuotedContent` use this
+ * predicate so a mid-word `#` doesn't accidentally blank everything
+ * after it (which previously hid destructive commands like
+ * `echo foo#bar; rm -rf /` — Codex P1 rounds 5 and 10).
+ */
+function isCommentBoundary(prevChar: string | undefined): boolean {
+  return (
+    prevChar === undefined ||
+    prevChar === ' ' ||
+    prevChar === '\t' ||
+    prevChar === '\n' ||
+    prevChar === '\r' ||
+    prevChar === ';' ||
+    prevChar === '&' ||
+    prevChar === '|' ||
+    prevChar === '<' ||
+    prevChar === '>' ||
+    prevChar === '(' ||
+    prevChar === '{'
+  );
+}
+
+/**
  * Strips `# …` shell comments (outside quoted spans) to a `\n` while
  * preserving quoted content as-is. Used by `validateBashCommandHardFloor`
  * so the deny-only AST scan doesn't false-positive on text that bash
@@ -158,32 +184,13 @@ export function stripComments(command: string): string {
       prevChar = char;
       continue;
     }
-    if (char === '#') {
-      // Bash treats `#` as a comment marker only when it begins a
-      // word — at start-of-input or after whitespace / a shell
-      // separator. `cat#foo` is one word; `cat #foo` is `cat` plus
-      // a comment.
-      const atWordBoundary =
-        prevChar === undefined ||
-        prevChar === ' ' ||
-        prevChar === '\t' ||
-        prevChar === '\n' ||
-        prevChar === '\r' ||
-        prevChar === ';' ||
-        prevChar === '&' ||
-        prevChar === '|' ||
-        prevChar === '<' ||
-        prevChar === '>' ||
-        prevChar === '(' ||
-        prevChar === '{';
-      if (atWordBoundary) {
-        while (i < command.length && command[i] !== '\n') {
-          i++;
-        }
-        output += '\n';
-        prevChar = '\n';
-        continue;
+    if (char === '#' && isCommentBoundary(prevChar)) {
+      while (i < command.length && command[i] !== '\n') {
+        i++;
       }
+      output += '\n';
+      prevChar = '\n';
+      continue;
     }
     output += char;
     prevChar = char;
@@ -193,28 +200,51 @@ export function stripComments(command: string): string {
 
 /**
  * Strips the contents of quoted spans (`"…"`, `'…'`, `` `…` ``) and
- * comments to `\n`-normalized whitespace so the destructive regex set
- * can be applied against the "structural" form of the command without
- * being fooled by quoted literals. Exported for the higher-level
- * validator wrapper.
+ * shell comments to `\n`-normalized whitespace so the destructive
+ * regex set can be applied against the "structural" form of the
+ * command without being fooled by quoted literals.
+ *
+ * Comment handling: same word-boundary rule as `stripComments` —
+ * mid-word `#` (e.g. `echo foo#bar; rm -rf /`) is literal text in
+ * bash and must NOT cause a blanket strip of the trailing
+ * destructive command (Codex P1 round-10).
+ *
+ * Parameter-expansion tracking: `${var#prefix}` uses `#` as an
+ * expansion operator, not a comment start. Tracking `${…}` depth
+ * keeps that text intact for the destructive-pattern regex.
  */
 export function stripQuotedContent(command: string): string {
   let output = '';
   let quote: '"' | '\'' | '`' | undefined;
   let escaped = false;
+  let braceDepth = 0;
+  let prevChar: string | undefined;
+
+  const append = (out: string): void => {
+    output += out;
+    // `prevChar` tracks what bash's tokenizer would see, not the
+    // possibly-blanked output char. We update it via a separate
+    // `setPrev` call so the word-boundary check on `#` reflects the
+    // original char (e.g. `o` in `foo#bar` stays `o`, not ` `).
+  };
+  const setPrev = (originalChar: string): void => {
+    prevChar = originalChar;
+  };
 
   for (let i = 0; i < command.length; i++) {
     const char = command[i];
 
     if (escaped) {
       escaped = false;
-      output += ' ';
+      append(' ');
+      setPrev(char);
       continue;
     }
 
     if (char === '\\') {
       escaped = true;
-      output += ' ';
+      append(' ');
+      setPrev(char);
       continue;
     }
 
@@ -222,26 +252,57 @@ export function stripQuotedContent(command: string): string {
       if (char === quote) {
         quote = undefined;
       }
-      output += ' ';
+      append(' ');
+      setPrev(char);
       continue;
     }
 
     if (char === '"' || char === '\'' || char === '`') {
       quote = char;
-      output += ' ';
+      append(' ');
+      setPrev(char);
       continue;
     }
 
-    if (char === '#') {
+    // Track `${…}` parameter-expansion depth. Inside `${…}`, `#` is
+    // an expansion operator (e.g. `${var#prefix}`), not a comment
+    // marker; we must NOT blank from it. Pre-fix
+    // `echo ${x#1}; rm -rf /` had the rest of the line stripped
+    // because the first unquoted `#` was treated as comment start
+    // (mirrors the same issue we fixed for `stripComments` in
+    // Codex P1 round-5; round-10 found it again here).
+    if (char === '$' && i + 1 < command.length && command[i + 1] === '{') {
+      append('$');
+      append('{');
+      i++;
+      braceDepth++;
+      setPrev('{');
+      continue;
+    }
+    if (braceDepth > 0) {
+      if (char === '{') braceDepth++;
+      else if (char === '}') braceDepth--;
+      append(char);
+      setPrev(char);
+      continue;
+    }
+
+    // `#` only starts a comment at a word boundary (start-of-input
+    // or after whitespace / shell separator). `echo foo#bar; rm -rf
+    // /` keeps the `; rm -rf /` visible to the destructive regex
+    // because the `#` is mid-word here (Codex P1 round-10).
+    if (char === '#' && isCommentBoundary(prevChar)) {
       while (i < command.length && command[i] !== '\n') {
-        output += ' ';
+        append(' ');
         i++;
       }
-      output += '\n';
+      append('\n');
+      setPrev('\n');
       continue;
     }
 
-    output += char;
+    append(char);
+    setPrev(char);
   }
 
   return output;
