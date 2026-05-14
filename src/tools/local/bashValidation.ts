@@ -149,6 +149,19 @@ export function stripComments(command: string): string {
       prevChar = char;
       continue;
     }
+    // Inside single quotes: NOTHING escapes — backslash is literal,
+    // only the closing `'` matters. Pre-fix the `\\` branch ran
+    // before this check, so `'abc\'` never closed the quote in our
+    // scanner — and `; rm -rf /` after looked "still inside the
+    // quote", suppressing subsequent comment-strip / quote-aware
+    // handling (same bug class as Codex P1 round-6 in
+    // `containsShellSeparator`; round-11 found it here too).
+    if (quote === '\'') {
+      if (char === '\'') quote = undefined;
+      output += char;
+      prevChar = char;
+      continue;
+    }
     if (char === '\\') {
       escaped = true;
       output += char;
@@ -236,6 +249,23 @@ export function stripQuotedContent(command: string): string {
 
     if (escaped) {
       escaped = false;
+      append(' ');
+      setPrev(char);
+      continue;
+    }
+
+    // Inside single quotes: NOTHING escapes — backslash is literal,
+    // only the closing `'` matters. Pre-fix the `\\` branch ran
+    // before this check, so `'abc\'` never closed the quote in our
+    // scanner — and the trailing `; rm -rf /` looked "still inside
+    // the quote", getting blanked. `matchAnyDestructive` then
+    // missed the destructive tail and the hard-floor was bypassable.
+    // Same bug class Codex flagged for `containsShellSeparator` in
+    // round 6 (Codex P1 round-11).
+    if (quote === '\'') {
+      if (char === '\'') {
+        quote = undefined;
+      }
       append(' ');
       setPrev(char);
       continue;

@@ -193,6 +193,22 @@ describe('validateBashCommandHardFloor', () => {
     expect(validateBashCommandHardFloor('eval \'rm -rf /\'').valid).toBe(false);
   });
 
+  it('blocks destructive tail when single-quote span contains a backslash (Codex P1 round-11)', () => {
+    // Pre-fix `stripQuotedContent` ran the `\\` escape branch BEFORE
+    // checking the active quote, so `'abc\\'` never closed the
+    // single-quoted span — and the trailing `; rm -rf /` got blanked
+    // along with the (apparently still-open) quoted span. Bash
+    // closes the quote at the `'` after the literal backslash and
+    // runs the destructive command.
+    const result = validateBashCommandHardFloor('echo \'abc\\\'; rm -rf /');
+    expect(result.valid).toBe(false);
+    expect(result.errors.join('\n')).toContain('destructive');
+
+    // Plain single-quoted text without backslash still works.
+    const benign = validateBashCommandHardFloor('echo \'abc\'');
+    expect(benign.valid).toBe(true);
+  });
+
   it('blocks destructive commands hidden after a mid-word # (Codex P1 round-10)', () => {
     // Pre-fix `stripQuotedContent` treated every unquoted `#` as a
     // comment start, blanking the trailing `; rm -rf /` from the
