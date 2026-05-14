@@ -122,7 +122,10 @@ function createCompletionStreamChunks(): OpenAIChatCompletionChunk[] {
   ];
 }
 
-function createContentChunk(content: string): OpenAIChatCompletionChunk {
+function createContentChunk(
+  content: string,
+  logprobs: OpenAIChatCompletionChunk['choices'][number]['logprobs'] = null
+): OpenAIChatCompletionChunk {
   return {
     id: 'chatcmpl-deepseek-test',
     object: 'chat.completion.chunk',
@@ -136,7 +139,7 @@ function createContentChunk(content: string): OpenAIChatCompletionChunk {
           content,
         },
         finish_reason: null,
-        logprobs: null,
+        logprobs,
       },
     ],
   };
@@ -552,6 +555,34 @@ describe('ChatDeepSeek', () => {
     }
 
     expect(textChunks).toEqual(['alpha ', 'beta ', 'gamma']);
+  });
+
+  it('keeps delayed DeepSeek logprob chunks intact', async () => {
+    const logprobs = { content: [], refusal: null } as NonNullable<
+      OpenAIChatCompletionChunk['choices'][number]['logprobs']
+    >;
+    const model = new CapturingChatDeepSeek(
+      {
+        apiKey: 'test-key',
+        model: 'deepseek-v4-pro',
+        streaming: true,
+        logprobs: true,
+        _lc_stream_delay: 1,
+      },
+      [createContentChunk('alpha beta gamma', logprobs)]
+    );
+    const chunks: ChatGenerationChunk[] = [];
+
+    for await (const chunk of model.streamChunksWithSignal(
+      new AbortController().signal
+    )) {
+      if (chunk.text !== '') {
+        chunks.push(chunk);
+      }
+    }
+
+    expect(chunks.map((chunk) => chunk.text)).toEqual(['alpha beta gamma']);
+    expect(chunks[0].generationInfo?.logprobs).toBe(logprobs);
   });
 
   it('emits callbacks for split delayed DeepSeek text chunks', async () => {

@@ -445,6 +445,7 @@ function splitTextGenerationChunk(
     !(message instanceof AIMessageChunk) ||
     typeof message.content !== 'string' ||
     message.content !== chunk.text ||
+    chunk.generationInfo?.logprobs != null ||
     chunk.generationInfo?.finish_reason != null
   ) {
     return [chunk];
