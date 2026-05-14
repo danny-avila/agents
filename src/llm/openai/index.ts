@@ -35,7 +35,6 @@ import type { ChatGeneration, ChatResult } from '@langchain/core/outputs';
 import type { ChatXAIInput } from '@langchain/xai';
 import type * as t from '@langchain/openai';
 import { isReasoningModel, _convertMessagesToOpenAIParams } from './utils';
-import { sleep } from '@/utils';
 
 // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
 const iife = <T>(fn: () => T) => fn();
@@ -405,20 +404,48 @@ function getCustomOpenAIClientOptions(
 
 async function* delayStreamChunks<T>(
   chunks: AsyncGenerator<T>,
-  delay?: number
+  delay?: number,
+  signal?: AbortSignal
 ): AsyncGenerator<T> {
   let lastYieldedAt: number | undefined;
   for await (const chunk of chunks) {
+    signal?.throwIfAborted();
     if (delay != null && delay > 0 && lastYieldedAt != null) {
       const timeSinceLastYield = Date.now() - lastYieldedAt;
       const timeToWait = Math.max(0, delay - timeSinceLastYield);
       if (timeToWait > 0) {
-        await sleep(timeToWait);
+        await sleepWithAbort(timeToWait, signal);
       }
     }
+    signal?.throwIfAborted();
     yield chunk;
     lastYieldedAt = Date.now();
   }
+}
+
+async function sleepWithAbort(
+  delay: number,
+  signal?: AbortSignal
+): Promise<void> {
+  if (delay <= 0) {
+    return;
+  }
+  signal?.throwIfAborted();
+  await new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, delay);
+    const onAbort = (): void => {
+      clearTimeout(timeout);
+      signal?.removeEventListener('abort', onAbort);
+      reject(signal?.reason ?? new Error('AbortError: User aborted request.'));
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted === true) {
+      onAbort();
+    }
+  });
 }
 
 function createAbortHandler(controller: AbortController): () => void {
@@ -1191,7 +1218,8 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
   ): AsyncGenerator<ChatGenerationChunk> {
     yield* delayStreamChunks(
       super._streamResponseChunks(messages, options, runManager),
-      this._lc_stream_delay
+      this._lc_stream_delay,
+      options.signal
     );
   }
 }
@@ -1301,7 +1329,8 @@ export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
   ): AsyncGenerator<ChatGenerationChunk> {
     yield* delayStreamChunks(
       super._streamResponseChunks(messages, options, runManager),
-      this._lc_stream_delay
+      this._lc_stream_delay,
+      options.signal
     );
   }
 }
@@ -1432,7 +1461,8 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
   ): AsyncGenerator<ChatGenerationChunk> {
     yield* delayStreamChunks(
       this._streamResponseChunksWithReasoning(messages, options, runManager),
-      this._lc_stream_delay
+      this._lc_stream_delay,
+      options.signal
     );
   }
 
@@ -1898,7 +1928,8 @@ export class ChatXAI extends OriginalChatXAI {
   ): AsyncGenerator<ChatGenerationChunk> {
     yield* delayStreamChunks(
       super._streamResponseChunks(messages, options, runManager),
-      this._lc_stream_delay
+      this._lc_stream_delay,
+      options.signal
     );
   }
 }

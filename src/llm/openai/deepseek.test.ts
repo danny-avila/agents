@@ -489,4 +489,34 @@ describe('ChatDeepSeek', () => {
 
     await expect(iterator.next()).rejects.toThrow('AbortError');
   });
+
+  it('does not yield a delayed DeepSeek chunk after abort', async () => {
+    const controller = new AbortController();
+    const model = new CapturingChatDeepSeek(
+      {
+        apiKey: 'test-key',
+        model: 'deepseek-v4-pro',
+        streaming: true,
+        _lc_stream_delay: 1000,
+      },
+      [createContentChunk('first '), createContentChunk('second')]
+    );
+    const stream = model.streamChunksWithSignal(controller.signal);
+    const iterator = stream[Symbol.asyncIterator]();
+
+    await expect(iterator.next()).resolves.toEqual(
+      expect.objectContaining({
+        done: false,
+        value: expect.objectContaining({
+          text: 'first ',
+        }),
+      })
+    );
+
+    const delayedChunk = iterator.next();
+    await Promise.resolve();
+    controller.abort(new Error('AbortError: User aborted request.'));
+
+    await expect(delayedChunk).rejects.toThrow('AbortError');
+  });
 });
