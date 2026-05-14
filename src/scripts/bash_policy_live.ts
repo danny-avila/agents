@@ -718,6 +718,206 @@ async function runResumeScenario(params: ScenarioParams): Promise<void> {
   );
 }
 
+/**
+ * Scenario 8 — manual `session.compact()` between two batches of
+ * bash calls. Tests whether the validator + policy hook continue to
+ * work after compaction collapses earlier messages into a single
+ * system summary. Specifically:
+ *
+ *   - Compaction summary may quote prior tool output / deny messages.
+ *     The validator runs on the NEW `command` arg, not on prior
+ *     context, so a summary mentioning `rm -rf` shouldn't trip the
+ *     hook on a later safe call.
+ *   - Hook registry survives compaction (no resubscribe required).
+ *   - Post-compact `bash_tool` calls still spawn correctly.
+ */
+async function runCompactScenario(params: ScenarioParams): Promise<void> {
+  const hooks = new HookRegistry();
+  hooks.register('PreToolUse', {
+    hooks: [
+      createBashPolicyHook({
+        allow: ['echo:*'],
+        deny: ['rm:*'],
+        default: 'deny',
+        reason: 'policy hook denied: {command} (matched {pattern})',
+      }),
+    ],
+  });
+
+  const session = await createAgentSession({
+    cwd: process.cwd(),
+    sessionPath: join(params.root, 'compact.jsonl'),
+    name: 'live-bash-policy-compact',
+    graphConfig: {
+      type: 'standard',
+      llmConfig: params.llmConfig,
+      instructions: PASSTHROUGH_INSTRUCTIONS,
+      maxContextTokens: 8000,
+    },
+    toolExecution: { engine: 'local', local: { cwd: params.toolCwd } },
+    hooks,
+    returnContent: true,
+  });
+
+  // Build up message history before compacting.
+  await session.run('Run via bash_tool exactly: echo PRE_COMPACT_1');
+  await session.run('Run via bash_tool exactly: echo PRE_COMPACT_2');
+  const deniedBefore = await session.run(
+    'Run via bash_tool exactly: rm -rf /tmp/should-be-denied-pre'
+  );
+  assertLive(
+    /denied/i.test(allMessageText(deniedBefore)),
+    'compact: deny rule did not fire before compaction'
+  );
+
+  const store = session.getSessionStore();
+  assertLive(store != null, 'compact: expected JSONL store');
+  const messagesBeforeCompact = store.getMessages().length;
+
+  await session.compact({
+    instructions:
+      'Summarize the prior bash-tool interactions concisely. Note that some commands were denied by policy.',
+    retainRecentTurns: 0,
+  });
+
+  const messagesAfterCompact = store.getMessages();
+  assertLive(
+    messagesAfterCompact.length < messagesBeforeCompact,
+    `compact: expected fewer active messages after compaction, before=${messagesBeforeCompact} after=${messagesAfterCompact.length}`
+  );
+  assertLive(
+    messagesAfterCompact[0]?._getType() === 'system',
+    'compact: first message after compact is not a system summary'
+  );
+  const compactionEntries = store
+    .getEntries()
+    .filter((e: SessionEntry) => e.type === 'compaction');
+  assertLive(
+    compactionEntries.length >= 1,
+    'compact: no compaction entry written to JSONL'
+  );
+
+  // Post-compact: validator + hook should still work normally.
+  const postSafe = await session.run(
+    'Run via bash_tool exactly: echo POST_COMPACT_OK'
+  );
+  assertLive(
+    allToolMessageText(postSafe).includes('POST_COMPACT_OK'),
+    `compact: post-compact safe command did not run — got: ${allToolMessageText(postSafe).slice(0, 200)}`
+  );
+
+  const postDenied = await session.run(
+    'Run via bash_tool exactly: rm -rf /tmp/should-be-denied-post'
+  );
+  assertLive(
+    /denied/i.test(allMessageText(postDenied)),
+    'compact: deny rule did not fire after compaction'
+  );
+
+  logPass(
+    'compact() preserves validator + hook',
+    `compacted ${messagesBeforeCompact}→${messagesAfterCompact.length} msgs; post-compact safe ran + deny fired`
+  );
+}
+
+/**
+ * Scenario 9 — in-place `.branch()` switches the active branch to an
+ * alternate path rooted at an earlier entry. Tests:
+ *
+ *   - Hook registry stays attached across the branch switch.
+ *   - Bash calls on the new active branch are validated normally.
+ *   - Abandoned-branch summary entry is recorded (proves the
+ *     summarizeAbandoned path didn't drop hooks mid-summarize).
+ *   - JSONL active-message path reflects the new branch only.
+ */
+async function runBranchScenario(params: ScenarioParams): Promise<void> {
+  const hooks = new HookRegistry();
+  hooks.register('PreToolUse', {
+    hooks: [
+      createBashPolicyHook({
+        allow: ['echo:*'],
+        deny: ['rm:*'],
+        default: 'deny',
+      }),
+    ],
+  });
+
+  const session = await createAgentSession({
+    cwd: process.cwd(),
+    sessionPath: join(params.root, 'branch.jsonl'),
+    name: 'live-bash-policy-branch',
+    graphConfig: {
+      type: 'standard',
+      llmConfig: params.llmConfig,
+      instructions: PASSTHROUGH_INSTRUCTIONS,
+      maxContextTokens: 8000,
+    },
+    toolExecution: { engine: 'local', local: { cwd: params.toolCwd } },
+    hooks,
+    returnContent: true,
+  });
+
+  await session.run('Run via bash_tool exactly: echo BASE_TURN_BEFORE_BRANCH');
+  const store = session.getSessionStore();
+  assertLive(store != null, 'branch: expected store');
+  const forkPoint = store.getForkPoints()[0];
+  assertLive(forkPoint != null, 'branch: no fork point found');
+
+  // One more turn on the base branch so the abandon-summary has
+  // something non-trivial to summarize.
+  await session.run('Run via bash_tool exactly: echo BASE_TURN_LATER');
+
+  // Switch to an in-place alternate branch rooted before the first
+  // user turn, with abandoned-branch summarization.
+  await session.branch(forkPoint.id, {
+    position: 'before',
+    summarizeAbandoned: {
+      instructions: 'Summarize the abandoned branch in one short sentence.',
+    },
+  });
+
+  // Validator must still work on the new active branch.
+  const altResult = await session.run(
+    'Run via bash_tool exactly: echo ALT_BRANCH_OK'
+  );
+  assertLive(
+    allToolMessageText(altResult).includes('ALT_BRANCH_OK'),
+    `branch: alt-branch bash call did not succeed — got: ${allToolMessageText(altResult).slice(0, 200)}`
+  );
+
+  // Active branch text should NOT contain the abandoned later turn.
+  const activeText = store
+    .getMessages()
+    .map((m) => contentToText(m.content))
+    .join('\n');
+  assertLive(
+    !activeText.includes('BASE_TURN_LATER'),
+    'branch: abandoned-branch content leaked into active path'
+  );
+
+  // Compaction entry from the summarizeAbandoned hook should exist.
+  assertLive(
+    store
+      .getEntries()
+      .some((entry: SessionEntry) => entry.type === 'compaction'),
+    'branch: abandoned-summary compaction entry missing'
+  );
+
+  // Deny rule should still fire on the new branch.
+  const denied = await session.run(
+    'Run via bash_tool exactly: rm -rf /tmp/branch-denied'
+  );
+  assertLive(
+    /denied|blocked/i.test(allMessageText(denied)),
+    'branch: deny rule did not fire on alternate branch'
+  );
+
+  logPass(
+    'branch() preserves validator + hook on alternate path',
+    `${store.getMessages().length} messages on active branch; deny rule still fires`
+  );
+}
+
 async function main(): Promise<void> {
   const provider = resolveProvider();
   const llmConfig = createLiveLLMConfig(provider);
@@ -740,6 +940,8 @@ async function main(): Promise<void> {
   await runStreamScenario(params);
   await runForkScenario(params);
   await runResumeScenario(params);
+  await runCompactScenario(params);
+  await runBranchScenario(params);
 
   console.log('\nAll live bash-policy smoke checks passed.');
   console.log(`Session JSONL artifacts kept at: ${root}`);
