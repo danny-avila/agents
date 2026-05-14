@@ -130,8 +130,19 @@ export function runBashAstChecks(
   if (SOURCE_FROM_VAR_RX.test(command)) {
     findings.push({
       code: 'source-from-variable',
-      message: 'Sourcing a script from an unbound variable is denied.',
-      severity: 'deny',
+      // Severity demoted from 'deny' to warn-by-default. The
+      // original threat was "sourcing from an attacker-controlled
+      // variable", but in a sandboxed agent context the agent
+      // itself constructs the command — the bypass shape isn't
+      // injection-via-unbound-var. Meanwhile the rule false-
+      // positived against legitimate dev-env init patterns
+      // (`source $HOME/.bashrc`, `source $VIRTUAL_ENV/bin/activate`,
+      // `source $NVM_DIR/nvm.sh`, etc.), which are exactly the
+      // shapes a code-execution agent runs to set up its working
+      // environment. `strict` mode still escalates this to deny.
+      message:
+        'Sourcing a script from an expanded variable; ensure the variable is trusted.',
+      severity: strict ? 'deny' : 'warn',
     });
   }
 

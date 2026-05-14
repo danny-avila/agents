@@ -103,18 +103,24 @@ describe('validateBashCommandHardFloor', () => {
     );
   });
 
-  it('blocks source from broader variable expansion forms (Codex P1 round-12)', () => {
-    // Pre-fix `SOURCE_FROM_VAR_RX` only matched `\$[A-Za-z_]`,
-    // missing `${VAR}` and other expansion forms.
-    expect(validateBashCommandHardFloor('source ${SCRIPT}').valid).toBe(false);
-    expect(validateBashCommandHardFloor('source "${REMOTE}"').valid).toBe(
-      false
+  it('does NOT block source-from-variable in the hard floor', () => {
+    // Demoted from deny→warn after round-12 FP audit: legitimate
+    // dev-env init (`source $HOME/.bashrc`,
+    // `source $VIRTUAL_ENV/bin/activate`, `source $NVM_DIR/nvm.sh`)
+    // are exactly the shapes a code-execution agent runs. The
+    // original threat (sourcing from attacker-controlled var) only
+    // applies if the agent doesn't control the command — which
+    // isn't the bypass shape we're protecting against. `strict`
+    // mode still escalates these to deny via `bashAst: 'strict'`.
+    expect(validateBashCommandHardFloor('source ${SCRIPT}').valid).toBe(true);
+    expect(validateBashCommandHardFloor('source "${REMOTE}"').valid).toBe(true);
+    expect(validateBashCommandHardFloor('. ${SETUP}').valid).toBe(true);
+    expect(validateBashCommandHardFloor('source $HOME/.bashrc').valid).toBe(
+      true
     );
-    expect(validateBashCommandHardFloor('. ${SETUP}').valid).toBe(false);
-    // Sanity: existing form still blocked.
-    expect(validateBashCommandHardFloor('source $REMOTE_SCRIPT').valid).toBe(
-      false
-    );
+    expect(
+      validateBashCommandHardFloor('source $VIRTUAL_ENV/bin/activate').valid
+    ).toBe(true);
   });
 
   it('blocks rm -rf via the positional-arg bypass shape', () => {
@@ -244,11 +250,20 @@ describe('validateBashCommandHardFloor', () => {
     expect(numbered.valid).toBe(false);
   });
 
-  it('blocks source-from-unbound-variable', () => {
+  it('source-from-variable surfaces as a warning under strict, allowed under floor', () => {
+    // Hard floor: allowed (warn-only severity post-FP audit).
     expect(validateBashCommandHardFloor('source $REMOTE_SCRIPT').valid).toBe(
-      false
+      true
     );
-    expect(validateBashCommandHardFloor('. $REMOTE_SCRIPT').valid).toBe(false);
+    expect(validateBashCommandHardFloor('. $REMOTE_SCRIPT').valid).toBe(true);
+    // Strict mode escalates back to deny via the static validator.
+    const strict = validateBashCommandStatic(
+      'source $REMOTE_SCRIPT',
+      undefined,
+      { bashAst: 'strict' }
+    );
+    expect(strict.valid).toBe(false);
+    expect(strict.errors.join('\n')).toContain('source-from-variable');
   });
 
   it('blocks nested-shell destructive payloads', () => {
