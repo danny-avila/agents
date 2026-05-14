@@ -526,8 +526,9 @@ async function* delayStreamChunks(
       }
       signal?.throwIfAborted();
       lastYieldedAt = Date.now();
-      yield outputChunk;
       await emitStreamChunkCallback(outputChunk, runManager);
+      signal?.throwIfAborted();
+      yield outputChunk;
     }
   }
 }

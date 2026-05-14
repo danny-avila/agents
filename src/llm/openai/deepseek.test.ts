@@ -1,4 +1,5 @@
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
+import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { ChatGenerationChunk } from '@langchain/core/outputs';
 import type { BaseMessage } from '@langchain/core/messages';
 import type { OpenAIClient } from '@langchain/openai';
@@ -65,6 +66,16 @@ class CapturingChatDeepSeek extends ChatDeepSeek {
     return this._streamResponseChunks([new HumanMessage('hi')], {
       signal,
     } as this['ParsedCallOptions']);
+  }
+
+  streamChunksWithCallbacks(
+    runManager?: CallbackManagerForLLMRun
+  ): AsyncGenerator<ChatGenerationChunk> {
+    return this._streamResponseChunks(
+      [new HumanMessage('hi')],
+      {} as this['ParsedCallOptions'],
+      runManager
+    );
   }
 }
 
@@ -575,6 +586,37 @@ describe('ChatDeepSeek', () => {
     }
 
     expect(textChunks).toEqual(['alpha ', 'beta ', 'gamma']);
+    expect(callbackTokens).toEqual(textChunks);
+  });
+
+  it('emits a delayed DeepSeek callback before an early stream break', async () => {
+    const model = new CapturingChatDeepSeek(
+      {
+        apiKey: 'test-key',
+        model: 'deepseek-v4-pro',
+        streaming: true,
+        _lc_stream_delay: 1,
+      },
+      [createContentChunk('alpha beta gamma')]
+    );
+    const textChunks: string[] = [];
+    const callbackTokens: string[] = [];
+    const runManager = {
+      handleLLMNewToken(token: string): void {
+        if (token !== '') {
+          callbackTokens.push(token);
+        }
+      },
+    } as unknown as CallbackManagerForLLMRun;
+
+    for await (const chunk of model.streamChunksWithCallbacks(runManager)) {
+      if (chunk.text !== '') {
+        textChunks.push(chunk.text);
+      }
+      break;
+    }
+
+    expect(textChunks).toEqual(['alpha ']);
     expect(callbackTokens).toEqual(textChunks);
   });
 

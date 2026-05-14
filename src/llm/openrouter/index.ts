@@ -283,14 +283,14 @@ export class ChatOpenRouter extends ChatOpenAI {
         } else {
           delete generationChunk.message.additional_kwargs.reasoning_details;
         }
-        yield generationChunk;
         await emitStreamChunkCallback(generationChunk, runManager);
+        yield generationChunk;
         continue;
       }
 
       delete generationChunk.message.additional_kwargs.reasoning_details;
-      yield generationChunk;
       await emitStreamChunkCallback(generationChunk, runManager);
+      yield generationChunk;
     }
   }
 }
