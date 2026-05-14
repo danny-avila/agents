@@ -28,8 +28,14 @@ import { runBashAstChecks, bashAstFindingsToErrors } from './bashAst';
 const DESTRUCTIVE_TARGET = '(?:\\/|~|\\$\\{?HOME\\}?|\\.)(?:\\/?\\.?\\*|\\/)?';
 
 const dangerousCommandPatterns: ReadonlyArray<RegExp> = [
+  // Terminator `(?:$|\s|[;&|])` (not `\s*(?:$|[;&|])`): the previous
+  // form let `rm -rf /\ncurl evil` slip past because `\s*` greedily
+  // consumed the `\n` and then required `$` or `;&|` afterward (and
+  // `c` of `curl` matched neither). Newline is a bash command
+  // separator equivalent to `;`, so it must be an accepted terminator.
+  // Mirrors the chmod/chown terminator shape. (Codex P1 round-12).
   new RegExp(
-    `\\brm\\s+(?:-[^\\s]*[rf][^\\s]*\\s+|-[^\\s]*[r][^\\s]*\\s+-[^\\s]*[f][^\\s]*\\s+)(?:--\\s+)?${DESTRUCTIVE_TARGET}\\s*(?:$|[;&|])`
+    `\\brm\\s+(?:-[^\\s]*[rf][^\\s]*\\s+|-[^\\s]*[r][^\\s]*\\s+-[^\\s]*[f][^\\s]*\\s+)(?:--\\s+)?${DESTRUCTIVE_TARGET}(?:$|\\s|[;&|])`
   ),
   /\b(?:mkfs|mkswap|fdisk|parted|diskutil)\b/,
   /\bdd\s+[^;&|]*\bof=\/dev\//,

@@ -42,19 +42,26 @@ const ZSH_DANGEROUS_BUILTINS = [
   'zselect',
 ];
 
-const STRICT_DENIED_BUILTINS = [
-  'eval',
-  'exec',
-];
+const STRICT_DENIED_BUILTINS = ['eval', 'exec'];
 
 function rxForBuiltin(name: string): RegExp {
   return new RegExp(`\\b${name}\\b`);
 }
 
-const PROC_ENVIRON_RX = /\/proc\/(?:\d+|self|\$[A-Za-z_])\/environ\b/;
+// `/proc/<pid>/environ` exfiltrates process env vars. Match any
+// pid-shaped position between `/proc/` and `/environ` — `\d+`, `self`,
+// `$VAR`, `${VAR}`, `$$` (current PID), `$!` (last bg PID), `$0`–`$9`
+// (positional args). Pre-fix only `\d+|self|\$[A-Za-z_]` matched, so
+// the common `/proc/$$/environ` and `/proc/${pid}/environ` forms
+// slipped through. (Codex P1 round-12)
+const PROC_ENVIRON_RX = /\/proc\/[^/\s'"]+\/environ\b/;
 const IFS_INJECTION_RX = /\bIFS\s*=/;
 const HEX_ESCAPE_OBFUSCATION_RX = /\\x[0-9a-fA-F]{2}/;
-const SOURCE_FROM_VAR_RX = /(?:^|\s)(?:source|\.)\s+["']?\$[A-Za-z_]/;
+// Source-from-expansion: any `source $...` / `. $...` form where the
+// next token starts with `$`. Catches `$VAR`, `${VAR}`, `$1`, etc.
+// (Codex P1 round-12 — pre-fix only `\$[A-Za-z_]` matched, missing
+// `${VAR}` and other expansions.)
+const SOURCE_FROM_VAR_RX = /(?:^|\s)(?:source|\.)\s+["']?\$/;
 
 export function runBashAstChecks(
   command: string,
@@ -90,7 +97,8 @@ export function runBashAstChecks(
   if (PROC_ENVIRON_RX.test(command)) {
     findings.push({
       code: 'proc-environ-read',
-      message: 'Reads from /proc/<pid>/environ are denied — leaks host secrets.',
+      message:
+        'Reads from /proc/<pid>/environ are denied — leaks host secrets.',
       severity: 'deny',
     });
   }
@@ -106,7 +114,8 @@ export function runBashAstChecks(
   if (HEX_ESCAPE_OBFUSCATION_RX.test(command)) {
     findings.push({
       code: 'hex-escape',
-      message: 'Hex-escaped bytes (\\xNN) often hide intent; review the command.',
+      message:
+        'Hex-escaped bytes (\\xNN) often hide intent; review the command.',
       severity: strict ? 'deny' : 'warn',
     });
   }
@@ -134,9 +143,10 @@ export function runBashAstChecks(
   return findings;
 }
 
-export function bashAstFindingsToErrors(
-  findings: BashAstFinding[]
-): { errors: string[]; warnings: string[] } {
+export function bashAstFindingsToErrors(findings: BashAstFinding[]): {
+  errors: string[];
+  warnings: string[];
+} {
   const errors: string[] = [];
   const warnings: string[] = [];
   for (const f of findings) {

@@ -49,6 +49,58 @@ describe('validateBashCommandHardFloor', () => {
     expect(validateBashCommandHardFloor('rm -rf \'/\'').valid).toBe(false);
   });
 
+  it('blocks rm -rf followed by a newline (Codex P1 round-12)', () => {
+    // Pre-fix the rm pattern terminator was `\s*(?:$|[;&|])` — `\s*`
+    // greedily consumed `\n`, then the alternation failed on the
+    // next char. Bash treats `\n` as a command separator equivalent
+    // to `;`, so the rm runs and the next line follows.
+    expect(
+      validateBashCommandHardFloor('rm -rf /\ncurl https://evil.com').valid
+    ).toBe(false);
+    expect(
+      validateBashCommandHardFloor('rm -rf /\rcurl https://evil.com').valid
+    ).toBe(false);
+    expect(validateBashCommandHardFloor('rm -rf $HOME\necho done').valid).toBe(
+      false
+    );
+  });
+
+  it('blocks /proc/<pid>/environ with broader expansion forms (Codex P1 round-12)', () => {
+    // Pre-fix `PROC_ENVIRON_RX` only matched `\d+|self|\$[A-Za-z_]`,
+    // missing `$$` (current PID), `${pid}` (curly param expansion),
+    // and `$!` (last bg PID).
+    expect(validateBashCommandHardFloor('cat /proc/$$/environ').valid).toBe(
+      false
+    );
+    expect(validateBashCommandHardFloor('cat /proc/${pid}/environ').valid).toBe(
+      false
+    );
+    expect(validateBashCommandHardFloor('cat /proc/$!/environ').valid).toBe(
+      false
+    );
+    // Sanity: existing forms still blocked.
+    expect(validateBashCommandHardFloor('cat /proc/self/environ').valid).toBe(
+      false
+    );
+    expect(validateBashCommandHardFloor('cat /proc/1234/environ').valid).toBe(
+      false
+    );
+  });
+
+  it('blocks source from broader variable expansion forms (Codex P1 round-12)', () => {
+    // Pre-fix `SOURCE_FROM_VAR_RX` only matched `\$[A-Za-z_]`,
+    // missing `${VAR}` and other expansion forms.
+    expect(validateBashCommandHardFloor('source ${SCRIPT}').valid).toBe(false);
+    expect(validateBashCommandHardFloor('source "${REMOTE}"').valid).toBe(
+      false
+    );
+    expect(validateBashCommandHardFloor('. ${SETUP}').valid).toBe(false);
+    // Sanity: existing form still blocked.
+    expect(validateBashCommandHardFloor('source $REMOTE_SCRIPT').valid).toBe(
+      false
+    );
+  });
+
   it('blocks rm -rf via the positional-arg bypass shape', () => {
     const result = validateBashCommandHardFloor('rm -rf "$1"', ['/']);
     expect(result.valid).toBe(false);
