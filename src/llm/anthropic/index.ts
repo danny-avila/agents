@@ -620,6 +620,7 @@ export class CustomAnthropic extends ChatAnthropicMessages {
     } = { done: false };
     let queuedChunkIndex = 0;
     let bufferedTextLength = 0;
+    let consumerClosed = false;
     let notifyConsumer: (() => void) | undefined;
     let notifyProducer: (() => void) | undefined;
 
@@ -657,7 +658,11 @@ export class CustomAnthropic extends ChatAnthropicMessages {
     };
 
     const waitForQueueSpace = async (): Promise<void> => {
-      while (isQueueAtCapacity() && !isSignalAborted(options.signal)) {
+      while (
+        isQueueAtCapacity() &&
+        !consumerClosed &&
+        !isSignalAborted(options.signal)
+      ) {
         await new Promise<void>((resolve) => {
           const signal = options.signal;
           const onAbort = (): void => {
@@ -697,7 +702,7 @@ export class CustomAnthropic extends ChatAnthropicMessages {
       queuedChunk: QueuedGenerationChunk
     ): Promise<void> => {
       await waitForQueueSpace();
-      if (isSignalAborted(options.signal)) {
+      if (consumerClosed || isSignalAborted(options.signal)) {
         stream.controller.abort();
         throw new Error('AbortError: User aborted the request.');
       }
@@ -876,6 +881,7 @@ export class CustomAnthropic extends ChatAnthropicMessages {
         );
       }
     } finally {
+      consumerClosed = true;
       if (!producerState.done) {
         stream.controller.abort();
         notifyProducerForSpace();

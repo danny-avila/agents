@@ -1176,6 +1176,37 @@ test('Anthropic stream smoothing skips empty text block starts', async () => {
   expect(contents).toEqual(['hello']);
 });
 
+test('Anthropic stream smoothing closes a queue-full producer after early break', async () => {
+  const events: AnthropicStreamEvent[] = [
+    {
+      type: 'content_block_delta',
+      index: 0,
+      delta: {
+        type: 'text_delta',
+        text: 'word '.repeat(3000),
+      },
+    },
+    { type: 'message_stop' },
+  ];
+  const model = new MockStreamingAnthropic(events);
+  const readOneChunk = async (): Promise<void> => {
+    for await (const chunk of await model.stream('hello')) {
+      if (typeof chunk.content === 'string' && chunk.content.length > 0) {
+        break;
+      }
+    }
+  };
+  const timeout = new Promise<never>((_, reject) => {
+    setTimeout(() => {
+      reject(new Error('stream close timed out'));
+    }, 1000);
+  });
+
+  await expect(
+    Promise.race([readOneChunk(), timeout])
+  ).resolves.toBeUndefined();
+});
+
 test('Anthropic live stream usage matches raw cumulative output snapshots', async () => {
   const model = new RecordingStreamingAnthropic({
     modelName,
