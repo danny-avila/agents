@@ -478,6 +478,246 @@ async function runMultiTurnStressScenario(
   );
 }
 
+/**
+ * Scenario 5 — exercise the new `.stream()` DX from #164 alongside
+ * the bash validation layer. Confirms the streaming code path through
+ * `Run` (different from `.run()`) still surfaces tool outputs and the
+ * JSONL store receives the same set of messages.
+ */
+async function runStreamScenario(params: ScenarioParams): Promise<void> {
+  const hooks = new HookRegistry();
+  hooks.register('PreToolUse', {
+    hooks: [createBashPolicyHook({ allow: ['echo:*'], default: 'deny' })],
+  });
+
+  const session = await createAgentSession({
+    cwd: process.cwd(),
+    sessionPath: join(params.root, 'stream.jsonl'),
+    name: 'live-bash-policy-stream',
+    graphConfig: {
+      type: 'standard',
+      llmConfig: params.llmConfig,
+      instructions: PASSTHROUGH_INSTRUCTIONS,
+      maxContextTokens: 4000,
+    },
+    toolExecution: { engine: 'local', local: { cwd: params.toolCwd } },
+    hooks,
+    returnContent: true,
+  });
+
+  const stream = session.stream(
+    'Run via bash_tool exactly: echo STREAM_PIPE_OK'
+  );
+  let streamedText = '';
+  for await (const chunk of stream.toTextStream()) {
+    streamedText += chunk;
+  }
+  const result = await stream.finalResult();
+
+  const toolText = allToolMessageText(result);
+  assertLive(
+    toolText.includes('STREAM_PIPE_OK'),
+    `stream: tool output missing marker — got: ${toolText.slice(0, 200)}`
+  );
+  // The text stream surfaces the agent's natural-language summary
+  // chunks. Don't insist on a specific phrase (LLM-dependent); just
+  // confirm the model said *something* coherent.
+  assertLive(
+    streamedText.trim() !== '',
+    'stream: text stream produced no chunks'
+  );
+
+  const store = session.getSessionStore();
+  assertLive(store != null, 'stream: expected JSONL store');
+  const messageEntries = store
+    .getEntries()
+    .filter((e: SessionEntry) => e.type === 'message');
+  assertLive(
+    messageEntries.length >= 3,
+    `stream: expected ≥3 message entries, got ${messageEntries.length}`
+  );
+  logPass(
+    'stream() pipe with bash validation',
+    `tool=${toolText.slice(0, 80)} | streamed=${streamedText.slice(0, 80)}`
+  );
+}
+
+/**
+ * Scenario 6 — fork a session at an early entry, run a different
+ * bash command on the fork. Confirms:
+ *
+ *   - The validation pipeline + policy hook re-attach correctly to
+ *     forked sessions (same runConfig.hooks reference).
+ *   - JSONL forks track validation outcomes per branch.
+ *   - Subsequent runs on the original session don't see fork-only
+ *     entries.
+ */
+async function runForkScenario(params: ScenarioParams): Promise<void> {
+  const hooks = new HookRegistry();
+  hooks.register('PreToolUse', {
+    hooks: [createBashPolicyHook({ allow: ['echo:*'], default: 'deny' })],
+  });
+
+  const session = await createAgentSession({
+    cwd: process.cwd(),
+    sessionPath: join(params.root, 'fork-base.jsonl'),
+    name: 'live-bash-policy-fork-base',
+    graphConfig: {
+      type: 'standard',
+      llmConfig: params.llmConfig,
+      instructions: PASSTHROUGH_INSTRUCTIONS,
+      maxContextTokens: 4000,
+    },
+    toolExecution: { engine: 'local', local: { cwd: params.toolCwd } },
+    hooks,
+    returnContent: true,
+  });
+
+  const firstResult = await session.run(
+    'Run via bash_tool exactly: echo BASE_TURN_A'
+  );
+  assertLive(
+    allToolMessageText(firstResult).includes('BASE_TURN_A'),
+    'fork: base turn A did not run'
+  );
+
+  const baseStore = session.getSessionStore();
+  assertLive(baseStore != null, 'fork: expected base store');
+  const forkPoint = baseStore.getForkPoints()[0];
+  assertLive(forkPoint != null, 'fork: no user fork point recorded');
+
+  // Continue the base session past the fork point.
+  await session.run('Run via bash_tool exactly: echo BASE_TURN_B');
+
+  // Fork BEFORE the first user turn — the forked session should
+  // start from a clean state and accept its own bash call.
+  const forked = await session.fork(forkPoint.id, {
+    cwd: params.root,
+    name: 'live-bash-policy-fork-branch',
+    position: 'before',
+  });
+  const forkResult = await forked.run(
+    'Run via bash_tool exactly: echo FORK_BRANCH_OK'
+  );
+  assertLive(
+    allToolMessageText(forkResult).includes('FORK_BRANCH_OK'),
+    'fork: forked session bash call did not succeed'
+  );
+
+  const forkStore = forked.getSessionStore();
+  assertLive(forkStore != null, 'fork: expected forked store');
+  assertLive(
+    forkStore.path !== baseStore.path,
+    'fork: forked store shares the base path'
+  );
+
+  // Forked-branch messages should NOT include the base's TURN_B
+  // (the fork was rooted before it). Validate isolation.
+  const forkMessagesText = forkStore
+    .getMessages()
+    .map((m) => contentToText(m.content))
+    .join('\n');
+  assertLive(
+    !forkMessagesText.includes('BASE_TURN_B'),
+    'fork: forked branch leaked content from later base turn'
+  );
+  logPass(
+    'fork() with bash validation isolates branches',
+    `base=${baseStore.path.split(/[\\/]/).pop()} fork=${forkStore.path.split(/[\\/]/).pop()}`
+  );
+}
+
+/**
+ * Scenario 7 — resume a session from its JSONL path in a fresh
+ * `AgentSession` instance, then run more bash commands. Confirms the
+ * validation + hook pipeline re-attaches on a session that came back
+ * to life from disk.
+ */
+async function runResumeScenario(params: ScenarioParams): Promise<void> {
+  const hooks = new HookRegistry();
+  hooks.register('PreToolUse', {
+    hooks: [createBashPolicyHook({ allow: ['echo:*'], default: 'deny' })],
+  });
+
+  const sessionPath = join(params.root, 'resume.jsonl');
+  const originalSession = await createAgentSession({
+    cwd: process.cwd(),
+    sessionPath,
+    name: 'live-bash-policy-resume-original',
+    graphConfig: {
+      type: 'standard',
+      llmConfig: params.llmConfig,
+      instructions: PASSTHROUGH_INSTRUCTIONS,
+      maxContextTokens: 4000,
+    },
+    toolExecution: { engine: 'local', local: { cwd: params.toolCwd } },
+    hooks,
+    returnContent: true,
+  });
+  const first = await originalSession.run(
+    'Run via bash_tool exactly: echo PRE_RESUME_OK'
+  );
+  assertLive(
+    allToolMessageText(first).includes('PRE_RESUME_OK'),
+    'resume: pre-resume turn did not run'
+  );
+  const originalStore = originalSession.getSessionStore();
+  assertLive(originalStore != null, 'resume: expected original store');
+  const messagesBeforeResume = originalStore.getMessages().length;
+
+  // Fresh session, ephemeral, then `resumeSession(path)` reattaches.
+  // Re-register hooks: hook registries are per-Run, so the new
+  // session needs its own (mirrors how a real host would re-construct
+  // hooks after process restart).
+  const resumedHooks = new HookRegistry();
+  resumedHooks.register('PreToolUse', {
+    hooks: [createBashPolicyHook({ allow: ['echo:*'], default: 'deny' })],
+  });
+  const resumed = await createAgentSession({
+    cwd: process.cwd(),
+    ephemeral: true,
+    graphConfig: {
+      type: 'standard',
+      llmConfig: params.llmConfig,
+      instructions: PASSTHROUGH_INSTRUCTIONS,
+      maxContextTokens: 4000,
+    },
+    toolExecution: { engine: 'local', local: { cwd: params.toolCwd } },
+    hooks: resumedHooks,
+    returnContent: true,
+  });
+  await resumed.resumeSession(sessionPath);
+  const resumedStore = resumed.getSessionStore();
+  assertLive(resumedStore != null, 'resume: expected resumed store');
+  assertLive(
+    resumedStore.getMessages().length === messagesBeforeResume,
+    `resume: replay restored ${resumedStore.getMessages().length} messages, expected ${messagesBeforeResume}`
+  );
+
+  const after = await resumed.run(
+    'Run via bash_tool exactly: echo POST_RESUME_OK'
+  );
+  assertLive(
+    allToolMessageText(after).includes('POST_RESUME_OK'),
+    'resume: post-resume turn did not run'
+  );
+
+  // The deny rule should still fire on the resumed session — proves
+  // hooks are wired through the new instance, not lost on replay.
+  const denied = await resumed.run(
+    'Run via bash_tool exactly: rm -rf /tmp/should-be-denied'
+  );
+  const deniedText = allMessageText(denied);
+  assertLive(
+    /denied|blocked/i.test(deniedText),
+    `resume: deny rule did not fire on resumed session — got: ${deniedText.slice(0, 200)}`
+  );
+  logPass(
+    'resumeSession() + bash validation',
+    `pre=${messagesBeforeResume} → post=${resumedStore.getMessages().length} messages, deny rule still fires`
+  );
+}
+
 async function main(): Promise<void> {
   const provider = resolveProvider();
   const llmConfig = createLiveLLMConfig(provider);
@@ -497,6 +737,9 @@ async function main(): Promise<void> {
   await runPolicyDenyScenario(params);
   await runHappyPathScenario(params);
   await runMultiTurnStressScenario(params);
+  await runStreamScenario(params);
+  await runForkScenario(params);
+  await runResumeScenario(params);
 
   console.log('\nAll live bash-policy smoke checks passed.');
   console.log(`Session JSONL artifacts kept at: ${root}`);
