@@ -519,4 +519,27 @@ describe('ChatDeepSeek', () => {
 
     await expect(delayedChunk).rejects.toThrow('AbortError');
   });
+
+  it('splits large delayed DeepSeek text chunks', async () => {
+    const model = new CapturingChatDeepSeek(
+      {
+        apiKey: 'test-key',
+        model: 'deepseek-v4-pro',
+        streaming: true,
+        _lc_stream_delay: 1,
+      },
+      [createContentChunk('alpha beta gamma')]
+    );
+    const textChunks: string[] = [];
+
+    for await (const chunk of model.streamChunksWithSignal(
+      new AbortController().signal
+    )) {
+      if (chunk.text) {
+        textChunks.push(chunk.text);
+      }
+    }
+
+    expect(textChunks).toEqual(['alpha ', 'beta ', 'gamma']);
+  });
 });

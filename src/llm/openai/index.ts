@@ -39,6 +39,9 @@ import { isReasoningModel, _convertMessagesToOpenAIParams } from './utils';
 // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
 const iife = <T>(fn: () => T) => fn();
 
+const STREAM_CHUNK_MIN_SIZE = 4;
+const STREAM_BOUNDARIES = new Set([' ', '.', ',', '!', '?', ';', ':']);
+
 export function isHeaders(headers: unknown): headers is Headers {
   return (
     typeof Headers !== 'undefined' &&
@@ -402,24 +405,101 @@ function getCustomOpenAIClientOptions(
   return requestOptions;
 }
 
-async function* delayStreamChunks<T>(
-  chunks: AsyncGenerator<T>,
+function findStreamChunkBoundary(text: string, minSize: number): number {
+  if (minSize >= text.length) {
+    return text.length;
+  }
+
+  for (let position = minSize; position < text.length; position++) {
+    if (STREAM_BOUNDARIES.has(text[position])) {
+      return position + 1;
+    }
+  }
+
+  return text.length;
+}
+
+function splitStreamToken(text: string): string[] {
+  const chunks: string[] = [];
+  let currentIndex = 0;
+
+  while (currentIndex < text.length) {
+    const remainingText = text.slice(currentIndex);
+    const chunkSize = findStreamChunkBoundary(
+      remainingText,
+      STREAM_CHUNK_MIN_SIZE
+    );
+    chunks.push(text.slice(currentIndex, currentIndex + chunkSize));
+    currentIndex += chunkSize;
+  }
+
+  return chunks;
+}
+
+function splitTextGenerationChunk(
+  chunk: ChatGenerationChunk
+): ChatGenerationChunk[] {
+  const { message } = chunk;
+  if (
+    !chunk.text ||
+    !(message instanceof AIMessageChunk) ||
+    typeof message.content !== 'string' ||
+    message.content !== chunk.text ||
+    chunk.generationInfo?.finish_reason != null
+  ) {
+    return [chunk];
+  }
+
+  const tokenChunks = splitStreamToken(chunk.text);
+  if (tokenChunks.length <= 1) {
+    return [chunk];
+  }
+
+  let emittedUsage = false;
+  return tokenChunks.map((token) => {
+    const usageMetadata =
+      emittedUsage && message.usage_metadata != null
+        ? undefined
+        : message.usage_metadata;
+    if (message.usage_metadata != null && !emittedUsage) {
+      emittedUsage = true;
+    }
+
+    return new ChatGenerationChunk({
+      text: token,
+      generationInfo: chunk.generationInfo,
+      message: new AIMessageChunk(
+        Object.assign({}, message, {
+          content: token,
+          usage_metadata: usageMetadata,
+        })
+      ),
+    });
+  });
+}
+
+async function* delayStreamChunks(
+  chunks: AsyncGenerator<ChatGenerationChunk>,
   delay?: number,
   signal?: AbortSignal
-): AsyncGenerator<T> {
+): AsyncGenerator<ChatGenerationChunk> {
   let lastYieldedAt: number | undefined;
   for await (const chunk of chunks) {
-    signal?.throwIfAborted();
-    if (delay != null && delay > 0 && lastYieldedAt != null) {
-      const timeSinceLastYield = Date.now() - lastYieldedAt;
-      const timeToWait = Math.max(0, delay - timeSinceLastYield);
-      if (timeToWait > 0) {
-        await sleepWithAbort(timeToWait, signal);
+    const outputChunks =
+      delay != null && delay > 0 ? splitTextGenerationChunk(chunk) : [chunk];
+    for (const outputChunk of outputChunks) {
+      signal?.throwIfAborted();
+      if (delay != null && delay > 0 && lastYieldedAt != null) {
+        const timeSinceLastYield = Date.now() - lastYieldedAt;
+        const timeToWait = Math.max(0, delay - timeSinceLastYield);
+        if (timeToWait > 0) {
+          await sleepWithAbort(timeToWait, signal);
+        }
       }
+      signal?.throwIfAborted();
+      yield outputChunk;
+      lastYieldedAt = Date.now();
     }
-    signal?.throwIfAborted();
-    yield chunk;
-    lastYieldedAt = Date.now();
   }
 }
 
