@@ -415,42 +415,58 @@ export function validateBashCommandHardFloor(
   // IFS, hex escape, eval/exec) — they're too noisy for an always-on
   // floor.
   //
-  // Scan an "effective command" assembled from the comment-stripped
-  // command + every positional arg (rather than the quote-stripped
-  // `normalized` form). Three bypass classes the original
-  // `runBashAstChecks(normalized, …)` call missed:
+  // We scan MULTIPLE candidate forms of the command+args so neither
+  // the way args are quoted nor the way they're concatenated at
+  // runtime can hide a deny pattern:
   //
-  //   1. Nested-shell payloads (Codex P1): `bash -lc 'cat
-  //      /proc/self/environ'` — `stripQuotedContent` blanks the inner
-  //      payload to whitespace, so `/proc/self/environ` disappeared
-  //      before the AST scan ran. Scanning the original (quotes
-  //      intact) command text catches it.
+  //   1. `stripped` alone — catches the bare case (no args, or
+  //      command contains the full pattern).
   //
-  //   2. Positional-arg exfil (Codex P1): `command: 'cat "$1"',
-  //      args: ['/proc/self/environ']` — the command body never
-  //      references the path. Appending args to the scanned string
-  //      catches it.
+  //   2. `${stripped} ${args.join(' ')}` — catches the
+  //      "one arg holds the full pattern" case (`args:
+  //      ['/proc/self/environ']`). Each arg is a separate word in
+  //      the scan, separated by spaces.
   //
-  //   3. Comment false-positive (Codex P2): `echo ok # cat
-  //      /proc/self/environ` would trip the deny pattern even though
-  //      bash never executes commented text. `stripComments` blanks
-  //      `#…\n` runs (outside quoted spans) so commented mentions
-  //      pass through.
+  //   3. `${stripped} ${args.join('')}` — catches the
+  //      "pattern split across args" case (Codex P1 round-9):
+  //      `command: 'cat "$1$2"', args: ['/proc/self', '/environ']`
+  //      executes `cat /proc/self/environ` at runtime because bash
+  //      concatenates `$1$2`. The space-joined form `... /proc/self
+  //      /environ` misses the regex; the raw-joined form
+  //      `.../proc/self/environ` matches.
   //
-  // False-positive tradeoff: `echo "discussing /proc/self/environ"`
-  // (the path mentioned inside a string literal that bash WILL pass
-  // to echo) still trips. Acceptable — the deny patterns are narrow
-  // enough that legitimate workloads basically never include them
-  // even as literal strings, and the cost of refusing such a print is
-  // negligible.
+  // Original-command bypasses also caught here via the stripped form:
+  //
+  //   - Nested-shell payloads (Codex P1 round-1):
+  //     `bash -lc 'cat /proc/self/environ'` — the original (quotes
+  //     intact) is scanned, so the payload's contents are visible.
+  //
+  //   - Comment false-positive (Codex P2 round-2): `echo ok #
+  //     cat /proc/self/environ` is stripped before the scan, so
+  //     commented mentions pass through.
+  //
+  // False-positive tradeoff: legitimate workloads with two adjacent
+  // path-shaped args like `cat "$1" "$2"` + `args: ['/proc/self',
+  // '/environ']` would now trip the floor. Acceptable — the deny
+  // patterns are narrow, the workload would be unusual, and refusing
+  // is cheaper than missing the real exfil shape.
   const stripped = stripComments(command);
-  const effectiveCommand =
-    args != null && args.length > 0
-      ? `${stripped} ${args.join(' ')}`
-      : stripped;
-  const findings = runBashAstChecks(effectiveCommand, 'auto');
-  for (const finding of findings) {
-    if (finding.severity === 'deny') {
+  const candidates: string[] = [stripped];
+  if (args != null && args.length > 0) {
+    const joinedSpaces = args.join(' ');
+    const joinedRaw = args.join('');
+    candidates.push(`${stripped} ${joinedSpaces}`);
+    if (joinedRaw !== joinedSpaces) {
+      candidates.push(`${stripped} ${joinedRaw}`);
+    }
+  }
+  const seenDenyCodes = new Set<string>();
+  for (const candidate of candidates) {
+    const findings = runBashAstChecks(candidate, 'auto');
+    for (const finding of findings) {
+      if (finding.severity !== 'deny') continue;
+      if (seenDenyCodes.has(finding.code)) continue;
+      seenDenyCodes.add(finding.code);
       errors.push(`[bashAst:${finding.code}] ${finding.message}`);
     }
   }

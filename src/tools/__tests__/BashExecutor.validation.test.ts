@@ -131,6 +131,34 @@ describe('validateBashCommandHardFloor', () => {
     expect(evalForm.errors.join('\n')).toContain('proc-environ-read');
   });
 
+  it('blocks /proc/<pid>/environ split across positional args (Codex P1 round-9)', () => {
+    // Pre-fix the hard-floor AST scan only saw args joined with
+    // spaces, so `command: 'cat "$1$2"', args: ['/proc/self', '/environ']`
+    // looked like `... /proc/self /environ` and missed the regex.
+    // Bash concatenates `$1$2` at runtime → reads /proc/self/environ.
+    // The fix scans both space-joined AND raw-joined forms; the raw
+    // join reassembles the path.
+    const slashBoundary = validateBashCommandHardFloor('cat "$1$2"', [
+      '/proc/self',
+      '/environ',
+    ]);
+    expect(slashBoundary.valid).toBe(false);
+    expect(slashBoundary.errors.join('\n')).toContain('proc-environ-read');
+
+    const midWord = validateBashCommandHardFloor('cat "$1$2"', [
+      '/proc/self/envi',
+      'ron',
+    ]);
+    expect(midWord.valid).toBe(false);
+
+    const threeWay = validateBashCommandHardFloor('cat "$1$2$3"', [
+      '/proc/',
+      'self/',
+      'environ',
+    ]);
+    expect(threeWay.valid).toBe(false);
+  });
+
   it('blocks /proc/<pid>/environ smuggled via positional arg (Codex P1 #2)', () => {
     // Pre-fix `findOffendingArg` only ran when the command matched
     // `rm/chmod/chown`, so a benign-looking `cat "$1"` with the
