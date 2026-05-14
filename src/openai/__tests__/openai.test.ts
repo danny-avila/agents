@@ -24,7 +24,9 @@ describe('OpenAI-compatible adapters', () => {
       } satisfies t.MessageDeltaEvent
     );
 
-    expect(writes.join('')).toContain('"content":"hello"');
+    expect(writes).toHaveLength(2);
+    expect(writes[0]).toContain('"role":"assistant"');
+    expect(writes[1]).toContain('"content":"hello"');
   });
 
   it('sends a final usage chunk and done marker', async () => {
@@ -39,8 +41,13 @@ describe('OpenAI-compatible adapters', () => {
       tracker,
     });
 
-    expect(writes.join('')).toContain('"total_tokens":8');
-    expect(writes.at(-1)).toBe('data: [DONE]\n\n');
+    expect(writes).toHaveLength(4);
+    expect(writes[0]).toContain('"role":"assistant"');
+    expect(writes[1]).toContain('"finish_reason":"stop"');
+    expect(writes[1]).not.toContain('"usage"');
+    expect(writes[2]).toContain('"choices":[]');
+    expect(writes[2]).toContain('"total_tokens":8');
+    expect(writes[3]).toBe('data: [DONE]\n\n');
   });
 
   it('uses tool_calls finish reason after streaming tool deltas', async () => {
@@ -75,7 +82,10 @@ describe('OpenAI-compatible adapters', () => {
       tracker,
     });
 
-    expect(writes.at(-2)).toContain('"finish_reason":"tool_calls"');
+    expect(writes[0]).toContain('"role":"assistant"');
+    expect(writes[1]).toContain('"tool_calls"');
+    expect(writes.at(-3)).toContain('"finish_reason":"tool_calls"');
+    expect(writes.at(-2)).toContain('"choices":[]');
   });
 
   it('uses stop finish reason when assistant text follows tool calls', async () => {
@@ -120,7 +130,8 @@ describe('OpenAI-compatible adapters', () => {
       tracker,
     });
 
-    expect(writes.at(-2)).toContain('"finish_reason":"stop"');
+    expect(writes.at(-3)).toContain('"finish_reason":"stop"');
+    expect(writes.at(-2)).toContain('"choices":[]');
   });
 
   it('scopes tool-call argument state by run step', async () => {
@@ -234,11 +245,13 @@ describe('OpenAI-compatible adapters', () => {
       tracker,
     });
 
-    expect(writes[0]).toContain('"tool_calls"');
-    expect(writes[0]).toContain('"id":"call_complete"');
-    expect(writes[0]).toContain('"name":"search"');
-    expect(writes[0]).toContain('"{\\"query\\":\\"sessions\\"}"');
-    expect(writes.at(-2)).toContain('"finish_reason":"tool_calls"');
+    expect(writes[0]).toContain('"role":"assistant"');
+    expect(writes[1]).toContain('"tool_calls"');
+    expect(writes[1]).toContain('"id":"call_complete"');
+    expect(writes[1]).toContain('"name":"search"');
+    expect(writes[1]).toContain('"{\\"query\\":\\"sessions\\"}"');
+    expect(writes.at(-3)).toContain('"finish_reason":"tool_calls"');
+    expect(writes.at(-2)).toContain('"choices":[]');
   });
 
   it('tracks partial usage metadata without NaN totals', async () => {
@@ -301,6 +314,7 @@ describe('OpenAI-compatible adapters', () => {
       tracker,
     });
 
+    expect(writes.at(-2)).toContain('"choices":[]');
     expect(writes.at(-2)).toContain(
       '"completion_tokens_details":{"reasoning_tokens":2}'
     );

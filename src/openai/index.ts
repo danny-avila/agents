@@ -59,6 +59,7 @@ export interface OpenAIChatCompletionChunk {
 }
 
 export interface OpenAIStreamTracker {
+  hasRole: boolean;
   hasText: boolean;
   hasReasoning: boolean;
   lastChunkKind?: 'text' | 'reasoning' | 'tool_call';
@@ -90,6 +91,7 @@ interface OpenAIToolCallFragment {
 
 export function createOpenAIStreamTracker(): OpenAIStreamTracker {
   return {
+    hasRole: false,
     hasText: false,
     hasReasoning: false,
     toolCalls: new Map(),
@@ -163,6 +165,20 @@ export function createChatCompletionChunk(
   };
 }
 
+export function createChatCompletionUsageChunk(
+  context: OpenAIResponseContext,
+  usage: OpenAICompletionUsage
+): OpenAIChatCompletionChunk {
+  return {
+    id: context.requestId,
+    object: 'chat.completion.chunk',
+    created: context.created,
+    model: context.model,
+    choices: [],
+    usage,
+  };
+}
+
 export async function writeOpenAISSE(
   writer: OpenAICompatibleWriter,
   data: OpenAIChatCompletionChunk | '[DONE]'
@@ -187,6 +203,19 @@ function getTextParts(
     }
   }
   return text;
+}
+
+async function emitAssistantRoleChunk(
+  config: OpenAIHandlerConfig
+): Promise<void> {
+  if (config.tracker.hasRole) {
+    return;
+  }
+  config.tracker.hasRole = true;
+  await writeOpenAISSE(
+    config.writer,
+    createChatCompletionChunk(config.context, { role: 'assistant' })
+  );
 }
 
 async function emitToolCallChunk(params: {
@@ -241,6 +270,7 @@ async function emitToolCallChunk(params: {
   if (argumentDelta !== '') {
     functionDelta.arguments = argumentDelta;
   }
+  await emitAssistantRoleChunk(config);
   await writeOpenAISSE(
     config.writer,
     createChatCompletionChunk(config.context, {
@@ -267,6 +297,7 @@ export function createOpenAIHandlers(
         for (const text of getTextParts(data as t.MessageDeltaEvent)) {
           config.tracker.hasText = true;
           config.tracker.lastChunkKind = 'text';
+          await emitAssistantRoleChunk(config);
           await writeOpenAISSE(
             config.writer,
             createChatCompletionChunk(config.context, { content: text })
@@ -279,6 +310,7 @@ export function createOpenAIHandlers(
         for (const text of getTextParts(data as t.ReasoningDeltaEvent)) {
           config.tracker.hasReasoning = true;
           config.tracker.lastChunkKind = 'reasoning';
+          await emitAssistantRoleChunk(config);
           await writeOpenAISSE(
             config.writer,
             createChatCompletionChunk(config.context, { reasoning: text })
@@ -359,9 +391,14 @@ export async function sendOpenAIFinalChunk(
       reasoning_tokens: config.tracker.usage.reasoningTokens,
     };
   }
+  await emitAssistantRoleChunk(config);
   await writeOpenAISSE(
     config.writer,
-    createChatCompletionChunk(config.context, {}, resolvedFinishReason, usage)
+    createChatCompletionChunk(config.context, {}, resolvedFinishReason)
+  );
+  await writeOpenAISSE(
+    config.writer,
+    createChatCompletionUsageChunk(config.context, usage)
   );
   await writeOpenAISSE(config.writer, '[DONE]');
 }
