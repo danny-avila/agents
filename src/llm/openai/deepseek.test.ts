@@ -543,6 +543,41 @@ describe('ChatDeepSeek', () => {
     expect(textChunks).toEqual(['alpha ', 'beta ', 'gamma']);
   });
 
+  it('emits callbacks for split delayed DeepSeek text chunks', async () => {
+    const model = new CapturingChatDeepSeek(
+      {
+        apiKey: 'test-key',
+        model: 'deepseek-v4-pro',
+        streaming: true,
+        _lc_stream_delay: 1,
+      },
+      [createContentChunk('alpha beta gamma')]
+    );
+    const textChunks: string[] = [];
+    const callbackTokens: string[] = [];
+
+    const stream = await model.stream([new HumanMessage('hi')], {
+      callbacks: [
+        {
+          handleLLMNewToken(token: string): void {
+            if (token !== '') {
+              callbackTokens.push(token);
+            }
+          },
+        },
+      ],
+    });
+
+    for await (const chunk of stream) {
+      if (typeof chunk.content === 'string' && chunk.content !== '') {
+        textChunks.push(chunk.content);
+      }
+    }
+
+    expect(textChunks).toEqual(['alpha ', 'beta ', 'gamma']);
+    expect(callbackTokens).toEqual(textChunks);
+  });
+
   it('counts consumer work toward delayed DeepSeek cadence', async () => {
     const model = new CapturingChatDeepSeek(
       {
