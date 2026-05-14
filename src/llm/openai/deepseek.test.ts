@@ -542,4 +542,42 @@ describe('ChatDeepSeek', () => {
 
     expect(textChunks).toEqual(['alpha ', 'beta ', 'gamma']);
   });
+
+  it('counts consumer work toward delayed DeepSeek cadence', async () => {
+    const model = new CapturingChatDeepSeek(
+      {
+        apiKey: 'test-key',
+        model: 'deepseek-v4-pro',
+        streaming: true,
+        _lc_stream_delay: 100,
+      },
+      [createContentChunk('first '), createContentChunk('second')]
+    );
+    const stream = model.streamChunksWithSignal(new AbortController().signal);
+    const iterator = stream[Symbol.asyncIterator]();
+
+    await expect(iterator.next()).resolves.toEqual(
+      expect.objectContaining({
+        done: false,
+        value: expect.objectContaining({
+          text: 'first ',
+        }),
+      })
+    );
+
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 125);
+    });
+    const started = Date.now();
+
+    await expect(iterator.next()).resolves.toEqual(
+      expect.objectContaining({
+        done: false,
+        value: expect.objectContaining({
+          text: 'second',
+        }),
+      })
+    );
+    expect(Date.now() - started).toBeLessThan(50);
+  });
 });

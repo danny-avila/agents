@@ -1143,6 +1143,39 @@ test('Anthropic stream usage handles multiple cumulative message_delta events', 
   });
 });
 
+test('Anthropic stream smoothing skips empty text block starts', async () => {
+  const events: AnthropicStreamEvent[] = [
+    {
+      type: 'content_block_start',
+      index: 0,
+      content_block: {
+        type: 'text',
+        text: '',
+        citations: null,
+      },
+    },
+    {
+      type: 'content_block_delta',
+      index: 0,
+      delta: {
+        type: 'text_delta',
+        text: 'hello',
+      },
+    },
+    { type: 'message_stop' },
+  ];
+  const model = new MockStreamingAnthropic(events);
+  const contents: string[] = [];
+
+  for await (const chunk of await model.stream('hello')) {
+    if (typeof chunk.content === 'string') {
+      contents.push(chunk.content);
+    }
+  }
+
+  expect(contents).toEqual(['hello']);
+});
+
 test('Anthropic live stream usage matches raw cumulative output snapshots', async () => {
   const model = new RecordingStreamingAnthropic({
     modelName,

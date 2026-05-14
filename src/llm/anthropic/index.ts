@@ -734,6 +734,9 @@ export class CustomAnthropic extends ChatAnthropicMessages {
       tokenType: StreamTokenType,
       chunk: AIMessageChunk
     ): Promise<void> => {
+      if (token === '') {
+        return Promise.resolve();
+      }
       if (this._lc_stream_delay <= 0) {
         return enqueueChunk({ token, chunk, smooth: false });
       }

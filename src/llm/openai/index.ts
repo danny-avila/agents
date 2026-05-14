@@ -497,8 +497,8 @@ async function* delayStreamChunks(
         }
       }
       signal?.throwIfAborted();
-      yield outputChunk;
       lastYieldedAt = Date.now();
+      yield outputChunk;
     }
   }
 }
