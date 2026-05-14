@@ -489,6 +489,39 @@ describe('JsonlSessionStore', () => {
     ]);
   });
 
+  it('restores persisted summary token counts into run config', async () => {
+    const mockRun = createMockRun('with summary');
+    const capturedConfigs = mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    await session.getSessionStore()?.appendEntryForCompaction({
+      text: 'stored summary',
+      tokenCount: 123,
+      retainedEntryIds: [],
+      summarizedEntryIds: [],
+    });
+
+    await session.run('fresh');
+
+    const { graphConfig } = capturedConfigs[0];
+    const initialSummary =
+      'initialSummary' in graphConfig ? graphConfig.initialSummary : undefined;
+    expect(initialSummary).toEqual({
+      text: 'stored summary',
+      tokenCount: 123,
+    });
+  });
+
   it('preserves custom handlers outside the session event adapter set', async () => {
     const mockRun = createMockRun('handled');
     const capturedConfigs = mockRunCreate(mockRun);
@@ -987,9 +1020,11 @@ describe('JsonlSessionStore', () => {
 
   it('compacts into a summary plus retained active path', async () => {
     mockSummarizer('summary of old work');
+    const tokenCounter: t.TokenCounter = () => 7;
     const session = await createAgentSession({
       cwd: dir,
       runId: 'template-run',
+      tokenCounter,
       graphConfig: {
         type: 'standard',
         llmConfig: {
@@ -1013,6 +1048,10 @@ describe('JsonlSessionStore', () => {
       'summary of old work',
       'recent',
     ]);
+    const summary = store
+      ?.getEntries()
+      .find((entry) => entry.type === 'summary');
+    expect(summary?.data.tokenCount).toBeGreaterThan(0);
   });
 
   it('records no retained ids when compaction retains zero messages', async () => {

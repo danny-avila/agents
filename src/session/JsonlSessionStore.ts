@@ -376,11 +376,18 @@ export class JsonlSessionStore {
 
   async appendEntryForCompaction(params: {
     text: string;
+    tokenCount?: number;
     retainedEntryIds: string[];
     summarizedEntryIds: string[];
     instructions?: string;
     parentId?: string | null;
   }): Promise<SessionSummaryEntry> {
+    const tokenCount =
+      typeof params.tokenCount === 'number' &&
+      Number.isFinite(params.tokenCount) &&
+      params.tokenCount >= 0
+        ? params.tokenCount
+        : undefined;
     const entry = await this.appendEntry<SessionSummaryEntry>({
       type: 'summary',
       parentId:
@@ -389,6 +396,7 @@ export class JsonlSessionStore {
           : (this.getLeafEntry()?.id ?? null),
       data: {
         text: params.text,
+        ...(tokenCount != null ? { tokenCount } : {}),
         retainedEntryIds: params.retainedEntryIds,
         summarizedEntryIds: params.summarizedEntryIds,
         ...(params.instructions != null && params.instructions !== ''

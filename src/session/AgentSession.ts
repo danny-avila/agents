@@ -429,7 +429,11 @@ function createSessionRunState(entries: SessionEntry[]): {
     if (entry.type === 'summary') {
       initialSummary = {
         text: entry.data.text,
-        tokenCount: 0,
+        tokenCount:
+          typeof entry.data.tokenCount === 'number' &&
+          Number.isFinite(entry.data.tokenCount)
+            ? entry.data.tokenCount
+            : 0,
       };
       messages.length = 0;
       continue;
@@ -586,6 +590,15 @@ function getSummaryText(summary: t.SummaryContentBlock | undefined): string {
     typeof firstBlock.text === 'string'
     ? firstBlock.text
     : '';
+}
+
+function getSummaryTokenCount(
+  summary: t.SummaryContentBlock | undefined
+): number {
+  return typeof summary?.tokenCount === 'number' &&
+    Number.isFinite(summary.tokenCount)
+    ? summary.tokenCount
+    : 0;
 }
 
 function filterRemoveMessages(messages: BaseMessage[]): BaseMessage[] {
@@ -1140,7 +1153,8 @@ export class AgentSession {
         sessionState.initialSummary,
         options.retainRecentTurns,
         options.instructions
-      )
+      ),
+      this.runConfig.tokenCounter
     );
     const graph = createManualCompactGraph({
       runId: compactRunId,
@@ -1192,6 +1206,7 @@ export class AgentSession {
     );
     const summary = await store.appendEntryForCompaction({
       text: summaryText,
+      tokenCount: getSummaryTokenCount(graph.completedSummary),
       retainedEntryIds,
       summarizedEntryIds: summarized.map((entry) => entry.id),
       instructions: options.instructions,

@@ -67,6 +67,7 @@ export type SessionSummaryEntry = SessionEntryBase<
   'summary',
   {
     text: string;
+    tokenCount?: number;
     retainedEntryIds: JsonValue[];
     summarizedEntryIds: JsonValue[];
     instructions?: string;
