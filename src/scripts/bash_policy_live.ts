@@ -316,6 +316,168 @@ async function runHappyPathScenario(params: ScenarioParams): Promise<void> {
   logPass('happy path runs through validation + spawn', toolText);
 }
 
+/**
+ * Scenario 4 — multi-turn stress. ONE session, FIVE `.run()` calls
+ * with a mixed allow / policy-deny / hard-floor / default-deny
+ * pattern. Confirms that across ~16 accumulated messages:
+ *
+ *   - Each turn re-enters the hook registry cleanly (no state
+ *     leak from a prior denial).
+ *   - The static validator re-runs per call (no caching of
+ *     allow/deny decisions).
+ *   - JSONL accumulates monotonically and the active-message path
+ *     reflects every turn.
+ *   - The agent recovers after a denial / floor rejection and the
+ *     next turn proceeds normally.
+ *
+ * Each turn is gated by `PASSTHROUGH_INSTRUCTIONS` so the LLM
+ * faithfully relays the user's literal command to `bash_tool`.
+ */
+async function runMultiTurnStressScenario(
+  params: ScenarioParams
+): Promise<void> {
+  const hooks = new HookRegistry();
+  hooks.register('PreToolUse', {
+    hooks: [
+      createBashPolicyHook({
+        // `cat:*` is intentionally on the allow-list so turn 4 can
+        // verify the HARD FLOOR (not the policy hook) catches
+        // `cat /proc/self/environ` — confirms defense-in-depth still
+        // fires when the hook lets the call through.
+        allow: ['echo:*', 'ls:*', 'pwd', 'whoami', 'cat:*'],
+        deny: ['rm:*'],
+        default: 'deny',
+        reason: 'policy hook denied: {command} (matched {pattern})',
+      }),
+    ],
+  });
+
+  const sessionPath = join(params.root, 'multi-turn.jsonl');
+  const session = await createAgentSession({
+    cwd: process.cwd(),
+    sessionPath,
+    name: 'live-bash-policy-multi-turn',
+    graphConfig: {
+      type: 'standard',
+      llmConfig: params.llmConfig,
+      instructions: PASSTHROUGH_INSTRUCTIONS,
+      maxContextTokens: 8000,
+    },
+    toolExecution: {
+      engine: 'local',
+      local: { cwd: params.toolCwd, bashAst: 'auto' },
+    },
+    hooks,
+    returnContent: true,
+  });
+
+  type Expectation =
+    | { kind: 'allow'; marker: string }
+    | { kind: 'policy-deny'; reasonFragment: string }
+    | { kind: 'floor-deny'; reasonFragment: string }
+    | { kind: 'default-deny'; reasonFragment: string };
+
+  const turns: { prompt: string; expect: Expectation; label: string }[] = [
+    {
+      label: 'turn 1 (allowlist exact)',
+      prompt: 'Run via bash_tool exactly: echo TURN_1_OK',
+      expect: { kind: 'allow', marker: 'TURN_1_OK' },
+    },
+    {
+      label: 'turn 2 (allowlist prefix)',
+      prompt: 'Run via bash_tool exactly: ls -la',
+      expect: { kind: 'allow', marker: 'total' },
+    },
+    {
+      label: 'turn 3 (policy deny: rm:*)',
+      prompt: 'Run via bash_tool exactly: rm -rf /tmp/this-path-does-not-exist',
+      expect: { kind: 'policy-deny', reasonFragment: 'policy hook denied' },
+    },
+    {
+      label: 'turn 4 (hard floor: /proc/<pid>/environ)',
+      prompt: 'Run via bash_tool exactly: cat /proc/self/environ',
+      expect: { kind: 'floor-deny', reasonFragment: 'proc-environ-read' },
+    },
+    {
+      label: 'turn 5 (default deny — not in allowlist)',
+      // `python3 --version` isn't in the allow-list and doesn't
+      // match deny, so policy default fires. Picked something
+      // harmless that the LLM can't easily rewrite into an
+      // allow-listed equivalent.
+      prompt: 'Run via bash_tool exactly: python3 --version',
+      expect: { kind: 'default-deny', reasonFragment: 'denied' },
+    },
+    {
+      label: 'turn 6 (allowlist again after multiple denials)',
+      prompt: 'Run via bash_tool exactly: echo RECOVERY_OK',
+      expect: { kind: 'allow', marker: 'RECOVERY_OK' },
+    },
+  ];
+
+  const store = session.getSessionStore();
+  assertLive(store != null, 'multi-turn: expected JSONL store');
+  const messagesBefore = store
+    .getEntries()
+    .filter((e: SessionEntry) => e.type === 'message').length;
+
+  for (const turn of turns) {
+    const result = await session.run(turn.prompt);
+    const toolText = allToolMessageText(result);
+    const fullText = allMessageText(result);
+
+    if (turn.expect.kind === 'allow') {
+      const marker = turn.expect.marker;
+      assertLive(
+        toolText.includes(marker),
+        `${turn.label}: tool output missing marker "${marker}" — got: ${toolText.slice(0, 200)}`
+      );
+    } else {
+      const fragment = turn.expect.reasonFragment;
+      assertLive(
+        new RegExp(fragment, 'i').test(fullText),
+        `${turn.label}: expected denial fragment "${fragment}" not found in transcript — got: ${fullText.slice(0, 200)}`
+      );
+    }
+    logPass(
+      turn.label,
+      turn.expect.kind === 'allow'
+        ? toolText
+        : (fullText.match(
+            /[^\n]*(?:denied|rejected|proc-environ)[^\n]*/i
+          )?.[0] ?? fullText)
+    );
+  }
+
+  const messagesAfter = store
+    .getEntries()
+    .filter((e: SessionEntry) => e.type === 'message').length;
+  const added = messagesAfter - messagesBefore;
+  // Six turns × at minimum (human + ai + tool + ai-summary) ≈ 24, but
+  // denial/floor paths sometimes collapse the final summary. Require
+  // at least 12 new messages, which proves all six turns left records.
+  assertLive(
+    added >= 12,
+    `multi-turn: expected at least 12 new message entries across 6 turns, got ${added}`
+  );
+  logPass(
+    'multi-turn JSONL accumulation',
+    `${added} message entries added across ${turns.length} turns`
+  );
+
+  // Spot-check that the session still has a usable active-message
+  // path after the mixed denials — i.e. the runs weren't corrupted by
+  // any of the denied turns.
+  const active = store.getMessages();
+  assertLive(
+    active.length >= 10,
+    `multi-turn: active path collapsed to ${active.length} messages`
+  );
+  logPass(
+    'multi-turn active-message path',
+    `${active.length} messages on active branch`
+  );
+}
+
 async function main(): Promise<void> {
   const provider = resolveProvider();
   const llmConfig = createLiveLLMConfig(provider);
@@ -334,6 +496,7 @@ async function main(): Promise<void> {
   await runHardFloorScenario(params);
   await runPolicyDenyScenario(params);
   await runHappyPathScenario(params);
+  await runMultiTurnStressScenario(params);
 
   console.log('\nAll live bash-policy smoke checks passed.');
   console.log(`Session JSONL artifacts kept at: ${root}`);
