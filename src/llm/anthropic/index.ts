@@ -22,12 +22,7 @@ import { _makeMessageChunkFromAnthropicEvent } from './utils/message_outputs';
 import { _convertMessagesToAnthropicPayload } from './utils/message_inputs';
 import { handleToolChoice } from './utils/tools';
 
-const DEFAULT_STREAM_DELAY = 12;
-const MAX_STREAM_DELAY = 20;
-const CATCH_UP_BUFFERED_CHARS = 300;
-const PARTIAL_CATCH_UP_BUFFERED_CHARS = 150;
-const PARTIAL_CATCH_UP_DELAY = 5;
-const IDLE_TOKEN_SMOOTHING_BUDGET = 80;
+const DEFAULT_STREAM_DELAY = 25;
 const MAX_STREAM_QUEUE_CHUNKS = 256;
 const MAX_STREAM_QUEUE_TEXT_CHARS = 8192;
 const STREAM_CHUNK_MIN_SIZE = 4;
@@ -279,28 +274,6 @@ function splitStreamToken(text: string): string[] {
   return chunks;
 }
 
-function getAdaptiveStreamDelay({
-  baseDelay,
-  bufferedTextLength,
-  hasEmittedText,
-}: {
-  baseDelay: number;
-  bufferedTextLength: number;
-  hasEmittedText: boolean;
-}): number {
-  if (!hasEmittedText || baseDelay <= 0) {
-    return 0;
-  }
-  if (bufferedTextLength >= CATCH_UP_BUFFERED_CHARS) {
-    return 0;
-  }
-  const cappedDelay = Math.min(baseDelay, MAX_STREAM_DELAY);
-  if (bufferedTextLength >= PARTIAL_CATCH_UP_BUFFERED_CHARS) {
-    return Math.min(cappedDelay, PARTIAL_CATCH_UP_DELAY);
-  }
-  return cappedDelay;
-}
-
 function getCadencedStreamDelay({
   targetDelay,
   lastVisibleTextAt,
@@ -465,7 +438,6 @@ type QueuedGenerationChunk = {
   token: string;
   smooth: boolean;
   textLength: number;
-  targetDelay?: number;
 };
 
 export class CustomAnthropic extends ChatAnthropicMessages {
@@ -740,17 +712,14 @@ export class CustomAnthropic extends ChatAnthropicMessages {
       token,
       chunk,
       smooth,
-      targetDelay,
     }: {
       token: string;
       chunk: AIMessageChunk;
       smooth: boolean;
-      targetDelay?: number;
     }): Promise<void> => {
       await enqueue({
         token,
         smooth,
-        targetDelay,
         textLength: smooth ? token.length : 0,
         chunk: this.createGenerationChunk({
           token,
@@ -771,18 +740,8 @@ export class CustomAnthropic extends ChatAnthropicMessages {
 
       const tokenChunks = splitStreamToken(token);
       if (tokenChunks.length <= 1) {
-        return enqueueChunk({ token, chunk, smooth: false });
+        return enqueueChunk({ token, chunk, smooth: true });
       }
-
-      const caughtUp = !hasQueuedChunks() && bufferedTextLength === 0;
-      const idleTargetDelay = caughtUp
-        ? Math.min(
-          this._lc_stream_delay,
-          Math.ceil(
-            IDLE_TOKEN_SMOOTHING_BUDGET / Math.max(1, tokenChunks.length - 1)
-          )
-        )
-        : undefined;
 
       let emittedUsage = false;
       return tokenChunks.reduce(async (previous, currentToken) => {
@@ -799,7 +758,6 @@ export class CustomAnthropic extends ChatAnthropicMessages {
           token: currentToken,
           chunk: chunkForToken,
           smooth: true,
-          targetDelay: idleTargetDelay,
         });
 
         if (newChunk.usage_metadata != null && !emittedUsage) {
@@ -888,13 +846,7 @@ export class CustomAnthropic extends ChatAnthropicMessages {
           notifyProducerForSpace();
           await waitForStreamDelay(
             getCadencedStreamDelay({
-              targetDelay:
-                queuedChunk.targetDelay ??
-                getAdaptiveStreamDelay({
-                  baseDelay: this._lc_stream_delay,
-                  bufferedTextLength,
-                  hasEmittedText,
-                }),
+              targetDelay: hasEmittedText ? this._lc_stream_delay : 0,
               lastVisibleTextAt,
               now: Date.now(),
             }),

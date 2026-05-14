@@ -759,7 +759,7 @@ describe('custom chat model class smoke tests', () => {
 
     expect(CustomAnthropic.lc_name()).toBe('LibreChatAnthropic');
     expect(model._lc_stream_delay).toBe(8);
-    expect(defaultModel._lc_stream_delay).toBe(12);
+    expect(defaultModel._lc_stream_delay).toBe(25);
     expect(params.output_config).toEqual({ effort: 'low' });
     expect(params.inference_geo).toBe('eu');
     expect(params.context_management).toEqual(contextManagement);
