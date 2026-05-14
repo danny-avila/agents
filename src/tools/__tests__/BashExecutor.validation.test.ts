@@ -65,6 +65,22 @@ describe('validateBashCommandHardFloor', () => {
     );
   });
 
+  it('blocks /proc/<pid>/environ with quoted segments (Codex P1 round-13)', () => {
+    // Bash resolves `"self"` and `'1'` at runtime to literal text,
+    // so the path is the same `/proc/self/environ`. Pre-fix the
+    // negated class `[^/\s'"]+` excluded quote chars, so quoted
+    // segments fell out of the match.
+    expect(validateBashCommandHardFloor('cat /proc/"self"/environ').valid).toBe(
+      false
+    );
+    expect(validateBashCommandHardFloor('cat /proc/\'self\'/environ').valid).toBe(
+      false
+    );
+    expect(validateBashCommandHardFloor('cat /proc/"1"/environ').valid).toBe(
+      false
+    );
+  });
+
   it('blocks /proc/<pid>/environ with broader expansion forms (Codex P1 round-12)', () => {
     // Pre-fix `PROC_ENVIRON_RX` only matched `\d+|self|\$[A-Za-z_]`,
     // missing `$$` (current PID), `${pid}` (curly param expansion),

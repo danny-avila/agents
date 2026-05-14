@@ -51,10 +51,17 @@ function rxForBuiltin(name: string): RegExp {
 // `/proc/<pid>/environ` exfiltrates process env vars. Match any
 // pid-shaped position between `/proc/` and `/environ` — `\d+`, `self`,
 // `$VAR`, `${VAR}`, `$$` (current PID), `$!` (last bg PID), `$0`–`$9`
-// (positional args). Pre-fix only `\d+|self|\$[A-Za-z_]` matched, so
-// the common `/proc/$$/environ` and `/proc/${pid}/environ` forms
-// slipped through. (Codex P1 round-12)
-const PROC_ENVIRON_RX = /\/proc\/[^/\s'"]+\/environ\b/;
+// (positional args), AND quoted variants like `"self"` (bash resolves
+// the quoted token to the same path at runtime — Codex P1 round-13).
+// The negated class only excludes slash and whitespace; quote chars
+// are part of the matched segment so `/proc/"self"/environ` and
+// `/proc/'1'/environ` are caught.
+//
+// Pre-fixes (round-12): only `\d+|self|\$[A-Za-z_]` matched; common
+// `/proc/$$/environ` and `/proc/${pid}/environ` slipped through.
+// Pre-fixes (round-13): the `[^/\s'"]` negated class excluded quote
+// chars, so quoted-segment variants weren't caught.
+const PROC_ENVIRON_RX = /\/proc\/[^/\s]+\/environ\b/;
 const IFS_INJECTION_RX = /\bIFS\s*=/;
 const HEX_ESCAPE_OBFUSCATION_RX = /\\x[0-9a-fA-F]{2}/;
 // Source-from-expansion: any `source $...` / `. $...` form where the

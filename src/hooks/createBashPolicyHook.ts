@@ -199,6 +199,22 @@ function containsShellSeparator(command: string): boolean {
       // separator, so benign uses like `git commit -m "$((1+1))"`
       // were denied under allowlist policies (Codex P2 round-10).
       if (i + 2 < command.length && command[i + 2] === '(') {
+        // Skip the entire `$((…))` body so inner arithmetic operators
+        // (`<`, `>`, etc.) aren't misclassified as shell separators
+        // by the rest of the loop. Track paren depth (start at 2 for
+        // the two opening parens; decrement on `)`, increment on
+        // inner `(`). Without this, `git log -n $((a>b))` denies
+        // under allowlist policies because the `>` inside arithmetic
+        // is treated as redirection (Codex P2 round-13).
+        let depth = 2;
+        let j = i + 3;
+        while (j < command.length && depth > 0) {
+          if (command[j] === '(') depth++;
+          else if (command[j] === ')') depth--;
+          j++;
+        }
+        // For-loop `i++` will move us past the last consumed char.
+        i = j - 1;
         continue;
       }
       return true;

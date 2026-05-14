@@ -95,6 +95,30 @@ describe('createBashPolicyHook — pattern matching', () => {
     expect((await run(hook, makeInput('npm\ttest'))).decision).toBe('allow'); // tab collapsed
   });
 
+  it('prefix match: arithmetic $((expr)) skips inner operators (Codex P2 round-13)', async () => {
+    // Pre-fix the round-10 arithmetic detection just `continue`d
+    // without advancing past the body, so inner `<`/`>` operators
+    // in `$((a<b))` still tripped the separator scan. Now we walk
+    // the paren depth to skip the entire arithmetic body.
+    const hook = createBashPolicyHook({
+      allow: ['echo:*', 'git:*'],
+      default: 'deny',
+    });
+    expect((await run(hook, makeInput('echo $((1<2))'))).decision).toBe(
+      'allow'
+    );
+    expect((await run(hook, makeInput('git log -n $((a>b))'))).decision).toBe(
+      'allow'
+    );
+    expect(
+      (await run(hook, makeInput('echo $((1*(2+3))) result'))).decision
+    ).toBe('allow');
+    // Sanity: still catches bare `<` outside arithmetic.
+    expect(
+      (await run(hook, makeInput('echo foo < /etc/passwd'))).decision
+    ).toBe('deny');
+  });
+
   it('prefix match: arithmetic $((expr)) is NOT treated as command substitution (Codex P2 round-10)', async () => {
     // Pre-fix `containsShellSeparator` returned true on any `$(`,
     // including arithmetic `$((1+1))`. Bash evaluates arithmetic
