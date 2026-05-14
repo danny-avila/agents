@@ -407,11 +407,17 @@ async function* delayStreamChunks<T>(
   chunks: AsyncGenerator<T>,
   delay?: number
 ): AsyncGenerator<T> {
+  let lastYieldedAt: number | undefined;
   for await (const chunk of chunks) {
-    yield chunk;
-    if (delay != null) {
-      await sleep(delay);
+    if (delay != null && delay > 0 && lastYieldedAt != null) {
+      const timeSinceLastYield = Date.now() - lastYieldedAt;
+      const timeToWait = Math.max(0, delay - timeSinceLastYield);
+      if (timeToWait > 0) {
+        await sleep(timeToWait);
+      }
     }
+    yield chunk;
+    lastYieldedAt = Date.now();
   }
 }
 
