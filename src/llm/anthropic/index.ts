@@ -302,6 +302,7 @@ async function waitForStreamDelay(
       if (timeoutRef.current) {
         clearTimeout(timeoutRef.current);
       }
+      signal?.removeEventListener('abort', onAbort);
       resolve();
     };
     timeoutRef.current = setTimeout(() => {
@@ -309,6 +310,9 @@ async function waitForStreamDelay(
       resolve();
     }, delay);
     signal?.addEventListener('abort', onAbort, { once: true });
+    if (isSignalAborted(signal)) {
+      onAbort();
+    }
   });
 }
 
