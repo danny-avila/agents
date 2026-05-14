@@ -76,6 +76,32 @@ describe('createBashPolicyHook — pattern matching', () => {
     );
   });
 
+  it('exact match: authorizes piped/chained commands when host lists them exactly (Codex P2 round-2 on #172)', async () => {
+    // Pre-fix the exact-match branch bailed on `containsShellSeparator`,
+    // so `allow: ['cat file | jq .']` could never match. The documented
+    // escape hatch for chained/piped commands is "use an exact rule";
+    // if the host writes the full string in `allow`, it should match.
+    const hook = createBashPolicyHook({
+      allow: ['cat file | jq .', 'find . -name "*.ts" -exec wc -l {} +'],
+      default: 'deny',
+    });
+    expect((await run(hook, makeInput('cat file | jq .'))).decision).toBe(
+      'allow'
+    );
+    expect(
+      (await run(hook, makeInput('find . -name "*.ts" -exec wc -l {} +')))
+        .decision
+    ).toBe('allow');
+    // Sanity: other commands still default-deny.
+    expect((await run(hook, makeInput('cat /etc/hosts'))).decision).toBe(
+      'deny'
+    );
+    // Sanity: over-matching still impossible — extra suffix doesn't match.
+    expect(
+      (await run(hook, makeInput('cat file | jq . ; rm -rf /tmp/x'))).decision
+    ).toBe('deny');
+  });
+
   it('exact match: refuses newline-separated input (Codex P2 round-6)', async () => {
     // Pre-fix `.replace(/\s+/g, ' ')` collapsed `\n` to a space, so
     // an exact rule `npm test` matched `npm\ntest` (which bash would

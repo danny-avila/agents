@@ -297,21 +297,22 @@ function compilePattern(pattern: string): CompiledMatcher {
       },
     };
   }
-  // Exact match: normalize space + tab only (NOT newlines/CR — those
-  // are shell separators bash treats as `;`). Pre-fix the `\s+`
-  // collapse turned `npm\ntest` into `npm test`, so an exact rule
-  // `"npm test"` matched multi-line input that bash would split into
-  // two commands (Codex P2 round-6). Also gate on
-  // `containsShellSeparator` so any chained / substituted input is
-  // refused even when the first command happens to collapse to the
-  // exact pattern.
+  // Exact match: equality after collapsing space+tab runs (NOT all
+  // `\s`, so newlines stay separators per round-6). We intentionally
+  // do NOT bail on `containsShellSeparator` here — exact patterns
+  // are the documented escape hatch for explicitly authorizing
+  // chained / piped / redirected commands. Round-6 protection is
+  // preserved by the space-tab-only normalization: `npm\ntest`
+  // doesn't collapse to `npm test`, and `npm test; curl evil`
+  // doesn't equal `npm test` either, so over-matching requires the
+  // host to list the full chained string exactly. (Codex P2 round-2
+  // on agents #172 — pre-fix the separator gate blocked legit
+  // `allow: ['cat file | jq .']` from ever matching.)
   const exact = pattern.replace(/[ \t]+/g, ' ').trim();
   return {
     source,
-    test: (command: string): boolean => {
-      if (containsShellSeparator(command)) return false;
-      return command.replace(/[ \t]+/g, ' ').trim() === exact;
-    },
+    test: (command: string): boolean =>
+      command.replace(/[ \t]+/g, ' ').trim() === exact,
   };
 }
 
