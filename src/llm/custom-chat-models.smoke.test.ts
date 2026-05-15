@@ -80,6 +80,19 @@ type OpenAIStreamEvent = {
 type OpenAIStreamItem =
   | OpenAIClient.Chat.Completions.ChatCompletionChunk
   | OpenAIStreamEvent;
+type FetchOutcome = 'resolved' | 'rejected' | 'pending';
+type AbortableFetchCapture = {
+  fetch: typeof fetch;
+  getSignal: () => AbortSignal | undefined;
+};
+type FetchTimeoutClient = {
+  fetchWithTimeout: (
+    url: RequestInfo,
+    init: RequestInit | undefined,
+    ms: number,
+    controller: AbortController
+  ) => Promise<Response>;
+};
 type MockableCompletionCreate = (
   request: unknown,
   options?: unknown
@@ -138,6 +151,55 @@ const baseAzureFields = {
   azureOpenAIApiVersion: '2024-10-21',
   azureOpenAIApiInstanceName: 'test-instance',
   azureOpenAIApiDeploymentName: 'test-deployment',
+};
+
+const waitForFetchOutcome = (
+  promise: Promise<Response>,
+  timeoutMs = 100
+): Promise<FetchOutcome> =>
+  Promise.race([
+    promise.then(
+      () => 'resolved' as const,
+      () => 'rejected' as const
+    ),
+    new Promise<'pending'>((resolve) => {
+      setTimeout(() => resolve('pending'), timeoutMs);
+    }),
+  ]);
+
+const createAbortableFetch = (): AbortableFetchCapture => {
+  let requestSignal: AbortSignal | undefined;
+  return {
+    fetch: async (_url, init): Promise<Response> =>
+      new Promise<Response>((_resolve, reject) => {
+        requestSignal = init?.signal ?? undefined;
+        requestSignal?.addEventListener(
+          'abort',
+          () => reject(new Error('Aborted')),
+          { once: true }
+        );
+      }),
+    getSignal: () => requestSignal,
+  };
+};
+
+const expectFetchTimeoutAbort = async (
+  client: FetchTimeoutClient,
+  capturedFetch: AbortableFetchCapture,
+  url: string
+): Promise<void> => {
+  const controller = new AbortController();
+
+  const response = client.fetchWithTimeout(
+    url,
+    { method: 'post' },
+    10,
+    controller
+  );
+
+  await expect(waitForFetchOutcome(response)).resolves.toBe('rejected');
+  expect(controller.signal.aborted).toBe(true);
+  expect(capturedFetch.getSignal()?.aborted).toBe(true);
 };
 
 const baseBedrockFields = {
@@ -711,8 +773,7 @@ describe('custom chat model class smoke tests', () => {
     }
 
     const usageChunk = chunks.find(
-      (chunk) =>
-        chunk.usage_metadata?.input_token_details?.cache_creation === 5
+      (chunk) => chunk.usage_metadata?.input_token_details?.cache_creation === 5
     );
     expect(usageChunk?.usage_metadata).toEqual({
       input_tokens: 11,
@@ -908,5 +969,58 @@ describe('custom chat model class smoke tests', () => {
     expect(response.status).toBe(200);
     expect(method).toBe('PATCH');
     expect(client.abortHandler).toBeDefined();
+  });
+
+  it('aborts custom OpenAI fetches when the request timeout elapses', async () => {
+    const capturedFetch = createAbortableFetch();
+    const client = new CustomOpenAIClient({
+      apiKey: 'test-key',
+      fetch: capturedFetch.fetch,
+    });
+
+    await expectFetchTimeoutAbort(
+      client,
+      capturedFetch,
+      'https://example.test/v1/chat/completions'
+    );
+  });
+
+  it('aborts custom Azure OpenAI fetches when the request timeout elapses', async () => {
+    const capturedFetch = createAbortableFetch();
+    const client = new CustomAzureOpenAIClient({
+      apiKey: 'test-azure-key',
+      apiVersion: '2024-10-21',
+      baseURL: 'https://example.test/openai/deployments/test-deployment',
+      fetch: capturedFetch.fetch,
+    });
+
+    await expectFetchTimeoutAbort(
+      client,
+      capturedFetch,
+      'https://example.test/openai/deployments/test-deployment/chat/completions'
+    );
+  });
+
+  it('propagates caller abort signals to custom OpenAI fetches', async () => {
+    const capturedFetch = createAbortableFetch();
+    const client = new CustomOpenAIClient({
+      apiKey: 'test-key',
+      fetch: capturedFetch.fetch,
+    });
+    const callerController = new AbortController();
+    const requestController = new AbortController();
+
+    const response = client.fetchWithTimeout(
+      'https://example.test/v1/chat/completions',
+      { method: 'post', signal: callerController.signal },
+      1000,
+      requestController
+    );
+
+    callerController.abort();
+
+    await expect(waitForFetchOutcome(response)).resolves.toBe('rejected');
+    expect(requestController.signal.aborted).toBe(true);
+    expect(capturedFetch.getSignal()?.aborted).toBe(true);
   });
 });

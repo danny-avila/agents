@@ -468,7 +468,7 @@ export class CustomOpenAIClient extends OpenAIClient {
     this.abortHandler = handler;
     if (signal) signal.addEventListener('abort', handler, { once: true });
 
-    const timeout = setTimeout(() => handler, ms);
+    const timeout = setTimeout(handler, ms);
 
     const fetchOptions = {
       signal: controller.signal as AbortSignal,
@@ -503,7 +503,7 @@ export class CustomAzureOpenAIClient extends AzureOpenAIClient {
     this.abortHandler = handler;
     if (signal) signal.addEventListener('abort', handler, { once: true });
 
-    const timeout = setTimeout(() => handler, ms);
+    const timeout = setTimeout(handler, ms);
 
     const fetchOptions = {
       signal: controller.signal as AbortSignal,
