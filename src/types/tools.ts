@@ -29,6 +29,28 @@ export type ToolRefs = {
 
 export type ToolRefGenerator = (tool_calls: ToolCall[]) => ToolRefs;
 
+export type EagerEventToolExecutionConfig = {
+  /**
+   * When enabled, event-driven tool calls may be started from the
+   * streaming layer as soon as the SDK observes a complete tool call.
+   * Results are still held until ToolNode materializes the final
+   * ToolMessages so provider message ordering is preserved.
+   */
+  enabled?: boolean;
+};
+
+export type EagerEventToolExecutionOutcome =
+  | { results: ToolExecuteResult[]; error?: undefined }
+  | { results?: undefined; error: Error };
+
+export type EagerEventToolExecution = {
+  toolCallId: string;
+  toolName: string;
+  args: Record<string, unknown>;
+  request: ToolCallRequest;
+  promise: Promise<EagerEventToolExecutionOutcome>;
+};
+
 export type ToolNodeOptions = {
   name?: string;
   tags?: string[];
@@ -51,6 +73,10 @@ export type ToolNodeOptions = {
   agentId?: string;
   /** Tool names that must be executed directly (via runTool) even in event-driven mode (e.g., graph-managed handoff tools) */
   directToolNames?: Set<string>;
+  /** Opt-in eager execution for event-driven tool calls. */
+  eagerEventToolExecution?: EagerEventToolExecutionConfig;
+  /** Shared per-run eager execution registry populated by the stream handler. */
+  eagerEventToolExecutions?: Map<string, EagerEventToolExecution>;
   /**
    * Hook registry for PreToolUse/PostToolUse/PostToolUseFailure/
    * PermissionDenied lifecycle hooks. Fires for **every** tool the

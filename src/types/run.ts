@@ -15,6 +15,7 @@ import type {
   ToolSessionMap,
   ToolExecutionConfig,
   ToolOutputReferencesConfig,
+  EagerEventToolExecutionConfig,
 } from '@/types/tools';
 import type { HumanInTheLoopConfig } from '@/types/hitl';
 import type { HookRegistry } from '@/hooks';
@@ -161,6 +162,16 @@ export type RunConfig = {
    * placeholders. Disabled by default so existing runs are unaffected.
    */
   toolOutputReferences?: ToolOutputReferencesConfig;
+  /**
+   * Opt-in latency optimization for event-driven tools. When enabled,
+   * the streaming layer may start a tool call as soon as it sees a
+   * complete, parseable tool call; ToolNode still waits for the final
+   * assistant message before appending ToolMessages, preserving provider
+   * ordering. The SDK automatically falls back to normal batch dispatch
+   * when hooks, HITL, output references, or ambiguous stream shapes make
+   * eager dispatch unsafe.
+   */
+  eagerEventToolExecution?: EagerEventToolExecutionConfig;
   /**
    * Selects the execution backend for built-in code tools. Omit this to keep
    * the remote LibreChat Code API sandbox. Set `{ engine: 'local' }` to run

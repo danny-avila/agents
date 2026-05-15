@@ -11,6 +11,8 @@ import {
   GraphEvents,
   StepTypes,
   Providers,
+  Constants,
+  CODE_EXECUTION_TOOLS,
 } from '@/common';
 import {
   handleServerToolResult,
@@ -18,6 +20,8 @@ import {
   handleToolCalls,
 } from '@/tools/handlers';
 import { getMessageId } from '@/messages';
+import { safeDispatchCustomEvent } from '@/utils/events';
+import { coerceRecordArgs, normalizeError } from '@/tools/eagerEventExecution';
 
 /**
  * Parses content to extract thinking sections enclosed in <think> tags using string operations
@@ -77,6 +81,189 @@ function getNonEmptyValue(possibleValues: string[]): string | undefined {
     }
   }
   return undefined;
+}
+
+function isBatchSensitiveToolExecution(graph: StandardGraph): boolean {
+  return (
+    graph.hookRegistry != null ||
+    graph.humanInTheLoop?.enabled === true ||
+    graph.toolOutputReferences?.enabled === true
+  );
+}
+
+function isDirectGraphTool(
+  name: string,
+  agentContext: AgentContext | undefined
+): boolean {
+  if (name.startsWith(Constants.LC_TRANSFER_TO_)) {
+    return true;
+  }
+  return (
+    (agentContext?.graphTools as t.GenericTool[] | undefined)?.some(
+      (tool) => 'name' in tool && tool.name === name
+    ) === true
+  );
+}
+
+function toCodeEnvFile(file: t.FileRef, execSessionId: string): t.CodeEnvFile {
+  const base = {
+    id: file.id,
+    resource_id: file.resource_id ?? file.id,
+    name: file.name,
+    storage_session_id: file.storage_session_id ?? execSessionId,
+  };
+  const kind = file.kind ?? 'user';
+  if (kind === 'skill' && file.version != null) {
+    return { ...base, kind: 'skill', version: file.version };
+  }
+  if (kind === 'agent') {
+    return { ...base, kind: 'agent' };
+  }
+  return { ...base, kind: 'user' };
+}
+
+function getCodeSessionContext(
+  graph: StandardGraph,
+  name: string
+): t.ToolCallRequest['codeSessionContext'] | undefined {
+  if (
+    !CODE_EXECUTION_TOOLS.has(name) &&
+    name !== Constants.SKILL_TOOL &&
+    name !== Constants.READ_FILE
+  ) {
+    return undefined;
+  }
+
+  const codeSession = graph.sessions.get(Constants.EXECUTE_CODE) as
+    | t.CodeSessionContext
+    | undefined;
+  if (codeSession?.session_id == null || codeSession.session_id === '') {
+    return undefined;
+  }
+
+  return {
+    session_id: codeSession.session_id,
+    files: codeSession.files?.map((file) =>
+      toCodeEnvFile(file, codeSession.session_id)
+    ),
+  };
+}
+
+function shouldAttemptEagerToolExecution(args: {
+  graph: StandardGraph;
+  metadata?: Record<string, unknown>;
+  agentContext?: AgentContext;
+  toolCall: ToolCall;
+}): boolean {
+  const { graph, metadata, agentContext, toolCall } = args;
+  if (graph.eagerEventToolExecution?.enabled !== true) {
+    return false;
+  }
+  if ((agentContext?.toolDefinitions?.length ?? 0) === 0) {
+    return false;
+  }
+  if (isBatchSensitiveToolExecution(graph)) {
+    return false;
+  }
+  if (
+    metadata?.[Constants.PROGRAMMATIC_TOOL_CALLING] === true ||
+    metadata?.[Constants.BASH_PROGRAMMATIC_TOOL_CALLING] === true
+  ) {
+    return false;
+  }
+  if (graph.handlerRegistry?.getHandler(GraphEvents.ON_TOOL_EXECUTE) == null) {
+    return false;
+  }
+  if (
+    toolCall.id == null ||
+    toolCall.id === '' ||
+    toolCall.name === '' ||
+    isDirectGraphTool(toolCall.name, agentContext)
+  ) {
+    return false;
+  }
+  return coerceRecordArgs(toolCall.args) != null;
+}
+
+function startEagerToolExecution(args: {
+  graph: StandardGraph;
+  metadata?: Record<string, unknown>;
+  agentContext?: AgentContext;
+  toolCall: ToolCall;
+}): void {
+  const { graph, metadata, agentContext, toolCall } = args;
+  if (
+    !shouldAttemptEagerToolExecution({
+      graph,
+      metadata,
+      agentContext,
+      toolCall,
+    })
+  ) {
+    return;
+  }
+
+  const id = toolCall.id!;
+  if (graph.eagerEventToolExecutions.has(id)) {
+    return;
+  }
+
+  const toolName = toolCall.name;
+  const coercedArgs = coerceRecordArgs(toolCall.args);
+  if (coercedArgs == null) {
+    return;
+  }
+
+  const turn = graph.eagerEventToolUsageCount.get(toolName) ?? 0;
+  graph.eagerEventToolUsageCount.set(toolName, turn + 1);
+
+  const request: t.ToolCallRequest = {
+    id,
+    name: toolName,
+    args: coercedArgs,
+    stepId: graph.toolCallStepIds.get(id) ?? '',
+    turn,
+  };
+
+  const codeSessionContext = getCodeSessionContext(graph, toolName);
+  if (codeSessionContext != null) {
+    request.codeSessionContext = codeSessionContext;
+  }
+
+  const promise: Promise<t.EagerEventToolExecutionOutcome> = new Promise<
+    t.ToolExecuteResult[]
+  >((resolve, reject) => {
+    const batchRequest: t.ToolExecuteBatchRequest = {
+      toolCalls: [request],
+      userId: graph.config?.configurable?.user_id as string | undefined,
+      agentId: agentContext?.agentId,
+      configurable: graph.config?.configurable as
+        | Record<string, unknown>
+        | undefined,
+      metadata,
+      resolve,
+      reject,
+    };
+
+    safeDispatchCustomEvent(
+      GraphEvents.ON_TOOL_EXECUTE,
+      batchRequest,
+      graph.config
+    );
+  }).then(
+    (results): t.EagerEventToolExecutionOutcome => ({ results }),
+    (error): t.EagerEventToolExecutionOutcome => ({
+      error: normalizeError(error),
+    })
+  );
+
+  graph.eagerEventToolExecutions.set(id, {
+    toolCallId: id,
+    toolName,
+    args: coercedArgs,
+    request,
+    promise,
+  });
 }
 
 export function getChunkContent({
@@ -186,6 +373,14 @@ export class ChatModelStreamHandler implements t.EventHandler {
     ) {
       hasToolCalls = true;
       await handleToolCalls(chunk.tool_calls, metadata, graph);
+      for (const toolCall of chunk.tool_calls) {
+        startEagerToolExecution({
+          graph,
+          metadata,
+          agentContext,
+          toolCall,
+        });
+      }
     }
 
     const hasToolCallChunks =

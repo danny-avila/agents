@@ -50,6 +50,7 @@ import {
   resolveLocalToolRegistry,
   resolveLocalExecutionTools,
 } from '@/tools/local';
+import { recordArgsEqual } from '@/tools/eagerEventExecution';
 
 /**
  * Per-call batch context for `runTool`. Bundles every optional
@@ -413,6 +414,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private sessions?: t.ToolSessionMap;
   /** When true, dispatches ON_TOOL_EXECUTE events instead of invoking tools directly */
   private eventDrivenMode: boolean = false;
+  /** Opt-in stream-layer prestart config for event-driven tools. */
+  private eagerEventToolExecution?: t.EagerEventToolExecutionConfig;
+  /** Shared per-run prestarted tool registry populated by ChatModelStreamHandler. */
+  private eagerEventToolExecutions?: Map<string, t.EagerEventToolExecution>;
   /** Agent ID for event-driven mode */
   private agentId?: string;
   /** Tool names that bypass event dispatch and execute directly (e.g., graph-managed handoff tools) */
@@ -469,6 +474,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     toolRegistry,
     sessions,
     eventDrivenMode,
+    eagerEventToolExecution,
+    eagerEventToolExecutions,
     agentId,
     directToolNames,
     maxContextTokens,
@@ -493,6 +500,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     });
     this.sessions = sessions;
     this.eventDrivenMode = eventDrivenMode ?? false;
+    this.eagerEventToolExecution = eagerEventToolExecution;
+    this.eagerEventToolExecutions = eagerEventToolExecutions;
     this.agentId = agentId;
     this.directToolNames = directToolNames;
     this.maxToolResultChars =
@@ -2370,28 +2379,57 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       });
 
       const requestMap = new Map(requests.map((r) => [r.id, r]));
+      const eagerExecutions: Array<{
+        request: t.ToolCallRequest;
+        execution: t.EagerEventToolExecution;
+      }> = [];
+      const dispatchRequests: t.ToolCallRequest[] = [];
 
-      const results = await new Promise<t.ToolExecuteResult[]>(
-        (resolve, reject) => {
-          const batchRequest: t.ToolExecuteBatchRequest = {
-            toolCalls: requests,
-            userId: config.configurable?.user_id as string | undefined,
-            agentId: this.agentId,
-            configurable: config.configurable as
-              | Record<string, unknown>
-              | undefined,
-            metadata: config.metadata as Record<string, unknown> | undefined,
-            resolve,
-            reject,
-          };
-
-          safeDispatchCustomEvent(
-            GraphEvents.ON_TOOL_EXECUTE,
-            batchRequest,
-            config
-          );
+      for (const request of requests) {
+        const eagerExecution = this.takeMatchingEagerEventExecution(request);
+        if (eagerExecution != null) {
+          eagerExecutions.push({ request, execution: eagerExecution });
+        } else {
+          dispatchRequests.push(request);
         }
-      );
+      }
+
+      const dispatchPromise =
+        dispatchRequests.length === 0
+          ? Promise.resolve([] as t.ToolExecuteResult[])
+          : new Promise<t.ToolExecuteResult[]>((resolve, reject) => {
+            const batchRequest: t.ToolExecuteBatchRequest = {
+              toolCalls: dispatchRequests,
+              userId: config.configurable?.user_id as string | undefined,
+              agentId: this.agentId,
+              configurable: config.configurable as
+                  | Record<string, unknown>
+                  | undefined,
+              metadata: config.metadata as
+                  | Record<string, unknown>
+                  | undefined,
+              resolve,
+              reject,
+            };
+
+            safeDispatchCustomEvent(
+              GraphEvents.ON_TOOL_EXECUTE,
+              batchRequest,
+              config
+            );
+          });
+
+      const eagerResultsPromise = Promise.all(
+        eagerExecutions.map(({ request, execution }) =>
+          this.resolveEagerEventExecution(request, execution)
+        )
+      ).then((results) => results.flat());
+
+      const [eagerResults, dispatchedResults] = await Promise.all([
+        eagerResultsPromise,
+        dispatchPromise,
+      ]);
+      const results = [...eagerResults, ...dispatchedResults];
 
       this.storeCodeSessionFromResults(results, requestMap);
 
@@ -2604,6 +2642,67 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     });
 
     return { toolMessages, injected };
+  }
+
+  private canConsumeEagerEventExecution(): boolean {
+    return (
+      this.eventDrivenMode &&
+      this.eagerEventToolExecution?.enabled === true &&
+      this.hookRegistry == null &&
+      this.humanInTheLoop?.enabled !== true &&
+      this.toolOutputRegistry == null
+    );
+  }
+
+  private takeMatchingEagerEventExecution(
+    request: t.ToolCallRequest
+  ): t.EagerEventToolExecution | undefined {
+    if (!this.canConsumeEagerEventExecution()) {
+      return undefined;
+    }
+
+    const execution = this.eagerEventToolExecutions?.get(request.id);
+    if (execution == null) {
+      return undefined;
+    }
+
+    this.eagerEventToolExecutions?.delete(request.id);
+
+    if (
+      execution.toolName !== request.name ||
+      !recordArgsEqual(execution.args, request.args)
+    ) {
+      return undefined;
+    }
+
+    return execution;
+  }
+
+  private async resolveEagerEventExecution(
+    request: t.ToolCallRequest,
+    execution: t.EagerEventToolExecution
+  ): Promise<t.ToolExecuteResult[]> {
+    const outcome = await execution.promise;
+    if (outcome.error != null) {
+      throw outcome.error;
+    }
+
+    const results = outcome.results.filter(
+      (result) => result.toolCallId === request.id
+    );
+    if (results.length > 0) {
+      return results;
+    }
+
+    return [
+      {
+        toolCallId: request.id,
+        status: 'error',
+        content: '',
+        errorMessage:
+          'Tool execution completed without a result for this tool call',
+      },
+    ];
   }
 
   /**

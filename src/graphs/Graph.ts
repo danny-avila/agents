@@ -160,6 +160,14 @@ export abstract class Graph<
    */
   toolOutputReferences: t.ToolOutputReferencesConfig | undefined;
   /**
+   * Run-scoped opt-in for eager event-driven tool execution. The stream
+   * handler may prestart eligible event-driven tools; ToolNode later
+   * consumes the settled promises while preserving final ToolMessage order.
+   */
+  eagerEventToolExecution: t.EagerEventToolExecutionConfig | undefined;
+  eagerEventToolExecutions: Map<string, t.EagerEventToolExecution> = new Map();
+  eagerEventToolUsageCount: Map<string, number> = new Map();
+  /**
    * Run-scoped execution backend for built-in code tools. Defaults to the
    * remote Code API sandbox when unset.
    */
@@ -198,6 +206,9 @@ export abstract class Graph<
     this.hookRegistry = undefined;
     this.humanInTheLoop = undefined;
     this.toolOutputReferences = undefined;
+    this.eagerEventToolExecution = undefined;
+    this.eagerEventToolExecutions.clear();
+    this.eagerEventToolUsageCount.clear();
     this.toolExecution = undefined;
     this.handlerDispatchedEventCounts.clear();
     /**
@@ -712,6 +723,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         toolRegistry: agentContext?.toolRegistry,
         hookRegistry: this.hookRegistry,
         humanInTheLoop: this.humanInTheLoop,
+        eagerEventToolExecution: this.eagerEventToolExecution,
+        eagerEventToolExecutions: this.eagerEventToolExecutions,
         toolExecution: this.toolExecution,
         directToolNames: directToolNames.size > 0 ? directToolNames : undefined,
         maxContextTokens: agentContext?.maxContextTokens,
