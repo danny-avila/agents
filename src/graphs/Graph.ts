@@ -167,6 +167,8 @@ export abstract class Graph<
   eagerEventToolExecution: t.EagerEventToolExecutionConfig | undefined;
   eagerEventToolExecutions: Map<string, t.EagerEventToolExecution> = new Map();
   eagerEventToolUsageCount: Map<string, number> = new Map();
+  eagerEventToolCallChunks: Map<string, t.EagerEventToolCallChunkState> =
+    new Map();
   /**
    * Run-scoped execution backend for built-in code tools. Defaults to the
    * remote Code API sandbox when unset.
@@ -209,6 +211,7 @@ export abstract class Graph<
     this.eagerEventToolExecution = undefined;
     this.eagerEventToolExecutions.clear();
     this.eagerEventToolUsageCount.clear();
+    this.eagerEventToolCallChunks.clear();
     this.toolExecution = undefined;
     this.handlerDispatchedEventCounts.clear();
     /**
@@ -421,6 +424,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
      * a stale reference on 2nd+ processStream calls.
      */
     this.toolCallStepIds.clear();
+    this.eagerEventToolCallChunks.clear();
     this.handlerDispatchedStepIds = resetIfNotEmpty(
       this.handlerDispatchedStepIds,
       new Set()

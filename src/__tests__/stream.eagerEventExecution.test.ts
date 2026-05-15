@@ -24,6 +24,7 @@ function createGraph(overrides: Partial<StandardGraph> = {}): StandardGraph {
     eagerEventToolExecution: { enabled: true },
     eagerEventToolExecutions: new Map(),
     eagerEventToolUsageCount: new Map(),
+    eagerEventToolCallChunks: new Map(),
     handlerRegistry,
     hookRegistry: undefined,
     humanInTheLoop: undefined,
@@ -134,6 +135,119 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
       args: { city: 'NYC' },
     });
     expect(graph.toolCallStepIds.has('call_weather')).toBe(true);
+  });
+
+  it('waits for streamed tool-call chunks to form complete JSON args', async () => {
+    const graph = createGraph();
+    const toolExecuteCalls: t.ToolExecuteBatchRequest[] = [];
+    jest.spyOn(events, 'safeDispatchCustomEvent').mockImplementation(
+      async (event, data): Promise<void> => {
+        if (event !== GraphEvents.ON_TOOL_EXECUTE) {
+          return;
+        }
+        const batch = data as t.ToolExecuteBatchRequest;
+        toolExecuteCalls.push(batch);
+        batch.resolve([
+          {
+            toolCallId: 'call_weather',
+            status: 'success',
+            content: 'sunny',
+          },
+        ]);
+      }
+    );
+
+    const handler = new ChatModelStreamHandler();
+
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_weather',
+              name: 'weather',
+              args: {},
+            },
+          ],
+          tool_call_chunks: [
+            {
+              id: 'call_weather',
+              name: 'weather',
+              args: '',
+              index: 0,
+            },
+          ],
+        } as unknown as t.StreamChunk,
+      },
+      { langgraph_node: 'agent' },
+      graph
+    );
+
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_call_chunks: [
+            {
+              args: '{"city"',
+              index: 0,
+            },
+          ],
+        } as unknown as t.StreamChunk,
+      },
+      { langgraph_node: 'agent' },
+      graph
+    );
+
+    expect(toolExecuteCalls).toHaveLength(0);
+
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_call_chunks: [
+            {
+              args: '{"city"',
+              index: 0,
+            },
+          ],
+        } as unknown as t.StreamChunk,
+      },
+      { langgraph_node: 'agent' },
+      graph
+    );
+
+    expect(toolExecuteCalls).toHaveLength(0);
+
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_call_chunks: [
+            {
+              args: ':"NYC"}',
+              index: 0,
+            },
+          ],
+        } as unknown as t.StreamChunk,
+      },
+      { langgraph_node: 'agent' },
+      graph
+    );
+
+    expect(toolExecuteCalls).toHaveLength(1);
+    expect(toolExecuteCalls[0].toolCalls[0]).toMatchObject({
+      id: 'call_weather',
+      name: 'weather',
+      args: { city: 'NYC' },
+      stepId: expect.stringMatching(/^step_/),
+      turn: 0,
+    });
   });
 
   it('does not prestart when batch-sensitive hooks are configured', async () => {

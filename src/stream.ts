@@ -1,7 +1,7 @@
 // src/stream.ts
 import type { ChatOpenAIReasoningSummary } from '@langchain/openai';
 import type { AIMessageChunk } from '@langchain/core/messages';
-import type { ToolCall } from '@langchain/core/messages/tool';
+import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
 import type { AgentContext } from '@/agents/AgentContext';
 import type { StandardGraph } from '@/graphs';
 import type * as t from '@/types';
@@ -266,6 +266,110 @@ function startEagerToolExecution(args: {
   });
 }
 
+function getEagerToolChunkKey(toolCallChunk: ToolCallChunk): string | undefined {
+  if (typeof toolCallChunk.index === 'number') {
+    return String(toolCallChunk.index);
+  }
+  if (toolCallChunk.id != null && toolCallChunk.id !== '') {
+    return toolCallChunk.id;
+  }
+  return undefined;
+}
+
+function parseCompleteRecordArgs(
+  argsText: string
+): Record<string, unknown> | undefined {
+  if (argsText.trim() === '') {
+    return undefined;
+  }
+
+  try {
+    const parsed = JSON.parse(argsText) as unknown;
+    return coerceRecordArgs(parsed) ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function startEagerToolExecutionsFromChunks(args: {
+  graph: StandardGraph;
+  metadata?: Record<string, unknown>;
+  agentContext?: AgentContext;
+  toolCallChunks?: ToolCallChunk[];
+}): void {
+  const { graph, metadata, agentContext, toolCallChunks } = args;
+  if (toolCallChunks == null || toolCallChunks.length === 0) {
+    return;
+  }
+
+  for (const toolCallChunk of toolCallChunks) {
+    const key = getEagerToolChunkKey(toolCallChunk);
+    if (key == null) {
+      continue;
+    }
+
+    const existing = graph.eagerEventToolCallChunks.get(key) ?? {
+      argsText: '',
+    };
+    const id =
+      toolCallChunk.id != null && toolCallChunk.id !== ''
+        ? toolCallChunk.id
+        : existing.id;
+    const name =
+      toolCallChunk.name != null && toolCallChunk.name !== ''
+        ? toolCallChunk.name
+        : existing.name;
+    const argsDelta = toolCallChunk.args ?? '';
+    // Some live stream paths surface the same raw tool-call delta twice.
+    // Skipping exact consecutive duplicates keeps assembly conservative; if
+    // this ever drops a legitimate repeated token, final ToolNode arg matching
+    // will reject the stale eager result and fall back to normal dispatch.
+    const isDuplicateDelta =
+      argsDelta !== '' && existing.lastArgsDelta === argsDelta;
+    const argsText = isDuplicateDelta
+      ? existing.argsText
+      : `${existing.argsText}${argsDelta}`;
+    const next = {
+      id,
+      name,
+      argsText,
+      lastArgsDelta:
+        argsDelta !== '' && !isDuplicateDelta
+          ? argsDelta
+          : existing.lastArgsDelta,
+    };
+    graph.eagerEventToolCallChunks.set(key, next);
+
+    if (isDuplicateDelta) {
+      continue;
+    }
+
+    if (id == null || id === '' || name == null || name === '') {
+      continue;
+    }
+    if (graph.eagerEventToolExecutions.has(id)) {
+      continue;
+    }
+
+    const recordArgs = parseCompleteRecordArgs(argsText);
+    if (recordArgs == null) {
+      continue;
+    }
+
+    startEagerToolExecution({
+      graph,
+      metadata,
+      agentContext,
+      toolCall: {
+        id,
+        name,
+        args: recordArgs,
+        type: ToolCallTypes.TOOL_CALL,
+      },
+    });
+  }
+}
+
 export function getChunkContent({
   chunk,
   provider,
@@ -360,6 +464,8 @@ export class ChatModelStreamHandler implements t.EventHandler {
     }
     this.handleReasoning(chunk, agentContext);
     let hasToolCalls = false;
+    const hasToolCallChunks =
+      (chunk.tool_call_chunks && chunk.tool_call_chunks.length > 0) ?? false;
     if (
       chunk.tool_calls &&
       chunk.tool_calls.length > 0 &&
@@ -373,18 +479,18 @@ export class ChatModelStreamHandler implements t.EventHandler {
     ) {
       hasToolCalls = true;
       await handleToolCalls(chunk.tool_calls, metadata, graph);
-      for (const toolCall of chunk.tool_calls) {
-        startEagerToolExecution({
-          graph,
-          metadata,
-          agentContext,
-          toolCall,
-        });
+      if (!hasToolCallChunks) {
+        for (const toolCall of chunk.tool_calls) {
+          startEagerToolExecution({
+            graph,
+            metadata,
+            agentContext,
+            toolCall,
+          });
+        }
       }
     }
 
-    const hasToolCallChunks =
-      (chunk.tool_call_chunks && chunk.tool_call_chunks.length > 0) ?? false;
     const isEmptyContent =
       typeof content === 'undefined' ||
       !content.length ||
@@ -411,6 +517,12 @@ export class ChatModelStreamHandler implements t.EventHandler {
       chunk.tool_call_chunks.length &&
       typeof chunk.tool_call_chunks[0]?.index === 'number'
     ) {
+      startEagerToolExecutionsFromChunks({
+        graph,
+        metadata,
+        agentContext,
+        toolCallChunks: chunk.tool_call_chunks,
+      });
       await handleToolCallChunks({
         graph,
         stepKey,

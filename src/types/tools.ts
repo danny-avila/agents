@@ -51,6 +51,13 @@ export type EagerEventToolExecution = {
   promise: Promise<EagerEventToolExecutionOutcome>;
 };
 
+export type EagerEventToolCallChunkState = {
+  id?: string;
+  name?: string;
+  argsText: string;
+  lastArgsDelta?: string;
+};
+
 export type ToolNodeOptions = {
   name?: string;
   tags?: string[];
