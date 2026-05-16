@@ -308,17 +308,31 @@ function startEagerToolExecutionsFromChunks(args: {
       continue;
     }
 
-    const existing = graph.eagerEventToolCallChunks.get(key) ?? {
-      argsText: '',
-    };
-    const id =
+    const incomingId =
       toolCallChunk.id != null && toolCallChunk.id !== ''
         ? toolCallChunk.id
-        : existing.id;
-    const name =
+        : undefined;
+    const incomingName =
       toolCallChunk.name != null && toolCallChunk.name !== ''
         ? toolCallChunk.name
-        : existing.name;
+        : undefined;
+    const previous = graph.eagerEventToolCallChunks.get(key);
+    const shouldReset =
+      previous != null &&
+      ((incomingId != null && previous.id != null && incomingId !== previous.id) ||
+        (incomingName != null &&
+          previous.name != null &&
+          incomingName !== previous.name));
+    const existing =
+      previous == null || shouldReset
+        ? {
+          argsText: '',
+        }
+        : previous;
+    const id =
+      incomingId ?? existing.id;
+    const name =
+      incomingName ?? existing.name;
     const argsDelta = toolCallChunk.args ?? '';
     // Some live stream paths surface the same raw tool-call delta twice.
     // Skipping exact consecutive duplicates keeps assembly conservative; if
