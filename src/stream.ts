@@ -333,30 +333,13 @@ function startEagerToolExecutionsFromChunks(args: {
       incomingId ?? existing.id;
     const name =
       incomingName ?? existing.name;
-    const argsDelta = toolCallChunk.args ?? '';
-    // Some live stream paths surface the same raw tool-call delta twice.
-    // Skipping exact consecutive duplicates keeps assembly conservative; if
-    // this ever drops a legitimate repeated token, final ToolNode arg matching
-    // will reject the stale eager result and fall back to normal dispatch.
-    const isDuplicateDelta =
-      argsDelta !== '' && existing.lastArgsDelta === argsDelta;
-    const argsText = isDuplicateDelta
-      ? existing.argsText
-      : `${existing.argsText}${argsDelta}`;
+    const argsText = `${existing.argsText}${toolCallChunk.args ?? ''}`;
     const next = {
       id,
       name,
       argsText,
-      lastArgsDelta:
-        argsDelta !== '' && !isDuplicateDelta
-          ? argsDelta
-          : existing.lastArgsDelta,
     };
     graph.eagerEventToolCallChunks.set(key, next);
-
-    if (isDuplicateDelta) {
-      continue;
-    }
 
     if (id == null || id === '' || name == null || name === '') {
       continue;

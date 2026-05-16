@@ -211,25 +211,6 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
           content: '',
           tool_call_chunks: [
             {
-              args: '{"city"',
-              index: 0,
-            },
-          ],
-        } as unknown as t.StreamChunk,
-      },
-      { langgraph_node: 'agent' },
-      graph
-    );
-
-    expect(toolExecuteCalls).toHaveLength(0);
-
-    await handler.handle(
-      GraphEvents.CHAT_MODEL_STREAM,
-      {
-        chunk: {
-          content: '',
-          tool_call_chunks: [
-            {
               args: ':"NYC"}',
               index: 0,
             },
@@ -299,6 +280,111 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
       id: 'call_stock',
       name: 'stock',
       args: { ticker: 'CH' },
+      stepId: expect.stringMatching(/^step_/),
+      turn: 0,
+    });
+  });
+
+  it('preserves repeated adjacent argument deltas', async () => {
+    const graph = createGraph();
+    const toolExecuteCalls: t.ToolExecuteBatchRequest[] = [];
+    jest.spyOn(events, 'safeDispatchCustomEvent').mockImplementation(
+      async (event, data): Promise<void> => {
+        if (event !== GraphEvents.ON_TOOL_EXECUTE) {
+          return;
+        }
+        const batch = data as t.ToolExecuteBatchRequest;
+        toolExecuteCalls.push(batch);
+        batch.resolve([
+          {
+            toolCallId: 'call_repeat',
+            status: 'success',
+            content: 'ok',
+          },
+        ]);
+      }
+    );
+
+    const handler = new ChatModelStreamHandler();
+    const metadata = { langgraph_node: 'agent' };
+
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_call_chunks: [
+            {
+              id: 'call_repeat',
+              name: 'weather',
+              args: '{"word":"b',
+              index: 0,
+            },
+          ],
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_call_chunks: [
+            {
+              args: 'o',
+              index: 0,
+            },
+          ],
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_call_chunks: [
+            {
+              args: 'o',
+              index: 0,
+            },
+          ],
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+
+    expect(toolExecuteCalls).toHaveLength(0);
+
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_call_chunks: [
+            {
+              args: 'k"}',
+              index: 0,
+            },
+          ],
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+
+    expect(toolExecuteCalls).toHaveLength(1);
+    expect(toolExecuteCalls[0].toolCalls[0]).toMatchObject({
+      id: 'call_repeat',
+      name: 'weather',
+      args: { word: 'book' },
       stepId: expect.stringMatching(/^step_/),
       turn: 0,
     });
