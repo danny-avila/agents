@@ -3,6 +3,7 @@ import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
 import type * as t from './types';
 import { getAttribution, createDefaultLogger } from './utils';
 import { createTavilyAPI } from './tavily-search';
+import { createVolcEngineAPI } from './volcengine-search';
 import { BaseReranker } from './rerankers';
 
 const chunker = {
@@ -422,6 +423,9 @@ export const createSearchAPI = (
     tavilyApiKey,
     tavilySearchUrl,
     tavilySearchOptions,
+    volcengineApiKey,
+    volcengineSearchUrl,
+    volcengineSearchType,
   } = config;
 
   if (searchProvider.toLowerCase() === 'serper') {
@@ -430,9 +434,15 @@ export const createSearchAPI = (
     return createSearXNGAPI(searxngInstanceUrl, searxngApiKey);
   } else if (searchProvider.toLowerCase() === 'tavily') {
     return createTavilyAPI(tavilyApiKey, tavilySearchUrl, tavilySearchOptions);
+  } else if (searchProvider.toLowerCase() === 'volcengine') {
+    return createVolcEngineAPI(
+      volcengineApiKey,
+      volcengineSearchUrl,
+      volcengineSearchType
+    );
   } else {
     throw new Error(
-      `Invalid search provider: ${searchProvider}. Must be 'serper', 'searxng', or 'tavily'`
+      `Invalid search provider: ${searchProvider}. Must be 'serper', 'searxng', 'tavily', or 'volcengine'`
     );
   }
 };

@@ -338,6 +338,9 @@ export const createSearchTool = (
     tavilySearchUrl,
     tavilyExtractUrl,
     tavilySearchOptions,
+    volcengineApiKey,
+    volcengineSearchUrl,
+    volcengineSearchType,
     rerankerType = 'cohere',
     topResults = 5,
     strategies = ['no_extraction'],
@@ -393,6 +396,9 @@ export const createSearchTool = (
     tavilyApiKey,
     tavilySearchUrl,
     tavilySearchOptions: effectiveTavilySearchOptions,
+    volcengineApiKey,
+    volcengineSearchUrl,
+    volcengineSearchType,
   });
 
   /** Create scraper based on scraperProvider */
