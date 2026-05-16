@@ -514,17 +514,17 @@ export class ChatModelStreamHandler implements t.EventHandler {
       chunk.tool_call_chunks.length &&
       typeof chunk.tool_call_chunks[0]?.index === 'number'
     ) {
-      startEagerToolExecutionsFromChunks({
-        graph,
-        metadata,
-        agentContext,
-        toolCallChunks: chunk.tool_call_chunks,
-      });
       await handleToolCallChunks({
         graph,
         stepKey,
         toolCallChunks: chunk.tool_call_chunks,
         metadata,
+      });
+      startEagerToolExecutionsFromChunks({
+        graph,
+        metadata,
+        agentContext,
+        toolCallChunks: chunk.tool_call_chunks,
       });
     }
 
