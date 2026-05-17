@@ -23,6 +23,8 @@ import { getMessageId } from '@/messages';
 import { safeDispatchCustomEvent } from '@/utils/events';
 import { coerceRecordArgs, normalizeError } from '@/tools/eagerEventExecution';
 
+const processedChatModelStreamChunks = new WeakSet<object>();
+
 /**
  * Parses content to extract thinking sections enclosed in <think> tags using string operations
  * @param content The content to parse
@@ -291,6 +293,22 @@ function parseCompleteRecordArgs(
   }
 }
 
+function mergeToolCallArgsText(existing: string, incoming: string): string {
+  if (incoming === '') {
+    return existing;
+  }
+  if (existing === '') {
+    return incoming;
+  }
+  if (incoming.startsWith(existing)) {
+    return incoming;
+  }
+  if (existing.startsWith(incoming)) {
+    return existing;
+  }
+  return `${existing}${incoming}`;
+}
+
 function startEagerToolExecutionsFromChunks(args: {
   graph: StandardGraph;
   metadata?: Record<string, unknown>;
@@ -333,7 +351,10 @@ function startEagerToolExecutionsFromChunks(args: {
       incomingId ?? existing.id;
     const name =
       incomingName ?? existing.name;
-    const argsText = `${existing.argsText}${toolCallChunk.args ?? ''}`;
+    const argsText = mergeToolCallArgsText(
+      existing.argsText,
+      toolCallChunk.args ?? ''
+    );
     const next = {
       id,
       name,
@@ -445,6 +466,11 @@ export class ChatModelStreamHandler implements t.EventHandler {
     const agentContext = graph.getAgentContext(metadata);
 
     const chunk = data.chunk as Partial<AIMessageChunk>;
+    if (processedChatModelStreamChunks.has(chunk)) {
+      return;
+    }
+    processedChatModelStreamChunks.add(chunk);
+
     const content = getChunkContent({
       chunk,
       reasoningKey: agentContext.reasoningKey,
