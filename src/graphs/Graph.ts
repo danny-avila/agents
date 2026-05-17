@@ -424,6 +424,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
      * a stale reference on 2nd+ processStream calls.
      */
     this.toolCallStepIds.clear();
+    this.eagerEventToolExecutions.clear();
+    this.eagerEventToolUsageCount.clear();
     this.eagerEventToolCallChunks.clear();
     this.handlerDispatchedStepIds = resetIfNotEmpty(
       this.handlerDispatchedStepIds,
