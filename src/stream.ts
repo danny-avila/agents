@@ -284,21 +284,6 @@ function getEagerToolChunkKey(
   return `${stepKey}\u0000${chunkKey}`;
 }
 
-function parseCompleteRecordArgs(
-  argsText: string
-): Record<string, unknown> | undefined {
-  if (argsText.trim() === '') {
-    return undefined;
-  }
-
-  try {
-    const parsed = JSON.parse(argsText) as unknown;
-    return coerceRecordArgs(parsed) ?? undefined;
-  } catch {
-    return undefined;
-  }
-}
-
 function mergeToolCallArgsText(existing: string, incoming: string): string {
   if (incoming === '') {
     return existing;
@@ -312,21 +297,28 @@ function mergeToolCallArgsText(existing: string, incoming: string): string {
   if (existing.startsWith(incoming)) {
     return existing;
   }
+  try {
+    JSON.parse(existing);
+    JSON.parse(incoming);
+    return incoming;
+  } catch {
+    // Fall through to delta concatenation.
+  }
   return `${existing}${incoming}`;
 }
 
-function startEagerToolExecutionsFromChunks(args: {
+function recordEagerToolCallChunks(args: {
   graph: StandardGraph;
   stepKey: string;
-  metadata?: Record<string, unknown>;
-  agentContext?: AgentContext;
   toolCallChunks?: ToolCallChunk[];
 }): void {
-  const { graph, stepKey, metadata, agentContext, toolCallChunks } = args;
+  const { graph, stepKey, toolCallChunks } = args;
   if (toolCallChunks == null || toolCallChunks.length === 0) {
     return;
   }
 
+  // Streamed args can be cumulative and parseable before the provider has
+  // emitted the final call; dispatch only happens from complete tool_calls.
   for (const toolCallChunk of toolCallChunks) {
     const key = getEagerToolChunkKey(stepKey, toolCallChunk);
     if (key == null) {
@@ -368,30 +360,6 @@ function startEagerToolExecutionsFromChunks(args: {
       argsText,
     };
     graph.eagerEventToolCallChunks.set(key, next);
-
-    if (id == null || id === '' || name == null || name === '') {
-      continue;
-    }
-    if (graph.eagerEventToolExecutions.has(id)) {
-      continue;
-    }
-
-    const recordArgs = parseCompleteRecordArgs(argsText);
-    if (recordArgs == null) {
-      continue;
-    }
-
-    startEagerToolExecution({
-      graph,
-      metadata,
-      agentContext,
-      toolCall: {
-        id,
-        name,
-        args: recordArgs,
-        type: ToolCallTypes.TOOL_CALL,
-      },
-    });
   }
 }
 
@@ -553,11 +521,9 @@ export class ChatModelStreamHandler implements t.EventHandler {
         toolCallChunks: chunk.tool_call_chunks,
         metadata,
       });
-      startEagerToolExecutionsFromChunks({
+      recordEagerToolCallChunks({
         graph,
         stepKey,
-        metadata,
-        agentContext,
         toolCallChunks: chunk.tool_call_chunks,
       });
     }
