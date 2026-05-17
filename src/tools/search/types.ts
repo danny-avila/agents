@@ -3,7 +3,7 @@ import type { RunnableConfig } from '@langchain/core/runnables';
 import type { BaseReranker } from './rerankers';
 import { DATE_RANGE } from './schema';
 
-export type SearchProvider = 'serper' | 'searxng' | 'tavily';
+export type SearchProvider = 'serper' | 'searxng' | 'tavily' | 'volcengine';
 export type ScraperProvider = 'firecrawl' | 'serper' | 'tavily';
 export type RerankerType = 'infinity' | 'jina' | 'cohere' | 'none';
 
@@ -115,6 +115,9 @@ export interface SearchConfig {
   tavilySearchUrl?: string;
   tavilyExtractUrl?: string;
   tavilySearchOptions?: TavilySearchOptions;
+  volcengineApiKey?: string;
+  volcengineSearchUrl?: string;
+  volcengineSearchType?: 'web' | 'web_summary';
 }
 
 export type References = {

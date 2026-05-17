@@ -7,13 +7,11 @@ on:
   workflow_dispatch:
 
 permissions:
-  id-token: write # Required for OIDC trusted publishing
   contents: read
 
 jobs:
   publish:
     runs-on: ubuntu-latest
-    environment: publish # Must match npm trusted publisher config
     steps:
       - uses: actions/checkout@v4
 
@@ -217,6 +215,7 @@ jobs:
 
       - name: Publish
         if: steps.check.outputs.skip != 'true'
-        run: npm publish $(ls librechat-agents-*.tgz) --access public --provenance --tag ${{ steps.publish_tag.outputs.tag }}
+        run: npm publish $(ls librechat-agents-*.tgz) --access public --tag ${{ steps.publish_tag.outputs.tag }}
         env:
           NODE_ENV: production
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
