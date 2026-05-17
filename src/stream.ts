@@ -268,14 +268,20 @@ function startEagerToolExecution(args: {
   });
 }
 
-function getEagerToolChunkKey(toolCallChunk: ToolCallChunk): string | undefined {
+function getEagerToolChunkKey(
+  stepKey: string,
+  toolCallChunk: ToolCallChunk
+): string | undefined {
+  let chunkKey: string | undefined;
   if (typeof toolCallChunk.index === 'number') {
-    return String(toolCallChunk.index);
+    chunkKey = String(toolCallChunk.index);
+  } else if (toolCallChunk.id != null && toolCallChunk.id !== '') {
+    chunkKey = toolCallChunk.id;
   }
-  if (toolCallChunk.id != null && toolCallChunk.id !== '') {
-    return toolCallChunk.id;
+  if (chunkKey == null) {
+    return undefined;
   }
-  return undefined;
+  return `${stepKey}\u0000${chunkKey}`;
 }
 
 function parseCompleteRecordArgs(
@@ -311,17 +317,18 @@ function mergeToolCallArgsText(existing: string, incoming: string): string {
 
 function startEagerToolExecutionsFromChunks(args: {
   graph: StandardGraph;
+  stepKey: string;
   metadata?: Record<string, unknown>;
   agentContext?: AgentContext;
   toolCallChunks?: ToolCallChunk[];
 }): void {
-  const { graph, metadata, agentContext, toolCallChunks } = args;
+  const { graph, stepKey, metadata, agentContext, toolCallChunks } = args;
   if (toolCallChunks == null || toolCallChunks.length === 0) {
     return;
   }
 
   for (const toolCallChunk of toolCallChunks) {
-    const key = getEagerToolChunkKey(toolCallChunk);
+    const key = getEagerToolChunkKey(stepKey, toolCallChunk);
     if (key == null) {
       continue;
     }
@@ -548,6 +555,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
       });
       startEagerToolExecutionsFromChunks({
         graph,
+        stepKey,
         metadata,
         agentContext,
         toolCallChunks: chunk.tool_call_chunks,
