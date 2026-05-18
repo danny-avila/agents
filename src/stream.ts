@@ -24,10 +24,6 @@ import { getMessageId } from '@/messages';
 import { safeDispatchCustomEvent } from '@/utils/events';
 import { coerceRecordArgs, normalizeError } from '@/tools/eagerEventExecution';
 
-const processedChatModelStreamChunks = new WeakMap<
-  StandardGraph,
-  WeakMap<object, string>
->();
 const LOCAL_CODING_BUNDLE_NAME_SET: ReadonlySet<string> = new Set(
   LOCAL_CODING_BUNDLE_NAMES
 );
@@ -98,50 +94,6 @@ function isBatchSensitiveToolExecution(graph: StandardGraph): boolean {
     graph.humanInTheLoop?.enabled === true ||
     graph.toolOutputReferences?.enabled === true
   );
-}
-
-function stringifyChunkDedupePart(value: unknown): string {
-  if (value == null) {
-    return '';
-  }
-  if (typeof value === 'string') {
-    return value;
-  }
-  try {
-    return String(JSON.stringify(value));
-  } catch {
-    return String(value);
-  }
-}
-
-function getChunkDedupeSignature(chunk: Partial<AIMessageChunk>): string {
-  return [
-    stringifyChunkDedupePart(chunk.id),
-    stringifyChunkDedupePart(chunk.content),
-    stringifyChunkDedupePart(chunk.additional_kwargs),
-    stringifyChunkDedupePart(chunk.tool_calls),
-    stringifyChunkDedupePart(chunk.tool_call_chunks),
-  ].join('\u0000');
-}
-
-function shouldSkipProcessedChunk(args: {
-  graph: StandardGraph;
-  chunk: Partial<AIMessageChunk>;
-}): boolean {
-  const { graph, chunk } = args;
-  let graphChunks = processedChatModelStreamChunks.get(graph);
-  if (graphChunks == null) {
-    graphChunks = new WeakMap<object, string>();
-    processedChatModelStreamChunks.set(graph, graphChunks);
-  }
-
-  const signature = getChunkDedupeSignature(chunk);
-  if (graphChunks.get(chunk) === signature) {
-    return true;
-  }
-
-  graphChunks.set(chunk, signature);
-  return false;
 }
 
 function isDirectGraphTool(
@@ -542,9 +494,6 @@ export class ChatModelStreamHandler implements t.EventHandler {
     const agentContext = graph.getAgentContext(metadata);
 
     const chunk = data.chunk as Partial<AIMessageChunk>;
-    if (shouldSkipProcessedChunk({ graph, chunk })) {
-      return;
-    }
 
     const content = getChunkContent({
       chunk,

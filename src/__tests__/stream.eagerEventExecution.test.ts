@@ -2,7 +2,13 @@ import { describe, it, expect, jest, afterEach } from '@jest/globals';
 import type { AgentContext } from '@/agents/AgentContext';
 import type { StandardGraph } from '@/graphs';
 import type * as t from '@/types';
-import { Constants, GraphEvents, Providers, StepTypes } from '@/common';
+import {
+  Constants,
+  ContentTypes,
+  GraphEvents,
+  Providers,
+  StepTypes,
+} from '@/common';
 import { HandlerRegistry } from '@/events';
 import * as events from '@/utils/events';
 import { ChatModelStreamHandler } from '@/stream';
@@ -723,106 +729,112 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     });
   });
 
-  it('ignores duplicate handling of the same stream chunk object', async () => {
+  it('preserves repeated deltas from a reused stream chunk object', async () => {
     const graph = createGraph();
-    const toolExecuteCalls: t.ToolExecuteBatchRequest[] = [];
-    jest.spyOn(events, 'safeDispatchCustomEvent').mockImplementation(
-      async (event, data): Promise<void> => {
-        if (event !== GraphEvents.ON_TOOL_EXECUTE) {
-          return;
-        }
-        const batch = data as t.ToolExecuteBatchRequest;
-        toolExecuteCalls.push(batch);
-        batch.resolve([
-          {
-            toolCallId: 'call_weather',
-            status: 'success',
-            content: 'sunny',
-          },
-        ]);
-      }
-    );
-
     const handler = new ChatModelStreamHandler();
     const metadata = { langgraph_node: 'agent' };
-    const startChunk = {
+    const reusableToolChunk: {
+      id?: string;
+      name?: string;
+      args: string;
+      index: number;
+    } = {
+      id: 'call_repeat',
+      name: 'weather',
+      args: '{"word":"b',
+      index: 0,
+    };
+    const reusableChunk = {
       content: '',
-      tool_call_chunks: [
-        {
-          id: 'call_weather',
-          name: 'weather',
-          args: '{"city"',
-          index: 0,
-        },
-      ],
-    } as unknown as t.StreamChunk;
-    const finalChunk = {
-      content: '',
-      tool_call_chunks: [
-        {
-          args: ':"NYC"}',
-          index: 0,
-        },
-      ],
+      tool_call_chunks: [reusableToolChunk],
     } as unknown as t.StreamChunk;
 
     await handler.handle(
       GraphEvents.CHAT_MODEL_STREAM,
-      { chunk: startChunk },
-      metadata,
-      graph
-    );
-    await handler.handle(
-      GraphEvents.CHAT_MODEL_STREAM,
-      { chunk: startChunk },
-      metadata,
-      graph
-    );
-    await handler.handle(
-      GraphEvents.CHAT_MODEL_STREAM,
-      { chunk: finalChunk },
-      metadata,
-      graph
-    );
-    await handler.handle(
-      GraphEvents.CHAT_MODEL_STREAM,
-      { chunk: finalChunk },
+      { chunk: reusableChunk },
       metadata,
       graph
     );
 
-    expect(toolExecuteCalls).toHaveLength(0);
+    reusableToolChunk.id = undefined;
+    reusableToolChunk.name = undefined;
+    reusableToolChunk.args = 'o';
+
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      { chunk: reusableChunk },
+      metadata,
+      graph
+    );
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      { chunk: reusableChunk },
+      metadata,
+      graph
+    );
+
+    reusableToolChunk.args = 'k"}';
+
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      { chunk: reusableChunk },
+      metadata,
+      graph
+    );
+
     expect(
       graph.eagerEventToolCallChunks.get(chunkStateKey('step-key', 0))
         ?.argsText
-    ).toBe('{"city":"NYC"}');
+    ).toBe('{"word":"book"}');
+  });
+
+  it('preserves repeated text deltas from a reused stream chunk object', async () => {
+    const dispatchMessageDelta = jest.fn<StandardGraph['dispatchMessageDelta']>(
+      async () => undefined
+    );
+    const graph = createGraph({
+      dispatchMessageDelta,
+      getAgentContext: jest.fn(
+        (): Partial<AgentContext> => ({
+          provider: Providers.OPENAI,
+          reasoningKey: 'reasoning_content',
+          currentTokenType: ContentTypes.TEXT,
+          toolDefinitions: [],
+          graphTools: [],
+          agentId: 'agent_1',
+        })
+      ) as unknown as StandardGraph['getAgentContext'],
+    });
+    const handler = new ChatModelStreamHandler();
+    const metadata = { langgraph_node: 'agent' };
+    const reusableChunk = { content: 'ha' } as unknown as t.StreamChunk;
 
     await handler.handle(
       GraphEvents.CHAT_MODEL_STREAM,
-      {
-        chunk: {
-          content: '',
-          tool_calls: [
-            {
-              id: 'call_weather',
-              name: 'weather',
-              args: { city: 'NYC' },
-            },
-          ],
-        } as unknown as t.StreamChunk,
-      },
+      { chunk: reusableChunk },
+      metadata,
+      graph
+    );
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      { chunk: reusableChunk },
       metadata,
       graph
     );
 
-    expect(toolExecuteCalls).toHaveLength(1);
-    expect(toolExecuteCalls[0].toolCalls[0]).toMatchObject({
-      id: 'call_weather',
-      name: 'weather',
-      args: { city: 'NYC' },
-      stepId: expect.stringMatching(/^step_/),
-      turn: 0,
-    });
+    expect(dispatchMessageDelta).toHaveBeenCalledTimes(2);
+    expect(dispatchMessageDelta).toHaveBeenNthCalledWith(
+      1,
+      expect.stringMatching(/^step_/),
+      { content: [{ type: ContentTypes.TEXT, text: 'ha' }] },
+      metadata
+    );
+    expect(dispatchMessageDelta).toHaveBeenNthCalledWith(
+      2,
+      expect.stringMatching(/^step_/),
+      { content: [{ type: ContentTypes.TEXT, text: 'ha' }] },
+      metadata
+    );
   });
 
   it('processes a reused chunk object when its streamed payload changes', async () => {
@@ -849,12 +861,6 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
 
     reusableToolChunk.args = ':"NYC"}';
 
-    await handler.handle(
-      GraphEvents.CHAT_MODEL_STREAM,
-      { chunk: reusableChunk },
-      metadata,
-      graph
-    );
     await handler.handle(
       GraphEvents.CHAT_MODEL_STREAM,
       { chunk: reusableChunk },
