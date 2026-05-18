@@ -58,6 +58,7 @@ describe('ToolNode eager event tool execution', () => {
   it('uses a matching prestarted event result without redispatching the tool', async () => {
     const { toolExecuteCalls } = installToolExecuteResponder('redispatched');
     const eagerExecutions = new Map<string, t.EagerEventToolExecution>();
+    const eagerUsageCount = new Map<string, number>([['weather', 1]]);
     const request: t.ToolCallRequest = {
       id: 'call_weather',
       name: 'weather',
@@ -86,6 +87,7 @@ describe('ToolNode eager event tool execution', () => {
       eventDrivenMode: true,
       eagerEventToolExecution: { enabled: true },
       eagerEventToolExecutions: eagerExecutions,
+      eagerEventToolUsageCount: eagerUsageCount,
       toolCallStepIds: new Map([['call_weather', 'step_weather']]),
     });
 
@@ -94,6 +96,7 @@ describe('ToolNode eager event tool execution', () => {
     })) as { messages: ToolMessage[] };
 
     expect(toolExecuteCalls).toHaveLength(0);
+    expect(eagerUsageCount.get('weather')).toBe(1);
     expect(eagerExecutions.has('call_weather')).toBe(false);
     expect(result.messages).toHaveLength(1);
     expect(result.messages[0].content).toBe('eager result');
@@ -144,5 +147,33 @@ describe('ToolNode eager event tool execution', () => {
     expect(result.messages).toHaveLength(1);
     expect(result.messages[0].status).toBe('error');
     expect(result.messages[0].content).toContain('refusing to re-run');
+  });
+
+  it('increments the shared eager turn counter for normal event dispatch', async () => {
+    const { toolExecuteCalls } = installToolExecuteResponder('normal result');
+    const eagerUsageCount = new Map<string, number>();
+
+    const toolNode = new ToolNode({
+      tools: [createDummyTool('weather')],
+      eventDrivenMode: true,
+      eagerEventToolExecution: { enabled: true },
+      eagerEventToolExecutions: new Map(),
+      eagerEventToolUsageCount: eagerUsageCount,
+      toolCallStepIds: new Map([['call_weather', 'step_weather']]),
+    });
+
+    const result = (await toolNode.invoke({
+      messages: [createAIMessage('call_weather', 'weather', { city: 'NYC' })],
+    })) as { messages: ToolMessage[] };
+
+    expect(toolExecuteCalls).toHaveLength(1);
+    expect(toolExecuteCalls[0].toolCalls[0]).toMatchObject({
+      id: 'call_weather',
+      name: 'weather',
+      turn: 0,
+    });
+    expect(eagerUsageCount.get('weather')).toBe(1);
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0].content).toBe('normal result');
   });
 });

@@ -83,6 +83,8 @@ export type ToolNodeOptions = {
   eagerEventToolExecution?: EagerEventToolExecutionConfig;
   /** Shared per-run eager execution registry populated by the stream handler. */
   eagerEventToolExecutions?: Map<string, EagerEventToolExecution>;
+  /** Shared per-run per-tool turn counter used by eager and normal event dispatch. */
+  eagerEventToolUsageCount?: Map<string, number>;
   /**
    * Hook registry for PreToolUse/PostToolUse/PostToolUseFailure/
    * PermissionDenied lifecycle hooks. Fires for **every** tool the

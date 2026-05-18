@@ -418,6 +418,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private eagerEventToolExecution?: t.EagerEventToolExecutionConfig;
   /** Shared per-run prestarted tool registry populated by ChatModelStreamHandler. */
   private eagerEventToolExecutions?: Map<string, t.EagerEventToolExecution>;
+  /** Shared per-run per-tool turn counter used by eager and normal event dispatch. */
+  private eagerEventToolUsageCount?: Map<string, number>;
   /** Agent ID for event-driven mode */
   private agentId?: string;
   /** Tool names that bypass event dispatch and execute directly (e.g., graph-managed handoff tools) */
@@ -476,6 +478,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     eventDrivenMode,
     eagerEventToolExecution,
     eagerEventToolExecutions,
+    eagerEventToolUsageCount,
     agentId,
     directToolNames,
     maxContextTokens,
@@ -502,6 +505,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     this.eventDrivenMode = eventDrivenMode ?? false;
     this.eagerEventToolExecution = eagerEventToolExecution;
     this.eagerEventToolExecutions = eagerEventToolExecutions;
+    this.eagerEventToolUsageCount = eagerEventToolUsageCount;
     this.agentId = agentId;
     this.directToolNames = directToolNames;
     this.maxToolResultChars =
@@ -705,6 +709,31 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
    */
   public getToolUsageCounts(): ReadonlyMap<string, number> {
     return new Map(this.toolUsageCount); // Return a copy
+  }
+
+  private recordToolUsageTurn(
+    toolName: string,
+    turn: number,
+    callId?: string
+  ): void {
+    this.toolUsageCount.set(
+      toolName,
+      Math.max(this.toolUsageCount.get(toolName) ?? 0, turn + 1)
+    );
+    if (callId != null && callId !== '') {
+      this.toolCallTurns.set(callId, turn);
+    }
+  }
+
+  private claimEventToolUsageTurn(
+    toolName: string,
+    callId?: string
+  ): number {
+    const counter = this.eagerEventToolUsageCount ?? this.toolUsageCount;
+    const turn = counter.get(toolName) ?? 0;
+    counter.set(toolName, turn + 1);
+    this.recordToolUsageTurn(toolName, turn, callId);
+    return turn;
   }
 
   /**
@@ -2341,8 +2370,20 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
     if (approvedEntries.length > 0) {
       const requests: t.ToolCallRequest[] = approvedEntries.map((entry) => {
-        const turn = this.toolUsageCount.get(entry.call.name) ?? 0;
-        this.toolUsageCount.set(entry.call.name, turn + 1);
+        const prestartedExecution =
+          this.canConsumeEagerEventExecution() && entry.call.id != null
+            ? this.eagerEventToolExecutions?.get(entry.call.id)
+            : undefined;
+        const turn =
+          prestartedExecution?.request.turn ??
+          this.claimEventToolUsageTurn(entry.call.name, entry.call.id);
+        if (prestartedExecution?.request.turn != null) {
+          this.recordToolUsageTurn(
+            entry.call.name,
+            prestartedExecution.request.turn,
+            entry.call.id
+          );
+        }
 
         if (entry.batchIndex != null && entry.call.id != null) {
           batchIndexByCallId.set(entry.call.id, entry.batchIndex);

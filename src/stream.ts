@@ -13,6 +13,7 @@ import {
   Providers,
   Constants,
   CODE_EXECUTION_TOOLS,
+  LOCAL_CODING_BUNDLE_NAMES,
 } from '@/common';
 import {
   handleServerToolResult,
@@ -24,6 +25,9 @@ import { safeDispatchCustomEvent } from '@/utils/events';
 import { coerceRecordArgs, normalizeError } from '@/tools/eagerEventExecution';
 
 const processedChatModelStreamChunks = new WeakSet<object>();
+const LOCAL_CODING_BUNDLE_NAME_SET: ReadonlySet<string> = new Set(
+  LOCAL_CODING_BUNDLE_NAMES
+);
 
 /**
  * Parses content to extract thinking sections enclosed in <think> tags using string operations
@@ -107,6 +111,16 @@ function isDirectGraphTool(
   );
 }
 
+function isDirectLocalTool(name: string, graph: StandardGraph): boolean {
+  if (graph.toolExecution?.engine !== 'local') {
+    return false;
+  }
+  if (graph.toolExecution.local?.includeCodingTools === false) {
+    return CODE_EXECUTION_TOOLS.has(name);
+  }
+  return LOCAL_CODING_BUNDLE_NAME_SET.has(name);
+}
+
 function toCodeEnvFile(file: t.FileRef, execSessionId: string): t.CodeEnvFile {
   const base = {
     id: file.id,
@@ -180,7 +194,8 @@ function shouldAttemptEagerToolExecution(args: {
     toolCall.id == null ||
     toolCall.id === '' ||
     toolCall.name === '' ||
-    isDirectGraphTool(toolCall.name, agentContext)
+    isDirectGraphTool(toolCall.name, agentContext) ||
+    isDirectLocalTool(toolCall.name, graph)
   ) {
     return false;
   }

@@ -731,6 +731,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         humanInTheLoop: this.humanInTheLoop,
         eagerEventToolExecution: this.eagerEventToolExecution,
         eagerEventToolExecutions: this.eagerEventToolExecutions,
+        eagerEventToolUsageCount: this.eagerEventToolUsageCount,
         toolExecution: this.toolExecution,
         directToolNames: directToolNames.size > 0 ? directToolNames : undefined,
         maxContextTokens: agentContext?.maxContextTokens,
