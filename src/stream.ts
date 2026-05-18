@@ -201,7 +201,9 @@ function isEagerToolExecutionEnabledForBatch(args: {
 }
 
 function hasFinalToolCallSignal(chunk: Partial<AIMessageChunk>): boolean {
-  const metadata = chunk.response_metadata as Record<string, unknown> | undefined;
+  const metadata = chunk.response_metadata as
+    | Record<string, unknown>
+    | undefined;
   const finishReason =
     metadata?.finish_reason ??
     metadata?.finishReason ??
@@ -222,9 +224,11 @@ function canPrestartSequentialStreamedToolChunks(
 function hasExplicitStreamedToolCallSeals(
   chunk: Partial<AIMessageChunk>
 ): boolean {
-  return getStreamedToolCallAdapter(
-    chunk.response_metadata as Record<string, unknown> | undefined
-  ) != null;
+  return (
+    getStreamedToolCallAdapter(
+      chunk.response_metadata as Record<string, unknown> | undefined
+    ) != null
+  );
 }
 
 function hasDirectToolCallInBatch(args: {
@@ -273,7 +277,13 @@ function createEagerToolExecutionPlan(args: {
   toolCalls: ToolCall[];
   skipExisting?: boolean;
 }): EagerToolExecutionEntry[] | undefined {
-  const { graph, metadata, agentContext, toolCalls, skipExisting = false } = args;
+  const {
+    graph,
+    metadata,
+    agentContext,
+    toolCalls,
+    skipExisting = false,
+  } = args;
   if (
     !isEagerToolExecutionEnabledForBatch({
       graph,
@@ -329,12 +339,14 @@ function createEagerToolExecutionPlan(args: {
     return undefined;
   }
 
-  return plan.requests.map((request): EagerToolExecutionEntry => ({
-    id: request.id,
-    toolName: request.name,
-    coercedArgs: request.args,
-    request,
-  }));
+  return plan.requests.map(
+    (request): EagerToolExecutionEntry => ({
+      id: request.id,
+      toolName: request.name,
+      coercedArgs: request.args,
+      request,
+    })
+  );
 }
 
 function startEagerToolExecutions(args: {
@@ -359,6 +371,14 @@ function startEagerToolExecutions(args: {
   const promise: Promise<t.EagerEventToolExecutionOutcome> = new Promise<
     t.ToolExecuteResult[]
   >((resolve, reject) => {
+    let dispatchSettled = false;
+    let resultSettled = false;
+    let settledResults: t.ToolExecuteResult[] | undefined;
+    const maybeResolve = (): void => {
+      if (dispatchSettled && resultSettled) {
+        resolve(settledResults ?? []);
+      }
+    };
     const batchRequest: t.ToolExecuteBatchRequest = {
       toolCalls: entries.map((entry) => entry.request),
       userId: graph.config?.configurable?.user_id as string | undefined,
@@ -367,15 +387,24 @@ function startEagerToolExecutions(args: {
         | Record<string, unknown>
         | undefined,
       metadata,
-      resolve,
+      resolve: (results): void => {
+        resultSettled = true;
+        settledResults = results;
+        maybeResolve();
+      },
       reject,
     };
 
-    safeDispatchCustomEvent(
+    void safeDispatchCustomEvent(
       GraphEvents.ON_TOOL_EXECUTE,
       batchRequest,
       graph.config
-    );
+    )
+      .then(() => {
+        dispatchSettled = true;
+        maybeResolve();
+      })
+      .catch(reject);
   }).then(
     (results): t.EagerEventToolExecutionOutcome => ({ results }),
     (error): t.EagerEventToolExecutionOutcome => ({
@@ -410,8 +439,12 @@ function getEagerToolChunkKey(
   return `${stepKey}\u0000${chunkKey}`;
 }
 
-function getEagerToolChunkIndex(toolCallChunk: ToolCallChunk): number | undefined {
-  return typeof toolCallChunk.index === 'number' ? toolCallChunk.index : undefined;
+function getEagerToolChunkIndex(
+  toolCallChunk: ToolCallChunk
+): number | undefined {
+  return typeof toolCallChunk.index === 'number'
+    ? toolCallChunk.index
+    : undefined;
 }
 
 function pruneEagerToolCallChunkStates(args: {
@@ -426,7 +459,10 @@ function pruneEagerToolCallChunkStates(args: {
     if (!key.startsWith(prefix)) {
       continue;
     }
-    if (clearStep || (state.id != null && toolCallIds?.has(state.id) === true)) {
+    if (
+      clearStep ||
+      (state.id != null && toolCallIds?.has(state.id) === true)
+    ) {
       graph.eagerEventToolCallChunks.delete(key);
     }
   }
@@ -514,7 +550,9 @@ function recordEagerToolCallChunks(args: {
     const previous = graph.eagerEventToolCallChunks.get(key);
     const shouldReset =
       previous != null &&
-      ((incomingId != null && previous.id != null && incomingId !== previous.id) ||
+      ((incomingId != null &&
+        previous.id != null &&
+        incomingId !== previous.id) ||
         (incomingName != null &&
           previous.name != null &&
           incomingName !== previous.name));
@@ -524,10 +562,8 @@ function recordEagerToolCallChunks(args: {
           argsText: '',
         }
         : previous;
-    const id =
-      incomingId ?? existing.id;
-    const name =
-      incomingName ?? existing.name;
+    const id = incomingId ?? existing.id;
+    const name = incomingName ?? existing.name;
     const incomingArgs = toolCallChunk.args ?? '';
     const isRepeatedObservedFragment =
       incomingArgs !== '' &&
@@ -624,9 +660,7 @@ function getStreamedReadyToolCalls(args: {
   }
 
   return readyEntries
-    .sort(
-      (left, right) => (left.state.index ?? 0) - (right.state.index ?? 0)
-    )
+    .sort((left, right) => (left.state.index ?? 0) - (right.state.index ?? 0))
     .flatMap(({ state }) => {
       const args = coerceRecordArgs(state.argsText);
       if (args == null) {

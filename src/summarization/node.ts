@@ -1137,7 +1137,7 @@ function createSummarizationChunkHandler({
         ? [{ type: ContentTypes.TEXT, text: raw } as t.MessageContentComplex]
         : raw;
 
-    safeDispatchCustomEvent(
+    void safeDispatchCustomEvent(
       GraphEvents.ON_SUMMARIZE_DELTA,
       {
         id: stepId,

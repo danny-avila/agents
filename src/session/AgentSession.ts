@@ -17,6 +17,7 @@ import type {
   AgentSessionStream,
   AgentSessionStreamEvent,
   SessionBranchOptions,
+  SessionCheckpointEntry,
   SessionCompactOptions,
   SessionEntry,
   SessionForkOptions,
@@ -332,6 +333,23 @@ function getConfigString(
   return typeof value === 'string' && value !== '' ? value : undefined;
 }
 
+function getConfigOptionalString(
+  config: RunnableConfig | undefined,
+  key: string
+): string | undefined {
+  const configurable = config?.configurable as
+    | Partial<Record<string, unknown>>
+    | undefined;
+  if (
+    configurable == null ||
+    !Object.prototype.hasOwnProperty.call(configurable, key)
+  ) {
+    return undefined;
+  }
+  const value = configurable[key];
+  return typeof value === 'string' ? value : undefined;
+}
+
 function createCallerConfig(
   threadId: string,
   options: AgentSessionRunOptions
@@ -362,6 +380,61 @@ function createCheckpointLookupConfig(config: RunnableConfig): RunnableConfig {
       ...(checkpointId != null ? { checkpoint_id: checkpointId } : {}),
     },
   };
+}
+
+function applyCheckpointReferenceToConfig<
+  TConfig extends RunnableConfig & { version?: 'v1' | 'v2' },
+>(
+  config: TConfig,
+  checkpoint:
+    | {
+        checkpointId?: string;
+        checkpointNs?: string;
+      }
+    | undefined,
+  options?: { overwrite?: boolean }
+): TConfig {
+  if (
+    checkpoint?.checkpointId == null ||
+    checkpoint.checkpointId === '' ||
+    (options?.overwrite !== true &&
+      getConfigString(config, 'checkpoint_id') != null)
+  ) {
+    return config;
+  }
+  return {
+    ...config,
+    configurable: {
+      ...config.configurable,
+      checkpoint_id: checkpoint.checkpointId,
+      checkpoint_ns: checkpoint.checkpointNs ?? '',
+    },
+  };
+}
+
+function getStoredCheckpointForConfig(
+  store: JsonlSessionStore | undefined,
+  threadId: string,
+  config: RunnableConfig
+): SessionCheckpointEntry | undefined {
+  const requestedCheckpointNs = getConfigOptionalString(
+    config,
+    'checkpoint_ns'
+  );
+  if (requestedCheckpointNs == null) {
+    return store?.getLatestCheckpoint(threadId);
+  }
+  const checkpoints = store?.getCheckpoints(threadId) ?? [];
+  for (let i = checkpoints.length - 1; i >= 0; i--) {
+    const checkpoint = checkpoints[i];
+    if (checkpoint.data.source === 'reset') {
+      return undefined;
+    }
+    if ((checkpoint.data.checkpointNs ?? '') === requestedCheckpointNs) {
+      return checkpoint;
+    }
+  }
+  return undefined;
 }
 
 function createLatestCheckpointLookupConfig(
@@ -816,14 +889,30 @@ export class AgentSession {
     runId: string;
     threadId: string;
     config: RunnableConfig;
+    checkpointId?: string;
+    checkpointNs?: string;
   }): Promise<void> {
     if (!this.checkpointing.enabled) {
       return;
     }
-    const tuple = await getLatestCheckpointTuple(
-      this.checkpointing.checkpointer,
-      params.config
+    const checkpointConfig = applyCheckpointReferenceToConfig(
+      params.config,
+      {
+        checkpointId: params.checkpointId,
+        checkpointNs: params.checkpointNs,
+      },
+      { overwrite: true }
     );
+    const tuple =
+      params.checkpointId != null && params.checkpointId !== ''
+        ? await getSelectedCheckpointTuple(
+          this.checkpointing.checkpointer,
+          checkpointConfig
+        )
+        : await getLatestCheckpointTuple(
+          this.checkpointing.checkpointer,
+          params.config
+        );
     if (!tuple) {
       return;
     }
@@ -974,6 +1063,8 @@ export class AgentSession {
         runId,
         threadId,
         config: callerConfig,
+        checkpointId: interrupt?.checkpointId,
+        checkpointNs: interrupt?.checkpointNs,
       });
       const contentParts = (content ?? handlerResult.contentParts).filter(
         (part): part is t.MessageContentComplex => part != null
@@ -1235,7 +1326,11 @@ export class AgentSession {
     const runId = options.runId ?? createRunId();
     const threadId = options.threadId ?? this.threadId;
     const isSessionThread = threadId === this.threadId;
-    const callerConfig = createCallerConfig(threadId, options);
+    const baseCallerConfig = createCallerConfig(threadId, options);
+    const callerConfig = applyCheckpointReferenceToConfig(
+      baseCallerConfig,
+      getStoredCheckpointForConfig(this.store, threadId, baseCallerConfig)?.data
+    );
     await this.store?.appendRunEvent('run.started', undefined, {
       runId,
       threadId,
@@ -1297,6 +1392,8 @@ export class AgentSession {
         runId,
         threadId,
         config: callerConfig,
+        checkpointId: interrupt?.checkpointId,
+        checkpointNs: interrupt?.checkpointNs,
       });
       const contentParts = (content ?? handlerResult.contentParts).filter(
         (part): part is t.MessageContentComplex => part != null
