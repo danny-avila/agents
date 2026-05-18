@@ -78,6 +78,29 @@ function getStepScopedEventId(data: unknown): string | undefined {
   return typeof candidate.id === 'string' ? candidate.id : undefined;
 }
 
+function isLangGraphResumeMapForInterrupt(
+  value: unknown,
+  interruptId: string
+): value is Record<string, unknown> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  return Object.prototype.hasOwnProperty.call(value, interruptId);
+}
+
+type InterruptStateSnapshot = {
+  config?: RunnableConfig;
+  tasks?: Array<{
+    interrupts?: Array<{ id?: string }>;
+  }>;
+};
+
+type WorkflowWithStateHistory = {
+  getStateHistory?(
+    config: RunnableConfig
+  ): AsyncIterableIterator<InterruptStateSnapshot>;
+};
+
 export class Run<_T extends t.BaseGraphState> {
   id: string;
   private tokenCounter?: t.TokenCounter;
@@ -734,6 +757,10 @@ export class Run<_T extends t.BaseGraphState> {
         }
       }
 
+      if (this._interrupt != null) {
+        await this.resolveInterruptResumeConfig(config);
+      }
+
       /**
        * Skip the Stop hook when the run paused on a HITL interrupt
        * (still pending human input) or was halted by a hook (the host
@@ -974,11 +1001,97 @@ export class Run<_T extends t.BaseGraphState> {
     },
     streamOptions?: t.EventStreamOptions
   ): Promise<MessageContentComplex[] | undefined> {
+    const interruptId = this._interrupt?.interruptId;
+    const scopedResume =
+      typeof interruptId === 'string' &&
+      interruptId.length > 0 &&
+      !isLangGraphResumeMapForInterrupt(resumeValue, interruptId)
+        ? { [interruptId]: resumeValue }
+        : resumeValue;
+    const resumeConfig = await this.resolveInterruptResumeConfig(callerConfig);
     return this.processStream(
-      new Command({ resume: resumeValue }),
-      callerConfig,
+      new Command({ resume: scopedResume }),
+      resumeConfig,
       streamOptions
     );
+  }
+
+  private async resolveInterruptResumeConfig(
+    callerConfig: Partial<RunnableConfig> & {
+      version: 'v1' | 'v2';
+      run_id?: string;
+    }
+  ): Promise<
+    Partial<RunnableConfig> & {
+      version: 'v1' | 'v2';
+      run_id?: string;
+    }
+  > {
+    const interrupt = this._interrupt;
+    const interruptId = interrupt?.interruptId;
+    const workflow = this.graphRunnable as
+      | (t.CompiledStateWorkflow & WorkflowWithStateHistory)
+      | undefined;
+    const stateHistory = workflow?.getStateHistory;
+    if (interrupt?.checkpointId != null && interrupt.checkpointId.length > 0) {
+      return {
+        ...callerConfig,
+        configurable: {
+          ...callerConfig.configurable,
+          checkpoint_id: interrupt.checkpointId,
+          ...(typeof interrupt.checkpointNs === 'string'
+            ? { checkpoint_ns: interrupt.checkpointNs }
+            : {}),
+        },
+      };
+    }
+    if (
+      interrupt == null ||
+      typeof interruptId !== 'string' ||
+      interruptId.length === 0 ||
+      typeof stateHistory !== 'function'
+    ) {
+      return callerConfig;
+    }
+
+    for await (const snapshot of stateHistory.call(
+      this.graphRunnable,
+      callerConfig as RunnableConfig
+    )) {
+      const hasMatchingInterrupt =
+        snapshot.tasks?.some(
+          (task) =>
+            task.interrupts?.some(
+              (interrupt) => interrupt.id === interruptId
+            ) === true
+        ) === true;
+      const checkpointConfigurable = snapshot.config?.configurable;
+      if (!hasMatchingInterrupt || checkpointConfigurable == null) {
+        continue;
+      }
+
+      const checkpointId = checkpointConfigurable.checkpoint_id;
+      const checkpointNs = checkpointConfigurable.checkpoint_ns;
+      if (typeof checkpointId === 'string' && checkpointId.length > 0) {
+        this._interrupt = {
+          ...interrupt,
+          checkpointId,
+          ...(typeof checkpointNs === 'string' ? { checkpointNs } : {}),
+        };
+        return {
+          ...callerConfig,
+          configurable: {
+            ...callerConfig.configurable,
+            checkpoint_id: checkpointId,
+            ...(typeof checkpointNs === 'string'
+              ? { checkpoint_ns: checkpointNs }
+              : {}),
+          },
+        };
+      }
+    }
+
+    return callerConfig;
   }
 
   private createSystemCallback<K extends keyof t.ClientCallbacks>(

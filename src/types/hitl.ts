@@ -327,6 +327,10 @@ export interface RunInterruptResult<TPayload = HumanInterruptPayload> {
   interruptId: string;
   /** `thread_id` the run was bound to — required to resume. */
   threadId?: string;
+  /** LangGraph checkpoint id that contains the paused interrupt task. */
+  checkpointId?: string;
+  /** LangGraph checkpoint namespace for the paused interrupt task. */
+  checkpointNs?: string;
   /** Structured payload describing what needs human input. */
   payload: TPayload;
 }

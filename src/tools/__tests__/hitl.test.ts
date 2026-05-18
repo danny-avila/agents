@@ -37,6 +37,20 @@ import { HookRegistry } from '@/hooks';
 import { Providers as providers, GraphEvents } from '@/common';
 import { ToolNode } from '../ToolNode';
 
+async function flushAsyncWork(): Promise<void> {
+  await Promise.resolve();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await Promise.resolve();
+}
+
+afterEach(async () => {
+  await flushAsyncWork();
+  jest.restoreAllMocks();
+  await flushAsyncWork();
+});
+
 /**
  * Schema-only tool stub. ToolNode in event-driven mode uses the schema
  * for binding/discovery but routes execution through the host via
@@ -71,8 +85,20 @@ function mockEventDispatch(mockResults: t.ToolExecuteResult[]): void {
 }
 
 type MessagesUpdate = { messages: BaseMessage[] };
+type InterruptStateSnapshot = {
+  config?: RunnableConfig;
+  tasks?: Array<{
+    interrupts?: Array<{ id?: string }>;
+  }>;
+};
 type CompiledMessagesGraph = Runnable<unknown, { messages: BaseMessage[] }> & {
   invoke(input: unknown, config?: RunnableConfig): Promise<unknown>;
+  getState?(
+    config: RunnableConfig
+  ): Promise<{ config?: RunnableConfig } | undefined>;
+  getStateHistory?(
+    config: RunnableConfig
+  ): AsyncIterableIterator<InterruptStateSnapshot>;
 };
 
 /** Factory for a minimal `agent → tools → END` graph wrapping the ToolNode. */
@@ -80,18 +106,26 @@ function buildHITLGraph(
   toolNode: ToolNode,
   toolCalls: Array<{ id: string; name: string; args: Record<string, unknown> }>
 ): CompiledMessagesGraph {
-  let agentInvocations = 0;
+  const toolCallIds = new Set(toolCalls.map((call) => call.id));
   const builder = new StateGraph(MessagesAnnotation)
-    .addNode('agent', (): MessagesUpdate => {
-      agentInvocations += 1;
+    .addNode('agent', (state: { messages?: BaseMessage[] }): MessagesUpdate => {
       /**
-       * First entry → emit the AIMessage carrying tool_calls so the
-       * ToolNode actually has work. After resume the agent re-enters
-       * once more (a normal LangGraph loop), but at that point any
-       * approved tool already has a ToolMessage in state, so we emit
-       * an empty AIMessage to satisfy the loop and end the run.
+       * Emit the AIMessage carrying tool_calls until this test graph
+       * actually has a matching ToolMessage in state. LangGraph usually
+       * resumes at the interrupted `tools` node, but under full-suite
+       * async callback pressure it can re-enter this tiny test graph from
+       * START while still carrying the resume value. A call-count based
+       * fake agent then returned "done" too early and made HITL resume
+       * assertions order-dependent. State is the stable contract here:
+       * no tool result means the tool node still needs work.
        */
-      if (agentInvocations === 1) {
+      const hasMatchingToolResult =
+        state.messages?.some(
+          (message): boolean =>
+            message._getType() === 'tool' &&
+            toolCallIds.has((message as ToolMessage).tool_call_id)
+        ) === true;
+      if (!hasMatchingToolResult) {
         return {
           messages: [new AIMessage({ content: '', tool_calls: toolCalls })],
         };
@@ -121,6 +155,52 @@ function makeHookRegistry(
     ],
   });
   return registry;
+}
+
+function resumeFromInterrupt<TResume>(
+  interrupted: unknown,
+  resume: TResume
+): Command {
+  if (isInterrupted<unknown>(interrupted)) {
+    const interruptId = interrupted.__interrupt__[0]?.id;
+    if (typeof interruptId === 'string' && interruptId.length > 0) {
+      return new Command({ resume: { [interruptId]: resume } });
+    }
+  }
+  return new Command({ resume });
+}
+
+async function resumeGraph<TResume>(
+  graph: CompiledMessagesGraph,
+  interrupted: unknown,
+  resume: TResume,
+  config: RunnableConfig
+): Promise<unknown> {
+  const interruptId = isInterrupted<unknown>(interrupted)
+    ? interrupted.__interrupt__[0]?.id
+    : undefined;
+  let checkpointConfig = config;
+  if (typeof interruptId === 'string' && graph.getStateHistory != null) {
+    for await (const snapshot of graph.getStateHistory(config)) {
+      const hasMatchingInterrupt =
+        snapshot.tasks?.some(
+          (task) =>
+            task.interrupts?.some(
+              (interrupt) => interrupt.id === interruptId
+            ) === true
+        ) === true;
+      if (hasMatchingInterrupt && snapshot.config != null) {
+        checkpointConfig = snapshot.config;
+        break;
+      }
+    }
+  } else {
+    checkpointConfig = (await graph.getState?.(config))?.config ?? config;
+  }
+  return graph.invoke(
+    resumeFromInterrupt(interrupted, resume),
+    checkpointConfig
+  );
 }
 
 describe('ToolNode HITL — `ask` decision raises interrupt() when humanInTheLoop is enabled', () => {
@@ -196,10 +276,14 @@ describe('ToolNode HITL — `ask` decision raises interrupt() when humanInTheLoo
     const interrupted = await graph.invoke({ messages: [] }, config);
     expect(isInterrupted(interrupted)).toBe(true);
 
-    const resumed = (await graph.invoke(
-      new Command({ resume: [{ type: 'approve' }] }),
+    const resumed = (await resumeGraph(
+      graph,
+      interrupted,
+      [{ type: 'approve' }],
       config
-    )) as { messages: BaseMessage[] };
+    )) as {
+      messages: BaseMessage[];
+    };
 
     const toolMessages = resumed.messages.filter(
       (m): m is ToolMessage => m._getType() === 'tool'
@@ -226,12 +310,12 @@ describe('ToolNode HITL — `ask` decision raises interrupt() when humanInTheLoo
     ]);
     const config = { configurable: { thread_id: 'thread-hitl-reject' } };
 
-    await graph.invoke({ messages: [] }, config);
+    const interrupted = await graph.invoke({ messages: [] }, config);
 
-    const resumed = (await graph.invoke(
-      new Command({
-        resume: [{ type: 'reject', reason: 'destructive command' }],
-      }),
+    const resumed = (await resumeGraph(
+      graph,
+      interrupted,
+      [{ type: 'reject', reason: 'destructive command' }],
       config
     )) as { messages: BaseMessage[] };
 
@@ -279,12 +363,12 @@ describe('ToolNode HITL — `ask` decision raises interrupt() when humanInTheLoo
     ]);
     const config = { configurable: { thread_id: 'thread-hitl-edit' } };
 
-    await graph.invoke({ messages: [] }, config);
+    const interrupted = await graph.invoke({ messages: [] }, config);
 
-    await graph.invoke(
-      new Command({
-        resume: [{ type: 'edit', updatedInput: { command: 'patched' } }],
-      }),
+    await resumeGraph(
+      graph,
+      interrupted,
+      [{ type: 'edit', updatedInput: { command: 'patched' } }],
       config
     );
 
@@ -320,16 +404,16 @@ describe('ToolNode HITL — `ask` decision raises interrupt() when humanInTheLoo
     ]);
     const config = { configurable: { thread_id: 'thread-hitl-respond' } };
 
-    await graph.invoke({ messages: [] }, config);
+    const interrupted = await graph.invoke({ messages: [] }, config);
 
     const dispatchCallsBefore = dispatchSpy.mock.calls.filter(
       ([event]) => event === 'on_tool_execute'
     ).length;
 
-    const resumed = (await graph.invoke(
-      new Command({
-        resume: [{ type: 'respond', responseText: 'no relevant results' }],
-      }),
+    const resumed = (await resumeGraph(
+      graph,
+      interrupted,
+      [{ type: 'respond', responseText: 'no relevant results' }],
       config
     )) as { messages: BaseMessage[] };
 
@@ -399,10 +483,12 @@ describe('ToolNode HITL — `ask` decision raises interrupt() when humanInTheLoo
     ]);
     const config = { configurable: { thread_id: 'thread-hitl-map' } };
 
-    await graph.invoke({ messages: [] }, config);
+    const interrupted = await graph.invoke({ messages: [] }, config);
 
-    const resumed = (await graph.invoke(
-      new Command({ resume: { call_1: { type: 'approve' } } }),
+    const resumed = (await resumeGraph(
+      graph,
+      interrupted,
+      { call_1: { type: 'approve' } },
       config
     )) as { messages: BaseMessage[] };
 
@@ -561,10 +647,10 @@ describe('ToolNode HITL — multi-tool batches', () => {
       'call_2',
     ]);
 
-    const resumed = (await graph.invoke(
-      new Command({
-        resume: [{ type: 'approve' }, { type: 'reject', reason: 'too risky' }],
-      }),
+    const resumed = (await resumeGraph(
+      graph,
+      interrupted,
+      [{ type: 'approve' }, { type: 'reject', reason: 'too risky' }],
       config
     )) as { messages: BaseMessage[] };
 
@@ -745,11 +831,12 @@ describe('Run integration — HITL fallback checkpointer + resume', () => {
       ],
     });
 
+    const hexToolCallId = '0123456789abcdef0123456789abcdef';
     const node = new ToolNode({
       tools: [createSchemaStub('echo')],
       eventDrivenMode: true,
       agentId: 'agent-x',
-      toolCallStepIds: new Map([['call_1', 'step_1']]),
+      toolCallStepIds: new Map([[hexToolCallId, 'step_1']]),
       hookRegistry: registry,
       humanInTheLoop: { enabled: true },
     });
@@ -762,7 +849,7 @@ describe('Run integration — HITL fallback checkpointer + resume', () => {
             new AIMessage({
               content: '',
               tool_calls: [
-                { id: 'call_1', name: 'echo', args: { command: 'x' } },
+                { id: hexToolCallId, name: 'echo', args: { command: 'x' } },
               ],
             }),
           ],
@@ -804,8 +891,10 @@ describe('Run integration — HITL fallback checkpointer + resume', () => {
     expect(dispatchCount).toBe(0);
 
     /** This is the API contract under test: Run.resume() with a
-     * decision array (not graph.invoke + Command). */
-    await run.resume([{ type: 'approve' }], callerConfig);
+     * tool_call_id-keyed decision map (not graph.invoke + Command).
+     * The tool_call_id intentionally looks like a LangGraph interrupt
+     * id; Run.resume must still wrap it under the real interrupt id. */
+    await run.resume({ [hexToolCallId]: { type: 'approve' } }, callerConfig);
 
     expect(dispatchCount).toBe(1);
     /** Resume completed naturally: interrupt cleared, no halt
@@ -1732,13 +1821,13 @@ describe('Codex review fixes', () => {
     ]);
     const config = { configurable: { thread_id: 'dedup-thread' } };
 
-    await graph.invoke({ messages: [] }, config);
+    const interrupted = await graph.invoke({ messages: [] }, config);
     /** First pass: interrupt() threw, so the deferred denial side
      * effects were not flushed. Zero step-completed events for the
      * denied tool yet. */
     expect(stepCompletedDispatches.filter((id) => id === 'call_a')).toEqual([]);
 
-    await graph.invoke(new Command({ resume: [{ type: 'approve' }] }), config);
+    await resumeGraph(graph, interrupted, [{ type: 'approve' }], config);
 
     /** After resume: the denied tool dispatches exactly once (deferred
      * flush on the resume re-execution); the approved tool dispatches
@@ -1803,13 +1892,13 @@ describe('Codex review fixes', () => {
     ]);
     const config = { configurable: { thread_id: 'allowed-enforce' } };
 
-    await graph.invoke({ messages: [] }, config);
+    const interrupted = await graph.invoke({ messages: [] }, config);
 
     /** Submit `edit` — outside the advertised allowlist. */
-    const resumed = (await graph.invoke(
-      new Command({
-        resume: [{ type: 'edit', updatedInput: { command: 'malicious' } }],
-      }),
+    const resumed = (await resumeGraph(
+      graph,
+      interrupted,
+      [{ type: 'edit', updatedInput: { command: 'malicious' } }],
       config
     )) as { messages: BaseMessage[] };
 
@@ -1875,10 +1964,10 @@ describe('Codex review fixes', () => {
     ]);
     const config = { configurable: { thread_id: 'allowed-pass' } };
 
-    await graph.invoke({ messages: [] }, config);
+    const interrupted = await graph.invoke({ messages: [] }, config);
 
     /** Submit `approve` — explicitly in the allowlist. */
-    await graph.invoke(new Command({ resume: [{ type: 'approve' }] }), config);
+    await resumeGraph(graph, interrupted, [{ type: 'approve' }], config);
 
     expect(dispatchedArgs).toEqual([{ command: 'original' }]);
   });
@@ -2048,7 +2137,7 @@ describe('Codex review fixes', () => {
       command: 'redacted-command',
     });
 
-    await graph.invoke(new Command({ resume: [{ type: 'approve' }] }), config);
+    await resumeGraph(graph, interrupted, [{ type: 'approve' }], config);
 
     /** And the host execution dispatches the rewritten args, not
      * the original. Without the fix, the policy redaction would be
@@ -2307,15 +2396,15 @@ describe('Codex review fixes', () => {
     ]);
     const config = { configurable: { thread_id: 'edit-malformed' } };
 
-    await graph.invoke({ messages: [] }, config);
+    const interrupted = await graph.invoke({ messages: [] }, config);
 
     /** `{ type: 'edit' }` with no updatedInput — same trust-boundary
      * issue as malformed respond. Must fail closed, NOT pass undefined
      * into applyInputOverride and approve a tool with garbage args. */
-    const resumed = (await graph.invoke(
-      new Command({
-        resume: [{ type: 'edit' } as unknown as t.ToolApprovalDecision],
-      }),
+    const resumed = (await resumeGraph(
+      graph,
+      interrupted,
+      [{ type: 'edit' } as unknown as t.ToolApprovalDecision],
       config
     )) as { messages: BaseMessage[] };
 
@@ -2361,19 +2450,19 @@ describe('Codex review fixes', () => {
     ]);
     const config = { configurable: { thread_id: 'edit-nonobject' } };
 
-    await graph.invoke({ messages: [] }, config);
+    const interrupted = await graph.invoke({ messages: [] }, config);
 
     /** `updatedInput: 'string'` — wire deserializer didn't enforce
      * object shape; SDK must reject. */
-    const resumed = (await graph.invoke(
-      new Command({
-        resume: [
-          {
-            type: 'edit',
-            updatedInput: 'not-an-object' as unknown as Record<string, unknown>,
-          },
-        ],
-      }),
+    const resumed = (await resumeGraph(
+      graph,
+      interrupted,
+      [
+        {
+          type: 'edit',
+          updatedInput: 'not-an-object' as unknown as Record<string, unknown>,
+        },
+      ],
       config
     )) as { messages: BaseMessage[] };
 
@@ -2410,17 +2499,17 @@ describe('Codex review fixes', () => {
     ]);
     const config = { configurable: { thread_id: 'edit-array' } };
 
-    await graph.invoke({ messages: [] }, config);
+    const interrupted = await graph.invoke({ messages: [] }, config);
 
-    const resumed = (await graph.invoke(
-      new Command({
-        resume: [
-          {
-            type: 'edit',
-            updatedInput: [1, 2, 3] as unknown as Record<string, unknown>,
-          },
-        ],
-      }),
+    const resumed = (await resumeGraph(
+      graph,
+      interrupted,
+      [
+        {
+          type: 'edit',
+          updatedInput: [1, 2, 3] as unknown as Record<string, unknown>,
+        },
+      ],
       config
     )) as { messages: BaseMessage[] };
 
@@ -2462,15 +2551,15 @@ describe('Codex review fixes', () => {
     ]);
     const config = { configurable: { thread_id: 'respond-malformed' } };
 
-    await graph.invoke({ messages: [] }, config);
+    const interrupted = await graph.invoke({ messages: [] }, config);
 
     /** Submit a `respond` decision with NO responseText — wire shape
      * the SDK can't honor. Must fail closed (blockEntry path), NOT
      * crash truncateToolResultContent on `undefined.length`. */
-    const resumed = (await graph.invoke(
-      new Command({
-        resume: [{ type: 'respond' } as unknown as t.ToolApprovalDecision],
-      }),
+    const resumed = (await resumeGraph(
+      graph,
+      interrupted,
+      [{ type: 'respond' } as unknown as t.ToolApprovalDecision],
       config
     )) as { messages: BaseMessage[] };
 
@@ -2508,19 +2597,19 @@ describe('Codex review fixes', () => {
     ]);
     const config = { configurable: { thread_id: 'respond-nonstring' } };
 
-    await graph.invoke({ messages: [] }, config);
+    const interrupted = await graph.invoke({ messages: [] }, config);
 
     /** `responseText: 42` — wire deserializer didn't enforce string;
      * SDK must reject without crashing. */
-    const resumed = (await graph.invoke(
-      new Command({
-        resume: [
-          {
-            type: 'respond',
-            responseText: 42 as unknown as string,
-          },
-        ],
-      }),
+    const resumed = (await resumeGraph(
+      graph,
+      interrupted,
+      [
+        {
+          type: 'respond',
+          responseText: 42 as unknown as string,
+        },
+      ],
       config
     )) as { messages: BaseMessage[] };
 
@@ -2571,14 +2660,14 @@ describe('Codex review fixes', () => {
     ]);
     const config = { configurable: { thread_id: 'respond-truncate' } };
 
-    await graph.invoke({ messages: [] }, config);
+    const interrupted = await graph.invoke({ messages: [] }, config);
 
     /** 200-char response — well over the 50-char cap. */
     const oversized = 'A'.repeat(200);
-    const resumed = (await graph.invoke(
-      new Command({
-        resume: [{ type: 'respond', responseText: oversized }],
-      }),
+    const resumed = (await resumeGraph(
+      graph,
+      interrupted,
+      [{ type: 'respond', responseText: oversized }],
       config
     )) as { messages: BaseMessage[] };
 
@@ -3091,8 +3180,10 @@ describe('Codex review fixes', () => {
     expect(payload.action_requests[0].tool_call_id).toBe('call_b');
     expect(dispatchedToolNames).toEqual([]);
 
-    const resumed = (await graph.invoke(
-      new Command({ resume: [{ type: 'approve' }] }),
+    const resumed = (await resumeGraph(
+      graph,
+      interrupted,
+      [{ type: 'approve' }],
       config
     )) as { messages: BaseMessage[] };
 
@@ -3222,17 +3313,17 @@ describe('Codex review fixes', () => {
     ]);
     const config = { configurable: { thread_id: 'mixed-respond-reject' } };
 
-    await graph.invoke({ messages: [] }, config);
+    const interrupted = await graph.invoke({ messages: [] }, config);
     /** First pass: interrupt fires before either dispatch path runs. */
     expect(stepCompletedDispatches).toEqual([]);
 
-    const resumed = (await graph.invoke(
-      new Command({
-        resume: [
-          { type: 'respond', responseText: 'fake answer' },
-          { type: 'reject', reason: 'no thanks' },
-        ],
-      }),
+    const resumed = (await resumeGraph(
+      graph,
+      interrupted,
+      [
+        { type: 'respond', responseText: 'fake answer' },
+        { type: 'reject', reason: 'no thanks' },
+      ],
       config
     )) as { messages: BaseMessage[] };
 
@@ -3394,13 +3485,13 @@ describe('Codex review fixes', () => {
     ]);
     const config = { configurable: { thread_id: 'unknown-decision' } };
 
-    await graph.invoke({ messages: [] }, config);
+    const interrupted = await graph.invoke({ messages: [] }, config);
 
     /** Host sends a typo'd / malformed decision. Must NOT silently approve. */
-    const resumed = (await graph.invoke(
-      new Command({
-        resume: [{ type: 'aproved' as 'approve' }],
-      }),
+    const resumed = (await resumeGraph(
+      graph,
+      interrupted,
+      [{ type: 'aproved' as 'approve' }],
       config
     )) as { messages: BaseMessage[] };
 
@@ -3555,7 +3646,7 @@ describe('AskUserQuestion — interrupt + resume', () => {
     const config = { configurable: { thread_id: 'ask-q-thread' } };
 
     const interrupted = (await graph.invoke({ messages: [] }, config)) as {
-      __interrupt__?: Array<{ value?: t.HumanInterruptPayload }>;
+      __interrupt__?: Array<{ id?: string; value?: t.HumanInterruptPayload }>;
     };
     expect(interrupted.__interrupt__).toBeDefined();
     const payload = interrupted.__interrupt__![0].value!;
@@ -3566,7 +3657,12 @@ describe('AskUserQuestion — interrupt + resume', () => {
     expect(payload.question.options).toHaveLength(2);
 
     const resolution: t.AskUserQuestionResolution = { answer: 'production' };
-    await graph.invoke(new Command({ resume: resolution }), config);
+    await resumeGraph(
+      graph as unknown as CompiledMessagesGraph,
+      interrupted,
+      resolution,
+      config
+    );
 
     expect(resumedAnswer).toBe('production');
   });

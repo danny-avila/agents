@@ -768,6 +768,217 @@ describe('JsonlSessionStore', () => {
     ).toEqual(['history']);
   });
 
+  it('resumes isolated Run instances from the stored interrupted checkpoint', async () => {
+    const checkpointer = new MemorySaver();
+    const mockRun = createMockRun('resumed');
+    mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      checkpointing: { checkpointer },
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    await putCheckpoint({
+      checkpointer,
+      threadId: session.threadId,
+      id: 'checkpoint_interrupted',
+    });
+    await session.getSessionStore()?.appendCheckpoint({
+      source: 'run',
+      threadId: session.threadId,
+      runId: 'run_interrupted',
+      checkpointId: 'checkpoint_interrupted',
+      checkpointNs: '',
+    });
+
+    await session.resumeInterrupt([{ type: 'approve' }]);
+
+    expect(mockRun.resume).toHaveBeenCalledWith(
+      [{ type: 'approve' }],
+      expect.objectContaining({
+        configurable: expect.objectContaining({
+          thread_id: session.threadId,
+          checkpoint_id: 'checkpoint_interrupted',
+          checkpoint_ns: '',
+        }),
+      })
+    );
+  });
+
+  it('records a new interrupt checkpoint after resuming from an older checkpoint', async () => {
+    const checkpointer = new MemorySaver();
+    const mockRun = createMockRun('interrupted again');
+    mockRun.getInterrupt.mockReturnValue({
+      interruptId: 'interrupt_again',
+      threadId: 'thread_new_interrupt',
+      checkpointId: 'checkpoint_new_interrupt',
+      checkpointNs: '',
+      payload: {
+        type: 'tool_approval',
+        action_requests: [],
+        review_configs: [],
+      },
+    });
+    mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      checkpointing: { checkpointer },
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    await putCheckpoint({
+      checkpointer,
+      threadId: session.threadId,
+      id: 'checkpoint_resume_source',
+    });
+    await putCheckpoint({
+      checkpointer,
+      threadId: session.threadId,
+      id: 'checkpoint_new_interrupt',
+    });
+    await session.getSessionStore()?.appendCheckpoint({
+      source: 'run',
+      threadId: session.threadId,
+      runId: 'run_interrupted',
+      checkpointId: 'checkpoint_resume_source',
+      checkpointNs: '',
+    });
+
+    await session.resumeInterrupt([{ type: 'approve' }]);
+
+    expect(
+      session.getSessionStore()?.getLatestCheckpoint(session.threadId)?.data
+    ).toMatchObject({
+      source: 'resume',
+      checkpointId: 'checkpoint_new_interrupt',
+    });
+  });
+
+  it('resumes isolated Run instances from the requested checkpoint namespace', async () => {
+    const checkpointer = new MemorySaver();
+    const mockRun = createMockRun('resumed requested namespace');
+    mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      checkpointing: { checkpointer },
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    await session.getSessionStore()?.appendCheckpoint({
+      source: 'run',
+      threadId: session.threadId,
+      runId: 'run_default',
+      checkpointId: 'checkpoint_default_latest',
+      checkpointNs: '',
+    });
+    await session.getSessionStore()?.appendCheckpoint({
+      source: 'run',
+      threadId: session.threadId,
+      runId: 'run_requested',
+      checkpointId: 'checkpoint_requested_latest',
+      checkpointNs: 'requested',
+    });
+    await session.getSessionStore()?.appendCheckpoint({
+      source: 'run',
+      threadId: session.threadId,
+      runId: 'run_default_again',
+      checkpointId: 'checkpoint_default_newer',
+      checkpointNs: '',
+    });
+
+    await session.resumeInterrupt([{ type: 'approve' }], {
+      config: {
+        configurable: {
+          checkpoint_ns: 'requested',
+        },
+      },
+    });
+
+    expect(mockRun.resume).toHaveBeenCalledWith(
+      [{ type: 'approve' }],
+      expect.objectContaining({
+        configurable: expect.objectContaining({
+          thread_id: session.threadId,
+          checkpoint_id: 'checkpoint_requested_latest',
+          checkpoint_ns: 'requested',
+        }),
+      })
+    );
+  });
+
+  it('resumes isolated Run instances from the explicitly requested default namespace', async () => {
+    const checkpointer = new MemorySaver();
+    const mockRun = createMockRun('resumed default namespace');
+    mockRunCreate(mockRun);
+    const session = await createAgentSession({
+      cwd: dir,
+      runId: 'template-run',
+      checkpointing: { checkpointer },
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: 'openAI' as never,
+          model: 'test-model',
+        },
+        instructions: 'test',
+      },
+    });
+    await session.getSessionStore()?.appendCheckpoint({
+      source: 'run',
+      threadId: session.threadId,
+      runId: 'run_default',
+      checkpointId: 'checkpoint_default_latest',
+      checkpointNs: '',
+    });
+    await session.getSessionStore()?.appendCheckpoint({
+      source: 'run',
+      threadId: session.threadId,
+      runId: 'run_requested_newer',
+      checkpointId: 'checkpoint_requested_newer',
+      checkpointNs: 'requested',
+    });
+
+    await session.resumeInterrupt([{ type: 'approve' }], {
+      config: {
+        configurable: {
+          checkpoint_ns: '',
+        },
+      },
+    });
+
+    expect(mockRun.resume).toHaveBeenCalledWith(
+      [{ type: 'approve' }],
+      expect.objectContaining({
+        configurable: expect.objectContaining({
+          thread_id: session.threadId,
+          checkpoint_id: 'checkpoint_default_latest',
+          checkpoint_ns: '',
+        }),
+      })
+    );
+  });
+
   it('uses only new input when LangGraph checkpoint state already exists', async () => {
     const checkpointer = new MemorySaver();
     const mockRun = createMockRun('checkpointed output');
