@@ -50,7 +50,10 @@ import {
   resolveLocalToolRegistry,
   resolveLocalExecutionTools,
 } from '@/tools/local';
-import { recordArgsEqual } from '@/tools/eagerEventExecution';
+import {
+  buildToolExecutionRequestPlan,
+  recordArgsEqual,
+} from '@/tools/eagerEventExecution';
 
 /**
  * Per-call batch context for `runTool`. Bundles every optional
@@ -725,19 +728,18 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     }
   }
 
-  private claimEventToolUsageTurn(
+  private recordEventToolPlanningTurn(
     toolName: string,
+    turn: number,
     callId?: string
-  ): number {
-    const counter =
-      this.canConsumeEagerEventExecution() &&
-      this.eagerEventToolUsageCount != null
-        ? this.eagerEventToolUsageCount
-        : this.toolUsageCount;
-    const turn = counter.get(toolName) ?? 0;
-    counter.set(toolName, turn + 1);
+  ): void {
     this.recordToolUsageTurn(toolName, turn, callId);
-    return turn;
+    if (this.canConsumeEagerEventExecution()) {
+      this.eagerEventToolUsageCount?.set(
+        toolName,
+        Math.max(this.eagerEventToolUsageCount.get(toolName) ?? 0, turn + 1)
+      );
+    }
   }
 
   /**
@@ -2373,55 +2375,37 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     const batchIndexByCallId = new Map<string, number>();
 
     if (approvedEntries.length > 0) {
-      const requests: t.ToolCallRequest[] = approvedEntries.map((entry) => {
-        const prestartedExecution =
-          this.canConsumeEagerEventExecution() && entry.call.id != null
-            ? this.eagerEventToolExecutions?.get(entry.call.id)
-            : undefined;
-        const turn =
-          prestartedExecution?.request.turn ??
-          this.claimEventToolUsageTurn(entry.call.name, entry.call.id);
-        if (prestartedExecution?.request.turn != null) {
-          this.recordToolUsageTurn(
-            entry.call.name,
-            prestartedExecution.request.turn,
-            entry.call.id
-          );
-        }
+      const plan = buildToolExecutionRequestPlan({
+        toolCalls: approvedEntries.map((entry) => {
+          const codeSessionContext =
+            CODE_EXECUTION_TOOLS.has(entry.call.name) ||
+            entry.call.name === Constants.SKILL_TOOL ||
+            entry.call.name === Constants.READ_FILE
+              ? this.getCodeSessionContext()
+              : undefined;
+          return {
+            id: entry.call.id,
+            name: entry.call.name,
+            args: entry.args,
+            stepId: entry.stepId,
+            codeSessionContext,
+          };
+        }),
+        usageCount: this.toolUsageCount,
+        recordTurn: (toolName, reservedTurn, callId) => {
+          this.recordEventToolPlanningTurn(toolName, reservedTurn, callId);
+        },
+      });
+      if (plan == null) {
+        throw new Error('Unable to build event tool execution request plan');
+      }
+      const requests = plan.requests;
 
+      for (const entry of approvedEntries) {
         if (entry.batchIndex != null && entry.call.id != null) {
           batchIndexByCallId.set(entry.call.id, entry.batchIndex);
         }
-
-        const request: t.ToolCallRequest = {
-          id: entry.call.id!,
-          name: entry.call.name,
-          args: entry.args,
-          stepId: entry.stepId,
-          turn,
-        };
-
-        /**
-         * Emit `codeSessionContext` for any tool whose host handler may need
-         * to reach into the code-execution sandbox:
-         *   - `CODE_EXECUTION_TOOLS` — direct executors that POST to /exec.
-         *   - `SKILL_TOOL` — skill files live alongside code-env state.
-         *   - `READ_FILE` — when the requested path is a code-env artifact
-         *     (e.g. `/mnt/data/...`) the host falls back to reading via the
-         *     same sandbox session; without the seeded `session_id` /
-         *     `_injected_files` here, that fallback can't see prior-turn
-         *     artifacts on the very first call of a turn.
-         */
-        if (
-          CODE_EXECUTION_TOOLS.has(entry.call.name) ||
-          entry.call.name === Constants.SKILL_TOOL ||
-          entry.call.name === Constants.READ_FILE
-        ) {
-          request.codeSessionContext = this.getCodeSessionContext();
-        }
-
-        return request;
-      });
+      }
 
       const requestMap = new Map(requests.map((r) => [r.id, r]));
       const eagerExecutions: Array<{
@@ -2715,7 +2699,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
     if (
       execution.toolName !== request.name ||
-      !recordArgsEqual(execution.args, request.args)
+      !recordArgsEqual(execution.args, request.args) ||
+      execution.request.turn !== request.turn
     ) {
       return {
         toolCallId: request.id,
@@ -2729,7 +2714,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               status: 'error',
               content: '',
               errorMessage:
-                'Tool call arguments changed after eager execution started; refusing to re-run the tool to avoid duplicate side effects.',
+                'Tool call changed after eager execution started; refusing to re-run the tool to avoid duplicate side effects.',
             },
           ],
         }),

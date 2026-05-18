@@ -311,6 +311,104 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     expect(weatherExecution?.promise).toBe(calendarExecution?.promise);
   });
 
+  it('assigns same-tool eager turns in model emission order', async () => {
+    const graph = createGraph();
+    const toolExecuteCalls: t.ToolExecuteBatchRequest[] = [];
+    jest.spyOn(events, 'safeDispatchCustomEvent').mockImplementation(
+      async (event, data): Promise<void> => {
+        if (event !== GraphEvents.ON_TOOL_EXECUTE) {
+          return;
+        }
+        const batch = data as t.ToolExecuteBatchRequest;
+        toolExecuteCalls.push(batch);
+        batch.resolve(
+          batch.toolCalls.map((request) => ({
+            toolCallId: request.id,
+            status: 'success' as const,
+            content: `${request.args.city} weather`,
+          }))
+        );
+      }
+    );
+
+    await new ChatModelStreamHandler().handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_weather_1',
+              name: 'weather',
+              args: { city: 'NYC' },
+            },
+            {
+              id: 'call_weather_2',
+              name: 'weather',
+              args: { city: 'Boston' },
+            },
+          ],
+          response_metadata: finalToolCallResponseMetadata,
+        } as unknown as t.StreamChunk,
+      },
+      { langgraph_node: 'agent' },
+      graph
+    );
+
+    expect(toolExecuteCalls).toHaveLength(1);
+    expect(toolExecuteCalls[0].toolCalls.map((call) => call.turn)).toEqual([
+      0, 1,
+    ]);
+    expect(graph.eagerEventToolUsageCount.get('weather')).toBe(2);
+    expect(graph.eagerEventToolExecutions.get('call_weather_1')?.request.turn)
+      .toBe(0);
+    expect(graph.eagerEventToolExecutions.get('call_weather_2')?.request.turn)
+      .toBe(1);
+  });
+
+  it('skips eager for the whole batch if any call is not request-plannable', async () => {
+    const graph = createGraph();
+    const toolExecuteCalls: t.ToolExecuteBatchRequest[] = [];
+    jest.spyOn(events, 'safeDispatchCustomEvent').mockImplementation(
+      async (event, data): Promise<void> => {
+        if (event !== GraphEvents.ON_TOOL_EXECUTE) {
+          return;
+        }
+        const batch = data as t.ToolExecuteBatchRequest;
+        toolExecuteCalls.push(batch);
+        batch.resolve([]);
+      }
+    );
+
+    await new ChatModelStreamHandler().handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_weather_bad',
+              name: 'weather',
+              args: '{"city":',
+            },
+            {
+              id: 'call_weather_good',
+              name: 'weather',
+              args: { city: 'Boston' },
+            },
+          ],
+          response_metadata: finalToolCallResponseMetadata,
+        } as unknown as t.StreamChunk,
+      },
+      { langgraph_node: 'agent' },
+      graph
+    );
+
+    expect(toolExecuteCalls).toHaveLength(0);
+    expect(graph.eagerEventToolExecutions.size).toBe(0);
+    expect(graph.eagerEventToolUsageCount.size).toBe(0);
+  });
+
   it('records complete chunk-only tool calls after creating a tool step', async () => {
     const graph = createGraph();
     const toolExecuteCalls: t.ToolExecuteBatchRequest[] = [];

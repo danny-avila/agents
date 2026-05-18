@@ -22,7 +22,10 @@ import {
 } from '@/tools/handlers';
 import { getMessageId } from '@/messages';
 import { safeDispatchCustomEvent } from '@/utils/events';
-import { coerceRecordArgs, normalizeError } from '@/tools/eagerEventExecution';
+import {
+  buildToolExecutionRequestPlan,
+  normalizeError,
+} from '@/tools/eagerEventExecution';
 
 const LOCAL_CODING_BUNDLE_NAME_SET: ReadonlySet<string> = new Set(
   LOCAL_CODING_BUNDLE_NAMES
@@ -164,13 +167,12 @@ function getCodeSessionContext(
   };
 }
 
-function shouldAttemptEagerToolExecution(args: {
+function isEagerToolExecutionEnabledForBatch(args: {
   graph: StandardGraph;
   metadata?: Record<string, unknown>;
   agentContext?: AgentContext;
-  toolCall: ToolCall;
 }): boolean {
-  const { graph, metadata, agentContext, toolCall } = args;
+  const { graph, metadata, agentContext } = args;
   if (graph.eagerEventToolExecution?.enabled !== true) {
     return false;
   }
@@ -189,16 +191,7 @@ function shouldAttemptEagerToolExecution(args: {
   if (graph.handlerRegistry?.getHandler(GraphEvents.ON_TOOL_EXECUTE) == null) {
     return false;
   }
-  if (
-    toolCall.id == null ||
-    toolCall.id === '' ||
-    toolCall.name === '' ||
-    isDirectGraphTool(toolCall.name, agentContext) ||
-    isDirectLocalTool(toolCall.name, graph)
-  ) {
-    return false;
-  }
-  return coerceRecordArgs(toolCall.args) != null;
+  return true;
 }
 
 function hasFinalToolCallSignal(chunk: Partial<AIMessageChunk>): boolean {
@@ -232,57 +225,61 @@ type EagerToolExecutionEntry = {
   request: t.ToolCallRequest;
 };
 
-function createEagerToolExecutionEntry(args: {
+function createEagerToolExecutionPlan(args: {
   graph: StandardGraph;
   metadata?: Record<string, unknown>;
   agentContext?: AgentContext;
-  toolCall: ToolCall;
-}): EagerToolExecutionEntry | undefined {
-  const { graph, metadata, agentContext, toolCall } = args;
+  toolCalls: ToolCall[];
+}): EagerToolExecutionEntry[] | undefined {
+  const { graph, metadata, agentContext, toolCalls } = args;
   if (
-    !shouldAttemptEagerToolExecution({
+    !isEagerToolExecutionEnabledForBatch({
       graph,
       metadata,
       agentContext,
-      toolCall,
     })
   ) {
     return undefined;
   }
 
-  const id = toolCall.id!;
-  if (graph.eagerEventToolExecutions.has(id)) {
+  if (hasDirectToolCallInBatch({ graph, agentContext, toolCalls })) {
     return undefined;
   }
 
-  const toolName = toolCall.name;
-  const coercedArgs = coerceRecordArgs(toolCall.args);
-  if (coercedArgs == null) {
+  // Eager execution must preserve ToolNode batch semantics exactly. If any
+  // call in the final batch cannot be planned, fall back for the whole batch.
+  if (
+    toolCalls.some(
+      (toolCall) =>
+        toolCall.id == null ||
+        toolCall.id === '' ||
+        toolCall.name === '' ||
+        graph.eagerEventToolExecutions.has(toolCall.id)
+    )
+  ) {
     return undefined;
   }
 
-  const turn = graph.eagerEventToolUsageCount.get(toolName) ?? 0;
-  graph.eagerEventToolUsageCount.set(toolName, turn + 1);
-
-  const request: t.ToolCallRequest = {
-    id,
-    name: toolName,
-    args: coercedArgs,
-    stepId: graph.toolCallStepIds.get(id) ?? '',
-    turn,
-  };
-
-  const codeSessionContext = getCodeSessionContext(graph, toolName);
-  if (codeSessionContext != null) {
-    request.codeSessionContext = codeSessionContext;
+  const plan = buildToolExecutionRequestPlan({
+    toolCalls: toolCalls.map((toolCall) => ({
+      id: toolCall.id,
+      name: toolCall.name,
+      args: toolCall.args,
+      stepId: graph.toolCallStepIds.get(toolCall.id!) ?? '',
+      codeSessionContext: getCodeSessionContext(graph, toolCall.name),
+    })),
+    usageCount: graph.eagerEventToolUsageCount,
+  });
+  if (plan == null) {
+    return undefined;
   }
 
-  return {
-    id,
-    toolName,
-    coercedArgs,
+  return plan.requests.map((request): EagerToolExecutionEntry => ({
+    id: request.id,
+    toolName: request.name,
+    coercedArgs: request.args,
     request,
-  };
+  }));
 }
 
 function startEagerToolExecutions(args: {
@@ -292,22 +289,13 @@ function startEagerToolExecutions(args: {
   toolCalls: ToolCall[];
 }): void {
   const { graph, metadata, agentContext, toolCalls } = args;
-  if (hasDirectToolCallInBatch({ graph, agentContext, toolCalls })) {
-    return;
-  }
-
-  const entries = toolCalls
-    .map((toolCall) =>
-      createEagerToolExecutionEntry({
-        graph,
-        metadata,
-        agentContext,
-        toolCall,
-      })
-    )
-    .filter((entry): entry is EagerToolExecutionEntry => entry != null);
-
-  if (entries.length === 0) {
+  const entries = createEagerToolExecutionPlan({
+    graph,
+    metadata,
+    agentContext,
+    toolCalls,
+  });
+  if (entries == null || entries.length === 0) {
     return;
   }
 

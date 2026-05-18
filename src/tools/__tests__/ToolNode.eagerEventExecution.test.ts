@@ -29,6 +29,19 @@ function createAIMessage(
   });
 }
 
+function createAIMessageWithToolCalls(
+  toolCalls: Array<{
+    id: string;
+    name: string;
+    args: Record<string, unknown>;
+  }>
+): AIMessage {
+  return new AIMessage({
+    content: '',
+    tool_calls: toolCalls,
+  });
+}
+
 function installToolExecuteResponder(content: string): {
   toolExecuteCalls: t.ToolExecuteBatchRequest[];
 } {
@@ -177,6 +190,81 @@ describe('ToolNode eager event tool execution', () => {
     expect(eagerUsageCount.get('weather')).toBe(1);
     expect(result.messages).toHaveLength(1);
     expect(result.messages[0].content).toBe('normal result');
+  });
+
+  it('preserves final turn order when only part of a batch was prestarted', async () => {
+    const { toolExecuteCalls } = installToolExecuteResponder('normal result');
+    const eagerExecutions = new Map<string, t.EagerEventToolExecution>();
+    const eagerUsageCount = new Map<string, number>([['weather', 1]]);
+    const staleRequest: t.ToolCallRequest = {
+      id: 'call_weather_2',
+      name: 'weather',
+      args: { city: 'Boston' },
+      stepId: 'step_weather_2',
+      turn: 0,
+    };
+    eagerExecutions.set('call_weather_2', {
+      toolCallId: 'call_weather_2',
+      toolName: 'weather',
+      args: { city: 'Boston' },
+      request: staleRequest,
+      promise: Promise.resolve({
+        results: [
+          {
+            toolCallId: 'call_weather_2',
+            status: 'success',
+            content: 'stale eager result',
+          },
+        ],
+      }),
+    });
+
+    const toolNode = new ToolNode({
+      tools: [createDummyTool('weather')],
+      eventDrivenMode: true,
+      eagerEventToolExecution: { enabled: true },
+      eagerEventToolExecutions: eagerExecutions,
+      eagerEventToolUsageCount: eagerUsageCount,
+      toolCallStepIds: new Map([
+        ['call_weather_1', 'step_weather_1'],
+        ['call_weather_2', 'step_weather_2'],
+      ]),
+    });
+
+    const result = (await toolNode.invoke({
+      messages: [
+        createAIMessageWithToolCalls([
+          {
+            id: 'call_weather_1',
+            name: 'weather',
+            args: { city: 'NYC' },
+          },
+          {
+            id: 'call_weather_2',
+            name: 'weather',
+            args: { city: 'Boston' },
+          },
+        ]),
+      ],
+    })) as { messages: ToolMessage[] };
+
+    expect(toolExecuteCalls).toHaveLength(1);
+    expect(toolExecuteCalls[0].toolCalls).toEqual([
+      expect.objectContaining({
+        id: 'call_weather_1',
+        name: 'weather',
+        turn: 0,
+      }),
+    ]);
+    expect(eagerExecutions.has('call_weather_2')).toBe(false);
+    expect(eagerUsageCount.get('weather')).toBe(2);
+    expect(result.messages.map((message) => message.tool_call_id)).toEqual([
+      'call_weather_1',
+      'call_weather_2',
+    ]);
+    expect(result.messages[0].status).toBe('success');
+    expect(result.messages[1].status).toBe('error');
+    expect(result.messages[1].content).toContain('refusing to re-run');
   });
 
   it('uses the legacy turn counter when eager mode cannot be consumed', async () => {
