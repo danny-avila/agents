@@ -211,6 +211,20 @@ function hasFinalToolCallSignal(chunk: Partial<AIMessageChunk>): boolean {
   return finishReason === 'tool_calls' || finishReason === 'tool_use';
 }
 
+function hasDirectToolCallInBatch(args: {
+  graph: StandardGraph;
+  agentContext?: AgentContext;
+  toolCalls: ToolCall[];
+}): boolean {
+  const { graph, agentContext, toolCalls } = args;
+  return toolCalls.some(
+    (toolCall) =>
+      toolCall.name !== '' &&
+      (isDirectGraphTool(toolCall.name, agentContext) ||
+        isDirectLocalTool(toolCall.name, graph))
+  );
+}
+
 type EagerToolExecutionEntry = {
   id: string;
   toolName: string;
@@ -278,6 +292,10 @@ function startEagerToolExecutions(args: {
   toolCalls: ToolCall[];
 }): void {
   const { graph, metadata, agentContext, toolCalls } = args;
+  if (hasDirectToolCallInBatch({ graph, agentContext, toolCalls })) {
+    return;
+  }
+
   const entries = toolCalls
     .map((toolCall) =>
       createEagerToolExecutionEntry({

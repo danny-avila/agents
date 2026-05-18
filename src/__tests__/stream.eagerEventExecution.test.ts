@@ -1336,6 +1336,58 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     expect(graph.eagerEventToolExecutions.size).toBe(0);
   });
 
+  it('does not prestart event tools in a mixed direct-tool batch', async () => {
+    const graph = createGraph({
+      toolExecution: {
+        engine: 'local',
+      } as StandardGraph['toolExecution'],
+      getAgentContext: jest.fn(
+        (): Partial<AgentContext> => ({
+          provider: Providers.OPENAI,
+          reasoningKey: 'reasoning_content',
+          toolDefinitions: [
+            { name: Constants.EXECUTE_CODE },
+            { name: 'weather' },
+          ],
+          graphTools: [],
+          agentId: 'agent_1',
+        })
+      ) as unknown as StandardGraph['getAgentContext'],
+    });
+    const dispatchSpy = jest.spyOn(events, 'safeDispatchCustomEvent');
+
+    await new ChatModelStreamHandler().handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_code',
+              name: Constants.EXECUTE_CODE,
+              args: { code: 'print(1)' },
+            },
+            {
+              id: 'call_weather',
+              name: 'weather',
+              args: { city: 'NYC' },
+            },
+          ],
+          response_metadata: finalToolCallResponseMetadata,
+        } as unknown as t.StreamChunk,
+      },
+      { langgraph_node: 'agent' },
+      graph
+    );
+
+    expect(dispatchSpy).not.toHaveBeenCalledWith(
+      GraphEvents.ON_TOOL_EXECUTE,
+      expect.anything(),
+      expect.anything()
+    );
+    expect(graph.eagerEventToolExecutions.size).toBe(0);
+  });
+
   it('continues eager turns after normal event-dispatch usage', async () => {
     const graph = createGraph();
     graph.eagerEventToolUsageCount.set('weather', 1);
