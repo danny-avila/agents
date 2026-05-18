@@ -729,7 +729,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     toolName: string,
     callId?: string
   ): number {
-    const counter = this.eagerEventToolUsageCount ?? this.toolUsageCount;
+    const counter =
+      this.canConsumeEagerEventExecution() &&
+      this.eagerEventToolUsageCount != null
+        ? this.eagerEventToolUsageCount
+        : this.toolUsageCount;
     const turn = counter.get(toolName) ?? 0;
     counter.set(toolName, turn + 1);
     this.recordToolUsageTurn(toolName, turn, callId);

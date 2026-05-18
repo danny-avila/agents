@@ -3,8 +3,10 @@ import { tool } from '@langchain/core/tools';
 import { AIMessage, ToolMessage } from '@langchain/core/messages';
 import { describe, it, expect, jest, afterEach } from '@jest/globals';
 import type { StructuredToolInterface } from '@langchain/core/tools';
+import type { PreToolUseHookInput, PreToolUseHookOutput } from '@/hooks';
 import type * as t from '@/types';
 import { GraphEvents } from '@/common';
+import { HookRegistry } from '@/hooks';
 import * as events from '@/utils/events';
 import { ToolNode } from '../ToolNode';
 
@@ -175,5 +177,55 @@ describe('ToolNode eager event tool execution', () => {
     expect(eagerUsageCount.get('weather')).toBe(1);
     expect(result.messages).toHaveLength(1);
     expect(result.messages[0].content).toBe('normal result');
+  });
+
+  it('uses the legacy turn counter when eager mode cannot be consumed', async () => {
+    const { toolExecuteCalls } = installToolExecuteResponder('normal result');
+    const eagerUsageCount = new Map<string, number>();
+    const preToolTurns: Array<number | undefined> = [];
+    const hookRegistry = new HookRegistry();
+    hookRegistry.register('PreToolUse', {
+      hooks: [
+        async (
+          input: PreToolUseHookInput
+        ): Promise<PreToolUseHookOutput> => {
+          preToolTurns.push(input.turn);
+          return { decision: 'allow' };
+        },
+      ],
+    });
+
+    const toolNode = new ToolNode({
+      tools: [createDummyTool('weather')],
+      eventDrivenMode: true,
+      eagerEventToolExecution: { enabled: true },
+      eagerEventToolExecutions: new Map(),
+      eagerEventToolUsageCount: eagerUsageCount,
+      hookRegistry,
+      toolCallStepIds: new Map([
+        ['call_weather_1', 'step_weather_1'],
+        ['call_weather_2', 'step_weather_2'],
+      ]),
+    });
+
+    await toolNode.invoke({
+      messages: [
+        createAIMessage('call_weather_1', 'weather', { city: 'NYC' }),
+      ],
+    });
+
+    eagerUsageCount.clear();
+
+    await toolNode.invoke({
+      messages: [
+        createAIMessage('call_weather_2', 'weather', { city: 'Boston' }),
+      ],
+    });
+
+    expect(preToolTurns).toEqual([0, 1]);
+    expect(toolExecuteCalls.map((call) => call.toolCalls[0].turn)).toEqual([
+      0, 1,
+    ]);
+    expect(eagerUsageCount.size).toBe(0);
   });
 });
