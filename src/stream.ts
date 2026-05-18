@@ -201,6 +201,16 @@ function shouldAttemptEagerToolExecution(args: {
   return coerceRecordArgs(toolCall.args) != null;
 }
 
+function hasFinalToolCallSignal(chunk: Partial<AIMessageChunk>): boolean {
+  const metadata = chunk.response_metadata as Record<string, unknown> | undefined;
+  const finishReason =
+    metadata?.finish_reason ??
+    metadata?.finishReason ??
+    metadata?.stop_reason ??
+    metadata?.stopReason;
+  return finishReason === 'tool_calls' || finishReason === 'tool_use';
+}
+
 type EagerToolExecutionEntry = {
   id: string;
   toolName: string;
@@ -526,7 +536,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
     ) {
       hasToolCalls = true;
       await handleToolCalls(chunk.tool_calls, metadata, graph);
-      if (!hasToolCallChunks) {
+      if (!hasToolCallChunks && hasFinalToolCallSignal(chunk)) {
         startEagerToolExecutions({
           graph,
           metadata,

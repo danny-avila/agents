@@ -89,6 +89,8 @@ function chunkStateKey(stepKey: string, chunkKey: string | number): string {
   return `${stepKey}\u0000${String(chunkKey)}`;
 }
 
+const finalToolCallResponseMetadata = { finish_reason: 'tool_calls' };
+
 describe('ChatModelStreamHandler eager event tool execution', () => {
   afterEach(() => {
     jest.restoreAllMocks();
@@ -126,6 +128,7 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
               args: { city: 'NYC' },
             },
           ],
+          response_metadata: finalToolCallResponseMetadata,
         } as unknown as t.StreamChunk,
       },
       { langgraph_node: 'agent' },
@@ -146,6 +149,79 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
       args: { city: 'NYC' },
     });
     expect(graph.toolCallStepIds.has('call_weather')).toBe(true);
+  });
+
+  it('does not prestart parseable tool calls before a final tool-call signal', async () => {
+    const graph = createGraph();
+    const toolExecuteCalls: t.ToolExecuteBatchRequest[] = [];
+    jest.spyOn(events, 'safeDispatchCustomEvent').mockImplementation(
+      async (event, data): Promise<void> => {
+        if (event !== GraphEvents.ON_TOOL_EXECUTE) {
+          return;
+        }
+        const batch = data as t.ToolExecuteBatchRequest;
+        toolExecuteCalls.push(batch);
+        batch.resolve([
+          {
+            toolCallId: 'call_weather',
+            status: 'success',
+            content: 'sunny',
+          },
+        ]);
+      }
+    );
+
+    const handler = new ChatModelStreamHandler();
+    const metadata = { langgraph_node: 'agent' };
+
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_weather',
+              name: 'weather',
+              args: { city: 'N' },
+            },
+          ],
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+
+    expect(toolExecuteCalls).toHaveLength(0);
+    expect(graph.eagerEventToolExecutions.has('call_weather')).toBe(false);
+
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_weather',
+              name: 'weather',
+              args: { city: 'NYC' },
+            },
+          ],
+          response_metadata: finalToolCallResponseMetadata,
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+
+    expect(toolExecuteCalls).toHaveLength(1);
+    expect(toolExecuteCalls[0].toolCalls[0]).toMatchObject({
+      id: 'call_weather',
+      name: 'weather',
+      args: { city: 'NYC' },
+      stepId: expect.stringMatching(/^step_/),
+      turn: 0,
+    });
   });
 
   it('prestarts multiple complete event-driven tool calls as one batch', async () => {
@@ -195,6 +271,7 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
               args: { date: 'today' },
             },
           ],
+          response_metadata: finalToolCallResponseMetadata,
         } as unknown as t.StreamChunk,
       },
       { langgraph_node: 'agent' },
@@ -379,6 +456,7 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
               args: { city: 'NYC' },
             },
           ],
+          response_metadata: finalToolCallResponseMetadata,
         } as unknown as t.StreamChunk,
       },
       { langgraph_node: 'agent' },
@@ -453,6 +531,7 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
               args: { ticker: 'CH' },
             },
           ],
+          response_metadata: finalToolCallResponseMetadata,
         } as unknown as t.StreamChunk,
       },
       { langgraph_node: 'agent' },
@@ -582,6 +661,7 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
               args: { word: 'book' },
             },
           ],
+          response_metadata: finalToolCallResponseMetadata,
         } as unknown as t.StreamChunk,
       },
       metadata,
@@ -713,6 +793,7 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
               args: { city: 'NYC', unit: 'C' },
             },
           ],
+          response_metadata: finalToolCallResponseMetadata,
         } as unknown as t.StreamChunk,
       },
       metadata,
@@ -905,6 +986,7 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
           args: { city: 'NYC' },
         },
       ],
+      response_metadata: finalToolCallResponseMetadata,
     } as unknown as t.StreamChunk;
 
     await handler.handle(
@@ -960,6 +1042,7 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
               args: { city: 'NYC' },
             },
           ],
+          response_metadata: finalToolCallResponseMetadata,
         } as unknown as t.StreamChunk,
       },
       metadata,
@@ -1006,6 +1089,7 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
               args: { ticker: 'CH' },
             },
           ],
+          response_metadata: finalToolCallResponseMetadata,
         } as unknown as t.StreamChunk,
       },
       metadata,
@@ -1140,6 +1224,7 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
               args: { city: 'SF' },
             },
           ],
+          response_metadata: finalToolCallResponseMetadata,
         } as unknown as t.StreamChunk,
       },
       { langgraph_node: 'agent_b' },
@@ -1158,6 +1243,7 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
               args: { city: 'NYC' },
             },
           ],
+          response_metadata: finalToolCallResponseMetadata,
         } as unknown as t.StreamChunk,
       },
       { langgraph_node: 'agent_a' },
@@ -1283,6 +1369,7 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
               args: { city: 'NYC' },
             },
           ],
+          response_metadata: finalToolCallResponseMetadata,
         } as unknown as t.StreamChunk,
       },
       { langgraph_node: 'agent' },
