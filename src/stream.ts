@@ -26,7 +26,7 @@ import { coerceRecordArgs, normalizeError } from '@/tools/eagerEventExecution';
 
 const processedChatModelStreamChunks = new WeakMap<
   StandardGraph,
-  WeakMap<object, Map<string, string>>
+  WeakMap<object, string>
 >();
 const LOCAL_CODING_BUNDLE_NAME_SET: ReadonlySet<string> = new Set(
   LOCAL_CODING_BUNDLE_NAMES
@@ -126,27 +126,21 @@ function getChunkDedupeSignature(chunk: Partial<AIMessageChunk>): string {
 
 function shouldSkipProcessedChunk(args: {
   graph: StandardGraph;
-  stepKey: string;
   chunk: Partial<AIMessageChunk>;
 }): boolean {
-  const { graph, stepKey, chunk } = args;
+  const { graph, chunk } = args;
   let graphChunks = processedChatModelStreamChunks.get(graph);
   if (graphChunks == null) {
-    graphChunks = new WeakMap<object, Map<string, string>>();
+    graphChunks = new WeakMap<object, string>();
     processedChatModelStreamChunks.set(graph, graphChunks);
   }
 
-  let signaturesByStep = graphChunks.get(chunk);
   const signature = getChunkDedupeSignature(chunk);
-  if (signaturesByStep?.get(stepKey) === signature) {
+  if (graphChunks.get(chunk) === signature) {
     return true;
   }
 
-  if (signaturesByStep == null) {
-    signaturesByStep = new Map<string, string>();
-    graphChunks.set(chunk, signaturesByStep);
-  }
-  signaturesByStep.set(stepKey, signature);
+  graphChunks.set(chunk, signature);
   return false;
 }
 
@@ -548,8 +542,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
     const agentContext = graph.getAgentContext(metadata);
 
     const chunk = data.chunk as Partial<AIMessageChunk>;
-    const stepKey = graph.getStepKey(metadata);
-    if (shouldSkipProcessedChunk({ graph, stepKey, chunk })) {
+    if (shouldSkipProcessedChunk({ graph, chunk })) {
       return;
     }
 
@@ -611,6 +604,8 @@ export class ChatModelStreamHandler implements t.EventHandler {
     } else if (isEmptyChunk) {
       return;
     }
+
+    const stepKey = graph.getStepKey(metadata);
 
     if (
       hasToolCallChunks &&
