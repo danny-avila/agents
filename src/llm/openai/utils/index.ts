@@ -38,6 +38,11 @@ import type {
   ChatOpenAIReasoningSummary,
 } from '@langchain/openai';
 import { toLangChainContent } from '@/messages/langchain';
+import {
+  STREAMED_TOOL_CALL_SEAL_METADATA_KEY,
+  STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY,
+  OPENAI_RESPONSES_STREAMED_TOOL_CALL_ADAPTER,
+} from '@/tools/streamedToolCallSeals';
 
 export type { OpenAICallOptions, OpenAIChatInput };
 
@@ -948,6 +953,8 @@ export function _convertOpenAIResponsesDeltaToBaseMessageChunk(
     chunk.type === 'response.output_item.added' &&
     chunk.item.type === 'function_call'
   ) {
+    response_metadata[STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY] =
+      OPENAI_RESPONSES_STREAMED_TOOL_CALL_ADAPTER;
     tool_call_chunks.push({
       type: 'tool_call_chunk',
       name: chunk.item.name,
@@ -988,9 +995,24 @@ export function _convertOpenAIResponsesDeltaToBaseMessageChunk(
       if (key !== 'id') response_metadata[key] = value;
     }
   } else if (chunk.type === 'response.function_call_arguments.delta') {
+    response_metadata[STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY] =
+      OPENAI_RESPONSES_STREAMED_TOOL_CALL_ADAPTER;
     tool_call_chunks.push({
       type: 'tool_call_chunk',
       args: chunk.delta,
+      index: chunk.output_index,
+    });
+  } else if (chunk.type === 'response.function_call_arguments.done') {
+    response_metadata[STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY] =
+      OPENAI_RESPONSES_STREAMED_TOOL_CALL_ADAPTER;
+    response_metadata[STREAMED_TOOL_CALL_SEAL_METADATA_KEY] = {
+      kind: 'single',
+      index: chunk.output_index,
+    };
+    tool_call_chunks.push({
+      type: 'tool_call_chunk',
+      name: chunk.name,
+      args: chunk.arguments,
       index: chunk.output_index,
     });
   } else if (

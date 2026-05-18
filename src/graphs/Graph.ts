@@ -160,6 +160,20 @@ export abstract class Graph<
    */
   toolOutputReferences: t.ToolOutputReferencesConfig | undefined;
   /**
+   * Run-scoped opt-in for eager event-driven tool execution. The stream
+   * handler may prestart eligible event-driven tools; ToolNode later
+   * consumes the settled promises while preserving final ToolMessage order.
+   */
+  eagerEventToolExecution: t.EagerEventToolExecutionConfig | undefined;
+  eagerEventToolExecutions: Map<string, t.EagerEventToolExecution> = new Map();
+  eagerEventToolUsageCount: Map<string, number> = new Map();
+  private eagerEventToolUsageCountsByAgentId: Map<
+    string,
+    Map<string, number>
+  > = new Map();
+  eagerEventToolCallChunks: Map<string, t.EagerEventToolCallChunkState> =
+    new Map();
+  /**
    * Run-scoped execution backend for built-in code tools. Defaults to the
    * remote Code API sandbox when unset.
    */
@@ -198,6 +212,10 @@ export abstract class Graph<
     this.hookRegistry = undefined;
     this.humanInTheLoop = undefined;
     this.toolOutputReferences = undefined;
+    this.eagerEventToolExecution = undefined;
+    this.eagerEventToolExecutions.clear();
+    this.clearEagerEventToolUsageCounts();
+    this.eagerEventToolCallChunks.clear();
     this.toolExecution = undefined;
     this.handlerDispatchedEventCounts.clear();
     /**
@@ -228,6 +246,25 @@ export abstract class Graph<
     }
     this._compiledToolNodes.clear();
     this.sessions.clear();
+  }
+
+  getEagerEventToolUsageCount(agentId?: string): Map<string, number> {
+    if (agentId == null || agentId === '') {
+      return this.eagerEventToolUsageCount;
+    }
+    let usageCount = this.eagerEventToolUsageCountsByAgentId.get(agentId);
+    if (usageCount == null) {
+      usageCount = new Map<string, number>();
+      this.eagerEventToolUsageCountsByAgentId.set(agentId, usageCount);
+    }
+    return usageCount;
+  }
+
+  protected clearEagerEventToolUsageCounts(): void {
+    this.eagerEventToolUsageCount.clear();
+    for (const usageCount of this.eagerEventToolUsageCountsByAgentId.values()) {
+      usageCount.clear();
+    }
   }
 
   markHandlerDispatchedEvent(eventName: string, stepId: string): () => void {
@@ -410,6 +447,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
      * a stale reference on 2nd+ processStream calls.
      */
     this.toolCallStepIds.clear();
+    this.eagerEventToolExecutions.clear();
+    this.clearEagerEventToolUsageCounts();
+    this.eagerEventToolCallChunks.clear();
     this.handlerDispatchedStepIds = resetIfNotEmpty(
       this.handlerDispatchedStepIds,
       new Set()
@@ -712,6 +752,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         toolRegistry: agentContext?.toolRegistry,
         hookRegistry: this.hookRegistry,
         humanInTheLoop: this.humanInTheLoop,
+        eagerEventToolExecution: this.eagerEventToolExecution,
+        eagerEventToolExecutions: this.eagerEventToolExecutions,
+        eagerEventToolUsageCount: this.getEagerEventToolUsageCount(
+          agentContext?.agentId
+        ),
         toolExecution: this.toolExecution,
         directToolNames: directToolNames.size > 0 ? directToolNames : undefined,
         maxContextTokens: agentContext?.maxContextTokens,

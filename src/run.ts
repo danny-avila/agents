@@ -85,6 +85,7 @@ export class Run<_T extends t.BaseGraphState> {
   private hookRegistry?: HookRegistry;
   private humanInTheLoop?: t.HumanInTheLoopConfig;
   private toolOutputReferences?: t.ToolOutputReferencesConfig;
+  private eagerEventToolExecution?: t.EagerEventToolExecutionConfig;
   private toolExecution?: t.ToolExecutionConfig;
   private indexTokenCountMap?: Record<string, number>;
   calibrationRatio: number = 1;
@@ -130,6 +131,7 @@ export class Run<_T extends t.BaseGraphState> {
     this.hookRegistry = config.hooks;
     this.humanInTheLoop = config.humanInTheLoop;
     this.toolOutputReferences = config.toolOutputReferences;
+    this.eagerEventToolExecution = config.eagerEventToolExecution;
     this.toolExecution = config.toolExecution;
 
     if (!config.graphConfig) {
@@ -211,6 +213,7 @@ export class Run<_T extends t.BaseGraphState> {
     standardGraph.hookRegistry = this.hookRegistry;
     standardGraph.humanInTheLoop = this.humanInTheLoop;
     standardGraph.toolOutputReferences = this.toolOutputReferences;
+    standardGraph.eagerEventToolExecution = this.eagerEventToolExecution;
     standardGraph.toolExecution = this.toolExecution;
     this.Graph = standardGraph;
     return standardGraph.createWorkflow();
@@ -236,6 +239,7 @@ export class Run<_T extends t.BaseGraphState> {
     multiAgentGraph.hookRegistry = this.hookRegistry;
     multiAgentGraph.humanInTheLoop = this.humanInTheLoop;
     multiAgentGraph.toolOutputReferences = this.toolOutputReferences;
+    multiAgentGraph.eagerEventToolExecution = this.eagerEventToolExecution;
     multiAgentGraph.toolExecution = this.toolExecution;
     this.Graph = multiAgentGraph;
     return multiAgentGraph.createWorkflow();

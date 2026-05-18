@@ -1,7 +1,7 @@
 // src/stream.ts
 import type { ChatOpenAIReasoningSummary } from '@langchain/openai';
 import type { AIMessageChunk } from '@langchain/core/messages';
-import type { ToolCall } from '@langchain/core/messages/tool';
+import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
 import type { AgentContext } from '@/agents/AgentContext';
 import type { StandardGraph } from '@/graphs';
 import type * as t from '@/types';
@@ -11,6 +11,9 @@ import {
   GraphEvents,
   StepTypes,
   Providers,
+  Constants,
+  CODE_EXECUTION_TOOLS,
+  LOCAL_CODING_BUNDLE_NAMES,
 } from '@/common';
 import {
   handleServerToolResult,
@@ -18,6 +21,21 @@ import {
   handleToolCalls,
 } from '@/tools/handlers';
 import { getMessageId } from '@/messages';
+import { safeDispatchCustomEvent } from '@/utils/events';
+import {
+  buildToolExecutionRequestPlan,
+  coerceRecordArgs,
+  normalizeError,
+} from '@/tools/eagerEventExecution';
+import {
+  getStreamedToolCallSeal,
+  getStreamedToolCallAdapter,
+  type StreamedToolCallSeal,
+} from '@/tools/streamedToolCallSeals';
+
+const LOCAL_CODING_BUNDLE_NAME_SET: ReadonlySet<string> = new Set(
+  LOCAL_CODING_BUNDLE_NAMES
+);
 
 /**
  * Parses content to extract thinking sections enclosed in <think> tags using string operations
@@ -77,6 +95,597 @@ function getNonEmptyValue(possibleValues: string[]): string | undefined {
     }
   }
   return undefined;
+}
+
+function isBatchSensitiveToolExecution(graph: StandardGraph): boolean {
+  return (
+    graph.hookRegistry != null ||
+    graph.humanInTheLoop?.enabled === true ||
+    graph.toolOutputReferences?.enabled === true
+  );
+}
+
+function isDirectGraphTool(
+  name: string,
+  agentContext: AgentContext | undefined
+): boolean {
+  if (name.startsWith(Constants.LC_TRANSFER_TO_)) {
+    return true;
+  }
+  return (
+    (agentContext?.graphTools as t.GenericTool[] | undefined)?.some(
+      (tool) => 'name' in tool && tool.name === name
+    ) === true
+  );
+}
+
+function isDirectLocalTool(name: string, graph: StandardGraph): boolean {
+  if (graph.toolExecution?.engine !== 'local') {
+    return false;
+  }
+  if (graph.toolExecution.local?.includeCodingTools === false) {
+    return CODE_EXECUTION_TOOLS.has(name);
+  }
+  return LOCAL_CODING_BUNDLE_NAME_SET.has(name);
+}
+
+function toCodeEnvFile(file: t.FileRef, execSessionId: string): t.CodeEnvFile {
+  const base = {
+    id: file.id,
+    resource_id: file.resource_id ?? file.id,
+    name: file.name,
+    storage_session_id: file.storage_session_id ?? execSessionId,
+  };
+  const kind = file.kind ?? 'user';
+  if (kind === 'skill' && file.version != null) {
+    return { ...base, kind: 'skill', version: file.version };
+  }
+  if (kind === 'agent') {
+    return { ...base, kind: 'agent' };
+  }
+  return { ...base, kind: 'user' };
+}
+
+function getCodeSessionContext(
+  graph: StandardGraph,
+  name: string
+): t.ToolCallRequest['codeSessionContext'] | undefined {
+  if (
+    !CODE_EXECUTION_TOOLS.has(name) &&
+    name !== Constants.SKILL_TOOL &&
+    name !== Constants.READ_FILE
+  ) {
+    return undefined;
+  }
+
+  const codeSession = graph.sessions.get(Constants.EXECUTE_CODE) as
+    | t.CodeSessionContext
+    | undefined;
+  if (codeSession?.session_id == null || codeSession.session_id === '') {
+    return undefined;
+  }
+
+  return {
+    session_id: codeSession.session_id,
+    files: codeSession.files?.map((file) =>
+      toCodeEnvFile(file, codeSession.session_id)
+    ),
+  };
+}
+
+function isEagerToolExecutionEnabledForBatch(args: {
+  graph: StandardGraph;
+  metadata?: Record<string, unknown>;
+  agentContext?: AgentContext;
+}): boolean {
+  const { graph, metadata, agentContext } = args;
+  if (graph.eagerEventToolExecution?.enabled !== true) {
+    return false;
+  }
+  if ((agentContext?.toolDefinitions?.length ?? 0) === 0) {
+    return false;
+  }
+  if (isBatchSensitiveToolExecution(graph)) {
+    return false;
+  }
+  if (
+    metadata?.[Constants.PROGRAMMATIC_TOOL_CALLING] === true ||
+    metadata?.[Constants.BASH_PROGRAMMATIC_TOOL_CALLING] === true
+  ) {
+    return false;
+  }
+  if (graph.handlerRegistry?.getHandler(GraphEvents.ON_TOOL_EXECUTE) == null) {
+    return false;
+  }
+  return true;
+}
+
+function hasFinalToolCallSignal(chunk: Partial<AIMessageChunk>): boolean {
+  const metadata = chunk.response_metadata as Record<string, unknown> | undefined;
+  const finishReason =
+    metadata?.finish_reason ??
+    metadata?.finishReason ??
+    metadata?.stop_reason ??
+    metadata?.stopReason;
+  return finishReason === 'tool_calls' || finishReason === 'tool_use';
+}
+
+function canPrestartSequentialStreamedToolChunks(
+  agentContext: AgentContext | undefined
+): boolean {
+  return (
+    agentContext?.provider === Providers.ANTHROPIC ||
+    agentContext?.provider === Providers.MOONSHOT
+  );
+}
+
+function hasExplicitStreamedToolCallSeals(
+  chunk: Partial<AIMessageChunk>
+): boolean {
+  return getStreamedToolCallAdapter(
+    chunk.response_metadata as Record<string, unknown> | undefined
+  ) != null;
+}
+
+function hasDirectToolCallInBatch(args: {
+  graph: StandardGraph;
+  agentContext?: AgentContext;
+  toolCalls: ToolCall[];
+}): boolean {
+  const { graph, agentContext, toolCalls } = args;
+  return toolCalls.some(
+    (toolCall) =>
+      toolCall.name !== '' &&
+      (isDirectGraphTool(toolCall.name, agentContext) ||
+        isDirectLocalTool(toolCall.name, graph))
+  );
+}
+
+function hasPotentialDirectToolInStreamContext(args: {
+  graph: StandardGraph;
+  agentContext?: AgentContext;
+}): boolean {
+  const { graph, agentContext } = args;
+  if (graph.toolExecution?.engine === 'local') {
+    return true;
+  }
+  if ((agentContext?.graphTools?.length ?? 0) > 0) {
+    return true;
+  }
+  return (
+    agentContext?.toolDefinitions?.some((toolDefinition) =>
+      toolDefinition.name.startsWith(Constants.LC_TRANSFER_TO_)
+    ) === true
+  );
+}
+
+type EagerToolExecutionEntry = {
+  id: string;
+  toolName: string;
+  coercedArgs: Record<string, unknown>;
+  request: t.ToolCallRequest;
+};
+
+function createEagerToolExecutionPlan(args: {
+  graph: StandardGraph;
+  metadata?: Record<string, unknown>;
+  agentContext?: AgentContext;
+  toolCalls: ToolCall[];
+  skipExisting?: boolean;
+}): EagerToolExecutionEntry[] | undefined {
+  const { graph, metadata, agentContext, toolCalls, skipExisting = false } = args;
+  if (
+    !isEagerToolExecutionEnabledForBatch({
+      graph,
+      metadata,
+      agentContext,
+    })
+  ) {
+    return undefined;
+  }
+
+  if (hasDirectToolCallInBatch({ graph, agentContext, toolCalls })) {
+    return undefined;
+  }
+
+  const candidateToolCalls = skipExisting
+    ? toolCalls.filter((toolCall) => {
+      if (toolCall.id == null || toolCall.id === '') {
+        return true;
+      }
+      return !graph.eagerEventToolExecutions.has(toolCall.id);
+    })
+    : toolCalls;
+  if (candidateToolCalls.length === 0) {
+    return [];
+  }
+
+  // Eager execution must preserve ToolNode batch semantics exactly for every
+  // unstarted call. If any candidate cannot be planned, fall back for that
+  // candidate set.
+  if (
+    candidateToolCalls.some(
+      (toolCall) =>
+        toolCall.id == null ||
+        toolCall.id === '' ||
+        toolCall.name === '' ||
+        (!skipExisting && graph.eagerEventToolExecutions.has(toolCall.id))
+    )
+  ) {
+    return undefined;
+  }
+
+  const plan = buildToolExecutionRequestPlan({
+    toolCalls: candidateToolCalls.map((toolCall) => ({
+      id: toolCall.id,
+      name: toolCall.name,
+      args: toolCall.args,
+      stepId: graph.toolCallStepIds.get(toolCall.id!) ?? '',
+      codeSessionContext: getCodeSessionContext(graph, toolCall.name),
+    })),
+    usageCount: graph.getEagerEventToolUsageCount(agentContext?.agentId),
+  });
+  if (plan == null) {
+    return undefined;
+  }
+
+  return plan.requests.map((request): EagerToolExecutionEntry => ({
+    id: request.id,
+    toolName: request.name,
+    coercedArgs: request.args,
+    request,
+  }));
+}
+
+function startEagerToolExecutions(args: {
+  graph: StandardGraph;
+  metadata?: Record<string, unknown>;
+  agentContext?: AgentContext;
+  toolCalls: ToolCall[];
+  skipExisting?: boolean;
+}): void {
+  const { graph, metadata, agentContext, toolCalls, skipExisting } = args;
+  const entries = createEagerToolExecutionPlan({
+    graph,
+    metadata,
+    agentContext,
+    toolCalls,
+    skipExisting,
+  });
+  if (entries == null || entries.length === 0) {
+    return;
+  }
+
+  const promise: Promise<t.EagerEventToolExecutionOutcome> = new Promise<
+    t.ToolExecuteResult[]
+  >((resolve, reject) => {
+    const batchRequest: t.ToolExecuteBatchRequest = {
+      toolCalls: entries.map((entry) => entry.request),
+      userId: graph.config?.configurable?.user_id as string | undefined,
+      agentId: agentContext?.agentId,
+      configurable: graph.config?.configurable as
+        | Record<string, unknown>
+        | undefined,
+      metadata,
+      resolve,
+      reject,
+    };
+
+    safeDispatchCustomEvent(
+      GraphEvents.ON_TOOL_EXECUTE,
+      batchRequest,
+      graph.config
+    );
+  }).then(
+    (results): t.EagerEventToolExecutionOutcome => ({ results }),
+    (error): t.EagerEventToolExecutionOutcome => ({
+      error: normalizeError(error),
+    })
+  );
+
+  for (const entry of entries) {
+    graph.eagerEventToolExecutions.set(entry.id, {
+      toolCallId: entry.id,
+      toolName: entry.toolName,
+      args: entry.coercedArgs,
+      request: entry.request,
+      promise,
+    });
+  }
+}
+
+function getEagerToolChunkKey(
+  stepKey: string,
+  toolCallChunk: ToolCallChunk
+): string | undefined {
+  let chunkKey: string | undefined;
+  if (typeof toolCallChunk.index === 'number') {
+    chunkKey = String(toolCallChunk.index);
+  } else if (toolCallChunk.id != null && toolCallChunk.id !== '') {
+    chunkKey = toolCallChunk.id;
+  }
+  if (chunkKey == null) {
+    return undefined;
+  }
+  return `${stepKey}\u0000${chunkKey}`;
+}
+
+function getEagerToolChunkIndex(toolCallChunk: ToolCallChunk): number | undefined {
+  return typeof toolCallChunk.index === 'number' ? toolCallChunk.index : undefined;
+}
+
+function pruneEagerToolCallChunkStates(args: {
+  graph: StandardGraph;
+  stepKey: string;
+  toolCallIds?: ReadonlySet<string>;
+  clearStep?: boolean;
+}): void {
+  const { graph, stepKey, toolCallIds, clearStep = false } = args;
+  const prefix = `${stepKey}\u0000`;
+  for (const [key, state] of graph.eagerEventToolCallChunks) {
+    if (!key.startsWith(prefix)) {
+      continue;
+    }
+    if (clearStep || (state.id != null && toolCallIds?.has(state.id) === true)) {
+      graph.eagerEventToolCallChunks.delete(key);
+    }
+  }
+}
+
+function isEagerToolChunkStateComplete(
+  state: t.EagerEventToolCallChunkState
+): boolean {
+  return (
+    state.id != null &&
+    state.id !== '' &&
+    state.name != null &&
+    state.name !== '' &&
+    coerceRecordArgs(state.argsText) != null
+  );
+}
+
+function mergeToolCallArgsText(existing: string, incoming: string): string {
+  if (incoming === '') {
+    return existing;
+  }
+  if (existing === '') {
+    return incoming;
+  }
+  if (incoming === existing) {
+    try {
+      JSON.parse(incoming);
+      return incoming;
+    } catch {
+      return `${existing}${incoming}`;
+    }
+  }
+  if (incoming.startsWith(existing)) {
+    return incoming;
+  }
+  if (existing.startsWith(incoming)) {
+    return existing;
+  }
+  try {
+    JSON.parse(existing);
+    JSON.parse(incoming);
+    return incoming;
+  } catch {
+    // Fall through to delta concatenation.
+  }
+  for (
+    let overlap = Math.min(existing.length, incoming.length);
+    overlap >= 8;
+    overlap -= 1
+  ) {
+    if (existing.endsWith(incoming.slice(0, overlap))) {
+      return `${existing}${incoming.slice(overlap)}`;
+    }
+  }
+  return `${existing}${incoming}`;
+}
+
+function recordEagerToolCallChunks(args: {
+  graph: StandardGraph;
+  stepKey: string;
+  toolCallChunks?: ToolCallChunk[];
+}): void {
+  const { graph, stepKey, toolCallChunks } = args;
+  if (toolCallChunks == null || toolCallChunks.length === 0) {
+    return;
+  }
+
+  // Streamed args can be cumulative and parseable before the provider has
+  // sealed the call. Recording stays separate from dispatch so the boundary
+  // logic can wait for either a later tool index or the final tool-call signal.
+  for (const toolCallChunk of toolCallChunks) {
+    const key = getEagerToolChunkKey(stepKey, toolCallChunk);
+    if (key == null) {
+      continue;
+    }
+
+    const incomingId =
+      toolCallChunk.id != null && toolCallChunk.id !== ''
+        ? toolCallChunk.id
+        : undefined;
+    const incomingName =
+      toolCallChunk.name != null && toolCallChunk.name !== ''
+        ? toolCallChunk.name
+        : undefined;
+    const previous = graph.eagerEventToolCallChunks.get(key);
+    const shouldReset =
+      previous != null &&
+      ((incomingId != null && previous.id != null && incomingId !== previous.id) ||
+        (incomingName != null &&
+          previous.name != null &&
+          incomingName !== previous.name));
+    const existing =
+      previous == null || shouldReset
+        ? {
+          argsText: '',
+        }
+        : previous;
+    const id =
+      incomingId ?? existing.id;
+    const name =
+      incomingName ?? existing.name;
+    const incomingArgs = toolCallChunk.args ?? '';
+    const isRepeatedObservedFragment =
+      incomingArgs !== '' &&
+      incomingArgs.length > 1 &&
+      incomingArgs === existing.lastArgsFragment;
+    const argsText = isRepeatedObservedFragment
+      ? existing.argsText
+      : mergeToolCallArgsText(existing.argsText, incomingArgs);
+    const next = {
+      id,
+      name,
+      argsText,
+      index: getEagerToolChunkIndex(toolCallChunk) ?? existing.index,
+      lastArgsFragment:
+        incomingArgs !== '' ? incomingArgs : existing.lastArgsFragment,
+    };
+    graph.eagerEventToolCallChunks.set(key, next);
+  }
+}
+
+function getStreamedReadyToolCalls(args: {
+  graph: StandardGraph;
+  stepKey: string;
+  toolCallChunks?: ToolCallChunk[];
+  seal?: StreamedToolCallSeal;
+  allowSequentialSeal?: boolean;
+  sealAll?: boolean;
+}): ToolCall[] {
+  const {
+    graph,
+    stepKey,
+    toolCallChunks,
+    seal,
+    allowSequentialSeal = false,
+    sealAll = false,
+  } = args;
+  const currentIndices = new Set<number>();
+  for (const toolCallChunk of toolCallChunks ?? []) {
+    const index = getEagerToolChunkIndex(toolCallChunk);
+    if (index != null) {
+      currentIndices.add(index);
+    }
+  }
+  const highestCurrentIndex =
+    currentIndices.size > 0 ? Math.max(...currentIndices) : undefined;
+  const prefix = `${stepKey}\u0000`;
+  const readyEntries: Array<{
+    key: string;
+    state: t.EagerEventToolCallChunkState;
+  }> = [];
+
+  for (const [key, state] of graph.eagerEventToolCallChunks) {
+    if (!key.startsWith(prefix)) {
+      continue;
+    }
+    if (state.id != null && graph.eagerEventToolExecutions.has(state.id)) {
+      graph.eagerEventToolCallChunks.delete(key);
+      continue;
+    }
+    if (!isEagerToolChunkStateComplete(state)) {
+      continue;
+    }
+    const isSealedByLaterChunk =
+      allowSequentialSeal &&
+      highestCurrentIndex != null &&
+      state.index != null &&
+      state.index < highestCurrentIndex &&
+      !currentIndices.has(state.index);
+    const isSealedExplicitly =
+      seal?.kind === 'single' &&
+      ((seal.id != null && state.id === seal.id) ||
+        (seal.index != null && state.index === seal.index));
+    if (
+      sealAll ||
+      seal?.kind === 'all' ||
+      isSealedByLaterChunk ||
+      isSealedExplicitly
+    ) {
+      readyEntries.push({ key, state });
+    }
+  }
+
+  pruneEagerToolCallChunkStates({
+    graph,
+    stepKey,
+    toolCallIds: new Set(
+      readyEntries
+        .map(({ state }) => state.id)
+        .filter((id): id is string => id != null && id !== '')
+    ),
+  });
+  if (sealAll) {
+    pruneEagerToolCallChunkStates({ graph, stepKey, clearStep: true });
+  }
+
+  return readyEntries
+    .sort(
+      (left, right) => (left.state.index ?? 0) - (right.state.index ?? 0)
+    )
+    .flatMap(({ state }) => {
+      const args = coerceRecordArgs(state.argsText);
+      if (args == null) {
+        return [];
+      }
+      return [
+        {
+          id: state.id,
+          name: state.name ?? '',
+          args,
+        },
+      ];
+    });
+}
+
+function startReadyStreamedEagerToolExecutions(args: {
+  graph: StandardGraph;
+  metadata?: Record<string, unknown>;
+  agentContext?: AgentContext;
+  stepKey: string;
+  toolCallChunks?: ToolCallChunk[];
+  seal?: StreamedToolCallSeal;
+  allowSequentialSeal?: boolean;
+  sealAll?: boolean;
+}): void {
+  const {
+    graph,
+    metadata,
+    agentContext,
+    stepKey,
+    toolCallChunks,
+    seal,
+    allowSequentialSeal,
+    sealAll,
+  } = args;
+  if (
+    hasPotentialDirectToolInStreamContext({ graph, agentContext }) ||
+    !isEagerToolExecutionEnabledForBatch({ graph, metadata, agentContext })
+  ) {
+    return;
+  }
+  const toolCalls = getStreamedReadyToolCalls({
+    graph,
+    stepKey,
+    toolCallChunks,
+    seal,
+    allowSequentialSeal,
+    sealAll,
+  });
+  if (toolCalls.length === 0) {
+    return;
+  }
+  startEagerToolExecutions({
+    graph,
+    metadata,
+    agentContext,
+    toolCalls,
+    skipExisting: true,
+  });
 }
 
 export function getChunkContent({
@@ -157,6 +766,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
     const agentContext = graph.getAgentContext(metadata);
 
     const chunk = data.chunk as Partial<AIMessageChunk>;
+
     const content = getChunkContent({
       chunk,
       reasoningKey: agentContext.reasoningKey,
@@ -172,7 +782,10 @@ export class ChatModelStreamHandler implements t.EventHandler {
       return;
     }
     this.handleReasoning(chunk, agentContext);
+    const stepKey = graph.getStepKey(metadata);
     let hasToolCalls = false;
+    const hasToolCallChunks =
+      (chunk.tool_call_chunks && chunk.tool_call_chunks.length > 0) ?? false;
     if (
       chunk.tool_calls &&
       chunk.tool_calls.length > 0 &&
@@ -186,10 +799,20 @@ export class ChatModelStreamHandler implements t.EventHandler {
     ) {
       hasToolCalls = true;
       await handleToolCalls(chunk.tool_calls, metadata, graph);
+      if (hasFinalToolCallSignal(chunk)) {
+        startEagerToolExecutions({
+          graph,
+          metadata,
+          agentContext,
+          toolCalls: chunk.tool_calls,
+          skipExisting: true,
+        });
+        if (!hasToolCallChunks) {
+          pruneEagerToolCallChunkStates({ graph, stepKey, clearStep: true });
+        }
+      }
     }
 
-    const hasToolCallChunks =
-      (chunk.tool_call_chunks && chunk.tool_call_chunks.length > 0) ?? false;
     const isEmptyContent =
       typeof content === 'undefined' ||
       !content.length ||
@@ -202,13 +825,10 @@ export class ChatModelStreamHandler implements t.EventHandler {
       (chunk.id ?? '') !== '' &&
       !graph.prelimMessageIdsByStepKey.has(chunk.id ?? '')
     ) {
-      const stepKey = graph.getStepKey(metadata);
       graph.prelimMessageIdsByStepKey.set(stepKey, chunk.id ?? '');
     } else if (isEmptyChunk) {
       return;
     }
-
-    const stepKey = graph.getStepKey(metadata);
 
     if (
       hasToolCallChunks &&
@@ -216,12 +836,40 @@ export class ChatModelStreamHandler implements t.EventHandler {
       chunk.tool_call_chunks.length &&
       typeof chunk.tool_call_chunks[0]?.index === 'number'
     ) {
+      const streamedToolCallSeal = getStreamedToolCallSeal(
+        chunk.response_metadata as Record<string, unknown> | undefined
+      );
+      const allowSequentialSeal =
+        canPrestartSequentialStreamedToolChunks(agentContext);
+      const canStreamEager =
+        (allowSequentialSeal || hasExplicitStreamedToolCallSeals(chunk)) &&
+        !hasPotentialDirectToolInStreamContext({ graph, agentContext }) &&
+        isEagerToolExecutionEnabledForBatch({ graph, metadata, agentContext });
+      if (canStreamEager) {
+        recordEagerToolCallChunks({
+          graph,
+          stepKey,
+          toolCallChunks: chunk.tool_call_chunks,
+        });
+      }
       await handleToolCallChunks({
         graph,
         stepKey,
         toolCallChunks: chunk.tool_call_chunks,
         metadata,
       });
+      if (canStreamEager) {
+        startReadyStreamedEagerToolExecutions({
+          graph,
+          metadata,
+          agentContext,
+          stepKey,
+          toolCallChunks: chunk.tool_call_chunks,
+          seal: streamedToolCallSeal,
+          allowSequentialSeal,
+          sealAll: hasFinalToolCallSignal(chunk),
+        });
+      }
     }
 
     if (isEmptyContent) {

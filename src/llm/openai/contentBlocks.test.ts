@@ -4,6 +4,12 @@ import {
   AIMessageChunk,
   type ContentBlock,
 } from '@langchain/core/messages';
+import {
+  STREAMED_TOOL_CALL_SEAL_METADATA_KEY,
+  STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY,
+  OPENAI_RESPONSES_STREAMED_TOOL_CALL_ADAPTER,
+} from '@/tools/streamedToolCallSeals';
+import { _convertOpenAIResponsesDeltaToBaseMessageChunk } from './utils';
 
 describe('OpenAI content block translator compatibility', () => {
   describe('Chat Completions', () => {
@@ -107,6 +113,35 @@ describe('OpenAI content block translator compatibility', () => {
   });
 
   describe('Responses', () => {
+    test('marks Responses function call arguments done as an explicit tool-call seal', () => {
+      const chunk = _convertOpenAIResponsesDeltaToBaseMessageChunk({
+        type: 'response.function_call_arguments.done',
+        sequence_number: 3,
+        item_id: 'fc_123',
+        output_index: 1,
+        name: 'search',
+        arguments: '{"query":"weather"}',
+      } as Parameters<typeof _convertOpenAIResponsesDeltaToBaseMessageChunk>[0]);
+      const message = chunk?.message as AIMessageChunk | undefined;
+
+      expect(message?.tool_call_chunks).toEqual([
+        {
+          type: 'tool_call_chunk',
+          name: 'search',
+          args: '{"query":"weather"}',
+          index: 1,
+        },
+      ]);
+      expect(message?.response_metadata).toMatchObject({
+        [STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY]:
+          OPENAI_RESPONSES_STREAMED_TOOL_CALL_ADAPTER,
+        [STREAMED_TOOL_CALL_SEAL_METADATA_KEY]: {
+          kind: 'single',
+          index: 1,
+        },
+      });
+    });
+
     test('translates Responses messages to v1 content blocks', () => {
       const code = ['print(', 'hello', ')'].join(String.fromCharCode(39));
       const responseTextBlock = {

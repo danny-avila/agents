@@ -50,6 +50,10 @@ import {
   resolveLocalToolRegistry,
   resolveLocalExecutionTools,
 } from '@/tools/local';
+import {
+  buildToolExecutionRequestPlan,
+  recordArgsEqual,
+} from '@/tools/eagerEventExecution';
 
 /**
  * Per-call batch context for `runTool`. Bundles every optional
@@ -413,6 +417,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private sessions?: t.ToolSessionMap;
   /** When true, dispatches ON_TOOL_EXECUTE events instead of invoking tools directly */
   private eventDrivenMode: boolean = false;
+  /** Opt-in stream-layer prestart config for event-driven tools. */
+  private eagerEventToolExecution?: t.EagerEventToolExecutionConfig;
+  /** Shared per-run prestarted tool registry populated by ChatModelStreamHandler. */
+  private eagerEventToolExecutions?: Map<string, t.EagerEventToolExecution>;
+  /** Shared per-run per-tool turn counter used by eager and normal event dispatch. */
+  private eagerEventToolUsageCount?: Map<string, number>;
   /** Agent ID for event-driven mode */
   private agentId?: string;
   /** Tool names that bypass event dispatch and execute directly (e.g., graph-managed handoff tools) */
@@ -469,6 +479,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     toolRegistry,
     sessions,
     eventDrivenMode,
+    eagerEventToolExecution,
+    eagerEventToolExecutions,
+    eagerEventToolUsageCount,
     agentId,
     directToolNames,
     maxContextTokens,
@@ -493,6 +506,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     });
     this.sessions = sessions;
     this.eventDrivenMode = eventDrivenMode ?? false;
+    this.eagerEventToolExecution = eagerEventToolExecution;
+    this.eagerEventToolExecutions = eagerEventToolExecutions;
+    this.eagerEventToolUsageCount = eagerEventToolUsageCount;
     this.agentId = agentId;
     this.directToolNames = directToolNames;
     this.maxToolResultChars =
@@ -696,6 +712,34 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
    */
   public getToolUsageCounts(): ReadonlyMap<string, number> {
     return new Map(this.toolUsageCount); // Return a copy
+  }
+
+  private recordToolUsageTurn(
+    toolName: string,
+    turn: number,
+    callId?: string
+  ): void {
+    this.toolUsageCount.set(
+      toolName,
+      Math.max(this.toolUsageCount.get(toolName) ?? 0, turn + 1)
+    );
+    if (callId != null && callId !== '') {
+      this.toolCallTurns.set(callId, turn);
+    }
+  }
+
+  private recordEventToolPlanningTurn(
+    toolName: string,
+    turn: number,
+    callId?: string
+  ): void {
+    this.recordToolUsageTurn(toolName, turn, callId);
+    if (this.canConsumeEagerEventExecution()) {
+      this.eagerEventToolUsageCount?.set(
+        toolName,
+        Math.max(this.eagerEventToolUsageCount.get(toolName) ?? 0, turn + 1)
+      );
+    }
   }
 
   /**
@@ -2331,67 +2375,99 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     const batchIndexByCallId = new Map<string, number>();
 
     if (approvedEntries.length > 0) {
-      const requests: t.ToolCallRequest[] = approvedEntries.map((entry) => {
-        const turn = this.toolUsageCount.get(entry.call.name) ?? 0;
-        this.toolUsageCount.set(entry.call.name, turn + 1);
+      const plan = buildToolExecutionRequestPlan({
+        toolCalls: approvedEntries.map((entry) => {
+          const codeSessionContext =
+            CODE_EXECUTION_TOOLS.has(entry.call.name) ||
+            entry.call.name === Constants.SKILL_TOOL ||
+            entry.call.name === Constants.READ_FILE
+              ? this.getCodeSessionContext()
+              : undefined;
+          return {
+            id: entry.call.id,
+            name: entry.call.name,
+            args: entry.args,
+            stepId: entry.stepId,
+            codeSessionContext,
+          };
+        }),
+        usageCount: this.toolUsageCount,
+        invalidArgsBehavior: 'error-result',
+        recordTurn: (toolName, reservedTurn, callId) => {
+          this.recordEventToolPlanningTurn(toolName, reservedTurn, callId);
+        },
+      });
+      if (plan == null) {
+        throw new Error('Unable to build event tool execution request plan');
+      }
+      const requests = plan.requests;
 
+      for (const entry of approvedEntries) {
         if (entry.batchIndex != null && entry.call.id != null) {
           batchIndexByCallId.set(entry.call.id, entry.batchIndex);
         }
+      }
 
-        const request: t.ToolCallRequest = {
-          id: entry.call.id!,
-          name: entry.call.name,
-          args: entry.args,
-          stepId: entry.stepId,
-          turn,
-        };
+      for (const result of plan.rejectedResults) {
+        this.eagerEventToolExecutions?.delete(result.toolCallId);
+      }
 
-        /**
-         * Emit `codeSessionContext` for any tool whose host handler may need
-         * to reach into the code-execution sandbox:
-         *   - `CODE_EXECUTION_TOOLS` — direct executors that POST to /exec.
-         *   - `SKILL_TOOL` — skill files live alongside code-env state.
-         *   - `READ_FILE` — when the requested path is a code-env artifact
-         *     (e.g. `/mnt/data/...`) the host falls back to reading via the
-         *     same sandbox session; without the seeded `session_id` /
-         *     `_injected_files` here, that fallback can't see prior-turn
-         *     artifacts on the very first call of a turn.
-         */
-        if (
-          CODE_EXECUTION_TOOLS.has(entry.call.name) ||
-          entry.call.name === Constants.SKILL_TOOL ||
-          entry.call.name === Constants.READ_FILE
-        ) {
-          request.codeSessionContext = this.getCodeSessionContext();
+      const requestMap = new Map(plan.allRequests.map((r) => [r.id, r]));
+      const eagerExecutions: Array<{
+        request: t.ToolCallRequest;
+        execution: t.EagerEventToolExecution;
+      }> = [];
+      const dispatchRequests: t.ToolCallRequest[] = [];
+
+      for (const request of requests) {
+        const eagerExecution = this.takeMatchingEagerEventExecution(request);
+        if (eagerExecution != null) {
+          eagerExecutions.push({ request, execution: eagerExecution });
+        } else {
+          dispatchRequests.push(request);
         }
+      }
 
-        return request;
-      });
+      const dispatchPromise =
+        dispatchRequests.length === 0
+          ? Promise.resolve([] as t.ToolExecuteResult[])
+          : new Promise<t.ToolExecuteResult[]>((resolve, reject) => {
+            const batchRequest: t.ToolExecuteBatchRequest = {
+              toolCalls: dispatchRequests,
+              userId: config.configurable?.user_id as string | undefined,
+              agentId: this.agentId,
+              configurable: config.configurable as
+                  | Record<string, unknown>
+                  | undefined,
+              metadata: config.metadata as
+                  | Record<string, unknown>
+                  | undefined,
+              resolve,
+              reject,
+            };
 
-      const requestMap = new Map(requests.map((r) => [r.id, r]));
+            safeDispatchCustomEvent(
+              GraphEvents.ON_TOOL_EXECUTE,
+              batchRequest,
+              config
+            );
+          });
 
-      const results = await new Promise<t.ToolExecuteResult[]>(
-        (resolve, reject) => {
-          const batchRequest: t.ToolExecuteBatchRequest = {
-            toolCalls: requests,
-            userId: config.configurable?.user_id as string | undefined,
-            agentId: this.agentId,
-            configurable: config.configurable as
-              | Record<string, unknown>
-              | undefined,
-            metadata: config.metadata as Record<string, unknown> | undefined,
-            resolve,
-            reject,
-          };
+      const eagerResultsPromise = Promise.all(
+        eagerExecutions.map(({ request, execution }) =>
+          this.resolveEagerEventExecution(request, execution)
+        )
+      ).then((results) => results.flat());
 
-          safeDispatchCustomEvent(
-            GraphEvents.ON_TOOL_EXECUTE,
-            batchRequest,
-            config
-          );
-        }
-      );
+      const [eagerResults, dispatchedResults] = await Promise.all([
+        eagerResultsPromise,
+        dispatchPromise,
+      ]);
+      const results = [
+        ...plan.rejectedResults,
+        ...eagerResults,
+        ...dispatchedResults,
+      ];
 
       this.storeCodeSessionFromResults(results, requestMap);
 
@@ -2604,6 +2680,84 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     });
 
     return { toolMessages, injected };
+  }
+
+  private canConsumeEagerEventExecution(): boolean {
+    return (
+      this.eventDrivenMode &&
+      this.eagerEventToolExecution?.enabled === true &&
+      this.hookRegistry == null &&
+      this.humanInTheLoop?.enabled !== true &&
+      this.toolOutputRegistry == null
+    );
+  }
+
+  private takeMatchingEagerEventExecution(
+    request: t.ToolCallRequest
+  ): t.EagerEventToolExecution | undefined {
+    if (!this.canConsumeEagerEventExecution()) {
+      return undefined;
+    }
+
+    const execution = this.eagerEventToolExecutions?.get(request.id);
+    if (execution == null) {
+      return undefined;
+    }
+
+    this.eagerEventToolExecutions?.delete(request.id);
+
+    if (
+      execution.toolName !== request.name ||
+      !recordArgsEqual(execution.args, request.args) ||
+      execution.request.turn !== request.turn
+    ) {
+      return {
+        toolCallId: request.id,
+        toolName: request.name,
+        args: request.args,
+        request,
+        promise: Promise.resolve({
+          results: [
+            {
+              toolCallId: request.id,
+              status: 'error',
+              content: '',
+              errorMessage:
+                'Tool call changed after eager execution started; refusing to re-run the tool to avoid duplicate side effects.',
+            },
+          ],
+        }),
+      };
+    }
+
+    return execution;
+  }
+
+  private async resolveEagerEventExecution(
+    request: t.ToolCallRequest,
+    execution: t.EagerEventToolExecution
+  ): Promise<t.ToolExecuteResult[]> {
+    const outcome = await execution.promise;
+    if (outcome.error != null) {
+      throw outcome.error;
+    }
+
+    const results = outcome.results.filter(
+      (result) => result.toolCallId === request.id
+    );
+    if (results.length > 0) {
+      return results;
+    }
+
+    return [
+      {
+        toolCallId: request.id,
+        status: 'error',
+        content: '',
+        errorMessage:
+          'Tool execution completed without a result for this tool call',
+      },
+    ];
   }
 
   /**
