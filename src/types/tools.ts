@@ -55,6 +55,8 @@ export type EagerEventToolCallChunkState = {
   id?: string;
   name?: string;
   argsText: string;
+  index?: number;
+  lastArgsFragment?: string;
 };
 
 export type ToolNodeOptions = {

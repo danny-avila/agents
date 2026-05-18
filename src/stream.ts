@@ -24,6 +24,7 @@ import { getMessageId } from '@/messages';
 import { safeDispatchCustomEvent } from '@/utils/events';
 import {
   buildToolExecutionRequestPlan,
+  coerceRecordArgs,
   normalizeError,
 } from '@/tools/eagerEventExecution';
 
@@ -218,6 +219,24 @@ function hasDirectToolCallInBatch(args: {
   );
 }
 
+function hasPotentialDirectToolInStreamContext(args: {
+  graph: StandardGraph;
+  agentContext?: AgentContext;
+}): boolean {
+  const { graph, agentContext } = args;
+  if (graph.toolExecution?.engine === 'local') {
+    return true;
+  }
+  if ((agentContext?.graphTools?.length ?? 0) > 0) {
+    return true;
+  }
+  return (
+    agentContext?.toolDefinitions?.some((toolDefinition) =>
+      toolDefinition.name.startsWith(Constants.LC_TRANSFER_TO_)
+    ) === true
+  );
+}
+
 type EagerToolExecutionEntry = {
   id: string;
   toolName: string;
@@ -230,8 +249,9 @@ function createEagerToolExecutionPlan(args: {
   metadata?: Record<string, unknown>;
   agentContext?: AgentContext;
   toolCalls: ToolCall[];
+  skipExisting?: boolean;
 }): EagerToolExecutionEntry[] | undefined {
-  const { graph, metadata, agentContext, toolCalls } = args;
+  const { graph, metadata, agentContext, toolCalls, skipExisting = false } = args;
   if (
     !isEagerToolExecutionEnabledForBatch({
       graph,
@@ -246,22 +266,35 @@ function createEagerToolExecutionPlan(args: {
     return undefined;
   }
 
-  // Eager execution must preserve ToolNode batch semantics exactly. If any
-  // call in the final batch cannot be planned, fall back for the whole batch.
+  const candidateToolCalls = skipExisting
+    ? toolCalls.filter((toolCall) => {
+      if (toolCall.id == null || toolCall.id === '') {
+        return true;
+      }
+      return !graph.eagerEventToolExecutions.has(toolCall.id);
+    })
+    : toolCalls;
+  if (candidateToolCalls.length === 0) {
+    return [];
+  }
+
+  // Eager execution must preserve ToolNode batch semantics exactly for every
+  // unstarted call. If any candidate cannot be planned, fall back for that
+  // candidate set.
   if (
-    toolCalls.some(
+    candidateToolCalls.some(
       (toolCall) =>
         toolCall.id == null ||
         toolCall.id === '' ||
         toolCall.name === '' ||
-        graph.eagerEventToolExecutions.has(toolCall.id)
+        (!skipExisting && graph.eagerEventToolExecutions.has(toolCall.id))
     )
   ) {
     return undefined;
   }
 
   const plan = buildToolExecutionRequestPlan({
-    toolCalls: toolCalls.map((toolCall) => ({
+    toolCalls: candidateToolCalls.map((toolCall) => ({
       id: toolCall.id,
       name: toolCall.name,
       args: toolCall.args,
@@ -287,13 +320,15 @@ function startEagerToolExecutions(args: {
   metadata?: Record<string, unknown>;
   agentContext?: AgentContext;
   toolCalls: ToolCall[];
+  skipExisting?: boolean;
 }): void {
-  const { graph, metadata, agentContext, toolCalls } = args;
+  const { graph, metadata, agentContext, toolCalls, skipExisting } = args;
   const entries = createEagerToolExecutionPlan({
     graph,
     metadata,
     agentContext,
     toolCalls,
+    skipExisting,
   });
   if (entries == null || entries.length === 0) {
     return;
@@ -353,6 +388,22 @@ function getEagerToolChunkKey(
   return `${stepKey}\u0000${chunkKey}`;
 }
 
+function getEagerToolChunkIndex(toolCallChunk: ToolCallChunk): number | undefined {
+  return typeof toolCallChunk.index === 'number' ? toolCallChunk.index : undefined;
+}
+
+function isEagerToolChunkStateComplete(
+  state: t.EagerEventToolCallChunkState
+): boolean {
+  return (
+    state.id != null &&
+    state.id !== '' &&
+    state.name != null &&
+    state.name !== '' &&
+    coerceRecordArgs(state.argsText) != null
+  );
+}
+
 function mergeToolCallArgsText(existing: string, incoming: string): string {
   if (incoming === '') {
     return existing;
@@ -381,6 +432,15 @@ function mergeToolCallArgsText(existing: string, incoming: string): string {
   } catch {
     // Fall through to delta concatenation.
   }
+  for (
+    let overlap = Math.min(existing.length, incoming.length);
+    overlap >= 8;
+    overlap -= 1
+  ) {
+    if (existing.endsWith(incoming.slice(0, overlap))) {
+      return `${existing}${incoming.slice(overlap)}`;
+    }
+  }
   return `${existing}${incoming}`;
 }
 
@@ -395,7 +455,8 @@ function recordEagerToolCallChunks(args: {
   }
 
   // Streamed args can be cumulative and parseable before the provider has
-  // emitted the final call; dispatch only happens from complete tool_calls.
+  // sealed the call. Recording stays separate from dispatch so the boundary
+  // logic can wait for either a later tool index or the final tool-call signal.
   for (const toolCallChunk of toolCallChunks) {
     const key = getEagerToolChunkKey(stepKey, toolCallChunk);
     if (key == null) {
@@ -427,17 +488,110 @@ function recordEagerToolCallChunks(args: {
       incomingId ?? existing.id;
     const name =
       incomingName ?? existing.name;
-    const argsText = mergeToolCallArgsText(
-      existing.argsText,
-      toolCallChunk.args ?? ''
-    );
+    const incomingArgs = toolCallChunk.args ?? '';
+    const isRepeatedObservedFragment =
+      incomingArgs !== '' &&
+      incomingArgs.length > 1 &&
+      incomingArgs === existing.lastArgsFragment;
+    const argsText = isRepeatedObservedFragment
+      ? existing.argsText
+      : mergeToolCallArgsText(existing.argsText, incomingArgs);
     const next = {
       id,
       name,
       argsText,
+      index: getEagerToolChunkIndex(toolCallChunk) ?? existing.index,
+      lastArgsFragment:
+        incomingArgs !== '' ? incomingArgs : existing.lastArgsFragment,
     };
     graph.eagerEventToolCallChunks.set(key, next);
   }
+}
+
+function getStreamedReadyToolCalls(args: {
+  graph: StandardGraph;
+  stepKey: string;
+  toolCallChunks?: ToolCallChunk[];
+  sealAll?: boolean;
+}): ToolCall[] {
+  const { graph, stepKey, toolCallChunks, sealAll = false } = args;
+  const currentIndices = new Set<number>();
+  for (const toolCallChunk of toolCallChunks ?? []) {
+    const index = getEagerToolChunkIndex(toolCallChunk);
+    if (index != null) {
+      currentIndices.add(index);
+    }
+  }
+  const highestCurrentIndex =
+    currentIndices.size > 0 ? Math.max(...currentIndices) : undefined;
+  const prefix = `${stepKey}\u0000`;
+  const readyStates: t.EagerEventToolCallChunkState[] = [];
+
+  for (const [key, state] of graph.eagerEventToolCallChunks) {
+    if (!key.startsWith(prefix) || !isEagerToolChunkStateComplete(state)) {
+      continue;
+    }
+    if (state.id != null && graph.eagerEventToolExecutions.has(state.id)) {
+      continue;
+    }
+    const isSealedByLaterChunk =
+      highestCurrentIndex != null &&
+      state.index != null &&
+      state.index < highestCurrentIndex &&
+      !currentIndices.has(state.index);
+    if (sealAll || isSealedByLaterChunk) {
+      readyStates.push(state);
+    }
+  }
+
+  return readyStates
+    .sort((left, right) => (left.index ?? 0) - (right.index ?? 0))
+    .flatMap((state) => {
+      const args = coerceRecordArgs(state.argsText);
+      if (args == null) {
+        return [];
+      }
+      return [
+        {
+          id: state.id,
+          name: state.name ?? '',
+          args,
+        },
+      ];
+    });
+}
+
+function startReadyStreamedEagerToolExecutions(args: {
+  graph: StandardGraph;
+  metadata?: Record<string, unknown>;
+  agentContext?: AgentContext;
+  stepKey: string;
+  toolCallChunks?: ToolCallChunk[];
+  sealAll?: boolean;
+}): void {
+  const { graph, metadata, agentContext, stepKey, toolCallChunks, sealAll } = args;
+  if (
+    hasPotentialDirectToolInStreamContext({ graph, agentContext }) ||
+    !isEagerToolExecutionEnabledForBatch({ graph, metadata, agentContext })
+  ) {
+    return;
+  }
+  const toolCalls = getStreamedReadyToolCalls({
+    graph,
+    stepKey,
+    toolCallChunks,
+    sealAll,
+  });
+  if (toolCalls.length === 0) {
+    return;
+  }
+  startEagerToolExecutions({
+    graph,
+    metadata,
+    agentContext,
+    toolCalls,
+    skipExisting: true,
+  });
 }
 
 export function getChunkContent({
@@ -556,6 +710,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
           metadata,
           agentContext,
           toolCalls: chunk.tool_calls,
+          skipExisting: true,
         });
       }
     }
@@ -586,16 +741,24 @@ export class ChatModelStreamHandler implements t.EventHandler {
       chunk.tool_call_chunks.length &&
       typeof chunk.tool_call_chunks[0]?.index === 'number'
     ) {
+      recordEagerToolCallChunks({
+        graph,
+        stepKey,
+        toolCallChunks: chunk.tool_call_chunks,
+      });
       await handleToolCallChunks({
         graph,
         stepKey,
         toolCallChunks: chunk.tool_call_chunks,
         metadata,
       });
-      recordEagerToolCallChunks({
+      startReadyStreamedEagerToolExecutions({
         graph,
+        metadata,
+        agentContext,
         stepKey,
         toolCallChunks: chunk.tool_call_chunks,
+        sealAll: hasFinalToolCallSignal(chunk),
       });
     }
 
