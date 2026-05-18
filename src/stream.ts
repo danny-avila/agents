@@ -205,6 +205,19 @@ function hasFinalToolCallSignal(chunk: Partial<AIMessageChunk>): boolean {
   return finishReason === 'tool_calls' || finishReason === 'tool_use';
 }
 
+function canPrestartSealedStreamedToolChunks(
+  agentContext: AgentContext | undefined
+): boolean {
+  // Starting a streamed tool before the final model message is only safe for
+  // providers whose streaming protocol seals one tool-use block before moving
+  // to the next. OpenAI-compatible routes can emit cumulative/ambiguous tool
+  // payloads and are handled by the final `tool_calls` path instead.
+  return (
+    agentContext?.provider === Providers.ANTHROPIC ||
+    agentContext?.provider === Providers.MOONSHOT
+  );
+}
+
 function hasDirectToolCallInBatch(args: {
   graph: StandardGraph;
   agentContext?: AgentContext;
@@ -783,6 +796,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
       typeof chunk.tool_call_chunks[0]?.index === 'number'
     ) {
       const canStreamEager =
+        canPrestartSealedStreamedToolChunks(agentContext) &&
         !hasPotentialDirectToolInStreamContext({ graph, agentContext }) &&
         isEagerToolExecutionEnabledForBatch({ graph, metadata, agentContext });
       if (canStreamEager) {

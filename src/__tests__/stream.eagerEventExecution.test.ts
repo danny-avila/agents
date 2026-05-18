@@ -44,8 +44,8 @@ function createGraph(overrides: Partial<StandardGraph> = {}): StandardGraph {
     prelimMessageIdsByStepKey: new Map(),
     getAgentContext: jest.fn(
       (): Partial<AgentContext> => ({
-        provider: Providers.OPENAI,
-        reasoningKey: 'reasoning_content',
+        provider: Providers.ANTHROPIC,
+        reasoningKey: 'reasoning',
         toolDefinitions: [{ name: 'weather' }],
         graphTools: [],
         agentId: 'agent_1',
@@ -230,8 +230,8 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     const graph = createGraph({
       getAgentContext: jest.fn(
         (): Partial<AgentContext> => ({
-          provider: Providers.OPENAI,
-          reasoningKey: 'reasoning_content',
+          provider: Providers.ANTHROPIC,
+          reasoningKey: 'reasoning',
           toolDefinitions: [{ name: 'weather' }, { name: 'calendar' }],
           graphTools: [],
           agentId: 'agent_1',
@@ -383,8 +383,8 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
       getEagerEventToolUsageCount: jest.fn(getUsageCount),
       getAgentContext: jest.fn(
         (metadata?: Record<string, unknown>): AgentContext => ({
-          provider: Providers.OPENAI,
-          reasoningKey: 'reasoning_content',
+          provider: Providers.ANTHROPIC,
+          reasoningKey: 'reasoning',
           toolDefinitions: [{ name: 'weather' }],
           graphTools: [],
           agentId:
@@ -1418,8 +1418,8 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     const graph = createGraph({
       getAgentContext: jest.fn(
         (): Partial<AgentContext> => ({
-          provider: Providers.OPENAI,
-          reasoningKey: 'reasoning_content',
+          provider: Providers.ANTHROPIC,
+          reasoningKey: 'reasoning',
           toolDefinitions: [{ name: 'weather' }, { name: 'stock' }],
           graphTools: [],
           agentId: 'agent_1',
@@ -1564,8 +1564,8 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     const graph = createGraph({
       getAgentContext: jest.fn(
         (): Partial<AgentContext> => ({
-          provider: Providers.OPENAI,
-          reasoningKey: 'reasoning_content',
+          provider: Providers.ANTHROPIC,
+          reasoningKey: 'reasoning',
           toolDefinitions: [{ name: 'weather' }, { name: 'stock' }],
           graphTools: [],
           agentId: 'agent_1',
