@@ -678,6 +678,53 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     });
   });
 
+  it('preserves identical incremental argument fragments', async () => {
+    const graph = createGraph();
+    const handler = new ChatModelStreamHandler();
+    const metadata = { langgraph_node: 'agent' };
+
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_call_chunks: [
+            {
+              id: 'call_repeat',
+              name: 'weather',
+              args: 'o',
+              index: 0,
+            },
+          ],
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_call_chunks: [
+            {
+              args: 'o',
+              index: 0,
+            },
+          ],
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+
+    expect(
+      graph.eagerEventToolCallChunks.get(chunkStateKey('step-key', 0))
+        ?.argsText
+    ).toBe('oo');
+  });
+
   it('does not prestart from cumulative streamed args before final tool calls', async () => {
     const graph = createGraph();
     const toolExecuteCalls: t.ToolExecuteBatchRequest[] = [];

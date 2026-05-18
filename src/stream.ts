@@ -372,6 +372,14 @@ function mergeToolCallArgsText(existing: string, incoming: string): string {
   if (existing === '') {
     return incoming;
   }
+  if (incoming === existing) {
+    try {
+      JSON.parse(incoming);
+      return incoming;
+    } catch {
+      return `${existing}${incoming}`;
+    }
+  }
   if (incoming.startsWith(existing)) {
     return incoming;
   }
