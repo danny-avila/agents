@@ -167,6 +167,10 @@ export abstract class Graph<
   eagerEventToolExecution: t.EagerEventToolExecutionConfig | undefined;
   eagerEventToolExecutions: Map<string, t.EagerEventToolExecution> = new Map();
   eagerEventToolUsageCount: Map<string, number> = new Map();
+  private eagerEventToolUsageCountsByAgentId: Map<
+    string,
+    Map<string, number>
+  > = new Map();
   eagerEventToolCallChunks: Map<string, t.EagerEventToolCallChunkState> =
     new Map();
   /**
@@ -210,7 +214,7 @@ export abstract class Graph<
     this.toolOutputReferences = undefined;
     this.eagerEventToolExecution = undefined;
     this.eagerEventToolExecutions.clear();
-    this.eagerEventToolUsageCount.clear();
+    this.clearEagerEventToolUsageCounts();
     this.eagerEventToolCallChunks.clear();
     this.toolExecution = undefined;
     this.handlerDispatchedEventCounts.clear();
@@ -242,6 +246,25 @@ export abstract class Graph<
     }
     this._compiledToolNodes.clear();
     this.sessions.clear();
+  }
+
+  getEagerEventToolUsageCount(agentId?: string): Map<string, number> {
+    if (agentId == null || agentId === '') {
+      return this.eagerEventToolUsageCount;
+    }
+    let usageCount = this.eagerEventToolUsageCountsByAgentId.get(agentId);
+    if (usageCount == null) {
+      usageCount = new Map<string, number>();
+      this.eagerEventToolUsageCountsByAgentId.set(agentId, usageCount);
+    }
+    return usageCount;
+  }
+
+  protected clearEagerEventToolUsageCounts(): void {
+    this.eagerEventToolUsageCount.clear();
+    for (const usageCount of this.eagerEventToolUsageCountsByAgentId.values()) {
+      usageCount.clear();
+    }
   }
 
   markHandlerDispatchedEvent(eventName: string, stepId: string): () => void {
@@ -425,7 +448,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
      */
     this.toolCallStepIds.clear();
     this.eagerEventToolExecutions.clear();
-    this.eagerEventToolUsageCount.clear();
+    this.clearEagerEventToolUsageCounts();
     this.eagerEventToolCallChunks.clear();
     this.handlerDispatchedStepIds = resetIfNotEmpty(
       this.handlerDispatchedStepIds,
@@ -731,7 +754,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         humanInTheLoop: this.humanInTheLoop,
         eagerEventToolExecution: this.eagerEventToolExecution,
         eagerEventToolExecutions: this.eagerEventToolExecutions,
-        eagerEventToolUsageCount: this.eagerEventToolUsageCount,
+        eagerEventToolUsageCount: this.getEagerEventToolUsageCount(
+          agentContext?.agentId
+        ),
         toolExecution: this.toolExecution,
         directToolNames: directToolNames.size > 0 ? directToolNames : undefined,
         maxContextTokens: agentContext?.maxContextTokens,

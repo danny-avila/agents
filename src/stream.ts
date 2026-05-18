@@ -268,7 +268,7 @@ function createEagerToolExecutionPlan(args: {
       stepId: graph.toolCallStepIds.get(toolCall.id!) ?? '',
       codeSessionContext: getCodeSessionContext(graph, toolCall.name),
     })),
-    usageCount: graph.eagerEventToolUsageCount,
+    usageCount: graph.getEagerEventToolUsageCount(agentContext?.agentId),
   });
   if (plan == null) {
     return undefined;
@@ -550,7 +550,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
     ) {
       hasToolCalls = true;
       await handleToolCalls(chunk.tool_calls, metadata, graph);
-      if (!hasToolCallChunks && hasFinalToolCallSignal(chunk)) {
+      if (hasFinalToolCallSignal(chunk)) {
         startEagerToolExecutions({
           graph,
           metadata,
