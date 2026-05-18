@@ -33,12 +33,12 @@ function createAIMessageWithToolCalls(
   toolCalls: Array<{
     id: string;
     name: string;
-    args: Record<string, unknown>;
+    args: unknown;
   }>
 ): AIMessage {
   return new AIMessage({
     content: '',
-    tool_calls: toolCalls,
+    tool_calls: toolCalls as AIMessage['tool_calls'],
   });
 }
 
@@ -265,6 +265,60 @@ describe('ToolNode eager event tool execution', () => {
     expect(result.messages[0].status).toBe('success');
     expect(result.messages[1].status).toBe('error');
     expect(result.messages[1].content).toContain('refusing to re-run');
+  });
+
+  it('returns a per-call error for malformed event tool args without aborting the batch', async () => {
+    const { toolExecuteCalls } = installToolExecuteResponder('normal result');
+    const eagerUsageCount = new Map<string, number>();
+
+    const toolNode = new ToolNode({
+      tools: [createDummyTool('weather')],
+      eventDrivenMode: true,
+      eagerEventToolExecution: { enabled: true },
+      eagerEventToolExecutions: new Map(),
+      eagerEventToolUsageCount: eagerUsageCount,
+      toolCallStepIds: new Map([
+        ['call_weather_bad', 'step_weather_bad'],
+        ['call_weather_good', 'step_weather_good'],
+      ]),
+    });
+
+    const result = (await toolNode.invoke({
+      messages: [
+        createAIMessageWithToolCalls([
+          {
+            id: 'call_weather_bad',
+            name: 'weather',
+            args: ['not', 'an', 'object'],
+          },
+          {
+            id: 'call_weather_good',
+            name: 'weather',
+            args: { city: 'Boston' },
+          },
+        ]),
+      ],
+    })) as { messages: ToolMessage[] };
+
+    expect(toolExecuteCalls).toHaveLength(1);
+    expect(toolExecuteCalls[0].toolCalls).toEqual([
+      expect.objectContaining({
+        id: 'call_weather_good',
+        name: 'weather',
+        turn: 1,
+      }),
+    ]);
+    expect(eagerUsageCount.get('weather')).toBe(2);
+    expect(result.messages.map((message) => message.tool_call_id)).toEqual([
+      'call_weather_bad',
+      'call_weather_good',
+    ]);
+    expect(result.messages[0].status).toBe('error');
+    expect(result.messages[0].content).toContain(
+      'Invalid tool call arguments'
+    );
+    expect(result.messages[1].status).toBe('success');
+    expect(result.messages[1].content).toBe('normal result');
   });
 
   it('uses the legacy turn counter when eager mode cannot be consumed', async () => {

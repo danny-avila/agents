@@ -55,20 +55,25 @@ export type ToolExecutionPlanCall = {
 };
 
 export type ToolExecutionRequestPlan = {
+  allRequests: t.ToolCallRequest[];
   requests: t.ToolCallRequest[];
+  rejectedResults: t.ToolExecuteResult[];
 };
 
 export function buildToolExecutionRequestPlan(args: {
   toolCalls: ToolExecutionPlanCall[];
   usageCount: Map<string, number>;
+  invalidArgsBehavior?: 'abort' | 'error-result';
   recordTurn?: (toolName: string, turn: number, callId: string) => void;
 }): ToolExecutionRequestPlan | undefined {
+  const invalidArgsBehavior = args.invalidArgsBehavior ?? 'abort';
   const prepared: Array<{
     id: string;
     name: string;
     args: Record<string, unknown>;
     stepId?: string;
     codeSessionContext?: t.ToolCallRequest['codeSessionContext'];
+    rejectedErrorMessage?: string;
   }> = [];
 
   for (const toolCall of args.toolCalls) {
@@ -81,7 +86,19 @@ export function buildToolExecutionRequestPlan(args: {
     }
     const coercedArgs = coerceRecordArgs(toolCall.args);
     if (coercedArgs == null) {
-      return undefined;
+      if (invalidArgsBehavior === 'abort') {
+        return undefined;
+      }
+      prepared.push({
+        id: toolCall.id,
+        name: toolCall.name,
+        args: {},
+        stepId: toolCall.stepId,
+        codeSessionContext: toolCall.codeSessionContext,
+        rejectedErrorMessage:
+          'Invalid tool call arguments: expected a JSON object.',
+      });
+      continue;
     }
     prepared.push({
       id: toolCall.id,
@@ -93,7 +110,7 @@ export function buildToolExecutionRequestPlan(args: {
   }
 
   const nextUsageCount = new Map(args.usageCount);
-  const requests = prepared.map((toolCall): t.ToolCallRequest => {
+  const allRequests = prepared.map((toolCall): t.ToolCallRequest => {
     const turn = nextUsageCount.get(toolCall.name) ?? 0;
     nextUsageCount.set(toolCall.name, turn + 1);
     const request: t.ToolCallRequest = {
@@ -108,13 +125,29 @@ export function buildToolExecutionRequestPlan(args: {
     }
     return request;
   });
+  const requests = allRequests.filter(
+    (_, index) => prepared[index].rejectedErrorMessage == null
+  );
+  const rejectedResults = prepared.flatMap((toolCall) => {
+    if (toolCall.rejectedErrorMessage == null) {
+      return [];
+    }
+    return [
+      {
+        toolCallId: toolCall.id,
+        status: 'error' as const,
+        content: '',
+        errorMessage: toolCall.rejectedErrorMessage,
+      },
+    ];
+  });
 
   for (const [toolName, count] of nextUsageCount) {
     args.usageCount.set(toolName, count);
   }
-  for (const request of requests) {
+  for (const request of allRequests) {
     args.recordTurn?.(request.name, request.turn ?? 0, request.id);
   }
 
-  return { requests };
+  return { allRequests, requests, rejectedResults };
 }

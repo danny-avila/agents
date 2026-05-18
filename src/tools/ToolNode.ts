@@ -2392,6 +2392,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           };
         }),
         usageCount: this.toolUsageCount,
+        invalidArgsBehavior: 'error-result',
         recordTurn: (toolName, reservedTurn, callId) => {
           this.recordEventToolPlanningTurn(toolName, reservedTurn, callId);
         },
@@ -2407,7 +2408,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         }
       }
 
-      const requestMap = new Map(requests.map((r) => [r.id, r]));
+      for (const result of plan.rejectedResults) {
+        this.eagerEventToolExecutions?.delete(result.toolCallId);
+      }
+
+      const requestMap = new Map(plan.allRequests.map((r) => [r.id, r]));
       const eagerExecutions: Array<{
         request: t.ToolCallRequest;
         execution: t.EagerEventToolExecution;
@@ -2458,7 +2463,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         eagerResultsPromise,
         dispatchPromise,
       ]);
-      const results = [...eagerResults, ...dispatchedResults];
+      const results = [
+        ...plan.rejectedResults,
+        ...eagerResults,
+        ...dispatchedResults,
+      ];
 
       this.storeCodeSessionFromResults(results, requestMap);
 
