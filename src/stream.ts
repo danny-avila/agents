@@ -782,25 +782,32 @@ export class ChatModelStreamHandler implements t.EventHandler {
       chunk.tool_call_chunks.length &&
       typeof chunk.tool_call_chunks[0]?.index === 'number'
     ) {
-      recordEagerToolCallChunks({
-        graph,
-        stepKey,
-        toolCallChunks: chunk.tool_call_chunks,
-      });
+      const canStreamEager =
+        !hasPotentialDirectToolInStreamContext({ graph, agentContext }) &&
+        isEagerToolExecutionEnabledForBatch({ graph, metadata, agentContext });
+      if (canStreamEager) {
+        recordEagerToolCallChunks({
+          graph,
+          stepKey,
+          toolCallChunks: chunk.tool_call_chunks,
+        });
+      }
       await handleToolCallChunks({
         graph,
         stepKey,
         toolCallChunks: chunk.tool_call_chunks,
         metadata,
       });
-      startReadyStreamedEagerToolExecutions({
-        graph,
-        metadata,
-        agentContext,
-        stepKey,
-        toolCallChunks: chunk.tool_call_chunks,
-        sealAll: hasFinalToolCallSignal(chunk),
-      });
+      if (canStreamEager) {
+        startReadyStreamedEagerToolExecutions({
+          graph,
+          metadata,
+          agentContext,
+          stepKey,
+          toolCallChunks: chunk.tool_call_chunks,
+          sealAll: hasFinalToolCallSignal(chunk),
+        });
+      }
     }
 
     if (isEmptyContent) {

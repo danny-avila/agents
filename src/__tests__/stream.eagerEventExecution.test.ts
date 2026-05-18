@@ -1979,6 +1979,40 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     expect(graph.eagerEventToolExecutions.size).toBe(0);
   });
 
+  it('does not buffer streamed chunks when eager execution is disabled', async () => {
+    const graph = createGraph({
+      eagerEventToolExecution: { enabled: false },
+    } as Partial<StandardGraph>);
+    const dispatchSpy = jest.spyOn(events, 'safeDispatchCustomEvent');
+
+    await new ChatModelStreamHandler().handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_call_chunks: [
+            {
+              id: 'call_weather',
+              name: 'weather',
+              args: '{"city":"NYC"}',
+              index: 0,
+            },
+          ],
+        } as unknown as t.StreamChunk,
+      },
+      { langgraph_node: 'agent' },
+      graph
+    );
+
+    expect(dispatchSpy).not.toHaveBeenCalledWith(
+      GraphEvents.ON_TOOL_EXECUTE,
+      expect.anything(),
+      expect.anything()
+    );
+    expect(graph.eagerEventToolExecutions.size).toBe(0);
+    expect(graph.eagerEventToolCallChunks.size).toBe(0);
+  });
+
   it('does not prestart local-engine direct coding tools', async () => {
     const graph = createGraph({
       toolExecution: {
@@ -2020,6 +2054,7 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
       expect.anything()
     );
     expect(graph.eagerEventToolExecutions.size).toBe(0);
+    expect(graph.eagerEventToolCallChunks.size).toBe(0);
   });
 
   it('does not prestart streamed local-engine direct coding tools', async () => {
@@ -2084,6 +2119,7 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
       expect.anything()
     );
     expect(graph.eagerEventToolExecutions.size).toBe(0);
+    expect(graph.eagerEventToolCallChunks.size).toBe(0);
   });
 
   it('does not prestart event tools in a mixed direct-tool batch', async () => {
