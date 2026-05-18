@@ -392,6 +392,24 @@ function getEagerToolChunkIndex(toolCallChunk: ToolCallChunk): number | undefine
   return typeof toolCallChunk.index === 'number' ? toolCallChunk.index : undefined;
 }
 
+function pruneEagerToolCallChunkStates(args: {
+  graph: StandardGraph;
+  stepKey: string;
+  toolCallIds?: ReadonlySet<string>;
+  clearStep?: boolean;
+}): void {
+  const { graph, stepKey, toolCallIds, clearStep = false } = args;
+  const prefix = `${stepKey}\u0000`;
+  for (const [key, state] of graph.eagerEventToolCallChunks) {
+    if (!key.startsWith(prefix)) {
+      continue;
+    }
+    if (clearStep || (state.id != null && toolCallIds?.has(state.id) === true)) {
+      graph.eagerEventToolCallChunks.delete(key);
+    }
+  }
+}
+
 function isEagerToolChunkStateComplete(
   state: t.EagerEventToolCallChunkState
 ): boolean {
@@ -525,13 +543,20 @@ function getStreamedReadyToolCalls(args: {
   const highestCurrentIndex =
     currentIndices.size > 0 ? Math.max(...currentIndices) : undefined;
   const prefix = `${stepKey}\u0000`;
-  const readyStates: t.EagerEventToolCallChunkState[] = [];
+  const readyEntries: Array<{
+    key: string;
+    state: t.EagerEventToolCallChunkState;
+  }> = [];
 
   for (const [key, state] of graph.eagerEventToolCallChunks) {
-    if (!key.startsWith(prefix) || !isEagerToolChunkStateComplete(state)) {
+    if (!key.startsWith(prefix)) {
       continue;
     }
     if (state.id != null && graph.eagerEventToolExecutions.has(state.id)) {
+      graph.eagerEventToolCallChunks.delete(key);
+      continue;
+    }
+    if (!isEagerToolChunkStateComplete(state)) {
       continue;
     }
     const isSealedByLaterChunk =
@@ -540,13 +565,28 @@ function getStreamedReadyToolCalls(args: {
       state.index < highestCurrentIndex &&
       !currentIndices.has(state.index);
     if (sealAll || isSealedByLaterChunk) {
-      readyStates.push(state);
+      readyEntries.push({ key, state });
     }
   }
 
-  return readyStates
-    .sort((left, right) => (left.index ?? 0) - (right.index ?? 0))
-    .flatMap((state) => {
+  pruneEagerToolCallChunkStates({
+    graph,
+    stepKey,
+    toolCallIds: new Set(
+      readyEntries
+        .map(({ state }) => state.id)
+        .filter((id): id is string => id != null && id !== '')
+    ),
+  });
+  if (sealAll) {
+    pruneEagerToolCallChunkStates({ graph, stepKey, clearStep: true });
+  }
+
+  return readyEntries
+    .sort(
+      (left, right) => (left.state.index ?? 0) - (right.state.index ?? 0)
+    )
+    .flatMap(({ state }) => {
       const args = coerceRecordArgs(state.argsText);
       if (args == null) {
         return [];
@@ -688,6 +728,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
       return;
     }
     this.handleReasoning(chunk, agentContext);
+    const stepKey = graph.getStepKey(metadata);
     let hasToolCalls = false;
     const hasToolCallChunks =
       (chunk.tool_call_chunks && chunk.tool_call_chunks.length > 0) ?? false;
@@ -712,6 +753,9 @@ export class ChatModelStreamHandler implements t.EventHandler {
           toolCalls: chunk.tool_calls,
           skipExisting: true,
         });
+        if (!hasToolCallChunks) {
+          pruneEagerToolCallChunkStates({ graph, stepKey, clearStep: true });
+        }
       }
     }
 
@@ -727,13 +771,10 @@ export class ChatModelStreamHandler implements t.EventHandler {
       (chunk.id ?? '') !== '' &&
       !graph.prelimMessageIdsByStepKey.has(chunk.id ?? '')
     ) {
-      const stepKey = graph.getStepKey(metadata);
       graph.prelimMessageIdsByStepKey.set(stepKey, chunk.id ?? '');
     } else if (isEmptyChunk) {
       return;
     }
-
-    const stepKey = graph.getStepKey(metadata);
 
     if (
       hasToolCallChunks &&

@@ -1499,6 +1499,12 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     ]);
     expect(graph.eagerEventToolExecutions.has('call_weather')).toBe(true);
     expect(graph.eagerEventToolExecutions.has('call_stock')).toBe(false);
+    expect(graph.eagerEventToolCallChunks.has(chunkStateKey('step-key', 0))).toBe(
+      false
+    );
+    expect(
+      graph.eagerEventToolCallChunks.get(chunkStateKey('step-key', 1))?.argsText
+    ).toBe('{"ticker":"C');
 
     await handler.handle(
       GraphEvents.CHAT_MODEL_STREAM,
@@ -1551,6 +1557,7 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
       stepId: expect.stringMatching(/^step_/),
       turn: 0,
     });
+    expect(graph.eagerEventToolCallChunks.size).toBe(0);
   });
 
   it('does not seal a streamed tool when the same chunk also carries its own index', async () => {
@@ -1902,6 +1909,13 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
       graph
     );
 
+    expect(graph.eagerEventToolCallChunks.has(chunkStateKey('agent_b', 0))).toBe(
+      false
+    );
+    expect(
+      graph.eagerEventToolCallChunks.get(chunkStateKey('agent_a', 0))?.argsText
+    ).toBe('{"city":"NYC"}');
+
     await handler.handle(
       GraphEvents.CHAT_MODEL_STREAM,
       {
@@ -1932,6 +1946,7 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
       name: 'weather',
       args: { city: 'NYC' },
     });
+    expect(graph.eagerEventToolCallChunks.size).toBe(0);
   });
 
   it('does not prestart when batch-sensitive hooks are configured', async () => {
