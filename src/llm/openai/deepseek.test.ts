@@ -1,4 +1,5 @@
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
+import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { ChatGenerationChunk } from '@langchain/core/outputs';
 import type { BaseMessage } from '@langchain/core/messages';
 import type { OpenAIClient } from '@langchain/openai';
@@ -66,6 +67,16 @@ class CapturingChatDeepSeek extends ChatDeepSeek {
       signal,
     } as this['ParsedCallOptions']);
   }
+
+  streamChunksWithCallbacks(
+    runManager?: CallbackManagerForLLMRun
+  ): AsyncGenerator<ChatGenerationChunk> {
+    return this._streamResponseChunks(
+      [new HumanMessage('hi')],
+      {} as this['ParsedCallOptions'],
+      runManager
+    );
+  }
 }
 
 function createToolContextMessages(): BaseMessage[] {
@@ -111,7 +122,10 @@ function createCompletionStreamChunks(): OpenAIChatCompletionChunk[] {
   ];
 }
 
-function createContentChunk(content: string): OpenAIChatCompletionChunk {
+function createContentChunk(
+  content: string,
+  logprobs: OpenAIChatCompletionChunk['choices'][number]['logprobs'] = null
+): OpenAIChatCompletionChunk {
   return {
     id: 'chatcmpl-deepseek-test',
     object: 'chat.completion.chunk',
@@ -125,7 +139,7 @@ function createContentChunk(content: string): OpenAIChatCompletionChunk {
           content,
         },
         finish_reason: null,
-        logprobs: null,
+        logprobs,
       },
     ],
   };
@@ -488,5 +502,190 @@ describe('ChatDeepSeek', () => {
     controller.abort();
 
     await expect(iterator.next()).rejects.toThrow('AbortError');
+  });
+
+  it('does not yield a delayed DeepSeek chunk after abort', async () => {
+    const controller = new AbortController();
+    const model = new CapturingChatDeepSeek(
+      {
+        apiKey: 'test-key',
+        model: 'deepseek-v4-pro',
+        streaming: true,
+        _lc_stream_delay: 1000,
+      },
+      [createContentChunk('first '), createContentChunk('second')]
+    );
+    const stream = model.streamChunksWithSignal(controller.signal);
+    const iterator = stream[Symbol.asyncIterator]();
+
+    await expect(iterator.next()).resolves.toEqual(
+      expect.objectContaining({
+        done: false,
+        value: expect.objectContaining({
+          text: 'first ',
+        }),
+      })
+    );
+
+    const delayedChunk = iterator.next();
+    await Promise.resolve();
+    controller.abort(new Error('AbortError: User aborted request.'));
+
+    await expect(delayedChunk).rejects.toThrow('AbortError');
+  });
+
+  it('splits large delayed DeepSeek text chunks', async () => {
+    const model = new CapturingChatDeepSeek(
+      {
+        apiKey: 'test-key',
+        model: 'deepseek-v4-pro',
+        streaming: true,
+        _lc_stream_delay: 1,
+      },
+      [createContentChunk('alpha beta gamma')]
+    );
+    const textChunks: string[] = [];
+
+    for await (const chunk of model.streamChunksWithSignal(
+      new AbortController().signal
+    )) {
+      if (chunk.text) {
+        textChunks.push(chunk.text);
+      }
+    }
+
+    expect(textChunks).toEqual(['alpha ', 'beta ', 'gamma']);
+  });
+
+  it('keeps delayed DeepSeek logprob chunks intact', async () => {
+    const logprobs = { content: [], refusal: null } as NonNullable<
+      OpenAIChatCompletionChunk['choices'][number]['logprobs']
+    >;
+    const model = new CapturingChatDeepSeek(
+      {
+        apiKey: 'test-key',
+        model: 'deepseek-v4-pro',
+        streaming: true,
+        logprobs: true,
+        _lc_stream_delay: 1,
+      },
+      [createContentChunk('alpha beta gamma', logprobs)]
+    );
+    const chunks: ChatGenerationChunk[] = [];
+
+    for await (const chunk of model.streamChunksWithSignal(
+      new AbortController().signal
+    )) {
+      if (chunk.text !== '') {
+        chunks.push(chunk);
+      }
+    }
+
+    expect(chunks.map((chunk) => chunk.text)).toEqual(['alpha beta gamma']);
+    expect(chunks[0].generationInfo?.logprobs).toBe(logprobs);
+  });
+
+  it('emits callbacks for split delayed DeepSeek text chunks', async () => {
+    const model = new CapturingChatDeepSeek(
+      {
+        apiKey: 'test-key',
+        model: 'deepseek-v4-pro',
+        streaming: true,
+        _lc_stream_delay: 1,
+      },
+      [createContentChunk('alpha beta gamma')]
+    );
+    const textChunks: string[] = [];
+    const callbackTokens: string[] = [];
+
+    const stream = await model.stream([new HumanMessage('hi')], {
+      callbacks: [
+        {
+          handleLLMNewToken(token: string): void {
+            if (token !== '') {
+              callbackTokens.push(token);
+            }
+          },
+        },
+      ],
+    });
+
+    for await (const chunk of stream) {
+      if (typeof chunk.content === 'string' && chunk.content !== '') {
+        textChunks.push(chunk.content);
+      }
+    }
+
+    expect(textChunks).toEqual(['alpha ', 'beta ', 'gamma']);
+    expect(callbackTokens).toEqual(textChunks);
+  });
+
+  it('emits a delayed DeepSeek callback before an early stream break', async () => {
+    const model = new CapturingChatDeepSeek(
+      {
+        apiKey: 'test-key',
+        model: 'deepseek-v4-pro',
+        streaming: true,
+        _lc_stream_delay: 1,
+      },
+      [createContentChunk('alpha beta gamma')]
+    );
+    const textChunks: string[] = [];
+    const callbackTokens: string[] = [];
+    const runManager = {
+      handleLLMNewToken(token: string): void {
+        if (token !== '') {
+          callbackTokens.push(token);
+        }
+      },
+    } as unknown as CallbackManagerForLLMRun;
+
+    for await (const chunk of model.streamChunksWithCallbacks(runManager)) {
+      if (chunk.text !== '') {
+        textChunks.push(chunk.text);
+      }
+      break;
+    }
+
+    expect(textChunks).toEqual(['alpha ']);
+    expect(callbackTokens).toEqual(textChunks);
+  });
+
+  it('counts consumer work toward delayed DeepSeek cadence', async () => {
+    const model = new CapturingChatDeepSeek(
+      {
+        apiKey: 'test-key',
+        model: 'deepseek-v4-pro',
+        streaming: true,
+        _lc_stream_delay: 100,
+      },
+      [createContentChunk('first '), createContentChunk('second')]
+    );
+    const stream = model.streamChunksWithSignal(new AbortController().signal);
+    const iterator = stream[Symbol.asyncIterator]();
+
+    await expect(iterator.next()).resolves.toEqual(
+      expect.objectContaining({
+        done: false,
+        value: expect.objectContaining({
+          text: 'first ',
+        }),
+      })
+    );
+
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 125);
+    });
+    const started = Date.now();
+
+    await expect(iterator.next()).resolves.toEqual(
+      expect.objectContaining({
+        done: false,
+        value: expect.objectContaining({
+          text: 'second',
+        }),
+      })
+    );
+    expect(Date.now() - started).toBeLessThan(50);
   });
 });

@@ -3,13 +3,15 @@ import {
   AIMessageChunk,
   HumanMessage,
 } from '@langchain/core/messages';
+import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { OpenAIChatInput, OpenAIClient } from '@langchain/openai';
-import type { ChatOpenRouterCallOptions } from '@/llm/openrouter';
-import type { CustomAnthropicInput } from '@/llm/anthropic';
+import type { ChatGenerationChunk } from '@langchain/core/outputs';
 import type {
   ChatAnthropicToolType,
   AnthropicMCPServerURLDefinition,
 } from '@/llm/anthropic/types';
+import type { ChatOpenRouterCallOptions } from '@/llm/openrouter';
+import type { CustomAnthropicInput } from '@/llm/anthropic';
 import {
   ChatXAI,
   ChatOpenAI,
@@ -132,6 +134,18 @@ type CompletionUsageWithCacheWrite = Omit<
   prompt_tokens_details?: PromptTokensDetailsWithCacheWrite;
 };
 type OpenAIStreamModel = ChatOpenAI | AzureChatOpenAI;
+
+class CallbackTestChatOpenRouter extends ChatOpenRouter {
+  streamChunksWithCallbacks(
+    runManager?: CallbackManagerForLLMRun
+  ): AsyncGenerator<ChatGenerationChunk> {
+    return this._streamResponseChunks(
+      [new HumanMessage('hi')],
+      {} as this['ParsedCallOptions'],
+      runManager
+    );
+  }
+}
 
 const baseAzureFields = {
   azureOpenAIApiKey: 'test-azure-key',
@@ -711,8 +725,7 @@ describe('custom chat model class smoke tests', () => {
     }
 
     const usageChunk = chunks.find(
-      (chunk) =>
-        chunk.usage_metadata?.input_token_details?.cache_creation === 5
+      (chunk) => chunk.usage_metadata?.input_token_details?.cache_creation === 5
     );
     expect(usageChunk?.usage_metadata).toEqual({
       input_tokens: 11,
@@ -728,6 +741,44 @@ describe('custom chat model class smoke tests', () => {
         reasoning: 6,
       },
     });
+  });
+
+  it('emits OpenRouter callbacks before an early stream break', async () => {
+    const model = new CallbackTestChatOpenRouter({
+      model: 'openai/gpt-4o-mini',
+      apiKey: 'test-key',
+      _lc_stream_delay: 1,
+    } as OpenRouterFields & { _lc_stream_delay: number });
+    const completions = (model as unknown as StreamingCompletionBackedModel)
+      .completions;
+    const textChunks: string[] = [];
+    const callbackTokens: string[] = [];
+
+    async function* streamChunks(): AsyncGenerator<OpenAIClient.Chat.Completions.ChatCompletionChunk> {
+      yield createOpenAIStreamChunk('alpha beta gamma');
+    }
+
+    completions.completionWithRetry = async (): Promise<
+      AsyncIterable<OpenAIClient.Chat.Completions.ChatCompletionChunk>
+    > => streamChunks();
+
+    const runManager = {
+      handleLLMNewToken(token: string): void {
+        if (token !== '') {
+          callbackTokens.push(token);
+        }
+      },
+    } as unknown as CallbackManagerForLLMRun;
+
+    for await (const chunk of model.streamChunksWithCallbacks(runManager)) {
+      if (chunk.text !== '') {
+        textChunks.push(chunk.text);
+      }
+      break;
+    }
+
+    expect(textChunks).toEqual(['alpha beta gamma']);
+    expect(callbackTokens).toEqual(textChunks);
   });
 
   it('keeps Anthropic output, residency, compaction, and stream-delay options', () => {
@@ -748,6 +799,10 @@ describe('custom chat model class smoke tests', () => {
       contextManagement,
       _lc_stream_delay: 8,
     });
+    const defaultModel = new CustomAnthropic({
+      model: 'claude-sonnet-4-5-20250929',
+      apiKey: 'test-key',
+    });
 
     const params = model.invocationParams({
       outputConfig: { effort: 'low' },
@@ -756,6 +811,7 @@ describe('custom chat model class smoke tests', () => {
 
     expect(CustomAnthropic.lc_name()).toBe('LibreChatAnthropic');
     expect(model._lc_stream_delay).toBe(8);
+    expect(defaultModel._lc_stream_delay).toBe(25);
     expect(params.output_config).toEqual({ effort: 'low' });
     expect(params.inference_geo).toBe('eu');
     expect(params.context_management).toEqual(contextManagement);

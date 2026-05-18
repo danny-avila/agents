@@ -35,10 +35,12 @@ import type { ChatGeneration, ChatResult } from '@langchain/core/outputs';
 import type { ChatXAIInput } from '@langchain/xai';
 import type * as t from '@langchain/openai';
 import { isReasoningModel, _convertMessagesToOpenAIParams } from './utils';
-import { sleep } from '@/utils';
 
 // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
 const iife = <T>(fn: () => T) => fn();
+
+const STREAM_CHUNK_MIN_SIZE = 4;
+const STREAM_BOUNDARIES = new Set([' ', '.', ',', '!', '?', ';', ':']);
 
 export function isHeaders(headers: unknown): headers is Headers {
   return (
@@ -403,16 +405,158 @@ function getCustomOpenAIClientOptions(
   return requestOptions;
 }
 
-async function* delayStreamChunks<T>(
-  chunks: AsyncGenerator<T>,
-  delay?: number
-): AsyncGenerator<T> {
-  for await (const chunk of chunks) {
-    yield chunk;
-    if (delay != null) {
-      await sleep(delay);
+function findStreamChunkBoundary(text: string, minSize: number): number {
+  if (minSize >= text.length) {
+    return text.length;
+  }
+
+  for (let position = minSize; position < text.length; position++) {
+    if (STREAM_BOUNDARIES.has(text[position])) {
+      return position + 1;
     }
   }
+
+  return text.length;
+}
+
+function splitStreamToken(text: string): string[] {
+  const chunks: string[] = [];
+  let currentIndex = 0;
+
+  while (currentIndex < text.length) {
+    const remainingText = text.slice(currentIndex);
+    const chunkSize = findStreamChunkBoundary(
+      remainingText,
+      STREAM_CHUNK_MIN_SIZE
+    );
+    chunks.push(text.slice(currentIndex, currentIndex + chunkSize));
+    currentIndex += chunkSize;
+  }
+
+  return chunks;
+}
+
+function splitTextGenerationChunk(
+  chunk: ChatGenerationChunk
+): ChatGenerationChunk[] {
+  const { message } = chunk;
+  if (
+    !chunk.text ||
+    !(message instanceof AIMessageChunk) ||
+    typeof message.content !== 'string' ||
+    message.content !== chunk.text ||
+    chunk.generationInfo?.logprobs != null ||
+    chunk.generationInfo?.finish_reason != null
+  ) {
+    return [chunk];
+  }
+
+  const tokenChunks = splitStreamToken(chunk.text);
+  if (tokenChunks.length <= 1) {
+    return [chunk];
+  }
+
+  let emittedUsage = false;
+  return tokenChunks.map((token) => {
+    const usageMetadata =
+      emittedUsage && message.usage_metadata != null
+        ? undefined
+        : message.usage_metadata;
+    if (message.usage_metadata != null && !emittedUsage) {
+      emittedUsage = true;
+    }
+
+    return new ChatGenerationChunk({
+      text: token,
+      generationInfo: chunk.generationInfo,
+      message: new AIMessageChunk(
+        Object.assign({}, message, {
+          content: token,
+          usage_metadata: usageMetadata,
+        })
+      ),
+    });
+  });
+}
+
+export async function emitStreamChunkCallback(
+  chunk: ChatGenerationChunk,
+  runManager?: CallbackManagerForLLMRun
+): Promise<void> {
+  await runManager?.handleLLMNewToken(
+    chunk.text,
+    getStreamChunkTokenIndices(chunk),
+    undefined,
+    undefined,
+    undefined,
+    { chunk }
+  );
+}
+
+function getStreamChunkTokenIndices(
+  chunk: ChatGenerationChunk
+): { prompt: number; completion: number } | undefined {
+  const prompt = chunk.generationInfo?.prompt;
+  const completion = chunk.generationInfo?.completion;
+
+  if (typeof prompt === 'number' && typeof completion === 'number') {
+    return { prompt, completion };
+  }
+
+  return undefined;
+}
+
+async function* delayStreamChunks(
+  chunks: AsyncGenerator<ChatGenerationChunk>,
+  delay?: number,
+  signal?: AbortSignal,
+  runManager?: CallbackManagerForLLMRun
+): AsyncGenerator<ChatGenerationChunk> {
+  let lastYieldedAt: number | undefined;
+  for await (const chunk of chunks) {
+    const outputChunks =
+      delay != null && delay > 0 ? splitTextGenerationChunk(chunk) : [chunk];
+    for (const outputChunk of outputChunks) {
+      signal?.throwIfAborted();
+      if (delay != null && delay > 0 && lastYieldedAt != null) {
+        const timeSinceLastYield = Date.now() - lastYieldedAt;
+        const timeToWait = Math.max(0, delay - timeSinceLastYield);
+        if (timeToWait > 0) {
+          await sleepWithAbort(timeToWait, signal);
+        }
+      }
+      signal?.throwIfAborted();
+      lastYieldedAt = Date.now();
+      await emitStreamChunkCallback(outputChunk, runManager);
+      signal?.throwIfAborted();
+      yield outputChunk;
+    }
+  }
+}
+
+async function sleepWithAbort(
+  delay: number,
+  signal?: AbortSignal
+): Promise<void> {
+  if (delay <= 0) {
+    return;
+  }
+  signal?.throwIfAborted();
+  await new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, delay);
+    const onAbort = (): void => {
+      clearTimeout(timeout);
+      signal?.removeEventListener('abort', onAbort);
+      reject(signal?.reason ?? new Error('AbortError: User aborted request.'));
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted === true) {
+      onAbort();
+    }
+  });
 }
 
 function createAbortHandler(controller: AbortController): () => void {
@@ -1184,8 +1328,10 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
     yield* delayStreamChunks(
-      super._streamResponseChunks(messages, options, runManager),
-      this._lc_stream_delay
+      super._streamResponseChunks(messages, options, undefined),
+      this._lc_stream_delay,
+      options.signal,
+      runManager
     );
   }
 }
@@ -1294,8 +1440,10 @@ export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
     yield* delayStreamChunks(
-      super._streamResponseChunks(messages, options, runManager),
-      this._lc_stream_delay
+      super._streamResponseChunks(messages, options, undefined),
+      this._lc_stream_delay,
+      options.signal,
+      runManager
     );
   }
 }
@@ -1425,8 +1573,10 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
     yield* delayStreamChunks(
-      this._streamResponseChunksWithReasoning(messages, options, runManager),
-      this._lc_stream_delay
+      this._streamResponseChunksWithReasoning(messages, options, undefined),
+      this._lc_stream_delay,
+      options.signal,
+      runManager
     );
   }
 
@@ -1767,14 +1917,7 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
   protected _getDeepSeekTokenIndices(
     chunk: ChatGenerationChunk
   ): { prompt: number; completion: number } | undefined {
-    const prompt = chunk.generationInfo?.prompt;
-    const completion = chunk.generationInfo?.completion;
-
-    if (typeof prompt === 'number' && typeof completion === 'number') {
-      return { prompt, completion };
-    }
-
-    return undefined;
+    return getStreamChunkTokenIndices(chunk);
   }
 
   protected _getDeepSeekPartialTagSplitIndex(
@@ -1891,8 +2034,10 @@ export class ChatXAI extends OriginalChatXAI {
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
     yield* delayStreamChunks(
-      super._streamResponseChunks(messages, options, runManager),
-      this._lc_stream_delay
+      super._streamResponseChunks(messages, options, undefined),
+      this._lc_stream_delay,
+      options.signal,
+      runManager
     );
   }
 }

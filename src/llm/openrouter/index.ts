@@ -1,4 +1,4 @@
-import { ChatOpenAI } from '@/llm/openai';
+import { ChatOpenAI, emitStreamChunkCallback } from '@/llm/openai';
 import type { BaseMessage } from '@langchain/core/messages';
 import type { ChatGenerationChunk } from '@langchain/core/outputs';
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
@@ -237,7 +237,7 @@ export class ChatOpenRouter extends ChatOpenAI {
     for await (const generationChunk of super._streamResponseChunks(
       messages,
       options,
-      runManager
+      undefined
     )) {
       let currentReasoningText = '';
       const reasoningDetails = getReasoningDetails(
@@ -283,11 +283,13 @@ export class ChatOpenRouter extends ChatOpenAI {
         } else {
           delete generationChunk.message.additional_kwargs.reasoning_details;
         }
+        await emitStreamChunkCallback(generationChunk, runManager);
         yield generationChunk;
         continue;
       }
 
       delete generationChunk.message.additional_kwargs.reasoning_details;
+      await emitStreamChunkCallback(generationChunk, runManager);
       yield generationChunk;
     }
   }
