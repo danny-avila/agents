@@ -825,6 +825,100 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     });
   });
 
+  it('processes a reused chunk object when its streamed payload changes', async () => {
+    const graph = createGraph();
+    const handler = new ChatModelStreamHandler();
+    const metadata = { langgraph_node: 'agent' };
+    const reusableToolChunk = {
+      id: 'call_weather',
+      name: 'weather',
+      args: '{"city"',
+      index: 0,
+    };
+    const reusableChunk = {
+      content: '',
+      tool_call_chunks: [reusableToolChunk],
+    } as unknown as t.StreamChunk;
+
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      { chunk: reusableChunk },
+      metadata,
+      graph
+    );
+
+    reusableToolChunk.args = ':"NYC"}';
+
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      { chunk: reusableChunk },
+      metadata,
+      graph
+    );
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      { chunk: reusableChunk },
+      metadata,
+      graph
+    );
+
+    expect(
+      graph.eagerEventToolCallChunks.get(chunkStateKey('step-key', 0))
+        ?.argsText
+    ).toBe('{"city":"NYC"}');
+  });
+
+  it('does not share chunk object de-duplication across graphs', async () => {
+    const graphA = createGraph();
+    const graphB = createGraph();
+    const toolExecuteCalls: t.ToolExecuteBatchRequest[] = [];
+    jest.spyOn(events, 'safeDispatchCustomEvent').mockImplementation(
+      async (event, data): Promise<void> => {
+        if (event !== GraphEvents.ON_TOOL_EXECUTE) {
+          return;
+        }
+        const batch = data as t.ToolExecuteBatchRequest;
+        toolExecuteCalls.push(batch);
+        batch.resolve(
+          batch.toolCalls.map((request) => ({
+            toolCallId: request.id,
+            status: 'success' as const,
+            content: `${request.id} result`,
+          }))
+        );
+      }
+    );
+
+    const handler = new ChatModelStreamHandler();
+    const sharedChunk = {
+      content: '',
+      tool_calls: [
+        {
+          id: 'call_weather',
+          name: 'weather',
+          args: { city: 'NYC' },
+        },
+      ],
+    } as unknown as t.StreamChunk;
+
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      { chunk: sharedChunk },
+      { langgraph_node: 'agent' },
+      graphA
+    );
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      { chunk: sharedChunk },
+      { langgraph_node: 'agent' },
+      graphB
+    );
+
+    expect(toolExecuteCalls).toHaveLength(2);
+    expect(graphA.eagerEventToolExecutions.has('call_weather')).toBe(true);
+    expect(graphB.eagerEventToolExecutions.has('call_weather')).toBe(true);
+  });
+
   it('prestarts a completed event tool before later parallel tool args finish', async () => {
     const graph = createGraph();
     const toolExecuteCalls: t.ToolExecuteBatchRequest[] = [];
