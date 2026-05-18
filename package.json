@@ -230,7 +230,7 @@
     "@langfuse/langchain": "^4.3.0",
     "@langfuse/otel": "^4.3.0",
     "@langfuse/tracing": "^4.3.0",
-    "@opentelemetry/sdk-node": "^0.207.0",
+    "@opentelemetry/sdk-node": "^0.218.0",
     "@scarf/scarf": "^1.4.0",
     "@types/diff": "^7.0.2",
     "ai-tokenizer": "^1.0.6",
