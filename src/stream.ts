@@ -27,6 +27,11 @@ import {
   coerceRecordArgs,
   normalizeError,
 } from '@/tools/eagerEventExecution';
+import {
+  getStreamedToolCallSeal,
+  getStreamedToolCallAdapter,
+  type StreamedToolCallSeal,
+} from '@/tools/streamedToolCallSeals';
 
 const LOCAL_CODING_BUNDLE_NAME_SET: ReadonlySet<string> = new Set(
   LOCAL_CODING_BUNDLE_NAMES
@@ -205,17 +210,21 @@ function hasFinalToolCallSignal(chunk: Partial<AIMessageChunk>): boolean {
   return finishReason === 'tool_calls' || finishReason === 'tool_use';
 }
 
-function canPrestartSealedStreamedToolChunks(
+function canPrestartSequentialStreamedToolChunks(
   agentContext: AgentContext | undefined
 ): boolean {
-  // Starting a streamed tool before the final model message is only safe for
-  // providers whose streaming protocol seals one tool-use block before moving
-  // to the next. OpenAI-compatible routes can emit cumulative/ambiguous tool
-  // payloads and are handled by the final `tool_calls` path instead.
   return (
     agentContext?.provider === Providers.ANTHROPIC ||
     agentContext?.provider === Providers.MOONSHOT
   );
+}
+
+function hasExplicitStreamedToolCallSeals(
+  chunk: Partial<AIMessageChunk>
+): boolean {
+  return getStreamedToolCallAdapter(
+    chunk.response_metadata as Record<string, unknown> | undefined
+  ) != null;
 }
 
 function hasDirectToolCallInBatch(args: {
@@ -543,9 +552,18 @@ function getStreamedReadyToolCalls(args: {
   graph: StandardGraph;
   stepKey: string;
   toolCallChunks?: ToolCallChunk[];
+  seal?: StreamedToolCallSeal;
+  allowSequentialSeal?: boolean;
   sealAll?: boolean;
 }): ToolCall[] {
-  const { graph, stepKey, toolCallChunks, sealAll = false } = args;
+  const {
+    graph,
+    stepKey,
+    toolCallChunks,
+    seal,
+    allowSequentialSeal = false,
+    sealAll = false,
+  } = args;
   const currentIndices = new Set<number>();
   for (const toolCallChunk of toolCallChunks ?? []) {
     const index = getEagerToolChunkIndex(toolCallChunk);
@@ -573,11 +591,21 @@ function getStreamedReadyToolCalls(args: {
       continue;
     }
     const isSealedByLaterChunk =
+      allowSequentialSeal &&
       highestCurrentIndex != null &&
       state.index != null &&
       state.index < highestCurrentIndex &&
       !currentIndices.has(state.index);
-    if (sealAll || isSealedByLaterChunk) {
+    const isSealedExplicitly =
+      seal?.kind === 'single' &&
+      ((seal.id != null && state.id === seal.id) ||
+        (seal.index != null && state.index === seal.index));
+    if (
+      sealAll ||
+      seal?.kind === 'all' ||
+      isSealedByLaterChunk ||
+      isSealedExplicitly
+    ) {
       readyEntries.push({ key, state });
     }
   }
@@ -620,9 +648,20 @@ function startReadyStreamedEagerToolExecutions(args: {
   agentContext?: AgentContext;
   stepKey: string;
   toolCallChunks?: ToolCallChunk[];
+  seal?: StreamedToolCallSeal;
+  allowSequentialSeal?: boolean;
   sealAll?: boolean;
 }): void {
-  const { graph, metadata, agentContext, stepKey, toolCallChunks, sealAll } = args;
+  const {
+    graph,
+    metadata,
+    agentContext,
+    stepKey,
+    toolCallChunks,
+    seal,
+    allowSequentialSeal,
+    sealAll,
+  } = args;
   if (
     hasPotentialDirectToolInStreamContext({ graph, agentContext }) ||
     !isEagerToolExecutionEnabledForBatch({ graph, metadata, agentContext })
@@ -633,6 +672,8 @@ function startReadyStreamedEagerToolExecutions(args: {
     graph,
     stepKey,
     toolCallChunks,
+    seal,
+    allowSequentialSeal,
     sealAll,
   });
   if (toolCalls.length === 0) {
@@ -795,8 +836,13 @@ export class ChatModelStreamHandler implements t.EventHandler {
       chunk.tool_call_chunks.length &&
       typeof chunk.tool_call_chunks[0]?.index === 'number'
     ) {
+      const streamedToolCallSeal = getStreamedToolCallSeal(
+        chunk.response_metadata as Record<string, unknown> | undefined
+      );
+      const allowSequentialSeal =
+        canPrestartSequentialStreamedToolChunks(agentContext);
       const canStreamEager =
-        canPrestartSealedStreamedToolChunks(agentContext) &&
+        (allowSequentialSeal || hasExplicitStreamedToolCallSeals(chunk)) &&
         !hasPotentialDirectToolInStreamContext({ graph, agentContext }) &&
         isEagerToolExecutionEnabledForBatch({ graph, metadata, agentContext });
       if (canStreamEager) {
@@ -819,6 +865,8 @@ export class ChatModelStreamHandler implements t.EventHandler {
           agentContext,
           stepKey,
           toolCallChunks: chunk.tool_call_chunks,
+          seal: streamedToolCallSeal,
+          allowSequentialSeal,
           sealAll: hasFinalToolCallSignal(chunk),
         });
       }
