@@ -142,6 +142,92 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     expect(graph.toolCallStepIds.has('call_weather')).toBe(true);
   });
 
+  it('prestarts multiple complete event-driven tool calls as one batch', async () => {
+    const graph = createGraph({
+      getAgentContext: jest.fn(
+        (): Partial<AgentContext> => ({
+          provider: Providers.OPENAI,
+          reasoningKey: 'reasoning_content',
+          toolDefinitions: [{ name: 'weather' }, { name: 'calendar' }],
+          graphTools: [],
+          agentId: 'agent_1',
+        })
+      ) as unknown as StandardGraph['getAgentContext'],
+    });
+    const toolExecuteCalls: t.ToolExecuteBatchRequest[] = [];
+    jest.spyOn(events, 'safeDispatchCustomEvent').mockImplementation(
+      async (event, data): Promise<void> => {
+        if (event !== GraphEvents.ON_TOOL_EXECUTE) {
+          return;
+        }
+        const batch = data as t.ToolExecuteBatchRequest;
+        toolExecuteCalls.push(batch);
+        batch.resolve(
+          batch.toolCalls.map((request) => ({
+            toolCallId: request.id,
+            status: 'success' as const,
+            content: `${request.name} result`,
+          }))
+        );
+      }
+    );
+
+    await new ChatModelStreamHandler().handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_weather',
+              name: 'weather',
+              args: { city: 'NYC' },
+            },
+            {
+              id: 'call_calendar',
+              name: 'calendar',
+              args: { date: 'today' },
+            },
+          ],
+        } as unknown as t.StreamChunk,
+      },
+      { langgraph_node: 'agent' },
+      graph
+    );
+
+    expect(toolExecuteCalls).toHaveLength(1);
+    expect(toolExecuteCalls[0].toolCalls).toHaveLength(2);
+    expect(toolExecuteCalls[0].toolCalls).toEqual([
+      expect.objectContaining({
+        id: 'call_weather',
+        name: 'weather',
+        args: { city: 'NYC' },
+        stepId: expect.stringMatching(/^step_/),
+        turn: 0,
+      }),
+      expect.objectContaining({
+        id: 'call_calendar',
+        name: 'calendar',
+        args: { date: 'today' },
+        stepId: expect.stringMatching(/^step_/),
+        turn: 0,
+      }),
+    ]);
+    const weatherExecution = graph.eagerEventToolExecutions.get('call_weather');
+    const calendarExecution = graph.eagerEventToolExecutions.get('call_calendar');
+    expect(weatherExecution).toMatchObject({
+      toolCallId: 'call_weather',
+      toolName: 'weather',
+      args: { city: 'NYC' },
+    });
+    expect(calendarExecution).toMatchObject({
+      toolCallId: 'call_calendar',
+      toolName: 'calendar',
+      args: { date: 'today' },
+    });
+    expect(weatherExecution?.promise).toBe(calendarExecution?.promise);
+  });
+
   it('records complete chunk-only tool calls after creating a tool step', async () => {
     const graph = createGraph();
     const toolExecuteCalls: t.ToolExecuteBatchRequest[] = [];

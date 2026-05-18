@@ -202,12 +202,19 @@ function shouldAttemptEagerToolExecution(args: {
   return coerceRecordArgs(toolCall.args) != null;
 }
 
-function startEagerToolExecution(args: {
+type EagerToolExecutionEntry = {
+  id: string;
+  toolName: string;
+  coercedArgs: Record<string, unknown>;
+  request: t.ToolCallRequest;
+};
+
+function createEagerToolExecutionEntry(args: {
   graph: StandardGraph;
   metadata?: Record<string, unknown>;
   agentContext?: AgentContext;
   toolCall: ToolCall;
-}): void {
+}): EagerToolExecutionEntry | undefined {
   const { graph, metadata, agentContext, toolCall } = args;
   if (
     !shouldAttemptEagerToolExecution({
@@ -217,18 +224,18 @@ function startEagerToolExecution(args: {
       toolCall,
     })
   ) {
-    return;
+    return undefined;
   }
 
   const id = toolCall.id!;
   if (graph.eagerEventToolExecutions.has(id)) {
-    return;
+    return undefined;
   }
 
   const toolName = toolCall.name;
   const coercedArgs = coerceRecordArgs(toolCall.args);
   if (coercedArgs == null) {
-    return;
+    return undefined;
   }
 
   const turn = graph.eagerEventToolUsageCount.get(toolName) ?? 0;
@@ -247,11 +254,41 @@ function startEagerToolExecution(args: {
     request.codeSessionContext = codeSessionContext;
   }
 
+  return {
+    id,
+    toolName,
+    coercedArgs,
+    request,
+  };
+}
+
+function startEagerToolExecutions(args: {
+  graph: StandardGraph;
+  metadata?: Record<string, unknown>;
+  agentContext?: AgentContext;
+  toolCalls: ToolCall[];
+}): void {
+  const { graph, metadata, agentContext, toolCalls } = args;
+  const entries = toolCalls
+    .map((toolCall) =>
+      createEagerToolExecutionEntry({
+        graph,
+        metadata,
+        agentContext,
+        toolCall,
+      })
+    )
+    .filter((entry): entry is EagerToolExecutionEntry => entry != null);
+
+  if (entries.length === 0) {
+    return;
+  }
+
   const promise: Promise<t.EagerEventToolExecutionOutcome> = new Promise<
     t.ToolExecuteResult[]
   >((resolve, reject) => {
     const batchRequest: t.ToolExecuteBatchRequest = {
-      toolCalls: [request],
+      toolCalls: entries.map((entry) => entry.request),
       userId: graph.config?.configurable?.user_id as string | undefined,
       agentId: agentContext?.agentId,
       configurable: graph.config?.configurable as
@@ -274,13 +311,15 @@ function startEagerToolExecution(args: {
     })
   );
 
-  graph.eagerEventToolExecutions.set(id, {
-    toolCallId: id,
-    toolName,
-    args: coercedArgs,
-    request,
-    promise,
-  });
+  for (const entry of entries) {
+    graph.eagerEventToolExecutions.set(entry.id, {
+      toolCallId: entry.id,
+      toolName: entry.toolName,
+      args: entry.coercedArgs,
+      request: entry.request,
+      promise,
+    });
+  }
 }
 
 function getEagerToolChunkKey(
@@ -493,14 +532,12 @@ export class ChatModelStreamHandler implements t.EventHandler {
       hasToolCalls = true;
       await handleToolCalls(chunk.tool_calls, metadata, graph);
       if (!hasToolCallChunks) {
-        for (const toolCall of chunk.tool_calls) {
-          startEagerToolExecution({
-            graph,
-            metadata,
-            agentContext,
-            toolCall,
-          });
-        }
+        startEagerToolExecutions({
+          graph,
+          metadata,
+          agentContext,
+          toolCalls: chunk.tool_calls,
+        });
       }
     }
 
