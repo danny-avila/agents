@@ -2672,7 +2672,23 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       execution.toolName !== request.name ||
       !recordArgsEqual(execution.args, request.args)
     ) {
-      return undefined;
+      return {
+        toolCallId: request.id,
+        toolName: request.name,
+        args: request.args,
+        request,
+        promise: Promise.resolve({
+          results: [
+            {
+              toolCallId: request.id,
+              status: 'error',
+              content: '',
+              errorMessage:
+                'Tool call arguments changed after eager execution started; refusing to re-run the tool to avoid duplicate side effects.',
+            },
+          ],
+        }),
+      };
     }
 
     return execution;

@@ -99,7 +99,7 @@ describe('ToolNode eager event tool execution', () => {
     expect(result.messages[0].content).toBe('eager result');
   });
 
-  it('falls back to normal dispatch when final args differ from the prestarted call', async () => {
+  it('fails closed without redispatching when final args differ from the prestarted call', async () => {
     const { toolExecuteCalls } = installToolExecuteResponder('fresh result');
     const eagerExecutions = new Map<string, t.EagerEventToolExecution>();
     const request: t.ToolCallRequest = {
@@ -139,10 +139,10 @@ describe('ToolNode eager event tool execution', () => {
       ],
     })) as { messages: ToolMessage[] };
 
-    expect(toolExecuteCalls).toHaveLength(1);
-    expect(toolExecuteCalls[0].toolCalls[0].args).toEqual({ city: 'Boston' });
+    expect(toolExecuteCalls).toHaveLength(0);
     expect(eagerExecutions.has('call_weather')).toBe(false);
     expect(result.messages).toHaveLength(1);
-    expect(result.messages[0].content).toBe('fresh result');
+    expect(result.messages[0].status).toBe('error');
+    expect(result.messages[0].content).toContain('refusing to re-run');
   });
 });
