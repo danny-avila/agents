@@ -215,10 +215,11 @@ function hasFinalToolCallSignal(chunk: Partial<AIMessageChunk>): boolean {
 function canPrestartSequentialStreamedToolChunks(
   agentContext: AgentContext | undefined
 ): boolean {
-  return (
-    agentContext?.provider === Providers.ANTHROPIC ||
-    agentContext?.provider === Providers.MOONSHOT
-  );
+  // Anthropic seals each prior streamed tool-use block when the next indexed
+  // tool-use block begins. Live Kimi/Moonshot streams can still revise prior
+  // args after advancing to the next index, so keep those on the final
+  // tool-call path unless they grow an explicit adapter seal.
+  return agentContext?.provider === Providers.ANTHROPIC;
 }
 
 function hasExplicitStreamedToolCallSeals(

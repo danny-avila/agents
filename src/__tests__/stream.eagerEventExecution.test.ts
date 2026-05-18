@@ -1793,6 +1793,119 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     expect(graph.eagerEventToolCallChunks.size).toBe(0);
   });
 
+  it('does not use next-index sealing for Moonshot streamed tool chunks', async () => {
+    const graph = createGraph({
+      getAgentContext: jest.fn(
+        (): Partial<AgentContext> => ({
+          provider: Providers.MOONSHOT,
+          reasoningKey: 'reasoning',
+          toolDefinitions: [{ name: 'weather' }, { name: 'stock' }],
+          graphTools: [],
+          agentId: 'agent_1',
+        })
+      ) as unknown as StandardGraph['getAgentContext'],
+    });
+    const toolExecuteCalls: t.ToolExecuteBatchRequest[] = [];
+    jest.spyOn(events, 'safeDispatchCustomEvent').mockImplementation(
+      async (event, data): Promise<void> => {
+        if (event !== GraphEvents.ON_TOOL_EXECUTE) {
+          return;
+        }
+        const batch = data as t.ToolExecuteBatchRequest;
+        toolExecuteCalls.push(batch);
+        batch.resolve(
+          batch.toolCalls.map((call) => ({
+            toolCallId: call.id,
+            status: 'success',
+            content: `ok ${call.name}`,
+          }))
+        );
+      }
+    );
+
+    const handler = new ChatModelStreamHandler();
+    const metadata = { langgraph_node: 'agent' };
+
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_call_chunks: [
+            {
+              id: 'call_weather',
+              name: 'weather',
+              args: '{"city":"NYC"}',
+              index: 0,
+            },
+          ],
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_call_chunks: [
+            {
+              id: 'call_stock',
+              name: 'stock',
+              args: '{"ticker":"C',
+              index: 1,
+            },
+          ],
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+
+    expect(toolExecuteCalls).toHaveLength(0);
+    expect(graph.eagerEventToolExecutions.size).toBe(0);
+    expect(graph.eagerEventToolCallChunks.size).toBe(0);
+
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_weather',
+              name: 'weather',
+              args: { city: 'NYC revised' },
+            },
+            {
+              id: 'call_stock',
+              name: 'stock',
+              args: { ticker: 'CH' },
+            },
+          ],
+          response_metadata: finalToolCallResponseMetadata,
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+
+    expect(toolExecuteCalls).toHaveLength(1);
+    expect(toolExecuteCalls[0].toolCalls).toEqual([
+      expect.objectContaining({
+        id: 'call_weather',
+        name: 'weather',
+        args: { city: 'NYC revised' },
+      }),
+      expect.objectContaining({
+        id: 'call_stock',
+        name: 'stock',
+        args: { ticker: 'CH' },
+      }),
+    ]);
+  });
+
   it('does not seal a streamed tool when the same chunk also carries its own index', async () => {
     const graph = createGraph({
       getAgentContext: jest.fn(
