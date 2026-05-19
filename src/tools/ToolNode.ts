@@ -1062,13 +1062,13 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             handlerError:
               handlerError instanceof Error
                 ? {
-                    message: handlerError.message,
-                    stack: handlerError.stack ?? undefined,
-                  }
+                  message: handlerError.message,
+                  stack: handlerError.stack ?? undefined,
+                }
                 : {
-                    message: String(handlerError),
-                    stack: undefined,
-                  },
+                  message: String(handlerError),
+                  stack: undefined,
+                },
           });
         }
       }
@@ -1076,11 +1076,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       const refMeta =
         unresolvedRefs.length > 0
           ? this.recordOutputReference(
-              runId,
-              errorContent,
-              undefined,
-              unresolvedRefs
-            )
+            runId,
+            errorContent,
+            undefined,
+            unresolvedRefs
+          )
           : undefined;
       return new ToolMessage({
         status: 'error',
@@ -2432,59 +2432,75 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         dispatchRequests.length === 0
           ? Promise.resolve([] as t.ToolExecuteResult[])
           : new Promise<t.ToolExecuteResult[]>((resolve, reject) => {
-              let dispatchSettled = false;
-              let resultSettled = false;
-              let settledResults: t.ToolExecuteResult[] | undefined;
+            let dispatchSettled = false;
+            let resultSettled = false;
+            let settledResults: t.ToolExecuteResult[] | undefined;
 
-              const maybeResolve = (): void => {
-                if (dispatchSettled && resultSettled) {
-                  resolve(settledResults ?? []);
-                }
-              };
+            const maybeResolve = (): void => {
+              if (dispatchSettled && resultSettled) {
+                resolve(settledResults ?? []);
+              }
+            };
 
-              const batchRequest: t.ToolExecuteBatchRequest = {
-                toolCalls: dispatchRequests,
-                userId: config.configurable?.user_id as string | undefined,
-                agentId: this.agentId,
-                configurable: config.configurable as
+            const batchRequest: t.ToolExecuteBatchRequest = {
+              toolCalls: dispatchRequests,
+              userId: config.configurable?.user_id as string | undefined,
+              agentId: this.agentId,
+              configurable: config.configurable as
                   | Record<string, unknown>
                   | undefined,
-                metadata: config.metadata as
+              metadata: config.metadata as
                   | Record<string, unknown>
                   | undefined,
-                resolve: (results): void => {
-                  resultSettled = true;
-                  settledResults = results;
-                  maybeResolve();
-                },
-                reject,
-              };
+              resolve: (results): void => {
+                resultSettled = true;
+                settledResults = results;
+                maybeResolve();
+              },
+              reject,
+            };
 
-              void safeDispatchCustomEvent(
-                GraphEvents.ON_TOOL_EXECUTE,
-                batchRequest,
-                config
-              )
-                .then(() => {
-                  dispatchSettled = true;
-                  maybeResolve();
-                })
-                .catch(reject);
-            });
+            void safeDispatchCustomEvent(
+              GraphEvents.ON_TOOL_EXECUTE,
+              batchRequest,
+              config
+            )
+              .then(() => {
+                dispatchSettled = true;
+                maybeResolve();
+              })
+              .catch(reject);
+          });
 
       const eagerResultsPromise = Promise.all(
-        eagerExecutions.map(({ request, execution }) =>
-          this.resolveEagerEventExecution(request, execution)
-        )
-      ).then((results) => results.flat());
+        eagerExecutions.map(async ({ request, execution }) => {
+          const results = await this.resolveEagerEventExecution(
+            request,
+            execution
+          );
+          return {
+            results,
+            completionDispatched: execution.completionDispatched === true,
+            toolCallId: request.id,
+          };
+        })
+      );
 
       const [eagerResults, dispatchedResults] = await Promise.all([
         eagerResultsPromise,
         dispatchPromise,
       ]);
+      const eagerCompletionDispatchedIds = new Set(
+        eagerResults
+          .filter((result) => result.completionDispatched)
+          .map((result) => result.toolCallId)
+      );
+      const flattenedEagerResults = eagerResults.flatMap(
+        (result) => result.results
+      );
       const results = [
         ...plan.rejectedResults,
-        ...eagerResults,
+        ...flattenedEagerResults,
         ...dispatchedResults,
       ];
 
@@ -2537,11 +2553,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           const errorRefMeta =
             unresolved.length > 0
               ? this.recordOutputReference(
-                  registryRunId,
-                  contentString,
-                  undefined,
-                  unresolved
-                )
+                registryRunId,
+                contentString,
+                undefined,
+                unresolved
+              )
               : undefined;
           toolMessage = new ToolMessage({
             status: 'error',
@@ -2660,14 +2676,16 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           });
         }
 
-        await this.dispatchStepCompleted(
-          result.toolCallId,
-          toolName,
-          request?.args ?? {},
-          contentString,
-          config,
-          request?.turn
-        );
+        if (!eagerCompletionDispatchedIds.has(result.toolCallId)) {
+          await this.dispatchStepCompleted(
+            result.toolCallId,
+            toolName,
+            request?.args ?? {},
+            contentString,
+            config,
+            request?.turn
+          );
+        }
 
         postToolBatchEntryByCallId.set(result.toolCallId, {
           toolName,
@@ -3015,15 +3033,15 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       outputs =
         directAdditionalContexts.length > 0
           ? [
-              sendOutput,
-              new HumanMessage({
-                content: directAdditionalContexts.join('\n\n'),
-                // Match the event-driven path's marker so hosts /
-                // model-side annotators treat this as system intent
-                // rather than ordinary user text. Codex P2 [46].
-                additional_kwargs: { role: 'system', source: 'hook' },
-              }),
-            ]
+            sendOutput,
+            new HumanMessage({
+              content: directAdditionalContexts.join('\n\n'),
+              // Match the event-driven path's marker so hosts /
+              // model-side annotators treat this as system intent
+              // rather than ordinary user text. Codex P2 [46].
+              additional_kwargs: { role: 'system', source: 'hook' },
+            }),
+          ]
           : [sendOutput];
       await this.handleRunToolCompletions(
         [input.lg_tool_call],
@@ -3174,17 +3192,17 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         const directOutputs: (BaseMessage | Command)[] =
           directCalls.length > 0
             ? await Promise.all(
-                directCalls.map((call, i) =>
-                  this.runDirectToolWithLifecycleHooks(call, config, {
-                    batchIndex: directIndices[i],
-                    turn,
-                    batchScopeId,
-                    resolvedArgsByCallId,
-                    preBatchSnapshot,
-                    additionalContextsSink: directAdditionalContexts,
-                  })
-                )
+              directCalls.map((call, i) =>
+                this.runDirectToolWithLifecycleHooks(call, config, {
+                  batchIndex: directIndices[i],
+                  turn,
+                  batchScopeId,
+                  resolvedArgsByCallId,
+                  preBatchSnapshot,
+                  additionalContextsSink: directAdditionalContexts,
+                })
               )
+            )
             : [];
 
         if (directCalls.length > 0 && directOutputs.length > 0) {
@@ -3199,29 +3217,29 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         const eventResult =
           eventCalls.length > 0
             ? await this.dispatchToolEvents(eventCalls, config, {
-                batchIndices: eventIndices,
-                turn,
-                batchScopeId,
-                preResolvedArgs: preResolvedEventArgs,
-                preBatchSnapshot,
-              })
+              batchIndices: eventIndices,
+              turn,
+              batchScopeId,
+              preResolvedArgs: preResolvedEventArgs,
+              preBatchSnapshot,
+            })
             : {
-                toolMessages: [] as ToolMessage[],
-                injected: [] as BaseMessage[],
-              };
+              toolMessages: [] as ToolMessage[],
+              injected: [] as BaseMessage[],
+            };
 
         const directInjected: BaseMessage[] =
           directAdditionalContexts.length > 0
             ? [
-                new HumanMessage({
-                  content: directAdditionalContexts.join('\n\n'),
-                  // System-role metadata to match the event-driven
-                  // path so policy/recovery guidance is treated
-                  // consistently regardless of whether the tool ran
-                  // direct or dispatched. Codex P2 [46].
-                  additional_kwargs: { role: 'system', source: 'hook' },
-                }),
-              ]
+              new HumanMessage({
+                content: directAdditionalContexts.join('\n\n'),
+                // System-role metadata to match the event-driven
+                // path so policy/recovery guidance is treated
+                // consistently regardless of whether the tool ran
+                // direct or dispatched. Codex P2 [46].
+                additional_kwargs: { role: 'system', source: 'hook' },
+              }),
+            ]
             : [];
         outputs = [
           ...directOutputs,
@@ -3260,15 +3278,15 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         outputs =
           directAdditionalContexts.length > 0
             ? [
-                ...toolOutputs,
-                new HumanMessage({
-                  content: directAdditionalContexts.join('\n\n'),
-                  // Same system-role marker the event-driven path
-                  // uses so direct vs dispatched is invisible to
-                  // downstream consumers. Codex P2 [46].
-                  additional_kwargs: { role: 'system', source: 'hook' },
-                }),
-              ]
+              ...toolOutputs,
+              new HumanMessage({
+                content: directAdditionalContexts.join('\n\n'),
+                // Same system-role marker the event-driven path
+                // uses so direct vs dispatched is invisible to
+                // downstream consumers. Codex P2 [46].
+                additional_kwargs: { role: 'system', source: 'hook' },
+              }),
+            ]
             : toolOutputs;
       }
     }
