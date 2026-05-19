@@ -2480,7 +2480,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           );
           return {
             results,
-            completionDispatched: execution.completionDispatched === true,
+            completionDispatched:
+              execution.completionDispatched === true &&
+              execution.request.turn === request.turn,
             toolCallId: request.id,
           };
         })
@@ -2724,8 +2726,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       this.eventDrivenMode &&
       this.eagerEventToolExecution?.enabled === true &&
       this.hookRegistry == null &&
-      this.humanInTheLoop?.enabled !== true &&
-      this.toolOutputRegistry == null
+      this.humanInTheLoop?.enabled !== true
     );
   }
 
@@ -2743,10 +2744,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
     this.eagerEventToolExecutions?.delete(request.id);
 
+    // Only tool identity + canonical args define side-effect identity here.
+    // `request.turn` is final-planning metadata; if it drifts between the
+    // streamed eager reservation and model-end materialization, consume the
+    // same-name/same-args eager result and let the final request drive refs,
+    // completion metadata, and PostToolBatch state.
     if (
       execution.toolName !== request.name ||
-      !recordArgsEqual(execution.args, request.args) ||
-      execution.request.turn !== request.turn
+      !recordArgsEqual(execution.args, request.args)
     ) {
       return {
         toolCallId: request.id,

@@ -145,6 +145,14 @@ export abstract class Graph<
   /** Set of invoked tool call IDs from non-message run steps completed mid-run, if any */
   invokedToolIds?: Set<string>;
   handlerRegistry: HandlerRegistry | undefined;
+  /**
+   * True when event-driven tool execution can be routed through callbacks even
+   * though this graph intentionally does not own the full handler registry.
+   * Self-spawned subagent graphs use this shape: their callback forwarder sends
+   * `ON_TOOL_EXECUTE` to the parent's handler, while child run-step events stay
+   * wrapped as `ON_SUBAGENT_UPDATE` instead of leaking as parent events.
+   */
+  eventToolExecutionAvailable: boolean = false;
   hookRegistry: HookRegistry | undefined;
   /**
    * Run-scoped HITL configuration. When `humanInTheLoop?.enabled` is
@@ -167,10 +175,8 @@ export abstract class Graph<
   eagerEventToolExecution: t.EagerEventToolExecutionConfig | undefined;
   eagerEventToolExecutions: Map<string, t.EagerEventToolExecution> = new Map();
   eagerEventToolUsageCount: Map<string, number> = new Map();
-  private eagerEventToolUsageCountsByAgentId: Map<
-    string,
-    Map<string, number>
-  > = new Map();
+  private eagerEventToolUsageCountsByAgentId: Map<string, Map<string, number>> =
+    new Map();
   eagerEventToolCallChunks: Map<string, t.EagerEventToolCallChunkState> =
     new Map();
   /**
@@ -1554,7 +1560,16 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           parentAgentId: agentContext.agentId,
           tokenCounter: agentContext.tokenCounter,
           maxDepth: effectiveSubagentDepth,
-          createChildGraph: (input): StandardGraph => new StandardGraph(input),
+          createChildGraph: (input): StandardGraph => {
+            const childGraph = new StandardGraph(input);
+            childGraph.toolOutputReferences = this.toolOutputReferences;
+            childGraph.eagerEventToolExecution = this.eagerEventToolExecution;
+            childGraph.toolExecution = this.toolExecution;
+            childGraph.eventToolExecutionAvailable =
+              this.handlerRegistry?.getHandler(GraphEvents.ON_TOOL_EXECUTE) !=
+              null;
+            return childGraph;
+          },
         });
 
         const subagentTool = tool(async (rawInput, config) => {

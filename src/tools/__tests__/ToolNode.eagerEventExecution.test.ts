@@ -117,6 +117,217 @@ describe('ToolNode eager event tool execution', () => {
     expect(result.messages[0].content).toBe('eager result');
   });
 
+  it('uses a prestarted event result when final args are canonically equivalent', async () => {
+    const { toolExecuteCalls } = installToolExecuteResponder('redispatched');
+    const eagerExecutions = new Map<string, t.EagerEventToolExecution>();
+    const request: t.ToolCallRequest = {
+      id: 'call_weather',
+      name: 'weather',
+      args: { city: 'NYC', units: 'metric' },
+      stepId: 'step_weather',
+      turn: 0,
+    };
+    eagerExecutions.set('call_weather', {
+      toolCallId: 'call_weather',
+      toolName: 'weather',
+      args: { city: 'NYC', units: 'metric' },
+      request,
+      promise: Promise.resolve({
+        results: [
+          {
+            toolCallId: 'call_weather',
+            status: 'success',
+            content: 'eager result',
+          },
+        ],
+      }),
+    });
+
+    const toolNode = new ToolNode({
+      tools: [createDummyTool('weather')],
+      eventDrivenMode: true,
+      eagerEventToolExecution: { enabled: true },
+      eagerEventToolExecutions: eagerExecutions,
+      toolCallStepIds: new Map([['call_weather', 'step_weather']]),
+    });
+
+    const result = (await toolNode.invoke({
+      messages: [
+        createAIMessage('call_weather', 'weather', {
+          units: 'metric',
+          city: 'NYC',
+        }),
+      ],
+    })) as { messages: ToolMessage[] };
+
+    expect(toolExecuteCalls).toHaveLength(0);
+    expect(eagerExecutions.has('call_weather')).toBe(false);
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0].content).toBe('eager result');
+  });
+
+  it('uses a prestarted event result when only final planning turn differs', async () => {
+    const { toolExecuteCalls } = installToolExecuteResponder('redispatched');
+    const eagerExecutions = new Map<string, t.EagerEventToolExecution>();
+    const eagerUsageCount = new Map<string, number>([['weather', 1]]);
+    const request: t.ToolCallRequest = {
+      id: 'call_weather',
+      name: 'weather',
+      args: { city: 'NYC' },
+      stepId: 'step_weather',
+      turn: 7,
+    };
+    eagerExecutions.set('call_weather', {
+      toolCallId: 'call_weather',
+      toolName: 'weather',
+      args: { city: 'NYC' },
+      request,
+      promise: Promise.resolve({
+        results: [
+          {
+            toolCallId: 'call_weather',
+            status: 'success',
+            content: 'eager result',
+          },
+        ],
+      }),
+    });
+
+    const toolNode = new ToolNode({
+      tools: [createDummyTool('weather')],
+      eventDrivenMode: true,
+      eagerEventToolExecution: { enabled: true },
+      eagerEventToolExecutions: eagerExecutions,
+      eagerEventToolUsageCount: eagerUsageCount,
+      toolCallStepIds: new Map([['call_weather', 'step_weather']]),
+    });
+
+    const result = (await toolNode.invoke({
+      messages: [createAIMessage('call_weather', 'weather', { city: 'NYC' })],
+    })) as { messages: ToolMessage[] };
+
+    expect(toolExecuteCalls).toHaveLength(0);
+    expect(eagerExecutions.has('call_weather')).toBe(false);
+    expect(eagerUsageCount.get('weather')).toBe(1);
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0].status).toBe('success');
+    expect(result.messages[0].content).toBe('eager result');
+  });
+
+  it('redispatches completion when a prestarted event result used a stale turn', async () => {
+    const stepCompletions: Array<{
+      result?: { index?: number; tool_call?: { output?: string } };
+    }> = [];
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data): Promise<boolean | void> => {
+        if (event === GraphEvents.ON_RUN_STEP_COMPLETED) {
+          stepCompletions.push(data as (typeof stepCompletions)[number]);
+          return true;
+        }
+        if (event === GraphEvents.ON_TOOL_EXECUTE) {
+          throw new Error('tool should not redispatch');
+        }
+      });
+
+    const eagerExecutions = new Map<string, t.EagerEventToolExecution>();
+    const eagerUsageCount = new Map<string, number>([['weather', 1]]);
+    const request: t.ToolCallRequest = {
+      id: 'call_weather',
+      name: 'weather',
+      args: { city: 'NYC' },
+      stepId: 'step_weather',
+      turn: 7,
+    };
+    eagerExecutions.set('call_weather', {
+      toolCallId: 'call_weather',
+      toolName: 'weather',
+      args: { city: 'NYC' },
+      request,
+      completionDispatched: true,
+      promise: Promise.resolve({
+        results: [
+          {
+            toolCallId: 'call_weather',
+            status: 'success',
+            content: 'eager result',
+          },
+        ],
+      }),
+    });
+
+    const toolNode = new ToolNode({
+      tools: [createDummyTool('weather')],
+      eventDrivenMode: true,
+      eagerEventToolExecution: { enabled: true },
+      eagerEventToolExecutions: eagerExecutions,
+      eagerEventToolUsageCount: eagerUsageCount,
+      toolCallStepIds: new Map([['call_weather', 'step_weather']]),
+    });
+
+    const result = (await toolNode.invoke({
+      messages: [createAIMessage('call_weather', 'weather', { city: 'NYC' })],
+    })) as { messages: ToolMessage[] };
+
+    expect(stepCompletions).toHaveLength(1);
+    expect(stepCompletions[0].result?.index).toBe(0);
+    expect(stepCompletions[0].result?.tool_call?.output).toBe('eager result');
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0].content).toBe('eager result');
+  });
+
+  it('uses a matching prestarted event result when output references are enabled', async () => {
+    const { toolExecuteCalls } = installToolExecuteResponder('redispatched');
+    const eagerExecutions = new Map<string, t.EagerEventToolExecution>();
+    const eagerUsageCount = new Map<string, number>([['weather', 1]]);
+    const request: t.ToolCallRequest = {
+      id: 'call_weather',
+      name: 'weather',
+      args: { city: 'NYC' },
+      stepId: 'step_weather',
+      turn: 0,
+    };
+    eagerExecutions.set('call_weather', {
+      toolCallId: 'call_weather',
+      toolName: 'weather',
+      args: { city: 'NYC' },
+      request,
+      promise: Promise.resolve({
+        results: [
+          {
+            toolCallId: 'call_weather',
+            status: 'success',
+            content: 'eager result',
+          },
+        ],
+      }),
+    });
+
+    const toolNode = new ToolNode({
+      tools: [createDummyTool('weather')],
+      eventDrivenMode: true,
+      eagerEventToolExecution: { enabled: true },
+      eagerEventToolExecutions: eagerExecutions,
+      eagerEventToolUsageCount: eagerUsageCount,
+      toolCallStepIds: new Map([['call_weather', 'step_weather']]),
+      toolOutputReferences: { enabled: true },
+    });
+
+    const result = (await toolNode.invoke(
+      {
+        messages: [createAIMessage('call_weather', 'weather', { city: 'NYC' })],
+      },
+      { configurable: { run_id: 'run_1' } }
+    )) as { messages: ToolMessage[] };
+
+    expect(toolExecuteCalls).toHaveLength(0);
+    expect(eagerExecutions.has('call_weather')).toBe(false);
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0].content).toBe('eager result');
+    expect(result.messages[0].additional_kwargs._refKey).toBe('tool0turn0');
+    expect(result.messages[0].additional_kwargs._refScope).toBe('run_1');
+  });
+
   it('does not redispatch completion when eager path already emitted it', async () => {
     const completedEvents: Array<{ result: t.ToolEndEvent }> = [];
     const toolExecuteCalls: t.ToolExecuteBatchRequest[] = [];
@@ -255,7 +466,7 @@ describe('ToolNode eager event tool execution', () => {
     const { toolExecuteCalls } = installToolExecuteResponder('normal result');
     const eagerExecutions = new Map<string, t.EagerEventToolExecution>();
     const eagerUsageCount = new Map<string, number>([['weather', 1]]);
-    const staleRequest: t.ToolCallRequest = {
+    const prestartedRequest: t.ToolCallRequest = {
       id: 'call_weather_2',
       name: 'weather',
       args: { city: 'Boston' },
@@ -266,13 +477,13 @@ describe('ToolNode eager event tool execution', () => {
       toolCallId: 'call_weather_2',
       toolName: 'weather',
       args: { city: 'Boston' },
-      request: staleRequest,
+      request: prestartedRequest,
       promise: Promise.resolve({
         results: [
           {
             toolCallId: 'call_weather_2',
             status: 'success',
-            content: 'stale eager result',
+            content: 'prestarted eager result',
           },
         ],
       }),
@@ -322,8 +533,8 @@ describe('ToolNode eager event tool execution', () => {
       'call_weather_2',
     ]);
     expect(result.messages[0].status).toBe('success');
-    expect(result.messages[1].status).toBe('error');
-    expect(result.messages[1].content).toContain('refusing to re-run');
+    expect(result.messages[1].status).toBe('success');
+    expect(result.messages[1].content).toBe('prestarted eager result');
   });
 
   it('returns a per-call error for malformed event tool args without aborting the batch', async () => {
@@ -373,9 +584,7 @@ describe('ToolNode eager event tool execution', () => {
       'call_weather_good',
     ]);
     expect(result.messages[0].status).toBe('error');
-    expect(result.messages[0].content).toContain(
-      'Invalid tool call arguments'
-    );
+    expect(result.messages[0].content).toContain('Invalid tool call arguments');
     expect(result.messages[1].status).toBe('success');
     expect(result.messages[1].content).toBe('normal result');
   });
@@ -387,9 +596,7 @@ describe('ToolNode eager event tool execution', () => {
     const hookRegistry = new HookRegistry();
     hookRegistry.register('PreToolUse', {
       hooks: [
-        async (
-          input: PreToolUseHookInput
-        ): Promise<PreToolUseHookOutput> => {
+        async (input: PreToolUseHookInput): Promise<PreToolUseHookOutput> => {
           preToolTurns.push(input.turn);
           return { decision: 'allow' };
         },
@@ -410,9 +617,7 @@ describe('ToolNode eager event tool execution', () => {
     });
 
     await toolNode.invoke({
-      messages: [
-        createAIMessage('call_weather_1', 'weather', { city: 'NYC' }),
-      ],
+      messages: [createAIMessage('call_weather_1', 'weather', { city: 'NYC' })],
     });
 
     eagerUsageCount.clear();

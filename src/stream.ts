@@ -36,6 +36,7 @@ import {
   getStreamedToolCallAdapter,
   type StreamedToolCallSeal,
 } from '@/tools/streamedToolCallSeals';
+import { TOOL_OUTPUT_REF_PATTERN } from '@/tools/toolOutputReferences';
 
 const LOCAL_CODING_BUNDLE_NAME_SET: ReadonlySet<string> = new Set(
   LOCAL_CODING_BUNDLE_NAMES
@@ -102,11 +103,22 @@ function getNonEmptyValue(possibleValues: string[]): string | undefined {
 }
 
 function isBatchSensitiveToolExecution(graph: StandardGraph): boolean {
-  return (
-    graph.hookRegistry != null ||
-    graph.humanInTheLoop?.enabled === true ||
-    graph.toolOutputReferences?.enabled === true
-  );
+  return graph.hookRegistry != null || graph.humanInTheLoop?.enabled === true;
+}
+
+function hasToolOutputReference(value: unknown): boolean {
+  if (typeof value === 'string') {
+    return TOOL_OUTPUT_REF_PATTERN.test(value);
+  }
+  if (Array.isArray(value)) {
+    return value.some((item) => hasToolOutputReference(item));
+  }
+  if (value !== null && typeof value === 'object') {
+    return Object.values(value as Record<string, unknown>).some((item) =>
+      hasToolOutputReference(item)
+    );
+  }
+  return false;
 }
 
 function isDirectGraphTool(
@@ -198,7 +210,10 @@ function isEagerToolExecutionEnabledForBatch(args: {
   ) {
     return false;
   }
-  if (graph.handlerRegistry?.getHandler(GraphEvents.ON_TOOL_EXECUTE) == null) {
+  if (
+    graph.handlerRegistry?.getHandler(GraphEvents.ON_TOOL_EXECUTE) == null &&
+    graph.eventToolExecutionAvailable !== true
+  ) {
     return false;
   }
   return true;
@@ -261,11 +276,47 @@ function hasPotentialDirectToolInStreamContext(args: {
   if ((agentContext?.graphTools?.length ?? 0) > 0) {
     return true;
   }
+  return false;
+}
+
+function hasDirectToolCallChunkInBatch(args: {
+  graph: StandardGraph;
+  agentContext?: AgentContext;
+  toolCallChunks?: ToolCallChunk[];
+}): boolean {
+  const { graph, agentContext, toolCallChunks } = args;
   return (
-    agentContext?.toolDefinitions?.some((toolDefinition) =>
-      toolDefinition.name.startsWith(Constants.LC_TRANSFER_TO_)
+    toolCallChunks?.some(
+      (toolCallChunk) =>
+        toolCallChunk.name != null &&
+        toolCallChunk.name !== '' &&
+        (isDirectGraphTool(toolCallChunk.name, agentContext) ||
+          isDirectLocalTool(toolCallChunk.name, graph))
     ) === true
   );
+}
+
+function hasDirectToolCallChunkStateInStep(args: {
+  graph: StandardGraph;
+  agentContext?: AgentContext;
+  stepKey: string;
+}): boolean {
+  const { graph, agentContext, stepKey } = args;
+  const prefix = `${stepKey}\u0000`;
+  for (const [key, state] of graph.eagerEventToolCallChunks) {
+    if (!key.startsWith(prefix)) {
+      continue;
+    }
+    const name = state.name;
+    if (
+      name != null &&
+      name !== '' &&
+      (isDirectGraphTool(name, agentContext) || isDirectLocalTool(name, graph))
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 type EagerToolExecutionEntry = {
@@ -300,6 +351,12 @@ function createEagerToolExecutionPlan(args: {
   }
 
   if (hasDirectToolCallInBatch({ graph, agentContext, toolCalls })) {
+    return undefined;
+  }
+  if (
+    graph.toolOutputReferences?.enabled === true &&
+    toolCalls.some((toolCall) => hasToolOutputReference(toolCall.args))
+  ) {
     return undefined;
   }
 
@@ -788,6 +845,8 @@ function startReadyStreamedEagerToolExecutions(args: {
   } = args;
   if (
     hasPotentialDirectToolInStreamContext({ graph, agentContext }) ||
+    hasDirectToolCallChunkInBatch({ graph, agentContext, toolCallChunks }) ||
+    hasDirectToolCallChunkStateInStep({ graph, agentContext, stepKey }) ||
     !isEagerToolExecutionEnabledForBatch({ graph, metadata, agentContext })
   ) {
     return;
