@@ -2480,7 +2480,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           );
           return {
             results,
-            completionDispatched: execution.completionDispatched === true,
+            completionDispatched:
+              execution.completionDispatched === true &&
+              execution.request.turn === request.turn,
             toolCallId: request.id,
           };
         })

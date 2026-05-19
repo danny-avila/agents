@@ -265,11 +265,15 @@ function hasDirectToolCallInBatch(args: {
   );
 }
 
-function hasPotentialLocalDirectToolInStreamContext(args: {
+function hasPotentialDirectToolInStreamContext(args: {
   graph: StandardGraph;
+  agentContext?: AgentContext;
 }): boolean {
-  const { graph } = args;
+  const { graph, agentContext } = args;
   if (graph.toolExecution?.engine === 'local') {
+    return true;
+  }
+  if ((agentContext?.graphTools?.length ?? 0) > 0) {
     return true;
   }
   return false;
@@ -840,7 +844,7 @@ function startReadyStreamedEagerToolExecutions(args: {
     sealAll,
   } = args;
   if (
-    hasPotentialLocalDirectToolInStreamContext({ graph }) ||
+    hasPotentialDirectToolInStreamContext({ graph, agentContext }) ||
     hasDirectToolCallChunkInBatch({ graph, agentContext, toolCallChunks }) ||
     hasDirectToolCallChunkStateInStep({ graph, agentContext, stepKey }) ||
     !isEagerToolExecutionEnabledForBatch({ graph, metadata, agentContext })
@@ -1022,7 +1026,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
         canPrestartSequentialStreamedToolChunks(agentContext);
       const canStreamEager =
         (allowSequentialSeal || hasExplicitStreamedToolCallSeals(chunk)) &&
-        !hasPotentialLocalDirectToolInStreamContext({ graph }) &&
+        !hasPotentialDirectToolInStreamContext({ graph, agentContext }) &&
         isEagerToolExecutionEnabledForBatch({ graph, metadata, agentContext });
       if (canStreamEager) {
         recordEagerToolCallChunks({

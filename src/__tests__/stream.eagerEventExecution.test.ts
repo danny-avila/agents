@@ -2937,7 +2937,7 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     expect(graph.eagerEventToolExecutions.has('toolu_net')).toBe(false);
   });
 
-  it('prestarts streamed remote bash tools when unrelated graph tools are present', async () => {
+  it('does not prestart streamed remote tools when graph tools may appear later', async () => {
     const graph = createGraph({
       getAgentContext: jest.fn(
         (): Partial<AgentContext> => ({
@@ -3013,14 +3013,9 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
       graph
     );
 
-    expect(toolExecuteCalls).toHaveLength(1);
-    expect(toolExecuteCalls[0].toolCalls).toEqual([
-      expect.objectContaining({
-        id: 'toolu_env',
-        name: Constants.BASH_TOOL,
-        args: { command: 'echo env' },
-      }),
-    ]);
+    expect(toolExecuteCalls).toHaveLength(0);
+    expect(graph.eagerEventToolExecutions.size).toBe(0);
+    expect(graph.eagerEventToolCallChunks.size).toBe(0);
   });
 
   it('prestarts streamed remote bash tools when code output references are enabled', async () => {
