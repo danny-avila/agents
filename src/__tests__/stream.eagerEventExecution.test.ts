@@ -1887,6 +1887,90 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     ).toBe(true);
   });
 
+  it('does not emit a stale eager completion after the active execution is invalidated', async () => {
+    const graph = createGraph({
+      getAgentContext: jest.fn(
+        (): Partial<AgentContext> => ({
+          provider: Providers.ANTHROPIC,
+          reasoningKey: 'reasoning',
+          toolDefinitions: [{ name: 'weather' }, { name: 'stock' }],
+          graphTools: [],
+          agentId: 'agent_1',
+        })
+      ) as unknown as StandardGraph['getAgentContext'],
+    });
+    const completedEvents: Array<{ result: t.ToolEndEvent }> = [];
+    let pendingBatch: t.ToolExecuteBatchRequest | undefined;
+    jest.spyOn(events, 'safeDispatchCustomEvent').mockImplementation(
+      async (event, data): Promise<void> => {
+        if (event === GraphEvents.ON_RUN_STEP_COMPLETED) {
+          completedEvents.push(data as { result: t.ToolEndEvent });
+          return;
+        }
+        if (event === GraphEvents.ON_TOOL_EXECUTE) {
+          pendingBatch = data as t.ToolExecuteBatchRequest;
+        }
+      }
+    );
+
+    const handler = new ChatModelStreamHandler();
+    const metadata = { langgraph_node: 'agent' };
+
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_call_chunks: [
+            {
+              id: 'call_weather',
+              name: 'weather',
+              args: '{"city":"NYC"}',
+              index: 0,
+            },
+          ],
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_call_chunks: [
+            {
+              id: 'call_stock',
+              name: 'stock',
+              args: '{"ticker":"C',
+              index: 1,
+            },
+          ],
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+
+    const staleRecord = graph.eagerEventToolExecutions.get('call_weather');
+    expect(staleRecord).toBeDefined();
+    expect(pendingBatch?.toolCalls).toHaveLength(1);
+
+    graph.eagerEventToolExecutions.delete('call_weather');
+    pendingBatch?.resolve([
+      {
+        toolCallId: 'call_weather',
+        status: 'success',
+        content: 'stale weather',
+      },
+    ]);
+    await staleRecord?.promise;
+
+    expect(completedEvents).toHaveLength(0);
+    expect(staleRecord?.completionDispatched).toBeUndefined();
+  });
+
   it('does not overwrite a completed tool output with later streamed deltas', () => {
     const { contentParts, aggregateContent } = createContentAggregator();
 

@@ -458,6 +458,9 @@ async function dispatchEagerToolCompletions(args: {
     if (record == null) {
       continue;
     }
+    if (graph.eagerEventToolExecutions.get(result.toolCallId) !== record) {
+      continue;
+    }
     const stepId =
       record.request.stepId ??
       graph.toolCallStepIds.get(result.toolCallId) ??
