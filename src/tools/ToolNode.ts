@@ -2724,8 +2724,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       this.eventDrivenMode &&
       this.eagerEventToolExecution?.enabled === true &&
       this.hookRegistry == null &&
-      this.humanInTheLoop?.enabled !== true &&
-      this.toolOutputRegistry == null
+      this.humanInTheLoop?.enabled !== true
     );
   }
 
