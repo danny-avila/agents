@@ -28,6 +28,10 @@ import {
   normalizeError,
 } from '@/tools/eagerEventExecution';
 import {
+  calculateMaxToolResultChars,
+  truncateToolResultContent,
+} from '@/utils/truncation';
+import {
   getStreamedToolCallSeal,
   getStreamedToolCallAdapter,
   type StreamedToolCallSeal,
@@ -369,6 +373,7 @@ function startEagerToolExecutions(args: {
     return;
   }
 
+  const records: t.EagerEventToolExecution[] = [];
   const promise: Promise<t.EagerEventToolExecutionOutcome> = new Promise<
     t.ToolExecuteResult[]
   >((resolve, reject) => {
@@ -407,20 +412,98 @@ function startEagerToolExecutions(args: {
       })
       .catch(reject);
   }).then(
-    (results): t.EagerEventToolExecutionOutcome => ({ results }),
+    async (results): Promise<t.EagerEventToolExecutionOutcome> => {
+      await dispatchEagerToolCompletions({
+        graph,
+        agentContext,
+        records,
+        results,
+      });
+      return { results };
+    },
     (error): t.EagerEventToolExecutionOutcome => ({
       error: normalizeError(error),
     })
   );
 
   for (const entry of entries) {
-    graph.eagerEventToolExecutions.set(entry.id, {
+    const record: t.EagerEventToolExecution = {
       toolCallId: entry.id,
       toolName: entry.toolName,
       args: entry.coercedArgs,
       request: entry.request,
       promise,
-    });
+    };
+    records.push(record);
+    graph.eagerEventToolExecutions.set(entry.id, record);
+  }
+}
+
+async function dispatchEagerToolCompletions(args: {
+  graph: StandardGraph;
+  agentContext?: AgentContext;
+  records: t.EagerEventToolExecution[];
+  results: t.ToolExecuteResult[];
+}): Promise<void> {
+  const { graph, agentContext, records, results } = args;
+  const recordById = new Map(
+    records.map((record) => [record.toolCallId, record])
+  );
+  const maxToolResultChars =
+    agentContext?.maxToolResultChars ??
+    calculateMaxToolResultChars(agentContext?.maxContextTokens);
+
+  for (const result of results) {
+    const record = recordById.get(result.toolCallId);
+    if (record == null) {
+      continue;
+    }
+    const stepId =
+      record.request.stepId ??
+      graph.toolCallStepIds.get(result.toolCallId) ??
+      '';
+    if (stepId === '') {
+      continue;
+    }
+    const output =
+      result.status === 'error'
+        ? `Error: ${result.errorMessage ?? 'Unknown error'}\n Please fix your mistakes.`
+        : truncateToolResultContent(
+          typeof result.content === 'string'
+            ? result.content
+            : JSON.stringify(result.content),
+          maxToolResultChars
+        );
+
+    try {
+      await safeDispatchCustomEvent(
+        GraphEvents.ON_RUN_STEP_COMPLETED,
+        {
+          result: {
+            id: stepId,
+            index: record.request.turn ?? 0,
+            type: 'tool_call' as const,
+            eager: true,
+            tool_call: {
+              args: JSON.stringify(record.request.args),
+              name: record.toolName,
+              id: result.toolCallId,
+              output,
+              progress: 1,
+            } as t.ProcessedToolCall,
+          },
+        },
+        graph.config
+      );
+      record.completionDispatched = true;
+    } catch (error) {
+      // Let ToolNode dispatch the completion through the normal path later.
+
+      console.warn(
+        `[stream] eager completion dispatch failed for toolCallId=${result.toolCallId}:`,
+        error instanceof Error ? error.message : error
+      );
+    }
   }
 }
 
@@ -1265,9 +1348,12 @@ export function createContentAggregator(): t.ContentAggregatorResult {
 
       const existingContent = contentParts[index] as
         | (Omit<t.ToolCallContent, 'tool_call'> & {
-            tool_call?: t.ToolCallPart;
+            tool_call?: t.ToolCallPart & t.PartMetadata;
           })
         | undefined;
+      if (!finalUpdate && existingContent?.tool_call?.progress === 1) {
+        return;
+      }
 
       /** When args are a valid object, they are likely already invoked */
       let args =

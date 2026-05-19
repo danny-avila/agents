@@ -117,6 +117,65 @@ describe('ToolNode eager event tool execution', () => {
     expect(result.messages[0].content).toBe('eager result');
   });
 
+  it('does not redispatch completion when eager path already emitted it', async () => {
+    const completedEvents: Array<{ result: t.ToolEndEvent }> = [];
+    const toolExecuteCalls: t.ToolExecuteBatchRequest[] = [];
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data): Promise<void> => {
+        if (event === GraphEvents.ON_RUN_STEP_COMPLETED) {
+          completedEvents.push(data as { result: t.ToolEndEvent });
+          return;
+        }
+        if (event !== GraphEvents.ON_TOOL_EXECUTE) {
+          return;
+        }
+        toolExecuteCalls.push(data as t.ToolExecuteBatchRequest);
+      });
+
+    const eagerExecutions = new Map<string, t.EagerEventToolExecution>();
+    const request: t.ToolCallRequest = {
+      id: 'call_weather',
+      name: 'weather',
+      args: { city: 'NYC' },
+      stepId: 'step_weather',
+      turn: 0,
+    };
+    eagerExecutions.set('call_weather', {
+      toolCallId: 'call_weather',
+      toolName: 'weather',
+      args: { city: 'NYC' },
+      request,
+      completionDispatched: true,
+      promise: Promise.resolve({
+        results: [
+          {
+            toolCallId: 'call_weather',
+            status: 'success',
+            content: 'eager result',
+          },
+        ],
+      }),
+    });
+
+    const toolNode = new ToolNode({
+      tools: [createDummyTool('weather')],
+      eventDrivenMode: true,
+      eagerEventToolExecution: { enabled: true },
+      eagerEventToolExecutions: eagerExecutions,
+      eagerEventToolUsageCount: new Map([['weather', 1]]),
+      toolCallStepIds: new Map([['call_weather', 'step_weather']]),
+    });
+
+    const result = (await toolNode.invoke({
+      messages: [createAIMessage('call_weather', 'weather', { city: 'NYC' })],
+    })) as { messages: ToolMessage[] };
+
+    expect(toolExecuteCalls).toHaveLength(0);
+    expect(completedEvents).toHaveLength(0);
+    expect(result.messages[0].content).toBe('eager result');
+  });
+
   it('fails closed without redispatching when final args differ from the prestarted call', async () => {
     const { toolExecuteCalls } = installToolExecuteResponder('fresh result');
     const eagerExecutions = new Map<string, t.EagerEventToolExecution>();

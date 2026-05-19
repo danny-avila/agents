@@ -49,6 +49,13 @@ export type EagerEventToolExecution = {
   args: Record<string, unknown>;
   request: ToolCallRequest;
   promise: Promise<EagerEventToolExecutionOutcome>;
+  /**
+   * True when the streaming eager path already emitted the user-visible
+   * ON_RUN_STEP_COMPLETED event for this call. ToolNode still consumes the
+   * result later to mutate graph state in provider-safe order, but skips
+   * duplicate completion emission.
+   */
+  completionDispatched?: boolean;
 };
 
 export type EagerEventToolCallChunkState = {
@@ -172,6 +179,8 @@ export type ToolEndEvent = {
   /** The content index of the tool call */
   index: number;
   type?: 'tool_call';
+  /** True when the stream eager path surfaced this completion before ToolNode finalized graph state. */
+  eager?: boolean;
 };
 
 /**
