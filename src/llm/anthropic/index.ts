@@ -9,6 +9,7 @@ import type {
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { AnthropicInput } from '@langchain/anthropic';
 import type { Anthropic } from '@anthropic-ai/sdk';
+import { CODE_EXECUTION_TOOLS, Constants } from '@/common';
 import type {
   AnthropicMessageCreateParams,
   AnthropicStreamingMessageCreateParams,
@@ -27,8 +28,14 @@ const MAX_STREAM_QUEUE_CHUNKS = 256;
 const MAX_STREAM_QUEUE_TEXT_CHARS = 8192;
 const STREAM_CHUNK_MIN_SIZE = 4;
 const STREAM_BOUNDARIES = new Set([' ', '.', ',', '!', '?', ';', ':']);
+const ANTHROPIC_EAGER_CODEAPI_TOOL_NAMES = new Set<string>([
+  ...CODE_EXECUTION_TOOLS,
+  Constants.READ_FILE,
+]);
 
 type StreamTokenType = 'string' | 'input' | 'content';
+type FormattedAnthropicTool = Anthropic.Messages.ToolUnion &
+  Record<string, unknown>;
 
 const ANTHROPIC_TOOL_BETAS: Partial<Record<string, AnthropicBeta>> = {
   tool_search_tool_regex_20251119: 'advanced-tool-use-2025-11-20',
@@ -159,6 +166,45 @@ function isSetSamplingValue(value?: number | null): value is number {
 
 function isNonDefaultTemperature(value?: number): boolean {
   return isSetSamplingValue(value) && value !== 1;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+/**
+ * Anthropic's fine-grained tool streaming is currently enabled per tool with
+ * `eager_input_streaming`. LangChain's generic `extras` schema does not pass
+ * that field through yet, so add it at the final Anthropic tool-shape boundary.
+ */
+function enableEagerInputStreamingForCodeApiTools(
+  tool: Anthropic.Messages.ToolUnion
+): Anthropic.Messages.ToolUnion {
+  if (!isRecord(tool)) {
+    return tool;
+  }
+
+  const name = tool.name;
+  if (
+    typeof name !== 'string' ||
+    !ANTHROPIC_EAGER_CODEAPI_TOOL_NAMES.has(name)
+  ) {
+    return tool;
+  }
+
+  const formattedTool = tool as FormattedAnthropicTool;
+  if (formattedTool.eager_input_streaming === false) {
+    return tool;
+  }
+
+  if (formattedTool.eager_input_streaming === true) {
+    return tool;
+  }
+
+  return {
+    ...formattedTool,
+    eager_input_streaming: true,
+  } as Anthropic.Messages.ToolUnion;
 }
 
 function validateInvocationParamCompatibility({
@@ -468,6 +514,13 @@ export class CustomAnthropic extends ChatAnthropicMessages {
     return 'LibreChatAnthropic';
   }
 
+  override formatStructuredToolToAnthropic(
+    tools?: ChatAnthropicToolType[]
+  ): Anthropic.Messages.ToolUnion[] | undefined {
+    const formatted = super.formatStructuredToolToAnthropic(tools);
+    return formatted?.map(enableEagerInputStreamingForCodeApiTools);
+  }
+
   /**
    * Get the parameters used to invoke the model
    */
@@ -759,12 +812,12 @@ export class CustomAnthropic extends ChatAnthropicMessages {
       return tokenChunks.reduce(async (previous, currentToken) => {
         await previous;
         const newChunk = cloneChunk(currentToken, tokenType, chunk);
-        const chunkForToken =
-          emittedUsage && newChunk.usage_metadata != null
-            ? new AIMessageChunk(
-              Object.assign({}, newChunk, { usage_metadata: undefined })
-            )
-            : newChunk;
+        let chunkForToken = newChunk;
+        if (emittedUsage && newChunk.usage_metadata != null) {
+          chunkForToken = new AIMessageChunk(
+            Object.assign({}, newChunk, { usage_metadata: undefined })
+          );
+        }
 
         await enqueueChunk({
           token: currentToken,
