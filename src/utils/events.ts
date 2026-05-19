@@ -13,9 +13,10 @@ export async function safeDispatchCustomEvent(
   event: string,
   payload: unknown,
   config?: RunnableConfig
-): Promise<void> {
+): Promise<boolean | void> {
   try {
     await dispatchCustomEvent(event, payload, config);
+    return true;
   } catch (e) {
     // Check if this is the known EventStreamCallbackHandler error
     if (
@@ -26,10 +27,11 @@ export async function safeDispatchCustomEvent(
       // Suppress this specific error - it's expected during parallel execution
       // when EventStreamCallbackHandler loses track of run IDs
       // console.debug('Suppressed error dispatching custom event:', e);
-      return;
+      return false;
     }
     // Log other errors
     console.error('Error dispatching custom event:', e);
+    return false;
   }
 }
 

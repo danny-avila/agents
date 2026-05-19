@@ -479,7 +479,7 @@ async function dispatchEagerToolCompletions(args: {
         );
 
     try {
-      await safeDispatchCustomEvent(
+      const dispatched = await safeDispatchCustomEvent(
         GraphEvents.ON_RUN_STEP_COMPLETED,
         {
           result: {
@@ -498,6 +498,9 @@ async function dispatchEagerToolCompletions(args: {
         },
         graph.config
       );
+      if (dispatched === false) {
+        continue;
+      }
       record.completionDispatched = true;
     } catch (error) {
       // Let ToolNode dispatch the completion through the normal path later.

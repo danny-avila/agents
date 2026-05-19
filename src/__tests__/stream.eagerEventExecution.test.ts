@@ -1971,6 +1971,82 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     expect(staleRecord?.completionDispatched).toBeUndefined();
   });
 
+  it('does not mark eager completion dispatched when event delivery is swallowed', async () => {
+    const graph = createGraph({
+      getAgentContext: jest.fn(
+        (): Partial<AgentContext> => ({
+          provider: Providers.ANTHROPIC,
+          reasoningKey: 'reasoning',
+          toolDefinitions: [{ name: 'weather' }, { name: 'stock' }],
+          graphTools: [],
+          agentId: 'agent_1',
+        })
+      ) as unknown as StandardGraph['getAgentContext'],
+    });
+    jest.spyOn(events, 'safeDispatchCustomEvent').mockImplementation(
+      async (event, data): Promise<boolean | void> => {
+        if (event === GraphEvents.ON_RUN_STEP_COMPLETED) {
+          return false;
+        }
+        if (event === GraphEvents.ON_TOOL_EXECUTE) {
+          const batch = data as t.ToolExecuteBatchRequest;
+          batch.resolve([
+            {
+              toolCallId: 'call_weather',
+              status: 'success',
+              content: 'weather result',
+            },
+          ]);
+        }
+      }
+    );
+
+    const handler = new ChatModelStreamHandler();
+    const metadata = { langgraph_node: 'agent' };
+
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_call_chunks: [
+            {
+              id: 'call_weather',
+              name: 'weather',
+              args: '{"city":"NYC"}',
+              index: 0,
+            },
+          ],
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_call_chunks: [
+            {
+              id: 'call_stock',
+              name: 'stock',
+              args: '{"ticker":"C',
+              index: 1,
+            },
+          ],
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+
+    const record = graph.eagerEventToolExecutions.get('call_weather');
+    await record?.promise;
+
+    expect(record?.completionDispatched).toBeUndefined();
+  });
+
   it('does not overwrite a completed tool output with later streamed deltas', () => {
     const { contentParts, aggregateContent } = createContentAggregator();
 
