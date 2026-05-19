@@ -1,4 +1,4 @@
-import { HumanMessage } from '@langchain/core/messages';
+import { AIMessage, HumanMessage } from '@langchain/core/messages';
 import { FakeListChatModel } from '@langchain/core/utils/testing';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type { RunnableConfig } from '@langchain/core/runnables';
@@ -218,6 +218,92 @@ describe('Subagent Integration', () => {
       (t) => 'name' in t && t.name === Constants.SUBAGENT
     );
     expect(subagentTool).toBeDefined();
+  });
+
+  it('inherits eager event-tool settings into self-spawn child graphs', async () => {
+    const originalCreateWorkflow = StandardGraph.prototype.createWorkflow;
+    const observedChildGraphs: Array<{
+      eagerEventToolExecution: StandardGraph['eagerEventToolExecution'];
+      toolOutputReferences: StandardGraph['toolOutputReferences'];
+      eventToolExecutionAvailable: boolean;
+    }> = [];
+    const createWorkflowSpy = jest
+      .spyOn(StandardGraph.prototype, 'createWorkflow')
+      .mockImplementation(function (this: StandardGraph) {
+        if (this.runId?.includes('_sub_') === true) {
+          observedChildGraphs.push({
+            eagerEventToolExecution: this.eagerEventToolExecution,
+            toolOutputReferences: this.toolOutputReferences,
+            eventToolExecutionAvailable: this.eventToolExecutionAvailable,
+          });
+          return {
+            invoke: jest.fn(async () => ({
+              messages: [new AIMessage('child done')],
+            })),
+          } as unknown as ReturnType<StandardGraph['createWorkflow']>;
+        }
+        return originalCreateWorkflow.call(this);
+      });
+
+    const agentWithSelfSpawn: t.AgentInputs = {
+      agentId: 'self-parent',
+      provider: Providers.OPENAI,
+      clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+      instructions: 'Agent with self-spawn for context isolation.',
+      maxContextTokens: 8000,
+      toolDefinitions: [{ name: 'mcp_lookup' }],
+      subagentConfigs: [
+        {
+          type: 'isolated',
+          name: 'Isolated Worker',
+          description: 'Runs a task with isolated context',
+          self: true,
+        },
+      ],
+    };
+
+    const run = await Run.create<t.IState>({
+      runId: `self-spawn-eager-${Date.now()}`,
+      graphConfig: {
+        type: 'standard',
+        agents: [agentWithSelfSpawn],
+      },
+      customHandlers: {
+        [GraphEvents.ON_TOOL_EXECUTE]: {
+          handle: async () => undefined,
+        },
+      },
+      eagerEventToolExecution: { enabled: true },
+      toolOutputReferences: { enabled: true },
+      returnContent: true,
+      skipCleanup: true,
+    });
+
+    const context = (run.Graph as StandardGraph).agentContexts.get(
+      'self-parent'
+    );
+    const subagentTool = (context?.graphTools as t.GenericTool[]).find(
+      (tool) => 'name' in tool && tool.name === Constants.SUBAGENT
+    );
+    expect(subagentTool).toBeDefined();
+
+    await subagentTool!.invoke(
+      {
+        description: 'Use your MCP tool.',
+        subagent_type: 'isolated',
+      },
+      callerConfig
+    );
+
+    expect(observedChildGraphs).toEqual([
+      {
+        eagerEventToolExecution: { enabled: true },
+        toolOutputReferences: { enabled: true },
+        eventToolExecutionAvailable: true,
+      },
+    ]);
+
+    createWorkflowSpy.mockRestore();
   });
 
   it('should not create subagent tool when maxSubagentDepth is 0', async () => {

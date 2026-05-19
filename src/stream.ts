@@ -210,7 +210,10 @@ function isEagerToolExecutionEnabledForBatch(args: {
   ) {
     return false;
   }
-  if (graph.handlerRegistry?.getHandler(GraphEvents.ON_TOOL_EXECUTE) == null) {
+  if (
+    graph.handlerRegistry?.getHandler(GraphEvents.ON_TOOL_EXECUTE) == null &&
+    graph.eventToolExecutionAvailable !== true
+  ) {
     return false;
   }
   return true;

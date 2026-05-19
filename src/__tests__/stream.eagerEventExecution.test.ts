@@ -163,6 +163,59 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     expect(graph.toolCallStepIds.has('call_weather')).toBe(true);
   });
 
+  it('prestarts when subagent callback forwarding can execute tools without a handler registry', async () => {
+    const graph = createGraph({
+      handlerRegistry: undefined,
+      eventToolExecutionAvailable: true,
+    });
+    const toolExecuteCalls: t.ToolExecuteBatchRequest[] = [];
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data): Promise<void> => {
+        if (event !== GraphEvents.ON_TOOL_EXECUTE) {
+          return;
+        }
+        const batch = data as t.ToolExecuteBatchRequest;
+        toolExecuteCalls.push(batch);
+        batch.resolve([
+          {
+            toolCallId: 'call_weather',
+            status: 'success',
+            content: 'sunny',
+          },
+        ]);
+      });
+
+    await new ChatModelStreamHandler().handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_weather',
+              name: 'weather',
+              args: { city: 'NYC' },
+            },
+          ],
+          response_metadata: finalToolCallResponseMetadata,
+        } as unknown as t.StreamChunk,
+      },
+      { langgraph_node: 'agent' },
+      graph
+    );
+
+    expect(toolExecuteCalls).toHaveLength(1);
+    expect(toolExecuteCalls[0].toolCalls[0]).toMatchObject({
+      id: 'call_weather',
+      name: 'weather',
+      args: { city: 'NYC' },
+      stepId: expect.stringMatching(/^step_/),
+      turn: 0,
+    });
+    expect(graph.eagerEventToolExecutions.has('call_weather')).toBe(true);
+  });
+
   it('does not prestart parseable tool calls before a final tool-call signal', async () => {
     const graph = createGraph();
     const toolExecuteCalls: t.ToolExecuteBatchRequest[] = [];
