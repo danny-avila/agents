@@ -34,8 +34,6 @@ const ANTHROPIC_EAGER_CODEAPI_TOOL_NAMES = new Set<string>([
 ]);
 
 type StreamTokenType = 'string' | 'input' | 'content';
-type FormattedAnthropicTool = Anthropic.Messages.ToolUnion &
-  Record<string, unknown>;
 
 const ANTHROPIC_TOOL_BETAS: Partial<Record<string, AnthropicBeta>> = {
   tool_search_tool_regex_20251119: 'advanced-tool-use-2025-11-20',
@@ -168,8 +166,10 @@ function isNonDefaultTemperature(value?: number): boolean {
   return isSetSamplingValue(value) && value !== 1;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null;
+function isAnthropicCustomTool(
+  tool: Anthropic.Messages.ToolUnion
+): tool is Anthropic.Messages.Tool {
+  return 'input_schema' in tool;
 }
 
 /**
@@ -180,31 +180,21 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function enableEagerInputStreamingForCodeApiTools(
   tool: Anthropic.Messages.ToolUnion
 ): Anthropic.Messages.ToolUnion {
-  if (!isRecord(tool)) {
-    return tool;
-  }
-
-  const name = tool.name;
   if (
-    typeof name !== 'string' ||
-    !ANTHROPIC_EAGER_CODEAPI_TOOL_NAMES.has(name)
+    !isAnthropicCustomTool(tool) ||
+    !ANTHROPIC_EAGER_CODEAPI_TOOL_NAMES.has(tool.name)
   ) {
     return tool;
   }
 
-  const formattedTool = tool as FormattedAnthropicTool;
-  if (formattedTool.eager_input_streaming === false) {
-    return tool;
-  }
-
-  if (formattedTool.eager_input_streaming === true) {
+  if (tool.eager_input_streaming != null) {
     return tool;
   }
 
   return {
-    ...formattedTool,
+    ...tool,
     eager_input_streaming: true,
-  } as Anthropic.Messages.ToolUnion;
+  };
 }
 
 function validateInvocationParamCompatibility({
