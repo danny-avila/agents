@@ -1419,6 +1419,73 @@ describe('SubagentExecutor', () => {
       expect(serialized).not.toContain('nested-completed-secret');
     });
 
+    it('does not drop non-droppable updates when the forwarding queue overflows', async () => {
+      const completedIds: string[] = [];
+      const registry = new HandlerRegistry();
+      registry.register(GraphEvents.ON_SUBAGENT_UPDATE, {
+        handle: async (_event, rawData): Promise<void> => {
+          const update = rawData as SubagentUpdateEvent;
+          if (update.phase === 'run_step_completed') {
+            const data = update.data as { result?: { id?: string } };
+            if (data.result?.id != null) {
+              completedIds.push(data.result.id);
+            }
+            await new Promise((resolve) => setTimeout(resolve, 1));
+          }
+        },
+      });
+
+      const factory: () => StandardGraph = (): StandardGraph =>
+        ({
+          createWorkflow: (): { invoke: jest.Mock } => ({
+            invoke: jest.fn().mockImplementation(async (_state, options) => {
+              const opts = options as { callbacks?: unknown[] };
+              const forwarder = (opts.callbacks ?? [])[0] as {
+                handleCustomEvent?: (
+                  eventName: string,
+                  data: unknown
+                ) => Promise<void> | void;
+              };
+              for (let index = 0; index < 80; index++) {
+                await forwarder.handleCustomEvent?.(
+                  GraphEvents.ON_RUN_STEP_COMPLETED,
+                  {
+                    result: {
+                      id: `step_${index}`,
+                      index,
+                      type: 'tool_call',
+                      tool_call: {
+                        id: `call_${index}`,
+                        name: 'calculator',
+                        args: '{}',
+                        output: `${index}`,
+                        progress: 1,
+                      },
+                    },
+                  }
+                );
+              }
+              return { messages: [new AIMessage('ok')] };
+            }),
+          }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph;
+
+      const executor = createExecutor({
+        createChildGraph: factory,
+        parentHandlerRegistry: registry,
+      });
+
+      await executor.execute({
+        description: 'Task',
+        subagentType: 'researcher',
+      });
+
+      expect(completedIds).toHaveLength(80);
+      expect(completedIds[0]).toBe('step_0');
+      expect(completedIds[completedIds.length - 1]).toBe('step_79');
+    });
+
     it('does NOT forward ON_TOOL_EXECUTE when the parent registry has no handler (safe fallback)', async () => {
       /**
        * The executor strips `toolDefinitions` when the parent registry has

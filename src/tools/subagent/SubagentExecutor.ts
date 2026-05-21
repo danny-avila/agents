@@ -603,7 +603,11 @@ export class SubagentExecutor {
         const dropIndex = queuedUpdates.findIndex((queued) =>
           isDroppableSubagentUpdatePhase(queued.phase)
         );
-        queuedUpdates.splice(dropIndex >= 0 ? dropIndex : 0, 1);
+        if (dropIndex >= 0) {
+          queuedUpdates.splice(dropIndex, 1);
+        } else if (isDroppableSubagentUpdatePhase(update.phase)) {
+          return;
+        }
       }
       queuedUpdates.push(update);
     };
