@@ -2,10 +2,16 @@ import { describe, it, expect, beforeEach } from '@jest/globals';
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import { HookRegistry } from '@/hooks/HookRegistry';
-import { Providers, GraphEvents } from '@/common';
+import { Providers, GraphEvents, StepTypes } from '@/common';
 import { HandlerRegistry } from '@/events';
 import { AgentContext } from '@/agents/AgentContext';
-import type { AgentInputs, ResolvedSubagentConfig } from '@/types';
+import type {
+  AgentInputs,
+  ResolvedSubagentConfig,
+  SubagentUpdateEvent,
+  ToolExecuteBatchRequest,
+  ToolExecuteResult,
+} from '@/types';
 import {
   SubagentExecutor,
   filterSubagentResult,
@@ -13,6 +19,7 @@ import {
   buildChildInputs,
   summarizeEvent,
 } from '../subagent';
+import { sanitizeForwardedSubagentUpdateData } from '../subagent/SubagentExecutor';
 import type { StandardGraph } from '@/graphs/Graph';
 
 jest.setTimeout(15000);
@@ -547,15 +554,17 @@ describe('SubagentExecutor', () => {
   });
 
   describe('parentConfigurable inheritance', () => {
+    type CapturingGraphFactory = {
+      factory: () => StandardGraph;
+      getInvokeConfig: () => Record<string, unknown> | undefined;
+    };
+
     /**
      * Build a stub factory that captures the second argument to
      * `workflow.invoke()` (the runnable config) so tests can assert on
      * the `configurable` we forwarded to the child graph.
      */
-    function makeCapturingGraphFactory(): {
-      factory: () => StandardGraph;
-      getInvokeConfig: () => Record<string, unknown> | undefined;
-    } {
+    function makeCapturingGraphFactory(): CapturingGraphFactory {
       let capturedConfig: Record<string, unknown> | undefined;
       const factory = (): StandardGraph =>
         ({
@@ -674,6 +683,41 @@ describe('SubagentExecutor', () => {
       expect(configurable.run_id).toBe('parent-run-id');
       expect(configurable.parent_run_id).toBe('grandparent-run-id');
       expect(configurable.requestBody).toEqual({ messageId: 'msg-1' });
+    });
+
+    it('strips LangGraph runtime fields from child workflow.invoke configurable', async () => {
+      const { factory, getInvokeConfig } = makeCapturingGraphFactory();
+      const executor = createExecutor({ createChildGraph: factory });
+
+      await executor.execute({
+        description: 'task',
+        subagentType: 'researcher',
+        parentConfigurable: {
+          __pregel_abort_signals: { externalAbortSignal: 'parent-signal' },
+          __pregel_call: (): void => undefined,
+          __pregel_scratchpad: { currentTaskInput: 'large-payload' },
+          checkpoint_id: 'parent-checkpoint-id',
+          checkpoint_map: { parent: 'checkpoint' },
+          checkpoint_ns: 'parent-checkpoint-ns',
+          requestBody: { messageId: 'msg-1' },
+          thread_id: 'parent-thread',
+          user: { id: 'user_abc' },
+        },
+      });
+
+      const configurable = getInvokeConfig()!.configurable as Record<
+        string,
+        unknown
+      >;
+      expect(configurable.__pregel_abort_signals).toBeUndefined();
+      expect(configurable.__pregel_call).toBeUndefined();
+      expect(configurable.__pregel_scratchpad).toBeUndefined();
+      expect(configurable.checkpoint_id).toBeUndefined();
+      expect(configurable.checkpoint_map).toBeUndefined();
+      expect(configurable.checkpoint_ns).toBeUndefined();
+      expect(configurable.requestBody).toEqual({ messageId: 'msg-1' });
+      expect(configurable.thread_id).toBe('parent-thread');
+      expect(configurable.user).toEqual({ id: 'user_abc' });
     });
 
     it('does not require parentConfigurable (back-compat with hosts that omit it)', async () => {
@@ -1099,6 +1143,384 @@ describe('SubagentExecutor', () => {
       ]);
     });
 
+    it('sanitizes ON_TOOL_EXECUTE before wrapping it in ON_SUBAGENT_UPDATE', async () => {
+      const toolRequests: ToolExecuteBatchRequest[] = [];
+      const subagentUpdates: SubagentUpdateEvent[] = [];
+      const registry = new HandlerRegistry();
+      registry.register(GraphEvents.ON_TOOL_EXECUTE, {
+        handle: (_event, rawData): void => {
+          const request = rawData as ToolExecuteBatchRequest;
+          toolRequests.push(request);
+          const results: ToolExecuteResult[] = request.toolCalls.map((call) => ({
+            toolCallId: call.id,
+            status: 'success',
+            content: `ran ${call.name}`,
+          }));
+          request.resolve(results);
+        },
+      });
+      registry.register(GraphEvents.ON_SUBAGENT_UPDATE, {
+        handle: (_event, rawData): void => {
+          subagentUpdates.push(rawData as SubagentUpdateEvent);
+        },
+      });
+
+      let capturedInvokeOptions: unknown;
+      const factory: () => StandardGraph = (): StandardGraph =>
+        ({
+          createWorkflow: (): { invoke: jest.Mock } => ({
+            invoke: jest.fn().mockImplementation(async (_state, options) => {
+              capturedInvokeOptions = options;
+              return { messages: [new AIMessage('ok')] };
+            }),
+          }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph;
+
+      const executor = createExecutor({
+        createChildGraph: factory,
+        parentHandlerRegistry: registry,
+      });
+
+      await executor.execute({
+        description: 'Task',
+        subagentType: 'researcher',
+        parentToolCallId: 'call_parent_123',
+      });
+
+      const opts = capturedInvokeOptions as { callbacks?: unknown[] };
+      const forwarder = (opts.callbacks ?? [])[0] as {
+        handleCustomEvent?: (
+          eventName: string,
+          data: unknown
+        ) => Promise<void> | void;
+      };
+
+      const batchRequest: ToolExecuteBatchRequest = {
+        toolCalls: [
+          {
+            id: 'call_child_xyz',
+            name: 'calculator',
+            args: { expression: '21 * 2' },
+            stepId: 'step_secret',
+            turn: 7,
+          },
+        ],
+        agentId: 'researcher',
+        userId: 'user_secret',
+        configurable: {
+          user: {
+            federatedTokens: {
+              access_token: 'access-secret',
+              id_token: 'id-secret',
+              refresh_token: 'refresh-secret',
+            },
+          },
+          requestBody: { currentTaskInput: 'sensitive task input' },
+        },
+        metadata: {
+          access_token: 'metadata-secret',
+        },
+        resolve: jest.fn(),
+        reject: jest.fn(),
+      };
+
+      await forwarder.handleCustomEvent?.(
+        GraphEvents.ON_TOOL_EXECUTE,
+        batchRequest
+      );
+
+      expect(toolRequests).toHaveLength(1);
+      expect(toolRequests[0].configurable).toBe(batchRequest.configurable);
+      expect(toolRequests[0].metadata).toBe(batchRequest.metadata);
+
+      const toolUpdate = subagentUpdates.find(
+        (update) =>
+          update.phase === 'run_step' &&
+          update.label === 'Calling calculator'
+      );
+      expect(toolUpdate?.data).toEqual({
+        agentId: 'researcher',
+        toolCalls: [
+          {
+            id: 'call_child_xyz',
+            name: 'calculator',
+            args: { expression: '21 * 2' },
+          },
+        ],
+      });
+      const serializedUpdate = JSON.stringify(toolUpdate);
+      expect(serializedUpdate).not.toContain('configurable');
+      expect(serializedUpdate).not.toContain('metadata');
+      expect(serializedUpdate).not.toContain('access-secret');
+      expect(serializedUpdate).not.toContain('id-secret');
+      expect(serializedUpdate).not.toContain('refresh-secret');
+      expect(serializedUpdate).not.toContain('metadata-secret');
+      expect(serializedUpdate).not.toContain('sensitive task input');
+      expect(serializedUpdate).not.toContain('step_secret');
+      expect(serializedUpdate).not.toContain('user_secret');
+    });
+
+    it('drains observational updates before stop without parallel handler publishes', async () => {
+      const phases: SubagentUpdateEvent['phase'][] = [];
+      let activePublishes = 0;
+      let maxActivePublishes = 0;
+      const registry = new HandlerRegistry();
+      registry.register(GraphEvents.ON_SUBAGENT_UPDATE, {
+        handle: async (_event, rawData): Promise<void> => {
+          const update = rawData as SubagentUpdateEvent;
+          activePublishes += 1;
+          maxActivePublishes = Math.max(maxActivePublishes, activePublishes);
+          if (update.phase === 'message_delta') {
+            await new Promise((resolve) => setTimeout(resolve, 1));
+          }
+          phases.push(update.phase);
+          activePublishes -= 1;
+        },
+      });
+
+      const factory: () => StandardGraph = (): StandardGraph =>
+        ({
+          createWorkflow: (): { invoke: jest.Mock } => ({
+            invoke: jest.fn().mockImplementation(async (_state, options) => {
+              const opts = options as { callbacks?: unknown[] };
+              const forwarder = (opts.callbacks ?? [])[0] as {
+                handleCustomEvent?: (
+                  eventName: string,
+                  data: unknown
+                ) => Promise<void> | void;
+              };
+              for (let index = 0; index < 5; index++) {
+                await forwarder.handleCustomEvent?.(
+                  GraphEvents.ON_MESSAGE_DELTA,
+                  {
+                    id: `msg_${index}`,
+                    delta: { content: [{ type: 'text', text: `${index}` }] },
+                  }
+                );
+              }
+              return { messages: [new AIMessage('ok')] };
+            }),
+          }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph;
+
+      const executor = createExecutor({
+        createChildGraph: factory,
+        parentHandlerRegistry: registry,
+      });
+
+      await executor.execute({
+        description: 'Task',
+        subagentType: 'researcher',
+      });
+
+      expect(maxActivePublishes).toBe(1);
+      expect(phases[0]).toBe('start');
+      expect(phases.slice(1, 6)).toEqual([
+        'message_delta',
+        'message_delta',
+        'message_delta',
+        'message_delta',
+        'message_delta',
+      ]);
+      expect(phases[phases.length - 1]).toBe('stop');
+    });
+
+    it('allowlists forwarded run step payloads before wrapping them in ON_SUBAGENT_UPDATE', async () => {
+      const subagentUpdates: SubagentUpdateEvent[] = [];
+      const registry = new HandlerRegistry();
+      registry.register(GraphEvents.ON_SUBAGENT_UPDATE, {
+        handle: (_event, rawData): void => {
+          subagentUpdates.push(rawData as SubagentUpdateEvent);
+        },
+      });
+
+      const output = 'tool output that should stay visible';
+      const factory: () => StandardGraph = (): StandardGraph =>
+        ({
+          createWorkflow: (): { invoke: jest.Mock } => ({
+            invoke: jest.fn().mockImplementation(async (_state, options) => {
+              const opts = options as { callbacks?: unknown[] };
+              const forwarder = (opts.callbacks ?? [])[0] as {
+                handleCustomEvent?: (
+                  eventName: string,
+                  data: unknown
+                ) => Promise<void> | void;
+              };
+              await forwarder.handleCustomEvent?.(GraphEvents.ON_RUN_STEP, {
+                id: 'step_1',
+                type: StepTypes.TOOL_CALLS,
+                agentId: 'researcher',
+                index: 0,
+                stepDetails: {
+                  type: StepTypes.TOOL_CALLS,
+                  tool_calls: [
+                    {
+                      id: 'call_1',
+                      name: 'calculator',
+                      args: { expression: '21 * 2' },
+                      futureSecret: 'nested-step-secret',
+                    },
+                  ],
+                  futureSecret: 'step-details-secret',
+                },
+                configurable: { access_token: 'access-secret' },
+                metadata: { refresh_token: 'refresh-secret' },
+                futureSecret: 'top-level-step-secret',
+              });
+              await forwarder.handleCustomEvent?.(
+                GraphEvents.ON_RUN_STEP_COMPLETED,
+                {
+                  result: {
+                    id: 'step_1',
+                    index: 0,
+                    type: 'tool_call',
+                    tool_call: {
+                      id: 'call_1',
+                      name: 'calculator',
+                      args: '{}',
+                      output,
+                      progress: 1,
+                      futureSecret: 'nested-completed-secret',
+                    },
+                    futureSecret: 'completed-result-secret',
+                  },
+                  configurable: { access_token: 'access-secret' },
+                  metadata: { refresh_token: 'refresh-secret' },
+                  futureSecret: 'top-level-completed-secret',
+                }
+              );
+              return { messages: [new AIMessage('ok')] };
+            }),
+          }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph;
+
+      const executor = createExecutor({
+        createChildGraph: factory,
+        parentHandlerRegistry: registry,
+      });
+
+      await executor.execute({
+        description: 'Task',
+        subagentType: 'researcher',
+      });
+
+      const runStep = subagentUpdates.find(
+        (update) => update.phase === 'run_step'
+      );
+      const completedStep = subagentUpdates.find(
+        (update) => update.phase === 'run_step_completed'
+      );
+      expect(runStep?.data).toEqual({
+        id: 'step_1',
+        type: StepTypes.TOOL_CALLS,
+        agentId: 'researcher',
+        index: 0,
+        stepDetails: {
+          type: StepTypes.TOOL_CALLS,
+          tool_calls: [
+            {
+              id: 'call_1',
+              name: 'calculator',
+              args: { expression: '21 * 2' },
+            },
+          ],
+        },
+      });
+      expect(completedStep?.data).toEqual({
+        result: {
+          id: 'step_1',
+          index: 0,
+          type: 'tool_call',
+          tool_call: {
+            id: 'call_1',
+            name: 'calculator',
+            args: '{}',
+            output,
+            progress: 1,
+          },
+        },
+      });
+      const serialized = JSON.stringify([runStep, completedStep]);
+      expect(serialized).toContain(output);
+      expect(serialized).not.toContain('futureSecret');
+      expect(serialized).not.toContain('access-secret');
+      expect(serialized).not.toContain('refresh-secret');
+      expect(serialized).not.toContain('top-level-step-secret');
+      expect(serialized).not.toContain('nested-step-secret');
+      expect(serialized).not.toContain('top-level-completed-secret');
+      expect(serialized).not.toContain('nested-completed-secret');
+    });
+
+    it('does not drop non-droppable updates when the forwarding queue overflows', async () => {
+      const completedIds: string[] = [];
+      const registry = new HandlerRegistry();
+      registry.register(GraphEvents.ON_SUBAGENT_UPDATE, {
+        handle: async (_event, rawData): Promise<void> => {
+          const update = rawData as SubagentUpdateEvent;
+          if (update.phase === 'run_step_completed') {
+            const data = update.data as { result?: { id?: string } };
+            if (data.result?.id != null) {
+              completedIds.push(data.result.id);
+            }
+            await new Promise((resolve) => setTimeout(resolve, 1));
+          }
+        },
+      });
+
+      const factory: () => StandardGraph = (): StandardGraph =>
+        ({
+          createWorkflow: (): { invoke: jest.Mock } => ({
+            invoke: jest.fn().mockImplementation(async (_state, options) => {
+              const opts = options as { callbacks?: unknown[] };
+              const forwarder = (opts.callbacks ?? [])[0] as {
+                handleCustomEvent?: (
+                  eventName: string,
+                  data: unknown
+                ) => Promise<void> | void;
+              };
+              for (let index = 0; index < 80; index++) {
+                await forwarder.handleCustomEvent?.(
+                  GraphEvents.ON_RUN_STEP_COMPLETED,
+                  {
+                    result: {
+                      id: `step_${index}`,
+                      index,
+                      type: 'tool_call',
+                      tool_call: {
+                        id: `call_${index}`,
+                        name: 'calculator',
+                        args: '{}',
+                        output: `${index}`,
+                        progress: 1,
+                      },
+                    },
+                  }
+                );
+              }
+              return { messages: [new AIMessage('ok')] };
+            }),
+          }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph;
+
+      const executor = createExecutor({
+        createChildGraph: factory,
+        parentHandlerRegistry: registry,
+      });
+
+      await executor.execute({
+        description: 'Task',
+        subagentType: 'researcher',
+      });
+
+      expect(completedIds).toHaveLength(80);
+      expect(completedIds[0]).toBe('step_0');
+      expect(completedIds[completedIds.length - 1]).toBe('step_79');
+    });
+
     it('does NOT forward ON_TOOL_EXECUTE when the parent registry has no handler (safe fallback)', async () => {
       /**
        * The executor strips `toolDefinitions` when the parent registry has
@@ -1292,5 +1714,117 @@ describe('summarizeEvent', () => {
 
   it('returns the event name for unknown events', () => {
     expect(summarizeEvent('on_unknown_event', {})).toBe('on_unknown_event');
+  });
+});
+
+describe('sanitizeForwardedSubagentUpdateData', () => {
+  it('uses an allowlist for run step payloads', () => {
+    const sanitized = sanitizeForwardedSubagentUpdateData(
+      GraphEvents.ON_RUN_STEP,
+      {
+        id: 'step_1',
+        type: StepTypes.TOOL_CALLS,
+        agentId: 'researcher',
+        index: 0,
+        stepDetails: {
+          type: StepTypes.TOOL_CALLS,
+          tool_calls: [
+            {
+              id: 'call_1',
+              name: 'calculator',
+              args: { expression: '21 * 2' },
+              futureSecret: 'nested-secret',
+            },
+          ],
+          futureSecret: 'details-secret',
+        },
+        configurable: { access_token: 'access-secret' },
+        metadata: { refresh_token: 'refresh-secret' },
+        futureSecret: 'top-level-secret',
+      }
+    );
+
+    expect(sanitized).toEqual({
+      id: 'step_1',
+      type: StepTypes.TOOL_CALLS,
+      agentId: 'researcher',
+      index: 0,
+      stepDetails: {
+        type: StepTypes.TOOL_CALLS,
+        tool_calls: [
+          {
+            id: 'call_1',
+            name: 'calculator',
+            args: { expression: '21 * 2' },
+          },
+        ],
+      },
+    });
+    const serialized = JSON.stringify(sanitized);
+    expect(serialized).not.toContain('futureSecret');
+    expect(serialized).not.toContain('top-level-secret');
+    expect(serialized).not.toContain('details-secret');
+    expect(serialized).not.toContain('nested-secret');
+    expect(serialized).not.toContain('access-secret');
+    expect(serialized).not.toContain('refresh-secret');
+  });
+
+  it('keeps completed tool output while stripping operational fields', () => {
+    const output = 'x'.repeat(10_000);
+    const sanitized = sanitizeForwardedSubagentUpdateData(
+      GraphEvents.ON_RUN_STEP_COMPLETED,
+      {
+        result: {
+          id: 'step_1',
+          index: 0,
+          type: 'tool_call',
+          tool_call: {
+            id: 'call_1',
+            name: 'list_tables_mcp_ClickHouse',
+            args: '{}',
+            output,
+            progress: 1,
+            futureSecret: 'nested-secret',
+          },
+          futureSecret: 'result-secret',
+        },
+        configurable: {
+          user: {
+            federatedTokens: {
+              access_token: 'access-secret',
+            },
+          },
+        },
+        metadata: {
+          refresh_token: 'refresh-secret',
+        },
+        futureSecret: 'top-level-secret',
+      }
+    );
+
+    expect(sanitized).toEqual({
+      result: {
+        id: 'step_1',
+        index: 0,
+        type: 'tool_call',
+        tool_call: {
+          id: 'call_1',
+          name: 'list_tables_mcp_ClickHouse',
+          args: '{}',
+          output,
+          progress: 1,
+        },
+      },
+    });
+    const serialized = JSON.stringify(sanitized);
+    expect(serialized).toContain(output);
+    expect(serialized).not.toContain('futureSecret');
+    expect(serialized).not.toContain('top-level-secret');
+    expect(serialized).not.toContain('result-secret');
+    expect(serialized).not.toContain('nested-secret');
+    expect(serialized).not.toContain('configurable');
+    expect(serialized).not.toContain('metadata');
+    expect(serialized).not.toContain('access-secret');
+    expect(serialized).not.toContain('refresh-secret');
   });
 });

@@ -1562,6 +1562,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           maxDepth: effectiveSubagentDepth,
           createChildGraph: (input): StandardGraph => {
             const childGraph = new StandardGraph(input);
+            childGraph.hookRegistry = this.hookRegistry;
+            /**
+             * Do not propagate `humanInTheLoop` into the child graph yet:
+             * nested subagent interrupts need a stable child checkpoint and
+             * resume bridge. Child hooks still fire; `ask` decisions fail
+             * closed inside the subagent until that flow is implemented.
+             */
             childGraph.toolOutputReferences = this.toolOutputReferences;
             childGraph.eagerEventToolExecution = this.eagerEventToolExecution;
             childGraph.toolExecution = this.toolExecution;

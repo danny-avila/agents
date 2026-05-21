@@ -5,29 +5,149 @@ import type { BaseMessage } from '@langchain/core/messages';
 import type { Callbacks } from '@langchain/core/callbacks/manager';
 import type {
   AgentInputs,
+  MessageDeltaEvent,
+  ProcessedToolCall,
+  ReasoningDeltaEvent,
+  RunStep,
+  RunStepDeltaEvent,
   StandardGraphInput,
   ResolvedSubagentConfig,
+  StepCompleted,
   SubagentConfig,
   SubagentUpdateEvent,
   SubagentUpdatePhase,
   ToolExecuteBatchRequest,
+  ToolCallDelta,
   TokenCounter,
 } from '@/types';
 import type { AggregatedHookResult, HookRegistry } from '@/hooks';
 import type { AgentContext } from '@/agents/AgentContext';
 import type { StandardGraph } from '@/graphs/Graph';
-import { GraphEvents, Callback } from '@/common';
+import { GraphEvents, Callback, StepTypes } from '@/common';
 import type { HandlerRegistry } from '@/events';
 import { executeHooks } from '@/hooks';
 
 const DEFAULT_MAX_TURNS = 25;
 const RECURSION_MULTIPLIER = 3;
 const ERROR_MESSAGE_MAX_CHARS = 200;
+const MAX_PENDING_SUBAGENT_UPDATES = 64;
 
 const HOOK_FALLBACK: AggregatedHookResult = Object.freeze({
   additionalContexts: [] as string[],
   errors: [] as string[],
 });
+
+type SanitizedSubagentToolCall = {
+  id: string;
+  name: string;
+  args?: ToolExecuteBatchRequest['toolCalls'][number]['args'];
+};
+
+type SanitizedSubagentToolExecuteData = {
+  toolCalls: SanitizedSubagentToolCall[];
+  agentId?: string;
+};
+
+type SanitizedRunStep = Partial<
+  Pick<
+    RunStep,
+    | 'agentId'
+    | 'groupId'
+    | 'id'
+    | 'index'
+    | 'runId'
+    | 'stepIndex'
+    | 'summary'
+    | 'type'
+    | 'usage'
+  >
+> & {
+  stepDetails?: SanitizedStepDetails;
+};
+
+type SanitizedStepDetails =
+  | {
+      type: StepTypes.MESSAGE_CREATION;
+      message_creation?: {
+        message_id?: string;
+      };
+    }
+  | {
+      type: StepTypes.TOOL_CALLS;
+      tool_calls?: SanitizedAgentToolCall[];
+    };
+
+type SanitizedAgentToolCall = {
+  id?: string;
+  name?: string;
+  args?: string | object;
+  type?: string;
+  function?: {
+    name?: string;
+    arguments?: string | object;
+  };
+};
+
+type SanitizedRunStepDelta = Partial<Pick<RunStepDeltaEvent, 'id'>> & {
+  delta?: SanitizedToolCallDelta;
+};
+
+type SanitizedToolCallDelta = Partial<
+  Pick<ToolCallDelta, 'auth' | 'expires_at' | 'summary' | 'type'>
+> & {
+  tool_calls?: SanitizedAgentToolCall[];
+};
+
+type SanitizedStepCompleted =
+  | {
+      id?: string;
+      index?: number;
+      type: 'tool_call';
+      tool_call?: SanitizedProcessedToolCall;
+    }
+  | {
+      type: 'summary';
+      summary?: Extract<StepCompleted, { type: 'summary' }>['summary'];
+    };
+
+type SanitizedProcessedToolCall = Partial<
+  Pick<ProcessedToolCall, 'args' | 'id' | 'name' | 'output' | 'progress'>
+>;
+
+type SanitizedRunStepCompleted = {
+  result?: SanitizedStepCompleted;
+};
+
+type SanitizedMessageDelta = Partial<Pick<MessageDeltaEvent, 'id'>> & {
+  delta?: {
+    content?: MessageDeltaEvent['delta']['content'];
+    tool_call_ids?: MessageDeltaEvent['delta']['tool_call_ids'];
+  };
+};
+
+type SanitizedReasoningDelta = Partial<Pick<ReasoningDeltaEvent, 'id'>> & {
+  delta?: {
+    content?: ReasoningDeltaEvent['delta']['content'];
+  };
+};
+
+type QueuedSubagentUpdate = {
+  eventName: string;
+  phase: SubagentUpdatePhase;
+  data: unknown;
+};
+
+type ForwarderCallback = {
+  handler: BaseCallbackHandler;
+  drain: () => Promise<void>;
+};
+
+const LANGGRAPH_RUNTIME_CONFIG_PREFIX = '__pregel_';
+const LANGGRAPH_CHECKPOINT_CONFIG_KEYS = new Set([
+  'checkpoint_id',
+  'checkpoint_map',
+  'checkpoint_ns',
+]);
 
 export type SubagentExecuteParams = {
   description: string;
@@ -41,11 +161,13 @@ export type SubagentExecuteParams = {
    */
   parentToolCallId?: string;
   /**
-   * Snapshot of the parent invocation's `config.configurable` at the
-   * spawn-tool call site. Inherited verbatim into the child workflow's
-   * `configurable` so host-set fields (`requestBody`, `user`,
-   * `userMCPAuthMap`, etc.) propagate — fixing MCP body-placeholder
-   * substitution and per-user lookups for subagent tool calls.
+   * Snapshot of the parent invocation's host `config.configurable` at
+   * the spawn-tool call site. Host-set fields (`requestBody`, `user`,
+   * `userMCPAuthMap`, etc.) propagate into the child workflow's
+   * `configurable` — fixing MCP body-placeholder substitution and
+   * per-user lookups for subagent tool calls. LangGraph runtime keys
+   * (`__pregel_*`, checkpoint bookkeeping) are intentionally not
+   * inherited; the child graph recreates its own runtime config.
    *
    * Inheritance details (verified empirically against LangGraph):
    *   - host-set keys propagate as-is into the child's tool dispatches;
@@ -233,7 +355,7 @@ export class SubagentExecutor {
       tokenCounter: this.tokenCounter,
     });
 
-    const forwarder = forwardingEnabled
+    const forwarding = forwardingEnabled
       ? this.createForwarderCallback({
         parentRegistry: parentRegistry!,
         subagentType,
@@ -242,6 +364,7 @@ export class SubagentExecutor {
         parentToolCallId,
       })
       : undefined;
+    const forwarder = forwarding?.handler;
 
     if (forwarder) {
       await this.emitSubagentUpdate(parentRegistry!, {
@@ -276,10 +399,11 @@ export class SubagentExecutor {
        */
       const callbacks: Callbacks = forwarder ? [forwarder] : [];
       /**
-       * Inherit the parent's `configurable` verbatim — host-set fields
+       * Inherit the parent's host `configurable` — host-set fields
        * (`requestBody`, `user`, `userMCPAuthMap`, etc.) AND the run-
        * identity fields (`run_id`, `parent_run_id`, `thread_id`) all
-       * propagate.
+       * propagate. LangGraph's own runtime keys are excluded because the
+       * child graph creates its own scratchpad/checkpoint/abort plumbing.
        *
        * Run-identity propagation is intentional and matches the
        * convention this executor itself already uses for `SubagentStart`
@@ -304,7 +428,7 @@ export class SubagentExecutor {
        * case (synchronous subagents within a single user turn).
        */
       const inheritedConfigurable: Record<string, unknown> =
-        params.parentConfigurable ?? {};
+        sanitizeChildConfigurable(params.parentConfigurable);
       result = await workflow.invoke(
         { messages: [new HumanMessage(description)] },
         {
@@ -321,6 +445,7 @@ export class SubagentExecutor {
     } catch (error) {
       const errorMessage = truncateErrorMessage(error);
       if (forwarder) {
+        await forwarding.drain();
         await this.emitSubagentUpdate(parentRegistry!, {
           childRunId,
           subagentType,
@@ -367,6 +492,7 @@ export class SubagentExecutor {
     }
 
     if (forwarder) {
+      await forwarding.drain();
       await this.emitSubagentUpdate(parentRegistry!, {
         childRunId,
         subagentType,
@@ -440,7 +566,7 @@ export class SubagentExecutor {
     subagentAgentId: string;
     childRunId: string;
     parentToolCallId?: string;
-  }): BaseCallbackHandler {
+  }): ForwarderCallback {
     const {
       parentRegistry,
       subagentType,
@@ -460,23 +586,73 @@ export class SubagentExecutor {
       if (!handler) {
         return;
       }
-      const event: SubagentUpdateEvent = {
-        runId: parentRunId,
-        subagentRunId: childRunId,
-        subagentType,
-        subagentAgentId,
-        parentAgentId,
-        parentToolCallId,
-        phase,
-        data,
-        label: summarizeEvent(eventName, data),
-        timestamp: new Date().toISOString(),
-      };
       try {
+        const event: SubagentUpdateEvent = {
+          runId: parentRunId,
+          subagentRunId: childRunId,
+          subagentType,
+          subagentAgentId,
+          parentAgentId,
+          parentToolCallId,
+          phase,
+          data: sanitizeForwardedSubagentUpdateData(eventName, data),
+          label: summarizeEvent(eventName, data),
+          timestamp: new Date().toISOString(),
+        };
         await handler.handle(GraphEvents.ON_SUBAGENT_UPDATE, event);
       } catch {
         /* observational — swallow */
       }
+    };
+
+    const queuedUpdates: QueuedSubagentUpdate[] = [];
+    let drainPromise: Promise<void> | undefined;
+
+    const enqueue = (update: QueuedSubagentUpdate): void => {
+      if (queuedUpdates.length >= MAX_PENDING_SUBAGENT_UPDATES) {
+        const dropIndex = queuedUpdates.findIndex((queued) =>
+          isDroppableSubagentUpdatePhase(queued.phase)
+        );
+        if (dropIndex >= 0) {
+          queuedUpdates.splice(dropIndex, 1);
+        } else if (isDroppableSubagentUpdatePhase(update.phase)) {
+          return;
+        }
+      }
+      queuedUpdates.push(update);
+    };
+
+    const drain = async (): Promise<void> => {
+      if (drainPromise != null) {
+        await drainPromise;
+        return;
+      }
+      drainPromise = (async (): Promise<void> => {
+        while (queuedUpdates.length > 0) {
+          const update = queuedUpdates.shift();
+          if (update == null) {
+            continue;
+          }
+          await wrap(update.eventName, update.phase, update.data);
+        }
+      })();
+      try {
+        await drainPromise;
+      } finally {
+        drainPromise = undefined;
+        if (queuedUpdates.length > 0) {
+          await drain();
+        }
+      }
+    };
+
+    const scheduleWrap = (
+      eventName: string,
+      phase: SubagentUpdatePhase,
+      data: unknown
+    ): void => {
+      enqueue({ eventName, phase, data });
+      void drain();
     };
 
     const handler = BaseCallbackHandler.fromMethods({
@@ -498,28 +674,28 @@ export class SubagentExecutor {
            * We also surface a short notice in the subagent-update stream so
            * the UI can show "calling <tool>" for each tool the child spawns.
            */
-          await wrap(eventName, 'run_step', data);
+          scheduleWrap(eventName, 'run_step', data);
           return;
         }
 
         if (eventName === GraphEvents.ON_RUN_STEP) {
-          await wrap(eventName, 'run_step', data);
+          scheduleWrap(eventName, 'run_step', data);
           return;
         }
         if (eventName === GraphEvents.ON_RUN_STEP_DELTA) {
-          await wrap(eventName, 'run_step_delta', data);
+          scheduleWrap(eventName, 'run_step_delta', data);
           return;
         }
         if (eventName === GraphEvents.ON_RUN_STEP_COMPLETED) {
-          await wrap(eventName, 'run_step_completed', data);
+          scheduleWrap(eventName, 'run_step_completed', data);
           return;
         }
         if (eventName === GraphEvents.ON_MESSAGE_DELTA) {
-          await wrap(eventName, 'message_delta', data);
+          scheduleWrap(eventName, 'message_delta', data);
           return;
         }
         if (eventName === GraphEvents.ON_REASONING_DELTA) {
-          await wrap(eventName, 'reasoning_delta', data);
+          scheduleWrap(eventName, 'reasoning_delta', data);
           return;
         }
       },
@@ -527,15 +703,317 @@ export class SubagentExecutor {
     /**
      * `awaitHandlers = true` is required so the child's `ToolNode` actually
      * blocks on the parent's `ON_TOOL_EXECUTE` handler until it resolves
-     * the batch request. The same flag applies to observational events
-     * (message_delta, run_step, …), which means a slow
-     * `ON_SUBAGENT_UPDATE` handler on the host serializes the child
-     * stream. If host-side latency becomes a concern, a future
-     * refinement could split operational and observational events into
-     * separate callback handlers with distinct await semantics.
+     * the batch request. Observational `ON_SUBAGENT_UPDATE` calls are queued
+     * behind a bounded sequential dispatcher so host UI publication cannot
+     * backpressure each child emission or run unbounded concurrent publishes.
+     * The executor drains this queue before terminal stop/error envelopes to
+     * preserve phase ordering.
      */
     handler.awaitHandlers = true;
-    return handler;
+    return { handler, drain };
+  }
+}
+
+function sanitizeChildConfigurable(
+  parentConfigurable: Record<string, unknown> | undefined
+): Record<string, unknown> {
+  if (parentConfigurable == null) {
+    return {};
+  }
+  return Object.fromEntries(
+    Object.entries(parentConfigurable).filter(
+      ([key]) => !isLangGraphRuntimeConfigKey(key)
+    )
+  );
+}
+
+function isLangGraphRuntimeConfigKey(key: string): boolean {
+  return (
+    key.startsWith(LANGGRAPH_RUNTIME_CONFIG_PREFIX) ||
+    LANGGRAPH_CHECKPOINT_CONFIG_KEYS.has(key)
+  );
+}
+
+export function sanitizeForwardedSubagentUpdateData(
+  eventName: string,
+  data: unknown
+): unknown {
+  if (eventName === GraphEvents.ON_TOOL_EXECUTE) {
+    return sanitizeToolExecuteUpdateData(data);
+  }
+  if (eventName === GraphEvents.ON_RUN_STEP) {
+    return sanitizeRunStepUpdateData(data);
+  }
+  if (eventName === GraphEvents.ON_RUN_STEP_DELTA) {
+    return sanitizeRunStepDeltaUpdateData(data);
+  }
+  if (eventName === GraphEvents.ON_RUN_STEP_COMPLETED) {
+    return sanitizeRunStepCompletedUpdateData(data);
+  }
+  if (eventName === GraphEvents.ON_MESSAGE_DELTA) {
+    return sanitizeMessageDeltaUpdateData(data);
+  }
+  if (eventName === GraphEvents.ON_REASONING_DELTA) {
+    return sanitizeReasoningDeltaUpdateData(data);
+  }
+  return undefined;
+}
+
+function isDroppableSubagentUpdatePhase(phase: SubagentUpdatePhase): boolean {
+  return (
+    phase === 'message_delta' ||
+    phase === 'reasoning_delta' ||
+    phase === 'run_step_delta'
+  );
+}
+
+function sanitizeToolExecuteUpdateData(
+  data: unknown
+): SanitizedSubagentToolExecuteData {
+  const request = data as Partial<ToolExecuteBatchRequest>;
+  const toolCalls = Array.isArray(request.toolCalls)
+    ? request.toolCalls.map(sanitizeToolCallForUpdate)
+    : [];
+  const sanitized: SanitizedSubagentToolExecuteData = { toolCalls };
+  if (typeof request.agentId === 'string') {
+    sanitized.agentId = request.agentId;
+  }
+  return sanitized;
+}
+
+function sanitizeToolCallForUpdate(
+  call: ToolExecuteBatchRequest['toolCalls'][number]
+): SanitizedSubagentToolCall {
+  const sanitized: SanitizedSubagentToolCall = {
+    id: call.id,
+    name: call.name,
+    args: call.args,
+  };
+  return sanitized;
+}
+
+function sanitizeRunStepUpdateData(data: unknown): SanitizedRunStep | undefined {
+  if (!isObjectLike(data)) {
+    return undefined;
+  }
+  const step = data as Partial<RunStep>;
+  const sanitized: SanitizedRunStep = {};
+  assignString(sanitized, 'agentId', step.agentId);
+  assignNumber(sanitized, 'groupId', step.groupId);
+  assignString(sanitized, 'id', step.id);
+  assignNumber(sanitized, 'index', step.index);
+  assignString(sanitized, 'runId', step.runId);
+  assignNumber(sanitized, 'stepIndex', step.stepIndex);
+  assignString(sanitized, 'type', step.type);
+  if (step.summary !== undefined) {
+    sanitized.summary = step.summary;
+  }
+  if (step.usage !== undefined) {
+    sanitized.usage = step.usage;
+  }
+  sanitized.stepDetails = sanitizeStepDetails(step.stepDetails);
+  return sanitized;
+}
+
+function sanitizeRunStepDeltaUpdateData(
+  data: unknown
+): SanitizedRunStepDelta | undefined {
+  if (!isObjectLike(data)) {
+    return undefined;
+  }
+  const event = data as Partial<RunStepDeltaEvent>;
+  const sanitized: SanitizedRunStepDelta = {};
+  assignString(sanitized, 'id', event.id);
+  sanitized.delta = sanitizeToolCallDelta(event.delta);
+  return sanitized;
+}
+
+function sanitizeRunStepCompletedUpdateData(
+  data: unknown
+): SanitizedRunStepCompleted | undefined {
+  if (!isObjectLike(data)) {
+    return undefined;
+  }
+  const event = data as { result?: unknown };
+  return { result: sanitizeStepCompleted(event.result) };
+}
+
+function sanitizeMessageDeltaUpdateData(
+  data: unknown
+): SanitizedMessageDelta | undefined {
+  if (!isObjectLike(data)) {
+    return undefined;
+  }
+  const event = data as Partial<MessageDeltaEvent>;
+  const sanitized: SanitizedMessageDelta = {};
+  assignString(sanitized, 'id', event.id);
+  if (event.delta != null) {
+    sanitized.delta = {};
+    if (event.delta.content !== undefined) {
+      sanitized.delta.content = event.delta.content;
+    }
+    if (event.delta.tool_call_ids !== undefined) {
+      sanitized.delta.tool_call_ids = event.delta.tool_call_ids;
+    }
+  }
+  return sanitized;
+}
+
+function sanitizeReasoningDeltaUpdateData(
+  data: unknown
+): SanitizedReasoningDelta | undefined {
+  if (!isObjectLike(data)) {
+    return undefined;
+  }
+  const event = data as Partial<ReasoningDeltaEvent>;
+  const sanitized: SanitizedReasoningDelta = {};
+  assignString(sanitized, 'id', event.id);
+  if (event.delta?.content !== undefined) {
+    sanitized.delta = { content: event.delta.content };
+  }
+  return sanitized;
+}
+
+function sanitizeStepDetails(stepDetails: unknown): SanitizedStepDetails | undefined {
+  if (!isObjectLike(stepDetails)) {
+    return undefined;
+  }
+  const rawDetails = stepDetails as {
+    message_creation?: { message_id?: unknown };
+    tool_calls?: unknown[];
+    type?: unknown;
+  };
+  if (rawDetails.type === StepTypes.MESSAGE_CREATION) {
+    const sanitized: SanitizedStepDetails = {
+      type: StepTypes.MESSAGE_CREATION,
+    };
+    const messageId = rawDetails.message_creation?.message_id;
+    if (typeof messageId === 'string') {
+      sanitized.message_creation = { message_id: messageId };
+    }
+    return sanitized;
+  }
+  if (rawDetails.type === StepTypes.TOOL_CALLS) {
+    const sanitized: SanitizedStepDetails = {
+      type: StepTypes.TOOL_CALLS,
+    };
+    if (Array.isArray(rawDetails.tool_calls)) {
+      sanitized.tool_calls = rawDetails.tool_calls.map(sanitizeAgentToolCall);
+    }
+    return sanitized;
+  }
+  return undefined;
+}
+
+function sanitizeToolCallDelta(
+  delta: ToolCallDelta | undefined
+): SanitizedToolCallDelta | undefined {
+  if (!isObjectLike(delta)) {
+    return undefined;
+  }
+  const sanitized: SanitizedToolCallDelta = {};
+  assignString(sanitized, 'auth', delta.auth);
+  assignNumber(sanitized, 'expires_at', delta.expires_at);
+  assignString(sanitized, 'type', delta.type);
+  if (delta.summary !== undefined) {
+    sanitized.summary = delta.summary;
+  }
+  if (Array.isArray(delta.tool_calls)) {
+    sanitized.tool_calls = delta.tool_calls.map(sanitizeAgentToolCall);
+  }
+  return sanitized;
+}
+
+function sanitizeStepCompleted(data: unknown): SanitizedStepCompleted | undefined {
+  if (!isObjectLike(data)) {
+    return undefined;
+  }
+  const completed = data as Partial<StepCompleted> & {
+    id?: unknown;
+    index?: unknown;
+    tool_call?: unknown;
+  };
+  if (completed.type === 'summary') {
+    return {
+      type: 'summary',
+      summary: completed.summary,
+    };
+  }
+  if (completed.type !== 'tool_call') {
+    return undefined;
+  }
+  const sanitized: SanitizedStepCompleted = { type: 'tool_call' };
+  assignString(sanitized, 'id', completed.id);
+  assignNumber(sanitized, 'index', completed.index);
+  sanitized.tool_call = sanitizeProcessedToolCall(completed.tool_call);
+  return sanitized;
+}
+
+function sanitizeProcessedToolCall(
+  toolCall: unknown
+): SanitizedProcessedToolCall | undefined {
+  if (!isObjectLike(toolCall)) {
+    return undefined;
+  }
+  const call = toolCall as Partial<ProcessedToolCall>;
+  const sanitized: SanitizedProcessedToolCall = {};
+  assignString(sanitized, 'id', call.id);
+  assignString(sanitized, 'name', call.name);
+  if (call.args !== undefined) {
+    sanitized.args = call.args;
+  }
+  assignString(sanitized, 'output', call.output);
+  assignNumber(sanitized, 'progress', call.progress);
+  return sanitized;
+}
+
+function sanitizeAgentToolCall(toolCall: unknown): SanitizedAgentToolCall {
+  if (!isObjectLike(toolCall)) {
+    return {};
+  }
+  const call = toolCall as SanitizedAgentToolCall;
+  const sanitized: SanitizedAgentToolCall = {};
+  assignString(sanitized, 'id', call.id);
+  assignString(sanitized, 'name', call.name);
+  assignString(sanitized, 'type', call.type);
+  if (call.args !== undefined) {
+    sanitized.args = call.args;
+  }
+  if (isObjectLike(call.function)) {
+    const fn: SanitizedAgentToolCall['function'] = {};
+    assignString(fn, 'name', call.function.name);
+    if (
+      typeof call.function.arguments === 'string' ||
+      isObjectLike(call.function.arguments)
+    ) {
+      fn.arguments = call.function.arguments;
+    }
+    sanitized.function = fn;
+  }
+  return sanitized;
+}
+
+function isObjectLike(value: unknown): value is object {
+  return value != null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function assignString<T extends object, K extends keyof T>(
+  target: T,
+  key: K,
+  value: unknown
+): void {
+  if (typeof value === 'string') {
+    target[key] = value as T[K];
+  }
+}
+
+function assignNumber<T extends object, K extends keyof T>(
+  target: T,
+  key: K,
+  value: unknown
+): void {
+  if (typeof value === 'number') {
+    target[key] = value as T[K];
   }
 }
 
