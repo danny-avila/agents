@@ -23,11 +23,50 @@ import { executeHooks } from '@/hooks';
 const DEFAULT_MAX_TURNS = 25;
 const RECURSION_MULTIPLIER = 3;
 const ERROR_MESSAGE_MAX_CHARS = 200;
+const SUBAGENT_UPDATE_OMITTED_KEYS = new Set([
+  'Authorization',
+  'access_token',
+  'accessToken',
+  'authorization',
+  'checkpoint',
+  'checkpointMap',
+  'configurable',
+  'currentTaskInput',
+  'federatedTokens',
+  'id_token',
+  'idToken',
+  'metadata',
+  'refreshToken',
+  'refresh_token',
+  'reject',
+  'requestBody',
+  'resolve',
+  'scratchpad',
+  'user',
+  'userId',
+  'userMCPAuthMap',
+  'user_id',
+]);
 
 const HOOK_FALLBACK: AggregatedHookResult = Object.freeze({
   additionalContexts: [] as string[],
   errors: [] as string[],
 });
+
+type SanitizedSubagentToolCall = {
+  id: string;
+  name: string;
+  args?: ToolExecuteBatchRequest['toolCalls'][number]['args'];
+};
+
+type SanitizedSubagentToolExecuteData = {
+  toolCalls: SanitizedSubagentToolCall[];
+  agentId?: string;
+};
+
+type ShallowSanitizedUpdateData = {
+  [key: string]: unknown;
+};
 
 export type SubagentExecuteParams = {
   description: string;
@@ -468,7 +507,7 @@ export class SubagentExecutor {
         parentAgentId,
         parentToolCallId,
         phase,
-        data,
+        data: sanitizeForwardedSubagentUpdateData(eventName, data),
         label: summarizeEvent(eventName, data),
         timestamp: new Date().toISOString(),
       };
@@ -498,28 +537,28 @@ export class SubagentExecutor {
            * We also surface a short notice in the subagent-update stream so
            * the UI can show "calling <tool>" for each tool the child spawns.
            */
-          await wrap(eventName, 'run_step', data);
+          void wrap(eventName, 'run_step', data);
           return;
         }
 
         if (eventName === GraphEvents.ON_RUN_STEP) {
-          await wrap(eventName, 'run_step', data);
+          void wrap(eventName, 'run_step', data);
           return;
         }
         if (eventName === GraphEvents.ON_RUN_STEP_DELTA) {
-          await wrap(eventName, 'run_step_delta', data);
+          void wrap(eventName, 'run_step_delta', data);
           return;
         }
         if (eventName === GraphEvents.ON_RUN_STEP_COMPLETED) {
-          await wrap(eventName, 'run_step_completed', data);
+          void wrap(eventName, 'run_step_completed', data);
           return;
         }
         if (eventName === GraphEvents.ON_MESSAGE_DELTA) {
-          await wrap(eventName, 'message_delta', data);
+          void wrap(eventName, 'message_delta', data);
           return;
         }
         if (eventName === GraphEvents.ON_REASONING_DELTA) {
-          await wrap(eventName, 'reasoning_delta', data);
+          void wrap(eventName, 'reasoning_delta', data);
           return;
         }
       },
@@ -527,16 +566,67 @@ export class SubagentExecutor {
     /**
      * `awaitHandlers = true` is required so the child's `ToolNode` actually
      * blocks on the parent's `ON_TOOL_EXECUTE` handler until it resolves
-     * the batch request. The same flag applies to observational events
-     * (message_delta, run_step, …), which means a slow
-     * `ON_SUBAGENT_UPDATE` handler on the host serializes the child
-     * stream. If host-side latency becomes a concern, a future
-     * refinement could split operational and observational events into
-     * separate callback handlers with distinct await semantics.
+     * the batch request. The callback also sees observational events
+     * (message_delta, run_step, …), but `ON_SUBAGENT_UPDATE` calls are
+     * deliberately emitted fire-and-forget so host UI publication cannot
+     * backpressure the child graph. `wrap` swallows handler errors because
+     * these events are observational.
      */
     handler.awaitHandlers = true;
     return handler;
   }
+}
+
+export function sanitizeForwardedSubagentUpdateData(
+  eventName: string,
+  data: unknown
+): unknown {
+  if (eventName === GraphEvents.ON_TOOL_EXECUTE) {
+    return sanitizeToolExecuteUpdateData(data);
+  }
+  if (data == null || typeof data !== 'object' || Array.isArray(data)) {
+    return data;
+  }
+  return omitOperationalUpdateFields(data);
+}
+
+function sanitizeToolExecuteUpdateData(
+  data: unknown
+): SanitizedSubagentToolExecuteData {
+  const request = data as Partial<ToolExecuteBatchRequest>;
+  const toolCalls = Array.isArray(request.toolCalls)
+    ? request.toolCalls.map(sanitizeToolCallForUpdate)
+    : [];
+  const sanitized: SanitizedSubagentToolExecuteData = { toolCalls };
+  if (typeof request.agentId === 'string') {
+    sanitized.agentId = request.agentId;
+  }
+  return sanitized;
+}
+
+function sanitizeToolCallForUpdate(
+  call: ToolExecuteBatchRequest['toolCalls'][number]
+): SanitizedSubagentToolCall {
+  const sanitized: SanitizedSubagentToolCall = {
+    id: call.id,
+    name: call.name,
+    args: call.args,
+  };
+  return sanitized;
+}
+
+function omitOperationalUpdateFields(data: object): ShallowSanitizedUpdateData {
+  const sanitized: ShallowSanitizedUpdateData = {};
+  for (const [key, value] of Object.entries(data)) {
+    if (
+      SUBAGENT_UPDATE_OMITTED_KEYS.has(key) ||
+      typeof value === 'function'
+    ) {
+      continue;
+    }
+    sanitized[key] = value;
+  }
+  return sanitized;
 }
 
 /**
