@@ -6,6 +6,7 @@ import type * as t from '@/types';
 import {
   BASH_SHELL_GUIDANCE,
   CODE_ARTIFACT_PATH_GUIDANCE,
+  appendTmpScratchReminder,
   appendCodeSessionFileSummary,
   emptyOutputMessage,
   buildCodeApiHttpErrorMessage,
@@ -111,7 +112,7 @@ export const BashExecutionToolDefinition = {
 } as const;
 
 function createBashExecutionTool(
-  params: t.BashExecutionToolParams = {}
+  params: t.BashExecutionToolParams | null = {}
 ): DynamicStructuredTool {
   return tool(
     async (rawInput, config) => {
@@ -180,9 +181,13 @@ function createBashExecutionTool(
         }
         if (result.stderr) formattedOutput += `stderr:\n${result.stderr}\n`;
 
+        const outputWithReminder = appendTmpScratchReminder(
+          formattedOutput,
+          command
+        );
         const hasFiles = result.files != null && result.files.length > 0;
         return [
-          appendCodeSessionFileSummary(formattedOutput, result.files),
+          appendCodeSessionFileSummary(outputWithReminder, result.files),
           (hasFiles
             ? { session_id: result.session_id, files: result.files }
             : {

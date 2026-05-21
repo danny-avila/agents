@@ -22,10 +22,22 @@ export const emptyOutputMessage =
   'stdout: Empty. Ensure you\'re writing output explicitly.\n';
 
 export const CODE_ARTIFACT_PATH_GUIDANCE =
-  'Persist artifacts in `/mnt/data` with standard extensions (.json/.txt/.csv/.tsv/.log/.parquet/.png/.jpg/.pdf/.xlsx); `/tmp` and odd extensions are same-call scratch.';
+  'Persist handoff artifacts in `/mnt/data` with standard extensions (.json/.txt/.csv/.tsv/.log/.parquet/.png/.jpg/.pdf/.xlsx); `/tmp` and odd extensions are same-call scratch only, not later-call storage.';
 
 export const BASH_SHELL_GUIDANCE =
   'Bash: multi-line files use heredoc/printf; run Python via python3 -c/heredoc, not bare Python.';
+
+const TMP_PATH_PATTERN = /(^|[^A-Za-z0-9_])\/tmp(?:\/|\b)/;
+
+export const TMP_SCRATCH_OUTPUT_REMINDER =
+  'Note: /tmp files are same-call scratch only and were not persisted; use /mnt/data for files needed later.';
+
+export function appendTmpScratchReminder(output: string, code: string): string {
+  if (!TMP_PATH_PATTERN.test(code)) {
+    return output;
+  }
+  return `${output.trimEnd()}\n${TMP_SCRATCH_OUTPUT_REMINDER}\n`;
+}
 
 const SUPPORTED_LANGUAGES = [
   'py',
@@ -208,9 +220,13 @@ function createCodeExecutionTool(
         }
         if (result.stderr) formattedOutput += `stderr:\n${result.stderr}\n`;
 
+        const outputWithReminder = appendTmpScratchReminder(
+          formattedOutput,
+          code
+        );
         const hasFiles = result.files != null && result.files.length > 0;
         return [
-          appendCodeSessionFileSummary(formattedOutput, result.files),
+          appendCodeSessionFileSummary(outputWithReminder, result.files),
           (hasFiles
             ? { session_id: result.session_id, files: result.files }
             : {

@@ -12,6 +12,7 @@ import {
   buildCodeApiHttpErrorMessage,
   emptyOutputMessage,
   getCodeBaseURL,
+  appendTmpScratchReminder,
   resolveCodeApiAuthHeaders,
 } from './CodeExecutor';
 import {
@@ -690,7 +691,8 @@ export async function executeTools(
  * @returns Tuple of [formatted string, artifact]
  */
 export function formatCompletedResponse(
-  response: t.ProgrammaticExecutionResponse
+  response: t.ProgrammaticExecutionResponse,
+  sourceCode = ''
 ): [string, t.ProgrammaticExecutionArtifact] {
   let formatted = '';
 
@@ -704,8 +706,10 @@ export function formatCompletedResponse(
     formatted += `stderr:\n${response.stderr}\n`;
   }
 
+  const outputWithReminder = appendTmpScratchReminder(formatted, sourceCode);
+
   return [
-    appendCodeSessionFileSummary(formatted, response.files),
+    appendCodeSessionFileSummary(outputWithReminder, response.files),
     {
       session_id: response.session_id,
       files: response.files,
@@ -863,7 +867,7 @@ export function createProgrammaticToolCallingTool(
         // ====================================================================
 
         if (response.status === 'completed') {
-          return formatCompletedResponse(response);
+          return formatCompletedResponse(response, code);
         }
 
         if (response.status === 'error') {
