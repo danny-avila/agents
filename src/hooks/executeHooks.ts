@@ -46,6 +46,11 @@ interface HookOutcome {
   timedOut: boolean;
 }
 
+interface AbortRace {
+  promise: Promise<never>;
+  cleanup: () => void;
+}
+
 function freshResult(): AggregatedHookResult {
   return {
     additionalContexts: [],
@@ -110,10 +115,10 @@ async function runHook(
   hook: WideCallback,
   input: HookInput,
   signal: AbortSignal,
+  abortPromise: Promise<never>,
   matcher: WideMatcher
 ): Promise<HookOutcome> {
   const hookPromise = Promise.resolve().then(() => hook(input, signal));
-  const { promise: abortPromise, cleanup } = makeAbortPromise(signal);
   try {
     const output = await Promise.race([hookPromise, abortPromise]);
     return { matcher, output, error: null, timedOut: false };
@@ -124,8 +129,22 @@ async function runHook(
       error: describeError(err),
       timedOut: isTimeout(err),
     };
+  }
+}
+
+async function runMatcherHooks(
+  matcher: WideMatcher,
+  input: HookInput,
+  signal: AbortSignal
+): Promise<HookOutcome[]> {
+  const abortRace: AbortRace = makeAbortPromise(signal);
+  const tasks = matcher.hooks.map((hook) =>
+    runHook(hook, input, signal, abortRace.promise, matcher)
+  );
+  try {
+    return await Promise.all(tasks);
   } finally {
-    cleanup();
+    abortRace.cleanup();
   }
 }
 
@@ -373,7 +392,7 @@ export async function executeHooks(
   }
 
   // --- SYNC CRITICAL SECTION: once-matcher removal must complete before any await ---
-  const tasks: Promise<HookOutcome>[] = [];
+  const tasks: Promise<HookOutcome[]>[] = [];
   for (const matcher of matchers) {
     if (!matchesQuery(matcher.pattern, matchQuery)) {
       continue;
@@ -381,18 +400,19 @@ export async function executeHooks(
     if (matcher.once === true) {
       registry.removeMatcher(event, matcher, sessionId);
     }
+    if (matcher.hooks.length === 0) {
+      continue;
+    }
     const perHookTimeout = matcher.timeout ?? timeoutMs;
     const matcherSignal = combineSignals(signal, perHookTimeout);
-    for (const hook of matcher.hooks) {
-      tasks.push(runHook(hook, input, matcherSignal, matcher));
-    }
+    tasks.push(runMatcherHooks(matcher, input, matcherSignal));
   }
   // --- END SYNC CRITICAL SECTION ---
   if (tasks.length === 0) {
     return freshResult();
   }
 
-  const outcomes = await Promise.all(tasks);
+  const outcomes = (await Promise.all(tasks)).flat();
   reportErrors(outcomes, event, logger);
   const aggregated = fold(outcomes);
   /**

@@ -109,6 +109,44 @@ describe('executeHooks', () => {
     consoleWarnSpy.mockRestore();
   });
 
+  describe('abort listener management', () => {
+    it('uses one abort listener for many hooks on one matcher', async () => {
+      const registry = new HookRegistry();
+      const listenerCounts = new Map<AbortSignal, number>();
+      let maxAbortListeners = 0;
+      const addEventListenerSpy = jest
+        .spyOn(AbortSignal.prototype, 'addEventListener')
+        .mockImplementation(function (
+          this: AbortSignal,
+          type: string,
+          _listener: EventListenerOrEventListenerObject | null
+        ): void {
+          if (type !== 'abort') {
+            return;
+          }
+          const count = (listenerCounts.get(this) ?? 0) + 1;
+          listenerCounts.set(this, count);
+          maxAbortListeners = Math.max(maxAbortListeners, count);
+        });
+      const hooks = Array.from({ length: 12 }, () =>
+        runStartHook(async (): Promise<RunStartHookOutput> => ({}))
+      );
+
+      try {
+        registry.register('RunStart', { hooks });
+
+        await executeHooks({
+          registry,
+          input: runStartInput(),
+          timeoutMs: 1000,
+        });
+        expect(maxAbortListeners).toBe(1);
+      } finally {
+        addEventListenerSpy.mockRestore();
+      }
+    });
+  });
+
   describe('empty matcher set', () => {
     it('returns an empty aggregated result when no matchers are registered', async () => {
       const registry = new HookRegistry();
