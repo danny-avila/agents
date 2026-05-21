@@ -69,7 +69,7 @@ const CORE_RULES = `Rules:
 - One call: state does not persist
 - Tools are pre-defined as bash functions—DO NOT redefine them
 - Each tool function accepts a JSON string argument
-- Tool stdout is JSON, not raw text; use jq -r . for strings, jq -r .field for objects
+- When parsing saved tool stdout with jq, use jq -r 'fromjson? // . | ...' so object and stringified-JSON results both work
 - Only echo/printf output returns to the model
 - ${CODE_ARTIFACT_PATH_GUIDANCE}
 - ${BASH_SHELL_GUIDANCE}
@@ -84,11 +84,11 @@ const EXAMPLES = `Example (Complete workflow in one call):
   echo "$data" | jq '.[] | .name'
 
 Example (Parallel calls):
-  web_search '{"query": "SF weather"}' > /tmp/sf.txt &
-  web_search '{"query": "NY weather"}' > /tmp/ny.txt &
+  web_search '{"query": "SF weather"}' > /mnt/data/sf.json &
+  web_search '{"query": "NY weather"}' > /mnt/data/ny.json &
   wait
-  echo "SF: $(cat /tmp/sf.txt)"
-  echo "NY: $(cat /tmp/ny.txt)"`;
+  echo "SF: $(jq -r . /mnt/data/sf.json)"
+  echo "NY: $(jq -r . /mnt/data/ny.json)"`;
 
 const CODE_PARAM_DESCRIPTION = `Bash code that calls tools programmatically. Tools are available as bash functions.
 
@@ -375,7 +375,7 @@ export function createBashProgrammaticToolCallingTool(
         // ====================================================================
 
         if (response.status === 'completed') {
-          return formatCompletedResponse(response);
+          return formatCompletedResponse(response, code);
         }
 
         if (response.status === 'error') {

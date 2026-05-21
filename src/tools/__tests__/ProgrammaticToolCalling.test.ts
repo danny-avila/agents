@@ -40,9 +40,11 @@ describe('ProgrammaticToolCalling', () => {
       const schema = createBashProgrammaticToolCallingSchema();
       const description = schema.properties.code.description;
 
-      expect(description).toContain('Tool stdout is JSON');
-      expect(description).toContain('not raw text');
-      expect(description).toContain('use jq -r . for strings');
+      expect(description).toContain('parsing saved tool stdout with jq');
+      expect(description).toContain('jq -r \'fromjson? // . | ...\'');
+      expect(description).toContain('stringified-JSON results');
+      expect(description).toContain('/mnt/data/sf.json');
+      expect(description).toContain('not later-call storage');
     });
   });
 
@@ -676,6 +678,25 @@ for member in team:
 
       expect(output).toContain('stdout:\nOutput');
       expect(output).toContain('stderr:\nWarning: deprecated function');
+    });
+
+    it('adds a /tmp scratch reminder when source code used /tmp', () => {
+      const response: t.ProgrammaticExecutionResponse = {
+        status: 'completed',
+        stdout: 'done\n',
+        stderr: '',
+        files: [],
+        session_id: 'sess_abc123',
+      };
+
+      const [output] = formatCompletedResponse(
+        response,
+        'tool "{}" > /tmp/result.json'
+      );
+
+      expect(output).toContain('stdout:\ndone');
+      expect(output).toContain('/tmp files are same-call scratch only');
+      expect(output).toContain('use /mnt/data for files needed later');
     });
 
     it('preserves files on the artifact and summarizes them without listing paths', () => {

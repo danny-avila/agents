@@ -21,6 +21,7 @@ describe('buildBashExecutionToolDescription', () => {
   it('warns about compact bash shell pitfalls', () => {
     expect(BashExecutionToolDescription).toContain('heredoc/printf');
     expect(BashExecutionToolDescription).toContain('not bare Python');
+    expect(BashExecutionToolDescription).toContain('not later-call storage');
   });
 
   it('appends the tool-output references guide when enabled', () => {
