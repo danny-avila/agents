@@ -344,6 +344,38 @@ describe('CodeAPI auth header injection', () => {
     );
   });
 
+  it('reminds that failed bash programmatic executions do not register new files', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        status: 'error',
+        error: 'jq failed',
+        stderr: 'jq: Cannot index string with string "name"',
+      })
+    );
+    const tool = createBashProgrammaticToolCallingTool();
+
+    await expect(
+      tool.invoke(
+        {
+          code: [
+            'lookup_user "{}" > /mnt/data/user.json',
+            'jq -r \'.result.name\' /mnt/data/user.json',
+          ].join('\n'),
+        },
+        {
+          toolCall: {
+            name: 'bash_programmatic_code_execution',
+            args: {},
+            toolMap: toolMap(),
+            toolDefs,
+          },
+        }
+      )
+    ).rejects.toThrow(
+      'files written during this failed call were not registered for later calls'
+    );
+  });
+
   it('fetches session files with the CodeAPI resource scope and auth headers', async () => {
     fetchMock.mockResolvedValueOnce(
       jsonResponse([

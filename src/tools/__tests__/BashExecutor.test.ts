@@ -21,6 +21,9 @@ describe('buildBashExecutionToolDescription', () => {
   it('warns about compact bash shell pitfalls', () => {
     expect(BashExecutionToolDescription).toContain('heredoc/printf');
     expect(BashExecutionToolDescription).toContain('not bare Python');
+    expect(BashExecutionToolDescription).toContain(
+      'failed executions do not register new files'
+    );
     expect(BashExecutionToolDescription).toContain('not later-call storage');
   });
 

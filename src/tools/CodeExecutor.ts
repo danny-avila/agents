@@ -22,21 +22,38 @@ export const emptyOutputMessage =
   'stdout: Empty. Ensure you\'re writing output explicitly.\n';
 
 export const CODE_ARTIFACT_PATH_GUIDANCE =
-  'Persist handoff artifacts in `/mnt/data` with standard extensions (.json/.txt/.csv/.tsv/.log/.parquet/.png/.jpg/.pdf/.xlsx); `/tmp` and odd extensions are same-call scratch only, not later-call storage.';
+  'Persist handoff artifacts in `/mnt/data` with standard extensions (.json/.txt/.csv/.tsv/.log/.parquet/.png/.jpg/.pdf/.xlsx); failed executions do not register new files; `/tmp` and odd extensions are same-call scratch only, not later-call storage.';
 
 export const BASH_SHELL_GUIDANCE =
   'Bash: multi-line files use heredoc/printf; run Python via python3 -c/heredoc, not bare Python.';
 
 const TMP_PATH_PATTERN = /(^|[^A-Za-z0-9_])\/tmp(?:\/|\b)/;
+const MNT_DATA_PATH_PATTERN = /(^|[^A-Za-z0-9_])\/mnt\/data(?:\/|\b)/;
 
 export const TMP_SCRATCH_OUTPUT_REMINDER =
   'Note: /tmp files are same-call scratch only and were not persisted; use /mnt/data for files needed later.';
+
+export const FAILED_EXECUTION_FILE_REMINDER =
+  'Note: any files written during this failed call were not registered for later calls; fix the error and rerun before relying on them.';
 
 export function appendTmpScratchReminder(output: string, code: string): string {
   if (!TMP_PATH_PATTERN.test(code)) {
     return output;
   }
   return `${output.trimEnd()}\n${TMP_SCRATCH_OUTPUT_REMINDER}\n`;
+}
+
+export function appendFailedExecutionFileReminder(
+  output: string,
+  code: string
+): string {
+  if (
+    !MNT_DATA_PATH_PATTERN.test(code) ||
+    output.includes(FAILED_EXECUTION_FILE_REMINDER)
+  ) {
+    return output;
+  }
+  return `${output.trimEnd()}\n${FAILED_EXECUTION_FILE_REMINDER}\n`;
 }
 
 const SUPPORTED_LANGUAGES = [
@@ -234,8 +251,12 @@ function createCodeExecutionTool(
             }) satisfies t.CodeExecutionArtifact,
         ];
       } catch (error) {
+        const messageWithReminder = appendFailedExecutionFileReminder(
+          (error as Error | undefined)?.message ?? '',
+          code
+        );
         throw new Error(
-          `Execution error:\n\n${(error as Error | undefined)?.message}`
+          `Execution error:\n\n${messageWithReminder}`
         );
       }
     },
