@@ -50,7 +50,7 @@ type GoogleFunctionCallBlock = MessageContentComplex & {
 
 const ANTHROPIC_EMPTY_TEXT_PLACEHOLDER = '_';
 const CLAUDE_4_MINOR_MODEL_PATTERN =
-  /claude-(?:opus|sonnet|haiku)-4[-.](\d)(?:[-.]|$)/i;
+  /claude-(?:opus|sonnet|haiku)-4[-.](\d)(?:[-.@]|$)/i;
 
 function _formatImage(imageUrl: string) {
   const parsed = parseBase64DataUrl({ dataUrl: imageUrl });

@@ -2644,6 +2644,7 @@ describe('Anthropic Reasoning with contentBlocks', () => {
 describe('Claude assistant prefill compatibility', () => {
   test.each([
     'claude-sonnet-4-6',
+    'claude-sonnet-4-6@20260217',
     'claude-opus-4-7',
     'global.anthropic.claude-opus-4-6-v1:0',
     'anthropic/claude-sonnet-4.6',
