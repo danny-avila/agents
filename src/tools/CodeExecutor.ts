@@ -4,7 +4,13 @@ import { HttpsProxyAgent } from 'https-proxy-agent';
 import { tool, DynamicStructuredTool } from '@langchain/core/tools';
 import { getEnvironmentVariable } from '@langchain/core/utils/env';
 import type * as t from '@/types';
+import { appendCodeSessionFileSummary } from '@/tools/CodeSessionFileSummary';
 import { EnvVar, Constants } from '@/common';
+
+export {
+  appendCodeSessionFileSummary,
+  stripCodeSessionFileSummary,
+} from '@/tools/CodeSessionFileSummary';
 
 config();
 
@@ -14,6 +20,12 @@ export const getCodeBaseURL = (): string =>
 
 export const emptyOutputMessage =
   'stdout: Empty. Ensure you\'re writing output explicitly.\n';
+
+export const CODE_ARTIFACT_PATH_GUIDANCE =
+  'Persist artifacts in `/mnt/data` with standard extensions (.json/.txt/.csv/.tsv/.log/.parquet/.png/.jpg/.pdf/.xlsx); `/tmp` and odd extensions are same-call scratch.';
+
+export const BASH_SHELL_GUIDANCE =
+  'Bash: multi-line files use heredoc/printf; run Python via python3 -c/heredoc, not bare Python.';
 
 const SUPPORTED_LANGUAGES = [
   'py',
@@ -44,8 +56,8 @@ export const CodeExecutionToolSchema = {
       type: 'string',
       description: `The complete, self-contained code to execute, without any truncation or minimization.
 - The environment is stateless; variables and imports don't persist between executions.
-- Generated files from previous executions are automatically available in "/mnt/data/".
-- Files from previous executions are automatically available and can be modified in place.
+- Prior /mnt/data files are available and can be modified in place.
+- ${CODE_ARTIFACT_PATH_GUIDANCE}
 - Input code **IS ALREADY** displayed to the user, so **DO NOT** repeat it in your response unless asked.
 - Output code **IS NOT** displayed to the user, so **DO** write all desired output explicitly.
 - IMPORTANT: You MUST explicitly print/output ALL results you want the user to see.
@@ -104,6 +116,7 @@ Runs code and returns stdout/stderr output from a stateless execution environmen
 Usage:
 - No network access available.
 - Generated files are automatically delivered; **DO NOT** provide download links.
+- ${CODE_ARTIFACT_PATH_GUIDANCE}
 - NEVER use this tool to execute malicious code.
 `.trim();
 
@@ -116,7 +129,7 @@ export const CodeExecutionToolDefinition = {
 } as const;
 
 function createCodeExecutionTool(
-  params: t.CodeExecutionToolParams = {}
+  params: t.CodeExecutionToolParams | null = {}
 ): DynamicStructuredTool {
   return tool(
     async (rawInput, config) => {
@@ -187,13 +200,6 @@ function createCodeExecutionTool(
         }
 
         const result: t.ExecuteResult = await response.json();
-        /* Output is stdout/stderr only — file listings were removed
-         * because the LLM-facing summary (split inherited/generated
-         * with prescriptive notes) caused more confusion than help,
-         * especially for bash where models naturally explore
-         * `/mnt/data/` themselves. The artifact still carries every
-         * file so the host's session map stays in sync; the LLM
-         * doesn't see them in the tool result text. */
         let formattedOutput = '';
         if (result.stdout) {
           formattedOutput += `stdout:\n${result.stdout}\n`;
@@ -204,7 +210,7 @@ function createCodeExecutionTool(
 
         const hasFiles = result.files != null && result.files.length > 0;
         return [
-          formattedOutput.trim(),
+          appendCodeSessionFileSummary(formattedOutput, result.files),
           (hasFiles
             ? { session_id: result.session_id, files: result.files }
             : {

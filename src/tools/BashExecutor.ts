@@ -4,6 +4,9 @@ import { HttpsProxyAgent } from 'https-proxy-agent';
 import { tool, DynamicStructuredTool } from '@langchain/core/tools';
 import type * as t from '@/types';
 import {
+  BASH_SHELL_GUIDANCE,
+  CODE_ARTIFACT_PATH_GUIDANCE,
+  appendCodeSessionFileSummary,
   emptyOutputMessage,
   buildCodeApiHttpErrorMessage,
   getCodeBaseURL,
@@ -23,8 +26,9 @@ export const BashExecutionToolSchema = {
       type: 'string',
       description: `The bash command or script to execute.
 - The environment is stateless; variables and state don't persist between executions.
-- Generated files from previous executions are automatically available in "/mnt/data/".
-- Files from previous executions are automatically available and can be modified in place.
+- Prior /mnt/data files are available and can be modified in place.
+- ${CODE_ARTIFACT_PATH_GUIDANCE}
+- ${BASH_SHELL_GUIDANCE}
 - Input code **IS ALREADY** displayed to the user, so **DO NOT** repeat it in your response unless asked.
 - Output code **IS NOT** displayed to the user, so **DO** write all desired output explicitly.
 - IMPORTANT: You MUST explicitly print/output ALL results you want the user to see.
@@ -46,6 +50,8 @@ Runs bash commands and returns stdout/stderr output from a stateless execution e
 Usage:
 - No network access available.
 - Generated files are automatically delivered; **DO NOT** provide download links.
+- ${CODE_ARTIFACT_PATH_GUIDANCE}
+- ${BASH_SHELL_GUIDANCE}
 - NEVER use this tool to execute malicious commands.
 `.trim();
 
@@ -166,11 +172,6 @@ function createBashExecutionTool(
         }
 
         const result: t.ExecuteResult = await response.json();
-        /* See `CodeExecutor.ts` — file listings were removed from the
-         * LLM-facing tool result. Bash especially benefits: models
-         * naturally `ls /mnt/data/` to discover what's available
-         * rather than relying on a prescriptive summary that
-         * misleads as often as it helps. */
         let formattedOutput = '';
         if (result.stdout) {
           formattedOutput += `stdout:\n${result.stdout}\n`;
@@ -181,7 +182,7 @@ function createBashExecutionTool(
 
         const hasFiles = result.files != null && result.files.length > 0;
         return [
-          formattedOutput.trim(),
+          appendCodeSessionFileSummary(formattedOutput, result.files),
           (hasFiles
             ? { session_id: result.session_id, files: result.files }
             : {

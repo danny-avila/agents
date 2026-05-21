@@ -204,6 +204,58 @@ describe('ToolNode tool output references', () => {
       expect(capturedArgs).toEqual(['first', 'echo raw-payload']);
     });
 
+    it('keeps generated-file summaries out of registered outputs', async () => {
+      const rawOutput = [
+        'stdout:',
+        '{"ok":true}',
+        '',
+        'Generated files:',
+        'Session files: 1 persisted file(s) are available in /mnt/data, including 0 image(s). Use known /mnt/data paths directly in later code-tool calls. The app displays files/images automatically; do not invent download links or wrap generated images in Markdown.',
+      ].join('\n');
+      const cleanOutput = 'stdout:\n{"ok":true}';
+      const capturedArgs: string[] = [];
+      const filesTool = tool(
+        async () =>
+          new ToolMessage({
+            status: 'success',
+            content: rawOutput,
+            name: 'files',
+            tool_call_id: 'c1',
+          }),
+        {
+          name: 'files',
+          description: 'returns generated-file summary output',
+          schema: z.object({ command: z.string() }),
+        }
+      ) as unknown as StructuredToolInterface;
+      const echo = createEchoTool({
+        capturedArgs,
+        outputs: ['resolved'],
+      });
+      const node = new ToolNode({
+        tools: [filesTool, echo],
+        toolOutputReferences: { enabled: true },
+      });
+
+      const [msg] = await invokeBatch(node, [
+        { id: 'c1', name: 'files', command: 'first' },
+      ]);
+      await invokeBatch(node, [
+        {
+          id: 'c2',
+          name: 'echo',
+          command: 'echo {{tool0turn0}}',
+        },
+      ]);
+
+      expect(msg.content).toBe(rawOutput);
+      expect(getRefKey(msg)).toBe('tool0turn0');
+      expect(
+        node._unsafeGetToolOutputRegistry()!.get('test-run', 'tool0turn0')
+      ).toBe(cleanOutput);
+      expect(capturedArgs).toEqual([`echo ${cleanOutput}`]);
+    });
+
     it('increments the turn counter per ToolNode batch', async () => {
       const capturedArgs: string[] = [];
       const t1 = createEchoTool({

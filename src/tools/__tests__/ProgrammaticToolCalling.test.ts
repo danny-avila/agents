@@ -8,6 +8,7 @@ import type * as t from '@/types';
 import { Constants } from '@/common';
 import {
   createProgrammaticToolCallingTool,
+  createProgrammaticToolCallingSchema,
   formatCompletedResponse,
   extractUsedToolNames,
   filterToolsByUsage,
@@ -15,6 +16,7 @@ import {
   normalizeToPythonIdentifier,
   unwrapToolResponse,
 } from '../ProgrammaticToolCalling';
+import { createBashProgrammaticToolCallingSchema } from '../BashProgrammaticToolCalling';
 import {
   createProgrammaticToolRegistry,
   createGetTeamMembersTool,
@@ -24,6 +26,26 @@ import {
 } from '@/test/mockTools';
 
 describe('ProgrammaticToolCalling', () => {
+  describe('tool descriptions', () => {
+    it('explains Python inner-tool call and result shape', () => {
+      const schema = createProgrammaticToolCallingSchema();
+      const description = schema.properties.code.description;
+
+      expect(description).toContain('keyword args only');
+      expect(description).toContain('never pass a dict');
+      expect(description).toContain('Tool results are decoded Python values');
+    });
+
+    it('explains bash inner-tool stdout shape', () => {
+      const schema = createBashProgrammaticToolCallingSchema();
+      const description = schema.properties.code.description;
+
+      expect(description).toContain('Tool stdout is JSON');
+      expect(description).toContain('not raw text');
+      expect(description).toContain('use jq -r . for strings');
+    });
+  });
+
   describe('executeTools', () => {
     let toolMap: t.ToolMap;
 
@@ -656,13 +678,7 @@ for member in team:
       expect(output).toContain('stderr:\nWarning: deprecated function');
     });
 
-    it('preserves files on the artifact but omits them from the LLM-facing output', () => {
-      /* The post-execution file summary was removed because it
-       * misled the model more than it helped — especially with
-       * bash, where models naturally `ls /mnt/data/` to discover
-       * available files. The artifact still carries every file
-       * so the host's session-tracking layer stays in sync;
-       * the LLM just doesn't see the prescriptive listing. */
+    it('preserves files on the artifact and summarizes them without listing paths', () => {
       const response: t.ProgrammaticExecutionResponse = {
         status: 'completed',
         stdout: 'Generated report\n',
@@ -677,9 +693,12 @@ for member in team:
 
       const [output, artifact] = formatCompletedResponse(response);
 
-      /* Tool result text is stdout/stderr only. */
       expect(output).toContain('stdout:\nGenerated report');
-      expect(output).not.toContain('Generated files:');
+      expect(output).toContain('Generated files:');
+      expect(output).toContain(
+        'Session files: 2 persisted file(s) are available in /mnt/data, including 0 image(s).'
+      );
+      expect(output).toContain('do not invent download links');
       expect(output).not.toContain('Available files');
       expect(output).not.toContain('report.pdf');
       expect(output).not.toContain('SKILL.md');
@@ -689,6 +708,25 @@ for member in team:
       /* Host-facing artifact still has every file with its
        * `inherited` flag intact for session-context merging. */
       expect(artifact.files).toHaveLength(3);
+      expect(artifact.files).toEqual(response.files);
+    });
+
+    it('omits the generated-file summary for inherited-only files', () => {
+      const response: t.ProgrammaticExecutionResponse = {
+        status: 'completed',
+        stdout: 'No new files\n',
+        stderr: '',
+        files: [
+          { id: 'i1', name: 'skills/SKILL.md', inherited: true },
+          { id: 'i2', name: 'inputs/source.csv', inherited: true },
+        ],
+        session_id: 'sess_abc123',
+      };
+
+      const [output, artifact] = formatCompletedResponse(response);
+
+      expect(output).toBe('stdout:\nNo new files');
+      expect(output).not.toContain('Generated files:');
       expect(artifact.files).toEqual(response.files);
     });
   });
@@ -889,11 +927,7 @@ for member in team:
       });
     });
 
-    it('passes files through on the artifact, never on the LLM-facing output', () => {
-      /* Output stays stdout/stderr-only regardless of file count or
-       * filename shape. The artifact is the sole sink for file refs;
-       * hosts thread them into `_injected_files` on subsequent
-       * tool calls via `storeCodeSessionFromResults`. */
+    it('summarizes files in output while keeping exact refs on the artifact', () => {
       const response: t.ProgrammaticExecutionResponse = {
         status: 'completed',
         stdout: 'Report generated\n',
@@ -909,12 +943,36 @@ for member in team:
 
       const [output, artifact] = formatCompletedResponse(response);
 
-      expect(output).toBe('stdout:\nReport generated');
+      expect(output).toContain('stdout:\nReport generated');
+      expect(output).toContain(
+        'Session files: 4 persisted file(s) are available in /mnt/data, including 1 image(s).'
+      );
       expect(output).not.toContain('report.csv');
       expect(output).not.toContain('chart.png');
-      expect(output).not.toContain('/mnt/data/');
 
       expect(artifact.files).toHaveLength(4);
+      expect(artifact.files).toEqual(response.files);
+    });
+
+    it('treats malformed file refs as non-image files', () => {
+      const malformedFile = { id: 'broken' } as t.FileRef;
+      const response: t.ProgrammaticExecutionResponse = {
+        status: 'completed',
+        stdout: 'Report generated\n',
+        stderr: '',
+        files: [
+          { id: '1', name: 'chart.png' },
+          malformedFile,
+          { id: '3', name: 'inherited.png', inherited: true },
+        ],
+        session_id: 'sess_xyz',
+      };
+
+      const [output, artifact] = formatCompletedResponse(response);
+
+      expect(output).toContain(
+        'Session files: 2 persisted file(s) are available in /mnt/data, including 1 image(s).'
+      );
       expect(artifact.files).toEqual(response.files);
     });
   });

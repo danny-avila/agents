@@ -46,6 +46,7 @@ import {
   buildReferenceKey,
   ToolOutputReferenceRegistry,
 } from '@/tools/toolOutputReferences';
+import { stripCodeSessionFileSummary } from '@/tools/CodeSessionFileSummary';
 import {
   resolveLocalToolRegistry,
   resolveLocalExecutionTools,
@@ -911,8 +912,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
        * Both session_id and _injected_files are injected directly to invokeParams
        * (not inside args) so they bypass Zod schema validation and reach config.toolCall.
        *
-       * session_id is always injected when available (even without tracked files)
-       * so the CodeExecutor can fall back to the /files endpoint for session continuity.
+       * session_id is always injected when available, but concrete file refs
+       * still need to travel through `_injected_files`; the legacy
+       * `/files/<session_id>` fallback was removed from the executors.
        */
       if (CODE_EXECUTION_TOOLS.has(call.name)) {
         const codeSession = this.sessions?.get(Constants.EXECUTE_CODE) as
@@ -959,6 +961,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         if (this.toolOutputRegistry != null || unresolvedRefs.length > 0) {
           if (typeof toolMsg.content === 'string') {
             const rawContent = toolMsg.content;
+            const registryContent = stripCodeSessionFileSummary(rawContent);
             const llmContent = truncateToolResultContent(
               rawContent,
               this.maxToolResultChars
@@ -966,7 +969,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             toolMsg.content = llmContent;
             const refMeta = this.recordOutputReference(
               runId,
-              rawContent,
+              registryContent,
               refKey,
               unresolvedRefs
             );
@@ -1015,7 +1018,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       );
       const refMeta = this.recordOutputReference(
         runId,
-        rawContent,
+        stripCodeSessionFileSummary(rawContent),
         refKey,
         unresolvedRefs
       );
@@ -2661,7 +2664,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               : undefined;
           const successRefMeta = this.recordOutputReference(
             registryRunId,
-            registryRaw,
+            stripCodeSessionFileSummary(registryRaw),
             refKey,
             unresolved
           );

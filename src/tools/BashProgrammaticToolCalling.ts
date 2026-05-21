@@ -8,7 +8,11 @@ import {
   executeTools,
   formatCompletedResponse,
 } from './ProgrammaticToolCalling';
-import { getCodeBaseURL } from './CodeExecutor';
+import {
+  BASH_SHELL_GUIDANCE,
+  CODE_ARTIFACT_PATH_GUIDANCE,
+  getCodeBaseURL,
+} from './CodeExecutor';
 import {
   clampCodeApiRunTimeoutMs,
   createCodeApiRunTimeoutSchema,
@@ -62,11 +66,13 @@ You MUST complete your entire workflow in ONE code block.
 DO NOT split work across multiple calls expecting to reuse variables.`;
 
 const CORE_RULES = `Rules:
-- EVERYTHING in one call—no state persists between executions
+- One call: state does not persist
 - Tools are pre-defined as bash functions—DO NOT redefine them
 - Each tool function accepts a JSON string argument
+- Tool stdout is JSON, not raw text; use jq -r . for strings, jq -r .field for objects
 - Only echo/printf output returns to the model
-- Generated files are automatically available in /mnt/data/ for subsequent executions
+- ${CODE_ARTIFACT_PATH_GUIDANCE}
+- ${BASH_SHELL_GUIDANCE}
 - timeout caps one sandbox run/replay iteration, not the total multi-round-trip workflow`;
 
 const ADDITIONAL_RULES =
