@@ -142,6 +142,13 @@ type ForwarderCallback = {
   drain: () => Promise<void>;
 };
 
+const LANGGRAPH_RUNTIME_CONFIG_PREFIX = '__pregel_';
+const LANGGRAPH_CHECKPOINT_CONFIG_KEYS = new Set([
+  'checkpoint_id',
+  'checkpoint_map',
+  'checkpoint_ns',
+]);
+
 export type SubagentExecuteParams = {
   description: string;
   subagentType: string;
@@ -154,11 +161,13 @@ export type SubagentExecuteParams = {
    */
   parentToolCallId?: string;
   /**
-   * Snapshot of the parent invocation's `config.configurable` at the
-   * spawn-tool call site. Inherited verbatim into the child workflow's
-   * `configurable` so host-set fields (`requestBody`, `user`,
-   * `userMCPAuthMap`, etc.) propagate — fixing MCP body-placeholder
-   * substitution and per-user lookups for subagent tool calls.
+   * Snapshot of the parent invocation's host `config.configurable` at
+   * the spawn-tool call site. Host-set fields (`requestBody`, `user`,
+   * `userMCPAuthMap`, etc.) propagate into the child workflow's
+   * `configurable` — fixing MCP body-placeholder substitution and
+   * per-user lookups for subagent tool calls. LangGraph runtime keys
+   * (`__pregel_*`, checkpoint bookkeeping) are intentionally not
+   * inherited; the child graph recreates its own runtime config.
    *
    * Inheritance details (verified empirically against LangGraph):
    *   - host-set keys propagate as-is into the child's tool dispatches;
@@ -390,10 +399,11 @@ export class SubagentExecutor {
        */
       const callbacks: Callbacks = forwarder ? [forwarder] : [];
       /**
-       * Inherit the parent's `configurable` verbatim — host-set fields
+       * Inherit the parent's host `configurable` — host-set fields
        * (`requestBody`, `user`, `userMCPAuthMap`, etc.) AND the run-
        * identity fields (`run_id`, `parent_run_id`, `thread_id`) all
-       * propagate.
+       * propagate. LangGraph's own runtime keys are excluded because the
+       * child graph creates its own scratchpad/checkpoint/abort plumbing.
        *
        * Run-identity propagation is intentional and matches the
        * convention this executor itself already uses for `SubagentStart`
@@ -418,7 +428,7 @@ export class SubagentExecutor {
        * case (synchronous subagents within a single user turn).
        */
       const inheritedConfigurable: Record<string, unknown> =
-        params.parentConfigurable ?? {};
+        sanitizeChildConfigurable(params.parentConfigurable);
       result = await workflow.invoke(
         { messages: [new HumanMessage(description)] },
         {
@@ -702,6 +712,26 @@ export class SubagentExecutor {
     handler.awaitHandlers = true;
     return { handler, drain };
   }
+}
+
+function sanitizeChildConfigurable(
+  parentConfigurable: Record<string, unknown> | undefined
+): Record<string, unknown> {
+  if (parentConfigurable == null) {
+    return {};
+  }
+  return Object.fromEntries(
+    Object.entries(parentConfigurable).filter(
+      ([key]) => !isLangGraphRuntimeConfigKey(key)
+    )
+  );
+}
+
+function isLangGraphRuntimeConfigKey(key: string): boolean {
+  return (
+    key.startsWith(LANGGRAPH_RUNTIME_CONFIG_PREFIX) ||
+    LANGGRAPH_CHECKPOINT_CONFIG_KEYS.has(key)
+  );
 }
 
 export function sanitizeForwardedSubagentUpdateData(

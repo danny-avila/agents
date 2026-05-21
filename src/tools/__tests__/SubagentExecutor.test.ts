@@ -685,6 +685,41 @@ describe('SubagentExecutor', () => {
       expect(configurable.requestBody).toEqual({ messageId: 'msg-1' });
     });
 
+    it('strips LangGraph runtime fields from child workflow.invoke configurable', async () => {
+      const { factory, getInvokeConfig } = makeCapturingGraphFactory();
+      const executor = createExecutor({ createChildGraph: factory });
+
+      await executor.execute({
+        description: 'task',
+        subagentType: 'researcher',
+        parentConfigurable: {
+          __pregel_abort_signals: { externalAbortSignal: 'parent-signal' },
+          __pregel_call: (): void => undefined,
+          __pregel_scratchpad: { currentTaskInput: 'large-payload' },
+          checkpoint_id: 'parent-checkpoint-id',
+          checkpoint_map: { parent: 'checkpoint' },
+          checkpoint_ns: 'parent-checkpoint-ns',
+          requestBody: { messageId: 'msg-1' },
+          thread_id: 'parent-thread',
+          user: { id: 'user_abc' },
+        },
+      });
+
+      const configurable = getInvokeConfig()!.configurable as Record<
+        string,
+        unknown
+      >;
+      expect(configurable.__pregel_abort_signals).toBeUndefined();
+      expect(configurable.__pregel_call).toBeUndefined();
+      expect(configurable.__pregel_scratchpad).toBeUndefined();
+      expect(configurable.checkpoint_id).toBeUndefined();
+      expect(configurable.checkpoint_map).toBeUndefined();
+      expect(configurable.checkpoint_ns).toBeUndefined();
+      expect(configurable.requestBody).toEqual({ messageId: 'msg-1' });
+      expect(configurable.thread_id).toBe('parent-thread');
+      expect(configurable.user).toEqual({ id: 'user_abc' });
+    });
+
     it('does not require parentConfigurable (back-compat with hosts that omit it)', async () => {
       const { factory, getInvokeConfig } = makeCapturingGraphFactory();
       const executor = createExecutor({ createChildGraph: factory });
