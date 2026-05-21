@@ -49,6 +49,10 @@ type GoogleFunctionCallBlock = MessageContentComplex & {
 };
 
 const ANTHROPIC_EMPTY_TEXT_PLACEHOLDER = '_';
+const CLAUDE_4_RELEASE_DATE_MODEL_PATTERN =
+  /claude-(?:opus|sonnet|haiku)-4-\d{8}(?:[-.@]|$)/i;
+const CLAUDE_4_MINOR_MODEL_PATTERN =
+  /claude-(?:opus|sonnet|haiku)-4[-.](\d+)(?:[-.@]|$)/i;
 
 function _formatImage(imageUrl: string) {
   const parsed = parseBase64DataUrl({ dataUrl: imageUrl });
@@ -794,6 +798,48 @@ export function _convertMessagesToAnthropicPayload(
     messages: mergeMessages(formattedMessages),
     system,
   } as AnthropicMessageCreateParams;
+}
+
+export function modelDisallowsAssistantPrefill(model?: string): boolean {
+  const modelId = model ?? '';
+  if (CLAUDE_4_RELEASE_DATE_MODEL_PATTERN.test(modelId)) {
+    return false;
+  }
+
+  const match = CLAUDE_4_MINOR_MODEL_PATTERN.exec(modelId);
+  if (!match) {
+    return false;
+  }
+  return Number(match[1]) >= 6;
+}
+
+export function stripUnsupportedAssistantPrefill<
+  T extends Pick<AnthropicMessageCreateParams, 'messages'> & { model?: string },
+>(request: T): T {
+  if (!modelDisallowsAssistantPrefill(request.model)) {
+    return request;
+  }
+
+  const messages = request.messages;
+  if (
+    messages.length <= 1 ||
+    messages[messages.length - 1]?.role !== 'assistant'
+  ) {
+    return request;
+  }
+
+  const nextMessages = [...messages];
+  while (
+    nextMessages.length > 1 &&
+    nextMessages[nextMessages.length - 1]?.role === 'assistant'
+  ) {
+    nextMessages.pop();
+  }
+
+  return {
+    ...request,
+    messages: nextMessages,
+  };
 }
 
 function mergeMessages(messages: AnthropicMessageCreateParams['messages']) {
