@@ -5,18 +5,25 @@ import type { BaseMessage } from '@langchain/core/messages';
 import type { Callbacks } from '@langchain/core/callbacks/manager';
 import type {
   AgentInputs,
+  MessageDeltaEvent,
+  ProcessedToolCall,
+  ReasoningDeltaEvent,
+  RunStep,
+  RunStepDeltaEvent,
   StandardGraphInput,
   ResolvedSubagentConfig,
+  StepCompleted,
   SubagentConfig,
   SubagentUpdateEvent,
   SubagentUpdatePhase,
   ToolExecuteBatchRequest,
+  ToolCallDelta,
   TokenCounter,
 } from '@/types';
 import type { AggregatedHookResult, HookRegistry } from '@/hooks';
 import type { AgentContext } from '@/agents/AgentContext';
 import type { StandardGraph } from '@/graphs/Graph';
-import { GraphEvents, Callback } from '@/common';
+import { GraphEvents, Callback, StepTypes } from '@/common';
 import type { HandlerRegistry } from '@/events';
 import { executeHooks } from '@/hooks';
 
@@ -24,30 +31,6 @@ const DEFAULT_MAX_TURNS = 25;
 const RECURSION_MULTIPLIER = 3;
 const ERROR_MESSAGE_MAX_CHARS = 200;
 const MAX_PENDING_SUBAGENT_UPDATES = 64;
-const SUBAGENT_UPDATE_OMITTED_KEYS = new Set([
-  'Authorization',
-  'access_token',
-  'accessToken',
-  'authorization',
-  'checkpoint',
-  'checkpointMap',
-  'configurable',
-  'currentTaskInput',
-  'federatedTokens',
-  'id_token',
-  'idToken',
-  'metadata',
-  'refreshToken',
-  'refresh_token',
-  'reject',
-  'requestBody',
-  'resolve',
-  'scratchpad',
-  'user',
-  'userId',
-  'userMCPAuthMap',
-  'user_id',
-]);
 
 const HOOK_FALLBACK: AggregatedHookResult = Object.freeze({
   additionalContexts: [] as string[],
@@ -65,8 +48,87 @@ type SanitizedSubagentToolExecuteData = {
   agentId?: string;
 };
 
-type ShallowSanitizedUpdateData = {
-  [key: string]: unknown;
+type SanitizedRunStep = Partial<
+  Pick<
+    RunStep,
+    | 'agentId'
+    | 'groupId'
+    | 'id'
+    | 'index'
+    | 'runId'
+    | 'stepIndex'
+    | 'summary'
+    | 'type'
+    | 'usage'
+  >
+> & {
+  stepDetails?: SanitizedStepDetails;
+};
+
+type SanitizedStepDetails =
+  | {
+      type: StepTypes.MESSAGE_CREATION;
+      message_creation?: {
+        message_id?: string;
+      };
+    }
+  | {
+      type: StepTypes.TOOL_CALLS;
+      tool_calls?: SanitizedAgentToolCall[];
+    };
+
+type SanitizedAgentToolCall = {
+  id?: string;
+  name?: string;
+  args?: string | object;
+  type?: string;
+  function?: {
+    name?: string;
+    arguments?: string | object;
+  };
+};
+
+type SanitizedRunStepDelta = Partial<Pick<RunStepDeltaEvent, 'id'>> & {
+  delta?: SanitizedToolCallDelta;
+};
+
+type SanitizedToolCallDelta = Partial<
+  Pick<ToolCallDelta, 'auth' | 'expires_at' | 'summary' | 'type'>
+> & {
+  tool_calls?: SanitizedAgentToolCall[];
+};
+
+type SanitizedStepCompleted =
+  | {
+      id?: string;
+      index?: number;
+      type: 'tool_call';
+      tool_call?: SanitizedProcessedToolCall;
+    }
+  | {
+      type: 'summary';
+      summary?: Extract<StepCompleted, { type: 'summary' }>['summary'];
+    };
+
+type SanitizedProcessedToolCall = Partial<
+  Pick<ProcessedToolCall, 'args' | 'id' | 'name' | 'output' | 'progress'>
+>;
+
+type SanitizedRunStepCompleted = {
+  result?: SanitizedStepCompleted;
+};
+
+type SanitizedMessageDelta = Partial<Pick<MessageDeltaEvent, 'id'>> & {
+  delta?: {
+    content?: MessageDeltaEvent['delta']['content'];
+    tool_call_ids?: MessageDeltaEvent['delta']['tool_call_ids'];
+  };
+};
+
+type SanitizedReasoningDelta = Partial<Pick<ReasoningDeltaEvent, 'id'>> & {
+  delta?: {
+    content?: ReasoningDeltaEvent['delta']['content'];
+  };
 };
 
 type QueuedSubagentUpdate = {
@@ -645,10 +707,22 @@ export function sanitizeForwardedSubagentUpdateData(
   if (eventName === GraphEvents.ON_TOOL_EXECUTE) {
     return sanitizeToolExecuteUpdateData(data);
   }
-  if (data == null || typeof data !== 'object' || Array.isArray(data)) {
-    return data;
+  if (eventName === GraphEvents.ON_RUN_STEP) {
+    return sanitizeRunStepUpdateData(data);
   }
-  return omitOperationalUpdateFields(data);
+  if (eventName === GraphEvents.ON_RUN_STEP_DELTA) {
+    return sanitizeRunStepDeltaUpdateData(data);
+  }
+  if (eventName === GraphEvents.ON_RUN_STEP_COMPLETED) {
+    return sanitizeRunStepCompletedUpdateData(data);
+  }
+  if (eventName === GraphEvents.ON_MESSAGE_DELTA) {
+    return sanitizeMessageDeltaUpdateData(data);
+  }
+  if (eventName === GraphEvents.ON_REASONING_DELTA) {
+    return sanitizeReasoningDeltaUpdateData(data);
+  }
+  return undefined;
 }
 
 function isDroppableSubagentUpdatePhase(phase: SubagentUpdatePhase): boolean {
@@ -684,18 +758,229 @@ function sanitizeToolCallForUpdate(
   return sanitized;
 }
 
-function omitOperationalUpdateFields(data: object): ShallowSanitizedUpdateData {
-  const sanitized: ShallowSanitizedUpdateData = {};
-  for (const [key, value] of Object.entries(data)) {
-    if (
-      SUBAGENT_UPDATE_OMITTED_KEYS.has(key) ||
-      typeof value === 'function'
-    ) {
-      continue;
+function sanitizeRunStepUpdateData(data: unknown): SanitizedRunStep | undefined {
+  if (!isObjectLike(data)) {
+    return undefined;
+  }
+  const step = data as Partial<RunStep>;
+  const sanitized: SanitizedRunStep = {};
+  assignString(sanitized, 'agentId', step.agentId);
+  assignNumber(sanitized, 'groupId', step.groupId);
+  assignString(sanitized, 'id', step.id);
+  assignNumber(sanitized, 'index', step.index);
+  assignString(sanitized, 'runId', step.runId);
+  assignNumber(sanitized, 'stepIndex', step.stepIndex);
+  assignString(sanitized, 'type', step.type);
+  if (step.summary !== undefined) {
+    sanitized.summary = step.summary;
+  }
+  if (step.usage !== undefined) {
+    sanitized.usage = step.usage;
+  }
+  sanitized.stepDetails = sanitizeStepDetails(step.stepDetails);
+  return sanitized;
+}
+
+function sanitizeRunStepDeltaUpdateData(
+  data: unknown
+): SanitizedRunStepDelta | undefined {
+  if (!isObjectLike(data)) {
+    return undefined;
+  }
+  const event = data as Partial<RunStepDeltaEvent>;
+  const sanitized: SanitizedRunStepDelta = {};
+  assignString(sanitized, 'id', event.id);
+  sanitized.delta = sanitizeToolCallDelta(event.delta);
+  return sanitized;
+}
+
+function sanitizeRunStepCompletedUpdateData(
+  data: unknown
+): SanitizedRunStepCompleted | undefined {
+  if (!isObjectLike(data)) {
+    return undefined;
+  }
+  const event = data as { result?: unknown };
+  return { result: sanitizeStepCompleted(event.result) };
+}
+
+function sanitizeMessageDeltaUpdateData(
+  data: unknown
+): SanitizedMessageDelta | undefined {
+  if (!isObjectLike(data)) {
+    return undefined;
+  }
+  const event = data as Partial<MessageDeltaEvent>;
+  const sanitized: SanitizedMessageDelta = {};
+  assignString(sanitized, 'id', event.id);
+  if (event.delta != null) {
+    sanitized.delta = {};
+    if (event.delta.content !== undefined) {
+      sanitized.delta.content = event.delta.content;
     }
-    sanitized[key] = value;
+    if (event.delta.tool_call_ids !== undefined) {
+      sanitized.delta.tool_call_ids = event.delta.tool_call_ids;
+    }
   }
   return sanitized;
+}
+
+function sanitizeReasoningDeltaUpdateData(
+  data: unknown
+): SanitizedReasoningDelta | undefined {
+  if (!isObjectLike(data)) {
+    return undefined;
+  }
+  const event = data as Partial<ReasoningDeltaEvent>;
+  const sanitized: SanitizedReasoningDelta = {};
+  assignString(sanitized, 'id', event.id);
+  if (event.delta?.content !== undefined) {
+    sanitized.delta = { content: event.delta.content };
+  }
+  return sanitized;
+}
+
+function sanitizeStepDetails(stepDetails: unknown): SanitizedStepDetails | undefined {
+  if (!isObjectLike(stepDetails)) {
+    return undefined;
+  }
+  const rawDetails = stepDetails as {
+    message_creation?: { message_id?: unknown };
+    tool_calls?: unknown[];
+    type?: unknown;
+  };
+  if (rawDetails.type === StepTypes.MESSAGE_CREATION) {
+    const sanitized: SanitizedStepDetails = {
+      type: StepTypes.MESSAGE_CREATION,
+    };
+    const messageId = rawDetails.message_creation?.message_id;
+    if (typeof messageId === 'string') {
+      sanitized.message_creation = { message_id: messageId };
+    }
+    return sanitized;
+  }
+  if (rawDetails.type === StepTypes.TOOL_CALLS) {
+    const sanitized: SanitizedStepDetails = {
+      type: StepTypes.TOOL_CALLS,
+    };
+    if (Array.isArray(rawDetails.tool_calls)) {
+      sanitized.tool_calls = rawDetails.tool_calls.map(sanitizeAgentToolCall);
+    }
+    return sanitized;
+  }
+  return undefined;
+}
+
+function sanitizeToolCallDelta(
+  delta: ToolCallDelta | undefined
+): SanitizedToolCallDelta | undefined {
+  if (!isObjectLike(delta)) {
+    return undefined;
+  }
+  const sanitized: SanitizedToolCallDelta = {};
+  assignString(sanitized, 'auth', delta.auth);
+  assignNumber(sanitized, 'expires_at', delta.expires_at);
+  assignString(sanitized, 'type', delta.type);
+  if (delta.summary !== undefined) {
+    sanitized.summary = delta.summary;
+  }
+  if (Array.isArray(delta.tool_calls)) {
+    sanitized.tool_calls = delta.tool_calls.map(sanitizeAgentToolCall);
+  }
+  return sanitized;
+}
+
+function sanitizeStepCompleted(data: unknown): SanitizedStepCompleted | undefined {
+  if (!isObjectLike(data)) {
+    return undefined;
+  }
+  const completed = data as Partial<StepCompleted> & {
+    id?: unknown;
+    index?: unknown;
+    tool_call?: unknown;
+  };
+  if (completed.type === 'summary') {
+    return {
+      type: 'summary',
+      summary: completed.summary,
+    };
+  }
+  if (completed.type !== 'tool_call') {
+    return undefined;
+  }
+  const sanitized: SanitizedStepCompleted = { type: 'tool_call' };
+  assignString(sanitized, 'id', completed.id);
+  assignNumber(sanitized, 'index', completed.index);
+  sanitized.tool_call = sanitizeProcessedToolCall(completed.tool_call);
+  return sanitized;
+}
+
+function sanitizeProcessedToolCall(
+  toolCall: unknown
+): SanitizedProcessedToolCall | undefined {
+  if (!isObjectLike(toolCall)) {
+    return undefined;
+  }
+  const call = toolCall as Partial<ProcessedToolCall>;
+  const sanitized: SanitizedProcessedToolCall = {};
+  assignString(sanitized, 'id', call.id);
+  assignString(sanitized, 'name', call.name);
+  if (call.args !== undefined) {
+    sanitized.args = call.args;
+  }
+  assignString(sanitized, 'output', call.output);
+  assignNumber(sanitized, 'progress', call.progress);
+  return sanitized;
+}
+
+function sanitizeAgentToolCall(toolCall: unknown): SanitizedAgentToolCall {
+  if (!isObjectLike(toolCall)) {
+    return {};
+  }
+  const call = toolCall as SanitizedAgentToolCall;
+  const sanitized: SanitizedAgentToolCall = {};
+  assignString(sanitized, 'id', call.id);
+  assignString(sanitized, 'name', call.name);
+  assignString(sanitized, 'type', call.type);
+  if (call.args !== undefined) {
+    sanitized.args = call.args;
+  }
+  if (isObjectLike(call.function)) {
+    const fn: SanitizedAgentToolCall['function'] = {};
+    assignString(fn, 'name', call.function.name);
+    if (
+      typeof call.function.arguments === 'string' ||
+      isObjectLike(call.function.arguments)
+    ) {
+      fn.arguments = call.function.arguments;
+    }
+    sanitized.function = fn;
+  }
+  return sanitized;
+}
+
+function isObjectLike(value: unknown): value is object {
+  return value != null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function assignString<T extends object, K extends keyof T>(
+  target: T,
+  key: K,
+  value: unknown
+): void {
+  if (typeof value === 'string') {
+    target[key] = value as T[K];
+  }
+}
+
+function assignNumber<T extends object, K extends keyof T>(
+  target: T,
+  key: K,
+  value: unknown
+): void {
+  if (typeof value === 'number') {
+    target[key] = value as T[K];
+  }
 }
 
 /**

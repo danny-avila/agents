@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach } from '@jest/globals';
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import { HookRegistry } from '@/hooks/HookRegistry';
-import { Providers, GraphEvents } from '@/common';
+import { Providers, GraphEvents, StepTypes } from '@/common';
 import { HandlerRegistry } from '@/events';
 import { AgentContext } from '@/agents/AgentContext';
 import type {
@@ -1489,6 +1489,57 @@ describe('summarizeEvent', () => {
 });
 
 describe('sanitizeForwardedSubagentUpdateData', () => {
+  it('uses an allowlist for run step payloads', () => {
+    const sanitized = sanitizeForwardedSubagentUpdateData(
+      GraphEvents.ON_RUN_STEP,
+      {
+        id: 'step_1',
+        type: StepTypes.TOOL_CALLS,
+        agentId: 'researcher',
+        index: 0,
+        stepDetails: {
+          type: StepTypes.TOOL_CALLS,
+          tool_calls: [
+            {
+              id: 'call_1',
+              name: 'calculator',
+              args: { expression: '21 * 2' },
+              futureSecret: 'nested-secret',
+            },
+          ],
+          futureSecret: 'details-secret',
+        },
+        configurable: { access_token: 'access-secret' },
+        metadata: { refresh_token: 'refresh-secret' },
+        futureSecret: 'top-level-secret',
+      }
+    );
+
+    expect(sanitized).toEqual({
+      id: 'step_1',
+      type: StepTypes.TOOL_CALLS,
+      agentId: 'researcher',
+      index: 0,
+      stepDetails: {
+        type: StepTypes.TOOL_CALLS,
+        tool_calls: [
+          {
+            id: 'call_1',
+            name: 'calculator',
+            args: { expression: '21 * 2' },
+          },
+        ],
+      },
+    });
+    const serialized = JSON.stringify(sanitized);
+    expect(serialized).not.toContain('futureSecret');
+    expect(serialized).not.toContain('top-level-secret');
+    expect(serialized).not.toContain('details-secret');
+    expect(serialized).not.toContain('nested-secret');
+    expect(serialized).not.toContain('access-secret');
+    expect(serialized).not.toContain('refresh-secret');
+  });
+
   it('keeps completed tool output while stripping operational fields', () => {
     const output = 'x'.repeat(10_000);
     const sanitized = sanitizeForwardedSubagentUpdateData(
@@ -1504,7 +1555,9 @@ describe('sanitizeForwardedSubagentUpdateData', () => {
             args: '{}',
             output,
             progress: 1,
+            futureSecret: 'nested-secret',
           },
+          futureSecret: 'result-secret',
         },
         configurable: {
           user: {
@@ -1516,6 +1569,7 @@ describe('sanitizeForwardedSubagentUpdateData', () => {
         metadata: {
           refresh_token: 'refresh-secret',
         },
+        futureSecret: 'top-level-secret',
       }
     );
 
@@ -1535,6 +1589,10 @@ describe('sanitizeForwardedSubagentUpdateData', () => {
     });
     const serialized = JSON.stringify(sanitized);
     expect(serialized).toContain(output);
+    expect(serialized).not.toContain('futureSecret');
+    expect(serialized).not.toContain('top-level-secret');
+    expect(serialized).not.toContain('result-secret');
+    expect(serialized).not.toContain('nested-secret');
     expect(serialized).not.toContain('configurable');
     expect(serialized).not.toContain('metadata');
     expect(serialized).not.toContain('access-secret');

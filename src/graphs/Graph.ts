@@ -1562,6 +1562,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           maxDepth: effectiveSubagentDepth,
           createChildGraph: (input): StandardGraph => {
             const childGraph = new StandardGraph(input);
+            childGraph.hookRegistry = this.hookRegistry;
+            childGraph.humanInTheLoop = this.humanInTheLoop;
             childGraph.toolOutputReferences = this.toolOutputReferences;
             childGraph.eagerEventToolExecution = this.eagerEventToolExecution;
             childGraph.toolExecution = this.toolExecution;
