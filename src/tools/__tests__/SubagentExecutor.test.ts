@@ -1226,6 +1226,72 @@ describe('SubagentExecutor', () => {
       expect(serializedUpdate).not.toContain('user_secret');
     });
 
+    it('drains observational updates before stop without parallel handler publishes', async () => {
+      const phases: SubagentUpdateEvent['phase'][] = [];
+      let activePublishes = 0;
+      let maxActivePublishes = 0;
+      const registry = new HandlerRegistry();
+      registry.register(GraphEvents.ON_SUBAGENT_UPDATE, {
+        handle: async (_event, rawData): Promise<void> => {
+          const update = rawData as SubagentUpdateEvent;
+          activePublishes += 1;
+          maxActivePublishes = Math.max(maxActivePublishes, activePublishes);
+          if (update.phase === 'message_delta') {
+            await new Promise((resolve) => setTimeout(resolve, 1));
+          }
+          phases.push(update.phase);
+          activePublishes -= 1;
+        },
+      });
+
+      const factory: () => StandardGraph = (): StandardGraph =>
+        ({
+          createWorkflow: (): { invoke: jest.Mock } => ({
+            invoke: jest.fn().mockImplementation(async (_state, options) => {
+              const opts = options as { callbacks?: unknown[] };
+              const forwarder = (opts.callbacks ?? [])[0] as {
+                handleCustomEvent?: (
+                  eventName: string,
+                  data: unknown
+                ) => Promise<void> | void;
+              };
+              for (let index = 0; index < 5; index++) {
+                await forwarder.handleCustomEvent?.(
+                  GraphEvents.ON_MESSAGE_DELTA,
+                  {
+                    id: `msg_${index}`,
+                    delta: { content: [{ type: 'text', text: `${index}` }] },
+                  }
+                );
+              }
+              return { messages: [new AIMessage('ok')] };
+            }),
+          }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph;
+
+      const executor = createExecutor({
+        createChildGraph: factory,
+        parentHandlerRegistry: registry,
+      });
+
+      await executor.execute({
+        description: 'Task',
+        subagentType: 'researcher',
+      });
+
+      expect(maxActivePublishes).toBe(1);
+      expect(phases[0]).toBe('start');
+      expect(phases.slice(1, 6)).toEqual([
+        'message_delta',
+        'message_delta',
+        'message_delta',
+        'message_delta',
+        'message_delta',
+      ]);
+      expect(phases[phases.length - 1]).toBe('stop');
+    });
+
     it('does NOT forward ON_TOOL_EXECUTE when the parent registry has no handler (safe fallback)', async () => {
       /**
        * The executor strips `toolDefinitions` when the parent registry has

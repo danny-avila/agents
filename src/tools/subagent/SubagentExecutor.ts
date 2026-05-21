@@ -23,6 +23,7 @@ import { executeHooks } from '@/hooks';
 const DEFAULT_MAX_TURNS = 25;
 const RECURSION_MULTIPLIER = 3;
 const ERROR_MESSAGE_MAX_CHARS = 200;
+const MAX_PENDING_SUBAGENT_UPDATES = 64;
 const SUBAGENT_UPDATE_OMITTED_KEYS = new Set([
   'Authorization',
   'access_token',
@@ -66,6 +67,17 @@ type SanitizedSubagentToolExecuteData = {
 
 type ShallowSanitizedUpdateData = {
   [key: string]: unknown;
+};
+
+type QueuedSubagentUpdate = {
+  eventName: string;
+  phase: SubagentUpdatePhase;
+  data: unknown;
+};
+
+type ForwarderCallback = {
+  handler: BaseCallbackHandler;
+  drain: () => Promise<void>;
 };
 
 export type SubagentExecuteParams = {
@@ -272,7 +284,7 @@ export class SubagentExecutor {
       tokenCounter: this.tokenCounter,
     });
 
-    const forwarder = forwardingEnabled
+    const forwarding = forwardingEnabled
       ? this.createForwarderCallback({
         parentRegistry: parentRegistry!,
         subagentType,
@@ -281,6 +293,7 @@ export class SubagentExecutor {
         parentToolCallId,
       })
       : undefined;
+    const forwarder = forwarding?.handler;
 
     if (forwarder) {
       await this.emitSubagentUpdate(parentRegistry!, {
@@ -360,6 +373,7 @@ export class SubagentExecutor {
     } catch (error) {
       const errorMessage = truncateErrorMessage(error);
       if (forwarder) {
+        await forwarding.drain();
         await this.emitSubagentUpdate(parentRegistry!, {
           childRunId,
           subagentType,
@@ -406,6 +420,7 @@ export class SubagentExecutor {
     }
 
     if (forwarder) {
+      await forwarding.drain();
       await this.emitSubagentUpdate(parentRegistry!, {
         childRunId,
         subagentType,
@@ -479,7 +494,7 @@ export class SubagentExecutor {
     subagentAgentId: string;
     childRunId: string;
     parentToolCallId?: string;
-  }): BaseCallbackHandler {
+  }): ForwarderCallback {
     const {
       parentRegistry,
       subagentType,
@@ -499,23 +514,69 @@ export class SubagentExecutor {
       if (!handler) {
         return;
       }
-      const event: SubagentUpdateEvent = {
-        runId: parentRunId,
-        subagentRunId: childRunId,
-        subagentType,
-        subagentAgentId,
-        parentAgentId,
-        parentToolCallId,
-        phase,
-        data: sanitizeForwardedSubagentUpdateData(eventName, data),
-        label: summarizeEvent(eventName, data),
-        timestamp: new Date().toISOString(),
-      };
       try {
+        const event: SubagentUpdateEvent = {
+          runId: parentRunId,
+          subagentRunId: childRunId,
+          subagentType,
+          subagentAgentId,
+          parentAgentId,
+          parentToolCallId,
+          phase,
+          data: sanitizeForwardedSubagentUpdateData(eventName, data),
+          label: summarizeEvent(eventName, data),
+          timestamp: new Date().toISOString(),
+        };
         await handler.handle(GraphEvents.ON_SUBAGENT_UPDATE, event);
       } catch {
         /* observational — swallow */
       }
+    };
+
+    const queuedUpdates: QueuedSubagentUpdate[] = [];
+    let drainPromise: Promise<void> | undefined;
+
+    const enqueue = (update: QueuedSubagentUpdate): void => {
+      if (queuedUpdates.length >= MAX_PENDING_SUBAGENT_UPDATES) {
+        const dropIndex = queuedUpdates.findIndex((queued) =>
+          isDroppableSubagentUpdatePhase(queued.phase)
+        );
+        queuedUpdates.splice(dropIndex >= 0 ? dropIndex : 0, 1);
+      }
+      queuedUpdates.push(update);
+    };
+
+    const drain = async (): Promise<void> => {
+      if (drainPromise != null) {
+        await drainPromise;
+        return;
+      }
+      drainPromise = (async (): Promise<void> => {
+        while (queuedUpdates.length > 0) {
+          const update = queuedUpdates.shift();
+          if (update == null) {
+            continue;
+          }
+          await wrap(update.eventName, update.phase, update.data);
+        }
+      })();
+      try {
+        await drainPromise;
+      } finally {
+        drainPromise = undefined;
+        if (queuedUpdates.length > 0) {
+          await drain();
+        }
+      }
+    };
+
+    const scheduleWrap = (
+      eventName: string,
+      phase: SubagentUpdatePhase,
+      data: unknown
+    ): void => {
+      enqueue({ eventName, phase, data });
+      void drain();
     };
 
     const handler = BaseCallbackHandler.fromMethods({
@@ -537,28 +598,28 @@ export class SubagentExecutor {
            * We also surface a short notice in the subagent-update stream so
            * the UI can show "calling <tool>" for each tool the child spawns.
            */
-          void wrap(eventName, 'run_step', data);
+          scheduleWrap(eventName, 'run_step', data);
           return;
         }
 
         if (eventName === GraphEvents.ON_RUN_STEP) {
-          void wrap(eventName, 'run_step', data);
+          scheduleWrap(eventName, 'run_step', data);
           return;
         }
         if (eventName === GraphEvents.ON_RUN_STEP_DELTA) {
-          void wrap(eventName, 'run_step_delta', data);
+          scheduleWrap(eventName, 'run_step_delta', data);
           return;
         }
         if (eventName === GraphEvents.ON_RUN_STEP_COMPLETED) {
-          void wrap(eventName, 'run_step_completed', data);
+          scheduleWrap(eventName, 'run_step_completed', data);
           return;
         }
         if (eventName === GraphEvents.ON_MESSAGE_DELTA) {
-          void wrap(eventName, 'message_delta', data);
+          scheduleWrap(eventName, 'message_delta', data);
           return;
         }
         if (eventName === GraphEvents.ON_REASONING_DELTA) {
-          void wrap(eventName, 'reasoning_delta', data);
+          scheduleWrap(eventName, 'reasoning_delta', data);
           return;
         }
       },
@@ -566,14 +627,14 @@ export class SubagentExecutor {
     /**
      * `awaitHandlers = true` is required so the child's `ToolNode` actually
      * blocks on the parent's `ON_TOOL_EXECUTE` handler until it resolves
-     * the batch request. The callback also sees observational events
-     * (message_delta, run_step, …), but `ON_SUBAGENT_UPDATE` calls are
-     * deliberately emitted fire-and-forget so host UI publication cannot
-     * backpressure the child graph. `wrap` swallows handler errors because
-     * these events are observational.
+     * the batch request. Observational `ON_SUBAGENT_UPDATE` calls are queued
+     * behind a bounded sequential dispatcher so host UI publication cannot
+     * backpressure each child emission or run unbounded concurrent publishes.
+     * The executor drains this queue before terminal stop/error envelopes to
+     * preserve phase ordering.
      */
     handler.awaitHandlers = true;
-    return handler;
+    return { handler, drain };
   }
 }
 
@@ -588,6 +649,14 @@ export function sanitizeForwardedSubagentUpdateData(
     return data;
   }
   return omitOperationalUpdateFields(data);
+}
+
+function isDroppableSubagentUpdatePhase(phase: SubagentUpdatePhase): boolean {
+  return (
+    phase === 'message_delta' ||
+    phase === 'reasoning_delta' ||
+    phase === 'run_step_delta'
+  );
 }
 
 function sanitizeToolExecuteUpdateData(
