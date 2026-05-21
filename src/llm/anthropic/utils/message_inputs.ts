@@ -49,8 +49,10 @@ type GoogleFunctionCallBlock = MessageContentComplex & {
 };
 
 const ANTHROPIC_EMPTY_TEXT_PLACEHOLDER = '_';
+const CLAUDE_4_RELEASE_DATE_MODEL_PATTERN =
+  /claude-(?:opus|sonnet|haiku)-4-\d{8}(?:[-.@]|$)/i;
 const CLAUDE_4_MINOR_MODEL_PATTERN =
-  /claude-(?:opus|sonnet|haiku)-4[-.](\d)(?:[-.@]|$)/i;
+  /claude-(?:opus|sonnet|haiku)-4[-.](\d+)(?:[-.@]|$)/i;
 
 function _formatImage(imageUrl: string) {
   const parsed = parseBase64DataUrl({ dataUrl: imageUrl });
@@ -799,7 +801,12 @@ export function _convertMessagesToAnthropicPayload(
 }
 
 export function modelDisallowsAssistantPrefill(model?: string): boolean {
-  const match = CLAUDE_4_MINOR_MODEL_PATTERN.exec(model ?? '');
+  const modelId = model ?? '';
+  if (CLAUDE_4_RELEASE_DATE_MODEL_PATTERN.test(modelId)) {
+    return false;
+  }
+
+  const match = CLAUDE_4_MINOR_MODEL_PATTERN.exec(modelId);
   if (!match) {
     return false;
   }

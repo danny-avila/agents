@@ -2646,8 +2646,10 @@ describe('Claude assistant prefill compatibility', () => {
     'claude-sonnet-4-6',
     'claude-sonnet-4-6@20260217',
     'claude-opus-4-7',
+    'claude-opus-4-10',
     'global.anthropic.claude-opus-4-6-v1:0',
     'anthropic/claude-sonnet-4.6',
+    'anthropic/claude-sonnet-4.12',
   ])('detects %s as not supporting assistant prefill', (model) => {
     expect(modelDisallowsAssistantPrefill(model)).toBe(true);
   });
@@ -2655,7 +2657,7 @@ describe('Claude assistant prefill compatibility', () => {
   test.each([
     'claude-sonnet-4-5-20250929',
     'claude-opus-4-20250514',
-    'claude-opus-4-70',
+    'anthropic.claude-opus-4-20250514-v1:0',
     'gpt-5.4',
   ])('leaves %s prefill support unchanged', (model) => {
     expect(modelDisallowsAssistantPrefill(model)).toBe(false);
