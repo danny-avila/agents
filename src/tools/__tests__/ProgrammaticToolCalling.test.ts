@@ -40,10 +40,15 @@ describe('ProgrammaticToolCalling', () => {
       const schema = createBashProgrammaticToolCallingSchema();
       const description = schema.properties.code.description;
 
-      expect(description).toContain('parsing saved tool stdout with jq');
-      expect(description).toContain('jq -r \'fromjson? // . | ...\'');
-      expect(description).toContain('stringified-JSON results');
+      expect(description).toContain('jq: use fromjson? // .');
+      expect(description).toContain('again on JSON-string fields');
+      expect(description).toContain('arrays may contain strings');
+      expect(description).toContain('raw=$(tool');
+      expect(description).toContain('direct tool > file may be empty');
       expect(description).toContain('/mnt/data/sf.json');
+      expect(description).toContain(
+        'failed executions do not register new files'
+      );
       expect(description).toContain('not later-call storage');
     });
   });

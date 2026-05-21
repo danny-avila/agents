@@ -9,6 +9,7 @@ import type * as t from '@/types';
 import {
   CODE_ARTIFACT_PATH_GUIDANCE,
   appendCodeSessionFileSummary,
+  appendFailedExecutionFileReminder,
   buildCodeApiHttpErrorMessage,
   emptyOutputMessage,
   getCodeBaseURL,
@@ -881,8 +882,12 @@ export function createProgrammaticToolCallingTool(
 
         throw new Error(`Unexpected response status: ${response.status}`);
       } catch (error) {
+        const messageWithReminder = appendFailedExecutionFileReminder(
+          (error as Error).message,
+          code
+        );
         throw new Error(
-          `Programmatic execution failed: ${(error as Error).message}`
+          `Programmatic execution failed: ${messageWithReminder}`
         );
       }
     },

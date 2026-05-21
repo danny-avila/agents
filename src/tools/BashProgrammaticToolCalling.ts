@@ -11,6 +11,7 @@ import {
 import {
   BASH_SHELL_GUIDANCE,
   CODE_ARTIFACT_PATH_GUIDANCE,
+  appendFailedExecutionFileReminder,
   getCodeBaseURL,
 } from './CodeExecutor';
 import {
@@ -69,7 +70,8 @@ const CORE_RULES = `Rules:
 - One call: state does not persist
 - Tools are pre-defined as bash functions—DO NOT redefine them
 - Each tool function accepts a JSON string argument
-- When parsing saved tool stdout with jq, use jq -r 'fromjson? // . | ...' so object and stringified-JSON results both work
+- Save tool output with raw=$(tool '{}'); printf '%s\n' "$raw" > /mnt/data/file.json; direct tool > file may be empty
+- jq: use fromjson? // . on saved tool stdout and again on JSON-string fields; check types since arrays may contain strings
 - Only echo/printf output returns to the model
 - ${CODE_ARTIFACT_PATH_GUIDANCE}
 - ${BASH_SHELL_GUIDANCE}
@@ -84,8 +86,8 @@ const EXAMPLES = `Example (Complete workflow in one call):
   echo "$data" | jq '.[] | .name'
 
 Example (Parallel calls):
-  web_search '{"query": "SF weather"}' > /mnt/data/sf.json &
-  web_search '{"query": "NY weather"}' > /mnt/data/ny.json &
+  { sf=$(web_search '{"query": "SF weather"}'); printf '%s\n' "$sf" > /mnt/data/sf.json; } &
+  { ny=$(web_search '{"query": "NY weather"}'); printf '%s\n' "$ny" > /mnt/data/ny.json; } &
   wait
   echo "SF: $(jq -r . /mnt/data/sf.json)"
   echo "NY: $(jq -r . /mnt/data/ny.json)"`;
@@ -389,8 +391,12 @@ export function createBashProgrammaticToolCallingTool(
 
         throw new Error(`Unexpected response status: ${response.status}`);
       } catch (error) {
+        const messageWithReminder = appendFailedExecutionFileReminder(
+          (error as Error).message,
+          code
+        );
         throw new Error(
-          `Bash programmatic execution failed: ${(error as Error).message}`
+          `Bash programmatic execution failed: ${messageWithReminder}`
         );
       }
     },

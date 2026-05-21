@@ -6,6 +6,7 @@ import type * as t from '@/types';
 import {
   BASH_SHELL_GUIDANCE,
   CODE_ARTIFACT_PATH_GUIDANCE,
+  appendFailedExecutionFileReminder,
   appendTmpScratchReminder,
   appendCodeSessionFileSummary,
   emptyOutputMessage,
@@ -195,8 +196,12 @@ function createBashExecutionTool(
             }) satisfies t.CodeExecutionArtifact,
         ];
       } catch (error) {
+        const messageWithReminder = appendFailedExecutionFileReminder(
+          (error as Error | undefined)?.message ?? '',
+          command
+        );
         throw new Error(
-          `Execution error:\n\n${(error as Error | undefined)?.message}`
+          `Execution error:\n\n${messageWithReminder}`
         );
       }
     },
