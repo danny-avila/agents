@@ -1292,6 +1292,133 @@ describe('SubagentExecutor', () => {
       expect(phases[phases.length - 1]).toBe('stop');
     });
 
+    it('allowlists forwarded run step payloads before wrapping them in ON_SUBAGENT_UPDATE', async () => {
+      const subagentUpdates: SubagentUpdateEvent[] = [];
+      const registry = new HandlerRegistry();
+      registry.register(GraphEvents.ON_SUBAGENT_UPDATE, {
+        handle: (_event, rawData): void => {
+          subagentUpdates.push(rawData as SubagentUpdateEvent);
+        },
+      });
+
+      const output = 'tool output that should stay visible';
+      const factory: () => StandardGraph = (): StandardGraph =>
+        ({
+          createWorkflow: (): { invoke: jest.Mock } => ({
+            invoke: jest.fn().mockImplementation(async (_state, options) => {
+              const opts = options as { callbacks?: unknown[] };
+              const forwarder = (opts.callbacks ?? [])[0] as {
+                handleCustomEvent?: (
+                  eventName: string,
+                  data: unknown
+                ) => Promise<void> | void;
+              };
+              await forwarder.handleCustomEvent?.(GraphEvents.ON_RUN_STEP, {
+                id: 'step_1',
+                type: StepTypes.TOOL_CALLS,
+                agentId: 'researcher',
+                index: 0,
+                stepDetails: {
+                  type: StepTypes.TOOL_CALLS,
+                  tool_calls: [
+                    {
+                      id: 'call_1',
+                      name: 'calculator',
+                      args: { expression: '21 * 2' },
+                      futureSecret: 'nested-step-secret',
+                    },
+                  ],
+                  futureSecret: 'step-details-secret',
+                },
+                configurable: { access_token: 'access-secret' },
+                metadata: { refresh_token: 'refresh-secret' },
+                futureSecret: 'top-level-step-secret',
+              });
+              await forwarder.handleCustomEvent?.(
+                GraphEvents.ON_RUN_STEP_COMPLETED,
+                {
+                  result: {
+                    id: 'step_1',
+                    index: 0,
+                    type: 'tool_call',
+                    tool_call: {
+                      id: 'call_1',
+                      name: 'calculator',
+                      args: '{}',
+                      output,
+                      progress: 1,
+                      futureSecret: 'nested-completed-secret',
+                    },
+                    futureSecret: 'completed-result-secret',
+                  },
+                  configurable: { access_token: 'access-secret' },
+                  metadata: { refresh_token: 'refresh-secret' },
+                  futureSecret: 'top-level-completed-secret',
+                }
+              );
+              return { messages: [new AIMessage('ok')] };
+            }),
+          }),
+          clearHeavyState: jest.fn(),
+        }) as unknown as StandardGraph;
+
+      const executor = createExecutor({
+        createChildGraph: factory,
+        parentHandlerRegistry: registry,
+      });
+
+      await executor.execute({
+        description: 'Task',
+        subagentType: 'researcher',
+      });
+
+      const runStep = subagentUpdates.find(
+        (update) => update.phase === 'run_step'
+      );
+      const completedStep = subagentUpdates.find(
+        (update) => update.phase === 'run_step_completed'
+      );
+      expect(runStep?.data).toEqual({
+        id: 'step_1',
+        type: StepTypes.TOOL_CALLS,
+        agentId: 'researcher',
+        index: 0,
+        stepDetails: {
+          type: StepTypes.TOOL_CALLS,
+          tool_calls: [
+            {
+              id: 'call_1',
+              name: 'calculator',
+              args: { expression: '21 * 2' },
+            },
+          ],
+        },
+      });
+      expect(completedStep?.data).toEqual({
+        result: {
+          id: 'step_1',
+          index: 0,
+          type: 'tool_call',
+          tool_call: {
+            id: 'call_1',
+            name: 'calculator',
+            args: '{}',
+            output,
+            progress: 1,
+          },
+        },
+      });
+      const serialized = JSON.stringify([runStep, completedStep]);
+      expect(serialized).toContain(output);
+      expect(serialized).not.toContain('futureSecret');
+      expect(serialized).not.toContain('access-secret');
+      expect(serialized).not.toContain('refresh-secret');
+      expect(serialized).not.toContain('top-level-step-secret');
+      expect(serialized).not.toContain('nested-step-secret');
+      expect(serialized).not.toContain('top-level-completed-secret');
+      expect(serialized).not.toContain('nested-completed-secret');
+    });
+
     it('does NOT forward ON_TOOL_EXECUTE when the parent registry has no handler (safe fallback)', async () => {
       /**
        * The executor strips `toolDefinitions` when the parent registry has
