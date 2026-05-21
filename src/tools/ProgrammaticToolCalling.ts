@@ -7,6 +7,8 @@ import type { ToolCall } from '@langchain/core/messages/tool';
 import type { ProgrammaticToolCallingJsonSchema } from './ptcTimeout';
 import type * as t from '@/types';
 import {
+  CODE_ARTIFACT_PATH_GUIDANCE,
+  appendCodeSessionFileSummary,
   buildCodeApiHttpErrorMessage,
   emptyOutputMessage,
   getCodeBaseURL,
@@ -36,15 +38,17 @@ You MUST complete your entire workflow in ONE code block: query → process → 
 DO NOT split work across multiple calls expecting to reuse variables.`;
 
 const CORE_RULES = `Rules:
-- EVERYTHING in one call—no state persists between executions
-- Just write code with await—auto-wrapped in async context
-- DO NOT define async def main() or call asyncio.run()
+- One call: state does not persist
+- Auto-wrapped async; use await, no main()/asyncio.run()
 - Tools are pre-defined—DO NOT write function definitions
+- Call tools with keyword args only (await tool(arg=value), never pass a dict)
+- Tool results are decoded Python values (dict/list/str)
 - Only print() output returns to the model
+- ${CODE_ARTIFACT_PATH_GUIDANCE}
 - timeout caps one sandbox run/replay iteration, not the total multi-round-trip workflow`;
 
-const ADDITIONAL_RULES = `- Generated files are automatically available in /mnt/data/ for subsequent executions
-- Tool names normalized: hyphens→underscores, keywords get \`_tool\` suffix`;
+const ADDITIONAL_RULES =
+  '- Tool names normalized: hyphens→underscores, keywords get `_tool` suffix';
 
 const EXAMPLES = `Example (Complete workflow in one call):
   # Query data
@@ -678,9 +682,9 @@ export async function executeTools(
 /**
  * Formats the completed response for the agent.
  *
- * Output is stdout/stderr only — see `CodeExecutor.ts`. The
- * artifact still carries every file so the host's session map
- * stays in sync; the LLM doesn't see them in the tool result text.
+ * Output includes stdout/stderr plus a compact session-file summary
+ * when artifacts were persisted. The artifact still carries every
+ * file so the host's session map stays in sync.
  *
  * @param response - The completed API response
  * @returns Tuple of [formatted string, artifact]
@@ -701,7 +705,7 @@ export function formatCompletedResponse(
   }
 
   return [
-    formatted.trim(),
+    appendCodeSessionFileSummary(formatted, response.files),
     {
       session_id: response.session_id,
       files: response.files,

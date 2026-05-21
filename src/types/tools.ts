@@ -303,9 +303,8 @@ export type FileRef = {
    * `true` when the codeapi sandbox echoed this entry as an unchanged
    * passthrough of an input the caller already owns (skill files,
    * downloaded inputs whose hash matched the baseline, inherited
-   * `.dirkeep` markers). The tool-result formatter renders these as
-   * "Available files" rather than "Generated files" so the LLM doesn't
-   * conflate infrastructure inputs with newly-produced outputs.
+   * `.dirkeep` markers). The host can use this flag to skip
+   * post-processing work for files the caller already owns.
    */
   inherited?: true;
 };

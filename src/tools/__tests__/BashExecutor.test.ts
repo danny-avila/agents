@@ -18,6 +18,11 @@ describe('buildBashExecutionToolDescription', () => {
     ).toBe(BashExecutionToolDescription);
   });
 
+  it('warns about compact bash shell pitfalls', () => {
+    expect(BashExecutionToolDescription).toContain('heredoc/printf');
+    expect(BashExecutionToolDescription).toContain('not bare Python');
+  });
+
   it('appends the tool-output references guide when enabled', () => {
     const composed = buildBashExecutionToolDescription({
       enableToolOutputReferences: true,

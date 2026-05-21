@@ -165,6 +165,17 @@ describe('CodeAPI auth header injection', () => {
     ).not.toHaveProperty('authHeaders');
   });
 
+  it('tolerates null params for direct code execution', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({ session_id: 'session_123', stdout: '1\n' })
+    );
+    const tool = createCodeExecutionTool(null);
+
+    await expect(
+      tool.invoke({ lang: 'py', code: 'print(1)' })
+    ).resolves.toBeDefined();
+  });
+
   it('forwards Authorization for bash execution', async () => {
     fetchMock.mockResolvedValueOnce(
       jsonResponse({ session_id: 'session_123', stdout: '1\n' })
