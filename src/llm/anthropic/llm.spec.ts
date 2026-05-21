@@ -64,7 +64,11 @@ import type {
   ToolEndEvent,
   TPayload,
 } from '@/types';
-import { _convertMessagesToAnthropicPayload } from './utils/message_inputs';
+import {
+  _convertMessagesToAnthropicPayload,
+  modelDisallowsAssistantPrefill,
+  stripUnsupportedAssistantPrefill,
+} from './utils/message_inputs';
 import {
   _makeMessageChunkFromAnthropicEvent,
   getAnthropicUsageMetadata,
@@ -2634,6 +2638,58 @@ describe('Anthropic Reasoning with contentBlocks', () => {
     const reasoningBlocks = blocks.filter(isReasoningContentBlock);
     expect(reasoningBlocks.length).toBeGreaterThan(0);
     expect(reasoningBlocks[0].reasoning.length).toBeGreaterThan(10);
+  });
+});
+
+describe('Claude assistant prefill compatibility', () => {
+  test.each([
+    'claude-sonnet-4-6',
+    'claude-opus-4-7',
+    'global.anthropic.claude-opus-4-6-v1:0',
+    'anthropic/claude-sonnet-4.6',
+  ])('detects %s as not supporting assistant prefill', (model) => {
+    expect(modelDisallowsAssistantPrefill(model)).toBe(true);
+  });
+
+  test.each([
+    'claude-sonnet-4-5-20250929',
+    'claude-opus-4-20250514',
+    'claude-opus-4-70',
+    'gpt-5.4',
+  ])('leaves %s prefill support unchanged', (model) => {
+    expect(modelDisallowsAssistantPrefill(model)).toBe(false);
+  });
+
+  test('strips trailing assistant messages for Claude 4.6+ requests', () => {
+    const request = {
+      model: 'claude-opus-4-6',
+      max_tokens: 100,
+      messages: [
+        { role: 'user' as const, content: 'What changed?' },
+        { role: 'assistant' as const, content: 'Draft prefill' },
+        { role: 'assistant' as const, content: 'Another prefill' },
+      ],
+    };
+
+    const sanitized = stripUnsupportedAssistantPrefill(request);
+
+    expect(sanitized).not.toBe(request);
+    expect(sanitized.messages).toEqual([
+      { role: 'user', content: 'What changed?' },
+    ]);
+  });
+
+  test('does not strip assistant messages for older Claude models', () => {
+    const request = {
+      model: 'claude-sonnet-4-5-20250929',
+      max_tokens: 100,
+      messages: [
+        { role: 'user' as const, content: 'Write JSON only.' },
+        { role: 'assistant' as const, content: '{' },
+      ],
+    };
+
+    expect(stripUnsupportedAssistantPrefill(request)).toBe(request);
   });
 });
 

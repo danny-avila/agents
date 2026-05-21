@@ -17,9 +17,13 @@ import type {
   ChatAnthropicToolType,
   AnthropicMCPServerURLDefinition,
   AnthropicContextManagementConfigParam,
+  AnthropicRequestOptions,
 } from '@/llm/anthropic/types';
 import { _makeMessageChunkFromAnthropicEvent } from './utils/message_outputs';
-import { _convertMessagesToAnthropicPayload } from './utils/message_inputs';
+import {
+  _convertMessagesToAnthropicPayload,
+  stripUnsupportedAssistantPrefill,
+} from './utils/message_inputs';
 import { handleToolChoice } from './utils/tools';
 
 const DEFAULT_STREAM_DELAY = 25;
@@ -591,6 +595,26 @@ export class CustomAnthropic extends ChatAnthropicMessages {
     });
   }
 
+  protected override async createStreamWithRetry(
+    request: AnthropicStreamingMessageCreateParams,
+    options?: AnthropicRequestOptions
+  ): ReturnType<ChatAnthropicMessages['createStreamWithRetry']> {
+    return super.createStreamWithRetry(
+      stripUnsupportedAssistantPrefill(request),
+      options
+    );
+  }
+
+  protected override async completionWithRetry(
+    request: AnthropicMessageCreateParams,
+    options: AnthropicRequestOptions
+  ): ReturnType<ChatAnthropicMessages['completionWithRetry']> {
+    return super.completionWithRetry(
+      stripUnsupportedAssistantPrefill(request),
+      options
+    );
+  }
+
   async *_streamResponseChunks(
     messages: BaseMessage[],
     options: this['ParsedCallOptions'],
@@ -599,11 +623,11 @@ export class CustomAnthropic extends ChatAnthropicMessages {
     this.resetTokenEvents();
     const params = this.invocationParams(options);
     const formattedMessages = _convertMessagesToAnthropicPayload(messages);
-    const payload = {
+    const payload = stripUnsupportedAssistantPrefill({
       ...params,
       ...formattedMessages,
       stream: true,
-    } as const;
+    } as const);
     const coerceContentToString =
       !_toolsInParams(payload) &&
       !_documentsInParams(payload) &&
