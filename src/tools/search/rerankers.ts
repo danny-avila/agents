@@ -32,7 +32,7 @@ export class JinaReranker extends BaseReranker {
 
   constructor({
     apiKey = process.env.JINA_API_KEY,
-    apiUrl = process.env.JINA_API_URL || 'https://api.jina.ai/v1/rerank',
+    apiUrl = process.env.JINA_API_URL ?? 'https://api.jina.ai/v1/rerank',
     logger,
   }: {
     apiKey?: string;
@@ -44,12 +44,18 @@ export class JinaReranker extends BaseReranker {
     this.apiUrl = apiUrl;
   }
 
+  getApiUrl(): string {
+    return this.apiUrl;
+  }
+
   async rerank(
     query: string,
     documents: string[],
     topK: number = 5
   ): Promise<t.Highlight[]> {
-    this.logger.debug(`Reranking ${documents.length} chunks with Jina using API URL: ${this.apiUrl}`);
+    this.logger.debug(
+      `Reranking ${documents.length} chunks with Jina using API URL: ${this.apiUrl}`
+    );
 
     try {
       if (this.apiKey == null || this.apiKey === '') {
@@ -200,6 +206,81 @@ export class InfinityReranker extends BaseReranker {
   }
 }
 
+export class ZeroEntropyReranker extends BaseReranker {
+  private apiUrl: string;
+  private model: string;
+
+  constructor({
+    apiKey = process.env.ZEROENTROPY_API_KEY,
+    apiUrl = process.env.ZEROENTROPY_API_URL ??
+      'https://api.zeroentropy.dev/v1/models/rerank',
+    model = process.env.ZEROENTROPY_MODEL ?? 'zerank-2',
+    logger,
+  }: {
+    apiKey?: string;
+    apiUrl?: string;
+    model?: string;
+    logger?: t.Logger;
+  }) {
+    super(logger);
+    this.apiKey = apiKey;
+    this.apiUrl = apiUrl;
+    this.model = model;
+  }
+
+  async rerank(
+    query: string,
+    documents: string[],
+    topK: number = 5
+  ): Promise<t.Highlight[]> {
+    this.logger.debug(
+      `Reranking ${documents.length} chunks with ZeroEntropy using API URL: ${this.apiUrl}`
+    );
+
+    try {
+      if (this.apiKey == null || this.apiKey === '') {
+        this.logger.warn(
+          'ZEROENTROPY_API_KEY is not set. Using default ranking.'
+        );
+        return this.getDefaultRanking(documents, topK);
+      }
+
+      const response = await axios.post<
+        t.ZeroEntropyRerankerResponse | undefined
+      >(
+        this.apiUrl,
+        {
+          model: this.model,
+          query,
+          documents,
+          top_n: topK,
+        },
+        {
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${this.apiKey}`,
+          },
+        }
+      );
+
+      if (response.data != null && response.data.results.length > 0) {
+        return response.data.results.map((result) => ({
+          text: documents[result.index],
+          score: result.relevance_score,
+        }));
+      }
+
+      this.logger.warn(
+        'Unexpected response format from ZeroEntropy API. Using default ranking.'
+      );
+      return this.getDefaultRanking(documents, topK);
+    } catch (error) {
+      this.logger.error('Error using ZeroEntropy reranker:', error);
+      return this.getDefaultRanking(documents, topK);
+    }
+  }
+}
+
 /**
  * Creates the appropriate reranker based on type and configuration
  */
@@ -208,19 +289,42 @@ export const createReranker = (config: {
   jinaApiKey?: string;
   jinaApiUrl?: string;
   cohereApiKey?: string;
+  zeroEntropyApiKey?: string;
+  zeroEntropyApiUrl?: string;
+  zeroEntropyModel?: string;
   logger?: t.Logger;
 }): BaseReranker | undefined => {
-  const { rerankerType, jinaApiKey, jinaApiUrl, cohereApiKey, logger } = config;
+  const {
+    rerankerType,
+    jinaApiKey,
+    jinaApiUrl,
+    cohereApiKey,
+    zeroEntropyApiKey,
+    zeroEntropyApiUrl,
+    zeroEntropyModel,
+    logger,
+  } = config;
 
   // Create a default logger if none is provided
   const defaultLogger = logger || createDefaultLogger();
 
   switch (rerankerType.toLowerCase()) {
   case 'jina':
-    return new JinaReranker({ apiKey: jinaApiKey, apiUrl: jinaApiUrl, logger: defaultLogger });
+    return new JinaReranker({
+      apiKey: jinaApiKey,
+      apiUrl: jinaApiUrl,
+      logger: defaultLogger,
+    });
   case 'cohere':
     return new CohereReranker({
       apiKey: cohereApiKey,
+      logger: defaultLogger,
+    });
+  case 'zeroentropy':
+    return new ZeroEntropyReranker({
+      apiKey: zeroEntropyApiKey,
+      apiUrl: zeroEntropyApiUrl,
+      model: zeroEntropyModel,
       logger: defaultLogger,
     });
   case 'infinity':
@@ -232,7 +336,11 @@ export const createReranker = (config: {
     defaultLogger.warn(
       `Unknown reranker type: ${rerankerType}. Defaulting to InfinityReranker.`
     );
-    return new JinaReranker({ apiKey: jinaApiKey, apiUrl: jinaApiUrl, logger: defaultLogger });
+    return new JinaReranker({
+      apiKey: jinaApiKey,
+      apiUrl: jinaApiUrl,
+      logger: defaultLogger,
+    });
   }
 };
 
