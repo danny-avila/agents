@@ -52,6 +52,7 @@ import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { shouldTriggerSummarization } from '@/summarization';
 import { createSummarizeNode } from '@/summarization/node';
 import { messagesStateReducer } from '@/messages/reducer';
+import { appendCallbacks } from '@/utils/callbacks';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { AgentContext } from '@/agents/AgentContext';
 import { createFakeStreamingLLM } from '@/llm/fake';
@@ -61,7 +62,11 @@ import { createLocalCodingToolBundle } from '@/tools/local/LocalCodingTools';
 import { createCloudflareCodingToolBundle } from '@/tools/cloudflare';
 import { isThinkingEnabled } from '@/llm/request';
 import { initializeModel } from '@/llm/init';
-import { createLangfuseHandler, disposeLangfuseHandler } from '@/langfuse';
+import {
+  createLangfuseHandler,
+  disposeLangfuseHandler,
+  createLangfuseTraceMetadata,
+} from '@/langfuse';
 import { HandlerRegistry } from '@/events';
 import { ChatOpenAI } from '@/llm/openai';
 import { partitionAndMarkOpenRouterToolCache } from '@/llm/openrouter/toolCache';
@@ -1337,19 +1342,18 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         langfuse: agentContext.langfuse,
         userId: config.configurable?.user_id as string | undefined,
         sessionId: config.configurable?.thread_id as string | undefined,
-        traceMetadata: {
+        traceMetadata: createLangfuseTraceMetadata({
           messageId: this.runId,
           parentMessageId: config.configurable?.requestBody?.parentMessageId,
           agentId,
           agentName: agentContext.name,
-        },
+        }),
+        tags: ['librechat', 'agent'],
       });
       const invokeConfig = langfuseHandler
         ? {
           ...config,
-          callbacks: ((config.callbacks as t.ProvidedCallbacks) ?? []).concat(
-            [langfuseHandler]
-          ),
+          callbacks: appendCallbacks(config.callbacks, [langfuseHandler]),
         }
         : config;
 

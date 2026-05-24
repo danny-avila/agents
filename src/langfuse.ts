@@ -1,8 +1,8 @@
 import { CallbackHandler } from '@langfuse/langchain';
-import { LangfuseSpanProcessor } from '@langfuse/otel';
+import { isDefaultExportSpan, LangfuseSpanProcessor } from '@langfuse/otel';
 import {
+  LangfuseOtelSpanAttributes,
   createObservationAttributes,
-  createTraceAttributes,
 } from '@langfuse/tracing';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
 import { BasicTracerProvider } from '@opentelemetry/sdk-trace-base';
@@ -10,16 +10,20 @@ import { SpanStatusCode } from '@opentelemetry/api';
 import type { Serialized } from '@langchain/core/load/serializable';
 import type { BaseMessage } from '@langchain/core/messages';
 import type { LLMResult } from '@langchain/core/outputs';
-import type { Span } from '@opentelemetry/api';
+import type { Attributes, Span } from '@opentelemetry/api';
 import type * as t from '@/types';
 import { isPresent } from '@/utils/misc';
 
-type TraceMetadata = Record<string, unknown>;
+const TRACE_METADATA_MAX_LENGTH = 200;
+const LANGFUSE_TRACER_NAME = 'langfuse-sdk';
+
+export type LangfuseTraceMetadata = Record<string, string>;
 
 type LangfuseHandlerParams = {
   userId?: string;
   sessionId?: string;
-  traceMetadata?: TraceMetadata;
+  traceMetadata?: LangfuseTraceMetadata;
+  tags?: string[];
 };
 
 type AgentLangfuseHandlerParams = LangfuseHandlerParams & {
@@ -31,6 +35,49 @@ type ResolvedLangfuseConfig = t.LangfuseConfig & {
   publicKey: string;
   secretKey: string;
 };
+
+function getEnvLangfuseBaseUrl(): string | undefined {
+  return process.env.LANGFUSE_BASE_URL ?? process.env.LANGFUSE_BASEURL;
+}
+
+function createTraceMetadata(
+  metadata: Record<string, unknown>
+): LangfuseTraceMetadata {
+  const traceMetadata: LangfuseTraceMetadata = {};
+  for (const [key, value] of Object.entries(metadata)) {
+    if (value == null) {
+      continue;
+    }
+    const stringValue = typeof value === 'string' ? value : String(value);
+    if (
+      stringValue.trim() === '' ||
+      stringValue.length > TRACE_METADATA_MAX_LENGTH
+    ) {
+      continue;
+    }
+    traceMetadata[key] = stringValue;
+  }
+  return traceMetadata;
+}
+
+export function createLangfuseTraceMetadata({
+  messageId,
+  parentMessageId,
+  agentId,
+  agentName,
+}: {
+  messageId?: unknown;
+  parentMessageId?: unknown;
+  agentId?: unknown;
+  agentName?: unknown;
+}): LangfuseTraceMetadata {
+  return createTraceMetadata({
+    messageId,
+    parentMessageId,
+    agentId,
+    agentName,
+  });
+}
 
 function getModelName(serialized: Serialized): string {
   const serializedRecord = serialized as unknown as Record<string, unknown>;
@@ -99,11 +146,39 @@ function getUsageDetails(
     : undefined;
 }
 
-function getTraceName(traceMetadata?: TraceMetadata): string {
+export function getLangfuseTraceName(
+  traceMetadata?: LangfuseTraceMetadata,
+  fallback: string = 'LibreChat Agent'
+): string {
   const agentName = traceMetadata?.agentName;
-  return typeof agentName === 'string' && agentName.trim() !== ''
-    ? `LibreChat Agent: ${agentName}`
-    : 'LibreChat Agent';
+  return isPresent(agentName) ? `${fallback}: ${agentName}` : fallback;
+}
+
+function getTraceAttributes({
+  userId,
+  sessionId,
+  traceMetadata,
+  tags,
+}: LangfuseHandlerParams): Attributes {
+  const attributes: Attributes = {
+    [LangfuseOtelSpanAttributes.TRACE_NAME]:
+      getLangfuseTraceName(traceMetadata),
+  };
+
+  if (isPresent(userId)) {
+    attributes[LangfuseOtelSpanAttributes.TRACE_USER_ID] = userId;
+  }
+  if (isPresent(sessionId)) {
+    attributes[LangfuseOtelSpanAttributes.TRACE_SESSION_ID] = sessionId;
+  }
+  if (tags != null && tags.length > 0) {
+    attributes[LangfuseOtelSpanAttributes.TRACE_TAGS] = tags;
+  }
+  for (const [key, value] of Object.entries(traceMetadata ?? {})) {
+    attributes[`${LangfuseOtelSpanAttributes.TRACE_METADATA}.${key}`] = value;
+  }
+
+  return attributes;
 }
 
 export class LangfuseAgentCallbackHandler extends BaseCallbackHandler {
@@ -113,7 +188,8 @@ export class LangfuseAgentCallbackHandler extends BaseCallbackHandler {
   private readonly processor: LangfuseSpanProcessor;
   private readonly userId?: string;
   private readonly sessionId?: string;
-  private readonly traceMetadata?: TraceMetadata;
+  private readonly traceMetadata?: LangfuseTraceMetadata;
+  private readonly tags?: string[];
   private readonly spans = new Map<string, Span>();
 
   constructor({
@@ -121,11 +197,13 @@ export class LangfuseAgentCallbackHandler extends BaseCallbackHandler {
     userId,
     sessionId,
     traceMetadata,
+    tags,
   }: LangfuseHandlerParams & { langfuse: ResolvedLangfuseConfig }) {
     super();
     this.userId = userId;
     this.sessionId = sessionId;
     this.traceMetadata = traceMetadata;
+    this.tags = tags;
     this.processor = new LangfuseSpanProcessor({
       publicKey: langfuse.publicKey,
       secretKey: langfuse.secretKey,
@@ -135,6 +213,9 @@ export class LangfuseAgentCallbackHandler extends BaseCallbackHandler {
         process.env.NODE_ENV ??
         'development',
       exportMode: 'immediate',
+      shouldExportSpan: ({ otelSpan }): boolean =>
+        isDefaultExportSpan(otelSpan) ||
+        otelSpan.instrumentationScope.name === LANGFUSE_TRACER_NAME,
     });
     this.provider = new BasicTracerProvider({
       spanProcessors: [this.processor],
@@ -160,16 +241,16 @@ export class LangfuseAgentCallbackHandler extends BaseCallbackHandler {
       return;
     }
 
-    const tracer = this.provider.getTracer('librechat-agents-langfuse');
+    const tracer = this.provider.getTracer(LANGFUSE_TRACER_NAME);
     const spanName =
       typeof name === 'string' && name.trim() !== '' ? name : getModelName(llm);
     const span = tracer.startSpan(spanName, {
       attributes: {
-        ...createTraceAttributes({
-          name: getTraceName(this.traceMetadata),
+        ...getTraceAttributes({
           userId: this.userId,
           sessionId: this.sessionId,
-          metadata: this.traceMetadata,
+          traceMetadata: this.traceMetadata,
+          tags: this.tags,
         }),
         ...createObservationAttributes('generation', {
           input,
@@ -312,6 +393,7 @@ export function createLangfuseHandler({
   userId,
   sessionId,
   traceMetadata,
+  tags,
 }: AgentLangfuseHandlerParams): LangfuseAgentCallbackHandler | undefined {
   if (!hasRequiredLangfuseConfig(langfuse)) {
     return undefined;
@@ -322,6 +404,7 @@ export function createLangfuseHandler({
     userId,
     sessionId,
     traceMetadata,
+    tags,
   });
 }
 
@@ -340,7 +423,7 @@ export function hasLangfuseEnvConfig(): boolean {
   return (
     isPresent(process.env.LANGFUSE_SECRET_KEY) &&
     isPresent(process.env.LANGFUSE_PUBLIC_KEY) &&
-    isPresent(process.env.LANGFUSE_BASE_URL)
+    isPresent(getEnvLangfuseBaseUrl())
   );
 }
 

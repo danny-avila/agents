@@ -31,9 +31,16 @@ import { HandlerRegistry } from '@/events';
 import { executeHooks } from '@/hooks';
 import { isOpenAILike } from '@/utils/llm';
 import {
+  appendCallbacks,
+  findCallback,
+  type CallbackEntry,
+} from '@/utils/callbacks';
+import {
   createLegacyLangfuseHandler,
+  createLangfuseTraceMetadata,
   createLangfuseHandler,
   disposeLangfuseHandler,
+  getLangfuseTraceName,
   hasExplicitLangfuseConfig,
   hasLangfuseEnvConfig,
   isLangfuseCallbackHandler,
@@ -598,42 +605,48 @@ export class Run<_T extends t.BaseGraphState> {
     /** Custom event callback to intercept and handle custom events */
     const customEventCallback = this.createCustomEventCallback();
 
-    const baseCallbacks = (config.callbacks as t.ProvidedCallbacks) ?? [];
     const streamCallbacks = streamOptions?.callbacks
       ? this.getCallbacks(streamOptions.callbacks)
-      : [];
+      : undefined;
 
     const customHandler = BaseCallbackHandler.fromMethods({
       [Callback.CUSTOM_EVENT]: customEventCallback,
     });
     customHandler.awaitHandlers = true;
 
-    config.callbacks = baseCallbacks
-      .concat(streamCallbacks)
-      .concat(customHandler);
+    config.callbacks = appendCallbacks(
+      config.callbacks,
+      streamCallbacks ? [streamCallbacks, customHandler] : [customHandler]
+    );
 
     if (
       hasLangfuseEnvConfig() &&
       !hasExplicitLangfuseConfig(this.Graph.agentContexts.values())
     ) {
-      const userId = config.configurable?.user_id;
-      const sessionId = config.configurable?.thread_id;
+      const userId =
+        typeof config.configurable?.user_id === 'string'
+          ? config.configurable.user_id
+          : undefined;
+      const sessionId =
+        typeof config.configurable?.thread_id === 'string'
+          ? config.configurable.thread_id
+          : undefined;
       const primaryContext = this.Graph.agentContexts.get(
         this.Graph.defaultAgentId
       );
-      const traceMetadata = {
+      const traceMetadata = createLangfuseTraceMetadata({
         messageId: this.id,
         parentMessageId: config.configurable?.requestBody?.parentMessageId,
         agentName: primaryContext?.name,
-      };
+      });
       const handler = createLegacyLangfuseHandler({
         userId,
         sessionId,
         traceMetadata,
+        tags: ['librechat', 'agent'],
       });
-      config.callbacks = (
-        (config.callbacks as t.ProvidedCallbacks) ?? []
-      ).concat([handler]);
+      config.runName = config.runName ?? getLangfuseTraceName(traceMetadata);
+      config.callbacks = appendCallbacks(config.callbacks, [handler]);
     }
 
     if (!this.id) {
@@ -1139,17 +1152,26 @@ export class Run<_T extends t.BaseGraphState> {
     titleMethod = TitleMethod.COMPLETION,
     titlePromptTemplate,
   }: t.RunTitleOptions): Promise<{ language?: string; title?: string }> {
-    let titleLangfuseHandler: unknown;
+    let titleLangfuseHandler: CallbackEntry | undefined;
+    const titleContext =
+      this.Graph == null
+        ? undefined
+        : this.Graph.agentContexts.get(this.Graph.defaultAgentId);
+    const traceMetadata = createLangfuseTraceMetadata({
+      messageId: 'title-' + this.id,
+      agentName: titleContext?.name,
+    });
+    const titleRunName = getLangfuseTraceName(traceMetadata, 'LibreChat Title');
+
     if (chainOptions != null) {
-      const userId = chainOptions.configurable?.user_id;
-      const sessionId = chainOptions.configurable?.thread_id;
-      const titleContext = this.Graph?.agentContexts.get(
-        this.Graph.defaultAgentId
-      );
-      const traceMetadata = {
-        messageId: 'title-' + this.id,
-        agentName: titleContext?.name,
-      };
+      const userId =
+        typeof chainOptions.configurable?.user_id === 'string'
+          ? chainOptions.configurable.user_id
+          : undefined;
+      const sessionId =
+        typeof chainOptions.configurable?.thread_id === 'string'
+          ? chainOptions.configurable.thread_id
+          : undefined;
       const hasExplicitLangfuse =
         this.Graph != null &&
         hasExplicitLangfuseConfig(this.Graph.agentContexts.values());
@@ -1159,20 +1181,20 @@ export class Run<_T extends t.BaseGraphState> {
           userId,
           sessionId,
           traceMetadata,
+          tags: ['librechat', 'title'],
         });
       } else if (hasLangfuseEnvConfig() && !hasExplicitLangfuse) {
         titleLangfuseHandler = createLegacyLangfuseHandler({
           userId,
           sessionId,
           traceMetadata,
+          tags: ['librechat', 'title'],
         });
       }
 
       if (titleLangfuseHandler != null) {
-        chainOptions.callbacks = (
-          (chainOptions.callbacks as t.ProvidedCallbacks) ?? []
-        ).concat([
-          titleLangfuseHandler as NonNullable<t.ProvidedCallbacks>[number],
+        chainOptions.callbacks = appendCallbacks(chainOptions.callbacks, [
+          titleLangfuseHandler,
         ]);
       }
     }
@@ -1236,6 +1258,7 @@ export class Run<_T extends t.BaseGraphState> {
     const invokeConfig = Object.assign({}, chainOptions, {
       run_id: this.id,
       runId: this.id,
+      runName: chainOptions?.runName ?? titleRunName,
     });
 
     try {
@@ -1247,9 +1270,10 @@ export class Run<_T extends t.BaseGraphState> {
       } catch (_e) {
         // Fallback: strip callbacks to avoid EventStream tracer errors in certain environments
         // but preserve Langfuse tracing if it exists.
-        const langfuseHandler = (
-          invokeConfig.callbacks as t.ProvidedCallbacks
-        )?.find(isLangfuseCallbackHandler);
+        const langfuseHandler = findCallback(
+          invokeConfig.callbacks,
+          isLangfuseCallbackHandler
+        );
         const { callbacks: _cb, ...rest } = invokeConfig;
         const safeConfig = Object.assign({}, rest, {
           callbacks: langfuseHandler ? [langfuseHandler] : [],

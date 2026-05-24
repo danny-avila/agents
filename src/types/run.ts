@@ -3,10 +3,7 @@ import type * as z from 'zod';
 import type { BaseMessage } from '@langchain/core/messages';
 import type { StructuredTool } from '@langchain/core/tools';
 import type { RunnableConfig } from '@langchain/core/runnables';
-import type {
-  BaseCallbackHandler,
-  CallbackHandlerMethods,
-} from '@langchain/core/callbacks/base';
+import type { Callbacks } from '@langchain/core/callbacks/manager';
 import type * as s from '@/types/stream';
 import type * as e from '@/common/enum';
 import type * as g from '@/types/graph';
@@ -213,9 +210,7 @@ export type RunConfig = {
   humanInTheLoop?: HumanInTheLoopConfig;
 };
 
-export type ProvidedCallbacks =
-  | (BaseCallbackHandler | CallbackHandlerMethods)[]
-  | undefined;
+export type ProvidedCallbacks = Callbacks | undefined;
 
 export type TokenCounter = (message: BaseMessage) => number;
 
