@@ -107,26 +107,105 @@ describe('Cloudflare sandbox execution backend', () => {
     expect(listPaths).toEqual(['/workspace']);
   });
 
-  it('aborts remote exec when the local timeout kills the spawn wrapper', async () => {
-    let signal: AbortSignal | undefined;
+  it('does not pass AbortSignal to Cloudflare spawn exec options', async () => {
+    let resolveExecCalled!: () => void;
+    const execCalled = new Promise<void>((resolve) => {
+      resolveExecCalled = resolve;
+    });
+    let receivedOptions: t.CloudflareSandboxExecOptions | undefined;
     const sandbox = createRuntime({
-      exec: (_command, options) =>
-        new Promise<t.CloudflareSandboxExecResult>((_resolve, reject) => {
-          signal = options?.signal;
-          signal?.addEventListener('abort', () => reject(new Error('aborted')));
-        }),
+      exec: (_command, options) => {
+        receivedOptions = options;
+        resolveExecCalled();
+        return new Promise<t.CloudflareSandboxExecResult>(() => undefined);
+      },
     });
     const config = createCloudflareLocalExecutionConfig({
       sandbox,
+      timeoutMs: 50,
+      workspaceRoot: '/workspace',
+    });
+
+    const resultPromise = spawnLocalProcess(
+      'bash',
+      ['-lc', 'sleep 10'],
+      config
+    );
+    await execCalled;
+    const result = await resultPromise;
+
+    expect(receivedOptions).not.toHaveProperty('signal');
+    expect(result.timedOut).toBe(true);
+    expect(result.exitCode).toBe(143);
+  });
+
+  it('passes AbortSignal to signal-aware runtimes and aborts it on kill', async () => {
+    let resolveExecCalled!: () => void;
+    const execCalled = new Promise<void>((resolve) => {
+      resolveExecCalled = resolve;
+    });
+    let receivedSignal: AbortSignal | undefined;
+    let abortEvents = 0;
+    const sandbox = createRuntime({
+      supportsExecSignal: true,
+      exec: (_command, options) => {
+        receivedSignal = options?.signal;
+        receivedSignal?.addEventListener('abort', () => {
+          abortEvents += 1;
+        });
+        resolveExecCalled();
+        return new Promise<t.CloudflareSandboxExecResult>(() => undefined);
+      },
+    });
+    const config = createCloudflareLocalExecutionConfig({
+      sandbox,
+      timeoutMs: 50,
+      workspaceRoot: '/workspace',
+    });
+
+    const resultPromise = spawnLocalProcess(
+      'bash',
+      ['-lc', 'sleep 10'],
+      config
+    );
+    await execCalled;
+    const result = await resultPromise;
+
+    expect(receivedSignal).toBeDefined();
+    expect(receivedSignal?.aborted).toBe(true);
+    expect(abortEvents).toBe(1);
+    expect(result.timedOut).toBe(true);
+    expect(result.exitCode).toBe(143);
+  });
+
+  it('does not start remote exec when killed before async sandbox resolution finishes', async () => {
+    let execCalls = 0;
+    let resolveSandbox!: (runtime: t.CloudflareSandboxRuntime) => void;
+    const sandboxPromise = new Promise<t.CloudflareSandboxRuntime>(
+      (resolve) => {
+        resolveSandbox = resolve;
+      }
+    );
+    const config = createCloudflareLocalExecutionConfig({
+      sandbox: () => sandboxPromise,
       timeoutMs: 10,
       workspaceRoot: '/workspace',
     });
 
     const result = await spawnLocalProcess('bash', ['-lc', 'sleep 10'], config);
+    resolveSandbox(
+      createRuntime({
+        exec: async () => {
+          execCalls += 1;
+          return { exitCode: 0, stdout: '', stderr: '' };
+        },
+      })
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
 
-    expect(signal?.aborted).toBe(true);
     expect(result.timedOut).toBe(true);
     expect(result.exitCode).toBe(143);
+    expect(execCalls).toBe(0);
   });
 
   it('memoizes sandbox factory results per config object', async () => {

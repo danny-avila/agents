@@ -469,6 +469,7 @@ export function createCloudflareBridgeRuntime(
   }
 
   return {
+    supportsExecSignal: true,
     getSandboxId,
     exec,
     readFile,

@@ -853,6 +853,12 @@ export type CloudflareSandboxListFilesResult =
     };
 
 export interface CloudflareSandboxRuntime {
+  /**
+   * True when this runtime can consume AbortSignal values in exec options.
+   * Native Cloudflare Sandbox Durable Object RPC cannot clone AbortSignal,
+   * but HTTP bridge runtimes can use it to abort the underlying fetch.
+   */
+  supportsExecSignal?: boolean;
   exec(
     command: string,
     options?: CloudflareSandboxExecOptions

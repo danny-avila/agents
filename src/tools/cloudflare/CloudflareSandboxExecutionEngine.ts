@@ -400,8 +400,8 @@ function createCloudflareSpawn(
   return (command, args, options) => {
     const stdout = new PassThrough();
     const stderr = new PassThrough();
-    const abortController = new AbortController();
     const child = new EventEmitter() as ChildProcessWithoutNullStreams;
+    const abortController = new AbortController();
     const state = { closed: false };
     const closeOnce = (
       exitCode: number | null,
@@ -451,13 +451,19 @@ function createCloudflareSpawn(
       const timedCommand = withInSandboxTimeout(rendered, timeoutMs);
       const cwd =
         options.cwd == null ? ctx.workspaceRoot : options.cwd.toString();
+      if (state.closed) {
+        return;
+      }
+      const execOptions: t.CloudflareSandboxExecOptions = {
+        cwd,
+        env: ctx.env,
+        timeout: outerTimeoutMs(timeoutMs),
+      };
+      if (ctx.sandbox.supportsExecSignal === true) {
+        execOptions.signal = abortController.signal;
+      }
       try {
-        const result = await ctx.sandbox.exec(timedCommand, {
-          cwd,
-          env: ctx.env,
-          timeout: outerTimeoutMs(timeoutMs),
-          signal: abortController.signal,
-        });
+        const result = await ctx.sandbox.exec(timedCommand, execOptions);
         if (state.closed) {
           return;
         }
