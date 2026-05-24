@@ -407,10 +407,7 @@ function createCloudflareSpawn(
       try {
         const result = await ctx.sandbox.exec(rendered, {
           cwd,
-          env: {
-            ...ctx.env,
-            ...(options.env as Record<string, string | undefined> | undefined),
-          },
+          env: ctx.env,
           timeout: ctx.timeoutMs,
           signal: abortController.signal,
         });
@@ -462,7 +459,7 @@ export function createCloudflareLocalExecutionConfig(
   };
 }
 
-async function validateCloudflareBashCommand(
+export async function validateCloudflareBashCommand(
   command: string,
   args: readonly string[],
   config: t.CloudflareSandboxExecutionConfig

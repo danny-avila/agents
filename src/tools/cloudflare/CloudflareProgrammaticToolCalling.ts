@@ -1,6 +1,8 @@
 import { tool } from '@langchain/core/tools';
 import type { DynamicStructuredTool } from '@langchain/core/tools';
 import type * as t from '@/types';
+
+/* eslint-disable no-useless-escape -- generated sandbox helper source needs escapes for emitted JS/Python string literals. */
 import {
   formatCompletedResponse,
   normalizeToPythonIdentifier,
@@ -19,6 +21,8 @@ import { Constants } from '@/common';
 import {
   executeCloudflareCode,
   getCloudflareWorkspaceRoot,
+  resolveCloudflareSandbox,
+  validateCloudflareBashCommand,
 } from './CloudflareSandboxExecutionEngine';
 
 type ProgrammaticParams = {
@@ -32,6 +36,7 @@ type ProgrammaticParams = {
 const DEFAULT_TIMEOUT = 60000;
 const MIN_TIMEOUT = 1000;
 const MAX_TIMEOUT = 300000;
+const DEFAULT_MAX_OUTPUT_CHARS = 200000;
 
 type TimeoutSchema = {
   type: 'integer';
@@ -102,6 +107,50 @@ function createTimeoutSchema(timeoutMs?: number): TimeoutSchema {
   };
 }
 
+function quoteShell(value: string): string {
+  if (/^[A-Za-z0-9_/:=.,@%+-]+$/.test(value)) {
+    return value;
+  }
+  const escapedQuote = String.raw`'\''`;
+  return `'${value.replace(/'/g, escapedQuote)}'`;
+}
+
+function truncateOutput(
+  value: string,
+  maxChars = DEFAULT_MAX_OUTPUT_CHARS
+): string {
+  if (value.length <= maxChars) {
+    return value;
+  }
+  const head = Math.floor(maxChars * 0.6);
+  const tail = maxChars - head;
+  const omitted = value.length - maxChars;
+  return `${value.slice(0, head)}\n\n[... ${omitted} characters truncated ...]\n\n${value.slice(
+    value.length - tail
+  )}`;
+}
+
+async function executeGeneratedCloudflareBash(
+  command: string,
+  config: t.CloudflareSandboxExecutionConfig
+): ReturnType<typeof executeCloudflareCode> {
+  const sandbox = await resolveCloudflareSandbox(config);
+  const workspaceRoot = getCloudflareWorkspaceRoot(config);
+  const shell = config.shell ?? 'bash';
+  const result = await sandbox.exec(`${shell} -lc ${quoteShell(command)}`, {
+    cwd: workspaceRoot,
+    env: config.env,
+    timeout: config.timeoutMs,
+  });
+  const maxOutputChars = config.maxOutputChars ?? DEFAULT_MAX_OUTPUT_CHARS;
+  return {
+    stdout: truncateOutput(result.stdout, maxOutputChars),
+    stderr: truncateOutput(result.stderr, maxOutputChars),
+    exitCode: result.exitCode,
+    timedOut: false,
+  };
+}
+
 function createCloudflareProgrammaticToolCallingSchema(
   config: t.CloudflareSandboxExecutionConfig
 ): CloudflareProgrammaticToolCallingJsonSchema {
@@ -157,20 +206,122 @@ function indent(code: string, spaces = 4): string {
     .join('\n');
 }
 
-function createPythonNativeToolSource(workspaceRoot: string): string {
+function pythonBoolean(value: boolean | undefined): 'True' | 'False' {
+  return value === true ? 'True' : 'False';
+}
+
+function createPythonNativeToolSource(
+  config: t.CloudflareSandboxExecutionConfig,
+  workspaceRoot: string
+): string {
   return `
 import asyncio, fnmatch, glob, json, os, pathlib, re, shlex, shutil, subprocess, sys, tempfile
 
 WORKSPACE = ${JSON.stringify(workspaceRoot)}
+READ_ONLY = ${pythonBoolean(config.readOnly)}
+ALLOW_DANGEROUS_COMMANDS = ${pythonBoolean(config.allowDangerousCommands)}
+DESTRUCTIVE_TARGET = r"(?:/|~|\\$\\{?HOME\\}?|\\.)(?:/?\\.?\\*|/)?"
+DANGEROUS_COMMAND_PATTERNS = [
+    re.compile(r"\\brm\\s+(?:-[^\\s]*[rf][^\\s]*\\s+|-[^\\s]*[r][^\\s]*\\s+-[^\\s]*[f][^\\s]*\\s+)(?:--\\s+)?" + DESTRUCTIVE_TARGET + r"\\s*(?:$|[;&|])"),
+    re.compile(r"\\b(?:mkfs|mkswap|fdisk|parted|diskutil)\\b"),
+    re.compile(r"\\bdd\\s+[^;&|]*\\bof=/dev/"),
+    re.compile(r"\\bchmod\\s+-R\\s+(?:777|a\\+w)\\s+(?:--\\s+)?" + DESTRUCTIVE_TARGET + r"(?:$|\\s|[;&|])"),
+    re.compile(r"\\bchown\\s+-R\\s+[^;&|]+\\s+(?:--\\s+)?" + DESTRUCTIVE_TARGET + r"(?:$|\\s|[;&|])"),
+    re.compile(r":\\s*\\(\\s*\\)\\s*\\{\\s*:\\s*\\|\\s*:\\s*&\\s*\\}\\s*;\\s*:"),
+]
+QUOTED_DESTRUCTIVE_PATTERNS = [
+    re.compile(r"\\brm\\s+(?:-[^\\s]*[rf][^\\s]*\\s+){1,3}(?:--\\s+)?[\\"']" + DESTRUCTIVE_TARGET + r"[\\"']"),
+    re.compile(r"\\bchmod\\s+-R\\s+(?:777|a\\+w)\\s+(?:--\\s+)?[\\"']" + DESTRUCTIVE_TARGET + r"[\\"']"),
+    re.compile(r"\\bchown\\s+-R\\s+[^;&|]+\\s+(?:--\\s+)?[\\"']" + DESTRUCTIVE_TARGET + r"[\\"']"),
+]
+NESTED_SHELL_PREFIX = r"(?:(?:ba|z|da|k)?sh|eval)\\s+(?:-l?c\\s+)?"
+NESTED_SHELL_DESTRUCTIVE_PATTERNS = [
+    re.compile(NESTED_SHELL_PREFIX + r"[\\"'][^\\"']*\\brm\\s+-[^\\s\\"']*[rf][^\\s\\"']*\\s+(?:--\\s+)?(?:/|~|\\$\\{?HOME\\}?|\\.)"),
+    re.compile(NESTED_SHELL_PREFIX + r"[\\"'][^\\"']*\\bchmod\\s+-R\\s+(?:777|a\\+w)\\s+(?:--\\s+)?(?:/|~|\\$\\{?HOME\\}?|\\.)"),
+    re.compile(NESTED_SHELL_PREFIX + r"[\\"'][^\\"']*\\bchown\\s+-R\\s+[^;&|]+\\s+(?:--\\s+)?(?:/|~|\\$\\{?HOME\\}?|\\.)"),
+]
+MUTATING_COMMAND_PATTERN = re.compile(r"\\b(?:rm|mv|cp|touch|mkdir|rmdir|ln|truncate|tee|sed\\s+-i|perl\\s+-pi|python(?:3)?\\s+-c|node\\s+-e|npm\\s+(?:install|ci|update|publish)|pnpm\\s+(?:install|update|publish)|yarn\\s+(?:install|add|publish)|git\\s+(?:add|commit|checkout|switch|reset|clean|rebase|merge|push|pull|stash|tag|branch)|chmod|chown)\\b|(?:^|[^<])>\\s*[^&]|\\bcat\\s+[^|;&]*>\\s*")
+PROTECTED_TARGET_ARG_RE = re.compile(r"^(?:/|~|\\$\\{?HOME\\}?|\\.)(?:/?\\.?\\*|/)?$")
+DESTRUCTIVE_OP_IN_COMMAND_RE = re.compile(r"\\b(?:rm\\s+-[^\\s]*[rf]|chmod\\s+-R|chown\\s+-R)\\b")
+
+def _is_within_workspace(file_path):
+    resolved = os.path.abspath(file_path)
+    root = os.path.abspath(WORKSPACE)
+    return resolved == root or resolved.startswith(root + os.sep)
 
 def _resolve(file_path="."):
     raw = file_path or "."
     candidate = raw if os.path.isabs(raw) else os.path.join(WORKSPACE, raw)
     resolved = os.path.abspath(candidate)
-    root = os.path.abspath(WORKSPACE)
-    if resolved != root and not resolved.startswith(root + os.sep):
+    if not _is_within_workspace(resolved):
         raise ValueError(f"Path is outside the Cloudflare sandbox workspace: {file_path}")
     return resolved
+
+def _assert_writable(tool_name):
+    if READ_ONLY:
+        raise PermissionError(f"{tool_name} is blocked in read-only Cloudflare sandbox mode.")
+
+def _strip_quoted_content(command):
+    output = []
+    quote = None
+    escaped = False
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if escaped:
+            escaped = False
+            output.append(" ")
+            index += 1
+            continue
+        if char == "\\\\":
+            escaped = True
+            output.append(" ")
+            index += 1
+            continue
+        if quote is not None:
+            if char == quote:
+                quote = None
+            output.append(" ")
+            index += 1
+            continue
+        if char in ("'", '"', "\`"):
+            quote = char
+            output.append(" ")
+            index += 1
+            continue
+        if char == "#":
+            while index < len(command) and command[index] != "\\n":
+                output.append(" ")
+                index += 1
+            output.append("\\n")
+            index += 1
+            continue
+        output.append(char)
+        index += 1
+    return "".join(output)
+
+def _validate_bash_command(command, args=None):
+    errors = []
+    normalized = _strip_quoted_content(command)
+    if command.strip() == "":
+        errors.append("Command is empty.")
+    if "\\0" in command:
+        errors.append("Command contains a NUL byte.")
+    if not ALLOW_DANGEROUS_COMMANDS:
+        if any(pattern.search(normalized) for pattern in DANGEROUS_COMMAND_PATTERNS):
+            errors.append("Command matches a destructive command pattern.")
+        elif any(pattern.search(command) for pattern in QUOTED_DESTRUCTIVE_PATTERNS):
+            errors.append("Command matches a destructive command pattern (quoted target).")
+        elif any(pattern.search(command) for pattern in NESTED_SHELL_DESTRUCTIVE_PATTERNS):
+            errors.append("Command matches a destructive command pattern (nested shell payload).")
+        elif args and DESTRUCTIVE_OP_IN_COMMAND_RE.search(command):
+            offending = next((str(arg) for arg in args if PROTECTED_TARGET_ARG_RE.search(str(arg))), None)
+            if offending is not None:
+                errors.append(f"Command matches a destructive command pattern (protected target \\"{offending}\\" passed via positional arg).")
+    if READ_ONLY and MUTATING_COMMAND_PATTERN.search(normalized):
+        errors.append("Command appears to mutate files or repository state in read-only Cloudflare sandbox mode.")
+    if errors:
+        raise ValueError("\\n".join(errors))
 
 def _line_window(content, offset=None, limit=None):
     start = max((offset or 1) - 1, 0)
@@ -179,6 +330,7 @@ def _line_window(content, offset=None, limit=None):
     return "\\n".join(f"{start + idx + 1:6d}\\t{line}" for idx, line in enumerate(selected))
 
 def _run(command, timeout=None, args=None):
+    _validate_bash_command(command, args=args)
     completed = subprocess.run(
         ["bash", "-lc", command, "--"] + [str(arg) for arg in (args or [])],
         cwd=WORKSPACE,
@@ -299,6 +451,7 @@ async def read_file(file_path, offset=None, limit=None):
         return _line_window(handle.read(), offset, limit)
 
 async def write_file(file_path, content):
+    _assert_writable("write_file")
     resolved = _resolve(file_path)
     os.makedirs(os.path.dirname(resolved), exist_ok=True)
     existed = os.path.exists(resolved)
@@ -307,6 +460,7 @@ async def write_file(file_path, content):
     return f"{'Overwrote' if existed else 'Created'} {resolved} ({len(content)} chars)."
 
 async def edit_file(file_path, old_text=None, new_text=None, edits=None):
+    _assert_writable("edit_file")
     resolved = _resolve(file_path)
     edits = edits or [{"old_text": old_text, "new_text": new_text}]
     content = open(resolved, encoding="utf-8").read()
@@ -349,7 +503,14 @@ async def grep_search(pattern, path=".", glob=None, max_results=200):
 
 async def glob_search(pattern, path=".", max_results=200):
     root = _resolve(path)
-    matches = glob_module.glob(os.path.join(root, pattern), recursive=True)[:max_results]
+    target = pattern if os.path.isabs(pattern) else os.path.join(root, pattern)
+    matches = []
+    for match in glob_module.glob(target, recursive=True):
+        resolved = os.path.abspath(match)
+        if _is_within_workspace(resolved):
+            matches.append(resolved)
+            if len(matches) >= max_results:
+                break
     return "\\n".join(matches) if matches else "No files found."
 
 async def compile_check(command=None, timeout_ms=None):
@@ -366,7 +527,10 @@ glob_module = glob
 `.trim();
 }
 
-function createNodeNativeToolSource(workspaceRoot: string): string {
+function createNodeNativeToolSource(
+  config: t.CloudflareSandboxExecutionConfig,
+  workspaceRoot: string
+): string {
   return `
 const fs = require("fs");
 const fsp = fs.promises;
@@ -374,6 +538,31 @@ const path = require("path");
 const cp = require("child_process");
 
 const WORKSPACE = ${JSON.stringify(workspaceRoot)};
+const READ_ONLY = ${JSON.stringify(config.readOnly === true)};
+const ALLOW_DANGEROUS_COMMANDS = ${JSON.stringify(config.allowDangerousCommands === true)};
+const DESTRUCTIVE_TARGET = "(?:\\\\/|~|\\\\$\\\\{?HOME\\\\}?|\\\\.)(?:\\\\/?\\\\.?\\\\*|\\\\/)?";
+const DANGEROUS_COMMAND_PATTERNS = [
+  new RegExp("\\\\brm\\\\s+(?:-[^\\\\s]*[rf][^\\\\s]*\\\\s+|-[^\\\\s]*[r][^\\\\s]*\\\\s+-[^\\\\s]*[f][^\\\\s]*\\\\s+)(?:--\\\\s+)?" + DESTRUCTIVE_TARGET + "\\\\s*(?:$|[;&|])"),
+  /\\b(?:mkfs|mkswap|fdisk|parted|diskutil)\\b/,
+  /\\bdd\\s+[^;&|]*\\bof=\\/dev\\//,
+  new RegExp("\\\\bchmod\\\\s+-R\\\\s+(?:777|a\\\\+w)\\\\s+(?:--\\\\s+)?" + DESTRUCTIVE_TARGET + "(?:$|\\\\s|[;&|])"),
+  new RegExp("\\\\bchown\\\\s+-R\\\\s+[^;&|]+\\\\s+(?:--\\\\s+)?" + DESTRUCTIVE_TARGET + "(?:$|\\\\s|[;&|])"),
+  /:\\s*\\(\\s*\\)\\s*\\{\\s*:\\s*\\|\\s*:\\s*&\\s*\\}\\s*;\\s*:/,
+];
+const QUOTED_DESTRUCTIVE_PATTERNS = [
+  new RegExp("\\\\brm\\\\s+(?:-[^\\\\s]*[rf][^\\\\s]*\\\\s+){1,3}(?:--\\\\s+)?[\\\"']" + DESTRUCTIVE_TARGET + "[\\\"']"),
+  new RegExp("\\\\bchmod\\\\s+-R\\\\s+(?:777|a\\\\+w)\\\\s+(?:--\\\\s+)?[\\\"']" + DESTRUCTIVE_TARGET + "[\\\"']"),
+  new RegExp("\\\\bchown\\\\s+-R\\\\s+[^;&|]+\\\\s+(?:--\\\\s+)?[\\\"']" + DESTRUCTIVE_TARGET + "[\\\"']"),
+];
+const NESTED_SHELL_PREFIX = "(?:(?:ba|z|da|k)?sh|eval)\\\\s+(?:-l?c\\\\s+)?";
+const NESTED_SHELL_DESTRUCTIVE_PATTERNS = [
+  new RegExp(NESTED_SHELL_PREFIX + "[\\\"'][^\\\"']*\\\\brm\\\\s+-[^\\\\s\\\"']*[rf][^\\\\s\\\"']*\\\\s+(?:--\\\\s+)?(?:\\\\/|~|\\\\$\\\\{?HOME\\\\}?|\\\\.)"),
+  new RegExp(NESTED_SHELL_PREFIX + "[\\\"'][^\\\"']*\\\\bchmod\\\\s+-R\\\\s+(?:777|a\\\\+w)\\\\s+(?:--\\\\s+)?(?:\\\\/|~|\\\\$\\\\{?HOME\\\\}?|\\\\.)"),
+  new RegExp(NESTED_SHELL_PREFIX + "[\\\"'][^\\\"']*\\\\bchown\\\\s+-R\\\\s+[^;&|]+\\\\s+(?:--\\\\s+)?(?:\\\\/|~|\\\\$\\\\{?HOME\\\\}?|\\\\.)"),
+];
+const MUTATING_COMMAND_PATTERN = /\\b(?:rm|mv|cp|touch|mkdir|rmdir|ln|truncate|tee|sed\\s+-i|perl\\s+-pi|python(?:3)?\\s+-c|node\\s+-e|npm\\s+(?:install|ci|update|publish)|pnpm\\s+(?:install|update|publish)|yarn\\s+(?:install|add|publish)|git\\s+(?:add|commit|checkout|switch|reset|clean|rebase|merge|push|pull|stash|tag|branch)|chmod|chown)\\b|(?:^|[^<])>\\s*[^&]|\\bcat\\s+[^|;&]*>\\s*/;
+const PROTECTED_TARGET_ARG_RE = /^(?:\\/|~|\\$\\{?HOME\\}?|\\.)(?:\\/?\\.?\\*|\\/)?$/;
+const DESTRUCTIVE_OP_IN_COMMAND_RE = /\\b(?:rm\\s+-[^\\s]*[rf]|chmod\\s+-R|chown\\s+-R)\\b/;
 
 function resolvePath(filePath) {
   const raw = filePath || ".";
@@ -384,6 +573,82 @@ function resolvePath(filePath) {
     throw new Error("Path is outside the Cloudflare sandbox workspace: " + filePath);
   }
   return resolved;
+}
+
+function assertWritable(toolName) {
+  if (READ_ONLY) {
+    throw new Error(toolName + " is blocked in read-only Cloudflare sandbox mode.");
+  }
+}
+
+function stripQuotedContent(command) {
+  let output = "";
+  let quote;
+  let escaped = false;
+  for (let index = 0; index < command.length; index++) {
+    const char = command[index];
+    if (escaped) {
+      escaped = false;
+      output += " ";
+      continue;
+    }
+    if (char === "\\\\") {
+      escaped = true;
+      output += " ";
+      continue;
+    }
+    if (quote != null) {
+      if (char === quote) quote = undefined;
+      output += " ";
+      continue;
+    }
+    if (char === "\\\"" || char === "'" || char === "\`") {
+      quote = char;
+      output += " ";
+      continue;
+    }
+    if (char === "#") {
+      while (index < command.length && command[index] !== "\\n") {
+        output += " ";
+        index += 1;
+      }
+      output += "\\n";
+      continue;
+    }
+    output += char;
+  }
+  return output;
+}
+
+function validateBashCommand(command, args) {
+  const errors = [];
+  const normalized = stripQuotedContent(command);
+  if (command.trim() === "") {
+    errors.push("Command is empty.");
+  }
+  if (command.includes("\\0")) {
+    errors.push("Command contains a NUL byte.");
+  }
+  if (!ALLOW_DANGEROUS_COMMANDS) {
+    if (DANGEROUS_COMMAND_PATTERNS.some((pattern) => pattern.test(normalized))) {
+      errors.push("Command matches a destructive command pattern.");
+    } else if (QUOTED_DESTRUCTIVE_PATTERNS.some((pattern) => pattern.test(command))) {
+      errors.push("Command matches a destructive command pattern (quoted target).");
+    } else if (NESTED_SHELL_DESTRUCTIVE_PATTERNS.some((pattern) => pattern.test(command))) {
+      errors.push("Command matches a destructive command pattern (nested shell payload).");
+    } else if ((args || []).length > 0 && DESTRUCTIVE_OP_IN_COMMAND_RE.test(command)) {
+      const offending = (args || []).map(String).find((arg) => PROTECTED_TARGET_ARG_RE.test(arg));
+      if (offending !== undefined) {
+        errors.push("Command matches a destructive command pattern (protected target \\"" + offending + "\\" passed via positional arg).");
+      }
+    }
+  }
+  if (READ_ONLY && MUTATING_COMMAND_PATTERN.test(normalized)) {
+    errors.push("Command appears to mutate files or repository state in read-only Cloudflare sandbox mode.");
+  }
+  if (errors.length > 0) {
+    throw new Error(errors.join("\\n"));
+  }
 }
 
 function lineWindow(content, offset, limit) {
@@ -401,6 +666,7 @@ function quote(value) {
 }
 
 function run(command, timeoutMs, args) {
+  validateBashCommand(command, args);
   return new Promise((resolve) => {
     const child = cp.spawn("bash", ["-lc", command, "--", ...((args || []).map(String))], {
       cwd: WORKSPACE,
@@ -585,6 +851,7 @@ async function read_file(payload) {
 }
 
 async function write_file(payload) {
+  assertWritable("write_file");
   const resolved = resolvePath(payload.file_path);
   await fsp.mkdir(path.dirname(resolved), { recursive: true });
   const existed = fs.existsSync(resolved);
@@ -593,6 +860,7 @@ async function write_file(payload) {
 }
 
 async function edit_file(payload) {
+  assertWritable("edit_file");
   const resolved = resolvePath(payload.file_path);
   const edits = payload.edits || [{ old_text: payload.old_text, new_text: payload.new_text }];
   let content = await fsp.readFile(resolved, "utf8");
@@ -694,6 +962,7 @@ main().catch((error) => {
 function createPythonProgram(
   userCode: string,
   toolDefs: t.LCTool[],
+  config: t.CloudflareSandboxExecutionConfig,
   workspaceRoot: string
 ): string {
   const aliases = toolDefs
@@ -705,7 +974,7 @@ function createPythonProgram(
     })
     .filter(Boolean)
     .join('\n');
-  return `${createPythonNativeToolSource(workspaceRoot)}
+  return `${createPythonNativeToolSource(config, workspaceRoot)}
 ${aliases}
 
 async def __lc_user_main__():
@@ -718,9 +987,10 @@ asyncio.run(__lc_user_main__())
 function createBashProgram(
   userCode: string,
   toolDefs: t.LCTool[],
+  config: t.CloudflareSandboxExecutionConfig,
   workspaceRoot: string
 ): string {
-  const helper = createNodeNativeToolSource(workspaceRoot);
+  const helper = createNodeNativeToolSource(config, workspaceRoot);
   const functions = toolDefs
     .map((def) => {
       const bashName = normalizeToBashIdentifier(def.name);
@@ -761,30 +1031,36 @@ async function runProgrammatic(args: {
   const timeoutMs =
     args.params.timeout ?? args.cloudflareConfig.timeoutMs ?? DEFAULT_TIMEOUT;
   const workspaceRoot = getCloudflareWorkspaceRoot(args.cloudflareConfig);
-  const result =
-    args.runtime === 'bash'
-      ? await executeCloudflareCode(
-        {
-          lang: 'bash',
-          code: createBashProgram(
-            args.params.code,
-            effectiveTools,
-            workspaceRoot
-          ),
-        },
-        { ...args.cloudflareConfig, timeoutMs }
-      )
-      : await executeCloudflareCode(
-        {
-          lang: 'py',
-          code: createPythonProgram(
-            args.params.code,
-            effectiveTools,
-            workspaceRoot
-          ),
-        },
-        { ...args.cloudflareConfig, timeoutMs }
-      );
+  let result: Awaited<ReturnType<typeof executeCloudflareCode>>;
+
+  if (args.runtime === 'bash') {
+    await validateCloudflareBashCommand(args.params.code, [], {
+      ...args.cloudflareConfig,
+      timeoutMs,
+    });
+    result = await executeGeneratedCloudflareBash(
+      createBashProgram(
+        args.params.code,
+        effectiveTools,
+        args.cloudflareConfig,
+        workspaceRoot
+      ),
+      { ...args.cloudflareConfig, timeoutMs }
+    );
+  } else {
+    result = await executeCloudflareCode(
+      {
+        lang: 'py',
+        code: createPythonProgram(
+          args.params.code,
+          effectiveTools,
+          args.cloudflareConfig,
+          workspaceRoot
+        ),
+      },
+      { ...args.cloudflareConfig, timeoutMs }
+    );
+  }
 
   if (result.exitCode !== 0 || result.timedOut) {
     throw new Error(

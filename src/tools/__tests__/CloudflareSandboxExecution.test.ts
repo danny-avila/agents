@@ -5,6 +5,10 @@ import {
   createCloudflareLocalExecutionConfig,
 } from '../cloudflare/CloudflareSandboxExecutionEngine';
 import { createCloudflareBridgeRuntime } from '../cloudflare/CloudflareBridgeRuntime';
+import {
+  createCloudflareBashProgrammaticToolCallingTool,
+  createCloudflareProgrammaticToolCallingTool,
+} from '../cloudflare/CloudflareProgrammaticToolCalling';
 
 function sseResponse(events: string): Response {
   return new Response(events, {
@@ -103,6 +107,87 @@ describe('Cloudflare sandbox execution backend', () => {
     expect(signal?.aborted).toBe(true);
     expect(result.timedOut).toBe(true);
     expect(result.exitCode).toBe(143);
+  });
+
+  it('forwards only explicit Cloudflare env vars to sandbox exec', async () => {
+    let execEnv: Record<string, string | undefined> | undefined;
+    const sandbox = createRuntime({
+      exec: async (_command, options) => {
+        execEnv = options?.env;
+        return {
+          exitCode: 0,
+          stdout: 'ok',
+          stderr: '',
+        };
+      },
+    });
+    const config = createCloudflareLocalExecutionConfig({
+      sandbox,
+      workspaceRoot: '/workspace',
+      env: { SAFE_FOR_SANDBOX: 'yes' },
+    });
+
+    await spawnLocalProcess('bash', ['-lc', 'echo ok'], config);
+
+    expect(execEnv).toEqual({ SAFE_FOR_SANDBOX: 'yes' });
+  });
+
+  it('injects read-only and workspace guards into Python programmatic tools', async () => {
+    let source = '';
+    const sandbox = createRuntime({
+      writeFile: async (_path, content) => {
+        source = String(content);
+        return { ok: true };
+      },
+      exec: async () => ({
+        exitCode: 0,
+        stdout: 'done',
+        stderr: '',
+      }),
+    });
+    const programmatic = createCloudflareProgrammaticToolCallingTool({
+      sandbox,
+      workspaceRoot: '/workspace',
+      readOnly: true,
+    });
+
+    await programmatic.invoke({
+      code: 'await write_file("x.txt", "blocked")',
+      lang: 'py',
+    });
+
+    expect(source).toContain('READ_ONLY = True');
+    expect(source).toContain('_assert_writable("write_file")');
+    expect(source).toContain('if _is_within_workspace(resolved):');
+    expect(source).toContain('_validate_bash_command(command, args=args)');
+  });
+
+  it('injects bash validation into bash programmatic tools', async () => {
+    let execCommand = '';
+    const sandbox = createRuntime({
+      exec: async (command) => {
+        execCommand = command;
+        return {
+          exitCode: 0,
+          stdout: 'done',
+          stderr: '',
+        };
+      },
+    });
+    const programmatic = createCloudflareBashProgrammaticToolCallingTool({
+      sandbox,
+      workspaceRoot: '/workspace',
+    });
+
+    await programmatic.invoke({
+      code: 'printf "%s\\n" "ok"',
+    });
+
+    expect(execCommand).toContain('const ALLOW_DANGEROUS_COMMANDS = false;');
+    expect(execCommand).toContain(
+      'function validateBashCommand(command, args)'
+    );
+    expect(execCommand).toContain('validateBashCommand(command, args);');
   });
 });
 
