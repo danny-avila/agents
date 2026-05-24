@@ -1,15 +1,28 @@
 import { LangfuseSpanProcessor } from '@langfuse/otel';
 import { BasicTracerProvider } from '@opentelemetry/sdk-trace-base';
+import { HumanMessage } from '@langchain/core/messages';
+import type { Serialized } from '@langchain/core/load/serializable';
 import { createLangfuseHandler } from '@/langfuse';
+
+const mockSpan = {
+  end: jest.fn(),
+  setAttributes: jest.fn(),
+  setStatus: jest.fn(),
+};
+const mockStartSpan = jest.fn(() => mockSpan);
+const mockGetTracer = jest.fn(() => ({
+  startSpan: mockStartSpan,
+}));
 
 jest.mock('@langfuse/otel', () => ({
   LangfuseSpanProcessor: jest.fn().mockImplementation(() => ({})),
+  isDefaultExportSpan: jest.fn(() => false),
 }));
 
 jest.mock('@opentelemetry/sdk-trace-base', () => ({
   BasicTracerProvider: jest.fn().mockImplementation(() => ({
     forceFlush: jest.fn(),
-    getTracer: jest.fn(),
+    getTracer: mockGetTracer,
     shutdown: jest.fn(),
   })),
 }));
@@ -40,6 +53,50 @@ describe('createLangfuseHandler', () => {
       (LangfuseSpanProcessor as jest.Mock).mock.calls[0][0].baseUrl
     ).toBeUndefined();
     expect(BasicTracerProvider).toHaveBeenCalledTimes(1);
+  });
+
+  it('starts per-agent spans with v5 trace attributes', async () => {
+    const handler = createLangfuseHandler({
+      langfuse: {
+        enabled: true,
+        publicKey: 'pk-test',
+        secretKey: 'sk-test',
+      },
+      userId: 'user-1',
+      sessionId: 'thread-1',
+      traceMetadata: {
+        messageId: 'message-1',
+        agentId: 'agent-1',
+        agentName: 'DWAINE',
+      },
+      tags: ['librechat', 'agent'],
+    });
+
+    await handler?.handleChatModelStart(
+      {
+        id: ['langchain', 'chat_models', 'ChatOpenAI'],
+        kwargs: { model: 'gpt-4o' },
+      } as unknown as Serialized,
+      [[new HumanMessage('hello')]],
+      'run-1'
+    );
+
+    expect(mockGetTracer).toHaveBeenCalledWith('langfuse-sdk');
+    expect(mockStartSpan).toHaveBeenCalledWith(
+      'gpt-4o',
+      expect.objectContaining({
+        attributes: expect.objectContaining({
+          'langfuse.trace.name': 'LibreChat Agent: DWAINE',
+          'langfuse.trace.metadata.agentId': 'agent-1',
+          'langfuse.trace.metadata.messageId': 'message-1',
+          'langfuse.observation.model.name': 'gpt-4o',
+          'langfuse.observation.type': 'generation',
+          'user.id': 'user-1',
+          'session.id': 'thread-1',
+          'langfuse.trace.tags': ['librechat', 'agent'],
+        }),
+      })
+    );
   });
 
   it('does not create a handler when a required key is missing', () => {

@@ -32,8 +32,10 @@ import { executeHooks } from '@/hooks';
 import { isOpenAILike } from '@/utils/llm';
 import {
   createLegacyLangfuseHandler,
+  createLangfuseTraceMetadata,
   createLangfuseHandler,
   disposeLangfuseHandler,
+  getLangfuseTraceName,
   hasExplicitLangfuseConfig,
   hasLangfuseEnvConfig,
   isLangfuseCallbackHandler,
@@ -616,21 +618,29 @@ export class Run<_T extends t.BaseGraphState> {
       hasLangfuseEnvConfig() &&
       !hasExplicitLangfuseConfig(this.Graph.agentContexts.values())
     ) {
-      const userId = config.configurable?.user_id;
-      const sessionId = config.configurable?.thread_id;
+      const userId =
+        typeof config.configurable?.user_id === 'string'
+          ? config.configurable.user_id
+          : undefined;
+      const sessionId =
+        typeof config.configurable?.thread_id === 'string'
+          ? config.configurable.thread_id
+          : undefined;
       const primaryContext = this.Graph.agentContexts.get(
         this.Graph.defaultAgentId
       );
-      const traceMetadata = {
+      const traceMetadata = createLangfuseTraceMetadata({
         messageId: this.id,
         parentMessageId: config.configurable?.requestBody?.parentMessageId,
         agentName: primaryContext?.name,
-      };
+      });
       const handler = createLegacyLangfuseHandler({
         userId,
         sessionId,
         traceMetadata,
+        tags: ['librechat', 'agent'],
       });
+      config.runName = config.runName ?? getLangfuseTraceName(traceMetadata);
       config.callbacks = (
         (config.callbacks as t.ProvidedCallbacks) ?? []
       ).concat([handler]);
@@ -1140,16 +1150,25 @@ export class Run<_T extends t.BaseGraphState> {
     titlePromptTemplate,
   }: t.RunTitleOptions): Promise<{ language?: string; title?: string }> {
     let titleLangfuseHandler: unknown;
+    const titleContext =
+      this.Graph == null
+        ? undefined
+        : this.Graph.agentContexts.get(this.Graph.defaultAgentId);
+    const traceMetadata = createLangfuseTraceMetadata({
+      messageId: 'title-' + this.id,
+      agentName: titleContext?.name,
+    });
+    const titleRunName = getLangfuseTraceName(traceMetadata, 'LibreChat Title');
+
     if (chainOptions != null) {
-      const userId = chainOptions.configurable?.user_id;
-      const sessionId = chainOptions.configurable?.thread_id;
-      const titleContext = this.Graph?.agentContexts.get(
-        this.Graph.defaultAgentId
-      );
-      const traceMetadata = {
-        messageId: 'title-' + this.id,
-        agentName: titleContext?.name,
-      };
+      const userId =
+        typeof chainOptions.configurable?.user_id === 'string'
+          ? chainOptions.configurable.user_id
+          : undefined;
+      const sessionId =
+        typeof chainOptions.configurable?.thread_id === 'string'
+          ? chainOptions.configurable.thread_id
+          : undefined;
       const hasExplicitLangfuse =
         this.Graph != null &&
         hasExplicitLangfuseConfig(this.Graph.agentContexts.values());
@@ -1159,12 +1178,14 @@ export class Run<_T extends t.BaseGraphState> {
           userId,
           sessionId,
           traceMetadata,
+          tags: ['librechat', 'title'],
         });
       } else if (hasLangfuseEnvConfig() && !hasExplicitLangfuse) {
         titleLangfuseHandler = createLegacyLangfuseHandler({
           userId,
           sessionId,
           traceMetadata,
+          tags: ['librechat', 'title'],
         });
       }
 
@@ -1236,6 +1257,7 @@ export class Run<_T extends t.BaseGraphState> {
     const invokeConfig = Object.assign({}, chainOptions, {
       run_id: this.id,
       runId: this.id,
+      runName: chainOptions?.runName ?? titleRunName,
     });
 
     try {
