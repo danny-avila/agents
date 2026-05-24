@@ -1,4 +1,8 @@
-import { Constants, CODE_EXECUTION_TOOLS } from '@/common';
+import {
+  Constants,
+  CODE_EXECUTION_TOOLS,
+  LOCAL_CODING_BUNDLE_NAMES,
+} from '@/common';
 import {
   createLocalBashExecutionTool,
   createLocalCodeExecutionTool,
@@ -65,6 +69,42 @@ function getCloudflareConfig(
   return config.cloudflare;
 }
 
+function getSelectedCloudflareCodingToolNames(
+  config: t.CloudflareSandboxExecutionConfig
+): Set<string> {
+  return new Set(config.codingToolNames ?? LOCAL_CODING_BUNDLE_NAMES);
+}
+
+function filterCloudflareCodingToolAllowlist(
+  tools: t.GraphTools | undefined,
+  selectedNames: Set<string>
+): t.GraphTools | undefined {
+  const existingTools = (tools as t.GenericTool[] | undefined) ?? [];
+  if (existingTools.length === 0) {
+    return tools;
+  }
+  return existingTools.filter((existingTool) => {
+    if (!('name' in existingTool) || typeof existingTool.name !== 'string') {
+      return true;
+    }
+    return (
+      !LOCAL_CODING_BUNDLE_NAMES.includes(existingTool.name) ||
+      selectedNames.has(existingTool.name)
+    );
+  });
+}
+
+function pruneCloudflareCodingToolAllowlist(
+  toolMap: t.ToolMap,
+  selectedNames: Set<string>
+): void {
+  for (const name of LOCAL_CODING_BUNDLE_NAMES) {
+    if (!selectedNames.has(name)) {
+      toolMap.delete(name);
+    }
+  }
+}
+
 function createLocalExecutionTool(
   name: string,
   config: t.LocalExecutionConfig
@@ -124,8 +164,10 @@ export function resolveLocalToolsForBinding(args: {
   if (shouldUseCloudflareSandboxExecution(args.toolExecution)) {
     const cloudflareConfig = getCloudflareConfig(args.toolExecution);
     if (shouldIncludeCodingTools(args.toolExecution)) {
+      const selectedNames =
+        getSelectedCloudflareCodingToolNames(cloudflareConfig);
       return mergeToolsByName(
-        args.tools,
+        filterCloudflareCodingToolAllowlist(args.tools, selectedNames),
         createCloudflareCodingTools(cloudflareConfig)
       );
     }
@@ -181,7 +223,16 @@ export function resolveLocalToolRegistry(args: {
   }
 
   const registry = new Map(args.toolRegistry ?? []);
+  const selectedNames = shouldUseCloudflareSandboxExecution(args.toolExecution)
+    ? getSelectedCloudflareCodingToolNames(
+      getCloudflareConfig(args.toolExecution)
+    )
+    : undefined;
   for (const definition of createLocalCodingToolDefinitions()) {
+    if (selectedNames != null && !selectedNames.has(definition.name)) {
+      registry.delete(definition.name);
+      continue;
+    }
     registry.set(definition.name, definition);
   }
   return registry;
@@ -217,6 +268,9 @@ export function resolveLocalExecutionTools(args: {
   if (shouldUseCloudflareSandboxExecution(args.toolExecution)) {
     const cloudflareConfig = getCloudflareConfig(args.toolExecution);
     if (shouldIncludeCodingTools(args.toolExecution)) {
+      const selectedNames =
+        getSelectedCloudflareCodingToolNames(cloudflareConfig);
+      pruneCloudflareCodingToolAllowlist(toolMap, selectedNames);
       if (
         cloudflareConfig.fileCheckpointing === true ||
         args.fileCheckpointer != null

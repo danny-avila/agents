@@ -77,6 +77,9 @@ function toSandboxPath(filePath: string, workspaceRoot: string): string {
   const resolved = raw.startsWith('/')
     ? path.normalize(raw)
     : path.resolve(root, raw);
+  if (root === '/') {
+    return resolved;
+  }
   if (resolved === root || resolved.startsWith(`${root}/`)) {
     return resolved;
   }

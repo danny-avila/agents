@@ -37,6 +37,11 @@ type SandboxRuntimeContext = {
   shell: string;
 };
 
+const sandboxFactoryCache = new WeakMap<
+  t.CloudflareSandboxExecutionConfig,
+  Promise<t.CloudflareSandboxRuntime>
+>();
+
 function normalizeWorkspaceRoot(workspaceRoot: string): string {
   const normalized = path.normalize(workspaceRoot);
   return normalized === '/' ? normalized : normalized.replace(/\/+$/, '');
@@ -54,7 +59,20 @@ export async function resolveCloudflareSandbox(
   config: t.CloudflareSandboxExecutionConfig
 ): Promise<t.CloudflareSandboxRuntime> {
   const sandbox = config.sandbox;
-  return typeof sandbox === 'function' ? await sandbox() : sandbox;
+  if (typeof sandbox !== 'function') {
+    return sandbox;
+  }
+  let cached = sandboxFactoryCache.get(config);
+  if (cached == null) {
+    cached = Promise.resolve()
+      .then(() => sandbox())
+      .catch((error: unknown) => {
+        sandboxFactoryCache.delete(config);
+        throw error;
+      });
+    sandboxFactoryCache.set(config, cached);
+  }
+  return cached;
 }
 
 async function getRuntimeContext(
@@ -76,6 +94,9 @@ function toSandboxPath(filePath: string, workspaceRoot: string): string {
   const resolved = raw.startsWith('/')
     ? path.normalize(raw)
     : path.resolve(root, raw);
+  if (root === '/') {
+    return resolved;
+  }
   if (resolved === root || resolved.startsWith(`${root}/`)) {
     return resolved;
   }
@@ -92,6 +113,15 @@ function quote(value: string): string {
     return value;
   }
   return `'${value.replace(/'/g, '\'\\\'\'')}'`;
+}
+
+function withInSandboxTimeout(command: string, timeoutMs: number): string {
+  const timeoutSeconds = Math.max(1, Math.ceil(timeoutMs / 1000));
+  return `timeout -k 2s ${timeoutSeconds}s ${command}`;
+}
+
+function outerTimeoutMs(timeoutMs: number): number {
+  return timeoutMs + 5000;
 }
 
 function truncateOutput(value: string, maxChars: number): string {
@@ -402,13 +432,14 @@ function createCloudflareSpawn(
     void (async (): Promise<void> => {
       const ctx = await getRuntimeContext(config);
       const rendered = [command, ...args].map(quote).join(' ');
+      const timedCommand = withInSandboxTimeout(rendered, ctx.timeoutMs);
       const cwd =
         options.cwd == null ? ctx.workspaceRoot : options.cwd.toString();
       try {
-        const result = await ctx.sandbox.exec(rendered, {
+        const result = await ctx.sandbox.exec(timedCommand, {
           cwd,
           env: ctx.env,
-          timeout: ctx.timeoutMs,
+          timeout: outerTimeoutMs(ctx.timeoutMs),
           signal: abortController.signal,
         });
         if (state.closed) {
@@ -495,11 +526,14 @@ export async function executeCloudflareBash(
     args.length > 0
       ? `${ctx.shell} -lc ${quote(command)} -- ${args.map(quote).join(' ')}`
       : `${ctx.shell} -lc ${quote(command)}`;
-  const result = await ctx.sandbox.exec(shellCommand, {
-    cwd: ctx.workspaceRoot,
-    env: ctx.env,
-    timeout: ctx.timeoutMs,
-  });
+  const result = await ctx.sandbox.exec(
+    withInSandboxTimeout(shellCommand, ctx.timeoutMs),
+    {
+      cwd: ctx.workspaceRoot,
+      env: ctx.env,
+      timeout: outerTimeoutMs(ctx.timeoutMs),
+    }
+  );
   return {
     stdout: truncateOutput(result.stdout, ctx.maxOutputChars),
     stderr: truncateOutput(result.stderr, ctx.maxOutputChars),
@@ -645,11 +679,14 @@ export async function executeCloudflareCode(
     );
   }
   try {
-    const result = await ctx.sandbox.exec(runtime.command, {
-      cwd: ctx.workspaceRoot,
-      env: ctx.env,
-      timeout: ctx.timeoutMs,
-    });
+    const result = await ctx.sandbox.exec(
+      withInSandboxTimeout(runtime.command, ctx.timeoutMs),
+      {
+        cwd: ctx.workspaceRoot,
+        env: ctx.env,
+        timeout: outerTimeoutMs(ctx.timeoutMs),
+      }
+    );
     return {
       stdout: truncateOutput(result.stdout, ctx.maxOutputChars),
       stderr: truncateOutput(result.stderr, ctx.maxOutputChars),

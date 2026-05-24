@@ -107,6 +107,21 @@ function createTimeoutSchema(timeoutMs?: number): TimeoutSchema {
   };
 }
 
+function clampExecutionTimeout(
+  requestedTimeoutMs: number | undefined,
+  configuredTimeoutMs: number | undefined
+): number {
+  const defaultTimeout = normalizeTimeout(configuredTimeoutMs);
+  const maxTimeout = Math.max(MAX_TIMEOUT, defaultTimeout);
+  if (requestedTimeoutMs == null || !Number.isFinite(requestedTimeoutMs)) {
+    return defaultTimeout;
+  }
+  return Math.min(
+    Math.max(MIN_TIMEOUT, Math.floor(requestedTimeoutMs)),
+    maxTimeout
+  );
+}
+
 function quoteShell(value: string): string {
   if (/^[A-Za-z0-9_/:=.,@%+-]+$/.test(value)) {
     return value;
@@ -130,6 +145,15 @@ function truncateOutput(
   )}`;
 }
 
+function withInSandboxTimeout(command: string, timeoutMs: number): string {
+  const timeoutSeconds = Math.max(1, Math.ceil(timeoutMs / 1000));
+  return `timeout -k 2s ${timeoutSeconds}s ${command}`;
+}
+
+function outerTimeoutMs(timeoutMs: number): number {
+  return timeoutMs + 5000;
+}
+
 async function executeGeneratedCloudflareBash(
   command: string,
   config: t.CloudflareSandboxExecutionConfig
@@ -137,11 +161,15 @@ async function executeGeneratedCloudflareBash(
   const sandbox = await resolveCloudflareSandbox(config);
   const workspaceRoot = getCloudflareWorkspaceRoot(config);
   const shell = config.shell ?? 'bash';
-  const result = await sandbox.exec(`${shell} -lc ${quoteShell(command)}`, {
-    cwd: workspaceRoot,
-    env: config.env,
-    timeout: config.timeoutMs,
-  });
+  const timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT;
+  const result = await sandbox.exec(
+    withInSandboxTimeout(`${shell} -lc ${quoteShell(command)}`, timeoutMs),
+    {
+      cwd: workspaceRoot,
+      env: config.env,
+      timeout: outerTimeoutMs(timeoutMs),
+    }
+  );
   const maxOutputChars = config.maxOutputChars ?? DEFAULT_MAX_OUTPUT_CHARS;
   return {
     stdout: truncateOutput(result.stdout, maxOutputChars),
@@ -1028,8 +1056,10 @@ async function runProgrammatic(args: {
     args.params.code,
     args.runtime
   );
-  const timeoutMs =
-    args.params.timeout ?? args.cloudflareConfig.timeoutMs ?? DEFAULT_TIMEOUT;
+  const timeoutMs = clampExecutionTimeout(
+    args.params.timeout,
+    args.cloudflareConfig.timeoutMs
+  );
   const workspaceRoot = getCloudflareWorkspaceRoot(args.cloudflareConfig);
   let result: Awaited<ReturnType<typeof executeCloudflareCode>>;
 

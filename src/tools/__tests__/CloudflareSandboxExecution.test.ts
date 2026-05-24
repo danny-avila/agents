@@ -1,8 +1,11 @@
 import type * as t from '@/types';
+import { Constants } from '@/common';
 import { spawnLocalProcess } from '../local/LocalExecutionEngine';
+import { resolveLocalToolsForBinding } from '../local/resolveLocalExecutionTools';
 import {
   createCloudflareWorkspaceFS,
   createCloudflareLocalExecutionConfig,
+  executeCloudflareBash,
 } from '../cloudflare/CloudflareSandboxExecutionEngine';
 import { createCloudflareBridgeRuntime } from '../cloudflare/CloudflareBridgeRuntime';
 import {
@@ -69,6 +72,22 @@ describe('Cloudflare sandbox execution backend', () => {
     expect(readPaths).toEqual(['/workspace/file.txt']);
   });
 
+  it('allows root workspace paths', async () => {
+    const readPaths: string[] = [];
+    const fs = createCloudflareWorkspaceFS({
+      workspaceRoot: '/',
+      sandbox: createRuntime({
+        readFile: async (filePath) => {
+          readPaths.push(filePath);
+          return 'ok';
+        },
+      }),
+    });
+
+    await expect(fs.readFile('tmp/file.txt', 'utf8')).resolves.toBe('ok');
+    expect(readPaths).toEqual(['/tmp/file.txt']);
+  });
+
   it('stats the workspace root without listing its parent directory', async () => {
     const listPaths: string[] = [];
     const fs = createCloudflareWorkspaceFS({
@@ -107,6 +126,52 @@ describe('Cloudflare sandbox execution backend', () => {
     expect(signal?.aborted).toBe(true);
     expect(result.timedOut).toBe(true);
     expect(result.exitCode).toBe(143);
+  });
+
+  it('memoizes sandbox factory results per config object', async () => {
+    let calls = 0;
+    const runtime = createRuntime({
+      readFile: async () => 'ok',
+      writeFile: async () => ({ ok: true }),
+    });
+    const config = {
+      workspaceRoot: '/workspace',
+      sandbox: async (): Promise<t.CloudflareSandboxRuntime> => {
+        calls += 1;
+        return runtime;
+      },
+    };
+    const fs = createCloudflareWorkspaceFS(config);
+
+    await fs.readFile('a.txt', 'utf8');
+    await fs.writeFile('b.txt', 'ok', 'utf8');
+
+    expect(calls).toBe(1);
+  });
+
+  it('wraps direct bash commands with an in-sandbox timeout', async () => {
+    let execCommand = '';
+    let execTimeout: number | undefined;
+    const sandbox = createRuntime({
+      exec: async (command, options) => {
+        execCommand = command;
+        execTimeout = options?.timeout;
+        return {
+          exitCode: 0,
+          stdout: 'ok',
+          stderr: '',
+        };
+      },
+    });
+
+    await executeCloudflareBash('echo ok', {
+      sandbox,
+      workspaceRoot: '/workspace',
+      timeoutMs: 1500,
+    });
+
+    expect(execCommand).toContain('timeout -k 2s 2s bash -lc');
+    expect(execTimeout).toBe(6500);
   });
 
   it('forwards only explicit Cloudflare env vars to sandbox exec', async () => {
@@ -162,6 +227,33 @@ describe('Cloudflare sandbox execution backend', () => {
     expect(source).toContain('_validate_bash_command(command, args=args)');
   });
 
+  it('clamps programmatic timeouts before sandbox execution', async () => {
+    const timeouts: Array<number | undefined> = [];
+    const sandbox = createRuntime({
+      writeFile: async () => ({ ok: true }),
+      exec: async (_command, options) => {
+        timeouts.push(options?.timeout);
+        return {
+          exitCode: 0,
+          stdout: 'done',
+          stderr: '',
+        };
+      },
+    });
+    const programmatic = createCloudflareProgrammaticToolCallingTool({
+      sandbox,
+      workspaceRoot: '/workspace',
+    });
+
+    await programmatic.invoke({
+      code: 'print("ok")',
+      lang: 'py',
+      timeout: 300000,
+    });
+
+    expect(timeouts[0]).toBe(305000);
+  });
+
   it('injects bash validation into bash programmatic tools', async () => {
     let execCommand = '';
     const sandbox = createRuntime({
@@ -188,6 +280,26 @@ describe('Cloudflare sandbox execution backend', () => {
       'function validateBashCommand(command, args)'
     );
     expect(execCommand).toContain('validateBashCommand(command, args);');
+  });
+
+  it('enforces Cloudflare codingToolNames as an allowlist', () => {
+    const tools = resolveLocalToolsForBinding({
+      tools: [
+        { name: Constants.EXECUTE_CODE } as t.GenericTool,
+        { name: Constants.BASH_TOOL } as t.GenericTool,
+      ],
+      toolExecution: {
+        engine: 'cloudflare-sandbox',
+        cloudflare: {
+          sandbox: createRuntime(),
+          codingToolNames: [Constants.BASH_TOOL],
+        },
+      },
+    }) as t.GenericTool[];
+    const names = tools.map((toolDef) => toolDef.name);
+
+    expect(names).toContain(Constants.BASH_TOOL);
+    expect(names).not.toContain(Constants.EXECUTE_CODE);
   });
 });
 
