@@ -45,6 +45,11 @@ function normalizePrefix(prefix: string | undefined): string {
   return withLeadingSlash.replace(/\/+$/, '');
 }
 
+function normalizeWorkspaceRoot(workspaceRoot: string): string {
+  const normalized = path.normalize(workspaceRoot);
+  return normalized === '/' ? normalized : normalized.replace(/\/+$/, '');
+}
+
 function base32Encode(bytes: Uint8Array): string {
   let bits = 0;
   let value = 0;
@@ -98,7 +103,7 @@ function encodeBridgePath(filePath: string): string {
 
 function toSandboxPath(filePath: string, workspaceRoot: string): string {
   const raw = filePath === '' ? '.' : filePath;
-  const root = path.normalize(workspaceRoot);
+  const root = normalizeWorkspaceRoot(workspaceRoot);
   const resolved = raw.startsWith('/')
     ? path.normalize(raw)
     : path.resolve(root, raw);
@@ -262,7 +267,7 @@ export function createCloudflareBridgeRuntime(
 ): CloudflareBridgeRuntime {
   const baseURL = normalizeBaseURL(config.baseURL);
   const apiPrefix = normalizePrefix(config.apiRoutePrefix);
-  const workspaceRoot = path.normalize(
+  const workspaceRoot = normalizeWorkspaceRoot(
     config.workspaceRoot ?? DEFAULT_WORKSPACE_ROOT
   );
   const shell = config.shell ?? DEFAULT_SHELL;
@@ -291,7 +296,10 @@ export function createCloudflareBridgeRuntime(
           );
         }
         return payload.id;
-      })();
+      })().catch((error: unknown) => {
+        sandboxIdPromise = undefined;
+        throw error;
+      });
     }
     return sandboxIdPromise;
   }
@@ -325,7 +333,7 @@ export function createCloudflareBridgeRuntime(
     let buffer = '';
     let stdout = '';
     let stderr = '';
-    let exitCode = 0;
+    let exitCode: number | undefined;
 
     try {
       for (;;) {
@@ -350,8 +358,32 @@ export function createCloudflareBridgeRuntime(
           }
         }
       }
+      buffer += decoder.decode();
+      const parsed = parseSSEChunk(buffer);
+      buffer = parsed.remainder;
+      for (const event of parsed.events) {
+        if (event.event === 'stdout') {
+          const decoded = decodeBase64(event.data);
+          stdout += decoded;
+          options.onOutput?.('stdout', decoded);
+        } else if (event.event === 'stderr') {
+          const decoded = decodeBase64(event.data);
+          stderr += decoded;
+          options.onOutput?.('stderr', decoded);
+        } else if (event.event === 'exit') {
+          exitCode = parseExitCode(event.data);
+        } else if (event.event === 'error') {
+          throw new Error(parseBridgeError(event.data));
+        }
+      }
     } finally {
       reader.releaseLock();
+    }
+
+    if (exitCode == null) {
+      throw new Error(
+        'Cloudflare sandbox bridge exec stream closed before an exit event.'
+      );
     }
 
     return {
@@ -417,7 +449,8 @@ export function createCloudflareBridgeRuntime(
   ): Promise<t.CloudflareSandboxFileInfo[]> {
     const resolvedPath = toSandboxPath(filePath, workspaceRoot);
     const maxDepth = options?.recursive === true ? '' : '-maxdepth 1';
-    const hiddenFilter = options?.includeHidden === true ? '' : ' ! -name \'.*\'';
+    const hiddenFilter =
+      options?.includeHidden === true ? '' : ' \\( -name \'.*\' -prune \\) -o';
     const command =
       `find ${quote(resolvedPath)} -mindepth 1 ${maxDepth}${hiddenFilter} ` +
       '-printf \'%y\\t%s\\t%p\\n\'';

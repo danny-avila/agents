@@ -1170,7 +1170,10 @@ function configShell(): string {
 const SIGKILL_ESCALATION_MS = 2000;
 
 function sigterm(child: ChildProcess): void {
-  if (child.pid == null) return;
+  if (child.pid == null) {
+    child.kill('SIGTERM');
+    return;
+  }
   try {
     if (process.platform === 'win32') {
       child.kill('SIGTERM');
@@ -1183,8 +1186,11 @@ function sigterm(child: ChildProcess): void {
 }
 
 function sigkill(child: ChildProcess): void {
-  if (child.pid == null) return;
   if (child.exitCode != null || child.signalCode != null) return;
+  if (child.pid == null) {
+    child.kill('SIGKILL');
+    return;
+  }
   try {
     if (process.platform === 'win32') {
       child.kill('SIGKILL');

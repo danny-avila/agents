@@ -37,10 +37,17 @@ type SandboxRuntimeContext = {
   shell: string;
 };
 
+function normalizeWorkspaceRoot(workspaceRoot: string): string {
+  const normalized = path.normalize(workspaceRoot);
+  return normalized === '/' ? normalized : normalized.replace(/\/+$/, '');
+}
+
 export function getCloudflareWorkspaceRoot(
   config?: t.CloudflareSandboxExecutionConfig
 ): string {
-  return config?.workspaceRoot ?? DEFAULT_WORKSPACE_ROOT;
+  return normalizeWorkspaceRoot(
+    config?.workspaceRoot ?? DEFAULT_WORKSPACE_ROOT
+  );
 }
 
 export async function resolveCloudflareSandbox(
@@ -65,10 +72,11 @@ async function getRuntimeContext(
 
 function toSandboxPath(filePath: string, workspaceRoot: string): string {
   const raw = filePath === '' ? '.' : filePath;
+  const root = normalizeWorkspaceRoot(workspaceRoot);
   const resolved = raw.startsWith('/')
     ? path.normalize(raw)
-    : path.resolve(workspaceRoot, raw);
-  if (resolved === workspaceRoot || resolved.startsWith(`${workspaceRoot}/`)) {
+    : path.resolve(root, raw);
+  if (resolved === root || resolved.startsWith(`${root}/`)) {
     return resolved;
   }
   throw new Error(
@@ -278,6 +286,12 @@ export function createCloudflareWorkspaceFS(
     stat: async (filePath: string) => {
       const sandbox = await resolveCloudflareSandbox(config);
       const resolved = toSandboxPath(filePath, workspaceRoot);
+      if (resolved === workspaceRoot) {
+        const entries = normalizeFileList(
+          await sandbox.listFiles(resolved, { includeHidden: true })
+        );
+        return createStats({ size: entries.length, type: 'directory' });
+      }
       const info = await findChildInfo(sandbox, resolved);
       if (info != null) {
         return createStats({ size: info.size, type: info.type });
@@ -349,7 +363,25 @@ function createCloudflareSpawn(
   return (command, args, options) => {
     const stdout = new PassThrough();
     const stderr = new PassThrough();
+    const abortController = new AbortController();
     const child = new EventEmitter() as ChildProcessWithoutNullStreams;
+    const state = { closed: false };
+    const closeOnce = (
+      exitCode: number | null,
+      signal: NodeJS.Signals | null
+    ): void => {
+      if (state.closed) {
+        return;
+      }
+      state.closed = true;
+      stdout.end();
+      stderr.end();
+      Object.assign(child, {
+        exitCode,
+        signalCode: signal,
+      });
+      child.emit('close', exitCode, signal);
+    };
     Object.assign(child, {
       stdout,
       stderr,
@@ -359,8 +391,10 @@ function createCloudflareSpawn(
       exitCode: null,
       signalCode: null,
       pid: undefined,
-      kill: () => {
-        Object.assign(child, { killed: true });
+      kill: (signal: NodeJS.Signals = 'SIGTERM') => {
+        Object.assign(child, { killed: true, signalCode: signal });
+        abortController.abort();
+        closeOnce(null, signal);
         return true;
       },
     });
@@ -378,19 +412,20 @@ function createCloudflareSpawn(
             ...(options.env as Record<string, string | undefined> | undefined),
           },
           timeout: ctx.timeoutMs,
+          signal: abortController.signal,
         });
+        if (state.closed) {
+          return;
+        }
         if (result.stdout) stdout.write(result.stdout);
         if (result.stderr) stderr.write(result.stderr);
-        stdout.end();
-        stderr.end();
-        Object.assign(child, { exitCode: result.exitCode });
-        child.emit('close', result.exitCode, null);
+        closeOnce(result.exitCode, null);
       } catch (error) {
+        if (state.closed) {
+          return;
+        }
         stderr.write((error as Error).message);
-        stdout.end();
-        stderr.end();
-        Object.assign(child, { exitCode: 1 });
-        child.emit('close', 1, null);
+        closeOnce(1, null);
       }
     })();
 
