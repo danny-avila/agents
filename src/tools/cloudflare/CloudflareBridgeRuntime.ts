@@ -432,8 +432,10 @@ export function createCloudflareBridgeRuntime(
     const maxDepth = options?.recursive === true ? '' : '-maxdepth 1';
     const hiddenFilter =
       options?.includeHidden === true ? '' : ' \\( -name \'.*\' -prune \\) -o';
+    const quotedPath = quote(resolvedPath);
     const command =
-      `find ${quote(resolvedPath)} -mindepth 1 ${maxDepth}${hiddenFilter} ` +
+      `[ -d ${quotedPath} ] || { printf '%s is not a directory\\n' ${quotedPath} >&2; exit 20; }; ` +
+      `find ${quotedPath} -mindepth 1 ${maxDepth}${hiddenFilter} ` +
       '-printf \'%y\\t%s\\t%p\\n\'';
     const result = await exec(command, { cwd: workspaceRoot });
     if (result.exitCode !== 0) {

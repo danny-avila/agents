@@ -6,6 +6,7 @@ import {
   createCloudflareWorkspaceFS,
   createCloudflareLocalExecutionConfig,
   executeCloudflareBash,
+  executeCloudflareCode,
 } from '../cloudflare/CloudflareSandboxExecutionEngine';
 import { createCloudflareBridgeRuntime } from '../cloudflare/CloudflareBridgeRuntime';
 import {
@@ -152,19 +153,21 @@ describe('Cloudflare sandbox execution backend', () => {
   it('wraps direct bash commands with an in-sandbox timeout', async () => {
     let execCommand = '';
     let execTimeout: number | undefined;
+    let calls = 0;
     const sandbox = createRuntime({
       exec: async (command, options) => {
+        calls += 1;
         execCommand = command;
         execTimeout = options?.timeout;
         return {
-          exitCode: 0,
+          exitCode: calls === 1 ? 0 : 124,
           stdout: 'ok',
           stderr: '',
         };
       },
     });
 
-    await executeCloudflareBash('echo ok', {
+    const result = await executeCloudflareBash('echo ok', {
       sandbox,
       workspaceRoot: '/workspace',
       timeoutMs: 1500,
@@ -172,6 +175,28 @@ describe('Cloudflare sandbox execution backend', () => {
 
     expect(execCommand).toContain('timeout -k 2s 2s bash -lc');
     expect(execTimeout).toBe(6500);
+    expect(result.timedOut).toBe(true);
+  });
+
+  it('marks Cloudflare code execution timeouts', async () => {
+    const sandbox = createRuntime({
+      exec: async (command) => ({
+        exitCode: command.startsWith('rm -rf') ? 0 : 124,
+        stdout: '',
+        stderr: '',
+      }),
+    });
+
+    const result = await executeCloudflareCode(
+      { lang: 'py', code: 'print("slow")' },
+      {
+        sandbox,
+        workspaceRoot: '/workspace',
+        timeoutMs: 1000,
+      }
+    );
+
+    expect(result.timedOut).toBe(true);
   });
 
   it('forwards only explicit Cloudflare env vars to sandbox exec', async () => {
@@ -392,5 +417,27 @@ describe('Cloudflare bridge runtime', () => {
 
     expect(command).toContain('-prune');
     expect(command).toContain('\\( -name \'.*\' -prune \\) -o');
+  });
+
+  it('fails bridge listFiles for non-directory targets', async () => {
+    const fetchImpl: typeof fetch = async (input) => {
+      const url = input.toString();
+      if (url.endsWith('/exec')) {
+        const stderr = Buffer.from('not a directory').toString('base64');
+        return sseResponse(
+          `event: stderr\ndata: ${stderr}\n\nevent: exit\ndata: {"exit_code":20}\n\n`
+        );
+      }
+      throw new Error(`Unexpected URL: ${url}`);
+    };
+    const runtime = createCloudflareBridgeRuntime({
+      baseURL: 'https://bridge.example',
+      sandboxId: 'abc',
+      fetch: fetchImpl,
+    });
+
+    await expect(runtime.listFiles('/workspace/file.txt')).rejects.toThrow(
+      'not a directory'
+    );
   });
 });

@@ -124,6 +124,10 @@ function outerTimeoutMs(timeoutMs: number): number {
   return timeoutMs + 5000;
 }
 
+function isInSandboxTimeoutExit(exitCode: number | null): boolean {
+  return exitCode === 124 || exitCode === 137;
+}
+
 function truncateOutput(value: string, maxChars: number): string {
   if (maxChars <= 0 || value.length <= maxChars) {
     return value;
@@ -538,7 +542,7 @@ export async function executeCloudflareBash(
     stdout: truncateOutput(result.stdout, ctx.maxOutputChars),
     stderr: truncateOutput(result.stderr, ctx.maxOutputChars),
     exitCode: result.exitCode,
-    timedOut: false,
+    timedOut: isInSandboxTimeoutExit(result.exitCode),
   };
 }
 
@@ -691,7 +695,7 @@ export async function executeCloudflareCode(
       stdout: truncateOutput(result.stdout, ctx.maxOutputChars),
       stderr: truncateOutput(result.stderr, ctx.maxOutputChars),
       exitCode: result.exitCode,
-      timedOut: false,
+      timedOut: isInSandboxTimeoutExit(result.exitCode),
     };
   } finally {
     await ctx.sandbox

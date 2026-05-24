@@ -154,6 +154,10 @@ function outerTimeoutMs(timeoutMs: number): number {
   return timeoutMs + 5000;
 }
 
+function isInSandboxTimeoutExit(exitCode: number | null): boolean {
+  return exitCode === 124 || exitCode === 137;
+}
+
 async function executeGeneratedCloudflareBash(
   command: string,
   config: t.CloudflareSandboxExecutionConfig
@@ -175,7 +179,7 @@ async function executeGeneratedCloudflareBash(
     stdout: truncateOutput(result.stdout, maxOutputChars),
     stderr: truncateOutput(result.stderr, maxOutputChars),
     exitCode: result.exitCode,
-    timedOut: false,
+    timedOut: isInSandboxTimeoutExit(result.exitCode),
   };
 }
 
