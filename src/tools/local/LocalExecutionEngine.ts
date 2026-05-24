@@ -704,6 +704,8 @@ export interface SpawnLocalProcessOptions {
   internal?: boolean;
 }
 
+export const LOCAL_SPAWN_TIMEOUT_MS = Symbol('librechat.localSpawn.timeoutMs');
+
 export async function spawnLocalProcess(
   command: string,
   args: string[],
@@ -746,12 +748,16 @@ export async function spawnLocalProcess(
 
   const launcher = getSpawn(config);
   return new Promise<SpawnResult>((resolveResult, reject) => {
-    const child = launcher(spawnCommand, spawnArgs, {
+    const spawnOptions: import('child_process').SpawnOptions = {
       cwd,
       detached: process.platform !== 'win32',
       env: { ...process.env, ...(config.env ?? {}) },
       stdio: ['ignore', 'pipe', 'pipe'],
+    };
+    Object.defineProperty(spawnOptions, LOCAL_SPAWN_TIMEOUT_MS, {
+      value: timeoutMs,
     });
+    const child = launcher(spawnCommand, spawnArgs, spawnOptions);
 
     let stdout = '';
     let stderr = '';

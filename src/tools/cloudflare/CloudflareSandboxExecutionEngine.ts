@@ -5,7 +5,10 @@ import type { ChildProcessWithoutNullStreams } from 'child_process';
 import type { WriteFileOptions, MakeDirectoryOptions, Stats } from 'fs';
 import type { FileHandle } from 'fs/promises';
 import type * as t from '@/types';
-import { validateBashCommand } from '@/tools/local/LocalExecutionEngine';
+import {
+  LOCAL_SPAWN_TIMEOUT_MS,
+  validateBashCommand,
+} from '@/tools/local/LocalExecutionEngine';
 import type { WorkspaceFS, ReaddirEntry } from '@/tools/local/workspaceFS';
 
 const DEFAULT_WORKSPACE_ROOT = '/workspace';
@@ -436,14 +439,23 @@ function createCloudflareSpawn(
     void (async (): Promise<void> => {
       const ctx = await getRuntimeContext(config);
       const rendered = [command, ...args].map(quote).join(' ');
-      const timedCommand = withInSandboxTimeout(rendered, ctx.timeoutMs);
+      const spawnTimeoutMs = (
+        options as {
+          [LOCAL_SPAWN_TIMEOUT_MS]?: number;
+        }
+      )[LOCAL_SPAWN_TIMEOUT_MS];
+      const timeoutMs =
+        typeof spawnTimeoutMs === 'number' && Number.isFinite(spawnTimeoutMs)
+          ? spawnTimeoutMs
+          : ctx.timeoutMs;
+      const timedCommand = withInSandboxTimeout(rendered, timeoutMs);
       const cwd =
         options.cwd == null ? ctx.workspaceRoot : options.cwd.toString();
       try {
         const result = await ctx.sandbox.exec(timedCommand, {
           cwd,
           env: ctx.env,
-          timeout: outerTimeoutMs(ctx.timeoutMs),
+          timeout: outerTimeoutMs(timeoutMs),
           signal: abortController.signal,
         });
         if (state.closed) {

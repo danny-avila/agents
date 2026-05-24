@@ -250,6 +250,7 @@ function createPythonNativeToolSource(
 import asyncio, fnmatch, glob, json, os, pathlib, re, shlex, shutil, subprocess, sys, tempfile
 
 WORKSPACE = ${JSON.stringify(workspaceRoot)}
+SHELL = ${JSON.stringify(config.shell ?? 'bash')}
 READ_ONLY = ${pythonBoolean(config.readOnly)}
 ALLOW_DANGEROUS_COMMANDS = ${pythonBoolean(config.allowDangerousCommands)}
 DESTRUCTIVE_TARGET = r"(?:/|~|\\$\\{?HOME\\}?|\\.)(?:/?\\.?\\*|/)?"
@@ -364,7 +365,7 @@ def _line_window(content, offset=None, limit=None):
 def _run(command, timeout=None, args=None):
     _validate_bash_command(command, args=args)
     completed = subprocess.run(
-        ["bash", "-lc", command, "--"] + [str(arg) for arg in (args or [])],
+        [SHELL, "-lc", command, "--"] + [str(arg) for arg in (args or [])],
         cwd=WORKSPACE,
         capture_output=True,
         text=True,
@@ -570,6 +571,7 @@ const path = require("path");
 const cp = require("child_process");
 
 const WORKSPACE = ${JSON.stringify(workspaceRoot)};
+const SHELL = ${JSON.stringify(config.shell ?? 'bash')};
 const READ_ONLY = ${JSON.stringify(config.readOnly === true)};
 const ALLOW_DANGEROUS_COMMANDS = ${JSON.stringify(config.allowDangerousCommands === true)};
 const DESTRUCTIVE_TARGET = "(?:\\\\/|~|\\\\$\\\\{?HOME\\\\}?|\\\\.)(?:\\\\/?\\\\.?\\\\*|\\\\/)?";
@@ -701,7 +703,7 @@ function quote(value) {
 function run(command, timeoutMs, args) {
   validateBashCommand(command, args);
   return new Promise((resolve) => {
-    const child = cp.spawn("bash", ["-lc", command, "--", ...((args || []).map(String))], {
+    const child = cp.spawn(SHELL, ["-lc", command, "--", ...((args || []).map(String))], {
       cwd: WORKSPACE,
       env: process.env,
     });

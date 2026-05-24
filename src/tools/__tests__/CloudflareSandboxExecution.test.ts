@@ -178,6 +178,37 @@ describe('Cloudflare sandbox execution backend', () => {
     expect(result.timedOut).toBe(true);
   });
 
+  it('passes call-specific timeouts to the Cloudflare spawn wrapper', async () => {
+    let execCommand = '';
+    let execTimeout: number | undefined;
+    const sandbox = createRuntime({
+      exec: async (command, options) => {
+        execCommand = command;
+        execTimeout = options?.timeout;
+        return {
+          exitCode: 0,
+          stdout: 'ok',
+          stderr: '',
+        };
+      },
+    });
+    const config = createCloudflareLocalExecutionConfig({
+      sandbox,
+      workspaceRoot: '/workspace',
+      timeoutMs: 1000,
+    });
+
+    await expect(
+      spawnLocalProcess('bash', ['-lc', 'echo ok'], {
+        ...config,
+        timeoutMs: 120000,
+      })
+    ).resolves.toMatchObject({ exitCode: 0, timedOut: false });
+
+    expect(execCommand).toContain('timeout -k 2s 120s bash -lc');
+    expect(execTimeout).toBe(125000);
+  });
+
   it('marks Cloudflare code execution timeouts', async () => {
     const sandbox = createRuntime({
       exec: async (command) => ({
@@ -239,6 +270,7 @@ describe('Cloudflare sandbox execution backend', () => {
       sandbox,
       workspaceRoot: '/workspace',
       readOnly: true,
+      shell: '/bin/sh',
     });
 
     await programmatic.invoke({
@@ -247,6 +279,8 @@ describe('Cloudflare sandbox execution backend', () => {
     });
 
     expect(source).toContain('READ_ONLY = True');
+    expect(source).toContain('SHELL = "/bin/sh"');
+    expect(source).toContain('[SHELL, "-lc", command, "--"]');
     expect(source).toContain('_assert_writable("write_file")');
     expect(source).toContain('if _is_within_workspace(resolved):');
     expect(source).toContain('_validate_bash_command(command, args=args)');
@@ -294,6 +328,7 @@ describe('Cloudflare sandbox execution backend', () => {
     const programmatic = createCloudflareBashProgrammaticToolCallingTool({
       sandbox,
       workspaceRoot: '/workspace',
+      shell: '/bin/sh',
     });
 
     await programmatic.invoke({
@@ -301,6 +336,8 @@ describe('Cloudflare sandbox execution backend', () => {
     });
 
     expect(execCommand).toContain('const ALLOW_DANGEROUS_COMMANDS = false;');
+    expect(execCommand).toContain('const SHELL = "/bin/sh";');
+    expect(execCommand).toContain('cp.spawn(SHELL, ["-lc", command, "--"');
     expect(execCommand).toContain(
       'function validateBashCommand(command, args)'
     );
