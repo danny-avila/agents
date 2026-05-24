@@ -342,7 +342,11 @@ function shouldUseLocalSandbox(config: t.LocalExecutionConfig): boolean {
 let sandboxOffWarned = false;
 
 function maybeWarnSandboxOff(config: t.LocalExecutionConfig): void {
-  if (sandboxOffWarned || shouldUseLocalSandbox(config)) {
+  if (
+    sandboxOffWarned ||
+    shouldUseLocalSandbox(config) ||
+    config.exec?.sandboxed === true
+  ) {
     return;
   }
   sandboxOffWarned = true;

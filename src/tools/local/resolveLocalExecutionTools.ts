@@ -12,6 +12,11 @@ import {
   createLocalBashProgrammaticToolCallingTool,
   createLocalProgrammaticToolCallingTool,
 } from './LocalProgrammaticToolCalling';
+import {
+  createCloudflareCodingToolBundle,
+  createCloudflareCodingTools,
+  createCloudflareExecutionTool,
+} from '@/tools/cloudflare';
 import type * as t from '@/types';
 
 type ResolveLocalToolsResult = {
@@ -34,11 +39,30 @@ function shouldUseLocalExecution(config?: t.ToolExecutionConfig): boolean {
   return config?.engine === 'local';
 }
 
+function shouldUseCloudflareSandboxExecution(
+  config?: t.ToolExecutionConfig
+): boolean {
+  return config?.engine === 'cloudflare-sandbox';
+}
+
 function shouldIncludeCodingTools(config?: t.ToolExecutionConfig): boolean {
   return (
-    shouldUseLocalExecution(config) &&
-    config?.local?.includeCodingTools !== false
+    (shouldUseLocalExecution(config) &&
+      config?.local?.includeCodingTools !== false) ||
+    (shouldUseCloudflareSandboxExecution(config) &&
+      config?.cloudflare?.includeCodingTools !== false)
   );
+}
+
+function getCloudflareConfig(
+  config?: t.ToolExecutionConfig
+): t.CloudflareSandboxExecutionConfig {
+  if (config?.cloudflare == null) {
+    throw new Error(
+      'toolExecution.cloudflare is required when engine is "cloudflare-sandbox".'
+    );
+  }
+  return config.cloudflare;
 }
 
 function createLocalExecutionTool(
@@ -90,8 +114,40 @@ export function resolveLocalToolsForBinding(args: {
   tools?: t.GraphTools;
   toolExecution?: t.ToolExecutionConfig;
 }): t.GraphTools | undefined {
-  if (!shouldUseLocalExecution(args.toolExecution)) {
+  if (
+    !shouldUseLocalExecution(args.toolExecution) &&
+    !shouldUseCloudflareSandboxExecution(args.toolExecution)
+  ) {
     return args.tools;
+  }
+
+  if (shouldUseCloudflareSandboxExecution(args.toolExecution)) {
+    const cloudflareConfig = getCloudflareConfig(args.toolExecution);
+    if (shouldIncludeCodingTools(args.toolExecution)) {
+      return mergeToolsByName(
+        args.tools,
+        createCloudflareCodingTools(cloudflareConfig)
+      );
+    }
+
+    const replacements = ((args.tools as t.GenericTool[] | undefined) ?? [])
+      .filter(
+        (existingTool): existingTool is t.GenericTool & { name: string } =>
+          'name' in existingTool &&
+          typeof existingTool.name === 'string' &&
+          CODE_EXECUTION_TOOLS.has(existingTool.name)
+      )
+      .map((existingTool) =>
+        createCloudflareExecutionTool(existingTool.name, cloudflareConfig)
+      )
+      .filter(
+        (cloudflareTool): cloudflareTool is t.GenericTool =>
+          cloudflareTool != null
+      );
+
+    return replacements.length === 0
+      ? args.tools
+      : mergeToolsByName(args.tools, replacements);
   }
 
   const localConfig = args.toolExecution?.local ?? {};
@@ -145,16 +201,65 @@ export function resolveLocalExecutionTools(args: {
   fileCheckpointer?: t.LocalFileCheckpointer;
 }): ResolveLocalToolsResult {
   const directToolNames = new Set<string>();
-  if (!shouldUseLocalExecution(args.toolExecution)) {
+  if (
+    !shouldUseLocalExecution(args.toolExecution) &&
+    !shouldUseCloudflareSandboxExecution(args.toolExecution)
+  ) {
     return {
       toolMap: args.toolMap,
       directToolNames,
     };
   }
 
-  const localConfig = args.toolExecution?.local ?? {};
   const toolMap = new Map(args.toolMap);
   let fileCheckpointer: t.LocalFileCheckpointer | undefined;
+
+  if (shouldUseCloudflareSandboxExecution(args.toolExecution)) {
+    const cloudflareConfig = getCloudflareConfig(args.toolExecution);
+    if (shouldIncludeCodingTools(args.toolExecution)) {
+      if (
+        cloudflareConfig.fileCheckpointing === true ||
+        args.fileCheckpointer != null
+      ) {
+        const bundle = createCloudflareCodingToolBundle(cloudflareConfig, {
+          checkpointer: args.fileCheckpointer,
+        });
+        fileCheckpointer = bundle.checkpointer;
+        for (const cloudflareTool of bundle.tools) {
+          toolMap.set(cloudflareTool.name, cloudflareTool);
+          directToolNames.add(cloudflareTool.name);
+        }
+      } else {
+        for (const cloudflareTool of createCloudflareCodingTools(
+          cloudflareConfig
+        )) {
+          toolMap.set(cloudflareTool.name, cloudflareTool);
+          directToolNames.add(cloudflareTool.name);
+        }
+      }
+    }
+
+    const includeCodingTools = shouldIncludeCodingTools(args.toolExecution);
+    for (const name of CODE_EXECUTION_TOOLS) {
+      if (includeCodingTools) continue;
+      if (!toolMap.has(name)) continue;
+
+      const cloudflareTool = createCloudflareExecutionTool(
+        name,
+        cloudflareConfig
+      );
+      if (cloudflareTool == null) {
+        continue;
+      }
+
+      toolMap.set(name, cloudflareTool);
+      directToolNames.add(name);
+    }
+
+    return { toolMap, directToolNames, fileCheckpointer };
+  }
+
+  const localConfig = args.toolExecution?.local ?? {};
 
   if (shouldIncludeCodingTools(args.toolExecution)) {
     // Use the bundle factory when fileCheckpointing is on so we can
@@ -163,7 +268,10 @@ export function resolveLocalExecutionTools(args: {
     // immediately discarded, making the public `fileCheckpointing`
     // config flag a silent no-op outside of direct
     // `createLocalCodingToolBundle()` use.
-    if (localConfig.fileCheckpointing === true || args.fileCheckpointer != null) {
+    if (
+      localConfig.fileCheckpointing === true ||
+      args.fileCheckpointer != null
+    ) {
       const bundle = createLocalCodingToolBundle(localConfig, {
         checkpointer: args.fileCheckpointer,
       });
