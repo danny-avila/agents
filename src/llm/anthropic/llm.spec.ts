@@ -34,6 +34,7 @@ import { toLangChainContent } from '@/messages/langchain';
 import { formatAgentMessages } from '@/messages/format';
 import { Constants, ContentTypes, GraphEvents, Providers } from '@/common';
 import { _documentsInParams, CustomAnthropic as ChatAnthropic } from './index';
+import { createSchemaOnlyTool } from '@/tools/schema';
 import { partitionAndMarkAnthropicToolCache } from '@/messages/anthropicToolCache';
 import { ChatModelStreamHandler, createContentAggregator } from '@/stream';
 import { ModelEndHandler, ToolEndHandler } from '@/events';
@@ -727,6 +728,87 @@ test('Test ChatAnthropic headers passed through', async () => {
   const message = new HumanMessage('Hello!');
   const res = await chat.invoke([message]);
   // console.log({ res });
+});
+
+test.each([
+  Constants.EXECUTE_CODE,
+  Constants.BASH_TOOL,
+  Constants.PROGRAMMATIC_TOOL_CALLING,
+  Constants.BASH_PROGRAMMATIC_TOOL_CALLING,
+  Constants.READ_FILE,
+])(
+  'Anthropic CodeAPI tool %s enables fine-grained tool input streaming',
+  (toolName) => {
+    const model = new ChatAnthropic({ modelName });
+    const codeApiTool = createSchemaOnlyTool({
+      name: toolName,
+      description: 'Run a CodeAPI-adjacent tool',
+      parameters: {
+        type: 'object',
+        properties: {
+          input: { type: 'string' },
+        },
+        required: ['input'],
+      },
+    });
+
+    const params = model.invocationParams({
+      tools: [codeApiTool],
+    } as never);
+
+    expect(params.tools?.[0]).toMatchObject({
+      name: toolName,
+      eager_input_streaming: true,
+    });
+  }
+);
+
+test('Anthropic fine-grained tool input streaming preserves explicit opt-out', () => {
+  const model = new ChatAnthropic({ modelName });
+
+  const params = model.invocationParams({
+    tools: [
+      {
+        name: Constants.BASH_TOOL,
+        description: 'Run bash',
+        eager_input_streaming: false,
+        input_schema: {
+          type: 'object',
+          properties: {
+            command: { type: 'string' },
+          },
+          required: ['command'],
+        },
+      },
+    ],
+  } as never);
+
+  expect(params.tools?.[0]).toMatchObject({
+    name: Constants.BASH_TOOL,
+    eager_input_streaming: false,
+  });
+});
+
+test('Anthropic fine-grained tool input streaming is scoped to CodeAPI tools', () => {
+  const model = new ChatAnthropic({ modelName });
+  const weatherTool = createSchemaOnlyTool({
+    name: 'get_weather',
+    description: 'Get weather',
+    parameters: {
+      type: 'object',
+      properties: {
+        location: { type: 'string' },
+      },
+      required: ['location'],
+    },
+  });
+
+  const params = model.invocationParams({
+    tools: [weatherTool],
+  } as never);
+
+  expect(params.tools?.[0]).toMatchObject({ name: 'get_weather' });
+  expect(params.tools?.[0]).not.toHaveProperty('eager_input_streaming');
 });
 
 describe('ChatAnthropic image inputs', () => {

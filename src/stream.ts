@@ -42,6 +42,13 @@ const LOCAL_CODING_BUNDLE_NAME_SET: ReadonlySet<string> = new Set(
   LOCAL_CODING_BUNDLE_NAMES
 );
 
+type ToolCallFinishSignalMetadata = {
+  finish_reason?: string | null;
+  finishReason?: string | null;
+  stop_reason?: string | null;
+  stopReason?: string | null;
+};
+
 /**
  * Parses content to extract thinking sections enclosed in <think> tags using string operations
  * @param content The content to parse
@@ -230,13 +237,20 @@ function isEagerToolExecutionEnabledForBatch(args: {
 
 function hasFinalToolCallSignal(chunk: Partial<AIMessageChunk>): boolean {
   const metadata = chunk.response_metadata as
-    | Record<string, unknown>
+    | ToolCallFinishSignalMetadata
+    | undefined;
+  const additionalKwargs = chunk.additional_kwargs as
+    | ToolCallFinishSignalMetadata
     | undefined;
   const finishReason =
     metadata?.finish_reason ??
     metadata?.finishReason ??
     metadata?.stop_reason ??
-    metadata?.stopReason;
+    metadata?.stopReason ??
+    additionalKwargs?.finish_reason ??
+    additionalKwargs?.finishReason ??
+    additionalKwargs?.stop_reason ??
+    additionalKwargs?.stopReason;
   return finishReason === 'tool_calls' || finishReason === 'tool_use';
 }
 
@@ -370,14 +384,15 @@ function createEagerToolExecutionPlan(args: {
     return undefined;
   }
 
-  const candidateToolCalls = skipExisting
-    ? toolCalls.filter((toolCall) => {
+  let candidateToolCalls = toolCalls;
+  if (skipExisting) {
+    candidateToolCalls = toolCalls.filter((toolCall) => {
       if (toolCall.id == null || toolCall.id === '') {
         return true;
       }
       return !graph.eagerEventToolExecutions.has(toolCall.id);
-    })
-    : toolCalls;
+    });
+  }
   if (candidateToolCalls.length === 0) {
     return [];
   }
@@ -535,15 +550,14 @@ async function dispatchEagerToolCompletions(args: {
     if (stepId === '') {
       continue;
     }
+    const resultContent =
+      typeof result.content === 'string'
+        ? result.content
+        : JSON.stringify(result.content);
     const output =
       result.status === 'error'
         ? `Error: ${result.errorMessage ?? 'Unknown error'}\n Please fix your mistakes.`
-        : truncateToolResultContent(
-          typeof result.content === 'string'
-            ? result.content
-            : JSON.stringify(result.content),
-          maxToolResultChars
-        );
+        : truncateToolResultContent(resultContent, maxToolResultChars);
 
     try {
       const dispatched = await safeDispatchCustomEvent(
@@ -714,11 +728,7 @@ function recordEagerToolCallChunks(args: {
           previous.name != null &&
           incomingName !== previous.name));
     const existing =
-      previous == null || shouldReset
-        ? {
-          argsText: '',
-        }
-        : previous;
+      previous == null || shouldReset ? { argsText: '' } : previous;
     const id = incomingId ?? existing.id;
     const name = incomingName ?? existing.name;
     const incomingArgs = toolCallChunk.args ?? '';
@@ -977,6 +987,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
     this.handleReasoning(chunk, agentContext);
     const stepKey = graph.getStepKey(metadata);
     let hasToolCalls = false;
+    const hasFinalToolSignal = hasFinalToolCallSignal(chunk);
     const hasToolCallChunks =
       (chunk.tool_call_chunks && chunk.tool_call_chunks.length > 0) ?? false;
     if (
@@ -992,7 +1003,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
     ) {
       hasToolCalls = true;
       await handleToolCalls(chunk.tool_calls, metadata, graph);
-      if (hasFinalToolCallSignal(chunk)) {
+      if (hasFinalToolSignal) {
         startEagerToolExecutions({
           graph,
           metadata,
@@ -1013,6 +1024,23 @@ export class ChatModelStreamHandler implements t.EventHandler {
 
     /** Set a preliminary message ID if found in empty chunk */
     const isEmptyChunk = isEmptyContent && !hasToolCallChunks;
+    if (isEmptyChunk) {
+      const allowSequentialSeal =
+        canPrestartSequentialStreamedToolChunks(agentContext);
+      if (
+        hasFinalToolSignal &&
+        (allowSequentialSeal || hasExplicitStreamedToolCallSeals(chunk))
+      ) {
+        startReadyStreamedEagerToolExecutions({
+          graph,
+          metadata,
+          agentContext,
+          stepKey,
+          allowSequentialSeal,
+          sealAll: true,
+        });
+      }
+    }
     if (
       isEmptyChunk &&
       (chunk.id ?? '') !== '' &&
@@ -1060,7 +1088,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
           toolCallChunks: chunk.tool_call_chunks,
           seal: streamedToolCallSeal,
           allowSequentialSeal,
-          sealAll: hasFinalToolCallSignal(chunk),
+          sealAll: hasFinalToolSignal,
         });
       }
     }
@@ -1324,7 +1352,7 @@ export function createContentAggregator(): t.ContentAggregatorResult {
     finalUpdate = false
   ): void => {
     if (!contentPart) {
-      console.warn('No content part found in \'updateContent\'');
+      console.warn('No content part found in updateContent');
       return;
     }
     const partType = contentPart.type ?? '';

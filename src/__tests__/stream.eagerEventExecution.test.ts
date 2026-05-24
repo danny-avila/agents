@@ -3003,6 +3003,88 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     expect(graph.eagerEventToolExecutions.has('toolu_net')).toBe(false);
   });
 
+  it('prestarts a single streamed remote bash tool on Anthropic final stop_reason', async () => {
+    const graph = createGraph({
+      getAgentContext: jest.fn(
+        (): Partial<AgentContext> => ({
+          provider: Providers.ANTHROPIC,
+          reasoningKey: 'reasoning',
+          toolDefinitions: [{ name: Constants.BASH_TOOL }],
+          graphTools: [],
+          agentId: 'agent_1',
+        })
+      ) as unknown as StandardGraph['getAgentContext'],
+    });
+    const toolExecuteCalls: t.ToolExecuteBatchRequest[] = [];
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data): Promise<void> => {
+        if (event !== GraphEvents.ON_TOOL_EXECUTE) {
+          return;
+        }
+        const batch = data as t.ToolExecuteBatchRequest;
+        toolExecuteCalls.push(batch);
+        batch.resolve([
+          {
+            toolCallId: 'toolu_env',
+            status: 'success',
+            content: 'ok bash_tool',
+          },
+        ]);
+      });
+
+    const handler = new ChatModelStreamHandler();
+    const metadata = { langgraph_node: 'agent' };
+
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_call_chunks: [
+            {
+              id: 'toolu_env',
+              name: Constants.BASH_TOOL,
+              args: '{"command":"echo env"}',
+              index: 0,
+            },
+          ],
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+
+    expect(toolExecuteCalls).toHaveLength(0);
+
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: [],
+          additional_kwargs: { stop_reason: 'tool_use' },
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+
+    expect(toolExecuteCalls).toHaveLength(1);
+    expect(toolExecuteCalls[0].toolCalls).toEqual([
+      expect.objectContaining({
+        id: 'toolu_env',
+        name: Constants.BASH_TOOL,
+        args: { command: 'echo env' },
+        stepId: expect.stringMatching(/^step_/),
+        turn: 0,
+      }),
+    ]);
+    expect(graph.eagerEventToolExecutions.has('toolu_env')).toBe(true);
+    expect(
+      graph.eagerEventToolCallChunks.has(chunkStateKey('step-key', 0))
+    ).toBe(false);
+  });
+
   it('does not prestart streamed remote tools when graph tools may appear later', async () => {
     const graph = createGraph({
       getAgentContext: jest.fn(
