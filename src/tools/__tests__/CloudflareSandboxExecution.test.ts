@@ -192,6 +192,27 @@ describe('Cloudflare sandbox execution backend', () => {
 });
 
 describe('Cloudflare bridge runtime', () => {
+  it('preserves caller-provided sandbox ids', async () => {
+    const urls: string[] = [];
+    const fetchImpl: typeof fetch = async (input) => {
+      urls.push(input.toString());
+      if (input.toString().endsWith('/exec')) {
+        return sseExit();
+      }
+      throw new Error(`Unexpected URL: ${input.toString()}`);
+    };
+    const runtime = createCloudflareBridgeRuntime({
+      baseURL: 'https://bridge.example',
+      sandboxId: 'user-123',
+      fetch: fetchImpl,
+    });
+
+    await expect(runtime.getSandboxId()).resolves.toBe('user-123');
+    await runtime.exec('true');
+
+    expect(urls).toEqual(['https://bridge.example/v1/sandbox/user-123/exec']);
+  });
+
   it('retries sandbox creation after a transient create failure', async () => {
     let createCalls = 0;
     const fetchImpl: typeof fetch = async (input) => {

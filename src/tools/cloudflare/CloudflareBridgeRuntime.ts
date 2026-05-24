@@ -4,8 +4,6 @@ import type * as t from '@/types';
 const DEFAULT_API_PREFIX = '/v1';
 const DEFAULT_WORKSPACE_ROOT = '/workspace';
 const DEFAULT_SHELL = 'bash';
-const BRIDGE_SANDBOX_ID_RE = /^[a-z2-7]{1,128}$/;
-const BASE32_ALPHABET = 'abcdefghijklmnopqrstuvwxyz234567';
 
 export type CloudflareBridgeRuntimeConfig = {
   /** Base URL of a Worker using `bridge()` from `@cloudflare/sandbox/bridge`. */
@@ -48,34 +46,6 @@ function normalizePrefix(prefix: string | undefined): string {
 function normalizeWorkspaceRoot(workspaceRoot: string): string {
   const normalized = path.normalize(workspaceRoot);
   return normalized === '/' ? normalized : normalized.replace(/\/+$/, '');
-}
-
-function base32Encode(bytes: Uint8Array): string {
-  let bits = 0;
-  let value = 0;
-  let output = '';
-  for (const byte of bytes) {
-    value = (value << 8) | byte;
-    bits += 8;
-    while (bits >= 5) {
-      output += BASE32_ALPHABET[(value >>> (bits - 5)) & 31];
-      bits -= 5;
-    }
-  }
-  if (bits > 0) {
-    output += BASE32_ALPHABET[(value << (5 - bits)) & 31];
-  }
-  return output;
-}
-
-async function normalizeBridgeSandboxId(id: string): Promise<string> {
-  const lower = id.toLowerCase();
-  if (BRIDGE_SANDBOX_ID_RE.test(lower)) {
-    return lower;
-  }
-  const bytes = new TextEncoder().encode(id);
-  const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes);
-  return `lc${base32Encode(new Uint8Array(digest)).slice(0, 50)}`;
 }
 
 function getFetch(config: CloudflareBridgeRuntimeConfig): typeof fetch {
@@ -273,9 +243,7 @@ export function createCloudflareBridgeRuntime(
   const shell = config.shell ?? DEFAULT_SHELL;
   const fetchImpl = getFetch(config);
   let sandboxIdPromise: Promise<string> | undefined =
-    config.sandboxId != null
-      ? normalizeBridgeSandboxId(config.sandboxId)
-      : undefined;
+    config.sandboxId != null ? Promise.resolve(config.sandboxId) : undefined;
 
   function bridgeURL(suffix: string): string {
     return `${baseURL}${apiPrefix}${suffix}`;
@@ -309,18 +277,22 @@ export function createCloudflareBridgeRuntime(
     options: t.CloudflareSandboxExecOptions = {}
   ): Promise<t.CloudflareSandboxExecResult> {
     const sandboxId = await getSandboxId();
-    const response = await fetchImpl(bridgeURL(`/sandbox/${sandboxId}/exec`), {
-      method: 'POST',
-      headers: createHeaders(config, {
-        'Content-Type': 'application/json',
-      }),
-      body: JSON.stringify({
-        argv: [shell, '-lc', commandWithEnv(command, options.env)],
-        cwd: toSandboxPath(options.cwd ?? workspaceRoot, workspaceRoot),
-        timeout_ms: options.timeout,
-      }),
-      signal: options.signal,
-    });
+    const sandboxPathId = encodeURIComponent(sandboxId);
+    const response = await fetchImpl(
+      bridgeURL(`/sandbox/${sandboxPathId}/exec`),
+      {
+        method: 'POST',
+        headers: createHeaders(config, {
+          'Content-Type': 'application/json',
+        }),
+        body: JSON.stringify({
+          argv: [shell, '-lc', commandWithEnv(command, options.env)],
+          cwd: toSandboxPath(options.cwd ?? workspaceRoot, workspaceRoot),
+          timeout_ms: options.timeout,
+        }),
+        signal: options.signal,
+      }
+    );
     await assertOk(response, 'exec');
     if (response.body == null) {
       throw new Error(
@@ -397,9 +369,12 @@ export function createCloudflareBridgeRuntime(
 
   async function readFile(filePath: string): Promise<Buffer> {
     const sandboxId = await getSandboxId();
+    const sandboxPathId = encodeURIComponent(sandboxId);
     const resolvedPath = toSandboxPath(filePath, workspaceRoot);
     const response = await fetchImpl(
-      bridgeURL(`/sandbox/${sandboxId}/file/${encodeBridgePath(resolvedPath)}`),
+      bridgeURL(
+        `/sandbox/${sandboxPathId}/file/${encodeBridgePath(resolvedPath)}`
+      ),
       {
         headers: createHeaders(config),
       }
@@ -414,10 +389,13 @@ export function createCloudflareBridgeRuntime(
     options?: { encoding?: string }
   ): Promise<unknown> {
     const sandboxId = await getSandboxId();
+    const sandboxPathId = encodeURIComponent(sandboxId);
     const resolvedPath = toSandboxPath(filePath, workspaceRoot);
     const body = await normalizeWriteBody(content, options);
     const response = await fetchImpl(
-      bridgeURL(`/sandbox/${sandboxId}/file/${encodeBridgePath(resolvedPath)}`),
+      bridgeURL(
+        `/sandbox/${sandboxPathId}/file/${encodeBridgePath(resolvedPath)}`
+      ),
       {
         method: 'PUT',
         headers: createHeaders(config, {

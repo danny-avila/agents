@@ -2847,6 +2847,72 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     expect(graph.eagerEventToolCallChunks.size).toBe(0);
   });
 
+  it('does not prestart streamed Cloudflare sandbox direct coding tools', async () => {
+    const graph = createGraph({
+      toolExecution: {
+        engine: 'cloudflare-sandbox',
+        cloudflare: { sandbox: {} },
+      } as StandardGraph['toolExecution'],
+      getAgentContext: jest.fn(
+        (): Partial<AgentContext> => ({
+          provider: Providers.OPENAI,
+          reasoningKey: 'reasoning_content',
+          toolDefinitions: [{ name: Constants.BASH_TOOL }, { name: 'weather' }],
+          graphTools: [],
+          agentId: 'agent_1',
+        })
+      ) as unknown as StandardGraph['getAgentContext'],
+    });
+    const dispatchSpy = jest.spyOn(events, 'safeDispatchCustomEvent');
+    const handler = new ChatModelStreamHandler();
+    const metadata = { langgraph_node: 'agent' };
+
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_call_chunks: [
+            {
+              id: 'call_weather',
+              name: 'weather',
+              args: '{"city":"NYC"}',
+              index: 0,
+            },
+          ],
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_call_chunks: [
+            {
+              id: 'call_bash',
+              name: Constants.BASH_TOOL,
+              args: '{"command":"echo ok"}',
+              index: 1,
+            },
+          ],
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+
+    expect(dispatchSpy).not.toHaveBeenCalledWith(
+      GraphEvents.ON_TOOL_EXECUTE,
+      expect.anything(),
+      expect.anything()
+    );
+    expect(graph.eagerEventToolExecutions.size).toBe(0);
+    expect(graph.eagerEventToolCallChunks.size).toBe(0);
+  });
+
   it('prestarts streamed remote bash tools when the next Anthropic tool call begins', async () => {
     const graph = createGraph({
       getAgentContext: jest.fn(
