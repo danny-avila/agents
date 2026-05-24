@@ -16,6 +16,8 @@ jobs:
     environment: publish # Must match npm trusted publisher config
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Use Node.js
         uses: actions/setup-node@v4
@@ -220,3 +222,66 @@ jobs:
         run: npm publish $(ls librechat-agents-*.tgz) --access public --provenance --tag ${{ steps.publish_tag.outputs.tag }}
         env:
           NODE_ENV: production
+
+  release:
+    needs: publish
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+
+      - name: Detect version commit
+        id: version
+        run: |
+          VERSION=$(git log -1 --pretty=%s "$GITHUB_SHA")
+          if echo "$VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "is_version=true" >> "$GITHUB_OUTPUT"
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "is_version=false" >> "$GITHUB_OUTPUT"
+          echo "Head commit subject '$VERSION' is not a release commit; skipping."
+
+      - name: Validate package version
+        if: steps.version.outputs.is_version == 'true'
+        run: |
+          PACKAGE_VERSION=$(node -p "require('./package.json').version")
+          VERSION="${{ steps.version.outputs.version }}"
+          if [ "v$PACKAGE_VERSION" != "$VERSION" ]; then
+            echo "::error title=Version mismatch::Commit subject is $VERSION, but package.json version is $PACKAGE_VERSION."
+            exit 1
+          fi
+
+      - name: Create GitHub release
+        if: steps.version.outputs.is_version == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if git rev-parse --verify --quiet "refs/tags/$VERSION" >/dev/null; then
+            TAG_SHA=$(git rev-list -n 1 "$VERSION")
+            if [ "$TAG_SHA" != "$GITHUB_SHA" ]; then
+              echo "::error title=Tag points at a different commit::Tag $VERSION points to $TAG_SHA, expected $GITHUB_SHA."
+              exit 1
+            fi
+          fi
+
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            echo "Release $VERSION already exists; skipping."
+            exit 0
+          fi
+
+          gh release create "$VERSION" \
+            --target "$GITHUB_SHA" \
+            --title "$VERSION" \
+            --generate-notes
