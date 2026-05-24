@@ -60,6 +60,7 @@ import { resolveLocalToolsForBinding } from '@/tools/local';
 import { createLocalCodingToolBundle } from '@/tools/local/LocalCodingTools';
 import { isThinkingEnabled } from '@/llm/request';
 import { initializeModel } from '@/llm/init';
+import { createLangfuseHandler, disposeLangfuseHandler } from '@/langfuse';
 import { HandlerRegistry } from '@/events';
 import { ChatOpenAI } from '@/llm/openai';
 import { partitionAndMarkOpenRouterToolCache } from '@/llm/openrouter/toolCache';
@@ -1318,6 +1319,26 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         { force: true }
       );
 
+      const langfuseHandler = createLangfuseHandler({
+        langfuse: agentContext.langfuse,
+        userId: config.configurable?.user_id as string | undefined,
+        sessionId: config.configurable?.thread_id as string | undefined,
+        traceMetadata: {
+          messageId: this.runId,
+          parentMessageId: config.configurable?.requestBody?.parentMessageId,
+          agentId,
+          agentName: agentContext.name,
+        },
+      });
+      const invokeConfig = langfuseHandler
+        ? {
+          ...config,
+          callbacks: ((config.callbacks as t.ProvidedCallbacks) ?? []).concat(
+            [langfuseHandler]
+          ),
+        }
+        : config;
+
       try {
         result = await attemptInvoke(
           {
@@ -1326,17 +1347,19 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             provider: agentContext.provider,
             context: this,
           },
-          config
+          invokeConfig
         );
       } catch (primaryError) {
         result = await tryFallbackProviders({
           fallbacks,
           tools: agentContext.tools,
           messages: finalMessages,
-          config,
+          config: invokeConfig,
           primaryError,
           context: this,
         });
+      } finally {
+        await disposeLangfuseHandler(langfuseHandler);
       }
 
       if (!result) {

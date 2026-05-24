@@ -53,6 +53,7 @@ export class AgentContext {
       name,
       provider,
       clientOptions,
+      langfuse,
       tools,
       toolMap,
       toolEnd,
@@ -80,6 +81,7 @@ export class AgentContext {
       name: name ?? agentId,
       provider,
       clientOptions,
+      langfuse,
       maxContextTokens,
       streamBuffer,
       tools,
@@ -149,6 +151,8 @@ export class AgentContext {
   provider: Providers;
   /** Client options for this agent */
   clientOptions?: t.ClientOptions;
+  /** Per-agent Langfuse tracing configuration. */
+  langfuse?: t.LangfuseConfig;
   /** Token count map indexed by message position */
   indexTokenCountMap: Record<string, number | undefined> = {};
   /** Canonical pre-run token map used to restore token accounting on reset */
@@ -309,6 +313,7 @@ export class AgentContext {
     name,
     provider,
     clientOptions,
+    langfuse,
     maxContextTokens,
     streamBuffer,
     tokenCounter,
@@ -332,6 +337,7 @@ export class AgentContext {
     name?: string;
     provider: Providers;
     clientOptions?: t.ClientOptions;
+    langfuse?: t.LangfuseConfig;
     maxContextTokens?: number;
     streamBuffer?: number;
     tokenCounter?: t.TokenCounter;
@@ -355,6 +361,7 @@ export class AgentContext {
     this.name = name;
     this.provider = provider;
     this.clientOptions = clientOptions;
+    this.langfuse = langfuse;
     this.maxContextTokens = maxContextTokens;
     this.streamBuffer = streamBuffer;
     this.tokenCounter = tokenCounter;
@@ -458,11 +465,14 @@ export class AgentContext {
   }
 
   private hasAvailableTool(name: string): boolean {
-    if (this.toolDefinitions?.some((tool) => tool.name === name)) return true;
-    if (this.tools?.some((tool) => 'name' in tool && tool.name === name)) {
+    if (this.toolDefinitions?.some((tool) => tool.name === name) === true)
+      return true;
+    if (
+      this.tools?.some((tool) => 'name' in tool && tool.name === name) === true
+    ) {
       return true;
     }
-    if (this.toolMap?.has(name)) return true;
+    if (this.toolMap?.has(name) === true) return true;
     return this.toolRegistry?.has(name) === true;
   }
 

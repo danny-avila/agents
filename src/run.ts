@@ -1,6 +1,5 @@
 // src/run.ts
 import './instrumentation';
-import { CallbackHandler } from '@langfuse/langchain';
 import { PromptTemplate } from '@langchain/core/prompts';
 import { RunnableLambda } from '@langchain/core/runnables';
 import { AzureChatOpenAI, ChatOpenAI } from '@langchain/openai';
@@ -31,7 +30,14 @@ import { initializeModel } from '@/llm/init';
 import { HandlerRegistry } from '@/events';
 import { executeHooks } from '@/hooks';
 import { isOpenAILike } from '@/utils/llm';
-import { isPresent } from '@/utils/misc';
+import {
+  createLegacyLangfuseHandler,
+  createLangfuseHandler,
+  disposeLangfuseHandler,
+  hasExplicitLangfuseConfig,
+  hasLangfuseEnvConfig,
+  isLangfuseCallbackHandler,
+} from '@/langfuse';
 import type { HookRegistry } from '@/hooks';
 
 export const defaultOmitOptions = new Set([
@@ -607,9 +613,8 @@ export class Run<_T extends t.BaseGraphState> {
       .concat(customHandler);
 
     if (
-      isPresent(process.env.LANGFUSE_SECRET_KEY) &&
-      isPresent(process.env.LANGFUSE_PUBLIC_KEY) &&
-      isPresent(process.env.LANGFUSE_BASE_URL)
+      hasLangfuseEnvConfig() &&
+      !hasExplicitLangfuseConfig(this.Graph.agentContexts.values())
     ) {
       const userId = config.configurable?.user_id;
       const sessionId = config.configurable?.thread_id;
@@ -621,7 +626,7 @@ export class Run<_T extends t.BaseGraphState> {
         parentMessageId: config.configurable?.requestBody?.parentMessageId,
         agentName: primaryContext?.name,
       };
-      const handler = new CallbackHandler({
+      const handler = createLegacyLangfuseHandler({
         userId,
         sessionId,
         traceMetadata,
@@ -1134,12 +1139,8 @@ export class Run<_T extends t.BaseGraphState> {
     titleMethod = TitleMethod.COMPLETION,
     titlePromptTemplate,
   }: t.RunTitleOptions): Promise<{ language?: string; title?: string }> {
-    if (
-      chainOptions != null &&
-      isPresent(process.env.LANGFUSE_SECRET_KEY) &&
-      isPresent(process.env.LANGFUSE_PUBLIC_KEY) &&
-      isPresent(process.env.LANGFUSE_BASE_URL)
-    ) {
+    let titleLangfuseHandler: unknown;
+    if (chainOptions != null) {
       const userId = chainOptions.configurable?.user_id;
       const sessionId = chainOptions.configurable?.thread_id;
       const titleContext = this.Graph?.agentContexts.get(
@@ -1149,14 +1150,31 @@ export class Run<_T extends t.BaseGraphState> {
         messageId: 'title-' + this.id,
         agentName: titleContext?.name,
       };
-      const handler = new CallbackHandler({
-        userId,
-        sessionId,
-        traceMetadata,
-      });
-      chainOptions.callbacks = (
-        (chainOptions.callbacks as t.ProvidedCallbacks) ?? []
-      ).concat([handler]);
+      const hasExplicitLangfuse =
+        this.Graph != null &&
+        hasExplicitLangfuseConfig(this.Graph.agentContexts.values());
+      if (titleContext?.langfuse != null) {
+        titleLangfuseHandler = createLangfuseHandler({
+          langfuse: titleContext.langfuse,
+          userId,
+          sessionId,
+          traceMetadata,
+        });
+      } else if (hasLangfuseEnvConfig() && !hasExplicitLangfuse) {
+        titleLangfuseHandler = createLegacyLangfuseHandler({
+          userId,
+          sessionId,
+          traceMetadata,
+        });
+      }
+
+      if (titleLangfuseHandler != null) {
+        chainOptions.callbacks = (
+          (chainOptions.callbacks as t.ProvidedCallbacks) ?? []
+        ).concat([
+          titleLangfuseHandler as NonNullable<t.ProvidedCallbacks>[number],
+        ]);
+      }
     }
 
     const convoTemplate = PromptTemplate.fromTemplate(
@@ -1221,24 +1239,28 @@ export class Run<_T extends t.BaseGraphState> {
     });
 
     try {
-      return await fullChain.invoke(
-        { input: inputText, output: response },
-        invokeConfig
-      );
-    } catch (_e) {
-      // Fallback: strip callbacks to avoid EventStream tracer errors in certain environments
-      // But preserve langfuse handler if it exists
-      const langfuseHandler = (
-        invokeConfig.callbacks as t.ProvidedCallbacks
-      )?.find((cb) => cb instanceof CallbackHandler);
-      const { callbacks: _cb, ...rest } = invokeConfig;
-      const safeConfig = Object.assign({}, rest, {
-        callbacks: langfuseHandler ? [langfuseHandler] : [],
-      });
-      return await fullChain.invoke(
-        { input: inputText, output: response },
-        safeConfig as Partial<RunnableConfig>
-      );
+      try {
+        return await fullChain.invoke(
+          { input: inputText, output: response },
+          invokeConfig
+        );
+      } catch (_e) {
+        // Fallback: strip callbacks to avoid EventStream tracer errors in certain environments
+        // but preserve Langfuse tracing if it exists.
+        const langfuseHandler = (
+          invokeConfig.callbacks as t.ProvidedCallbacks
+        )?.find(isLangfuseCallbackHandler);
+        const { callbacks: _cb, ...rest } = invokeConfig;
+        const safeConfig = Object.assign({}, rest, {
+          callbacks: langfuseHandler ? [langfuseHandler] : [],
+        });
+        return await fullChain.invoke(
+          { input: inputText, output: response },
+          safeConfig as Partial<RunnableConfig>
+        );
+      }
+    } finally {
+      await disposeLangfuseHandler(titleLangfuseHandler);
     }
   }
 }
