@@ -279,7 +279,7 @@ DESTRUCTIVE_OP_IN_COMMAND_RE = re.compile(r"\\b(?:rm\\s+-[^\\s]*[rf]|chmod\\s+-R
 def _is_within_workspace(file_path):
     resolved = os.path.abspath(file_path)
     root = os.path.abspath(WORKSPACE)
-    return resolved == root or resolved.startswith(root + os.sep)
+    return os.path.commonpath([root, resolved]) == root
 
 def _resolve(file_path="."):
     raw = file_path or "."
@@ -601,7 +601,8 @@ function resolvePath(filePath) {
   const candidate = path.isAbsolute(raw) ? raw : path.join(WORKSPACE, raw);
   const resolved = path.resolve(candidate);
   const root = path.resolve(WORKSPACE);
-  if (resolved !== root && !resolved.startsWith(root + path.sep)) {
+  const relative = path.relative(root, resolved);
+  if (relative && (relative.startsWith("..") || path.isAbsolute(relative))) {
     throw new Error("Path is outside the Cloudflare sandbox workspace: " + filePath);
   }
   return resolved;

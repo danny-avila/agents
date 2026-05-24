@@ -307,6 +307,63 @@ describe('Cloudflare sandbox execution backend', () => {
     expect(execCommand).toContain('validateBashCommand(command, args);');
   });
 
+  it('uses root-safe path containment in programmatic helpers', async () => {
+    let pythonSource = '';
+    const pythonSandbox = createRuntime({
+      writeFile: async (_path, content) => {
+        pythonSource = String(content);
+        return { ok: true };
+      },
+      exec: async () => ({
+        exitCode: 0,
+        stdout: 'done',
+        stderr: '',
+      }),
+    });
+    const pythonProgrammatic = createCloudflareProgrammaticToolCallingTool({
+      sandbox: pythonSandbox,
+      workspaceRoot: '/',
+    });
+
+    await pythonProgrammatic.invoke({
+      code: 'print("ok")',
+      lang: 'py',
+    });
+
+    expect(pythonSource).toContain('WORKSPACE = "/"');
+    expect(pythonSource).toContain(
+      'return os.path.commonpath([root, resolved]) == root'
+    );
+
+    let bashCommand = '';
+    const bashSandbox = createRuntime({
+      exec: async (command) => {
+        bashCommand = command;
+        return {
+          exitCode: 0,
+          stdout: 'done',
+          stderr: '',
+        };
+      },
+    });
+    const bashProgrammatic = createCloudflareBashProgrammaticToolCallingTool({
+      sandbox: bashSandbox,
+      workspaceRoot: '/',
+    });
+
+    await bashProgrammatic.invoke({
+      code: 'printf "%s\\n" "ok"',
+    });
+
+    expect(bashCommand).toContain('const WORKSPACE = "/";');
+    expect(bashCommand).toContain(
+      'const relative = path.relative(root, resolved);'
+    );
+    expect(bashCommand).toContain(
+      'relative.startsWith("..") || path.isAbsolute(relative)'
+    );
+  });
+
   it('enforces Cloudflare codingToolNames as an allowlist', () => {
     const tools = resolveLocalToolsForBinding({
       tools: [
