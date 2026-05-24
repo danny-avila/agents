@@ -136,10 +136,19 @@ function isDirectGraphTool(
 }
 
 function isDirectLocalTool(name: string, graph: StandardGraph): boolean {
-  if (graph.toolExecution?.engine !== 'local') {
+  const toolExecution = graph.toolExecution;
+  const engine = toolExecution?.engine;
+  if (
+    toolExecution == null ||
+    (engine !== 'local' && engine !== 'cloudflare-sandbox')
+  ) {
     return false;
   }
-  if (graph.toolExecution.local?.includeCodingTools === false) {
+  const includeCodingTools =
+    engine === 'cloudflare-sandbox'
+      ? toolExecution.cloudflare?.includeCodingTools
+      : toolExecution.local?.includeCodingTools;
+  if (includeCodingTools === false) {
     return CODE_EXECUTION_TOOLS.has(name);
   }
   return LOCAL_CODING_BUNDLE_NAME_SET.has(name);
@@ -270,7 +279,8 @@ function hasPotentialDirectToolInStreamContext(args: {
   agentContext?: AgentContext;
 }): boolean {
   const { graph, agentContext } = args;
-  if (graph.toolExecution?.engine === 'local') {
+  const engine = graph.toolExecution?.engine;
+  if (engine === 'local' || engine === 'cloudflare-sandbox') {
     return true;
   }
   if ((agentContext?.graphTools?.length ?? 0) > 0) {

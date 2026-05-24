@@ -505,11 +505,12 @@ export type ToolOutputReferencesConfig = {
   maxTotalSize?: number;
 };
 
-export type ToolExecutionEngine = 'sandbox' | 'local';
+export type ToolExecutionEngine = 'sandbox' | 'local' | 'cloudflare-sandbox';
 
 /**
  * Records pre-write file contents so callers can rewind edits/writes
- * made by the local engine. Implementations live in `src/tools/local`.
+ * made by local-compatible coding-tool engines. Implementations live
+ * in `src/tools/local`.
  */
 export interface LocalFileCheckpointer {
   /**
@@ -634,6 +635,12 @@ export type LocalExecConfig = {
    * overridden together for non-host engines.
    */
   fs?: import('@/tools/local/workspaceFS').WorkspaceFS;
+  /**
+   * Set by custom execution backends that already provide their own
+   * sandbox boundary. Suppresses the local host-sandbox warning while
+   * preserving the warning for plain host `child_process` execution.
+   */
+  sandboxed?: boolean;
 };
 
 export type LocalExecutionConfig = {
@@ -790,11 +797,143 @@ export type LocalExecutionConfig = {
   };
 };
 
+export type CloudflareSandboxExecOptions = {
+  cwd?: string;
+  env?: Record<string, string | undefined>;
+  timeout?: number;
+  stream?: boolean;
+  onOutput?: (stream: 'stdout' | 'stderr', data: string) => void;
+  signal?: AbortSignal;
+};
+
+export type CloudflareSandboxExecResult = {
+  success?: boolean;
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  command?: string;
+  duration?: number;
+  timestamp?: string;
+};
+
+export type CloudflareSandboxReadFileResult =
+  | string
+  | Buffer
+  | Uint8Array
+  | {
+      content: string | Buffer | Uint8Array | ReadableStream<Uint8Array>;
+      size?: number;
+      mimeType?: string;
+      encoding?: 'utf-8' | 'utf8' | 'base64';
+      isBinary?: boolean;
+    };
+
+export type CloudflareSandboxListFilesOptions = {
+  recursive?: boolean;
+  includeHidden?: boolean;
+};
+
+export type CloudflareSandboxFileInfo = {
+  name: string;
+  absolutePath?: string;
+  relativePath?: string;
+  type?: 'file' | 'directory' | 'symlink' | 'other';
+  size?: number;
+  modifiedAt?: string;
+  mode?: string;
+};
+
+export type CloudflareSandboxListFilesResult =
+  | CloudflareSandboxFileInfo[]
+  | {
+      files: CloudflareSandboxFileInfo[];
+      count?: number;
+      path?: string;
+      success?: boolean;
+    };
+
+export interface CloudflareSandboxRuntime {
+  exec(
+    command: string,
+    options?: CloudflareSandboxExecOptions
+  ): Promise<CloudflareSandboxExecResult>;
+  readFile(
+    path: string,
+    options?: { encoding?: string }
+  ): Promise<CloudflareSandboxReadFileResult>;
+  writeFile(
+    path: string,
+    content: string | ReadableStream<Uint8Array>,
+    options?: { encoding?: string }
+  ): Promise<unknown>;
+  mkdir(path: string, options?: { recursive?: boolean }): Promise<unknown>;
+  listFiles(
+    path: string,
+    options?: CloudflareSandboxListFilesOptions
+  ): Promise<CloudflareSandboxListFilesResult>;
+  deleteFile(path: string): Promise<unknown>;
+}
+
+export type CloudflareSandboxExecutionConfig = {
+  sandbox:
+    | CloudflareSandboxRuntime
+    | (() => CloudflareSandboxRuntime | Promise<CloudflareSandboxRuntime>);
+  /** Working directory inside the sandbox. Defaults to `/workspace`. */
+  workspaceRoot?: string;
+  /** Extra environment variables merged into sandbox command executions. */
+  env?: Record<string, string | undefined>;
+  /** Default timeout for sandbox commands, in milliseconds. */
+  timeoutMs?: number;
+  /** Maximum stdout/stderr characters surfaced to the model. */
+  maxOutputChars?: number;
+  /**
+   * Add the built-in coding suite when `engine` is `cloudflare-sandbox`.
+   * Defaults to true, matching the local execution backend.
+   */
+  includeCodingTools?: boolean;
+  /**
+   * Optional exact coding-tool names to expose when `includeCodingTools`
+   * is on. Defaults to the full local-parity Cloudflare bundle. Use this
+   * to publish a bash-only sandbox surface, for example file/search tools
+   * plus `bash_tool` and `run_tools_with_bash`, without exposing
+   * `execute_code`.
+   */
+  codingToolNames?: readonly string[];
+  /** Optional shell executable for bash-style tools. Defaults to `bash`. */
+  shell?: string;
+  /**
+   * Optional project-level compile check configuration. Mirrors the local
+   * execution backend.
+   */
+  compileCheck?: LocalExecutionConfig['compileCheck'];
+  /** Optional read-only guard for mutating coding tools. */
+  readOnly?: boolean;
+  /** Permit dangerous commands that the validator otherwise blocks. */
+  allowDangerousCommands?: LocalExecutionConfig['allowDangerousCommands'];
+  /** Tree-sitter-bash AST validation pass for bash commands. */
+  bashAst?: LocalExecutionConfig['bashAst'];
+  /**
+   * Enable per-Run file checkpointing for `edit_file` / `write_file`
+   * against the Cloudflare Sandbox workspace.
+   */
+  fileCheckpointing?: LocalExecutionConfig['fileCheckpointing'];
+  /** Maximum bytes to read in `read_file` before returning a stub. */
+  maxReadBytes?: LocalExecutionConfig['maxReadBytes'];
+  /** Controls whether `read_file` returns binary files as attachments. */
+  attachReadAttachments?: LocalExecutionConfig['attachReadAttachments'];
+  /** Maximum pre-encoding byte size to embed inline. */
+  maxAttachmentBytes?: LocalExecutionConfig['maxAttachmentBytes'];
+  /** Run a fast per-file syntax check after successful edits/writes. */
+  postEditSyntaxCheck?: LocalExecutionConfig['postEditSyntaxCheck'];
+};
+
 export type ToolExecutionConfig = {
   /** `sandbox` preserves the remote Code API behavior and is the default. */
   engine?: ToolExecutionEngine;
   /** Local process execution settings used when `engine` is `local`. */
   local?: LocalExecutionConfig;
+  /** Cloudflare Sandbox execution settings used when `engine` is `cloudflare-sandbox`. */
+  cloudflare?: CloudflareSandboxExecutionConfig;
 };
 
 export type ProgrammaticCache = {

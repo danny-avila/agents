@@ -342,7 +342,11 @@ function shouldUseLocalSandbox(config: t.LocalExecutionConfig): boolean {
 let sandboxOffWarned = false;
 
 function maybeWarnSandboxOff(config: t.LocalExecutionConfig): void {
-  if (sandboxOffWarned || shouldUseLocalSandbox(config)) {
+  if (
+    sandboxOffWarned ||
+    shouldUseLocalSandbox(config) ||
+    config.exec?.sandboxed === true
+  ) {
     return;
   }
   sandboxOffWarned = true;
@@ -700,6 +704,8 @@ export interface SpawnLocalProcessOptions {
   internal?: boolean;
 }
 
+export const LOCAL_SPAWN_TIMEOUT_MS = Symbol('librechat.localSpawn.timeoutMs');
+
 export async function spawnLocalProcess(
   command: string,
   args: string[],
@@ -742,12 +748,16 @@ export async function spawnLocalProcess(
 
   const launcher = getSpawn(config);
   return new Promise<SpawnResult>((resolveResult, reject) => {
-    const child = launcher(spawnCommand, spawnArgs, {
+    const spawnOptions: import('child_process').SpawnOptions = {
       cwd,
       detached: process.platform !== 'win32',
       env: { ...process.env, ...(config.env ?? {}) },
       stdio: ['ignore', 'pipe', 'pipe'],
+    };
+    Object.defineProperty(spawnOptions, LOCAL_SPAWN_TIMEOUT_MS, {
+      value: timeoutMs,
     });
+    const child = launcher(spawnCommand, spawnArgs, spawnOptions);
 
     let stdout = '';
     let stderr = '';
@@ -1166,7 +1176,10 @@ function configShell(): string {
 const SIGKILL_ESCALATION_MS = 2000;
 
 function sigterm(child: ChildProcess): void {
-  if (child.pid == null) return;
+  if (child.pid == null) {
+    child.kill('SIGTERM');
+    return;
+  }
   try {
     if (process.platform === 'win32') {
       child.kill('SIGTERM');
@@ -1179,8 +1192,11 @@ function sigterm(child: ChildProcess): void {
 }
 
 function sigkill(child: ChildProcess): void {
-  if (child.pid == null) return;
   if (child.exitCode != null || child.signalCode != null) return;
+  if (child.pid == null) {
+    child.kill('SIGKILL');
+    return;
+  }
   try {
     if (process.platform === 'win32') {
       child.kill('SIGKILL');

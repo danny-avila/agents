@@ -27,6 +27,7 @@ export * from './tools/ToolNode';
 export * from './tools/schema';
 export * from './tools/handlers';
 export * from './tools/local';
+export * from './tools/cloudflare';
 export * from './tools/search';
 
 /* Misc. */
