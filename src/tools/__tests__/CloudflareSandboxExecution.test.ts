@@ -107,24 +107,34 @@ describe('Cloudflare sandbox execution backend', () => {
     expect(listPaths).toEqual(['/workspace']);
   });
 
-  it('aborts remote exec when the local timeout kills the spawn wrapper', async () => {
-    let signal: AbortSignal | undefined;
+  it('does not pass AbortSignal to Cloudflare spawn exec options', async () => {
+    let resolveExecCalled!: () => void;
+    const execCalled = new Promise<void>((resolve) => {
+      resolveExecCalled = resolve;
+    });
+    let receivedOptions: t.CloudflareSandboxExecOptions | undefined;
     const sandbox = createRuntime({
-      exec: (_command, options) =>
-        new Promise<t.CloudflareSandboxExecResult>((_resolve, reject) => {
-          signal = options?.signal;
-          signal?.addEventListener('abort', () => reject(new Error('aborted')));
-        }),
+      exec: (_command, options) => {
+        receivedOptions = options;
+        resolveExecCalled();
+        return new Promise<t.CloudflareSandboxExecResult>(() => undefined);
+      },
     });
     const config = createCloudflareLocalExecutionConfig({
       sandbox,
-      timeoutMs: 10,
+      timeoutMs: 50,
       workspaceRoot: '/workspace',
     });
 
-    const result = await spawnLocalProcess('bash', ['-lc', 'sleep 10'], config);
+    const resultPromise = spawnLocalProcess(
+      'bash',
+      ['-lc', 'sleep 10'],
+      config
+    );
+    await execCalled;
+    const result = await resultPromise;
 
-    expect(signal?.aborted).toBe(true);
+    expect(receivedOptions).not.toHaveProperty('signal');
     expect(result.timedOut).toBe(true);
     expect(result.exitCode).toBe(143);
   });

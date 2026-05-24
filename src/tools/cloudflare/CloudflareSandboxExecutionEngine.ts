@@ -400,7 +400,6 @@ function createCloudflareSpawn(
   return (command, args, options) => {
     const stdout = new PassThrough();
     const stderr = new PassThrough();
-    const abortController = new AbortController();
     const child = new EventEmitter() as ChildProcessWithoutNullStreams;
     const state = { closed: false };
     const closeOnce = (
@@ -430,7 +429,6 @@ function createCloudflareSpawn(
       pid: undefined,
       kill: (signal: NodeJS.Signals = 'SIGTERM') => {
         Object.assign(child, { killed: true, signalCode: signal });
-        abortController.abort();
         closeOnce(null, signal);
         return true;
       },
@@ -456,7 +454,6 @@ function createCloudflareSpawn(
           cwd,
           env: ctx.env,
           timeout: outerTimeoutMs(timeoutMs),
-          signal: abortController.signal,
         });
         if (state.closed) {
           return;
