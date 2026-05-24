@@ -31,6 +31,11 @@ import { HandlerRegistry } from '@/events';
 import { executeHooks } from '@/hooks';
 import { isOpenAILike } from '@/utils/llm';
 import {
+  appendCallbacks,
+  findCallback,
+  type CallbackEntry,
+} from '@/utils/callbacks';
+import {
   createLegacyLangfuseHandler,
   createLangfuseTraceMetadata,
   createLangfuseHandler,
@@ -600,19 +605,19 @@ export class Run<_T extends t.BaseGraphState> {
     /** Custom event callback to intercept and handle custom events */
     const customEventCallback = this.createCustomEventCallback();
 
-    const baseCallbacks = (config.callbacks as t.ProvidedCallbacks) ?? [];
     const streamCallbacks = streamOptions?.callbacks
       ? this.getCallbacks(streamOptions.callbacks)
-      : [];
+      : undefined;
 
     const customHandler = BaseCallbackHandler.fromMethods({
       [Callback.CUSTOM_EVENT]: customEventCallback,
     });
     customHandler.awaitHandlers = true;
 
-    config.callbacks = baseCallbacks
-      .concat(streamCallbacks)
-      .concat(customHandler);
+    config.callbacks = appendCallbacks(
+      config.callbacks,
+      streamCallbacks ? [streamCallbacks, customHandler] : [customHandler]
+    );
 
     if (
       hasLangfuseEnvConfig() &&
@@ -641,9 +646,7 @@ export class Run<_T extends t.BaseGraphState> {
         tags: ['librechat', 'agent'],
       });
       config.runName = config.runName ?? getLangfuseTraceName(traceMetadata);
-      config.callbacks = (
-        (config.callbacks as t.ProvidedCallbacks) ?? []
-      ).concat([handler]);
+      config.callbacks = appendCallbacks(config.callbacks, [handler]);
     }
 
     if (!this.id) {
@@ -1149,7 +1152,7 @@ export class Run<_T extends t.BaseGraphState> {
     titleMethod = TitleMethod.COMPLETION,
     titlePromptTemplate,
   }: t.RunTitleOptions): Promise<{ language?: string; title?: string }> {
-    let titleLangfuseHandler: unknown;
+    let titleLangfuseHandler: CallbackEntry | undefined;
     const titleContext =
       this.Graph == null
         ? undefined
@@ -1190,10 +1193,8 @@ export class Run<_T extends t.BaseGraphState> {
       }
 
       if (titleLangfuseHandler != null) {
-        chainOptions.callbacks = (
-          (chainOptions.callbacks as t.ProvidedCallbacks) ?? []
-        ).concat([
-          titleLangfuseHandler as NonNullable<t.ProvidedCallbacks>[number],
+        chainOptions.callbacks = appendCallbacks(chainOptions.callbacks, [
+          titleLangfuseHandler,
         ]);
       }
     }
@@ -1269,9 +1270,10 @@ export class Run<_T extends t.BaseGraphState> {
       } catch (_e) {
         // Fallback: strip callbacks to avoid EventStream tracer errors in certain environments
         // but preserve Langfuse tracing if it exists.
-        const langfuseHandler = (
-          invokeConfig.callbacks as t.ProvidedCallbacks
-        )?.find(isLangfuseCallbackHandler);
+        const langfuseHandler = findCallback(
+          invokeConfig.callbacks,
+          isLangfuseCallbackHandler
+        );
         const { callbacks: _cb, ...rest } = invokeConfig;
         const safeConfig = Object.assign({}, rest, {
           callbacks: langfuseHandler ? [langfuseHandler] : [],

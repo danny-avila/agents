@@ -52,6 +52,7 @@ import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { shouldTriggerSummarization } from '@/summarization';
 import { createSummarizeNode } from '@/summarization/node';
 import { messagesStateReducer } from '@/messages/reducer';
+import { appendCallbacks } from '@/utils/callbacks';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { AgentContext } from '@/agents/AgentContext';
 import { createFakeStreamingLLM } from '@/llm/fake';
@@ -1352,9 +1353,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       const invokeConfig = langfuseHandler
         ? {
           ...config,
-          callbacks: ((config.callbacks as t.ProvidedCallbacks) ?? []).concat(
-            [langfuseHandler]
-          ),
+          callbacks: appendCallbacks(config.callbacks, [langfuseHandler]),
         }
         : config;
 
