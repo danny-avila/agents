@@ -106,6 +106,49 @@ describe('ProgrammaticToolCalling', () => {
       });
     });
 
+    it('parses ClickHouse-style JSON strings with SQL punctuation for object-schema tools', async () => {
+      const invoke = jest.fn<
+        (_input: unknown, _config: unknown) => Promise<unknown>
+          >(async (input) => input);
+      const customTool = {
+        name: 'run_select_query_mcp_ClickHouse',
+        schema: {
+          type: 'object',
+          properties: {
+            serviceId: { type: 'string' },
+            query: { type: 'string' },
+          },
+          required: ['serviceId', 'query'],
+        },
+        invoke,
+      } as unknown as t.GenericTool;
+      const customToolMap: t.ToolMap = new Map([
+        ['run_select_query_mcp_ClickHouse', customTool],
+      ]);
+      const input = {
+        serviceId: '45886e06-932b-4cff-bb49-3f7281d80717',
+        query:
+          'SELECT name, round(avg(tempAvg)/10.0, 2) AS avg_temp_c ' +
+          'FROM system.columns WHERE database=\'default\' ' +
+          'AND table=\'uk_prices_3\' AND tempAvg != -9999',
+      };
+      const toolCalls: t.PTCToolCall[] = [
+        {
+          id: 'call_001',
+          name: 'run_select_query_mcp_ClickHouse',
+          input: JSON.stringify(input),
+        },
+      ];
+
+      const results = await executeTools(toolCalls, customToolMap);
+
+      expect(results[0].is_error).toBe(false);
+      expect(results[0].result).toEqual(input);
+      expect(invoke).toHaveBeenCalledWith(input, {
+        metadata: { [Constants.PROGRAMMATIC_TOOL_CALLING]: true },
+      });
+    });
+
     it('preserves JSON-looking strings for string-input tools', async () => {
       const invoke = jest.fn<
         (_input: unknown, _config: unknown) => Promise<unknown>
@@ -129,6 +172,39 @@ describe('ProgrammaticToolCalling', () => {
       expect(results[0].is_error).toBe(false);
       expect(results[0].result).toBe('{"raw":true}');
       expect(invoke).toHaveBeenCalledWith('{"raw":true}', {
+        metadata: { [Constants.PROGRAMMATIC_TOOL_CALLING]: true },
+      });
+    });
+
+    it('preserves ClickHouse-style JSON strings for raw string-input tools', async () => {
+      const invoke = jest.fn<
+        (_input: unknown, _config: unknown) => Promise<unknown>
+          >(async (input) => input);
+      const customTool = {
+        name: 'string_tool',
+        schema: { type: 'string' },
+        invoke,
+      } as unknown as t.GenericTool;
+      const customToolMap: t.ToolMap = new Map([['string_tool', customTool]]);
+      const input = JSON.stringify({
+        serviceId: '45886e06-932b-4cff-bb49-3f7281d80717',
+        query:
+          'SELECT round(avg(tempAvg)/10.0, 2) AS avg_temp_c ' +
+          'FROM default.weather_noaa_mt WHERE database=\'default\'',
+      });
+      const toolCalls: t.PTCToolCall[] = [
+        {
+          id: 'call_001',
+          name: 'string_tool',
+          input,
+        },
+      ];
+
+      const results = await executeTools(toolCalls, customToolMap);
+
+      expect(results[0].is_error).toBe(false);
+      expect(results[0].result).toBe(input);
+      expect(invoke).toHaveBeenCalledWith(input, {
         metadata: { [Constants.PROGRAMMATIC_TOOL_CALLING]: true },
       });
     });

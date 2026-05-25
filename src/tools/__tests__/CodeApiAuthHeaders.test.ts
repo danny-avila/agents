@@ -268,6 +268,26 @@ describe('CodeAPI auth header injection', () => {
     expect(requestBodyAt(0).timeout).toBe(15000);
   });
 
+  it('accepts larger programmatic timeout inputs and clamps before execution', async () => {
+    const tool = createProgrammaticToolCallingTool({
+      runTimeoutMs: 15000,
+    });
+
+    await tool.invoke(
+      { code: 'result = await lookup_user()\nprint(result)', timeout: 30000 },
+      {
+        toolCall: {
+          name: 'programmatic_code_execution',
+          args: {},
+          toolMap: toolMap(),
+          toolDefs,
+        },
+      }
+    );
+
+    expect(requestBodyAt(0).timeout).toBe(15000);
+  });
+
   it('defaults bash programmatic timeout to the configured CodeAPI run cap', async () => {
     const tool = createBashProgrammaticToolCallingTool({
       runTimeoutMs: 15000,
@@ -275,6 +295,26 @@ describe('CodeAPI auth header injection', () => {
 
     await tool.invoke(
       { code: 'lookup_user "{}"' },
+      {
+        toolCall: {
+          name: 'bash_programmatic_code_execution',
+          args: {},
+          toolMap: toolMap(),
+          toolDefs,
+        },
+      }
+    );
+
+    expect(requestBodyAt(0).timeout).toBe(15000);
+  });
+
+  it('accepts larger bash programmatic timeout inputs and clamps before execution', async () => {
+    const tool = createBashProgrammaticToolCallingTool({
+      runTimeoutMs: 15000,
+    });
+
+    await tool.invoke(
+      { code: 'lookup_user "{}"', timeout: 30000 },
       {
         toolCall: {
           name: 'bash_programmatic_code_execution',
