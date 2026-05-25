@@ -2,6 +2,7 @@ import { EnvVar } from '@/common';
 
 export const DEFAULT_CODE_API_RUN_TIMEOUT_MS = 15_000;
 export const MIN_CODE_API_RUN_TIMEOUT_MS = 1_000;
+export const MAX_CODE_API_RUN_TIMEOUT_SCHEMA_MS = 300_000;
 
 type TimeoutSchema = {
   type: 'integer';
@@ -74,16 +75,25 @@ export function createCodeApiRunTimeoutSchema(
 ): TimeoutSchema {
   const normalizedMaxRunTimeoutMs =
     normalizeTimeoutMs(maxRunTimeoutMs) ?? DEFAULT_CODE_API_RUN_TIMEOUT_MS;
+  const normalizedSchemaMaxRunTimeoutMs = Math.max(
+    normalizedMaxRunTimeoutMs,
+    MAX_CODE_API_RUN_TIMEOUT_SCHEMA_MS
+  );
   const formattedTimeout = formatTimeout(normalizedMaxRunTimeoutMs);
+  const formattedSchemaMaxTimeout = formatTimeout(
+    normalizedSchemaMaxRunTimeoutMs
+  );
 
   return {
     type: 'integer',
     minimum: MIN_CODE_API_RUN_TIMEOUT_MS,
-    maximum: normalizedMaxRunTimeoutMs,
+    maximum: normalizedSchemaMaxRunTimeoutMs,
     default: normalizedMaxRunTimeoutMs,
     description:
       'Maximum wall-clock time in milliseconds for one sandbox run or replay iteration. ' +
       'This is not the total multi-round-trip task budget. ' +
-      `Default: ${formattedTimeout}. Max: ${formattedTimeout}.`,
+      `Default: ${formattedTimeout}. ` +
+      'Accepted values above the configured cap are clamped before execution. ' +
+      `Schema max: ${formattedSchemaMaxTimeout}. Configured cap: ${formattedTimeout}.`,
   };
 }

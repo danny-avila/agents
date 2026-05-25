@@ -16,6 +16,7 @@ import { createBashProgrammaticToolCallingTool } from '../BashProgrammaticToolCa
 import {
   clampCodeApiRunTimeoutMs,
   createCodeApiRunTimeoutSchema,
+  MAX_CODE_API_RUN_TIMEOUT_SCHEMA_MS,
 } from '../ptcTimeout';
 import {
   createLocalProgrammaticToolCallingTool,
@@ -292,9 +293,11 @@ describe('CodeAPI auth header injection', () => {
 
     expect(clampCodeApiRunTimeoutMs(60000, 15000)).toBe(15000);
     expect(schema.default).toBe(15000);
-    expect(schema.maximum).toBe(15000);
+    expect(schema.maximum).toBe(MAX_CODE_API_RUN_TIMEOUT_SCHEMA_MS);
     expect(schema.description).toContain('one sandbox run');
     expect(schema.description).toContain('not the total multi-round-trip');
+    expect(schema.description).toContain('clamped before execution');
+    expect(schema.description).toContain('Configured cap: 15 seconds');
   });
 
   it('keeps local programmatic timeout schemas aligned with local execution defaults', () => {
