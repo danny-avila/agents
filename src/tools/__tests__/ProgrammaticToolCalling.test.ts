@@ -86,6 +86,135 @@ describe('ProgrammaticToolCalling', () => {
       });
     });
 
+    it('parses JSON-string inputs before invoking structured tools', async () => {
+      const toolCalls: t.PTCToolCall[] = [
+        {
+          id: 'call_001',
+          name: 'get_weather',
+          input: '{"city":"San Francisco"}',
+        },
+      ];
+
+      const results = await executeTools(toolCalls, toolMap);
+
+      expect(results).toHaveLength(1);
+      expect(results[0].call_id).toBe('call_001');
+      expect(results[0].is_error).toBe(false);
+      expect(results[0].result).toEqual({
+        temperature: 65,
+        condition: 'Foggy',
+      });
+    });
+
+    it('preserves JSON-looking strings for string-input tools', async () => {
+      const invoke = jest.fn<
+        (_input: unknown, _config: unknown) => Promise<unknown>
+          >(async (input) => input);
+      const customTool = {
+        name: 'string_tool',
+        schema: { type: 'string' },
+        invoke,
+      } as unknown as t.GenericTool;
+      const customToolMap: t.ToolMap = new Map([['string_tool', customTool]]);
+      const toolCalls: t.PTCToolCall[] = [
+        {
+          id: 'call_001',
+          name: 'string_tool',
+          input: '{"raw":true}',
+        },
+      ];
+
+      const results = await executeTools(toolCalls, customToolMap);
+
+      expect(results[0].is_error).toBe(false);
+      expect(results[0].result).toBe('{"raw":true}');
+      expect(invoke).toHaveBeenCalledWith('{"raw":true}', {
+        metadata: { [Constants.PROGRAMMATIC_TOOL_CALLING]: true },
+      });
+    });
+
+    it('stringifies object inputs before invoking string-input tools', async () => {
+      const invoke = jest.fn<
+        (_input: unknown, _config: unknown) => Promise<unknown>
+          >(async (input) => input);
+      const customTool = {
+        name: 'string_tool',
+        schema: { type: 'string' },
+        invoke,
+      } as unknown as t.GenericTool;
+      const customToolMap: t.ToolMap = new Map([['string_tool', customTool]]);
+      const toolCalls: t.PTCToolCall[] = [
+        {
+          id: 'call_001',
+          name: 'string_tool',
+          input: { raw: true },
+        },
+      ];
+
+      const results = await executeTools(toolCalls, customToolMap);
+
+      expect(results[0].is_error).toBe(false);
+      expect(results[0].result).toBe('{"raw":true}');
+      expect(invoke).toHaveBeenCalledWith('{"raw":true}', {
+        metadata: { [Constants.PROGRAMMATIC_TOOL_CALLING]: true },
+      });
+    });
+
+    it('preserves object inputs for mixed object-or-string schemas', async () => {
+      const invoke = jest.fn<
+        (_input: unknown, _config: unknown) => Promise<unknown>
+          >(async (input) => input);
+      const customTool = {
+        name: 'mixed_tool',
+        schema: { type: ['object', 'string'] },
+        invoke,
+      } as unknown as t.GenericTool;
+      const customToolMap: t.ToolMap = new Map([['mixed_tool', customTool]]);
+      const input = { raw: true };
+      const toolCalls: t.PTCToolCall[] = [
+        {
+          id: 'call_001',
+          name: 'mixed_tool',
+          input,
+        },
+      ];
+
+      const results = await executeTools(toolCalls, customToolMap);
+
+      expect(results[0].is_error).toBe(false);
+      expect(results[0].result).toBe(input);
+      expect(invoke).toHaveBeenCalledWith(input, {
+        metadata: { [Constants.PROGRAMMATIC_TOOL_CALLING]: true },
+      });
+    });
+
+    it('preserves JSON-looking strings for mixed object-or-string schemas', async () => {
+      const invoke = jest.fn<
+        (_input: unknown, _config: unknown) => Promise<unknown>
+          >(async (input) => input);
+      const customTool = {
+        name: 'mixed_tool',
+        schema: { type: ['object', 'string'] },
+        invoke,
+      } as unknown as t.GenericTool;
+      const customToolMap: t.ToolMap = new Map([['mixed_tool', customTool]]);
+      const toolCalls: t.PTCToolCall[] = [
+        {
+          id: 'call_001',
+          name: 'mixed_tool',
+          input: '{"raw":true}',
+        },
+      ];
+
+      const results = await executeTools(toolCalls, customToolMap);
+
+      expect(results[0].is_error).toBe(false);
+      expect(results[0].result).toBe('{"raw":true}');
+      expect(invoke).toHaveBeenCalledWith('{"raw":true}', {
+        metadata: { [Constants.PROGRAMMATIC_TOOL_CALLING]: true },
+      });
+    });
+
     it('marks bash PTC inner tool invocations with bash metadata', async () => {
       const invoke = jest.fn<
         (_input: unknown, _config: unknown) => Promise<{ ok: boolean }>
