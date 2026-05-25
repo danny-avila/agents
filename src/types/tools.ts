@@ -1025,9 +1025,9 @@ export type PTCToolCall = {
   id: string;
   /** Tool name */
   name: string;
-  /** Input parameters */
+  /** Input parameters. Some bridges may serialize object input as JSON text. */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  input: Record<string, any>;
+  input: Record<string, any> | string;
 };
 
 /**

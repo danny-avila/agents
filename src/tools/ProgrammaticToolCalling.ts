@@ -630,6 +630,122 @@ export function unwrapToolResponse(
   return result;
 }
 
+type ToolInputSchemaKind = {
+  object: boolean;
+  string: boolean;
+};
+
+function detectSchemaKind(schema: unknown): ToolInputSchemaKind {
+  const kind: ToolInputSchemaKind = { object: false, string: false };
+
+  if (!schema || typeof schema !== 'object') {
+    return kind;
+  }
+
+  const jsonSchemaType = (schema as { type?: unknown }).type;
+  if (jsonSchemaType === 'object') {
+    kind.object = true;
+  } else if (jsonSchemaType === 'string') {
+    kind.string = true;
+  } else if (Array.isArray(jsonSchemaType)) {
+    kind.object = jsonSchemaType.includes('object');
+    kind.string = jsonSchemaType.includes('string');
+  }
+
+  const zodDef = (schema as { _def?: unknown })._def;
+  if (!zodDef || typeof zodDef !== 'object') {
+    return kind;
+  }
+
+  const zodType = (zodDef as { type?: unknown; typeName?: unknown }).type;
+  const zodTypeName = (zodDef as { type?: unknown; typeName?: unknown })
+    .typeName;
+
+  if (zodType === 'object' || zodTypeName === 'ZodObject') {
+    kind.object = true;
+  } else if (zodType === 'string' || zodTypeName === 'ZodString') {
+    kind.string = true;
+  }
+
+  const innerSchema =
+    (
+      zodDef as {
+        innerType?: unknown;
+        schema?: unknown;
+        type?: unknown;
+      }
+    ).innerType ?? (zodDef as { schema?: unknown }).schema;
+  if (innerSchema) {
+    const innerKind = detectSchemaKind(innerSchema);
+    kind.object ||= innerKind.object;
+    kind.string ||= innerKind.string;
+  }
+
+  const options = (zodDef as { options?: unknown }).options;
+  if (Array.isArray(options)) {
+    for (const option of options) {
+      const optionKind = detectSchemaKind(option);
+      kind.object ||= optionKind.object;
+      kind.string ||= optionKind.string;
+    }
+  }
+
+  return kind;
+}
+
+function getToolInputSchemaKind(tool: t.GenericTool): ToolInputSchemaKind {
+  if (tool.constructor.name === 'DynamicTool') {
+    return { object: false, string: true };
+  }
+
+  const schema = (tool as { schema?: unknown }).schema;
+  return detectSchemaKind(schema);
+}
+
+function normalizeToolInput(
+  input: t.PTCToolCall['input'],
+  tool: t.GenericTool
+): t.PTCToolCall['input'] {
+  const schemaKind = getToolInputSchemaKind(tool);
+
+  if (typeof input !== 'string') {
+    if (!schemaKind.string || schemaKind.object) {
+      return input;
+    }
+
+    const inputValue = (input as { input?: unknown }).input;
+    if (typeof inputValue === 'string') {
+      return input;
+    }
+
+    return JSON.stringify(input);
+  }
+
+  if (!schemaKind.object || schemaKind.string) {
+    return input;
+  }
+
+  const trimmed = input.trim();
+  if (!trimmed.startsWith('{')) {
+    return input;
+  }
+
+  try {
+    const parsed: unknown = JSON.parse(trimmed);
+    if (
+      typeof parsed === 'object' &&
+      parsed !== null &&
+      !Array.isArray(parsed)
+    ) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    return input;
+  }
+
+  return input;
+}
+
 /**
  * Executes tools in parallel when requested by the API.
  * Uses Promise.all for parallel execution, catching individual errors.
@@ -656,7 +772,7 @@ export async function executeTools(
     }
 
     try {
-      const result = await tool.invoke(call.input, {
+      const result = await tool.invoke(normalizeToolInput(call.input, tool), {
         metadata: { [programmaticToolName]: true },
       });
 
