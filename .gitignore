@@ -14,3 +14,4 @@ credentials/**/*
 coverage/**/*
 .cursor/
 .claude/
+.codex/
