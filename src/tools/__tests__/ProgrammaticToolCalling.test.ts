@@ -16,7 +16,10 @@ import {
   normalizeToPythonIdentifier,
   unwrapToolResponse,
 } from '../ProgrammaticToolCalling';
-import { createBashProgrammaticToolCallingSchema } from '../BashProgrammaticToolCalling';
+import {
+  createBashProgrammaticToolCallingSchema,
+  normalizeBashToolResultsForReplay,
+} from '../BashProgrammaticToolCalling';
 import {
   createProgrammaticToolRegistry,
   createGetTeamMembersTool,
@@ -40,9 +43,11 @@ describe('ProgrammaticToolCalling', () => {
       const schema = createBashProgrammaticToolCallingSchema();
       const description = schema.properties.code.description;
 
-      expect(description).toContain('jq: use fromjson? // .');
-      expect(description).toContain('again on JSON-string fields');
-      expect(description).toContain('arrays may contain strings');
+      expect(description).toContain(
+        'Tool stdout is normalized to one compact JSON value'
+      );
+      expect(description).toContain('use fromjson? // .');
+      expect(description).toContain('only for JSON-string fields');
       expect(description).toContain('raw=$(tool');
       expect(description).toContain('direct tool > file may be empty');
       expect(description).toContain('/mnt/data/sf.json');
@@ -50,6 +55,69 @@ describe('ProgrammaticToolCalling', () => {
         'failed executions do not register new files'
       );
       expect(description).toContain('not later-call storage');
+    });
+  });
+
+  describe('normalizeBashToolResultsForReplay', () => {
+    it('decodes JSON-looking string results before bash replay', () => {
+      const results = normalizeBashToolResultsForReplay([
+        {
+          call_id: 'call_001',
+          result: JSON.stringify({
+            result: {
+              data: [{ station_id: 'USW00094725', winter_days: 91 }],
+            },
+          }),
+          is_error: false,
+        },
+      ]);
+
+      expect(results[0].result).toEqual({
+        result: {
+          data: [{ station_id: 'USW00094725', winter_days: 91 }],
+        },
+      });
+    });
+
+    it('decodes JSON-looking array string results before bash replay', () => {
+      const results = normalizeBashToolResultsForReplay([
+        {
+          call_id: 'call_001',
+          result: '[{"name":"tempAvg"},{"name":"snowDepth"}]',
+          is_error: false,
+        },
+      ]);
+
+      expect(results[0].result).toEqual([
+        { name: 'tempAvg' },
+        { name: 'snowDepth' },
+      ]);
+    });
+
+    it('preserves plain strings, invalid JSON strings, and error results', () => {
+      const errorJson = '{"message":"tool failed"}';
+      const results = normalizeBashToolResultsForReplay([
+        {
+          call_id: 'call_001',
+          result: 'plain text',
+          is_error: false,
+        },
+        {
+          call_id: 'call_002',
+          result: '{not json}',
+          is_error: false,
+        },
+        {
+          call_id: 'call_003',
+          result: errorJson,
+          is_error: true,
+          error_message: 'tool failed',
+        },
+      ]);
+
+      expect(results[0].result).toBe('plain text');
+      expect(results[1].result).toBe('{not json}');
+      expect(results[2].result).toBe(errorJson);
     });
   });
 

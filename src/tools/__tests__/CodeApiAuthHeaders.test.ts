@@ -34,6 +34,8 @@ type FetchMock = jest.MockedFunction<
 
 type CodeApiRequestBody = {
   timeout?: number;
+  continuation_token?: string;
+  tool_results?: t.PTCToolResult[];
 };
 
 type TimeoutSchemaForTest = {
@@ -385,6 +387,58 @@ describe('CodeAPI auth header injection', () => {
         }),
       })
     );
+  });
+
+  it('normalizes JSON-looking bash programmatic tool results before continuation', async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({
+          status: 'tool_call_required',
+          continuation_token: 'continue_123',
+          tool_calls: [{ id: 'call_001', name: 'lookup_user', input: {} }],
+        })
+      )
+      .mockResolvedValueOnce(completedResponse('done'));
+    const tool = createBashProgrammaticToolCallingTool();
+    const customToolMap = new Map([
+      [
+        'lookup_user',
+        {
+          name: 'lookup_user',
+          invoke: jest.fn(async () =>
+            JSON.stringify({
+              result: {
+                data: [{ id: 'user_123', name: 'Ada' }],
+              },
+            })
+          ),
+        },
+      ],
+    ]) as unknown as t.ToolMap;
+
+    await tool.invoke(
+      { code: 'lookup_user "{}"' },
+      {
+        toolCall: {
+          name: 'bash_programmatic_code_execution',
+          args: {},
+          toolMap: customToolMap,
+          toolDefs,
+        },
+      }
+    );
+
+    expect(requestBodyAt(1).tool_results).toEqual([
+      {
+        call_id: 'call_001',
+        result: {
+          result: {
+            data: [{ id: 'user_123', name: 'Ada' }],
+          },
+        },
+        is_error: false,
+      },
+    ]);
   });
 
   it('reminds that failed bash programmatic executions do not register new files', async () => {
