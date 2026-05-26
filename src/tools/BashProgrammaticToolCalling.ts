@@ -71,7 +71,7 @@ const CORE_RULES = `Rules:
 - Tools are pre-defined as bash functions—DO NOT redefine them
 - Each tool function accepts a JSON string argument
 - Save tool output with raw=$(tool '{}'); printf '%s\n' "$raw" > /mnt/data/file.json; direct tool > file may be empty
-- jq: use fromjson? // . on saved tool stdout and again on JSON-string fields; check types since arrays may contain strings
+- Tool stdout is normalized to one compact JSON value when possible; parse saved stdout once, then use fromjson? // . only for JSON-string fields
 - Only echo/printf output returns to the model
 - ${CODE_ARTIFACT_PATH_GUIDANCE}
 - ${BASH_SHELL_GUIDANCE}
@@ -148,6 +148,38 @@ export const BashProgrammaticToolCallingDefinition = {
   description: BashProgrammaticToolCallingDescription,
   schema: BashProgrammaticToolCallingSchema,
 } as const;
+
+function maybeParseJsonResultString(result: unknown): unknown {
+  if (typeof result !== 'string') {
+    return result;
+  }
+
+  const trimmed = result.trim();
+  if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) {
+    return result;
+  }
+
+  try {
+    return JSON.parse(trimmed) as unknown;
+  } catch {
+    return result;
+  }
+}
+
+export function normalizeBashToolResultsForReplay(
+  toolResults: t.PTCToolResult[]
+): t.PTCToolResult[] {
+  return toolResults.map((toolResult) => {
+    if (toolResult.is_error) {
+      return toolResult;
+    }
+
+    return {
+      ...toolResult,
+      result: maybeParseJsonResultString(toolResult.result),
+    };
+  });
+}
 
 // ============================================================================
 // Helper Functions
@@ -355,10 +387,12 @@ export function createBashProgrammaticToolCallingTool(
             );
           }
 
-          const toolResults = await executeTools(
-            response.tool_calls ?? [],
-            toolMap,
-            Constants.BASH_PROGRAMMATIC_TOOL_CALLING
+          const toolResults = normalizeBashToolResultsForReplay(
+            await executeTools(
+              response.tool_calls ?? [],
+              toolMap,
+              Constants.BASH_PROGRAMMATIC_TOOL_CALLING
+            )
           );
 
           response = await makeRequest(
