@@ -15,6 +15,12 @@ describe('ToolNode Langfuse redaction context', () => {
     mockWithLangfuseToolOutputTracingConfig.mockClear();
   });
 
+  it('uses a stable default run name for tracing', () => {
+    const node = new ToolNode({ tools: [] });
+
+    expect(node.name).toBe('tool_batch');
+  });
+
   it('scopes ToolNode invocation with run and agent Langfuse config', async () => {
     const runLangfuse = {
       toolOutputTracing: { enabled: true },

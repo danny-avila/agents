@@ -20,6 +20,7 @@ const langfuseConfigKey = createContextKey('librechat.langfuse.config');
 const toolOutputTracingStorage =
   new AsyncLocalStorage<ResolvedLangfuseToolOutputTracingConfig>();
 const langfuseConfigStorage = new AsyncLocalStorage<t.LangfuseConfig>();
+const LANGGRAPH_TOOL_NODE_PREFIX = 'tools=';
 
 const CHAT_ROLES = new Set([
   'assistant',
@@ -446,6 +447,26 @@ function isToolObservation(attributes: Record<string, unknown>): boolean {
   return typeof type === 'string' && type.toLowerCase() === 'tool';
 }
 
+function classifyLangGraphToolNodeSpan(
+  attributes: Record<string, unknown>
+): void {
+  const type = attributes[LangfuseOtelSpanAttributes.OBSERVATION_TYPE];
+  if (typeof type !== 'string' || type.toLowerCase() !== 'span') {
+    return;
+  }
+
+  const langGraphNode =
+    attributes[
+      `${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.langgraph_node`
+    ];
+  if (
+    typeof langGraphNode === 'string' &&
+    langGraphNode.startsWith(LANGGRAPH_TOOL_NODE_PREFIX)
+  ) {
+    attributes[LangfuseOtelSpanAttributes.OBSERVATION_TYPE] = 'tool';
+  }
+}
+
 function redactToolObservationOutput(
   span: ReadableSpan,
   attributes: Record<string, unknown>,
@@ -469,11 +490,13 @@ export function redactLangfuseSpanToolOutputs(
   span: ReadableSpan,
   config: ResolvedLangfuseToolOutputTracingConfig
 ): void {
+  const attributes = (span as SpanWithAttributes).attributes;
+  classifyLangGraphToolNodeSpan(attributes);
+
   if (!shouldApplyToolOutputRedaction(config)) {
     return;
   }
 
-  const attributes = (span as SpanWithAttributes).attributes;
   redactToolObservationOutput(span, attributes, config);
 
   for (const key of [
@@ -618,10 +641,7 @@ function hasLangfuseConfigKeys(langfuse?: t.LangfuseConfig): boolean {
   if (langfuse == null) {
     return false;
   }
-  return (
-    isPresent(langfuse.secretKey) &&
-    isPresent(langfuse.publicKey)
-  );
+  return isPresent(langfuse.secretKey) && isPresent(langfuse.publicKey);
 }
 
 export function shouldTraceToolNodeForLangfuse({
@@ -639,8 +659,7 @@ export function shouldTraceToolNodeForLangfuse({
   const explicit = langfuse?.toolNodeTracing?.enabled;
   if (explicit != null) {
     return (
-      explicit &&
-      (hasLangfuseConfigKeys(langfuse) || hasLangfuseEnvKeys())
+      explicit && (hasLangfuseConfigKeys(langfuse) || hasLangfuseEnvKeys())
     );
   }
 

@@ -103,6 +103,8 @@ type RunToolBatchContext = {
   additionalContextsSink?: string[];
 };
 
+const TOOL_NODE_RUN_NAME = 'tool_batch';
+
 /**
  * Per-batch context for `dispatchToolEvents` / `executeViaEvent`.
  * Mirrors {@link RunToolBatchContext} for the event-driven path,
@@ -500,7 +502,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     toolExecution,
     fileCheckpointer,
   }: t.ToolNodeConstructorParams) {
-    super({ name, tags, func: (input, config) => this.run(input, config) });
+    super({
+      name: name ?? TOOL_NODE_RUN_NAME,
+      tags,
+      func: (input, config) => this.run(input, config),
+    });
     this.trace = trace ?? this.trace;
     this.runLangfuse = runLangfuse;
     this.agentLangfuse = agentLangfuse;
