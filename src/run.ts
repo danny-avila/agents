@@ -584,20 +584,21 @@ export class Run<_T extends t.BaseGraphState> {
   private getStreamToolOutputTracingLangfuseConfig(
     graph: StandardGraph | MultiAgentGraph
   ): t.LangfuseConfig | undefined {
-    if (this.langfuse?.toolOutputTracing != null) {
-      return undefined;
-    }
-
     const toolOutputTracingConfigs = Array.from(
       graph.agentContexts.values()
     )
-      .map((context) => context.langfuse?.toolOutputTracing)
+      .map((context) => {
+        return resolveLangfuseConfig(this.langfuse, context.langfuse)
+          ?.toolOutputTracing;
+      })
       .filter((config): config is t.LangfuseToolOutputTracingConfig => {
         return config != null;
       });
 
     if (toolOutputTracingConfigs.length === 0) {
-      return undefined;
+      return this.langfuse?.toolOutputTracing != null
+        ? { toolOutputTracing: this.langfuse.toolOutputTracing }
+        : undefined;
     }
     if (toolOutputTracingConfigs.length === 1) {
       return { toolOutputTracing: toolOutputTracingConfigs[0] };

@@ -52,6 +52,11 @@ import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { shouldTriggerSummarization } from '@/summarization';
 import { createSummarizeNode } from '@/summarization/node';
 import { messagesStateReducer } from '@/messages/reducer';
+import {
+  appendCallbacks,
+  findCallback,
+  type CallbackEntry,
+} from '@/utils/callbacks';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { AgentContext } from '@/agents/AgentContext';
 import { createFakeStreamingLLM } from '@/llm/fake';
@@ -62,6 +67,14 @@ import { createCloudflareCodingToolBundle } from '@/tools/cloudflare';
 import { isThinkingEnabled } from '@/llm/request';
 import { initializeModel } from '@/llm/init';
 import {
+  createLangfuseHandler,
+  createLangfuseTraceMetadata,
+  disposeLangfuseHandler,
+  isLangfuseCallbackHandler,
+} from '@/langfuse';
+import { initializeLangfuseTracing } from '@/instrumentation';
+import {
+  resolveLangfuseConfig,
   shouldTraceToolNodeForLangfuse,
   withLangfuseToolOutputTracingConfig,
 } from '@/langfuseToolOutputTracing';
@@ -1352,7 +1365,33 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         { force: true }
       );
 
-      const invokeConfig = config;
+      const langfuse = resolveLangfuseConfig(
+        this.langfuse,
+        agentContext.langfuse
+      );
+      let langfuseHandler: CallbackEntry | undefined;
+      let invokeConfig = config;
+      if (findCallback(config.callbacks, isLangfuseCallbackHandler) == null) {
+        initializeLangfuseTracing(langfuse);
+        langfuseHandler = createLangfuseHandler({
+          langfuse,
+          userId: config.configurable?.user_id as string | undefined,
+          sessionId: config.configurable?.thread_id as string | undefined,
+          traceMetadata: createLangfuseTraceMetadata({
+            messageId: this.runId,
+            parentMessageId: config.configurable?.requestBody?.parentMessageId,
+            agentId,
+            agentName: agentContext.name,
+          }),
+          tags: ['librechat', 'agent'],
+        });
+        if (langfuseHandler != null) {
+          invokeConfig = {
+            ...config,
+            callbacks: appendCallbacks(config.callbacks, [langfuseHandler]),
+          };
+        }
+      }
 
       try {
         result = await withLangfuseToolOutputTracingConfig(
@@ -1383,6 +1422,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             }),
           agentContext.langfuse
         );
+      } finally {
+        await disposeLangfuseHandler(langfuseHandler);
       }
 
       if (!result) {

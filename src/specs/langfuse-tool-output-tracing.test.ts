@@ -117,7 +117,18 @@ describe('Langfuse tool output tracing redaction', () => {
           baseUrl: 'https://langfuse.test',
         },
       })
-    ).toBe(false);
+    ).toBe(true);
+    expect(
+      shouldTraceToolNodeForLangfuse({
+        agentLangfuse: {
+          enabled: true,
+          publicKey: 'pk-agent',
+          secretKey: 'sk-agent',
+          baseUrl: 'https://langfuse.test',
+          toolNodeTracing: { enabled: true },
+        },
+      })
+    ).toBe(true);
 
     process.env.LANGFUSE_SECRET_KEY = 'sk-test';
     process.env.LANGFUSE_PUBLIC_KEY = 'pk-test';

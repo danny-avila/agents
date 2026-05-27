@@ -583,6 +583,18 @@ function hasLangfuseEnvKeys(): boolean {
   );
 }
 
+function hasLangfuseConfigKeys(langfuse?: t.LangfuseConfig): boolean {
+  if (langfuse == null) {
+    return false;
+  }
+  return (
+    isPresent(langfuse.secretKey) &&
+    isPresent(langfuse.publicKey) &&
+    (isPresent(langfuse.baseUrl) ||
+      isPresent(process.env.LANGFUSE_BASE_URL ?? process.env.LANGFUSE_BASEURL))
+  );
+}
+
 export function shouldTraceToolNodeForLangfuse({
   runLangfuse,
   agentLangfuse,
@@ -594,14 +606,21 @@ export function shouldTraceToolNodeForLangfuse({
     agentLangfuse?.toolNodeTracing?.enabled ??
     runLangfuse?.toolNodeTracing?.enabled;
   if (explicit != null) {
-    return explicit && hasLangfuseEnvKeys();
+    return (
+      explicit &&
+      (hasLangfuseConfigKeys(resolveLangfuseConfig(runLangfuse, agentLangfuse)) ||
+        hasLangfuseEnvKeys())
+    );
   }
 
   if (agentLangfuse?.enabled === false || runLangfuse?.enabled === false) {
     return false;
   }
 
-  return hasLangfuseEnvKeys();
+  return (
+    hasLangfuseConfigKeys(resolveLangfuseConfig(runLangfuse, agentLangfuse)) ||
+    hasLangfuseEnvKeys()
+  );
 }
 
 export function resolveLangfuseConfig(

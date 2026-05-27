@@ -86,4 +86,40 @@ describe('Langfuse callback composition', () => {
 
     expect(mockStartActiveSpan).toHaveBeenCalled();
   });
+
+  it('attaches Langfuse callbacks for direct graph invocations', async () => {
+    const run = await Run.create<t.IState>({
+      runId: 'test-langfuse-direct-graph',
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'agent_abc123',
+            name: 'DWAINE',
+            provider: Providers.OPENAI,
+            clientOptions: { model: 'gpt-4' },
+            tools: [],
+            langfuse: {
+              enabled: true,
+              publicKey: 'pk-test',
+              secretKey: 'sk-test',
+            },
+          },
+        ],
+      },
+      skipCleanup: true,
+    });
+
+    run.Graph?.overrideTestModel(['hello']);
+    const workflow = run.Graph?.createWorkflow();
+    await workflow?.invoke(
+      { messages: [new HumanMessage('hello')] },
+      {
+        callbacks: [],
+        configurable: { thread_id: 'thread-1', user_id: 'user-1' },
+      }
+    );
+
+    expect(mockStartActiveSpan).toHaveBeenCalled();
+  });
 });

@@ -165,10 +165,64 @@ describe('Langfuse instrumentation', () => {
     expect(provider).toBe(mockTracerProvider);
     expect(mockLangfuseSpanProcessor).toHaveBeenCalledWith(
       expect.objectContaining({
+        publicKey: 'pk-env',
+        secretKey: 'sk-env',
         baseUrl: 'https://langfuse.config',
       })
     );
     expect(mockBasicTracerProvider).toHaveBeenCalledTimes(1);
+  });
+
+  it('creates a new isolated provider when explicit credentials change', async () => {
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    initializeLangfuseTracing({
+      publicKey: 'pk-first',
+      secretKey: 'sk-first',
+      baseUrl: 'https://langfuse.first',
+    });
+    initializeLangfuseTracing({
+      publicKey: 'pk-second',
+      secretKey: 'sk-second',
+      baseUrl: 'https://langfuse.second',
+    });
+
+    expect(mockLangfuseSpanProcessor).toHaveBeenCalledTimes(2);
+    expect(mockLangfuseSpanProcessor).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        publicKey: 'pk-first',
+        secretKey: 'sk-first',
+        baseUrl: 'https://langfuse.first',
+      })
+    );
+    expect(mockLangfuseSpanProcessor).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        publicKey: 'pk-second',
+        secretKey: 'sk-second',
+        baseUrl: 'https://langfuse.second',
+      })
+    );
+    expect(mockBasicTracerProvider).toHaveBeenCalledTimes(2);
+    expect(mockSetLangfuseTracerProvider).toHaveBeenCalledTimes(2);
+  });
+
+  it('passes explicit redaction config into the redacting processor fallback', async () => {
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    initializeLangfuseTracing({
+      publicKey: 'pk-config',
+      secretKey: 'sk-config',
+      baseUrl: 'https://langfuse.config',
+      toolOutputTracing: { enabled: false },
+    });
+
+    const providerInput = mockBasicTracerProvider.mock
+      .calls[0][0] as BasicTracerProviderInput;
+    expect(providerInput.spanProcessors[0]).toMatchObject({
+      fallbackConfig: expect.objectContaining({
+        enabled: false,
+      }),
+    });
   });
 
   it('reuses the isolated provider after initialization', async () => {

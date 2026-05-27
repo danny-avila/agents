@@ -13,6 +13,7 @@ import type { LangfuseSpanProcessorParams } from '@langfuse/otel';
 import type * as t from '@/types';
 
 let langfuseTracerProvider: BasicTracerProvider | undefined;
+let langfuseTracerProviderKey: string | undefined;
 const contextManagerProbeKey = createContextKey(
   'langfuse-context-manager-probe'
 );
@@ -42,44 +43,70 @@ function getLangfuseSpanProcessorParams(
   if (langfuse?.enabled === false) {
     return undefined;
   }
-  const baseUrl = isPresent(langfuse?.baseUrl)
-    ? { baseUrl: langfuse.baseUrl }
-    : {};
   if (hasLangfuseConfigCredentials(langfuse)) {
     return {
       publicKey: langfuse.publicKey,
       secretKey: langfuse.secretKey,
-      ...baseUrl,
+      ...(isPresent(langfuse.baseUrl) ? { baseUrl: langfuse.baseUrl } : {}),
     };
   }
-  if (
-    hasLangfuseEnvConfig() ||
-    (isPresent(langfuse?.baseUrl) && hasLangfuseEnvCredentials())
-  ) {
-    return baseUrl;
+  if (hasLangfuseEnvConfig()) {
+    return {
+      publicKey: process.env.LANGFUSE_PUBLIC_KEY as string,
+      secretKey: process.env.LANGFUSE_SECRET_KEY as string,
+      baseUrl: langfuse?.baseUrl ??
+        process.env.LANGFUSE_BASE_URL ??
+        process.env.LANGFUSE_BASEURL,
+    };
+  }
+  if (isPresent(langfuse?.baseUrl) && hasLangfuseEnvCredentials()) {
+    return {
+      publicKey: process.env.LANGFUSE_PUBLIC_KEY as string,
+      secretKey: process.env.LANGFUSE_SECRET_KEY as string,
+      baseUrl: langfuse.baseUrl,
+    };
   }
   return undefined;
+}
+
+function getLangfuseTracerProviderKey(
+  params: LangfuseSpanProcessorParams,
+  langfuse?: t.LangfuseConfig
+): string {
+  return JSON.stringify({
+    publicKey: params.publicKey,
+    secretKey: params.secretKey,
+    baseUrl: params.baseUrl,
+    environment: params.environment,
+    toolOutputTracing: langfuse?.toolOutputTracing,
+  });
 }
 
 export function initializeLangfuseTracing(
   langfuse?: t.LangfuseConfig
 ): BasicTracerProvider | undefined {
-  if (langfuseTracerProvider != null) {
-    return langfuseTracerProvider;
-  }
-
   const params = getLangfuseSpanProcessorParams(langfuse);
   if (params == null) {
     return undefined;
   }
 
+  const providerKey = getLangfuseTracerProviderKey(params, langfuse);
+  if (
+    langfuseTracerProvider != null &&
+    langfuseTracerProviderKey === providerKey
+  ) {
+    return langfuseTracerProvider;
+  }
+
   ensureOpenTelemetryContextManager();
   const langfuseSpanProcessor = createLangfuseSpanProcessor(
-    Object.keys(params).length > 0 ? params : undefined
+    params,
+    langfuse
   );
   langfuseTracerProvider = new BasicTracerProvider({
     spanProcessors: [langfuseSpanProcessor],
   });
+  langfuseTracerProviderKey = providerKey;
 
   setLangfuseTracerProvider(langfuseTracerProvider);
   return langfuseTracerProvider;
