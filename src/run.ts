@@ -44,6 +44,7 @@ import {
   hasExplicitLangfuseConfig,
   hasLangfuseEnvConfig,
   isLangfuseCallbackHandler,
+  isExplicitLangfuseConfig,
 } from '@/langfuse';
 import {
   resolveLangfuseConfig,
@@ -566,6 +567,30 @@ export class Run<_T extends t.BaseGraphState> {
     );
   }
 
+  private getStreamToolLangfuseConfig(
+    graph: StandardGraph | MultiAgentGraph
+  ): t.LangfuseConfig | undefined {
+    if (this.langfuse != null) {
+      return this.langfuse;
+    }
+
+    const primaryContext = graph.agentContexts.get(graph.defaultAgentId);
+    if (
+      primaryContext?.langfuse != null &&
+      primaryContext.langfuse.enabled !== false
+    ) {
+      return primaryContext.langfuse;
+    }
+
+    for (const context of graph.agentContexts.values()) {
+      if (context.langfuse != null && context.langfuse.enabled !== false) {
+        return context.langfuse;
+      }
+    }
+
+    return undefined;
+  }
+
   async processStream(
     inputs: t.IState | Command,
     callerConfig: Partial<RunnableConfig> & {
@@ -642,24 +667,23 @@ export class Run<_T extends t.BaseGraphState> {
     );
 
     const hasExplicitLangfuse =
-      this.langfuse?.enabled === true ||
-      this.langfuse?.enabled === false ||
+      isExplicitLangfuseConfig(this.langfuse) ||
       hasExplicitLangfuseConfig(graph.agentContexts.values());
     const primaryContext = graph.agentContexts.get(graph.defaultAgentId);
+    const userId =
+      typeof config.configurable?.user_id === 'string'
+        ? config.configurable.user_id
+        : undefined;
+    const sessionId =
+      typeof config.configurable?.thread_id === 'string'
+        ? config.configurable.thread_id
+        : undefined;
+    const traceMetadata = createLangfuseTraceMetadata({
+      messageId: this.id,
+      parentMessageId: config.configurable?.requestBody?.parentMessageId,
+      agentName: primaryContext?.name,
+    });
     if (hasLangfuseEnvConfig() && !hasExplicitLangfuse) {
-      const userId =
-        typeof config.configurable?.user_id === 'string'
-          ? config.configurable.user_id
-          : undefined;
-      const sessionId =
-        typeof config.configurable?.thread_id === 'string'
-          ? config.configurable.thread_id
-          : undefined;
-      const traceMetadata = createLangfuseTraceMetadata({
-        messageId: this.id,
-        parentMessageId: config.configurable?.requestBody?.parentMessageId,
-        agentName: primaryContext?.name,
-      });
       const handler = createLegacyLangfuseHandler({
         userId,
         sessionId,
@@ -702,6 +726,7 @@ export class Run<_T extends t.BaseGraphState> {
      * preserving session hooks would leak them into the next run.
      */
     let streamThrew = false;
+    let toolLangfuseHandler: CallbackEntry | undefined;
 
     const consumeStream = async (): Promise<void> => {
       /**
@@ -830,6 +855,22 @@ export class Run<_T extends t.BaseGraphState> {
     };
 
     try {
+      if (hasExplicitLangfuse) {
+        toolLangfuseHandler = createLangfuseHandler({
+          langfuse: this.getStreamToolLangfuseConfig(graph),
+          userId,
+          sessionId,
+          traceMetadata,
+          tags: ['librechat', 'agent'],
+          callbackScope: 'tools',
+          useToolOutputTracingFallback: false,
+        });
+        if (toolLangfuseHandler != null) {
+          config.callbacks = appendCallbacks(config.callbacks, [
+            toolLangfuseHandler,
+          ]);
+        }
+      }
       await withLangfuseToolOutputTracingConfig(this.langfuse, consumeStream);
     } catch (err) {
       streamThrew = true;
@@ -852,6 +893,7 @@ export class Run<_T extends t.BaseGraphState> {
       }
       throw err;
     } finally {
+      await disposeLangfuseHandler(toolLangfuseHandler);
       /**
        * Preserve session-scoped hooks when the run paused on a HITL
        * interrupt — the very next call will be `Run.resume()`, which

@@ -30,6 +30,8 @@ type LangfuseHandlerParams = {
 
 type AgentLangfuseHandlerParams = LangfuseHandlerParams & {
   langfuse?: t.LangfuseConfig;
+  callbackScope?: LangfuseCallbackScope;
+  useToolOutputTracingFallback?: boolean;
 };
 
 type ResolvedLangfuseConfig = t.LangfuseConfig & {
@@ -38,6 +40,8 @@ type ResolvedLangfuseConfig = t.LangfuseConfig & {
   secretKey: string;
 };
 
+type LangfuseCallbackScope = 'all' | 'models' | 'tools';
+
 function getEnvLangfuseBaseUrl(): string | undefined {
   return process.env.LANGFUSE_BASE_URL ?? process.env.LANGFUSE_BASEURL;
 }
@@ -45,6 +49,18 @@ function getEnvLangfuseBaseUrl(): string | undefined {
 function hasLangfuseTracingConfig(langfuse?: t.LangfuseConfig): boolean {
   return (
     langfuse?.toolNodeTracing != null || langfuse?.toolOutputTracing != null
+  );
+}
+
+export function isExplicitLangfuseConfig(
+  langfuse?: t.LangfuseConfig
+): boolean {
+  return (
+    langfuse?.enabled != null ||
+    isPresent(langfuse?.publicKey) ||
+    isPresent(langfuse?.secretKey) ||
+    isPresent(langfuse?.baseUrl) ||
+    hasLangfuseTracingConfig(langfuse)
   );
 }
 
@@ -150,6 +166,26 @@ function getModelParameters(
   ) as Record<string, string | number>;
 }
 
+function getToolName(serialized: Serialized): string {
+  const serializedRecord = serialized as unknown as Record<string, unknown>;
+  const kwargs = serializedRecord.kwargs as Record<string, unknown> | undefined;
+  const toolName =
+    kwargs?.name ??
+    kwargs?.tool_name ??
+    kwargs?.toolName ??
+    serializedRecord.name;
+
+  if (typeof toolName === 'string' && toolName.trim() !== '') {
+    return toolName;
+  }
+
+  if (Array.isArray(serializedRecord.id) && serializedRecord.id.length > 0) {
+    return String(serializedRecord.id[serializedRecord.id.length - 1]);
+  }
+
+  return 'Tool';
+}
+
 function getOutput(output: LLMResult): unknown {
   return output.generations.map((generation) =>
     generation.map((item) => {
@@ -223,6 +259,7 @@ export class LangfuseAgentCallbackHandler extends BaseCallbackHandler {
   private readonly sessionId?: string;
   private readonly traceMetadata?: LangfuseTraceMetadata;
   private readonly tags?: string[];
+  private readonly callbackScope: LangfuseCallbackScope;
   private readonly spans = new Map<string, Span>();
 
   constructor({
@@ -231,12 +268,19 @@ export class LangfuseAgentCallbackHandler extends BaseCallbackHandler {
     sessionId,
     traceMetadata,
     tags,
-  }: LangfuseHandlerParams & { langfuse: ResolvedLangfuseConfig }) {
+    callbackScope = 'all',
+    useToolOutputTracingFallback = true,
+  }: LangfuseHandlerParams & {
+    langfuse: ResolvedLangfuseConfig;
+    callbackScope?: LangfuseCallbackScope;
+    useToolOutputTracingFallback?: boolean;
+  }) {
     super();
     this.userId = userId;
     this.sessionId = sessionId;
     this.traceMetadata = traceMetadata;
     this.tags = tags;
+    this.callbackScope = callbackScope;
     this.processor = createLangfuseSpanProcessor(
       {
         publicKey: langfuse.publicKey,
@@ -252,11 +296,19 @@ export class LangfuseAgentCallbackHandler extends BaseCallbackHandler {
           otelSpan.instrumentationScope.name === LANGFUSE_TRACER_NAME,
       },
       undefined,
-      langfuse
+      useToolOutputTracingFallback ? langfuse : undefined
     );
     this.provider = new BasicTracerProvider({
       spanProcessors: [this.processor],
     });
+  }
+
+  private shouldHandleModels(): boolean {
+    return this.callbackScope !== 'tools';
+  }
+
+  private shouldHandleTools(): boolean {
+    return this.callbackScope !== 'models';
   }
 
   private startGenerationSpan({
@@ -274,6 +326,9 @@ export class LangfuseAgentCallbackHandler extends BaseCallbackHandler {
     metadata?: Record<string, unknown>;
     name?: string;
   }): void {
+    if (!this.shouldHandleModels()) {
+      return;
+    }
     if (this.spans.has(runId)) {
       return;
     }
@@ -296,6 +351,52 @@ export class LangfuseAgentCallbackHandler extends BaseCallbackHandler {
           metadata: {
             ...metadata,
             ...this.traceMetadata,
+          },
+        }),
+      },
+    });
+    this.spans.set(runId, span);
+  }
+
+  private startToolSpan({
+    tool,
+    input,
+    runId,
+    metadata,
+    name,
+    toolCallId,
+  }: {
+    tool: Serialized;
+    input: string;
+    runId: string;
+    metadata?: Record<string, unknown>;
+    name?: string;
+    toolCallId?: string;
+  }): void {
+    if (!this.shouldHandleTools()) {
+      return;
+    }
+    if (this.spans.has(runId)) {
+      return;
+    }
+
+    const tracer = this.provider.getTracer(LANGFUSE_TRACER_NAME);
+    const spanName =
+      typeof name === 'string' && name.trim() !== '' ? name : getToolName(tool);
+    const span = tracer.startSpan(spanName, {
+      attributes: {
+        ...getTraceAttributes({
+          userId: this.userId,
+          sessionId: this.sessionId,
+          traceMetadata: this.traceMetadata,
+          tags: this.tags,
+        }),
+        ...createObservationAttributes('tool', {
+          input,
+          metadata: {
+            ...metadata,
+            ...this.traceMetadata,
+            ...(isPresent(toolCallId) ? { toolCallId } : {}),
           },
         }),
       },
@@ -344,6 +445,9 @@ export class LangfuseAgentCallbackHandler extends BaseCallbackHandler {
   }
 
   async handleLLMEnd(output: LLMResult, runId: string): Promise<void> {
+    if (!this.shouldHandleModels()) {
+      return;
+    }
     const span = this.spans.get(runId);
     if (!span) {
       return;
@@ -361,6 +465,9 @@ export class LangfuseAgentCallbackHandler extends BaseCallbackHandler {
   }
 
   async handleLLMError(err: unknown, runId: string): Promise<void> {
+    if (!this.shouldHandleModels()) {
+      return;
+    }
     const span = this.spans.get(runId);
     if (!span) {
       return;
@@ -370,6 +477,67 @@ export class LangfuseAgentCallbackHandler extends BaseCallbackHandler {
     span.setStatus({ code: SpanStatusCode.ERROR, message });
     span.setAttributes(
       createObservationAttributes('generation', {
+        level: 'ERROR',
+        statusMessage: message,
+      })
+    );
+    span.end();
+    this.spans.delete(runId);
+    await this.flush();
+  }
+
+  async handleToolStart(
+    tool: Serialized,
+    input: string,
+    runId: string,
+    _parentRunId?: string,
+    _tags?: string[],
+    metadata?: Record<string, unknown>,
+    name?: string,
+    toolCallId?: string
+  ): Promise<void> {
+    this.startToolSpan({
+      tool,
+      input,
+      runId,
+      metadata,
+      name,
+      toolCallId,
+    });
+  }
+
+  async handleToolEnd(output: unknown, runId: string): Promise<void> {
+    if (!this.shouldHandleTools()) {
+      return;
+    }
+    const span = this.spans.get(runId);
+    if (!span) {
+      return;
+    }
+
+    span.setAttributes(
+      createObservationAttributes('tool', {
+        output,
+      })
+    );
+    span.end();
+    this.spans.delete(runId);
+    await this.flush();
+  }
+
+  async handleToolError(err: unknown, runId: string): Promise<void> {
+    if (!this.shouldHandleTools()) {
+      return;
+    }
+    const span = this.spans.get(runId);
+    if (!span) {
+      return;
+    }
+
+    const message = err instanceof Error ? err.message : String(err);
+    span.setStatus({ code: SpanStatusCode.ERROR, message });
+    span.setAttributes(
+      createObservationAttributes('tool', {
         level: 'ERROR',
         statusMessage: message,
       })
@@ -431,6 +599,8 @@ export function createLangfuseHandler({
   sessionId,
   traceMetadata,
   tags,
+  callbackScope,
+  useToolOutputTracingFallback,
 }: AgentLangfuseHandlerParams): LangfuseAgentCallbackHandler | undefined {
   const resolvedLangfuse = resolveRequiredLangfuseConfig(langfuse);
   if (resolvedLangfuse == null) {
@@ -443,6 +613,8 @@ export function createLangfuseHandler({
     sessionId,
     traceMetadata,
     tags,
+    callbackScope,
+    useToolOutputTracingFallback,
   });
 }
 
@@ -450,13 +622,7 @@ export function hasExplicitLangfuseConfig(
   contexts: Iterable<{ langfuse?: t.LangfuseConfig }>
 ): boolean {
   for (const context of contexts) {
-    if (
-      context.langfuse?.enabled != null ||
-      isPresent(context.langfuse?.publicKey) ||
-      isPresent(context.langfuse?.secretKey) ||
-      isPresent(context.langfuse?.baseUrl) ||
-      hasLangfuseTracingConfig(context.langfuse)
-    ) {
+    if (isExplicitLangfuseConfig(context.langfuse)) {
       return true;
     }
   }

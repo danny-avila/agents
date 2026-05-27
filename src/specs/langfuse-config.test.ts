@@ -13,6 +13,8 @@ const mockStartSpan = jest.fn(() => mockSpan);
 const mockGetTracer = jest.fn(() => ({
   startSpan: mockStartSpan,
 }));
+const mockForceFlush = jest.fn();
+const mockShutdown = jest.fn();
 
 jest.mock('@langfuse/otel', () => ({
   LangfuseSpanProcessor: jest.fn().mockImplementation(() => ({})),
@@ -21,9 +23,9 @@ jest.mock('@langfuse/otel', () => ({
 
 jest.mock('@opentelemetry/sdk-trace-base', () => ({
   BasicTracerProvider: jest.fn().mockImplementation(() => ({
-    forceFlush: jest.fn(),
+    forceFlush: mockForceFlush,
     getTracer: mockGetTracer,
-    shutdown: jest.fn(),
+    shutdown: mockShutdown,
   })),
 }));
 
@@ -108,6 +110,88 @@ describe('createLangfuseHandler', () => {
         }),
       })
     );
+  });
+
+  it('starts tool spans with input and output attributes', async () => {
+    const handler = createLangfuseHandler({
+      langfuse: {
+        enabled: true,
+        publicKey: 'pk-test',
+        secretKey: 'sk-test',
+      },
+      userId: 'user-1',
+      sessionId: 'thread-1',
+      traceMetadata: {
+        messageId: 'message-1',
+        agentId: 'agent-1',
+        agentName: 'DWAINE',
+      },
+      tags: ['librechat', 'agent'],
+      callbackScope: 'tools',
+      useToolOutputTracingFallback: false,
+    });
+
+    await handler?.handleToolStart(
+      {
+        id: ['langchain', 'tools', 'DynamicStructuredTool'],
+        kwargs: { name: 'mcp_clickhouse' },
+      } as unknown as Serialized,
+      '{"query":"select 1"}',
+      'tool-run-1',
+      undefined,
+      undefined,
+      { langgraph_node: 'tools=agent-1' },
+      undefined,
+      'call-1'
+    );
+    await handler?.handleToolEnd('secret rows', 'tool-run-1');
+
+    expect(mockStartSpan).toHaveBeenCalledWith(
+      'mcp_clickhouse',
+      expect.objectContaining({
+        attributes: expect.objectContaining({
+          'langfuse.trace.name': 'LibreChat Agent: DWAINE',
+          'langfuse.trace.metadata.agentId': 'agent-1',
+          'langfuse.trace.metadata.messageId': 'message-1',
+          'langfuse.observation.type': 'tool',
+          'langfuse.observation.input': '{"query":"select 1"}',
+          'langfuse.observation.metadata.toolCallId': 'call-1',
+          'user.id': 'user-1',
+          'session.id': 'thread-1',
+          'langfuse.trace.tags': ['librechat', 'agent'],
+        }),
+      })
+    );
+    expect(mockSpan.setAttributes).toHaveBeenCalledWith(
+      expect.objectContaining({
+        'langfuse.observation.type': 'tool',
+        'langfuse.observation.output': 'secret rows',
+      })
+    );
+    expect(mockSpan.end).toHaveBeenCalledTimes(1);
+    expect(mockForceFlush).toHaveBeenCalled();
+  });
+
+  it('does not start model spans for a tool-only handler', async () => {
+    const handler = createLangfuseHandler({
+      langfuse: {
+        enabled: true,
+        publicKey: 'pk-test',
+        secretKey: 'sk-test',
+      },
+      callbackScope: 'tools',
+    });
+
+    await handler?.handleChatModelStart(
+      {
+        id: ['langchain', 'chat_models', 'ChatOpenAI'],
+        kwargs: { model: 'gpt-4o' },
+      } as unknown as Serialized,
+      [[new HumanMessage('hello')]],
+      'run-1'
+    );
+
+    expect(mockStartSpan).not.toHaveBeenCalled();
   });
 
   it('does not create a handler when a required key is missing', () => {
