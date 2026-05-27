@@ -6,10 +6,23 @@ import type * as t from '@/types';
 
 const mockSpan = {
   end: jest.fn(),
+  spanContext: jest.fn(() => ({
+    traceId: 'trace-id',
+    spanId: 'span-id',
+    traceFlags: 1,
+  })),
   setAttributes: jest.fn(),
   setStatus: jest.fn(),
 };
 const mockStartSpan = jest.fn(() => mockSpan);
+const mockStartActiveSpan = jest.fn(
+  (
+    _name: string,
+    _options: unknown,
+    _context: unknown,
+    callback: (span: typeof mockSpan) => unknown
+  ) => callback(mockSpan)
+);
 const mockForceFlush = jest.fn();
 const mockShutdown = jest.fn();
 
@@ -22,6 +35,7 @@ jest.mock('@opentelemetry/sdk-trace-base', () => ({
   BasicTracerProvider: jest.fn().mockImplementation(() => ({
     forceFlush: mockForceFlush,
     getTracer: jest.fn(() => ({
+      startActiveSpan: mockStartActiveSpan,
       startSpan: mockStartSpan,
     })),
     shutdown: mockShutdown,
@@ -70,6 +84,6 @@ describe('Langfuse callback composition', () => {
 
     await run.processStream({ messages: [new HumanMessage('hello')] }, config);
 
-    expect(mockStartSpan).toHaveBeenCalled();
+    expect(mockStartActiveSpan).toHaveBeenCalled();
   });
 });

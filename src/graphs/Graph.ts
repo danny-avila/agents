@@ -52,7 +52,6 @@ import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { shouldTriggerSummarization } from '@/summarization';
 import { createSummarizeNode } from '@/summarization/node';
 import { messagesStateReducer } from '@/messages/reducer';
-import { appendCallbacks } from '@/utils/callbacks';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { AgentContext } from '@/agents/AgentContext';
 import { createFakeStreamingLLM } from '@/llm/fake';
@@ -63,12 +62,6 @@ import { createCloudflareCodingToolBundle } from '@/tools/cloudflare';
 import { isThinkingEnabled } from '@/llm/request';
 import { initializeModel } from '@/llm/init';
 import {
-  createLangfuseHandler,
-  disposeLangfuseHandler,
-  createLangfuseTraceMetadata,
-} from '@/langfuse';
-import {
-  resolveLangfuseConfig,
   shouldTraceToolNodeForLangfuse,
   withLangfuseToolOutputTracingConfig,
 } from '@/langfuseToolOutputTracing';
@@ -234,7 +227,6 @@ export abstract class Graph<
     this.hookRegistry = undefined;
     this.humanInTheLoop = undefined;
     this.toolOutputReferences = undefined;
-    this.langfuse = undefined;
     this.eagerEventToolExecution = undefined;
     this.eagerEventToolExecutions.clear();
     this.clearEagerEventToolUsageCounts();
@@ -1360,28 +1352,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         { force: true }
       );
 
-      const langfuse = resolveLangfuseConfig(
-        this.langfuse,
-        agentContext.langfuse
-      );
-      const langfuseHandler = createLangfuseHandler({
-        langfuse,
-        userId: config.configurable?.user_id as string | undefined,
-        sessionId: config.configurable?.thread_id as string | undefined,
-        traceMetadata: createLangfuseTraceMetadata({
-          messageId: this.runId,
-          parentMessageId: config.configurable?.requestBody?.parentMessageId,
-          agentId,
-          agentName: agentContext.name,
-        }),
-        tags: ['librechat', 'agent'],
-      });
-      const invokeConfig = langfuseHandler
-        ? {
-          ...config,
-          callbacks: appendCallbacks(config.callbacks, [langfuseHandler]),
-        }
-        : config;
+      const invokeConfig = config;
 
       try {
         result = await withLangfuseToolOutputTracingConfig(
@@ -1412,8 +1383,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             }),
           agentContext.langfuse
         );
-      } finally {
-        await disposeLangfuseHandler(langfuseHandler);
       }
 
       if (!result) {

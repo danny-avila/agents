@@ -133,6 +133,44 @@ describe('Langfuse instrumentation', () => {
     );
   });
 
+  it('registers tracing from explicit Langfuse config credentials', async () => {
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    const provider = initializeLangfuseTracing({
+      publicKey: 'pk-config',
+      secretKey: 'sk-config',
+      baseUrl: 'https://langfuse.config',
+    });
+
+    expect(provider).toBe(mockTracerProvider);
+    expect(mockLangfuseSpanProcessor).toHaveBeenCalledWith(
+      expect.objectContaining({
+        publicKey: 'pk-config',
+        secretKey: 'sk-config',
+        baseUrl: 'https://langfuse.config',
+      })
+    );
+    expect(mockBasicTracerProvider).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses env credentials with a config-provided Langfuse baseUrl', async () => {
+    process.env.LANGFUSE_SECRET_KEY = 'sk-env';
+    process.env.LANGFUSE_PUBLIC_KEY = 'pk-env';
+
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    const provider = initializeLangfuseTracing({
+      baseUrl: 'https://langfuse.config',
+      toolOutputTracing: { enabled: false },
+    });
+
+    expect(provider).toBe(mockTracerProvider);
+    expect(mockLangfuseSpanProcessor).toHaveBeenCalledWith(
+      expect.objectContaining({
+        baseUrl: 'https://langfuse.config',
+      })
+    );
+    expect(mockBasicTracerProvider).toHaveBeenCalledTimes(1);
+  });
+
   it('reuses the isolated provider after initialization', async () => {
     process.env.LANGFUSE_SECRET_KEY = 'sk-test';
     process.env.LANGFUSE_PUBLIC_KEY = 'pk-test';

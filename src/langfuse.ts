@@ -1,23 +1,8 @@
 import { CallbackHandler } from '@langfuse/langchain';
-import { isDefaultExportSpan } from '@langfuse/otel';
-import {
-  LangfuseOtelSpanAttributes,
-  createObservationAttributes,
-} from '@langfuse/tracing';
-import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
-import { BasicTracerProvider } from '@opentelemetry/sdk-trace-base';
-import { SpanStatusCode } from '@opentelemetry/api';
-import { createLangfuseSpanProcessor } from '@/langfuseToolOutputTracing';
-import type { Serialized } from '@langchain/core/load/serializable';
-import type { BaseMessage } from '@langchain/core/messages';
-import type { LLMResult } from '@langchain/core/outputs';
-import type { Attributes, Span } from '@opentelemetry/api';
-import type { SpanProcessor } from '@opentelemetry/sdk-trace-base';
 import type * as t from '@/types';
 import { isPresent } from '@/utils/misc';
 
 const TRACE_METADATA_MAX_LENGTH = 200;
-const LANGFUSE_TRACER_NAME = 'langfuse-sdk';
 
 export type LangfuseTraceMetadata = Record<string, string>;
 
@@ -30,17 +15,7 @@ type LangfuseHandlerParams = {
 
 type AgentLangfuseHandlerParams = LangfuseHandlerParams & {
   langfuse?: t.LangfuseConfig;
-  callbackScope?: LangfuseCallbackScope;
-  useToolOutputTracingFallback?: boolean;
 };
-
-type ResolvedLangfuseConfig = t.LangfuseConfig & {
-  enabled: true;
-  publicKey: string;
-  secretKey: string;
-};
-
-type LangfuseCallbackScope = 'all' | 'models' | 'tools';
 
 function getEnvLangfuseBaseUrl(): string | undefined {
   return process.env.LANGFUSE_BASE_URL ?? process.env.LANGFUSE_BASEURL;
@@ -50,6 +25,23 @@ function hasLangfuseTracingConfig(langfuse?: t.LangfuseConfig): boolean {
   return (
     langfuse?.toolNodeTracing != null || langfuse?.toolOutputTracing != null
   );
+}
+
+export function hasLangfuseConfigCredentials(
+  langfuse?: t.LangfuseConfig
+): langfuse is t.LangfuseConfig & {
+  publicKey: string;
+  secretKey: string;
+} {
+  return (
+    langfuse != null &&
+    isPresent(langfuse.publicKey) &&
+    isPresent(langfuse.secretKey)
+  );
+}
+
+function hasLangfuseConfigBaseUrl(langfuse?: t.LangfuseConfig): boolean {
+  return isPresent(langfuse?.baseUrl);
 }
 
 export function isExplicitLangfuseConfig(
@@ -62,31 +54,6 @@ export function isExplicitLangfuseConfig(
     isPresent(langfuse?.baseUrl) ||
     hasLangfuseTracingConfig(langfuse)
   );
-}
-
-function resolveRequiredLangfuseConfig(
-  langfuse?: t.LangfuseConfig
-): ResolvedLangfuseConfig | undefined {
-  if (hasRequiredLangfuseConfig(langfuse)) {
-    return langfuse;
-  }
-  if (langfuse?.enabled === false) {
-    return undefined;
-  }
-  if (
-    !hasLangfuseEnvConfig() ||
-    (langfuse?.enabled !== true && !hasLangfuseTracingConfig(langfuse))
-  ) {
-    return undefined;
-  }
-
-  return {
-    ...langfuse,
-    enabled: true,
-    publicKey: process.env.LANGFUSE_PUBLIC_KEY as string,
-    secretKey: process.env.LANGFUSE_SECRET_KEY as string,
-    baseUrl: getEnvLangfuseBaseUrl(),
-  };
 }
 
 function createTraceMetadata(
@@ -128,93 +95,6 @@ export function createLangfuseTraceMetadata({
   });
 }
 
-function getModelName(serialized: Serialized): string {
-  const serializedRecord = serialized as unknown as Record<string, unknown>;
-  const kwargs = serializedRecord.kwargs as Record<string, unknown> | undefined;
-  const modelName =
-    kwargs?.model ??
-    kwargs?.model_name ??
-    kwargs?.modelName ??
-    kwargs?.model_id ??
-    kwargs?.modelId ??
-    serializedRecord.name;
-
-  if (typeof modelName === 'string' && modelName.trim() !== '') {
-    return modelName;
-  }
-
-  if (Array.isArray(serializedRecord.id) && serializedRecord.id.length > 0) {
-    return String(serializedRecord.id[serializedRecord.id.length - 1]);
-  }
-
-  return 'ChatModel';
-}
-
-function getModelParameters(
-  extraParams?: Record<string, unknown>
-): Record<string, string | number> {
-  const invocationParams = extraParams?.invocation_params;
-  const params =
-    invocationParams != null && typeof invocationParams === 'object'
-      ? (invocationParams as Record<string, unknown>)
-      : (extraParams ?? {});
-
-  return Object.fromEntries(
-    Object.entries(params).filter(([, value]) => {
-      return typeof value === 'string' || typeof value === 'number';
-    })
-  ) as Record<string, string | number>;
-}
-
-function getToolName(serialized: Serialized): string {
-  const serializedRecord = serialized as unknown as Record<string, unknown>;
-  const kwargs = serializedRecord.kwargs as Record<string, unknown> | undefined;
-  const toolName =
-    kwargs?.name ??
-    kwargs?.tool_name ??
-    kwargs?.toolName ??
-    serializedRecord.name;
-
-  if (typeof toolName === 'string' && toolName.trim() !== '') {
-    return toolName;
-  }
-
-  if (Array.isArray(serializedRecord.id) && serializedRecord.id.length > 0) {
-    return String(serializedRecord.id[serializedRecord.id.length - 1]);
-  }
-
-  return 'Tool';
-}
-
-function getOutput(output: LLMResult): unknown {
-  return output.generations.map((generation) =>
-    generation.map((item) => {
-      if ('message' in item && item.message != null) {
-        return (item.message as { content?: unknown }).content;
-      }
-      return item.text;
-    })
-  );
-}
-
-function getUsageDetails(
-  output: LLMResult
-): Record<string, number> | undefined {
-  const llmOutput = output.llmOutput as Record<string, unknown> | undefined;
-  const usage = llmOutput?.tokenUsage ?? llmOutput?.usage;
-  if (usage == null || typeof usage !== 'object') {
-    return undefined;
-  }
-
-  const usageEntries = Object.entries(usage as Record<string, unknown>).filter(
-    ([, value]) => typeof value === 'number'
-  );
-
-  return usageEntries.length > 0
-    ? (Object.fromEntries(usageEntries) as Record<string, number>)
-    : undefined;
-}
-
 export function getLangfuseTraceName(
   traceMetadata?: LangfuseTraceMetadata,
   fallback: string = 'LibreChat Agent'
@@ -223,367 +103,27 @@ export function getLangfuseTraceName(
   return isPresent(agentName) ? `${fallback}: ${agentName}` : fallback;
 }
 
-function getTraceAttributes({
-  userId,
-  sessionId,
-  traceMetadata,
-  tags,
-}: LangfuseHandlerParams): Attributes {
-  const attributes: Attributes = {
-    [LangfuseOtelSpanAttributes.TRACE_NAME]:
-      getLangfuseTraceName(traceMetadata),
-  };
-
-  if (isPresent(userId)) {
-    attributes[LangfuseOtelSpanAttributes.TRACE_USER_ID] = userId;
-  }
-  if (isPresent(sessionId)) {
-    attributes[LangfuseOtelSpanAttributes.TRACE_SESSION_ID] = sessionId;
-  }
-  if (tags != null && tags.length > 0) {
-    attributes[LangfuseOtelSpanAttributes.TRACE_TAGS] = tags;
-  }
-  for (const [key, value] of Object.entries(traceMetadata ?? {})) {
-    attributes[`${LangfuseOtelSpanAttributes.TRACE_METADATA}.${key}`] = value;
-  }
-
-  return attributes;
+export function hasLangfuseEnvConfig(): boolean {
+  return hasLangfuseEnvCredentials() && isPresent(getEnvLangfuseBaseUrl());
 }
 
-export class LangfuseAgentCallbackHandler extends BaseCallbackHandler {
-  name = 'librechat_langfuse_agent_handler';
-
-  private readonly provider: BasicTracerProvider;
-  private readonly processor: SpanProcessor;
-  private readonly userId?: string;
-  private readonly sessionId?: string;
-  private readonly traceMetadata?: LangfuseTraceMetadata;
-  private readonly tags?: string[];
-  private readonly callbackScope: LangfuseCallbackScope;
-  private readonly spans = new Map<string, Span>();
-
-  constructor({
-    langfuse,
-    userId,
-    sessionId,
-    traceMetadata,
-    tags,
-    callbackScope = 'all',
-    useToolOutputTracingFallback = true,
-  }: LangfuseHandlerParams & {
-    langfuse: ResolvedLangfuseConfig;
-    callbackScope?: LangfuseCallbackScope;
-    useToolOutputTracingFallback?: boolean;
-  }) {
-    super();
-    this.userId = userId;
-    this.sessionId = sessionId;
-    this.traceMetadata = traceMetadata;
-    this.tags = tags;
-    this.callbackScope = callbackScope;
-    this.processor = createLangfuseSpanProcessor(
-      {
-        publicKey: langfuse.publicKey,
-        secretKey: langfuse.secretKey,
-        ...(isPresent(langfuse.baseUrl) ? { baseUrl: langfuse.baseUrl } : {}),
-        environment:
-          process.env.LANGFUSE_TRACING_ENVIRONMENT ??
-          process.env.NODE_ENV ??
-          'development',
-        exportMode: 'immediate',
-        shouldExportSpan: ({ otelSpan }): boolean =>
-          isDefaultExportSpan(otelSpan) ||
-          otelSpan.instrumentationScope.name === LANGFUSE_TRACER_NAME,
-      },
-      undefined,
-      useToolOutputTracingFallback ? langfuse : undefined
-    );
-    this.provider = new BasicTracerProvider({
-      spanProcessors: [this.processor],
-    });
-  }
-
-  private shouldHandleModels(): boolean {
-    return this.callbackScope !== 'tools';
-  }
-
-  private shouldHandleTools(): boolean {
-    return this.callbackScope !== 'models';
-  }
-
-  private startGenerationSpan({
-    llm,
-    input,
-    runId,
-    extraParams,
-    metadata,
-    name,
-  }: {
-    llm: Serialized;
-    input: unknown;
-    runId: string;
-    extraParams?: Record<string, unknown>;
-    metadata?: Record<string, unknown>;
-    name?: string;
-  }): void {
-    if (!this.shouldHandleModels()) {
-      return;
-    }
-    if (this.spans.has(runId)) {
-      return;
-    }
-
-    const tracer = this.provider.getTracer(LANGFUSE_TRACER_NAME);
-    const spanName =
-      typeof name === 'string' && name.trim() !== '' ? name : getModelName(llm);
-    const span = tracer.startSpan(spanName, {
-      attributes: {
-        ...getTraceAttributes({
-          userId: this.userId,
-          sessionId: this.sessionId,
-          traceMetadata: this.traceMetadata,
-          tags: this.tags,
-        }),
-        ...createObservationAttributes('generation', {
-          input,
-          model: getModelName(llm),
-          modelParameters: getModelParameters(extraParams),
-          metadata: {
-            ...metadata,
-            ...this.traceMetadata,
-          },
-        }),
-      },
-    });
-    this.spans.set(runId, span);
-  }
-
-  private startToolSpan({
-    tool,
-    input,
-    runId,
-    metadata,
-    name,
-    toolCallId,
-  }: {
-    tool: Serialized;
-    input: string;
-    runId: string;
-    metadata?: Record<string, unknown>;
-    name?: string;
-    toolCallId?: string;
-  }): void {
-    if (!this.shouldHandleTools()) {
-      return;
-    }
-    if (this.spans.has(runId)) {
-      return;
-    }
-
-    const tracer = this.provider.getTracer(LANGFUSE_TRACER_NAME);
-    const spanName =
-      typeof name === 'string' && name.trim() !== '' ? name : getToolName(tool);
-    const span = tracer.startSpan(spanName, {
-      attributes: {
-        ...getTraceAttributes({
-          userId: this.userId,
-          sessionId: this.sessionId,
-          traceMetadata: this.traceMetadata,
-          tags: this.tags,
-        }),
-        ...createObservationAttributes('tool', {
-          input,
-          metadata: {
-            ...metadata,
-            ...this.traceMetadata,
-            ...(isPresent(toolCallId) ? { toolCallId } : {}),
-          },
-        }),
-      },
-    });
-    this.spans.set(runId, span);
-  }
-
-  async handleChatModelStart(
-    llm: Serialized,
-    messages: BaseMessage[][],
-    runId: string,
-    _parentRunId?: string,
-    extraParams?: Record<string, unknown>,
-    _tags?: string[],
-    metadata?: Record<string, unknown>,
-    name?: string
-  ): Promise<void> {
-    this.startGenerationSpan({
-      llm,
-      input: messages,
-      runId,
-      extraParams,
-      metadata,
-      name,
-    });
-  }
-
-  async handleLLMStart(
-    llm: Serialized,
-    prompts: string[],
-    runId: string,
-    _parentRunId?: string,
-    extraParams?: Record<string, unknown>,
-    _tags?: string[],
-    metadata?: Record<string, unknown>,
-    name?: string
-  ): Promise<void> {
-    this.startGenerationSpan({
-      llm,
-      input: prompts,
-      runId,
-      extraParams,
-      metadata,
-      name,
-    });
-  }
-
-  async handleLLMEnd(output: LLMResult, runId: string): Promise<void> {
-    if (!this.shouldHandleModels()) {
-      return;
-    }
-    const span = this.spans.get(runId);
-    if (!span) {
-      return;
-    }
-
-    span.setAttributes(
-      createObservationAttributes('generation', {
-        output: getOutput(output),
-        usageDetails: getUsageDetails(output),
-      })
-    );
-    span.end();
-    this.spans.delete(runId);
-    await this.flush();
-  }
-
-  async handleLLMError(err: unknown, runId: string): Promise<void> {
-    if (!this.shouldHandleModels()) {
-      return;
-    }
-    const span = this.spans.get(runId);
-    if (!span) {
-      return;
-    }
-
-    const message = err instanceof Error ? err.message : String(err);
-    span.setStatus({ code: SpanStatusCode.ERROR, message });
-    span.setAttributes(
-      createObservationAttributes('generation', {
-        level: 'ERROR',
-        statusMessage: message,
-      })
-    );
-    span.end();
-    this.spans.delete(runId);
-    await this.flush();
-  }
-
-  async handleToolStart(
-    tool: Serialized,
-    input: string,
-    runId: string,
-    _parentRunId?: string,
-    _tags?: string[],
-    metadata?: Record<string, unknown>,
-    name?: string,
-    toolCallId?: string
-  ): Promise<void> {
-    this.startToolSpan({
-      tool,
-      input,
-      runId,
-      metadata,
-      name,
-      toolCallId,
-    });
-  }
-
-  async handleToolEnd(output: unknown, runId: string): Promise<void> {
-    if (!this.shouldHandleTools()) {
-      return;
-    }
-    const span = this.spans.get(runId);
-    if (!span) {
-      return;
-    }
-
-    span.setAttributes(
-      createObservationAttributes('tool', {
-        output,
-      })
-    );
-    span.end();
-    this.spans.delete(runId);
-    await this.flush();
-  }
-
-  async handleToolError(err: unknown, runId: string): Promise<void> {
-    if (!this.shouldHandleTools()) {
-      return;
-    }
-    const span = this.spans.get(runId);
-    if (!span) {
-      return;
-    }
-
-    const message = err instanceof Error ? err.message : String(err);
-    span.setStatus({ code: SpanStatusCode.ERROR, message });
-    span.setAttributes(
-      createObservationAttributes('tool', {
-        level: 'ERROR',
-        statusMessage: message,
-      })
-    );
-    span.end();
-    this.spans.delete(runId);
-    await this.flush();
-  }
-
-  private async flush(): Promise<void> {
-    try {
-      await this.provider.forceFlush();
-    } catch (error) {
-      process.emitWarning(
-        `[LangfuseAgentCallbackHandler] Failed to flush Langfuse spans: ${
-          error instanceof Error ? error.message : String(error)
-        }`
-      );
-    }
-  }
-
-  async dispose(): Promise<void> {
-    for (const span of this.spans.values()) {
-      span.end();
-    }
-    this.spans.clear();
-    await this.flush();
-    try {
-      await this.provider.shutdown();
-    } catch (error) {
-      process.emitWarning(
-        `[LangfuseAgentCallbackHandler] Failed to shut down Langfuse provider: ${
-          error instanceof Error ? error.message : String(error)
-        }`
-      );
-    }
-  }
-}
-
-function hasRequiredLangfuseConfig(
-  langfuse?: t.LangfuseConfig
-): langfuse is ResolvedLangfuseConfig {
+export function hasLangfuseEnvCredentials(): boolean {
   return (
-    langfuse?.enabled === true &&
-    isPresent(langfuse.publicKey) &&
-    isPresent(langfuse.secretKey)
+    isPresent(process.env.LANGFUSE_SECRET_KEY) &&
+    isPresent(process.env.LANGFUSE_PUBLIC_KEY)
+  );
+}
+
+export function shouldCreateLangfuseHandler(
+  langfuse?: t.LangfuseConfig
+): boolean {
+  if (langfuse?.enabled === false) {
+    return false;
+  }
+  return (
+    hasLangfuseEnvConfig() ||
+    hasLangfuseConfigCredentials(langfuse) ||
+    (hasLangfuseConfigBaseUrl(langfuse) && hasLangfuseEnvCredentials())
   );
 }
 
@@ -599,22 +139,15 @@ export function createLangfuseHandler({
   sessionId,
   traceMetadata,
   tags,
-  callbackScope,
-  useToolOutputTracingFallback,
-}: AgentLangfuseHandlerParams): LangfuseAgentCallbackHandler | undefined {
-  const resolvedLangfuse = resolveRequiredLangfuseConfig(langfuse);
-  if (resolvedLangfuse == null) {
+}: AgentLangfuseHandlerParams): CallbackHandler | undefined {
+  if (!shouldCreateLangfuseHandler(langfuse)) {
     return undefined;
   }
-
-  return new LangfuseAgentCallbackHandler({
-    langfuse: resolvedLangfuse,
+  return new CallbackHandler({
     userId,
     sessionId,
     traceMetadata,
     tags,
-    callbackScope,
-    useToolOutputTracingFallback,
   });
 }
 
@@ -629,23 +162,11 @@ export function hasExplicitLangfuseConfig(
   return false;
 }
 
-export function hasLangfuseEnvConfig(): boolean {
-  return (
-    isPresent(process.env.LANGFUSE_SECRET_KEY) &&
-    isPresent(process.env.LANGFUSE_PUBLIC_KEY) &&
-    isPresent(getEnvLangfuseBaseUrl())
-  );
-}
-
 export function isLangfuseCallbackHandler(value: unknown): boolean {
-  return (
-    value instanceof CallbackHandler ||
-    value instanceof LangfuseAgentCallbackHandler
-  );
+  return value instanceof CallbackHandler;
 }
 
-export async function disposeLangfuseHandler(value: unknown): Promise<void> {
-  if (value instanceof LangfuseAgentCallbackHandler) {
-    await value.dispose();
-  }
+export async function disposeLangfuseHandler(_value: unknown): Promise<void> {
+  // The official Langfuse LangChain callback handler is flushed by the
+  // configured OpenTelemetry span processor.
 }

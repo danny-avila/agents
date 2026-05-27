@@ -109,7 +109,7 @@ describe('Langfuse trace metadata includes agentName', () => {
     expect(MockedCallbackHandler).not.toHaveBeenCalled();
   });
 
-  it('does not use the legacy CallbackHandler for redaction-only agent config', async () => {
+  it('uses the nested Langfuse CallbackHandler for redaction-only agent config', async () => {
     const run = await createTestRun('DWAINE', {
       langfuse: {
         toolOutputTracing: { enabled: false },
@@ -120,10 +120,10 @@ describe('Langfuse trace metadata includes agentName', () => {
       { configurable: { thread_id: 't1', user_id: 'u1' }, version: 'v2' }
     );
 
-    expect(MockedCallbackHandler).not.toHaveBeenCalled();
+    expect(MockedCallbackHandler).toHaveBeenCalledTimes(1);
   });
 
-  it('does not use the legacy CallbackHandler for redaction-only run config', async () => {
+  it('uses the nested Langfuse CallbackHandler for redaction-only run config', async () => {
     const run = await createTestRun(
       'DWAINE',
       {},
@@ -138,6 +138,25 @@ describe('Langfuse trace metadata includes agentName', () => {
       { configurable: { thread_id: 't1', user_id: 'u1' }, version: 'v2' }
     );
 
-    expect(MockedCallbackHandler).not.toHaveBeenCalled();
+    expect(MockedCallbackHandler).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves run-level Langfuse config after graph cleanup for later turns', async () => {
+    const langfuse = {
+      toolOutputTracing: { enabled: false },
+    };
+    const run = await createTestRun(
+      'DWAINE',
+      {},
+      {
+        langfuse,
+      }
+    );
+    await run.processStream(
+      { messages: [] },
+      { configurable: { thread_id: 't1', user_id: 'u1' }, version: 'v2' }
+    );
+
+    expect(run.Graph?.langfuse).toBe(langfuse);
   });
 });

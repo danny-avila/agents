@@ -1,5 +1,5 @@
 // src/run.ts
-import './instrumentation';
+import { initializeLangfuseTracing } from './instrumentation';
 import { PromptTemplate } from '@langchain/core/prompts';
 import { RunnableLambda } from '@langchain/core/runnables';
 import { AzureChatOpenAI, ChatOpenAI } from '@langchain/openai';
@@ -36,15 +36,11 @@ import {
   type CallbackEntry,
 } from '@/utils/callbacks';
 import {
-  createLegacyLangfuseHandler,
   createLangfuseTraceMetadata,
   createLangfuseHandler,
   disposeLangfuseHandler,
   getLangfuseTraceName,
-  hasExplicitLangfuseConfig,
-  hasLangfuseEnvConfig,
   isLangfuseCallbackHandler,
-  isExplicitLangfuseConfig,
 } from '@/langfuse';
 import {
   resolveLangfuseConfig,
@@ -567,28 +563,82 @@ export class Run<_T extends t.BaseGraphState> {
     );
   }
 
-  private getStreamToolLangfuseConfig(
+  private getStreamLangfuseConfig(
     graph: StandardGraph | MultiAgentGraph
   ): t.LangfuseConfig | undefined {
-    if (this.langfuse != null) {
-      return this.langfuse;
-    }
-
     const primaryContext = graph.agentContexts.get(graph.defaultAgentId);
-    if (
-      primaryContext?.langfuse != null &&
-      primaryContext.langfuse.enabled !== false
-    ) {
-      return primaryContext.langfuse;
+    if (primaryContext != null) {
+      return resolveLangfuseConfig(this.langfuse, primaryContext.langfuse);
     }
 
     for (const context of graph.agentContexts.values()) {
-      if (context.langfuse != null && context.langfuse.enabled !== false) {
-        return context.langfuse;
+      const langfuse = resolveLangfuseConfig(this.langfuse, context.langfuse);
+      if (langfuse != null) {
+        return langfuse;
       }
     }
 
-    return undefined;
+    return this.langfuse;
+  }
+
+  private getStreamToolOutputTracingLangfuseConfig(
+    graph: StandardGraph | MultiAgentGraph
+  ): t.LangfuseConfig | undefined {
+    if (this.langfuse?.toolOutputTracing != null) {
+      return undefined;
+    }
+
+    const toolOutputTracingConfigs = Array.from(
+      graph.agentContexts.values()
+    )
+      .map((context) => context.langfuse?.toolOutputTracing)
+      .filter((config): config is t.LangfuseToolOutputTracingConfig => {
+        return config != null;
+      });
+
+    if (toolOutputTracingConfigs.length === 0) {
+      return undefined;
+    }
+    if (toolOutputTracingConfigs.length === 1) {
+      return { toolOutputTracing: toolOutputTracingConfigs[0] };
+    }
+
+    let enabled: boolean | undefined;
+    let redactionText: string | undefined;
+    let redactedToolNameMatchMode: 'exact' | 'partial' | undefined;
+    const redactedToolNames = new Set<string>();
+
+    for (const config of toolOutputTracingConfigs) {
+      if (config.enabled === false) {
+        enabled = false;
+      } else if (enabled !== false && config.enabled != null) {
+        enabled = config.enabled;
+      }
+
+      redactionText ??= config.redactionText;
+      if (config.redactedToolNameMatchMode === 'partial') {
+        redactedToolNameMatchMode = 'partial';
+      } else {
+        redactedToolNameMatchMode ??= config.redactedToolNameMatchMode;
+      }
+
+      for (const toolName of config.redactedToolNames ?? []) {
+        redactedToolNames.add(toolName);
+      }
+    }
+
+    return {
+      toolOutputTracing: {
+        ...(enabled != null ? { enabled } : {}),
+        ...(redactedToolNames.size > 0
+          ? { redactedToolNames: Array.from(redactedToolNames) }
+          : {}),
+        ...(redactedToolNameMatchMode != null
+          ? { redactedToolNameMatchMode }
+          : {}),
+        ...(redactionText != null ? { redactionText } : {}),
+      },
+    };
   }
 
   async processStream(
@@ -666,9 +716,6 @@ export class Run<_T extends t.BaseGraphState> {
       streamCallbacks ? [streamCallbacks, customHandler] : [customHandler]
     );
 
-    const hasExplicitLangfuse =
-      isExplicitLangfuseConfig(this.langfuse) ||
-      hasExplicitLangfuseConfig(graph.agentContexts.values());
     const primaryContext = graph.agentContexts.get(graph.defaultAgentId);
     const userId =
       typeof config.configurable?.user_id === 'string'
@@ -681,17 +728,21 @@ export class Run<_T extends t.BaseGraphState> {
     const traceMetadata = createLangfuseTraceMetadata({
       messageId: this.id,
       parentMessageId: config.configurable?.requestBody?.parentMessageId,
+      agentId: graph.defaultAgentId,
       agentName: primaryContext?.name,
     });
-    if (hasLangfuseEnvConfig() && !hasExplicitLangfuse) {
-      const handler = createLegacyLangfuseHandler({
-        userId,
-        sessionId,
-        traceMetadata,
-        tags: ['librechat', 'agent'],
-      });
+    const streamLangfuseConfig = this.getStreamLangfuseConfig(graph);
+    initializeLangfuseTracing(streamLangfuseConfig);
+    const langfuseHandler = createLangfuseHandler({
+      langfuse: streamLangfuseConfig,
+      userId,
+      sessionId,
+      traceMetadata,
+      tags: ['librechat', 'agent'],
+    });
+    if (langfuseHandler != null) {
       config.runName = config.runName ?? getLangfuseTraceName(traceMetadata);
-      config.callbacks = appendCallbacks(config.callbacks, [handler]);
+      config.callbacks = appendCallbacks(config.callbacks, [langfuseHandler]);
     }
 
     if (!this.id) {
@@ -726,7 +777,6 @@ export class Run<_T extends t.BaseGraphState> {
      * preserving session hooks would leak them into the next run.
      */
     let streamThrew = false;
-    let toolLangfuseHandler: CallbackEntry | undefined;
 
     const consumeStream = async (): Promise<void> => {
       /**
@@ -855,23 +905,11 @@ export class Run<_T extends t.BaseGraphState> {
     };
 
     try {
-      if (hasExplicitLangfuse) {
-        toolLangfuseHandler = createLangfuseHandler({
-          langfuse: this.getStreamToolLangfuseConfig(graph),
-          userId,
-          sessionId,
-          traceMetadata,
-          tags: ['librechat', 'agent'],
-          callbackScope: 'tools',
-          useToolOutputTracingFallback: false,
-        });
-        if (toolLangfuseHandler != null) {
-          config.callbacks = appendCallbacks(config.callbacks, [
-            toolLangfuseHandler,
-          ]);
-        }
-      }
-      await withLangfuseToolOutputTracingConfig(this.langfuse, consumeStream);
+      await withLangfuseToolOutputTracingConfig(
+        this.langfuse,
+        consumeStream,
+        this.getStreamToolOutputTracingLangfuseConfig(graph)
+      );
     } catch (err) {
       streamThrew = true;
       if (this.hookRegistry?.hasHookFor('StopFailure', this.id) === true) {
@@ -893,7 +931,6 @@ export class Run<_T extends t.BaseGraphState> {
       }
       throw err;
     } finally {
-      await disposeLangfuseHandler(toolLangfuseHandler);
       /**
        * Preserve session-scoped hooks when the run paused on a HITL
        * interrupt — the very next call will be `Run.resume()`, which
@@ -1233,30 +1270,18 @@ export class Run<_T extends t.BaseGraphState> {
         typeof chainOptions.configurable?.thread_id === 'string'
           ? chainOptions.configurable.thread_id
           : undefined;
-      const hasExplicitLangfuse =
-        this.langfuse?.enabled === true ||
-        this.langfuse?.enabled === false ||
-        (this.Graph != null &&
-          hasExplicitLangfuseConfig(this.Graph.agentContexts.values()));
+      const titleLangfuseConfig = resolveLangfuseConfig(
+        this.langfuse,
+        titleContext?.langfuse
+      );
+      initializeLangfuseTracing(titleLangfuseConfig);
       titleLangfuseHandler = createLangfuseHandler({
-        langfuse: resolveLangfuseConfig(this.langfuse, titleContext?.langfuse),
+        langfuse: titleLangfuseConfig,
         userId,
         sessionId,
         traceMetadata,
         tags: ['librechat', 'title'],
       });
-      if (
-        titleLangfuseHandler == null &&
-        hasLangfuseEnvConfig() &&
-        !hasExplicitLangfuse
-      ) {
-        titleLangfuseHandler = createLegacyLangfuseHandler({
-          userId,
-          sessionId,
-          traceMetadata,
-          tags: ['librechat', 'title'],
-        });
-      }
 
       if (titleLangfuseHandler != null) {
         chainOptions.callbacks = appendCallbacks(chainOptions.callbacks, [

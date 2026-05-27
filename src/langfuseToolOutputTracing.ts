@@ -43,6 +43,10 @@ type RedactionResult = {
   changed: boolean;
 };
 
+type RedactionContext = {
+  toolNamesByCallId: Map<string, string>;
+};
+
 const TOOL_OUTPUT_FIELD_KEYS = ['content', 'artifact'];
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -223,18 +227,40 @@ function getNestedStringField(
   return getStringField(nested, fieldKey);
 }
 
-function getSerializedToolName(
+function getSerializedToolCallId(
   value: Record<string, unknown>
 ): string | undefined {
-  const role = getStringField(value, 'role');
   return (
+    getStringField(value, 'tool_call_id') ??
+    getNestedStringField(value, 'kwargs', 'tool_call_id') ??
+    getNestedStringField(value, 'additional_kwargs', 'tool_call_id') ??
+    getNestedStringField(value, 'data', 'tool_call_id') ??
+    (typeof value.id === 'string' ? value.id : undefined)
+  );
+}
+
+function getSerializedToolName(
+  value: Record<string, unknown>,
+  redactionContext?: RedactionContext
+): string | undefined {
+  const role = getStringField(value, 'role');
+  const explicitName =
     getStringField(value, 'name') ??
     getStringField(value, 'tool_name') ??
+    getNestedStringField(value, 'function', 'name') ??
     getNestedStringField(value, 'kwargs', 'name') ??
     getNestedStringField(value, 'additional_kwargs', 'name') ??
     getNestedStringField(value, 'data', 'name') ??
-    (role != null && role.toLowerCase() !== 'tool' ? role : undefined)
-  );
+    (role != null && role.toLowerCase() !== 'tool' ? role : undefined);
+
+  if (explicitName != null) {
+    return explicitName;
+  }
+
+  const toolCallId = getSerializedToolCallId(value);
+  return toolCallId != null
+    ? redactionContext?.toolNamesByCallId.get(toolCallId)
+    : undefined;
 }
 
 function hasToolMessageIdentity(value: Record<string, unknown>): boolean {
@@ -300,15 +326,42 @@ function redactToolContentFields(
   return next;
 }
 
+function collectToolCallNames(
+  value: unknown,
+  redactionContext: RedactionContext
+): void {
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectToolCallNames(item, redactionContext);
+    }
+    return;
+  }
+
+  if (!isRecord(value)) {
+    return;
+  }
+
+  const toolCallId = getSerializedToolCallId(value);
+  const toolName = getSerializedToolName(value);
+  if (toolCallId != null && toolName != null) {
+    redactionContext.toolNamesByCallId.set(toolCallId, toolName);
+  }
+
+  for (const child of Object.values(value)) {
+    collectToolCallNames(child, redactionContext);
+  }
+}
+
 function redactValue(
   value: unknown,
-  config: ResolvedLangfuseToolOutputTracingConfig
+  config: ResolvedLangfuseToolOutputTracingConfig,
+  redactionContext: RedactionContext
 ): RedactionResult {
   if (Array.isArray(value)) {
     let changed = false;
     const next: unknown[] = [];
     for (const item of value) {
-      const result = redactValue(item, config);
+      const result = redactValue(item, config, redactionContext);
       if (result.changed) {
         changed = true;
       }
@@ -321,7 +374,7 @@ function redactValue(
     return { value, changed: false };
   }
 
-  const toolName = getSerializedToolName(value);
+  const toolName = getSerializedToolName(value, redactionContext);
   if (hasToolMessageIdentity(value) && shouldRedactTool(toolName, config)) {
     return {
       value: redactToolContentFields(value, config),
@@ -332,7 +385,7 @@ function redactValue(
   let changed = false;
   const next: Record<string, unknown> = {};
   for (const [key, child] of Object.entries(value)) {
-    const result = redactValue(child, config);
+    const result = redactValue(child, config, redactionContext);
     if (result.changed) {
       changed = true;
     }
@@ -346,8 +399,12 @@ function redactSerializedValue(
   value: unknown,
   config: ResolvedLangfuseToolOutputTracingConfig
 ): RedactionResult {
+  const redactionContext: RedactionContext = {
+    toolNamesByCallId: new Map(),
+  };
   if (typeof value !== 'string') {
-    return redactValue(value, config);
+    collectToolCallNames(value, redactionContext);
+    return redactValue(value, config, redactionContext);
   }
 
   const trimmed = value.trim();
@@ -357,7 +414,8 @@ function redactSerializedValue(
 
   try {
     const parsed = JSON.parse(value) as unknown;
-    const result = redactValue(parsed, config);
+    collectToolCallNames(parsed, redactionContext);
+    const result = redactValue(parsed, config, redactionContext);
     return result.changed
       ? { value: JSON.stringify(result.value), changed: true }
       : { value, changed: false };

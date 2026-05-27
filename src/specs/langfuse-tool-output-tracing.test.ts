@@ -233,6 +233,53 @@ describe('Langfuse tool output tracing redaction', () => {
     expect(redacted[0].content).toBe(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
   });
 
+  it('maps tool_call_id to the preceding tool call name for allowlisted redaction', () => {
+    const messages = [
+      {
+        role: 'assistant',
+        content: '',
+        tool_calls: [
+          {
+            id: 'call_sql',
+            name: 'execute_sql',
+            args: { query: 'select * from private_table' },
+          },
+        ],
+      },
+      {
+        role: 'tool',
+        tool_call_id: 'call_sql',
+        content: 'sensitive row output',
+      },
+      {
+        role: 'tool',
+        tool_call_id: 'call_bash',
+        content: 'public build log',
+      },
+    ];
+    const span = createSpan('gpt-4o', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_TYPE]: 'generation',
+      [LangfuseOtelSpanAttributes.OBSERVATION_INPUT]: JSON.stringify(messages),
+    });
+
+    redactLangfuseSpanToolOutputs(
+      span,
+      createConfig({
+        redactedToolNames: new Set(['execute_sql']),
+      })
+    );
+
+    const redacted = readJsonAttribute<RedactedMessage[]>(
+      span,
+      LangfuseOtelSpanAttributes.OBSERVATION_INPUT
+    );
+    expect(redacted[0].tool_calls?.[0]?.args?.query).toBe(
+      'select * from private_table'
+    );
+    expect(redacted[1].content).toBe(LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT);
+    expect(redacted[2].content).toBe('public build log');
+  });
+
   it('does not redact partial tool name matches by default', () => {
     const span = createSpan('clickhouse_execute_sql_prod', {
       [LangfuseOtelSpanAttributes.OBSERVATION_TYPE]: 'tool',
