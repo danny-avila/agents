@@ -1,17 +1,27 @@
-import { NodeSDK } from '@opentelemetry/sdk-node';
 import { LangfuseSpanProcessor } from '@langfuse/otel';
-import { isPresent } from '@/utils/misc';
+import { setLangfuseTracerProvider } from '@langfuse/tracing';
+import { BasicTracerProvider } from '@opentelemetry/sdk-trace-base';
+import { hasLangfuseEnvConfig } from '@/langfuse';
 
-if (
-  isPresent(process.env.LANGFUSE_SECRET_KEY) &&
-  isPresent(process.env.LANGFUSE_PUBLIC_KEY) &&
-  isPresent(process.env.LANGFUSE_BASE_URL ?? process.env.LANGFUSE_BASEURL)
-) {
+let langfuseTracerProvider: BasicTracerProvider | undefined;
+
+export function initializeLangfuseTracingFromEnv():
+  | BasicTracerProvider
+  | undefined {
+  if (langfuseTracerProvider != null) {
+    return langfuseTracerProvider;
+  }
+  if (!hasLangfuseEnvConfig()) {
+    return undefined;
+  }
+
   const langfuseSpanProcessor = new LangfuseSpanProcessor();
-
-  const sdk = new NodeSDK({
+  langfuseTracerProvider = new BasicTracerProvider({
     spanProcessors: [langfuseSpanProcessor],
   });
 
-  sdk.start();
+  setLangfuseTracerProvider(langfuseTracerProvider);
+  return langfuseTracerProvider;
 }
+
+initializeLangfuseTracingFromEnv();
