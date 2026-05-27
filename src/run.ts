@@ -958,6 +958,7 @@ export class Run<_T extends t.BaseGraphState> {
        * unaffected — their entries live under their own session ids.
        */
       this.hookRegistry?.clearHaltSignal(this.id);
+      await disposeLangfuseHandler(langfuseHandler);
 
       /**
        * Break the reference chain that keeps heavy data alive via

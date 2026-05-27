@@ -632,16 +632,16 @@ export function shouldTraceToolNodeForLangfuse({
   agentLangfuse?: t.LangfuseConfig;
 }): boolean {
   const langfuse = resolveLangfuseConfig(runLangfuse, agentLangfuse);
+  if (langfuse?.enabled === false) {
+    return false;
+  }
+
   const explicit = langfuse?.toolNodeTracing?.enabled;
   if (explicit != null) {
     return (
       explicit &&
       (hasLangfuseConfigKeys(langfuse) || hasLangfuseEnvKeys())
     );
-  }
-
-  if (langfuse?.enabled === false) {
-    return false;
   }
 
   return hasLangfuseConfigKeys(langfuse) || hasLangfuseEnvKeys();

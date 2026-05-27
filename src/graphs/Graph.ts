@@ -1369,26 +1369,35 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         this.langfuse,
         agentContext.langfuse
       );
+      const traceMetadata = createLangfuseTraceMetadata({
+        messageId: this.runId,
+        parentMessageId: config.configurable?.requestBody?.parentMessageId,
+        agentId,
+        agentName: agentContext.name,
+      });
       let langfuseHandler: CallbackEntry | undefined;
-      let invokeConfig = config;
+      let invokeConfig = {
+        ...config,
+        metadata: {
+          ...(config.metadata ?? {}),
+          ...traceMetadata,
+        },
+      };
       initializeLangfuseTracing(langfuse);
       if (findCallback(config.callbacks, isLangfuseCallbackHandler) == null) {
         langfuseHandler = createLangfuseHandler({
           langfuse,
           userId: config.configurable?.user_id as string | undefined,
           sessionId: config.configurable?.thread_id as string | undefined,
-          traceMetadata: createLangfuseTraceMetadata({
-            messageId: this.runId,
-            parentMessageId: config.configurable?.requestBody?.parentMessageId,
-            agentId,
-            agentName: agentContext.name,
-          }),
+          traceMetadata,
           tags: ['librechat', 'agent'],
         });
         if (langfuseHandler != null) {
           invokeConfig = {
-            ...config,
-            callbacks: appendCallbacks(config.callbacks, [langfuseHandler]),
+            ...invokeConfig,
+            callbacks: appendCallbacks(invokeConfig.callbacks, [
+              langfuseHandler,
+            ]),
           };
         }
       }

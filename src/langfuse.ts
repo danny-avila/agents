@@ -1,3 +1,4 @@
+import { getLangfuseTracerProvider } from '@langfuse/tracing';
 import { CallbackHandler } from '@langfuse/langchain';
 import type * as t from '@/types';
 import { isPresent } from '@/utils/misc';
@@ -15,6 +16,10 @@ type LangfuseHandlerParams = {
 
 type AgentLangfuseHandlerParams = LangfuseHandlerParams & {
   langfuse?: t.LangfuseConfig;
+};
+
+type FlushableTracerProvider = {
+  forceFlush?: () => Promise<void> | void;
 };
 
 function hasLangfuseTracingConfig(langfuse?: t.LangfuseConfig): boolean {
@@ -162,7 +167,10 @@ export function isLangfuseCallbackHandler(value: unknown): boolean {
   return value instanceof CallbackHandler;
 }
 
-export async function disposeLangfuseHandler(_value: unknown): Promise<void> {
-  // The official Langfuse LangChain callback handler is flushed by the
-  // configured OpenTelemetry span processor.
+export async function disposeLangfuseHandler(value: unknown): Promise<void> {
+  if (value == null) {
+    return;
+  }
+  const provider = getLangfuseTracerProvider() as FlushableTracerProvider;
+  await provider.forceFlush?.();
 }

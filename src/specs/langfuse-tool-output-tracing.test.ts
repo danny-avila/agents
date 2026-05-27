@@ -166,6 +166,20 @@ describe('Langfuse tool output tracing redaction', () => {
     ).toBe(true);
   });
 
+  it('keeps ToolNode tracing disabled when resolved Langfuse is disabled', () => {
+    process.env.LANGFUSE_SECRET_KEY = 'sk-test';
+    process.env.LANGFUSE_PUBLIC_KEY = 'pk-test';
+
+    expect(
+      shouldTraceToolNodeForLangfuse({
+        runLangfuse: {
+          enabled: false,
+          toolNodeTracing: { enabled: true },
+        },
+      })
+    ).toBe(false);
+  });
+
   it('redacts raw tool observation output when tool output tracing is disabled', () => {
     const span = createSpan('execute_sql', {
       [LangfuseOtelSpanAttributes.OBSERVATION_TYPE]: 'tool',

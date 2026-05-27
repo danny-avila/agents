@@ -85,6 +85,7 @@ describe('Langfuse callback composition', () => {
     await run.processStream({ messages: [new HumanMessage('hello')] }, config);
 
     expect(mockStartActiveSpan).toHaveBeenCalled();
+    expect(mockForceFlush).toHaveBeenCalled();
   });
 
   it('attaches Langfuse callbacks for direct graph invocations', async () => {
@@ -177,6 +178,74 @@ describe('Langfuse callback composition', () => {
         publicKey: 'pk-agent',
         secretKey: 'sk-agent',
         baseUrl: 'https://langfuse.agent',
+      })
+    );
+  });
+
+  it('adds current agent metadata when a stream Langfuse callback already exists', async () => {
+    const metadataSpy = jest.fn();
+    const { createLangfuseHandler } = await import('@/langfuse');
+    const streamHandler = createLangfuseHandler({
+      langfuse: {
+        publicKey: 'pk-run',
+        secretKey: 'sk-run',
+        baseUrl: 'https://langfuse.run',
+      },
+    });
+    const run = await Run.create<t.IState>({
+      runId: 'test-langfuse-agent-metadata-with-stream-callback',
+      graphConfig: {
+        type: 'multi-agent',
+        agents: [
+          {
+            agentId: 'agent_default',
+            name: 'Default Agent',
+            provider: Providers.OPENAI,
+            clientOptions: { model: 'gpt-4' },
+            tools: [],
+          },
+          {
+            agentId: 'agent_specialist',
+            name: 'Specialist Agent',
+            provider: Providers.OPENAI,
+            clientOptions: { model: 'gpt-4' },
+            tools: [],
+          },
+        ],
+        edges: [],
+      },
+      skipCleanup: true,
+    });
+
+    run.Graph?.overrideTestModel(['hello from specialist']);
+    const agentNode = run.Graph?.createAgentNode('agent_specialist');
+    await agentNode?.invoke(
+      { messages: [new HumanMessage('hello')] },
+      {
+        callbacks: [
+          ...(streamHandler != null ? [streamHandler] : []),
+          {
+            handleChatModelStart: async (
+              _llm: unknown,
+              _messages: unknown,
+              _runId: string,
+              _parentRunId?: string,
+              _extraParams?: unknown,
+              _tags?: string[],
+              metadata?: Record<string, unknown>
+            ): Promise<void> => {
+              metadataSpy(metadata);
+            },
+          },
+        ],
+        configurable: { thread_id: 'thread-1', user_id: 'user-1' },
+      }
+    );
+
+    expect(metadataSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentId: 'agent_specialist',
+        agentName: 'Specialist Agent',
       })
     );
   });
