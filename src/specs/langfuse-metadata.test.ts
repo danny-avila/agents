@@ -107,7 +107,7 @@ describe('Langfuse trace metadata includes agentName', () => {
     expect(MockedCallbackHandler).not.toHaveBeenCalled();
   });
 
-  it('keeps env Langfuse enabled for redaction-only agent config', async () => {
+  it('does not use the legacy CallbackHandler for redaction-only agent config', async () => {
     const run = await createTestRun('DWAINE', {
       langfuse: {
         toolOutputTracing: { enabled: false },
@@ -118,6 +118,6 @@ describe('Langfuse trace metadata includes agentName', () => {
       { configurable: { thread_id: 't1', user_id: 'u1' }, version: 'v2' }
     );
 
-    expect(MockedCallbackHandler).toHaveBeenCalledTimes(1);
+    expect(MockedCallbackHandler).not.toHaveBeenCalled();
   });
 });

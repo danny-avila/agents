@@ -42,6 +42,37 @@ function getEnvLangfuseBaseUrl(): string | undefined {
   return process.env.LANGFUSE_BASE_URL ?? process.env.LANGFUSE_BASEURL;
 }
 
+function hasLangfuseTracingConfig(langfuse?: t.LangfuseConfig): boolean {
+  return (
+    langfuse?.toolNodeTracing != null || langfuse?.toolOutputTracing != null
+  );
+}
+
+function resolveRequiredLangfuseConfig(
+  langfuse?: t.LangfuseConfig
+): ResolvedLangfuseConfig | undefined {
+  if (hasRequiredLangfuseConfig(langfuse)) {
+    return langfuse;
+  }
+  if (langfuse?.enabled === false) {
+    return undefined;
+  }
+  if (
+    !hasLangfuseEnvConfig() ||
+    (langfuse?.enabled !== true && !hasLangfuseTracingConfig(langfuse))
+  ) {
+    return undefined;
+  }
+
+  return {
+    ...langfuse,
+    enabled: true,
+    publicKey: process.env.LANGFUSE_PUBLIC_KEY as string,
+    secretKey: process.env.LANGFUSE_SECRET_KEY as string,
+    baseUrl: getEnvLangfuseBaseUrl(),
+  };
+}
+
 function createTraceMetadata(
   metadata: Record<string, unknown>
 ): LangfuseTraceMetadata {
@@ -401,12 +432,13 @@ export function createLangfuseHandler({
   traceMetadata,
   tags,
 }: AgentLangfuseHandlerParams): LangfuseAgentCallbackHandler | undefined {
-  if (!hasRequiredLangfuseConfig(langfuse)) {
+  const resolvedLangfuse = resolveRequiredLangfuseConfig(langfuse);
+  if (resolvedLangfuse == null) {
     return undefined;
   }
 
   return new LangfuseAgentCallbackHandler({
-    langfuse,
+    langfuse: resolvedLangfuse,
     userId,
     sessionId,
     traceMetadata,
@@ -422,7 +454,8 @@ export function hasExplicitLangfuseConfig(
       context.langfuse?.enabled != null ||
       isPresent(context.langfuse?.publicKey) ||
       isPresent(context.langfuse?.secretKey) ||
-      isPresent(context.langfuse?.baseUrl)
+      isPresent(context.langfuse?.baseUrl) ||
+      hasLangfuseTracingConfig(context.langfuse)
     ) {
       return true;
     }

@@ -28,8 +28,19 @@ jest.mock('@opentelemetry/sdk-trace-base', () => ({
 }));
 
 describe('createLangfuseHandler', () => {
+  const originalEnv = process.env;
+
   beforeEach(() => {
     jest.clearAllMocks();
+    process.env = { ...originalEnv };
+    delete process.env.LANGFUSE_PUBLIC_KEY;
+    delete process.env.LANGFUSE_SECRET_KEY;
+    delete process.env.LANGFUSE_BASE_URL;
+    delete process.env.LANGFUSE_BASEURL;
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
   });
 
   it('creates a handler when keys are provided and baseUrl is omitted', () => {
@@ -110,5 +121,28 @@ describe('createLangfuseHandler', () => {
     expect(handler).toBeUndefined();
     expect(LangfuseSpanProcessor).not.toHaveBeenCalled();
     expect(BasicTracerProvider).not.toHaveBeenCalled();
+  });
+
+  it('hydrates redaction-only config from env keys', () => {
+    process.env.LANGFUSE_PUBLIC_KEY = 'pk-env';
+    process.env.LANGFUSE_SECRET_KEY = 'sk-env';
+    process.env.LANGFUSE_BASE_URL = 'https://langfuse.env';
+
+    const handler = createLangfuseHandler({
+      langfuse: {
+        toolOutputTracing: { enabled: false },
+      },
+    });
+
+    expect(handler).toBeDefined();
+    expect(LangfuseSpanProcessor).toHaveBeenCalledWith(
+      expect.objectContaining({
+        publicKey: 'pk-env',
+        secretKey: 'sk-env',
+        baseUrl: 'https://langfuse.env',
+        exportMode: 'immediate',
+      })
+    );
+    expect(BasicTracerProvider).toHaveBeenCalledTimes(1);
   });
 });
