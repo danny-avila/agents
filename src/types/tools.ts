@@ -6,6 +6,7 @@ import type { HookRegistry } from '@/hooks';
 import type { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import type { MessageContentComplex, ToolErrorData } from './stream';
 import type { HumanInTheLoopConfig } from './hitl';
+import type { LangfuseConfig } from './graph';
 
 /** Replacement type for `import type { ToolCall } from '@langchain/core/messages/tool'` in order to have stringified args typed */
 export type CustomToolCall = {
@@ -69,6 +70,12 @@ export type EagerEventToolCallChunkState = {
 export type ToolNodeOptions = {
   name?: string;
   tags?: string[];
+  /** Enables LangChain/LangGraph tracing for this ToolNode. Defaults to false. */
+  trace?: boolean;
+  /** Run-level Langfuse config used to scope ToolNode trace redaction. */
+  runLangfuse?: LangfuseConfig;
+  /** Agent-level Langfuse config used to scope ToolNode trace redaction. */
+  agentLangfuse?: LangfuseConfig;
   handleToolErrors?: boolean;
   loadRuntimeTools?: ToolRefGenerator;
   toolCallStepIds?: Map<string, string>;

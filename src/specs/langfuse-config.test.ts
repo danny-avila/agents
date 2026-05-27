@@ -1,67 +1,40 @@
-import { LangfuseSpanProcessor } from '@langfuse/otel';
-import { BasicTracerProvider } from '@opentelemetry/sdk-trace-base';
-import { HumanMessage } from '@langchain/core/messages';
-import type { Serialized } from '@langchain/core/load/serializable';
-import { createLangfuseHandler } from '@/langfuse';
+import { CallbackHandler } from '@langfuse/langchain';
+import {
+  createLangfuseHandler,
+  hasLangfuseConfigCredentials,
+  shouldCreateLangfuseHandler,
+} from '@/langfuse';
 
-const mockSpan = {
-  end: jest.fn(),
-  setAttributes: jest.fn(),
-  setStatus: jest.fn(),
-};
-const mockStartSpan = jest.fn(() => mockSpan);
-const mockGetTracer = jest.fn(() => ({
-  startSpan: mockStartSpan,
+jest.mock('@langfuse/langchain', () => ({
+  CallbackHandler: jest.fn().mockImplementation((params) => ({ params })),
 }));
 
-jest.mock('@langfuse/otel', () => ({
-  LangfuseSpanProcessor: jest.fn().mockImplementation(() => ({})),
-  isDefaultExportSpan: jest.fn(() => false),
-}));
-
-jest.mock('@opentelemetry/sdk-trace-base', () => ({
-  BasicTracerProvider: jest.fn().mockImplementation(() => ({
-    forceFlush: jest.fn(),
-    getTracer: mockGetTracer,
-    shutdown: jest.fn(),
-  })),
-}));
+const MockedCallbackHandler = CallbackHandler as jest.MockedClass<
+  typeof CallbackHandler
+>;
 
 describe('createLangfuseHandler', () => {
+  const originalEnv = process.env;
+
   beforeEach(() => {
     jest.clearAllMocks();
+    process.env = { ...originalEnv };
+    delete process.env.LANGFUSE_PUBLIC_KEY;
+    delete process.env.LANGFUSE_SECRET_KEY;
+    delete process.env.LANGFUSE_BASE_URL;
+    delete process.env.LANGFUSE_BASEURL;
   });
 
-  it('creates a handler when keys are provided and baseUrl is omitted', () => {
-    const handler = createLangfuseHandler({
-      langfuse: {
-        enabled: true,
-        publicKey: 'pk-test',
-        secretKey: 'sk-test',
-      },
-    });
-
-    expect(handler).toBeDefined();
-    expect(LangfuseSpanProcessor).toHaveBeenCalledWith(
-      expect.objectContaining({
-        publicKey: 'pk-test',
-        secretKey: 'sk-test',
-        exportMode: 'immediate',
-      })
-    );
-    expect(
-      (LangfuseSpanProcessor as jest.Mock).mock.calls[0][0].baseUrl
-    ).toBeUndefined();
-    expect(BasicTracerProvider).toHaveBeenCalledTimes(1);
+  afterEach(() => {
+    process.env = originalEnv;
   });
 
-  it('starts per-agent spans with v5 trace attributes', async () => {
+  it('creates the official Langfuse callback handler when env keys are present', () => {
+    process.env.LANGFUSE_PUBLIC_KEY = 'pk-env';
+    process.env.LANGFUSE_SECRET_KEY = 'sk-env';
+    process.env.LANGFUSE_BASE_URL = 'https://langfuse.env';
+
     const handler = createLangfuseHandler({
-      langfuse: {
-        enabled: true,
-        publicKey: 'pk-test',
-        secretKey: 'sk-test',
-      },
       userId: 'user-1',
       sessionId: 'thread-1',
       traceMetadata: {
@@ -72,34 +45,60 @@ describe('createLangfuseHandler', () => {
       tags: ['librechat', 'agent'],
     });
 
-    await handler?.handleChatModelStart(
-      {
-        id: ['langchain', 'chat_models', 'ChatOpenAI'],
-        kwargs: { model: 'gpt-4o' },
-      } as unknown as Serialized,
-      [[new HumanMessage('hello')]],
-      'run-1'
-    );
-
-    expect(mockGetTracer).toHaveBeenCalledWith('langfuse-sdk');
-    expect(mockStartSpan).toHaveBeenCalledWith(
-      'gpt-4o',
-      expect.objectContaining({
-        attributes: expect.objectContaining({
-          'langfuse.trace.name': 'LibreChat Agent: DWAINE',
-          'langfuse.trace.metadata.agentId': 'agent-1',
-          'langfuse.trace.metadata.messageId': 'message-1',
-          'langfuse.observation.model.name': 'gpt-4o',
-          'langfuse.observation.type': 'generation',
-          'user.id': 'user-1',
-          'session.id': 'thread-1',
-          'langfuse.trace.tags': ['librechat', 'agent'],
-        }),
-      })
-    );
+    expect(handler).toBeDefined();
+    expect(MockedCallbackHandler).toHaveBeenCalledWith({
+      userId: 'user-1',
+      sessionId: 'thread-1',
+      traceMetadata: {
+        messageId: 'message-1',
+        agentId: 'agent-1',
+        agentName: 'DWAINE',
+      },
+      tags: ['librechat', 'agent'],
+    });
   });
 
-  it('does not create a handler when a required key is missing', () => {
+  it('creates a handler for explicit credentials supplied in config', () => {
+    const handler = createLangfuseHandler({
+      langfuse: {
+        publicKey: 'pk-test',
+        secretKey: 'sk-test',
+      },
+    });
+
+    expect(handler).toBeDefined();
+    expect(MockedCallbackHandler).toHaveBeenCalledTimes(1);
+  });
+
+  it('hydrates redaction-only config from env keys', () => {
+    process.env.LANGFUSE_PUBLIC_KEY = 'pk-env';
+    process.env.LANGFUSE_SECRET_KEY = 'sk-env';
+    process.env.LANGFUSE_BASE_URL = 'https://langfuse.env';
+
+    const handler = createLangfuseHandler({
+      langfuse: {
+        toolOutputTracing: { enabled: false },
+      },
+    });
+
+    expect(handler).toBeDefined();
+    expect(MockedCallbackHandler).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not create a handler when Langfuse is disabled', () => {
+    const handler = createLangfuseHandler({
+      langfuse: {
+        enabled: false,
+        publicKey: 'pk-test',
+        secretKey: 'sk-test',
+      },
+    });
+
+    expect(handler).toBeUndefined();
+    expect(MockedCallbackHandler).not.toHaveBeenCalled();
+  });
+
+  it('does not create a handler when credentials are unavailable', () => {
     const handler = createLangfuseHandler({
       langfuse: {
         enabled: true,
@@ -108,7 +107,44 @@ describe('createLangfuseHandler', () => {
     });
 
     expect(handler).toBeUndefined();
-    expect(LangfuseSpanProcessor).not.toHaveBeenCalled();
-    expect(BasicTracerProvider).not.toHaveBeenCalled();
+    expect(MockedCallbackHandler).not.toHaveBeenCalled();
+  });
+
+  it('detects complete config credentials', () => {
+    expect(
+      hasLangfuseConfigCredentials({
+        publicKey: 'pk-test',
+        secretKey: 'sk-test',
+      })
+    ).toBe(true);
+    expect(
+      hasLangfuseConfigCredentials({
+        publicKey: 'pk-test',
+      })
+    ).toBe(false);
+  });
+
+  it('uses env credentials for redaction-only configs', () => {
+    process.env.LANGFUSE_PUBLIC_KEY = 'pk-env';
+    process.env.LANGFUSE_SECRET_KEY = 'sk-env';
+    process.env.LANGFUSE_BASE_URL = 'https://langfuse.env';
+
+    expect(
+      shouldCreateLangfuseHandler({
+        toolOutputTracing: { enabled: false },
+      })
+    ).toBe(true);
+  });
+
+  it('uses env credentials with a config-provided baseUrl', () => {
+    process.env.LANGFUSE_PUBLIC_KEY = 'pk-env';
+    process.env.LANGFUSE_SECRET_KEY = 'sk-env';
+
+    expect(
+      shouldCreateLangfuseHandler({
+        baseUrl: 'https://langfuse.config',
+        toolOutputTracing: { enabled: false },
+      })
+    ).toBe(true);
   });
 });

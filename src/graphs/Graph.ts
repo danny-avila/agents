@@ -52,7 +52,11 @@ import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { shouldTriggerSummarization } from '@/summarization';
 import { createSummarizeNode } from '@/summarization/node';
 import { messagesStateReducer } from '@/messages/reducer';
-import { appendCallbacks } from '@/utils/callbacks';
+import {
+  appendCallbacks,
+  findCallback,
+  type CallbackEntry,
+} from '@/utils/callbacks';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { AgentContext } from '@/agents/AgentContext';
 import { createFakeStreamingLLM } from '@/llm/fake';
@@ -64,9 +68,16 @@ import { isThinkingEnabled } from '@/llm/request';
 import { initializeModel } from '@/llm/init';
 import {
   createLangfuseHandler,
-  disposeLangfuseHandler,
   createLangfuseTraceMetadata,
+  disposeLangfuseHandler,
+  isLangfuseCallbackHandler,
 } from '@/langfuse';
+import { initializeLangfuseTracing } from '@/instrumentation';
+import {
+  resolveLangfuseConfig,
+  shouldTraceToolNodeForLangfuse,
+  withLangfuseToolOutputTracingConfig,
+} from '@/langfuseToolOutputTracing';
 import { HandlerRegistry } from '@/events';
 import { ChatOpenAI } from '@/llm/openai';
 import { partitionAndMarkOpenRouterToolCache } from '@/llm/openrouter/toolCache';
@@ -174,6 +185,10 @@ export abstract class Graph<
    * graph compiles.
    */
   toolOutputReferences: t.ToolOutputReferencesConfig | undefined;
+  /**
+   * Run-scoped Langfuse defaults. Per-agent config wins when present.
+   */
+  langfuse: t.LangfuseConfig | undefined;
   /**
    * Run-scoped opt-in for eager event-driven tool execution. The stream
    * handler may prestart eligible event-driven tools; ToolNode later
@@ -427,6 +442,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     runId,
     signal,
     agents,
+    langfuse,
     tokenCounter,
     indexTokenCountMap,
     calibrationRatio,
@@ -434,6 +450,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     super();
     this.runId = runId;
     this.signal = signal;
+    this.langfuse = langfuse;
 
     if (agents.length === 0) {
       throw new Error('At least one agent configuration is required');
@@ -743,6 +760,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     const toolDefinitions = agentContext?.toolDefinitions;
     const eventDrivenMode =
       toolDefinitions != null && toolDefinitions.length > 0;
+    const traceToolNode = shouldTraceToolNodeForLangfuse({
+      runLangfuse: this.langfuse,
+      agentLangfuse: agentContext?.langfuse,
+    });
 
     if (eventDrivenMode) {
       const schemaTools = createSchemaOnlyTools(toolDefinitions);
@@ -770,6 +791,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       const node = new CustomToolNode<t.BaseGraphState>({
         tools: allTools,
         toolMap: allToolMap,
+        trace: traceToolNode,
+        runLangfuse: this.langfuse,
+        agentLangfuse: agentContext?.langfuse,
         eventDrivenMode: true,
         sessions: this.sessions,
         toolDefinitions: toolDefMap,
@@ -815,6 +839,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     const node = new CustomToolNode<t.BaseGraphState>({
       tools: allTraditionalTools,
       toolMap: traditionalToolMap,
+      trace: traceToolNode,
+      runLangfuse: this.langfuse,
+      agentLangfuse: agentContext?.langfuse,
       toolCallStepIds: this.toolCallStepIds,
       errorHandler: (data, metadata): Promise<void> =>
         StandardGraph.handleToolCallErrorStatic(this, data, metadata),
@@ -1338,44 +1365,72 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         { force: true }
       );
 
-      const langfuseHandler = createLangfuseHandler({
-        langfuse: agentContext.langfuse,
-        userId: config.configurable?.user_id as string | undefined,
-        sessionId: config.configurable?.thread_id as string | undefined,
-        traceMetadata: createLangfuseTraceMetadata({
-          messageId: this.runId,
-          parentMessageId: config.configurable?.requestBody?.parentMessageId,
-          agentId,
-          agentName: agentContext.name,
-        }),
-        tags: ['librechat', 'agent'],
+      const langfuse = resolveLangfuseConfig(
+        this.langfuse,
+        agentContext.langfuse
+      );
+      const traceMetadata = createLangfuseTraceMetadata({
+        messageId: this.runId,
+        parentMessageId: config.configurable?.requestBody?.parentMessageId,
+        agentId,
+        agentName: agentContext.name,
       });
-      const invokeConfig = langfuseHandler
-        ? {
-          ...config,
-          callbacks: appendCallbacks(config.callbacks, [langfuseHandler]),
+      let langfuseHandler: CallbackEntry | undefined;
+      let invokeConfig = {
+        ...config,
+        metadata: {
+          ...(config.metadata ?? {}),
+          ...traceMetadata,
+        },
+      };
+      initializeLangfuseTracing(langfuse);
+      if (findCallback(config.callbacks, isLangfuseCallbackHandler) == null) {
+        langfuseHandler = createLangfuseHandler({
+          langfuse,
+          userId: config.configurable?.user_id as string | undefined,
+          sessionId: config.configurable?.thread_id as string | undefined,
+          traceMetadata,
+          tags: ['librechat', 'agent'],
+        });
+        if (langfuseHandler != null) {
+          invokeConfig = {
+            ...invokeConfig,
+            callbacks: appendCallbacks(invokeConfig.callbacks, [
+              langfuseHandler,
+            ]),
+          };
         }
-        : config;
+      }
 
       try {
-        result = await attemptInvoke(
-          {
-            model: (this.overrideModel ?? model) as t.ChatModel,
-            messages: finalMessages,
-            provider: agentContext.provider,
-            context: this,
-          },
-          invokeConfig
+        result = await withLangfuseToolOutputTracingConfig(
+          this.langfuse,
+          () =>
+            attemptInvoke(
+              {
+                model: (this.overrideModel ?? model) as t.ChatModel,
+                messages: finalMessages,
+                provider: agentContext.provider,
+                context: this,
+              },
+              invokeConfig
+            ),
+          agentContext.langfuse
         );
       } catch (primaryError) {
-        result = await tryFallbackProviders({
-          fallbacks,
-          tools: agentContext.tools,
-          messages: finalMessages,
-          config: invokeConfig,
-          primaryError,
-          context: this,
-        });
+        result = await withLangfuseToolOutputTracingConfig(
+          this.langfuse,
+          () =>
+            tryFallbackProviders({
+              fallbacks,
+              tools: agentContext.tools,
+              messages: finalMessages,
+              config: invokeConfig,
+              primaryError,
+              context: this,
+            }),
+          agentContext.langfuse
+        );
       } finally {
         await disposeLangfuseHandler(langfuseHandler);
       }
@@ -1599,6 +1654,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           parentHandlerRegistry: getParentHandlerRegistry,
           parentRunId: this.runId ?? '',
           parentAgentId: agentContext.agentId,
+          langfuse: this.langfuse,
           tokenCounter: agentContext.tokenCounter,
           maxDepth: effectiveSubagentDepth,
           createChildGraph: (input): StandardGraph => {

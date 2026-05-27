@@ -12,7 +12,8 @@ const MockedCallbackHandler = CallbackHandler as jest.MockedClass<
 
 async function createTestRun(
   agentName?: string,
-  agentOverrides: Record<string, unknown> = {}
+  agentOverrides: Record<string, unknown> = {},
+  runOverrides: Record<string, unknown> = {}
 ): Promise<Run<never>> {
   const run = await Run.create({
     runId: 'test-run-id',
@@ -29,6 +30,7 @@ async function createTestRun(
         },
       ],
     },
+    ...runOverrides,
   });
 
   const emptyStream = (async function* (): AsyncGenerator {
@@ -105,5 +107,56 @@ describe('Langfuse trace metadata includes agentName', () => {
     );
 
     expect(MockedCallbackHandler).not.toHaveBeenCalled();
+  });
+
+  it('uses the nested Langfuse CallbackHandler for redaction-only agent config', async () => {
+    const run = await createTestRun('DWAINE', {
+      langfuse: {
+        toolOutputTracing: { enabled: false },
+      },
+    });
+    await run.processStream(
+      { messages: [] },
+      { configurable: { thread_id: 't1', user_id: 'u1' }, version: 'v2' }
+    );
+
+    expect(MockedCallbackHandler).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses the nested Langfuse CallbackHandler for redaction-only run config', async () => {
+    const run = await createTestRun(
+      'DWAINE',
+      {},
+      {
+        langfuse: {
+          toolOutputTracing: { enabled: false },
+        },
+      }
+    );
+    await run.processStream(
+      { messages: [] },
+      { configurable: { thread_id: 't1', user_id: 'u1' }, version: 'v2' }
+    );
+
+    expect(MockedCallbackHandler).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves run-level Langfuse config after graph cleanup for later turns', async () => {
+    const langfuse = {
+      toolOutputTracing: { enabled: false },
+    };
+    const run = await createTestRun(
+      'DWAINE',
+      {},
+      {
+        langfuse,
+      }
+    );
+    await run.processStream(
+      { messages: [] },
+      { configurable: { thread_id: 't1', user_id: 'u1' }, version: 'v2' }
+    );
+
+    expect(run.Graph?.langfuse).toBe(langfuse);
   });
 });

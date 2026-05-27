@@ -295,6 +295,7 @@ export type StandardGraphInput = {
   runId?: string;
   signal?: AbortSignal;
   agents: AgentInputs[];
+  langfuse?: LangfuseConfig;
   tokenCounter?: TokenCounter;
   indexTokenCountMap?: Record<string, number>;
   calibrationRatio?: number;
@@ -408,11 +409,42 @@ export interface SubagentUpdateEvent {
   timestamp: string;
 }
 
+export type LangfuseToolOutputTracingConfig = {
+  /**
+   * Whether tool outputs should be exported to Langfuse. Defaults to
+   * `true`. Set to `false` to keep tool spans and redact their output.
+   */
+  enabled?: boolean;
+  /**
+   * Optional allowlist of tool names whose outputs should be redacted even
+   * when `enabled` is true.
+   */
+  redactedToolNames?: string[];
+  /**
+   * Match strategy for `redactedToolNames`. Defaults to `exact`; use
+   * `partial` to redact tools whose names contain a configured value.
+   */
+  redactedToolNameMatchMode?: 'exact' | 'partial';
+  /** Replacement text used for redacted tool outputs. */
+  redactionText?: string;
+};
+
+export type LangfuseToolNodeTracingConfig = {
+  /**
+   * Overrides ToolNode callback tracing. ToolNode spans are exported by the
+   * env-backed Langfuse callback, so this only enables tracing when that
+   * callback is configured.
+   */
+  enabled?: boolean;
+};
+
 export interface LangfuseConfig {
   enabled?: boolean;
   publicKey?: string;
   secretKey?: string;
   baseUrl?: string;
+  toolNodeTracing?: LangfuseToolNodeTracingConfig;
+  toolOutputTracing?: LangfuseToolOutputTracingConfig;
 }
 
 export interface AgentInputs {
