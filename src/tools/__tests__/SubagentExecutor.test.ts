@@ -424,6 +424,38 @@ describe('SubagentExecutor', () => {
     expect(clearHeavyState).toHaveBeenCalled();
   });
 
+  it('passes parent Langfuse config to the child graph', async () => {
+    const langfuse = {
+      enabled: true,
+      publicKey: 'pk-run',
+      secretKey: 'sk-run',
+      baseUrl: 'https://langfuse.test',
+      toolOutputTracing: { enabled: false },
+    };
+    let observedLangfuse: typeof langfuse | undefined;
+    const executor = createExecutor({
+      langfuse,
+      createChildGraph: (input): StandardGraph => {
+        observedLangfuse = input.langfuse as typeof langfuse;
+        return {
+          createWorkflow: (): { invoke: jest.Mock } => ({
+            invoke: jest.fn().mockResolvedValue({
+              messages: [new AIMessage('child done')],
+            }),
+          }),
+          clearHeavyState: jest.fn(),
+        } as unknown as StandardGraph;
+      },
+    });
+
+    await executor.execute({
+      description: 'Research this topic',
+      subagentType: 'researcher',
+    });
+
+    expect(observedLangfuse).toBe(langfuse);
+  });
+
   it('returns error message when child graph throws', async () => {
     const executor = createExecutor({
       createChildGraph: makeThrowingGraphFactory(

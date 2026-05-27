@@ -118,6 +118,12 @@ export type StandardGraphConfig = Omit<
 export type RunConfig = {
   runId: string;
   graphConfig: LegacyGraphConfig | StandardGraphConfig | MultiAgentGraphConfig;
+  /**
+   * Run-scoped Langfuse configuration. Per-agent `AgentInputs.langfuse`
+   * takes precedence for agent-specific spans; this object supplies defaults
+   * for run-wide tracing controls such as tool-output redaction.
+   */
+  langfuse?: g.LangfuseConfig;
   customHandlers?: Record<string, g.EventHandler>;
   /**
    * Pre-constructed hook registry for this run. Hooks fire at lifecycle

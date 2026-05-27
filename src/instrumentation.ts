@@ -1,9 +1,9 @@
-import { LangfuseSpanProcessor } from '@langfuse/otel';
 import { setLangfuseTracerProvider } from '@langfuse/tracing';
 import { BasicTracerProvider } from '@opentelemetry/sdk-trace-base';
 import { context, ROOT_CONTEXT, createContextKey } from '@opentelemetry/api';
 import { AsyncLocalStorageContextManager } from '@opentelemetry/context-async-hooks';
 import { hasLangfuseEnvConfig } from '@/langfuse';
+import { createLangfuseSpanProcessor } from '@/langfuseToolOutputTracing';
 
 let langfuseTracerProvider: BasicTracerProvider | undefined;
 const contextManagerProbeKey = createContextKey(
@@ -40,7 +40,7 @@ export function initializeLangfuseTracingFromEnv():
   }
 
   ensureOpenTelemetryContextManager();
-  const langfuseSpanProcessor = new LangfuseSpanProcessor();
+  const langfuseSpanProcessor = createLangfuseSpanProcessor();
   langfuseTracerProvider = new BasicTracerProvider({
     spanProcessors: [langfuseSpanProcessor],
   });

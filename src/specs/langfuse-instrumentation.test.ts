@@ -25,7 +25,17 @@ const mockTracerProvider = {
   getTracer: jest.fn(),
   shutdown: jest.fn(),
 };
-const mockBasicTracerProvider = jest.fn(() => mockTracerProvider);
+type BasicTracerProviderInput = {
+  spanProcessors: Array<{
+    forceFlush?: unknown;
+    onEnd?: unknown;
+    onStart?: unknown;
+    shutdown?: unknown;
+  }>;
+};
+const mockBasicTracerProvider = jest.fn(
+  (_input?: BasicTracerProviderInput) => mockTracerProvider
+);
 
 jest.mock('@langfuse/otel', () => ({
   LangfuseSpanProcessor: mockLangfuseSpanProcessor,
@@ -101,8 +111,17 @@ describe('Langfuse instrumentation', () => {
 
     expect(provider).toBe(mockTracerProvider);
     expect(mockLangfuseSpanProcessor).toHaveBeenCalledTimes(1);
-    expect(mockBasicTracerProvider).toHaveBeenCalledWith({
-      spanProcessors: [mockLangfuseSpanProcessorInstance],
+    const providerInput = mockBasicTracerProvider.mock
+      .calls[0][0] as BasicTracerProviderInput;
+    expect(providerInput.spanProcessors).toHaveLength(1);
+    expect(providerInput.spanProcessors[0]).not.toBe(
+      mockLangfuseSpanProcessorInstance
+    );
+    expect(providerInput.spanProcessors[0]).toMatchObject({
+      forceFlush: expect.any(Function),
+      onEnd: expect.any(Function),
+      onStart: expect.any(Function),
+      shutdown: expect.any(Function),
     });
     expect(mockSetLangfuseTracerProvider).toHaveBeenCalledWith(
       mockTracerProvider

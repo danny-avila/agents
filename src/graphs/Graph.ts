@@ -67,6 +67,11 @@ import {
   disposeLangfuseHandler,
   createLangfuseTraceMetadata,
 } from '@/langfuse';
+import {
+  resolveLangfuseConfig,
+  shouldTraceToolNodeForLangfuse,
+  withLangfuseToolOutputTracingConfig,
+} from '@/langfuseToolOutputTracing';
 import { HandlerRegistry } from '@/events';
 import { ChatOpenAI } from '@/llm/openai';
 import { partitionAndMarkOpenRouterToolCache } from '@/llm/openrouter/toolCache';
@@ -175,6 +180,10 @@ export abstract class Graph<
    */
   toolOutputReferences: t.ToolOutputReferencesConfig | undefined;
   /**
+   * Run-scoped Langfuse defaults. Per-agent config wins when present.
+   */
+  langfuse: t.LangfuseConfig | undefined;
+  /**
    * Run-scoped opt-in for eager event-driven tool execution. The stream
    * handler may prestart eligible event-driven tools; ToolNode later
    * consumes the settled promises while preserving final ToolMessage order.
@@ -225,6 +234,7 @@ export abstract class Graph<
     this.hookRegistry = undefined;
     this.humanInTheLoop = undefined;
     this.toolOutputReferences = undefined;
+    this.langfuse = undefined;
     this.eagerEventToolExecution = undefined;
     this.eagerEventToolExecutions.clear();
     this.clearEagerEventToolUsageCounts();
@@ -427,6 +437,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     runId,
     signal,
     agents,
+    langfuse,
     tokenCounter,
     indexTokenCountMap,
     calibrationRatio,
@@ -434,6 +445,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     super();
     this.runId = runId;
     this.signal = signal;
+    this.langfuse = langfuse;
 
     if (agents.length === 0) {
       throw new Error('At least one agent configuration is required');
@@ -743,6 +755,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     const toolDefinitions = agentContext?.toolDefinitions;
     const eventDrivenMode =
       toolDefinitions != null && toolDefinitions.length > 0;
+    const traceToolNode = shouldTraceToolNodeForLangfuse({
+      runLangfuse: this.langfuse,
+      agentLangfuse: agentContext?.langfuse,
+    });
 
     if (eventDrivenMode) {
       const schemaTools = createSchemaOnlyTools(toolDefinitions);
@@ -770,6 +786,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       const node = new CustomToolNode<t.BaseGraphState>({
         tools: allTools,
         toolMap: allToolMap,
+        trace: traceToolNode,
+        runLangfuse: this.langfuse,
+        agentLangfuse: agentContext?.langfuse,
         eventDrivenMode: true,
         sessions: this.sessions,
         toolDefinitions: toolDefMap,
@@ -815,6 +834,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     const node = new CustomToolNode<t.BaseGraphState>({
       tools: allTraditionalTools,
       toolMap: traditionalToolMap,
+      trace: traceToolNode,
+      runLangfuse: this.langfuse,
+      agentLangfuse: agentContext?.langfuse,
       toolCallStepIds: this.toolCallStepIds,
       errorHandler: (data, metadata): Promise<void> =>
         StandardGraph.handleToolCallErrorStatic(this, data, metadata),
@@ -1338,8 +1360,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         { force: true }
       );
 
+      const langfuse = resolveLangfuseConfig(
+        this.langfuse,
+        agentContext.langfuse
+      );
       const langfuseHandler = createLangfuseHandler({
-        langfuse: agentContext.langfuse,
+        langfuse,
         userId: config.configurable?.user_id as string | undefined,
         sessionId: config.configurable?.thread_id as string | undefined,
         traceMetadata: createLangfuseTraceMetadata({
@@ -1358,24 +1384,34 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         : config;
 
       try {
-        result = await attemptInvoke(
-          {
-            model: (this.overrideModel ?? model) as t.ChatModel,
-            messages: finalMessages,
-            provider: agentContext.provider,
-            context: this,
-          },
-          invokeConfig
+        result = await withLangfuseToolOutputTracingConfig(
+          this.langfuse,
+          () =>
+            attemptInvoke(
+              {
+                model: (this.overrideModel ?? model) as t.ChatModel,
+                messages: finalMessages,
+                provider: agentContext.provider,
+                context: this,
+              },
+              invokeConfig
+            ),
+          agentContext.langfuse
         );
       } catch (primaryError) {
-        result = await tryFallbackProviders({
-          fallbacks,
-          tools: agentContext.tools,
-          messages: finalMessages,
-          config: invokeConfig,
-          primaryError,
-          context: this,
-        });
+        result = await withLangfuseToolOutputTracingConfig(
+          this.langfuse,
+          () =>
+            tryFallbackProviders({
+              fallbacks,
+              tools: agentContext.tools,
+              messages: finalMessages,
+              config: invokeConfig,
+              primaryError,
+              context: this,
+            }),
+          agentContext.langfuse
+        );
       } finally {
         await disposeLangfuseHandler(langfuseHandler);
       }
@@ -1599,6 +1635,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           parentHandlerRegistry: getParentHandlerRegistry,
           parentRunId: this.runId ?? '',
           parentAgentId: agentContext.agentId,
+          langfuse: this.langfuse,
           tokenCounter: agentContext.tokenCounter,
           maxDepth: effectiveSubagentDepth,
           createChildGraph: (input): StandardGraph => {

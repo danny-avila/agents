@@ -213,6 +213,7 @@ export type SubagentExecutorOptions = {
   hookRegistry?: HookRegistry;
   parentRunId: string;
   parentAgentId?: string;
+  langfuse?: StandardGraphInput['langfuse'];
   tokenCounter?: TokenCounter;
   /** Remaining nesting budget. 0 or negative blocks execution. */
   maxDepth?: number;
@@ -243,6 +244,7 @@ export class SubagentExecutor {
   private readonly hookRegistry?: HookRegistry;
   private readonly parentRunId: string;
   private readonly parentAgentId?: string;
+  private readonly langfuse?: StandardGraphInput['langfuse'];
   private readonly tokenCounter?: TokenCounter;
   private readonly maxDepth: number;
   private readonly createChildGraph: ChildGraphFactory;
@@ -256,6 +258,7 @@ export class SubagentExecutor {
     this.hookRegistry = options.hookRegistry;
     this.parentRunId = options.parentRunId;
     this.parentAgentId = options.parentAgentId;
+    this.langfuse = options.langfuse;
     this.tokenCounter = options.tokenCounter;
     this.maxDepth = options.maxDepth ?? 1;
     this.createChildGraph = options.createChildGraph;
@@ -352,18 +355,20 @@ export class SubagentExecutor {
       runId: childRunId,
       signal: this.parentSignal,
       agents: [childInputs],
+      langfuse: this.langfuse,
       tokenCounter: this.tokenCounter,
     });
 
-    const forwarding = forwardingEnabled
-      ? this.createForwarderCallback({
+    let forwarding: ForwarderCallback | undefined;
+    if (forwardingEnabled) {
+      forwarding = this.createForwarderCallback({
         parentRegistry: parentRegistry!,
         subagentType,
         subagentAgentId: childAgentId,
         childRunId,
         parentToolCallId,
-      })
-      : undefined;
+      });
+    }
     const forwarder = forwarding?.handler;
 
     if (forwarder) {
@@ -444,7 +449,7 @@ export class SubagentExecutor {
       );
     } catch (error) {
       const errorMessage = truncateErrorMessage(error);
-      if (forwarder) {
+      if (forwarding) {
         await forwarding.drain();
         await this.emitSubagentUpdate(parentRegistry!, {
           childRunId,
@@ -491,7 +496,7 @@ export class SubagentExecutor {
       });
     }
 
-    if (forwarder) {
+    if (forwarding) {
       await forwarding.drain();
       await this.emitSubagentUpdate(parentRegistry!, {
         childRunId,

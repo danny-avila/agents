@@ -41,6 +41,7 @@ import {
 import { safeDispatchCustomEvent } from '@/utils/events';
 import { executeHooks } from '@/hooks';
 import { toLangChainContent } from '@/messages/langchain';
+import { withLangfuseToolOutputTracingConfig } from '@/langfuseToolOutputTracing';
 import { Constants, GraphEvents, CODE_EXECUTION_TOOLS } from '@/common';
 import {
   buildReferenceKey,
@@ -394,6 +395,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private loadRuntimeTools?: t.ToolRefGenerator;
   handleToolErrors = true;
   trace = false;
+  private runLangfuse?: t.LangfuseConfig;
+  private agentLangfuse?: t.LangfuseConfig;
   toolCallStepIds?: Map<string, string>;
   errorHandler?: t.ToolNodeConstructorParams['errorHandler'];
   private toolUsageCount: Map<string, number>;
@@ -473,6 +476,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     toolMap,
     name,
     tags,
+    trace,
+    runLangfuse,
+    agentLangfuse,
     errorHandler,
     toolCallStepIds,
     handleToolErrors,
@@ -495,6 +501,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     fileCheckpointer,
   }: t.ToolNodeConstructorParams) {
     super({ name, tags, func: (input, config) => this.run(input, config) });
+    this.trace = trace ?? this.trace;
+    this.runLangfuse = runLangfuse;
+    this.agentLangfuse = agentLangfuse;
     this.toolMap = toolMap ?? new Map(tools.map((tool) => [tool.name, tool]));
     this.toolCallStepIds = toolCallStepIds;
     this.handleToolErrors = handleToolErrors ?? this.handleToolErrors;
@@ -543,6 +552,19 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         maxTotalSize: toolOutputReferences.maxTotalSize,
       });
     }
+  }
+
+  override async invoke(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    input: any,
+    options?: Partial<RunnableConfig>
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  ): Promise<any> {
+    return withLangfuseToolOutputTracingConfig(
+      this.runLangfuse,
+      () => super.invoke(input, options),
+      this.agentLangfuse
+    );
   }
 
   /**
@@ -2140,13 +2162,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
         /**
          * `interrupt()` reads the current `RunnableConfig` from
-         * AsyncLocalStorage, but our `RunnableCallable` sets
-         * `trace = false` for ToolNode (intentional — avoids LangSmith
-         * tracing per tool call). Without the trace path, the upstream
-         * `runWithConfig` frame is never established, so we re-anchor
-         * here using the node's own `config` — Pregel hands us a
-         * config that already carries every checkpoint/scratchpad key
-         * `interrupt()` needs to suspend and resume.
+         * AsyncLocalStorage. ToolNode usually runs with tracing disabled
+         * (unless Langfuse explicitly enables it), so the upstream
+         * `runWithConfig` frame may not exist. Re-anchor here using the
+         * node's own `config` — Pregel hands us a config that already
+         * carries every checkpoint/scratchpad key `interrupt()` needs to
+         * suspend and resume.
          */
         const resumeValue = AsyncLocalStorageProviderSingleton.runWithConfig(
           config,

@@ -106,4 +106,18 @@ describe('Langfuse trace metadata includes agentName', () => {
 
     expect(MockedCallbackHandler).not.toHaveBeenCalled();
   });
+
+  it('keeps env Langfuse enabled for redaction-only agent config', async () => {
+    const run = await createTestRun('DWAINE', {
+      langfuse: {
+        toolOutputTracing: { enabled: false },
+      },
+    });
+    await run.processStream(
+      { messages: [] },
+      { configurable: { thread_id: 't1', user_id: 'u1' }, version: 'v2' }
+    );
+
+    expect(MockedCallbackHandler).toHaveBeenCalledTimes(1);
+  });
 });

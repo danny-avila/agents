@@ -45,6 +45,10 @@ import {
   hasLangfuseEnvConfig,
   isLangfuseCallbackHandler,
 } from '@/langfuse';
+import {
+  resolveLangfuseConfig,
+  withLangfuseToolOutputTracingConfig,
+} from '@/langfuseToolOutputTracing';
 import type { HookRegistry } from '@/hooks';
 
 export const defaultOmitOptions = new Set([
@@ -120,6 +124,7 @@ export class Run<_T extends t.BaseGraphState> {
   private handlerRegistry?: HandlerRegistry;
   private hookRegistry?: HookRegistry;
   private humanInTheLoop?: t.HumanInTheLoopConfig;
+  private langfuse?: t.LangfuseConfig;
   private toolOutputReferences?: t.ToolOutputReferencesConfig;
   private eagerEventToolExecution?: t.EagerEventToolExecutionConfig;
   private toolExecution?: t.ToolExecutionConfig;
@@ -166,6 +171,7 @@ export class Run<_T extends t.BaseGraphState> {
     this.handlerRegistry = handlerRegistry;
     this.hookRegistry = config.hooks;
     this.humanInTheLoop = config.humanInTheLoop;
+    this.langfuse = config.langfuse;
     this.toolOutputReferences = config.toolOutputReferences;
     this.eagerEventToolExecution = config.eagerEventToolExecution;
     this.toolExecution = config.toolExecution;
@@ -238,6 +244,7 @@ export class Run<_T extends t.BaseGraphState> {
       signal,
       runId: this.id,
       agents: [agentConfig],
+      langfuse: this.langfuse,
       tokenCounter: this.tokenCounter,
       indexTokenCountMap: this.indexTokenCountMap,
       calibrationRatio: this.calibrationRatio,
@@ -264,6 +271,7 @@ export class Run<_T extends t.BaseGraphState> {
       runId: this.id,
       agents,
       edges,
+      langfuse: this.langfuse,
       tokenCounter: this.tokenCounter,
       indexTokenCountMap: this.indexTokenCountMap,
       calibrationRatio: this.calibrationRatio,
@@ -546,6 +554,18 @@ export class Run<_T extends t.BaseGraphState> {
     };
   }
 
+  private shouldClearHookSession(streamThrew: boolean): boolean {
+    return (
+      this._interrupt == null || this._haltedReason != null || streamThrew
+    );
+  }
+
+  private isAwaitingResume(streamThrew: boolean): boolean {
+    return (
+      this._interrupt != null && this._haltedReason == null && !streamThrew
+    );
+  }
+
   async processStream(
     inputs: t.IState | Command,
     callerConfig: Partial<RunnableConfig> & {
@@ -564,6 +584,8 @@ export class Run<_T extends t.BaseGraphState> {
         'Graph not initialized. Make sure to use Run.create() to instantiate the Run.'
       );
     }
+    const graphRunnable = this.graphRunnable;
+    const graph = this.Graph;
 
     /**
      * `Command` inputs (currently only `Command({ resume })`) are
@@ -596,7 +618,7 @@ export class Run<_T extends t.BaseGraphState> {
      * boundary.
      */
     if (!isResume) {
-      this.Graph.resetValues(streamOptions?.keepContent);
+      graph.resetValues(streamOptions?.keepContent);
     }
     this._interrupt = undefined;
     this._haltedReason = undefined;
@@ -619,10 +641,12 @@ export class Run<_T extends t.BaseGraphState> {
       streamCallbacks ? [streamCallbacks, customHandler] : [customHandler]
     );
 
-    if (
-      hasLangfuseEnvConfig() &&
-      !hasExplicitLangfuseConfig(this.Graph.agentContexts.values())
-    ) {
+    const hasExplicitLangfuse =
+      this.langfuse?.enabled === true ||
+      this.langfuse?.enabled === false ||
+      hasExplicitLangfuseConfig(graph.agentContexts.values());
+    const primaryContext = graph.agentContexts.get(graph.defaultAgentId);
+    if (hasLangfuseEnvConfig() && !hasExplicitLangfuse) {
       const userId =
         typeof config.configurable?.user_id === 'string'
           ? config.configurable.user_id
@@ -631,9 +655,6 @@ export class Run<_T extends t.BaseGraphState> {
         typeof config.configurable?.thread_id === 'string'
           ? config.configurable.thread_id
           : undefined;
-      const primaryContext = this.Graph.agentContexts.get(
-        this.Graph.defaultAgentId
-      );
       const traceMetadata = createLangfuseTraceMetadata({
         messageId: this.id,
         parentMessageId: config.configurable?.requestBody?.parentMessageId,
@@ -672,25 +693,6 @@ export class Run<_T extends t.BaseGraphState> {
     }
 
     /**
-     * `streamEvents` accepts both state inputs and `Command` (resume) at
-     * runtime, but our `CompiledStateWorkflow` type narrows the first
-     * arg to `BaseGraphState`. Cast on the call so the resume path
-     * type-checks without widening the wrapper for every caller.
-     */
-    const stream = this.graphRunnable.streamEvents(inputs as t.IState, config, {
-      raiseError: true,
-      /**
-       * Prevent EventStreamCallbackHandler from processing custom events.
-       * Custom events are already handled via our createCustomEventCallback()
-       * which routes them through the handlerRegistry.
-       * Without this flag, EventStreamCallbackHandler throws errors when
-       * custom events are dispatched for run IDs not in its internal map
-       * (due to timing issues in parallel execution or after run cleanup).
-       */
-      ignoreCustomEvent: true,
-    });
-
-    /**
      * Tracks whether the stream loop threw. Used by the `finally`
      * block to decide whether to honor the interrupt-preservation
      * guard for session hooks: a captured `_interrupt` is only
@@ -701,7 +703,26 @@ export class Run<_T extends t.BaseGraphState> {
      */
     let streamThrew = false;
 
-    try {
+    const consumeStream = async (): Promise<void> => {
+      /**
+       * `streamEvents` accepts both state inputs and `Command` (resume) at
+       * runtime, but our `CompiledStateWorkflow` type narrows the first
+       * arg to `BaseGraphState`. Cast on the call so the resume path
+       * type-checks without widening the wrapper for every caller.
+       */
+      const stream = graphRunnable.streamEvents(inputs as t.IState, config, {
+        raiseError: true,
+        /**
+         * Prevent EventStreamCallbackHandler from processing custom events.
+         * Custom events are already handled via our createCustomEventCallback()
+         * which routes them through the handlerRegistry.
+         * Without this flag, EventStreamCallbackHandler throws errors when
+         * custom events are dispatched for run IDs not in its internal map
+         * (due to timing issues in parallel execution or after run cleanup).
+         */
+        ignoreCustomEvent: true,
+      });
+
       for await (const event of stream) {
         const { data, metadata, ...info } = event;
 
@@ -797,9 +818,8 @@ export class Run<_T extends t.BaseGraphState> {
             hook_event_name: 'Stop',
             runId: this.id,
             threadId,
-            agentId: this.Graph.defaultAgentId,
-            messages:
-              this.Graph.getRunMessages() ?? stateInputs?.messages ?? [],
+            agentId: graph.defaultAgentId,
+            messages: graph.getRunMessages() ?? stateInputs?.messages ?? [],
             stopHookActive: false, // will be true when stop is triggered by a hook (Phase 2)
           },
           sessionId: this.id,
@@ -807,6 +827,10 @@ export class Run<_T extends t.BaseGraphState> {
           /* Stop hook errors must not masquerade as stream failures */
         });
       }
+    };
+
+    try {
+      await withLangfuseToolOutputTracingConfig(this.langfuse, consumeStream);
     } catch (err) {
       streamThrew = true;
       if (this.hookRegistry?.hasHookFor('StopFailure', this.id) === true) {
@@ -842,11 +866,7 @@ export class Run<_T extends t.BaseGraphState> {
        * expected, sessions must drop). Every state where no resume
        * is expected clears.
        */
-      if (
-        this._interrupt == null ||
-        this._haltedReason != null ||
-        streamThrew
-      ) {
+      if (this.shouldClearHookSession(streamThrew)) {
         this.hookRegistry?.clearSession(this.id);
       }
       /**
@@ -915,8 +935,7 @@ export class Run<_T extends t.BaseGraphState> {
        * Run from scratch) is a separate concern; see
        * `HumanInTheLoopConfig` JSDoc.
        */
-      const awaitingResume =
-        this._interrupt != null && this._haltedReason == null && !streamThrew;
+      const awaitingResume = this.isAwaitingResume(streamThrew);
       if (!this.skipCleanup && !awaitingResume) {
         this.Graph.clearHeavyState();
       }
@@ -1173,17 +1192,22 @@ export class Run<_T extends t.BaseGraphState> {
           ? chainOptions.configurable.thread_id
           : undefined;
       const hasExplicitLangfuse =
-        this.Graph != null &&
-        hasExplicitLangfuseConfig(this.Graph.agentContexts.values());
-      if (titleContext?.langfuse != null) {
-        titleLangfuseHandler = createLangfuseHandler({
-          langfuse: titleContext.langfuse,
-          userId,
-          sessionId,
-          traceMetadata,
-          tags: ['librechat', 'title'],
-        });
-      } else if (hasLangfuseEnvConfig() && !hasExplicitLangfuse) {
+        this.langfuse?.enabled === true ||
+        this.langfuse?.enabled === false ||
+        (this.Graph != null &&
+          hasExplicitLangfuseConfig(this.Graph.agentContexts.values()));
+      titleLangfuseHandler = createLangfuseHandler({
+        langfuse: resolveLangfuseConfig(this.langfuse, titleContext?.langfuse),
+        userId,
+        sessionId,
+        traceMetadata,
+        tags: ['librechat', 'title'],
+      });
+      if (
+        titleLangfuseHandler == null &&
+        hasLangfuseEnvConfig() &&
+        !hasExplicitLangfuse
+      ) {
         titleLangfuseHandler = createLegacyLangfuseHandler({
           userId,
           sessionId,
@@ -1263,9 +1287,14 @@ export class Run<_T extends t.BaseGraphState> {
 
     try {
       try {
-        return await fullChain.invoke(
-          { input: inputText, output: response },
-          invokeConfig
+        return await withLangfuseToolOutputTracingConfig(
+          this.langfuse,
+          () =>
+            fullChain.invoke(
+              { input: inputText, output: response },
+              invokeConfig
+            ),
+          titleContext?.langfuse
         );
       } catch (_e) {
         // Fallback: strip callbacks to avoid EventStream tracer errors in certain environments
@@ -1278,9 +1307,14 @@ export class Run<_T extends t.BaseGraphState> {
         const safeConfig = Object.assign({}, rest, {
           callbacks: langfuseHandler ? [langfuseHandler] : [],
         });
-        return await fullChain.invoke(
-          { input: inputText, output: response },
-          safeConfig as Partial<RunnableConfig>
+        return await withLangfuseToolOutputTracingConfig(
+          this.langfuse,
+          () =>
+            fullChain.invoke(
+              { input: inputText, output: response },
+              safeConfig as Partial<RunnableConfig>
+            ),
+          titleContext?.langfuse
         );
       }
     } finally {

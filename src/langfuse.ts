@@ -1,5 +1,5 @@
 import { CallbackHandler } from '@langfuse/langchain';
-import { isDefaultExportSpan, LangfuseSpanProcessor } from '@langfuse/otel';
+import { isDefaultExportSpan } from '@langfuse/otel';
 import {
   LangfuseOtelSpanAttributes,
   createObservationAttributes,
@@ -7,10 +7,12 @@ import {
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
 import { BasicTracerProvider } from '@opentelemetry/sdk-trace-base';
 import { SpanStatusCode } from '@opentelemetry/api';
+import { createLangfuseSpanProcessor } from '@/langfuseToolOutputTracing';
 import type { Serialized } from '@langchain/core/load/serializable';
 import type { BaseMessage } from '@langchain/core/messages';
 import type { LLMResult } from '@langchain/core/outputs';
 import type { Attributes, Span } from '@opentelemetry/api';
+import type { SpanProcessor } from '@opentelemetry/sdk-trace-base';
 import type * as t from '@/types';
 import { isPresent } from '@/utils/misc';
 
@@ -185,7 +187,7 @@ export class LangfuseAgentCallbackHandler extends BaseCallbackHandler {
   name = 'librechat_langfuse_agent_handler';
 
   private readonly provider: BasicTracerProvider;
-  private readonly processor: LangfuseSpanProcessor;
+  private readonly processor: SpanProcessor;
   private readonly userId?: string;
   private readonly sessionId?: string;
   private readonly traceMetadata?: LangfuseTraceMetadata;
@@ -204,19 +206,23 @@ export class LangfuseAgentCallbackHandler extends BaseCallbackHandler {
     this.sessionId = sessionId;
     this.traceMetadata = traceMetadata;
     this.tags = tags;
-    this.processor = new LangfuseSpanProcessor({
-      publicKey: langfuse.publicKey,
-      secretKey: langfuse.secretKey,
-      ...(isPresent(langfuse.baseUrl) ? { baseUrl: langfuse.baseUrl } : {}),
-      environment:
-        process.env.LANGFUSE_TRACING_ENVIRONMENT ??
-        process.env.NODE_ENV ??
-        'development',
-      exportMode: 'immediate',
-      shouldExportSpan: ({ otelSpan }): boolean =>
-        isDefaultExportSpan(otelSpan) ||
-        otelSpan.instrumentationScope.name === LANGFUSE_TRACER_NAME,
-    });
+    this.processor = createLangfuseSpanProcessor(
+      {
+        publicKey: langfuse.publicKey,
+        secretKey: langfuse.secretKey,
+        ...(isPresent(langfuse.baseUrl) ? { baseUrl: langfuse.baseUrl } : {}),
+        environment:
+          process.env.LANGFUSE_TRACING_ENVIRONMENT ??
+          process.env.NODE_ENV ??
+          'development',
+        exportMode: 'immediate',
+        shouldExportSpan: ({ otelSpan }): boolean =>
+          isDefaultExportSpan(otelSpan) ||
+          otelSpan.instrumentationScope.name === LANGFUSE_TRACER_NAME,
+      },
+      undefined,
+      langfuse
+    );
     this.provider = new BasicTracerProvider({
       spanProcessors: [this.processor],
     });
@@ -412,7 +418,12 @@ export function hasExplicitLangfuseConfig(
   contexts: Iterable<{ langfuse?: t.LangfuseConfig }>
 ): boolean {
   for (const context of contexts) {
-    if (context.langfuse != null) {
+    if (
+      context.langfuse?.enabled != null ||
+      isPresent(context.langfuse?.publicKey) ||
+      isPresent(context.langfuse?.secretKey) ||
+      isPresent(context.langfuse?.baseUrl)
+    ) {
       return true;
     }
   }
