@@ -1,17 +1,52 @@
-import { NodeSDK } from '@opentelemetry/sdk-node';
 import { LangfuseSpanProcessor } from '@langfuse/otel';
-import { isPresent } from '@/utils/misc';
+import { setLangfuseTracerProvider } from '@langfuse/tracing';
+import { BasicTracerProvider } from '@opentelemetry/sdk-trace-base';
+import { context, ROOT_CONTEXT, createContextKey } from '@opentelemetry/api';
+import { AsyncLocalStorageContextManager } from '@opentelemetry/context-async-hooks';
+import { hasLangfuseEnvConfig } from '@/langfuse';
 
-if (
-  isPresent(process.env.LANGFUSE_SECRET_KEY) &&
-  isPresent(process.env.LANGFUSE_PUBLIC_KEY) &&
-  isPresent(process.env.LANGFUSE_BASE_URL ?? process.env.LANGFUSE_BASEURL)
-) {
+let langfuseTracerProvider: BasicTracerProvider | undefined;
+const contextManagerProbeKey = createContextKey(
+  'langfuse-context-manager-probe'
+);
+
+function hasActiveContextManager(): boolean {
+  return context.with(
+    ROOT_CONTEXT.setValue(contextManagerProbeKey, true),
+    () => context.active().getValue(contextManagerProbeKey) === true
+  );
+}
+
+export function ensureOpenTelemetryContextManager(): void {
+  if (hasActiveContextManager()) {
+    return;
+  }
+
+  const contextManager = new AsyncLocalStorageContextManager();
+  contextManager.enable();
+  if (!context.setGlobalContextManager(contextManager)) {
+    contextManager.disable();
+  }
+}
+
+export function initializeLangfuseTracingFromEnv():
+  | BasicTracerProvider
+  | undefined {
+  if (langfuseTracerProvider != null) {
+    return langfuseTracerProvider;
+  }
+  if (!hasLangfuseEnvConfig()) {
+    return undefined;
+  }
+
+  ensureOpenTelemetryContextManager();
   const langfuseSpanProcessor = new LangfuseSpanProcessor();
-
-  const sdk = new NodeSDK({
+  langfuseTracerProvider = new BasicTracerProvider({
     spanProcessors: [langfuseSpanProcessor],
   });
 
-  sdk.start();
+  setLangfuseTracerProvider(langfuseTracerProvider);
+  return langfuseTracerProvider;
 }
+
+initializeLangfuseTracingFromEnv();
