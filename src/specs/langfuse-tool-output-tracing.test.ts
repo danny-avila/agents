@@ -114,7 +114,6 @@ describe('Langfuse tool output tracing redaction', () => {
           enabled: true,
           publicKey: 'pk-run',
           secretKey: 'sk-run',
-          baseUrl: 'https://langfuse.test',
         },
       })
     ).toBe(true);
@@ -145,6 +144,26 @@ describe('Langfuse tool output tracing redaction', () => {
         runLangfuse: { toolNodeTracing: { enabled: false } },
       })
     ).toBe(false);
+  });
+
+  it('lets agent Langfuse enablement override disabled run defaults for ToolNode tracing', () => {
+    delete process.env.LANGFUSE_SECRET_KEY;
+    delete process.env.LANGFUSE_PUBLIC_KEY;
+    delete process.env.LANGFUSE_BASE_URL;
+
+    expect(
+      shouldTraceToolNodeForLangfuse({
+        runLangfuse: {
+          enabled: false,
+        },
+        agentLangfuse: {
+          enabled: true,
+          publicKey: 'pk-agent',
+          secretKey: 'sk-agent',
+          baseUrl: 'https://langfuse.test',
+        },
+      })
+    ).toBe(true);
   });
 
   it('redacts raw tool observation output when tool output tracing is disabled', () => {

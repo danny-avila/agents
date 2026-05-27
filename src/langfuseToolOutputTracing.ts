@@ -16,8 +16,10 @@ export const LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT = '[tool output redacted]';
 const langfuseToolOutputTracingConfigKey = createContextKey(
   'librechat.langfuse.tool-output-tracing'
 );
+const langfuseConfigKey = createContextKey('librechat.langfuse.config');
 const toolOutputTracingStorage =
   new AsyncLocalStorage<ResolvedLangfuseToolOutputTracingConfig>();
+const langfuseConfigStorage = new AsyncLocalStorage<t.LangfuseConfig>();
 
 const CHAT_ROLES = new Set([
   'assistant',
@@ -498,6 +500,18 @@ function getContextToolOutputTracingConfig(
     : undefined;
 }
 
+export function getContextLangfuseConfig(
+  activeContext: Context
+): t.LangfuseConfig | undefined {
+  const asyncConfig = langfuseConfigStorage.getStore();
+  if (asyncConfig != null) {
+    return asyncConfig;
+  }
+
+  const value = activeContext.getValue(langfuseConfigKey);
+  return isRecord(value) ? (value as t.LangfuseConfig) : undefined;
+}
+
 class ToolOutputRedactingLangfuseSpanProcessor implements SpanProcessor {
   private readonly processor: LangfuseSpanProcessor;
   private readonly fallbackConfig?: ResolvedLangfuseToolOutputTracingConfig;
@@ -516,7 +530,7 @@ class ToolOutputRedactingLangfuseSpanProcessor implements SpanProcessor {
 
   onStart(span: Span, parentContext: Context): void {
     const config =
-      this.fallbackConfig ?? getContextToolOutputTracingConfig(parentContext);
+      getContextToolOutputTracingConfig(parentContext) ?? this.fallbackConfig;
     if (config != null) {
       this.spanConfigs.set(span, config);
     }
@@ -559,27 +573,44 @@ export function withLangfuseToolOutputTracingConfig<T>(
   action: () => T,
   agentLangfuse?: t.LangfuseConfig
 ): T {
-  if (
+  const langfuse = resolveLangfuseConfig(runLangfuse, agentLangfuse);
+  const hasNoToolOutputConfig =
     runLangfuse?.toolOutputTracing == null &&
-    agentLangfuse?.toolOutputTracing == null
-  ) {
+    agentLangfuse?.toolOutputTracing == null;
+
+  if (langfuse == null && hasNoToolOutputConfig) {
     return action();
   }
 
-  const config = resolveToolOutputTracingConfig(runLangfuse, agentLangfuse);
-  const activeContext = context
-    .active()
-    .setValue(langfuseToolOutputTracingConfigKey, config);
-  return toolOutputTracingStorage.run(config, () =>
-    context.with(activeContext, action)
-  );
+  const config = hasNoToolOutputConfig
+    ? undefined
+    : resolveToolOutputTracingConfig(runLangfuse, agentLangfuse);
+  let activeContext = context.active();
+  if (langfuse != null) {
+    activeContext = activeContext.setValue(langfuseConfigKey, langfuse);
+  }
+  if (config != null) {
+    activeContext = activeContext.setValue(
+      langfuseToolOutputTracingConfigKey,
+      config
+    );
+  }
+
+  const runWithContext = (): T => context.with(activeContext, action);
+  const runWithToolOutputConfig = (): T =>
+    config != null
+      ? toolOutputTracingStorage.run(config, runWithContext)
+      : runWithContext();
+
+  return langfuse != null
+    ? langfuseConfigStorage.run(langfuse, runWithToolOutputConfig)
+    : runWithToolOutputConfig();
 }
 
 function hasLangfuseEnvKeys(): boolean {
   return (
     isPresent(process.env.LANGFUSE_SECRET_KEY) &&
-    isPresent(process.env.LANGFUSE_PUBLIC_KEY) &&
-    isPresent(process.env.LANGFUSE_BASE_URL ?? process.env.LANGFUSE_BASEURL)
+    isPresent(process.env.LANGFUSE_PUBLIC_KEY)
   );
 }
 
@@ -589,9 +620,7 @@ function hasLangfuseConfigKeys(langfuse?: t.LangfuseConfig): boolean {
   }
   return (
     isPresent(langfuse.secretKey) &&
-    isPresent(langfuse.publicKey) &&
-    (isPresent(langfuse.baseUrl) ||
-      isPresent(process.env.LANGFUSE_BASE_URL ?? process.env.LANGFUSE_BASEURL))
+    isPresent(langfuse.publicKey)
   );
 }
 
@@ -602,25 +631,20 @@ export function shouldTraceToolNodeForLangfuse({
   runLangfuse?: t.LangfuseConfig;
   agentLangfuse?: t.LangfuseConfig;
 }): boolean {
-  const explicit =
-    agentLangfuse?.toolNodeTracing?.enabled ??
-    runLangfuse?.toolNodeTracing?.enabled;
+  const langfuse = resolveLangfuseConfig(runLangfuse, agentLangfuse);
+  const explicit = langfuse?.toolNodeTracing?.enabled;
   if (explicit != null) {
     return (
       explicit &&
-      (hasLangfuseConfigKeys(resolveLangfuseConfig(runLangfuse, agentLangfuse)) ||
-        hasLangfuseEnvKeys())
+      (hasLangfuseConfigKeys(langfuse) || hasLangfuseEnvKeys())
     );
   }
 
-  if (agentLangfuse?.enabled === false || runLangfuse?.enabled === false) {
+  if (langfuse?.enabled === false) {
     return false;
   }
 
-  return (
-    hasLangfuseConfigKeys(resolveLangfuseConfig(runLangfuse, agentLangfuse)) ||
-    hasLangfuseEnvKeys()
-  );
+  return hasLangfuseConfigKeys(langfuse) || hasLangfuseEnvKeys();
 }
 
 export function resolveLangfuseConfig(
@@ -634,16 +658,26 @@ export function resolveLangfuseConfig(
     return runLangfuse;
   }
 
+  const toolNodeTracing =
+    runLangfuse.toolNodeTracing != null || agentLangfuse.toolNodeTracing != null
+      ? {
+        ...runLangfuse.toolNodeTracing,
+        ...agentLangfuse.toolNodeTracing,
+      }
+      : undefined;
+  const toolOutputTracing =
+    runLangfuse.toolOutputTracing != null ||
+    agentLangfuse.toolOutputTracing != null
+      ? {
+        ...runLangfuse.toolOutputTracing,
+        ...agentLangfuse.toolOutputTracing,
+      }
+      : undefined;
+
   return {
     ...runLangfuse,
     ...agentLangfuse,
-    toolNodeTracing: {
-      ...runLangfuse.toolNodeTracing,
-      ...agentLangfuse.toolNodeTracing,
-    },
-    toolOutputTracing: {
-      ...runLangfuse.toolOutputTracing,
-      ...agentLangfuse.toolOutputTracing,
-    },
+    ...(toolNodeTracing != null ? { toolNodeTracing } : {}),
+    ...(toolOutputTracing != null ? { toolOutputTracing } : {}),
   };
 }

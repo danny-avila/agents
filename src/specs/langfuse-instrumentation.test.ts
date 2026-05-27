@@ -33,6 +33,16 @@ type BasicTracerProviderInput = {
     shutdown?: unknown;
   }>;
 };
+type RoutingSpanProcessorForTest = BasicTracerProviderInput['spanProcessors'][0] & {
+  processors: Map<
+    string,
+    {
+      fallbackConfig?: {
+        enabled?: boolean;
+      };
+    }
+  >;
+};
 const mockBasicTracerProvider = jest.fn(
   (_input?: BasicTracerProviderInput) => mockTracerProvider
 );
@@ -173,7 +183,7 @@ describe('Langfuse instrumentation', () => {
     expect(mockBasicTracerProvider).toHaveBeenCalledTimes(1);
   });
 
-  it('creates a new isolated provider when explicit credentials change', async () => {
+  it('does not replace the global provider when explicit credentials change', async () => {
     const { initializeLangfuseTracing } = await import('@/instrumentation');
     initializeLangfuseTracing({
       publicKey: 'pk-first',
@@ -203,8 +213,8 @@ describe('Langfuse instrumentation', () => {
         baseUrl: 'https://langfuse.second',
       })
     );
-    expect(mockBasicTracerProvider).toHaveBeenCalledTimes(2);
-    expect(mockSetLangfuseTracerProvider).toHaveBeenCalledTimes(2);
+    expect(mockBasicTracerProvider).toHaveBeenCalledTimes(1);
+    expect(mockSetLangfuseTracerProvider).toHaveBeenCalledTimes(1);
   });
 
   it('passes explicit redaction config into the redacting processor fallback', async () => {
@@ -218,10 +228,11 @@ describe('Langfuse instrumentation', () => {
 
     const providerInput = mockBasicTracerProvider.mock
       .calls[0][0] as BasicTracerProviderInput;
-    expect(providerInput.spanProcessors[0]).toMatchObject({
-      fallbackConfig: expect.objectContaining({
-        enabled: false,
-      }),
+    const routingProcessor =
+      providerInput.spanProcessors[0] as RoutingSpanProcessorForTest;
+    const childProcessors = Array.from(routingProcessor.processors.values());
+    expect(childProcessors[0]?.fallbackConfig).toMatchObject({
+      enabled: false,
     });
   });
 

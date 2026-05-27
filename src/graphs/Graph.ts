@@ -1371,8 +1371,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       );
       let langfuseHandler: CallbackEntry | undefined;
       let invokeConfig = config;
+      initializeLangfuseTracing(langfuse);
       if (findCallback(config.callbacks, isLangfuseCallbackHandler) == null) {
-        initializeLangfuseTracing(langfuse);
         langfuseHandler = createLangfuseHandler({
           langfuse,
           userId: config.configurable?.user_id as string | undefined,

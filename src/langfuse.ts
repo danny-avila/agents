@@ -17,10 +17,6 @@ type AgentLangfuseHandlerParams = LangfuseHandlerParams & {
   langfuse?: t.LangfuseConfig;
 };
 
-function getEnvLangfuseBaseUrl(): string | undefined {
-  return process.env.LANGFUSE_BASE_URL ?? process.env.LANGFUSE_BASEURL;
-}
-
 function hasLangfuseTracingConfig(langfuse?: t.LangfuseConfig): boolean {
   return (
     langfuse?.toolNodeTracing != null || langfuse?.toolOutputTracing != null
@@ -104,7 +100,7 @@ export function getLangfuseTraceName(
 }
 
 export function hasLangfuseEnvConfig(): boolean {
-  return hasLangfuseEnvCredentials() && isPresent(getEnvLangfuseBaseUrl());
+  return hasLangfuseEnvCredentials();
 }
 
 export function hasLangfuseEnvCredentials(): boolean {

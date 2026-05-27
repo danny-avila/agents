@@ -907,7 +907,7 @@ export class Run<_T extends t.BaseGraphState> {
 
     try {
       await withLangfuseToolOutputTracingConfig(
-        this.langfuse,
+        streamLangfuseConfig,
         consumeStream,
         this.getStreamToolOutputTracingLangfuseConfig(graph)
       );
