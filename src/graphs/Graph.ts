@@ -81,6 +81,7 @@ import {
 import { HandlerRegistry } from '@/events';
 import { ChatOpenAI } from '@/llm/openai';
 import { partitionAndMarkOpenRouterToolCache } from '@/llm/openrouter/toolCache';
+import { partitionAndMarkBedrockToolCache } from '@/llm/bedrock/toolCache';
 import type { HookRegistry } from '@/hooks';
 
 const { AGENT, TOOLS, SUMMARIZE } = GraphNodeKeys;
@@ -959,6 +960,19 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       ) {
         toolsForBinding =
           partitionAndMarkOpenRouterToolCache(
+            rawToolsForBinding,
+            makeIsDeferred(agentContext.toolDefinitions)
+          ) ?? rawToolsForBinding;
+      } else if (
+        agentContext.provider === Providers.BEDROCK &&
+        (
+          agentContext.clientOptions as
+            | t.BedrockAnthropicClientOptions
+            | undefined
+        )?.promptCache === true
+      ) {
+        toolsForBinding =
+          partitionAndMarkBedrockToolCache(
             rawToolsForBinding,
             makeIsDeferred(agentContext.toolDefinitions)
           ) ?? rawToolsForBinding;

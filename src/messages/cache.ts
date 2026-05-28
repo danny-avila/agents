@@ -470,11 +470,11 @@ export function stripBedrockCacheControl<T extends MessageWithContent>(
 }
 
 /**
- * Adds Bedrock Converse API cache points to the last two messages.
+ * Adds Bedrock Converse API cache points to the latest two user messages.
  * Inserts `{ cachePoint: { type: 'default' } }` as a separate content block
  * immediately after the last text block in each targeted message.
  * Strips ALL existing cache control (both Bedrock and Anthropic formats) from all messages,
- * then adds fresh cache points to the last 2 messages in a single backward pass.
+ * then adds fresh cache points to the latest two non-tool user messages in a single backward pass.
  * This ensures we don't accumulate stale cache points across multiple turns.
  * Returns a new array - only clones messages that require modification.
  * @param messages - The array of message objects.
@@ -483,12 +483,12 @@ export function stripBedrockCacheControl<T extends MessageWithContent>(
 export function addBedrockCacheControl<
   T extends MessageWithContent & { getType?: () => string; role?: string },
 >(messages: T[]): T[] {
-  if (!Array.isArray(messages) || messages.length < 2) {
+  if (!Array.isArray(messages) || messages.length === 0) {
     return messages;
   }
 
   const updatedMessages: T[] = [...messages];
-  let messagesModified = 0;
+  let cachePointsAdded = 0;
 
   for (let i = updatedMessages.length - 1; i >= 0; i--) {
     const originalMessage = updatedMessages[i];
@@ -510,21 +510,27 @@ export function addBedrockCacheControl<
     }
 
     const isToolMessage = messageType === 'tool' || messageRole === 'tool';
+    const isUserMessage = messageType === 'human' || messageRole === 'user';
     const content = originalMessage.content;
+    const hasSerializationProps =
+      'lc_kwargs' in originalMessage ||
+      'lc_serializable' in originalMessage ||
+      'lc_namespace' in originalMessage;
     const hasArrayContent = Array.isArray(content);
     const isEmptyString = typeof content === 'string' && content === '';
     const needsCacheAdd =
-      messagesModified < 2 &&
+      cachePointsAdded < 2 &&
+      isUserMessage &&
       !isToolMessage &&
       !isEmptyString &&
       (typeof content === 'string' || hasArrayContent);
 
-    if (!needsCacheAdd && !hasArrayContent) {
+    if (!needsCacheAdd && !hasArrayContent && !hasSerializationProps) {
       continue;
     }
 
-    let workingContent: MessageContentComplex[];
-    let modified = false;
+    let workingContent: string | MessageContentComplex[];
+    let modified = hasSerializationProps;
 
     if (hasArrayContent) {
       // Single pass: clone blocks, strip cache markers, find last
@@ -563,14 +569,16 @@ export function addBedrockCacheControl<
         workingContent.splice(lastNonEmptyTextIndex + 1, 0, {
           cachePoint: { type: 'default' },
         } as MessageContentComplex);
-        messagesModified++;
+        cachePointsAdded++;
       }
     } else if (typeof content === 'string' && needsCacheAdd) {
       workingContent = [
         { type: ContentTypes.TEXT, text: content },
         { cachePoint: { type: 'default' } } as MessageContentComplex,
       ];
-      messagesModified++;
+      cachePointsAdded++;
+    } else if (typeof content === 'string' && hasSerializationProps) {
+      workingContent = content;
     } else {
       continue;
     }

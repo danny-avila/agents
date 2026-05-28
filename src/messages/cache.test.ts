@@ -287,23 +287,28 @@ type TestMsg = {
 };
 
 describe('addBedrockCacheControl (Bedrock cache checkpoints)', () => {
-  it('returns input when not enough messages', () => {
+  it('returns empty input unchanged and caches a single user message', () => {
     const empty: TestMsg[] = [];
     expect(addBedrockCacheControl(empty)).toEqual(empty);
     const single: TestMsg[] = [{ role: 'user', content: 'only' }];
-    expect(addBedrockCacheControl(single)).toEqual(single);
+    expect(addBedrockCacheControl(single)[0].content).toEqual([
+      { type: ContentTypes.TEXT, text: 'only' },
+      { cachePoint: { type: 'default' } },
+    ]);
   });
 
-  it('wraps string content and appends separate cachePoint block', () => {
+  it('wraps latest user string content and appends separate cachePoint block', () => {
     const messages: TestMsg[] = [
       { role: 'user', content: 'Hello' },
       { role: 'assistant', content: [{ type: ContentTypes.TEXT, text: 'Hi' }] },
     ];
     const result = addBedrockCacheControl(messages);
-    const last = result[1].content as MessageContentComplex[];
-    expect(Array.isArray(last)).toBe(true);
-    expect(last[0]).toEqual({ type: ContentTypes.TEXT, text: 'Hi' });
-    expect(last[1]).toEqual({ cachePoint: { type: 'default' } });
+    const user = result[0].content as MessageContentComplex[];
+    const assistant = result[1].content as MessageContentComplex[];
+    expect(Array.isArray(user)).toBe(true);
+    expect(user[0]).toEqual({ type: ContentTypes.TEXT, text: 'Hello' });
+    expect(user[1]).toEqual({ cachePoint: { type: 'default' } });
+    expect(assistant).toEqual([{ type: ContentTypes.TEXT, text: 'Hi' }]);
   });
 
   it('inserts cachePoint after the last text when multiple text blocks exist', () => {
@@ -345,20 +350,21 @@ describe('addBedrockCacheControl (Bedrock cache checkpoints)', () => {
 
     expect(second[0]).toEqual({ type: ContentTypes.TEXT, text: 'Reply A' });
     expect(second[1]).toEqual({ type: ContentTypes.TEXT, text: 'Reply B' });
-    expect(second[2]).toEqual({ cachePoint: { type: 'default' } });
+    expect(second).toHaveLength(2);
   });
 
-  it('skips adding cachePoint when content is an empty array', () => {
+  it('skips empty arrays and caches the latest non-empty user message', () => {
     const messages: TestMsg[] = [
       { role: 'user', content: [] },
       { role: 'assistant', content: [] },
-      { role: 'user', content: 'ignored because only last two are modified' },
+      { role: 'user', content: 'latest cacheable user message' },
     ];
 
     const result = addBedrockCacheControl(messages);
 
     const first = result[0].content as MessageContentComplex[];
     const second = result[1].content as MessageContentComplex[];
+    const third = result[2].content as MessageContentComplex[];
 
     expect(Array.isArray(first)).toBe(true);
     expect(first.length).toBe(0);
@@ -366,39 +372,51 @@ describe('addBedrockCacheControl (Bedrock cache checkpoints)', () => {
     expect(Array.isArray(second)).toBe(true);
     expect(second.length).toBe(0);
     expect(second[0]).not.toEqual({ cachePoint: { type: 'default' } });
+
+    expect(third).toEqual([
+      { type: ContentTypes.TEXT, text: 'latest cacheable user message' },
+      { cachePoint: { type: 'default' } },
+    ]);
   });
 
-  it('skips adding cachePoint when content is an empty string', () => {
+  it('skips empty strings and caches the latest non-empty user message', () => {
     const messages: TestMsg[] = [
       { role: 'user', content: '' },
       { role: 'assistant', content: '' },
-      { role: 'user', content: 'ignored because only last two are modified' },
+      { role: 'user', content: 'latest cacheable user message' },
     ];
 
     const result = addBedrockCacheControl(messages);
 
     expect(result[0].content).toBe('');
     expect(result[1].content).toBe('');
+    expect(result[2].content).toEqual([
+      { type: ContentTypes.TEXT, text: 'latest cacheable user message' },
+      { cachePoint: { type: 'default' } },
+    ]);
   });
 
   /** (I don't think this will ever occur in actual use, but its the only branch left uncovered so I'm covering it */
-  it('skips messages with non-string, non-array content and still modifies the previous to reach two edits', () => {
+  it('skips messages with non-string, non-array content', () => {
     const messages: TestMsg[] = [
       {
         role: 'user',
-        content: [{ type: ContentTypes.TEXT, text: 'Will be modified' }],
+        content: [{ type: ContentTypes.TEXT, text: 'Older user message' }],
       },
       { role: 'assistant', content: undefined },
       {
         role: 'user',
-        content: [{ type: ContentTypes.TEXT, text: 'Also modified' }],
+        content: [{ type: ContentTypes.TEXT, text: 'Latest user message' }],
       },
     ];
 
     const result = addBedrockCacheControl(messages);
 
     const last = result[2].content as MessageContentComplex[];
-    expect(last[0]).toEqual({ type: ContentTypes.TEXT, text: 'Also modified' });
+    expect(last[0]).toEqual({
+      type: ContentTypes.TEXT,
+      text: 'Latest user message',
+    });
     expect(last[1]).toEqual({ cachePoint: { type: 'default' } });
 
     expect(result[1].content).toBeUndefined();
@@ -406,7 +424,7 @@ describe('addBedrockCacheControl (Bedrock cache checkpoints)', () => {
     const first = result[0].content as MessageContentComplex[];
     expect(first[0]).toEqual({
       type: ContentTypes.TEXT,
-      text: 'Will be modified',
+      text: 'Older user message',
     });
     expect(first[1]).toEqual({ cachePoint: { type: 'default' } });
   });
@@ -511,7 +529,7 @@ describe('addBedrockCacheControl (Bedrock cache checkpoints)', () => {
     expect(systemContent[2]).toHaveProperty('cache_control');
   });
 
-  it('skips serialized system messages while adding cache points to non-system turns', () => {
+  it('skips serialized system messages while adding a cache point to the latest user turn', () => {
     const messages: TestMsg[] = [
       {
         role: 'system',
@@ -575,7 +593,7 @@ describe('addBedrockCacheControl (Bedrock cache checkpoints)', () => {
       type: ContentTypes.TEXT,
       text: 'Sure! The capital of France is Paris.',
     });
-    expect(assistant[1]).toEqual({ cachePoint: { type: 'default' } });
+    expect(assistant).toHaveLength(1);
   });
 
   it('is idempotent - calling multiple times does not add duplicate cache points', () => {
@@ -601,12 +619,11 @@ describe('addBedrockCacheControl (Bedrock cache checkpoints)', () => {
     });
     expect(firstContent[1]).toEqual({ cachePoint: { type: 'default' } });
 
-    expect(secondContent.length).toBe(2);
+    expect(secondContent.length).toBe(1);
     expect(secondContent[0]).toEqual({
       type: ContentTypes.TEXT,
       text: 'First response',
     });
-    expect(secondContent[1]).toEqual({ cachePoint: { type: 'default' } });
 
     const result2 = addBedrockCacheControl(result1);
     const firstContentAfter = result2[0].content as MessageContentComplex[];
@@ -619,15 +636,14 @@ describe('addBedrockCacheControl (Bedrock cache checkpoints)', () => {
     });
     expect(firstContentAfter[1]).toEqual({ cachePoint: { type: 'default' } });
 
-    expect(secondContentAfter.length).toBe(2);
+    expect(secondContentAfter.length).toBe(1);
     expect(secondContentAfter[0]).toEqual({
       type: ContentTypes.TEXT,
       text: 'First response',
     });
-    expect(secondContentAfter[1]).toEqual({ cachePoint: { type: 'default' } });
   });
 
-  it('skips messages that already have cache points in multi-agent scenarios', () => {
+  it('strips stale cache points and caches the latest user messages in multi-agent scenarios', () => {
     const messages: TestMsg[] = [
       {
         role: 'user',
@@ -647,8 +663,16 @@ describe('addBedrockCacheControl (Bedrock cache checkpoints)', () => {
     ];
 
     const result = addBedrockCacheControl(messages);
+    const firstContent = result[0].content as MessageContentComplex[];
     const lastContent = result[2].content as MessageContentComplex[];
     const secondLastContent = result[1].content as MessageContentComplex[];
+
+    expect(firstContent.length).toBe(2);
+    expect(firstContent[0]).toEqual({
+      type: ContentTypes.TEXT,
+      text: 'Hello',
+    });
+    expect(firstContent[1]).toEqual({ cachePoint: { type: 'default' } });
 
     expect(lastContent.length).toBe(2);
     expect(lastContent[0]).toEqual({
@@ -657,12 +681,11 @@ describe('addBedrockCacheControl (Bedrock cache checkpoints)', () => {
     });
     expect(lastContent[1]).toEqual({ cachePoint: { type: 'default' } });
 
-    expect(secondLastContent.length).toBe(2);
+    expect(secondLastContent.length).toBe(1);
     expect(secondLastContent[0]).toEqual({
       type: ContentTypes.TEXT,
       text: 'Response from agent 1',
     });
-    expect(secondLastContent[1]).toEqual({ cachePoint: { type: 'default' } });
   });
 
   it('skips cachePoint on AI messages with only whitespace text and reasoning (tool-call scenario)', () => {
@@ -704,6 +727,42 @@ describe('addBedrockCacheControl (Bedrock cache checkpoints)', () => {
     expect(userContent[userContent.length - 1]).toEqual({
       cachePoint: { type: 'default' },
     });
+  });
+
+  it('keeps cachePoint on the stable user boundary through tool loops', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('Use the stable prompt context.'),
+      new AIMessage({
+        content: 'I will call the first tool.',
+        tool_calls: [{ id: 'call_1', name: 'lookup', args: { step: 1 } }],
+      }),
+      new ToolMessage({
+        content: 'volatile tool result 1',
+        tool_call_id: 'call_1',
+      }),
+      new AIMessage({
+        content: 'I will call the second tool.',
+        tool_calls: [{ id: 'call_2', name: 'lookup', args: { step: 2 } }],
+      }),
+      new ToolMessage({
+        content: 'volatile tool result 2',
+        tool_call_id: 'call_2',
+      }),
+    ];
+
+    const result = addBedrockCacheControl(messages);
+
+    const userContent = result[0].content as MessageContentComplex[];
+    expect(userContent[userContent.length - 1]).toEqual({
+      cachePoint: { type: 'default' },
+    });
+
+    for (const message of result.slice(1)) {
+      const content = message.content;
+      expect(
+        Array.isArray(content) && content.some((block) => 'cachePoint' in block)
+      ).toBe(false);
+    }
   });
 });
 
@@ -947,7 +1006,7 @@ describe('Multi-agent provider interoperability', () => {
     expect('cache_control' in secondContent[0]).toBe(false);
 
     expect(firstContent.some((b) => 'cachePoint' in b)).toBe(true);
-    expect(secondContent.some((b) => 'cachePoint' in b)).toBe(true);
+    expect(secondContent.some((b) => 'cachePoint' in b)).toBe(false);
   });
 
   it('strips Bedrock cache using separate function (backwards compat)', () => {
@@ -1142,7 +1201,7 @@ describe('Immutability - addBedrockCacheControl does not mutate original message
     expect(typeof originalMessages[1].content).toBe('string');
 
     expect(Array.isArray(result[0].content)).toBe(true);
-    expect(Array.isArray(result[1].content)).toBe(true);
+    expect(result[1].content).toBe('Hi there');
   });
 
   it('should not mutate original messages when adding cache points to array content', () => {
@@ -1178,9 +1237,9 @@ describe('Immutability - addBedrockCacheControl does not mutate original message
     const resultFirstContent = result[0].content as MessageContentComplex[];
     const resultSecondContent = result[1].content as MessageContentComplex[];
     expect(resultFirstContent.length).toBe(originalFirstContentLength + 1);
-    expect(resultSecondContent.length).toBe(originalSecondContentLength + 1);
+    expect(resultSecondContent.length).toBe(originalSecondContentLength);
     expect(resultFirstContent.some((b) => 'cachePoint' in b)).toBe(true);
-    expect(resultSecondContent.some((b) => 'cachePoint' in b)).toBe(true);
+    expect(resultSecondContent.some((b) => 'cachePoint' in b)).toBe(false);
   });
 
   it('should not mutate original messages when stripping existing cache control', () => {
@@ -1339,13 +1398,13 @@ describe('Multi-turn cache cleanup', () => {
     const lastContent = result[3].content as MessageContentComplex[];
     const secondLastContent = result[2].content as MessageContentComplex[];
 
-    expect(lastContent.some((b) => 'cachePoint' in b)).toBe(true);
+    expect(lastContent.some((b) => 'cachePoint' in b)).toBe(false);
     expect(secondLastContent.some((b) => 'cachePoint' in b)).toBe(true);
 
     const firstContent = result[0].content as MessageContentComplex[];
     const secondContent = result[1].content as MessageContentComplex[];
 
-    expect(firstContent.some((b) => 'cachePoint' in b)).toBe(false);
+    expect(firstContent.some((b) => 'cachePoint' in b)).toBe(true);
     expect(secondContent.some((b) => 'cachePoint' in b)).toBe(false);
   });
 
@@ -1561,14 +1620,14 @@ describe('OpenRouter prompt caching (reuses addCacheControl)', () => {
     const lastUser = converted[2];
 
     expect(Array.isArray(firstUser.content)).toBe(true);
-    expect(
-      (firstUser.content as CacheControlBlock[])[0]
-    ).toHaveProperty('cache_control');
+    expect((firstUser.content as CacheControlBlock[])[0]).toHaveProperty(
+      'cache_control'
+    );
 
     expect(Array.isArray(lastUser.content)).toBe(true);
-    expect(
-      (lastUser.content as CacheControlBlock[])[0]
-    ).toHaveProperty('cache_control');
+    expect((lastUser.content as CacheControlBlock[])[0]).toHaveProperty(
+      'cache_control'
+    );
   });
 
   it('strips Bedrock cache before applying OpenRouter/Anthropic cache', () => {

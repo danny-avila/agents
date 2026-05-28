@@ -28,6 +28,7 @@ import { ChatGenerationChunk, ChatResult } from '@langchain/core/outputs';
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { ChatBedrockConverseInput } from '@langchain/aws';
 import type { BaseMessage, ResponseMetadata } from '@langchain/core/messages';
+import { insertBedrockToolCachePoint } from './toolCache';
 import {
   convertToConverseMessages,
   handleConverseStreamContentBlockStart,
@@ -49,6 +50,11 @@ export type ServiceTierType = 'priority' | 'default' | 'flex' | 'reserved';
  */
 export interface CustomChatBedrockConverseInput
   extends ChatBedrockConverseInput {
+  /**
+   * Enables Bedrock prompt cache checkpoints for message and tool prefixes.
+   */
+  promptCache?: boolean;
+
   /**
    * Application Inference Profile ARN to use for the model.
    * For example, "arn:aws:bedrock:eu-west-1:123456789102:application-inference-profile/fm16bt65tzgx"
@@ -84,6 +90,11 @@ export interface CustomChatBedrockConverseCallOptions {
 
 export class CustomChatBedrockConverse extends ChatBedrockConverse {
   /**
+   * Whether to insert Bedrock prompt cache checkpoints when available.
+   */
+  promptCache?: boolean;
+
+  /**
    * Application Inference Profile ARN to use instead of model ID.
    */
   applicationInferenceProfile?: string;
@@ -95,6 +106,7 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
 
   constructor(fields?: CustomChatBedrockConverseInput) {
     super(fields);
+    this.promptCache = fields?.promptCache;
     this.applicationInferenceProfile = fields?.applicationInferenceProfile;
     this.serviceTier = fields?.serviceTier;
   }
@@ -120,12 +132,17 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
     serviceTier?: { type: ServiceTierType };
   } {
     const baseParams = super.invocationParams(options);
+    const toolConfig =
+      this.promptCache === true
+        ? insertBedrockToolCachePoint(baseParams.toolConfig, true)
+        : baseParams.toolConfig;
 
     /** Service tier from options or fall back to class-level setting */
     const serviceTierType = options?.serviceTier ?? this.serviceTier;
 
     return {
       ...baseParams,
+      toolConfig,
       serviceTier: serviceTierType ? { type: serviceTierType } : undefined,
     };
   }
