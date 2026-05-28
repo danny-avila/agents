@@ -3,8 +3,8 @@ import type { RunnableConfig } from '@langchain/core/runnables';
 import type { BaseReranker } from './rerankers';
 import { DATE_RANGE } from './schema';
 
-export type SearchProvider = 'serper' | 'searxng' | 'tavily';
-export type ScraperProvider = 'firecrawl' | 'serper' | 'tavily';
+export type SearchProvider = 'serper' | 'searxng' | 'tavily' | 'parallel';
+export type ScraperProvider = 'firecrawl' | 'serper' | 'tavily' | 'parallel';
 export type RerankerType = 'infinity' | 'jina' | 'cohere' | 'none';
 
 export interface Highlight {
@@ -106,6 +106,85 @@ export interface TavilySearchPayload {
   chunks_per_source?: number;
 }
 
+/**
+ * Parallel Search API
+ * Docs: https://docs.parallel.ai/api-reference/search/search
+ *
+ * Notes for tool-callers:
+ * - Provide both `objective` and `search_queries` for best results.
+ * - `search_queries` should be 2-3 diverse keyword queries, each 3-6 words; max 5.
+ * - Restrictive options (`include_domains`, `exclude_domains`, `location`,
+ *   `max_results`) can reduce result quality; only use when needed.
+ */
+export interface ParallelSearchOptions {
+  /**
+   * Optional natural-language objective that always accompanies the LLM query.
+   * When set, the runtime objective is `"${objective}\n\n${query}"`.
+   */
+  objective?: string;
+  /** Extra keyword queries appended to the LLM-supplied query. */
+  search_queries?: string[];
+  /**
+   * Search mode preset. `advanced` (default) for highest quality, `basic` for
+   * lower latency on simple lookups. See https://docs.parallel.ai/search/modes.
+   */
+  mode?: 'basic' | 'advanced';
+  /** Upper bound on total characters across excerpts from all results. */
+  max_chars_total?: number;
+  /**
+   * The model generating the request and consuming the results, e.g.
+   * `claude-opus-4-7`. Enables model-specific result tuning.
+   */
+  client_model?: string;
+  /** ISO 3166-1 alpha-2 country code (e.g. `us`, `gb`, `de`). */
+  location?: string;
+  /** Domain restriction list — see Parallel docs. */
+  include_domains?: string[];
+  /** Domain exclusion list — see Parallel docs. */
+  exclude_domains?: string[];
+  /** Upper bound on excerpt size per result. Minimum 1000 chars. */
+  max_chars_per_result?: number;
+  /** Upper bound on number of results. Defaults to 10. */
+  max_results?: number;
+  /** Override request timeout in ms. */
+  timeout?: number;
+}
+
+export interface ParallelSearchPayload {
+  objective?: string;
+  search_queries: string[];
+  mode?: ParallelSearchOptions['mode'];
+  max_chars_total?: number;
+  client_model?: string;
+  session_id?: string;
+  advanced_settings?: {
+    source_policy?: {
+      include_domains?: string[];
+      exclude_domains?: string[];
+    };
+    location?: string;
+    max_results?: number;
+    excerpt_settings?: {
+      max_chars_per_result?: number;
+    };
+  };
+}
+
+export interface ParallelSearchResult {
+  url: string;
+  title?: string | null;
+  publish_date?: string | null;
+  excerpts: string[];
+}
+
+export interface ParallelSearchResponse {
+  search_id: string;
+  results?: ParallelSearchResult[];
+  warnings?: unknown;
+  usage?: Array<{ name: string; count: number }>;
+  session_id?: string;
+}
+
 export interface SearchConfig {
   searchProvider?: SearchProvider;
   serperApiKey?: string;
@@ -115,6 +194,10 @@ export interface SearchConfig {
   tavilySearchUrl?: string;
   tavilyExtractUrl?: string;
   tavilySearchOptions?: TavilySearchOptions;
+  parallelApiKey?: string;
+  parallelSearchUrl?: string;
+  parallelExtractUrl?: string;
+  parallelSearchOptions?: ParallelSearchOptions;
 }
 
 export type References = {
@@ -164,6 +247,87 @@ export interface TavilyScraperConfig {
   includeFavicon?: boolean;
   format?: 'markdown' | 'text';
 }
+
+/**
+ * Parallel Extract API config
+ * Docs: https://docs.parallel.ai/api-reference/extract/extract
+ */
+export interface ParallelScraperConfig {
+  apiKey?: string;
+  apiUrl?: string;
+  timeout?: number;
+  logger?: Logger;
+  /**
+   * If true, request full page content in addition to excerpts. Defaults to false
+   * (excerpts only — already markdown-formatted and LLM-ready).
+   */
+  fullContent?: boolean;
+  /** Optional default objective applied to every extract call. */
+  objective?: string;
+  /** Optional default keyword queries to focus excerpts. */
+  searchQueries?: string[];
+  /** Per-call cap on total chars across excerpts. */
+  maxCharsTotal?: number;
+  /** Per-result excerpt cap (minimum 1000). */
+  maxCharsPerResult?: number;
+  /**
+   * The model generating the request and consuming the results, e.g.
+   * `claude-opus-4-7`. Enables model-specific result tuning.
+   */
+  clientModel?: string;
+}
+
+export interface ParallelExtractPayload {
+  urls: string[];
+  objective?: string;
+  search_queries?: string[];
+  max_chars_total?: number;
+  session_id?: string;
+  client_model?: string;
+  advanced_settings?: {
+    excerpt_settings?: {
+      max_chars_per_result?: number;
+    };
+    full_content_settings?: {
+      enabled?: boolean;
+    };
+  };
+}
+
+export interface ParallelExtractResult {
+  url: string;
+  title?: string | null;
+  publish_date?: string | null;
+  excerpts?: string[];
+  full_content?: string | null;
+}
+
+export interface ParallelExtractError {
+  url: string;
+  error_type?: string;
+  http_status_code?: number;
+  content?: string;
+}
+
+export interface ParallelExtractResponse {
+  extract_id: string;
+  results?: ParallelExtractResult[];
+  errors?: ParallelExtractError[];
+  warnings?: unknown;
+  usage?: Array<{ name: string; count: number }>;
+  session_id?: string;
+}
+
+export interface ParallelScrapeData {
+  rawContent: string;
+  title?: string;
+  publishDate?: string;
+  excerpts: string[];
+}
+
+export type ParallelScrapeResponse =
+  | { success: true; data: ParallelScrapeData; error?: undefined }
+  | { success: false; data?: undefined; error: string };
 
 export interface ScraperContentResult {
   content: string;
@@ -223,6 +387,7 @@ export interface SearchToolConfig
   scraperProvider?: ScraperProvider;
   scraperTimeout?: number;
   serperScraperOptions?: SerperScraperConfig;
+  parallelScraperOptions?: ParallelScraperConfig;
   onSearchResults?: (
     results: SearchResult,
     runnableConfig?: RunnableConfig
@@ -244,7 +409,8 @@ export type UsedReferences = {
 export type AnyScraperResponse =
   | FirecrawlScrapeResponse
   | SerperScrapeResponse
-  | TavilyScrapeResponse;
+  | TavilyScrapeResponse
+  | ParallelScrapeResponse;
 
 /** Base Scraper Interface */
 export interface BaseScraper {
@@ -279,6 +445,14 @@ export type TavilyScrapeOptions = Omit<
   TavilyScraperConfig,
   'apiKey' | 'apiUrl' | 'logger'
 >;
+
+export type ParallelScrapeOptions = Omit<
+  ParallelScraperConfig,
+  'apiKey' | 'apiUrl' | 'logger'
+> & {
+  /** Optional session id to group this call with related Search/Extract calls. */
+  sessionId?: string;
+};
 
 export interface TavilyExtractPayload {
   urls: string[];
