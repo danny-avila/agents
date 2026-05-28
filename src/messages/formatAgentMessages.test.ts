@@ -97,12 +97,7 @@ describe('formatAgentMessages', () => {
     expect(result.summary!.tokenCount).toBe(12);
     expect(result.messages[0]).toBeInstanceOf(AIMessage);
     expect(result.messages[1]).toBeInstanceOf(HumanMessage);
-    expect(
-      (result.messages[0].content as MessageContentComplex[])[0]
-    ).toMatchObject({
-      type: ContentTypes.TEXT,
-      text: 'Preserved tail',
-    });
+    expect(result.messages[0].content).toBe('Preserved tail');
     expect(result.indexTokenCountMap?.[0]).toBeLessThan(18);
     expect(result.indexTokenCountMap?.[0]).toBeGreaterThan(0);
     expect(result.indexTokenCountMap?.[1]).toBe(4);
@@ -134,12 +129,7 @@ describe('formatAgentMessages', () => {
     expect(result.summary!.text).toBe('Newest summary');
     expect(result.summary!.tokenCount).toBe(9);
     expect(result.messages[0]).toBeInstanceOf(AIMessage);
-    expect(
-      (result.messages[0].content as MessageContentComplex[])[0]
-    ).toMatchObject({
-      type: ContentTypes.TEXT,
-      text: 'Keep this part',
-    });
+    expect(result.messages[0].content).toBe('Keep this part');
   });
 
   it('should format messages with content arrays', () => {
@@ -228,12 +218,7 @@ describe('formatAgentMessages', () => {
       result.messages.some((message) => message instanceof ToolMessage)
     ).toBe(false);
     expect((result.messages[1] as AIMessage).tool_calls).toHaveLength(0);
-    expect(result.messages[1].content).toEqual([
-      {
-        type: ContentTypes.TEXT,
-        [ContentTypes.TEXT]: 'Philadelphia 76ers',
-      },
-    ]);
+    expect(result.messages[1].content).toBe('Philadelphia 76ers');
   });
 
   it('preserves paused Anthropic server tool calls without creating ToolMessages', () => {
@@ -266,8 +251,9 @@ describe('formatAgentMessages', () => {
 
     expect(result.messages).toHaveLength(1);
     expect(result.messages[0]).toBeInstanceOf(AIMessage);
-    expect(result.messages.some((message) => message instanceof ToolMessage))
-      .toBe(false);
+    expect(
+      result.messages.some((message) => message instanceof ToolMessage)
+    ).toBe(false);
     expect((result.messages[0] as AIMessage).tool_calls).toHaveLength(0);
     expect(result.messages[0].content).toEqual([
       {
@@ -369,6 +355,10 @@ describe('formatAgentMessages', () => {
 
     expect(anthropicPayload.messages).toHaveLength(3);
     for (const message of anthropicPayload.messages) {
+      if (typeof message.content === 'string') {
+        expect(message.content.trim().length).toBeGreaterThan(0);
+        continue;
+      }
       expect(Array.isArray(message.content)).toBe(true);
       const content = message.content as Array<{
         text?: unknown;
@@ -444,7 +434,7 @@ describe('formatAgentMessages', () => {
     expect(result.messages.length).toBeGreaterThan(0);
   });
 
-  it('should handle multiple content parts in assistant messages', () => {
+  it('should join multiple text-only parts in assistant messages into a string', () => {
     const payload = [
       {
         role: 'assistant',
@@ -457,7 +447,26 @@ describe('formatAgentMessages', () => {
     const result = formatAgentMessages(payload);
     expect(result.messages).toHaveLength(1);
     expect(result.messages[0]).toBeInstanceOf(AIMessage);
-    expect(result.messages[0].content).toHaveLength(2);
+    expect(typeof result.messages[0].content).toBe('string');
+    expect(result.messages[0].content).toBe('Part 1\nPart 2');
+  });
+
+  it('flattens single-text-part assistant content to a string on multi-turn replays', () => {
+    const payload: TPayload = [
+      { role: 'user', content: 'Test1' },
+      {
+        role: 'assistant',
+        content: [
+          { type: ContentTypes.TEXT, [ContentTypes.TEXT]: 'Test received.' },
+        ],
+      },
+      { role: 'user', content: 'Test2' },
+    ];
+    const result = formatAgentMessages(payload);
+    expect(result.messages).toHaveLength(3);
+    expect(result.messages[1]).toBeInstanceOf(AIMessage);
+    expect(typeof result.messages[1].content).toBe('string');
+    expect(result.messages[1].content).toBe('Test received.');
   });
 
   it('should heal invalid tool call structure by creating a preceding AIMessage', () => {
@@ -614,9 +623,7 @@ describe('formatAgentMessages', () => {
     expect(result.messages[3].content).toBe('23.89°C');
 
     // Check final AIMessage
-    expect(result.messages[4].content).toStrictEqual([
-      { [ContentTypes.TEXT]: 'Here\'s your answer.', type: ContentTypes.TEXT },
-    ]);
+    expect(result.messages[4].content).toBe('Here\'s your answer.');
   });
 
   it('should dynamically discover tools from tool_search output and keep their tool calls', () => {
@@ -1423,13 +1430,8 @@ describe('formatAgentMessages', () => {
 
     expect(result.messages).toHaveLength(1);
     expect(result.messages[0]).toBeInstanceOf(AIMessage);
-    const content = result.messages[0].content;
-    expect(Array.isArray(content)).toBe(true);
-    expect(
-      (content as { type: string; text?: string }[]).every(
-        (p) => (p.text ?? '').trim() !== ''
-      )
-    ).toBe(true);
+    expect(typeof result.messages[0].content).toBe('string');
+    expect(result.messages[0].content).toBe('Actual content here.');
   });
 
   it('should preserve whitespace-only text that has tool_call_ids (common Bedrock pattern)', () => {
@@ -1511,19 +1513,8 @@ describe('formatAgentMessages', () => {
 
     expect(result.messages).toHaveLength(1);
     expect(result.messages[0]).toBeInstanceOf(AIMessage);
-    expect(result.messages[0].content).toEqual([
-      { type: ContentTypes.TEXT, [ContentTypes.TEXT]: 'Hello there' },
-      { type: ContentTypes.TEXT, [ContentTypes.TEXT]: 'Final answer' },
-    ]);
-
-    const hasErrorContent =
-      Array.isArray(result.messages[0].content) &&
-      result.messages[0].content.some(
-        (item) =>
-          item.type === ContentTypes.ERROR ||
-          JSON.stringify(item).includes('An error occurred')
-      );
-    expect(hasErrorContent).toBe(false);
+    expect(result.messages[0].content).toBe('Hello there\nFinal answer');
+    expect(result.messages[0].content).not.toContain('An error occurred');
   });
   it('should handle indexTokenCountMap and return updated map', () => {
     const payload = [
@@ -2093,12 +2084,7 @@ describe('formatAgentMessages', () => {
     // The AIMessage should have no tool calls or an empty array
     const toolCalls = (result.messages[0] as AIMessage).tool_calls;
     expect(toolCalls === undefined || toolCalls.length === 0).toBe(true);
-    expect(result.messages[0].content).toStrictEqual([
-      {
-        type: ContentTypes.TEXT,
-        [ContentTypes.TEXT]: 'Here is the information.',
-      },
-    ]);
+    expect(result.messages[0].content).toBe('Here is the information.');
   });
 
   it('should NOT skip tool calls with no name but valid output', () => {
