@@ -2510,5 +2510,68 @@ describe('thinking enabled — non-Anthropic reasoning_content blocks (issue #19
 
     expect(result!.context.length).toBeGreaterThan(0);
     expect(result!.messagesToRefine.length).toBeGreaterThan(0);
+    // The stale carried-over index must NOT be propagated: createPruneMessages
+    // persists it as runThinkingStartIndex, and a stale value would suppress
+    // the trailing scan on later turns and miss a real reasoning block.
+    expect(result!.thinkingStartIndex).toBeUndefined();
+  });
+
+  it('does not match an Anthropic thinking block for a Bedrock (reasoning_content) run', () => {
+    // The cross-type fallback is one-directional: REASONING_CONTENT (Bedrock)
+    // must not match a `thinking` block, since the Bedrock input converter
+    // rejects `thinking` blocks and reattaching one would break the request.
+    const tokenCounter = createTestTokenCounter();
+    const messages: BaseMessage[] = [
+      new SystemMessage('you are a helpful assistant'),
+      new AIMessage({
+        content: [
+          {
+            type: ContentTypes.THINKING,
+            thinking: 'inherited Anthropic-style reasoning',
+            signature: 'sig-anthropic',
+          },
+          {
+            type: 'tool_use',
+            id: 'tc_get_doc',
+            name: 'get_doc_content',
+            input: { docId: 'abc' },
+          },
+        ],
+        tool_calls: [
+          {
+            id: 'tc_get_doc',
+            name: 'get_doc_content',
+            args: { docId: 'abc' },
+            type: 'tool_call',
+          },
+        ],
+      }),
+      new ToolMessage({
+        content: 'c'.repeat(6000),
+        tool_call_id: 'tc_get_doc',
+        name: 'get_doc_content',
+      }),
+    ];
+
+    const indexTokenCountMap: Record<string, number | undefined> = {};
+    for (let i = 0; i < messages.length; i++) {
+      indexTokenCountMap[i] = tokenCounter(messages[i]);
+    }
+
+    let result: ReturnType<typeof realGetMessagesWithinTokenLimit> | undefined;
+    expect(() => {
+      result = realGetMessagesWithinTokenLimit({
+        messages,
+        maxContextTokens: 200,
+        indexTokenCountMap,
+        thinkingEnabled: true,
+        tokenCounter,
+        reasoningType: ContentTypes.REASONING_CONTENT,
+      });
+    }).not.toThrow();
+
+    // The thinking block is intentionally not located for a Bedrock run, so no
+    // index is reported and nothing gets reattached.
+    expect(result!.thinkingStartIndex).toBeUndefined();
   });
 });

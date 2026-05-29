@@ -609,21 +609,20 @@ export type PruningResult = {
 };
 
 /**
- * Reasoning blocks carry provider-specific `type` tags: Anthropic emits
- * `thinking`, while Bedrock and OpenAI-compatible reasoning providers
- * (DeepSeek-R1, DashScope/Qwen-thinking) emit `reasoning_content`. Only
- * Anthropic and Bedrock have their blocks normalized upstream, so a reasoning
- * provider routed through an OpenAI-compatible surface reaches the pruner with
- * its native `reasoning_content` tag intact — regardless of the `reasoningType`
- * inferred from the provider name. Matching the full set lets the pruner locate
- * the block by whichever shape is actually present, so an unexpected tag cannot
- * hide it and trip the malformed-payload guards. See issue #191.
+ * Locates a reasoning block in assistant content. Reasoning blocks carry
+ * provider-specific `type` tags: Anthropic emits `thinking`, while Bedrock and
+ * OpenAI-compatible reasoning providers (DeepSeek-R1, DashScope/Qwen-thinking)
+ * emit `reasoning_content`. DeepSeek/Qwen route through the `THINKING` default
+ * even though their blocks are `reasoning_content` and aren't normalized
+ * upstream, so for the `THINKING` case we also accept `reasoning_content` — this
+ * is what fixes issue #191.
+ *
+ * The broadening is intentionally one-directional. A Bedrock run
+ * (`REASONING_CONTENT`) must NOT match an Anthropic `thinking` block: the
+ * Bedrock input converter rejects `thinking` blocks outright
+ * (`src/llm/bedrock/utils/message_inputs.ts`), so reattaching one to a
+ * surviving message would make the request fail before it is sent.
  */
-const reasoningBlockTypes = new Set<string>([
-  ContentTypes.THINKING,
-  ContentTypes.REASONING_CONTENT,
-]);
-
 function findReasoningBlock(
   content: MessageContentComplex[],
   reasoningType: ContentTypes
@@ -631,7 +630,8 @@ function findReasoningBlock(
   return content.find(
     (part) =>
       part.type === reasoningType ||
-      (part.type != null && reasoningBlockTypes.has(part.type))
+      (reasoningType === ContentTypes.THINKING &&
+        part.type === ContentTypes.REASONING_CONTENT)
   ) as ThinkingContentText | ReasoningContentText | undefined;
 }
 
@@ -848,6 +848,15 @@ export function getMessagesWithinTokenLimit({
    * one to make the failure fatal.
    */
   if ((thinkingEndIndex > -1 && thinkingStartIndex < 0) || !thinkingBlock) {
+    /**
+     * No block was located, so any `thinkingStartIndex` set above came from a
+     * stale carried-over index pointing at a block-less message. Drop it:
+     * `createPruneMessages` persists the returned index as
+     * `runThinkingStartIndex`, and a stale value would suppress the trailing
+     * scan (`thinkingStartIndex < 0`) on later turns, causing a real reasoning
+     * block to be missed and never reattached.
+     */
+    delete result.thinkingStartIndex;
     result.context = context.reverse() as BaseMessage[];
     return result;
   }
