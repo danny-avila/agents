@@ -3,7 +3,7 @@ import type { RunnableConfig } from '@langchain/core/runnables';
 import type { BaseReranker } from './rerankers';
 import { DATE_RANGE } from './schema';
 
-export type SearchProvider = 'serper' | 'searxng' | 'tavily';
+export type SearchProvider = 'serper' | 'searxng' | 'tavily' | 'firecrawl';
 export type ScraperProvider = 'firecrawl' | 'serper' | 'tavily';
 export type RerankerType = 'infinity' | 'jina' | 'cohere' | 'none';
 
@@ -115,6 +115,10 @@ export interface SearchConfig {
   tavilySearchUrl?: string;
   tavilyExtractUrl?: string;
   tavilySearchOptions?: TavilySearchOptions;
+  firecrawlApiKey?: string;
+  firecrawlApiUrl?: string;
+  firecrawlVersion?: string;
+  firecrawlOptions?: FirecrawlScraperConfig;
 }
 
 export type References = {
@@ -411,6 +415,78 @@ export interface TavilySearchResponse {
   results?: TavilySearchResult[];
 }
 
+export interface FirecrawlSearchResult {
+  title?: string;
+  url?: string;
+  description?: string;
+  markdown?: string;
+  html?: string;
+  rawHtml?: string;
+  metadata?: {
+    sourceURL?: string;
+    url?: string;
+    title?: string;
+    description?: string;
+  };
+}
+
+export interface FirecrawlImageSearchResult {
+  title?: string;
+  imageUrl?: string;
+  imageWidth?: number;
+  imageHeight?: number;
+  url?: string;
+  position?: number;
+}
+
+export interface FirecrawlNewsSearchResult extends FirecrawlSearchResult {
+  snippet?: string;
+  date?: string;
+  imageUrl?: string;
+  position?: number;
+}
+
+export interface FirecrawlSearchGroupedData {
+  web?: FirecrawlSearchResult[];
+  images?: FirecrawlImageSearchResult[];
+  news?: FirecrawlNewsSearchResult[];
+}
+
+export type FirecrawlSearchData =
+  | FirecrawlSearchResult[]
+  | FirecrawlSearchGroupedData;
+
+export interface FirecrawlSearchResponse {
+  success: boolean;
+  data?: FirecrawlSearchData;
+  warning?: string | null;
+  error?: string;
+}
+
+export type FirecrawlSearchSource = 'web' | 'images' | 'news';
+
+export type FirecrawlSearchFormat =
+  | string
+  | {
+      type: string;
+    };
+
+export interface FirecrawlSearchScrapeOptions
+  extends Omit<FirecrawlScrapeOptions, 'formats' | 'timeout' | 'location'> {
+  formats?: FirecrawlSearchFormat[];
+  timeout?: number;
+  location?: { country?: string; languages?: string[] } | string;
+}
+
+export interface FirecrawlSearchPayload {
+  query: string;
+  limit: number;
+  sources: FirecrawlSearchSource[];
+  tbs?: string;
+  country?: string;
+  scrapeOptions?: FirecrawlSearchScrapeOptions;
+}
+
 export interface TavilyExtractResult {
   url: string;
   raw_content?: string;
@@ -488,6 +564,9 @@ export interface NewsResult {
   source?: string;
   imageUrl?: string;
   position?: number;
+  content?: string;
+  attribution?: string;
+  processed?: boolean;
 }
 
 export interface ShoppingResult {

@@ -409,6 +409,292 @@ const createSearXNGAPI = (
   return { getSources };
 };
 
+const createFirecrawlSearchAPI = ({
+  firecrawlApiKey,
+  firecrawlApiUrl,
+  firecrawlVersion,
+  firecrawlOptions,
+}: Pick<
+  t.SearchConfig,
+  | 'firecrawlApiKey'
+  | 'firecrawlApiUrl'
+  | 'firecrawlVersion'
+  | 'firecrawlOptions'
+>): {
+  getSources: (params: t.GetSourcesParams) => Promise<t.SearchResult>;
+} => {
+  const apiKey = firecrawlApiKey ?? process.env.FIRECRAWL_API_KEY;
+  const logger = createDefaultLogger();
+  const version = firecrawlVersion ?? process.env.FIRECRAWL_VERSION ?? 'v2';
+  const baseUrl =
+    firecrawlApiUrl ??
+    process.env.FIRECRAWL_BASE_URL ??
+    'https://api.firecrawl.dev';
+  const apiUrl = `${baseUrl.replace(/\/+$/, '')}/${version}/search`;
+  const timeout = 10000;
+
+  if (apiKey == null || apiKey === '') {
+    throw new Error('FIRECRAWL_API_KEY is required for Firecrawl API');
+  }
+
+  const getSourcesForRequest = ({
+    images,
+    news,
+    type,
+  }: Pick<
+    t.GetSourcesParams,
+    'images' | 'news' | 'type'
+  >): t.FirecrawlSearchSource[] => {
+    if (type === 'images') {
+      return ['images'];
+    }
+    if (type === 'news') {
+      return ['news'];
+    }
+
+    const sources = new Set<t.FirecrawlSearchSource>(['web']);
+    if (images === true) {
+      sources.add('images');
+    }
+    if (news === true) {
+      sources.add('news');
+    }
+    return [...sources];
+  };
+
+  const createScrapeOptions = ():
+    | t.FirecrawlSearchScrapeOptions
+    | undefined => {
+    if (firecrawlOptions?.formats == null) {
+      return undefined;
+    }
+
+    const hasMarkdown = firecrawlOptions.formats.some(
+      (format) => format === 'markdown'
+    );
+    if (!hasMarkdown) {
+      return undefined;
+    }
+
+    const scrapeOptions: t.FirecrawlSearchScrapeOptions = {
+      formats: firecrawlOptions.formats.map((format) => ({ type: format })),
+    };
+    if (firecrawlOptions.blockAds != null) {
+      scrapeOptions.blockAds = firecrawlOptions.blockAds;
+    }
+    if (firecrawlOptions.changeTrackingOptions != null) {
+      scrapeOptions.changeTrackingOptions =
+        firecrawlOptions.changeTrackingOptions;
+    }
+    if (firecrawlOptions.excludeTags != null) {
+      scrapeOptions.excludeTags = firecrawlOptions.excludeTags;
+    }
+    if (firecrawlOptions.headers != null) {
+      scrapeOptions.headers = firecrawlOptions.headers;
+    }
+    if (firecrawlOptions.includeTags != null) {
+      scrapeOptions.includeTags = firecrawlOptions.includeTags;
+    }
+    if (firecrawlOptions.location != null) {
+      scrapeOptions.location = firecrawlOptions.location;
+    }
+    if (firecrawlOptions.maxAge != null) {
+      scrapeOptions.maxAge = firecrawlOptions.maxAge;
+    }
+    if (firecrawlOptions.mobile != null) {
+      scrapeOptions.mobile = firecrawlOptions.mobile;
+    }
+    if (firecrawlOptions.onlyMainContent != null) {
+      scrapeOptions.onlyMainContent = firecrawlOptions.onlyMainContent;
+    }
+    if (firecrawlOptions.parsePDF != null) {
+      scrapeOptions.parsePDF = firecrawlOptions.parsePDF;
+    }
+    if (firecrawlOptions.removeBase64Images != null) {
+      scrapeOptions.removeBase64Images = firecrawlOptions.removeBase64Images;
+    }
+    if (firecrawlOptions.skipTlsVerification != null) {
+      scrapeOptions.skipTlsVerification = firecrawlOptions.skipTlsVerification;
+    }
+    if (firecrawlOptions.storeInCache != null) {
+      scrapeOptions.storeInCache = firecrawlOptions.storeInCache;
+    }
+    if (firecrawlOptions.timeout != null) {
+      scrapeOptions.timeout = firecrawlOptions.timeout;
+    }
+    if (firecrawlOptions.waitFor != null) {
+      scrapeOptions.waitFor = firecrawlOptions.waitFor;
+    }
+    if (firecrawlOptions.zeroDataRetention != null) {
+      scrapeOptions.zeroDataRetention = firecrawlOptions.zeroDataRetention;
+    }
+    return scrapeOptions;
+  };
+
+  const getFirecrawlLink = (result: t.FirecrawlSearchResult): string =>
+    result.url ?? result.metadata?.sourceURL ?? result.metadata?.url ?? '';
+
+  const getFirecrawlTitle = (
+    result: t.FirecrawlSearchResult,
+    link: string
+  ): string => result.title ?? result.metadata?.title ?? link;
+
+  const getFirecrawlSnippet = (result: t.FirecrawlSearchResult): string =>
+    result.description ?? result.metadata?.description ?? '';
+
+  const getFirecrawlData = (
+    data?: t.FirecrawlSearchData
+  ): t.FirecrawlSearchGroupedData => {
+    if (data == null) {
+      return {};
+    }
+    if (Array.isArray(data)) {
+      return { web: data };
+    }
+    return data;
+  };
+
+  const getHostname = (link?: string): string | undefined => {
+    if (link == null || link === '') {
+      return undefined;
+    }
+    try {
+      return new URL(link).hostname;
+    } catch {
+      return link;
+    }
+  };
+
+  const getSources = async ({
+    query,
+    date,
+    country,
+    images,
+    news,
+    numResults = 8,
+    type,
+  }: t.GetSourcesParams): Promise<t.SearchResult> => {
+    if (!query.trim()) {
+      return { success: false, error: 'Query cannot be empty' };
+    }
+
+    const sources = getSourcesForRequest({ images, news, type });
+    const payload: t.FirecrawlSearchPayload = {
+      query,
+      limit: Math.min(Math.max(1, numResults), 100),
+      sources,
+    };
+    const normalizedCountry = country?.trim().toUpperCase();
+    const scrapeOptions = createScrapeOptions();
+
+    if (normalizedCountry != null && normalizedCountry !== '') {
+      payload.country = normalizedCountry;
+    }
+    if (date != null && sources.includes('web')) {
+      payload.tbs = `qdr:${date}`;
+    }
+    if (scrapeOptions != null) {
+      payload.scrapeOptions = scrapeOptions;
+    }
+
+    try {
+      const response = await axios.post<t.FirecrawlSearchResponse>(
+        apiUrl,
+        payload,
+        {
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${apiKey}`,
+          },
+          timeout,
+        }
+      );
+
+      if (!response.data.success) {
+        return {
+          success: false,
+          error: response.data.error ?? 'Firecrawl API request failed',
+        };
+      }
+
+      const searchData = getFirecrawlData(response.data.data);
+      const organic: t.ProcessedOrganic[] = (searchData.web ?? [])
+        .filter((result) => {
+          const link = getFirecrawlLink(result);
+          return link !== '';
+        })
+        .map((result, index): t.ProcessedOrganic => {
+          const link = getFirecrawlLink(result);
+          const title = getFirecrawlTitle(result, link);
+          return {
+            position: index + 1,
+            title,
+            link,
+            snippet: getFirecrawlSnippet(result),
+            content: result.markdown,
+            attribution: getAttribution(link, undefined, logger),
+            processed: false,
+          };
+        });
+      const imageResults: t.ImageResult[] = (searchData.images ?? [])
+        .filter((result) => result.imageUrl != null && result.imageUrl !== '')
+        .map((result, index) => ({
+          title: result.title,
+          imageUrl: result.imageUrl,
+          imageWidth: result.imageWidth,
+          imageHeight: result.imageHeight,
+          link: result.url,
+          source: getHostname(result.url),
+          domain: getHostname(result.url),
+          position: result.position ?? index + 1,
+        }));
+      const newsResults: t.NewsResult[] = (searchData.news ?? [])
+        .filter((result) => {
+          const link = getFirecrawlLink(result);
+          return link !== '';
+        })
+        .map((result, index) => {
+          const link = getFirecrawlLink(result);
+          const title = getFirecrawlTitle(result, link);
+          const source = getHostname(link);
+          return {
+            title,
+            link,
+            snippet: result.snippet ?? getFirecrawlSnippet(result),
+            date: result.date,
+            source,
+            imageUrl: result.imageUrl,
+            position: result.position ?? index + 1,
+            content: result.markdown,
+            attribution: getAttribution(link, undefined, logger),
+            processed: false,
+          };
+        });
+
+      return {
+        success: true,
+        data: {
+          organic,
+          images: imageResults,
+          topStories: [],
+          relatedSearches: [],
+          videos: [],
+          news: newsResults,
+        },
+      };
+    } catch (error) {
+      const errorMessage =
+        error instanceof Error ? error.message : String(error);
+      return {
+        success: false,
+        error: `Firecrawl API request failed: ${errorMessage}`,
+      };
+    }
+  };
+
+  return { getSources };
+};
+
 export const createSearchAPI = (
   config: t.SearchConfig
 ): {
@@ -422,6 +708,10 @@ export const createSearchAPI = (
     tavilyApiKey,
     tavilySearchUrl,
     tavilySearchOptions,
+    firecrawlApiKey,
+    firecrawlApiUrl,
+    firecrawlVersion,
+    firecrawlOptions,
   } = config;
 
   if (searchProvider.toLowerCase() === 'serper') {
@@ -430,9 +720,16 @@ export const createSearchAPI = (
     return createSearXNGAPI(searxngInstanceUrl, searxngApiKey);
   } else if (searchProvider.toLowerCase() === 'tavily') {
     return createTavilyAPI(tavilyApiKey, tavilySearchUrl, tavilySearchOptions);
+  } else if (searchProvider.toLowerCase() === 'firecrawl') {
+    return createFirecrawlSearchAPI({
+      firecrawlApiKey,
+      firecrawlApiUrl,
+      firecrawlVersion,
+      firecrawlOptions,
+    });
   } else {
     throw new Error(
-      `Invalid search provider: ${searchProvider}. Must be 'serper', 'searxng', or 'tavily'`
+      `Invalid search provider: ${searchProvider}. Must be 'serper', 'searxng', 'tavily', or 'firecrawl'`
     );
   }
 };
