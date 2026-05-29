@@ -253,6 +253,51 @@ describe('CustomChatBedrockConverse', () => {
     });
   });
 
+  describe('guardrailConfig configuration', () => {
+    test('should pass guardrailConfig through to ConverseStreamCommand', async () => {
+      const guardrailConfig = {
+        guardrailIdentifier: 'test-guardrail-id',
+        guardrailVersion: 'DRAFT',
+        trace: 'enabled_full' as const,
+        streamProcessingMode: 'sync' as const,
+      };
+      const mockSend = jest.fn<any>().mockResolvedValue({
+        stream: (async function* streamChunks() {
+          yield {
+            contentBlockDelta: {
+              contentBlockIndex: 0,
+              delta: { text: 'Guardrail response' },
+            },
+          };
+        })(),
+      });
+
+      const mockClient = {
+        send: mockSend,
+      } as unknown as BedrockRuntimeClient;
+
+      const model = new CustomChatBedrockConverse({
+        ...baseConstructorArgs,
+        model: 'anthropic.claude-3-haiku-20240307-v1:0',
+        guardrailConfig,
+        client: mockClient,
+      });
+
+      let chunks = 0;
+      for await (const _chunk of await model.stream([
+        new HumanMessage('Hello'),
+      ])) {
+        chunks += 1;
+      }
+
+      expect(mockSend).toHaveBeenCalledTimes(1);
+      expect(chunks).toBe(1);
+      const commandArg = mockSend.mock.calls[0][0] as ConverseStreamCommand;
+      expect(commandArg).toBeInstanceOf(ConverseStreamCommand);
+      expect(commandArg.input.guardrailConfig).toEqual(guardrailConfig);
+    });
+  });
+
   describe('serviceTier configuration', () => {
     test('should set serviceTier in constructor', () => {
       const model = new CustomChatBedrockConverse({

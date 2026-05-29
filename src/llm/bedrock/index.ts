@@ -22,7 +22,11 @@
  */
 
 import { ChatBedrockConverse } from '@langchain/aws';
-import { ConverseStreamCommand } from '@aws-sdk/client-bedrock-runtime';
+import {
+  ConverseStreamCommand,
+  type GuardrailConfiguration,
+  type GuardrailStreamConfiguration,
+} from '@aws-sdk/client-bedrock-runtime';
 import { AIMessageChunk } from '@langchain/core/messages';
 import { ChatGenerationChunk, ChatResult } from '@langchain/core/outputs';
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
@@ -43,6 +47,9 @@ import {
  */
 export type ServiceTierType = 'priority' | 'default' | 'flex' | 'reserved';
 
+export type CustomGuardrailConfiguration = GuardrailConfiguration &
+  Pick<GuardrailStreamConfiguration, 'streamProcessingMode'>;
+
 /**
  * Extended input interface with additional features:
  * - applicationInferenceProfile: Use an inference profile ARN instead of model ID
@@ -54,6 +61,12 @@ export interface CustomChatBedrockConverseInput
    * Enables Bedrock prompt cache checkpoints for message and tool prefixes.
    */
   promptCache?: boolean;
+
+  /**
+   * Guardrail configuration for Converse and ConverseStream invocations.
+   * `streamProcessingMode` is only used by ConverseStream.
+   */
+  guardrailConfig?: CustomGuardrailConfiguration;
 
   /**
    * Application Inference Profile ARN to use for the model.
@@ -86,6 +99,7 @@ export interface CustomChatBedrockConverseInput
  */
 export interface CustomChatBedrockConverseCallOptions {
   serviceTier?: ServiceTierType;
+  guardrailConfig?: CustomGuardrailConfiguration;
 }
 
 export class CustomChatBedrockConverse extends ChatBedrockConverse {
