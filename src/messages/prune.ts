@@ -563,7 +563,7 @@ function addThinkingBlock(
       },
     ];
   /** Edge case, the message already has the thinking block */
-  if (content[0].type === thinkingBlock.type) {
+  if (content[0]?.type === thinkingBlock.type) {
     return message;
   }
   content.unshift(thinkingBlock);
@@ -607,6 +607,33 @@ export type PruningResult = {
   messagesToRefine: BaseMessage[];
   thinkingStartIndex?: number;
 };
+
+/**
+ * Locates a reasoning block in assistant content. Reasoning blocks carry
+ * provider-specific `type` tags: Anthropic emits `thinking`, while Bedrock and
+ * OpenAI-compatible reasoning providers (DeepSeek-R1, DashScope/Qwen-thinking)
+ * emit `reasoning_content`. DeepSeek/Qwen route through the `THINKING` default
+ * even though their blocks are `reasoning_content` and aren't normalized
+ * upstream, so for the `THINKING` case we also accept `reasoning_content` — this
+ * is what fixes issue #191.
+ *
+ * The broadening is intentionally one-directional. A Bedrock run
+ * (`REASONING_CONTENT`) must NOT match an Anthropic `thinking` block: the
+ * Bedrock input converter rejects `thinking` blocks outright
+ * (`src/llm/bedrock/utils/message_inputs.ts`), so reattaching one to a
+ * surviving message would make the request fail before it is sent.
+ */
+function findReasoningBlock(
+  content: MessageContentComplex[],
+  reasoningType: ContentTypes
+): ThinkingContentText | ReasoningContentText | undefined {
+  return content.find(
+    (part) =>
+      part.type === reasoningType ||
+      (reasoningType === ContentTypes.THINKING &&
+        part.type === ContentTypes.REASONING_CONTENT)
+  ) as ThinkingContentText | ReasoningContentText | undefined;
+}
 
 /**
  * Processes an array of messages and returns a context of messages that fit within a specified token limit.
@@ -670,9 +697,7 @@ export function getMessagesWithinTokenLimit({
   if (_thinkingStartIndex > -1) {
     const thinkingMessageContent = messages[_thinkingStartIndex]?.content;
     if (Array.isArray(thinkingMessageContent)) {
-      thinkingBlock = thinkingMessageContent.find(
-        (content) => content.type === reasoningType
-      ) as ThinkingContentText | undefined;
+      thinkingBlock = findReasoningBlock(thinkingMessageContent, reasoningType);
     }
   }
 
@@ -705,9 +730,10 @@ export function getMessagesWithinTokenLimit({
         messageType === 'ai' &&
         Array.isArray(poppedMessage.content)
       ) {
-        thinkingBlock = poppedMessage.content.find(
-          (content) => content.type === reasoningType
-        ) as ThinkingContentText | undefined;
+        thinkingBlock = findReasoningBlock(
+          poppedMessage.content,
+          reasoningType
+        );
         thinkingStartIndex = thinkingBlock != null ? currentIndex : -1;
       }
       /**
@@ -811,16 +837,28 @@ export function getMessagesWithinTokenLimit({
     return result;
   }
 
-  if (thinkingEndIndex > -1 && thinkingStartIndex < 0) {
-    throw new Error(
-      'The payload is malformed. There is a thinking sequence but no "AI" messages with thinking blocks.'
-    );
-  }
-
-  if (!thinkingBlock) {
-    throw new Error(
-      'The payload is malformed. There is a thinking sequence but no thinking block found.'
-    );
+  /**
+   * A trailing reasoning sequence was detected but its block could not be
+   * located in the surviving context. Rather than throw — which permanently
+   * bricks the conversation, re-firing on every retry of the same thread (see
+   * issue #191) — return the partially-pruned context and let the provider
+   * surface a real, recoverable error if the payload is genuinely malformed.
+   * Strict providers (Anthropic) reject it cleanly; lenient ones (DeepSeek,
+   * Qwen) proceed. The pruner cannot know which applies, so it must not be the
+   * one to make the failure fatal.
+   */
+  if ((thinkingEndIndex > -1 && thinkingStartIndex < 0) || !thinkingBlock) {
+    /**
+     * No block was located, so any `thinkingStartIndex` set above came from a
+     * stale carried-over index pointing at a block-less message. Drop it:
+     * `createPruneMessages` persists the returned index as
+     * `runThinkingStartIndex`, and a stale value would suppress the trailing
+     * scan (`thinkingStartIndex < 0`) on later turns, causing a real reasoning
+     * block to be missed and never reattached.
+     */
+    delete result.thinkingStartIndex;
+    result.context = context.reverse() as BaseMessage[];
+    return result;
   }
 
   let assistantIndex = -1;
