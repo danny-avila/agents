@@ -180,6 +180,34 @@ describe('Langfuse tool output tracing redaction', () => {
     ).toBe(false);
   });
 
+  it('classifies LangGraph tool-node spans as Langfuse tool observations', () => {
+    const span = createSpan('tool_batch', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_TYPE]: 'span',
+      [`${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.langgraph_node`]:
+        'tools=agent_1',
+    });
+
+    redactLangfuseSpanToolOutputs(span, createConfig());
+
+    expect(span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_TYPE]).toBe(
+      'tool'
+    );
+  });
+
+  it('does not reclassify non-tool LangGraph spans', () => {
+    const span = createSpan('agent=agent_1', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_TYPE]: 'span',
+      [`${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.langgraph_node`]:
+        'agent=agent_1',
+    });
+
+    redactLangfuseSpanToolOutputs(span, createConfig());
+
+    expect(span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_TYPE]).toBe(
+      'span'
+    );
+  });
+
   it('redacts raw tool observation output when tool output tracing is disabled', () => {
     const span = createSpan('execute_sql', {
       [LangfuseOtelSpanAttributes.OBSERVATION_TYPE]: 'tool',
