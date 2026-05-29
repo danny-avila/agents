@@ -524,7 +524,14 @@ class ToolOutputRedactingLangfuseSpanProcessor implements SpanProcessor {
     params?: LangfuseSpanProcessorParams,
     fallbackConfig?: ResolvedLangfuseToolOutputTracingConfig
   ) {
-    this.processor = new LangfuseSpanProcessor(params);
+    this.processor = new LangfuseSpanProcessor(
+      params?.baseUrl != null
+        ? {
+          ...params,
+          additionalHeaders: params.additionalHeaders,
+        }
+        : params
+    );
     this.fallbackConfig = fallbackConfig;
   }
 
@@ -618,10 +625,7 @@ function hasLangfuseConfigKeys(langfuse?: t.LangfuseConfig): boolean {
   if (langfuse == null) {
     return false;
   }
-  return (
-    isPresent(langfuse.secretKey) &&
-    isPresent(langfuse.publicKey)
-  );
+  return isPresent(langfuse.secretKey) && isPresent(langfuse.publicKey);
 }
 
 export function shouldTraceToolNodeForLangfuse({
@@ -639,8 +643,7 @@ export function shouldTraceToolNodeForLangfuse({
   const explicit = langfuse?.toolNodeTracing?.enabled;
   if (explicit != null) {
     return (
-      explicit &&
-      (hasLangfuseConfigKeys(langfuse) || hasLangfuseEnvKeys())
+      explicit && (hasLangfuseConfigKeys(langfuse) || hasLangfuseEnvKeys())
     );
   }
 
