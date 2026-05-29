@@ -2382,3 +2382,133 @@ describe('thinking enabled — tail tool_use without a thinking block (issue #11
     expect(result.thinkingStartIndex).toBeGreaterThanOrEqual(0);
   });
 });
+
+describe('thinking enabled — non-Anthropic reasoning_content blocks (issue #191)', () => {
+  it('locates a trailing reasoning_content block even when reasoningType defaults to THINKING (DeepSeek/Qwen)', () => {
+    // DeepSeek-R1 and DashScope/Qwen-thinking route through the non-Bedrock
+    // branch, so the caller passes reasoningType: THINKING — but their blocks
+    // are tagged `reasoning_content` and are not normalized upstream. With a
+    // system prompt at index 0 and an all-AI/tool tail, the consume loop never
+    // pops a human to clear thinkingEndIndex (the issue #116 escape hatch), so
+    // searching only for `thinking` missed the present block and threw a fatal
+    // that permanently bricked the thread. The pruner must find the block by
+    // its actual shape instead.
+    const tokenCounter = createTestTokenCounter();
+    const messages: BaseMessage[] = [
+      new SystemMessage('you are a helpful assistant'),
+      new AIMessage({
+        content: [
+          {
+            type: ContentTypes.REASONING_CONTENT,
+            reasoningText: {
+              text: 'I will fetch the doc',
+              signature: 'sig-new',
+            },
+          },
+          {
+            type: 'tool_use',
+            id: 'tc_get_doc',
+            name: 'get_doc_content',
+            input: { docId: 'abc' },
+          },
+        ],
+        tool_calls: [
+          {
+            id: 'tc_get_doc',
+            name: 'get_doc_content',
+            args: { docId: 'abc' },
+            type: 'tool_call',
+          },
+        ],
+      }),
+      new ToolMessage({
+        content: 'c'.repeat(6000),
+        tool_call_id: 'tc_get_doc',
+        name: 'get_doc_content',
+      }),
+    ];
+
+    const indexTokenCountMap: Record<string, number | undefined> = {};
+    for (let i = 0; i < messages.length; i++) {
+      indexTokenCountMap[i] = tokenCounter(messages[i]);
+    }
+
+    let result: ReturnType<typeof realGetMessagesWithinTokenLimit> | undefined;
+    expect(() => {
+      result = realGetMessagesWithinTokenLimit({
+        messages,
+        maxContextTokens: 200,
+        indexTokenCountMap,
+        thinkingEnabled: true,
+        tokenCounter,
+        reasoningType: ContentTypes.THINKING,
+      });
+    }).not.toThrow();
+
+    // thinkingStartIndex is only set when the reasoning block is actually
+    // located — isolating the find fix (B) from the graceful-degradation
+    // safety net (C), which would swallow the throw without finding anything.
+    expect(result!.thinkingStartIndex).toBeGreaterThanOrEqual(0);
+  });
+
+  it('does not throw when a carried-over thinking sequence has no locatable block', () => {
+    // Models a stale runThinkingStartIndex carry-over pointing at an assistant
+    // message that has no reasoning block. The pruner cannot find a block, but
+    // a trailing AI/tool sequence keeps thinkingEndIndex set, so it used to
+    // reach the fatal "no thinking block found" throw. Defense in depth: a
+    // misconfiguration upstream of the pruner must not be able to brick the
+    // thread — degrade to the partially-pruned context instead.
+    const tokenCounter = createTestTokenCounter();
+    const messages: BaseMessage[] = [
+      new HumanMessage('h'.repeat(100)),
+      new AIMessage({
+        content: [{ type: 'text', text: 'a reply with no reasoning block' }],
+      }),
+      new HumanMessage('please read the doc'),
+      new AIMessage({
+        content: [
+          {
+            type: 'tool_use',
+            id: 'tc_get_doc',
+            name: 'get_doc_content',
+            input: { docId: 'abc' },
+          },
+        ],
+        tool_calls: [
+          {
+            id: 'tc_get_doc',
+            name: 'get_doc_content',
+            args: { docId: 'abc' },
+            type: 'tool_call',
+          },
+        ],
+      }),
+      new ToolMessage({
+        content: 'x'.repeat(150),
+        tool_call_id: 'tc_get_doc',
+        name: 'get_doc_content',
+      }),
+    ];
+
+    const indexTokenCountMap: Record<string, number | undefined> = {};
+    for (let i = 0; i < messages.length; i++) {
+      indexTokenCountMap[i] = tokenCounter(messages[i]);
+    }
+
+    let result: ReturnType<typeof realGetMessagesWithinTokenLimit> | undefined;
+    expect(() => {
+      result = realGetMessagesWithinTokenLimit({
+        messages,
+        maxContextTokens: 200,
+        indexTokenCountMap,
+        thinkingEnabled: true,
+        tokenCounter,
+        thinkingStartIndex: 1,
+        reasoningType: ContentTypes.THINKING,
+      });
+    }).not.toThrow();
+
+    expect(result!.context.length).toBeGreaterThan(0);
+    expect(result!.messagesToRefine.length).toBeGreaterThan(0);
+  });
+});
