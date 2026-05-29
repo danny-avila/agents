@@ -87,7 +87,7 @@ export type BedrockAnthropicInput = ChatBedrockConverseInput & {
     AnthropicReasoning;
   promptCache?: boolean;
 };
-export type BedrockConverseClientOptions = ChatBedrockConverseInput;
+export type BedrockConverseClientOptions = BedrockAnthropicInput;
 export type BedrockAnthropicClientOptions = BedrockAnthropicInput;
 export type GoogleClientOptions = GoogleGenerativeAIChatInput & {
   customHeaders?: RequestOptions['customHeaders'];
@@ -128,7 +128,7 @@ export type ProviderOptionsMap = {
   [Providers.MISTRALAI]: MistralAIClientOptions;
   [Providers.MISTRAL]: MistralAIClientOptions;
   [Providers.OPENROUTER]: ChatOpenRouterCallOptions;
-  [Providers.BEDROCK]: BedrockConverseClientOptions;
+  [Providers.BEDROCK]: BedrockAnthropicClientOptions;
   [Providers.XAI]: XAIClientOptions;
   [Providers.MOONSHOT]: OpenAIClientOptions;
 };

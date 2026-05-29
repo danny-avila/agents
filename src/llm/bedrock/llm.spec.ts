@@ -18,14 +18,16 @@ import {
   ConverseCommand,
   ConverseStreamCommand,
 } from '@aws-sdk/client-bedrock-runtime';
-import type { ConverseResponse } from '@aws-sdk/client-bedrock-runtime';
+import type { ConverseResponse, Tool } from '@aws-sdk/client-bedrock-runtime';
 import {
   convertConverseMessageToLangChainMessage,
   handleConverseStreamMetadata,
   convertToConverseMessages,
 } from './utils';
+import type { GraphTools } from '@/types';
 import { toLangChainContent } from '@/messages/langchain';
 import { CustomChatBedrockConverse, ServiceTierType } from './index';
+import { partitionAndMarkBedrockToolCache } from './toolCache';
 
 jest.setTimeout(120000);
 
@@ -83,6 +85,17 @@ function humanMessageWithContent(
   content: MessageContentComplex[]
 ): HumanMessage {
   return new HumanMessage({ content: toLangChainContent(content) });
+}
+
+function getBedrockToolName(entry: Tool): string {
+  if ('cachePoint' in entry) {
+    return 'cachePoint';
+  }
+  return entry.toolSpec?.name ?? 'missing';
+}
+
+function getBedrockToolNames(tools: Tool[] | undefined): string[] {
+  return (tools ?? []).map(getBedrockToolName);
 }
 
 describe('CustomChatBedrockConverse', () => {
@@ -310,6 +323,101 @@ describe('CustomChatBedrockConverse', () => {
       expect(params.inferenceConfig?.temperature).toBe(0.5);
       expect(params.inferenceConfig?.maxTokens).toBe(100);
       expect(params.inferenceConfig?.stopSequences).toEqual(['stop_sequence']);
+    });
+  });
+
+  describe('promptCache tool configuration', () => {
+    test('adds a Bedrock cache point for directly-bound tools', () => {
+      const model = new CustomChatBedrockConverse({
+        ...baseConstructorArgs,
+        promptCache: true,
+      });
+
+      const params = model.invocationParams({
+        tools: [
+          {
+            type: 'function',
+            function: {
+              name: 'direct_tool',
+              description: 'Direct tool',
+              parameters: { type: 'object', properties: {} },
+            },
+          },
+        ],
+      });
+
+      expect(getBedrockToolNames(params.toolConfig?.tools)).toEqual([
+        'direct_tool',
+        'cachePoint',
+      ]);
+    });
+
+    test('adds the Bedrock cache point before deferred tools', () => {
+      const model = new CustomChatBedrockConverse({
+        ...baseConstructorArgs,
+        promptCache: true,
+      });
+      const tools = partitionAndMarkBedrockToolCache(
+        [
+          {
+            type: 'function',
+            function: {
+              name: 'static_tool',
+              description: 'Static tool',
+              parameters: { type: 'object', properties: {} },
+            },
+          },
+          {
+            type: 'function',
+            function: {
+              name: 'deferred_tool',
+              description: 'Deferred tool',
+              parameters: { type: 'object', properties: {} },
+            },
+          },
+        ] as GraphTools,
+        (name) => name === 'deferred_tool'
+      );
+
+      const params = model.invocationParams({ tools });
+
+      expect(getBedrockToolNames(params.toolConfig?.tools)).toEqual([
+        'static_tool',
+        'cachePoint',
+        'deferred_tool',
+      ]);
+      expect(JSON.stringify(params.toolConfig?.tools)).not.toContain(
+        '__lc_bedrock_cache_point_after'
+      );
+    });
+
+    test('does not fall back to caching when Graph marks all tools deferred', () => {
+      const model = new CustomChatBedrockConverse({
+        ...baseConstructorArgs,
+        promptCache: true,
+      });
+      const tools = partitionAndMarkBedrockToolCache(
+        [
+          {
+            type: 'function',
+            function: {
+              name: 'deferred_tool',
+              description: 'Deferred tool',
+              parameters: { type: 'object', properties: {} },
+            },
+          },
+        ] as GraphTools,
+        () => true
+      );
+
+      const params = model.invocationParams({ tools });
+
+      expect(getBedrockToolNames(params.toolConfig?.tools)).toEqual([
+        'deferred_tool',
+      ]);
+      expect(JSON.stringify(params.toolConfig?.tools)).not.toContain(
+        '__lc_bedrock_skip_tool_cache'
+      );
     });
   });
 
