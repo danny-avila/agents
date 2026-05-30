@@ -1,12 +1,21 @@
 import { CallbackHandler } from '@langfuse/langchain';
 import {
   createLangfuseHandler,
+  disposeLangfuseHandler,
   hasLangfuseConfigCredentials,
   shouldCreateLangfuseHandler,
 } from '@/langfuse';
 
+const mockForceFlush = jest.fn();
+
 jest.mock('@langfuse/langchain', () => ({
   CallbackHandler: jest.fn().mockImplementation((params) => ({ params })),
+}));
+
+jest.mock('@langfuse/tracing', () => ({
+  getLangfuseTracerProvider: jest.fn(() => ({
+    forceFlush: mockForceFlush,
+  })),
 }));
 
 const MockedCallbackHandler = CallbackHandler as jest.MockedClass<
@@ -23,6 +32,7 @@ describe('createLangfuseHandler', () => {
     delete process.env.LANGFUSE_SECRET_KEY;
     delete process.env.LANGFUSE_BASE_URL;
     delete process.env.LANGFUSE_BASEURL;
+    delete process.env.LANGFUSE_FORCE_FLUSH_ON_DISPOSE;
   });
 
   afterEach(() => {
@@ -146,5 +156,18 @@ describe('createLangfuseHandler', () => {
         toolOutputTracing: { enabled: false },
       })
     ).toBe(true);
+  });
+
+  it('does not flush the shared Langfuse provider during per-chat cleanup', async () => {
+    await expect(disposeLangfuseHandler({})).resolves.toBeUndefined();
+    expect(mockForceFlush).not.toHaveBeenCalled();
+  });
+
+  it('force flushes during cleanup when explicitly enabled', async () => {
+    process.env.LANGFUSE_FORCE_FLUSH_ON_DISPOSE = 'true';
+
+    await expect(disposeLangfuseHandler({})).resolves.toBeUndefined();
+
+    expect(mockForceFlush).toHaveBeenCalledTimes(1);
   });
 });
