@@ -45,6 +45,7 @@ jest.mock('@opentelemetry/sdk-trace-base', () => ({
 describe('Langfuse callback composition', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    delete process.env.LANGFUSE_FORCE_FLUSH_ON_DISPOSE;
   });
 
   it('runs explicit per-agent tracing when callbacks is a CallbackManager', async () => {
@@ -85,7 +86,7 @@ describe('Langfuse callback composition', () => {
     await run.processStream({ messages: [new HumanMessage('hello')] }, config);
 
     expect(mockStartActiveSpan).toHaveBeenCalled();
-    expect(mockForceFlush).toHaveBeenCalled();
+    expect(mockForceFlush).not.toHaveBeenCalled();
   });
 
   it('attaches Langfuse callbacks for direct graph invocations', async () => {

@@ -4,6 +4,7 @@ import type * as t from '@/types';
 import { isPresent } from '@/utils/misc';
 
 const TRACE_METADATA_MAX_LENGTH = 200;
+const LANGFUSE_FORCE_FLUSH_ON_DISPOSE = 'LANGFUSE_FORCE_FLUSH_ON_DISPOSE';
 
 export type LangfuseTraceMetadata = Record<string, string>;
 
@@ -21,6 +22,13 @@ type AgentLangfuseHandlerParams = LangfuseHandlerParams & {
 type FlushableTracerProvider = {
   forceFlush?: () => Promise<void> | void;
 };
+
+function parseBooleanEnv(value?: string): boolean {
+  if (value == null) {
+    return false;
+  }
+  return ['1', 'true', 'yes', 'on'].includes(value.trim().toLowerCase());
+}
 
 function hasLangfuseTracingConfig(langfuse?: t.LangfuseConfig): boolean {
   return (
@@ -45,9 +53,7 @@ function hasLangfuseConfigBaseUrl(langfuse?: t.LangfuseConfig): boolean {
   return isPresent(langfuse?.baseUrl);
 }
 
-export function isExplicitLangfuseConfig(
-  langfuse?: t.LangfuseConfig
-): boolean {
+export function isExplicitLangfuseConfig(langfuse?: t.LangfuseConfig): boolean {
   return (
     langfuse?.enabled != null ||
     isPresent(langfuse?.publicKey) ||
@@ -168,7 +174,10 @@ export function isLangfuseCallbackHandler(value: unknown): boolean {
 }
 
 export async function disposeLangfuseHandler(value: unknown): Promise<void> {
-  if (value == null) {
+  if (
+    value == null ||
+    !parseBooleanEnv(process.env[LANGFUSE_FORCE_FLUSH_ON_DISPOSE])
+  ) {
     return;
   }
   const provider = getLangfuseTracerProvider() as FlushableTracerProvider;
