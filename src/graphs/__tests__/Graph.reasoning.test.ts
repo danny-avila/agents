@@ -33,6 +33,17 @@ class InvokeOnlyReasoningModel implements t.ChatModel {
   }
 }
 
+class InvokeOnlyMessageModel implements t.ChatModel {
+  constructor(private readonly message: AIMessageChunk) {}
+
+  async invoke(
+    _messages: BaseMessage[],
+    _config?: RunnableConfig
+  ): Promise<AIMessageChunk> {
+    return this.message;
+  }
+}
+
 class StreamingReasoningModel implements t.ChatModel {
   constructor(private readonly chunks: AIMessageChunk[]) {}
 
@@ -262,7 +273,9 @@ describe('StandardGraph final response reasoning fallback', () => {
       config
     );
 
-    expect(finalContentParts).toBeDefined();
+    expect(finalContentParts).toEqual([
+      { type: ContentTypes.THINK, think: reasoningText },
+    ]);
     expect(reasoningDeltas).toHaveLength(1);
     expect(reasoningDeltas[0].delta.content?.[0]).toEqual({
       type: ContentTypes.THINK,
@@ -310,6 +323,166 @@ describe('StandardGraph final response reasoning fallback', () => {
     expect(contentParts).toEqual([
       { type: ContentTypes.THINK, think: reasoningText },
       { type: ContentTypes.TEXT, text },
+    ]);
+  });
+
+  it('returns reasoning content without a custom aggregator', async () => {
+    const reasoningText = 'Reasoning should persist for returnContent.';
+    const run = await Run.create<t.IState>({
+      runId: 'reasoning-fallback-return-content',
+      graphConfig: {
+        type: 'standard',
+        llmConfig,
+      },
+      returnContent: true,
+      skipCleanup: true,
+    });
+
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+
+    run.Graph.overrideModel = new InvokeOnlyReasoningModel({
+      content: '',
+      reasoningContent: reasoningText,
+    });
+
+    const finalContentParts = await run.processStream(
+      { messages: [new HumanMessage('return reasoning content')] },
+      {
+        ...config,
+        configurable: {
+          thread_id: 'reasoning-fallback-return-content',
+        },
+      }
+    );
+
+    expect(finalContentParts).toEqual([
+      { type: ContentTypes.THINK, think: reasoningText },
+    ]);
+  });
+
+  it('emits every OpenAI reasoning summary segment in invoke-only fallback', async () => {
+    const reasoningText = 'First summary. Second summary.';
+    const reasoningDeltas: t.ReasoningDeltaEvent[] = [];
+    const { contentParts, aggregateContent } = createContentAggregator();
+    const run = await Run.create<t.IState>({
+      runId: 'reasoning-fallback-openai-multi-summary',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: Providers.OPENAI,
+          disableStreaming: true,
+          streamUsage: false,
+        },
+        reasoningKey: 'reasoning',
+      },
+      returnContent: true,
+      skipCleanup: true,
+      customHandlers: createReasoningHandlers(
+        aggregateContent,
+        reasoningDeltas
+      ),
+    });
+
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+
+    run.Graph.overrideModel = new InvokeOnlyMessageModel(
+      new AIMessageChunk({
+        content: '',
+        additional_kwargs: {
+          reasoning: {
+            summary: [{ text: 'First summary. ' }, { text: 'Second summary.' }],
+          },
+        },
+      })
+    );
+
+    const finalContentParts = await run.processStream(
+      { messages: [new HumanMessage('return multi summary reasoning')] },
+      {
+        ...config,
+        configurable: {
+          thread_id: 'reasoning-fallback-openai-multi-summary',
+        },
+      }
+    );
+
+    expect(reasoningDeltas).toHaveLength(1);
+    expect(reasoningDeltas[0].delta.content?.[0]).toEqual({
+      type: ContentTypes.THINK,
+      think: reasoningText,
+    });
+    expect(finalContentParts).toEqual([
+      { type: ContentTypes.THINK, think: reasoningText },
+    ]);
+    expect(contentParts).toEqual([
+      { type: ContentTypes.THINK, think: reasoningText },
+    ]);
+  });
+
+  it('emits OpenRouter reasoning_details in invoke-only fallback', async () => {
+    const reasoningText = 'OpenRouter detail reasoning.';
+    const reasoningDeltas: t.ReasoningDeltaEvent[] = [];
+    const { contentParts, aggregateContent } = createContentAggregator();
+    const run = await Run.create<t.IState>({
+      runId: 'reasoning-fallback-openrouter-details',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: Providers.OPENROUTER,
+          disableStreaming: true,
+          streamUsage: false,
+        },
+        reasoningKey: 'reasoning',
+      },
+      returnContent: true,
+      skipCleanup: true,
+      customHandlers: createReasoningHandlers(
+        aggregateContent,
+        reasoningDeltas
+      ),
+    });
+
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+
+    run.Graph.overrideModel = new InvokeOnlyMessageModel(
+      new AIMessageChunk({
+        content: '',
+        additional_kwargs: {
+          reasoning_details: [
+            { type: 'reasoning.text', text: 'OpenRouter detail ' },
+            { type: 'reasoning.encrypted', id: 'encrypted' },
+            { type: 'reasoning.text', text: 'reasoning.' },
+          ],
+        },
+      })
+    );
+
+    const finalContentParts = await run.processStream(
+      { messages: [new HumanMessage('return OpenRouter reasoning details')] },
+      {
+        ...config,
+        configurable: {
+          thread_id: 'reasoning-fallback-openrouter-details',
+        },
+      }
+    );
+
+    expect(reasoningDeltas).toHaveLength(1);
+    expect(reasoningDeltas[0].delta.content?.[0]).toEqual({
+      type: ContentTypes.THINK,
+      think: reasoningText,
+    });
+    expect(finalContentParts).toEqual([
+      { type: ContentTypes.THINK, think: reasoningText },
+    ]);
+    expect(contentParts).toEqual([
+      { type: ContentTypes.THINK, think: reasoningText },
     ]);
   });
 

@@ -91,6 +91,7 @@ const CALIBRATION_VARIANCE_THRESHOLD = 0.15;
 
 type ReasoningKey = 'reasoning_content' | 'reasoning';
 type ReasoningSummary = { summary?: Array<{ text?: string }> };
+type ReasoningDetail = { type?: string; text?: string };
 
 function getHandlerDispatchedEventKey(
   eventName: string,
@@ -105,10 +106,25 @@ function getReasoningText(
   if (typeof value === 'string') {
     return value !== '' ? value : undefined;
   }
-  const summaryText = value?.summary?.[0]?.text;
-  return summaryText != null && summaryText !== ''
-    ? summaryText
-    : undefined;
+  const summaryText = value?.summary
+    ?.map((summary) => summary.text ?? '')
+    .filter((text) => text !== '')
+    .join('');
+  return summaryText != null && summaryText !== '' ? summaryText : undefined;
+}
+
+function getReasoningDetailsText(
+  value: ReasoningDetail[] | null | undefined
+): string | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const reasoningText = value
+    .filter((detail) => detail.type === 'reasoning.text')
+    .map((detail) => detail.text ?? '')
+    .filter((text) => text !== '')
+    .join('');
+  return reasoningText !== '' ? reasoningText : undefined;
 }
 
 function getResponseReasoningContent({
@@ -145,12 +161,19 @@ function getResponseReasoningContent({
     return reasoningContent;
   }
 
-  return getReasoningText(
+  const reasoning = getReasoningText(
     additionalKwargs.reasoning as
       | string
       | Partial<ReasoningSummary>
       | null
       | undefined
+  );
+  if (reasoning != null) {
+    return reasoning;
+  }
+
+  return getReasoningDetailsText(
+    additionalKwargs.reasoning_details as ReasoningDetail[] | null | undefined
   );
 }
 
