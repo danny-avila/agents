@@ -11,6 +11,18 @@ jest.mock('@/utils', () => ({
   sleep: (): Promise<void> => Promise.resolve(),
 }));
 
+const createRunStep = (id: string): t.RunStep => ({
+  id,
+  stepIndex: 0,
+  type: StepTypes.MESSAGE_CREATION,
+  index: 0,
+  stepDetails: {
+    type: StepTypes.MESSAGE_CREATION,
+    message_creation: { message_id: id },
+  },
+  usage: null,
+});
+
 describe('Stream Generation and Handling', () => {
   let mockHandlers: {
     [GraphEvents.ON_RUN_STEP]: jest.Mock;
@@ -158,6 +170,58 @@ End code.`;
 
     expect(tokens).toContain(' ');
     expect(tokens.join('')).toBe('Hello  world');
+  });
+});
+
+describe('ContentAggregator empty deltas', () => {
+  it('should ignore empty message delta content arrays', () => {
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const { contentParts, aggregateContent } = createContentAggregator();
+
+    try {
+      aggregateContent({
+        event: GraphEvents.ON_RUN_STEP,
+        data: createRunStep('step_empty_message'),
+      });
+
+      aggregateContent({
+        event: GraphEvents.ON_MESSAGE_DELTA,
+        data: {
+          id: 'step_empty_message',
+          delta: { content: [] },
+        },
+      });
+
+      expect(warnSpy).not.toHaveBeenCalled();
+      expect(contentParts).toEqual([]);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it('should ignore empty reasoning delta content arrays', () => {
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const { contentParts, aggregateContent } = createContentAggregator();
+
+    try {
+      aggregateContent({
+        event: GraphEvents.ON_RUN_STEP,
+        data: createRunStep('step_empty_reasoning'),
+      });
+
+      aggregateContent({
+        event: GraphEvents.ON_REASONING_DELTA,
+        data: {
+          id: 'step_empty_reasoning',
+          delta: { content: [] },
+        },
+      });
+
+      expect(warnSpy).not.toHaveBeenCalled();
+      expect(contentParts).toEqual([]);
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 });
 
