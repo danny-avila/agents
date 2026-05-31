@@ -364,13 +364,18 @@ export function convertMessagesToContent(
 ): t.MessageContentComplex[] {
   const processedContent: t.MessageContentComplex[] = [];
 
-  const addContentPart = (message: BaseMessage | null): void => {
+  const addToolCallBoundary = (): number => {
+    processedContent.push({ type: ContentTypes.TEXT, text: '' });
+    return processedContent.length - 1;
+  };
+
+  const addContentPart = (message: BaseMessage | null): number | undefined => {
     const content =
       message?.lc_kwargs.content != null
         ? message.lc_kwargs.content
         : message?.content;
     if (content === undefined) {
-      return;
+      return undefined;
     }
     const reasoningContent =
       message?._getType() === 'ai' && !hasReasoningContent(content)
@@ -384,18 +389,27 @@ export function convertMessagesToContent(
     }
     if (typeof content === 'string') {
       if (content === '') {
-        return;
+        return undefined;
       }
       processedContent.push({
-        type: 'text',
+        type: ContentTypes.TEXT,
         text: content,
       });
+      return processedContent.length - 1;
     } else if (Array.isArray(content)) {
-      const filteredContent = content.filter(
-        (item) => item != null && item.type !== 'tool_use'
-      );
-      processedContent.push(...filteredContent);
+      let textContentIndex: number | undefined;
+      for (const item of content) {
+        if (item == null || item.type === 'tool_use') {
+          continue;
+        }
+        processedContent.push(item);
+        if (item.type === ContentTypes.TEXT) {
+          textContentIndex = processedContent.length - 1;
+        }
+      }
+      return textContentIndex;
     }
+    return undefined;
   };
 
   let currentAIMessageIndex = -1;
@@ -418,8 +432,8 @@ export function convertMessagesToContent(
         toolCallMap.set(tool_call.id, tool_call);
       }
 
-      addContentPart(message);
-      currentAIMessageIndex = processedContent.length - 1;
+      currentAIMessageIndex =
+        addContentPart(message) ?? addToolCallBoundary();
       continue;
     } else if (
       messageType === 'tool' &&
@@ -449,6 +463,12 @@ export function convertMessagesToContent(
   }
 
   return processedContent;
+}
+
+function stringifyToolMessageContent(
+  content: ToolMessage['content'] | null | undefined
+): string {
+  return content == null ? '' : String(content);
 }
 
 export function formatAnthropicArtifactContent(messages: BaseMessage[]): void {
@@ -488,7 +508,12 @@ export function formatAnthropicArtifactContent(messages: BaseMessage[]): void {
     ) {
       const base = Array.isArray(msg.content)
         ? msg.content
-        : [{ type: 'text' as const, text: String(msg.content) }];
+        : [
+          {
+            type: ContentTypes.TEXT,
+            text: stringifyToolMessageContent(msg.content),
+          },
+        ];
       msg.content = base.concat(msg.artifact.content);
     }
   }

@@ -1,11 +1,16 @@
 import {
   HumanMessage,
   AIMessage,
+  AIMessageChunk,
   SystemMessage,
   ToolMessage,
 } from '@langchain/core/messages';
 import type { MessageContentComplex, TPayload } from '@/types';
 import { formatAgentMessages } from './format';
+import {
+  convertMessagesToContent,
+  formatAnthropicArtifactContent,
+} from './core';
 import { _convertMessagesToAnthropicPayload } from '@/llm/anthropic/utils/message_inputs';
 import { Constants, ContentTypes, Providers } from '@/common';
 
@@ -616,6 +621,123 @@ describe('formatAgentMessages', () => {
     // Check final AIMessage
     expect(result.messages[4].content).toStrictEqual([
       { [ContentTypes.TEXT]: 'Here\'s your answer.', type: ContentTypes.TEXT },
+    ]);
+  });
+
+  it('preserves tool-only assistant turn boundaries when converting messages to content', () => {
+    const messages = [
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          {
+            id: 'call_1',
+            name: 'lookup',
+            args: { step: 1 },
+            type: 'tool_call' as const,
+          },
+        ],
+      }),
+      new ToolMessage({
+        content: 'first result',
+        tool_call_id: 'call_1',
+        name: 'lookup',
+      }),
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          {
+            id: 'call_2',
+            name: 'lookup',
+            args: { step: 2 },
+            type: 'tool_call' as const,
+          },
+        ],
+      }),
+      new ToolMessage({
+        content: 'second result',
+        tool_call_id: 'call_2',
+        name: 'lookup',
+      }),
+    ];
+
+    const content = convertMessagesToContent(messages);
+    expect(content).toHaveLength(4);
+    expect(content[0]).toMatchObject({
+      type: ContentTypes.TEXT,
+      text: '',
+      tool_call_ids: ['call_1'],
+    });
+    expect(content[1]).toMatchObject({
+      type: ContentTypes.TOOL_CALL,
+      tool_call: {
+        id: 'call_1',
+        name: 'lookup',
+        output: 'first result',
+      },
+    });
+    expect(content[2]).toMatchObject({
+      type: ContentTypes.TEXT,
+      text: '',
+      tool_call_ids: ['call_2'],
+    });
+    expect(content[3]).toMatchObject({
+      type: ContentTypes.TOOL_CALL,
+      tool_call: {
+        id: 'call_2',
+        name: 'lookup',
+        output: 'second result',
+      },
+    });
+
+    const result = formatAgentMessages([{ role: 'assistant', content }]);
+    expect(result.messages).toHaveLength(4);
+    expect(result.messages[0]).toBeInstanceOf(AIMessage);
+    expect(result.messages[1]).toBeInstanceOf(ToolMessage);
+    expect(result.messages[2]).toBeInstanceOf(AIMessage);
+    expect(result.messages[3]).toBeInstanceOf(ToolMessage);
+    expect((result.messages[0] as AIMessage).tool_calls?.[0].id).toBe(
+      'call_1'
+    );
+    expect((result.messages[1] as ToolMessage).tool_call_id).toBe('call_1');
+    expect((result.messages[2] as AIMessage).tool_calls?.[0].id).toBe(
+      'call_2'
+    );
+    expect((result.messages[3] as ToolMessage).tool_call_id).toBe('call_2');
+  });
+
+  it('keeps absent tool content empty when merging Anthropic artifacts', () => {
+    const toolMessage = new ToolMessage({
+      content: '',
+      tool_call_id: 'call_artifact',
+      name: 'render',
+      artifact: {
+        content: [{ type: ContentTypes.TEXT, text: 'artifact text' }],
+      },
+    });
+    Object.defineProperty(toolMessage, 'content', {
+      value: undefined,
+      writable: true,
+      configurable: true,
+    });
+
+    formatAnthropicArtifactContent([
+      new AIMessageChunk({
+        content: '',
+        tool_calls: [
+          {
+            id: 'call_artifact',
+            name: 'render',
+            args: {},
+            type: 'tool_call' as const,
+          },
+        ],
+      }),
+      toolMessage,
+    ]);
+
+    expect(toolMessage.content).toEqual([
+      { type: ContentTypes.TEXT, text: '' },
+      { type: ContentTypes.TEXT, text: 'artifact text' },
     ]);
   });
 
