@@ -6,6 +6,8 @@ import { ContentTypes, GraphEvents, Providers } from '@/common';
 import { createContentAggregator } from '@/stream';
 import { Run } from '@/run';
 
+type ReasoningKey = 'reasoning_content' | 'reasoning';
+
 class InvokeOnlyReasoningModel implements t.ChatModel {
   constructor(
     private readonly response: {
@@ -27,9 +29,45 @@ class InvokeOnlyReasoningModel implements t.ChatModel {
   }
 }
 
+class StreamingReasoningModel implements t.ChatModel {
+  constructor(private readonly chunks: AIMessageChunk[]) {}
+
+  async invoke(
+    _messages: BaseMessage[],
+    _config?: RunnableConfig
+  ): Promise<AIMessageChunk> {
+    return this.chunks[this.chunks.length - 1] ?? new AIMessageChunk('');
+  }
+
+  async stream(
+    _messages: BaseMessage[],
+    _config?: RunnableConfig
+  ): Promise<AsyncIterable<AIMessageChunk>> {
+    const chunks = this.chunks;
+    return (async function* streamChunks(): AsyncGenerator<AIMessageChunk> {
+      for (const chunk of chunks) {
+        yield chunk;
+      }
+    })();
+  }
+}
+
+function createReasoningChunk(
+  reasoningKey: ReasoningKey,
+  reasoningText: string
+): AIMessageChunk {
+  return new AIMessageChunk({
+    content: '',
+    additional_kwargs: {
+      [reasoningKey]: reasoningText,
+    },
+  });
+}
+
 function createReasoningHandlers(
   aggregateContent: t.ContentAggregator,
-  reasoningDeltas: t.ReasoningDeltaEvent[]
+  reasoningDeltas: t.ReasoningDeltaEvent[],
+  messageDeltas?: t.MessageDeltaEvent[]
 ): Record<string | GraphEvents, t.EventHandler> {
   return {
     [GraphEvents.ON_RUN_STEP]: {
@@ -42,7 +80,9 @@ function createReasoningHandlers(
         event: GraphEvents.ON_MESSAGE_DELTA,
         data: t.StreamEventData
       ): void => {
-        aggregateContent({ event, data: data as t.MessageDeltaEvent });
+        const messageDelta = data as t.MessageDeltaEvent;
+        messageDeltas?.push(messageDelta);
+        aggregateContent({ event, data: messageDelta });
       },
     },
     [GraphEvents.ON_REASONING_DELTA]: {
@@ -154,4 +194,139 @@ describe('StandardGraph final response reasoning fallback', () => {
       { type: ContentTypes.TEXT, text },
     ]);
   });
+
+  it.each([
+    {
+      providerName: 'DeepSeek',
+      provider: Providers.DEEPSEEK,
+      reasoningKey: 'reasoning_content' as const,
+    },
+    {
+      providerName: 'OpenRouter',
+      provider: Providers.OPENROUTER,
+      reasoningKey: 'reasoning' as const,
+    },
+  ])(
+    'does not replay streamed $providerName reasoning from the final fallback',
+    async ({ provider, providerName, reasoningKey }) => {
+      const text = 'Done.';
+      const reasoningText = 'Check the provider reasoning stream first.';
+      const firstReasoningChunk = reasoningText.slice(0, 19);
+      const secondReasoningChunk = reasoningText.slice(19);
+      const reasoningDeltas: t.ReasoningDeltaEvent[] = [];
+      const messageDeltas: t.MessageDeltaEvent[] = [];
+      const { contentParts, aggregateContent } = createContentAggregator();
+      const run = await Run.create<t.IState>({
+        runId: `reasoning-fallback-${providerName.toLowerCase()}-stream`,
+        graphConfig: {
+          type: 'standard',
+          llmConfig: {
+            provider,
+            streamUsage: false,
+          },
+          reasoningKey,
+        },
+        returnContent: true,
+        skipCleanup: true,
+        customHandlers: createReasoningHandlers(
+          aggregateContent,
+          reasoningDeltas,
+          messageDeltas
+        ),
+      });
+
+      if (!run.Graph) {
+        throw new Error('Expected graph to be initialized');
+      }
+
+      run.Graph.overrideModel = new StreamingReasoningModel([
+        createReasoningChunk(reasoningKey, firstReasoningChunk),
+        createReasoningChunk(reasoningKey, secondReasoningChunk),
+        new AIMessageChunk({ content: text }),
+      ]);
+
+      await run.processStream(
+        { messages: [new HumanMessage('stream provider reasoning')] },
+        {
+          ...config,
+          configurable: {
+            thread_id: `reasoning-fallback-${providerName.toLowerCase()}-stream`,
+          },
+        }
+      );
+
+      expect(reasoningDeltas).toHaveLength(2);
+      expect(messageDeltas).toHaveLength(1);
+      expect(contentParts).toEqual([
+        { type: ContentTypes.THINK, think: reasoningText },
+        { type: ContentTypes.TEXT, text },
+      ]);
+    }
+  );
+
+  it.each([
+    {
+      providerName: 'DeepSeek',
+      provider: Providers.DEEPSEEK,
+      reasoningKey: 'reasoning_content' as const,
+    },
+    {
+      providerName: 'OpenRouter',
+      provider: Providers.OPENROUTER,
+      reasoningKey: 'reasoning' as const,
+    },
+  ])(
+    'does not replay streamed reasoning-only $providerName output',
+    async ({ provider, providerName, reasoningKey }) => {
+      const reasoningText = 'The answer is still being considered.';
+      const firstReasoningChunk = reasoningText.slice(0, 14);
+      const secondReasoningChunk = reasoningText.slice(14);
+      const reasoningDeltas: t.ReasoningDeltaEvent[] = [];
+      const messageDeltas: t.MessageDeltaEvent[] = [];
+      const { contentParts, aggregateContent } = createContentAggregator();
+      const run = await Run.create<t.IState>({
+        runId: `reasoning-only-${providerName.toLowerCase()}-stream`,
+        graphConfig: {
+          type: 'standard',
+          llmConfig: {
+            provider,
+            streamUsage: false,
+          },
+          reasoningKey,
+        },
+        returnContent: true,
+        skipCleanup: true,
+        customHandlers: createReasoningHandlers(
+          aggregateContent,
+          reasoningDeltas,
+          messageDeltas
+        ),
+      });
+
+      if (!run.Graph) {
+        throw new Error('Expected graph to be initialized');
+      }
+
+      run.Graph.overrideModel = new StreamingReasoningModel([
+        createReasoningChunk(reasoningKey, firstReasoningChunk),
+        createReasoningChunk(reasoningKey, secondReasoningChunk),
+      ]);
+
+      await run.processStream(
+        { messages: [new HumanMessage('stream provider reasoning only')] },
+        {
+          ...config,
+          configurable: {
+            thread_id: `reasoning-only-${providerName.toLowerCase()}-stream`,
+          },
+        }
+      );
+
+      expect(reasoningDeltas).toHaveLength(2);
+      expect(messageDeltas).toHaveLength(0);
+      expect(contentParts).toEqual([
+        { type: ContentTypes.THINK, think: reasoningText },
+      ]);
+    }
+  );
 });
