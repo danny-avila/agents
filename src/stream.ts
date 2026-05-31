@@ -1317,6 +1317,14 @@ export function createContentAggregator(): t.ContentAggregatorResult {
     number,
     { agentId?: string; groupId?: number }
   >();
+  const getFirstContentPart = (
+    content?: t.MessageDelta['content'] | t.MessageContentComplex
+  ): t.MessageContentComplex | undefined => {
+    if (content == null) {
+      return undefined;
+    }
+    return Array.isArray(content) ? content[0] : content;
+  };
 
   const updateContent = (
     index: number,
@@ -1588,11 +1596,8 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         return;
       }
 
-      if (messageDelta.delta.content) {
-        const contentPart = Array.isArray(messageDelta.delta.content)
-          ? messageDelta.delta.content[0]
-          : messageDelta.delta.content;
-
+      const contentPart = getFirstContentPart(messageDelta.delta.content);
+      if (contentPart != null) {
         updateContent(runStep.index, contentPart);
       }
     } else if (
@@ -1612,11 +1617,8 @@ export function createContentAggregator(): t.ContentAggregatorResult {
         return;
       }
 
-      if (reasoningDelta.delta.content) {
-        const contentPart = Array.isArray(reasoningDelta.delta.content)
-          ? reasoningDelta.delta.content[0]
-          : reasoningDelta.delta.content;
-
+      const contentPart = getFirstContentPart(reasoningDelta.delta.content);
+      if (contentPart != null) {
         updateContent(runStep.index, contentPart);
       }
     } else if (event === GraphEvents.ON_RUN_STEP_DELTA) {

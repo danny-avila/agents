@@ -89,11 +89,206 @@ const { AGENT, TOOLS, SUMMARIZE } = GraphNodeKeys;
 /** Minimum relative variance before calibrated toolSchemaTokens overrides current value. */
 const CALIBRATION_VARIANCE_THRESHOLD = 0.15;
 
+type ReasoningKey = 'reasoning_content' | 'reasoning';
+type ReasoningSummary = { summary?: Array<{ text?: string }> };
+type ReasoningDetail = { type?: string; text?: string };
+
 function getHandlerDispatchedEventKey(
   eventName: string,
   stepId: string
 ): string {
   return `${eventName}:${stepId}`;
+}
+
+function getReasoningText(
+  value: string | Partial<ReasoningSummary> | null | undefined
+): string | undefined {
+  if (typeof value === 'string') {
+    return value !== '' ? value : undefined;
+  }
+  const summaryText = value?.summary
+    ?.map((summary) => summary.text ?? '')
+    .filter((text) => text !== '')
+    .join('');
+  return summaryText != null && summaryText !== '' ? summaryText : undefined;
+}
+
+function getReasoningDetailsText(
+  value: ReasoningDetail[] | null | undefined
+): string | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const reasoningText = value
+    .filter((detail) => detail.type === 'reasoning.text')
+    .map((detail) => detail.text ?? '')
+    .filter((text) => text !== '')
+    .join('');
+  return reasoningText !== '' ? reasoningText : undefined;
+}
+
+function getResponseReasoningContent({
+  responseMessage,
+  reasoningKey,
+}: {
+  responseMessage?: Partial<AIMessageChunk>;
+  reasoningKey: ReasoningKey;
+}): string | undefined {
+  const additionalKwargs = responseMessage?.additional_kwargs;
+  if (additionalKwargs == null) {
+    return undefined;
+  }
+
+  const keyedReasoning = getReasoningText(
+    additionalKwargs[reasoningKey] as
+      | string
+      | Partial<ReasoningSummary>
+      | null
+      | undefined
+  );
+  if (keyedReasoning != null) {
+    return keyedReasoning;
+  }
+
+  const reasoningContent = getReasoningText(
+    additionalKwargs.reasoning_content as
+      | string
+      | Partial<ReasoningSummary>
+      | null
+      | undefined
+  );
+  if (reasoningContent != null) {
+    return reasoningContent;
+  }
+
+  const reasoning = getReasoningText(
+    additionalKwargs.reasoning as
+      | string
+      | Partial<ReasoningSummary>
+      | null
+      | undefined
+  );
+  if (reasoning != null) {
+    return reasoning;
+  }
+
+  return getReasoningDetailsText(
+    additionalKwargs.reasoning_details as ReasoningDetail[] | null | undefined
+  );
+}
+
+function getTextMessageDeltaContent(
+  content: MessageContent | undefined
+): t.MessageDelta['content'] | undefined {
+  if (content == null) {
+    return undefined;
+  }
+  if (typeof content === 'string') {
+    return content !== ''
+      ? [{ type: ContentTypes.TEXT, text: content }]
+      : undefined;
+  }
+  if (content.length === 0) {
+    return undefined;
+  }
+  if (
+    !content.every(
+      (contentPart) =>
+        typeof contentPart === 'object' &&
+        'type' in contentPart &&
+        typeof contentPart.type === 'string' &&
+        contentPart.type.startsWith('text')
+    )
+  ) {
+    return undefined;
+  }
+  return content as t.MessageDelta['content'];
+}
+
+async function dispatchTextMessageContent({
+  graph,
+  stepKey,
+  content,
+  metadata,
+}: {
+  graph: Graph<t.BaseGraphState>;
+  stepKey: string;
+  content: t.MessageDelta['content'];
+  metadata: Record<string, unknown>;
+}): Promise<boolean> {
+  const messageId = getMessageId(stepKey, graph) ?? '';
+  if (!messageId) {
+    return false;
+  }
+  await graph.dispatchRunStep(
+    stepKey,
+    {
+      type: StepTypes.MESSAGE_CREATION,
+      message_creation: { message_id: messageId },
+    },
+    metadata
+  );
+  const stepId = graph.getStepIdByKey(stepKey);
+  await graph.dispatchMessageDelta(stepId, { content }, metadata);
+  return true;
+}
+
+async function dispatchReasoningContent({
+  graph,
+  agentContext,
+  reasoningContent,
+  metadata,
+}: {
+  graph: Graph<t.BaseGraphState>;
+  agentContext: AgentContext;
+  reasoningContent: string;
+  metadata: Record<string, unknown>;
+}): Promise<boolean> {
+  const previousTokenType = agentContext.currentTokenType;
+  const previousTokenTypeSwitch = agentContext.tokenTypeSwitch;
+  const previousTransitionCount = agentContext.reasoningTransitionCount;
+
+  agentContext.currentTokenType = ContentTypes.THINK;
+  agentContext.tokenTypeSwitch = 'reasoning';
+
+  const stepKey = graph.getStepKey(metadata);
+  const messageId = getMessageId(stepKey, graph) ?? '';
+  if (!messageId) {
+    agentContext.currentTokenType = previousTokenType;
+    agentContext.tokenTypeSwitch = previousTokenTypeSwitch;
+    agentContext.reasoningTransitionCount = previousTransitionCount;
+    return false;
+  }
+
+  await graph.dispatchRunStep(
+    stepKey,
+    {
+      type: StepTypes.MESSAGE_CREATION,
+      message_creation: { message_id: messageId },
+    },
+    metadata
+  );
+  const stepId = graph.getStepIdByKey(stepKey);
+  await graph.dispatchReasoningDelta(
+    stepId,
+    {
+      content: [{ type: ContentTypes.THINK, think: reasoningContent }],
+    },
+    metadata
+  );
+  return true;
+}
+
+function markPostReasoningContent(agentContext: AgentContext): void {
+  if (
+    agentContext.tokenTypeSwitch !== 'reasoning' ||
+    agentContext.currentTokenType === ContentTypes.TEXT
+  ) {
+    return;
+  }
+  agentContext.currentTokenType = ContentTypes.TEXT;
+  agentContext.tokenTypeSwitch = 'content';
+  agentContext.reasoningTransitionCount++;
 }
 
 export abstract class Graph<
@@ -1472,60 +1667,37 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       const toolCalls = (responseMessage as AIMessageChunk | undefined)
         ?.tool_calls;
       const hasToolCalls = Array.isArray(toolCalls) && toolCalls.length > 0;
+      const metadata = config.metadata as Record<string, unknown>;
+      const responseReasoningContent = getResponseReasoningContent({
+        responseMessage: responseMessage as Partial<AIMessageChunk> | undefined,
+        reasoningKey: agentContext.reasoningKey,
+      });
+      const textMessageContent = getTextMessageDeltaContent(
+        responseMessage?.content as MessageContent | undefined
+      );
 
       if (hasToolCalls) {
-        const metadata = config.metadata as Record<string, unknown>;
-        const stepKey = this.getStepKey(metadata);
-        const content = responseMessage?.content as MessageContent | undefined;
-        const hasTextContent =
-          content != null &&
-          (typeof content === 'string'
-            ? content !== ''
-            : Array.isArray(content) && content.length > 0);
-
-        /**
-         * Dispatch text content BEFORE creating TOOL_CALLS steps.
-         * getMessageId returns a new ID only on the first call for a step key;
-         * if the for-await consumer already claimed it, this is a no-op.
-         */
-        if (hasTextContent) {
-          const messageId = getMessageId(stepKey, this) ?? '';
-          if (messageId) {
-            await this.dispatchRunStep(
-              stepKey,
-              {
-                type: StepTypes.MESSAGE_CREATION,
-                message_creation: { message_id: messageId },
-              },
-              metadata
-            );
-            const stepId = this.getStepIdByKey(stepKey);
-            if (typeof content === 'string') {
-              await this.dispatchMessageDelta(
-                stepId,
-                {
-                  content: [{ type: ContentTypes.TEXT, text: content }],
-                },
-                metadata
-              );
-            } else if (
-              Array.isArray(content) &&
-              content.every(
-                (c) =>
-                  typeof c === 'object' &&
-                  'type' in c &&
-                  typeof c.type === 'string' &&
-                  c.type.startsWith('text')
-              )
-            ) {
-              await this.dispatchMessageDelta(
-                stepId,
-                {
-                  content: content as t.MessageDelta['content'],
-                },
-                metadata
-              );
-            }
+        const dispatchedReasoning =
+          responseReasoningContent != null &&
+          (await dispatchReasoningContent({
+            graph: this,
+            agentContext,
+            reasoningContent: responseReasoningContent,
+            metadata,
+          }));
+        if (dispatchedReasoning) {
+          markPostReasoningContent(agentContext);
+        }
+        if (textMessageContent != null) {
+          const stepKey = this.getStepKey(metadata);
+          const dispatchedText = await dispatchTextMessageContent({
+            graph: this,
+            stepKey,
+            content: textMessageContent,
+            metadata,
+          });
+          if (dispatchedText) {
+            markPostReasoningContent(agentContext);
           }
         }
 
@@ -1533,60 +1705,30 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }
 
       /**
-       * When streaming is disabled, on_chat_model_stream events are never
-       * emitted so ChatModelStreamHandler never fires. Dispatch the text
-       * content as MESSAGE_CREATION + MESSAGE_DELTA here.
+       * When streaming events are unavailable, ChatModelStreamHandler never
+       * fires. Dispatch final reasoning/text content here. getMessageId makes
+       * this a no-op when the streaming path already handled the same step.
        */
-      const disableStreaming =
-        (agentContext.clientOptions as t.OpenAIClientOptions | undefined)
-          ?.disableStreaming === true;
-
-      if (
-        disableStreaming &&
-        !hasToolCalls &&
-        responseMessage != null &&
-        (responseMessage.content as MessageContent | undefined) != null
-      ) {
-        const metadata = config.metadata as Record<string, unknown>;
-        const stepKey = this.getStepKey(metadata);
-        const messageId = getMessageId(stepKey, this) ?? '';
-        if (messageId) {
-          await this.dispatchRunStep(
+      if (!hasToolCalls && responseMessage != null) {
+        const dispatchedReasoning =
+          responseReasoningContent != null &&
+          (await dispatchReasoningContent({
+            graph: this,
+            agentContext,
+            reasoningContent: responseReasoningContent,
+            metadata,
+          }));
+        if (dispatchedReasoning && textMessageContent != null) {
+          markPostReasoningContent(agentContext);
+        }
+        if (textMessageContent != null) {
+          const stepKey = this.getStepKey(metadata);
+          await dispatchTextMessageContent({
+            graph: this,
             stepKey,
-            {
-              type: StepTypes.MESSAGE_CREATION,
-              message_creation: { message_id: messageId },
-            },
-            metadata
-          );
-          const stepId = this.getStepIdByKey(stepKey);
-          const content = responseMessage.content;
-          if (typeof content === 'string') {
-            await this.dispatchMessageDelta(
-              stepId,
-              {
-                content: [{ type: ContentTypes.TEXT, text: content }],
-              },
-              metadata
-            );
-          } else if (
-            Array.isArray(content) &&
-            content.every(
-              (c) =>
-                typeof c === 'object' &&
-                'type' in c &&
-                typeof c.type === 'string' &&
-                c.type.startsWith('text')
-            )
-          ) {
-            await this.dispatchMessageDelta(
-              stepId,
-              {
-                content: content as t.MessageDelta['content'],
-              },
-              metadata
-            );
-          }
+            content: textMessageContent,
+            metadata,
+          });
         }
       }
 

@@ -283,10 +283,15 @@ const skipTests = process.env.MOONSHOT_API_KEY == null;
       const finalContentParts = await run.processStream(inputs, testConfig);
       expect(finalContentParts).toBeDefined();
 
-      const allTextParts = finalContentParts?.every(
-        (part) => part.type === ContentTypes.TEXT
+      const supportedContentParts = finalContentParts?.every(
+        (part) =>
+          part.type === ContentTypes.TEXT || part.type === ContentTypes.THINK
       );
-      expect(allTextParts).toBe(true);
+      expect(supportedContentParts).toBe(true);
+      const textParts =
+        finalContentParts?.filter((part) => part.type === ContentTypes.TEXT) ??
+        [];
+      expect(textParts.length).toBeGreaterThan(0);
 
       expect(collectedUsage.length).toBeGreaterThan(0);
       expect(collectedUsage[0].input_tokens).toBeGreaterThan(0);
