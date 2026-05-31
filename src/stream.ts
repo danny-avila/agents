@@ -42,6 +42,10 @@ const LOCAL_CODING_BUNDLE_NAME_SET: ReadonlySet<string> = new Set(
   LOCAL_CODING_BUNDLE_NAMES
 );
 
+type ReasoningSummaryLike = {
+  summary?: Array<{ text?: string }>;
+};
+
 /**
  * Parses content to extract thinking sections enclosed in <think> tags using string operations
  * @param content The content to parse
@@ -931,9 +935,91 @@ export function getChunkContent({
     }
     return chunk?.content;
   }
+  const keyedReasoning = chunk?.additional_kwargs?.[reasoningKey] as
+    | string
+    | undefined;
+  if (
+    typeof chunk?.content === 'string' &&
+    chunk.content !== '' &&
+    keyedReasoning != null &&
+    keyedReasoning !== ''
+  ) {
+    return chunk.content;
+  }
+  return ((keyedReasoning as string | undefined) ?? '') || chunk?.content;
+}
+
+function isDisableStreamingEnabled(
+  clientOptions: t.ClientOptions | undefined
+): boolean {
   return (
-    ((chunk?.additional_kwargs?.[reasoningKey] as string | undefined) ?? '') ||
-    chunk?.content
+    clientOptions != null &&
+    'disableStreaming' in clientOptions &&
+    clientOptions.disableStreaming === true
+  );
+}
+
+function hasReasoningContent(
+  value: string | ReasoningSummaryLike | object[] | null | undefined
+): boolean {
+  if (typeof value === 'string') {
+    return value !== '';
+  }
+  if (Array.isArray(value)) {
+    return value.length > 0;
+  }
+  if (value == null) {
+    return false;
+  }
+  return (
+    value.summary?.some(
+      (summary) => summary.text != null && summary.text.length > 0
+    ) === true
+  );
+}
+
+function shouldDeferDisableStreamingMixedFinalChunk({
+  chunk,
+  agentContext,
+}: {
+  chunk: Partial<AIMessageChunk>;
+  agentContext: AgentContext;
+}): boolean {
+  if (!isDisableStreamingEnabled(agentContext.clientOptions)) {
+    return false;
+  }
+  if (
+    (chunk.tool_calls?.length ?? 0) > 0 ||
+    (chunk.tool_call_chunks?.length ?? 0) > 0 ||
+    typeof chunk.content !== 'string' ||
+    chunk.content === ''
+  ) {
+    return false;
+  }
+  const additionalKwargs = chunk.additional_kwargs;
+  return (
+    hasReasoningContent(
+      additionalKwargs?.[agentContext.reasoningKey] as
+        | string
+        | ReasoningSummaryLike
+        | null
+        | undefined
+    ) ||
+    hasReasoningContent(
+      additionalKwargs?.reasoning_content as
+        | string
+        | ReasoningSummaryLike
+        | null
+        | undefined
+    ) ||
+    hasReasoningContent(
+      additionalKwargs?.reasoning as
+        | string
+        | ReasoningSummaryLike
+        | null
+        | undefined
+    ) ||
+    hasReasoningContent(additionalKwargs?.reasoning_details as object[])
   );
 }
 
@@ -972,6 +1058,9 @@ export class ChatModelStreamHandler implements t.EventHandler {
       agentContext,
     });
     if (skipHandling) {
+      return;
+    }
+    if (shouldDeferDisableStreamingMixedFinalChunk({ chunk, agentContext })) {
       return;
     }
     this.handleReasoning(chunk, agentContext);

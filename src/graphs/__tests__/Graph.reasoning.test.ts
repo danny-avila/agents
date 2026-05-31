@@ -105,7 +105,9 @@ function createReasoningChunk(
   });
 }
 
-function createOpenAIReasoningSummaryChunk(reasoningText: string): AIMessageChunk {
+function createOpenAIReasoningSummaryChunk(
+  reasoningText: string
+): AIMessageChunk {
   return new AIMessageChunk({
     content: '',
     additional_kwargs: {
@@ -123,7 +125,10 @@ function createReasoningHandlers(
 ): Record<string | GraphEvents, t.EventHandler> {
   return {
     [GraphEvents.ON_RUN_STEP]: {
-      handle: (event: GraphEvents.ON_RUN_STEP, data: t.StreamEventData): void => {
+      handle: (
+        event: GraphEvents.ON_RUN_STEP,
+        data: t.StreamEventData
+      ): void => {
         aggregateContent({ event, data: data as t.RunStep });
       },
     },
@@ -320,6 +325,58 @@ describe('StandardGraph final response reasoning fallback', () => {
       config
     );
 
+    expect(contentParts).toEqual([
+      { type: ContentTypes.THINK, think: reasoningText },
+      { type: ContentTypes.TEXT, text },
+    ]);
+  });
+
+  it('uses the final fallback for one-shot disableStreaming mixed chunks', async () => {
+    const text = 'Cloudflare content check.';
+    const reasoningText = 'Plan the exact final wording.';
+    const reasoningDeltas: t.ReasoningDeltaEvent[] = [];
+    const messageDeltas: t.MessageDeltaEvent[] = [];
+    const { contentParts, aggregateContent } = createContentAggregator();
+    const run = await Run.create<t.IState>({
+      runId: 'reasoning-fallback-disable-streaming-mixed-final-chunk',
+      graphConfig: {
+        type: 'standard',
+        llmConfig,
+      },
+      returnContent: true,
+      skipCleanup: true,
+      customHandlers: createReasoningHandlers(
+        aggregateContent,
+        reasoningDeltas,
+        messageDeltas
+      ),
+    });
+
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+
+    run.Graph.overrideModel = new StreamingReasoningModel([
+      new AIMessageChunk({
+        content: text,
+        additional_kwargs: {
+          reasoning_content: reasoningText,
+        },
+      }),
+    ]);
+
+    await run.processStream(
+      { messages: [new HumanMessage('return mixed final chunk')] },
+      {
+        ...config,
+        configurable: {
+          thread_id: 'reasoning-fallback-disable-streaming-mixed-final-chunk',
+        },
+      }
+    );
+
+    expect(reasoningDeltas).toHaveLength(1);
+    expect(messageDeltas).toHaveLength(1);
     expect(contentParts).toEqual([
       { type: ContentTypes.THINK, think: reasoningText },
       { type: ContentTypes.TEXT, text },
