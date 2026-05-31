@@ -1,9 +1,13 @@
 import { AIMessageChunk, HumanMessage } from '@langchain/core/messages';
+import { ChatGenerationChunk } from '@langchain/core/outputs';
+import { FakeListChatModel } from '@langchain/core/utils/testing';
+import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { RunnableConfig } from '@langchain/core/runnables';
-import type { BaseMessage } from '@langchain/core/messages';
+import type { BaseMessage, UsageMetadata } from '@langchain/core/messages';
 import type * as t from '@/types';
 import { ContentTypes, GraphEvents, Providers } from '@/common';
 import { createContentAggregator } from '@/stream';
+import { ModelEndHandler, ToolEndHandler } from '@/events';
 import { Run } from '@/run';
 
 type ReasoningKey = 'reasoning_content' | 'reasoning';
@@ -49,6 +53,32 @@ class StreamingReasoningModel implements t.ChatModel {
         yield chunk;
       }
     })();
+  }
+}
+
+class CallbackStreamingReasoningModel extends FakeListChatModel {
+  constructor(private readonly chunks: AIMessageChunk[]) {
+    super({ responses: [''] });
+  }
+
+  _llmType(): string {
+    return 'callback-streaming-reasoning';
+  }
+
+  async *_streamResponseChunks(
+    _messages: BaseMessage[],
+    _options: this['ParsedCallOptions'],
+    runManager?: CallbackManagerForLLMRun
+  ): AsyncGenerator<ChatGenerationChunk> {
+    for (const chunk of this.chunks) {
+      const text = typeof chunk.content === 'string' ? chunk.content : '';
+      yield new ChatGenerationChunk({
+        text,
+        generationInfo: {},
+        message: chunk,
+      });
+      void runManager?.handleLLMNewToken(text);
+    }
   }
 }
 
@@ -105,6 +135,83 @@ function createReasoningHandlers(
         reasoningDeltas.push(reasoningDelta);
         aggregateContent({ event, data: reasoningDelta });
       },
+    },
+  };
+}
+
+function createLibreChatLikeHandlers({
+  aggregateContent,
+  collectedUsage,
+  emittedEvents,
+}: {
+  aggregateContent: t.ContentAggregator;
+  collectedUsage: UsageMetadata[];
+  emittedEvents: Array<{ event: string; data: unknown }>;
+}): Record<string | GraphEvents, t.EventHandler> {
+  const modelEndHandler = new ModelEndHandler(collectedUsage);
+  const toolEndHandler = new ToolEndHandler();
+  const aggregateAndEmit = (
+    event: GraphEvents,
+    data: t.StreamEventData
+  ): void => {
+    aggregateContent({
+      event,
+      data: data as
+        | t.RunStep
+        | t.MessageDeltaEvent
+        | t.ReasoningDeltaEvent
+        | t.RunStepDeltaEvent
+        | { result: t.ToolEndEvent },
+    });
+    emittedEvents.push({
+      event,
+      data,
+    });
+  };
+
+  return {
+    [GraphEvents.CHAT_MODEL_END]: {
+      handle: async (event, data, metadata, graph): Promise<void> => {
+        await modelEndHandler.handle(
+          event,
+          data as t.ModelEndData,
+          metadata,
+          graph
+        );
+        emittedEvents.push({
+          event,
+          data,
+        });
+      },
+    },
+    [GraphEvents.TOOL_END]: toolEndHandler,
+    [GraphEvents.ON_RUN_STEP]: {
+      handle: (event: GraphEvents.ON_RUN_STEP, data: t.StreamEventData): void =>
+        aggregateAndEmit(event, data),
+    },
+    [GraphEvents.ON_RUN_STEP_DELTA]: {
+      handle: (
+        event: GraphEvents.ON_RUN_STEP_DELTA,
+        data: t.StreamEventData
+      ): void => aggregateAndEmit(event, data),
+    },
+    [GraphEvents.ON_RUN_STEP_COMPLETED]: {
+      handle: (
+        event: GraphEvents.ON_RUN_STEP_COMPLETED,
+        data: t.StreamEventData
+      ): void => aggregateAndEmit(event, data),
+    },
+    [GraphEvents.ON_MESSAGE_DELTA]: {
+      handle: (
+        event: GraphEvents.ON_MESSAGE_DELTA,
+        data: t.StreamEventData
+      ): void => aggregateAndEmit(event, data),
+    },
+    [GraphEvents.ON_REASONING_DELTA]: {
+      handle: (
+        event: GraphEvents.ON_REASONING_DELTA,
+        data: t.StreamEventData
+      ): void => aggregateAndEmit(event, data),
     },
   };
 }
@@ -390,6 +497,75 @@ describe('StandardGraph final response reasoning fallback', () => {
 
     expect(reasoningDeltas).toHaveLength(2);
     expect(messageDeltas).toHaveLength(1);
+    expect(contentParts).toEqual([
+      { type: ContentTypes.THINK, think: reasoningText },
+      { type: ContentTypes.TEXT, text },
+    ]);
+  });
+
+  it('preserves LibreChat-like callbacks including model_end usage collection', async () => {
+    const text = 'Visible answer.';
+    const reasoningText = 'Visible reasoning.';
+    const usage: UsageMetadata = {
+      input_tokens: 7,
+      output_tokens: 5,
+      total_tokens: 12,
+      output_token_details: {
+        reasoning: 3,
+      },
+    };
+    const collectedUsage: UsageMetadata[] = [];
+    const emittedEvents: Array<{ event: string; data: unknown }> = [];
+    const { contentParts, aggregateContent } = createContentAggregator();
+    const run = await Run.create<t.IState>({
+      runId: 'reasoning-fallback-librechat-callbacks',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: Providers.DEEPSEEK,
+          streamUsage: false,
+        },
+      },
+      returnContent: true,
+      skipCleanup: true,
+      customHandlers: createLibreChatLikeHandlers({
+        aggregateContent,
+        collectedUsage,
+        emittedEvents,
+      }),
+    });
+
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+
+    run.Graph.overrideModel = new CallbackStreamingReasoningModel([
+      createReasoningChunk('reasoning_content', reasoningText.slice(0, 8)),
+      createReasoningChunk('reasoning_content', reasoningText.slice(8)),
+      new AIMessageChunk({
+        content: text,
+        usage_metadata: usage,
+      }),
+    ]);
+
+    await run.processStream(
+      { messages: [new HumanMessage('stream with LibreChat handlers')] },
+      {
+        ...config,
+        configurable: {
+          thread_id: 'reasoning-fallback-librechat-callbacks',
+        },
+      }
+    );
+
+    const countEvents = (event: GraphEvents): number =>
+      emittedEvents.filter((entry) => entry.event === event).length;
+
+    expect(countEvents(GraphEvents.ON_REASONING_DELTA)).toBe(2);
+    expect(countEvents(GraphEvents.ON_MESSAGE_DELTA)).toBe(1);
+    expect(countEvents(GraphEvents.CHAT_MODEL_END)).toBe(1);
+    expect(collectedUsage).toHaveLength(1);
+    expect(collectedUsage[0]).toMatchObject(usage);
     expect(contentParts).toEqual([
       { type: ContentTypes.THINK, think: reasoningText },
       { type: ContentTypes.TEXT, text },
