@@ -64,6 +64,17 @@ function createReasoningChunk(
   });
 }
 
+function createOpenAIReasoningSummaryChunk(reasoningText: string): AIMessageChunk {
+  return new AIMessageChunk({
+    content: '',
+    additional_kwargs: {
+      reasoning: {
+        summary: [{ text: reasoningText }],
+      },
+    },
+  });
+}
+
 function createReasoningHandlers(
   aggregateContent: t.ContentAggregator,
   reasoningDeltas: t.ReasoningDeltaEvent[],
@@ -329,4 +340,59 @@ describe('StandardGraph final response reasoning fallback', () => {
       ]);
     }
   );
+
+  it('does not replay streamed OpenAI reasoning summaries from the final fallback', async () => {
+    const text = 'Done.';
+    const reasoningText = 'Use the summary reasoning channel.';
+    const firstReasoningChunk = reasoningText.slice(0, 15);
+    const secondReasoningChunk = reasoningText.slice(15);
+    const reasoningDeltas: t.ReasoningDeltaEvent[] = [];
+    const messageDeltas: t.MessageDeltaEvent[] = [];
+    const { contentParts, aggregateContent } = createContentAggregator();
+    const run = await Run.create<t.IState>({
+      runId: 'reasoning-fallback-openai-summary-stream',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: Providers.OPENAI,
+          streamUsage: false,
+        },
+        reasoningKey: 'reasoning',
+      },
+      returnContent: true,
+      skipCleanup: true,
+      customHandlers: createReasoningHandlers(
+        aggregateContent,
+        reasoningDeltas,
+        messageDeltas
+      ),
+    });
+
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+
+    run.Graph.overrideModel = new StreamingReasoningModel([
+      createOpenAIReasoningSummaryChunk(firstReasoningChunk),
+      createOpenAIReasoningSummaryChunk(secondReasoningChunk),
+      new AIMessageChunk({ content: text }),
+    ]);
+
+    await run.processStream(
+      { messages: [new HumanMessage('stream OpenAI summary reasoning')] },
+      {
+        ...config,
+        configurable: {
+          thread_id: 'reasoning-fallback-openai-summary-stream',
+        },
+      }
+    );
+
+    expect(reasoningDeltas).toHaveLength(2);
+    expect(messageDeltas).toHaveLength(1);
+    expect(contentParts).toEqual([
+      { type: ContentTypes.THINK, think: reasoningText },
+      { type: ContentTypes.TEXT, text },
+    ]);
+  });
 });
