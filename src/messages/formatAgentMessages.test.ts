@@ -469,6 +469,25 @@ describe('formatAgentMessages', () => {
     expect(result.messages[1].content).toBe('Test received.');
   });
 
+  it('preserves whitespace-sensitive text when flattening assistant content', () => {
+    const preformatted = '    def foo():\n        return 1\n';
+    const payload: TPayload = [
+      { role: 'user', content: 'Show me indented code' },
+      {
+        role: 'assistant',
+        content: [
+          { type: ContentTypes.TEXT, [ContentTypes.TEXT]: preformatted },
+        ],
+      },
+      { role: 'user', content: 'Thanks' },
+    ];
+    const result = formatAgentMessages(payload);
+    expect(result.messages[1]).toBeInstanceOf(AIMessage);
+    expect(typeof result.messages[1].content).toBe('string');
+    // Leading indentation and the trailing newline must survive the flatten.
+    expect(result.messages[1].content).toBe(preformatted);
+  });
+
   it('should heal invalid tool call structure by creating a preceding AIMessage', () => {
     const payload = [
       {

@@ -374,23 +374,23 @@ function getToolUseId(part: MessageContentComplex): string | undefined {
 /**
  * Builds the `content` for an assistant message in a single pass.
  *
- * Text-only parts are joined into a string because the Chat Completions
- * schema requires `assistant.content` to be a string; an array of text parts
- * is rejected by strict OpenAI-compatible proxies. Parts with any non-text
- * block keep their array shape.
+ * Text-only parts are joined with a newline into a string. The original text is
+ * not trimmed, so whitespace-sensitive replies (indented code, trailing
+ * newlines) replay verbatim. Parts with any non-text block keep their array
+ * shape.
  *
  * @param parts - The accumulated assistant content parts.
  * @returns A string for text-only content, otherwise the content array.
  */
 function buildAssistantContent(parts: MessageContentComplex[]): MessageContent {
-  let text = '';
+  const texts: string[] = [];
   for (const part of parts) {
     if (part.type !== ContentTypes.TEXT) {
       return toLangChainContent(parts);
     }
-    text += `${getTextContent(part)}\n`;
+    texts.push(getTextContent(part));
   }
-  return text.trim();
+  return texts.join('\n');
 }
 
 /**
