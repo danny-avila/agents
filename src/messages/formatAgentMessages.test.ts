@@ -14,6 +14,23 @@ import {
 import { _convertMessagesToAnthropicPayload } from '@/llm/anthropic/utils/message_inputs';
 import { Constants, ContentTypes, Providers } from '@/common';
 
+type AnthropicPayloadBlock = {
+  content?: unknown;
+  id?: string;
+  input?: unknown;
+  name?: string;
+  text?: string;
+  tool_use_id?: string;
+  type: string;
+};
+
+const getAnthropicPayloadBlocks = (
+  content: unknown
+): AnthropicPayloadBlock[] => {
+  expect(Array.isArray(content)).toBe(true);
+  return content as AnthropicPayloadBlock[];
+};
+
 describe('formatAgentMessages', () => {
   it('should format simple user and AI messages', () => {
     const payload: TPayload = [
@@ -271,8 +288,9 @@ describe('formatAgentMessages', () => {
 
     expect(result.messages).toHaveLength(1);
     expect(result.messages[0]).toBeInstanceOf(AIMessage);
-    expect(result.messages.some((message) => message instanceof ToolMessage))
-      .toBe(false);
+    expect(
+      result.messages.some((message) => message instanceof ToolMessage)
+    ).toBe(false);
     expect((result.messages[0] as AIMessage).tool_calls).toHaveLength(0);
     expect(result.messages[0].content).toEqual([
       {
@@ -387,6 +405,205 @@ describe('formatAgentMessages', () => {
         }
       }
     }
+  });
+
+  it('preserves Anthropic Vertex web search pair when mixed with regular tool calls', () => {
+    const serverToolId = `${Constants.ANTHROPIC_SERVER_TOOL_PREFIX}vrtx_search_1`;
+    const calculatorToolId = 'toolu_calc_1';
+    const payload: TPayload = [
+      {
+        role: 'user',
+        content: 'Search current Claude Vertex docs and calculate 6 * 7.',
+      },
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: serverToolId,
+              name: 'web_search',
+              args: '{"query":"Claude Vertex web search"}',
+            },
+          },
+          {
+            type: ContentTypes.TEXT,
+            text: 'I will calculate the number too.',
+            tool_call_ids: [calculatorToolId],
+          },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: calculatorToolId,
+              name: 'calculator',
+              args: '{"expression":"6*7"}',
+              output: '42',
+            },
+          },
+          {
+            type: 'web_search_tool_result',
+            tool_use_id: serverToolId,
+            content: [
+              {
+                type: 'web_search_result',
+                url: 'https://example.com/claude-vertex',
+                title: 'Claude on Vertex',
+                encrypted_content: 'opaque',
+                page_age: '1d',
+              },
+            ],
+          } as MessageContentComplex,
+          {
+            type: ContentTypes.TEXT,
+            text: ' \n\t ',
+          },
+          {
+            type: ContentTypes.TEXT,
+            text: 'The calculation result is 42.',
+          },
+        ],
+      },
+      {
+        role: 'user',
+        content: 'Follow up on that.',
+      },
+    ];
+
+    const { messages } = formatAgentMessages(
+      payload,
+      undefined,
+      new Set(['web_search', 'calculator']),
+      undefined,
+      { provider: Providers.ANTHROPIC }
+    );
+    const anthropicPayload = _convertMessagesToAnthropicPayload(messages);
+    const allBlocks = anthropicPayload.messages.flatMap((message) =>
+      typeof message.content === 'string'
+        ? []
+        : getAnthropicPayloadBlocks(message.content)
+    );
+    const serverToolMessageBlocks = anthropicPayload.messages
+      .map((message) =>
+        typeof message.content === 'string'
+          ? []
+          : getAnthropicPayloadBlocks(message.content)
+      )
+      .find((blocks) => blocks.some((block) => block.id === serverToolId));
+    const serverToolUseBlocks = allBlocks.filter(
+      (block) => block.type === 'server_tool_use'
+    );
+    const webSearchResultBlocks = allBlocks.filter(
+      (block) => block.type === 'web_search_tool_result'
+    );
+    const regularToolUseBlocks = allBlocks.filter(
+      (block) => block.type === 'tool_use' && block.id === calculatorToolId
+    );
+    const whitespaceTextBlocks = allBlocks.filter(
+      (block) =>
+        block.type === ContentTypes.TEXT &&
+        typeof block.text === 'string' &&
+        block.text.trim().length === 0
+    );
+
+    expect(messages.some((message) => message instanceof ToolMessage)).toBe(
+      true
+    );
+    expect(
+      messages.some(
+        (message) =>
+          message instanceof ToolMessage &&
+          message.tool_call_id === serverToolId
+      )
+    ).toBe(false);
+    expect(serverToolUseBlocks).toEqual([
+      {
+        type: 'server_tool_use',
+        id: serverToolId,
+        name: 'web_search',
+        input: { query: 'Claude Vertex web search' },
+      },
+    ]);
+    expect(webSearchResultBlocks).toHaveLength(1);
+    expect(webSearchResultBlocks[0].tool_use_id).toBe(serverToolId);
+    expect(serverToolMessageBlocks).toBeDefined();
+    expect(
+      serverToolMessageBlocks?.findIndex((block) => block.id === serverToolId)
+    ).toBeLessThan(
+      serverToolMessageBlocks?.findIndex(
+        (block) => block.tool_use_id === serverToolId
+      ) ?? -1
+    );
+    expect(regularToolUseBlocks).toHaveLength(1);
+    expect(whitespaceTextBlocks).toHaveLength(0);
+  });
+
+  it('drops unpaired historical Anthropic Vertex web search calls from mixed turns', () => {
+    const serverToolId = `${Constants.ANTHROPIC_SERVER_TOOL_PREFIX}vrtx_missing_result`;
+    const calculatorToolId = 'toolu_calc_1';
+    const payload: TPayload = [
+      {
+        role: 'user',
+        content: 'Search for current Claude info and calculate 6 * 7.',
+      },
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: serverToolId,
+              name: 'web_search',
+              args: '{"query":"Claude Vertex web search"}',
+              output: 'Search results were formatted for the assistant.',
+            },
+          },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: calculatorToolId,
+              name: 'calculator',
+              args: '{"expression":"6*7"}',
+              output: '42',
+            },
+          },
+        ],
+      },
+      {
+        role: 'user',
+        content: 'Follow up on that.',
+      },
+    ];
+
+    const { messages } = formatAgentMessages(
+      payload,
+      undefined,
+      new Set(['web_search', 'calculator']),
+      undefined,
+      { provider: Providers.ANTHROPIC }
+    );
+    const anthropicPayload = _convertMessagesToAnthropicPayload(messages);
+    const allBlocks = anthropicPayload.messages.flatMap((message) =>
+      typeof message.content === 'string'
+        ? []
+        : getAnthropicPayloadBlocks(message.content)
+    );
+
+    expect(
+      messages.some(
+        (message) =>
+          message instanceof ToolMessage &&
+          message.tool_call_id === serverToolId
+      )
+    ).toBe(false);
+    expect(allBlocks.some((block) => block.id === serverToolId)).toBe(false);
+    expect(allBlocks.some((block) => block.tool_use_id === serverToolId)).toBe(
+      false
+    );
+    expect(
+      allBlocks.some(
+        (block) => block.type === 'tool_use' && block.id === calculatorToolId
+      )
+    ).toBe(true);
   });
 
   it('should handle malformed tool call entries with missing tool_call property', () => {
@@ -695,13 +912,9 @@ describe('formatAgentMessages', () => {
     expect(result.messages[1]).toBeInstanceOf(ToolMessage);
     expect(result.messages[2]).toBeInstanceOf(AIMessage);
     expect(result.messages[3]).toBeInstanceOf(ToolMessage);
-    expect((result.messages[0] as AIMessage).tool_calls?.[0].id).toBe(
-      'call_1'
-    );
+    expect((result.messages[0] as AIMessage).tool_calls?.[0].id).toBe('call_1');
     expect((result.messages[1] as ToolMessage).tool_call_id).toBe('call_1');
-    expect((result.messages[2] as AIMessage).tool_calls?.[0].id).toBe(
-      'call_2'
-    );
+    expect((result.messages[2] as AIMessage).tool_calls?.[0].id).toBe('call_2');
     expect((result.messages[3] as ToolMessage).tool_call_id).toBe('call_2');
   });
 

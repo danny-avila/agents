@@ -284,6 +284,7 @@ export const formatFromLangChain = (
 };
 
 interface FormatAssistantMessageOptions {
+  preserveUnpairedServerToolUses?: boolean;
   preserveReasoningContent?: boolean;
   provider?: Providers;
 }
@@ -390,6 +391,7 @@ function formatAssistantMessage(
   const pendingServerToolUses = new Map<string, MessageContentComplex>();
   const shouldPreserveReasoningContent =
     options?.preserveReasoningContent === true;
+  const serverToolResultIds = new Set<string>();
 
   const takePendingReasoningContent = (): string | undefined => {
     if (!shouldPreserveReasoningContent || !pendingReasoningContent) {
@@ -442,10 +444,26 @@ function formatAssistantMessage(
         continue;
       }
       const toolUseId = getToolUseId(part);
+      if (
+        toolUseId?.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX) === true
+      ) {
+        serverToolResultIds.add(toolUseId);
+      }
+    }
+
+    for (const part of contentParts) {
+      if (part == null) {
+        continue;
+      }
+      const toolUseId = getToolUseId(part);
       if (toolUseId != null) {
         flushPendingServerToolUse(toolUseId);
       } else if (hasMeaningfulAssistantContent(part)) {
-        pendingServerToolUses.clear();
+        for (const id of pendingServerToolUses.keys()) {
+          if (!serverToolResultIds.has(id)) {
+            pendingServerToolUses.delete(id);
+          }
+        }
       }
       if (part.type === ContentTypes.TEXT && part.tool_call_ids) {
         /*
@@ -494,6 +512,12 @@ function formatAssistantMessage(
           typeof _tool_call.id === 'string' &&
           _tool_call.id.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX)
         ) {
+          if (
+            !serverToolResultIds.has(_tool_call.id) &&
+            options.preserveUnpairedServerToolUses !== true
+          ) {
+            continue;
+          }
           if (
             emittedServerToolUseIds.has(_tool_call.id) ||
             pendingServerToolUses.has(_tool_call.id)
@@ -1254,6 +1278,7 @@ export const formatAgentMessages = (
     }
 
     const formattedMessages = formatAssistantMessage(processedMessage, {
+      preserveUnpairedServerToolUses: i === payload.length - 1,
       preserveReasoningContent: options?.provider === Providers.DEEPSEEK,
       provider: options?.provider,
     });
