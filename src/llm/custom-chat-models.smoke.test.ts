@@ -135,6 +135,22 @@ type OpenRouterReasoningStreamChoice = Omit<
 > & {
   delta: OpenRouterReasoningStreamDelta;
 };
+type OpenAICompatibleReasoningStreamDelta =
+  OpenAIClient.Chat.Completions.ChatCompletionChunk.Choice.Delta & {
+    reasoning?: string;
+    reasoning_details?: Array<{
+      type: 'reasoning.text';
+      text?: string;
+      format?: string;
+      index?: number;
+    }>;
+  };
+type OpenAICompatibleReasoningStreamChoice = Omit<
+  OpenAIClient.Chat.Completions.ChatCompletionChunk.Choice,
+  'delta'
+> & {
+  delta: OpenAICompatibleReasoningStreamDelta;
+};
 type PromptTokensDetailsWithCacheWrite = NonNullable<
   OpenAIClient.Completions.CompletionUsage['prompt_tokens_details']
 > & {
@@ -470,6 +486,104 @@ describe('custom chat model class smoke tests', () => {
         streaming: true,
       })
     );
+  });
+
+  it('preserves OpenAI-compatible reasoning deltas during OpenAI streaming', async () => {
+    const model = new ChatOpenAI({
+      model: 'openai/gpt-oss-120b',
+      apiKey: 'test-key',
+      streaming: true,
+    });
+    const completions = (model as unknown as StreamingCompletionBackedModel)
+      .completions;
+    const createChunk = (
+      choice: OpenAICompatibleReasoningStreamChoice
+    ): OpenAIClient.Chat.Completions.ChatCompletionChunk => ({
+      id: 'chatcmpl-openai-compatible-reasoning',
+      object: 'chat.completion.chunk',
+      created: 0,
+      model: 'openai/gpt-oss-120b',
+      choices: [choice],
+    });
+
+    async function* streamChunks(): AsyncGenerator<OpenAIClient.Chat.Completions.ChatCompletionChunk> {
+      yield createChunk({
+        index: 0,
+        delta: {
+          role: 'assistant',
+          content: '',
+        },
+        finish_reason: null,
+      });
+      yield createChunk({
+        index: 0,
+        delta: {
+          reasoning: 'Think ',
+          reasoning_details: [
+            {
+              type: 'reasoning.text',
+              text: 'Think ',
+              format: 'text',
+              index: 0,
+            },
+          ],
+        },
+        finish_reason: null,
+      });
+      yield createChunk({
+        index: 0,
+        delta: {
+          reasoning: 'hard',
+          reasoning_details: [
+            {
+              type: 'reasoning.text',
+              text: 'hard',
+              format: 'text',
+              index: 0,
+            },
+          ],
+        },
+        finish_reason: null,
+      });
+      yield createChunk({
+        index: 0,
+        delta: { content: 'answer' },
+        finish_reason: 'stop',
+      });
+    }
+
+    completions.completionWithRetry = async (): Promise<
+      AsyncIterable<OpenAIClient.Chat.Completions.ChatCompletionChunk>
+    > => streamChunks();
+
+    const chunks: AIMessageChunk[] = [];
+    const stream = await model.stream([new HumanMessage('think')]);
+    for await (const chunk of stream) {
+      chunks.push(chunk);
+    }
+
+    expect(
+      chunks
+        .map((chunk) => chunk.additional_kwargs.reasoning_content)
+        .filter((reasoningContent) => reasoningContent != null)
+    ).toEqual(['Think ', 'hard']);
+    expect(chunks[1].additional_kwargs.reasoning_details).toEqual([
+      {
+        type: 'reasoning.text',
+        text: 'Think ',
+        format: 'text',
+        index: 0,
+      },
+    ]);
+    expect(chunks[2].additional_kwargs.reasoning_details).toEqual([
+      {
+        type: 'reasoning.text',
+        text: 'hard',
+        format: 'text',
+        index: 0,
+      },
+    ]);
+    expect(chunks.at(-1)?.content).toBe('answer');
   });
 
   it('skips custom OpenAI-compatible SSE events during Azure streaming', async () => {
