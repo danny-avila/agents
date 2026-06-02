@@ -606,6 +606,78 @@ describe('formatAgentMessages', () => {
     ).toBe(true);
   });
 
+  it('deduplicates repeated Anthropic Vertex client tool calls in replay payloads', () => {
+    const calculatorToolId = 'toolu_vrtx_calc_1';
+    const payload: TPayload = [
+      {
+        role: 'user',
+        content: 'Calculate 19 * 23.',
+      },
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: calculatorToolId,
+              name: 'calculator',
+              args: '{"input":"19 * 23"}',
+              output: '437',
+            },
+          },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: calculatorToolId,
+              name: 'calculator',
+              args: '',
+            },
+          },
+          {
+            type: ContentTypes.TEXT,
+            text: '437437',
+          },
+        ],
+      },
+      {
+        role: 'user',
+        content: 'What was the result?',
+      },
+    ];
+
+    const { messages } = formatAgentMessages(
+      payload,
+      undefined,
+      new Set(['calculator']),
+      undefined,
+      { provider: Providers.ANTHROPIC }
+    );
+    const anthropicPayload = _convertMessagesToAnthropicPayload(messages);
+    const allBlocks = anthropicPayload.messages.flatMap((message) =>
+      typeof message.content === 'string'
+        ? []
+        : getAnthropicPayloadBlocks(message.content)
+    );
+    const toolUseBlocks = allBlocks.filter(
+      (block) => block.type === 'tool_use' && block.id === calculatorToolId
+    );
+    const toolResultBlocks = allBlocks.filter(
+      (block) =>
+        block.type === 'tool_result' && block.tool_use_id === calculatorToolId
+    );
+
+    expect(toolUseBlocks).toEqual([
+      {
+        type: 'tool_use',
+        id: calculatorToolId,
+        name: 'calculator',
+        input: { input: '19 * 23' },
+      },
+    ]);
+    expect(toolResultBlocks).toHaveLength(1);
+    expect(toolResultBlocks[0].content).toBe('437');
+  });
+
   it('should handle malformed tool call entries with missing tool_call property', () => {
     const tools = new Set(['search']);
     const payload = [

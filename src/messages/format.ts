@@ -372,6 +372,22 @@ function getToolUseId(part: MessageContentComplex): string | undefined {
   return part.tool_use_id;
 }
 
+function getToolCallId(part: MessageContentComplex): string | undefined {
+  if (part.type !== ContentTypes.TOOL_CALL) {
+    return undefined;
+  }
+  const id = part.tool_call?.id;
+  return typeof id === 'string' && id !== '' ? id : undefined;
+}
+
+function hasToolCallOutput(part: MessageContentComplex): boolean {
+  if (part.type !== ContentTypes.TOOL_CALL) {
+    return false;
+  }
+  const output = part.tool_call?.output;
+  return output != null && output !== '';
+}
+
 /**
  * Helper function to format an assistant message
  * @param message The message to format
@@ -392,6 +408,7 @@ function formatAssistantMessage(
   const shouldPreserveReasoningContent =
     options?.preserveReasoningContent === true;
   const serverToolResultIds = new Set<string>();
+  const preferredToolCallParts = new Map<string, MessageContentComplex>();
 
   const takePendingReasoningContent = (): string | undefined => {
     if (!shouldPreserveReasoningContent || !pendingReasoningContent) {
@@ -449,6 +466,19 @@ function formatAssistantMessage(
       ) {
         serverToolResultIds.add(toolUseId);
       }
+      if (options?.provider === Providers.ANTHROPIC) {
+        const toolCallId = getToolCallId(part);
+        if (toolCallId == null) {
+          continue;
+        }
+        const preferredPart = preferredToolCallParts.get(toolCallId);
+        if (
+          preferredPart == null ||
+          (!hasToolCallOutput(preferredPart) && hasToolCallOutput(part))
+        ) {
+          preferredToolCallParts.set(toolCallId, part);
+        }
+      }
     }
 
     for (const part of contentParts) {
@@ -489,6 +519,14 @@ function formatAssistantMessage(
       } else if (part.type === ContentTypes.TOOL_CALL) {
         // Skip malformed tool call entries without tool_call property
         if (part.tool_call == null) {
+          continue;
+        }
+        const toolCallId = getToolCallId(part);
+        if (
+          options?.provider === Providers.ANTHROPIC &&
+          toolCallId != null &&
+          preferredToolCallParts.get(toolCallId) !== part
+        ) {
           continue;
         }
 
