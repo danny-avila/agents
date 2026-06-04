@@ -372,6 +372,28 @@ function getToolUseId(part: MessageContentComplex): string | undefined {
 }
 
 /**
+ * Builds the `content` for an assistant message in a single pass.
+ *
+ * Text-only parts are joined with a newline into a string. The original text is
+ * not trimmed, so whitespace-sensitive replies (indented code, trailing
+ * newlines) replay verbatim. Parts with any non-text block keep their array
+ * shape.
+ *
+ * @param parts - The accumulated assistant content parts.
+ * @returns A string for text-only content, otherwise the content array.
+ */
+function buildAssistantContent(parts: MessageContentComplex[]): MessageContent {
+  const texts: string[] = [];
+  for (const part of parts) {
+    if (part.type !== ContentTypes.TEXT) {
+      return toLangChainContent(parts);
+    }
+    texts.push(getTextContent(part));
+  }
+  return texts.join('\n');
+}
+
+/**
  * Helper function to format an assistant message
  * @param message The message to format
  * @param options Optional formatting options
@@ -384,7 +406,6 @@ function formatAssistantMessage(
   const formattedMessages: Array<AIMessage | ToolMessage> = [];
   let currentContent: MessageContentComplex[] = [];
   let lastAIMessage: AIMessage | null = null;
-  let hasReasoning = false;
   let pendingReasoningContent = '';
   const emittedServerToolUseIds = new Set<string>();
   const pendingServerToolUses = new Map<string, MessageContentComplex>();
@@ -550,7 +571,6 @@ function formatAssistantMessage(
         part.type === ContentTypes.REASONING_CONTENT ||
         part.type === 'redacted_thinking'
       ) {
-        hasReasoning = true;
         pendingReasoningContent += extractReasoningContent(part);
         continue;
       } else if (
@@ -571,24 +591,11 @@ function formatAssistantMessage(
     }
   }
 
-  if (hasReasoning && currentContent.length > 0) {
-    let content = '';
-    for (const part of currentContent) {
-      if (part.type !== ContentTypes.TEXT) {
-        formattedMessages.push(
-          createAIMessage(toLangChainContent(currentContent))
-        );
-        return formattedMessages;
-      }
-      content += `${getTextContent(part)}\n`;
-    }
-    content = content.trim();
-
-    if (content) {
+  if (currentContent.length > 0) {
+    const content = buildAssistantContent(currentContent);
+    if (content !== '') {
       formattedMessages.push(createAIMessage(content));
     }
-  } else if (currentContent.length > 0) {
-    formattedMessages.push(createAIMessage(toLangChainContent(currentContent)));
   }
 
   return formattedMessages;
