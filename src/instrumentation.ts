@@ -12,7 +12,10 @@ import {
   getContextLangfuseConfig,
 } from '@/langfuseToolOutputTracing';
 import { isPresent } from '@/utils/misc';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { createHash, randomBytes } from 'node:crypto';
 import type {
+  IdGenerator,
   ReadableSpan,
   Span,
   SpanProcessor,
@@ -20,6 +23,43 @@ import type {
 import type { LangfuseSpanProcessorParams } from '@langfuse/otel';
 import type { Context } from '@opentelemetry/api';
 import type * as t from '@/types';
+
+/**
+ * Per-run seed for deterministic Langfuse trace ids. When a run opts in
+ * (`LangfuseConfig.deterministicTraceId`), it executes its stream inside
+ * `runWithTraceIdSeed(runId, …)` and the IdGenerator below derives the root
+ * trace id from that seed instead of a random one. This lets external systems
+ * (e.g. a host app recording user feedback after the fact) attach scores or
+ * observations to the trace by regenerating the same id from the run/message
+ * id — no trace lookup required. With no active seed it falls back to random
+ * ids, so default behavior is unchanged.
+ */
+const traceIdSeedStore = new AsyncLocalStorage<string>();
+
+export function runWithTraceIdSeed<T>(
+  seed: string | undefined,
+  fn: () => T
+): T {
+  return isPresent(seed) ? traceIdSeedStore.run(seed, fn) : fn();
+}
+
+/** sha256(seed) → first 32 hex chars; matches `@langfuse/tracing` `createTraceId`. */
+function traceIdFromSeed(seed: string): string {
+  return createHash('sha256').update(seed, 'utf8').digest('hex').slice(0, 32);
+}
+
+class SeededTraceIdGenerator implements IdGenerator {
+  generateTraceId(): string {
+    const seed = traceIdSeedStore.getStore();
+    return isPresent(seed)
+      ? traceIdFromSeed(seed)
+      : randomBytes(16).toString('hex');
+  }
+
+  generateSpanId(): string {
+    return randomBytes(8).toString('hex');
+  }
+}
 
 let langfuseTracerProvider: BasicTracerProvider | undefined;
 let langfuseRoutingSpanProcessor: RoutingLangfuseSpanProcessor | undefined;
@@ -163,6 +203,7 @@ export function initializeLangfuseTracing(
   langfuseRoutingSpanProcessor.ensureProcessor(langfuse);
   langfuseTracerProvider = new BasicTracerProvider({
     spanProcessors: [langfuseRoutingSpanProcessor],
+    idGenerator: new SeededTraceIdGenerator(),
   });
 
   setLangfuseTracerProvider(langfuseTracerProvider);

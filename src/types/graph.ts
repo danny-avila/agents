@@ -445,6 +445,14 @@ export interface LangfuseConfig {
   baseUrl?: string;
   toolNodeTracing?: LangfuseToolNodeTracingConfig;
   toolOutputTracing?: LangfuseToolOutputTracingConfig;
+  /**
+   * When true, derive the run's root Langfuse trace id deterministically from
+   * its `runId` (`sha256(runId)` → 32 hex chars, matching `@langfuse/tracing`
+   * `createTraceId`) instead of a random id. This lets external systems attach
+   * scores or observations to the trace afterwards by regenerating the same id
+   * from the run/message id, without a trace lookup. Default: random ids.
+   */
+  deterministicTraceId?: boolean;
 }
 
 export interface AgentInputs {
