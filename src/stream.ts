@@ -1009,6 +1009,14 @@ export function getChunkContent({
   reasoningKey: 'reasoning_content' | 'reasoning';
 }): string | t.MessageContentComplex[] | undefined {
   if (
+    (provider === Providers.GOOGLE || provider === Providers.VERTEXAI) &&
+    Array.isArray(chunk?.content) &&
+    chunk.content.some((c) => isGoogleServerSideToolContentPart(c))
+  ) {
+    return chunk.content;
+  }
+
+  if (
     (provider === Providers.OPENAI || provider === Providers.AZURE) &&
     (
       chunk?.additional_kwargs?.reasoning as

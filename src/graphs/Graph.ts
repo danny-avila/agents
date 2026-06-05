@@ -177,7 +177,39 @@ function getResponseReasoningContent({
   );
 }
 
-function getTextMessageDeltaContent(
+function isTextMessageContentPart(
+  contentPart: MessageContent[number] | t.MessageContentComplex
+): boolean {
+  return (
+    typeof contentPart === 'object' &&
+    'type' in contentPart &&
+    typeof contentPart.type === 'string' &&
+    contentPart.type.startsWith('text')
+  );
+}
+
+function isGoogleServerSideToolMessageContentPart(
+  contentPart: MessageContent[number] | t.MessageContentComplex
+): boolean {
+  return (
+    typeof contentPart === 'object' &&
+    'type' in contentPart &&
+    (contentPart.type === 'toolCall' || contentPart.type === 'toolResponse')
+  );
+}
+
+function hasGoogleServerSideToolDeltaContent(
+  content: t.MessageDelta['content']
+): content is t.MessageContentComplex[] {
+  return (
+    Array.isArray(content) &&
+    content.some((contentPart) =>
+      isGoogleServerSideToolMessageContentPart(contentPart)
+    )
+  );
+}
+
+function getMessageDeltaContent(
   content: MessageContent | undefined
 ): t.MessageDelta['content'] | undefined {
   if (content == null) {
@@ -192,29 +224,45 @@ function getTextMessageDeltaContent(
     return undefined;
   }
 
-  const isTextContentPart = (contentPart: MessageContent[number]): boolean =>
-    typeof contentPart === 'object' &&
-    'type' in contentPart &&
-    typeof contentPart.type === 'string' &&
-    contentPart.type.startsWith('text');
-  const hasGoogleServerSideToolPart = content.some(
-    (contentPart) =>
-      typeof contentPart === 'object' &&
-      'type' in contentPart &&
-      (contentPart.type === 'toolCall' || contentPart.type === 'toolResponse')
+  const hasGoogleServerSideToolPart = content.some((contentPart) =>
+    isGoogleServerSideToolMessageContentPart(contentPart)
   );
-  if (content.every((contentPart) => isTextContentPart(contentPart))) {
+  if (content.every((contentPart) => isTextMessageContentPart(contentPart))) {
     return content as t.MessageDelta['content'];
   }
   if (!hasGoogleServerSideToolPart) {
     return undefined;
   }
-  const textContent = content.filter((contentPart) =>
-    isTextContentPart(contentPart)
+  const messageContent = content.filter(
+    (contentPart) =>
+      isTextMessageContentPart(contentPart) ||
+      isGoogleServerSideToolMessageContentPart(contentPart)
   );
-  return textContent.length > 0
-    ? (textContent as t.MessageDelta['content'])
+  return messageContent.length > 0
+    ? (messageContent as t.MessageDelta['content'])
     : undefined;
+}
+
+async function dispatchMessageCreationStep({
+  graph,
+  stepKey,
+  messageId,
+  metadata,
+}: {
+  graph: Graph<t.BaseGraphState>;
+  stepKey: string;
+  messageId: string;
+  metadata: Record<string, unknown>;
+}): Promise<string> {
+  await graph.dispatchRunStep(
+    stepKey,
+    {
+      type: StepTypes.MESSAGE_CREATION,
+      message_creation: { message_id: messageId },
+    },
+    metadata
+  );
+  return graph.getStepIdByKey(stepKey);
 }
 
 async function dispatchTextMessageContent({
@@ -232,15 +280,28 @@ async function dispatchTextMessageContent({
   if (!messageId) {
     return false;
   }
-  await graph.dispatchRunStep(
+  if (hasGoogleServerSideToolDeltaContent(content)) {
+    for (const contentPart of content) {
+      const stepId = await dispatchMessageCreationStep({
+        graph,
+        stepKey,
+        messageId,
+        metadata,
+      });
+      await graph.dispatchMessageDelta(
+        stepId,
+        { content: [contentPart] },
+        metadata
+      );
+    }
+    return true;
+  }
+  const stepId = await dispatchMessageCreationStep({
+    graph,
     stepKey,
-    {
-      type: StepTypes.MESSAGE_CREATION,
-      message_creation: { message_id: messageId },
-    },
-    metadata
-  );
-  const stepId = graph.getStepIdByKey(stepKey);
+    messageId,
+    metadata,
+  });
   await graph.dispatchMessageDelta(stepId, { content }, metadata);
   return true;
 }
@@ -1684,7 +1745,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         responseMessage: responseMessage as Partial<AIMessageChunk> | undefined,
         reasoningKey: agentContext.reasoningKey,
       });
-      const textMessageContent = getTextMessageDeltaContent(
+      const textMessageContent = getMessageDeltaContent(
         responseMessage?.content as MessageContent | undefined
       );
 

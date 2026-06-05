@@ -54,6 +54,11 @@ type GoogleServerSideToolPart = Part & {
   toolResponse?: object;
 };
 
+type GoogleServerSideToolPartMetadata = {
+  thought?: boolean;
+  thoughtSignature?: string;
+};
+
 /**
  * Executes a function immediately and returns its result.
  * Functional utility similar to an Immediately Invoked Function Expression (IIFE).
@@ -138,12 +143,27 @@ function isGoogleServerSideToolPart(
 function convertGoogleServerSideToolPart(
   content: MessageContentComplex & GoogleServerSideToolPart
 ): Part {
-  if (content.type !== 'toolCall' && content.type !== 'toolResponse') {
-    return content as Part;
+  const metadata: GoogleServerSideToolPartMetadata = {};
+  if ('thought' in content && typeof content.thought === 'boolean') {
+    metadata.thought = content.thought;
+  }
+  if (
+    'thoughtSignature' in content &&
+    typeof content.thoughtSignature === 'string'
+  ) {
+    metadata.thoughtSignature = content.thoughtSignature;
+  }
+  if ('toolCall' in content && content.toolCall != null) {
+    return { toolCall: content.toolCall, ...metadata } as unknown as Part;
+  }
+  if ('toolResponse' in content && content.toolResponse != null) {
+    return {
+      toolResponse: content.toolResponse,
+      ...metadata,
+    } as unknown as Part;
   }
 
-  const { type: _type, ...part } = content;
-  return part as Part;
+  return content as Part;
 }
 
 function convertGoogleServerSideToolResponsePart(

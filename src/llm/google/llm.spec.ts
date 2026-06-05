@@ -791,6 +791,9 @@ test('Normalizes auto tool choice when server-side tool invocation config is ena
 test('Preserves Gemini server-side tool context parts in history', () => {
   const toolCallPart = {
     type: 'toolCall',
+    agentId: 'agent_1',
+    groupId: 1,
+    thoughtSignature: 'signature-1',
     toolCall: {
       id: 'server-search-1',
       name: 'google_search',
@@ -799,6 +802,8 @@ test('Preserves Gemini server-side tool context parts in history', () => {
   } as const;
   const toolResponsePart = {
     type: 'toolResponse',
+    agentId: 'agent_1',
+    groupId: 1,
     toolResponse: {
       id: 'server-search-1',
       name: 'google_search',
@@ -812,6 +817,7 @@ test('Preserves Gemini server-side tool context parts in history', () => {
   expect(convertMessageContentToParts(message, true, [])).toEqual([
     {
       toolCall: toolCallPart.toolCall,
+      thoughtSignature: 'signature-1',
     },
     {
       toolResponse: toolResponsePart.toolResponse,

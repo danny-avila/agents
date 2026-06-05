@@ -390,7 +390,7 @@ describe('StandardGraph final response reasoning fallback', () => {
     );
 
     expect(finalContentParts).toEqual(messageContent);
-    expect(contentParts).toEqual([{ type: ContentTypes.TEXT, text }]);
+    expect(contentParts).toEqual(messageContent);
   });
 
   it('returns reasoning content without a custom aggregator', async () => {

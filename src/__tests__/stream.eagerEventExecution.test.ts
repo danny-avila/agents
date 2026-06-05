@@ -1782,6 +1782,56 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     expect(messageDeltas[0]?.delta).toEqual({ content: [toolCallPart] });
   });
 
+  it('dispatches Gemini server-side tool context when reasoning is present', async () => {
+    const dispatchMessageDelta = jest.fn<StandardGraph['dispatchMessageDelta']>(
+      async () => undefined
+    );
+    const graph = createGraph({
+      dispatchMessageDelta,
+      getAgentContext: jest.fn(
+        (): Partial<AgentContext> => ({
+          provider: Providers.GOOGLE,
+          reasoningKey: 'reasoning',
+          currentTokenType: ContentTypes.TEXT,
+          toolDefinitions: [],
+          graphTools: [],
+          agentId: 'agent_1',
+        })
+      ) as unknown as StandardGraph['getAgentContext'],
+    });
+    const handler = new ChatModelStreamHandler();
+    const metadata = { langgraph_node: 'agent' };
+    const toolCallPart: t.MessageContentComplex = {
+      type: 'toolCall',
+      toolCall: {
+        id: 'server-search-1',
+        name: 'google_search',
+        args: {},
+      },
+    };
+
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: [toolCallPart],
+          additional_kwargs: {
+            reasoning: 'Need to search before answering.',
+          },
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+
+    expect(dispatchMessageDelta).toHaveBeenCalledTimes(1);
+    expect(dispatchMessageDelta).toHaveBeenCalledWith(
+      expect.stringMatching(/^step_/),
+      { content: [toolCallPart] },
+      metadata
+    );
+  });
+
   it('keeps separately streamed Gemini server-side tool context blocks on separate message steps', async () => {
     const graph = createGraph({
       getAgentContext: jest.fn(
