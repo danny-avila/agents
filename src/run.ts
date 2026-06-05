@@ -1,5 +1,8 @@
 // src/run.ts
-import { initializeLangfuseTracing } from './instrumentation';
+import {
+  initializeLangfuseTracing,
+  runWithTraceIdSeed,
+} from './instrumentation';
 import { PromptTemplate } from '@langchain/core/prompts';
 import { RunnableLambda } from '@langchain/core/runnables';
 import { AzureChatOpenAI, ChatOpenAI } from '@langchain/openai';
@@ -553,9 +556,7 @@ export class Run<_T extends t.BaseGraphState> {
   }
 
   private shouldClearHookSession(streamThrew: boolean): boolean {
-    return (
-      this._interrupt == null || this._haltedReason != null || streamThrew
-    );
+    return this._interrupt == null || this._haltedReason != null || streamThrew;
   }
 
   private isAwaitingResume(streamThrew: boolean): boolean {
@@ -585,9 +586,7 @@ export class Run<_T extends t.BaseGraphState> {
   private getStreamToolOutputTracingLangfuseConfig(
     graph: StandardGraph | MultiAgentGraph
   ): t.LangfuseConfig | undefined {
-    const toolOutputTracingConfigs = Array.from(
-      graph.agentContexts.values()
-    )
+    const toolOutputTracingConfigs = Array.from(graph.agentContexts.values())
       .map((context) => {
         return resolveLangfuseConfig(this.langfuse, context.langfuse)
           ?.toolOutputTracing;
@@ -908,21 +907,30 @@ export class Run<_T extends t.BaseGraphState> {
     };
 
     try {
-      await withLangfuseToolOutputTracingConfig(
-        streamLangfuseConfig,
+      // When opted in, seed the root trace id from this run's id so feedback /
+      // other external signals can be attached to the trace later without a
+      // lookup (see SeededTraceIdGenerator in ./instrumentation).
+      await runWithTraceIdSeed(
+        streamLangfuseConfig?.deterministicTraceId === true
+          ? this.id
+          : undefined,
         () =>
-          withLangfuseAttributes(
-            {
-              langfuse: streamLangfuseConfig,
-              userId,
-              sessionId,
-              traceName,
-              traceMetadata,
-              tags: ['librechat', 'agent'],
-            },
-            consumeStream
-          ),
-        this.getStreamToolOutputTracingLangfuseConfig(graph)
+          withLangfuseToolOutputTracingConfig(
+            streamLangfuseConfig,
+            () =>
+              withLangfuseAttributes(
+                {
+                  langfuse: streamLangfuseConfig,
+                  userId,
+                  sessionId,
+                  traceName,
+                  traceMetadata,
+                  tags: ['librechat', 'agent'],
+                },
+                consumeStream
+              ),
+            this.getStreamToolOutputTracingLangfuseConfig(graph)
+          )
       );
     } catch (err) {
       streamThrew = true;
