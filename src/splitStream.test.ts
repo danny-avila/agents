@@ -225,6 +225,54 @@ describe('ContentAggregator empty deltas', () => {
   });
 });
 
+describe('ContentAggregator provider-specific parts', () => {
+  it('should preserve Gemini server-side tool content blocks', () => {
+    const { contentParts, aggregateContent } = createContentAggregator();
+    const toolCallPart: t.MessageContentComplex = {
+      type: 'toolCall',
+      toolCall: {
+        id: 'server-search-1',
+        name: 'google_search',
+        args: {},
+      },
+    };
+    const toolResponsePart: t.MessageContentComplex = {
+      type: 'toolResponse',
+      toolResponse: {
+        id: 'server-search-1',
+        name: 'google_search',
+        response: { results: [] },
+      },
+    };
+
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP,
+      data: createRunStep('step_tool_call'),
+    });
+    aggregateContent({
+      event: GraphEvents.ON_MESSAGE_DELTA,
+      data: {
+        id: 'step_tool_call',
+        delta: { content: [toolCallPart] },
+      },
+    });
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP,
+      data: { ...createRunStep('step_tool_response'), index: 1 },
+    });
+    aggregateContent({
+      event: GraphEvents.ON_MESSAGE_DELTA,
+      data: {
+        id: 'step_tool_response',
+        delta: { content: [toolResponsePart] },
+      },
+    });
+
+    expect(contentParts[0]).toEqual(toolCallPart);
+    expect(contentParts[1]).toEqual(toolResponsePart);
+  });
+});
+
 describe('ContentAggregator with SplitStreamHandler', () => {
   it('should aggregate content from multiple message blocks', async () => {
     const runId = nanoid();

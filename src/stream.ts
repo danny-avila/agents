@@ -1388,6 +1388,8 @@ export function createContentAggregator(): t.ContentAggregatorResult {
       };
 
       contentParts[index] = update;
+    } else if (partType === 'toolCall' || partType === 'toolResponse') {
+      contentParts[index] = contentPart;
     } else if (partType === ContentTypes.SUMMARY) {
       const currentSummary = contentParts[index] as
         | t.SummaryContentBlock

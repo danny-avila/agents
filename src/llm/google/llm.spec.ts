@@ -31,6 +31,8 @@ import type { ContentBlock } from '@langchain/core/messages';
 import { CustomChatGoogleGenerativeAI as ChatGoogleGenerativeAI } from './index';
 import {
   convertMessageContentToParts,
+  convertResponseContentToChatGenerationChunk,
+  mapGenerateContentResultToChatResult,
   _FUNCTION_CALL_THOUGHT_SIGNATURES_MAP_KEY,
 } from './utils/common';
 
@@ -785,6 +787,47 @@ test('Preserves Gemini server-side tool context parts in history', () => {
       toolResponse: toolResponsePart.toolResponse,
     },
   ]);
+});
+
+test('Preserves Gemini server-side tool context parts from responses', () => {
+  const toolCallPart = {
+    toolCall: {
+      id: 'server-search-1',
+      name: 'google_search',
+      args: {},
+    },
+  };
+  const toolResponsePart = {
+    toolResponse: {
+      id: 'server-search-1',
+      name: 'google_search',
+      response: { results: [] },
+    },
+  };
+  const response = {
+    candidates: [
+      {
+        content: {
+          role: 'model',
+          parts: [toolCallPart, toolResponsePart],
+        },
+      },
+    ],
+  } as unknown as Parameters<
+    typeof convertResponseContentToChatGenerationChunk
+  >[0];
+
+  const chunk = convertResponseContentToChatGenerationChunk(response, {
+    index: 0,
+  });
+  const result = mapGenerateContentResultToChatResult(response);
+
+  const expectedContent = [
+    { ...toolCallPart, type: 'toolCall' },
+    { ...toolResponsePart, type: 'toolResponse' },
+  ];
+  expect(chunk?.message.content).toEqual(expectedContent);
+  expect(result.generations[0].message.content).toEqual(expectedContent);
 });
 
 test('Supports tool_choice', async () => {

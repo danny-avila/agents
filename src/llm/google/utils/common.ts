@@ -146,6 +146,26 @@ function convertGoogleServerSideToolPart(
   return part as Part;
 }
 
+function convertGoogleServerSideToolResponsePart(
+  part: Part
+): GoogleServerSideToolPart | undefined {
+  if (
+    'toolCall' in part &&
+    typeof part.toolCall === 'object' &&
+    part.toolCall != null
+  ) {
+    return { ...part, type: 'toolCall', toolCall: part.toolCall };
+  }
+  if (
+    'toolResponse' in part &&
+    typeof part.toolResponse === 'object' &&
+    part.toolResponse != null
+  ) {
+    return { ...part, type: 'toolResponse', toolResponse: part.toolResponse };
+  }
+  return undefined;
+}
+
 function inferToolNameFromPreviousMessages(
   message: ToolMessage | ToolMessageChunk,
   previousMessages: BaseMessage[]
@@ -630,6 +650,10 @@ export function convertResponseContentToChatGenerationChunk(
               codeExecutionResult: p.codeExecutionResult,
             };
           }
+          const serverSideToolPart = convertGoogleServerSideToolResponsePart(p);
+          if (serverSideToolPart !== undefined) {
+            return serverSideToolPart;
+          }
           return p;
         })
         .filter((p) => p !== undefined)
@@ -789,6 +813,10 @@ export function mapGenerateContentResultToChatResult(
               type: 'codeExecutionResult',
               codeExecutionResult: p.codeExecutionResult,
             };
+          }
+          const serverSideToolPart = convertGoogleServerSideToolResponsePart(p);
+          if (serverSideToolPart !== undefined) {
+            return serverSideToolPart;
           }
           return p;
         })
