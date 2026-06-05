@@ -92,6 +92,7 @@ export type BedrockAnthropicClientOptions = BedrockAnthropicInput;
 export type GoogleClientOptions = GoogleGenerativeAIChatInput & {
   customHeaders?: RequestOptions['customHeaders'];
   thinkingConfig?: GoogleThinkingConfig;
+  includeServerSideToolInvocations?: boolean;
 };
 export type DeepSeekClientOptions = Partial<ChatDeepSeekInput>;
 export type XAIClientOptions = ChatXAIInput;

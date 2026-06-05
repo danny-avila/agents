@@ -29,7 +29,10 @@ import type {
 } from '@google/generative-ai';
 import type { ContentBlock } from '@langchain/core/messages';
 import { CustomChatGoogleGenerativeAI as ChatGoogleGenerativeAI } from './index';
-import { _FUNCTION_CALL_THOUGHT_SIGNATURES_MAP_KEY } from './utils/common';
+import {
+  convertMessageContentToParts,
+  _FUNCTION_CALL_THOUGHT_SIGNATURES_MAP_KEY,
+} from './utils/common';
 
 // Save the original value of the 'LANGCHAIN_CALLBACKS_BACKGROUND' environment variable
 const originalBackground = process.env.LANGCHAIN_CALLBACKS_BACKGROUND;
@@ -729,6 +732,59 @@ test('Invoke with JSON mode', async () => {
   expect(res.usage_metadata.total_tokens).toBe(
     res.usage_metadata.input_tokens + res.usage_metadata.output_tokens
   );
+});
+
+test('Includes server-side tool invocation config when enabled', () => {
+  const model = new ChatGoogleGenerativeAI({
+    apiKey: 'test-key',
+    model: 'gemini-3.5-flash',
+    includeServerSideToolInvocations: true,
+  });
+  const getWeather = {
+    name: 'get_weather',
+    description: 'Get the weather',
+  };
+
+  const request = model.invocationParams({
+    tools: [{ googleSearch: {} }, { functionDeclarations: [getWeather] }],
+  });
+
+  expect(request.toolConfig).toEqual(
+    expect.objectContaining({
+      includeServerSideToolInvocations: true,
+    })
+  );
+});
+
+test('Preserves Gemini server-side tool context parts in history', () => {
+  const toolCallPart = {
+    type: 'toolCall',
+    toolCall: {
+      id: 'server-search-1',
+      name: 'google_search',
+      args: {},
+    },
+  } as const;
+  const toolResponsePart = {
+    type: 'toolResponse',
+    toolResponse: {
+      id: 'server-search-1',
+      name: 'google_search',
+      response: { results: [] },
+    },
+  } as const;
+  const message = new AIMessage({
+    content: [toolCallPart, toolResponsePart],
+  });
+
+  expect(convertMessageContentToParts(message, true, [])).toEqual([
+    {
+      toolCall: toolCallPart.toolCall,
+    },
+    {
+      toolResponse: toolResponsePart.toolResponse,
+    },
+  ]);
 });
 
 test('Supports tool_choice', async () => {

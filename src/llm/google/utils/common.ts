@@ -48,6 +48,12 @@ export const _FUNCTION_CALL_THOUGHT_SIGNATURES_MAP_KEY =
 const DUMMY_SIGNATURE =
   'ErYCCrMCAdHtim9kOoOkrPiCNVsmlpMIKd7ZMxgiFbVQOkgp7nlLcDMzVsZwIzvuT7nQROivoXA72ccC2lSDvR0Gh7dkWaGuj7ctv6t7ZceHnecx0QYa+ix8tYpRfjhyWozQ49lWiws6+YGjCt10KRTyWsZ2h6O7iHTYJwKIRwGUHRKy/qK/6kFxJm5ML00gLq4D8s5Z6DBpp2ZlR+uF4G8jJgeWQgyHWVdx2wGYElaceVAc66tZdPQRdOHpWtgYSI1YdaXgVI8KHY3/EfNc2YqqMIulvkDBAnuMhkAjV9xmBa54Tq+ih3Im4+r3DzqhGqYdsSkhS0kZMwte4Hjs65dZzCw9lANxIqYi1DJ639WNPYihp/DCJCos7o+/EeSPJaio5sgWDyUnMGkY1atsJZ+m7pj7DD5tvQ==';
 
+type GoogleServerSideToolPart = Part & {
+  type?: 'toolCall' | 'toolResponse';
+  toolCall?: object;
+  toolResponse?: object;
+};
+
 /**
  * Executes a function immediately and returns its result.
  * Functional utility similar to an Immediately Invoked Function Expression (IIFE).
@@ -116,6 +122,28 @@ function messageContentMedia(content: MessageContentComplex): Part {
   }
 
   throw new Error('Invalid media content');
+}
+
+function isGoogleServerSideToolPart(
+  content: MessageContentComplex
+): content is MessageContentComplex & GoogleServerSideToolPart {
+  return (
+    'toolCall' in content ||
+    'toolResponse' in content ||
+    content.type === 'toolCall' ||
+    content.type === 'toolResponse'
+  );
+}
+
+function convertGoogleServerSideToolPart(
+  content: MessageContentComplex & GoogleServerSideToolPart
+): Part {
+  if (content.type !== 'toolCall' && content.type !== 'toolResponse') {
+    return content as Part;
+  }
+
+  const { type: _type, ...part } = content;
+  return part as Part;
 }
 
 function inferToolNameFromPreviousMessages(
@@ -278,6 +306,10 @@ function _convertLangChainContentToPart(
       content,
       _getStandardContentBlockConverter(isMultimodalModel)
     );
+  }
+
+  if (isGoogleServerSideToolPart(content)) {
+    return convertGoogleServerSideToolPart(content);
   }
 
   if (content.type === 'text') {

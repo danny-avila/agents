@@ -7,6 +7,7 @@ import { GoogleGenerativeAI as GenerativeAI } from '@google/generative-ai';
 import type {
   GenerateContentRequest,
   SafetySetting,
+  ToolConfig,
 } from '@google/generative-ai';
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { BaseMessage, UsageMetadata } from '@langchain/core/messages';
@@ -18,8 +19,13 @@ import {
   mapGenerateContentResultToChatResult,
 } from './utils/common';
 
+type GoogleToolConfigWithServerSideInvocations = ToolConfig & {
+  includeServerSideToolInvocations?: boolean;
+};
+
 export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
   thinkingConfig?: GoogleThinkingConfig;
+  includeServerSideToolInvocations?: boolean;
 
   /**
    * Override to add gemini-3 model support for multimodal and function calling thought signatures
@@ -92,6 +98,9 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
     }
 
     this.thinkingConfig = fields.thinkingConfig ?? this.thinkingConfig;
+    this.includeServerSideToolInvocations =
+      fields.includeServerSideToolInvocations ??
+      this.includeServerSideToolInvocations;
 
     this.streaming = fields.streaming ?? this.streaming;
     this.json = fields.json;
@@ -190,6 +199,19 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
         /** @ts-ignore */
         thinkingConfig: this.thinkingConfig,
       };
+    }
+    if (
+      this.includeServerSideToolInvocations === true &&
+      Array.isArray(params.tools) &&
+      params.tools.length > 0
+    ) {
+      const toolConfig = params.toolConfig as
+        | GoogleToolConfigWithServerSideInvocations
+        | undefined;
+      params.toolConfig = {
+        ...toolConfig,
+        includeServerSideToolInvocations: true,
+      } as ToolConfig;
     }
     return params;
   }
