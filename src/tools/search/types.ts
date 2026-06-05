@@ -5,7 +5,12 @@ import { DATE_RANGE } from './schema';
 
 export type SearchProvider = 'serper' | 'searxng' | 'tavily';
 export type ScraperProvider = 'firecrawl' | 'serper' | 'tavily';
-export type RerankerType = 'infinity' | 'jina' | 'cohere' | 'none';
+export type RerankerType =
+  | 'infinity'
+  | 'jina'
+  | 'cohere'
+  | 'zeroentropy'
+  | 'none';
 
 export interface Highlight {
   score: number;
@@ -206,6 +211,20 @@ export interface CohereRerankerResponse {
   };
 }
 
+export interface ZeroEntropyRerankerResult {
+  index: number;
+  relevance_score: number;
+}
+
+export interface ZeroEntropyRerankerResponse {
+  results: ZeroEntropyRerankerResult[];
+  total_bytes?: number;
+  total_tokens?: number;
+  actual_latency_mode?: string;
+  e2e_latency?: number;
+  inference_latency?: number;
+}
+
 export type SafeSearchLevel = 0 | 1 | 2;
 
 export type Logger = WinstonLogger;
@@ -219,6 +238,9 @@ export interface SearchToolConfig
   jinaApiKey?: string;
   jinaApiUrl?: string;
   cohereApiKey?: string;
+  zeroEntropyApiKey?: string;
+  zeroEntropyApiUrl?: string;
+  zeroEntropyModel?: string;
   rerankerType?: RerankerType;
   scraperProvider?: ScraperProvider;
   scraperTimeout?: number;

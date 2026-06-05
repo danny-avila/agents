@@ -354,6 +354,9 @@ export const createSearchTool = (
     jinaApiKey,
     jinaApiUrl,
     cohereApiKey,
+    zeroEntropyApiKey,
+    zeroEntropyApiUrl,
+    zeroEntropyModel,
     onSearchResults: _onSearchResults,
     onGetHighlights,
   } = config;
@@ -433,6 +436,9 @@ export const createSearchTool = (
     jinaApiKey,
     jinaApiUrl,
     cohereApiKey,
+    zeroEntropyApiKey,
+    zeroEntropyApiUrl,
+    zeroEntropyModel,
     logger,
   });
 

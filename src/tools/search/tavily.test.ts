@@ -436,6 +436,73 @@ describe('Tavily search API', () => {
       },
     });
   });
+
+  it('passes ZeroEntropy reranker config through the search tool', async () => {
+    mockedAxios.post
+      .mockResolvedValueOnce({
+        data: {
+          results: [
+            {
+              title: 'Example',
+              url: 'https://example.com',
+              content: 'Example summary',
+            },
+          ],
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          results: [
+            {
+              url: 'https://example.com',
+              raw_content: 'Extracted content for ZeroEntropy reranking.',
+              images: [],
+            },
+          ],
+          failed_results: [],
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          results: [
+            {
+              index: 0,
+              relevance_score: 0.95,
+            },
+          ],
+        },
+      });
+
+    const searchTool = createSearchTool({
+      searchProvider: 'tavily',
+      tavilyApiKey: 'search-key',
+      scraperProvider: 'tavily',
+      rerankerType: 'zeroentropy',
+      zeroEntropyApiKey: 'zero-key',
+      zeroEntropyApiUrl: 'https://proxy.example.com/zerank',
+      zeroEntropyModel: 'zerank-1-small',
+      logger: mockLogger,
+    });
+
+    await searchTool.invoke({
+      query: 'example query',
+    });
+    const [rerankUrl, rerankPayload, rerankConfig] =
+      mockedAxios.post.mock.calls[2];
+
+    expect(mockedAxios.post).toHaveBeenCalledTimes(3);
+    expect(rerankUrl).toBe('https://proxy.example.com/zerank');
+    expect(rerankPayload).toMatchObject({
+      model: 'zerank-1-small',
+      query: 'example query',
+      top_n: 5,
+    });
+    expect(rerankConfig).toMatchObject({
+      headers: {
+        Authorization: 'Bearer zero-key',
+      },
+    });
+  });
 });
 
 describe('TavilyScraper', () => {
