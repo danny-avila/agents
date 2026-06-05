@@ -1832,6 +1832,48 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     );
   });
 
+  it('does not dispatch Gemini server-side tool context blocks for non-Google providers', async () => {
+    const dispatchMessageDelta = jest.fn<StandardGraph['dispatchMessageDelta']>(
+      async () => undefined
+    );
+    const graph = createGraph({
+      dispatchMessageDelta,
+      getAgentContext: jest.fn(
+        (): Partial<AgentContext> => ({
+          provider: Providers.OPENAI,
+          reasoningKey: 'reasoning_content',
+          currentTokenType: ContentTypes.TEXT,
+          toolDefinitions: [],
+          graphTools: [],
+          agentId: 'agent_1',
+        })
+      ) as unknown as StandardGraph['getAgentContext'],
+    });
+    const handler = new ChatModelStreamHandler();
+    const metadata = { langgraph_node: 'agent' };
+    const toolCallPart: t.MessageContentComplex = {
+      type: 'toolCall',
+      toolCall: {
+        id: 'server-search-1',
+        name: 'google_search',
+        args: {},
+      },
+    };
+
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: [toolCallPart],
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+
+    expect(dispatchMessageDelta).not.toHaveBeenCalled();
+  });
+
   it('keeps separately streamed Gemini server-side tool context blocks on separate message steps', async () => {
     const graph = createGraph({
       getAgentContext: jest.fn(

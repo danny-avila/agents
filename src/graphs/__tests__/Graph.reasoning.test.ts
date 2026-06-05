@@ -393,6 +393,63 @@ describe('StandardGraph final response reasoning fallback', () => {
     expect(contentParts).toEqual(messageContent);
   });
 
+  it('does not preserve Gemini server-side context blocks for non-Google invoke fallbacks', async () => {
+    const text = 'Search complete.';
+    const { contentParts, aggregateContent } = createContentAggregator();
+    const run = await Run.create<t.IState>({
+      runId: 'reasoning-fallback-non-google-server-side-shape',
+      graphConfig: {
+        type: 'standard',
+        llmConfig,
+      },
+      returnContent: true,
+      skipCleanup: true,
+      customHandlers: createReasoningHandlers(aggregateContent, []),
+    });
+
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+
+    const messageContent: t.MessageContentComplex[] = [
+      {
+        type: 'toolCall',
+        toolCall: {
+          id: 'server-search-1',
+          name: 'google_search',
+          args: {},
+        },
+      },
+      { type: ContentTypes.TEXT, text },
+      {
+        type: 'toolResponse',
+        toolResponse: {
+          id: 'server-search-1',
+          name: 'google_search',
+          response: { results: [] },
+        },
+      },
+    ];
+    run.Graph.overrideModel = new InvokeOnlyMessageModel(
+      new AIMessageChunk({
+        content: toLangChainContent(messageContent),
+      })
+    );
+
+    const finalContentParts = await run.processStream(
+      { messages: [new HumanMessage('search and answer')] },
+      {
+        ...config,
+        configurable: {
+          thread_id: 'reasoning-fallback-non-google-server-side-shape',
+        },
+      }
+    );
+
+    expect(finalContentParts).toEqual(messageContent);
+    expect(contentParts).toEqual([]);
+  });
+
   it('returns reasoning content without a custom aggregator', async () => {
     const reasoningText = 'Reasoning should persist for returnContent.';
     const run = await Run.create<t.IState>({

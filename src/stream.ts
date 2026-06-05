@@ -21,6 +21,7 @@ import {
   handleToolCalls,
 } from '@/tools/handlers';
 import { getMessageId } from '@/messages';
+import { isGoogleLike } from '@/utils';
 import { safeDispatchCustomEvent } from '@/utils/events';
 import {
   buildToolExecutionRequestPlan,
@@ -1009,7 +1010,7 @@ export function getChunkContent({
   reasoningKey: 'reasoning_content' | 'reasoning';
 }): string | t.MessageContentComplex[] | undefined {
   if (
-    (provider === Providers.GOOGLE || provider === Providers.VERTEXAI) &&
+    isGoogleLike(provider) &&
     Array.isArray(chunk?.content) &&
     chunk.content.some((c) => isGoogleServerSideToolContentPart(c))
   ) {
@@ -1196,6 +1197,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
     }
 
     if (
+      isGoogleLike(agentContext.provider) &&
       Array.isArray(content) &&
       content.some((c) => isGoogleServerSideToolContentPart(c))
     ) {

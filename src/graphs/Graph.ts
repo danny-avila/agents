@@ -199,9 +199,11 @@ function isGoogleServerSideToolMessageContentPart(
 }
 
 function hasGoogleServerSideToolDeltaContent(
+  provider: Providers | undefined,
   content: t.MessageDelta['content']
 ): content is t.MessageContentComplex[] {
   return (
+    isGoogleLike(provider) &&
     Array.isArray(content) &&
     content.some((contentPart) =>
       isGoogleServerSideToolMessageContentPart(contentPart)
@@ -210,6 +212,7 @@ function hasGoogleServerSideToolDeltaContent(
 }
 
 function getMessageDeltaContent(
+  provider: Providers | undefined,
   content: MessageContent | undefined
 ): t.MessageDelta['content'] | undefined {
   if (content == null) {
@@ -224,9 +227,11 @@ function getMessageDeltaContent(
     return undefined;
   }
 
-  const hasGoogleServerSideToolPart = content.some((contentPart) =>
-    isGoogleServerSideToolMessageContentPart(contentPart)
-  );
+  const hasGoogleServerSideToolPart =
+    isGoogleLike(provider) &&
+    content.some((contentPart) =>
+      isGoogleServerSideToolMessageContentPart(contentPart)
+    );
   if (content.every((contentPart) => isTextMessageContentPart(contentPart))) {
     return content as t.MessageDelta['content'];
   }
@@ -268,11 +273,13 @@ async function dispatchMessageCreationStep({
 async function dispatchTextMessageContent({
   graph,
   stepKey,
+  provider,
   content,
   metadata,
 }: {
   graph: Graph<t.BaseGraphState>;
   stepKey: string;
+  provider?: Providers;
   content: t.MessageDelta['content'];
   metadata: Record<string, unknown>;
 }): Promise<boolean> {
@@ -280,7 +287,7 @@ async function dispatchTextMessageContent({
   if (!messageId) {
     return false;
   }
-  if (hasGoogleServerSideToolDeltaContent(content)) {
+  if (hasGoogleServerSideToolDeltaContent(provider, content)) {
     for (const contentPart of content) {
       const stepId = await dispatchMessageCreationStep({
         graph,
@@ -1746,6 +1753,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         reasoningKey: agentContext.reasoningKey,
       });
       const textMessageContent = getMessageDeltaContent(
+        agentContext.provider,
         responseMessage?.content as MessageContent | undefined
       );
 
@@ -1766,6 +1774,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           const dispatchedText = await dispatchTextMessageContent({
             graph: this,
             stepKey,
+            provider: agentContext.provider,
             content: textMessageContent,
             metadata,
           });
@@ -1799,6 +1808,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           await dispatchTextMessageContent({
             graph: this,
             stepKey,
+            provider: agentContext.provider,
             content: textMessageContent,
             metadata,
           });
