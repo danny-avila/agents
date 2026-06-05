@@ -7,6 +7,7 @@ import type { BaseMessage, UsageMetadata } from '@langchain/core/messages';
 import type * as t from '@/types';
 import { ContentTypes, GraphEvents, Providers } from '@/common';
 import { createContentAggregator } from '@/stream';
+import { toLangChainContent } from '@/messages/langchain';
 import { ModelEndHandler, ToolEndHandler } from '@/events';
 import { Run } from '@/run';
 
@@ -105,7 +106,9 @@ function createReasoningChunk(
   });
 }
 
-function createOpenAIReasoningSummaryChunk(reasoningText: string): AIMessageChunk {
+function createOpenAIReasoningSummaryChunk(
+  reasoningText: string
+): AIMessageChunk {
   return new AIMessageChunk({
     content: '',
     additional_kwargs: {
@@ -123,7 +126,10 @@ function createReasoningHandlers(
 ): Record<string | GraphEvents, t.EventHandler> {
   return {
     [GraphEvents.ON_RUN_STEP]: {
-      handle: (event: GraphEvents.ON_RUN_STEP, data: t.StreamEventData): void => {
+      handle: (
+        event: GraphEvents.ON_RUN_STEP,
+        data: t.StreamEventData
+      ): void => {
         aggregateContent({ event, data: data as t.RunStep });
       },
     },
@@ -324,6 +330,67 @@ describe('StandardGraph final response reasoning fallback', () => {
       { type: ContentTypes.THINK, think: reasoningText },
       { type: ContentTypes.TEXT, text },
     ]);
+  });
+
+  it('emits final text from invoke-only Gemini server-side context responses', async () => {
+    const text = 'Search complete.';
+    const { contentParts, aggregateContent } = createContentAggregator();
+    const run = await Run.create<t.IState>({
+      runId: 'reasoning-fallback-gemini-server-side-context',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: Providers.GOOGLE,
+          disableStreaming: true,
+          streamUsage: false,
+        },
+      },
+      returnContent: true,
+      skipCleanup: true,
+      customHandlers: createReasoningHandlers(aggregateContent, []),
+    });
+
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+
+    const messageContent: t.MessageContentComplex[] = [
+      {
+        type: 'toolCall',
+        toolCall: {
+          id: 'server-search-1',
+          name: 'google_search',
+          args: {},
+        },
+      },
+      { type: ContentTypes.TEXT, text },
+      {
+        type: 'toolResponse',
+        toolResponse: {
+          id: 'server-search-1',
+          name: 'google_search',
+          response: { results: [] },
+        },
+      },
+    ];
+    run.Graph.overrideModel = new InvokeOnlyMessageModel(
+      new AIMessageChunk({
+        content: toLangChainContent(messageContent),
+      })
+    );
+
+    const finalContentParts = await run.processStream(
+      { messages: [new HumanMessage('search and answer')] },
+      {
+        ...config,
+        configurable: {
+          thread_id: 'reasoning-fallback-gemini-server-side-context',
+        },
+      }
+    );
+
+    expect(finalContentParts).toEqual(messageContent);
+    expect(contentParts).toEqual([{ type: ContentTypes.TEXT, text }]);
   });
 
   it('returns reasoning content without a custom aggregator', async () => {

@@ -191,18 +191,30 @@ function getTextMessageDeltaContent(
   if (content.length === 0) {
     return undefined;
   }
-  if (
-    !content.every(
-      (contentPart) =>
-        typeof contentPart === 'object' &&
-        'type' in contentPart &&
-        typeof contentPart.type === 'string' &&
-        contentPart.type.startsWith('text')
-    )
-  ) {
+
+  const isTextContentPart = (contentPart: MessageContent[number]): boolean =>
+    typeof contentPart === 'object' &&
+    'type' in contentPart &&
+    typeof contentPart.type === 'string' &&
+    contentPart.type.startsWith('text');
+  const hasGoogleServerSideToolPart = content.some(
+    (contentPart) =>
+      typeof contentPart === 'object' &&
+      'type' in contentPart &&
+      (contentPart.type === 'toolCall' || contentPart.type === 'toolResponse')
+  );
+  if (content.every((contentPart) => isTextContentPart(contentPart))) {
+    return content as t.MessageDelta['content'];
+  }
+  if (!hasGoogleServerSideToolPart) {
     return undefined;
   }
-  return content as t.MessageDelta['content'];
+  const textContent = content.filter((contentPart) =>
+    isTextContentPart(contentPart)
+  );
+  return textContent.length > 0
+    ? (textContent as t.MessageDelta['content'])
+    : undefined;
 }
 
 async function dispatchTextMessageContent({

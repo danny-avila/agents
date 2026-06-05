@@ -758,6 +758,36 @@ test('Includes server-side tool invocation config when enabled', () => {
   );
 });
 
+test('Normalizes auto tool choice when server-side tool invocation config is enabled', () => {
+  const model = new ChatGoogleGenerativeAI({
+    apiKey: 'test-key',
+    model: 'gemini-3.5-flash',
+    includeServerSideToolInvocations: true,
+  });
+  const getWeather = {
+    name: 'get_weather',
+    description: 'Get the weather',
+  };
+
+  const request = model.invocationParams({
+    tools: [{ googleSearch: {} }, { functionDeclarations: [getWeather] }],
+    tool_choice: 'auto',
+  });
+  const toolConfig = request.toolConfig as
+    | {
+        includeServerSideToolInvocations?: boolean;
+        functionCallingConfig?: { mode?: string };
+      }
+    | undefined;
+
+  expect(toolConfig).toEqual(
+    expect.objectContaining({
+      includeServerSideToolInvocations: true,
+    })
+  );
+  expect(toolConfig?.functionCallingConfig?.mode).toBe('VALIDATED');
+});
+
 test('Preserves Gemini server-side tool context parts in history', () => {
   const toolCallPart = {
     type: 'toolCall',

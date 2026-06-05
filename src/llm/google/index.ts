@@ -3,7 +3,10 @@ import { AIMessageChunk } from '@langchain/core/messages';
 import { ChatGenerationChunk } from '@langchain/core/outputs';
 import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
 import { getEnvironmentVariable } from '@langchain/core/utils/env';
-import { GoogleGenerativeAI as GenerativeAI } from '@google/generative-ai';
+import {
+  FunctionCallingMode,
+  GoogleGenerativeAI as GenerativeAI,
+} from '@google/generative-ai';
 import type {
   GenerateContentRequest,
   SafetySetting,
@@ -21,6 +24,14 @@ import {
 
 type GoogleToolConfigWithServerSideInvocations = ToolConfig & {
   includeServerSideToolInvocations?: boolean;
+  functionCallingConfig?: Omit<
+    NonNullable<ToolConfig['functionCallingConfig']>,
+    'mode'
+  > & {
+    mode?:
+      | NonNullable<ToolConfig['functionCallingConfig']>['mode']
+      | 'VALIDATED';
+  };
 };
 
 export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
@@ -208,8 +219,17 @@ export class CustomChatGoogleGenerativeAI extends ChatGoogleGenerativeAI {
       const toolConfig = params.toolConfig as
         | GoogleToolConfigWithServerSideInvocations
         | undefined;
+      const functionCallingConfig = toolConfig?.functionCallingConfig;
       params.toolConfig = {
         ...toolConfig,
+        ...(functionCallingConfig?.mode === FunctionCallingMode.AUTO
+          ? {
+            functionCallingConfig: {
+              ...functionCallingConfig,
+              mode: 'VALIDATED',
+            },
+          }
+          : {}),
         includeServerSideToolInvocations: true,
       } as ToolConfig;
     }

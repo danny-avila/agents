@@ -1611,6 +1611,78 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     );
   });
 
+  it('dispatches Gemini server-side tool context blocks from mixed stream content', async () => {
+    const dispatchMessageDelta = jest.fn<StandardGraph['dispatchMessageDelta']>(
+      async () => undefined
+    );
+    const graph = createGraph({
+      dispatchMessageDelta,
+      getAgentContext: jest.fn(
+        (): Partial<AgentContext> => ({
+          provider: Providers.GOOGLE,
+          reasoningKey: 'reasoning',
+          currentTokenType: ContentTypes.TEXT,
+          toolDefinitions: [],
+          graphTools: [],
+          agentId: 'agent_1',
+        })
+      ) as unknown as StandardGraph['getAgentContext'],
+    });
+    const handler = new ChatModelStreamHandler();
+    const metadata = { langgraph_node: 'agent' };
+    const toolCallPart: t.MessageContentComplex = {
+      type: 'toolCall',
+      toolCall: {
+        id: 'server-search-1',
+        name: 'google_search',
+        args: {},
+      },
+    };
+    const textPart: t.MessageContentComplex = {
+      type: ContentTypes.TEXT,
+      text: 'Search complete.',
+    };
+    const toolResponsePart: t.MessageContentComplex = {
+      type: 'toolResponse',
+      toolResponse: {
+        id: 'server-search-1',
+        name: 'google_search',
+        response: { results: [] },
+      },
+    };
+
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: [toolCallPart, textPart, toolResponsePart],
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+
+    expect(dispatchMessageDelta).toHaveBeenCalledTimes(3);
+    expect(dispatchMessageDelta).toHaveBeenNthCalledWith(
+      1,
+      expect.stringMatching(/^step_/),
+      { content: [toolCallPart] },
+      metadata
+    );
+    expect(dispatchMessageDelta).toHaveBeenNthCalledWith(
+      2,
+      expect.stringMatching(/^step_/),
+      { content: [textPart] },
+      metadata
+    );
+    expect(dispatchMessageDelta).toHaveBeenNthCalledWith(
+      3,
+      expect.stringMatching(/^step_/),
+      { content: [toolResponsePart] },
+      metadata
+    );
+  });
+
   it('processes a reused chunk object when its streamed payload changes', async () => {
     const graph = createGraph();
     const handler = new ChatModelStreamHandler();

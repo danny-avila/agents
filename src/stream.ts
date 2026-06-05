@@ -329,6 +329,53 @@ function hasDirectToolCallChunkStateInStep(args: {
   return false;
 }
 
+function isGoogleServerSideToolContentPart(
+  contentPart: t.MessageContentComplex
+): boolean {
+  return contentPart.type === 'toolCall' || contentPart.type === 'toolResponse';
+}
+
+function isTextContentPart(contentPart: t.MessageContentComplex): boolean {
+  return contentPart.type?.startsWith(ContentTypes.TEXT) ?? false;
+}
+
+async function dispatchMessageContentParts({
+  graph,
+  stepKey,
+  stepId,
+  content,
+  metadata,
+}: {
+  graph: StandardGraph;
+  stepKey: string;
+  stepId: string;
+  content: t.MessageContentComplex[];
+  metadata?: Record<string, unknown>;
+}): Promise<void> {
+  let currentStepId = stepId;
+  for (let index = 0; index < content.length; index++) {
+    if (index > 0) {
+      currentStepId = await graph.dispatchRunStep(
+        stepKey,
+        {
+          type: StepTypes.MESSAGE_CREATION,
+          message_creation: {
+            message_id: getMessageId(stepKey, graph, true) ?? '',
+          },
+        },
+        metadata
+      );
+    }
+    await graph.dispatchMessageDelta(
+      currentStepId,
+      {
+        content: [content[index]],
+      },
+      metadata
+    );
+  }
+}
+
 type EagerToolExecutionEntry = {
   id: string;
   toolName: string;
@@ -1186,9 +1233,7 @@ hasToolCallChunks: ${hasToolCallChunks}
           metadata
         );
       }
-    } else if (
-      content.every((c) => c.type?.startsWith(ContentTypes.TEXT) ?? false)
-    ) {
+    } else if (content.every((c) => isTextContentPart(c))) {
       await graph.dispatchMessageDelta(
         stepId,
         {
@@ -1196,6 +1241,17 @@ hasToolCallChunks: ${hasToolCallChunks}
         },
         metadata
       );
+    } else if (content.some((c) => isGoogleServerSideToolContentPart(c))) {
+      const messageContent = content.filter(
+        (c) => isTextContentPart(c) || isGoogleServerSideToolContentPart(c)
+      );
+      await dispatchMessageContentParts({
+        graph,
+        stepKey,
+        stepId,
+        content: messageContent,
+        metadata,
+      });
     } else if (
       content.every(
         (c) =>
