@@ -8,6 +8,7 @@ import {
   GraphEvents,
   Providers,
   StepTypes,
+  ToolCallTypes,
 } from '@/common';
 import { HandlerRegistry } from '@/events';
 import * as events from '@/utils/events';
@@ -1786,8 +1787,12 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     const dispatchMessageDelta = jest.fn<StandardGraph['dispatchMessageDelta']>(
       async () => undefined
     );
+    const dispatchReasoningDelta = jest.fn<
+      StandardGraph['dispatchReasoningDelta']
+    >(async () => undefined);
     const graph = createGraph({
       dispatchMessageDelta,
+      dispatchReasoningDelta,
       getAgentContext: jest.fn(
         (): Partial<AgentContext> => ({
           provider: Providers.GOOGLE,
@@ -1830,6 +1835,87 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
       { content: [toolCallPart] },
       metadata
     );
+    expect(dispatchReasoningDelta).toHaveBeenCalledWith(
+      expect.stringMatching(/^step_/),
+      {
+        content: [
+          {
+            type: ContentTypes.THINK,
+            think: 'Need to search before answering.',
+          },
+        ],
+      },
+      metadata
+    );
+  });
+
+  it('dispatches Gemini server-side tool context before client tool calls in mixed chunks', async () => {
+    const dispatchOrder: string[] = [];
+    const dispatchMessageDelta = jest.fn<StandardGraph['dispatchMessageDelta']>(
+      async (_id, delta) => {
+        if (
+          delta.content?.some(
+            (contentPart) => contentPart.type === 'toolCall'
+          ) === true
+        ) {
+          dispatchOrder.push('server-context');
+        }
+      }
+    );
+    const graph = createGraph({
+      dispatchMessageDelta,
+      getAgentContext: jest.fn(
+        (): Partial<AgentContext> => ({
+          provider: Providers.GOOGLE,
+          reasoningKey: 'reasoning',
+          currentTokenType: ContentTypes.TEXT,
+          toolDefinitions: [{ name: 'weather' }],
+          graphTools: [],
+          agentId: 'agent_1',
+        })
+      ) as unknown as StandardGraph['getAgentContext'],
+    });
+    const dispatchRunStep = graph.dispatchRunStep.bind(graph);
+    graph.dispatchRunStep = jest.fn<StandardGraph['dispatchRunStep']>(
+      async (stepKey, stepDetails, metadata) => {
+        const stepId = await dispatchRunStep(stepKey, stepDetails, metadata);
+        if ((stepDetails as t.StepDetails).type === StepTypes.TOOL_CALLS) {
+          dispatchOrder.push('client-tool-calls');
+        }
+        return stepId;
+      }
+    );
+    const handler = new ChatModelStreamHandler();
+    const metadata = { langgraph_node: 'agent' };
+    const toolCallPart: t.MessageContentComplex = {
+      type: 'toolCall',
+      toolCall: {
+        id: 'server-search-1',
+        name: 'google_search',
+        args: {},
+      },
+    };
+
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: [toolCallPart],
+          tool_calls: [
+            {
+              type: ToolCallTypes.TOOL_CALL,
+              id: 'call_weather',
+              name: 'weather',
+              args: { city: 'NYC' },
+            },
+          ],
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+
+    expect(dispatchOrder).toEqual(['server-context', 'client-tool-calls']);
   });
 
   it('does not dispatch Gemini server-side tool context blocks for non-Google providers', async () => {

@@ -59,6 +59,38 @@ type GoogleServerSideToolPartMetadata = {
   thoughtSignature?: string;
 };
 
+type GoogleFunctionCallWithId = FunctionCallPart['functionCall'] & {
+  id?: string;
+};
+
+type GoogleFunctionResponseWithId = {
+  name: string;
+  response: object;
+  id?: string;
+};
+
+function getGoogleFunctionId(id?: string): string | undefined {
+  return id != null && id !== '' ? id : undefined;
+}
+
+function createGoogleFunctionResponsePart({
+  name,
+  response,
+  id,
+}: {
+  name: string;
+  response: object;
+  id?: string;
+}): Part {
+  const functionId = getGoogleFunctionId(id);
+  const functionResponse: GoogleFunctionResponseWithId = {
+    name,
+    response,
+    ...(functionId != null ? { id: functionId } : {}),
+  };
+  return { functionResponse };
+}
+
 /**
  * Executes a function immediately and returns its result.
  * Functional utility similar to an Immediately Invoked Function Expression (IIFE).
@@ -447,25 +479,23 @@ export function convertMessageContentToParts(
 
     if (message.status === 'error') {
       return [
-        {
-          functionResponse: {
-            name: messageName,
-            // The API expects an object with an `error` field if the function call fails.
-            // `error` must be a valid object (not a string or array), so we wrap `message.content` here
-            response: { error: { details: result } },
-          },
-        },
+        createGoogleFunctionResponsePart({
+          name: messageName,
+          // The API expects an object with an `error` field if the function call fails.
+          // `error` must be a valid object (not a string or array), so we wrap `message.content` here
+          response: { error: { details: result } },
+          id: message.tool_call_id,
+        }),
       ];
     }
 
     return [
-      {
-        functionResponse: {
-          name: messageName,
-          // again, can't have a string or array value for `response`, so we wrap it as an object here
-          response: { result },
-        },
-      },
+      createGoogleFunctionResponsePart({
+        name: messageName,
+        // again, can't have a string or array value for `response`, so we wrap it as an object here
+        response: { result },
+        id: message.tool_call_id,
+      }),
     ];
   }
 
@@ -504,12 +534,15 @@ export function convertMessageContentToParts(
         }
         return '';
       });
+      const functionId = getGoogleFunctionId(tc.id);
+      const functionCall: GoogleFunctionCallWithId = {
+        name: tc.name,
+        args: tc.args,
+        ...(functionId != null ? { id: functionId } : {}),
+      };
 
       return {
-        functionCall: {
-          name: tc.name,
-          args: tc.args,
-        },
+        functionCall,
         ...(thoughtSignature ? { thoughtSignature } : {}),
       };
     });
@@ -761,11 +794,7 @@ export function mapGenerateContentResultToChatResult(
     usageMetadata: UsageMetadata | undefined;
   }
 ): ChatResult {
-  if (
-    !response.candidates ||
-    response.candidates.length === 0 ||
-    !response.candidates[0]
-  ) {
+  if (!response.candidates || response.candidates.length === 0) {
     return {
       generations: [],
       llmOutput: {
@@ -801,7 +830,7 @@ export function mapGenerateContentResultToChatResult(
   if (
     Array.isArray(candidateContent?.parts) &&
     candidateContent.parts.length === 1 &&
-    candidateContent.parts[0].text &&
+    (candidateContent.parts[0].text ?? '') !== '' &&
     !(
       'thought' in candidateContent.parts[0] &&
       candidateContent.parts[0].thought === true
@@ -887,7 +916,7 @@ export function mapGenerateContentResultToChatResult(
   const generation: ChatGeneration = {
     text,
     message: new AIMessage({
-      content: content ?? '',
+      content,
       tool_calls,
       additional_kwargs,
       usage_metadata: extra?.usageMetadata,

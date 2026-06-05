@@ -825,6 +825,43 @@ test('Preserves Gemini server-side tool context parts in history', () => {
   ]);
 });
 
+test('Preserves Gemini function-call ids in history', () => {
+  const aiMessage = new AIMessage({
+    content: '',
+    tool_calls: [
+      {
+        id: 'call_weather_1',
+        name: 'get_weather',
+        args: { city: 'NYC' },
+      },
+    ],
+  });
+  const toolMessage = new ToolMessage({
+    content: 'sunny',
+    name: 'get_weather',
+    tool_call_id: 'call_weather_1',
+  });
+
+  expect(convertMessageContentToParts(aiMessage, true, [])).toEqual([
+    {
+      functionCall: {
+        id: 'call_weather_1',
+        name: 'get_weather',
+        args: { city: 'NYC' },
+      },
+    },
+  ]);
+  expect(convertMessageContentToParts(toolMessage, true, [aiMessage])).toEqual([
+    {
+      functionResponse: {
+        id: 'call_weather_1',
+        name: 'get_weather',
+        response: { result: 'sunny' },
+      },
+    },
+  ]);
+});
+
 test('Preserves Gemini server-side tool context parts from responses', () => {
   const toolCallPart = {
     toolCall: {

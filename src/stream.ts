@@ -349,6 +349,32 @@ function isReasoningContentPart(contentPart: t.MessageContentComplex): boolean {
   );
 }
 
+function getReasoningTextFromContentPart(
+  contentPart: t.MessageContentComplex
+): string {
+  return (
+    (contentPart as t.ThinkingContentText).thinking ??
+    (contentPart as Partial<t.GoogleReasoningContentText>).reasoning ??
+    (contentPart as Partial<t.BedrockReasoningContentText>).reasoningText
+      ?.text ??
+    ''
+  );
+}
+
+function getReasoningTextFromChunk(
+  chunk: Partial<AIMessageChunk>,
+  agentContext: AgentContext
+): string {
+  const reasoning = chunk.additional_kwargs?.[agentContext.reasoningKey] as
+    | string
+    | Partial<ChatOpenAIReasoningSummary>
+    | undefined;
+  if (typeof reasoning === 'string') {
+    return reasoning;
+  }
+  return reasoning?.summary?.[0]?.text ?? '';
+}
+
 const googleServerSideToolStepIdsByGraph = new WeakMap<
   StandardGraph,
   Set<string>
@@ -446,6 +472,86 @@ async function dispatchMessageContentParts({
       metadata
     );
   }
+}
+
+async function dispatchReasoningContentParts({
+  graph,
+  stepKey,
+  content,
+  metadata,
+}: {
+  graph: StandardGraph;
+  stepKey: string;
+  content: t.MessageContentComplex[];
+  metadata?: Record<string, unknown>;
+}): Promise<void> {
+  if (content.length === 0) {
+    return;
+  }
+  const currentStepId = await dispatchMessageCreationStep({
+    graph,
+    stepKey,
+    metadata,
+  });
+  await graph.dispatchReasoningDelta(
+    currentStepId,
+    {
+      content,
+    },
+    metadata
+  );
+}
+
+async function dispatchGoogleServerSideToolStreamContent({
+  graph,
+  stepKey,
+  chunk,
+  agentContext,
+  content,
+  metadata,
+}: {
+  graph: StandardGraph;
+  stepKey: string;
+  chunk: Partial<AIMessageChunk>;
+  agentContext: AgentContext;
+  content: t.MessageContentComplex[];
+  metadata?: Record<string, unknown>;
+}): Promise<void> {
+  const reasoningContent: t.MessageContentComplex[] = [];
+  const reasoningText = getReasoningTextFromChunk(chunk, agentContext);
+  if (reasoningText !== '') {
+    reasoningContent.push({
+      type: ContentTypes.THINK,
+      think: reasoningText,
+    });
+  }
+  reasoningContent.push(
+    ...content
+      .filter((contentPart) => isReasoningContentPart(contentPart))
+      .map((contentPart) => ({
+        type: ContentTypes.THINK,
+        think: getReasoningTextFromContentPart(contentPart),
+      }))
+      .filter((contentPart) => contentPart.think !== '')
+  );
+  await dispatchReasoningContentParts({
+    graph,
+    stepKey,
+    content: reasoningContent,
+    metadata,
+  });
+
+  const messageContent = content.filter(
+    (contentPart) =>
+      isTextContentPart(contentPart) ||
+      isGoogleServerSideToolContentPart(contentPart)
+  );
+  await dispatchMessageContentParts({
+    graph,
+    stepKey,
+    content: messageContent,
+    metadata,
+  });
 }
 
 type EagerToolExecutionEntry = {
@@ -1106,6 +1212,21 @@ export class ChatModelStreamHandler implements t.EventHandler {
     let hasToolCalls = false;
     const hasToolCallChunks =
       (chunk.tool_call_chunks && chunk.tool_call_chunks.length > 0) ?? false;
+    const hasGoogleServerSideToolContent =
+      isGoogleLike(agentContext.provider) &&
+      Array.isArray(content) &&
+      content.some((c) => isGoogleServerSideToolContentPart(c));
+    if (hasGoogleServerSideToolContent && Array.isArray(content)) {
+      await dispatchGoogleServerSideToolStreamContent({
+        graph,
+        stepKey,
+        chunk,
+        agentContext,
+        content,
+        metadata,
+      });
+    }
+
     if (
       chunk.tool_calls &&
       chunk.tool_calls.length > 0 &&
@@ -1196,20 +1317,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
       return;
     }
 
-    if (
-      isGoogleLike(agentContext.provider) &&
-      Array.isArray(content) &&
-      content.some((c) => isGoogleServerSideToolContentPart(c))
-    ) {
-      const messageContent = content.filter(
-        (c) => isTextContentPart(c) || isGoogleServerSideToolContentPart(c)
-      );
-      await dispatchMessageContentParts({
-        graph,
-        stepKey,
-        content: messageContent,
-        metadata,
-      });
+    if (hasGoogleServerSideToolContent) {
       return;
     }
 
