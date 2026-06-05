@@ -339,37 +339,108 @@ function isTextContentPart(contentPart: t.MessageContentComplex): boolean {
   return contentPart.type?.startsWith(ContentTypes.TEXT) ?? false;
 }
 
+function isReasoningContentPart(contentPart: t.MessageContentComplex): boolean {
+  return (
+    (contentPart.type?.startsWith(ContentTypes.THINKING) ?? false) ||
+    (contentPart.type?.startsWith(ContentTypes.REASONING) ?? false) ||
+    (contentPart.type?.startsWith(ContentTypes.REASONING_CONTENT) ?? false) ||
+    contentPart.type === 'redacted_thinking'
+  );
+}
+
+const googleServerSideToolStepIdsByGraph = new WeakMap<
+  StandardGraph,
+  Set<string>
+>();
+
+function markGoogleServerSideToolMessageStep(
+  graph: StandardGraph,
+  stepId: string
+): void {
+  const stepIds = googleServerSideToolStepIdsByGraph.get(graph) ?? new Set();
+  stepIds.add(stepId);
+  googleServerSideToolStepIdsByGraph.set(graph, stepIds);
+}
+
+function isGoogleServerSideToolMessageStep(
+  graph: StandardGraph,
+  stepId: string
+): boolean {
+  return googleServerSideToolStepIdsByGraph.get(graph)?.has(stepId) === true;
+}
+
+function shouldStartFreshMessageStepAfterGoogleServerSideTool({
+  graph,
+  stepId,
+  runStep,
+  content,
+}: {
+  graph: StandardGraph;
+  stepId: string;
+  runStep?: t.RunStep;
+  content: string | t.MessageContentComplex[];
+}): boolean {
+  if (
+    runStep?.type !== StepTypes.MESSAGE_CREATION ||
+    !isGoogleServerSideToolMessageStep(graph, stepId)
+  ) {
+    return false;
+  }
+  if (typeof content === 'string') {
+    return true;
+  }
+  return (
+    content.every((c) => isTextContentPart(c)) ||
+    content.every((c) => isReasoningContentPart(c))
+  );
+}
+
+async function dispatchMessageCreationStep({
+  graph,
+  stepKey,
+  metadata,
+}: {
+  graph: StandardGraph;
+  stepKey: string;
+  metadata?: Record<string, unknown>;
+}): Promise<string> {
+  const messageId = getMessageId(stepKey, graph, true) ?? '';
+  return graph.dispatchRunStep(
+    stepKey,
+    {
+      type: StepTypes.MESSAGE_CREATION,
+      message_creation: {
+        message_id: messageId,
+      },
+    },
+    metadata
+  );
+}
+
 async function dispatchMessageContentParts({
   graph,
   stepKey,
-  stepId,
   content,
   metadata,
 }: {
   graph: StandardGraph;
   stepKey: string;
-  stepId: string;
   content: t.MessageContentComplex[];
   metadata?: Record<string, unknown>;
 }): Promise<void> {
-  let currentStepId = stepId;
-  for (let index = 0; index < content.length; index++) {
-    if (index > 0) {
-      currentStepId = await graph.dispatchRunStep(
-        stepKey,
-        {
-          type: StepTypes.MESSAGE_CREATION,
-          message_creation: {
-            message_id: getMessageId(stepKey, graph, true) ?? '',
-          },
-        },
-        metadata
-      );
+  for (const contentPart of content) {
+    const currentStepId = await dispatchMessageCreationStep({
+      graph,
+      stepKey,
+      metadata,
+    });
+    if (isGoogleServerSideToolContentPart(contentPart)) {
+      markGoogleServerSideToolMessageStep(graph, currentStepId);
     }
     await graph.dispatchMessageDelta(
       currentStepId,
       {
-        content: [content[index]],
+        content: [contentPart],
       },
       metadata
     );
@@ -1116,6 +1187,22 @@ export class ChatModelStreamHandler implements t.EventHandler {
       return;
     }
 
+    if (
+      Array.isArray(content) &&
+      content.some((c) => isGoogleServerSideToolContentPart(c))
+    ) {
+      const messageContent = content.filter(
+        (c) => isTextContentPart(c) || isGoogleServerSideToolContentPart(c)
+      );
+      await dispatchMessageContentParts({
+        graph,
+        stepKey,
+        content: messageContent,
+        metadata,
+      });
+      return;
+    }
+
     const message_id = getMessageId(stepKey, graph) ?? '';
     if (message_id) {
       await graph.dispatchRunStep(
@@ -1130,8 +1217,19 @@ export class ChatModelStreamHandler implements t.EventHandler {
       );
     }
 
-    const stepId = graph.getStepIdByKey(stepKey);
-    const runStep = graph.getRunStep(stepId);
+    let stepId = graph.getStepIdByKey(stepKey);
+    let runStep = graph.getRunStep(stepId);
+    if (
+      shouldStartFreshMessageStepAfterGoogleServerSideTool({
+        graph,
+        stepId,
+        runStep,
+        content,
+      })
+    ) {
+      stepId = await dispatchMessageCreationStep({ graph, stepKey, metadata });
+      runStep = graph.getRunStep(stepId);
+    }
     if (!runStep) {
       console.warn(`\n
 ==============================================================
@@ -1241,26 +1339,7 @@ hasToolCallChunks: ${hasToolCallChunks}
         },
         metadata
       );
-    } else if (content.some((c) => isGoogleServerSideToolContentPart(c))) {
-      const messageContent = content.filter(
-        (c) => isTextContentPart(c) || isGoogleServerSideToolContentPart(c)
-      );
-      await dispatchMessageContentParts({
-        graph,
-        stepKey,
-        stepId,
-        content: messageContent,
-        metadata,
-      });
-    } else if (
-      content.every(
-        (c) =>
-          (c.type?.startsWith(ContentTypes.THINKING) ?? false) ||
-          (c.type?.startsWith(ContentTypes.REASONING) ?? false) ||
-          (c.type?.startsWith(ContentTypes.REASONING_CONTENT) ?? false) ||
-          c.type === 'redacted_thinking'
-      )
-    ) {
+    } else if (content.every((c) => isReasoningContentPart(c))) {
       await graph.dispatchReasoningDelta(
         stepId,
         {
