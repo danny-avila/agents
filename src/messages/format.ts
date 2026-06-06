@@ -106,15 +106,19 @@ interface FormatMessageParams {
   langChain?: boolean;
 }
 
-type LangChainMessageRole = 'system' | 'user' | 'assistant' | 'tool';
+export type LangChainMessageRole = 'system' | 'user' | 'assistant' | 'tool';
 
-function withMessageRole<T extends BaseMessage>(
+export type RoleBearingMessage<T extends BaseMessage = BaseMessage> = T & {
+  role: LangChainMessageRole;
+};
+
+export function withMessageRole<T extends BaseMessage>(
   message: T,
   role: LangChainMessageRole
-): T {
+): RoleBearingMessage<T> {
   const roleMessage = message as T & { role?: LangChainMessageRole };
   if (roleMessage.role === role) {
-    return message;
+    return roleMessage as RoleBearingMessage<T>;
   }
   Object.defineProperty(roleMessage, 'role', {
     value: role,
@@ -122,7 +126,7 @@ function withMessageRole<T extends BaseMessage>(
     enumerable: false,
     configurable: true,
   });
-  return message;
+  return roleMessage as RoleBearingMessage<T>;
 }
 
 interface FormattedMessage {
@@ -146,9 +150,9 @@ export const formatMessage = ({
   langChain = false,
 }: FormatMessageParams):
   | FormattedMessage
-  | HumanMessage
-  | AIMessage
-  | SystemMessage => {
+  | RoleBearingMessage<HumanMessage>
+  | RoleBearingMessage<AIMessage>
+  | RoleBearingMessage<SystemMessage> => {
   // eslint-disable-next-line prefer-const
   let { role: _role, _name, sender, text, content: _content, lc_id } = message;
   if (lc_id && lc_id[2] && !langChain) {
@@ -274,14 +278,21 @@ export const formatMessage = ({
 export const formatLangChainMessages = (
   messages: Array<MessageInput>,
   formatOptions: Omit<FormatMessageParams, 'message' | 'langChain'>
-): Array<HumanMessage | AIMessage | SystemMessage> => {
+): Array<
+  | RoleBearingMessage<HumanMessage>
+  | RoleBearingMessage<AIMessage>
+  | RoleBearingMessage<SystemMessage>
+> => {
   return messages.map((msg) => {
     const formatted = formatMessage({
       ...formatOptions,
       message: msg,
       langChain: true,
     });
-    return formatted as HumanMessage | AIMessage | SystemMessage;
+    return formatted as
+      | RoleBearingMessage<HumanMessage>
+      | RoleBearingMessage<AIMessage>
+      | RoleBearingMessage<SystemMessage>;
   });
 };
 
@@ -411,10 +422,12 @@ function getToolUseId(part: MessageContentComplex): string | undefined {
 function formatAssistantMessage(
   message: Partial<TMessage>,
   options?: FormatAssistantMessageOptions
-): Array<AIMessage | ToolMessage> {
-  const formattedMessages: Array<AIMessage | ToolMessage> = [];
+): Array<RoleBearingMessage<AIMessage> | RoleBearingMessage<ToolMessage>> {
+  const formattedMessages: Array<
+    RoleBearingMessage<AIMessage> | RoleBearingMessage<ToolMessage>
+  > = [];
   let currentContent: MessageContentComplex[] = [];
-  let lastAIMessage: AIMessage | null = null;
+  let lastAIMessage: RoleBearingMessage<AIMessage> | null = null;
   let hasReasoning = false;
   let pendingReasoningContent = '';
   const emittedServerToolUseIds = new Set<string>();
@@ -431,7 +444,9 @@ function formatAssistantMessage(
     return reasoningContent;
   };
 
-  const createAIMessage = (content: MessageContent): AIMessage => {
+  const createAIMessage = (
+    content: MessageContent
+  ): RoleBearingMessage<AIMessage> => {
     const reasoningContent = takePendingReasoningContent();
     return withMessageRole(
       new AIMessage({
@@ -1044,7 +1059,12 @@ export const formatAgentMessages = (
   skills?: Map<string, string>,
   options?: FormatAgentMessagesOptions
 ): {
-  messages: Array<HumanMessage | AIMessage | SystemMessage | ToolMessage>;
+  messages: Array<
+    | RoleBearingMessage<HumanMessage>
+    | RoleBearingMessage<AIMessage>
+    | RoleBearingMessage<SystemMessage>
+    | RoleBearingMessage<ToolMessage>
+  >;
   indexTokenCountMap?: Record<number, number>;
   /** Cross-run summary extracted from the payload. Should be forwarded to the
    *  agent run so it can be included in the system message via AgentContext. */
@@ -1059,7 +1079,10 @@ export const formatAgentMessages = (
   };
 } => {
   const messages: Array<
-    HumanMessage | AIMessage | SystemMessage | ToolMessage
+    | RoleBearingMessage<HumanMessage>
+    | RoleBearingMessage<AIMessage>
+    | RoleBearingMessage<SystemMessage>
+    | RoleBearingMessage<ToolMessage>
   > = [];
   // If indexTokenCountMap is provided, create a new map to track the updated indices
   const updatedIndexTokenCountMap: Record<number, number> = {};
@@ -1115,7 +1138,10 @@ export const formatAgentMessages = (
       const formattedMessage = formatMessage({
         message: message as MessageInput,
         langChain: true,
-      }) as HumanMessage | AIMessage | SystemMessage;
+      }) as
+        | RoleBearingMessage<HumanMessage>
+        | RoleBearingMessage<AIMessage>
+        | RoleBearingMessage<SystemMessage>;
       if (sourceMessageId != null && sourceMessageId !== '') {
         formattedMessage.id = sourceMessageId;
       }
