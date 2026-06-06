@@ -116,8 +116,8 @@
     "prepublishOnly": "npm run build",
     "build": "NODE_ENV=production rollup -c && tsc -p tsconfig.build.json",
     "build:dev": "rollup -c",
-    "sort-imports": "bun run scripts/sort-imports.ts",
-    "sort-imports:check": "bun run scripts/sort-imports.ts --check",
+    "sort-imports": "node scripts/sort-imports.ts",
+    "sort-imports:check": "node scripts/sort-imports.ts --check",
     "start": "node dist/esm/main.js",
     "clean": "node ./config/clean.js",
     "script": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/cli.ts",
@@ -270,7 +270,6 @@
     "@rollup/plugin-node-resolve": "^15.2.3",
     "@rollup/plugin-typescript": "^12.1.2",
     "@swc/core": "^1.6.13",
-    "@types/bun": "^1.3.14",
     "@types/jest": "^30.0.0",
     "@types/node": "^24.13.1",
     "@types/node-fetch": "^2.6.13",
@@ -297,6 +296,7 @@
   },
   "lint-staged": {
     "*.{js,ts}": [
+      "node scripts/sort-imports.ts",
       "prettier --write",
       "eslint --fix"
     ],

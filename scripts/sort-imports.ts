@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env node
 /**
  * Sorts imports in all .ts files under src/ per project convention
  * (AGENTS.md § Import Order):
@@ -8,16 +8,23 @@
  * 3. import type from local    — longest line to shortest
  * 4. Local value imports       — longest line to shortest
  *
- * Run:        bun run sort-imports
- * Check only: bun run sort-imports:check
+ * Runtime-agnostic: uses only Node APIs, so it runs under either
+ * `node scripts/sort-imports.ts` (Node 24+ strips types natively) or
+ * `bun run scripts/sort-imports.ts`.
+ *
+ * Run:        npm run sort-imports
+ * Check only: npm run sort-imports:check
  */
 
-import { Glob } from 'bun';
-import { join } from 'node:path';
+import { readFile, writeFile, readdir } from 'node:fs/promises';
+import { join, relative, resolve, sep, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const ROOT = join(import.meta.dir, '..');
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const SRC = join(ROOT, 'src');
-const CHECK = process.argv.includes('--check');
+const args = process.argv.slice(2);
+const CHECK = args.includes('--check');
+const FILE_ARGS = args.filter((arg) => !arg.startsWith('--'));
 
 /** Directories under src/ excluded from linting (mirrors eslint.config.mjs). */
 const EXCLUDED_DIRS = ['scripts/', 'proto/'];
@@ -43,14 +50,39 @@ interface Stmt {
   len: number;
 }
 
+/** Per-file opt-out for modules where import order is load-bearing. */
+const IGNORE_MARKER = /^\s*\/\/\s*sort-imports-ignore\b/;
+
 function extractSpec(raw: string): string | null {
   return raw.match(/from\s+['"]([^'"]+)['"]/)?.[1] ?? null;
 }
 
+/** Applies the AGENTS.md grouping/length ordering to a run of pure imports. */
+function sortSegment(stmts: Stmt[]): string[] {
+  const g1 = stmts
+    .filter((s) => !s.isType && !s.isLocal)
+    .sort((a, b) => a.len - b.len);
+  const g2 = stmts
+    .filter((s) => s.isType && !s.isLocal)
+    .sort((a, b) => b.len - a.len);
+  const g3 = stmts
+    .filter((s) => s.isType && s.isLocal)
+    .sort((a, b) => b.len - a.len);
+  const g4 = stmts
+    .filter((s) => !s.isType && s.isLocal)
+    .sort((a, b) => b.len - a.len);
+  return [...g1, ...g2, ...g3, ...g4].map((s) => s.raw);
+}
+
 function sortFileImports(content: string): string | null {
   const lines = content.split('\n');
-  let i = 0;
 
+  // Honor an explicit opt-out anywhere in the file.
+  if (lines.some((line) => IGNORE_MARKER.test(line))) {
+    return null;
+  }
+
+  let i = 0;
   while (i < lines.length) {
     const t = lines[i].trimStart();
     if (
@@ -69,9 +101,20 @@ function sortFileImports(content: string): string | null {
   }
 
   const importStart = i;
-  const sideEffects: string[] = [];
-  const stmts: Stmt[] = [];
+  // Side-effect imports (no `from` clause) are treated as immovable
+  // barriers: sorting is confined to each contiguous run of pure imports
+  // between them, so module-evaluation order around anything with side
+  // effects (polyfills, registration, etc.) is never changed.
+  const emitted: string[] = [];
+  const originalRaws: string[] = [];
+  let segment: Stmt[] = [];
   let importEnd = i;
+
+  const flushSegment = (): void => {
+    if (segment.length === 0) return;
+    emitted.push(...sortSegment(segment));
+    segment = [];
+  };
 
   while (i < lines.length) {
     const t = lines[i].trimStart();
@@ -85,15 +128,17 @@ function sortFileImports(content: string): string | null {
     }
     i = j + 1;
     importEnd = i;
+    originalRaws.push(raw);
 
     const spec = extractSpec(raw);
     if (spec == null || spec === '') {
-      sideEffects.push(raw);
+      flushSegment();
+      emitted.push(raw);
       while (i < lines.length && lines[i].trim() === '') i++;
       continue;
     }
 
-    stmts.push({
+    segment.push({
       raw,
       spec,
       isType: /^import\s+type[\s{]/.test(raw.trimStart()),
@@ -106,44 +151,60 @@ function sortFileImports(content: string): string | null {
 
     while (i < lines.length && lines[i].trim() === '') i++;
   }
+  flushSegment();
 
-  if (stmts.length < 2 && sideEffects.length === 0) return null;
-
-  const g1 = stmts
-    .filter((s) => !s.isType && !s.isLocal)
-    .sort((a, b) => a.len - b.len);
-  const g2 = stmts
-    .filter((s) => s.isType && !s.isLocal)
-    .sort((a, b) => b.len - a.len);
-  const g3 = stmts
-    .filter((s) => s.isType && s.isLocal)
-    .sort((a, b) => b.len - a.len);
-  const g4 = stmts
-    .filter((s) => !s.isType && s.isLocal)
-    .sort((a, b) => b.len - a.len);
-  const sorted = [...sideEffects, ...g1, ...g2, ...g3, ...g4];
-
-  const oldBlock = [...sideEffects, ...stmts.map((s) => s.raw)].join('\n');
-  const newBlock = sorted
-    .map((s) => (typeof s === 'string' ? s : s.raw))
-    .join('\n');
-  if (oldBlock === newBlock) return null;
+  if (originalRaws.length < 2) return null;
+  if (originalRaws.join('\n') === emitted.join('\n')) return null;
 
   return [
     ...lines.slice(0, importStart),
-    ...sorted.map((s) => (typeof s === 'string' ? s : s.raw)),
+    ...emitted,
     ...lines.slice(importEnd),
   ].join('\n');
 }
 
-const glob = new Glob('**/*.ts');
+/** Recursively yields absolute paths of every `.ts` file under `dir`. */
+async function* walkTypeScriptFiles(dir: string): AsyncGenerator<string> {
+  const entries = await readdir(dir, { withFileTypes: true });
+  for (const entry of entries) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      yield* walkTypeScriptFiles(full);
+    } else if (entry.isFile() && entry.name.endsWith('.ts')) {
+      yield full;
+    }
+  }
+}
+
+/**
+ * Resolves the set of files to process. When explicit paths are passed
+ * (e.g. by lint-staged) only those `.ts` files under `src/` are sorted;
+ * otherwise every non-excluded file under `src/` is scanned.
+ */
+async function collectFiles(): Promise<string[]> {
+  if (FILE_ARGS.length > 0) {
+    return FILE_ARGS.map((file) => resolve(file)).filter(
+      (abs) =>
+        abs.endsWith('.ts') &&
+        abs.startsWith(`${SRC}${sep}`) &&
+        !isExcluded(relative(SRC, abs))
+    );
+  }
+
+  const files: string[] = [];
+  for await (const abs of walkTypeScriptFiles(SRC)) {
+    if (isExcluded(relative(SRC, abs))) continue;
+    files.push(abs);
+  }
+  return files;
+}
+
 let changed = 0;
 let total = 0;
 
-for await (const rel of glob.scan({ cwd: SRC })) {
-  if (isExcluded(rel)) continue;
-  const filePath = join(SRC, rel);
-  const content = await Bun.file(filePath).text();
+for (const filePath of await collectFiles()) {
+  const rel = relative(ROOT, filePath);
+  const content = await readFile(filePath, 'utf8');
   const result = sortFileImports(content);
   total++;
   if (result === null) continue;
@@ -151,14 +212,14 @@ for await (const rel of glob.scan({ cwd: SRC })) {
   if (CHECK) {
     console.log(`  ✗ ${rel}`);
   } else {
-    await Bun.write(filePath, result);
+    await writeFile(filePath, result);
     console.log(`  ✓ ${rel}`);
   }
 }
 
 if (CHECK && changed) {
   console.log(
-    `\n${changed}/${total} files need sorting. Run: bun run sort-imports`
+    `\n${changed}/${total} files need sorting. Run: npm run sort-imports`
   );
   process.exit(1);
 } else if (changed) {
