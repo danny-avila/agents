@@ -294,16 +294,27 @@ export function createWorkspacePolicyHook(
   const readPolicy: OutsideAccessPolicy = config.outsideRead ?? 'ask';
   const writePolicy: OutsideAccessPolicy = config.outsideWrite ?? 'ask';
 
-  const extractors: Record<string, PathExtractor> = {
+  const extractors: Record<string, PathExtractor | undefined> = {
     ...DEFAULT_EXTRACTORS,
     ...(config.pathExtractors ?? {}),
+  };
+
+  /** Unknown tools are treated as writes (the stricter policy). */
+  const resolvePolicy = (toolName: string): OutsideAccessPolicy => {
+    if (WRITE_TOOLS.has(toolName)) {
+      return writePolicy;
+    }
+    if (READ_TOOLS.has(toolName)) {
+      return readPolicy;
+    }
+    return writePolicy;
   };
 
   return async (input: PreToolUseHookInput): Promise<PreToolUseHookOutput> => {
     const extractor = extractors[input.toolName];
     if (extractor == null) return { decision: 'allow' };
 
-    const paths = extractor((input.toolInput ?? {}) as Record<string, unknown>);
+    const paths = extractor(input.toolInput);
     if (paths.length === 0) return { decision: 'allow' };
 
     // Two-stage check:
@@ -332,11 +343,7 @@ export function createWorkspacePolicyHook(
     }
     if (outside.length === 0) return { decision: 'allow' };
 
-    const policy = WRITE_TOOLS.has(input.toolName)
-      ? writePolicy
-      : READ_TOOLS.has(input.toolName)
-        ? readPolicy
-        : writePolicy; // unknown tools — treat as write (stricter)
+    const policy = resolvePolicy(input.toolName);
     if (policy === 'allow') return { decision: 'allow' };
 
     const decision: ToolDecision = policy === 'deny' ? 'deny' : 'ask';

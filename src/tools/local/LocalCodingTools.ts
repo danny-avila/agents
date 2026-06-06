@@ -738,7 +738,7 @@ async function isRipgrepAvailable(
       { ...config, timeoutMs: 5000, sandbox: { enabled: false } },
       { internal: true }
     )
-      .then((probe) => probe != null && probe.exitCode === 0)
+      .then((probe) => probe.exitCode === 0)
       .catch(() => false);
     envMap.set(envKey, probePromise);
   }
@@ -954,6 +954,17 @@ function compileFallbackRegex(pattern: string): RegExp {
  * diagnostic skip-sentinels (Codex P2 [43]). */
 type FallbackGrepResult = { matches: string[]; skipped: string[] };
 
+/** Renders fallback-grep output: real matches first, skip diagnostics appended. */
+function formatFallbackGrepDisplay(result: FallbackGrepResult): string {
+  if (result.matches.length > 0) {
+    return [...result.matches, ...result.skipped].join('\n');
+  }
+  if (result.skipped.length > 0) {
+    return result.skipped.join('\n');
+  }
+  return 'No matches found.';
+}
+
 async function fallbackGrep(
   root: string,
   pattern: string,
@@ -1141,15 +1152,9 @@ export function createLocalGrepSearchTool(
           maxResults,
           fs
         );
-        // Display: real matches first, skip diagnostics appended.
         // Artifact count: ONLY real matches (Codex P2 [43] —
         // skip sentinels used to inflate the count and the budget).
-        const display =
-          matches.length > 0
-            ? [...matches, ...skipped].join('\n')
-            : skipped.length > 0
-              ? skipped.join('\n')
-              : 'No matches found.';
+        const display = formatFallbackGrepDisplay({ matches, skipped });
         return [
           display,
           {

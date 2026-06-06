@@ -403,6 +403,9 @@ function createCloudflareSpawn(
     const child = new EventEmitter() as ChildProcessWithoutNullStreams;
     const abortController = new AbortController();
     const state = { closed: false };
+    /** Read through a function so concurrent `closeOnce` mutation (via
+     * `kill()`/abort during an `await`) isn't statically narrowed away. */
+    const isClosed = (): boolean => state.closed;
     const closeOnce = (
       exitCode: number | null,
       signal: NodeJS.Signals | null
@@ -451,7 +454,7 @@ function createCloudflareSpawn(
       const timedCommand = withInSandboxTimeout(rendered, timeoutMs);
       const cwd =
         options.cwd == null ? ctx.workspaceRoot : options.cwd.toString();
-      if (state.closed) {
+      if (isClosed()) {
         return;
       }
       const execOptions: t.CloudflareSandboxExecOptions = {
@@ -464,14 +467,14 @@ function createCloudflareSpawn(
       }
       try {
         const result = await ctx.sandbox.exec(timedCommand, execOptions);
-        if (state.closed) {
+        if (isClosed()) {
           return;
         }
         if (result.stdout) stdout.write(result.stdout);
         if (result.stderr) stderr.write(result.stderr);
         closeOnce(result.exitCode, null);
       } catch (error) {
-        if (state.closed) {
+        if (isClosed()) {
           return;
         }
         stderr.write((error as Error).message);
