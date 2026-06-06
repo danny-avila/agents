@@ -2,6 +2,16 @@ import { z } from 'zod';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { spawnSync } from 'child_process';
+import { tool } from '@langchain/core/tools';
+import { AIMessage, ToolMessage } from '@langchain/core/messages';
+import {
+  describe,
+  it,
+  expect,
+  afterEach,
+  beforeEach,
+  jest,
+} from '@jest/globals';
 import {
   mkdtemp,
   rm,
@@ -9,21 +19,15 @@ import {
   writeFile as fsWriteFile,
   readFile as fsReadFile,
 } from 'fs/promises';
-import { tool } from '@langchain/core/tools';
-import { AIMessage, ToolMessage } from '@langchain/core/messages';
-import type { BaseMessage } from '@langchain/core/messages';
-import { describe, it, expect, afterEach, beforeEach, jest } from '@jest/globals';
 import type { StructuredToolInterface } from '@langchain/core/tools';
+import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
-import { Constants, Providers } from '@/common';
-import { ToolNode } from '../ToolNode';
 import {
   executeLocalBash,
   executeLocalCode,
   validateBashCommand,
   _resetLocalEngineWarningsForTests,
 } from '../local/LocalExecutionEngine';
-import { resolveLocalToolsForBinding } from '../local/resolveLocalExecutionTools';
 import {
   createLocalCodingToolBundle,
   _resetRipgrepCacheForTests,
@@ -32,9 +36,12 @@ import {
   runPostEditSyntaxCheck,
   _resetSyntaxCheckProbeCacheForTests,
 } from '../local/syntaxCheck';
+import { resolveLocalToolsForBinding } from '../local/resolveLocalExecutionTools';
+import { LocalFileCheckpointerImpl } from '../local/FileCheckpointer';
 import { createCompileCheckTool } from '../local/CompileCheckTool';
 import { runBashAstChecks } from '../local/bashAst';
-import { LocalFileCheckpointerImpl } from '../local/FileCheckpointer';
+import { Constants, Providers } from '@/common';
+import { ToolNode } from '../ToolNode';
 
 const hasPython3 = spawnSync('python3', ['--version']).status === 0;
 
@@ -47,14 +54,11 @@ async function createTempDir(): Promise<string> {
 }
 
 function createRemoteBashStub(): StructuredToolInterface {
-  return tool(
-    async () => 'remote bash should not run',
-    {
-      name: Constants.BASH_TOOL,
-      description: 'Remote bash stub',
-      schema: z.object({ command: z.string() }),
-    }
-  ) as unknown as StructuredToolInterface;
+  return tool(async () => 'remote bash should not run', {
+    name: Constants.BASH_TOOL,
+    description: 'Remote bash stub',
+    schema: z.object({ command: z.string() }),
+  }) as unknown as StructuredToolInterface;
 }
 
 function messagesFromResult(
@@ -216,7 +220,9 @@ describe('local execution tools', () => {
 describe('local engine bashAst', () => {
   it('flags command substitution in auto mode', () => {
     const findings = runBashAstChecks('echo $(whoami)', 'auto');
-    expect(findings.some((f) => f.code === 'cmd-subst-dollar-paren')).toBe(true);
+    expect(findings.some((f) => f.code === 'cmd-subst-dollar-paren')).toBe(
+      true
+    );
   });
 
   it('escalates command substitution to deny in strict mode', () => {
@@ -227,7 +233,11 @@ describe('local engine bashAst', () => {
 
   it('always denies /proc/<pid>/environ access', () => {
     const findings = runBashAstChecks('cat /proc/1/environ', 'auto');
-    expect(findings.some((f) => f.code === 'proc-environ-read' && f.severity === 'deny')).toBe(true);
+    expect(
+      findings.some(
+        (f) => f.code === 'proc-environ-read' && f.severity === 'deny'
+      )
+    ).toBe(true);
   });
 
   it('never produces findings when off', () => {
@@ -432,8 +442,7 @@ describe('local edit fuzzy matching', () => {
       // LLM emits a trailing-whitespace-stripped version.
       old_text:
         'function greet(name: string) {\n  return `Hello, ${name}!`;\n}',
-      new_text:
-        'function greet(name: string) {\n  return `Hi, ${name}!`;\n}',
+      new_text: 'function greet(name: string) {\n  return `Hi, ${name}!`;\n}',
     });
     expect(String(result)).toContain('strategies: line-trimmed');
     const after = await fsReadFile(file, 'utf8');
@@ -701,7 +710,10 @@ describe('compile_check', () => {
       name: 'compile_check',
       args: { command: 'echo hello && false' },
       type: 'tool_call',
-    })) as { content: string; artifact: { passed: boolean; exit_code: number | null } };
+    })) as {
+      content: string;
+      artifact: { passed: boolean; exit_code: number | null };
+    };
     expect(message.content).toContain('FAILED');
     expect(message.content).toContain('hello');
     expect(message.artifact.passed).toBe(false);
@@ -764,18 +776,20 @@ describe('codex review fixes', () => {
       // Backend A: pretends rg works (returns a fake spawn whose
       // process exits 0 on every call). The cache should record true
       // for THIS backend.
-      const okBackend = jest.fn((cmd: string, _args: string[], _opts: unknown) => {
-        const ok = require('child_process').spawn('echo', [cmd]);
-        return ok;
-      }) as unknown as t.LocalSpawn;
+      const okBackend = jest.fn(
+        (cmd: string, _args: string[], _opts: unknown) => {
+          const ok = require('child_process').spawn('echo', [cmd]);
+          return ok;
+        }
+      ) as unknown as t.LocalSpawn;
       // Backend B: pretends rg does not exist (returns a child that
       // exits 127, the "command not found" code).
       const missingBackend = jest.fn(
         (_cmd: string, _args: string[], _opts: unknown) => {
-          const child = require('child_process').spawn(
-            'sh',
-            ['-c', 'exit 127']
-          );
+          const child = require('child_process').spawn('sh', [
+            '-c',
+            'exit 127',
+          ]);
           return child;
         }
       ) as unknown as t.LocalSpawn;
@@ -798,9 +812,11 @@ describe('codex review fixes', () => {
       });
 
       // Run grep against A first — populates cache for A's backend.
-      await bundleA.tools.find((t_) => t_.name === 'grep_search')!.invoke({
-        pattern: 'needle',
-      });
+      await bundleA.tools
+        .find((t_) => t_.name === 'grep_search')!
+        .invoke({
+          pattern: 'needle',
+        });
       // Run grep against B — must NOT see cached "true" from A's
       // backend. With the bug, B would try to spawn rg, fail, and
       // throw instead of falling back to the Node walker.
@@ -825,7 +841,9 @@ describe('codex review fixes', () => {
           additionalRoots: ['../shared'],
         },
       });
-      const readTool = bundle.tools.find((t_) => t_.name === Constants.READ_FILE);
+      const readTool = bundle.tools.find(
+        (t_) => t_.name === Constants.READ_FILE
+      );
       // Without the fix, '../shared/lib.ts' would resolve relative to
       // process.cwd (this test runner), miss the boundary check, and
       // throw "Path is outside the local workspace".
@@ -842,7 +860,10 @@ describe('codex review fixes', () => {
 
 describe('codex review fixes (round 2)', () => {
   describe('streaming output cap (Codex P1)', () => {
-    const { spawnLocalProcess, _resetLocalEngineWarningsForTests: _ } = require('../local/LocalExecutionEngine');
+    const {
+      spawnLocalProcess,
+      _resetLocalEngineWarningsForTests: _,
+    } = require('../local/LocalExecutionEngine');
 
     it('hard-kills the child when total streamed bytes exceed maxSpawnedBytes', async () => {
       // Cap at 64 KiB. `yes` would otherwise run unbounded.
@@ -877,7 +898,10 @@ describe('codex review fixes (round 2)', () => {
       expect(result.exitCode).toBe(0);
       expect(result.fullOutputPath).toBeTruthy();
       const fs = await import('fs/promises');
-      const spilled = await fs.readFile(result.fullOutputPath as string, 'utf8');
+      const spilled = await fs.readFile(
+        result.fullOutputPath as string,
+        'utf8'
+      );
       // The spill file holds more bytes than the in-memory truncation.
       expect(spilled.length).toBeGreaterThan(result.stdout.length);
     });
@@ -902,7 +926,10 @@ describe('codex review fixes (round 2)', () => {
       const result = await bashTool!.invoke({
         id: 'b1',
         name: Constants.BASH_TOOL,
-        args: { command: 'echo "first=$1 second=$2"', args: ['hello', 'world'] },
+        args: {
+          command: 'echo "first=$1 second=$2"',
+          args: ['hello', 'world'],
+        },
         type: 'tool_call',
       });
       const text = JSON.stringify(result);
@@ -939,7 +966,8 @@ describe('codex review fixes (round 3)', () => {
       ) => {
         calls.push(command);
         // Fall through to a real spawn so the call resolves cleanly.
-        const { spawn: realSpawn } = require('child_process') as typeof import('child_process');
+        const { spawn: realSpawn } =
+          require('child_process') as typeof import('child_process');
         return realSpawn(command, args, opts);
       }) as unknown as t.LocalSpawn;
 
@@ -959,7 +987,9 @@ describe('codex review fixes (round 3)', () => {
       _resetSyntaxCheckProbeCacheForTests();
 
       // Backend A: probes succeed (real spawn).
-      const realSpawn = (require('child_process') as typeof import('child_process')).spawn;
+      const realSpawn = (
+        require('child_process') as typeof import('child_process')
+      ).spawn;
       const okBackend: t.LocalSpawn = ((
         cmd: string,
         args: string[],
@@ -970,7 +1000,8 @@ describe('codex review fixes (round 3)', () => {
         _cmd: string,
         _args: string[],
         opts: import('child_process').SpawnOptions
-      ) => realSpawn('sh', ['-c', 'exit 127'], opts)) as unknown as t.LocalSpawn;
+      ) =>
+        realSpawn('sh', ['-c', 'exit 127'], opts)) as unknown as t.LocalSpawn;
 
       const cwdA = await createTempDir();
       const cwdB = await createTempDir();
@@ -1039,7 +1070,7 @@ describe('codex review fixes (round 4)', () => {
     });
 
     it('blocks rm -rf \'/\' (target inside single quotes)', async () => {
-      const result = await validateBashCommand("rm -rf '/'");
+      const result = await validateBashCommand('rm -rf \'/\'');
       expect(result.valid).toBe(false);
       expect(result.errors.join('\n')).toContain('destructive command pattern');
     });
@@ -1067,7 +1098,6 @@ describe('codex review fixes (round 4)', () => {
 
 describe('codex review fixes (round 5)', () => {
   describe('maxSpawnedBytes=0 disables the cap (Codex P2 #11)', () => {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { spawnLocalProcess } = require('../local/LocalExecutionEngine');
 
     it('does not kill on first byte when maxSpawnedBytes is 0', async () => {
@@ -1109,7 +1139,7 @@ describe('codex review fixes (round 5)', () => {
     // happy path here; the static `createWriteStream` import means a
     // ReferenceError would surface as a test failure regardless of
     // which build runs the test.
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
+
     const { spawnLocalProcess } = require('../local/LocalExecutionEngine');
 
     it('writes a spill file without a runtime require', async () => {
@@ -1136,8 +1166,9 @@ describe('codex review fixes (round 5)', () => {
   });
 
   describe('sandbox config: loopback bridge access (Codex P1 #14)', () => {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { buildSandboxRuntimeConfig } = require('../local/LocalExecutionEngine');
+    const {
+      buildSandboxRuntimeConfig,
+    } = require('../local/LocalExecutionEngine');
 
     it('seeds allowedDomains with loopback hosts so the bridge works under sandbox', () => {
       const cfg = buildSandboxRuntimeConfig({}, '/tmp/ws', () => []);
@@ -1148,7 +1179,11 @@ describe('codex review fixes (round 5)', () => {
 
     it('keeps user-supplied allowedDomains and does not duplicate loopback', () => {
       const cfg = buildSandboxRuntimeConfig(
-        { sandbox: { network: { allowedDomains: ['api.example.com', '127.0.0.1'] } } },
+        {
+          sandbox: {
+            network: { allowedDomains: ['api.example.com', '127.0.0.1'] },
+          },
+        },
         '/tmp/ws',
         () => []
       );
@@ -1175,8 +1210,9 @@ describe('codex review fixes (round 5)', () => {
   });
 
   describe('sandbox allowWrite includes additionalRoots (Codex P2 #15)', () => {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { buildSandboxRuntimeConfig } = require('../local/LocalExecutionEngine');
+    const {
+      buildSandboxRuntimeConfig,
+    } = require('../local/LocalExecutionEngine');
 
     it('adds workspace.additionalRoots to allowWrite alongside cwd', () => {
       const cfg = buildSandboxRuntimeConfig(
@@ -1188,7 +1224,7 @@ describe('codex review fixes (round 5)', () => {
           },
         },
         '/tmp/repo/app',
-        () => ['/tmp/runtime-default'],
+        () => ['/tmp/runtime-default']
       );
       expect(cfg.filesystem.allowWrite).toEqual(
         expect.arrayContaining([
@@ -1209,7 +1245,7 @@ describe('codex review fixes (round 5)', () => {
           },
         },
         '/tmp/repo/app',
-        () => [],
+        () => []
       );
       // ../shared anchored to root: /tmp/repo/app -> /tmp/repo/shared.
       expect(cfg.filesystem.allowWrite).toContain('/tmp/repo/shared');
@@ -1253,7 +1289,6 @@ describe('codex review fixes (round 5)', () => {
       // flagged. Pre-fix, glob_search dropped exitCode/stderr on
       // the floor and returned "No files found." regardless.
       const realSpawn = (
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
         require('child_process') as typeof import('child_process')
       ).spawn;
       const fakeRgBackend: t.LocalSpawn = ((
@@ -1304,7 +1339,6 @@ describe('codex review fixes (round 5)', () => {
       // glob_search had this fix but grep_search hadn't been
       // updated to match).
       const realSpawn = (
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
         require('child_process') as typeof import('child_process')
       ).spawn;
       const fakeRgBackend: t.LocalSpawn = ((
@@ -1435,13 +1469,13 @@ describe('comprehensive review (round 7) — manual finding C', () => {
     });
 
     it('blocks sh -c "chmod -R 777 /"', async () => {
-      const result = await validateBashCommand("sh -c 'chmod -R 777 /'");
+      const result = await validateBashCommand('sh -c \'chmod -R 777 /\'');
       expect(result.valid).toBe(false);
       expect(result.errors.join('\n')).toMatch(/destructive command pattern/);
     });
 
     it('blocks eval "rm -rf /"', async () => {
-      const result = await validateBashCommand("eval 'rm -rf /'");
+      const result = await validateBashCommand('eval \'rm -rf /\'');
       expect(result.valid).toBe(false);
       expect(result.errors.join('\n')).toMatch(/destructive command pattern/);
     });
@@ -1631,7 +1665,6 @@ describe('comprehensive review (round 7) — manual finding E', () => {
 describe('comprehensive review (round 8) — Codex P1 #24 / P1 #25', () => {
   describe('JSON post-edit syntax check uses WorkspaceFS (Codex P1 #24)', () => {
     it('routes the JSON read through `local.exec.fs` instead of host fs', async () => {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
       const { runPostEditSyntaxCheck } = require('../local/syntaxCheck');
 
       const reads: string[] = [];
@@ -1669,7 +1702,6 @@ describe('comprehensive review (round 8) — Codex P1 #24 / P1 #25', () => {
     });
 
     it('flags invalid JSON returned by the WorkspaceFS', async () => {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
       const { runPostEditSyntaxCheck } = require('../local/syntaxCheck');
       const fakeFs = {
         readFile: async () => '{ invalid: json',
@@ -1764,7 +1796,6 @@ describe('comprehensive review (round 8) — Codex P1 #24 / P1 #25', () => {
 
 describe('comprehensive review (round 9) — Codex P1 (overflow-killed) + audit findings', () => {
   describe('overflow-killed processes report as failures (Codex P1)', () => {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { spawnLocalProcess } = require('../local/LocalExecutionEngine');
 
     it('reports overflowKilled=true and a non-null exit code when maxSpawnedBytes is exceeded', async () => {
@@ -1811,7 +1842,6 @@ describe('comprehensive review (round 9) — Codex P1 (overflow-killed) + audit 
   });
 
   describe('signal-killed processes report as failures (Codex P2 — generalizes the overflow fix)', () => {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { spawnLocalProcess } = require('../local/LocalExecutionEngine');
 
     it('synthesizes a non-zero exit code and surfaces the signal name on `kill -9 $$`', async () => {
@@ -1861,7 +1891,6 @@ describe('comprehensive review (round 9) — Codex P1 (overflow-killed) + audit 
       // is unavailable (the rg --version probe always fails). This
       // way the fallback compileFallbackRegex actually runs.
       const realSpawn = (
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
         require('child_process') as typeof import('child_process')
       ).spawn;
       const noRgBackend: t.LocalSpawn = ((
@@ -1907,7 +1936,7 @@ describe('comprehensive review (round 9) — Codex P1 (overflow-killed) + audit 
         toolExecution: { engine: 'local' },
       });
       // Capture the bash_tool instance
-      // eslint-disable-next-line @typescript-eslint/dot-notation
+
       const m1 = (node1 as unknown as { toolMap: Map<string, unknown> })
         .toolMap;
       expect(m1.has(Constants.BASH_TOOL)).toBe(true);
@@ -1930,7 +1959,6 @@ describe('comprehensive review (round 9) — Codex P1 (overflow-killed) + audit 
 
 describe('comprehensive review (round 10) — Codex P1 #28 / P2 #29', () => {
   describe('SIGKILL escalation defeats SIGTERM-trapping processes (Codex P1 #28)', () => {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { spawnLocalProcess } = require('../local/LocalExecutionEngine');
 
     it('escalates to SIGKILL when timeoutMs elapses and the child traps SIGTERM', async () => {
@@ -1942,7 +1970,7 @@ describe('comprehensive review (round 10) — Codex P1 #28 / P2 #29', () => {
       const start = Date.now();
       const result = await spawnLocalProcess(
         'bash',
-        ['-c', "trap '' TERM; while true; do sleep 0.1; done"],
+        ['-c', 'trap \'\' TERM; while true; do sleep 0.1; done'],
         { timeoutMs: 1500, sandbox: { enabled: false } }
       );
       const elapsed = Date.now() - start;
@@ -1968,7 +1996,6 @@ describe('comprehensive review (round 10) — Codex P1 #28 / P2 #29', () => {
       // verdict and tried to use rg under an env without it,
       // failing with ENOENT.
       const realSpawn = (
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
         require('child_process') as typeof import('child_process')
       ).spawn;
 
@@ -1993,14 +2020,12 @@ describe('comprehensive review (round 10) — Codex P1 #28 / P2 #29', () => {
 
       const cwdA = await createTempDir();
       const cwdB = await createTempDir();
-      await (await import('fs/promises')).writeFile(
-        join(cwdA, 'a.ts'),
-        'needle\n'
-      );
-      await (await import('fs/promises')).writeFile(
-        join(cwdB, 'b.ts'),
-        'needle\n'
-      );
+      await (
+        await import('fs/promises')
+      ).writeFile(join(cwdA, 'a.ts'), 'needle\n');
+      await (
+        await import('fs/promises')
+      ).writeFile(join(cwdB, 'b.ts'), 'needle\n');
 
       // Run A: env says rg is available → cache records `true` for
       // (backend, env-A).
@@ -2009,12 +2034,14 @@ describe('comprehensive review (round 10) — Codex P1 #28 / P2 #29', () => {
         exec: { spawn: envSensitive },
         env: { PATH: '/with/rg' },
       });
-      await bundleA.tools.find((t_) => t_.name === 'grep_search')!.invoke({
-        id: 'gA',
-        name: 'grep_search',
-        args: { pattern: 'needle' },
-        type: 'tool_call',
-      });
+      await bundleA.tools
+        .find((t_) => t_.name === 'grep_search')!
+        .invoke({
+          id: 'gA',
+          name: 'grep_search',
+          args: { pattern: 'needle' },
+          type: 'tool_call',
+        });
 
       // Run B: same backend, DIFFERENT env (PATH excludes rg). Must
       // run a fresh probe and fall back to the Node walker, NOT
@@ -2042,14 +2069,12 @@ describe('comprehensive review (round 10) — Codex P1 #28 / P2 #29', () => {
   });
 
   describe('compile-style runtimes honor local.shell (Codex P2 #29)', () => {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { executeLocalCode } = require('../local/LocalExecutionEngine');
 
     it('routes the rust runtime through `local.shell` instead of bare `bash`', async () => {
       // Intercept spawn — assert the configured shell is used for
       // the rs runtime, not hardcoded `bash`.
       const realSpawn = (
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
         require('child_process') as typeof import('child_process')
       ).spawn;
       const calls: string[] = [];
@@ -2065,7 +2090,11 @@ describe('comprehensive review (round 10) — Codex P1 #28 / P2 #29', () => {
 
       await executeLocalCode(
         { lang: 'rs', code: 'fn main() {}', args: [] },
-        { shell: '/bin/sh', exec: { spawn: intercept }, sandbox: { enabled: false } }
+        {
+          shell: '/bin/sh',
+          exec: { spawn: intercept },
+          sandbox: { enabled: false },
+        }
       );
 
       // The rust path's compile-and-run command should have been
@@ -2077,8 +2106,10 @@ describe('comprehensive review (round 10) — Codex P1 #28 / P2 #29', () => {
 
 describe('comprehensive review (round 12) — Codex P1 #36', () => {
   describe('granular workspace flags override the legacy allowOutsideWorkspace', () => {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { getWriteRoots, getReadRoots } = require('../local/LocalExecutionEngine');
+    const {
+      getWriteRoots,
+      getReadRoots,
+    } = require('../local/LocalExecutionEngine');
 
     it('workspace.allowWriteOutside=false beats allowOutsideWorkspace=true (Codex P1 #36)', () => {
       // Pre-fix the OR short-circuited on the legacy flag, returning
@@ -2190,8 +2221,9 @@ describe('comprehensive review (round 14) — Codex P1 #37 + P2 #38/#40/#41', ()
     });
 
     it('blocks the positional-arg dot-glob form too', async () => {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const { executeLocalBashWithArgs } = require('../local/LocalExecutionEngine');
+      const {
+        executeLocalBashWithArgs,
+      } = require('../local/LocalExecutionEngine');
       await expect(
         executeLocalBashWithArgs('rm -rf "$1"', ['/.*'], {
           sandbox: { enabled: false },
@@ -2291,7 +2323,6 @@ describe('comprehensive review (round 14) — Codex P1 #37 + P2 #38/#40/#41', ()
     it('reports `matches: 0` when only oversize files are present', async () => {
       _resetRipgrepCacheForTests();
       const realSpawn = (
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
         require('child_process') as typeof import('child_process')
       ).spawn;
       const noRgBackend: t.LocalSpawn = ((
@@ -2386,8 +2417,9 @@ describe('comprehensive review (round 14) — Codex P1 #37 + P2 #38/#40/#41', ()
   });
 
   describe('bash args validated against destructive-target patterns (Codex P1 [45])', () => {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { executeLocalBashWithArgs } = require('../local/LocalExecutionEngine');
+    const {
+      executeLocalBashWithArgs,
+    } = require('../local/LocalExecutionEngine');
 
     it('blocks `rm -rf "$1"` + args=["/"]', async () => {
       await expect(
@@ -2495,8 +2527,9 @@ describe('comprehensive review (round 14) — Codex P1 #37 + P2 #38/#40/#41', ()
 
   describe('resolveWorkspacePathSafe routes through WorkspaceFS.realpath (Codex P2 #38)', () => {
     it('honors a custom workspace fs realpath impl', async () => {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const { resolveWorkspacePathSafe } = require('../local/LocalExecutionEngine');
+      const {
+        resolveWorkspacePathSafe,
+      } = require('../local/LocalExecutionEngine');
       const calls: string[] = [];
       const fakeFs = {
         readFile: async () => '',
@@ -2539,7 +2572,6 @@ describe('comprehensive review (round 14) — Codex P1 #37 + P2 #38/#40/#41', ()
     it('does not bleed `hasNode` verdict from one env to another on the same backend', async () => {
       _resetSyntaxCheckProbeCacheForTests();
       const realSpawn = (
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
         require('child_process') as typeof import('child_process')
       ).spawn;
       const calls: Array<{ cmd: string; env?: NodeJS.ProcessEnv }> = [];
@@ -2563,7 +2595,6 @@ describe('comprehensive review (round 14) — Codex P1 #37 + P2 #38/#40/#41', ()
         return realSpawn('sh', ['-c', 'exit 0'], opts);
       }) as unknown as t.LocalSpawn;
 
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
       const { runPostEditSyntaxCheck } = require('../local/syntaxCheck');
       const cwd = await createTempDir();
       const file = join(cwd, 'a.js');
@@ -2581,14 +2612,16 @@ describe('comprehensive review (round 14) — Codex P1 #37 + P2 #38/#40/#41', ()
       // syntax-check via the missing node. Now: separate cache slot
       // for envB → its own probe → records `false` → skips check.
       const probeCallsBefore = calls.filter(
-        (c) => c.cmd === 'node' && c.env?.PATH?.includes('without-node') === true
+        (c) =>
+          c.cmd === 'node' && c.env?.PATH?.includes('without-node') === true
       ).length;
       await runPostEditSyntaxCheck(file, {
         exec: { spawn: envSensitive },
         env: { PATH: '/without-node' },
       });
       const probeCallsAfter = calls.filter(
-        (c) => c.cmd === 'node' && c.env?.PATH?.includes('without-node') === true
+        (c) =>
+          c.cmd === 'node' && c.env?.PATH?.includes('without-node') === true
       ).length;
       // A fresh probe must have run for envB (count went up).
       expect(probeCallsAfter).toBeGreaterThan(probeCallsBefore);
@@ -2599,7 +2632,6 @@ describe('comprehensive review (round 14) — Codex P1 #37 + P2 #38/#40/#41', ()
     it('emits a sentinel and continues instead of reading multi-MB files into memory', async () => {
       _resetRipgrepCacheForTests();
       const realSpawn = (
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
         require('child_process') as typeof import('child_process')
       ).spawn;
       // Force the Node fallback by making rg unavailable.

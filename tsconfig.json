@@ -11,9 +11,8 @@
     "resolveJsonModule": true,
     "sourceMap": true,
     "rootDir": "./src",
-    "baseUrl": ".",
     "paths": {
-      "@/*": ["src/*"]
+      "@/*": ["./src/*"]
     }
   },
   "ts-node": {

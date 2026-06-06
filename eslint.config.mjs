@@ -103,4 +103,11 @@ export default defineConfig([globalIgnores([
     rules: {
         "no-console": "off",
     },
+}, {
+    files: ["**/*.test.ts", "**/*.spec.ts", "**/__tests__/**/*.ts"],
+
+    rules: {
+        "@typescript-eslint/no-require-imports": "off",
+        "@typescript-eslint/explicit-function-return-type": "off",
+    },
 }]);
