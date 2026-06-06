@@ -185,7 +185,7 @@ describe('JinaReranker', () => {
           message: 'Request failed with status code 500',
           method: 'POST',
           name: 'Error',
-          responseData: expect.stringContaining('upstream failed'),
+          responseDataSummary: 'object(2)',
           status: 500,
           url: 'https://test-jina-endpoint.com/v1/rerank',
         })
@@ -194,12 +194,12 @@ describe('JinaReranker', () => {
       const metadata = errorSpy.mock.calls.flat()[1];
       const serializedMetadata = JSON.stringify(metadata);
 
-      expect(serializedMetadata).toContain('[truncated]');
+      expect(serializedMetadata).not.toContain('upstream failed');
       expect(serializedMetadata).not.toContain('Authorization');
       expect(serializedMetadata).not.toContain('api_key');
       expect(serializedMetadata).not.toContain('document1');
       expect(serializedMetadata).not.toContain('test-key');
-      expect(serializedMetadata.length).toBeLessThan(2600);
+      expect(serializedMetadata.length).toBeLessThan(500);
     });
   });
 });

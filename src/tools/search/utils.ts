@@ -14,7 +14,7 @@ export interface SafeErrorLog {
   status?: number;
   method?: string;
   url?: string;
-  responseData?: string;
+  responseDataSummary?: string;
   value?: string;
 }
 
@@ -45,23 +45,20 @@ const truncateLogValue = (value: string): string =>
     ? value
     : `${value.slice(0, LOG_VALUE_MAX_LENGTH)}... [truncated]`;
 
-const stringifyLogValue = (value: unknown): string => {
+const summarizeLogValue = (value: unknown): string => {
+  if (value === null) {
+    return 'null';
+  }
+  if (Array.isArray(value)) {
+    return `array(${value.length})`;
+  }
   if (typeof value === 'string') {
-    return truncateLogValue(value);
+    return `string(${value.length})`;
   }
-  if (
-    typeof value === 'undefined' ||
-    typeof value === 'function' ||
-    typeof value === 'symbol'
-  ) {
-    return truncateLogValue(String(value));
+  if (typeof value === 'object') {
+    return `object(${Object.keys(value).length})`;
   }
-
-  try {
-    return truncateLogValue(JSON.stringify(value));
-  } catch {
-    return truncateLogValue(String(value));
-  }
+  return typeof value;
 };
 
 const sanitizeUrlForLog = (url: string): string => {
@@ -98,7 +95,7 @@ const formatAxiosErrorForLog = (
     log.url = sanitizeUrlForLog(url);
   }
   if (typeof response?.data !== 'undefined') {
-    log.responseData = stringifyLogValue(response.data);
+    log.responseDataSummary = summarizeLogValue(response.data);
   }
 
   return log;
@@ -116,7 +113,7 @@ export const formatErrorForLog = (error: unknown): SafeErrorLog => {
   }
   return {
     message: String(error),
-    value: stringifyLogValue(error),
+    value: summarizeLogValue(error),
   };
 };
 
