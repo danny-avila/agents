@@ -913,16 +913,6 @@ export function getChunkContent({
         | undefined
     )?.summary?.[0]?.text;
   }
-  /**
-   * For OpenRouter, reasoning is stored in additional_kwargs.reasoning (not reasoning_content).
-   * NOTE: We intentionally do NOT extract text from reasoning_details here.
-   * The reasoning_details array contains the FULL accumulated reasoning text (set only on final chunk),
-   * but individual reasoning tokens are already streamed via additional_kwargs.reasoning.
-   * Extracting from reasoning_details would cause duplication.
-   * The reasoning_details is only used for:
-   * 1. Detecting reasoning mode in handleReasoning()
-   * 2. Final message storage (for thought signatures)
-   */
   if (provider === Providers.OPENROUTER) {
     // Content presence signals end of reasoning phase - prefer content over reasoning
     // This handles transitional chunks that may have both reasoning and content
@@ -932,6 +922,12 @@ export function getChunkContent({
     const reasoning = chunk?.additional_kwargs?.reasoning as string | undefined;
     if (reasoning != null && reasoning !== '') {
       return reasoning;
+    }
+    const reasoningContent = chunk?.additional_kwargs?.reasoning_content as
+      | string
+      | undefined;
+    if (reasoningContent != null && reasoningContent !== '') {
+      return reasoningContent;
     }
     return chunk?.content;
   }
@@ -1029,6 +1025,59 @@ function shouldDeferMixedFinalReasoningChunk({
   );
 }
 
+function hasCurrentTextDeltaStep({
+  graph,
+  metadata,
+}: {
+  graph: StandardGraph;
+  metadata?: Record<string, unknown>;
+}): boolean {
+  if (metadata == null) {
+    return false;
+  }
+  const baseStepKey = graph.getStepBaseKey(metadata);
+  for (const [stepKey, stepIds] of graph.stepKeyIds) {
+    if (stepKey !== baseStepKey && !stepKey.startsWith(`${baseStepKey}_`)) {
+      continue;
+    }
+    if (stepIds.some((stepId) => graph.messageStepHasTextDeltas.has(stepId))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function shouldSkipLateOpenRouterReasoningChunk({
+  chunk,
+  agentContext,
+  graph,
+  metadata,
+}: {
+  chunk: Partial<AIMessageChunk>;
+  agentContext: AgentContext;
+  graph: StandardGraph;
+  metadata?: Record<string, unknown>;
+}): boolean {
+  if (
+    agentContext.provider !== Providers.OPENROUTER ||
+    (chunk.tool_calls?.length ?? 0) > 0 ||
+    (chunk.tool_call_chunks?.length ?? 0) > 0 ||
+    (chunk.content != null && chunk.content !== '')
+  ) {
+    return false;
+  }
+  return (
+    (hasReasoningContent(chunk.additional_kwargs?.reasoning as string) ||
+      hasReasoningContent(
+        chunk.additional_kwargs?.reasoning_content as string
+      ) ||
+      hasReasoningContent(
+        chunk.additional_kwargs?.reasoning_details as object[]
+      )) &&
+    hasCurrentTextDeltaStep({ graph, metadata })
+  );
+}
+
 export class ChatModelStreamHandler implements t.EventHandler {
   async handle(
     event: string,
@@ -1067,6 +1116,16 @@ export class ChatModelStreamHandler implements t.EventHandler {
       return;
     }
     if (shouldDeferMixedFinalReasoningChunk({ chunk, agentContext })) {
+      return;
+    }
+    if (
+      shouldSkipLateOpenRouterReasoningChunk({
+        chunk,
+        agentContext,
+        graph,
+        metadata,
+      })
+    ) {
       return;
     }
     this.handleReasoning(chunk, agentContext);
@@ -1350,7 +1409,9 @@ hasToolCallChunks: ${hasToolCallChunks}
         Array.isArray(chunk.additional_kwargs.reasoning_details) &&
         chunk.additional_kwargs.reasoning_details.length > 0) ||
         (typeof chunk.additional_kwargs?.reasoning === 'string' &&
-          chunk.additional_kwargs.reasoning !== ''))
+          chunk.additional_kwargs.reasoning !== '') ||
+        (typeof chunk.additional_kwargs?.reasoning_content === 'string' &&
+          chunk.additional_kwargs.reasoning_content !== ''))
     ) {
       reasoning_content = 'valid';
     }

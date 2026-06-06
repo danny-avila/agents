@@ -640,6 +640,58 @@ describe('StandardGraph final response reasoning fallback', () => {
     }
   );
 
+  it('streams OpenRouter reasoning_content before visible text', async () => {
+    const text = '391.';
+    const reasoningText = 'Use the difference of squares.';
+    const reasoningDeltas: t.ReasoningDeltaEvent[] = [];
+    const messageDeltas: t.MessageDeltaEvent[] = [];
+    const { contentParts, aggregateContent } = createContentAggregator();
+    const run = await Run.create<t.IState>({
+      runId: 'reasoning-fallback-openrouter-reasoning-content-stream',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: Providers.OPENROUTER,
+          streamUsage: false,
+        },
+        reasoningKey: 'reasoning',
+      },
+      returnContent: true,
+      skipCleanup: true,
+      customHandlers: createReasoningHandlers(
+        aggregateContent,
+        reasoningDeltas,
+        messageDeltas
+      ),
+    });
+
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+
+    run.Graph.overrideModel = new StreamingReasoningModel([
+      createReasoningChunk('reasoning_content', reasoningText),
+      new AIMessageChunk({ content: text }),
+    ]);
+
+    await run.processStream(
+      { messages: [new HumanMessage('stream OpenRouter reasoning_content')] },
+      {
+        ...config,
+        configurable: {
+          thread_id: 'reasoning-fallback-openrouter-reasoning-content-stream',
+        },
+      }
+    );
+
+    expect(reasoningDeltas).toHaveLength(1);
+    expect(messageDeltas).toHaveLength(1);
+    expect(contentParts).toEqual([
+      { type: ContentTypes.THINK, think: reasoningText },
+      { type: ContentTypes.TEXT, text },
+    ]);
+  });
+
   it('does not replay streamed OpenRouter text when the final chunk has reasoning_details', async () => {
     const text = '391.';
     const reasoningText = '17 times 23 equals 391.';
@@ -749,12 +801,64 @@ describe('StandardGraph final response reasoning fallback', () => {
       }
     );
 
-    expect(reasoningDeltas).toHaveLength(1);
+    expect(reasoningDeltas).toHaveLength(0);
     expect(messageDeltas).toHaveLength(1);
-    expect(contentParts).toEqual([
-      { type: ContentTypes.TEXT, text },
+    expect(contentParts).toEqual([{ type: ContentTypes.TEXT, text }]);
+    expect(finalContentParts).toEqual([
       { type: ContentTypes.THINK, think: reasoningText },
+      { type: ContentTypes.TEXT, text },
     ]);
+    expect(run.getRunMessages()?.[0]?.content).toBe(text);
+  });
+
+  it('does not replay streamed text when late OpenRouter reasoning_content arrives', async () => {
+    const text = '391.';
+    const reasoningText = 'Confirm the arithmetic after visible text.';
+    const reasoningDeltas: t.ReasoningDeltaEvent[] = [];
+    const messageDeltas: t.MessageDeltaEvent[] = [];
+    const { contentParts, aggregateContent } = createContentAggregator();
+    const run = await Run.create<t.IState>({
+      runId: 'reasoning-fallback-openrouter-text-before-reasoning-content',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: Providers.OPENROUTER,
+          streamUsage: false,
+        },
+        reasoningKey: 'reasoning',
+      },
+      returnContent: true,
+      skipCleanup: true,
+      customHandlers: createReasoningHandlers(
+        aggregateContent,
+        reasoningDeltas,
+        messageDeltas
+      ),
+    });
+
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+
+    run.Graph.overrideModel = new StreamingReasoningModel([
+      new AIMessageChunk({ content: text }),
+      createReasoningChunk('reasoning_content', reasoningText),
+    ]);
+
+    const finalContentParts = await run.processStream(
+      { messages: [new HumanMessage('think briefly, what is 17 x 23?')] },
+      {
+        ...config,
+        configurable: {
+          thread_id:
+            'reasoning-fallback-openrouter-text-before-reasoning-content',
+        },
+      }
+    );
+
+    expect(reasoningDeltas).toHaveLength(0);
+    expect(messageDeltas).toHaveLength(1);
+    expect(contentParts).toEqual([{ type: ContentTypes.TEXT, text }]);
     expect(finalContentParts).toEqual([
       { type: ContentTypes.THINK, think: reasoningText },
       { type: ContentTypes.TEXT, text },
@@ -807,12 +911,9 @@ describe('StandardGraph final response reasoning fallback', () => {
       }
     );
 
-    expect(reasoningDeltas).toHaveLength(1);
+    expect(reasoningDeltas).toHaveLength(0);
     expect(messageDeltas).toHaveLength(1);
-    expect(contentParts).toEqual([
-      { type: ContentTypes.TEXT, text },
-      { type: ContentTypes.THINK, think: reasoningText },
-    ]);
+    expect(contentParts).toEqual([{ type: ContentTypes.TEXT, text }]);
     expect(finalContentParts).toEqual([
       { type: ContentTypes.THINK, think: reasoningText },
       { type: ContentTypes.TEXT, text },
@@ -872,7 +973,7 @@ describe('StandardGraph final response reasoning fallback', () => {
       }
     );
 
-    expect(reasoningDeltas).toHaveLength(1);
+    expect(reasoningDeltas).toHaveLength(0);
     expect(messageDeltas).toHaveLength(2);
     expect(messageDeltas[1].delta.content?.[0]).toEqual({
       type: ContentTypes.TEXT,
@@ -880,7 +981,6 @@ describe('StandardGraph final response reasoning fallback', () => {
     });
     expect(contentParts).toEqual([
       { type: ContentTypes.TEXT, text: replayWithSuffix },
-      { type: ContentTypes.THINK, think: reasoningText },
     ]);
     expect(finalContentParts).toEqual([
       { type: ContentTypes.THINK, think: reasoningText },
@@ -1109,7 +1209,7 @@ describe('StandardGraph final response reasoning fallback', () => {
       }
     );
 
-    expect(reasoningDeltas).toHaveLength(1);
+    expect(reasoningDeltas).toHaveLength(0);
     expect(messageDeltas.map((delta) => delta.delta.content?.[0])).toEqual([
       { type: ContentTypes.TEXT, text: 'world' },
     ]);

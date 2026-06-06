@@ -373,6 +373,28 @@ function markPostReasoningContent(agentContext: AgentContext): void {
   agentContext.reasoningTransitionCount++;
 }
 
+function getDispatchableFinalReasoningContent({
+  agentContext,
+  responseReasoningContent,
+  hasStreamedTextDeltaStep,
+  hasStreamedReasoningDeltaStep,
+}: {
+  agentContext: AgentContext;
+  responseReasoningContent: string | undefined;
+  hasStreamedTextDeltaStep: boolean;
+  hasStreamedReasoningDeltaStep: boolean;
+}): string | undefined {
+  if (responseReasoningContent == null || hasStreamedReasoningDeltaStep) {
+    return undefined;
+  }
+  if (
+    agentContext.provider === Providers.OPENROUTER && hasStreamedTextDeltaStep
+  ) {
+    return undefined;
+  }
+  return responseReasoningContent;
+}
+
 export abstract class Graph<
   T extends t.BaseGraphState = t.BaseGraphState,
   _TNodeName extends string = string,
@@ -1808,15 +1830,21 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         graph: this,
         metadata,
       });
+      const dispatchableFinalReasoningContent =
+        getDispatchableFinalReasoningContent({
+          agentContext,
+          responseReasoningContent,
+          hasStreamedTextDeltaStep,
+          hasStreamedReasoningDeltaStep,
+        });
 
       if (hasToolCalls) {
         const dispatchedReasoning =
-          responseReasoningContent != null &&
-          !hasStreamedReasoningDeltaStep &&
+          dispatchableFinalReasoningContent != null &&
           (await dispatchReasoningContent({
             graph: this,
             agentContext,
-            reasoningContent: responseReasoningContent,
+            reasoningContent: dispatchableFinalReasoningContent,
             metadata,
           }));
         if (dispatchedReasoning) {
@@ -1845,12 +1873,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
        */
       if (!hasToolCalls && responseMessage != null) {
         const dispatchedReasoning =
-          responseReasoningContent != null &&
-          !hasStreamedReasoningDeltaStep &&
+          dispatchableFinalReasoningContent != null &&
           (await dispatchReasoningContent({
             graph: this,
             agentContext,
-            reasoningContent: responseReasoningContent,
+            reasoningContent: dispatchableFinalReasoningContent,
             metadata,
           }));
         if (dispatchedReasoning && textMessageContent != null) {
