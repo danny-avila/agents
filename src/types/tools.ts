@@ -970,6 +970,7 @@ export type ProgrammaticHookContext = {
   runId: string;
   threadId?: string;
   agentId?: string;
+  executingAgentId?: string;
 };
 
 /** Search mode: code_interpreter uses external sandbox, local uses safe substring matching */

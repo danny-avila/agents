@@ -219,6 +219,7 @@ export async function applyPreToolUseHooksForBridge(
       runId: hookContext.runId,
       threadId: hookContext.threadId,
       agentId: hookContext.agentId,
+      executingAgentId: hookContext.executingAgentId,
       toolName,
       toolInput,
       toolUseId,

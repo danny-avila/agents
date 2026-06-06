@@ -147,6 +147,47 @@ describe('Direct-path lifecycle hooks (in-process tools)', () => {
     expect(String(message.content)).toBe('ran:ls');
   });
 
+  it('executingAgentId defaults to agentId for direct callers, and an explicit value wins', async () => {
+    const echo = createDirectTool('echo', (args) => `ran:${args.command}`);
+    const captured: Array<string | undefined> = [];
+    const registry = new HookRegistry();
+    registry.register('PreToolUse', {
+      hooks: [
+        async (input): Promise<PreToolUseHookOutput> => {
+          captured.push(input.executingAgentId);
+          return { decision: 'allow' };
+        },
+      ],
+    });
+
+    // Only the existing `agentId` option is passed → executingAgentId defaults to it.
+    const defaulted = new ToolNode({
+      tools: [echo],
+      eventDrivenMode: true,
+      hookRegistry: registry,
+      directToolNames: new Set(['echo']),
+      agentId: 'solo-agent',
+    });
+    await defaulted.invoke({
+      messages: [aiCall('call_def', 'echo', { command: 'a' })],
+    });
+
+    // An explicit executingAgentId overrides the agentId default.
+    const explicit = new ToolNode({
+      tools: [echo],
+      eventDrivenMode: true,
+      hookRegistry: registry,
+      directToolNames: new Set(['echo']),
+      agentId: 'solo-agent',
+      executingAgentId: 'owner-agent',
+    });
+    await explicit.invoke({
+      messages: [aiCall('call_exp', 'echo', { command: 'b' })],
+    });
+
+    expect(captured).toEqual(['solo-agent', 'owner-agent']);
+  });
+
   it('PreToolUse updatedInput rewrites the args before runTool sees them', async () => {
     const seen: Record<string, unknown>[] = [];
     const echo = createDirectTool('echo', (args) => {

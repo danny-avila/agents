@@ -534,7 +534,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     this.eagerEventToolExecutions = eagerEventToolExecutions;
     this.eagerEventToolUsageCount = eagerEventToolUsageCount;
     this.agentId = agentId;
-    this.executingAgentId = executingAgentId;
+    // Default to agentId so callers constructing ToolNode directly (who pass the
+    // existing agentId option) still get attribution without knowing the new option.
+    this.executingAgentId = executingAgentId ?? agentId;
     this.directToolNames = directToolNames;
     this.maxToolResultChars =
       maxToolResultChars ?? calculateMaxToolResultChars(maxContextTokens);
@@ -934,6 +936,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             runId: (config.configurable?.run_id as string | undefined) ?? '',
             threadId: config.configurable?.thread_id as string | undefined,
             agentId: this.agentId,
+            executingAgentId: this.executingAgentId,
           },
         };
       } else if (call.name === Constants.TOOL_SEARCH) {
