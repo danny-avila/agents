@@ -1,5 +1,8 @@
 // src/run.ts
-import { initializeLangfuseTracing } from './instrumentation';
+import {
+  initializeLangfuseTracing,
+  runWithTraceIdSeed,
+} from './instrumentation';
 import { PromptTemplate } from '@langchain/core/prompts';
 import { RunnableLambda } from '@langchain/core/runnables';
 import { AzureChatOpenAI, ChatOpenAI } from '@langchain/openai';
@@ -41,6 +44,7 @@ import {
   disposeLangfuseHandler,
   getLangfuseTraceName,
   isLangfuseCallbackHandler,
+  withLangfuseAttributes,
 } from '@/langfuse';
 import {
   resolveLangfuseConfig,
@@ -552,9 +556,7 @@ export class Run<_T extends t.BaseGraphState> {
   }
 
   private shouldClearHookSession(streamThrew: boolean): boolean {
-    return (
-      this._interrupt == null || this._haltedReason != null || streamThrew
-    );
+    return this._interrupt == null || this._haltedReason != null || streamThrew;
   }
 
   private isAwaitingResume(streamThrew: boolean): boolean {
@@ -584,9 +586,7 @@ export class Run<_T extends t.BaseGraphState> {
   private getStreamToolOutputTracingLangfuseConfig(
     graph: StandardGraph | MultiAgentGraph
   ): t.LangfuseConfig | undefined {
-    const toolOutputTracingConfigs = Array.from(
-      graph.agentContexts.values()
-    )
+    const toolOutputTracingConfigs = Array.from(graph.agentContexts.values())
       .map((context) => {
         return resolveLangfuseConfig(this.langfuse, context.langfuse)
           ?.toolOutputTracing;
@@ -732,6 +732,7 @@ export class Run<_T extends t.BaseGraphState> {
       agentId: graph.defaultAgentId,
       agentName: primaryContext?.name,
     });
+    const traceName = config.runName ?? getLangfuseTraceName(traceMetadata);
     const streamLangfuseConfig = this.getStreamLangfuseConfig(graph);
     initializeLangfuseTracing(streamLangfuseConfig);
     const langfuseHandler = createLangfuseHandler({
@@ -742,7 +743,7 @@ export class Run<_T extends t.BaseGraphState> {
       tags: ['librechat', 'agent'],
     });
     if (langfuseHandler != null) {
-      config.runName = config.runName ?? getLangfuseTraceName(traceMetadata);
+      config.runName = traceName;
       config.callbacks = appendCallbacks(config.callbacks, [langfuseHandler]);
     }
 
@@ -906,10 +907,30 @@ export class Run<_T extends t.BaseGraphState> {
     };
 
     try {
-      await withLangfuseToolOutputTracingConfig(
-        streamLangfuseConfig,
-        consumeStream,
-        this.getStreamToolOutputTracingLangfuseConfig(graph)
+      // When opted in, seed the root trace id from this run's id so feedback /
+      // other external signals can be attached to the trace later without a
+      // lookup (see SeededTraceIdGenerator in ./instrumentation).
+      await runWithTraceIdSeed(
+        streamLangfuseConfig?.deterministicTraceId === true
+          ? this.id
+          : undefined,
+        () =>
+          withLangfuseToolOutputTracingConfig(
+            streamLangfuseConfig,
+            () =>
+              withLangfuseAttributes(
+                {
+                  langfuse: streamLangfuseConfig,
+                  userId,
+                  sessionId,
+                  traceName,
+                  traceMetadata,
+                  tags: ['librechat', 'agent'],
+                },
+                consumeStream
+              ),
+            this.getStreamToolOutputTracingLangfuseConfig(graph)
+          )
       );
     } catch (err) {
       streamThrew = true;
@@ -1253,6 +1274,9 @@ export class Run<_T extends t.BaseGraphState> {
     titlePromptTemplate,
   }: t.RunTitleOptions): Promise<{ language?: string; title?: string }> {
     let titleLangfuseHandler: CallbackEntry | undefined;
+    let titleLangfuseConfig: t.LangfuseConfig | undefined;
+    let titleUserId: string | undefined;
+    let titleSessionId: string | undefined;
     const titleContext =
       this.Graph == null
         ? undefined
@@ -1264,23 +1288,23 @@ export class Run<_T extends t.BaseGraphState> {
     const titleRunName = getLangfuseTraceName(traceMetadata, 'LibreChat Title');
 
     if (chainOptions != null) {
-      const userId =
+      titleUserId =
         typeof chainOptions.configurable?.user_id === 'string'
           ? chainOptions.configurable.user_id
           : undefined;
-      const sessionId =
+      titleSessionId =
         typeof chainOptions.configurable?.thread_id === 'string'
           ? chainOptions.configurable.thread_id
           : undefined;
-      const titleLangfuseConfig = resolveLangfuseConfig(
+      titleLangfuseConfig = resolveLangfuseConfig(
         this.langfuse,
         titleContext?.langfuse
       );
       initializeLangfuseTracing(titleLangfuseConfig);
       titleLangfuseHandler = createLangfuseHandler({
         langfuse: titleLangfuseConfig,
-        userId,
-        sessionId,
+        userId: titleUserId,
+        sessionId: titleSessionId,
         traceMetadata,
         tags: ['librechat', 'title'],
       });
@@ -1354,15 +1378,30 @@ export class Run<_T extends t.BaseGraphState> {
       runName: chainOptions?.runName ?? titleRunName,
     });
 
+    const invokeTitleChain = (
+      runtimeConfig: Partial<RunnableConfig>
+    ): Promise<{ language?: string; title?: string }> =>
+      withLangfuseAttributes(
+        {
+          langfuse: titleLangfuseConfig,
+          userId: titleUserId,
+          sessionId: titleSessionId,
+          traceName: runtimeConfig.runName ?? titleRunName,
+          traceMetadata,
+          tags: ['librechat', 'title'],
+        },
+        () =>
+          fullChain.invoke(
+            { input: inputText, output: response },
+            runtimeConfig
+          )
+      );
+
     try {
       try {
         return await withLangfuseToolOutputTracingConfig(
           this.langfuse,
-          () =>
-            fullChain.invoke(
-              { input: inputText, output: response },
-              invokeConfig
-            ),
+          () => invokeTitleChain(invokeConfig),
           titleContext?.langfuse
         );
       } catch (_e) {
@@ -1378,11 +1417,7 @@ export class Run<_T extends t.BaseGraphState> {
         });
         return await withLangfuseToolOutputTracingConfig(
           this.langfuse,
-          () =>
-            fullChain.invoke(
-              { input: inputText, output: response },
-              safeConfig as Partial<RunnableConfig>
-            ),
+          () => invokeTitleChain(safeConfig as Partial<RunnableConfig>),
           titleContext?.langfuse
         );
       }

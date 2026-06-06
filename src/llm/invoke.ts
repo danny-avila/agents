@@ -51,6 +51,127 @@ export type InvokeContext = NonNullable<
  */
 export type OnChunk = (chunk: AIMessageChunk) => void | Promise<void>;
 
+function getRegisteredDefaultChatStreamHandler(
+  context?: InvokeContext
+): ChatModelStreamHandler | undefined {
+  const handler = context?.handlerRegistry?.getHandler(
+    GraphEvents.CHAT_MODEL_STREAM
+  );
+  return handler instanceof ChatModelStreamHandler ? handler : undefined;
+}
+
+function hasReasoningDetails(chunk: AIMessageChunk): boolean {
+  const reasoningDetails = chunk.additional_kwargs.reasoning_details;
+  return Array.isArray(reasoningDetails) && reasoningDetails.length > 0;
+}
+
+function removeOpenRouterFinalReasoningReplayContent({
+  current,
+  next,
+  provider,
+}: {
+  current?: AIMessageChunk;
+  next: AIMessageChunk;
+  provider: Providers;
+}): AIMessageChunk {
+  const content = getOpenRouterFinalReasoningContent({
+    current,
+    next,
+    provider,
+  });
+  if (content == null || content === next.content) {
+    return next;
+  }
+
+  return new AIMessageChunk(
+    Object.assign({}, next, {
+      content,
+    })
+  );
+}
+
+function getOpenRouterFinalReasoningContent({
+  current,
+  next,
+  provider,
+}: {
+  current?: AIMessageChunk;
+  next: AIMessageChunk;
+  provider: Providers;
+}): string | undefined {
+  if (
+    provider !== Providers.OPENROUTER ||
+    current == null ||
+    !hasReasoningDetails(next) ||
+    typeof current.content !== 'string' ||
+    current.content === '' ||
+    typeof next.content !== 'string' ||
+    next.content === ''
+  ) {
+    return undefined;
+  }
+  if (!next.content.startsWith(current.content)) {
+    return next.content;
+  }
+  return next.content.slice(current.content.length);
+}
+
+function removeReasoningDetails(
+  additionalKwargs: AIMessageChunk['additional_kwargs']
+): AIMessageChunk['additional_kwargs'] {
+  return Object.fromEntries(
+    Object.entries(additionalKwargs).filter(
+      ([key]) => key !== 'reasoning_details'
+    )
+  );
+}
+
+function getStreamHandlingChunk({
+  current,
+  next,
+  provider,
+}: {
+  current?: AIMessageChunk;
+  next: AIMessageChunk;
+  provider: Providers;
+}): AIMessageChunk | undefined {
+  const content = getOpenRouterFinalReasoningContent({
+    current,
+    next,
+    provider,
+  });
+  if (content == null) {
+    return next;
+  }
+  if (content === '') {
+    return undefined;
+  }
+  return new AIMessageChunk(
+    Object.assign({}, next, {
+      content,
+      additional_kwargs: removeReasoningDetails(next.additional_kwargs),
+    })
+  );
+}
+
+function appendStreamChunk({
+  current,
+  next,
+  provider,
+}: {
+  current?: AIMessageChunk;
+  next: AIMessageChunk;
+  provider: Providers;
+}): AIMessageChunk {
+  if (current == null) {
+    return next;
+  }
+  return concat(
+    current,
+    removeOpenRouterFinalReasoningReplayContent({ current, next, provider })
+  );
+}
+
 /**
  * Invokes a chat model with the given messages, handling both streaming and
  * non-streaming paths.
@@ -90,23 +211,62 @@ export async function attemptInvoke(
   if (model.stream) {
     const stream = await model.stream(messagesForProvider, config);
     let finalChunk: AIMessageChunk | undefined;
+    const registeredStreamHandler =
+      getRegisteredDefaultChatStreamHandler(context);
 
     if (onChunk) {
       for await (const chunk of stream) {
         await onChunk(chunk);
-        finalChunk = finalChunk ? concat(finalChunk, chunk) : chunk;
+        finalChunk = appendStreamChunk({
+          current: finalChunk,
+          next: chunk,
+          provider,
+        });
       }
-    } else {
+    } else if (registeredStreamHandler == null) {
       const metadata = config?.metadata as Record<string, unknown> | undefined;
       const streamHandler = new ChatModelStreamHandler();
       for await (const chunk of stream) {
-        await streamHandler.handle(
-          GraphEvents.CHAT_MODEL_STREAM,
-          { chunk },
-          metadata,
-          context
-        );
-        finalChunk = finalChunk ? concat(finalChunk, chunk) : chunk;
+        const handlingChunk = getStreamHandlingChunk({
+          current: finalChunk,
+          next: chunk,
+          provider,
+        });
+        if (handlingChunk != null) {
+          await streamHandler.handle(
+            GraphEvents.CHAT_MODEL_STREAM,
+            { chunk: handlingChunk },
+            metadata,
+            context
+          );
+        }
+        finalChunk = appendStreamChunk({
+          current: finalChunk,
+          next: chunk,
+          provider,
+        });
+      }
+    } else {
+      const metadata = config?.metadata as Record<string, unknown> | undefined;
+      for await (const chunk of stream) {
+        const handlingChunk = getStreamHandlingChunk({
+          current: finalChunk,
+          next: chunk,
+          provider,
+        });
+        if (handlingChunk != null && handlingChunk !== chunk) {
+          await registeredStreamHandler.handle(
+            GraphEvents.CHAT_MODEL_STREAM,
+            { chunk: handlingChunk },
+            metadata,
+            context
+          );
+        }
+        finalChunk = appendStreamChunk({
+          current: finalChunk,
+          next: chunk,
+          provider,
+        });
       }
     }
 

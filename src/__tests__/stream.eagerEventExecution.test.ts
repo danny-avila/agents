@@ -1648,6 +1648,105 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     );
   });
 
+  it('defers disableStreaming mixed hidden reasoning and visible text chunks', async () => {
+    const dispatchMessageDelta = jest.fn<StandardGraph['dispatchMessageDelta']>(
+      async () => undefined
+    );
+    const dispatchReasoningDelta = jest.fn<
+      StandardGraph['dispatchReasoningDelta']
+    >(async () => undefined);
+    const agentContext: Partial<AgentContext> = {
+      provider: Providers.OPENAI,
+      reasoningKey: 'reasoning_content',
+      clientOptions: { disableStreaming: true } as t.OpenAIClientOptions,
+      currentTokenType: ContentTypes.TEXT,
+      toolDefinitions: [],
+      graphTools: [],
+      agentId: 'agent_1',
+    };
+    const graph = createGraph({
+      dispatchMessageDelta,
+      dispatchReasoningDelta,
+      getAgentContext: jest.fn(
+        () => agentContext
+      ) as unknown as StandardGraph['getAgentContext'],
+    });
+    const handler = new ChatModelStreamHandler();
+    const metadata = { langgraph_node: 'agent' };
+
+    const mixedChunk = {
+      content: 'final answer',
+      additional_kwargs: {
+        reasoning_content: 'hidden reasoning',
+      },
+    } as unknown as t.StreamChunk;
+
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      { chunk: mixedChunk },
+      metadata,
+      graph
+    );
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      { chunk: mixedChunk },
+      metadata,
+      graph
+    );
+
+    expect(dispatchReasoningDelta).not.toHaveBeenCalled();
+    expect(dispatchMessageDelta).not.toHaveBeenCalled();
+    expect(graph.dispatchRunStep).not.toHaveBeenCalled();
+  });
+
+  it('leaves mixed hidden reasoning and visible text chunks on the streaming path', async () => {
+    const dispatchMessageDelta = jest.fn<StandardGraph['dispatchMessageDelta']>(
+      async () => undefined
+    );
+    const dispatchReasoningDelta = jest.fn<
+      StandardGraph['dispatchReasoningDelta']
+    >(async () => undefined);
+    const graph = createGraph({
+      dispatchMessageDelta,
+      dispatchReasoningDelta,
+      getAgentContext: jest.fn(
+        (): Partial<AgentContext> => ({
+          provider: Providers.OPENAI,
+          reasoningKey: 'reasoning_content',
+          currentTokenType: ContentTypes.TEXT,
+          toolDefinitions: [],
+          graphTools: [],
+          agentId: 'agent_1',
+        })
+      ) as unknown as StandardGraph['getAgentContext'],
+    });
+    const metadata = { langgraph_node: 'agent' };
+
+    await new ChatModelStreamHandler().handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: 'streamed answer',
+          additional_kwargs: {
+            reasoning_content: 'hidden reasoning',
+          },
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+
+    expect(dispatchReasoningDelta).not.toHaveBeenCalled();
+    expect(dispatchMessageDelta).toHaveBeenCalledTimes(1);
+    expect(dispatchMessageDelta).toHaveBeenCalledWith(
+      expect.stringMatching(/^step_/),
+      {
+        content: [{ type: ContentTypes.TEXT, text: 'streamed answer' }],
+      },
+      metadata
+    );
+  });
+
   it('dispatches Gemini server-side tool context blocks from mixed stream content', async () => {
     const dispatchMessageDelta = jest.fn<StandardGraph['dispatchMessageDelta']>(
       async () => undefined
