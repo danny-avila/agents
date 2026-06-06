@@ -431,6 +431,13 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private eagerEventToolUsageCount?: Map<string, number>;
   /** Agent ID for event-driven mode */
   private agentId?: string;
+  /**
+   * ID of the agent that owns this tool node, whenever the graph knows it
+   * (including top-level agents in a multi-agent graph). Surfaced to hooks as
+   * `executingAgentId` so they can attribute a tool batch to a specific agent
+   * even where `agentId` (the subagent-scope marker) is undefined.
+   */
+  private executingAgentId?: string;
   /** Tool names that bypass event dispatch and execute directly (e.g., graph-managed handoff tools) */
   private directToolNames?: Set<string>;
   /**
@@ -492,6 +499,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     eagerEventToolExecutions,
     eagerEventToolUsageCount,
     agentId,
+    executingAgentId,
     directToolNames,
     maxContextTokens,
     maxToolResultChars,
@@ -526,6 +534,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     this.eagerEventToolExecutions = eagerEventToolExecutions;
     this.eagerEventToolUsageCount = eagerEventToolUsageCount;
     this.agentId = agentId;
+    // Default to agentId so callers constructing ToolNode directly (who pass the
+    // existing agentId option) still get attribution without knowing the new option.
+    this.executingAgentId = executingAgentId ?? agentId;
     this.directToolNames = directToolNames;
     this.maxToolResultChars =
       maxToolResultChars ?? calculateMaxToolResultChars(maxContextTokens);
@@ -925,6 +936,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             runId: (config.configurable?.run_id as string | undefined) ?? '',
             threadId: config.configurable?.thread_id as string | undefined,
             agentId: this.agentId,
+            executingAgentId: this.executingAgentId,
           },
         };
       } else if (call.name === Constants.TOOL_SEARCH) {
@@ -1260,6 +1272,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           runId,
           threadId,
           agentId: this.agentId,
+          executingAgentId: this.executingAgentId,
           toolName: call.name,
           toolInput: resolvedArgs,
           toolUseId: call.id ?? '',
@@ -1467,6 +1480,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           runId,
           threadId,
           agentId: this.agentId,
+          executingAgentId: this.executingAgentId,
           toolName: call.name,
           toolInput: effectiveCall.args as Record<string, unknown>,
           toolUseId: call.id ?? '',
@@ -1500,6 +1514,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           runId,
           threadId,
           agentId: this.agentId,
+          executingAgentId: this.executingAgentId,
           toolName: call.name,
           toolInput: effectiveCall.args as Record<string, unknown>,
           toolOutput: output.content,
@@ -1606,6 +1621,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           runId,
           threadId,
           agentId: this.agentId,
+          executingAgentId: this.executingAgentId,
           toolName: call.name,
           toolInput: resolvedArgs,
           toolUseId: call.id ?? '',
@@ -1950,6 +1966,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               runId,
               threadId,
               agentId: this.agentId,
+              executingAgentId: this.executingAgentId,
               toolName: entry.call.name,
               toolInput: entry.args,
               toolUseId: entry.call.id!,
@@ -2041,6 +2058,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                 runId,
                 threadId,
                 agentId: this.agentId,
+                executingAgentId: this.executingAgentId,
                 toolName: item.toolName,
                 toolInput: item.args,
                 toolUseId: item.callId,
@@ -2609,6 +2627,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                 runId,
                 threadId,
                 agentId: this.agentId,
+                executingAgentId: this.executingAgentId,
                 toolName,
                 toolInput: request?.args ?? {},
                 toolUseId: result.toolCallId,
@@ -2652,6 +2671,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                 runId,
                 threadId,
                 agentId: this.agentId,
+                executingAgentId: this.executingAgentId,
                 toolName,
                 toolInput: request?.args ?? {},
                 toolOutput: result.content,
@@ -2889,6 +2909,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           runId,
           threadId,
           agentId: this.agentId,
+          executingAgentId: this.executingAgentId,
           entries: orderedBatchEntries,
         },
         sessionId: runId,

@@ -1464,6 +1464,30 @@ for member in team:
       expect(gate.denyReason).toContain('no writes from bridge');
     });
 
+    it('threads executingAgentId from the hook context to bridge PreToolUse hooks', async () => {
+      const { HookRegistry } = await import('@/hooks');
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const ptcMod = require('../local/LocalProgrammaticToolCalling');
+      const registry = new HookRegistry();
+      let seen: string | undefined = 'UNSET';
+      registry.register('PreToolUse', {
+        hooks: [
+          // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
+          async (input) => {
+            seen = input.executingAgentId;
+            return { decision: 'allow' };
+          },
+        ],
+      });
+      await ptcMod.applyPreToolUseHooksForBridge(
+        { registry, runId: 'r1', executingAgentId: 'repo_investigator' },
+        'write_file',
+        'call_1',
+        { path: '/tmp/x' }
+      );
+      expect(seen).toBe('repo_investigator');
+    });
+
     it('passes through when no hook denies (allow path)', async () => {
       const { HookRegistry } = await import('@/hooks');
       // eslint-disable-next-line @typescript-eslint/no-require-imports

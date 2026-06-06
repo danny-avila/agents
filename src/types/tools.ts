@@ -93,6 +93,9 @@ export type ToolNodeOptions = {
   toolDefinitions?: Map<string, LCTool>;
   /** Agent ID for event-driven mode (used to identify which agent's context to use) */
   agentId?: string;
+  /** ID of the agent that owns this tool node, surfaced to hooks as `executingAgentId`
+   * so a batch can be attributed to a specific agent even where `agentId` is undefined. */
+  executingAgentId?: string;
   /** Tool names that must be executed directly (via runTool) even in event-driven mode (e.g., graph-managed handoff tools) */
   directToolNames?: Set<string>;
   /** Opt-in eager execution for event-driven tool calls. */
@@ -967,6 +970,7 @@ export type ProgrammaticHookContext = {
   runId: string;
   threadId?: string;
   agentId?: string;
+  executingAgentId?: string;
 };
 
 /** Search mode: code_interpreter uses external sandbox, local uses safe substring matching */

@@ -292,11 +292,16 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
     const registry = new HookRegistry();
     const preToolEvents: string[] = [];
     const postToolEvents: string[] = [];
+    // `executingAgentId` is always the owning agent (incl. top-level), unlike
+    // `agentId` which stays undefined outside a subagent scope.
+    const preExecEvents: string[] = [];
+    const postExecEvents: string[] = [];
 
     const preHook: HookCallback<'PreToolUse'> = async (
       input
     ): Promise<PreToolUseHookOutput> => {
       preToolEvents.push(`${input.agentId ?? '-'}:${input.toolName}`);
+      preExecEvents.push(`${input.executingAgentId ?? '-'}:${input.toolName}`);
       return { decision: 'allow' };
     };
     registry.register('PreToolUse', { hooks: [preHook] });
@@ -305,6 +310,7 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
       input
     ): Promise<PostToolUseHookOutput> => {
       postToolEvents.push(`${input.agentId ?? '-'}:${input.toolName}`);
+      postExecEvents.push(`${input.executingAgentId ?? '-'}:${input.toolName}`);
       return {};
     };
     registry.register('PostToolUse', { hooks: [postHook] });
@@ -351,6 +357,14 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
     expect(preToolEvents).toContain('researcher-child:calculator');
     expect(postToolEvents).toContain('-:subagent');
     expect(postToolEvents).toContain('researcher-child:calculator');
+
+    // `agentId` stays the subagent-scope marker (undefined at the top level),
+    // but `executingAgentId` attributes every batch to its owning agent — incl.
+    // the top-level parent, which a multi-agent host needs and `agentId` can't give.
+    expect(preExecEvents).toContain('hook-parent:subagent');
+    expect(preExecEvents).toContain('researcher-child:calculator');
+    expect(postExecEvents).toContain('hook-parent:subagent');
+    expect(postExecEvents).toContain('researcher-child:calculator');
   });
 
   it('child subagent tool ask hooks fail closed instead of starting unsupported nested HITL', async () => {

@@ -1218,6 +1218,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         sessions: this.sessions,
         toolDefinitions: toolDefMap,
         agentId: agentContext?.agentId,
+        executingAgentId: agentContext?.agentId,
         toolCallStepIds: this.toolCallStepIds,
         toolRegistry: agentContext?.toolRegistry,
         hookRegistry: this.hookRegistry,
@@ -1262,6 +1263,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       trace: traceToolNode,
       runLangfuse: this.langfuse,
       agentLangfuse: agentContext?.langfuse,
+      // `agentId` is intentionally left unset on this path (it is the
+      // subagent-scope marker); `executingAgentId` always identifies the owning
+      // agent so hooks can attribute the batch even at the top level.
+      executingAgentId: agentContext?.agentId,
       toolCallStepIds: this.toolCallStepIds,
       errorHandler: (data, metadata): Promise<void> =>
         StandardGraph.handleToolCallErrorStatic(this, data, metadata),
