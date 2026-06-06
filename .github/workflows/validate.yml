@@ -211,6 +211,7 @@ jobs:
         id: google_llm_tests
         if: steps.google_changes.outputs.changed == 'true'
         continue-on-error: true
+        timeout-minutes: 6
         run: npx jest src/llm/google/llm.spec.ts --runInBand
         env:
           NODE_OPTIONS: '--experimental-vm-modules'
@@ -247,6 +248,7 @@ jobs:
         id: anthropic_llm_tests
         if: steps.anthropic_changes.outputs.changed == 'true'
         continue-on-error: true
+        timeout-minutes: 6
         run: npx jest src/llm/anthropic/llm.spec.ts
         env:
           NODE_OPTIONS: '--experimental-vm-modules'
@@ -277,6 +279,7 @@ jobs:
 
       - name: Run PTC unit tests
         if: steps.ptc_changes.outputs.changed == 'true'
+        timeout-minutes: 6
         run: npx jest src/tools/__tests__/ProgrammaticToolCalling.test.ts
         env:
           NODE_OPTIONS: '--experimental-vm-modules'
@@ -294,6 +297,7 @@ jobs:
 
       - name: Run Tool Search unit tests
         if: steps.tool_search_changes.outputs.changed == 'true'
+        timeout-minutes: 6
         run: npx jest src/tools/__tests__/ToolSearch.test.ts
         env:
           NODE_OPTIONS: '--experimental-vm-modules'
