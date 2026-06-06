@@ -697,6 +697,162 @@ describe('formatAgentMessages', () => {
     }
   });
 
+  it('preserves Anthropic server tool pairs before regular tool boundaries', () => {
+    const serverToolId = `${Constants.ANTHROPIC_SERVER_TOOL_PREFIX}search_before_calc`;
+    const calculatorToolId = 'toolu_calc_after_search';
+    const payload: TPayload = [
+      {
+        role: 'user',
+        content: 'Search first, then calculate 19 * 23.',
+      },
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.TEXT,
+            text: 'I will search first.',
+          },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: serverToolId,
+              name: 'web_search',
+              args: '{"query":"Anthropic web search docs"}',
+            },
+          },
+          {
+            type: 'web_search_tool_result',
+            tool_use_id: serverToolId,
+            content: [
+              {
+                type: 'web_search_result',
+                url: 'https://example.com/anthropic-web-search',
+                title: 'Anthropic web search',
+                encrypted_content: 'opaque',
+                page_age: '1d',
+              },
+            ],
+          } as MessageContentComplex,
+          {
+            type: ContentTypes.TEXT,
+            text: 'Now I will calculate.',
+            tool_call_ids: [calculatorToolId],
+          },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: calculatorToolId,
+              name: 'calculator',
+              args: '{"input":"19 * 23"}',
+              output: '437',
+            },
+          },
+          {
+            type: ContentTypes.TEXT,
+            text: 'The calculation result is 437.',
+          },
+        ],
+      },
+      {
+        role: 'user',
+        content: 'Summarize the prior results.',
+      },
+    ];
+
+    const { messages } = formatAgentMessages(
+      payload,
+      undefined,
+      new Set(['web_search', 'calculator']),
+      undefined,
+      { provider: Providers.ANTHROPIC }
+    );
+    const anthropicPayload = _convertMessagesToAnthropicPayload(messages);
+    const assistantBlocks = anthropicPayload.messages
+      .filter((message) => message.role === 'assistant')
+      .flatMap((message) =>
+        typeof message.content === 'string'
+          ? []
+          : getAnthropicPayloadBlocks(message.content)
+      );
+    const serverToolUseIndex = assistantBlocks.findIndex(
+      (block) => block.type === 'server_tool_use' && block.id === serverToolId
+    );
+    const serverResultIndex = assistantBlocks.findIndex(
+      (block) =>
+        block.type === 'web_search_tool_result' &&
+        block.tool_use_id === serverToolId
+    );
+    const calculatorToolUseIndex = assistantBlocks.findIndex(
+      (block) => block.type === 'tool_use' && block.id === calculatorToolId
+    );
+
+    expect(serverToolUseIndex).toBeGreaterThanOrEqual(0);
+    expect(serverResultIndex).toBeGreaterThan(serverToolUseIndex);
+    expect(calculatorToolUseIndex).toBeGreaterThan(serverResultIndex);
+    expect(
+      messages.some(
+        (message) =>
+          message instanceof ToolMessage &&
+          message.tool_call_id === calculatorToolId
+      )
+    ).toBe(true);
+  });
+
+  it('does not pair malformed Anthropic server tool result blocks', () => {
+    const serverToolId = `${Constants.ANTHROPIC_SERVER_TOOL_PREFIX}malformed_result`;
+    const payload: TPayload = [
+      {
+        role: 'user',
+        content: 'Search current docs.',
+      },
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: serverToolId,
+              name: 'web_search',
+              args: '{"query":"Anthropic web search docs"}',
+            },
+          },
+          {
+            type: ContentTypes.TEXT,
+            text: 'Malformed result should not pair this server tool.',
+            tool_use_id: serverToolId,
+          } as MessageContentComplex,
+          {
+            type: ContentTypes.TEXT,
+            text: 'Here is the final answer.',
+          },
+        ],
+      },
+      {
+        role: 'user',
+        content: 'Follow up.',
+      },
+    ];
+
+    const { messages } = formatAgentMessages(
+      payload,
+      undefined,
+      new Set(['web_search']),
+      undefined,
+      { provider: Providers.ANTHROPIC }
+    );
+    const anthropicPayload = _convertMessagesToAnthropicPayload(messages);
+    const allBlocks = anthropicPayload.messages.flatMap((message) =>
+      typeof message.content === 'string'
+        ? []
+        : getAnthropicPayloadBlocks(message.content)
+    );
+
+    expect(allBlocks.some((block) => block.id === serverToolId)).toBe(false);
+    expect(allBlocks.some((block) => block.tool_use_id === serverToolId)).toBe(
+      false
+    );
+  });
+
   it('drops unpaired historical Anthropic Vertex web search calls from mixed turns', () => {
     const serverToolId = `${Constants.ANTHROPIC_SERVER_TOOL_PREFIX}vrtx_missing_result`;
     const calculatorToolId = 'toolu_calc_1';

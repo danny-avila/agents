@@ -372,6 +372,25 @@ function getToolUseId(part: MessageContentComplex): string | undefined {
   return part.tool_use_id;
 }
 
+function isValidServerToolResult(part: MessageContentComplex): boolean {
+  const toolUseId = getToolUseId(part);
+  if (
+    toolUseId?.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX) !== true ||
+    part.type !== 'web_search_tool_result' ||
+    !('content' in part)
+  ) {
+    return false;
+  }
+  const { content } = part as { content?: unknown };
+  return (
+    Array.isArray(content) ||
+    (content != null &&
+      typeof content === 'object' &&
+      'type' in content &&
+      (content as { type?: unknown }).type === 'web_search_tool_result_error')
+  );
+}
+
 function getToolCallId(part: MessageContentComplex): string | undefined {
   if (part.type !== ContentTypes.TOOL_CALL) {
     return undefined;
@@ -460,11 +479,8 @@ function formatAssistantMessage(
       if (part == null) {
         continue;
       }
-      const toolUseId = getToolUseId(part);
-      if (
-        toolUseId?.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX) === true
-      ) {
-        serverToolResultIds.add(toolUseId);
+      if (isValidServerToolResult(part)) {
+        serverToolResultIds.add(getToolUseId(part) ?? '');
       }
       if (options?.provider === Providers.ANTHROPIC) {
         const toolCallId = getToolCallId(part);
@@ -487,6 +503,12 @@ function formatAssistantMessage(
       }
       const toolUseId = getToolUseId(part);
       if (toolUseId != null) {
+        if (
+          toolUseId.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX) &&
+          !isValidServerToolResult(part)
+        ) {
+          continue;
+        }
         flushPendingServerToolUse(toolUseId);
       } else if (hasMeaningfulAssistantContent(part)) {
         for (const id of pendingServerToolUses.keys()) {
@@ -501,6 +523,15 @@ function formatAssistantMessage(
         For Anthropic models, the "tool_calls" field on a message is only respected if content is a string.
         */
         if (currentContent.length > 0) {
+          if (
+            currentContent.some((content) => content.type !== ContentTypes.TEXT)
+          ) {
+            currentContent.push(part);
+            lastAIMessage = createAIMessage(toLangChainContent(currentContent));
+            formattedMessages.push(lastAIMessage);
+            currentContent = [];
+            continue;
+          }
           let content = currentContent.reduce((acc, curr) => {
             if (curr.type === ContentTypes.TEXT) {
               return `${acc}${getTextContent(curr)}\n`;
@@ -593,10 +624,21 @@ function formatAssistantMessage(
         }
 
         tool_call.args = args;
-        if (!lastAIMessage.tool_calls) {
-          lastAIMessage.tool_calls = [];
+        if (Array.isArray(lastAIMessage.content)) {
+          const content = lastAIMessage.content as MessageContentComplex[];
+          content.push({
+            type: 'tool_use',
+            id: tool_call.id,
+            name: tool_call.name,
+            input: args,
+          } as MessageContentComplex);
+          lastAIMessage.content = content as MessageContent;
+        } else {
+          if (!lastAIMessage.tool_calls) {
+            lastAIMessage.tool_calls = [];
+          }
+          lastAIMessage.tool_calls.push(tool_call as ToolCall);
         }
-        lastAIMessage.tool_calls.push(tool_call as ToolCall);
 
         formattedMessages.push(
           new ToolMessage({
