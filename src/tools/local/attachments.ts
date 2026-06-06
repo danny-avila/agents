@@ -112,12 +112,6 @@ const SUPPORTED_IMAGE_MIMES = new Set<string>([
   'image/webp',
 ]);
 
-/** Mime types that get returned to the model as inline attachments. */
-const SUPPORTED_ATTACHMENT_MIMES = new Set<string>([
-  ...SUPPORTED_IMAGE_MIMES,
-  'application/pdf',
-]);
-
 export type AttachmentMode = 'images-only' | 'images-and-pdf' | 'off';
 
 export type Attachment =

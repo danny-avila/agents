@@ -1,4 +1,5 @@
 import { ToolCall } from '@langchain/core/messages/tool';
+import { AsyncLocalStorageProviderSingleton } from '@langchain/core/singletons';
 import {
   ToolMessage,
   HumanMessage,
@@ -14,7 +15,6 @@ import {
   isGraphInterrupt,
   MessagesAnnotation,
 } from '@langchain/langgraph';
-import { AsyncLocalStorageProviderSingleton } from '@langchain/core/singletons';
 import type {
   RunnableConfig,
   RunnableToolLike,
@@ -33,29 +33,29 @@ import type {
   PostToolBatchEntry,
 } from '@/hooks';
 import type * as t from '@/types';
-import { RunnableCallable } from '@/utils';
-import {
-  calculateMaxToolResultChars,
-  truncateToolResultContent,
-} from '@/utils/truncation';
-import { safeDispatchCustomEvent } from '@/utils/events';
-import { executeHooks } from '@/hooks';
-import { toLangChainContent } from '@/messages/langchain';
-import { withLangfuseToolOutputTracingConfig } from '@/langfuseToolOutputTracing';
-import { Constants, GraphEvents, CODE_EXECUTION_TOOLS } from '@/common';
 import {
   buildReferenceKey,
   ToolOutputReferenceRegistry,
 } from '@/tools/toolOutputReferences';
-import { stripCodeSessionFileSummary } from '@/tools/CodeSessionFileSummary';
-import {
-  resolveLocalToolRegistry,
-  resolveLocalExecutionTools,
-} from '@/tools/local';
 import {
   buildToolExecutionRequestPlan,
   recordArgsEqual,
 } from '@/tools/eagerEventExecution';
+import {
+  calculateMaxToolResultChars,
+  truncateToolResultContent,
+} from '@/utils/truncation';
+import {
+  resolveLocalToolRegistry,
+  resolveLocalExecutionTools,
+} from '@/tools/local';
+import { withLangfuseToolOutputTracingConfig } from '@/langfuseToolOutputTracing';
+import { stripCodeSessionFileSummary } from '@/tools/CodeSessionFileSummary';
+import { Constants, GraphEvents, CODE_EXECUTION_TOOLS } from '@/common';
+import { toLangChainContent } from '@/messages/langchain';
+import { safeDispatchCustomEvent } from '@/utils/events';
+import { RunnableCallable } from '@/utils';
+import { executeHooks } from '@/hooks';
 
 /**
  * Per-call batch context for `runTool`. Bundles every optional

@@ -6,13 +6,13 @@ import {
   ToolMessage,
 } from '@langchain/core/messages';
 import type { MessageContentComplex, TPayload } from '@/types';
-import { formatAgentMessages } from './format';
+import { _convertMessagesToAnthropicPayload } from '@/llm/anthropic/utils/message_inputs';
 import {
   convertMessagesToContent,
   formatAnthropicArtifactContent,
 } from './core';
-import { _convertMessagesToAnthropicPayload } from '@/llm/anthropic/utils/message_inputs';
 import { Constants, ContentTypes, Providers } from '@/common';
+import { formatAgentMessages } from './format';
 
 type AnthropicPayloadBlock = {
   content?: unknown;

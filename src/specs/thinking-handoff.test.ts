@@ -1,7 +1,7 @@
 // src/specs/thinking-handoff.test.ts
 import { HumanMessage, ToolMessage } from '@langchain/core/messages';
-import type { ToolCall } from '@langchain/core/messages/tool';
 import type { RunnableConfig } from '@langchain/core/runnables';
+import type { ToolCall } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
 import { Providers, Constants } from '@/common';
 import { StandardGraph } from '@/graphs/Graph';

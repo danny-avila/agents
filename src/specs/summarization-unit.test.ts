@@ -12,8 +12,8 @@ import {
   createPruneMessages,
 } from '@/messages/prune';
 import { shouldTriggerSummarization } from '@/summarization/index';
-import { Providers } from '@/common';
 import { SummarizationTrigger } from '@/types';
+import { Providers } from '@/common';
 
 // ---------------------------------------------------------------------------
 // Shared helpers

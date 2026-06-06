@@ -103,7 +103,7 @@
   ],
   "packageManager": "npm@10.5.2",
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=24.0.0"
   },
   "files": [
     "dist",
@@ -116,6 +116,8 @@
     "prepublishOnly": "npm run build",
     "build": "NODE_ENV=production rollup -c && tsc -p tsconfig.build.json",
     "build:dev": "rollup -c",
+    "sort-imports": "node scripts/sort-imports.ts",
+    "sort-imports:check": "node scripts/sort-imports.ts --check",
     "start": "node dist/esm/main.js",
     "clean": "node ./config/clean.js",
     "script": "node -r dotenv/config --loader ./tsconfig-paths-bootstrap.mjs --experimental-specifier-resolution=node ./src/scripts/cli.ts",
@@ -269,7 +271,7 @@
     "@rollup/plugin-typescript": "^12.1.2",
     "@swc/core": "^1.6.13",
     "@types/jest": "^30.0.0",
-    "@types/node": "^20.14.11",
+    "@types/node": "^24.13.1",
     "@types/node-fetch": "^2.6.13",
     "@types/yargs-parser": "^21.0.3",
     "@typescript-eslint/eslint-plugin": "^8.24.0",
@@ -294,6 +296,7 @@
   },
   "lint-staged": {
     "*.{js,ts}": [
+      "node scripts/sort-imports.ts",
       "prettier --write",
       "eslint --fix"
     ],

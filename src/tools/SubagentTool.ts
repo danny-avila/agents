@@ -1,6 +1,6 @@
-import { Constants } from '@/common';
-import type { SubagentConfig } from '@/types';
 import type { JsonSchemaType, LCTool } from '@/types/tools';
+import type { SubagentConfig } from '@/types';
+import { Constants } from '@/common';
 
 export const SubagentToolName = Constants.SUBAGENT;
 

@@ -14,9 +14,9 @@ import {
   addBedrockCacheControl,
   addCacheControl,
 } from './cache';
-import { formatAgentMessages } from './format';
 import { _convertMessagesToOpenAIParams } from '@/llm/openai/utils';
 import { toLangChainContent } from './langchain';
+import { formatAgentMessages } from './format';
 import { ContentTypes } from '@/common/enum';
 
 type CacheControlBlock = MessageContentComplex & {

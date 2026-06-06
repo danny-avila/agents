@@ -13,9 +13,9 @@
  */
 
 import { ToolMessage, type BaseMessage } from '@langchain/core/messages';
+import type { ContextPruningSettings } from './contextPruningSettings';
 import type { ContextPruningConfig } from '@/types/graph';
 import type { TokenCounter } from '@/types/run';
-import type { ContextPruningSettings } from './contextPruningSettings';
 import { resolveContextPruningSettings } from './contextPruningSettings';
 
 /**

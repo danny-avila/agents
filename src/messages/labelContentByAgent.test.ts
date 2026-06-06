@@ -1,6 +1,6 @@
-import { ContentTypes } from '@/common';
-import { labelContentByAgent } from './format';
 import type { MessageContentComplex, ToolCallContent } from '@/types';
+import { labelContentByAgent } from './format';
+import { ContentTypes } from '@/common';
 
 /**
  * Type guard to check if content is ToolCallContent

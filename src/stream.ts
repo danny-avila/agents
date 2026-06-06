@@ -1,7 +1,7 @@
 // src/stream.ts
+import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
 import type { ChatOpenAIReasoningSummary } from '@langchain/openai';
 import type { AIMessageChunk } from '@langchain/core/messages';
-import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
 import type { AgentContext } from '@/agents/AgentContext';
 import type { StandardGraph } from '@/graphs';
 import type * as t from '@/types';
@@ -16,28 +16,28 @@ import {
   LOCAL_CODING_BUNDLE_NAMES,
 } from '@/common';
 import {
-  handleServerToolResult,
-  handleToolCallChunks,
-  handleToolCalls,
-} from '@/tools/handlers';
-import { getMessageId } from '@/messages';
-import { isGoogleLike } from '@/utils';
-import { safeDispatchCustomEvent } from '@/utils/events';
+  getStreamedToolCallSeal,
+  getStreamedToolCallAdapter,
+  type StreamedToolCallSeal,
+} from '@/tools/streamedToolCallSeals';
 import {
   buildToolExecutionRequestPlan,
   coerceRecordArgs,
   normalizeError,
 } from '@/tools/eagerEventExecution';
 import {
+  handleServerToolResult,
+  handleToolCallChunks,
+  handleToolCalls,
+} from '@/tools/handlers';
+import {
   calculateMaxToolResultChars,
   truncateToolResultContent,
 } from '@/utils/truncation';
-import {
-  getStreamedToolCallSeal,
-  getStreamedToolCallAdapter,
-  type StreamedToolCallSeal,
-} from '@/tools/streamedToolCallSeals';
 import { TOOL_OUTPUT_REF_PATTERN } from '@/tools/toolOutputReferences';
+import { safeDispatchCustomEvent } from '@/utils/events';
+import { isGoogleLike } from '@/utils/llm';
+import { getMessageId } from '@/messages';
 
 const LOCAL_CODING_BUNDLE_NAME_SET: ReadonlySet<string> = new Set(
   LOCAL_CODING_BUNDLE_NAMES

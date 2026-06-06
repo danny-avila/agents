@@ -1,7 +1,7 @@
 import { HumanMessage, getBufferString } from '@langchain/core/messages';
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
-import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ChatGenerationChunk } from '@langchain/core/outputs';
+import type { RunnableConfig } from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';

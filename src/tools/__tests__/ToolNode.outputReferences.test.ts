@@ -3,15 +3,12 @@ import { tool } from '@langchain/core/tools';
 import { AIMessage, ToolMessage } from '@langchain/core/messages';
 import { describe, it, expect, jest, afterEach } from '@jest/globals';
 import type { StructuredToolInterface } from '@langchain/core/tools';
+import type { PostToolUseHookOutput, PreToolUseHookOutput } from '@/hooks';
 import type * as t from '@/types';
+import { ToolOutputReferenceRegistry } from '../toolOutputReferences';
 import * as events from '@/utils/events';
-import type {
-  PostToolUseHookOutput,
-  PreToolUseHookOutput,
-} from '@/hooks';
 import { HookRegistry } from '@/hooks';
 import { ToolNode } from '../ToolNode';
-import { ToolOutputReferenceRegistry } from '../toolOutputReferences';
 
 /**
  * Reads the lazy ref-metadata stamped onto a `ToolMessage` by ToolNode.

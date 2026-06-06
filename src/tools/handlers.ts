@@ -2,11 +2,15 @@
 // src/tools/handlers.ts
 import { nanoid } from 'nanoid';
 import { ToolMessage } from '@langchain/core/messages';
-import type { AnthropicWebSearchResultBlockParam } from '@/llm/anthropic/types';
 import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
+import type { AnthropicWebSearchResultBlockParam } from '@/llm/anthropic/types';
 import type { Graph, MultiAgentGraph, StandardGraph } from '@/graphs';
 import type { AgentContext } from '@/agents/AgentContext';
 import type * as t from '@/types';
+import {
+  coerceAnthropicSearchResults,
+  isAnthropicWebSearchResult,
+} from '@/tools/search/anthropic';
 import {
   ToolCallTypes,
   GraphEvents,
@@ -14,10 +18,6 @@ import {
   Providers,
   Constants,
 } from '@/common';
-import {
-  coerceAnthropicSearchResults,
-  isAnthropicWebSearchResult,
-} from '@/tools/search/anthropic';
 import { formatResultsForLLM } from '@/tools/search/format';
 import { getMessageId } from '@/messages';
 

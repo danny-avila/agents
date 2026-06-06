@@ -1,16 +1,16 @@
 /* eslint-disable @typescript-eslint/explicit-function-return-type */
 /* eslint-disable @typescript-eslint/no-empty-object-type */
-import {
-  BaseLLMOutputParser,
-  OutputParserException,
-} from '@langchain/core/output_parsers';
-import { JsonOutputKeyToolsParserParamsInterop } from '@langchain/core/output_parsers/openai_tools';
 import { ChatGeneration } from '@langchain/core/outputs';
 import { ToolCall } from '@langchain/core/messages/tool';
 import {
   interopSafeParseAsync,
   InteropZodType,
 } from '@langchain/core/utils/types';
+import {
+  BaseLLMOutputParser,
+  OutputParserException,
+} from '@langchain/core/output_parsers';
+import { JsonOutputKeyToolsParserParamsInterop } from '@langchain/core/output_parsers/openai_tools';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 interface AnthropicToolsOutputParserParams<T extends Record<string, any>>

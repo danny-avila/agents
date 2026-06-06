@@ -1,10 +1,5 @@
 import { describe, it, expect } from '@jest/globals';
 import {
-  Constants,
-  LOCAL_CODING_BUNDLE_NAMES,
-  LOCAL_CODING_TOOL_NAMES,
-} from '@/common';
-import {
   createLocalCodingTools,
   createLocalCodingToolDefinitions,
   LocalEditFileToolName,
@@ -13,6 +8,11 @@ import {
   LocalListDirectoryToolName,
   LocalWriteFileToolName,
 } from '../local/LocalCodingTools';
+import {
+  Constants,
+  LOCAL_CODING_BUNDLE_NAMES,
+  LOCAL_CODING_TOOL_NAMES,
+} from '@/common';
 import { CompileCheckToolName } from '../local/CompileCheckTool';
 
 /**
@@ -45,7 +45,9 @@ describe('local coding tool names', () => {
     expect(Constants.BASH_TOOL).toBe('bash_tool');
     expect(Constants.EXECUTE_CODE).toBe('execute_code');
     expect(Constants.PROGRAMMATIC_TOOL_CALLING).toBe('run_tools_with_code');
-    expect(Constants.BASH_PROGRAMMATIC_TOOL_CALLING).toBe('run_tools_with_bash');
+    expect(Constants.BASH_PROGRAMMATIC_TOOL_CALLING).toBe(
+      'run_tools_with_bash'
+    );
   });
 
   it('LOCAL_CODING_BUNDLE_NAMES matches every name the bundle ships', () => {

@@ -1,8 +1,8 @@
 import { nanoid } from 'nanoid';
-import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
 import { HumanMessage } from '@langchain/core/messages';
-import type { BaseMessage } from '@langchain/core/messages';
+import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
 import type { Callbacks } from '@langchain/core/callbacks/manager';
+import type { BaseMessage } from '@langchain/core/messages';
 import type {
   AgentInputs,
   MessageDeltaEvent,
@@ -23,8 +23,8 @@ import type {
 import type { AggregatedHookResult, HookRegistry } from '@/hooks';
 import type { AgentContext } from '@/agents/AgentContext';
 import type { StandardGraph } from '@/graphs/Graph';
-import { GraphEvents, Callback, StepTypes } from '@/common';
 import type { HandlerRegistry } from '@/events';
+import { GraphEvents, Callback, StepTypes } from '@/common';
 import { executeHooks } from '@/hooks';
 
 const DEFAULT_MAX_TURNS = 25;
@@ -797,7 +797,9 @@ function sanitizeToolCallForUpdate(
   return sanitized;
 }
 
-function sanitizeRunStepUpdateData(data: unknown): SanitizedRunStep | undefined {
+function sanitizeRunStepUpdateData(
+  data: unknown
+): SanitizedRunStep | undefined {
   if (!isObjectLike(data)) {
     return undefined;
   }
@@ -879,7 +881,9 @@ function sanitizeReasoningDeltaUpdateData(
   return sanitized;
 }
 
-function sanitizeStepDetails(stepDetails: unknown): SanitizedStepDetails | undefined {
+function sanitizeStepDetails(
+  stepDetails: unknown
+): SanitizedStepDetails | undefined {
   if (!isObjectLike(stepDetails)) {
     return undefined;
   }
@@ -929,7 +933,9 @@ function sanitizeToolCallDelta(
   return sanitized;
 }
 
-function sanitizeStepCompleted(data: unknown): SanitizedStepCompleted | undefined {
+function sanitizeStepCompleted(
+  data: unknown
+): SanitizedStepCompleted | undefined {
   if (!isObjectLike(data)) {
     return undefined;
   }

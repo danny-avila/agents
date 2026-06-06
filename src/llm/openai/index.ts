@@ -1,18 +1,18 @@
 import { AzureOpenAI as AzureOpenAIClient } from 'openai';
 import { ChatXAI as OriginalChatXAI } from '@langchain/xai';
 import { ChatGenerationChunk } from '@langchain/core/outputs';
+import { ToolDefinition } from '@langchain/core/language_models/base';
+import { ChatDeepSeek as OriginalChatDeepSeek } from '@langchain/deepseek';
+import { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import {
   AIMessage,
   AIMessageChunk,
   isAIMessage,
 } from '@langchain/core/messages';
-import { ToolDefinition } from '@langchain/core/language_models/base';
 import {
   convertToOpenAITool,
   isLangChainTool,
 } from '@langchain/core/utils/function_calling';
-import { ChatDeepSeek as OriginalChatDeepSeek } from '@langchain/deepseek';
-import { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import {
   getEndpoint,
   OpenAIClient,
@@ -24,7 +24,6 @@ import {
   AzureChatOpenAIResponses as OriginalAzureChatOpenAIResponses,
   AzureChatOpenAICompletions as OriginalAzureChatOpenAICompletions,
 } from '@langchain/openai';
-import type { HeaderValue, HeadersLike } from './types';
 import type {
   BaseMessage,
   BaseMessageChunk,
@@ -34,6 +33,7 @@ import type { BindToolsInput } from '@langchain/core/language_models/chat_models
 import type { ChatGeneration, ChatResult } from '@langchain/core/outputs';
 import type { ChatXAIInput } from '@langchain/xai';
 import type * as t from '@langchain/openai';
+import type { HeaderValue, HeadersLike } from './types';
 import { isReasoningModel, _convertMessagesToOpenAIParams } from './utils';
 
 // eslint-disable-next-line @typescript-eslint/explicit-function-return-type

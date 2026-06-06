@@ -9,8 +9,8 @@ import type {
   MessageContentComplex,
   ReasoningContentText,
 } from '@/types/stream';
-import type { TokenCounter } from '@/types/run';
 import type { ContextPruningConfig } from '@/types/graph';
+import type { TokenCounter } from '@/types/run';
 import {
   calculateMaxToolResultChars,
   truncateToolResultContent,

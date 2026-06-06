@@ -1,13 +1,6 @@
 // src/hooks/__tests__/compactHooks.test.ts
-import { HumanMessage, AIMessage } from '@langchain/core/messages';
 import { FakeListChatModel } from '@langchain/core/utils/testing';
-import { HookRegistry } from '../HookRegistry';
-import { Run } from '@/run';
-import * as providers from '@/llm/providers';
-import { ToolEndHandler, ModelEndHandler } from '@/events';
-import { createTokenCounter } from '@/utils/tokens';
-import { Providers, GraphEvents } from '@/common';
-import type * as t from '@/types';
+import { HumanMessage, AIMessage } from '@langchain/core/messages';
 import type {
   HookCallback,
   PreCompactHookInput,
@@ -15,6 +8,13 @@ import type {
   PostCompactHookInput,
   PostCompactHookOutput,
 } from '../types';
+import type * as t from '@/types';
+import { ToolEndHandler, ModelEndHandler } from '@/events';
+import { createTokenCounter } from '@/utils/tokens';
+import { Providers, GraphEvents } from '@/common';
+import { HookRegistry } from '../HookRegistry';
+import * as providers from '@/llm/providers';
+import { Run } from '@/run';
 
 const SUMMARY_RESPONSE = '## Summary\nUser asked a question and got an answer.';
 

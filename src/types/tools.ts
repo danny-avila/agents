@@ -2,11 +2,11 @@
 import type { StructuredToolInterface } from '@langchain/core/tools';
 import type { RunnableToolLike } from '@langchain/core/runnables';
 import type { ToolCall } from '@langchain/core/messages/tool';
-import type { HookRegistry } from '@/hooks';
 import type { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import type { MessageContentComplex, ToolErrorData } from './stream';
 import type { HumanInTheLoopConfig } from './hitl';
 import type { LangfuseConfig } from './graph';
+import type { HookRegistry } from '@/hooks';
 
 /** Replacement type for `import type { ToolCall } from '@langchain/core/messages/tool'` in order to have stringified args typed */
 export type CustomToolCall = {

@@ -26,6 +26,7 @@
 import { resolve } from 'path';
 import { tool } from '@langchain/core/tools';
 import type { DynamicStructuredTool } from '@langchain/core/tools';
+import type { WorkspaceFS } from './workspaceFS';
 import type * as t from '@/types';
 import {
   getLocalCwd,
@@ -34,7 +35,6 @@ import {
   truncateLocalOutput,
   validateBashCommand,
 } from './LocalExecutionEngine';
-import type { WorkspaceFS } from './workspaceFS';
 import { Constants } from '@/common';
 
 /** Back-compat alias; canonical name lives on `Constants.COMPILE_CHECK`. */
@@ -173,8 +173,7 @@ export function createCompileCheckTool(
       }
 
       if (detection.command === '') {
-        const explainer =
-          `compile_check: ${detection.reason}. Pass an explicit \`command\` (e.g. \`npm run typecheck\`) to override.`;
+        const explainer = `compile_check: ${detection.reason}. Pass an explicit \`command\` (e.g. \`npm run typecheck\`) to override.`;
         return [
           explainer,
           {
@@ -196,8 +195,7 @@ export function createCompileCheckTool(
       // mutating overrides.
       const validation = await validateBashCommand(detection.command, config);
       if (!validation.valid) {
-        const explainer =
-          `compile_check refused to run \`${detection.command}\`: ${validation.errors.join('; ')}`;
+        const explainer = `compile_check refused to run \`${detection.command}\`: ${validation.errors.join('; ')}`;
         return [
           explainer,
           {
@@ -223,8 +221,7 @@ export function createCompileCheckTool(
         }
       );
 
-      const passed =
-        result.exitCode === 0 && !result.timedOut;
+      const passed = result.exitCode === 0 && !result.timedOut;
       const headline = passed
         ? `compile_check (${detection.kind}) PASSED via \`${detection.command}\``
         : `compile_check (${detection.kind}) FAILED via \`${detection.command}\` ` +

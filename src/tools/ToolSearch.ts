@@ -1,6 +1,6 @@
 // src/tools/ToolSearch.ts
-import * as okapibm25Module from 'okapibm25';
 import { config } from 'dotenv';
+import * as okapibm25Module from 'okapibm25';
 
 type BM25Fn = (
   documents: string[],

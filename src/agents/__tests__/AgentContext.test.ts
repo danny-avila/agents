@@ -1,9 +1,9 @@
 // src/agents/__tests__/AgentContext.test.ts
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
-import { AgentContext } from '../AgentContext';
-import { Constants, Providers } from '@/common';
-import { addBedrockCacheControl } from '@/messages/cache';
 import type * as t from '@/types';
+import { addBedrockCacheControl } from '@/messages/cache';
+import { Constants, Providers } from '@/common';
+import { AgentContext } from '../AgentContext';
 
 describe('AgentContext', () => {
   type TestSystemContentBlock =

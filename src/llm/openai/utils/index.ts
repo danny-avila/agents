@@ -1,12 +1,12 @@
 /* eslint-disable @typescript-eslint/ban-ts-comment */
 /* eslint-disable @typescript-eslint/explicit-function-return-type */
 import { type OpenAI as OpenAIClient } from 'openai';
-import type {
-  ChatCompletionContentPartText,
-  ChatCompletionContentPartImage,
-  ChatCompletionContentPartInputAudio,
-  ChatCompletionContentPart,
-} from 'openai/resources/chat/completions';
+import { ChatGenerationChunk } from '@langchain/core/outputs';
+import {
+  convertLangChainToolCallToOpenAI,
+  makeInvalidToolCall,
+  parseToolCall,
+} from '@langchain/core/output_parsers/openai_tools';
 import {
   AIMessage,
   AIMessageChunk,
@@ -25,24 +25,24 @@ import {
   convertToProviderContentBlock,
   isDataContentBlock,
 } from '@langchain/core/messages';
-import { ChatGenerationChunk } from '@langchain/core/outputs';
-import {
-  convertLangChainToolCallToOpenAI,
-  makeInvalidToolCall,
-  parseToolCall,
-} from '@langchain/core/output_parsers/openai_tools';
-import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
+import type {
+  ChatCompletionContentPartText,
+  ChatCompletionContentPartImage,
+  ChatCompletionContentPartInputAudio,
+  ChatCompletionContentPart,
+} from 'openai/resources/chat/completions';
 import type {
   OpenAICallOptions,
   OpenAIChatInput,
   ChatOpenAIReasoningSummary,
 } from '@langchain/openai';
-import { toLangChainContent } from '@/messages/langchain';
+import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
 import {
   STREAMED_TOOL_CALL_SEAL_METADATA_KEY,
   STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY,
   OPENAI_RESPONSES_STREAMED_TOOL_CALL_ADAPTER,
 } from '@/tools/streamedToolCallSeals';
+import { toLangChainContent } from '@/messages/langchain';
 
 export type { OpenAICallOptions, OpenAIChatInput };
 

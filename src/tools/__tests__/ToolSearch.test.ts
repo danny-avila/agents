@@ -4,6 +4,7 @@
  * Tests helper functions and sanitization logic without hitting the API.
  */
 import { describe, it, expect } from '@jest/globals';
+import type { ToolMetadata, LCToolRegistry } from '@/types';
 import {
   sanitizeRegex,
   escapeRegexSpecialChars,
@@ -20,7 +21,6 @@ import {
   getBaseToolName,
   formatServerListing,
 } from '../ToolSearch';
-import type { ToolMetadata, LCToolRegistry } from '@/types';
 
 describe('ToolSearch', () => {
   describe('escapeRegexSpecialChars', () => {

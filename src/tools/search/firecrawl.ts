@@ -1,7 +1,7 @@
 import axios from 'axios';
-import { processContent } from './content';
 import type * as t from './types';
 import { createDefaultLogger } from './utils';
+import { processContent } from './content';
 
 /**
  * Firecrawl scraper implementation

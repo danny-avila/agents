@@ -1,7 +1,6 @@
 import { HumanMessage } from '@langchain/core/messages';
 import { FakeListChatModel } from '@langchain/core/utils/testing';
 import type { ToolCall } from '@langchain/core/messages/tool';
-import type * as t from '@/types';
 import type {
   HookCallback,
   PermissionDeniedHookOutput,
@@ -12,9 +11,7 @@ import type {
   SubagentStopHookInput,
   SubagentStopHookOutput,
 } from '@/hooks/types';
-import { HookRegistry } from '@/hooks/HookRegistry';
-import { Run } from '@/run';
-import { FakeChatModel } from '@/llm/fake';
+import type * as t from '@/types';
 import {
   Constants,
   GraphEvents,
@@ -22,7 +19,10 @@ import {
   ToolEndHandler,
   ModelEndHandler,
 } from '@/index';
+import { HookRegistry } from '@/hooks/HookRegistry';
 import * as providers from '@/llm/providers';
+import { FakeChatModel } from '@/llm/fake';
+import { Run } from '@/run';
 
 const CHILD_RESPONSE = 'Hook test child response.';
 
@@ -275,9 +275,7 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
               toolCalls: [createCalculatorToolCall()],
             });
           }
-          bindTools(
-            tools: unknown
-          ): ReturnType<FakeChatModel['withConfig']> {
+          bindTools(tools: unknown): ReturnType<FakeChatModel['withConfig']> {
             const config = {
               tools,
             } as Parameters<FakeChatModel['withConfig']>[0];
@@ -379,9 +377,7 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
               toolCalls: [createCalculatorToolCall()],
             });
           }
-          bindTools(
-            tools: unknown
-          ): ReturnType<FakeChatModel['withConfig']> {
+          bindTools(tools: unknown): ReturnType<FakeChatModel['withConfig']> {
             const config = {
               tools,
             } as Parameters<FakeChatModel['withConfig']>[0];

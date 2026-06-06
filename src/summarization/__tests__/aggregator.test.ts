@@ -1,6 +1,6 @@
-import { createContentAggregator } from '@/stream';
-import { ContentTypes, GraphEvents, StepTypes } from '@/common';
 import type * as t from '@/types';
+import { ContentTypes, GraphEvents, StepTypes } from '@/common';
+import { createContentAggregator } from '@/stream';
 
 describe('createContentAggregator – SUMMARY accumulation', () => {
   it('accumulates text from multiple ON_SUMMARIZE_DELTA events', () => {

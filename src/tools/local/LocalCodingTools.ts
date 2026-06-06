@@ -1,12 +1,8 @@
 import { basename, dirname } from 'path';
-import { tool } from '@langchain/core/tools';
 import { createTwoFilesPatch } from 'diff';
+import { tool } from '@langchain/core/tools';
 import type { DynamicStructuredTool } from '@langchain/core/tools';
 import type * as t from '@/types';
-import {
-  createLocalBashExecutionTool,
-  createLocalCodeExecutionTool,
-} from './LocalExecutionTools';
 import {
   createLocalBashProgrammaticToolCallingTool,
   createLocalProgrammaticToolCallingTool,
@@ -18,15 +14,19 @@ import {
   spawnLocalProcess,
   truncateLocalOutput,
 } from './LocalExecutionEngine';
-import { createLocalFileCheckpointer } from './FileCheckpointer';
-import { applyEdit, locateEdit } from './editStrategies';
-import { decodeFile, encodeFile } from './textEncoding';
-import { classifyAttachment, imageAttachmentContent } from './attachments';
-import { runPostEditSyntaxCheck } from './syntaxCheck';
+import {
+  createLocalBashExecutionTool,
+  createLocalCodeExecutionTool,
+} from './LocalExecutionTools';
 import {
   createCompileCheckTool,
   createCompileCheckToolDefinition,
 } from './CompileCheckTool';
+import { classifyAttachment, imageAttachmentContent } from './attachments';
+import { createLocalFileCheckpointer } from './FileCheckpointer';
+import { applyEdit, locateEdit } from './editStrategies';
+import { decodeFile, encodeFile } from './textEncoding';
+import { runPostEditSyntaxCheck } from './syntaxCheck';
 import { Constants } from '@/common';
 
 const MAX_READ_CHARS = 256000;
@@ -51,7 +51,8 @@ export const LocalReadFileToolSchema: t.JsonSchemaType = {
   properties: {
     file_path: {
       type: 'string',
-      description: 'Path to a local file, relative to the configured cwd unless absolute paths are allowed.',
+      description:
+        'Path to a local file, relative to the configured cwd unless absolute paths are allowed.',
     },
     offset: {
       type: 'integer',
@@ -70,7 +71,8 @@ export const LocalWriteFileToolSchema: t.JsonSchemaType = {
   properties: {
     file_path: {
       type: 'string',
-      description: 'Path to write, relative to the configured cwd unless absolute paths are allowed.',
+      description:
+        'Path to write, relative to the configured cwd unless absolute paths are allowed.',
     },
     content: {
       type: 'string',
@@ -85,7 +87,8 @@ export const LocalEditFileToolSchema: t.JsonSchemaType = {
   properties: {
     file_path: {
       type: 'string',
-      description: 'Path to edit, relative to the configured cwd unless absolute paths are allowed.',
+      description:
+        'Path to edit, relative to the configured cwd unless absolute paths are allowed.',
     },
     old_text: {
       type: 'string',
@@ -97,7 +100,8 @@ export const LocalEditFileToolSchema: t.JsonSchemaType = {
     },
     edits: {
       type: 'array',
-      description: 'Optional batch of exact replacements. Each old_text must appear exactly once in the original file.',
+      description:
+        'Optional batch of exact replacements. Each old_text must appear exactly once in the original file.',
       items: {
         type: 'object',
         properties: {
@@ -217,8 +221,7 @@ function lineWindow(
   }
   const numbered = out
     .map(
-      (text, index) =>
-        `${String(start + index + 1).padStart(6, ' ')}\t${text}`
+      (text, index) => `${String(start + index + 1).padStart(6, ' ')}\t${text}`
     )
     .join('\n');
   return {
@@ -247,10 +250,7 @@ async function maybeRunSyntaxCheck(
   return { mode, outcome };
 }
 
-function appendSyntaxCheckSummary(
-  base: string,
-  run: SyntaxRun
-): string {
+function appendSyntaxCheckSummary(base: string, run: SyntaxRun): string {
   if (run == null) return base;
   if (run.outcome.ok) return base;
   const banner =
@@ -395,7 +395,11 @@ export function createLocalReadFileTool(
         offset?: number;
         limit?: number;
       };
-      const path = await resolveWorkspacePathSafe(input.file_path, config, 'read');
+      const path = await resolveWorkspacePathSafe(
+        input.file_path,
+        config,
+        'read'
+      );
       const fileStat = await fs.stat(path);
       if (!fileStat.isFile()) {
         throw new Error(`Path is not a file: ${input.file_path}`);
@@ -416,8 +420,7 @@ export function createLocalReadFileTool(
             path,
             bytes: fileStat.size,
             mode: attachmentMode,
-            maxBytes:
-              config.maxAttachmentBytes ?? DEFAULT_MAX_ATTACHMENT_BYTES,
+            maxBytes: config.maxAttachmentBytes ?? DEFAULT_MAX_ATTACHMENT_BYTES,
             // Route through the configured WorkspaceFS so a custom
             // engine sees the same path semantics as `read_file`
             // itself (manual review finding F).
@@ -515,7 +518,11 @@ export function createLocalWriteFileTool(
       if (config.readOnly === true) {
         throw new Error('write_file is blocked in read-only local mode.');
       }
-      const path = await resolveWorkspacePathSafe(input.file_path, config, 'write');
+      const path = await resolveWorkspacePathSafe(
+        input.file_path,
+        config,
+        'write'
+      );
       if (checkpointer != null) {
         await checkpointer.captureBeforeWrite(path);
       }
@@ -604,7 +611,11 @@ export function createLocalEditFileTool(
         throw new Error('edit_file requires old_text/new_text or edits[].');
       }
 
-      const path = await resolveWorkspacePathSafe(input.file_path, config, 'write');
+      const path = await resolveWorkspacePathSafe(
+        input.file_path,
+        config,
+        'write'
+      );
       const raw = await fs.readFile(path, 'utf8');
       const encoding = decodeFile(raw);
       const original = encoding.text;
@@ -727,7 +738,7 @@ async function isRipgrepAvailable(
       { ...config, timeoutMs: 5000, sandbox: { enabled: false } },
       { internal: true }
     )
-      .then((probe) => probe != null && probe.exitCode === 0)
+      .then((probe) => probe.exitCode === 0)
       .catch(() => false);
     envMap.set(envKey, probePromise);
   }
@@ -943,6 +954,17 @@ function compileFallbackRegex(pattern: string): RegExp {
  * diagnostic skip-sentinels (Codex P2 [43]). */
 type FallbackGrepResult = { matches: string[]; skipped: string[] };
 
+/** Renders fallback-grep output: real matches first, skip diagnostics appended. */
+function formatFallbackGrepDisplay(result: FallbackGrepResult): string {
+  if (result.matches.length > 0) {
+    return [...result.matches, ...result.skipped].join('\n');
+  }
+  if (result.skipped.length > 0) {
+    return result.skipped.join('\n');
+  }
+  return 'No matches found.';
+}
+
 async function fallbackGrep(
   root: string,
   pattern: string,
@@ -953,7 +975,9 @@ async function fallbackGrep(
   const rx = compileFallbackRegex(pattern);
   const deadline = Date.now() + FALLBACK_GREP_BUDGET_MS;
   const globRx =
-    globFilter != null && globFilter !== '' ? globToRegExp(globFilter) : undefined;
+    globFilter != null && globFilter !== ''
+      ? globToRegExp(globFilter)
+      : undefined;
   const matches: string[] = [];
   // Track skipped (oversize) files separately so they don't consume
   // the maxResults budget. Codex P2 [43]: round 14's fix pushed skip
@@ -970,7 +994,9 @@ async function fallbackGrep(
       return { matches, skipped: skippedDiagnostics };
     }
     if (globRx != null) {
-      const rel = file.startsWith(root + '/') ? file.slice(root.length + 1) : file;
+      const rel = file.startsWith(root + '/')
+        ? file.slice(root.length + 1)
+        : file;
       if (!globRx.test(rel)) {
         continue;
       }
@@ -1028,7 +1054,9 @@ async function fallbackGlob(
   const rx = globToRegExp(pattern);
   const out: string[] = [];
   for await (const file of walkFiles(root, fs)) {
-    const rel = file.startsWith(root + '/') ? file.slice(root.length + 1) : file;
+    const rel = file.startsWith(root + '/')
+      ? file.slice(root.length + 1)
+      : file;
     if (rx.test(rel)) {
       out.push(file);
       if (out.length >= maxResults) {
@@ -1051,7 +1079,11 @@ export function createLocalGrepSearchTool(
         glob?: string;
         max_results?: number;
       };
-      const target = await resolveWorkspacePathSafe(input.path ?? '.', config, 'read');
+      const target = await resolveWorkspacePathSafe(
+        input.path ?? '.',
+        config,
+        'read'
+      );
       const maxResults = Math.max(input.max_results ?? DEFAULT_MAX_RESULTS, 1);
 
       if (await isRipgrepAvailable(config)) {
@@ -1067,7 +1099,9 @@ export function createLocalGrepSearchTool(
           '--hidden',
           '--glob',
           '!.git/**',
-          ...(input.glob != null && input.glob !== '' ? ['--glob', input.glob] : []),
+          ...(input.glob != null && input.glob !== ''
+            ? ['--glob', input.glob]
+            : []),
           '-e',
           input.pattern,
           target,
@@ -1084,7 +1118,10 @@ export function createLocalGrepSearchTool(
         // got from P2 #13), exit-2 errors silently mapped to
         // `matches: 0`, so the agent treated tooling failures as a
         // genuine absence of matches.
-        if (result.timedOut || (result.exitCode != null && result.exitCode > 1)) {
+        if (
+          result.timedOut ||
+          (result.exitCode != null && result.exitCode > 1)
+        ) {
           const detail = result.stderr.trim() || `rg exited ${result.exitCode}`;
           return [
             `grep_search failed: ${detail}`,
@@ -1096,7 +1133,10 @@ export function createLocalGrepSearchTool(
             },
           ];
         }
-        const lines = result.stdout.split('\n').filter(Boolean).slice(0, maxResults);
+        const lines = result.stdout
+          .split('\n')
+          .filter(Boolean)
+          .slice(0, maxResults);
         const output =
           lines.length > 0
             ? lines.join('\n')
@@ -1112,15 +1152,9 @@ export function createLocalGrepSearchTool(
           maxResults,
           fs
         );
-        // Display: real matches first, skip diagnostics appended.
         // Artifact count: ONLY real matches (Codex P2 [43] —
         // skip sentinels used to inflate the count and the budget).
-        const display =
-          matches.length > 0
-            ? [...matches, ...skipped].join('\n')
-            : skipped.length > 0
-              ? skipped.join('\n')
-              : 'No matches found.';
+        const display = formatFallbackGrepDisplay({ matches, skipped });
         return [
           display,
           {
@@ -1165,13 +1199,25 @@ export function createLocalGlobSearchTool(
         path?: string;
         max_results?: number;
       };
-      const target = await resolveWorkspacePathSafe(input.path ?? '.', config, 'read');
+      const target = await resolveWorkspacePathSafe(
+        input.path ?? '.',
+        config,
+        'read'
+      );
       const maxResults = Math.max(input.max_results ?? DEFAULT_MAX_RESULTS, 1);
 
       if (await isRipgrepAvailable(config)) {
         const result = await spawnLocalProcess(
           'rg',
-          ['--files', '--hidden', '--glob', '!.git/**', '--glob', input.pattern, target],
+          [
+            '--files',
+            '--hidden',
+            '--glob',
+            '!.git/**',
+            '--glob',
+            input.pattern,
+            target,
+          ],
           { ...config, timeoutMs: config.timeoutMs ?? 30000 }
         );
         // rg --files exit codes:
@@ -1181,7 +1227,10 @@ export function createLocalGlobSearchTool(
         // Without this branch, exit-2 errors used to silently map to
         // "No files found." — the agent then treats a tooling failure
         // as a real absence of matches.
-        if (result.timedOut || (result.exitCode != null && result.exitCode > 1)) {
+        if (
+          result.timedOut ||
+          (result.exitCode != null && result.exitCode > 1)
+        ) {
           const detail = result.stderr.trim() || `rg exited ${result.exitCode}`;
           return [
             `glob_search failed: ${detail}`,
@@ -1226,10 +1275,16 @@ export function createLocalListDirectoryTool(
   return tool(
     async (rawInput) => {
       const input = rawInput as { path?: string };
-      const path = await resolveWorkspacePathSafe(input.path ?? '.', config, 'read');
+      const path = await resolveWorkspacePathSafe(
+        input.path ?? '.',
+        config,
+        'read'
+      );
       const entries = await fs.readdir(path, { withFileTypes: true });
       const output = entries
-        .map((entry) => `${entry.isDirectory() ? 'dir ' : 'file'}\t${entry.name}`)
+        .map(
+          (entry) => `${entry.isDirectory() ? 'dir ' : 'file'}\t${entry.name}`
+        )
         .join('\n');
       return [output || 'Directory is empty.', { path, count: entries.length }];
     },

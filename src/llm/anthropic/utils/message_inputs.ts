@@ -4,6 +4,7 @@
  * This util file contains functions for converting LangChain messages to Anthropic messages.
  */
 import { createHash } from 'node:crypto';
+import { ToolCall } from '@langchain/core/messages/tool';
 import {
   type BaseMessage,
   type SystemMessage,
@@ -18,7 +19,6 @@ import {
   convertToProviderContentBlock,
   parseBase64DataUrl,
 } from '@langchain/core/messages';
-import { ToolCall } from '@langchain/core/messages/tool';
 import {
   AnthropicImageBlockParam,
   AnthropicMessageCreateParams,

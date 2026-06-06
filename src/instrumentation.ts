@@ -1,7 +1,18 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { createHash, randomBytes } from 'node:crypto';
 import { setLangfuseTracerProvider } from '@langfuse/tracing';
 import { BasicTracerProvider } from '@opentelemetry/sdk-trace-base';
 import { context, ROOT_CONTEXT, createContextKey } from '@opentelemetry/api';
 import { AsyncLocalStorageContextManager } from '@opentelemetry/context-async-hooks';
+import type {
+  IdGenerator,
+  ReadableSpan,
+  Span,
+  SpanProcessor,
+} from '@opentelemetry/sdk-trace-base';
+import type { LangfuseSpanProcessorParams } from '@langfuse/otel';
+import type { Context } from '@opentelemetry/api';
+import type * as t from '@/types';
 import {
   hasLangfuseConfigCredentials,
   hasLangfuseEnvCredentials,
@@ -12,17 +23,6 @@ import {
   getContextLangfuseConfig,
 } from '@/langfuseToolOutputTracing';
 import { isPresent } from '@/utils/misc';
-import { AsyncLocalStorage } from 'node:async_hooks';
-import { createHash, randomBytes } from 'node:crypto';
-import type {
-  IdGenerator,
-  ReadableSpan,
-  Span,
-  SpanProcessor,
-} from '@opentelemetry/sdk-trace-base';
-import type { LangfuseSpanProcessorParams } from '@langfuse/otel';
-import type { Context } from '@opentelemetry/api';
-import type * as t from '@/types';
 
 /**
  * Per-run seed for deterministic Langfuse trace ids. When a run opts in

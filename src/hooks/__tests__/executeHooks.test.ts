@@ -1,7 +1,4 @@
 // src/hooks/__tests__/executeHooks.test.ts
-import { HookRegistry } from '../HookRegistry';
-import { executeHooks } from '../executeHooks';
-import { clearMatcherCache } from '../matchers';
 import type {
   HookCallback,
   HookMatcher,
@@ -14,6 +11,9 @@ import type {
   PostToolUseHookInput,
   PostToolUseHookOutput,
 } from '../types';
+import { clearMatcherCache } from '../matchers';
+import { HookRegistry } from '../HookRegistry';
+import { executeHooks } from '../executeHooks';
 
 function preToolUseInput(
   toolName: string,

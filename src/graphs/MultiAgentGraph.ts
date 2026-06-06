@@ -15,8 +15,8 @@ import {
   getCurrentTaskInput,
   messagesStateReducer,
 } from '@langchain/langgraph';
-import type { LangGraphRunnableConfig } from '@langchain/langgraph';
 import type { BaseMessage, AIMessageChunk } from '@langchain/core/messages';
+import type { LangGraphRunnableConfig } from '@langchain/langgraph';
 import type { ToolRunnableConfig } from '@langchain/core/tools';
 import type * as t from '@/types';
 import { StandardGraph } from './Graph';

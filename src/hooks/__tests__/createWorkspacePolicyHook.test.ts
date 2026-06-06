@@ -2,12 +2,12 @@ import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 import { mkdtemp, rm } from 'fs/promises';
 import { describe, it, expect, beforeEach, afterEach } from '@jest/globals';
-import { createWorkspacePolicyHook } from '../createWorkspacePolicyHook';
 import type {
   HookCallback,
   PreToolUseHookInput,
   PreToolUseHookOutput,
 } from '../types';
+import { createWorkspacePolicyHook } from '../createWorkspacePolicyHook';
 
 function call(
   hook: HookCallback<'PreToolUse'>,
@@ -49,13 +49,17 @@ describe('createWorkspacePolicyHook', () => {
 
   it('allows in-workspace relative paths', async () => {
     const hook = createWorkspacePolicyHook({ root: workspace });
-    const out = await call(hook,makeInput('read_file', { file_path: 'src/x.ts' }));
+    const out = await call(
+      hook,
+      makeInput('read_file', { file_path: 'src/x.ts' })
+    );
     expect(out.decision).toBe('allow');
   });
 
   it('allows in-workspace absolute paths', async () => {
     const hook = createWorkspacePolicyHook({ root: workspace });
-    const out = await call(hook,
+    const out = await call(
+      hook,
       makeInput('read_file', { file_path: join(workspace, 'src/x.ts') })
     );
     expect(out.decision).toBe('allow');
@@ -66,7 +70,8 @@ describe('createWorkspacePolicyHook', () => {
       root: workspace,
       additionalRoots: [extra],
     });
-    const out = await call(hook,
+    const out = await call(
+      hook,
       makeInput('read_file', { file_path: join(extra, 'lib/y.ts') })
     );
     expect(out.decision).toBe('allow');
@@ -74,7 +79,8 @@ describe('createWorkspacePolicyHook', () => {
 
   it('asks by default when path is outside the workspace (read tool)', async () => {
     const hook = createWorkspacePolicyHook({ root: workspace });
-    const out = await call(hook,
+    const out = await call(
+      hook,
       makeInput('read_file', { file_path: '/etc/passwd' })
     );
     expect(out.decision).toBe('ask');
@@ -84,7 +90,8 @@ describe('createWorkspacePolicyHook', () => {
 
   it('asks by default when path is outside the workspace (write tool)', async () => {
     const hook = createWorkspacePolicyHook({ root: workspace });
-    const out = await call(hook,
+    const out = await call(
+      hook,
       makeInput('write_file', {
         file_path: '/etc/foo',
         content: 'malicious',
@@ -98,7 +105,8 @@ describe('createWorkspacePolicyHook', () => {
       root: workspace,
       outsideRead: 'deny',
     });
-    const out = await call(hook,
+    const out = await call(
+      hook,
       makeInput('read_file', { file_path: '/etc/passwd' })
     );
     expect(out.decision).toBe('deny');
@@ -110,7 +118,8 @@ describe('createWorkspacePolicyHook', () => {
       root: workspace,
       outsideWrite: 'deny',
     });
-    const out = await call(hook,
+    const out = await call(
+      hook,
       makeInput('edit_file', {
         file_path: '/etc/foo',
         old_text: 'a',
@@ -125,7 +134,8 @@ describe('createWorkspacePolicyHook', () => {
       root: workspace,
       outsideRead: 'allow',
     });
-    const out = await call(hook,
+    const out = await call(
+      hook,
       makeInput('read_file', { file_path: '/etc/passwd' })
     );
     expect(out.decision).toBe('allow');
@@ -133,7 +143,8 @@ describe('createWorkspacePolicyHook', () => {
 
   it('passes through when the tool has no extractor (e.g. bash)', async () => {
     const hook = createWorkspacePolicyHook({ root: workspace });
-    const out = await call(hook,
+    const out = await call(
+      hook,
       makeInput('bash', { command: 'cat /etc/passwd' })
     );
     expect(out.decision).toBe('allow');
@@ -141,7 +152,7 @@ describe('createWorkspacePolicyHook', () => {
 
   it('passes through when the path arg is missing/empty', async () => {
     const hook = createWorkspacePolicyHook({ root: workspace });
-    const out = await call(hook,makeInput('grep_search', { pattern: 'x' }));
+    const out = await call(hook, makeInput('grep_search', { pattern: 'x' }));
     expect(out.decision).toBe('allow');
   });
 
@@ -149,16 +160,17 @@ describe('createWorkspacePolicyHook', () => {
     const hook = createWorkspacePolicyHook({
       root: workspace,
       pathExtractors: {
-        my_custom_tool: (i) =>
-          typeof i.target === 'string' ? [i.target] : [],
+        my_custom_tool: (i) => (typeof i.target === 'string' ? [i.target] : []),
       },
     });
-    const inside = await call(hook,
+    const inside = await call(
+      hook,
       makeInput('my_custom_tool', { target: 'in/workspace.ts' })
     );
     expect(inside.decision).toBe('allow');
 
-    const outside = await call(hook,
+    const outside = await call(
+      hook,
       makeInput('my_custom_tool', { target: '/elsewhere/x.ts' })
     );
     // Unknown tools default to write-policy (stricter): 'ask'.
@@ -170,7 +182,8 @@ describe('createWorkspacePolicyHook', () => {
       root: workspace,
       reason: '{tool} blocked from {paths}',
     });
-    const out = await call(hook,
+    const out = await call(
+      hook,
       makeInput('read_file', { file_path: '/somewhere/else.ts' })
     );
     expect(out.reason).toBe('read_file blocked from /somewhere/else.ts');
@@ -184,7 +197,8 @@ describe('createWorkspacePolicyHook', () => {
           Array.isArray(i.paths) ? (i.paths as string[]) : [],
       },
     });
-    const out = await call(hook,
+    const out = await call(
+      hook,
       makeInput('multi_file_tool', {
         paths: [join(workspace, 'a.ts'), '/etc/passwd'],
       })
@@ -196,7 +210,8 @@ describe('createWorkspacePolicyHook', () => {
 
   it('respects resolved root paths (relative root config)', async () => {
     const hook = createWorkspacePolicyHook({ root: '.' });
-    const out = await call(hook,
+    const out = await call(
+      hook,
       makeInput('read_file', { file_path: resolve('.', 'src/x.ts') })
     );
     expect(out.decision).toBe('allow');
@@ -206,10 +221,7 @@ describe('createWorkspacePolicyHook', () => {
     it('rejects a symlink inside the workspace that points outside', async () => {
       const fs = await import('fs/promises');
       await fs.writeFile(join(extra, 'secret.txt'), 'top-secret\n');
-      await fs.symlink(
-        join(extra, 'secret.txt'),
-        join(workspace, 'escape')
-      );
+      await fs.symlink(join(extra, 'secret.txt'), join(workspace, 'escape'));
       const hook = createWorkspacePolicyHook({
         root: workspace,
         outsideRead: 'deny',

@@ -1,5 +1,6 @@
 import { ChatGoogle } from '@langchain/google-gauth';
 import { ChatConnection } from '@langchain/google-common';
+import { AIMessageChunk, isAIMessage } from '@langchain/core/messages';
 import type {
   GeminiContent,
   GeminiRequest,
@@ -8,7 +9,6 @@ import type {
 } from '@langchain/google-common';
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { BaseMessage, UsageMetadata } from '@langchain/core/messages';
-import { AIMessageChunk, isAIMessage } from '@langchain/core/messages';
 import type { ChatGenerationChunk } from '@langchain/core/outputs';
 import type { GoogleThinkingConfig, VertexAIClientOptions } from '@/types';
 

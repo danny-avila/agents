@@ -1,5 +1,5 @@
-import type { Tool, ToolConfiguration } from '@aws-sdk/client-bedrock-runtime';
 import type { BindToolsInput } from '@langchain/core/language_models/chat_models';
+import type { Tool, ToolConfiguration } from '@aws-sdk/client-bedrock-runtime';
 import type { OpenAIClient } from '@langchain/openai';
 import type { DocumentType } from '@smithy/types';
 import type { GraphTools } from '@/types';

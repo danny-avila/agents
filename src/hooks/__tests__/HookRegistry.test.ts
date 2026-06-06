@@ -1,11 +1,11 @@
 // src/hooks/__tests__/HookRegistry.test.ts
-import { HookRegistry } from '../HookRegistry';
 import type {
   HookMatcher,
   HookCallback,
   PreToolUseHookOutput,
   PostToolUseHookOutput,
 } from '../types';
+import { HookRegistry } from '../HookRegistry';
 
 const noop: HookCallback<
   'PreToolUse'

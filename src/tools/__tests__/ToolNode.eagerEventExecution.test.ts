@@ -5,9 +5,9 @@ import { describe, it, expect, jest, afterEach } from '@jest/globals';
 import type { StructuredToolInterface } from '@langchain/core/tools';
 import type { PreToolUseHookInput, PreToolUseHookOutput } from '@/hooks';
 import type * as t from '@/types';
+import * as events from '@/utils/events';
 import { GraphEvents } from '@/common';
 import { HookRegistry } from '@/hooks';
-import * as events from '@/utils/events';
 import { ToolNode } from '../ToolNode';
 
 function createDummyTool(name: string): StructuredToolInterface {

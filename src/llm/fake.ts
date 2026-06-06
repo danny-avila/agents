@@ -1,9 +1,9 @@
-import { ChatGenerationChunk } from '@langchain/core/outputs';
 import { AIMessageChunk } from '@langchain/core/messages';
-import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
-import type { BaseMessage } from '@langchain/core/messages';
+import { ChatGenerationChunk } from '@langchain/core/outputs';
 import { FakeListChatModel } from '@langchain/core/utils/testing';
 import { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
+import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
+import type { BaseMessage } from '@langchain/core/messages';
 
 type SplitStrategy = {
   type: 'regex' | 'fixed';
@@ -20,7 +20,7 @@ export class FakeChatModel extends FakeListChatModel {
     sleep,
     emitCustomEvent,
     splitStrategy = { type: 'regex', value: /(?<=\s+)|(?=\s+)/ },
-    toolCalls = []
+    toolCalls = [],
   }: {
     responses: string[];
     sleep?: number;
@@ -45,25 +45,31 @@ export class FakeChatModel extends FakeListChatModel {
       return chunks;
     }
   }
-  _createResponseChunk(text: string, tool_call_chunks?: ToolCallChunk[]): ChatGenerationChunk {
+  _createResponseChunk(
+    text: string,
+    tool_call_chunks?: ToolCallChunk[]
+  ): ChatGenerationChunk {
     return new ChatGenerationChunk({
       text,
       generationInfo: {},
       message: new AIMessageChunk({
         content: text,
         tool_call_chunks,
-        additional_kwargs: tool_call_chunks ? {
-          tool_calls: tool_call_chunks.map((toolCall) => ({
-            index: toolCall.index ?? 0,
-            id: toolCall.id ?? '',
-            type: 'function',
-            function: {
-              name: toolCall.name ?? '',
-              arguments: toolCall.args ?? '',
-            },
-          })),
-        } : undefined,
-      })});
+        additional_kwargs: tool_call_chunks
+          ? {
+            tool_calls: tool_call_chunks.map((toolCall) => ({
+              index: toolCall.index ?? 0,
+              id: toolCall.id ?? '',
+              type: 'function',
+              function: {
+                name: toolCall.name ?? '',
+                arguments: toolCall.args ?? '',
+              },
+            })),
+          }
+          : undefined,
+      }),
+    });
   }
 
   async *_streamResponseChunks(
@@ -96,7 +102,7 @@ export class FakeChatModel extends FakeListChatModel {
     await this._sleepIfRequested();
     if (this.toolCalls.length > 0 && !this.addedToolCalls) {
       this.addedToolCalls = true;
-      const toolCallChunks = this.toolCalls.map((toolCall) => {;
+      const toolCallChunks = this.toolCalls.map((toolCall) => {
         return {
           name: toolCall.name,
           args: JSON.stringify(toolCall.args),
@@ -116,13 +122,12 @@ export function createFakeStreamingLLM({
   sleep,
   splitStrategy,
   toolCalls,
-} : {
-  responses: string[],
-  sleep?: number,
-  splitStrategy?: SplitStrategy,
-  toolCalls?: ToolCall[]
-}
-): FakeChatModel {
+}: {
+  responses: string[];
+  sleep?: number;
+  splitStrategy?: SplitStrategy;
+  toolCalls?: ToolCall[];
+}): FakeChatModel {
   return new FakeChatModel({
     sleep,
     responses,

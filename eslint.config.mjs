@@ -55,7 +55,7 @@ export default defineConfig([globalIgnores([
         sourceType: "module",
 
         parserOptions: {
-            project: "./tsconfig.json",
+            project: ["./tsconfig.json", "./scripts/tsconfig.json"],
         },
     },
 
@@ -93,14 +93,21 @@ export default defineConfig([globalIgnores([
         "@typescript-eslint/consistent-type-assertions": "error",
         "@typescript-eslint/explicit-function-return-type": "error",
         "@typescript-eslint/no-explicit-any": "error",
-        "no-nested-ternary": "warn",
+        "no-nested-ternary": "error",
         "@typescript-eslint/no-unnecessary-condition": "warn",
         "@typescript-eslint/strict-boolean-expressions": "warn",
     },
 }, {
-    files: ["src/stream.ts", "src/utils/logging.ts"],
+    files: ["src/stream.ts", "src/utils/logging.ts", "scripts/**/*.ts"],
 
     rules: {
         "no-console": "off",
+    },
+}, {
+    files: ["**/*.test.ts", "**/*.spec.ts", "**/__tests__/**/*.ts"],
+
+    rules: {
+        "@typescript-eslint/no-require-imports": "off",
+        "@typescript-eslint/explicit-function-return-type": "off",
     },
 }]);

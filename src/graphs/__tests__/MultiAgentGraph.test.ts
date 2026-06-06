@@ -1,7 +1,7 @@
 // src/graphs/__tests__/MultiAgentGraph.test.ts
+import type * as t from '@/types';
 import { MultiAgentGraph } from '../MultiAgentGraph';
 import { Providers } from '@/common';
-import type * as t from '@/types';
 
 describe('MultiAgentGraph.validateEdgeAgents', () => {
   const makeAgent = (agentId: string): t.AgentInputs => ({

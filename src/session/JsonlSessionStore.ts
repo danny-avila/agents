@@ -1,5 +1,6 @@
 import { homedir } from 'os';
 import { createHash } from 'crypto';
+import { SystemMessage } from '@langchain/core/messages';
 import { basename, dirname, isAbsolute, join, resolve } from 'path';
 import {
   access,
@@ -10,6 +11,7 @@ import {
   stat,
   writeFile,
 } from 'fs/promises';
+import type { BaseMessage } from '@langchain/core/messages';
 import type {
   CreateSessionFileOptions,
   SessionBranchOptions,
@@ -26,15 +28,13 @@ import type {
   SessionStateEntry,
   SessionTreeNode,
 } from './types';
-import type { BaseMessage } from '@langchain/core/messages';
-import { SystemMessage } from '@langchain/core/messages';
-import { createEntryId, createSessionId, createTimestamp } from './ids';
 import {
   deserializeMessage,
   getMessageRole,
   serializeMessage,
   toJsonValue,
 } from './messageSerialization';
+import { createEntryId, createSessionId, createTimestamp } from './ids';
 
 const SESSION_VERSION = 1;
 const DEFAULT_SESSION_ROOT = join(

@@ -9,21 +9,21 @@
  *
  * Uses FakeListChatModel — no API keys required.
  */
+import { FakeListChatModel } from '@langchain/core/utils/testing';
 import {
   HumanMessage,
   AIMessage,
   BaseMessage,
   UsageMetadata,
 } from '@langchain/core/messages';
-import { FakeListChatModel } from '@langchain/core/utils/testing';
 import type * as t from '@/types';
 import { ToolEndHandler, ModelEndHandler } from '@/events';
-import { GraphEvents, Providers } from '@/common';
-import { createContentAggregator } from '@/stream';
 import { createTokenCounter } from '@/utils/tokens';
+import { createContentAggregator } from '@/stream';
+import { GraphEvents, Providers } from '@/common';
 import { getLLMConfig } from '@/utils/llmConfig';
-import { Run } from '@/run';
 import * as providers from '@/llm/providers';
+import { Run } from '@/run';
 
 function getSummaryText(summary: t.SummaryContentBlock | undefined): string {
   if (!summary) return '';

@@ -1,3 +1,10 @@
+import { StructuredToolInterface } from '@langchain/core/tools';
+import { ToolChoice } from '@langchain/core/language_models/chat_models';
+import { isLangChainTool } from '@langchain/core/utils/function_calling';
+import {
+  isOpenAITool,
+  ToolDefinition,
+} from '@langchain/core/language_models/base';
 import {
   Tool as GenerativeAITool,
   ToolConfig,
@@ -6,16 +13,9 @@ import {
   FunctionDeclarationsTool,
   FunctionDeclarationSchema,
 } from '@google/generative-ai';
-import { ToolChoice } from '@langchain/core/language_models/chat_models';
-import { StructuredToolInterface } from '@langchain/core/tools';
-import { isLangChainTool } from '@langchain/core/utils/function_calling';
-import {
-  isOpenAITool,
-  ToolDefinition,
-} from '@langchain/core/language_models/base';
+import { removeAdditionalProperties } from './zod_to_genai_parameters';
 import { convertToGenerativeAITools } from './common';
 import { GoogleGenerativeAIToolType } from '../types';
-import { removeAdditionalProperties } from './zod_to_genai_parameters';
 
 export function convertToolsToGenAI(
   tools: GoogleGenerativeAIToolType[],

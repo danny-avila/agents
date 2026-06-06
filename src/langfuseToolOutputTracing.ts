@@ -1,7 +1,7 @@
-import { context, createContextKey } from '@opentelemetry/api';
-import { LangfuseSpanProcessor } from '@langfuse/otel';
-import { LangfuseOtelSpanAttributes } from '@langfuse/tracing';
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { LangfuseSpanProcessor } from '@langfuse/otel';
+import { context, createContextKey } from '@opentelemetry/api';
+import { LangfuseOtelSpanAttributes } from '@langfuse/tracing';
 import type {
   ReadableSpan,
   Span,

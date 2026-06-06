@@ -1,11 +1,9 @@
 import { dirname } from 'path';
-import { nodeWorkspaceFS } from './workspaceFS';
 import type { WorkspaceFS } from './workspaceFS';
 import type * as t from '@/types';
+import { nodeWorkspaceFS } from './workspaceFS';
 
-type Snapshot =
-  | { kind: 'absent' }
-  | { kind: 'present'; content: Buffer };
+type Snapshot = { kind: 'absent' } | { kind: 'present'; content: Buffer };
 
 /**
  * Per-Run snapshot store for write_file / edit_file. Captures the
@@ -34,7 +32,10 @@ export class LocalFileCheckpointerImpl implements t.LocalFileCheckpointer {
   ) {}
 
   async captureBeforeWrite(absolutePath: string): Promise<void> {
-    if (this.snapshots.has(absolutePath) || this.oversizePaths.has(absolutePath)) {
+    if (
+      this.snapshots.has(absolutePath) ||
+      this.oversizePaths.has(absolutePath)
+    ) {
       return;
     }
     let info;

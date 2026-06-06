@@ -1,6 +1,5 @@
 // src/hooks/executeHooks.ts
 import type { Logger } from 'winston';
-import type { HookRegistry } from './HookRegistry';
 import type {
   HookInput,
   HookEvent,
@@ -11,6 +10,7 @@ import type {
   HookCallback,
   AggregatedHookResult,
 } from './types';
+import type { HookRegistry } from './HookRegistry';
 import { matchesQuery } from './matchers';
 
 /** Default per-hook timeout when a matcher doesn't set its own. */

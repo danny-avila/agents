@@ -1,5 +1,7 @@
 import { z } from 'zod';
 import { tool } from '@langchain/core/tools';
+import { AIMessage, ToolMessage } from '@langchain/core/messages';
+import { describe, it, expect, jest, afterEach } from '@jest/globals';
 import {
   END,
   START,
@@ -9,11 +11,9 @@ import {
   MessagesAnnotation,
   Command,
 } from '@langchain/langgraph';
-import { AIMessage, ToolMessage } from '@langchain/core/messages';
-import { describe, it, expect, jest, afterEach } from '@jest/globals';
+import type { Runnable, RunnableConfig } from '@langchain/core/runnables';
 import type { StructuredToolInterface } from '@langchain/core/tools';
 import type { BaseMessage } from '@langchain/core/messages';
-import type { Runnable, RunnableConfig } from '@langchain/core/runnables';
 import type { PreToolUseHookOutput } from '@/hooks';
 import type * as t from '@/types';
 import { HookRegistry } from '@/hooks';
@@ -60,7 +60,11 @@ function buildGraph(
     .addNode('agent', (): MessagesUpdate => {
       agentInvocations += 1;
       if (agentInvocations === 1) {
-        return { messages: [aiCall(toolCalls[0].id, toolCalls[0].name, toolCalls[0].args)] };
+        return {
+          messages: [
+            aiCall(toolCalls[0].id, toolCalls[0].name, toolCalls[0].args),
+          ],
+        };
       }
       return { messages: [] };
     })
@@ -80,14 +84,11 @@ describe('direct-path HITL: resume scope', () => {
 
   it('re-executes the direct tool body on resume when interrupt() fires from the direct path', async () => {
     const sideEffect = jest.fn(() => 'EXECUTED');
-    const directTool = tool(
-      async () => sideEffect(),
-      {
-        name: 'echo',
-        description: 'direct tool that records every body invocation',
-        schema: z.object({ command: z.string().optional() }).passthrough(),
-      }
-    ) as unknown as StructuredToolInterface;
+    const directTool = tool(async () => sideEffect(), {
+      name: 'echo',
+      description: 'direct tool that records every body invocation',
+      schema: z.object({ command: z.string().optional() }).passthrough(),
+    }) as unknown as StructuredToolInterface;
 
     const registry = new HookRegistry();
     let hookInvocations = 0;
@@ -149,7 +150,9 @@ describe('direct-path HITL: resume scope', () => {
 
     // Result should carry the executed output.
     const messages = (second as { messages: ToolMessage[] }).messages;
-    const toolMsg = messages.find((m) => m instanceof ToolMessage) as ToolMessage;
+    const toolMsg = messages.find(
+      (m) => m instanceof ToolMessage
+    ) as ToolMessage;
     expect(String(toolMsg.content)).toBe('EXECUTED');
   });
 
@@ -199,17 +202,20 @@ describe('direct-path HITL: resume scope', () => {
     });
 
     const builder = new StateGraph(MessagesAnnotation)
-      .addNode('agent', (): MessagesUpdate => ({
-        messages: [
-          new AIMessage({
-            content: '',
-            tool_calls: [
-              { id: 'a1', name: 'tool_a', args: {} },
-              { id: 'b1', name: 'tool_b', args: {} },
-            ],
-          }),
-        ],
-      }))
+      .addNode(
+        'agent',
+        (): MessagesUpdate => ({
+          messages: [
+            new AIMessage({
+              content: '',
+              tool_calls: [
+                { id: 'a1', name: 'tool_a', args: {} },
+                { id: 'b1', name: 'tool_b', args: {} },
+              ],
+            }),
+          ],
+        })
+      )
       .addNode('tools', node)
       .addEdge(START, 'agent')
       .addEdge('agent', 'tools')
@@ -311,14 +317,11 @@ describe('direct-path HITL: resume scope', () => {
     });
 
     it('fails closed when updatedInput is missing or wrong-shaped', async () => {
-      const directTool = tool(
-        async () => 'should-not-execute',
-        {
-          name: 'echo',
-          description: 'must not execute on malformed edit',
-          schema: z.object({ command: z.string().optional() }).passthrough(),
-        }
-      ) as unknown as StructuredToolInterface;
+      const directTool = tool(async () => 'should-not-execute', {
+        name: 'echo',
+        description: 'must not execute on malformed edit',
+        schema: z.object({ command: z.string().optional() }).passthrough(),
+      }) as unknown as StructuredToolInterface;
 
       const registry = new HookRegistry();
       registry.register('PreToolUse', {
