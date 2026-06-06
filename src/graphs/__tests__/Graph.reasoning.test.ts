@@ -6,7 +6,7 @@ import type { RunnableConfig } from '@langchain/core/runnables';
 import type { BaseMessage, UsageMetadata } from '@langchain/core/messages';
 import type { OpenAIClient } from '@langchain/openai';
 import type * as t from '@/types';
-import { ContentTypes, GraphEvents, Providers } from '@/common';
+import { ContentTypes, GraphEvents, Providers, StepTypes } from '@/common';
 import { ChatModelStreamHandler, createContentAggregator } from '@/stream';
 import { ChatOpenRouter } from '@/llm/openrouter';
 import { ModelEndHandler, ToolEndHandler } from '@/events';
@@ -818,6 +818,242 @@ describe('StandardGraph final response reasoning fallback', () => {
       { type: ContentTypes.TEXT, text },
     ]);
     expect(run.getRunMessages()?.[0]?.content).toBe(text);
+  });
+
+  it('keeps new OpenRouter final text suffixes that carry reasoning_details', async () => {
+    const firstText = 'Hello ';
+    const replayWithSuffix = 'Hello world';
+    const reasoningText = 'The greeting needs one more word.';
+    const reasoningDeltas: t.ReasoningDeltaEvent[] = [];
+    const messageDeltas: t.MessageDeltaEvent[] = [];
+    const { contentParts, aggregateContent } = createContentAggregator();
+    const run = await Run.create<t.IState>({
+      runId: 'reasoning-fallback-openrouter-final-suffix-details',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: Providers.OPENROUTER,
+          streamUsage: false,
+        },
+        reasoningKey: 'reasoning',
+      },
+      returnContent: true,
+      skipCleanup: true,
+      customHandlers: createReasoningHandlers(
+        aggregateContent,
+        reasoningDeltas,
+        messageDeltas
+      ),
+    });
+
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+
+    run.Graph.overrideModel = new StreamingReasoningModel([
+      new AIMessageChunk({ content: firstText }),
+      new AIMessageChunk({
+        content: replayWithSuffix,
+        additional_kwargs: {
+          reasoning_details: [
+            { type: 'reasoning.text', text: reasoningText },
+          ],
+        },
+      }),
+    ]);
+
+    const finalContentParts = await run.processStream(
+      { messages: [new HumanMessage('finish the greeting')] },
+      {
+        ...config,
+        configurable: {
+          thread_id: 'reasoning-fallback-openrouter-final-suffix-details',
+        },
+      }
+    );
+
+    expect(reasoningDeltas).toHaveLength(1);
+    expect(messageDeltas).toHaveLength(2);
+    expect(messageDeltas[1].delta.content?.[0]).toEqual({
+      type: ContentTypes.TEXT,
+      text: 'world',
+    });
+    expect(contentParts).toEqual([
+      { type: ContentTypes.TEXT, text: replayWithSuffix },
+      { type: ContentTypes.THINK, think: reasoningText },
+    ]);
+    expect(finalContentParts).toEqual([
+      { type: ContentTypes.THINK, think: reasoningText },
+      { type: ContentTypes.TEXT, text: replayWithSuffix },
+    ]);
+    expect(run.getRunMessages()?.[0]?.content).toBe(replayWithSuffix);
+  });
+
+  it('keeps post-tool final text when an earlier invocation streamed text', async () => {
+    const streamedBeforeTool = 'I will check that. ';
+    const finalAfterTool = 'The answer is 391.';
+    const reasoningDeltas: t.ReasoningDeltaEvent[] = [];
+    const messageDeltas: t.MessageDeltaEvent[] = [];
+    const { aggregateContent } = createContentAggregator();
+    const run = await Run.create<t.IState>({
+      runId: 'reasoning-fallback-post-tool-final-text',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: Providers.OPENAI,
+          disableStreaming: true,
+          streamUsage: false,
+        },
+      },
+      returnContent: true,
+      skipCleanup: true,
+      customHandlers: createReasoningHandlers(
+        aggregateContent,
+        reasoningDeltas,
+        messageDeltas
+      ),
+    });
+
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+
+    const graph = run.Graph;
+    const metadata = {
+      thread_id: 'reasoning-fallback-post-tool-final-text',
+      langgraph_node: 'agent=default',
+      langgraph_step: 1,
+      checkpoint_ns: '',
+    };
+    const runConfig = {
+      ...config,
+      configurable: {
+        thread_id: 'reasoning-fallback-post-tool-final-text',
+      },
+      metadata,
+    };
+    graph.config = runConfig;
+    const streamedStepKey = graph.getStepKey(metadata);
+    await graph.dispatchRunStep(
+      streamedStepKey,
+      {
+        type: StepTypes.MESSAGE_CREATION,
+        message_creation: { message_id: 'msg-before-tool' },
+      },
+      metadata
+    );
+    await graph.dispatchMessageDelta(
+      graph.getStepIdByKey(streamedStepKey),
+      {
+        content: [
+          {
+            type: ContentTypes.TEXT,
+            text: streamedBeforeTool,
+          },
+        ],
+      },
+      metadata
+    );
+
+    graph.invokedToolIds = new Set(['call_calculator']);
+    graph.overrideModel = new InvokeOnlyMessageModel(
+      new AIMessageChunk({ content: finalAfterTool })
+    );
+
+    await graph.createCallModel('default')(
+      { messages: [new HumanMessage('continue after tool')] },
+      runConfig
+    );
+
+    expect(messageDeltas.map((delta) => delta.delta.content?.[0])).toEqual([
+      {
+        type: ContentTypes.TEXT,
+        text: streamedBeforeTool,
+      },
+      {
+        type: ContentTypes.TEXT,
+        text: finalAfterTool,
+      },
+    ]);
+  });
+
+  it('composes observer chat stream handlers with default graph dispatch', async () => {
+    const firstText = 'Vis';
+    const secondText = 'ible answer.';
+    const observedTextChunks: string[] = [];
+    const reasoningDeltas: t.ReasoningDeltaEvent[] = [];
+    const messageDeltas: t.MessageDeltaEvent[] = [];
+    const { contentParts, aggregateContent } = createContentAggregator();
+    const run = await Run.create<t.IState>({
+      runId: 'reasoning-fallback-openrouter-observer-stream',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: Providers.OPENROUTER,
+          streamUsage: false,
+        },
+        reasoningKey: 'reasoning',
+      },
+      returnContent: true,
+      skipCleanup: true,
+      customHandlers: {
+        [GraphEvents.CHAT_MODEL_STREAM]: {
+          handle: (
+            _event: string,
+            data: t.StreamEventData
+          ): void => {
+            const content = (data.chunk as AIMessageChunk | undefined)
+              ?.content;
+            if (typeof content === 'string' && content !== '') {
+              observedTextChunks.push(content);
+            }
+          },
+        },
+        ...createReasoningHandlers(
+          aggregateContent,
+          reasoningDeltas,
+          messageDeltas
+        ),
+      },
+    });
+
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+
+    const model = new ChatOpenRouter({
+      model: 'google/gemini-test',
+      apiKey: 'test-key',
+    });
+    const completions = (model as unknown as StreamingCompletionBackedModel)
+      .completions;
+
+    async function* streamChunks(): AsyncGenerator<OpenAIClient.Chat.Completions.ChatCompletionChunk> {
+      yield createOpenRouterStreamChunk(firstText);
+      yield createOpenRouterStreamChunk(secondText, 'stop');
+    }
+
+    completions.completionWithRetry = async (): Promise<
+      AsyncIterable<OpenAIClient.Chat.Completions.ChatCompletionChunk>
+    > => streamChunks();
+    run.Graph.overrideModel = model as t.ChatModel;
+
+    await run.processStream(
+      { messages: [new HumanMessage('stream OpenRouter text to observer')] },
+      {
+        ...config,
+        configurable: {
+          thread_id: 'reasoning-fallback-openrouter-observer-stream',
+        },
+      }
+    );
+
+    expect(observedTextChunks).toEqual([firstText, secondText]);
+    expect(reasoningDeltas).toHaveLength(0);
+    expect(messageDeltas).toHaveLength(2);
+    expect(contentParts).toEqual([
+      { type: ContentTypes.TEXT, text: `${firstText}${secondText}` },
+    ]);
   });
 
   it('does not handle OpenRouter callback-emitted chunks twice inside graph streaming', async () => {

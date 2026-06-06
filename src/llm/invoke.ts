@@ -51,9 +51,12 @@ export type InvokeContext = NonNullable<
  */
 export type OnChunk = (chunk: AIMessageChunk) => void | Promise<void>;
 
-function hasRegisteredChatStreamHandler(context?: InvokeContext): boolean {
+function hasRegisteredDefaultChatStreamHandler(
+  context?: InvokeContext
+): boolean {
   return (
-    context?.handlerRegistry?.getHandler(GraphEvents.CHAT_MODEL_STREAM) != null
+    context?.handlerRegistry?.getHandler(GraphEvents.CHAT_MODEL_STREAM) instanceof
+    ChatModelStreamHandler
   );
 }
 
@@ -71,6 +74,31 @@ function removeOpenRouterFinalReasoningReplayContent({
   next: AIMessageChunk;
   provider: Providers;
 }): AIMessageChunk {
+  const content = getOpenRouterFinalReasoningContent({
+    current,
+    next,
+    provider,
+  });
+  if (content == null || content === next.content) {
+    return next;
+  }
+
+  return new AIMessageChunk(
+    Object.assign({}, next, {
+      content,
+    })
+  );
+}
+
+function getOpenRouterFinalReasoningContent({
+  current,
+  next,
+  provider,
+}: {
+  current?: AIMessageChunk;
+  next: AIMessageChunk;
+  provider: Providers;
+}): string | undefined {
   if (
     provider !== Providers.OPENROUTER ||
     current == null ||
@@ -80,12 +108,48 @@ function removeOpenRouterFinalReasoningReplayContent({
     typeof next.content !== 'string' ||
     next.content === ''
   ) {
+    return undefined;
+  }
+  if (!next.content.startsWith(current.content)) {
+    return next.content;
+  }
+  return next.content.slice(current.content.length);
+}
+
+function removeReasoningDetails(
+  additionalKwargs: AIMessageChunk['additional_kwargs']
+): AIMessageChunk['additional_kwargs'] {
+  return Object.fromEntries(
+    Object.entries(additionalKwargs).filter(
+      ([key]) => key !== 'reasoning_details'
+    )
+  );
+}
+
+function getStreamHandlingChunk({
+  current,
+  next,
+  provider,
+}: {
+  current?: AIMessageChunk;
+  next: AIMessageChunk;
+  provider: Providers;
+}): AIMessageChunk | undefined {
+  const content = getOpenRouterFinalReasoningContent({
+    current,
+    next,
+    provider,
+  });
+  if (content == null) {
     return next;
   }
-
+  if (content === '') {
+    return undefined;
+  }
   return new AIMessageChunk(
     Object.assign({}, next, {
-      content: '',
+      content,
+      additional_kwargs: removeReasoningDetails(next.additional_kwargs),
     })
   );
 }
@@ -157,16 +221,23 @@ export async function attemptInvoke(
           provider,
         });
       }
-    } else if (!hasRegisteredChatStreamHandler(context)) {
+    } else if (!hasRegisteredDefaultChatStreamHandler(context)) {
       const metadata = config?.metadata as Record<string, unknown> | undefined;
       const streamHandler = new ChatModelStreamHandler();
       for await (const chunk of stream) {
-        await streamHandler.handle(
-          GraphEvents.CHAT_MODEL_STREAM,
-          { chunk },
-          metadata,
-          context
-        );
+        const handlingChunk = getStreamHandlingChunk({
+          current: finalChunk,
+          next: chunk,
+          provider,
+        });
+        if (handlingChunk != null) {
+          await streamHandler.handle(
+            GraphEvents.CHAT_MODEL_STREAM,
+            { chunk: handlingChunk },
+            metadata,
+            context
+          );
+        }
         finalChunk = appendStreamChunk({
           current: finalChunk,
           next: chunk,

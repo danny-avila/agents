@@ -807,7 +807,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   getStepBaseKey(metadata: Record<string, unknown> | undefined): string {
     if (!metadata) return '';
 
-    const keyList = this.getBaseKeyList(metadata);
+    const keyList = this.getInvocationKeyList(metadata);
     if (this.checkKeyList(keyList)) {
       throw new Error('Missing metadata');
     }
@@ -861,7 +861,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   ): (string | number | undefined)[] {
     if (!metadata) return [];
 
-    const keyList = this.getBaseKeyList(metadata);
+    const keyList = this.getInvocationKeyList(metadata);
     const agentContext = this.getAgentContext(metadata);
     if (
       agentContext.currentTokenType === ContentTypes.THINK ||
@@ -872,10 +872,16 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       keyList.push(`post-reasoning-${agentContext.reasoningTransitionCount}`);
     }
 
+    return keyList;
+  }
+
+  private getInvocationKeyList(
+    metadata: Record<string, unknown>
+  ): (string | number | undefined)[] {
+    const keyList = this.getBaseKeyList(metadata);
     if (this.invokedToolIds != null && this.invokedToolIds.size > 0) {
       keyList.push(this.invokedToolIds.size + '');
     }
-
     return keyList;
   }
 
