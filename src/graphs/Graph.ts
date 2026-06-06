@@ -177,7 +177,42 @@ function getResponseReasoningContent({
   );
 }
 
-function getTextMessageDeltaContent(
+function isTextMessageContentPart(
+  contentPart: MessageContent[number] | t.MessageContentComplex
+): boolean {
+  return (
+    typeof contentPart === 'object' &&
+    'type' in contentPart &&
+    typeof contentPart.type === 'string' &&
+    contentPart.type.startsWith('text')
+  );
+}
+
+function isGoogleServerSideToolMessageContentPart(
+  contentPart: MessageContent[number] | t.MessageContentComplex
+): boolean {
+  return (
+    typeof contentPart === 'object' &&
+    'type' in contentPart &&
+    (contentPart.type === 'toolCall' || contentPart.type === 'toolResponse')
+  );
+}
+
+function hasGoogleServerSideToolDeltaContent(
+  provider: Providers | undefined,
+  content: t.MessageDelta['content']
+): content is t.MessageContentComplex[] {
+  return (
+    isGoogleLike(provider) &&
+    Array.isArray(content) &&
+    content.some((contentPart) =>
+      isGoogleServerSideToolMessageContentPart(contentPart)
+    )
+  );
+}
+
+function getMessageDeltaContent(
+  provider: Providers | undefined,
   content: MessageContent | undefined
 ): t.MessageDelta['content'] | undefined {
   if (content == null) {
@@ -191,18 +226,26 @@ function getTextMessageDeltaContent(
   if (content.length === 0) {
     return undefined;
   }
-  if (
-    !content.every(
-      (contentPart) =>
-        typeof contentPart === 'object' &&
-        'type' in contentPart &&
-        typeof contentPart.type === 'string' &&
-        contentPart.type.startsWith('text')
-    )
-  ) {
+
+  const hasGoogleServerSideToolPart =
+    isGoogleLike(provider) &&
+    content.some((contentPart) =>
+      isGoogleServerSideToolMessageContentPart(contentPart)
+    );
+  if (content.every((contentPart) => isTextMessageContentPart(contentPart))) {
+    return content as t.MessageDelta['content'];
+  }
+  if (!hasGoogleServerSideToolPart) {
     return undefined;
   }
-  return content as t.MessageDelta['content'];
+  const messageContent = content.filter(
+    (contentPart) =>
+      isTextMessageContentPart(contentPart) ||
+      isGoogleServerSideToolMessageContentPart(contentPart)
+  );
+  return messageContent.length > 0
+    ? (messageContent as t.MessageDelta['content'])
+    : undefined;
 }
 
 function hasTextDeltaContent(
@@ -287,21 +330,17 @@ function clearCurrentDeltaStepMarkers({
   }
 }
 
-async function dispatchTextMessageContent({
+async function dispatchMessageCreationStep({
   graph,
   stepKey,
-  content,
+  messageId,
   metadata,
 }: {
   graph: Graph<t.BaseGraphState>;
   stepKey: string;
-  content: t.MessageDelta['content'];
+  messageId: string;
   metadata: Record<string, unknown>;
-}): Promise<boolean> {
-  const messageId = getMessageId(stepKey, graph) ?? '';
-  if (!messageId) {
-    return false;
-  }
+}): Promise<string> {
   await graph.dispatchRunStep(
     stepKey,
     {
@@ -310,7 +349,48 @@ async function dispatchTextMessageContent({
     },
     metadata
   );
-  const stepId = graph.getStepIdByKey(stepKey);
+  return graph.getStepIdByKey(stepKey);
+}
+
+async function dispatchTextMessageContent({
+  graph,
+  stepKey,
+  provider,
+  content,
+  metadata,
+}: {
+  graph: Graph<t.BaseGraphState>;
+  stepKey: string;
+  provider?: Providers;
+  content: t.MessageDelta['content'];
+  metadata: Record<string, unknown>;
+}): Promise<boolean> {
+  const messageId = getMessageId(stepKey, graph) ?? '';
+  if (!messageId) {
+    return false;
+  }
+  if (hasGoogleServerSideToolDeltaContent(provider, content)) {
+    for (const contentPart of content) {
+      const stepId = await dispatchMessageCreationStep({
+        graph,
+        stepKey,
+        messageId,
+        metadata,
+      });
+      await graph.dispatchMessageDelta(
+        stepId,
+        { content: [contentPart] },
+        metadata
+      );
+    }
+    return true;
+  }
+  const stepId = await dispatchMessageCreationStep({
+    graph,
+    stepKey,
+    messageId,
+    metadata,
+  });
   await graph.dispatchMessageDelta(stepId, { content }, metadata);
   return true;
 }
@@ -388,7 +468,8 @@ function getDispatchableFinalReasoningContent({
     return undefined;
   }
   if (
-    agentContext.provider === Providers.OPENROUTER && hasStreamedTextDeltaStep
+    agentContext.provider === Providers.OPENROUTER &&
+    hasStreamedTextDeltaStep
   ) {
     return undefined;
   }
@@ -1819,7 +1900,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         responseMessage: responseMessage as Partial<AIMessageChunk> | undefined,
         reasoningKey: agentContext.reasoningKey,
       });
-      const textMessageContent = getTextMessageDeltaContent(
+      const textMessageContent = getMessageDeltaContent(
+        agentContext.provider,
         responseMessage?.content as MessageContent | undefined
       );
       const hasStreamedTextDeltaStep = hasCurrentTextDeltaStep({
@@ -1855,6 +1937,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           const dispatchedText = await dispatchTextMessageContent({
             graph: this,
             stepKey,
+            provider: agentContext.provider,
             content: textMessageContent,
             metadata,
           });
@@ -1888,6 +1971,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           await dispatchTextMessageContent({
             graph: this,
             stepKey,
+            provider: agentContext.provider,
             content: textMessageContent,
             metadata,
           });

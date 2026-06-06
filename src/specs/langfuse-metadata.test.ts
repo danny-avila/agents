@@ -15,8 +15,9 @@ jest.mock('@langfuse/tracing', () => ({
 const MockedCallbackHandler = CallbackHandler as jest.MockedClass<
   typeof CallbackHandler
 >;
-const MockedPropagateAttributes =
-  propagateAttributes as jest.MockedFunction<typeof propagateAttributes>;
+const MockedPropagateAttributes = propagateAttributes as jest.MockedFunction<
+  typeof propagateAttributes
+>;
 
 async function createTestRun(
   agentName?: string,

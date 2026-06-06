@@ -1,5 +1,8 @@
 import { CallbackHandler } from '@langfuse/langchain';
-import { getLangfuseTracerProvider, propagateAttributes } from '@langfuse/tracing';
+import {
+  getLangfuseTracerProvider,
+  propagateAttributes,
+} from '@langfuse/tracing';
 import type { PropagateAttributesParams } from '@langfuse/tracing';
 import type * as t from '@/types';
 import { isPresent } from '@/utils/misc';

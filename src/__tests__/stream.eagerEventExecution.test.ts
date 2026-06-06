@@ -8,6 +8,7 @@ import {
   GraphEvents,
   Providers,
   StepTypes,
+  ToolCallTypes,
 } from '@/common';
 import { HandlerRegistry } from '@/events';
 import * as events from '@/utils/events';
@@ -95,6 +96,42 @@ function createGraph(overrides: Partial<StandardGraph> = {}): StandardGraph {
 
 function chunkStateKey(stepKey: string, chunkKey: string | number): string {
   return `${stepKey}\u0000${String(chunkKey)}`;
+}
+
+function attachContentAggregator(graph: StandardGraph): {
+  contentParts: Array<t.MessageContentComplex | undefined>;
+} {
+  const { contentParts, aggregateContent } = createContentAggregator();
+  const dispatchRunStep = graph.dispatchRunStep.bind(graph);
+  const stepIndices = new Map<string, number>();
+  graph.dispatchRunStep = jest.fn<StandardGraph['dispatchRunStep']>(
+    async (stepKey, stepDetails, metadata) => {
+      const stepId = await dispatchRunStep(stepKey, stepDetails, metadata);
+      const runStep = graph.getRunStep(stepId);
+      if (runStep != null) {
+        if (!stepIndices.has(stepId)) {
+          stepIndices.set(stepId, stepIndices.size);
+        }
+        aggregateContent({
+          event: GraphEvents.ON_RUN_STEP,
+          data: {
+            ...runStep,
+            index: stepIndices.get(stepId) ?? 0,
+          },
+        });
+      }
+      return stepId;
+    }
+  );
+  graph.dispatchMessageDelta = jest.fn<StandardGraph['dispatchMessageDelta']>(
+    async (id, delta) => {
+      aggregateContent({
+        event: GraphEvents.ON_MESSAGE_DELTA,
+        data: { id, delta } as t.MessageDeltaEvent,
+      });
+    }
+  );
+  return { contentParts };
 }
 
 const finalToolCallResponseMetadata = { finish_reason: 'tool_calls' };
@@ -1636,6 +1673,7 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     });
     const handler = new ChatModelStreamHandler();
     const metadata = { langgraph_node: 'agent' };
+
     const mixedChunk = {
       content: 'final answer',
       additional_kwargs: {
@@ -1707,6 +1745,407 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
       },
       metadata
     );
+  });
+
+  it('dispatches Gemini server-side tool context blocks from mixed stream content', async () => {
+    const dispatchMessageDelta = jest.fn<StandardGraph['dispatchMessageDelta']>(
+      async () => undefined
+    );
+    const graph = createGraph({
+      dispatchMessageDelta,
+      getAgentContext: jest.fn(
+        (): Partial<AgentContext> => ({
+          provider: Providers.GOOGLE,
+          reasoningKey: 'reasoning',
+          currentTokenType: ContentTypes.TEXT,
+          toolDefinitions: [],
+          graphTools: [],
+          agentId: 'agent_1',
+        })
+      ) as unknown as StandardGraph['getAgentContext'],
+    });
+    const handler = new ChatModelStreamHandler();
+    const metadata = { langgraph_node: 'agent' };
+    const toolCallPart: t.MessageContentComplex = {
+      type: 'toolCall',
+      toolCall: {
+        id: 'server-search-1',
+        name: 'google_search',
+        args: {},
+      },
+    };
+    const textPart: t.MessageContentComplex = {
+      type: ContentTypes.TEXT,
+      text: 'Search complete.',
+    };
+    const toolResponsePart: t.MessageContentComplex = {
+      type: 'toolResponse',
+      toolResponse: {
+        id: 'server-search-1',
+        name: 'google_search',
+        response: { results: [] },
+      },
+    };
+
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: [toolCallPart, textPart, toolResponsePart],
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+
+    expect(dispatchMessageDelta).toHaveBeenCalledTimes(3);
+    expect(dispatchMessageDelta).toHaveBeenNthCalledWith(
+      1,
+      expect.stringMatching(/^step_/),
+      { content: [toolCallPart] },
+      metadata
+    );
+    expect(dispatchMessageDelta).toHaveBeenNthCalledWith(
+      2,
+      expect.stringMatching(/^step_/),
+      { content: [textPart] },
+      metadata
+    );
+    expect(dispatchMessageDelta).toHaveBeenNthCalledWith(
+      3,
+      expect.stringMatching(/^step_/),
+      { content: [toolResponsePart] },
+      metadata
+    );
+  });
+
+  it('dispatches Gemini server-side tool context onto message steps after tool chunks', async () => {
+    const messageDeltas: Array<{
+      id: string;
+      delta: t.MessageDelta;
+    }> = [];
+    const dispatchMessageDelta = jest.fn<StandardGraph['dispatchMessageDelta']>(
+      async (id, delta) => {
+        messageDeltas.push({
+          id,
+          delta,
+        });
+      }
+    );
+    const graph = createGraph({
+      dispatchMessageDelta,
+      getAgentContext: jest.fn(
+        (): Partial<AgentContext> => ({
+          provider: Providers.GOOGLE,
+          reasoningKey: 'reasoning',
+          currentTokenType: ContentTypes.TEXT,
+          toolDefinitions: [{ name: 'weather' }],
+          graphTools: [],
+          agentId: 'agent_1',
+        })
+      ) as unknown as StandardGraph['getAgentContext'],
+    });
+    const handler = new ChatModelStreamHandler();
+    const metadata = { langgraph_node: 'agent' };
+    const toolCallPart: t.MessageContentComplex = {
+      type: 'toolCall',
+      toolCall: {
+        id: 'server-search-1',
+        name: 'google_search',
+        args: {},
+      },
+    };
+
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: [toolCallPart],
+          tool_call_chunks: [
+            {
+              id: 'call_weather',
+              name: 'weather',
+              args: '{"city":"NYC"}',
+              index: 0,
+            },
+          ],
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+
+    expect(dispatchMessageDelta).toHaveBeenCalledTimes(1);
+    expect(graph.getRunStep(messageDeltas[0]?.id ?? '')?.type).toBe(
+      StepTypes.MESSAGE_CREATION
+    );
+    expect(messageDeltas[0]?.delta).toEqual({ content: [toolCallPart] });
+  });
+
+  it('dispatches Gemini server-side tool context when reasoning is present', async () => {
+    const dispatchMessageDelta = jest.fn<StandardGraph['dispatchMessageDelta']>(
+      async () => undefined
+    );
+    const dispatchReasoningDelta = jest.fn<
+      StandardGraph['dispatchReasoningDelta']
+    >(async () => undefined);
+    const graph = createGraph({
+      dispatchMessageDelta,
+      dispatchReasoningDelta,
+      getAgentContext: jest.fn(
+        (): Partial<AgentContext> => ({
+          provider: Providers.GOOGLE,
+          reasoningKey: 'reasoning',
+          currentTokenType: ContentTypes.TEXT,
+          toolDefinitions: [],
+          graphTools: [],
+          agentId: 'agent_1',
+        })
+      ) as unknown as StandardGraph['getAgentContext'],
+    });
+    const handler = new ChatModelStreamHandler();
+    const metadata = { langgraph_node: 'agent' };
+    const toolCallPart: t.MessageContentComplex = {
+      type: 'toolCall',
+      toolCall: {
+        id: 'server-search-1',
+        name: 'google_search',
+        args: {},
+      },
+    };
+
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: [toolCallPart],
+          additional_kwargs: {
+            reasoning: 'Need to search before answering.',
+          },
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+
+    expect(dispatchMessageDelta).toHaveBeenCalledTimes(1);
+    expect(dispatchMessageDelta).toHaveBeenCalledWith(
+      expect.stringMatching(/^step_/),
+      { content: [toolCallPart] },
+      metadata
+    );
+    expect(dispatchReasoningDelta).toHaveBeenCalledWith(
+      expect.stringMatching(/^step_/),
+      {
+        content: [
+          {
+            type: ContentTypes.THINK,
+            think: 'Need to search before answering.',
+          },
+        ],
+      },
+      metadata
+    );
+  });
+
+  it('dispatches Gemini server-side tool context before client tool calls in mixed chunks', async () => {
+    const dispatchOrder: string[] = [];
+    const dispatchMessageDelta = jest.fn<StandardGraph['dispatchMessageDelta']>(
+      async (_id, delta) => {
+        if (
+          delta.content?.some(
+            (contentPart) => contentPart.type === 'toolCall'
+          ) === true
+        ) {
+          dispatchOrder.push('server-context');
+        }
+      }
+    );
+    const graph = createGraph({
+      dispatchMessageDelta,
+      getAgentContext: jest.fn(
+        (): Partial<AgentContext> => ({
+          provider: Providers.GOOGLE,
+          reasoningKey: 'reasoning',
+          currentTokenType: ContentTypes.TEXT,
+          toolDefinitions: [{ name: 'weather' }],
+          graphTools: [],
+          agentId: 'agent_1',
+        })
+      ) as unknown as StandardGraph['getAgentContext'],
+    });
+    const dispatchRunStep = graph.dispatchRunStep.bind(graph);
+    graph.dispatchRunStep = jest.fn<StandardGraph['dispatchRunStep']>(
+      async (stepKey, stepDetails, metadata) => {
+        const stepId = await dispatchRunStep(stepKey, stepDetails, metadata);
+        if ((stepDetails as t.StepDetails).type === StepTypes.TOOL_CALLS) {
+          dispatchOrder.push('client-tool-calls');
+        }
+        return stepId;
+      }
+    );
+    const handler = new ChatModelStreamHandler();
+    const metadata = { langgraph_node: 'agent' };
+    const toolCallPart: t.MessageContentComplex = {
+      type: 'toolCall',
+      toolCall: {
+        id: 'server-search-1',
+        name: 'google_search',
+        args: {},
+      },
+    };
+
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: [toolCallPart],
+          tool_calls: [
+            {
+              type: ToolCallTypes.TOOL_CALL,
+              id: 'call_weather',
+              name: 'weather',
+              args: { city: 'NYC' },
+            },
+          ],
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+
+    expect(dispatchOrder).toEqual(['server-context', 'client-tool-calls']);
+  });
+
+  it('does not dispatch Gemini server-side tool context blocks for non-Google providers', async () => {
+    const dispatchMessageDelta = jest.fn<StandardGraph['dispatchMessageDelta']>(
+      async () => undefined
+    );
+    const graph = createGraph({
+      dispatchMessageDelta,
+      getAgentContext: jest.fn(
+        (): Partial<AgentContext> => ({
+          provider: Providers.OPENAI,
+          reasoningKey: 'reasoning_content',
+          currentTokenType: ContentTypes.TEXT,
+          toolDefinitions: [],
+          graphTools: [],
+          agentId: 'agent_1',
+        })
+      ) as unknown as StandardGraph['getAgentContext'],
+    });
+    const handler = new ChatModelStreamHandler();
+    const metadata = { langgraph_node: 'agent' };
+    const toolCallPart: t.MessageContentComplex = {
+      type: 'toolCall',
+      toolCall: {
+        id: 'server-search-1',
+        name: 'google_search',
+        args: {},
+      },
+    };
+
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: [toolCallPart],
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+
+    expect(dispatchMessageDelta).not.toHaveBeenCalled();
+  });
+
+  it('keeps separately streamed Gemini server-side tool context blocks on separate message steps', async () => {
+    const graph = createGraph({
+      getAgentContext: jest.fn(
+        (): Partial<AgentContext> => ({
+          provider: Providers.GOOGLE,
+          reasoningKey: 'reasoning',
+          currentTokenType: ContentTypes.TEXT,
+          toolDefinitions: [],
+          graphTools: [],
+          agentId: 'agent_1',
+        })
+      ) as unknown as StandardGraph['getAgentContext'],
+    });
+    const { contentParts } = attachContentAggregator(graph);
+    const handler = new ChatModelStreamHandler();
+    const metadata = { langgraph_node: 'agent' };
+    const toolCallPart: t.MessageContentComplex = {
+      type: 'toolCall',
+      toolCall: {
+        id: 'server-search-1',
+        name: 'google_search',
+        args: {},
+      },
+    };
+    const toolResponsePart: t.MessageContentComplex = {
+      type: 'toolResponse',
+      toolResponse: {
+        id: 'server-search-1',
+        name: 'google_search',
+        response: { results: [] },
+      },
+    };
+
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: [toolCallPart],
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: [toolResponsePart],
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: [
+            {
+              type: ContentTypes.TEXT,
+              text: 'Done',
+            },
+          ],
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: ' again.',
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+
+    expect(contentParts).toEqual([
+      toolCallPart,
+      toolResponsePart,
+      {
+        type: ContentTypes.TEXT,
+        text: 'Done again.',
+      },
+    ]);
   });
 
   it('processes a reused chunk object when its streamed payload changes', async () => {

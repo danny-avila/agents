@@ -29,7 +29,12 @@ import type {
 } from '@google/generative-ai';
 import type { ContentBlock } from '@langchain/core/messages';
 import { CustomChatGoogleGenerativeAI as ChatGoogleGenerativeAI } from './index';
-import { _FUNCTION_CALL_THOUGHT_SIGNATURES_MAP_KEY } from './utils/common';
+import {
+  convertMessageContentToParts,
+  convertResponseContentToChatGenerationChunk,
+  mapGenerateContentResultToChatResult,
+  _FUNCTION_CALL_THOUGHT_SIGNATURES_MAP_KEY,
+} from './utils/common';
 
 // Save the original value of the 'LANGCHAIN_CALLBACKS_BACKGROUND' environment variable
 const originalBackground = process.env.LANGCHAIN_CALLBACKS_BACKGROUND;
@@ -729,6 +734,173 @@ test('Invoke with JSON mode', async () => {
   expect(res.usage_metadata.total_tokens).toBe(
     res.usage_metadata.input_tokens + res.usage_metadata.output_tokens
   );
+});
+
+test('Includes server-side tool invocation config when enabled', () => {
+  const model = new ChatGoogleGenerativeAI({
+    apiKey: 'test-key',
+    model: 'gemini-3.5-flash',
+    includeServerSideToolInvocations: true,
+  });
+  const getWeather = {
+    name: 'get_weather',
+    description: 'Get the weather',
+  };
+
+  const request = model.invocationParams({
+    tools: [{ googleSearch: {} }, { functionDeclarations: [getWeather] }],
+  });
+
+  expect(request.toolConfig).toEqual(
+    expect.objectContaining({
+      includeServerSideToolInvocations: true,
+    })
+  );
+});
+
+test('Normalizes auto tool choice when server-side tool invocation config is enabled', () => {
+  const model = new ChatGoogleGenerativeAI({
+    apiKey: 'test-key',
+    model: 'gemini-3.5-flash',
+    includeServerSideToolInvocations: true,
+  });
+  const getWeather = {
+    name: 'get_weather',
+    description: 'Get the weather',
+  };
+
+  const request = model.invocationParams({
+    tools: [{ googleSearch: {} }, { functionDeclarations: [getWeather] }],
+    tool_choice: 'auto',
+  });
+  const toolConfig = request.toolConfig as
+    | {
+        includeServerSideToolInvocations?: boolean;
+        functionCallingConfig?: { mode?: string };
+      }
+    | undefined;
+
+  expect(toolConfig).toEqual(
+    expect.objectContaining({
+      includeServerSideToolInvocations: true,
+    })
+  );
+  expect(toolConfig?.functionCallingConfig?.mode).toBe('VALIDATED');
+});
+
+test('Preserves Gemini server-side tool context parts in history', () => {
+  const toolCallPart = {
+    type: 'toolCall',
+    agentId: 'agent_1',
+    groupId: 1,
+    thoughtSignature: 'signature-1',
+    toolCall: {
+      id: 'server-search-1',
+      name: 'google_search',
+      args: {},
+    },
+  } as const;
+  const toolResponsePart = {
+    type: 'toolResponse',
+    agentId: 'agent_1',
+    groupId: 1,
+    toolResponse: {
+      id: 'server-search-1',
+      name: 'google_search',
+      response: { results: [] },
+    },
+  } as const;
+  const message = new AIMessage({
+    content: [toolCallPart, toolResponsePart],
+  });
+
+  expect(convertMessageContentToParts(message, true, [])).toEqual([
+    {
+      toolCall: toolCallPart.toolCall,
+      thoughtSignature: 'signature-1',
+    },
+    {
+      toolResponse: toolResponsePart.toolResponse,
+    },
+  ]);
+});
+
+test('Preserves Gemini function-call ids in history', () => {
+  const aiMessage = new AIMessage({
+    content: '',
+    tool_calls: [
+      {
+        id: 'call_weather_1',
+        name: 'get_weather',
+        args: { city: 'NYC' },
+      },
+    ],
+  });
+  const toolMessage = new ToolMessage({
+    content: 'sunny',
+    name: 'get_weather',
+    tool_call_id: 'call_weather_1',
+  });
+
+  expect(convertMessageContentToParts(aiMessage, true, [])).toEqual([
+    {
+      functionCall: {
+        id: 'call_weather_1',
+        name: 'get_weather',
+        args: { city: 'NYC' },
+      },
+    },
+  ]);
+  expect(convertMessageContentToParts(toolMessage, true, [aiMessage])).toEqual([
+    {
+      functionResponse: {
+        id: 'call_weather_1',
+        name: 'get_weather',
+        response: { result: 'sunny' },
+      },
+    },
+  ]);
+});
+
+test('Preserves Gemini server-side tool context parts from responses', () => {
+  const toolCallPart = {
+    toolCall: {
+      id: 'server-search-1',
+      name: 'google_search',
+      args: {},
+    },
+  };
+  const toolResponsePart = {
+    toolResponse: {
+      id: 'server-search-1',
+      name: 'google_search',
+      response: { results: [] },
+    },
+  };
+  const response = {
+    candidates: [
+      {
+        content: {
+          role: 'model',
+          parts: [toolCallPart, toolResponsePart],
+        },
+      },
+    ],
+  } as unknown as Parameters<
+    typeof convertResponseContentToChatGenerationChunk
+  >[0];
+
+  const chunk = convertResponseContentToChatGenerationChunk(response, {
+    index: 0,
+  });
+  const result = mapGenerateContentResultToChatResult(response);
+
+  const expectedContent = [
+    { ...toolCallPart, type: 'toolCall' },
+    { ...toolResponsePart, type: 'toolResponse' },
+  ];
+  expect(chunk?.message.content).toEqual(expectedContent);
+  expect(result.generations[0].message.content).toEqual(expectedContent);
 });
 
 test('Supports tool_choice', async () => {

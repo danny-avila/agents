@@ -8,6 +8,7 @@ import type { OpenAIClient } from '@langchain/openai';
 import type * as t from '@/types';
 import { ContentTypes, GraphEvents, Providers, StepTypes } from '@/common';
 import { ChatModelStreamHandler, createContentAggregator } from '@/stream';
+import { toLangChainContent } from '@/messages/langchain';
 import { ChatOpenRouter } from '@/llm/openrouter';
 import { ModelEndHandler, ToolEndHandler } from '@/events';
 import { Run } from '@/run';
@@ -357,6 +358,124 @@ describe('StandardGraph final response reasoning fallback', () => {
       { type: ContentTypes.THINK, think: reasoningText },
       { type: ContentTypes.TEXT, text },
     ]);
+  });
+
+  it('emits final text from invoke-only Gemini server-side context responses', async () => {
+    const text = 'Search complete.';
+    const { contentParts, aggregateContent } = createContentAggregator();
+    const run = await Run.create<t.IState>({
+      runId: 'reasoning-fallback-gemini-server-side-context',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: Providers.GOOGLE,
+          disableStreaming: true,
+          streamUsage: false,
+        },
+      },
+      returnContent: true,
+      skipCleanup: true,
+      customHandlers: createReasoningHandlers(aggregateContent, []),
+    });
+
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+
+    const messageContent: t.MessageContentComplex[] = [
+      {
+        type: 'toolCall',
+        toolCall: {
+          id: 'server-search-1',
+          name: 'google_search',
+          args: {},
+        },
+      },
+      { type: ContentTypes.TEXT, text },
+      {
+        type: 'toolResponse',
+        toolResponse: {
+          id: 'server-search-1',
+          name: 'google_search',
+          response: { results: [] },
+        },
+      },
+    ];
+    run.Graph.overrideModel = new InvokeOnlyMessageModel(
+      new AIMessageChunk({
+        content: toLangChainContent(messageContent),
+      })
+    );
+
+    const finalContentParts = await run.processStream(
+      { messages: [new HumanMessage('search and answer')] },
+      {
+        ...config,
+        configurable: {
+          thread_id: 'reasoning-fallback-gemini-server-side-context',
+        },
+      }
+    );
+
+    expect(finalContentParts).toEqual(messageContent);
+    expect(contentParts).toEqual(messageContent);
+  });
+
+  it('does not preserve Gemini server-side context blocks for non-Google invoke fallbacks', async () => {
+    const text = 'Search complete.';
+    const { contentParts, aggregateContent } = createContentAggregator();
+    const run = await Run.create<t.IState>({
+      runId: 'reasoning-fallback-non-google-server-side-shape',
+      graphConfig: {
+        type: 'standard',
+        llmConfig,
+      },
+      returnContent: true,
+      skipCleanup: true,
+      customHandlers: createReasoningHandlers(aggregateContent, []),
+    });
+
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+
+    const messageContent: t.MessageContentComplex[] = [
+      {
+        type: 'toolCall',
+        toolCall: {
+          id: 'server-search-1',
+          name: 'google_search',
+          args: {},
+        },
+      },
+      { type: ContentTypes.TEXT, text },
+      {
+        type: 'toolResponse',
+        toolResponse: {
+          id: 'server-search-1',
+          name: 'google_search',
+          response: { results: [] },
+        },
+      },
+    ];
+    run.Graph.overrideModel = new InvokeOnlyMessageModel(
+      new AIMessageChunk({
+        content: toLangChainContent(messageContent),
+      })
+    );
+
+    const finalContentParts = await run.processStream(
+      { messages: [new HumanMessage('search and answer')] },
+      {
+        ...config,
+        configurable: {
+          thread_id: 'reasoning-fallback-non-google-server-side-shape',
+        },
+      }
+    );
+
+    expect(finalContentParts).toEqual(messageContent);
+    expect(contentParts).toEqual([]);
   });
 
   it('uses the final fallback for one-shot disableStreaming mixed chunks', async () => {
@@ -725,9 +844,7 @@ describe('StandardGraph final response reasoning fallback', () => {
       new AIMessageChunk({
         content: text,
         additional_kwargs: {
-          reasoning_details: [
-            { type: 'reasoning.text', text: reasoningText },
-          ],
+          reasoning_details: [{ type: 'reasoning.text', text: reasoningText }],
         },
       }),
     ]);
@@ -784,9 +901,7 @@ describe('StandardGraph final response reasoning fallback', () => {
       new AIMessageChunk({
         content: text,
         additional_kwargs: {
-          reasoning_details: [
-            { type: 'reasoning.text', text: reasoningText },
-          ],
+          reasoning_details: [{ type: 'reasoning.text', text: reasoningText }],
         },
       }),
     ]);
@@ -796,7 +911,8 @@ describe('StandardGraph final response reasoning fallback', () => {
       {
         ...config,
         configurable: {
-          thread_id: 'reasoning-fallback-openrouter-streamed-text-final-details',
+          thread_id:
+            'reasoning-fallback-openrouter-streamed-text-final-details',
         },
       }
     );
@@ -905,8 +1021,7 @@ describe('StandardGraph final response reasoning fallback', () => {
       {
         ...config,
         configurable: {
-          thread_id:
-            'reasoning-fallback-openrouter-text-before-reasoning-key',
+          thread_id: 'reasoning-fallback-openrouter-text-before-reasoning-key',
         },
       }
     );
@@ -956,9 +1071,7 @@ describe('StandardGraph final response reasoning fallback', () => {
       new AIMessageChunk({
         content: replayWithSuffix,
         additional_kwargs: {
-          reasoning_details: [
-            { type: 'reasoning.text', text: reasoningText },
-          ],
+          reasoning_details: [{ type: 'reasoning.text', text: reasoningText }],
         },
       }),
     ]);
@@ -1191,9 +1304,7 @@ describe('StandardGraph final response reasoning fallback', () => {
       new AIMessageChunk({
         content: replayWithSuffix,
         additional_kwargs: {
-          reasoning_details: [
-            { type: 'reasoning.text', text: reasoningText },
-          ],
+          reasoning_details: [{ type: 'reasoning.text', text: reasoningText }],
         },
       }),
     ]);
@@ -1203,8 +1314,7 @@ describe('StandardGraph final response reasoning fallback', () => {
       {
         ...config,
         configurable: {
-          thread_id:
-            'reasoning-fallback-openrouter-registered-handler-suffix',
+          thread_id: 'reasoning-fallback-openrouter-registered-handler-suffix',
         },
       }
     );
@@ -1241,12 +1351,8 @@ describe('StandardGraph final response reasoning fallback', () => {
       skipCleanup: true,
       customHandlers: {
         [GraphEvents.CHAT_MODEL_STREAM]: {
-          handle: (
-            _event: string,
-            data: t.StreamEventData
-          ): void => {
-            const content = (data.chunk as AIMessageChunk | undefined)
-              ?.content;
+          handle: (_event: string, data: t.StreamEventData): void => {
+            const content = (data.chunk as AIMessageChunk | undefined)?.content;
             if (typeof content === 'string' && content !== '') {
               observedTextChunks.push(content);
             }

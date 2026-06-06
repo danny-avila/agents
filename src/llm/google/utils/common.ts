@@ -48,6 +48,49 @@ export const _FUNCTION_CALL_THOUGHT_SIGNATURES_MAP_KEY =
 const DUMMY_SIGNATURE =
   'ErYCCrMCAdHtim9kOoOkrPiCNVsmlpMIKd7ZMxgiFbVQOkgp7nlLcDMzVsZwIzvuT7nQROivoXA72ccC2lSDvR0Gh7dkWaGuj7ctv6t7ZceHnecx0QYa+ix8tYpRfjhyWozQ49lWiws6+YGjCt10KRTyWsZ2h6O7iHTYJwKIRwGUHRKy/qK/6kFxJm5ML00gLq4D8s5Z6DBpp2ZlR+uF4G8jJgeWQgyHWVdx2wGYElaceVAc66tZdPQRdOHpWtgYSI1YdaXgVI8KHY3/EfNc2YqqMIulvkDBAnuMhkAjV9xmBa54Tq+ih3Im4+r3DzqhGqYdsSkhS0kZMwte4Hjs65dZzCw9lANxIqYi1DJ639WNPYihp/DCJCos7o+/EeSPJaio5sgWDyUnMGkY1atsJZ+m7pj7DD5tvQ==';
 
+type GoogleServerSideToolPart = Part & {
+  type?: 'toolCall' | 'toolResponse';
+  toolCall?: object;
+  toolResponse?: object;
+};
+
+type GoogleServerSideToolPartMetadata = {
+  thought?: boolean;
+  thoughtSignature?: string;
+};
+
+type GoogleFunctionCallWithId = FunctionCallPart['functionCall'] & {
+  id?: string;
+};
+
+type GoogleFunctionResponseWithId = {
+  name: string;
+  response: object;
+  id?: string;
+};
+
+function getGoogleFunctionId(id?: string): string | undefined {
+  return id != null && id !== '' ? id : undefined;
+}
+
+function createGoogleFunctionResponsePart({
+  name,
+  response,
+  id,
+}: {
+  name: string;
+  response: object;
+  id?: string;
+}): Part {
+  const functionId = getGoogleFunctionId(id);
+  const functionResponse: GoogleFunctionResponseWithId = {
+    name,
+    response,
+    ...(functionId != null ? { id: functionId } : {}),
+  };
+  return { functionResponse };
+}
+
 /**
  * Executes a function immediately and returns its result.
  * Functional utility similar to an Immediately Invoked Function Expression (IIFE).
@@ -116,6 +159,63 @@ function messageContentMedia(content: MessageContentComplex): Part {
   }
 
   throw new Error('Invalid media content');
+}
+
+function isGoogleServerSideToolPart(
+  content: MessageContentComplex
+): content is MessageContentComplex & GoogleServerSideToolPart {
+  return (
+    'toolCall' in content ||
+    'toolResponse' in content ||
+    content.type === 'toolCall' ||
+    content.type === 'toolResponse'
+  );
+}
+
+function convertGoogleServerSideToolPart(
+  content: MessageContentComplex & GoogleServerSideToolPart
+): Part {
+  const metadata: GoogleServerSideToolPartMetadata = {};
+  if ('thought' in content && typeof content.thought === 'boolean') {
+    metadata.thought = content.thought;
+  }
+  if (
+    'thoughtSignature' in content &&
+    typeof content.thoughtSignature === 'string'
+  ) {
+    metadata.thoughtSignature = content.thoughtSignature;
+  }
+  if ('toolCall' in content && content.toolCall != null) {
+    return { toolCall: content.toolCall, ...metadata } as unknown as Part;
+  }
+  if ('toolResponse' in content && content.toolResponse != null) {
+    return {
+      toolResponse: content.toolResponse,
+      ...metadata,
+    } as unknown as Part;
+  }
+
+  return content as Part;
+}
+
+function convertGoogleServerSideToolResponsePart(
+  part: Part
+): GoogleServerSideToolPart | undefined {
+  if (
+    'toolCall' in part &&
+    typeof part.toolCall === 'object' &&
+    part.toolCall != null
+  ) {
+    return { ...part, type: 'toolCall', toolCall: part.toolCall };
+  }
+  if (
+    'toolResponse' in part &&
+    typeof part.toolResponse === 'object' &&
+    part.toolResponse != null
+  ) {
+    return { ...part, type: 'toolResponse', toolResponse: part.toolResponse };
+  }
+  return undefined;
 }
 
 function inferToolNameFromPreviousMessages(
@@ -280,6 +380,10 @@ function _convertLangChainContentToPart(
     );
   }
 
+  if (isGoogleServerSideToolPart(content)) {
+    return convertGoogleServerSideToolPart(content);
+  }
+
   if (content.type === 'text') {
     return { text: content.text };
   } else if (content.type === 'executableCode') {
@@ -375,25 +479,23 @@ export function convertMessageContentToParts(
 
     if (message.status === 'error') {
       return [
-        {
-          functionResponse: {
-            name: messageName,
-            // The API expects an object with an `error` field if the function call fails.
-            // `error` must be a valid object (not a string or array), so we wrap `message.content` here
-            response: { error: { details: result } },
-          },
-        },
+        createGoogleFunctionResponsePart({
+          name: messageName,
+          // The API expects an object with an `error` field if the function call fails.
+          // `error` must be a valid object (not a string or array), so we wrap `message.content` here
+          response: { error: { details: result } },
+          id: message.tool_call_id,
+        }),
       ];
     }
 
     return [
-      {
-        functionResponse: {
-          name: messageName,
-          // again, can't have a string or array value for `response`, so we wrap it as an object here
-          response: { result },
-        },
-      },
+      createGoogleFunctionResponsePart({
+        name: messageName,
+        // again, can't have a string or array value for `response`, so we wrap it as an object here
+        response: { result },
+        id: message.tool_call_id,
+      }),
     ];
   }
 
@@ -432,12 +534,15 @@ export function convertMessageContentToParts(
         }
         return '';
       });
+      const functionId = getGoogleFunctionId(tc.id);
+      const functionCall: GoogleFunctionCallWithId = {
+        name: tc.name,
+        args: tc.args,
+        ...(functionId != null ? { id: functionId } : {}),
+      };
 
       return {
-        functionCall: {
-          name: tc.name,
-          args: tc.args,
-        },
+        functionCall,
         ...(thoughtSignature ? { thoughtSignature } : {}),
       };
     });
@@ -598,6 +703,10 @@ export function convertResponseContentToChatGenerationChunk(
               codeExecutionResult: p.codeExecutionResult,
             };
           }
+          const serverSideToolPart = convertGoogleServerSideToolResponsePart(p);
+          if (serverSideToolPart !== undefined) {
+            return serverSideToolPart;
+          }
           return p;
         })
         .filter((p) => p !== undefined)
@@ -685,11 +794,7 @@ export function mapGenerateContentResultToChatResult(
     usageMetadata: UsageMetadata | undefined;
   }
 ): ChatResult {
-  if (
-    !response.candidates ||
-    response.candidates.length === 0 ||
-    !response.candidates[0]
-  ) {
+  if (!response.candidates || response.candidates.length === 0) {
     return {
       generations: [],
       llmOutput: {
@@ -725,7 +830,7 @@ export function mapGenerateContentResultToChatResult(
   if (
     Array.isArray(candidateContent?.parts) &&
     candidateContent.parts.length === 1 &&
-    candidateContent.parts[0].text &&
+    (candidateContent.parts[0].text ?? '') !== '' &&
     !(
       'thought' in candidateContent.parts[0] &&
       candidateContent.parts[0].thought === true
@@ -757,6 +862,10 @@ export function mapGenerateContentResultToChatResult(
               type: 'codeExecutionResult',
               codeExecutionResult: p.codeExecutionResult,
             };
+          }
+          const serverSideToolPart = convertGoogleServerSideToolResponsePart(p);
+          if (serverSideToolPart !== undefined) {
+            return serverSideToolPart;
           }
           return p;
         })
@@ -807,7 +916,7 @@ export function mapGenerateContentResultToChatResult(
   const generation: ChatGeneration = {
     text,
     message: new AIMessage({
-      content: content ?? '',
+      content,
       tool_calls,
       additional_kwargs,
       usage_metadata: extra?.usageMetadata,
