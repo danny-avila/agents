@@ -3,7 +3,7 @@ import type * as t from './types';
 
 const DEFAULT_TAVILY_TIMEOUT = 15000;
 
-const TAVILY_COUNTRY_ALIASES: Record<string, string> = {
+const TAVILY_COUNTRY_ALIASES: Partial<Record<string, string>> = {
   ba: 'bosnia and herzegovina',
   cg: 'congo',
   cz: 'czech republic',
@@ -319,7 +319,7 @@ export const createTavilyAPI = (
       if (tavilyCountry != null) {
         payload.country = tavilyCountry;
       }
-      if (type === 'images' || options?.includeImages) {
+      if (type === 'images' || options?.includeImages === true) {
         payload.include_images = true;
       }
       if (options?.includeAnswer != null) {

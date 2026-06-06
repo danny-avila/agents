@@ -1,6 +1,13 @@
 import axios from 'axios';
 import type * as t from './types';
-import { createDefaultLogger } from './utils';
+import { createDefaultLogger, formatErrorForLog } from './utils';
+
+const DEFAULT_JINA_API_URL = 'https://api.jina.ai/v1/rerank';
+
+const getDefaultJinaApiUrl = (): string =>
+  process.env.JINA_API_URL != null && process.env.JINA_API_URL !== ''
+    ? process.env.JINA_API_URL
+    : DEFAULT_JINA_API_URL;
 
 export abstract class BaseReranker {
   protected apiKey: string | undefined;
@@ -32,7 +39,7 @@ export class JinaReranker extends BaseReranker {
 
   constructor({
     apiKey = process.env.JINA_API_KEY,
-    apiUrl = process.env.JINA_API_URL || 'https://api.jina.ai/v1/rerank',
+    apiUrl = getDefaultJinaApiUrl(),
     logger,
   }: {
     apiKey?: string;
@@ -107,7 +114,7 @@ export class JinaReranker extends BaseReranker {
         return this.getDefaultRanking(documents, topK);
       }
     } catch (error) {
-      this.logger.error('Error using Jina reranker:', error);
+      this.logger.error('Error using Jina reranker', formatErrorForLog(error));
       // Fallback to default ranking on error
       return this.getDefaultRanking(documents, topK);
     }
@@ -174,7 +181,10 @@ export class CohereReranker extends BaseReranker {
         return this.getDefaultRanking(documents, topK);
       }
     } catch (error) {
-      this.logger.error('Error using Cohere reranker:', error);
+      this.logger.error(
+        'Error using Cohere reranker',
+        formatErrorForLog(error)
+      );
       // Fallback to default ranking on error
       return this.getDefaultRanking(documents, topK);
     }
