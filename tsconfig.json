@@ -6,6 +6,7 @@
     "target": "ESNext",
     "skipLibCheck": true,
     "strict": true,
+    "types": ["node", "jest"],
     "allowSyntheticDefaultImports": true,
     "resolveJsonModule": true,
     "sourceMap": true,
@@ -19,7 +20,7 @@
     "transpileOnly": true,
     "swc": true
   },
-  "include": ["src/**/*", "scripts/**/*"],
+  "include": ["src/**/*"],
   "exclude": [
     "node_modules",
     "**/*.spec.ts",
