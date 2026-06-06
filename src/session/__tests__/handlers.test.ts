@@ -1,8 +1,8 @@
+import type { AgentSessionStreamEvent } from '@/session';
+import type * as t from '@/types';
 import { ContentTypes, GraphEvents, StepTypes } from '@/common';
 import { composeEventHandlers } from '@/events';
 import { createRunHandlers } from '@/session';
-import type { AgentSessionStreamEvent } from '@/session';
-import type * as t from '@/types';
 
 describe('createRunHandlers', () => {
   it('emits live session events through the same graph handlers before user handlers', async () => {

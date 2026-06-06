@@ -4,11 +4,6 @@ import type { ToolCall } from '@langchain/core/messages/tool';
 import type { ProgrammaticToolCallingJsonSchema } from './ptcTimeout';
 import type * as t from '@/types';
 import {
-  makeRequest,
-  executeTools,
-  formatCompletedResponse,
-} from './ProgrammaticToolCalling';
-import {
   BASH_SHELL_GUIDANCE,
   CODE_ARTIFACT_PATH_GUIDANCE,
   appendFailedExecutionFileReminder,
@@ -19,6 +14,11 @@ import {
   createCodeApiRunTimeoutSchema,
   resolveCodeApiRunTimeoutMs,
 } from './ptcTimeout';
+import {
+  makeRequest,
+  executeTools,
+  formatCompletedResponse,
+} from './ProgrammaticToolCalling';
 import { Constants } from '@/common';
 
 config();

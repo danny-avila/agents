@@ -3,6 +3,11 @@ import type { AgentContext } from '@/agents/AgentContext';
 import type { StandardGraph } from '@/graphs';
 import type * as t from '@/types';
 import {
+  STREAMED_TOOL_CALL_SEAL_METADATA_KEY,
+  STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY,
+  OPENAI_RESPONSES_STREAMED_TOOL_CALL_ADAPTER,
+} from '@/tools/streamedToolCallSeals';
+import {
   Constants,
   ContentTypes,
   GraphEvents,
@@ -10,14 +15,9 @@ import {
   StepTypes,
   ToolCallTypes,
 } from '@/common';
+import { ChatModelStreamHandler, createContentAggregator } from '@/stream';
 import { HandlerRegistry } from '@/events';
 import * as events from '@/utils/events';
-import { ChatModelStreamHandler, createContentAggregator } from '@/stream';
-import {
-  STREAMED_TOOL_CALL_SEAL_METADATA_KEY,
-  STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY,
-  OPENAI_RESPONSES_STREAMED_TOOL_CALL_ADAPTER,
-} from '@/tools/streamedToolCallSeals';
 
 function createGraph(overrides: Partial<StandardGraph> = {}): StandardGraph {
   const runSteps = new Map<string, t.RunStep>();

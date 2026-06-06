@@ -1,13 +1,13 @@
 import { HumanMessage } from '@langchain/core/messages';
 import type { TPayload } from '@/types';
-import { formatAgentMessages } from './format';
 import { ContentTypes, Constants } from '@/common';
+import { formatAgentMessages } from './format';
 
 /** Helper to build a skill tool_call content part */
 function skillToolCall(
   id: string,
   skillName: string,
-  output = 'Skill loaded.',
+  output = 'Skill loaded.'
 ): Record<string, unknown> {
   return {
     type: ContentTypes.TOOL_CALL,
@@ -45,15 +45,24 @@ describe('formatAgentMessages skill body reconstruction', () => {
         },
       ];
 
-      const { messages } = formatAgentMessages(payload, undefined, tools, skillBodies);
+      const { messages } = formatAgentMessages(
+        payload,
+        undefined,
+        tools,
+        skillBodies
+      );
 
       // user, AI, ToolMessage, injected HumanMessage
       expect(messages.length).toBeGreaterThanOrEqual(4);
       const last = messages[messages.length - 1];
       expect(last).toBeInstanceOf(HumanMessage);
-      expect(last.content).toBe('# PDF Analyzer\nAnalyze PDF files step by step.');
+      expect(last.content).toBe(
+        '# PDF Analyzer\nAnalyze PDF files step by step.'
+      );
       expect((last as HumanMessage).additional_kwargs.source).toBe('skill');
-      expect((last as HumanMessage).additional_kwargs.skillName).toBe('pdf-analyzer');
+      expect((last as HumanMessage).additional_kwargs.skillName).toBe(
+        'pdf-analyzer'
+      );
       expect((last as HumanMessage).additional_kwargs.isMeta).toBe(true);
     });
 
@@ -67,7 +76,12 @@ describe('formatAgentMessages skill body reconstruction', () => {
         },
       ];
 
-      const { messages } = formatAgentMessages(payload, undefined, restrictedTools, skillBodies);
+      const { messages } = formatAgentMessages(
+        payload,
+        undefined,
+        restrictedTools,
+        skillBodies
+      );
 
       const humanMessages = messages.filter((m) => m instanceof HumanMessage);
       // Only the user message, no injected skill body
@@ -83,7 +97,12 @@ describe('formatAgentMessages skill body reconstruction', () => {
         },
       ];
 
-      const { messages } = formatAgentMessages(payload, undefined, tools, skillBodies);
+      const { messages } = formatAgentMessages(
+        payload,
+        undefined,
+        tools,
+        skillBodies
+      );
 
       const humanMessages = messages.filter((m) => m instanceof HumanMessage);
       expect(humanMessages).toHaveLength(1); // only the user message
@@ -100,13 +119,22 @@ describe('formatAgentMessages skill body reconstruction', () => {
         },
       ];
 
-      const { messages } = formatAgentMessages(payload, undefined, undefined, skillBodies);
+      const { messages } = formatAgentMessages(
+        payload,
+        undefined,
+        undefined,
+        skillBodies
+      );
 
       const injected = messages.filter(
-        (m) => m instanceof HumanMessage && (m as HumanMessage).additional_kwargs?.source === 'skill',
+        (m) =>
+          m instanceof HumanMessage &&
+          (m as HumanMessage).additional_kwargs.source === 'skill'
       );
       expect(injected).toHaveLength(1);
-      expect(injected[0].content).toBe('# Code Review\nReview the code for issues.');
+      expect(injected[0].content).toBe(
+        '# Code Review\nReview the code for issues.'
+      );
     });
 
     it('no injection when skills Map is undefined', () => {
@@ -118,10 +146,17 @@ describe('formatAgentMessages skill body reconstruction', () => {
         },
       ];
 
-      const { messages } = formatAgentMessages(payload, undefined, undefined, undefined);
+      const { messages } = formatAgentMessages(
+        payload,
+        undefined,
+        undefined,
+        undefined
+      );
 
       const injected = messages.filter(
-        (m) => m instanceof HumanMessage && (m as HumanMessage).additional_kwargs?.source === 'skill',
+        (m) =>
+          m instanceof HumanMessage &&
+          (m as HumanMessage).additional_kwargs.source === 'skill'
       );
       expect(injected).toHaveLength(0);
     });
@@ -135,10 +170,17 @@ describe('formatAgentMessages skill body reconstruction', () => {
         },
       ];
 
-      const { messages } = formatAgentMessages(payload, undefined, undefined, new Map());
+      const { messages } = formatAgentMessages(
+        payload,
+        undefined,
+        undefined,
+        new Map()
+      );
 
       const injected = messages.filter(
-        (m) => m instanceof HumanMessage && (m as HumanMessage).additional_kwargs?.source === 'skill',
+        (m) =>
+          m instanceof HumanMessage &&
+          (m as HumanMessage).additional_kwargs.source === 'skill'
       );
       expect(injected).toHaveLength(0);
     });
@@ -166,10 +208,17 @@ describe('formatAgentMessages skill body reconstruction', () => {
         },
       ];
 
-      const { messages } = formatAgentMessages(payload, undefined, tools, skillBodies);
+      const { messages } = formatAgentMessages(
+        payload,
+        undefined,
+        tools,
+        skillBodies
+      );
 
       const injected = messages.filter(
-        (m) => m instanceof HumanMessage && (m as HumanMessage).additional_kwargs?.source === 'skill',
+        (m) =>
+          m instanceof HumanMessage &&
+          (m as HumanMessage).additional_kwargs.source === 'skill'
       );
       expect(injected).toHaveLength(1);
     });
@@ -193,10 +242,17 @@ describe('formatAgentMessages skill body reconstruction', () => {
         },
       ];
 
-      const { messages } = formatAgentMessages(payload, undefined, tools, skillBodies);
+      const { messages } = formatAgentMessages(
+        payload,
+        undefined,
+        tools,
+        skillBodies
+      );
 
       const injected = messages.filter(
-        (m) => m instanceof HumanMessage && (m as HumanMessage).additional_kwargs?.source === 'skill',
+        (m) =>
+          m instanceof HumanMessage &&
+          (m as HumanMessage).additional_kwargs.source === 'skill'
       );
       expect(injected).toHaveLength(0); // gracefully skipped
     });
@@ -220,10 +276,17 @@ describe('formatAgentMessages skill body reconstruction', () => {
         },
       ];
 
-      const { messages } = formatAgentMessages(payload, undefined, tools, skillBodies);
+      const { messages } = formatAgentMessages(
+        payload,
+        undefined,
+        tools,
+        skillBodies
+      );
 
       const injected = messages.filter(
-        (m) => m instanceof HumanMessage && (m as HumanMessage).additional_kwargs?.source === 'skill',
+        (m) =>
+          m instanceof HumanMessage &&
+          (m as HumanMessage).additional_kwargs.source === 'skill'
       );
       expect(injected).toHaveLength(0);
     });
@@ -244,10 +307,17 @@ describe('formatAgentMessages skill body reconstruction', () => {
         },
       ];
 
-      const { messages } = formatAgentMessages(payload, undefined, tools, skillBodies);
+      const { messages } = formatAgentMessages(
+        payload,
+        undefined,
+        tools,
+        skillBodies
+      );
 
       const injected = messages.filter(
-        (m) => m instanceof HumanMessage && (m as HumanMessage).additional_kwargs?.source === 'skill',
+        (m) =>
+          m instanceof HumanMessage &&
+          (m as HumanMessage).additional_kwargs.source === 'skill'
       );
       expect(injected).toHaveLength(1);
     });
@@ -264,13 +334,22 @@ describe('formatAgentMessages skill body reconstruction', () => {
         },
       ];
 
-      const { messages } = formatAgentMessages(payload, undefined, tools, skillBodies);
+      const { messages } = formatAgentMessages(
+        payload,
+        undefined,
+        tools,
+        skillBodies
+      );
 
       const injected = messages.filter(
-        (m) => m instanceof HumanMessage && (m as HumanMessage).additional_kwargs?.source === 'skill',
+        (m) =>
+          m instanceof HumanMessage &&
+          (m as HumanMessage).additional_kwargs.source === 'skill'
       );
       expect(injected).toHaveLength(2);
-      const names = injected.map((m) => (m as HumanMessage).additional_kwargs.skillName);
+      const names = injected.map(
+        (m) => (m as HumanMessage).additional_kwargs.skillName
+      );
       expect(names).toContain('pdf-analyzer');
       expect(names).toContain('code-review');
     });
@@ -304,7 +383,7 @@ describe('formatAgentMessages skill body reconstruction', () => {
         payload,
         inputTokenMap,
         tools,
-        skillBodies,
+        skillBodies
       );
 
       // There should be messages: user, AI, ToolMessage, injected HumanMessage

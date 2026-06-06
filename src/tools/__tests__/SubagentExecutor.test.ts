@@ -1,10 +1,6 @@
 import { describe, it, expect, beforeEach } from '@jest/globals';
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
-import { HookRegistry } from '@/hooks/HookRegistry';
-import { Providers, GraphEvents, StepTypes } from '@/common';
-import { HandlerRegistry } from '@/events';
-import { AgentContext } from '@/agents/AgentContext';
 import type {
   AgentInputs,
   ResolvedSubagentConfig,
@@ -12,6 +8,7 @@ import type {
   ToolExecuteBatchRequest,
   ToolExecuteResult,
 } from '@/types';
+import type { StandardGraph } from '@/graphs/Graph';
 import {
   SubagentExecutor,
   filterSubagentResult,
@@ -20,7 +17,10 @@ import {
   summarizeEvent,
 } from '../subagent';
 import { sanitizeForwardedSubagentUpdateData } from '../subagent/SubagentExecutor';
-import type { StandardGraph } from '@/graphs/Graph';
+import { Providers, GraphEvents, StepTypes } from '@/common';
+import { AgentContext } from '@/agents/AgentContext';
+import { HookRegistry } from '@/hooks/HookRegistry';
+import { HandlerRegistry } from '@/events';
 
 jest.setTimeout(15000);
 
@@ -635,7 +635,10 @@ describe('SubagentExecutor', () => {
 
       const invokeConfig = getInvokeConfig();
       expect(invokeConfig).toBeDefined();
-      const configurable = invokeConfig!.configurable as Record<string, unknown>;
+      const configurable = invokeConfig!.configurable as Record<
+        string,
+        unknown
+      >;
       expect(configurable.requestBody).toEqual({
         messageId: 'msg-123',
         conversationId: 'conv-456',
@@ -1183,11 +1186,13 @@ describe('SubagentExecutor', () => {
         handle: (_event, rawData): void => {
           const request = rawData as ToolExecuteBatchRequest;
           toolRequests.push(request);
-          const results: ToolExecuteResult[] = request.toolCalls.map((call) => ({
-            toolCallId: call.id,
-            status: 'success',
-            content: `ran ${call.name}`,
-          }));
+          const results: ToolExecuteResult[] = request.toolCalls.map(
+            (call) => ({
+              toolCallId: call.id,
+              status: 'success',
+              content: `ran ${call.name}`,
+            })
+          );
           request.resolve(results);
         },
       });
@@ -1268,8 +1273,7 @@ describe('SubagentExecutor', () => {
 
       const toolUpdate = subagentUpdates.find(
         (update) =>
-          update.phase === 'run_step' &&
-          update.label === 'Calling calculator'
+          update.phase === 'run_step' && update.label === 'Calling calculator'
       );
       expect(toolUpdate?.data).toEqual({
         agentId: 'researcher',

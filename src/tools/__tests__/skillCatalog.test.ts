@@ -1,6 +1,6 @@
 import { describe, it, expect } from '@jest/globals';
-import { formatSkillCatalog } from '../skillCatalog';
 import type { SkillCatalogEntry } from '@/types';
+import { formatSkillCatalog } from '../skillCatalog';
 
 describe('formatSkillCatalog', () => {
   it('returns empty string for empty array', () => {

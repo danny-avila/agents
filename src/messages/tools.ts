@@ -1,8 +1,8 @@
 // src/messages/toolDiscovery.ts
 import { AIMessageChunk, ToolMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
-import { Constants } from '@/common';
 import { findLastIndex } from './core';
+import { Constants } from '@/common';
 
 type ToolSearchArtifact = {
   tool_references?: Array<{ tool_name: string }>;

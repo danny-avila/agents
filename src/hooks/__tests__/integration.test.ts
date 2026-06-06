@@ -1,8 +1,5 @@
 // src/hooks/__tests__/integration.test.ts
 import { HumanMessage } from '@langchain/core/messages';
-import { HookRegistry } from '../HookRegistry';
-import { Run } from '@/run';
-import type * as t from '@/types';
 import type {
   HookCallback,
   RunStartHookInput,
@@ -12,7 +9,10 @@ import type {
   StopHookOutput,
   StopFailureHookOutput,
 } from '../types';
+import type * as t from '@/types';
+import { HookRegistry } from '../HookRegistry';
 import { Providers } from '@/common';
+import { Run } from '@/run';
 
 const llmConfig: t.LLMConfig = {
   provider: Providers.OPENAI,

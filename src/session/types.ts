@@ -1,6 +1,6 @@
 import type { RunnableConfig } from '@langchain/core/runnables';
-import type { BaseMessage } from '@langchain/core/messages';
 import type { BaseCheckpointSaver } from '@langchain/langgraph';
+import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
 
 export type JsonPrimitive = string | number | boolean | null;

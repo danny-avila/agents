@@ -1,8 +1,8 @@
 import { config } from 'dotenv';
 import fetch, { RequestInit } from 'node-fetch';
 import { HttpsProxyAgent } from 'https-proxy-agent';
-import { tool, DynamicStructuredTool } from '@langchain/core/tools';
 import { getEnvironmentVariable } from '@langchain/core/utils/env';
+import { tool, DynamicStructuredTool } from '@langchain/core/tools';
 import type * as t from '@/types';
 import { appendCodeSessionFileSummary } from '@/tools/CodeSessionFileSummary';
 import { EnvVar, Constants } from '@/common';
@@ -255,9 +255,7 @@ function createCodeExecutionTool(
           (error as Error | undefined)?.message ?? '',
           code
         );
-        throw new Error(
-          `Execution error:\n\n${messageWithReminder}`
-        );
+        throw new Error(`Execution error:\n\n${messageWithReminder}`);
       }
     },
     {

@@ -48,15 +48,15 @@
  */
 
 import { homedir } from 'os';
-import { isAbsolute, relative, resolve } from 'path';
 import { realpath } from 'fs/promises';
-import { Constants } from '@/common';
+import { isAbsolute, relative, resolve } from 'path';
 import type {
   HookCallback,
   PreToolUseHookInput,
   PreToolUseHookOutput,
   ToolDecision,
 } from './types';
+import { Constants } from '@/common';
 
 /**
  * What to do when a tool call references a path outside the workspace.
@@ -213,9 +213,7 @@ async function realpathOrSelf(absolutePath: string): Promise<string> {
   }
 }
 
-async function realpathOfPathOrAncestor(
-  absolutePath: string
-): Promise<string> {
+async function realpathOfPathOrAncestor(absolutePath: string): Promise<string> {
   let current = absolutePath;
   let suffix = '';
   // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
@@ -305,9 +303,7 @@ export function createWorkspacePolicyHook(
     const extractor = extractors[input.toolName];
     if (extractor == null) return { decision: 'allow' };
 
-    const paths = extractor(
-      (input.toolInput ?? {}) as Record<string, unknown>
-    );
+    const paths = extractor((input.toolInput ?? {}) as Record<string, unknown>);
     if (paths.length === 0) return { decision: 'allow' };
 
     // Two-stage check:

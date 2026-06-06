@@ -1,6 +1,6 @@
-import { ChatOpenRouter } from './index';
-import type { OpenRouterReasoning, ChatOpenRouterCallOptions } from './index';
 import type { OpenAIChatInput } from '@langchain/openai';
+import type { OpenRouterReasoning, ChatOpenRouterCallOptions } from './index';
+import { ChatOpenRouter } from './index';
 
 type CreateRouterOptions = Partial<
   ChatOpenRouterCallOptions &

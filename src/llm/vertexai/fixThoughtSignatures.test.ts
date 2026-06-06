@@ -1,6 +1,6 @@
 import { expect, test, describe } from '@jest/globals';
-import type { GeminiContent } from '@langchain/google-common';
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
+import type { GeminiContent } from '@langchain/google-common';
 import { fixThoughtSignatures } from './index';
 
 const SIG_A = 'AY89a1/sigA==';

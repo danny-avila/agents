@@ -1,5 +1,5 @@
 import { describe, it, expect } from '@jest/globals';
-import { Constants } from '@/common';
+import type { SubagentConfig } from '@/types';
 import {
   SubagentToolName,
   SubagentToolDescription,
@@ -8,7 +8,7 @@ import {
   createSubagentToolDefinition,
   buildSubagentToolParams,
 } from '../SubagentTool';
-import type { SubagentConfig } from '@/types';
+import { Constants } from '@/common';
 
 describe('SubagentTool', () => {
   describe('schema structure', () => {

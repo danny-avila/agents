@@ -1,15 +1,22 @@
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { mkdtemp, rm, writeFile } from 'fs/promises';
-import { describe, it, expect, beforeEach, afterEach, jest } from '@jest/globals';
-import { Constants } from '@/common';
-import { createLocalCodingToolBundle } from '../local/LocalCodingTools';
+import {
+  describe,
+  it,
+  expect,
+  beforeEach,
+  afterEach,
+  jest,
+} from '@jest/globals';
+import type { WorkspaceFS } from '../local/workspaceFS';
 import {
   resolveWorkspacePathSafe,
   getWorkspaceFS,
 } from '../local/LocalExecutionEngine';
+import { createLocalCodingToolBundle } from '../local/LocalCodingTools';
 import { nodeWorkspaceFS } from '../local/workspaceFS';
-import type { WorkspaceFS } from '../local/workspaceFS';
+import { Constants } from '@/common';
 
 describe('workspace seam', () => {
   let workspace: string;
@@ -97,10 +104,14 @@ describe('workspace seam', () => {
       // the real Node impl so the tool actually completes; the spy just
       // proves the seam.
       const tracked: WorkspaceFS = {
-        readFile: jest.fn(nodeWorkspaceFS.readFile) as unknown as WorkspaceFS['readFile'],
+        readFile: jest.fn(
+          nodeWorkspaceFS.readFile
+        ) as unknown as WorkspaceFS['readFile'],
         writeFile: jest.fn(nodeWorkspaceFS.writeFile),
         stat: jest.fn(nodeWorkspaceFS.stat),
-        readdir: jest.fn(nodeWorkspaceFS.readdir) as unknown as WorkspaceFS['readdir'],
+        readdir: jest.fn(
+          nodeWorkspaceFS.readdir
+        ) as unknown as WorkspaceFS['readdir'],
         mkdir: jest.fn(nodeWorkspaceFS.mkdir),
         realpath: jest.fn(nodeWorkspaceFS.realpath),
         unlink: jest.fn(nodeWorkspaceFS.unlink),
@@ -120,7 +131,9 @@ describe('workspace seam', () => {
       expect(tracked.writeFile).toHaveBeenCalled();
       expect(tracked.mkdir).toHaveBeenCalled();
 
-      const readTool = bundle.tools.find((t) => t.name === Constants.READ_FILE)!;
+      const readTool = bundle.tools.find(
+        (t) => t.name === Constants.READ_FILE
+      )!;
       await readTool.invoke({
         id: 'c2',
         name: Constants.READ_FILE,

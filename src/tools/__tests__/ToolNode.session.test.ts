@@ -4,9 +4,9 @@ import { AIMessage } from '@langchain/core/messages';
 import { describe, it, expect, jest, afterEach } from '@jest/globals';
 import type { StructuredToolInterface } from '@langchain/core/tools';
 import type * as t from '@/types';
+import * as events from '@/utils/events';
 import { ToolNode } from '../ToolNode';
 import { Constants } from '@/common';
-import * as events from '@/utils/events';
 
 /**
  * Creates a mock execute_code tool that captures the toolCall config it receives.

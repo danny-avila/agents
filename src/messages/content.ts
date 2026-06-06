@@ -1,5 +1,5 @@
-import { ContentTypes } from '@/common';
 import type { BaseMessage } from '@langchain/core/messages';
+import { ContentTypes } from '@/common';
 
 /**
  * Formats an array of messages for LangChain, making sure all content fields are strings

@@ -19,11 +19,11 @@ import type {
   AnthropicContextManagementConfigParam,
   AnthropicRequestOptions,
 } from '@/llm/anthropic/types';
-import { _makeMessageChunkFromAnthropicEvent } from './utils/message_outputs';
 import {
   _convertMessagesToAnthropicPayload,
   stripUnsupportedAssistantPrefill,
 } from './utils/message_inputs';
+import { _makeMessageChunkFromAnthropicEvent } from './utils/message_outputs';
 import { handleToolChoice } from './utils/tools';
 
 const DEFAULT_STREAM_DELAY = 25;

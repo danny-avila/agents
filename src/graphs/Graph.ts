@@ -11,6 +11,7 @@ import type {
   MessageContent,
 } from '@langchain/core/messages';
 import type { ToolCall } from '@langchain/core/messages/tool';
+import type { HookRegistry } from '@/hooks';
 import type * as t from '@/types';
 import {
   formatAnthropicArtifactContent,
@@ -29,12 +30,16 @@ import {
   partitionAndMarkAnthropicToolCache,
 } from '@/messages';
 import {
-  GraphNodeKeys,
-  ContentTypes,
-  GraphEvents,
-  Providers,
-  StepTypes,
-} from '@/common';
+  resolveLangfuseConfig,
+  shouldTraceToolNodeForLangfuse,
+  withLangfuseToolOutputTracingConfig,
+} from '@/langfuseToolOutputTracing';
+import {
+  createLangfuseHandler,
+  createLangfuseTraceMetadata,
+  disposeLangfuseHandler,
+  isLangfuseCallbackHandler,
+} from '@/langfuse';
 import {
   resetIfNotEmpty,
   isAnthropicLike,
@@ -43,46 +48,41 @@ import {
   joinKeys,
   sleep,
 } from '@/utils';
-import { SubagentExecutor, resolveSubagentConfigs } from '@/tools/subagent';
-import { buildSubagentToolParams } from '@/tools/SubagentTool';
-import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
-import { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
-import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
-import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
-import { shouldTriggerSummarization } from '@/summarization';
-import { createSummarizeNode } from '@/summarization/node';
-import { messagesStateReducer } from '@/messages/reducer';
+import {
+  GraphNodeKeys,
+  ContentTypes,
+  GraphEvents,
+  Providers,
+  StepTypes,
+} from '@/common';
 import {
   appendCallbacks,
   findCallback,
   type CallbackEntry,
 } from '@/utils/callbacks';
+import { partitionAndMarkOpenRouterToolCache } from '@/llm/openrouter/toolCache';
+import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
+import { createLocalCodingToolBundle } from '@/tools/local/LocalCodingTools';
+import { SubagentExecutor, resolveSubagentConfigs } from '@/tools/subagent';
+import { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
+import { partitionAndMarkBedrockToolCache } from '@/llm/bedrock/toolCache';
+import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
+import { createCloudflareCodingToolBundle } from '@/tools/cloudflare';
+import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
+import { buildSubagentToolParams } from '@/tools/SubagentTool';
+import { initializeLangfuseTracing } from '@/instrumentation';
+import { shouldTriggerSummarization } from '@/summarization';
+import { resolveLocalToolsForBinding } from '@/tools/local';
+import { createSummarizeNode } from '@/summarization/node';
+import { messagesStateReducer } from '@/messages/reducer';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { AgentContext } from '@/agents/AgentContext';
 import { createFakeStreamingLLM } from '@/llm/fake';
 import { handleToolCalls } from '@/tools/handlers';
-import { resolveLocalToolsForBinding } from '@/tools/local';
-import { createLocalCodingToolBundle } from '@/tools/local/LocalCodingTools';
-import { createCloudflareCodingToolBundle } from '@/tools/cloudflare';
 import { isThinkingEnabled } from '@/llm/request';
 import { initializeModel } from '@/llm/init';
-import {
-  createLangfuseHandler,
-  createLangfuseTraceMetadata,
-  disposeLangfuseHandler,
-  isLangfuseCallbackHandler,
-} from '@/langfuse';
-import { initializeLangfuseTracing } from '@/instrumentation';
-import {
-  resolveLangfuseConfig,
-  shouldTraceToolNodeForLangfuse,
-  withLangfuseToolOutputTracingConfig,
-} from '@/langfuseToolOutputTracing';
 import { HandlerRegistry } from '@/events';
 import { ChatOpenAI } from '@/llm/openai';
-import { partitionAndMarkOpenRouterToolCache } from '@/llm/openrouter/toolCache';
-import { partitionAndMarkBedrockToolCache } from '@/llm/bedrock/toolCache';
-import type { HookRegistry } from '@/hooks';
 
 const { AGENT, TOOLS, SUMMARIZE } = GraphNodeKeys;
 

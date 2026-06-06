@@ -5,7 +5,6 @@
  */
 import { describe, it, expect, jest, beforeEach } from '@jest/globals';
 import type * as t from '@/types';
-import { Constants } from '@/common';
 import {
   createProgrammaticToolCallingTool,
   createProgrammaticToolCallingSchema,
@@ -17,16 +16,17 @@ import {
   unwrapToolResponse,
 } from '../ProgrammaticToolCalling';
 import {
-  createBashProgrammaticToolCallingSchema,
-  normalizeBashToolResultsForReplay,
-} from '../BashProgrammaticToolCalling';
-import {
   createProgrammaticToolRegistry,
   createGetTeamMembersTool,
   createGetExpensesTool,
   createGetWeatherTool,
   createCalculatorTool,
 } from '@/test/mockTools';
+import {
+  createBashProgrammaticToolCallingSchema,
+  normalizeBashToolResultsForReplay,
+} from '../BashProgrammaticToolCalling';
+import { Constants } from '@/common';
 
 describe('ProgrammaticToolCalling', () => {
   describe('tool descriptions', () => {

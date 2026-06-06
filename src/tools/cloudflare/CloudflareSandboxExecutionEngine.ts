@@ -1,15 +1,15 @@
-import { EventEmitter } from 'events';
 import { PassThrough } from 'stream';
 import { posix as path } from 'path';
-import type { ChildProcessWithoutNullStreams } from 'child_process';
+import { EventEmitter } from 'events';
 import type { WriteFileOptions, MakeDirectoryOptions, Stats } from 'fs';
+import type { ChildProcessWithoutNullStreams } from 'child_process';
 import type { FileHandle } from 'fs/promises';
+import type { WorkspaceFS, ReaddirEntry } from '@/tools/local/workspaceFS';
 import type * as t from '@/types';
 import {
   LOCAL_SPAWN_TIMEOUT_MS,
   validateBashCommand,
 } from '@/tools/local/LocalExecutionEngine';
-import type { WorkspaceFS, ReaddirEntry } from '@/tools/local/workspaceFS';
 
 const DEFAULT_WORKSPACE_ROOT = '/workspace';
 const DEFAULT_TIMEOUT_MS = 60000;

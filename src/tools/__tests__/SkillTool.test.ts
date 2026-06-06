@@ -2,18 +2,18 @@ import { z } from 'zod';
 import { tool } from '@langchain/core/tools';
 import { describe, it, expect } from '@jest/globals';
 import { AIMessage, HumanMessage } from '@langchain/core/messages';
-import type { BaseMessage } from '@langchain/core/messages';
 import type { StructuredToolInterface } from '@langchain/core/tools';
+import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
-import * as events from '@/utils/events';
-import { ToolNode } from '../ToolNode';
-import { Constants } from '@/common';
 import {
   SkillToolDescription,
   SkillToolDefinition,
   SkillToolSchema,
   SkillToolName,
 } from '../SkillTool';
+import * as events from '@/utils/events';
+import { ToolNode } from '../ToolNode';
+import { Constants } from '@/common';
 
 describe('SkillTool', () => {
   describe('schema structure', () => {

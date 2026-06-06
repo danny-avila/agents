@@ -1,15 +1,6 @@
 // src/hooks/__tests__/toolHooks.test.ts
-import { ToolCall } from '@langchain/core/messages/tool';
 import { HumanMessage } from '@langchain/core/messages';
-import { HookRegistry } from '../HookRegistry';
-import { Run } from '@/run';
-import {
-  GraphEvents,
-  Providers,
-  ToolEndHandler,
-  ModelEndHandler,
-} from '@/index';
-import type * as t from '@/types';
+import { ToolCall } from '@langchain/core/messages/tool';
 import type {
   HookCallback,
   PreToolUseHookOutput,
@@ -21,6 +12,15 @@ import type {
   PostToolUseHookInput,
   PostToolUseFailureHookInput,
 } from '../types';
+import type * as t from '@/types';
+import {
+  GraphEvents,
+  Providers,
+  ToolEndHandler,
+  ModelEndHandler,
+} from '@/index';
+import { HookRegistry } from '../HookRegistry';
+import { Run } from '@/run';
 
 const llmConfig: t.LLMConfig = {
   provider: Providers.OPENAI,

@@ -1,11 +1,11 @@
-import { GraphEvents } from '@/common';
+import type * as t from '@/types';
 import {
   createChatCompletionChunk,
   createOpenAIHandlers,
   createOpenAIStreamTracker,
   sendOpenAIFinalChunk,
 } from '@/openai';
-import type * as t from '@/types';
+import { GraphEvents } from '@/common';
 
 describe('OpenAI-compatible adapters', () => {
   it('creates chunks and streams message deltas as SSE data', async () => {

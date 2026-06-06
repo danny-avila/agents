@@ -1,8 +1,4 @@
 import {
-  type FunctionDeclarationSchema as GenerativeAIFunctionDeclarationSchema,
-  type SchemaType as FunctionDeclarationSchemaType,
-} from '@google/generative-ai';
-import {
   InteropZodType,
   isInteropZodSchema,
 } from '@langchain/core/utils/types';
@@ -10,6 +6,10 @@ import {
   type JsonSchema7Type,
   toJsonSchema,
 } from '@langchain/core/utils/json_schema';
+import {
+  type FunctionDeclarationSchema as GenerativeAIFunctionDeclarationSchema,
+  type SchemaType as FunctionDeclarationSchemaType,
+} from '@google/generative-ai';
 
 export interface GenerativeAIJsonSchema extends Record<string, unknown> {
   properties?: Record<string, GenerativeAIJsonSchema>;

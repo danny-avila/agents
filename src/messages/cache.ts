@@ -6,11 +6,11 @@ import {
   SystemMessage,
   MessageContentComplex,
 } from '@langchain/core/messages';
-import type { AnthropicMessage } from '@/types/messages';
 import type Anthropic from '@anthropic-ai/sdk';
+import type { AnthropicMessage } from '@/types/messages';
+import { toLangChainContent } from './langchain';
 import { ContentTypes } from '@/common/enum';
 import { withMessageRole } from './format';
-import { toLangChainContent } from './langchain';
 
 type MessageWithContent = {
   content?: string | MessageContentComplex[];

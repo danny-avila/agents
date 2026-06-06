@@ -15,10 +15,10 @@
  * ```
  */
 
-import { GraphEvents } from '@/common';
+import type * as t from '@/types';
 import { ChatModelStreamHandler, createContentAggregator } from '@/stream';
 import { ToolEndHandler, ModelEndHandler } from '@/events';
-import type * as t from '@/types';
+import { GraphEvents } from '@/common';
 
 interface HandlerCallbacks {
   onRunStep?: (event: GraphEvents.ON_RUN_STEP, data: t.StreamEventData) => void;

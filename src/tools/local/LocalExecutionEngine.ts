@@ -1,14 +1,14 @@
 import { tmpdir } from 'os';
-import { isAbsolute, relative, resolve } from 'path';
-import { createHash, randomUUID } from 'crypto';
-import { mkdir, realpath, rm, writeFile } from 'fs/promises';
-import { createWriteStream } from 'fs';
 import { spawn } from 'child_process';
+import { createWriteStream } from 'fs';
+import { createHash, randomUUID } from 'crypto';
+import { isAbsolute, relative, resolve } from 'path';
+import { mkdir, realpath, rm, writeFile } from 'fs/promises';
 import type { ChildProcess } from 'child_process';
-import { runBashAstChecks, bashAstFindingsToErrors } from './bashAst';
-import { nodeWorkspaceFS } from './workspaceFS';
 import type { WorkspaceFS } from './workspaceFS';
 import type * as t from '@/types';
+import { runBashAstChecks, bashAstFindingsToErrors } from './bashAst';
+import { nodeWorkspaceFS } from './workspaceFS';
 
 const DEFAULT_TIMEOUT_MS = 60000;
 const DEFAULT_MAX_OUTPUT_CHARS = 200000;

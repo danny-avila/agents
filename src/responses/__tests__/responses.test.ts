@@ -1,11 +1,11 @@
-import { GraphEvents } from '@/common';
+import type * as t from '@/types';
 import {
   buildResponse,
   createResponseTracker,
   createResponsesEventHandlers,
   emitResponseCompleted,
 } from '@/responses';
-import type * as t from '@/types';
+import { GraphEvents } from '@/common';
 
 describe('Responses-compatible adapters', () => {
   it('streams semantic response events through a generic writer', async () => {

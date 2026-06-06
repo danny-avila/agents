@@ -1,16 +1,8 @@
-import {
-  POSSIBLE_ROLES,
-  type Part,
-  type Content,
-  type TextPart,
-  type FileDataPart,
-  type InlineDataPart,
-  type FunctionCallPart,
-  type GenerateContentCandidate,
-  type EnhancedGenerateContentResponse,
-  type FunctionDeclaration as GenerativeAIFunctionDeclaration,
-  type FunctionDeclarationsTool as GoogleGenerativeAIFunctionDeclarationsTool,
-} from '@google/generative-ai';
+import { v4 as uuidv4 } from 'uuid';
+import { ChatGenerationChunk } from '@langchain/core/outputs';
+import { ToolCallChunk } from '@langchain/core/messages/tool';
+import { isOpenAITool } from '@langchain/core/language_models/base';
+import { isLangChainTool } from '@langchain/core/utils/function_calling';
 import {
   AIMessage,
   AIMessageChunk,
@@ -29,18 +21,26 @@ import {
   convertToProviderContentBlock,
   isDataContentBlock,
 } from '@langchain/core/messages';
-import { ChatGenerationChunk } from '@langchain/core/outputs';
+import {
+  POSSIBLE_ROLES,
+  type Part,
+  type Content,
+  type TextPart,
+  type FileDataPart,
+  type InlineDataPart,
+  type FunctionCallPart,
+  type GenerateContentCandidate,
+  type EnhancedGenerateContentResponse,
+  type FunctionDeclaration as GenerativeAIFunctionDeclaration,
+  type FunctionDeclarationsTool as GoogleGenerativeAIFunctionDeclarationsTool,
+} from '@google/generative-ai';
 import type { ChatGeneration, ChatResult } from '@langchain/core/outputs';
-import { isLangChainTool } from '@langchain/core/utils/function_calling';
-import { isOpenAITool } from '@langchain/core/language_models/base';
-import { ToolCallChunk } from '@langchain/core/messages/tool';
-import { v4 as uuidv4 } from 'uuid';
 import {
   jsonSchemaToGeminiParameters,
   schemaToGenerativeAIParameters,
 } from './zod_to_genai_parameters';
-import { GoogleGenerativeAIToolType } from '../types';
 import { toLangChainContent } from '@/messages/langchain';
+import { GoogleGenerativeAIToolType } from '../types';
 
 export const _FUNCTION_CALL_THOUGHT_SIGNATURES_MAP_KEY =
   '__gemini_function_call_thought_signatures__';
