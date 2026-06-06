@@ -1,5 +1,6 @@
-import { getLangfuseTracerProvider } from '@langfuse/tracing';
 import { CallbackHandler } from '@langfuse/langchain';
+import { getLangfuseTracerProvider, propagateAttributes } from '@langfuse/tracing';
+import type { PropagateAttributesParams } from '@langfuse/tracing';
 import type * as t from '@/types';
 import { isPresent } from '@/utils/misc';
 
@@ -17,6 +18,10 @@ type LangfuseHandlerParams = {
 
 type AgentLangfuseHandlerParams = LangfuseHandlerParams & {
   langfuse?: t.LangfuseConfig;
+};
+
+type LangfuseAttributeParams = AgentLangfuseHandlerParams & {
+  traceName?: string;
 };
 
 type FlushableTracerProvider = {
@@ -156,6 +161,32 @@ export function createLangfuseHandler({
     traceMetadata,
     tags,
   });
+}
+
+function createPropagateAttributeParams({
+  userId,
+  sessionId,
+  traceMetadata,
+  traceName,
+  tags,
+}: LangfuseAttributeParams): PropagateAttributesParams {
+  return {
+    userId,
+    sessionId,
+    traceName,
+    tags,
+    metadata: traceMetadata,
+  };
+}
+
+export function withLangfuseAttributes<T>(
+  params: LangfuseAttributeParams,
+  action: () => T
+): T {
+  if (!shouldCreateLangfuseHandler(params.langfuse)) {
+    return action();
+  }
+  return propagateAttributes(createPropagateAttributeParams(params), action);
 }
 
 export function hasExplicitLangfuseConfig(

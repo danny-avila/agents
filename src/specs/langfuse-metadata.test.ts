@@ -1,4 +1,5 @@
 import { CallbackHandler } from '@langfuse/langchain';
+import { propagateAttributes } from '@langfuse/tracing';
 import { Providers } from '@/common';
 import { Run } from '@/run';
 
@@ -6,9 +7,16 @@ jest.mock('@langfuse/langchain', () => ({
   CallbackHandler: jest.fn().mockImplementation(() => ({})),
 }));
 
+jest.mock('@langfuse/tracing', () => ({
+  ...jest.requireActual('@langfuse/tracing'),
+  propagateAttributes: jest.fn((_params, action: () => unknown) => action()),
+}));
+
 const MockedCallbackHandler = CallbackHandler as jest.MockedClass<
   typeof CallbackHandler
 >;
+const MockedPropagateAttributes =
+  propagateAttributes as jest.MockedFunction<typeof propagateAttributes>;
 
 async function createTestRun(
   agentName?: string,
@@ -70,6 +78,35 @@ describe('Langfuse trace metadata includes agentName', () => {
     expect(ctorArgs?.traceMetadata).toMatchObject({ agentName: 'DWAINE' });
   });
 
+  it('propagates Langfuse identity around processStream observations', async () => {
+    const run = await createTestRun('DWAINE');
+    await run.processStream(
+      { messages: [] },
+      {
+        configurable: {
+          thread_id: 'thread-123',
+          user_id: 'user-456',
+          requestBody: { parentMessageId: 'parent-789' },
+        },
+        version: 'v2',
+      }
+    );
+
+    expect(MockedPropagateAttributes).toHaveBeenCalledTimes(1);
+    expect(MockedPropagateAttributes.mock.calls[0][0]).toMatchObject({
+      userId: 'user-456',
+      sessionId: 'thread-123',
+      traceName: 'LibreChat Agent: DWAINE',
+      tags: ['librechat', 'agent'],
+      metadata: {
+        messageId: 'test-run-id',
+        parentMessageId: 'parent-789',
+        agentId: 'agent_abc123',
+        agentName: 'DWAINE',
+      },
+    });
+  });
+
   it('falls back to agentId when agent has no explicit name', async () => {
     const run = await createTestRun();
     await run.processStream(
@@ -93,6 +130,7 @@ describe('Langfuse trace metadata includes agentName', () => {
     );
 
     expect(MockedCallbackHandler).not.toHaveBeenCalled();
+    expect(MockedPropagateAttributes).not.toHaveBeenCalled();
   });
 
   it('does not create the legacy CallbackHandler when explicit agent config is supplied', async () => {
