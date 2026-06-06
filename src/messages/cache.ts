@@ -9,6 +9,7 @@ import {
 import type { AnthropicMessage } from '@/types/messages';
 import type Anthropic from '@anthropic-ai/sdk';
 import { ContentTypes } from '@/common/enum';
+import { withMessageRole } from './format';
 import { toLangChainContent } from './langchain';
 
 type MessageWithContent = {
@@ -56,19 +57,31 @@ function cloneMessage<T extends MessageWithContent>(
     const msgType = message.getType();
     switch (msgType) {
     case 'ai':
-      return new AIMessage({
-        ...baseParams,
-        tool_calls: (message as unknown as AIMessage).tool_calls,
-      }) as unknown as T;
+      return withMessageRole(
+        new AIMessage({
+          ...baseParams,
+          tool_calls: (message as unknown as AIMessage).tool_calls,
+        }),
+        'assistant'
+      ) as unknown as T;
     case 'human':
-      return new HumanMessage(baseParams) as unknown as T;
+      return withMessageRole(
+        new HumanMessage(baseParams),
+        'user'
+      ) as unknown as T;
     case 'system':
-      return new SystemMessage(baseParams) as unknown as T;
+      return withMessageRole(
+        new SystemMessage(baseParams),
+        'system'
+      ) as unknown as T;
     case 'tool':
-      return new ToolMessage({
-        ...baseParams,
-        tool_call_id: (message as unknown as ToolMessage).tool_call_id,
-      }) as unknown as T;
+      return withMessageRole(
+        new ToolMessage({
+          ...baseParams,
+          tool_call_id: (message as unknown as ToolMessage).tool_call_id,
+        }),
+        'tool'
+      ) as unknown as T;
     default:
       break;
     }

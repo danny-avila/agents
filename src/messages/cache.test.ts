@@ -14,6 +14,7 @@ import {
   addBedrockCacheControl,
   addCacheControl,
 } from './cache';
+import { formatAgentMessages } from './format';
 import { _convertMessagesToOpenAIParams } from '@/llm/openai/utils';
 import { toLangChainContent } from './langchain';
 import { ContentTypes } from '@/common/enum';
@@ -1474,6 +1475,27 @@ describe('Multi-turn cache cleanup', () => {
 });
 
 describe('LangChain message type preservation', () => {
+  it('preserves direct roles for formatted LangChain messages after addCacheControl', () => {
+    const { messages } = formatAgentMessages([
+      { role: 'user', content: 'Hello' },
+      { role: 'assistant', content: 'Hi there' },
+      { role: 'user', content: 'Thanks' },
+    ]);
+
+    const result = addCacheControl(messages);
+
+    expect(result.map((message) => message.role)).toEqual([
+      'user',
+      'assistant',
+      'user',
+    ]);
+    expect(result[0]).toBeInstanceOf(HumanMessage);
+    expect(result[0]).not.toBe(messages[0]);
+    expect(Object.keys(result[0])).not.toContain('role');
+    expect(result[1]).toBe(messages[1]);
+    expect(result[2]).not.toBe(messages[2]);
+  });
+
   it('should preserve instanceof for LangChain messages after addCacheControl', () => {
     const messages: BaseMessage[] = [
       new HumanMessage({ content: [{ type: 'text', text: 'Hello' }] }),

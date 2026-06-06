@@ -24,6 +24,12 @@ describe('formatAgentMessages', () => {
     expect(result.messages).toHaveLength(2);
     expect(result.messages[0]).toBeInstanceOf(HumanMessage);
     expect(result.messages[1]).toBeInstanceOf(AIMessage);
+    expect(result.messages.map((message) => message.role)).toEqual([
+      'user',
+      'assistant',
+    ]);
+    expect(Object.keys(result.messages[0])).not.toContain('role');
+    expect(Object.keys(result.messages[1])).not.toContain('role');
   });
 
   it('preserves source messageId on formatted messages', () => {
@@ -56,6 +62,11 @@ describe('formatAgentMessages', () => {
     expect(result.messages[0]).toBeInstanceOf(AIMessage);
     expect(result.messages[1]).toBeInstanceOf(ToolMessage);
     expect(result.messages[2]).toBeInstanceOf(HumanMessage);
+    expect(result.messages.map((message) => message.role)).toEqual([
+      'assistant',
+      'tool',
+      'user',
+    ]);
     expect(result.messages[0].id).toBe('msg_assistant_1');
     expect(result.messages[1].id).toBe('msg_assistant_1');
     expect(result.messages[2].id).toBe('msg_user_1');
@@ -68,6 +79,8 @@ describe('formatAgentMessages', () => {
     const result = formatAgentMessages(payload);
     expect(result.messages).toHaveLength(1);
     expect(result.messages[0]).toBeInstanceOf(SystemMessage);
+    expect(result.messages[0].role).toBe('system');
+    expect(Object.keys(result.messages[0])).not.toContain('role');
   });
 
   it('should prepend the latest summary and trim context before its boundary', () => {
@@ -271,8 +284,9 @@ describe('formatAgentMessages', () => {
 
     expect(result.messages).toHaveLength(1);
     expect(result.messages[0]).toBeInstanceOf(AIMessage);
-    expect(result.messages.some((message) => message instanceof ToolMessage))
-      .toBe(false);
+    expect(
+      result.messages.some((message) => message instanceof ToolMessage)
+    ).toBe(false);
     expect((result.messages[0] as AIMessage).tool_calls).toHaveLength(0);
     expect(result.messages[0].content).toEqual([
       {
@@ -695,13 +709,9 @@ describe('formatAgentMessages', () => {
     expect(result.messages[1]).toBeInstanceOf(ToolMessage);
     expect(result.messages[2]).toBeInstanceOf(AIMessage);
     expect(result.messages[3]).toBeInstanceOf(ToolMessage);
-    expect((result.messages[0] as AIMessage).tool_calls?.[0].id).toBe(
-      'call_1'
-    );
+    expect((result.messages[0] as AIMessage).tool_calls?.[0].id).toBe('call_1');
     expect((result.messages[1] as ToolMessage).tool_call_id).toBe('call_1');
-    expect((result.messages[2] as AIMessage).tool_calls?.[0].id).toBe(
-      'call_2'
-    );
+    expect((result.messages[2] as AIMessage).tool_calls?.[0].id).toBe('call_2');
     expect((result.messages[3] as ToolMessage).tool_call_id).toBe('call_2');
   });
 

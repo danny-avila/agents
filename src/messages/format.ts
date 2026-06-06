@@ -106,6 +106,29 @@ interface FormatMessageParams {
   langChain?: boolean;
 }
 
+export type LangChainMessageRole = 'system' | 'user' | 'assistant' | 'tool';
+
+export type RoleBearingMessage<T extends BaseMessage = BaseMessage> = T & {
+  role: LangChainMessageRole;
+};
+
+export function withMessageRole<T extends BaseMessage>(
+  message: T,
+  role: LangChainMessageRole
+): RoleBearingMessage<T> {
+  const roleMessage = message as T & { role?: LangChainMessageRole };
+  if (roleMessage.role === role) {
+    return roleMessage as RoleBearingMessage<T>;
+  }
+  Object.defineProperty(roleMessage, 'role', {
+    value: role,
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  });
+  return roleMessage as RoleBearingMessage<T>;
+}
+
 interface FormattedMessage {
   role: string;
   content: string | MessageContentComplex[];
@@ -127,9 +150,9 @@ export const formatMessage = ({
   langChain = false,
 }: FormatMessageParams):
   | FormattedMessage
-  | HumanMessage
-  | AIMessage
-  | SystemMessage => {
+  | RoleBearingMessage<HumanMessage>
+  | RoleBearingMessage<AIMessage>
+  | RoleBearingMessage<SystemMessage> => {
   // eslint-disable-next-line prefer-const
   let { role: _role, _name, sender, text, content: _content, lc_id } = message;
   if (lc_id && lc_id[2] && !langChain) {
@@ -217,7 +240,10 @@ export const formatMessage = ({
       return mediaMessage;
     }
 
-    return new HumanMessage(toLangChainMessageFields(mediaMessage));
+    return withMessageRole(
+      new HumanMessage(toLangChainMessageFields(mediaMessage)),
+      'user'
+    );
   }
 
   if (!langChain) {
@@ -225,11 +251,20 @@ export const formatMessage = ({
   }
 
   if (role === 'user') {
-    return new HumanMessage(toLangChainMessageFields(formattedMessage));
+    return withMessageRole(
+      new HumanMessage(toLangChainMessageFields(formattedMessage)),
+      'user'
+    );
   } else if (role === 'assistant') {
-    return new AIMessage(toLangChainMessageFields(formattedMessage));
+    return withMessageRole(
+      new AIMessage(toLangChainMessageFields(formattedMessage)),
+      'assistant'
+    );
   } else {
-    return new SystemMessage(toLangChainMessageFields(formattedMessage));
+    return withMessageRole(
+      new SystemMessage(toLangChainMessageFields(formattedMessage)),
+      'system'
+    );
   }
 };
 
@@ -243,14 +278,21 @@ export const formatMessage = ({
 export const formatLangChainMessages = (
   messages: Array<MessageInput>,
   formatOptions: Omit<FormatMessageParams, 'message' | 'langChain'>
-): Array<HumanMessage | AIMessage | SystemMessage> => {
+): Array<
+  | RoleBearingMessage<HumanMessage>
+  | RoleBearingMessage<AIMessage>
+  | RoleBearingMessage<SystemMessage>
+> => {
   return messages.map((msg) => {
     const formatted = formatMessage({
       ...formatOptions,
       message: msg,
       langChain: true,
     });
-    return formatted as HumanMessage | AIMessage | SystemMessage;
+    return formatted as
+      | RoleBearingMessage<HumanMessage>
+      | RoleBearingMessage<AIMessage>
+      | RoleBearingMessage<SystemMessage>;
   });
 };
 
@@ -380,10 +422,12 @@ function getToolUseId(part: MessageContentComplex): string | undefined {
 function formatAssistantMessage(
   message: Partial<TMessage>,
   options?: FormatAssistantMessageOptions
-): Array<AIMessage | ToolMessage> {
-  const formattedMessages: Array<AIMessage | ToolMessage> = [];
+): Array<RoleBearingMessage<AIMessage> | RoleBearingMessage<ToolMessage>> {
+  const formattedMessages: Array<
+    RoleBearingMessage<AIMessage> | RoleBearingMessage<ToolMessage>
+  > = [];
   let currentContent: MessageContentComplex[] = [];
-  let lastAIMessage: AIMessage | null = null;
+  let lastAIMessage: RoleBearingMessage<AIMessage> | null = null;
   let hasReasoning = false;
   let pendingReasoningContent = '';
   const emittedServerToolUseIds = new Set<string>();
@@ -400,14 +444,19 @@ function formatAssistantMessage(
     return reasoningContent;
   };
 
-  const createAIMessage = (content: MessageContent): AIMessage => {
+  const createAIMessage = (
+    content: MessageContent
+  ): RoleBearingMessage<AIMessage> => {
     const reasoningContent = takePendingReasoningContent();
-    return new AIMessage({
-      content,
-      ...(reasoningContent != null && {
-        additional_kwargs: { reasoning_content: reasoningContent },
+    return withMessageRole(
+      new AIMessage({
+        content,
+        ...(reasoningContent != null && {
+          additional_kwargs: { reasoning_content: reasoningContent },
+        }),
       }),
-    });
+      'assistant'
+    );
   };
 
   const attachPendingReasoningContent = (aiMessage: AIMessage): void => {
@@ -537,11 +586,14 @@ function formatAssistantMessage(
         lastAIMessage.tool_calls.push(tool_call as ToolCall);
 
         formattedMessages.push(
-          new ToolMessage({
-            tool_call_id: tool_call.id ?? '',
-            name: tool_call.name,
-            content: output != null ? output : '',
-          })
+          withMessageRole(
+            new ToolMessage({
+              tool_call_id: tool_call.id ?? '',
+              name: tool_call.name,
+              content: output != null ? output : '',
+            }),
+            'tool'
+          )
         );
       } else if (
         part.type === ContentTypes.THINK ||
@@ -1007,7 +1059,12 @@ export const formatAgentMessages = (
   skills?: Map<string, string>,
   options?: FormatAgentMessagesOptions
 ): {
-  messages: Array<HumanMessage | AIMessage | SystemMessage | ToolMessage>;
+  messages: Array<
+    | RoleBearingMessage<HumanMessage>
+    | RoleBearingMessage<AIMessage>
+    | RoleBearingMessage<SystemMessage>
+    | RoleBearingMessage<ToolMessage>
+  >;
   indexTokenCountMap?: Record<number, number>;
   /** Cross-run summary extracted from the payload. Should be forwarded to the
    *  agent run so it can be included in the system message via AgentContext. */
@@ -1022,7 +1079,10 @@ export const formatAgentMessages = (
   };
 } => {
   const messages: Array<
-    HumanMessage | AIMessage | SystemMessage | ToolMessage
+    | RoleBearingMessage<HumanMessage>
+    | RoleBearingMessage<AIMessage>
+    | RoleBearingMessage<SystemMessage>
+    | RoleBearingMessage<ToolMessage>
   > = [];
   // If indexTokenCountMap is provided, create a new map to track the updated indices
   const updatedIndexTokenCountMap: Record<number, number> = {};
@@ -1078,7 +1138,10 @@ export const formatAgentMessages = (
       const formattedMessage = formatMessage({
         message: message as MessageInput,
         langChain: true,
-      }) as HumanMessage | AIMessage | SystemMessage;
+      }) as
+        | RoleBearingMessage<HumanMessage>
+        | RoleBearingMessage<AIMessage>
+        | RoleBearingMessage<SystemMessage>;
       if (sourceMessageId != null && sourceMessageId !== '') {
         formattedMessage.id = sourceMessageId;
       }
@@ -1273,15 +1336,18 @@ export const formatAgentMessages = (
         const body = skills?.get(skillName) ?? '';
         if (body) {
           messages.push(
-            new HumanMessage({
-              content: body,
-              additional_kwargs: {
-                role: 'user',
-                isMeta: true,
-                source: 'skill',
-                skillName,
-              },
-            })
+            withMessageRole(
+              new HumanMessage({
+                content: body,
+                additional_kwargs: {
+                  role: 'user',
+                  isMeta: true,
+                  source: 'skill',
+                  skillName,
+                },
+              }),
+              'user'
+            )
           );
         }
       }
@@ -1721,7 +1787,12 @@ export function ensureThinkingBlockInMessages(
         'ensureThinkingBlockInMessages: injecting [Previous agent context] HumanMessage' +
           ` (${parts.length} msgs at index ${i}, no thinking block in chain)`
       );
-      result.push(new HumanMessage({ content: toLangChainContent(parts) }));
+      result.push(
+        withMessageRole(
+          new HumanMessage({ content: toLangChainContent(parts) }),
+          'user'
+        )
+      );
       i = j;
     } else {
       // Keep the message as is
