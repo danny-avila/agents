@@ -978,10 +978,6 @@ function hasReasoningContent(
   );
 }
 
-function recordStreamedTextDelta(agentContext: AgentContext): void {
-  agentContext.streamedTextDeltaCount++;
-}
-
 function shouldDeferMixedFinalReasoningChunk({
   chunk,
   agentContext,
@@ -1213,7 +1209,6 @@ hasToolCallChunks: ${hasToolCallChunks}
       return;
     } else if (typeof content === 'string') {
       if (agentContext.currentTokenType === ContentTypes.TEXT) {
-        recordStreamedTextDelta(agentContext);
         await graph.dispatchMessageDelta(
           stepId,
           {
@@ -1259,7 +1254,6 @@ hasToolCallChunks: ${hasToolCallChunks}
           );
 
           const newStepId = graph.getStepIdByKey(newStepKey);
-          recordStreamedTextDelta(agentContext);
           await graph.dispatchMessageDelta(
             newStepId,
             {
@@ -1290,7 +1284,6 @@ hasToolCallChunks: ${hasToolCallChunks}
     } else if (
       content.every((c) => c.type?.startsWith(ContentTypes.TEXT) ?? false)
     ) {
-      recordStreamedTextDelta(agentContext);
       await graph.dispatchMessageDelta(
         stepId,
         {

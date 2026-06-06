@@ -217,16 +217,23 @@ function hasTextDeltaContent(
   );
 }
 
-function shouldSkipFinalTextFallback({
-  agentContext,
-  content,
+function hasCurrentTextDeltaStep({
+  graph,
+  metadata,
 }: {
-  agentContext: AgentContext;
-  content: t.MessageDelta['content'] | undefined;
+  graph: Graph<t.BaseGraphState>;
+  metadata: Record<string, unknown>;
 }): boolean {
-  return (
-    agentContext.streamedTextDeltaCount > 0 && hasTextDeltaContent(content)
-  );
+  const baseStepKey = graph.getStepBaseKey(metadata);
+  for (const [stepKey, stepIds] of graph.stepKeyIds) {
+    if (stepKey !== baseStepKey && !stepKey.startsWith(`${baseStepKey}_`)) {
+      continue;
+    }
+    if (stepIds.some((stepId) => graph.messageStepHasTextDeltas.has(stepId))) {
+      return true;
+    }
+  }
+  return false;
 }
 
 async function dispatchTextMessageContent({
@@ -333,6 +340,9 @@ export abstract class Graph<
   abstract getKeyList(
     metadata: Record<string, unknown> | undefined
   ): (string | number | undefined)[];
+  abstract getStepBaseKey(
+    metadata: Record<string, unknown> | undefined
+  ): string;
   abstract getStepKey(metadata: Record<string, unknown> | undefined): string;
   abstract checkKeyList(keyList: (string | number | undefined)[]): boolean;
   abstract getStepIdByKey(stepKey: string, index?: number): string;
@@ -364,6 +374,7 @@ export abstract class Graph<
     state: t.AgentSubgraphState,
     config?: RunnableConfig
   ) => Promise<Partial<t.AgentSubgraphState>>;
+  messageStepHasTextDeltas: Set<string> = new Set();
   messageStepHasToolCalls: Map<string, boolean> = new Map();
   messageIdsByStepKey: Map<string, string> = new Map();
   prelimMessageIdsByStepKey: Map<string, string> = new Map();
@@ -453,6 +464,7 @@ export abstract class Graph<
     this.stepKeyIds = new Map();
     this.toolCallStepIds.clear();
     this.messageIdsByStepKey = new Map();
+    this.messageStepHasTextDeltas = new Set();
     this.messageStepHasToolCalls = new Map();
     this.prelimMessageIdsByStepKey = new Map();
     this.invokedToolIds = undefined;
@@ -729,6 +741,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       this.messageStepHasToolCalls,
       new Map()
     );
+    this.messageStepHasTextDeltas = resetIfNotEmpty(
+      this.messageStepHasTextDeltas,
+      new Set()
+    );
     this.prelimMessageIdsByStepKey = resetIfNotEmpty(
       this.prelimMessageIdsByStepKey,
       new Map()
@@ -788,6 +804,17 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     return agentContext;
   }
 
+  getStepBaseKey(metadata: Record<string, unknown> | undefined): string {
+    if (!metadata) return '';
+
+    const keyList = this.getBaseKeyList(metadata);
+    if (this.checkKeyList(keyList)) {
+      throw new Error('Missing metadata');
+    }
+
+    return joinKeys(keyList);
+  }
+
   getStepKey(metadata: Record<string, unknown> | undefined): string {
     if (!metadata) return '';
 
@@ -834,6 +861,27 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   ): (string | number | undefined)[] {
     if (!metadata) return [];
 
+    const keyList = this.getBaseKeyList(metadata);
+    const agentContext = this.getAgentContext(metadata);
+    if (
+      agentContext.currentTokenType === ContentTypes.THINK ||
+      agentContext.currentTokenType === 'think_and_text'
+    ) {
+      keyList.push('reasoning');
+    } else if (agentContext.tokenTypeSwitch === 'content') {
+      keyList.push(`post-reasoning-${agentContext.reasoningTransitionCount}`);
+    }
+
+    if (this.invokedToolIds != null && this.invokedToolIds.size > 0) {
+      keyList.push(this.invokedToolIds.size + '');
+    }
+
+    return keyList;
+  }
+
+  private getBaseKeyList(
+    metadata: Record<string, unknown>
+  ): (string | number | undefined)[] {
     const configurable = this.config?.configurable;
     const runId =
       (metadata.run_id as string | undefined) ??
@@ -854,20 +902,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       metadata.langgraph_step as number,
       checkpointNs,
     ];
-
-    const agentContext = this.getAgentContext(metadata);
-    if (
-      agentContext.currentTokenType === ContentTypes.THINK ||
-      agentContext.currentTokenType === 'think_and_text'
-    ) {
-      keyList.push('reasoning');
-    } else if (agentContext.tokenTypeSwitch === 'content') {
-      keyList.push(`post-reasoning-${agentContext.reasoningTransitionCount}`);
-    }
-
-    if (this.invokedToolIds != null && this.invokedToolIds.size > 0) {
-      keyList.push(this.invokedToolIds.size + '');
-    }
 
     return keyList;
   }
@@ -1636,7 +1670,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }
 
       try {
-        agentContext.streamedTextDeltaCount = 0;
         result = await withLangfuseToolOutputTracingConfig(
           this.langfuse,
           () =>
@@ -1652,7 +1685,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           agentContext.langfuse
         );
       } catch (primaryError) {
-        agentContext.streamedTextDeltaCount = 0;
         result = await withLangfuseToolOutputTracingConfig(
           this.langfuse,
           () =>
@@ -1701,6 +1733,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       const textMessageContent = getTextMessageDeltaContent(
         responseMessage?.content as MessageContent | undefined
       );
+      const hasStreamedTextDeltaStep = hasCurrentTextDeltaStep({
+        graph: this,
+        metadata,
+      });
 
       if (hasToolCalls) {
         const dispatchedReasoning =
@@ -1714,13 +1750,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         if (dispatchedReasoning) {
           markPostReasoningContent(agentContext);
         }
-        if (
-          textMessageContent != null &&
-          !shouldSkipFinalTextFallback({
-            agentContext,
-            content: textMessageContent,
-          })
-        ) {
+        if (textMessageContent != null && !hasStreamedTextDeltaStep) {
           const stepKey = this.getStepKey(metadata);
           const dispatchedText = await dispatchTextMessageContent({
             graph: this,
@@ -1753,13 +1783,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         if (dispatchedReasoning && textMessageContent != null) {
           markPostReasoningContent(agentContext);
         }
-        if (
-          textMessageContent != null &&
-          !shouldSkipFinalTextFallback({
-            agentContext,
-            content: textMessageContent,
-          })
-        ) {
+        if (textMessageContent != null && !hasStreamedTextDeltaStep) {
           const stepKey = this.getStepKey(metadata);
           await dispatchTextMessageContent({
             graph: this,
@@ -2332,6 +2356,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       id,
       delta,
     };
+    if (hasTextDeltaContent(delta.content)) {
+      this.messageStepHasTextDeltas.add(id);
+    }
     const handler = this.handlerRegistry?.getHandler(
       GraphEvents.ON_MESSAGE_DELTA
     );

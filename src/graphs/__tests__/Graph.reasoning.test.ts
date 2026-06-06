@@ -739,7 +739,7 @@ describe('StandardGraph final response reasoning fallback', () => {
       }),
     ]);
 
-    await run.processStream(
+    const finalContentParts = await run.processStream(
       { messages: [new HumanMessage('think briefly, what is 17 x 23?')] },
       {
         ...config,
@@ -755,6 +755,69 @@ describe('StandardGraph final response reasoning fallback', () => {
       { type: ContentTypes.TEXT, text },
       { type: ContentTypes.THINK, think: reasoningText },
     ]);
+    expect(finalContentParts).toEqual([
+      { type: ContentTypes.THINK, think: reasoningText },
+      { type: ContentTypes.TEXT, text },
+    ]);
+    expect(run.getRunMessages()?.[0]?.content).toBe(text);
+  });
+
+  it('does not replay streamed text when the final fallback is on the reasoning key', async () => {
+    const text = '391.';
+    const reasoningText = 'Confirm the arithmetic after visible text.';
+    const reasoningDeltas: t.ReasoningDeltaEvent[] = [];
+    const messageDeltas: t.MessageDeltaEvent[] = [];
+    const { contentParts, aggregateContent } = createContentAggregator();
+    const run = await Run.create<t.IState>({
+      runId: 'reasoning-fallback-openrouter-text-before-reasoning-key',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: Providers.OPENROUTER,
+          streamUsage: false,
+        },
+        reasoningKey: 'reasoning',
+      },
+      returnContent: true,
+      skipCleanup: true,
+      customHandlers: createReasoningHandlers(
+        aggregateContent,
+        reasoningDeltas,
+        messageDeltas
+      ),
+    });
+
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+
+    run.Graph.overrideModel = new StreamingReasoningModel([
+      new AIMessageChunk({ content: text }),
+      createReasoningChunk('reasoning', reasoningText),
+    ]);
+
+    const finalContentParts = await run.processStream(
+      { messages: [new HumanMessage('think briefly, what is 17 x 23?')] },
+      {
+        ...config,
+        configurable: {
+          thread_id:
+            'reasoning-fallback-openrouter-text-before-reasoning-key',
+        },
+      }
+    );
+
+    expect(reasoningDeltas).toHaveLength(1);
+    expect(messageDeltas).toHaveLength(1);
+    expect(contentParts).toEqual([
+      { type: ContentTypes.TEXT, text },
+      { type: ContentTypes.THINK, think: reasoningText },
+    ]);
+    expect(finalContentParts).toEqual([
+      { type: ContentTypes.THINK, think: reasoningText },
+      { type: ContentTypes.TEXT, text },
+    ]);
+    expect(run.getRunMessages()?.[0]?.content).toBe(text);
   });
 
   it('does not handle OpenRouter callback-emitted chunks twice inside graph streaming', async () => {
