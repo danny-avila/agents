@@ -21,7 +21,7 @@ import {
   handleToolCalls,
 } from '@/tools/handlers';
 import { getMessageId } from '@/messages';
-import { isGoogleLike } from '@/utils';
+import { isGoogleLike } from '@/utils/llm';
 import { safeDispatchCustomEvent } from '@/utils/events';
 import {
   buildToolExecutionRequestPlan,
