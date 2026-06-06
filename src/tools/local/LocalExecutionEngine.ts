@@ -2,10 +2,13 @@ import { tmpdir } from 'os';
 import { isAbsolute, relative, resolve } from 'path';
 import { createHash, randomUUID } from 'crypto';
 import { mkdir, realpath, rm, writeFile } from 'fs/promises';
-import { createWriteStream } from 'fs';
+import { createWriteStream, unlinkSync } from 'fs';
 import { spawn } from 'child_process';
 import type { ChildProcess } from 'child_process';
-import { runBashAstChecks, bashAstFindingsToErrors } from './bashAst';
+import {
+  validateBashCommandStatic,
+  type BashValidationResult,
+} from './bashValidation';
 import { nodeWorkspaceFS } from './workspaceFS';
 import type { WorkspaceFS } from './workspaceFS';
 import type * as t from '@/types';
@@ -22,106 +25,12 @@ const DEFAULT_MAX_SPAWNED_BYTES = 50 * 1024 * 1024;
 const DEFAULT_LOCAL_SESSION_ID = 'local';
 const DEFAULT_SHELL = process.platform === 'win32' ? 'bash.exe' : 'bash';
 
-// `(?:--\s+)?` before each destructive-target alternation: GNU/BSD
-// utilities accept `--` as an end-of-options marker, so `rm -rf -- /`
-// is identical in effect to `rm -rf /` but pre-fix it slipped past
-// the guard because the regex required the path to follow option
-// flags directly. Codex P1 #20.
-// `DESTRUCTIVE_TARGET` is the canonical "protected location" pattern:
-// matches `/`, `~`, `$HOME`, `${HOME}`, `.`, each optionally followed
-// by a trailing-slash and/or wildcard glob suffix. The suffix matrix:
-//   ''     — `$HOME`              (round 14)
-//   '/'    — `$HOME/`             (round 14, Codex P1 [37])
-//   '*'    — `$HOME*`             (round 15, Codex P1 [42])
-//   '/*'   — `$HOME/*`            (round 15, Codex P1 [42])
-//   '.*'   — `$HOME.*`            (round 17, Codex P1 [47])
-//   '/.*'  — `$HOME/.*`           (round 17, Codex P1 [47]) — the
-//            dot-glob form deletes all dotfiles under the protected
-//            root, just as destructive as `/*` but the prior matrix
-//            missed it.
-// Suffix expression: `(?:\/?\.?\*|\/)?` — one of:
-//   `\/?\.?\*` → `*`, `.*`, `/*`, `/.*`
-//   `\/`       → `/`
-//   (empty)    → bare base
-const DESTRUCTIVE_TARGET = '(?:\\/|~|\\$\\{?HOME\\}?|\\.)(?:\\/?\\.?\\*|\\/)?';
-
-const dangerousCommandPatterns: ReadonlyArray<RegExp> = [
-  new RegExp(
-    `\\brm\\s+(?:-[^\\s]*[rf][^\\s]*\\s+|-[^\\s]*[r][^\\s]*\\s+-[^\\s]*[f][^\\s]*\\s+)(?:--\\s+)?${DESTRUCTIVE_TARGET}\\s*(?:$|[;&|])`
-  ),
-  /\b(?:mkfs|mkswap|fdisk|parted|diskutil)\b/,
-  /\bdd\s+[^;&|]*\bof=\/dev\//,
-  new RegExp(
-    `\\bchmod\\s+-R\\s+(?:777|a\\+w)\\s+(?:--\\s+)?${DESTRUCTIVE_TARGET}(?:$|\\s|[;&|])`
-  ),
-  new RegExp(
-    `\\bchown\\s+-R\\s+[^;&|]+\\s+(?:--\\s+)?${DESTRUCTIVE_TARGET}(?:$|\\s|[;&|])`
-  ),
-  /:\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/,
-];
-
-/**
- * Companion patterns that look for destructive targets *inside*
- * matching quote pairs. These are checked against the ORIGINAL
- * command (not the post-quote-strip `normalized` form), because
- * `stripQuotedContent` blanks the contents of quoted spans —
- * which would otherwise let `rm -rf "/"` and friends slip past
- * `dangerousCommandPatterns`.
- *
- * Kept as a separate list so we don't pay false-positive cost on
- * benign uses like `echo "rm -rf /"` (the print case): each pattern
- * here REQUIRES a quote *around the destructive path argument*, not
- * just a quote *somewhere* in the command. `echo "rm -rf /"` has
- * `/` outside of any quote-pair-around-the-path (the quotes wrap
- * the whole `rm -rf /` text), so it doesn't match here either.
- */
-// Quoted variant uses the same DESTRUCTIVE_TARGET (which accepts an
-// optional trailing slash) so `rm -rf "$HOME/"` and `rm -rf "~/"`
-// don't slip past. Codex P1 #37.
-const quotedDestructivePatterns: ReadonlyArray<RegExp> = [
-  new RegExp(
-    `\\brm\\s+(?:-[^\\s]*[rf][^\\s]*\\s+){1,3}(?:--\\s+)?["']${DESTRUCTIVE_TARGET}["']`
-  ),
-  new RegExp(
-    `\\bchmod\\s+-R\\s+(?:777|a\\+w)\\s+(?:--\\s+)?["']${DESTRUCTIVE_TARGET}["']`
-  ),
-  new RegExp(
-    `\\bchown\\s+-R\\s+[^;&|]+\\s+(?:--\\s+)?["']${DESTRUCTIVE_TARGET}["']`
-  ),
-];
-
-/**
- * Catches destructive operations smuggled inside a nested shell or
- * `eval` call, e.g. `bash -lc "rm -rf $HOME"` — the outer command
- * looks benign (`bash -lc "..."`) and the destructive `rm` lives
- * inside the quoted payload that `stripQuotedContent` blanks out.
- * Comprehensive review (manual finding C) flagged this as a real
- * bypass of the otherwise-correct quote-strip-then-match approach.
- *
- * Run against the ORIGINAL command (quotes intact) so the inside of
- * the nested-shell payload is visible. Conservative: matches only
- * the same operation set as `dangerousCommandPatterns` (rm -rf,
- * chmod -R 777, chown -R) when they appear inside a `<shell> -[l]?c
- * "..."` or `eval "..."` payload.
- */
-const NESTED_SHELL_PREFIX = '(?:(?:ba|z|da|k)?sh|eval)\\s+(?:-l?c\\s+)?';
-const nestedShellDestructivePatterns: ReadonlyArray<RegExp> = [
-  new RegExp(
-    NESTED_SHELL_PREFIX +
-      '["\'][^"\']*\\brm\\s+-[^\\s"\']*[rf][^\\s"\']*\\s+(?:--\\s+)?(?:\\/|~|\\$\\{?HOME\\}?|\\.)'
-  ),
-  new RegExp(
-    NESTED_SHELL_PREFIX +
-      '["\'][^"\']*\\bchmod\\s+-R\\s+(?:777|a\\+w)\\s+(?:--\\s+)?(?:\\/|~|\\$\\{?HOME\\}?|\\.)'
-  ),
-  new RegExp(
-    NESTED_SHELL_PREFIX +
-      '["\'][^"\']*\\bchown\\s+-R\\s+[^;&|]+\\s+(?:--\\s+)?(?:\\/|~|\\$\\{?HOME\\}?|\\.)'
-  ),
-];
-
-const mutatingCommandPattern =
-  /\b(?:rm|mv|cp|touch|mkdir|rmdir|ln|truncate|tee|sed\s+-i|perl\s+-pi|python(?:3)?\s+-c|node\s+-e|npm\s+(?:install|ci|update|publish)|pnpm\s+(?:install|update|publish)|yarn\s+(?:install|add|publish)|git\s+(?:add|commit|checkout|switch|reset|clean|rebase|merge|push|pull|stash|tag|branch)|chmod|chown)\b|(?:^|[^<])>\s*[^&]|\bcat\s+[^|;&]*>\s*/;
+// Regex bodies for destructive/quoted/nested-shell/positional-arg
+// command shapes live in `./bashValidation.ts` so the same set is
+// reusable from the remote BashExecutor without pulling in
+// `LocalExecutionEngine`'s node-only deps. `validateBashCommand`
+// below is now a thin wrapper that adds the `bash -n` syntax
+// preflight on top of `validateBashCommandStatic`.
 
 type SpawnResult = {
   stdout: string;
@@ -203,11 +112,54 @@ let sandboxConfigKey: string | undefined;
 let sandboxInitialized = false;
 let sandboxRuntimePromise: Promise<SandboxRuntimeModule> | undefined;
 
-export type BashValidationResult = {
-  valid: boolean;
-  errors: string[];
-  warnings: string[];
-};
+/**
+ * Registry of spill files this Node process has created. The spill
+ * exists so the model can `cat $fullOutputPath` to inspect overflow
+ * output across subsequent tool calls — its lifetime must outlast
+ * the originating spawn, but should NOT outlast the Node process
+ * (otherwise CI runners and dev machines accumulate orphan files in
+ * `tmpdir()` forever; the GiB-scale tmp leak that prompted this fix).
+ *
+ * On normal process exit, `unlinkAllSpillFiles()` synchronously
+ * deletes every tracked path. `_resetLocalEngineSpillFilesForTests`
+ * lets test suites trigger the same cleanup in `afterEach`/`afterAll`
+ * so a long-running Jest worker doesn't accumulate files between
+ * unrelated test files.
+ *
+ * Unclean process exits (SIGKILL, native crash, OS OOM killer) still
+ * leak — same as today. The registry is a best-effort cleanup, not
+ * a guarantee.
+ */
+const trackedSpillPaths = new Set<string>();
+let spillExitHandlerInstalled = false;
+
+function unlinkAllSpillFiles(): void {
+  for (const p of trackedSpillPaths) {
+    try {
+      unlinkSync(p);
+    } catch {
+      /* file may already be gone; cleanup is best-effort */
+    }
+  }
+  trackedSpillPaths.clear();
+}
+
+function ensureSpillExitHandler(): void {
+  if (spillExitHandlerInstalled) return;
+  spillExitHandlerInstalled = true;
+  process.on('exit', unlinkAllSpillFiles);
+}
+
+/**
+ * Test-only: synchronously delete every tracked spill file and
+ * forget them. Pair with `_resetLocalEngineWarningsForTests` in
+ * `afterEach`/`afterAll` for full state reset.
+ *
+ * @internal Not part of the public SDK surface.
+ */
+export function _resetLocalEngineSpillFilesForTests(): void {
+  unlinkAllSpillFiles();
+}
 
 function isToolExecutionConfig(
   config: t.ToolExecutionConfig | t.LocalExecutionConfig
@@ -383,123 +335,30 @@ export function truncateLocalOutput(
   )}`;
 }
 
-function stripQuotedContent(command: string): string {
-  let output = '';
-  let quote: '"' | '\'' | '`' | undefined;
-  let escaped = false;
-
-  for (let i = 0; i < command.length; i++) {
-    const char = command[i];
-
-    if (escaped) {
-      escaped = false;
-      output += ' ';
-      continue;
-    }
-
-    if (char === '\\') {
-      escaped = true;
-      output += ' ';
-      continue;
-    }
-
-    if (quote != null) {
-      if (char === quote) {
-        quote = undefined;
-      }
-      output += ' ';
-      continue;
-    }
-
-    if (char === '"' || char === '\'' || char === '`') {
-      quote = char;
-      output += ' ';
-      continue;
-    }
-
-    if (char === '#') {
-      while (i < command.length && command[i] !== '\n') {
-        output += ' ';
-        i++;
-      }
-      output += '\n';
-      continue;
-    }
-
-    output += char;
-  }
-
-  return output;
-}
-
+/**
+ * Local-engine bash validation: synchronous regex + heuristic pass
+ * (via {@link validateBashCommandStatic}) followed by a `bash -n`
+ * syntax preflight. Returns the historical `{ valid, errors,
+ * warnings }` shape so existing call sites (`executeLocalBash`,
+ * `executeLocalBashWithArgs`, `CompileCheckTool`, …) keep working
+ * unchanged.
+ *
+ * Remote callers that can't spawn a local bash should use
+ * {@link validateBashCommandStatic} or {@link validateBashCommandHardFloor}
+ * from `./bashValidation` directly.
+ */
 export async function validateBashCommand(
   command: string,
-  config: t.LocalExecutionConfig = {}
+  config: t.LocalExecutionConfig = {},
+  args?: readonly string[]
 ): Promise<BashValidationResult> {
-  const errors: string[] = [];
-  const warnings: string[] = [];
-  const normalized = stripQuotedContent(command);
-
-  if (command.trim() === '') {
-    errors.push('Command is empty.');
-  }
-
-  if (command.includes('\0')) {
-    errors.push('Command contains a NUL byte.');
-  }
-
-  if (config.allowDangerousCommands !== true) {
-    let blocked = false;
-    // Strip-then-match for the bare-form patterns (avoids false
-    // positives where the destructive text is buried inside a
-    // string the user is just printing).
-    for (const pattern of dangerousCommandPatterns) {
-      if (pattern.test(normalized)) {
-        errors.push('Command matches a destructive command pattern.');
-        blocked = true;
-        break;
-      }
-    }
-    // Original-form pass for patterns that REQUIRE matching quote
-    // pairs around a destructive path. Without this, `rm -rf "/"`
-    // and `chmod -R 777 "/"` slip past the strip-then-match pass
-    // because their destructive target is inside quotes.
-    if (!blocked) {
-      for (const pattern of quotedDestructivePatterns) {
-        if (pattern.test(command)) {
-          errors.push(
-            'Command matches a destructive command pattern (quoted target).'
-          );
-          blocked = true;
-          break;
-        }
-      }
-    }
-    if (!blocked) {
-      for (const pattern of nestedShellDestructivePatterns) {
-        if (pattern.test(command)) {
-          errors.push(
-            'Command matches a destructive command pattern (nested shell payload).'
-          );
-          break;
-        }
-      }
-    }
-  }
-
-  const bashAstMode = config.bashAst ?? 'off';
-  if (bashAstMode !== 'off' && config.allowDangerousCommands !== true) {
-    const findings = runBashAstChecks(normalized, bashAstMode);
-    const split = bashAstFindingsToErrors(findings);
-    errors.push(...split.errors);
-    warnings.push(...split.warnings);
-  }
-
-  if (config.readOnly === true && mutatingCommandPattern.test(normalized)) {
-    errors.push(
-      'Command appears to mutate files or repository state in read-only local mode.'
-    );
-  }
+  const staticResult = validateBashCommandStatic(command, args, {
+    readOnly: config.readOnly === true,
+    bashAst: config.bashAst ?? 'off',
+    allowDangerousCommands: config.allowDangerousCommands === true,
+  });
+  const errors = [...staticResult.errors];
+  const warnings = [...staticResult.warnings];
 
   // Use the same shell the actual execution path will use. Hard-coding
   // DEFAULT_SHELL here would reject perfectly valid commands when the
@@ -530,10 +389,6 @@ export async function validateBashCommand(
         ? 'Command failed shell syntax validation.'
         : `Command failed shell syntax validation: ${syntax.stderr.trim()}`
     );
-  }
-
-  if (/\bsudo\b/.test(normalized)) {
-    warnings.push('Command requests elevated privileges with sudo.');
   }
 
   return {
@@ -778,6 +633,14 @@ export async function spawnLocalProcess(
       // would throw `ReferenceError: require is not defined` in ESM
       // consumers (this package ships both `dist/cjs` and `dist/esm`).
       spillPath = resolve(tmpdir(), `lc-local-output-${randomUUID()}.txt`);
+      // Track for process-exit cleanup. The spill file outlives the
+      // spawn (so the model can `cat` it in a follow-up call) but
+      // not the Node process — without this registry, every overflow
+      // ever produced by every Run on this machine accumulates in
+      // tmpdir forever. Lazy `process.on('exit')` install avoids
+      // adding a global listener until a spill actually happens.
+      trackedSpillPaths.add(spillPath);
+      ensureSpillExitHandler();
       spillStream = createWriteStream(spillPath);
       spillStream.write('===== stdout =====\n');
       spillStream.write(stdout);
@@ -787,15 +650,23 @@ export async function spawnLocalProcess(
     };
 
     const handleChunk = (buf: Buffer, kind: 'stdout' | 'stderr'): void => {
+      // Once the overflow guard has tripped, drop EVERY subsequent
+      // chunk on the floor. Pre-fix this was the GB-scale tmp-leak
+      // bug: the first overflow chunk returned, but subsequent chunks
+      // (from a fast-output child like `yes` that ignores SIGTERM)
+      // kept falling through to `ensureSpill()` and writing into the
+      // temp file for the full 2-second SIGTERM→SIGKILL escalation
+      // window — easily 5–20 GiB at typical `yes` rates. We still
+      // tally `totalSpawnedBytes` so the post-kill summary is
+      // accurate, but no bytes go to memory or disk after the kill.
       totalSpawnedBytes += buf.length;
+      if (overflowKilled) {
+        return;
+      }
       // hardKillBytes <= 0 means "no cap" per the public config contract
       // (see LocalExecutionConfig.maxSpawnedBytes). Skip the kill check
       // entirely in that case so a single byte doesn't terminate the run.
-      if (
-        hardKillBytes > 0 &&
-        totalSpawnedBytes > hardKillBytes &&
-        !overflowKilled
-      ) {
+      if (hardKillBytes > 0 && totalSpawnedBytes > hardKillBytes) {
         overflowKilled = true;
         killProcessTree(child);
         return;
@@ -928,54 +799,20 @@ export async function executeLocalBash(
  * identically in both surfaces.
  */
 /**
- * Matches a single arg that, on its own, references a protected
- * location (`/`, `~`, `$HOME`, `${HOME}`, `.`, with optional trailing
- * slash, wildcard, or dot-glob suffix). Used to spot the
- * `command: 'rm -rf "$1"', args: ['/']` shape where the destructive
- * target is moved into a positional arg to evade the command regex.
- * Codex P1 [45], extended for dot-glob in Codex P1 [47] (mirrors the
- * `DESTRUCTIVE_TARGET` suffix matrix exactly).
+ * Variant of `executeLocalBash` that exposes `args` as positional
+ * shell parameters (`$1`, `$2`, …). The positional-arg
+ * protected-target check (e.g. `command: 'rm -rf "$1"', args: ['/']`)
+ * lives in `validateBashCommandStatic` — we thread `args` through to
+ * the validator so the bypass-via-positional case is caught up front.
  */
-const PROTECTED_TARGET_ARG_RE = /^(?:\/|~|\$\{?HOME\}?|\.)(?:\/?\.?\*|\/)?$/;
-
-/**
- * Mutating-op recognizer for the args check. Conservative: only the
- * three operations the destructive-command guard already covers
- * directly (`rm -rf …`, `chmod -R …`, `chown -R …`). Other shell
- * builtins might mutate state (`mv`, `cp` over an existing file,
- * etc.) but the destructive guard doesn't try to catch those today,
- * so we don't widen here either.
- */
-const DESTRUCTIVE_OP_IN_COMMAND_RE =
-  /\b(?:rm\s+-[^\s]*[rf]|chmod\s+-R|chown\s+-R)\b/;
-
 export async function executeLocalBashWithArgs(
   command: string,
   args: readonly string[],
   config: t.LocalExecutionConfig = {}
 ): Promise<SpawnResult> {
-  const validation = await validateBashCommand(command, config);
+  const validation = await validateBashCommand(command, config, args);
   if (!validation.valid) {
     throw new Error(validation.errors.join('\n'));
-  }
-  // Per-arg protected-target check (Codex P1 [45]). The command
-  // regex can't see `$1`/`$@` substitutions at runtime — `command:
-  // 'rm -rf "$1"', args: ['/']` would expand to `rm -rf '/'` inside
-  // bash but the validator only saw `rm -rf "$1"` (no destructive
-  // target). Block when (a) the command contains a destructive op
-  // AND (b) at least one arg matches the protected-target shape.
-  // Skipped when allowDangerousCommands is true (host-opted-in).
-  if (
-    args.length > 0 &&
-    config.allowDangerousCommands !== true &&
-    DESTRUCTIVE_OP_IN_COMMAND_RE.test(command)
-  ) {
-    const offending = args.find((a) => PROTECTED_TARGET_ARG_RE.test(a));
-    if (offending !== undefined) {
-      throw new Error(
-        `Command matches a destructive command pattern (protected target "${offending}" passed via positional arg).`
-      );
-    }
   }
   const shell = config.shell ?? DEFAULT_SHELL;
   return spawnLocalProcess(shell, ['-lc', command, '--', ...args], config);

@@ -1082,8 +1082,47 @@ export type ProgrammaticExecutionArtifact = {
   files?: FileRefs;
 };
 
-/** Parameters for creating a bash execution tool (same API as CodeExecutor, bash-only) */
-export type BashExecutionToolParams = CodeExecutionToolParams;
+/**
+ * Validation mode applied to the `command` string before the remote
+ * `BashExecutor` posts to the Code API `/exec` endpoint.
+ *
+ * Independent of the local engine's `bashAst` field (which gates the
+ * full local-engine validator including `bash -n` syntax). On the
+ * remote path there is no local bash to spawn, so this is regex /
+ * heuristic only.
+ *
+ * Default behavior:
+ *
+ *   - A small **always-on hard floor** runs regardless of this value.
+ *     It blocks the patterns that should NEVER run on a remote
+ *     sandbox: destructive shapes against protected roots (`rm -rf
+ *     /`), disk-tampering utilities (`mkfs`, `dd of=/dev/…`), fork
+ *     bombs, `/proc/<pid>/environ` reads, `source $UNBOUND_VAR`, and
+ *     zsh privileged builtins. Not bypassable by config — the host
+ *     does not own the remote sandbox.
+ *
+ *   - `'off'` (default) leaves only the hard floor active.
+ *
+ *   - `'auto'` adds the full static validation pass (bashAst
+ *     heuristics for command substitution, IFS injection, hex
+ *     escapes, etc.). Warnings are surfaced but don't block.
+ *
+ *   - `'strict'` adds the static pass and escalates the bashAst
+ *     warnings to denials. Use for read-only / production agents.
+ */
+export type BashExecutionValidationMode = 'off' | 'auto' | 'strict';
+
+/** Parameters for creating a bash execution tool (same API as CodeExecutor, bash-only). */
+export type BashExecutionToolParams =
+  | undefined
+  | (Exclude<CodeExecutionToolParams, undefined> & {
+      /**
+       * Optional pre-execution validation for the remote `/exec`
+       * path. See {@link BashExecutionValidationMode}. Defaults to
+       * `'off'` (hard floor only).
+       */
+      validation?: BashExecutionValidationMode;
+    });
 
 /** Parameters for creating a bash programmatic tool calling tool (same API as PTC, bash-only) */
 export type BashProgrammaticToolCallingParams = ProgrammaticToolCallingParams;

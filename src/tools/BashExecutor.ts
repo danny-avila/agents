@@ -14,6 +14,10 @@ import {
   getCodeBaseURL,
   resolveCodeApiAuthHeaders,
 } from './CodeExecutor';
+import {
+  validateBashCommandHardFloor,
+  validateBashCommandStatic,
+} from './local/bashValidation';
 import { Constants } from '@/common';
 
 config();
@@ -117,7 +121,7 @@ function createBashExecutionTool(
 ): DynamicStructuredTool {
   return tool(
     async (rawInput, config) => {
-      const { authHeaders, ...executionParams } = params ?? {};
+      const { authHeaders, validation, ...executionParams } = params ?? {};
       const { command, ...rest } = rawInput as {
         command: string;
         args?: string[];
@@ -126,6 +130,42 @@ function createBashExecutionTool(
         session_id?: string;
         _injected_files?: t.CodeEnvFile[];
       };
+
+      // (1) Always-on hard floor. Blocks the patterns that should
+      // never run on a remote sandbox: destructive shapes against
+      // protected roots, disk-tampering utilities, fork bombs,
+      // `/proc/<pid>/environ` reads, source-from-unbound-var, and
+      // zsh privileged builtins. Not bypassable by config — the
+      // host doesn't own the remote sandbox.
+      const floor = validateBashCommandHardFloor(
+        command,
+        (rest as { args?: readonly string[] }).args
+      );
+      if (!floor.valid) {
+        throw new Error(
+          `Bash command rejected by remote validator: ${floor.errors.join('; ')}`
+        );
+      }
+
+      // (2) Optional fuller validation when the host opts in via
+      // `validation: 'auto' | 'strict'`. Adds the bashAst heuristic
+      // pass on top of the floor. `'strict'` escalates warnings
+      // (cmd subst, IFS, hex escape, eval/exec) to denials.
+      if (validation != null && validation !== 'off') {
+        const full = validateBashCommandStatic(
+          command,
+          (rest as { args?: readonly string[] }).args,
+          {
+            bashAst: validation === 'strict' ? 'strict' : 'auto',
+            allowDangerousCommands: false,
+          }
+        );
+        if (!full.valid) {
+          throw new Error(
+            `Bash command rejected by remote validator: ${full.errors.join('; ')}`
+          );
+        }
+      }
 
       const postData: Record<string, unknown> = {
         lang: 'bash',
