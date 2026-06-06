@@ -72,6 +72,32 @@ jobs:
       - name: TypeScript type-check
         run: npx tsc --noEmit
 
+  circular-deps:
+    needs: install
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+
+      - name: Restore node_modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: node-modules-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      - name: Build and check for circular dependencies
+        run: |
+          output=$(npm run build:dev 2>&1)
+          echo "$output"
+          if echo "$output" | grep -qi "Circular depend"; then
+            echo "::error title=Circular dependency detected::Rollup reported a circular dependency. See the build output above."
+            exit 1
+          fi
+
   test:
     needs: install
     runs-on: ubuntu-latest
