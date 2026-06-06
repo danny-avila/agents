@@ -39,11 +39,16 @@ export type StopDecision = 'continue' | 'block';
  * - `runId` identifies the current agent run and is always present.
  * - `threadId` identifies the conversation thread when the host has one.
  * - `agentId` is only set when the hook fires inside a subagent scope.
+ * - `executingAgentId` identifies the agent that owns the node emitting the hook,
+ *   whenever the graph knows it — including top-level agents in a multi-agent
+ *   graph (where `agentId` is intentionally undefined). Use this to attribute a
+ *   hook to a specific agent regardless of subagent scope.
  */
 export interface BaseHookInput {
   runId: string;
   threadId?: string;
   agentId?: string;
+  executingAgentId?: string;
 }
 
 export interface RunStartHookInput extends BaseHookInput {
