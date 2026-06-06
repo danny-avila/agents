@@ -106,6 +106,25 @@ interface FormatMessageParams {
   langChain?: boolean;
 }
 
+type LangChainMessageRole = 'system' | 'user' | 'assistant' | 'tool';
+
+function withMessageRole<T extends BaseMessage>(
+  message: T,
+  role: LangChainMessageRole
+): T {
+  const roleMessage = message as T & { role?: LangChainMessageRole };
+  if (roleMessage.role === role) {
+    return message;
+  }
+  Object.defineProperty(roleMessage, 'role', {
+    value: role,
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  });
+  return message;
+}
+
 interface FormattedMessage {
   role: string;
   content: string | MessageContentComplex[];
@@ -217,7 +236,10 @@ export const formatMessage = ({
       return mediaMessage;
     }
 
-    return new HumanMessage(toLangChainMessageFields(mediaMessage));
+    return withMessageRole(
+      new HumanMessage(toLangChainMessageFields(mediaMessage)),
+      'user'
+    );
   }
 
   if (!langChain) {
@@ -225,11 +247,20 @@ export const formatMessage = ({
   }
 
   if (role === 'user') {
-    return new HumanMessage(toLangChainMessageFields(formattedMessage));
+    return withMessageRole(
+      new HumanMessage(toLangChainMessageFields(formattedMessage)),
+      'user'
+    );
   } else if (role === 'assistant') {
-    return new AIMessage(toLangChainMessageFields(formattedMessage));
+    return withMessageRole(
+      new AIMessage(toLangChainMessageFields(formattedMessage)),
+      'assistant'
+    );
   } else {
-    return new SystemMessage(toLangChainMessageFields(formattedMessage));
+    return withMessageRole(
+      new SystemMessage(toLangChainMessageFields(formattedMessage)),
+      'system'
+    );
   }
 };
 
@@ -402,12 +433,15 @@ function formatAssistantMessage(
 
   const createAIMessage = (content: MessageContent): AIMessage => {
     const reasoningContent = takePendingReasoningContent();
-    return new AIMessage({
-      content,
-      ...(reasoningContent != null && {
-        additional_kwargs: { reasoning_content: reasoningContent },
+    return withMessageRole(
+      new AIMessage({
+        content,
+        ...(reasoningContent != null && {
+          additional_kwargs: { reasoning_content: reasoningContent },
+        }),
       }),
-    });
+      'assistant'
+    );
   };
 
   const attachPendingReasoningContent = (aiMessage: AIMessage): void => {
@@ -537,11 +571,14 @@ function formatAssistantMessage(
         lastAIMessage.tool_calls.push(tool_call as ToolCall);
 
         formattedMessages.push(
-          new ToolMessage({
-            tool_call_id: tool_call.id ?? '',
-            name: tool_call.name,
-            content: output != null ? output : '',
-          })
+          withMessageRole(
+            new ToolMessage({
+              tool_call_id: tool_call.id ?? '',
+              name: tool_call.name,
+              content: output != null ? output : '',
+            }),
+            'tool'
+          )
         );
       } else if (
         part.type === ContentTypes.THINK ||
@@ -1273,15 +1310,18 @@ export const formatAgentMessages = (
         const body = skills?.get(skillName) ?? '';
         if (body) {
           messages.push(
-            new HumanMessage({
-              content: body,
-              additional_kwargs: {
-                role: 'user',
-                isMeta: true,
-                source: 'skill',
-                skillName,
-              },
-            })
+            withMessageRole(
+              new HumanMessage({
+                content: body,
+                additional_kwargs: {
+                  role: 'user',
+                  isMeta: true,
+                  source: 'skill',
+                  skillName,
+                },
+              }),
+              'user'
+            )
           );
         }
       }
@@ -1721,7 +1761,12 @@ export function ensureThinkingBlockInMessages(
         'ensureThinkingBlockInMessages: injecting [Previous agent context] HumanMessage' +
           ` (${parts.length} msgs at index ${i}, no thinking block in chain)`
       );
-      result.push(new HumanMessage({ content: toLangChainContent(parts) }));
+      result.push(
+        withMessageRole(
+          new HumanMessage({ content: toLangChainContent(parts) }),
+          'user'
+        )
+      );
       i = j;
     } else {
       // Keep the message as is
