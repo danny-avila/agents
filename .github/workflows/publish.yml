@@ -11,7 +11,12 @@ permissions:
   contents: read
 
 jobs:
+  validate:
+    uses: ./.github/workflows/validate.yml
+    secrets: inherit
+
   publish:
+    needs: validate
     runs-on: ubuntu-latest
     environment: publish # Must match npm trusted publisher config
     steps:
@@ -31,160 +36,10 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: ESLint
-        run: npx eslint "src/**/*.ts"
-
-      - name: TypeScript type-check
-        run: npx tsc --noEmit
-
       - name: Build
         run: npm run build
         env:
           NODE_ENV: production
-
-      - name: Run tests
-        run: npx jest --testPathIgnorePatterns=title.memory-leak.test.ts --testPathIgnorePatterns=llm.spec.ts --testPathIgnorePatterns=integration.test.ts
-        env:
-          NODE_OPTIONS: '--experimental-vm-modules'
-          NODE_ENV: test
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-          AZURE_MODEL_NAME: ${{ secrets.AZURE_MODEL_NAME }}
-          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
-          AZURE_OPENAI_API_VERSION: ${{ secrets.AZURE_OPENAI_API_VERSION }}
-          AZURE_OPENAI_API_INSTANCE: ${{ secrets.AZURE_OPENAI_API_INSTANCE }}
-          AZURE_OPENAI_API_DEPLOYMENT: ${{ secrets.AZURE_OPENAI_API_DEPLOYMENT }}
-          AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
-          BEDROCK_AWS_ACCESS_KEY_ID: ${{ secrets.BEDROCK_AWS_ACCESS_KEY_ID }}
-          BEDROCK_AWS_SECRET_ACCESS_KEY: ${{ secrets.BEDROCK_AWS_SECRET_ACCESS_KEY }}
-
-      - name: Check for Google LLM changes
-        id: google_changes
-        run: |
-          # Find the previous version commit (skip=1 because HEAD is the current version commit)
-          PREV_VERSION=$(git log --grep="^v[0-9]" --skip=1 --max-count=1 --format="%H" 2>/dev/null || echo "")
-          if [ -z "$PREV_VERSION" ]; then
-            BASE_REF="HEAD~10"
-          else
-            BASE_REF="$PREV_VERSION"
-          fi
-
-          if git diff --name-only $BASE_REF HEAD 2>/dev/null | grep -q "^src/llm/google/"; then
-            echo "changed=true" >> $GITHUB_OUTPUT
-          else
-            echo "changed=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Run Google LLM tests (flaky - timeouts allowed)
-        id: google_llm_tests
-        if: steps.google_changes.outputs.changed == 'true'
-        continue-on-error: true
-        timeout-minutes: 5
-        run: npx jest src/llm/google/llm.spec.ts
-        env:
-          NODE_ENV: test
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-
-      - name: Surface Google LLM soft failure
-        if: always() && steps.google_changes.outputs.changed == 'true' && steps.google_llm_tests.outcome == 'failure'
-        run: |
-          echo "::warning title=Soft-failed Google LLM tests::The Google LLM integration suite failed, but this workflow allows provider API failures. Inspect the publish job logs before releasing."
-          {
-            echo "### Soft-failed Google LLM tests"
-            echo ""
-            echo "The Google LLM integration suite failed, but this job intentionally allows provider API failures."
-            echo ""
-            echo "- Suite: \`npx jest src/llm/google/llm.spec.ts\`"
-            echo "- Logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Check for Anthropic LLM changes
-        id: anthropic_changes
-        run: |
-          PREV_VERSION=$(git log --grep="^v[0-9]" --skip=1 --max-count=1 --format="%H" 2>/dev/null || echo "")
-          if [ -z "$PREV_VERSION" ]; then
-            BASE_REF="HEAD~10"
-          else
-            BASE_REF="$PREV_VERSION"
-          fi
-
-          if git diff --name-only $BASE_REF HEAD 2>/dev/null | grep -q "^src/llm/anthropic/"; then
-            echo "changed=true" >> $GITHUB_OUTPUT
-          else
-            echo "changed=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Run Anthropic LLM tests (flaky - timeouts allowed)
-        id: anthropic_llm_tests
-        if: steps.anthropic_changes.outputs.changed == 'true'
-        continue-on-error: true
-        timeout-minutes: 5
-        run: npx jest src/llm/anthropic/llm.spec.ts
-        env:
-          NODE_ENV: test
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-
-      - name: Surface Anthropic LLM soft failure
-        if: always() && steps.anthropic_changes.outputs.changed == 'true' && steps.anthropic_llm_tests.outcome == 'failure'
-        run: |
-          echo "::warning title=Soft-failed Anthropic LLM tests::The Anthropic LLM integration suite failed, but this workflow allows provider API failures. Inspect the publish job logs before releasing."
-          {
-            echo "### Soft-failed Anthropic LLM tests"
-            echo ""
-            echo "The Anthropic LLM integration suite failed, but this job intentionally allows provider API failures."
-            echo ""
-            echo "- Suite: \`npx jest src/llm/anthropic/llm.spec.ts\`"
-            echo "- Logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Check for PTC changes
-        id: ptc_changes
-        run: |
-          PREV_VERSION=$(git log --grep="^v[0-9]" --skip=1 --max-count=1 --format="%H" 2>/dev/null || echo "")
-          if [ -z "$PREV_VERSION" ]; then
-            BASE_REF="HEAD~10"
-          else
-            BASE_REF="$PREV_VERSION"
-          fi
-
-          if git diff --name-only $BASE_REF HEAD 2>/dev/null | grep -qE "^src/tools/ProgrammaticToolCalling\.ts|^src/tools/ToolNode\.ts|^src/agents/AgentContext\.ts|^src/test/mockTools\.ts"; then
-            echo "changed=true" >> $GITHUB_OUTPUT
-          else
-            echo "changed=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Run PTC unit tests
-        if: steps.ptc_changes.outputs.changed == 'true'
-        timeout-minutes: 5
-        run: npx jest src/tools/__tests__/ProgrammaticToolCalling.test.ts
-        env:
-          NODE_ENV: test
-          LIBRECHAT_CODE_BASEURL: ${{ secrets.LIBRECHAT_CODE_BASEURL }}
-
-      - name: Check for Tool Search changes
-        id: tool_search_changes
-        run: |
-          PREV_VERSION=$(git log --grep="^v[0-9]" --skip=1 --max-count=1 --format="%H" 2>/dev/null || echo "")
-          if [ -z "$PREV_VERSION" ]; then
-            BASE_REF="HEAD~10"
-          else
-            BASE_REF="$PREV_VERSION"
-          fi
-
-          if git diff --name-only $BASE_REF HEAD 2>/dev/null | grep -qE "^src/tools/ToolSearch\.ts|^src/tools/ToolNode\.ts|^src/agents/AgentContext\.ts|^src/test/mockTools\.ts"; then
-            echo "changed=true" >> $GITHUB_OUTPUT
-          else
-            echo "changed=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Run Tool Search unit tests
-        if: steps.tool_search_changes.outputs.changed == 'true'
-        timeout-minutes: 5
-        run: npx jest src/tools/__tests__/ToolSearch.test.ts
-        env:
-          NODE_ENV: test
-          LIBRECHAT_CODE_BASEURL: ${{ secrets.LIBRECHAT_CODE_BASEURL }}
 
       - name: Prune development dependencies
         run: npm prune --production
