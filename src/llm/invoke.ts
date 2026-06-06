@@ -51,6 +51,67 @@ export type InvokeContext = NonNullable<
  */
 export type OnChunk = (chunk: AIMessageChunk) => void | Promise<void>;
 
+function hasRegisteredChatStreamHandler(context?: InvokeContext): boolean {
+  return (
+    context?.handlerRegistry?.getHandler(GraphEvents.CHAT_MODEL_STREAM) != null
+  );
+}
+
+function hasReasoningDetails(chunk: AIMessageChunk): boolean {
+  const reasoningDetails = chunk.additional_kwargs.reasoning_details;
+  return Array.isArray(reasoningDetails) && reasoningDetails.length > 0;
+}
+
+function removeOpenRouterFinalReplayContent({
+  current,
+  next,
+  provider,
+}: {
+  current?: AIMessageChunk;
+  next: AIMessageChunk;
+  provider: Providers;
+}): AIMessageChunk {
+  if (
+    provider !== Providers.OPENROUTER ||
+    current == null ||
+    !hasReasoningDetails(next) ||
+    typeof current.content !== 'string' ||
+    current.content === '' ||
+    typeof next.content !== 'string' ||
+    next.content === ''
+  ) {
+    return next;
+  }
+
+  if (!next.content.startsWith(current.content)) {
+    return next;
+  }
+
+  return new AIMessageChunk(
+    Object.assign({}, next, {
+      content: next.content.slice(current.content.length),
+    })
+  );
+}
+
+function appendStreamChunk({
+  current,
+  next,
+  provider,
+}: {
+  current?: AIMessageChunk;
+  next: AIMessageChunk;
+  provider: Providers;
+}): AIMessageChunk {
+  if (current == null) {
+    return next;
+  }
+  return concat(
+    current,
+    removeOpenRouterFinalReplayContent({ current, next, provider })
+  );
+}
+
 /**
  * Invokes a chat model with the given messages, handling both streaming and
  * non-streaming paths.
@@ -94,9 +155,13 @@ export async function attemptInvoke(
     if (onChunk) {
       for await (const chunk of stream) {
         await onChunk(chunk);
-        finalChunk = finalChunk ? concat(finalChunk, chunk) : chunk;
+        finalChunk = appendStreamChunk({
+          current: finalChunk,
+          next: chunk,
+          provider,
+        });
       }
-    } else {
+    } else if (!hasRegisteredChatStreamHandler(context)) {
       const metadata = config?.metadata as Record<string, unknown> | undefined;
       const streamHandler = new ChatModelStreamHandler();
       for await (const chunk of stream) {
@@ -106,7 +171,19 @@ export async function attemptInvoke(
           metadata,
           context
         );
-        finalChunk = finalChunk ? concat(finalChunk, chunk) : chunk;
+        finalChunk = appendStreamChunk({
+          current: finalChunk,
+          next: chunk,
+          provider,
+        });
+      }
+    } else {
+      for await (const chunk of stream) {
+        finalChunk = appendStreamChunk({
+          current: finalChunk,
+          next: chunk,
+          provider,
+        });
       }
     }
 

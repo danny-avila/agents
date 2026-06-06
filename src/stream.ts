@@ -978,16 +978,29 @@ function hasReasoningContent(
   );
 }
 
-function shouldDeferDisableStreamingMixedFinalChunk({
+function recordStreamedTextContent(
+  agentContext: AgentContext,
+  content: string | t.MessageDelta['content'] | undefined
+): void {
+  if (content == null) {
+    return;
+  }
+  if (typeof content === 'string') {
+    agentContext.streamedTextContent += content;
+    return;
+  }
+  agentContext.streamedTextContent += content
+    .map((part) => (part.type === ContentTypes.TEXT ? part.text : ''))
+    .join('');
+}
+
+function shouldDeferMixedFinalReasoningChunk({
   chunk,
   agentContext,
 }: {
   chunk: Partial<AIMessageChunk>;
   agentContext: AgentContext;
 }): boolean {
-  if (!isDisableStreamingEnabled(agentContext.clientOptions)) {
-    return false;
-  }
   if (
     (chunk.tool_calls?.length ?? 0) > 0 ||
     (chunk.tool_call_chunks?.length ?? 0) > 0 ||
@@ -997,6 +1010,15 @@ function shouldDeferDisableStreamingMixedFinalChunk({
     return false;
   }
   const additionalKwargs = chunk.additional_kwargs;
+  if (
+    agentContext.provider === Providers.OPENROUTER &&
+    hasReasoningContent(additionalKwargs?.reasoning_details as object[])
+  ) {
+    return true;
+  }
+  if (!isDisableStreamingEnabled(agentContext.clientOptions)) {
+    return false;
+  }
   return (
     hasReasoningContent(
       additionalKwargs?.[agentContext.reasoningKey] as
@@ -1060,7 +1082,7 @@ export class ChatModelStreamHandler implements t.EventHandler {
     if (skipHandling) {
       return;
     }
-    if (shouldDeferDisableStreamingMixedFinalChunk({ chunk, agentContext })) {
+    if (shouldDeferMixedFinalReasoningChunk({ chunk, agentContext })) {
       return;
     }
     this.handleReasoning(chunk, agentContext);
@@ -1203,6 +1225,7 @@ hasToolCallChunks: ${hasToolCallChunks}
       return;
     } else if (typeof content === 'string') {
       if (agentContext.currentTokenType === ContentTypes.TEXT) {
+        recordStreamedTextContent(agentContext, content);
         await graph.dispatchMessageDelta(
           stepId,
           {
@@ -1248,6 +1271,7 @@ hasToolCallChunks: ${hasToolCallChunks}
           );
 
           const newStepId = graph.getStepIdByKey(newStepKey);
+          recordStreamedTextContent(agentContext, text);
           await graph.dispatchMessageDelta(
             newStepId,
             {
@@ -1278,6 +1302,7 @@ hasToolCallChunks: ${hasToolCallChunks}
     } else if (
       content.every((c) => c.type?.startsWith(ContentTypes.TEXT) ?? false)
     ) {
+      recordStreamedTextContent(agentContext, content);
       await graph.dispatchMessageDelta(
         stepId,
         {

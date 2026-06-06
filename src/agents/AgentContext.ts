@@ -252,6 +252,8 @@ export class AgentContext {
   /** Current token type being processed */
   currentTokenType: ContentTypes.TEXT | ContentTypes.THINK | 'think_and_text' =
     ContentTypes.TEXT;
+  /** Visible text dispatched through stream deltas in the current run */
+  streamedTextContent = '';
   /** Whether tools should end the workflow */
   toolEnd: boolean = false;
   /** Cached system runnable (created lazily) */
@@ -904,6 +906,7 @@ export class AgentContext {
     this.tokenTypeSwitch = undefined;
     this.reasoningTransitionCount = 0;
     this.currentTokenType = ContentTypes.TEXT;
+    this.streamedTextContent = '';
     this.discoveredToolNames.clear();
     this.handoffContext = undefined;
 

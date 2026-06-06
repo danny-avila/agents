@@ -205,6 +205,33 @@ function getTextMessageDeltaContent(
   return content as t.MessageDelta['content'];
 }
 
+function getTextDeltaValue(
+  content: t.MessageDelta['content'] | undefined
+): string | undefined {
+  if (content == null) {
+    return undefined;
+  }
+  const text = content
+    .map((contentPart) =>
+      contentPart.type === ContentTypes.TEXT ? contentPart.text : ''
+    )
+    .join('');
+  return text !== '' ? text : undefined;
+}
+
+function isFinalTextReplay({
+  agentContext,
+  content,
+}: {
+  agentContext: AgentContext;
+  content: t.MessageDelta['content'] | undefined;
+}): boolean {
+  const text = getTextDeltaValue(content);
+  // Keep this exact: the reported replay stores byte-identical answer text.
+  // Prefix/suffix guessing risks suppressing legitimate final content.
+  return text != null && text === agentContext.streamedTextContent;
+}
+
 async function dispatchTextMessageContent({
   graph,
   stepKey,
@@ -1688,7 +1715,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         if (dispatchedReasoning) {
           markPostReasoningContent(agentContext);
         }
-        if (textMessageContent != null) {
+        if (
+          textMessageContent != null &&
+          !isFinalTextReplay({ agentContext, content: textMessageContent })
+        ) {
           const stepKey = this.getStepKey(metadata);
           const dispatchedText = await dispatchTextMessageContent({
             graph: this,
@@ -1721,7 +1751,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         if (dispatchedReasoning && textMessageContent != null) {
           markPostReasoningContent(agentContext);
         }
-        if (textMessageContent != null) {
+        if (
+          textMessageContent != null &&
+          !isFinalTextReplay({ agentContext, content: textMessageContent })
+        ) {
           const stepKey = this.getStepKey(metadata);
           await dispatchTextMessageContent({
             graph: this,
