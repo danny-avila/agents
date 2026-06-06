@@ -211,10 +211,43 @@ function hasTextDeltaContent(
   if (content == null) {
     return false;
   }
+  return content.some((contentPart) => {
+    if (contentPart.type?.startsWith(ContentTypes.TEXT) !== true) {
+      return false;
+    }
+    const text = (contentPart as Partial<{ text: string }>).text;
+    return typeof text === 'string' && text !== '';
+  });
+}
+
+function hasReasoningDeltaContent(
+  content: t.ReasoningDelta['content'] | undefined
+): boolean {
+  if (content == null) {
+    return false;
+  }
   return content.some(
     (contentPart) =>
-      contentPart.type === ContentTypes.TEXT && contentPart.text !== ''
+      contentPart.type === ContentTypes.THINK && contentPart.think !== ''
   );
+}
+
+function getCurrentStepIds({
+  graph,
+  metadata,
+}: {
+  graph: Graph<t.BaseGraphState>;
+  metadata: Record<string, unknown>;
+}): string[] {
+  const baseStepKey = graph.getStepBaseKey(metadata);
+  const currentStepIds: string[] = [];
+  for (const [stepKey, stepIds] of graph.stepKeyIds) {
+    if (stepKey !== baseStepKey && !stepKey.startsWith(`${baseStepKey}_`)) {
+      continue;
+    }
+    currentStepIds.push(...stepIds);
+  }
+  return currentStepIds;
 }
 
 function hasCurrentTextDeltaStep({
@@ -224,16 +257,34 @@ function hasCurrentTextDeltaStep({
   graph: Graph<t.BaseGraphState>;
   metadata: Record<string, unknown>;
 }): boolean {
-  const baseStepKey = graph.getStepBaseKey(metadata);
-  for (const [stepKey, stepIds] of graph.stepKeyIds) {
-    if (stepKey !== baseStepKey && !stepKey.startsWith(`${baseStepKey}_`)) {
-      continue;
-    }
-    if (stepIds.some((stepId) => graph.messageStepHasTextDeltas.has(stepId))) {
-      return true;
-    }
+  return getCurrentStepIds({ graph, metadata }).some((stepId) =>
+    graph.messageStepHasTextDeltas.has(stepId)
+  );
+}
+
+function hasCurrentReasoningDeltaStep({
+  graph,
+  metadata,
+}: {
+  graph: Graph<t.BaseGraphState>;
+  metadata: Record<string, unknown>;
+}): boolean {
+  return getCurrentStepIds({ graph, metadata }).some((stepId) =>
+    graph.reasoningStepHasDeltas.has(stepId)
+  );
+}
+
+function clearCurrentDeltaStepMarkers({
+  graph,
+  metadata,
+}: {
+  graph: Graph<t.BaseGraphState>;
+  metadata: Record<string, unknown>;
+}): void {
+  for (const stepId of getCurrentStepIds({ graph, metadata })) {
+    graph.messageStepHasTextDeltas.delete(stepId);
+    graph.reasoningStepHasDeltas.delete(stepId);
   }
-  return false;
 }
 
 async function dispatchTextMessageContent({
@@ -389,6 +440,7 @@ export abstract class Graph<
    * the same step are scoped to the active custom event dispatch.
    */
   handlerDispatchedStepIds: Set<string> = new Set();
+  reasoningStepHasDeltas: Set<string> = new Set();
   protected handlerDispatchedEventCounts: Map<string, number> = new Map();
   signal?: AbortSignal;
   /** Set of invoked tool call IDs from non-message run steps completed mid-run, if any */
@@ -465,6 +517,7 @@ export abstract class Graph<
     this.toolCallStepIds.clear();
     this.messageIdsByStepKey = new Map();
     this.messageStepHasTextDeltas = new Set();
+    this.reasoningStepHasDeltas = new Set();
     this.messageStepHasToolCalls = new Map();
     this.prelimMessageIdsByStepKey = new Map();
     this.invokedToolIds = undefined;
@@ -743,6 +796,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     );
     this.messageStepHasTextDeltas = resetIfNotEmpty(
       this.messageStepHasTextDeltas,
+      new Set()
+    );
+    this.reasoningStepHasDeltas = resetIfNotEmpty(
+      this.reasoningStepHasDeltas,
       new Set()
     );
     this.prelimMessageIdsByStepKey = resetIfNotEmpty(
@@ -1674,6 +1731,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           };
         }
       }
+      const metadata = config.metadata as Record<string, unknown>;
 
       try {
         result = await withLangfuseToolOutputTracingConfig(
@@ -1691,6 +1749,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           agentContext.langfuse
         );
       } catch (primaryError) {
+        clearCurrentDeltaStepMarkers({
+          graph: this,
+          metadata,
+        });
         result = await withLangfuseToolOutputTracingConfig(
           this.langfuse,
           () =>
@@ -1731,7 +1793,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       const toolCalls = (responseMessage as AIMessageChunk | undefined)
         ?.tool_calls;
       const hasToolCalls = Array.isArray(toolCalls) && toolCalls.length > 0;
-      const metadata = config.metadata as Record<string, unknown>;
       const responseReasoningContent = getResponseReasoningContent({
         responseMessage: responseMessage as Partial<AIMessageChunk> | undefined,
         reasoningKey: agentContext.reasoningKey,
@@ -1743,10 +1804,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         graph: this,
         metadata,
       });
+      const hasStreamedReasoningDeltaStep = hasCurrentReasoningDeltaStep({
+        graph: this,
+        metadata,
+      });
 
       if (hasToolCalls) {
         const dispatchedReasoning =
           responseReasoningContent != null &&
+          !hasStreamedReasoningDeltaStep &&
           (await dispatchReasoningContent({
             graph: this,
             agentContext,
@@ -1780,6 +1846,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       if (!hasToolCalls && responseMessage != null) {
         const dispatchedReasoning =
           responseReasoningContent != null &&
+          !hasStreamedReasoningDeltaStep &&
           (await dispatchReasoningContent({
             graph: this,
             agentContext,
@@ -2403,6 +2470,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       id: stepId,
       delta,
     };
+    if (hasReasoningDeltaContent(delta.content)) {
+      this.reasoningStepHasDeltas.add(stepId);
+    }
     const handler = this.handlerRegistry?.getHandler(
       GraphEvents.ON_REASONING_DELTA
     );

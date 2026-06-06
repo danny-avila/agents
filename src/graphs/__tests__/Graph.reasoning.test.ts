@@ -977,6 +977,149 @@ describe('StandardGraph final response reasoning fallback', () => {
     ]);
   });
 
+  it('does not replay streamed text block variants from the final fallback', async () => {
+    const text = 'Variant text.';
+    const textDeltaContent: t.MessageDelta['content'] = [
+      { type: 'text_delta', text },
+    ];
+    const reasoningDeltas: t.ReasoningDeltaEvent[] = [];
+    const messageDeltas: t.MessageDeltaEvent[] = [];
+    const { aggregateContent } = createContentAggregator();
+    const run = await Run.create<t.IState>({
+      runId: 'reasoning-fallback-text-delta-block',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: Providers.OPENAI,
+          disableStreaming: true,
+          streamUsage: false,
+        },
+      },
+      returnContent: true,
+      skipCleanup: true,
+      customHandlers: createReasoningHandlers(
+        aggregateContent,
+        reasoningDeltas,
+        messageDeltas
+      ),
+    });
+
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+
+    const graph = run.Graph;
+    const metadata = {
+      thread_id: 'reasoning-fallback-text-delta-block',
+      langgraph_node: 'agent=default',
+      langgraph_step: 1,
+      checkpoint_ns: '',
+    };
+    const runConfig = {
+      ...config,
+      configurable: {
+        thread_id: 'reasoning-fallback-text-delta-block',
+      },
+      metadata,
+    };
+    graph.config = runConfig;
+    const stepKey = graph.getStepKey(metadata);
+    await graph.dispatchRunStep(
+      stepKey,
+      {
+        type: StepTypes.MESSAGE_CREATION,
+        message_creation: { message_id: 'msg-text-delta-block' },
+      },
+      metadata
+    );
+    await graph.dispatchMessageDelta(
+      graph.getStepIdByKey(stepKey),
+      { content: textDeltaContent },
+      metadata
+    );
+
+    graph.overrideModel = new InvokeOnlyMessageModel(
+      new AIMessageChunk({ content: textDeltaContent as never })
+    );
+
+    await graph.createCallModel('default')(
+      { messages: [new HumanMessage('finish text delta block')] },
+      runConfig
+    );
+
+    expect(messageDeltas.map((delta) => delta.delta.content?.[0])).toEqual([
+      { type: 'text_delta', text },
+    ]);
+  });
+
+  it('sanitizes OpenRouter final reasoning chunks for registered stream handlers', async () => {
+    const firstText = 'Hello ';
+    const replayWithSuffix = 'Hello world';
+    const reasoningText = 'The greeting needs one more word.';
+    const reasoningDeltas: t.ReasoningDeltaEvent[] = [];
+    const messageDeltas: t.MessageDeltaEvent[] = [];
+    const { aggregateContent } = createContentAggregator();
+    const streamHandler = new ChatModelStreamHandler();
+    const run = await Run.create<t.IState>({
+      runId: 'reasoning-fallback-openrouter-registered-handler-suffix',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: Providers.OPENROUTER,
+          streamUsage: false,
+        },
+        reasoningKey: 'reasoning',
+      },
+      returnContent: true,
+      skipCleanup: true,
+      customHandlers: {
+        [GraphEvents.CHAT_MODEL_STREAM]: streamHandler,
+        ...createReasoningHandlers(
+          aggregateContent,
+          reasoningDeltas,
+          messageDeltas
+        ),
+      },
+    });
+
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+
+    run.Graph.overrideModel = new StreamingReasoningModel([
+      new AIMessageChunk({ content: firstText }),
+      new AIMessageChunk({
+        content: replayWithSuffix,
+        additional_kwargs: {
+          reasoning_details: [
+            { type: 'reasoning.text', text: reasoningText },
+          ],
+        },
+      }),
+    ]);
+
+    const finalContentParts = await run.processStream(
+      { messages: [new HumanMessage('stream OpenRouter suffix once')] },
+      {
+        ...config,
+        configurable: {
+          thread_id:
+            'reasoning-fallback-openrouter-registered-handler-suffix',
+        },
+      }
+    );
+
+    expect(reasoningDeltas).toHaveLength(1);
+    expect(messageDeltas.map((delta) => delta.delta.content?.[0])).toEqual([
+      { type: ContentTypes.TEXT, text: 'world' },
+    ]);
+    expect(finalContentParts).toEqual([
+      { type: ContentTypes.THINK, think: reasoningText },
+      { type: ContentTypes.TEXT, text: replayWithSuffix },
+    ]);
+    expect(run.getRunMessages()?.[0]?.content).toBe(replayWithSuffix);
+  });
+
   it('composes observer chat stream handlers with default graph dispatch', async () => {
     const firstText = 'Vis';
     const secondText = 'ible answer.';

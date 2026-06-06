@@ -51,13 +51,13 @@ export type InvokeContext = NonNullable<
  */
 export type OnChunk = (chunk: AIMessageChunk) => void | Promise<void>;
 
-function hasRegisteredDefaultChatStreamHandler(
+function getRegisteredDefaultChatStreamHandler(
   context?: InvokeContext
-): boolean {
-  return (
-    context?.handlerRegistry?.getHandler(GraphEvents.CHAT_MODEL_STREAM) instanceof
-    ChatModelStreamHandler
+): ChatModelStreamHandler | undefined {
+  const handler = context?.handlerRegistry?.getHandler(
+    GraphEvents.CHAT_MODEL_STREAM
   );
+  return handler instanceof ChatModelStreamHandler ? handler : undefined;
 }
 
 function hasReasoningDetails(chunk: AIMessageChunk): boolean {
@@ -211,6 +211,8 @@ export async function attemptInvoke(
   if (model.stream) {
     const stream = await model.stream(messagesForProvider, config);
     let finalChunk: AIMessageChunk | undefined;
+    const registeredStreamHandler =
+      getRegisteredDefaultChatStreamHandler(context);
 
     if (onChunk) {
       for await (const chunk of stream) {
@@ -221,7 +223,7 @@ export async function attemptInvoke(
           provider,
         });
       }
-    } else if (!hasRegisteredDefaultChatStreamHandler(context)) {
+    } else if (registeredStreamHandler == null) {
       const metadata = config?.metadata as Record<string, unknown> | undefined;
       const streamHandler = new ChatModelStreamHandler();
       for await (const chunk of stream) {
@@ -245,7 +247,21 @@ export async function attemptInvoke(
         });
       }
     } else {
+      const metadata = config?.metadata as Record<string, unknown> | undefined;
       for await (const chunk of stream) {
+        const handlingChunk = getStreamHandlingChunk({
+          current: finalChunk,
+          next: chunk,
+          provider,
+        });
+        if (handlingChunk != null && handlingChunk !== chunk) {
+          await registeredStreamHandler.handle(
+            GraphEvents.CHAT_MODEL_STREAM,
+            { chunk: handlingChunk },
+            metadata,
+            context
+          );
+        }
         finalChunk = appendStreamChunk({
           current: finalChunk,
           next: chunk,
