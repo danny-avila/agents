@@ -62,7 +62,7 @@ function hasReasoningDetails(chunk: AIMessageChunk): boolean {
   return Array.isArray(reasoningDetails) && reasoningDetails.length > 0;
 }
 
-function removeOpenRouterFinalReplayContent({
+function removeOpenRouterFinalReasoningReplayContent({
   current,
   next,
   provider,
@@ -83,13 +83,9 @@ function removeOpenRouterFinalReplayContent({
     return next;
   }
 
-  if (!next.content.startsWith(current.content)) {
-    return next;
-  }
-
   return new AIMessageChunk(
     Object.assign({}, next, {
-      content: next.content.slice(current.content.length),
+      content: '',
     })
   );
 }
@@ -108,7 +104,7 @@ function appendStreamChunk({
   }
   return concat(
     current,
-    removeOpenRouterFinalReplayContent({ current, next, provider })
+    removeOpenRouterFinalReasoningReplayContent({ current, next, provider })
   );
 }
 

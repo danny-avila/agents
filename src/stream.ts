@@ -978,20 +978,8 @@ function hasReasoningContent(
   );
 }
 
-function recordStreamedTextContent(
-  agentContext: AgentContext,
-  content: string | t.MessageDelta['content'] | undefined
-): void {
-  if (content == null) {
-    return;
-  }
-  if (typeof content === 'string') {
-    agentContext.streamedTextContent += content;
-    return;
-  }
-  agentContext.streamedTextContent += content
-    .map((part) => (part.type === ContentTypes.TEXT ? part.text : ''))
-    .join('');
+function recordStreamedTextDelta(agentContext: AgentContext): void {
+  agentContext.streamedTextDeltaCount++;
 }
 
 function shouldDeferMixedFinalReasoningChunk({
@@ -1225,7 +1213,7 @@ hasToolCallChunks: ${hasToolCallChunks}
       return;
     } else if (typeof content === 'string') {
       if (agentContext.currentTokenType === ContentTypes.TEXT) {
-        recordStreamedTextContent(agentContext, content);
+        recordStreamedTextDelta(agentContext);
         await graph.dispatchMessageDelta(
           stepId,
           {
@@ -1271,7 +1259,7 @@ hasToolCallChunks: ${hasToolCallChunks}
           );
 
           const newStepId = graph.getStepIdByKey(newStepKey);
-          recordStreamedTextContent(agentContext, text);
+          recordStreamedTextDelta(agentContext);
           await graph.dispatchMessageDelta(
             newStepId,
             {
@@ -1302,7 +1290,7 @@ hasToolCallChunks: ${hasToolCallChunks}
     } else if (
       content.every((c) => c.type?.startsWith(ContentTypes.TEXT) ?? false)
     ) {
-      recordStreamedTextContent(agentContext, content);
+      recordStreamedTextDelta(agentContext);
       await graph.dispatchMessageDelta(
         stepId,
         {

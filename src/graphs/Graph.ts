@@ -205,31 +205,28 @@ function getTextMessageDeltaContent(
   return content as t.MessageDelta['content'];
 }
 
-function getTextDeltaValue(
+function hasTextDeltaContent(
   content: t.MessageDelta['content'] | undefined
-): string | undefined {
+): boolean {
   if (content == null) {
-    return undefined;
+    return false;
   }
-  const text = content
-    .map((contentPart) =>
-      contentPart.type === ContentTypes.TEXT ? contentPart.text : ''
-    )
-    .join('');
-  return text !== '' ? text : undefined;
+  return content.some(
+    (contentPart) =>
+      contentPart.type === ContentTypes.TEXT && contentPart.text !== ''
+  );
 }
 
-function isFinalTextReplay({
+function shouldSkipFinalTextFallback({
   agentContext,
   content,
 }: {
   agentContext: AgentContext;
   content: t.MessageDelta['content'] | undefined;
 }): boolean {
-  const text = getTextDeltaValue(content);
-  // Keep this exact: the reported replay stores byte-identical answer text.
-  // Prefix/suffix guessing risks suppressing legitimate final content.
-  return text != null && text === agentContext.streamedTextContent;
+  return (
+    agentContext.streamedTextDeltaCount > 0 && hasTextDeltaContent(content)
+  );
 }
 
 async function dispatchTextMessageContent({
@@ -1639,6 +1636,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }
 
       try {
+        agentContext.streamedTextDeltaCount = 0;
         result = await withLangfuseToolOutputTracingConfig(
           this.langfuse,
           () =>
@@ -1654,6 +1652,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           agentContext.langfuse
         );
       } catch (primaryError) {
+        agentContext.streamedTextDeltaCount = 0;
         result = await withLangfuseToolOutputTracingConfig(
           this.langfuse,
           () =>
@@ -1717,7 +1716,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         }
         if (
           textMessageContent != null &&
-          !isFinalTextReplay({ agentContext, content: textMessageContent })
+          !shouldSkipFinalTextFallback({
+            agentContext,
+            content: textMessageContent,
+          })
         ) {
           const stepKey = this.getStepKey(metadata);
           const dispatchedText = await dispatchTextMessageContent({
@@ -1753,7 +1755,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         }
         if (
           textMessageContent != null &&
-          !isFinalTextReplay({ agentContext, content: textMessageContent })
+          !shouldSkipFinalTextFallback({
+            agentContext,
+            content: textMessageContent,
+          })
         ) {
           const stepKey = this.getStepKey(metadata);
           await dispatchTextMessageContent({
