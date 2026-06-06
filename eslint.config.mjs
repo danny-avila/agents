@@ -98,7 +98,7 @@ export default defineConfig([globalIgnores([
         "@typescript-eslint/strict-boolean-expressions": "warn",
     },
 }, {
-    files: ["src/stream.ts", "src/utils/logging.ts"],
+    files: ["src/stream.ts", "src/utils/logging.ts", "scripts/**/*.ts"],
 
     rules: {
         "no-console": "off",
