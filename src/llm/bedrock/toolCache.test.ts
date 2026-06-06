@@ -15,17 +15,30 @@ type OpenAITool = {
   };
 };
 
-function createOpenAITool(name: string): OpenAITool {
+type CreateOpenAIToolOptions = {
+  description?: string;
+  omitDescription?: boolean;
+};
+
+function createOpenAITool(
+  name: string,
+  options: CreateOpenAIToolOptions = {}
+): OpenAITool {
+  const functionDefinition: OpenAITool['function'] = {
+    name,
+    parameters: {
+      type: 'object',
+      properties: {},
+    },
+  };
+  const description = options.description ?? `${name} description`;
+  if (options.omitDescription !== true) {
+    functionDefinition.description = description;
+  }
+
   return {
     type: 'function',
-    function: {
-      name,
-      description: `${name} description`,
-      parameters: {
-        type: 'object',
-        properties: {},
-      },
-    },
+    function: functionDefinition,
   };
 }
 
@@ -38,6 +51,11 @@ function toolName(entry: Tool): string {
 
 function toolNames(tools: Tool[] | undefined): string[] {
   return (tools ?? []).map(toolName);
+}
+
+function getToolSpec(entry: Tool): Tool.ToolSpecMember['toolSpec'] {
+  expect(entry).toHaveProperty('toolSpec');
+  return (entry as Tool.ToolSpecMember).toolSpec;
 }
 
 describe('partitionAndMarkBedrockToolCache', () => {
@@ -127,5 +145,26 @@ describe('partitionAndMarkBedrockToolCache', () => {
     );
 
     expect(toolNames(result?.tools)).toEqual(['direct_tool', 'cachePoint']);
+  });
+
+  it('omits empty OpenAI tool descriptions when converting for Bedrock', () => {
+    const tools = [
+      createOpenAITool('missing_description', { omitDescription: true }),
+      createOpenAITool('empty_description', { description: '' }),
+      createOpenAITool('described_tool'),
+    ] as GraphTools;
+
+    const marked = partitionAndMarkBedrockToolCache(
+      tools,
+      () => false
+    ) as Tool[];
+    const result = insertBedrockToolCachePoint({ tools: marked }, false);
+    const convertedTools = result?.tools ?? [];
+
+    expect(getToolSpec(convertedTools[0])).not.toHaveProperty('description');
+    expect(getToolSpec(convertedTools[1])).not.toHaveProperty('description');
+    expect(getToolSpec(convertedTools[2]).description).toBe(
+      'described_tool description'
+    );
   });
 });

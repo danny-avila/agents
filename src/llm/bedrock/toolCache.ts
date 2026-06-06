@@ -60,12 +60,17 @@ function getToolName(tool: unknown): string | undefined {
 }
 
 function openAIToBedrockTool(tool: OpenAIFunctionTool): Tool.ToolSpecMember {
+  const toolSpec: NonNullable<Tool.ToolSpecMember['toolSpec']> = {
+    name: tool.function.name,
+    inputSchema: { json: tool.function.parameters as DocumentType },
+  };
+
+  if (tool.function.description != null && tool.function.description !== '') {
+    toolSpec.description = tool.function.description;
+  }
+
   return {
-    toolSpec: {
-      name: tool.function.name,
-      description: tool.function.description,
-      inputSchema: { json: tool.function.parameters as DocumentType },
-    },
+    toolSpec,
   };
 }
 
