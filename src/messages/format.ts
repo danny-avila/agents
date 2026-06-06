@@ -29,6 +29,7 @@ import type { RunnableConfig } from '@langchain/core/runnables';
 import { emitAgentLog } from '@/utils/events';
 import { Providers, ContentTypes, Constants } from '@/common';
 import { toLangChainContent, toLangChainMessageFields } from './langchain';
+import { normalizeAnthropicToolCallId } from '@/llm/anthropic/utils/message_inputs';
 
 interface MediaMessageParams {
   message: {
@@ -376,7 +377,6 @@ function isValidServerToolResult(part: MessageContentComplex): boolean {
   const toolUseId = getToolUseId(part);
   if (
     toolUseId?.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX) !== true ||
-    part.type !== 'web_search_tool_result' ||
     !('content' in part)
   ) {
     return false;
@@ -503,13 +503,18 @@ function formatAssistantMessage(
       }
       const toolUseId = getToolUseId(part);
       if (toolUseId != null) {
+        const isServerToolResult = isValidServerToolResult(part);
         if (
           toolUseId.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX) &&
-          !isValidServerToolResult(part)
+          !isServerToolResult
         ) {
           continue;
         }
         flushPendingServerToolUse(toolUseId);
+        if (isServerToolResult) {
+          currentContent.push(part);
+          continue;
+        }
       } else if (hasMeaningfulAssistantContent(part)) {
         for (const id of pendingServerToolUses.keys()) {
           if (!serverToolResultIds.has(id)) {
@@ -624,11 +629,14 @@ function formatAssistantMessage(
         }
 
         tool_call.args = args;
-        if (Array.isArray(lastAIMessage.content)) {
+        if (
+          options?.provider === Providers.ANTHROPIC &&
+          Array.isArray(lastAIMessage.content)
+        ) {
           const content = lastAIMessage.content as MessageContentComplex[];
           content.push({
             type: 'tool_use',
-            id: tool_call.id,
+            id: normalizeAnthropicToolCallId(tool_call.id ?? ''),
             name: tool_call.name,
             input: args,
           } as MessageContentComplex);
