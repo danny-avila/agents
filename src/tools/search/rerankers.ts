@@ -1,8 +1,10 @@
 import axios from 'axios';
 import type * as t from './types';
 import { createDefaultLogger, formatErrorForLog } from './utils';
+import { getAxiosProxyOptions } from './proxy';
 
 const DEFAULT_JINA_API_URL = 'https://api.jina.ai/v1/rerank';
+const COHERE_API_URL = 'https://api.cohere.com/v2/rerank';
 
 const getDefaultJinaApiUrl = (): string =>
   process.env.JINA_API_URL != null && process.env.JINA_API_URL !== ''
@@ -56,7 +58,9 @@ export class JinaReranker extends BaseReranker {
     documents: string[],
     topK: number = 5
   ): Promise<t.Highlight[]> {
-    this.logger.debug(`Reranking ${documents.length} chunks with Jina using API URL: ${this.apiUrl}`);
+    this.logger.debug(
+      `Reranking ${documents.length} chunks with Jina using API URL: ${this.apiUrl}`
+    );
 
     try {
       if (this.apiKey == null || this.apiKey === '') {
@@ -80,6 +84,7 @@ export class JinaReranker extends BaseReranker {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${this.apiKey}`,
           },
+          ...getAxiosProxyOptions(this.apiUrl),
         }
       );
 
@@ -154,13 +159,14 @@ export class CohereReranker extends BaseReranker {
       };
 
       const response = await axios.post<t.CohereRerankerResponse | undefined>(
-        'https://api.cohere.com/v2/rerank',
+        COHERE_API_URL,
         requestData,
         {
           headers: {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${this.apiKey}`,
           },
+          ...getAxiosProxyOptions(COHERE_API_URL),
         }
       );
 
@@ -227,7 +233,11 @@ export const createReranker = (config: {
 
   switch (rerankerType.toLowerCase()) {
   case 'jina':
-    return new JinaReranker({ apiKey: jinaApiKey, apiUrl: jinaApiUrl, logger: defaultLogger });
+    return new JinaReranker({
+      apiKey: jinaApiKey,
+      apiUrl: jinaApiUrl,
+      logger: defaultLogger,
+    });
   case 'cohere':
     return new CohereReranker({
       apiKey: cohereApiKey,
@@ -242,7 +252,11 @@ export const createReranker = (config: {
     defaultLogger.warn(
       `Unknown reranker type: ${rerankerType}. Defaulting to InfinityReranker.`
     );
-    return new JinaReranker({ apiKey: jinaApiKey, apiUrl: jinaApiUrl, logger: defaultLogger });
+    return new JinaReranker({
+      apiKey: jinaApiKey,
+      apiUrl: jinaApiUrl,
+      logger: defaultLogger,
+    });
   }
 };
 

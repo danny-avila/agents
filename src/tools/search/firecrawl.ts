@@ -1,5 +1,6 @@
 import axios from 'axios';
 import type * as t from './types';
+import { getAxiosProxyOptions } from './proxy';
 import { createDefaultLogger } from './utils';
 import { processContent } from './content';
 
@@ -121,6 +122,7 @@ export class FirecrawlScraper implements t.BaseScraper {
           Authorization: `Bearer ${this.apiKey}`,
         },
         timeout: this.timeout,
+        ...getAxiosProxyOptions(this.apiUrl),
       });
 
       return [url, response.data];

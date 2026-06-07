@@ -1,5 +1,6 @@
 import axios from 'axios';
 import type * as t from './types';
+import { getAxiosProxyOptions } from './proxy';
 import { createDefaultLogger } from './utils';
 
 const DEFAULT_BASIC_TIMEOUT = 15000;
@@ -140,6 +141,7 @@ export class TavilyScraper implements t.BaseScraper {
           'Content-Type': 'application/json',
         },
         timeout: effectiveTimeout,
+        ...getAxiosProxyOptions(this.apiUrl),
       });
 
       const data = response.data;
