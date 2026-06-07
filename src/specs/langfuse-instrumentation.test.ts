@@ -33,16 +33,17 @@ type BasicTracerProviderInput = {
     shutdown?: unknown;
   }>;
 };
-type RoutingSpanProcessorForTest = BasicTracerProviderInput['spanProcessors'][0] & {
-  processors: Map<
-    string,
-    {
-      fallbackConfig?: {
-        enabled?: boolean;
-      };
-    }
-  >;
-};
+type RoutingSpanProcessorForTest =
+  BasicTracerProviderInput['spanProcessors'][0] & {
+    processors: Map<
+      string,
+      {
+        fallbackToolConfig?: {
+          enabled?: boolean;
+        };
+      }
+    >;
+  };
 const mockBasicTracerProvider = jest.fn(
   (_input?: BasicTracerProviderInput) => mockTracerProvider
 );
@@ -228,10 +229,10 @@ describe('Langfuse instrumentation', () => {
 
     const providerInput = mockBasicTracerProvider.mock
       .calls[0][0] as BasicTracerProviderInput;
-    const routingProcessor =
-      providerInput.spanProcessors[0] as RoutingSpanProcessorForTest;
+    const routingProcessor = providerInput
+      .spanProcessors[0] as RoutingSpanProcessorForTest;
     const childProcessors = Array.from(routingProcessor.processors.values());
-    expect(childProcessors[0]?.fallbackConfig).toMatchObject({
+    expect(childProcessors[0]?.fallbackToolConfig).toMatchObject({
       enabled: false,
     });
   });
