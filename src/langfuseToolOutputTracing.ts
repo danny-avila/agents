@@ -10,6 +10,15 @@ import type {
 import type { LangfuseSpanProcessorParams } from '@langfuse/otel';
 import type { Context } from '@opentelemetry/api';
 import type * as t from '@/types';
+import {
+  getContextMessageContentRedactionConfig,
+  hasExplicitMessageContentRedactionConfig,
+  redactLangfuseSpanMessageContent,
+  resolveMessageContentRedactionConfig,
+  runWithMessageContentRedactionConfig,
+  setMessageContentRedactionConfigOnContext,
+  type ResolvedLangfuseMessageContentRedactionConfig,
+} from '@/langfuseContentRedaction';
 
 export const LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT = '[tool output redacted]';
 
@@ -535,38 +544,61 @@ export function getContextLangfuseConfig(
   return isRecord(value) ? (value as t.LangfuseConfig) : undefined;
 }
 
-class ToolOutputRedactingLangfuseSpanProcessor implements SpanProcessor {
+class LangfuseRedactingSpanProcessor implements SpanProcessor {
   private readonly processor: LangfuseSpanProcessor;
-  private readonly fallbackConfig?: ResolvedLangfuseToolOutputTracingConfig;
-  private readonly spanConfigs = new WeakMap<
+  private readonly fallbackToolConfig?: ResolvedLangfuseToolOutputTracingConfig;
+  private readonly fallbackContentConfig?: ResolvedLangfuseMessageContentRedactionConfig;
+  private readonly spanToolConfigs = new WeakMap<
     object,
     ResolvedLangfuseToolOutputTracingConfig
+  >();
+  private readonly spanContentConfigs = new WeakMap<
+    object,
+    ResolvedLangfuseMessageContentRedactionConfig
   >();
 
   constructor(
     params?: LangfuseSpanProcessorParams,
-    fallbackConfig?: ResolvedLangfuseToolOutputTracingConfig
+    fallbackToolConfig?: ResolvedLangfuseToolOutputTracingConfig,
+    fallbackContentConfig?: ResolvedLangfuseMessageContentRedactionConfig
   ) {
     this.processor = new LangfuseSpanProcessor(params);
-    this.fallbackConfig = fallbackConfig;
+    this.fallbackToolConfig = fallbackToolConfig;
+    this.fallbackContentConfig = fallbackContentConfig;
   }
 
   onStart(span: Span, parentContext: Context): void {
-    const config =
-      getContextToolOutputTracingConfig(parentContext) ?? this.fallbackConfig;
-    if (config != null) {
-      this.spanConfigs.set(span, config);
+    const toolConfig =
+      getContextToolOutputTracingConfig(parentContext) ??
+      this.fallbackToolConfig;
+    if (toolConfig != null) {
+      this.spanToolConfigs.set(span, toolConfig);
     }
+
+    const contentConfig =
+      getContextMessageContentRedactionConfig(parentContext) ??
+      this.fallbackContentConfig;
+    if (contentConfig != null) {
+      this.spanContentConfigs.set(span, contentConfig);
+    }
+
     this.processor.onStart(span, parentContext);
   }
 
   onEnd(span: ReadableSpan): void {
-    const config =
-      this.spanConfigs.get(span) ??
+    const toolConfig =
+      this.spanToolConfigs.get(span) ??
       toolOutputTracingStorage.getStore() ??
-      this.fallbackConfig ??
+      this.fallbackToolConfig ??
       resolveToolOutputTracingConfig();
-    redactLangfuseSpanToolOutputs(span, config);
+    redactLangfuseSpanToolOutputs(span, toolConfig);
+
+    const contentConfig =
+      this.spanContentConfigs.get(span) ??
+      this.fallbackContentConfig ??
+      resolveMessageContentRedactionConfig();
+    redactLangfuseSpanMessageContent(span, contentConfig);
+
     this.processor.onEnd(span);
   }
 
@@ -584,11 +616,18 @@ export function createLangfuseSpanProcessor(
   runLangfuse?: t.LangfuseConfig,
   agentLangfuse?: t.LangfuseConfig
 ): SpanProcessor {
-  const fallbackConfig =
-    runLangfuse != null || agentLangfuse != null
-      ? resolveToolOutputTracingConfig(runLangfuse, agentLangfuse)
-      : undefined;
-  return new ToolOutputRedactingLangfuseSpanProcessor(params, fallbackConfig);
+  const hasAnyLangfuseConfig = runLangfuse != null || agentLangfuse != null;
+  const fallbackToolConfig = hasAnyLangfuseConfig
+    ? resolveToolOutputTracingConfig(runLangfuse, agentLangfuse)
+    : undefined;
+  const fallbackContentConfig = hasAnyLangfuseConfig
+    ? resolveMessageContentRedactionConfig(runLangfuse, agentLangfuse)
+    : undefined;
+  return new LangfuseRedactingSpanProcessor(
+    params,
+    fallbackToolConfig,
+    fallbackContentConfig
+  );
 }
 
 export function withLangfuseToolOutputTracingConfig<T>(
@@ -600,30 +639,48 @@ export function withLangfuseToolOutputTracingConfig<T>(
   const hasNoToolOutputConfig =
     runLangfuse?.toolOutputTracing == null &&
     agentLangfuse?.toolOutputTracing == null;
+  const hasNoContentConfig = !hasExplicitMessageContentRedactionConfig(
+    runLangfuse,
+    agentLangfuse
+  );
 
-  if (langfuse == null && hasNoToolOutputConfig) {
+  if (langfuse == null && hasNoToolOutputConfig && hasNoContentConfig) {
     return action();
   }
 
-  const config = hasNoToolOutputConfig
+  const toolConfig = hasNoToolOutputConfig
     ? undefined
     : resolveToolOutputTracingConfig(runLangfuse, agentLangfuse);
+  const contentConfig = hasNoContentConfig
+    ? undefined
+    : resolveMessageContentRedactionConfig(runLangfuse, agentLangfuse);
+
   let activeContext = context.active();
   if (langfuse != null) {
     activeContext = activeContext.setValue(langfuseConfigKey, langfuse);
   }
-  if (config != null) {
+  if (toolConfig != null) {
     activeContext = activeContext.setValue(
       langfuseToolOutputTracingConfigKey,
-      config
+      toolConfig
+    );
+  }
+  if (contentConfig != null) {
+    activeContext = setMessageContentRedactionConfigOnContext(
+      activeContext,
+      contentConfig
     );
   }
 
   const runWithContext = (): T => context.with(activeContext, action);
-  const runWithToolOutputConfig = (): T =>
-    config != null
-      ? toolOutputTracingStorage.run(config, runWithContext)
+  const runWithContentConfig = (): T =>
+    contentConfig != null
+      ? runWithMessageContentRedactionConfig(contentConfig, runWithContext)
       : runWithContext();
+  const runWithToolOutputConfig = (): T =>
+    toolConfig != null
+      ? toolOutputTracingStorage.run(toolConfig, runWithContentConfig)
+      : runWithContentConfig();
 
   return langfuse != null
     ? langfuseConfigStorage.run(langfuse, runWithToolOutputConfig)

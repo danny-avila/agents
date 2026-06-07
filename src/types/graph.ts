@@ -438,6 +438,24 @@ export type LangfuseToolNodeTracingConfig = {
   enabled?: boolean;
 };
 
+export type LangfuseMessageContentRedactionConfig = {
+  /**
+   * When true, scrub credential-shaped substrings (API keys, tokens, JWTs)
+   * out of chain/generation span input/output attributes before they leave
+   * for Langfuse. Targets the user/assistant message text path that the
+   * `toolOutputTracing` redaction deliberately preserves. Defaults to
+   * `false` (opt-in).
+   */
+  enabled?: boolean;
+  /**
+   * Optional allowlist of built-in pattern ids to apply. When omitted, all
+   * built-in patterns run. Unknown ids are ignored.
+   */
+  patternIds?: string[];
+  /** Replacement text inserted after each matched prefix. */
+  redactionText?: string;
+};
+
 export interface LangfuseConfig {
   enabled?: boolean;
   publicKey?: string;
@@ -445,6 +463,7 @@ export interface LangfuseConfig {
   baseUrl?: string;
   toolNodeTracing?: LangfuseToolNodeTracingConfig;
   toolOutputTracing?: LangfuseToolOutputTracingConfig;
+  messageContentRedaction?: LangfuseMessageContentRedactionConfig;
   /**
    * When true, derive the run's root Langfuse trace id deterministically from
    * its `runId` (`sha256(runId)` → 32 hex chars, matching `@langfuse/tracing`

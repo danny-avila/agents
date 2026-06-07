@@ -130,6 +130,7 @@ function getLangfuseTracerProviderKey(
     baseUrl: params.baseUrl,
     environment: params.environment,
     toolOutputTracing: langfuse?.toolOutputTracing,
+    messageContentRedaction: langfuse?.messageContentRedaction,
   });
 }
 
