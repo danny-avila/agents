@@ -442,6 +442,15 @@ export class Run<_T extends t.BaseGraphState> {
         config.callbacks = undefined;
         return true;
       }
+      if (typeof promptResult.updatedPrompt === 'string') {
+        const idx = stateInputs.messages.lastIndexOf(lastHuman);
+        if (idx >= 0) {
+          stateInputs.messages[idx] = applyPromptOverride(
+            lastHuman,
+            promptResult.updatedPrompt
+          );
+        }
+      }
       for (const ctx of promptResult.additionalContexts) {
         preStreamContexts.push(ctx);
       }
@@ -1460,4 +1469,37 @@ function extractPromptText(message: BaseMessage): string {
     }
   }
   return parts.join('\n');
+}
+
+function applyPromptOverride(
+  message: BaseMessage,
+  updatedPrompt: string
+): BaseMessage {
+  const content = message.content;
+  const baseFields = {
+    additional_kwargs: message.additional_kwargs,
+    response_metadata: message.response_metadata,
+    name: message.name,
+    id: message.id,
+  };
+  if (typeof content === 'string' || !Array.isArray(content)) {
+    return new HumanMessage({ ...baseFields, content: updatedPrompt });
+  }
+
+  const next: typeof content = [];
+  let textInserted = false;
+  for (const block of content) {
+    if (typeof block === 'object' && 'type' in block && block.type === 'text') {
+      if (!textInserted) {
+        next.push({ type: 'text', text: updatedPrompt });
+        textInserted = true;
+      }
+      continue;
+    }
+    next.push(block);
+  }
+  if (!textInserted) {
+    next.unshift({ type: 'text', text: updatedPrompt });
+  }
+  return new HumanMessage({ ...baseFields, content: next });
 }

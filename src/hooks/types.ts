@@ -307,6 +307,25 @@ export type RunStartHookOutput = BaseHookOutput;
 export interface UserPromptSubmitHookOutput extends BaseHookOutput {
   decision?: ToolDecision;
   reason?: string;
+  /**
+   * Replacement prompt text. When set, the SDK rewrites the last
+   * human message's text content with this value before the model
+   * turn runs. Use this to surface a guardrail-scrubbed version of
+   * the user's prompt (PII redaction, jailbreak filtering, etc.).
+   *
+   * Multimodal handling: if the message's content is a string, it's
+   * replaced wholesale. If it's a content-block array, the first
+   * text block's text is replaced with this value and any other text
+   * blocks are dropped; non-text blocks (images, files) are
+   * preserved in their original order.
+   *
+   * When multiple hooks set `updatedPrompt` within a single
+   * `executeHooks` call, the last writer in registration order wins
+   * (same precedence as `PreToolUseHookOutput.updatedInput`).
+   * Consumers that need a single authoritative rewrite should still
+   * scope `updatedPrompt` to one hook per matcher.
+   */
+  updatedPrompt?: string;
 }
 
 export interface PreToolUseHookOutput extends BaseHookOutput {
@@ -506,6 +525,13 @@ export interface AggregatedHookResult {
    * means "use the original tool output".
    */
   updatedOutput?: unknown;
+  /**
+   * Replacement prompt text from a `UserPromptSubmit` hook. Same
+   * last-writer-wins-in-registration-order semantics as
+   * `updatedInput`. Present only when at least one hook set it;
+   * `undefined` means "use the original user prompt unchanged".
+   */
+  updatedPrompt?: string;
   /** Accumulated `additionalContext` strings from every hook, in order. */
   additionalContexts: string[];
   /** True if any hook returned `preventContinuation`. */

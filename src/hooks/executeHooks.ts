@@ -274,6 +274,19 @@ function applyUpdatedOutput(
   agg.updatedOutput = output.updatedOutput;
 }
 
+function applyUpdatedPrompt(
+  agg: AggregatedHookResult,
+  output: HookOutput
+): void {
+  if (
+    !('updatedPrompt' in output) ||
+    typeof output.updatedPrompt !== 'string'
+  ) {
+    return;
+  }
+  agg.updatedPrompt = output.updatedPrompt;
+}
+
 function applyAllowedDecisions(
   agg: AggregatedHookResult,
   output: HookOutput
@@ -314,6 +327,7 @@ function fold(outcomes: readonly HookOutcome[]): AggregatedHookResult {
     applyDecision(agg, output);
     applyUpdatedInput(agg, output);
     applyUpdatedOutput(agg, output);
+    applyUpdatedPrompt(agg, output);
     applyAllowedDecisions(agg, output);
   }
   return agg;
