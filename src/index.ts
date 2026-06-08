@@ -78,3 +78,16 @@ export { FakeChatModel, createFakeStreamingLLM } from './llm/fake';
 export { initializeModel } from './llm/init';
 export { attemptInvoke, tryFallbackProviders } from './llm/invoke';
 export { isThinkingEnabled, getMaxOutputTokensKey } from './llm/request';
+
+/* Message Content Redaction (PII filter primitive) */
+export {
+  DEFAULT_REDACTION_TEXT,
+  filterMessageContent,
+  redactSensitiveText,
+  redactSensitiveValue,
+} from './messageContentRedaction';
+export type {
+  MessageContentRedactionConfig,
+  PatternMatch,
+  SensitivePattern,
+} from './messageContentRedaction';
