@@ -2,6 +2,20 @@ import type { BaseMessage, MessageContent } from '@langchain/core/messages';
 
 export const DEFAULT_REDACTION_TEXT = '[REDACTED]';
 
+/**
+ * Regex shape contract:
+ *   - `pattern` must be `/g`-flagged (validated at call time; throws
+ *     otherwise — see resolveConfig).
+ *   - The first capture group is treated as the visible prefix that
+ *     survives redaction. Replacement is always `$1<redactionText>`,
+ *     so the regex must place the prefix at the start of the match
+ *     (e.g. `/\b(sk-)[A-Za-z0-9_-]+/g`). A pattern whose first group
+ *     is somewhere in the middle (e.g. `/secret=([a-z]+)/g`) will
+ *     produce broken output because the bytes between the match start
+ *     and the capture group are also dropped.
+ *   - Use a zero-width empty group `()` at the start if you want no
+ *     visible prefix preserved.
+ */
 export type SensitivePattern = {
   id: string;
   label: string;
@@ -25,6 +39,15 @@ type ResolvedConfig = {
 };
 
 function resolveConfig(config: MessageContentRedactionConfig): ResolvedConfig {
+  for (const { id, pattern } of config.patterns) {
+    if (!pattern.global) {
+      throw new TypeError(
+        `[messageContentRedaction] pattern "${id}" must use the global (g) flag; ` +
+          'without it, only the first match in a string is scrubbed and ' +
+          'subsequent matches silently leak.'
+      );
+    }
+  }
   return {
     patterns: config.patterns,
     redactionText: config.redactionText ?? DEFAULT_REDACTION_TEXT,

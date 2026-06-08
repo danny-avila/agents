@@ -1471,19 +1471,34 @@ function extractPromptText(message: BaseMessage): string {
   return parts.join('\n');
 }
 
+/**
+ * Replaces the message's content with `updatedPrompt` while preserving
+ * the original message's prototype (so `instanceof` checks still hold
+ * on subclasses) and every own property other than `content`.
+ *
+ * Multimodal note: when the content is a content-block array, the
+ * `extractPromptText` helper concatenates all text blocks into one
+ * string for the hook (with `\n` separators). The hook can only
+ * return a single replacement string, so we collapse the text blocks
+ * into one block carrying that string. Non-text blocks (images,
+ * files, tool-result blocks, etc.) are preserved in their original
+ * order. This is lossy if a host depended on per-text-block layout —
+ * use the underlying message directly in that case rather than the
+ * hook-rewrite path.
+ */
 function applyPromptOverride(
   message: BaseMessage,
   updatedPrompt: string
 ): BaseMessage {
   const content = message.content;
-  const baseFields = {
-    additional_kwargs: message.additional_kwargs,
-    response_metadata: message.response_metadata,
-    name: message.name,
-    id: message.id,
-  };
+  const clone = Object.assign(
+    Object.create(Object.getPrototypeOf(message)),
+    message
+  ) as BaseMessage;
+
   if (typeof content === 'string' || !Array.isArray(content)) {
-    return new HumanMessage({ ...baseFields, content: updatedPrompt });
+    clone.content = updatedPrompt;
+    return clone;
   }
 
   const next: typeof content = [];
@@ -1501,5 +1516,6 @@ function applyPromptOverride(
   if (!textInserted) {
     next.unshift({ type: 'text', text: updatedPrompt });
   }
-  return new HumanMessage({ ...baseFields, content: next });
+  clone.content = next;
+  return clone;
 }
