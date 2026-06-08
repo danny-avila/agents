@@ -82,9 +82,7 @@ export { isThinkingEnabled, getMaxOutputTokensKey } from './llm/request';
 /* Message Content Redaction (PII filter primitive) */
 export {
   DEFAULT_REDACTION_TEXT,
-  filterMessageContent,
   redactSensitiveText,
-  redactSensitiveValue,
 } from './messageContentRedaction';
 export type {
   MessageContentRedactionConfig,

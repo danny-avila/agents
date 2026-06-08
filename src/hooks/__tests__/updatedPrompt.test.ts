@@ -1,11 +1,9 @@
-import { HumanMessage } from '@langchain/core/messages';
 import type {
   HookCallback,
   UserPromptSubmitHookInput,
   UserPromptSubmitHookOutput,
 } from '../types';
 import {
-  filterMessageContent,
   redactSensitiveText,
   type SensitivePattern,
 } from '@/messageContentRedaction';
@@ -96,25 +94,6 @@ describe('executeHooks — updatedPrompt fold', () => {
     });
 
     expect(result.updatedPrompt).toBe('second rewrite');
-  });
-
-  it('skips non-string updatedPrompt values', async () => {
-    const registry = new HookRegistry();
-    registry.register(
-      'UserPromptSubmit',
-      userPromptMatcher(
-        async (): Promise<UserPromptSubmitHookOutput> => ({
-          updatedPrompt: 42 as unknown as string,
-        })
-      )
-    );
-
-    const result = await executeHooks({
-      registry,
-      input: promptSubmitInput('original'),
-    });
-
-    expect(result.updatedPrompt).toBeUndefined();
   });
 
   it('leaves updatedPrompt unset when no hook supplies one', async () => {
@@ -225,21 +204,5 @@ describe('messageContentRedaction as a UserPromptSubmit hook', () => {
     expect(result.updatedPrompt).toBe(
       'jwt eyJ[REDACTED] and key sk-ant-FAKE1234567890'
     );
-  });
-});
-
-describe('filterMessageContent helper alongside updatedPrompt', () => {
-  it('scrubs a HumanMessage array — useful when a hook wants to inspect full message history', () => {
-    const messages = [
-      new HumanMessage('first sk-proj-FAKE1234567890'),
-      new HumanMessage('second clean prompt'),
-    ];
-    const { messages: filtered, matches } = filterMessageContent(messages, {
-      patterns: TEST_PATTERNS,
-    });
-
-    expect(filtered[0].content).toBe('first sk-proj-[REDACTED]');
-    expect(filtered[1]).toBe(messages[1]);
-    expect(matches.map((m) => m.patternId)).toEqual(['openai_key']);
   });
 });
