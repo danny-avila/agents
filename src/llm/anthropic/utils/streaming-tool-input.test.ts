@@ -97,6 +97,36 @@ describe('_convertMessagesToAnthropicPayload — aggregated streaming tool input
     const toolUse = (assistant!.content as any[]).find((b) => b.type === 'tool_use');
     expect(toolUse.input).toEqual({ input: '2 + 2' });
   });
+
+  // Adapted from @langchain/anthropic's
+  // "partial tool input is correctly merged before calling Anthropic API".
+  it('merges sibling input_json_delta blocks into tool_use input (persisted, no tool_calls)', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('What\'s the weather in Seattle tomorrow?'),
+      new AIMessage({
+        content: [
+          { type: 'text', index: 1, text: 'I need to call the get_weather tool' },
+          { type: 'tool_use', index: 2, name: 'get_weather', id: 'tool_call_id', input: '' },
+          { type: 'input_json_delta', index: 2, input: '{"city": "' },
+          { type: 'input_json_delta', index: 2, input: 'Seattle", "da' },
+          { type: 'input_json_delta', index: 2, input: 'te": "to' },
+          { type: 'input_json_delta', index: 2, input: 'morrow"}' },
+        ] as any,
+      }),
+    ];
+
+    const payload = _convertMessagesToAnthropicPayload(messages);
+    const assistant = payload.messages.find((m: any) => m.role === 'assistant');
+    const blocks = assistant!.content as any[];
+    expect(blocks.filter((b) => b.type === 'input_json_delta')).toHaveLength(0);
+    const toolUse = blocks.find((b) => b.type === 'tool_use');
+    expect(toolUse).toMatchObject({
+      type: 'tool_use',
+      name: 'get_weather',
+      id: 'tool_call_id',
+      input: { city: 'Seattle', date: 'tomorrow' },
+    });
+  });
 });
 
 describe('_makeMessageChunkFromAnthropicEvent — streamed tool input merges into content', () => {

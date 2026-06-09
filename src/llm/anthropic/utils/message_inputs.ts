@@ -643,19 +643,33 @@ function _formatContent(message: BaseMessage) {
         }
 
         // Core's streaming aggregation can leave the inline tool_use input empty
-        // (the assembled arguments live in `message.tool_calls`). Restore it from the
-        // matching aggregated tool call when the inline input is missing.
+        // (the assembled arguments live in `message.tool_calls` or, for persisted
+        // messages, in sibling input_json_delta blocks). Restore it when missing.
         if (
           contentPartCopy.type === 'tool_use' &&
-          isAIMessage(message) &&
           typeof contentPartCopy.id === 'string' &&
           (contentPartCopy.input === '' || contentPartCopy.input == null)
         ) {
-          const matchingToolCall = message.tool_calls?.find(
-            (toolCall) => toolCall.id === contentPartCopy.id
-          );
+          const matchingToolCall = isAIMessage(message)
+            ? message.tool_calls?.find((toolCall) => toolCall.id === contentPartCopy.id)
+            : undefined;
           if (matchingToolCall) {
             contentPartCopy.input = matchingToolCall.args;
+          } else {
+            const blockIndex = (contentPart as Record<string, unknown>).index;
+            const merged = contentParts
+              .filter((part) => {
+                const p = part as Record<string, unknown>;
+                return (
+                  p.type === 'input_json_delta' &&
+                  p.index === blockIndex &&
+                  typeof p.input === 'string'
+                );
+              })
+              .reduce((acc, part) => acc + (part as Record<string, unknown>).input, '');
+            if (merged !== '') {
+              contentPartCopy.input = merged;
+            }
           }
         }
 

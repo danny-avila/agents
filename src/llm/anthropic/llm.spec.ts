@@ -3199,3 +3199,39 @@ describe('Opus 4.6', () => {
     });
   });
 });
+
+describe('Tool input survives message conversion', () => {
+  // Adapted from @langchain/anthropic's "converting messages doesn't drop tool input".
+  // Guards the core >= 1.1.46 streaming-aggregation regression where the tool_use
+  // content block's input was emptied (and re-serialization dropped it).
+  test('converting messages does not drop tool input (live)', async () => {
+    const jokeTool = {
+      name: 'generate_random_joke',
+      description: 'Generate a random joke.',
+      schema: z.object({
+        prompt: z.string().describe('The prompt to generate the joke for.'),
+      }),
+    };
+    const model = new ChatAnthropic({
+      model: 'claude-sonnet-4-5-20250929',
+      temperature: 0,
+    }).bindTools([jokeTool]);
+
+    const result = await model.invoke([
+      new HumanMessage(
+        'Generate three (3) random jokes. Use the generate_random_joke tool and call it three times before responding. This is very important.'
+      ),
+    ]);
+    expect(result.tool_calls?.length ?? 0).toBeGreaterThan(0);
+
+    const converted = _convertMessagesToAnthropicPayload([result]);
+    const toolUseBlocks = (
+      converted.messages[0].content as unknown as Array<Record<string, unknown>>
+    ).filter((block) => block.type === 'tool_use');
+    expect(toolUseBlocks.length).toBeGreaterThan(0);
+    for (const block of toolUseBlocks) {
+      expect(block.input).toBeDefined();
+      expect((block.input as Record<string, unknown>).prompt).toBeDefined();
+    }
+  });
+});
