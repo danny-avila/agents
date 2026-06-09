@@ -410,4 +410,104 @@ describe('formatAgentMessages skill body reconstruction', () => {
       expect(assistantTotal).toBe(500);
     });
   });
+
+  describe('skipSkillBodyNames (fresh-prime dedupe)', () => {
+    const tools = new Set([Constants.SKILL_TOOL]);
+
+    const injectedSkillBodies = (
+      messages: ReturnType<typeof formatAgentMessages>['messages']
+    ) =>
+      messages.filter(
+        (m) =>
+          m instanceof HumanMessage &&
+          (m as HumanMessage).additional_kwargs.source === 'skill'
+      );
+
+    it('does NOT reconstruct body when skill name is in skipSkillBodyNames', () => {
+      const payload: TPayload = [
+        { role: 'user', content: 'Review my code' },
+        {
+          role: 'assistant',
+          content: [skillToolCall('call_1', 'code-review')],
+        },
+      ];
+
+      const { messages } = formatAgentMessages(
+        payload,
+        undefined,
+        tools,
+        skillBodies,
+        { skipSkillBodyNames: new Set(['code-review']) }
+      );
+
+      expect(injectedSkillBodies(messages)).toHaveLength(0);
+    });
+
+    it('reconstructs only names NOT in skipSkillBodyNames', () => {
+      const payload: TPayload = [
+        { role: 'user', content: 'Go' },
+        {
+          role: 'assistant',
+          content: [
+            skillToolCall('call_1', 'pdf-analyzer'),
+            skillToolCall('call_2', 'code-review'),
+          ],
+        },
+      ];
+
+      const { messages } = formatAgentMessages(
+        payload,
+        undefined,
+        tools,
+        skillBodies,
+        { skipSkillBodyNames: new Set(['code-review']) }
+      );
+
+      const injected = injectedSkillBodies(messages);
+      expect(injected).toHaveLength(1);
+      expect((injected[0] as HumanMessage).additional_kwargs.skillName).toBe(
+        'pdf-analyzer'
+      );
+    });
+
+    it('reconstructs normally when skipSkillBodyNames is empty', () => {
+      const payload: TPayload = [
+        { role: 'user', content: 'Review my code' },
+        {
+          role: 'assistant',
+          content: [skillToolCall('call_1', 'code-review')],
+        },
+      ];
+
+      const { messages } = formatAgentMessages(
+        payload,
+        undefined,
+        tools,
+        skillBodies,
+        { skipSkillBodyNames: new Set() }
+      );
+
+      expect(injectedSkillBodies(messages)).toHaveLength(1);
+    });
+
+    it('skips in the non-tools-filtering path too', () => {
+      const payload: TPayload = [
+        { role: 'user', content: 'Review my code' },
+        {
+          role: 'assistant',
+          content: [skillToolCall('call_1', 'code-review')],
+        },
+      ];
+
+      const { messages } = formatAgentMessages(
+        payload,
+        undefined,
+        undefined,
+        skillBodies,
+        { skipSkillBodyNames: new Set(['code-review']) }
+      );
+
+      expect(injectedSkillBodies(messages)).toHaveLength(0);
+    });
+  });
 });

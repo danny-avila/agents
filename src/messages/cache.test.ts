@@ -13,6 +13,7 @@ import {
   stripBedrockCacheControl,
   addBedrockCacheControl,
   addCacheControl,
+  addCacheControlToStablePrefixMessages,
 } from './cache';
 import { _convertMessagesToOpenAIParams } from '@/llm/openai/utils';
 import { toLangChainContent } from './langchain';
@@ -764,6 +765,127 @@ describe('addBedrockCacheControl (Bedrock cache checkpoints)', () => {
         Array.isArray(content) && content.some((block) => 'cachePoint' in block)
       ).toBe(false);
     }
+  });
+});
+
+describe('synthetic skill/meta messages are not cache-anchored', () => {
+  const hasAnthropicMarker = (m: BaseMessage): boolean =>
+    Array.isArray(m.content) &&
+    m.content.some((block) => 'cache_control' in block);
+
+  const hasBedrockCachePoint = (m: BaseMessage): boolean =>
+    Array.isArray(m.content) &&
+    m.content.some((block) => 'cachePoint' in block);
+
+  const skillBody = (skillName: string, content = 'SKILL BODY'): HumanMessage =>
+    new HumanMessage({
+      content,
+      additional_kwargs: { isMeta: true, source: 'skill', skillName },
+    });
+
+  it('Anthropic: skips a trailing synthetic skill message; markers land on the real user messages', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('First real question'),
+      new AIMessage('Answer'),
+      new HumanMessage('Second real question'),
+      skillBody('pdf-analyzer'),
+    ];
+
+    const result = addCacheControl<BaseMessage>(messages);
+
+    expect(hasAnthropicMarker(result[3])).toBe(false);
+    expect(hasAnthropicMarker(result[2])).toBe(true);
+    expect(hasAnthropicMarker(result[0])).toBe(true);
+  });
+
+  it('Anthropic: strips a stale marker from a synthetic skill message without re-adding one', () => {
+    const stale = new HumanMessage({
+      content: toLangChainContent([
+        {
+          type: 'text',
+          text: 'SKILL BODY',
+          cache_control: { type: 'ephemeral' },
+        } as MessageContentComplex,
+      ]),
+      additional_kwargs: {
+        isMeta: true,
+        source: 'skill',
+        skillName: 'pdf-analyzer',
+      },
+    });
+    const messages: BaseMessage[] = [
+      new HumanMessage('Real question'),
+      new AIMessage('Answer'),
+      stale,
+    ];
+
+    const result = addCacheControl<BaseMessage>(messages);
+
+    expect(hasAnthropicMarker(result[2])).toBe(false);
+    expect(hasAnthropicMarker(result[0])).toBe(true);
+  });
+
+  it('Anthropic: detects skill messages by additional_kwargs.source even without isMeta', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('Real question'),
+      new AIMessage('Answer'),
+      new HumanMessage({
+        content: 'SKILL BODY',
+        additional_kwargs: { source: 'skill', skillName: 'pdf-analyzer' },
+      }),
+    ];
+
+    const result = addCacheControl<BaseMessage>(messages);
+
+    expect(hasAnthropicMarker(result[2])).toBe(false);
+    expect(hasAnthropicMarker(result[0])).toBe(true);
+  });
+
+  it('Bedrock: skips a trailing synthetic skill message; cachePoints land on the real user messages', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('First real question'),
+      new AIMessage('Answer'),
+      new HumanMessage('Second real question'),
+      skillBody('pdf-analyzer'),
+    ];
+
+    const result = addBedrockCacheControl<BaseMessage>(messages);
+
+    expect(hasBedrockCachePoint(result[3])).toBe(false);
+    expect(hasBedrockCachePoint(result[2])).toBe(true);
+    expect(hasBedrockCachePoint(result[0])).toBe(true);
+  });
+
+  it('stable-prefix fallback: anchors the real user message, not a synthetic skill message', () => {
+    // Mirrors AgentContext's dynamic-tail path: the only assistant message is a
+    // skill-only tool call (no text), so the assistant-only pass adds no marker
+    // and the cacheable fallback runs. It must skip the reconstructed skill
+    // HumanMessage and anchor the real user message instead.
+    const messages: BaseMessage[] = [
+      new HumanMessage('Real stable question'),
+      new AIMessage({
+        content: toLangChainContent([
+          {
+            type: 'tool_use',
+            id: 'call_1',
+            name: 'skill',
+            input: { skillName: 'pdf-analyzer' },
+          } as MessageContentComplex,
+        ]),
+        tool_calls: [
+          { id: 'call_1', name: 'skill', args: { skillName: 'pdf-analyzer' } },
+        ],
+      }),
+      skillBody('pdf-analyzer'),
+    ];
+
+    const result = addCacheControlToStablePrefixMessages<BaseMessage>(
+      messages,
+      2
+    );
+
+    expect(hasAnthropicMarker(result[2])).toBe(false);
+    expect(hasAnthropicMarker(result[0])).toBe(true);
   });
 });
 
