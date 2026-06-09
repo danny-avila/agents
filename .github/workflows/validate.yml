@@ -87,7 +87,7 @@ jobs:
           output=$(npm run build:dev 2>&1)
           echo "$output"
           if echo "$output" | grep -qi "Circular depend"; then
-            echo "::error title=Circular dependency detected::Rollup reported a circular dependency. See the build output above."
+            echo "::error title=Circular dependency detected::The bundler reported a circular dependency. See the build output above."
             exit 1
           fi
 
