@@ -524,6 +524,17 @@ function _formatContent(message: BaseMessage) {
         return null;
       }
 
+      // Core's v1 streaming aggregation can leave a partial tool-input delta as a
+      // standalone block typed `text` carrying `input` but no `text`. The assembled
+      // input is restored on the tool_use block from `message.tool_calls`, so drop it.
+      if (
+        contentPart.type === 'text' &&
+        'input' in contentPart &&
+        !('text' in contentPart)
+      ) {
+        return null;
+      }
+
       if (isDataContentBlock(contentPart)) {
         return convertToProviderContentBlock(
           contentPart,
@@ -617,9 +628,9 @@ function _formatContent(message: BaseMessage) {
         }
 
         if (contentPartCopy.type === 'input_json_delta') {
-          // `input_json_delta` type only represents yielding partial tool inputs
-          // and is not a valid type for Anthropic messages.
-          contentPartCopy.type = 'tool_use';
+          // Orphaned partial tool-input delta with no id of its own. The assembled
+          // input is restored on the tool_use block from `message.tool_calls`; drop it.
+          return null;
         }
 
         if (
@@ -629,6 +640,37 @@ function _formatContent(message: BaseMessage) {
           contentPartCopy.id.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX)
         ) {
           contentPartCopy.type = 'server_tool_use';
+        }
+
+        // Core's streaming aggregation can leave the inline tool_use input empty
+        // (the assembled arguments live in `message.tool_calls` or, for persisted
+        // messages, in sibling input_json_delta blocks). Restore it when missing.
+        if (
+          contentPartCopy.type === 'tool_use' &&
+          typeof contentPartCopy.id === 'string' &&
+          (contentPartCopy.input === '' || contentPartCopy.input == null)
+        ) {
+          const matchingToolCall = isAIMessage(message)
+            ? message.tool_calls?.find((toolCall) => toolCall.id === contentPartCopy.id)
+            : undefined;
+          if (matchingToolCall) {
+            contentPartCopy.input = matchingToolCall.args;
+          } else {
+            const blockIndex = (contentPart as Record<string, unknown>).index;
+            const merged = contentParts
+              .filter((part) => {
+                const p = part as Record<string, unknown>;
+                return (
+                  p.type === 'input_json_delta' &&
+                  p.index === blockIndex &&
+                  typeof p.input === 'string'
+                );
+              })
+              .reduce((acc, part) => acc + (part as Record<string, unknown>).input, '');
+            if (merged !== '') {
+              contentPartCopy.input = merged;
+            }
+          }
         }
 
         if ('input' in contentPartCopy) {

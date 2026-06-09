@@ -203,10 +203,14 @@ export function _makeMessageChunkFromAnthropicEvent(
   ) {
     const content = [
       {
+        // No `type`: core's streaming aggregation merges this partial input into the
+        // sibling tool_use/server_tool_use block at the same index, keeping its type.
+        // A typed delta block won't merge under core >= 1.1.46 ("keep different block
+        // types separate"), which would orphan the input and empty the tool_use input.
         index: data.index,
         input: data.delta.partial_json,
-        type: data.delta.type,
-      },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as any,
     ];
     return {
       chunk: new AIMessageChunk({
