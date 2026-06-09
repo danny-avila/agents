@@ -66,6 +66,25 @@ const chunker = {
   },
 };
 
+const DEFAULT_MAX_CONTENT_LENGTH = 50000;
+
+/** Resolves the per-source scraped content cap from config, the
+ * `SEARCH_MAX_CONTENT_LENGTH` env var, or the default (50,000 chars) */
+function resolveMaxContentLength(maxContentLength?: number): number {
+  if (maxContentLength != null && maxContentLength > 0) {
+    return maxContentLength;
+  }
+  const envValue = Number(process.env.SEARCH_MAX_CONTENT_LENGTH);
+  if (Number.isFinite(envValue) && envValue > 0) {
+    return envValue;
+  }
+  return DEFAULT_MAX_CONTENT_LENGTH;
+}
+
+function truncateContent(content: string, maxLength: number): string {
+  return content.length > maxLength ? content.slice(0, maxLength) : content;
+}
+
 function createSourceUpdateCallback(sourceMap: Map<string, t.ValidSource>) {
   return (link: string, update?: Partial<t.ValidSource>): void => {
     const source = sourceMap.get(link);
@@ -83,12 +102,14 @@ const getHighlights = async ({
   content,
   reranker,
   topResults = 5,
+  maxContentLength = DEFAULT_MAX_CONTENT_LENGTH,
   logger,
 }: {
   content: string;
   query: string;
   reranker?: BaseReranker;
   topResults?: number;
+  maxContentLength?: number;
   logger?: t.Logger;
 }): Promise<t.Highlight[] | undefined> => {
   const logger_ = logger || createDefaultLogger();
@@ -103,7 +124,9 @@ const getHighlights = async ({
   }
 
   try {
-    const documents = await chunker.splitText(content);
+    const documents = await chunker.splitText(
+      truncateContent(content, maxContentLength)
+    );
     if (Array.isArray(documents)) {
       return await reranker.rerank(query, documents, topResults);
     } else {
@@ -457,6 +480,7 @@ export const createSourceProcessor = (
     logger,
   } = config;
 
+  const maxContentLength = resolveMaxContentLength(config.maxContentLength);
   const logger_ = logger || createDefaultLogger();
   const scraper = scraperInstance;
 
@@ -475,7 +499,7 @@ export const createSourceProcessor = (
         url,
         references,
         attribution,
-        content: chunker.cleanText(content),
+        content: truncateContent(chunker.cleanText(content), maxContentLength),
       };
     }
 
@@ -498,6 +522,7 @@ export const createSourceProcessor = (
         query,
         reranker,
         content: result.content,
+        maxContentLength,
         logger: logger_,
       });
       if (onGetHighlights) {
@@ -703,6 +728,14 @@ export const createSourceProcessor = (
 
       if (news && topStories.length > 0) {
         updateSourcesWithContent(topStories, sourceMap);
+      }
+
+      if (topStories.length > numElements) {
+        /** Merged news results can far exceed the requested source count;
+         * every entry here is formatted into the LLM output, so cap them
+         * like organic results (sliced after enrichment to keep the
+         * scraped/reranked entries, which come first) */
+        result.data.topStories = topStories.slice(0, numElements);
       }
 
       return result.data;

@@ -133,6 +133,10 @@ export interface ScrapeResult {
 
 export interface ProcessSourcesConfig {
   topResults?: number;
+  /** Max chars of scraped content stored per source and passed to the
+   * chunker/reranker. Defaults to 50,000; also configurable via the
+   * `SEARCH_MAX_CONTENT_LENGTH` env var. */
+  maxContentLength?: number;
   strategies?: string[];
   filterContent?: boolean;
   reranker?: BaseReranker;

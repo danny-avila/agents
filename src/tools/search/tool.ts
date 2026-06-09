@@ -23,9 +23,10 @@ import { createReranker } from './rerankers';
 import { Constants } from '@/common';
 
 /**
- * Executes parallel searches and merges the results
+ * Executes parallel searches and merges the results,
+ * deduplicating top stories by link
  */
-async function executeParallelSearches({
+export async function executeParallelSearches({
   searchAPI,
   query,
   date,
@@ -172,6 +173,23 @@ async function executeParallelSearches({
       }
     }
   });
+
+  if (
+    mergedResults.topStories !== undefined &&
+    mergedResults.topStories.length > 1
+  ) {
+    /** The main search's own news results and the parallel news sub-search
+     * frequently return the same stories — keep the first occurrence of each
+     * link so duplicates aren't scraped, reranked, and formatted repeatedly */
+    const seenLinks = new Set<string>();
+    mergedResults.topStories = mergedResults.topStories.filter((story) => {
+      if (!story.link || seenLinks.has(story.link)) {
+        return false;
+      }
+      seenLinks.add(story.link);
+      return true;
+    });
+  }
 
   return { success: true, data: mergedResults };
 }
@@ -340,6 +358,7 @@ export const createSearchTool = (
     tavilySearchOptions,
     rerankerType = 'cohere',
     topResults = 5,
+    maxContentLength,
     strategies = ['no_extraction'],
     filterContent = true,
     safeSearch = 1,
@@ -444,6 +463,7 @@ export const createSearchTool = (
     {
       reranker: selectedReranker,
       topResults,
+      maxContentLength,
       strategies,
       filterContent,
       logger,

@@ -240,7 +240,15 @@ export function expandHighlights(
         !result.highlights ||
         result.highlights.length === 0
       ) {
-        return result; // No modification needed
+        if (result.content == null && result.references == null) {
+          return result;
+        }
+        /** Raw scraped content must never leave this function — without
+         * highlights to expand, strip it instead of passing it downstream */
+        const strippedResult = { ...result };
+        delete strippedResult.content;
+        delete strippedResult.references;
+        return strippedResult;
       }
 
       // Create a shallow copy with expanded highlights
