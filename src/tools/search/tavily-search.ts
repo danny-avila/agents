@@ -1,5 +1,6 @@
 import axios from 'axios';
 import type * as t from './types';
+import { getAxiosProxyOptions } from './proxy';
 
 const DEFAULT_TAVILY_TIMEOUT = 15000;
 
@@ -359,6 +360,7 @@ export const createTavilyAPI = (
             'Content-Type': 'application/json',
           },
           timeout: config.timeout,
+          ...getAxiosProxyOptions(config.apiUrl),
         }
       );
 

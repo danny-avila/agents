@@ -3,6 +3,7 @@ import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
 import type * as t from './types';
 import { getAttribution, createDefaultLogger } from './utils';
 import { createTavilyAPI } from './tavily-search';
+import { getAxiosProxyOptions } from './proxy';
 import { BaseReranker } from './rerankers';
 
 const chunker = {
@@ -186,6 +187,7 @@ const createSerperAPI = (
             'Content-Type': 'application/json',
           },
           timeout: config.timeout,
+          ...getAxiosProxyOptions(apiEndpoint),
         }
       );
 
@@ -284,6 +286,7 @@ const createSearXNGAPI = (
         headers,
         params,
         timeout: config.timeout,
+        ...getAxiosProxyOptions(searchUrl),
       });
 
       const data = response.data;

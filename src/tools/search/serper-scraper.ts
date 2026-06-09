@@ -1,5 +1,6 @@
 import axios from 'axios';
 import type * as t from './types';
+import { getAxiosProxyOptions } from './proxy';
 import { createDefaultLogger } from './utils';
 
 /**
@@ -88,6 +89,7 @@ export class SerperScraper implements t.BaseScraper {
           'Content-Type': 'application/json',
         },
         timeout: options.timeout ?? this.timeout,
+        ...getAxiosProxyOptions(this.apiUrl),
       });
 
       return [url, { success: true, data: response.data }];
