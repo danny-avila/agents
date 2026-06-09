@@ -2,6 +2,7 @@
 import { AIMessage, HumanMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import { _convertMessagesToAnthropicPayload } from './message_inputs';
+import { _makeMessageChunkFromAnthropicEvent } from './message_outputs';
 
 /**
  * Regression for @langchain/core >= 1.1.46 streaming aggregation: a tool call's
@@ -95,5 +96,61 @@ describe('_convertMessagesToAnthropicPayload — aggregated streaming tool input
     const assistant = payload.messages.find((m: any) => m.role === 'assistant');
     const toolUse = (assistant!.content as any[]).find((b) => b.type === 'tool_use');
     expect(toolUse.input).toEqual({ input: '2 + 2' });
+  });
+});
+
+describe('_makeMessageChunkFromAnthropicEvent — streamed tool input merges into content', () => {
+  const fields = { streamUsage: true, coerceContentToString: false };
+
+  it('emits input deltas without a type so aggregation merges them into the tool_use block', () => {
+    const events: any[] = [
+      {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'tool_use', id: 'toolu_1', name: 'calculator', input: {} },
+      },
+      {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'input_json_delta', partial_json: '{"input"' },
+      },
+      {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'input_json_delta', partial_json: ': "2 + 2"}' },
+      },
+    ];
+    const chunks = events
+      .map((e) => _makeMessageChunkFromAnthropicEvent(e, fields)?.chunk)
+      .filter((c): c is NonNullable<typeof c> => c != null);
+
+    // input-delta chunks must not carry a `type` (so core merges them by index
+    // into the sibling tool_use/server_tool_use block rather than orphaning them)
+    const deltaBlocks = chunks
+      .slice(1)
+      .flatMap((c) => (Array.isArray(c.content) ? (c.content as any[]) : []))
+      .filter((b) => 'input' in b);
+    expect(deltaBlocks.length).toBeGreaterThan(0);
+    deltaBlocks.forEach((b) => expect('type' in b).toBe(false));
+
+    // aggregate the chunks the way core does during streaming
+    const merged = chunks.reduce((acc, c) => acc.concat(c));
+    const blocks = merged.content as any[];
+
+    const toolUse = blocks.find((b) => b.type === 'tool_use');
+    expect(toolUse).toMatchObject({ type: 'tool_use', id: 'toolu_1', name: 'calculator' });
+    const parsed =
+      typeof toolUse.input === 'string' ? JSON.parse(toolUse.input) : toolUse.input;
+    expect(parsed).toEqual({ input: '2 + 2' });
+
+    // no orphaned delta block survives aggregation
+    expect(blocks.filter((b) => b.type !== 'tool_use' && 'input' in b)).toHaveLength(0);
+
+    // tool_calls remain correctly aggregated
+    expect(merged.tool_calls?.[0]).toMatchObject({
+      id: 'toolu_1',
+      name: 'calculator',
+      args: { input: '2 + 2' },
+    });
   });
 });
