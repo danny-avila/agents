@@ -35,6 +35,15 @@ type AgentSystemContentBlock =
   | { cachePoint: { type: 'default' } };
 
 type PromptCacheProvider = Providers.ANTHROPIC | Providers.OPENROUTER;
+type GraphToolEntry = t.GraphTools[number];
+
+function getBindingToolName(tool: GraphToolEntry): string | undefined {
+  if (tool == null || typeof tool !== 'object' || !('name' in tool)) {
+    return undefined;
+  }
+
+  return typeof tool.name === 'string' ? tool.name : undefined;
+}
 
 /**
  * Encapsulates agent-specific state that can vary between agents in a multi-agent system
@@ -231,6 +240,8 @@ export class AgentContext {
   toolDefinitions?: t.LCTool[];
   /** Set of tool names discovered via tool search (to be loaded) */
   discoveredToolNames: Set<string> = new Set();
+  /** Duplicate tool binding warnings already emitted for this agent. */
+  private loggedDuplicateToolBindings: Set<string> = new Set();
   /** Original AgentInputs used to create this context — used for self-spawn subagent resolution. */
   _sourceInputs?: t.AgentInputs;
   /** Subagent configurations for hierarchical delegation. */
@@ -1344,10 +1355,13 @@ export class AgentContext {
     const filtered = this.getEffectiveInstanceTools();
 
     if (this.graphTools && this.graphTools.length > 0) {
-      return [...(filtered ?? []), ...this.graphTools];
+      return this.dedupeToolsForBinding([
+        ...(filtered ?? []),
+        ...this.graphTools,
+      ] as t.GraphTools);
     }
 
-    return filtered;
+    return filtered ? this.dedupeToolsForBinding(filtered) : filtered;
   }
 
   /** Creates schema-only tools from toolDefinitions for event-driven mode, merged with native tools */
@@ -1371,7 +1385,48 @@ export class AgentContext {
       allTools.push(...instanceTools);
     }
 
-    return allTools;
+    return this.dedupeToolsForBinding(allTools as t.GraphTools);
+  }
+
+  private dedupeToolsForBinding(tools: t.GraphTools): t.GraphTools {
+    const seenNames = new Set<string>();
+    const duplicateNames = new Set<string>();
+    const dedupedTools: GraphToolEntry[] = [];
+
+    for (const tool of tools) {
+      const name = getBindingToolName(tool);
+      if (!name) {
+        dedupedTools.push(tool);
+        continue;
+      }
+
+      if (seenNames.has(name)) {
+        duplicateNames.add(name);
+        continue;
+      }
+
+      seenNames.add(name);
+      dedupedTools.push(tool);
+    }
+
+    if (duplicateNames.size === 0) {
+      return tools;
+    }
+
+    const namesToLog = [...duplicateNames].filter(
+      (name) => !this.loggedDuplicateToolBindings.has(name)
+    );
+    if (namesToLog.length > 0) {
+      for (const name of namesToLog) {
+        this.loggedDuplicateToolBindings.add(name);
+      }
+      const duplicateList = namesToLog.join(', ');
+      console.warn(
+        `[AgentContext] Removed duplicate tool binding(s) for agent "${this.agentId}": ${duplicateList}`
+      );
+    }
+
+    return dedupedTools as t.GraphTools;
   }
 
   /** Filters tool instances for binding based on registry config */
