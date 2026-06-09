@@ -524,6 +524,17 @@ function _formatContent(message: BaseMessage) {
         return null;
       }
 
+      // Core's v1 streaming aggregation can leave a partial tool-input delta as a
+      // standalone block typed `text` carrying `input` but no `text`. The assembled
+      // input is restored on the tool_use block from `message.tool_calls`, so drop it.
+      if (
+        contentPart.type === 'text' &&
+        'input' in contentPart &&
+        !('text' in contentPart)
+      ) {
+        return null;
+      }
+
       if (isDataContentBlock(contentPart)) {
         return convertToProviderContentBlock(
           contentPart,
@@ -617,9 +628,9 @@ function _formatContent(message: BaseMessage) {
         }
 
         if (contentPartCopy.type === 'input_json_delta') {
-          // `input_json_delta` type only represents yielding partial tool inputs
-          // and is not a valid type for Anthropic messages.
-          contentPartCopy.type = 'tool_use';
+          // Orphaned partial tool-input delta with no id of its own. The assembled
+          // input is restored on the tool_use block from `message.tool_calls`; drop it.
+          return null;
         }
 
         if (
@@ -629,6 +640,23 @@ function _formatContent(message: BaseMessage) {
           contentPartCopy.id.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX)
         ) {
           contentPartCopy.type = 'server_tool_use';
+        }
+
+        // Core's streaming aggregation can leave the inline tool_use input empty
+        // (the assembled arguments live in `message.tool_calls`). Restore it from the
+        // matching aggregated tool call when the inline input is missing.
+        if (
+          contentPartCopy.type === 'tool_use' &&
+          isAIMessage(message) &&
+          typeof contentPartCopy.id === 'string' &&
+          (contentPartCopy.input === '' || contentPartCopy.input == null)
+        ) {
+          const matchingToolCall = message.tool_calls?.find(
+            (toolCall) => toolCall.id === contentPartCopy.id
+          );
+          if (matchingToolCall) {
+            contentPartCopy.input = matchingToolCall.args;
+          }
         }
 
         if ('input' in contentPartCopy) {
