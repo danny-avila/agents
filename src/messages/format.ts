@@ -334,6 +334,10 @@ interface FormatAssistantMessageOptions {
 
 interface FormatAgentMessagesOptions {
   provider?: Providers;
+  /** Skill names already primed fresh this turn (manual/always-apply). Their
+   *  historical `skill` tool_calls are not reconstructed into a HumanMessage,
+   *  so the same SKILL.md body is not injected twice in one request. */
+  skipSkillBodyNames?: Set<string>;
 }
 
 function extractReasoningContent(
@@ -1159,6 +1163,7 @@ function extractSkillName(args: unknown): string | undefined {
  * @param indexTokenCountMap - Optional map of message indices to token counts.
  * @param tools - Optional set of tool names that are allowed in the request.
  * @param skills - Optional map of skill name to body for reconstructing skill HumanMessages.
+ * @param options - Optional formatting options (provider, skipSkillBodyNames).
  * @returns - Object containing formatted messages and updated indexTokenCountMap if provided.
  */
 export const formatAgentMessages = (
@@ -1445,7 +1450,11 @@ export const formatAgentMessages = (
     const endMessageIndex = messages.length;
 
     if (pendingSkillNames?.size != null && pendingSkillNames.size > 0) {
+      const skipSkillBodyNames = options?.skipSkillBodyNames;
       for (const skillName of pendingSkillNames) {
+        if (skipSkillBodyNames != null && skipSkillBodyNames.has(skillName)) {
+          continue;
+        }
         const body = skills?.get(skillName) ?? '';
         if (body) {
           messages.push(

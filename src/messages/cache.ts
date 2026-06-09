@@ -182,6 +182,7 @@ export function addCacheControl<T extends AnthropicMessage | BaseMessage>(
     const needsCacheAdd =
       userMessagesModified < 2 &&
       isUserMessage &&
+      !isSyntheticMetaMessage(originalMessage) &&
       (typeof content === 'string' || hasArrayContent);
 
     // Skip messages that don't need any work
@@ -261,6 +262,26 @@ function getMessageRole(message: MessageWithContent): string | undefined {
     return message.role;
   }
   return undefined;
+}
+
+const SKILL_MESSAGE_SOURCE = 'skill';
+
+/**
+ * Synthetic skill/meta messages (reconstructed skill bodies, primed SKILL.md
+ * instructions) are re-injected every turn and are not stable conversation
+ * turns. They must not anchor a fresh prompt-cache marker — doing so pins the
+ * cache to a volatile/duplicated prefix. Stale markers are still stripped from
+ * them; only the *adding* of new markers is suppressed. Detected via
+ * `additional_kwargs.isMeta === true` or `additional_kwargs.source === 'skill'`.
+ */
+function isSyntheticMetaMessage(message: MessageWithContent): boolean {
+  const { additional_kwargs: kwargs } = message as {
+    additional_kwargs?: { isMeta?: unknown; source?: unknown };
+  };
+  if (kwargs == null) {
+    return false;
+  }
+  return kwargs.isMeta === true || kwargs.source === SKILL_MESSAGE_SOURCE;
 }
 
 function isCacheableConversationMessage(message: MessageWithContent): boolean {
@@ -536,6 +557,7 @@ export function addBedrockCacheControl<
       isUserMessage &&
       !isToolMessage &&
       !isEmptyString &&
+      !isSyntheticMetaMessage(originalMessage) &&
       (typeof content === 'string' || hasArrayContent);
 
     if (!needsCacheAdd && !hasArrayContent && !hasSerializationProps) {
