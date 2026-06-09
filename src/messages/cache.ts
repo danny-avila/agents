@@ -326,7 +326,9 @@ function addCacheControlToRecentMessages<
     const content = originalMessage.content;
     const hasArrayContent = Array.isArray(content);
     const canAddCache =
-      cachePointsAdded < maxCachePoints && canUseMessage(originalMessage);
+      cachePointsAdded < maxCachePoints &&
+      canUseMessage(originalMessage) &&
+      !isSyntheticMetaMessage(originalMessage);
 
     if (!canAddCache && !hasArrayContent) {
       continue;
