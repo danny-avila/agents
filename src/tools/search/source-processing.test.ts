@@ -258,6 +258,46 @@ describe('createSourceProcessor topStories capping', () => {
     expect(data.topStories?.[0].content).toBeDefined();
   });
 
+  test('caps topStories when organic results are missing', async () => {
+    const scrapedUrls: string[] = [];
+    const processor = createProcessorWithStories(scrapedUrls);
+
+    const data = await processor.processSources({
+      query: 'test query',
+      proMode: true,
+      onGetHighlights: undefined,
+      news: true,
+      numElements: 3,
+      result: {
+        success: true,
+        data: { topStories: storyLinks.map(makeStory) },
+      },
+    });
+
+    expect(data.topStories?.length).toBe(3);
+    expect(scrapedUrls).toEqual([]);
+  });
+
+  test('caps topStories on the empty-links early return with news disabled', async () => {
+    const scrapedUrls: string[] = [];
+    const processor = createProcessorWithStories(scrapedUrls);
+
+    const data = await processor.processSources({
+      query: 'test query',
+      proMode: true,
+      onGetHighlights: undefined,
+      news: false,
+      numElements: 3,
+      result: {
+        success: true,
+        data: { organic: [], topStories: storyLinks.map(makeStory) },
+      },
+    });
+
+    expect(data.topStories?.length).toBe(3);
+    expect(scrapedUrls).toEqual([]);
+  });
+
   test('caps topStories to numElements even when news is disabled', async () => {
     const scrapedUrls: string[] = [];
     const processor = createProcessorWithStories(scrapedUrls);

@@ -631,7 +631,20 @@ export const createSourceProcessor = (
           images: [],
           relatedSearches: [],
         };
-      } else if (!result.data.organic) {
+      }
+
+      if (
+        result.data.topStories != null &&
+        result.data.topStories.length > numElements
+      ) {
+        /** Merged news results can far exceed the requested source count;
+         * every entry is formatted into the LLM output, so cap them up
+         * front — before any early return below and before scraping
+         * entries the cap would discard */
+        result.data.topStories = result.data.topStories.slice(0, numElements);
+      }
+
+      if (!result.data.organic) {
         return result.data;
       }
 
@@ -728,14 +741,6 @@ export const createSourceProcessor = (
 
       if (news && topStories.length > 0) {
         updateSourcesWithContent(topStories, sourceMap);
-      }
-
-      if (topStories.length > numElements) {
-        /** Merged news results can far exceed the requested source count;
-         * every entry here is formatted into the LLM output, so cap them
-         * like organic results (sliced after enrichment to keep the
-         * scraped/reranked entries, which come first) */
-        result.data.topStories = topStories.slice(0, numElements);
       }
 
       return result.data;
