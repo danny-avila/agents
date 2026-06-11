@@ -265,6 +265,21 @@ function hasExplicitStreamedToolCallSeals(
   );
 }
 
+/**
+ * True when a provider adapter marked every tool call on this chunk as
+ * complete on arrival (seal kind `all`), e.g. Google GenAI / Vertex AI, whose
+ * protocol delivers function calls as whole objects rather than arg deltas.
+ */
+function hasOnArrivalToolCallSeal(chunk: Partial<AIMessageChunk>): boolean {
+  const metadata = chunk.response_metadata as
+    | Record<string, unknown>
+    | undefined;
+  return (
+    getStreamedToolCallAdapter(metadata) != null &&
+    getStreamedToolCallSeal(metadata)?.kind === 'all'
+  );
+}
+
 function hasDirectToolCallInBatch(args: {
   graph: StandardGraph;
   agentContext?: AgentContext;
@@ -1405,6 +1420,21 @@ export class ChatModelStreamHandler implements t.EventHandler {
         if (!hasToolCallChunks) {
           pruneEagerToolCallChunkStates({ graph, stepKey, clearStep: true });
         }
+      } else if (
+        hasOnArrivalToolCallSeal(chunk) &&
+        !hasPotentialDirectToolInStreamContext({ graph, agentContext })
+      ) {
+        // Providers like Google never signal `tool_calls`/`tool_use` as the
+        // finish reason, but their adapters seal calls on arrival — prestart
+        // these mid-stream under the same direct-tool guard as streamed
+        // chunk sealing.
+        startEagerToolExecutions({
+          graph,
+          metadata,
+          agentContext,
+          toolCalls: chunk.tool_calls,
+          skipExisting: true,
+        });
       }
     }
 

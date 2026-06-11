@@ -11,6 +11,11 @@ import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager
 import type { BaseMessage, UsageMetadata } from '@langchain/core/messages';
 import type { ChatGenerationChunk } from '@langchain/core/outputs';
 import type { GoogleThinkingConfig, VertexAIClientOptions } from '@/types';
+import {
+  STREAMED_TOOL_CALL_SEAL_METADATA_KEY,
+  STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY,
+  GOOGLE_STREAMED_TOOL_CALL_ADAPTER,
+} from '@/tools/streamedToolCallSeals';
 
 /**
  * `@langchain/google-common`'s `_streamResponseChunks` emits usage on TWO
@@ -46,6 +51,31 @@ export function repairStreamUsageMetadata(
   if (generationInfoUsage.output_tokens <= current.output_tokens)
     return current;
   return generationInfoUsage;
+}
+
+/**
+ * The Gemini API delivers function calls as complete objects — never as
+ * partial arg deltas. `@langchain/google-common` pre-parses each streamed
+ * functionCall part into `tool_calls` (invalid args land in
+ * `invalid_tool_calls` instead), so a chunk whose tool-call chunks all parsed
+ * cleanly is sealed on arrival for eager tool execution. Anything that fails
+ * the parse check is left unstamped and falls back to the lazy path.
+ */
+export function sealCompleteStreamedToolCalls(message: AIMessageChunk): void {
+  const chunkCount = message.tool_call_chunks?.length ?? 0;
+  if (
+    chunkCount === 0 ||
+    (message.invalid_tool_calls?.length ?? 0) > 0 ||
+    (message.tool_calls?.length ?? 0) !== chunkCount
+  ) {
+    return;
+  }
+  message.response_metadata = {
+    ...message.response_metadata,
+    [STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY]:
+      GOOGLE_STREAMED_TOOL_CALL_ADAPTER,
+    [STREAMED_TOOL_CALL_SEAL_METADATA_KEY]: { kind: 'all' },
+  };
 }
 
 type AdditionalKwargs =
@@ -503,6 +533,7 @@ export class ChatVertexAI extends ChatGoogle {
         if (repaired !== chunk.message.usage_metadata) {
           chunk.message.usage_metadata = repaired;
         }
+        sealCompleteStreamedToolCalls(chunk.message);
       }
       yield chunk;
     }

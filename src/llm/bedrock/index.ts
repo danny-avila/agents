@@ -34,6 +34,7 @@ import type { BaseMessage, ResponseMetadata } from '@langchain/core/messages';
 import type { ChatBedrockConverseInput } from '@langchain/aws';
 import {
   convertToConverseMessages,
+  createConverseToolUseStopChunk,
   handleConverseStreamContentBlockStart,
   handleConverseStreamContentBlockDelta,
   handleConverseStreamMetadata,
@@ -224,6 +225,7 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
     }
 
     const seenBlockIndices = new Set<number>();
+    const toolUseBlockIndices = new Set<number>();
 
     for await (const event of response.stream) {
       if (event.contentBlockStart != null) {
@@ -234,6 +236,9 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
           const idx = event.contentBlockStart.contentBlockIndex;
           if (idx != null) {
             seenBlockIndices.add(idx);
+            if (event.contentBlockStart.start?.toolUse != null) {
+              toolUseBlockIndices.add(idx);
+            }
           }
           yield this.enrichChunk(startChunk, seenBlockIndices);
         }
@@ -263,6 +268,11 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
         const stopIdx = event.contentBlockStop.contentBlockIndex;
         if (stopIdx != null) {
           seenBlockIndices.add(stopIdx);
+          if (toolUseBlockIndices.has(stopIdx)) {
+            // Converse guarantees the block's input is complete at stop, so
+            // emit an explicit seal chunk for eager tool execution.
+            yield createConverseToolUseStopChunk(stopIdx);
+          }
         }
       } else {
         yield new ChatGenerationChunk({

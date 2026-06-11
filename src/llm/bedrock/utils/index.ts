@@ -10,6 +10,7 @@ export {
 
 export {
   convertConverseMessageToLangChainMessage,
+  createConverseToolUseStopChunk,
   handleConverseStreamContentBlockStart,
   handleConverseStreamContentBlockDelta,
   handleConverseStreamMetadata,
