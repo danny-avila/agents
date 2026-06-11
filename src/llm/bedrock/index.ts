@@ -226,6 +226,14 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
 
     const seenBlockIndices = new Set<number>();
     const toolUseBlockIndices = new Set<number>();
+    /**
+     * Guardrails can reject an already-streamed toolUse block at
+     * `messageStop` (`guardrail_intervened`), after `contentBlockStop` has
+     * passed. Only emit eager-execution seals when no guardrails are
+     * configured, so a later intervention can't race an eagerly started tool.
+     */
+    const sealToolUseOnStop =
+      options.guardrailConfig == null && this.guardrailConfig == null;
 
     for await (const event of response.stream) {
       if (event.contentBlockStart != null) {
@@ -280,7 +288,7 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
         const stopIdx = event.contentBlockStop.contentBlockIndex;
         if (stopIdx != null) {
           seenBlockIndices.add(stopIdx);
-          if (toolUseBlockIndices.has(stopIdx)) {
+          if (sealToolUseOnStop && toolUseBlockIndices.has(stopIdx)) {
             // Converse guarantees the block's input is complete at stop, so
             // emit an explicit seal chunk for eager tool execution — through
             // the callback path too, for registered stream handlers.
