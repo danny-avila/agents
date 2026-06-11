@@ -1625,6 +1625,17 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }
 
       let finalMessages = messagesToUse;
+      /** Tail snapshot for the dispatch-time usage delta: in-place
+       *  formatters (artifact appends, Bedrock content rewrites, legacy
+       *  string conversion) only mutate trailing messages and are invisible
+       *  to both length and identity checks — capture before they run */
+      let preFormatTailTokens: number | null = null;
+      if (contextUsage != null && agentContext.tokenCounter != null) {
+        preFormatTailTokens = 0;
+        for (const message of messagesToUse.slice(-2)) {
+          preFormatTailTokens += agentContext.tokenCounter(message);
+        }
+      }
       if (agentContext.useLegacyContent) {
         finalMessages = formatContentStrings(finalMessages);
       }
@@ -1817,6 +1828,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
       /** Past the empty-prompt guard — a model call is now guaranteed */
       if (contextUsage != null) {
+        const usageRatio =
+          contextUsage.calibrationRatio != null &&
+          contextUsage.calibrationRatio > 0
+            ? contextUsage.calibrationRatio
+            : 1;
         if (
           agentContext.tokenCounter != null &&
           finalMessages.length !== messagesToUse.length
@@ -1828,11 +1844,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           for (const message of finalMessages) {
             rawTokens += agentContext.tokenCounter(message);
           }
-          const ratio =
-            contextUsage.calibrationRatio != null &&
-            contextUsage.calibrationRatio > 0
-              ? contextUsage.calibrationRatio
-              : 1;
           if (
             contextUsage.contextBudget != null &&
             contextUsage.effectiveInstructionTokens != null
@@ -1841,7 +1852,29 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               0,
               contextUsage.contextBudget -
                 contextUsage.effectiveInstructionTokens -
-                Math.round(rawTokens * ratio)
+                Math.round(rawTokens * usageRatio)
+            );
+          }
+        } else if (
+          preFormatTailTokens != null &&
+          agentContext.tokenCounter != null &&
+          contextUsage.remainingContextTokens != null
+        ) {
+          /** Same-length formatting can still grow trailing messages in
+           *  place — adjust remaining by the tail's calibrated delta */
+          let postFormatTailTokens = 0;
+          for (const message of finalMessages.slice(-2)) {
+            postFormatTailTokens += agentContext.tokenCounter(message);
+          }
+          const tailDelta = postFormatTailTokens - preFormatTailTokens;
+          if (tailDelta !== 0) {
+            contextUsage.remainingContextTokens = Math.max(
+              0,
+              Math.min(
+                contextUsage.contextBudget ?? Number.MAX_SAFE_INTEGER,
+                contextUsage.remainingContextTokens -
+                  Math.round(tailDelta * usageRatio)
+              )
             );
           }
         }
