@@ -63,6 +63,7 @@ describe('ON_CONTEXT_USAGE event', () => {
     expect(event.agentId).toBeDefined();
     expect(event.breakdown.maxContextTokens).toBe(maxContextTokens);
     expect(event.breakdown.instructionTokens).toBeGreaterThan(0);
+    expect(event.breakdown.toolTokenCounts).toEqual({});
     expect(event.contextBudget).toBeGreaterThan(0);
     expect(event.contextBudget).toBeLessThanOrEqual(maxContextTokens);
     expect(event.effectiveInstructionTokens).toBeGreaterThan(0);

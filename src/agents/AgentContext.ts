@@ -191,6 +191,10 @@ export class AgentContext {
   dynamicInstructionTokens: number = 0;
   /** Token count for tool schemas only. */
   toolSchemaTokens: number = 0;
+  /** Per-tool schema token counts (post-multiplier), keyed by tool name. */
+  toolTokenCounts: Record<string, number> = {};
+  /** Names of counted tools that are deferred (`defer_loading`) and discovered. */
+  deferredToolNames: string[] = [];
   /** Running calibration ratio from the pruner — persisted across runs via contextMeta. */
   calibrationRatio: number = 1;
   /** Provider-observed instruction overhead from the pruner's best-variance turn. */
@@ -894,6 +898,8 @@ export class AgentContext {
     this.systemMessageTokens = 0;
     this.dynamicInstructionTokens = 0;
     this.toolSchemaTokens = 0;
+    this.toolTokenCounts = {};
+    this.deferredToolNames = [];
     this.cachedSystemRunnable = undefined;
     this.systemRunnableStale = true;
     this.lastToken = undefined;
@@ -1006,6 +1012,7 @@ export class AgentContext {
   ): Promise<void> {
     let toolTokens = 0;
     const countedToolNames = new Set<string>();
+    const rawToolTokenCounts: Record<string, number> = {};
 
     /**
      * Iterate both `tools` (user-provided instance tools) and `graphTools`
@@ -1040,11 +1047,14 @@ export class AgentContext {
             toolName,
             (genericTool.description as string | undefined) ?? ''
           );
-          toolTokens += tokenCounter(
+          const schemaTokens = tokenCounter(
             new SystemMessage(JSON.stringify(jsonSchema))
           );
+          toolTokens += schemaTokens;
           if (toolName) {
             countedToolNames.add(toolName);
+            rawToolTokenCounts[toolName] =
+              (rawToolTokenCounts[toolName] ?? 0) + schemaTokens;
           }
         }
       }
@@ -1062,7 +1072,13 @@ export class AgentContext {
           parameters: def.parameters ?? {},
         },
       };
-      toolTokens += tokenCounter(new SystemMessage(JSON.stringify(schema)));
+      const schemaTokens = tokenCounter(
+        new SystemMessage(JSON.stringify(schema))
+      );
+      toolTokens += schemaTokens;
+      countedToolNames.add(def.name);
+      rawToolTokenCounts[def.name] =
+        (rawToolTokenCounts[def.name] ?? 0) + schemaTokens;
     }
 
     const isAnthropic =
@@ -1077,6 +1093,17 @@ export class AgentContext {
       ? ANTHROPIC_TOOL_TOKEN_MULTIPLIER
       : DEFAULT_TOOL_TOKEN_MULTIPLIER;
     this.toolSchemaTokens = Math.ceil(toolTokens * toolTokenMultiplier);
+
+    const toolTokenCounts: Record<string, number> = {};
+    const deferredToolNames: string[] = [];
+    for (const [name, rawCount] of Object.entries(rawToolTokenCounts)) {
+      toolTokenCounts[name] = Math.ceil(rawCount * toolTokenMultiplier);
+      if (this.toolRegistry?.get(name)?.defer_loading === true) {
+        deferredToolNames.push(name);
+      }
+    }
+    this.toolTokenCounts = toolTokenCounts;
+    this.deferredToolNames = deferredToolNames;
   }
 
   /**
@@ -1255,6 +1282,11 @@ export class AgentContext {
       messageCount,
       messageTokens,
       availableForMessages,
+      toolTokenCounts: { ...this.toolTokenCounts },
+      deferredToolNames:
+        this.deferredToolNames.length > 0
+          ? [...this.deferredToolNames]
+          : undefined,
     };
   }
 
