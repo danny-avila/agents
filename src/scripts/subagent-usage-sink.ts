@@ -86,7 +86,9 @@ async function main(): Promise<void> {
       [GraphEvents.TOOL_END]: new ToolEndHandler(),
       [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(collectedUsage),
     },
-    subagentUsageSink: (event) => sunkEvents.push(event),
+    subagentUsageSink: (event) => {
+      sunkEvents.push(event);
+    },
   });
 
   const callerConfig = {

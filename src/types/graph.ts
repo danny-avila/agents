@@ -466,11 +466,16 @@ export interface SubagentUsageEvent {
 }
 
 /**
- * Host-provided callback receiving {@link SubagentUsageEvent}s. Invoked
- * synchronously as each child model call completes; implementations should
- * be cheap and non-throwing (errors are swallowed by the executor).
+ * Host-provided callback receiving {@link SubagentUsageEvent}s. Invoked as
+ * each child model call completes. May return a promise — the executor
+ * awaits each dispatch (so all usage is recorded before the child's result
+ * resolves to the parent) and swallows both synchronous throws and
+ * rejections; implementations should still be cheap, as they sit on the
+ * child's model-call path.
  */
-export type SubagentUsageSink = (event: SubagentUsageEvent) => void;
+export type SubagentUsageSink = (
+  event: SubagentUsageEvent
+) => void | Promise<void>;
 
 export type LangfuseToolOutputTracingConfig = {
   /**

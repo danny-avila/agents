@@ -543,7 +543,9 @@ describe('SubagentExecutor', () => {
       const events: SubagentUsageEvent[] = [];
       const { factory, getInput } = makeCapturingGraphFactory();
       const executor = createExecutor({
-        usageSink: (event) => events.push(event),
+        usageSink: (event) => {
+          events.push(event);
+        },
         createChildGraph: factory,
       });
 
@@ -613,7 +615,9 @@ describe('SubagentExecutor', () => {
         },
       });
       const executor = createExecutor({
-        usageSink: (event) => events.push(event),
+        usageSink: (event) => {
+          events.push(event);
+        },
         createChildGraph: factory,
       });
 
@@ -652,7 +656,9 @@ describe('SubagentExecutor', () => {
         },
       });
       const executor = createExecutor({
-        usageSink: (event) => events.push(event),
+        usageSink: (event) => {
+          events.push(event);
+        },
         createChildGraph: factory,
       });
 
@@ -687,7 +693,9 @@ describe('SubagentExecutor', () => {
         },
       });
       const executor = createExecutor({
-        usageSink: (event) => events.push(event),
+        usageSink: (event) => {
+          events.push(event);
+        },
         createChildGraph: factory,
       });
 
@@ -731,7 +739,9 @@ describe('SubagentExecutor', () => {
         },
       });
       const executor = createExecutor({
-        usageSink: (event) => events.push(event),
+        usageSink: (event) => {
+          events.push(event);
+        },
         createChildGraph: factory,
       });
 
@@ -774,7 +784,9 @@ describe('SubagentExecutor', () => {
         },
       });
       const executor = createExecutor({
-        usageSink: (event) => events.push(event),
+        usageSink: (event) => {
+          events.push(event);
+        },
         createChildGraph: factory,
       });
 
@@ -794,7 +806,9 @@ describe('SubagentExecutor', () => {
         },
       });
       const executor = createExecutor({
-        usageSink: (event) => events.push(event),
+        usageSink: (event) => {
+          events.push(event);
+        },
         createChildGraph: factory,
       });
 
@@ -832,6 +846,55 @@ describe('SubagentExecutor', () => {
       });
 
       expect(result.content).toBe('child done');
+    });
+
+    it('awaits async sinks and swallows their rejections', async () => {
+      const settled: string[] = [];
+      const { factory } = makeCapturingGraphFactory({
+        drive: async (handler) => {
+          await handler.handleLLMEnd?.(
+            makeLLMEndOutput({
+              input_tokens: 1,
+              output_tokens: 1,
+              total_tokens: 2,
+            }),
+            'call-1'
+          );
+          await handler.handleLLMEnd?.(
+            makeLLMEndOutput({
+              input_tokens: 2,
+              output_tokens: 2,
+              total_tokens: 4,
+            }),
+            'call-2'
+          );
+          /**
+           * Both sink dispatches must have settled by the time
+           * `handleLLMEnd` resolves — a dropped promise would leave
+           * `recorded` missing here and surface the second call's
+           * rejection as unhandled.
+           */
+          settled.push('drive-done');
+        },
+      });
+      const executor = createExecutor({
+        usageSink: async (event) => {
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          if (event.usage.input_tokens === 2) {
+            throw new Error('async host sink rejected');
+          }
+          settled.push('recorded');
+        },
+        createChildGraph: factory,
+      });
+
+      const result = await executor.execute({
+        description: 'Research this topic',
+        subagentType: 'researcher',
+      });
+
+      expect(result.content).toBe('child done');
+      expect(settled).toEqual(['recorded', 'drive-done']);
     });
   });
 

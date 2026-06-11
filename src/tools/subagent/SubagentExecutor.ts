@@ -389,9 +389,10 @@ export class SubagentExecutor {
       subagentUsageSink:
         hostUsageSink == null
           ? undefined
-          : (event): void => {
-            hostUsageSink({ ...event, runId: this.parentRunId });
-          },
+          : /** Returns the host sink's result so async sinks stay awaited
+             *  through every wrapper layer. */
+          (event): void | Promise<void> =>
+            hostUsageSink({ ...event, runId: this.parentRunId }),
     });
 
     let forwarding: ForwarderCallback | undefined;
@@ -853,7 +854,7 @@ function createUsageCaptureHandler(args: {
         });
       }
     },
-    handleLLMEnd: (output: LLMResult, runId: string): void => {
+    handleLLMEnd: async (output: LLMResult, runId: string): Promise<void> => {
       const callInfo = callInfoByCallId.get(runId);
       callInfoByCallId.delete(runId);
       const model = callInfo?.model ?? fallbackModel;
@@ -874,8 +875,15 @@ function createUsageCaptureHandler(args: {
           if (usage == null) {
             continue;
           }
+          /**
+           * Awaited so async host sinks (billing/persistence) complete
+           * before the model call resolves — `awaitHandlers` only waits on
+           * `handleLLMEnd` itself, so a dropped promise here would let the
+           * parent run finish before usage is recorded and would turn sink
+           * rejections into unhandled rejections.
+           */
           try {
-            sink({
+            await sink({
               usage,
               model,
               provider: callProvider,
@@ -885,7 +893,7 @@ function createUsageCaptureHandler(args: {
               runId: parentRunId,
             });
           } catch {
-            /* observational — a throwing host sink must not break the child run */
+            /* observational — a throwing/rejecting host sink must not break the child run */
           }
           break;
         }

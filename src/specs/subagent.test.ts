@@ -462,7 +462,9 @@ describe('Subagent Integration', () => {
       returnContent: true,
       skipCleanup: true,
       customHandlers,
-      subagentUsageSink: (event) => sunkEvents.push(event),
+      subagentUsageSink: (event) => {
+        sunkEvents.push(event);
+      },
     });
 
     const subagentToolCall: ToolCall = {

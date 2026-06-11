@@ -6,8 +6,8 @@ import {
   DEFAULT_SUMMARIZATION_PROMPT,
   DEFAULT_UPDATE_SUMMARIZATION_PROMPT,
 } from '@/summarization/node';
+import { Constants, GraphEvents, Providers } from '@/common';
 import { AgentContext } from '@/agents/AgentContext';
-import { GraphEvents, Providers } from '@/common';
 import * as providers from '@/llm/providers';
 import * as eventUtils from '@/utils/events';
 
@@ -214,6 +214,65 @@ describe('createSummarizeNode', () => {
     expect(
       (completeEvent?.data as t.SummarizeCompleteEvent).error
     ).toBeUndefined();
+  });
+
+  it('stamps INVOKED_MODEL/INVOKED_PROVIDER metadata for a dedicated summarizer model', async () => {
+    captureEvents();
+
+    const capturedConfigs: unknown[] = [];
+    jest.spyOn(providers, 'getChatModelClass').mockReturnValue(
+      class {
+        constructor() {
+          return {
+            invoke: jest
+              .fn()
+              .mockImplementation(
+                async (_messages: unknown, config?: unknown) => {
+                  capturedConfigs.push(config);
+                  return { content: 'Summary text' };
+                }
+              ),
+          };
+        }
+      } as never
+    );
+
+    const agentContext = createAgentContext({
+      summarizationConfig: {
+        retainRecent: { turns: 0 },
+        model: 'gpt-4.1-mini',
+      },
+    });
+    const graph = mockGraph();
+    const node = createSummarizeNode({
+      agentContext,
+      graph,
+      generateStepId,
+    });
+
+    await node(
+      {
+        messages: [new HumanMessage('Hello'), new HumanMessage('World')],
+        summarizationRequest: {
+          remainingContextTokens: 1000,
+          agentId: 'agent_0',
+        },
+      },
+      {} as RunnableConfig
+    );
+
+    /**
+     * Usage consumers (the subagent usage-capture handler) attribute the
+     * call from these keys — without them, a summarizer model that differs
+     * from the agent's primary would be billed against the primary config.
+     */
+    const config = capturedConfigs[0] as {
+      metadata?: Record<string, unknown>;
+    };
+    expect(config.metadata?.[Constants.INVOKED_MODEL]).toBe('gpt-4.1-mini');
+    expect(config.metadata?.[Constants.INVOKED_PROVIDER]).toBe(
+      Providers.OPENAI
+    );
   });
 
   it('collects streamed text when model supports stream()', async () => {
