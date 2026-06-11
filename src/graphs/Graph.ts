@@ -109,6 +109,35 @@ function trailingMutationStart(messages: BaseMessage[]): number {
   return Math.max(0, Math.min(index, messages.length - 2));
 }
 
+/**
+ * Re-derives the breakdown fields coupled to the calibrated budget math so
+ * the snapshot stays internally consistent: the aggregate
+ * `instructionTokens`/`availableForMessages` reflect the pruner's effective
+ * (calibrated) overhead — component fields remain local estimates — and
+ * `messageTokens` mirrors `contextBudget - instructions - remaining`.
+ */
+function syncBudgetDerivedFields(usage: t.ContextUsageEvent): void {
+  const { breakdown, contextBudget, effectiveInstructionTokens } = usage;
+  if (effectiveInstructionTokens == null) {
+    return;
+  }
+  breakdown.instructionTokens = effectiveInstructionTokens;
+  if (contextBudget == null) {
+    return;
+  }
+  breakdown.availableForMessages = Math.max(
+    0,
+    contextBudget - effectiveInstructionTokens
+  );
+  if (usage.remainingContextTokens == null) {
+    return;
+  }
+  breakdown.messageTokens = Math.max(
+    0,
+    contextBudget - effectiveInstructionTokens - usage.remainingContextTokens
+  );
+}
+
 type ReasoningKey = 'reasoning_content' | 'reasoning';
 type ReasoningSummary = { summary?: Array<{ text?: string }> };
 type ReasoningDetail = { type?: string; text?: string };
@@ -1537,16 +1566,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
          *  missum); `prePruneContextTokens` carries the pre-prune metric. */
         const usageBreakdown = agentContext.getTokenBudgetBreakdown(messages);
         usageBreakdown.messageCount = context.length;
-        if (
-          contextBudget != null &&
-          effectiveInstructionTokens != null &&
-          remainingContextTokens != null
-        ) {
-          usageBreakdown.messageTokens = Math.max(
-            0,
-            contextBudget - effectiveInstructionTokens - remainingContextTokens
-          );
-        }
         contextUsage = {
           runId: this.runId,
           agentId,
@@ -1557,6 +1576,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           remainingContextTokens,
           calibrationRatio: agentContext.calibrationRatio,
         };
+        syncBudgetDerivedFields(contextUsage);
 
         const hasPrunedMessages =
           agentContext.summarizationEnabled === true &&
@@ -1884,6 +1904,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           for (const message of finalMessages) {
             rawTokens += agentContext.tokenCounter(message);
           }
+          contextUsage.breakdown.messageCount = finalMessages.length;
           if (
             contextUsage.contextBudget != null &&
             contextUsage.effectiveInstructionTokens != null
@@ -1918,6 +1939,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             );
           }
         }
+        syncBudgetDerivedFields(contextUsage);
         /** Awaited so async host handlers receive the pre-invoke snapshot
          *  before any model deltas are emitted */
         await safeDispatchCustomEvent(

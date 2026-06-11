@@ -72,6 +72,18 @@ describe('ON_CONTEXT_USAGE event', () => {
     expect(event.remainingContextTokens).toBeLessThan(
       event.contextBudget as number
     );
+    expect(event.breakdown.instructionTokens).toBe(
+      event.effectiveInstructionTokens
+    );
+    expect(event.breakdown.availableForMessages).toBe(
+      (event.contextBudget as number) -
+        (event.effectiveInstructionTokens as number)
+    );
+    expect(event.breakdown.messageTokens).toBe(
+      (event.contextBudget as number) -
+        (event.effectiveInstructionTokens as number) -
+        (event.remainingContextTokens as number)
+    );
   });
 
   it('does not dispatch when no tokenCounter is configured', async () => {
