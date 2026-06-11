@@ -415,6 +415,16 @@ export type ToolExecuteBatchRequest = {
   resolve: (results: ToolExecuteResult[]) => void;
   /** Promise rejector - handler calls this on fatal error */
   reject: (error: Error) => void;
+  /**
+   * Optional per-call result channel. When present, the handler MAY invoke
+   * this as each tool call settles (before the final `resolve`) so the
+   * graph can emit that call's completion event without waiting for the
+   * slowest call in the batch. Purely an emission fast-path: the handler
+   * must still pass every result to `resolve`, which remains the
+   * authoritative batch outcome. Only provided when no post-tool hooks or
+   * human-in-the-loop flows could change a result after execution.
+   */
+  onResult?: (result: ToolExecuteResult) => void;
 };
 
 /**
