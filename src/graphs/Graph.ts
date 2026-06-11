@@ -1492,6 +1492,16 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               : 1;
           if (variance > CALIBRATION_VARIANCE_THRESHOLD) {
             agentContext.toolSchemaTokens = calibratedToolTokens;
+            /** Keep the per-tool breakdown summing to the calibrated
+             *  aggregate by scaling each entry proportionally */
+            if (agentContext.toolTokenCounts != null && currentToolTokens > 0) {
+              const factor = calibratedToolTokens / currentToolTokens;
+              for (const name of Object.keys(agentContext.toolTokenCounts)) {
+                agentContext.toolTokenCounts[name] = Math.round(
+                  agentContext.toolTokenCounts[name] * factor
+                );
+              }
+            }
           }
         }
         messagesToUse = context;

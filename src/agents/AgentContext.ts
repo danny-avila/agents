@@ -1247,9 +1247,8 @@ export class AgentContext {
    * Returns a structured breakdown of how the context token budget is consumed.
    * Useful for diagnostics when context overflow or pruning issues occur.
    *
-   * Note: `toolCount` reflects discoveries immediately, but `toolSchemaTokens`
-   * is a snapshot taken during `calculateInstructionTokens` and is not
-   * recomputed when `markToolsAsDiscovered` is called mid-run.
+   * Note: `markToolsAsDiscovered` re-triggers `calculateInstructionTokens`,
+   * so `toolSchemaTokens`/`toolTokenCounts` refresh before the next call.
    */
   getTokenBudgetBreakdown(messages?: BaseMessage[]): t.TokenBudgetBreakdown {
     const maxContextTokens = this.maxContextTokens ?? 0;
@@ -1273,7 +1272,14 @@ export class AgentContext {
       }
     }
 
-    const reserveTokens = Math.round(maxContextTokens * DEFAULT_RESERVE_RATIO);
+    /** Mirror the pruner's reserve math so availableForMessages agrees
+     *  with the contextBudget computed during pruning */
+    const reserveRatio =
+      this.summarizationConfig?.reserveRatio ?? DEFAULT_RESERVE_RATIO;
+    const reserveTokens =
+      reserveRatio > 0 && reserveRatio < 1
+        ? Math.round(maxContextTokens * reserveRatio)
+        : 0;
     const availableForMessages = Math.max(
       0,
       maxContextTokens - reserveTokens - this.instructionTokens
@@ -1365,6 +1371,14 @@ export class AgentContext {
     }
     if (hasNewDiscoveries) {
       this.systemRunnableStale = true;
+      /** Refresh schema token accounting so the next call's budget and
+       *  per-tool breakdown include the newly discovered tools; awaited
+       *  via tokenCalculationPromise before the next model call */
+      if (this.tokenCounter) {
+        this.tokenCalculationPromise = this.calculateInstructionTokens(
+          this.tokenCounter
+        );
+      }
     }
     return hasNewDiscoveries;
   }
