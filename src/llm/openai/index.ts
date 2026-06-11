@@ -702,10 +702,38 @@ function stampSequentialStreamedToolCallAdapter(
 }
 
 function isOfficialOpenAIBaseURL(baseURL: string | null | undefined): boolean {
-  if (baseURL == null || baseURL === '') {
+  // The OpenAI SDK falls back to OPENAI_BASE_URL when the client has no
+  // explicit baseURL, so an unset constructor value can still route to an
+  // OpenAI-compatible endpoint.
+  const effectiveBaseURL =
+    baseURL != null && baseURL !== '' ? baseURL : process.env.OPENAI_BASE_URL;
+  if (effectiveBaseURL == null || effectiveBaseURL === '') {
     return true;
   }
-  return OFFICIAL_OPENAI_BASE_URL_PATTERN.test(baseURL);
+  return OFFICIAL_OPENAI_BASE_URL_PATTERN.test(effectiveBaseURL);
+}
+
+const AZURE_FIRST_PARTY_BASE_PATH_PATTERN =
+  /^https:\/\/[^/]+\.(openai\.azure\.com|cognitiveservices\.azure\.com)(:\d+)?(\/|$)/;
+
+/**
+ * Azure OpenAI is first-party when requests resolve to an instance-name
+ * endpoint or an *.openai.azure.com / *.cognitiveservices.azure.com base
+ * path. A custom `clientConfig.baseURL` or a non-Azure `azureOpenAIBasePath`
+ * routes through a proxy or Azure-compatible endpoint whose stream contract
+ * is unknown, so those are not stamped.
+ */
+function isFirstPartyAzureEndpoint(args: {
+  baseURL: string | null | undefined;
+  azureOpenAIBasePath: string | undefined;
+}): boolean {
+  if (args.baseURL != null && args.baseURL !== '') {
+    return false;
+  }
+  if (args.azureOpenAIBasePath == null || args.azureOpenAIBasePath === '') {
+    return true;
+  }
+  return AZURE_FIRST_PARTY_BASE_PATH_PATTERN.test(args.azureOpenAIBasePath);
 }
 
 class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
@@ -1137,15 +1165,22 @@ class LibreChatAzureOpenAICompletions extends OriginalAzureChatOpenAICompletions
     rawResponse: OpenAIClient.Chat.Completions.ChatCompletionChunk,
     defaultRole?: OpenAIClient.Chat.ChatCompletionRole
   ): BaseMessageChunk {
-    // Azure OpenAI is first-party: same sequential-by-index stream contract
-    // as api.openai.com, so its tool-call deltas are always stamped.
-    return stampSequentialStreamedToolCallAdapter(
-      super._convertCompletionsDeltaToBaseMessageChunk(
-        delta,
-        rawResponse,
-        defaultRole
-      )
+    const message = super._convertCompletionsDeltaToBaseMessageChunk(
+      delta,
+      rawResponse,
+      defaultRole
     );
+    if (
+      isFirstPartyAzureEndpoint({
+        baseURL: this.clientConfig.baseURL,
+        azureOpenAIBasePath: this.azureOpenAIBasePath,
+      })
+    ) {
+      // First-party Azure OpenAI: same sequential-by-index stream contract
+      // as api.openai.com.
+      return stampSequentialStreamedToolCallAdapter(message);
+    }
+    return message;
   }
 
   _getClientOptions(
