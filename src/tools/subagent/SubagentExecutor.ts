@@ -26,7 +26,7 @@ import type { AggregatedHookResult, HookRegistry } from '@/hooks';
 import type { AgentContext } from '@/agents/AgentContext';
 import type { StandardGraph } from '@/graphs/Graph';
 import type { HandlerRegistry } from '@/events';
-import { GraphEvents, Callback, StepTypes } from '@/common';
+import { Constants, GraphEvents, Callback, StepTypes } from '@/common';
 import { executeHooks } from '@/hooks';
 
 const DEFAULT_MAX_TURNS = 25;
@@ -364,6 +364,7 @@ export class SubagentExecutor {
     const childRunId = `${this.parentRunId}_sub_${nanoid(8)}`;
     const maxTurns = config.maxTurns ?? DEFAULT_MAX_TURNS;
 
+    const hostUsageSink = this.usageSink;
     const childGraph = this.createChildGraph({
       runId: childRunId,
       signal: this.parentSignal,
@@ -377,8 +378,20 @@ export class SubagentExecutor {
        * level attaches its own capture callback — `workflow.invoke` replaces
        * the inherited callback chain, so a single top-level handler would
        * never see grandchild model calls.
+       *
+       * The wrapper rewrites `runId` to THIS executor's parent run: nested
+       * executors emit with their own `parentRunId` (a `*_sub_*` child id),
+       * and each wrapper layer rewrites upward, so by the time an event
+       * reaches the host sink its `runId` is the ROOT run — hosts keying
+       * billing by run id never see intermediate child run ids there
+       * (`subagentRunId` still identifies the emitting child).
        */
-      subagentUsageSink: this.usageSink,
+      subagentUsageSink:
+        hostUsageSink == null
+          ? undefined
+          : (event): void => {
+            hostUsageSink({ ...event, runId: this.parentRunId });
+          },
     });
 
     let forwarding: ForwarderCallback | undefined;
@@ -784,9 +797,15 @@ function createUsageCaptureHandler(args: {
   subagentRunId: string;
   subagentAgentId: string;
   parentRunId: string;
-  /** Child config's provider enum — hosts key pricing/cache semantics off it. */
+  /**
+   * Child config's provider enum — the default tag when a call carries no
+   * `INVOKED_PROVIDER` metadata (hosts key pricing/cache semantics off it).
+   */
   provider?: string;
-  /** Child config's model, used when a call carries no `ls_model_name`. */
+  /**
+   * Child config's model, used when a call carries neither `ls_model_name`
+   * nor `INVOKED_MODEL` metadata.
+   */
   fallbackModel?: string;
 }): BaseCallbackHandler {
   const {
@@ -798,8 +817,19 @@ function createUsageCaptureHandler(args: {
     provider,
     fallbackModel,
   } = args;
-  /** Per-call `ls_model_name` keyed by LangChain callback runId. */
-  const modelNamesByCallId = new Map<string, string>();
+  /**
+   * Per-call attribution keyed by LangChain callback runId. `model` joins
+   * `ls_model_name` (provider-reported) with `INVOKED_MODEL` (stamped by
+   * `tryFallbackProviders` from the fallback's client options); `provider`
+   * is `INVOKED_PROVIDER`, stamped by `attemptInvoke` with the SDK enum of
+   * the provider that ACTUALLY served the call — correct for
+   * fallback-served calls, where the static config provider would mis-tag
+   * pricing/cache semantics.
+   */
+  const callInfoByCallId = new Map<
+    string,
+    { model?: string; provider?: string }
+  >();
   const handler = BaseCallbackHandler.fromMethods({
     handleChatModelStart: (
       _llm: unknown,
@@ -810,15 +840,32 @@ function createUsageCaptureHandler(args: {
       _tags?: string[],
       metadata?: Record<string, unknown>
     ): void => {
-      const lsModelName = metadata?.ls_model_name;
-      if (typeof lsModelName === 'string' && lsModelName.length > 0) {
-        modelNamesByCallId.set(runId, lsModelName);
+      const callModel =
+        asNonEmptyString(metadata?.ls_model_name) ??
+        asNonEmptyString(metadata?.[Constants.INVOKED_MODEL]);
+      const callProvider = asNonEmptyString(
+        metadata?.[Constants.INVOKED_PROVIDER]
+      );
+      if (callModel != null || callProvider != null) {
+        callInfoByCallId.set(runId, {
+          model: callModel,
+          provider: callProvider,
+        });
       }
     },
     handleLLMEnd: (output: LLMResult, runId: string): void => {
-      const model = modelNamesByCallId.get(runId) ?? fallbackModel;
-      modelNamesByCallId.delete(runId);
+      const callInfo = callInfoByCallId.get(runId);
+      callInfoByCallId.delete(runId);
+      const model = callInfo?.model ?? fallbackModel;
+      const callProvider = callInfo?.provider ?? provider;
       for (const generationGroup of output.generations) {
+        /**
+         * At most ONE event per generation group: each group is one
+         * provider request (the outer array is per-prompt for batched
+         * calls), and with multiple completions (`n > 1`) every choice in
+         * a group repeats the request-level `usage_metadata` — emitting
+         * per choice would multiply billed tokens.
+         */
         for (const generation of generationGroup) {
           const message = (generation as ChatGeneration | undefined)?.message;
           const usage = (
@@ -831,7 +878,7 @@ function createUsageCaptureHandler(args: {
             sink({
               usage,
               model,
-              provider,
+              provider: callProvider,
               subagentType,
               subagentRunId,
               subagentAgentId,
@@ -840,11 +887,12 @@ function createUsageCaptureHandler(args: {
           } catch {
             /* observational — a throwing host sink must not break the child run */
           }
+          break;
         }
       }
     },
     handleLLMError: (_err: unknown, runId: string): void => {
-      modelNamesByCallId.delete(runId);
+      callInfoByCallId.delete(runId);
     },
   });
   /**
@@ -854,6 +902,10 @@ function createUsageCaptureHandler(args: {
    */
   handler.awaitHandlers = true;
   return handler;
+}
+
+function asNonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value !== '' ? value : undefined;
 }
 
 /**

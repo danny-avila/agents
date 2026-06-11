@@ -19,7 +19,7 @@ import {
   summarizeEvent,
 } from '../subagent';
 import { sanitizeForwardedSubagentUpdateData } from '../subagent/SubagentExecutor';
-import { Providers, GraphEvents, StepTypes } from '@/common';
+import { Constants, Providers, GraphEvents, StepTypes } from '@/common';
 import { AgentContext } from '@/agents/AgentContext';
 import { HookRegistry } from '@/hooks/HookRegistry';
 import { HandlerRegistry } from '@/events';
@@ -519,32 +519,31 @@ describe('SubagentExecutor', () => {
       };
     }
 
+    const makeChoice = (
+      usage: Record<string, number> | undefined
+    ): unknown => ({
+      text: 'ok',
+      message: new AIMessage({
+        content: 'ok',
+        ...(usage
+          ? {
+            usage_metadata: usage as unknown as AIMessage['usage_metadata'],
+          }
+          : {}),
+      }),
+    });
+
     const makeLLMEndOutput = (
       usage: Record<string, number> | undefined
     ): unknown => ({
-      generations: [
-        [
-          {
-            text: 'ok',
-            message: new AIMessage({
-              content: 'ok',
-              ...(usage
-                ? {
-                  usage_metadata:
-                      usage as unknown as AIMessage['usage_metadata'],
-                }
-                : {}),
-            }),
-          },
-        ],
-      ],
+      generations: [[makeChoice(usage)]],
     });
 
-    it('forwards the sink into the child graph input (nested propagation)', async () => {
-      const sink = jest.fn();
+    it('forwards a wrapped sink into the child graph input that rewrites runId to the root run', async () => {
+      const events: SubagentUsageEvent[] = [];
       const { factory, getInput } = makeCapturingGraphFactory();
       const executor = createExecutor({
-        usageSink: sink,
+        usageSink: (event) => events.push(event),
         createChildGraph: factory,
       });
 
@@ -553,7 +552,29 @@ describe('SubagentExecutor', () => {
         subagentType: 'researcher',
       });
 
-      expect(getInput()?.subagentUsageSink).toBe(sink);
+      const forwarded = getInput()?.subagentUsageSink;
+      expect(typeof forwarded).toBe('function');
+      /**
+       * Simulate a NESTED child's emission: its executor stamps `runId`
+       * with its own parent (an intermediate `*_sub_*` id). The wrapper
+       * must rewrite it to THIS executor's parent run so the host always
+       * sees root-run attribution, while the emitting child's identity
+       * (`subagentRunId`) is preserved.
+       */
+      forwarded?.({
+        usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+        model: 'gpt-4o-mini',
+        provider: Providers.OPENAI,
+        subagentType: 'nested-grandchild',
+        subagentRunId: 'test-run_sub_a_sub_b',
+        subagentAgentId: 'grandchild',
+        runId: 'test-run_sub_a',
+      });
+
+      expect(events).toHaveLength(1);
+      expect(events[0].runId).toBe('test-run');
+      expect(events[0].subagentRunId).toBe('test-run_sub_a_sub_b');
+      expect(events[0].subagentType).toBe('nested-grandchild');
     });
 
     it('does not attach a capture callback when no sink is provided', async () => {
@@ -643,6 +664,126 @@ describe('SubagentExecutor', () => {
       expect(events).toHaveLength(1);
       /** `makeChildInputs` configures `clientOptions.modelName`. */
       expect(events[0].model).toBe('gpt-4o-mini');
+    });
+
+    it('emits one event per generation group when a call has multiple completions (n > 1)', async () => {
+      const usage = { input_tokens: 10, output_tokens: 4, total_tokens: 14 };
+      const events: SubagentUsageEvent[] = [];
+      const { factory } = makeCapturingGraphFactory({
+        drive: async (handler) => {
+          /**
+           * One provider request with two choices — both carry the same
+           * request-level usage. Emitting per choice would double-bill.
+           */
+          await handler.handleLLMEnd?.(
+            { generations: [[makeChoice(usage), makeChoice(usage)]] },
+            'call-1'
+          );
+          /** Batched prompts: two groups = two requests = two events. */
+          await handler.handleLLMEnd?.(
+            { generations: [[makeChoice(usage)], [makeChoice(usage)]] },
+            'call-2'
+          );
+        },
+      });
+      const executor = createExecutor({
+        usageSink: (event) => events.push(event),
+        createChildGraph: factory,
+      });
+
+      await executor.execute({
+        description: 'Research this topic',
+        subagentType: 'researcher',
+      });
+
+      expect(events).toHaveLength(3);
+    });
+
+    it('prefers INVOKED_PROVIDER/INVOKED_MODEL metadata for fallback-served calls', async () => {
+      const events: SubagentUsageEvent[] = [];
+      const { factory } = makeCapturingGraphFactory({
+        drive: async (handler) => {
+          /**
+           * Mirror a fallback-served call: `attemptInvoke` stamps the
+           * serving provider, `tryFallbackProviders` stamps the fallback's
+           * configured model, and the provider reports no `ls_model_name`.
+           */
+          await handler.handleChatModelStart?.(
+            {},
+            [[]],
+            'call-1',
+            undefined,
+            undefined,
+            undefined,
+            {
+              [Constants.INVOKED_PROVIDER]: Providers.ANTHROPIC,
+              [Constants.INVOKED_MODEL]: 'claude-fallback-1',
+            }
+          );
+          await handler.handleLLMEnd?.(
+            makeLLMEndOutput({
+              input_tokens: 5,
+              output_tokens: 3,
+              total_tokens: 8,
+            }),
+            'call-1'
+          );
+        },
+      });
+      const executor = createExecutor({
+        usageSink: (event) => events.push(event),
+        createChildGraph: factory,
+      });
+
+      await executor.execute({
+        description: 'Research this topic',
+        subagentType: 'researcher',
+      });
+
+      expect(events).toHaveLength(1);
+      /** Not the configured primary (openAI / gpt-4o-mini). */
+      expect(events[0].provider).toBe(Providers.ANTHROPIC);
+      expect(events[0].model).toBe('claude-fallback-1');
+    });
+
+    it('prefers provider-reported ls_model_name over INVOKED_MODEL', async () => {
+      const events: SubagentUsageEvent[] = [];
+      const { factory } = makeCapturingGraphFactory({
+        drive: async (handler) => {
+          await handler.handleChatModelStart?.(
+            {},
+            [[]],
+            'call-1',
+            undefined,
+            undefined,
+            undefined,
+            {
+              ls_model_name: 'claude-fallback-1-20260101',
+              [Constants.INVOKED_PROVIDER]: Providers.ANTHROPIC,
+              [Constants.INVOKED_MODEL]: 'claude-fallback-1',
+            }
+          );
+          await handler.handleLLMEnd?.(
+            makeLLMEndOutput({
+              input_tokens: 5,
+              output_tokens: 3,
+              total_tokens: 8,
+            }),
+            'call-1'
+          );
+        },
+      });
+      const executor = createExecutor({
+        usageSink: (event) => events.push(event),
+        createChildGraph: factory,
+      });
+
+      await executor.execute({
+        description: 'Research this topic',
+        subagentType: 'researcher',
+      });
+
+      expect(events[0].model).toBe('claude-fallback-1-20260101');
     });
 
     it('skips model calls that report no usage_metadata', async () => {

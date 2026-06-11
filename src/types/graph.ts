@@ -435,13 +435,18 @@ export interface SubagentUsageEvent {
    * Model that produced this usage. Per-call `ls_model_name` from the
    * model's callback metadata when available (covers child-side
    * summarization or any call that differs from the configured model),
-   * falling back to the subagent config's `clientOptions` model.
+   * then the fallback-invocation's configured model (`INVOKED_MODEL`
+   * metadata), then the subagent config's `clientOptions` model.
    */
   model?: string;
   /**
-   * Provider of the subagent's configured agent (the SDK `Providers`
-   * enum value from its `AgentInputs`, not LangSmith's `ls_provider`
-   * string — hosts key pricing/cache semantics off the enum).
+   * Provider that actually served this call — the SDK `Providers` enum
+   * value stamped per-invocation by `attemptInvoke` (`INVOKED_PROVIDER`
+   * metadata), so fallback-served calls are attributed to the fallback
+   * provider, not the configured primary. Falls back to the subagent
+   * config's provider. Never LangSmith's `ls_provider` string — derived
+   * providers inherit that from their base class, and hosts key
+   * pricing/cache semantics off the enum.
    */
   provider?: string;
   /** Subagent `type` identifier from the SubagentConfig. */
@@ -450,7 +455,13 @@ export interface SubagentUsageEvent {
   subagentRunId: string;
   /** Child agent ID assigned to this subagent execution. */
   subagentAgentId: string;
-  /** Parent run ID under which the subagent was spawned. */
+  /**
+   * ROOT run ID of the host run that owns billing. For nested subagents
+   * each forwarding layer rewrites this upward, so events from any depth
+   * surface with the outermost run's ID — never an intermediate
+   * `*_sub_*` child id (use {@link subagentRunId} to identify the
+   * emitting child).
+   */
   runId: string;
 }
 
