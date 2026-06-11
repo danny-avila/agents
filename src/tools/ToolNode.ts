@@ -2476,6 +2476,49 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         }
       }
 
+      /**
+       * Per-call completion fast-path: when the host reports a result
+       * through `onResult` before the batch resolves, emit that call's
+       * completed run step immediately instead of waiting for the slowest
+       * call in the batch. Safe only when nothing can change the result
+       * after execution — post-tool hooks may rewrite output and HITL may
+       * deny a call, so those configurations keep batch-time emission.
+       * Ids are claimed synchronously before the async dispatch and
+       * released if the dispatch fails, letting the batch path re-emit.
+       */
+      const canEmitEarlyCompletions =
+        this.hookRegistry == null && this.humanInTheLoop?.enabled !== true;
+      const earlyCompletionDispatchedIds = new Set<string>();
+      const earlyCompletionDispatches: Array<Promise<void>> = [];
+      const dispatchRequestById = new Map(
+        dispatchRequests.map((request) => [request.id, request])
+      );
+      const onResult = (result: t.ToolExecuteResult): void => {
+        const request =
+          result.toolCallId != null
+            ? dispatchRequestById.get(result.toolCallId)
+            : undefined;
+        if (
+          request == null ||
+          earlyCompletionDispatchedIds.has(result.toolCallId)
+        ) {
+          return;
+        }
+        earlyCompletionDispatchedIds.add(result.toolCallId);
+        earlyCompletionDispatches.push(
+          this.dispatchEarlyToolCompletion(result, request, config).then(
+            (dispatched) => {
+              if (!dispatched) {
+                earlyCompletionDispatchedIds.delete(result.toolCallId);
+              }
+            },
+            () => {
+              earlyCompletionDispatchedIds.delete(result.toolCallId);
+            }
+          )
+        );
+      };
+
       const dispatchPromise =
         dispatchRequests.length === 0
           ? Promise.resolve([] as t.ToolExecuteResult[])
@@ -2506,6 +2549,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                 maybeResolve();
               },
               reject,
+              ...(canEmitEarlyCompletions && { onResult }),
             };
 
             void safeDispatchCustomEvent(
@@ -2540,6 +2584,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         eagerResultsPromise,
         dispatchPromise,
       ]);
+      // Settle in-flight early completion dispatches before the batch loop
+      // below decides which completions still need emitting.
+      await Promise.allSettled(earlyCompletionDispatches);
       const eagerCompletionDispatchedIds = new Set(
         eagerResults
           .filter((result) => result.completionDispatched)
@@ -2728,7 +2775,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           });
         }
 
-        if (!eagerCompletionDispatchedIds.has(result.toolCallId)) {
+        if (
+          !eagerCompletionDispatchedIds.has(result.toolCallId) &&
+          !earlyCompletionDispatchedIds.has(result.toolCallId)
+        ) {
           await this.dispatchStepCompleted(
             result.toolCallId,
             toolName,
@@ -2946,7 +2996,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     output: string,
     config: RunnableConfig,
     turn?: number
-  ): Promise<void> {
+  ): Promise<boolean> {
     const stepId = this.toolCallStepIds?.get(toolCallId) ?? '';
     if (!stepId) {
       // eslint-disable-next-line no-console
@@ -2957,7 +3007,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       );
     }
 
-    await safeDispatchCustomEvent(
+    const dispatched = await safeDispatchCustomEvent(
       GraphEvents.ON_RUN_STEP_COMPLETED,
       {
         result: {
@@ -2974,6 +3024,38 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         },
       },
       config
+    );
+    return dispatched !== false;
+  }
+
+  /**
+   * Emits the completed run step for a single host-reported result before
+   * the batch resolves. Mirrors the batch loop's output formatting exactly;
+   * callers gate on the no-hooks/no-HITL configuration, so the raw result
+   * content here is also the final content. Returns whether the event was
+   * actually dispatched so the caller can fall back to batch-time emission.
+   */
+  private async dispatchEarlyToolCompletion(
+    result: t.ToolExecuteResult,
+    request: t.ToolCallRequest,
+    config: RunnableConfig
+  ): Promise<boolean> {
+    const output =
+      result.status === 'error'
+        ? `Error: ${result.errorMessage ?? 'Unknown error'}\n Please fix your mistakes.`
+        : truncateToolResultContent(
+          typeof result.content === 'string'
+            ? result.content
+            : JSON.stringify(result.content),
+          this.maxToolResultChars
+        );
+    return this.dispatchStepCompleted(
+      result.toolCallId,
+      request.name,
+      request.args,
+      output,
+      config,
+      request.turn
     );
   }
 
