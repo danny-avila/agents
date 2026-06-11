@@ -17,6 +17,11 @@ import type {
   MessageContentReasoningBlockReasoningTextPartial,
   MessageContentReasoningBlockRedacted,
 } from '../types';
+import {
+  STREAMED_TOOL_CALL_SEAL_METADATA_KEY,
+  STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY,
+  BEDROCK_CONVERSE_STREAMED_TOOL_CALL_ADAPTER,
+} from '@/tools/streamedToolCallSeals';
 import { toLangChainContent } from '@/messages/langchain';
 
 /**
@@ -235,6 +240,8 @@ export function handleConverseStreamContentBlockDelta(
         ],
         response_metadata: {
           contentBlockIndex: contentBlockDelta.contentBlockIndex,
+          [STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY]:
+            BEDROCK_CONVERSE_STREAMED_TOOL_CALL_ADAPTER,
         },
       }),
     });
@@ -292,6 +299,8 @@ export function handleConverseStreamContentBlockStart(
         ],
         response_metadata: {
           contentBlockIndex: index,
+          [STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY]:
+            BEDROCK_CONVERSE_STREAMED_TOOL_CALL_ADAPTER,
         },
       }),
     });
@@ -299,6 +308,40 @@ export function handleConverseStreamContentBlockStart(
 
   // Return null for non-tool content block starts (text blocks don't need special handling)
   return null;
+}
+
+/**
+ * Build the chunk emitted when a Converse `contentBlockStop` event closes a
+ * toolUse block. The Converse protocol guarantees a block's input is complete
+ * at `contentBlockStop`, so this chunk carries an explicit streamed tool-call
+ * seal for that block index. The empty `args` delta merges as a no-op into the
+ * accumulated tool call; id/name are omitted so the chunk matches the existing
+ * entry purely by index.
+ */
+export function createConverseToolUseStopChunk(
+  contentBlockIndex: number
+): ChatGenerationChunk {
+  return new ChatGenerationChunk({
+    text: '',
+    message: new AIMessageChunk({
+      content: '',
+      tool_call_chunks: [
+        {
+          args: '',
+          index: contentBlockIndex,
+          type: 'tool_call_chunk',
+        },
+      ],
+      response_metadata: {
+        [STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY]:
+          BEDROCK_CONVERSE_STREAMED_TOOL_CALL_ADAPTER,
+        [STREAMED_TOOL_CALL_SEAL_METADATA_KEY]: {
+          kind: 'single',
+          index: contentBlockIndex,
+        },
+      },
+    }),
+  });
 }
 
 /**

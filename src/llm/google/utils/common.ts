@@ -36,6 +36,11 @@ import {
 } from '@google/generative-ai';
 import type { ChatGeneration, ChatResult } from '@langchain/core/outputs';
 import {
+  STREAMED_TOOL_CALL_SEAL_METADATA_KEY,
+  STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY,
+  GOOGLE_STREAMED_TOOL_CALL_ADAPTER,
+} from '@/tools/streamedToolCallSeals';
+import {
   jsonSchemaToGeminiParameters,
   schemaToGenerativeAIParameters,
 } from './zod_to_genai_parameters';
@@ -770,6 +775,18 @@ export function convertResponseContentToChatGenerationChunk(
     response.candidates[0]?.finishReason === 'MAX_TOKENS' ||
     response.candidates[0]?.finishReason === 'SAFETY';
 
+  // The GenAI API delivers function calls as complete objects (never partial
+  // arg deltas), so every call on this chunk is sealed on arrival for eager
+  // tool execution.
+  const response_metadata: Record<string, unknown> | undefined =
+    toolCallChunks.length > 0
+      ? {
+        [STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY]:
+            GOOGLE_STREAMED_TOOL_CALL_ADAPTER,
+        [STREAMED_TOOL_CALL_SEAL_METADATA_KEY]: { kind: 'all' },
+      }
+      : undefined;
+
   return new ChatGenerationChunk({
     text,
     message: new AIMessageChunk({
@@ -779,6 +796,7 @@ export function convertResponseContentToChatGenerationChunk(
       // Each chunk can have unique "generationInfo", and merging strategy is unclear,
       // so leave blank for now.
       additional_kwargs,
+      response_metadata,
       usage_metadata: isFinalChunk ? extra.usageMetadata : undefined,
     }),
     generationInfo,
