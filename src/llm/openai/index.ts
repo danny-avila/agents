@@ -714,14 +714,15 @@ function isOfficialOpenAIBaseURL(baseURL: string | null | undefined): boolean {
 }
 
 const AZURE_FIRST_PARTY_BASE_PATH_PATTERN =
-  /^https:\/\/[^/]+\.(openai\.azure\.com|cognitiveservices\.azure\.com)(:\d+)?(\/|$)/;
+  /^https:\/\/[^/]+\.(openai\.azure\.com|cognitiveservices\.azure\.com|api\.cognitive\.microsoft\.com)(:\d+)?(\/|$)/;
 
 /**
  * Azure OpenAI is first-party when requests resolve to an instance-name
- * endpoint or an *.openai.azure.com / *.cognitiveservices.azure.com base
- * path. A custom `clientConfig.baseURL` or a non-Azure `azureOpenAIBasePath`
- * routes through a proxy or Azure-compatible endpoint whose stream contract
- * is unknown, so those are not stamped.
+ * endpoint or an *.openai.azure.com / *.cognitiveservices.azure.com /
+ * regional *.api.cognitive.microsoft.com base path. A custom
+ * `clientConfig.baseURL` or a non-Azure `azureOpenAIBasePath` routes through
+ * a proxy or Azure-compatible endpoint whose stream contract is unknown, so
+ * those are not stamped.
  */
 function isFirstPartyAzureEndpoint(args: {
   baseURL: string | null | undefined;

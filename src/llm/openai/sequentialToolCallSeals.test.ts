@@ -1,5 +1,5 @@
-import { expect, test, describe } from '@jest/globals';
 import { AIMessageChunk } from '@langchain/core/messages';
+import { expect, test, describe, beforeEach, afterAll } from '@jest/globals';
 import type { BaseMessageChunk } from '@langchain/core/messages';
 import {
   STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY,
@@ -54,6 +54,30 @@ function adapterOf(message: AIMessageChunk): unknown {
 }
 
 describe('Chat Completions sequential tool-call seal stamping', () => {
+  // Both the implementation (OPENAI_BASE_URL fallback) and the Azure
+  // constructor (AZURE_OPENAI_BASE_PATH fallback) read the environment, so
+  // isolate these vars to keep the suite deterministic across shells.
+  const ISOLATED_ENV_VARS = ['OPENAI_BASE_URL', 'AZURE_OPENAI_BASE_PATH'];
+  const originalEnv = new Map(
+    ISOLATED_ENV_VARS.map((name) => [name, process.env[name]])
+  );
+
+  beforeEach(() => {
+    for (const name of ISOLATED_ENV_VARS) {
+      delete process.env[name];
+    }
+  });
+
+  afterAll(() => {
+    for (const [name, value] of originalEnv) {
+      if (value == null) {
+        delete process.env[name];
+      } else {
+        process.env[name] = value;
+      }
+    }
+  });
+
   test('stamps tool-call deltas when no baseURL is configured (official)', () => {
     const model = new ChatOpenAI({ model: 'gpt-5.5', apiKey: 'test' });
     const message = convertDelta(model, toolCallDelta);
@@ -94,37 +118,19 @@ describe('Chat Completions sequential tool-call seal stamping', () => {
   });
 
   test('does not stamp when OPENAI_BASE_URL routes to a compatible endpoint', () => {
-    const previous = process.env.OPENAI_BASE_URL;
     process.env.OPENAI_BASE_URL = 'https://api.moonshot.ai/v1';
-    try {
-      const model = new ChatOpenAI({ model: 'gpt-5.5', apiKey: 'test' });
-      const message = convertDelta(model, toolCallDelta);
-      expect(adapterOf(message)).toBeUndefined();
-    } finally {
-      if (previous == null) {
-        delete process.env.OPENAI_BASE_URL;
-      } else {
-        process.env.OPENAI_BASE_URL = previous;
-      }
-    }
+    const model = new ChatOpenAI({ model: 'gpt-5.5', apiKey: 'test' });
+    const message = convertDelta(model, toolCallDelta);
+    expect(adapterOf(message)).toBeUndefined();
   });
 
   test('stamps when OPENAI_BASE_URL points at api.openai.com', () => {
-    const previous = process.env.OPENAI_BASE_URL;
     process.env.OPENAI_BASE_URL = 'https://api.openai.com/v1';
-    try {
-      const model = new ChatOpenAI({ model: 'gpt-5.5', apiKey: 'test' });
-      const message = convertDelta(model, toolCallDelta);
-      expect(adapterOf(message)).toBe(
-        OPENAI_CHAT_SEQUENTIAL_STREAMED_TOOL_CALL_ADAPTER
-      );
-    } finally {
-      if (previous == null) {
-        delete process.env.OPENAI_BASE_URL;
-      } else {
-        process.env.OPENAI_BASE_URL = previous;
-      }
-    }
+    const model = new ChatOpenAI({ model: 'gpt-5.5', apiKey: 'test' });
+    const message = convertDelta(model, toolCallDelta);
+    expect(adapterOf(message)).toBe(
+      OPENAI_CHAT_SEQUENTIAL_STREAMED_TOOL_CALL_ADAPTER
+    );
   });
 
   test('stamps Azure OpenAI tool-call deltas (first-party endpoint)', () => {
@@ -147,6 +153,20 @@ describe('Chat Completions sequential tool-call seal stamping', () => {
       azureOpenAIApiVersion: '2024-08-01-preview',
       azureOpenAIBasePath:
         'https://test-resource.openai.azure.com/openai/deployments',
+    });
+    const message = convertDelta(model, toolCallDelta);
+    expect(adapterOf(message)).toBe(
+      OPENAI_CHAT_SEQUENTIAL_STREAMED_TOOL_CALL_ADAPTER
+    );
+  });
+
+  test('stamps Azure deltas for a regional cognitive services base path', () => {
+    const model = new AzureChatOpenAI({
+      azureOpenAIApiKey: 'test',
+      azureOpenAIApiDeploymentName: 'test-deployment',
+      azureOpenAIApiVersion: '2024-08-01-preview',
+      azureOpenAIBasePath:
+        'https://westeurope.api.cognitive.microsoft.com/openai/deployments',
     });
     const message = convertDelta(model, toolCallDelta);
     expect(adapterOf(message)).toBe(
