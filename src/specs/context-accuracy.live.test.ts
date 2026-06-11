@@ -7,6 +7,10 @@
  *
  * Run with:
  * RUN_CONTEXT_USAGE_LIVE_TESTS=1 ANTHROPIC_API_KEY=... npm test -- context-accuracy.live.test.ts --runInBand
+ *
+ * The google/bedrock matrix entries skip without GOOGLE_API_KEY /
+ * BEDROCK_AWS_* creds; Bedrock's AWS SDK needs
+ * NODE_OPTIONS='--experimental-vm-modules' under jest.
  */
 import { config as dotenvConfig } from 'dotenv';
 dotenvConfig();
@@ -92,6 +96,50 @@ function buildLongInstructions(salt: string): string {
     ),
   ].join(' ');
 }
+
+/** Cross-provider accuracy matrix: different tokenizers and usage shapes */
+const providerMatrix: Array<{
+  name: string;
+  enabled: boolean;
+  llmConfig: Record<string, unknown>;
+}> = [
+  {
+    name: 'google',
+    enabled: !!process.env.GOOGLE_API_KEY,
+    llmConfig: {
+      provider: Providers.GOOGLE,
+      model: process.env.GOOGLE_CONTEXT_LIVE_MODEL ?? 'gemini-2.5-flash',
+      apiKey: process.env.GOOGLE_API_KEY,
+      temperature: 0,
+      streaming: true,
+      streamUsage: true,
+    },
+  },
+  {
+    name: 'bedrock',
+    enabled:
+      !!process.env.BEDROCK_AWS_ACCESS_KEY_ID &&
+      !!process.env.BEDROCK_AWS_SECRET_ACCESS_KEY,
+    llmConfig: {
+      provider: Providers.BEDROCK,
+      model:
+        process.env.BEDROCK_CONTEXT_LIVE_MODEL ??
+        'us.anthropic.claude-sonnet-4-6',
+      region:
+        process.env.BEDROCK_AWS_REGION ??
+        process.env.AWS_DEFAULT_REGION ??
+        'us-east-1',
+      credentials: {
+        accessKeyId: process.env.BEDROCK_AWS_ACCESS_KEY_ID,
+        secretAccessKey: process.env.BEDROCK_AWS_SECRET_ACCESS_KEY,
+      },
+      temperature: 0,
+      maxTokens: 128,
+      streaming: true,
+      streamUsage: true,
+    },
+  },
+];
 
 describeIfLive('Context accuracy live integration', () => {
   jest.setTimeout(240_000);
@@ -210,6 +258,82 @@ describeIfLive('Context accuracy live integration', () => {
       .join(' ');
     expect(text).toContain('4323');
   });
+
+  for (const entry of providerMatrix) {
+    const itIfProvider = entry.enabled ? it : it.skip;
+    itIfProvider(
+      `${entry.name}: tool-loop estimates track provider counts across tokenizers`,
+      async () => {
+        const capture = createCapture();
+        const run = await Run.create<t.IState>({
+          runId: `ctx-acc-${entry.name}-${Date.now()}`,
+          graphConfig: {
+            type: 'standard',
+            llmConfig: entry.llmConfig as t.LLMConfig,
+            instructions:
+              'You are a precise assistant. Use the add tool for any arithmetic, then reply with only the number. ' +
+              Array.from(
+                { length: 40 },
+                (_, i) =>
+                  `Rule ${i}: answer precisely and keep responses to a single line.`
+              ).join(' '),
+            maxContextTokens: 16000,
+            tools: [addTool],
+          },
+          returnContent: true,
+          skipCleanup: true,
+          customHandlers: capture.handlers,
+          tokenCounter,
+          indexTokenCountMap: {},
+        });
+
+        await run.processStream(
+          {
+            messages: [
+              new HumanMessage(
+                'Use the add tool to compute 1742 + 2581, then reply with only the number.'
+              ),
+            ],
+          },
+          createStreamConfig(`ctx-acc-${entry.name}-${Date.now()}`)
+        );
+
+        expect(capture.contextEvents.length).toBeGreaterThanOrEqual(2);
+        expect(capture.collectedUsage.length).toBe(
+          capture.contextEvents.length
+        );
+
+        const ratios = capture.contextEvents.map((event, index) => {
+          const usage = capture.collectedUsage[index];
+          const baseInput = usage.input_tokens ?? 0;
+          const cacheSum =
+            (usage.input_token_details?.cache_creation ?? 0) +
+            (usage.input_token_details?.cache_read ?? 0);
+          const providerInput =
+            baseInput + (cacheSum > baseInput ? cacheSum : 0);
+          return estimatedUsed(event) / providerInput;
+        });
+        console.log(`[ctx-accuracy] ${entry.name} ratios:`, ratios, {
+          provider: capture.collectedUsage.map((u) => ({
+            input: u.input_tokens,
+            details: u.input_token_details,
+          })),
+        });
+
+        /** Foreign tokenizers diverge most on the uncalibrated first call */
+        expect(ratios[0]).toBeGreaterThan(0.3);
+        expect(ratios[0]).toBeLessThan(3);
+
+        /** Calibration has real counts from call 1 — tighter band */
+        const last = ratios[ratios.length - 1];
+        expect(last).toBeGreaterThan(0.5);
+        expect(last).toBeLessThan(2);
+        expect(Math.abs(last - 1)).toBeLessThanOrEqual(
+          Math.abs(ratios[0] - 1) + 0.2
+        );
+      }
+    );
+  }
 
   it('stays accurate when pruning drops history under a small budget', async () => {
     const capture = createCapture();
