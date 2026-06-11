@@ -1318,14 +1318,30 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     effectiveInstructionTokens?: number;
   } {
     if (params.messages.length === 0) {
+      /** Post-compaction calls still invoke the model — report the same
+       *  reserve-adjusted budget fields as the populated paths */
+      const emptyInstructionTokens =
+        factoryParams.getInstructionTokens?.() ?? 0;
+      const emptyReserveRatio =
+        factoryParams.reserveRatio ?? DEFAULT_RESERVE_RATIO;
+      const emptyBudget =
+        factoryParams.maxTokens -
+        (emptyReserveRatio > 0 && emptyReserveRatio < 1
+          ? Math.round(factoryParams.maxTokens * emptyReserveRatio)
+          : 0);
       return {
         context: [],
         indexTokenCountMap,
         messagesToRefine: [],
         prePruneContextTokens: 0,
-        remainingContextTokens: factoryParams.maxTokens,
+        remainingContextTokens: Math.max(
+          0,
+          emptyBudget - emptyInstructionTokens
+        ),
         calibrationRatio,
         resolvedInstructionOverhead: bestInstructionOverhead,
+        contextBudget: emptyBudget,
+        effectiveInstructionTokens: emptyInstructionTokens,
       };
     }
 

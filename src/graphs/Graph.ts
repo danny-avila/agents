@@ -89,6 +89,26 @@ const { AGENT, TOOLS, SUMMARIZE } = GraphNodeKeys;
 /** Minimum relative variance before calibrated toolSchemaTokens overrides current value. */
 const CALIBRATION_VARIANCE_THRESHOLD = 0.15;
 
+/**
+ * Start index of the span post-prune formatters can mutate in place: the
+ * trailing tool batch plus its owning AI message (artifact formatting touches
+ * every tool result after the last AI tool call; Bedrock rewrites the AI
+ * message before a trailing tool result). Capped so the usage-snapshot
+ * recount stays constant-cost.
+ */
+function trailingMutationStart(messages: BaseMessage[]): number {
+  const MAX_SPAN = 16;
+  let index = messages.length - 1;
+  while (
+    index >= 0 &&
+    messages[index]?.getType() === 'tool' &&
+    messages.length - index < MAX_SPAN
+  ) {
+    index--;
+  }
+  return Math.max(0, Math.min(index, messages.length - 2));
+}
+
 type ReasoningKey = 'reasoning_content' | 'reasoning';
 type ReasoningSummary = { summary?: Array<{ text?: string }> };
 type ReasoningDetail = { type?: string; text?: string };
@@ -1508,11 +1528,29 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
         /** Dispatched right before the model invoke — a summarization
          *  detour returns from this node without an LLM call, and the
-         *  post-summary retry produces its own snapshot */
+         *  post-summary retry produces its own snapshot.
+         *
+         *  The breakdown describes the post-prune prompt: counts from the
+         *  kept context, message tokens derived from the same calibrated
+         *  budget math as `remainingContextTokens` (the index map is keyed
+         *  by pre-prune state indices, so summing it over `context` would
+         *  missum); `prePruneContextTokens` carries the pre-prune metric. */
+        const usageBreakdown = agentContext.getTokenBudgetBreakdown(messages);
+        usageBreakdown.messageCount = context.length;
+        if (
+          contextBudget != null &&
+          effectiveInstructionTokens != null &&
+          remainingContextTokens != null
+        ) {
+          usageBreakdown.messageTokens = Math.max(
+            0,
+            contextBudget - effectiveInstructionTokens - remainingContextTokens
+          );
+        }
         contextUsage = {
           runId: this.runId,
           agentId,
-          breakdown: agentContext.getTokenBudgetBreakdown(messages),
+          breakdown: usageBreakdown,
           contextBudget,
           effectiveInstructionTokens,
           prePruneContextTokens,
@@ -1627,12 +1665,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       let finalMessages = messagesToUse;
       /** Tail snapshot for the dispatch-time usage delta: in-place
        *  formatters (artifact appends, Bedrock content rewrites, legacy
-       *  string conversion) only mutate trailing messages and are invisible
-       *  to both length and identity checks — capture before they run */
+       *  string conversion) only mutate the trailing tool batch and are
+       *  invisible to both length and identity checks — capture before
+       *  they run */
+      const tailStart = trailingMutationStart(messagesToUse);
       let preFormatTailTokens: number | null = null;
       if (contextUsage != null && agentContext.tokenCounter != null) {
         preFormatTailTokens = 0;
-        for (const message of messagesToUse.slice(-2)) {
+        for (const message of messagesToUse.slice(tailStart)) {
           preFormatTailTokens += agentContext.tokenCounter(message);
         }
       }
@@ -1860,10 +1900,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           agentContext.tokenCounter != null &&
           contextUsage.remainingContextTokens != null
         ) {
-          /** Same-length formatting can still grow trailing messages in
-           *  place — adjust remaining by the tail's calibrated delta */
+          /** Same-length formatting can still grow the trailing tool batch
+           *  in place — adjust remaining by its calibrated delta */
           let postFormatTailTokens = 0;
-          for (const message of finalMessages.slice(-2)) {
+          for (const message of finalMessages.slice(tailStart)) {
             postFormatTailTokens += agentContext.tokenCounter(message);
           }
           const tailDelta = postFormatTailTokens - preFormatTailTokens;
@@ -1878,7 +1918,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             );
           }
         }
-        void safeDispatchCustomEvent(
+        /** Awaited so async host handlers receive the pre-invoke snapshot
+         *  before any model deltas are emitted */
+        await safeDispatchCustomEvent(
           GraphEvents.ON_CONTEXT_USAGE,
           contextUsage,
           config

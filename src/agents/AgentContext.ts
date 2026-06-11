@@ -1013,7 +1013,9 @@ export class AgentContext {
   ): Promise<void> {
     let toolTokens = 0;
     const countedToolNames = new Set<string>();
-    const rawToolTokenCounts: Record<string, number> = {};
+    /** Prototype-free: external tool names like `toString` must not hit
+     *  inherited properties during accumulation */
+    const rawToolTokenCounts: Record<string, number> = Object.create(null);
     const deferredCountedNames = new Set<string>();
 
     /**
@@ -1099,7 +1101,7 @@ export class AgentContext {
       : DEFAULT_TOOL_TOKEN_MULTIPLIER;
     this.toolSchemaTokens = Math.ceil(toolTokens * toolTokenMultiplier);
 
-    const toolTokenCounts: Record<string, number> = {};
+    const toolTokenCounts: Record<string, number> = Object.create(null);
     const deferredToolNames: string[] = [];
     for (const [name, rawCount] of Object.entries(rawToolTokenCounts)) {
       toolTokenCounts[name] = Math.ceil(rawCount * toolTokenMultiplier);

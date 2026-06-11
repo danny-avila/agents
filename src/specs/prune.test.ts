@@ -1444,7 +1444,10 @@ describe('Prune Messages Tests', () => {
       expect(result.context).toEqual([]);
       expect(result.messagesToRefine).toEqual([]);
       expect(result.prePruneContextTokens).toBe(0);
-      expect(result.remainingContextTokens).toBe(8000);
+      /** Reserve-adjusted budget (8000 − 5%) minus instruction overhead */
+      expect(result.contextBudget).toBe(7600);
+      expect(result.effectiveInstructionTokens).toBe(4000);
+      expect(result.remainingContextTokens).toBe(3600);
     });
   });
 
