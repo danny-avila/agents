@@ -8,6 +8,7 @@ import {
   OPENAI_RESPONSES_STREAMED_TOOL_CALL_ADAPTER,
   BEDROCK_CONVERSE_STREAMED_TOOL_CALL_ADAPTER,
   GOOGLE_STREAMED_TOOL_CALL_ADAPTER,
+  OPENAI_CHAT_SEQUENTIAL_STREAMED_TOOL_CALL_ADAPTER,
 } from '@/tools/streamedToolCallSeals';
 import {
   Constants,
@@ -148,6 +149,10 @@ const bedrockConverseToolCallMetadata = {
 const googleOnArrivalToolCallMetadata = {
   [STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY]: GOOGLE_STREAMED_TOOL_CALL_ADAPTER,
   [STREAMED_TOOL_CALL_SEAL_METADATA_KEY]: { kind: 'all' },
+};
+const openAIChatSequentialToolCallMetadata = {
+  [STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY]:
+    OPENAI_CHAT_SEQUENTIAL_STREAMED_TOOL_CALL_ADAPTER,
 };
 
 describe('ChatModelStreamHandler eager event tool execution', () => {
@@ -4530,6 +4535,144 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
       expect.anything()
     );
     expect(graph.eagerEventToolExecutions.size).toBe(0);
+  });
+
+  it('prestarts official OpenAI sequential streamed tool calls when a later index begins', async () => {
+    const graph = createGraph({
+      getAgentContext: jest.fn(
+        (): Partial<AgentContext> => ({
+          provider: Providers.OPENAI,
+          reasoningKey: 'reasoning_content',
+          toolDefinitions: [{ name: 'weather' }, { name: 'stock' }],
+          graphTools: [],
+          agentId: 'agent_1',
+        })
+      ) as unknown as StandardGraph['getAgentContext'],
+    });
+    const toolExecuteCalls: t.ToolExecuteBatchRequest[] = [];
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data): Promise<void> => {
+        if (event !== GraphEvents.ON_TOOL_EXECUTE) {
+          return;
+        }
+        const batch = data as t.ToolExecuteBatchRequest;
+        toolExecuteCalls.push(batch);
+        batch.resolve(
+          batch.toolCalls.map((call) => ({
+            toolCallId: call.id,
+            status: 'success',
+            content: `ok ${call.name}`,
+          }))
+        );
+      });
+
+    const handler = new ChatModelStreamHandler();
+    const metadata = { langgraph_node: 'agent' };
+
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_call_chunks: [
+            {
+              id: 'call_weather',
+              name: 'weather',
+              args: '{"city":"NYC"}',
+              index: 0,
+            },
+          ],
+          response_metadata: openAIChatSequentialToolCallMetadata,
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+
+    expect(toolExecuteCalls).toHaveLength(0);
+
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_call_chunks: [
+            {
+              id: 'call_stock',
+              name: 'stock',
+              index: 1,
+            },
+          ],
+          response_metadata: openAIChatSequentialToolCallMetadata,
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+
+    expect(toolExecuteCalls).toHaveLength(1);
+    expect(toolExecuteCalls[0].toolCalls[0]).toMatchObject({
+      id: 'call_weather',
+      name: 'weather',
+      args: { city: 'NYC' },
+      stepId: expect.stringMatching(/^step_/),
+      turn: 0,
+    });
+
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_call_chunks: [
+            {
+              args: '{"ticker":"CH"}',
+              index: 1,
+            },
+          ],
+          response_metadata: openAIChatSequentialToolCallMetadata,
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+
+    expect(toolExecuteCalls).toHaveLength(1);
+
+    // The final cumulative tool_calls chunk dispatches only the unstarted call.
+    await handler.handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_weather',
+              name: 'weather',
+              args: { city: 'NYC' },
+            },
+            {
+              id: 'call_stock',
+              name: 'stock',
+              args: { ticker: 'CH' },
+            },
+          ],
+          response_metadata: finalToolCallResponseMetadata,
+        } as unknown as t.StreamChunk,
+      },
+      metadata,
+      graph
+    );
+
+    expect(toolExecuteCalls).toHaveLength(2);
+    expect(toolExecuteCalls[1].toolCalls).toHaveLength(1);
+    expect(toolExecuteCalls[1].toolCalls[0]).toMatchObject({
+      id: 'call_stock',
+      name: 'stock',
+      args: { ticker: 'CH' },
+      turn: 0,
+    });
   });
 
   it('does not prestart on-arrival sealed calls when direct tools may stream', async () => {

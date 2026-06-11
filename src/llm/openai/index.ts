@@ -34,6 +34,10 @@ import type { ChatGeneration, ChatResult } from '@langchain/core/outputs';
 import type { ChatXAIInput } from '@langchain/xai';
 import type * as t from '@langchain/openai';
 import type { HeaderValue, HeadersLike } from './types';
+import {
+  STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY,
+  OPENAI_CHAT_SEQUENTIAL_STREAMED_TOOL_CALL_ADAPTER,
+} from '@/tools/streamedToolCallSeals';
 import { isReasoningModel, _convertMessagesToOpenAIParams } from './utils';
 
 // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
@@ -670,6 +674,69 @@ export class CustomAzureOpenAIClient extends AzureOpenAIClient {
   }
 }
 
+const OFFICIAL_OPENAI_BASE_URL_PATTERN = /^https:\/\/api\.openai\.com(\/|$)/;
+
+/**
+ * Official OpenAI (api.openai.com) and Azure OpenAI Chat Completions streams
+ * emit tool-call deltas strictly sequentially by index: once a delta for a
+ * later index appears, a prior index's arguments never change. Stamping this
+ * adapter lets the stream handler seal a prior call for eager execution the
+ * moment the next call begins. OpenAI-compatible endpoints (custom baseURL)
+ * must NOT be stamped — e.g. live Kimi/Moonshot streams revise prior-index
+ * args after advancing — so callers gate on the wire endpoint, not the class.
+ */
+function stampSequentialStreamedToolCallAdapter(
+  message: BaseMessageChunk
+): BaseMessageChunk {
+  if (
+    message instanceof AIMessageChunk &&
+    (message.tool_call_chunks?.length ?? 0) > 0
+  ) {
+    message.response_metadata = {
+      ...message.response_metadata,
+      [STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY]:
+        OPENAI_CHAT_SEQUENTIAL_STREAMED_TOOL_CALL_ADAPTER,
+    };
+  }
+  return message;
+}
+
+function isOfficialOpenAIBaseURL(baseURL: string | null | undefined): boolean {
+  // The OpenAI SDK falls back to OPENAI_BASE_URL when the client has no
+  // explicit baseURL, so an unset constructor value can still route to an
+  // OpenAI-compatible endpoint.
+  const effectiveBaseURL =
+    baseURL != null && baseURL !== '' ? baseURL : process.env.OPENAI_BASE_URL;
+  if (effectiveBaseURL == null || effectiveBaseURL === '') {
+    return true;
+  }
+  return OFFICIAL_OPENAI_BASE_URL_PATTERN.test(effectiveBaseURL);
+}
+
+const AZURE_FIRST_PARTY_BASE_PATH_PATTERN =
+  /^https:\/\/[^/]+\.(openai\.azure\.com|cognitiveservices\.azure\.com|api\.cognitive\.microsoft\.com)(:\d+)?(\/|$)/;
+
+/**
+ * Azure OpenAI is first-party when requests resolve to an instance-name
+ * endpoint or an *.openai.azure.com / *.cognitiveservices.azure.com /
+ * regional *.api.cognitive.microsoft.com base path. A custom
+ * `clientConfig.baseURL` or a non-Azure `azureOpenAIBasePath` routes through
+ * a proxy or Azure-compatible endpoint whose stream contract is unknown, so
+ * those are not stamped.
+ */
+function isFirstPartyAzureEndpoint(args: {
+  baseURL: string | null | undefined;
+  azureOpenAIBasePath: string | undefined;
+}): boolean {
+  if (args.baseURL != null && args.baseURL !== '') {
+    return false;
+  }
+  if (args.azureOpenAIBasePath == null || args.azureOpenAIBasePath === '') {
+    return true;
+  }
+  return AZURE_FIRST_PARTY_BASE_PATH_PATTERN.test(args.azureOpenAIBasePath);
+}
+
 class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
   private includeReasoningContent?: boolean;
   private includeReasoningDetails?: boolean;
@@ -721,7 +788,7 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
     rawResponse: OpenAIClient.Chat.Completions.ChatCompletionChunk,
     defaultRole?: OpenAIClient.Chat.ChatCompletionRole
   ): BaseMessageChunk {
-    return attachLibreChatDeltaFields(
+    const message = attachLibreChatDeltaFields(
       super._convertCompletionsDeltaToBaseMessageChunk(
         delta,
         rawResponse,
@@ -729,6 +796,10 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
       ),
       delta
     );
+    if (isOfficialOpenAIBaseURL(this.clientConfig.baseURL)) {
+      return stampSequentialStreamedToolCallAdapter(message);
+    }
+    return message;
   }
 
   protected _convertCompletionsMessageToBaseMessage(
@@ -1088,6 +1159,29 @@ class LibreChatAzureOpenAICompletions extends OriginalAzureChatOpenAICompletions
     options?: this['ParsedCallOptions']
   ): OpenAIClient.Reasoning | undefined {
     return getGatedReasoningParams(this.model, this.reasoning, options);
+  }
+
+  protected _convertCompletionsDeltaToBaseMessageChunk(
+    delta: Record<string, unknown>,
+    rawResponse: OpenAIClient.Chat.Completions.ChatCompletionChunk,
+    defaultRole?: OpenAIClient.Chat.ChatCompletionRole
+  ): BaseMessageChunk {
+    const message = super._convertCompletionsDeltaToBaseMessageChunk(
+      delta,
+      rawResponse,
+      defaultRole
+    );
+    if (
+      isFirstPartyAzureEndpoint({
+        baseURL: this.clientConfig.baseURL,
+        azureOpenAIBasePath: this.azureOpenAIBasePath,
+      })
+    ) {
+      // First-party Azure OpenAI: same sequential-by-index stream contract
+      // as api.openai.com.
+      return stampSequentialStreamedToolCallAdapter(message);
+    }
+    return message;
   }
 
   _getClientOptions(

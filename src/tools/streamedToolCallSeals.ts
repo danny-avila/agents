@@ -5,17 +5,39 @@ export const STREAMED_TOOL_CALL_SEAL_METADATA_KEY =
 export const OPENAI_RESPONSES_STREAMED_TOOL_CALL_ADAPTER = 'openai_responses';
 export const BEDROCK_CONVERSE_STREAMED_TOOL_CALL_ADAPTER = 'bedrock_converse';
 export const GOOGLE_STREAMED_TOOL_CALL_ADAPTER = 'google_genai';
+export const OPENAI_CHAT_SEQUENTIAL_STREAMED_TOOL_CALL_ADAPTER =
+  'openai_chat_sequential';
 
 export type StreamedToolCallAdapter =
   | typeof OPENAI_RESPONSES_STREAMED_TOOL_CALL_ADAPTER
   | typeof BEDROCK_CONVERSE_STREAMED_TOOL_CALL_ADAPTER
-  | typeof GOOGLE_STREAMED_TOOL_CALL_ADAPTER;
+  | typeof GOOGLE_STREAMED_TOOL_CALL_ADAPTER
+  | typeof OPENAI_CHAT_SEQUENTIAL_STREAMED_TOOL_CALL_ADAPTER;
 
 const STREAMED_TOOL_CALL_ADAPTERS: ReadonlySet<string> = new Set([
   OPENAI_RESPONSES_STREAMED_TOOL_CALL_ADAPTER,
   BEDROCK_CONVERSE_STREAMED_TOOL_CALL_ADAPTER,
   GOOGLE_STREAMED_TOOL_CALL_ADAPTER,
+  OPENAI_CHAT_SEQUENTIAL_STREAMED_TOOL_CALL_ADAPTER,
 ]);
+
+/**
+ * Adapters whose wire protocol streams tool calls strictly sequentially by
+ * index, so a prior call is sealed the moment a later index begins. Used by
+ * the stream handler to extend next-index sealing beyond the provider-keyed
+ * Anthropic allowlist.
+ */
+const SEQUENTIAL_SEAL_STREAMED_TOOL_CALL_ADAPTERS: ReadonlySet<string> =
+  new Set([OPENAI_CHAT_SEQUENTIAL_STREAMED_TOOL_CALL_ADAPTER]);
+
+export function streamedToolCallAdapterAllowsSequentialSeal(
+  metadata: Record<string, unknown> | undefined
+): boolean {
+  const adapter = getStreamedToolCallAdapter(metadata);
+  return (
+    adapter != null && SEQUENTIAL_SEAL_STREAMED_TOOL_CALL_ADAPTERS.has(adapter)
+  );
+}
 
 export type StreamedToolCallSeal =
   | {
