@@ -1014,6 +1014,7 @@ export class AgentContext {
     let toolTokens = 0;
     const countedToolNames = new Set<string>();
     const rawToolTokenCounts: Record<string, number> = {};
+    const deferredCountedNames = new Set<string>();
 
     /**
      * Iterate both `tools` (user-provided instance tools) and `graphTools`
@@ -1080,6 +1081,9 @@ export class AgentContext {
       countedToolNames.add(def.name);
       rawToolTokenCounts[def.name] =
         (rawToolTokenCounts[def.name] ?? 0) + schemaTokens;
+      if (def.defer_loading === true) {
+        deferredCountedNames.add(def.name);
+      }
     }
 
     const isAnthropic =
@@ -1099,7 +1103,10 @@ export class AgentContext {
     const deferredToolNames: string[] = [];
     for (const [name, rawCount] of Object.entries(rawToolTokenCounts)) {
       toolTokenCounts[name] = Math.ceil(rawCount * toolTokenMultiplier);
-      if (this.toolRegistry?.get(name)?.defer_loading === true) {
+      if (
+        deferredCountedNames.has(name) ||
+        this.toolRegistry?.get(name)?.defer_loading === true
+      ) {
         deferredToolNames.push(name);
       }
     }

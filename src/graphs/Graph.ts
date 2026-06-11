@@ -1732,42 +1732,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         }
       }
 
-      if (contextUsage != null) {
-        if (
-          agentContext.tokenCounter != null &&
-          finalMessages.length !== messagesToUse.length
-        ) {
-          /** Post-prune formatting restructured the payload (e.g. thinking
-           *  placeholder collapse, orphan drops) — recount so the gauge
-           *  reflects what is actually sent */
-          let rawTokens = 0;
-          for (const message of finalMessages) {
-            rawTokens += agentContext.tokenCounter(message);
-          }
-          const ratio =
-            contextUsage.calibrationRatio != null &&
-            contextUsage.calibrationRatio > 0
-              ? contextUsage.calibrationRatio
-              : 1;
-          if (
-            contextUsage.contextBudget != null &&
-            contextUsage.effectiveInstructionTokens != null
-          ) {
-            contextUsage.remainingContextTokens = Math.max(
-              0,
-              contextUsage.contextBudget -
-                contextUsage.effectiveInstructionTokens -
-                Math.round(rawTokens * ratio)
-            );
-          }
-        }
-        void safeDispatchCustomEvent(
-          GraphEvents.ON_CONTEXT_USAGE,
-          contextUsage,
-          config
-        );
-      }
-
       if (
         agentContext.lastStreamCall != null &&
         agentContext.streamBuffer != null
@@ -1838,6 +1802,43 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             type: 'empty_messages',
             info: `Message pruning removed all messages as none fit in the context window. ${guidance}\n${breakdown}`,
           })
+        );
+      }
+
+      /** Past the empty-prompt guard — a model call is now guaranteed */
+      if (contextUsage != null) {
+        if (
+          agentContext.tokenCounter != null &&
+          finalMessages.length !== messagesToUse.length
+        ) {
+          /** Post-prune formatting restructured the payload (e.g. thinking
+           *  placeholder collapse, orphan drops) — recount so the gauge
+           *  reflects what is actually sent */
+          let rawTokens = 0;
+          for (const message of finalMessages) {
+            rawTokens += agentContext.tokenCounter(message);
+          }
+          const ratio =
+            contextUsage.calibrationRatio != null &&
+            contextUsage.calibrationRatio > 0
+              ? contextUsage.calibrationRatio
+              : 1;
+          if (
+            contextUsage.contextBudget != null &&
+            contextUsage.effectiveInstructionTokens != null
+          ) {
+            contextUsage.remainingContextTokens = Math.max(
+              0,
+              contextUsage.contextBudget -
+                contextUsage.effectiveInstructionTokens -
+                Math.round(rawTokens * ratio)
+            );
+          }
+        }
+        void safeDispatchCustomEvent(
+          GraphEvents.ON_CONTEXT_USAGE,
+          contextUsage,
+          config
         );
       }
 
