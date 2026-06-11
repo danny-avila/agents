@@ -129,6 +129,7 @@ export class Run<_T extends t.BaseGraphState> {
   private toolOutputReferences?: t.ToolOutputReferencesConfig;
   private eagerEventToolExecution?: t.EagerEventToolExecutionConfig;
   private toolExecution?: t.ToolExecutionConfig;
+  private subagentUsageSink?: t.SubagentUsageSink;
   private indexTokenCountMap?: Record<string, number>;
   calibrationRatio: number = 1;
   graphRunnable?: t.CompiledStateWorkflow;
@@ -176,6 +177,7 @@ export class Run<_T extends t.BaseGraphState> {
     this.toolOutputReferences = config.toolOutputReferences;
     this.eagerEventToolExecution = config.eagerEventToolExecution;
     this.toolExecution = config.toolExecution;
+    this.subagentUsageSink = config.subagentUsageSink;
 
     if (!config.graphConfig) {
       throw new Error('Graph config not provided');
@@ -249,6 +251,7 @@ export class Run<_T extends t.BaseGraphState> {
       tokenCounter: this.tokenCounter,
       indexTokenCountMap: this.indexTokenCountMap,
       calibrationRatio: this.calibrationRatio,
+      subagentUsageSink: this.subagentUsageSink,
     });
     /** Propagate compile options from graph config */
     standardGraph.compileOptions = this.applyHITLCheckpointerFallback(
@@ -276,6 +279,7 @@ export class Run<_T extends t.BaseGraphState> {
       tokenCounter: this.tokenCounter,
       indexTokenCountMap: this.indexTokenCountMap,
       calibrationRatio: this.calibrationRatio,
+      subagentUsageSink: this.subagentUsageSink,
     });
 
     multiAgentGraph.compileOptions =

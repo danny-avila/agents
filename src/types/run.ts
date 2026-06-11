@@ -126,6 +126,15 @@ export type RunConfig = {
   langfuse?: g.LangfuseConfig;
   customHandlers?: Record<string, g.EventHandler>;
   /**
+   * Receives token usage for every model call made inside subagent child
+   * runs (including nested subagents). Child graphs execute via `invoke()`
+   * outside this run's `streamEvents` loop, so their model-end events never
+   * reach `customHandlers` — without this sink, child usage is invisible to
+   * the host. Parent-graph calls are not reported here; they flow through
+   * the registered `CHAT_MODEL_END` handler as usual.
+   */
+  subagentUsageSink?: g.SubagentUsageSink;
+  /**
    * Pre-constructed hook registry for this run. Hooks fire at lifecycle
    * points in `processStream` (RunStart, UserPromptSubmit, Stop,
    * StopFailure) and around tool calls (PreToolUse, PostToolUse,

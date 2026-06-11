@@ -825,6 +825,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   agentContexts: Map<string, AgentContext> = new Map();
   /** Default agent ID to use */
   defaultAgentId: string;
+  /**
+   * Host sink for model usage emitted inside subagent child runs. Threaded
+   * into each `SubagentExecutor` this graph creates (and from there into
+   * child graphs, so nested subagents report too). See
+   * {@link t.StandardGraphInput.subagentUsageSink}.
+   */
+  subagentUsageSink?: t.SubagentUsageSink;
 
   constructor({
     runId,
@@ -834,11 +841,13 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     tokenCounter,
     indexTokenCountMap,
     calibrationRatio,
+    subagentUsageSink,
   }: t.StandardGraphInput) {
     super();
     this.runId = runId;
     this.signal = signal;
     this.langfuse = langfuse;
+    this.subagentUsageSink = subagentUsageSink;
 
     if (agents.length === 0) {
       throw new Error('At least one agent configuration is required');
@@ -2063,6 +2072,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           parentAgentId: agentContext.agentId,
           langfuse: this.langfuse,
           tokenCounter: agentContext.tokenCounter,
+          usageSink: this.subagentUsageSink,
           maxDepth: effectiveSubagentDepth,
           createChildGraph: (input): StandardGraph => {
             const childGraph = new StandardGraph(input);

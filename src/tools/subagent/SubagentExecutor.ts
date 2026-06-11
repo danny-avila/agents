@@ -1,8 +1,9 @@
 import { nanoid } from 'nanoid';
 import { HumanMessage } from '@langchain/core/messages';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
+import type { BaseMessage, UsageMetadata } from '@langchain/core/messages';
+import type { ChatGeneration, LLMResult } from '@langchain/core/outputs';
 import type { Callbacks } from '@langchain/core/callbacks/manager';
-import type { BaseMessage } from '@langchain/core/messages';
 import type {
   AgentInputs,
   MessageDeltaEvent,
@@ -16,6 +17,7 @@ import type {
   SubagentConfig,
   SubagentUpdateEvent,
   SubagentUpdatePhase,
+  SubagentUsageSink,
   ToolExecuteBatchRequest,
   ToolCallDelta,
   TokenCounter,
@@ -236,6 +238,15 @@ export type SubagentExecutorOptions = {
    * post-`createWorkflow`, so `createAgentNode` must capture lazily).
    */
   parentHandlerRegistry?: HandlerRegistry | (() => HandlerRegistry | undefined);
+  /**
+   * Receives a usage event for every model call the child run makes. The
+   * child workflow executes via `invoke()` with a detached callbacks array,
+   * so its `on_chat_model_end` events never reach the parent's handler
+   * registry — without this sink, child token usage is invisible to the
+   * host (unbilled model calls). Forwarded into the child graph's input so
+   * nested subagents report through the same sink.
+   */
+  usageSink?: SubagentUsageSink;
 };
 
 export class SubagentExecutor {
@@ -248,6 +259,7 @@ export class SubagentExecutor {
   private readonly tokenCounter?: TokenCounter;
   private readonly maxDepth: number;
   private readonly createChildGraph: ChildGraphFactory;
+  private readonly usageSink?: SubagentUsageSink;
   private readonly resolveParentHandlerRegistry?: () =>
     | HandlerRegistry
     | undefined;
@@ -262,6 +274,7 @@ export class SubagentExecutor {
     this.tokenCounter = options.tokenCounter;
     this.maxDepth = options.maxDepth ?? 1;
     this.createChildGraph = options.createChildGraph;
+    this.usageSink = options.usageSink;
     const rawRegistry = options.parentHandlerRegistry;
     if (typeof rawRegistry === 'function') {
       this.resolveParentHandlerRegistry = rawRegistry;
@@ -357,6 +370,15 @@ export class SubagentExecutor {
       agents: [childInputs],
       langfuse: this.langfuse,
       tokenCounter: this.tokenCounter,
+      /**
+       * Forwarded so the child graph's own `SubagentExecutor` (created in
+       * its `createAgentNode` when `allowNested` keeps subagentConfigs)
+       * reports nested-child usage through the same host sink. Each nesting
+       * level attaches its own capture callback — `workflow.invoke` replaces
+       * the inherited callback chain, so a single top-level handler would
+       * never see grandchild model calls.
+       */
+      subagentUsageSink: this.usageSink,
     });
 
     let forwarding: ForwarderCallback | undefined;
@@ -402,7 +424,31 @@ export class SubagentExecutor {
        * `runName` gives the child a distinct LangSmith trace root (avoids
        * nested trace pollution).
        */
-      const callbacks: Callbacks = forwarder ? [forwarder] : [];
+      const callbackHandlers: BaseCallbackHandler[] = [];
+      if (forwarder) {
+        callbackHandlers.push(forwarder);
+      }
+      /**
+       * Usage capture rides the same detached callbacks array. Because
+       * `callbacks` REPLACES the inherited chain (see above), the host's
+       * `CHAT_MODEL_END` handler never observes the child's model calls —
+       * this handler is the child-side equivalent of `ModelEndHandler`,
+       * reporting per-call usage to the host's sink for billing.
+       */
+      if (this.usageSink) {
+        callbackHandlers.push(
+          createUsageCaptureHandler({
+            sink: this.usageSink,
+            subagentType,
+            subagentRunId: childRunId,
+            subagentAgentId: childAgentId,
+            parentRunId: this.parentRunId,
+            provider: config.agentInputs.provider,
+            fallbackModel: extractConfiguredModel(config.agentInputs),
+          })
+        );
+      }
+      const callbacks: Callbacks = callbackHandlers;
       /**
        * Inherit the parent's host `configurable` — host-set fields
        * (`requestBody`, `user`, `userMCPAuthMap`, etc.) AND the run-
@@ -717,6 +763,118 @@ export class SubagentExecutor {
     handler.awaitHandlers = true;
     return { handler, drain };
   }
+}
+
+/**
+ * Builds the child-run equivalent of a host `CHAT_MODEL_END` handler: a
+ * callback that joins per-call model identity (captured from
+ * `ls_model_name` at chat-model start) with the usage metadata reported at
+ * LLM end, and emits a {@link SubagentUsageEvent} through the host's sink.
+ *
+ * Attached to the child `workflow.invoke` callbacks array, so it observes
+ * every model call inside the child graph — the agent loop and any
+ * auxiliary calls (e.g. child-side summarization). It does NOT observe
+ * deeper subagent levels: each nesting level replaces the callback chain
+ * and attaches its own capture handler via the forwarded
+ * `subagentUsageSink` on the child graph's input.
+ */
+function createUsageCaptureHandler(args: {
+  sink: SubagentUsageSink;
+  subagentType: string;
+  subagentRunId: string;
+  subagentAgentId: string;
+  parentRunId: string;
+  /** Child config's provider enum — hosts key pricing/cache semantics off it. */
+  provider?: string;
+  /** Child config's model, used when a call carries no `ls_model_name`. */
+  fallbackModel?: string;
+}): BaseCallbackHandler {
+  const {
+    sink,
+    subagentType,
+    subagentRunId,
+    subagentAgentId,
+    parentRunId,
+    provider,
+    fallbackModel,
+  } = args;
+  /** Per-call `ls_model_name` keyed by LangChain callback runId. */
+  const modelNamesByCallId = new Map<string, string>();
+  const handler = BaseCallbackHandler.fromMethods({
+    handleChatModelStart: (
+      _llm: unknown,
+      _messages: unknown,
+      runId: string,
+      _parentRunId?: string,
+      _extraParams?: Record<string, unknown>,
+      _tags?: string[],
+      metadata?: Record<string, unknown>
+    ): void => {
+      const lsModelName = metadata?.ls_model_name;
+      if (typeof lsModelName === 'string' && lsModelName.length > 0) {
+        modelNamesByCallId.set(runId, lsModelName);
+      }
+    },
+    handleLLMEnd: (output: LLMResult, runId: string): void => {
+      const model = modelNamesByCallId.get(runId) ?? fallbackModel;
+      modelNamesByCallId.delete(runId);
+      for (const generationGroup of output.generations) {
+        for (const generation of generationGroup) {
+          const message = (generation as ChatGeneration | undefined)?.message;
+          const usage = (
+            message as { usage_metadata?: UsageMetadata } | undefined
+          )?.usage_metadata;
+          if (usage == null) {
+            continue;
+          }
+          try {
+            sink({
+              usage,
+              model,
+              provider,
+              subagentType,
+              subagentRunId,
+              subagentAgentId,
+              runId: parentRunId,
+            });
+          } catch {
+            /* observational — a throwing host sink must not break the child run */
+          }
+        }
+      }
+    },
+    handleLLMError: (_err: unknown, runId: string): void => {
+      modelNamesByCallId.delete(runId);
+    },
+  });
+  /**
+   * Dispatch usage synchronously with each model call so all entries are
+   * sunk before `workflow.invoke` resolves — hosts read their accumulator
+   * right after the parent run completes.
+   */
+  handler.awaitHandlers = true;
+  return handler;
+}
+
+/**
+ * Best-effort read of the configured model from a subagent's client
+ * options. Providers disagree on the key (`model` vs `modelName`), and the
+ * value is only a fallback for calls that carry no `ls_model_name`.
+ */
+function extractConfiguredModel(agentInputs: AgentInputs): string | undefined {
+  const clientOptions = agentInputs.clientOptions as
+    | { model?: unknown; modelName?: unknown }
+    | undefined;
+  if (typeof clientOptions?.model === 'string' && clientOptions.model !== '') {
+    return clientOptions.model;
+  }
+  if (
+    typeof clientOptions?.modelName === 'string' &&
+    clientOptions.modelName !== ''
+  ) {
+    return clientOptions.modelName;
+  }
+  return undefined;
 }
 
 function sanitizeChildConfigurable(

@@ -3,6 +3,7 @@ import type {
   BaseMessage,
   AIMessageChunk,
   SystemMessage,
+  UsageMetadata,
 } from '@langchain/core/messages';
 import type { BindToolsInput } from '@langchain/core/language_models/chat_models';
 import type { START, StateGraph, StateGraphArgs } from '@langchain/langgraph';
@@ -299,6 +300,17 @@ export type StandardGraphInput = {
   tokenCounter?: TokenCounter;
   indexTokenCountMap?: Record<string, number>;
   calibrationRatio?: number;
+  /**
+   * Receives a {@link SubagentUsageEvent} for every model call made inside
+   * a subagent child run spawned from this graph (including nested
+   * subagents and child-side summarization calls). Child graphs run via
+   * `invoke()` outside the host's `streamEvents` loop, so their
+   * `on_chat_model_end` events never reach the run's handler registry —
+   * this sink is the only way hosts can observe child token usage for
+   * billing/accounting. Parent-graph model calls are NOT reported here;
+   * they already flow through the registry's `CHAT_MODEL_END` handler.
+   */
+  subagentUsageSink?: SubagentUsageSink;
 };
 
 export type GraphEdge = {
@@ -408,6 +420,46 @@ export interface SubagentUpdateEvent {
   /** ISO timestamp for ordering / display. */
   timestamp: string;
 }
+
+/**
+ * Token usage for a single model call made inside a subagent child run.
+ * Emitted through {@link SubagentUsageSink} as each call completes, so
+ * hosts can bill child-run model usage that never reaches the parent
+ * run's `CHAT_MODEL_END` handler (child graphs execute via `invoke()`
+ * outside the host's `streamEvents` loop).
+ */
+export interface SubagentUsageEvent {
+  /** Usage metadata reported by the child's model call. */
+  usage: UsageMetadata;
+  /**
+   * Model that produced this usage. Per-call `ls_model_name` from the
+   * model's callback metadata when available (covers child-side
+   * summarization or any call that differs from the configured model),
+   * falling back to the subagent config's `clientOptions` model.
+   */
+  model?: string;
+  /**
+   * Provider of the subagent's configured agent (the SDK `Providers`
+   * enum value from its `AgentInputs`, not LangSmith's `ls_provider`
+   * string — hosts key pricing/cache semantics off the enum).
+   */
+  provider?: string;
+  /** Subagent `type` identifier from the SubagentConfig. */
+  subagentType: string;
+  /** Child run ID (unique per subagent execution). */
+  subagentRunId: string;
+  /** Child agent ID assigned to this subagent execution. */
+  subagentAgentId: string;
+  /** Parent run ID under which the subagent was spawned. */
+  runId: string;
+}
+
+/**
+ * Host-provided callback receiving {@link SubagentUsageEvent}s. Invoked
+ * synchronously as each child model call completes; implementations should
+ * be cheap and non-throwing (errors are swallowed by the executor).
+ */
+export type SubagentUsageSink = (event: SubagentUsageEvent) => void;
 
 export type LangfuseToolOutputTracingConfig = {
   /**
