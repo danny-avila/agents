@@ -241,6 +241,18 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
             }
           }
           yield this.enrichChunk(startChunk, seenBlockIndices);
+
+          // Registered stream handlers receive chunks through callback
+          // events, not the yielded generator — dispatch the start chunk so
+          // they see the tool call's id/name (eager chunk state needs both).
+          await runManager?.handleLLMNewToken(
+            startChunk.text,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            { chunk: startChunk }
+          );
         }
       } else if (event.contentBlockDelta != null) {
         const deltaChunk = handleConverseStreamContentBlockDelta(
@@ -270,8 +282,18 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
           seenBlockIndices.add(stopIdx);
           if (toolUseBlockIndices.has(stopIdx)) {
             // Converse guarantees the block's input is complete at stop, so
-            // emit an explicit seal chunk for eager tool execution.
-            yield createConverseToolUseStopChunk(stopIdx);
+            // emit an explicit seal chunk for eager tool execution — through
+            // the callback path too, for registered stream handlers.
+            const sealChunk = createConverseToolUseStopChunk(stopIdx);
+            yield sealChunk;
+            await runManager?.handleLLMNewToken(
+              sealChunk.text,
+              undefined,
+              undefined,
+              undefined,
+              undefined,
+              { chunk: sealChunk }
+            );
           }
         }
       } else {
