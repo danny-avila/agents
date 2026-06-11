@@ -6,6 +6,12 @@ import type { AgentContext } from '@/agents/AgentContext';
 import type { StandardGraph } from '@/graphs';
 import type * as t from '@/types';
 import {
+  getStreamedToolCallSeal,
+  getStreamedToolCallAdapter,
+  streamedToolCallAdapterAllowsSequentialSeal,
+  type StreamedToolCallSeal,
+} from '@/tools/streamedToolCallSeals';
+import {
   ToolCallTypes,
   ContentTypes,
   GraphEvents,
@@ -15,11 +21,6 @@ import {
   CODE_EXECUTION_TOOLS,
   LOCAL_CODING_BUNDLE_NAMES,
 } from '@/common';
-import {
-  getStreamedToolCallSeal,
-  getStreamedToolCallAdapter,
-  type StreamedToolCallSeal,
-} from '@/tools/streamedToolCallSeals';
 import {
   buildToolExecutionRequestPlan,
   coerceRecordArgs,
@@ -1465,7 +1466,10 @@ export class ChatModelStreamHandler implements t.EventHandler {
         chunk.response_metadata as Record<string, unknown> | undefined
       );
       const allowSequentialSeal =
-        canPrestartSequentialStreamedToolChunks(agentContext);
+        canPrestartSequentialStreamedToolChunks(agentContext) ||
+        streamedToolCallAdapterAllowsSequentialSeal(
+          chunk.response_metadata as Record<string, unknown> | undefined
+        );
       const canStreamEager =
         (allowSequentialSeal || hasExplicitStreamedToolCallSeals(chunk)) &&
         !hasPotentialDirectToolInStreamContext({ graph, agentContext }) &&
