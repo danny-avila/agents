@@ -16,6 +16,7 @@ import { createSearchAPI, createSourceProcessor } from './search';
 import { createSerperScraper } from './serper-scraper';
 import { createTavilyScraper } from './tavily-scraper';
 import { createFirecrawlScraper } from './firecrawl';
+import { createParallelScraper } from './parallel-scraper';
 import { expandHighlights } from './highlights';
 import { formatResultsForLLM } from './format';
 import { createDefaultLogger } from './utils';
@@ -356,6 +357,11 @@ export const createSearchTool = (
     tavilySearchUrl,
     tavilyExtractUrl,
     tavilySearchOptions,
+    parallelApiKey,
+    parallelSearchUrl,
+    parallelExtractUrl,
+    parallelSearchOptions,
+    parallelScraperOptions,
     rerankerType = 'cohere',
     topResults = 5,
     maxContentLength,
@@ -394,7 +400,11 @@ export const createSearchTool = (
     news: newsSchema,
   };
 
-  if (searchProvider === 'serper' || searchProvider === 'tavily') {
+  if (
+    searchProvider === 'serper' ||
+    searchProvider === 'tavily' ||
+    searchProvider === 'parallel'
+  ) {
     schemaProperties.country = countrySchema;
   }
 
@@ -412,6 +422,9 @@ export const createSearchTool = (
     tavilyApiKey,
     tavilySearchUrl,
     tavilySearchOptions: effectiveTavilySearchOptions,
+    parallelApiKey,
+    parallelSearchUrl,
+    parallelSearchOptions,
   });
 
   /** Create scraper based on scraperProvider */
@@ -433,6 +446,17 @@ export const createSearchTool = (
         process.env.TAVILY_API_KEY,
       apiUrl: tavilyScraperOptions?.apiUrl ?? tavilyExtractUrl,
       timeout: scraperTimeout ?? tavilyScraperOptions?.timeout,
+      logger,
+    });
+  } else if (scraperProvider === 'parallel') {
+    scraperInstance = createParallelScraper({
+      ...parallelScraperOptions,
+      apiKey:
+        parallelScraperOptions?.apiKey ??
+        parallelApiKey ??
+        process.env.PARALLEL_API_KEY,
+      apiUrl: parallelScraperOptions?.apiUrl ?? parallelExtractUrl,
+      timeout: scraperTimeout ?? parallelScraperOptions?.timeout,
       logger,
     });
   } else {
@@ -474,7 +498,8 @@ export const createSearchTool = (
   const search = createSearchProcessor({
     searchAPI,
     safeSearch,
-    supportsVideos: searchProvider !== 'tavily',
+    supportsVideos:
+      searchProvider !== 'tavily' && searchProvider !== 'parallel',
     sourceProcessor,
     onGetHighlights,
     logger,
