@@ -191,8 +191,9 @@ export class AgentContext {
   dynamicInstructionTokens: number = 0;
   /** Token count for tool schemas only. */
   toolSchemaTokens: number = 0;
-  /** Per-tool schema token counts (post-multiplier), keyed by tool name. */
-  toolTokenCounts: Record<string, number> = {};
+  /** Per-tool schema token counts (post-multiplier), keyed by tool name.
+   *  `undefined` when not calculated (e.g. cached aggregate schema tokens). */
+  toolTokenCounts?: Record<string, number>;
   /** Names of counted tools that are deferred (`defer_loading`) and discovered. */
   deferredToolNames: string[] = [];
   /** Running calibration ratio from the pruner — persisted across runs via contextMeta. */
@@ -898,7 +899,7 @@ export class AgentContext {
     this.systemMessageTokens = 0;
     this.dynamicInstructionTokens = 0;
     this.toolSchemaTokens = 0;
-    this.toolTokenCounts = {};
+    this.toolTokenCounts = undefined;
     this.deferredToolNames = [];
     this.cachedSystemRunnable = undefined;
     this.systemRunnableStale = true;
@@ -1282,7 +1283,8 @@ export class AgentContext {
       messageCount,
       messageTokens,
       availableForMessages,
-      toolTokenCounts: { ...this.toolTokenCounts },
+      toolTokenCounts:
+        this.toolTokenCounts != null ? { ...this.toolTokenCounts } : undefined,
       deferredToolNames:
         this.deferredToolNames.length > 0
           ? [...this.deferredToolNames]

@@ -1423,6 +1423,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       this.config = config;
 
       let messagesToUse = messages;
+      let contextUsage: t.ContextUsageEvent | null = null;
       if (
         !agentContext.pruneMessages &&
         agentContext.tokenCounter &&
@@ -1495,20 +1496,19 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         }
         messagesToUse = context;
 
-        void safeDispatchCustomEvent(
-          GraphEvents.ON_CONTEXT_USAGE,
-          {
-            runId: this.runId,
-            agentId,
-            breakdown: agentContext.getTokenBudgetBreakdown(messages),
-            contextBudget,
-            effectiveInstructionTokens,
-            prePruneContextTokens,
-            remainingContextTokens,
-            calibrationRatio: agentContext.calibrationRatio,
-          } satisfies t.ContextUsageEvent,
-          config
-        );
+        /** Dispatched right before the model invoke — a summarization
+         *  detour returns from this node without an LLM call, and the
+         *  post-summary retry produces its own snapshot */
+        contextUsage = {
+          runId: this.runId,
+          agentId,
+          breakdown: agentContext.getTokenBudgetBreakdown(messages),
+          contextBudget,
+          effectiveInstructionTokens,
+          prePruneContextTokens,
+          remainingContextTokens,
+          calibrationRatio: agentContext.calibrationRatio,
+        };
 
         const hasPrunedMessages =
           agentContext.summarizationEnabled === true &&
@@ -1730,6 +1730,42 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             { runId: this.runId, agentId }
           );
         }
+      }
+
+      if (contextUsage != null) {
+        if (
+          agentContext.tokenCounter != null &&
+          finalMessages.length !== messagesToUse.length
+        ) {
+          /** Post-prune formatting restructured the payload (e.g. thinking
+           *  placeholder collapse, orphan drops) — recount so the gauge
+           *  reflects what is actually sent */
+          let rawTokens = 0;
+          for (const message of finalMessages) {
+            rawTokens += agentContext.tokenCounter(message);
+          }
+          const ratio =
+            contextUsage.calibrationRatio != null &&
+            contextUsage.calibrationRatio > 0
+              ? contextUsage.calibrationRatio
+              : 1;
+          if (
+            contextUsage.contextBudget != null &&
+            contextUsage.effectiveInstructionTokens != null
+          ) {
+            contextUsage.remainingContextTokens = Math.max(
+              0,
+              contextUsage.contextBudget -
+                contextUsage.effectiveInstructionTokens -
+                Math.round(rawTokens * ratio)
+            );
+          }
+        }
+        void safeDispatchCustomEvent(
+          GraphEvents.ON_CONTEXT_USAGE,
+          contextUsage,
+          config
+        );
       }
 
       if (
