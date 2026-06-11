@@ -2107,9 +2107,20 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
       }
     }
 
+    /** Scale raw-space remaining back to calibrated/provider units so it is
+     *  directly comparable with pruningBudget and prePruneContextTokens */
+    const rawRemaining = Math.max(
+      0,
+      initialRemainingContextTokens + reclaimedTokens
+    );
     const remainingContextTokens = Math.max(
       0,
-      Math.min(pruningBudget, initialRemainingContextTokens + reclaimedTokens)
+      Math.min(
+        pruningBudget,
+        calibrationRatio > 0
+          ? Math.round(rawRemaining * calibrationRatio)
+          : rawRemaining
+      )
     );
 
     runThinkingStartIndex = thinkingStartIndex ?? -1;
