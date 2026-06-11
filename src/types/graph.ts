@@ -89,7 +89,13 @@ export interface AgentLogEvent {
   agentId?: string;
 }
 
-/** Per-model-call context window usage snapshot, dispatched after pruning */
+/**
+ * Per-model-call context window usage snapshot, dispatched after pruning and
+ * before the model invocation. Dispatched once per `callModel` invocation:
+ * fallback retries reuse the snapshot since the prompt is identical — budget
+ * numbers reflect the primary provider's tokenizer, and the calibration
+ * ratio self-corrects from whichever provider reports usage.
+ */
 export interface ContextUsageEvent {
   runId?: string;
   agentId?: string;

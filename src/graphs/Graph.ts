@@ -23,6 +23,7 @@ import {
   formatArtifactPayload,
   enforceOriginalContentCap,
   formatContentStrings,
+  isLegacyConvertible,
   createPruneMessages,
   addCacheControl,
   getMessageId,
@@ -45,6 +46,7 @@ import {
   isAnthropicLike,
   isOpenAILike,
   isGoogleLike,
+  apportionTokenCounts,
   joinKeys,
   sleep,
 } from '@/utils';
@@ -1541,15 +1543,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               : 1;
           if (variance > CALIBRATION_VARIANCE_THRESHOLD) {
             agentContext.toolSchemaTokens = calibratedToolTokens;
-            /** Keep the per-tool breakdown summing to the calibrated
-             *  aggregate by scaling each entry proportionally */
+            /** Largest-remainder apportionment keeps the per-tool breakdown
+             *  summing exactly to the calibrated aggregate */
             if (agentContext.toolTokenCounts != null && currentToolTokens > 0) {
-              const factor = calibratedToolTokens / currentToolTokens;
-              for (const name of Object.keys(agentContext.toolTokenCounts)) {
-                agentContext.toolTokenCounts[name] = Math.round(
-                  agentContext.toolTokenCounts[name] * factor
-                );
-              }
+              agentContext.toolTokenCounts = apportionTokenCounts(
+                agentContext.toolTokenCounts,
+                calibratedToolTokens / currentToolTokens,
+                calibratedToolTokens
+              );
             }
           }
         }
@@ -1685,15 +1686,29 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       let finalMessages = messagesToUse;
       /** Tail snapshot for the dispatch-time usage delta: in-place
        *  formatters (artifact appends, Bedrock content rewrites, legacy
-       *  string conversion) only mutate the trailing tool batch and are
-       *  invisible to both length and identity checks — capture before
-       *  they run */
+       *  string conversion) mutate without changing length or identity —
+       *  capture before they run. Legacy string conversion can also touch
+       *  messages before the tail, so those convertible indices are
+       *  tracked separately (none exist in the common case). */
       const tailStart = trailingMutationStart(messagesToUse);
       let preFormatTailTokens: number | null = null;
+      let legacyIndices: number[] | null = null;
+      let preFormatLegacyTokens = 0;
       if (contextUsage != null && agentContext.tokenCounter != null) {
         preFormatTailTokens = 0;
         for (const message of messagesToUse.slice(tailStart)) {
           preFormatTailTokens += agentContext.tokenCounter(message);
+        }
+        if (agentContext.useLegacyContent) {
+          legacyIndices = [];
+          for (let i = 0; i < tailStart; i++) {
+            if (isLegacyConvertible(messagesToUse[i])) {
+              legacyIndices.push(i);
+              preFormatLegacyTokens += agentContext.tokenCounter(
+                messagesToUse[i]
+              );
+            }
+          }
         }
       }
       if (agentContext.useLegacyContent) {
@@ -1921,20 +1936,30 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           agentContext.tokenCounter != null &&
           contextUsage.remainingContextTokens != null
         ) {
-          /** Same-length formatting can still grow the trailing tool batch
-           *  in place — adjust remaining by its calibrated delta */
+          /** Same-length formatting can still mutate in place — the trailing
+           *  tool batch (artifacts, Bedrock rewrites) and any legacy-converted
+           *  messages before it — adjust remaining by the calibrated delta */
           let postFormatTailTokens = 0;
           for (const message of finalMessages.slice(tailStart)) {
             postFormatTailTokens += agentContext.tokenCounter(message);
           }
-          const tailDelta = postFormatTailTokens - preFormatTailTokens;
-          if (tailDelta !== 0) {
+          let formatDelta = postFormatTailTokens - preFormatTailTokens;
+          if (legacyIndices != null && legacyIndices.length > 0) {
+            let postFormatLegacyTokens = 0;
+            for (const index of legacyIndices) {
+              postFormatLegacyTokens += agentContext.tokenCounter(
+                finalMessages[index]
+              );
+            }
+            formatDelta += postFormatLegacyTokens - preFormatLegacyTokens;
+          }
+          if (formatDelta !== 0) {
             contextUsage.remainingContextTokens = Math.max(
               0,
               Math.min(
                 contextUsage.contextBudget ?? Number.MAX_SAFE_INTEGER,
                 contextUsage.remainingContextTokens -
-                  Math.round(tailDelta * usageRatio)
+                  Math.round(formatDelta * usageRatio)
               )
             );
           }

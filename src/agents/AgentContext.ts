@@ -21,6 +21,7 @@ import {
   addCacheControlToStablePrefixMessages,
 } from '@/messages/cache';
 import { createSchemaOnlyTools } from '@/tools/schema';
+import { apportionTokenCounts } from '@/utils/tokens';
 import { DEFAULT_RESERVE_RATIO } from '@/messages';
 import { toJsonSchema } from '@/utils/schema';
 
@@ -1101,10 +1102,15 @@ export class AgentContext {
       : DEFAULT_TOOL_TOKEN_MULTIPLIER;
     this.toolSchemaTokens = Math.ceil(toolTokens * toolTokenMultiplier);
 
-    const toolTokenCounts: Record<string, number> = Object.create(null);
+    /** Largest-remainder apportionment keeps the per-tool counts summing
+     *  exactly to the aggregate despite per-entry rounding */
+    const toolTokenCounts = apportionTokenCounts(
+      rawToolTokenCounts,
+      toolTokenMultiplier,
+      this.toolSchemaTokens
+    );
     const deferredToolNames: string[] = [];
-    for (const [name, rawCount] of Object.entries(rawToolTokenCounts)) {
-      toolTokenCounts[name] = Math.ceil(rawCount * toolTokenMultiplier);
+    for (const name of Object.keys(rawToolTokenCounts)) {
       if (
         deferredCountedNames.has(name) ||
         this.toolRegistry?.get(name)?.defer_loading === true
