@@ -23,6 +23,7 @@ import {
   formatArtifactPayload,
   enforceOriginalContentCap,
   formatContentStrings,
+  isLegacyConvertible,
   createPruneMessages,
   addCacheControl,
   getMessageId,
@@ -45,6 +46,7 @@ import {
   isAnthropicLike,
   isOpenAILike,
   isGoogleLike,
+  apportionTokenCounts,
   joinKeys,
   sleep,
 } from '@/utils';
@@ -88,6 +90,55 @@ const { AGENT, TOOLS, SUMMARIZE } = GraphNodeKeys;
 
 /** Minimum relative variance before calibrated toolSchemaTokens overrides current value. */
 const CALIBRATION_VARIANCE_THRESHOLD = 0.15;
+
+/**
+ * Start index of the span post-prune formatters can mutate in place: the
+ * trailing tool batch plus its owning AI message (artifact formatting touches
+ * every tool result after the last AI tool call; Bedrock rewrites the AI
+ * message before a trailing tool result). Capped so the usage-snapshot
+ * recount stays constant-cost.
+ */
+function trailingMutationStart(messages: BaseMessage[]): number {
+  const MAX_SPAN = 16;
+  let index = messages.length - 1;
+  while (
+    index >= 0 &&
+    messages[index]?.getType() === 'tool' &&
+    messages.length - index < MAX_SPAN
+  ) {
+    index--;
+  }
+  return Math.max(0, Math.min(index, messages.length - 2));
+}
+
+/**
+ * Re-derives the breakdown fields coupled to the calibrated budget math so
+ * the snapshot stays internally consistent: the aggregate
+ * `instructionTokens`/`availableForMessages` reflect the pruner's effective
+ * (calibrated) overhead — component fields remain local estimates — and
+ * `messageTokens` mirrors `contextBudget - instructions - remaining`.
+ */
+function syncBudgetDerivedFields(usage: t.ContextUsageEvent): void {
+  const { breakdown, contextBudget, effectiveInstructionTokens } = usage;
+  if (effectiveInstructionTokens == null) {
+    return;
+  }
+  breakdown.instructionTokens = effectiveInstructionTokens;
+  if (contextBudget == null) {
+    return;
+  }
+  breakdown.availableForMessages = Math.max(
+    0,
+    contextBudget - effectiveInstructionTokens
+  );
+  if (usage.remainingContextTokens == null) {
+    return;
+  }
+  breakdown.messageTokens = Math.max(
+    0,
+    contextBudget - effectiveInstructionTokens - usage.remainingContextTokens
+  );
+}
 
 type ReasoningKey = 'reasoning_content' | 'reasoning';
 type ReasoningSummary = { summary?: Array<{ text?: string }> };
@@ -1423,6 +1474,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       this.config = config;
 
       let messagesToUse = messages;
+      let contextUsage: t.ContextUsageEvent | null = null;
       if (
         !agentContext.pruneMessages &&
         agentContext.tokenCounter &&
@@ -1462,6 +1514,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           originalToolContent,
           calibrationRatio,
           resolvedInstructionOverhead,
+          contextBudget,
+          effectiveInstructionTokens,
         } = agentContext.pruneMessages({
           messages,
           usageMetadata: agentContext.currentUsage,
@@ -1489,9 +1543,41 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               : 1;
           if (variance > CALIBRATION_VARIANCE_THRESHOLD) {
             agentContext.toolSchemaTokens = calibratedToolTokens;
+            /** Largest-remainder apportionment keeps the per-tool breakdown
+             *  summing exactly to the calibrated aggregate */
+            if (agentContext.toolTokenCounts != null && currentToolTokens > 0) {
+              agentContext.toolTokenCounts = apportionTokenCounts(
+                agentContext.toolTokenCounts,
+                calibratedToolTokens / currentToolTokens,
+                calibratedToolTokens
+              );
+            }
           }
         }
         messagesToUse = context;
+
+        /** Dispatched right before the model invoke — a summarization
+         *  detour returns from this node without an LLM call, and the
+         *  post-summary retry produces its own snapshot.
+         *
+         *  The breakdown describes the post-prune prompt: counts from the
+         *  kept context, message tokens derived from the same calibrated
+         *  budget math as `remainingContextTokens` (the index map is keyed
+         *  by pre-prune state indices, so summing it over `context` would
+         *  missum); `prePruneContextTokens` carries the pre-prune metric. */
+        const usageBreakdown = agentContext.getTokenBudgetBreakdown(messages);
+        usageBreakdown.messageCount = context.length;
+        contextUsage = {
+          runId: this.runId,
+          agentId,
+          breakdown: usageBreakdown,
+          contextBudget,
+          effectiveInstructionTokens,
+          prePruneContextTokens,
+          remainingContextTokens,
+          calibrationRatio: agentContext.calibrationRatio,
+        };
+        syncBudgetDerivedFields(contextUsage);
 
         const hasPrunedMessages =
           agentContext.summarizationEnabled === true &&
@@ -1598,6 +1684,33 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }
 
       let finalMessages = messagesToUse;
+      /** Tail snapshot for the dispatch-time usage delta: in-place
+       *  formatters (artifact appends, Bedrock content rewrites, legacy
+       *  string conversion) mutate without changing length or identity —
+       *  capture before they run. Legacy string conversion can also touch
+       *  messages before the tail, so those convertible indices are
+       *  tracked separately (none exist in the common case). */
+      const tailStart = trailingMutationStart(messagesToUse);
+      let preFormatTailTokens: number | null = null;
+      let legacyIndices: number[] | null = null;
+      let preFormatLegacyTokens = 0;
+      if (contextUsage != null && agentContext.tokenCounter != null) {
+        preFormatTailTokens = 0;
+        for (const message of messagesToUse.slice(tailStart)) {
+          preFormatTailTokens += agentContext.tokenCounter(message);
+        }
+        if (agentContext.useLegacyContent) {
+          legacyIndices = [];
+          for (let i = 0; i < tailStart; i++) {
+            if (isLegacyConvertible(messagesToUse[i])) {
+              legacyIndices.push(i);
+              preFormatLegacyTokens += agentContext.tokenCounter(
+                messagesToUse[i]
+              );
+            }
+          }
+        }
+      }
       if (agentContext.useLegacyContent) {
         finalMessages = formatContentStrings(finalMessages);
       }
@@ -1785,6 +1898,79 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             type: 'empty_messages',
             info: `Message pruning removed all messages as none fit in the context window. ${guidance}\n${breakdown}`,
           })
+        );
+      }
+
+      /** Past the empty-prompt guard — a model call is now guaranteed */
+      if (contextUsage != null) {
+        const usageRatio =
+          contextUsage.calibrationRatio != null &&
+          contextUsage.calibrationRatio > 0
+            ? contextUsage.calibrationRatio
+            : 1;
+        if (
+          agentContext.tokenCounter != null &&
+          finalMessages.length !== messagesToUse.length
+        ) {
+          /** Post-prune formatting restructured the payload (e.g. thinking
+           *  placeholder collapse, orphan drops) — recount so the gauge
+           *  reflects what is actually sent */
+          let rawTokens = 0;
+          for (const message of finalMessages) {
+            rawTokens += agentContext.tokenCounter(message);
+          }
+          contextUsage.breakdown.messageCount = finalMessages.length;
+          if (
+            contextUsage.contextBudget != null &&
+            contextUsage.effectiveInstructionTokens != null
+          ) {
+            contextUsage.remainingContextTokens = Math.max(
+              0,
+              contextUsage.contextBudget -
+                contextUsage.effectiveInstructionTokens -
+                Math.round(rawTokens * usageRatio)
+            );
+          }
+        } else if (
+          preFormatTailTokens != null &&
+          agentContext.tokenCounter != null &&
+          contextUsage.remainingContextTokens != null
+        ) {
+          /** Same-length formatting can still mutate in place — the trailing
+           *  tool batch (artifacts, Bedrock rewrites) and any legacy-converted
+           *  messages before it — adjust remaining by the calibrated delta */
+          let postFormatTailTokens = 0;
+          for (const message of finalMessages.slice(tailStart)) {
+            postFormatTailTokens += agentContext.tokenCounter(message);
+          }
+          let formatDelta = postFormatTailTokens - preFormatTailTokens;
+          if (legacyIndices != null && legacyIndices.length > 0) {
+            let postFormatLegacyTokens = 0;
+            for (const index of legacyIndices) {
+              postFormatLegacyTokens += agentContext.tokenCounter(
+                finalMessages[index]
+              );
+            }
+            formatDelta += postFormatLegacyTokens - preFormatLegacyTokens;
+          }
+          if (formatDelta !== 0) {
+            contextUsage.remainingContextTokens = Math.max(
+              0,
+              Math.min(
+                contextUsage.contextBudget ?? Number.MAX_SAFE_INTEGER,
+                contextUsage.remainingContextTokens -
+                  Math.round(formatDelta * usageRatio)
+              )
+            );
+          }
+        }
+        syncBudgetDerivedFields(contextUsage);
+        /** Awaited so async host handlers receive the pre-invoke snapshot
+         *  before any model deltas are emitted */
+        await safeDispatchCustomEvent(
+          GraphEvents.ON_CONTEXT_USAGE,
+          contextUsage,
+          config
         );
       }
 

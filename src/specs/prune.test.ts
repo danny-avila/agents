@@ -472,6 +472,53 @@ describe('Prune Messages Tests', () => {
       expect(typeof result.remainingContextTokens).toBe('number');
     });
 
+    it('should return remaining tokens in calibrated units when pruning with calibration', () => {
+      const tokenCounter = createTestTokenCounter();
+      const messages = [
+        new SystemMessage('System instruction'),
+        new HumanMessage('Message 1'),
+        new AIMessage('Response 1'),
+        new HumanMessage('Message 2'),
+        new AIMessage('Response 2'),
+      ];
+
+      const indexTokenCountMap = {
+        0: tokenCounter(messages[0]),
+        1: tokenCounter(messages[1]),
+        2: tokenCounter(messages[2]),
+        3: tokenCounter(messages[3]),
+        4: tokenCounter(messages[4]),
+      };
+
+      const calibrationRatio = 2;
+      const maxTokens = 80;
+      const pruneMessages = createPruneMessages({
+        maxTokens,
+        startIndex: 0,
+        tokenCounter,
+        indexTokenCountMap,
+        reserveRatio: 0,
+        calibrationRatio,
+      });
+
+      const result = pruneMessages({ messages });
+
+      expect(result.messagesToRefine?.length).toBeGreaterThan(0);
+
+      /** Pruning selects within rawSpaceBudget = maxTokens / ratio (raw units,
+       *  minus the 3-token assistant label); the returned remaining must be
+       *  scaled back so `budget - remaining` reflects provider-space usage */
+      const keptRaw = result.context.reduce(
+        (sum, msg) => sum + tokenCounter(msg),
+        0
+      );
+      const rawSpaceBudget = Math.round(maxTokens / calibrationRatio);
+      const expectedRemaining =
+        (rawSpaceBudget - keptRaw - 3) * calibrationRatio;
+      expect(result.remainingContextTokens).toBe(expectedRemaining);
+      expect(result.contextBudget).toBe(maxTokens);
+    });
+
     it('should respect startType parameter', () => {
       const tokenCounter = createTestTokenCounter();
       const messages = [
@@ -1397,7 +1444,10 @@ describe('Prune Messages Tests', () => {
       expect(result.context).toEqual([]);
       expect(result.messagesToRefine).toEqual([]);
       expect(result.prePruneContextTokens).toBe(0);
-      expect(result.remainingContextTokens).toBe(8000);
+      /** Reserve-adjusted budget (8000 − 5%) minus instruction overhead */
+      expect(result.contextBudget).toBe(7600);
+      expect(result.effectiveInstructionTokens).toBe(4000);
+      expect(result.remainingContextTokens).toBe(3600);
     });
   });
 

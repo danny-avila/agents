@@ -242,6 +242,10 @@ export type TokenBudgetBreakdown = {
   messageTokens: number;
   /** Tokens available for messages after instructions. */
   availableForMessages: number;
+  /** Per-tool schema token counts (post-multiplier), keyed by tool name. */
+  toolTokenCounts?: Record<string, number>;
+  /** Names of counted tools that are deferred (`defer_loading`) and discovered. */
+  deferredToolNames?: string[];
 };
 
 export type EventStreamOptions = {

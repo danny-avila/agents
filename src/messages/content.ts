@@ -1,5 +1,25 @@
-import type { BaseMessage } from '@langchain/core/messages';
+import type {
+  BaseMessage,
+  MessageContentComplex,
+} from '@langchain/core/messages';
 import { ContentTypes } from '@/common';
+
+/**
+ * Whether {@link formatContentStrings} will flatten this message's content:
+ * a human/ai/system message whose content is an array of text-only blocks.
+ */
+export const isLegacyConvertible = (message: BaseMessage): boolean => {
+  const messageType = message.getType();
+  const isValidMessage =
+    messageType === 'human' || messageType === 'ai' || messageType === 'system';
+  if (!isValidMessage) {
+    return false;
+  }
+  if (!Array.isArray(message.content)) {
+    return false;
+  }
+  return message.content.every((block) => block.type === ContentTypes.TEXT);
+};
 
 /**
  * Formats an array of messages for LangChain, making sure all content fields are strings
@@ -13,42 +33,14 @@ export const formatContentStrings = (
   const result: Array<BaseMessage> = [];
 
   for (const message of payload) {
-    const messageType = message.getType();
-    const isValidMessage =
-      messageType === 'human' ||
-      messageType === 'ai' ||
-      messageType === 'system';
-
-    if (!isValidMessage) {
-      result.push(message);
-      continue;
-    }
-
-    // If content is already a string, add as-is
-    if (typeof message.content === 'string') {
-      result.push(message);
-      continue;
-    }
-
-    // If content is not an array, add as-is
-    if (!Array.isArray(message.content)) {
-      result.push(message);
-      continue;
-    }
-
-    // Check if all content blocks are text type
-    const allTextBlocks = message.content.every(
-      (block) => block.type === ContentTypes.TEXT
-    );
-
-    // Only convert to string if all blocks are text type
-    if (!allTextBlocks) {
+    if (!isLegacyConvertible(message)) {
       result.push(message);
       continue;
     }
 
     // Reduce text types to a single string
-    const content = message.content.reduce((acc, curr) => {
+    const blocks = message.content as MessageContentComplex[];
+    const content = blocks.reduce((acc, curr) => {
       if (curr.type === ContentTypes.TEXT) {
         return `${acc}${curr[ContentTypes.TEXT] || ''}\n`;
       }

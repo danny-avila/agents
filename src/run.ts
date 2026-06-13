@@ -78,6 +78,7 @@ const CUSTOM_GRAPH_EVENTS = new Set<string>([
   GraphEvents.ON_SUMMARIZE_COMPLETE,
   GraphEvents.ON_SUBAGENT_UPDATE,
   GraphEvents.ON_AGENT_LOG,
+  GraphEvents.ON_CONTEXT_USAGE,
   GraphEvents.ON_CUSTOM_EVENT,
 ]);
 

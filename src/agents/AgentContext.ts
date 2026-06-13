@@ -21,6 +21,7 @@ import {
   addCacheControlToStablePrefixMessages,
 } from '@/messages/cache';
 import { createSchemaOnlyTools } from '@/tools/schema';
+import { apportionTokenCounts } from '@/utils/tokens';
 import { DEFAULT_RESERVE_RATIO } from '@/messages';
 import { toJsonSchema } from '@/utils/schema';
 
@@ -191,6 +192,11 @@ export class AgentContext {
   dynamicInstructionTokens: number = 0;
   /** Token count for tool schemas only. */
   toolSchemaTokens: number = 0;
+  /** Per-tool schema token counts (post-multiplier), keyed by tool name.
+   *  `undefined` when not calculated (e.g. cached aggregate schema tokens). */
+  toolTokenCounts?: Record<string, number>;
+  /** Names of counted tools that are deferred (`defer_loading`) and discovered. */
+  deferredToolNames: string[] = [];
   /** Running calibration ratio from the pruner — persisted across runs via contextMeta. */
   calibrationRatio: number = 1;
   /** Provider-observed instruction overhead from the pruner's best-variance turn. */
@@ -894,6 +900,8 @@ export class AgentContext {
     this.systemMessageTokens = 0;
     this.dynamicInstructionTokens = 0;
     this.toolSchemaTokens = 0;
+    this.toolTokenCounts = undefined;
+    this.deferredToolNames = [];
     this.cachedSystemRunnable = undefined;
     this.systemRunnableStale = true;
     this.lastToken = undefined;
@@ -1006,6 +1014,10 @@ export class AgentContext {
   ): Promise<void> {
     let toolTokens = 0;
     const countedToolNames = new Set<string>();
+    /** Prototype-free: external tool names like `toString` must not hit
+     *  inherited properties during accumulation */
+    const rawToolTokenCounts: Record<string, number> = Object.create(null);
+    const deferredCountedNames = new Set<string>();
 
     /**
      * Iterate both `tools` (user-provided instance tools) and `graphTools`
@@ -1040,11 +1052,14 @@ export class AgentContext {
             toolName,
             (genericTool.description as string | undefined) ?? ''
           );
-          toolTokens += tokenCounter(
+          const schemaTokens = tokenCounter(
             new SystemMessage(JSON.stringify(jsonSchema))
           );
+          toolTokens += schemaTokens;
           if (toolName) {
             countedToolNames.add(toolName);
+            rawToolTokenCounts[toolName] =
+              (rawToolTokenCounts[toolName] ?? 0) + schemaTokens;
           }
         }
       }
@@ -1062,7 +1077,16 @@ export class AgentContext {
           parameters: def.parameters ?? {},
         },
       };
-      toolTokens += tokenCounter(new SystemMessage(JSON.stringify(schema)));
+      const schemaTokens = tokenCounter(
+        new SystemMessage(JSON.stringify(schema))
+      );
+      toolTokens += schemaTokens;
+      countedToolNames.add(def.name);
+      rawToolTokenCounts[def.name] =
+        (rawToolTokenCounts[def.name] ?? 0) + schemaTokens;
+      if (def.defer_loading === true) {
+        deferredCountedNames.add(def.name);
+      }
     }
 
     const isAnthropic =
@@ -1077,6 +1101,25 @@ export class AgentContext {
       ? ANTHROPIC_TOOL_TOKEN_MULTIPLIER
       : DEFAULT_TOOL_TOKEN_MULTIPLIER;
     this.toolSchemaTokens = Math.ceil(toolTokens * toolTokenMultiplier);
+
+    /** Largest-remainder apportionment keeps the per-tool counts summing
+     *  exactly to the aggregate despite per-entry rounding */
+    const toolTokenCounts = apportionTokenCounts(
+      rawToolTokenCounts,
+      toolTokenMultiplier,
+      this.toolSchemaTokens
+    );
+    const deferredToolNames: string[] = [];
+    for (const name of Object.keys(rawToolTokenCounts)) {
+      if (
+        deferredCountedNames.has(name) ||
+        this.toolRegistry?.get(name)?.defer_loading === true
+      ) {
+        deferredToolNames.push(name);
+      }
+    }
+    this.toolTokenCounts = toolTokenCounts;
+    this.deferredToolNames = deferredToolNames;
   }
 
   /**
@@ -1212,9 +1255,8 @@ export class AgentContext {
    * Returns a structured breakdown of how the context token budget is consumed.
    * Useful for diagnostics when context overflow or pruning issues occur.
    *
-   * Note: `toolCount` reflects discoveries immediately, but `toolSchemaTokens`
-   * is a snapshot taken during `calculateInstructionTokens` and is not
-   * recomputed when `markToolsAsDiscovered` is called mid-run.
+   * Note: `markToolsAsDiscovered` re-triggers `calculateInstructionTokens`,
+   * so `toolSchemaTokens`/`toolTokenCounts` refresh before the next call.
    */
   getTokenBudgetBreakdown(messages?: BaseMessage[]): t.TokenBudgetBreakdown {
     const maxContextTokens = this.maxContextTokens ?? 0;
@@ -1238,7 +1280,14 @@ export class AgentContext {
       }
     }
 
-    const reserveTokens = Math.round(maxContextTokens * DEFAULT_RESERVE_RATIO);
+    /** Mirror the pruner's reserve math so availableForMessages agrees
+     *  with the contextBudget computed during pruning */
+    const reserveRatio =
+      this.summarizationConfig?.reserveRatio ?? DEFAULT_RESERVE_RATIO;
+    const reserveTokens =
+      reserveRatio > 0 && reserveRatio < 1
+        ? Math.round(maxContextTokens * reserveRatio)
+        : 0;
     const availableForMessages = Math.max(
       0,
       maxContextTokens - reserveTokens - this.instructionTokens
@@ -1255,6 +1304,12 @@ export class AgentContext {
       messageCount,
       messageTokens,
       availableForMessages,
+      toolTokenCounts:
+        this.toolTokenCounts != null ? { ...this.toolTokenCounts } : undefined,
+      deferredToolNames:
+        this.deferredToolNames.length > 0
+          ? [...this.deferredToolNames]
+          : undefined,
     };
   }
 
@@ -1324,6 +1379,14 @@ export class AgentContext {
     }
     if (hasNewDiscoveries) {
       this.systemRunnableStale = true;
+      /** Refresh schema token accounting so the next call's budget and
+       *  per-tool breakdown include the newly discovered tools; awaited
+       *  via tokenCalculationPromise before the next model call */
+      if (this.tokenCounter) {
+        this.tokenCalculationPromise = this.calculateInstructionTokens(
+          this.tokenCounter
+        );
+      }
     }
     return hasNewDiscoveries;
   }

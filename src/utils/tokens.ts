@@ -396,6 +396,39 @@ export function getTokenCountForMessage(
 }
 
 /**
+ * Largest-remainder apportionment: scales each count by `multiplier` and
+ * distributes the rounding remainder so the results sum exactly to
+ * `targetTotal`. Keeps per-item breakdowns reconciled with an aggregate
+ * computed as a single rounded product of the summed raw counts.
+ */
+export function apportionTokenCounts(
+  rawCounts: Record<string, number>,
+  multiplier: number,
+  targetTotal: number
+): Record<string, number> {
+  const result: Record<string, number> = Object.create(null);
+  const remainders: Array<{ name: string; remainder: number }> = [];
+  let floorSum = 0;
+  for (const [name, rawCount] of Object.entries(rawCounts)) {
+    const scaled = rawCount * multiplier;
+    const floored = Math.floor(scaled);
+    result[name] = floored;
+    floorSum += floored;
+    remainders.push({ name, remainder: scaled - floored });
+  }
+  let leftover = targetTotal - floorSum;
+  if (leftover <= 0 || remainders.length === 0) {
+    return result;
+  }
+  remainders.sort((a, b) => b.remainder - a.remainder);
+  for (let i = 0; leftover > 0; i = (i + 1) % remainders.length) {
+    result[remainders[i].name] += 1;
+    leftover--;
+  }
+  return result;
+}
+
+/**
  * Anthropic's API consistently reports ~10% more tokens than the local
  * claude tokenizer due to internal message framing and content encoding.
  * Verified empirically across content types via the count_tokens endpoint.
