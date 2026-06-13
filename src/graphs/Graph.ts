@@ -1462,6 +1462,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           originalToolContent,
           calibrationRatio,
           resolvedInstructionOverhead,
+          contextBudget,
+          effectiveInstructionTokens,
         } = agentContext.pruneMessages({
           messages,
           usageMetadata: agentContext.currentUsage,
@@ -1492,6 +1494,21 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           }
         }
         messagesToUse = context;
+
+        void safeDispatchCustomEvent(
+          GraphEvents.ON_CONTEXT_USAGE,
+          {
+            runId: this.runId,
+            agentId,
+            breakdown: agentContext.getTokenBudgetBreakdown(messages),
+            contextBudget,
+            effectiveInstructionTokens,
+            prePruneContextTokens,
+            remainingContextTokens,
+            calibrationRatio: agentContext.calibrationRatio,
+          } satisfies t.ContextUsageEvent,
+          config
+        );
 
         const hasPrunedMessages =
           agentContext.summarizationEnabled === true &&

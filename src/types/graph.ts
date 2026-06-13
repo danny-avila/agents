@@ -29,10 +29,10 @@ import type {
   MessageDeltaEvent,
   ReasoningDeltaEvent,
 } from '@/types/stream';
+import type { TokenCounter, TokenBudgetBreakdown } from '@/types/run';
 import type { Providers, Callback, GraphNodeKeys } from '@/common';
 import type { StandardGraph, MultiAgentGraph } from '@/graphs';
 import type { ClientOptions } from '@/types/llm';
-import type { TokenCounter } from '@/types/run';
 
 /** Interface for bound model with stream and invoke methods */
 export interface ChatModel {
@@ -89,6 +89,24 @@ export interface AgentLogEvent {
   agentId?: string;
 }
 
+/** Per-model-call context window usage snapshot, dispatched after pruning */
+export interface ContextUsageEvent {
+  runId?: string;
+  agentId?: string;
+  /** Structural token budget snapshot from AgentContext.getTokenBudgetBreakdown */
+  breakdown: TokenBudgetBreakdown;
+  /** Usable budget this call: maxContextTokens minus output reserve */
+  contextBudget?: number;
+  /** Calibrated instruction overhead actually applied this call */
+  effectiveInstructionTokens?: number;
+  /** Calibrated message tokens before pruning (excluding instructions) */
+  prePruneContextTokens?: number;
+  /** Tokens still free after instructions + pruned messages */
+  remainingContextTokens?: number;
+  /** EMA ratio of provider-reported vs locally estimated token counts */
+  calibrationRatio?: number;
+}
+
 export interface EventHandler {
   handle(
     event: string,
@@ -104,6 +122,7 @@ export interface EventHandler {
       | SummarizeCompleteEvent
       | SubagentUpdateEvent
       | AgentLogEvent
+      | ContextUsageEvent
       | ToolExecuteBatchRequest
       | { result: ToolEndEvent },
     metadata?: Record<string, unknown>,

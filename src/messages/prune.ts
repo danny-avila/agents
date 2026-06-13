@@ -1312,6 +1312,10 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     originalToolContent?: Map<number, string>;
     calibrationRatio?: number;
     resolvedInstructionOverhead?: number;
+    /** Usable budget this call: maxTokens minus output reserve */
+    contextBudget?: number;
+    /** Calibrated instruction overhead actually applied this call */
+    effectiveInstructionTokens?: number;
   } {
     if (params.messages.length === 0) {
       return {
@@ -1549,6 +1553,8 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
           pruningBudget > 0 ? calibratedTotalTokens / pruningBudget : 0,
         calibrationRatio,
         resolvedInstructionOverhead: bestInstructionOverhead,
+        contextBudget: pruningBudget,
+        effectiveInstructionTokens: currentInstructionTokens,
       };
     }
 
@@ -1752,6 +1758,8 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
           originalToolContent.size > 0 ? originalToolContent : undefined,
         calibrationRatio,
         resolvedInstructionOverhead: bestInstructionOverhead,
+        contextBudget: pruningBudget,
+        effectiveInstructionTokens: currentInstructionTokens,
       };
     }
 
@@ -2123,6 +2131,8 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         originalToolContent.size > 0 ? originalToolContent : undefined,
       calibrationRatio,
       resolvedInstructionOverhead: bestInstructionOverhead,
+      contextBudget: pruningBudget,
+      effectiveInstructionTokens: currentInstructionTokens,
     };
   };
 }
