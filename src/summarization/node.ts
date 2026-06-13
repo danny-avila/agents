@@ -10,7 +10,13 @@ import type { AgentContext } from '@/agents/AgentContext';
 import type { HookRegistry } from '@/hooks';
 import type { OnChunk } from '@/llm/invoke';
 import type * as t from '@/types';
-import { ContentTypes, GraphEvents, StepTypes, Providers } from '@/common';
+import {
+  Constants,
+  ContentTypes,
+  GraphEvents,
+  StepTypes,
+  Providers,
+} from '@/common';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { createRemoveAllMessage } from '@/messages/reducer';
@@ -938,6 +944,19 @@ export function createSummarizeNode({
           agent_id: request.agentId,
           summarization_provider: clientConfig.provider,
           summarization_model: clientConfig.modelName,
+          /**
+             * Per-call model attribution for usage consumers (the subagent
+             * usage-capture handler): the summarizer's model can differ from
+             * the agent's primary, and providers that emit no `ls_model_name`
+             * would otherwise be billed against the primary config's model.
+             * Omitted for self-summarize (no explicit model — the primary
+             * config fallback is then correct). `tryFallbackProviders`
+             * overrides this per fallback attempt; `INVOKED_PROVIDER` is
+             * stamped by `attemptInvoke` itself.
+             */
+          ...(clientConfig.modelName != null && clientConfig.modelName !== ''
+            ? { [Constants.INVOKED_MODEL]: clientConfig.modelName }
+            : {}),
         },
       }
       : undefined;

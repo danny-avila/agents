@@ -1,6 +1,12 @@
+import { ChatGenerationChunk } from '@langchain/core/outputs';
 import { FakeListChatModel } from '@langchain/core/utils/testing';
-import { AIMessage, HumanMessage } from '@langchain/core/messages';
+import {
+  AIMessage,
+  AIMessageChunk,
+  HumanMessage,
+} from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
+import type { UsageMetadata } from '@langchain/core/messages';
 import type { ToolCall } from '@langchain/core/messages/tool';
 import type * as t from '@/types';
 import {
@@ -387,5 +393,122 @@ describe('Subagent Integration', () => {
     expect(contextWith!.toolSchemaTokens).toBeGreaterThan(
       contextWithout!.toolSchemaTokens
     );
+  });
+
+  it('reports child model usage through subagentUsageSink', async () => {
+    const CHILD_USAGE = {
+      input_tokens: 11,
+      output_tokens: 7,
+      total_tokens: 18,
+    };
+    /**
+     * The default mock (FakeListChatModel) reports no usage. Re-mock with a
+     * subclass that reports `usage_metadata` the way live providers do:
+     * stamped on the generation in the invoke path, and carried on a final
+     * zero-content chunk in the stream path (the graph's `attemptInvoke`
+     * prefers `model.stream()`, and chunk concatenation folds the usage
+     * into the aggregated message that `handleLLMEnd` receives).
+     */
+    getChatModelClassSpy.mockImplementation(((provider: Providers) => {
+      if (provider === Providers.OPENAI) {
+        return class extends FakeListChatModel {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          constructor(_options: any) {
+            super({ responses: [CHILD_RESPONSE] });
+          }
+          async _generate(
+            ...args: Parameters<FakeListChatModel['_generate']>
+          ): ReturnType<FakeListChatModel['_generate']> {
+            const result = await super._generate(...args);
+            for (const generation of result.generations) {
+              (generation.message as AIMessage).usage_metadata = {
+                ...CHILD_USAGE,
+              };
+            }
+            return result;
+          }
+          async *_streamResponseChunks(
+            ...args: Parameters<FakeListChatModel['_streamResponseChunks']>
+          ): ReturnType<FakeListChatModel['_streamResponseChunks']> {
+            yield* super._streamResponseChunks(...args);
+            yield new ChatGenerationChunk({
+              text: '',
+              message: new AIMessageChunk({
+                content: '',
+                usage_metadata: { ...CHILD_USAGE },
+              }),
+            });
+          }
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        } as any;
+      }
+      return originalGetChatModelClass(provider);
+    }) as typeof providers.getChatModelClass);
+
+    const collectedUsage: UsageMetadata[] = [];
+    const sunkEvents: t.SubagentUsageEvent[] = [];
+    const customHandlers: Record<string, t.EventHandler> = {
+      [GraphEvents.TOOL_END]: new ToolEndHandler(),
+      [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(collectedUsage),
+    };
+
+    const runId = `subagent-usage-${Date.now()}`;
+    const run = await Run.create<t.IState>({
+      runId,
+      graphConfig: {
+        type: 'standard',
+        agents: [createParentAgent()],
+      },
+      returnContent: true,
+      skipCleanup: true,
+      customHandlers,
+      subagentUsageSink: (event) => {
+        sunkEvents.push(event);
+      },
+    });
+
+    const subagentToolCall: ToolCall = {
+      id: 'call_subagent_usage',
+      name: Constants.SUBAGENT,
+      args: {
+        description: 'What is the capital of France?',
+        subagent_type: 'researcher',
+      },
+      type: 'tool_call',
+    };
+
+    run.Graph?.overrideTestModel(
+      [
+        'Let me delegate this research task.',
+        `Based on the research: ${CHILD_RESPONSE}`,
+      ],
+      10,
+      [subagentToolCall]
+    );
+
+    await run.processStream(
+      { messages: [new HumanMessage('What is the capital of France?')] },
+      callerConfig
+    );
+
+    /** Child made exactly one model call; all events are child-tagged. */
+    expect(sunkEvents).toHaveLength(1);
+    const event = sunkEvents[0];
+    /** Chunk concat adds empty `*_token_details` — match on the counts. */
+    expect(event.usage).toMatchObject(CHILD_USAGE);
+    expect(event.subagentType).toBe('researcher');
+    expect(event.subagentAgentId).toBe('researcher');
+    expect(event.provider).toBe(Providers.OPENAI);
+    /** FakeListChatModel emits no ls_model_name → config fallback. */
+    expect(event.model).toBe('gpt-4o-mini');
+    expect(event.runId).toBe(runId);
+    expect(event.subagentRunId).toContain(`${runId}_sub_`);
+    /**
+     * The parent's own calls must NOT be routed through the sink — they
+     * flow through the registered CHAT_MODEL_END handler. (The fake
+     * override model reports no usage, so collectedUsage stays empty;
+     * the load-bearing assertion is that the sink saw no parent calls.)
+     */
+    expect(sunkEvents.every((e) => e.subagentType === 'researcher')).toBe(true);
   });
 });

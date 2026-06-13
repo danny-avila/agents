@@ -12,8 +12,8 @@ import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
 import { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
+import { Constants, Providers } from '@/common';
 import { ToolNode } from '@/tools/ToolNode';
-import { Providers } from '@/common';
 
 /**
  * Minimal stub model shape `attemptInvoke` reads. Either `invoke` or
@@ -334,6 +334,84 @@ describe('tryFallbackProviders applies the same lazy annotation transform', () =
     expect(invokeMessages.length).toBeGreaterThanOrEqual(1);
     expect(invokeMessages[invokeMessages.length - 1][0].content).toBe(
       '[ref: tool0turn0]\noutput'
+    );
+
+    jest.dontMock('@/llm/init');
+    jest.resetModules();
+  });
+});
+
+describe('invocation attribution metadata', () => {
+  it('stamps INVOKED_PROVIDER on the config passed to the model', async () => {
+    const capturedConfigs: unknown[] = [];
+    const model: StubModel = {
+      invoke: jest.fn(
+        async (_m: BaseMessage[], config?: unknown): Promise<AIMessage> => {
+          capturedConfigs.push(config);
+          return new AIMessage({ content: 'ok' });
+        }
+      ),
+    };
+
+    await attemptInvoke(
+      {
+        model: model as t.ChatModel,
+        messages: [new HumanMessage('hi')],
+        /** A ChatOpenAI-derived provider — `ls_provider` would lie here. */
+        provider: Providers.DEEPSEEK,
+      },
+      { configurable: { run_id: 'run-attr' }, metadata: { existing: true } }
+    );
+
+    const config = capturedConfigs[0] as {
+      metadata?: Record<string, unknown>;
+    };
+    expect(config.metadata?.[Constants.INVOKED_PROVIDER]).toBe(
+      Providers.DEEPSEEK
+    );
+    /** Pre-existing metadata is preserved, not replaced. */
+    expect(config.metadata?.existing).toBe(true);
+  });
+
+  it('stamps INVOKED_MODEL from the fallback clientOptions in tryFallbackProviders', async () => {
+    const capturedConfigs: unknown[] = [];
+    const model: StubModel = {
+      invoke: jest.fn(
+        async (_m: BaseMessage[], config?: unknown): Promise<AIMessage> => {
+          capturedConfigs.push(config);
+          return new AIMessage({ content: 'ok' });
+        }
+      ),
+    };
+
+    jest.doMock('@/llm/init', () => ({
+      initializeModel: (): unknown => model,
+    }));
+    jest.resetModules();
+    const { tryFallbackProviders: freshTry } = (await import(
+      '@/llm/invoke'
+    )) as { tryFallbackProviders: typeof tryFallbackProviders };
+
+    await freshTry({
+      fallbacks: [
+        {
+          provider: Providers.ANTHROPIC,
+          clientOptions: { model: 'claude-fallback-1' },
+        },
+      ],
+      messages: [new HumanMessage('hi')],
+      primaryError: new Error('primary failed'),
+      config: { configurable: { run_id: 'run-attr-fb' } },
+    });
+
+    const config = capturedConfigs[0] as {
+      metadata?: Record<string, unknown>;
+    };
+    expect(config.metadata?.[Constants.INVOKED_MODEL]).toBe(
+      'claude-fallback-1'
+    );
+    expect(config.metadata?.[Constants.INVOKED_PROVIDER]).toBe(
+      Providers.ANTHROPIC
     );
 
     jest.dontMock('@/llm/init');

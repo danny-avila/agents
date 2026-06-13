@@ -6,10 +6,10 @@ import type { BaseMessage } from '@langchain/core/messages';
 import type { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import type * as t from '@/types';
 import { annotateMessagesForLLM } from '@/tools/toolOutputReferences';
+import { Constants, GraphEvents, Providers } from '@/common';
 import { manualToolStreamProviders } from '@/llm/providers';
 import { modifyDeltaProperties } from '@/messages';
 import { ChatModelStreamHandler } from '@/stream';
-import { GraphEvents, Providers } from '@/common';
 import { initializeModel } from '@/llm/init';
 
 /**
@@ -208,6 +208,23 @@ export async function attemptInvoke(
   const runId = config?.configurable?.run_id as string | undefined;
   const messagesForProvider = annotateMessagesForLLM(messages, registry, runId);
 
+  /**
+   * Stamp the provider that is ACTUALLY serving this invocation onto the
+   * callback metadata. `attemptInvoke` is the single funnel for primary,
+   * fallback, and summarization model calls, so consumers that need
+   * provider attribution per call (the subagent usage-capture handler)
+   * read this key instead of trusting static agent config — which is
+   * wrong for fallback-served calls — or `ls_provider` — which derived
+   * providers inherit from their base class.
+   */
+  config = {
+    ...config,
+    metadata: {
+      ...(config?.metadata ?? {}),
+      [Constants.INVOKED_PROVIDER]: provider,
+    },
+  };
+
   if (model.stream) {
     const stream = await model.stream(messagesForProvider, config);
     let finalChunk: AIMessageChunk | undefined;
@@ -224,7 +241,7 @@ export async function attemptInvoke(
         });
       }
     } else if (registeredStreamHandler == null) {
-      const metadata = config?.metadata as Record<string, unknown> | undefined;
+      const metadata = config.metadata as Record<string, unknown> | undefined;
       const streamHandler = new ChatModelStreamHandler();
       for await (const chunk of stream) {
         const handlingChunk = getStreamHandlingChunk({
@@ -247,7 +264,7 @@ export async function attemptInvoke(
         });
       }
     } else {
-      const metadata = config?.metadata as Record<string, unknown> | undefined;
+      const metadata = config.metadata as Record<string, unknown> | undefined;
       for await (const chunk of stream) {
         const handlingChunk = getStreamHandlingChunk({
           current: finalChunk,
@@ -293,6 +310,25 @@ export async function attemptInvoke(
 }
 
 /**
+ * Best-effort read of the configured model name from client options.
+ * Providers disagree on the key (`model` vs `modelName`).
+ */
+function extractClientOptionsModel(
+  clientOptions: t.ClientOptions | undefined
+): string | undefined {
+  const options = clientOptions as
+    | { model?: unknown; modelName?: unknown }
+    | undefined;
+  if (typeof options?.model === 'string' && options.model !== '') {
+    return options.model;
+  }
+  if (typeof options?.modelName === 'string' && options.modelName !== '') {
+    return options.modelName;
+  }
+  return undefined;
+}
+
+/**
  * Attempts each fallback provider in order until one succeeds.
  * Throws the last error if all fallbacks fail.
  */
@@ -321,6 +357,24 @@ export async function tryFallbackProviders({
         clientOptions: fb.clientOptions,
         tools,
       });
+      /**
+       * Stamp the fallback's configured model onto callback metadata so
+       * per-call attribution (subagent usage capture) doesn't fall back to
+       * the PRIMARY config's model when the provider reports no
+       * `ls_model_name`. The serving provider is stamped uniformly by
+       * `attemptInvoke` (`INVOKED_PROVIDER`).
+       */
+      const fbModelName = extractClientOptionsModel(fb.clientOptions);
+      const fbConfig: RunnableConfig | undefined =
+        fbModelName == null
+          ? config
+          : {
+            ...config,
+            metadata: {
+              ...(config?.metadata ?? {}),
+              [Constants.INVOKED_MODEL]: fbModelName,
+            },
+          };
       const result = await attemptInvoke(
         {
           model: fbModel as t.ChatModel,
@@ -329,7 +383,7 @@ export async function tryFallbackProviders({
           context,
           onChunk,
         },
-        config
+        fbConfig
       );
       return result;
     } catch (e) {

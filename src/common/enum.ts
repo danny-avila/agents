@@ -187,6 +187,17 @@ export enum Constants {
   /** Anthropic server tool ID prefix (web_search, code_execution, etc.) */
   ANTHROPIC_SERVER_TOOL_PREFIX = 'srvtoolu_',
   SKILL_TOOL = 'skill',
+  /**
+   * Callback-metadata keys stamped by `attemptInvoke` /
+   * `tryFallbackProviders` carrying the provider (SDK `Providers` enum
+   * value) and configured model that actually served a model invocation.
+   * Unlike `ls_provider` — which derived providers inherit from their base
+   * class (e.g. DeepSeek/OpenRouter report `'openai'`) — these reflect the
+   * SDK's own routing, including fallback-provider calls. Consumed by the
+   * subagent usage-capture handler to tag billing events.
+   */
+  INVOKED_PROVIDER = '__invoked_provider',
+  INVOKED_MODEL = '__invoked_model',
   READ_FILE = 'read_file',
   BASH_TOOL = 'bash_tool',
   BASH_PROGRAMMATIC_TOOL_CALLING = 'run_tools_with_bash',
