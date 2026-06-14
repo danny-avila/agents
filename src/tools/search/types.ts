@@ -3,8 +3,8 @@ import type { Logger as WinstonLogger } from 'winston';
 import type { BaseReranker } from './rerankers';
 import { DATE_RANGE } from './schema';
 
-export type SearchProvider = 'serper' | 'searxng' | 'tavily';
-export type ScraperProvider = 'firecrawl' | 'serper' | 'tavily';
+export type SearchProvider = 'serper' | 'searxng' | 'tavily' | 'crw';
+export type ScraperProvider = 'firecrawl' | 'serper' | 'tavily' | 'crw';
 export type RerankerType = 'infinity' | 'jina' | 'cohere' | 'none';
 
 export interface Highlight {
@@ -106,6 +106,34 @@ export interface TavilySearchPayload {
   chunks_per_source?: number;
 }
 
+export interface CrwSearchOptions {
+  /** Max results to request (maps to `limit`; clamped 1..20). */
+  maxResults?: number;
+  /** Add 'images' to the sources array. */
+  includeImages?: boolean;
+  timeout?: number;
+}
+
+export interface CrwSearchPayload {
+  query: string;
+  limit: number;
+  sources?: Array<'web' | 'images'>;
+}
+
+export interface CrwSearchResult {
+  title?: string;
+  url?: string;
+  description?: string;
+  markdown?: string;
+}
+
+export interface CrwSearchResponse {
+  success: boolean;
+  data?: CrwSearchResult[];
+  error?: string;
+  error_code?: string;
+}
+
 export interface SearchConfig {
   searchProvider?: SearchProvider;
   serperApiKey?: string;
@@ -115,6 +143,9 @@ export interface SearchConfig {
   tavilySearchUrl?: string;
   tavilyExtractUrl?: string;
   tavilySearchOptions?: TavilySearchOptions;
+  crwApiKey?: string;
+  crwApiUrl?: string;
+  crwSearchOptions?: CrwSearchOptions;
 }
 
 export type References = {
@@ -218,6 +249,7 @@ export interface SearchToolConfig
     ProcessSourcesConfig,
     FirecrawlConfig {
   tavilyScraperOptions?: TavilyScraperConfig;
+  crwScraperOptions?: CrwScraperConfig;
   /** Max chars of highlight content this tool feeds the MODEL per search (the
    * dominant, otherwise-unbounded part of the output). Distinct from
    * `maxContentLength`, which caps scraped/reranked content per source — full
@@ -255,7 +287,8 @@ export type UsedReferences = {
 export type AnyScraperResponse =
   | FirecrawlScrapeResponse
   | SerperScrapeResponse
-  | TavilyScrapeResponse;
+  | TavilyScrapeResponse
+  | CrwScrapeResponse;
 
 /** Base Scraper Interface */
 export interface BaseScraper {
@@ -279,6 +312,30 @@ export interface BaseScraper {
 export type FirecrawlScrapeOptions = Omit<
   FirecrawlScraperConfig,
   'apiKey' | 'apiUrl' | 'version' | 'logger'
+>;
+
+export interface CrwScraperConfig {
+  apiKey?: string;
+  apiUrl?: string;
+  formats?: string[];
+  timeout?: number;
+  logger?: Logger;
+  onlyMainContent?: boolean;
+  includeTags?: string[];
+  excludeTags?: string[];
+  waitFor?: number;
+  headers?: Record<string, string>;
+  renderJs?: boolean | null;
+  cssSelector?: string;
+  xpath?: string;
+  proxy?: string;
+  stealth?: boolean;
+  jsonSchema?: object;
+}
+
+export type CrwScrapeOptions = Omit<
+  CrwScraperConfig,
+  'apiKey' | 'apiUrl' | 'logger'
 >;
 
 export type SerperScrapeOptions = Omit<
@@ -378,6 +435,34 @@ export interface FirecrawlScrapeResponse {
     metadata?: ScrapeMetadata;
   };
   error?: string;
+}
+
+export interface CrwScrapeResponse {
+  success: boolean;
+  data?: {
+    markdown?: string;
+    html?: string;
+    rawHtml?: string;
+    plainText?: string;
+    screenshot?: string;
+    links?: string[];
+    metadata?: ScrapeMetadata;
+  };
+  error?: string;
+  error_code?: string;
+}
+
+export interface CrwRawScrapeResponse {
+  success?: boolean;
+  markdown?: string;
+  html?: string;
+  rawHtml?: string;
+  plainText?: string;
+  screenshot?: string;
+  links?: string[];
+  metadata?: ScrapeMetadata;
+  error?: string;
+  error_code?: string;
 }
 
 export interface SerperScrapeResponse {
