@@ -16,6 +16,7 @@ import { createSearchAPI, createSourceProcessor } from './search';
 import { createSerperScraper } from './serper-scraper';
 import { createTavilyScraper } from './tavily-scraper';
 import { createFirecrawlScraper } from './firecrawl';
+import { createCrwScraper } from './crw-scraper';
 import { expandHighlights } from './highlights';
 import { formatResultsForLLM } from './format';
 import { createDefaultLogger } from './utils';
@@ -329,8 +330,8 @@ function createTool({
 /**
  * Creates a search tool with configurable search and scraper providers.
  *
- * Search providers: Serper (Google results), SearXNG (self-hosted meta-search), Tavily (AI-optimized).
- * Scraper providers: Firecrawl (default, full-featured), Serper (lightweight), Tavily (batch extraction).
+ * Search providers: Serper (Google results), SearXNG (self-hosted meta-search), Tavily (AI-optimized), fastCRW (Firecrawl-compatible, self-host or cloud).
+ * Scraper providers: Firecrawl (default, full-featured), Serper (lightweight), Tavily (batch extraction), fastCRW (Firecrawl-compatible, self-host or cloud).
  *
  * The country schema field is exposed to the LLM for providers that support localized results.
  */
@@ -369,6 +370,10 @@ export const createSearchTool = (
     firecrawlOptions,
     serperScraperOptions,
     tavilyScraperOptions,
+    crwApiKey,
+    crwApiUrl,
+    crwSearchOptions,
+    crwScraperOptions,
     scraperTimeout,
     jinaApiKey,
     jinaApiUrl,
@@ -412,6 +417,9 @@ export const createSearchTool = (
     tavilyApiKey,
     tavilySearchUrl,
     tavilySearchOptions: effectiveTavilySearchOptions,
+    crwApiKey,
+    crwApiUrl,
+    crwSearchOptions,
   });
 
   /** Create scraper based on scraperProvider */
@@ -433,6 +441,16 @@ export const createSearchTool = (
         process.env.TAVILY_API_KEY,
       apiUrl: tavilyScraperOptions?.apiUrl ?? tavilyExtractUrl,
       timeout: scraperTimeout ?? tavilyScraperOptions?.timeout,
+      logger,
+    });
+  } else if (scraperProvider === 'crw') {
+    scraperInstance = createCrwScraper({
+      ...crwScraperOptions,
+      apiKey:
+        crwScraperOptions?.apiKey ?? crwApiKey ?? process.env.CRW_API_KEY,
+      apiUrl: crwScraperOptions?.apiUrl ?? crwApiUrl,
+      timeout: scraperTimeout ?? crwScraperOptions?.timeout,
+      formats: crwScraperOptions?.formats ?? ['markdown', 'rawHtml'],
       logger,
     });
   } else {
@@ -474,7 +492,7 @@ export const createSearchTool = (
   const search = createSearchProcessor({
     searchAPI,
     safeSearch,
-    supportsVideos: searchProvider !== 'tavily',
+    supportsVideos: searchProvider !== 'tavily' && searchProvider !== 'crw',
     sourceProcessor,
     onGetHighlights,
     logger,
