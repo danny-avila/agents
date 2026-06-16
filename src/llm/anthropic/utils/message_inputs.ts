@@ -429,6 +429,14 @@ function _formatContent(message: BaseMessage) {
     'web_search_result',
   ];
   const textTypes = ['text', 'text_delta'];
+  /**
+   * Reasoning blocks emitted by other providers — Bedrock's `reasoning_content`,
+   * Google's `reasoning`, and LibreChat's `think`. Their signatures are
+   * provider-specific and cannot be validated by Anthropic, so on a
+   * cross-provider handoff (e.g. Bedrock → Anthropic) we drop them rather than
+   * forwarding an unusable block. The receiving model produces its own thinking.
+   */
+  const foreignReasoningTypes = ['reasoning_content', 'reasoning', 'think'];
   const { content } = message;
 
   if (typeof content === 'string') {
@@ -651,7 +659,9 @@ function _formatContent(message: BaseMessage) {
           (contentPartCopy.input === '' || contentPartCopy.input == null)
         ) {
           const matchingToolCall = isAIMessage(message)
-            ? message.tool_calls?.find((toolCall) => toolCall.id === contentPartCopy.id)
+            ? message.tool_calls?.find(
+              (toolCall) => toolCall.id === contentPartCopy.id
+            )
             : undefined;
           if (matchingToolCall) {
             contentPartCopy.input = matchingToolCall.args;
@@ -666,7 +676,10 @@ function _formatContent(message: BaseMessage) {
                   typeof p.input === 'string'
                 );
               })
-              .reduce((acc, part) => acc + (part as Record<string, unknown>).input, '');
+              .reduce(
+                (acc, part) => acc + (part as Record<string, unknown>).input,
+                ''
+              );
             if (merged !== '') {
               contentPartCopy.input = merged;
             }
@@ -720,12 +733,17 @@ function _formatContent(message: BaseMessage) {
           name: correspondingToolCall.name,
           input: functionCallPart.functionCall.args,
         };
+      } else if (foreignReasoningTypes.some((t) => t === contentPart.type)) {
+        return null;
       } else {
+        // Unknown block type: log for diagnostics but degrade gracefully by
+        // dropping it instead of throwing, so a single unrecognized block can
+        // never crash an entire run (e.g. a cross-provider handoff).
         console.error(
-          'Unsupported content part:',
+          'Dropping unsupported content part:',
           JSON.stringify(contentPart, null, 2)
         );
-        throw new Error('Unsupported message content format');
+        return null;
       }
     });
     const filteredContentBlocks = contentBlocks.filter(
