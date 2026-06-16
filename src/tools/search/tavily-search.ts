@@ -1,5 +1,6 @@
 import axios from 'axios';
 import type * as t from './types';
+import { getHostname } from './utils';
 
 const DEFAULT_TAVILY_TIMEOUT = 15000;
 
@@ -243,14 +244,6 @@ const normalizeTavilyTimeRange = (
     return timeRange;
   default:
     return undefined;
-  }
-};
-
-const getHostname = (link: string): string => {
-  try {
-    return new URL(link).hostname;
-  } catch {
-    return link;
   }
 };
 

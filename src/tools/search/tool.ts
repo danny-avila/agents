@@ -339,7 +339,7 @@ function createTool({
 /**
  * Creates a search tool with configurable search and scraper providers.
  *
- * Search providers: Serper (Google results), SearXNG (self-hosted meta-search), Tavily (AI-optimized).
+ * Search providers: Serper (Google results), SearXNG (self-hosted meta-search), Tavily (AI-optimized), Brave (independent index).
  * Scraper providers: Firecrawl (default, full-featured), Serper (lightweight), Tavily (batch extraction).
  *
  * The country schema field is exposed to the LLM for providers that support localized results.
@@ -369,6 +369,9 @@ export const createSearchTool = (
     keenableApiKey,
     keenableApiUrl,
     keenableSearchOptions,
+    braveApiKey,
+    braveApiUrl,
+    braveSearchOptions,
     rerankerType = 'cohere',
     rerankerTimeout,
     topResults = 5,
@@ -411,7 +414,11 @@ export const createSearchTool = (
     news: newsSchema,
   };
 
-  if (searchProvider === 'serper' || searchProvider === 'tavily') {
+  if (
+    searchProvider === 'serper' ||
+    searchProvider === 'tavily' ||
+    searchProvider === 'brave'
+  ) {
     schemaProperties.country = countrySchema;
   }
 
@@ -432,6 +439,9 @@ export const createSearchTool = (
     keenableApiKey,
     keenableApiUrl,
     keenableSearchOptions,
+    braveApiKey,
+    braveApiUrl,
+    braveSearchOptions,
   });
 
   /** Create scraper based on scraperProvider */
