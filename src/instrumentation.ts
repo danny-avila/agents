@@ -97,6 +97,9 @@ function getLangfuseSpanProcessorParams(
       publicKey: langfuse.publicKey,
       secretKey: langfuse.secretKey,
       ...(isPresent(langfuse.baseUrl) ? { baseUrl: langfuse.baseUrl } : {}),
+      ...(langfuse.additionalHeaders != null
+        ? { additionalHeaders: langfuse.additionalHeaders }
+        : {}),
     };
   }
   if (hasLangfuseEnvConfig()) {

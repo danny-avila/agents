@@ -547,7 +547,14 @@ class ToolOutputRedactingLangfuseSpanProcessor implements SpanProcessor {
     params?: LangfuseSpanProcessorParams,
     fallbackConfig?: ResolvedLangfuseToolOutputTracingConfig
   ) {
-    this.processor = new LangfuseSpanProcessor(params);
+    this.processor = new LangfuseSpanProcessor(
+      params?.baseUrl != null
+        ? {
+          ...params,
+          additionalHeaders: params.additionalHeaders,
+        }
+        : params
+    );
     this.fallbackConfig = fallbackConfig;
   }
 

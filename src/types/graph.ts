@@ -536,6 +536,7 @@ export interface LangfuseConfig {
   publicKey?: string;
   secretKey?: string;
   baseUrl?: string;
+  additionalHeaders?: Record<string, string>;
   toolNodeTracing?: LangfuseToolNodeTracingConfig;
   toolOutputTracing?: LangfuseToolOutputTracingConfig;
   /**
