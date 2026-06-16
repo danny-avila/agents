@@ -2147,4 +2147,84 @@ describe('AgentContext', () => {
       expect(ctx.lastCallUsage!.inputTokens).toBe(8005);
     });
   });
+
+  describe('projectContextUsage', () => {
+    const countByChars = (msg: { content: unknown }): number => {
+      const content =
+        typeof msg.content === 'string'
+          ? msg.content
+          : JSON.stringify(msg.content);
+      return content.length;
+    };
+
+    const buildBranch = (
+      maxContextTokens: number,
+      perMessageTokens: number,
+      count: number,
+    ): { ctx: AgentContext; messages: AIMessage[] } => {
+      const ctx = createBasicContext({ tokenCounter: countByChars });
+      ctx.maxContextTokens = maxContextTokens;
+      const messages: AIMessage[] = [];
+      const indexTokenCountMap: Record<string, number> = {};
+      for (let i = 0; i < count; i++) {
+        messages.push(
+          i % 2 === 0
+            ? (new HumanMessage(`m${i}`) as unknown as AIMessage)
+            : new AIMessage(`m${i}`),
+        );
+        indexTokenCountMap[String(i)] = perMessageTokens;
+      }
+      ctx.indexTokenCountMap = indexTokenCountMap;
+      return { ctx, messages };
+    };
+
+    it('returns null without a tokenizer or a window', () => {
+      const noCounter = createBasicContext({});
+      noCounter.maxContextTokens = 1000;
+      expect(noCounter.projectContextUsage([new HumanMessage('hi')])).toBeNull();
+
+      const noWindow = createBasicContext({ tokenCounter: countByChars });
+      noWindow.maxContextTokens = undefined;
+      expect(noWindow.projectContextUsage([new HumanMessage('hi')])).toBeNull();
+    });
+
+    it('keeps the whole branch and reports headroom when it fits', () => {
+      const { ctx, messages } = buildBranch(100_000, 1_000, 4);
+      const usage = ctx.projectContextUsage(messages);
+
+      expect(usage).not.toBeNull();
+      expect(usage!.breakdown.messageCount).toBe(4);
+      expect(usage!.breakdown.maxContextTokens).toBe(100_000);
+      expect(usage!.remainingContextTokens).toBeGreaterThan(0);
+      expect(usage!.breakdown.messageTokens).toBeGreaterThan(0);
+
+      const max = usage!.contextBudget ?? usage!.breakdown.maxContextTokens;
+      const used = max - (usage!.remainingContextTokens ?? 0);
+      expect(used).toBeLessThanOrEqual(max);
+    });
+
+    it('prunes older messages when the branch exceeds the window', () => {
+      const { ctx, messages } = buildBranch(3_000, 1_000, 6);
+      const usage = ctx.projectContextUsage(messages);
+
+      expect(usage).not.toBeNull();
+      expect(usage!.breakdown.messageCount).toBeGreaterThan(0);
+      expect(usage!.breakdown.messageCount).toBeLessThan(6);
+      expect(usage!.remainingContextTokens).toBeGreaterThanOrEqual(0);
+
+      const max = usage!.contextBudget ?? usage!.breakdown.maxContextTokens;
+      expect(max - (usage!.remainingContextTokens ?? 0)).toBeLessThanOrEqual(max);
+    });
+
+    it('does not mutate the context (local pruner, no field writes)', () => {
+      const { ctx, messages } = buildBranch(3_000, 1_000, 6);
+      const mapBefore = { ...ctx.indexTokenCountMap };
+
+      expect(ctx.pruneMessages).toBeUndefined();
+      ctx.projectContextUsage(messages);
+
+      expect(ctx.pruneMessages).toBeUndefined();
+      expect(ctx.indexTokenCountMap).toEqual(mapBefore);
+    });
+  });
 });
