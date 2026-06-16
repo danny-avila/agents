@@ -1770,9 +1770,48 @@ function appendToolCalls(
  *   compatibility for callers that don't yet pass the boundary.
  * @returns The messages array with tool sequences converted to buffer strings if necessary
  */
+/**
+ * Whether a content block is a thinking/reasoning block the target provider
+ * will actually keep (and that therefore satisfies the "a tool_use turn must
+ * begin with a thinking block" invariant). Foreign reasoning that the provider
+ * converter drops on a cross-provider handoff does NOT count — otherwise the
+ * pre-pass leaves such a turn as an assistant message, the converter then drops
+ * the reasoning, and the result is a tool_use turn with no thinking block. Must
+ * stay in sync with the converters' reasoning handling.
+ */
+function isNativeThinkingBlock(
+  block: ExtendedMessageContent,
+  provider: Providers
+): boolean {
+  if (typeof block !== 'object' || block.type == null) {
+    return false;
+  }
+  if (provider === Providers.BEDROCK) {
+    return block.type === ContentTypes.REASONING_CONTENT;
+  }
+  if (provider === Providers.ANTHROPIC) {
+    if (block.type === 'redacted_thinking') {
+      return true;
+    }
+    if (block.type === ContentTypes.THINKING) {
+      const signature = (block as { signature?: string }).signature;
+      return signature != null && signature !== '';
+    }
+    return false;
+  }
+  // Other providers don't enforce the thinking-before-tool-use invariant;
+  // preserve the prior broad behavior.
+  return (
+    block.type === ContentTypes.THINKING ||
+    block.type === ContentTypes.REASONING_CONTENT ||
+    block.type === ContentTypes.REASONING ||
+    block.type === 'redacted_thinking'
+  );
+}
+
 export function ensureThinkingBlockInMessages(
   messages: BaseMessage[],
-  _provider: Providers,
+  provider: Providers,
   config?: RunnableConfig,
   runStartIndex?: number
 ): BaseMessage[] {
@@ -1832,12 +1871,7 @@ export function ensureThinkingBlockInMessages(
         }
         if (c.type === 'tool_use') {
           hasToolUse = true;
-        } else if (
-          c.type === ContentTypes.THINKING ||
-          c.type === ContentTypes.REASONING_CONTENT ||
-          c.type === ContentTypes.REASONING ||
-          c.type === 'redacted_thinking'
-        ) {
+        } else if (isNativeThinkingBlock(c, provider)) {
           hasThinkingBlock = true;
         }
         if (hasToolUse && hasThinkingBlock) {
@@ -1846,9 +1880,13 @@ export function ensureThinkingBlockInMessages(
       }
     }
 
-    // Bedrock also stores reasoning in additional_kwargs (may not be in content array)
+    // Bedrock also stores reasoning in additional_kwargs (may not be in content
+    // array). Only counts for a Bedrock target — for Anthropic the converter
+    // reads content blocks, not additional_kwargs, so it would not satisfy the
+    // invariant.
     if (
       !hasThinkingBlock &&
+      provider === Providers.BEDROCK &&
       aiMsg.additional_kwargs.reasoning_content != null
     ) {
       hasThinkingBlock = true;
@@ -1881,7 +1919,7 @@ export function ensureThinkingBlockInMessages(
       // Walk backwards — if an earlier AI message in the same chain (before
       // the nearest HumanMessage) has a thinking/reasoning block, this is a
       // continuation of a thinking-enabled turn, not a non-thinking handoff.
-      if (chainHasThinkingBlock(messages, i)) {
+      if (chainHasThinkingBlock(messages, i, provider)) {
         result.push(msg);
         i++;
         continue;
@@ -1939,7 +1977,8 @@ export function ensureThinkingBlockInMessages(
  */
 function chainHasThinkingBlock(
   messages: BaseMessage[],
-  currentIndex: number
+  currentIndex: number,
+  provider: Providers
 ): boolean {
   for (let k = currentIndex - 1; k >= 0; k--) {
     const prev = messages[k];
@@ -1963,22 +2002,16 @@ function chainHasThinkingBlock(
 
       if (Array.isArray(prevAiMsg.content) && prevAiMsg.content.length > 0) {
         const content = prevAiMsg.content as ExtendedMessageContent[];
-        if (
-          content.some(
-            (c) =>
-              typeof c === 'object' &&
-              (c.type === ContentTypes.THINKING ||
-                c.type === ContentTypes.REASONING_CONTENT ||
-                c.type === ContentTypes.REASONING ||
-                c.type === 'redacted_thinking')
-          )
-        ) {
+        if (content.some((c) => isNativeThinkingBlock(c, provider))) {
           return true;
         }
       }
 
-      // Bedrock also stores reasoning in additional_kwargs
-      if (prevAiMsg.additional_kwargs.reasoning_content != null) {
+      // Bedrock also stores reasoning in additional_kwargs (Bedrock target only)
+      if (
+        provider === Providers.BEDROCK &&
+        prevAiMsg.additional_kwargs.reasoning_content != null
+      ) {
         return true;
       }
     }

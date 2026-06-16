@@ -1376,4 +1376,119 @@ describe('ensureThinkingBlockInMessages', () => {
       );
     });
   });
+
+  describe('cross-provider reasoning does not satisfy the thinking invariant', () => {
+    const toolCalls = [
+      {
+        id: 'call_x',
+        name: 'calculator',
+        args: { input: '2+2' },
+        type: 'tool_call' as const,
+      },
+    ];
+
+    test('Bedrock reasoning_content + tool_calls is converted for an Anthropic target', () => {
+      const messages = [
+        new HumanMessage({ content: 'Calculate something' }),
+        new AIMessage({
+          content: [
+            {
+              type: ContentTypes.REASONING_CONTENT,
+              reasoningText: { text: 'thinking', signature: 'bedrock-sig' },
+            },
+          ],
+          tool_calls: toolCalls,
+        }),
+        new ToolMessage({ content: '4', tool_call_id: 'call_x' }),
+      ];
+      const result = ensureThinkingBlockInMessages(
+        messages,
+        Providers.ANTHROPIC
+      );
+      expect(result[1]).toBeInstanceOf(HumanMessage);
+      expect(getTextContent(result[1])).toContain('[Previous agent context]');
+    });
+
+    test('Bedrock reasoning_content + tool_calls is preserved for a Bedrock target', () => {
+      const messages = [
+        new HumanMessage({ content: 'Calculate something' }),
+        new AIMessage({
+          content: [
+            {
+              type: ContentTypes.REASONING_CONTENT,
+              reasoningText: { text: 'thinking', signature: 'bedrock-sig' },
+            },
+          ],
+          tool_calls: toolCalls,
+        }),
+        new ToolMessage({ content: '4', tool_call_id: 'call_x' }),
+      ];
+      const result = ensureThinkingBlockInMessages(messages, Providers.BEDROCK);
+      expect(result[1]).toBeInstanceOf(AIMessage);
+    });
+
+    test('Anthropic thinking + tool_calls is converted for a Bedrock target', () => {
+      const messages = [
+        new HumanMessage({ content: 'Calculate something' }),
+        new AIMessage({
+          content: [
+            {
+              type: ContentTypes.THINKING,
+              thinking: 'reasoning',
+              signature: 'anthropic-sig',
+            },
+          ],
+          tool_calls: toolCalls,
+        }),
+        new ToolMessage({ content: '4', tool_call_id: 'call_x' }),
+      ];
+      const result = ensureThinkingBlockInMessages(messages, Providers.BEDROCK);
+      expect(result[1]).toBeInstanceOf(HumanMessage);
+      expect(getTextContent(result[1])).toContain('[Previous agent context]');
+    });
+
+    test('Anthropic signed thinking + tool_calls is preserved for an Anthropic target', () => {
+      const messages = [
+        new HumanMessage({ content: 'go' }),
+        new AIMessage({
+          content: [
+            {
+              type: ContentTypes.THINKING,
+              thinking: 'reasoning',
+              signature: 'anthropic-sig',
+            },
+          ],
+          tool_calls: toolCalls,
+        }),
+        new ToolMessage({ content: '4', tool_call_id: 'call_x' }),
+      ];
+      const result = ensureThinkingBlockInMessages(
+        messages,
+        Providers.ANTHROPIC
+      );
+      expect(result[1]).toBeInstanceOf(AIMessage);
+    });
+
+    test('unsigned thinking + tool_calls is converted for an Anthropic target', () => {
+      const messages = [
+        new HumanMessage({ content: 'Calculate something' }),
+        new AIMessage({
+          content: [
+            {
+              type: ContentTypes.THINKING,
+              thinking: 'google reasoning, no signature',
+            },
+          ],
+          tool_calls: toolCalls,
+        }),
+        new ToolMessage({ content: '4', tool_call_id: 'call_x' }),
+      ];
+      const result = ensureThinkingBlockInMessages(
+        messages,
+        Providers.ANTHROPIC
+      );
+      expect(result[1]).toBeInstanceOf(HumanMessage);
+      expect(getTextContent(result[1])).toContain('[Previous agent context]');
+    });
+  });
 });
