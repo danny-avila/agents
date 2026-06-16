@@ -734,19 +734,14 @@ function _formatContent(message: BaseMessage) {
           input: functionCallPart.functionCall.args,
         };
       } else if (foreignReasoningTypes.some((t) => t === contentPart.type)) {
-        return null;
-      } else if (isAIMessage(message)) {
-        // Assistant turns can carry provider-specific artifacts (e.g. a new
-        // reasoning variant) that Anthropic cannot consume. Drop them rather
-        // than crash a cross-provider handoff mid-run.
-        console.error(
-          'Dropping unsupported assistant content part:',
-          JSON.stringify(contentPart, null, 2)
-        );
+        // Foreign reasoning (Bedrock `reasoning_content`, Google `reasoning`,
+        // LibreChat `think`) carries provider-specific signatures Anthropic
+        // cannot validate; drop it so a cross-provider handoff doesn't crash.
+        // Anything else unknown still throws below rather than being silently
+        // dropped — real content (user media, Google code-execution blocks)
+        // must be surfaced, not discarded.
         return null;
       } else {
-        // User/tool content is real input — surface it rather than silently
-        // omit it (e.g. unsupported media on a user prompt).
         console.error(
           'Unsupported content part:',
           JSON.stringify(contentPart, null, 2)
@@ -834,22 +829,28 @@ export function _convertMessagesToAnthropicPayload(
           };
         }
       } else {
-        const { content } = message;
+        const formattedContent = _formatContent(message);
+        const formattedBlocks = Array.isArray(formattedContent)
+          ? formattedContent
+          : [];
+        // Tool calls already materialized as content blocks by `_formatContent`.
+        // Derived from the FORMATTED output (not the raw content by type) so
+        // that Google `functionCall` parts — which `_formatContent` converts
+        // into `tool_use` — count as represented and are not appended twice.
         const representedToolIds = new Set(
-          content
+          formattedBlocks
             .filter(
-              (contentPart) =>
-                contentPart.type === 'tool_use' ||
-                contentPart.type === 'input_json_delta' ||
-                contentPart.type === 'server_tool_use'
+              (block) =>
+                block != null &&
+                (block.type === 'tool_use' || block.type === 'server_tool_use')
             )
-            .map((contentPart) => contentPart.id)
+            .map((block) => (block as { id?: string }).id)
         );
-        // Client tool calls present in `tool_calls` but missing from `content`
-        // — e.g. a Bedrock extended-thinking turn records the tool only in
-        // `tool_calls` and leaves it out of `content`. Without materializing
-        // them, dropping the sibling reasoning block silently loses the
-        // (handoff) tool call instead of forwarding it to Anthropic.
+        // Client tool calls present in `tool_calls` but absent from the
+        // formatted content — e.g. a Bedrock extended-thinking turn records the
+        // tool only on `tool_calls` and leaves `content` as just the reasoning
+        // block. Without materializing them, dropping that reasoning block
+        // silently loses the (handoff) tool call instead of forwarding it.
         const unrepresentedToolCalls = toolCalls.filter(
           (toolCall) =>
             !(
@@ -857,13 +858,10 @@ export function _convertMessagesToAnthropicPayload(
               false
             ) && !representedToolIds.has(toolCall.id)
         );
-        const formattedContent = _formatContent(message);
         if (unrepresentedToolCalls.length === 0) {
           return { role, content: formattedContent };
         }
-        const existingBlocks = (
-          Array.isArray(formattedContent) ? formattedContent : []
-        ).filter(
+        const existingBlocks = formattedBlocks.filter(
           (block) =>
             !(
               block != null &&

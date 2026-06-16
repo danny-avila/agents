@@ -126,30 +126,27 @@ describe('_convertMessagesToAnthropicPayload — cross-provider reasoning blocks
     );
   });
 
-  it('on an assistant turn, drops a genuinely unknown block instead of throwing', () => {
+  it('throws (not silently drops) on an unknown assistant block such as Google code execution', () => {
+    // executableCode/codeExecutionResult carry real visible content; silently
+    // dropping them on a Google → Anthropic handoff would lose evidence.
     const history: BaseMessage[] = [
-      new HumanMessage('hi'),
+      new HumanMessage('run some code'),
       new AIMessage({
         content: [
-          { type: 'some_future_block_type', foo: 'bar' } as any,
-          { type: 'text', text: 'Still here.' },
+          {
+            type: 'executableCode',
+            executableCode: { language: 'PYTHON', code: 'print(2+2)' },
+          } as any,
+          { type: 'text', text: 'Here is the result.' },
         ],
       }),
     ];
-    expect(() => _convertMessagesToAnthropicPayload(history)).not.toThrow();
-    const assistant = _convertMessagesToAnthropicPayload(history).messages.find(
-      (m: any) => m.role === 'assistant'
+    expect(() => _convertMessagesToAnthropicPayload(history)).toThrow(
+      'Unsupported message content format'
     );
-    const blocks = assistant!.content as any[];
-    expect(
-      blocks.find((b) => b.type === 'some_future_block_type')
-    ).toBeUndefined();
-    expect(
-      blocks.some((b) => b.type === 'text' && b.text === 'Still here.')
-    ).toBe(true);
   });
 
-  it('on a user turn, throws on an unsupported block rather than silently dropping it', () => {
+  it('throws (not silently drops) on an unsupported user block such as media', () => {
     const history: BaseMessage[] = [
       new HumanMessage({
         content: [
@@ -203,6 +200,39 @@ describe('_convertMessagesToAnthropicPayload — cross-provider reasoning blocks
     });
     // The `_` placeholder must not linger once a real tool_use block is present.
     expect(blocks.some((b) => b.type === 'text' && b.text === '_')).toBe(false);
+  });
+
+  it('does not duplicate a Google functionCall tool call already materialized by _formatContent', () => {
+    // _formatContent converts the `functionCall` part into a tool_use; the
+    // materialization must recognize it as represented and not append a second.
+    const history: BaseMessage[] = [
+      new HumanMessage('weather in SF?'),
+      new AIMessage({
+        content: [
+          {
+            functionCall: { name: 'get_weather', args: { city: 'SF' } },
+          } as any,
+        ],
+        tool_calls: [
+          {
+            id: 'call_weather_1',
+            name: 'get_weather',
+            args: { city: 'SF' },
+            type: 'tool_call',
+          },
+        ],
+      }),
+    ];
+    const payload = _convertMessagesToAnthropicPayload(history);
+    const assistant = payload.messages.find((m: any) => m.role === 'assistant');
+    const blocks = assistant!.content as any[];
+    const toolUses = blocks.filter((b) => b.type === 'tool_use');
+    expect(toolUses).toHaveLength(1);
+    expect(toolUses[0]).toMatchObject({
+      type: 'tool_use',
+      id: 'call_weather_1',
+      name: 'get_weather',
+    });
   });
 
   it('falls back to placeholder text when reasoning was the only content', () => {
