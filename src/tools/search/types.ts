@@ -218,6 +218,13 @@ export interface SearchToolConfig
     ProcessSourcesConfig,
     FirecrawlConfig {
   tavilyScraperOptions?: TavilyScraperConfig;
+  /** Max chars of highlight content this tool feeds the MODEL per search (the
+   * dominant, otherwise-unbounded part of the output). Distinct from
+   * `maxContentLength`, which caps scraped/reranked content per source — full
+   * content always remains in the `WEB_SEARCH` artifact. Defaults to 50,000;
+   * also configurable via the `SEARCH_MAX_LLM_OUTPUT_CHARS` env var. Hosts that
+   * know the context window (e.g. LibreChat) pass a window-relative value. */
+  maxOutputChars?: number;
   logger?: Logger;
   safeSearch?: SafeSearchLevel;
   jinaApiKey?: string;

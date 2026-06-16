@@ -1,6 +1,113 @@
 import type * as t from './types';
 import { getDomainName, fileExtRegex } from './utils';
 
+/** Default per-search budget for model-facing highlight content (chars). Hosts
+ *  that know the context window (e.g. LibreChat) pass a window-relative value;
+ *  this fixed fallback keeps standalone consumers bounded instead of dumping the
+ *  full reranked content of every source into the prompt. */
+const DEFAULT_MAX_LLM_OUTPUT_CHARS = 50000;
+
+/** Minimum room (chars) worth filling with a truncated boundary highlight; below
+ *  this we drop it whole rather than emit a useless sliver. */
+const MIN_PARTIAL_HIGHLIGHT_CHARS = 200;
+
+/** Resolves the per-search highlight budget from config, the
+ *  `SEARCH_MAX_LLM_OUTPUT_CHARS` env var, or the default (50,000 chars). */
+export function resolveMaxLLMOutputChars(maxOutputChars?: number): number {
+  if (maxOutputChars != null && maxOutputChars > 0) {
+    return maxOutputChars;
+  }
+  const envValue = Number(process.env.SEARCH_MAX_LLM_OUTPUT_CHARS);
+  if (Number.isFinite(envValue) && envValue > 0) {
+    return envValue;
+  }
+  return DEFAULT_MAX_LLM_OUTPUT_CHARS;
+}
+
+/** Inline citation markers embedded in highlight text, e.g. `(link#2 "Title")`.
+ *  Mirrors the matcher in `highlights.ts` so truncation can tell which citations
+ *  survive in a sliced prefix. */
+const REFERENCE_MARKER_REGEX = /\((link|image|video)#(\d+)(?:\s+"[^"]*")?\)/g;
+
+/** Builds the set of `type#originalIndex` keys whose complete citation marker
+ *  appears in `text`, so references can be filtered to those still visible. */
+function visibleReferenceKeys(text: string): Set<string> {
+  const keys = new Set<string>();
+  if (!text.includes('#')) {
+    return keys;
+  }
+  const regex = new RegExp(REFERENCE_MARKER_REGEX);
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(text)) !== null) {
+    keys.add(`${match[1]}#${parseInt(match[2], 10) - 1}`);
+  }
+  return keys;
+}
+
+/** Truncates a highlight to `maxLen` chars of (already-trimmed) text, keeping
+ *  only the references whose markers survive in the kept prefix — markers in the
+ *  cut tail would otherwise emit Core References for citations the model can no
+ *  longer see, while a blanket drop would lose still-visible ones. */
+function truncateHighlight(highlight: t.Highlight, text: string, maxLen: number): t.Highlight {
+  const prefix = text.slice(0, maxLen);
+  const truncated: t.Highlight = { score: highlight.score, text: `${prefix}\n…[truncated]` };
+  if (highlight.references != null && highlight.references.length > 0) {
+    const keys = visibleReferenceKeys(prefix);
+    const visible = highlight.references.filter((ref) => keys.has(`${ref.type}#${ref.originalIndex}`));
+    if (visible.length > 0) {
+      truncated.references = visible;
+    }
+  }
+  return truncated;
+}
+
+/** Bounds the highlight chunks — the dominant, unbounded part of search output —
+ *  to `maxChars`, walking sources in relevance order (organic first, then news;
+ *  highlights in their reranked order). Whole highlights are kept until the
+ *  budget is hit, the boundary one is truncated if meaningful room remains, and
+ *  every later highlight is dropped (relevance-ordered prefix). Blank highlights
+ *  are skipped (never rendered, so never charged); a truncated highlight keeps
+ *  only references whose markers survive in the kept prefix. Snippets/titles/URLs
+ *  are left untouched (small, high-signal) and per-source `content` stays in the
+ *  `WEB_SEARCH` artifact for citations. Mutates `results` in place; returns how
+ *  many highlights were dropped or truncated (0 when everything fit). */
+function trimHighlightsToBudget(results: t.SearchResultData, maxChars: number): number {
+  let used = 0;
+  let trimmed = 0;
+  const sections: (t.ValidSource[] | undefined)[] = [results.organic, results.topStories];
+  for (const sources of sections) {
+    if (sources == null) {
+      continue;
+    }
+    for (const source of sources) {
+      const highlights = source.highlights;
+      if (highlights == null || highlights.length === 0) {
+        continue;
+      }
+      const kept: t.Highlight[] = [];
+      for (const highlight of highlights) {
+        const text = highlight.text.trim();
+        if (text.length === 0) {
+          continue;
+        }
+        if (used + text.length <= maxChars) {
+          kept.push(highlight);
+          used += text.length;
+          continue;
+        }
+        const remaining = maxChars - used;
+        if (remaining >= MIN_PARTIAL_HIGHLIGHT_CHARS) {
+          kept.push(truncateHighlight(highlight, text, remaining));
+        }
+        used = maxChars;
+        trimmed++;
+      }
+      source.highlights = kept;
+    }
+  }
+  return trimmed;
+}
+
 function addHighlightSection(): string[] {
   return ['\n## Highlights', ''];
 }
@@ -112,8 +219,15 @@ function formatSource(
 
 export function formatResultsForLLM(
   turn: number,
-  results: t.SearchResultData
+  results: t.SearchResultData,
+  maxOutputChars?: number
 ): { output: string; references: t.ResultReference[] } {
+  /** Bound highlight content to the per-search budget before formatting */
+  const trimmedHighlights = trimHighlightsToBudget(
+    results,
+    resolveMaxLLMOutputChars(maxOutputChars)
+  );
+
   /** Array to collect all output lines */
   const outputLines: string[] = [];
 
@@ -243,8 +357,11 @@ export function formatResultsForLLM(
     outputLines.push(paaLines.join(''));
   }
 
-  return {
-    output: outputLines.join('\n').trim(),
-    references,
-  };
+  let output = outputLines.join('\n').trim();
+  if (trimmedHighlights > 0) {
+    output += `\n\n_[${trimmedHighlights} additional highlight${
+      trimmedHighlights === 1 ? '' : 's'
+    } omitted to fit the context budget; the cited sources contain the full content.]_`;
+  }
+  return { output, references };
 }
