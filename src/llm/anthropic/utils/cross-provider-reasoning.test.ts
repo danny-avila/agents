@@ -9,9 +9,10 @@ import { _convertMessagesToAnthropicPayload } from './message_inputs';
  * block ({ reasoningText: { text, signature } }) in the history. The official
  * Anthropic converter has no branch for it and previously threw
  * "Unsupported message content format", crashing the handoff. Foreign reasoning
- * (Bedrock `reasoning_content`, Google `reasoning`, LibreChat `think`) must be
- * dropped, and any other unknown block must degrade gracefully instead of
- * throwing.
+ * (Bedrock `reasoning_content`, Google `reasoning`, LibreChat `think`) is
+ * dropped; an unknown block degrades gracefully on assistant turns but still
+ * throws on user/tool input (real content must not be silently omitted); and a
+ * tool call carried only on `tool_calls` survives dropping its reasoning sibling.
  */
 describe('_convertMessagesToAnthropicPayload — cross-provider reasoning blocks', () => {
   const bedrockHandoffHistory = (): BaseMessage[] => [
@@ -125,7 +126,7 @@ describe('_convertMessagesToAnthropicPayload — cross-provider reasoning blocks
     );
   });
 
-  it('degrades gracefully (drops, does not throw) on a genuinely unknown block type', () => {
+  it('on an assistant turn, drops a genuinely unknown block instead of throwing', () => {
     const history: BaseMessage[] = [
       new HumanMessage('hi'),
       new AIMessage({
@@ -146,6 +147,62 @@ describe('_convertMessagesToAnthropicPayload — cross-provider reasoning blocks
     expect(
       blocks.some((b) => b.type === 'text' && b.text === 'Still here.')
     ).toBe(true);
+  });
+
+  it('on a user turn, throws on an unsupported block rather than silently dropping it', () => {
+    const history: BaseMessage[] = [
+      new HumanMessage({
+        content: [
+          {
+            type: 'video_url',
+            video_url: { url: 'https://example.com/v.mp4' },
+          } as any,
+          { type: 'text', text: 'what is in this video?' },
+        ],
+      }),
+    ];
+    expect(() => _convertMessagesToAnthropicPayload(history)).toThrow(
+      'Unsupported message content format'
+    );
+  });
+
+  it('preserves a tool call carried only on tool_calls when its reasoning sibling is dropped', () => {
+    // Mirrors a Bedrock extended-thinking turn: the tool lives only on
+    // `tool_calls`; `content` holds just the reasoning block (no tool_use).
+    const history: BaseMessage[] = [
+      new HumanMessage('research Assort Health'),
+      new AIMessage({
+        content: [
+          {
+            type: 'reasoning_content',
+            reasoningText: { text: 'I should hand off now.', signature: 'sig' },
+          } as any,
+        ],
+        tool_calls: [
+          {
+            id: 'tooluse_transfer',
+            name: 'lc_transfer_to_data_agent',
+            args: { reason: 'need consumption data' },
+            type: 'tool_call',
+          },
+        ],
+      }),
+    ];
+    expect(() => _convertMessagesToAnthropicPayload(history)).not.toThrow();
+    const assistant = _convertMessagesToAnthropicPayload(history).messages.find(
+      (m: any) => m.role === 'assistant'
+    );
+    const blocks = assistant!.content as any[];
+    expect(blocks.find((b) => b.type === 'reasoning_content')).toBeUndefined();
+    const toolUse = blocks.find((b) => b.type === 'tool_use');
+    expect(toolUse).toMatchObject({
+      type: 'tool_use',
+      id: 'tooluse_transfer',
+      name: 'lc_transfer_to_data_agent',
+      input: { reason: 'need consumption data' },
+    });
+    // The `_` placeholder must not linger once a real tool_use block is present.
+    expect(blocks.some((b) => b.type === 'text' && b.text === '_')).toBe(false);
   });
 
   it('falls back to placeholder text when reasoning was the only content', () => {

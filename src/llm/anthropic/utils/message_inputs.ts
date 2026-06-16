@@ -735,15 +735,23 @@ function _formatContent(message: BaseMessage) {
         };
       } else if (foreignReasoningTypes.some((t) => t === contentPart.type)) {
         return null;
-      } else {
-        // Unknown block type: log for diagnostics but degrade gracefully by
-        // dropping it instead of throwing, so a single unrecognized block can
-        // never crash an entire run (e.g. a cross-provider handoff).
+      } else if (isAIMessage(message)) {
+        // Assistant turns can carry provider-specific artifacts (e.g. a new
+        // reasoning variant) that Anthropic cannot consume. Drop them rather
+        // than crash a cross-provider handoff mid-run.
         console.error(
-          'Dropping unsupported content part:',
+          'Dropping unsupported assistant content part:',
           JSON.stringify(contentPart, null, 2)
         );
         return null;
+      } else {
+        // User/tool content is real input — surface it rather than silently
+        // omit it (e.g. unsupported media on a user prompt).
+        console.error(
+          'Unsupported content part:',
+          JSON.stringify(contentPart, null, 2)
+        );
+        throw new Error('Unsupported message content format');
       }
     });
     const filteredContentBlocks = contentBlocks.filter(
@@ -827,24 +835,49 @@ export function _convertMessagesToAnthropicPayload(
         }
       } else {
         const { content } = message;
-        const hasMismatchedToolCalls = !toolCalls.every(
-          (toolCall) =>
-            !!content.find(
+        const representedToolIds = new Set(
+          content
+            .filter(
               (contentPart) =>
-                (contentPart.type === 'tool_use' ||
-                  contentPart.type === 'input_json_delta' ||
-                  contentPart.type === 'server_tool_use') &&
-                contentPart.id === toolCall.id
+                contentPart.type === 'tool_use' ||
+                contentPart.type === 'input_json_delta' ||
+                contentPart.type === 'server_tool_use'
+            )
+            .map((contentPart) => contentPart.id)
+        );
+        // Client tool calls present in `tool_calls` but missing from `content`
+        // — e.g. a Bedrock extended-thinking turn records the tool only in
+        // `tool_calls` and leaves it out of `content`. Without materializing
+        // them, dropping the sibling reasoning block silently loses the
+        // (handoff) tool call instead of forwarding it to Anthropic.
+        const unrepresentedToolCalls = toolCalls.filter(
+          (toolCall) =>
+            !(
+              toolCall.id?.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX) ??
+              false
+            ) && !representedToolIds.has(toolCall.id)
+        );
+        const formattedContent = _formatContent(message);
+        if (unrepresentedToolCalls.length === 0) {
+          return { role, content: formattedContent };
+        }
+        const existingBlocks = (
+          Array.isArray(formattedContent) ? formattedContent : []
+        ).filter(
+          (block) =>
+            !(
+              block != null &&
+              block.type === 'text' &&
+              'text' in block &&
+              block.text === ANTHROPIC_EMPTY_TEXT_PLACEHOLDER
             )
         );
-        if (hasMismatchedToolCalls) {
-          console.warn(
-            'The "tool_calls" field on a message is only respected if content is a string.'
-          );
-        }
         return {
           role,
-          content: _formatContent(message),
+          content: [
+            ...existingBlocks,
+            ...unrepresentedToolCalls.map(_convertLangChainToolCallToAnthropic),
+          ],
         };
       }
     } else {
