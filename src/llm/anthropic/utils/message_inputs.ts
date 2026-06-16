@@ -429,6 +429,14 @@ function _formatContent(message: BaseMessage) {
     'web_search_result',
   ];
   const textTypes = ['text', 'text_delta'];
+  /**
+   * Reasoning blocks emitted by other providers — Bedrock's `reasoning_content`,
+   * Google's `reasoning`, and LibreChat's `think`. Their signatures are
+   * provider-specific and cannot be validated by Anthropic, so on a
+   * cross-provider handoff (e.g. Bedrock → Anthropic) we drop them rather than
+   * forwarding an unusable block. The receiving model produces its own thinking.
+   */
+  const foreignReasoningTypes = ['reasoning_content', 'reasoning', 'think'];
   const { content } = message;
 
   if (typeof content === 'string') {
@@ -568,6 +576,15 @@ function _formatContent(message: BaseMessage) {
         };
       } else if (contentPart.type === 'thinking') {
         const thinkingPart = contentPart as AnthropicThinkingBlockParam;
+        // Google thinking-enabled output reuses `type: 'thinking'` but carries
+        // no Anthropic signature. Anthropic rejects an unsigned thinking block,
+        // so on an assistant turn treat it as foreign reasoning and drop it
+        // rather than forward an unusable block. Signed (Anthropic-native)
+        // thinking is forwarded as before.
+        const signature = (thinkingPart as { signature?: string }).signature;
+        if (isAIMessage(message) && (signature == null || signature === '')) {
+          return null;
+        }
         const block: AnthropicThinkingBlockParam = {
           type: 'thinking' as const, // Explicitly setting the type as "thinking"
           thinking: thinkingPart.thinking,
@@ -651,7 +668,9 @@ function _formatContent(message: BaseMessage) {
           (contentPartCopy.input === '' || contentPartCopy.input == null)
         ) {
           const matchingToolCall = isAIMessage(message)
-            ? message.tool_calls?.find((toolCall) => toolCall.id === contentPartCopy.id)
+            ? message.tool_calls?.find(
+              (toolCall) => toolCall.id === contentPartCopy.id
+            )
             : undefined;
           if (matchingToolCall) {
             contentPartCopy.input = matchingToolCall.args;
@@ -666,7 +685,10 @@ function _formatContent(message: BaseMessage) {
                   typeof p.input === 'string'
                 );
               })
-              .reduce((acc, part) => acc + (part as Record<string, unknown>).input, '');
+              .reduce(
+                (acc, part) => acc + (part as Record<string, unknown>).input,
+                ''
+              );
             if (merged !== '') {
               contentPartCopy.input = merged;
             }
@@ -720,6 +742,18 @@ function _formatContent(message: BaseMessage) {
           name: correspondingToolCall.name,
           input: functionCallPart.functionCall.args,
         };
+      } else if (
+        isAIMessage(message) &&
+        foreignReasoningTypes.some((t) => t === contentPart.type)
+      ) {
+        // Foreign reasoning on an ASSISTANT turn (Bedrock `reasoning_content`,
+        // Google `reasoning`, LibreChat `think`) carries provider-specific
+        // signatures Anthropic cannot validate; drop it so a cross-provider
+        // handoff doesn't crash. The same types on a user/tool turn are real
+        // input and fall through to the throw below rather than being silently
+        // dropped — as does any other unknown block (user media, Google
+        // code-execution), which must be surfaced, not discarded.
+        return null;
       } else {
         console.error(
           'Unsupported content part:',
@@ -808,25 +842,53 @@ export function _convertMessagesToAnthropicPayload(
           };
         }
       } else {
-        const { content } = message;
-        const hasMismatchedToolCalls = !toolCalls.every(
+        const formattedContent = _formatContent(message);
+        const formattedBlocks = Array.isArray(formattedContent)
+          ? formattedContent
+          : [];
+        // Tool calls already materialized as content blocks by `_formatContent`.
+        // Derived from the FORMATTED output (not the raw content by type) so
+        // that Google `functionCall` parts — which `_formatContent` converts
+        // into `tool_use` — count as represented and are not appended twice.
+        const representedToolIds = new Set(
+          formattedBlocks
+            .filter(
+              (block) =>
+                block != null &&
+                (block.type === 'tool_use' || block.type === 'server_tool_use')
+            )
+            .map((block) => (block as { id?: string }).id)
+        );
+        // Client tool calls present in `tool_calls` but absent from the
+        // formatted content — e.g. a Bedrock extended-thinking turn records the
+        // tool only on `tool_calls` and leaves `content` as just the reasoning
+        // block. Without materializing them, dropping that reasoning block
+        // silently loses the (handoff) tool call instead of forwarding it.
+        const unrepresentedToolCalls = toolCalls.filter(
           (toolCall) =>
-            !!content.find(
-              (contentPart) =>
-                (contentPart.type === 'tool_use' ||
-                  contentPart.type === 'input_json_delta' ||
-                  contentPart.type === 'server_tool_use') &&
-                contentPart.id === toolCall.id
+            !(
+              toolCall.id?.startsWith(Constants.ANTHROPIC_SERVER_TOOL_PREFIX) ??
+              false
+            ) && !representedToolIds.has(toolCall.id)
+        );
+        if (unrepresentedToolCalls.length === 0) {
+          return { role, content: formattedContent };
+        }
+        const existingBlocks = formattedBlocks.filter(
+          (block) =>
+            !(
+              block != null &&
+              block.type === 'text' &&
+              'text' in block &&
+              block.text === ANTHROPIC_EMPTY_TEXT_PLACEHOLDER
             )
         );
-        if (hasMismatchedToolCalls) {
-          console.warn(
-            'The "tool_calls" field on a message is only respected if content is a string.'
-          );
-        }
         return {
           role,
-          content: _formatContent(message),
+          content: [
+            ...existingBlocks,
+            ...unrepresentedToolCalls.map(_convertLangChainToolCallToAnthropic),
+          ],
         };
       }
     } else {

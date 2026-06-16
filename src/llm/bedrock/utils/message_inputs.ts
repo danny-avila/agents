@@ -29,6 +29,26 @@ import type {
 } from '../types';
 
 /**
+ * Reasoning blocks from other providers, relative to Bedrock. Bedrock's native
+ * reasoning format is `reasoning_content`; these carry provider-specific
+ * signatures Bedrock cannot validate, so they are dropped on a cross-provider
+ * handoff (e.g. Anthropic → Bedrock) rather than crashing the conversion.
+ */
+const FOREIGN_REASONING_TYPES = [
+  'thinking',
+  'redacted_thinking',
+  'reasoning',
+  'think',
+];
+
+/**
+ * Bedrock Converse rejects assistant messages with no content blocks. When
+ * filtering (e.g. dropping foreign reasoning) empties an assistant turn that
+ * also has no tool calls, fall back to this placeholder text.
+ */
+const BEDROCK_EMPTY_TEXT_PLACEHOLDER = '_';
+
+/**
  * Convert a LangChain reasoning block to a Bedrock reasoning block.
  */
 export function langchainReasoningBlockToBedrockReasoningBlock(
@@ -644,6 +664,15 @@ function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
             type: 'default',
           },
         } as BedrockContentBlock);
+      } else if (FOREIGN_REASONING_TYPES.some((t) => t === block.type)) {
+        // Reasoning from another provider (Anthropic `thinking`/
+        // `redacted_thinking`, Google `reasoning`, LibreChat `think`). Bedrock's
+        // native reasoning is `reasoning_content` (handled above); a foreign
+        // block carries a signature Bedrock cannot validate, so drop it on a
+        // cross-provider handoff (e.g. Anthropic → Bedrock) rather than crash.
+        // The Bedrock model produces its own reasoning. Anything else unknown
+        // still throws below — real content must be surfaced, not dropped.
+        return;
       } else {
         const blockValues = Object.fromEntries(
           Object.entries(block).filter(([key]) => key !== 'type')
@@ -670,6 +699,12 @@ function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
       ...(assistantMsg.content ?? []),
       ...toolUseBlocks,
     ] as BedrockContentBlock[];
+  }
+
+  // Bedrock rejects an assistant message with no content blocks; if filtering
+  // (e.g. dropping foreign reasoning) left it empty, emit a placeholder.
+  if (assistantMsg.content == null || assistantMsg.content.length === 0) {
+    assistantMsg.content = [{ text: BEDROCK_EMPTY_TEXT_PLACEHOLDER }];
   }
 
   return assistantMsg;
