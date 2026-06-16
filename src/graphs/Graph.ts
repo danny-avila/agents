@@ -25,6 +25,7 @@ import {
   formatContentStrings,
   isLegacyConvertible,
   createPruneMessages,
+  syncBudgetDerivedFields,
   addCacheControl,
   getMessageId,
   makeIsDeferred,
@@ -109,35 +110,6 @@ function trailingMutationStart(messages: BaseMessage[]): number {
     index--;
   }
   return Math.max(0, Math.min(index, messages.length - 2));
-}
-
-/**
- * Re-derives the breakdown fields coupled to the calibrated budget math so
- * the snapshot stays internally consistent: the aggregate
- * `instructionTokens`/`availableForMessages` reflect the pruner's effective
- * (calibrated) overhead — component fields remain local estimates — and
- * `messageTokens` mirrors `contextBudget - instructions - remaining`.
- */
-function syncBudgetDerivedFields(usage: t.ContextUsageEvent): void {
-  const { breakdown, contextBudget, effectiveInstructionTokens } = usage;
-  if (effectiveInstructionTokens == null) {
-    return;
-  }
-  breakdown.instructionTokens = effectiveInstructionTokens;
-  if (contextBudget == null) {
-    return;
-  }
-  breakdown.availableForMessages = Math.max(
-    0,
-    contextBudget - effectiveInstructionTokens
-  );
-  if (usage.remainingContextTokens == null) {
-    return;
-  }
-  breakdown.messageTokens = Math.max(
-    0,
-    contextBudget - effectiveInstructionTokens - usage.remainingContextTokens
-  );
 }
 
 type ReasoningKey = 'reasoning_content' | 'reasoning';

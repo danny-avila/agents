@@ -8,6 +8,9 @@ export * from './messages';
 /* Graphs */
 export * from './graphs';
 
+/* Context-usage projection (host-side pre-send snapshot) */
+export * from './agents/projection';
+
 /* Summarization */
 export * from './summarization';
 

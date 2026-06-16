@@ -7,7 +7,6 @@ import type {
   BaseMessageFields,
 } from '@langchain/core/messages';
 import type { RunnableConfig, Runnable } from '@langchain/core/runnables';
-import type { createPruneMessages } from '@/messages';
 import type * as t from '@/types';
 import {
   ANTHROPIC_TOOL_TOKEN_MULTIPLIER,
@@ -19,10 +18,16 @@ import {
 import {
   addCacheControl,
   addCacheControlToStablePrefixMessages,
+  cloneMessage,
 } from '@/messages/cache';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { apportionTokenCounts } from '@/utils/tokens';
-import { DEFAULT_RESERVE_RATIO } from '@/messages';
+import {
+  DEFAULT_RESERVE_RATIO,
+  createPruneMessages,
+  syncBudgetDerivedFields,
+} from '@/messages';
+import { isThinkingEnabled } from '@/llm/request';
 import { toJsonSchema } from '@/utils/schema';
 
 type AgentSystemTextBlock = {
@@ -1328,6 +1333,102 @@ export class AgentContext {
       `  availableForMessages: ${b.availableForMessages}`,
     ];
     return lines.join('\n');
+  }
+
+  /**
+   * Projects the context-usage snapshot for an arbitrary message set WITHOUT
+   * invoking the model — the pre-send / page-load / window-switch counterpart to
+   * the live `ON_CONTEXT_USAGE` snapshot. Runs the same pruner + budget math the
+   * graph uses (`createPruneMessages` → `getTokenBudgetBreakdown` →
+   * `syncBudgetDerivedFields`) so projected numbers match a real call. Returns
+   * null when the context lacks the tokenizer or window needed to prune. Omits
+   * the live post-format reconciliation (provider-specific, invoke-time) — a
+   * small, acceptable delta for a pre-send estimate.
+   *
+   * Safe to call off the hot path: the supplied `messages` are never mutated
+   * (each is passed as a clone — the pruner both replaces tool-result slots and
+   * unshifts reasoning blocks into AI content arrays in place), and this
+   * context's own state is untouched apart from refreshing stale instruction
+   * counts (idempotent, exactly what a real call does). Token counts are
+   * recounted for the supplied messages (the context's `indexTokenCountMap` is
+   * keyed to the live run's branch and would missum an arbitrary branch) unless
+   * the caller passes a map it guarantees matches. Calibration is NOT re-derived
+   * from this context's live usage (a fresh pruner would compare the prior
+   * call's provider input against the whole projected branch); the learned
+   * `calibrationRatio` is applied as a static seed, and callers may override it
+   * with a persisted ratio via `opts.calibrationRatio`.
+   */
+  projectContextUsage(
+    messages: BaseMessage[],
+    opts?: {
+      runId?: string;
+      agentId?: string;
+      calibrationRatio?: number;
+      indexTokenCountMap?: Record<string, number | undefined>;
+    }
+  ): t.ContextUsageEvent | null {
+    const tokenCounter = this.tokenCounter;
+    if (tokenCounter == null || this.maxContextTokens == null) {
+      return null;
+    }
+    /** Refresh stale system overhead (handoff/summary changes) so instruction
+     *  tokens match the prompt a real call would send. */
+    this.initializeSystemRunnable();
+    /** Clone array-content messages: the pruner unshifts reasoning blocks into
+     *  AI content arrays in place, which would otherwise corrupt the caller's
+     *  history. (Slot replacements land on the mapped array, not the caller's.) */
+    const projected = messages.map((message) =>
+      Array.isArray(message.content)
+        ? cloneMessage(message, [...message.content])
+        : message
+    );
+    let indexTokenCountMap = opts?.indexTokenCountMap;
+    if (indexTokenCountMap == null) {
+      indexTokenCountMap = {};
+      for (let i = 0; i < messages.length; i++) {
+        indexTokenCountMap[String(i)] = tokenCounter(messages[i]);
+      }
+    }
+    const prune = createPruneMessages({
+      startIndex: 0,
+      provider: this.provider,
+      tokenCounter,
+      maxTokens: this.maxContextTokens,
+      thinkingEnabled: isThinkingEnabled(this.provider, this.clientOptions),
+      indexTokenCountMap,
+      contextPruningConfig: this.contextPruningConfig,
+      summarizationEnabled: this.summarizationEnabled,
+      reserveRatio: this.summarizationConfig?.reserveRatio,
+      calibrationRatio: opts?.calibrationRatio ?? this.calibrationRatio,
+      getInstructionTokens: () => this.instructionTokens,
+    });
+    const {
+      context,
+      prePruneContextTokens,
+      remainingContextTokens,
+      contextBudget,
+      effectiveInstructionTokens,
+      calibrationRatio,
+    } = prune({
+      messages: projected,
+      usageMetadata: undefined,
+      lastCallUsage: undefined,
+      totalTokensFresh: false,
+    });
+    const breakdown = this.getTokenBudgetBreakdown(messages);
+    breakdown.messageCount = context.length;
+    const usage: t.ContextUsageEvent = {
+      runId: opts?.runId,
+      agentId: opts?.agentId,
+      breakdown,
+      contextBudget,
+      effectiveInstructionTokens,
+      prePruneContextTokens,
+      remainingContextTokens,
+      calibrationRatio,
+    };
+    syncBudgetDerivedFields(usage);
+    return usage;
   }
 
   /**

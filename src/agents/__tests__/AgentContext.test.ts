@@ -2147,4 +2147,233 @@ describe('AgentContext', () => {
       expect(ctx.lastCallUsage!.inputTokens).toBe(8005);
     });
   });
+
+  describe('projectContextUsage', () => {
+    const countByChars = (msg: { content: unknown }): number => {
+      const content =
+        typeof msg.content === 'string'
+          ? msg.content
+          : JSON.stringify(msg.content);
+      return content.length;
+    };
+
+    const buildBranch = (
+      maxContextTokens: number,
+      perMessageTokens: number,
+      count: number,
+    ): { ctx: AgentContext; messages: AIMessage[] } => {
+      const ctx = createBasicContext({ tokenCounter: countByChars });
+      ctx.maxContextTokens = maxContextTokens;
+      const messages: AIMessage[] = [];
+      for (let i = 0; i < count; i++) {
+        // countByChars counts content length, and projectContextUsage recounts
+        // the supplied messages — so size content to the intended per-msg tokens.
+        const content = 'x'.repeat(perMessageTokens);
+        messages.push(
+          i % 2 === 0
+            ? (new HumanMessage(content) as unknown as AIMessage)
+            : new AIMessage(content),
+        );
+      }
+      return { ctx, messages };
+    };
+
+    it('returns null without a tokenizer or a window', () => {
+      const noCounter = createBasicContext({});
+      noCounter.maxContextTokens = 1000;
+      expect(noCounter.projectContextUsage([new HumanMessage('hi')])).toBeNull();
+
+      const noWindow = createBasicContext({ tokenCounter: countByChars });
+      noWindow.maxContextTokens = undefined;
+      expect(noWindow.projectContextUsage([new HumanMessage('hi')])).toBeNull();
+    });
+
+    it('keeps the whole branch and reports headroom when it fits', () => {
+      const { ctx, messages } = buildBranch(100_000, 1_000, 4);
+      const usage = ctx.projectContextUsage(messages);
+
+      expect(usage).not.toBeNull();
+      expect(usage!.breakdown.messageCount).toBe(4);
+      expect(usage!.breakdown.maxContextTokens).toBe(100_000);
+      expect(usage!.remainingContextTokens).toBeGreaterThan(0);
+      expect(usage!.breakdown.messageTokens).toBeGreaterThan(0);
+
+      const max = usage!.contextBudget ?? usage!.breakdown.maxContextTokens;
+      const used = max - (usage!.remainingContextTokens ?? 0);
+      expect(used).toBeLessThanOrEqual(max);
+    });
+
+    it('prunes older messages when the branch exceeds the window', () => {
+      const { ctx, messages } = buildBranch(3_000, 1_000, 6);
+      const usage = ctx.projectContextUsage(messages);
+
+      expect(usage).not.toBeNull();
+      expect(usage!.breakdown.messageCount).toBeGreaterThan(0);
+      expect(usage!.breakdown.messageCount).toBeLessThan(6);
+      expect(usage!.remainingContextTokens).toBeGreaterThanOrEqual(0);
+
+      const max = usage!.contextBudget ?? usage!.breakdown.maxContextTokens;
+      expect(max - (usage!.remainingContextTokens ?? 0)).toBeLessThanOrEqual(max);
+    });
+
+    it('does not mutate the context (local pruner, no field writes)', () => {
+      const { ctx, messages } = buildBranch(3_000, 1_000, 6);
+      const mapBefore = { ...ctx.indexTokenCountMap };
+
+      expect(ctx.pruneMessages).toBeUndefined();
+      ctx.projectContextUsage(messages);
+
+      expect(ctx.pruneMessages).toBeUndefined();
+      expect(ctx.indexTokenCountMap).toEqual(mapBefore);
+    });
+
+    it('does not mutate the caller messages under context pressure', () => {
+      const ctx = createBasicContext({ tokenCounter: countByChars });
+      ctx.maxContextTokens = 400;
+      const consumed = new ToolMessage({
+        content: 'x'.repeat(20_000),
+        tool_call_id: 't1',
+        name: 'tool',
+      });
+      const messages: AIMessage[] = [
+        new HumanMessage('question') as unknown as AIMessage,
+        new AIMessage({
+          content: '',
+          tool_calls: [{ id: 't1', name: 'tool', args: {} }],
+        }),
+        consumed as unknown as AIMessage,
+        new AIMessage('final answer'),
+      ];
+      const originalRef = messages[2];
+      const originalContent = (messages[2] as unknown as ToolMessage).content;
+
+      ctx.projectContextUsage(messages);
+
+      expect(messages[2]).toBe(originalRef);
+      expect((messages[2] as unknown as ToolMessage).content).toBe(
+        originalContent,
+      );
+    });
+
+    it('recounts the supplied branch, ignoring a stale context token map', () => {
+      const ctx = createBasicContext({ tokenCounter: countByChars });
+      ctx.maxContextTokens = 3_000;
+      // Empty/stale map — if it were reused, every message would count as 0 and
+      // nothing would prune. The fresh recount must drive pruning instead.
+      ctx.indexTokenCountMap = {};
+      const messages: AIMessage[] = [];
+      for (let i = 0; i < 6; i++) {
+        messages.push(new HumanMessage('x'.repeat(1_000)) as unknown as AIMessage);
+      }
+
+      const usage = ctx.projectContextUsage(messages);
+
+      expect(usage).not.toBeNull();
+      expect(usage!.breakdown.messageCount).toBeLessThan(6);
+    });
+
+    it('uses a caller-supplied token map when provided', () => {
+      const { ctx, messages } = buildBranch(3_000, 1, 6);
+      // Each message is ~1 char, so a recount would fit all 6. The supplied map
+      // claims 1000 each, forcing a prune — proving the map is honored.
+      const indexTokenCountMap: Record<string, number> = {};
+      for (let i = 0; i < messages.length; i++) {
+        indexTokenCountMap[String(i)] = 1_000;
+      }
+
+      const usage = ctx.projectContextUsage(messages, { indexTokenCountMap });
+
+      expect(usage!.breakdown.messageCount).toBeLessThan(6);
+    });
+
+    it('ignores this context live usage so projections are not recalibrated', () => {
+      const build = (): { ctx: AgentContext; messages: AIMessage[] } => {
+        const ctx = createBasicContext({ tokenCounter: countByChars });
+        ctx.maxContextTokens = 5_000;
+        const messages: AIMessage[] = [0, 1, 2].map(
+          () => new HumanMessage('x'.repeat(1_000)) as unknown as AIMessage,
+        );
+        return { ctx, messages };
+      };
+
+      const clean = build();
+      const cleanUsage = clean.ctx.projectContextUsage(clean.messages);
+
+      const dirty = build();
+      dirty.ctx.currentUsage = {
+        input_tokens: 4_000,
+        output_tokens: 50,
+        total_tokens: 4_050,
+      };
+      dirty.ctx.updateLastCallUsage({ input_tokens: 4_000, output_tokens: 50 });
+      const dirtyUsage = dirty.ctx.projectContextUsage(dirty.messages);
+
+      expect(dirtyUsage!.remainingContextTokens).toBe(
+        cleanUsage!.remainingContextTokens,
+      );
+      expect(dirtyUsage!.calibrationRatio).toBe(cleanUsage!.calibrationRatio);
+    });
+
+    it('does not mutate AI message content arrays during projection', () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.ANTHROPIC,
+          clientOptions: {
+            model: 'claude-x',
+            thinking: { type: 'enabled', budget_tokens: 1024 },
+          } as never,
+        },
+        tokenCounter: countByChars,
+      });
+      ctx.maxContextTokens = 2_000;
+      const aiContent = [
+        { type: 'thinking', thinking: 'step by step', signature: 'sig' },
+        { type: 'text', text: 'the answer' },
+      ];
+      const ai = new AIMessage({ content: aiContent as never });
+      const messages: AIMessage[] = [
+        new HumanMessage('question') as unknown as AIMessage,
+        ai,
+        new HumanMessage('another') as unknown as AIMessage,
+      ];
+      const contentRef = ai.content;
+      const lenBefore = (ai.content as unknown[]).length;
+
+      ctx.projectContextUsage(messages);
+
+      expect(messages[1].content).toBe(contentRef);
+      expect((messages[1].content as unknown[]).length).toBe(lenBefore);
+    });
+
+    it('honors an explicit calibrationRatio seed', () => {
+      const base = buildBranch(100_000, 1_000, 4);
+      const baseUsage = base.ctx.projectContextUsage(base.messages);
+
+      const scaled = buildBranch(100_000, 1_000, 4);
+      const scaledUsage = scaled.ctx.projectContextUsage(scaled.messages, {
+        calibrationRatio: 3,
+      });
+
+      expect(scaledUsage!.calibrationRatio).toBe(3);
+      expect(scaledUsage!.remainingContextTokens).not.toBe(
+        baseUsage!.remainingContextTokens,
+      );
+    });
+
+    it('refreshes a stale system runnable before projecting', () => {
+      const ctx = createBasicContext({
+        agentConfig: { instructions: 'system prompt' },
+        tokenCounter: countByChars,
+      });
+      ctx.maxContextTokens = 5_000;
+      ctx.initializeSystemRunnable();
+      const systemBefore = ctx.systemMessageTokens;
+
+      // Adds a handoff preamble + marks stale, but defers the token recount.
+      ctx.setHandoffContext('PriorAgent', ['SiblingA', 'SiblingB']);
+      ctx.projectContextUsage([new HumanMessage('hi') as unknown as AIMessage]);
+
+      expect(ctx.systemMessageTokens).toBeGreaterThan(systemBefore);
+    });
+  });
 });
