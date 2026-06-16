@@ -733,13 +733,17 @@ function _formatContent(message: BaseMessage) {
           name: correspondingToolCall.name,
           input: functionCallPart.functionCall.args,
         };
-      } else if (foreignReasoningTypes.some((t) => t === contentPart.type)) {
-        // Foreign reasoning (Bedrock `reasoning_content`, Google `reasoning`,
-        // LibreChat `think`) carries provider-specific signatures Anthropic
-        // cannot validate; drop it so a cross-provider handoff doesn't crash.
-        // Anything else unknown still throws below rather than being silently
-        // dropped — real content (user media, Google code-execution blocks)
-        // must be surfaced, not discarded.
+      } else if (
+        isAIMessage(message) &&
+        foreignReasoningTypes.some((t) => t === contentPart.type)
+      ) {
+        // Foreign reasoning on an ASSISTANT turn (Bedrock `reasoning_content`,
+        // Google `reasoning`, LibreChat `think`) carries provider-specific
+        // signatures Anthropic cannot validate; drop it so a cross-provider
+        // handoff doesn't crash. The same types on a user/tool turn are real
+        // input and fall through to the throw below rather than being silently
+        // dropped — as does any other unknown block (user media, Google
+        // code-execution), which must be surfaced, not discarded.
         return null;
       } else {
         console.error(

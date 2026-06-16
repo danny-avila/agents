@@ -164,6 +164,23 @@ describe('_convertMessagesToAnthropicPayload — cross-provider reasoning blocks
     );
   });
 
+  it('does not drop a reasoning-typed block on a user turn (only assistant reasoning is dropped)', () => {
+    const history: BaseMessage[] = [
+      new HumanMessage({
+        content: [
+          {
+            type: 'reasoning_content',
+            reasoningText: { text: 'user text' },
+          } as any,
+          { type: 'text', text: 'hello' },
+        ],
+      }),
+    ];
+    expect(() => _convertMessagesToAnthropicPayload(history)).toThrow(
+      'Unsupported message content format'
+    );
+  });
+
   it('preserves a tool call carried only on tool_calls when its reasoning sibling is dropped', () => {
     // Mirrors a Bedrock extended-thinking turn: the tool lives only on
     // `tool_calls`; `content` holds just the reasoning block (no tool_use).
