@@ -289,10 +289,12 @@ function createOnSearchResults({
 function createTool({
   schema,
   search,
+  maxOutputChars,
   onSearchResults: _onSearchResults,
 }: {
   schema: Record<string, unknown>;
   search: ReturnType<typeof createSearchProcessor>;
+  maxOutputChars?: number;
   onSearchResults: t.SearchToolConfig['onSearchResults'];
 }): DynamicStructuredTool {
   return tool(
@@ -313,7 +315,7 @@ function createTool({
         }),
       });
       const turn = runnableConfig.toolCall?.turn ?? 0;
-      const { output, references } = formatResultsForLLM(turn, searchResult);
+      const { output, references } = formatResultsForLLM(turn, searchResult, maxOutputChars);
       const data: t.SearchResultData = { turn, ...searchResult, references };
       return [output, { [Constants.WEB_SEARCH]: data }];
     },
@@ -359,6 +361,7 @@ export const createSearchTool = (
     rerankerType = 'cohere',
     topResults = 5,
     maxContentLength,
+    maxOutputChars,
     strategies = ['no_extraction'],
     filterContent = true,
     safeSearch = 1,
@@ -483,6 +486,7 @@ export const createSearchTool = (
   return createTool({
     search,
     schema: toolSchema,
+    maxOutputChars,
     onSearchResults: _onSearchResults,
   });
 };

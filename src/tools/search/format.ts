@@ -1,6 +1,71 @@
 import type * as t from './types';
 import { getDomainName, fileExtRegex } from './utils';
 
+/** Default per-search budget for model-facing highlight content (chars). Hosts
+ *  that know the context window (e.g. LibreChat) pass a window-relative value;
+ *  this fixed fallback keeps standalone consumers bounded instead of dumping the
+ *  full reranked content of every source into the prompt. */
+const DEFAULT_MAX_LLM_OUTPUT_CHARS = 50000;
+
+/** Minimum room (chars) worth filling with a truncated boundary highlight; below
+ *  this we drop it whole rather than emit a useless sliver. */
+const MIN_PARTIAL_HIGHLIGHT_CHARS = 200;
+
+/** Resolves the per-search highlight budget from config, the
+ *  `SEARCH_MAX_LLM_OUTPUT_CHARS` env var, or the default (50,000 chars). */
+export function resolveMaxLLMOutputChars(maxOutputChars?: number): number {
+  if (maxOutputChars != null && maxOutputChars > 0) {
+    return maxOutputChars;
+  }
+  const envValue = Number(process.env.SEARCH_MAX_LLM_OUTPUT_CHARS);
+  if (Number.isFinite(envValue) && envValue > 0) {
+    return envValue;
+  }
+  return DEFAULT_MAX_LLM_OUTPUT_CHARS;
+}
+
+/** Bounds the highlight chunks — the dominant, unbounded part of search output —
+ *  to `maxChars`, walking sources in relevance order (organic first, then news;
+ *  highlights in their reranked order). Whole highlights are kept until the
+ *  budget is hit, the boundary one is truncated if meaningful room remains, and
+ *  the rest are dropped. Snippets/titles/URLs are left untouched (small,
+ *  high-signal) and the full content stays in the `WEB_SEARCH` artifact for
+ *  citations. Mutates `results` in place; returns how many highlights were
+ *  dropped or truncated (0 when everything fit). */
+function trimHighlightsToBudget(results: t.SearchResultData, maxChars: number): number {
+  let used = 0;
+  let trimmed = 0;
+  const sections: (t.ValidSource[] | undefined)[] = [results.organic, results.topStories];
+  for (const sources of sections) {
+    if (sources == null) {
+      continue;
+    }
+    for (const source of sources) {
+      const highlights = source.highlights;
+      if (highlights == null || highlights.length === 0) {
+        continue;
+      }
+      const kept: t.Highlight[] = [];
+      for (const highlight of highlights) {
+        const length = highlight.text.length;
+        if (used + length <= maxChars) {
+          kept.push(highlight);
+          used += length;
+          continue;
+        }
+        const remaining = maxChars - used;
+        if (remaining >= MIN_PARTIAL_HIGHLIGHT_CHARS) {
+          kept.push({ ...highlight, text: `${highlight.text.slice(0, remaining)}\n…[truncated]` });
+          used = maxChars;
+        }
+        trimmed++;
+      }
+      source.highlights = kept;
+    }
+  }
+  return trimmed;
+}
+
 function addHighlightSection(): string[] {
   return ['\n## Highlights', ''];
 }
@@ -112,8 +177,15 @@ function formatSource(
 
 export function formatResultsForLLM(
   turn: number,
-  results: t.SearchResultData
+  results: t.SearchResultData,
+  maxOutputChars?: number
 ): { output: string; references: t.ResultReference[] } {
+  /** Bound highlight content to the per-search budget before formatting */
+  const trimmedHighlights = trimHighlightsToBudget(
+    results,
+    resolveMaxLLMOutputChars(maxOutputChars)
+  );
+
   /** Array to collect all output lines */
   const outputLines: string[] = [];
 
@@ -243,8 +315,11 @@ export function formatResultsForLLM(
     outputLines.push(paaLines.join(''));
   }
 
-  return {
-    output: outputLines.join('\n').trim(),
-    references,
-  };
+  let output = outputLines.join('\n').trim();
+  if (trimmedHighlights > 0) {
+    output += `\n\n_[${trimmedHighlights} additional highlight${
+      trimmedHighlights === 1 ? '' : 's'
+    } omitted to fit the context budget; the cited sources contain the full content.]_`;
+  }
+  return { output, references };
 }
