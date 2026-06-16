@@ -254,6 +254,126 @@ function isCachePoint(block: MessageContentComplex): boolean {
   return 'cachePoint' in block && !('type' in block);
 }
 
+const THINKING_BLOCK_TYPES = new Set(['thinking', 'redacted_thinking']);
+
+/**
+ * A block can anchor the tail cache breakpoint when it is a real content block
+ * that the Anthropic API accepts `cache_control` on. Thinking/redacted_thinking
+ * blocks reject cache_control, and empty text blocks are not cacheable, so both
+ * are excluded.
+ */
+function isTailCacheableBlock(block: MessageContentComplex): boolean {
+  if (isCachePoint(block)) {
+    return false;
+  }
+  const type = (block as { type?: string }).type;
+  if (type == null || THINKING_BLOCK_TYPES.has(type)) {
+    return false;
+  }
+  if (type === 'text') {
+    const text = (block as { text?: string }).text;
+    return text != null && text.trim() !== '';
+  }
+  return true;
+}
+
+/**
+ * Anthropic API: single tail cache breakpoint (default strategy).
+ *
+ * Places exactly ONE `cache_control` marker on the last cacheable block of the
+ * final non-synthetic message, mirroring the Claude Code strategy
+ * (`markerIndex = messages.length - 1`). Because the marker always rides the
+ * true tail, the entire conversation prefix is written once and read back on
+ * the next turn as the history grows append-only — instead of the rolling
+ * "last two user messages" markers, which leave freshly appended tool/assistant
+ * turns outside the cached prefix and re-write large spans every step.
+ *
+ * Stale markers (Anthropic `cache_control` and Bedrock cache points) are
+ * stripped from every message in a single backward pass so exactly one marker
+ * survives. Synthetic skill/meta messages are skipped as anchors (their volatile
+ * content must not pin the cache) but still have stale markers removed.
+ *
+ * Returns a new array; only messages that require modification are cloned.
+ */
+export function addTailCacheControl<T extends AnthropicMessage | BaseMessage>(
+  messages: T[]
+): T[] {
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return messages;
+  }
+
+  const updatedMessages: T[] = [...messages];
+  let markerPlaced = false;
+
+  for (let i = updatedMessages.length - 1; i >= 0; i--) {
+    const originalMessage = updatedMessages[i];
+    const content = originalMessage.content;
+    const hasArrayContent = Array.isArray(content);
+    const canPlaceMarker =
+      !markerPlaced && !isSyntheticMetaMessage(originalMessage);
+
+    // Earlier string-content messages carry no markers to strip.
+    if (!canPlaceMarker && !hasArrayContent) {
+      continue;
+    }
+
+    let workingContent: MessageContentComplex[];
+    let modified = false;
+
+    if (hasArrayContent) {
+      const src = content as MessageContentComplex[];
+      workingContent = [];
+      let tailIndex = -1;
+      for (let j = 0; j < src.length; j++) {
+        const block = src[j];
+        if (isCachePoint(block)) {
+          modified = true;
+          continue;
+        }
+        const cloned = { ...block };
+        if ('cache_control' in cloned) {
+          delete (cloned as Record<string, unknown>).cache_control;
+          modified = true;
+        }
+        if (canPlaceMarker && isTailCacheableBlock(cloned as MessageContentComplex)) {
+          tailIndex = workingContent.length;
+        }
+        workingContent.push(cloned as MessageContentComplex);
+      }
+
+      if (canPlaceMarker && tailIndex >= 0) {
+        (workingContent[tailIndex] as Anthropic.TextBlockParam).cache_control = {
+          type: 'ephemeral',
+        };
+        markerPlaced = true;
+        modified = true;
+      }
+
+      if (!modified) {
+        continue;
+      }
+    } else if (
+      typeof content === 'string' &&
+      canPlaceMarker &&
+      content.trim() !== ''
+    ) {
+      workingContent = [
+        { type: 'text', text: content, cache_control: { type: 'ephemeral' } },
+      ] as unknown as MessageContentComplex[];
+      markerPlaced = true;
+    } else {
+      continue;
+    }
+
+    updatedMessages[i] = cloneMessage(
+      originalMessage as MessageWithContent,
+      workingContent
+    ) as T;
+  }
+
+  return updatedMessages;
+}
+
 function getMessageRole(message: MessageWithContent): string | undefined {
   if (message instanceof BaseMessage) {
     return message.getType();
@@ -614,6 +734,126 @@ export function addBedrockCacheControl<
         { cachePoint: { type: 'default' } } as MessageContentComplex,
       ];
       cachePointsAdded++;
+    } else if (typeof content === 'string' && hasSerializationProps) {
+      workingContent = content;
+    } else {
+      continue;
+    }
+
+    updatedMessages[i] = cloneMessage(originalMessage, workingContent);
+  }
+
+  return updatedMessages;
+}
+
+/**
+ * Bedrock Converse API: single tail cache breakpoint (default strategy).
+ *
+ * The Bedrock counterpart of {@link addTailCacheControl}. Strips ALL existing
+ * cache control (Bedrock cache points and Anthropic `cache_control`) from every
+ * message, then inserts exactly ONE `{ cachePoint: { type: 'default' } }` block
+ * immediately after the last non-empty text block of the most recent
+ * non-synthetic, non-system message. Anchoring on the rolling tail keeps the
+ * cached prefix append-only as the conversation grows, instead of re-writing
+ * large spans every turn with the legacy "last two user messages" cache points.
+ *
+ * System messages are sanitized (Anthropic `cache_control` stripped) but never
+ * anchored. Synthetic skill/meta messages are skipped as anchors so their
+ * volatile content cannot pin the cache.
+ *
+ * Returns a new array - only clones messages that require modification.
+ */
+export function addBedrockTailCacheControl<
+  T extends MessageWithContent & { getType?: () => string; role?: string },
+>(messages: T[]): T[] {
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return messages;
+  }
+
+  const updatedMessages: T[] = [...messages];
+  let cachePointPlaced = false;
+
+  for (let i = updatedMessages.length - 1; i >= 0; i--) {
+    const originalMessage = updatedMessages[i];
+    const messageType =
+      'getType' in originalMessage &&
+      typeof originalMessage.getType === 'function'
+        ? originalMessage.getType()
+        : undefined;
+    const messageRole =
+      'role' in originalMessage && typeof originalMessage.role === 'string'
+        ? originalMessage.role
+        : undefined;
+
+    const isSystemMessage =
+      messageType === 'system' || messageRole === 'system';
+    if (isSystemMessage) {
+      updatedMessages[i] = sanitizeBedrockSystemMessage(originalMessage);
+      continue;
+    }
+
+    const content = originalMessage.content;
+    const hasSerializationProps =
+      'lc_kwargs' in originalMessage ||
+      'lc_serializable' in originalMessage ||
+      'lc_namespace' in originalMessage;
+    const hasArrayContent = Array.isArray(content);
+    const isEmptyString = typeof content === 'string' && content === '';
+    const canPlaceCachePoint =
+      !cachePointPlaced &&
+      !isEmptyString &&
+      !isSyntheticMetaMessage(originalMessage) &&
+      (typeof content === 'string' || hasArrayContent);
+
+    if (!canPlaceCachePoint && !hasArrayContent && !hasSerializationProps) {
+      continue;
+    }
+
+    let workingContent: string | MessageContentComplex[];
+    let modified = hasSerializationProps;
+
+    if (hasArrayContent) {
+      const src = content as MessageContentComplex[];
+      workingContent = [];
+      let lastNonEmptyTextIndex = -1;
+      for (let j = 0; j < src.length; j++) {
+        const block = src[j];
+        if (isCachePoint(block)) {
+          modified = true;
+          continue;
+        }
+        const cloned = { ...block };
+        if ('cache_control' in cloned) {
+          delete (cloned as Record<string, unknown>).cache_control;
+          modified = true;
+        }
+        const type = (cloned as { type?: string }).type;
+        if (type === ContentTypes.TEXT || type === 'text') {
+          const text = (cloned as { text?: string }).text;
+          if (text != null && text.trim() !== '') {
+            lastNonEmptyTextIndex = workingContent.length;
+          }
+        }
+        workingContent.push(cloned as MessageContentComplex);
+      }
+
+      if (!modified && !canPlaceCachePoint) {
+        continue;
+      }
+
+      if (canPlaceCachePoint && lastNonEmptyTextIndex >= 0) {
+        workingContent.splice(lastNonEmptyTextIndex + 1, 0, {
+          cachePoint: { type: 'default' },
+        } as MessageContentComplex);
+        cachePointPlaced = true;
+        modified = true;
+      }
+    } else if (typeof content === 'string' && canPlaceCachePoint) {
+      workingContent = [
+        { type: ContentTypes.TEXT, text: content },
+        { cachePoint: { type: 'default' } } as MessageContentComplex,
+      ];
+      cachePointPlaced = true;
     } else if (typeof content === 'string' && hasSerializationProps) {
       workingContent = content;
     } else {

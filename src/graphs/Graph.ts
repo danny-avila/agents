@@ -19,14 +19,14 @@ import {
   convertMessagesToContent,
   sanitizeOrphanToolBlocks,
   extractToolDiscoveries,
-  addBedrockCacheControl,
+  addBedrockTailCacheControl,
   formatArtifactPayload,
   enforceOriginalContentCap,
   formatContentStrings,
   isLegacyConvertible,
   createPruneMessages,
   syncBudgetDerivedFields,
-  addCacheControl,
+  addTailCacheControl,
   getMessageId,
   makeIsDeferred,
   partitionAndMarkAnthropicToolCache,
@@ -1741,14 +1741,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           anthropicOptions?.promptCache === true &&
           !agentContext.systemRunnable
         ) {
-          finalMessages = addCacheControl<BaseMessage>(finalMessages);
+          finalMessages = addTailCacheControl<BaseMessage>(finalMessages);
         }
       } else if (agentContext.provider === Providers.BEDROCK) {
         const bedrockOptions = agentContext.clientOptions as
           | t.BedrockAnthropicClientOptions
           | undefined;
         if (bedrockOptions?.promptCache === true) {
-          finalMessages = addBedrockCacheControl<BaseMessage>(finalMessages);
+          finalMessages = addBedrockTailCacheControl<BaseMessage>(finalMessages);
         }
       } else if (agentContext.provider === Providers.OPENROUTER) {
         const openRouterOptions = agentContext.clientOptions as
@@ -1758,7 +1758,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           openRouterOptions?.promptCache === true &&
           !agentContext.systemRunnable
         ) {
-          finalMessages = addCacheControl<BaseMessage>(finalMessages);
+          finalMessages = addTailCacheControl<BaseMessage>(finalMessages);
         }
       }
 

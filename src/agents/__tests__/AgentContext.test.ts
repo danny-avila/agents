@@ -274,16 +274,11 @@ describe('AgentContext', () => {
         new HumanMessage('First'),
         new HumanMessage('Second'),
       ]);
-      const firstContent = result[1].content as TestSystemContentBlock[];
       const secondContent = result[2].content as TestSystemContentBlock[];
 
       expect(result).toHaveLength(3);
       expect(result[0].content).toBe('Dynamic only');
-      expect(firstContent[0]).toMatchObject({
-        type: 'text',
-        text: 'First',
-        cache_control: { type: 'ephemeral' },
-      });
+      expect(result[1].content).toBe('First');
       expect(secondContent[0]).toMatchObject({
         type: 'text',
         text: 'Second',
@@ -686,7 +681,7 @@ describe('AgentContext', () => {
       expect(result[8].content).toBe('Now answer without tools');
     });
 
-    it('adds OpenRouter body cache points when there is no dynamic tail', async () => {
+    it('adds a single OpenRouter body cache point on the tail when there is no dynamic tail', async () => {
       const ctx = createBasicContext({
         agentConfig: {
           provider: Providers.OPENROUTER,
@@ -702,9 +697,8 @@ describe('AgentContext', () => {
         new HumanMessage('First'),
         new HumanMessage('Second'),
       ]);
-      const firstContent = result[1].content as TestSystemContentBlock[];
       const secondContent = result[2].content as TestSystemContentBlock[];
-      expect(firstContent[0]).toHaveProperty('cache_control');
+      expect(result[1].content).toBe('First');
       expect(secondContent[0]).toHaveProperty('cache_control');
     });
 

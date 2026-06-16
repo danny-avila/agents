@@ -16,7 +16,7 @@ import {
   Providers,
 } from '@/common';
 import {
-  addCacheControl,
+  addTailCacheControl,
   addCacheControlToStablePrefixMessages,
   cloneMessage,
 } from '@/messages/cache';
@@ -689,7 +689,7 @@ export class AgentContext {
         dynamicTail.length === 0 &&
         body.length >= 2
       ) {
-        body = addCacheControl(body);
+        body = addTailCacheControl(body);
       }
       return [...prefix, ...body];
     }).withConfig({ runName: 'prompt' });
