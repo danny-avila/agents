@@ -13,9 +13,9 @@ const makeOrganic = (
 
 const highlight = (text: string, score = 0.9): t.Highlight => ({ text, score });
 
-const reference = (url: string): t.UsedReferences[number] => ({
+const reference = (url: string, originalIndex = 0): t.UsedReferences[number] => ({
   type: 'link',
-  originalIndex: 0,
+  originalIndex,
   reference: { originalUrl: url, title: 'Ref', text: 'ref' },
 });
 
@@ -135,7 +135,7 @@ describe('formatResultsForLLM highlight budget', () => {
     expect(output).not.toContain(OMISSION_MARKER);
   });
 
-  test('drops references on a truncated highlight (markers in the cut tail)', () => {
+  test('drops references with no surviving marker when truncating', () => {
     const withRefs = highlight('A'.repeat(1000));
     withRefs.references = [reference('https://cited.example')];
     const results: t.SearchResultData = {
@@ -148,6 +148,45 @@ describe('formatResultsForLLM highlight budget', () => {
     expect(output).not.toContain('Core References');
     expect(output).not.toContain('https://cited.example');
     expect(references).toHaveLength(0);
+  });
+
+  test('keeps references whose marker survives truncation and drops the rest', () => {
+    const withRefs = highlight(`(link#1) ${'A'.repeat(1000)} (link#2)`);
+    withRefs.references = [
+      reference('https://one.example', 0),
+      reference('https://two.example', 1),
+    ];
+    const results: t.SearchResultData = {
+      organic: [makeOrganic('https://a.com', [withRefs])],
+    };
+
+    const { output, references } = formatResultsForLLM(0, results, 500);
+
+    expect(output).toContain('…[truncated]');
+    expect(output).toContain('https://one.example');
+    expect(output).not.toContain('https://two.example');
+    expect(references).toHaveLength(1);
+    expect(references[0].link).toBe('https://one.example');
+  });
+
+  test('stops at the boundary highlight — no lower-ranked highlight slips in', () => {
+    const results: t.SearchResultData = {
+      organic: [
+        makeOrganic('https://a.com', [
+          highlight('A'.repeat(100), 0.9),
+          highlight('B'.repeat(300), 0.8),
+          highlight('C'.repeat(10), 0.7),
+        ]),
+      ],
+    };
+
+    const { output } = formatResultsForLLM(0, results, 150);
+
+    expect(output).toContain('A'.repeat(100));
+    expect(output).not.toContain('B'.repeat(300));
+    expect(output).not.toContain('C'.repeat(10));
+    expect(output).not.toContain('…[truncated]');
+    expect(countHighlightBlocks(output)).toBe(1);
   });
 
   test('keeps references on a whole highlight that fits the budget', () => {

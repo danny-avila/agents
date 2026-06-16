@@ -24,14 +24,51 @@ export function resolveMaxLLMOutputChars(maxOutputChars?: number): number {
   return DEFAULT_MAX_LLM_OUTPUT_CHARS;
 }
 
+/** Inline citation markers embedded in highlight text, e.g. `(link#2 "Title")`.
+ *  Mirrors the matcher in `highlights.ts` so truncation can tell which citations
+ *  survive in a sliced prefix. */
+const REFERENCE_MARKER_REGEX = /\((link|image|video)#(\d+)(?:\s+"[^"]*")?\)/g;
+
+/** Builds the set of `type#originalIndex` keys whose complete citation marker
+ *  appears in `text`, so references can be filtered to those still visible. */
+function visibleReferenceKeys(text: string): Set<string> {
+  const keys = new Set<string>();
+  if (!text.includes('#')) {
+    return keys;
+  }
+  const regex = new RegExp(REFERENCE_MARKER_REGEX);
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(text)) !== null) {
+    keys.add(`${match[1]}#${parseInt(match[2], 10) - 1}`);
+  }
+  return keys;
+}
+
+/** Truncates a highlight to `maxLen` chars of (already-trimmed) text, keeping
+ *  only the references whose markers survive in the kept prefix — markers in the
+ *  cut tail would otherwise emit Core References for citations the model can no
+ *  longer see, while a blanket drop would lose still-visible ones. */
+function truncateHighlight(highlight: t.Highlight, text: string, maxLen: number): t.Highlight {
+  const prefix = text.slice(0, maxLen);
+  const truncated: t.Highlight = { score: highlight.score, text: `${prefix}\n…[truncated]` };
+  if (highlight.references != null && highlight.references.length > 0) {
+    const keys = visibleReferenceKeys(prefix);
+    const visible = highlight.references.filter((ref) => keys.has(`${ref.type}#${ref.originalIndex}`));
+    if (visible.length > 0) {
+      truncated.references = visible;
+    }
+  }
+  return truncated;
+}
+
 /** Bounds the highlight chunks — the dominant, unbounded part of search output —
  *  to `maxChars`, walking sources in relevance order (organic first, then news;
  *  highlights in their reranked order). Whole highlights are kept until the
  *  budget is hit, the boundary one is truncated if meaningful room remains, and
- *  the rest are dropped. Blank highlights are skipped (never rendered, so never
- *  charged); a truncated highlight drops its references since markers in the cut
- *  tail would point at citations no longer shown. Snippets/titles/URLs are left
- *  untouched (small, high-signal) and per-source `content` stays in the
+ *  every later highlight is dropped (relevance-ordered prefix). Blank highlights
+ *  are skipped (never rendered, so never charged); a truncated highlight keeps
+ *  only references whose markers survive in the kept prefix. Snippets/titles/URLs
+ *  are left untouched (small, high-signal) and per-source `content` stays in the
  *  `WEB_SEARCH` artifact for citations. Mutates `results` in place; returns how
  *  many highlights were dropped or truncated (0 when everything fit). */
 function trimHighlightsToBudget(results: t.SearchResultData, maxChars: number): number {
@@ -60,9 +97,9 @@ function trimHighlightsToBudget(results: t.SearchResultData, maxChars: number): 
         }
         const remaining = maxChars - used;
         if (remaining >= MIN_PARTIAL_HIGHLIGHT_CHARS) {
-          kept.push({ score: highlight.score, text: `${text.slice(0, remaining)}\n…[truncated]` });
-          used = maxChars;
+          kept.push(truncateHighlight(highlight, text, remaining));
         }
+        used = maxChars;
         trimmed++;
       }
       source.highlights = kept;
