@@ -2313,5 +2313,67 @@ describe('AgentContext', () => {
       );
       expect(dirtyUsage!.calibrationRatio).toBe(cleanUsage!.calibrationRatio);
     });
+
+    it('does not mutate AI message content arrays during projection', () => {
+      const ctx = createBasicContext({
+        agentConfig: {
+          provider: Providers.ANTHROPIC,
+          clientOptions: {
+            model: 'claude-x',
+            thinking: { type: 'enabled', budget_tokens: 1024 },
+          } as never,
+        },
+        tokenCounter: countByChars,
+      });
+      ctx.maxContextTokens = 2_000;
+      const aiContent = [
+        { type: 'thinking', thinking: 'step by step', signature: 'sig' },
+        { type: 'text', text: 'the answer' },
+      ];
+      const ai = new AIMessage({ content: aiContent as never });
+      const messages: AIMessage[] = [
+        new HumanMessage('question') as unknown as AIMessage,
+        ai,
+        new HumanMessage('another') as unknown as AIMessage,
+      ];
+      const contentRef = ai.content;
+      const lenBefore = (ai.content as unknown[]).length;
+
+      ctx.projectContextUsage(messages);
+
+      expect(messages[1].content).toBe(contentRef);
+      expect((messages[1].content as unknown[]).length).toBe(lenBefore);
+    });
+
+    it('honors an explicit calibrationRatio seed', () => {
+      const base = buildBranch(100_000, 1_000, 4);
+      const baseUsage = base.ctx.projectContextUsage(base.messages);
+
+      const scaled = buildBranch(100_000, 1_000, 4);
+      const scaledUsage = scaled.ctx.projectContextUsage(scaled.messages, {
+        calibrationRatio: 3,
+      });
+
+      expect(scaledUsage!.calibrationRatio).toBe(3);
+      expect(scaledUsage!.remainingContextTokens).not.toBe(
+        baseUsage!.remainingContextTokens,
+      );
+    });
+
+    it('refreshes a stale system runnable before projecting', () => {
+      const ctx = createBasicContext({
+        agentConfig: { instructions: 'system prompt' },
+        tokenCounter: countByChars,
+      });
+      ctx.maxContextTokens = 5_000;
+      ctx.initializeSystemRunnable();
+      const systemBefore = ctx.systemMessageTokens;
+
+      // Adds a handoff preamble + marks stale, but defers the token recount.
+      ctx.setHandoffContext('PriorAgent', ['SiblingA', 'SiblingB']);
+      ctx.projectContextUsage([new HumanMessage('hi') as unknown as AIMessage]);
+
+      expect(ctx.systemMessageTokens).toBeGreaterThan(systemBefore);
+    });
   });
 });

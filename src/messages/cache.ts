@@ -41,7 +41,7 @@ function deepCloneContent<T extends string | MessageContentComplex[]>(
  * in downstream code (e.g., ensureThinkingBlockInMessages).
  * For plain objects (AnthropicMessage), uses object spread.
  */
-function cloneMessage<T extends MessageWithContent>(
+export function cloneMessage<T extends MessageWithContent>(
   message: T,
   content: string | MessageContentComplex[]
 ): T {

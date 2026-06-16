@@ -18,6 +18,7 @@ import {
 import {
   addCacheControl,
   addCacheControlToStablePrefixMessages,
+  cloneMessage,
 } from '@/messages/cache';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { apportionTokenCounts } from '@/utils/tokens';
@@ -1344,22 +1345,25 @@ export class AgentContext {
    * the live post-format reconciliation (provider-specific, invoke-time) — a
    * small, acceptable delta for a pre-send estimate.
    *
-   * Safe to call off the hot path: the pruner replaces tool-result slots in
-   * place, so the supplied `messages` are passed as a shallow copy and never
-   * mutated; this context's own state is untouched. Token counts are recounted
-   * for the supplied messages (the context's `indexTokenCountMap` is keyed to
-   * the live run's branch and would missum an arbitrary branch) unless the
-   * caller passes a map it guarantees matches. Live usage is NOT pulled from this
-   * context — a fresh pruner would recalibrate the prior call's provider input
-   * against the whole projected branch; an uncalibrated estimate is the honest
-   * pre-send view. Callers wanting calibration pass `usageMetadata` explicitly.
+   * Safe to call off the hot path: the supplied `messages` are never mutated
+   * (each is passed as a clone — the pruner both replaces tool-result slots and
+   * unshifts reasoning blocks into AI content arrays in place), and this
+   * context's own state is untouched apart from refreshing stale instruction
+   * counts (idempotent, exactly what a real call does). Token counts are
+   * recounted for the supplied messages (the context's `indexTokenCountMap` is
+   * keyed to the live run's branch and would missum an arbitrary branch) unless
+   * the caller passes a map it guarantees matches. Calibration is NOT re-derived
+   * from this context's live usage (a fresh pruner would compare the prior
+   * call's provider input against the whole projected branch); the learned
+   * `calibrationRatio` is applied as a static seed, and callers may override it
+   * with a persisted ratio via `opts.calibrationRatio`.
    */
   projectContextUsage(
     messages: BaseMessage[],
     opts?: {
       runId?: string;
       agentId?: string;
-      usageMetadata?: Partial<UsageMetadata>;
+      calibrationRatio?: number;
       indexTokenCountMap?: Record<string, number | undefined>;
     }
   ): t.ContextUsageEvent | null {
@@ -1367,6 +1371,17 @@ export class AgentContext {
     if (tokenCounter == null || this.maxContextTokens == null) {
       return null;
     }
+    /** Refresh stale system overhead (handoff/summary changes) so instruction
+     *  tokens match the prompt a real call would send. */
+    this.initializeSystemRunnable();
+    /** Clone array-content messages: the pruner unshifts reasoning blocks into
+     *  AI content arrays in place, which would otherwise corrupt the caller's
+     *  history. (Slot replacements land on the mapped array, not the caller's.) */
+    const projected = messages.map((message) =>
+      Array.isArray(message.content)
+        ? cloneMessage(message, [...message.content])
+        : message
+    );
     let indexTokenCountMap = opts?.indexTokenCountMap;
     if (indexTokenCountMap == null) {
       indexTokenCountMap = {};
@@ -1384,7 +1399,7 @@ export class AgentContext {
       contextPruningConfig: this.contextPruningConfig,
       summarizationEnabled: this.summarizationEnabled,
       reserveRatio: this.summarizationConfig?.reserveRatio,
-      calibrationRatio: this.calibrationRatio,
+      calibrationRatio: opts?.calibrationRatio ?? this.calibrationRatio,
       getInstructionTokens: () => this.instructionTokens,
     });
     const {
@@ -1395,8 +1410,8 @@ export class AgentContext {
       effectiveInstructionTokens,
       calibrationRatio,
     } = prune({
-      messages: [...messages],
-      usageMetadata: opts?.usageMetadata,
+      messages: projected,
+      usageMetadata: undefined,
       lastCallUsage: undefined,
       totalTokensFresh: false,
     });
