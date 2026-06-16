@@ -28,10 +28,12 @@ export function resolveMaxLLMOutputChars(maxOutputChars?: number): number {
  *  to `maxChars`, walking sources in relevance order (organic first, then news;
  *  highlights in their reranked order). Whole highlights are kept until the
  *  budget is hit, the boundary one is truncated if meaningful room remains, and
- *  the rest are dropped. Snippets/titles/URLs are left untouched (small,
- *  high-signal) and the full content stays in the `WEB_SEARCH` artifact for
- *  citations. Mutates `results` in place; returns how many highlights were
- *  dropped or truncated (0 when everything fit). */
+ *  the rest are dropped. Blank highlights are skipped (never rendered, so never
+ *  charged); a truncated highlight drops its references since markers in the cut
+ *  tail would point at citations no longer shown. Snippets/titles/URLs are left
+ *  untouched (small, high-signal) and per-source `content` stays in the
+ *  `WEB_SEARCH` artifact for citations. Mutates `results` in place; returns how
+ *  many highlights were dropped or truncated (0 when everything fit). */
 function trimHighlightsToBudget(results: t.SearchResultData, maxChars: number): number {
   let used = 0;
   let trimmed = 0;
@@ -47,15 +49,18 @@ function trimHighlightsToBudget(results: t.SearchResultData, maxChars: number): 
       }
       const kept: t.Highlight[] = [];
       for (const highlight of highlights) {
-        const length = highlight.text.length;
-        if (used + length <= maxChars) {
+        const text = highlight.text.trim();
+        if (text.length === 0) {
+          continue;
+        }
+        if (used + text.length <= maxChars) {
           kept.push(highlight);
-          used += length;
+          used += text.length;
           continue;
         }
         const remaining = maxChars - used;
         if (remaining >= MIN_PARTIAL_HIGHLIGHT_CHARS) {
-          kept.push({ ...highlight, text: `${highlight.text.slice(0, remaining)}\n…[truncated]` });
+          kept.push({ score: highlight.score, text: `${text.slice(0, remaining)}\n…[truncated]` });
           used = maxChars;
         }
         trimmed++;

@@ -13,6 +13,12 @@ const makeOrganic = (
 
 const highlight = (text: string, score = 0.9): t.Highlight => ({ text, score });
 
+const reference = (url: string): t.UsedReferences[number] => ({
+  type: 'link',
+  originalIndex: 0,
+  reference: { originalUrl: url, title: 'Ref', text: 'ref' },
+});
+
 const countHighlightBlocks = (output: string): number =>
   (output.match(/### Highlight \d+/g) ?? []).length;
 
@@ -126,6 +132,53 @@ describe('formatResultsForLLM highlight budget', () => {
     expect(output).toContain('A'.repeat(100));
     expect(output).toContain('B'.repeat(100));
     expect(countHighlightBlocks(output)).toBe(2);
+    expect(output).not.toContain(OMISSION_MARKER);
+  });
+
+  test('drops references on a truncated highlight (markers in the cut tail)', () => {
+    const withRefs = highlight('A'.repeat(1000));
+    withRefs.references = [reference('https://cited.example')];
+    const results: t.SearchResultData = {
+      organic: [makeOrganic('https://a.com', [withRefs])],
+    };
+
+    const { output, references } = formatResultsForLLM(0, results, 500);
+
+    expect(output).toContain('…[truncated]');
+    expect(output).not.toContain('Core References');
+    expect(output).not.toContain('https://cited.example');
+    expect(references).toHaveLength(0);
+  });
+
+  test('keeps references on a whole highlight that fits the budget', () => {
+    const withRefs = highlight('A'.repeat(100));
+    withRefs.references = [reference('https://cited.example')];
+    const results: t.SearchResultData = {
+      organic: [makeOrganic('https://a.com', [withRefs])],
+    };
+
+    const { output, references } = formatResultsForLLM(0, results, 50000);
+
+    expect(output).toContain('Core References');
+    expect(references).toHaveLength(1);
+    expect(references[0].link).toBe('https://cited.example');
+  });
+
+  test('skips blank highlights instead of charging them against the budget', () => {
+    const results: t.SearchResultData = {
+      organic: [
+        makeOrganic('https://a.com', [
+          highlight('   \n\t  '),
+          highlight('A'.repeat(100)),
+        ]),
+      ],
+    };
+
+    const { output } = formatResultsForLLM(0, results, 100);
+
+    expect(output).toContain('A'.repeat(100));
+    expect(output).not.toContain('…[truncated]');
+    expect(countHighlightBlocks(output)).toBe(1);
     expect(output).not.toContain(OMISSION_MARKER);
   });
 
