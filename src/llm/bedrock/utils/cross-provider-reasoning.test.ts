@@ -62,6 +62,27 @@ describe('convertToConverseMessages — cross-provider reasoning (Anthropic → 
     });
   });
 
+  it('emits a placeholder (not empty content) when a reasoning-only turn is fully dropped', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('hi'),
+      new AIMessage({
+        content: [
+          {
+            type: 'thinking',
+            thinking: 'only thinking, no other content',
+          } as any,
+        ],
+      }),
+    ];
+    expect(() => convertToConverseMessages(messages)).not.toThrow();
+    const { converseMessages } = convertToConverseMessages(messages);
+    const assistant = converseMessages.find((m) => m.role === 'assistant');
+    const content = assistant!.content as any[];
+    expect(content.length).toBeGreaterThan(0);
+    expect(content.find((b) => 'reasoningContent' in b)).toBeUndefined();
+    expect(content.every((b) => 'text' in b)).toBe(true);
+  });
+
   it('still throws on a genuinely unknown assistant block', () => {
     const messages: BaseMessage[] = [
       new HumanMessage('run code'),

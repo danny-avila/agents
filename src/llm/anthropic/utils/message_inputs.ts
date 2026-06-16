@@ -576,6 +576,15 @@ function _formatContent(message: BaseMessage) {
         };
       } else if (contentPart.type === 'thinking') {
         const thinkingPart = contentPart as AnthropicThinkingBlockParam;
+        // Google thinking-enabled output reuses `type: 'thinking'` but carries
+        // no Anthropic signature. Anthropic rejects an unsigned thinking block,
+        // so on an assistant turn treat it as foreign reasoning and drop it
+        // rather than forward an unusable block. Signed (Anthropic-native)
+        // thinking is forwarded as before.
+        const signature = (thinkingPart as { signature?: string }).signature;
+        if (isAIMessage(message) && (signature == null || signature === '')) {
+          return null;
+        }
         const block: AnthropicThinkingBlockParam = {
           type: 'thinking' as const, // Explicitly setting the type as "thinking"
           thinking: thinkingPart.thinking,

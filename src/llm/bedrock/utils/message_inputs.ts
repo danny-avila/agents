@@ -42,6 +42,13 @@ const FOREIGN_REASONING_TYPES = [
 ];
 
 /**
+ * Bedrock Converse rejects assistant messages with no content blocks. When
+ * filtering (e.g. dropping foreign reasoning) empties an assistant turn that
+ * also has no tool calls, fall back to this placeholder text.
+ */
+const BEDROCK_EMPTY_TEXT_PLACEHOLDER = '_';
+
+/**
  * Convert a LangChain reasoning block to a Bedrock reasoning block.
  */
 export function langchainReasoningBlockToBedrockReasoningBlock(
@@ -692,6 +699,12 @@ function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
       ...(assistantMsg.content ?? []),
       ...toolUseBlocks,
     ] as BedrockContentBlock[];
+  }
+
+  // Bedrock rejects an assistant message with no content blocks; if filtering
+  // (e.g. dropping foreign reasoning) left it empty, emit a placeholder.
+  if (assistantMsg.content == null || assistantMsg.content.length === 0) {
+    assistantMsg.content = [{ text: BEDROCK_EMPTY_TEXT_PLACEHOLDER }];
   }
 
   return assistantMsg;

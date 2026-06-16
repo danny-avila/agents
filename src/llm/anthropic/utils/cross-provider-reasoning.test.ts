@@ -127,6 +127,55 @@ describe('_convertMessagesToAnthropicPayload — cross-provider reasoning blocks
     );
   });
 
+  it('drops an unsigned `thinking` block (Google thinking-enabled output) on an assistant turn', () => {
+    const history: BaseMessage[] = [
+      new HumanMessage('hi'),
+      new AIMessage({
+        content: [
+          {
+            type: 'thinking',
+            thinking: 'google chain of thought, no signature',
+          } as any,
+          { type: 'text', text: 'Answer.' },
+        ],
+      }),
+    ];
+    expect(() => _convertMessagesToAnthropicPayload(history)).not.toThrow();
+    const assistant = _convertMessagesToAnthropicPayload(history).messages.find(
+      (m: any) => m.role === 'assistant'
+    );
+    const blocks = assistant!.content as any[];
+    expect(blocks.find((b) => b.type === 'thinking')).toBeUndefined();
+    expect(blocks.some((b) => b.type === 'text' && b.text === 'Answer.')).toBe(
+      true
+    );
+  });
+
+  it('forwards a signed `thinking` block (Anthropic-native) unchanged', () => {
+    const history: BaseMessage[] = [
+      new HumanMessage('hi'),
+      new AIMessage({
+        content: [
+          {
+            type: 'thinking',
+            thinking: 'native reasoning',
+            signature: 'valid-sig',
+          } as any,
+          { type: 'text', text: 'Answer.' },
+        ],
+      }),
+    ];
+    const assistant = _convertMessagesToAnthropicPayload(history).messages.find(
+      (m: any) => m.role === 'assistant'
+    );
+    const blocks = assistant!.content as any[];
+    expect(blocks.find((b) => b.type === 'thinking')).toMatchObject({
+      type: 'thinking',
+      thinking: 'native reasoning',
+      signature: 'valid-sig',
+    });
+  });
+
   it('throws (not silently drops) on an unknown assistant block such as Google code execution', () => {
     // executableCode/codeExecutionResult carry real visible content; silently
     // dropping them on a Google → Anthropic handoff would lose evidence.
