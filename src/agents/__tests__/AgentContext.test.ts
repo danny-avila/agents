@@ -2165,16 +2165,16 @@ describe('AgentContext', () => {
       const ctx = createBasicContext({ tokenCounter: countByChars });
       ctx.maxContextTokens = maxContextTokens;
       const messages: AIMessage[] = [];
-      const indexTokenCountMap: Record<string, number> = {};
       for (let i = 0; i < count; i++) {
+        // countByChars counts content length, and projectContextUsage recounts
+        // the supplied messages — so size content to the intended per-msg tokens.
+        const content = 'x'.repeat(perMessageTokens);
         messages.push(
           i % 2 === 0
-            ? (new HumanMessage(`m${i}`) as unknown as AIMessage)
-            : new AIMessage(`m${i}`),
+            ? (new HumanMessage(content) as unknown as AIMessage)
+            : new AIMessage(content),
         );
-        indexTokenCountMap[String(i)] = perMessageTokens;
       }
-      ctx.indexTokenCountMap = indexTokenCountMap;
       return { ctx, messages };
     };
 
@@ -2225,6 +2225,93 @@ describe('AgentContext', () => {
 
       expect(ctx.pruneMessages).toBeUndefined();
       expect(ctx.indexTokenCountMap).toEqual(mapBefore);
+    });
+
+    it('does not mutate the caller messages under context pressure', () => {
+      const ctx = createBasicContext({ tokenCounter: countByChars });
+      ctx.maxContextTokens = 400;
+      const consumed = new ToolMessage({
+        content: 'x'.repeat(20_000),
+        tool_call_id: 't1',
+        name: 'tool',
+      });
+      const messages: AIMessage[] = [
+        new HumanMessage('question') as unknown as AIMessage,
+        new AIMessage({
+          content: '',
+          tool_calls: [{ id: 't1', name: 'tool', args: {} }],
+        }),
+        consumed as unknown as AIMessage,
+        new AIMessage('final answer'),
+      ];
+      const originalRef = messages[2];
+      const originalContent = (messages[2] as unknown as ToolMessage).content;
+
+      ctx.projectContextUsage(messages);
+
+      expect(messages[2]).toBe(originalRef);
+      expect((messages[2] as unknown as ToolMessage).content).toBe(
+        originalContent,
+      );
+    });
+
+    it('recounts the supplied branch, ignoring a stale context token map', () => {
+      const ctx = createBasicContext({ tokenCounter: countByChars });
+      ctx.maxContextTokens = 3_000;
+      // Empty/stale map — if it were reused, every message would count as 0 and
+      // nothing would prune. The fresh recount must drive pruning instead.
+      ctx.indexTokenCountMap = {};
+      const messages: AIMessage[] = [];
+      for (let i = 0; i < 6; i++) {
+        messages.push(new HumanMessage('x'.repeat(1_000)) as unknown as AIMessage);
+      }
+
+      const usage = ctx.projectContextUsage(messages);
+
+      expect(usage).not.toBeNull();
+      expect(usage!.breakdown.messageCount).toBeLessThan(6);
+    });
+
+    it('uses a caller-supplied token map when provided', () => {
+      const { ctx, messages } = buildBranch(3_000, 1, 6);
+      // Each message is ~1 char, so a recount would fit all 6. The supplied map
+      // claims 1000 each, forcing a prune — proving the map is honored.
+      const indexTokenCountMap: Record<string, number> = {};
+      for (let i = 0; i < messages.length; i++) {
+        indexTokenCountMap[String(i)] = 1_000;
+      }
+
+      const usage = ctx.projectContextUsage(messages, { indexTokenCountMap });
+
+      expect(usage!.breakdown.messageCount).toBeLessThan(6);
+    });
+
+    it('ignores this context live usage so projections are not recalibrated', () => {
+      const build = (): { ctx: AgentContext; messages: AIMessage[] } => {
+        const ctx = createBasicContext({ tokenCounter: countByChars });
+        ctx.maxContextTokens = 5_000;
+        const messages: AIMessage[] = [0, 1, 2].map(
+          () => new HumanMessage('x'.repeat(1_000)) as unknown as AIMessage,
+        );
+        return { ctx, messages };
+      };
+
+      const clean = build();
+      const cleanUsage = clean.ctx.projectContextUsage(clean.messages);
+
+      const dirty = build();
+      dirty.ctx.currentUsage = {
+        input_tokens: 4_000,
+        output_tokens: 50,
+        total_tokens: 4_050,
+      };
+      dirty.ctx.updateLastCallUsage({ input_tokens: 4_000, output_tokens: 50 });
+      const dirtyUsage = dirty.ctx.projectContextUsage(dirty.messages);
+
+      expect(dirtyUsage!.remainingContextTokens).toBe(
+        cleanUsage!.remainingContextTokens,
+      );
+      expect(dirtyUsage!.calibrationRatio).toBe(cleanUsage!.calibrationRatio);
     });
   });
 });

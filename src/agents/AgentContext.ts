@@ -1339,11 +1339,20 @@ export class AgentContext {
    * invoking the model — the pre-send / page-load / window-switch counterpart to
    * the live `ON_CONTEXT_USAGE` snapshot. Runs the same pruner + budget math the
    * graph uses (`createPruneMessages` → `getTokenBudgetBreakdown` →
-   * `syncBudgetDerivedFields`) so projected numbers match a real call. Uses a
-   * local pruner and never mutates this context, so it is safe to call off the
-   * hot path. Returns null when the context lacks the tokenizer or window needed
-   * to prune. Omits the live post-format reconciliation (provider-specific,
-   * invoke-time) — a small, acceptable delta for a pre-send estimate.
+   * `syncBudgetDerivedFields`) so projected numbers match a real call. Returns
+   * null when the context lacks the tokenizer or window needed to prune. Omits
+   * the live post-format reconciliation (provider-specific, invoke-time) — a
+   * small, acceptable delta for a pre-send estimate.
+   *
+   * Safe to call off the hot path: the pruner replaces tool-result slots in
+   * place, so the supplied `messages` are passed as a shallow copy and never
+   * mutated; this context's own state is untouched. Token counts are recounted
+   * for the supplied messages (the context's `indexTokenCountMap` is keyed to
+   * the live run's branch and would missum an arbitrary branch) unless the
+   * caller passes a map it guarantees matches. Live usage is NOT pulled from this
+   * context — a fresh pruner would recalibrate the prior call's provider input
+   * against the whole projected branch; an uncalibrated estimate is the honest
+   * pre-send view. Callers wanting calibration pass `usageMetadata` explicitly.
    */
   projectContextUsage(
     messages: BaseMessage[],
@@ -1351,18 +1360,27 @@ export class AgentContext {
       runId?: string;
       agentId?: string;
       usageMetadata?: Partial<UsageMetadata>;
+      indexTokenCountMap?: Record<string, number | undefined>;
     }
   ): t.ContextUsageEvent | null {
-    if (this.tokenCounter == null || this.maxContextTokens == null) {
+    const tokenCounter = this.tokenCounter;
+    if (tokenCounter == null || this.maxContextTokens == null) {
       return null;
+    }
+    let indexTokenCountMap = opts?.indexTokenCountMap;
+    if (indexTokenCountMap == null) {
+      indexTokenCountMap = {};
+      for (let i = 0; i < messages.length; i++) {
+        indexTokenCountMap[String(i)] = tokenCounter(messages[i]);
+      }
     }
     const prune = createPruneMessages({
       startIndex: 0,
       provider: this.provider,
-      tokenCounter: this.tokenCounter,
+      tokenCounter,
       maxTokens: this.maxContextTokens,
       thinkingEnabled: isThinkingEnabled(this.provider, this.clientOptions),
-      indexTokenCountMap: this.indexTokenCountMap,
+      indexTokenCountMap,
       contextPruningConfig: this.contextPruningConfig,
       summarizationEnabled: this.summarizationEnabled,
       reserveRatio: this.summarizationConfig?.reserveRatio,
@@ -1377,10 +1395,10 @@ export class AgentContext {
       effectiveInstructionTokens,
       calibrationRatio,
     } = prune({
-      messages,
-      usageMetadata: opts?.usageMetadata ?? this.currentUsage,
-      lastCallUsage: this.lastCallUsage,
-      totalTokensFresh: this.totalTokensFresh,
+      messages: [...messages],
+      usageMetadata: opts?.usageMetadata,
+      lastCallUsage: undefined,
+      totalTokensFresh: false,
     });
     const breakdown = this.getTokenBudgetBreakdown(messages);
     breakdown.messageCount = context.length;
