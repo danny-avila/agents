@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
 import { AIMessage, HumanMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import { _convertMessagesToAnthropicPayload } from './message_inputs';
@@ -15,6 +14,22 @@ import { _convertMessagesToAnthropicPayload } from './message_inputs';
  * surfaced); and a tool call carried only on `tool_calls` survives dropping its
  * reasoning sibling without being duplicated.
  */
+type AnthropicPayload = ReturnType<typeof _convertMessagesToAnthropicPayload>;
+
+/** Minimal view of a converted Anthropic content block the assertions read. */
+interface TestBlock {
+  type?: string;
+  text?: string;
+}
+
+const findAssistant = (payload: AnthropicPayload) =>
+  payload.messages.find((m) => m.role === 'assistant');
+
+const assistantBlocks = (payload: AnthropicPayload): TestBlock[] => {
+  const content = findAssistant(payload)?.content;
+  return Array.isArray(content) ? (content as TestBlock[]) : [];
+};
+
 describe('_convertMessagesToAnthropicPayload — cross-provider reasoning blocks', () => {
   const bedrockHandoffHistory = (): BaseMessage[] => [
     new HumanMessage('research Assort Health'),
@@ -27,14 +42,14 @@ describe('_convertMessagesToAnthropicPayload — cross-provider reasoning blocks
             text: 'Let me search Notion then hand off to the data agent.',
             signature: 'bedrock-signature-not-valid-for-anthropic',
           },
-        } as any,
+        },
         { type: 'text', text: 'Kicking off the searches now.' },
         {
           type: 'tool_use',
           id: 'tooluse_abc',
           name: 'notion-search',
           input: { query: 'Assort Health' },
-        } as any,
+        },
       ],
       tool_calls: [
         {
@@ -55,9 +70,8 @@ describe('_convertMessagesToAnthropicPayload — cross-provider reasoning blocks
 
   it('drops reasoning_content (incl. its foreign signature) but keeps text and tool_use', () => {
     const payload = _convertMessagesToAnthropicPayload(bedrockHandoffHistory());
-    const assistant = payload.messages.find((m: any) => m.role === 'assistant');
-    expect(assistant).toBeDefined();
-    const blocks = assistant!.content as any[];
+    expect(findAssistant(payload)).toBeDefined();
+    const blocks = assistantBlocks(payload);
 
     expect(blocks.find((b) => b.type === 'reasoning_content')).toBeUndefined();
     expect(
@@ -87,19 +101,13 @@ describe('_convertMessagesToAnthropicPayload — cross-provider reasoning blocks
       new HumanMessage('hi'),
       new AIMessage({
         content: [
-          {
-            type: 'reasoning',
-            reasoning: 'internal google chain of thought',
-          } as any,
+          { type: 'reasoning', reasoning: 'internal google chain of thought' },
           { type: 'text', text: 'Hello!' },
         ],
       }),
     ];
     expect(() => _convertMessagesToAnthropicPayload(history)).not.toThrow();
-    const assistant = _convertMessagesToAnthropicPayload(history).messages.find(
-      (m: any) => m.role === 'assistant'
-    );
-    const blocks = assistant!.content as any[];
+    const blocks = assistantBlocks(_convertMessagesToAnthropicPayload(history));
     expect(blocks.find((b) => b.type === 'reasoning')).toBeUndefined();
     expect(blocks.some((b) => b.type === 'text' && b.text === 'Hello!')).toBe(
       true
@@ -111,16 +119,13 @@ describe('_convertMessagesToAnthropicPayload — cross-provider reasoning blocks
       new HumanMessage('hi'),
       new AIMessage({
         content: [
-          { type: 'think', think: 'librechat serialized reasoning' } as any,
+          { type: 'think', think: 'librechat serialized reasoning' },
           { type: 'text', text: 'Done.' },
         ],
       }),
     ];
     expect(() => _convertMessagesToAnthropicPayload(history)).not.toThrow();
-    const assistant = _convertMessagesToAnthropicPayload(history).messages.find(
-      (m: any) => m.role === 'assistant'
-    );
-    const blocks = assistant!.content as any[];
+    const blocks = assistantBlocks(_convertMessagesToAnthropicPayload(history));
     expect(blocks.find((b) => b.type === 'think')).toBeUndefined();
     expect(blocks.some((b) => b.type === 'text' && b.text === 'Done.')).toBe(
       true
@@ -135,16 +140,13 @@ describe('_convertMessagesToAnthropicPayload — cross-provider reasoning blocks
           {
             type: 'thinking',
             thinking: 'google chain of thought, no signature',
-          } as any,
+          },
           { type: 'text', text: 'Answer.' },
         ],
       }),
     ];
     expect(() => _convertMessagesToAnthropicPayload(history)).not.toThrow();
-    const assistant = _convertMessagesToAnthropicPayload(history).messages.find(
-      (m: any) => m.role === 'assistant'
-    );
-    const blocks = assistant!.content as any[];
+    const blocks = assistantBlocks(_convertMessagesToAnthropicPayload(history));
     expect(blocks.find((b) => b.type === 'thinking')).toBeUndefined();
     expect(blocks.some((b) => b.type === 'text' && b.text === 'Answer.')).toBe(
       true
@@ -160,15 +162,12 @@ describe('_convertMessagesToAnthropicPayload — cross-provider reasoning blocks
             type: 'thinking',
             thinking: 'native reasoning',
             signature: 'valid-sig',
-          } as any,
+          },
           { type: 'text', text: 'Answer.' },
         ],
       }),
     ];
-    const assistant = _convertMessagesToAnthropicPayload(history).messages.find(
-      (m: any) => m.role === 'assistant'
-    );
-    const blocks = assistant!.content as any[];
+    const blocks = assistantBlocks(_convertMessagesToAnthropicPayload(history));
     expect(blocks.find((b) => b.type === 'thinking')).toMatchObject({
       type: 'thinking',
       thinking: 'native reasoning',
@@ -186,7 +185,7 @@ describe('_convertMessagesToAnthropicPayload — cross-provider reasoning blocks
           {
             type: 'executableCode',
             executableCode: { language: 'PYTHON', code: 'print(2+2)' },
-          } as any,
+          },
           { type: 'text', text: 'Here is the result.' },
         ],
       }),
@@ -203,7 +202,7 @@ describe('_convertMessagesToAnthropicPayload — cross-provider reasoning blocks
           {
             type: 'video_url',
             video_url: { url: 'https://example.com/v.mp4' },
-          } as any,
+          },
           { type: 'text', text: 'what is in this video?' },
         ],
       }),
@@ -217,10 +216,7 @@ describe('_convertMessagesToAnthropicPayload — cross-provider reasoning blocks
     const history: BaseMessage[] = [
       new HumanMessage({
         content: [
-          {
-            type: 'reasoning_content',
-            reasoningText: { text: 'user text' },
-          } as any,
+          { type: 'reasoning_content', reasoningText: { text: 'user text' } },
           { type: 'text', text: 'hello' },
         ],
       }),
@@ -240,7 +236,7 @@ describe('_convertMessagesToAnthropicPayload — cross-provider reasoning blocks
           {
             type: 'reasoning_content',
             reasoningText: { text: 'I should hand off now.', signature: 'sig' },
-          } as any,
+          },
         ],
         tool_calls: [
           {
@@ -253,13 +249,9 @@ describe('_convertMessagesToAnthropicPayload — cross-provider reasoning blocks
       }),
     ];
     expect(() => _convertMessagesToAnthropicPayload(history)).not.toThrow();
-    const assistant = _convertMessagesToAnthropicPayload(history).messages.find(
-      (m: any) => m.role === 'assistant'
-    );
-    const blocks = assistant!.content as any[];
+    const blocks = assistantBlocks(_convertMessagesToAnthropicPayload(history));
     expect(blocks.find((b) => b.type === 'reasoning_content')).toBeUndefined();
-    const toolUse = blocks.find((b) => b.type === 'tool_use');
-    expect(toolUse).toMatchObject({
+    expect(blocks.find((b) => b.type === 'tool_use')).toMatchObject({
       type: 'tool_use',
       id: 'tooluse_transfer',
       name: 'lc_transfer_to_data_agent',
@@ -277,8 +269,9 @@ describe('_convertMessagesToAnthropicPayload — cross-provider reasoning blocks
       new AIMessage({
         content: [
           {
+            type: 'functionCall',
             functionCall: { name: 'get_weather', args: { city: 'SF' } },
-          } as any,
+          },
         ],
         tool_calls: [
           {
@@ -290,9 +283,7 @@ describe('_convertMessagesToAnthropicPayload — cross-provider reasoning blocks
         ],
       }),
     ];
-    const payload = _convertMessagesToAnthropicPayload(history);
-    const assistant = payload.messages.find((m: any) => m.role === 'assistant');
-    const blocks = assistant!.content as any[];
+    const blocks = assistantBlocks(_convertMessagesToAnthropicPayload(history));
     const toolUses = blocks.filter((b) => b.type === 'tool_use');
     expect(toolUses).toHaveLength(1);
     expect(toolUses[0]).toMatchObject({
@@ -313,15 +304,12 @@ describe('_convertMessagesToAnthropicPayload — cross-provider reasoning blocks
               text: 'only thinking, no visible text',
               signature: 'sig',
             },
-          } as any,
+          },
         ],
       }),
     ];
     expect(() => _convertMessagesToAnthropicPayload(history)).not.toThrow();
-    const assistant = _convertMessagesToAnthropicPayload(history).messages.find(
-      (m: any) => m.role === 'assistant'
-    );
-    const blocks = assistant!.content as any[];
+    const blocks = assistantBlocks(_convertMessagesToAnthropicPayload(history));
     expect(blocks.find((b) => b.type === 'reasoning_content')).toBeUndefined();
     expect(blocks.length).toBeGreaterThan(0);
     expect(blocks.every((b) => b.type === 'text')).toBe(true);

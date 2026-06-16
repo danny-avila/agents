@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
 import { AIMessage, HumanMessage } from '@langchain/core/messages';
 import type { BaseMessage } from '@langchain/core/messages';
 import { convertToConverseMessages } from './message_inputs';
@@ -14,6 +13,24 @@ import { convertToConverseMessages } from './message_inputs';
  * turns, while any other unknown block still throws rather than being silently
  * omitted.
  */
+type ConverseResult = ReturnType<typeof convertToConverseMessages>;
+
+/** Minimal view of a converted Bedrock Converse content block the assertions read. */
+interface ConverseBlock {
+  text?: string;
+  reasoningContent?: { reasoningText?: { text?: string; signature?: string } };
+  toolUse?: {
+    toolUseId?: string;
+    name?: string;
+    input?: Record<string, string>;
+  };
+}
+
+const assistantContent = (result: ConverseResult): ConverseBlock[] => {
+  const msg = result.converseMessages.find((m) => m.role === 'assistant');
+  return (msg?.content ?? []) as ConverseBlock[];
+};
+
 describe('convertToConverseMessages — cross-provider reasoning (Anthropic → Bedrock)', () => {
   it('drops Anthropic thinking/redacted_thinking on an assistant turn, keeping text and tool calls', () => {
     const messages: BaseMessage[] = [
@@ -24,8 +41,8 @@ describe('convertToConverseMessages — cross-provider reasoning (Anthropic → 
             type: 'thinking',
             thinking: 'Let me hand off to the data agent.',
             signature: 'anthropic-signature-not-valid-for-bedrock',
-          } as any,
-          { type: 'redacted_thinking', data: 'redacted-blob' } as any,
+          },
+          { type: 'redacted_thinking', data: 'redacted-blob' },
           { type: 'text', text: 'Handing off now.' },
         ],
         tool_calls: [
@@ -40,21 +57,16 @@ describe('convertToConverseMessages — cross-provider reasoning (Anthropic → 
     ];
 
     expect(() => convertToConverseMessages(messages)).not.toThrow();
-    const { converseMessages } = convertToConverseMessages(messages);
-    const assistant = converseMessages.find((m) => m.role === 'assistant');
-    expect(assistant).toBeDefined();
-    const content = assistant!.content as any[];
+    const content = assistantContent(convertToConverseMessages(messages));
 
-    expect(content.find((b) => 'reasoningContent' in b)).toBeUndefined();
+    expect(content.find((b) => b.reasoningContent != null)).toBeUndefined();
     expect(JSON.stringify(content)).not.toContain(
       'anthropic-signature-not-valid-for-bedrock'
     );
     expect(JSON.stringify(content)).not.toContain('redacted-blob');
 
-    expect(
-      content.some((b) => 'text' in b && b.text === 'Handing off now.')
-    ).toBe(true);
-    const toolUse = content.find((b) => 'toolUse' in b);
+    expect(content.some((b) => b.text === 'Handing off now.')).toBe(true);
+    const toolUse = content.find((b) => b.toolUse != null);
     expect(toolUse?.toolUse).toMatchObject({
       toolUseId: 'tooluse_transfer',
       name: 'lc_transfer_to_data_agent',
@@ -67,20 +79,15 @@ describe('convertToConverseMessages — cross-provider reasoning (Anthropic → 
       new HumanMessage('hi'),
       new AIMessage({
         content: [
-          {
-            type: 'thinking',
-            thinking: 'only thinking, no other content',
-          } as any,
+          { type: 'thinking', thinking: 'only thinking, no other content' },
         ],
       }),
     ];
     expect(() => convertToConverseMessages(messages)).not.toThrow();
-    const { converseMessages } = convertToConverseMessages(messages);
-    const assistant = converseMessages.find((m) => m.role === 'assistant');
-    const content = assistant!.content as any[];
+    const content = assistantContent(convertToConverseMessages(messages));
     expect(content.length).toBeGreaterThan(0);
-    expect(content.find((b) => 'reasoningContent' in b)).toBeUndefined();
-    expect(content.every((b) => 'text' in b)).toBe(true);
+    expect(content.find((b) => b.reasoningContent != null)).toBeUndefined();
+    expect(content.every((b) => typeof b.text === 'string')).toBe(true);
   });
 
   it('still throws on a genuinely unknown assistant block', () => {
@@ -88,7 +95,7 @@ describe('convertToConverseMessages — cross-provider reasoning (Anthropic → 
       new HumanMessage('run code'),
       new AIMessage({
         content: [
-          { type: 'some_future_block_type', foo: 'bar' } as any,
+          { type: 'some_future_block_type', foo: 'bar' },
           { type: 'text', text: 'done' },
         ],
       }),
@@ -109,17 +116,15 @@ describe('convertToConverseMessages — cross-provider reasoning (Anthropic → 
               text: 'native bedrock reasoning',
               signature: 'sig',
             },
-          } as any,
+          },
           { type: 'text', text: 'answer' },
         ],
       }),
     ];
-    const { converseMessages } = convertToConverseMessages(messages);
-    const assistant = converseMessages.find((m) => m.role === 'assistant');
-    const content = assistant!.content as any[];
-    const reasoning = content.find((b) => 'reasoningContent' in b);
+    const content = assistantContent(convertToConverseMessages(messages));
+    const reasoning = content.find((b) => b.reasoningContent != null);
     expect(reasoning).toBeDefined();
-    expect(reasoning.reasoningContent.reasoningText.text).toBe(
+    expect(reasoning?.reasoningContent?.reasoningText?.text).toBe(
       'native bedrock reasoning'
     );
   });
