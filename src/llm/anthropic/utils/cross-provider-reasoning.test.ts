@@ -8,11 +8,12 @@ import { _convertMessagesToAnthropicPayload } from './message_inputs';
  * Bedrock turn that used extended thinking leaves a `reasoning_content` content
  * block ({ reasoningText: { text, signature } }) in the history. The official
  * Anthropic converter has no branch for it and previously threw
- * "Unsupported message content format", crashing the handoff. Foreign reasoning
- * (Bedrock `reasoning_content`, Google `reasoning`, LibreChat `think`) is
- * dropped; an unknown block degrades gracefully on assistant turns but still
- * throws on user/tool input (real content must not be silently omitted); and a
- * tool call carried only on `tool_calls` survives dropping its reasoning sibling.
+ * "Unsupported message content format", crashing the handoff. Only known
+ * foreign reasoning (Bedrock `reasoning_content`, Google `reasoning`, LibreChat
+ * `think`) is dropped; any other unknown block still throws rather than being
+ * silently omitted (real content — user media, Google code-execution — must be
+ * surfaced); and a tool call carried only on `tool_calls` survives dropping its
+ * reasoning sibling without being duplicated.
  */
 describe('_convertMessagesToAnthropicPayload — cross-provider reasoning blocks', () => {
   const bedrockHandoffHistory = (): BaseMessage[] => [
