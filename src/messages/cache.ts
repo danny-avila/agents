@@ -255,36 +255,41 @@ function isCachePoint(block: MessageContentComplex): boolean {
 }
 
 /**
- * Reasoning block types that must never anchor the tail cache breakpoint:
+ * Block types that must never anchor the tail cache breakpoint, because the
+ * marker would not survive to the model call:
  * - `thinking` / `redacted_thinking`: native Anthropic reasoning — the API
  *   rejects `cache_control` on these blocks.
  * - `reasoning_content` / `reasoning` / `think`: foreign reasoning (Bedrock,
  *   Google, LibreChat) that `_convertMessagesToAnthropicPayload` DROPS on
- *   assistant turns during a cross-provider handoff. Anchoring the only
- *   breakpoint on a block that is about to disappear silently loses tail
- *   caching, so these are excluded too.
+ *   assistant turns during a cross-provider handoff.
+ * - `input_json_delta`: persisted partial tool-input deltas, also DROPPED by
+ *   `_convertMessagesToAnthropicPayload` (the assembled input is restored onto
+ *   the tool_use block).
+ * Anchoring the only breakpoint on a block that is about to disappear silently
+ * loses tail caching, so all of these are excluded.
  */
-const NON_ANCHORABLE_REASONING_TYPES = new Set([
+const NON_ANCHORABLE_BLOCK_TYPES = new Set([
   'thinking',
   'redacted_thinking',
   'reasoning_content',
   'reasoning',
   'think',
+  'input_json_delta',
 ]);
 
 /**
  * A block can anchor the tail cache breakpoint when it is a real content block
  * that the Anthropic API accepts `cache_control` on and that survives provider
- * conversion. Native/foreign reasoning blocks are excluded (see
- * {@link NON_ANCHORABLE_REASONING_TYPES}), and empty text blocks are not
- * cacheable, so both are skipped.
+ * conversion. Reasoning / dropped-delta blocks are excluded (see
+ * {@link NON_ANCHORABLE_BLOCK_TYPES}), and empty text blocks are not cacheable,
+ * so both are skipped.
  */
 function isTailCacheableBlock(block: MessageContentComplex): boolean {
   if (isCachePoint(block)) {
     return false;
   }
   const type = (block as { type?: string }).type;
-  if (type == null || NON_ANCHORABLE_REASONING_TYPES.has(type)) {
+  if (type == null || NON_ANCHORABLE_BLOCK_TYPES.has(type)) {
     return false;
   }
   if (type === 'text') {

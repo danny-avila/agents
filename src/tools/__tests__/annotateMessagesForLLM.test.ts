@@ -173,6 +173,56 @@ describe('annotateMessagesForLLM', () => {
     expect(out[0].content).toBe('[ref: tool0turn0]\nplain output');
   });
 
+  it('annotates a live ref on multi-part content (prompt-cache-rewritten tool tail)', () => {
+    /**
+     * A tail tool result that prompt caching rewrote from a string into a
+     * text-block array (to host the cache_control / cachePoint marker) keeps
+     * its `_refKey` on additional_kwargs. The live-ref marker must still be
+     * projected as a leading text block; otherwise the common tool-result
+     * tail silently loses its reference annotation once cached.
+     */
+    const registry = new ToolOutputReferenceRegistry();
+    registry.set('r1', 'tool0turn0', 'raw');
+    const tm = makeToolMessage({
+      content: [
+        { type: 'text', text: 'output', cache_control: { type: 'ephemeral' } },
+      ] as unknown as ToolMessage['content'],
+      additional_kwargs: { _refKey: 'tool0turn0' },
+    });
+    const out = annotateMessagesForLLM([tm], registry, 'r1');
+    const blocks = out[0].content as Array<{
+      type: string;
+      text?: string;
+      cache_control?: unknown;
+    }>;
+    expect(blocks).toHaveLength(2);
+    expect(blocks[0]).toEqual({ type: 'text', text: '[ref: tool0turn0]' });
+    // The original block (and its cache marker) is preserved after the prefix.
+    expect(blocks[1].text).toBe('output');
+    expect(blocks[1].cache_control).toEqual({ type: 'ephemeral' });
+  });
+
+  it('annotates both live ref and unresolved on multi-part content', () => {
+    const registry = new ToolOutputReferenceRegistry();
+    registry.set('r1', 'tool0turn0', 'raw');
+    const tm = makeToolMessage({
+      content: [
+        { type: 'text', text: 'output' },
+      ] as unknown as ToolMessage['content'],
+      additional_kwargs: {
+        _refKey: 'tool0turn0',
+        _unresolvedRefs: ['tool9turn9'],
+      },
+    });
+    const out = annotateMessagesForLLM([tm], registry, 'r1');
+    const blocks = out[0].content as Array<{ type: string; text?: string }>;
+    expect(blocks.map((b) => b.text)).toEqual([
+      '[ref: tool0turn0]',
+      '[unresolved refs: tool9turn9]',
+      'output',
+    ]);
+  });
+
   it('prepends an unresolved-refs warning text block to multi-part content', () => {
     const registry = new ToolOutputReferenceRegistry();
     const tm = makeToolMessage({

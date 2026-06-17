@@ -19,6 +19,7 @@ import {
   convertToProviderContentBlock,
   parseBase64DataUrl,
 } from '@langchain/core/messages';
+import type { AnthropicMessage } from '@/types/messages';
 import {
   AnthropicImageBlockParam,
   AnthropicMessageCreateParams,
@@ -33,6 +34,7 @@ import {
   AnthropicCompactionBlockParam,
   AnthropicToolResponse,
 } from '../types';
+import { addTailCacheControl } from '@/messages/cache';
 import { Constants } from '@/common';
 
 type StandardTextBlock = Data.StandardTextBlock;
@@ -917,6 +919,16 @@ export function modelDisallowsAssistantPrefill(model?: string): boolean {
   return Number(match[1]) >= 6;
 }
 
+function messagesHaveCacheControl(
+  messages: AnthropicMessageCreateParams['messages']
+): boolean {
+  return messages.some(
+    (message) =>
+      Array.isArray(message.content) &&
+      message.content.some((block) => 'cache_control' in block)
+  );
+}
+
 export function stripUnsupportedAssistantPrefill<
   T extends Pick<AnthropicMessageCreateParams, 'messages'> & { model?: string },
 >(request: T): T {
@@ -940,9 +952,23 @@ export function stripUnsupportedAssistantPrefill<
     nextMessages.pop();
   }
 
+  /**
+   * If a single tail prompt-cache breakpoint rode the stripped assistant
+   * prefill, the survivors may now carry no `cache_control` at all, dropping
+   * message caching for this request. Re-anchor the breakpoint on the new tail
+   * (only when one was actually lost, so caching-off requests stay untouched).
+   * Reuses `addTailCacheControl` so the re-anchor honors the same block
+   * exclusions (reasoning / dropped deltas) as the original placement.
+   */
+  const reanchored =
+    messagesHaveCacheControl(messages) &&
+    !messagesHaveCacheControl(nextMessages)
+      ? addTailCacheControl(nextMessages as AnthropicMessage[])
+      : nextMessages;
+
   return {
     ...request,
-    messages: nextMessages,
+    messages: reanchored,
   };
 }
 
