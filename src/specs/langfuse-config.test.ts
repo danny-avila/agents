@@ -3,6 +3,7 @@ import {
   createLangfuseHandler,
   disposeLangfuseHandler,
   hasLangfuseConfigCredentials,
+  isExplicitLangfuseConfig,
   shouldCreateLangfuseHandler,
 } from '@/langfuse';
 
@@ -187,6 +188,39 @@ describe('createLangfuseHandler', () => {
       shouldCreateLangfuseHandler({
         baseUrl: 'https://langfuse.config',
         toolOutputTracing: { enabled: false },
+      })
+    ).toBe(true);
+  });
+
+  it('does not treat sanitized-away trace attributes as explicit config', () => {
+    expect(
+      isExplicitLangfuseConfig({
+        metadata: {
+          empty: '',
+          whitespace: '   ',
+          missing: null,
+          tooLong: 'x'.repeat(201),
+        },
+        tags: ['', '   '],
+      })
+    ).toBe(false);
+  });
+
+  it('treats valid trace metadata or tags as explicit config', () => {
+    expect(
+      isExplicitLangfuseConfig({
+        metadata: {
+          tenantId: 'tenant-1',
+        },
+        tags: ['', '   '],
+      })
+    ).toBe(true);
+    expect(
+      isExplicitLangfuseConfig({
+        metadata: {
+          empty: '',
+        },
+        tags: ['tenant:tenant-1'],
       })
     ).toBe(true);
   });

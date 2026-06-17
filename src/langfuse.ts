@@ -47,8 +47,8 @@ function hasLangfuseTracingConfig(langfuse?: t.LangfuseConfig): boolean {
 
 function hasLangfuseTraceAttributes(langfuse?: t.LangfuseConfig): boolean {
   return (
-    Object.keys(langfuse?.metadata ?? {}).length > 0 ||
-    (langfuse?.tags?.length ?? 0) > 0
+    Object.keys(createTraceMetadata(langfuse?.metadata ?? {})).length > 0 ||
+    (mergeLangfuseTags(undefined, langfuse?.tags)?.length ?? 0) > 0
   );
 }
 
