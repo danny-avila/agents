@@ -1,10 +1,10 @@
 import { CallbackHandler } from '@langfuse/langchain';
 import {
-  createLangfuseHandler,
-  disposeLangfuseHandler,
   hasLangfuseConfigCredentials,
-  isExplicitLangfuseConfig,
   shouldCreateLangfuseHandler,
+  isExplicitLangfuseConfig,
+  disposeLangfuseHandler,
+  createLangfuseHandler,
 } from '@/langfuse';
 
 const mockForceFlush = jest.fn();
