@@ -1754,48 +1754,53 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         );
       }
 
-      // Determine the prompt-cache strategy up front. The tail breakpoint must
-      // be applied AFTER thinking normalization and orphan sanitization (see
-      // below), but orphan sanitization must still run for prompt-cached sends —
-      // so its gate has to know a cache marker is coming. Anthropic/OpenRouter
-      // (which both use the ephemeral cache_control marker) skip when a system
-      // runnable owns the system-prompt breakpoint.
-      const anthropicPromptCache =
+      // Determine the prompt-cache strategy up front. Two distinct facts:
+      //
+      //   `providerPromptCacheEnabled` — prompt caching is on for this provider
+      //   at all. This drives orphan cleanup, because EVERY cached send must be
+      //   sanitized — including the system-runnable path, where AgentContext (not
+      //   this node) adds the body marker.
+      //
+      //   `willAddTailCache` — THIS node will add the marker itself. Anthropic /
+      //   OpenRouter defer to the system runnable when one owns the system-prompt
+      //   breakpoint, so they exclude that case; Bedrock always marks here.
+      const anthropicPromptCacheEnabled =
         agentContext.provider === Providers.ANTHROPIC &&
         (agentContext.clientOptions as t.AnthropicClientOptions | undefined)
-          ?.promptCache === true &&
-        !agentContext.systemRunnable;
-      const openRouterPromptCache =
+          ?.promptCache === true;
+      const openRouterPromptCacheEnabled =
         agentContext.provider === Providers.OPENROUTER &&
         (
           agentContext.clientOptions as
             | t.ProviderOptionsMap[Providers.OPENROUTER]
             | undefined
-        )?.promptCache === true &&
-        !agentContext.systemRunnable;
-      const bedrockPromptCache =
+        )?.promptCache === true;
+      const bedrockPromptCacheEnabled =
         agentContext.provider === Providers.BEDROCK &&
         (
           agentContext.clientOptions as
             | t.BedrockAnthropicClientOptions
             | undefined
         )?.promptCache === true;
-      const willAddTailCache =
-        anthropicPromptCache || openRouterPromptCache || bedrockPromptCache;
+      const providerPromptCacheEnabled =
+        anthropicPromptCacheEnabled ||
+        openRouterPromptCacheEnabled ||
+        bedrockPromptCacheEnabled;
 
       // Intentionally broad: runs when the pruner wasn't used, when any
       // post-pruning transform (ensureThinkingBlock, etc.) reassigned
-      // finalMessages, OR when a prompt-cache marker is about to be added. The
-      // last clause matters because the marker is now applied AFTER this gate:
-      // without it, a prompt-cached send whose pruner returned the context
-      // unchanged would skip cleanup and could ship orphaned AI/tool pairs from
-      // persisted history. sanitizeOrphanToolBlocks fast-paths to a Set diff
-      // check when no orphans exist, so the cost is negligible.
+      // finalMessages, OR when this is a prompt-cached send. The last clause
+      // matters because the marker is now applied AFTER this gate (and, for the
+      // system-runnable path, in AgentContext entirely): without it, a cached
+      // send whose pruner returned the context unchanged would skip cleanup and
+      // could ship orphaned AI/tool pairs from persisted history.
+      // sanitizeOrphanToolBlocks fast-paths to a Set diff check when no orphans
+      // exist, so the cost is negligible.
       const needsOrphanSanitize =
         anthropicLike &&
         (!agentContext.pruneMessages ||
           finalMessages !== messagesToUse ||
-          willAddTailCache);
+          providerPromptCacheEnabled);
       if (needsOrphanSanitize) {
         const beforeSanitize = finalMessages.length;
         finalMessages = sanitizeOrphanToolBlocks(finalMessages);
@@ -1822,10 +1827,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       // cachePoint, and sanitizeOrphanToolBlocks can drop the anchored block — so
       // marking earlier would let the only breakpoint vanish before the model
       // call (zero message caching). Anchoring on the final message list keeps
-      // the marker on a block that actually ships.
-      if (anthropicPromptCache || openRouterPromptCache) {
+      // the marker on a block that actually ships. The system-runnable path
+      // adds its body marker in AgentContext, so this node skips it there.
+      if (
+        (anthropicPromptCacheEnabled || openRouterPromptCacheEnabled) &&
+        !agentContext.systemRunnable
+      ) {
         finalMessages = addTailCacheControl<BaseMessage>(finalMessages);
-      } else if (bedrockPromptCache) {
+      } else if (bedrockPromptCacheEnabled) {
         finalMessages = addBedrockTailCacheControl<BaseMessage>(finalMessages);
       }
 
