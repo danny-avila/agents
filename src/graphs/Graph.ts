@@ -1733,35 +1733,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         }
       }
 
-      if (agentContext.provider === Providers.ANTHROPIC) {
-        const anthropicOptions = agentContext.clientOptions as
-          | t.AnthropicClientOptions
-          | undefined;
-        if (
-          anthropicOptions?.promptCache === true &&
-          !agentContext.systemRunnable
-        ) {
-          finalMessages = addTailCacheControl<BaseMessage>(finalMessages);
-        }
-      } else if (agentContext.provider === Providers.BEDROCK) {
-        const bedrockOptions = agentContext.clientOptions as
-          | t.BedrockAnthropicClientOptions
-          | undefined;
-        if (bedrockOptions?.promptCache === true) {
-          finalMessages = addBedrockTailCacheControl<BaseMessage>(finalMessages);
-        }
-      } else if (agentContext.provider === Providers.OPENROUTER) {
-        const openRouterOptions = agentContext.clientOptions as
-          | t.ProviderOptionsMap[Providers.OPENROUTER]
-          | undefined;
-        if (
-          openRouterOptions?.promptCache === true &&
-          !agentContext.systemRunnable
-        ) {
-          finalMessages = addTailCacheControl<BaseMessage>(finalMessages);
-        }
-      }
-
       if (
         isThinkingEnabled(agentContext.provider, agentContext.clientOptions)
       ) {
@@ -1784,7 +1755,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       }
 
       // Intentionally broad: runs when the pruner wasn't used OR any post-pruning
-      // transform (addCacheControl, ensureThinkingBlock, etc.) reassigned finalMessages.
+      // transform (ensureThinkingBlock, etc.) reassigned finalMessages.
       // sanitizeOrphanToolBlocks fast-paths to a Set diff check when no orphans exist,
       // so the cost is negligible and this acts as a safety net for Anthropic/Bedrock.
       const needsOrphanSanitize =
@@ -1806,6 +1777,44 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             },
             { runId: this.runId, agentId }
           );
+        }
+      }
+
+      // Place the single tail prompt-cache breakpoint LAST, after thinking
+      // normalization and orphan sanitization. ensureThinkingBlockInMessages can
+      // fold a trailing non-thinking AI→Tool chain into a `[Previous agent
+      // context]` HumanMessage whose builder copies text but not cache_control /
+      // cachePoint, and sanitizeOrphanToolBlocks can drop the anchored block — so
+      // marking earlier would let the only breakpoint vanish before the model
+      // call (zero message caching). Anchoring on the final message list keeps
+      // the marker on a block that actually ships.
+      if (agentContext.provider === Providers.ANTHROPIC) {
+        const anthropicOptions = agentContext.clientOptions as
+          | t.AnthropicClientOptions
+          | undefined;
+        if (
+          anthropicOptions?.promptCache === true &&
+          !agentContext.systemRunnable
+        ) {
+          finalMessages = addTailCacheControl<BaseMessage>(finalMessages);
+        }
+      } else if (agentContext.provider === Providers.BEDROCK) {
+        const bedrockOptions = agentContext.clientOptions as
+          | t.BedrockAnthropicClientOptions
+          | undefined;
+        if (bedrockOptions?.promptCache === true) {
+          finalMessages =
+            addBedrockTailCacheControl<BaseMessage>(finalMessages);
+        }
+      } else if (agentContext.provider === Providers.OPENROUTER) {
+        const openRouterOptions = agentContext.clientOptions as
+          | t.ProviderOptionsMap[Providers.OPENROUTER]
+          | undefined;
+        if (
+          openRouterOptions?.promptCache === true &&
+          !agentContext.systemRunnable
+        ) {
+          finalMessages = addTailCacheControl<BaseMessage>(finalMessages);
         }
       }
 

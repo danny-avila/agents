@@ -254,20 +254,37 @@ function isCachePoint(block: MessageContentComplex): boolean {
   return 'cachePoint' in block && !('type' in block);
 }
 
-const THINKING_BLOCK_TYPES = new Set(['thinking', 'redacted_thinking']);
+/**
+ * Reasoning block types that must never anchor the tail cache breakpoint:
+ * - `thinking` / `redacted_thinking`: native Anthropic reasoning — the API
+ *   rejects `cache_control` on these blocks.
+ * - `reasoning_content` / `reasoning` / `think`: foreign reasoning (Bedrock,
+ *   Google, LibreChat) that `_convertMessagesToAnthropicPayload` DROPS on
+ *   assistant turns during a cross-provider handoff. Anchoring the only
+ *   breakpoint on a block that is about to disappear silently loses tail
+ *   caching, so these are excluded too.
+ */
+const NON_ANCHORABLE_REASONING_TYPES = new Set([
+  'thinking',
+  'redacted_thinking',
+  'reasoning_content',
+  'reasoning',
+  'think',
+]);
 
 /**
  * A block can anchor the tail cache breakpoint when it is a real content block
- * that the Anthropic API accepts `cache_control` on. Thinking/redacted_thinking
- * blocks reject cache_control, and empty text blocks are not cacheable, so both
- * are excluded.
+ * that the Anthropic API accepts `cache_control` on and that survives provider
+ * conversion. Native/foreign reasoning blocks are excluded (see
+ * {@link NON_ANCHORABLE_REASONING_TYPES}), and empty text blocks are not
+ * cacheable, so both are skipped.
  */
 function isTailCacheableBlock(block: MessageContentComplex): boolean {
   if (isCachePoint(block)) {
     return false;
   }
   const type = (block as { type?: string }).type;
-  if (type == null || THINKING_BLOCK_TYPES.has(type)) {
+  if (type == null || NON_ANCHORABLE_REASONING_TYPES.has(type)) {
     return false;
   }
   if (type === 'text') {
@@ -335,16 +352,20 @@ export function addTailCacheControl<T extends AnthropicMessage | BaseMessage>(
           delete (cloned as Record<string, unknown>).cache_control;
           modified = true;
         }
-        if (canPlaceMarker && isTailCacheableBlock(cloned as MessageContentComplex)) {
+        if (
+          canPlaceMarker &&
+          isTailCacheableBlock(cloned as MessageContentComplex)
+        ) {
           tailIndex = workingContent.length;
         }
         workingContent.push(cloned as MessageContentComplex);
       }
 
       if (canPlaceMarker && tailIndex >= 0) {
-        (workingContent[tailIndex] as Anthropic.TextBlockParam).cache_control = {
-          type: 'ephemeral',
-        };
+        (workingContent[tailIndex] as Anthropic.TextBlockParam).cache_control =
+          {
+            type: 'ephemeral',
+          };
         markerPlaced = true;
         modified = true;
       }

@@ -135,6 +135,33 @@ describe('addTailCacheControl (single tail breakpoint)', () => {
     expect(blocksOf(result[1])[1]).not.toHaveProperty('cache_control');
   });
 
+  test.each(['reasoning_content', 'reasoning', 'think'])(
+    'does not anchor on a trailing foreign reasoning block (%s)',
+    (reasoningType) => {
+      // Foreign reasoning (Bedrock/Google/LibreChat) is dropped by the
+      // Anthropic converter on assistant turns; anchoring the only breakpoint
+      // there would silently lose tail caching on a cross-provider handoff.
+      const messages: BaseMessage[] = [
+        new HumanMessage('Hi'),
+        new AIMessage({
+          content: toLangChainContent([
+            { type: 'text', text: 'Here is my answer.' },
+            { type: reasoningType, text: 'foreign reasoning' },
+          ] as MessageContentComplex[]),
+        }),
+      ];
+
+      const result = addTailCacheControl(messages);
+
+      expect(countCacheMarkers(result)).toBe(1);
+      // Marker must land on the surviving text block, not the reasoning block.
+      expect(blocksOf(result[1])[0].cache_control).toEqual({
+        type: 'ephemeral',
+      });
+      expect(blocksOf(result[1])[1]).not.toHaveProperty('cache_control');
+    }
+  );
+
   test('skips synthetic meta tail and anchors on the previous real message', () => {
     const realTail = new AIMessage({ content: 'real answer' });
     const metaTail = new HumanMessage({ content: 'reinjected skill body' });
