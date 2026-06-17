@@ -680,33 +680,33 @@ export function resolveLangfuseConfig(
   const toolNodeTracing =
     runLangfuse.toolNodeTracing != null || agentLangfuse.toolNodeTracing != null
       ? {
-          ...runLangfuse.toolNodeTracing,
-          ...agentLangfuse.toolNodeTracing,
-        }
+        ...runLangfuse.toolNodeTracing,
+        ...agentLangfuse.toolNodeTracing,
+      }
       : undefined;
   const toolOutputTracing =
     runLangfuse.toolOutputTracing != null ||
     agentLangfuse.toolOutputTracing != null
       ? {
-          ...runLangfuse.toolOutputTracing,
-          ...agentLangfuse.toolOutputTracing,
-        }
+        ...runLangfuse.toolOutputTracing,
+        ...agentLangfuse.toolOutputTracing,
+      }
       : undefined;
   const metadata =
     runLangfuse.metadata != null || agentLangfuse.metadata != null
       ? {
-          ...runLangfuse.metadata,
-          ...agentLangfuse.metadata,
-        }
+        ...runLangfuse.metadata,
+        ...agentLangfuse.metadata,
+      }
       : undefined;
   const tags =
     runLangfuse.tags != null || agentLangfuse.tags != null
       ? [
-          ...new Set([
-            ...(runLangfuse.tags ?? []),
-            ...(agentLangfuse.tags ?? []),
-          ]),
-        ]
+        ...new Set([
+          ...(runLangfuse.tags ?? []),
+          ...(agentLangfuse.tags ?? []),
+        ]),
+      ]
       : undefined;
 
   return {
