@@ -29,6 +29,29 @@ regardless of where that call's own breakpoints sit.
 This is the dominant agent shape (one request → many tool calls), which is
 exactly where the legacy approach degrades hardest.
 
+### Truncation and compaction
+
+Two harness behaviours mutate the transcript rather than append to it, so they
+deserve explicit treatment:
+
+- **Tool-output truncation** is applied **once, at tool-execution time**
+  ([`ToolNode`](../src/tools/ToolNode.ts) via
+  [`truncateToolResultContent`](../src/utils/truncation.ts)) with a cap derived
+  from the model's **fixed context window**, and the truncated string is what's
+  persisted. It is a pure, deterministic function (covered by
+  [`truncation.test.ts`](../src/utils/__tests__/truncation.test.ts)) and the cap
+  does not vary turn to turn, so a truncated result is a stable block in the
+  prefix — it never re-truncates differently and so never busts the cache.
+- **Compaction (summarization)** replaces the head with a durable summary
+  (`AgentContext.summaryText`, re-injected identically each turn). The
+  compaction event is a one-time cache miss for **any** strategy — the cached
+  prefix genuinely changed. Afterwards the summary is the new stable head and
+  the tail strategy re-establishes append-only caching over the continued
+  transcript. The benchmark's **post-compaction** scenario exercises exactly
+  this transition, and it is one of the largest wins (after compaction the
+  summary is the only user message, so legacy re-sends all continued tool work
+  uncached).
+
 ## Metric
 
 For each model call the provider reports a token breakdown. Summed per scenario:
@@ -56,29 +79,34 @@ direction is stable). `effective` is the headline — lower is cheaper.
 
 | Scenario                                     | strategy |    read |  write |      fresh |          effective |
 | -------------------------------------------- | -------- | ------: | -----: | ---------: | -----------------: |
-| Agent tool loop (1 user turn, N tool rounds) | legacy   |  98,352 | 24,588 | **46,221** |             86,791 |
-|                                              | tail     | 137,363 | 31,801 |     **33** |  **53,521** (−38%) |
+| Agent tool loop (1 user turn, N tool rounds) | legacy   |  92,348 | 23,087 | **44,705** |             82,799 |
+|                                              | tail     | 129,823 | 30,284 |     **33** |  **50,870** (−39%) |
 | Multi-turn chat (frequent user messages)     | legacy   |  90,478 | 23,662 | **21,595** |             60,220 |
-|                                              | tail     | 104,555 | 22,162 |     **18** |  **38,176** (−37%) |
-| Realistic agent (user turns + tool rounds)   | legacy   | 498,440 | 39,525 | **50,654** |            149,904 |
-|                                              | tail     | 519,827 | 41,702 |     **90** | **104,200** (−30%) |
+|                                              | tail     | 118,765 | 25,004 |     **18** |  **43,150** (−28%) |
+| Realistic agent (user turns + tool rounds)   | legacy   | 498,344 | 39,514 | **50,635** |            149,862 |
+|                                              | tail     | 545,327 | 43,202 |     **90** | **108,625** (−28%) |
+| Post-compaction (summary head + tool loop)   | legacy   |  69,852 | 40,538 | **63,346** |            121,004 |
+|                                              | tail     | 123,118 | 47,576 |     **42** |  **71,824** (−41%) |
 
 ### Bedrock (Converse)
 
-| Scenario                                     | strategy |    read |  write |      fresh |         effective |
-| -------------------------------------------- | -------- | ------: | -----: | ---------: | ----------------: |
-| Agent tool loop (1 user turn, N tool rounds) | legacy   | 100,430 | 20,086 | **21,618** |            56,768 |
-|                                              | tail     | 122,308 | 28,778 |     **33** | **48,236** (−15%) |
-| Multi-turn chat (frequent user messages)     | legacy   | 119,565 | 25,164 |         18 |            43,430 |
-|                                              | tail     | 104,555 | 22,162 |         18 | **38,176** (−12%) |
-| Realistic agent (user turns + tool rounds)   | legacy   | 521,423 | 39,514 | **27,556** |           129,091 |
-|                                              | tail     | 596,553 | 46,228 |     **90** | **117,530** (−9%) |
+| Scenario                                     | strategy |    read |  write |      fresh |          effective |
+| -------------------------------------------- | -------- | ------: | -----: | ---------: | -----------------: |
+| Agent tool loop (1 user turn, N tool rounds) | legacy   | 122,940 | 24,588 | **21,633** |             64,662 |
+|                                              | tail     | 121,518 | 28,623 |     **33** |  **47,964** (−26%) |
+| Multi-turn chat (frequent user messages)     | legacy   | 119,560 | 25,163 |         18 |             43,428 |
+|                                              | tail     | 104,555 | 22,162 |         18 |  **38,176** (−12%) |
+| Realistic agent (user turns + tool rounds)   | legacy   | 495,826 | 38,003 | **27,538** |            124,624 |
+|                                              | tail     | 545,327 | 43,202 |     **90** | **108,625** (−13%) |
+| Post-compaction (summary head + tool loop)   | legacy   |  96,139 | 35,287 | **22,808** |             76,531 |
+|                                              | tail     | 123,118 | 47,576 |     **42** |   **71,824** (−6%) |
 
 The tail strategy is cheaper (lower `effective`) in **every** scenario on both
-providers. The clearest signal is `fresh`: the legacy approach reprocesses tens
-of thousands of full-price tokens in any tool-bearing conversation, which the
-tail strategy reduces to near zero. Even the legacy strong case (frequent user
-messages, no tools) is a tie-or-win for the tail strategy.
+providers (4/4 each). The clearest signal is `fresh`: the legacy approach
+reprocesses tens of thousands of full-price tokens in any tool-bearing
+conversation, which the tail strategy reduces to near zero. Even the legacy
+strong case (frequent user messages, no tools) is a tie-or-win for the tail
+strategy.
 
 ## Reproduce
 

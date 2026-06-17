@@ -183,6 +183,84 @@ function agentMixedScenario(nonce: string, rounds: number): BaseMessage[][] {
   return steps;
 }
 
+const SUMMARY_TOKENS = 1500; // compacted-history summary injected post-compaction
+
+/**
+ * Post-compaction (summarization): a few tool rounds on the original context,
+ * then a compaction event replaces the head with a summary message, then the
+ * agent continues. The compaction step is a deliberate cache miss for BOTH
+ * strategies (the cached prefix genuinely changed — unavoidable). What matters
+ * is the POST-compaction phase: the summary becomes the new stable head and the
+ * tail strategy re-establishes append-only caching over the continuing tool
+ * loop, whereas legacy pins on the lone summary user-message and re-sends the
+ * new tool work uncached. (Tool results here are already the truncated,
+ * persisted strings ToolNode stores — truncation is applied once at exec time
+ * with a model-fixed cap, so it does not mutate the prefix across turns.)
+ */
+function postCompactionScenario(
+  nonce: string,
+  rounds: number
+): BaseMessage[][] {
+  const steps: BaseMessage[][] = [];
+
+  // Phase 1: pre-compaction growth on the original context.
+  const pre: BaseMessage[] = [
+    new HumanMessage(
+      `Session ${nonce}. ${filler(STABLE_TOKENS, `pre${nonce}`)}\n\nAnalyze the dataset.`
+    ),
+  ];
+  for (let i = 1; i <= 2; i++) {
+    steps.push([...pre]);
+    pre.push(
+      new AIMessage({
+        content: `Pre ${i}.`,
+        tool_calls: [
+          {
+            id: `pc_${nonce}_${i}`,
+            name: 'process_records',
+            args: { batch: i },
+          },
+        ],
+      })
+    );
+    pre.push(
+      new ToolMessage({
+        tool_call_id: `pc_${nonce}_${i}`,
+        content: `Pre result ${i}. ${filler(TOOL_RESULT_TOKENS, `pr${i}`)}`,
+      })
+    );
+  }
+
+  // Compaction: head replaced by a durable summary; continue from there.
+  const post: BaseMessage[] = [
+    new HumanMessage(
+      `Session ${nonce} (resumed after compaction).\n<summary>\n${filler(SUMMARY_TOKENS, `sum${nonce}`)}\n</summary>\n\nContinue the analysis.`
+    ),
+  ];
+  for (let i = 1; i <= rounds; i++) {
+    steps.push([...post]);
+    post.push(
+      new AIMessage({
+        content: `Post ${i}.`,
+        tool_calls: [
+          {
+            id: `po_${nonce}_${i}`,
+            name: 'process_records',
+            args: { batch: i },
+          },
+        ],
+      })
+    );
+    post.push(
+      new ToolMessage({
+        tool_call_id: `po_${nonce}_${i}`,
+        content: `Post result ${i}. ${filler(TOOL_RESULT_TOKENS, `po${i}`)}`,
+      })
+    );
+  }
+  return steps;
+}
+
 const SCENARIOS: Array<{
   name: string;
   build: (nonce: string, rounds: number) => BaseMessage[][];
@@ -195,6 +273,10 @@ const SCENARIOS: Array<{
   {
     name: 'Realistic agent (user turns + tool rounds)',
     build: agentMixedScenario,
+  },
+  {
+    name: 'Post-compaction (summary head + continued tool loop)',
+    build: postCompactionScenario,
   },
 ];
 
