@@ -832,15 +832,34 @@ function convertToolMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
     content = [{ text: String(msg.content) }];
   }
 
+  // A `cachePoint` is a message-level ContentBlock — it is NOT a valid
+  // ToolResultContentBlock. A tail prompt-cache breakpoint that anchors on a
+  // tool result therefore ends up nested inside `toolResult.content`, which
+  // Bedrock silently ignores (no cache write, no cache read). Hoist any
+  // cachePoint(s) out of the tool result body so they sit as siblings after
+  // it, which is the only position Bedrock honors.
+  const toolResultContent: BedrockContentBlock[] = [];
+  const trailingCachePoints: BedrockContentBlock[] = [];
+  for (const block of content) {
+    if (isDefaultCachePoint(block)) {
+      trailingCachePoints.push({
+        cachePoint: { type: 'default' },
+      } as BedrockContentBlock);
+    } else {
+      toolResultContent.push(block);
+    }
+  }
+
   return {
     role: 'user',
     content: [
       {
         toolResult: {
           toolUseId: toolCallId,
-          content: content as { text: string }[],
+          content: toolResultContent as { text: string }[],
         },
       },
+      ...trailingCachePoints,
     ],
   };
 }

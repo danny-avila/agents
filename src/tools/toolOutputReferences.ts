@@ -682,28 +682,42 @@ export function annotateMessagesForLLM(
         liveRef,
         unresolved
       );
-    } else if (
-      annotates &&
-      Array.isArray(tm.content) &&
-      unresolved.length > 0
-    ) {
-      const warningBlock = {
-        type: 'text' as const,
-        text: `[unresolved refs: ${unresolved.join(', ')}]`,
-      };
+    } else if (annotates && Array.isArray(tm.content)) {
       /**
-       * `as unknown as ToolMessage['content']` is unavoidable here:
-       * LangChain's content union (`MessageContentComplex[] |
-       * DataContentBlock[] | string`) does not accept a freshly built
-       * mixed array literal even though the structural shape is valid
-       * at runtime. The double-cast is structurally safe — we
-       * preserve every block from `tm.content` and prepend a single
-       * `{ type: 'text', text }` block that all providers accept.
+       * Array tool content. The string annotator can't run — this notably
+       * includes a tail tool result that prompt caching rewrote from a string
+       * into a text-block array to host its `cache_control` / `cachePoint`
+       * marker (the `_refKey` survives on `additional_kwargs`). Project the
+       * same markers the string path would, as leading text blocks: the live
+       * `[ref: …]` prefix and/or the unresolved-refs warning. Without this the
+       * common tool-result tail loses its reference marker once cached.
+       *
+       * `as unknown as ToolMessage['content']` is unavoidable: LangChain's
+       * content union does not accept a freshly built mixed array literal even
+       * though the structural shape is valid at runtime. The double-cast is
+       * structurally safe — every original block is preserved and only
+       * `{ type: 'text', text }` blocks (which all providers accept) are
+       * prepended.
        */
-      nextContent = [
-        warningBlock,
-        ...tm.content,
-      ] as unknown as ToolMessage['content'];
+      const prefixBlocks: Array<{ type: 'text'; text: string }> = [];
+      if (liveRef != null) {
+        prefixBlocks.push({
+          type: 'text',
+          text: buildReferencePrefix(liveRef),
+        });
+      }
+      if (unresolved.length > 0) {
+        prefixBlocks.push({
+          type: 'text',
+          text: `[unresolved refs: ${unresolved.join(', ')}]`,
+        });
+      }
+      if (prefixBlocks.length > 0) {
+        nextContent = [
+          ...prefixBlocks,
+          ...tm.content,
+        ] as unknown as ToolMessage['content'];
+      }
     }
 
     /**

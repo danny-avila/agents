@@ -22,7 +22,7 @@ import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { createRemoveAllMessage } from '@/messages/reducer';
 import { splitAtRecencyBoundary } from '@/messages/recency';
 import { getMaxOutputTokensKey } from '@/llm/request';
-import { addCacheControl } from '@/messages/cache';
+import { addTailCacheControl } from '@/messages/cache';
 import { initializeModel } from '@/llm/init';
 import { getChunkContent } from '@/stream';
 import { executeHooks } from '@/hooks';
@@ -1227,7 +1227,7 @@ async function summarizeWithCacheHit({
 
   const fullMessages = [...messages, new HumanMessage(instruction)];
   const invokeMessages =
-    usePromptCache === true ? addCacheControl(fullMessages) : fullMessages;
+    usePromptCache === true ? addTailCacheControl(fullMessages) : fullMessages;
 
   const result = await attemptInvoke(
     {

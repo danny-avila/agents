@@ -140,6 +140,35 @@ export function normalizeAnthropicToolCallId(
   return `${sanitized.slice(0, prefixMaxLength)}_${hash}`;
 }
 
+/**
+ * Lift any `cache_control` off the inner blocks of a tool result onto the
+ * `tool_result` block itself. Anthropic documents the top-level
+ * `messages.content` block as the cacheable position and does not document
+ * caching of sub-content blocks; the API currently honors a nested marker, but
+ * anchoring on the documented position keeps the single tail breakpoint robust
+ * (and mirrors the Bedrock cachePoint hoist). The first marker found wins; it is
+ * stripped from every inner block so exactly one survives, on the outer block.
+ */
+function hoistToolResultCacheControl(
+  content: string | MessageContentComplex[]
+): { content: string | MessageContentComplex[]; cacheControl: unknown } {
+  if (!Array.isArray(content)) {
+    return { content, cacheControl: undefined };
+  }
+  let cacheControl: unknown;
+  const stripped = content.map((block) => {
+    if ('cache_control' in block) {
+      cacheControl ??= (block as Record<string, unknown>).cache_control;
+      const clone = { ...(block as Record<string, unknown>) };
+      delete clone.cache_control;
+      return clone as MessageContentComplex;
+    }
+    return block;
+  });
+  // `stripped` is element-equal to `content` when no marker was present.
+  return { content: stripped, cacheControl };
+}
+
 function _ensureMessageContents(
   messages: BaseMessage[]
 ): (SystemMessage | HumanMessage | AIMessage)[] {
@@ -183,13 +212,20 @@ function _ensureMessageContents(
         const toolMessageContent = (
           message as { content?: BaseMessage['content'] | null }
         ).content;
+        // Hoist a tail cache_control off the inner content onto the
+        // tool_result block itself (the documented cacheable position).
+        const { content: hoistedContent, cacheControl } =
+          toolMessageContent != null
+            ? hoistToolResultCacheControl(_formatContent(message))
+            : { content: undefined, cacheControl: undefined };
         updatedMsgs.push(
           new HumanMessage({
             content: [
               {
                 type: 'tool_result',
-                ...(toolMessageContent != null
-                  ? { content: _formatContent(message) }
+                ...(hoistedContent != null ? { content: hoistedContent } : {}),
+                ...(cacheControl != null
+                  ? { cache_control: cacheControl as { type: 'ephemeral' } }
                   : {}),
                 tool_use_id: normalizeAnthropicToolCallId(
                   (message as ToolMessage).tool_call_id
@@ -917,6 +953,86 @@ export function modelDisallowsAssistantPrefill(model?: string): boolean {
   return Number(match[1]) >= 6;
 }
 
+function messagesHaveCacheControl(
+  messages: AnthropicMessageCreateParams['messages']
+): boolean {
+  return messages.some(
+    (message) =>
+      Array.isArray(message.content) &&
+      message.content.some((block) => 'cache_control' in block)
+  );
+}
+
+/** Anthropic rejects cache_control on these reasoning blocks. */
+const NON_CACHEABLE_PAYLOAD_BLOCK_TYPES = new Set([
+  'thinking',
+  'redacted_thinking',
+]);
+
+/**
+ * Place one ephemeral `cache_control` on the last cacheable block of the final
+ * message of an already-converted Anthropic payload. Used to re-anchor the tail
+ * breakpoint after a trailing assistant prefill is stripped. Operates on the
+ * post-conversion payload, where blocks the converter drops (foreign reasoning,
+ * input_json_delta) are already gone — only native thinking blocks must be
+ * skipped. Returns a new array only when it actually places a marker.
+ */
+function reanchorTailCacheControl(
+  messages: AnthropicMessageCreateParams['messages']
+): AnthropicMessageCreateParams['messages'] {
+  if (messages.length === 0) {
+    return messages;
+  }
+  const lastIndex = messages.length - 1;
+  const tail = messages[lastIndex];
+  const content = tail.content;
+
+  if (typeof content === 'string') {
+    if (content.trim() === '') {
+      return messages;
+    }
+    const next = [...messages];
+    next[lastIndex] = {
+      ...tail,
+      content: [
+        { type: 'text', text: content, cache_control: { type: 'ephemeral' } },
+      ],
+    } as (typeof messages)[number];
+    return next;
+  }
+
+  if (!Array.isArray(content)) {
+    return messages;
+  }
+
+  let anchor = -1;
+  for (let i = 0; i < content.length; i++) {
+    const type = (content[i] as { type?: string }).type;
+    if (type == null || NON_CACHEABLE_PAYLOAD_BLOCK_TYPES.has(type)) {
+      continue;
+    }
+    if (
+      type === 'text' &&
+      ((content[i] as { text?: string }).text ?? '').trim() === ''
+    ) {
+      continue;
+    }
+    anchor = i;
+  }
+  if (anchor < 0) {
+    return messages;
+  }
+
+  const next = [...messages];
+  next[lastIndex] = {
+    ...tail,
+    content: content.map((block, i) =>
+      i === anchor ? { ...block, cache_control: { type: 'ephemeral' } } : block
+    ),
+  } as (typeof messages)[number];
+  return next;
+}
+
 export function stripUnsupportedAssistantPrefill<
   T extends Pick<AnthropicMessageCreateParams, 'messages'> & { model?: string },
 >(request: T): T {
@@ -940,9 +1056,21 @@ export function stripUnsupportedAssistantPrefill<
     nextMessages.pop();
   }
 
+  /**
+   * If a single tail prompt-cache breakpoint rode the stripped assistant
+   * prefill, the survivors may now carry no `cache_control` at all, dropping
+   * message caching for this request. Re-anchor the breakpoint on the new tail
+   * (only when one was actually lost, so caching-off requests stay untouched).
+   */
+  const reanchored =
+    messagesHaveCacheControl(messages) &&
+    !messagesHaveCacheControl(nextMessages)
+      ? reanchorTailCacheControl(nextMessages)
+      : nextMessages;
+
   return {
     ...request,
-    messages: nextMessages,
+    messages: reanchored,
   };
 }
 

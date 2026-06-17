@@ -19,14 +19,14 @@ import {
   convertMessagesToContent,
   sanitizeOrphanToolBlocks,
   extractToolDiscoveries,
-  addBedrockCacheControl,
+  addBedrockTailCacheControl,
   formatArtifactPayload,
   enforceOriginalContentCap,
   formatContentStrings,
   isLegacyConvertible,
   createPruneMessages,
   syncBudgetDerivedFields,
-  addCacheControl,
+  addTailCacheControl,
   getMessageId,
   makeIsDeferred,
   partitionAndMarkAnthropicToolCache,
@@ -1733,35 +1733,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         }
       }
 
-      if (agentContext.provider === Providers.ANTHROPIC) {
-        const anthropicOptions = agentContext.clientOptions as
-          | t.AnthropicClientOptions
-          | undefined;
-        if (
-          anthropicOptions?.promptCache === true &&
-          !agentContext.systemRunnable
-        ) {
-          finalMessages = addCacheControl<BaseMessage>(finalMessages);
-        }
-      } else if (agentContext.provider === Providers.BEDROCK) {
-        const bedrockOptions = agentContext.clientOptions as
-          | t.BedrockAnthropicClientOptions
-          | undefined;
-        if (bedrockOptions?.promptCache === true) {
-          finalMessages = addBedrockCacheControl<BaseMessage>(finalMessages);
-        }
-      } else if (agentContext.provider === Providers.OPENROUTER) {
-        const openRouterOptions = agentContext.clientOptions as
-          | t.ProviderOptionsMap[Providers.OPENROUTER]
-          | undefined;
-        if (
-          openRouterOptions?.promptCache === true &&
-          !agentContext.systemRunnable
-        ) {
-          finalMessages = addCacheControl<BaseMessage>(finalMessages);
-        }
-      }
-
       if (
         isThinkingEnabled(agentContext.provider, agentContext.clientOptions)
       ) {
@@ -1783,13 +1754,53 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         );
       }
 
-      // Intentionally broad: runs when the pruner wasn't used OR any post-pruning
-      // transform (addCacheControl, ensureThinkingBlock, etc.) reassigned finalMessages.
-      // sanitizeOrphanToolBlocks fast-paths to a Set diff check when no orphans exist,
-      // so the cost is negligible and this acts as a safety net for Anthropic/Bedrock.
+      // Determine the prompt-cache strategy up front. Two distinct facts:
+      //
+      //   `providerPromptCacheEnabled` — prompt caching is on for this provider
+      //   at all. This drives orphan cleanup, because EVERY cached send must be
+      //   sanitized — including the system-runnable path, where AgentContext (not
+      //   this node) adds the body marker.
+      //
+      //   `willAddTailCache` — THIS node will add the marker itself. Anthropic /
+      //   OpenRouter defer to the system runnable when one owns the system-prompt
+      //   breakpoint, so they exclude that case; Bedrock always marks here.
+      const anthropicPromptCacheEnabled =
+        agentContext.provider === Providers.ANTHROPIC &&
+        (agentContext.clientOptions as t.AnthropicClientOptions | undefined)
+          ?.promptCache === true;
+      const openRouterPromptCacheEnabled =
+        agentContext.provider === Providers.OPENROUTER &&
+        (
+          agentContext.clientOptions as
+            | t.ProviderOptionsMap[Providers.OPENROUTER]
+            | undefined
+        )?.promptCache === true;
+      const bedrockPromptCacheEnabled =
+        agentContext.provider === Providers.BEDROCK &&
+        (
+          agentContext.clientOptions as
+            | t.BedrockAnthropicClientOptions
+            | undefined
+        )?.promptCache === true;
+      const providerPromptCacheEnabled =
+        anthropicPromptCacheEnabled ||
+        openRouterPromptCacheEnabled ||
+        bedrockPromptCacheEnabled;
+
+      // Intentionally broad: runs when the pruner wasn't used, when any
+      // post-pruning transform (ensureThinkingBlock, etc.) reassigned
+      // finalMessages, OR when this is a prompt-cached send. The last clause
+      // matters because the marker is now applied AFTER this gate (and, for the
+      // system-runnable path, in AgentContext entirely): without it, a cached
+      // send whose pruner returned the context unchanged would skip cleanup and
+      // could ship orphaned AI/tool pairs from persisted history.
+      // sanitizeOrphanToolBlocks fast-paths to a Set diff check when no orphans
+      // exist, so the cost is negligible.
       const needsOrphanSanitize =
         anthropicLike &&
-        (!agentContext.pruneMessages || finalMessages !== messagesToUse);
+        (!agentContext.pruneMessages ||
+          finalMessages !== messagesToUse ||
+          providerPromptCacheEnabled);
       if (needsOrphanSanitize) {
         const beforeSanitize = finalMessages.length;
         finalMessages = sanitizeOrphanToolBlocks(finalMessages);
@@ -1807,6 +1818,24 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             { runId: this.runId, agentId }
           );
         }
+      }
+
+      // Place the single tail prompt-cache breakpoint LAST, after thinking
+      // normalization and orphan sanitization. ensureThinkingBlockInMessages can
+      // fold a trailing non-thinking AI→Tool chain into a `[Previous agent
+      // context]` HumanMessage whose builder copies text but not cache_control /
+      // cachePoint, and sanitizeOrphanToolBlocks can drop the anchored block — so
+      // marking earlier would let the only breakpoint vanish before the model
+      // call (zero message caching). Anchoring on the final message list keeps
+      // the marker on a block that actually ships. The system-runnable path
+      // adds its body marker in AgentContext, so this node skips it there.
+      if (
+        (anthropicPromptCacheEnabled || openRouterPromptCacheEnabled) &&
+        !agentContext.systemRunnable
+      ) {
+        finalMessages = addTailCacheControl<BaseMessage>(finalMessages);
+      } else if (bedrockPromptCacheEnabled) {
+        finalMessages = addBedrockTailCacheControl<BaseMessage>(finalMessages);
       }
 
       if (
