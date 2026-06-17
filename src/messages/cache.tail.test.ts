@@ -4,11 +4,11 @@ import {
   SystemMessage,
   ToolMessage,
 } from '@langchain/core/messages';
-import type Anthropic from '@anthropic-ai/sdk';
 import type {
   BaseMessage,
   MessageContentComplex,
 } from '@langchain/core/messages';
+import type Anthropic from '@anthropic-ai/sdk';
 import type { AnthropicMessages } from '@/types/messages';
 import { addTailCacheControl, addBedrockTailCacheControl } from './cache';
 import { toLangChainContent } from './langchain';
@@ -235,9 +235,7 @@ describe('addBedrockTailCacheControl (single tail cachePoint)', () => {
     expect(countCachePoints(result)).toBe(1);
     const tail = blocksOf(result[2]);
     expect(tail[tail.length - 1]).toEqual({ cachePoint: { type: 'default' } });
-    expect(
-      blocksOf(result[0]).some((b) => 'cachePoint' in b)
-    ).toBe(false);
+    expect(blocksOf(result[0]).some((b) => 'cachePoint' in b)).toBe(false);
   });
 
   test('strips Anthropic cache_control from a system message but never anchors it', () => {
@@ -289,6 +287,26 @@ describe('addBedrockTailCacheControl (single tail cachePoint)', () => {
     expect(countCachePoints(result)).toBe(1);
     expect(blocksOf(result[1])).toEqual([
       { type: 'text', text: 'Final' },
+      { cachePoint: { type: 'default' } },
+    ]);
+  });
+
+  test('anchors on a trailing string tool result (agent-loop tail)', () => {
+    const result = addBedrockTailCacheControl([
+      new HumanMessage('Run the tool'),
+      new AIMessage({
+        content: 'Calling it',
+        tool_calls: [{ id: 't1', name: 'search', args: {} }],
+      }),
+      new ToolMessage({ tool_call_id: 't1', content: 'result body' }),
+    ]);
+
+    // The single cachePoint must land on the trailing tool result so the
+    // tool output is part of the cached prefix; the converter later hoists it
+    // out of toolResult.content (see toolResultCachePoint.test.ts).
+    expect(countCachePoints(result)).toBe(1);
+    expect(blocksOf(result[2])).toEqual([
+      { type: 'text', text: 'result body' },
       { cachePoint: { type: 'default' } },
     ]);
   });
