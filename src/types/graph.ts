@@ -536,6 +536,8 @@ export interface LangfuseConfig {
   publicKey?: string;
   secretKey?: string;
   baseUrl?: string;
+  metadata?: Record<string, string | number | boolean | null | undefined>;
+  tags?: string[];
   toolNodeTracing?: LangfuseToolNodeTracingConfig;
   toolOutputTracing?: LangfuseToolOutputTracingConfig;
   /**

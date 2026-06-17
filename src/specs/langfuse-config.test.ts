@@ -68,6 +68,39 @@ describe('createLangfuseHandler', () => {
     });
   });
 
+  it('adds configured trace metadata and tags to the callback handler', () => {
+    process.env.LANGFUSE_PUBLIC_KEY = 'pk-env';
+    process.env.LANGFUSE_SECRET_KEY = 'sk-env';
+
+    const handler = createLangfuseHandler({
+      langfuse: {
+        metadata: {
+          tenantId: 'tenant-1',
+          empty: '',
+          skipped: null,
+        },
+        tags: ['tenant:tenant-1', 'agent'],
+      },
+      traceMetadata: {
+        messageId: 'message-1',
+        agentId: 'agent-1',
+      },
+      tags: ['librechat', 'agent'],
+    });
+
+    expect(handler).toBeDefined();
+    expect(MockedCallbackHandler).toHaveBeenCalledWith({
+      userId: undefined,
+      sessionId: undefined,
+      traceMetadata: {
+        tenantId: 'tenant-1',
+        messageId: 'message-1',
+        agentId: 'agent-1',
+      },
+      tags: ['librechat', 'agent', 'tenant:tenant-1'],
+    });
+  });
+
   it('creates a handler for explicit credentials supplied in config', () => {
     const handler = createLangfuseHandler({
       langfuse: {

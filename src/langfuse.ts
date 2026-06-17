@@ -11,6 +11,7 @@ const TRACE_METADATA_MAX_LENGTH = 200;
 const LANGFUSE_FORCE_FLUSH_ON_DISPOSE = 'LANGFUSE_FORCE_FLUSH_ON_DISPOSE';
 
 export type LangfuseTraceMetadata = Record<string, string>;
+type LangfuseMetadata = NonNullable<t.LangfuseConfig['metadata']>;
 
 type LangfuseHandlerParams = {
   userId?: string;
@@ -44,6 +45,13 @@ function hasLangfuseTracingConfig(langfuse?: t.LangfuseConfig): boolean {
   );
 }
 
+function hasLangfuseTraceAttributes(langfuse?: t.LangfuseConfig): boolean {
+  return (
+    Object.keys(langfuse?.metadata ?? {}).length > 0 ||
+    (langfuse?.tags?.length ?? 0) > 0
+  );
+}
+
 export function hasLangfuseConfigCredentials(
   langfuse?: t.LangfuseConfig
 ): langfuse is t.LangfuseConfig & {
@@ -67,6 +75,7 @@ export function isExplicitLangfuseConfig(langfuse?: t.LangfuseConfig): boolean {
     isPresent(langfuse?.publicKey) ||
     isPresent(langfuse?.secretKey) ||
     isPresent(langfuse?.baseUrl) ||
+    hasLangfuseTraceAttributes(langfuse) ||
     hasLangfuseTracingConfig(langfuse)
   );
 }
@@ -108,6 +117,27 @@ export function createLangfuseTraceMetadata({
     agentId,
     agentName,
   });
+}
+
+function mergeLangfuseTraceMetadata(
+  traceMetadata?: LangfuseTraceMetadata,
+  metadata?: LangfuseMetadata
+): LangfuseTraceMetadata | undefined {
+  const merged = createTraceMetadata({
+    ...(metadata ?? {}),
+    ...(traceMetadata ?? {}),
+  });
+  return Object.keys(merged).length > 0 ? merged : undefined;
+}
+
+function mergeLangfuseTags(
+  tags?: string[],
+  configTags?: string[]
+): string[] | undefined {
+  const merged = [...(tags ?? []), ...(configTags ?? [])].filter(
+    (tag) => tag.trim() !== ''
+  );
+  return merged.length > 0 ? [...new Set(merged)] : undefined;
 }
 
 export function getLangfuseTraceName(
@@ -161,12 +191,16 @@ export function createLangfuseHandler({
   return new CallbackHandler({
     userId,
     sessionId,
-    traceMetadata,
-    tags,
+    traceMetadata: mergeLangfuseTraceMetadata(
+      traceMetadata,
+      langfuse?.metadata
+    ),
+    tags: mergeLangfuseTags(tags, langfuse?.tags),
   });
 }
 
 function createPropagateAttributeParams({
+  langfuse,
   userId,
   sessionId,
   traceMetadata,
@@ -177,8 +211,8 @@ function createPropagateAttributeParams({
     userId,
     sessionId,
     traceName,
-    tags,
-    metadata: traceMetadata,
+    tags: mergeLangfuseTags(tags, langfuse?.tags),
+    metadata: mergeLangfuseTraceMetadata(traceMetadata, langfuse?.metadata),
   };
 }
 

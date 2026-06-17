@@ -586,6 +586,8 @@ describe('Langfuse tool output tracing redaction', () => {
         publicKey: 'pk-run',
         secretKey: 'sk-run',
         baseUrl: 'https://langfuse.test',
+        metadata: { tenantId: 'tenant-run' },
+        tags: ['tenant:tenant-run', 'shared'],
         toolNodeTracing: { enabled: true },
         toolOutputTracing: {
           enabled: true,
@@ -593,6 +595,8 @@ describe('Langfuse tool output tracing redaction', () => {
         },
       },
       {
+        metadata: { agentId: 'agent-1' },
+        tags: ['shared', 'agent:agent-1'],
         toolOutputTracing: {
           enabled: false,
           redactedToolNames: ['execute_sql'],
@@ -605,6 +609,8 @@ describe('Langfuse tool output tracing redaction', () => {
       publicKey: 'pk-run',
       secretKey: 'sk-run',
       baseUrl: 'https://langfuse.test',
+      metadata: { tenantId: 'tenant-run', agentId: 'agent-1' },
+      tags: ['tenant:tenant-run', 'shared', 'agent:agent-1'],
       toolNodeTracing: { enabled: true },
       toolOutputTracing: {
         enabled: false,
