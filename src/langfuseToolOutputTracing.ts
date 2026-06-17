@@ -692,10 +692,28 @@ export function resolveLangfuseConfig(
         ...agentLangfuse.toolOutputTracing,
       }
       : undefined;
+  const metadata =
+    runLangfuse.metadata != null || agentLangfuse.metadata != null
+      ? {
+        ...runLangfuse.metadata,
+        ...agentLangfuse.metadata,
+      }
+      : undefined;
+  const tags =
+    runLangfuse.tags != null || agentLangfuse.tags != null
+      ? [
+        ...new Set([
+          ...(runLangfuse.tags ?? []),
+          ...(agentLangfuse.tags ?? []),
+        ]),
+      ]
+      : undefined;
 
   return {
     ...runLangfuse,
     ...agentLangfuse,
+    ...(metadata != null ? { metadata } : {}),
+    ...(tags != null ? { tags } : {}),
     ...(toolNodeTracing != null ? { toolNodeTracing } : {}),
     ...(toolOutputTracing != null ? { toolOutputTracing } : {}),
   };

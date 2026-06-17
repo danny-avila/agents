@@ -108,6 +108,50 @@ describe('Langfuse trace metadata includes agentName', () => {
     });
   });
 
+  it('propagates configured Langfuse metadata and tags around processStream observations', async () => {
+    const run = await createTestRun(
+      'DWAINE',
+      {},
+      {
+        langfuse: {
+          metadata: { tenantId: 'tenant-1' },
+          tags: ['tenant:tenant-1'],
+        },
+      }
+    );
+    await run.processStream(
+      { messages: [] },
+      {
+        configurable: {
+          thread_id: 'thread-123',
+          user_id: 'user-456',
+        },
+        version: 'v2',
+      }
+    );
+
+    expect(MockedCallbackHandler).toHaveBeenCalledTimes(1);
+    const ctorArgs = MockedCallbackHandler.mock.calls[0][0];
+    expect(ctorArgs).toMatchObject({
+      traceMetadata: {
+        tenantId: 'tenant-1',
+        messageId: 'test-run-id',
+        agentId: 'agent_abc123',
+        agentName: 'DWAINE',
+      },
+      tags: ['librechat', 'agent', 'tenant:tenant-1'],
+    });
+    expect(MockedPropagateAttributes.mock.calls[0][0]).toMatchObject({
+      tags: ['librechat', 'agent', 'tenant:tenant-1'],
+      metadata: {
+        tenantId: 'tenant-1',
+        messageId: 'test-run-id',
+        agentId: 'agent_abc123',
+        agentName: 'DWAINE',
+      },
+    });
+  });
+
   it('falls back to agentId when agent has no explicit name', async () => {
     const run = await createTestRun();
     await run.processStream(

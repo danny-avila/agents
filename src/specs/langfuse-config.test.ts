@@ -1,9 +1,10 @@
 import { CallbackHandler } from '@langfuse/langchain';
 import {
-  createLangfuseHandler,
-  disposeLangfuseHandler,
   hasLangfuseConfigCredentials,
   shouldCreateLangfuseHandler,
+  isExplicitLangfuseConfig,
+  disposeLangfuseHandler,
+  createLangfuseHandler,
 } from '@/langfuse';
 
 const mockForceFlush = jest.fn();
@@ -65,6 +66,39 @@ describe('createLangfuseHandler', () => {
         agentName: 'DWAINE',
       },
       tags: ['librechat', 'agent'],
+    });
+  });
+
+  it('adds configured trace metadata and tags to the callback handler', () => {
+    process.env.LANGFUSE_PUBLIC_KEY = 'pk-env';
+    process.env.LANGFUSE_SECRET_KEY = 'sk-env';
+
+    const handler = createLangfuseHandler({
+      langfuse: {
+        metadata: {
+          tenantId: 'tenant-1',
+          empty: '',
+          skipped: null,
+        },
+        tags: ['tenant:tenant-1', 'agent'],
+      },
+      traceMetadata: {
+        messageId: 'message-1',
+        agentId: 'agent-1',
+      },
+      tags: ['librechat', 'agent'],
+    });
+
+    expect(handler).toBeDefined();
+    expect(MockedCallbackHandler).toHaveBeenCalledWith({
+      userId: undefined,
+      sessionId: undefined,
+      traceMetadata: {
+        tenantId: 'tenant-1',
+        messageId: 'message-1',
+        agentId: 'agent-1',
+      },
+      tags: ['librechat', 'agent', 'tenant:tenant-1'],
     });
   });
 
@@ -154,6 +188,39 @@ describe('createLangfuseHandler', () => {
       shouldCreateLangfuseHandler({
         baseUrl: 'https://langfuse.config',
         toolOutputTracing: { enabled: false },
+      })
+    ).toBe(true);
+  });
+
+  it('does not treat sanitized-away trace attributes as explicit config', () => {
+    expect(
+      isExplicitLangfuseConfig({
+        metadata: {
+          empty: '',
+          whitespace: '   ',
+          missing: null,
+          tooLong: 'x'.repeat(201),
+        },
+        tags: ['', '   '],
+      })
+    ).toBe(false);
+  });
+
+  it('treats valid trace metadata or tags as explicit config', () => {
+    expect(
+      isExplicitLangfuseConfig({
+        metadata: {
+          tenantId: 'tenant-1',
+        },
+        tags: ['', '   '],
+      })
+    ).toBe(true);
+    expect(
+      isExplicitLangfuseConfig({
+        metadata: {
+          empty: '',
+        },
+        tags: ['tenant:tenant-1'],
       })
     ).toBe(true);
   });
