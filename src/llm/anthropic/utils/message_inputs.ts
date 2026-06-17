@@ -19,7 +19,6 @@ import {
   convertToProviderContentBlock,
   parseBase64DataUrl,
 } from '@langchain/core/messages';
-import type { AnthropicMessage } from '@/types/messages';
 import {
   AnthropicImageBlockParam,
   AnthropicMessageCreateParams,
@@ -34,7 +33,6 @@ import {
   AnthropicCompactionBlockParam,
   AnthropicToolResponse,
 } from '../types';
-import { addTailCacheControl } from '@/messages/cache';
 import { Constants } from '@/common';
 
 type StandardTextBlock = Data.StandardTextBlock;
@@ -965,6 +963,76 @@ function messagesHaveCacheControl(
   );
 }
 
+/** Anthropic rejects cache_control on these reasoning blocks. */
+const NON_CACHEABLE_PAYLOAD_BLOCK_TYPES = new Set([
+  'thinking',
+  'redacted_thinking',
+]);
+
+/**
+ * Place one ephemeral `cache_control` on the last cacheable block of the final
+ * message of an already-converted Anthropic payload. Used to re-anchor the tail
+ * breakpoint after a trailing assistant prefill is stripped. Operates on the
+ * post-conversion payload, where blocks the converter drops (foreign reasoning,
+ * input_json_delta) are already gone — only native thinking blocks must be
+ * skipped. Returns a new array only when it actually places a marker.
+ */
+function reanchorTailCacheControl(
+  messages: AnthropicMessageCreateParams['messages']
+): AnthropicMessageCreateParams['messages'] {
+  if (messages.length === 0) {
+    return messages;
+  }
+  const lastIndex = messages.length - 1;
+  const tail = messages[lastIndex];
+  const content = tail.content;
+
+  if (typeof content === 'string') {
+    if (content.trim() === '') {
+      return messages;
+    }
+    const next = [...messages];
+    next[lastIndex] = {
+      ...tail,
+      content: [
+        { type: 'text', text: content, cache_control: { type: 'ephemeral' } },
+      ],
+    } as (typeof messages)[number];
+    return next;
+  }
+
+  if (!Array.isArray(content)) {
+    return messages;
+  }
+
+  let anchor = -1;
+  for (let i = 0; i < content.length; i++) {
+    const type = (content[i] as { type?: string }).type;
+    if (type == null || NON_CACHEABLE_PAYLOAD_BLOCK_TYPES.has(type)) {
+      continue;
+    }
+    if (
+      type === 'text' &&
+      ((content[i] as { text?: string }).text ?? '').trim() === ''
+    ) {
+      continue;
+    }
+    anchor = i;
+  }
+  if (anchor < 0) {
+    return messages;
+  }
+
+  const next = [...messages];
+  next[lastIndex] = {
+    ...tail,
+    content: content.map((block, i) =>
+      i === anchor ? { ...block, cache_control: { type: 'ephemeral' } } : block
+    ),
+  } as (typeof messages)[number];
+  return next;
+}
+
 export function stripUnsupportedAssistantPrefill<
   T extends Pick<AnthropicMessageCreateParams, 'messages'> & { model?: string },
 >(request: T): T {
@@ -993,13 +1061,11 @@ export function stripUnsupportedAssistantPrefill<
    * prefill, the survivors may now carry no `cache_control` at all, dropping
    * message caching for this request. Re-anchor the breakpoint on the new tail
    * (only when one was actually lost, so caching-off requests stay untouched).
-   * Reuses `addTailCacheControl` so the re-anchor honors the same block
-   * exclusions (reasoning / dropped deltas) as the original placement.
    */
   const reanchored =
     messagesHaveCacheControl(messages) &&
     !messagesHaveCacheControl(nextMessages)
-      ? addTailCacheControl(nextMessages as AnthropicMessage[])
+      ? reanchorTailCacheControl(nextMessages)
       : nextMessages;
 
   return {
