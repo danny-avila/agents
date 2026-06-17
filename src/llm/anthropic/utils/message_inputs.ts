@@ -142,6 +142,35 @@ export function normalizeAnthropicToolCallId(
   return `${sanitized.slice(0, prefixMaxLength)}_${hash}`;
 }
 
+/**
+ * Lift any `cache_control` off the inner blocks of a tool result onto the
+ * `tool_result` block itself. Anthropic documents the top-level
+ * `messages.content` block as the cacheable position and does not document
+ * caching of sub-content blocks; the API currently honors a nested marker, but
+ * anchoring on the documented position keeps the single tail breakpoint robust
+ * (and mirrors the Bedrock cachePoint hoist). The first marker found wins; it is
+ * stripped from every inner block so exactly one survives, on the outer block.
+ */
+function hoistToolResultCacheControl(
+  content: string | MessageContentComplex[]
+): { content: string | MessageContentComplex[]; cacheControl: unknown } {
+  if (!Array.isArray(content)) {
+    return { content, cacheControl: undefined };
+  }
+  let cacheControl: unknown;
+  const stripped = content.map((block) => {
+    if ('cache_control' in block) {
+      cacheControl ??= (block as Record<string, unknown>).cache_control;
+      const clone = { ...(block as Record<string, unknown>) };
+      delete clone.cache_control;
+      return clone as MessageContentComplex;
+    }
+    return block;
+  });
+  // `stripped` is element-equal to `content` when no marker was present.
+  return { content: stripped, cacheControl };
+}
+
 function _ensureMessageContents(
   messages: BaseMessage[]
 ): (SystemMessage | HumanMessage | AIMessage)[] {
@@ -185,13 +214,20 @@ function _ensureMessageContents(
         const toolMessageContent = (
           message as { content?: BaseMessage['content'] | null }
         ).content;
+        // Hoist a tail cache_control off the inner content onto the
+        // tool_result block itself (the documented cacheable position).
+        const { content: hoistedContent, cacheControl } =
+          toolMessageContent != null
+            ? hoistToolResultCacheControl(_formatContent(message))
+            : { content: undefined, cacheControl: undefined };
         updatedMsgs.push(
           new HumanMessage({
             content: [
               {
                 type: 'tool_result',
-                ...(toolMessageContent != null
-                  ? { content: _formatContent(message) }
+                ...(hoistedContent != null ? { content: hoistedContent } : {}),
+                ...(cacheControl != null
+                  ? { cache_control: cacheControl as { type: 'ephemeral' } }
                   : {}),
                 tool_use_id: normalizeAnthropicToolCallId(
                   (message as ToolMessage).tool_call_id

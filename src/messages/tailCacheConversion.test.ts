@@ -71,7 +71,7 @@ describe('tail breakpoint survives Anthropic conversion', () => {
     expect(breakpointSurvives(payload.messages as PayloadMessage[])).toBe(true);
   });
 
-  test('string tool-result tail keeps a usable breakpoint', () => {
+  test('string tool-result tail keeps a usable breakpoint on the tool_result block', () => {
     const messages: BaseMessage[] = [
       new HumanMessage('run it'),
       new AIMessage({
@@ -86,6 +86,27 @@ describe('tail breakpoint survives Anthropic conversion', () => {
     );
 
     expect(breakpointSurvives(payload.messages as PayloadMessage[])).toBe(true);
+
+    // The marker must sit on the top-level tool_result block (the documented
+    // cacheable position), NOT nested inside tool_result.content.
+    const toolResult = (payload.messages as PayloadMessage[])
+      .flatMap((m) => (Array.isArray(m.content) ? m.content : []))
+      .find(
+        (b): b is Record<string, unknown> =>
+          b != null &&
+          typeof b === 'object' &&
+          'type' in b &&
+          (b as { type?: string }).type === 'tool_result'
+      ) as { cache_control?: unknown; content?: unknown } | undefined;
+    expect(toolResult?.cache_control).toEqual({ type: 'ephemeral' });
+    const inner = toolResult?.content;
+    if (Array.isArray(inner)) {
+      expect(
+        inner.some(
+          (b) => b != null && typeof b === 'object' && 'cache_control' in b
+        )
+      ).toBe(false);
+    }
   });
 
   test('marking AFTER the thinking fold preserves the breakpoint (Graph order)', () => {
