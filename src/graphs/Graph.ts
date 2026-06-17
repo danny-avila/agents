@@ -1754,13 +1754,48 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         );
       }
 
-      // Intentionally broad: runs when the pruner wasn't used OR any post-pruning
-      // transform (ensureThinkingBlock, etc.) reassigned finalMessages.
-      // sanitizeOrphanToolBlocks fast-paths to a Set diff check when no orphans exist,
-      // so the cost is negligible and this acts as a safety net for Anthropic/Bedrock.
+      // Determine the prompt-cache strategy up front. The tail breakpoint must
+      // be applied AFTER thinking normalization and orphan sanitization (see
+      // below), but orphan sanitization must still run for prompt-cached sends —
+      // so its gate has to know a cache marker is coming. Anthropic/OpenRouter
+      // (which both use the ephemeral cache_control marker) skip when a system
+      // runnable owns the system-prompt breakpoint.
+      const anthropicPromptCache =
+        agentContext.provider === Providers.ANTHROPIC &&
+        (agentContext.clientOptions as t.AnthropicClientOptions | undefined)
+          ?.promptCache === true &&
+        !agentContext.systemRunnable;
+      const openRouterPromptCache =
+        agentContext.provider === Providers.OPENROUTER &&
+        (
+          agentContext.clientOptions as
+            | t.ProviderOptionsMap[Providers.OPENROUTER]
+            | undefined
+        )?.promptCache === true &&
+        !agentContext.systemRunnable;
+      const bedrockPromptCache =
+        agentContext.provider === Providers.BEDROCK &&
+        (
+          agentContext.clientOptions as
+            | t.BedrockAnthropicClientOptions
+            | undefined
+        )?.promptCache === true;
+      const willAddTailCache =
+        anthropicPromptCache || openRouterPromptCache || bedrockPromptCache;
+
+      // Intentionally broad: runs when the pruner wasn't used, when any
+      // post-pruning transform (ensureThinkingBlock, etc.) reassigned
+      // finalMessages, OR when a prompt-cache marker is about to be added. The
+      // last clause matters because the marker is now applied AFTER this gate:
+      // without it, a prompt-cached send whose pruner returned the context
+      // unchanged would skip cleanup and could ship orphaned AI/tool pairs from
+      // persisted history. sanitizeOrphanToolBlocks fast-paths to a Set diff
+      // check when no orphans exist, so the cost is negligible.
       const needsOrphanSanitize =
         anthropicLike &&
-        (!agentContext.pruneMessages || finalMessages !== messagesToUse);
+        (!agentContext.pruneMessages ||
+          finalMessages !== messagesToUse ||
+          willAddTailCache);
       if (needsOrphanSanitize) {
         const beforeSanitize = finalMessages.length;
         finalMessages = sanitizeOrphanToolBlocks(finalMessages);
@@ -1788,34 +1823,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       // marking earlier would let the only breakpoint vanish before the model
       // call (zero message caching). Anchoring on the final message list keeps
       // the marker on a block that actually ships.
-      if (agentContext.provider === Providers.ANTHROPIC) {
-        const anthropicOptions = agentContext.clientOptions as
-          | t.AnthropicClientOptions
-          | undefined;
-        if (
-          anthropicOptions?.promptCache === true &&
-          !agentContext.systemRunnable
-        ) {
-          finalMessages = addTailCacheControl<BaseMessage>(finalMessages);
-        }
-      } else if (agentContext.provider === Providers.BEDROCK) {
-        const bedrockOptions = agentContext.clientOptions as
-          | t.BedrockAnthropicClientOptions
-          | undefined;
-        if (bedrockOptions?.promptCache === true) {
-          finalMessages =
-            addBedrockTailCacheControl<BaseMessage>(finalMessages);
-        }
-      } else if (agentContext.provider === Providers.OPENROUTER) {
-        const openRouterOptions = agentContext.clientOptions as
-          | t.ProviderOptionsMap[Providers.OPENROUTER]
-          | undefined;
-        if (
-          openRouterOptions?.promptCache === true &&
-          !agentContext.systemRunnable
-        ) {
-          finalMessages = addTailCacheControl<BaseMessage>(finalMessages);
-        }
+      if (anthropicPromptCache || openRouterPromptCache) {
+        finalMessages = addTailCacheControl<BaseMessage>(finalMessages);
+      } else if (bedrockPromptCache) {
+        finalMessages = addBedrockTailCacheControl<BaseMessage>(finalMessages);
       }
 
       if (
