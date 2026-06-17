@@ -73,6 +73,22 @@ export function langchainReasoningBlockToBedrockReasoningBlock(
 }
 
 /**
+ * Whether a reasoning block can be serialized to a valid Bedrock
+ * `reasoningContent`. Bedrock Converse rejects `reasoningText` with a null/empty
+ * `text` (e.g. a signature-only block that never merged with its text), so such
+ * blocks must be dropped rather than sent.
+ */
+function isSerializableBedrockReasoningBlock(
+  content: MessageContentReasoningBlock
+): boolean {
+  if (content.reasoningText != null) {
+    const text = content.reasoningText.text;
+    return text != null && text !== '';
+  }
+  return content.redactedContent != null && content.redactedContent !== '';
+}
+
+/**
  * Concatenate consecutive reasoning blocks in content array.
  */
 export function concatenateLangchainReasoningBlocks(
@@ -653,10 +669,17 @@ function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
           contentBlocks.push({ text });
         }
       } else if (block.type === 'reasoning_content') {
+        const reasoningBlock = block as MessageContentReasoningBlock;
+        // Bedrock Converse rejects reasoningContent whose reasoningText.text is
+        // null/empty (a signature-only block that never merged with its text).
+        // Drop it rather than emit an invalid request; the empty-turn
+        // placeholder below covers a turn left with no content.
+        if (!isSerializableBedrockReasoningBlock(reasoningBlock)) {
+          return;
+        }
         contentBlocks.push({
-          reasoningContent: langchainReasoningBlockToBedrockReasoningBlock(
-            block as MessageContentReasoningBlock
-          ),
+          reasoningContent:
+            langchainReasoningBlockToBedrockReasoningBlock(reasoningBlock),
         } as BedrockContentBlock);
       } else if (isDefaultCachePoint(block)) {
         contentBlocks.push({
