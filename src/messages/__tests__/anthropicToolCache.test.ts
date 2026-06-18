@@ -173,6 +173,27 @@ describe('partitionAndMarkAnthropicToolCache', () => {
       ttl: '1h',
     });
   });
+
+  it('strips a pre-marked earlier static tool so only the tail carries the 1h marker', () => {
+    const a = fakeTool('a-static') as {
+      extras?: { cache_control?: { type: string; ttl?: string } };
+    };
+    a.extras = { cache_control: { type: 'ephemeral' } };
+    const b = fakeTool('b-static');
+    const out = partitionAndMarkAnthropicToolCache(
+      [a, b] as never,
+      () => false,
+      '1h'
+    ) as Array<{
+      extras?: { cache_control?: { type: string; ttl?: string } };
+    }>;
+    // Earlier tool's stray 5m marker is removed so it can't precede the tail.
+    expect(out[0].extras?.cache_control).toBeUndefined();
+    expect(out[1].extras?.cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    });
+  });
 });
 
 describe('makeIsDeferred', () => {

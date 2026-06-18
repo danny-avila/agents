@@ -165,8 +165,11 @@ export function insertBedrockToolCachePoint(
   for (let i = 0; i < tools.length; i++) {
     const tool = tools[i];
     if (isBedrockCachePoint(tool)) {
+      // Normalize an existing cache point to the resolved TTL so a stale
+      // 5-minute tool breakpoint never precedes the new 1-hour system/message
+      // breakpoints (Bedrock requires longer-TTL entries to appear first).
       hasCachePoint = true;
-      cleanedTools.push(tool);
+      cleanedTools.push(cachePoint);
       continue;
     }
     if (tool[BEDROCK_TOOL_CACHE_MARKER] === true) {

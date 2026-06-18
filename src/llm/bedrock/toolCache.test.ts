@@ -167,4 +167,28 @@ describe('partitionAndMarkBedrockToolCache', () => {
       'described_tool description'
     );
   });
+
+  it('normalizes an existing tool cache point to the resolved 1h ttl', () => {
+    const result = insertBedrockToolCachePoint(
+      {
+        tools: [
+          {
+            toolSpec: {
+              name: 'direct_tool',
+              description: 'Direct tool',
+              inputSchema: { json: { type: 'object', properties: {} } },
+            },
+          },
+          { cachePoint: { type: 'default' } },
+        ] as Tool[],
+      },
+      false,
+      '1h'
+    );
+    const cachePoints = (result?.tools ?? []).filter(
+      (t): t is Tool.CachePointMember => 'cachePoint' in t
+    );
+    expect(cachePoints).toHaveLength(1);
+    expect(cachePoints[0].cachePoint).toEqual({ type: 'default', ttl: '1h' });
+  });
 });

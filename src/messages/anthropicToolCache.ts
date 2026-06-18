@@ -82,6 +82,26 @@ function getCacheControlTtl(
   return cacheControl?.ttl === '1h' ? '1h' : undefined;
 }
 
+/**
+ * Return a clone of `tool` with any `cache_control` removed (from the block
+ * itself for built-ins, or from `extras` for custom tools), preserving the
+ * prototype chain. Used to clear stray markers off earlier static tools so they
+ * never anchor a competing breakpoint.
+ */
+function stripCacheControl(
+  tool: AnthropicToolCacheCandidate
+): AnthropicToolCacheCandidate {
+  const prototype = Object.getPrototypeOf(tool) ?? Object.prototype;
+  if (isAnthropicBuiltInTool(tool)) {
+    const wrapped = { ...tool };
+    delete wrapped.cache_control;
+    return Object.assign(Object.create(prototype), wrapped);
+  }
+  const wrapped = { ...tool, extras: { ...(tool.extras ?? {}) } };
+  delete wrapped.extras.cache_control;
+  return Object.assign(Object.create(prototype), wrapped);
+}
+
 function markCacheControl(
   tool: AnthropicToolCacheCandidate,
   ttl?: PromptCacheTtl
@@ -165,20 +185,34 @@ export function partitionAndMarkAnthropicToolCache(
     return tools;
   }
 
+  // Anthropic requires longer-TTL cache breakpoints to precede shorter ones, and
+  // tools render before system/messages. Strip any stray cache_control off the
+  // earlier static tools so a leftover 5-minute marker never sits ahead of the
+  // resolved tool/system/message breakpoint, then stamp (or re-stamp) only the
+  // last static tool with the resolved TTL.
+  let mutated = false;
+  for (let i = 0; i < staticTools.length - 1; i++) {
+    const candidate = staticTools[i] as AnthropicToolCacheCandidate;
+    if (hasCacheControl(candidate)) {
+      staticTools[i] = stripCacheControl(candidate);
+      mutated = true;
+    }
+  }
+
   const last = staticTools[
     staticTools.length - 1
   ] as AnthropicToolCacheCandidate;
-  // Already marked with the resolved TTL? Don't churn the array. A stale marker
-  // carrying a different TTL must be re-stamped: Anthropic requires longer-TTL
-  // breakpoints to precede shorter ones, and tools render before system/messages,
-  // so a leftover 5-minute tool marker ahead of a 1-hour system/message
-  // breakpoint would make the request invalid.
   const desiredTtl: '1h' | undefined = ttl === '1h' ? '1h' : undefined;
-  if (hasCacheControl(last) && getCacheControlTtl(last) === desiredTtl) {
-    if (deferredTools.length === 0) return tools;
-    return [...staticTools, ...deferredTools] as GraphTools;
+  const lastAlreadyCorrect =
+    hasCacheControl(last) && getCacheControlTtl(last) === desiredTtl;
+  if (!lastAlreadyCorrect) {
+    staticTools[staticTools.length - 1] = markCacheControl(last, ttl);
+    mutated = true;
   }
 
-  staticTools[staticTools.length - 1] = markCacheControl(last, ttl);
+  // Nothing changed and nothing to reorder — return the original reference.
+  if (!mutated && deferredTools.length === 0) {
+    return tools;
+  }
   return [...staticTools, ...deferredTools] as GraphTools;
 }
