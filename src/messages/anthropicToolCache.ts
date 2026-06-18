@@ -76,19 +76,19 @@ function hasCacheControl(tool: AnthropicToolCacheCandidate): boolean {
 }
 
 /**
- * Read the extended-cache TTL (`'1h'`) carried by a tool's existing
- * `cache_control`, or `undefined` for the legacy 5-minute marker (no `ttl`).
- * Checks the direct block first, then `extras` (custom tools).
+ * Return the `cache_control` from the location that actually reaches the
+ * Anthropic payload for this tool's shape: directly on the block for
+ * provider-shaped tools (built-ins and raw Anthropic tools), or under `extras`
+ * for LangChain custom tools (the adapter promotes only that). Returns
+ * `undefined` when no marker sits in the effective location — a marker in the
+ * wrong place (e.g. a direct marker on a custom tool) does not count.
  */
-function getCacheControlTtl(
+function getEffectiveCacheControl(
   tool: AnthropicToolCacheCandidate
-): '1h' | undefined {
-  const cacheControl = (
-    isAnthropicBuiltInTool(tool)
-      ? tool.cache_control
-      : (tool.cache_control ?? tool.extras?.cache_control)
+): { ttl?: unknown } | undefined {
+  return (
+    isProviderShapedTool(tool) ? tool.cache_control : tool.extras?.cache_control
   ) as { ttl?: unknown } | undefined;
-  return cacheControl?.ttl === '1h' ? '1h' : undefined;
 }
 
 /**
@@ -241,8 +241,14 @@ export function partitionAndMarkAnthropicToolCache(
     staticTools.length - 1
   ] as AnthropicToolCacheCandidate;
   const desiredTtl: '1h' | undefined = ttl === '1h' ? '1h' : undefined;
+  // "Already correct" requires a marker IN the effective location (one that
+  // reaches the payload for this tool's shape) carrying the resolved TTL. A
+  // marker in the wrong place — e.g. a direct `cache_control` on a LangChain
+  // custom tool — is ineffective and must be re-stamped.
+  const effective = getEffectiveCacheControl(last);
   const lastAlreadyCorrect =
-    hasCacheControl(last) && getCacheControlTtl(last) === desiredTtl;
+    effective != null &&
+    (effective.ttl === '1h' ? '1h' : undefined) === desiredTtl;
   if (!lastAlreadyCorrect) {
     staticTools[staticTools.length - 1] = markCacheControl(last, ttl);
     mutated = true;

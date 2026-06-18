@@ -28,7 +28,6 @@ import {
   syncBudgetDerivedFields,
   addTailCacheControl,
   resolvePromptCacheTtl,
-  resolveBedrockPromptCacheTtl,
   getMessageId,
   makeIsDeferred,
   partitionAndMarkAnthropicToolCache,
@@ -1860,10 +1859,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           | undefined;
         finalMessages = addBedrockTailCacheControl<BaseMessage>(
           finalMessages,
-          resolveBedrockPromptCacheTtl(
-            bedrockOptions?.promptCacheTtl,
-            bedrockOptions?.model
-          )
+          resolvePromptCacheTtl(bedrockOptions?.promptCacheTtl)
         );
       }
 

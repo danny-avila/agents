@@ -285,6 +285,29 @@ describe('partitionAndMarkAnthropicToolCache', () => {
     // deferred tool so the breakpoint precedes discovered tools.
     expect(out.map((t) => t.name)).toEqual(['a-static', 'z-deferred']);
   });
+
+  it('re-stamps a LangChain tool whose marker sits only on the direct block', () => {
+    // A StructuredTool (custom) pre-marked directly — not under extras — does
+    // not reach the payload, so the breakpoint must be re-stamped under extras.
+    const t = fakeTool('a-static') as {
+      cache_control?: unknown;
+      extras?: { cache_control?: { type: string; ttl?: string } };
+    };
+    t.cache_control = { type: 'ephemeral', ttl: '1h' };
+    const out = partitionAndMarkAnthropicToolCache(
+      [t] as never,
+      () => false,
+      '1h'
+    ) as Array<{
+      cache_control?: unknown;
+      extras?: { cache_control?: { type: string; ttl?: string } };
+    }>;
+    expect(out[0].extras?.cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    });
+    expect(out[0].cache_control).toBeUndefined();
+  });
 });
 
 describe('makeIsDeferred', () => {

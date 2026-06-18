@@ -48,48 +48,6 @@ export function resolvePromptCacheTtl(
   return ttl ?? DEFAULT_PROMPT_CACHE_TTL;
 }
 
-/**
- * Bedrock model IDs (matched as a substring of the full model/ARN) that accept
- * the 1-hour extended cache `ttl`. Per AWS, every other Bedrock model — including
- * Sonnet/Opus 4.6 and all 3.x/4.0/4.1 — supports only the 5-minute default, and
- * sending `ttl: '1h'` to them is unsupported. Keep this conservative: a model is
- * opted into 1h only when explicitly listed here.
- * @see https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html
- */
-const BEDROCK_EXTENDED_TTL_MODELS = [
-  'claude-opus-4-5',
-  'claude-sonnet-4-5',
-  'claude-haiku-4-5',
-] as const;
-
-function bedrockModelSupportsExtendedTtl(model: string | undefined): boolean {
-  if (model == null || model === '') {
-    return false;
-  }
-  return BEDROCK_EXTENDED_TTL_MODELS.some((id) => model.includes(id));
-}
-
-/**
- * Resolve the Bedrock prompt-cache checkpoint TTL.
- *
- * An explicit `promptCacheTtl` is always honored (the caller's stated intent).
- * When omitted, the 1-hour extended cache is the default ONLY on Bedrock models
- * that support it ({@link BEDROCK_EXTENDED_TTL_MODELS}); every other model falls
- * back to the legacy 5-minute default so existing `promptCache` configurations
- * on older Bedrock Claude models are never rejected for an unsupported `ttl`.
- */
-export function resolveBedrockPromptCacheTtl(
-  ttl: PromptCacheTtl | undefined,
-  model: string | undefined
-): PromptCacheTtl {
-  if (ttl != null) {
-    return ttl;
-  }
-  return bedrockModelSupportsExtendedTtl(model)
-    ? DEFAULT_PROMPT_CACHE_TTL
-    : '5m';
-}
-
 /** Anthropic `cache_control` shape (the SDK accepts an optional `ttl`). */
 type AnthropicCacheControl = { type: 'ephemeral'; ttl?: '1h' };
 
@@ -220,38 +178,53 @@ export function cloneMessage<T extends MessageWithContent>(
   return cloned;
 }
 
-function stripAnthropicCacheControlFromBlocks(
-  content: MessageContentComplex[]
-): { content: MessageContentComplex[]; modified: boolean } {
-  let modified = false;
-  const strippedContent = content.map((block) => {
-    if (!('cache_control' in block)) {
-      return block;
-    }
-
-    const cloned: MessageContentWithCacheControl = { ...block };
-    delete cloned.cache_control;
-    modified = true;
-    return cloned;
-  });
-
-  return { content: strippedContent, modified };
-}
-
+/**
+ * Sanitize a Bedrock system message: strip Anthropic `cache_control` (Bedrock
+ * conversion can't use it) and normalize any existing `cachePoint` to the
+ * resolved TTL. The normalization matters because Bedrock requires longer-TTL
+ * checkpoints to appear before shorter ones — a stale 5-minute system cachePoint
+ * (host-supplied or carried over from a 5m config) left ahead of a 1-hour
+ * message tail would make the request invalid. System messages are never
+ * anchored as the tail breakpoint; this only fixes markers already present.
+ */
 function sanitizeBedrockSystemMessage<T extends MessageWithContent>(
-  message: T
+  message: T,
+  ttl?: PromptCacheTtl
 ): T {
   const content = message.content;
   if (!Array.isArray(content)) {
     return message;
   }
 
-  const stripped = stripAnthropicCacheControlFromBlocks(content);
-  if (!stripped.modified) {
+  const sanitized: MessageContentComplex[] = [];
+  let modified = false;
+  for (const block of content) {
+    if (isCachePoint(block)) {
+      const existing = (block as { cachePoint?: { ttl?: unknown } }).cachePoint;
+      const desired = buildBedrockCachePoint(ttl);
+      if (existing?.ttl !== desired.ttl) {
+        modified = true;
+        sanitized.push({ cachePoint: desired } as MessageContentComplex);
+      } else {
+        sanitized.push(block);
+      }
+      continue;
+    }
+    if ('cache_control' in block) {
+      const cloned: MessageContentWithCacheControl = { ...block };
+      delete cloned.cache_control;
+      modified = true;
+      sanitized.push(cloned);
+      continue;
+    }
+    sanitized.push(block);
+  }
+
+  if (!modified) {
     return message;
   }
 
-  return cloneMessage(message, stripped.content);
+  return cloneMessage(message, sanitized);
 }
 
 /**
@@ -799,7 +772,7 @@ export function addBedrockCacheControl<
     const isSystemMessage =
       messageType === 'system' || messageRole === 'system';
     if (isSystemMessage) {
-      updatedMessages[i] = sanitizeBedrockSystemMessage(originalMessage);
+      updatedMessages[i] = sanitizeBedrockSystemMessage(originalMessage, ttl);
       continue;
     }
 
@@ -926,7 +899,7 @@ export function addBedrockTailCacheControl<
     const isSystemMessage =
       messageType === 'system' || messageRole === 'system';
     if (isSystemMessage) {
-      updatedMessages[i] = sanitizeBedrockSystemMessage(originalMessage);
+      updatedMessages[i] = sanitizeBedrockSystemMessage(originalMessage, ttl);
       continue;
     }
 

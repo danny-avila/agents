@@ -39,10 +39,7 @@ import {
   handleConverseStreamContentBlockDelta,
   handleConverseStreamMetadata,
 } from './utils';
-import {
-  resolveBedrockPromptCacheTtl,
-  type PromptCacheTtl,
-} from '@/messages/cache';
+import { resolvePromptCacheTtl, type PromptCacheTtl } from '@/messages/cache';
 import { insertBedrockToolCachePoint } from './toolCache';
 
 /**
@@ -68,10 +65,11 @@ export interface CustomChatBedrockConverseInput
   promptCache?: boolean;
 
   /**
-   * Prompt-cache checkpoint TTL. When omitted, defaults to the 1-hour extended
-   * cache on Bedrock models that support it (Claude Opus 4.5 / Sonnet 4.5 /
-   * Haiku 4.5) and to the legacy 5-minute cache on all other models. Set `'5m'`
-   * or `'1h'` to override the per-model default.
+   * Prompt-cache checkpoint TTL. Defaults to `'1h'` (extended cache) when
+   * `promptCache` is enabled; set `'5m'` for the legacy 5-minute behavior.
+   * Bedrock models that don't support the 1-hour TTL downgrade to 5m
+   * server-side (verified on Sonnet/Opus 4.6), so the default is safe to leave
+   * on; use `'5m'` for any model that rejects it.
    */
   promptCacheTtl?: PromptCacheTtl;
 
@@ -127,15 +125,6 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
   promptCacheTtl?: PromptCacheTtl;
 
   /**
-   * Configured Claude model id, captured at construction for prompt-cache TTL
-   * gating. `this.model` is temporarily swapped to the application inference
-   * profile ARN during (non-)streaming generation — when `invocationParams`
-   * runs inside that window — so resolving the TTL against `this.model` there
-   * would misgate. This stable copy is never swapped.
-   */
-  private readonly promptCacheModelId?: string;
-
-  /**
    * Application Inference Profile ARN to use instead of model ID.
    */
   applicationInferenceProfile?: string;
@@ -149,7 +138,6 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
     super(fields);
     this.promptCache = fields?.promptCache;
     this.promptCacheTtl = fields?.promptCacheTtl;
-    this.promptCacheModelId = fields?.model;
     this.applicationInferenceProfile = fields?.applicationInferenceProfile;
     this.serviceTier = fields?.serviceTier;
   }
@@ -180,10 +168,7 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
         ? insertBedrockToolCachePoint(
           baseParams.toolConfig,
           true,
-          resolveBedrockPromptCacheTtl(
-            this.promptCacheTtl,
-            this.promptCacheModelId ?? this.model
-          )
+          resolvePromptCacheTtl(this.promptCacheTtl)
         )
         : baseParams.toolConfig;
 

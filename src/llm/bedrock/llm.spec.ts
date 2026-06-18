@@ -397,18 +397,11 @@ describe('CustomChatBedrockConverse', () => {
       ]);
     });
 
-    test('resolves the tool cache TTL against the configured model when this.model is swapped to an inference profile', () => {
+    test('defaults the tool cache point to the 1h extended TTL', () => {
       const model = new CustomChatBedrockConverse({
         ...baseConstructorArgs,
-        model: 'anthropic.claude-sonnet-4-5-20250929-v1:0',
-        applicationInferenceProfile:
-          'arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abc',
         promptCache: true,
       });
-      // Simulate the in-generation swap that temporarily points this.model at
-      // the profile ARN (which carries no recognizable Claude model id).
-      (model as unknown as { model: string }).model =
-        model.applicationInferenceProfile as string;
 
       const params = model.invocationParams({
         tools: [
@@ -431,6 +424,37 @@ describe('CustomChatBedrockConverse', () => {
       expect((cachePoints[0] as { cachePoint: unknown }).cachePoint).toEqual({
         type: 'default',
         ttl: '1h',
+      });
+    });
+
+    test('honors an explicit 5m promptCacheTtl on the tool cache point', () => {
+      const model = new CustomChatBedrockConverse({
+        ...baseConstructorArgs,
+        promptCache: true,
+        promptCacheTtl: '5m',
+      });
+
+      const params = model.invocationParams({
+        tools: [
+          {
+            type: 'function',
+            function: {
+              name: 'direct_tool',
+              description: 'Direct tool',
+              parameters: { type: 'object', properties: {} },
+            },
+          },
+        ],
+      });
+
+      const toolList = (params.toolConfig?.tools ?? []) as unknown as Array<
+        Record<string, unknown>
+      >;
+      const cachePoints = toolList.filter((t) => 'cachePoint' in t);
+      expect(cachePoints).toHaveLength(1);
+      // 5m omits the ttl field (provider default).
+      expect((cachePoints[0] as { cachePoint: unknown }).cachePoint).toEqual({
+        type: 'default',
       });
     });
 

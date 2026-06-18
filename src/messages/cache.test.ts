@@ -19,7 +19,6 @@ import {
   buildAnthropicCacheControl,
   buildBedrockCachePoint,
   resolvePromptCacheTtl,
-  resolveBedrockPromptCacheTtl,
   DEFAULT_PROMPT_CACHE_TTL,
 } from './cache';
 import { _convertMessagesToOpenAIParams } from '@/llm/openai/utils';
@@ -1834,43 +1833,6 @@ describe('prompt-cache TTL (1h default, 5m legacy)', () => {
     });
   });
 
-  describe('resolveBedrockPromptCacheTtl (model-gated default)', () => {
-    it('defaults to 1h only on Bedrock models that support the extended cache', () => {
-      for (const model of [
-        'anthropic.claude-sonnet-4-5-20250929-v1:0',
-        'us.anthropic.claude-opus-4-5-20251101-v1:0',
-        'anthropic.claude-haiku-4-5-20251001-v1:0',
-      ]) {
-        expect(resolveBedrockPromptCacheTtl(undefined, model)).toBe('1h');
-      }
-    });
-
-    it('falls back to 5m on Bedrock models without 1h support', () => {
-      for (const model of [
-        'anthropic.claude-3-5-sonnet-20241022-v2:0',
-        'anthropic.claude-3-7-sonnet-20250219-v1:0',
-        'anthropic.claude-sonnet-4-6',
-        'anthropic.claude-opus-4-6-v1',
-        'anthropic.claude-opus-4-20250514-v1:0',
-        undefined,
-      ]) {
-        expect(resolveBedrockPromptCacheTtl(undefined, model)).toBe('5m');
-      }
-    });
-
-    it('honors an explicit ttl regardless of model support', () => {
-      expect(
-        resolveBedrockPromptCacheTtl('1h', 'anthropic.claude-3-5-sonnet')
-      ).toBe('1h');
-      expect(
-        resolveBedrockPromptCacheTtl(
-          '5m',
-          'anthropic.claude-sonnet-4-5-20250929-v1:0'
-        )
-      ).toBe('5m');
-    });
-  });
-
   describe('marker builders', () => {
     it('buildAnthropicCacheControl adds ttl only for 1h', () => {
       expect(buildAnthropicCacheControl('1h')).toEqual({
@@ -1983,6 +1945,31 @@ describe('prompt-cache TTL (1h default, 5m legacy)', () => {
           cachePoint: { type: 'default' },
         });
       }
+    });
+
+    it('normalizes a stale 5m system cachePoint to the resolved tail ttl', () => {
+      const msgs: TestMsg[] = [
+        {
+          role: 'system',
+          content: [
+            { type: ContentTypes.TEXT, text: 'System' },
+            { cachePoint: { type: 'default' } } as MessageContentComplex,
+          ],
+        },
+        { role: 'user', content: 'Hello' },
+        { role: 'assistant', content: 'Hi' },
+      ];
+      const result = addBedrockTailCacheControl(msgs, '1h');
+      // Stale 5m system checkpoint is upgraded to 1h so it never precedes the
+      // 1h message tail (Bedrock requires longer-TTL checkpoints first).
+      const system = result[0].content as MessageContentComplex[];
+      expect(system[system.length - 1]).toEqual({
+        cachePoint: { type: 'default', ttl: '1h' },
+      });
+      const tail = result[result.length - 1].content as MessageContentComplex[];
+      expect(tail[tail.length - 1]).toEqual({
+        cachePoint: { type: 'default', ttl: '1h' },
+      });
     });
   });
 

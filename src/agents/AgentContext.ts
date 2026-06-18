@@ -14,7 +14,6 @@ import {
   buildAnthropicCacheControl,
   buildBedrockCachePoint,
   resolvePromptCacheTtl,
-  resolveBedrockPromptCacheTtl,
   cloneMessage,
   type PromptCacheTtl,
 } from '@/messages/cache';
@@ -868,18 +867,14 @@ export class AgentContext {
   }
 
   /**
-   * Resolved TTL for Bedrock prompt-cache checkpoints. Defaults to `'1h'` only
-   * on Bedrock models that support the extended cache; older models fall back
-   * to the 5-minute default so unsupported `ttl` values are never sent.
+   * Resolved TTL for Bedrock prompt-cache checkpoints (default `'1h'`).
+   * Models that don't support the 1-hour TTL downgrade to 5m server-side.
    */
   private getBedrockPromptCacheTtl(): PromptCacheTtl {
     const bedrockOptions = this.clientOptions as
       | t.BedrockAnthropicClientOptions
       | undefined;
-    return resolveBedrockPromptCacheTtl(
-      bedrockOptions?.promptCacheTtl,
-      bedrockOptions?.model
-    );
+    return resolvePromptCacheTtl(bedrockOptions?.promptCacheTtl);
   }
 
   private buildSystemMessage({

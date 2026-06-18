@@ -745,7 +745,9 @@ describe('AgentContext', () => {
       const result = await ctx.systemRunnable!.invoke([
         new HumanMessage('Hello'),
       ]);
-      const finalMessages = addBedrockCacheControl(result);
+      // The graph applies the same resolved TTL it stamped on the system
+      // checkpoint, so the 1h system cachePoint is preserved (normalized to 1h).
+      const finalMessages = addBedrockCacheControl(result, '1h');
       expect(finalMessages[0].content).toEqual([
         { type: 'text', text: 'Stable instructions' },
         { cachePoint: { type: 'default', ttl: '1h' } },
