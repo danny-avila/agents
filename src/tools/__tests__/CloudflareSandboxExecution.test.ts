@@ -257,6 +257,42 @@ describe('Cloudflare sandbox execution backend', () => {
     expect(result.timedOut).toBe(true);
   });
 
+  it('rejects with a client-side timeout when sandbox exec stalls (no native cancellation)', async () => {
+    // The native Cloudflare Sandbox DO exec() is uncancellable (ExecOptions has no
+    // signal) and its own `timeout` is not enforced when the container/RPC stalls,
+    // while the in-sandbox `timeout(1)` wrapper only bounds a *running* command.
+    // Without a client-side race a stalled exec hangs until the host's run-level
+    // abort, burning the whole budget on one tool call (issue #251).
+    jest.useFakeTimers();
+    try {
+      let mainExecCalls = 0;
+      const sandbox = createRuntime({
+        exec: (command) => {
+          // Cleanup (`rm -rf`) resolves immediately; the real command stalls,
+          // simulating an unresponsive / cold container exec that never returns.
+          if (command.startsWith('rm -rf')) {
+            return Promise.resolve({ exitCode: 0, stdout: '', stderr: '' });
+          }
+          mainExecCalls += 1;
+          return new Promise<t.CloudflareSandboxExecResult>(() => undefined);
+        },
+      });
+
+      const promise = executeCloudflareCode(
+        { lang: 'py', code: 'print("slow")' },
+        { sandbox, workspaceRoot: '/workspace', timeoutMs: 1000 }
+      );
+      const assertion = expect(promise).rejects.toThrow(/client-side timeout/);
+
+      // Client backstop = outerTimeoutMs(1000) + 5000 = 11000ms; advance past it.
+      await jest.advanceTimersByTimeAsync(11500);
+      await assertion;
+      expect(mainExecCalls).toBe(1);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   it('passes call-specific timeouts to the Cloudflare spawn wrapper', async () => {
     let execCommand = '';
     let execTimeout: number | undefined;

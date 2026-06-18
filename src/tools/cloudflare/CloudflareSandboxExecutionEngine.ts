@@ -131,6 +131,63 @@ function isInSandboxTimeoutExit(exitCode: number | null): boolean {
   return exitCode === 124 || exitCode === 137;
 }
 
+/**
+ * Client-side backstop timeout for a `sandbox.exec()` await: a few seconds beyond
+ * the exec's own `timeout` option, so a stalled exec that never honors `timeout`
+ * still can't outlast this.
+ */
+function clientExecTimeoutMs(timeoutMs: number): number {
+  return outerTimeoutMs(timeoutMs) + 5000;
+}
+
+/**
+ * Bound a `sandbox.exec()` await with a CLIENT-SIDE timeout.
+ *
+ * The native Cloudflare Sandbox Durable Object `exec()` is effectively
+ * uncancellable from the host: `ExecOptions` has no `signal` (so
+ * `supportsExecSignal` is false for the native transport), and its `timeout`
+ * option is not reliably enforced when the container/RPC itself stalls — while
+ * the in-sandbox `timeout(1)` wrapper only bounds a command that is actually
+ * running. So a stalled exec (an unresponsive/cold container) otherwise hangs
+ * until the host's run-level abort, burning the whole run budget on one tool
+ * call. This race guarantees the host await settles within `timeoutMs`
+ * regardless of the transport.
+ *
+ * On timeout the underlying `exec` promise may keep running in the DO (a
+ * native-DO exec cannot be truly cancelled), so its late settlement is swallowed
+ * to avoid an unhandled rejection.
+ */
+async function withClientTimeout<T>(
+  exec: Promise<T>,
+  timeoutMs: number,
+  label: string
+): Promise<T> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    return exec;
+  }
+  // Swallow a late rejection from the losing promise after the race settles.
+  exec.catch(() => undefined);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      exec,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          reject(
+            new Error(
+              `${label} exceeded ${timeoutMs}ms client-side timeout (sandbox exec did not return)`
+            )
+          );
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
+}
+
 function truncateOutput(value: string, maxChars: number): string {
   if (maxChars <= 0 || value.length <= maxChars) {
     return value;
@@ -466,7 +523,11 @@ function createCloudflareSpawn(
         execOptions.signal = abortController.signal;
       }
       try {
-        const result = await ctx.sandbox.exec(timedCommand, execOptions);
+        const result = await withClientTimeout(
+          ctx.sandbox.exec(timedCommand, execOptions),
+          clientExecTimeoutMs(timeoutMs),
+          'cloudflare sandbox exec'
+        );
         if (isClosed()) {
           return;
         }
@@ -551,13 +612,14 @@ export async function executeCloudflareBash(
     args.length > 0
       ? `${ctx.shell} -lc ${quote(command)} -- ${args.map(quote).join(' ')}`
       : `${ctx.shell} -lc ${quote(command)}`;
-  const result = await ctx.sandbox.exec(
-    withInSandboxTimeout(shellCommand, ctx.timeoutMs),
-    {
+  const result = await withClientTimeout(
+    ctx.sandbox.exec(withInSandboxTimeout(shellCommand, ctx.timeoutMs), {
       cwd: ctx.workspaceRoot,
       env: ctx.env,
       timeout: outerTimeoutMs(ctx.timeoutMs),
-    }
+    }),
+    clientExecTimeoutMs(ctx.timeoutMs),
+    'cloudflare sandbox bash exec'
   );
   return {
     stdout: truncateOutput(result.stdout, ctx.maxOutputChars),
@@ -704,13 +766,14 @@ export async function executeCloudflareCode(
     );
   }
   try {
-    const result = await ctx.sandbox.exec(
-      withInSandboxTimeout(runtime.command, ctx.timeoutMs),
-      {
+    const result = await withClientTimeout(
+      ctx.sandbox.exec(withInSandboxTimeout(runtime.command, ctx.timeoutMs), {
         cwd: ctx.workspaceRoot,
         env: ctx.env,
         timeout: outerTimeoutMs(ctx.timeoutMs),
-      }
+      }),
+      clientExecTimeoutMs(ctx.timeoutMs),
+      'cloudflare sandbox code-exec'
     );
     return {
       stdout: truncateOutput(result.stdout, ctx.maxOutputChars),
@@ -719,13 +782,15 @@ export async function executeCloudflareCode(
       timedOut: isInSandboxTimeoutExit(result.exitCode),
     };
   } finally {
-    await ctx.sandbox
-      .exec(`rm -rf ${quote(tempDir)}`, {
+    await withClientTimeout(
+      ctx.sandbox.exec(`rm -rf ${quote(tempDir)}`, {
         cwd: ctx.workspaceRoot,
         env: ctx.env,
         timeout: 10000,
-      })
-      .catch(() => undefined);
+      }),
+      clientExecTimeoutMs(10000),
+      'cloudflare sandbox cleanup'
+    ).catch(() => undefined);
   }
 }
 
