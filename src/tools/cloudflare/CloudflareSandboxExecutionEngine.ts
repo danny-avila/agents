@@ -184,12 +184,15 @@ export async function withClientTimeout<T>(
       exec,
       new Promise<never>((_resolve, reject) => {
         timer = setTimeout(() => {
-          options.onTimeout?.();
+          // Reject FIRST so this client-timeout message reliably wins the race;
+          // only then abort a signal-aware exec, whose resulting AbortError must
+          // not surface to the caller instead of the timeout.
           reject(
             new Error(
               `${label} exceeded ${timeoutMs}ms client-side timeout (sandbox exec did not return)`
             )
           );
+          options.onTimeout?.();
         }, timeoutMs);
         if (options.unref === true) {
           (timer as { unref?: () => void } | undefined)?.unref?.();
@@ -215,7 +218,8 @@ export async function execWithClientTimeout(
   command: string,
   options: t.CloudflareSandboxExecOptions,
   timeoutMs: number,
-  label: string
+  label: string,
+  runOptions: { unref?: boolean } = {}
 ): Promise<t.CloudflareSandboxExecResult> {
   const controller = new AbortController();
   const execOptions: t.CloudflareSandboxExecOptions = { ...options };
@@ -227,6 +231,7 @@ export async function execWithClientTimeout(
     timeoutMs,
     label,
     {
+      unref: runOptions.unref,
       onTimeout: () => controller.abort(),
     }
   );
@@ -839,12 +844,14 @@ export async function executeCloudflareCode(
     // After a stalled/failed run, detach it (unref'd) so we don't pile a second
     // client timeout onto the caller's latency; cleanup still runs best-effort.
     const detach = !execSucceeded;
-    const cleanup = withClientTimeout(
-      ctx.sandbox.exec(`rm -rf ${quote(tempDir)}`, {
+    const cleanup = execWithClientTimeout(
+      ctx.sandbox,
+      `rm -rf ${quote(tempDir)}`,
+      {
         cwd: ctx.workspaceRoot,
         env: ctx.env,
         timeout: 10000,
-      }),
+      },
       clientExecTimeoutMs(10000),
       'cloudflare sandbox cleanup',
       { unref: detach }
