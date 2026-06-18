@@ -136,7 +136,7 @@ function isInSandboxTimeoutExit(exitCode: number | null): boolean {
  * the exec's own `timeout` option, so a stalled exec that never honors `timeout`
  * still can't outlast this.
  */
-function clientExecTimeoutMs(timeoutMs: number): number {
+export function clientExecTimeoutMs(timeoutMs: number): number {
   return outerTimeoutMs(timeoutMs) + 5000;
 }
 
@@ -157,7 +157,7 @@ function clientExecTimeoutMs(timeoutMs: number): number {
  * native-DO exec cannot be truly cancelled), so its late settlement is swallowed
  * to avoid an unhandled rejection.
  */
-async function withClientTimeout<T>(
+export async function withClientTimeout<T>(
   exec: Promise<T>,
   timeoutMs: number,
   label: string
@@ -179,6 +179,10 @@ async function withClientTimeout<T>(
             )
           );
         }, timeoutMs);
+        // Don't let the backstop keep the host process / event loop alive if the
+        // race already settled elsewhere (e.g. spawnLocalProcess killed the child
+        // while the underlying exec promise is still pending).
+        (timer as { unref?: () => void } | undefined)?.unref?.();
       }),
     ]);
   } finally {
@@ -782,7 +786,11 @@ export async function executeCloudflareCode(
       timedOut: isInSandboxTimeoutExit(result.exitCode),
     };
   } finally {
-    await withClientTimeout(
+    // Fire-and-forget: don't make the caller wait on cleanup. If the sandbox is
+    // stalled, the primary exec already client-timed-out, and awaiting cleanup
+    // would add another client timeout to the caller's latency. The unref'd
+    // backstop bounds the detached cleanup without keeping the process alive.
+    void withClientTimeout(
       ctx.sandbox.exec(`rm -rf ${quote(tempDir)}`, {
         cwd: ctx.workspaceRoot,
         env: ctx.env,
