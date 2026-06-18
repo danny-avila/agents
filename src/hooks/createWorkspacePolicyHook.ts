@@ -166,13 +166,14 @@ function extractCompileCheckPaths(input: Record<string, unknown>): string[] {
   return out;
 }
 
+// All built-in coding tools take their file/dir target in `path`.
+const extractPath: PathExtractor = (i) =>
+  typeof i.path === 'string' && i.path !== '' ? [i.path] : [];
+
 const DEFAULT_EXTRACTORS: Record<string, PathExtractor> = {
-  [Constants.READ_FILE]: (i) =>
-    typeof i.file_path === 'string' ? [i.file_path] : [],
-  [Constants.WRITE_FILE]: (i) =>
-    typeof i.file_path === 'string' ? [i.file_path] : [],
-  [Constants.EDIT_FILE]: (i) =>
-    typeof i.file_path === 'string' ? [i.file_path] : [],
+  [Constants.READ_FILE]: extractPath,
+  [Constants.WRITE_FILE]: extractPath,
+  [Constants.EDIT_FILE]: extractPath,
   [Constants.GREP_SEARCH]: (i) =>
     typeof i.path === 'string' && i.path !== '' ? [i.path] : [],
   [Constants.GLOB_SEARCH]: (i) =>

@@ -9,9 +9,9 @@ import { Constants } from '@/common';
 
 describe('ReadFile', () => {
   describe('schema structure', () => {
-    it('has file_path as required string property', () => {
-      expect(ReadFileToolSchema.properties.file_path.type).toBe('string');
-      expect(ReadFileToolSchema.required).toContain('file_path');
+    it('has path as required string property', () => {
+      expect(ReadFileToolSchema.properties.path.type).toBe('string');
+      expect(ReadFileToolSchema.required).toContain('path');
     });
 
     it('is an object type schema', () => {

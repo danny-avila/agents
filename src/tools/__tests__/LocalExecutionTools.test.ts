@@ -175,8 +175,8 @@ describe('local execution tools', () => {
         aiMessageWithToolCall(Constants.PROGRAMMATIC_TOOL_CALLING, {
           lang: 'py',
           code: [
-            'await write_file(file_path="ptc.txt", content="from local ptc")',
-            'contents = await read_file(file_path="ptc.txt")',
+            'await write_file(path="ptc.txt", content="from local ptc")',
+            'contents = await read_file(path="ptc.txt")',
             'print(contents)',
           ].join('\n'),
         }),
@@ -205,8 +205,8 @@ describe('local execution tools', () => {
       messages: [
         aiMessageWithToolCall(Constants.PROGRAMMATIC_TOOL_CALLING, {
           code: [
-            'write_file \'{"file_path":"bash-ptc.txt","content":"from bash ptc"}\'',
-            'read_file \'{"file_path":"bash-ptc.txt"}\'',
+            'write_file \'{"path":"bash-ptc.txt","content":"from bash ptc"}\'',
+            'read_file \'{"path":"bash-ptc.txt"}\'',
           ].join('\n'),
         }),
       ],
@@ -335,8 +335,8 @@ describe('LocalFileCheckpointer', () => {
 
     const writeTool = bundle.tools.find((tool_) => tool_.name === 'write_file');
     expect(writeTool).toBeDefined();
-    await writeTool!.invoke({ file_path: 'cp.txt', content: 'first' });
-    await writeTool!.invoke({ file_path: 'cp.txt', content: 'second' });
+    await writeTool!.invoke({ path: 'cp.txt', content: 'first' });
+    await writeTool!.invoke({ path: 'cp.txt', content: 'second' });
 
     const restored = await bundle.checkpointer!.rewind();
     expect(restored).toBe(1);
@@ -352,7 +352,7 @@ describe('local read tool guards', () => {
 
     const bundle = createLocalCodingToolBundle({ cwd });
     const readTool = bundle.tools.find((t_) => t_.name === Constants.READ_FILE);
-    const result = await readTool!.invoke({ file_path: 'binary.bin' });
+    const result = await readTool!.invoke({ path: 'binary.bin' });
     expect(String(result)).toContain('binary file');
   });
 
@@ -366,7 +366,7 @@ describe('local read tool guards', () => {
       maxReadBytes: 1024,
     });
     const readTool = bundle.tools.find((t_) => t_.name === Constants.READ_FILE);
-    const result = await readTool!.invoke({ file_path: 'big.txt' });
+    const result = await readTool!.invoke({ path: 'big.txt' });
     expect(String(result)).toContain('exceeds the 1024-byte read cap');
   });
 
@@ -380,7 +380,7 @@ describe('local read tool guards', () => {
     const bundle = createLocalCodingToolBundle({ cwd });
     const readTool = bundle.tools.find((t_) => t_.name === Constants.READ_FILE);
     await expect(
-      readTool!.invoke({ file_path: 'escape/secret.txt' })
+      readTool!.invoke({ path: 'escape/secret.txt' })
     ).rejects.toThrow(/symlink escape/);
   });
 });
@@ -406,7 +406,7 @@ describe('local programmatic bridge auth', () => {
           code: [
             'import os, json, urllib.request, urllib.error',
             'url = os.environ["BRIDGE_PROBE_URL"] if "BRIDGE_PROBE_URL" in os.environ else __LIBRECHAT_TOOL_BRIDGE',
-            'body = json.dumps({"name":"read_file","input":{"file_path":"x"}}).encode("utf-8")',
+            'body = json.dumps({"name":"read_file","input":{"path":"x"}}).encode("utf-8")',
             'try:',
             '  req = urllib.request.Request(url, data=body, headers={"Content-Type":"application/json"}, method="POST")',
             '  urllib.request.urlopen(req, timeout=5)',
@@ -438,7 +438,7 @@ describe('local edit fuzzy matching', () => {
     const bundle = createLocalCodingToolBundle({ cwd });
     const editTool = bundle.tools.find((tt) => tt.name === 'edit_file');
     const result = await editTool!.invoke({
-      file_path: 'a.ts',
+      path: 'a.ts',
       // LLM emits a trailing-whitespace-stripped version.
       old_text:
         'function greet(name: string) {\n  return `Hello, ${name}!`;\n}',
@@ -461,7 +461,7 @@ describe('local edit fuzzy matching', () => {
     const bundle = createLocalCodingToolBundle({ cwd });
     const editTool = bundle.tools.find((tt) => tt.name === 'edit_file');
     const result = await editTool!.invoke({
-      file_path: 'a.ts',
+      path: 'a.ts',
       // LLM stripped the 4-space indent
       old_text: 'method() {\n    return 1;\n}',
       new_text: 'method() {\n    return 42;\n}',
@@ -480,7 +480,7 @@ describe('local edit fuzzy matching', () => {
     const bundle = createLocalCodingToolBundle({ cwd });
     const editTool = bundle.tools.find((tt) => tt.name === 'edit_file');
     const result = await editTool!.invoke({
-      file_path: 'a.txt',
+      path: 'a.txt',
       old_text: 'second',
       new_text: 'SECOND',
     });
@@ -497,7 +497,7 @@ describe('local edit fuzzy matching', () => {
     const bundle = createLocalCodingToolBundle({ cwd });
     const editTool = bundle.tools.find((tt) => tt.name === 'edit_file');
     await editTool!.invoke({
-      file_path: 'a.txt',
+      path: 'a.txt',
       old_text: 'two',
       new_text: 'TWO',
     });
@@ -512,7 +512,7 @@ describe('local edit fuzzy matching', () => {
     await fsWriteFile(file, BOM + 'hello\n', 'utf8');
     const bundle = createLocalCodingToolBundle({ cwd });
     const writeTool = bundle.tools.find((tt) => tt.name === 'write_file');
-    await writeTool!.invoke({ file_path: 'a.txt', content: 'goodbye\n' });
+    await writeTool!.invoke({ path: 'a.txt', content: 'goodbye\n' });
     const raw = await fsReadFile(file, 'utf8');
     expect(raw.startsWith(BOM)).toBe(true);
     expect(raw.slice(1)).toBe('goodbye\n');
@@ -532,7 +532,7 @@ describe('local read attachments', () => {
     await fsWriteFile(file, tinyPng);
     const bundle = createLocalCodingToolBundle({ cwd });
     const readTool = bundle.tools.find((tt) => tt.name === Constants.READ_FILE);
-    const result = await readTool!.invoke({ file_path: 'tiny.png' });
+    const result = await readTool!.invoke({ path: 'tiny.png' });
     expect(String(result)).toContain('binary file');
   });
 
@@ -552,7 +552,7 @@ describe('local read attachments', () => {
     const message = (await readTool!.invoke({
       id: 'call_image',
       name: Constants.READ_FILE,
-      args: { file_path: 'tiny.png' },
+      args: { path: 'tiny.png' },
       type: 'tool_call',
     })) as { content: unknown; artifact: unknown };
     expect(Array.isArray(message.content)).toBe(true);
@@ -589,7 +589,7 @@ describe('local read attachments', () => {
       maxAttachmentBytes: 100,
     });
     const readTool = bundle.tools.find((tt) => tt.name === Constants.READ_FILE);
-    const result = await readTool!.invoke({ file_path: 'big.png' });
+    const result = await readTool!.invoke({ path: 'big.png' });
     expect(String(result)).toMatch(/Refusing to embed/);
   });
 
@@ -602,7 +602,7 @@ describe('local read attachments', () => {
       attachReadAttachments: 'images-only',
     });
     const readTool = bundle.tools.find((tt) => tt.name === Constants.READ_FILE);
-    const result = await readTool!.invoke({ file_path: 'a.txt' });
+    const result = await readTool!.invoke({ path: 'a.txt' });
     expect(String(result)).toContain('hello world');
   });
 });
@@ -662,7 +662,7 @@ describe('post-edit syntax check', () => {
     const message = (await writeTool!.invoke({
       id: 'call_w',
       name: 'write_file',
-      args: { file_path: 'broken.js', content: 'function (\n' },
+      args: { path: 'broken.js', content: 'function (\n' },
       type: 'tool_call',
     })) as { content: string; artifact: { syntax_error?: string } };
     expect(message.content).toContain('[syntax-check warning');
@@ -680,7 +680,7 @@ describe('post-edit syntax check', () => {
       writeTool!.invoke({
         id: 'call_w',
         name: 'write_file',
-        args: { file_path: 'broken.js', content: 'function (\n' },
+        args: { path: 'broken.js', content: 'function (\n' },
         type: 'tool_call',
       })
     ).rejects.toThrow(/syntax check failed/);
@@ -850,7 +850,7 @@ describe('codex review fixes', () => {
       const result = await readTool!.invoke({
         id: 'c',
         name: Constants.READ_FILE,
-        args: { file_path: join(parent, 'shared/lib.ts') },
+        args: { path: join(parent, 'shared/lib.ts') },
         type: 'tool_call',
       });
       expect(JSON.stringify(result)).toContain('X');
@@ -2253,7 +2253,7 @@ describe('comprehensive review (round 14) — Codex P1 #37 + P2 #38/#40/#41', ()
         writeTool!.invoke({
           id: 'wf-strict',
           name: Constants.WRITE_FILE,
-          args: { file_path: file, content: 'function broken( {\n' },
+          args: { path: file, content: 'function broken( {\n' },
           type: 'tool_call',
         })
       ).rejects.toThrow(/syntax check failed.*reverted/i);
@@ -2281,7 +2281,7 @@ describe('comprehensive review (round 14) — Codex P1 #37 + P2 #38/#40/#41', ()
         writeTool!.invoke({
           id: 'wf-strict-new',
           name: Constants.WRITE_FILE,
-          args: { file_path: file, content: 'function broken( {\n' },
+          args: { path: file, content: 'function broken( {\n' },
           type: 'tool_call',
         })
       ).rejects.toThrow(/syntax check failed.*reverted/i);
@@ -2308,7 +2308,7 @@ describe('comprehensive review (round 14) — Codex P1 #37 + P2 #38/#40/#41', ()
           id: 'ef-strict',
           name: Constants.EDIT_FILE,
           args: {
-            file_path: file,
+            path: file,
             old_text: 'return 1;',
             new_text: 'return broken(',
           },

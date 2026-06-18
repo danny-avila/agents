@@ -49,7 +49,7 @@ export const LocalListDirectoryToolName = Constants.LIST_DIRECTORY;
 export const LocalReadFileToolSchema: t.JsonSchemaType = {
   type: 'object',
   properties: {
-    file_path: {
+    path: {
       type: 'string',
       description:
         'Path to a local file, relative to the configured cwd unless absolute paths are allowed.',
@@ -63,13 +63,13 @@ export const LocalReadFileToolSchema: t.JsonSchemaType = {
       description: 'Optional maximum number of lines to return.',
     },
   },
-  required: ['file_path'],
+  required: ['path'],
 };
 
 export const LocalWriteFileToolSchema: t.JsonSchemaType = {
   type: 'object',
   properties: {
-    file_path: {
+    path: {
       type: 'string',
       description:
         'Path to write, relative to the configured cwd unless absolute paths are allowed.',
@@ -79,13 +79,13 @@ export const LocalWriteFileToolSchema: t.JsonSchemaType = {
       description: 'Complete file contents to write.',
     },
   },
-  required: ['file_path', 'content'],
+  required: ['path', 'content'],
 };
 
 export const LocalEditFileToolSchema: t.JsonSchemaType = {
   type: 'object',
   properties: {
-    file_path: {
+    path: {
       type: 'string',
       description:
         'Path to edit, relative to the configured cwd unless absolute paths are allowed.',
@@ -112,7 +112,7 @@ export const LocalEditFileToolSchema: t.JsonSchemaType = {
       },
     },
   },
-  required: ['file_path'],
+  required: ['path'],
 };
 
 export const LocalGrepSearchToolSchema: t.JsonSchemaType = {
@@ -391,18 +391,18 @@ export function createLocalReadFileTool(
   return tool(
     async (rawInput) => {
       const input = rawInput as {
-        file_path: string;
+        path: string;
         offset?: number;
         limit?: number;
       };
       const path = await resolveWorkspacePathSafe(
-        input.file_path,
+        input.path,
         config,
         'read'
       );
       const fileStat = await fs.stat(path);
       if (!fileStat.isFile()) {
-        throw new Error(`Path is not a file: ${input.file_path}`);
+        throw new Error(`Path is not a file: ${input.path}`);
       }
       const maxBytes = Math.max(
         config.maxReadBytes ?? DEFAULT_MAX_READ_BYTES,
@@ -514,12 +514,12 @@ export function createLocalWriteFileTool(
   const fs = getWorkspaceFS(config);
   return tool(
     async (rawInput) => {
-      const input = rawInput as { file_path: string; content: string };
+      const input = rawInput as { path: string; content: string };
       if (config.readOnly === true) {
         throw new Error('write_file is blocked in read-only local mode.');
       }
       const path = await resolveWorkspacePathSafe(
-        input.file_path,
+        input.path,
         config,
         'write'
       );
@@ -598,7 +598,7 @@ export function createLocalEditFileTool(
   return tool(
     async (rawInput) => {
       const input = rawInput as {
-        file_path: string;
+        path: string;
         old_text?: string;
         new_text?: string;
         edits?: Array<{ old_text?: string; new_text?: string }>;
@@ -612,7 +612,7 @@ export function createLocalEditFileTool(
       }
 
       const path = await resolveWorkspacePathSafe(
-        input.file_path,
+        input.path,
         config,
         'write'
       );
@@ -627,7 +627,7 @@ export function createLocalEditFileTool(
         const match = locateEdit(next, edit.oldText);
         if (match == null) {
           throw new Error(
-            `Edit ${i + 1}/${edits.length}: could not locate old_text in ${input.file_path}. ` +
+            `Edit ${i + 1}/${edits.length}: could not locate old_text in ${input.path}. ` +
               'Tried exact, line-trimmed, whitespace-normalized, and indentation-flexible matching. ' +
               'Re-read the file and copy the literal lines.'
           );

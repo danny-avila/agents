@@ -1021,7 +1021,7 @@ describe('ToolNode code execution session management', () => {
           {
             id: 'call_rf',
             name: Constants.READ_FILE,
-            args: { file_path: '/mnt/data/data.csv' },
+            args: { path: '/mnt/data/data.csv' },
           },
         ],
       });
@@ -1062,7 +1062,7 @@ describe('ToolNode code execution session management', () => {
           {
             id: 'call_rf2',
             name: Constants.READ_FILE,
-            args: { file_path: 'some-skill/notes.md' },
+            args: { path: 'some-skill/notes.md' },
           },
         ],
       });

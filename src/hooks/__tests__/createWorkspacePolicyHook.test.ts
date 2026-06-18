@@ -51,7 +51,7 @@ describe('createWorkspacePolicyHook', () => {
     const hook = createWorkspacePolicyHook({ root: workspace });
     const out = await call(
       hook,
-      makeInput('read_file', { file_path: 'src/x.ts' })
+      makeInput('read_file', { path: 'src/x.ts' })
     );
     expect(out.decision).toBe('allow');
   });
@@ -60,7 +60,7 @@ describe('createWorkspacePolicyHook', () => {
     const hook = createWorkspacePolicyHook({ root: workspace });
     const out = await call(
       hook,
-      makeInput('read_file', { file_path: join(workspace, 'src/x.ts') })
+      makeInput('read_file', { path: join(workspace, 'src/x.ts') })
     );
     expect(out.decision).toBe('allow');
   });
@@ -72,7 +72,7 @@ describe('createWorkspacePolicyHook', () => {
     });
     const out = await call(
       hook,
-      makeInput('read_file', { file_path: join(extra, 'lib/y.ts') })
+      makeInput('read_file', { path: join(extra, 'lib/y.ts') })
     );
     expect(out.decision).toBe('allow');
   });
@@ -81,7 +81,7 @@ describe('createWorkspacePolicyHook', () => {
     const hook = createWorkspacePolicyHook({ root: workspace });
     const out = await call(
       hook,
-      makeInput('read_file', { file_path: '/etc/passwd' })
+      makeInput('read_file', { path: '/etc/passwd' })
     );
     expect(out.decision).toBe('ask');
     expect(out.reason).toContain('/etc/passwd');
@@ -93,7 +93,7 @@ describe('createWorkspacePolicyHook', () => {
     const out = await call(
       hook,
       makeInput('write_file', {
-        file_path: '/etc/foo',
+        path: '/etc/foo',
         content: 'malicious',
       })
     );
@@ -107,7 +107,7 @@ describe('createWorkspacePolicyHook', () => {
     });
     const out = await call(
       hook,
-      makeInput('read_file', { file_path: '/etc/passwd' })
+      makeInput('read_file', { path: '/etc/passwd' })
     );
     expect(out.decision).toBe('deny');
     expect(out.reason).toContain('/etc/passwd');
@@ -121,7 +121,7 @@ describe('createWorkspacePolicyHook', () => {
     const out = await call(
       hook,
       makeInput('edit_file', {
-        file_path: '/etc/foo',
+        path: '/etc/foo',
         old_text: 'a',
         new_text: 'b',
       })
@@ -136,7 +136,7 @@ describe('createWorkspacePolicyHook', () => {
     });
     const out = await call(
       hook,
-      makeInput('read_file', { file_path: '/etc/passwd' })
+      makeInput('read_file', { path: '/etc/passwd' })
     );
     expect(out.decision).toBe('allow');
   });
@@ -184,7 +184,7 @@ describe('createWorkspacePolicyHook', () => {
     });
     const out = await call(
       hook,
-      makeInput('read_file', { file_path: '/somewhere/else.ts' })
+      makeInput('read_file', { path: '/somewhere/else.ts' })
     );
     expect(out.reason).toBe('read_file blocked from /somewhere/else.ts');
   });
@@ -212,7 +212,7 @@ describe('createWorkspacePolicyHook', () => {
     const hook = createWorkspacePolicyHook({ root: '.' });
     const out = await call(
       hook,
-      makeInput('read_file', { file_path: resolve('.', 'src/x.ts') })
+      makeInput('read_file', { path: resolve('.', 'src/x.ts') })
     );
     expect(out.decision).toBe('allow');
   });
@@ -228,7 +228,7 @@ describe('createWorkspacePolicyHook', () => {
       });
       const out = await call(
         hook,
-        makeInput('read_file', { file_path: 'escape' })
+        makeInput('read_file', { path: 'escape' })
       );
       expect(out.decision).toBe('deny');
       expect(out.reason).toContain('escape');
@@ -245,7 +245,7 @@ describe('createWorkspacePolicyHook', () => {
       });
       const out = await call(
         hook,
-        makeInput('read_file', { file_path: join(altMount, 'file.ts') })
+        makeInput('read_file', { path: join(altMount, 'file.ts') })
       );
       expect(out.decision).toBe('allow');
     });
