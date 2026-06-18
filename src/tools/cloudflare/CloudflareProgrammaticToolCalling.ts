@@ -478,30 +478,30 @@ async def execute_code(lang, code, args=None):
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
-async def read_file(file_path, offset=None, limit=None):
-    resolved = _resolve(file_path)
+async def read_file(path, offset=None, limit=None):
+    resolved = _resolve(path)
     with open(resolved, encoding="utf-8") as handle:
         return _line_window(handle.read(), offset, limit)
 
-async def write_file(file_path, content):
+async def write_file(path, content):
     _assert_writable("write_file")
-    resolved = _resolve(file_path)
+    resolved = _resolve(path)
     os.makedirs(os.path.dirname(resolved), exist_ok=True)
     existed = os.path.exists(resolved)
     with open(resolved, "w", encoding="utf-8") as handle:
         handle.write(content)
     return f"{'Overwrote' if existed else 'Created'} {resolved} ({len(content)} chars)."
 
-async def edit_file(file_path, old_text=None, new_text=None, edits=None):
+async def edit_file(path, old_text=None, new_text=None, edits=None):
     _assert_writable("edit_file")
-    resolved = _resolve(file_path)
+    resolved = _resolve(path)
     edits = edits or [{"old_text": old_text, "new_text": new_text}]
     content = open(resolved, encoding="utf-8").read()
     for edit in edits:
         old = edit.get("old_text") or ""
         new = edit.get("new_text") or ""
         if content.count(old) != 1:
-            raise ValueError(f"Could not locate old_text exactly once in {file_path}")
+            raise ValueError(f"Could not locate old_text exactly once in {path}")
         content = content.replace(old, new, 1)
     open(resolved, "w", encoding="utf-8").write(content)
     return f"Applied {len(edits)} edit(s) to {resolved}."
@@ -881,13 +881,13 @@ async function execute_code(payload) {
 }
 
 async function read_file(payload) {
-  const resolved = resolvePath(payload.file_path);
+  const resolved = resolvePath(payload.path);
   return lineWindow(await fsp.readFile(resolved, "utf8"), payload.offset, payload.limit);
 }
 
 async function write_file(payload) {
   assertWritable("write_file");
-  const resolved = resolvePath(payload.file_path);
+  const resolved = resolvePath(payload.path);
   await fsp.mkdir(path.dirname(resolved), { recursive: true });
   const existed = fs.existsSync(resolved);
   await fsp.writeFile(resolved, payload.content, "utf8");
@@ -896,14 +896,14 @@ async function write_file(payload) {
 
 async function edit_file(payload) {
   assertWritable("edit_file");
-  const resolved = resolvePath(payload.file_path);
+  const resolved = resolvePath(payload.path);
   const edits = payload.edits || [{ old_text: payload.old_text, new_text: payload.new_text }];
   let content = await fsp.readFile(resolved, "utf8");
   for (const edit of edits) {
     const oldText = edit.old_text || "";
     const newText = edit.new_text || "";
     if (oldText === "" || content.split(oldText).length - 1 !== 1) {
-      throw new Error("Could not locate old_text exactly once in " + payload.file_path);
+      throw new Error("Could not locate old_text exactly once in " + payload.path);
     }
     content = content.replace(oldText, newText);
   }
