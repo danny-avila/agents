@@ -223,30 +223,41 @@ export async function execWithClientTimeout(
 ): Promise<t.CloudflareSandboxExecResult> {
   const controller = new AbortController();
   const execOptions: t.CloudflareSandboxExecOptions = { ...options };
+  const callerSignal = options.signal;
+  let onCallerAbort: (() => void) | undefined;
   if (sandbox.supportsExecSignal === true) {
     // Compose the caller's signal (e.g. run/user cancellation) with our timeout
     // controller so EITHER source cancels the exec — don't clobber the caller's.
-    const callerSignal = options.signal;
     if (callerSignal != null) {
       if (callerSignal.aborted) {
         controller.abort();
       } else {
-        callerSignal.addEventListener('abort', () => controller.abort(), {
-          once: true,
-        });
+        onCallerAbort = (): void => controller.abort();
+        callerSignal.addEventListener('abort', onCallerAbort, { once: true });
       }
     }
     execOptions.signal = controller.signal;
+  } else if ('signal' in execOptions) {
+    // Native DO RPC cannot consume an AbortSignal (and would fail to clone it).
+    // Strip any caller-provided one so the spread above can't reintroduce it.
+    delete execOptions.signal;
   }
-  return withClientTimeout(
-    sandbox.exec(command, execOptions),
-    timeoutMs,
-    label,
-    {
-      unref: runOptions.unref,
-      onTimeout: () => controller.abort(),
+  try {
+    return await withClientTimeout(
+      sandbox.exec(command, execOptions),
+      timeoutMs,
+      label,
+      {
+        unref: runOptions.unref,
+        onTimeout: () => controller.abort(),
+      }
+    );
+  } finally {
+    // Don't leave a listener attached to a long-lived/shared caller signal.
+    if (onCallerAbort != null && callerSignal != null) {
+      callerSignal.removeEventListener('abort', onCallerAbort);
     }
-  );
+  }
 }
 
 function truncateOutput(value: string, maxChars: number): string {

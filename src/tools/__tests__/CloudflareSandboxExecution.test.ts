@@ -365,6 +365,29 @@ describe('Cloudflare sandbox execution backend', () => {
     expect(received?.aborted).toBe(true);
   });
 
+  it('strips a caller signal for native runtimes that cannot consume it', async () => {
+    let received: t.CloudflareSandboxExecOptions | undefined;
+    const sandbox = createRuntime({
+      // no supportsExecSignal -> native DO, which cannot clone/consume a signal
+      exec: async (_command, options) => {
+        received = options;
+        return { exitCode: 0, stdout: 'ok', stderr: '' };
+      },
+    });
+    const caller = new AbortController();
+
+    await execWithClientTimeout(
+      sandbox,
+      'echo hi',
+      { cwd: '/workspace', signal: caller.signal },
+      60000,
+      'test'
+    );
+
+    expect(received).toBeDefined();
+    expect(received).not.toHaveProperty('signal');
+  });
+
   it('passes call-specific timeouts to the Cloudflare spawn wrapper', async () => {
     let execCommand = '';
     let execTimeout: number | undefined;
