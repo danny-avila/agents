@@ -26,6 +26,10 @@
  */
 
 import type { GraphTools } from '@/types';
+import {
+  buildAnthropicCacheControl,
+  type PromptCacheTtl,
+} from '@/messages/cache';
 
 const ANTHROPIC_BUILT_IN_TOOL_PREFIXES = [
   'text_editor_',
@@ -40,8 +44,6 @@ const ANTHROPIC_BUILT_IN_TOOL_PREFIXES = [
   'tool_search_',
   'mcp_toolset',
 ] as const;
-
-const CACHE_CONTROL = { type: 'ephemeral' as const };
 
 type AnthropicToolCacheCandidate = {
   name?: unknown;
@@ -68,21 +70,23 @@ function hasCacheControl(tool: AnthropicToolCacheCandidate): boolean {
 }
 
 function markCacheControl(
-  tool: AnthropicToolCacheCandidate
+  tool: AnthropicToolCacheCandidate,
+  ttl?: PromptCacheTtl
 ): AnthropicToolCacheCandidate {
+  const cacheControl = buildAnthropicCacheControl(ttl);
   const prototype = Object.getPrototypeOf(tool) ?? Object.prototype;
   if (isAnthropicBuiltInTool(tool)) {
     const wrapped = { ...tool };
     delete wrapped.extras;
     return Object.assign(Object.create(prototype), wrapped, {
-      cache_control: CACHE_CONTROL,
+      cache_control: cacheControl,
     });
   }
 
   return Object.assign(Object.create(prototype), tool, {
     extras: {
       ...(tool.extras ?? {}),
-      cache_control: CACHE_CONTROL,
+      cache_control: cacheControl,
     },
   });
 }
@@ -124,7 +128,8 @@ export function makeIsDeferred(
  */
 export function partitionAndMarkAnthropicToolCache(
   tools: GraphTools | undefined,
-  isDeferred: (toolName: string) => boolean
+  isDeferred: (toolName: string) => boolean,
+  ttl?: PromptCacheTtl
 ): GraphTools | undefined {
   if (tools == null || tools.length === 0) return tools;
 
@@ -156,6 +161,6 @@ export function partitionAndMarkAnthropicToolCache(
     return [...staticTools, ...deferredTools] as GraphTools;
   }
 
-  staticTools[staticTools.length - 1] = markCacheControl(last);
+  staticTools[staticTools.length - 1] = markCacheControl(last, ttl);
   return [...staticTools, ...deferredTools] as GraphTools;
 }

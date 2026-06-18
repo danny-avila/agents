@@ -27,6 +27,7 @@ import {
   createPruneMessages,
   syncBudgetDerivedFields,
   addTailCacheControl,
+  resolvePromptCacheTtl,
   getMessageId,
   makeIsDeferred,
   partitionAndMarkAnthropicToolCache,
@@ -1404,7 +1405,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         toolsForBinding =
           partitionAndMarkAnthropicToolCache(
             rawToolsForBinding,
-            makeIsDeferred(agentContext.toolDefinitions)
+            makeIsDeferred(agentContext.toolDefinitions),
+            resolvePromptCacheTtl(
+              (
+                agentContext.clientOptions as
+                  | t.AnthropicClientOptions
+                  | undefined
+              )?.promptCacheTtl
+            )
           ) ?? rawToolsForBinding;
       } else if (
         agentContext.provider === Providers.OPENROUTER &&
@@ -1833,9 +1841,29 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         (anthropicPromptCacheEnabled || openRouterPromptCacheEnabled) &&
         !agentContext.systemRunnable
       ) {
-        finalMessages = addTailCacheControl<BaseMessage>(finalMessages);
+        finalMessages = addTailCacheControl<BaseMessage>(
+          finalMessages,
+          anthropicPromptCacheEnabled
+            ? resolvePromptCacheTtl(
+              (
+                  agentContext.clientOptions as
+                    | t.AnthropicClientOptions
+                    | undefined
+              )?.promptCacheTtl
+            )
+            : undefined
+        );
       } else if (bedrockPromptCacheEnabled) {
-        finalMessages = addBedrockTailCacheControl<BaseMessage>(finalMessages);
+        finalMessages = addBedrockTailCacheControl<BaseMessage>(
+          finalMessages,
+          resolvePromptCacheTtl(
+            (
+              agentContext.clientOptions as
+                | t.BedrockAnthropicClientOptions
+                | undefined
+            )?.promptCacheTtl
+          )
+        );
       }
 
       if (

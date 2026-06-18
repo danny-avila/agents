@@ -22,6 +22,7 @@ import type { Runnable } from '@langchain/core/runnables';
 import type { OpenAI as OpenAIClient } from 'openai';
 import type { ChatXAIInput } from '@langchain/xai';
 import type { ChatOpenRouterCallOptions } from '@/llm/openrouter';
+import type { PromptCacheTtl } from '@/messages/cache';
 import {
   AzureChatOpenAI,
   ChatDeepSeek,
@@ -76,6 +77,12 @@ export type OpenAIClientOptions = ChatOpenAIFields;
 export type AnthropicClientOptions = Omit<AnthropicInput, 'thinking'> & {
   thinking?: ThinkingConfig;
   promptCache?: boolean;
+  /**
+   * Prompt-cache breakpoint TTL. Defaults to `'1h'` (extended cache) when
+   * `promptCache` is enabled; set `'5m'` to opt back into the legacy
+   * 5-minute behavior.
+   */
+  promptCacheTtl?: PromptCacheTtl;
 };
 export type MistralAIClientOptions = ChatMistralAIInput;
 export type VertexAIClientOptions = ChatVertexAIInput & {
@@ -86,6 +93,12 @@ export type BedrockAnthropicInput = ChatBedrockConverseInput & {
   additionalModelRequestFields?: ChatBedrockConverseInput['additionalModelRequestFields'] &
     AnthropicReasoning;
   promptCache?: boolean;
+  /**
+   * Prompt-cache checkpoint TTL. Defaults to `'1h'` (extended cache) when
+   * `promptCache` is enabled; set `'5m'` to opt back into the legacy
+   * 5-minute behavior.
+   */
+  promptCacheTtl?: PromptCacheTtl;
 };
 export type BedrockConverseClientOptions = BedrockAnthropicInput;
 export type BedrockAnthropicClientOptions = BedrockAnthropicInput;

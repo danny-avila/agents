@@ -9,6 +9,15 @@ import type {
 import type { RunnableConfig, Runnable } from '@langchain/core/runnables';
 import type * as t from '@/types';
 import {
+  addTailCacheControl,
+  addCacheControlToStablePrefixMessages,
+  buildAnthropicCacheControl,
+  buildBedrockCachePoint,
+  resolvePromptCacheTtl,
+  cloneMessage,
+  type PromptCacheTtl,
+} from '@/messages/cache';
+import {
   ANTHROPIC_TOOL_TOKEN_MULTIPLIER,
   DEFAULT_TOOL_TOKEN_MULTIPLIER,
   ContentTypes,
@@ -16,29 +25,24 @@ import {
   Providers,
 } from '@/common';
 import {
-  addTailCacheControl,
-  addCacheControlToStablePrefixMessages,
-  cloneMessage,
-} from '@/messages/cache';
-import { createSchemaOnlyTools } from '@/tools/schema';
-import { apportionTokenCounts } from '@/utils/tokens';
-import {
   DEFAULT_RESERVE_RATIO,
   createPruneMessages,
   syncBudgetDerivedFields,
 } from '@/messages';
+import { createSchemaOnlyTools } from '@/tools/schema';
+import { apportionTokenCounts } from '@/utils/tokens';
 import { isThinkingEnabled } from '@/llm/request';
 import { toJsonSchema } from '@/utils/schema';
 
 type AgentSystemTextBlock = {
   type: 'text';
   text: string;
-  cache_control?: { type: 'ephemeral' };
+  cache_control?: { type: 'ephemeral'; ttl?: '1h' };
 };
 
 type AgentSystemContentBlock =
   | AgentSystemTextBlock
-  | { cachePoint: { type: 'default' } };
+  | { cachePoint: { type: 'default'; ttl?: '1h' } };
 
 type PromptCacheProvider = Providers.ANTHROPIC | Providers.OPENROUTER;
 
@@ -689,7 +693,10 @@ export class AgentContext {
         dynamicTail.length === 0 &&
         body.length >= 2
       ) {
-        body = addTailCacheControl(body);
+        body = addTailCacheControl(
+          body,
+          this.getPromptCacheTtl(promptCacheProvider)
+        );
       }
       return [...prefix, ...body];
     }).withConfig({ runName: 'prompt' });
@@ -713,7 +720,9 @@ export class AgentContext {
         {
           type: 'text',
           text: wrappedSummary,
-          cache_control: { type: 'ephemeral' },
+          cache_control: buildAnthropicCacheControl(
+            this.getPromptCacheTtl(Providers.ANTHROPIC)
+          ),
         },
       ],
     });
@@ -760,7 +769,10 @@ export class AgentContext {
     );
     const stablePrefix = messages.slice(0, tailIndex);
     const trailingMessages = messages.slice(tailIndex);
-    const cacheablePrefix = this.addStablePromptCacheMarkers(stablePrefix);
+    const cacheablePrefix = this.addStablePromptCacheMarkers(
+      stablePrefix,
+      this.getPromptCacheTtl(promptCacheProvider)
+    );
 
     return [...cacheablePrefix, ...tail, ...trailingMessages];
   }
@@ -791,14 +803,17 @@ export class AgentContext {
     return messages.length;
   }
 
-  private addStablePromptCacheMarkers(messages: BaseMessage[]): BaseMessage[] {
+  private addStablePromptCacheMarkers(
+    messages: BaseMessage[],
+    ttl?: PromptCacheTtl
+  ): BaseMessage[] {
     if (messages.length <= 1) {
       return messages;
     }
 
     return [
       messages[0],
-      ...addCacheControlToStablePrefixMessages(messages.slice(1), 2),
+      ...addCacheControlToStablePrefixMessages(messages.slice(1), 2, ttl),
     ];
   }
 
@@ -834,6 +849,33 @@ export class AgentContext {
     return bedrockOptions?.promptCache === true;
   }
 
+  /**
+   * Resolved TTL for the active prompt-cache provider. Anthropic uses the
+   * configured `promptCacheTtl` (default `'1h'` extended cache); OpenRouter
+   * keeps its legacy 5-minute marker (no `ttl`) to preserve existing behavior.
+   */
+  private getPromptCacheTtl(
+    provider: PromptCacheProvider | undefined
+  ): PromptCacheTtl | undefined {
+    if (provider !== Providers.ANTHROPIC) {
+      return undefined;
+    }
+    return resolvePromptCacheTtl(
+      (this.clientOptions as t.AnthropicClientOptions | undefined)
+        ?.promptCacheTtl
+    );
+  }
+
+  /**
+   * Resolved TTL for Bedrock prompt-cache checkpoints (default `'1h'`).
+   */
+  private getBedrockPromptCacheTtl(): PromptCacheTtl {
+    return resolvePromptCacheTtl(
+      (this.clientOptions as t.BedrockAnthropicClientOptions | undefined)
+        ?.promptCacheTtl
+    );
+  }
+
   private buildSystemMessage({
     stableInstructions,
     dynamicInstructions,
@@ -855,7 +897,9 @@ export class AgentContext {
         content.push({
           type: 'text',
           text: stableInstructions,
-          cache_control: { type: 'ephemeral' },
+          cache_control: buildAnthropicCacheControl(
+            this.getPromptCacheTtl(promptCacheProvider)
+          ),
         });
       }
       if (dynamicInstructions && !shouldMoveDynamicInstructions) {
@@ -883,7 +927,7 @@ export class AgentContext {
     if (this.hasBedrockPromptCache() && stableInstructions) {
       const content: AgentSystemContentBlock[] = [
         { type: 'text', text: stableInstructions },
-        { cachePoint: { type: 'default' } },
+        { cachePoint: buildBedrockCachePoint(this.getBedrockPromptCacheTtl()) },
       ];
       if (dynamicInstructions) {
         content.push({ type: 'text', text: dynamicInstructions });

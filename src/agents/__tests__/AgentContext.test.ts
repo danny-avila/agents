@@ -7,8 +7,12 @@ import { AgentContext } from '../AgentContext';
 
 describe('AgentContext', () => {
   type TestSystemContentBlock =
-    | { type: 'text'; text: string; cache_control?: { type: 'ephemeral' } }
-    | { cachePoint: { type: 'default' } };
+    | {
+        type: 'text';
+        text: string;
+        cache_control?: { type: 'ephemeral'; ttl?: '1h' };
+      }
+    | { cachePoint: { type: 'default'; ttl?: '1h' } };
 
   type ContextOptions = {
     agentConfig?: Partial<t.AgentInputs>;
@@ -98,7 +102,7 @@ describe('AgentContext', () => {
         {
           type: 'text',
           text: 'Stable instructions',
-          cache_control: { type: 'ephemeral' },
+          cache_control: { type: 'ephemeral', ttl: '1h' },
         },
       ]);
       expect(result[1].content).toBe('Hello');
@@ -176,7 +180,7 @@ describe('AgentContext', () => {
       const content = result[0].content as TestSystemContentBlock[];
       expect(content).toEqual([
         { type: 'text', text: 'Stable instructions' },
-        { cachePoint: { type: 'default' } },
+        { cachePoint: { type: 'default', ttl: '1h' } },
         { type: 'text', text: 'Dynamic instructions' },
       ]);
     });
@@ -744,7 +748,7 @@ describe('AgentContext', () => {
       const finalMessages = addBedrockCacheControl(result);
       expect(finalMessages[0].content).toEqual([
         { type: 'text', text: 'Stable instructions' },
-        { cachePoint: { type: 'default' } },
+        { cachePoint: { type: 'default', ttl: '1h' } },
         { type: 'text', text: 'Dynamic instructions' },
       ]);
     });
@@ -2154,7 +2158,7 @@ describe('AgentContext', () => {
     const buildBranch = (
       maxContextTokens: number,
       perMessageTokens: number,
-      count: number,
+      count: number
     ): { ctx: AgentContext; messages: AIMessage[] } => {
       const ctx = createBasicContext({ tokenCounter: countByChars });
       ctx.maxContextTokens = maxContextTokens;
@@ -2166,7 +2170,7 @@ describe('AgentContext', () => {
         messages.push(
           i % 2 === 0
             ? (new HumanMessage(content) as unknown as AIMessage)
-            : new AIMessage(content),
+            : new AIMessage(content)
         );
       }
       return { ctx, messages };
@@ -2175,7 +2179,9 @@ describe('AgentContext', () => {
     it('returns null without a tokenizer or a window', () => {
       const noCounter = createBasicContext({});
       noCounter.maxContextTokens = 1000;
-      expect(noCounter.projectContextUsage([new HumanMessage('hi')])).toBeNull();
+      expect(
+        noCounter.projectContextUsage([new HumanMessage('hi')])
+      ).toBeNull();
 
       const noWindow = createBasicContext({ tokenCounter: countByChars });
       noWindow.maxContextTokens = undefined;
@@ -2207,7 +2213,9 @@ describe('AgentContext', () => {
       expect(usage!.remainingContextTokens).toBeGreaterThanOrEqual(0);
 
       const max = usage!.contextBudget ?? usage!.breakdown.maxContextTokens;
-      expect(max - (usage!.remainingContextTokens ?? 0)).toBeLessThanOrEqual(max);
+      expect(max - (usage!.remainingContextTokens ?? 0)).toBeLessThanOrEqual(
+        max
+      );
     });
 
     it('does not mutate the context (local pruner, no field writes)', () => {
@@ -2245,7 +2253,7 @@ describe('AgentContext', () => {
 
       expect(messages[2]).toBe(originalRef);
       expect((messages[2] as unknown as ToolMessage).content).toBe(
-        originalContent,
+        originalContent
       );
     });
 
@@ -2257,7 +2265,9 @@ describe('AgentContext', () => {
       ctx.indexTokenCountMap = {};
       const messages: AIMessage[] = [];
       for (let i = 0; i < 6; i++) {
-        messages.push(new HumanMessage('x'.repeat(1_000)) as unknown as AIMessage);
+        messages.push(
+          new HumanMessage('x'.repeat(1_000)) as unknown as AIMessage
+        );
       }
 
       const usage = ctx.projectContextUsage(messages);
@@ -2285,7 +2295,7 @@ describe('AgentContext', () => {
         const ctx = createBasicContext({ tokenCounter: countByChars });
         ctx.maxContextTokens = 5_000;
         const messages: AIMessage[] = [0, 1, 2].map(
-          () => new HumanMessage('x'.repeat(1_000)) as unknown as AIMessage,
+          () => new HumanMessage('x'.repeat(1_000)) as unknown as AIMessage
         );
         return { ctx, messages };
       };
@@ -2303,7 +2313,7 @@ describe('AgentContext', () => {
       const dirtyUsage = dirty.ctx.projectContextUsage(dirty.messages);
 
       expect(dirtyUsage!.remainingContextTokens).toBe(
-        cleanUsage!.remainingContextTokens,
+        cleanUsage!.remainingContextTokens
       );
       expect(dirtyUsage!.calibrationRatio).toBe(cleanUsage!.calibrationRatio);
     });
@@ -2350,7 +2360,7 @@ describe('AgentContext', () => {
 
       expect(scaledUsage!.calibrationRatio).toBe(3);
       expect(scaledUsage!.remainingContextTokens).not.toBe(
-        baseUsage!.remainingContextTokens,
+        baseUsage!.remainingContextTokens
       );
     });
 

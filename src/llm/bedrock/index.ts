@@ -32,6 +32,7 @@ import {
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { BaseMessage, ResponseMetadata } from '@langchain/core/messages';
 import type { ChatBedrockConverseInput } from '@langchain/aws';
+import type { PromptCacheTtl } from '@/messages/cache';
 import {
   convertToConverseMessages,
   createConverseToolUseStopChunk,
@@ -62,6 +63,12 @@ export interface CustomChatBedrockConverseInput
    * Enables Bedrock prompt cache checkpoints for message and tool prefixes.
    */
   promptCache?: boolean;
+
+  /**
+   * Prompt-cache checkpoint TTL. Defaults to `'1h'` (extended cache) when
+   * `promptCache` is enabled; set `'5m'` for the legacy 5-minute behavior.
+   */
+  promptCacheTtl?: PromptCacheTtl;
 
   /**
    * Guardrail configuration for Converse and ConverseStream invocations.
@@ -110,6 +117,11 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
   promptCache?: boolean;
 
   /**
+   * Prompt-cache checkpoint TTL (`'5m'` legacy or `'1h'` extended cache).
+   */
+  promptCacheTtl?: PromptCacheTtl;
+
+  /**
    * Application Inference Profile ARN to use instead of model ID.
    */
   applicationInferenceProfile?: string;
@@ -122,6 +134,7 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
   constructor(fields?: CustomChatBedrockConverseInput) {
     super(fields);
     this.promptCache = fields?.promptCache;
+    this.promptCacheTtl = fields?.promptCacheTtl;
     this.applicationInferenceProfile = fields?.applicationInferenceProfile;
     this.serviceTier = fields?.serviceTier;
   }
@@ -149,7 +162,11 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
     const baseParams = super.invocationParams(options);
     const toolConfig =
       this.promptCache === true
-        ? insertBedrockToolCachePoint(baseParams.toolConfig, true)
+        ? insertBedrockToolCachePoint(
+          baseParams.toolConfig,
+          true,
+          this.promptCacheTtl
+        )
         : baseParams.toolConfig;
 
     /** Service tier from options or fall back to class-level setting */

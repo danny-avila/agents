@@ -15,8 +15,12 @@ type LivePromptCacheProvider =
   | Providers.OPENROUTER;
 
 type PromptCacheExpectedSystemBlock =
-  | { type: 'text'; text: string; cache_control?: { type: 'ephemeral' } }
-  | { cachePoint: { type: 'default' } };
+  | {
+      type: 'text';
+      text: string;
+      cache_control?: { type: 'ephemeral'; ttl?: '1h' };
+    }
+  | { cachePoint: { type: 'default'; ttl?: '1h' } };
 
 type LivePromptCacheClientOptions =
   | t.ClientOptions

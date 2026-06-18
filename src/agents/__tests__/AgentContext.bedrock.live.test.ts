@@ -279,7 +279,11 @@ function addLatestUserOnlyBedrockCacheControl(
       if (!modified) {
         continue;
       }
-    } else if (typeof content === 'string' && content.trim() !== '' && canAddCache) {
+    } else if (
+      typeof content === 'string' &&
+      content.trim() !== '' &&
+      canAddCache
+    ) {
       workingContent = [
         { type: 'text', text: content } as MessageContentComplex,
         cachePointBlock(),
@@ -490,7 +494,7 @@ describeIfLive('AgentContext Bedrock prompt cache live API', () => {
           text: stableInstructions,
         },
         {
-          cachePoint: { type: 'default' },
+          cachePoint: { type: 'default', ttl: '1h' },
         },
         {
           type: 'text',
@@ -643,9 +647,7 @@ describeIfLive('AgentContext Bedrock prompt cache live API', () => {
       })}\n`
     );
 
-    expect(currentSecond.cacheRead).toBeGreaterThan(
-      latestOnlySecond.cacheRead
-    );
+    expect(currentSecond.cacheRead).toBeGreaterThan(latestOnlySecond.cacheRead);
     expect(currentSecond.cacheCreation).toBeLessThan(
       latestOnlySecond.cacheCreation
     );

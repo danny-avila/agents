@@ -11,6 +11,11 @@ import type { HookRegistry } from '@/hooks';
 import type { OnChunk } from '@/llm/invoke';
 import type * as t from '@/types';
 import {
+  addTailCacheControl,
+  resolvePromptCacheTtl,
+  type PromptCacheTtl,
+} from '@/messages/cache';
+import {
   Constants,
   ContentTypes,
   GraphEvents,
@@ -22,7 +27,6 @@ import { attemptInvoke, tryFallbackProviders } from '@/llm/invoke';
 import { createRemoveAllMessage } from '@/messages/reducer';
 import { splitAtRecencyBoundary } from '@/messages/recency';
 import { getMaxOutputTokensKey } from '@/llm/request';
-import { addTailCacheControl } from '@/messages/cache';
 import { initializeModel } from '@/llm/init';
 import { getChunkContent } from '@/stream';
 import { executeHooks } from '@/hooks';
@@ -552,6 +556,16 @@ async function executeSummarizationWithFallback(params: {
       provider: clientConfig.provider as Providers,
       reasoningKey: agentContext.reasoningKey,
       usePromptCache,
+      promptCacheTtl:
+        (clientConfig.provider as Providers) === Providers.ANTHROPIC
+          ? resolvePromptCacheTtl(
+            (
+                clientConfig.clientOptions as {
+                  promptCacheTtl?: PromptCacheTtl;
+                }
+            ).promptCacheTtl
+          )
+          : undefined,
       log,
     });
     summaryText = result.text;
@@ -1205,6 +1219,7 @@ async function summarizeWithCacheHit({
   provider,
   reasoningKey,
   usePromptCache,
+  promptCacheTtl,
   log,
 }: {
   model: t.ChatModel;
@@ -1217,6 +1232,7 @@ async function summarizeWithCacheHit({
   provider: Providers;
   reasoningKey?: 'reasoning_content' | 'reasoning';
   usePromptCache?: boolean;
+  promptCacheTtl?: PromptCacheTtl;
   log?: LogFn;
 }): Promise<{ text: string; usage?: Partial<UsageMetadata> }> {
   const instruction = buildSummarizationInstruction(
@@ -1227,7 +1243,9 @@ async function summarizeWithCacheHit({
 
   const fullMessages = [...messages, new HumanMessage(instruction)];
   const invokeMessages =
-    usePromptCache === true ? addTailCacheControl(fullMessages) : fullMessages;
+    usePromptCache === true
+      ? addTailCacheControl(fullMessages, promptCacheTtl)
+      : fullMessages;
 
   const result = await attemptInvoke(
     {
