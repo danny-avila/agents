@@ -397,6 +397,43 @@ describe('CustomChatBedrockConverse', () => {
       ]);
     });
 
+    test('resolves the tool cache TTL against the configured model when this.model is swapped to an inference profile', () => {
+      const model = new CustomChatBedrockConverse({
+        ...baseConstructorArgs,
+        model: 'anthropic.claude-sonnet-4-5-20250929-v1:0',
+        applicationInferenceProfile:
+          'arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abc',
+        promptCache: true,
+      });
+      // Simulate the in-generation swap that temporarily points this.model at
+      // the profile ARN (which carries no recognizable Claude model id).
+      (model as unknown as { model: string }).model =
+        model.applicationInferenceProfile as string;
+
+      const params = model.invocationParams({
+        tools: [
+          {
+            type: 'function',
+            function: {
+              name: 'direct_tool',
+              description: 'Direct tool',
+              parameters: { type: 'object', properties: {} },
+            },
+          },
+        ],
+      });
+
+      const toolList = (params.toolConfig?.tools ?? []) as unknown as Array<
+        Record<string, unknown>
+      >;
+      const cachePoints = toolList.filter((t) => 'cachePoint' in t);
+      expect(cachePoints).toHaveLength(1);
+      expect((cachePoints[0] as { cachePoint: unknown }).cachePoint).toEqual({
+        type: 'default',
+        ttl: '1h',
+      });
+    });
+
     test('adds the Bedrock cache point before deferred tools', () => {
       const model = new CustomChatBedrockConverse({
         ...baseConstructorArgs,

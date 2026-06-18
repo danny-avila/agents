@@ -62,43 +62,50 @@ function isAnthropicBuiltInTool(
   );
 }
 
+/**
+ * Whether a tool already carries a cache breakpoint. Built-ins use a direct
+ * `cache_control`; custom tools normally carry it under `extras`, but a
+ * caller-supplied Anthropic-native tool object can also put it directly on the
+ * block — check both so stale markers are never missed.
+ */
 function hasCacheControl(tool: AnthropicToolCacheCandidate): boolean {
   if (isAnthropicBuiltInTool(tool)) {
     return tool.cache_control != null;
   }
-  return tool.extras?.cache_control != null;
+  return tool.cache_control != null || tool.extras?.cache_control != null;
 }
 
 /**
  * Read the extended-cache TTL (`'1h'`) carried by a tool's existing
  * `cache_control`, or `undefined` for the legacy 5-minute marker (no `ttl`).
+ * Checks the direct block first, then `extras` (custom tools).
  */
 function getCacheControlTtl(
   tool: AnthropicToolCacheCandidate
 ): '1h' | undefined {
-  const cacheControl = isAnthropicBuiltInTool(tool)
-    ? (tool.cache_control as { ttl?: unknown } | undefined)
-    : (tool.extras?.cache_control as { ttl?: unknown } | undefined);
+  const cacheControl = (
+    isAnthropicBuiltInTool(tool)
+      ? tool.cache_control
+      : (tool.cache_control ?? tool.extras?.cache_control)
+  ) as { ttl?: unknown } | undefined;
   return cacheControl?.ttl === '1h' ? '1h' : undefined;
 }
 
 /**
- * Return a clone of `tool` with any `cache_control` removed (from the block
- * itself for built-ins, or from `extras` for custom tools), preserving the
- * prototype chain. Used to clear stray markers off earlier static tools so they
- * never anchor a competing breakpoint.
+ * Return a clone of `tool` with any `cache_control` removed — both the direct
+ * block marker and the `extras` marker — preserving the prototype chain. Used
+ * to clear stray markers off tools that must not anchor a competing breakpoint.
  */
 function stripCacheControl(
   tool: AnthropicToolCacheCandidate
 ): AnthropicToolCacheCandidate {
   const prototype = Object.getPrototypeOf(tool) ?? Object.prototype;
-  if (isAnthropicBuiltInTool(tool)) {
-    const wrapped = { ...tool };
-    delete wrapped.cache_control;
-    return Object.assign(Object.create(prototype), wrapped);
+  const wrapped = { ...tool };
+  delete wrapped.cache_control;
+  if (wrapped.extras != null) {
+    wrapped.extras = { ...wrapped.extras };
+    delete wrapped.extras.cache_control;
   }
-  const wrapped = { ...tool, extras: { ...(tool.extras ?? {}) } };
-  delete wrapped.extras.cache_control;
   return Object.assign(Object.create(prototype), wrapped);
 }
 
@@ -116,7 +123,10 @@ function markCacheControl(
     });
   }
 
-  return Object.assign(Object.create(prototype), tool, {
+  // Drop any direct marker so it can't compete with the `extras` breakpoint.
+  const wrapped = { ...tool };
+  delete wrapped.cache_control;
+  return Object.assign(Object.create(prototype), wrapped, {
     extras: {
       ...(tool.extras ?? {}),
       cache_control: cacheControl,
@@ -181,16 +191,27 @@ export function partitionAndMarkAnthropicToolCache(
     }
   }
 
-  if (staticTools.length === 0) {
-    return tools;
+  // Anthropic serializes ALL tools before system/messages, so a stray
+  // cache_control on any tool — static or deferred — that survives the resolved
+  // breakpoint would violate the longer-TTL-first ordering. Strip stale markers
+  // off the deferred tools first (they sit after the breakpoint but still before
+  // system/messages, and the all-deferred case has no breakpoint of its own).
+  let mutated = false;
+  for (let i = 0; i < deferredTools.length; i++) {
+    const candidate = deferredTools[i] as AnthropicToolCacheCandidate;
+    if (hasCacheControl(candidate)) {
+      deferredTools[i] = stripCacheControl(candidate);
+      mutated = true;
+    }
   }
 
-  // Anthropic requires longer-TTL cache breakpoints to precede shorter ones, and
-  // tools render before system/messages. Strip any stray cache_control off the
-  // earlier static tools so a leftover 5-minute marker never sits ahead of the
-  // resolved tool/system/message breakpoint, then stamp (or re-stamp) only the
-  // last static tool with the resolved TTL.
-  let mutated = false;
+  if (staticTools.length === 0) {
+    return mutated ? ([...deferredTools] as GraphTools) : tools;
+  }
+
+  // Strip any stray cache_control off the earlier static tools so a leftover
+  // 5-minute marker never sits ahead of the resolved breakpoint, then stamp (or
+  // re-stamp) only the last static tool with the resolved TTL.
   for (let i = 0; i < staticTools.length - 1; i++) {
     const candidate = staticTools[i] as AnthropicToolCacheCandidate;
     if (hasCacheControl(candidate)) {
@@ -211,7 +232,7 @@ export function partitionAndMarkAnthropicToolCache(
   }
 
   // Nothing changed and nothing to reorder — return the original reference.
-  if (!mutated && deferredTools.length === 0) {
+  if (!mutated) {
     return tools;
   }
   return [...staticTools, ...deferredTools] as GraphTools;

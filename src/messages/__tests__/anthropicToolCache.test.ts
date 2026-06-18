@@ -194,6 +194,82 @@ describe('partitionAndMarkAnthropicToolCache', () => {
       ttl: '1h',
     });
   });
+
+  it('strips stale markers off deferred tools so they do not precede the system/message breakpoint', () => {
+    const staticTool = fakeTool('a-static');
+    const deferred = fakeTool('b-deferred') as {
+      extras?: { cache_control?: { type: string } };
+    };
+    deferred.extras = { cache_control: { type: 'ephemeral' } };
+    const out = partitionAndMarkAnthropicToolCache(
+      [staticTool, deferred] as never,
+      (name) => name === 'b-deferred',
+      '1h'
+    ) as Array<{
+      extras?: { cache_control?: { type: string; ttl?: string } };
+    }>;
+    expect(out[0].extras?.cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    });
+    expect(out[1].extras?.cache_control).toBeUndefined();
+  });
+
+  it('strips stale markers in the all-deferred case', () => {
+    const deferred = fakeTool('only-deferred') as {
+      extras?: { cache_control?: { type: string } };
+    };
+    deferred.extras = { cache_control: { type: 'ephemeral' } };
+    const out = partitionAndMarkAnthropicToolCache(
+      [deferred] as never,
+      () => true,
+      '1h'
+    ) as Array<{ extras?: { cache_control?: unknown } }>;
+    expect(out[0].extras?.cache_control).toBeUndefined();
+  });
+
+  it('strips a direct cache_control on an earlier native (non-built-in) tool', () => {
+    const nativeWithMarker = {
+      name: 'native_a',
+      input_schema: { type: 'object', properties: {} },
+      cache_control: { type: 'ephemeral' },
+    };
+    const out = partitionAndMarkAnthropicToolCache(
+      [nativeWithMarker, fakeTool('native_b')] as never,
+      () => false,
+      '1h'
+    ) as Array<{
+      cache_control?: unknown;
+      extras?: { cache_control?: { type: string; ttl?: string } };
+    }>;
+    expect(out[0].cache_control).toBeUndefined();
+    expect(out[1].extras?.cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    });
+  });
+
+  it('does not leave a competing direct marker on the tail native tool', () => {
+    const nativeTail = {
+      name: 'native_tail',
+      input_schema: { type: 'object', properties: {} },
+      cache_control: { type: 'ephemeral' },
+    };
+    const out = partitionAndMarkAnthropicToolCache(
+      [nativeTail] as never,
+      () => false,
+      '1h'
+    ) as Array<{
+      cache_control?: unknown;
+      extras?: { cache_control?: { type: string; ttl?: string } };
+    }>;
+    // Stale direct marker removed; single 1h breakpoint lives under extras.
+    expect(out[0].cache_control).toBeUndefined();
+    expect(out[0].extras?.cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    });
+  });
 });
 
 describe('makeIsDeferred', () => {

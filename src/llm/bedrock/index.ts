@@ -127,6 +127,15 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
   promptCacheTtl?: PromptCacheTtl;
 
   /**
+   * Configured Claude model id, captured at construction for prompt-cache TTL
+   * gating. `this.model` is temporarily swapped to the application inference
+   * profile ARN during (non-)streaming generation — when `invocationParams`
+   * runs inside that window — so resolving the TTL against `this.model` there
+   * would misgate. This stable copy is never swapped.
+   */
+  private readonly promptCacheModelId?: string;
+
+  /**
    * Application Inference Profile ARN to use instead of model ID.
    */
   applicationInferenceProfile?: string;
@@ -140,6 +149,7 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
     super(fields);
     this.promptCache = fields?.promptCache;
     this.promptCacheTtl = fields?.promptCacheTtl;
+    this.promptCacheModelId = fields?.model;
     this.applicationInferenceProfile = fields?.applicationInferenceProfile;
     this.serviceTier = fields?.serviceTier;
   }
@@ -170,7 +180,10 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
         ? insertBedrockToolCachePoint(
           baseParams.toolConfig,
           true,
-          resolveBedrockPromptCacheTtl(this.promptCacheTtl, this.model)
+          resolveBedrockPromptCacheTtl(
+            this.promptCacheTtl,
+            this.promptCacheModelId ?? this.model
+          )
         )
         : baseParams.toolConfig;
 
