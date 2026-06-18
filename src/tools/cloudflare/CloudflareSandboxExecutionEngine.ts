@@ -224,6 +224,18 @@ export async function execWithClientTimeout(
   const controller = new AbortController();
   const execOptions: t.CloudflareSandboxExecOptions = { ...options };
   if (sandbox.supportsExecSignal === true) {
+    // Compose the caller's signal (e.g. run/user cancellation) with our timeout
+    // controller so EITHER source cancels the exec — don't clobber the caller's.
+    const callerSignal = options.signal;
+    if (callerSignal != null) {
+      if (callerSignal.aborted) {
+        controller.abort();
+      } else {
+        callerSignal.addEventListener('abort', () => controller.abort(), {
+          once: true,
+        });
+      }
+    }
     execOptions.signal = controller.signal;
   }
   return withClientTimeout(

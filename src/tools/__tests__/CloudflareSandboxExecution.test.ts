@@ -2,6 +2,7 @@ import type * as t from '@/types';
 import {
   createCloudflareWorkspaceFS,
   createCloudflareLocalExecutionConfig,
+  execWithClientTimeout,
   executeCloudflareBash,
   executeCloudflareCode,
 } from '../cloudflare/CloudflareSandboxExecutionEngine';
@@ -323,6 +324,45 @@ describe('Cloudflare sandbox execution backend', () => {
     } finally {
       jest.useRealTimers();
     }
+  });
+
+  it('composes a caller abort signal with the timeout instead of clobbering it', async () => {
+    let received: AbortSignal | undefined;
+    const sandbox = createRuntime({
+      supportsExecSignal: true,
+      exec: (_command, options) => {
+        received = options?.signal;
+        return new Promise<t.CloudflareSandboxExecResult>(
+          (_resolve, reject) => {
+            options?.signal?.addEventListener(
+              'abort',
+              () => reject(new Error('aborted')),
+              { once: true }
+            );
+          }
+        );
+      },
+    });
+
+    const caller = new AbortController();
+    const settled = execWithClientTimeout(
+      sandbox,
+      'echo hi',
+      { signal: caller.signal },
+      60000,
+      'test'
+    ).catch((e) => e as Error);
+
+    await Promise.resolve();
+    expect(received).toBeDefined();
+    // The exec gets a composed signal, not the caller's directly.
+    expect(received).not.toBe(caller.signal);
+    expect(received?.aborted).toBe(false);
+
+    // A caller cancellation must reach the exec (not wait for the client timeout).
+    caller.abort();
+    await settled;
+    expect(received?.aborted).toBe(true);
   });
 
   it('passes call-specific timeouts to the Cloudflare spawn wrapper', async () => {
