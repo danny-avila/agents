@@ -94,9 +94,10 @@ export type BedrockAnthropicInput = ChatBedrockConverseInput & {
     AnthropicReasoning;
   promptCache?: boolean;
   /**
-   * Prompt-cache checkpoint TTL. Defaults to `'1h'` (extended cache) when
-   * `promptCache` is enabled; set `'5m'` to opt back into the legacy
-   * 5-minute behavior.
+   * Prompt-cache checkpoint TTL. When omitted, defaults to the 1-hour extended
+   * cache on Bedrock models that support it (Claude Opus 4.5 / Sonnet 4.5 /
+   * Haiku 4.5) and to the legacy 5-minute cache on all other models. Set `'5m'`
+   * or `'1h'` to override the per-model default.
    */
   promptCacheTtl?: PromptCacheTtl;
 };
