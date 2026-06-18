@@ -249,7 +249,7 @@ describe('partitionAndMarkAnthropicToolCache', () => {
     });
   });
 
-  it('does not leave a competing direct marker on the tail native tool', () => {
+  it('upgrades a raw Anthropic tail tool to a direct 1h marker (not extras)', () => {
     const nativeTail = {
       name: 'native_tail',
       input_schema: { type: 'object', properties: {} },
@@ -260,15 +260,30 @@ describe('partitionAndMarkAnthropicToolCache', () => {
       () => false,
       '1h'
     ) as Array<{
-      cache_control?: unknown;
-      extras?: { cache_control?: { type: string; ttl?: string } };
+      cache_control?: { type: string; ttl?: string };
+      extras?: { cache_control?: unknown };
     }>;
-    // Stale direct marker removed; single 1h breakpoint lives under extras.
-    expect(out[0].cache_control).toBeUndefined();
-    expect(out[0].extras?.cache_control).toEqual({
-      type: 'ephemeral',
-      ttl: '1h',
-    });
+    // Raw Anthropic tools carry cache_control directly (extras is not promoted
+    // for them), so the stale marker is upgraded in place to 1h — not moved.
+    expect(out[0].cache_control).toEqual({ type: 'ephemeral', ttl: '1h' });
+    expect(out[0].extras?.cache_control).toBeUndefined();
+  });
+
+  it('reorders deferred tools after a correctly pre-marked static tool', () => {
+    const deferred = fakeTool('z-deferred');
+    const staticTool = fakeTool('a-static') as {
+      extras?: { cache_control?: { type: string; ttl?: string } };
+    };
+    // Already carries the resolved 1h marker, so nothing is mutated...
+    staticTool.extras = { cache_control: { type: 'ephemeral', ttl: '1h' } };
+    const out = partitionAndMarkAnthropicToolCache(
+      [deferred, staticTool] as never, // deferred precedes static in the input
+      (name) => name === 'z-deferred',
+      '1h'
+    ) as Array<{ name?: string }>;
+    // ...but the static (cached) tool must still be hoisted ahead of the
+    // deferred tool so the breakpoint precedes discovered tools.
+    expect(out.map((t) => t.name)).toEqual(['a-static', 'z-deferred']);
   });
 });
 

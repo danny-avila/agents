@@ -109,13 +109,29 @@ function stripCacheControl(
   return Object.assign(Object.create(prototype), wrapped);
 }
 
+/**
+ * Whether `tool` is already in the Anthropic provider payload shape — an
+ * Anthropic built-in or a raw Anthropic tool object (has `input_schema`). These
+ * carry `cache_control` directly on the block; the LangChain adapter does NOT
+ * promote `extras.cache_control` for them. LangChain StructuredTools, by
+ * contrast, expose the marker via `extras`.
+ */
+function isProviderShapedTool(tool: AnthropicToolCacheCandidate): boolean {
+  return (
+    isAnthropicBuiltInTool(tool) ||
+    'input_schema' in (tool as Record<string, unknown>)
+  );
+}
+
 function markCacheControl(
   tool: AnthropicToolCacheCandidate,
   ttl?: PromptCacheTtl
 ): AnthropicToolCacheCandidate {
   const cacheControl = buildAnthropicCacheControl(ttl);
   const prototype = Object.getPrototypeOf(tool) ?? Object.prototype;
-  if (isAnthropicBuiltInTool(tool)) {
+  if (isProviderShapedTool(tool)) {
+    // Built-ins and raw Anthropic tool objects carry cache_control directly on
+    // the block; `extras` is not promoted onto the payload for these shapes.
     const wrapped = { ...tool };
     delete wrapped.extras;
     return Object.assign(Object.create(prototype), wrapped, {
@@ -123,7 +139,8 @@ function markCacheControl(
     });
   }
 
-  // Drop any direct marker so it can't compete with the `extras` breakpoint.
+  // LangChain custom tools: drop any direct marker and expose the breakpoint via
+  // `extras`, which the Anthropic adapter promotes onto the payload.
   const wrapped = { ...tool };
   delete wrapped.cache_control;
   return Object.assign(Object.create(prototype), wrapped, {
@@ -231,8 +248,10 @@ export function partitionAndMarkAnthropicToolCache(
     mutated = true;
   }
 
-  // Nothing changed and nothing to reorder — return the original reference.
-  if (!mutated) {
+  // Return the original reference only when nothing changed AND partitioning
+  // moved nothing. When deferred tools exist they must end up after the cache
+  // breakpoint, so the partitioned array is returned even if no marker changed.
+  if (!mutated && deferredTools.length === 0) {
     return tools;
   }
   return [...staticTools, ...deferredTools] as GraphTools;
