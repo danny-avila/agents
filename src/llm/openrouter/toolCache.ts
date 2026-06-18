@@ -1,12 +1,16 @@
 import type { BindToolsInput } from '@langchain/core/language_models/chat_models';
 import type { OpenAIClient } from '@langchain/openai';
 import type { GraphTools } from '@/types';
+import {
+  buildAnthropicCacheControl,
+  type PromptCacheTtl,
+} from '@/messages/cache';
 import { _convertToOpenAITool } from '@/llm/openai';
 
-const CACHE_CONTROL = { type: 'ephemeral' as const };
+type OpenRouterCacheControl = { type: 'ephemeral'; ttl?: '1h' };
 
 type OpenRouterToolWithCacheControl = OpenAIClient.ChatCompletionTool & {
-  cache_control?: typeof CACHE_CONTROL;
+  cache_control?: OpenRouterCacheControl;
   defer_loading?: boolean;
 };
 
@@ -46,17 +50,19 @@ function toOpenRouterTool(tool: unknown): OpenRouterToolWithCacheControl {
 }
 
 function markCacheControl(
-  tool: OpenRouterToolWithCacheControl
+  tool: OpenRouterToolWithCacheControl,
+  ttl?: PromptCacheTtl
 ): OpenRouterToolWithCacheControl {
   return {
     ...tool,
-    cache_control: CACHE_CONTROL,
+    cache_control: buildAnthropicCacheControl(ttl),
   };
 }
 
 export function partitionAndMarkOpenRouterToolCache(
   tools: GraphTools | undefined,
-  isDeferred: (toolName: string) => boolean
+  isDeferred: (toolName: string) => boolean,
+  ttl?: PromptCacheTtl
 ): GraphTools | undefined {
   if (tools == null || tools.length === 0) {
     return tools;
@@ -82,7 +88,8 @@ export function partitionAndMarkOpenRouterToolCache(
   }
 
   staticTools[staticTools.length - 1] = markCacheControl(
-    staticTools[staticTools.length - 1]
+    staticTools[staticTools.length - 1],
+    ttl
   );
 
   return [...staticTools, ...deferredTools] as GraphTools;

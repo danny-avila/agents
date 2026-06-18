@@ -6,6 +6,7 @@ import type {
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { ChatGenerationChunk } from '@langchain/core/outputs';
 import type { BaseMessage } from '@langchain/core/messages';
+import type { PromptCacheTtl } from '@/messages/cache';
 import { ChatOpenAI, emitStreamChunkCallback } from '@/llm/openai';
 
 export type OpenRouterReasoningEffort =
@@ -30,6 +31,13 @@ export interface ChatOpenRouterCallOptions
   reasoning?: OpenRouterReasoning;
   modelKwargs?: OpenAIChatInput['modelKwargs'];
   promptCache?: boolean;
+  /**
+   * Prompt-cache breakpoint TTL. Defaults to `'1h'` (extended cache) when
+   * `promptCache` is enabled; set `'5m'` for the legacy 5-minute behavior.
+   * OpenRouter forwards this to Claude upstreams (Anthropic / Bedrock / Vertex),
+   * which downgrade to 5m where the extended TTL isn't supported.
+   */
+  promptCacheTtl?: PromptCacheTtl;
 }
 
 export type ChatOpenRouterInput = Partial<
@@ -107,6 +115,7 @@ export class ChatOpenRouter extends ChatOpenAI {
   constructor(_fields: ChatOpenRouterInput) {
     const fieldsWithoutPromptCache: ChatOpenRouterInput = { ..._fields };
     delete fieldsWithoutPromptCache.promptCache;
+    delete fieldsWithoutPromptCache.promptCacheTtl;
 
     const {
       include_reasoning,

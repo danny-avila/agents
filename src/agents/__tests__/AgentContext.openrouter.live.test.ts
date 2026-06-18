@@ -93,7 +93,7 @@ describeIfLive('AgentContext OpenRouter prompt cache live API', () => {
         {
           type: 'text',
           text: stableInstructions,
-          cache_control: { type: 'ephemeral' },
+          cache_control: { type: 'ephemeral', ttl: '1h' },
         },
       ],
     });

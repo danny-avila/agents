@@ -850,18 +850,18 @@ export class AgentContext {
   }
 
   /**
-   * Resolved TTL for the active prompt-cache provider. Anthropic uses the
-   * configured `promptCacheTtl` (default `'1h'` extended cache); OpenRouter
-   * keeps its legacy 5-minute marker (no `ttl`) to preserve existing behavior.
+   * Resolved TTL for the active prompt-cache provider (Anthropic or OpenRouter).
+   * Both expose `promptCacheTtl` and use the Anthropic `cache_control` format, so
+   * the configured value resolves the same way (default `'1h'` extended cache).
    */
   private getPromptCacheTtl(
     provider: PromptCacheProvider | undefined
   ): PromptCacheTtl | undefined {
-    if (provider !== Providers.ANTHROPIC) {
+    if (provider == null) {
       return undefined;
     }
     return resolvePromptCacheTtl(
-      (this.clientOptions as t.AnthropicClientOptions | undefined)
+      (this.clientOptions as { promptCacheTtl?: PromptCacheTtl } | undefined)
         ?.promptCacheTtl
     );
   }
@@ -919,7 +919,9 @@ export class AgentContext {
           {
             type: 'text',
             text: stableInstructions,
-            cache_control: { type: 'ephemeral' },
+            cache_control: buildAnthropicCacheControl(
+              this.getPromptCacheTtl(promptCacheProvider)
+            ),
           },
         ],
       } as BaseMessageFields);

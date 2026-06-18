@@ -244,7 +244,7 @@ describe('AgentContext', () => {
         {
           type: 'text',
           text: 'Stable instructions',
-          cache_control: { type: 'ephemeral' },
+          cache_control: { type: 'ephemeral', ttl: '1h' },
         },
       ]);
       expect(result[1].content).toBe('Hello');

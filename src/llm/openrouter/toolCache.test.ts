@@ -9,7 +9,7 @@ type OpenRouterTool = {
     description?: string;
     parameters?: object;
   };
-  cache_control?: { type: 'ephemeral' };
+  cache_control?: { type: 'ephemeral'; ttl?: '1h' };
   defer_loading?: boolean;
 };
 
@@ -79,5 +79,29 @@ describe('partitionAndMarkOpenRouterToolCache', () => {
     ]);
     expect(result[0].cache_control).toEqual({ type: 'ephemeral' });
     expect(result[1]).not.toHaveProperty('cache_control');
+  });
+
+  it('stamps the resolved 1h ttl on the last static tool', () => {
+    const result = partitionAndMarkOpenRouterToolCache(
+      [
+        createOpenAITool('static_one'),
+        createOpenAITool('static_two'),
+      ] as GraphTools,
+      () => false,
+      '1h'
+    ) as OpenRouterTool[];
+
+    expect(result[1].cache_control).toEqual({ type: 'ephemeral', ttl: '1h' });
+    expect(result[0]).not.toHaveProperty('cache_control');
+  });
+
+  it('omits ttl for the 5m legacy default', () => {
+    const result = partitionAndMarkOpenRouterToolCache(
+      [createOpenAITool('only_static')] as GraphTools,
+      () => false,
+      '5m'
+    ) as OpenRouterTool[];
+
+    expect(result[0].cache_control).toEqual({ type: 'ephemeral' });
   });
 });

@@ -1425,7 +1425,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         toolsForBinding =
           partitionAndMarkOpenRouterToolCache(
             rawToolsForBinding,
-            makeIsDeferred(agentContext.toolDefinitions)
+            makeIsDeferred(agentContext.toolDefinitions),
+            resolvePromptCacheTtl(
+              (
+                agentContext.clientOptions as
+                  | t.ProviderOptionsMap[Providers.OPENROUTER]
+                  | undefined
+              )?.promptCacheTtl
+            )
           ) ?? rawToolsForBinding;
       } else if (
         agentContext.provider === Providers.BEDROCK &&
@@ -1843,15 +1850,19 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       ) {
         finalMessages = addTailCacheControl<BaseMessage>(
           finalMessages,
-          anthropicPromptCacheEnabled
-            ? resolvePromptCacheTtl(
-              (
+          resolvePromptCacheTtl(
+            anthropicPromptCacheEnabled
+              ? (
                   agentContext.clientOptions as
                     | t.AnthropicClientOptions
                     | undefined
               )?.promptCacheTtl
-            )
-            : undefined
+              : (
+                  agentContext.clientOptions as
+                    | t.ProviderOptionsMap[Providers.OPENROUTER]
+                    | undefined
+              )?.promptCacheTtl
+          )
         );
       } else if (bedrockPromptCacheEnabled) {
         const bedrockOptions = agentContext.clientOptions as
