@@ -125,7 +125,7 @@ describe('workspace seam', () => {
       await writeTool.invoke({
         id: 'c1',
         name: 'write_file',
-        args: { file_path: 'note.md', content: 'hi\n' },
+        args: { path: 'note.md', content: 'hi\n' },
         type: 'tool_call',
       });
       expect(tracked.writeFile).toHaveBeenCalled();
@@ -137,7 +137,7 @@ describe('workspace seam', () => {
       await readTool.invoke({
         id: 'c2',
         name: Constants.READ_FILE,
-        args: { file_path: 'note.md' },
+        args: { path: 'note.md' },
         type: 'tool_call',
       });
       expect(tracked.stat).toHaveBeenCalled();

@@ -22,13 +22,13 @@ CONSTRAINTS:
 export const ReadFileToolSchema = {
   type: 'object',
   properties: {
-    file_path: {
+    path: {
       type: 'string',
       description:
         'Path to the file. For skill files: "{skillName}/{path}" (e.g. "pdf-analyzer/src/utils.py"). For code execution output: the path as returned by the execution tool.',
     },
   },
-  required: ['file_path'],
+  required: ['path'],
 } as const;
 
 export const ReadFileToolDefinition = {

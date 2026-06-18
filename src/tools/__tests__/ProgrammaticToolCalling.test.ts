@@ -1503,10 +1503,10 @@ for member in team:
         { registry, runId: 'r1' },
         'read_file',
         'call_1',
-        { file_path: '/tmp/x' }
+        { path: '/tmp/x' }
       );
       expect(gate.denyReason).toBeUndefined();
-      expect(gate.input).toEqual({ file_path: '/tmp/x' });
+      expect(gate.input).toEqual({ path: '/tmp/x' });
     });
 
     it('applies updatedInput to the inner tool args', async () => {
@@ -1520,7 +1520,7 @@ for member in team:
           // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
           async () => ({
             decision: 'allow',
-            updatedInput: { file_path: '/tmp/rewritten' },
+            updatedInput: { path: '/tmp/rewritten' },
           }),
         ],
       });
@@ -1529,10 +1529,10 @@ for member in team:
         { registry, runId: 'r1' },
         'read_file',
         'call_1',
-        { file_path: '/tmp/original' }
+        { path: '/tmp/original' }
       );
       expect(gate.denyReason).toBeUndefined();
-      expect(gate.input).toEqual({ file_path: '/tmp/rewritten' });
+      expect(gate.input).toEqual({ path: '/tmp/rewritten' });
     });
 
     it('treats `ask` as fail-closed deny (HITL not reachable from bridge)', async () => {
