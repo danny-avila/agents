@@ -187,7 +187,11 @@ function addLatestUserOnlyAnthropicCacheControl(
       if (!modified) {
         continue;
       }
-    } else if (typeof content === 'string' && content.trim() !== '' && canAddCache) {
+    } else if (
+      typeof content === 'string' &&
+      content.trim() !== '' &&
+      canAddCache
+    ) {
       workingContent = [
         {
           type: 'text',
@@ -348,7 +352,7 @@ describeIfLive('AgentContext Anthropic prompt cache live API', () => {
         {
           type: 'text',
           text: stableInstructions,
-          cache_control: { type: 'ephemeral' },
+          cache_control: { type: 'ephemeral', ttl: '1h' },
         },
       ],
     });

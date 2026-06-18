@@ -978,11 +978,16 @@ const NON_CACHEABLE_PAYLOAD_BLOCK_TYPES = new Set([
  * skipped. Returns a new array only when it actually places a marker.
  */
 function reanchorTailCacheControl(
-  messages: AnthropicMessageCreateParams['messages']
+  messages: AnthropicMessageCreateParams['messages'],
+  ttl?: '1h'
 ): AnthropicMessageCreateParams['messages'] {
   if (messages.length === 0) {
     return messages;
   }
+  const cacheControl =
+    ttl === '1h'
+      ? ({ type: 'ephemeral', ttl: '1h' } as const)
+      : ({ type: 'ephemeral' } as const);
   const lastIndex = messages.length - 1;
   const tail = messages[lastIndex];
   const content = tail.content;
@@ -994,9 +999,7 @@ function reanchorTailCacheControl(
     const next = [...messages];
     next[lastIndex] = {
       ...tail,
-      content: [
-        { type: 'text', text: content, cache_control: { type: 'ephemeral' } },
-      ],
+      content: [{ type: 'text', text: content, cache_control: cacheControl }],
     } as (typeof messages)[number];
     return next;
   }
@@ -1027,10 +1030,34 @@ function reanchorTailCacheControl(
   next[lastIndex] = {
     ...tail,
     content: content.map((block, i) =>
-      i === anchor ? { ...block, cache_control: { type: 'ephemeral' } } : block
+      i === anchor ? { ...block, cache_control: cacheControl } : block
     ),
   } as (typeof messages)[number];
   return next;
+}
+
+/**
+ * Find the extended-cache TTL (`'1h'`) carried by an existing `cache_control`
+ * breakpoint, so {@link reanchorTailCacheControl} can re-apply the same TTL the
+ * stripped prefill had. Returns `undefined` for the legacy 5-minute default
+ * (no `ttl`), keeping that path byte-identical to before.
+ */
+function findCacheControlTtl(
+  messages: AnthropicMessageCreateParams['messages']
+): '1h' | undefined {
+  for (const message of messages) {
+    if (!Array.isArray(message.content)) {
+      continue;
+    }
+    for (const block of message.content) {
+      const cacheControl = (block as { cache_control?: { ttl?: unknown } })
+        .cache_control;
+      if (cacheControl?.ttl === '1h') {
+        return '1h';
+      }
+    }
+  }
+  return undefined;
 }
 
 export function stripUnsupportedAssistantPrefill<
@@ -1065,7 +1092,7 @@ export function stripUnsupportedAssistantPrefill<
   const reanchored =
     messagesHaveCacheControl(messages) &&
     !messagesHaveCacheControl(nextMessages)
-      ? reanchorTailCacheControl(nextMessages)
+      ? reanchorTailCacheControl(nextMessages, findCacheControlTtl(messages))
       : nextMessages;
 
   return {

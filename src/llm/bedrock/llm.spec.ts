@@ -397,6 +397,67 @@ describe('CustomChatBedrockConverse', () => {
       ]);
     });
 
+    test('defaults the tool cache point to the 1h extended TTL', () => {
+      const model = new CustomChatBedrockConverse({
+        ...baseConstructorArgs,
+        promptCache: true,
+      });
+
+      const params = model.invocationParams({
+        tools: [
+          {
+            type: 'function',
+            function: {
+              name: 'direct_tool',
+              description: 'Direct tool',
+              parameters: { type: 'object', properties: {} },
+            },
+          },
+        ],
+      });
+
+      const toolList = (params.toolConfig?.tools ?? []) as unknown as Array<
+        Record<string, unknown>
+      >;
+      const cachePoints = toolList.filter((t) => 'cachePoint' in t);
+      expect(cachePoints).toHaveLength(1);
+      expect((cachePoints[0] as { cachePoint: unknown }).cachePoint).toEqual({
+        type: 'default',
+        ttl: '1h',
+      });
+    });
+
+    test('honors an explicit 5m promptCacheTtl on the tool cache point', () => {
+      const model = new CustomChatBedrockConverse({
+        ...baseConstructorArgs,
+        promptCache: true,
+        promptCacheTtl: '5m',
+      });
+
+      const params = model.invocationParams({
+        tools: [
+          {
+            type: 'function',
+            function: {
+              name: 'direct_tool',
+              description: 'Direct tool',
+              parameters: { type: 'object', properties: {} },
+            },
+          },
+        ],
+      });
+
+      const toolList = (params.toolConfig?.tools ?? []) as unknown as Array<
+        Record<string, unknown>
+      >;
+      const cachePoints = toolList.filter((t) => 'cachePoint' in t);
+      expect(cachePoints).toHaveLength(1);
+      // 5m omits the ttl field (provider default).
+      expect((cachePoints[0] as { cachePoint: unknown }).cachePoint).toEqual({
+        type: 'default',
+      });
+    });
+
     test('adds the Bedrock cache point before deferred tools', () => {
       const model = new CustomChatBedrockConverse({
         ...baseConstructorArgs,

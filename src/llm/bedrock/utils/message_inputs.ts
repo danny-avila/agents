@@ -427,24 +427,40 @@ const standardContentBlockConverter: StandardContentBlockConverter<{
   },
 };
 
+type BedrockPromptCacheTtl = '5m' | '1h';
+type NormalizedBedrockCachePoint = {
+  type: 'default';
+  ttl?: BedrockPromptCacheTtl;
+};
+
 /**
- * Check if a block has a cache point.
+ * Check if a block has a default cache point and return its normalized form,
+ * preserving an optional extended-TTL `ttl` (`'5m'` | `'1h'`). Returns
+ * `undefined` when the block is not a default cache point.
  */
-function isDefaultCachePoint(block: unknown): boolean {
+function getDefaultCachePoint(
+  block: unknown
+): NormalizedBedrockCachePoint | undefined {
   if (typeof block !== 'object' || block === null) {
-    return false;
+    return undefined;
   }
   if (!('cachePoint' in block)) {
-    return false;
+    return undefined;
   }
   const cachePoint = (block as { cachePoint?: unknown }).cachePoint;
   if (typeof cachePoint !== 'object' || cachePoint === null) {
-    return false;
+    return undefined;
   }
   if (!('type' in cachePoint)) {
-    return false;
+    return undefined;
   }
-  return (cachePoint as { type?: string }).type === 'default';
+  if ((cachePoint as { type?: string }).type !== 'default') {
+    return undefined;
+  }
+  const ttl = (cachePoint as { ttl?: unknown }).ttl;
+  return ttl === '5m' || ttl === '1h'
+    ? { type: 'default', ttl }
+    : { type: 'default' };
 }
 
 /**
@@ -570,11 +586,10 @@ function convertLangChainContentBlockToConverseContentBlock({
     } as BedrockContentBlock;
   }
 
-  if (isDefaultCachePoint(block)) {
+  const cachePoint = getDefaultCachePoint(block);
+  if (cachePoint != null) {
     return {
-      cachePoint: {
-        type: 'default',
-      },
+      cachePoint,
     } as BedrockContentBlock;
   }
 
@@ -604,14 +619,14 @@ function convertSystemMessageToConverseMessage(
         contentBlocks.push({
           text: (block as { text: string }).text,
         });
-      } else if (isDefaultCachePoint(block)) {
-        contentBlocks.push({
-          cachePoint: {
-            type: 'default',
-          },
-        } as BedrockSystemContentBlock);
       } else {
-        break;
+        const cachePoint = getDefaultCachePoint(block);
+        if (cachePoint == null) {
+          break;
+        }
+        contentBlocks.push({
+          cachePoint,
+        } as BedrockSystemContentBlock);
       }
     }
     if (msg.content.length === contentBlocks.length) {
@@ -681,28 +696,29 @@ function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
           reasoningContent:
             langchainReasoningBlockToBedrockReasoningBlock(reasoningBlock),
         } as BedrockContentBlock);
-      } else if (isDefaultCachePoint(block)) {
-        contentBlocks.push({
-          cachePoint: {
-            type: 'default',
-          },
-        } as BedrockContentBlock);
-      } else if (FOREIGN_REASONING_TYPES.some((t) => t === block.type)) {
-        // Reasoning from another provider (Anthropic `thinking`/
-        // `redacted_thinking`, Google `reasoning`, LibreChat `think`). Bedrock's
-        // native reasoning is `reasoning_content` (handled above); a foreign
-        // block carries a signature Bedrock cannot validate, so drop it on a
-        // cross-provider handoff (e.g. Anthropic → Bedrock) rather than crash.
-        // The Bedrock model produces its own reasoning. Anything else unknown
-        // still throws below — real content must be surfaced, not dropped.
-        return;
       } else {
-        const blockValues = Object.fromEntries(
-          Object.entries(block).filter(([key]) => key !== 'type')
-        );
-        throw new Error(
-          `Unsupported content block type: ${block.type} with content of ${JSON.stringify(blockValues, null, 2)}`
-        );
+        const cachePoint = getDefaultCachePoint(block);
+        if (cachePoint != null) {
+          contentBlocks.push({
+            cachePoint,
+          } as BedrockContentBlock);
+        } else if (FOREIGN_REASONING_TYPES.some((t) => t === block.type)) {
+          // Reasoning from another provider (Anthropic `thinking`/
+          // `redacted_thinking`, Google `reasoning`, LibreChat `think`).
+          // Bedrock's native reasoning is `reasoning_content` (handled above); a
+          // foreign block carries a signature Bedrock cannot validate, so drop
+          // it on a cross-provider handoff (e.g. Anthropic → Bedrock) rather
+          // than crash. The Bedrock model produces its own reasoning. Anything
+          // else unknown still throws below — real content must be surfaced.
+          return;
+        } else {
+          const blockValues = Object.fromEntries(
+            Object.entries(block).filter(([key]) => key !== 'type')
+          );
+          throw new Error(
+            `Unsupported content block type: ${block.type} with content of ${JSON.stringify(blockValues, null, 2)}`
+          );
+        }
       }
     });
 
@@ -864,9 +880,10 @@ function convertToolMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
   const toolResultContent: BedrockContentBlock[] = [];
   const trailingCachePoints: BedrockContentBlock[] = [];
   for (const block of content) {
-    if (isDefaultCachePoint(block)) {
+    const cachePoint = getDefaultCachePoint(block);
+    if (cachePoint != null) {
       trailingCachePoints.push({
-        cachePoint: { type: 'default' },
+        cachePoint,
       } as BedrockContentBlock);
     } else {
       toolResultContent.push(block);

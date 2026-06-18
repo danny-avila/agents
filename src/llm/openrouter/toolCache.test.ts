@@ -9,7 +9,7 @@ type OpenRouterTool = {
     description?: string;
     parameters?: object;
   };
-  cache_control?: { type: 'ephemeral' };
+  cache_control?: { type: 'ephemeral'; ttl?: '1h' };
   defer_loading?: boolean;
 };
 
@@ -78,6 +78,57 @@ describe('partitionAndMarkOpenRouterToolCache', () => {
       'dynamic_tool',
     ]);
     expect(result[0].cache_control).toEqual({ type: 'ephemeral' });
+    expect(result[1]).not.toHaveProperty('cache_control');
+  });
+
+  it('stamps the resolved 1h ttl on the last static tool', () => {
+    const result = partitionAndMarkOpenRouterToolCache(
+      [
+        createOpenAITool('static_one'),
+        createOpenAITool('static_two'),
+      ] as GraphTools,
+      () => false,
+      '1h'
+    ) as OpenRouterTool[];
+
+    expect(result[1].cache_control).toEqual({ type: 'ephemeral', ttl: '1h' });
+    expect(result[0]).not.toHaveProperty('cache_control');
+  });
+
+  it('omits ttl for the 5m legacy default', () => {
+    const result = partitionAndMarkOpenRouterToolCache(
+      [createOpenAITool('only_static')] as GraphTools,
+      () => false,
+      '5m'
+    ) as OpenRouterTool[];
+
+    expect(result[0].cache_control).toEqual({ type: 'ephemeral' });
+  });
+
+  it('strips a stale marker off an earlier static tool', () => {
+    const earlier = createOpenAITool('static_one');
+    earlier.cache_control = { type: 'ephemeral' };
+    const result = partitionAndMarkOpenRouterToolCache(
+      [earlier, createOpenAITool('static_two')] as GraphTools,
+      () => false,
+      '1h'
+    ) as OpenRouterTool[];
+
+    // No stale 5m marker survives ahead of the resolved 1h breakpoint.
+    expect(result[0]).not.toHaveProperty('cache_control');
+    expect(result[1].cache_control).toEqual({ type: 'ephemeral', ttl: '1h' });
+  });
+
+  it('strips a stale marker off a deferred tool', () => {
+    const deferred = createOpenAITool('deferred_one');
+    deferred.cache_control = { type: 'ephemeral' };
+    const result = partitionAndMarkOpenRouterToolCache(
+      [createOpenAITool('static_one'), deferred] as GraphTools,
+      (name) => name === 'deferred_one',
+      '1h'
+    ) as OpenRouterTool[];
+
+    expect(result[0].cache_control).toEqual({ type: 'ephemeral', ttl: '1h' });
     expect(result[1]).not.toHaveProperty('cache_control');
   });
 });

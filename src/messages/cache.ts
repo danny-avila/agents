@@ -21,6 +21,65 @@ type MessageContentWithCacheControl = MessageContentComplex & {
 };
 
 /**
+ * Prompt-cache breakpoint TTL.
+ *
+ * Both Anthropic (`cache_control.ttl`) and Bedrock (`cachePoint.ttl`) accept
+ * `'5m'` (the legacy provider default) and `'1h'` (the extended cache). When
+ * prompt caching is enabled the SDK now defaults to the 1-hour extended cache
+ * (see {@link DEFAULT_PROMPT_CACHE_TTL}); pass `'5m'` to opt back into the
+ * legacy 5-minute behavior.
+ */
+export type PromptCacheTtl = '5m' | '1h';
+
+/**
+ * Default TTL applied wherever a prompt-cache breakpoint is added. The 1-hour
+ * extended cache keeps prefixes warm across longer gaps between turns, at the
+ * cost of a higher one-time cache-write multiplier (2x vs 1.25x for 5m).
+ */
+export const DEFAULT_PROMPT_CACHE_TTL: PromptCacheTtl = '1h';
+
+/**
+ * Resolve an optionally-configured TTL to a concrete value, defaulting to the
+ * 1-hour extended cache. Used at the Anthropic/Bedrock prompt-cache call sites.
+ */
+export function resolvePromptCacheTtl(
+  ttl: PromptCacheTtl | undefined
+): PromptCacheTtl {
+  return ttl ?? DEFAULT_PROMPT_CACHE_TTL;
+}
+
+/** Anthropic `cache_control` shape (the SDK accepts an optional `ttl`). */
+type AnthropicCacheControl = { type: 'ephemeral'; ttl?: '1h' };
+
+/**
+ * Build an Anthropic `cache_control` breakpoint for the given TTL. `'5m'` (or
+ * `undefined`) omits the `ttl` field — that is the provider default, so the
+ * payload stays byte-identical to the legacy 5-minute marker. `'1h'` adds the
+ * explicit extended-cache `ttl`.
+ */
+export function buildAnthropicCacheControl(
+  ttl?: PromptCacheTtl
+): AnthropicCacheControl {
+  return ttl === '1h'
+    ? { type: 'ephemeral', ttl: '1h' }
+    : { type: 'ephemeral' };
+}
+
+/** Bedrock `cachePoint` shape (the SDK accepts an optional `ttl`). */
+type BedrockCachePoint = { type: 'default'; ttl?: '1h' };
+
+/**
+ * Build a Bedrock `cachePoint` for the given TTL. Mirrors
+ * {@link buildAnthropicCacheControl}: `'5m'`/`undefined` omits `ttl` (the
+ * legacy default), `'1h'` adds the extended-cache `ttl`.
+ */
+export function buildBedrockCachePoint(
+  ttl?: PromptCacheTtl
+): BedrockCachePoint {
+  return ttl === '1h' ? { type: 'default', ttl: '1h' } : { type: 'default' };
+}
+
+/**
  * Deep clones a message's content to prevent mutation of the original.
  */
 function deepCloneContent<T extends string | MessageContentComplex[]>(
@@ -119,38 +178,53 @@ export function cloneMessage<T extends MessageWithContent>(
   return cloned;
 }
 
-function stripAnthropicCacheControlFromBlocks(
-  content: MessageContentComplex[]
-): { content: MessageContentComplex[]; modified: boolean } {
-  let modified = false;
-  const strippedContent = content.map((block) => {
-    if (!('cache_control' in block)) {
-      return block;
-    }
-
-    const cloned: MessageContentWithCacheControl = { ...block };
-    delete cloned.cache_control;
-    modified = true;
-    return cloned;
-  });
-
-  return { content: strippedContent, modified };
-}
-
+/**
+ * Sanitize a Bedrock system message: strip Anthropic `cache_control` (Bedrock
+ * conversion can't use it) and normalize any existing `cachePoint` to the
+ * resolved TTL. The normalization matters because Bedrock requires longer-TTL
+ * checkpoints to appear before shorter ones — a stale 5-minute system cachePoint
+ * (host-supplied or carried over from a 5m config) left ahead of a 1-hour
+ * message tail would make the request invalid. System messages are never
+ * anchored as the tail breakpoint; this only fixes markers already present.
+ */
 function sanitizeBedrockSystemMessage<T extends MessageWithContent>(
-  message: T
+  message: T,
+  ttl?: PromptCacheTtl
 ): T {
   const content = message.content;
   if (!Array.isArray(content)) {
     return message;
   }
 
-  const stripped = stripAnthropicCacheControlFromBlocks(content);
-  if (!stripped.modified) {
+  const sanitized: MessageContentComplex[] = [];
+  let modified = false;
+  for (const block of content) {
+    if (isCachePoint(block)) {
+      const existing = (block as { cachePoint?: { ttl?: unknown } }).cachePoint;
+      const desired = buildBedrockCachePoint(ttl);
+      if (existing?.ttl !== desired.ttl) {
+        modified = true;
+        sanitized.push({ cachePoint: desired } as MessageContentComplex);
+      } else {
+        sanitized.push(block);
+      }
+      continue;
+    }
+    if ('cache_control' in block) {
+      const cloned: MessageContentWithCacheControl = { ...block };
+      delete cloned.cache_control;
+      modified = true;
+      sanitized.push(cloned);
+      continue;
+    }
+    sanitized.push(block);
+  }
+
+  if (!modified) {
     return message;
   }
 
-  return cloneMessage(message, stripped.content);
+  return cloneMessage(message, sanitized);
 }
 
 /**
@@ -163,7 +237,8 @@ function sanitizeBedrockSystemMessage<T extends MessageWithContent>(
  * @returns - A new array of message objects with cache control added.
  */
 export function addCacheControl<T extends AnthropicMessage | BaseMessage>(
-  messages: T[]
+  messages: T[],
+  ttl?: PromptCacheTtl
 ): T[] {
   if (!Array.isArray(messages) || messages.length < 2) {
     return messages;
@@ -224,14 +299,16 @@ export function addCacheControl<T extends AnthropicMessage | BaseMessage>(
       if (needsCacheAdd && lastTextIndex >= 0) {
         (
           workingContent[lastTextIndex] as Anthropic.TextBlockParam
-        ).cache_control = {
-          type: 'ephemeral',
-        };
+        ).cache_control = buildAnthropicCacheControl(ttl);
         userMessagesModified++;
       }
     } else if (typeof content === 'string' && needsCacheAdd) {
       workingContent = [
-        { type: 'text', text: content, cache_control: { type: 'ephemeral' } },
+        {
+          type: 'text',
+          text: content,
+          cache_control: buildAnthropicCacheControl(ttl),
+        },
       ] as unknown as MessageContentComplex[];
       userMessagesModified++;
     } else {
@@ -318,7 +395,8 @@ function isTailCacheableBlock(block: MessageContentComplex): boolean {
  * Returns a new array; only messages that require modification are cloned.
  */
 export function addTailCacheControl<T extends AnthropicMessage | BaseMessage>(
-  messages: T[]
+  messages: T[],
+  ttl?: PromptCacheTtl
 ): T[] {
   if (!Array.isArray(messages) || messages.length === 0) {
     return messages;
@@ -368,9 +446,7 @@ export function addTailCacheControl<T extends AnthropicMessage | BaseMessage>(
 
       if (canPlaceMarker && tailIndex >= 0) {
         (workingContent[tailIndex] as Anthropic.TextBlockParam).cache_control =
-          {
-            type: 'ephemeral',
-          };
+          buildAnthropicCacheControl(ttl);
         markerPlaced = true;
         modified = true;
       }
@@ -384,7 +460,11 @@ export function addTailCacheControl<T extends AnthropicMessage | BaseMessage>(
       content.trim() !== ''
     ) {
       workingContent = [
-        { type: 'text', text: content, cache_control: { type: 'ephemeral' } },
+        {
+          type: 'text',
+          text: content,
+          cache_control: buildAnthropicCacheControl(ttl),
+        },
       ] as unknown as MessageContentComplex[];
       markerPlaced = true;
     } else {
@@ -454,7 +534,8 @@ function addCacheControlToRecentMessages<
 >(
   messages: T[],
   maxCachePoints: number,
-  canUseMessage: (message: MessageWithContent) => boolean
+  canUseMessage: (message: MessageWithContent) => boolean,
+  ttl?: PromptCacheTtl
 ): T[] {
   if (
     !Array.isArray(messages) ||
@@ -513,9 +594,7 @@ function addCacheControlToRecentMessages<
       if (canAddCache && lastNonEmptyTextIndex >= 0) {
         (
           workingContent[lastNonEmptyTextIndex] as Anthropic.TextBlockParam
-        ).cache_control = {
-          type: 'ephemeral',
-        };
+        ).cache_control = buildAnthropicCacheControl(ttl);
         cachePointsAdded++;
         modified = true;
       }
@@ -529,7 +608,11 @@ function addCacheControlToRecentMessages<
       canAddCache
     ) {
       workingContent = [
-        { type: 'text', text: content, cache_control: { type: 'ephemeral' } },
+        {
+          type: 'text',
+          text: content,
+          cache_control: buildAnthropicCacheControl(ttl),
+        },
       ] as unknown as MessageContentComplex[];
       cachePointsAdded++;
     } else {
@@ -547,11 +630,12 @@ function addCacheControlToRecentMessages<
 
 export function addCacheControlToStablePrefixMessages<
   T extends AnthropicMessage | BaseMessage,
->(messages: T[], maxCachePoints: number): T[] {
+>(messages: T[], maxCachePoints: number, ttl?: PromptCacheTtl): T[] {
   const assistantMarked = addCacheControlToRecentMessages(
     messages,
     maxCachePoints,
-    isAssistantConversationMessage
+    isAssistantConversationMessage,
+    ttl
   );
 
   if (assistantMarked.some(hasCacheMarker)) {
@@ -561,7 +645,8 @@ export function addCacheControlToStablePrefixMessages<
   return addCacheControlToRecentMessages(
     messages,
     maxCachePoints,
-    isCacheableConversationMessage
+    isCacheableConversationMessage,
+    ttl
   );
 }
 
@@ -664,7 +749,7 @@ export function stripBedrockCacheControl<T extends MessageWithContent>(
  */
 export function addBedrockCacheControl<
   T extends MessageWithContent & { getType?: () => string; role?: string },
->(messages: T[]): T[] {
+>(messages: T[], ttl?: PromptCacheTtl): T[] {
   if (!Array.isArray(messages) || messages.length === 0) {
     return messages;
   }
@@ -687,7 +772,7 @@ export function addBedrockCacheControl<
     const isSystemMessage =
       messageType === 'system' || messageRole === 'system';
     if (isSystemMessage) {
-      updatedMessages[i] = sanitizeBedrockSystemMessage(originalMessage);
+      updatedMessages[i] = sanitizeBedrockSystemMessage(originalMessage, ttl);
       continue;
     }
 
@@ -750,14 +835,14 @@ export function addBedrockCacheControl<
       // Skip if no cacheable text content exists (whitespace-only messages).
       if (needsCacheAdd && lastNonEmptyTextIndex >= 0) {
         workingContent.splice(lastNonEmptyTextIndex + 1, 0, {
-          cachePoint: { type: 'default' },
+          cachePoint: buildBedrockCachePoint(ttl),
         } as MessageContentComplex);
         cachePointsAdded++;
       }
     } else if (typeof content === 'string' && needsCacheAdd) {
       workingContent = [
         { type: ContentTypes.TEXT, text: content },
-        { cachePoint: { type: 'default' } } as MessageContentComplex,
+        { cachePoint: buildBedrockCachePoint(ttl) } as MessageContentComplex,
       ];
       cachePointsAdded++;
     } else if (typeof content === 'string' && hasSerializationProps) {
@@ -791,7 +876,7 @@ export function addBedrockCacheControl<
  */
 export function addBedrockTailCacheControl<
   T extends MessageWithContent & { getType?: () => string; role?: string },
->(messages: T[]): T[] {
+>(messages: T[], ttl?: PromptCacheTtl): T[] {
   if (!Array.isArray(messages) || messages.length === 0) {
     return messages;
   }
@@ -814,7 +899,7 @@ export function addBedrockTailCacheControl<
     const isSystemMessage =
       messageType === 'system' || messageRole === 'system';
     if (isSystemMessage) {
-      updatedMessages[i] = sanitizeBedrockSystemMessage(originalMessage);
+      updatedMessages[i] = sanitizeBedrockSystemMessage(originalMessage, ttl);
       continue;
     }
 
@@ -869,7 +954,7 @@ export function addBedrockTailCacheControl<
 
       if (canPlaceCachePoint && lastNonEmptyTextIndex >= 0) {
         workingContent.splice(lastNonEmptyTextIndex + 1, 0, {
-          cachePoint: { type: 'default' },
+          cachePoint: buildBedrockCachePoint(ttl),
         } as MessageContentComplex);
         cachePointPlaced = true;
         modified = true;
@@ -877,7 +962,7 @@ export function addBedrockTailCacheControl<
     } else if (typeof content === 'string' && canPlaceCachePoint) {
       workingContent = [
         { type: ContentTypes.TEXT, text: content },
-        { cachePoint: { type: 'default' } } as MessageContentComplex,
+        { cachePoint: buildBedrockCachePoint(ttl) } as MessageContentComplex,
       ];
       cachePointPlaced = true;
     } else if (typeof content === 'string' && hasSerializationProps) {

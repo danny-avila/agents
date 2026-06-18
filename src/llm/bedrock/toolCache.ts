@@ -3,11 +3,8 @@ import type { Tool, ToolConfiguration } from '@aws-sdk/client-bedrock-runtime';
 import type { OpenAIClient } from '@langchain/openai';
 import type { DocumentType } from '@smithy/types';
 import type { GraphTools } from '@/types';
+import { buildBedrockCachePoint, type PromptCacheTtl } from '@/messages/cache';
 import { _convertToOpenAITool } from '@/llm/openai';
-
-const CACHE_POINT: Tool.CachePointMember = {
-  cachePoint: { type: 'default' },
-};
 
 const BEDROCK_TOOL_CACHE_MARKER = '__lc_bedrock_cache_point_after';
 const BEDROCK_TOOL_CACHE_DISABLED_MARKER = '__lc_bedrock_skip_tool_cache';
@@ -148,12 +145,17 @@ export function partitionAndMarkBedrockToolCache(
 
 export function insertBedrockToolCachePoint(
   toolConfig: ToolConfiguration | undefined,
-  fallbackToEnd: boolean
+  fallbackToEnd: boolean,
+  ttl?: PromptCacheTtl
 ): ToolConfiguration | undefined {
   const tools = toolConfig?.tools as BedrockToolWithCacheMarker[] | undefined;
   if (tools == null || tools.length === 0) {
     return toolConfig;
   }
+
+  const cachePoint: Tool.CachePointMember = {
+    cachePoint: buildBedrockCachePoint(ttl),
+  };
 
   let markerIndex = -1;
   let hasCachePoint = false;
@@ -163,8 +165,11 @@ export function insertBedrockToolCachePoint(
   for (let i = 0; i < tools.length; i++) {
     const tool = tools[i];
     if (isBedrockCachePoint(tool)) {
+      // Normalize an existing cache point to the resolved TTL so a stale
+      // 5-minute tool breakpoint never precedes the new 1-hour system/message
+      // breakpoints (Bedrock requires longer-TTL entries to appear first).
       hasCachePoint = true;
-      cleanedTools.push(tool);
+      cleanedTools.push(cachePoint);
       continue;
     }
     if (tool[BEDROCK_TOOL_CACHE_MARKER] === true) {
@@ -189,7 +194,7 @@ export function insertBedrockToolCachePoint(
     ...toolConfig,
     tools: [
       ...cleanedTools.slice(0, insertionIndex + 1),
-      CACHE_POINT,
+      cachePoint,
       ...cleanedTools.slice(insertionIndex + 1),
     ],
   };

@@ -140,6 +140,174 @@ describe('partitionAndMarkAnthropicToolCache', () => {
     // is returned unchanged (same reference) so we don't churn the array.
     expect(partitionAndMarkAnthropicToolCache(input, () => false)).toBe(input);
   });
+
+  it('stamps the resolved 1h ttl on the last static tool', () => {
+    const out = partitionAndMarkAnthropicToolCache(
+      [fakeTool('a-static'), fakeTool('b-static')] as never,
+      () => false,
+      '1h'
+    ) as Array<{
+      extras?: { cache_control?: { type: string; ttl?: string } };
+    }>;
+    expect(out[1].extras?.cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    });
+    expect(out[0].extras?.cache_control).toBeUndefined();
+  });
+
+  it('re-stamps a pre-marked 5m tool to 1h so it does not precede a 1h breakpoint', () => {
+    const a = fakeTool('a-static') as {
+      extras?: { cache_control?: { type: string; ttl?: string } };
+    };
+    a.extras = { cache_control: { type: 'ephemeral' } };
+    const out = partitionAndMarkAnthropicToolCache(
+      [a] as never,
+      () => false,
+      '1h'
+    ) as Array<{
+      extras?: { cache_control?: { type: string; ttl?: string } };
+    }>;
+    expect(out[0].extras?.cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    });
+  });
+
+  it('strips a pre-marked earlier static tool so only the tail carries the 1h marker', () => {
+    const a = fakeTool('a-static') as {
+      extras?: { cache_control?: { type: string; ttl?: string } };
+    };
+    a.extras = { cache_control: { type: 'ephemeral' } };
+    const b = fakeTool('b-static');
+    const out = partitionAndMarkAnthropicToolCache(
+      [a, b] as never,
+      () => false,
+      '1h'
+    ) as Array<{
+      extras?: { cache_control?: { type: string; ttl?: string } };
+    }>;
+    // Earlier tool's stray 5m marker is removed so it can't precede the tail.
+    expect(out[0].extras?.cache_control).toBeUndefined();
+    expect(out[1].extras?.cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    });
+  });
+
+  it('strips stale markers off deferred tools so they do not precede the system/message breakpoint', () => {
+    const staticTool = fakeTool('a-static');
+    const deferred = fakeTool('b-deferred') as {
+      extras?: { cache_control?: { type: string } };
+    };
+    deferred.extras = { cache_control: { type: 'ephemeral' } };
+    const out = partitionAndMarkAnthropicToolCache(
+      [staticTool, deferred] as never,
+      (name) => name === 'b-deferred',
+      '1h'
+    ) as Array<{
+      extras?: { cache_control?: { type: string; ttl?: string } };
+    }>;
+    expect(out[0].extras?.cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    });
+    expect(out[1].extras?.cache_control).toBeUndefined();
+  });
+
+  it('strips stale markers in the all-deferred case', () => {
+    const deferred = fakeTool('only-deferred') as {
+      extras?: { cache_control?: { type: string } };
+    };
+    deferred.extras = { cache_control: { type: 'ephemeral' } };
+    const out = partitionAndMarkAnthropicToolCache(
+      [deferred] as never,
+      () => true,
+      '1h'
+    ) as Array<{ extras?: { cache_control?: unknown } }>;
+    expect(out[0].extras?.cache_control).toBeUndefined();
+  });
+
+  it('strips a direct cache_control on an earlier native (non-built-in) tool', () => {
+    const nativeWithMarker = {
+      name: 'native_a',
+      input_schema: { type: 'object', properties: {} },
+      cache_control: { type: 'ephemeral' },
+    };
+    const out = partitionAndMarkAnthropicToolCache(
+      [nativeWithMarker, fakeTool('native_b')] as never,
+      () => false,
+      '1h'
+    ) as Array<{
+      cache_control?: unknown;
+      extras?: { cache_control?: { type: string; ttl?: string } };
+    }>;
+    expect(out[0].cache_control).toBeUndefined();
+    expect(out[1].extras?.cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    });
+  });
+
+  it('upgrades a raw Anthropic tail tool to a direct 1h marker (not extras)', () => {
+    const nativeTail = {
+      name: 'native_tail',
+      input_schema: { type: 'object', properties: {} },
+      cache_control: { type: 'ephemeral' },
+    };
+    const out = partitionAndMarkAnthropicToolCache(
+      [nativeTail] as never,
+      () => false,
+      '1h'
+    ) as Array<{
+      cache_control?: { type: string; ttl?: string };
+      extras?: { cache_control?: unknown };
+    }>;
+    // Raw Anthropic tools carry cache_control directly (extras is not promoted
+    // for them), so the stale marker is upgraded in place to 1h — not moved.
+    expect(out[0].cache_control).toEqual({ type: 'ephemeral', ttl: '1h' });
+    expect(out[0].extras?.cache_control).toBeUndefined();
+  });
+
+  it('reorders deferred tools after a correctly pre-marked static tool', () => {
+    const deferred = fakeTool('z-deferred');
+    const staticTool = fakeTool('a-static') as {
+      extras?: { cache_control?: { type: string; ttl?: string } };
+    };
+    // Already carries the resolved 1h marker, so nothing is mutated...
+    staticTool.extras = { cache_control: { type: 'ephemeral', ttl: '1h' } };
+    const out = partitionAndMarkAnthropicToolCache(
+      [deferred, staticTool] as never, // deferred precedes static in the input
+      (name) => name === 'z-deferred',
+      '1h'
+    ) as Array<{ name?: string }>;
+    // ...but the static (cached) tool must still be hoisted ahead of the
+    // deferred tool so the breakpoint precedes discovered tools.
+    expect(out.map((t) => t.name)).toEqual(['a-static', 'z-deferred']);
+  });
+
+  it('re-stamps a LangChain tool whose marker sits only on the direct block', () => {
+    // A StructuredTool (custom) pre-marked directly — not under extras — does
+    // not reach the payload, so the breakpoint must be re-stamped under extras.
+    const t = fakeTool('a-static') as {
+      cache_control?: unknown;
+      extras?: { cache_control?: { type: string; ttl?: string } };
+    };
+    t.cache_control = { type: 'ephemeral', ttl: '1h' };
+    const out = partitionAndMarkAnthropicToolCache(
+      [t] as never,
+      () => false,
+      '1h'
+    ) as Array<{
+      cache_control?: unknown;
+      extras?: { cache_control?: { type: string; ttl?: string } };
+    }>;
+    expect(out[0].extras?.cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    });
+    expect(out[0].cache_control).toBeUndefined();
+  });
 });
 
 describe('makeIsDeferred', () => {
