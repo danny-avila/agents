@@ -293,6 +293,38 @@ describe('Cloudflare sandbox execution backend', () => {
     }
   });
 
+  it('aborts signal-aware execs when the client timeout fires', async () => {
+    // For signal-aware transports (e.g. the HTTP bridge), a client timeout should
+    // actually cancel the underlying exec, not just abandon it.
+    jest.useFakeTimers();
+    try {
+      let mainSignal: AbortSignal | undefined;
+      const sandbox = createRuntime({
+        supportsExecSignal: true,
+        exec: (command, options) => {
+          if (command.startsWith('rm -rf')) {
+            return Promise.resolve({ exitCode: 0, stdout: '', stderr: '' });
+          }
+          mainSignal = options?.signal;
+          return new Promise<t.CloudflareSandboxExecResult>(() => undefined);
+        },
+      });
+
+      const promise = executeCloudflareCode(
+        { lang: 'py', code: 'print("slow")' },
+        { sandbox, workspaceRoot: '/workspace', timeoutMs: 1000 }
+      );
+      const assertion = expect(promise).rejects.toThrow(/client-side timeout/);
+      await jest.advanceTimersByTimeAsync(11500);
+      await assertion;
+
+      expect(mainSignal).toBeDefined();
+      expect(mainSignal?.aborted).toBe(true);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   it('passes call-specific timeouts to the Cloudflare spawn wrapper', async () => {
     let execCommand = '';
     let execTimeout: number | undefined;

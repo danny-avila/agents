@@ -20,11 +20,11 @@ import {
 import { Constants } from '@/common';
 import {
   clientExecTimeoutMs,
+  execWithClientTimeout,
   executeCloudflareCode,
   getCloudflareWorkspaceRoot,
   resolveCloudflareSandbox,
   validateCloudflareBashCommand,
-  withClientTimeout,
 } from './CloudflareSandboxExecutionEngine';
 
 type ProgrammaticParams = {
@@ -168,15 +168,14 @@ async function executeGeneratedCloudflareBash(
   const workspaceRoot = getCloudflareWorkspaceRoot(config);
   const shell = config.shell ?? 'bash';
   const timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT;
-  const result = await withClientTimeout(
-    sandbox.exec(
-      withInSandboxTimeout(`${shell} -lc ${quoteShell(command)}`, timeoutMs),
-      {
-        cwd: workspaceRoot,
-        env: config.env,
-        timeout: outerTimeoutMs(timeoutMs),
-      }
-    ),
+  const result = await execWithClientTimeout(
+    sandbox,
+    withInSandboxTimeout(`${shell} -lc ${quoteShell(command)}`, timeoutMs),
+    {
+      cwd: workspaceRoot,
+      env: config.env,
+      timeout: outerTimeoutMs(timeoutMs),
+    },
     clientExecTimeoutMs(timeoutMs),
     'cloudflare bash programmatic exec'
   );

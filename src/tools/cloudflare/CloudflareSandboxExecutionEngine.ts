@@ -160,7 +160,18 @@ export function clientExecTimeoutMs(timeoutMs: number): number {
 export async function withClientTimeout<T>(
   exec: Promise<T>,
   timeoutMs: number,
-  label: string
+  label: string,
+  options: {
+    /**
+     * Detach the backstop timer from the event loop. Use ONLY when something else
+     * already settles the caller (e.g. the spawn path, where spawnLocalProcess's
+     * own timer resolves the child). The awaited direct-exec paths must leave it
+     * REF'd so the timeout is guaranteed to fire even if nothing else is pending.
+     */
+    unref?: boolean;
+    /** Invoked when the client timeout fires — e.g. abort a signal-aware exec. */
+    onTimeout?: () => void;
+  } = {}
 ): Promise<T> {
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     return exec;
@@ -173,16 +184,16 @@ export async function withClientTimeout<T>(
       exec,
       new Promise<never>((_resolve, reject) => {
         timer = setTimeout(() => {
+          options.onTimeout?.();
           reject(
             new Error(
               `${label} exceeded ${timeoutMs}ms client-side timeout (sandbox exec did not return)`
             )
           );
         }, timeoutMs);
-        // Don't let the backstop keep the host process / event loop alive if the
-        // race already settled elsewhere (e.g. spawnLocalProcess killed the child
-        // while the underlying exec promise is still pending).
-        (timer as { unref?: () => void } | undefined)?.unref?.();
+        if (options.unref === true) {
+          (timer as { unref?: () => void } | undefined)?.unref?.();
+        }
       }),
     ]);
   } finally {
@@ -190,6 +201,35 @@ export async function withClientTimeout<T>(
       clearTimeout(timer);
     }
   }
+}
+
+/**
+ * Run `sandbox.exec()` bounded by a client-side timeout, and — for signal-aware
+ * transports (e.g. the HTTP bridge, `supportsExecSignal === true`) — abort the
+ * underlying exec when the timeout fires instead of merely abandoning it. The
+ * native DO transport ignores `signal`, so it only gets the timeout. Leaves the
+ * backstop timer ref'd (this is an awaited direct-exec path).
+ */
+export async function execWithClientTimeout(
+  sandbox: t.CloudflareSandboxRuntime,
+  command: string,
+  options: t.CloudflareSandboxExecOptions,
+  timeoutMs: number,
+  label: string
+): Promise<t.CloudflareSandboxExecResult> {
+  const controller = new AbortController();
+  const execOptions: t.CloudflareSandboxExecOptions = { ...options };
+  if (sandbox.supportsExecSignal === true) {
+    execOptions.signal = controller.signal;
+  }
+  return withClientTimeout(
+    sandbox.exec(command, execOptions),
+    timeoutMs,
+    label,
+    {
+      onTimeout: () => controller.abort(),
+    }
+  );
 }
 
 function truncateOutput(value: string, maxChars: number): string {
@@ -530,7 +570,10 @@ function createCloudflareSpawn(
         const result = await withClientTimeout(
           ctx.sandbox.exec(timedCommand, execOptions),
           clientExecTimeoutMs(timeoutMs),
-          'cloudflare sandbox exec'
+          'cloudflare sandbox exec',
+          // spawnLocalProcess's own timer already resolves the child, so this
+          // backstop may safely detach; abort the (signal-aware) exec on timeout.
+          { unref: true, onTimeout: () => abortController.abort() }
         );
         if (isClosed()) {
           return;
@@ -616,12 +659,14 @@ export async function executeCloudflareBash(
     args.length > 0
       ? `${ctx.shell} -lc ${quote(command)} -- ${args.map(quote).join(' ')}`
       : `${ctx.shell} -lc ${quote(command)}`;
-  const result = await withClientTimeout(
-    ctx.sandbox.exec(withInSandboxTimeout(shellCommand, ctx.timeoutMs), {
+  const result = await execWithClientTimeout(
+    ctx.sandbox,
+    withInSandboxTimeout(shellCommand, ctx.timeoutMs),
+    {
       cwd: ctx.workspaceRoot,
       env: ctx.env,
       timeout: outerTimeoutMs(ctx.timeoutMs),
-    }),
+    },
     clientExecTimeoutMs(ctx.timeoutMs),
     'cloudflare sandbox bash exec'
   );
@@ -769,16 +814,20 @@ export async function executeCloudflareCode(
       }
     );
   }
+  let execSucceeded = false;
   try {
-    const result = await withClientTimeout(
-      ctx.sandbox.exec(withInSandboxTimeout(runtime.command, ctx.timeoutMs), {
+    const result = await execWithClientTimeout(
+      ctx.sandbox,
+      withInSandboxTimeout(runtime.command, ctx.timeoutMs),
+      {
         cwd: ctx.workspaceRoot,
         env: ctx.env,
         timeout: outerTimeoutMs(ctx.timeoutMs),
-      }),
+      },
       clientExecTimeoutMs(ctx.timeoutMs),
       'cloudflare sandbox code-exec'
     );
+    execSucceeded = true;
     return {
       stdout: truncateOutput(result.stdout, ctx.maxOutputChars),
       stderr: truncateOutput(result.stderr, ctx.maxOutputChars),
@@ -786,19 +835,23 @@ export async function executeCloudflareCode(
       timedOut: isInSandboxTimeoutExit(result.exitCode),
     };
   } finally {
-    // Fire-and-forget: don't make the caller wait on cleanup. If the sandbox is
-    // stalled, the primary exec already client-timed-out, and awaiting cleanup
-    // would add another client timeout to the caller's latency. The unref'd
-    // backstop bounds the detached cleanup without keeping the process alive.
-    void withClientTimeout(
+    // After a normal run, AWAIT cleanup so the temp dir is gone before returning.
+    // After a stalled/failed run, detach it (unref'd) so we don't pile a second
+    // client timeout onto the caller's latency; cleanup still runs best-effort.
+    const detach = !execSucceeded;
+    const cleanup = withClientTimeout(
       ctx.sandbox.exec(`rm -rf ${quote(tempDir)}`, {
         cwd: ctx.workspaceRoot,
         env: ctx.env,
         timeout: 10000,
       }),
       clientExecTimeoutMs(10000),
-      'cloudflare sandbox cleanup'
+      'cloudflare sandbox cleanup',
+      { unref: detach }
     ).catch(() => undefined);
+    if (!detach) {
+      await cleanup;
+    }
   }
 }
 
