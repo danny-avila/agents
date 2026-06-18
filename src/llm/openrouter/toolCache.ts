@@ -59,6 +59,22 @@ function markCacheControl(
   };
 }
 
+/**
+ * Drop any existing `cache_control` from a tool. Reused/caller-supplied tools
+ * can carry a stale marker (e.g. from a prior `promptCacheTtl: '5m'` run); since
+ * all tools serialize before system/messages, a leftover 5-minute marker ahead
+ * of the resolved breakpoint would violate the longer-TTL-first ordering.
+ */
+function stripCacheControl(
+  tool: OpenRouterToolWithCacheControl
+): OpenRouterToolWithCacheControl {
+  if (tool.cache_control == null) {
+    return tool;
+  }
+  const { cache_control: _omit, ...rest } = tool;
+  return rest;
+}
+
 export function partitionAndMarkOpenRouterToolCache(
   tools: GraphTools | undefined,
   isDeferred: (toolName: string) => boolean,
@@ -83,10 +99,21 @@ export function partitionAndMarkOpenRouterToolCache(
     staticTools.push(converted);
   }
 
+  // Deferred tools sit after the breakpoint but still before system/messages,
+  // so strip any stale marker off them.
+  for (let i = 0; i < deferredTools.length; i++) {
+    deferredTools[i] = stripCacheControl(deferredTools[i]);
+  }
+
   if (staticTools.length === 0) {
     return [...deferredTools] as GraphTools;
   }
 
+  // Strip stale markers off the earlier static tools, then stamp only the last
+  // static tool with the resolved TTL (markCacheControl overwrites any marker).
+  for (let i = 0; i < staticTools.length - 1; i++) {
+    staticTools[i] = stripCacheControl(staticTools[i]);
+  }
   staticTools[staticTools.length - 1] = markCacheControl(
     staticTools[staticTools.length - 1],
     ttl

@@ -557,7 +557,8 @@ async function executeSummarizationWithFallback(params: {
       reasoningKey: agentContext.reasoningKey,
       usePromptCache,
       promptCacheTtl:
-        (clientConfig.provider as Providers) === Providers.ANTHROPIC
+        (clientConfig.provider as Providers) === Providers.ANTHROPIC ||
+        (clientConfig.provider as Providers) === Providers.OPENROUTER
           ? resolvePromptCacheTtl(
             (
                 clientConfig.clientOptions as {
