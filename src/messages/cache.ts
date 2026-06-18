@@ -48,6 +48,48 @@ export function resolvePromptCacheTtl(
   return ttl ?? DEFAULT_PROMPT_CACHE_TTL;
 }
 
+/**
+ * Bedrock model IDs (matched as a substring of the full model/ARN) that accept
+ * the 1-hour extended cache `ttl`. Per AWS, every other Bedrock model — including
+ * Sonnet/Opus 4.6 and all 3.x/4.0/4.1 — supports only the 5-minute default, and
+ * sending `ttl: '1h'` to them is unsupported. Keep this conservative: a model is
+ * opted into 1h only when explicitly listed here.
+ * @see https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html
+ */
+const BEDROCK_EXTENDED_TTL_MODELS = [
+  'claude-opus-4-5',
+  'claude-sonnet-4-5',
+  'claude-haiku-4-5',
+] as const;
+
+function bedrockModelSupportsExtendedTtl(model: string | undefined): boolean {
+  if (model == null || model === '') {
+    return false;
+  }
+  return BEDROCK_EXTENDED_TTL_MODELS.some((id) => model.includes(id));
+}
+
+/**
+ * Resolve the Bedrock prompt-cache checkpoint TTL.
+ *
+ * An explicit `promptCacheTtl` is always honored (the caller's stated intent).
+ * When omitted, the 1-hour extended cache is the default ONLY on Bedrock models
+ * that support it ({@link BEDROCK_EXTENDED_TTL_MODELS}); every other model falls
+ * back to the legacy 5-minute default so existing `promptCache` configurations
+ * on older Bedrock Claude models are never rejected for an unsupported `ttl`.
+ */
+export function resolveBedrockPromptCacheTtl(
+  ttl: PromptCacheTtl | undefined,
+  model: string | undefined
+): PromptCacheTtl {
+  if (ttl != null) {
+    return ttl;
+  }
+  return bedrockModelSupportsExtendedTtl(model)
+    ? DEFAULT_PROMPT_CACHE_TTL
+    : '5m';
+}
+
 /** Anthropic `cache_control` shape (the SDK accepts an optional `ttl`). */
 type AnthropicCacheControl = { type: 'ephemeral'; ttl?: '1h' };
 

@@ -69,6 +69,19 @@ function hasCacheControl(tool: AnthropicToolCacheCandidate): boolean {
   return tool.extras?.cache_control != null;
 }
 
+/**
+ * Read the extended-cache TTL (`'1h'`) carried by a tool's existing
+ * `cache_control`, or `undefined` for the legacy 5-minute marker (no `ttl`).
+ */
+function getCacheControlTtl(
+  tool: AnthropicToolCacheCandidate
+): '1h' | undefined {
+  const cacheControl = isAnthropicBuiltInTool(tool)
+    ? (tool.cache_control as { ttl?: unknown } | undefined)
+    : (tool.extras?.cache_control as { ttl?: unknown } | undefined);
+  return cacheControl?.ttl === '1h' ? '1h' : undefined;
+}
+
 function markCacheControl(
   tool: AnthropicToolCacheCandidate,
   ttl?: PromptCacheTtl
@@ -155,8 +168,13 @@ export function partitionAndMarkAnthropicToolCache(
   const last = staticTools[
     staticTools.length - 1
   ] as AnthropicToolCacheCandidate;
-  // Already marked? Don't double-clone.
-  if (hasCacheControl(last)) {
+  // Already marked with the resolved TTL? Don't churn the array. A stale marker
+  // carrying a different TTL must be re-stamped: Anthropic requires longer-TTL
+  // breakpoints to precede shorter ones, and tools render before system/messages,
+  // so a leftover 5-minute tool marker ahead of a 1-hour system/message
+  // breakpoint would make the request invalid.
+  const desiredTtl: '1h' | undefined = ttl === '1h' ? '1h' : undefined;
+  if (hasCacheControl(last) && getCacheControlTtl(last) === desiredTtl) {
     if (deferredTools.length === 0) return tools;
     return [...staticTools, ...deferredTools] as GraphTools;
   }

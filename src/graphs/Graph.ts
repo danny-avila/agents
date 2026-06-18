@@ -28,6 +28,7 @@ import {
   syncBudgetDerivedFields,
   addTailCacheControl,
   resolvePromptCacheTtl,
+  resolveBedrockPromptCacheTtl,
   getMessageId,
   makeIsDeferred,
   partitionAndMarkAnthropicToolCache,
@@ -1854,14 +1855,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             : undefined
         );
       } else if (bedrockPromptCacheEnabled) {
+        const bedrockOptions = agentContext.clientOptions as
+          | t.BedrockAnthropicClientOptions
+          | undefined;
         finalMessages = addBedrockTailCacheControl<BaseMessage>(
           finalMessages,
-          resolvePromptCacheTtl(
-            (
-              agentContext.clientOptions as
-                | t.BedrockAnthropicClientOptions
-                | undefined
-            )?.promptCacheTtl
+          resolveBedrockPromptCacheTtl(
+            bedrockOptions?.promptCacheTtl,
+            bedrockOptions?.model
           )
         );
       }

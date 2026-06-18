@@ -32,7 +32,6 @@ import {
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { BaseMessage, ResponseMetadata } from '@langchain/core/messages';
 import type { ChatBedrockConverseInput } from '@langchain/aws';
-import type { PromptCacheTtl } from '@/messages/cache';
 import {
   convertToConverseMessages,
   createConverseToolUseStopChunk,
@@ -40,6 +39,10 @@ import {
   handleConverseStreamContentBlockDelta,
   handleConverseStreamMetadata,
 } from './utils';
+import {
+  resolveBedrockPromptCacheTtl,
+  type PromptCacheTtl,
+} from '@/messages/cache';
 import { insertBedrockToolCachePoint } from './toolCache';
 
 /**
@@ -165,7 +168,7 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
         ? insertBedrockToolCachePoint(
           baseParams.toolConfig,
           true,
-          this.promptCacheTtl
+          resolveBedrockPromptCacheTtl(this.promptCacheTtl, this.model)
         )
         : baseParams.toolConfig;
 

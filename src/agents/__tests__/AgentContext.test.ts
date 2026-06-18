@@ -168,7 +168,7 @@ describe('AgentContext', () => {
         agentConfig: {
           provider: Providers.BEDROCK,
           clientOptions: {
-            model: 'anthropic.claude-3-5-sonnet',
+            model: 'anthropic.claude-sonnet-4-5-20250929-v1:0',
             promptCache: true,
           },
           instructions: 'Stable instructions',
@@ -190,7 +190,7 @@ describe('AgentContext', () => {
         agentConfig: {
           provider: Providers.BEDROCK,
           clientOptions: {
-            model: 'anthropic.claude-3-5-sonnet',
+            model: 'anthropic.claude-sonnet-4-5-20250929-v1:0',
             promptCache: true,
           },
           instructions: undefined,
@@ -734,7 +734,7 @@ describe('AgentContext', () => {
         agentConfig: {
           provider: Providers.BEDROCK,
           clientOptions: {
-            model: 'anthropic.claude-3-5-sonnet',
+            model: 'anthropic.claude-sonnet-4-5-20250929-v1:0',
             promptCache: true,
           },
           instructions: 'Stable instructions',

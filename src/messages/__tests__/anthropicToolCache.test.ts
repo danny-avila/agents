@@ -140,6 +140,39 @@ describe('partitionAndMarkAnthropicToolCache', () => {
     // is returned unchanged (same reference) so we don't churn the array.
     expect(partitionAndMarkAnthropicToolCache(input, () => false)).toBe(input);
   });
+
+  it('stamps the resolved 1h ttl on the last static tool', () => {
+    const out = partitionAndMarkAnthropicToolCache(
+      [fakeTool('a-static'), fakeTool('b-static')] as never,
+      () => false,
+      '1h'
+    ) as Array<{
+      extras?: { cache_control?: { type: string; ttl?: string } };
+    }>;
+    expect(out[1].extras?.cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    });
+    expect(out[0].extras?.cache_control).toBeUndefined();
+  });
+
+  it('re-stamps a pre-marked 5m tool to 1h so it does not precede a 1h breakpoint', () => {
+    const a = fakeTool('a-static') as {
+      extras?: { cache_control?: { type: string; ttl?: string } };
+    };
+    a.extras = { cache_control: { type: 'ephemeral' } };
+    const out = partitionAndMarkAnthropicToolCache(
+      [a] as never,
+      () => false,
+      '1h'
+    ) as Array<{
+      extras?: { cache_control?: { type: string; ttl?: string } };
+    }>;
+    expect(out[0].extras?.cache_control).toEqual({
+      type: 'ephemeral',
+      ttl: '1h',
+    });
+  });
 });
 
 describe('makeIsDeferred', () => {
