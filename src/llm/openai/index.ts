@@ -38,7 +38,11 @@ import {
   STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY,
   OPENAI_CHAT_SEQUENTIAL_STREAMED_TOOL_CALL_ADAPTER,
 } from '@/tools/streamedToolCallSeals';
-import { isReasoningModel, _convertMessagesToOpenAIParams } from './utils';
+import {
+  isReasoningModel,
+  _convertMessagesToOpenAIParams,
+  stripImagesFromMessages,
+} from './utils';
 
 // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
 const iife = <T>(fn: () => T) => fn();
@@ -1355,11 +1359,18 @@ function withLibreChatOpenAIFields(
 export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
   _lc_stream_delay?: number;
 
+  /** When false, image_url parts are stripped before sending (avoids non-multimodal API errors). */
+  protected visionCapable: boolean;
+
   constructor(
-    fields?: LibreChatOpenAIFields & t.OpenAIChatInput['modelKwargs']
+    fields?: LibreChatOpenAIFields & {
+      vision?: boolean;
+    } & t.OpenAIChatInput['modelKwargs']
   ) {
-    super(withLibreChatOpenAIFields(fields));
+    const { vision, ...rest } = fields ?? {};
+    super(withLibreChatOpenAIFields(rest as LibreChatOpenAIFields));
     this._lc_stream_delay = fields?._lc_stream_delay;
+    this.visionCapable = vision ?? true;
   }
 
   public get exposedClient(): CustomOpenAIClient {
@@ -1422,7 +1433,11 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
     yield* delayStreamChunks(
-      super._streamResponseChunks(messages, options, undefined),
+      super._streamResponseChunks(
+        stripImagesFromMessages(messages, this.visionCapable),
+        options,
+        undefined
+      ),
       this._lc_stream_delay,
       options.signal,
       runManager
@@ -1433,11 +1448,19 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
 export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
   _lc_stream_delay?: number;
 
-  constructor(fields?: LibreChatAzureOpenAIFields) {
-    super(fields);
-    this.completions = new LibreChatAzureOpenAICompletions(fields);
-    this.responses = new LibreChatAzureOpenAIResponses(fields);
+  protected visionCapable: boolean;
+
+  constructor(fields?: LibreChatAzureOpenAIFields & { vision?: boolean }) {
+    const { vision, ...rest } = fields ?? {};
+    super(rest as LibreChatAzureOpenAIFields);
+    this.completions = new LibreChatAzureOpenAICompletions(
+      rest as LibreChatAzureOpenAIFields
+    );
+    this.responses = new LibreChatAzureOpenAIResponses(
+      rest as LibreChatAzureOpenAIFields
+    );
     this._lc_stream_delay = fields?._lc_stream_delay;
+    this.visionCapable = vision ?? true;
   }
 
   public get exposedClient(): CustomOpenAIClient {
@@ -1534,7 +1557,11 @@ export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
     yield* delayStreamChunks(
-      super._streamResponseChunks(messages, options, undefined),
+      super._streamResponseChunks(
+        stripImagesFromMessages(messages, this.visionCapable),
+        options,
+        undefined
+      ),
       this._lc_stream_delay,
       options.signal,
       runManager
@@ -1542,15 +1569,19 @@ export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
   }
 }
 export class ChatDeepSeek extends OriginalChatDeepSeek {
+  protected visionCapable: boolean;
   _lc_stream_delay?: number;
 
   constructor(
     fields?: ConstructorParameters<typeof OriginalChatDeepSeek>[0] & {
+      vision?: boolean;
       _lc_stream_delay?: number;
     }
   ) {
-    super(fields);
+    const { vision, ...rest } = fields ?? {};
+    super(rest as ConstructorParameters<typeof OriginalChatDeepSeek>[0]);
     this._lc_stream_delay = fields?._lc_stream_delay;
+    this.visionCapable = vision ?? true;
   }
 
   public get exposedClient(): CustomOpenAIClient {
@@ -1667,7 +1698,11 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
     yield* delayStreamChunks(
-      this._streamResponseChunksWithReasoning(messages, options, undefined),
+      this._streamResponseChunksWithReasoning(
+        stripImagesFromMessages(messages, this.visionCapable),
+        options,
+        undefined
+      ),
       this._lc_stream_delay,
       options.signal,
       runManager
@@ -2064,15 +2099,19 @@ export class ChatMoonshot extends ChatOpenAI {
 export class ChatXAI extends OriginalChatXAI {
   _lc_stream_delay?: number;
 
+  protected visionCapable: boolean;
+
   constructor(
     fields?: Partial<ChatXAIInput> & {
       configuration?: { baseURL?: string };
       clientConfig?: { baseURL?: string };
       _lc_stream_delay?: number;
+      vision?: boolean;
     }
   ) {
     super(fields);
     this._lc_stream_delay = fields?._lc_stream_delay;
+    this.visionCapable = fields?.vision ?? true;
     const customBaseURL =
       fields?.configuration?.baseURL ?? fields?.clientConfig?.baseURL;
     if (customBaseURL != null && customBaseURL) {
@@ -2128,7 +2167,11 @@ export class ChatXAI extends OriginalChatXAI {
     runManager?: CallbackManagerForLLMRun
   ): AsyncGenerator<ChatGenerationChunk> {
     yield* delayStreamChunks(
-      super._streamResponseChunks(messages, options, undefined),
+      super._streamResponseChunks(
+        stripImagesFromMessages(messages, this.visionCapable),
+        options,
+        undefined
+      ),
       this._lc_stream_delay,
       options.signal,
       runManager
