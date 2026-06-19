@@ -152,7 +152,10 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
     this.promptCacheTtl = fields?.promptCacheTtl;
     this.applicationInferenceProfile = fields?.applicationInferenceProfile;
     this.serviceTier = fields?.serviceTier;
-    this.cacheModelId = fields?.model ?? '';
+    // `super(fields)` initializes `this.model` to LangChain's default Claude
+    // model when `fields.model` is omitted, so fall back to it rather than ''
+    // (which would treat the default Claude model as tool-cache-unsupported).
+    this.cacheModelId = fields?.model ?? this.model;
   }
 
   static lc_name(): string {

@@ -593,6 +593,35 @@ describe('CustomChatBedrockConverse', () => {
         'cachePoint',
       ]);
     });
+
+    test('still adds a tool cache point when model is omitted (default is Claude)', () => {
+      // When no model is provided, LangChain initializes this.model to a default
+      // Claude model, so the tool cache point must still apply.
+      const model = new CustomChatBedrockConverse({
+        ...baseConstructorArgs,
+        promptCache: true,
+      });
+
+      expect(model.model).toMatch(/claude/i);
+
+      const params = model.invocationParams({
+        tools: [
+          {
+            type: 'function',
+            function: {
+              name: 'direct_tool',
+              description: 'Direct tool',
+              parameters: { type: 'object', properties: {} },
+            },
+          },
+        ],
+      });
+
+      expect(getBedrockToolNames(params.toolConfig?.tools)).toEqual([
+        'direct_tool',
+        'cachePoint',
+      ]);
+    });
   });
 
   describe('contentBlockIndex cleanup', () => {

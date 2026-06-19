@@ -1441,16 +1441,21 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           agentContext.clientOptions as
             | t.BedrockAnthropicClientOptions
             | undefined
-        )?.promptCache === true &&
-        supportsBedrockToolCache(
-          (agentContext.clientOptions as { model?: string } | undefined)?.model
-        )
+        )?.promptCache === true
       ) {
-        toolsForBinding =
-          partitionAndMarkBedrockToolCache(
-            rawToolsForBinding,
-            makeIsDeferred(agentContext.toolDefinitions)
-          ) ?? rawToolsForBinding;
+        const bedrockModel = (
+          agentContext.clientOptions as { model?: string } | undefined
+        )?.model;
+        // An omitted model falls back to LangChain's default Claude model (which
+        // supports tool caching); only an explicit non-Claude model (e.g. Nova)
+        // skips tool marking so its stray marker never leaks into toolConfig.
+        if (bedrockModel == null || supportsBedrockToolCache(bedrockModel)) {
+          toolsForBinding =
+            partitionAndMarkBedrockToolCache(
+              rawToolsForBinding,
+              makeIsDeferred(agentContext.toolDefinitions)
+            ) ?? rawToolsForBinding;
+        }
       }
 
       let model =
