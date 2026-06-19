@@ -295,8 +295,14 @@ async function revertStrictWrite(
     } else {
       await fs.unlink(path);
     }
-  } catch {
-    /* best-effort: caller still sees the original syntax error */
+  } catch (error) {
+    // A timed-out revert leaves the rejected write on disk — the caller would
+    // otherwise claim "reverted to pre-write state" while the bad bytes remain.
+    // Surface it; for other failures stay best-effort (caller sees the original
+    // syntax error).
+    if (isWorkspaceClientTimeoutError(error)) {
+      throw error;
+    }
   }
 }
 

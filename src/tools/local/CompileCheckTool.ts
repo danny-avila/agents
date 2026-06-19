@@ -27,6 +27,7 @@ import { resolve } from 'path';
 import { tool } from '@langchain/core/tools';
 import type { DynamicStructuredTool } from '@langchain/core/tools';
 import type { WorkspaceFS } from './workspaceFS';
+import { isWorkspaceClientTimeoutError } from './workspaceFS';
 import type * as t from '@/types';
 import {
   getLocalCwd,
@@ -74,7 +75,12 @@ async function pathExists(fs: WorkspaceFS, p: string): Promise<boolean> {
   try {
     await fs.stat(p);
     return true;
-  } catch {
+  } catch (error) {
+    // A stalled-RPC timeout is not "absent" — don't let it pick a weaker/wrong
+    // toolchain after waiting through the backstop; surface it.
+    if (isWorkspaceClientTimeoutError(error)) {
+      throw error;
+    }
     return false;
   }
 }
@@ -94,7 +100,12 @@ async function detect(cwd: string, fs: WorkspaceFS): Promise<Detection> {
   if (await pathExists(fs, resolve(cwd, 'package.json'))) {
     const pkgRaw = await fs
       .readFile(resolve(cwd, 'package.json'), 'utf8')
-      .catch(() => '');
+      .catch((error) => {
+        if (isWorkspaceClientTimeoutError(error)) {
+          throw error;
+        }
+        return '';
+      });
     if (pkgRaw.includes('"typescript"')) {
       return {
         kind: 'typescript',
@@ -124,7 +135,12 @@ async function detect(cwd: string, fs: WorkspaceFS): Promise<Detection> {
   ) {
     const pyToml = await fs
       .readFile(resolve(cwd, 'pyproject.toml'), 'utf8')
-      .catch(() => '');
+      .catch((error) => {
+        if (isWorkspaceClientTimeoutError(error)) {
+          throw error;
+        }
+        return '';
+      });
     if (pyToml.includes('mypy')) {
       return {
         kind: 'python-mypy',

@@ -65,7 +65,14 @@ export class LocalFileCheckpointerImpl implements t.LocalFileCheckpointer {
     let restored = 0;
     for (const [path, snapshot] of this.snapshots.entries()) {
       if (snapshot.kind === 'absent') {
-        await this.fs.unlink(path).catch(() => undefined);
+        await this.fs.unlink(path).catch((error) => {
+          // A timed-out delete did NOT happen — surface it rather than counting
+          // the path as restored (which would falsely claim the workspace is
+          // back to its pre-write state).
+          if (isWorkspaceClientTimeoutError(error)) {
+            throw error;
+          }
+        });
         restored++;
         continue;
       }
@@ -73,7 +80,11 @@ export class LocalFileCheckpointerImpl implements t.LocalFileCheckpointer {
         await this.fs.mkdir(dirname(path), { recursive: true });
         await this.fs.writeFile(path, snapshot.content);
         restored++;
-      } catch {
+      } catch (error) {
+        // A timed-out restore left the bad write in place — surface it.
+        if (isWorkspaceClientTimeoutError(error)) {
+          throw error;
+        }
         // Best-effort: ignore individual restore failures so the rest
         // of the rewind continues.
       }

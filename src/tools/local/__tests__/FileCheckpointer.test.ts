@@ -86,6 +86,25 @@ describe('LocalFileCheckpointerImpl', () => {
     expect(await cp.rewind()).toBe(0);
   });
 
+  it('rewind rethrows a client-timeout from a restore write instead of claiming success', async () => {
+    // A stalled restore write leaves the bad bytes on disk — rewind must surface
+    // the timeout, not silently count the path as restored.
+    const fs = {
+      stat: async () => ({ isFile: () => true, size: 5 }),
+      readFile: async () => Buffer.from('orig\n'),
+      mkdir: async () => undefined,
+      writeFile: async () => {
+        throw new WorkspaceClientTimeoutError(
+          'cloudflare sandbox writeFile exceeded 6000ms client-side timeout'
+        );
+      },
+    } as unknown as WorkspaceFS;
+    const cp = new LocalFileCheckpointerImpl(32 * 1024 * 1024, fs);
+
+    await cp.captureBeforeWrite('/workspace/a.txt'); // snapshots 'present'
+    await expect(cp.rewind()).rejects.toThrow(/client-side timeout/);
+  });
+
   it('rewinds across multiple files in a single pass', async () => {
     const a = join(dir, 'multi-a.txt');
     const b = join(dir, 'multi-b.txt');
