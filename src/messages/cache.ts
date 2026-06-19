@@ -80,6 +80,31 @@ export function buildBedrockCachePoint(
 }
 
 /**
+ * A `cachePoint` under `toolConfig.tools` is only accepted on Anthropic Claude
+ * models. Amazon Nova rejects it outright — `Malformed input request:
+ * #/toolConfig/tools/0: extraneous key [cachePoint] is not permitted` — even
+ * though it accepts `cachePoint` in `system` and `messages` (verified live:
+ * Nova returns HTTP 200 with real `cacheWriteInputTokens` for both). Per the AWS
+ * prompt-caching docs the support table lists `tools` for Claude only.
+ *
+ * Gate ONLY the tool checkpoint on this, so a `promptCache: true` config on Nova
+ * keeps its valid message/system caching instead of either 400-ing (tool point)
+ * or losing caching entirely. This is a capability gate (the key is rejected
+ * outright), distinct from the TTL value which Bedrock downgrades gracefully.
+ *
+ * @see https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html
+ * @see https://github.com/danny-avila/LibreChat/issues/13838
+ */
+export function supportsBedrockToolCache(
+  model: string | undefined | null
+): boolean {
+  if (typeof model !== 'string') {
+    return false;
+  }
+  return /claude|anthropic/i.test(model);
+}
+
+/**
  * Deep clones a message's content to prevent mutation of the original.
  */
 function deepCloneContent<T extends string | MessageContentComplex[]>(

@@ -28,6 +28,7 @@ import {
   syncBudgetDerivedFields,
   addTailCacheControl,
   resolvePromptCacheTtl,
+  supportsBedrockToolCache,
   getMessageId,
   makeIsDeferred,
   partitionAndMarkAnthropicToolCache,
@@ -1442,11 +1443,19 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             | undefined
         )?.promptCache === true
       ) {
-        toolsForBinding =
-          partitionAndMarkBedrockToolCache(
-            rawToolsForBinding,
-            makeIsDeferred(agentContext.toolDefinitions)
-          ) ?? rawToolsForBinding;
+        const bedrockModel = (
+          agentContext.clientOptions as { model?: string } | undefined
+        )?.model;
+        // An omitted model falls back to LangChain's default Claude model (which
+        // supports tool caching); only an explicit non-Claude model (e.g. Nova)
+        // skips tool marking so its stray marker never leaks into toolConfig.
+        if (bedrockModel == null || supportsBedrockToolCache(bedrockModel)) {
+          toolsForBinding =
+            partitionAndMarkBedrockToolCache(
+              rawToolsForBinding,
+              makeIsDeferred(agentContext.toolDefinitions)
+            ) ?? rawToolsForBinding;
+        }
       }
 
       let model =
@@ -1790,6 +1799,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             | t.ProviderOptionsMap[Providers.OPENROUTER]
             | undefined
         )?.promptCache === true;
+      // Message/system cache points work on all cache-capable Bedrock models,
+      // including Nova (verified live: HTTP 200 with cacheWriteInputTokens). Only
+      // the tool checkpoint is Claude-only, so this is gated on promptCache alone.
       const bedrockPromptCacheEnabled =
         agentContext.provider === Providers.BEDROCK &&
         (
