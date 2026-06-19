@@ -14,6 +14,7 @@ import {
   buildAnthropicCacheControl,
   buildBedrockCachePoint,
   resolvePromptCacheTtl,
+  resolveBedrockPromptCacheTtl,
   cloneMessage,
   type PromptCacheTtl,
 } from '@/messages/cache';
@@ -869,14 +870,18 @@ export class AgentContext {
   }
 
   /**
-   * Resolved TTL for Bedrock prompt-cache checkpoints (default `'1h'`).
-   * Models that don't support the 1-hour TTL downgrade to 5m server-side.
+   * Resolved TTL for Bedrock prompt-cache checkpoints (default `'1h'` on Claude).
+   * Claude models downgrade an unsupported 1h to 5m server-side; non-Claude
+   * models (Nova) reject the extended TTL, so they are clamped to 5m.
    */
   private getBedrockPromptCacheTtl(): PromptCacheTtl {
     const bedrockOptions = this.clientOptions as
       | t.BedrockAnthropicClientOptions
       | undefined;
-    return resolvePromptCacheTtl(bedrockOptions?.promptCacheTtl);
+    return resolveBedrockPromptCacheTtl(
+      bedrockOptions?.promptCacheTtl,
+      (bedrockOptions as { model?: string } | undefined)?.model
+    );
   }
 
   private buildSystemMessage({
