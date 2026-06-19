@@ -141,6 +141,18 @@ export function clientExecTimeoutMs(timeoutMs: number): number {
 }
 
 /**
+ * Client-side backstop timeout for a native-DO sandbox FILE-IO RPC
+ * (`readFile`/`writeFile`/`listFiles`/`mkdir`/`deleteFile`). Unlike `exec()`
+ * there is no in-sandbox `timeout(1)` layer for these to honor, so this is just a
+ * few seconds of headroom over the configured tool timeout — enough that a normal
+ * (even large, byte-capped) read completes, while a stalled/cold container can't
+ * outlast it. See `withClientTimeout` for why the native DO RPC needs this.
+ */
+export function clientFsTimeoutMs(timeoutMs: number): number {
+  return timeoutMs + 5000;
+}
+
+/**
  * Bound a `sandbox.exec()` await with a CLIENT-SIDE timeout.
  *
  * The native Cloudflare Sandbox Durable Object `exec()` is effectively
@@ -412,12 +424,17 @@ function createDirent(info: t.CloudflareSandboxFileInfo): ReaddirEntry {
 
 async function findChildInfo(
   sandbox: t.CloudflareSandboxRuntime,
-  filePath: string
+  filePath: string,
+  timeoutMs: number
 ): Promise<t.CloudflareSandboxFileInfo | undefined> {
   const parent = path.dirname(filePath);
   const basename = path.basename(filePath);
   const entries = normalizeFileList(
-    await sandbox.listFiles(parent, { includeHidden: true })
+    await withClientTimeout(
+      sandbox.listFiles(parent, { includeHidden: true }),
+      timeoutMs,
+      'cloudflare sandbox listFiles'
+    )
   );
   return entries.find((entry) => {
     const absolute = entryAbsolutePath(entry, parent);
@@ -429,13 +446,25 @@ export function createCloudflareWorkspaceFS(
   config: t.CloudflareSandboxExecutionConfig
 ): WorkspaceFS {
   const workspaceRoot = getCloudflareWorkspaceRoot(config);
+  // Native-DO file-IO RPCs have the SAME stall hazard as exec() (PR #252): no
+  // `signal`, no reliably-enforced timeout, so a cold/unresponsive container
+  // hangs the host await until the run-level abort — burning the whole budget on
+  // one read (observed: a `read_file` that stalled ~552s before the wall-clock
+  // budget killed it). Bound every native FS RPC with the same client-side
+  // backstop the exec sites use.
+  const fsTimeoutMs = clientFsTimeoutMs(config.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  const bound = <T>(op: Promise<T>, label: string): Promise<T> =>
+    withClientTimeout(op, fsTimeoutMs, `cloudflare sandbox ${label}`);
 
   const fs: WorkspaceFS = {
     readFile: (async (filePath: string, encoding?: 'utf8') => {
       const sandbox = await resolveCloudflareSandbox(config);
       const resolved = toSandboxPath(filePath, workspaceRoot);
       const buffer = await normalizeReadFileContent(
-        await sandbox.readFile(resolved, encoding ? { encoding } : undefined)
+        await bound(
+          sandbox.readFile(resolved, encoding ? { encoding } : undefined),
+          'readFile'
+        )
       );
       return encoding != null ? buffer.toString(encoding) : buffer;
     }) as WorkspaceFS['readFile'],
@@ -447,29 +476,38 @@ export function createCloudflareWorkspaceFS(
       const sandbox = await resolveCloudflareSandbox(config);
       const resolved = toSandboxPath(filePath, workspaceRoot);
       const normalized = normalizeWriteFileContent(content);
-      await sandbox.writeFile(resolved, normalized.content, normalized.options);
+      await bound(
+        sandbox.writeFile(resolved, normalized.content, normalized.options),
+        'writeFile'
+      );
     },
     stat: async (filePath: string) => {
       const sandbox = await resolveCloudflareSandbox(config);
       const resolved = toSandboxPath(filePath, workspaceRoot);
       if (resolved === workspaceRoot) {
         const entries = normalizeFileList(
-          await sandbox.listFiles(resolved, { includeHidden: true })
+          await bound(
+            sandbox.listFiles(resolved, { includeHidden: true }),
+            'listFiles'
+          )
         );
         return createStats({ size: entries.length, type: 'directory' });
       }
-      const info = await findChildInfo(sandbox, resolved);
+      const info = await findChildInfo(sandbox, resolved, fsTimeoutMs);
       if (info != null) {
         return createStats({ size: info.size, type: info.type });
       }
       try {
         const entries = normalizeFileList(
-          await sandbox.listFiles(resolved, { includeHidden: true })
+          await bound(
+            sandbox.listFiles(resolved, { includeHidden: true }),
+            'listFiles'
+          )
         );
         return createStats({ size: entries.length, type: 'directory' });
       } catch {
         const buffer = await normalizeReadFileContent(
-          await sandbox.readFile(resolved)
+          await bound(sandbox.readFile(resolved), 'readFile')
         );
         return createStats({ size: buffer.length, type: 'file' });
       }
@@ -478,7 +516,10 @@ export function createCloudflareWorkspaceFS(
       const sandbox = await resolveCloudflareSandbox(config);
       const resolved = toSandboxPath(filePath, workspaceRoot);
       const entries = normalizeFileList(
-        await sandbox.listFiles(resolved, { includeHidden: true })
+        await bound(
+          sandbox.listFiles(resolved, { includeHidden: true }),
+          'listFiles'
+        )
       );
       if (options?.withFileTypes === true) {
         return entries.map(createDirent);
@@ -487,21 +528,27 @@ export function createCloudflareWorkspaceFS(
     }) as WorkspaceFS['readdir'],
     mkdir: async (filePath: string, options?: MakeDirectoryOptions) => {
       const sandbox = await resolveCloudflareSandbox(config);
-      await sandbox.mkdir(toSandboxPath(filePath, workspaceRoot), {
-        recursive: options?.recursive,
-      });
+      await bound(
+        sandbox.mkdir(toSandboxPath(filePath, workspaceRoot), {
+          recursive: options?.recursive,
+        }),
+        'mkdir'
+      );
     },
     realpath: async (filePath: string) =>
       toSandboxPath(filePath, workspaceRoot),
     unlink: async (filePath: string) => {
       const sandbox = await resolveCloudflareSandbox(config);
-      await sandbox.deleteFile(toSandboxPath(filePath, workspaceRoot));
+      await bound(
+        sandbox.deleteFile(toSandboxPath(filePath, workspaceRoot)),
+        'deleteFile'
+      );
     },
     open: async (filePath: string, _flags: 'r') => {
       const sandbox = await resolveCloudflareSandbox(config);
       const resolved = toSandboxPath(filePath, workspaceRoot);
       const buffer = await normalizeReadFileContent(
-        await sandbox.readFile(resolved)
+        await bound(sandbox.readFile(resolved), 'readFile')
       );
       return {
         read: async (

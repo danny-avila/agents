@@ -388,6 +388,81 @@ describe('Cloudflare sandbox execution backend', () => {
     expect(received).not.toHaveProperty('signal');
   });
 
+  it('rejects with a client-side timeout when sandbox readFile stalls', async () => {
+    // The native-DO file-IO RPCs (readFile/writeFile/listFiles/...) have the same
+    // stall hazard exec() does: no signal, no enforced timeout. A cold/unresponsive
+    // container otherwise hangs the host await until the run-level abort, burning
+    // the whole budget on one read (observed live: a `read_file` stalled ~552s).
+    jest.useFakeTimers();
+    try {
+      let readCalls = 0;
+      const fs = createCloudflareWorkspaceFS({
+        workspaceRoot: '/workspace',
+        timeoutMs: 1000,
+        sandbox: createRuntime({
+          readFile: () => {
+            readCalls += 1;
+            return new Promise<string>(() => undefined);
+          },
+        }),
+      });
+
+      const promise = (fs.readFile as (p: string) => Promise<unknown>)(
+        '/workspace/a.txt'
+      );
+      const assertion = expect(promise).rejects.toThrow(/client-side timeout/);
+      // Client backstop = clientFsTimeoutMs(1000) = 6000ms; advance past it.
+      await jest.advanceTimersByTimeAsync(6500);
+      await assertion;
+      expect(readCalls).toBe(1);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('rejects with a client-side timeout when sandbox listFiles stalls', async () => {
+    jest.useFakeTimers();
+    try {
+      const fs = createCloudflareWorkspaceFS({
+        workspaceRoot: '/workspace',
+        timeoutMs: 1000,
+        sandbox: createRuntime({
+          listFiles: () =>
+            new Promise<t.CloudflareSandboxFileInfo[]>(() => undefined),
+        }),
+      });
+
+      const promise = (fs.readdir as (p: string) => Promise<unknown>)(
+        '/workspace/sub'
+      );
+      const assertion = expect(promise).rejects.toThrow(/client-side timeout/);
+      await jest.advanceTimersByTimeAsync(6500);
+      await assertion;
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('does not time out a native FS RPC that returns in time', async () => {
+    jest.useFakeTimers();
+    try {
+      const fs = createCloudflareWorkspaceFS({
+        workspaceRoot: '/workspace',
+        timeoutMs: 1000,
+        sandbox: createRuntime({ readFile: async () => 'contents' }),
+      });
+
+      const result = await (
+        fs.readFile as (p: string, e: 'utf8') => Promise<string>
+      )('/workspace/a.txt', 'utf8');
+      expect(result).toBe('contents');
+      // The backstop timer must have been cleared, not left dangling.
+      expect(jest.getTimerCount()).toBe(0);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   it('passes call-specific timeouts to the Cloudflare spawn wrapper', async () => {
     let execCommand = '';
     let execTimeout: number | undefined;
