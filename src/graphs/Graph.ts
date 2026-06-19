@@ -28,6 +28,7 @@ import {
   syncBudgetDerivedFields,
   addTailCacheControl,
   resolvePromptCacheTtl,
+  resolveBedrockPromptCacheTtl,
   supportsBedrockToolCache,
   getMessageId,
   makeIsDeferred,
@@ -1880,9 +1881,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         const bedrockOptions = agentContext.clientOptions as
           | t.BedrockAnthropicClientOptions
           | undefined;
+        // Non-Claude models (Nova) reject the extended 1h TTL, so resolve it
+        // against the model — message/system caching stays on, clamped to 5m.
         finalMessages = addBedrockTailCacheControl<BaseMessage>(
           finalMessages,
-          resolvePromptCacheTtl(bedrockOptions?.promptCacheTtl)
+          resolveBedrockPromptCacheTtl(
+            bedrockOptions?.promptCacheTtl,
+            (bedrockOptions as { model?: string } | undefined)?.model
+          )
         );
       }
 
