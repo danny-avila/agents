@@ -19,6 +19,7 @@ import {
   buildAnthropicCacheControl,
   buildBedrockCachePoint,
   resolvePromptCacheTtl,
+  resolveBedrockPromptCacheTtl,
   supportsBedrockToolCache,
   DEFAULT_PROMPT_CACHE_TTL,
 } from './cache';
@@ -923,6 +924,37 @@ describe('supportsBedrockToolCache', () => {
     expect(supportsBedrockToolCache('')).toBe(false);
     expect(supportsBedrockToolCache(undefined)).toBe(false);
     expect(supportsBedrockToolCache(null)).toBe(false);
+  });
+});
+
+describe('resolveBedrockPromptCacheTtl', () => {
+  test('Claude: defaults to 1h and honors an explicit ttl', () => {
+    const claude = 'us.anthropic.claude-sonnet-4-5-20250929-v1:0';
+    expect(resolveBedrockPromptCacheTtl(undefined, claude)).toBe('1h');
+    expect(resolveBedrockPromptCacheTtl('1h', claude)).toBe('1h');
+    expect(resolveBedrockPromptCacheTtl('5m', claude)).toBe('5m');
+  });
+
+  test('Nova: clamps to 5m even when 1h is configured (extended TTL Anthropic-only)', () => {
+    const nova = 'us.amazon.nova-lite-v1:0';
+    expect(resolveBedrockPromptCacheTtl(undefined, nova)).toBe('5m');
+    expect(resolveBedrockPromptCacheTtl('1h', nova)).toBe('5m');
+    expect(resolveBedrockPromptCacheTtl('5m', nova)).toBe('5m');
+  });
+
+  test('other non-Claude families clamp to 5m', () => {
+    expect(
+      resolveBedrockPromptCacheTtl('1h', 'meta.llama3-1-70b-instruct-v1:0')
+    ).toBe('5m');
+    expect(
+      resolveBedrockPromptCacheTtl('1h', 'mistral.mistral-large-2407-v1:0')
+    ).toBe('5m');
+  });
+
+  test('omitted model defaults to Claude behavior (1h)', () => {
+    expect(resolveBedrockPromptCacheTtl(undefined, undefined)).toBe('1h');
+    expect(resolveBedrockPromptCacheTtl(undefined, null)).toBe('1h');
+    expect(resolveBedrockPromptCacheTtl('1h', undefined)).toBe('1h');
   });
 });
 

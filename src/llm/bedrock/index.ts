@@ -40,7 +40,7 @@ import {
   handleConverseStreamMetadata,
 } from './utils';
 import {
-  resolvePromptCacheTtl,
+  resolveBedrockPromptCacheTtl,
   supportsBedrockToolCache,
   type PromptCacheTtl,
 } from '@/messages/cache';
@@ -184,7 +184,7 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
         ? insertBedrockToolCachePoint(
           baseParams.toolConfig,
           true,
-          resolvePromptCacheTtl(this.promptCacheTtl)
+          resolveBedrockPromptCacheTtl(this.promptCacheTtl, this.cacheModelId)
         )
         : baseParams.toolConfig;
 

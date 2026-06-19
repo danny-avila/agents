@@ -80,6 +80,16 @@ export function buildBedrockCachePoint(
 }
 
 /**
+ * Whether a Bedrock model id is an Anthropic Claude model. Claude is the only
+ * Bedrock family that accepts the explicit cache features below; Amazon Nova and
+ * others reject them. Matches both the `anthropic.` and cross-region
+ * (`us.anthropic.`) / bare `claude` forms.
+ */
+function isBedrockAnthropicModel(model: string | undefined | null): boolean {
+  return typeof model === 'string' && /claude|anthropic/i.test(model);
+}
+
+/**
  * A `cachePoint` under `toolConfig.tools` is only accepted on Anthropic Claude
  * models. Amazon Nova rejects it outright — `Malformed input request:
  * #/toolConfig/tools/0: extraneous key [cachePoint] is not permitted` — even
@@ -89,8 +99,7 @@ export function buildBedrockCachePoint(
  *
  * Gate ONLY the tool checkpoint on this, so a `promptCache: true` config on Nova
  * keeps its valid message/system caching instead of either 400-ing (tool point)
- * or losing caching entirely. This is a capability gate (the key is rejected
- * outright), distinct from the TTL value which Bedrock downgrades gracefully.
+ * or losing caching entirely.
  *
  * @see https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html
  * @see https://github.com/danny-avila/LibreChat/issues/13838
@@ -98,10 +107,27 @@ export function buildBedrockCachePoint(
 export function supportsBedrockToolCache(
   model: string | undefined | null
 ): boolean {
-  if (typeof model !== 'string') {
-    return false;
+  return isBedrockAnthropicModel(model);
+}
+
+/**
+ * Resolve the Bedrock `cachePoint` TTL for a model. The extended `1h` TTL is
+ * Anthropic-only: non-Claude models (e.g. Nova) hard-reject it with
+ * `Extended TTL prompt caching is only supported for Anthropic models`, so they
+ * are clamped to `5m` even when `1h` is configured (verified live). An omitted
+ * model defaults to a Claude model, and Claude downgrades an unsupported `1h` to
+ * `5m` server-side, so the `1h` default is safe for the Claude/undefined paths.
+ *
+ * @see https://github.com/danny-avila/LibreChat/issues/13838
+ */
+export function resolveBedrockPromptCacheTtl(
+  ttl: PromptCacheTtl | undefined,
+  model: string | undefined | null
+): PromptCacheTtl {
+  if (model != null && !isBedrockAnthropicModel(model)) {
+    return '5m';
   }
-  return /claude|anthropic/i.test(model);
+  return resolvePromptCacheTtl(ttl);
 }
 
 /**
