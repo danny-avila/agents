@@ -897,25 +897,29 @@ export async function executeCloudflareCode(
     input.args,
     ctx.shell
   );
-  // Bound the temp-dir setup RPCs too: these run BEFORE the bounded exec, so a
-  // native-DO stall here would hang the host await on a single mkdir/writeFile
-  // and burn the run budget before code-exec is ever reached.
-  await withClientTimeout(
-    ctx.sandbox.mkdir(tempDir, { recursive: true }),
-    clientFsTimeoutMs(ctx.timeoutMs),
-    'cloudflare sandbox mkdir'
-  );
-  if (runtime.source != null) {
-    await withClientTimeout(
-      ctx.sandbox.writeFile(path.join(tempDir, runtime.fileName), runtime.source, {
-        encoding: 'utf8',
-      }),
-      clientFsTimeoutMs(ctx.timeoutMs),
-      'cloudflare sandbox writeFile'
-    );
-  }
   let execSucceeded = false;
   try {
+    // Bound the temp-dir setup RPCs (they run BEFORE the bounded exec): a
+    // native-DO stall here would hang the host on a single mkdir/writeFile and
+    // burn the run budget. Keep them INSIDE the try so the finally cleanup still
+    // removes .lc-exec/<uuid> if setup throws — the uncancellable write can land
+    // late on a cold container, so an orphaned dir would otherwise accumulate.
+    await withClientTimeout(
+      ctx.sandbox.mkdir(tempDir, { recursive: true }),
+      clientFsTimeoutMs(ctx.timeoutMs),
+      'cloudflare sandbox mkdir'
+    );
+    if (runtime.source != null) {
+      await withClientTimeout(
+        ctx.sandbox.writeFile(
+          path.join(tempDir, runtime.fileName),
+          runtime.source,
+          { encoding: 'utf8' }
+        ),
+        clientFsTimeoutMs(ctx.timeoutMs),
+        'cloudflare sandbox writeFile'
+      );
+    }
     const result = await execWithClientTimeout(
       ctx.sandbox,
       withInSandboxTimeout(runtime.command, ctx.timeoutMs),

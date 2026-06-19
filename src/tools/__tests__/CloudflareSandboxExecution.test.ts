@@ -507,6 +507,36 @@ describe('Cloudflare sandbox execution backend', () => {
     }
   });
 
+  it('still cleans up the temp dir when execute_code setup (writeFile) times out', async () => {
+    // The setup RPCs are inside the try, so a stalled writeFile still triggers
+    // the finally cleanup — otherwise the late (uncancellable) write leaves an
+    // orphaned .lc-exec/<uuid> dir behind on every cold-container failure.
+    jest.useFakeTimers();
+    try {
+      const execCommands: string[] = [];
+      const sandbox = createRuntime({
+        mkdir: async () => ({ ok: true }),
+        writeFile: () => new Promise<{ ok: true }>(() => undefined), // stalls
+        exec: async (command) => {
+          execCommands.push(command);
+          return { exitCode: 0, stdout: '', stderr: '' };
+        },
+      });
+
+      const promise = executeCloudflareCode(
+        { lang: 'py', code: 'print("hi")' },
+        { sandbox, workspaceRoot: '/workspace', timeoutMs: 1000 }
+      ).catch((e: unknown) => e);
+      await jest.advanceTimersByTimeAsync(6500);
+      const settled = await promise;
+      expect(isWorkspaceClientTimeoutError(settled)).toBe(true);
+      // Cleanup must have been issued despite the setup failure.
+      expect(execCommands.some((c) => c.startsWith('rm -rf'))).toBe(true);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   it('rejects with a client-side timeout when sandbox listFiles stalls', async () => {
     jest.useFakeTimers();
     try {

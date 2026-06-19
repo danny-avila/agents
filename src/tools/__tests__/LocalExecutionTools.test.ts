@@ -37,6 +37,8 @@ import {
   _resetSyntaxCheckProbeCacheForTests,
 } from '../local/syntaxCheck';
 import { resolveLocalToolsForBinding } from '../local/resolveLocalExecutionTools';
+import { WorkspaceClientTimeoutError } from '../local/workspaceFS';
+import type { WorkspaceFS } from '../local/workspaceFS';
 import { LocalFileCheckpointerImpl } from '../local/FileCheckpointer';
 import { createCompileCheckTool } from '../local/CompileCheckTool';
 import { runBashAstChecks } from '../local/bashAst';
@@ -2316,6 +2318,58 @@ describe('comprehensive review (round 14) — Codex P1 #37 + P2 #38/#40/#41', ()
         })
       ).rejects.toThrow(/syntax check failed.*reverted/i);
       expect(await fsp.readFile(file, 'utf8')).toBe(original);
+    });
+
+    it('write_file: still reverts when the strict validation READ times out', async () => {
+      // A stalled validation read must not leave the just-written bytes on disk —
+      // strict mode's revert contract still applies when validation is
+      // inconclusive due to a timeout (here a brand-new file -> unlink).
+      const cwd = await createTempDir();
+      const file = join(cwd, 'config.json');
+      const unlinked: string[] = [];
+      let written = false;
+      const fakeFs = {
+        readFile: async () => {
+          if (!written) {
+            // write_file pre-read: the file does not exist yet.
+            throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+          }
+          // jsonCheck's post-write validation read stalls.
+          throw new WorkspaceClientTimeoutError(
+            'cloudflare sandbox readFile exceeded 6000ms client-side timeout'
+          );
+        },
+        writeFile: async () => {
+          written = true;
+        },
+        mkdir: async () => undefined,
+        unlink: async (p: string) => {
+          unlinked.push(p);
+        },
+        stat: async () => ({ isFile: () => true, size: 1 }),
+        readdir: async () => [],
+        realpath: async (p: string) => p,
+      } as unknown as WorkspaceFS;
+
+      const bundle = createLocalCodingToolBundle({
+        cwd,
+        postEditSyntaxCheck: 'strict',
+        exec: { fs: fakeFs },
+      });
+      const writeTool = bundle.tools.find(
+        (tt) => tt.name === Constants.WRITE_FILE
+      );
+      await expect(
+        writeTool!.invoke({
+          id: 'wf-strict-read-timeout',
+          name: Constants.WRITE_FILE,
+          args: { path: file, content: '{"ok": true}\n' },
+          type: 'tool_call',
+        })
+      ).rejects.toThrow(/client-side timeout/);
+      // strict mode attempted the revert (brand-new file -> unlink), rather than
+      // leaving the unvalidated write on disk.
+      expect(unlinked.length).toBeGreaterThan(0);
     });
   });
 

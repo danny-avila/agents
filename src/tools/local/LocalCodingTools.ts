@@ -558,7 +558,21 @@ export function createLocalWriteFileTool(
       const finalText = encodeFile(input.content, encoding);
       await fs.writeFile(path, finalText, 'utf8');
 
-      const syntax = await maybeRunSyntaxCheck(path, config);
+      let syntax;
+      try {
+        syntax = await maybeRunSyntaxCheck(path, config);
+      } catch (error) {
+        // A validation-read timeout must still honor strict mode's revert
+        // contract: restore the pre-write state before surfacing (best-effort —
+        // the revert may itself time out on the same stalled container).
+        if (
+          isWorkspaceClientTimeoutError(error) &&
+          config.postEditSyntaxCheck === 'strict'
+        ) {
+          await revertStrictWrite(fs, path, existed, before, encoding);
+        }
+        throw error;
+      }
 
       const diff = existed
         ? summariseDiff(path, before, input.content)
@@ -654,7 +668,20 @@ export function createLocalEditFileTool(
       const finalText = encodeFile(next, encoding);
       await fs.writeFile(path, finalText, 'utf8');
 
-      const syntax = await maybeRunSyntaxCheck(path, config);
+      let syntax;
+      try {
+        syntax = await maybeRunSyntaxCheck(path, config);
+      } catch (error) {
+        // As in write_file: a validation-read timeout still triggers strict
+        // mode's revert (edit_file always operates on an existing file).
+        if (
+          isWorkspaceClientTimeoutError(error) &&
+          config.postEditSyntaxCheck === 'strict'
+        ) {
+          await revertStrictWrite(fs, path, true, original, encoding);
+        }
+        throw error;
+      }
 
       const diff = summariseDiff(path, original, next);
       const fuzzy = strategiesUsed.some((s) => s !== 'exact');
