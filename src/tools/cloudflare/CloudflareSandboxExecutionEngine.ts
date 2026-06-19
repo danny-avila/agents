@@ -131,6 +131,135 @@ function isInSandboxTimeoutExit(exitCode: number | null): boolean {
   return exitCode === 124 || exitCode === 137;
 }
 
+/**
+ * Client-side backstop timeout for a `sandbox.exec()` await: a few seconds beyond
+ * the exec's own `timeout` option, so a stalled exec that never honors `timeout`
+ * still can't outlast this.
+ */
+export function clientExecTimeoutMs(timeoutMs: number): number {
+  return outerTimeoutMs(timeoutMs) + 5000;
+}
+
+/**
+ * Bound a `sandbox.exec()` await with a CLIENT-SIDE timeout.
+ *
+ * The native Cloudflare Sandbox Durable Object `exec()` is effectively
+ * uncancellable from the host: `ExecOptions` has no `signal` (so
+ * `supportsExecSignal` is false for the native transport), and its `timeout`
+ * option is not reliably enforced when the container/RPC itself stalls — while
+ * the in-sandbox `timeout(1)` wrapper only bounds a command that is actually
+ * running. So a stalled exec (an unresponsive/cold container) otherwise hangs
+ * until the host's run-level abort, burning the whole run budget on one tool
+ * call. This race guarantees the host await settles within `timeoutMs`
+ * regardless of the transport.
+ *
+ * On timeout the underlying `exec` promise may keep running in the DO (a
+ * native-DO exec cannot be truly cancelled), so its late settlement is swallowed
+ * to avoid an unhandled rejection.
+ */
+export async function withClientTimeout<T>(
+  exec: Promise<T>,
+  timeoutMs: number,
+  label: string,
+  options: {
+    /**
+     * Detach the backstop timer from the event loop. Use ONLY when something else
+     * already settles the caller (e.g. the spawn path, where spawnLocalProcess's
+     * own timer resolves the child). The awaited direct-exec paths must leave it
+     * REF'd so the timeout is guaranteed to fire even if nothing else is pending.
+     */
+    unref?: boolean;
+    /** Invoked when the client timeout fires — e.g. abort a signal-aware exec. */
+    onTimeout?: () => void;
+  } = {}
+): Promise<T> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    return exec;
+  }
+  // Swallow a late rejection from the losing promise after the race settles.
+  exec.catch(() => undefined);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      exec,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          // Reject FIRST so this client-timeout message reliably wins the race;
+          // only then abort a signal-aware exec, whose resulting AbortError must
+          // not surface to the caller instead of the timeout.
+          reject(
+            new Error(
+              `${label} exceeded ${timeoutMs}ms client-side timeout (sandbox exec did not return)`
+            )
+          );
+          options.onTimeout?.();
+        }, timeoutMs);
+        if (options.unref === true) {
+          (timer as { unref?: () => void } | undefined)?.unref?.();
+        }
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
+}
+
+/**
+ * Run `sandbox.exec()` bounded by a client-side timeout, and — for signal-aware
+ * transports (e.g. the HTTP bridge, `supportsExecSignal === true`) — abort the
+ * underlying exec when the timeout fires instead of merely abandoning it. The
+ * native DO transport ignores `signal`, so it only gets the timeout. Leaves the
+ * backstop timer ref'd (this is an awaited direct-exec path).
+ */
+export async function execWithClientTimeout(
+  sandbox: t.CloudflareSandboxRuntime,
+  command: string,
+  options: t.CloudflareSandboxExecOptions,
+  timeoutMs: number,
+  label: string,
+  runOptions: { unref?: boolean } = {}
+): Promise<t.CloudflareSandboxExecResult> {
+  const controller = new AbortController();
+  const execOptions: t.CloudflareSandboxExecOptions = { ...options };
+  const callerSignal = options.signal;
+  let onCallerAbort: (() => void) | undefined;
+  if (sandbox.supportsExecSignal === true) {
+    // Compose the caller's signal (e.g. run/user cancellation) with our timeout
+    // controller so EITHER source cancels the exec — don't clobber the caller's.
+    if (callerSignal != null) {
+      if (callerSignal.aborted) {
+        controller.abort();
+      } else {
+        onCallerAbort = (): void => controller.abort();
+        callerSignal.addEventListener('abort', onCallerAbort, { once: true });
+      }
+    }
+    execOptions.signal = controller.signal;
+  } else if ('signal' in execOptions) {
+    // Native DO RPC cannot consume an AbortSignal (and would fail to clone it).
+    // Strip any caller-provided one so the spread above can't reintroduce it.
+    delete execOptions.signal;
+  }
+  try {
+    return await withClientTimeout(
+      sandbox.exec(command, execOptions),
+      timeoutMs,
+      label,
+      {
+        unref: runOptions.unref,
+        onTimeout: () => controller.abort(),
+      }
+    );
+  } finally {
+    // Don't leave a listener attached to a long-lived/shared caller signal.
+    if (onCallerAbort != null && callerSignal != null) {
+      callerSignal.removeEventListener('abort', onCallerAbort);
+    }
+  }
+}
+
 function truncateOutput(value: string, maxChars: number): string {
   if (maxChars <= 0 || value.length <= maxChars) {
     return value;
@@ -466,7 +595,14 @@ function createCloudflareSpawn(
         execOptions.signal = abortController.signal;
       }
       try {
-        const result = await ctx.sandbox.exec(timedCommand, execOptions);
+        const result = await withClientTimeout(
+          ctx.sandbox.exec(timedCommand, execOptions),
+          clientExecTimeoutMs(timeoutMs),
+          'cloudflare sandbox exec',
+          // spawnLocalProcess's own timer already resolves the child, so this
+          // backstop may safely detach; abort the (signal-aware) exec on timeout.
+          { unref: true, onTimeout: () => abortController.abort() }
+        );
         if (isClosed()) {
           return;
         }
@@ -551,13 +687,16 @@ export async function executeCloudflareBash(
     args.length > 0
       ? `${ctx.shell} -lc ${quote(command)} -- ${args.map(quote).join(' ')}`
       : `${ctx.shell} -lc ${quote(command)}`;
-  const result = await ctx.sandbox.exec(
+  const result = await execWithClientTimeout(
+    ctx.sandbox,
     withInSandboxTimeout(shellCommand, ctx.timeoutMs),
     {
       cwd: ctx.workspaceRoot,
       env: ctx.env,
       timeout: outerTimeoutMs(ctx.timeoutMs),
-    }
+    },
+    clientExecTimeoutMs(ctx.timeoutMs),
+    'cloudflare sandbox bash exec'
   );
   return {
     stdout: truncateOutput(result.stdout, ctx.maxOutputChars),
@@ -703,15 +842,20 @@ export async function executeCloudflareCode(
       }
     );
   }
+  let execSucceeded = false;
   try {
-    const result = await ctx.sandbox.exec(
+    const result = await execWithClientTimeout(
+      ctx.sandbox,
       withInSandboxTimeout(runtime.command, ctx.timeoutMs),
       {
         cwd: ctx.workspaceRoot,
         env: ctx.env,
         timeout: outerTimeoutMs(ctx.timeoutMs),
-      }
+      },
+      clientExecTimeoutMs(ctx.timeoutMs),
+      'cloudflare sandbox code-exec'
     );
+    execSucceeded = true;
     return {
       stdout: truncateOutput(result.stdout, ctx.maxOutputChars),
       stderr: truncateOutput(result.stderr, ctx.maxOutputChars),
@@ -719,13 +863,25 @@ export async function executeCloudflareCode(
       timedOut: isInSandboxTimeoutExit(result.exitCode),
     };
   } finally {
-    await ctx.sandbox
-      .exec(`rm -rf ${quote(tempDir)}`, {
+    // After a normal run, AWAIT cleanup so the temp dir is gone before returning.
+    // After a stalled/failed run, detach it (unref'd) so we don't pile a second
+    // client timeout onto the caller's latency; cleanup still runs best-effort.
+    const detach = !execSucceeded;
+    const cleanup = execWithClientTimeout(
+      ctx.sandbox,
+      `rm -rf ${quote(tempDir)}`,
+      {
         cwd: ctx.workspaceRoot,
         env: ctx.env,
         timeout: 10000,
-      })
-      .catch(() => undefined);
+      },
+      clientExecTimeoutMs(10000),
+      'cloudflare sandbox cleanup',
+      { unref: detach }
+    ).catch(() => undefined);
+    if (!detach) {
+      await cleanup;
+    }
   }
 }
 

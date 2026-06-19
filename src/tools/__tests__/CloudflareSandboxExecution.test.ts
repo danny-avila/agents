@@ -2,6 +2,7 @@ import type * as t from '@/types';
 import {
   createCloudflareWorkspaceFS,
   createCloudflareLocalExecutionConfig,
+  execWithClientTimeout,
   executeCloudflareBash,
   executeCloudflareCode,
 } from '../cloudflare/CloudflareSandboxExecutionEngine';
@@ -255,6 +256,136 @@ describe('Cloudflare sandbox execution backend', () => {
     expect(execCommand).toContain('timeout -k 2s 2s bash -lc');
     expect(execTimeout).toBe(6500);
     expect(result.timedOut).toBe(true);
+  });
+
+  it('rejects with a client-side timeout when sandbox exec stalls (no native cancellation)', async () => {
+    // The native Cloudflare Sandbox DO exec() is uncancellable (ExecOptions has no
+    // signal) and its own `timeout` is not enforced when the container/RPC stalls,
+    // while the in-sandbox `timeout(1)` wrapper only bounds a *running* command.
+    // Without a client-side race a stalled exec hangs until the host's run-level
+    // abort, burning the whole budget on one tool call (issue #251).
+    jest.useFakeTimers();
+    try {
+      let mainExecCalls = 0;
+      const sandbox = createRuntime({
+        exec: (command) => {
+          // Cleanup (`rm -rf`) resolves immediately; the real command stalls,
+          // simulating an unresponsive / cold container exec that never returns.
+          if (command.startsWith('rm -rf')) {
+            return Promise.resolve({ exitCode: 0, stdout: '', stderr: '' });
+          }
+          mainExecCalls += 1;
+          return new Promise<t.CloudflareSandboxExecResult>(() => undefined);
+        },
+      });
+
+      const promise = executeCloudflareCode(
+        { lang: 'py', code: 'print("slow")' },
+        { sandbox, workspaceRoot: '/workspace', timeoutMs: 1000 }
+      );
+      const assertion = expect(promise).rejects.toThrow(/client-side timeout/);
+
+      // Client backstop = outerTimeoutMs(1000) + 5000 = 11000ms; advance past it.
+      await jest.advanceTimersByTimeAsync(11500);
+      await assertion;
+      expect(mainExecCalls).toBe(1);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('aborts signal-aware execs when the client timeout fires', async () => {
+    // For signal-aware transports (e.g. the HTTP bridge), a client timeout should
+    // actually cancel the underlying exec, not just abandon it.
+    jest.useFakeTimers();
+    try {
+      let mainSignal: AbortSignal | undefined;
+      const sandbox = createRuntime({
+        supportsExecSignal: true,
+        exec: (command, options) => {
+          if (command.startsWith('rm -rf')) {
+            return Promise.resolve({ exitCode: 0, stdout: '', stderr: '' });
+          }
+          mainSignal = options?.signal;
+          return new Promise<t.CloudflareSandboxExecResult>(() => undefined);
+        },
+      });
+
+      const promise = executeCloudflareCode(
+        { lang: 'py', code: 'print("slow")' },
+        { sandbox, workspaceRoot: '/workspace', timeoutMs: 1000 }
+      );
+      const assertion = expect(promise).rejects.toThrow(/client-side timeout/);
+      await jest.advanceTimersByTimeAsync(11500);
+      await assertion;
+
+      expect(mainSignal).toBeDefined();
+      expect(mainSignal?.aborted).toBe(true);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('composes a caller abort signal with the timeout instead of clobbering it', async () => {
+    let received: AbortSignal | undefined;
+    const sandbox = createRuntime({
+      supportsExecSignal: true,
+      exec: (_command, options) => {
+        received = options?.signal;
+        return new Promise<t.CloudflareSandboxExecResult>(
+          (_resolve, reject) => {
+            options?.signal?.addEventListener(
+              'abort',
+              () => reject(new Error('aborted')),
+              { once: true }
+            );
+          }
+        );
+      },
+    });
+
+    const caller = new AbortController();
+    const settled = execWithClientTimeout(
+      sandbox,
+      'echo hi',
+      { signal: caller.signal },
+      60000,
+      'test'
+    ).catch((e) => e as Error);
+
+    await Promise.resolve();
+    expect(received).toBeDefined();
+    // The exec gets a composed signal, not the caller's directly.
+    expect(received).not.toBe(caller.signal);
+    expect(received?.aborted).toBe(false);
+
+    // A caller cancellation must reach the exec (not wait for the client timeout).
+    caller.abort();
+    await settled;
+    expect(received?.aborted).toBe(true);
+  });
+
+  it('strips a caller signal for native runtimes that cannot consume it', async () => {
+    let received: t.CloudflareSandboxExecOptions | undefined;
+    const sandbox = createRuntime({
+      // no supportsExecSignal -> native DO, which cannot clone/consume a signal
+      exec: async (_command, options) => {
+        received = options;
+        return { exitCode: 0, stdout: 'ok', stderr: '' };
+      },
+    });
+    const caller = new AbortController();
+
+    await execWithClientTimeout(
+      sandbox,
+      'echo hi',
+      { cwd: '/workspace', signal: caller.signal },
+      60000,
+      'test'
+    );
+
+    expect(received).toBeDefined();
+    expect(received).not.toHaveProperty('signal');
   });
 
   it('passes call-specific timeouts to the Cloudflare spawn wrapper', async () => {

@@ -19,6 +19,8 @@ import {
 } from '@/tools/BashProgrammaticToolCalling';
 import { Constants } from '@/common';
 import {
+  clientExecTimeoutMs,
+  execWithClientTimeout,
   executeCloudflareCode,
   getCloudflareWorkspaceRoot,
   resolveCloudflareSandbox,
@@ -166,13 +168,16 @@ async function executeGeneratedCloudflareBash(
   const workspaceRoot = getCloudflareWorkspaceRoot(config);
   const shell = config.shell ?? 'bash';
   const timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT;
-  const result = await sandbox.exec(
+  const result = await execWithClientTimeout(
+    sandbox,
     withInSandboxTimeout(`${shell} -lc ${quoteShell(command)}`, timeoutMs),
     {
       cwd: workspaceRoot,
       env: config.env,
       timeout: outerTimeoutMs(timeoutMs),
-    }
+    },
+    clientExecTimeoutMs(timeoutMs),
+    'cloudflare bash programmatic exec'
   );
   const maxOutputChars = config.maxOutputChars ?? DEFAULT_MAX_OUTPUT_CHARS;
   return {
