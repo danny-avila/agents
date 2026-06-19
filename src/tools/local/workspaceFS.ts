@@ -39,6 +39,33 @@ export type ReaddirEntry = {
   isSymbolicLink(): boolean;
 };
 
+/**
+ * Thrown when a {@link WorkspaceFS} operation is abandoned by a client-side
+ * backstop timeout (a stalled remote/sandbox RPC that never returned). This is
+ * DISTINCT from "file not found": callers that catch generic FS failures as
+ * absence — e.g. a pre-read before an overwrite, or a `stat` before snapshotting
+ * — MUST rethrow this so a stalled read isn't mistaken for a missing file (which
+ * would otherwise overwrite an existing file or snapshot it as absent).
+ */
+export class WorkspaceClientTimeoutError extends Error {
+  readonly code = 'WORKSPACE_CLIENT_TIMEOUT';
+  constructor(message: string) {
+    super(message);
+    this.name = 'WorkspaceClientTimeoutError';
+  }
+}
+
+export function isWorkspaceClientTimeoutError(
+  error: unknown
+): error is WorkspaceClientTimeoutError {
+  return (
+    error instanceof WorkspaceClientTimeoutError ||
+    (typeof error === 'object' &&
+      error !== null &&
+      (error as { code?: unknown }).code === 'WORKSPACE_CLIENT_TIMEOUT')
+  );
+}
+
 export interface WorkspaceFS {
   readFile(path: string, encoding: 'utf8'): Promise<string>;
   readFile(path: string): Promise<Buffer>;

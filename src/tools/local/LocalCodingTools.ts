@@ -3,6 +3,7 @@ import { createTwoFilesPatch } from 'diff';
 import { tool } from '@langchain/core/tools';
 import type { DynamicStructuredTool } from '@langchain/core/tools';
 import type * as t from '@/types';
+import { isWorkspaceClientTimeoutError } from './workspaceFS';
 import {
   createLocalBashProgrammaticToolCallingTool,
   createLocalProgrammaticToolCallingTool,
@@ -538,7 +539,12 @@ export function createLocalWriteFileTool(
         before = decoded.text;
         encoding = decoded;
         existed = true;
-      } catch {
+      } catch (error) {
+        // A stalled-RPC timeout is NOT "file absent" — treating it as such would
+        // overwrite an existing file with fresh content. Surface it instead.
+        if (isWorkspaceClientTimeoutError(error)) {
+          throw error;
+        }
         existed = false;
       }
 

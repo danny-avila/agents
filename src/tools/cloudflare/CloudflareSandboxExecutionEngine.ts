@@ -5,6 +5,7 @@ import type { WriteFileOptions, MakeDirectoryOptions, Stats } from 'fs';
 import type { ChildProcessWithoutNullStreams } from 'child_process';
 import type { FileHandle } from 'fs/promises';
 import type { WorkspaceFS, ReaddirEntry } from '@/tools/local/workspaceFS';
+import { WorkspaceClientTimeoutError } from '@/tools/local/workspaceFS';
 import type * as t from '@/types';
 import {
   LOCAL_SPAWN_TIMEOUT_MS,
@@ -200,8 +201,8 @@ export async function withClientTimeout<T>(
           // only then abort a signal-aware exec, whose resulting AbortError must
           // not surface to the caller instead of the timeout.
           reject(
-            new Error(
-              `${label} exceeded ${timeoutMs}ms client-side timeout (sandbox exec did not return)`
+            new WorkspaceClientTimeoutError(
+              `${label} exceeded ${timeoutMs}ms client-side timeout (sandbox RPC did not return)`
             )
           );
           options.onTimeout?.();
@@ -460,11 +461,15 @@ export function createCloudflareWorkspaceFS(
     readFile: (async (filePath: string, encoding?: 'utf8') => {
       const sandbox = await resolveCloudflareSandbox(config);
       const resolved = toSandboxPath(filePath, workspaceRoot);
-      const buffer = await normalizeReadFileContent(
-        await bound(
-          sandbox.readFile(resolved, encoding ? { encoding } : undefined),
-          'readFile'
-        )
+      // Wrap the stream drain (normalizeReadFileContent) inside the backstop too:
+      // a sandbox.readFile that resolves to a { content: ReadableStream } can
+      // still stall mid-drain after the RPC promise settled.
+      const buffer = await bound(
+        (async (): Promise<Buffer> =>
+          normalizeReadFileContent(
+            await sandbox.readFile(resolved, encoding ? { encoding } : undefined)
+          ))(),
+        'readFile'
       );
       return encoding != null ? buffer.toString(encoding) : buffer;
     }) as WorkspaceFS['readFile'],
@@ -506,8 +511,10 @@ export function createCloudflareWorkspaceFS(
         );
         return createStats({ size: entries.length, type: 'directory' });
       } catch {
-        const buffer = await normalizeReadFileContent(
-          await bound(sandbox.readFile(resolved), 'readFile')
+        const buffer = await bound(
+          (async (): Promise<Buffer> =>
+            normalizeReadFileContent(await sandbox.readFile(resolved)))(),
+          'readFile'
         );
         return createStats({ size: buffer.length, type: 'file' });
       }
@@ -547,8 +554,10 @@ export function createCloudflareWorkspaceFS(
     open: async (filePath: string, _flags: 'r') => {
       const sandbox = await resolveCloudflareSandbox(config);
       const resolved = toSandboxPath(filePath, workspaceRoot);
-      const buffer = await normalizeReadFileContent(
-        await bound(sandbox.readFile(resolved), 'readFile')
+      const buffer = await bound(
+        (async (): Promise<Buffer> =>
+          normalizeReadFileContent(await sandbox.readFile(resolved)))(),
+        'readFile'
       );
       return {
         read: async (
@@ -879,14 +888,21 @@ export async function executeCloudflareCode(
     input.args,
     ctx.shell
   );
-  await ctx.sandbox.mkdir(tempDir, { recursive: true });
+  // Bound the temp-dir setup RPCs too: these run BEFORE the bounded exec, so a
+  // native-DO stall here would hang the host await on a single mkdir/writeFile
+  // and burn the run budget before code-exec is ever reached.
+  await withClientTimeout(
+    ctx.sandbox.mkdir(tempDir, { recursive: true }),
+    clientFsTimeoutMs(ctx.timeoutMs),
+    'cloudflare sandbox mkdir'
+  );
   if (runtime.source != null) {
-    await ctx.sandbox.writeFile(
-      path.join(tempDir, runtime.fileName),
-      runtime.source,
-      {
+    await withClientTimeout(
+      ctx.sandbox.writeFile(path.join(tempDir, runtime.fileName), runtime.source, {
         encoding: 'utf8',
-      }
+      }),
+      clientFsTimeoutMs(ctx.timeoutMs),
+      'cloudflare sandbox writeFile'
     );
   }
   let execSucceeded = false;

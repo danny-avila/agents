@@ -1,7 +1,7 @@
 import { dirname } from 'path';
 import type { WorkspaceFS } from './workspaceFS';
 import type * as t from '@/types';
-import { nodeWorkspaceFS } from './workspaceFS';
+import { isWorkspaceClientTimeoutError, nodeWorkspaceFS } from './workspaceFS';
 
 type Snapshot = { kind: 'absent' } | { kind: 'present'; content: Buffer };
 
@@ -41,7 +41,12 @@ export class LocalFileCheckpointerImpl implements t.LocalFileCheckpointer {
     let info;
     try {
       info = await this.fs.stat(absolutePath);
-    } catch {
+    } catch (error) {
+      // A stalled-RPC timeout is NOT "file absent" — snapshotting it as absent
+      // would delete an existing file on revert. Surface it instead.
+      if (isWorkspaceClientTimeoutError(error)) {
+        throw error;
+      }
       this.snapshots.set(absolutePath, { kind: 'absent' });
       return;
     }

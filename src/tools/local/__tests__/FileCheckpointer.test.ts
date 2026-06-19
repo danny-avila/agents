@@ -3,6 +3,10 @@ import { join } from 'path';
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'fs/promises';
 import { describe, it, expect, beforeEach, afterEach } from '@jest/globals';
 import { LocalFileCheckpointerImpl } from '../FileCheckpointer';
+import {
+  WorkspaceClientTimeoutError,
+  type WorkspaceFS,
+} from '../workspaceFS';
 
 /**
  * Pins the LocalFileCheckpointer's per-Run snapshot/rewind contract.
@@ -61,6 +65,25 @@ describe('LocalFileCheckpointerImpl', () => {
     const restored = await cp.rewind();
     expect(restored).toBe(1);
     await expect(stat(file)).rejects.toThrow();
+  });
+
+  it('rethrows a client-timeout from stat instead of snapshotting as absent', async () => {
+    // A stalled stat() must NOT be recorded as "absent" — that would delete an
+    // existing file on rewind. The timeout has to surface.
+    const fs = {
+      stat: async () => {
+        throw new WorkspaceClientTimeoutError(
+          'cloudflare sandbox listFiles exceeded 6000ms client-side timeout'
+        );
+      },
+    } as unknown as WorkspaceFS;
+    const cp = new LocalFileCheckpointerImpl(32 * 1024 * 1024, fs);
+
+    await expect(cp.captureBeforeWrite('/workspace/a.txt')).rejects.toThrow(
+      /client-side timeout/
+    );
+    // Nothing was snapshotted, so rewind is a no-op (no spurious deletion).
+    expect(await cp.rewind()).toBe(0);
   });
 
   it('rewinds across multiple files in a single pass', async () => {
