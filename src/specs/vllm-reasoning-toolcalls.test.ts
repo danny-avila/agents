@@ -205,6 +205,7 @@ describe('custom OpenAI-compatible endpoint (vLLM reasoning + qwen3_coder tool c
     const { aggregateContent } = createContentAggregator();
     const collectedUsage: UsageMetadata[] = [];
     const runSteps: t.RunStep[] = [];
+    const streamedToolArgs: string[] = [];
 
     const run = await Run.create<t.IState>({
       runId: 'vllm-tool-calls',
@@ -225,6 +226,25 @@ describe('custom OpenAI-compatible endpoint (vLLM reasoning + qwen3_coder tool c
           ): void => {
             runSteps.push(data as t.RunStep);
             aggregateContent({ event, data: data as t.RunStep });
+          },
+        },
+        [GraphEvents.ON_RUN_STEP_DELTA]: {
+          handle: (
+            _event: GraphEvents.ON_RUN_STEP_DELTA,
+            data: t.StreamEventData
+          ): void => {
+            const { delta } = data as t.RunStepDeltaEvent;
+            if (
+              delta.type !== StepTypes.TOOL_CALLS ||
+              delta.tool_calls == null
+            ) {
+              return;
+            }
+            for (const toolCallDelta of delta.tool_calls) {
+              if (typeof toolCallDelta.args === 'string') {
+                streamedToolArgs.push(toolCallDelta.args);
+              }
+            }
           },
         },
         [GraphEvents.ON_RUN_STEP_COMPLETED]: {
@@ -312,6 +332,7 @@ describe('custom OpenAI-compatible endpoint (vLLM reasoning + qwen3_coder tool c
 
     expect(modelCall).toBe(2);
     expect(toolCallStepNames).toContain('get_weather');
+    expect(streamedToolArgs.join('')).toBe('{"location": "Berlin"}');
     expect(weatherArgs).toEqual({ location: 'Berlin' });
     expect(messages.some((message) => message.getType() === 'tool')).toBe(true);
     expect(finalAnswer).toContain('Das Wetter in Berlin ist sonnig.');
