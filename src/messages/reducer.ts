@@ -46,12 +46,16 @@ export function messagesStateReducer(
   const leftArray = Array.isArray(left) ? left : [left];
   const rightArray = Array.isArray(right) ? right : [right];
   // coerce to message
-  const leftMessages = (leftArray as BaseMessageLike[]).map(
-    coerceMessageLikeToMessage
-  );
-  const rightMessages = (rightArray as BaseMessageLike[]).map(
-    coerceMessageLikeToMessage
-  );
+  // Filter out null/undefined entries before coercion: providers can emit
+  // empty/partial stream chunks that arrive as `undefined`, and
+  // coerceMessageLikeToMessage throws "Cannot read properties of undefined
+  // (reading 'role')", crashing the run. Refs LibreChat Discussion #12284.
+  const leftMessages = (leftArray as BaseMessageLike[])
+    .filter((m) => m != null)
+    .map(coerceMessageLikeToMessage);
+  const rightMessages = (rightArray as BaseMessageLike[])
+    .filter((m) => m != null)
+    .map(coerceMessageLikeToMessage);
   // assign missing ids
   for (const m of leftMessages) {
     if (m.id === null || m.id === undefined) {
