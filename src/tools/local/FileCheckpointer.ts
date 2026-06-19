@@ -1,7 +1,7 @@
 import { dirname } from 'path';
 import type { WorkspaceFS } from './workspaceFS';
 import type * as t from '@/types';
-import { nodeWorkspaceFS } from './workspaceFS';
+import { isWorkspaceClientTimeoutError, nodeWorkspaceFS } from './workspaceFS';
 
 type Snapshot = { kind: 'absent' } | { kind: 'present'; content: Buffer };
 
@@ -41,7 +41,12 @@ export class LocalFileCheckpointerImpl implements t.LocalFileCheckpointer {
     let info;
     try {
       info = await this.fs.stat(absolutePath);
-    } catch {
+    } catch (error) {
+      // A stalled-RPC timeout is NOT "file absent" — snapshotting it as absent
+      // would delete an existing file on revert. Surface it instead.
+      if (isWorkspaceClientTimeoutError(error)) {
+        throw error;
+      }
       this.snapshots.set(absolutePath, { kind: 'absent' });
       return;
     }
@@ -60,7 +65,14 @@ export class LocalFileCheckpointerImpl implements t.LocalFileCheckpointer {
     let restored = 0;
     for (const [path, snapshot] of this.snapshots.entries()) {
       if (snapshot.kind === 'absent') {
-        await this.fs.unlink(path).catch(() => undefined);
+        await this.fs.unlink(path).catch((error) => {
+          // A timed-out delete did NOT happen — surface it rather than counting
+          // the path as restored (which would falsely claim the workspace is
+          // back to its pre-write state).
+          if (isWorkspaceClientTimeoutError(error)) {
+            throw error;
+          }
+        });
         restored++;
         continue;
       }
@@ -68,7 +80,11 @@ export class LocalFileCheckpointerImpl implements t.LocalFileCheckpointer {
         await this.fs.mkdir(dirname(path), { recursive: true });
         await this.fs.writeFile(path, snapshot.content);
         restored++;
-      } catch {
+      } catch (error) {
+        // A timed-out restore left the bad write in place — surface it.
+        if (isWorkspaceClientTimeoutError(error)) {
+          throw error;
+        }
         // Best-effort: ignore individual restore failures so the rest
         // of the rewind continues.
       }

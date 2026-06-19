@@ -18,6 +18,7 @@
 
 import { extname } from 'path';
 import type * as t from '@/types';
+import { isWorkspaceClientTimeoutError } from './workspaceFS';
 import {
   getSpawn,
   getWorkspaceFS,
@@ -168,7 +169,13 @@ const jsonCheck: SyntaxChecker = async (path, config) => {
   // file → catch returns undefined → ok: true) or read a different
   // file with the same absolute path. Codex P1 #24.
   const fs = getWorkspaceFS(config);
-  const raw = await fs.readFile(path, 'utf8').catch(() => undefined);
+  const raw = await fs.readFile(path, 'utf8').catch((error) => {
+    // A stalled read must not pass the syntax gate as ok:true — surface it.
+    if (isWorkspaceClientTimeoutError(error)) {
+      throw error;
+    }
+    return undefined;
+  });
   if (raw == null) return { ok: true };
   try {
     JSON.parse(raw);
@@ -237,7 +244,12 @@ export async function runPostEditSyntaxCheck(
       };
     }
     return result;
-  } catch {
+  } catch (error) {
+    // Don't swallow a stalled-RPC timeout as "no checker outcome" (which would
+    // let the write through without a real syntax gate) — surface it.
+    if (isWorkspaceClientTimeoutError(error)) {
+      throw error;
+    }
     return null;
   }
 }

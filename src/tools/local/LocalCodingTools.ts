@@ -3,6 +3,7 @@ import { createTwoFilesPatch } from 'diff';
 import { tool } from '@langchain/core/tools';
 import type { DynamicStructuredTool } from '@langchain/core/tools';
 import type * as t from '@/types';
+import { isWorkspaceClientTimeoutError } from './workspaceFS';
 import {
   createLocalBashProgrammaticToolCallingTool,
   createLocalProgrammaticToolCallingTool,
@@ -294,8 +295,14 @@ async function revertStrictWrite(
     } else {
       await fs.unlink(path);
     }
-  } catch {
-    /* best-effort: caller still sees the original syntax error */
+  } catch (error) {
+    // A timed-out revert leaves the rejected write on disk — the caller would
+    // otherwise claim "reverted to pre-write state" while the bad bytes remain.
+    // Surface it; for other failures stay best-effort (caller sees the original
+    // syntax error).
+    if (isWorkspaceClientTimeoutError(error)) {
+      throw error;
+    }
   }
 }
 
@@ -538,7 +545,12 @@ export function createLocalWriteFileTool(
         before = decoded.text;
         encoding = decoded;
         existed = true;
-      } catch {
+      } catch (error) {
+        // A stalled-RPC timeout is NOT "file absent" — treating it as such would
+        // overwrite an existing file with fresh content. Surface it instead.
+        if (isWorkspaceClientTimeoutError(error)) {
+          throw error;
+        }
         existed = false;
       }
 
@@ -546,7 +558,21 @@ export function createLocalWriteFileTool(
       const finalText = encodeFile(input.content, encoding);
       await fs.writeFile(path, finalText, 'utf8');
 
-      const syntax = await maybeRunSyntaxCheck(path, config);
+      let syntax;
+      try {
+        syntax = await maybeRunSyntaxCheck(path, config);
+      } catch (error) {
+        // A validation-read timeout must still honor strict mode's revert
+        // contract: restore the pre-write state before surfacing (best-effort —
+        // the revert may itself time out on the same stalled container).
+        if (
+          isWorkspaceClientTimeoutError(error) &&
+          config.postEditSyntaxCheck === 'strict'
+        ) {
+          await revertStrictWrite(fs, path, existed, before, encoding);
+        }
+        throw error;
+      }
 
       const diff = existed
         ? summariseDiff(path, before, input.content)
@@ -642,7 +668,20 @@ export function createLocalEditFileTool(
       const finalText = encodeFile(next, encoding);
       await fs.writeFile(path, finalText, 'utf8');
 
-      const syntax = await maybeRunSyntaxCheck(path, config);
+      let syntax;
+      try {
+        syntax = await maybeRunSyntaxCheck(path, config);
+      } catch (error) {
+        // As in write_file: a validation-read timeout still triggers strict
+        // mode's revert (edit_file always operates on an existing file).
+        if (
+          isWorkspaceClientTimeoutError(error) &&
+          config.postEditSyntaxCheck === 'strict'
+        ) {
+          await revertStrictWrite(fs, path, true, original, encoding);
+        }
+        throw error;
+      }
 
       const diff = summariseDiff(path, original, next);
       const fuzzy = strategiesUsed.some((s) => s !== 'exact');
@@ -826,7 +865,12 @@ async function* walkFiles(
     let entries;
     try {
       entries = await fs.readdir(dir, { withFileTypes: true });
-    } catch {
+    } catch (error) {
+      // A stalled-RPC timeout must surface, not be silently skipped as an
+      // unreadable directory — that would corrupt search results ("no matches").
+      if (isWorkspaceClientTimeoutError(error)) {
+        throw error;
+      }
       continue;
     }
     for (const entry of entries) {
@@ -1009,7 +1053,12 @@ async function fallbackGrep(
     let stat;
     try {
       stat = await fs.stat(file);
-    } catch {
+    } catch (error) {
+      // A stalled-RPC timeout must surface, not be skipped — skipping a file can
+      // report "no matches" even when the (unreadable-due-to-stall) file matched.
+      if (isWorkspaceClientTimeoutError(error)) {
+        throw error;
+      }
       continue;
     }
     if (stat.size > FALLBACK_GREP_MAX_FILE_BYTES) {
@@ -1021,7 +1070,11 @@ async function fallbackGrep(
     let content;
     try {
       content = await fs.readFile(file, 'utf8');
-    } catch {
+    } catch (error) {
+      // As above: a client-timeout means a stalled read, not an unreadable file.
+      if (isWorkspaceClientTimeoutError(error)) {
+        throw error;
+      }
       continue;
     }
     if (content.includes('\0')) {
