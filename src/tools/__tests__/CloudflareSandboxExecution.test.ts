@@ -454,6 +454,39 @@ describe('Cloudflare sandbox execution backend', () => {
     }
   });
 
+  it('rethrows a stat directory-probe timeout instead of falling through to readFile', async () => {
+    // findChildInfo returns nothing -> the directory probe (listFiles) runs; if it
+    // STALLS it must surface, not fall through to the readFile branch (which would
+    // burn a SECOND full backstop, ~2x the timeout, before the caller sees it).
+    jest.useFakeTimers();
+    try {
+      let readFileCalls = 0;
+      const fs = createCloudflareWorkspaceFS({
+        workspaceRoot: '/workspace',
+        timeoutMs: 1000,
+        sandbox: createRuntime({
+          listFiles: (dir) =>
+            dir === '/workspace/probe-me'
+              ? new Promise(() => undefined) // the probe stalls
+              : Promise.resolve([]), // findChildInfo's parent listing returns fast
+          readFile: () => {
+            readFileCalls += 1;
+            return Promise.resolve('');
+          },
+        }),
+      });
+
+      const error = fs.stat('/workspace/probe-me').catch((e: unknown) => e);
+      await jest.advanceTimersByTimeAsync(6500);
+      const settled = await error;
+      expect(isWorkspaceClientTimeoutError(settled)).toBe(true);
+      // Must NOT have fallen through to the readFile probe.
+      expect(readFileCalls).toBe(0);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   it('bounds execute_code temp-dir setup RPCs (mkdir/writeFile) that stall', async () => {
     jest.useFakeTimers();
     try {

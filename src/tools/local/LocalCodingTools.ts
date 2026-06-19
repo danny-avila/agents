@@ -832,7 +832,12 @@ async function* walkFiles(
     let entries;
     try {
       entries = await fs.readdir(dir, { withFileTypes: true });
-    } catch {
+    } catch (error) {
+      // A stalled-RPC timeout must surface, not be silently skipped as an
+      // unreadable directory — that would corrupt search results ("no matches").
+      if (isWorkspaceClientTimeoutError(error)) {
+        throw error;
+      }
       continue;
     }
     for (const entry of entries) {
@@ -1015,7 +1020,12 @@ async function fallbackGrep(
     let stat;
     try {
       stat = await fs.stat(file);
-    } catch {
+    } catch (error) {
+      // A stalled-RPC timeout must surface, not be skipped — skipping a file can
+      // report "no matches" even when the (unreadable-due-to-stall) file matched.
+      if (isWorkspaceClientTimeoutError(error)) {
+        throw error;
+      }
       continue;
     }
     if (stat.size > FALLBACK_GREP_MAX_FILE_BYTES) {
@@ -1027,7 +1037,11 @@ async function fallbackGrep(
     let content;
     try {
       content = await fs.readFile(file, 'utf8');
-    } catch {
+    } catch (error) {
+      // As above: a client-timeout means a stalled read, not an unreadable file.
+      if (isWorkspaceClientTimeoutError(error)) {
+        throw error;
+      }
       continue;
     }
     if (content.includes('\0')) {

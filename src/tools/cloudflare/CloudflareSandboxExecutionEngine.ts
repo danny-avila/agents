@@ -5,7 +5,10 @@ import type { WriteFileOptions, MakeDirectoryOptions, Stats } from 'fs';
 import type { ChildProcessWithoutNullStreams } from 'child_process';
 import type { FileHandle } from 'fs/promises';
 import type { WorkspaceFS, ReaddirEntry } from '@/tools/local/workspaceFS';
-import { WorkspaceClientTimeoutError } from '@/tools/local/workspaceFS';
+import {
+  WorkspaceClientTimeoutError,
+  isWorkspaceClientTimeoutError,
+} from '@/tools/local/workspaceFS';
 import type * as t from '@/types';
 import {
   LOCAL_SPAWN_TIMEOUT_MS,
@@ -510,7 +513,13 @@ export function createCloudflareWorkspaceFS(
           )
         );
         return createStats({ size: entries.length, type: 'directory' });
-      } catch {
+      } catch (error) {
+        // A directory-probe timeout is a stalled container, not "not a directory".
+        // Don't fall through to the readFile branch — that would wait through a
+        // SECOND full backstop (~2x the timeout) before surfacing.
+        if (isWorkspaceClientTimeoutError(error)) {
+          throw error;
+        }
         const buffer = await bound(
           (async (): Promise<Buffer> =>
             normalizeReadFileContent(await sandbox.readFile(resolved)))(),
