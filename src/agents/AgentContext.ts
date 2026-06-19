@@ -846,6 +846,8 @@ export class AgentContext {
     const bedrockOptions = this.clientOptions as
       | t.BedrockAnthropicClientOptions
       | undefined;
+    // Nova accepts system/message cachePoints (only the tool checkpoint is
+    // Claude-only), so this is gated on promptCache alone.
     return bedrockOptions?.promptCache === true;
   }
 

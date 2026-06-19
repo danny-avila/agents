@@ -375,6 +375,7 @@ describe('CustomChatBedrockConverse', () => {
     test('adds a Bedrock cache point for directly-bound tools', () => {
       const model = new CustomChatBedrockConverse({
         ...baseConstructorArgs,
+        model: 'anthropic.claude-3-haiku-20240307-v1:0',
         promptCache: true,
       });
 
@@ -400,6 +401,7 @@ describe('CustomChatBedrockConverse', () => {
     test('defaults the tool cache point to the 1h extended TTL', () => {
       const model = new CustomChatBedrockConverse({
         ...baseConstructorArgs,
+        model: 'anthropic.claude-3-haiku-20240307-v1:0',
         promptCache: true,
       });
 
@@ -430,6 +432,7 @@ describe('CustomChatBedrockConverse', () => {
     test('honors an explicit 5m promptCacheTtl on the tool cache point', () => {
       const model = new CustomChatBedrockConverse({
         ...baseConstructorArgs,
+        model: 'anthropic.claude-3-haiku-20240307-v1:0',
         promptCache: true,
         promptCacheTtl: '5m',
       });
@@ -461,6 +464,7 @@ describe('CustomChatBedrockConverse', () => {
     test('adds the Bedrock cache point before deferred tools', () => {
       const model = new CustomChatBedrockConverse({
         ...baseConstructorArgs,
+        model: 'anthropic.claude-3-haiku-20240307-v1:0',
         promptCache: true,
       });
       const tools = partitionAndMarkBedrockToolCache(
@@ -500,6 +504,7 @@ describe('CustomChatBedrockConverse', () => {
     test('does not fall back to caching when Graph marks all tools deferred', () => {
       const model = new CustomChatBedrockConverse({
         ...baseConstructorArgs,
+        model: 'anthropic.claude-3-haiku-20240307-v1:0',
         promptCache: true,
       });
       const tools = partitionAndMarkBedrockToolCache(
@@ -524,6 +529,69 @@ describe('CustomChatBedrockConverse', () => {
       expect(JSON.stringify(params.toolConfig?.tools)).not.toContain(
         '__lc_bedrock_skip_tool_cache'
       );
+    });
+
+    test('does not add a tool cache point for Amazon Nova models', () => {
+      // Regression for danny-avila/LibreChat#13838: Nova rejects a cachePoint in
+      // toolConfig.tools ("Malformed input request: #/toolConfig/tools/0:
+      // extraneous key [cachePoint] is not permitted"). Only the tool checkpoint
+      // is Claude-only — Nova still caches system/messages — so promptCache: true
+      // on Nova must omit just the tool cache point.
+      const model = new CustomChatBedrockConverse({
+        ...baseConstructorArgs,
+        model: 'us.amazon.nova-pro-v1:0',
+        promptCache: true,
+      });
+
+      const params = model.invocationParams({
+        tools: [
+          {
+            type: 'function',
+            function: {
+              name: 'direct_tool',
+              description: 'Direct tool',
+              parameters: { type: 'object', properties: {} },
+            },
+          },
+        ],
+      });
+
+      expect(getBedrockToolNames(params.toolConfig?.tools)).toEqual([
+        'direct_tool',
+      ]);
+      expect(JSON.stringify(params.toolConfig?.tools ?? [])).not.toContain(
+        'cachePoint'
+      );
+    });
+
+    test('still adds a tool cache point for a Claude model behind an inference profile', () => {
+      // The configured Claude model id is captured at construction, so the gate
+      // survives the application-inference-profile ARN swap during generation.
+      const model = new CustomChatBedrockConverse({
+        ...baseConstructorArgs,
+        model: 'anthropic.claude-sonnet-4-5-20250929-v1:0',
+        applicationInferenceProfile:
+          'arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/test',
+        promptCache: true,
+      });
+
+      const params = model.invocationParams({
+        tools: [
+          {
+            type: 'function',
+            function: {
+              name: 'direct_tool',
+              description: 'Direct tool',
+              parameters: { type: 'object', properties: {} },
+            },
+          },
+        ],
+      });
+
+      expect(getBedrockToolNames(params.toolConfig?.tools)).toEqual([
+        'direct_tool',
+        'cachePoint',
+      ]);
     });
   });
 

@@ -19,6 +19,7 @@ import {
   buildAnthropicCacheControl,
   buildBedrockCachePoint,
   resolvePromptCacheTtl,
+  supportsBedrockToolCache,
   DEFAULT_PROMPT_CACHE_TTL,
 } from './cache';
 import { _convertMessagesToOpenAIParams } from '@/llm/openai/utils';
@@ -892,6 +893,36 @@ describe('synthetic skill/meta messages are not cache-anchored', () => {
 
     expect(hasAnthropicMarker(result[2])).toBe(false);
     expect(hasAnthropicMarker(result[0])).toBe(true);
+  });
+});
+
+describe('supportsBedrockToolCache', () => {
+  test('returns true for Claude model ids (incl. cross-region + profile)', () => {
+    expect(
+      supportsBedrockToolCache('anthropic.claude-3-5-sonnet-20241022-v2:0')
+    ).toBe(true);
+    expect(
+      supportsBedrockToolCache('us.anthropic.claude-sonnet-4-5-20250929-v1:0')
+    ).toBe(true);
+    expect(supportsBedrockToolCache('anthropic.claude-opus-4-6-v1')).toBe(true);
+  });
+
+  test('returns false for Nova and other non-Claude families (tool cache only)', () => {
+    // Nova accepts system/message cachePoints but rejects the tool checkpoint.
+    expect(supportsBedrockToolCache('us.amazon.nova-pro-v1:0')).toBe(false);
+    expect(supportsBedrockToolCache('amazon.nova-lite-v1:0')).toBe(false);
+    expect(supportsBedrockToolCache('meta.llama3-1-70b-instruct-v1:0')).toBe(
+      false
+    );
+    expect(supportsBedrockToolCache('mistral.mistral-large-2407-v1:0')).toBe(
+      false
+    );
+  });
+
+  test('returns false for empty / missing model', () => {
+    expect(supportsBedrockToolCache('')).toBe(false);
+    expect(supportsBedrockToolCache(undefined)).toBe(false);
+    expect(supportsBedrockToolCache(null)).toBe(false);
   });
 });
 

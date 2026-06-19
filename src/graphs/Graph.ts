@@ -28,6 +28,7 @@ import {
   syncBudgetDerivedFields,
   addTailCacheControl,
   resolvePromptCacheTtl,
+  supportsBedrockToolCache,
   getMessageId,
   makeIsDeferred,
   partitionAndMarkAnthropicToolCache,
@@ -1440,7 +1441,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           agentContext.clientOptions as
             | t.BedrockAnthropicClientOptions
             | undefined
-        )?.promptCache === true
+        )?.promptCache === true &&
+        supportsBedrockToolCache(
+          (agentContext.clientOptions as { model?: string } | undefined)?.model
+        )
       ) {
         toolsForBinding =
           partitionAndMarkBedrockToolCache(
@@ -1790,6 +1794,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             | t.ProviderOptionsMap[Providers.OPENROUTER]
             | undefined
         )?.promptCache === true;
+      // Message/system cache points work on all cache-capable Bedrock models,
+      // including Nova (verified live: HTTP 200 with cacheWriteInputTokens). Only
+      // the tool checkpoint is Claude-only, so this is gated on promptCache alone.
       const bedrockPromptCacheEnabled =
         agentContext.provider === Providers.BEDROCK &&
         (

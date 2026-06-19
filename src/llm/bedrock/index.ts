@@ -39,7 +39,11 @@ import {
   handleConverseStreamContentBlockDelta,
   handleConverseStreamMetadata,
 } from './utils';
-import { resolvePromptCacheTtl, type PromptCacheTtl } from '@/messages/cache';
+import {
+  resolvePromptCacheTtl,
+  supportsBedrockToolCache,
+  type PromptCacheTtl,
+} from '@/messages/cache';
 import { insertBedrockToolCachePoint } from './toolCache';
 
 /**
@@ -134,12 +138,21 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
    */
   serviceTier?: ServiceTierType;
 
+  /**
+   * The configured model id, captured at construction so it survives the
+   * temporary `this.model` swap to an application-inference-profile ARN during
+   * generation. Used to gate the Bedrock tool cache point to Claude models
+   * (see {@link supportsBedrockToolCache}).
+   */
+  private readonly cacheModelId: string;
+
   constructor(fields?: CustomChatBedrockConverseInput) {
     super(fields);
     this.promptCache = fields?.promptCache;
     this.promptCacheTtl = fields?.promptCacheTtl;
     this.applicationInferenceProfile = fields?.applicationInferenceProfile;
     this.serviceTier = fields?.serviceTier;
+    this.cacheModelId = fields?.model ?? '';
   }
 
   static lc_name(): string {
@@ -164,7 +177,7 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
   } {
     const baseParams = super.invocationParams(options);
     const toolConfig =
-      this.promptCache === true
+      this.promptCache === true && supportsBedrockToolCache(this.cacheModelId)
         ? insertBedrockToolCachePoint(
           baseParams.toolConfig,
           true,
