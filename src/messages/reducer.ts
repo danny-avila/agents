@@ -35,6 +35,26 @@ export type Messages =
   | BaseMessageLike;
 
 /**
+ * Coerce each entry to a {@link BaseMessage} in a single pass, skipping
+ * null/undefined entries. Providers can emit empty/partial stream chunks that
+ * arrive as `undefined`; passing those to `coerceMessageLikeToMessage` throws
+ * "Cannot read properties of undefined (reading 'role')" and crashes the run.
+ * Folding the null check into the coercion loop avoids a second pass over the
+ * array. Refs LibreChat Discussion #12284.
+ */
+function coerceMessages(
+  messages: ReadonlyArray<BaseMessageLike | null | undefined>
+): BaseMessage[] {
+  const coerced: BaseMessage[] = [];
+  for (const message of messages) {
+    if (message != null) {
+      coerced.push(coerceMessageLikeToMessage(message));
+    }
+  }
+  return coerced;
+}
+
+/**
  * Prebuilt reducer that combines returned messages.
  * Can handle standard messages and special modifiers like {@link RemoveMessage}
  * instances.
@@ -45,17 +65,9 @@ export function messagesStateReducer(
 ): BaseMessage[] {
   const leftArray = Array.isArray(left) ? left : [left];
   const rightArray = Array.isArray(right) ? right : [right];
-  // coerce to message
-  // Filter out null/undefined entries before coercion: providers can emit
-  // empty/partial stream chunks that arrive as `undefined`, and
-  // coerceMessageLikeToMessage throws "Cannot read properties of undefined
-  // (reading 'role')", crashing the run. Refs LibreChat Discussion #12284.
-  const leftMessages = (leftArray as BaseMessageLike[])
-    .filter((m) => m != null)
-    .map(coerceMessageLikeToMessage);
-  const rightMessages = (rightArray as BaseMessageLike[])
-    .filter((m) => m != null)
-    .map(coerceMessageLikeToMessage);
+  // coerce to message, skipping null/undefined entries in the same pass
+  const leftMessages = coerceMessages(leftArray as BaseMessageLike[]);
+  const rightMessages = coerceMessages(rightArray as BaseMessageLike[]);
   // assign missing ids
   for (const m of leftMessages) {
     if (m.id === null || m.id === undefined) {
