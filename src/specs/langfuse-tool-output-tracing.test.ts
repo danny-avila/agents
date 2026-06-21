@@ -1,15 +1,26 @@
+import { context } from '@opentelemetry/api';
 import { LangfuseOtelSpanAttributes } from '@langfuse/tracing';
 import { AIMessage, ToolMessage, HumanMessage } from '@langchain/core/messages';
 import type { ReadableSpan } from '@opentelemetry/sdk-trace-base';
 import type { BaseMessage } from '@langchain/core/messages';
+import type { Context } from '@opentelemetry/api';
 import type { TPayload } from '@/types';
 import {
   LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT,
   redactLangfuseSpanToolOutputs,
-  resolveLangfuseConfig,
   shouldTraceToolNodeForLangfuse,
-  type ResolvedLangfuseToolOutputTracingConfig,
 } from '@/langfuseToolOutputTracing';
+import {
+  resolveLangfuseConfigForSpan,
+  resolveToolOutputTracingConfigForSpan,
+  withLangfuseRuntimeScope,
+} from '@/langfuseRuntimeScope';
+import {
+  runWithLangfuseRuntimeContext,
+  type ResolvedLangfuseToolOutputTracingConfig,
+} from '@/langfuseRuntimeContext';
+import { ensureOpenTelemetryContextManager } from '@/instrumentation';
+import { resolveLangfuseConfig } from '@/langfuseConfig';
 import { formatAgentMessages } from '@/messages/format';
 import { ContentTypes } from '@/common';
 
@@ -618,5 +629,93 @@ describe('Langfuse tool output tracing redaction', () => {
         redactionText: '[redacted]',
       },
     });
+  });
+
+  it('keeps OTEL context fallback for spans outside callback runtime scope', () => {
+    ensureOpenTelemetryContextManager();
+    const langfuse = {
+      publicKey: 'pk-context',
+      secretKey: 'sk-context',
+      baseUrl: 'https://langfuse.context',
+    };
+    let capturedContext: Context | undefined;
+
+    withLangfuseRuntimeScope({ langfuse }, () => {
+      capturedContext = context.active();
+    });
+
+    expect(capturedContext).toBeDefined();
+    expect(resolveLangfuseConfigForSpan(capturedContext!)).toBe(langfuse);
+  });
+
+  it('keeps OTEL tool-output fallback for spans outside callback runtime scope', () => {
+    ensureOpenTelemetryContextManager();
+    let capturedContext: Context | undefined;
+
+    withLangfuseRuntimeScope(
+      { toolOutputTracing: createConfig({ enabled: false }) },
+      () => {
+        capturedContext = context.active();
+      }
+    );
+
+    expect(capturedContext).toBeDefined();
+    expect(
+      resolveToolOutputTracingConfigForSpan(capturedContext!)
+    ).toMatchObject({
+      enabled: false,
+    });
+  });
+
+  it('prefers ALS runtime tenant config over OTEL fallback config', () => {
+    ensureOpenTelemetryContextManager();
+    const otelLangfuse = {
+      publicKey: 'pk-otel',
+      secretKey: 'sk-otel',
+      baseUrl: 'https://langfuse.otel',
+    };
+    const runtimeLangfuse = {
+      publicKey: 'pk-runtime',
+      secretKey: 'sk-runtime',
+      baseUrl: 'https://langfuse.runtime',
+    };
+    let capturedContext: Context | undefined;
+
+    withLangfuseRuntimeScope({ langfuse: otelLangfuse }, () => {
+      capturedContext = context.active();
+    });
+
+    runWithLangfuseRuntimeContext({ langfuse: runtimeLangfuse }, () => {
+      expect(resolveLangfuseConfigForSpan(capturedContext!)).toBe(
+        runtimeLangfuse
+      );
+    });
+  });
+
+  it('prefers ALS runtime tool-output config over OTEL fallback config', () => {
+    ensureOpenTelemetryContextManager();
+    const runtimeToolOutputTracing = {
+      enabled: false,
+      redactedToolNames: new Set(['runtime_tool']),
+      redactedToolNameMatchMode: 'exact' as const,
+      redactionText: '[runtime]',
+    };
+    let capturedContext: Context | undefined;
+
+    withLangfuseRuntimeScope(
+      { toolOutputTracing: createConfig({ enabled: true }) },
+      () => {
+        capturedContext = context.active();
+      }
+    );
+
+    runWithLangfuseRuntimeContext(
+      { toolOutputTracing: runtimeToolOutputTracing },
+      () => {
+        expect(resolveToolOutputTracingConfigForSpan(capturedContext!)).toBe(
+          runtimeToolOutputTracing
+        );
+      }
+    );
   });
 });

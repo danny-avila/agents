@@ -1,6 +1,4 @@
-import { AsyncLocalStorage } from 'node:async_hooks';
 import { LangfuseSpanProcessor } from '@langfuse/otel';
-import { context, createContextKey } from '@opentelemetry/api';
 import { LangfuseOtelSpanAttributes } from '@langfuse/tracing';
 import type {
   ReadableSpan,
@@ -9,17 +7,18 @@ import type {
 } from '@opentelemetry/sdk-trace-base';
 import type { LangfuseSpanProcessorParams } from '@langfuse/otel';
 import type { Context } from '@opentelemetry/api';
+import type { ResolvedLangfuseToolOutputTracingConfig } from '@/langfuseRuntimeContext';
 import type * as t from '@/types';
+import {
+  LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT,
+  normalizeToolName,
+  resolveLangfuseConfig,
+  resolveToolOutputTracingConfig,
+} from '@/langfuseConfig';
+import { resolveToolOutputTracingConfigForSpan } from '@/langfuseRuntimeScope';
 
-export const LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT = '[tool output redacted]';
+export { LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT, resolveLangfuseConfig };
 
-const langfuseToolOutputTracingConfigKey = createContextKey(
-  'librechat.langfuse.tool-output-tracing'
-);
-const langfuseConfigKey = createContextKey('librechat.langfuse.config');
-const toolOutputTracingStorage =
-  new AsyncLocalStorage<ResolvedLangfuseToolOutputTracingConfig>();
-const langfuseConfigStorage = new AsyncLocalStorage<t.LangfuseConfig>();
 const LANGGRAPH_TOOL_NODE_PREFIX = 'tools=';
 
 const CHAT_ROLES = new Set([
@@ -29,13 +28,6 @@ const CHAT_ROLES = new Set([
   'system',
   'user',
 ]);
-
-export type ResolvedLangfuseToolOutputTracingConfig = {
-  enabled: boolean;
-  redactedToolNames: Set<string>;
-  redactedToolNameMatchMode: 'exact' | 'partial';
-  redactionText: string;
-};
 
 type SpanWithAttributes = ReadableSpan & {
   attributes: Record<string, unknown>;
@@ -58,122 +50,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isPresent(value: unknown): value is string {
   return typeof value === 'string' && value.trim() !== '';
-}
-
-function parseBoolean(value: string | undefined): boolean | undefined {
-  if (value == null) {
-    return undefined;
-  }
-
-  const normalized = value.trim().toLowerCase();
-  if (['1', 'true', 'yes', 'on'].includes(normalized)) {
-    return true;
-  }
-  if (['0', 'false', 'no', 'off'].includes(normalized)) {
-    return false;
-  }
-
-  return undefined;
-}
-
-function normalizeToolName(name: string): string {
-  return name.trim().toLowerCase();
-}
-
-function normalizeToolNames(names: string[] | undefined): Set<string> {
-  const normalized = new Set<string>();
-  for (const name of names ?? []) {
-    if (isPresent(name)) {
-      normalized.add(normalizeToolName(name));
-    }
-  }
-  return normalized;
-}
-
-function parseToolNames(value: string | undefined): string[] | undefined {
-  if (!isPresent(value)) {
-    return undefined;
-  }
-
-  return value
-    .split(',')
-    .map((name) => name.trim())
-    .filter((name) => name !== '');
-}
-
-function getEnvToolOutputTracingEnabled(): boolean | undefined {
-  const traceToolOutputs = parseBoolean(
-    process.env.LANGFUSE_TRACE_TOOL_OUTPUTS
-  );
-  if (traceToolOutputs != null) {
-    return traceToolOutputs;
-  }
-
-  const redactToolOutputs = parseBoolean(
-    process.env.LANGFUSE_REDACT_TOOL_OUTPUTS
-  );
-  if (redactToolOutputs != null) {
-    return !redactToolOutputs;
-  }
-
-  return parseBoolean(process.env.LANGFUSE_TOOL_OUTPUT_TRACING_ENABLED);
-}
-
-function getEnvRedactedToolNames(): string[] | undefined {
-  return (
-    parseToolNames(process.env.LANGFUSE_REDACT_TOOL_OUTPUT_NAMES) ??
-    parseToolNames(process.env.LANGFUSE_REDACT_TOOL_NAMES)
-  );
-}
-
-function getEnvRedactionText(): string | undefined {
-  return isPresent(process.env.LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT)
-    ? process.env.LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT
-    : undefined;
-}
-
-function getEnvToolNameMatchMode(): 'exact' | 'partial' | undefined {
-  const mode = (
-    process.env.LANGFUSE_REDACT_TOOL_OUTPUT_NAME_MATCH_MODE ??
-    process.env.LANGFUSE_REDACT_TOOL_NAME_MATCH_MODE
-  )
-    ?.trim()
-    .toLowerCase();
-  if (mode === 'exact' || mode === 'partial') {
-    return mode;
-  }
-  return undefined;
-}
-
-function resolveToolOutputTracingConfig(
-  runLangfuse?: t.LangfuseConfig,
-  agentLangfuse?: t.LangfuseConfig
-): ResolvedLangfuseToolOutputTracingConfig {
-  const runConfig = runLangfuse?.toolOutputTracing;
-  const agentConfig = agentLangfuse?.toolOutputTracing;
-
-  return {
-    enabled:
-      agentConfig?.enabled ??
-      runConfig?.enabled ??
-      getEnvToolOutputTracingEnabled() ??
-      true,
-    redactedToolNames: normalizeToolNames(
-      agentConfig?.redactedToolNames ??
-        runConfig?.redactedToolNames ??
-        getEnvRedactedToolNames()
-    ),
-    redactedToolNameMatchMode:
-      agentConfig?.redactedToolNameMatchMode ??
-      runConfig?.redactedToolNameMatchMode ??
-      getEnvToolNameMatchMode() ??
-      'exact',
-    redactionText:
-      agentConfig?.redactionText ??
-      runConfig?.redactionText ??
-      getEnvRedactionText() ??
-      LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT,
-  };
 }
 
 function shouldApplyToolOutputRedaction(
@@ -509,32 +385,6 @@ export function redactLangfuseSpanToolOutputs(
   }
 }
 
-function getContextToolOutputTracingConfig(
-  activeContext: Context
-): ResolvedLangfuseToolOutputTracingConfig | undefined {
-  const asyncConfig = toolOutputTracingStorage.getStore();
-  if (asyncConfig != null) {
-    return asyncConfig;
-  }
-
-  const value = activeContext.getValue(langfuseToolOutputTracingConfigKey);
-  return isRecord(value)
-    ? (value as ResolvedLangfuseToolOutputTracingConfig)
-    : undefined;
-}
-
-export function getContextLangfuseConfig(
-  activeContext: Context
-): t.LangfuseConfig | undefined {
-  const asyncConfig = langfuseConfigStorage.getStore();
-  if (asyncConfig != null) {
-    return asyncConfig;
-  }
-
-  const value = activeContext.getValue(langfuseConfigKey);
-  return isRecord(value) ? (value as t.LangfuseConfig) : undefined;
-}
-
 class ToolOutputRedactingLangfuseSpanProcessor implements SpanProcessor {
   private readonly processor: LangfuseSpanProcessor;
   private readonly fallbackConfig?: ResolvedLangfuseToolOutputTracingConfig;
@@ -553,7 +403,8 @@ class ToolOutputRedactingLangfuseSpanProcessor implements SpanProcessor {
 
   onStart(span: Span, parentContext: Context): void {
     const config =
-      getContextToolOutputTracingConfig(parentContext) ?? this.fallbackConfig;
+      resolveToolOutputTracingConfigForSpan(parentContext) ??
+      this.fallbackConfig;
     if (config != null) {
       this.spanConfigs.set(span, config);
     }
@@ -561,12 +412,10 @@ class ToolOutputRedactingLangfuseSpanProcessor implements SpanProcessor {
   }
 
   onEnd(span: ReadableSpan): void {
-    const config =
-      this.spanConfigs.get(span) ??
-      toolOutputTracingStorage.getStore() ??
-      this.fallbackConfig ??
-      resolveToolOutputTracingConfig();
-    redactLangfuseSpanToolOutputs(span, config);
+    const config = this.spanConfigs.get(span) ?? this.fallbackConfig;
+    if (config != null) {
+      redactLangfuseSpanToolOutputs(span, config);
+    }
     this.processor.onEnd(span);
   }
 
@@ -589,45 +438,6 @@ export function createLangfuseSpanProcessor(
       ? resolveToolOutputTracingConfig(runLangfuse, agentLangfuse)
       : undefined;
   return new ToolOutputRedactingLangfuseSpanProcessor(params, fallbackConfig);
-}
-
-export function withLangfuseToolOutputTracingConfig<T>(
-  runLangfuse: t.LangfuseConfig | undefined,
-  action: () => T,
-  agentLangfuse?: t.LangfuseConfig
-): T {
-  const langfuse = resolveLangfuseConfig(runLangfuse, agentLangfuse);
-  const hasNoToolOutputConfig =
-    runLangfuse?.toolOutputTracing == null &&
-    agentLangfuse?.toolOutputTracing == null;
-
-  if (langfuse == null && hasNoToolOutputConfig) {
-    return action();
-  }
-
-  const config = hasNoToolOutputConfig
-    ? undefined
-    : resolveToolOutputTracingConfig(runLangfuse, agentLangfuse);
-  let activeContext = context.active();
-  if (langfuse != null) {
-    activeContext = activeContext.setValue(langfuseConfigKey, langfuse);
-  }
-  if (config != null) {
-    activeContext = activeContext.setValue(
-      langfuseToolOutputTracingConfigKey,
-      config
-    );
-  }
-
-  const runWithContext = (): T => context.with(activeContext, action);
-  const runWithToolOutputConfig = (): T =>
-    config != null
-      ? toolOutputTracingStorage.run(config, runWithContext)
-      : runWithContext();
-
-  return langfuse != null
-    ? langfuseConfigStorage.run(langfuse, runWithToolOutputConfig)
-    : runWithToolOutputConfig();
 }
 
 function hasLangfuseEnvKeys(): boolean {
@@ -664,57 +474,4 @@ export function shouldTraceToolNodeForLangfuse({
   }
 
   return hasLangfuseConfigKeys(langfuse) || hasLangfuseEnvKeys();
-}
-
-export function resolveLangfuseConfig(
-  runLangfuse?: t.LangfuseConfig,
-  agentLangfuse?: t.LangfuseConfig
-): t.LangfuseConfig | undefined {
-  if (runLangfuse == null) {
-    return agentLangfuse;
-  }
-  if (agentLangfuse == null) {
-    return runLangfuse;
-  }
-
-  const toolNodeTracing =
-    runLangfuse.toolNodeTracing != null || agentLangfuse.toolNodeTracing != null
-      ? {
-        ...runLangfuse.toolNodeTracing,
-        ...agentLangfuse.toolNodeTracing,
-      }
-      : undefined;
-  const toolOutputTracing =
-    runLangfuse.toolOutputTracing != null ||
-    agentLangfuse.toolOutputTracing != null
-      ? {
-        ...runLangfuse.toolOutputTracing,
-        ...agentLangfuse.toolOutputTracing,
-      }
-      : undefined;
-  const metadata =
-    runLangfuse.metadata != null || agentLangfuse.metadata != null
-      ? {
-        ...runLangfuse.metadata,
-        ...agentLangfuse.metadata,
-      }
-      : undefined;
-  const tags =
-    runLangfuse.tags != null || agentLangfuse.tags != null
-      ? [
-        ...new Set([
-          ...(runLangfuse.tags ?? []),
-          ...(agentLangfuse.tags ?? []),
-        ]),
-      ]
-      : undefined;
-
-  return {
-    ...runLangfuse,
-    ...agentLangfuse,
-    ...(metadata != null ? { metadata } : {}),
-    ...(tags != null ? { tags } : {}),
-    ...(toolNodeTracing != null ? { toolNodeTracing } : {}),
-    ...(toolOutputTracing != null ? { toolOutputTracing } : {}),
-  };
 }

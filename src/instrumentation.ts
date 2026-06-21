@@ -1,4 +1,3 @@
-import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomBytes } from 'node:crypto';
 import { setLangfuseTracerProvider } from '@langfuse/tracing';
 import { BasicTracerProvider } from '@opentelemetry/sdk-trace-base';
@@ -19,38 +18,27 @@ import {
   hasLangfuseEnvConfig,
 } from '@/langfuse';
 import {
-  createLangfuseSpanProcessor,
-  getContextLangfuseConfig,
-} from '@/langfuseToolOutputTracing';
+  resolveLangfuseConfigForSpan,
+  resolveTraceIdSeedForSpan,
+} from '@/langfuseRuntimeScope';
+import { createLangfuseSpanProcessor } from '@/langfuseToolOutputTracing';
+import { traceIdFromSeed } from '@/langfuseRuntimeContext';
 import { isPresent } from '@/utils/misc';
 
 /**
  * Per-run seed for deterministic Langfuse trace ids. When a run opts in
  * (`LangfuseConfig.deterministicTraceId`), it executes its stream inside
- * `runWithTraceIdSeed(runId, …)` and the IdGenerator below derives the root
- * trace id from that seed instead of a random one. This lets external systems
- * (e.g. a host app recording user feedback after the fact) attach scores or
- * observations to the trace by regenerating the same id from the run/message
- * id — no trace lookup required. With no active seed it falls back to random
- * ids, so default behavior is unchanged.
+ * `runWithTraceIdSeed(runId, ...)` from `./langfuseRuntimeContext`, and the
+ * IdGenerator below derives the root trace id from that seed instead of a
+ * random one. This lets external systems (e.g. a host app recording user
+ * feedback after the fact) attach scores or observations to the trace by
+ * regenerating the same id from the run/message id; no trace lookup required.
+ * With no active seed it falls back to random ids, so default behavior is
+ * unchanged.
  */
-const traceIdSeedStore = new AsyncLocalStorage<string>();
-
-export function runWithTraceIdSeed<T>(
-  seed: string | undefined,
-  fn: () => T
-): T {
-  return isPresent(seed) ? traceIdSeedStore.run(seed, fn) : fn();
-}
-
-/** sha256(seed) → first 32 hex chars; matches `@langfuse/tracing` `createTraceId`. */
-function traceIdFromSeed(seed: string): string {
-  return createHash('sha256').update(seed, 'utf8').digest('hex').slice(0, 32);
-}
-
 class SeededTraceIdGenerator implements IdGenerator {
   generateTraceId(): string {
-    const seed = traceIdSeedStore.getStore();
+    const seed = resolveTraceIdSeedForSpan(context.active());
     return isPresent(seed)
       ? traceIdFromSeed(seed)
       : randomBytes(16).toString('hex');
@@ -120,13 +108,19 @@ function getLangfuseSpanProcessorParams(
   return undefined;
 }
 
+function hashCacheKeyValue(value: string | undefined): string | undefined {
+  return isPresent(value)
+    ? createHash('sha256').update(value, 'utf8').digest('hex')
+    : undefined;
+}
+
 function getLangfuseTracerProviderKey(
   params: LangfuseSpanProcessorParams,
   langfuse?: t.LangfuseConfig
 ): string {
   return JSON.stringify({
     publicKey: params.publicKey,
-    secretKey: params.secretKey,
+    secretKeyHash: hashCacheKeyValue(params.secretKey),
     baseUrl: params.baseUrl,
     environment: params.environment,
     toolOutputTracing: langfuse?.toolOutputTracing,
@@ -134,6 +128,9 @@ function getLangfuseTracerProviderKey(
 }
 
 class RoutingLangfuseSpanProcessor implements SpanProcessor {
+  // Processors live for the process lifetime. LibreChat tenant Langfuse
+  // destinations are expected to be a bounded admin-managed set, and shutdown
+  // drains every cached processor when the provider is disposed.
   private readonly processors = new Map<string, SpanProcessor>();
   private readonly spanProcessors = new WeakMap<object, SpanProcessor>();
 
@@ -156,7 +153,7 @@ class RoutingLangfuseSpanProcessor implements SpanProcessor {
 
   onStart(span: Span, parentContext: Context): void {
     const processor = this.ensureProcessor(
-      getContextLangfuseConfig(parentContext)
+      resolveLangfuseConfigForSpan(parentContext)
     );
     if (processor == null) {
       return;

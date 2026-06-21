@@ -1,50 +1,105 @@
 import { HumanMessage } from '@langchain/core/messages';
 import { CallbackManager } from '@langchain/core/callbacks/manager';
+import { context as otelContext, trace as otelTrace } from '@opentelemetry/api';
 import type * as t from '@/types';
+import { traceIdFromSeed } from '@/langfuseRuntimeContext';
 import { Providers } from '@/common';
 import { Run } from '@/run';
 
-const mockSpan = {
-  end: jest.fn(),
-  spanContext: jest.fn(() => ({
-    traceId: 'trace-id',
-    spanId: 'span-id',
-    traceFlags: 1,
-  })),
-  setAttributes: jest.fn(),
-  setStatus: jest.fn(),
+const mockProcessorStarts: Array<{
+  params: unknown;
+  traceId: string;
+}> = [];
+let mockProviderInput:
+  | {
+      spanProcessors?: Array<{
+        onStart?: (span: unknown, parentContext: unknown) => void;
+        onEnd?: (span: unknown) => void;
+      }>;
+      idGenerator?: {
+        generateTraceId: () => string;
+        generateSpanId: () => string;
+      };
+    }
+  | undefined;
+
+const createMockSpan = (traceIdOverride?: string) => {
+  const traceId =
+    traceIdOverride ??
+    mockProviderInput?.idGenerator?.generateTraceId() ??
+    'trace-id';
+  const spanId = mockProviderInput?.idGenerator?.generateSpanId() ?? 'span-id';
+  const span = {
+    end: jest.fn(() => {
+      for (const processor of mockProviderInput?.spanProcessors ?? []) {
+        processor.onEnd?.(span);
+      }
+    }),
+    spanContext: jest.fn(() => ({
+      traceId,
+      spanId,
+      traceFlags: 1,
+    })),
+    setAttributes: jest.fn(),
+    setStatus: jest.fn(),
+    attributes: {},
+  };
+  for (const processor of mockProviderInput?.spanProcessors ?? []) {
+    processor.onStart?.(span, otelContext.active());
+  }
+  return span;
 };
-const mockStartSpan = jest.fn(() => mockSpan);
+
+const mockStartSpan = jest.fn(() => createMockSpan());
 const mockStartActiveSpan = jest.fn(
   (
     _name: string,
     _options: unknown,
-    _context: unknown,
-    callback: (span: typeof mockSpan) => unknown
-  ) => callback(mockSpan)
+    activeContext: Parameters<typeof otelTrace.getSpanContext>[0],
+    callback: (span: ReturnType<typeof createMockSpan>) => unknown
+  ) =>
+    callback(createMockSpan(otelTrace.getSpanContext(activeContext)?.traceId))
 );
 const mockForceFlush = jest.fn();
 const mockShutdown = jest.fn();
 
 jest.mock('@langfuse/otel', () => ({
-  LangfuseSpanProcessor: jest.fn().mockImplementation(() => ({})),
+  LangfuseSpanProcessor: jest.fn().mockImplementation((params) => ({
+    forceFlush: jest.fn(),
+    onEnd: jest.fn(),
+    onStart: jest.fn((span) => {
+      mockProcessorStarts.push({
+        params,
+        traceId: span.spanContext().traceId,
+      });
+    }),
+    shutdown: jest.fn(),
+  })),
   isDefaultExportSpan: jest.fn(() => false),
 }));
 
 jest.mock('@opentelemetry/sdk-trace-base', () => ({
-  BasicTracerProvider: jest.fn().mockImplementation(() => ({
-    forceFlush: mockForceFlush,
-    getTracer: jest.fn(() => ({
-      startActiveSpan: mockStartActiveSpan,
-      startSpan: mockStartSpan,
-    })),
-    shutdown: mockShutdown,
-  })),
+  BasicTracerProvider: jest.fn().mockImplementation((input) => {
+    mockProviderInput = input;
+    return {
+      forceFlush: mockForceFlush,
+      getTracer: jest.fn(() => ({
+        startActiveSpan: mockStartActiveSpan,
+        startSpan: mockStartSpan,
+      })),
+      shutdown: mockShutdown,
+    };
+  }),
 }));
 
 describe('Langfuse callback composition', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    mockProcessorStarts.length = 0;
+    delete process.env.LANGFUSE_PUBLIC_KEY;
+    delete process.env.LANGFUSE_SECRET_KEY;
+    delete process.env.LANGFUSE_BASE_URL;
+    delete process.env.LANGFUSE_BASEURL;
     delete process.env.LANGFUSE_FORCE_FLUSH_ON_DISPOSE;
   });
 
@@ -180,6 +235,120 @@ describe('Langfuse callback composition', () => {
         secretKey: 'sk-agent',
         baseUrl: 'https://langfuse.agent',
       })
+    );
+  });
+
+  it('binds handler callback spans to their own Langfuse config and trace seed', async () => {
+    const { createLangfuseHandler } = await import('@/langfuse');
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    const tenantA = {
+      publicKey: 'pk-tenant-a',
+      secretKey: 'sk-tenant-a',
+      baseUrl: 'https://langfuse.proxy',
+      deterministicTraceId: true,
+    };
+    const tenantB = {
+      publicKey: 'pk-tenant-b',
+      secretKey: 'sk-tenant-b',
+      baseUrl: 'https://langfuse.proxy',
+      deterministicTraceId: true,
+    };
+    initializeLangfuseTracing(tenantA);
+    initializeLangfuseTracing(tenantB);
+
+    const handlerA = createLangfuseHandler({
+      langfuse: tenantA,
+      traceIdSeed: 'run-tenant-a',
+    });
+    const handlerB = createLangfuseHandler({
+      langfuse: tenantB,
+      traceIdSeed: 'run-tenant-b',
+    });
+
+    await Promise.all([
+      handlerA?.handleChainStart(
+        { lc: 1, type: 'not_implemented', id: ['TenantAChain'] },
+        { input: 'tenant a' },
+        'lc-run-a'
+      ),
+      handlerB?.handleChainStart(
+        { lc: 1, type: 'not_implemented', id: ['TenantBChain'] },
+        { input: 'tenant b' },
+        'lc-run-b'
+      ),
+    ]);
+
+    expect(mockProcessorStarts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          params: expect.objectContaining({
+            publicKey: 'pk-tenant-a',
+            secretKey: 'sk-tenant-a',
+            baseUrl: 'https://langfuse.proxy',
+          }),
+          traceId: traceIdFromSeed('run-tenant-a'),
+        }),
+        expect.objectContaining({
+          params: expect.objectContaining({
+            publicKey: 'pk-tenant-b',
+            secretKey: 'sk-tenant-b',
+            baseUrl: 'https://langfuse.proxy',
+          }),
+          traceId: traceIdFromSeed('run-tenant-b'),
+        }),
+      ])
+    );
+  });
+
+  it('uses deterministic trace ids when tracing is configured from env only', async () => {
+    process.env.LANGFUSE_PUBLIC_KEY = 'pk-env';
+    process.env.LANGFUSE_SECRET_KEY = 'sk-env';
+    process.env.LANGFUSE_BASE_URL = 'https://langfuse.env';
+
+    const runId = 'test-langfuse-env-deterministic-run';
+    const run = await Run.create<t.IState>({
+      runId,
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'agent_abc123',
+            name: 'DWAINE',
+            provider: Providers.OPENAI,
+            clientOptions: { model: 'gpt-4' },
+            tools: [],
+          },
+        ],
+      },
+      langfuse: {
+        deterministicTraceId: true,
+        metadata: { 'librechat.tenant.id': 'tenant-env' },
+        tags: ['tenant:tenant-env'],
+      },
+      skipCleanup: true,
+    });
+
+    run.Graph?.overrideTestModel(['hello']);
+
+    await run.processStream(
+      { messages: [new HumanMessage('hello')] },
+      {
+        configurable: { thread_id: 'thread-1', user_id: 'user-1' },
+        version: 'v2' as const,
+      }
+    );
+
+    expect(mockProcessorStarts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          params: expect.objectContaining({
+            publicKey: 'pk-env',
+            secretKey: 'sk-env',
+            baseUrl: 'https://langfuse.env',
+          }),
+          traceId: traceIdFromSeed(runId),
+        }),
+      ])
     );
   });
 

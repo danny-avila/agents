@@ -7,6 +7,7 @@ import type { BaseMessage, MessageContent } from '@langchain/core/messages';
 import type { Generation, LLMResult } from '@langchain/core/outputs';
 import type { PropagateAttributesParams } from '@langfuse/tracing';
 import type * as t from '@/types';
+import { withLangfuseRuntimeScope } from '@/langfuseRuntimeScope';
 import { isPresent } from '@/utils/misc';
 import { ContentTypes } from '@/common';
 
@@ -21,6 +22,7 @@ type LangfuseHandlerParams = {
   sessionId?: string;
   traceMetadata?: LangfuseTraceMetadata;
   tags?: string[];
+  traceIdSeed?: string;
 };
 
 type AgentLangfuseHandlerParams = LangfuseHandlerParams & {
@@ -200,6 +202,75 @@ function withReasoningForLangfuseOutput(output: LLMResult): LLMResult {
 }
 
 class ReasoningAwareLangfuseCallbackHandler extends CallbackHandler {
+  private readonly langfuse?: t.LangfuseConfig;
+  private readonly traceIdSeed?: string;
+
+  constructor(params?: AgentLangfuseHandlerParams) {
+    const { langfuse, traceIdSeed, ...handlerParams } = params ?? {};
+    super(handlerParams);
+    this.langfuse = langfuse;
+    this.traceIdSeed = traceIdSeed;
+  }
+
+  private getDeterministicTraceSeed(): string | undefined {
+    return this.langfuse?.deterministicTraceId === true
+      ? this.traceIdSeed
+      : undefined;
+  }
+
+  private withRuntimeContext<T>(action: () => T): T {
+    const seed = this.getDeterministicTraceSeed();
+    return withLangfuseRuntimeScope(
+      { langfuse: this.langfuse, traceIdSeed: seed },
+      action
+    );
+  }
+
+  // LangChain may invoke callback handlers outside the caller's OTEL context.
+  // Re-enter tenant scope only for callbacks that start Langfuse observations;
+  // end/error/token callbacks use spans already bound to a processor at start.
+  override handleChainStart(
+    ...args: Parameters<CallbackHandler['handleChainStart']>
+  ): ReturnType<CallbackHandler['handleChainStart']> {
+    return this.withRuntimeContext(() => super.handleChainStart(...args));
+  }
+
+  override handleAgentAction(
+    ...args: Parameters<CallbackHandler['handleAgentAction']>
+  ): ReturnType<CallbackHandler['handleAgentAction']> {
+    return this.withRuntimeContext(() => super.handleAgentAction(...args));
+  }
+
+  override handleGenerationStart(
+    ...args: Parameters<CallbackHandler['handleGenerationStart']>
+  ): ReturnType<CallbackHandler['handleGenerationStart']> {
+    return this.withRuntimeContext(() => super.handleGenerationStart(...args));
+  }
+
+  override handleChatModelStart(
+    ...args: Parameters<CallbackHandler['handleChatModelStart']>
+  ): ReturnType<CallbackHandler['handleChatModelStart']> {
+    return this.withRuntimeContext(() => super.handleChatModelStart(...args));
+  }
+
+  override handleLLMStart(
+    ...args: Parameters<CallbackHandler['handleLLMStart']>
+  ): ReturnType<CallbackHandler['handleLLMStart']> {
+    return this.withRuntimeContext(() => super.handleLLMStart(...args));
+  }
+
+  override handleToolStart(
+    ...args: Parameters<CallbackHandler['handleToolStart']>
+  ): ReturnType<CallbackHandler['handleToolStart']> {
+    return this.withRuntimeContext(() => super.handleToolStart(...args));
+  }
+
+  override handleRetrieverStart(
+    ...args: Parameters<CallbackHandler['handleRetrieverStart']>
+  ): ReturnType<CallbackHandler['handleRetrieverStart']> {
+    return this.withRuntimeContext(() => super.handleRetrieverStart(...args));
+  }
+
   override async handleLLMEnd(
     output: LLMResult,
     runId: string,
@@ -358,6 +429,7 @@ export function createLangfuseHandler({
   sessionId,
   traceMetadata,
   tags,
+  traceIdSeed,
 }: AgentLangfuseHandlerParams): CallbackHandler | undefined {
   if (!shouldCreateLangfuseHandler(langfuse)) {
     return undefined;
@@ -370,6 +442,8 @@ export function createLangfuseHandler({
       langfuse?.metadata
     ),
     tags: mergeLangfuseTags(tags, langfuse?.tags),
+    langfuse,
+    traceIdSeed,
   });
 }
 
