@@ -15,7 +15,11 @@ const TRACE_METADATA_MAX_LENGTH = 200;
 const LANGFUSE_FORCE_FLUSH_ON_DISPOSE = 'LANGFUSE_FORCE_FLUSH_ON_DISPOSE';
 
 export type LangfuseTraceMetadata = Record<string, string>;
+export type LangfuseTraceAttributes = Record<string, string | number | boolean>;
 type LangfuseMetadata = NonNullable<t.LangfuseConfig['metadata']>;
+type LangfuseConfigTraceAttributes = NonNullable<
+  t.LangfuseConfig['librechatTraceAttributes']
+>;
 
 type LangfuseHandlerParams = {
   userId?: string;
@@ -293,6 +297,9 @@ function hasLangfuseTracingConfig(langfuse?: t.LangfuseConfig): boolean {
 function hasLangfuseTraceAttributes(langfuse?: t.LangfuseConfig): boolean {
   return (
     Object.keys(createTraceMetadata(langfuse?.metadata ?? {})).length > 0 ||
+    Object.keys(
+      createLibreChatTraceAttributes(langfuse?.librechatTraceAttributes ?? {})
+    ).length > 0 ||
     (mergeLangfuseTags(undefined, langfuse?.tags)?.length ?? 0) > 0
   );
 }
@@ -343,6 +350,26 @@ function createTraceMetadata(
     traceMetadata[key] = stringValue;
   }
   return traceMetadata;
+}
+
+export function createLibreChatTraceAttributes(
+  attributes: LangfuseConfigTraceAttributes
+): LangfuseTraceAttributes {
+  const librechatTraceAttributes: LangfuseTraceAttributes = {};
+  for (const [key, value] of Object.entries(attributes)) {
+    if (value == null || key.trim() === '') {
+      continue;
+    }
+    if (typeof value === 'string') {
+      if (value.trim() === '' || value.length > TRACE_METADATA_MAX_LENGTH) {
+        continue;
+      }
+      librechatTraceAttributes[key] = value;
+      continue;
+    }
+    librechatTraceAttributes[key] = value;
+  }
+  return librechatTraceAttributes;
 }
 
 export function createLangfuseTraceMetadata({

@@ -10,6 +10,7 @@ const mockProcessorStarts: Array<{
   params: unknown;
   traceId: string;
 }> = [];
+const mockSpanAttributeSets: Array<Record<string, unknown>> = [];
 let mockProviderInput:
   | {
       spanProcessors?: Array<{
@@ -40,7 +41,9 @@ const createMockSpan = (traceIdOverride?: string) => {
       spanId,
       traceFlags: 1,
     })),
-    setAttributes: jest.fn(),
+    setAttributes: jest.fn((attributes: Record<string, unknown>) => {
+      mockSpanAttributeSets.push(attributes);
+    }),
     setStatus: jest.fn(),
     attributes: {},
   };
@@ -96,6 +99,7 @@ describe('Langfuse callback composition', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockProcessorStarts.length = 0;
+    mockSpanAttributeSets.length = 0;
     delete process.env.LANGFUSE_PUBLIC_KEY;
     delete process.env.LANGFUSE_SECRET_KEY;
     delete process.env.LANGFUSE_BASE_URL;
@@ -298,6 +302,34 @@ describe('Langfuse callback composition', () => {
         }),
       ])
     );
+  });
+
+  it('attaches configured trace attributes to Langfuse callback spans', async () => {
+    const { createLangfuseHandler } = await import('@/langfuse');
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    const langfuse = {
+      publicKey: 'pk-tenant-a',
+      secretKey: 'sk-tenant-a',
+      baseUrl: 'https://langfuse.proxy',
+      librechatTraceAttributes: {
+        'librechat.langfuse.tenant_export.enabled': 'true',
+        'librechat.langfuse.destination': 'eu',
+        ignored: '',
+      },
+    };
+    initializeLangfuseTracing(langfuse);
+    const handler = createLangfuseHandler({ langfuse });
+
+    await handler?.handleChainStart(
+      { lc: 1, type: 'not_implemented', id: ['TenantAChain'] },
+      { input: 'tenant a' },
+      'lc-run-a'
+    );
+
+    expect(mockSpanAttributeSets).toContainEqual({
+      'librechat.langfuse.tenant_export.enabled': 'true',
+      'librechat.langfuse.destination': 'eu',
+    });
   });
 
   it('uses deterministic trace ids when tracing is configured from env only', async () => {

@@ -13,6 +13,7 @@ import type { LangfuseSpanProcessorParams } from '@langfuse/otel';
 import type { Context } from '@opentelemetry/api';
 import type * as t from '@/types';
 import {
+  createLibreChatTraceAttributes,
   hasLangfuseConfigCredentials,
   hasLangfuseEnvCredentials,
   hasLangfuseEnvConfig,
@@ -152,11 +153,17 @@ class RoutingLangfuseSpanProcessor implements SpanProcessor {
   }
 
   onStart(span: Span, parentContext: Context): void {
-    const processor = this.ensureProcessor(
-      resolveLangfuseConfigForSpan(parentContext)
-    );
+    const langfuse = resolveLangfuseConfigForSpan(parentContext);
+    const processor = this.ensureProcessor(langfuse);
     if (processor == null) {
       return;
+    }
+
+    const librechatTraceAttributes = createLibreChatTraceAttributes(
+      langfuse?.librechatTraceAttributes ?? {}
+    );
+    if (Object.keys(librechatTraceAttributes).length > 0) {
+      span.setAttributes(librechatTraceAttributes);
     }
 
     this.spanProcessors.set(span, processor);
