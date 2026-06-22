@@ -92,6 +92,26 @@ function getEnvToolNameMatchMode(): 'exact' | 'partial' | undefined {
   return undefined;
 }
 
+function hasEnvToolOutputTracingConfig(): boolean {
+  return (
+    getEnvToolOutputTracingEnabled() != null ||
+    getEnvRedactedToolNames() != null ||
+    getEnvRedactionText() != null ||
+    getEnvToolNameMatchMode() != null
+  );
+}
+
+export function hasToolOutputTracingConfig(
+  runLangfuse?: t.LangfuseConfig,
+  agentLangfuse?: t.LangfuseConfig
+): boolean {
+  return (
+    runLangfuse?.toolOutputTracing != null ||
+    agentLangfuse?.toolOutputTracing != null ||
+    hasEnvToolOutputTracingConfig()
+  );
+}
+
 export function resolveToolOutputTracingConfig(
   runLangfuse?: t.LangfuseConfig,
   agentLangfuse?: t.LangfuseConfig

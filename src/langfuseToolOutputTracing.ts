@@ -11,6 +11,7 @@ import type { ResolvedLangfuseToolOutputTracingConfig } from '@/langfuseRuntimeC
 import type * as t from '@/types';
 import {
   LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT,
+  hasToolOutputTracingConfig,
   normalizeToolName,
   resolveLangfuseConfig,
   resolveToolOutputTracingConfig,
@@ -433,10 +434,9 @@ export function createLangfuseSpanProcessor(
   runLangfuse?: t.LangfuseConfig,
   agentLangfuse?: t.LangfuseConfig
 ): SpanProcessor {
-  const fallbackConfig =
-    runLangfuse != null || agentLangfuse != null
-      ? resolveToolOutputTracingConfig(runLangfuse, agentLangfuse)
-      : undefined;
+  const fallbackConfig = hasToolOutputTracingConfig(runLangfuse, agentLangfuse)
+    ? resolveToolOutputTracingConfig(runLangfuse, agentLangfuse)
+    : undefined;
   return new ToolOutputRedactingLangfuseSpanProcessor(params, fallbackConfig);
 }
 

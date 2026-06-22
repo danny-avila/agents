@@ -13,6 +13,7 @@ import {
   runWithLangfuseRuntimeContext,
 } from '@/langfuseRuntimeContext';
 import {
+  hasToolOutputTracingConfig,
   resolveLangfuseConfig,
   resolveToolOutputTracingConfig,
 } from '@/langfuseConfig';
@@ -124,10 +125,10 @@ export function resolveLangfuseRuntimeScope({
   traceIdSeed,
 }: ResolveLangfuseRuntimeScopeParams): LangfuseRuntimeScope {
   const langfuse = resolveLangfuseConfig(runLangfuse, langfuseOverlay);
-  const hasNoToolOutputConfig =
-    runLangfuse?.toolOutputTracing == null &&
-    langfuseOverlay?.toolOutputTracing == null;
-  const toolOutputTracing = hasNoToolOutputConfig
+  const toolOutputTracing = !hasToolOutputTracingConfig(
+    runLangfuse,
+    langfuseOverlay
+  )
     ? undefined
     : resolveToolOutputTracingConfig(runLangfuse, langfuseOverlay);
   return { langfuse, traceIdSeed, toolOutputTracing };

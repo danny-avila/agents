@@ -6,15 +6,16 @@ import type { BaseMessage } from '@langchain/core/messages';
 import type { Context } from '@opentelemetry/api';
 import type { TPayload } from '@/types';
 import {
+  resolveLangfuseConfigForSpan,
+  resolveLangfuseRuntimeScope,
+  resolveToolOutputTracingConfigForSpan,
+  withLangfuseRuntimeScope,
+} from '@/langfuseRuntimeScope';
+import {
   LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT,
   redactLangfuseSpanToolOutputs,
   shouldTraceToolNodeForLangfuse,
 } from '@/langfuseToolOutputTracing';
-import {
-  resolveLangfuseConfigForSpan,
-  resolveToolOutputTracingConfigForSpan,
-  withLangfuseRuntimeScope,
-} from '@/langfuseRuntimeScope';
 import {
   runWithLangfuseRuntimeContext,
   type ResolvedLangfuseToolOutputTracingConfig,
@@ -665,6 +666,67 @@ describe('Langfuse tool output tracing redaction', () => {
     ).toMatchObject({
       enabled: false,
     });
+  });
+
+  it('honors env-only tool-output redaction in runtime scope', () => {
+    ensureOpenTelemetryContextManager();
+    process.env.LANGFUSE_REDACT_TOOL_OUTPUTS = 'true';
+    let capturedContext: Context | undefined;
+
+    withLangfuseRuntimeScope(resolveLangfuseRuntimeScope({}), () => {
+      capturedContext = context.active();
+    });
+
+    expect(capturedContext).toBeDefined();
+    const config = resolveToolOutputTracingConfigForSpan(capturedContext!);
+    expect(config).toMatchObject({
+      enabled: false,
+      redactedToolNameMatchMode: 'exact',
+      redactionText: LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT,
+    });
+    expect(config?.redactedToolNames.size).toBe(0);
+  });
+
+  it('applies agent tool-output redaction override through runtime scope', () => {
+    ensureOpenTelemetryContextManager();
+    let capturedContext: Context | undefined;
+
+    withLangfuseRuntimeScope(
+      resolveLangfuseRuntimeScope({
+        runLangfuse: {
+          toolOutputTracing: {
+            enabled: true,
+            redactionText: '[agent redacted]',
+          },
+        },
+        langfuseOverlay: {
+          toolOutputTracing: {
+            enabled: false,
+          },
+        },
+      }),
+      () => {
+        capturedContext = context.active();
+      }
+    );
+
+    expect(capturedContext).toBeDefined();
+    const config = resolveToolOutputTracingConfigForSpan(capturedContext!);
+    expect(config).toMatchObject({
+      enabled: false,
+      redactionText: '[agent redacted]',
+    });
+
+    const span = createSpan('execute_sql', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_TYPE]: 'tool',
+      [LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]: 'secret rows',
+    });
+
+    redactLangfuseSpanToolOutputs(span, config!);
+
+    expect(span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]).toBe(
+      '[agent redacted]'
+    );
   });
 
   it('prefers ALS runtime tenant config over OTEL fallback config', () => {
