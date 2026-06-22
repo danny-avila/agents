@@ -304,6 +304,61 @@ describe('Langfuse callback composition', () => {
     );
   });
 
+  it('preserves an active agent Langfuse runtime scope for callback-created spans', async () => {
+    const { createLangfuseHandler } = await import('@/langfuse');
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    const { withLangfuseRuntimeScope } = await import('@/langfuseRuntimeScope');
+    const runLangfuse = {
+      publicKey: 'pk-run',
+      secretKey: 'sk-run',
+      baseUrl: 'https://langfuse.run',
+      deterministicTraceId: true,
+    };
+    const agentLangfuse = {
+      publicKey: 'pk-agent',
+      secretKey: 'sk-agent',
+      baseUrl: 'https://langfuse.agent',
+      deterministicTraceId: true,
+    };
+    initializeLangfuseTracing(runLangfuse);
+    initializeLangfuseTracing(agentLangfuse);
+    const streamHandler = createLangfuseHandler({
+      langfuse: runLangfuse,
+      traceIdSeed: 'run-seed',
+    });
+
+    await withLangfuseRuntimeScope(
+      { langfuse: agentLangfuse, traceIdSeed: 'agent-seed' },
+      () =>
+        streamHandler?.handleChainStart(
+          { lc: 1, type: 'not_implemented', id: ['AgentScopedChain'] },
+          { input: 'agent scoped' },
+          'lc-agent-run'
+        )
+    );
+
+    expect(mockProcessorStarts).toContainEqual(
+      expect.objectContaining({
+        params: expect.objectContaining({
+          publicKey: 'pk-agent',
+          secretKey: 'sk-agent',
+          baseUrl: 'https://langfuse.agent',
+        }),
+        traceId: traceIdFromSeed('agent-seed'),
+      })
+    );
+    expect(mockProcessorStarts).not.toContainEqual(
+      expect.objectContaining({
+        params: expect.objectContaining({
+          publicKey: 'pk-run',
+          secretKey: 'sk-run',
+          baseUrl: 'https://langfuse.run',
+        }),
+        traceId: traceIdFromSeed('run-seed'),
+      })
+    );
+  });
+
   it('attaches configured trace attributes to Langfuse callback spans', async () => {
     const { createLangfuseHandler } = await import('@/langfuse');
     const { initializeLangfuseTracing } = await import('@/instrumentation');

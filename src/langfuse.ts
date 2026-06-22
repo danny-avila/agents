@@ -1,11 +1,16 @@
 import { CallbackHandler } from '@langfuse/langchain';
+import { context as otelContext } from '@opentelemetry/api';
 import {
   getLangfuseTracerProvider,
   propagateAttributes,
 } from '@langfuse/tracing';
 import type { PropagateAttributesParams } from '@langfuse/tracing';
 import type * as t from '@/types';
-import { withLangfuseRuntimeScope } from '@/langfuseRuntimeScope';
+import {
+  resolveLangfuseConfigForSpan,
+  resolveTraceIdSeedForSpan,
+  withLangfuseRuntimeScope,
+} from '@/langfuseRuntimeScope';
 import { isPresent, parseBooleanEnv } from '@/utils/misc';
 
 const TRACE_METADATA_MAX_LENGTH = 200;
@@ -56,9 +61,15 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
   }
 
   private withRuntimeContext<T>(action: () => T): T {
+    const activeContext = otelContext.active();
+    const langfuse =
+      resolveLangfuseConfigForSpan(activeContext) ?? this.langfuse;
     const seed = this.getDeterministicTraceSeed();
     return withLangfuseRuntimeScope(
-      { langfuse: this.langfuse, traceIdSeed: seed },
+      {
+        langfuse,
+        traceIdSeed: resolveTraceIdSeedForSpan(activeContext) ?? seed,
+      },
       action
     );
   }
