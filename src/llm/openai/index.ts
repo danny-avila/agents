@@ -318,23 +318,9 @@ type OpenAIToolCallDelta = NonNullable<
 
 /**
  * Per-choice state for repairing streamed tool-call indices from
- * OpenAI-compatible providers that do not assign a distinct `index` to each
- * parallel tool call. Ollama, for example, streams `index: 0` for every call
- * in a parallel batch (ollama/ollama#15457), and older builds omit `index`
- * entirely (ollama/ollama#7881). LangChain merges streamed tool-call chunks by
- * `index`, so without unique indices the sibling calls collapse into one — the
- * extra calls lose their arguments and fail tool-input schema validation
- * before any request is sent.
- *
- * A streamed tool call is delivered as a *start* delta (carrying `id` and/or
- * `function.name`) followed by argument-fragment deltas; in a streaming
- * protocol a call's fragments arrive before the next call starts. So we assign
- * one repaired index per start (keyed by `id` when present, otherwise by start
- * order) and route id-less fragments to the call currently in progress. Repair
- * only engages once the provider's indices prove unreliable — a call start with
- * no index, or a second start reusing an index already opened — so well-behaved
- * streams (official OpenAI, modern Ollama, first-party Azure) pass through
- * unchanged.
+ * OpenAI-compatible providers that reuse or omit `index` across parallel calls
+ * (e.g. Ollama streams `index: 0` for every call, ollama/ollama#15457), which
+ * makes LangChain merge siblings into one and drop their args.
  */
 type ToolCallReindexState = {
   indexById: Map<string, number>;
@@ -358,9 +344,10 @@ function isNonEmptyString(value: unknown): value is string {
 }
 
 /**
- * Rewrites `index` on a delta's tool calls so siblings stay distinct, mutating
- * in place. No-op for well-behaved streams: while the provider's indices remain
- * trustworthy nothing is rewritten.
+ * Rewrites `index` in place so sibling calls stay distinct. A no-op until the
+ * provider's indices prove unreliable. A call is a start delta (`id`/name)
+ * followed by arg fragments; we assign one index per start (by `id`, else order)
+ * and route id-less fragments to the in-progress call.
  */
 function reindexToolCallDeltas(
   toolCalls: OpenAIToolCallDelta[],
@@ -372,8 +359,8 @@ function reindexToolCallDeltas(
       typeof toolCall.index === 'number' ? toolCall.index : undefined;
     const isStart = id != null || isNonEmptyString(toolCall.function?.name);
 
-    // A start with no index, or reusing an index already opened by an earlier
-    // start, means the provider's indices can't be trusted to separate calls.
+    // A start with no index, or one reusing an already-opened index, means the
+    // provider's indices can't separate calls.
     if (
       !state.unreliable &&
       isStart &&
@@ -386,8 +373,8 @@ function reindexToolCallDeltas(
     }
 
     if (!state.unreliable) {
-      // Trust provider indices; only track the in-progress call so an
-      // index-less fragment can still be anchored if one shows up.
+      // Indices still trusted; track the in-progress call to anchor any
+      // index-less fragment.
       if (providerIndex != null) {
         state.current = providerIndex;
         if (isStart) {
@@ -418,10 +405,8 @@ function reindexToolCallDeltas(
 }
 
 /**
- * Repairs unreliable streamed tool-call indices in place. State is kept per
- * `choice.index` because `tool_calls[].index` is scoped to a choice, so
- * concurrent choices (`n > 1`) never influence one another. Exported
- * (underscore prefix) for unit testing.
+ * Repairs streamed tool-call indices in place, keeping state per `choice.index`
+ * (so `n > 1` choices don't interfere). Exported for unit testing.
  */
 export async function* _reindexToolCallStream(
   stream: AsyncIterable<OpenAIChatCompletionChunk>
@@ -916,8 +901,7 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
       request,
       requestOptions,
       super.completionWithRetry.bind(this) as OpenAIChatCompletionRetry,
-      // Official OpenAI streams tool calls with correct distinct indices;
-      // OpenAI-compatible endpoints (Ollama, etc.) may not — repair those.
+      // Repair tool-call indices only for OpenAI-compatible endpoints.
       { reindexToolCalls: !isOfficialOpenAIBaseURL(this.clientConfig.baseURL) }
     );
   }
@@ -1404,8 +1388,7 @@ class LibreChatAzureOpenAICompletions extends OriginalAzureChatOpenAICompletions
       request,
       requestOptions,
       super.completionWithRetry.bind(this) as OpenAIChatCompletionRetry,
-      // First-party Azure shares OpenAI's stream contract; a proxy / Azure-
-      // compatible endpoint may not — repair tool-call indices for those.
+      // Repair tool-call indices only for non-first-party Azure endpoints.
       {
         reindexToolCalls: !isFirstPartyAzureEndpoint({
           baseURL: this.clientConfig.baseURL,

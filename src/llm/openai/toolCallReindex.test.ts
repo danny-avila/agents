@@ -2,13 +2,9 @@ import { expect, test, describe } from '@jest/globals';
 import { _reindexToolCallStream } from './index';
 
 /**
- * Regression coverage for OpenAI-compatible providers (e.g. Ollama) that stream
- * parallel tool calls without a distinct, reliable `index` per call.
- * See ollama/ollama#15457 (index always 0) and #7881 (no index). Downstream,
- * LangChain merges streamed tool-call chunks by `index`, so without repair the
- * sibling calls collapse and the extra calls lose their arguments — surfacing
- * as "Received tool input did not match expected schema" before any request is
- * sent (LibreChat #13885).
+ * Coverage for OpenAI-compatible providers that stream parallel tool calls with
+ * unreliable `index` (e.g. Ollama, ollama/ollama#15457), which makes LangChain
+ * merge siblings and drop their args.
  */
 
 const TOOL = 'echo_mcp_everything-test';
@@ -50,10 +46,9 @@ async function reindex(chunks: ToolCallDelta[][]): Promise<ToolCallDelta[]> {
 }
 
 /**
- * Merge tool-call deltas the way an `index`-keyed accumulator (LangChain,
- * Vercel AI SDK) does: concatenate argument fragments per index, then parse.
- * Returns the parsed args per call ordered by index, or `null` for a call
- * whose accumulated arguments are not valid JSON.
+ * Merge deltas the way an `index`-keyed accumulator (LangChain) does:
+ * concatenate args per index and parse. Returns parsed args per call by index,
+ * or `null` when the accumulated args aren't valid JSON.
  */
 function mergeByIndex(deltas: ToolCallDelta[]): Array<unknown> {
   const byIndex = new Map<number, { args: string }>();
