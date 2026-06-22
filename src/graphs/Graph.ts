@@ -35,11 +35,6 @@ import {
   partitionAndMarkAnthropicToolCache,
 } from '@/messages';
 import {
-  resolveLangfuseConfig,
-  shouldTraceToolNodeForLangfuse,
-  withLangfuseToolOutputTracingConfig,
-} from '@/langfuseToolOutputTracing';
-import {
   createLangfuseHandler,
   createLangfuseTraceMetadata,
   disposeLangfuseHandler,
@@ -55,6 +50,10 @@ import {
   sleep,
 } from '@/utils';
 import {
+  resolveLangfuseRuntimeScope,
+  withLangfuseRuntimeScope,
+} from '@/langfuseRuntimeScope';
+import {
   GraphNodeKeys,
   ContentTypes,
   GraphEvents,
@@ -67,6 +66,7 @@ import {
   type CallbackEntry,
 } from '@/utils/callbacks';
 import { partitionAndMarkOpenRouterToolCache } from '@/llm/openrouter/toolCache';
+import { shouldTraceToolNodeForLangfuse } from '@/langfuseToolOutputTracing';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
 import { createLocalCodingToolBundle } from '@/tools/local/LocalCodingTools';
 import { SubagentExecutor, resolveSubagentConfigs } from '@/tools/subagent';
@@ -81,6 +81,7 @@ import { shouldTriggerSummarization } from '@/summarization';
 import { resolveLocalToolsForBinding } from '@/tools/local';
 import { createSummarizeNode } from '@/summarization/node';
 import { messagesStateReducer } from '@/messages/reducer';
+import { resolveLangfuseConfig } from '@/langfuseConfig';
 import { createSchemaOnlyTools } from '@/tools/schema';
 import { AgentContext } from '@/agents/AgentContext';
 import { createFakeStreamingLLM } from '@/llm/fake';
@@ -2079,6 +2080,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           sessionId: config.configurable?.thread_id as string | undefined,
           traceMetadata,
           tags: ['librechat', 'agent'],
+          traceIdSeed:
+            langfuse?.deterministicTraceId === true ? this.runId : undefined,
         });
         if (langfuseHandler != null) {
           invokeConfig = {
@@ -2092,8 +2095,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       const metadata = config.metadata as Record<string, unknown>;
 
       try {
-        result = await withLangfuseToolOutputTracingConfig(
-          this.langfuse,
+        result = await withLangfuseRuntimeScope(
+          resolveLangfuseRuntimeScope({
+            runLangfuse: this.langfuse,
+            langfuseOverlay: agentContext.langfuse,
+          }),
           () =>
             attemptInvoke(
               {
@@ -2103,16 +2109,18 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
                 context: this,
               },
               invokeConfig
-            ),
-          agentContext.langfuse
+            )
         );
       } catch (primaryError) {
         clearCurrentDeltaStepMarkers({
           graph: this,
           metadata,
         });
-        result = await withLangfuseToolOutputTracingConfig(
-          this.langfuse,
+        result = await withLangfuseRuntimeScope(
+          resolveLangfuseRuntimeScope({
+            runLangfuse: this.langfuse,
+            langfuseOverlay: agentContext.langfuse,
+          }),
           () =>
             tryFallbackProviders({
               fallbacks,
@@ -2121,8 +2129,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
               config: invokeConfig,
               primaryError,
               context: this,
-            }),
-          agentContext.langfuse
+            })
         );
       } finally {
         await disposeLangfuseHandler(langfuseHandler);

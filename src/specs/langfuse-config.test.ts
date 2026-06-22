@@ -9,9 +9,16 @@ import {
 
 const mockForceFlush = jest.fn();
 
-jest.mock('@langfuse/langchain', () => ({
-  CallbackHandler: jest.fn().mockImplementation((params) => ({ params })),
-}));
+jest.mock('@langfuse/langchain', () => {
+  const CallbackHandler = jest.fn(function (
+    this: { params?: unknown; name?: string },
+    params: unknown
+  ) {
+    this.params = params;
+    this.name = 'LangfuseCallbackHandler';
+  });
+  return { CallbackHandler };
+});
 
 jest.mock('@langfuse/tracing', () => ({
   getLangfuseTracerProvider: jest.fn(() => ({

@@ -33,16 +33,17 @@ type BasicTracerProviderInput = {
     shutdown?: unknown;
   }>;
 };
-type RoutingSpanProcessorForTest = BasicTracerProviderInput['spanProcessors'][0] & {
-  processors: Map<
-    string,
-    {
-      fallbackConfig?: {
-        enabled?: boolean;
-      };
-    }
-  >;
-};
+type RoutingSpanProcessorForTest =
+  BasicTracerProviderInput['spanProcessors'][0] & {
+    processors: Map<
+      string,
+      {
+        fallbackConfig?: {
+          enabled?: boolean;
+        };
+      }
+    >;
+  };
 const mockBasicTracerProvider = jest.fn(
   (_input?: BasicTracerProviderInput) => mockTracerProvider
 );
@@ -217,6 +218,25 @@ describe('Langfuse instrumentation', () => {
     expect(mockSetLangfuseTracerProvider).toHaveBeenCalledTimes(1);
   });
 
+  it('does not store raw secret keys in processor cache keys', async () => {
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    initializeLangfuseTracing({
+      publicKey: 'pk-cache',
+      secretKey: 'sk-cache-secret',
+      baseUrl: 'https://langfuse.cache',
+    });
+
+    const providerInput = mockBasicTracerProvider.mock
+      .calls[0][0] as BasicTracerProviderInput;
+    const routingProcessor = providerInput
+      .spanProcessors[0] as RoutingSpanProcessorForTest;
+    const processorKeys = Array.from(routingProcessor.processors.keys());
+
+    expect(processorKeys).toHaveLength(1);
+    expect(processorKeys[0]).toContain('secretKeyHash');
+    expect(processorKeys[0]).not.toContain('sk-cache-secret');
+  });
+
   it('passes explicit redaction config into the redacting processor fallback', async () => {
     const { initializeLangfuseTracing } = await import('@/instrumentation');
     initializeLangfuseTracing({
@@ -228,8 +248,8 @@ describe('Langfuse instrumentation', () => {
 
     const providerInput = mockBasicTracerProvider.mock
       .calls[0][0] as BasicTracerProviderInput;
-    const routingProcessor =
-      providerInput.spanProcessors[0] as RoutingSpanProcessorForTest;
+    const routingProcessor = providerInput
+      .spanProcessors[0] as RoutingSpanProcessorForTest;
     const childProcessors = Array.from(routingProcessor.processors.values());
     expect(childProcessors[0]?.fallbackConfig).toMatchObject({
       enabled: false,
