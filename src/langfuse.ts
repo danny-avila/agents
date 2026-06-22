@@ -3,13 +3,10 @@ import {
   getLangfuseTracerProvider,
   propagateAttributes,
 } from '@langfuse/tracing';
-import type { BaseMessage, MessageContent } from '@langchain/core/messages';
-import type { Generation, LLMResult } from '@langchain/core/outputs';
 import type { PropagateAttributesParams } from '@langfuse/tracing';
 import type * as t from '@/types';
 import { withLangfuseRuntimeScope } from '@/langfuseRuntimeScope';
 import { isPresent, parseBooleanEnv } from '@/utils/misc';
-import { ContentTypes } from '@/common';
 
 const TRACE_METADATA_MAX_LENGTH = 200;
 const LANGFUSE_FORCE_FLUSH_ON_DISPOSE = 'LANGFUSE_FORCE_FLUSH_ON_DISPOSE';
@@ -41,164 +38,7 @@ type FlushableTracerProvider = {
   forceFlush?: () => Promise<void> | void;
 };
 
-type ReasoningSummary = {
-  summary?: Array<{ text?: string | null }>;
-};
-
-type ReasoningDetail = {
-  type?: string;
-  text?: string | null;
-};
-
-type MessageWithReasoning = BaseMessage & {
-  additional_kwargs?: BaseMessage['additional_kwargs'] & {
-    reasoning?: string | ReasoningSummary | null;
-    reasoning_content?: string | ReasoningSummary | null;
-    reasoning_details?: ReasoningDetail[] | null;
-  };
-};
-
-type ChatGenerationWithMessage = Generation & {
-  message: MessageWithReasoning;
-};
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value != null && typeof value === 'object' && !Array.isArray(value);
-}
-
-function getReasoningText(
-  value: string | ReasoningSummary | null | undefined
-): string | undefined {
-  if (typeof value === 'string') {
-    return isPresent(value) ? value : undefined;
-  }
-  const summaryText = value?.summary
-    ?.map((summary) => summary.text ?? '')
-    .filter((text) => text !== '')
-    .join('');
-  return summaryText != null && summaryText !== '' ? summaryText : undefined;
-}
-
-function getReasoningDetailsText(
-  value: ReasoningDetail[] | null | undefined
-): string | undefined {
-  if (!Array.isArray(value)) {
-    return undefined;
-  }
-  const reasoningText = value
-    .filter((detail) => detail.type === 'reasoning.text')
-    .map((detail) => detail.text ?? '')
-    .filter((text) => text !== '')
-    .join('');
-  return reasoningText !== '' ? reasoningText : undefined;
-}
-
-function getMessageReasoningText(
-  message: MessageWithReasoning
-): string | undefined {
-  const additionalKwargs = message.additional_kwargs;
-  if (additionalKwargs == null) {
-    return undefined;
-  }
-
-  return (
-    getReasoningText(additionalKwargs.reasoning_content) ??
-    getReasoningText(additionalKwargs.reasoning) ??
-    getReasoningDetailsText(additionalKwargs.reasoning_details)
-  );
-}
-
-function hasReasoningContentPart(content: MessageContent): boolean {
-  return (
-    Array.isArray(content) &&
-    content.some((part) => {
-      if (!isRecord(part) || typeof part.type !== 'string') {
-        return false;
-      }
-      return (
-        part.type === ContentTypes.THINK ||
-        part.type === ContentTypes.THINKING ||
-        part.type === ContentTypes.REASONING ||
-        part.type === ContentTypes.REASONING_CONTENT ||
-        part.type === 'redacted_thinking'
-      );
-    })
-  );
-}
-
-function withReasoningContent(
-  content: MessageContent,
-  reasoningText: string
-): MessageContent {
-  if (hasReasoningContentPart(content)) {
-    return content;
-  }
-
-  const reasoningPart = {
-    type: ContentTypes.THINK,
-    think: reasoningText,
-  };
-  return Array.isArray(content)
-    ? [reasoningPart, ...content]
-    : [reasoningPart, { type: ContentTypes.TEXT, text: content }];
-}
-
-function hasMessage(
-  generation: Generation
-): generation is ChatGenerationWithMessage {
-  return (
-    'message' in generation &&
-    isRecord(generation.message) &&
-    'additional_kwargs' in generation.message &&
-    'content' in generation.message
-  );
-}
-
-function cloneMessageWithContent(
-  message: MessageWithReasoning,
-  content: MessageContent
-): MessageWithReasoning {
-  return Object.assign(Object.create(Object.getPrototypeOf(message)), message, {
-    content,
-  });
-}
-
-function withReasoningForLangfuseOutput(output: LLMResult): LLMResult {
-  let changed = false;
-  const generations = output.generations.map((generationList) => {
-    return generationList.map((generation) => {
-      if (!hasMessage(generation)) {
-        return generation;
-      }
-      const reasoningText = getMessageReasoningText(generation.message);
-      if (!isPresent(reasoningText)) {
-        return generation;
-      }
-
-      const originalContent = generation.message.content;
-      const nextContent = withReasoningContent(originalContent, reasoningText);
-      if (nextContent === originalContent) {
-        return generation;
-      }
-
-      changed = true;
-      return {
-        ...generation,
-        message: cloneMessageWithContent(generation.message, nextContent),
-      };
-    });
-  });
-
-  if (!changed) {
-    return output;
-  }
-  return {
-    ...output,
-    generations,
-  };
-}
-
-class ReasoningAwareLangfuseCallbackHandler extends CallbackHandler {
+class ScopedLangfuseCallbackHandler extends CallbackHandler {
   private readonly langfuse?: t.LangfuseConfig;
   private readonly traceIdSeed?: string;
 
@@ -266,18 +106,6 @@ class ReasoningAwareLangfuseCallbackHandler extends CallbackHandler {
     ...args: Parameters<CallbackHandler['handleRetrieverStart']>
   ): ReturnType<CallbackHandler['handleRetrieverStart']> {
     return this.withRuntimeContext(() => super.handleRetrieverStart(...args));
-  }
-
-  override async handleLLMEnd(
-    output: LLMResult,
-    runId: string,
-    parentRunId?: string | undefined
-  ): Promise<void> {
-    await super.handleLLMEnd(
-      withReasoningForLangfuseOutput(output),
-      runId,
-      parentRunId
-    );
   }
 }
 
@@ -440,7 +268,7 @@ export function shouldCreateLangfuseHandler(
 export function createLegacyLangfuseHandler(
   params: LangfuseHandlerParams
 ): CallbackHandler {
-  return new ReasoningAwareLangfuseCallbackHandler(params);
+  return new ScopedLangfuseCallbackHandler(params);
 }
 
 export function createLangfuseHandler({
@@ -454,7 +282,7 @@ export function createLangfuseHandler({
   if (!shouldCreateLangfuseHandler(langfuse)) {
     return undefined;
   }
-  return new ReasoningAwareLangfuseCallbackHandler({
+  return new ScopedLangfuseCallbackHandler({
     userId,
     sessionId,
     traceMetadata: mergeLangfuseTraceMetadata(

@@ -1,6 +1,4 @@
 import { CallbackHandler } from '@langfuse/langchain';
-import { AIMessageChunk } from '@langchain/core/messages';
-import type { ChatGeneration, LLMResult } from '@langchain/core/outputs';
 import {
   hasLangfuseConfigCredentials,
   shouldCreateLangfuseHandler,
@@ -8,10 +6,8 @@ import {
   disposeLangfuseHandler,
   createLangfuseHandler,
 } from '@/langfuse';
-import { ContentTypes } from '@/common';
 
 const mockForceFlush = jest.fn();
-const mockHandleLLMEnd = jest.fn();
 
 jest.mock('@langfuse/langchain', () => {
   const CallbackHandler = jest.fn(function (
@@ -21,8 +17,6 @@ jest.mock('@langfuse/langchain', () => {
     this.params = params;
     this.name = 'LangfuseCallbackHandler';
   });
-  CallbackHandler.prototype.handleLLMEnd = (...args: unknown[]) =>
-    mockHandleLLMEnd(...args);
   return { CallbackHandler };
 });
 
@@ -41,7 +35,6 @@ describe('createLangfuseHandler', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
-    mockHandleLLMEnd.mockResolvedValue(undefined);
     process.env = { ...originalEnv };
     delete process.env.LANGFUSE_PUBLIC_KEY;
     delete process.env.LANGFUSE_SECRET_KEY;
@@ -126,141 +119,6 @@ describe('createLangfuseHandler', () => {
 
     expect(handler).toBeDefined();
     expect(MockedCallbackHandler).toHaveBeenCalledTimes(1);
-  });
-
-  it('adds exposed reasoning text to Langfuse generation output without mutating the message', async () => {
-    let tracedContent: AIMessageChunk['content'] | undefined;
-    mockHandleLLMEnd.mockImplementation(async (llmOutput: LLMResult) => {
-      const tracedMessage = llmOutput.generations[0][0] as unknown as {
-        message: AIMessageChunk;
-      };
-      tracedContent = tracedMessage.message.content;
-    });
-    const handler = createLangfuseHandler({
-      langfuse: {
-        publicKey: 'pk-test',
-        secretKey: 'sk-test',
-      },
-    });
-    const message = new AIMessageChunk({
-      content: 'Visible answer.',
-      additional_kwargs: {
-        reasoning_content: 'Inspect the data first.',
-      },
-    });
-    const output: LLMResult = {
-      generations: [
-        [
-          {
-            text: 'Visible answer.',
-            message,
-          } as ChatGeneration,
-        ],
-      ],
-    };
-
-    await handler?.handleLLMEnd(output, 'run-1');
-
-    expect(mockHandleLLMEnd).toHaveBeenCalledTimes(1);
-    expect(tracedContent).toEqual([
-      {
-        type: ContentTypes.THINK,
-        think: 'Inspect the data first.',
-      },
-      {
-        type: ContentTypes.TEXT,
-        text: 'Visible answer.',
-      },
-    ]);
-    expect(message.content).toBe('Visible answer.');
-  });
-
-  it('does not duplicate Bedrock reasoning_content blocks already in message content', async () => {
-    let tracedContent: AIMessageChunk['content'] | undefined;
-    mockHandleLLMEnd.mockImplementation(async (llmOutput: LLMResult) => {
-      const tracedMessage = llmOutput.generations[0][0] as unknown as {
-        message: AIMessageChunk;
-      };
-      tracedContent = tracedMessage.message.content;
-    });
-    const content = [
-      {
-        type: ContentTypes.REASONING_CONTENT,
-        reasoningText: { text: 'Use Bedrock native reasoning.' },
-      },
-      { type: ContentTypes.TEXT, text: 'Visible answer.' },
-    ];
-    const handler = createLangfuseHandler({
-      langfuse: {
-        publicKey: 'pk-test',
-        secretKey: 'sk-test',
-      },
-    });
-    const message = new AIMessageChunk({
-      content,
-      additional_kwargs: {
-        reasoning_content: 'Use Bedrock native reasoning.',
-      },
-    });
-    const output: LLMResult = {
-      generations: [
-        [
-          {
-            text: 'Visible answer.',
-            message,
-          } as ChatGeneration,
-        ],
-      ],
-    };
-
-    await handler?.handleLLMEnd(output, 'run-1');
-
-    expect(mockHandleLLMEnd).toHaveBeenCalledTimes(1);
-    expect(tracedContent).toBe(content);
-    expect(message.content).toBe(content);
-  });
-
-  it('passes Anthropic thinking blocks already in message content unchanged', async () => {
-    let tracedContent: AIMessageChunk['content'] | undefined;
-    mockHandleLLMEnd.mockImplementation(async (llmOutput: LLMResult) => {
-      const tracedMessage = llmOutput.generations[0][0] as unknown as {
-        message: AIMessageChunk;
-      };
-      tracedContent = tracedMessage.message.content;
-    });
-    const content = [
-      {
-        type: ContentTypes.THINKING,
-        thinking: 'Use Anthropic native thinking.',
-        signature: 'sig',
-      },
-      { type: ContentTypes.TEXT, text: 'Visible answer.' },
-    ];
-    const handler = createLangfuseHandler({
-      langfuse: {
-        publicKey: 'pk-test',
-        secretKey: 'sk-test',
-      },
-    });
-    const message = new AIMessageChunk({
-      content,
-    });
-    const output: LLMResult = {
-      generations: [
-        [
-          {
-            text: 'Visible answer.',
-            message,
-          } as ChatGeneration,
-        ],
-      ],
-    };
-
-    await handler?.handleLLMEnd(output, 'run-1');
-
-    expect(mockHandleLLMEnd).toHaveBeenCalledTimes(1);
-    expect(tracedContent).toBe(content);
-    expect(message.content).toBe(content);
   });
 
   it('hydrates redaction-only config from env keys', () => {
