@@ -301,12 +301,19 @@ function getOpenAIChatCompletionChunk(
 }
 
 async function* filterOpenAIChatCompletionStream(
-  stream: AsyncIterable<OpenAIChatCompletionStreamItem>
+  stream: AsyncIterable<OpenAIChatCompletionStreamItem>,
+  reindexToolCalls = false
 ): AsyncGenerator<OpenAIChatCompletionChunk> {
+  const stateByChoice = reindexToolCalls
+    ? new Map<number, ToolCallReindexState>()
+    : null;
   for await (const item of stream) {
     const chunk = getOpenAIChatCompletionChunk(item);
     if (chunk == null) {
       continue;
+    }
+    if (stateByChoice != null) {
+      reindexChunkToolCalls(chunk, stateByChoice);
     }
     yield chunk;
   }
@@ -324,19 +331,13 @@ type OpenAIToolCallDelta = NonNullable<
  */
 type ToolCallReindexState = {
   indexById: Map<string, number>;
-  startedProviderIndices: Set<number>;
   next: number;
   unreliable: boolean;
   current?: number;
 };
 
 function createToolCallReindexState(): ToolCallReindexState {
-  return {
-    indexById: new Map(),
-    startedProviderIndices: new Set(),
-    next: 0,
-    unreliable: false,
-  };
+  return { indexById: new Map(), next: 0, unreliable: false };
 }
 
 function isNonEmptyString(value: unknown): value is string {
@@ -359,17 +360,14 @@ function reindexToolCallDeltas(
       typeof toolCall.index === 'number' ? toolCall.index : undefined;
     const isStart = id != null || isNonEmptyString(toolCall.function?.name);
 
-    // A start with no index, or one reusing an already-opened index, means the
-    // provider's indices can't separate calls.
+    // A start with no index, or one at/below the highest index already opened
+    // (`next` is the high-water mark), means indices can't separate calls.
     if (
       !state.unreliable &&
       isStart &&
-      (providerIndex == null || state.startedProviderIndices.has(providerIndex))
+      (providerIndex == null || providerIndex < state.next)
     ) {
       state.unreliable = true;
-    }
-    if (isStart && providerIndex != null) {
-      state.startedProviderIndices.add(providerIndex);
     }
 
     if (!state.unreliable) {
@@ -405,26 +403,35 @@ function reindexToolCallDeltas(
 }
 
 /**
- * Repairs streamed tool-call indices in place, keeping state per `choice.index`
- * (so `n > 1` choices don't interfere). Exported for unit testing.
+ * Repairs one chunk's tool-call indices in place. State is kept per
+ * `choice.index` (`tool_calls[].index` is choice-scoped) so `n > 1` choices
+ * don't interfere.
  */
+function reindexChunkToolCalls(
+  chunk: OpenAIChatCompletionChunk,
+  stateByChoice: Map<number, ToolCallReindexState>
+): void {
+  for (const choice of chunk.choices) {
+    const toolCalls = choice.delta.tool_calls;
+    if (toolCalls == null || toolCalls.length === 0) {
+      continue;
+    }
+    let state = stateByChoice.get(choice.index);
+    if (state == null) {
+      state = createToolCallReindexState();
+      stateByChoice.set(choice.index, state);
+    }
+    reindexToolCallDeltas(toolCalls, state);
+  }
+}
+
+/** Standalone reindex generator, exported for unit testing. */
 export async function* _reindexToolCallStream(
   stream: AsyncIterable<OpenAIChatCompletionChunk>
 ): AsyncGenerator<OpenAIChatCompletionChunk> {
   const stateByChoice = new Map<number, ToolCallReindexState>();
   for await (const chunk of stream) {
-    for (const choice of chunk.choices) {
-      const toolCalls = choice.delta.tool_calls;
-      if (toolCalls == null || toolCalls.length === 0) {
-        continue;
-      }
-      let state = stateByChoice.get(choice.index);
-      if (state == null) {
-        state = createToolCallReindexState();
-        stateByChoice.set(choice.index, state);
-      }
-      reindexToolCallDeltas(toolCalls, state);
-    }
+    reindexChunkToolCalls(chunk, stateByChoice);
     yield chunk;
   }
 }
@@ -443,12 +450,10 @@ async function completionWithFilteredOpenAIStream(
   }
 
   const stream = await completionWithRetry(request, requestOptions);
-  const filtered = filterOpenAIChatCompletionStream(
-    stream as AsyncIterable<OpenAIChatCompletionStreamItem>
+  return filterOpenAIChatCompletionStream(
+    stream as AsyncIterable<OpenAIChatCompletionStreamItem>,
+    options?.reindexToolCalls === true
   );
-  return options?.reindexToolCalls === true
-    ? _reindexToolCallStream(filtered)
-    : filtered;
 }
 
 function attachLibreChatDeltaFields(
