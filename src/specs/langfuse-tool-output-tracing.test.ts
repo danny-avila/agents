@@ -6,22 +6,26 @@ import type { BaseMessage } from '@langchain/core/messages';
 import type { Context } from '@opentelemetry/api';
 import type { TPayload } from '@/types';
 import {
+  LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT,
+  classifyLangfuseToolNodeSpan,
+  redactLangfuseSpanToolOutputs,
+  shouldTraceToolNodeForLangfuse,
+} from '@/langfuseToolOutputTracing';
+import {
   resolveLangfuseConfigForSpan,
   resolveLangfuseRuntimeScope,
   resolveToolOutputTracingConfigForSpan,
   withLangfuseRuntimeScope,
 } from '@/langfuseRuntimeScope';
 import {
-  LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT,
-  redactLangfuseSpanToolOutputs,
-  shouldTraceToolNodeForLangfuse,
-} from '@/langfuseToolOutputTracing';
-import {
   runWithLangfuseRuntimeContext,
   type ResolvedLangfuseToolOutputTracingConfig,
 } from '@/langfuseRuntimeContext';
+import {
+  resolveLangfuseConfig,
+  resolveToolOutputTracingConfig,
+} from '@/langfuseConfig';
 import { ensureOpenTelemetryContextManager } from '@/instrumentation';
-import { resolveLangfuseConfig } from '@/langfuseConfig';
 import { formatAgentMessages } from '@/messages/format';
 import { ContentTypes } from '@/common';
 
@@ -200,6 +204,20 @@ describe('Langfuse tool output tracing redaction', () => {
     });
 
     redactLangfuseSpanToolOutputs(span, createConfig());
+
+    expect(span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_TYPE]).toBe(
+      'tool'
+    );
+  });
+
+  it('classifies LangGraph tool-node spans without requiring redaction config', () => {
+    const span = createSpan('tool_batch', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_TYPE]: 'span',
+      [`${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.langgraph_node`]:
+        'tools=agent_1',
+    });
+
+    classifyLangfuseToolNodeSpan(span);
 
     expect(span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_TYPE]).toBe(
       'tool'
@@ -599,7 +617,12 @@ describe('Langfuse tool output tracing redaction', () => {
         secretKey: 'sk-run',
         baseUrl: 'https://langfuse.test',
         metadata: { tenantId: 'tenant-run' },
+        librechatTraceAttributes: {
+          'librechat.langfuse.destination': 'eu',
+          'librechat.langfuse.tenant_export.enabled': true,
+        },
         tags: ['tenant:tenant-run', 'shared'],
+        deterministicTraceId: true,
         toolNodeTracing: { enabled: true },
         toolOutputTracing: {
           enabled: true,
@@ -607,7 +630,13 @@ describe('Langfuse tool output tracing redaction', () => {
         },
       },
       {
+        publicKey: 'pk-agent',
+        secretKey: 'sk-agent',
+        baseUrl: 'https://langfuse.agent',
         metadata: { agentId: 'agent-1' },
+        librechatTraceAttributes: {
+          'librechat.langfuse.public_key': 'pk-agent',
+        },
         tags: ['shared', 'agent:agent-1'],
         toolOutputTracing: {
           enabled: false,
@@ -618,11 +647,17 @@ describe('Langfuse tool output tracing redaction', () => {
 
     expect(resolved).toMatchObject({
       enabled: true,
-      publicKey: 'pk-run',
-      secretKey: 'sk-run',
-      baseUrl: 'https://langfuse.test',
+      publicKey: 'pk-agent',
+      secretKey: 'sk-agent',
+      baseUrl: 'https://langfuse.agent',
       metadata: { tenantId: 'tenant-run', agentId: 'agent-1' },
+      librechatTraceAttributes: {
+        'librechat.langfuse.destination': 'eu',
+        'librechat.langfuse.tenant_export.enabled': true,
+        'librechat.langfuse.public_key': 'pk-agent',
+      },
       tags: ['tenant:tenant-run', 'shared', 'agent:agent-1'],
+      deterministicTraceId: true,
       toolNodeTracing: { enabled: true },
       toolOutputTracing: {
         enabled: false,
@@ -630,6 +665,158 @@ describe('Langfuse tool output tracing redaction', () => {
         redactionText: '[redacted]',
       },
     });
+  });
+
+  it('inherits deterministic trace ids when tenant config only supplies connection settings', () => {
+    const resolved = resolveLangfuseConfig(
+      {
+        deterministicTraceId: true,
+      },
+      {
+        publicKey: 'pk-tenant',
+        secretKey: 'sk-tenant',
+        baseUrl: 'https://langfuse.tenant',
+      }
+    );
+
+    expect(resolved).toMatchObject({
+      publicKey: 'pk-tenant',
+      secretKey: 'sk-tenant',
+      baseUrl: 'https://langfuse.tenant',
+      deterministicTraceId: true,
+    });
+  });
+
+  it('inherits application-level redaction when tenant config does not explicitly opt out', () => {
+    process.env.LANGFUSE_REDACT_TOOL_OUTPUTS = 'true';
+    process.env.LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT = '[app redacted]';
+
+    const config = resolveToolOutputTracingConfig(
+      {
+        publicKey: 'pk-tenant',
+        secretKey: 'sk-tenant',
+        baseUrl: 'https://langfuse.tenant',
+        toolOutputTracing: {
+          redactionText: '[tenant redacted]',
+        },
+      },
+      undefined
+    );
+
+    expect(config).toMatchObject({
+      enabled: false,
+      redactionText: '[tenant redacted]',
+    });
+  });
+
+  it('keeps application redacted tool names when tenant adds its own names', () => {
+    process.env.LANGFUSE_REDACT_TOOL_OUTPUT_NAMES = 'run_sql';
+
+    const config = resolveToolOutputTracingConfig(
+      {
+        toolOutputTracing: {
+          redactedToolNames: ['execute_sql'],
+        },
+      },
+      {
+        toolOutputTracing: {
+          redactedToolNames: ['web_search'],
+        },
+      }
+    );
+
+    expect([...config.redactedToolNames].sort()).toEqual([
+      'execute_sql',
+      'run_sql',
+      'web_search',
+    ]);
+  });
+
+  it('keeps application partial redaction matching when tenant adds exact redaction config', () => {
+    process.env.LANGFUSE_REDACT_TOOL_OUTPUT_NAME_MATCH_MODE = 'partial';
+
+    const config = resolveToolOutputTracingConfig(
+      {
+        toolOutputTracing: {
+          redactedToolNames: ['execute'],
+        },
+      },
+      {
+        toolOutputTracing: {
+          redactedToolNameMatchMode: 'exact',
+          redactedToolNames: ['web_search'],
+        },
+      }
+    );
+
+    expect(config.redactedToolNameMatchMode).toBe('partial');
+
+    const span = createSpan('execute_sql', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_TYPE]: 'tool',
+      [LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]: 'secret rows',
+    });
+
+    redactLangfuseSpanToolOutputs(span, config);
+
+    expect(span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]).toBe(
+      LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT
+    );
+  });
+
+  it('lets tenant explicitly opt out of application-level redact-all outputs', () => {
+    process.env.LANGFUSE_REDACT_TOOL_OUTPUTS = 'true';
+
+    const config = resolveToolOutputTracingConfig(
+      {
+        publicKey: 'pk-tenant',
+        secretKey: 'sk-tenant',
+        toolOutputTracing: {
+          enabled: true,
+        },
+      },
+      undefined
+    );
+
+    expect(config.enabled).toBe(true);
+    expect(config.redactedToolNames.size).toBe(0);
+  });
+
+  it('applies application-level redaction through tenant runtime scope unless tenant opts out', () => {
+    ensureOpenTelemetryContextManager();
+    process.env.LANGFUSE_REDACT_TOOL_OUTPUTS = 'true';
+    process.env.LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT = '[app redacted]';
+    let capturedContext: Context | undefined;
+
+    withLangfuseRuntimeScope(
+      resolveLangfuseRuntimeScope({
+        runLangfuse: {
+          publicKey: 'pk-tenant',
+          secretKey: 'sk-tenant',
+          baseUrl: 'https://langfuse.tenant',
+        },
+      }),
+      () => {
+        capturedContext = context.active();
+      }
+    );
+
+    expect(capturedContext).toBeDefined();
+    const config = resolveToolOutputTracingConfigForSpan(capturedContext!);
+    expect(config).toMatchObject({
+      enabled: false,
+      redactionText: '[app redacted]',
+    });
+
+    const span = createSpan('execute_sql', {
+      [LangfuseOtelSpanAttributes.OBSERVATION_TYPE]: 'tool',
+      [LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]: 'tenant secret rows',
+    });
+
+    redactLangfuseSpanToolOutputs(span, config!);
+
+    expect(span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]).toBe(
+      '[app redacted]'
+    );
   });
 
   it('keeps OTEL context fallback for spans outside callback runtime scope', () => {

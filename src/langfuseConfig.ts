@@ -86,6 +86,41 @@ function hasEnvToolOutputTracingConfig(): boolean {
   );
 }
 
+function resolveToolOutputTracingEnabled(
+  runConfig?: t.LangfuseToolOutputTracingConfig,
+  agentConfig?: t.LangfuseToolOutputTracingConfig
+): boolean {
+  return (
+    agentConfig?.enabled ??
+    runConfig?.enabled ??
+    getEnvToolOutputTracingEnabled() ??
+    true
+  );
+}
+
+function resolveRedactedToolNames(
+  runConfig?: t.LangfuseToolOutputTracingConfig,
+  agentConfig?: t.LangfuseToolOutputTracingConfig
+): Set<string> {
+  return normalizeToolNames([
+    ...(getEnvRedactedToolNames() ?? []),
+    ...(runConfig?.redactedToolNames ?? []),
+    ...(agentConfig?.redactedToolNames ?? []),
+  ]);
+}
+
+function resolveToolNameMatchMode(
+  runConfig?: t.LangfuseToolOutputTracingConfig,
+  agentConfig?: t.LangfuseToolOutputTracingConfig
+): 'exact' | 'partial' {
+  const modes = [
+    getEnvToolNameMatchMode(),
+    runConfig?.redactedToolNameMatchMode,
+    agentConfig?.redactedToolNameMatchMode,
+  ];
+  return modes.includes('partial') ? 'partial' : 'exact';
+}
+
 export function hasToolOutputTracingConfig(
   runLangfuse?: t.LangfuseConfig,
   agentLangfuse?: t.LangfuseConfig
@@ -105,21 +140,9 @@ export function resolveToolOutputTracingConfig(
   const agentConfig = agentLangfuse?.toolOutputTracing;
 
   return {
-    enabled:
-      agentConfig?.enabled ??
-      runConfig?.enabled ??
-      getEnvToolOutputTracingEnabled() ??
-      true,
-    redactedToolNames: normalizeToolNames(
-      agentConfig?.redactedToolNames ??
-        runConfig?.redactedToolNames ??
-        getEnvRedactedToolNames()
-    ),
-    redactedToolNameMatchMode:
-      agentConfig?.redactedToolNameMatchMode ??
-      runConfig?.redactedToolNameMatchMode ??
-      getEnvToolNameMatchMode() ??
-      'exact',
+    enabled: resolveToolOutputTracingEnabled(runConfig, agentConfig),
+    redactedToolNames: resolveRedactedToolNames(runConfig, agentConfig),
+    redactedToolNameMatchMode: resolveToolNameMatchMode(runConfig, agentConfig),
     redactionText:
       agentConfig?.redactionText ??
       runConfig?.redactionText ??
@@ -161,6 +184,14 @@ export function resolveLangfuseConfig(
         ...agentLangfuse.metadata,
       }
       : undefined;
+  const librechatTraceAttributes =
+    runLangfuse.librechatTraceAttributes != null ||
+    agentLangfuse.librechatTraceAttributes != null
+      ? {
+        ...runLangfuse.librechatTraceAttributes,
+        ...agentLangfuse.librechatTraceAttributes,
+      }
+      : undefined;
   const tags =
     runLangfuse.tags != null || agentLangfuse.tags != null
       ? [
@@ -175,6 +206,7 @@ export function resolveLangfuseConfig(
     ...runLangfuse,
     ...agentLangfuse,
     ...(metadata != null ? { metadata } : {}),
+    ...(librechatTraceAttributes != null ? { librechatTraceAttributes } : {}),
     ...(tags != null ? { tags } : {}),
     ...(toolNodeTracing != null ? { toolNodeTracing } : {}),
     ...(toolOutputTracing != null ? { toolOutputTracing } : {}),

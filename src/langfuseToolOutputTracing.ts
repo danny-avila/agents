@@ -344,6 +344,10 @@ function classifyLangGraphToolNodeSpan(
   }
 }
 
+export function classifyLangfuseToolNodeSpan(span: ReadableSpan): void {
+  classifyLangGraphToolNodeSpan((span as SpanWithAttributes).attributes);
+}
+
 function redactToolObservationOutput(
   span: ReadableSpan,
   attributes: Record<string, unknown>,
@@ -368,7 +372,7 @@ export function redactLangfuseSpanToolOutputs(
   config: ResolvedLangfuseToolOutputTracingConfig
 ): void {
   const attributes = (span as SpanWithAttributes).attributes;
-  classifyLangGraphToolNodeSpan(attributes);
+  classifyLangfuseToolNodeSpan(span);
 
   if (!shouldApplyToolOutputRedaction(config)) {
     return;
@@ -413,6 +417,7 @@ class ToolOutputRedactingLangfuseSpanProcessor implements SpanProcessor {
   }
 
   onEnd(span: ReadableSpan): void {
+    classifyLangfuseToolNodeSpan(span);
     const config = this.spanConfigs.get(span) ?? this.fallbackConfig;
     if (config != null) {
       redactLangfuseSpanToolOutputs(span, config);
