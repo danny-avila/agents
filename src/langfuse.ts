@@ -8,7 +8,7 @@ import type { Generation, LLMResult } from '@langchain/core/outputs';
 import type { PropagateAttributesParams } from '@langfuse/tracing';
 import type * as t from '@/types';
 import { withLangfuseRuntimeScope } from '@/langfuseRuntimeScope';
-import { isPresent } from '@/utils/misc';
+import { isPresent, parseBooleanEnv } from '@/utils/misc';
 import { ContentTypes } from '@/common';
 
 const TRACE_METADATA_MAX_LENGTH = 200;
@@ -61,13 +61,6 @@ type MessageWithReasoning = BaseMessage & {
 type ChatGenerationWithMessage = Generation & {
   message: MessageWithReasoning;
 };
-
-function parseBooleanEnv(value?: string): boolean {
-  if (value == null) {
-    return false;
-  }
-  return ['1', 'true', 'yes', 'on'].includes(value.trim().toLowerCase());
-}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value != null && typeof value === 'object' && !Array.isArray(value);

@@ -2,6 +2,24 @@ export function isPresent(value: string | null | undefined): value is string {
   return value != null && value !== '';
 }
 
+export function parseBooleanEnv(
+  value: string | undefined
+): boolean | undefined {
+  if (value == null) {
+    return undefined;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) {
+    return true;
+  }
+  if (['0', 'false', 'no', 'off'].includes(normalized)) {
+    return false;
+  }
+
+  return undefined;
+}
+
 /**
  * Unescapes a c-escaped string
  * @param str The string to unescape

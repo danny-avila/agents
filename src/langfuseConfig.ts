@@ -1,26 +1,11 @@
 import type { ResolvedLangfuseToolOutputTracingConfig } from '@/langfuseRuntimeContext';
 import type * as t from '@/types';
+import { parseBooleanEnv } from '@/utils/misc';
 
 export const LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT = '[tool output redacted]';
 
 function isPresent(value: unknown): value is string {
   return typeof value === 'string' && value.trim() !== '';
-}
-
-function parseBoolean(value: string | undefined): boolean | undefined {
-  if (value == null) {
-    return undefined;
-  }
-
-  const normalized = value.trim().toLowerCase();
-  if (['1', 'true', 'yes', 'on'].includes(normalized)) {
-    return true;
-  }
-  if (['0', 'false', 'no', 'off'].includes(normalized)) {
-    return false;
-  }
-
-  return undefined;
 }
 
 export function normalizeToolName(name: string): string {
@@ -49,21 +34,21 @@ function parseToolNames(value: string | undefined): string[] | undefined {
 }
 
 function getEnvToolOutputTracingEnabled(): boolean | undefined {
-  const traceToolOutputs = parseBoolean(
+  const traceToolOutputs = parseBooleanEnv(
     process.env.LANGFUSE_TRACE_TOOL_OUTPUTS
   );
   if (traceToolOutputs != null) {
     return traceToolOutputs;
   }
 
-  const redactToolOutputs = parseBoolean(
+  const redactToolOutputs = parseBooleanEnv(
     process.env.LANGFUSE_REDACT_TOOL_OUTPUTS
   );
   if (redactToolOutputs != null) {
     return !redactToolOutputs;
   }
 
-  return parseBoolean(process.env.LANGFUSE_TOOL_OUTPUT_TRACING_ENABLED);
+  return parseBooleanEnv(process.env.LANGFUSE_TOOL_OUTPUT_TRACING_ENABLED);
 }
 
 function getEnvRedactedToolNames(): string[] | undefined {
