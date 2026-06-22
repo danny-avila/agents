@@ -131,4 +131,59 @@ describe('streamed tool-call index repair', () => {
     // concatenated args are not valid JSON.
     expect(mergeByIndex(raw)).toEqual([null]);
   });
+
+  test('repairs id-less starts that reuse an index, via the name signal', async () => {
+    // No tool-call ids at all; each call start carries function.name and the
+    // provider stamps index 0 on every delta.
+    const out = await reindex([
+      [{ index: 0, type: 'function', function: { name: TOOL, arguments: '' } }],
+      [{ index: 0, function: { arguments: '{"message":"alpha"}' } }],
+      [{ index: 0, type: 'function', function: { name: TOOL, arguments: '' } }],
+      [{ index: 0, function: { arguments: '{"message":"beta"}' } }],
+    ]);
+    expect(mergeByIndex(out)).toEqual([{ message: 'alpha' }, { message: 'beta' }]);
+  });
+
+  test('repairs index-less argument fragments when starts carry distinct indices', async () => {
+    const out = await reindex([
+      [{ index: 0, id: 'a', type: 'function', function: { name: TOOL, arguments: '' } }],
+      [{ function: { arguments: '{"message":"alpha"}' } }],
+      [{ index: 1, id: 'b', type: 'function', function: { name: TOOL, arguments: '' } }],
+      [{ function: { arguments: '{"message":"beta"}' } }],
+    ]);
+    expect(mergeByIndex(out)).toEqual([{ message: 'alpha' }, { message: 'beta' }]);
+  });
+
+  test('keeps repair state separate per choice (n > 1)', async () => {
+    // Two choices each open a call at provider index 0. Shared state would
+    // mis-detect a reused index and bump choice 1 to index 1.
+    async function* source(): AsyncGenerator<Record<string, unknown>> {
+      yield {
+        id: 'chatcmpl-1',
+        object: 'chat.completion.chunk',
+        created: 1,
+        model: 'qwen',
+        choices: [
+          { index: 0, delta: { tool_calls: [{ index: 0, id: 'x', type: 'function', function: { name: TOOL, arguments: '{"message":"alpha"}' } }] }, finish_reason: null },
+          { index: 1, delta: { tool_calls: [{ index: 0, id: 'y', type: 'function', function: { name: TOOL, arguments: '{"message":"beta"}' } }] }, finish_reason: null },
+        ],
+      };
+    }
+    const choiceIndices = new Map<number, number[]>();
+    for await (const chunk of _reindexToolCallStream(
+      source() as unknown as AsyncIterable<never>,
+    )) {
+      const choices = (chunk as unknown as Record<string, unknown>)
+        .choices as Array<{ index: number; delta?: { tool_calls?: ToolCallDelta[] } }>;
+      for (const choice of choices) {
+        const indices = choiceIndices.get(choice.index) ?? [];
+        for (const tc of choice.delta?.tool_calls ?? []) {
+          indices.push(tc.index as number);
+        }
+        choiceIndices.set(choice.index, indices);
+      }
+    }
+    expect(choiceIndices.get(0)).toEqual([0]);
+    expect(choiceIndices.get(1)).toEqual([0]);
+  });
 });

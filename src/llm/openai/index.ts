@@ -317,33 +317,39 @@ type OpenAIToolCallDelta = NonNullable<
 >;
 
 /**
- * Per-stream state for repairing streamed tool-call indices from
+ * Per-choice state for repairing streamed tool-call indices from
  * OpenAI-compatible providers that do not assign a distinct `index` to each
  * parallel tool call. Ollama, for example, streams `index: 0` for every call
  * in a parallel batch (ollama/ollama#15457), and older builds omit `index`
  * entirely (ollama/ollama#7881). LangChain merges streamed tool-call chunks by
  * `index`, so without unique indices the sibling calls collapse into one — the
  * extra calls lose their arguments and fail tool-input schema validation
- * before any request is sent. Repair keys on the provider's tool-call `id`
- * (which the affected providers still emit), falling back to call-start signals
- * when even the `id` is absent.
+ * before any request is sent.
+ *
+ * A streamed tool call is delivered as a *start* delta (carrying `id` and/or
+ * `function.name`) followed by argument-fragment deltas; in a streaming
+ * protocol a call's fragments arrive before the next call starts. So we assign
+ * one repaired index per start (keyed by `id` when present, otherwise by start
+ * order) and route id-less fragments to the call currently in progress. Repair
+ * only engages once the provider's indices prove unreliable — a call start with
+ * no index, or a second start reusing an index already opened — so well-behaved
+ * streams (official OpenAI, modern Ollama, first-party Azure) pass through
+ * unchanged.
  */
 type ToolCallReindexState = {
-  assignedById: Map<string, number>;
-  firstIdByProviderIndex: Map<number, string>;
+  indexById: Map<string, number>;
+  startedProviderIndices: Set<number>;
   next: number;
-  active: boolean;
-  seeded: boolean;
-  lastIndex?: number;
+  unreliable: boolean;
+  current?: number;
 };
 
 function createToolCallReindexState(): ToolCallReindexState {
   return {
-    assignedById: new Map(),
-    firstIdByProviderIndex: new Map(),
+    indexById: new Map(),
+    startedProviderIndices: new Set(),
     next: 0,
-    active: false,
-    seeded: false,
+    unreliable: false,
   };
 }
 
@@ -352,10 +358,9 @@ function isNonEmptyString(value: unknown): value is string {
 }
 
 /**
- * Rewrites `index` on a delta's tool calls so siblings stay distinct. Repair
- * only engages once the provider's indices prove unreliable — two different
- * ids sharing one index, or a call start with no index at all — so well-behaved
- * streams (official OpenAI, modern Ollama) pass through byte-for-byte.
+ * Rewrites `index` on a delta's tool calls so siblings stay distinct, mutating
+ * in place. No-op for well-behaved streams: while the provider's indices remain
+ * trustworthy nothing is rewritten.
  */
 function reindexToolCallDeltas(
   toolCalls: OpenAIToolCallDelta[],
@@ -365,67 +370,75 @@ function reindexToolCallDeltas(
     const id = isNonEmptyString(toolCall.id) ? toolCall.id : undefined;
     const providerIndex =
       typeof toolCall.index === 'number' ? toolCall.index : undefined;
-    const isCallStart = id != null || isNonEmptyString(toolCall.function?.name);
+    const isStart = id != null || isNonEmptyString(toolCall.function?.name);
 
-    if (!state.active) {
-      if (isCallStart && providerIndex == null) {
-        state.active = true;
-      } else if (id != null && providerIndex != null) {
-        const firstId = state.firstIdByProviderIndex.get(providerIndex);
-        if (firstId == null) {
-          state.firstIdByProviderIndex.set(providerIndex, id);
-        } else if (firstId !== id) {
-          state.active = true;
-        }
-      }
+    // A start with no index, or reusing an index already opened by an earlier
+    // start, means the provider's indices can't be trusted to separate calls.
+    if (
+      !state.unreliable &&
+      isStart &&
+      (providerIndex == null || state.startedProviderIndices.has(providerIndex))
+    ) {
+      state.unreliable = true;
+    }
+    if (isStart && providerIndex != null) {
+      state.startedProviderIndices.add(providerIndex);
     }
 
-    if (!state.active) {
+    if (!state.unreliable) {
+      // Trust provider indices; only track the in-progress call so an
+      // index-less fragment can still be anchored if one shows up.
       if (providerIndex != null) {
-        state.lastIndex = providerIndex;
+        state.current = providerIndex;
+        if (isStart) {
+          if (id != null) {
+            state.indexById.set(id, providerIndex);
+          }
+          state.next = Math.max(state.next, providerIndex + 1);
+        }
+      } else if (state.current != null) {
+        toolCall.index = state.current;
       }
       continue;
     }
 
-    if (!state.seeded) {
-      // Preserve indices already emitted before repair engaged.
-      for (const [index, firstId] of state.firstIdByProviderIndex) {
-        if (!state.assignedById.has(firstId)) {
-          state.assignedById.set(firstId, index);
-          state.next = Math.max(state.next, index + 1);
-        }
-      }
-      state.seeded = true;
-    }
-
     let assigned: number;
     if (id != null) {
-      assigned = state.assignedById.get(id) ?? state.next++;
-      state.assignedById.set(id, assigned);
-    } else if (isCallStart) {
+      assigned = state.indexById.get(id) ?? state.next++;
+      state.indexById.set(id, assigned);
+      state.current = assigned;
+    } else if (isStart) {
       assigned = state.next++;
+      state.current = assigned;
     } else {
-      assigned = state.lastIndex ?? 0;
+      assigned = state.current ?? 0;
     }
     toolCall.index = assigned;
-    state.lastIndex = assigned;
   }
 }
 
 /**
- * Repairs unreliable streamed tool-call indices in place. Exported (underscore
- * prefix) for unit testing.
+ * Repairs unreliable streamed tool-call indices in place. State is kept per
+ * `choice.index` because `tool_calls[].index` is scoped to a choice, so
+ * concurrent choices (`n > 1`) never influence one another. Exported
+ * (underscore prefix) for unit testing.
  */
 export async function* _reindexToolCallStream(
   stream: AsyncIterable<OpenAIChatCompletionChunk>
 ): AsyncGenerator<OpenAIChatCompletionChunk> {
-  const state = createToolCallReindexState();
+  const stateByChoice = new Map<number, ToolCallReindexState>();
   for await (const chunk of stream) {
     for (const choice of chunk.choices) {
       const toolCalls = choice.delta.tool_calls;
-      if (toolCalls != null && toolCalls.length > 0) {
-        reindexToolCallDeltas(toolCalls, state);
+      if (toolCalls == null || toolCalls.length === 0) {
+        continue;
       }
+      let state = stateByChoice.get(choice.index);
+      if (state == null) {
+        state = createToolCallReindexState();
+        stateByChoice.set(choice.index, state);
+      }
+      reindexToolCallDeltas(toolCalls, state);
     }
     yield chunk;
   }
