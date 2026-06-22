@@ -312,10 +312,130 @@ async function* filterOpenAIChatCompletionStream(
   }
 }
 
+type OpenAIToolCallDelta = NonNullable<
+  NonNullable<OpenAIChatCompletionChunk['choices'][number]['delta']['tool_calls']>[number]
+>;
+
+/**
+ * Per-stream state for repairing streamed tool-call indices from
+ * OpenAI-compatible providers that do not assign a distinct `index` to each
+ * parallel tool call. Ollama, for example, streams `index: 0` for every call
+ * in a parallel batch (ollama/ollama#15457), and older builds omit `index`
+ * entirely (ollama/ollama#7881). LangChain merges streamed tool-call chunks by
+ * `index`, so without unique indices the sibling calls collapse into one — the
+ * extra calls lose their arguments and fail tool-input schema validation
+ * before any request is sent. Repair keys on the provider's tool-call `id`
+ * (which the affected providers still emit), falling back to call-start signals
+ * when even the `id` is absent.
+ */
+type ToolCallReindexState = {
+  assignedById: Map<string, number>;
+  firstIdByProviderIndex: Map<number, string>;
+  next: number;
+  active: boolean;
+  seeded: boolean;
+  lastIndex?: number;
+};
+
+function createToolCallReindexState(): ToolCallReindexState {
+  return {
+    assignedById: new Map(),
+    firstIdByProviderIndex: new Map(),
+    next: 0,
+    active: false,
+    seeded: false,
+  };
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value !== '';
+}
+
+/**
+ * Rewrites `index` on a delta's tool calls so siblings stay distinct. Repair
+ * only engages once the provider's indices prove unreliable — two different
+ * ids sharing one index, or a call start with no index at all — so well-behaved
+ * streams (official OpenAI, modern Ollama) pass through byte-for-byte.
+ */
+function reindexToolCallDeltas(
+  toolCalls: OpenAIToolCallDelta[],
+  state: ToolCallReindexState
+): void {
+  for (const toolCall of toolCalls) {
+    const id = isNonEmptyString(toolCall.id) ? toolCall.id : undefined;
+    const providerIndex =
+      typeof toolCall.index === 'number' ? toolCall.index : undefined;
+    const isCallStart = id != null || isNonEmptyString(toolCall.function?.name);
+
+    if (!state.active) {
+      if (isCallStart && providerIndex == null) {
+        state.active = true;
+      } else if (id != null && providerIndex != null) {
+        const firstId = state.firstIdByProviderIndex.get(providerIndex);
+        if (firstId == null) {
+          state.firstIdByProviderIndex.set(providerIndex, id);
+        } else if (firstId !== id) {
+          state.active = true;
+        }
+      }
+    }
+
+    if (!state.active) {
+      if (providerIndex != null) {
+        state.lastIndex = providerIndex;
+      }
+      continue;
+    }
+
+    if (!state.seeded) {
+      // Preserve indices already emitted before repair engaged.
+      for (const [index, firstId] of state.firstIdByProviderIndex) {
+        if (!state.assignedById.has(firstId)) {
+          state.assignedById.set(firstId, index);
+          state.next = Math.max(state.next, index + 1);
+        }
+      }
+      state.seeded = true;
+    }
+
+    let assigned: number;
+    if (id != null) {
+      assigned = state.assignedById.get(id) ?? state.next++;
+      state.assignedById.set(id, assigned);
+    } else if (isCallStart) {
+      assigned = state.next++;
+    } else {
+      assigned = state.lastIndex ?? 0;
+    }
+    toolCall.index = assigned;
+    state.lastIndex = assigned;
+  }
+}
+
+/**
+ * Repairs unreliable streamed tool-call indices in place. Exported (underscore
+ * prefix) for unit testing.
+ */
+export async function* _reindexToolCallStream(
+  stream: AsyncIterable<OpenAIChatCompletionChunk>
+): AsyncGenerator<OpenAIChatCompletionChunk> {
+  const state = createToolCallReindexState();
+  for await (const chunk of stream) {
+    for (const choice of chunk.choices) {
+      const toolCalls = choice.delta.tool_calls;
+      if (toolCalls != null && toolCalls.length > 0) {
+        reindexToolCallDeltas(toolCalls, state);
+      }
+    }
+    yield chunk;
+  }
+}
+
 async function completionWithFilteredOpenAIStream(
   request: OpenAIChatCompletionRequest,
   requestOptions: OpenAICoreRequestOptions | undefined,
-  completionWithRetry: OpenAIChatCompletionRetry
+  completionWithRetry: OpenAIChatCompletionRetry,
+  options?: { reindexToolCalls?: boolean }
 ): Promise<OpenAIChatCompletionResult> {
   if (request.stream !== true) {
     return (await completionWithRetry(
@@ -325,9 +445,12 @@ async function completionWithFilteredOpenAIStream(
   }
 
   const stream = await completionWithRetry(request, requestOptions);
-  return filterOpenAIChatCompletionStream(
+  const filtered = filterOpenAIChatCompletionStream(
     stream as AsyncIterable<OpenAIChatCompletionStreamItem>
   );
+  return options?.reindexToolCalls === true
+    ? _reindexToolCallStream(filtered)
+    : filtered;
 }
 
 function attachLibreChatDeltaFields(
@@ -779,7 +902,10 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
     return completionWithFilteredOpenAIStream(
       request,
       requestOptions,
-      super.completionWithRetry.bind(this) as OpenAIChatCompletionRetry
+      super.completionWithRetry.bind(this) as OpenAIChatCompletionRetry,
+      // Official OpenAI streams tool calls with correct distinct indices;
+      // OpenAI-compatible endpoints (Ollama, etc.) may not — repair those.
+      { reindexToolCalls: !isOfficialOpenAIBaseURL(this.clientConfig.baseURL) }
     );
   }
 
@@ -1264,7 +1390,15 @@ class LibreChatAzureOpenAICompletions extends OriginalAzureChatOpenAICompletions
     return completionWithFilteredOpenAIStream(
       request,
       requestOptions,
-      super.completionWithRetry.bind(this) as OpenAIChatCompletionRetry
+      super.completionWithRetry.bind(this) as OpenAIChatCompletionRetry,
+      // First-party Azure shares OpenAI's stream contract; a proxy / Azure-
+      // compatible endpoint may not — repair tool-call indices for those.
+      {
+        reindexToolCalls: !isFirstPartyAzureEndpoint({
+          baseURL: this.clientConfig.baseURL,
+          azureOpenAIBasePath: this.azureOpenAIBasePath,
+        }),
+      }
     );
   }
 }

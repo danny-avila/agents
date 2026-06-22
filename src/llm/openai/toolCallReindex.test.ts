@@ -1,0 +1,134 @@
+import { expect, test, describe } from '@jest/globals';
+import { _reindexToolCallStream } from './index';
+
+/**
+ * Regression coverage for OpenAI-compatible providers (e.g. Ollama) that stream
+ * parallel tool calls without a distinct, reliable `index` per call.
+ * See ollama/ollama#15457 (index always 0) and #7881 (no index). Downstream,
+ * LangChain merges streamed tool-call chunks by `index`, so without repair the
+ * sibling calls collapse and the extra calls lose their arguments — surfacing
+ * as "Received tool input did not match expected schema" before any request is
+ * sent (LibreChat #13885).
+ */
+
+const TOOL = 'echo_mcp_everything-test';
+
+type ToolCallDelta = {
+  index?: number;
+  id?: string;
+  type?: 'function';
+  function?: { name?: string; arguments?: string };
+};
+
+function chunkWith(toolCalls: ToolCallDelta[]): Record<string, unknown> {
+  return {
+    id: 'chatcmpl-1',
+    object: 'chat.completion.chunk',
+    created: 1,
+    model: 'qwen',
+    choices: [{ index: 0, delta: { tool_calls: toolCalls }, finish_reason: null }],
+  };
+}
+
+async function reindex(chunks: ToolCallDelta[][]): Promise<ToolCallDelta[]> {
+  async function* source(): AsyncGenerator<Record<string, unknown>> {
+    for (const toolCalls of chunks) {
+      yield chunkWith(toolCalls);
+    }
+  }
+  const flat: ToolCallDelta[] = [];
+  for await (const chunk of _reindexToolCallStream(
+    source() as unknown as AsyncIterable<never>,
+  )) {
+    const choices = (chunk as unknown as Record<string, unknown>)
+      .choices as Array<{ delta?: { tool_calls?: ToolCallDelta[] } }>;
+    for (const choice of choices) {
+      flat.push(...(choice.delta?.tool_calls ?? []));
+    }
+  }
+  return flat;
+}
+
+/**
+ * Merge tool-call deltas the way an `index`-keyed accumulator (LangChain,
+ * Vercel AI SDK) does: concatenate argument fragments per index, then parse.
+ * Returns the parsed args per call ordered by index, or `null` for a call
+ * whose accumulated arguments are not valid JSON.
+ */
+function mergeByIndex(deltas: ToolCallDelta[]): Array<unknown> {
+  const byIndex = new Map<number, { args: string }>();
+  for (const d of deltas) {
+    const index = typeof d.index === 'number' ? d.index : 0;
+    const bucket = byIndex.get(index) ?? { args: '' };
+    bucket.args += d.function?.arguments ?? '';
+    byIndex.set(index, bucket);
+  }
+  return [...byIndex.keys()]
+    .sort((a, b) => a - b)
+    .map((index) => {
+      try {
+        return JSON.parse(byIndex.get(index)!.args) as unknown;
+      } catch {
+        return null;
+      }
+    });
+}
+
+describe('streamed tool-call index repair', () => {
+  test('repairs index: 0 on every call, fragmented args (ollama/ollama#15457)', async () => {
+    const out = await reindex([
+      [{ index: 0, id: 'a', type: 'function', function: { name: TOOL, arguments: '' } }],
+      [{ index: 0, function: { arguments: '{"message":' } }],
+      [{ index: 0, function: { arguments: '"alpha"}' } }],
+      [{ index: 0, id: 'b', type: 'function', function: { name: TOOL, arguments: '' } }],
+      [{ index: 0, function: { arguments: '{"message":' } }],
+      [{ index: 0, function: { arguments: '"beta"}' } }],
+      [{ index: 0, id: 'c', type: 'function', function: { name: TOOL, arguments: '' } }],
+      [{ index: 0, function: { arguments: '{"message":' } }],
+      [{ index: 0, function: { arguments: '"gamma"}' } }],
+    ]);
+    expect(mergeByIndex(out)).toEqual([
+      { message: 'alpha' },
+      { message: 'beta' },
+      { message: 'gamma' },
+    ]);
+  });
+
+  test('repairs missing index, fragmented args (ollama/ollama#7881)', async () => {
+    const out = await reindex([
+      [{ id: 'a', type: 'function', function: { name: TOOL, arguments: '' } }],
+      [{ function: { arguments: '{"message":"alpha"}' } }],
+      [{ id: 'b', type: 'function', function: { name: TOOL, arguments: '' } }],
+      [{ function: { arguments: '{"message":"beta"}' } }],
+    ]);
+    expect(mergeByIndex(out)).toEqual([{ message: 'alpha' }, { message: 'beta' }]);
+  });
+
+  test('leaves well-behaved streams (distinct indices) untouched', async () => {
+    const input: ToolCallDelta[][] = [
+      [{ index: 0, id: 'a', type: 'function', function: { name: TOOL, arguments: '{"message":' } }],
+      [{ index: 0, function: { arguments: '"alpha"}' } }],
+      [{ index: 1, id: 'b', type: 'function', function: { name: TOOL, arguments: '{"message":"beta"}' } }],
+      [{ index: 2, id: 'c', type: 'function', function: { name: TOOL, arguments: '{"message":"gamma"}' } }],
+    ];
+    const out = await reindex(input.map((c) => JSON.parse(JSON.stringify(c))));
+    expect(out.map((tc) => tc.index)).toEqual([0, 0, 1, 2]);
+    expect(mergeByIndex(out)).toEqual([
+      { message: 'alpha' },
+      { message: 'beta' },
+      { message: 'gamma' },
+    ]);
+  });
+
+  test('without repair, fragmented args + shared index 0 collapse (documents the bug)', () => {
+    const raw: ToolCallDelta[] = [
+      { index: 0, id: 'a', type: 'function', function: { name: TOOL, arguments: '' } },
+      { index: 0, function: { arguments: '{"message":"alpha"}' } },
+      { index: 0, id: 'b', type: 'function', function: { name: TOOL, arguments: '' } },
+      { index: 0, function: { arguments: '{"message":"beta"}' } },
+    ];
+    // Index-keyed merge with no repair collapses both calls into index 0, whose
+    // concatenated args are not valid JSON.
+    expect(mergeByIndex(raw)).toEqual([null]);
+  });
+});
