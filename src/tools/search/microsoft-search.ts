@@ -27,6 +27,30 @@ interface MicrosoftNewsResult {
   isAdult?: boolean;
 }
 
+interface MicrosoftVideoResult {
+  title?: string;
+  url?: string;
+  description?: string;
+  summary?: string;
+  publishedBy?: string;
+  length?: string;
+  lastUpdatedAt?: string;
+  thumbnailUrl?: string;
+  isAdult?: boolean;
+}
+
+interface MicrosoftImageResult {
+  title?: string;
+  url?: string;
+  hostPageUrl?: string;
+  caption?: string;
+  width?: number;
+  height?: number;
+  thumbnailUrl?: string;
+  lastUpdatedAt?: string;
+  isAdult?: boolean;
+}
+
 interface MicrosoftWebResponse {
   webResults?: MicrosoftWebResult[];
   traceId?: string;
@@ -37,8 +61,26 @@ interface MicrosoftNewsResponse {
   traceId?: string;
 }
 
+interface MicrosoftVideosResponse {
+  videoResults?: MicrosoftVideoResult[];
+  traceId?: string;
+}
+
+interface MicrosoftImagesResponse {
+  imageResults?: MicrosoftImageResult[];
+  traceId?: string;
+}
+
 const truncate = (text: string, maxLength: number): string =>
   text.length > maxLength ? text.slice(0, maxLength) : text;
+
+const getHostname = (link: string): string => {
+  try {
+    return new URL(link).hostname;
+  } catch {
+    return '';
+  }
+};
 
 /**
  * Microsoft Web IQ search API.
@@ -47,7 +89,10 @@ const truncate = (text: string, maxLength: number): string =>
  * returned `content` is a query-relevant extract used as the organic snippet;
  * full-text grounding is left to the Browse scraper. News search hits
  * `POST /v3/search/news` and is mapped to topStories, mirroring how Serper
- * folds news results into topStories.
+ * folds news results into topStories. Video search hits
+ * `POST /v3/search/videos` and is mapped to the `videos` collection; image
+ * search hits `POST /v3/search/images` and is mapped to the `images`
+ * collection.
  */
 export const createMicrosoftSearchAPI = (
   config: t.SearchConfig
@@ -171,17 +216,117 @@ export const createMicrosoftSearchAPI = (
     return { success: true, data };
   };
 
+  const searchVideos = async (
+    query: string,
+    numResults: number,
+    safeSearch?: t.SafeSearchLevel
+  ): Promise<t.SearchResult> => {
+    const payload: Record<string, string | number> = {
+      query,
+      maxResults: options.maxResults ?? numResults,
+      language: options.language ?? 'en',
+      region: options.region ?? 'US',
+      safeSearch: safeSearch === 0 ? 'off' : 'strict',
+    };
+    if (options.freshness != null && options.freshness !== '') {
+      payload.freshness = options.freshness;
+    }
+    const response = await axios.post<MicrosoftVideosResponse>(
+      `${baseUrl}/search/videos`,
+      payload,
+      { headers, timeout: REQUEST_TIMEOUT }
+    );
+
+    const videoResults = response.data.videoResults ?? [];
+    const videos: t.VideoResult[] = videoResults
+      .filter((item) => item.url != null && item.url !== '')
+      .map((item, index) => ({
+        position: index + 1,
+        title: item.title ?? '',
+        link: item.url ?? '',
+        snippet: item.description ?? item.summary ?? '',
+        imageUrl: item.thumbnailUrl ?? '',
+        duration: item.length ?? '',
+        channel: item.publishedBy ?? '',
+        source: getHostname(item.url ?? ''),
+        date: item.lastUpdatedAt ?? '',
+      }));
+
+    const data: t.SearchResultData = {
+      organic: [],
+      topStories: [],
+      images: [],
+      videos,
+      news: [],
+      relatedSearches: [],
+    };
+
+    return { success: true, data };
+  };
+
+  const searchImages = async (
+    query: string,
+    numResults: number,
+    safeSearch?: t.SafeSearchLevel
+  ): Promise<t.SearchResult> => {
+    const payload: Record<string, string | number> = {
+      query,
+      maxResults: options.maxResults ?? numResults,
+      language: options.language ?? 'en',
+      region: options.region ?? 'US',
+      safeSearch: safeSearch === 0 ? 'off' : 'strict',
+    };
+    const response = await axios.post<MicrosoftImagesResponse>(
+      `${baseUrl}/search/images`,
+      payload,
+      { headers, timeout: REQUEST_TIMEOUT }
+    );
+
+    const imageResults = response.data.imageResults ?? [];
+    const images: t.ImageResult[] = imageResults
+      .filter((item) => item.url != null && item.url !== '')
+      .map((item, index) => ({
+        position: index + 1,
+        title: item.title ?? '',
+        imageUrl: item.url ?? '',
+        imageWidth: item.width,
+        imageHeight: item.height,
+        thumbnailUrl: item.thumbnailUrl ?? '',
+        link: item.hostPageUrl ?? '',
+        source: getHostname(item.hostPageUrl ?? ''),
+        domain: getHostname(item.hostPageUrl ?? ''),
+      }));
+
+    const data: t.SearchResultData = {
+      organic: [],
+      topStories: [],
+      images,
+      videos: [],
+      news: [],
+      relatedSearches: [],
+    };
+
+    return { success: true, data };
+  };
+
   const getSources = async ({
     query,
     numResults = DEFAULT_MAX_RESULTS,
     type,
     news,
+    safeSearch,
   }: t.GetSourcesParams): Promise<t.SearchResult> => {
     if (!query.trim()) {
       return { success: false, error: 'Query cannot be empty' };
     }
 
     try {
+      if (type === 'images') {
+        return await searchImages(query, numResults, safeSearch);
+      }
+      if (type === 'videos') {
+        return await searchVideos(query, numResults, safeSearch);
+      }
       if (news === true || type === 'news') {
         return await searchNews(query, numResults);
       }

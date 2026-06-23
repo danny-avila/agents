@@ -131,9 +131,117 @@ describe('Microsoft Web IQ search API', () => {
     expect(result.data?.news?.[0]?.snippet).toBe('terse news snippet');
   });
 
+  it('hits the videos endpoint and maps videoResults to videos when type is videos', async () => {
+    mockedAxios.post.mockResolvedValueOnce({
+      status: 200,
+      data: {
+        videoResults: [
+          {
+            title: 'Cute Puppies',
+            url: 'https://videos.example.com/watch?v=abc',
+            description: 'A compilation of puppies.',
+            publishedBy: 'Puppy Channel',
+            length: '00:03:21',
+            thumbnailUrl: 'https://img.example.com/thumb.jpg',
+            lastUpdatedAt: '2026-01-06T00:00:00Z',
+          },
+          {
+            title: 'No URL',
+            url: '',
+            description: 'should be filtered out',
+          },
+        ],
+        traceId: 'trace-videos',
+      },
+    });
+
+    const searchAPI = createSearchAPI({
+      searchProvider: 'microsoftWebIQ',
+      microsoftWebIQApiKey: 'test-key',
+    });
+
+    const result = await searchAPI.getSources({
+      query: 'cute puppy videos',
+      type: 'videos',
+      safeSearch: 0,
+    });
+
+    const [url, payload] = mockedAxios.post.mock.calls[0];
+    expect(url).toBe('https://api.microsoft.ai/v3/search/videos');
+    expect(payload).toMatchObject({
+      query: 'cute puppy videos',
+      safeSearch: 'off',
+    });
+    expect(result.data?.videos).toEqual([
+      {
+        position: 1,
+        title: 'Cute Puppies',
+        link: 'https://videos.example.com/watch?v=abc',
+        snippet: 'A compilation of puppies.',
+        imageUrl: 'https://img.example.com/thumb.jpg',
+        duration: '00:03:21',
+        channel: 'Puppy Channel',
+        source: 'videos.example.com',
+        date: '2026-01-06T00:00:00Z',
+      },
+    ]);
+  });
+
+  it('hits the images endpoint and maps imageResults to images when type is images', async () => {
+    mockedAxios.post.mockResolvedValueOnce({
+      status: 200,
+      data: {
+        imageResults: [
+          {
+            title: 'A Cat',
+            url: 'https://img.example.com/cat.jpg',
+            hostPageUrl: 'https://cats.example.com/gallery',
+            caption: 'a fluffy cat',
+            width: 800,
+            height: 600,
+            thumbnailUrl: 'https://img.example.com/cat-thumb.jpg',
+            lastUpdatedAt: '2026-01-07T00:00:00Z',
+          },
+          {
+            title: 'No URL',
+            url: '',
+            hostPageUrl: 'https://cats.example.com/missing',
+          },
+        ],
+        traceId: 'trace-images',
+      },
+    });
+
+    const searchAPI = createSearchAPI({
+      searchProvider: 'microsoftWebIQ',
+      microsoftWebIQApiKey: 'test-key',
+    });
+
+    const result = await searchAPI.getSources({
+      query: 'cats',
+      type: 'images',
+    });
+
+    const [url, payload] = mockedAxios.post.mock.calls[0];
+    expect(url).toBe('https://api.microsoft.ai/v3/search/images');
+    expect(payload).toMatchObject({ query: 'cats', safeSearch: 'strict' });
+    expect(result.data?.images).toEqual([
+      {
+        position: 1,
+        title: 'A Cat',
+        imageUrl: 'https://img.example.com/cat.jpg',
+        imageWidth: 800,
+        imageHeight: 600,
+        thumbnailUrl: 'https://img.example.com/cat-thumb.jpg',
+        link: 'https://cats.example.com/gallery',
+        source: 'cats.example.com',
+        domain: 'cats.example.com',
+      },
+    ]);
+  });
+
   it('returns a failure result when the request throws', async () => {
     mockedAxios.post.mockRejectedValueOnce(new Error('Network error'));
-
     const searchAPI = createSearchAPI({
       searchProvider: 'microsoftWebIQ',
       microsoftWebIQApiKey: 'test-key',

@@ -117,6 +117,7 @@ export interface MicrosoftWebIQSearchOptions {
   contentFormat?: 'passage' | 'text' | 'html' | 'markdown';
   maxLength?: number;
   location?: string;
+  freshness?: string;
 }
 
 export interface SearchConfig {

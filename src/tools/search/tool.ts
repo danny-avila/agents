@@ -496,8 +496,7 @@ export const createSearchTool = (
   const search = createSearchProcessor({
     searchAPI,
     safeSearch,
-    supportsVideos:
-      searchProvider !== 'tavily' && searchProvider !== 'microsoftWebIQ',
+    supportsVideos: searchProvider !== 'tavily',
     sourceProcessor,
     onGetHighlights,
     logger,

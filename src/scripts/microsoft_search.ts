@@ -49,8 +49,42 @@ async function testNewsSearch(): Promise<void> {
   console.dir(result.data?.topStories?.slice(0, 3), { depth: null });
 }
 
+async function testVideoSearch(): Promise<void> {
+  header('3. Video Search (/v3/search/videos)');
+  const api = createMicrosoftSearchAPI({
+    searchProvider: 'microsoftWebIQ',
+    microsoftWebIQApiKey: apiKey,
+    microsoftWebIQBaseUrl: baseUrl,
+  });
+  const result = await api.getSources({ query: QUERY, type: 'videos' });
+  console.log('success:', result.success);
+  if (!result.success) {
+    console.log('error:', result.error);
+    return;
+  }
+  console.log('videos count:', result.data?.videos?.length ?? 0);
+  console.dir(result.data?.videos?.slice(0, 3), { depth: null });
+}
+
+async function testImageSearch(): Promise<void> {
+  header('4. Image Search (/v3/search/images)');
+  const api = createMicrosoftSearchAPI({
+    searchProvider: 'microsoftWebIQ',
+    microsoftWebIQApiKey: apiKey,
+    microsoftWebIQBaseUrl: baseUrl,
+  });
+  const result = await api.getSources({ query: QUERY, type: 'images' });
+  console.log('success:', result.success);
+  if (!result.success) {
+    console.log('error:', result.error);
+    return;
+  }
+  console.log('images count:', result.data?.images?.length ?? 0);
+  console.dir(result.data?.images?.slice(0, 3), { depth: null });
+}
+
 async function testBrowse(): Promise<void> {
-  header('3. Browse scraper (/v3/browse)');
+  header('5. Browse scraper (/v3/browse)');
   const scraper = createMicrosoftScraper({
     apiKey,
     baseUrl,
@@ -71,7 +105,7 @@ async function testBrowse(): Promise<void> {
 
 async function testFullTool(): Promise<void> {
   header(
-    '4. Full search tool (search -> scrape -> rerank, no LLM, no reranker)'
+    '6. Full search tool (search -> scrape -> rerank, no LLM, no reranker)'
   );
   const tool = createSearchTool({
     searchProvider: 'microsoftWebIQ',
@@ -96,6 +130,8 @@ async function main(): Promise<void> {
 
   await testWebSearch();
   await testNewsSearch();
+  await testVideoSearch();
+  await testImageSearch();
   await testBrowse();
   await testFullTool();
 }
