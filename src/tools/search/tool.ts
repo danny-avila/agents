@@ -315,7 +315,11 @@ function createTool({
         }),
       });
       const turn = runnableConfig.toolCall?.turn ?? 0;
-      const { output, references } = formatResultsForLLM(turn, searchResult, maxOutputChars);
+      const { output, references } = formatResultsForLLM(
+        turn,
+        searchResult,
+        maxOutputChars
+      );
       const data: t.SearchResultData = { turn, ...searchResult, references };
       return [output, { [Constants.WEB_SEARCH]: data }];
     },
@@ -358,6 +362,9 @@ export const createSearchTool = (
     tavilySearchUrl,
     tavilyExtractUrl,
     tavilySearchOptions,
+    keenableApiKey,
+    keenableApiUrl,
+    keenableSearchOptions,
     rerankerType = 'cohere',
     topResults = 5,
     maxContentLength,
@@ -415,6 +422,9 @@ export const createSearchTool = (
     tavilyApiKey,
     tavilySearchUrl,
     tavilySearchOptions: effectiveTavilySearchOptions,
+    keenableApiKey,
+    keenableApiUrl,
+    keenableSearchOptions,
   });
 
   /** Create scraper based on scraperProvider */
@@ -477,7 +487,8 @@ export const createSearchTool = (
   const search = createSearchProcessor({
     searchAPI,
     safeSearch,
-    supportsVideos: searchProvider !== 'tavily',
+    supportsVideos:
+      searchProvider !== 'tavily' && searchProvider !== 'keenable',
     sourceProcessor,
     onGetHighlights,
     logger,
