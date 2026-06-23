@@ -334,6 +334,10 @@ interface FormatAssistantMessageOptions {
 
 interface FormatAgentMessagesOptions {
   provider?: Providers;
+  /** Reconstruct hidden `reasoning_content` from `THINK` parts onto prior
+   *  tool-call messages. Explicit opt-in for OpenAI-compatible endpoints that
+   *  replay reasoning across turns; defaults to on for DeepSeek thinking-mode. */
+  preserveReasoningContent?: boolean;
   /** Skill names already primed fresh this turn (manual/always-apply). Their
    *  historical `skill` tool_calls are not reconstructed into a HumanMessage,
    *  so the same SKILL.md body is not injected twice in one request. */
@@ -1435,7 +1439,8 @@ export const formatAgentMessages = (
 
     const formattedMessages = formatAssistantMessage(processedMessage, {
       preserveUnpairedServerToolUses: i === payload.length - 1,
-      preserveReasoningContent: options?.provider === Providers.DEEPSEEK,
+      preserveReasoningContent:
+        options?.preserveReasoningContent ?? options?.provider === Providers.DEEPSEEK,
       provider: options?.provider,
     });
     if (sourceMessageId != null && sourceMessageId !== '') {
