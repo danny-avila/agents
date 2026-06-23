@@ -1,7 +1,14 @@
-import { HumanMessage } from '@langchain/core/messages';
 import { CallbackManager } from '@langchain/core/callbacks/manager';
 import { context as otelContext, trace as otelTrace } from '@opentelemetry/api';
+import { CallbackHandler as LangfuseCallbackHandler } from '@langfuse/langchain';
+import {
+  AIMessage,
+  AIMessageChunk,
+  HumanMessage,
+} from '@langchain/core/messages';
+import type { ChatGeneration, LLMResult } from '@langchain/core/outputs';
 import type * as t from '@/types';
+import { PROMPT_CACHE_TTL_RESPONSE_METADATA_KEY } from '@/messages/cache';
 import { traceIdFromSeed } from '@/langfuseRuntimeContext';
 import { Providers } from '@/common';
 import { Run } from '@/run';
@@ -505,5 +512,257 @@ describe('Langfuse callback composition', () => {
         agentName: 'Specialist Agent',
       })
     );
+  });
+
+  it('normalizes Bedrock cache write tokens into Langfuse TTL usage details', async () => {
+    const { normalizePromptCacheUsageForLangfuse } = await import(
+      '@/langfuse/promptCacheUsage'
+    );
+    const message = new AIMessage({
+      content: 'done',
+      response_metadata: {
+        [PROMPT_CACHE_TTL_RESPONSE_METADATA_KEY]: '1h',
+      },
+      usage_metadata: {
+        input_tokens: 8283,
+        output_tokens: 58,
+        total_tokens: 8341,
+        input_token_details: {
+          cache_read: 7618,
+          cache_creation: 604,
+        },
+      },
+    });
+    const output: LLMResult = {
+      generations: [[{ text: 'done', message } as ChatGeneration]],
+    };
+
+    const normalized = normalizePromptCacheUsageForLangfuse(output);
+    const normalizedMessage = (normalized.generations[0][0] as ChatGeneration)
+      .message as AIMessage;
+
+    expect(normalizedMessage.usage_metadata?.input_token_details).toEqual({
+      cache_read: 7618,
+      cache_creation: 0,
+      cache_creation_1h: 604,
+    });
+    expect(message.usage_metadata?.input_token_details).toEqual({
+      cache_read: 7618,
+      cache_creation: 604,
+    });
+  });
+
+  it('normalizes Bedrock 5m cache write tokens for Langfuse', async () => {
+    const { normalizePromptCacheUsageForLangfuse } = await import(
+      '@/langfuse/promptCacheUsage'
+    );
+    const message = new AIMessage({
+      content: 'done',
+      response_metadata: {
+        [PROMPT_CACHE_TTL_RESPONSE_METADATA_KEY]: '5m',
+      },
+      usage_metadata: {
+        input_tokens: 100,
+        output_tokens: 10,
+        total_tokens: 110,
+        input_token_details: {
+          cache_creation: 25,
+        },
+      },
+    });
+
+    const normalized = normalizePromptCacheUsageForLangfuse({
+      generations: [[{ text: 'done', message } as ChatGeneration]],
+    });
+    const normalizedMessage = (normalized.generations[0][0] as ChatGeneration)
+      .message as AIMessage;
+
+    expect(normalizedMessage.usage_metadata?.input_token_details).toEqual({
+      cache_creation: 0,
+      cache_creation_5m: 25,
+    });
+  });
+
+  it('leaves generic cache creation untouched when Bedrock TTL is missing', async () => {
+    const { normalizePromptCacheUsageForLangfuse } = await import(
+      '@/langfuse/promptCacheUsage'
+    );
+    const message = new AIMessage({
+      content: 'done',
+      usage_metadata: {
+        input_tokens: 100,
+        output_tokens: 10,
+        total_tokens: 110,
+        input_token_details: {
+          cache_creation: 25,
+        },
+      },
+    });
+
+    const output: LLMResult = {
+      generations: [[{ text: 'done', message } as ChatGeneration]],
+    };
+
+    expect(normalizePromptCacheUsageForLangfuse(output)).toBe(output);
+  });
+
+  it('normalizes Anthropic explicit cache creation buckets for Langfuse', async () => {
+    const { normalizePromptCacheUsageForLangfuse } = await import(
+      '@/langfuse/promptCacheUsage'
+    );
+    const message = new AIMessage({
+      content: 'done',
+      response_metadata: {
+        model_provider: 'anthropic',
+        usage: {
+          cache_creation: {
+            ephemeral_5m_input_tokens: 10,
+            ephemeral_1h_input_tokens: 20,
+          },
+        },
+      },
+      usage_metadata: {
+        input_tokens: 40,
+        output_tokens: 5,
+        total_tokens: 45,
+        input_token_details: {
+          cache_read: 3,
+          cache_creation: 30,
+        },
+      },
+    });
+    const output: LLMResult = {
+      generations: [[{ text: 'done', message } as ChatGeneration]],
+    };
+
+    const normalized = normalizePromptCacheUsageForLangfuse(output);
+    const normalizedMessage = (normalized.generations[0][0] as ChatGeneration)
+      .message as AIMessage;
+
+    expect(normalizedMessage.usage_metadata?.input_token_details).toEqual({
+      cache_read: 3,
+      cache_creation: 0,
+      cache_creation_5m: 10,
+      cache_creation_1h: 20,
+    });
+    expect(message.usage_metadata?.input_token_details).toEqual({
+      cache_read: 3,
+      cache_creation: 30,
+    });
+  });
+
+  it('keeps any unbucketed cache creation remainder on the generic key', async () => {
+    const { normalizePromptCacheUsageForLangfuse } = await import(
+      '@/langfuse/promptCacheUsage'
+    );
+    const message = new AIMessage({
+      content: 'done',
+      response_metadata: {
+        model_provider: 'anthropic',
+        usage: {
+          cache_creation: {
+            ephemeral_5m_input_tokens: 10,
+            ephemeral_1h_input_tokens: 20,
+          },
+        },
+      },
+      usage_metadata: {
+        input_tokens: 50,
+        output_tokens: 5,
+        total_tokens: 55,
+        input_token_details: {
+          cache_creation: 35,
+        },
+      },
+    });
+
+    const normalized = normalizePromptCacheUsageForLangfuse({
+      generations: [[{ text: 'done', message } as ChatGeneration]],
+    });
+    const normalizedMessage = (normalized.generations[0][0] as ChatGeneration)
+      .message as AIMessage;
+
+    expect(normalizedMessage.usage_metadata?.input_token_details).toEqual({
+      cache_creation: 5,
+      cache_creation_5m: 10,
+      cache_creation_1h: 20,
+    });
+  });
+
+  it('normalizes AIMessageChunk usage metadata', async () => {
+    const { normalizePromptCacheUsageForLangfuse } = await import(
+      '@/langfuse/promptCacheUsage'
+    );
+    const message = new AIMessageChunk({
+      content: 'done',
+      response_metadata: {
+        [PROMPT_CACHE_TTL_RESPONSE_METADATA_KEY]: '1h',
+      },
+      usage_metadata: {
+        input_tokens: 50,
+        output_tokens: 5,
+        total_tokens: 55,
+        input_token_details: {
+          cache_creation: 12,
+        },
+      },
+    });
+
+    const normalized = normalizePromptCacheUsageForLangfuse({
+      generations: [[{ text: 'done', message } as ChatGeneration]],
+    });
+    const normalizedMessage = (normalized.generations[0][0] as ChatGeneration)
+      .message as AIMessageChunk;
+
+    expect(normalizedMessage).toBeInstanceOf(AIMessageChunk);
+    expect(normalizedMessage.usage_metadata?.input_token_details).toEqual({
+      cache_creation: 0,
+      cache_creation_1h: 12,
+    });
+  });
+
+  it('normalizes prompt cache usage before delegating to Langfuse handleLLMEnd', async () => {
+    const { createLangfuseHandler } = await import('@/langfuse');
+    const handleLLMEndSpy = jest
+      .spyOn(LangfuseCallbackHandler.prototype, 'handleLLMEnd')
+      .mockResolvedValue(undefined);
+    const handler = createLangfuseHandler({
+      langfuse: {
+        publicKey: 'pk-test',
+        secretKey: 'sk-test',
+      },
+    });
+    const message = new AIMessage({
+      content: 'done',
+      response_metadata: {
+        [PROMPT_CACHE_TTL_RESPONSE_METADATA_KEY]: '1h',
+      },
+      usage_metadata: {
+        input_tokens: 50,
+        output_tokens: 5,
+        total_tokens: 55,
+        input_token_details: {
+          cache_creation: 12,
+        },
+      },
+    });
+
+    await handler?.handleLLMEnd(
+      { generations: [[{ text: 'done', message } as ChatGeneration]] },
+      'llm-run'
+    );
+
+    const delegatedOutput = handleLLMEndSpy.mock.calls[0]?.[0] as LLMResult;
+    handleLLMEndSpy.mockRestore();
+    const delegatedMessage = (
+      delegatedOutput.generations[0][0] as ChatGeneration
+    ).message as AIMessage;
+    expect(delegatedMessage.usage_metadata?.input_token_details).toEqual({
+      cache_creation: 0,
+      cache_creation_1h: 12,
+    });
+    expect(message.usage_metadata?.input_token_details).toEqual({
+      cache_creation: 12,
+    });
   });
 });
