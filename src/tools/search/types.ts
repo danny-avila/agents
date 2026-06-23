@@ -3,7 +3,7 @@ import type { Logger as WinstonLogger } from 'winston';
 import type { BaseReranker } from './rerankers';
 import { DATE_RANGE } from './schema';
 
-export type SearchProvider = 'serper' | 'searxng' | 'tavily';
+export type SearchProvider = 'serper' | 'searxng' | 'tavily' | 'keenable';
 export type ScraperProvider = 'firecrawl' | 'serper' | 'tavily';
 export type RerankerType = 'infinity' | 'jina' | 'cohere' | 'none';
 
@@ -115,6 +115,35 @@ export interface SearchConfig {
   tavilySearchUrl?: string;
   tavilyExtractUrl?: string;
   tavilySearchOptions?: TavilySearchOptions;
+  keenableApiKey?: string;
+  keenableApiUrl?: string;
+  keenableSearchOptions?: KeenableSearchOptions;
+}
+
+export interface KeenableSearchOptions {
+  maxResults?: number;
+  /** Restrict results to a single domain, e.g. "github.com". */
+  site?: string;
+  /** Sent as the X-Keenable-Title attribution header. Defaults to "LibreChat". */
+  attributionTitle?: string;
+  timeout?: number;
+}
+
+export interface KeenableSearchPayload {
+  query: string;
+  site?: string;
+}
+
+export interface KeenableSearchResult {
+  title?: string;
+  url?: string;
+  description?: string;
+  snippet?: string;
+  published_at?: string;
+}
+
+export interface KeenableSearchResponse {
+  results?: KeenableSearchResult[];
 }
 
 export type References = {
