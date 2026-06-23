@@ -27,9 +27,9 @@ import {
   withLangfuseAttributes,
 } from '@/langfuse';
 import {
-  resolveLangfuseConfig,
-  withLangfuseToolOutputTracingConfig,
-} from '@/langfuseToolOutputTracing';
+  resolveLangfuseRuntimeScope,
+  withLangfuseRuntimeScope,
+} from '@/langfuseRuntimeScope';
 import {
   appendCallbacks,
   findCallback,
@@ -39,13 +39,11 @@ import {
   createCompletionTitleRunnable,
   createTitleRunnable,
 } from '@/utils/title';
-import {
-  initializeLangfuseTracing,
-  runWithTraceIdSeed,
-} from './instrumentation';
 import { createTokenCounter, encodingForModel } from '@/utils/tokens';
+import { initializeLangfuseTracing } from './instrumentation';
 import { GraphEvents, Callback, TitleMethod } from '@/common';
 import { MultiAgentGraph } from '@/graphs/MultiAgentGraph';
+import { resolveLangfuseConfig } from '@/langfuseConfig';
 import { StandardGraph } from '@/graphs/Graph';
 import { initializeModel } from '@/llm/init';
 import { HandlerRegistry } from '@/events';
@@ -746,6 +744,10 @@ export class Run<_T extends t.BaseGraphState> {
       sessionId,
       traceMetadata,
       tags: ['librechat', 'agent'],
+      traceIdSeed:
+        streamLangfuseConfig?.deterministicTraceId === true
+          ? this.id
+          : undefined,
     });
     if (langfuseHandler != null) {
       config.runName = traceName;
@@ -915,26 +917,26 @@ export class Run<_T extends t.BaseGraphState> {
       // When opted in, seed the root trace id from this run's id so feedback /
       // other external signals can be attached to the trace later without a
       // lookup (see SeededTraceIdGenerator in ./instrumentation).
-      await runWithTraceIdSeed(
-        streamLangfuseConfig?.deterministicTraceId === true
-          ? this.id
-          : undefined,
+      await withLangfuseRuntimeScope(
+        resolveLangfuseRuntimeScope({
+          runLangfuse: streamLangfuseConfig,
+          langfuseOverlay: this.getStreamToolOutputTracingLangfuseConfig(graph),
+          traceIdSeed:
+            streamLangfuseConfig?.deterministicTraceId === true
+              ? this.id
+              : undefined,
+        }),
         () =>
-          withLangfuseToolOutputTracingConfig(
-            streamLangfuseConfig,
-            () =>
-              withLangfuseAttributes(
-                {
-                  langfuse: streamLangfuseConfig,
-                  userId,
-                  sessionId,
-                  traceName,
-                  traceMetadata,
-                  tags: ['librechat', 'agent'],
-                },
-                consumeStream
-              ),
-            this.getStreamToolOutputTracingLangfuseConfig(graph)
+          withLangfuseAttributes(
+            {
+              langfuse: streamLangfuseConfig,
+              userId,
+              sessionId,
+              traceName,
+              traceMetadata,
+              tags: ['librechat', 'agent'],
+            },
+            consumeStream
           )
       );
     } catch (err) {
@@ -1312,6 +1314,10 @@ export class Run<_T extends t.BaseGraphState> {
         sessionId: titleSessionId,
         traceMetadata,
         tags: ['librechat', 'title'],
+        traceIdSeed:
+          titleLangfuseConfig?.deterministicTraceId === true
+            ? 'title-' + this.id
+            : undefined,
       });
 
       if (titleLangfuseHandler != null) {
@@ -1404,10 +1410,12 @@ export class Run<_T extends t.BaseGraphState> {
 
     try {
       try {
-        return await withLangfuseToolOutputTracingConfig(
-          this.langfuse,
-          () => invokeTitleChain(invokeConfig),
-          titleContext?.langfuse
+        return await withLangfuseRuntimeScope(
+          resolveLangfuseRuntimeScope({
+            runLangfuse: this.langfuse,
+            langfuseOverlay: titleContext?.langfuse,
+          }),
+          () => invokeTitleChain(invokeConfig)
         );
       } catch (_e) {
         // Fallback: strip callbacks to avoid EventStream tracer errors in certain environments
@@ -1420,10 +1428,12 @@ export class Run<_T extends t.BaseGraphState> {
         const safeConfig = Object.assign({}, rest, {
           callbacks: langfuseHandler ? [langfuseHandler] : [],
         });
-        return await withLangfuseToolOutputTracingConfig(
-          this.langfuse,
-          () => invokeTitleChain(safeConfig as Partial<RunnableConfig>),
-          titleContext?.langfuse
+        return await withLangfuseRuntimeScope(
+          resolveLangfuseRuntimeScope({
+            runLangfuse: this.langfuse,
+            langfuseOverlay: titleContext?.langfuse,
+          }),
+          () => invokeTitleChain(safeConfig as Partial<RunnableConfig>)
         );
       }
     } finally {

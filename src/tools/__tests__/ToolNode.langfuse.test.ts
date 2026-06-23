@@ -1,18 +1,25 @@
-const mockWithLangfuseToolOutputTracingConfig = jest.fn(
-  (_runLangfuse: unknown, action: () => unknown, _agentLangfuse: unknown) =>
-    action()
+const mockWithLangfuseRuntimeScope = jest.fn(
+  (_scope: unknown, action: () => unknown) => action()
 );
+const mockResolvedScope = {
+  langfuse: {
+    toolOutputTracing: { enabled: false },
+  },
+};
+const mockResolveLangfuseRuntimeScope = jest.fn(() => mockResolvedScope);
 
-jest.mock('@/langfuseToolOutputTracing', () => ({
-  ...jest.requireActual('@/langfuseToolOutputTracing'),
-  withLangfuseToolOutputTracingConfig: mockWithLangfuseToolOutputTracingConfig,
+jest.mock('@/langfuseRuntimeScope', () => ({
+  ...jest.requireActual('@/langfuseRuntimeScope'),
+  resolveLangfuseRuntimeScope: mockResolveLangfuseRuntimeScope,
+  withLangfuseRuntimeScope: mockWithLangfuseRuntimeScope,
 }));
 
 import { ToolNode } from '../ToolNode';
 
 describe('ToolNode Langfuse redaction context', () => {
   beforeEach(() => {
-    mockWithLangfuseToolOutputTracingConfig.mockClear();
+    mockWithLangfuseRuntimeScope.mockClear();
+    mockResolveLangfuseRuntimeScope.mockClear();
   });
 
   it('uses a stable default run name for tracing', () => {
@@ -38,10 +45,13 @@ describe('ToolNode Langfuse redaction context', () => {
       'ToolNode only accepts AIMessages'
     );
 
-    expect(mockWithLangfuseToolOutputTracingConfig).toHaveBeenCalledWith(
+    expect(mockResolveLangfuseRuntimeScope).toHaveBeenCalledWith({
       runLangfuse,
-      expect.any(Function),
-      agentLangfuse
+      langfuseOverlay: agentLangfuse,
+    });
+    expect(mockWithLangfuseRuntimeScope).toHaveBeenCalledWith(
+      mockResolvedScope,
+      expect.any(Function)
     );
   });
 });

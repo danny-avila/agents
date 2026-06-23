@@ -34,6 +34,10 @@ import type {
 } from '@/hooks';
 import type * as t from '@/types';
 import {
+  resolveLangfuseRuntimeScope,
+  withLangfuseRuntimeScope,
+} from '@/langfuseRuntimeScope';
+import {
   buildReferenceKey,
   ToolOutputReferenceRegistry,
 } from '@/tools/toolOutputReferences';
@@ -49,7 +53,6 @@ import {
   resolveLocalToolRegistry,
   resolveLocalExecutionTools,
 } from '@/tools/local';
-import { withLangfuseToolOutputTracingConfig } from '@/langfuseToolOutputTracing';
 import { stripCodeSessionFileSummary } from '@/tools/CodeSessionFileSummary';
 import { Constants, GraphEvents, CODE_EXECUTION_TOOLS } from '@/common';
 import { toLangChainContent } from '@/messages/langchain';
@@ -577,10 +580,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     options?: Partial<RunnableConfig>
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
   ): Promise<any> {
-    return withLangfuseToolOutputTracingConfig(
-      this.runLangfuse,
-      () => super.invoke(input, options),
-      this.agentLangfuse
+    return withLangfuseRuntimeScope(
+      resolveLangfuseRuntimeScope({
+        runLangfuse: this.runLangfuse,
+        langfuseOverlay: this.agentLangfuse,
+      }),
+      () => super.invoke(input, options)
     );
   }
 

@@ -537,6 +537,15 @@ export interface LangfuseConfig {
   secretKey?: string;
   baseUrl?: string;
   metadata?: Record<string, string | number | boolean | null | undefined>;
+  /**
+   * Internal OTLP span attributes to attach to Langfuse observations before
+   * export. Intended for collector-side routing/filtering; strip these in the
+   * collector before forwarding spans to Langfuse.
+   */
+  librechatTraceAttributes?: Record<
+    string,
+    string | number | boolean | null | undefined
+  >;
   tags?: string[];
   toolNodeTracing?: LangfuseToolNodeTracingConfig;
   toolOutputTracing?: LangfuseToolOutputTracingConfig;
