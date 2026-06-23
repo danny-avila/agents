@@ -4,25 +4,37 @@ config();
 import { createMicrosoftSearchAPI } from '@/tools/search/microsoft-search';
 import { createMicrosoftScraper } from '@/tools/search/microsoft-scraper';
 import { createSearchTool } from '@/tools/search';
+import { Constants } from '@/common';
 
 const apiKey = process.env.MICROSOFT_WEBIQ_API_KEY;
 const baseUrl = process.env.MICROSOFT_WEBIQ_BASE_URL;
 
 const QUERY = process.env.SMOKE_QUERY ?? 'latest typescript release notes';
 const SCRAPE_URL = process.env.SMOKE_URL ?? 'https://www.typescriptlang.org/';
+/** Comma-separated subset of steps to run, e.g. SMOKE_ONLY=videos,images */
+const ONLY = (process.env.SMOKE_ONLY ?? '')
+  .split(',')
+  .map((step) => step.trim().toLowerCase())
+  .filter((step) => step !== '');
+
+const createApi = (): ReturnType<typeof createMicrosoftSearchAPI> =>
+  createMicrosoftSearchAPI({
+    searchProvider: 'microsoftWebIQ',
+    microsoftWebIQApiKey: apiKey,
+    microsoftWebIQBaseUrl: baseUrl,
+  });
 
 function header(title: string): void {
   console.log(`\n========== ${title} ==========`);
 }
 
+function shouldRun(step: string): boolean {
+  return ONLY.length === 0 || ONLY.includes(step);
+}
+
 async function testWebSearch(): Promise<void> {
   header('1. Web Search (/v3/search/web)');
-  const api = createMicrosoftSearchAPI({
-    searchProvider: 'microsoftWebIQ',
-    microsoftWebIQApiKey: apiKey,
-    microsoftWebIQBaseUrl: baseUrl,
-  });
-  const result = await api.getSources({ query: QUERY });
+  const result = await createApi().getSources({ query: QUERY });
   console.log('success:', result.success);
   if (!result.success) {
     console.log('error:', result.error);
@@ -34,12 +46,7 @@ async function testWebSearch(): Promise<void> {
 
 async function testNewsSearch(): Promise<void> {
   header('2. News Search (/v3/search/news)');
-  const api = createMicrosoftSearchAPI({
-    searchProvider: 'microsoftWebIQ',
-    microsoftWebIQApiKey: apiKey,
-    microsoftWebIQBaseUrl: baseUrl,
-  });
-  const result = await api.getSources({ query: QUERY, news: true });
+  const result = await createApi().getSources({ query: QUERY, news: true });
   console.log('success:', result.success);
   if (!result.success) {
     console.log('error:', result.error);
@@ -51,12 +58,7 @@ async function testNewsSearch(): Promise<void> {
 
 async function testVideoSearch(): Promise<void> {
   header('3. Video Search (/v3/search/videos)');
-  const api = createMicrosoftSearchAPI({
-    searchProvider: 'microsoftWebIQ',
-    microsoftWebIQApiKey: apiKey,
-    microsoftWebIQBaseUrl: baseUrl,
-  });
-  const result = await api.getSources({ query: QUERY, type: 'videos' });
+  const result = await createApi().getSources({ query: QUERY, type: 'videos' });
   console.log('success:', result.success);
   if (!result.success) {
     console.log('error:', result.error);
@@ -68,12 +70,7 @@ async function testVideoSearch(): Promise<void> {
 
 async function testImageSearch(): Promise<void> {
   header('4. Image Search (/v3/search/images)');
-  const api = createMicrosoftSearchAPI({
-    searchProvider: 'microsoftWebIQ',
-    microsoftWebIQApiKey: apiKey,
-    microsoftWebIQBaseUrl: baseUrl,
-  });
-  const result = await api.getSources({ query: QUERY, type: 'images' });
+  const result = await createApi().getSources({ query: QUERY, type: 'images' });
   console.log('success:', result.success);
   if (!result.success) {
     console.log('error:', result.error);
@@ -85,10 +82,7 @@ async function testImageSearch(): Promise<void> {
 
 async function testBrowse(): Promise<void> {
   header('5. Browse scraper (/v3/browse)');
-  const scraper = createMicrosoftScraper({
-    apiKey,
-    baseUrl,
-  });
+  const scraper = createMicrosoftScraper({ apiKey, baseUrl });
   const [url, response] = await scraper.scrapeUrl(SCRAPE_URL);
   console.log('url:', url);
   console.log('success:', response.success);
@@ -105,7 +99,7 @@ async function testBrowse(): Promise<void> {
 
 async function testFullTool(): Promise<void> {
   header(
-    '6. Full search tool (search -> scrape -> rerank, no LLM, no reranker)'
+    '6. Full search tool (web + news + videos + images -> scrape, no LLM, no reranker)'
   );
   const tool = createSearchTool({
     searchProvider: 'microsoftWebIQ',
@@ -115,8 +109,19 @@ async function testFullTool(): Promise<void> {
     rerankerType: 'none',
     topResults: 3,
   });
-  const output = await tool.invoke({ query: QUERY });
-  console.dir(output, { depth: 4 });
+  const message = await tool.invoke({
+    name: tool.name,
+    args: { query: QUERY, news: true, videos: true, images: true },
+    id: 'smoke-full-tool',
+    type: 'tool_call',
+  });
+  const data = message.artifact?.[Constants.WEB_SEARCH];
+  console.log('organic:', data?.organic?.length ?? 0);
+  console.log('topStories:', data?.topStories?.length ?? 0);
+  console.log('videos:', data?.videos?.length ?? 0);
+  console.log('images:', data?.images?.length ?? 0);
+  console.log('\n--- formatted content sent to the model ---');
+  console.log(message.content);
 }
 
 async function main(): Promise<void> {
@@ -127,13 +132,24 @@ async function main(): Promise<void> {
   console.log('baseUrl:', baseUrl ?? 'https://api.microsoft.ai/v3 (default)');
   console.log('query:', QUERY);
   console.log('scrape url:', SCRAPE_URL);
+  if (ONLY.length > 0) {
+    console.log('only:', ONLY.join(', '));
+  }
 
-  await testWebSearch();
-  await testNewsSearch();
-  await testVideoSearch();
-  await testImageSearch();
-  await testBrowse();
-  await testFullTool();
+  const steps: Array<[string, () => Promise<void>]> = [
+    ['web', testWebSearch],
+    ['news', testNewsSearch],
+    ['videos', testVideoSearch],
+    ['images', testImageSearch],
+    ['browse', testBrowse],
+    ['tool', testFullTool],
+  ];
+
+  for (const [name, run] of steps) {
+    if (shouldRun(name)) {
+      await run();
+    }
+  }
 }
 
 main().catch((err) => {
