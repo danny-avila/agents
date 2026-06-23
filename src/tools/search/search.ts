@@ -2,6 +2,7 @@ import axios from 'axios';
 import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
 import type * as t from './types';
 import { getAttribution, createDefaultLogger } from './utils';
+import { createMicrosoftSearchAPI } from './microsoft-search';
 import { createTavilyAPI } from './tavily-search';
 import { BaseReranker } from './rerankers';
 
@@ -453,9 +454,11 @@ export const createSearchAPI = (
     return createSearXNGAPI(searxngInstanceUrl, searxngApiKey);
   } else if (searchProvider.toLowerCase() === 'tavily') {
     return createTavilyAPI(tavilyApiKey, tavilySearchUrl, tavilySearchOptions);
+  } else if (searchProvider.toLowerCase() === 'microsoftwebiq') {
+    return createMicrosoftSearchAPI(config);
   } else {
     throw new Error(
-      `Invalid search provider: ${searchProvider}. Must be 'serper', 'searxng', or 'tavily'`
+      `Invalid search provider: ${searchProvider}. Must be 'serper', 'searxng', 'tavily', or 'microsoftWebIQ'`
     );
   }
 };

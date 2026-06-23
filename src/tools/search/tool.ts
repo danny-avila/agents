@@ -13,6 +13,7 @@ import {
   DATE_RANGE,
 } from './schema';
 import { createSearchAPI, createSourceProcessor } from './search';
+import { createMicrosoftScraper } from './microsoft-scraper';
 import { createSerperScraper } from './serper-scraper';
 import { createTavilyScraper } from './tavily-scraper';
 import { createFirecrawlScraper } from './firecrawl';
@@ -315,7 +316,11 @@ function createTool({
         }),
       });
       const turn = runnableConfig.toolCall?.turn ?? 0;
-      const { output, references } = formatResultsForLLM(turn, searchResult, maxOutputChars);
+      const { output, references } = formatResultsForLLM(
+        turn,
+        searchResult,
+        maxOutputChars
+      );
       const data: t.SearchResultData = { turn, ...searchResult, references };
       return [output, { [Constants.WEB_SEARCH]: data }];
     },
@@ -372,6 +377,9 @@ export const createSearchTool = (
     firecrawlOptions,
     serperScraperOptions,
     tavilyScraperOptions,
+    microsoftScraperOptions,
+    microsoftWebIQApiKey,
+    microsoftWebIQBaseUrl,
     scraperTimeout,
     jinaApiKey,
     jinaApiUrl,
@@ -415,6 +423,9 @@ export const createSearchTool = (
     tavilyApiKey,
     tavilySearchUrl,
     tavilySearchOptions: effectiveTavilySearchOptions,
+    microsoftWebIQApiKey,
+    microsoftWebIQBaseUrl,
+    microsoftWebIQSearchOptions: config.microsoftWebIQSearchOptions,
   });
 
   /** Create scraper based on scraperProvider */
@@ -436,6 +447,14 @@ export const createSearchTool = (
         process.env.TAVILY_API_KEY,
       apiUrl: tavilyScraperOptions?.apiUrl ?? tavilyExtractUrl,
       timeout: scraperTimeout ?? tavilyScraperOptions?.timeout,
+      logger,
+    });
+  } else if (scraperProvider === 'microsoftWebIQ') {
+    scraperInstance = createMicrosoftScraper({
+      ...microsoftScraperOptions,
+      apiKey: microsoftScraperOptions?.apiKey ?? microsoftWebIQApiKey,
+      baseUrl: microsoftScraperOptions?.baseUrl ?? microsoftWebIQBaseUrl,
+      timeout: scraperTimeout ?? microsoftScraperOptions?.timeout,
       logger,
     });
   } else {
@@ -477,7 +496,8 @@ export const createSearchTool = (
   const search = createSearchProcessor({
     searchAPI,
     safeSearch,
-    supportsVideos: searchProvider !== 'tavily',
+    supportsVideos:
+      searchProvider !== 'tavily' && searchProvider !== 'microsoftWebIQ',
     sourceProcessor,
     onGetHighlights,
     logger,
