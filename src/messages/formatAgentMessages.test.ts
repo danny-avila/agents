@@ -2189,6 +2189,82 @@ describe('formatAgentMessages', () => {
     );
   });
 
+  it('should preserve hidden reasoning_content via explicit preserveReasoningContent without a provider', () => {
+    const payload: TPayload = [
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.THINK,
+            [ContentTypes.THINK]: 'Need calculator.',
+          },
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]: 'Using calculator.',
+            tool_call_ids: ['call_1'],
+          },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 'call_1',
+              name: 'calculator',
+              args: '{"input":"127 * 453"}',
+              output: '57531',
+            },
+          },
+        ],
+      },
+    ];
+
+    const result = formatAgentMessages(payload, undefined, undefined, undefined, {
+      preserveReasoningContent: true,
+    });
+
+    const toolCallMessage = result.messages[0] as AIMessage;
+    expect(toolCallMessage.tool_calls).toHaveLength(1);
+    expect(toolCallMessage.additional_kwargs.reasoning_content).toBe(
+      'Need calculator.'
+    );
+  });
+
+  it('should not reconstruct reasoning_content when preserveReasoningContent is explicitly false for DeepSeek', () => {
+    const payload: TPayload = [
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.THINK,
+            [ContentTypes.THINK]: 'Need calculator.',
+          },
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]: 'Using calculator.',
+            tool_call_ids: ['call_1'],
+          },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              id: 'call_1',
+              name: 'calculator',
+              args: '{"input":"127 * 453"}',
+              output: '57531',
+            },
+          },
+        ],
+      },
+    ];
+
+    const result = formatAgentMessages(payload, undefined, undefined, undefined, {
+      provider: Providers.DEEPSEEK,
+      preserveReasoningContent: false,
+    });
+
+    const toolCallMessage = result.messages[0] as AIMessage;
+    expect(
+      toolCallMessage.additional_kwargs.reasoning_content
+    ).toBeUndefined();
+  });
+
   it('should preserve DeepSeek reasoning from supported hidden content blocks', () => {
     const payload: TPayload = [
       {
