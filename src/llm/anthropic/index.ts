@@ -486,6 +486,7 @@ export class CustomAnthropic extends ChatAnthropicMessages {
       | Anthropic.Messages.ToolChoiceAuto
       | Anthropic.Messages.ToolChoiceAny
       | Anthropic.Messages.ToolChoiceTool
+      | Anthropic.Messages.ToolChoiceNone
       | undefined = handleToolChoice(options?.tool_choice);
 
     const callOptions = options as CustomAnthropicCallOptions | undefined;
@@ -508,12 +509,19 @@ export class CustomAnthropic extends ChatAnthropicMessages {
     const toolBetas = getToolBetas(options?.tools);
     const compactionBetas = getCompactionBetas(contextManagement);
     const taskBudgetBetas = getTaskBudgetBetas(this.model, mergedOutputConfig);
-    const formattedTools = this.formatStructuredToolToAnthropic(options?.tools);
+    const formattedTools = this.formatStructuredToolToAnthropic(
+      options?.tools,
+      {
+        strict: options?.strict,
+      }
+    );
 
     const sharedParams = {
       tools: formattedTools,
       tool_choice,
-      thinking: this.thinking,
+      // Match upstream: omit `thinking` unless the user set it, so we don't send
+      // `{ type: 'disabled' }` (an unsupported param on some models) by default.
+      thinking: this.thinkingExplicitlySet ? this.thinking : undefined,
       context_management: contextManagement,
       ...this.invocationKwargs,
       container: callOptions?.container,
@@ -527,6 +535,9 @@ export class CustomAnthropic extends ChatAnthropicMessages {
       output_config: mergedOutputConfig,
       inference_geo: inferenceGeo,
       mcp_servers: callOptions?.mcp_servers,
+      // Top-level request cache_control (1.5.x): API auto-advances the cache
+      // breakpoint across turns. Additive — independent of our block-level cache.
+      cache_control: options?.cache_control,
     };
     validateInvocationParamCompatibility({
       model: this.model,

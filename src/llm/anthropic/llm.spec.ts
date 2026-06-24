@@ -2087,6 +2087,71 @@ describe('Citations', () => {
   });
 });
 
+// Inherited from @langchain/anthropic@1.5.1 tests/chat_models.test.ts — verifies
+// the fork honors upstream's `thinkingExplicitlySet` gating in invocationParams.
+describe('invocationParams thinking gating', () => {
+  test('omits thinking when not explicitly configured', () => {
+    const model = new ChatAnthropic({
+      model: 'claude-haiku-4-5-20251001',
+      apiKey: 'testing',
+    });
+
+    expect(model.invocationParams({}).thinking).toBeUndefined();
+  });
+
+  test('includes thinking when explicitly disabled', () => {
+    const model = new ChatAnthropic({
+      model: 'claude-haiku-4-5-20251001',
+      apiKey: 'testing',
+      thinking: { type: 'disabled' },
+    });
+
+    expect(model.invocationParams({}).thinking).toEqual({ type: 'disabled' });
+  });
+
+  test('includes thinking when explicitly enabled', () => {
+    const model = new ChatAnthropic({
+      model: 'claude-haiku-4-5-20251001',
+      temperature: 1,
+      apiKey: 'testing',
+      thinking: { type: 'enabled', budget_tokens: 1000 },
+    });
+
+    expect(model.invocationParams({}).thinking).toEqual({
+      type: 'enabled',
+      budget_tokens: 1000,
+    });
+  });
+});
+
+// Inherited from @langchain/anthropic@1.5.1 — top-level request cache_control.
+describe('invocationParams cache_control', () => {
+  const newModel = () =>
+    new ChatAnthropic({
+      model: 'claude-haiku-4-5-20251001',
+      apiKey: 'testing',
+    });
+
+  test('includes cache_control when provided in call options', () => {
+    expect(
+      newModel().invocationParams({ cache_control: { type: 'ephemeral' } })
+        .cache_control
+    ).toEqual({ type: 'ephemeral' });
+  });
+
+  test('includes cache_control with 1h ttl', () => {
+    expect(
+      newModel().invocationParams({
+        cache_control: { type: 'ephemeral', ttl: '1h' },
+      }).cache_control
+    ).toEqual({ type: 'ephemeral', ttl: '1h' });
+  });
+
+  test('omits cache_control when not provided', () => {
+    expect(newModel().invocationParams({}).cache_control).toBeUndefined();
+  });
+});
+
 describe('Opus 4.7', () => {
   test('default max_tokens for claude-opus-4-7 is 16384', () => {
     const model = new ChatAnthropic({
