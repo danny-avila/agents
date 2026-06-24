@@ -32,11 +32,13 @@ export default defineConfig([globalIgnores([
     "src/llm/anthropic/inherited-stream-events.spec.ts",
     "src/llm/anthropic/inherited-content-utils.spec.ts",
     "src/llm/google/llm.spec.ts",
+    "src/llm/google/inherited-stream-events.spec.ts",
     "src/llm/openai/llm.spec.ts",
     "src/llm/openai/inherited-deepseek.spec.ts",
     "src/llm/openai/inherited-xai.spec.ts",
     "src/llm/bedrock/llm.spec.ts",
     "src/llm/vertexai/llm.spec.ts",
+    "src/llm/vertexai/inherited-stream-events.spec.ts",
 ]), {
     extends: fixupConfigRules(compat.extends(
         "eslint:recommended",
