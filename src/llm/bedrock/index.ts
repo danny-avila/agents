@@ -44,6 +44,7 @@ import {
   supportsBedrockToolCache,
   type PromptCacheTtl,
 } from '@/messages/cache';
+import { applyCachePointsToConversePayload } from './cachePoints';
 import { insertBedrockToolCachePoint } from './toolCache';
 
 /**
@@ -244,6 +245,14 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
     }
 
     const modelId = this.getModelId();
+
+    applyCachePointsToConversePayload({
+      cacheControl: options.cache_control,
+      system: converseSystem,
+      messages: converseMessages,
+      params,
+      modelId,
+    });
 
     const command = new ConverseStreamCommand({
       modelId,
