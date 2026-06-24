@@ -204,10 +204,6 @@
     "@browserbasehq/stagehand": {
       "openai": "$openai"
     },
-    "@langchain/google-common": "$@langchain/google-common",
-    "@langchain/google-gauth": "$@langchain/google-gauth",
-    "@langchain/google-genai": "$@langchain/google-genai",
-    "@langchain/google-vertexai": "$@langchain/google-vertexai",
     "uuid": "$uuid",
     "fast-xml-parser": "5.7.2",
     "ajv": "6.14.0",
