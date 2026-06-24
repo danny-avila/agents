@@ -951,6 +951,120 @@ describe('Run integration — HITL fallback checkpointer + resume', () => {
     expect(run.getHaltReason()).toBeUndefined();
   });
 
+  it('Run.resume() forwards `update` so langgraph applies the channel edit through streamEvents', async () => {
+    /** Executing proof (not a spy): interrupt on a tool, resume with an
+     * injected message via `update`, then read the committed checkpoint.
+     * langgraph 1.4.5 maps an INPUT resume Command through `mapCommand`
+     * (pregel/io.js), which applies resume AND update AND goto, so the
+     * injected message must land in the messages channel. */
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data) => {
+        if (event !== 'on_tool_execute') {
+          return;
+        }
+        const request = data as {
+          toolCalls: t.ToolCallRequest[];
+          resolve: (r: t.ToolExecuteResult[]) => void;
+        };
+        request.resolve(
+          request.toolCalls.map((c) => ({
+            toolCallId: c.id,
+            content: 'host-result',
+            status: 'success' as const,
+          }))
+        );
+      });
+
+    const registry = new HookRegistry();
+    registry.register('PreToolUse', {
+      hooks: [
+        async (): Promise<PreToolUseHookOutput> => ({
+          decision: 'ask',
+          reason: 'review',
+        }),
+      ],
+    });
+
+    const hexToolCallId = '0123456789abcdef0123456789abcdef';
+    const node = new ToolNode({
+      tools: [createSchemaStub('echo')],
+      eventDrivenMode: true,
+      agentId: 'agent-x',
+      toolCallStepIds: new Map([[hexToolCallId, 'step_1']]),
+      hookRegistry: registry,
+      humanInTheLoop: { enabled: true },
+    });
+
+    const builder = new StateGraph(MessagesAnnotation)
+      .addNode(
+        'agent',
+        (): MessagesUpdate => ({
+          messages: [
+            new AIMessage({
+              content: '',
+              tool_calls: [
+                { id: hexToolCallId, name: 'echo', args: { command: 'x' } },
+              ],
+            }),
+          ],
+        })
+      )
+      .addNode('tools', node)
+      .addEdge(START, 'agent')
+      .addEdge('agent', 'tools')
+      .addEdge('tools', END);
+    const graph = builder.compile({ checkpointer: new MemorySaver() });
+
+    const { Run } = await import('@/run');
+    const { HumanMessage } = await import('@langchain/core/messages');
+    const run = await Run.create<t.IState>({
+      runId: 'run-resume-update',
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'a',
+            provider: providers.OPENAI,
+            clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+          },
+        ],
+      },
+      hooks: registry,
+      humanInTheLoop: { enabled: true },
+    });
+    run.graphRunnable = graph as unknown as t.CompiledStateWorkflow;
+
+    const callerConfig = {
+      configurable: { thread_id: 'run-resume-update-thread' },
+      version: 'v2' as const,
+    };
+
+    await run.processStream({ messages: [] }, callerConfig);
+    expect(run.getInterrupt()).toBeDefined();
+
+    const injected = new HumanMessage({ content: 'human-injected-on-resume' });
+    await run.resume(
+      { [hexToolCallId]: { type: 'approve' } },
+      callerConfig,
+      undefined,
+      { update: { messages: [injected] } }
+    );
+
+    expect(run.getInterrupt()).toBeUndefined();
+
+    const state = await graph.getState(callerConfig);
+    const contents = (state.values.messages as BaseMessage[]).map(
+      (m) => m.content
+    );
+    /** Proves langgraph honored `update` on the INPUT resume Command. */
+    expect(contents).toContain('human-injected-on-resume');
+    /** Resume itself still completed: the approved tool produced its result. */
+    expect(contents).toContain('host-result');
+  });
+
   it('Run.getHaltReason() reports prompt_denied when UserPromptSubmit denies the prompt', async () => {
     const registry = new HookRegistry();
     registry.register('UserPromptSubmit', {
