@@ -19,8 +19,12 @@ import type {
   RunnableConfig,
   RunnableToolLike,
 } from '@langchain/core/runnables';
+import type {
+  ToolRuntime,
+  StructuredToolInterface,
+} from '@langchain/core/tools';
 import type { BaseMessage, AIMessage } from '@langchain/core/messages';
-import type { StructuredToolInterface } from '@langchain/core/tools';
+import type { LangGraphRunnableConfig } from '@langchain/langgraph';
 import type {
   ToolOutputResolveView,
   PreResolvedArgsMap,
@@ -65,7 +69,7 @@ import { executeHooks } from '@/hooks';
  * batch-scoped value the method needs so the signature stays at
  * three positional parameters even as new context fields are added.
  */
-type RunToolBatchContext = {
+type RunToolBatchContext<T = unknown> = {
   /** Position of this call within the parent ToolNode batch. */
   batchIndex?: number;
   /** Batch turn shared across every call in the batch. */
@@ -104,6 +108,13 @@ type RunToolBatchContext = {
    * contract for hosts relying on it for policy / recovery guidance.
    */
   additionalContextsSink?: string[];
+  /**
+   * Graph state the ToolNode was invoked with, threaded from `run()`
+   * so `tool.invoke` can forward it as langgraph 1.4's `runtime.state`
+   * (the deprecation-free replacement for `getCurrentTaskInput()`,
+   * which relies on `node:async_hooks` and is browser-incompatible).
+   */
+  runInput?: T;
 };
 
 const TOOL_NODE_RUN_NAME = 'tool_batch';
@@ -798,7 +809,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   protected async runTool(
     call: ToolCall,
     config: RunnableConfig,
-    batchContext: RunToolBatchContext = {}
+    batchContext: RunToolBatchContext<T> = {}
   ): Promise<BaseMessage | Command> {
     const {
       batchIndex,
@@ -806,6 +817,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       batchScopeId,
       resolvedArgsByCallId,
       preBatchSnapshot,
+      runInput,
     } = batchContext;
     const tool = this.toolMap.get(call.name);
     const registry = this.toolOutputRegistry;
@@ -980,7 +992,27 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         }
       }
 
-      const output = await tool.invoke(invokeParams, config);
+      /**
+       * Forward the graph state as langgraph 1.4's `runtime.state` so
+       * tools can read it off their second argument instead of the
+       * deprecated `getCurrentTaskInput()` (which relies on
+       * `node:async_hooks` and is browser-incompatible). Shape mirrors
+       * langgraph's prebuilt ToolNode runtime exactly.
+       */
+      const lgConfig = config as LangGraphRunnableConfig;
+      const runtime: ToolRuntime<T> = {
+        ...config,
+        state: runInput as ToolRuntime<T>['state'],
+        toolCallId: call.id ?? '',
+        config,
+        context: lgConfig.context as ToolRuntime<T>['context'],
+        store: (lgConfig.store ?? null) as ToolRuntime<T>['store'],
+        writer:
+          lgConfig.writer ??
+          (config.configurable?.writer as ToolRuntime<T>['writer']) ??
+          null,
+      };
+      const output = await tool.invoke(invokeParams, runtime);
       if (isCommand(output)) {
         return output;
       }
@@ -1192,7 +1224,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private async runDirectToolWithLifecycleHooks(
     call: ToolCall,
     config: RunnableConfig,
-    batchContext: RunToolBatchContext = {}
+    batchContext: RunToolBatchContext<T> = {}
   ): Promise<BaseMessage | Command> {
     const runId = (config.configurable?.run_id as string | undefined) ?? '';
     const hookRegistry = this.hookRegistry;
@@ -3162,6 +3194,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       // branch, so direct tools dispatched via Send (a supported
       // input shape) still silently dropped hook context.
       const directAdditionalContexts: string[] = [];
+      // Mirror langgraph's prebuilt ToolNode: the Send-input state is
+      // the input minus the `lg_tool_call` envelope key.
+      const { lg_tool_call: _sendToolCall, ...sendState } = input;
       const sendOutput = await this.runDirectToolWithLifecycleHooks(
         input.lg_tool_call,
         config,
@@ -3171,6 +3206,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           batchScopeId,
           resolvedArgsByCallId,
           additionalContextsSink: directAdditionalContexts,
+          runInput: sendState as T,
         }
       );
       outputs =
@@ -3343,6 +3379,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                   resolvedArgsByCallId,
                   preBatchSnapshot,
                   additionalContextsSink: directAdditionalContexts,
+                  runInput: input as T,
                 })
               )
             )
@@ -3407,6 +3444,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
               resolvedArgsByCallId,
               preBatchSnapshot,
               additionalContextsSink: directAdditionalContexts,
+              runInput: input as T,
             })
           )
         );

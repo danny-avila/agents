@@ -10,10 +10,10 @@ import {
   MessagesAnnotation,
   Command,
   START,
-  getCurrentTaskInput,
   END,
 } from '@langchain/langgraph';
 import { ToolMessage } from '@langchain/core/messages';
+import type { ToolRuntime } from '@langchain/core/tools';
 
 interface CreateHandoffToolParams {
   agentName: string;
@@ -28,16 +28,15 @@ const createHandoffTool = ({
   const toolDescription = description || `Ask agent '${agentName}' for help`;
 
   const handoffTool = tool(
-    async (_, config) => {
+    async (_, runtime: ToolRuntime) => {
       const toolMessage = new ToolMessage({
         content: `Successfully transferred to ${agentName}`,
         name: toolName,
-        tool_call_id: config.toolCall.id,
+        tool_call_id: runtime.toolCallId,
       });
 
-      // inject the current agent state
-      const state =
-        getCurrentTaskInput() as (typeof MessagesAnnotation)['State'];
+      // inject the current agent state via langgraph 1.4 `runtime.state`
+      const state = runtime.state as (typeof MessagesAnnotation)['State'];
       return new Command({
         goto: agentName,
         update: { messages: state.messages.concat(toolMessage) },
