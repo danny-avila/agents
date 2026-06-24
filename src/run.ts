@@ -667,7 +667,7 @@ export class Run<_T extends t.BaseGraphState> {
     const graph = this.Graph;
 
     /**
-     * `Command` inputs (currently only `Command({ resume })`) are
+     * `Command` inputs (`Command({ resume, update?, goto? })`) are
      * resume-mode invocations: LangGraph rebuilds graph state from the
      * checkpointer, so we skip RunStart / UserPromptSubmit hooks (no
      * new prompt to evaluate) and read run-state from the Graph wrapper
@@ -1139,13 +1139,31 @@ export class Run<_T extends t.BaseGraphState> {
     return cp == null ? 0 : cp.rewind();
   }
 
+  /**
+   * Resume an interrupted run. `commandOptions` forwards langgraph 1.4.5
+   * `Command` fields applied together with `resume` in one superstep:
+   * - `update`: channel updates committed at the resume point. On a *rebuilt*
+   *   Run (new instance + durable checkpointer), `update.messages` are the first
+   *   write the fresh wrapper sees, so they seed the `getRunMessages()` /
+   *   `returnContent` baseline and are excluded from them (still committed to the
+   *   checkpoint). Hosts that rebuild + inject messages should persist them
+   *   directly or read from `getState`. Unreachable without a durable checkpointer.
+   * - `goto`: a *dynamic* edge that does not cancel static `addEdge` routes. On
+   *   the built-in standard graph the fixed `toolNode -> agentNode/END` edge still
+   *   fires, so `goto` adds rather than replaces (e.g. `goto: END` will not stop a
+   *   tool-node resume). Intended for custom, Command-routed graphs.
+   */
   async resume<TResume = t.ToolApprovalDecision[] | t.ToolApprovalDecisionMap>(
     resumeValue: TResume,
     callerConfig: Partial<RunnableConfig> & {
       version: 'v1' | 'v2';
       run_id?: string;
     },
-    streamOptions?: t.EventStreamOptions
+    streamOptions?: t.EventStreamOptions,
+    commandOptions?: Pick<
+      ConstructorParameters<typeof Command>[0],
+      'update' | 'goto'
+    >
   ): Promise<MessageContentComplex[] | undefined> {
     const interruptId = this._interrupt?.interruptId;
     const scopedResume =
@@ -1155,8 +1173,18 @@ export class Run<_T extends t.BaseGraphState> {
         ? { [interruptId]: resumeValue }
         : resumeValue;
     const resumeConfig = await this.resolveInterruptResumeConfig(callerConfig);
+    // langgraph 1.4.5 applies resume + state update + reroute in one superstep
+    // (single checkpoint). `update`/`goto` are omitted unless the caller sets them.
     return this.processStream(
-      new Command({ resume: scopedResume }),
+      new Command({
+        resume: scopedResume,
+        ...(commandOptions?.update !== undefined
+          ? { update: commandOptions.update }
+          : {}),
+        ...(commandOptions?.goto !== undefined
+          ? { goto: commandOptions.goto }
+          : {}),
+      }),
       resumeConfig,
       streamOptions
     );
