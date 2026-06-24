@@ -33,6 +33,8 @@ export default defineConfig([globalIgnores([
     "src/llm/anthropic/inherited-content-utils.spec.ts",
     "src/llm/google/llm.spec.ts",
     "src/llm/openai/llm.spec.ts",
+    "src/llm/openai/inherited-deepseek.spec.ts",
+    "src/llm/openai/inherited-xai.spec.ts",
     "src/llm/bedrock/llm.spec.ts",
     "src/llm/vertexai/llm.spec.ts",
 ]), {
