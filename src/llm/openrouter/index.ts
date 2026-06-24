@@ -161,9 +161,7 @@ export class ChatOpenRouter extends ChatOpenAI {
     return 'LibreChatOpenRouter';
   }
 
-  // @ts-expect-error - OpenRouter reasoning extends OpenAI Reasoning with additional
-  // effort levels ('xhigh' | 'none' | 'minimal') not in ReasoningEffort.
-  // The parent's generic conditional return type cannot be widened in an override.
+  // OpenRouter widens OpenAI reasoning with extra effort levels ('xhigh' | 'none' | 'minimal').
   override invocationParams(
     options?: this['ParsedCallOptions'],
     extra?: InvocationParamsExtra
