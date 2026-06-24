@@ -1139,6 +1139,20 @@ export class Run<_T extends t.BaseGraphState> {
     return cp == null ? 0 : cp.rewind();
   }
 
+  /**
+   * Resume an interrupted run. `commandOptions` forwards langgraph 1.4.5
+   * `Command` fields applied together with `resume` in one superstep:
+   * - `update`: channel updates committed at the resume point. On a *rebuilt*
+   *   Run (new instance + durable checkpointer), `update.messages` are the first
+   *   write the fresh wrapper sees, so they seed the `getRunMessages()` /
+   *   `returnContent` baseline and are excluded from them (still committed to the
+   *   checkpoint). Hosts that rebuild + inject messages should persist them
+   *   directly or read from `getState`. Unreachable without a durable checkpointer.
+   * - `goto`: a *dynamic* edge that does not cancel static `addEdge` routes. On
+   *   the built-in standard graph the fixed `toolNode -> agentNode/END` edge still
+   *   fires, so `goto` adds rather than replaces (e.g. `goto: END` will not stop a
+   *   tool-node resume). Intended for custom, Command-routed graphs.
+   */
   async resume<TResume = t.ToolApprovalDecision[] | t.ToolApprovalDecisionMap>(
     resumeValue: TResume,
     callerConfig: Partial<RunnableConfig> & {
