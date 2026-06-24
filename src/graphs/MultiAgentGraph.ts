@@ -12,12 +12,11 @@ import {
   Command,
   StateGraph,
   Annotation,
-  getCurrentTaskInput,
   messagesStateReducer,
 } from '@langchain/langgraph';
 import type { BaseMessage, AIMessageChunk } from '@langchain/core/messages';
 import type { LangGraphRunnableConfig } from '@langchain/langgraph';
-import type { ToolRunnableConfig } from '@langchain/core/tools';
+import type { ToolRuntime } from '@langchain/core/tools';
 import type * as t from '@/types';
 import { StandardGraph } from './Graph';
 import { Constants } from '@/common';
@@ -330,12 +329,10 @@ export class MultiAgentGraph extends StandardGraph {
 
       tools.push(
         tool(
-          async (rawInput, config) => {
+          async (rawInput, runtime: ToolRuntime) => {
             const input = rawInput as Record<string, unknown>;
-            const state = getCurrentTaskInput() as t.BaseGraphState;
-            const toolCallId =
-              (config as ToolRunnableConfig | undefined)?.toolCall?.id ??
-              'unknown';
+            const state = runtime.state as t.BaseGraphState;
+            const toolCallId = runtime.toolCall?.id ?? 'unknown';
 
             /** Evaluated condition */
             const result = edge.condition!(state);
@@ -414,11 +411,9 @@ export class MultiAgentGraph extends StandardGraph {
 
         tools.push(
           tool(
-            async (rawInput, config) => {
+            async (rawInput, runtime: ToolRuntime) => {
               const input = rawInput as Record<string, unknown>;
-              const toolCallId =
-                (config as ToolRunnableConfig | undefined)?.toolCall?.id ??
-                'unknown';
+              const toolCallId = runtime.toolCall?.id ?? 'unknown';
 
               let content = `Successfully transferred to ${destination}`;
               if (
@@ -439,7 +434,7 @@ export class MultiAgentGraph extends StandardGraph {
                 },
               });
 
-              const state = getCurrentTaskInput() as t.BaseGraphState;
+              const state = runtime.state as t.BaseGraphState;
 
               /**
                * For parallel handoff support:
