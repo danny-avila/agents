@@ -966,6 +966,47 @@ describe('AgentContext', () => {
       expect(result).toEqual(tools);
     });
 
+    it('dedupes duplicate named tools before binding and logs a warning', () => {
+      const warnSpy = jest
+        .spyOn(console, 'warn')
+        .mockImplementation(() => undefined);
+      const nativeWebSearch = {
+        name: 'web_search',
+        type: 'web_search_20250305',
+      } as unknown as t.GenericTool;
+
+      try {
+        const ctx = createBasicContext({
+          agentConfig: {
+            provider: Providers.ANTHROPIC,
+            toolDefinitions: [
+              {
+                name: 'web_search',
+                description: 'LibreChat search',
+                parameters: { type: 'object', properties: {} },
+              },
+            ],
+            tools: [nativeWebSearch],
+          },
+        });
+
+        const result = ctx.getToolsForBinding() as t.GenericTool[];
+
+        expect(result).toHaveLength(1);
+        expect(result.map((tool) => tool.name)).toEqual(['web_search']);
+        expect(result[0]).not.toBe(nativeWebSearch);
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+        expect(warnSpy).toHaveBeenCalledWith(
+          expect.stringContaining('Removed duplicate tool binding(s)')
+        );
+
+        ctx.getToolsForBinding();
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
     it('excludes code_execution-only tools', () => {
       const tools = [
         createMockTool('direct_tool'),
