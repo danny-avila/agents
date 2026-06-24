@@ -302,6 +302,66 @@ export interface ConvertMessagesOptions {
   convertReasoningDetailsToContent?: boolean;
 }
 
+/** Placeholder text inserted when image content is stripped for non-vision models. */
+const IMAGE_OMITTED_PLACEHOLDER =
+  '(Image content omitted - model does not support vision)';
+
+/**
+ * Drops `image_url` parts from a single message's content. When stripping empties
+ * an array, a text placeholder is substituted so the message still carries content.
+ */
+function filterImagePartsIfNeeded(
+  content: string | unknown[]
+): string | unknown[] {
+  if (typeof content === 'string') {
+    return content;
+  }
+  const filtered = content.filter((part: unknown) => {
+    if (part != null && typeof part === 'object' && 'type' in part) {
+      return (part as { type: string }).type !== 'image_url';
+    }
+    return true;
+  });
+  return filtered.length > 0
+    ? filtered
+    : [{ type: 'text' as const, text: IMAGE_OMITTED_PLACEHOLDER }];
+}
+
+/**
+ * Strips `image_url` content parts from messages when the target model lacks vision
+ * support. Applied once as a choke point before streaming, so images never reach a
+ * model that would reject them ("model is not a multimodal model" / "No endpoints
+ * found that support image input"). Returns the input unchanged when visionCapable
+ * is true, and only clones the messages that actually carry images.
+ */
+export function stripImagesFromMessages(
+  messages: BaseMessage[],
+  visionCapable: boolean
+): BaseMessage[] {
+  if (visionCapable) {
+    return messages;
+  }
+  return messages.map((msg) => {
+    if (!Array.isArray(msg.content)) {
+      return msg;
+    }
+    const hasImage = msg.content.some(
+      (part) => 'type' in part && part.type === 'image_url'
+    );
+    if (!hasImage) {
+      return msg;
+    }
+    const clone = Object.assign(
+      Object.create(Object.getPrototypeOf(msg)),
+      msg
+    ) as BaseMessage;
+    clone.content = filterImagePartsIfNeeded(
+      msg.content
+    ) as BaseMessage['content'];
+    return clone;
+  });
+}
+
 // Used in LangSmith, export is important here
 export function _convertMessagesToOpenAIParams(
   messages: BaseMessage[],
