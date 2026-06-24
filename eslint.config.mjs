@@ -29,6 +29,7 @@ export default defineConfig([globalIgnores([
     "./script_docs.ts",
     "src/llm/anthropic/llm.spec.ts",
     "src/llm/google/llm.spec.ts",
+    "src/llm/openai/llm.spec.ts",
     "src/llm/bedrock/llm.spec.ts",
     "src/llm/vertexai/llm.spec.ts",
 ]), {
