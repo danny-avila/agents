@@ -761,6 +761,54 @@ describe('Run integration — HITL fallback checkpointer + resume', () => {
     expect(run.Graph?.compileOptions?.checkpointer).toBe(hostCheckpointer);
   });
 
+  it('Run.resume forwards update + goto into the resume Command (langgraph 1.4.5)', async () => {
+    const { Run } = await import('@/run');
+    const { Providers } = await import('@/common');
+
+    const run = await Run.create<t.IState>({
+      runId: 'hitl-resume-update-goto',
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'a',
+            provider: Providers.OPENAI,
+            clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+          },
+        ],
+      },
+    });
+
+    const spy = jest.spyOn(run, 'processStream').mockResolvedValue(undefined);
+
+    const decision = [{ type: 'approve' as const }];
+    const update = { messages: [new AIMessage('host-edit')] };
+    await run.resume(
+      decision,
+      { version: 'v1', configurable: { thread_id: 't' } },
+      undefined,
+      { update, goto: 'agent' }
+    );
+
+    const cmd = spy.mock.calls[0]?.[0] as Command;
+    expect(cmd).toBeInstanceOf(Command);
+    // No interrupt was captured, so the resume value passes through unscoped.
+    expect(cmd.resume).toEqual(decision);
+    expect(cmd.update).toEqual(update);
+    expect(cmd.goto).toEqual(['agent']); // langgraph normalizes goto to an array
+
+    // Backward-compat: omitting commandOptions leaves update unset, goto empty.
+    await run.resume(decision, {
+      version: 'v1',
+      configurable: { thread_id: 't' },
+    });
+    const cmd2 = spy.mock.calls[1]?.[0] as Command;
+    expect(cmd2.update).toBeUndefined();
+    expect(cmd2.goto).toEqual([]);
+  });
+
   it('re-exports langgraph HITL primitives from the SDK barrel for host use', async () => {
     const indexExports = await import('@/index');
     expect(indexExports.MemorySaver).toBe(MemorySaver);

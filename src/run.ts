@@ -667,7 +667,7 @@ export class Run<_T extends t.BaseGraphState> {
     const graph = this.Graph;
 
     /**
-     * `Command` inputs (currently only `Command({ resume })`) are
+     * `Command` inputs (`Command({ resume, update?, goto? })`) are
      * resume-mode invocations: LangGraph rebuilds graph state from the
      * checkpointer, so we skip RunStart / UserPromptSubmit hooks (no
      * new prompt to evaluate) and read run-state from the Graph wrapper
@@ -1145,7 +1145,11 @@ export class Run<_T extends t.BaseGraphState> {
       version: 'v1' | 'v2';
       run_id?: string;
     },
-    streamOptions?: t.EventStreamOptions
+    streamOptions?: t.EventStreamOptions,
+    commandOptions?: Pick<
+      ConstructorParameters<typeof Command>[0],
+      'update' | 'goto'
+    >
   ): Promise<MessageContentComplex[] | undefined> {
     const interruptId = this._interrupt?.interruptId;
     const scopedResume =
@@ -1155,8 +1159,18 @@ export class Run<_T extends t.BaseGraphState> {
         ? { [interruptId]: resumeValue }
         : resumeValue;
     const resumeConfig = await this.resolveInterruptResumeConfig(callerConfig);
+    // langgraph 1.4.5 applies resume + state update + reroute in one superstep
+    // (single checkpoint). `update`/`goto` are omitted unless the caller sets them.
     return this.processStream(
-      new Command({ resume: scopedResume }),
+      new Command({
+        resume: scopedResume,
+        ...(commandOptions?.update !== undefined
+          ? { update: commandOptions.update }
+          : {}),
+        ...(commandOptions?.goto !== undefined
+          ? { goto: commandOptions.goto }
+          : {}),
+      }),
       resumeConfig,
       streamOptions
     );
