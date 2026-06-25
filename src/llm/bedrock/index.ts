@@ -22,7 +22,7 @@
  */
 
 import { ChatBedrockConverse } from '@langchain/aws';
-import { AIMessageChunk } from '@langchain/core/messages';
+import { AIMessage, AIMessageChunk } from '@langchain/core/messages';
 import { ChatGenerationChunk, ChatResult } from '@langchain/core/outputs';
 import {
   ConverseStreamCommand,
@@ -40,6 +40,7 @@ import {
   handleConverseStreamMetadata,
 } from './utils';
 import {
+  createPromptCacheTtlResponseMetadata,
   resolveBedrockPromptCacheTtl,
   supportsBedrockToolCache,
   type PromptCacheTtl,
@@ -217,7 +218,12 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
     }
 
     try {
-      return await super._generateNonStreaming(messages, options, runManager);
+      const result = await super._generateNonStreaming(
+        messages,
+        options,
+        runManager
+      );
+      return this.withPromptCacheTtlMetadata(result);
     } finally {
       this.model = originalModel;
     }
@@ -243,6 +249,7 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
     if ((options as Record<string, unknown>).streamUsage !== undefined) {
       streamUsage = (options as Record<string, unknown>).streamUsage as boolean;
     }
+    const promptCacheTtl = this.getPromptCacheTtl();
 
     const modelId = this.getModelId();
 
@@ -328,7 +335,10 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
           { chunk: deltaChunk }
         );
       } else if (event.metadata != null) {
-        yield handleConverseStreamMetadata(event.metadata, { streamUsage });
+        yield handleConverseStreamMetadata(event.metadata, {
+          streamUsage,
+          promptCacheTtl,
+        });
       } else if (event.contentBlockStop != null) {
         const stopIdx = event.contentBlockStop.contentBlockIndex;
         if (stopIdx != null) {
@@ -419,6 +429,62 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
       }),
       generationInfo: chunk.generationInfo,
     });
+  }
+
+  private getPromptCacheTtl(): PromptCacheTtl | undefined {
+    return this.promptCache === true
+      ? resolveBedrockPromptCacheTtl(this.promptCacheTtl, this.cacheModelId)
+      : undefined;
+  }
+
+  private withPromptCacheTtlMetadata(result: ChatResult): ChatResult {
+    const promptCacheTtl = this.getPromptCacheTtl();
+    if (promptCacheTtl == null) {
+      return result;
+    }
+
+    let changed = false;
+    const generations = result.generations.map((generation) => {
+      const message = generation.message;
+      if (!(message instanceof AIMessage)) {
+        return generation;
+      }
+
+      const inputTokenDetails = message.usage_metadata?.input_token_details as
+        | Record<string, unknown>
+        | undefined;
+      const cacheCreation = inputTokenDetails?.cache_creation;
+      if (
+        typeof cacheCreation !== 'number' ||
+        !Number.isFinite(cacheCreation) ||
+        cacheCreation <= 0
+      ) {
+        return generation;
+      }
+
+      changed = true;
+      return {
+        ...generation,
+        message: new AIMessage({
+          content: message.content,
+          additional_kwargs: message.additional_kwargs,
+          response_metadata: {
+            ...message.response_metadata,
+            ...createPromptCacheTtlResponseMetadata(
+              cacheCreation,
+              promptCacheTtl
+            ),
+          },
+          id: message.id,
+          name: message.name,
+          tool_calls: message.tool_calls,
+          invalid_tool_calls: message.invalid_tool_calls,
+          usage_metadata: message.usage_metadata,
+        }),
+      };
+    });
+
+    return changed ? { ...result, generations } : result;
   }
 
   /**

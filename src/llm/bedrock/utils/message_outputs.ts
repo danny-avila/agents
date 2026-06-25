@@ -22,6 +22,10 @@ import {
   STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY,
   BEDROCK_CONVERSE_STREAMED_TOOL_CALL_ADAPTER,
 } from '@/tools/streamedToolCallSeals';
+import {
+  createPromptCacheTtlResponseMetadata,
+  type PromptCacheTtl,
+} from '@/messages/cache';
 import { toLangChainContent } from '@/messages/langchain';
 
 /**
@@ -349,7 +353,7 @@ export function createConverseToolUseStopChunk(
  */
 export function handleConverseStreamMetadata(
   metadata: ConverseStreamMetadataEvent,
-  extra: { streamUsage: boolean }
+  extra: { streamUsage: boolean; promptCacheTtl?: PromptCacheTtl }
 ): ChatGenerationChunk {
   const usage = metadata.usage as
     | (NonNullable<ConverseStreamMetadataEvent['usage']> & {
@@ -385,6 +389,10 @@ export function handleConverseStreamMetadata(
       response_metadata: {
         // Use the same key as returned from the Converse API
         metadata,
+        ...createPromptCacheTtlResponseMetadata(
+          cacheWrite,
+          extra.promptCacheTtl
+        ),
       },
     }),
   });

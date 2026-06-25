@@ -12,7 +12,7 @@ import {
   type MessageContentComplex,
 } from '@langchain/core/messages';
 import { concat } from '@langchain/core/utils/stream';
-import { ChatGenerationChunk } from '@langchain/core/outputs';
+import { ChatGenerationChunk, type ChatResult } from '@langchain/core/outputs';
 import {
   BedrockRuntimeClient,
   ConverseCommand,
@@ -26,6 +26,7 @@ import {
 } from './utils';
 import type { GraphTools } from '@/types';
 import { toLangChainContent } from '@/messages/langchain';
+import { PROMPT_CACHE_TTL_RESPONSE_METADATA_KEY } from '@/messages/cache';
 import { CustomChatBedrockConverse, ServiceTierType } from './index';
 import { partitionAndMarkBedrockToolCache } from './toolCache';
 
@@ -916,12 +917,16 @@ describe('handleConverseStreamMetadata - cache token extraction', () => {
 
     const chunk = handleConverseStreamMetadata(metadata, {
       streamUsage: true,
+      promptCacheTtl: '1h',
     });
     const msg = chunk.message as AIMessageChunk;
 
     expect(msg.usage_metadata?.input_token_details).toEqual({
       cache_read: 0,
       cache_creation: 10000,
+    });
+    expect(msg.response_metadata).toMatchObject({
+      [PROMPT_CACHE_TTL_RESPONSE_METADATA_KEY]: '1h',
     });
   });
 
@@ -943,6 +948,46 @@ describe('handleConverseStreamMetadata - cache token extraction', () => {
     const msg = chunk.message as AIMessageChunk;
 
     expect(msg.usage_metadata).toBeUndefined();
+  });
+});
+
+describe('CustomChatBedrockConverse prompt-cache TTL metadata', () => {
+  test('stamps non-streaming cache writes with the resolved prompt-cache TTL', () => {
+    const model = new CustomChatBedrockConverse({
+      ...baseConstructorArgs,
+      model: 'anthropic.claude-sonnet-4-5-20250929-v1:0',
+      promptCache: true,
+      promptCacheTtl: '5m',
+    });
+    const result: ChatResult = {
+      generations: [
+        {
+          text: 'Hello!',
+          message: new AIMessage({
+            content: 'Hello!',
+            usage_metadata: {
+              input_tokens: 100,
+              output_tokens: 5,
+              total_tokens: 105,
+              input_token_details: {
+                cache_creation: 20,
+              },
+            },
+          }),
+        },
+      ],
+    };
+
+    const enriched = (
+      model as unknown as {
+        withPromptCacheTtlMetadata: (result: ChatResult) => ChatResult;
+      }
+    ).withPromptCacheTtlMetadata(result);
+
+    expect(enriched.generations[0].message.response_metadata).toMatchObject({
+      [PROMPT_CACHE_TTL_RESPONSE_METADATA_KEY]: '5m',
+    });
+    expect(result.generations[0].message.response_metadata).toEqual({});
   });
 });
 

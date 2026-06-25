@@ -11,6 +11,7 @@ import {
   resolveTraceIdSeedForSpan,
   withLangfuseRuntimeScope,
 } from '@/langfuseRuntimeScope';
+import { normalizePromptCacheUsageForLangfuse } from '@/langfuse/promptCacheUsage';
 import { isPresent, parseBooleanEnv } from '@/utils/misc';
 
 const TRACE_METADATA_MAX_LENGTH = 200;
@@ -105,6 +106,18 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
     ...args: Parameters<CallbackHandler['handleLLMStart']>
   ): ReturnType<CallbackHandler['handleLLMStart']> {
     return this.withRuntimeContext(() => super.handleLLMStart(...args));
+  }
+
+  override handleLLMEnd(
+    output: Parameters<CallbackHandler['handleLLMEnd']>[0],
+    runId: Parameters<CallbackHandler['handleLLMEnd']>[1],
+    parentRunId?: Parameters<CallbackHandler['handleLLMEnd']>[2]
+  ): ReturnType<CallbackHandler['handleLLMEnd']> {
+    return super.handleLLMEnd(
+      normalizePromptCacheUsageForLangfuse(output),
+      runId,
+      parentRunId
+    );
   }
 
   override handleToolStart(

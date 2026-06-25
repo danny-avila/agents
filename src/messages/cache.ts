@@ -39,6 +39,26 @@ export type PromptCacheTtl = '5m' | '1h';
 export const DEFAULT_PROMPT_CACHE_TTL: PromptCacheTtl = '1h';
 
 /**
+ * Response metadata key used to tell observability sinks which prompt-cache
+ * TTL produced provider-reported cache write tokens.
+ */
+export const PROMPT_CACHE_TTL_RESPONSE_METADATA_KEY = 'prompt_cache_ttl';
+
+export function createPromptCacheTtlResponseMetadata(
+  cacheCreation: unknown,
+  ttl: PromptCacheTtl | undefined
+): Partial<
+  Record<typeof PROMPT_CACHE_TTL_RESPONSE_METADATA_KEY, PromptCacheTtl>
+> {
+  return typeof cacheCreation === 'number' &&
+    Number.isFinite(cacheCreation) &&
+    cacheCreation > 0 &&
+    ttl != null
+    ? { [PROMPT_CACHE_TTL_RESPONSE_METADATA_KEY]: ttl }
+    : {};
+}
+
+/**
  * Resolve an optionally-configured TTL to a concrete value, defaulting to the
  * 1-hour extended cache. Used at the Anthropic/Bedrock prompt-cache call sites.
  */

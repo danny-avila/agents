@@ -14,6 +14,11 @@ interface AnthropicUsageData {
   output_tokens?: number | null;
   cache_creation_input_tokens?: number | null;
   cache_read_input_tokens?: number | null;
+  // Preserved in response_metadata.usage so Langfuse can split cache writes by TTL.
+  cache_creation?: {
+    ephemeral_5m_input_tokens?: number | null;
+    ephemeral_1h_input_tokens?: number | null;
+  } | null;
 }
 
 export function getAnthropicUsageMetadata(
