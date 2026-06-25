@@ -261,3 +261,22 @@ export type EventStreamOptions = {
   callbacks?: g.ClientCallbacks;
   keepContent?: boolean;
 };
+
+/**
+ * When to persist checkpoints during a run. Mirrors langgraph's option:
+ * `'async'`/`'sync'` checkpoint every superstep; `'exit'` checkpoints only
+ * at the graph's exit/interrupt boundary. Kept as a local union to avoid
+ * coupling to langgraph internals (it is not exported from the root).
+ */
+export type Durability = 'async' | 'sync' | 'exit';
+
+/**
+ * Config accepted by `processStream`/`resume`. Extends `RunnableConfig` with
+ * the stream `version`, an optional `run_id`, and an optional `durability`
+ * override forwarded to langgraph's run options.
+ */
+export type RunStreamConfig = Partial<RunnableConfig> & {
+  version: 'v1' | 'v2';
+  run_id?: string;
+  durability?: Durability;
+};

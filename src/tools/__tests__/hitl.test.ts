@@ -761,6 +761,128 @@ describe('Run integration — HITL fallback checkpointer + resume', () => {
     expect(run.Graph?.compileOptions?.checkpointer).toBe(hostCheckpointer);
   });
 
+  it('processStream defaults durability to "exit" when a checkpointer is active', async () => {
+    const { Run } = await import('@/run');
+    const { Providers } = await import('@/common');
+
+    const run = await Run.create<t.IState>({
+      runId: 'durability-exit-default',
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'a',
+            provider: Providers.OPENAI,
+            clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+          },
+        ],
+      },
+      humanInTheLoop: { enabled: true },
+    });
+    expect(run.Graph?.compileOptions?.checkpointer).toBeInstanceOf(MemorySaver);
+
+    const graph = new StateGraph(MessagesAnnotation)
+      .addNode('noop', (): MessagesUpdate => ({ messages: [] }))
+      .addEdge(START, 'noop')
+      .addEdge('noop', END)
+      .compile();
+    const spy = jest.spyOn(graph, 'streamEvents');
+    run.graphRunnable = graph as unknown as t.CompiledStateWorkflow;
+
+    await run.processStream(
+      { messages: [] },
+      { version: 'v2', configurable: { thread_id: 't' } }
+    );
+
+    const streamedConfig = spy.mock.calls[0]?.[1] as
+      | t.RunStreamConfig
+      | undefined;
+    expect(streamedConfig?.durability).toBe('exit');
+  });
+
+  it('processStream respects an explicit caller durability over the checkpointer default', async () => {
+    const { Run } = await import('@/run');
+    const { Providers } = await import('@/common');
+
+    const run = await Run.create<t.IState>({
+      runId: 'durability-explicit-override',
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'a',
+            provider: Providers.OPENAI,
+            clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+          },
+        ],
+      },
+      humanInTheLoop: { enabled: true },
+    });
+
+    const graph = new StateGraph(MessagesAnnotation)
+      .addNode('noop', (): MessagesUpdate => ({ messages: [] }))
+      .addEdge(START, 'noop')
+      .addEdge('noop', END)
+      .compile();
+    const spy = jest.spyOn(graph, 'streamEvents');
+    run.graphRunnable = graph as unknown as t.CompiledStateWorkflow;
+
+    await run.processStream(
+      { messages: [] },
+      { version: 'v2', durability: 'sync', configurable: { thread_id: 't' } }
+    );
+
+    const streamedConfig = spy.mock.calls[0]?.[1] as
+      | t.RunStreamConfig
+      | undefined;
+    expect(streamedConfig?.durability).toBe('sync');
+  });
+
+  it('processStream leaves durability unset when no checkpointer is active', async () => {
+    const { Run } = await import('@/run');
+    const { Providers } = await import('@/common');
+
+    const run = await Run.create<t.IState>({
+      runId: 'durability-no-checkpointer',
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'a',
+            provider: Providers.OPENAI,
+            clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'noop',
+            maxContextTokens: 8000,
+          },
+        ],
+      },
+      // humanInTheLoop omitted — no checkpointer installed
+    });
+    expect(run.Graph?.compileOptions?.checkpointer).toBeUndefined();
+
+    const graph = new StateGraph(MessagesAnnotation)
+      .addNode('noop', (): MessagesUpdate => ({ messages: [] }))
+      .addEdge(START, 'noop')
+      .addEdge('noop', END)
+      .compile();
+    const spy = jest.spyOn(graph, 'streamEvents');
+    run.graphRunnable = graph as unknown as t.CompiledStateWorkflow;
+
+    await run.processStream(
+      { messages: [] },
+      { version: 'v2', configurable: { thread_id: 't' } }
+    );
+
+    const streamedConfig = spy.mock.calls[0]?.[1] as
+      | t.RunStreamConfig
+      | undefined;
+    expect(streamedConfig?.durability).toBeUndefined();
+  });
+
   it('Run.resume forwards update + goto into the resume Command (langgraph 1.4.5)', async () => {
     const { Run } = await import('@/run');
     const { Providers } = await import('@/common');

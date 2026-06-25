@@ -647,10 +647,7 @@ export class Run<_T extends t.BaseGraphState> {
 
   async processStream(
     inputs: t.IState | Command,
-    callerConfig: Partial<RunnableConfig> & {
-      version: 'v1' | 'v2';
-      run_id?: string;
-    },
+    callerConfig: t.RunStreamConfig,
     streamOptions?: t.EventStreamOptions
   ): Promise<MessageContentComplex[] | undefined> {
     if (this.graphRunnable == null) {
@@ -676,10 +673,7 @@ export class Run<_T extends t.BaseGraphState> {
     const isResume = inputs instanceof Command;
     const stateInputs = isResume ? undefined : (inputs as t.IState);
 
-    const config: Partial<RunnableConfig> & {
-      version: 'v1' | 'v2';
-      run_id?: string;
-    } = {
+    const config: t.RunStreamConfig = {
       recursionLimit: 50,
       ...callerConfig,
       configurable: { ...callerConfig.configurable },
@@ -762,6 +756,19 @@ export class Run<_T extends t.BaseGraphState> {
     config.configurable = Object.assign(config.configurable ?? {}, {
       run_id: this.id,
     });
+
+    /**
+     * Default `durability: 'exit'` whenever a checkpointer is active so
+     * runs skip per-superstep checkpoint writes and persist only at the
+     * exit/interrupt boundary (all HITL/resume needs). An explicit caller
+     * value wins; no checkpointer leaves it unset (langgraph default).
+     */
+    if (
+      config.durability == null &&
+      graph.compileOptions?.checkpointer != null
+    ) {
+      config.durability = 'exit';
+    }
 
     const threadId = config.configurable.thread_id as string | undefined;
 
@@ -1155,10 +1162,7 @@ export class Run<_T extends t.BaseGraphState> {
    */
   async resume<TResume = t.ToolApprovalDecision[] | t.ToolApprovalDecisionMap>(
     resumeValue: TResume,
-    callerConfig: Partial<RunnableConfig> & {
-      version: 'v1' | 'v2';
-      run_id?: string;
-    },
+    callerConfig: t.RunStreamConfig,
     streamOptions?: t.EventStreamOptions,
     commandOptions?: Pick<
       ConstructorParameters<typeof Command>[0],
@@ -1191,16 +1195,8 @@ export class Run<_T extends t.BaseGraphState> {
   }
 
   private async resolveInterruptResumeConfig(
-    callerConfig: Partial<RunnableConfig> & {
-      version: 'v1' | 'v2';
-      run_id?: string;
-    }
-  ): Promise<
-    Partial<RunnableConfig> & {
-      version: 'v1' | 'v2';
-      run_id?: string;
-    }
-  > {
+    callerConfig: t.RunStreamConfig
+  ): Promise<t.RunStreamConfig> {
     const interrupt = this._interrupt;
     const interruptId = interrupt?.interruptId;
     const workflow = this.graphRunnable as
