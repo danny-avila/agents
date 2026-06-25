@@ -209,7 +209,10 @@ export type AgentSessionInput = string | BaseMessage | BaseMessage[] | t.IState;
 export interface AgentSessionRunOptions {
   runId?: string;
   threadId?: string;
-  config?: Partial<RunnableConfig> & { version?: 'v1' | 'v2' };
+  config?: Partial<RunnableConfig> & {
+    version?: 'v1' | 'v2';
+    durability?: t.Durability;
+  };
   streamOptions?: t.EventStreamOptions;
 }
 

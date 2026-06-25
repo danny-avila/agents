@@ -135,6 +135,13 @@ export class Run<_T extends t.BaseGraphState> {
   Graph: StandardGraph | MultiAgentGraph | undefined;
   returnContent: boolean = false;
   private skipCleanup: boolean = false;
+  /**
+   * Whether the compiled graph was built with a checkpointer (host-supplied
+   * or the HITL `MemorySaver` fallback). Captured at graph creation because
+   * the constructor can later overwrite `Graph.compileOptions` with the raw
+   * caller options, dropping the fallback checkpointer from that metadata.
+   */
+  private hasCheckpointer: boolean = false;
   private _streamResult: t.MessageContentComplex[] | undefined;
   /**
    * Captured interrupt payload typed as `unknown` because the SDK
@@ -256,6 +263,7 @@ export class Run<_T extends t.BaseGraphState> {
     standardGraph.compileOptions = this.applyHITLCheckpointerFallback(
       config.compileOptions
     );
+    this.hasCheckpointer = standardGraph.compileOptions?.checkpointer != null;
     standardGraph.hookRegistry = this.hookRegistry;
     standardGraph.humanInTheLoop = this.humanInTheLoop;
     standardGraph.toolOutputReferences = this.toolOutputReferences;
@@ -283,6 +291,7 @@ export class Run<_T extends t.BaseGraphState> {
 
     multiAgentGraph.compileOptions =
       this.applyHITLCheckpointerFallback(compileOptions);
+    this.hasCheckpointer = multiAgentGraph.compileOptions?.checkpointer != null;
 
     multiAgentGraph.hookRegistry = this.hookRegistry;
     multiAgentGraph.humanInTheLoop = this.humanInTheLoop;
@@ -763,10 +772,7 @@ export class Run<_T extends t.BaseGraphState> {
      * exit/interrupt boundary (all HITL/resume needs). An explicit caller
      * value wins; no checkpointer leaves it unset (langgraph default).
      */
-    if (
-      config.durability == null &&
-      graph.compileOptions?.checkpointer != null
-    ) {
+    if (config.durability == null && this.hasCheckpointer) {
       config.durability = 'exit';
     }
 
