@@ -1,6 +1,6 @@
 import { MongoClient } from 'mongodb';
 import { HumanMessage } from '@langchain/core/messages';
-import { MongoMemoryServer } from 'mongodb-memory-server';
+import { MongoMemoryServer } from 'mongodb-memory-server-core';
 import { MongoDBSaver } from '@langchain/langgraph-checkpoint-mongodb';
 import { describe, it, expect, beforeAll, afterAll } from '@jest/globals';
 import type * as t from '@/types';
