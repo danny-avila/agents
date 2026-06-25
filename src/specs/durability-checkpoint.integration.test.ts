@@ -174,4 +174,70 @@ describe('durability default — real Mongo checkpointer', () => {
       expect(asyncRun.done.writes).toBeGreaterThan(exitRun.done.writes);
     });
   });
+
+  describe('multiple interrupts (sequential ask-user-questions)', () => {
+    const State = Annotation.Root({
+      qa: Annotation<string[]>({
+        reducer: (a, b) => a.concat(b),
+        default: () => [],
+      }),
+    });
+
+    const drain = async (stream: AsyncIterable<unknown>): Promise<void> => {
+      for await (const _event of stream) {
+        // Consume the event stream.
+      }
+    };
+
+    it('checkpoints each interrupt boundary, chains them, and discards none across resumes', async () => {
+      const dbName = 'multi_exit';
+      const saver = new MongoDBSaver({ client, dbName });
+      const graph = new StateGraph(State)
+        .addNode('ask1', () => ({ qa: [`Q1=${interrupt({ q: 'Q1' })}`] }))
+        .addNode('ask2', () => ({ qa: [`Q2=${interrupt({ q: 'Q2' })}`] }))
+        .addNode('done', () => ({ qa: ['done'] }))
+        .addEdge(START, 'ask1')
+        .addEdge('ask1', 'ask2')
+        .addEdge('ask2', 'done')
+        .addEdge('done', END)
+        .compile({ checkpointer: saver });
+
+      const cfg = {
+        configurable: { thread_id: dbName },
+        durability: 'exit' as const,
+        version: 'v2' as const,
+      };
+
+      // First question -> pauses at ask1, one checkpoint at that boundary.
+      await drain(graph.streamEvents({ qa: [] }, cfg, { raiseError: true }));
+      let state = await graph.getState(cfg);
+      expect(state.next).toEqual(['ask1']);
+      expect((await counts(dbName)).checkpoints).toBe(1);
+
+      // Answer 1 -> the run continues and the LLM asks a second question.
+      // The chain grows to 2: the first interrupt checkpoint is retained as
+      // the parent, not discarded or overwritten.
+      await drain(
+        graph.streamEvents(new Command({ resume: 'A1' }), cfg, {
+          raiseError: true,
+        })
+      );
+      state = await graph.getState(cfg);
+      expect(state.next).toEqual(['ask2']);
+      expect(state.values.qa).toEqual(['Q1=A1']);
+      expect((await counts(dbName)).checkpoints).toBe(2);
+
+      // Answer 2 -> run completes; both answers applied, three checkpoints
+      // total (two interrupt boundaries + final exit).
+      await drain(
+        graph.streamEvents(new Command({ resume: 'A2' }), cfg, {
+          raiseError: true,
+        })
+      );
+      state = await graph.getState(cfg);
+      expect(state.next).toEqual([]);
+      expect(state.values.qa).toEqual(['Q1=A1', 'Q2=A2', 'done']);
+      expect((await counts(dbName)).checkpoints).toBe(3);
+    });
+  });
 });
