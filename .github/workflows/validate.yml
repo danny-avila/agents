@@ -303,3 +303,20 @@ jobs:
           NODE_OPTIONS: '--experimental-vm-modules'
           NODE_ENV: test
           LIBRECHAT_CODE_BASEURL: ${{ secrets.LIBRECHAT_CODE_BASEURL }}
+
+      - name: Check for durability changes
+        id: durability_changes
+        run: |
+          if git diff --name-only $DIFF_RANGE 2>/dev/null | grep -qE "^src/run\.ts|^src/types/run\.ts|^src/specs/durability-checkpoint\.integration\.test\.ts"; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run durability checkpoint integration test (downloads a mongod binary)
+        if: steps.durability_changes.outputs.changed == 'true'
+        timeout-minutes: 6
+        run: npx jest src/specs/durability-checkpoint.integration.test.ts
+        env:
+          NODE_OPTIONS: '--experimental-vm-modules'
+          NODE_ENV: test

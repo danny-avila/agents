@@ -135,6 +135,13 @@ export class Run<_T extends t.BaseGraphState> {
   Graph: StandardGraph | MultiAgentGraph | undefined;
   returnContent: boolean = false;
   private skipCleanup: boolean = false;
+  /**
+   * Whether the compiled graph was built with a checkpointer (host-supplied
+   * or the HITL `MemorySaver` fallback). Captured at graph creation because
+   * the constructor can later overwrite `Graph.compileOptions` with the raw
+   * caller options, dropping the fallback checkpointer from that metadata.
+   */
+  private hasCheckpointer: boolean = false;
   private _streamResult: t.MessageContentComplex[] | undefined;
   /**
    * Captured interrupt payload typed as `unknown` because the SDK
@@ -256,6 +263,7 @@ export class Run<_T extends t.BaseGraphState> {
     standardGraph.compileOptions = this.applyHITLCheckpointerFallback(
       config.compileOptions
     );
+    this.hasCheckpointer = standardGraph.compileOptions?.checkpointer != null;
     standardGraph.hookRegistry = this.hookRegistry;
     standardGraph.humanInTheLoop = this.humanInTheLoop;
     standardGraph.toolOutputReferences = this.toolOutputReferences;
@@ -283,6 +291,7 @@ export class Run<_T extends t.BaseGraphState> {
 
     multiAgentGraph.compileOptions =
       this.applyHITLCheckpointerFallback(compileOptions);
+    this.hasCheckpointer = multiAgentGraph.compileOptions?.checkpointer != null;
 
     multiAgentGraph.hookRegistry = this.hookRegistry;
     multiAgentGraph.humanInTheLoop = this.humanInTheLoop;
@@ -647,10 +656,7 @@ export class Run<_T extends t.BaseGraphState> {
 
   async processStream(
     inputs: t.IState | Command,
-    callerConfig: Partial<RunnableConfig> & {
-      version: 'v1' | 'v2';
-      run_id?: string;
-    },
+    callerConfig: t.RunStreamConfig,
     streamOptions?: t.EventStreamOptions
   ): Promise<MessageContentComplex[] | undefined> {
     if (this.graphRunnable == null) {
@@ -676,10 +682,7 @@ export class Run<_T extends t.BaseGraphState> {
     const isResume = inputs instanceof Command;
     const stateInputs = isResume ? undefined : (inputs as t.IState);
 
-    const config: Partial<RunnableConfig> & {
-      version: 'v1' | 'v2';
-      run_id?: string;
-    } = {
+    const config: t.RunStreamConfig = {
       recursionLimit: 50,
       ...callerConfig,
       configurable: { ...callerConfig.configurable },
@@ -762,6 +765,16 @@ export class Run<_T extends t.BaseGraphState> {
     config.configurable = Object.assign(config.configurable ?? {}, {
       run_id: this.id,
     });
+
+    /**
+     * Default `durability: 'exit'` whenever a checkpointer is active so
+     * runs skip per-superstep checkpoint writes and persist only at the
+     * exit/interrupt boundary (all HITL/resume needs). An explicit caller
+     * value wins; no checkpointer leaves it unset (langgraph default).
+     */
+    if (config.durability == null && this.hasCheckpointer) {
+      config.durability = 'exit';
+    }
 
     const threadId = config.configurable.thread_id as string | undefined;
 
@@ -1155,10 +1168,7 @@ export class Run<_T extends t.BaseGraphState> {
    */
   async resume<TResume = t.ToolApprovalDecision[] | t.ToolApprovalDecisionMap>(
     resumeValue: TResume,
-    callerConfig: Partial<RunnableConfig> & {
-      version: 'v1' | 'v2';
-      run_id?: string;
-    },
+    callerConfig: t.RunStreamConfig,
     streamOptions?: t.EventStreamOptions,
     commandOptions?: Pick<
       ConstructorParameters<typeof Command>[0],
@@ -1191,16 +1201,8 @@ export class Run<_T extends t.BaseGraphState> {
   }
 
   private async resolveInterruptResumeConfig(
-    callerConfig: Partial<RunnableConfig> & {
-      version: 'v1' | 'v2';
-      run_id?: string;
-    }
-  ): Promise<
-    Partial<RunnableConfig> & {
-      version: 'v1' | 'v2';
-      run_id?: string;
-    }
-  > {
+    callerConfig: t.RunStreamConfig
+  ): Promise<t.RunStreamConfig> {
     const interrupt = this._interrupt;
     const interruptId = interrupt?.interruptId;
     const workflow = this.graphRunnable as
