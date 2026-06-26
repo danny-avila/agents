@@ -137,6 +137,8 @@ export interface ProcessSourcesConfig {
    * chunker/reranker. Defaults to 50,000; also configurable via the
    * `SEARCH_MAX_CONTENT_LENGTH` env var. */
   maxContentLength?: number;
+  mainExpandBy?: number;
+  separatorExpandBy?: number;
   strategies?: string[];
   filterContent?: boolean;
   reranker?: BaseReranker;

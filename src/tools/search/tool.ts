@@ -200,6 +200,8 @@ function createSearchProcessor({
   supportsVideos,
   sourceProcessor,
   onGetHighlights,
+  mainExpandBy,
+  separatorExpandBy,
   logger,
 }: {
   safeSearch: t.SearchToolConfig['safeSearch'];
@@ -207,6 +209,8 @@ function createSearchProcessor({
   searchAPI: ReturnType<typeof createSearchAPI>;
   sourceProcessor: ReturnType<typeof createSourceProcessor>;
   onGetHighlights: t.SearchToolConfig['onGetHighlights'];
+  mainExpandBy: t.SearchToolConfig['mainExpandBy'];
+  separatorExpandBy: t.SearchToolConfig['separatorExpandBy'];
   logger: t.Logger;
 }) {
   return async function ({
@@ -255,7 +259,11 @@ function createSearchProcessor({
         numElements: maxSources,
       });
 
-      return expandHighlights(processedSources);
+      return expandHighlights(
+        processedSources,
+        mainExpandBy,
+        separatorExpandBy
+      );
     } catch (error) {
       logger.error('Error in search:', error);
       return {
@@ -315,7 +323,11 @@ function createTool({
         }),
       });
       const turn = runnableConfig.toolCall?.turn ?? 0;
-      const { output, references } = formatResultsForLLM(turn, searchResult, maxOutputChars);
+      const { output, references } = formatResultsForLLM(
+        turn,
+        searchResult,
+        maxOutputChars
+      );
       const data: t.SearchResultData = { turn, ...searchResult, references };
       return [output, { [Constants.WEB_SEARCH]: data }];
     },
@@ -361,6 +373,8 @@ export const createSearchTool = (
     rerankerType = 'cohere',
     topResults = 5,
     maxContentLength,
+    mainExpandBy,
+    separatorExpandBy,
     maxOutputChars,
     strategies = ['no_extraction'],
     filterContent = true,
@@ -480,6 +494,8 @@ export const createSearchTool = (
     supportsVideos: searchProvider !== 'tavily',
     sourceProcessor,
     onGetHighlights,
+    mainExpandBy,
+    separatorExpandBy,
     logger,
   });
 
