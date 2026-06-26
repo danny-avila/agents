@@ -3,8 +3,12 @@ import type { Logger as WinstonLogger } from 'winston';
 import type { BaseReranker } from './rerankers';
 import { DATE_RANGE } from './schema';
 
-export type SearchProvider = 'serper' | 'searxng' | 'tavily';
-export type ScraperProvider = 'firecrawl' | 'serper' | 'tavily';
+export type SearchProvider = 'serper' | 'searxng' | 'tavily' | 'microsoftWebIQ';
+export type ScraperProvider =
+  | 'firecrawl'
+  | 'serper'
+  | 'tavily'
+  | 'microsoftWebIQ';
 export type RerankerType = 'infinity' | 'jina' | 'cohere' | 'none';
 
 export interface Highlight {
@@ -106,6 +110,16 @@ export interface TavilySearchPayload {
   chunks_per_source?: number;
 }
 
+export interface MicrosoftWebIQSearchOptions {
+  maxResults?: number;
+  language?: string;
+  region?: string;
+  contentFormat?: 'passage' | 'text' | 'html' | 'markdown';
+  maxLength?: number;
+  location?: string;
+  freshness?: string;
+}
+
 export interface SearchConfig {
   searchProvider?: SearchProvider;
   serperApiKey?: string;
@@ -115,6 +129,9 @@ export interface SearchConfig {
   tavilySearchUrl?: string;
   tavilyExtractUrl?: string;
   tavilySearchOptions?: TavilySearchOptions;
+  microsoftWebIQApiKey?: string;
+  microsoftWebIQBaseUrl?: string;
+  microsoftWebIQSearchOptions?: MicrosoftWebIQSearchOptions;
 }
 
 export type References = {
@@ -169,6 +186,15 @@ export interface TavilyScraperConfig {
   format?: 'markdown' | 'text';
 }
 
+export interface MicrosoftScraperConfig {
+  apiKey?: string;
+  baseUrl?: string;
+  timeout?: number;
+  logger?: Logger;
+  maxLength?: number;
+  contentFormat?: 'text' | 'html' | 'markdown';
+}
+
 export interface ScraperContentResult {
   content: string;
 }
@@ -218,6 +244,7 @@ export interface SearchToolConfig
     ProcessSourcesConfig,
     FirecrawlConfig {
   tavilyScraperOptions?: TavilyScraperConfig;
+  microsoftScraperOptions?: MicrosoftScraperConfig;
   /** Max chars of highlight content this tool feeds the MODEL per search (the
    * dominant, otherwise-unbounded part of the output). Distinct from
    * `maxContentLength`, which caps scraped/reranked content per source — full
@@ -255,7 +282,8 @@ export type UsedReferences = {
 export type AnyScraperResponse =
   | FirecrawlScrapeResponse
   | SerperScrapeResponse
-  | TavilyScrapeResponse;
+  | TavilyScrapeResponse
+  | MicrosoftBrowseResponse;
 
 /** Base Scraper Interface */
 export interface BaseScraper {
@@ -397,6 +425,25 @@ export interface TavilyScrapeResponse {
     rawContent?: string;
     images?: string[];
     favicon?: string;
+  };
+  error?: string;
+}
+
+export type MicrosoftScrapeOptions = Omit<
+  MicrosoftScraperConfig,
+  'apiKey' | 'baseUrl' | 'logger'
+>;
+
+export interface MicrosoftBrowseResponse {
+  success: boolean;
+  data?: {
+    url?: string;
+    title?: string;
+    content?: string;
+    language?: string;
+    lastUpdatedAt?: string;
+    crawledAt?: string;
+    isAdult?: boolean;
   };
   error?: string;
 }
