@@ -227,6 +227,8 @@ export interface ProcessSourcesConfig {
    * configurable via the `SEARCH_CHUNK_OVERLAP` env var. Clamped below
    * `chunkSize`. */
   chunkOverlap?: number;
+  mainExpandBy?: number;
+  separatorExpandBy?: number;
   strategies?: string[];
   filterContent?: boolean;
   reranker?: BaseReranker;
