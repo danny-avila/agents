@@ -72,7 +72,7 @@ type ConfigurableUser = {
 
 /**
  * Resolve the trace userId from a configurable user object.
- * Reads LIBRECHAT_TRACE_USER_ID_FIELD env var (email | username | id) to
+ * Reads LIBRECHAT_TRACE_USER_ID_FIELD env var (email | username | name | id) to
  * pick the field; falls back to email → username when the env var is unset.
  * This is the fallback path used when RunConfig.user.userId is not set by
  * the host (e.g. older LibreChat versions). The host-provided value in
