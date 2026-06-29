@@ -124,8 +124,6 @@ export type StandardGraphConfig = Omit<
 export type UserTraceContext = {
   /** Human-readable identifier — e.g. email address or username. */
   userId?: string;
-  /** OIDC group memberships, emitted as `group:<name>` tags in trace backends that support them. */
-  groups?: string[];
 };
 
 export type RunConfig = {
@@ -133,8 +131,7 @@ export type RunConfig = {
   graphConfig: LegacyGraphConfig | StandardGraphConfig | MultiAgentGraphConfig;
   /**
    * Authenticated user identity for trace attribution.
-   * When provided, tracing backends use `userId` as the trace owner and
-   * emit one `group:<name>` tag per entry in `groups`.
+   * When provided, tracing backends use `userId` as the trace owner.
    */
   user?: UserTraceContext;
   /**
