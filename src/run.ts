@@ -67,7 +67,6 @@ type ConfigurableUser = {
   email?: string;
   username?: string;
   name?: string;
-  groups?: string[];
 };
 
 /**
@@ -775,9 +774,6 @@ export class Run<_T extends t.BaseGraphState> {
     const userId =
       this.user?.userId ??
       resolveConfigurableUserId(configurableUser, config.configurable?.user_id);
-    const userGroups: string[] =
-      this.user?.groups ??
-      (Array.isArray(configurableUser?.groups) ? configurableUser.groups : []);
     const sessionId =
       typeof config.configurable?.thread_id === 'string'
         ? config.configurable.thread_id
@@ -796,7 +792,7 @@ export class Run<_T extends t.BaseGraphState> {
       userId,
       sessionId,
       traceMetadata,
-      tags: ['librechat', 'agent', ...userGroups.map((g) => `group:${g}`)],
+      tags: ['librechat', 'agent'],
       traceIdSeed:
         streamLangfuseConfig?.deterministicTraceId === true
           ? this.id
@@ -1384,11 +1380,6 @@ export class Run<_T extends t.BaseGraphState> {
           titleConfigurableUser,
           chainOptions.configurable?.user_id
         );
-      const titleUserGroups: string[] =
-        this.user?.groups ??
-        (Array.isArray(titleConfigurableUser?.groups)
-          ? titleConfigurableUser.groups
-          : []);
       titleSessionId =
         typeof chainOptions.configurable?.thread_id === 'string'
           ? chainOptions.configurable.thread_id
@@ -1403,11 +1394,7 @@ export class Run<_T extends t.BaseGraphState> {
         userId: titleUserId,
         sessionId: titleSessionId,
         traceMetadata,
-        tags: [
-          'librechat',
-          'title',
-          ...titleUserGroups.map((g) => `group:${g}`),
-        ],
+        tags: ['librechat', 'title'],
         traceIdSeed:
           titleLangfuseConfig?.deterministicTraceId === true
             ? 'title-' + this.id
