@@ -63,6 +63,41 @@ export const defaultOmitOptions = new Set([
   'additionalModelRequestFields',
 ]);
 
+type ConfigurableUser = {
+  email?: string;
+  username?: string;
+  name?: string;
+  groups?: string[];
+};
+
+/**
+ * Resolve the trace userId from a configurable user object.
+ * Reads LIBRECHAT_TRACE_USER_ID_FIELD env var (email | username | id) to
+ * pick the field; falls back to email → username when the env var is unset.
+ * This is the fallback path used when RunConfig.user.userId is not set by
+ * the host (e.g. older LibreChat versions). The host-provided value in
+ * RunConfig.user.userId always takes precedence.
+ */
+function resolveConfigurableUserId(
+  user: ConfigurableUser | undefined,
+  rawUserId?: unknown
+): string | undefined {
+  const field =
+    typeof process !== 'undefined'
+      ? (process.env.LIBRECHAT_TRACE_USER_ID_FIELD ?? 'email')
+      : 'email';
+  if (field === 'name') {
+    return user?.name || user?.email || undefined;
+  }
+  if (field === 'username') {
+    return user?.username || user?.email || undefined;
+  }
+  if (field === 'id') {
+    return typeof rawUserId === 'string' ? rawUserId : user?.email || undefined;
+  }
+  return user?.email || user?.username || undefined;
+}
+
 const CUSTOM_GRAPH_EVENTS = new Set<string>([
   GraphEvents.ON_AGENT_UPDATE,
   GraphEvents.ON_RUN_STEP,
@@ -726,11 +761,15 @@ export class Run<_T extends t.BaseGraphState> {
     );
 
     const primaryContext = graph.agentContexts.get(graph.defaultAgentId);
+    const configurableUser = config.configurable?.user as
+      | ConfigurableUser
+      | undefined;
     const userId =
       this.user?.userId ??
-      (typeof config.configurable?.user_id === 'string'
-        ? config.configurable.user_id
-        : undefined);
+      resolveConfigurableUserId(configurableUser, config.configurable?.user_id);
+    const userGroups: string[] =
+      this.user?.groups ??
+      (Array.isArray(configurableUser?.groups) ? configurableUser.groups : []);
     const sessionId =
       typeof config.configurable?.thread_id === 'string'
         ? config.configurable.thread_id
@@ -749,11 +788,7 @@ export class Run<_T extends t.BaseGraphState> {
       userId,
       sessionId,
       traceMetadata,
-      tags: [
-        'librechat',
-        'agent',
-        ...(this.user?.groups?.map((g) => `group:${g}`) ?? []),
-      ],
+      tags: ['librechat', 'agent', ...userGroups.map((g) => `group:${g}`)],
       traceIdSeed:
         streamLangfuseConfig?.deterministicTraceId === true
           ? this.id
@@ -1332,11 +1367,20 @@ export class Run<_T extends t.BaseGraphState> {
     const titleRunName = getLangfuseTraceName(traceMetadata, 'LibreChat Title');
 
     if (chainOptions != null) {
+      const titleConfigurableUser = chainOptions.configurable?.user as
+        | ConfigurableUser
+        | undefined;
       titleUserId =
         this.user?.userId ??
-        (typeof chainOptions.configurable?.user_id === 'string'
-          ? chainOptions.configurable.user_id
-          : undefined);
+        resolveConfigurableUserId(
+          titleConfigurableUser,
+          chainOptions.configurable?.user_id
+        );
+      const titleUserGroups: string[] =
+        this.user?.groups ??
+        (Array.isArray(titleConfigurableUser?.groups)
+          ? titleConfigurableUser.groups
+          : []);
       titleSessionId =
         typeof chainOptions.configurable?.thread_id === 'string'
           ? chainOptions.configurable.thread_id
@@ -1354,7 +1398,7 @@ export class Run<_T extends t.BaseGraphState> {
         tags: [
           'librechat',
           'title',
-          ...(this.user?.groups?.map((g) => `group:${g}`) ?? []),
+          ...titleUserGroups.map((g) => `group:${g}`),
         ],
         traceIdSeed:
           titleLangfuseConfig?.deterministicTraceId === true
