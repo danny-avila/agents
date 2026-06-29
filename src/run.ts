@@ -125,6 +125,7 @@ export class Run<_T extends t.BaseGraphState> {
   private hookRegistry?: HookRegistry;
   private humanInTheLoop?: t.HumanInTheLoopConfig;
   private langfuse?: t.LangfuseConfig;
+  private user?: t.UserTraceContext;
   private toolOutputReferences?: t.ToolOutputReferencesConfig;
   private eagerEventToolExecution?: t.EagerEventToolExecutionConfig;
   private codeSessionToolNames?: string[];
@@ -182,6 +183,7 @@ export class Run<_T extends t.BaseGraphState> {
     this.hookRegistry = config.hooks;
     this.humanInTheLoop = config.humanInTheLoop;
     this.langfuse = config.langfuse;
+    this.user = config.user;
     this.toolOutputReferences = config.toolOutputReferences;
     this.eagerEventToolExecution = config.eagerEventToolExecution;
     this.codeSessionToolNames = config.codeSessionToolNames;
@@ -733,9 +735,10 @@ export class Run<_T extends t.BaseGraphState> {
 
     const primaryContext = graph.agentContexts.get(graph.defaultAgentId);
     const userId =
-      typeof config.configurable?.user_id === 'string'
+      this.user?.userId ??
+      (typeof config.configurable?.user_id === 'string'
         ? config.configurable.user_id
-        : undefined;
+        : undefined);
     const sessionId =
       typeof config.configurable?.thread_id === 'string'
         ? config.configurable.thread_id
@@ -754,7 +757,11 @@ export class Run<_T extends t.BaseGraphState> {
       userId,
       sessionId,
       traceMetadata,
-      tags: ['librechat', 'agent'],
+      tags: [
+        'librechat',
+        'agent',
+        ...(this.user?.groups?.map((g) => `group:${g}`) ?? []),
+      ],
       traceIdSeed:
         streamLangfuseConfig?.deterministicTraceId === true
           ? this.id
@@ -1334,9 +1341,10 @@ export class Run<_T extends t.BaseGraphState> {
 
     if (chainOptions != null) {
       titleUserId =
-        typeof chainOptions.configurable?.user_id === 'string'
+        this.user?.userId ??
+        (typeof chainOptions.configurable?.user_id === 'string'
           ? chainOptions.configurable.user_id
-          : undefined;
+          : undefined);
       titleSessionId =
         typeof chainOptions.configurable?.thread_id === 'string'
           ? chainOptions.configurable.thread_id
@@ -1351,7 +1359,11 @@ export class Run<_T extends t.BaseGraphState> {
         userId: titleUserId,
         sessionId: titleSessionId,
         traceMetadata,
-        tags: ['librechat', 'title'],
+        tags: [
+          'librechat',
+          'title',
+          ...(this.user?.groups?.map((g) => `group:${g}`) ?? []),
+        ],
         traceIdSeed:
           titleLangfuseConfig?.deterministicTraceId === true
             ? 'title-' + this.id
