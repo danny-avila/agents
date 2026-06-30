@@ -621,9 +621,17 @@ function _formatContent(message: BaseMessage) {
         if (isAIMessage(message) && (signature == null || signature === '')) {
           return null;
         }
+        // Opus 4.7+ omits thinking text by default (signed but text-less
+        // block), so `thinking` may be absent on a signed block even though the
+        // type declares it required. Coerce to '' — JSON.stringify drops an
+        // undefined value, which would send a `thinking` block missing its
+        // required `thinking` field and trip a 400
+        // `messages.N.content.M.thinking.thinking: Field required`.
+        const thinkingText =
+          (thinkingPart as { thinking?: string }).thinking ?? '';
         const block: AnthropicThinkingBlockParam = {
           type: 'thinking' as const, // Explicitly setting the type as "thinking"
-          thinking: thinkingPart.thinking,
+          thinking: thinkingText,
           signature: thinkingPart.signature,
           ...(cacheControl != null ? { cache_control: cacheControl } : {}),
         };
