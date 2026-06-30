@@ -6,6 +6,7 @@ import type { BaseMessage } from '@langchain/core/messages';
 import type { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import type * as t from '@/types';
 import { annotateMessagesForLLM } from '@/tools/toolOutputReferences';
+import { assertNotTruncatedToolCall } from '@/llm/truncation';
 import { Constants, GraphEvents, Providers } from '@/common';
 import { manualToolStreamProviders } from '@/llm/providers';
 import { modifyDeltaProperties } from '@/messages';
@@ -297,6 +298,7 @@ export async function attemptInvoke(
       );
     }
 
+    assertNotTruncatedToolCall(finalChunk);
     return { messages: [finalChunk as AIMessageChunk] };
   }
 
@@ -306,6 +308,7 @@ export async function attemptInvoke(
       (tool_call: ToolCall) => !!tool_call.name
     );
   }
+  assertNotTruncatedToolCall(finalMessage);
   return { messages: [finalMessage] };
 }
 
