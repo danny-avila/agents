@@ -53,6 +53,37 @@ describe('getTruncationStopReason', () => {
     expect(getTruncationStopReason(message)).toBe('max_tokens');
   });
 
+  it('detects Anthropic streaming shape (additional_kwargs.stop_reason)', () => {
+    const message = new AIMessageChunk({
+      content: '',
+      additional_kwargs: { stop_reason: 'max_tokens' },
+      response_metadata: { model_provider: 'anthropic' },
+    });
+    expect(getTruncationStopReason(message)).toBe('max_tokens');
+  });
+
+  it('detects OpenAI Responses shape (incomplete_details.reason)', () => {
+    const message = new AIMessage({
+      content: '',
+      response_metadata: {
+        status: 'incomplete',
+        incomplete_details: { reason: 'max_output_tokens' },
+      },
+    });
+    expect(getTruncationStopReason(message)).toBe('max_tokens');
+  });
+
+  it('returns null for a non-token incomplete reason (content_filter)', () => {
+    const message = new AIMessage({
+      content: '',
+      response_metadata: {
+        status: 'incomplete',
+        incomplete_details: { reason: 'content_filter' },
+      },
+    });
+    expect(getTruncationStopReason(message)).toBeNull();
+  });
+
   it('returns null for normal stop reasons', () => {
     expect(
       getTruncationStopReason(
@@ -165,6 +196,32 @@ describe('assertNotTruncatedToolCall', () => {
     expect(() =>
       assertNotTruncatedToolCall(message, Providers.ANTHROPIC)
     ).toThrow(OutputTruncationError);
+  });
+
+  it('throws for an Anthropic streaming tool call truncated via additional_kwargs', () => {
+    const message = new AIMessageChunk({
+      content: '',
+      tool_calls: [{ id: '1', name: 'create_file', args: { path: 'a' } }],
+      additional_kwargs: { stop_reason: 'max_tokens' },
+      response_metadata: { model_provider: 'anthropic' },
+    });
+    expect(() =>
+      assertNotTruncatedToolCall(message, Providers.ANTHROPIC)
+    ).toThrow(OutputTruncationError);
+  });
+
+  it('throws for an OpenAI Responses tool call truncated via incomplete_details', () => {
+    const message = new AIMessage({
+      content: '',
+      tool_calls: [{ id: '1', name: 'create_file', args: { path: 'a' } }],
+      response_metadata: {
+        status: 'incomplete',
+        incomplete_details: { reason: 'max_output_tokens' },
+      },
+    });
+    expect(() => assertNotTruncatedToolCall(message, Providers.OPENAI)).toThrow(
+      OutputTruncationError
+    );
   });
 
   it('does not throw for providers that deliver complete tool calls (Google/Vertex)', () => {
