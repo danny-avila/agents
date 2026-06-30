@@ -315,3 +315,69 @@ describe('_convertMessagesToAnthropicPayload — cross-provider reasoning blocks
     expect(blocks.every((b) => b.type === 'text')).toBe(true);
   });
 });
+
+/**
+ * Regression for Opus 4.7+ "thinking omitted by default": the Messages API
+ * returns a signed `thinking` block whose `thinking` text is absent (only the
+ * signature carries the encrypted reasoning). Forwarding it as
+ * `{ thinking: undefined, signature }` drops the field at JSON.stringify time
+ * and the API rejects the replay with
+ * `messages.N.content.M.thinking.thinking: Field required`. The converter must
+ * coerce the missing text to '' so the required field is always present.
+ */
+describe('_convertMessagesToAnthropicPayload — signed text-less thinking (Opus 4.7+ omitted)', () => {
+  interface ThinkingBlock {
+    type?: string;
+    thinking?: string;
+    signature?: string;
+    text?: string;
+  }
+
+  const signedTextlessHistory = (): BaseMessage[] => [
+    new HumanMessage('summarize the repo'),
+    new AIMessage({
+      content: [
+        { type: 'thinking', signature: 'sig-encrypted-reasoning' },
+        { type: 'text', text: 'Here is the summary.' },
+      ],
+    }),
+  ];
+
+  it('keeps the signed block and emits an empty (not undefined) thinking field', () => {
+    const payload = _convertMessagesToAnthropicPayload(signedTextlessHistory());
+    const blocks = assistantBlocks(payload) as ThinkingBlock[];
+    const thinking = blocks.find((b) => b.type === 'thinking');
+
+    expect(thinking).toBeDefined();
+    expect(thinking?.signature).toBe('sig-encrypted-reasoning');
+    expect(thinking?.thinking).toBe('');
+    expect('thinking' in (thinking as object)).toBe(true);
+  });
+
+  it('serializes the thinking field rather than dropping it (the 400 trigger)', () => {
+    const payload = _convertMessagesToAnthropicPayload(signedTextlessHistory());
+    const blocks = assistantBlocks(payload) as ThinkingBlock[];
+    const thinking = blocks.find((b) => b.type === 'thinking');
+
+    expect(JSON.stringify(thinking)).toContain('"thinking":""');
+  });
+
+  it('still drops an unsigned text-less thinking block (foreign reasoning)', () => {
+    const history: BaseMessage[] = [
+      new HumanMessage('hi'),
+      new AIMessage({
+        content: [
+          { type: 'thinking' },
+          { type: 'text', text: 'Hello!' },
+        ],
+      }),
+    ];
+    const blocks = assistantBlocks(
+      _convertMessagesToAnthropicPayload(history)
+    ) as ThinkingBlock[];
+    expect(blocks.find((b) => b.type === 'thinking')).toBeUndefined();
+    expect(
+      blocks.some((b) => b.type === 'text' && b.text === 'Hello!')
+    ).toBe(true);
+  });
+});
