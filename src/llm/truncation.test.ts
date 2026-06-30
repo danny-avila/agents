@@ -5,6 +5,7 @@ import {
   assertNotTruncatedToolCall,
   getTruncationStopReason,
 } from '@/llm/truncation';
+import { Providers } from '@/common';
 
 describe('getTruncationStopReason', () => {
   it('returns null when there is no response metadata', () => {
@@ -153,5 +154,32 @@ describe('assertNotTruncatedToolCall', () => {
     expect(() => assertNotTruncatedToolCall(message)).toThrow(
       OutputTruncationError
     );
+  });
+
+  it('still throws for a streaming-arg provider (Anthropic)', () => {
+    const message = new AIMessage({
+      content: '',
+      tool_calls: [{ id: '1', name: 'create_file', args: { path: 'a' } }],
+      response_metadata: { stop_reason: 'max_tokens' },
+    });
+    expect(() =>
+      assertNotTruncatedToolCall(message, Providers.ANTHROPIC)
+    ).toThrow(OutputTruncationError);
+  });
+
+  it('does not throw for providers that deliver complete tool calls (Google/Vertex)', () => {
+    const message = new AIMessage({
+      content: '',
+      tool_calls: [
+        { id: '1', name: 'create_file', args: { path: 'a', content: 'b' } },
+      ],
+      response_metadata: { finishReason: 'MAX_TOKENS' },
+    });
+    expect(() =>
+      assertNotTruncatedToolCall(message, Providers.GOOGLE)
+    ).not.toThrow();
+    expect(() =>
+      assertNotTruncatedToolCall(message, Providers.VERTEXAI)
+    ).not.toThrow();
   });
 });

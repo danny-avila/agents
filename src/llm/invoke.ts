@@ -298,7 +298,7 @@ export async function attemptInvoke(
       );
     }
 
-    assertNotTruncatedToolCall(finalChunk);
+    assertNotTruncatedToolCall(finalChunk, provider);
     return { messages: [finalChunk as AIMessageChunk] };
   }
 
@@ -308,7 +308,7 @@ export async function attemptInvoke(
       (tool_call: ToolCall) => !!tool_call.name
     );
   }
-  assertNotTruncatedToolCall(finalMessage);
+  assertNotTruncatedToolCall(finalMessage, provider);
   return { messages: [finalMessage] };
 }
 

@@ -1,4 +1,16 @@
 import type { AIMessageChunk, BaseMessage } from '@langchain/core/messages';
+import { Providers } from '@/common';
+
+/**
+ * Providers whose adapters deliver tool calls as complete, atomic objects
+ * rather than streamed argument deltas. Google/Vertex (GenAI) emit each
+ * `functionCall` whole and seal it on arrival, so a `MAX_TOKENS` finish does
+ * NOT imply the arguments were cut off — the truncation guard must skip them.
+ */
+const ATOMIC_TOOL_CALL_ARG_PROVIDERS = new Set<Providers>([
+  Providers.GOOGLE,
+  Providers.VERTEXAI,
+]);
 
 /**
  * Normalized truncation reasons across providers. Providers disagree on the
@@ -122,15 +134,22 @@ function collectToolCallNames(message: AIMessageChunk | BaseMessage): string[] {
 
 /**
  * Throws {@link OutputTruncationError} when `message` was truncated by the
- * output token limit AND still carries a tool call. A tool call emitted under
- * truncation has incomplete arguments (the tool-use block is the last thing the
- * model streams), so letting it through makes the agent loop on a malformed
- * call. No-ops for normal completions and for truncated plain-text turns.
+ * output token limit AND still carries a tool call. For providers that stream
+ * tool arguments incrementally (Anthropic, Bedrock, OpenAI), a tool call
+ * emitted under truncation has incomplete arguments — the tool-use block is the
+ * last thing the model streams — so letting it through makes the agent loop on a
+ * malformed call. No-ops for normal completions, truncated plain-text turns, and
+ * providers that deliver complete tool calls atomically (Google/Vertex), where
+ * `MAX_TOKENS` does not imply the arguments were cut off.
  */
 export function assertNotTruncatedToolCall(
-  message: AIMessageChunk | BaseMessage | undefined | null
+  message: AIMessageChunk | BaseMessage | undefined | null,
+  provider?: Providers
 ): void {
   if (message == null) {
+    return;
+  }
+  if (provider != null && ATOMIC_TOOL_CALL_ARG_PROVIDERS.has(provider)) {
     return;
   }
   const stopReason = getTruncationStopReason(message);
