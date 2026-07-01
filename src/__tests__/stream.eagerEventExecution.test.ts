@@ -4771,4 +4771,59 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     expect(toolExecuteCalls).toHaveLength(0);
     expect(graph.eagerEventToolExecutions.has('call_file')).toBe(false);
   });
+
+  it('keeps the direct-tool batch guard when an excluded tool is also direct', async () => {
+    // edit_file is both a direct graph tool AND excluded from eager. A mixed
+    // batch with a direct tool must suppress eager for the whole batch, so the
+    // sibling event tool must NOT prestart — excluding edit_file must not hide
+    // it from the batch-level direct-tool guard.
+    const graph = createGraph({
+      eagerEventToolExecution: {
+        enabled: true,
+        excludeToolNames: ['edit_file'],
+      },
+      getAgentContext: jest.fn(() => ({
+        provider: Providers.ANTHROPIC,
+        reasoningKey: 'reasoning',
+        toolDefinitions: [{ name: 'weather' }, { name: 'edit_file' }],
+        graphTools: [{ name: 'edit_file' }],
+        agentId: 'agent_1',
+      })) as unknown as StandardGraph['getAgentContext'],
+    });
+    const toolExecuteCalls: t.ToolExecuteBatchRequest[] = [];
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data): Promise<void> => {
+        if (event !== GraphEvents.ON_TOOL_EXECUTE) {
+          return;
+        }
+        toolExecuteCalls.push(data as t.ToolExecuteBatchRequest);
+        (data as t.ToolExecuteBatchRequest).resolve([]);
+      });
+
+    await new ChatModelStreamHandler().handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_calls: [
+            { id: 'call_weather', name: 'weather', args: { city: 'NYC' } },
+            {
+              id: 'call_edit',
+              name: 'edit_file',
+              args: { path: '/mnt/data/x.py' },
+            },
+          ],
+          response_metadata: finalToolCallResponseMetadata,
+        } as unknown as t.StreamChunk,
+      },
+      { langgraph_node: 'agent' },
+      graph
+    );
+
+    // Direct tool in batch suppresses eager for the whole batch.
+    expect(toolExecuteCalls).toHaveLength(0);
+    expect(graph.eagerEventToolExecutions.has('call_weather')).toBe(false);
+    expect(graph.eagerEventToolExecutions.has('call_edit')).toBe(false);
+  });
 });

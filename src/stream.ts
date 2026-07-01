@@ -626,7 +626,7 @@ function createEagerToolExecutionPlan(args: {
     return undefined;
   }
 
-  const candidateToolCalls = skipExisting
+  const unstartedToolCalls = skipExisting
     ? toolCalls.filter((toolCall) => {
       if (toolCall.id == null || toolCall.id === '') {
         return true;
@@ -634,6 +634,13 @@ function createEagerToolExecutionPlan(args: {
       return !graph.eagerEventToolExecutions.has(toolCall.id);
     })
     : toolCalls;
+  // Drop host-excluded tools only AFTER the batch-level guards above have run
+  // against the full batch, so excluding a call never hides a sibling direct
+  // tool from `hasDirectToolCallInBatch`. Excluded calls fall through to normal
+  // ToolNode execution; siblings may still eager-execute.
+  const candidateToolCalls = unstartedToolCalls.filter(
+    (toolCall) => !isEagerExecutionExcludedTool(toolCall.name, graph)
+  );
   if (candidateToolCalls.length === 0) {
     return [];
   }
@@ -685,17 +692,11 @@ function startEagerToolExecutions(args: {
   skipExisting?: boolean;
 }): void {
   const { graph, metadata, agentContext, toolCalls, skipExisting } = args;
-  const eligibleToolCalls = toolCalls.filter(
-    (toolCall) => !isEagerExecutionExcludedTool(toolCall.name, graph)
-  );
-  if (eligibleToolCalls.length === 0) {
-    return;
-  }
   const entries = createEagerToolExecutionPlan({
     graph,
     metadata,
     agentContext,
-    toolCalls: eligibleToolCalls,
+    toolCalls,
     skipExisting,
   });
   if (entries == null || entries.length === 0) {
