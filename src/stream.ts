@@ -135,7 +135,14 @@ function isEagerExecutionExcludedTool(
     return false;
   }
   const excluded = graph.eagerEventToolExecution?.excludeToolNames;
-  return excluded != null && excluded.includes(name);
+  if (excluded != null && excluded.includes(name)) {
+    return true;
+  }
+  // A code-session participant writes to the shared sandbox, so it is
+  // side-effecting: never prestart it speculatively (a revised/superseded turn
+  // would leave the write applied). Implies exclusion without the host having
+  // to also list the name in excludeToolNames.
+  return graph.codeSessionToolNames?.includes(name) === true;
 }
 
 function isDirectGraphTool(

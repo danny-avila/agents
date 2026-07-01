@@ -980,7 +980,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
        * still need to travel through `_injected_files`; the legacy
        * `/files/<session_id>` fallback was removed from the executors.
        */
-      if (CODE_EXECUTION_TOOLS.has(call.name)) {
+      if (this.participatesInCodeSession(call.name)) {
         const codeSession = this.sessions?.get(Constants.EXECUTE_CODE) as
           | t.CodeSessionContext
           | undefined;

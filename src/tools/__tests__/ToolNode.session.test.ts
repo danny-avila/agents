@@ -140,6 +140,52 @@ describe('ToolNode code execution session management', () => {
       expect(capturedConfigs[0]._injected_files).toBeUndefined();
     });
 
+    it('injects the existing session into declared host tools on the direct path', async () => {
+      const capturedConfigs: Record<string, unknown>[] = [];
+      const sessions: t.ToolSessionMap = new Map();
+      sessions.set(Constants.EXECUTE_CODE, {
+        session_id: 'host-session',
+        files: [
+          { id: 'g1', name: 'gen.png', storage_session_id: 'host-session' },
+        ],
+        lastUpdated: Date.now(),
+      } satisfies t.CodeSessionContext);
+
+      const cfTool = tool(
+        async (_input, config) => {
+          capturedConfigs.push({ ...(config.toolCall ?? {}) });
+          return 'Created /mnt/data/x.py';
+        },
+        {
+          name: 'create_file',
+          description: 'write a file',
+          schema: z.object({ path: z.string(), content: z.string() }),
+        }
+      ) as unknown as StructuredToolInterface;
+
+      const toolNode = new ToolNode({
+        tools: [cfTool],
+        sessions,
+        codeSessionToolNames: ['create_file', 'edit_file'],
+      });
+
+      const aiMsg = new AIMessage({
+        content: '',
+        tool_calls: [
+          {
+            id: 'call_cf',
+            name: 'create_file',
+            args: { path: '/mnt/data/x.py', content: 'print(1)' },
+          },
+        ],
+      });
+      await toolNode.invoke({ messages: [aiMsg] });
+
+      // Declared host tool writes into the current sandbox, not a fresh one.
+      expect(capturedConfigs).toHaveLength(1);
+      expect(capturedConfigs[0].session_id).toBe('host-session');
+    });
+
     it('preserves per-file storage_session_id for multi-session files', async () => {
       const capturedConfigs: Record<string, unknown>[] = [];
       const sessions: t.ToolSessionMap = new Map();

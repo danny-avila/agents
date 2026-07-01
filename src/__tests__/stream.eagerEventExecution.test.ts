@@ -4772,6 +4772,50 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     expect(graph.eagerEventToolExecutions.has('call_file')).toBe(false);
   });
 
+  it('does not prestart codeSessionToolNames tools even without excludeToolNames', async () => {
+    // A declared session-writing host tool is side-effecting, so it must not be
+    // eagerly prestarted even when the host didn't also list it in excludeToolNames.
+    const graph = createGraph({
+      eagerEventToolExecution: { enabled: true },
+      codeSessionToolNames: ['create_file', 'edit_file'],
+    });
+    const toolExecuteCalls: t.ToolExecuteBatchRequest[] = [];
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data): Promise<void> => {
+        if (event !== GraphEvents.ON_TOOL_EXECUTE) {
+          return;
+        }
+        const batch = data as t.ToolExecuteBatchRequest;
+        toolExecuteCalls.push(batch);
+        batch.resolve([
+          { toolCallId: 'call_cf2', status: 'success', content: 'ok' },
+        ]);
+      });
+
+    await new ChatModelStreamHandler().handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_cf2',
+              name: 'create_file',
+              args: { path: '/mnt/data/y.py', content: 'print(2)' },
+            },
+          ],
+          response_metadata: finalToolCallResponseMetadata,
+        } as unknown as t.StreamChunk,
+      },
+      { langgraph_node: 'agent' },
+      graph
+    );
+
+    expect(toolExecuteCalls).toHaveLength(0);
+    expect(graph.eagerEventToolExecutions.has('call_cf2')).toBe(false);
+  });
+
   it('keeps the direct-tool batch guard when an excluded tool is also direct', async () => {
     // edit_file is both a direct graph tool AND excluded from eager. A mixed
     // batch with a direct tool must suppress eager for the whole batch, so the
