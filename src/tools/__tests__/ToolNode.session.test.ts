@@ -1174,5 +1174,47 @@ describe('ToolNode code execution session management', () => {
       expect(capturedRequests[0].name).toBe('web_search');
       expect(capturedRequests[0].codeSessionContext).toBeUndefined();
     });
+
+    it('attaches codeSessionContext to declared host tools so they write into the current sandbox', async () => {
+      const sessions: t.ToolSessionMap = new Map();
+      sessions.set(Constants.EXECUTE_CODE, {
+        session_id: 'cf-session',
+        files: [
+          { id: 'g1', name: 'gen.png', storage_session_id: 'cf-session' },
+        ],
+        lastUpdated: Date.now(),
+      } satisfies t.CodeSessionContext);
+
+      const { capturedRequests } = captureBatchRequests();
+
+      const toolNode = new ToolNode({
+        tools: [createDummyTool('create_file')],
+        sessions,
+        eventDrivenMode: true,
+        codeSessionToolNames: ['create_file', 'edit_file'],
+        toolCallStepIds: new Map([['call_cf', 'step_cf']]),
+      });
+
+      const aiMsg = new AIMessage({
+        content: '',
+        tool_calls: [
+          {
+            id: 'call_cf',
+            name: 'create_file',
+            args: { path: '/mnt/data/x.py', content: 'print(1)' },
+          },
+        ],
+      });
+
+      await toolNode.invoke({ messages: [aiMsg] });
+
+      expect(capturedRequests).toHaveLength(1);
+      expect(capturedRequests[0].name).toBe('create_file');
+      // Existing session is injected so create_file writes into the current
+      // sandbox instead of spawning a separate one.
+      expect(capturedRequests[0].codeSessionContext?.session_id).toBe(
+        'cf-session'
+      );
+    });
   });
 });

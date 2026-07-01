@@ -2487,7 +2487,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       const plan = buildToolExecutionRequestPlan({
         toolCalls: approvedEntries.map((entry) => {
           const codeSessionContext =
-            CODE_EXECUTION_TOOLS.has(entry.call.name) ||
+            this.participatesInCodeSession(entry.call.name) ||
             entry.call.name === Constants.SKILL_TOOL ||
             entry.call.name === Constants.READ_FILE
               ? this.getCodeSessionContext()

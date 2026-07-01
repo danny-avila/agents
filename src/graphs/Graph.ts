@@ -1312,6 +1312,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       toolRegistry: agentContext?.toolRegistry,
       sessions: this.sessions,
       toolExecution: this.toolExecution,
+      codeSessionToolNames: this.codeSessionToolNames,
       hookRegistry: this.hookRegistry,
       humanInTheLoop: this.humanInTheLoop,
       maxContextTokens: agentContext?.maxContextTokens,

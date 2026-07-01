@@ -195,7 +195,8 @@ function getCodeSessionContext(
   if (
     !CODE_EXECUTION_TOOLS.has(name) &&
     name !== Constants.SKILL_TOOL &&
-    name !== Constants.READ_FILE
+    name !== Constants.READ_FILE &&
+    graph.codeSessionToolNames?.includes(name) !== true
   ) {
     return undefined;
   }
