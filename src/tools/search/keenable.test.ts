@@ -1,5 +1,6 @@
 import axios from 'axios';
 import { createSearchAPI } from './search';
+import { DATE_RANGE } from './schema';
 
 jest.mock('axios');
 const mockedAxios = axios as jest.Mocked<typeof axios>;
@@ -117,6 +118,22 @@ describe('Keenable search API', () => {
       expect.any(Object)
     );
     expect(result.data?.organic).toHaveLength(2);
+  });
+
+  it('maps date ranges to Keenable published filters', async () => {
+    mockedAxios.post.mockResolvedValueOnce(sampleResponse);
+
+    const searchAPI = createSearchAPI({ searchProvider: 'keenable' });
+    await searchAPI.getSources({
+      query: 'typescript',
+      date: DATE_RANGE.PAST_WEEK,
+    });
+
+    expect(mockedAxios.post).toHaveBeenCalledWith(
+      expect.any(String),
+      { query: 'typescript', published_after: '7d' },
+      expect.any(Object)
+    );
   });
 
   it('surfaces request failures as a structured error', async () => {

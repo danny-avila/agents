@@ -132,6 +132,7 @@ export interface KeenableSearchOptions {
 export interface KeenableSearchPayload {
   query: string;
   site?: string;
+  published_after?: string;
 }
 
 export interface KeenableSearchResult {
