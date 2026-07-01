@@ -140,6 +140,52 @@ describe('ToolNode code execution session management', () => {
       expect(capturedConfigs[0]._injected_files).toBeUndefined();
     });
 
+    it('injects the existing session into declared host tools on the direct path', async () => {
+      const capturedConfigs: Record<string, unknown>[] = [];
+      const sessions: t.ToolSessionMap = new Map();
+      sessions.set(Constants.EXECUTE_CODE, {
+        session_id: 'host-session',
+        files: [
+          { id: 'g1', name: 'gen.png', storage_session_id: 'host-session' },
+        ],
+        lastUpdated: Date.now(),
+      } satisfies t.CodeSessionContext);
+
+      const cfTool = tool(
+        async (_input, config) => {
+          capturedConfigs.push({ ...(config.toolCall ?? {}) });
+          return 'Created /mnt/data/x.py';
+        },
+        {
+          name: 'create_file',
+          description: 'write a file',
+          schema: z.object({ path: z.string(), content: z.string() }),
+        }
+      ) as unknown as StructuredToolInterface;
+
+      const toolNode = new ToolNode({
+        tools: [cfTool],
+        sessions,
+        codeSessionToolNames: ['create_file', 'edit_file'],
+      });
+
+      const aiMsg = new AIMessage({
+        content: '',
+        tool_calls: [
+          {
+            id: 'call_cf',
+            name: 'create_file',
+            args: { path: '/mnt/data/x.py', content: 'print(1)' },
+          },
+        ],
+      });
+      await toolNode.invoke({ messages: [aiMsg] });
+
+      // Declared host tool writes into the current sandbox, not a fresh one.
+      expect(capturedConfigs).toHaveLength(1);
+      expect(capturedConfigs[0].session_id).toBe('host-session');
+    });
+
     it('preserves per-file storage_session_id for multi-session files', async () => {
       const capturedConfigs: Record<string, unknown>[] = [];
       const sessions: t.ToolSessionMap = new Map();
@@ -774,6 +820,78 @@ describe('ToolNode code execution session management', () => {
       expect(sessions.has(Constants.EXECUTE_CODE)).toBe(false);
     });
 
+    it('stores the exec session for host tools declared in codeSessionToolNames', () => {
+      const sessions: t.ToolSessionMap = new Map();
+      const toolNode = new ToolNode({
+        tools: [createMockCodeTool({ capturedConfigs: [] })],
+        sessions,
+        eventDrivenMode: true,
+        codeSessionToolNames: ['create_file', 'edit_file'],
+      });
+
+      const storeMethod = (
+        toolNode as unknown as {
+          storeCodeSessionFromResults: (
+            results: t.ToolExecuteResult[],
+            requestMap: Map<string, t.ToolCallRequest>
+          ) => void;
+        }
+      ).storeCodeSessionFromResults.bind(toolNode);
+
+      storeMethod(
+        [
+          {
+            toolCallId: 'tc-cf',
+            content: 'Created /mnt/data/x.py (10 chars).',
+            artifact: { session_id: 'authoring-session' },
+            status: 'success',
+          },
+        ],
+        new Map([['tc-cf', { id: 'tc-cf', name: 'create_file', args: {} }]])
+      );
+
+      // create_file's exec session is folded into the shared code session, so a
+      // later bash_tool/execute_code call reuses the same sandbox.
+      const stored = sessions.get(Constants.EXECUTE_CODE) as
+        | t.CodeSessionContext
+        | undefined;
+      expect(stored?.session_id).toBe('authoring-session');
+    });
+
+    it('does not store a host authoring tool session when not declared', () => {
+      const sessions: t.ToolSessionMap = new Map();
+      const toolNode = new ToolNode({
+        tools: [createMockCodeTool({ capturedConfigs: [] })],
+        sessions,
+        eventDrivenMode: true,
+        // codeSessionToolNames omitted — create_file must NOT be treated as a
+        // code-session participant.
+      });
+
+      const storeMethod = (
+        toolNode as unknown as {
+          storeCodeSessionFromResults: (
+            results: t.ToolExecuteResult[],
+            requestMap: Map<string, t.ToolCallRequest>
+          ) => void;
+        }
+      ).storeCodeSessionFromResults.bind(toolNode);
+
+      storeMethod(
+        [
+          {
+            toolCallId: 'tc-cf2',
+            content: 'Created /mnt/data/x.py (10 chars).',
+            artifact: { session_id: 'authoring-session' },
+            status: 'success',
+          },
+        ],
+        new Map([['tc-cf2', { id: 'tc-cf2', name: 'create_file', args: {} }]])
+      );
+
+      expect(sessions.has(Constants.EXECUTE_CODE)).toBe(false);
+    });
+
     it('ignores error results', () => {
       const sessions: t.ToolSessionMap = new Map();
 
@@ -1101,6 +1219,48 @@ describe('ToolNode code execution session management', () => {
       expect(capturedRequests).toHaveLength(1);
       expect(capturedRequests[0].name).toBe('web_search');
       expect(capturedRequests[0].codeSessionContext).toBeUndefined();
+    });
+
+    it('attaches codeSessionContext to declared host tools so they write into the current sandbox', async () => {
+      const sessions: t.ToolSessionMap = new Map();
+      sessions.set(Constants.EXECUTE_CODE, {
+        session_id: 'cf-session',
+        files: [
+          { id: 'g1', name: 'gen.png', storage_session_id: 'cf-session' },
+        ],
+        lastUpdated: Date.now(),
+      } satisfies t.CodeSessionContext);
+
+      const { capturedRequests } = captureBatchRequests();
+
+      const toolNode = new ToolNode({
+        tools: [createDummyTool('create_file')],
+        sessions,
+        eventDrivenMode: true,
+        codeSessionToolNames: ['create_file', 'edit_file'],
+        toolCallStepIds: new Map([['call_cf', 'step_cf']]),
+      });
+
+      const aiMsg = new AIMessage({
+        content: '',
+        tool_calls: [
+          {
+            id: 'call_cf',
+            name: 'create_file',
+            args: { path: '/mnt/data/x.py', content: 'print(1)' },
+          },
+        ],
+      });
+
+      await toolNode.invoke({ messages: [aiMsg] });
+
+      expect(capturedRequests).toHaveLength(1);
+      expect(capturedRequests[0].name).toBe('create_file');
+      // Existing session is injected so create_file writes into the current
+      // sandbox instead of spawning a separate one.
+      expect(capturedRequests[0].codeSessionContext?.session_id).toBe(
+        'cf-session'
+      );
     });
   });
 });

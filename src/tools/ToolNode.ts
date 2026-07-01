@@ -439,6 +439,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private eventDrivenMode: boolean = false;
   /** Opt-in stream-layer prestart config for event-driven tools. */
   private eagerEventToolExecution?: t.EagerEventToolExecutionConfig;
+  /** Host tools that write to the code sandbox and share its exec session. */
+  private codeSessionToolNames?: ReadonlySet<string>;
   /** Shared per-run prestarted tool registry populated by ChatModelStreamHandler. */
   private eagerEventToolExecutions?: Map<string, t.EagerEventToolExecution>;
   /** Shared per-run per-tool turn counter used by eager and normal event dispatch. */
@@ -515,6 +517,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     agentId,
     executingAgentId,
     directToolNames,
+    codeSessionToolNames,
     maxContextTokens,
     maxToolResultChars,
     hookRegistry,
@@ -552,6 +555,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     // existing agentId option) still get attribution without knowing the new option.
     this.executingAgentId = executingAgentId ?? agentId;
     this.directToolNames = directToolNames;
+    this.codeSessionToolNames =
+      codeSessionToolNames != null && codeSessionToolNames.length > 0
+        ? new Set(codeSessionToolNames)
+        : undefined;
     this.maxToolResultChars =
       maxToolResultChars ?? calculateMaxToolResultChars(maxContextTokens);
     this.hookRegistry = hookRegistry;
@@ -973,7 +980,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
        * still need to travel through `_injected_files`; the legacy
        * `/files/<session_id>` fallback was removed from the executors.
        */
-      if (CODE_EXECUTION_TOOLS.has(call.name)) {
+      if (this.participatesInCodeSession(call.name)) {
         const codeSession = this.sessions?.get(Constants.EXECUTE_CODE) as
           | t.CodeSessionContext
           | undefined;
@@ -1759,6 +1766,23 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
    * Extracts code execution session context from tool results and stores in Graph.sessions.
    * Mirrors the session storage logic in handleRunToolCompletions for direct execution.
    */
+  /**
+   * True when a tool's successful result should fold its returned exec
+   * `session_id` into the shared code session: built-in `CODE_EXECUTION_TOOLS`,
+   * plus host-declared sandbox-writing tools (`codeSessionToolNames`, e.g.
+   * create_file/edit_file). Kept name-scoped rather than a blanket artifact
+   * opt-in so only host-declared tools can influence the shared session.
+   */
+  private participatesInCodeSession(name: string): boolean {
+    if (name === '') {
+      return false;
+    }
+    return (
+      CODE_EXECUTION_TOOLS.has(name) ||
+      this.codeSessionToolNames?.has(name) === true
+    );
+  }
+
   private storeCodeSessionFromResults(
     results: t.ToolExecuteResult[],
     requestMap: Map<string, t.ToolCallRequest>
@@ -1777,7 +1801,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       if (
         request?.name == null ||
         request.name === '' ||
-        (!CODE_EXECUTION_TOOLS.has(request.name) &&
+        (!this.participatesInCodeSession(request.name) &&
           request.name !== Constants.SKILL_TOOL)
       ) {
         continue;
@@ -1830,7 +1854,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         continue;
       }
 
-      if (this.sessions && CODE_EXECUTION_TOOLS.has(call.name)) {
+      if (this.sessions && this.participatesInCodeSession(call.name)) {
         const artifact = toolMessage.artifact as
           | t.CodeExecutionArtifact
           | undefined;
@@ -2463,7 +2487,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       const plan = buildToolExecutionRequestPlan({
         toolCalls: approvedEntries.map((entry) => {
           const codeSessionContext =
-            CODE_EXECUTION_TOOLS.has(entry.call.name) ||
+            this.participatesInCodeSession(entry.call.name) ||
             entry.call.name === Constants.SKILL_TOOL ||
             entry.call.name === Constants.READ_FILE
               ? this.getCodeSessionContext()

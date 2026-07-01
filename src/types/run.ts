@@ -185,6 +185,15 @@ export type RunConfig = {
    */
   eagerEventToolExecution?: EagerEventToolExecutionConfig;
   /**
+   * Names of host tools that write to the code-execution sandbox but are not
+   * built-in `CODE_EXECUTION_TOOLS` (e.g. LibreChat's create_file/edit_file).
+   * Their successful results fold the returned exec `session_id` into the
+   * shared code session, so a file such a tool writes is visible to later
+   * bash_tool/execute_code calls running in the same sandbox. Host-declared so
+   * the SDK stays name-agnostic.
+   */
+  codeSessionToolNames?: string[];
+  /**
    * Selects the execution backend for built-in code tools. Omit this to keep
    * the remote LibreChat Code API sandbox. Set `{ engine: 'local' }` to run
    * code execution locally and auto-bind the local coding tool suite unless
