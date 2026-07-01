@@ -38,6 +38,16 @@ export type EagerEventToolExecutionConfig = {
    * ToolMessages so provider message ordering is preserved.
    */
   enabled?: boolean;
+  /**
+   * Tool names that must never be started eagerly. Eager execution
+   * speculates on tool args before the model turn commits, so
+   * side-effecting tools (e.g. file writes) should opt out: a
+   * speculative write can land even if the turn is superseded, and a
+   * later arg revision would otherwise trip the "changed after eager
+   * execution" guard. Excluded calls fall through to normal ToolNode
+   * execution with final args.
+   */
+  excludeToolNames?: string[];
 };
 
 export type EagerEventToolExecutionOutcome =

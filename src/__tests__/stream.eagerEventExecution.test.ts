@@ -4726,4 +4726,103 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     expect(toolExecuteCalls).toHaveLength(0);
     expect(graph.eagerEventToolExecutions.size).toBe(0);
   });
+
+  it('does not prestart tools listed in excludeToolNames', async () => {
+    const graph = createGraph({
+      eagerEventToolExecution: {
+        enabled: true,
+        excludeToolNames: ['create_file'],
+      },
+    });
+    const toolExecuteCalls: t.ToolExecuteBatchRequest[] = [];
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data): Promise<void> => {
+        if (event !== GraphEvents.ON_TOOL_EXECUTE) {
+          return;
+        }
+        const batch = data as t.ToolExecuteBatchRequest;
+        toolExecuteCalls.push(batch);
+        batch.resolve([
+          { toolCallId: 'call_file', status: 'success', content: 'ok' },
+        ]);
+      });
+
+    await new ChatModelStreamHandler().handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_file',
+              name: 'create_file',
+              args: { path: '/mnt/data/x.py', content: 'print(1)' },
+            },
+          ],
+          response_metadata: finalToolCallResponseMetadata,
+        } as unknown as t.StreamChunk,
+      },
+      { langgraph_node: 'agent' },
+      graph
+    );
+
+    // Excluded: no eager execution started; the call falls through to ToolNode.
+    expect(toolExecuteCalls).toHaveLength(0);
+    expect(graph.eagerEventToolExecutions.has('call_file')).toBe(false);
+  });
+
+  it('accumulates large indented streamed args without dropping characters', async () => {
+    const graph = createGraph();
+    // Content whose lines repeat 8+ char runs (indentation, tokens) that the
+    // old overlap-dedup heuristic would falsely strip at chunk boundaries.
+    const content = [
+      'def outer():',
+      '    def inner():',
+      '        for i in range(10):',
+      '            result = compute(i)',
+      '            result = compute(i)',
+      '            values.append(result)',
+      '        return values',
+      '    return inner',
+    ].join('\n');
+    const argsJson = JSON.stringify({
+      path: '/mnt/data/measure.py',
+      content,
+    });
+
+    const handler = new ChatModelStreamHandler();
+    const metadata = { langgraph_node: 'agent' };
+    // Stream the args JSON in small fixed-size fragments (mid-string splits).
+    const size = 17;
+    for (let i = 0; i < argsJson.length; i += size) {
+      const fragment = argsJson.slice(i, i + size);
+      await handler.handle(
+        GraphEvents.CHAT_MODEL_STREAM,
+        {
+          chunk: {
+            content: '',
+            tool_call_chunks: [
+              i === 0
+                ? {
+                  id: 'call_big',
+                  name: 'create_file',
+                  args: fragment,
+                  index: 0,
+                }
+                : { args: fragment, index: 0 },
+            ],
+          } as unknown as t.StreamChunk,
+        },
+        metadata,
+        graph
+      );
+    }
+
+    const argsText = graph.eagerEventToolCallChunks.get(
+      chunkStateKey('step-key', 0)
+    )?.argsText;
+    expect(argsText).toBe(argsJson);
+    expect(JSON.parse(argsText as string).content).toBe(content);
+  });
 });

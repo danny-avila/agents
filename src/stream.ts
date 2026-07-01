@@ -1,4 +1,5 @@
 // src/stream.ts
+import { parsePartialJson } from '@langchain/core/output_parsers';
 import type { ToolCall, ToolCallChunk } from '@langchain/core/messages/tool';
 import type { ChatOpenAIReasoningSummary } from '@langchain/openai';
 import type { AIMessageChunk } from '@langchain/core/messages';
@@ -125,6 +126,17 @@ function hasToolOutputReference(value: unknown): boolean {
     );
   }
   return false;
+}
+
+function isEagerExecutionExcludedTool(
+  name: string,
+  graph: StandardGraph
+): boolean {
+  if (name === '') {
+    return false;
+  }
+  const excluded = graph.eagerEventToolExecution?.excludeToolNames;
+  return excluded != null && excluded.includes(name);
 }
 
 function isDirectGraphTool(
@@ -674,11 +686,17 @@ function startEagerToolExecutions(args: {
   skipExisting?: boolean;
 }): void {
   const { graph, metadata, agentContext, toolCalls, skipExisting } = args;
+  const eligibleToolCalls = toolCalls.filter(
+    (toolCall) => !isEagerExecutionExcludedTool(toolCall.name, graph)
+  );
+  if (eligibleToolCalls.length === 0) {
+    return;
+  }
   const entries = createEagerToolExecutionPlan({
     graph,
     metadata,
     agentContext,
-    toolCalls,
+    toolCalls: eligibleToolCalls,
     skipExisting,
   });
   if (entries == null || entries.length === 0) {
@@ -910,16 +928,50 @@ function mergeToolCallArgsText(existing: string, incoming: string): string {
   } catch {
     // Fall through to delta concatenation.
   }
+  /**
+   * Neither side contains the other. `incoming`'s first chars may equal
+   * `existing`'s suffix for one of two reasons: a genuine partial resend
+   * (the provider re-sent the tail of the prior fragment before
+   * continuing) or a coincidental match where `incoming` is a pure delta
+   * whose leading chars happen to repeat `existing`'s tail — extremely
+   * common for indented code inside a string value (e.g. 8 spaces).
+   * Blindly stripping the overlap silently deletes real content, so only
+   * dedupe when doing so yields a MORE complete parse than a plain append
+   * (a real resend recovers structure the doubled seam would break);
+   * otherwise concatenate and keep every character.
+   */
+  const plain = `${existing}${incoming}`;
   for (
     let overlap = Math.min(existing.length, incoming.length);
     overlap >= 8;
     overlap -= 1
   ) {
     if (existing.endsWith(incoming.slice(0, overlap))) {
-      return `${existing}${incoming.slice(overlap)}`;
+      const deduped = `${existing}${incoming.slice(overlap)}`;
+      return parsedArgsCompleteness(deduped) > parsedArgsCompleteness(plain)
+        ? deduped
+        : plain;
     }
   }
-  return `${existing}${incoming}`;
+  return plain;
+}
+
+/**
+ * Completeness score for a partial tool-args JSON string: the serialized
+ * length of what `parsePartialJson` can recover (0 when nothing parses).
+ * Used to pick between a plain-concatenated merge and an overlap-deduped
+ * merge — whichever preserves more structured content wins.
+ */
+function parsedArgsCompleteness(argsText: string): number {
+  const parsed = parsePartialJson(argsText);
+  if (parsed == null || typeof parsed !== 'object') {
+    return 0;
+  }
+  try {
+    return JSON.stringify(parsed).length;
+  } catch {
+    return 0;
+  }
 }
 
 function recordEagerToolCallChunks(args: {
