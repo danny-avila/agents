@@ -774,6 +774,78 @@ describe('ToolNode code execution session management', () => {
       expect(sessions.has(Constants.EXECUTE_CODE)).toBe(false);
     });
 
+    it('stores the exec session for host tools declared in codeSessionToolNames', () => {
+      const sessions: t.ToolSessionMap = new Map();
+      const toolNode = new ToolNode({
+        tools: [createMockCodeTool({ capturedConfigs: [] })],
+        sessions,
+        eventDrivenMode: true,
+        codeSessionToolNames: ['create_file', 'edit_file'],
+      });
+
+      const storeMethod = (
+        toolNode as unknown as {
+          storeCodeSessionFromResults: (
+            results: t.ToolExecuteResult[],
+            requestMap: Map<string, t.ToolCallRequest>
+          ) => void;
+        }
+      ).storeCodeSessionFromResults.bind(toolNode);
+
+      storeMethod(
+        [
+          {
+            toolCallId: 'tc-cf',
+            content: 'Created /mnt/data/x.py (10 chars).',
+            artifact: { session_id: 'authoring-session' },
+            status: 'success',
+          },
+        ],
+        new Map([['tc-cf', { id: 'tc-cf', name: 'create_file', args: {} }]])
+      );
+
+      // create_file's exec session is folded into the shared code session, so a
+      // later bash_tool/execute_code call reuses the same sandbox.
+      const stored = sessions.get(Constants.EXECUTE_CODE) as
+        | t.CodeSessionContext
+        | undefined;
+      expect(stored?.session_id).toBe('authoring-session');
+    });
+
+    it('does not store a host authoring tool session when not declared', () => {
+      const sessions: t.ToolSessionMap = new Map();
+      const toolNode = new ToolNode({
+        tools: [createMockCodeTool({ capturedConfigs: [] })],
+        sessions,
+        eventDrivenMode: true,
+        // codeSessionToolNames omitted — create_file must NOT be treated as a
+        // code-session participant.
+      });
+
+      const storeMethod = (
+        toolNode as unknown as {
+          storeCodeSessionFromResults: (
+            results: t.ToolExecuteResult[],
+            requestMap: Map<string, t.ToolCallRequest>
+          ) => void;
+        }
+      ).storeCodeSessionFromResults.bind(toolNode);
+
+      storeMethod(
+        [
+          {
+            toolCallId: 'tc-cf2',
+            content: 'Created /mnt/data/x.py (10 chars).',
+            artifact: { session_id: 'authoring-session' },
+            status: 'success',
+          },
+        ],
+        new Map([['tc-cf2', { id: 'tc-cf2', name: 'create_file', args: {} }]])
+      );
+
+      expect(sessions.has(Constants.EXECUTE_CODE)).toBe(false);
+    });
+
     it('ignores error results', () => {
       const sessions: t.ToolSessionMap = new Map();
 

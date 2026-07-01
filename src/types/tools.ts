@@ -110,6 +110,12 @@ export type ToolNodeOptions = {
   directToolNames?: Set<string>;
   /** Opt-in eager execution for event-driven tool calls. */
   eagerEventToolExecution?: EagerEventToolExecutionConfig;
+  /**
+   * Host tool names that write to the code-execution sandbox but are not
+   * built-in `CODE_EXECUTION_TOOLS`. Their exec `session_id` is folded into the
+   * shared code session so later bash_tool/execute_code calls see written files.
+   */
+  codeSessionToolNames?: string[];
   /** Shared per-run eager execution registry populated by the stream handler. */
   eagerEventToolExecutions?: Map<string, EagerEventToolExecution>;
   /** Shared per-run per-tool turn counter used by eager and normal event dispatch. */

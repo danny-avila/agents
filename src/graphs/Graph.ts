@@ -66,8 +66,8 @@ import {
   type CallbackEntry,
 } from '@/utils/callbacks';
 import { partitionAndMarkOpenRouterToolCache } from '@/llm/openrouter/toolCache';
-import { shouldTraceToolNodeForLangfuse } from '@/langfuseToolOutputTracing';
 import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
+import { shouldTraceToolNodeForLangfuse } from '@/langfuseToolOutputTracing';
 import { createLocalCodingToolBundle } from '@/tools/local/LocalCodingTools';
 import { SubagentExecutor, resolveSubagentConfigs } from '@/tools/subagent';
 import { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
@@ -608,6 +608,7 @@ export abstract class Graph<
    * consumes the settled promises while preserving final ToolMessage order.
    */
   eagerEventToolExecution: t.EagerEventToolExecutionConfig | undefined;
+  codeSessionToolNames: string[] | undefined;
   eagerEventToolExecutions: Map<string, t.EagerEventToolExecution> = new Map();
   eagerEventToolUsageCount: Map<string, number> = new Map();
   private eagerEventToolUsageCountsByAgentId: Map<string, Map<string, number>> =
@@ -656,6 +657,7 @@ export abstract class Graph<
     this.humanInTheLoop = undefined;
     this.toolOutputReferences = undefined;
     this.eagerEventToolExecution = undefined;
+    this.codeSessionToolNames = undefined;
     this.eagerEventToolExecutions.clear();
     this.clearEagerEventToolUsageCounts();
     this.eagerEventToolCallChunks.clear();
@@ -1260,6 +1262,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         hookRegistry: this.hookRegistry,
         humanInTheLoop: this.humanInTheLoop,
         eagerEventToolExecution: this.eagerEventToolExecution,
+        codeSessionToolNames: this.codeSessionToolNames,
         eagerEventToolExecutions: this.eagerEventToolExecutions,
         eagerEventToolUsageCount: this.getEagerEventToolUsageCount(
           agentContext?.agentId
@@ -2333,6 +2336,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
              */
             childGraph.toolOutputReferences = this.toolOutputReferences;
             childGraph.eagerEventToolExecution = this.eagerEventToolExecution;
+            childGraph.codeSessionToolNames = this.codeSessionToolNames;
             childGraph.toolExecution = this.toolExecution;
             childGraph.eventToolExecutionAvailable =
               this.handlerRegistry?.getHandler(GraphEvents.ON_TOOL_EXECUTE) !=
