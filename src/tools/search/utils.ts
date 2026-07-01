@@ -175,3 +175,11 @@ export function getAttribution(
 
   return getDomainName(link, metadata, logger);
 }
+
+export const getHostname = (link: string): string => {
+  try {
+    return new URL(link).hostname;
+  } catch {
+    return link;
+  }
+};

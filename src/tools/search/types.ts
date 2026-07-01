@@ -3,7 +3,7 @@ import type { Logger as WinstonLogger } from 'winston';
 import type { BaseReranker } from './rerankers';
 import { DATE_RANGE } from './schema';
 
-export type SearchProvider = 'serper' | 'searxng' | 'tavily';
+export type SearchProvider = 'serper' | 'searxng' | 'tavily' | 'brave';
 export type ScraperProvider = 'firecrawl' | 'serper' | 'tavily';
 export type RerankerType = 'infinity' | 'jina' | 'cohere' | 'none';
 
@@ -106,6 +106,18 @@ export interface TavilySearchPayload {
   chunks_per_source?: number;
 }
 
+export type BraveTimeRange = 'pd' | 'pw' | 'pm' | 'py';
+export type BraveSafeSearch = 'off' | 'moderate' | 'strict';
+
+export interface BraveSearchOptions {
+  count?: number;
+  freshness?: BraveTimeRange;
+  safesearch?: BraveSafeSearch;
+  /** https://api-dashboard.search.brave.com/documentation/resources/goggles */
+  goggles?: string;
+  timeout?: number;
+}
+
 export interface SearchConfig {
   searchProvider?: SearchProvider;
   serperApiKey?: string;
@@ -115,6 +127,9 @@ export interface SearchConfig {
   tavilySearchUrl?: string;
   tavilyExtractUrl?: string;
   tavilySearchOptions?: TavilySearchOptions;
+  braveApiKey?: string;
+  braveApiUrl?: string;
+  braveSearchOptions?: BraveSearchOptions;
 }
 
 export type References = {
@@ -428,6 +443,95 @@ export interface TavilyExtractResult {
   images?: string[];
   favicon?: string;
   error?: string;
+}
+
+export interface BraveThumbnail {
+  src?: string;
+  original?: string;
+  width?: number;
+  height?: number;
+}
+
+export interface BraveProfile {
+  name?: string;
+  url?: string;
+  long_name?: string;
+  img?: string;
+}
+
+export interface BraveWebResult {
+  title?: string;
+  url?: string;
+  description?: string;
+  age?: string;
+  page_age?: string;
+  profile?: BraveProfile;
+  meta_url?: { hostname?: string };
+  thumbnail?: BraveThumbnail;
+  extra_snippets?: string[];
+}
+
+export interface BraveNewsResult {
+  title?: string;
+  url?: string;
+  description?: string;
+  age?: string;
+  page_age?: string;
+  source?: string;
+  profile?: BraveProfile;
+  meta_url?: { hostname?: string };
+  thumbnail?: BraveThumbnail;
+  extra_snippets?: string[];
+}
+
+export interface BraveImageResult {
+  title?: string;
+  url?: string;
+  source?: string;
+  thumbnail?: BraveThumbnail;
+  properties?: {
+    url?: string;
+    placeholder?: string;
+    width?: number;
+    height?: number;
+  };
+}
+
+export interface BraveVideoResult {
+  title?: string;
+  url?: string;
+  description?: string;
+  age?: string;
+  page_age?: string;
+  video?: {
+    duration?: string;
+    views?: number;
+    creator?: string;
+    publisher?: string;
+    requires_subscription?: boolean;
+    tags?: string[];
+    author?: BraveProfile;
+  };
+  meta_url?: { hostname?: string };
+  thumbnail?: BraveThumbnail;
+}
+
+export interface BraveWebSearchResponse {
+  web?: { results?: BraveWebResult[] };
+  news?: { results?: BraveNewsResult[] };
+  videos?: { results?: BraveVideoResult[] };
+}
+
+export interface BraveNewsSearchResponse {
+  results?: BraveNewsResult[];
+}
+
+export interface BraveImageSearchResponse {
+  results?: BraveImageResult[];
+}
+
+export interface BraveVideoSearchResponse {
+  results?: BraveVideoResult[];
 }
 
 export interface FirecrawlScraperConfig {
