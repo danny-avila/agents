@@ -127,6 +127,17 @@ function hasToolOutputReference(value: unknown): boolean {
   return false;
 }
 
+function isEagerExecutionExcludedTool(
+  name: string,
+  graph: StandardGraph
+): boolean {
+  if (name === '') {
+    return false;
+  }
+  const excluded = graph.eagerEventToolExecution?.excludeToolNames;
+  return excluded != null && excluded.includes(name);
+}
+
 function isDirectGraphTool(
   name: string,
   agentContext: AgentContext | undefined
@@ -615,7 +626,7 @@ function createEagerToolExecutionPlan(args: {
     return undefined;
   }
 
-  const candidateToolCalls = skipExisting
+  const unstartedToolCalls = skipExisting
     ? toolCalls.filter((toolCall) => {
       if (toolCall.id == null || toolCall.id === '') {
         return true;
@@ -623,6 +634,13 @@ function createEagerToolExecutionPlan(args: {
       return !graph.eagerEventToolExecutions.has(toolCall.id);
     })
     : toolCalls;
+  // Drop host-excluded tools only AFTER the batch-level guards above have run
+  // against the full batch, so excluding a call never hides a sibling direct
+  // tool from `hasDirectToolCallInBatch`. Excluded calls fall through to normal
+  // ToolNode execution; siblings may still eager-execute.
+  const candidateToolCalls = unstartedToolCalls.filter(
+    (toolCall) => !isEagerExecutionExcludedTool(toolCall.name, graph)
+  );
   if (candidateToolCalls.length === 0) {
     return [];
   }
