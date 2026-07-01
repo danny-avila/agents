@@ -1,5 +1,6 @@
 import axios from 'axios';
 import type * as t from './types';
+import { DATE_RANGE } from './schema';
 
 const DEFAULT_KEENABLE_TIMEOUT = 15000;
 
@@ -7,6 +8,13 @@ const DEFAULT_KEENABLE_TIMEOUT = 15000;
  * falling back to the public endpoint; a key only lifts rate limits. */
 const KEENABLE_DEFAULT_API_URL = 'https://api.keenable.ai/v1/search';
 const KEENABLE_PUBLIC_API_URL = 'https://api.keenable.ai/v1/search/public';
+const KEENABLE_DATE_RANGES: Record<DATE_RANGE, string> = {
+  [DATE_RANGE.PAST_HOUR]: '1h',
+  [DATE_RANGE.PAST_24_HOURS]: '1d',
+  [DATE_RANGE.PAST_WEEK]: '7d',
+  [DATE_RANGE.PAST_MONTH]: '1mo',
+  [DATE_RANGE.PAST_YEAR]: '1y',
+};
 
 export const createKeenableAPI = (
   apiKey?: string,
@@ -36,6 +44,7 @@ export const createKeenableAPI = (
 
   const getSources = async ({
     query,
+    date,
     numResults = 8,
   }: t.GetSourcesParams): Promise<t.SearchResult> => {
     if (!query.trim()) {
@@ -48,6 +57,9 @@ export const createKeenableAPI = (
       const payload: t.KeenableSearchPayload = { query };
       if (options?.site != null && options.site !== '') {
         payload.site = options.site;
+      }
+      if (date != null) {
+        payload.published_after = KEENABLE_DATE_RANGES[date];
       }
 
       const response = await axios.post<t.KeenableSearchResponse>(
