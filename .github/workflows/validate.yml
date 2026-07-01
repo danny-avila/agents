@@ -130,9 +130,21 @@ jobs:
           BEDROCK_AWS_SECRET_ACCESS_KEY: ${{ secrets.BEDROCK_AWS_SECRET_ACCESS_KEY }}
 
   summarization-tests:
-    name: 'summarization tests'
+    name: 'summarization tests (${{ matrix.group }})'
     needs: install
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: anthropic
+            pattern: 'Anthropic Summarization E2E|Token accounting audit'
+          - group: openai
+            pattern: 'OpenAI Summarization E2E'
+          - group: bedrock
+            pattern: 'Bedrock Summarization E2E'
+          - group: local
+            pattern: 'no API keys'
     steps:
       - uses: actions/checkout@v4
 
@@ -146,8 +158,8 @@ jobs:
           path: node_modules
           key: node-modules-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
 
-      - name: Run summarization tests
-        run: npx jest src/specs/summarization.test.ts --maxWorkers=50%
+      - name: Run summarization tests (${{ matrix.group }})
+        run: npx jest src/specs/summarization.test.ts -t "${{ matrix.pattern }}" --maxWorkers=50%
         env:
           NODE_OPTIONS: '--experimental-vm-modules'
           NODE_ENV: test
