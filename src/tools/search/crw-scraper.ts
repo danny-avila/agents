@@ -35,7 +35,7 @@ export class CrwScraper implements t.BaseScraper {
       config.apiUrl ?? process.env.CRW_API_URL ?? 'https://api.fastcrw.com';
     this.apiUrl = `${baseUrl.replace(/\/+$/, '')}/v1/scrape`;
 
-    this.defaultFormats = config.formats ?? ['markdown', 'rawHtml'];
+    this.defaultFormats = config.formats ?? ['markdown', 'html'];
     this.timeout = config.timeout ?? 7500;
     this.logger = config.logger || createDefaultLogger();
 
@@ -77,7 +77,10 @@ export class CrwScraper implements t.BaseScraper {
         xpath: options.xpath ?? this.xpath,
         proxy: options.proxy ?? this.proxy,
         stealth: options.stealth ?? this.stealth,
+        // Cloud honors `timeout` (live-verified); the published OpenAPI
+        // documents `deadlineMs` (1..60000) instead. Send both.
         timeout: payloadTimeout,
+        deadlineMs: Math.max(1, Math.min(payloadTimeout, 60000)),
       });
 
       const headers: Record<string, string> = {
@@ -126,10 +129,11 @@ export class CrwScraper implements t.BaseScraper {
       return ['', undefined];
     }
 
-    if (response.data.markdown != null && response.data.html != null) {
+    const htmlSource = response.data.html ?? response.data.rawHtml;
+    if (response.data.markdown != null && htmlSource != null) {
       try {
         const { markdown, ...rest } = processContent(
-          response.data.html,
+          htmlSource,
           response.data.markdown
         );
         return [markdown, rest];

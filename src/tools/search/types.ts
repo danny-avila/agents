@@ -129,6 +129,7 @@ export interface CrwSearchResult {
   description?: string;
   snippet?: string;
   position?: number;
+  category?: string;
 }
 
 export interface CrwImageSearchResult extends CrwSearchResult {
@@ -148,7 +149,7 @@ export interface CrwSearchGroups {
 
 export interface CrwSearchResponse {
   success: boolean;
-  data?: CrwSearchGroups & { results?: CrwSearchGroups };
+  data?: (CrwSearchGroups & { results?: CrwSearchGroups }) | CrwSearchResult[];
   error?: string;
   error_code?: string;
 }

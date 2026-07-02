@@ -11,6 +11,22 @@ const getHostname = (link: string): string => {
   }
 };
 
+/** The published OpenAPI (docs.fastcrw.com) documents `data` as a flat
+ * SearchResult[] with a `category` field; route rows into source groups. */
+const splitByCategory = (rows: t.CrwSearchResult[]): t.CrwSearchGroups => {
+  const groups: Required<t.CrwSearchGroups> = { web: [], images: [], news: [] };
+  for (const row of rows) {
+    if (row.category === 'news') {
+      groups.news.push(row);
+    } else if (row.category === 'images') {
+      groups.images.push({ ...row, imageUrl: row.url });
+    } else {
+      groups.web.push(row);
+    }
+  }
+  return groups;
+};
+
 export const createCrwAPI = (
   apiKey?: string,
   apiUrl?: string,
@@ -88,13 +104,16 @@ export const createCrwAPI = (
         };
       }
 
-      // fastCRW keys results by source: {data: {web: [...], images: [...],
-      // news: [...]}} (cloud, live-verified 2026-07-02); tolerate a
-      // {data: {results: {...groups}}} wrapper for self-host variants.
+      // fastCRW cloud keys results by source: {data: {web: [...], images:
+      // [...], news: [...]}} (live-verified 2026-07-02); the published
+      // OpenAPI documents a flat SearchResult[] instead (self-host), and a
+      // {data: {results: {...groups}}} wrapper also exists. Accept all three.
       // OrganicResult.link is a REQUIRED string (types.ts), so defend against
       // null/empty urls to never feed a broken '' link into the scraper.
       const container = body.data ?? {};
-      const data = container.results ?? container;
+      const data: t.CrwSearchGroups = Array.isArray(container)
+        ? splitByCategory(container)
+        : (container.results ?? container);
       const organicResults: t.OrganicResult[] = (data.web ?? [])
         .filter((r) => r.url != null && r.url !== '')
         .map((r) => ({

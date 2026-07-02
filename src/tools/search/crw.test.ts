@@ -224,6 +224,44 @@ describe('CRW search API', () => {
     ]);
   });
 
+  it('routes a flat data array by category (documented OpenAPI shape)', async () => {
+    mockedAxios.post.mockResolvedValueOnce({
+      data: {
+        success: true,
+        data: [
+          {
+            title: 'W',
+            url: 'https://e.com/w',
+            snippet: 'S',
+            category: 'general',
+          },
+          {
+            title: 'N',
+            url: 'https://e.com/n',
+            snippet: 'S',
+            category: 'news',
+          },
+          { title: 'I', url: 'https://e.com/i.png', category: 'images' },
+          { title: 'U', url: 'https://e.com/u', snippet: 'S' },
+        ],
+      },
+    });
+
+    const searchAPI = createSearchAPI({
+      searchProvider: 'crw',
+      crwApiKey: 'test-key',
+    });
+
+    const result = await searchAPI.getSources({ query: 'example query' });
+
+    expect(result.data?.organic?.map((r) => r.link)).toEqual([
+      'https://e.com/w',
+      'https://e.com/u',
+    ]);
+    expect(result.data?.news?.[0].link).toBe('https://e.com/n');
+    expect(result.data?.images?.[0].imageUrl).toBe('https://e.com/i.png');
+  });
+
   it('unwraps a data.results wrapper (self-host shape)', async () => {
     mockedAxios.post.mockResolvedValueOnce({
       data: {
@@ -418,7 +456,36 @@ describe('CrwScraper', () => {
       await scraper.scrapeUrl('https://example.com');
       const [, payload, config] = mockedAxios.post.mock.calls[0];
       expect((payload as { timeout: number }).timeout).toBe(7500);
+      expect((payload as { deadlineMs: number }).deadlineMs).toBe(7500);
       expect((config as { timeout: number }).timeout).toBe(12500);
+    });
+
+    it('clamps deadlineMs to the documented 60000 max', async () => {
+      mockedAxios.post.mockResolvedValueOnce({
+        data: { success: true, markdown: '# Hi' },
+      });
+      const scraper = createCrwScraper({
+        apiKey: 'k',
+        timeout: 90000,
+        logger: mockLogger,
+      });
+      await scraper.scrapeUrl('https://example.com');
+      const [, payload] = mockedAxios.post.mock.calls[0];
+      expect((payload as { timeout: number }).timeout).toBe(90000);
+      expect((payload as { deadlineMs: number }).deadlineMs).toBe(60000);
+    });
+
+    it('requests markdown + html by default', async () => {
+      mockedAxios.post.mockResolvedValueOnce({
+        data: { success: true, markdown: '# Hi' },
+      });
+      const scraper = createCrwScraper({ apiKey: 'k', logger: mockLogger });
+      await scraper.scrapeUrl('https://example.com');
+      const [, payload] = mockedAxios.post.mock.calls[0];
+      expect((payload as { formats: string[] }).formats).toEqual([
+        'markdown',
+        'html',
+      ]);
     });
   });
 
@@ -527,6 +594,15 @@ describe('CrwScraper', () => {
       expect(references).toHaveProperty('links');
       expect(references).toHaveProperty('images');
       expect(references).toHaveProperty('videos');
+    });
+
+    it('runs the ref-marker pass from rawHtml when html is absent', () => {
+      const [content, references] = scraper.extractContent({
+        success: true,
+        data: { markdown: '# Hi', rawHtml: '<p>x</p>' },
+      });
+      expect(typeof content).toBe('string');
+      expect(references).toHaveProperty('links');
     });
 
     it('returns empty on a failed response', () => {
