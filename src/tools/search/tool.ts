@@ -197,13 +197,17 @@ export async function executeParallelSearches({
 function createSearchProcessor({
   searchAPI,
   safeSearch,
+  supportsImages,
   supportsVideos,
+  supportsNews,
   sourceProcessor,
   onGetHighlights,
   logger,
 }: {
   safeSearch: t.SearchToolConfig['safeSearch'];
+  supportsImages: boolean;
   supportsVideos: boolean;
+  supportsNews: boolean;
   searchAPI: ReturnType<typeof createSearchAPI>;
   sourceProcessor: ReturnType<typeof createSourceProcessor>;
   onGetHighlights: t.SearchToolConfig['onGetHighlights'];
@@ -238,9 +242,9 @@ function createSearchProcessor({
         date,
         country,
         safeSearch,
-        images,
+        images: supportsImages && images,
         videos: supportsVideos && videos,
-        news,
+        news: supportsNews && news,
         logger,
       });
 
@@ -315,7 +319,11 @@ function createTool({
         }),
       });
       const turn = runnableConfig.toolCall?.turn ?? 0;
-      const { output, references } = formatResultsForLLM(turn, searchResult, maxOutputChars);
+      const { output, references } = formatResultsForLLM(
+        turn,
+        searchResult,
+        maxOutputChars
+      );
       const data: t.SearchResultData = { turn, ...searchResult, references };
       return [output, { [Constants.WEB_SEARCH]: data }];
     },
@@ -358,6 +366,9 @@ export const createSearchTool = (
     tavilySearchUrl,
     tavilyExtractUrl,
     tavilySearchOptions,
+    keenableApiKey,
+    keenableApiUrl,
+    keenableSearchOptions,
     rerankerType = 'cohere',
     topResults = 5,
     maxContentLength,
@@ -415,6 +426,9 @@ export const createSearchTool = (
     tavilyApiKey,
     tavilySearchUrl,
     tavilySearchOptions: effectiveTavilySearchOptions,
+    keenableApiKey,
+    keenableApiUrl,
+    keenableSearchOptions,
   });
 
   /** Create scraper based on scraperProvider */
@@ -477,7 +491,12 @@ export const createSearchTool = (
   const search = createSearchProcessor({
     searchAPI,
     safeSearch,
-    supportsVideos: searchProvider !== 'tavily',
+    // Keenable is organic-only: its API ignores `type`, so image/news
+    // sub-searches would spend rate limit and merge nothing.
+    supportsImages: searchProvider !== 'keenable',
+    supportsVideos:
+      searchProvider !== 'tavily' && searchProvider !== 'keenable',
+    supportsNews: searchProvider !== 'keenable',
     sourceProcessor,
     onGetHighlights,
     logger,
