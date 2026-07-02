@@ -114,22 +114,38 @@ export interface CrwSearchOptions {
   timeout?: number;
 }
 
+export type CrwSearchSource = 'web' | 'images' | 'news';
+
 export interface CrwSearchPayload {
   query: string;
   limit: number;
-  sources?: Array<'web' | 'images'>;
+  sources?: CrwSearchSource[];
 }
 
 export interface CrwSearchResult {
   title?: string;
   url?: string;
   description?: string;
-  markdown?: string;
+  snippet?: string;
+  position?: number;
+}
+
+export interface CrwImageSearchResult extends CrwSearchResult {
+  imageUrl?: string;
+  imageFormat?: string;
+}
+
+export interface CrwNewsSearchResult extends CrwSearchResult {
+  publishedDate?: string;
 }
 
 export interface CrwSearchResponse {
   success: boolean;
-  data?: CrwSearchResult[];
+  data?: {
+    web?: CrwSearchResult[];
+    images?: CrwImageSearchResult[];
+    news?: CrwNewsSearchResult[];
+  };
   error?: string;
   error_code?: string;
 }
@@ -437,23 +453,7 @@ export interface FirecrawlScrapeResponse {
   error?: string;
 }
 
-export interface CrwScrapeResponse {
-  success: boolean;
-  data?: {
-    markdown?: string;
-    html?: string;
-    rawHtml?: string;
-    plainText?: string;
-    screenshot?: string;
-    links?: string[];
-    metadata?: ScrapeMetadata;
-  };
-  error?: string;
-  error_code?: string;
-}
-
-export interface CrwRawScrapeResponse {
-  success?: boolean;
+export interface CrwScrapeData {
   markdown?: string;
   html?: string;
   rawHtml?: string;
@@ -461,6 +461,18 @@ export interface CrwRawScrapeResponse {
   screenshot?: string;
   links?: string[];
   metadata?: ScrapeMetadata;
+}
+
+export interface CrwScrapeResponse {
+  success: boolean;
+  data?: CrwScrapeData;
+  error?: string;
+  error_code?: string;
+}
+
+export interface CrwRawScrapeResponse extends CrwScrapeData {
+  success?: boolean;
+  data?: CrwScrapeData;
   error?: string;
   error_code?: string;
 }

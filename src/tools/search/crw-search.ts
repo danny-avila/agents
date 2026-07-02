@@ -22,8 +22,11 @@ export const createCrwAPI = (
   // override for parity with the scraper. Self-host may have no auth, so —
   // unlike Tavily (createTavilyAPI throws on missing key) — we do NOT throw
   // here; we only attach the Authorization header when a key is present.
-  const base = (apiUrl ?? process.env.CRW_API_URL ?? 'https://fastcrw.com/api')
-    .replace(/\/+$/, '');
+  const base = (
+    apiUrl ??
+    process.env.CRW_API_URL ??
+    'https://fastcrw.com/api'
+  ).replace(/\/+$/, '');
   const config = {
     apiKey: apiKey ?? process.env.CRW_API_KEY,
     apiUrl: `${base}/v1/search`,
@@ -40,11 +43,20 @@ export const createCrwAPI = (
     }
 
     try {
-      const limit = Math.min(Math.max(1, options?.maxResults ?? numResults), 20);
-      const sources: Array<'web' | 'images'> =
-        type === 'images' || options?.includeImages === true
-          ? ['web', 'images']
-          : ['web'];
+      const limit = Math.min(
+        Math.max(1, options?.maxResults ?? numResults),
+        20
+      );
+      // Mirror Serper's verticals: image/news requests hit only their native
+      // fastCRW source; plain web optionally adds images via includeImages.
+      let sources: t.CrwSearchSource[];
+      if (type === 'images') {
+        sources = ['images'];
+      } else if (type === 'news') {
+        sources = ['news'];
+      } else {
+        sources = options?.includeImages === true ? ['web', 'images'] : ['web'];
+      }
 
       const payload: t.CrwSearchPayload = { query, limit, sources };
 
@@ -71,32 +83,43 @@ export const createCrwAPI = (
         };
       }
 
-      // OrganicResult.link is a REQUIRED string (types.ts). fastCRW marks
-      // result.url as present, but defend against null/empty so we never feed a
-      // broken '' link into the scraper.
-      const organicResults: t.OrganicResult[] = (body.data ?? [])
+      // fastCRW keys results by source: {data: {web: [...], images: [...],
+      // news: [...]}} (live-verified 2026-07-02). OrganicResult.link is a
+      // REQUIRED string (types.ts), so defend against null/empty urls to never
+      // feed a broken '' link into the scraper.
+      const data = body.data ?? {};
+      const organicResults: t.OrganicResult[] = (data.web ?? [])
         .filter((r) => r.url != null && r.url !== '')
         .map((r) => ({
           title: r.title ?? '',
           link: r.url as string,
-          snippet: r.description ?? '',
+          snippet: r.description ?? r.snippet ?? '',
+          position: r.position,
         }));
 
-      // fastCRW /v1/search exposes no native news/video verticals.
-      // Mirror Tavily by deriving `news` from organic when news is requested.
-      const newsResults: t.NewsResult[] =
-        type === 'news'
-          ? organicResults.map((r) => ({
-            title: r.title,
-            link: r.link,
-            snippet: r.snippet,
-            source: getHostname(r.link),
-          }))
-          : [];
+      const imageResults: t.ImageResult[] = (data.images ?? [])
+        .filter((r) => r.imageUrl != null && r.imageUrl !== '')
+        .map((r) => ({
+          title: r.title,
+          imageUrl: r.imageUrl,
+          link: r.url,
+          position: r.position,
+        }));
+
+      const newsResults: t.NewsResult[] = (data.news ?? [])
+        .filter((r) => r.url != null && r.url !== '')
+        .map((r) => ({
+          title: r.title ?? '',
+          link: r.url as string,
+          snippet: r.description ?? r.snippet ?? '',
+          date: r.publishedDate,
+          source: getHostname(r.url as string),
+          position: r.position,
+        }));
 
       const results: t.SearchResultData = {
         organic: organicResults,
-        images: [],
+        images: imageResults,
         topStories: [],
         videos: [],
         news: newsResults,
