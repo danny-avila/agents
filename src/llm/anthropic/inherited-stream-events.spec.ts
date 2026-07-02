@@ -32,7 +32,6 @@ import { HumanMessage } from '@langchain/core/messages';
 import { ChatModelStream } from '@langchain/core/language_models/stream';
 import type { BaseChatModelCallOptions } from '@langchain/core/language_models/chat_models';
 import type { ChatModelStreamEvent } from '@langchain/core/language_models/event';
-import type { Stream } from '@anthropic-ai/sdk/streaming';
 import type {
   AnthropicMessageStreamEvent,
   AnthropicRequestOptions,
@@ -57,10 +56,14 @@ class MockStreamChatAnthropic extends ChatAnthropic {
     this.mockEvents = mockEvents;
   }
 
+  // Inherit the base method's own Stream identity instead of importing
+  // @anthropic-ai/sdk/streaming here: the SDK ships dual .d.ts/.d.mts types,
+  // and an independent import can resolve to the other format's identity
+  // depending on compile order (flaky TS2416 in sharded CI).
   protected override async createStreamWithRetry(
     request: AnthropicStreamingMessageCreateParams,
     _options?: AnthropicRequestOptions
-  ): Promise<Stream<AnthropicMessageStreamEvent>> {
+  ): ReturnType<ChatAnthropic['createStreamWithRetry']> {
     this.capturedRequest = request;
     const events = this.mockEvents;
     return {
@@ -70,7 +73,7 @@ class MockStreamChatAnthropic extends ChatAnthropic {
           yield event as AnthropicMessageStreamEvent;
         }
       },
-    } as unknown as Stream<AnthropicMessageStreamEvent>;
+    } as unknown as Awaited<ReturnType<ChatAnthropic['createStreamWithRetry']>>;
   }
 }
 
