@@ -81,20 +81,21 @@ function resolveConfigurableUserId(
   user: ConfigurableUser | undefined,
   rawUserId?: unknown
 ): string | undefined {
+  const raw = typeof rawUserId === 'string' ? rawUserId : undefined;
   const field =
     typeof process !== 'undefined'
       ? (process.env.LIBRECHAT_TRACE_USER_ID_FIELD ?? 'email')
       : 'email';
   if (field === 'name') {
-    return user?.name || user?.email || undefined;
+    return user?.name || user?.email || raw;
   }
   if (field === 'username') {
-    return user?.username || user?.email || undefined;
+    return user?.username || user?.email || raw;
   }
   if (field === 'id') {
-    return typeof rawUserId === 'string' ? rawUserId : user?.email || undefined;
+    return raw || user?.email;
   }
-  return user?.email || user?.username || undefined;
+  return user?.email || user?.username || raw;
 }
 
 const CUSTOM_GRAPH_EVENTS = new Set<string>([
