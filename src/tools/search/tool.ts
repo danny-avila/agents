@@ -197,13 +197,17 @@ export async function executeParallelSearches({
 function createSearchProcessor({
   searchAPI,
   safeSearch,
+  supportsImages,
   supportsVideos,
+  supportsNews,
   sourceProcessor,
   onGetHighlights,
   logger,
 }: {
   safeSearch: t.SearchToolConfig['safeSearch'];
+  supportsImages: boolean;
   supportsVideos: boolean;
+  supportsNews: boolean;
   searchAPI: ReturnType<typeof createSearchAPI>;
   sourceProcessor: ReturnType<typeof createSourceProcessor>;
   onGetHighlights: t.SearchToolConfig['onGetHighlights'];
@@ -238,9 +242,9 @@ function createSearchProcessor({
         date,
         country,
         safeSearch,
-        images,
+        images: supportsImages && images,
         videos: supportsVideos && videos,
-        news,
+        news: supportsNews && news,
         logger,
       });
 
@@ -487,8 +491,12 @@ export const createSearchTool = (
   const search = createSearchProcessor({
     searchAPI,
     safeSearch,
+    // Keenable is organic-only: its API ignores `type`, so image/news
+    // sub-searches would spend rate limit and merge nothing.
+    supportsImages: searchProvider !== 'keenable',
     supportsVideos:
       searchProvider !== 'tavily' && searchProvider !== 'keenable',
+    supportsNews: searchProvider !== 'keenable',
     sourceProcessor,
     onGetHighlights,
     logger,

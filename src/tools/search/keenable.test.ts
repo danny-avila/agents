@@ -1,5 +1,6 @@
 import axios from 'axios';
 import { createSearchAPI } from './search';
+import { createSearchTool } from './tool';
 import { DATE_RANGE } from './schema';
 
 jest.mock('axios');
@@ -144,5 +145,39 @@ describe('Keenable search API', () => {
 
     expect(result.success).toBe(false);
     expect(result.error).toBe('Keenable API request failed: Network error');
+  });
+});
+
+describe('Keenable capability gating', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    delete process.env.KEENABLE_API_KEY;
+    delete process.env.KEENABLE_API_URL;
+  });
+
+  it('skips image/news/video sub-searches (organic-only provider)', async () => {
+    mockedAxios.post.mockResolvedValueOnce(sampleResponse).mockResolvedValue({
+      data: { success: true, data: { markdown: '# A', html: '<p>a</p>' } },
+    });
+
+    const searchTool = createSearchTool({
+      searchProvider: 'keenable',
+      scraperProvider: 'firecrawl',
+      firecrawlApiKey: 'k',
+      topResults: 1,
+      rerankerType: 'none',
+    });
+
+    await searchTool.invoke({
+      query: 'typescript',
+      images: true,
+      news: true,
+      videos: true,
+    });
+
+    const searchCalls = mockedAxios.post.mock.calls.filter(([url]) =>
+      (url as string).includes('keenable')
+    );
+    expect(searchCalls).toHaveLength(1);
   });
 });
