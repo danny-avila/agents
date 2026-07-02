@@ -3,6 +3,10 @@ import type * as t from './types';
 import { createDefaultLogger } from './utils';
 import { processContent } from './content';
 
+/** HTTP headroom over the payload render budget: fastCRW's queue/verification
+ * overhead is not counted against `timeout`, so the client must wait longer. */
+const CRW_TIMEOUT_BUFFER = 5000;
+
 /**
  * fastCRW scraper. Firecrawl-compatible web scraper; single binary;
  * self-host or cloud. Posts to {base}/v1/scrape.
@@ -61,6 +65,7 @@ export class CrwScraper implements t.BaseScraper {
     options: t.CrwScrapeOptions = {}
   ): Promise<[string, t.CrwScrapeResponse]> {
     try {
+      const payloadTimeout = options.timeout ?? this.timeout;
       const payload = omitUndefined({
         url,
         formats: options.formats ?? this.defaultFormats,
@@ -75,7 +80,7 @@ export class CrwScraper implements t.BaseScraper {
         proxy: options.proxy ?? this.proxy,
         stealth: options.stealth ?? this.stealth,
         jsonSchema: options.jsonSchema ?? this.jsonSchema,
-        timeout: options.timeout ?? this.timeout,
+        timeout: payloadTimeout,
       });
 
       const headers: Record<string, string> = {
@@ -90,7 +95,7 @@ export class CrwScraper implements t.BaseScraper {
         payload,
         {
           headers,
-          timeout: this.timeout,
+          timeout: payloadTimeout + CRW_TIMEOUT_BUFFER,
         }
       );
 
@@ -175,14 +180,9 @@ export const createCrwScraper = (config: t.CrwScraperConfig = {}): CrwScraper =>
   new CrwScraper(config);
 
 /**
- * fastCRW returns scrape fields at the TOP LEVEL ({success, markdown, ...}),
- * whereas this engine's scrapers expect them nested under `data`. Normalize so
- * extractContent/extractMetadata (Firecrawl-shaped) work unchanged.
- *
- * IMPORTANT: this ALWAYS wraps top-level fields — it never short-circuits on a
- * top-level `data` key. CRW scrape responses have no legitimate top-level `data`
- * (only Firecrawl nests under `data`); a `jsonSchema` extraction keyed `data`
- * must NOT bypass normalization.
+ * fastCRW cloud nests scrape fields under `data` ({success, data: {markdown,
+ * ...}}, live-verified 2026-07-02), matching Firecrawl. Prefer the nested
+ * container and fall back to top-level fields for self-host/legacy responses.
  */
 function normalizeCrwResponse(
   raw: t.CrwRawScrapeResponse | null | undefined
@@ -200,16 +200,17 @@ function normalizeCrwResponse(
       error_code: raw.error_code,
     };
   }
+  const data = raw.data ?? raw;
   return {
     success: true,
     data: {
-      markdown: raw.markdown,
-      html: raw.html,
-      rawHtml: raw.rawHtml,
-      plainText: raw.plainText,
-      screenshot: raw.screenshot,
-      links: raw.links,
-      metadata: raw.metadata,
+      markdown: data.markdown,
+      html: data.html,
+      rawHtml: data.rawHtml,
+      plainText: data.plainText,
+      screenshot: data.screenshot,
+      links: data.links,
+      metadata: data.metadata,
     },
   };
 }

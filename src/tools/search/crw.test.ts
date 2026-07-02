@@ -90,7 +90,11 @@ describe('CRW search API', () => {
     mockedAxios.post.mockResolvedValueOnce({
       data: {
         success: true,
-        data: [{ title: 'T', url: 'https://e.com', description: 'D' }],
+        data: {
+          web: [
+            { title: 'T', url: 'https://e.com', description: 'D', position: 1 },
+          ],
+        },
       },
     });
 
@@ -116,12 +120,26 @@ describe('CRW search API', () => {
       title: 'T',
       link: 'https://e.com',
       snippet: 'D',
+      position: 1,
     });
   });
 
-  it('adds images to the sources array when images are requested', async () => {
+  it('uses the images source and maps image results', async () => {
     mockedAxios.post.mockResolvedValueOnce({
-      data: { success: true, data: [] },
+      data: {
+        success: true,
+        data: {
+          images: [
+            {
+              title: 'I',
+              url: 'https://e.com/page',
+              imageUrl: 'https://e.com/i.png',
+              position: 1,
+            },
+            { title: 'no-image-url', url: 'https://e.com/x' },
+          ],
+        },
+      },
     });
 
     const searchAPI = createSearchAPI({
@@ -129,10 +147,80 @@ describe('CRW search API', () => {
       crwApiKey: 'test-key',
     });
 
-    await searchAPI.getSources({ query: 'example query', type: 'images' });
+    const result = await searchAPI.getSources({
+      query: 'example query',
+      type: 'images',
+    });
+
+    const [, payload] = mockedAxios.post.mock.calls[0];
+    expect((payload as t.CrwSearchPayload).sources).toEqual(['images']);
+    expect(result.data?.images).toEqual([
+      {
+        title: 'I',
+        imageUrl: 'https://e.com/i.png',
+        link: 'https://e.com/page',
+        position: 1,
+      },
+    ]);
+  });
+
+  it('adds images to a web search when includeImages is set', async () => {
+    mockedAxios.post.mockResolvedValueOnce({
+      data: { success: true, data: { web: [] } },
+    });
+
+    const searchAPI = createSearchAPI({
+      searchProvider: 'crw',
+      crwApiKey: 'test-key',
+      crwSearchOptions: { includeImages: true },
+    });
+
+    await searchAPI.getSources({ query: 'example query' });
 
     const [, payload] = mockedAxios.post.mock.calls[0];
     expect((payload as t.CrwSearchPayload).sources).toEqual(['web', 'images']);
+  });
+
+  it('uses the news source and maps news results', async () => {
+    mockedAxios.post.mockResolvedValueOnce({
+      data: {
+        success: true,
+        data: {
+          news: [
+            {
+              title: 'N',
+              url: 'https://news.example.com/story',
+              description: 'D',
+              publishedDate: '2026-07-01T20:40:00',
+              position: 1,
+            },
+          ],
+        },
+      },
+    });
+
+    const searchAPI = createSearchAPI({
+      searchProvider: 'crw',
+      crwApiKey: 'test-key',
+    });
+
+    const result = await searchAPI.getSources({
+      query: 'example query',
+      type: 'news',
+    });
+
+    const [, payload] = mockedAxios.post.mock.calls[0];
+    expect((payload as t.CrwSearchPayload).sources).toEqual(['news']);
+    expect(result.data?.news).toEqual([
+      {
+        title: 'N',
+        link: 'https://news.example.com/story',
+        snippet: 'D',
+        date: '2026-07-01T20:40:00',
+        source: 'news.example.com',
+        position: 1,
+      },
+    ]);
   });
 
   it('surfaces an envelope failure with the error code', async () => {
@@ -159,7 +247,7 @@ describe('CRW search API', () => {
 
   it('honors the base-URL override for search', async () => {
     mockedAxios.post.mockResolvedValueOnce({
-      data: { success: true, data: [] },
+      data: { success: true, data: { web: [] } },
     });
 
     const searchAPI = createSearchAPI({
@@ -176,7 +264,7 @@ describe('CRW search API', () => {
 
   it('omits the Authorization header when keyless', async () => {
     mockedAxios.post.mockResolvedValueOnce({
-      data: { success: true, data: [] },
+      data: { success: true, data: { web: [] } },
     });
 
     const searchAPI = createSearchAPI({
@@ -197,10 +285,12 @@ describe('CRW search API', () => {
     mockedAxios.post.mockResolvedValueOnce({
       data: {
         success: true,
-        data: [
-          { title: 'A', url: '', description: 'x' },
-          { title: 'B', url: 'https://ok.com', description: 'y' },
-        ],
+        data: {
+          web: [
+            { title: 'A', url: '', description: 'x' },
+            { title: 'B', url: 'https://ok.com', description: 'y' },
+          ],
+        },
       },
     });
 
@@ -262,14 +352,15 @@ describe('CrwScraper', () => {
       expect(url).toBe('http://localhost:3000/v1/scrape');
     });
 
-    it('uses the default timeout', async () => {
+    it('sends the render budget and pads the HTTP timeout', async () => {
       mockedAxios.post.mockResolvedValueOnce({
         data: { success: true, markdown: '# Hi' },
       });
       const scraper = createCrwScraper({ apiKey: 'k', logger: mockLogger });
       await scraper.scrapeUrl('https://example.com');
-      const [, , config] = mockedAxios.post.mock.calls[0];
-      expect((config as { timeout: number }).timeout).toBe(7500);
+      const [, payload, config] = mockedAxios.post.mock.calls[0];
+      expect((payload as { timeout: number }).timeout).toBe(7500);
+      expect((config as { timeout: number }).timeout).toBe(12500);
     });
   });
 
@@ -304,6 +395,37 @@ describe('CrwScraper', () => {
       (keylessConfig as { headers: Record<string, string> }).headers
         .Authorization
     ).toBeUndefined();
+  });
+
+  it('reads the nested data container from cloud responses', async () => {
+    mockedAxios.post.mockResolvedValueOnce({
+      data: {
+        success: true,
+        data: {
+          markdown: '# Hi',
+          html: '<p>x</p>',
+          metadata: { title: 't' },
+          links: [],
+        },
+      },
+    });
+    const scraper = createCrwScraper({ apiKey: 'k', logger: mockLogger });
+    const result = await scraper.scrapeUrl('https://example.com');
+    expect(result).toEqual([
+      'https://example.com',
+      {
+        success: true,
+        data: {
+          markdown: '# Hi',
+          html: '<p>x</p>',
+          metadata: { title: 't' },
+          links: [],
+          rawHtml: undefined,
+          plainText: undefined,
+          screenshot: undefined,
+        },
+      },
+    ]);
   });
 
   it('normalizes top-level fields into the nested data shape', async () => {
@@ -397,9 +519,7 @@ describe('CrwScraper', () => {
     });
 
     it('returns {} when metadata is missing', () => {
-      expect(
-        scraper.extractMetadata({ success: true, data: {} })
-      ).toEqual({});
+      expect(scraper.extractMetadata({ success: true, data: {} })).toEqual({});
     });
   });
 
@@ -433,9 +553,7 @@ describe('CrwScraper', () => {
     const [url, response] = await scraper.scrapeUrl('https://example.com');
     expect(url).toBe('https://example.com');
     expect(response.success).toBe(false);
-    expect(response.error).toBe(
-      'fastCRW API request failed: Network error'
-    );
+    expect(response.error).toBe('fastCRW API request failed: Network error');
   });
 
   it('assembles the payload via omitUndefined', async () => {
@@ -458,7 +576,9 @@ describe('CrwScraper', () => {
       renderJs: true,
     });
     expect(payload as Record<string, unknown>).not.toHaveProperty('proxy');
-    expect(payload as Record<string, unknown>).not.toHaveProperty('cssSelector');
+    expect(payload as Record<string, unknown>).not.toHaveProperty(
+      'cssSelector'
+    );
   });
 });
 
@@ -472,16 +592,20 @@ describe('CRW search tool wiring', () => {
       .mockResolvedValueOnce({
         data: {
           success: true,
-          data: [{ title: 'T', url: 'https://ex.com/a', description: 'D' }],
+          data: {
+            web: [{ title: 'T', url: 'https://ex.com/a', description: 'D' }],
+          },
         },
       })
       .mockResolvedValueOnce({
         data: {
           success: true,
-          markdown: '# A',
-          html: '<p>a</p>',
-          metadata: { title: 'T' },
-          links: [],
+          data: {
+            markdown: '# A',
+            html: '<p>a</p>',
+            metadata: { title: 'T' },
+            links: [],
+          },
         },
       });
 
@@ -516,16 +640,20 @@ describe('CRW search tool wiring', () => {
       .mockResolvedValueOnce({
         data: {
           success: true,
-          data: [{ title: 'T', url: 'https://ex.com/a', description: 'D' }],
+          data: {
+            web: [{ title: 'T', url: 'https://ex.com/a', description: 'D' }],
+          },
         },
       })
       .mockResolvedValueOnce({
         data: {
           success: true,
-          markdown: '# A',
-          html: '<p>a</p>',
-          metadata: { title: 'T' },
-          links: [],
+          data: {
+            markdown: '# A',
+            html: '<p>a</p>',
+            metadata: { title: 'T' },
+            links: [],
+          },
         },
       });
 
