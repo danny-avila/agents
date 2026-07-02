@@ -140,13 +140,15 @@ export interface CrwNewsSearchResult extends CrwSearchResult {
   publishedDate?: string;
 }
 
+export interface CrwSearchGroups {
+  web?: CrwSearchResult[];
+  images?: CrwImageSearchResult[];
+  news?: CrwNewsSearchResult[];
+}
+
 export interface CrwSearchResponse {
   success: boolean;
-  data?: {
-    web?: CrwSearchResult[];
-    images?: CrwImageSearchResult[];
-    news?: CrwNewsSearchResult[];
-  };
+  data?: CrwSearchGroups & { results?: CrwSearchGroups };
   error?: string;
   error_code?: string;
 }
