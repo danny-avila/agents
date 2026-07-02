@@ -234,6 +234,72 @@ describe('createSourceProcessor content capping', () => {
   });
 });
 
+describe('createSourceProcessor reranker chunking', () => {
+  const link = 'https://a.com';
+  const baseFields = {
+    query: 'test query',
+    proMode: true,
+    onGetHighlights: undefined,
+  };
+
+  const runWithConfig = async (
+    config: Partial<t.ProcessSourcesConfig>
+  ): Promise<string[]> => {
+    const reranker = new RecordingReranker();
+    const scraper = createFakeScraper({ [link]: makeLongContent(10000) });
+    const processor = createSourceProcessor(
+      { reranker, logger: silentLogger, ...config },
+      scraper
+    );
+
+    await processor.processSources({
+      ...baseFields,
+      news: false,
+      numElements: 5,
+      result: { success: true, data: { organic: [makeOrganic(link)] } },
+    });
+
+    return reranker.rerankCalls[0] ?? [];
+  };
+
+  test('configured chunkSize produces fewer, larger chunks', async () => {
+    const defaultDocs = await runWithConfig({});
+    const largeDocs = await runWithConfig({
+      chunkSize: 500,
+      chunkOverlap: 100,
+    });
+
+    expect(defaultDocs.length).toBeGreaterThan(0);
+    expect(largeDocs.length).toBeGreaterThan(0);
+    expect(largeDocs.length).toBeLessThan(defaultDocs.length);
+    expect(Math.max(...defaultDocs.map((d) => d.length))).toBeLessThanOrEqual(
+      150
+    );
+    expect(Math.max(...largeDocs.map((d) => d.length))).toBeLessThanOrEqual(
+      500
+    );
+  });
+
+  test('respects SEARCH_CHUNK_SIZE env vars when config is not set', async () => {
+    process.env.SEARCH_CHUNK_SIZE = '500';
+    process.env.SEARCH_CHUNK_OVERLAP = '100';
+    try {
+      const docs = await runWithConfig({});
+      expect(docs.length).toBeGreaterThan(0);
+      expect(Math.max(...docs.map((d) => d.length))).toBeLessThanOrEqual(500);
+    } finally {
+      delete process.env.SEARCH_CHUNK_SIZE;
+      delete process.env.SEARCH_CHUNK_OVERLAP;
+    }
+  });
+
+  test('clamps overlap below chunk size instead of throwing', async () => {
+    const docs = await runWithConfig({ chunkSize: 200, chunkOverlap: 300 });
+    expect(docs.length).toBeGreaterThan(0);
+    expect(Math.max(...docs.map((d) => d.length))).toBeLessThanOrEqual(200);
+  });
+});
+
 describe('createSourceProcessor topStories capping', () => {
   const storyLinks = Array.from(
     { length: 8 },

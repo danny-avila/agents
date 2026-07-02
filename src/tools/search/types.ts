@@ -137,6 +137,15 @@ export interface ProcessSourcesConfig {
    * chunker/reranker. Defaults to 50,000; also configurable via the
    * `SEARCH_MAX_CONTENT_LENGTH` env var. */
   maxContentLength?: number;
+  /** Chunk size (chars) for splitting scraped content before reranking.
+   * Defaults to 150; also configurable via the `SEARCH_CHUNK_SIZE` env var.
+   * Larger chunks send fewer documents to the reranker (lower cost/latency);
+   * highlights are expanded ±300-450 chars around each hit either way. */
+  chunkSize?: number;
+  /** Overlap (chars) between adjacent chunks. Defaults to 50; also
+   * configurable via the `SEARCH_CHUNK_OVERLAP` env var. Clamped below
+   * `chunkSize`. */
+  chunkOverlap?: number;
   strategies?: string[];
   filterContent?: boolean;
   reranker?: BaseReranker;
