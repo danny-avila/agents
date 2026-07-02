@@ -120,6 +120,7 @@ export interface CrwSearchPayload {
   query: string;
   limit: number;
   sources?: CrwSearchSource[];
+  tbs?: string;
 }
 
 export interface CrwSearchResult {
@@ -346,7 +347,6 @@ export interface CrwScraperConfig {
   xpath?: string;
   proxy?: string;
   stealth?: boolean;
-  jsonSchema?: object;
 }
 
 export type CrwScrapeOptions = Omit<

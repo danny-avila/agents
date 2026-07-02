@@ -3,6 +3,7 @@ import type * as t from './types';
 import { CrwScraper, createCrwScraper } from './crw-scraper';
 import { createSearchAPI } from './search';
 import { createSearchTool } from './tool';
+import { DATE_RANGE } from './schema';
 
 jest.mock('axios');
 const mockedAxios = axios as jest.Mocked<typeof axios>;
@@ -106,7 +107,7 @@ describe('CRW search API', () => {
     const result = await searchAPI.getSources({ query: 'example query' });
 
     const [url, payload, config] = mockedAxios.post.mock.calls[0];
-    expect(url).toBe('https://fastcrw.com/api/v1/search');
+    expect(url).toBe('https://api.fastcrw.com/v1/search');
     expect(payload).toEqual({
       query: 'example query',
       limit: 8,
@@ -221,6 +222,41 @@ describe('CRW search API', () => {
         position: 1,
       },
     ]);
+  });
+
+  it('maps the date parameter to a qdr tbs filter', async () => {
+    mockedAxios.post.mockResolvedValueOnce({
+      data: { success: true, data: { web: [] } },
+    });
+
+    const searchAPI = createSearchAPI({
+      searchProvider: 'crw',
+      crwApiKey: 'test-key',
+    });
+
+    await searchAPI.getSources({
+      query: 'example query',
+      date: DATE_RANGE.PAST_24_HOURS,
+    });
+
+    const [, payload] = mockedAxios.post.mock.calls[0];
+    expect((payload as t.CrwSearchPayload).tbs).toBe('qdr:d');
+  });
+
+  it('omits tbs when no date is given', async () => {
+    mockedAxios.post.mockResolvedValueOnce({
+      data: { success: true, data: { web: [] } },
+    });
+
+    const searchAPI = createSearchAPI({
+      searchProvider: 'crw',
+      crwApiKey: 'test-key',
+    });
+
+    await searchAPI.getSources({ query: 'example query' });
+
+    const [, payload] = mockedAxios.post.mock.calls[0];
+    expect(payload as Record<string, unknown>).not.toHaveProperty('tbs');
   });
 
   it('surfaces an envelope failure with the error code', async () => {
@@ -338,7 +374,7 @@ describe('CrwScraper', () => {
       const scraper = createCrwScraper({ apiKey: 'k', logger: mockLogger });
       await scraper.scrapeUrl('https://example.com');
       const [url] = mockedAxios.post.mock.calls[0];
-      expect(url).toBe('https://fastcrw.com/api/v1/scrape');
+      expect(url).toBe('https://api.fastcrw.com/v1/scrape');
     });
 
     it('honors the CRW_API_URL env override', async () => {
@@ -671,7 +707,7 @@ describe('CRW search tool wiring', () => {
 
     const [searchUrl] = mockedAxios.post.mock.calls[0];
     const [scrapeUrl] = mockedAxios.post.mock.calls[1];
-    expect(searchUrl).toBe('https://fastcrw.com/api/v1/search');
+    expect(searchUrl).toBe('https://api.fastcrw.com/v1/search');
     expect(scrapeUrl).toBe('http://localhost:3000/v1/scrape');
   });
 });
