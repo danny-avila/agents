@@ -25,7 +25,7 @@ export const createCrwAPI = (
   const base = (
     apiUrl ??
     process.env.CRW_API_URL ??
-    'https://fastcrw.com/api'
+    'https://api.fastcrw.com'
   ).replace(/\/+$/, '');
   const config = {
     apiKey: apiKey ?? process.env.CRW_API_KEY,
@@ -35,6 +35,7 @@ export const createCrwAPI = (
 
   const getSources = async ({
     query,
+    date,
     numResults = 8,
     type,
   }: t.GetSourcesParams): Promise<t.SearchResult> => {
@@ -59,6 +60,10 @@ export const createCrwAPI = (
       }
 
       const payload: t.CrwSearchPayload = { query, limit, sources };
+      if (date != null) {
+        // Serper-style qdr filter; live-verified to constrain results.
+        payload.tbs = `qdr:${date}`;
+      }
 
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
