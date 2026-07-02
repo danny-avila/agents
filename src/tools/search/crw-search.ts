@@ -89,10 +89,12 @@ export const createCrwAPI = (
       }
 
       // fastCRW keys results by source: {data: {web: [...], images: [...],
-      // news: [...]}} (live-verified 2026-07-02). OrganicResult.link is a
-      // REQUIRED string (types.ts), so defend against null/empty urls to never
-      // feed a broken '' link into the scraper.
-      const data = body.data ?? {};
+      // news: [...]}} (cloud, live-verified 2026-07-02); tolerate a
+      // {data: {results: {...groups}}} wrapper for self-host variants.
+      // OrganicResult.link is a REQUIRED string (types.ts), so defend against
+      // null/empty urls to never feed a broken '' link into the scraper.
+      const container = body.data ?? {};
+      const data = container.results ?? container;
       const organicResults: t.OrganicResult[] = (data.web ?? [])
         .filter((r) => r.url != null && r.url !== '')
         .map((r) => ({

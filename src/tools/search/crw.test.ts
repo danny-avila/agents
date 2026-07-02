@@ -224,6 +224,28 @@ describe('CRW search API', () => {
     ]);
   });
 
+  it('unwraps a data.results wrapper (self-host shape)', async () => {
+    mockedAxios.post.mockResolvedValueOnce({
+      data: {
+        success: true,
+        data: {
+          results: {
+            web: [{ title: 'T', url: 'https://e.com', description: 'D' }],
+          },
+        },
+      },
+    });
+
+    const searchAPI = createSearchAPI({
+      searchProvider: 'crw',
+      crwApiKey: 'test-key',
+    });
+
+    const result = await searchAPI.getSources({ query: 'example query' });
+
+    expect(result.data?.organic?.[0].link).toBe('https://e.com');
+  });
+
   it('maps the date parameter to a qdr tbs filter', async () => {
     mockedAxios.post.mockResolvedValueOnce({
       data: { success: true, data: { web: [] } },
