@@ -521,6 +521,7 @@ export const createSourceProcessor = (
       const highlights = await getHighlights({
         query,
         reranker,
+        topResults,
         content: result.content,
         maxContentLength,
         logger: logger_,

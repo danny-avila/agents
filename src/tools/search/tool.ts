@@ -315,7 +315,11 @@ function createTool({
         }),
       });
       const turn = runnableConfig.toolCall?.turn ?? 0;
-      const { output, references } = formatResultsForLLM(turn, searchResult, maxOutputChars);
+      const { output, references } = formatResultsForLLM(
+        turn,
+        searchResult,
+        maxOutputChars
+      );
       const data: t.SearchResultData = { turn, ...searchResult, references };
       return [output, { [Constants.WEB_SEARCH]: data }];
     },
@@ -359,6 +363,7 @@ export const createSearchTool = (
     tavilyExtractUrl,
     tavilySearchOptions,
     rerankerType = 'cohere',
+    rerankerTimeout,
     topResults = 5,
     maxContentLength,
     maxOutputChars,
@@ -455,6 +460,7 @@ export const createSearchTool = (
     jinaApiKey,
     jinaApiUrl,
     cohereApiKey,
+    rerankerTimeout,
     logger,
   });
 

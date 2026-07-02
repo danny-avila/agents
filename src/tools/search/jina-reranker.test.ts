@@ -150,7 +150,8 @@ describe('JinaReranker', () => {
     });
 
     it('should log compact Axios errors without request internals', async () => {
-      const customUrl = 'https://test-jina-endpoint.com/v1/rerank?api_key=hidden';
+      const customUrl =
+        'https://test-jina-endpoint.com/v1/rerank?api_key=hidden';
       const reranker = new JinaReranker({
         apiKey: 'test-key',
         apiUrl: customUrl,
@@ -201,6 +202,49 @@ describe('JinaReranker', () => {
       expect(serializedMetadata).not.toContain('test-key');
       expect(serializedMetadata.length).toBeLessThan(500);
     });
+
+    it('should bound the rerank request with the default timeout', async () => {
+      const customUrl = 'https://test-jina-endpoint.com/v1/rerank';
+      const reranker = new JinaReranker({
+        apiKey: 'test-key',
+        apiUrl: customUrl,
+        logger: mockLogger,
+      });
+      jest.spyOn(mockLogger, 'debug').mockImplementation(() => mockLogger);
+      const postSpy = jest.spyOn(axios, 'post').mockResolvedValueOnce({
+        data: { results: [{ index: 0, relevance_score: 0.9 }] },
+      });
+
+      await reranker.rerank('test query', ['document1'], 1);
+
+      expect(postSpy).toHaveBeenCalledWith(
+        customUrl,
+        expect.any(Object),
+        expect.objectContaining({ timeout: 10000 })
+      );
+    });
+
+    it('should bound the rerank request with a custom timeout', async () => {
+      const customUrl = 'https://test-jina-endpoint.com/v1/rerank';
+      const reranker = new JinaReranker({
+        apiKey: 'test-key',
+        apiUrl: customUrl,
+        timeout: 2500,
+        logger: mockLogger,
+      });
+      jest.spyOn(mockLogger, 'debug').mockImplementation(() => mockLogger);
+      const postSpy = jest.spyOn(axios, 'post').mockResolvedValueOnce({
+        data: { results: [{ index: 0, relevance_score: 0.9 }] },
+      });
+
+      await reranker.rerank('test query', ['document1'], 1);
+
+      expect(postSpy).toHaveBeenCalledWith(
+        customUrl,
+        expect.any(Object),
+        expect.objectContaining({ timeout: 2500 })
+      );
+    });
   });
 });
 
@@ -233,5 +277,30 @@ describe('createReranker', () => {
     }
     const apiUrl = getApiUrl(reranker);
     expect(apiUrl).toBe('https://api.jina.ai/v1/rerank');
+  });
+
+  it('should pass rerankerTimeout through to the rerank request', async () => {
+    const customUrl = 'https://custom-jina-endpoint.com/v1/rerank';
+    const reranker = createReranker({
+      rerankerType: 'jina',
+      jinaApiKey: 'test-key',
+      jinaApiUrl: customUrl,
+      rerankerTimeout: 4000,
+      logger: createDefaultLogger(),
+    });
+    if (!(reranker instanceof JinaReranker)) {
+      throw new Error('Expected createReranker to return a JinaReranker.');
+    }
+    const postSpy = jest.spyOn(axios, 'post').mockResolvedValueOnce({
+      data: { results: [{ index: 0, relevance_score: 0.9 }] },
+    });
+
+    await reranker.rerank('test query', ['document1'], 1);
+
+    expect(postSpy).toHaveBeenCalledWith(
+      customUrl,
+      expect.any(Object),
+      expect.objectContaining({ timeout: 4000 })
+    );
   });
 });

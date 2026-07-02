@@ -231,6 +231,8 @@ export interface SearchToolConfig
   jinaApiUrl?: string;
   cohereApiKey?: string;
   rerankerType?: RerankerType;
+  /** Timeout (ms) for rerank API requests. Defaults to 10,000. */
+  rerankerTimeout?: number;
   scraperProvider?: ScraperProvider;
   scraperTimeout?: number;
   serperScraperOptions?: SerperScraperConfig;

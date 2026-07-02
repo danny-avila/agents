@@ -14,6 +14,7 @@ const silentLogger = {
 
 class RecordingReranker extends BaseReranker {
   public rerankCalls: string[][] = [];
+  public topKCalls: number[] = [];
 
   constructor() {
     super(silentLogger);
@@ -25,6 +26,7 @@ class RecordingReranker extends BaseReranker {
     topK: number = 5
   ): Promise<t.Highlight[]> {
     this.rerankCalls.push(documents);
+    this.topKCalls.push(topK);
     return this.getDefaultRanking(documents, topK);
   }
 }
@@ -211,6 +213,24 @@ describe('createSourceProcessor content capping', () => {
     });
 
     expect(data.organic?.[0].content?.length).toBe(50000);
+  });
+
+  test('passes configured topResults through to the reranker', async () => {
+    const reranker = new RecordingReranker();
+    const scraper = createFakeScraper({ [link]: makeLongContent(3000) });
+    const processor = createSourceProcessor(
+      { reranker, topResults: 2, logger: silentLogger },
+      scraper
+    );
+
+    await processor.processSources({
+      ...baseFields,
+      news: false,
+      numElements: 5,
+      result: { success: true, data: { organic: [makeOrganic(link)] } },
+    });
+
+    expect(reranker.topKCalls).toEqual([2]);
   });
 });
 

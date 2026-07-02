@@ -4,6 +4,11 @@ import { createDefaultLogger, formatErrorForLog } from './utils';
 
 const DEFAULT_JINA_API_URL = 'https://api.jina.ai/v1/rerank';
 
+/** Every other network call in the search pipeline is bounded (scrapers,
+ * search providers); rerank requests must be too, or a hung rerank API
+ * stalls the whole tool. */
+const DEFAULT_RERANKER_TIMEOUT = 10000;
+
 const getDefaultJinaApiUrl = (): string =>
   process.env.JINA_API_URL != null && process.env.JINA_API_URL !== ''
     ? process.env.JINA_API_URL
@@ -36,19 +41,23 @@ export abstract class BaseReranker {
 
 export class JinaReranker extends BaseReranker {
   private apiUrl: string;
+  private timeout: number;
 
   constructor({
     apiKey = process.env.JINA_API_KEY,
     apiUrl = getDefaultJinaApiUrl(),
+    timeout = DEFAULT_RERANKER_TIMEOUT,
     logger,
   }: {
     apiKey?: string;
     apiUrl?: string;
+    timeout?: number;
     logger?: t.Logger;
   }) {
     super(logger);
     this.apiKey = apiKey;
     this.apiUrl = apiUrl;
+    this.timeout = timeout;
   }
 
   async rerank(
@@ -56,7 +65,9 @@ export class JinaReranker extends BaseReranker {
     documents: string[],
     topK: number = 5
   ): Promise<t.Highlight[]> {
-    this.logger.debug(`Reranking ${documents.length} chunks with Jina using API URL: ${this.apiUrl}`);
+    this.logger.debug(
+      `Reranking ${documents.length} chunks with Jina using API URL: ${this.apiUrl}`
+    );
 
     try {
       if (this.apiKey == null || this.apiKey === '') {
@@ -80,6 +91,7 @@ export class JinaReranker extends BaseReranker {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${this.apiKey}`,
           },
+          timeout: this.timeout,
         }
       );
 
@@ -122,15 +134,20 @@ export class JinaReranker extends BaseReranker {
 }
 
 export class CohereReranker extends BaseReranker {
+  private timeout: number;
+
   constructor({
     apiKey = process.env.COHERE_API_KEY,
+    timeout = DEFAULT_RERANKER_TIMEOUT,
     logger,
   }: {
     apiKey?: string;
+    timeout?: number;
     logger?: t.Logger;
   }) {
     super(logger);
     this.apiKey = apiKey;
+    this.timeout = timeout;
   }
 
   async rerank(
@@ -161,6 +178,7 @@ export class CohereReranker extends BaseReranker {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${this.apiKey}`,
           },
+          timeout: this.timeout,
         }
       );
 
@@ -218,19 +236,33 @@ export const createReranker = (config: {
   jinaApiKey?: string;
   jinaApiUrl?: string;
   cohereApiKey?: string;
+  rerankerTimeout?: number;
   logger?: t.Logger;
 }): BaseReranker | undefined => {
-  const { rerankerType, jinaApiKey, jinaApiUrl, cohereApiKey, logger } = config;
+  const {
+    rerankerType,
+    jinaApiKey,
+    jinaApiUrl,
+    cohereApiKey,
+    rerankerTimeout,
+    logger,
+  } = config;
 
   // Create a default logger if none is provided
   const defaultLogger = logger || createDefaultLogger();
 
   switch (rerankerType.toLowerCase()) {
   case 'jina':
-    return new JinaReranker({ apiKey: jinaApiKey, apiUrl: jinaApiUrl, logger: defaultLogger });
+    return new JinaReranker({
+      apiKey: jinaApiKey,
+      apiUrl: jinaApiUrl,
+      timeout: rerankerTimeout,
+      logger: defaultLogger,
+    });
   case 'cohere':
     return new CohereReranker({
       apiKey: cohereApiKey,
+      timeout: rerankerTimeout,
       logger: defaultLogger,
     });
   case 'infinity':
@@ -242,7 +274,12 @@ export const createReranker = (config: {
     defaultLogger.warn(
       `Unknown reranker type: ${rerankerType}. Defaulting to InfinityReranker.`
     );
-    return new JinaReranker({ apiKey: jinaApiKey, apiUrl: jinaApiUrl, logger: defaultLogger });
+    return new JinaReranker({
+      apiKey: jinaApiKey,
+      apiUrl: jinaApiUrl,
+      timeout: rerankerTimeout,
+      logger: defaultLogger,
+    });
   }
 };
 
