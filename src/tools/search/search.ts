@@ -67,11 +67,11 @@ const chunker = {
 };
 
 const DEFAULT_MAX_CONTENT_LENGTH = 50000;
-const DEFAULT_CHUNK_SIZE = 150;
-const DEFAULT_CHUNK_OVERLAP = 50;
+const DEFAULT_CHUNK_SIZE = 500;
+const DEFAULT_CHUNK_OVERLAP = 100;
 
 /** Resolves reranker chunking from config, the `SEARCH_CHUNK_SIZE` /
- * `SEARCH_CHUNK_OVERLAP` env vars, or the defaults (150 / 50 chars). The
+ * `SEARCH_CHUNK_OVERLAP` env vars, or the defaults (500 / 100 chars). The
  * overlap is clamped below the chunk size — `RecursiveCharacterTextSplitter`
  * throws when overlap >= size. */
 function resolveChunkOptions(

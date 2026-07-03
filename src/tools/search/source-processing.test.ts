@@ -262,31 +262,31 @@ describe('createSourceProcessor reranker chunking', () => {
     return reranker.rerankCalls[0] ?? [];
   };
 
-  test('configured chunkSize produces fewer, larger chunks', async () => {
+  test('defaults to 500-char chunks; smaller configured chunkSize produces more, smaller chunks', async () => {
     const defaultDocs = await runWithConfig({});
-    const largeDocs = await runWithConfig({
-      chunkSize: 500,
-      chunkOverlap: 100,
+    const smallDocs = await runWithConfig({
+      chunkSize: 150,
+      chunkOverlap: 50,
     });
 
     expect(defaultDocs.length).toBeGreaterThan(0);
-    expect(largeDocs.length).toBeGreaterThan(0);
-    expect(largeDocs.length).toBeLessThan(defaultDocs.length);
+    expect(smallDocs.length).toBeGreaterThan(defaultDocs.length);
     expect(Math.max(...defaultDocs.map((d) => d.length))).toBeLessThanOrEqual(
-      150
-    );
-    expect(Math.max(...largeDocs.map((d) => d.length))).toBeLessThanOrEqual(
       500
+    );
+    expect(Math.max(...defaultDocs.map((d) => d.length))).toBeGreaterThan(150);
+    expect(Math.max(...smallDocs.map((d) => d.length))).toBeLessThanOrEqual(
+      150
     );
   });
 
   test('respects SEARCH_CHUNK_SIZE env vars when config is not set', async () => {
-    process.env.SEARCH_CHUNK_SIZE = '500';
-    process.env.SEARCH_CHUNK_OVERLAP = '100';
+    process.env.SEARCH_CHUNK_SIZE = '150';
+    process.env.SEARCH_CHUNK_OVERLAP = '50';
     try {
       const docs = await runWithConfig({});
       expect(docs.length).toBeGreaterThan(0);
-      expect(Math.max(...docs.map((d) => d.length))).toBeLessThanOrEqual(500);
+      expect(Math.max(...docs.map((d) => d.length))).toBeLessThanOrEqual(150);
     } finally {
       delete process.env.SEARCH_CHUNK_SIZE;
       delete process.env.SEARCH_CHUNK_OVERLAP;
