@@ -181,15 +181,14 @@ function getReasoningDetailsText(
 function getAdditionalReasoningContent(
   message: BaseMessage
 ): string | undefined {
-  const additionalKwargs =
-    message.additional_kwargs as ReasoningAdditionalKwargs | undefined;
+  const additionalKwargs = message.additional_kwargs as
+    | ReasoningAdditionalKwargs
+    | undefined;
   if (additionalKwargs == null) {
     return undefined;
   }
 
-  const reasoningContent = getReasoningText(
-    additionalKwargs.reasoning_content
-  );
+  const reasoningContent = getReasoningText(additionalKwargs.reasoning_content);
   if (reasoningContent != null) {
     return reasoningContent;
   }
@@ -432,8 +431,7 @@ export function convertMessagesToContent(
         toolCallMap.set(tool_call.id, tool_call);
       }
 
-      currentAIMessageIndex =
-        addContentPart(message) ?? addToolCallBoundary();
+      currentAIMessageIndex = addContentPart(message) ?? addToolCallBoundary();
       continue;
     } else if (
       messageType === 'tool' &&
@@ -519,6 +517,16 @@ export function formatAnthropicArtifactContent(messages: BaseMessage[]): void {
   }
 }
 
+/**
+ * Assistant bridge inserted between the tool result and the human message that
+ * carries its image artifact. Strict OpenAI-compatible providers (Scaleway,
+ * Mistral) reject a `user` message that directly follows a `tool` message
+ * ("Unexpected role 'user' after role 'tool'"), so the artifacts cannot be
+ * handed over as a bare trailing human message. Bridging with a short assistant
+ * turn keeps role alternation valid across OpenAI, Scaleway/Mistral and Google.
+ */
+const ARTIFACT_BRIDGE_TEXT = 'Here is the generated image:';
+
 export function formatArtifactPayload(messages: BaseMessage[]): void {
   const lastMessageY = messages[messages.length - 1];
   if (!(lastMessageY instanceof ToolMessage)) return;
@@ -558,6 +566,7 @@ export function formatArtifactPayload(messages: BaseMessage[]): void {
 
   if (aggregatedContent.length > 0) {
     messages.push(
+      new AIMessage({ content: ARTIFACT_BRIDGE_TEXT }),
       new HumanMessage({ content: toLangChainContent(aggregatedContent) })
     );
   }
