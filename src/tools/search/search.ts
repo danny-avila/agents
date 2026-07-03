@@ -67,6 +67,43 @@ const chunker = {
 };
 
 const DEFAULT_MAX_CONTENT_LENGTH = 50000;
+const DEFAULT_CHUNK_SIZE = 150;
+const DEFAULT_CHUNK_OVERLAP = 50;
+
+/** Resolves reranker chunking from config, the `SEARCH_CHUNK_SIZE` /
+ * `SEARCH_CHUNK_OVERLAP` env vars, or the defaults (150 / 50 chars). The
+ * overlap is clamped below the chunk size — `RecursiveCharacterTextSplitter`
+ * throws when overlap >= size. */
+function resolveChunkOptions(
+  chunkSize?: number,
+  chunkOverlap?: number
+): { chunkSize: number; chunkOverlap: number } {
+  const resolve = (
+    configValue: number | undefined,
+    envVar: string,
+    fallback: number
+  ): number => {
+    if (configValue != null && configValue > 0) {
+      return configValue;
+    }
+    const envValue = Number(process.env[envVar]);
+    if (Number.isFinite(envValue) && envValue > 0) {
+      return envValue;
+    }
+    return fallback;
+  };
+
+  const size = resolve(chunkSize, 'SEARCH_CHUNK_SIZE', DEFAULT_CHUNK_SIZE);
+  let overlap = resolve(
+    chunkOverlap,
+    'SEARCH_CHUNK_OVERLAP',
+    DEFAULT_CHUNK_OVERLAP
+  );
+  if (overlap >= size) {
+    overlap = Math.floor(size / 3);
+  }
+  return { chunkSize: size, chunkOverlap: overlap };
+}
 
 /** Resolves the per-source scraped content cap from config, the
  * `SEARCH_MAX_CONTENT_LENGTH` env var, or the default (50,000 chars) */
@@ -103,6 +140,7 @@ const getHighlights = async ({
   reranker,
   topResults = 5,
   maxContentLength = DEFAULT_MAX_CONTENT_LENGTH,
+  chunkOptions,
   logger,
 }: {
   content: string;
@@ -110,6 +148,7 @@ const getHighlights = async ({
   reranker?: BaseReranker;
   topResults?: number;
   maxContentLength?: number;
+  chunkOptions?: { chunkSize: number; chunkOverlap: number };
   logger?: t.Logger;
 }): Promise<t.Highlight[] | undefined> => {
   const logger_ = logger || createDefaultLogger();
@@ -125,7 +164,8 @@ const getHighlights = async ({
 
   try {
     const documents = await chunker.splitText(
-      truncateContent(content, maxContentLength)
+      truncateContent(content, maxContentLength),
+      chunkOptions
     );
     if (Array.isArray(documents)) {
       return await reranker.rerank(query, documents, topResults);
@@ -481,6 +521,10 @@ export const createSourceProcessor = (
   } = config;
 
   const maxContentLength = resolveMaxContentLength(config.maxContentLength);
+  const chunkOptions = resolveChunkOptions(
+    config.chunkSize,
+    config.chunkOverlap
+  );
   const logger_ = logger || createDefaultLogger();
   const scraper = scraperInstance;
 
@@ -521,8 +565,10 @@ export const createSourceProcessor = (
       const highlights = await getHighlights({
         query,
         reranker,
+        topResults,
         content: result.content,
         maxContentLength,
+        chunkOptions,
         logger: logger_,
       });
       if (onGetHighlights) {
