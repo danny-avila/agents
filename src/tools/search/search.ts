@@ -2,6 +2,7 @@ import axios from 'axios';
 import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
 import type * as t from './types';
 import { getAttribution, createDefaultLogger } from './utils';
+import { createKeenableAPI } from './keenable-search';
 import { createTavilyAPI } from './tavily-search';
 import { BaseReranker } from './rerankers';
 
@@ -485,6 +486,9 @@ export const createSearchAPI = (
     tavilyApiKey,
     tavilySearchUrl,
     tavilySearchOptions,
+    keenableApiKey,
+    keenableApiUrl,
+    keenableSearchOptions,
   } = config;
 
   if (searchProvider.toLowerCase() === 'serper') {
@@ -493,9 +497,15 @@ export const createSearchAPI = (
     return createSearXNGAPI(searxngInstanceUrl, searxngApiKey);
   } else if (searchProvider.toLowerCase() === 'tavily') {
     return createTavilyAPI(tavilyApiKey, tavilySearchUrl, tavilySearchOptions);
+  } else if (searchProvider.toLowerCase() === 'keenable') {
+    return createKeenableAPI(
+      keenableApiKey,
+      keenableApiUrl,
+      keenableSearchOptions
+    );
   } else {
     throw new Error(
-      `Invalid search provider: ${searchProvider}. Must be 'serper', 'searxng', or 'tavily'`
+      `Invalid search provider: ${searchProvider}. Must be 'serper', 'searxng', 'tavily', or 'keenable'`
     );
   }
 };
