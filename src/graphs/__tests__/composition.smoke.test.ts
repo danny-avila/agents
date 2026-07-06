@@ -95,6 +95,37 @@ describe('LangGraph composition smoke tests', () => {
     expect(graph.getToolCount()).toBe(3);
   });
 
+  it('keeps ordinary tools executable when graphTools are added without a host toolMap (traditional mode)', () => {
+    type HostTool = NonNullable<t.AgentInputs['graphTools']>[number];
+    const echoTool = { name: 'echo_tool' } as unknown as HostTool;
+    const askLikeTool = { name: 'ask_user_question' } as unknown as HostTool;
+    const graph = new StandardGraph({
+      runId: 'toolmap-merge-smoke',
+      agents: [
+        {
+          ...makeAgent('agent'),
+          tools: [echoTool],
+          graphTools: [askLikeTool],
+        },
+      ],
+    });
+    const agentContext = graph.agentContexts.get('agent');
+    const node = graph.initializeTools({
+      currentTools: agentContext?.tools,
+      currentToolMap: undefined,
+      agentContext,
+    });
+    /**
+     * ToolNode treats a provided toolMap as authoritative — if the merged map
+     * built for graphTools drops the base tools, they stay bound to the model
+     * but every call fails as an unknown tool (Codex #289 round 2).
+     */
+    const toolMap = (node as unknown as { toolMap: Map<string, unknown> })
+      .toolMap;
+    expect(toolMap.has('echo_tool')).toBe(true);
+    expect(toolMap.has('ask_user_question')).toBe(true);
+  });
+
   it('clears run-scoped eager tool state on reset', () => {
     const graph = new StandardGraph({
       runId: 'standard-eager-reset',

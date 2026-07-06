@@ -1294,10 +1294,25 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       graphTools && graphTools.length > 0
         ? [...baseTools, ...graphTools]
         : baseTools;
+    /**
+     * ToolNode treats a supplied `toolMap` as authoritative (it only derives
+     * one from `tools` when the param is undefined), so when graphTools force
+     * us to build a merged map here, an absent `currentToolMap` must be
+     * seeded from the BASE tools first — otherwise ordinary tools stay bound
+     * to the model but vanish from the execution map and every call to them
+     * fails as an unknown tool (Codex #289 round 2).
+     */
     const traditionalToolMap =
       graphTools && graphTools.length > 0
         ? new Map([
-          ...(currentToolMap ?? new Map()),
+          ...(currentToolMap ??
+              new Map(
+                baseTools
+                  .filter(
+                    (t): t is t.GenericTool & { name: string } => 'name' in t
+                  )
+                  .map((t) => [t.name, t] as [string, t.GenericTool])
+              )),
           ...graphTools
             .filter((t): t is t.GenericTool & { name: string } => 'name' in t)
             .map((t) => [t.name, t] as [string, t.GenericTool]),
