@@ -1422,6 +1422,15 @@ export function buildChildInputs(
      */
     initialSummary: undefined,
     discoveredTools: undefined,
+    /**
+     * Host-supplied direct tools are parent-scoped: child graphs compile
+     * WITHOUT a checkpointer, so an interrupt-capable graph tool (the whole
+     * reason `AgentInputs.graphTools` exists) would deterministically throw
+     * `No checkpointer set` inside the child. Cleared for every child —
+     * including self-spawn, whose config is resolved from the parent's
+     * `_sourceInputs` and would otherwise inherit these silently.
+     */
+    graphTools: undefined,
   };
 
   if (config.allowNested === true) {

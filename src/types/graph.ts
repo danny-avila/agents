@@ -610,6 +610,20 @@ export interface AgentInputs {
   subagentConfigs?: SubagentConfig[];
   /** Maximum subagent nesting depth. Default 1 means top-level agents can spawn subagents but subagents cannot nest further. */
   maxSubagentDepth?: number;
+  /**
+   * Host-supplied tool instances that must execute IN-PROCESS inside the graph's
+   * ToolNode even when the run is event-driven (`toolDefinitions` non-empty). Each
+   * instance is bound to the model alongside the schema-only event tools and its
+   * name is marked direct, so calls bypass ON_TOOL_EXECUTE dispatch and run inside
+   * the Pregel task frame. This is the only execution mode where a tool body may
+   * raise a LangGraph `interrupt()` (e.g. a tool built on `askUserQuestion()`) —
+   * the host-side event handler runs outside the graph task, where `interrupt()`
+   * throws. Do NOT also list these tools in `toolDefinitions` (they would be bound
+   * twice). NOT inherited by subagent child graphs: children compile without a
+   * checkpointer, so an interrupt-capable tool could never pause there —
+   * `buildChildInputs` clears this field along with the other parent-scoped state.
+   */
+  graphTools?: GraphTools;
 }
 
 export interface ContextPruningConfig {

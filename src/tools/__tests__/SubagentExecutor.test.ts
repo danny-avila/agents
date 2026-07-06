@@ -292,6 +292,31 @@ describe('buildChildInputs', () => {
     expect(result.toolDefinitions).toBeUndefined();
   });
 
+  it('strips host-supplied graphTools (children compile without a checkpointer, so interrupt-capable direct tools cannot work there)', () => {
+    const askLikeTool = { name: 'ask_user_question' } as unknown as NonNullable<
+      AgentInputs['graphTools']
+    >[number];
+    const inputsWithGraphTools: AgentInputs = {
+      ...parentAgentInputs,
+      graphTools: [askLikeTool],
+    };
+    const config: ResolvedSubagentConfig = {
+      type: 'researcher',
+      name: 'R',
+      description: 'd',
+      agentInputs: inputsWithGraphTools,
+    };
+    const result = buildChildInputs(config, 'child', 3);
+    /**
+     * Covers the self-spawn shape too: its config resolves `agentInputs`
+     * from the parent's `_sourceInputs` via shallow spread, so without this
+     * clear the child would inherit the direct tool and deterministically
+     * fail with `No checkpointer set` on first use.
+     */
+    expect(result.graphTools).toBeUndefined();
+    expect(inputsWithGraphTools.graphTools).toHaveLength(1); // parent untouched
+  });
+
   it('strips parent-run-scoped initialSummary and discoveredTools from child inputs', () => {
     /**
      * Codex P1: a child inheriting `initialSummary` or `discoveredTools` from
