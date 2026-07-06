@@ -469,7 +469,7 @@ describe('Langfuse per-run routing integration', () => {
       expectNamedSpansUseTraceId({
         starts,
         traceId: titleTraceId,
-        names: [`LibreChat Title: Parent ${tenantId}`, 'CompletionTitleChain'],
+        names: [`LibreChat Title: Parent ${tenantId}`, 'GenerateTitle'],
       });
       expectNoCrossTenantTrace({
         tenantId,
