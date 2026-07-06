@@ -292,6 +292,12 @@ export type CodeExecutionToolParams =
       files?: CodeEnvFile[];
       /** Optional host-supplied Code API auth headers. */
       authHeaders?: CodeApiAuthHeaders;
+      /**
+       * Advertise best-effort stateful sessions in the tool description
+       * (variables/files may persist between calls, may reset). Prompt text
+       * only; the wire hint is gated by `toolExecution.sandbox`.
+       */
+      statefulSessions?: boolean;
     };
 
 export type CodeApiAuthHeaderMap = Record<string, string>;
@@ -347,6 +353,13 @@ export type ExecuteResult = {
   stdout: string;
   stderr: string;
   files?: FileRefs;
+  /**
+   * Durable runtime session id echoed by a stateful Code API backend
+   * (hash of tenant+user+hint). Additive; absent on stateless servers.
+   */
+  runtime_session_id?: string;
+  /** Whether this execution reused a warm runtime session or started fresh. */
+  runtime_status?: 'new' | 'reused';
 };
 
 /** JSON Schema type definition for tool parameters */
@@ -413,6 +426,12 @@ export type ToolCallRequest = {
     session_id: string;
     files?: CodeEnvFile[];
   };
+  /**
+   * Stable runtime session hint for stateful sandbox sessions. Orthogonal to
+   * `codeSessionContext` (which threads the transient exec-session for file
+   * continuity): the hint identifies the durable server-side runtime session.
+   */
+  runtimeSessionHint?: string;
 };
 
 /** Batch request containing ALL tool calls for a graph step */
@@ -969,6 +988,23 @@ export type CloudflareSandboxExecutionConfig = {
   postEditSyntaxCheck?: LocalExecutionConfig['postEditSyntaxCheck'];
 };
 
+export type SandboxExecutionConfig = {
+  /**
+   * Opt into best-effort stateful runtime sessions on the remote Code API
+   * (its warm per-session MicroVM backend). The transport is unchanged — this
+   * only sends a stable session hint and, paired with the `statefulSessions`
+   * tool factory param, adjusts the model-facing description.
+   */
+  statefulSessions?: boolean;
+  /**
+   * Stable identity for the runtime session (e.g. the conversation id). The
+   * server derives the real session id as hash(tenant, user, hint), so this
+   * is never a security boundary. Falls back to `configurable.thread_id` when
+   * omitted.
+   */
+  runtimeSessionHint?: string;
+};
+
 export type ToolExecutionConfig = {
   /** `sandbox` preserves the remote Code API behavior and is the default. */
   engine?: ToolExecutionEngine;
@@ -976,6 +1012,8 @@ export type ToolExecutionConfig = {
   local?: LocalExecutionConfig;
   /** Cloudflare Sandbox execution settings used when `engine` is `cloudflare-sandbox`. */
   cloudflare?: CloudflareSandboxExecutionConfig;
+  /** Remote sandbox settings; applies when `engine` is `sandbox` or omitted. */
+  sandbox?: SandboxExecutionConfig;
 };
 
 export type ProgrammaticCache = {
@@ -1099,6 +1137,10 @@ export type ProgrammaticExecutionResponse = {
   stderr?: string;
   files?: FileRefs;
 
+  /** Durable runtime session echo from a stateful backend (additive). */
+  runtime_session_id?: string;
+  runtime_status?: 'new' | 'reused';
+
   /** Present when status='error' */
   error?: string;
 };
@@ -1110,6 +1152,9 @@ export type ProgrammaticExecutionArtifact = {
   /** Execution session — see `CodeSessionContext.session_id`. */
   session_id?: string;
   files?: FileRefs;
+  /** Durable runtime session echo from a stateful backend (additive). */
+  runtime_session_id?: string;
+  runtime_status?: 'new' | 'reused';
 };
 
 /** Parameters for creating a bash execution tool (same API as CodeExecutor, bash-only) */
@@ -1134,6 +1179,13 @@ export type ProgrammaticToolCallingParams = {
   debug?: boolean;
   /** Optional host-supplied Code API auth headers. */
   authHeaders?: CodeApiAuthHeaders;
+  /**
+   * Send the runtime session hint on the initial /exec/programmatic request
+   * for stateful sessions. PTC keeps its stateless prompt in v1 — the wire
+   * hint plumbs through, but the "each call is a fresh interpreter" wording
+   * is intentionally unchanged until server-side session behavior is proven.
+   */
+  statefulSessions?: boolean;
 };
 
 // ============================================================================
@@ -1166,6 +1218,9 @@ export type CodeExecutionArtifact = {
   /** Execution session — see `CodeSessionContext.session_id`. */
   session_id?: string;
   files?: FileRefs;
+  /** Durable runtime session echo from a stateful backend (additive). */
+  runtime_session_id?: string;
+  runtime_status?: 'new' | 'reused';
 };
 
 /**

@@ -58,6 +58,29 @@ Usage:
 `.trim();
 
 /**
+ * Bash statefulness is filesystem-tier: on a warm session the machine (files
+ * including /tmp, installed packages, background processes) persists between
+ * calls, but each call may start a fresh shell — so shell variables and cwd
+ * are NOT reliable, and the machine can be reset at any time. Only /mnt/data
+ * is durable.
+ */
+export const STATEFUL_BASH_NOTE =
+  'Session state (best-effort): commands in this conversation usually run on the same machine, so files (including /tmp), installed packages, and running background processes from earlier calls typically persist. Each call may still start a fresh shell — do not rely on shell variables or the working directory carrying over — and the machine may be reset at any time. Only /mnt/data is durable.';
+
+export const StatefulBashExecutionToolDescription = `
+Runs bash commands and returns stdout/stderr output from a session-based execution environment, similar to a long-running machine.
+
+${STATEFUL_BASH_NOTE}
+
+Usage:
+- No network access available.
+- Generated files are automatically delivered; **DO NOT** provide download links.
+- ${CODE_ARTIFACT_PATH_GUIDANCE}
+- ${BASH_SHELL_GUIDANCE}
+- NEVER use this tool to execute malicious commands.
+`.trim();
+
+/**
  * Supplemental prompt documenting the tool-output reference feature.
  *
  * Hosts should append this (separated by a blank line) to the base
@@ -87,11 +110,45 @@ Referencing previous tool outputs:
  */
 export function buildBashExecutionToolDescription(options?: {
   enableToolOutputReferences?: boolean;
+  statefulSessions?: boolean;
 }): string {
+  const base =
+    options?.statefulSessions === true
+      ? StatefulBashExecutionToolDescription
+      : BashExecutionToolDescription;
   if (options?.enableToolOutputReferences === true) {
-    return `${BashExecutionToolDescription}\n\n${BashToolOutputReferencesGuide}`;
+    return `${base}\n\n${BashToolOutputReferencesGuide}`;
   }
-  return BashExecutionToolDescription;
+  return base;
+}
+
+const STATELESS_BASH_PARAM_NOTE =
+  'The environment is stateless; variables and state don\'t persist between executions.';
+const STATEFUL_BASH_PARAM_NOTE =
+  'Files, installed packages, and background processes usually persist between calls, but each call may start a fresh shell (do not rely on shell variables or cwd) and the machine may reset. Only /mnt/data is durable.';
+
+export function buildBashExecutionToolSchema(opts?: {
+  statefulSessions?: boolean;
+}): typeof BashExecutionToolSchema {
+  const note =
+    opts?.statefulSessions === true
+      ? STATEFUL_BASH_PARAM_NOTE
+      : STATELESS_BASH_PARAM_NOTE;
+  const commandDescription =
+    BashExecutionToolSchema.properties.command.description.replace(
+      STATELESS_BASH_PARAM_NOTE,
+      note
+    );
+  return {
+    ...BashExecutionToolSchema,
+    properties: {
+      ...BashExecutionToolSchema.properties,
+      command: {
+        ...BashExecutionToolSchema.properties.command,
+        description: commandDescription,
+      },
+    },
+  } as typeof BashExecutionToolSchema;
 }
 
 export const BashExecutionToolName = Constants.BASH_TOOL;
@@ -117,15 +174,23 @@ function createBashExecutionTool(
 ): DynamicStructuredTool {
   return tool(
     async (rawInput, config) => {
-      const { authHeaders, ...executionParams } = params ?? {};
+      /* `statefulSessions` is prompt-only — keep it out of the wire body. */
+      const {
+        authHeaders,
+        statefulSessions: _statefulSessions,
+        ...executionParams
+      } = params ?? {};
+      void _statefulSessions;
       const { command, ...rest } = rawInput as {
         command: string;
         args?: string[];
       };
-      const { session_id, _injected_files } = (config.toolCall ?? {}) as {
-        session_id?: string;
-        _injected_files?: t.CodeEnvFile[];
-      };
+      const { session_id, _injected_files, _runtime_session_hint } =
+        (config.toolCall ?? {}) as {
+          session_id?: string;
+          _injected_files?: t.CodeEnvFile[];
+          _runtime_session_hint?: string;
+        };
 
       const postData: Record<string, unknown> = {
         lang: 'bash',
@@ -133,6 +198,13 @@ function createBashExecutionTool(
         ...rest,
         ...executionParams,
       };
+
+      if (
+        typeof _runtime_session_hint === 'string' &&
+        _runtime_session_hint !== ''
+      ) {
+        postData.runtime_session_hint = _runtime_session_hint;
+      }
 
       /* See `CodeExecutor.ts` for the rationale — `/files/<session_id>`
        * HTTP fallback was removed because codeapi's sessionAuth requires
@@ -187,12 +259,24 @@ function createBashExecutionTool(
           command
         );
         const hasFiles = result.files != null && result.files.length > 0;
+        const runtimeEcho =
+          result.runtime_session_id != null
+            ? {
+              runtime_session_id: result.runtime_session_id,
+              runtime_status: result.runtime_status,
+            }
+            : {};
         return [
           appendCodeSessionFileSummary(outputWithReminder, result.files),
           (hasFiles
-            ? { session_id: result.session_id, files: result.files }
+            ? {
+              session_id: result.session_id,
+              files: result.files,
+              ...runtimeEcho,
+            }
             : {
               session_id: result.session_id,
+              ...runtimeEcho,
             }) satisfies t.CodeExecutionArtifact,
         ];
       } catch (error) {
@@ -200,15 +284,15 @@ function createBashExecutionTool(
           (error as Error | undefined)?.message ?? '',
           command
         );
-        throw new Error(
-          `Execution error:\n\n${messageWithReminder}`
-        );
+        throw new Error(`Execution error:\n\n${messageWithReminder}`);
       }
     },
     {
       name: BashExecutionToolName,
-      description: BashExecutionToolDescription,
-      schema: BashExecutionToolSchema,
+      description: buildBashExecutionToolDescription({
+        statefulSessions: params?.statefulSessions,
+      }),
+      schema: buildBashExecutionToolSchema(params ?? undefined),
       responseFormat: Constants.CONTENT_AND_ARTIFACT,
     }
   );

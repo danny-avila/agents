@@ -2,8 +2,10 @@ import { describe, it, expect } from '@jest/globals';
 import {
   BashExecutionToolDescription,
   BashToolOutputReferencesGuide,
+  StatefulBashExecutionToolDescription,
   buildBashExecutionToolDescription,
 } from '../BashExecutor';
+import { CODE_ARTIFACT_PATH_GUIDANCE } from '../CodeExecutor';
 
 describe('buildBashExecutionToolDescription', () => {
   it('returns the base description by default', () => {
@@ -54,5 +56,42 @@ describe('buildBashExecutionToolDescription', () => {
       enableToolOutputReferences: true,
     });
     expect(composed.includes(`${BashExecutionToolDescription}\n\n`)).toBe(true);
+  });
+
+  describe('stateful variant', () => {
+    it('selects the stateful description when statefulSessions is on', () => {
+      expect(
+        buildBashExecutionToolDescription({ statefulSessions: true })
+      ).toBe(StatefulBashExecutionToolDescription);
+    });
+
+    it('hedges: usually-persists but may-reset, and only /mnt/data is durable', () => {
+      const d = StatefulBashExecutionToolDescription;
+      expect(d).toContain('usually');
+      expect(d).toContain('may be reset');
+      expect(d).toContain('Only /mnt/data is durable');
+      /* filesystem-tier, not shell-variable-tier */
+      expect(d).toContain('do not rely on shell variables');
+    });
+
+    it('keeps the artifact-path guidance in both variants', () => {
+      expect(BashExecutionToolDescription).toContain(
+        CODE_ARTIFACT_PATH_GUIDANCE
+      );
+      expect(StatefulBashExecutionToolDescription).toContain(
+        CODE_ARTIFACT_PATH_GUIDANCE
+      );
+    });
+
+    it('still composes with the output-references guide', () => {
+      const composed = buildBashExecutionToolDescription({
+        statefulSessions: true,
+        enableToolOutputReferences: true,
+      });
+      expect(composed.startsWith(StatefulBashExecutionToolDescription)).toBe(
+        true
+      );
+      expect(composed).toContain(BashToolOutputReferencesGuide);
+    });
   });
 });

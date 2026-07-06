@@ -304,8 +304,15 @@ export function createBashProgrammaticToolCallingTool(
         Partial<t.ProgrammaticCache> & {
           session_id?: string;
           _injected_files?: t.CodeEnvFile[];
+          _runtime_session_hint?: string;
         };
-      const { toolMap, toolDefs, session_id, _injected_files } = toolCall;
+      const {
+        toolMap,
+        toolDefs,
+        session_id,
+        _injected_files,
+        _runtime_session_hint,
+      } = toolCall;
 
       if (toolMap == null || toolMap.size === 0) {
         throw new Error(
@@ -351,6 +358,15 @@ export function createBashProgrammaticToolCallingTool(
           );
         }
 
+        /* Stateful sessions: hint on the INITIAL request only (continuations
+         * bind via continuation_token). Wire-only in v1 — BashPTC keeps its
+         * stateless prompt. */
+        const runtimeSessionHint =
+          typeof _runtime_session_hint === 'string' &&
+          _runtime_session_hint !== ''
+            ? _runtime_session_hint
+            : undefined;
+
         let response = await makeRequest(
           EXEC_ENDPOINT,
           {
@@ -360,6 +376,9 @@ export function createBashProgrammaticToolCallingTool(
             session_id,
             timeout,
             ...(files && files.length > 0 ? { files } : {}),
+            ...(runtimeSessionHint != null
+              ? { runtime_session_hint: runtimeSessionHint }
+              : {}),
           },
           proxy,
           initParams.authHeaders

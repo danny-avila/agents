@@ -997,6 +997,20 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             );
           }
         }
+
+        /**
+         * Stateful runtime session hint — orthogonal to the transient
+         * exec-session above, and injected independently (a first call has a
+         * hint but no exec session yet). Explicit host hint wins; otherwise
+         * fall back to the conversation's thread_id.
+         */
+        const runtimeSessionHint = this.resolveRuntimeSessionHint(config);
+        if (runtimeSessionHint != null) {
+          invokeParams = {
+            ...invokeParams,
+            _runtime_session_hint: runtimeSessionHint,
+          };
+        }
       }
 
       /**
@@ -1783,6 +1797,26 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     );
   }
 
+  /**
+   * Resolves the stateful runtime session hint for the remote sandbox: only
+   * when `toolExecution.sandbox.statefulSessions` is on; explicit host hint
+   * else the conversation `thread_id`. Undefined disables the wire field.
+   */
+  private resolveRuntimeSessionHint(
+    config: RunnableConfig
+  ): string | undefined {
+    const sandbox = this.toolExecution?.sandbox;
+    if (sandbox?.statefulSessions !== true) {
+      return undefined;
+    }
+    const explicit = sandbox.runtimeSessionHint;
+    if (explicit != null && explicit !== '') {
+      return explicit;
+    }
+    const threadId = config.configurable?.thread_id as string | undefined;
+    return threadId != null && threadId !== '' ? threadId : undefined;
+  }
+
   private storeCodeSessionFromResults(
     results: t.ToolExecuteResult[],
     requestMap: Map<string, t.ToolCallRequest>
@@ -2492,12 +2526,18 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             entry.call.name === Constants.READ_FILE
               ? this.getCodeSessionContext()
               : undefined;
+          const runtimeSessionHint = this.participatesInCodeSession(
+            entry.call.name
+          )
+            ? this.resolveRuntimeSessionHint(config)
+            : undefined;
           return {
             id: entry.call.id,
             name: entry.call.name,
             args: entry.args,
             stepId: entry.stepId,
             codeSessionContext,
+            runtimeSessionHint,
           };
         }),
         usageCount: this.toolUsageCount,

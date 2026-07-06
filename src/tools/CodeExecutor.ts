@@ -149,6 +149,64 @@ Usage:
 - NEVER use this tool to execute malicious code.
 `.trim();
 
+/**
+ * Best-effort statefulness note. Deliberately hedged: warm reuse is an
+ * optimization, not a guarantee (the runtime may be reset on idle timeout,
+ * eviction, or the 8h VM lifetime), so the model must never depend on carried
+ * state for correctness and must persist anything durable to /mnt/data.
+ */
+export const STATEFUL_ENV_NOTE =
+  'Session state (best-effort): consecutive executions in this conversation usually share one runtime, so variables, imports, and in-memory data from earlier successful calls are typically still available. The runtime may be reset at any time, so treat carried-over state as an optimization, never a guarantee. Anything that must survive MUST be written to /mnt/data. If a NameError/ImportError signals lost state, re-run the needed setup and continue.';
+
+export const StatefulCodeExecutionToolDescription = `
+Runs code and returns stdout/stderr output from a session-based execution environment, similar to a long-running command-line session.
+
+${STATEFUL_ENV_NOTE}
+
+Usage:
+- No network access available.
+- Generated files are automatically delivered; **DO NOT** provide download links.
+- ${CODE_ARTIFACT_PATH_GUIDANCE}
+- NEVER use this tool to execute malicious code.
+`.trim();
+
+export function buildCodeExecutionToolDescription(opts?: {
+  statefulSessions?: boolean;
+}): string {
+  return opts?.statefulSessions === true
+    ? StatefulCodeExecutionToolDescription
+    : CodeExecutionToolDescription;
+}
+
+const STATELESS_CODE_PARAM_NOTE =
+  'The environment is stateless; variables and imports don\'t persist between executions.';
+const STATEFUL_CODE_PARAM_NOTE =
+  'Executions in this conversation usually share one runtime: variables and imports from prior successful calls are typically still defined, but the runtime may reset between calls. Rebuild state on NameError/ImportError; persist anything important to /mnt/data.';
+
+export function buildCodeExecutionToolSchema(opts?: {
+  statefulSessions?: boolean;
+}): typeof CodeExecutionToolSchema {
+  const note =
+    opts?.statefulSessions === true
+      ? STATEFUL_CODE_PARAM_NOTE
+      : STATELESS_CODE_PARAM_NOTE;
+  const codeDescription =
+    CodeExecutionToolSchema.properties.code.description.replace(
+      STATELESS_CODE_PARAM_NOTE,
+      note
+    );
+  return {
+    ...CodeExecutionToolSchema,
+    properties: {
+      ...CodeExecutionToolSchema.properties,
+      code: {
+        ...CodeExecutionToolSchema.properties.code,
+        description: codeDescription,
+      },
+    },
+  } as typeof CodeExecutionToolSchema;
+}
+
 export const CodeExecutionToolName = Constants.EXECUTE_CODE;
 
 export const CodeExecutionToolDefinition = {
@@ -162,7 +220,14 @@ function createCodeExecutionTool(
 ): DynamicStructuredTool {
   return tool(
     async (rawInput, config) => {
-      const { authHeaders, ...executionParams } = params ?? {};
+      /* `statefulSessions` is a prompt-only flag (drives the description);
+       * keep it out of the wire body. */
+      const {
+        authHeaders,
+        statefulSessions: _statefulSessions,
+        ...executionParams
+      } = params ?? {};
+      void _statefulSessions;
       const { lang, code, ...rest } = rawInput as {
         lang: SupportedLanguage;
         code: string;
@@ -173,10 +238,12 @@ function createCodeExecutionTool(
        * - session_id: associates with the previous run.
        * - _injected_files: File refs to pass directly (avoids /files endpoint race condition).
        */
-      const { session_id, _injected_files } = (config.toolCall ?? {}) as {
-        session_id?: string;
-        _injected_files?: t.CodeEnvFile[];
-      };
+      const { session_id, _injected_files, _runtime_session_hint } =
+        (config.toolCall ?? {}) as {
+          session_id?: string;
+          _injected_files?: t.CodeEnvFile[];
+          _runtime_session_hint?: string;
+        };
 
       const postData: Record<string, unknown> = {
         lang,
@@ -184,6 +251,16 @@ function createCodeExecutionTool(
         ...rest,
         ...executionParams,
       };
+
+      /* Stateful sessions: forward the hint so the Code API can route this
+       * execution to a warm per-session runtime. Additive — stateless
+       * servers ignore the unknown field. */
+      if (
+        typeof _runtime_session_hint === 'string' &&
+        _runtime_session_hint !== ''
+      ) {
+        postData.runtime_session_hint = _runtime_session_hint;
+      }
 
       /* File injection: `_injected_files` from ToolNode (set when host
        * primes a CodeSessionContext) or `params.files` from tool
@@ -242,12 +319,27 @@ function createCodeExecutionTool(
           code
         );
         const hasFiles = result.files != null && result.files.length > 0;
+        /* Echo the durable runtime session (stateful backends only) so hosts
+         * can surface a "session active / was reset" signal later. Additive:
+         * absent on stateless servers. */
+        const runtimeEcho =
+          result.runtime_session_id != null
+            ? {
+              runtime_session_id: result.runtime_session_id,
+              runtime_status: result.runtime_status,
+            }
+            : {};
         return [
           appendCodeSessionFileSummary(outputWithReminder, result.files),
           (hasFiles
-            ? { session_id: result.session_id, files: result.files }
+            ? {
+              session_id: result.session_id,
+              files: result.files,
+              ...runtimeEcho,
+            }
             : {
               session_id: result.session_id,
+              ...runtimeEcho,
             }) satisfies t.CodeExecutionArtifact,
         ];
       } catch (error) {
@@ -260,8 +352,8 @@ function createCodeExecutionTool(
     },
     {
       name: CodeExecutionToolName,
-      description: CodeExecutionToolDescription,
-      schema: CodeExecutionToolSchema,
+      description: buildCodeExecutionToolDescription(params ?? undefined),
+      schema: buildCodeExecutionToolSchema(params ?? undefined),
       responseFormat: Constants.CONTENT_AND_ARTIFACT,
     }
   );
