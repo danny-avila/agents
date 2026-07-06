@@ -1140,7 +1140,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   getToolCount(): number {
     const context = this.agentContexts.get(this.defaultAgentId);
     return (
-      (context?.tools?.length ?? 0) + (context?.toolDefinitions?.length ?? 0)
+      (context?.tools?.length ?? 0) +
+      (context?.toolDefinitions?.length ?? 0) +
+      /**
+       * Graph-managed + host-supplied direct tools (handoff, subagent,
+       * `AgentInputs.graphTools`) are bound to the model and token-accounted,
+       * so a count that omits them under-reports the run's tool surface
+       * (Codex #289 P3).
+       */
+      (context?.graphTools?.length ?? 0)
     );
   }
 

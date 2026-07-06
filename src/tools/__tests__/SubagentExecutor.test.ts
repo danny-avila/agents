@@ -292,7 +292,7 @@ describe('buildChildInputs', () => {
     expect(result.toolDefinitions).toBeUndefined();
   });
 
-  it('strips host-supplied graphTools (children compile without a checkpointer, so interrupt-capable direct tools cannot work there)', () => {
+  it('scrubs INHERITED graphTools on self-spawn (parent-spread config) but keeps an explicit child config’s own', () => {
     const askLikeTool = { name: 'ask_user_question' } as unknown as NonNullable<
       AgentInputs['graphTools']
     >[number];
@@ -300,20 +300,39 @@ describe('buildChildInputs', () => {
       ...parentAgentInputs,
       graphTools: [askLikeTool],
     };
-    const config: ResolvedSubagentConfig = {
+
+    /**
+     * Self-spawn: `resolveSubagentConfigs` fills `agentInputs` as a shallow
+     * spread of the parent's `_sourceInputs`, so the parent-scoped direct
+     * tool would leak into a checkpointer-less child graph and fail with
+     * `No checkpointer set` — must be scrubbed.
+     */
+    const selfConfig: ResolvedSubagentConfig = {
+      type: 'self',
+      name: 'Self',
+      description: 'd',
+      self: true,
+      agentInputs: { ...inputsWithGraphTools },
+    };
+    expect(
+      buildChildInputs(selfConfig, 'child-self', 3).graphTools
+    ).toBeUndefined();
+
+    /**
+     * Explicit child config: a host that deliberately attaches its own
+     * in-process direct tools to a child keeps them (Codex #289 P2 —
+     * interrupt-capable tools still fail in children, but non-interrupting
+     * direct tools are legitimate there).
+     */
+    const explicitConfig: ResolvedSubagentConfig = {
       type: 'researcher',
       name: 'R',
       description: 'd',
       agentInputs: inputsWithGraphTools,
     };
-    const result = buildChildInputs(config, 'child', 3);
-    /**
-     * Covers the self-spawn shape too: its config resolves `agentInputs`
-     * from the parent's `_sourceInputs` via shallow spread, so without this
-     * clear the child would inherit the direct tool and deterministically
-     * fail with `No checkpointer set` on first use.
-     */
-    expect(result.graphTools).toBeUndefined();
+    expect(
+      buildChildInputs(explicitConfig, 'child-explicit', 3).graphTools
+    ).toEqual([askLikeTool]);
     expect(inputsWithGraphTools.graphTools).toHaveLength(1); // parent untouched
   });
 

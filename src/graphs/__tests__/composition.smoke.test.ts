@@ -73,6 +73,28 @@ const expectCompiledWorkflow = (
 };
 
 describe('LangGraph composition smoke tests', () => {
+  it('getToolCount includes direct graph tools (host-supplied graphTools) alongside instances and definitions', () => {
+    const askLikeTool = { name: 'ask_user_question' } as unknown as NonNullable<
+      t.AgentInputs['graphTools']
+    >[number];
+    const graph = new StandardGraph({
+      runId: 'toolcount-smoke',
+      agents: [
+        {
+          ...makeAgent('agent'),
+          toolDefinitions: [
+            { name: 'evt1', description: 'event tool one' },
+            { name: 'evt2', description: 'event tool two' },
+          ],
+          graphTools: [askLikeTool],
+        },
+      ],
+    });
+    // 2 schema-only event tools + 1 in-process direct tool — all bound to the
+    // model and token-accounted, so all must be counted (Codex #289 P3).
+    expect(graph.getToolCount()).toBe(3);
+  });
+
   it('clears run-scoped eager tool state on reset', () => {
     const graph = new StandardGraph({
       runId: 'standard-eager-reset',

@@ -619,11 +619,19 @@ export interface AgentInputs {
    * raise a LangGraph `interrupt()` (e.g. a tool built on `askUserQuestion()`) —
    * the host-side event handler runs outside the graph task, where `interrupt()`
    * throws. Do NOT also list these tools in `toolDefinitions` (they would be bound
-   * twice). NOT inherited by subagent child graphs: children compile without a
-   * checkpointer, so an interrupt-capable tool could never pause there —
-   * `buildChildInputs` clears this field along with the other parent-scoped state.
+   * twice). NOT inherited by SELF-SPAWNED subagent children (their config is a
+   * shallow spread of the parent's inputs, and child graphs compile without a
+   * checkpointer, so an interrupt-capable tool could never pause there) —
+   * `buildChildInputs` scrubs the inherited copy; an EXPLICIT child config that
+   * lists its own `graphTools` keeps them.
+   *
+   * Deliberately `GenericTool[]`, not `GraphTools`: the wider union admits
+   * schema-only shapes (OpenAI `BindToolsInput`, Google tool objects) that
+   * `initializeTools` cannot register in the ToolNode direct map — the model
+   * would bind a tool the SDK advertised as in-process but cannot execute.
+   * Every entry must be a real executable tool instance with a `name`.
    */
-  graphTools?: GraphTools;
+  graphTools?: GenericTool[];
 }
 
 export interface ContextPruningConfig {
