@@ -181,10 +181,19 @@ function createBashExecutionTool(
         ...executionParams
       } = params ?? {};
       void _statefulSessions;
-      const { command, ...rest } = rawInput as {
+      /* Drop any model-supplied `runtime_session_hint` from the raw args: the
+       * hint must only come from ToolNode's injected `_runtime_session_hint`
+       * (below), never from the tool call itself. */
+      const {
+        command,
+        runtime_session_hint: _ignoredModelHint,
+        ...rest
+      } = rawInput as {
         command: string;
+        runtime_session_hint?: unknown;
         args?: string[];
       };
+      void _ignoredModelHint;
       const { session_id, _injected_files, _runtime_session_hint } =
         (config.toolCall ?? {}) as {
           session_id?: string;

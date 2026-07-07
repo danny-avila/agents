@@ -228,11 +228,23 @@ function createCodeExecutionTool(
         ...executionParams
       } = params ?? {};
       void _statefulSessions;
-      const { lang, code, ...rest } = rawInput as {
+      /* Drop any model-supplied `runtime_session_hint` from the raw args: the
+       * hint is host-controlled and must only ever come from ToolNode's
+       * injected `_runtime_session_hint` (below). Spreading `...rest` into
+       * postData would otherwise let a tool call opt itself into / pick a
+       * stateful runtime even when statefulSessions is off. */
+      const {
+        lang,
+        code,
+        runtime_session_hint: _ignoredModelHint,
+        ...rest
+      } = rawInput as {
         lang: SupportedLanguage;
         code: string;
+        runtime_session_hint?: unknown;
         args?: string[];
       };
+      void _ignoredModelHint;
       /**
        * Extract session context from config.toolCall (injected by ToolNode).
        * - session_id: associates with the previous run.

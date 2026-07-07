@@ -1179,13 +1179,11 @@ export type ProgrammaticToolCallingParams = {
   debug?: boolean;
   /** Optional host-supplied Code API auth headers. */
   authHeaders?: CodeApiAuthHeaders;
-  /**
-   * Send the runtime session hint on the initial /exec/programmatic request
-   * for stateful sessions. PTC keeps its stateless prompt in v1 — the wire
-   * hint plumbs through, but the "each call is a fresh interpreter" wording
-   * is intentionally unchanged until server-side session behavior is proven.
-   */
-  statefulSessions?: boolean;
+  /* No `statefulSessions` here: PTC is stateless in v1. The initial
+   * /exec/programmatic request still forwards a ToolNode-injected
+   * `_runtime_session_hint` when present, but there is no factory-level opt-in
+   * to advertise (it would be a no-op). Re-add with real behavior when PTC
+   * stateful prompting lands. */
 };
 
 // ============================================================================

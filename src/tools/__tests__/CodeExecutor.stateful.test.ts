@@ -90,4 +90,24 @@ describe('CodeExecutor runtime_session_hint wire field', () => {
     const calls = await run({}, { statefulSessions: true });
     expect('statefulSessions' in calls[0]).toBe(false);
   });
+
+  it('strips a model-supplied runtime_session_hint from the raw args', async () => {
+    const codeTool = createCodeExecutionTool({});
+    await codeTool.invoke(
+      { lang: 'py', code: 'print(1)', runtime_session_hint: 'model-picked' },
+      { toolCall: {} } as unknown as RunnableConfig
+    );
+    expect('runtime_session_hint' in fetchCalls[0]).toBe(false);
+  });
+
+  it('lets only the ToolNode-injected hint reach the wire, ignoring model args', async () => {
+    const codeTool = createCodeExecutionTool({});
+    await codeTool.invoke(
+      { lang: 'py', code: 'print(1)', runtime_session_hint: 'model-picked' },
+      {
+        toolCall: { _runtime_session_hint: 'host-conv' },
+      } as unknown as RunnableConfig
+    );
+    expect(fetchCalls[0].runtime_session_hint).toBe('host-conv');
+  });
 });

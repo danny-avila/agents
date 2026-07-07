@@ -23,7 +23,6 @@ import {
 } from '@/common';
 import {
   buildToolExecutionRequestPlan,
-  resolveRuntimeSessionHint,
   coerceRecordArgs,
   normalizeError,
 } from '@/tools/eagerEventExecution';
@@ -143,7 +142,18 @@ function isEagerExecutionExcludedTool(
   // side-effecting: never prestart it speculatively (a revised/superseded turn
   // would leave the write applied). Implies exclusion without the host having
   // to also list the name in excludeToolNames.
-  return graph.codeSessionToolNames?.includes(name) === true;
+  if (graph.codeSessionToolNames?.includes(name) === true) {
+    return true;
+  }
+  // With stateful sessions on, execute_code/bash run against a DURABLE warm
+  // runtime. Speculative prestart there is unsafe: if the model revises the
+  // args, ToolNode discards the eager result but the mutation has already
+  // landed in the session workspace, corrupting later runs. Stateless mode
+  // uses a throwaway VM per call, so eager prestart stays safe there.
+  return (
+    graph.toolExecution?.sandbox?.statefulSessions === true &&
+    CODE_EXECUTION_TOOLS.has(name)
+  );
 }
 
 function isDirectGraphTool(
@@ -669,7 +679,11 @@ function createEagerToolExecutionPlan(args: {
     return undefined;
   }
 
-  const threadId = graph.config?.configurable?.thread_id as string | undefined;
+  /* No runtimeSessionHint here on purpose: the eager path is speculative, and
+   * code-session tools (the only ones that carry a hint) are excluded from
+   * eager prestart entirely when stateful sessions are on — see
+   * isEagerExecutionExcludedTool. The durable runtime is only ever touched by
+   * the committed ToolNode path. */
   const plan = buildToolExecutionRequestPlan({
     toolCalls: candidateToolCalls.map((toolCall) => ({
       id: toolCall.id,
@@ -677,13 +691,6 @@ function createEagerToolExecutionPlan(args: {
       args: toolCall.args,
       stepId: graph.toolCallStepIds.get(toolCall.id!) ?? '',
       codeSessionContext: getCodeSessionContext(graph, toolCall.name),
-      /* Same gate as ToolNode.participatesInCodeSession: code-execution tools
-       * (+ host tools sharing the session), not skill/read_file. */
-      runtimeSessionHint:
-        CODE_EXECUTION_TOOLS.has(toolCall.name) ||
-        graph.codeSessionToolNames?.includes(toolCall.name) === true
-          ? resolveRuntimeSessionHint(graph.toolExecution, threadId)
-          : undefined,
     })),
     usageCount: graph.getEagerEventToolUsageCount(agentContext?.agentId),
   });
