@@ -1403,7 +1403,7 @@ export class Run<_T extends t.BaseGraphState> {
         inputText,
         skipLanguage,
       }),
-    }).withConfig({ runName: 'ConvoTransform' });
+    }).withConfig({ runName: 'PrepareTitleInput' });
 
     const titleChain =
       titleMethod === TitleMethod.COMPLETION
@@ -1412,10 +1412,10 @@ export class Run<_T extends t.BaseGraphState> {
 
     /** Pipes `convoTemplate` -> `transformer` -> `titleChain` */
     const fullChain = convoTemplate
-      .withConfig({ runName: 'ConvoTemplate' })
+      .withConfig({ runName: 'FormatConversation' })
       .pipe(convoToTitleInput)
       .pipe(titleChain)
-      .withConfig({ runName: 'TitleChain' });
+      .withConfig({ runName: 'GenerateConversationTitle' });
 
     const invokeConfig = Object.assign({}, chainOptions, {
       run_id: this.id,

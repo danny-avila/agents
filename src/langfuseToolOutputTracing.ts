@@ -16,6 +16,10 @@ import {
   resolveLangfuseConfig,
   resolveToolOutputTracingConfig,
 } from '@/langfuseConfig';
+import {
+  shapeLangfuseSpan,
+  shouldDropLangfuseSpan,
+} from '@/langfuseTraceShaping';
 import { resolveToolOutputTracingConfigForSpan } from '@/langfuseRuntimeScope';
 
 export { LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT, resolveLangfuseConfig };
@@ -407,6 +411,9 @@ class ToolOutputRedactingLangfuseSpanProcessor implements SpanProcessor {
   }
 
   onStart(span: Span, parentContext: Context): void {
+    if (shouldDropLangfuseSpan(span.name)) {
+      return;
+    }
     const config =
       resolveToolOutputTracingConfigForSpan(parentContext) ??
       this.fallbackConfig;
@@ -417,7 +424,11 @@ class ToolOutputRedactingLangfuseSpanProcessor implements SpanProcessor {
   }
 
   onEnd(span: ReadableSpan): void {
+    if (shouldDropLangfuseSpan(span.name)) {
+      return;
+    }
     classifyLangfuseToolNodeSpan(span);
+    shapeLangfuseSpan(span);
     const config = this.spanConfigs.get(span) ?? this.fallbackConfig;
     if (config != null) {
       redactLangfuseSpanToolOutputs(span, config);

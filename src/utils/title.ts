@@ -53,7 +53,7 @@ export const createTitleRunnable = async (
 
   const titlePrompt = ChatPromptTemplate.fromTemplate(
     _titlePrompt ?? defaultTitlePrompt
-  ).withConfig({ runName: 'TitlePrompt' });
+  ).withConfig({ runName: 'BuildTitlePrompt' });
 
   const titleOnlyInnerChain = RunnableSequence.from([titlePrompt, titleLLM]);
   const combinedInnerChain = RunnableSequence.from([titlePrompt, combinedLLM]);
@@ -67,7 +67,7 @@ export const createTitleRunnable = async (
       const result = await titleOnlyInnerChain.invoke(input, config);
       return result as { title: string };
     },
-  }).withConfig({ runName: 'TitleOnlyChain' });
+  }).withConfig({ runName: 'GenerateTitleOnly' });
 
   /** Wrap combinedChain in RunnableLambda to create parent span */
   const combinedChain = new RunnableLambda({
@@ -78,7 +78,7 @@ export const createTitleRunnable = async (
       const result = await combinedInnerChain.invoke(input, config);
       return result as { language: string; title: string };
     },
-  }).withConfig({ runName: 'TitleLanguageChain' });
+  }).withConfig({ runName: 'GenerateTitleAndDetectLanguage' });
 
   /** Runnable to add default values if needed */
   const addDefaults = new RunnableLambda({
@@ -88,7 +88,7 @@ export const createTitleRunnable = async (
       language: result?.language ?? 'English',
       title: result?.title ?? '',
     }),
-  }).withConfig({ runName: 'AddDefaults' });
+  }).withConfig({ runName: 'ApplyTitleDefaults' });
 
   const combinedChainInner = RunnableSequence.from([
     combinedChain,
@@ -103,7 +103,7 @@ export const createTitleRunnable = async (
     ): Promise<{ language: string; title: string }> => {
       return await combinedChainInner.invoke(input, config);
     },
-  }).withConfig({ runName: 'CombinedChainWithDefaults' });
+  }).withConfig({ runName: 'GenerateTitleAndDetectLanguageWithDefaults' });
 
   return new RunnableLambda({
     func: async (
@@ -124,7 +124,7 @@ export const createTitleRunnable = async (
 
       return await combinedChainWithDefaults.invoke(invokeInput, config);
     },
-  }).withConfig({ runName: 'TitleGenerator' });
+  }).withConfig({ runName: 'GenerateTitle' });
 };
 
 const defaultCompletionPrompt = `Provide a concise, 5-word-or-less title for the conversation, using title case conventions. Only return the title itself.
@@ -138,7 +138,7 @@ export const createCompletionTitleRunnable = async (
 ): Promise<Runnable> => {
   const completionPrompt = ChatPromptTemplate.fromTemplate(
     titlePrompt ?? defaultCompletionPrompt
-  ).withConfig({ runName: 'CompletionTitlePrompt' });
+  ).withConfig({ runName: 'BuildTitlePrompt' });
 
   /** Runnable to extract content from model response */
   const extractContent = new RunnableLambda({
@@ -157,7 +157,7 @@ export const createCompletionTitleRunnable = async (
       }
       return { title: content.trim() };
     },
-  }).withConfig({ runName: 'ExtractTitle' });
+  }).withConfig({ runName: 'ParseTitleFromResponse' });
 
   const innerChain = RunnableSequence.from([
     completionPrompt,
@@ -173,5 +173,5 @@ export const createCompletionTitleRunnable = async (
     ): Promise<{ title: string }> => {
       return await innerChain.invoke(input, config);
     },
-  }).withConfig({ runName: 'CompletionTitleChain' });
+  }).withConfig({ runName: 'GenerateTitle' });
 };
