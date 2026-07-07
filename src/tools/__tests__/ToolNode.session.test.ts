@@ -1263,4 +1263,90 @@ describe('ToolNode code execution session management', () => {
       );
     });
   });
+
+  describe('stateful runtime session hint injection', () => {
+    it('injects the explicit runtimeSessionHint when statefulSessions is on', async () => {
+      const capturedConfigs: Record<string, unknown>[] = [];
+      const mockTool = createMockCodeTool({ capturedConfigs });
+      const toolNode = new ToolNode({
+        tools: [mockTool],
+        sessions: new Map(),
+        toolExecution: {
+          engine: 'sandbox',
+          sandbox: {
+            statefulSessions: true,
+            runtimeSessionHint: 'conv-explicit',
+          },
+        },
+      });
+
+      await toolNode.invoke({ messages: [createAIMessageWithCodeCall('c1')] });
+
+      expect(capturedConfigs[0]._runtime_session_hint).toBe('conv-explicit');
+    });
+
+    it('falls back to configurable.thread_id when no explicit hint is given', async () => {
+      const capturedConfigs: Record<string, unknown>[] = [];
+      const mockTool = createMockCodeTool({ capturedConfigs });
+      const toolNode = new ToolNode({
+        tools: [mockTool],
+        sessions: new Map(),
+        toolExecution: {
+          engine: 'sandbox',
+          sandbox: { statefulSessions: true },
+        },
+      });
+
+      await toolNode.invoke(
+        { messages: [createAIMessageWithCodeCall('c1')] },
+        { configurable: { thread_id: 'thread-abc' } }
+      );
+
+      expect(capturedConfigs[0]._runtime_session_hint).toBe('thread-abc');
+    });
+
+    it('does not inject a hint when statefulSessions is off', async () => {
+      const capturedConfigs: Record<string, unknown>[] = [];
+      const mockTool = createMockCodeTool({ capturedConfigs });
+      const toolNode = new ToolNode({
+        tools: [mockTool],
+        sessions: new Map(),
+        toolExecution: {
+          engine: 'sandbox',
+          sandbox: { statefulSessions: false },
+        },
+      });
+
+      await toolNode.invoke(
+        { messages: [createAIMessageWithCodeCall('c1')] },
+        { configurable: { thread_id: 'thread-abc' } }
+      );
+
+      expect(capturedConfigs[0]._runtime_session_hint).toBeUndefined();
+    });
+
+    it('injects the hint independently of an existing exec session', async () => {
+      const capturedConfigs: Record<string, unknown>[] = [];
+      const sessions: t.ToolSessionMap = new Map();
+      sessions.set(Constants.EXECUTE_CODE, {
+        session_id: 'exec-1',
+        files: [],
+        lastUpdated: 0,
+      });
+      const mockTool = createMockCodeTool({ capturedConfigs });
+      const toolNode = new ToolNode({
+        tools: [mockTool],
+        sessions,
+        toolExecution: {
+          engine: 'sandbox',
+          sandbox: { statefulSessions: true, runtimeSessionHint: 'conv-1' },
+        },
+      });
+
+      await toolNode.invoke({ messages: [createAIMessageWithCodeCall('c1')] });
+
+      expect(capturedConfigs[0].session_id).toBe('exec-1');
+      expect(capturedConfigs[0]._runtime_session_hint).toBe('conv-1');
+    });
+  });
 });

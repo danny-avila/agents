@@ -38,6 +38,11 @@ import type {
 } from '@/hooks';
 import type * as t from '@/types';
 import {
+  buildToolExecutionRequestPlan,
+  resolveRuntimeSessionHint,
+  recordArgsEqual,
+} from '@/tools/eagerEventExecution';
+import {
   resolveLangfuseRuntimeScope,
   withLangfuseRuntimeScope,
 } from '@/langfuseRuntimeScope';
@@ -45,10 +50,6 @@ import {
   buildReferenceKey,
   ToolOutputReferenceRegistry,
 } from '@/tools/toolOutputReferences';
-import {
-  buildToolExecutionRequestPlan,
-  recordArgsEqual,
-} from '@/tools/eagerEventExecution';
 import {
   calculateMaxToolResultChars,
   truncateToolResultContent,
@@ -997,6 +998,20 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             );
           }
         }
+
+        /**
+         * Stateful runtime session hint — orthogonal to the transient
+         * exec-session above, and injected independently (a first call has a
+         * hint but no exec session yet). Explicit host hint wins; otherwise
+         * fall back to the conversation's thread_id.
+         */
+        const runtimeSessionHint = this.resolveRuntimeSessionHint(config);
+        if (runtimeSessionHint != null) {
+          invokeParams = {
+            ...invokeParams,
+            _runtime_session_hint: runtimeSessionHint,
+          };
+        }
       }
 
       /**
@@ -1783,6 +1798,17 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     );
   }
 
+  /** Delegates to the shared resolver so the direct and event-driven planning
+   *  paths derive the runtime session hint identically. */
+  private resolveRuntimeSessionHint(
+    config: RunnableConfig
+  ): string | undefined {
+    return resolveRuntimeSessionHint(
+      this.toolExecution,
+      config.configurable?.thread_id as string | undefined
+    );
+  }
+
   private storeCodeSessionFromResults(
     results: t.ToolExecuteResult[],
     requestMap: Map<string, t.ToolCallRequest>
@@ -2492,12 +2518,18 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             entry.call.name === Constants.READ_FILE
               ? this.getCodeSessionContext()
               : undefined;
+          const runtimeSessionHint = this.participatesInCodeSession(
+            entry.call.name
+          )
+            ? this.resolveRuntimeSessionHint(config)
+            : undefined;
           return {
             id: entry.call.id,
             name: entry.call.name,
             args: entry.args,
             stepId: entry.stepId,
             codeSessionContext,
+            runtimeSessionHint,
           };
         }),
         usageCount: this.toolUsageCount,
