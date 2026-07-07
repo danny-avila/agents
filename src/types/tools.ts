@@ -295,7 +295,10 @@ export type CodeExecutionToolParams =
       /**
        * Advertise best-effort stateful sessions in the tool description
        * (variables/files may persist between calls, may reset). Prompt text
-       * only; the wire hint is gated by `toolExecution.sandbox`.
+       * only, and it must be set here because the description is bound to the
+       * LLM at construction time. Pair it with the run-scoped
+       * `toolExecution.sandbox.statefulSessions` gate, which drives the wire
+       * hint — set both from one flag so the prompt and the backend agree.
        */
       statefulSessions?: boolean;
     };
@@ -991,9 +994,18 @@ export type CloudflareSandboxExecutionConfig = {
 export type SandboxExecutionConfig = {
   /**
    * Opt into best-effort stateful runtime sessions on the remote Code API
-   * (its warm per-session MicroVM backend). The transport is unchanged — this
-   * only sends a stable session hint and, paired with the `statefulSessions`
-   * tool factory param, adjusts the model-facing description.
+   * (its warm per-session MicroVM backend). This gate is run-scoped: it only
+   * controls the wire behavior (ToolNode injecting the session hint on
+   * execute_code/bash calls). The transport is otherwise unchanged.
+   *
+   * It does NOT change the model-facing tool description. Tool descriptions are
+   * bound to the LLM at construction time (`createCodeExecutionTool` /
+   * `createBashExecutionTool`), before this run config is applied inside the
+   * graph, so they can only be adjusted via the tools' own `statefulSessions`
+   * factory param. Set BOTH from one flag (as LibreChat does): with this on but
+   * the factory param off, the backend runs statefully while the model is still
+   * told the environment is stateless (non-corrupting — the model just won't
+   * exploit persistence).
    */
   statefulSessions?: boolean;
   /**
