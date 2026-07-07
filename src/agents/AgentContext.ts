@@ -85,6 +85,7 @@ export class AgentContext {
       toolSchemaTokens,
       subagentConfigs,
       maxSubagentDepth,
+      graphTools,
     } = agentConfig;
 
     const agentContext = new AgentContext({
@@ -116,6 +117,14 @@ export class AgentContext {
     agentContext._sourceInputs = agentConfig;
     agentContext.subagentConfigs = subagentConfigs;
     agentContext.maxSubagentDepth = maxSubagentDepth;
+    /**
+     * Host-supplied direct tools (see `AgentInputs.graphTools`). Copied — never
+     * aliased — because the SDK later pushes graph-managed tools (handoff /
+     * subagent) into this same array and must not mutate the host's input.
+     */
+    if (graphTools && graphTools.length > 0) {
+      agentContext.graphTools = [...graphTools];
+    }
 
     if (initialSummary?.text != null && initialSummary.text !== '') {
       agentContext.setInitialSummary(

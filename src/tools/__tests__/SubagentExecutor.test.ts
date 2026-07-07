@@ -292,6 +292,50 @@ describe('buildChildInputs', () => {
     expect(result.toolDefinitions).toBeUndefined();
   });
 
+  it('scrubs INHERITED graphTools on self-spawn (parent-spread config) but keeps an explicit child config’s own', () => {
+    const askLikeTool = { name: 'ask_user_question' } as unknown as NonNullable<
+      AgentInputs['graphTools']
+    >[number];
+    const inputsWithGraphTools: AgentInputs = {
+      ...parentAgentInputs,
+      graphTools: [askLikeTool],
+    };
+
+    /**
+     * Self-spawn: `resolveSubagentConfigs` fills `agentInputs` as a shallow
+     * spread of the parent's `_sourceInputs`, so the parent-scoped direct
+     * tool would leak into a checkpointer-less child graph and fail with
+     * `No checkpointer set` — must be scrubbed.
+     */
+    const selfConfig: ResolvedSubagentConfig = {
+      type: 'self',
+      name: 'Self',
+      description: 'd',
+      self: true,
+      agentInputs: { ...inputsWithGraphTools },
+    };
+    expect(
+      buildChildInputs(selfConfig, 'child-self', 3).graphTools
+    ).toBeUndefined();
+
+    /**
+     * Explicit child config: a host that deliberately attaches its own
+     * in-process direct tools to a child keeps them (Codex #289 P2 —
+     * interrupt-capable tools still fail in children, but non-interrupting
+     * direct tools are legitimate there).
+     */
+    const explicitConfig: ResolvedSubagentConfig = {
+      type: 'researcher',
+      name: 'R',
+      description: 'd',
+      agentInputs: inputsWithGraphTools,
+    };
+    expect(
+      buildChildInputs(explicitConfig, 'child-explicit', 3).graphTools
+    ).toEqual([askLikeTool]);
+    expect(inputsWithGraphTools.graphTools).toHaveLength(1); // parent untouched
+  });
+
   it('strips parent-run-scoped initialSummary and discoveredTools from child inputs', () => {
     /**
      * Codex P1: a child inheriting `initialSummary` or `discoveredTools` from

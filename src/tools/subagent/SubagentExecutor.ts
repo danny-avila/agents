@@ -1422,6 +1422,17 @@ export function buildChildInputs(
      */
     initialSummary: undefined,
     discoveredTools: undefined,
+    /**
+     * Host-supplied direct tools are scrubbed from INHERITED configs only.
+     * A self-spawn config's `agentInputs` is a shallow spread of the parent's
+     * `_sourceInputs`, so without this a parent-scoped graph tool (e.g. an
+     * interrupt-raising ask_user_question, which needs the parent's
+     * checkpointer — child graphs compile without one) would silently leak
+     * into the child and deterministically throw `No checkpointer set`. An
+     * EXPLICIT child config that lists its own `graphTools` is a deliberate
+     * host choice and keeps them (Codex #289 P2).
+     */
+    graphTools: config.self === true ? undefined : agentInputs.graphTools,
   };
 
   if (config.allowNested === true) {

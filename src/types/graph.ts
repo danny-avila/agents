@@ -610,6 +610,28 @@ export interface AgentInputs {
   subagentConfigs?: SubagentConfig[];
   /** Maximum subagent nesting depth. Default 1 means top-level agents can spawn subagents but subagents cannot nest further. */
   maxSubagentDepth?: number;
+  /**
+   * Host-supplied tool instances that must execute IN-PROCESS inside the graph's
+   * ToolNode even when the run is event-driven (`toolDefinitions` non-empty). Each
+   * instance is bound to the model alongside the schema-only event tools and its
+   * name is marked direct, so calls bypass ON_TOOL_EXECUTE dispatch and run inside
+   * the Pregel task frame. This is the only execution mode where a tool body may
+   * raise a LangGraph `interrupt()` (e.g. a tool built on `askUserQuestion()`) —
+   * the host-side event handler runs outside the graph task, where `interrupt()`
+   * throws. Do NOT also list these tools in `toolDefinitions` (they would be bound
+   * twice). NOT inherited by SELF-SPAWNED subagent children (their config is a
+   * shallow spread of the parent's inputs, and child graphs compile without a
+   * checkpointer, so an interrupt-capable tool could never pause there) —
+   * `buildChildInputs` scrubs the inherited copy; an EXPLICIT child config that
+   * lists its own `graphTools` keeps them.
+   *
+   * Deliberately `GenericTool[]`, not `GraphTools`: the wider union admits
+   * schema-only shapes (OpenAI `BindToolsInput`, Google tool objects) that
+   * `initializeTools` cannot register in the ToolNode direct map — the model
+   * would bind a tool the SDK advertised as in-process but cannot execute.
+   * Every entry must be a real executable tool instance with a `name`.
+   */
+  graphTools?: GenericTool[];
 }
 
 export interface ContextPruningConfig {

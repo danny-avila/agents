@@ -42,6 +42,46 @@ describe('AgentContext', () => {
       schema: { type: 'object', properties: {} },
     }) as unknown as t.GenericTool;
 
+  describe('fromConfig — host-supplied graphTools', () => {
+    it('copies graphTools onto the context without aliasing the host array', () => {
+      const askTool = createMockTool('ask_user_question');
+      const hostGraphTools = [askTool];
+      const ctx = createBasicContext({
+        agentConfig: { graphTools: hostGraphTools },
+      });
+
+      expect(ctx.graphTools).toEqual([askTool]);
+      expect(ctx.graphTools).not.toBe(hostGraphTools);
+
+      /** The SDK pushes graph-managed tools (handoff/subagent) into this
+       *  array later — that must never mutate the host's input. */
+      (ctx.graphTools as t.GenericTool[]).push(createMockTool('subagent'));
+      expect(hostGraphTools).toHaveLength(1);
+    });
+
+    it('leaves graphTools undefined when the host supplies none (or an empty list)', () => {
+      expect(createBasicContext().graphTools).toBeUndefined();
+      expect(
+        createBasicContext({ agentConfig: { graphTools: [] } }).graphTools
+      ).toBeUndefined();
+    });
+
+    it('binds host graphTools to the model in event-driven mode', () => {
+      const askTool = createMockTool('ask_user_question');
+      const ctx = createBasicContext({
+        agentConfig: {
+          graphTools: [askTool],
+          toolDefinitions: [{ name: 'echo', description: 'host event tool' }],
+        },
+      });
+
+      const bound = ctx.getToolsForBinding() ?? [];
+      const names = (bound as Array<{ name?: string }>).map((t) => t.name);
+      expect(names).toContain('ask_user_question');
+      expect(names).toContain('echo');
+    });
+  });
+
   describe('System Runnable - Lazy Creation', () => {
     it('creates system runnable on first access', () => {
       const ctx = createBasicContext({

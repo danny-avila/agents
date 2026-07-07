@@ -3996,6 +3996,91 @@ describe('AskUserQuestion — interrupt + resume', () => {
     expect(resumedAnswer).toBe('production');
   });
 
+  it('a DIRECT tool in event-driven mode can raise ask_user_question from its body and resume with the answer as its ToolMessage', async () => {
+    /**
+     * The production host shape (e.g. LibreChat's `AgentInputs.graphTools`
+     * plumb): the run is event-driven (other tools are schema-only
+     * definitions dispatched to the host), but an interrupt-capable tool is
+     * supplied as a real instance and marked direct so it executes inside
+     * the Pregel task frame. Event dispatch must never see the call — a
+     * host-side handler runs outside the graph, where `interrupt()` throws.
+     */
+    const { askUserQuestion } = await import('@/hitl');
+
+    const dispatchSpy = jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async () => {});
+
+    let bodyRuns = 0;
+    const askTool = tool(
+      async (input: { question: string }) => {
+        bodyRuns += 1;
+        const resolution = askUserQuestion(input);
+        return resolution.answer;
+      },
+      {
+        name: 'ask_user_question',
+        description: 'Ask the user a clarifying question.',
+        schema: z.object({ question: z.string() }),
+      }
+    ) as unknown as StructuredToolInterface;
+
+    const node = new ToolNode({
+      tools: [createSchemaStub('echo'), askTool],
+      toolMap: new Map([
+        ['echo', createSchemaStub('echo')],
+        ['ask_user_question', askTool],
+      ]),
+      eventDrivenMode: true,
+      agentId: 'agent-ask-direct',
+      toolCallStepIds: new Map([['call_ask_1', 'step_call_ask_1']]),
+      directToolNames: new Set(['ask_user_question']),
+    });
+
+    const graph = buildHITLGraph(node, [
+      {
+        id: 'call_ask_1',
+        name: 'ask_user_question',
+        args: { question: 'Which environment?' },
+      },
+    ]);
+    const config = { configurable: { thread_id: 'thread-ask-direct' } };
+
+    const interrupted = await graph.invoke({ messages: [] }, config);
+    expect(isInterrupted<t.HumanInterruptPayload>(interrupted)).toBe(true);
+    if (!isInterrupted<t.HumanInterruptPayload>(interrupted)) {
+      throw new Error('expected interrupt');
+    }
+    const payload = interrupted.__interrupt__[0].value!;
+    if (payload.type !== 'ask_user_question') {
+      throw new Error('expected ask_user_question payload');
+    }
+    expect(payload.question.question).toBe('Which environment?');
+    expect(bodyRuns).toBe(1);
+
+    /** The interrupt came from the direct path — never dispatched to the host. */
+    const toolExecuteDispatches = dispatchSpy.mock.calls.filter(
+      ([event]) => event === 'on_tool_execute'
+    );
+    expect(toolExecuteDispatches).toHaveLength(0);
+
+    const resumed = (await resumeGraph(
+      graph,
+      interrupted,
+      { answer: 'staging' } satisfies t.AskUserQuestionResolution,
+      config
+    )) as MessagesUpdate;
+
+    expect(bodyRuns).toBe(2); // body re-runs from the top on the resume pass
+    const toolMessage = resumed.messages.find(
+      (m): m is ToolMessage =>
+        m._getType() === 'tool' &&
+        (m as ToolMessage).tool_call_id === 'call_ask_1'
+    );
+    expect(toolMessage).toBeDefined();
+    expect(String(toolMessage!.content)).toBe('staging');
+  });
+
   it('isAskUserQuestionInterrupt narrows the payload union correctly', async () => {
     const { isAskUserQuestionInterrupt, isToolApprovalInterrupt } =
       await import('@/types/hitl');
