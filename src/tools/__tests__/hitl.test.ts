@@ -3996,6 +3996,54 @@ describe('AskUserQuestion — interrupt + resume', () => {
     expect(resumedAnswer).toBe('production');
   });
 
+  it('carries multiSelect through the interrupt payload and resumes with the joined option values', async () => {
+    const { askUserQuestion } = await import('@/hitl');
+
+    let resumedAnswer: string | undefined;
+
+    const builder = new StateGraph(MessagesAnnotation)
+      .addNode('clarifier', () => {
+        const resolution = askUserQuestion({
+          question: 'Which environments?',
+          options: [
+            { label: 'Staging', value: 'staging' },
+            { label: 'Production', value: 'production' },
+          ],
+          multiSelect: true,
+        });
+        resumedAnswer = resolution.answer;
+        return { messages: [] };
+      })
+      .addEdge(START, 'clarifier')
+      .addEdge('clarifier', END);
+    const graph = builder.compile({ checkpointer: new MemorySaver() });
+
+    const config = { configurable: { thread_id: 'ask-q-multi-thread' } };
+
+    const interrupted = (await graph.invoke({ messages: [] }, config)) as {
+      __interrupt__?: Array<{ id?: string; value?: t.HumanInterruptPayload }>;
+    };
+    const payload = interrupted.__interrupt__![0].value!;
+    if (payload.type !== 'ask_user_question') {
+      throw new Error('expected ask_user_question');
+    }
+    expect(payload.question.multiSelect).toBe(true);
+    expect(payload.question.options).toHaveLength(2);
+
+    // Host joins the selected option values with ", ".
+    const resolution: t.AskUserQuestionResolution = {
+      answer: 'staging, production',
+    };
+    await resumeGraph(
+      graph as unknown as CompiledMessagesGraph,
+      interrupted,
+      resolution,
+      config
+    );
+
+    expect(resumedAnswer).toBe('staging, production');
+  });
+
   it('a DIRECT tool in event-driven mode can raise ask_user_question from its body and resume with the answer as its ToolMessage', async () => {
     /**
      * The production host shape (e.g. LibreChat's `AgentInputs.graphTools`

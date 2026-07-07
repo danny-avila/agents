@@ -140,6 +140,13 @@ export interface AskUserQuestionRequest {
    * UI allows it. Omit to require a free-form answer.
    */
   options?: AskUserQuestionOption[];
+  /**
+   * When `true`, the host UI may let the user pick several options; the
+   * resulting `AskUserQuestionResolution.answer` is the selected option
+   * values joined by `", "`. When omitted or `false`, hosts render a
+   * single-select picker. Only meaningful alongside `options`.
+   */
+  multiSelect?: boolean;
 }
 
 /**
@@ -168,9 +175,10 @@ export type HumanInterruptPayload =
 export interface AskUserQuestionResolution {
   /**
    * The human's answer. Free-form text, or — when `options` were
-   * provided — one of the option `value`s. Hosts may also send any
-   * structured object their custom UI defines; see the host docs for
-   * what your downstream consumer expects.
+   * provided — one of the option `value`s (or, when the request set
+   * `multiSelect`, several option `value`s joined by `", "`). Hosts may
+   * also send any structured object their custom UI defines; see the
+   * host docs for what your downstream consumer expects.
    */
   answer: string;
 }
