@@ -38,11 +38,16 @@ const askTool = tool(
   }
 );
 
-const strictTool = tool(async ({ n }: { n: number }) => `got ${n}`, {
-  name: 'strict_tool',
-  description: 'A tool with a strict schema.',
-  schema: z.object({ n: z.number().max(1) }),
-});
+const strictTool = tool(
+  async ({ items }: { items: string[] }) => `got ${items.length}`,
+  {
+    name: 'strict_tool',
+    // Array cap mirrors the field repro: an ask_user_question sibling whose
+    // `options` array exceeded the 12-option schema cap.
+    description: 'A tool with a strict array-cap schema.',
+    schema: z.object({ items: z.array(z.string()).max(1) }),
+  }
+);
 
 describe('Direct tool schema error across interrupt/resume', () => {
   jest.setTimeout(30000);
@@ -119,7 +124,7 @@ describe('Direct tool schema error across interrupt/resume', () => {
         },
         {
           name: 'strict_tool',
-          args: { n: 5 },
+          args: { items: ['a', 'b', 'c'] },
           id: 'call_strict_1',
           type: 'tool_call',
         },
@@ -148,7 +153,11 @@ describe('Direct tool schema error across interrupt/resume', () => {
           e.output?.includes('Error processing tool') === true
       );
       expect(strictCompletions).toHaveLength(1);
-      expect(strictCompletions[0].output).toContain('at most 1');
+      // Stable LangChain wrapper text (version-independent), proving the
+      // completion carried the schema-validation failure.
+      expect(strictCompletions[0].output).toContain(
+        'did not match expected schema'
+      );
 
       /** Pass 2: fresh instance (host restart shape), resume with the
        *  answer. The batch re-executes; the strict tool fails again before
