@@ -3243,11 +3243,6 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   protected async run(input: any, config: RunnableConfig): Promise<T> {
     this.toolCallTurns.clear();
-    // Per-batch: a fresh run (including a resume re-execution) owns its own
-    // undispatched-error markers. Clearing here reclaims any left behind when a
-    // prior invocation interrupted before its completion loop ran, so a stale id
-    // can't survive to double-dispatch or accumulate across the node's lifetime.
-    this.undispatchedToolErrors.clear();
     /**
      * Per-batch local map for resolved (post-substitution) args.
      * Lives on the stack so concurrent `run()` calls on the same
