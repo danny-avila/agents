@@ -416,6 +416,13 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private agentLangfuse?: t.LangfuseConfig;
   toolCallStepIds?: Map<string, string>;
   errorHandler?: t.ToolNodeConstructorParams['errorHandler'];
+  /**
+   * Tool call ids whose `errorHandler` did NOT dispatch the error completion
+   * event (it returned `false` or threw). The output loop must dispatch the
+   * completion for these itself — skipping them there would strand the
+   * client's tool-call part without a terminal event.
+   */
+  private undispatchedToolErrors: Set<string> = new Set();
   private toolUsageCount: Map<string, number>;
   /** Maps toolCallId → turn captured in runTool, used by handleRunToolCompletions */
   private toolCallTurns: Map<string, number> = new Map();
@@ -1140,7 +1147,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       }
       if (this.errorHandler) {
         try {
-          await this.errorHandler(
+          const dispatched = await this.errorHandler(
             {
               error: e,
               id: call.id!,
@@ -1149,7 +1156,20 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             },
             config.metadata
           );
+          if (dispatched === false && call.id != null && call.id !== '') {
+            /**
+             * The handler could not dispatch the error completion (typically
+             * a resume pass, where a fast-failing tool errors before the
+             * step replay registers its run step). Remember the call so the
+             * output loop dispatches the completion itself instead of
+             * assuming the handler covered it.
+             */
+            this.undispatchedToolErrors.add(call.id);
+          }
         } catch (handlerError) {
+          if (call.id != null && call.id !== '') {
+            this.undispatchedToolErrors.add(call.id);
+          }
           // eslint-disable-next-line no-console
           console.error('Error in errorHandler:', {
             toolName: call.name,
@@ -1875,8 +1895,16 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       const toolCallId = call.id ?? '';
 
       // Skip error ToolMessages when errorHandler already dispatched ON_RUN_STEP_COMPLETED
-      // via handleToolCallErrorStatic. Without this check, errors would be double-dispatched.
-      if (toolMessage.status === 'error' && this.errorHandler != null) {
+      // via handleToolCallErrorStatic — dispatching again here would double-dispatch.
+      // When the handler reported it could NOT dispatch (no run step registered yet at
+      // error time, e.g. a fast-failing tool on a resume pass), fall through: by now the
+      // step replay has usually registered the id, so this loop's dispatch is the only
+      // terminal event the client's tool-call part will ever get.
+      if (
+        toolMessage.status === 'error' &&
+        this.errorHandler != null &&
+        !this.undispatchedToolErrors.has(toolCallId)
+      ) {
         continue;
       }
 

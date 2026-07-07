@@ -1281,7 +1281,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         maxToolResultChars: agentContext?.maxToolResultChars,
         toolOutputRegistry: this.getOrCreateToolOutputRegistry(),
         fileCheckpointer: this.getOrCreateFileCheckpointer(),
-        errorHandler: (data, metadata): Promise<void> =>
+        errorHandler: (data, metadata): Promise<boolean> =>
           StandardGraph.handleToolCallErrorStatic(this, data, metadata),
       });
       this.registerCompiledToolNode(node);
@@ -1330,7 +1330,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       // agent so hooks can attribute the batch even at the top level.
       executingAgentId: agentContext?.agentId,
       toolCallStepIds: this.toolCallStepIds,
-      errorHandler: (data, metadata): Promise<void> =>
+      errorHandler: (data, metadata): Promise<boolean> =>
         StandardGraph.handleToolCallErrorStatic(this, data, metadata),
       toolRegistry: agentContext?.toolRegistry,
       sessions: this.sessions,
@@ -2715,32 +2715,38 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
 
   /**
    * Static version of handleToolCallError to avoid creating strong references
-   * that prevent garbage collection
+   * that prevent garbage collection.
+   *
+   * Returns whether the error completion event was actually dispatched. A
+   * tool can error before this graph instance has a run step for the call —
+   * on a resume pass the interrupted batch re-executes IMMEDIATELY on graph
+   * re-entry, before any step replay has registered `toolCallStepIds` (a
+   * fast-failing tool, e.g. a schema-validation reject, loses that race).
+   * That is a caller-recoverable condition, not an invariant violation: the
+   * ToolNode falls back to its normal completion dispatch for the error
+   * ToolMessage when this returns `false`, so throwing here would only
+   * replace a recoverable miss with a lost completion event and a scary log.
    */
   static async handleToolCallErrorStatic(
     graph: StandardGraph,
     data: t.ToolErrorData,
     metadata?: Record<string, unknown>
-  ): Promise<void> {
-    if (!graph.config) {
-      throw new Error('No config provided');
-    }
-
+  ): Promise<boolean> {
     if (!data.id) {
       console.warn('No Tool ID provided for Tool Error');
-      return;
+      return false;
     }
 
     const stepId = graph.toolCallStepIds.get(data.id) ?? '';
     if (!stepId) {
-      throw new Error(`No stepId found for tool_call_id ${data.id}`);
+      return false;
     }
 
     const { name, input: args, error } = data;
 
     const runStep = graph.getRunStep(stepId);
     if (!runStep) {
-      throw new Error(`No run step found for stepId ${stepId}`);
+      return false;
     }
 
     const tool_call: t.ProcessedToolCall = {
@@ -2766,6 +2772,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         metadata,
         graph
       );
+    return true;
   }
 
   /**
@@ -2775,8 +2782,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   async handleToolCallError(
     data: t.ToolErrorData,
     metadata?: Record<string, unknown>
-  ): Promise<void> {
-    await StandardGraph.handleToolCallErrorStatic(this, data, metadata);
+  ): Promise<boolean> {
+    return StandardGraph.handleToolCallErrorStatic(this, data, metadata);
   }
 
   async dispatchRunStepDelta(
