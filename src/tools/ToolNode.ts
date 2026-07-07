@@ -458,6 +458,17 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   /** Tool names that bypass event dispatch and execute directly (e.g., graph-managed handoff tools) */
   private directToolNames?: Set<string>;
   /**
+   * Tool names whose in-process body may raise a LangGraph `interrupt()`
+   * mid-execution (e.g. `ask_user_question`). Treated as direct (so the
+   * body actually runs in-process where `interrupt()` works) and, within
+   * a batch, scheduled ahead of non-interrupting direct siblings so a
+   * mid-body interrupt unwinds the ToolNode before a non-idempotent
+   * sibling executes — preventing the double side effect LangGraph's
+   * resume-time batch re-execution would otherwise cause. See
+   * {@link t.ToolNodeOptions.interruptingToolNames}.
+   */
+  private interruptingToolNames?: Set<string>;
+  /**
    * File checkpointer extracted from the local coding tool bundle when
    * `toolExecution.local.fileCheckpointing === true`. Exposed via
    * {@link getFileCheckpointer}. Undefined when checkpointing is off
@@ -518,6 +529,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     agentId,
     executingAgentId,
     directToolNames,
+    interruptingToolNames,
     codeSessionToolNames,
     maxContextTokens,
     maxToolResultChars,
@@ -556,6 +568,10 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     // existing agentId option) still get attribution without knowing the new option.
     this.executingAgentId = executingAgentId ?? agentId;
     this.directToolNames = directToolNames;
+    this.interruptingToolNames =
+      interruptingToolNames != null && interruptingToolNames.size > 0
+        ? interruptingToolNames
+        : undefined;
     this.codeSessionToolNames =
       codeSessionToolNames != null && codeSessionToolNames.length > 0
         ? new Set(codeSessionToolNames)
@@ -3181,6 +3197,94 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   }
 
   /**
+   * Execute a group of direct (in-process) tool calls with interrupt-safe
+   * ordering, returning outputs aligned 1:1 with `directCalls`.
+   *
+   * Fast path (the common case): when no call in the group is in
+   * `interruptingToolNames`, this is a single `Promise.all` — byte-for-byte
+   * the prior behavior, so ordinary batches are unaffected.
+   *
+   * Interrupt-safe path: when the group contains an interrupting tool (e.g.
+   * `ask_user_question`, whose body raises a LangGraph `interrupt()` to
+   * collect a human answer), the interrupting calls run as their own awaited
+   * group **first**; only after they all settle without interrupting do the
+   * remaining (potentially non-idempotent) siblings run. If an interrupting
+   * call throws a `GraphInterrupt`, the `await` below rejects and unwinds the
+   * whole ToolNode *before* any non-interrupting sibling has started — so a
+   * sibling with real side effects (send_email, billing) never executes on
+   * the first pass. On the resume pass LangGraph re-runs the batch from the
+   * top; the interrupting tool resolves with the host's answer instead of
+   * throwing, and the siblings execute for the FIRST time, exactly once.
+   *
+   * Without this ordering, a flat `Promise.all` starts every sibling
+   * concurrently, so a non-idempotent sibling can complete its side effect
+   * before the interrupt unwinds and then run a SECOND time on resume — the
+   * duplicate side effect this method exists to prevent. Interrupting tools
+   * are expected to be side-effect-free (they only suspend), so running them
+   * as a group and re-running them on resume is harmless.
+   *
+   * `batchIndices[i]` is `directCalls[i]`'s position within the parent
+   * ToolNode batch (used for `{{tool<i>turn<n>}}` registration); it is
+   * preserved regardless of execution order. `baseContext` carries the
+   * batch-scoped fields every call shares; `batchIndex` is filled in
+   * per-call here.
+   */
+  private async runDirectBatchInterruptSafe(
+    directCalls: ToolCall[],
+    batchIndices: number[],
+    config: RunnableConfig,
+    baseContext: Omit<RunToolBatchContext<T>, 'batchIndex'>
+  ): Promise<(BaseMessage | Command)[]> {
+    const runOne = (
+      call: ToolCall,
+      position: number
+    ): Promise<BaseMessage | Command> =>
+      this.runDirectToolWithLifecycleHooks(call, config, {
+        ...baseContext,
+        batchIndex: batchIndices[position],
+      });
+
+    const interrupting = this.interruptingToolNames;
+    const hasInterrupting =
+      interrupting != null &&
+      directCalls.some((call) => interrupting.has(call.name));
+
+    if (!hasInterrupting) {
+      return Promise.all(directCalls.map((call, i) => runOne(call, i)));
+    }
+
+    const outputs: (BaseMessage | Command)[] = new Array(directCalls.length);
+    const interruptingPositions: number[] = [];
+    const regularPositions: number[] = [];
+    for (let i = 0; i < directCalls.length; i++) {
+      if (interrupting.has(directCalls[i].name)) {
+        interruptingPositions.push(i);
+      } else {
+        regularPositions.push(i);
+      }
+    }
+
+    // Interrupting group first. A GraphInterrupt here propagates out of the
+    // `await` before any regular sibling is dispatched below.
+    const interruptingOutputs = await Promise.all(
+      interruptingPositions.map((i) => runOne(directCalls[i], i))
+    );
+    interruptingPositions.forEach((i, k) => {
+      outputs[i] = interruptingOutputs[k];
+    });
+
+    // No interrupting call suspended — safe to run the remaining siblings.
+    const regularOutputs = await Promise.all(
+      regularPositions.map((i) => runOne(directCalls[i], i))
+    );
+    regularPositions.forEach((i, k) => {
+      outputs[i] = regularOutputs[k];
+    });
+
+    return outputs;
+  }
+
+  /**
    * Execute all tool calls via ON_TOOL_EXECUTE event dispatch.
    * Injected messages are placed AFTER ToolMessages to respect provider
    * message ordering (AIMessage tool_calls must be immediately followed
@@ -3235,6 +3339,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     if (this.isSendInput(input)) {
       const isLocalTool =
         this.directToolNames?.has(input.lg_tool_call.name) === true ||
+        this.interruptingToolNames?.has(input.lg_tool_call.name) === true ||
         this.shouldHandleUnknownHandoffLocally(input.lg_tool_call.name);
       if (this.eventDrivenMode && !isLocalTool) {
         return this.executeViaEvent([input.lg_tool_call], config, input, {
@@ -3355,6 +3460,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           const entry = { call, batchIndex: i };
           if (
             directToolNames?.has(call.name) === true ||
+            this.interruptingToolNames?.has(call.name) === true ||
             this.shouldHandleUnknownHandoffLocally(
               call.name,
               hasRegisteredHandoffTool
@@ -3426,18 +3532,18 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         const directAdditionalContexts: string[] = [];
         const directOutputs: (BaseMessage | Command)[] =
           directCalls.length > 0
-            ? await Promise.all(
-              directCalls.map((call, i) =>
-                this.runDirectToolWithLifecycleHooks(call, config, {
-                  batchIndex: directIndices[i],
-                  turn,
-                  batchScopeId,
-                  resolvedArgsByCallId,
-                  preBatchSnapshot,
-                  additionalContextsSink: directAdditionalContexts,
-                  runInput: input as T,
-                })
-              )
+            ? await this.runDirectBatchInterruptSafe(
+              directCalls,
+              directIndices,
+              config,
+              {
+                turn,
+                batchScopeId,
+                resolvedArgsByCallId,
+                preBatchSnapshot,
+                additionalContextsSink: directAdditionalContexts,
+                runInput: input as T,
+              }
             )
             : [];
 
@@ -3491,18 +3597,18 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         const preBatchSnapshot =
           this.toolOutputRegistry?.snapshot(batchScopeId);
         const directAdditionalContexts: string[] = [];
-        const toolOutputs = await Promise.all(
-          filteredCalls.map((call, i) =>
-            this.runDirectToolWithLifecycleHooks(call, config, {
-              batchIndex: i,
-              turn,
-              batchScopeId,
-              resolvedArgsByCallId,
-              preBatchSnapshot,
-              additionalContextsSink: directAdditionalContexts,
-              runInput: input as T,
-            })
-          )
+        const toolOutputs = await this.runDirectBatchInterruptSafe(
+          filteredCalls,
+          filteredCalls.map((_call, i) => i),
+          config,
+          {
+            turn,
+            batchScopeId,
+            resolvedArgsByCallId,
+            preBatchSnapshot,
+            additionalContextsSink: directAdditionalContexts,
+            runInput: input as T,
+          }
         );
         await this.handleRunToolCompletions(
           filteredCalls,

@@ -609,6 +609,14 @@ export abstract class Graph<
    */
   eagerEventToolExecution: t.EagerEventToolExecutionConfig | undefined;
   codeSessionToolNames: string[] | undefined;
+  /**
+   * Run-scoped names of tools whose in-process body may raise a LangGraph
+   * `interrupt()` (e.g. `ask_user_question`). Threaded from
+   * `RunConfig.interruptingToolNames` into every ToolNode this graph
+   * compiles so a mid-batch interrupt cannot double-execute non-idempotent
+   * siblings on resume. See {@link t.ToolNodeOptions.interruptingToolNames}.
+   */
+  interruptingToolNames: string[] | undefined;
   eagerEventToolExecutions: Map<string, t.EagerEventToolExecution> = new Map();
   eagerEventToolUsageCount: Map<string, number> = new Map();
   private eagerEventToolUsageCountsByAgentId: Map<string, Map<string, number>> =
@@ -658,6 +666,7 @@ export abstract class Graph<
     this.toolOutputReferences = undefined;
     this.eagerEventToolExecution = undefined;
     this.codeSessionToolNames = undefined;
+    this.interruptingToolNames = undefined;
     this.eagerEventToolExecutions.clear();
     this.clearEagerEventToolUsageCounts();
     this.eagerEventToolCallChunks.clear();
@@ -1277,6 +1286,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         ),
         toolExecution: this.toolExecution,
         directToolNames: directToolNames.size > 0 ? directToolNames : undefined,
+        interruptingToolNames:
+          this.interruptingToolNames != null &&
+          this.interruptingToolNames.length > 0
+            ? new Set(this.interruptingToolNames)
+            : undefined,
         maxContextTokens: agentContext?.maxContextTokens,
         maxToolResultChars: agentContext?.maxToolResultChars,
         toolOutputRegistry: this.getOrCreateToolOutputRegistry(),
@@ -1336,6 +1350,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       sessions: this.sessions,
       toolExecution: this.toolExecution,
       codeSessionToolNames: this.codeSessionToolNames,
+      interruptingToolNames:
+        this.interruptingToolNames != null &&
+        this.interruptingToolNames.length > 0
+          ? new Set(this.interruptingToolNames)
+          : undefined,
       hookRegistry: this.hookRegistry,
       humanInTheLoop: this.humanInTheLoop,
       maxContextTokens: agentContext?.maxContextTokens,
@@ -2361,6 +2380,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             childGraph.toolOutputReferences = this.toolOutputReferences;
             childGraph.eagerEventToolExecution = this.eagerEventToolExecution;
             childGraph.codeSessionToolNames = this.codeSessionToolNames;
+            // Pure execution-ordering hint (unlike `humanInTheLoop` above):
+            // it only ever schedules an interrupting tool ahead of its
+            // siblings, so propagating it into subagents can prevent a
+            // double side effect but never introduce one.
+            childGraph.interruptingToolNames = this.interruptingToolNames;
             childGraph.toolExecution = this.toolExecution;
             childGraph.eventToolExecutionAvailable =
               this.handlerRegistry?.getHandler(GraphEvents.ON_TOOL_EXECUTE) !=

@@ -108,6 +108,27 @@ export type ToolNodeOptions = {
   executingAgentId?: string;
   /** Tool names that must be executed directly (via runTool) even in event-driven mode (e.g., graph-managed handoff tools) */
   directToolNames?: Set<string>;
+  /**
+   * Tool names whose in-process body may raise a LangGraph `interrupt()`
+   * mid-execution — e.g. an `ask_user_question` tool that suspends the
+   * run to collect a human answer. Membership has two effects:
+   *   1. The tool is always executed in-process (folded into the direct
+   *      partition), since a body `interrupt()` only works for a tool
+   *      that runs inside the graph node — an event-dispatched tool
+   *      runs on the host and never reaches `interrupt()`.
+   *   2. Within a single tool-call batch, these tools are executed as
+   *      their own awaited group **before** their non-interrupting
+   *      direct siblings. If one interrupts, the ToolNode unwinds before
+   *      any sibling runs, so a non-idempotent sibling (send_email,
+   *      billing) cannot execute once on the first pass and AGAIN when
+   *      LangGraph re-runs the interrupted batch on resume.
+   *
+   * Opt-in and empty by default: when unset (or when no batch call
+   * matches), direct-batch execution is byte-for-byte unchanged. See the
+   * "Resume re-execution" section of {@link HumanInTheLoopConfig} for the
+   * batch re-execution contract this guards against.
+   */
+  interruptingToolNames?: Set<string>;
   /** Opt-in eager execution for event-driven tool calls. */
   eagerEventToolExecution?: EagerEventToolExecutionConfig;
   /**
