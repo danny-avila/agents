@@ -197,15 +197,21 @@ export type RunConfig = {
    * Names of host tools whose in-process body may raise a LangGraph
    * `interrupt()` mid-execution — the canonical example is an
    * `ask_user_question` tool that suspends the run to collect a human
-   * answer. Declaring a tool here does two things: it is always executed
-   * in-process (a body `interrupt()` only fires for a tool that runs inside
-   * the graph node, never for one dispatched to the host), and within a
-   * single tool-call batch it is scheduled **ahead of** its non-interrupting
-   * siblings. That ordering guarantees a mid-body interrupt unwinds the tool
-   * batch before a non-idempotent sibling (send_email, billing) executes, so
-   * the sibling cannot run once on the first pass and AGAIN when LangGraph
-   * re-runs the interrupted batch on resume. Host-declared so the SDK stays
-   * name-agnostic; omit to keep the prior (unguarded) behavior.
+   * answer. Within a single tool-call batch, a named tool that is a real
+   * in-process graphTool (the only kind whose body can reach `interrupt()`;
+   * graphTools are auto-marked direct) is scheduled **ahead of** its
+   * non-interrupting direct siblings. That ordering guarantees a mid-body
+   * interrupt unwinds the tool batch before a non-idempotent sibling
+   * (send_email, billing) executes, so the sibling cannot run once on the
+   * first pass and AGAIN when LangGraph re-runs the interrupted batch on
+   * resume.
+   *
+   * This only reorders the direct group — it does NOT force a name onto
+   * the direct path. A name that is only an inherited event `toolDefinition`
+   * (schema-only stub, e.g. in a self-spawned child) stays event-dispatched;
+   * the guard applies only to tools that are independently direct.
+   * Host-declared so the SDK stays name-agnostic; omit to keep the prior
+   * (unguarded) behavior.
    */
   interruptingToolNames?: string[];
   /**

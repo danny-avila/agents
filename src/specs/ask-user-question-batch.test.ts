@@ -221,4 +221,69 @@ describe('ask_user_question batched with a sibling tool', () => {
       expect(sideEffect).toHaveBeenCalledTimes(1);
     });
   });
+
+  describe('interruptingToolNames only reorders; never forces direct (Codex #294)', () => {
+    // A self-spawned child scrubs inherited `graphTools` but keeps the
+    // event `toolDefinition`, so a name like `ask_user_question` exists
+    // only as a schema-only stub. Propagating `interruptingToolNames`
+    // must NOT force that name onto the direct path — invoking the stub
+    // throws "should not be invoked directly". It must stay dispatched.
+    it('dispatches an interrupting name that has no in-process implementation', async () => {
+      const directlyInvoked = jest.fn();
+      // Mirrors createSchemaOnlyTool: throws if invoked in-process.
+      const stub = tool(
+        async () => {
+          directlyInvoked();
+          throw new Error(
+            'Tool "ask_user_question" should not be invoked directly in event-driven mode.'
+          );
+        },
+        {
+          name: 'ask_user_question',
+          description: 'schema-only event stub',
+          schema: z.object({}).passthrough(),
+        }
+      ) as unknown as StructuredToolInterface;
+
+      jest
+        .spyOn(events, 'safeDispatchCustomEvent')
+        .mockImplementation(async (event, data) => {
+          if (event !== 'on_tool_execute') {
+            return;
+          }
+          const req = data as {
+            toolCalls: Array<{ id: string; name: string }>;
+            resolve: (results: t.ToolExecuteResult[]) => void;
+          };
+          req.resolve(
+            req.toolCalls.map((tc) => ({
+              toolCallId: tc.id,
+              content: 'HOST-HANDLED',
+              status: 'success' as const,
+            }))
+          );
+          return true;
+        });
+
+      const node = new ToolNode({
+        tools: [stub],
+        eventDrivenMode: true,
+        // NOT in directToolNames → it is an event tool, even though it is
+        // named in interruptingToolNames.
+        interruptingToolNames: new Set(['ask_user_question']),
+      });
+      const graph = buildGraph(node, [ASK]);
+      const config = { configurable: { thread_id: 'stub-stays-event' } };
+
+      const result = await graph.invoke({ messages: [] }, config);
+
+      // Dispatched to the host, NOT invoked in-process.
+      expect(directlyInvoked).not.toHaveBeenCalled();
+      const msg = (result as { messages: ToolMessage[] }).messages.find(
+        (m) => m instanceof ToolMessage
+      ) as ToolMessage;
+      expect(msg.status).toBe('success');
+      expect(String(msg.content)).toBe('HOST-HANDLED');
+    });
+  });
 });

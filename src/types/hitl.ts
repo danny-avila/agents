@@ -325,6 +325,14 @@ export function isAskUserQuestionInterrupt(
  * runs first. Tools with side effects should still be written
  * idempotent as defense in depth.
  *
+ * The guard only REORDERS the direct group — declaring a name does not
+ * force it onto the direct path. The interrupting tool must already be a
+ * real in-process graphTool (the only kind whose body can reach
+ * `interrupt()`). A name that resolves to a schema-only event stub (an
+ * inherited `toolDefinition` with no executable instance, e.g. in a
+ * self-spawned child that scrubs `graphTools`) stays event-dispatched
+ * and the ordering is a no-op for it.
+ *
  * ## Note on idempotency
  *
  * Same root cause as the resume re-execution above: LangGraph

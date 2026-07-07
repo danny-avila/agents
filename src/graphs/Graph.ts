@@ -2380,10 +2380,16 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             childGraph.toolOutputReferences = this.toolOutputReferences;
             childGraph.eagerEventToolExecution = this.eagerEventToolExecution;
             childGraph.codeSessionToolNames = this.codeSessionToolNames;
-            // Pure execution-ordering hint (unlike `humanInTheLoop` above):
-            // it only ever schedules an interrupting tool ahead of its
-            // siblings, so propagating it into subagents can prevent a
-            // double side effect but never introduce one.
+            // Pure execution-ordering hint (unlike `humanInTheLoop` above).
+            // It ONLY reorders tools already in the child's direct group;
+            // it does not force a name onto the direct path (that fold-in
+            // was removed — Codex review of #294). So for a self-spawned
+            // child that scrubs inherited `graphTools` (keeping only the
+            // event `toolDefinition` / schema-only stub for a name like
+            // `ask_user_question`), the name isn't in the child's direct
+            // group and this is a no-op — the stub is still dispatched via
+            // ON_TOOL_EXECUTE, never invoked directly. Where the child DOES
+            // have the executable graphTool, the guard correctly applies.
             childGraph.interruptingToolNames = this.interruptingToolNames;
             childGraph.toolExecution = this.toolExecution;
             childGraph.eventToolExecutionAvailable =

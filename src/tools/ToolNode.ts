@@ -459,13 +459,17 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private directToolNames?: Set<string>;
   /**
    * Tool names whose in-process body may raise a LangGraph `interrupt()`
-   * mid-execution (e.g. `ask_user_question`). Treated as direct (so the
-   * body actually runs in-process where `interrupt()` works) and, within
-   * a batch, scheduled ahead of non-interrupting direct siblings so a
-   * mid-body interrupt unwinds the ToolNode before a non-idempotent
-   * sibling executes — preventing the double side effect LangGraph's
-   * resume-time batch re-execution would otherwise cause. See
-   * {@link t.ToolNodeOptions.interruptingToolNames}.
+   * mid-execution (e.g. `ask_user_question`). Used only to REORDER within
+   * the direct group: a tool named here that is *already* direct (a real
+   * in-process graphTool — the only kind whose body can reach
+   * `interrupt()`) is scheduled ahead of its non-interrupting direct
+   * siblings, so a mid-body interrupt unwinds the ToolNode before a
+   * non-idempotent sibling executes and LangGraph's resume-time batch
+   * re-execution can't double it. This set is deliberately NOT folded
+   * into direct classification: a name that resolves to a schema-only
+   * event stub (an inherited `toolDefinition` with no executable
+   * instance) stays event-dispatched — forcing it direct would invoke
+   * the stub, which throws. See {@link t.ToolNodeOptions.interruptingToolNames}.
    */
   private interruptingToolNames?: Set<string>;
   /**
@@ -3339,7 +3343,6 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     if (this.isSendInput(input)) {
       const isLocalTool =
         this.directToolNames?.has(input.lg_tool_call.name) === true ||
-        this.interruptingToolNames?.has(input.lg_tool_call.name) === true ||
         this.shouldHandleUnknownHandoffLocally(input.lg_tool_call.name);
       if (this.eventDrivenMode && !isLocalTool) {
         return this.executeViaEvent([input.lg_tool_call], config, input, {
@@ -3460,7 +3463,6 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           const entry = { call, batchIndex: i };
           if (
             directToolNames?.has(call.name) === true ||
-            this.interruptingToolNames?.has(call.name) === true ||
             this.shouldHandleUnknownHandoffLocally(
               call.name,
               hasRegisteredHandoffTool
