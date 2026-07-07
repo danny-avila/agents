@@ -1167,9 +1167,13 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             this.undispatchedToolErrors.add(call.id);
           }
         } catch (handlerError) {
-          if (call.id != null && call.id !== '') {
-            this.undispatchedToolErrors.add(call.id);
-          }
+          // A THROWN handler is not proof the completion wasn't dispatched: the
+          // built-in session handler emits `tool.completed` BEFORE invoking a
+          // user ON_RUN_STEP_COMPLETED callback, so a throw from that callback
+          // has already dispatched. Marking it undispatched would make the
+          // fallback loop re-emit a duplicate completion — only an explicit
+          // `false` return (handled above) means "nothing dispatched"; a throw
+          // is just logged.
           // eslint-disable-next-line no-console
           console.error('Error in errorHandler:', {
             toolName: call.name,

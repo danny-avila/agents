@@ -2757,21 +2757,30 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       progress: 1,
     };
 
-    await graph.handlerRegistry
-      ?.getHandler(GraphEvents.ON_RUN_STEP_COMPLETED)
-      ?.handle(
-        GraphEvents.ON_RUN_STEP_COMPLETED,
-        {
-          result: {
-            id: stepId,
-            index: runStep.index,
-            type: 'tool_call',
-            tool_call,
-          } as t.ToolCompleteEvent,
-        },
-        metadata,
-        graph
-      );
+    // No registered ON_RUN_STEP_COMPLETED handler ⇒ nothing was dispatched.
+    // Report `false` so the ToolNode runs its own fallback dispatch; returning
+    // `true` here would silently drop the error completion for hosts that wire
+    // completions through callback-based custom events instead of a handler.
+    const handler = graph.handlerRegistry?.getHandler(
+      GraphEvents.ON_RUN_STEP_COMPLETED
+    );
+    if (!handler) {
+      return false;
+    }
+
+    await handler.handle(
+      GraphEvents.ON_RUN_STEP_COMPLETED,
+      {
+        result: {
+          id: stepId,
+          index: runStep.index,
+          type: 'tool_call',
+          tool_call,
+        } as t.ToolCompleteEvent,
+      },
+      metadata,
+      graph
+    );
     return true;
   }
 
