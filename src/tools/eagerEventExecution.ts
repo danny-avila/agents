@@ -52,7 +52,29 @@ export type ToolExecutionPlanCall = {
   args: unknown;
   stepId?: string;
   codeSessionContext?: t.ToolCallRequest['codeSessionContext'];
+  runtimeSessionHint?: string;
 };
+
+/**
+ * Stateful runtime session hint for the remote sandbox: only when
+ * `toolExecution.sandbox.statefulSessions` is on; explicit host hint else the
+ * conversation `thread_id`. Undefined disables the wire field. Shared by the
+ * direct ToolNode path and both event-driven planners so they stay in lockstep.
+ */
+export function resolveRuntimeSessionHint(
+  toolExecution: t.ToolExecutionConfig | undefined,
+  threadId: string | undefined
+): string | undefined {
+  const sandbox = toolExecution?.sandbox;
+  if (sandbox?.statefulSessions !== true) {
+    return undefined;
+  }
+  const explicit = sandbox.runtimeSessionHint;
+  if (explicit != null && explicit !== '') {
+    return explicit;
+  }
+  return threadId != null && threadId !== '' ? threadId : undefined;
+}
 
 export type ToolExecutionRequestPlan = {
   allRequests: t.ToolCallRequest[];
@@ -73,15 +95,12 @@ export function buildToolExecutionRequestPlan(args: {
     args: Record<string, unknown>;
     stepId?: string;
     codeSessionContext?: t.ToolCallRequest['codeSessionContext'];
+    runtimeSessionHint?: string;
     rejectedErrorMessage?: string;
   }> = [];
 
   for (const toolCall of args.toolCalls) {
-    if (
-      toolCall.id == null ||
-      toolCall.id === '' ||
-      toolCall.name === ''
-    ) {
+    if (toolCall.id == null || toolCall.id === '' || toolCall.name === '') {
       return undefined;
     }
     const coercedArgs = coerceRecordArgs(toolCall.args);
@@ -95,6 +114,7 @@ export function buildToolExecutionRequestPlan(args: {
         args: {},
         stepId: toolCall.stepId,
         codeSessionContext: toolCall.codeSessionContext,
+        runtimeSessionHint: toolCall.runtimeSessionHint,
         rejectedErrorMessage:
           'Invalid tool call arguments: expected a JSON object.',
       });
@@ -106,6 +126,7 @@ export function buildToolExecutionRequestPlan(args: {
       args: coercedArgs,
       stepId: toolCall.stepId,
       codeSessionContext: toolCall.codeSessionContext,
+      runtimeSessionHint: toolCall.runtimeSessionHint,
     });
   }
 
@@ -122,6 +143,12 @@ export function buildToolExecutionRequestPlan(args: {
     };
     if (toolCall.codeSessionContext != null) {
       request.codeSessionContext = toolCall.codeSessionContext;
+    }
+    if (
+      toolCall.runtimeSessionHint != null &&
+      toolCall.runtimeSessionHint !== ''
+    ) {
+      request.runtimeSessionHint = toolCall.runtimeSessionHint;
     }
     return request;
   });

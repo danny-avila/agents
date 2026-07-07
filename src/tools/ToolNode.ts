@@ -38,6 +38,11 @@ import type {
 } from '@/hooks';
 import type * as t from '@/types';
 import {
+  buildToolExecutionRequestPlan,
+  resolveRuntimeSessionHint,
+  recordArgsEqual,
+} from '@/tools/eagerEventExecution';
+import {
   resolveLangfuseRuntimeScope,
   withLangfuseRuntimeScope,
 } from '@/langfuseRuntimeScope';
@@ -45,10 +50,6 @@ import {
   buildReferenceKey,
   ToolOutputReferenceRegistry,
 } from '@/tools/toolOutputReferences';
-import {
-  buildToolExecutionRequestPlan,
-  recordArgsEqual,
-} from '@/tools/eagerEventExecution';
 import {
   calculateMaxToolResultChars,
   truncateToolResultContent,
@@ -1797,24 +1798,15 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     );
   }
 
-  /**
-   * Resolves the stateful runtime session hint for the remote sandbox: only
-   * when `toolExecution.sandbox.statefulSessions` is on; explicit host hint
-   * else the conversation `thread_id`. Undefined disables the wire field.
-   */
+  /** Delegates to the shared resolver so the direct and event-driven planning
+   *  paths derive the runtime session hint identically. */
   private resolveRuntimeSessionHint(
     config: RunnableConfig
   ): string | undefined {
-    const sandbox = this.toolExecution?.sandbox;
-    if (sandbox?.statefulSessions !== true) {
-      return undefined;
-    }
-    const explicit = sandbox.runtimeSessionHint;
-    if (explicit != null && explicit !== '') {
-      return explicit;
-    }
-    const threadId = config.configurable?.thread_id as string | undefined;
-    return threadId != null && threadId !== '' ? threadId : undefined;
+    return resolveRuntimeSessionHint(
+      this.toolExecution,
+      config.configurable?.thread_id as string | undefined
+    );
   }
 
   private storeCodeSessionFromResults(

@@ -23,6 +23,7 @@ import {
 } from '@/common';
 import {
   buildToolExecutionRequestPlan,
+  resolveRuntimeSessionHint,
   coerceRecordArgs,
   normalizeError,
 } from '@/tools/eagerEventExecution';
@@ -668,6 +669,7 @@ function createEagerToolExecutionPlan(args: {
     return undefined;
   }
 
+  const threadId = graph.config?.configurable?.thread_id as string | undefined;
   const plan = buildToolExecutionRequestPlan({
     toolCalls: candidateToolCalls.map((toolCall) => ({
       id: toolCall.id,
@@ -675,6 +677,13 @@ function createEagerToolExecutionPlan(args: {
       args: toolCall.args,
       stepId: graph.toolCallStepIds.get(toolCall.id!) ?? '',
       codeSessionContext: getCodeSessionContext(graph, toolCall.name),
+      /* Same gate as ToolNode.participatesInCodeSession: code-execution tools
+       * (+ host tools sharing the session), not skill/read_file. */
+      runtimeSessionHint:
+        CODE_EXECUTION_TOOLS.has(toolCall.name) ||
+        graph.codeSessionToolNames?.includes(toolCall.name) === true
+          ? resolveRuntimeSessionHint(graph.toolExecution, threadId)
+          : undefined,
     })),
     usageCount: graph.getEagerEventToolUsageCount(agentContext?.agentId),
   });
