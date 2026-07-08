@@ -89,10 +89,18 @@ export type ToolNodeOptions = {
   handleToolErrors?: boolean;
   loadRuntimeTools?: ToolRefGenerator;
   toolCallStepIds?: Map<string, string>;
+  /**
+   * Dispatches the error completion event for a failed tool call. Returns
+   * whether the event was actually dispatched — `false` (e.g. no run step is
+   * registered for the call yet, which happens when a tool fails fast on a
+   * resume pass) tells the ToolNode to fall back to its own completion
+   * dispatch for the error ToolMessage. A `void` resolution is treated as
+   * dispatched for backward compatibility.
+   */
   errorHandler?: (
     data: ToolErrorData,
     metadata?: Record<string, unknown>
-  ) => Promise<void>;
+  ) => Promise<boolean | void>;
   /** Tool registry for lazy computation of programmatic tools and tool search */
   toolRegistry?: LCToolRegistry;
   /** Reference to Graph's sessions map for automatic session injection */
