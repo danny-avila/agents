@@ -128,6 +128,7 @@ export class Run<_T extends t.BaseGraphState> {
   private toolOutputReferences?: t.ToolOutputReferencesConfig;
   private eagerEventToolExecution?: t.EagerEventToolExecutionConfig;
   private codeSessionToolNames?: string[];
+  private interruptingToolNames?: string[];
   private toolExecution?: t.ToolExecutionConfig;
   private subagentUsageSink?: t.SubagentUsageSink;
   private indexTokenCountMap?: Record<string, number>;
@@ -184,6 +185,7 @@ export class Run<_T extends t.BaseGraphState> {
     this.toolOutputReferences = config.toolOutputReferences;
     this.eagerEventToolExecution = config.eagerEventToolExecution;
     this.codeSessionToolNames = config.codeSessionToolNames;
+    this.interruptingToolNames = config.interruptingToolNames;
     this.toolExecution = config.toolExecution;
     this.subagentUsageSink = config.subagentUsageSink;
 
@@ -271,6 +273,7 @@ export class Run<_T extends t.BaseGraphState> {
     standardGraph.toolOutputReferences = this.toolOutputReferences;
     standardGraph.eagerEventToolExecution = this.eagerEventToolExecution;
     standardGraph.codeSessionToolNames = this.codeSessionToolNames;
+    standardGraph.interruptingToolNames = this.interruptingToolNames;
     standardGraph.toolExecution = this.toolExecution;
     this.Graph = standardGraph;
     return standardGraph.createWorkflow();
@@ -301,6 +304,7 @@ export class Run<_T extends t.BaseGraphState> {
     multiAgentGraph.toolOutputReferences = this.toolOutputReferences;
     multiAgentGraph.eagerEventToolExecution = this.eagerEventToolExecution;
     multiAgentGraph.codeSessionToolNames = this.codeSessionToolNames;
+    multiAgentGraph.interruptingToolNames = this.interruptingToolNames;
     multiAgentGraph.toolExecution = this.toolExecution;
     this.Graph = multiAgentGraph;
     return multiAgentGraph.createWorkflow();

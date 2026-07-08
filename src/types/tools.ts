@@ -116,6 +116,34 @@ export type ToolNodeOptions = {
   executingAgentId?: string;
   /** Tool names that must be executed directly (via runTool) even in event-driven mode (e.g., graph-managed handoff tools) */
   directToolNames?: Set<string>;
+  /**
+   * Tool names whose in-process body may raise a LangGraph `interrupt()`
+   * mid-execution — e.g. an `ask_user_question` tool that suspends the
+   * run to collect a human answer.
+   *
+   * Within a single tool-call batch, a named tool that is *already*
+   * direct (a real in-process graphTool — the only kind whose body can
+   * reach `interrupt()`; graphTools are auto-marked direct by the graph)
+   * is executed as its own awaited group **before** its non-interrupting
+   * direct siblings. If it interrupts, the ToolNode unwinds before any
+   * sibling runs, so a non-idempotent sibling (send_email, billing)
+   * cannot execute once on the first pass and AGAIN when LangGraph re-runs
+   * the interrupted batch on resume.
+   *
+   * This set only REORDERS the direct group; it does NOT promote a name
+   * into it. A name that resolves to a schema-only event stub (an
+   * inherited `toolDefinition` with no executable instance — e.g. in a
+   * self-spawned child that scrubs `graphTools`) stays event-dispatched.
+   * Forcing such a name direct would invoke the stub, which throws
+   * "should not be invoked directly in event-driven mode". For the guard
+   * to apply, the interrupting tool must independently be direct.
+   *
+   * Opt-in and empty by default: when unset (or when no direct batch call
+   * matches), direct-batch execution is byte-for-byte unchanged. See the
+   * "Resume re-execution" section of {@link HumanInTheLoopConfig} for the
+   * batch re-execution contract this guards against.
+   */
+  interruptingToolNames?: Set<string>;
   /** Opt-in eager execution for event-driven tool calls. */
   eagerEventToolExecution?: EagerEventToolExecutionConfig;
   /**
