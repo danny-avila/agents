@@ -533,9 +533,11 @@ async function* delayStreamChunks(
       }
       signal?.throwIfAborted();
       lastYieldedAt = Date.now();
+      // Dedupe before emitting so token callbacks and the yielded chunk
+      // (and both downstream aggregations) observe the same cleaned metadata.
+      dropRepeatedScalarMetadata(outputChunk, seenScalarMetadata);
       await emitStreamChunkCallback(outputChunk, runManager);
       signal?.throwIfAborted();
-      dropRepeatedScalarMetadata(outputChunk, seenScalarMetadata);
       yield outputChunk;
     }
   }

@@ -1,6 +1,10 @@
 import { concat } from '@langchain/core/utils/stream';
 import { expect, test, describe } from '@jest/globals';
 import { HumanMessage, AIMessageChunk } from '@langchain/core/messages';
+import type {
+  NewTokenIndices,
+  HandleLLMNewTokenCallbackFields,
+} from '@langchain/core/callbacks/base';
 import type { LLMResult } from '@langchain/core/outputs';
 import type { OpenAIClient } from '@langchain/openai';
 import { ChatOpenAI } from './index';
@@ -63,10 +67,13 @@ function rawChunk(
   } as unknown as RawChunk;
 }
 
-async function collect(
-  model: ChatOpenAI
-): Promise<{ coreEnd?: AIMessageChunk; hostConcat?: AIMessageChunk }> {
+async function collect(model: ChatOpenAI): Promise<{
+  coreEnd?: AIMessageChunk;
+  hostConcat?: AIMessageChunk;
+  tokenFinishReasons: unknown[];
+}> {
   let coreEnd: AIMessageChunk | undefined;
+  const tokenFinishReasons: unknown[] = [];
   const stream = await model.stream([new HumanMessage('hi')], {
     callbacks: [
       {
@@ -76,6 +83,30 @@ async function collect(
             | undefined;
           coreEnd = generation?.message;
         },
+        handleLLMNewToken(
+          _token: string,
+          _idx: NewTokenIndices,
+          _runId: string,
+          _parentRunId?: string,
+          _tags?: string[],
+          fields?: HandleLLMNewTokenCallbackFields
+        ): void {
+          // At emit time the scalars still live in `generationInfo` (core
+          // folds them into `response_metadata` only after it receives the
+          // chunk), so read the surface a token-callback consumer sees here.
+          const chunk = fields?.chunk as
+            | {
+                generationInfo?: Record<string, unknown>;
+                message?: AIMessageChunk;
+              }
+            | undefined;
+          const finishReason =
+            chunk?.generationInfo?.finish_reason ??
+            chunk?.message?.response_metadata?.finish_reason;
+          if (finishReason != null) {
+            tokenFinishReasons.push(finishReason);
+          }
+        },
       },
     ],
   });
@@ -83,7 +114,7 @@ async function collect(
   for await (const chunk of stream) {
     hostConcat = hostConcat == null ? chunk : concat(hostConcat, chunk);
   }
-  return { coreEnd, hostConcat };
+  return { coreEnd, hostConcat, tokenFinishReasons };
 }
 
 describe('streamed response_metadata scalar de-duplication', () => {
@@ -96,7 +127,7 @@ describe('streamed response_metadata scalar de-duplication', () => {
       } as Partial<RawChunk>),
     ]);
 
-    const { coreEnd, hostConcat } = await collect(model);
+    const { coreEnd, hostConcat, tokenFinishReasons } = await collect(model);
 
     for (const meta of [
       coreEnd?.response_metadata,
@@ -107,6 +138,9 @@ describe('streamed response_metadata scalar de-duplication', () => {
       // keep-first still preserves a field that only appears on the 2nd chunk
       expect(meta?.service_tier).toBe('default');
     }
+    // token callbacks observe the same de-duplicated chunks (finish_reason
+    // stays on the first finish chunk only, never re-emitted on the repeat)
+    expect(tokenFinishReasons).toEqual(['stop']);
   });
 
   test('leaves a conformant single-finish stream untouched', async () => {
