@@ -33,12 +33,14 @@ import type { BindToolsInput } from '@langchain/core/language_models/chat_models
 import type { ChatGeneration, ChatResult } from '@langchain/core/outputs';
 import type { ChatXAIInput } from '@langchain/xai';
 import type * as t from '@langchain/openai';
+import type { SeenScalarMetadata } from './streamMetadata';
 import type { HeaderValue, HeadersLike } from './types';
 import {
   STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY,
   OPENAI_CHAT_SEQUENTIAL_STREAMED_TOOL_CALL_ADAPTER,
 } from '@/tools/streamedToolCallSeals';
 import { isReasoningModel, _convertMessagesToOpenAIParams } from './utils';
+import { dropRepeatedScalarMetadata } from './streamMetadata';
 
 // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
 const iife = <T>(fn: () => T) => fn();
@@ -514,7 +516,13 @@ async function* delayStreamChunks(
   chunks: AsyncGenerator<ChatGenerationChunk>,
   delay?: number,
   signal?: AbortSignal,
-  runManager?: CallbackManagerForLLMRun
+  runManager?: CallbackManagerForLLMRun,
+  // When provided, de-duplicate repeated scalar metadata just before emitting,
+  // so token callbacks and the yielded chunk observe the same cleaned data.
+  // Omitted by callers that wrap this stream and finalize downstream (e.g.
+  // `ChatOpenRouter`, which needs the raw `finish_reason` as its flush signal
+  // and de-duplicates after its own processing).
+  seenScalarMetadata?: SeenScalarMetadata
 ): AsyncGenerator<ChatGenerationChunk> {
   let lastYieldedAt: number | undefined;
   for await (const chunk of chunks) {
@@ -531,6 +539,9 @@ async function* delayStreamChunks(
       }
       signal?.throwIfAborted();
       lastYieldedAt = Date.now();
+      if (seenScalarMetadata != null) {
+        dropRepeatedScalarMetadata(outputChunk, seenScalarMetadata);
+      }
       await emitStreamChunkCallback(outputChunk, runManager);
       signal?.throwIfAborted();
       yield outputChunk;
@@ -1425,6 +1436,25 @@ export class ChatOpenAI extends OriginalChatOpenAI<t.ChatOpenAICallOptions> {
       super._streamResponseChunks(messages, options, undefined),
       this._lc_stream_delay,
       options.signal,
+      runManager,
+      new Map()
+    );
+  }
+
+  /**
+   * Raw variant that skips scalar-metadata de-duplication. Used by subclasses
+   * (e.g. `ChatOpenRouter`) that read `finish_reason` as a control signal and
+   * must de-duplicate only after their own finalization.
+   */
+  protected _streamRawResponseChunks(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions'],
+    runManager?: CallbackManagerForLLMRun
+  ): AsyncGenerator<ChatGenerationChunk> {
+    return delayStreamChunks(
+      super._streamResponseChunks(messages, options, undefined),
+      this._lc_stream_delay,
+      options.signal,
       runManager
     );
   }
@@ -1537,7 +1567,8 @@ export class AzureChatOpenAI extends OriginalAzureChatOpenAI {
       super._streamResponseChunks(messages, options, undefined),
       this._lc_stream_delay,
       options.signal,
-      runManager
+      runManager,
+      new Map()
     );
   }
 }
@@ -1670,7 +1701,8 @@ export class ChatDeepSeek extends OriginalChatDeepSeek {
       this._streamResponseChunksWithReasoning(messages, options, undefined),
       this._lc_stream_delay,
       options.signal,
-      runManager
+      runManager,
+      new Map()
     );
   }
 
@@ -2131,7 +2163,8 @@ export class ChatXAI extends OriginalChatXAI {
       super._streamResponseChunks(messages, options, undefined),
       this._lc_stream_delay,
       options.signal,
-      runManager
+      runManager,
+      new Map()
     );
   }
 }

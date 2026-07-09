@@ -36,6 +36,8 @@ export default defineConfig([globalIgnores([
     "src/llm/openai/llm.spec.ts",
     "src/llm/openai/inherited-deepseek.spec.ts",
     "src/llm/openai/inherited-xai.spec.ts",
+    "src/llm/openai/streamMetadataDedup.spec.ts",
+    "src/llm/openai/streamMetadata.spec.ts",
     "src/llm/bedrock/llm.spec.ts",
     "src/llm/bedrock/inherited-cache.spec.ts",
     "src/llm/bedrock/inherited.spec.ts",
