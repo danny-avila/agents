@@ -1,0 +1,86 @@
+import { expect, test, describe } from '@jest/globals';
+import { AIMessageChunk } from '@langchain/core/messages';
+import { ChatGenerationChunk } from '@langchain/core/outputs';
+import type { SeenScalarMetadata } from './streamMetadata';
+import { dropRepeatedScalarMetadata } from './streamMetadata';
+
+function chunkWithGenerationInfo(
+  generationInfo: Record<string, unknown>
+): ChatGenerationChunk {
+  return new ChatGenerationChunk({
+    text: '',
+    message: new AIMessageChunk({ content: '' }),
+    generationInfo,
+  });
+}
+
+describe('dropRepeatedScalarMetadata', () => {
+  test('drops a scalar repeated within the same completion (keep-first)', () => {
+    const seen: SeenScalarMetadata = new Map();
+    const first = chunkWithGenerationInfo({
+      completion: 0,
+      finish_reason: 'stop',
+      model_name: 'm',
+    });
+    const second = chunkWithGenerationInfo({
+      completion: 0,
+      finish_reason: 'stop',
+      model_name: 'm',
+    });
+
+    dropRepeatedScalarMetadata(first, seen);
+    dropRepeatedScalarMetadata(second, seen);
+
+    expect(first.generationInfo?.finish_reason).toBe('stop');
+    expect(second.generationInfo?.finish_reason).toBeUndefined();
+    expect(second.generationInfo?.model_name).toBeUndefined();
+  });
+
+  test('keeps a scalar that repeats across different completion indices', () => {
+    const seen: SeenScalarMetadata = new Map();
+    const choice0 = chunkWithGenerationInfo({
+      completion: 0,
+      finish_reason: 'stop',
+      model_name: 'm',
+    });
+    const choice1 = chunkWithGenerationInfo({
+      completion: 1,
+      finish_reason: 'stop',
+      model_name: 'm',
+    });
+
+    dropRepeatedScalarMetadata(choice0, seen);
+    dropRepeatedScalarMetadata(choice1, seen);
+
+    // each completion keeps its own finish metadata (n > 1 aggregates per choice)
+    expect(choice0.generationInfo?.finish_reason).toBe('stop');
+    expect(choice1.generationInfo?.finish_reason).toBe('stop');
+  });
+
+  test('clones before deleting so a shared metadata object is not mutated', () => {
+    const seen: SeenScalarMetadata = new Map();
+    // Simulate ChatDeepSeek splitting one raw chunk into pieces that share the
+    // same generationInfo object.
+    const shared = { completion: 0, finish_reason: 'stop', model_name: 'm' };
+    const first = new ChatGenerationChunk({
+      text: '',
+      message: new AIMessageChunk({ content: 'a' }),
+      generationInfo: shared,
+    });
+    const second = new ChatGenerationChunk({
+      text: '',
+      message: new AIMessageChunk({ content: 'b' }),
+      generationInfo: shared,
+    });
+
+    dropRepeatedScalarMetadata(first, seen);
+    dropRepeatedScalarMetadata(second, seen);
+
+    // the already-emitted first piece (and the shared object) keep finish_reason
+    expect(first.generationInfo?.finish_reason).toBe('stop');
+    expect(shared.finish_reason).toBe('stop');
+    // the repeat piece got its own cleaned copy
+    expect(second.generationInfo?.finish_reason).toBeUndefined();
+    expect(second.generationInfo).not.toBe(first.generationInfo);
+  });
+});

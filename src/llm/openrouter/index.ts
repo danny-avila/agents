@@ -6,7 +6,9 @@ import type {
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { ChatGenerationChunk } from '@langchain/core/outputs';
 import type { BaseMessage } from '@langchain/core/messages';
+import type { SeenScalarMetadata } from '@/llm/openai/streamMetadata';
 import type { PromptCacheTtl } from '@/messages/cache';
+import { dropRepeatedScalarMetadata } from '@/llm/openai/streamMetadata';
 import { ChatOpenAI, emitStreamChunkCallback } from '@/llm/openai';
 
 export type OpenRouterReasoningEffort =
@@ -240,8 +242,11 @@ export class ChatOpenRouter extends ChatOpenAI {
       string,
       OpenRouterReasoningEncryptedDetail
     >();
+    // Consume the raw (un-deduped) stream so `finish_reason` survives as the
+    // reasoning-flush signal below; de-duplicate after that, before emitting.
+    const seenScalarMetadata: SeenScalarMetadata = new Map();
 
-    for await (const generationChunk of super._streamResponseChunks(
+    for await (const generationChunk of super._streamRawResponseChunks(
       messages,
       options,
       undefined
@@ -290,12 +295,11 @@ export class ChatOpenRouter extends ChatOpenAI {
         } else {
           delete generationChunk.message.additional_kwargs.reasoning_details;
         }
-        await emitStreamChunkCallback(generationChunk, runManager);
-        yield generationChunk;
-        continue;
+      } else {
+        delete generationChunk.message.additional_kwargs.reasoning_details;
       }
 
-      delete generationChunk.message.additional_kwargs.reasoning_details;
+      dropRepeatedScalarMetadata(generationChunk, seenScalarMetadata);
       await emitStreamChunkCallback(generationChunk, runManager);
       yield generationChunk;
     }
