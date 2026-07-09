@@ -39,6 +39,7 @@ import {
   OPENAI_CHAT_SEQUENTIAL_STREAMED_TOOL_CALL_ADAPTER,
 } from '@/tools/streamedToolCallSeals';
 import { isReasoningModel, _convertMessagesToOpenAIParams } from './utils';
+import { dropRepeatedScalarMetadata } from './streamMetadata';
 
 // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
 const iife = <T>(fn: () => T) => fn();
@@ -508,53 +509,6 @@ function getStreamChunkTokenIndices(
   }
 
   return undefined;
-}
-
-/**
- * `@langchain/openai` stamps these scalar fields together onto every chunk
- * whose `choice.finish_reason` is set. Providers that emit `finish_reason` on
- * more than one streamed chunk (e.g. OpenRouter) otherwise make core's
- * `_mergeDicts` concatenate them into `stopstop` / duplicated model names — in
- * both the aggregated graph message and the Langfuse trace. Core keeps
- * `id`/`name`/`model_provider` last but not these, so keep the first occurrence
- * and drop later repeats at the source, before either aggregation runs.
- */
-const REPEATED_SCALAR_METADATA_FIELDS = [
-  'model_name',
-  'finish_reason',
-  'service_tier',
-  'system_fingerprint',
-] as const;
-
-function dropRepeatedScalarMetadata(
-  chunk: ChatGenerationChunk,
-  seen: Set<string>
-): void {
-  const generationInfo = chunk.generationInfo as
-    | Record<string, unknown>
-    | undefined;
-  const responseMetadata = chunk.message.response_metadata as Record<
-    string,
-    unknown
-  >;
-  for (const field of REPEATED_SCALAR_METADATA_FIELDS) {
-    const inGenerationInfo =
-      generationInfo != null && generationInfo[field] != null;
-    const inResponseMetadata = responseMetadata[field] != null;
-    if (!inGenerationInfo && !inResponseMetadata) {
-      continue;
-    }
-    if (!seen.has(field)) {
-      seen.add(field);
-      continue;
-    }
-    if (inGenerationInfo) {
-      delete generationInfo[field];
-    }
-    if (inResponseMetadata) {
-      delete responseMetadata[field];
-    }
-  }
 }
 
 async function* delayStreamChunks(
