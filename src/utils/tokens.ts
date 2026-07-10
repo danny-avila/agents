@@ -17,7 +17,7 @@ const OPENAI_IMAGE_TOKENS_PER_TILE = 170;
 /** Google Gemini fixed per-image cost. */
 const _GEMINI_IMAGE_TOKENS = 258;
 /** Safety margin for image and document token estimates (5% overestimate). */
-const IMAGE_TOKEN_SAFETY_MARGIN = 1.05;
+export const IMAGE_TOKEN_SAFETY_MARGIN = 1.05;
 
 /**
  * Anthropic PDF: each page costs image tokens + text tokens.
@@ -32,6 +32,26 @@ const _GEMINI_PDF_TOKENS_PER_PAGE = 258;
 const BASE64_BYTES_PER_PDF_PAGE = 75_000;
 /** Fallback token cost for URL-referenced documents without local data. */
 const URL_DOCUMENT_FALLBACK_TOKENS = 2000;
+
+/**
+ * Timed media (video/audio) is priced by DURATION, not size, and the content
+ * carries no duration — so duration is estimated from encoded size at
+ * representative bitrates and priced at Gemini's rates (the dominant provider
+ * for native video/audio). Deliberately rough; superseded by real provider
+ * usage after the first turn.
+ */
+/** Gemini video ≈ 258 tokens/frame (1 fps) + 32 tokens/s audio ≈ 300 tokens/s. */
+const VIDEO_TOKENS_PER_SECOND = 300;
+/** Gemini audio: 32 tokens/s (single channel). */
+const AUDIO_TOKENS_PER_SECOND = 32;
+/** Representative encoded byte rates for duration-from-size estimation. */
+const VIDEO_BYTES_PER_SECOND = 250_000; // ~2 Mbps
+const AUDIO_BYTES_PER_SECOND = 16_000; // ~128 kbps
+/** Flat fallback when only a URL is present (no size to estimate from) — ~30s. */
+const VIDEO_URL_FALLBACK_TOKENS = 9000;
+const AUDIO_URL_FALLBACK_TOKENS = 960;
+/** Content block types that carry timed media (video/audio). */
+const TIMED_MEDIA_TYPES = new Set(['media', 'video_url', 'input_audio']);
 
 /**
  * Extracts image dimensions from the first bytes of a base64-encoded
@@ -135,7 +155,7 @@ export function estimateOpenAIImageTokens(
  * Extracts dimensions from base64 header when available.
  * Falls back to Anthropic minimum (1024) when dimensions can't be determined.
  */
-function estimateImageBlockTokens(
+export function estimateImageBlockTokens(
   block: Record<string, unknown>,
   encoding: EncodingName
 ): number {
@@ -180,7 +200,7 @@ function estimateImageBlockTokens(
  * - Base64 PDF: page count estimated from base64 length × per-page cost.
  * - URL reference: conservative flat estimate.
  */
-function estimateDocumentBlockTokens(
+export function estimateDocumentBlockTokens(
   block: Record<string, unknown>,
   encoding: EncodingName,
   getTokenCount: (text: string) => number
@@ -287,6 +307,143 @@ function estimateDocumentBlockTokens(
   return URL_DOCUMENT_FALLBACK_TOKENS;
 }
 
+/** Decoded byte length of base64 or a `data:` URL; 0 for a remote/empty URL. */
+function base64ByteLength(value: string | undefined): number {
+  if (typeof value !== 'string' || value.length === 0) {
+    return 0;
+  }
+  if (value.startsWith('data:')) {
+    const comma = value.indexOf(',');
+    return comma < 0 ? 0 : Math.floor(((value.length - comma - 1) * 3) / 4);
+  }
+  if (/^https?:\/\//i.test(value)) {
+    return 0;
+  }
+  return Math.floor((value.length * 3) / 4);
+}
+
+function timedMediaTokens(
+  bytes: number,
+  bytesPerSecond: number,
+  tokensPerSecond: number,
+  urlFallback: number
+): number {
+  if (bytes <= 0) {
+    return urlFallback;
+  }
+  return Math.max(
+    tokensPerSecond,
+    Math.ceil((bytes / bytesPerSecond) * tokensPerSecond)
+  );
+}
+
+/**
+ * Estimates token cost for a timed-media block (video/audio). Handles Google
+ * `{ type: 'media', mimeType, data }`, OpenRouter `{ type: 'video_url' }` and
+ * `{ type: 'input_audio' }`. Duration is inferred from encoded size (providers
+ * price by duration, which the block does not carry); a bare URL falls back to
+ * a ~30s flat estimate. Unknown `media` mime is treated as video (the larger
+ * rate) to stay conservative.
+ */
+export function estimateTimedMediaBlockTokens(
+  block: Record<string, unknown>
+): number {
+  if (block.type === 'input_audio') {
+    const audio = block.input_audio as { data?: string } | undefined;
+    return timedMediaTokens(
+      base64ByteLength(audio?.data),
+      AUDIO_BYTES_PER_SECOND,
+      AUDIO_TOKENS_PER_SECOND,
+      AUDIO_URL_FALLBACK_TOKENS
+    );
+  }
+  if (block.type === 'video_url') {
+    const video = block.video_url as string | { url?: string } | undefined;
+    const url = typeof video === 'string' ? video : video?.url;
+    return timedMediaTokens(
+      base64ByteLength(url),
+      VIDEO_BYTES_PER_SECOND,
+      VIDEO_TOKENS_PER_SECOND,
+      VIDEO_URL_FALLBACK_TOKENS
+    );
+  }
+  if (block.type === 'media') {
+    const mime = typeof block.mimeType === 'string' ? block.mimeType : '';
+    const data = typeof block.data === 'string' ? block.data : undefined;
+    if (mime.startsWith('audio/')) {
+      return timedMediaTokens(
+        base64ByteLength(data),
+        AUDIO_BYTES_PER_SECOND,
+        AUDIO_TOKENS_PER_SECOND,
+        AUDIO_URL_FALLBACK_TOKENS
+      );
+    }
+    return timedMediaTokens(
+      base64ByteLength(data),
+      VIDEO_BYTES_PER_SECOND,
+      VIDEO_TOKENS_PER_SECOND,
+      VIDEO_URL_FALLBACK_TOKENS
+    );
+  }
+  return 0;
+}
+
+/**
+ * Sums the estimated token cost of the image, document, and timed-media blocks
+ * in a message content array (`image_url` / `image` / `image_file` via image
+ * estimation; `document` / `file` via document estimation; `media` /
+ * `video_url` / `input_audio` via timed-media estimation), applying the same
+ * 5% safety margin as {@link getTokenCountForMessage}. Text, tool_call, and
+ * other non-media blocks are ignored. Use this to price attachments that are
+ * not already represented as inline content the caller counts elsewhere.
+ */
+export function estimateMediaTokensForMessage(
+  content: unknown,
+  encoding: EncodingName = 'o200k_base',
+  getTokenCount: (text: string) => number = (text) => Math.ceil(text.length / 4)
+): number {
+  if (!Array.isArray(content)) {
+    return 0;
+  }
+  let total = 0;
+  for (const raw of content) {
+    const item = raw as
+      | (Record<string, unknown> & { type?: string })
+      | null
+      | undefined;
+    if (item == null || typeof item.type !== 'string') {
+      continue;
+    }
+    if (
+      item.type === ContentTypes.IMAGE_URL ||
+      item.type === 'image_url' ||
+      item.type === 'image'
+    ) {
+      total += Math.ceil(
+        estimateImageBlockTokens(item, encoding) * IMAGE_TOKEN_SAFETY_MARGIN
+      );
+      continue;
+    }
+    if (
+      item.type === 'document' ||
+      item.type === 'file' ||
+      item.type === ContentTypes.IMAGE_FILE
+    ) {
+      total += Math.ceil(
+        estimateDocumentBlockTokens(item, encoding, getTokenCount) *
+          IMAGE_TOKEN_SAFETY_MARGIN
+      );
+      continue;
+    }
+    if (TIMED_MEDIA_TYPES.has(item.type)) {
+      total += Math.ceil(
+        estimateTimedMediaBlockTokens(item) * IMAGE_TOKEN_SAFETY_MARGIN
+      );
+    }
+  }
+  return total;
+}
+
 const tokenizers: Partial<Record<EncodingName, Tokenizer>> = {};
 
 async function getTokenizer(
@@ -354,6 +511,13 @@ export function getTokenCountForMessage(
           numTokens += Math.ceil(
             estimateDocumentBlockTokens(item, encoding, getTokenCount) *
               IMAGE_TOKEN_SAFETY_MARGIN
+          );
+          continue;
+        }
+
+        if (TIMED_MEDIA_TYPES.has(item.type)) {
+          numTokens += Math.ceil(
+            estimateTimedMediaBlockTokens(item) * IMAGE_TOKEN_SAFETY_MARGIN
           );
           continue;
         }
