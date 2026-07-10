@@ -1,7 +1,9 @@
 import { HumanMessage } from '@langchain/core/messages';
+import { LangfuseOtelSpanAttributes } from '@langfuse/tracing';
 import { CallbackManager } from '@langchain/core/callbacks/manager';
 import { context as otelContext, trace as otelTrace } from '@opentelemetry/api';
 import type * as t from '@/types';
+import { handleConverseStreamMetadata } from '@/llm/bedrock/utils/message_outputs';
 import { traceIdFromSeed } from '@/langfuseRuntimeContext';
 import { Providers } from '@/common';
 import { Run } from '@/run';
@@ -385,6 +387,60 @@ describe('Langfuse callback composition', () => {
       'librechat.langfuse.tenant_export.enabled': 'true',
       'librechat.langfuse.destination': 'eu',
     });
+  });
+
+  it('exports Bedrock prompt-cache usage buckets to Langfuse', async () => {
+    const { createLangfuseHandler } = await import('@/langfuse');
+    const handler = createLangfuseHandler({
+      langfuse: {
+        publicKey: 'pk-test',
+        secretKey: 'sk-test',
+      },
+    });
+    const runId = 'test-langfuse-bedrock-cache-usage';
+
+    await handler?.handleChatModelStart(
+      {
+        lc: 1,
+        type: 'constructor',
+        id: ['LibreChatBedrockConverse'],
+        kwargs: {},
+      },
+      [[new HumanMessage('hello')]],
+      runId
+    );
+
+    const generation = handleConverseStreamMetadata(
+      {
+        usage: {
+          inputTokens: 13,
+          outputTokens: 5,
+          totalTokens: 20849,
+          cacheReadInputTokens: 10831,
+          cacheWriteInputTokens: 10000,
+        },
+        metrics: { latencyMs: 1000 },
+      },
+      { streamUsage: true }
+    );
+    await handler?.handleLLMEnd({ generations: [[generation]] }, runId);
+
+    const usageDetails = mockSpanAttributeSets
+      .map(
+        (attributes) =>
+          attributes[LangfuseOtelSpanAttributes.OBSERVATION_USAGE_DETAILS]
+      )
+      .find((value): value is string => typeof value === 'string');
+
+    expect(usageDetails).toBe(
+      JSON.stringify({
+        input: 0,
+        output: 5,
+        total: 20849,
+        input_cache_read: 10831,
+        input_cache_creation: 10000,
+      })
+    );
   });
 
   it('uses deterministic trace ids when tracing is configured from env only', async () => {
