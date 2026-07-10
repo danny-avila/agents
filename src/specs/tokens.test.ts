@@ -204,6 +204,57 @@ describe('estimateTimedMediaBlockTokens', () => {
     ).toBe(32);
   });
 
+  test('standard type=video / type=audio blocks (Bedrock converter shape)', () => {
+    // 750,000 bytes video / 250,000 = 3s * 300 = 900
+    expect(
+      estimateTimedMediaBlockTokens({ type: 'video', mimeType: 'video/mp4', data: B64(1_000_000) }),
+    ).toBe(900);
+    // 240,000 bytes audio / 16,000 = 15s * 32 = 480
+    expect(
+      estimateTimedMediaBlockTokens({ type: 'audio', mimeType: 'audio/mpeg', data: B64(320_000) }),
+    ).toBe(480);
+  });
+
+  test('reads Uint8Array data and base64 url payloads', () => {
+    // 240,000-byte Uint8Array audio -> 15s * 32 = 480
+    expect(
+      estimateTimedMediaBlockTokens({
+        type: 'audio',
+        mimeType: 'audio/wav',
+        data: new Uint8Array(240_000),
+      }),
+    ).toBe(480);
+    // base64 data url on a bare video block
+    expect(
+      estimateTimedMediaBlockTokens({
+        type: 'video',
+        mimeType: 'video/mp4',
+        url: `data:video/mp4;base64,${B64(1_000_000)}`,
+      }),
+    ).toBe(900);
+  });
+
+  test('non-video/audio media (image/document MIME) is NOT priced as video', () => {
+    expect(
+      estimateTimedMediaBlockTokens({ type: 'media', mimeType: 'image/png', fileUri: 's3://x' }),
+    ).toBe(0);
+    expect(
+      estimateTimedMediaBlockTokens({ type: 'media', mimeType: 'image/png', data: B64(400_000) }),
+    ).toBe(0);
+    expect(
+      estimateTimedMediaBlockTokens({ type: 'media', mimeType: 'application/pdf', data: B64(400) }),
+    ).toBe(0);
+  });
+
+  test('fileId / bare URL with no size falls back to the ~30s estimate', () => {
+    expect(
+      estimateTimedMediaBlockTokens({ type: 'video', mimeType: 'video/mp4', fileId: 's3://v' }),
+    ).toBe(9000);
+    expect(
+      estimateTimedMediaBlockTokens({ type: 'audio', mimeType: 'audio/mp3', fileId: 's3://a' }),
+    ).toBe(960);
+  });
+
   test('returns 0 for non-timed-media blocks', () => {
     expect(estimateTimedMediaBlockTokens({ type: 'text' })).toBe(0);
   });

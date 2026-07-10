@@ -50,8 +50,15 @@ const AUDIO_BYTES_PER_SECOND = 16_000; // ~128 kbps
 /** Flat fallback when only a URL is present (no size to estimate from) — ~30s. */
 const VIDEO_URL_FALLBACK_TOKENS = 9000;
 const AUDIO_URL_FALLBACK_TOKENS = 960;
-/** Content block types that carry timed media (video/audio). */
-const TIMED_MEDIA_TYPES = new Set(['media', 'video_url', 'input_audio']);
+/** Content block types that can carry timed media (video/audio). `media` is
+ *  generic (Google) so it is classified by MIME; the rest are unambiguous. */
+const TIMED_MEDIA_TYPES = new Set([
+  'media',
+  'video',
+  'audio',
+  'video_url',
+  'input_audio',
+]);
 
 /**
  * Extracts image dimensions from the first bytes of a base64-encoded
@@ -337,55 +344,89 @@ function timedMediaTokens(
   );
 }
 
+/** Decoded byte length of a media block payload — `data` (base64 string or
+ *  `Uint8Array`) or a base64 `url`; 0 for a bare remote URL, `fileId`/`fileUri`,
+ *  or empty. */
+function mediaBlockByteLength(block: Record<string, unknown>): number {
+  const data = block.data;
+  if (typeof data === 'string') {
+    return base64ByteLength(data);
+  }
+  if (data instanceof Uint8Array) {
+    return data.length;
+  }
+  if (typeof block.url === 'string') {
+    return base64ByteLength(block.url);
+  }
+  return 0;
+}
+
+/** Classifies a block as timed media, or null when it is not video/audio — e.g.
+ *  a generic Google `media` block carrying an image/document MIME, which must
+ *  NOT be priced as video. */
+function timedMediaKind(
+  block: Record<string, unknown>
+): 'video' | 'audio' | null {
+  if (block.type === 'input_audio' || block.type === 'audio') {
+    return 'audio';
+  }
+  if (block.type === 'video_url' || block.type === 'video') {
+    return 'video';
+  }
+  if (block.type === 'media') {
+    const mime = typeof block.mimeType === 'string' ? block.mimeType : '';
+    if (mime.startsWith('audio/')) {
+      return 'audio';
+    }
+    if (mime.startsWith('video/')) {
+      return 'video';
+    }
+  }
+  return null;
+}
+
 /**
  * Estimates token cost for a timed-media block (video/audio). Handles Google
- * `{ type: 'media', mimeType, data }`, OpenRouter `{ type: 'video_url' }` and
- * `{ type: 'input_audio' }`. Duration is inferred from encoded size (providers
- * price by duration, which the block does not carry); a bare URL falls back to
- * a ~30s flat estimate. Unknown `media` mime is treated as video (the larger
- * rate) to stay conservative.
+ * `{ type: 'media', mimeType, data|url|fileUri }`, OpenRouter
+ * `{ type: 'video_url' }` / `{ type: 'input_audio' }`, and standard
+ * `{ type: 'video' }` / `{ type: 'audio' }` blocks (payload as `data` base64 or
+ * `Uint8Array`, base64 `url`, or `fileId`). Duration is inferred from encoded
+ * size (providers price by duration, which the block does not carry) at Gemini's
+ * rates; a payload with no size (bare URL / file id) falls back to a ~30s
+ * estimate. Returns 0 for non-timed media (e.g. an image/document `media` block)
+ * so it is never mispriced as video.
  */
 export function estimateTimedMediaBlockTokens(
   block: Record<string, unknown>
 ): number {
+  const kind = timedMediaKind(block);
+  if (kind == null) {
+    return 0;
+  }
+  let bytes: number;
   if (block.type === 'input_audio') {
     const audio = block.input_audio as { data?: string } | undefined;
+    bytes = base64ByteLength(audio?.data);
+  } else if (block.type === 'video_url') {
+    const video = block.video_url as string | { url?: string } | undefined;
+    bytes = base64ByteLength(typeof video === 'string' ? video : video?.url);
+  } else {
+    bytes = mediaBlockByteLength(block);
+  }
+  if (kind === 'audio') {
     return timedMediaTokens(
-      base64ByteLength(audio?.data),
+      bytes,
       AUDIO_BYTES_PER_SECOND,
       AUDIO_TOKENS_PER_SECOND,
       AUDIO_URL_FALLBACK_TOKENS
     );
   }
-  if (block.type === 'video_url') {
-    const video = block.video_url as string | { url?: string } | undefined;
-    const url = typeof video === 'string' ? video : video?.url;
-    return timedMediaTokens(
-      base64ByteLength(url),
-      VIDEO_BYTES_PER_SECOND,
-      VIDEO_TOKENS_PER_SECOND,
-      VIDEO_URL_FALLBACK_TOKENS
-    );
-  }
-  if (block.type === 'media') {
-    const mime = typeof block.mimeType === 'string' ? block.mimeType : '';
-    const data = typeof block.data === 'string' ? block.data : undefined;
-    if (mime.startsWith('audio/')) {
-      return timedMediaTokens(
-        base64ByteLength(data),
-        AUDIO_BYTES_PER_SECOND,
-        AUDIO_TOKENS_PER_SECOND,
-        AUDIO_URL_FALLBACK_TOKENS
-      );
-    }
-    return timedMediaTokens(
-      base64ByteLength(data),
-      VIDEO_BYTES_PER_SECOND,
-      VIDEO_TOKENS_PER_SECOND,
-      VIDEO_URL_FALLBACK_TOKENS
-    );
-  }
-  return 0;
+  return timedMediaTokens(
+    bytes,
+    VIDEO_BYTES_PER_SECOND,
+    VIDEO_TOKENS_PER_SECOND,
+    VIDEO_URL_FALLBACK_TOKENS
+  );
 }
 
 /**
