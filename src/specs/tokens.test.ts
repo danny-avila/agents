@@ -161,6 +161,13 @@ describe('estimateMediaTokensForMessage', () => {
     const video = [{ type: 'media', mimeType: 'video/mp4', data: 'A'.repeat(1_000_000) }];
     expect(estimateMediaTokensForMessage(video)).toBe(Math.ceil(900 * IMAGE_TOKEN_SAFETY_MARGIN));
   });
+
+  test('prices image_file blocks as images (1024 fallback), not documents (2000)', () => {
+    const content = [{ type: 'image_file', image_file: { file_id: 'file-abc' } }];
+    expect(estimateMediaTokensForMessage(content, 'claude')).toBe(
+      Math.ceil(1024 * IMAGE_TOKEN_SAFETY_MARGIN),
+    );
+  });
 });
 
 describe('estimateTimedMediaBlockTokens', () => {
@@ -253,6 +260,25 @@ describe('estimateTimedMediaBlockTokens', () => {
     expect(
       estimateTimedMediaBlockTokens({ type: 'audio', mimeType: 'audio/mp3', fileId: 's3://a' }),
     ).toBe(960);
+  });
+
+  test('reads native Bedrock nested source.bytes (video/audio)', () => {
+    expect(
+      estimateTimedMediaBlockTokens({ type: 'video', video: { source: { bytes: new Uint8Array(750_000) } } }),
+    ).toBe(900); // 750,000 / 250,000 = 3s * 300
+    expect(
+      estimateTimedMediaBlockTokens({ type: 'audio', audio: { source: { bytes: new Uint8Array(240_000) } } }),
+    ).toBe(480); // 240,000 / 16,000 = 15s * 32
+  });
+
+  test('non-data URI schemes (gs://, s3://) are treated as remote, not base64', () => {
+    // gs:// audio must hit the ~30s remote fallback, not clamp to 32
+    expect(
+      estimateTimedMediaBlockTokens({ type: 'audio', mimeType: 'audio/mp3', url: 'gs://bucket/a.mp3' }),
+    ).toBe(960);
+    expect(
+      estimateTimedMediaBlockTokens({ type: 'media', mimeType: 'video/mp4', data: 's3://bucket/v.mp4' }),
+    ).toBe(9000);
   });
 
   test('returns 0 for non-timed-media blocks', () => {

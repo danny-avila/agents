@@ -314,7 +314,9 @@ export function estimateDocumentBlockTokens(
   return URL_DOCUMENT_FALLBACK_TOKENS;
 }
 
-/** Decoded byte length of base64 or a `data:` URL; 0 for a remote/empty URL. */
+/** Decoded byte length of base64 or a `data:` URL; 0 for any remote URI (http,
+ *  gs, s3, file, …) or empty. Base64 never contains `:`, so any scheme prefix
+ *  marks a remote reference with no local size. */
 function base64ByteLength(value: string | undefined): number {
   if (typeof value !== 'string' || value.length === 0) {
     return 0;
@@ -323,7 +325,7 @@ function base64ByteLength(value: string | undefined): number {
     const comma = value.indexOf(',');
     return comma < 0 ? 0 : Math.floor(((value.length - comma - 1) * 3) / 4);
   }
-  if (/^https?:\/\//i.test(value)) {
+  if (/^[a-z][a-z0-9+.-]*:/i.test(value)) {
     return 0;
   }
   return Math.floor((value.length * 3) / 4);
@@ -344,9 +346,10 @@ function timedMediaTokens(
   );
 }
 
-/** Decoded byte length of a media block payload — `data` (base64 string or
- *  `Uint8Array`) or a base64 `url`; 0 for a bare remote URL, `fileId`/`fileUri`,
- *  or empty. */
+/** Decoded byte length of a media block payload — top-level `data` (base64
+ *  string or `Uint8Array`) or base64 `url`, or the native Bedrock nested
+ *  `video|audio.source.bytes` (`Uint8Array`); 0 for a bare remote URL,
+ *  `fileId`/`fileUri`, S3 location, or empty. */
 function mediaBlockByteLength(block: Record<string, unknown>): number {
   const data = block.data;
   if (typeof data === 'string') {
@@ -357,6 +360,13 @@ function mediaBlockByteLength(block: Record<string, unknown>): number {
   }
   if (typeof block.url === 'string') {
     return base64ByteLength(block.url);
+  }
+  const nested = (block.video ?? block.audio) as
+    | { source?: { bytes?: unknown } }
+    | undefined;
+  const bytes = nested?.source?.bytes;
+  if (bytes instanceof Uint8Array) {
+    return bytes.length;
   }
   return 0;
 }
@@ -458,18 +468,15 @@ export function estimateMediaTokensForMessage(
     if (
       item.type === ContentTypes.IMAGE_URL ||
       item.type === 'image_url' ||
-      item.type === 'image'
+      item.type === 'image' ||
+      item.type === ContentTypes.IMAGE_FILE
     ) {
       total += Math.ceil(
         estimateImageBlockTokens(item, encoding) * IMAGE_TOKEN_SAFETY_MARGIN
       );
       continue;
     }
-    if (
-      item.type === 'document' ||
-      item.type === 'file' ||
-      item.type === ContentTypes.IMAGE_FILE
-    ) {
+    if (item.type === 'document' || item.type === 'file') {
       total += Math.ceil(
         estimateDocumentBlockTokens(item, encoding, getTokenCount) *
           IMAGE_TOKEN_SAFETY_MARGIN
