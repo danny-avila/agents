@@ -21,6 +21,7 @@ import { Run } from '@/run';
 import { formatAgentMessages } from '@/messages/format';
 import { FakeListChatModel } from '@langchain/core/utils/testing';
 import * as providers from '@/llm/providers';
+import { hasAnyEnv, hasEnv, hasEveryEnv } from './spec.utils';
 
 const SUMMARY_WRAPPER_OVERHEAD_TOKENS = 33;
 
@@ -287,7 +288,7 @@ function logTurn(
 // Anthropic Summarization Tests
 // ---------------------------------------------------------------------------
 
-const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
+const hasAnthropic = hasEnv('ANTHROPIC_API_KEY');
 (hasAnthropic ? describe : describe.skip)('Anthropic Summarization E2E', () => {
   jest.setTimeout(180_000);
 
@@ -599,7 +600,7 @@ const hasAnthropic = process.env.ANTHROPIC_API_KEY != null;
   }, 180_000);
 
   test('cross-provider summarization: Anthropic agent with OpenAI summarizer', async () => {
-    const hasOpenAI = process.env.OPENAI_API_KEY != null;
+    const hasOpenAI = hasEnv('OPENAI_API_KEY');
     if (!hasOpenAI) {
       console.log('  Skipping cross-provider test (no OPENAI_API_KEY)');
       return;
@@ -1026,7 +1027,7 @@ const requiredBedrockEnv = [
   'BEDROCK_AWS_ACCESS_KEY_ID',
   'BEDROCK_AWS_SECRET_ACCESS_KEY',
 ];
-const hasBedrock = requiredBedrockEnv.every((k) => process.env[k] != null);
+const hasBedrock = hasEveryEnv(requiredBedrockEnv);
 
 (hasBedrock ? describe : describe.skip)('Bedrock Summarization E2E', () => {
   jest.setTimeout(180_000);
@@ -1159,7 +1160,7 @@ const hasBedrock = requiredBedrockEnv.every((k) => process.env[k] != null);
 // OpenAI Summarization Tests
 // ---------------------------------------------------------------------------
 
-const hasOpenAI = process.env.OPENAI_API_KEY != null;
+const hasOpenAI = hasEnv('OPENAI_API_KEY');
 (hasOpenAI ? describe : describe.skip)('OpenAI Summarization E2E', () => {
   jest.setTimeout(120_000);
 
@@ -2111,7 +2112,6 @@ describe('Tight context with oversized tool results (no API keys)', () => {
             constructor(_options: any) {
               super({ responses: [SUMMARY_RESPONSE] });
             }
-            // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
             async *_streamResponseChunks(
               messages: any[],
               options: any,
@@ -2419,17 +2419,14 @@ describe('Tight context with oversized tool results (no API keys)', () => {
 // Token accounting audit (requires API keys)
 // ---------------------------------------------------------------------------
 
-const hasAnyApiKey =
-  process.env.ANTHROPIC_API_KEY != null || process.env.OPENAI_API_KEY != null;
+const hasAnyApiKey = hasAnyEnv(['ANTHROPIC_API_KEY', 'OPENAI_API_KEY']);
 
 (hasAnyApiKey ? describe : describe.skip)('Token accounting audit', () => {
   jest.setTimeout(180_000);
 
-  const agentProvider =
-    process.env.ANTHROPIC_API_KEY != null &&
-    process.env.ANTHROPIC_API_KEY !== ''
-      ? Providers.ANTHROPIC
-      : Providers.OPENAI;
+  const agentProvider = hasEnv('ANTHROPIC_API_KEY')
+    ? Providers.ANTHROPIC
+    : Providers.OPENAI;
   const summarizationProvider = agentProvider;
   const summarizationModel =
     agentProvider === Providers.ANTHROPIC ? 'claude-haiku-4-5' : 'gpt-4.1-mini';
@@ -2960,7 +2957,6 @@ describe('Summarization deduplication correctness (no API keys)', () => {
               chunkCallCount++;
               super({ responses: [response] });
             }
-            // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
             async *_streamResponseChunks(
               messages: any[],
               options: any,
