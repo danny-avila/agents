@@ -135,9 +135,10 @@ export type PruneMessagesParams = {
   usageMetadata?: Partial<UsageMetadata>;
   startType?: ReturnType<BaseMessage['getType']>;
   /**
-   * Usage from the most recent LLM call only (not accumulated).
-   * When provided, calibration uses this instead of usageMetadata
-   * to avoid inflated ratios from N×cacheRead accumulation.
+   * Fallback usage from the most recent LLM call only (not accumulated).
+   * Calibration prefers the provider's raw `usageMetadata.input_tokens`
+   * when available, because cache detail fields may use non-window
+   * accounting units.
    */
   lastCallUsage?: {
     totalTokens: number;
@@ -1436,8 +1437,10 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
     // no per-turn oscillation, no map mutation.
     if (currentUsage && params.totalTokensFresh !== false) {
       const instructionOverhead = factoryParams.getInstructionTokens?.() ?? 0;
-      const providerInputTokens =
-        params.lastCallUsage?.inputTokens ?? currentUsage.input_tokens;
+      const rawProviderInputTokens = Number(params.usageMetadata?.input_tokens);
+      const providerInputTokens = checkValidNumber(rawProviderInputTokens)
+        ? rawProviderInputTokens
+        : (params.lastCallUsage?.inputTokens ?? currentUsage.input_tokens);
 
       // Sum raw tiktoken counts for messages the provider saw (excludes
       // new outputs from this turn — the provider hasn't seen them yet).
@@ -1458,8 +1461,20 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         0,
         providerInputTokens - instructionOverhead
       );
+      const minimumComparableInputTokens =
+        instructionOverhead + rawSentThisTurn * CALIBRATION_RATIO_MIN;
+      let calibrationSkipReason: string | undefined;
+      if (rawSentThisTurn <= 0) {
+        calibrationSkipReason = 'no_sent_messages';
+      } else if (providerMessageTokens <= 0) {
+        calibrationSkipReason = 'input_below_instruction_overhead';
+      } else if (providerInputTokens < minimumComparableInputTokens) {
+        calibrationSkipReason = 'input_below_calibration_floor';
+      } else if (providerInputTokens > factoryParams.maxTokens) {
+        calibrationSkipReason = 'input_exceeds_context_window';
+      }
 
-      if (rawSentThisTurn > 0 && providerMessageTokens > 0) {
+      if (calibrationSkipReason == null) {
         cumulativeRawSent += rawSentThisTurn;
         cumulativeProviderReported += providerMessageTokens;
         const newRatio = cumulativeProviderReported / cumulativeRawSent;
@@ -1467,33 +1482,44 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
           CALIBRATION_RATIO_MIN,
           Math.min(CALIBRATION_RATIO_MAX, newRatio)
         );
+
+        const calibratedOurTotal =
+          instructionOverhead + rawSentThisTurn * calibrationRatio;
+        const overallRatio =
+          calibratedOurTotal > 0 ? providerInputTokens / calibratedOurTotal : 0;
+        const variancePct = Math.round((overallRatio - 1) * 100);
+
+        const absVariance = Math.abs(overallRatio - 1);
+        if (absVariance < bestVarianceAbs) {
+          bestVarianceAbs = absVariance;
+          bestInstructionOverhead = Math.max(
+            0,
+            Math.round(providerInputTokens - rawSentThisTurn * calibrationRatio)
+          );
+          bestInstructionEstimate = factoryParams.getInstructionTokens?.() ?? 0;
+        }
+
+        factoryParams.log?.('debug', 'Calibration observed', {
+          providerInputTokens,
+          calibratedEstimate: Math.round(calibratedOurTotal),
+          variance: `${variancePct > 0 ? '+' : ''}${variancePct}%`,
+          calibrationRatio: Math.round(calibrationRatio * 100) / 100,
+          instructionOverhead,
+          cumulativeRawSent,
+          cumulativeProviderReported,
+        });
+      } else {
+        factoryParams.log?.('debug', 'Calibration skipped', {
+          reason: calibrationSkipReason,
+          providerInputTokens,
+          minimumComparableInputTokens: Math.round(
+            minimumComparableInputTokens
+          ),
+          maxContextTokens: factoryParams.maxTokens,
+          rawSentThisTurn,
+          instructionOverhead,
+        });
       }
-
-      const calibratedOurTotal =
-        instructionOverhead + rawSentThisTurn * calibrationRatio;
-      const overallRatio =
-        calibratedOurTotal > 0 ? providerInputTokens / calibratedOurTotal : 0;
-      const variancePct = Math.round((overallRatio - 1) * 100);
-
-      const absVariance = Math.abs(overallRatio - 1);
-      if (absVariance < bestVarianceAbs && rawSentThisTurn > 0) {
-        bestVarianceAbs = absVariance;
-        bestInstructionOverhead = Math.max(
-          0,
-          Math.round(providerInputTokens - rawSentThisTurn * calibrationRatio)
-        );
-        bestInstructionEstimate = factoryParams.getInstructionTokens?.() ?? 0;
-      }
-
-      factoryParams.log?.('debug', 'Calibration observed', {
-        providerInputTokens,
-        calibratedEstimate: Math.round(calibratedOurTotal),
-        variance: `${variancePct > 0 ? '+' : ''}${variancePct}%`,
-        calibrationRatio: Math.round(calibrationRatio * 100) / 100,
-        instructionOverhead,
-        cumulativeRawSent,
-        cumulativeProviderReported,
-      });
     }
 
     // Computed BEFORE pre-flight truncation so the effective budget can drive
