@@ -1,9 +1,20 @@
 import { CallbackHandler } from '@langfuse/langchain';
 import { context as otelContext } from '@opentelemetry/api';
+import { AIMessage, AIMessageChunk } from '@langchain/core/messages';
 import {
   getLangfuseTracerProvider,
   propagateAttributes,
 } from '@langfuse/tracing';
+import type {
+  AIMessageChunkFields,
+  AIMessageFields,
+  UsageMetadata,
+} from '@langchain/core/messages';
+import type {
+  ChatGeneration,
+  Generation,
+  LLMResult,
+} from '@langchain/core/outputs';
 import type { PropagateAttributesParams } from '@langfuse/tracing';
 import type * as t from '@/types';
 import {
@@ -42,6 +53,116 @@ type LangfuseAttributeParams = AgentLangfuseHandlerParams & {
 type FlushableTracerProvider = {
   forceFlush?: () => Promise<void> | void;
 };
+
+type BedrockResponseUsage = {
+  inputTokens?: number;
+  cacheReadInputTokens?: number;
+  cacheWriteInputTokens?: number;
+};
+
+type BedrockResponseMetadata = {
+  metadata?: {
+    usage?: BedrockResponseUsage;
+  };
+};
+
+function getLangfuseBedrockUsage(
+  message: AIMessage | AIMessageChunk
+): UsageMetadata | undefined {
+  const usageMetadata = message.usage_metadata;
+  const bedrockUsage = (message.response_metadata as BedrockResponseMetadata)
+    .metadata?.usage;
+  if (
+    usageMetadata == null ||
+    bedrockUsage == null ||
+    usageMetadata.input_tokens !== bedrockUsage.inputTokens
+  ) {
+    return usageMetadata;
+  }
+
+  const cacheRead = bedrockUsage.cacheReadInputTokens ?? 0;
+  const cacheCreation = bedrockUsage.cacheWriteInputTokens ?? 0;
+  if (cacheRead === 0 && cacheCreation === 0) {
+    return usageMetadata;
+  }
+
+  return {
+    ...usageMetadata,
+    input_tokens: usageMetadata.input_tokens + cacheRead + cacheCreation,
+  };
+}
+
+function cloneMessageWithUsage(
+  message: AIMessage | AIMessageChunk,
+  usageMetadata: UsageMetadata
+): AIMessage | AIMessageChunk {
+  const fields: AIMessageFields = {
+    content: message.content,
+    additional_kwargs: message.additional_kwargs,
+    response_metadata: message.response_metadata,
+    id: message.id,
+    name: message.name,
+    tool_calls: message.tool_calls,
+    invalid_tool_calls: message.invalid_tool_calls,
+    usage_metadata: usageMetadata,
+  };
+
+  if (message instanceof AIMessageChunk) {
+    const chunkFields: AIMessageChunkFields = {
+      ...fields,
+      tool_call_chunks: message.tool_call_chunks,
+    };
+    return new AIMessageChunk(chunkFields);
+  }
+
+  return new AIMessage(fields);
+}
+
+function normalizeGenerationForLangfuse(generation: Generation): Generation {
+  if (!('message' in generation)) {
+    return generation;
+  }
+
+  const message = (generation as ChatGeneration).message;
+  if (!(message instanceof AIMessage || message instanceof AIMessageChunk)) {
+    return generation;
+  }
+
+  const usageMetadata = getLangfuseBedrockUsage(message);
+  if (usageMetadata == null || usageMetadata === message.usage_metadata) {
+    return generation;
+  }
+
+  const chatGeneration: ChatGeneration = {
+    ...(generation as ChatGeneration),
+    message: cloneMessageWithUsage(message, usageMetadata),
+  };
+  return chatGeneration;
+}
+
+function normalizeBedrockUsageForLangfuse(output: LLMResult): LLMResult {
+  if (output.generations.length === 0) {
+    return output;
+  }
+
+  const listIndex = output.generations.length - 1;
+  const generationList = output.generations[listIndex];
+  if (generationList.length === 0) {
+    return output;
+  }
+
+  const generationIndex = generationList.length - 1;
+  const generation = generationList[generationIndex];
+  const normalized = normalizeGenerationForLangfuse(generation);
+  if (normalized === generation) {
+    return output;
+  }
+
+  const generations = [...output.generations];
+  generations[listIndex] = [...generationList];
+  generations[listIndex][generationIndex] = normalized;
+  return { ...output, generations };
+}
 
 class ScopedLangfuseCallbackHandler extends CallbackHandler {
   private readonly langfuse?: t.LangfuseConfig;
@@ -105,6 +226,18 @@ class ScopedLangfuseCallbackHandler extends CallbackHandler {
     ...args: Parameters<CallbackHandler['handleLLMStart']>
   ): ReturnType<CallbackHandler['handleLLMStart']> {
     return this.withRuntimeContext(() => super.handleLLMStart(...args));
+  }
+
+  override handleLLMEnd(
+    output: LLMResult,
+    runId: string,
+    parentRunId?: string
+  ): Promise<void> {
+    return super.handleLLMEnd(
+      normalizeBedrockUsageForLangfuse(output),
+      runId,
+      parentRunId
+    );
   }
 
   override handleToolStart(
@@ -351,7 +484,7 @@ export function isLangfuseCallbackHandler(value: unknown): boolean {
 export async function disposeLangfuseHandler(value: unknown): Promise<void> {
   if (
     value == null ||
-    !parseBooleanEnv(process.env[LANGFUSE_FORCE_FLUSH_ON_DISPOSE])
+    parseBooleanEnv(process.env[LANGFUSE_FORCE_FLUSH_ON_DISPOSE]) !== true
   ) {
     return;
   }

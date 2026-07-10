@@ -391,6 +391,11 @@ describe('Langfuse callback composition', () => {
 
   it('exports Bedrock prompt-cache usage buckets to Langfuse', async () => {
     const { createLangfuseHandler } = await import('@/langfuse');
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    initializeLangfuseTracing({
+      publicKey: 'pk-test',
+      secretKey: 'sk-test',
+    });
     const handler = createLangfuseHandler({
       langfuse: {
         publicKey: 'pk-test',
@@ -434,7 +439,7 @@ describe('Langfuse callback composition', () => {
 
     expect(usageDetails).toBe(
       JSON.stringify({
-        input: 0,
+        input: 13,
         output: 5,
         total: 20849,
         input_cache_read: 10831,
