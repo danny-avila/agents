@@ -182,7 +182,7 @@ describe('ToolNode per-call onResult completion emission', () => {
     expect(byId.filter((id) => id === 'call_unknown')).toHaveLength(0);
   });
 
-  it('does not offer onResult when batch-sensitive hooks are configured', async () => {
+  it('does not offer onResult when result-altering hooks are configured', async () => {
     let observedBatch: t.ToolExecuteBatchRequest | undefined;
 
     jest
@@ -202,10 +202,14 @@ describe('ToolNode per-call onResult completion emission', () => {
         ]);
       });
 
+    const hookRegistry = new HookRegistry();
+    hookRegistry.register('PostToolUse', {
+      hooks: [async () => ({})],
+    });
     const toolNode = new ToolNode({
       tools: [createDummyTool('weather')],
       eventDrivenMode: true,
-      hookRegistry: new HookRegistry(),
+      hookRegistry,
       toolCallStepIds: new Map([['call_weather', 'step_weather']]),
     });
 
@@ -219,6 +223,49 @@ describe('ToolNode per-call onResult completion emission', () => {
 
     expect(observedBatch).toBeDefined();
     expect(observedBatch?.onResult).toBeUndefined();
+  });
+
+  it('offers onResult when the registry only has observation hooks (PostToolBatch)', async () => {
+    let observedBatch: t.ToolExecuteBatchRequest | undefined;
+
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data): Promise<void> => {
+        if (event !== GraphEvents.ON_TOOL_EXECUTE) {
+          return;
+        }
+        const batch = data as t.ToolExecuteBatchRequest;
+        observedBatch = batch;
+        batch.resolve([
+          {
+            toolCallId: 'call_weather',
+            status: 'success',
+            content: 'sunny',
+          },
+        ]);
+      });
+
+    const hookRegistry = new HookRegistry();
+    hookRegistry.register('PostToolBatch', {
+      hooks: [async () => ({})],
+    });
+    const toolNode = new ToolNode({
+      tools: [createDummyTool('weather')],
+      eventDrivenMode: true,
+      hookRegistry,
+      toolCallStepIds: new Map([['call_weather', 'step_weather']]),
+    });
+
+    await toolNode.invoke({
+      messages: [
+        createAIMessageWithToolCalls([
+          { id: 'call_weather', name: 'weather', args: { city: 'NYC' } },
+        ]),
+      ],
+    });
+
+    expect(observedBatch).toBeDefined();
+    expect(observedBatch?.onResult).toBeDefined();
   });
 
   it('does not offer onResult when human-in-the-loop is enabled', async () => {

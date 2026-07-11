@@ -2091,6 +2091,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     const postToolBatchEntryByCallId = new Map<string, PostToolBatchEntry>();
     const HOOK_FALLBACK: AggregatedHookResult = Object.freeze({
       additionalContexts: [] as string[],
+      injectedMessages: [] as t.InjectedMessage[],
       errors: [] as string[],
     });
 
@@ -2637,7 +2638,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
        * released if the dispatch fails, letting the batch path re-emit.
        */
       const canEmitEarlyCompletions =
-        this.hookRegistry == null && this.humanInTheLoop?.enabled !== true;
+        this.hookRegistry?.hasResultAlteringHooks() !== true &&
+        this.humanInTheLoop?.enabled !== true;
       const earlyCompletionDispatchedIds = new Set<string>();
       const earlyCompletionDispatches: Array<Promise<void>> = [];
       const dispatchRequestById = new Map(
@@ -2975,7 +2977,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     return (
       this.eventDrivenMode &&
       this.eagerEventToolExecution?.enabled === true &&
-      this.hookRegistry == null &&
+      this.hookRegistry?.hasResultAlteringHooks() !== true &&
       this.humanInTheLoop?.enabled !== true
     );
   }
@@ -3098,6 +3100,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         orderedBatchEntries.push(entry);
       }
     }
+    const hookInjectedMessages: t.InjectedMessage[] = [];
     if (
       this.hookRegistry?.hasHookFor('PostToolBatch', runId) === true &&
       orderedBatchEntries.length > 0
@@ -3118,6 +3121,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         for (const ctx of batchHookResult.additionalContexts) {
           batchAdditionalContexts.push(ctx);
         }
+        for (const msg of batchHookResult.injectedMessages) {
+          hookInjectedMessages.push(msg);
+        }
       }
     }
 
@@ -3136,6 +3142,24 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           additional_kwargs: { role: 'system', source: 'hook' },
         })
       );
+    }
+
+    /**
+     * Hook-returned `injectedMessages` land AFTER the consolidated context
+     * message: one converted `HumanMessage` per entry (role/source kept in
+     * `additional_kwargs`), preserving per-message identity so verbatim
+     * user speech (e.g. steering) sits closest to the next model call.
+     */
+    if (hookInjectedMessages.length > 0) {
+      try {
+        injected.push(...this.convertInjectedMessages(hookInjectedMessages));
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          '[ToolNode] Failed to convert PostToolBatch injectedMessages:',
+          e instanceof Error ? e.message : e
+        );
+      }
     }
   }
 

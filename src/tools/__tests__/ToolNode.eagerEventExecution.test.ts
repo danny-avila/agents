@@ -634,4 +634,55 @@ describe('ToolNode eager event tool execution', () => {
     ]);
     expect(eagerUsageCount.size).toBe(0);
   });
+
+  it('consumes a prestarted eager result when the registry only has observation hooks', async () => {
+    const { toolExecuteCalls } = installToolExecuteResponder('redispatched');
+    const eagerExecutions = new Map<string, t.EagerEventToolExecution>();
+    const eagerUsageCount = new Map<string, number>([['weather', 1]]);
+    const request: t.ToolCallRequest = {
+      id: 'call_weather',
+      name: 'weather',
+      args: { city: 'NYC' },
+      stepId: 'step_weather',
+      turn: 0,
+    };
+    eagerExecutions.set('call_weather', {
+      toolCallId: 'call_weather',
+      toolName: 'weather',
+      args: { city: 'NYC' },
+      request,
+      promise: Promise.resolve({
+        results: [
+          {
+            toolCallId: 'call_weather',
+            status: 'success',
+            content: 'eager result',
+          },
+        ],
+      }),
+    });
+
+    const hookRegistry = new HookRegistry();
+    hookRegistry.register('PostToolBatch', {
+      hooks: [async () => ({})],
+    });
+    const toolNode = new ToolNode({
+      tools: [createDummyTool('weather')],
+      eventDrivenMode: true,
+      eagerEventToolExecution: { enabled: true },
+      eagerEventToolExecutions: eagerExecutions,
+      eagerEventToolUsageCount: eagerUsageCount,
+      hookRegistry,
+      toolCallStepIds: new Map([['call_weather', 'step_weather']]),
+    });
+
+    const result = (await toolNode.invoke({
+      messages: [createAIMessage('call_weather', 'weather', { city: 'NYC' })],
+    })) as { messages: ToolMessage[] };
+
+    expect(toolExecuteCalls).toHaveLength(0);
+    expect(eagerExecutions.has('call_weather')).toBe(false);
+    const toolMessage = result.messages.find((m) => m instanceof ToolMessage);
+    expect(toolMessage?.content).toBe('eager result');
+  });
 });

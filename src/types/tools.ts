@@ -516,7 +516,7 @@ export type InjectedMessage = {
   /** When true, the message is framework-internal: not shown in UI, not counted as a user turn */
   isMeta?: boolean;
   /** Origin tag for downstream consumers (UI, pruner, compaction) */
-  source?: 'skill' | 'hook' | 'system';
+  source?: 'skill' | 'hook' | 'system' | 'steer';
   /** Only set when source is 'skill', for compaction preservation */
   skillName?: string;
 };
