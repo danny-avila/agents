@@ -373,26 +373,38 @@ function mediaBlockByteLength(block: Record<string, unknown>): number {
 
 /** Classifies a block as timed media, or null when it is not video/audio — e.g.
  *  a generic Google `media` block carrying an image/document MIME, which must
- *  NOT be priced as video. */
+ *  NOT be priced as video. Also handles the Google shape where `type` IS the
+ *  MIME string (e.g. `{ type: 'audio/wav', data }`). */
 function timedMediaKind(
   block: Record<string, unknown>
 ): 'video' | 'audio' | null {
-  if (block.type === 'input_audio' || block.type === 'audio') {
+  const type = typeof block.type === 'string' ? block.type : '';
+  if (type === 'input_audio' || type === 'audio') {
     return 'audio';
   }
-  if (block.type === 'video_url' || block.type === 'video') {
+  if (type === 'video_url' || type === 'video') {
     return 'video';
   }
-  if (block.type === 'media') {
-    const mime = typeof block.mimeType === 'string' ? block.mimeType : '';
-    if (mime.startsWith('audio/')) {
-      return 'audio';
-    }
-    if (mime.startsWith('video/')) {
-      return 'video';
-    }
+  const mime =
+    type === 'media' && typeof block.mimeType === 'string' ? block.mimeType : type;
+  if (mime.startsWith('audio/')) {
+    return 'audio';
+  }
+  if (mime.startsWith('video/')) {
+    return 'video';
   }
   return null;
+}
+
+/** Whether a content-block `type` can carry timed media — the fixed set plus the
+ *  Google MIME-as-type shape (`audio/*` / `video/*`). Gates callers before they
+ *  hand the block to {@link estimateTimedMediaBlockTokens}. */
+function isTimedMediaType(type: string): boolean {
+  return (
+    TIMED_MEDIA_TYPES.has(type) ||
+    type.startsWith('audio/') ||
+    type.startsWith('video/')
+  );
 }
 
 /**
@@ -437,59 +449,6 @@ export function estimateTimedMediaBlockTokens(
     VIDEO_TOKENS_PER_SECOND,
     VIDEO_URL_FALLBACK_TOKENS
   );
-}
-
-/**
- * Sums the estimated token cost of the image, document, and timed-media blocks
- * in a message content array (`image_url` / `image` / `image_file` via image
- * estimation; `document` / `file` via document estimation; `media` /
- * `video_url` / `input_audio` via timed-media estimation), applying the same
- * 5% safety margin as {@link getTokenCountForMessage}. Text, tool_call, and
- * other non-media blocks are ignored. Use this to price attachments that are
- * not already represented as inline content the caller counts elsewhere.
- */
-export function estimateMediaTokensForMessage(
-  content: unknown,
-  encoding: EncodingName = 'o200k_base',
-  getTokenCount: (text: string) => number = (text) => Math.ceil(text.length / 4)
-): number {
-  if (!Array.isArray(content)) {
-    return 0;
-  }
-  let total = 0;
-  for (const raw of content) {
-    const item = raw as
-      | (Record<string, unknown> & { type?: string })
-      | null
-      | undefined;
-    if (item == null || typeof item.type !== 'string') {
-      continue;
-    }
-    if (
-      item.type === ContentTypes.IMAGE_URL ||
-      item.type === 'image_url' ||
-      item.type === 'image' ||
-      item.type === ContentTypes.IMAGE_FILE
-    ) {
-      total += Math.ceil(
-        estimateImageBlockTokens(item, encoding) * IMAGE_TOKEN_SAFETY_MARGIN
-      );
-      continue;
-    }
-    if (item.type === 'document' || item.type === 'file') {
-      total += Math.ceil(
-        estimateDocumentBlockTokens(item, encoding, getTokenCount) *
-          IMAGE_TOKEN_SAFETY_MARGIN
-      );
-      continue;
-    }
-    if (TIMED_MEDIA_TYPES.has(item.type)) {
-      total += Math.ceil(
-        estimateTimedMediaBlockTokens(item) * IMAGE_TOKEN_SAFETY_MARGIN
-      );
-    }
-  }
-  return total;
 }
 
 const tokenizers: Partial<Record<EncodingName, Tokenizer>> = {};
@@ -563,7 +522,7 @@ export function getTokenCountForMessage(
           continue;
         }
 
-        if (TIMED_MEDIA_TYPES.has(item.type)) {
+        if (isTimedMediaType(item.type)) {
           numTokens += Math.ceil(
             estimateTimedMediaBlockTokens(item) * IMAGE_TOKEN_SAFETY_MARGIN
           );

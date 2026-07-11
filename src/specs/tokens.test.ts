@@ -5,9 +5,7 @@ import {
   TokenEncoderManager,
   estimateImageBlockTokens,
   estimateDocumentBlockTokens,
-  estimateMediaTokensForMessage,
   estimateTimedMediaBlockTokens,
-  IMAGE_TOKEN_SAFETY_MARGIN,
 } from '@/utils/tokens';
 
 /** Builds a minimal PNG data URI whose IHDR encodes the given dimensions. */
@@ -133,43 +131,6 @@ describe('estimateDocumentBlockTokens', () => {
   });
 });
 
-describe('estimateMediaTokensForMessage', () => {
-  const countChars = (text: string): number => text.length;
-
-  test('sums image + document blocks with the safety margin, ignoring text/tool_call', () => {
-    const content = [
-      { type: 'text', text: 'describe these' },
-      { type: 'image_url', image_url: { url: pngDataUri(1024, 768) } },
-      { type: 'file', source_type: 'text', text: 'hello world' },
-      { type: 'tool_call', tool_call: { name: 'x', args: '{}', output: 'ok' } },
-    ];
-    const image = Math.ceil(1049 * IMAGE_TOKEN_SAFETY_MARGIN); // 1102
-    const doc = Math.ceil(11 * IMAGE_TOKEN_SAFETY_MARGIN); // 12
-    expect(estimateMediaTokensForMessage(content, 'claude', countChars)).toBe(
-      image + doc
-    );
-  });
-
-  test('returns 0 for string content or empty arrays', () => {
-    expect(estimateMediaTokensForMessage('plain string')).toBe(0);
-    expect(estimateMediaTokensForMessage([])).toBe(0);
-    expect(estimateMediaTokensForMessage([{ type: 'text', text: 'hi' }])).toBe(0);
-  });
-
-  test('prices timed-media (video/audio) blocks with the margin', () => {
-    // 1,000,000 base64 chars -> 750,000 bytes -> 3s video -> 900 tokens
-    const video = [{ type: 'media', mimeType: 'video/mp4', data: 'A'.repeat(1_000_000) }];
-    expect(estimateMediaTokensForMessage(video)).toBe(Math.ceil(900 * IMAGE_TOKEN_SAFETY_MARGIN));
-  });
-
-  test('prices image_file blocks as images (1024 fallback), not documents (2000)', () => {
-    const content = [{ type: 'image_file', image_file: { file_id: 'file-abc' } }];
-    expect(estimateMediaTokensForMessage(content, 'claude')).toBe(
-      Math.ceil(1024 * IMAGE_TOKEN_SAFETY_MARGIN),
-    );
-  });
-});
-
 describe('estimateTimedMediaBlockTokens', () => {
   const B64 = (chars: number): string => 'A'.repeat(chars);
 
@@ -281,7 +242,19 @@ describe('estimateTimedMediaBlockTokens', () => {
     ).toBe(9000);
   });
 
+  test('classifies Google MIME-as-type blocks (type is the mime string)', () => {
+    // { type: 'audio/wav', data } -> 240,000 bytes / 16,000 = 15s * 32 = 480
+    expect(
+      estimateTimedMediaBlockTokens({ type: 'audio/wav', data: B64(320_000) }),
+    ).toBe(480);
+    // { type: 'video/mp4', data } -> 750,000 / 250,000 = 3s * 300 = 900
+    expect(
+      estimateTimedMediaBlockTokens({ type: 'video/mp4', data: B64(1_000_000) }),
+    ).toBe(900);
+  });
+
   test('returns 0 for non-timed-media blocks', () => {
     expect(estimateTimedMediaBlockTokens({ type: 'text' })).toBe(0);
+    expect(estimateTimedMediaBlockTokens({ type: 'image/png', data: B64(400) })).toBe(0);
   });
 });
