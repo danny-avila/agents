@@ -16,14 +16,16 @@ import {
   createMetadataAggregator,
 } from '@/events';
 import { ContentTypes, GraphEvents, Providers, TitleMethod } from '@/common';
-import { capitalizeFirstLetter } from './spec.utils';
+import { capitalizeFirstLetter, hasEnv } from './spec.utils';
 import { createContentAggregator } from '@/stream';
 import { getLLMConfig } from '@/utils/llmConfig';
 import { getArgs } from '@/scripts/args';
 import { Run } from '@/run';
 
 const provider = Providers.ANTHROPIC;
-describe(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
+const describeIf = hasEnv('ANTHROPIC_API_KEY') ? describe : describe.skip;
+
+describeIf(`${capitalizeFirstLetter(provider)} Streaming Tests`, () => {
   jest.setTimeout(90000);
   let run: Run<t.IState>;
   let runningHistory: BaseMessage[];
