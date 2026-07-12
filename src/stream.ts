@@ -110,7 +110,7 @@ function getNonEmptyValue(possibleValues: string[]): string | undefined {
 
 function isBatchSensitiveToolExecution(graph: StandardGraph): boolean {
   return (
-    graph.hookRegistry?.hasResultAlteringHooks() === true ||
+    graph.hookRegistry?.hasResultAlteringHooks(graph.runId) === true ||
     graph.humanInTheLoop?.enabled === true
   );
 }

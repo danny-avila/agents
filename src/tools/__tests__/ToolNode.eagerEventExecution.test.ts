@@ -685,4 +685,107 @@ describe('ToolNode eager event tool execution', () => {
     const toolMessage = result.messages.find((m) => m instanceof ToolMessage);
     expect(toolMessage?.content).toBe('eager result');
   });
+
+  it('ignores another run session-scoped result-altering hooks when consuming', async () => {
+    const { toolExecuteCalls } = installToolExecuteResponder('redispatched');
+    const eagerExecutions = new Map<string, t.EagerEventToolExecution>();
+    const request: t.ToolCallRequest = {
+      id: 'call_weather',
+      name: 'weather',
+      args: { city: 'NYC' },
+      stepId: 'step_weather',
+      turn: 0,
+    };
+    eagerExecutions.set('call_weather', {
+      toolCallId: 'call_weather',
+      toolName: 'weather',
+      args: { city: 'NYC' },
+      request,
+      promise: Promise.resolve({
+        results: [
+          {
+            toolCallId: 'call_weather',
+            status: 'success',
+            content: 'eager result',
+          },
+        ],
+      }),
+    });
+
+    const hookRegistry = new HookRegistry();
+    hookRegistry.registerSession('some-other-run', 'PreToolUse', {
+      hooks: [async () => ({ decision: 'allow' as const })],
+    });
+    const toolNode = new ToolNode({
+      tools: [createDummyTool('weather')],
+      eventDrivenMode: true,
+      eagerEventToolExecution: { enabled: true },
+      eagerEventToolExecutions: eagerExecutions,
+      eagerEventToolUsageCount: new Map(),
+      hookRegistry,
+      toolCallStepIds: new Map([['call_weather', 'step_weather']]),
+    });
+
+    const result = (await toolNode.invoke({
+      messages: [createAIMessage('call_weather', 'weather', { city: 'NYC' })],
+    })) as { messages: ToolMessage[] };
+
+    expect(toolExecuteCalls).toHaveLength(0);
+    expect(eagerExecutions.has('call_weather')).toBe(false);
+    const toolMessage = result.messages.find((m) => m instanceof ToolMessage);
+    expect(toolMessage?.content).toBe('eager result');
+  });
+
+  it('consumes a prestarted eager result even after a result-altering hook registers mid-run', async () => {
+    const { toolExecuteCalls } = installToolExecuteResponder('redispatched');
+    const eagerExecutions = new Map<string, t.EagerEventToolExecution>();
+    const request: t.ToolCallRequest = {
+      id: 'call_weather',
+      name: 'weather',
+      args: { city: 'NYC' },
+      stepId: 'step_weather',
+      turn: 0,
+    };
+    // The record exists => the host already dispatched this execution before
+    // the hook below was registered. Declining to consume would re-dispatch
+    // the same call and run the tool's side effects twice.
+    eagerExecutions.set('call_weather', {
+      toolCallId: 'call_weather',
+      toolName: 'weather',
+      args: { city: 'NYC' },
+      request,
+      promise: Promise.resolve({
+        results: [
+          {
+            toolCallId: 'call_weather',
+            status: 'success',
+            content: 'eager result',
+          },
+        ],
+      }),
+    });
+
+    const hookRegistry = new HookRegistry();
+    hookRegistry.register('PreToolUse', {
+      hooks: [async () => ({ decision: 'allow' as const })],
+    });
+    const toolNode = new ToolNode({
+      tools: [createDummyTool('weather')],
+      eventDrivenMode: true,
+      eagerEventToolExecution: { enabled: true },
+      eagerEventToolExecutions: eagerExecutions,
+      eagerEventToolUsageCount: new Map(),
+      hookRegistry,
+      toolCallStepIds: new Map([['call_weather', 'step_weather']]),
+    });
+
+    const result = (await toolNode.invoke({
+      messages: [createAIMessage('call_weather', 'weather', { city: 'NYC' })],
+    })) as { messages: ToolMessage[] };
+
+    expect(toolExecuteCalls).toHaveLength(0);
+    expect(eagerExecutions.has('call_weather')).toBe(false);
+    const toolMessage = result.messages.find((m) => m instanceof ToolMessage);
+    expect(toolMessage?.content).toBe('eager result');
+  });
 });
