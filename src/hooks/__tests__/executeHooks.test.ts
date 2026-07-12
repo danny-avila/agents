@@ -155,7 +155,11 @@ describe('executeHooks', () => {
         input: preToolUseInput('Bash'),
         matchQuery: 'Bash',
       });
-      expect(result).toEqual({ additionalContexts: [], errors: [] });
+      expect(result).toEqual({
+        additionalContexts: [],
+        injectedMessages: [],
+        errors: [],
+      });
     });
 
     it('returns an empty result when no matcher pattern matches the query', async () => {
@@ -176,7 +180,11 @@ describe('executeHooks', () => {
         matchQuery: 'Bash',
       });
       expect(called).toBe(false);
-      expect(result).toEqual({ additionalContexts: [], errors: [] });
+      expect(result).toEqual({
+        additionalContexts: [],
+        injectedMessages: [],
+        errors: [],
+      });
     });
   });
 
@@ -436,6 +444,81 @@ describe('executeHooks', () => {
         'context one',
         'context two',
       ]);
+    });
+  });
+
+  describe('injectedMessages accumulation', () => {
+    it('accumulates injectedMessages from every hook in registration order', async () => {
+      const registry = new HookRegistry();
+      registry.register('PreToolUse', {
+        hooks: [
+          preToolHook(
+            async (): Promise<PreToolUseHookOutput> => ({
+              injectedMessages: [
+                { role: 'user', content: 'steer one', source: 'steer' },
+              ],
+            })
+          ),
+          preToolHook(
+            async (): Promise<PreToolUseHookOutput> => emptyPreOutput
+          ),
+        ],
+      });
+      registry.register('PreToolUse', {
+        hooks: [
+          preToolHook(
+            async (): Promise<PreToolUseHookOutput> => ({
+              injectedMessages: [
+                { role: 'user', content: 'steer two', source: 'steer' },
+                { role: 'system', content: 'hint', source: 'hook' },
+              ],
+            })
+          ),
+        ],
+      });
+      const result = await executeHooks({
+        registry,
+        input: preToolUseInput('Bash'),
+        matchQuery: 'Bash',
+      });
+      expect(result.injectedMessages).toEqual([
+        { role: 'user', content: 'steer one', source: 'steer' },
+        { role: 'user', content: 'steer two', source: 'steer' },
+        { role: 'system', content: 'hint', source: 'hook' },
+      ]);
+    });
+
+    it('returns an empty array when no hook sets injectedMessages', async () => {
+      const registry = new HookRegistry();
+      registry.register('PreToolUse', { hooks: [noopPreHook] });
+      const result = await executeHooks({
+        registry,
+        input: preToolUseInput('Bash'),
+        matchQuery: 'Bash',
+      });
+      expect(result.injectedMessages).toEqual([]);
+    });
+
+    it('skips injectedMessages from fire-and-forget (async) outputs', async () => {
+      const registry = new HookRegistry();
+      registry.register('PreToolUse', {
+        hooks: [
+          preToolHook(
+            async (): Promise<PreToolUseHookOutput> => ({
+              async: true,
+              injectedMessages: [
+                { role: 'user', content: 'ignored', source: 'steer' },
+              ],
+            })
+          ),
+        ],
+      });
+      const result = await executeHooks({
+        registry,
+        input: preToolUseInput('Bash'),
+        matchQuery: 'Bash',
+      });
+      expect(result.injectedMessages).toEqual([]);
     });
   });
 

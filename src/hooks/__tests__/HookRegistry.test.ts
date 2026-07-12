@@ -187,4 +187,52 @@ describe('HookRegistry', () => {
       }
     });
   });
+
+  describe('hasResultAlteringHooks', () => {
+    it('returns false for an empty registry', () => {
+      const registry = new HookRegistry();
+      expect(registry.hasResultAlteringHooks()).toBe(false);
+      expect(registry.hasResultAlteringHooks('run-1')).toBe(false);
+    });
+
+    it('returns false when only observation hooks are registered', () => {
+      const registry = new HookRegistry();
+      registry.register('PostToolBatch', { hooks: [async () => ({})] });
+      registry.register('Stop', { hooks: [async () => ({})] });
+      expect(registry.hasResultAlteringHooks()).toBe(false);
+      expect(registry.hasResultAlteringHooks('run-1')).toBe(false);
+    });
+
+    it('returns true for each result-altering event registered globally', () => {
+      for (const event of [
+        'PreToolUse',
+        'PostToolUse',
+        'PostToolUseFailure',
+      ] as const) {
+        const registry = new HookRegistry();
+        registry.register(event, { hooks: [async () => ({})] });
+        expect(registry.hasResultAlteringHooks()).toBe(true);
+        expect(registry.hasResultAlteringHooks('any-session')).toBe(true);
+      }
+    });
+
+    it('scopes session lookups to the given sessionId', () => {
+      const registry = new HookRegistry();
+      registry.registerSession('run-a', 'PreToolUse', makePreToolUseMatcher());
+      expect(registry.hasResultAlteringHooks('run-a')).toBe(true);
+      expect(registry.hasResultAlteringHooks('run-b')).toBe(false);
+    });
+
+    it('conservatively scans all sessions when no sessionId is given', () => {
+      const registry = new HookRegistry();
+      registry.registerSession(
+        'run-a',
+        'PostToolUse',
+        makePostToolUseMatcher()
+      );
+      expect(registry.hasResultAlteringHooks()).toBe(true);
+      registry.clearSession('run-a');
+      expect(registry.hasResultAlteringHooks()).toBe(false);
+    });
+  });
 });

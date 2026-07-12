@@ -109,7 +109,10 @@ function getNonEmptyValue(possibleValues: string[]): string | undefined {
 }
 
 function isBatchSensitiveToolExecution(graph: StandardGraph): boolean {
-  return graph.hookRegistry != null || graph.humanInTheLoop?.enabled === true;
+  return (
+    graph.hookRegistry?.hasResultAlteringHooks(graph.runId) === true ||
+    graph.humanInTheLoop?.enabled === true
+  );
 }
 
 function hasToolOutputReference(value: unknown): boolean {

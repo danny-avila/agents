@@ -1566,6 +1566,118 @@ describe('ToolNode HITL — PostToolBatch hook', () => {
     expect(injected).toBeDefined();
     expect(String(injected!.content)).toContain('format the response as JSON');
   });
+
+  it('PostToolBatch injectedMessages land as individual HumanMessages after the consolidated context', async () => {
+    mockEventDispatch([
+      { toolCallId: 'call_1', content: 'ok', status: 'success' },
+    ]);
+
+    const registry = new HookRegistry();
+    registry.register('PostToolBatch', {
+      hooks: [
+        async (): Promise<PostToolBatchHookOutput> => ({
+          additionalContext: 'batch convention',
+          injectedMessages: [
+            { role: 'user', content: 'steer one', source: 'steer' },
+            { role: 'user', content: 'steer two', source: 'steer' },
+          ],
+        }),
+      ],
+    });
+
+    const node = new ToolNode({
+      tools: [createSchemaStub('echo')],
+      eventDrivenMode: true,
+      agentId: 'agent-x',
+      toolCallStepIds: new Map([['call_1', 'step_1']]),
+      hookRegistry: registry,
+      humanInTheLoop: { enabled: false },
+    });
+
+    const graph = buildHITLGraph(node, [
+      { id: 'call_1', name: 'echo', args: { command: 'a' } },
+    ]);
+    const result = (await graph.invoke(
+      { messages: [] },
+      { configurable: { thread_id: 'batch-steer-thread' } }
+    )) as { messages: BaseMessage[] };
+
+    type KwargMessage = {
+      additional_kwargs?: { source?: string; role?: string };
+    };
+    const humanMessages = result.messages.filter(
+      (m) => m._getType() === 'human'
+    );
+    const contextIndex = humanMessages.findIndex(
+      (m) => (m as KwargMessage).additional_kwargs?.source === 'hook'
+    );
+    const steerMessages = humanMessages.filter(
+      (m) => (m as KwargMessage).additional_kwargs?.source === 'steer'
+    );
+
+    expect(contextIndex).toBeGreaterThanOrEqual(0);
+    expect(steerMessages).toHaveLength(2);
+    expect(String(steerMessages[0].content)).toBe('steer one');
+    expect(String(steerMessages[1].content)).toBe('steer two');
+    for (const steer of steerMessages) {
+      expect((steer as KwargMessage).additional_kwargs?.role).toBe('user');
+      expect(humanMessages.indexOf(steer)).toBeGreaterThan(contextIndex);
+    }
+    const toolIndex = result.messages.findIndex((m) => m._getType() === 'tool');
+    const firstSteerIndex = result.messages.indexOf(steerMessages[0]);
+    expect(firstSteerIndex).toBeGreaterThan(toolIndex);
+  });
+
+  it('PostToolBatch injectedMessages work without additionalContext', async () => {
+    mockEventDispatch([
+      { toolCallId: 'call_1', content: 'ok', status: 'success' },
+    ]);
+
+    const registry = new HookRegistry();
+    registry.register('PostToolBatch', {
+      hooks: [
+        async (): Promise<PostToolBatchHookOutput> => ({
+          injectedMessages: [
+            { role: 'user', content: 'solo steer', source: 'steer' },
+          ],
+        }),
+      ],
+    });
+
+    const node = new ToolNode({
+      tools: [createSchemaStub('echo')],
+      eventDrivenMode: true,
+      agentId: 'agent-x',
+      toolCallStepIds: new Map([['call_1', 'step_1']]),
+      hookRegistry: registry,
+      humanInTheLoop: { enabled: false },
+    });
+
+    const graph = buildHITLGraph(node, [
+      { id: 'call_1', name: 'echo', args: { command: 'a' } },
+    ]);
+    const result = (await graph.invoke(
+      { messages: [] },
+      { configurable: { thread_id: 'solo-steer-thread' } }
+    )) as { messages: BaseMessage[] };
+
+    type KwargMessage = {
+      additional_kwargs?: { source?: string; role?: string };
+    };
+    const consolidated = result.messages.find(
+      (m) =>
+        m._getType() === 'human' &&
+        (m as KwargMessage).additional_kwargs?.source === 'hook'
+    );
+    const steer = result.messages.find(
+      (m) =>
+        m._getType() === 'human' &&
+        (m as KwargMessage).additional_kwargs?.source === 'steer'
+    );
+    expect(consolidated).toBeUndefined();
+    expect(steer).toBeDefined();
+    expect(String(steer!.content)).toBe('solo steer');
+  });
 });
 
 describe('ToolNode HITL — per-hook allowedDecisions override', () => {

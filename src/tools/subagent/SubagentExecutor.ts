@@ -6,6 +6,7 @@ import type { ChatGeneration, LLMResult } from '@langchain/core/outputs';
 import type { Callbacks } from '@langchain/core/callbacks/manager';
 import type {
   AgentInputs,
+  InjectedMessage,
   MessageDeltaEvent,
   ProcessedToolCall,
   ReasoningDeltaEvent,
@@ -36,6 +37,7 @@ const MAX_PENDING_SUBAGENT_UPDATES = 64;
 
 const HOOK_FALLBACK: AggregatedHookResult = Object.freeze({
   additionalContexts: [] as string[],
+  injectedMessages: [] as InjectedMessage[],
   errors: [] as string[],
 });
 

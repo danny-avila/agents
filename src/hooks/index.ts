@@ -9,6 +9,13 @@
 export { HookRegistry } from './HookRegistry';
 export type { HookHaltSignal } from './HookRegistry';
 export { executeHooks, DEFAULT_HOOK_TIMEOUT_MS } from './executeHooks';
+/**
+ * Feature probe for hosts: hook outputs support `injectedMessages`
+ * (per-message graph-state injection at the `PostToolBatch` boundary).
+ * Hosts must gate drain-style hooks on this so a queued message can never
+ * be consumed by an SDK version that would silently drop it.
+ */
+export const HOOK_INJECTED_MESSAGES_CAPABLE = true;
 export {
   matchesQuery,
   hasNestedQuantifier,

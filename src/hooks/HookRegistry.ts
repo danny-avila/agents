@@ -14,6 +14,17 @@ import type { HookEvent, HookMatcher } from './types';
 type MatcherBucket = Partial<Record<HookEvent, HookMatcher<HookEvent>[]>>;
 
 /**
+ * Events whose hooks can change a tool call's input or output. Presence of
+ * any of these disables eager tool execution and early completion emission;
+ * observation-only events (`PostToolBatch`, `Stop`, telemetry hooks) do not.
+ */
+const RESULT_ALTERING_HOOK_EVENTS = [
+  'PreToolUse',
+  'PostToolUse',
+  'PostToolUseFailure',
+] as const satisfies readonly HookEvent[];
+
+/**
  * Snapshot of a halt request raised by a hook returning
  * `preventContinuation: true`. The SDK's run loop polls for this between
  * stream events and exits cleanly when set, skipping the `Stop` hook
@@ -196,6 +207,31 @@ export class HookRegistry {
     this.haltSignals.delete(sessionId);
   }
 
+  /**
+   * True when any registered hook can alter a tool result before or after
+   * execution (`PreToolUse`, `PostToolUse`, `PostToolUseFailure`). Eager
+   * tool execution and early completion emission gate on this instead of
+   * registry presence, so observation-only registries (e.g. a
+   * `PostToolBatch` steering drain) keep those fast paths. With
+   * `sessionId`, checks global + that session; without it, conservatively
+   * scans every session bucket.
+   */
+  hasResultAlteringHooks(sessionId?: string): boolean {
+    if (hasResultAlteringInBucket(this.global)) {
+      return true;
+    }
+    if (sessionId !== undefined) {
+      const bucket = this.sessions.get(sessionId);
+      return bucket !== undefined && hasResultAlteringInBucket(bucket);
+    }
+    for (const bucket of this.sessions.values()) {
+      if (hasResultAlteringInBucket(bucket)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   /** True if at least one matcher exists for `event` (global + session). */
   hasHookFor(event: HookEvent, sessionId?: string): boolean {
     if (readList(this.global, event).length > 0) {
@@ -240,6 +276,15 @@ function readList(
   event: HookEvent
 ): HookMatcher<HookEvent>[] {
   return bucket[event] ?? [];
+}
+
+function hasResultAlteringInBucket(bucket: MatcherBucket): boolean {
+  for (const event of RESULT_ALTERING_HOOK_EVENTS) {
+    if (readList(bucket, event).length > 0) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function removeFromList<E extends HookEvent>(

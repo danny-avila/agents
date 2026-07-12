@@ -54,6 +54,7 @@ interface AbortRace {
 function freshResult(): AggregatedHookResult {
   return {
     additionalContexts: [],
+    injectedMessages: [],
     errors: [],
   };
 }
@@ -244,6 +245,19 @@ function applyContext(agg: AggregatedHookResult, output: HookOutput): void {
   }
 }
 
+function applyInjectedMessages(
+  agg: AggregatedHookResult,
+  output: HookOutput
+): void {
+  if (
+    output.injectedMessages === undefined ||
+    output.injectedMessages.length === 0
+  ) {
+    return;
+  }
+  agg.injectedMessages.push(...output.injectedMessages);
+}
+
 function applyStopFlag(agg: AggregatedHookResult, output: HookOutput): void {
   if (output.preventContinuation !== true) {
     return;
@@ -310,6 +324,7 @@ function fold(outcomes: readonly HookOutcome[]): AggregatedHookResult {
       continue;
     }
     applyContext(agg, output);
+    applyInjectedMessages(agg, output);
     applyStopFlag(agg, output);
     applyDecision(agg, output);
     applyUpdatedInput(agg, output);

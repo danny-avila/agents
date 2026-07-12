@@ -822,10 +822,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private recordEventToolPlanningTurn(
     toolName: string,
     turn: number,
-    callId?: string
+    callId?: string,
+    runId?: string
   ): void {
     this.recordToolUsageTurn(toolName, turn, callId);
-    if (this.canConsumeEagerEventExecution()) {
+    if (this.canConsumeEagerEventExecution(runId)) {
       this.eagerEventToolUsageCount?.set(
         toolName,
         Math.max(this.eagerEventToolUsageCount.get(toolName) ?? 0, turn + 1)
@@ -2091,6 +2092,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     const postToolBatchEntryByCallId = new Map<string, PostToolBatchEntry>();
     const HOOK_FALLBACK: AggregatedHookResult = Object.freeze({
       additionalContexts: [] as string[],
+      injectedMessages: [] as t.InjectedMessage[],
       errors: [] as string[],
     });
 
@@ -2592,7 +2594,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         usageCount: this.toolUsageCount,
         invalidArgsBehavior: 'error-result',
         recordTurn: (toolName, reservedTurn, callId) => {
-          this.recordEventToolPlanningTurn(toolName, reservedTurn, callId);
+          this.recordEventToolPlanningTurn(
+            toolName,
+            reservedTurn,
+            callId,
+            runId
+          );
         },
       });
       if (plan == null) {
@@ -2637,7 +2644,8 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
        * released if the dispatch fails, letting the batch path re-emit.
        */
       const canEmitEarlyCompletions =
-        this.hookRegistry == null && this.humanInTheLoop?.enabled !== true;
+        this.hookRegistry?.hasResultAlteringHooks(runId) !== true &&
+        this.humanInTheLoop?.enabled !== true;
       const earlyCompletionDispatchedIds = new Set<string>();
       const earlyCompletionDispatches: Array<Promise<void>> = [];
       const dispatchRequestById = new Map(
@@ -2971,11 +2979,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
     return { toolMessages, injected };
   }
 
-  private canConsumeEagerEventExecution(): boolean {
+  /** Run-scoped so another run's session hooks can't flip this run's gate. */
+  private canConsumeEagerEventExecution(runId?: string): boolean {
     return (
       this.eventDrivenMode &&
       this.eagerEventToolExecution?.enabled === true &&
-      this.hookRegistry == null &&
+      this.hookRegistry?.hasResultAlteringHooks(runId) !== true &&
       this.humanInTheLoop?.enabled !== true
     );
   }
@@ -2983,7 +2992,15 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
   private takeMatchingEagerEventExecution(
     request: t.ToolCallRequest
   ): t.EagerEventToolExecution | undefined {
-    if (!this.canConsumeEagerEventExecution()) {
+    // Static enablement only: a stored record means the reservation-time
+    // gates passed and the host already dispatched the execution. Re-checking
+    // the dynamic hook gate here could decline consumption after a mid-run
+    // registration and send the same call through normal dispatch — executing
+    // the tool twice. PostToolUse hooks still process consumed results below.
+    if (
+      !this.eventDrivenMode ||
+      this.eagerEventToolExecution?.enabled !== true
+    ) {
       return undefined;
     }
 
@@ -3098,6 +3115,7 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         orderedBatchEntries.push(entry);
       }
     }
+    const hookInjectedMessages: t.InjectedMessage[] = [];
     if (
       this.hookRegistry?.hasHookFor('PostToolBatch', runId) === true &&
       orderedBatchEntries.length > 0
@@ -3118,6 +3136,9 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
         for (const ctx of batchHookResult.additionalContexts) {
           batchAdditionalContexts.push(ctx);
         }
+        for (const msg of batchHookResult.injectedMessages) {
+          hookInjectedMessages.push(msg);
+        }
       }
     }
 
@@ -3136,6 +3157,24 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           additional_kwargs: { role: 'system', source: 'hook' },
         })
       );
+    }
+
+    /**
+     * Hook-returned `injectedMessages` land AFTER the consolidated context
+     * message: one converted `HumanMessage` per entry (role/source kept in
+     * `additional_kwargs`), preserving per-message identity so verbatim
+     * user speech (e.g. steering) sits closest to the next model call.
+     */
+    if (hookInjectedMessages.length > 0) {
+      try {
+        injected.push(...this.convertInjectedMessages(hookInjectedMessages));
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          '[ToolNode] Failed to convert PostToolBatch injectedMessages:',
+          e instanceof Error ? e.message : e
+        );
+      }
     }
   }
 

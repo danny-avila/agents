@@ -21,6 +21,13 @@ import {
 import { ChatModelStreamHandler, createContentAggregator } from '@/stream';
 import { HandlerRegistry } from '@/events';
 import * as events from '@/utils/events';
+import { HookRegistry } from '@/hooks';
+
+function createResultAlteringRegistry(): HookRegistry {
+  const registry = new HookRegistry();
+  registry.register('PreToolUse', { hooks: [async () => ({})] });
+  return registry;
+}
 
 function createGraph(overrides: Partial<StandardGraph> = {}): StandardGraph {
   const runSteps = new Map<string, t.RunStep>();
@@ -3223,7 +3230,7 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
 
   it('does not prestart when batch-sensitive hooks are configured', async () => {
     const graph = createGraph({
-      hookRegistry: {} as StandardGraph['hookRegistry'],
+      hookRegistry: createResultAlteringRegistry(),
     });
     const dispatchSpy = jest.spyOn(events, 'safeDispatchCustomEvent');
 
@@ -3251,6 +3258,56 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
       expect.anything()
     );
     expect(graph.eagerEventToolExecutions.size).toBe(0);
+  });
+
+  it('prestarts when the registry only has observation hooks (PostToolBatch)', async () => {
+    const observationRegistry = new HookRegistry();
+    observationRegistry.register('PostToolBatch', {
+      hooks: [async () => ({})],
+    });
+    const graph = createGraph({ hookRegistry: observationRegistry });
+    const toolExecuteCalls: t.ToolExecuteBatchRequest[] = [];
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data): Promise<void> => {
+        if (event !== GraphEvents.ON_TOOL_EXECUTE) {
+          return;
+        }
+        const batch = data as t.ToolExecuteBatchRequest;
+        toolExecuteCalls.push(batch);
+        batch.resolve([
+          {
+            toolCallId: 'call_weather',
+            status: 'success',
+            content: 'sunny',
+          },
+        ]);
+      });
+
+    await new ChatModelStreamHandler().handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_weather',
+              name: 'weather',
+              args: { city: 'NYC' },
+            },
+          ],
+          response_metadata: finalToolCallResponseMetadata,
+        } as unknown as t.StreamChunk,
+      },
+      { langgraph_node: 'agent' },
+      graph
+    );
+
+    expect(toolExecuteCalls).toHaveLength(1);
+    expect(graph.eagerEventToolExecutions.get('call_weather')).toMatchObject({
+      toolCallId: 'call_weather',
+      toolName: 'weather',
+    });
   });
 
   it('does not buffer streamed chunks when eager execution is disabled', async () => {
@@ -4418,7 +4475,7 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
 
   it('does not prestart on-arrival sealed calls when batch-sensitive hooks are configured', async () => {
     const graph = createGraph({
-      hookRegistry: {} as StandardGraph['hookRegistry'],
+      hookRegistry: createResultAlteringRegistry(),
     });
     const dispatchSpy = jest.spyOn(events, 'safeDispatchCustomEvent');
 

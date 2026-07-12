@@ -1,5 +1,6 @@
 // src/hooks/types.ts
 import type { BaseMessage } from '@langchain/core/messages';
+import type { InjectedMessage } from '@/types/tools';
 
 /**
  * Closed set of hook lifecycle events supported by the hooks system.
@@ -134,7 +135,9 @@ export interface PostToolBatchEntry {
  *
  * Order: fires AFTER all per-tool PostToolUse / PostToolUseFailure hooks
  * for the same batch have completed, BEFORE the next model call. Pass an
- * `additionalContext` to inject context for that next model turn.
+ * `additionalContext` to inject context for that next model turn, or
+ * `injectedMessages` to inject standalone per-message user speech (e.g.
+ * mid-run steering) that must not be consolidated with hook context.
  */
 export interface PostToolBatchHookInput extends BaseHookInput {
   hook_event_name: 'PostToolBatch';
@@ -246,6 +249,18 @@ export type HookInputByEvent = {
 export interface BaseHookOutput {
   /** Context string to inject into the conversation. Accumulated across hooks. */
   additionalContext?: string;
+  /**
+   * Messages to inject into graph state, one `HumanMessage` per entry
+   * (converted via `ToolNode.convertInjectedMessages`, which preserves
+   * `role`/`source`/`isMeta` in `additional_kwargs`). Unlike
+   * `additionalContext` — which is consolidated across hooks into a single
+   * system-flavored message — each entry keeps its own identity and role,
+   * making this the channel for injecting verbatim user speech (e.g. a
+   * mid-run steering message). Accumulated across hooks in registration
+   * order. Currently consumed only at the `PostToolBatch` dispatch site;
+   * other events ignore the field.
+   */
+  injectedMessages?: InjectedMessage[];
   /** True to prevent the next model turn. Any hook can set this. */
   preventContinuation?: boolean;
   /** Reason reported alongside `preventContinuation`. */
@@ -508,6 +523,8 @@ export interface AggregatedHookResult {
   updatedOutput?: unknown;
   /** Accumulated `additionalContext` strings from every hook, in order. */
   additionalContexts: string[];
+  /** Accumulated `injectedMessages` from every hook, in registration order. */
+  injectedMessages: InjectedMessage[];
   /** True if any hook returned `preventContinuation`. */
   preventContinuation?: boolean;
   /**
