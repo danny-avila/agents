@@ -761,6 +761,16 @@ function formatAssistantMessage(
             }
           }
           currentContent = [];
+        } else if (shouldPreserveReasoningContent && pendingReasoningContent) {
+          /**
+           * Reasoning directly preceding a steer has no `currentContent`
+           * flush to consume it and the anchor resets below — emit an anchor
+           * AIMessage now (createAIMessage folds the pending reasoning into
+           * `additional_kwargs.reasoning_content`) or the persisted
+           * assistant reasoning silently vanishes on replay.
+           */
+          lastAIMessage = createAIMessage('');
+          formattedMessages.push(lastAIMessage);
         }
         const steerPart = part as {
           steer?: string;

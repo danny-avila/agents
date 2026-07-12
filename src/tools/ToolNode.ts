@@ -2780,24 +2780,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             request,
             execution
           );
-          /**
-           * Force a corrected batch-time re-emission ONLY when an active hook
-           * can actually rewrite this consumed result: `PostToolUse` rewrites
-           * success outputs via `updatedOutput`, while failure hooks cannot
-           * replace output — a duplicate completion there would change
-           * nothing. The stream already emitted the raw eager completion
-           * before the hook existed; treating a rewritable one as NOT
-           * dispatched converges host/UI step output to the final
-           * ToolMessage.
-           */
-          const rewritable =
-            hasPostHook && results.some((result) => result.status !== 'error');
           return {
             results,
             completionDispatched:
               execution.completionDispatched === true &&
-              execution.request.turn === request.turn &&
-              !rewritable,
+              execution.request.turn === request.turn,
             toolCallId: request.id,
           };
         })
@@ -2963,6 +2950,15 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                 this.maxToolResultChars
               );
               finalToolOutput = hookResult.updatedOutput;
+              /**
+               * The hook ACTUALLY rewrote this output: any completion the
+               * stream already emitted for the consumed eager result showed
+               * the raw content, so un-mark it and let the dispatch below
+               * re-emit the corrected version. Hooks that merely observe or
+               * add context leave the original emission final — no
+               * duplicates.
+               */
+              eagerCompletionDispatchedIds.delete(result.toolCallId);
             }
           }
 

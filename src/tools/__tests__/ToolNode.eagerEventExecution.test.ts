@@ -1005,6 +1005,69 @@ describe('ToolNode eager event tool execution', () => {
     expect(stepCompletions).toHaveLength(0);
   });
 
+  it('keeps the original emission final for observe-only PostToolUse hooks', async () => {
+    const stepCompletions: Array<{
+      result?: { tool_call?: { output?: string } };
+    }> = [];
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data): Promise<boolean | void> => {
+        if (event === GraphEvents.ON_RUN_STEP_COMPLETED) {
+          stepCompletions.push(data as (typeof stepCompletions)[number]);
+          return true;
+        }
+      });
+
+    const eagerExecutions = new Map<string, t.EagerEventToolExecution>();
+    const request: t.ToolCallRequest = {
+      id: 'call_weather',
+      name: 'weather',
+      args: { city: 'NYC' },
+      stepId: 'step_weather',
+      turn: 0,
+    };
+    eagerExecutions.set('call_weather', {
+      toolCallId: 'call_weather',
+      toolName: 'weather',
+      args: { city: 'NYC' },
+      request,
+      completionDispatched: true,
+      promise: Promise.resolve({
+        results: [
+          {
+            toolCallId: 'call_weather',
+            status: 'success',
+            content: 'raw eager output',
+          },
+        ],
+      }),
+    });
+
+    // The hook runs but returns no updatedOutput — the already-emitted
+    // eager completion is final and must not be duplicated.
+    const hookRegistry = new HookRegistry();
+    hookRegistry.register('PostToolUse', {
+      hooks: [async () => ({})],
+    });
+    const toolNode = new ToolNode({
+      tools: [createDummyTool('weather')],
+      eventDrivenMode: true,
+      eagerEventToolExecution: { enabled: true },
+      eagerEventToolExecutions: eagerExecutions,
+      eagerEventToolUsageCount: new Map(),
+      hookRegistry,
+      toolCallStepIds: new Map([['call_weather', 'step_weather']]),
+    });
+
+    const result = (await toolNode.invoke({
+      messages: [createAIMessage('call_weather', 'weather', { city: 'NYC' })],
+    })) as { messages: ToolMessage[] };
+
+    const toolMessage = result.messages.find((m) => m instanceof ToolMessage);
+    expect(toolMessage?.content).toBe('raw eager output');
+    expect(stepCompletions).toHaveLength(0);
+  });
+
   it('re-emits a corrected completion when hooks rewrite a consumed eager result', async () => {
     const stepCompletions: Array<{
       result?: { tool_call?: { output?: string } };

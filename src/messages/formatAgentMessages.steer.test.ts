@@ -121,6 +121,42 @@ describe('formatAgentMessages steer replay', () => {
     expect(messages[1].content).toBe('Change of plans.');
   });
 
+  it('preserves pending reasoning that directly precedes a steer', () => {
+    const payload: TPayload = [
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.THINK,
+            [ContentTypes.THINK]: 'chain of thought',
+          },
+          {
+            type: ContentTypes.STEER,
+            [ContentTypes.STEER]: 'Stop and reconsider.',
+          } as unknown as Record<string, unknown>,
+        ],
+      },
+    ];
+
+    const { messages } = formatAgentMessages(
+      payload,
+      undefined,
+      undefined,
+      undefined,
+      {
+        preserveReasoningContent: true,
+      }
+    );
+
+    expect(messages).toHaveLength(2);
+    expect(messages[0]).toBeInstanceOf(AIMessage);
+    expect(messages[0].additional_kwargs.reasoning_content).toBe(
+      'chain of thought'
+    );
+    expect(messages[1]).toBeInstanceOf(HumanMessage);
+    expect(messages[1].content).toBe('Stop and reconsider.');
+  });
+
   it('uses the host-stamped media array for multimodal steers', () => {
     const media = [
       { type: 'text', text: 'Look at this screenshot.' },
