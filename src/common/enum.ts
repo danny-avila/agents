@@ -140,6 +140,8 @@ export enum ContentTypes {
   SUMMARY = 'summary',
   /** Bedrock */
   REASONING_CONTENT = 'reasoning_content',
+  /** Mid-run user steer persisted inline in an assistant message; replayed as a user turn */
+  STEER = 'steer',
 }
 
 export enum ToolCallTypes {
