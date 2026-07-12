@@ -406,6 +406,16 @@ export function addResponseCacheBreakpoints(
         if (!isResponseMessage(item)) {
           return false;
         }
+        /** Only input roles take a Responses breakpoint. Assistant/tool turns
+         *  carry output content (string or output_text) that the API rejects
+         *  under an input marker, so they're never eligible. */
+        if (
+          item.role !== 'system' &&
+          item.role !== 'developer' &&
+          item.role !== 'user'
+        ) {
+          return false;
+        }
         const content = item.content as
           | string
           | OpenAIClient.Responses.ResponseInputMessageContentList;

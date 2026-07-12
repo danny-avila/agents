@@ -50,8 +50,8 @@ describe('managed GPT-5.6 request fields', () => {
       },
       {
         type: 'message',
-        role: 'assistant',
-        content: [{ type: 'input_text', text: 'Prior answer.' }],
+        role: 'user',
+        content: [{ type: 'input_text', text: 'Prior question.' }],
       },
       {
         type: 'message',
@@ -130,6 +130,30 @@ describe('managed GPT-5.6 request fields', () => {
       {
         type: 'input_text',
         text: 'Stable system prompt.',
+        prompt_cache_breakpoint: { mode: 'explicit' },
+      },
+    ]);
+  });
+
+  it('does not rewrite assistant string content as input_text', () => {
+    const input = [
+      { type: 'message', role: 'system', content: 'Stable system prompt.' },
+      { type: 'message', role: 'user', content: 'First question.' },
+      { type: 'message', role: 'assistant', content: 'Prior answer.' },
+      { type: 'message', role: 'user', content: 'Current question.' },
+    ] as unknown as OpenAI.Responses.ResponseInput;
+    const result = addResponseCacheBreakpoints(input) as unknown as Array<{
+      content: unknown;
+    }>;
+
+    // input_text under role:assistant is rejected with a 400, so assistant
+    // string content must stay a string and the breakpoint falls back to the
+    // prior user turn.
+    expect(result[2].content).toBe('Prior answer.');
+    expect(result[1].content).toEqual([
+      {
+        type: 'input_text',
+        text: 'First question.',
         prompt_cache_breakpoint: { mode: 'explicit' },
       },
     ]);

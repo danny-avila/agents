@@ -45,7 +45,7 @@ export type AzureClientOptions = Partial<OpenAIChatInput> &
     deploymentName?: string;
   } & BaseChatModelParams & {
     configuration?: OAIClientOptions;
-  };
+  } & ManagedRequestOptions;
 /**
  * Controls whether Claude's reasoning content is returned in adaptive
  * thinking responses. Added for Claude Opus 4.7, which omits thinking by
@@ -73,10 +73,13 @@ export type GoogleThinkingConfig = {
   includeThoughts?: boolean;
   thinkingLevel?: 'THINKING_LEVEL_UNSPECIFIED' | 'LOW' | 'MEDIUM' | 'HIGH';
 };
-export type OpenAIClientOptions = ChatOpenAIFields & {
+/** GPT-5.6 managed-request passthrough fields, shared by the OpenAI and
+ *  Azure wrappers that both read them. */
+export type ManagedRequestOptions = {
   promptCacheExplicit?: boolean;
   safety_identifier?: string;
 };
+export type OpenAIClientOptions = ChatOpenAIFields & ManagedRequestOptions;
 export type AnthropicClientOptions = Omit<AnthropicInput, 'thinking'> & {
   thinking?: ThinkingConfig;
   promptCache?: boolean;
