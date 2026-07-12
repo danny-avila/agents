@@ -1470,9 +1470,10 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
         calibrationSkipReason = 'input_below_instruction_overhead';
       } else if (providerInputTokens < minimumComparableInputTokens) {
         calibrationSkipReason = 'input_below_calibration_floor';
-      } else if (providerInputTokens > factoryParams.maxTokens) {
-        calibrationSkipReason = 'input_exceeds_context_window';
       }
+      // No upper-bound rejection: maxTokens is an application budget, not the
+      // provider's real context window.  Usage above the budget is a genuine
+      // measurement — and the one that must drive pruning/summarization.
 
       if (calibrationSkipReason == null) {
         cumulativeRawSent += rawSentThisTurn;
@@ -1515,7 +1516,6 @@ export function createPruneMessages(factoryParams: PruneMessagesFactoryParams) {
           minimumComparableInputTokens: Math.round(
             minimumComparableInputTokens
           ),
-          maxContextTokens: factoryParams.maxTokens,
           rawSentThisTurn,
           instructionOverhead,
         });

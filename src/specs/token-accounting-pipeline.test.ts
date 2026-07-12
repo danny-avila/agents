@@ -823,6 +823,70 @@ describe('Token accounting pipeline — Anthropic vs OpenAI cache semantics', ()
     });
   });
 
+  it('accepts provider usage above the application budget and prunes', () => {
+    // maxTokens is an application budget, not the provider's context window.
+    // The provider accepts requests past the budget and reports true usage —
+    // exactly the turns where calibration must feed pruning/summarization.
+    const messages = [
+      new SystemMessage('system instructions'),
+      new HumanMessage('first user turn'),
+      new AIMessage('first response'),
+      new HumanMessage('second user turn'),
+      new AIMessage('second response'),
+    ];
+    const indexTokenCountMap: Record<string, number | undefined> = {
+      0: 40,
+      1: 120,
+      2: 110,
+      3: 120,
+      4: 80,
+    };
+    const rawTotal = 470;
+    const providerInputTokens = 620;
+    const logs: Array<{
+      level: string;
+      message: string;
+      data?: Record<string, unknown>;
+    }> = [];
+
+    const pruneMessages = createPruneMessages({
+      provider: Providers.ANTHROPIC,
+      maxTokens: 500,
+      startIndex: messages.length,
+      tokenCounter: charCounter,
+      indexTokenCountMap,
+      summarizationEnabled: true,
+      reserveRatio: 0,
+      log: (level, message, data) => logs.push({ level, message, data }),
+    });
+
+    const result = pruneMessages({
+      messages,
+      usageMetadata: {
+        input_tokens: providerInputTokens,
+        output_tokens: 25,
+      },
+    });
+
+    // The above-budget measurement calibrates instead of being discarded.
+    expect(
+      logs.find((entry) => entry.message === 'Calibration skipped')
+    ).toBeUndefined();
+    expect(
+      logs.find((entry) => entry.message === 'Calibration observed')?.data
+    ).toMatchObject({ providerInputTokens });
+    expect(result.calibrationRatio).toBeCloseTo(
+      providerInputTokens / rawTotal,
+      2
+    );
+
+    // Calibrated context (620) exceeds the budget (500), so messages are
+    // yielded for summarization instead of returning the full context.
+    expect(result.messagesToRefine).toBeDefined();
+    expect(result.messagesToRefine!.length).toBeGreaterThan(0);
+    expect(result.context.length).toBeLessThan(messages.length);
+  });
+
   it('OpenAI inclusive cache does NOT inflate calibration input', () => {
     const messages = [new HumanMessage('Hello'), new AIMessage('Hi')];
 
