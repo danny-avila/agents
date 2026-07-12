@@ -17,7 +17,7 @@ const OPENAI_IMAGE_TOKENS_PER_TILE = 170;
 /** Google Gemini fixed per-image cost. */
 const _GEMINI_IMAGE_TOKENS = 258;
 /** Safety margin for image and document token estimates (5% overestimate). */
-const IMAGE_TOKEN_SAFETY_MARGIN = 1.05;
+export const IMAGE_TOKEN_SAFETY_MARGIN = 1.05;
 
 /**
  * Anthropic PDF: each page costs image tokens + text tokens.
@@ -32,6 +32,33 @@ const _GEMINI_PDF_TOKENS_PER_PAGE = 258;
 const BASE64_BYTES_PER_PDF_PAGE = 75_000;
 /** Fallback token cost for URL-referenced documents without local data. */
 const URL_DOCUMENT_FALLBACK_TOKENS = 2000;
+
+/**
+ * Timed media (video/audio) is priced by DURATION, not size, and the content
+ * carries no duration — so duration is estimated from encoded size at
+ * representative bitrates and priced at Gemini's rates (the dominant provider
+ * for native video/audio). Deliberately rough; superseded by real provider
+ * usage after the first turn.
+ */
+/** Gemini video ≈ 258 tokens/frame (1 fps) + 32 tokens/s audio ≈ 300 tokens/s. */
+const VIDEO_TOKENS_PER_SECOND = 300;
+/** Gemini audio: 32 tokens/s (single channel). */
+const AUDIO_TOKENS_PER_SECOND = 32;
+/** Representative encoded byte rates for duration-from-size estimation. */
+const VIDEO_BYTES_PER_SECOND = 250_000; // ~2 Mbps
+const AUDIO_BYTES_PER_SECOND = 16_000; // ~128 kbps
+/** Flat fallback when only a URL is present (no size to estimate from) — ~30s. */
+const VIDEO_URL_FALLBACK_TOKENS = 9000;
+const AUDIO_URL_FALLBACK_TOKENS = 960;
+/** Content block types that can carry timed media (video/audio). `media` is
+ *  generic (Google) so it is classified by MIME; the rest are unambiguous. */
+const TIMED_MEDIA_TYPES = new Set([
+  'media',
+  'video',
+  'audio',
+  'video_url',
+  'input_audio',
+]);
 
 /**
  * Extracts image dimensions from the first bytes of a base64-encoded
@@ -135,7 +162,7 @@ export function estimateOpenAIImageTokens(
  * Extracts dimensions from base64 header when available.
  * Falls back to Anthropic minimum (1024) when dimensions can't be determined.
  */
-function estimateImageBlockTokens(
+export function estimateImageBlockTokens(
   block: Record<string, unknown>,
   encoding: EncodingName
 ): number {
@@ -180,7 +207,7 @@ function estimateImageBlockTokens(
  * - Base64 PDF: page count estimated from base64 length × per-page cost.
  * - URL reference: conservative flat estimate.
  */
-function estimateDocumentBlockTokens(
+export function estimateDocumentBlockTokens(
   block: Record<string, unknown>,
   encoding: EncodingName,
   getTokenCount: (text: string) => number
@@ -287,6 +314,150 @@ function estimateDocumentBlockTokens(
   return URL_DOCUMENT_FALLBACK_TOKENS;
 }
 
+/** Decoded byte length of base64 or a `data:` URL; 0 for any remote URI (http,
+ *  gs, s3, file, …) or empty. Base64 never contains `:`, so any scheme prefix
+ *  marks a remote reference with no local size. */
+function base64ByteLength(value: string | undefined): number {
+  if (typeof value !== 'string' || value.length === 0) {
+    return 0;
+  }
+  if (value.startsWith('data:')) {
+    const comma = value.indexOf(',');
+    return comma < 0 ? 0 : Math.floor(((value.length - comma - 1) * 3) / 4);
+  }
+  if (/^[a-z][a-z0-9+.-]*:/i.test(value)) {
+    return 0;
+  }
+  return Math.floor((value.length * 3) / 4);
+}
+
+function timedMediaTokens(
+  bytes: number,
+  bytesPerSecond: number,
+  tokensPerSecond: number,
+  urlFallback: number
+): number {
+  if (bytes <= 0) {
+    return urlFallback;
+  }
+  return Math.max(
+    tokensPerSecond,
+    Math.ceil((bytes / bytesPerSecond) * tokensPerSecond)
+  );
+}
+
+/** Decoded byte length of a media block payload — top-level `data` (base64
+ *  string or `Uint8Array`) or base64 `url`, or the nested `video|audio.{data,
+ *  url, source.bytes}` shapes (`formatMessage` media arrays / native Bedrock);
+ *  0 for a bare remote URL, `fileId`/`fileUri`, S3 location, or empty. */
+function mediaBlockByteLength(block: Record<string, unknown>): number {
+  const data = block.data;
+  if (typeof data === 'string') {
+    return base64ByteLength(data);
+  }
+  if (data instanceof Uint8Array) {
+    return data.length;
+  }
+  if (typeof block.url === 'string') {
+    return base64ByteLength(block.url);
+  }
+  const nested = (block.video ?? block.audio) as
+    | { data?: unknown; url?: unknown; source?: { bytes?: unknown } }
+    | undefined;
+  if (nested != null) {
+    if (typeof nested.data === 'string') {
+      return base64ByteLength(nested.data);
+    }
+    if (typeof nested.url === 'string') {
+      return base64ByteLength(nested.url);
+    }
+    if (nested.source?.bytes instanceof Uint8Array) {
+      return nested.source.bytes.length;
+    }
+  }
+  return 0;
+}
+
+/** Classifies a block as timed media, or null when it is not video/audio — e.g.
+ *  a generic Google `media` block carrying an image/document MIME, which must
+ *  NOT be priced as video. Also handles the Google shape where `type` IS the
+ *  MIME string (e.g. `{ type: 'audio/wav', data }`). */
+function timedMediaKind(
+  block: Record<string, unknown>
+): 'video' | 'audio' | null {
+  const type = typeof block.type === 'string' ? block.type : '';
+  if (type === 'input_audio' || type === 'audio') {
+    return 'audio';
+  }
+  if (type === 'video_url' || type === 'video') {
+    return 'video';
+  }
+  const mime =
+    type === 'media' && typeof block.mimeType === 'string' ? block.mimeType : type;
+  if (mime.startsWith('audio/')) {
+    return 'audio';
+  }
+  if (mime.startsWith('video/')) {
+    return 'video';
+  }
+  return null;
+}
+
+/** Whether a content-block `type` can carry timed media — the fixed set plus the
+ *  Google MIME-as-type shape (`audio/*` / `video/*`). Gates callers before they
+ *  hand the block to {@link estimateTimedMediaBlockTokens}. */
+function isTimedMediaType(type: string): boolean {
+  return (
+    TIMED_MEDIA_TYPES.has(type) ||
+    type.startsWith('audio/') ||
+    type.startsWith('video/')
+  );
+}
+
+/**
+ * Estimates token cost for a timed-media block (video/audio). Handles Google
+ * `{ type: 'media', mimeType, data|url|fileUri }`, OpenRouter
+ * `{ type: 'video_url' }` / `{ type: 'input_audio' }`, and standard
+ * `{ type: 'video' }` / `{ type: 'audio' }` blocks (payload as `data` base64 or
+ * `Uint8Array`, base64 `url`, or `fileId`). Duration is inferred from encoded
+ * size (providers price by duration, which the block does not carry) at Gemini's
+ * rates; a payload with no size (bare URL / file id) falls back to a ~30s
+ * estimate. Returns 0 for non-timed media (e.g. an image/document `media` block)
+ * so it is never mispriced as video.
+ */
+export function estimateTimedMediaBlockTokens(
+  block: Record<string, unknown>
+): number {
+  const kind = timedMediaKind(block);
+  if (kind == null) {
+    return 0;
+  }
+  let bytes: number;
+  if (block.type === 'input_audio') {
+    const audio = block.input_audio as { data?: string } | undefined;
+    bytes = base64ByteLength(audio?.data);
+  } else if (block.type === 'video_url') {
+    const video = block.video_url as string | { url?: string } | undefined;
+    bytes = base64ByteLength(typeof video === 'string' ? video : video?.url);
+  } else {
+    bytes = mediaBlockByteLength(block);
+  }
+  if (kind === 'audio') {
+    return timedMediaTokens(
+      bytes,
+      AUDIO_BYTES_PER_SECOND,
+      AUDIO_TOKENS_PER_SECOND,
+      AUDIO_URL_FALLBACK_TOKENS
+    );
+  }
+  return timedMediaTokens(
+    bytes,
+    VIDEO_BYTES_PER_SECOND,
+    VIDEO_TOKENS_PER_SECOND,
+    VIDEO_URL_FALLBACK_TOKENS
+  );
+}
+
 const tokenizers: Partial<Record<EncodingName, Tokenizer>> = {};
 
 async function getTokenizer(
@@ -354,6 +525,13 @@ export function getTokenCountForMessage(
           numTokens += Math.ceil(
             estimateDocumentBlockTokens(item, encoding, getTokenCount) *
               IMAGE_TOKEN_SAFETY_MARGIN
+          );
+          continue;
+        }
+
+        if (isTimedMediaType(item.type)) {
+          numTokens += Math.ceil(
+            estimateTimedMediaBlockTokens(item) * IMAGE_TOKEN_SAFETY_MARGIN
           );
           continue;
         }
