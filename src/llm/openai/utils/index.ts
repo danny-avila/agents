@@ -527,7 +527,7 @@ export function _convertMessagesToOpenAIResponsesParams(
   model?: string,
   zdrEnabled?: boolean
 ): ResponsesInputItem[] {
-  return messages.flatMap(
+  const input = messages.flatMap(
     (lcMsg): ResponsesInputItem | ResponsesInputItem[] => {
       const additional_kwargs =
         lcMsg.additional_kwargs as BaseMessageFields['additional_kwargs'] & {
@@ -604,23 +604,30 @@ export function _convertMessagesToOpenAIResponsesParams(
       }
 
       if (role === 'assistant') {
-        // if we have the original response items, just reuse them
-        if (
-          !zdrEnabled &&
+        const input: ResponsesInputItem[] = [];
+        const replayOutput =
           responseMetadata.output != null &&
           Array.isArray(responseMetadata.output) &&
           responseMetadata.output.length > 0 &&
           responseMetadata.output.every((item) => 'type' in item)
-        ) {
-          return responseMetadata.output;
+            ? responseMetadata.output
+            : [];
+        if (replayOutput.some((item) => item.type === 'message')) {
+          return replayOutput;
         }
-
-        // otherwise, try to reconstruct the response from what we have
-
-        const input: ResponsesInputItem[] = [];
+        input.push(...replayOutput);
+        const replayedFunctionCalls = new Set(
+          replayOutput
+            .filter((item) => item.type === 'function_call')
+            .map((item) => item.call_id)
+        );
 
         // reasoning items
-        if (additional_kwargs.reasoning && !zdrEnabled) {
+        if (
+          additional_kwargs.reasoning &&
+          !replayOutput.some((item) => item.type === 'reasoning') &&
+          (!zdrEnabled || additional_kwargs.reasoning.encrypted_content != null)
+        ) {
           const reasoningItem = _convertReasoningSummaryToOpenAIResponsesParams(
             additional_kwargs.reasoning
           );
@@ -645,60 +652,75 @@ export function _convertMessagesToOpenAIResponsesParams(
           ];
         }
 
-        input.push({
-          type: 'message',
-          role: 'assistant',
-          ...(lcMsg.id && !zdrEnabled && lcMsg.id.startsWith('msg_')
-            ? { id: lcMsg.id }
-            : {}),
-          content:
-            typeof content === 'string'
-              ? content
-              : content.flatMap((item) => {
-                if (item.type === 'text') {
-                  const textItem = item as MessageContentComplex & {
-                      annotations?: unknown[];
+        if (
+          typeof content === 'string' ? content.length > 0 : content.length > 0
+        ) {
+          input.push({
+            type: 'message',
+            role: 'assistant',
+            ...(lcMsg.id && !zdrEnabled && lcMsg.id.startsWith('msg_')
+              ? { id: lcMsg.id }
+              : {}),
+            content:
+              typeof content === 'string'
+                ? content
+                : content.flatMap((item) => {
+                  if (item.type === 'text') {
+                    const textItem = item as MessageContentComplex & {
+                        annotations?: unknown[];
+                      };
+                    return {
+                      type: 'output_text',
+                      text: item.text,
+                      annotations: textItem.annotations ?? [],
                     };
-                  return {
-                    type: 'output_text',
-                    text: item.text,
-                    annotations: textItem.annotations ?? [],
-                  };
-                }
+                  }
 
-                if (item.type === 'output_text' || item.type === 'refusal') {
-                  return item;
-                }
+                  if (
+                    item.type === 'output_text' ||
+                      item.type === 'refusal'
+                  ) {
+                    return item;
+                  }
 
-                return [];
-              }),
-        } as ResponsesInputItem);
+                  return [];
+                }),
+          } as ResponsesInputItem);
+        }
 
         const functionCallIds = additional_kwargs[_FUNCTION_CALL_IDS_MAP_KEY];
 
         if (isAIMessage(lcMsg) && !!lcMsg.tool_calls?.length) {
           input.push(
-            ...lcMsg.tool_calls.map(
-              (toolCall): ResponsesInputItem => ({
-                type: 'function_call',
-                name: toolCall.name,
-                arguments: JSON.stringify(toolCall.args),
-                call_id: toolCall.id!,
-                ...(zdrEnabled ? { id: functionCallIds?.[toolCall.id!] } : {}),
-              })
-            )
+            ...lcMsg.tool_calls
+              .filter((toolCall) => !replayedFunctionCalls.has(toolCall.id!))
+              .map(
+                (toolCall): ResponsesInputItem => ({
+                  type: 'function_call',
+                  name: toolCall.name,
+                  arguments: JSON.stringify(toolCall.args),
+                  call_id: toolCall.id!,
+                  ...(!zdrEnabled
+                    ? { id: functionCallIds?.[toolCall.id!] }
+                    : {}),
+                })
+              )
           );
         } else if (additional_kwargs.tool_calls) {
           input.push(
-            ...additional_kwargs.tool_calls.map(
-              (toolCall): ResponsesInputItem => ({
-                type: 'function_call',
-                name: toolCall.function.name,
-                call_id: toolCall.id,
-                arguments: toolCall.function.arguments,
-                ...(zdrEnabled ? { id: functionCallIds?.[toolCall.id] } : {}),
-              })
-            )
+            ...additional_kwargs.tool_calls
+              .filter((toolCall) => !replayedFunctionCalls.has(toolCall.id))
+              .map(
+                (toolCall): ResponsesInputItem => ({
+                  type: 'function_call',
+                  name: toolCall.function.name,
+                  call_id: toolCall.id,
+                  arguments: toolCall.function.arguments,
+                  ...(!zdrEnabled
+                    ? { id: functionCallIds?.[toolCall.id] }
+                    : {}),
+                })
+              )
           );
         }
 
@@ -802,13 +824,14 @@ export function _convertMessagesToOpenAIResponsesParams(
       return [];
     }
   );
+  return input;
 }
 
 export function isReasoningModel(model?: string) {
   return model != null && model !== '' && /\b(o\d|gpt-[5-9])\b/i.test(model);
 }
 
-function _convertOpenAIResponsesMessageToBaseMessage(
+export function _convertOpenAIResponsesMessageToBaseMessage(
   response: ResponsesCreateInvoke | ResponsesParseInvoke
 ): BaseMessage {
   if (response.error) {
@@ -829,6 +852,8 @@ function _convertOpenAIResponsesMessageToBaseMessage(
     incomplete_details: response.incomplete_details,
     metadata: response.metadata,
     object: response.object,
+    output: response.output,
+    usage: response.usage,
     status: response.status,
     user: response.user,
     service_tier: response.service_tier,
@@ -984,7 +1009,10 @@ export function _convertOpenAIResponsesDeltaToBaseMessageChunk(
     response_metadata.id = chunk.response.id;
     response_metadata.model_name = chunk.response.model;
     response_metadata.model = chunk.response.model;
-  } else if (chunk.type === 'response.completed') {
+  } else if (
+    chunk.type === 'response.completed' ||
+    chunk.type === 'response.incomplete'
+  ) {
     const msg = _convertOpenAIResponsesMessageToBaseMessage(chunk.response);
 
     usage_metadata = chunk.response.usage;

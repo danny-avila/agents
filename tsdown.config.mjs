@@ -1,4 +1,5 @@
 import { defineConfig } from 'tsdown';
+import { isAbsolute } from 'node:path';
 
 const entry = {
   main: 'src/index.ts',
@@ -6,7 +7,8 @@ const entry = {
   'responses/index': 'src/responses/index.ts',
   'langchain/index': 'src/langchain/index.ts',
   'langchain/google-common': 'src/langchain/google-common.ts',
-  'langchain/language_models/chat_models': 'src/langchain/language_models/chat_models.ts',
+  'langchain/language_models/chat_models':
+    'src/langchain/language_models/chat_models.ts',
   'langchain/messages': 'src/langchain/messages.ts',
   'langchain/messages/tool': 'src/langchain/messages/tool.ts',
   'langchain/openai': 'src/langchain/openai.ts',
@@ -37,7 +39,8 @@ const shared = {
   // Match the prior Rollup build (`external: [/node_modules/]`): bundle nothing
   // third-party, compile only this package's own modules.
   deps: {
-    neverBundle: (id) => !id.startsWith('.') && !id.startsWith('@/') && !id.startsWith('/'),
+    neverBundle: (id) =>
+      !id.startsWith('.') && !id.startsWith('@/') && !isAbsolute(id),
     onlyBundle: false,
   },
 };

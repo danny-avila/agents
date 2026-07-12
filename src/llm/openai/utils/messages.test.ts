@@ -1,5 +1,8 @@
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
-import { _convertMessagesToOpenAIParams } from './index';
+import {
+  _convertMessagesToOpenAIParams,
+  _convertMessagesToOpenAIResponsesParams,
+} from './index';
 
 describe('_convertMessagesToOpenAIParams', () => {
   it('includes reasoning_content for assistant messages in tool-call context when requested', () => {
@@ -155,5 +158,73 @@ describe('_convertMessagesToOpenAIParams', () => {
         reasoning_content: 'The prior calculator result is available.',
       })
     );
+  });
+});
+
+describe('_convertMessagesToOpenAIResponsesParams', () => {
+  it('combines persisted reasoning items with reconstructed standard tool calls', () => {
+    const firstReasoning = {
+      type: 'reasoning' as const,
+      id: 'rs_1',
+      summary: [],
+      encrypted_content: 'encrypted-1',
+    };
+    const finalReasoning = {
+      type: 'reasoning' as const,
+      id: 'rs_2',
+      summary: [],
+      encrypted_content: 'encrypted-2',
+    };
+    const messages = [
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          {
+            id: 'call_1',
+            name: 'lookup',
+            args: {},
+            type: 'tool_call',
+          },
+        ],
+        response_metadata: {
+          model_provider: 'openai',
+          output: [firstReasoning],
+        },
+      }),
+      new ToolMessage({
+        content: '{"ok":true}',
+        tool_call_id: 'call_1',
+      }),
+      new AIMessage({
+        content: 'Done.',
+        response_metadata: {
+          model_provider: 'openai',
+          output: [finalReasoning],
+        },
+      }),
+    ];
+
+    expect(
+      _convertMessagesToOpenAIResponsesParams(messages, 'gpt-5.6', true)
+    ).toEqual([
+      firstReasoning,
+      {
+        type: 'function_call',
+        name: 'lookup',
+        arguments: '{}',
+        call_id: 'call_1',
+      },
+      {
+        type: 'function_call_output',
+        call_id: 'call_1',
+        output: '{"ok":true}',
+      },
+      finalReasoning,
+      {
+        type: 'message',
+        role: 'assistant',
+        content: 'Done.',
+      },
+    ]);
   });
 });

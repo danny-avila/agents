@@ -73,7 +73,10 @@ export type GoogleThinkingConfig = {
   includeThoughts?: boolean;
   thinkingLevel?: 'THINKING_LEVEL_UNSPECIFIED' | 'LOW' | 'MEDIUM' | 'HIGH';
 };
-export type OpenAIClientOptions = ChatOpenAIFields;
+export type OpenAIClientOptions = ChatOpenAIFields & {
+  promptCacheExplicit?: boolean;
+  safety_identifier?: string;
+};
 export type AnthropicClientOptions = Omit<AnthropicInput, 'thinking'> & {
   thinking?: ThinkingConfig;
   promptCache?: boolean;
