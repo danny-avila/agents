@@ -727,7 +727,7 @@ describe('Token accounting pipeline — end-to-end multi-turn with calibration',
 });
 
 describe('Token accounting pipeline — Anthropic vs OpenAI cache semantics', () => {
-  it('Anthropic additive cache inflates calibration input correctly', () => {
+  it('Anthropic normalized cache input calibrates from input_tokens only', () => {
     const messages = [new HumanMessage('Hello'), new AIMessage('Hi')];
 
     const indexTokenCountMap: Record<string, number | undefined> = {
@@ -744,12 +744,12 @@ describe('Token accounting pipeline — Anthropic vs OpenAI cache semantics', ()
       reserveRatio: 0,
     });
 
-    // Anthropic: input_tokens=30, cache_read=60, cache_creation=20
-    // cacheSum=80 > baseInput=30 → additive → totalInput=30+80=110
+    // Anthropic output normalization stores cache-inclusive prompt tokens in
+    // input_tokens and repeats the cache components in input_token_details.
     const result = pruneMessages({
       messages,
       usageMetadata: {
-        input_tokens: 30,
+        input_tokens: 110,
         output_tokens: 15,
         input_token_details: { cache_read: 60, cache_creation: 20 },
       },
@@ -759,6 +759,68 @@ describe('Token accounting pipeline — Anthropic vs OpenAI cache semantics', ()
     expect(result.indexTokenCountMap[0]).toBe(50);
     expect(result.indexTokenCountMap[1]).toBe(50);
     expect(result.calibrationRatio).toBeCloseTo(1.1, 1);
+  });
+
+  it('skips Bedrock cache-artifact turns instead of poisoning instruction overhead', () => {
+    const messages = [
+      new SystemMessage('system instructions'),
+      new HumanMessage('first user turn'),
+      new AIMessage('first response'),
+      new HumanMessage('second user turn'),
+      new AIMessage('second response'),
+    ];
+    const indexTokenCountMap: Record<string, number | undefined> = {
+      0: 3197,
+      1: 8000,
+      2: 7000,
+      3: 9506,
+      4: 1,
+    };
+    const instructionTokens = 5450;
+    const logs: Array<{
+      level: string;
+      message: string;
+      data?: Record<string, unknown>;
+    }> = [];
+
+    const pruneMessages = createPruneMessages({
+      provider: Providers.BEDROCK,
+      maxTokens: 126935,
+      startIndex: messages.length,
+      tokenCounter: charCounter,
+      indexTokenCountMap,
+      reserveRatio: 0.05,
+      getInstructionTokens: () => instructionTokens,
+      log: (level, message, data) => logs.push({ level, message, data }),
+    });
+
+    const result = pruneMessages({
+      messages,
+      usageMetadata: {
+        input_tokens: 6,
+        output_tokens: 1,
+        input_token_details: {
+          cache_creation: 380974,
+          cache_read: 13165,
+        },
+      },
+    });
+
+    expect(result.calibrationRatio).toBe(1);
+    expect(result.resolvedInstructionOverhead).toBeUndefined();
+    expect(result.remainingContextTokens).toBeGreaterThan(0);
+    expect(
+      logs.find((entry) => entry.message === 'Calibration skipped')?.data
+    ).toMatchObject({
+      reason: 'input_below_instruction_overhead',
+      providerInputTokens: 6,
+      instructionOverhead: instructionTokens,
+    });
+    expect(
+      logs.find((entry) => entry.message === 'Budget')?.data
+    ).toMatchObject({
+      instructionTokens,
+    });
   });
 
   it('OpenAI inclusive cache does NOT inflate calibration input', () => {

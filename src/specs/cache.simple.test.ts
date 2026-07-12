@@ -11,7 +11,7 @@ import {
 } from '@langchain/core/messages';
 import type * as t from '@/types';
 import { ModelEndHandler, ToolEndHandler } from '@/events';
-import { capitalizeFirstLetter } from './spec.utils';
+import { capitalizeFirstLetter, hasEnv, hasEveryEnv } from './spec.utils';
 import { createContentAggregator } from '@/stream';
 import { GraphEvents, Providers } from '@/common';
 import { getLLMConfig } from '@/utils/llmConfig';
@@ -82,7 +82,20 @@ describe('Prompt Caching Integration Tests', () => {
     version: 'v2' as const,
   };
 
-  describe('Anthropic Prompt Caching', () => {
+  const requiredBedrockEnv = [
+    'BEDROCK_AWS_REGION',
+    'BEDROCK_AWS_ACCESS_KEY_ID',
+    'BEDROCK_AWS_SECRET_ACCESS_KEY',
+  ];
+  const hasAnthropicApiKey = hasEnv('ANTHROPIC_API_KEY');
+  const hasBedrockCredentials = hasEveryEnv(requiredBedrockEnv);
+
+  const describeIfAnthropic = hasAnthropicApiKey ? describe : describe.skip;
+  const describeIfBedrock = hasBedrockCredentials ? describe : describe.skip;
+  const describeIfAnthropicAndBedrock =
+    hasAnthropicApiKey && hasBedrockCredentials ? describe : describe.skip;
+
+  describeIfAnthropic('Anthropic Prompt Caching', () => {
     const provider = Providers.ANTHROPIC;
 
     test(`${capitalizeFirstLetter(provider)}: multi-turn conversation with caching should not corrupt messages`, async () => {
@@ -212,7 +225,7 @@ describe('Prompt Caching Integration Tests', () => {
     });
   });
 
-  describe('Bedrock Prompt Caching', () => {
+  describeIfBedrock('Bedrock Prompt Caching', () => {
     const provider = Providers.BEDROCK;
 
     test(`${capitalizeFirstLetter(provider)}: multi-turn conversation with caching should not corrupt messages`, async () => {
@@ -340,7 +353,7 @@ describe('Prompt Caching Integration Tests', () => {
     });
   });
 
-  describe('Cross-provider message isolation', () => {
+  describeIfAnthropicAndBedrock('Cross-provider message isolation', () => {
     test('Messages processed by Anthropic should not affect Bedrock processing', async () => {
       const anthropicConfig = getLLMConfig(Providers.ANTHROPIC);
       const bedrockConfig = getLLMConfig(Providers.BEDROCK);
