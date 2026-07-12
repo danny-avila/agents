@@ -2752,7 +2752,16 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             results,
             completionDispatched:
               execution.completionDispatched === true &&
-              execution.request.turn === request.turn,
+              execution.request.turn === request.turn &&
+              /**
+               * A result-altering hook active THIS batch may rewrite the
+               * consumed output below, but the stream already emitted the raw
+               * eager completion before the hook existed. Treating it as NOT
+               * dispatched forces a corrected batch-time re-emission, so
+               * host/UI step output converges to the final ToolMessage.
+               */
+              !hasPostHook &&
+              !hasFailureHook,
             toolCallId: request.id,
           };
         })
