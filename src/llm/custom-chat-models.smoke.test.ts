@@ -1077,12 +1077,19 @@ describe('custom chat model class smoke tests', () => {
       model: 'anthropic.claude-3-haiku-20240307-v1:0',
       applicationInferenceProfile,
       serviceTier: 'priority',
+      _lc_stream_delay: 12,
+    });
+    const defaultStreamDelayModel = new CustomChatBedrockConverse({
+      ...baseBedrockFields,
+      model: 'anthropic.claude-3-haiku-20240307-v1:0',
     });
 
     expect(CustomChatBedrockConverse.lc_name()).toBe(
       'LibreChatBedrockConverse'
     );
     expect(model.applicationInferenceProfile).toBe(applicationInferenceProfile);
+    expect(model._lc_stream_delay).toBe(12);
+    expect(defaultStreamDelayModel._lc_stream_delay).toBe(0);
     expect(model.invocationParams({}).serviceTier).toEqual({
       type: 'priority',
     });

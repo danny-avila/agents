@@ -100,6 +100,10 @@ export type BedrockAnthropicInput = ChatBedrockConverseInput & {
    * server-side, so the default is safe to leave on.
    */
   promptCacheTtl?: PromptCacheTtl;
+  /**
+   * Minimum delay in milliseconds between visible streamed text deltas.
+   */
+  _lc_stream_delay?: number;
 };
 export type BedrockConverseClientOptions = BedrockAnthropicInput;
 export type BedrockAnthropicClientOptions = BedrockAnthropicInput;

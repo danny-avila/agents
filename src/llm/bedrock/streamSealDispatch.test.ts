@@ -155,4 +155,40 @@ describe('Converse stream seal dispatch', () => {
     expect(dispatched.some(hasSeal)).toBe(false);
     expect(dispatched).toHaveLength(1);
   });
+
+  test('paces visible text deltas with configured stream delay', async () => {
+    const setTimeoutSpy = jest.spyOn(globalThis, 'setTimeout');
+
+    try {
+      const { yielded, dispatched } = await runStream(
+        [
+          {
+            contentBlockDelta: {
+              contentBlockIndex: 0,
+              delta: { text: 'hello' },
+            },
+          },
+          {
+            contentBlockDelta: {
+              contentBlockIndex: 0,
+              delta: { text: ' world' },
+            },
+          },
+        ],
+        { _lc_stream_delay: 35 }
+      );
+
+      expect(yielded.map((m) => m.content)).toEqual(['hello', ' world']);
+      expect(dispatched.map((m) => m.content)).toEqual(['hello', ' world']);
+
+      const timeoutDelays = setTimeoutSpy.mock.calls
+        .map(([, delay]) => delay)
+        .filter((delay): delay is number => typeof delay === 'number');
+      expect(timeoutDelays.some((delay) => delay > 0 && delay <= 35)).toBe(
+        true
+      );
+    } finally {
+      setTimeoutSpy.mockRestore();
+    }
+  });
 });

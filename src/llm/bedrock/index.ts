@@ -57,6 +57,52 @@ export type ServiceTierType = 'priority' | 'default' | 'flex' | 'reserved';
 export type CustomGuardrailConfiguration = GuardrailConfiguration &
   Pick<GuardrailStreamConfiguration, 'streamProcessingMode'>;
 
+function getCadencedStreamDelay({
+  targetDelay,
+  lastVisibleTextAt,
+  now,
+}: {
+  targetDelay: number;
+  lastVisibleTextAt?: number;
+  now: number;
+}): number {
+  if (targetDelay <= 0 || lastVisibleTextAt == null) {
+    return 0;
+  }
+  return Math.max(0, targetDelay - (now - lastVisibleTextAt));
+}
+
+async function waitForStreamDelay(
+  delay: number,
+  signal?: AbortSignal
+): Promise<void> {
+  if (delay <= 0 || isSignalAborted(signal)) {
+    return;
+  }
+  await new Promise<void>((resolve) => {
+    const timeoutRef: { current?: ReturnType<typeof setTimeout> } = {};
+    const onAbort = (): void => {
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+      }
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    };
+    timeoutRef.current = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, delay);
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (isSignalAborted(signal)) {
+      onAbort();
+    }
+  });
+}
+
+function isSignalAborted(signal?: AbortSignal): boolean {
+  return signal?.aborted === true;
+}
+
 /**
  * Extended input interface with additional features:
  * - applicationInferenceProfile: Use an inference profile ARN instead of model ID
@@ -77,6 +123,11 @@ export interface CustomChatBedrockConverseInput
    * on; use `'5m'` for any model that rejects it.
    */
   promptCacheTtl?: PromptCacheTtl;
+
+  /**
+   * Minimum delay in milliseconds between visible streamed text deltas.
+   */
+  _lc_stream_delay?: number;
 
   /**
    * Guardrail configuration for Converse and ConverseStream invocations.
@@ -119,6 +170,8 @@ export interface CustomChatBedrockConverseCallOptions {
 }
 
 export class CustomChatBedrockConverse extends ChatBedrockConverse {
+  _lc_stream_delay: number;
+
   /**
    * Whether to insert Bedrock prompt cache checkpoints when available.
    */
@@ -151,6 +204,7 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
     super(fields);
     this.promptCache = fields?.promptCache;
     this.promptCacheTtl = fields?.promptCacheTtl;
+    this._lc_stream_delay = Math.max(0, fields?._lc_stream_delay ?? 0);
     this.applicationInferenceProfile = fields?.applicationInferenceProfile;
     this.serviceTier = fields?.serviceTier;
     // `super(fields)` initializes `this.model` to LangChain's default Claude
@@ -271,6 +325,8 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
 
     const seenBlockIndices = new Set<number>();
     const toolUseBlockIndices = new Set<number>();
+    let hasEmittedText = false;
+    let lastVisibleTextAt: number | undefined;
     /**
      * Guardrails can reject an already-streamed toolUse block at
      * `messageStop` (`guardrail_intervened`), after `contentBlockStop` has
@@ -315,6 +371,22 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
         const idx = event.contentBlockDelta.contentBlockIndex;
         if (idx != null) {
           seenBlockIndices.add(idx);
+        }
+
+        if (deltaChunk.text !== '') {
+          await waitForStreamDelay(
+            getCadencedStreamDelay({
+              targetDelay: hasEmittedText ? this._lc_stream_delay : 0,
+              lastVisibleTextAt,
+              now: Date.now(),
+            }),
+            options.signal
+          );
+          if (isSignalAborted(options.signal)) {
+            throw new Error('AbortError: User aborted the request.');
+          }
+          hasEmittedText = true;
+          lastVisibleTextAt = Date.now();
         }
 
         yield this.enrichChunk(deltaChunk, seenBlockIndices);
