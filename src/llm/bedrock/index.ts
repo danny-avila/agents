@@ -512,13 +512,19 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
       const enqueueDelta = async (
         contentBlockDelta: ContentBlockDeltaEvent
       ): Promise<void> => {
+        const delta = contentBlockDelta.delta;
+        if (delta == null) {
+          throw new Error('No delta found in content block.');
+        }
+
         const idx = contentBlockDelta.contentBlockIndex;
         if (idx != null) {
           seenBlockIndices.add(idx);
         }
 
-        const text = contentBlockDelta.delta?.text;
-        const reasoningText = contentBlockDelta.delta?.reasoningContent?.text;
+        const text = delta.text;
+        const reasoningContent = delta.reasoningContent;
+        const reasoningText = reasoningContent?.text;
         const visibleText =
           typeof text === 'string'
             ? text
@@ -535,15 +541,17 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
           if (typeof text === 'string') {
             splitDelta = {
               ...contentBlockDelta,
-              delta: { ...contentBlockDelta.delta, text: token },
+              delta: { text: token },
             };
-          } else if (typeof reasoningText === 'string') {
+          } else if (
+            typeof reasoningText === 'string' &&
+            reasoningContent != null
+          ) {
             splitDelta = {
               ...contentBlockDelta,
               delta: {
-                ...contentBlockDelta.delta,
                 reasoningContent: {
-                  ...contentBlockDelta.delta.reasoningContent,
+                  ...reasoningContent,
                   text: token,
                 },
               },
