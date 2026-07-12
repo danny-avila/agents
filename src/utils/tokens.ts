@@ -347,9 +347,9 @@ function timedMediaTokens(
 }
 
 /** Decoded byte length of a media block payload — top-level `data` (base64
- *  string or `Uint8Array`) or base64 `url`, or the native Bedrock nested
- *  `video|audio.source.bytes` (`Uint8Array`); 0 for a bare remote URL,
- *  `fileId`/`fileUri`, S3 location, or empty. */
+ *  string or `Uint8Array`) or base64 `url`, or the nested `video|audio.{data,
+ *  url, source.bytes}` shapes (`formatMessage` media arrays / native Bedrock);
+ *  0 for a bare remote URL, `fileId`/`fileUri`, S3 location, or empty. */
 function mediaBlockByteLength(block: Record<string, unknown>): number {
   const data = block.data;
   if (typeof data === 'string') {
@@ -362,11 +362,18 @@ function mediaBlockByteLength(block: Record<string, unknown>): number {
     return base64ByteLength(block.url);
   }
   const nested = (block.video ?? block.audio) as
-    | { source?: { bytes?: unknown } }
+    | { data?: unknown; url?: unknown; source?: { bytes?: unknown } }
     | undefined;
-  const bytes = nested?.source?.bytes;
-  if (bytes instanceof Uint8Array) {
-    return bytes.length;
+  if (nested != null) {
+    if (typeof nested.data === 'string') {
+      return base64ByteLength(nested.data);
+    }
+    if (typeof nested.url === 'string') {
+      return base64ByteLength(nested.url);
+    }
+    if (nested.source?.bytes instanceof Uint8Array) {
+      return nested.source.bytes.length;
+    }
   }
   return 0;
 }

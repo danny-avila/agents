@@ -232,6 +232,24 @@ describe('estimateTimedMediaBlockTokens', () => {
     ).toBe(480); // 240,000 / 16,000 = 15s * 32
   });
 
+  test('reads nested video/audio data-URL and data payloads, remote stays fallback', () => {
+    // nested data URL sized by its bytes (750,000 -> 3s * 300)
+    expect(
+      estimateTimedMediaBlockTokens({
+        type: 'video',
+        video: { url: `data:video/mp4;base64,${B64(1_000_000)}` },
+      }),
+    ).toBe(900);
+    // nested base64 data (240,000 -> 15s * 32)
+    expect(
+      estimateTimedMediaBlockTokens({ type: 'audio', audio: { data: B64(320_000) } }),
+    ).toBe(480);
+    // nested REMOTE url has no size -> ~30s fallback
+    expect(
+      estimateTimedMediaBlockTokens({ type: 'video', video: { url: 'https://x/v.mp4' } }),
+    ).toBe(9000);
+  });
+
   test('non-data URI schemes (gs://, s3://) are treated as remote, not base64', () => {
     // gs:// audio must hit the ~30s remote fallback, not clamp to 32
     expect(
