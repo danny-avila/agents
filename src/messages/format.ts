@@ -738,9 +738,12 @@ function formatAssistantMessage(
         assistant content first so ordering is preserved, then replay the
         steer as a standalone user message — multimodal when the host stamped
         a pre-encoded `media` content array (attachment refs are re-encoded
-        per turn host-side, like any other user media). `lastAIMessage` is NOT
-        reset: preceding tool_call parts already emitted their ToolMessages,
-        so the HumanMessage lands after them in valid provider order.
+        per turn host-side, like any other user media). `lastAIMessage` is
+        reset AFTER the HumanMessage: a post-steer tool_call must mint a
+        FRESH assistant anchor (the heal path) so its AIMessage lands after
+        the user turn — attaching it to the pre-steer anchor would emit its
+        ToolMessage after the HumanMessage while the call itself sat before
+        it, an invalid provider ordering.
         */
         if (currentContent.length > 0) {
           if (
@@ -776,6 +779,7 @@ function formatAssistantMessage(
             'user'
           )
         );
+        lastAIMessage = null;
       } else if (
         part.type === ContentTypes.ERROR ||
         part.type === ContentTypes.AGENT_UPDATE ||

@@ -2103,6 +2103,32 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
        * to defensively `?.` it across every reference inside.
        */
       const hookRegistry = this.hookRegistry;
+      /**
+       * Pull each call's prestarted eager record BEFORE awaiting the hooks:
+       * an async deny must never race the eager host promise into emitting a
+       * successful completion (`dispatchEagerToolCompletions`' map-identity
+       * check skips deleted records). Allowed entries get their record
+       * restored in the decision loop below so consumption still works;
+       * denied entries stay deleted. Ask/interrupt configs never have eager
+       * records (HITL disables the reservation gate).
+       */
+      const preemptedEagerRecords = new Map<
+        string,
+        t.EagerEventToolExecution
+      >();
+      if (this.eagerEventToolExecutions != null) {
+        for (const entry of preToolCalls) {
+          const callId = entry.call.id;
+          if (callId == null) {
+            continue;
+          }
+          const record = this.eagerEventToolExecutions.get(callId);
+          if (record != null) {
+            preemptedEagerRecords.set(callId, record);
+            this.eagerEventToolExecutions.delete(callId);
+          }
+        }
+      }
       const preResults = await Promise.all(
         preToolCalls.map((entry) =>
           executeHooks({
@@ -2321,6 +2347,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
         if (hookResult.updatedInput != null) {
           applyInputOverride(entry, hookResult.updatedInput);
+        }
+        if (entry.call.id != null) {
+          const preempted = preemptedEagerRecords.get(entry.call.id);
+          if (preempted != null) {
+            this.eagerEventToolExecutions?.set(entry.call.id, preempted);
+          }
         }
         approvedEntries.push(entry);
       }
@@ -2748,20 +2780,24 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             request,
             execution
           );
+          /**
+           * Force a corrected batch-time re-emission ONLY when an active hook
+           * can actually rewrite this consumed result: `PostToolUse` rewrites
+           * success outputs via `updatedOutput`, while failure hooks cannot
+           * replace output — a duplicate completion there would change
+           * nothing. The stream already emitted the raw eager completion
+           * before the hook existed; treating a rewritable one as NOT
+           * dispatched converges host/UI step output to the final
+           * ToolMessage.
+           */
+          const rewritable =
+            hasPostHook && results.some((result) => result.status !== 'error');
           return {
             results,
             completionDispatched:
               execution.completionDispatched === true &&
               execution.request.turn === request.turn &&
-              /**
-               * A result-altering hook active THIS batch may rewrite the
-               * consumed output below, but the stream already emitted the raw
-               * eager completion before the hook existed. Treating it as NOT
-               * dispatched forces a corrected batch-time re-emission, so
-               * host/UI step output converges to the final ToolMessage.
-               */
-              !hasPostHook &&
-              !hasFailureHook,
+              !rewritable,
             toolCallId: request.id,
           };
         })

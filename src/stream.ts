@@ -113,16 +113,17 @@ function isBatchSensitiveToolExecution(
   metadata?: Record<string, unknown>
 ): boolean {
   /**
-   * Resolve the hook-session id exactly the way ToolNode will
-   * (`configurable.run_id` first): a subagent child graph carries its own
-   * `graph.runId`, but its ToolNode executes hooks under the PARENT's
-   * inherited run id — gating on the child id would miss parent
-   * session-scoped result-altering hooks and prestart a call those hooks
-   * intend to rewrite or block.
+   * Resolve the hook-session id exactly the way ToolNode will: its hook
+   * lookups read `config.configurable.run_id` ONLY, so that source wins here
+   * too (a subagent child graph carries its own `graph.runId`, but its
+   * ToolNode executes hooks under the PARENT's inherited configurable run
+   * id). The metadata / graph.runId fallbacks only apply when no
+   * configurable id exists and can only be conservative — a false positive
+   * merely skips eager prestart.
    */
   const runId =
-    (metadata?.run_id as string | undefined) ??
     (graph.config?.configurable?.run_id as string | undefined) ??
+    (metadata?.run_id as string | undefined) ??
     graph.runId;
   return (
     graph.hookRegistry?.hasResultAlteringHooks(runId) === true ||

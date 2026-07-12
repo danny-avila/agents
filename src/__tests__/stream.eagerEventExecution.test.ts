@@ -3230,9 +3230,9 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
 
   it('does not prestart when parent-run session hooks alter results', async () => {
     // A subagent child graph has its own runId, but ToolNode executes hooks
-    // under the PARENT run id inherited via metadata/configurable — the
-    // prestart gate must resolve the same id or it prestarts calls the
-    // parent's hooks intend to rewrite or block.
+    // under the PARENT run id from `configurable.run_id` ONLY — the prestart
+    // gate must read the same source (a differing metadata run id here is a
+    // deliberate distractor pinning the precedence).
     const sessionRegistry = new HookRegistry();
     sessionRegistry.registerSession('parent-run', 'PreToolUse', {
       hooks: [async () => ({ decision: 'allow' as const })],
@@ -3240,7 +3240,11 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     const graph = createGraph({
       runId: 'child-run',
       hookRegistry: sessionRegistry,
-    });
+      config: {
+        configurable: { user_id: 'user_1', run_id: 'parent-run' },
+        metadata: { run_id: 'run_1' },
+      },
+    } as Partial<StandardGraph>);
     const sessionDispatchSpy = jest.spyOn(events, 'safeDispatchCustomEvent');
 
     await new ChatModelStreamHandler().handle(
@@ -3253,7 +3257,7 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
           ],
         } as unknown as t.StreamChunk,
       },
-      { langgraph_node: 'agent', run_id: 'parent-run' },
+      { langgraph_node: 'agent', run_id: 'some-other-run' },
       graph
     );
 

@@ -832,6 +832,179 @@ describe('ToolNode eager event tool execution', () => {
     expect(toolMessage?.content).toBe('raw output');
   });
 
+  it('removes prestarted records while PreToolUse hooks are in flight', async () => {
+    const { toolExecuteCalls } = installToolExecuteResponder('redispatched');
+    const eagerExecutions = new Map<string, t.EagerEventToolExecution>();
+    const request: t.ToolCallRequest = {
+      id: 'call_weather',
+      name: 'weather',
+      args: { city: 'NYC' },
+      stepId: 'step_weather',
+      turn: 0,
+    };
+    eagerExecutions.set('call_weather', {
+      toolCallId: 'call_weather',
+      toolName: 'weather',
+      args: { city: 'NYC' },
+      request,
+      promise: Promise.resolve({
+        results: [
+          {
+            toolCallId: 'call_weather',
+            status: 'success',
+            content: 'eager result',
+          },
+        ],
+      }),
+    });
+
+    const seenDuringHook: boolean[] = [];
+    const hookRegistry = new HookRegistry();
+    hookRegistry.register('PreToolUse', {
+      hooks: [
+        async () => {
+          // The record must be OUT of the map while this hook is pending, so
+          // a resolving eager promise cannot emit a successful completion for
+          // a call this hook is about to deny.
+          seenDuringHook.push(eagerExecutions.has('call_weather'));
+          return { decision: 'deny' as const, reason: 'no' };
+        },
+      ],
+    });
+    const toolNode = new ToolNode({
+      tools: [createDummyTool('weather')],
+      eventDrivenMode: true,
+      eagerEventToolExecution: { enabled: true },
+      eagerEventToolExecutions: eagerExecutions,
+      eagerEventToolUsageCount: new Map(),
+      hookRegistry,
+      toolCallStepIds: new Map([['call_weather', 'step_weather']]),
+    });
+
+    const result = (await toolNode.invoke({
+      messages: [createAIMessage('call_weather', 'weather', { city: 'NYC' })],
+    })) as { messages: ToolMessage[] };
+
+    expect(seenDuringHook).toEqual([false]);
+    expect(eagerExecutions.has('call_weather')).toBe(false);
+    expect(toolExecuteCalls).toHaveLength(0);
+    const toolMessage = result.messages.find((m) => m instanceof ToolMessage);
+    expect(String(toolMessage?.content)).toContain('Blocked');
+  });
+
+  it('restores preempted records for allowed calls and consumes them', async () => {
+    const { toolExecuteCalls } = installToolExecuteResponder('redispatched');
+    const eagerExecutions = new Map<string, t.EagerEventToolExecution>();
+    const request: t.ToolCallRequest = {
+      id: 'call_weather',
+      name: 'weather',
+      args: { city: 'NYC' },
+      stepId: 'step_weather',
+      turn: 0,
+    };
+    eagerExecutions.set('call_weather', {
+      toolCallId: 'call_weather',
+      toolName: 'weather',
+      args: { city: 'NYC' },
+      request,
+      promise: Promise.resolve({
+        results: [
+          {
+            toolCallId: 'call_weather',
+            status: 'success',
+            content: 'eager result',
+          },
+        ],
+      }),
+    });
+
+    const hookRegistry = new HookRegistry();
+    hookRegistry.register('PreToolUse', {
+      hooks: [async () => ({ decision: 'allow' as const })],
+    });
+    const toolNode = new ToolNode({
+      tools: [createDummyTool('weather')],
+      eventDrivenMode: true,
+      eagerEventToolExecution: { enabled: true },
+      eagerEventToolExecutions: eagerExecutions,
+      eagerEventToolUsageCount: new Map(),
+      hookRegistry,
+      toolCallStepIds: new Map([['call_weather', 'step_weather']]),
+    });
+
+    const result = (await toolNode.invoke({
+      messages: [createAIMessage('call_weather', 'weather', { city: 'NYC' })],
+    })) as { messages: ToolMessage[] };
+
+    expect(toolExecuteCalls).toHaveLength(0);
+    expect(eagerExecutions.has('call_weather')).toBe(false);
+    const toolMessage = result.messages.find((m) => m instanceof ToolMessage);
+    expect(toolMessage?.content).toBe('eager result');
+  });
+
+  it('does not duplicate completions for hooks that cannot rewrite the result', async () => {
+    const stepCompletions: Array<{
+      result?: { tool_call?: { output?: string } };
+    }> = [];
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data): Promise<boolean | void> => {
+        if (event === GraphEvents.ON_RUN_STEP_COMPLETED) {
+          stepCompletions.push(data as (typeof stepCompletions)[number]);
+          return true;
+        }
+      });
+
+    const eagerExecutions = new Map<string, t.EagerEventToolExecution>();
+    const request: t.ToolCallRequest = {
+      id: 'call_weather',
+      name: 'weather',
+      args: { city: 'NYC' },
+      stepId: 'step_weather',
+      turn: 0,
+    };
+    eagerExecutions.set('call_weather', {
+      toolCallId: 'call_weather',
+      toolName: 'weather',
+      args: { city: 'NYC' },
+      request,
+      completionDispatched: true,
+      promise: Promise.resolve({
+        results: [
+          {
+            toolCallId: 'call_weather',
+            status: 'success',
+            content: 'raw eager output',
+          },
+        ],
+      }),
+    });
+
+    // A failure hook cannot replace a SUCCESS result's output — the already
+    // emitted eager completion is final, so no batch re-emission may fire.
+    const hookRegistry = new HookRegistry();
+    hookRegistry.register('PostToolUseFailure', {
+      hooks: [async () => ({})],
+    });
+    const toolNode = new ToolNode({
+      tools: [createDummyTool('weather')],
+      eventDrivenMode: true,
+      eagerEventToolExecution: { enabled: true },
+      eagerEventToolExecutions: eagerExecutions,
+      eagerEventToolUsageCount: new Map(),
+      hookRegistry,
+      toolCallStepIds: new Map([['call_weather', 'step_weather']]),
+    });
+
+    const result = (await toolNode.invoke({
+      messages: [createAIMessage('call_weather', 'weather', { city: 'NYC' })],
+    })) as { messages: ToolMessage[] };
+
+    const toolMessage = result.messages.find((m) => m instanceof ToolMessage);
+    expect(toolMessage?.content).toBe('raw eager output');
+    expect(stepCompletions).toHaveLength(0);
+  });
+
   it('re-emits a corrected completion when hooks rewrite a consumed eager result', async () => {
     const stepCompletions: Array<{
       result?: { tool_call?: { output?: string } };

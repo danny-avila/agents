@@ -56,6 +56,48 @@ describe('formatAgentMessages steer replay', () => {
     expect(trailing).toBeInstanceOf(AIMessage);
   });
 
+  it('mints a fresh assistant anchor for a tool call after a steer', () => {
+    const payload: TPayload = [
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]: 'First step.',
+            tool_call_ids: ['call_1'],
+          },
+          toolCallPart('call_1'),
+          {
+            type: ContentTypes.STEER,
+            [ContentTypes.STEER]: 'Do the second thing instead.',
+          } as unknown as Record<string, unknown>,
+          toolCallPart('call_2', 'search', 'second result'),
+        ],
+      },
+    ];
+
+    const { messages } = formatAgentMessages(payload);
+
+    // AI(call_1), Tool(call_1), Human(steer), AI(call_2), Tool(call_2) —
+    // the post-steer tool call must NOT attach to the pre-steer anchor, or
+    // its ToolMessage would trail the user turn while the call precedes it.
+    expect(messages.map((message) => message.constructor.name)).toEqual([
+      'AIMessage',
+      'ToolMessage',
+      'HumanMessage',
+      'AIMessage',
+      'ToolMessage',
+    ]);
+    const postSteerAnchor = messages[3] as AIMessage;
+    expect(postSteerAnchor.tool_calls?.map((call) => call.id)).toEqual([
+      'call_2',
+    ]);
+    const preSteerAnchor = messages[0] as AIMessage;
+    expect(preSteerAnchor.tool_calls?.map((call) => call.id)).toEqual([
+      'call_1',
+    ]);
+  });
+
   it('flushes accumulated assistant text before the steer user message', () => {
     const payload: TPayload = [
       {
