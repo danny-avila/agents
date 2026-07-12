@@ -101,7 +101,7 @@ export type BedrockAnthropicInput = ChatBedrockConverseInput & {
    */
   promptCacheTtl?: PromptCacheTtl;
   /**
-   * Minimum delay in milliseconds between visible streamed text deltas.
+   * Minimum delay in milliseconds between visible streamed content deltas.
    */
   _lc_stream_delay?: number;
 };

@@ -59,17 +59,17 @@ export type CustomGuardrailConfiguration = GuardrailConfiguration &
 
 function getCadencedStreamDelay({
   targetDelay,
-  lastVisibleTextAt,
+  lastVisibleContentAt,
   now,
 }: {
   targetDelay: number;
-  lastVisibleTextAt?: number;
+  lastVisibleContentAt?: number;
   now: number;
 }): number {
-  if (targetDelay <= 0 || lastVisibleTextAt == null) {
+  if (targetDelay <= 0 || lastVisibleContentAt == null) {
     return 0;
   }
-  return Math.max(0, targetDelay - (now - lastVisibleTextAt));
+  return Math.max(0, targetDelay - (now - lastVisibleContentAt));
 }
 
 async function waitForStreamDelay(
@@ -125,7 +125,7 @@ export interface CustomChatBedrockConverseInput
   promptCacheTtl?: PromptCacheTtl;
 
   /**
-   * Minimum delay in milliseconds between visible streamed text deltas.
+   * Minimum delay in milliseconds between visible streamed content deltas.
    */
   _lc_stream_delay?: number;
 
@@ -325,8 +325,8 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
 
     const seenBlockIndices = new Set<number>();
     const toolUseBlockIndices = new Set<number>();
-    let hasEmittedText = false;
-    let lastVisibleTextAt: number | undefined;
+    let hasEmittedVisibleContent = false;
+    let lastVisibleContentAt: number | undefined;
     /**
      * Guardrails can reject an already-streamed toolUse block at
      * `messageStop` (`guardrail_intervened`), after `contentBlockStop` has
@@ -373,11 +373,19 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
           seenBlockIndices.add(idx);
         }
 
-        if (deltaChunk.text !== '') {
+        const reasoningContent =
+          deltaChunk.message.additional_kwargs.reasoning_content;
+        const hasVisibleContent =
+          deltaChunk.text !== '' ||
+          (typeof reasoningContent === 'string' && reasoningContent !== '');
+
+        if (hasVisibleContent) {
           await waitForStreamDelay(
             getCadencedStreamDelay({
-              targetDelay: hasEmittedText ? this._lc_stream_delay : 0,
-              lastVisibleTextAt,
+              targetDelay: hasEmittedVisibleContent
+                ? this._lc_stream_delay
+                : 0,
+              lastVisibleContentAt,
               now: Date.now(),
             }),
             options.signal
@@ -385,8 +393,8 @@ export class CustomChatBedrockConverse extends ChatBedrockConverse {
           if (isSignalAborted(options.signal)) {
             throw new Error('AbortError: User aborted the request.');
           }
-          hasEmittedText = true;
-          lastVisibleTextAt = Date.now();
+          hasEmittedVisibleContent = true;
+          lastVisibleContentAt = Date.now();
         }
 
         yield this.enrichChunk(deltaChunk, seenBlockIndices);

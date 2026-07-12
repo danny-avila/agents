@@ -191,4 +191,44 @@ describe('Converse stream seal dispatch', () => {
       setTimeoutSpy.mockRestore();
     }
   });
+
+  test('paces visible reasoning deltas with configured stream delay', async () => {
+    const setTimeoutSpy = jest.spyOn(globalThis, 'setTimeout');
+
+    try {
+      const { yielded, dispatched } = await runStream(
+        [
+          {
+            contentBlockDelta: {
+              contentBlockIndex: 0,
+              delta: { reasoningContent: { text: 'First thought' } },
+            },
+          },
+          {
+            contentBlockDelta: {
+              contentBlockIndex: 0,
+              delta: { reasoningContent: { text: 'Second thought' } },
+            },
+          },
+        ],
+        { _lc_stream_delay: 35 }
+      );
+
+      expect(
+        yielded.map((m) => m.additional_kwargs.reasoning_content)
+      ).toEqual(['First thought', 'Second thought']);
+      expect(
+        dispatched.map((m) => m.additional_kwargs.reasoning_content)
+      ).toEqual(['First thought', 'Second thought']);
+
+      const timeoutDelays = setTimeoutSpy.mock.calls
+        .map(([, delay]) => delay)
+        .filter((delay): delay is number => typeof delay === 'number');
+      expect(timeoutDelays.some((delay) => delay > 0 && delay <= 35)).toBe(
+        true
+      );
+    } finally {
+      setTimeoutSpy.mockRestore();
+    }
+  });
 });
