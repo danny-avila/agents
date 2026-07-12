@@ -192,6 +192,27 @@ describe('Converse stream seal dispatch', () => {
     }
   });
 
+  test('splits large text deltas at Anthropic stream boundaries', async () => {
+    const { yielded, dispatched } = await runStream(
+      [
+        {
+          contentBlockDelta: {
+            contentBlockIndex: 0,
+            delta: { text: 'alpha beta gamma' },
+          },
+        },
+      ],
+      { _lc_stream_delay: 1 }
+    );
+
+    expect(yielded.map((m) => m.content)).toEqual(['alpha ', 'beta ', 'gamma']);
+    expect(dispatched.map((m) => m.content)).toEqual([
+      'alpha ',
+      'beta ',
+      'gamma',
+    ]);
+  });
+
   test('paces visible reasoning deltas with configured stream delay', async () => {
     const setTimeoutSpy = jest.spyOn(globalThis, 'setTimeout');
 
@@ -201,25 +222,25 @@ describe('Converse stream seal dispatch', () => {
           {
             contentBlockDelta: {
               contentBlockIndex: 0,
-              delta: { reasoningContent: { text: 'First thought' } },
+              delta: { reasoningContent: { text: 'One' } },
             },
           },
           {
             contentBlockDelta: {
               contentBlockIndex: 0,
-              delta: { reasoningContent: { text: 'Second thought' } },
+              delta: { reasoningContent: { text: 'Two' } },
             },
           },
         ],
         { _lc_stream_delay: 35 }
       );
 
-      expect(
-        yielded.map((m) => m.additional_kwargs.reasoning_content)
-      ).toEqual(['First thought', 'Second thought']);
+      expect(yielded.map((m) => m.additional_kwargs.reasoning_content)).toEqual(
+        ['One', 'Two']
+      );
       expect(
         dispatched.map((m) => m.additional_kwargs.reasoning_content)
-      ).toEqual(['First thought', 'Second thought']);
+      ).toEqual(['One', 'Two']);
 
       const timeoutDelays = setTimeoutSpy.mock.calls
         .map(([, delay]) => delay)
