@@ -2185,6 +2185,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           contentString,
           reason,
         });
+        /**
+         * A prestarted eager execution for a now-blocked call must neither be
+         * consumed nor emit its completion — the run reports this call as
+         * blocked. Deleting the record makes `dispatchEagerToolCompletions`'
+         * map-identity check skip the pending emission (same pattern as the
+         * rejected-results cleanup below).
+         */
+        this.eagerEventToolExecutions?.delete(entry.call.id!);
       };
 
       const flushDeferredBlockedSideEffects = async (): Promise<void> => {
@@ -2646,6 +2654,18 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       const canEmitEarlyCompletions =
         this.hookRegistry?.hasResultAlteringHooks(runId) !== true &&
         this.humanInTheLoop?.enabled !== true;
+      /**
+       * Snapshot the post-hook gates at the same instant as the early-emission
+       * gate: a result-altering hook registered while this batch is in flight
+       * applies from the NEXT batch. Evaluating these after results settle
+       * would let a late hook rewrite the ToolMessage AFTER an early
+       * completion already emitted the pre-hook output — two views of the
+       * same call.
+       */
+      const hasPostHook =
+        this.hookRegistry?.hasHookFor('PostToolUse', runId) === true;
+      const hasFailureHook =
+        this.hookRegistry?.hasHookFor('PostToolUseFailure', runId) === true;
       const earlyCompletionDispatchedIds = new Set<string>();
       const earlyCompletionDispatches: Array<Promise<void>> = [];
       const dispatchRequestById = new Map(
@@ -2760,11 +2780,6 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       ];
 
       this.storeCodeSessionFromResults(results, requestMap);
-
-      const hasPostHook =
-        this.hookRegistry?.hasHookFor('PostToolUse', runId) === true;
-      const hasFailureHook =
-        this.hookRegistry?.hasHookFor('PostToolUseFailure', runId) === true;
 
       for (const result of results) {
         if (result.injectedMessages && result.injectedMessages.length > 0) {

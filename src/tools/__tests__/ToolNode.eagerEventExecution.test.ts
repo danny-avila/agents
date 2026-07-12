@@ -736,6 +736,102 @@ describe('ToolNode eager event tool execution', () => {
     expect(toolMessage?.content).toBe('eager result');
   });
 
+  it('discards a prestarted eager record when a PreToolUse hook blocks the call', async () => {
+    const { toolExecuteCalls } = installToolExecuteResponder('redispatched');
+    const eagerExecutions = new Map<string, t.EagerEventToolExecution>();
+    const request: t.ToolCallRequest = {
+      id: 'call_weather',
+      name: 'weather',
+      args: { city: 'NYC' },
+      stepId: 'step_weather',
+      turn: 0,
+    };
+    eagerExecutions.set('call_weather', {
+      toolCallId: 'call_weather',
+      toolName: 'weather',
+      args: { city: 'NYC' },
+      request,
+      promise: Promise.resolve({
+        results: [
+          {
+            toolCallId: 'call_weather',
+            status: 'success',
+            content: 'eager result',
+          },
+        ],
+      }),
+    });
+
+    const hookRegistry = new HookRegistry();
+    hookRegistry.register('PreToolUse', {
+      hooks: [
+        async () => ({ decision: 'deny' as const, reason: 'not allowed' }),
+      ],
+    });
+    const toolNode = new ToolNode({
+      tools: [createDummyTool('weather')],
+      eventDrivenMode: true,
+      eagerEventToolExecution: { enabled: true },
+      eagerEventToolExecutions: eagerExecutions,
+      eagerEventToolUsageCount: new Map(),
+      hookRegistry,
+      toolCallStepIds: new Map([['call_weather', 'step_weather']]),
+    });
+
+    const result = (await toolNode.invoke({
+      messages: [createAIMessage('call_weather', 'weather', { city: 'NYC' })],
+    })) as { messages: ToolMessage[] };
+
+    // The record must be gone so the prestarted promise can never emit a
+    // successful completion for a call the run reported as blocked.
+    expect(eagerExecutions.has('call_weather')).toBe(false);
+    expect(toolExecuteCalls).toHaveLength(0);
+    const toolMessage = result.messages.find((m) => m instanceof ToolMessage);
+    expect(String(toolMessage?.content)).toContain('Blocked');
+  });
+
+  it('skips post hooks registered while the batch is in flight (snapshot semantics)', async () => {
+    const hookRegistry = new HookRegistry();
+    hookRegistry.register('PostToolBatch', { hooks: [async () => ({})] });
+
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data): Promise<void> => {
+        if (event !== GraphEvents.ON_TOOL_EXECUTE) {
+          return;
+        }
+        const batch = data as t.ToolExecuteBatchRequest;
+        // A result-altering hook lands while the host tool is executing: the
+        // whole batch keeps the gate snapshot from dispatch start, so the
+        // rewrite applies from the NEXT batch and cannot diverge from any
+        // already-emitted early completion.
+        hookRegistry.register('PostToolUse', {
+          hooks: [async () => ({ updatedOutput: 'REWRITTEN' })],
+        });
+        batch.resolve(
+          batch.toolCalls.map((toolCall) => ({
+            toolCallId: toolCall.id,
+            status: 'success' as const,
+            content: 'raw output',
+          }))
+        );
+      });
+
+    const toolNode = new ToolNode({
+      tools: [createDummyTool('weather')],
+      eventDrivenMode: true,
+      hookRegistry,
+      toolCallStepIds: new Map([['call_weather', 'step_weather']]),
+    });
+
+    const result = (await toolNode.invoke({
+      messages: [createAIMessage('call_weather', 'weather', { city: 'NYC' })],
+    })) as { messages: ToolMessage[] };
+
+    const toolMessage = result.messages.find((m) => m instanceof ToolMessage);
+    expect(toolMessage?.content).toBe('raw output');
+  });
+
   it('consumes a prestarted eager result even after a result-altering hook registers mid-run', async () => {
     const { toolExecuteCalls } = installToolExecuteResponder('redispatched');
     const eagerExecutions = new Map<string, t.EagerEventToolExecution>();
