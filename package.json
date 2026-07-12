@@ -112,7 +112,7 @@
     "README.md"
   ],
   "scripts": {
-    "prepare": "node husky-setup.js && npm run build",
+    "prepare": "node husky-setup.js",
     "prepublishOnly": "npm run build",
     "build": "tsdown && tsc -p tsconfig.build.json",
     "build:dev": "tsdown",

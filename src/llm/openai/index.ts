@@ -336,18 +336,55 @@ function isResponseMessage(
   return item.type === 'message';
 }
 
+/** Only `input_text`/`input_image`/`input_file` accept a Responses breakpoint;
+ *  `output_text`/`refusal` (replayed assistant blocks) are rejected with a 400. */
+function isCacheableResponsePart(part: unknown): part is CacheableResponsePart {
+  if (typeof part !== 'object' || part == null || !('type' in part)) {
+    return false;
+  }
+  return (
+    part.type === 'input_text' ||
+    part.type === 'input_image' ||
+    part.type === 'input_file'
+  );
+}
+
 function addResponseBreakpoint(
   item: OpenAIClient.Responses.ResponseInputItem
 ): OpenAIClient.Responses.ResponseInputItem {
   if (!isResponseMessage(item)) {
     return item;
   }
-  if (!Array.isArray(item.content) || item.content.length === 0) {
+  const rawContent = item.content as
+    | string
+    | OpenAIClient.Responses.ResponseInputMessageContentList;
+  if (typeof rawContent === 'string') {
+    if (rawContent.length === 0) {
+      return item;
+    }
+    return {
+      ...item,
+      content: [
+        {
+          type: 'input_text',
+          text: rawContent,
+          prompt_cache_breakpoint: { mode: 'explicit' },
+        },
+      ],
+    } as OpenAIClient.Responses.ResponseInputItem;
+  }
+  if (!Array.isArray(rawContent) || rawContent.length === 0) {
     return item;
   }
 
-  const content = [...item.content];
-  const index = content.length - 1;
+  const content = [...rawContent];
+  let index = content.length - 1;
+  while (index >= 0 && !isCacheableResponsePart(content[index])) {
+    index--;
+  }
+  if (index < 0) {
+    return item;
+  }
   content[index] = {
     ...(content[index] as CacheableResponsePart),
     prompt_cache_breakpoint: { mode: 'explicit' },
@@ -365,12 +402,18 @@ export function addResponseCacheBreakpoints(
   const indexes = new Set(
     selectCacheBreakpointIndexes(
       input.map((item) => (isResponseMessage(item) ? item.role : undefined)),
-      input.map(
-        (item) =>
-          isResponseMessage(item) &&
-          Array.isArray(item.content) &&
-          item.content.length > 0
-      )
+      input.map((item) => {
+        if (!isResponseMessage(item)) {
+          return false;
+        }
+        const content = item.content as
+          | string
+          | OpenAIClient.Responses.ResponseInputMessageContentList;
+        return typeof content === 'string'
+          ? content.length > 0
+          : Array.isArray(content) &&
+              content.some((part) => isCacheableResponsePart(part));
+      })
     )
   );
   return input.map((item, index) =>
