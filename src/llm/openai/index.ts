@@ -102,9 +102,13 @@ type LibreChatOpenAIFields = t.ChatOpenAIFields & {
   includeReasoningContent?: boolean;
   includeReasoningDetails?: boolean;
   convertReasoningDetailsToContent?: boolean;
+  promptCacheExplicit?: boolean;
+  safety_identifier?: string;
 };
 type LibreChatAzureOpenAIFields = t.AzureOpenAIInput & {
   _lc_stream_delay?: number;
+  promptCacheExplicit?: boolean;
+  safety_identifier?: string;
 };
 type ReasoningCallOptions = {
   reasoning?: OpenAIClient.Reasoning;
@@ -153,6 +157,366 @@ type OpenAIChatCompletionRetry = (
 ) => Promise<
   AsyncIterable<OpenAIChatCompletionStreamItem> | OpenAIChatCompletion
 >;
+type OpenAIManagedRequestFields = {
+  promptCacheExplicit?: boolean;
+  safetyIdentifier?: string;
+};
+type OpenAIManagedRequestParams = {
+  prompt_cache_options?: {
+    mode: 'explicit';
+    ttl: '30m';
+  };
+  safety_identifier?: string;
+};
+type ResponsesRequest =
+  | OpenAIClient.Responses.ResponseCreateParamsStreaming
+  | OpenAIClient.Responses.ResponseCreateParamsNonStreaming;
+type ResponsesResult =
+  | AsyncIterable<OpenAIClient.Responses.ResponseStreamEvent>
+  | OpenAIClient.Responses.Response;
+type CacheableChatPart = {
+  type: 'text' | 'image_url' | 'input_audio' | 'file' | 'refusal';
+  prompt_cache_breakpoint?: { mode: 'explicit' };
+  [key: string]: unknown;
+};
+type CacheableResponsePart = (
+  | OpenAIClient.Responses.ResponseInputText
+  | OpenAIClient.Responses.ResponseInputImage
+  | OpenAIClient.Responses.ResponseInputFile
+) & {
+  prompt_cache_breakpoint?: { mode: 'explicit' };
+};
+type ResponsesUsageWithCacheWrite = OpenAIClient.Responses.ResponseUsage & {
+  input_tokens_details?: OpenAIClient.Responses.ResponseUsage['input_tokens_details'] & {
+    cache_write_tokens?: number;
+  };
+};
+const CACHE_WRITE_METADATA_KEY = '__librechat_cache_write_tokens';
+
+function applyManagedRequestParams<T extends object>(
+  params: T,
+  fields: OpenAIManagedRequestFields
+): T & OpenAIManagedRequestParams {
+  return {
+    ...params,
+    ...(fields.promptCacheExplicit === true && {
+      prompt_cache_options: {
+        mode: 'explicit' as const,
+        ttl: '30m' as const,
+      },
+    }),
+    ...(fields.safetyIdentifier != null && {
+      safety_identifier: fields.safetyIdentifier,
+    }),
+  };
+}
+
+function isCacheableChatPart(part: unknown): part is CacheableChatPart {
+  if (typeof part !== 'object' || part == null || !('type' in part)) {
+    return false;
+  }
+  return (
+    part.type === 'text' ||
+    part.type === 'image_url' ||
+    part.type === 'input_audio' ||
+    part.type === 'file' ||
+    part.type === 'refusal'
+  );
+}
+
+function canAddChatBreakpoint(
+  message: OpenAIClient.Chat.Completions.ChatCompletionMessageParam
+): boolean {
+  if (
+    message.role !== 'system' &&
+    message.role !== 'developer' &&
+    message.role !== 'user' &&
+    message.role !== 'assistant' &&
+    message.role !== 'tool'
+  ) {
+    return false;
+  }
+  if (typeof message.content === 'string') {
+    return message.content.length > 0;
+  }
+  return (
+    Array.isArray(message.content) &&
+    message.content.some((part) => isCacheableChatPart(part))
+  );
+}
+
+function addChatBreakpoint(
+  message: OpenAIClient.Chat.Completions.ChatCompletionMessageParam
+): OpenAIClient.Chat.Completions.ChatCompletionMessageParam {
+  if (!canAddChatBreakpoint(message)) {
+    return message;
+  }
+
+  if (typeof message.content === 'string') {
+    return {
+      ...message,
+      content: [
+        {
+          type: 'text',
+          text: message.content,
+          prompt_cache_breakpoint: { mode: 'explicit' },
+        },
+      ],
+    } as unknown as OpenAIClient.Chat.Completions.ChatCompletionMessageParam;
+  }
+  if (!Array.isArray(message.content) || message.content.length === 0) {
+    return message;
+  }
+
+  const content = [...message.content] as unknown as CacheableChatPart[];
+  let index = content.length - 1;
+  while (index >= 0 && !isCacheableChatPart(content[index])) {
+    index--;
+  }
+  if (index < 0) {
+    return message;
+  }
+  content[index] = {
+    ...content[index],
+    prompt_cache_breakpoint: { mode: 'explicit' },
+  };
+  return {
+    ...message,
+    content,
+  } as unknown as OpenAIClient.Chat.Completions.ChatCompletionMessageParam;
+}
+
+function selectCacheBreakpointIndexes(
+  roles: Array<string | undefined>,
+  cacheable: boolean[]
+): number[] {
+  let instructionIndex = -1;
+  let latestUserIndex = -1;
+  for (let index = 0; index < roles.length; index++) {
+    const role = roles[index];
+    if ((role === 'system' || role === 'developer') && cacheable[index]) {
+      instructionIndex = index;
+    }
+    if (role === 'user') {
+      latestUserIndex = index;
+    }
+  }
+
+  const indexes = new Set<number>();
+  if (instructionIndex >= 0) {
+    indexes.add(instructionIndex);
+  }
+  for (let index = latestUserIndex - 1; index >= 0; index--) {
+    if (cacheable[index]) {
+      indexes.add(index);
+      break;
+    }
+  }
+  return [...indexes];
+}
+
+/** @internal */
+export function addChatCacheBreakpoints(
+  messages: OpenAIClient.Chat.Completions.ChatCompletionMessageParam[]
+): OpenAIClient.Chat.Completions.ChatCompletionMessageParam[] {
+  const indexes = new Set(
+    selectCacheBreakpointIndexes(
+      messages.map((message) => message.role),
+      messages.map((message) => canAddChatBreakpoint(message))
+    )
+  );
+  return messages.map((message, index) =>
+    indexes.has(index) ? addChatBreakpoint(message) : message
+  );
+}
+
+function isResponseMessage(
+  item: OpenAIClient.Responses.ResponseInputItem
+): item is OpenAIClient.Responses.ResponseInputItem.Message {
+  return item.type === 'message';
+}
+
+/** Only `input_text`/`input_image`/`input_file` accept a Responses breakpoint;
+ *  `output_text`/`refusal` (replayed assistant blocks) are rejected with a 400. */
+function isCacheableResponsePart(part: unknown): part is CacheableResponsePart {
+  if (typeof part !== 'object' || part == null || !('type' in part)) {
+    return false;
+  }
+  return (
+    part.type === 'input_text' ||
+    part.type === 'input_image' ||
+    part.type === 'input_file'
+  );
+}
+
+function addResponseBreakpoint(
+  item: OpenAIClient.Responses.ResponseInputItem
+): OpenAIClient.Responses.ResponseInputItem {
+  if (!isResponseMessage(item)) {
+    return item;
+  }
+  const rawContent = item.content as
+    | string
+    | OpenAIClient.Responses.ResponseInputMessageContentList;
+  if (typeof rawContent === 'string') {
+    if (rawContent.length === 0) {
+      return item;
+    }
+    return {
+      ...item,
+      content: [
+        {
+          type: 'input_text',
+          text: rawContent,
+          prompt_cache_breakpoint: { mode: 'explicit' },
+        },
+      ],
+    } as OpenAIClient.Responses.ResponseInputItem;
+  }
+  if (!Array.isArray(rawContent) || rawContent.length === 0) {
+    return item;
+  }
+
+  const content = [...rawContent];
+  let index = content.length - 1;
+  while (index >= 0 && !isCacheableResponsePart(content[index])) {
+    index--;
+  }
+  if (index < 0) {
+    return item;
+  }
+  content[index] = {
+    ...(content[index] as CacheableResponsePart),
+    prompt_cache_breakpoint: { mode: 'explicit' },
+  };
+  return { ...item, content };
+}
+
+/** @internal */
+export function addResponseCacheBreakpoints(
+  input: OpenAIClient.Responses.ResponseCreateParams['input']
+): OpenAIClient.Responses.ResponseCreateParams['input'] {
+  if (!Array.isArray(input)) {
+    return input;
+  }
+  const indexes = new Set(
+    selectCacheBreakpointIndexes(
+      input.map((item) => (isResponseMessage(item) ? item.role : undefined)),
+      input.map((item) => {
+        if (!isResponseMessage(item)) {
+          return false;
+        }
+        /** Only input roles take a Responses breakpoint. Assistant/tool turns
+         *  carry output content (string or output_text) that the API rejects
+         *  under an input marker, so they're never eligible. */
+        if (
+          item.role !== 'system' &&
+          item.role !== 'developer' &&
+          item.role !== 'user'
+        ) {
+          return false;
+        }
+        const content = item.content as
+          | string
+          | OpenAIClient.Responses.ResponseInputMessageContentList;
+        return typeof content === 'string'
+          ? content.length > 0
+          : Array.isArray(content) &&
+              content.some((part) => isCacheableResponsePart(part));
+      })
+    )
+  );
+  return input.map((item, index) =>
+    indexes.has(index) ? addResponseBreakpoint(item) : item
+  );
+}
+
+/** @internal */
+export function shouldIncludeEncryptedReasoning(
+  model: string,
+  params: {
+    store?: boolean | null;
+    reasoning?: unknown;
+  }
+): boolean {
+  const reasoningContext = (
+    params.reasoning as
+      | { context?: 'auto' | 'current_turn' | 'all_turns' }
+      | undefined
+  )?.context;
+  return (
+    /^gpt-5\.6(?:-|$)/i.test(model) &&
+    (params.store === false || reasoningContext !== 'current_turn')
+  );
+}
+
+function getCacheWriteTokens(message: BaseMessage): number | undefined {
+  const responseMetadata = message.response_metadata as {
+    usage?: ResponsesUsageWithCacheWrite;
+    metadata?: Record<string, string>;
+  };
+  const reported =
+    responseMetadata.usage?.input_tokens_details.cache_write_tokens;
+  if (reported != null) {
+    return reported;
+  }
+  const serialized = responseMetadata.metadata?.[CACHE_WRITE_METADATA_KEY];
+  if (serialized == null) {
+    return;
+  }
+  const parsed = Number(serialized);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function attachCacheWriteUsage(message: BaseMessage): void {
+  const cacheWriteTokens = getCacheWriteTokens(message);
+  if (
+    cacheWriteTokens == null ||
+    !isAIMessage(message) ||
+    message.usage_metadata == null
+  ) {
+    return;
+  }
+  message.usage_metadata.input_token_details = {
+    ...message.usage_metadata.input_token_details,
+    cache_creation: cacheWriteTokens,
+  };
+  const responseMetadata = message.response_metadata as {
+    metadata?: Record<string, string>;
+  };
+  if (responseMetadata.metadata?.[CACHE_WRITE_METADATA_KEY] == null) {
+    return;
+  }
+  const metadata = { ...responseMetadata.metadata };
+  delete metadata[CACHE_WRITE_METADATA_KEY];
+  message.response_metadata = {
+    ...message.response_metadata,
+    metadata,
+  };
+}
+
+function attachCacheWriteMetadata(
+  response: OpenAIClient.Responses.Response
+): OpenAIClient.Responses.Response {
+  const usage = response.usage as ResponsesUsageWithCacheWrite | undefined;
+  const cacheWriteTokens = usage?.input_tokens_details.cache_write_tokens;
+  if (cacheWriteTokens == null) {
+    return response;
+  }
+  return {
+    ...response,
+    metadata: {
+      ...(response.metadata ?? {}),
+      [CACHE_WRITE_METADATA_KEY]: String(cacheWriteTokens),
+    },
+  };
+}
+
+function isResponsesStream(
+  result: ResponsesResult
+): result is AsyncIterable<OpenAIClient.Responses.ResponseStreamEvent> {
+  return Symbol.asyncIterator in result;
+}
 
 function createUsageMetadata(
   usage?: OpenAIClient.Completions.CompletionUsage
@@ -752,6 +1116,8 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
   private includeReasoningContent?: boolean;
   private includeReasoningDetails?: boolean;
   private convertReasoningDetailsToContent?: boolean;
+  private promptCacheExplicit?: boolean;
+  private safetyIdentifier?: string;
 
   constructor(fields?: LibreChatOpenAIFields) {
     super(fields);
@@ -759,6 +1125,18 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
     this.includeReasoningDetails = fields?.includeReasoningDetails;
     this.convertReasoningDetailsToContent =
       fields?.convertReasoningDetailsToContent;
+    this.promptCacheExplicit = fields?.promptCacheExplicit;
+    this.safetyIdentifier = fields?.safety_identifier;
+  }
+
+  invocationParams(
+    options?: this['ParsedCallOptions'],
+    extra?: { streaming?: boolean }
+  ): ReturnType<OriginalChatOpenAICompletions['invocationParams']> {
+    return applyManagedRequestParams(super.invocationParams(options, extra), {
+      promptCacheExplicit: this.promptCacheExplicit,
+      safetyIdentifier: this.safetyIdentifier,
+    });
   }
 
   protected _getReasoningParams(
@@ -788,7 +1166,9 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
     requestOptions?: OpenAICoreRequestOptions
   ): Promise<AsyncIterable<OpenAIChatCompletionChunk> | OpenAIChatCompletion> {
     return completionWithFilteredOpenAIStream(
-      request,
+      this.promptCacheExplicit === true
+        ? { ...request, messages: addChatCacheBreakpoints(request.messages) }
+        : request,
       requestOptions,
       super.completionWithRetry.bind(this) as OpenAIChatCompletionRetry
     );
@@ -1152,6 +1532,88 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
 }
 
 class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
+  private promptCacheExplicit?: boolean;
+  private safetyIdentifier?: string;
+
+  constructor(fields?: LibreChatOpenAIFields) {
+    super(fields);
+    this.promptCacheExplicit = fields?.promptCacheExplicit;
+    this.safetyIdentifier = fields?.safety_identifier;
+  }
+
+  invocationParams(
+    options?: this['ParsedCallOptions']
+  ): ReturnType<OriginalChatOpenAIResponses['invocationParams']> {
+    const params = applyManagedRequestParams(super.invocationParams(options), {
+      promptCacheExplicit: this.promptCacheExplicit,
+      safetyIdentifier: this.safetyIdentifier,
+    });
+    if (shouldIncludeEncryptedReasoning(this.model, params)) {
+      params.include = [
+        ...new Set([
+          ...(params.include ?? []),
+          'reasoning.encrypted_content' as const,
+        ]),
+      ];
+    }
+    return params;
+  }
+
+  async completionWithRetry(
+    request: OpenAIClient.Responses.ResponseCreateParamsStreaming,
+    requestOptions?: OpenAICoreRequestOptions
+  ): Promise<AsyncIterable<OpenAIClient.Responses.ResponseStreamEvent>>;
+  async completionWithRetry(
+    request: OpenAIClient.Responses.ResponseCreateParamsNonStreaming,
+    requestOptions?: OpenAICoreRequestOptions
+  ): Promise<OpenAIClient.Responses.Response>;
+  async completionWithRetry(
+    request: ResponsesRequest,
+    requestOptions?: OpenAICoreRequestOptions
+  ): Promise<ResponsesResult> {
+    const managedRequest = {
+      ...request,
+      input:
+        this.promptCacheExplicit === true
+          ? addResponseCacheBreakpoints(request.input)
+          : request.input,
+    };
+    const result = await super.completionWithRetry(
+      managedRequest as OpenAIClient.Responses.ResponseCreateParamsStreaming,
+      requestOptions
+    );
+    return isResponsesStream(result)
+      ? result
+      : attachCacheWriteMetadata(result);
+  }
+
+  async _generate(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions'],
+    runManager?: CallbackManagerForLLMRun
+  ): Promise<ChatResult> {
+    const result = await super._generate(messages, options, runManager);
+    for (const generation of result.generations) {
+      attachCacheWriteUsage(generation.message);
+    }
+    return result;
+  }
+
+  async *_streamResponseChunks(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions'],
+    runManager?: CallbackManagerForLLMRun
+  ): AsyncGenerator<ChatGenerationChunk> {
+    for await (const chunk of super._streamResponseChunks(
+      messages,
+      options,
+      runManager
+    )) {
+      attachCacheWriteUsage(chunk.message);
+      yield chunk;
+    }
+  }
+
   protected _getReasoningParams(
     options?: this['ParsedCallOptions']
   ): OpenAIClient.Reasoning | undefined {
@@ -1166,6 +1628,25 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
 }
 
 class LibreChatAzureOpenAICompletions extends OriginalAzureChatOpenAICompletions {
+  private promptCacheExplicit?: boolean;
+  private safetyIdentifier?: string;
+
+  constructor(fields?: LibreChatAzureOpenAIFields) {
+    super(fields);
+    this.promptCacheExplicit = fields?.promptCacheExplicit;
+    this.safetyIdentifier = fields?.safety_identifier;
+  }
+
+  invocationParams(
+    options?: this['ParsedCallOptions'],
+    extra?: { streaming?: boolean }
+  ): ReturnType<OriginalAzureChatOpenAICompletions['invocationParams']> {
+    return applyManagedRequestParams(super.invocationParams(options, extra), {
+      promptCacheExplicit: this.promptCacheExplicit,
+      safetyIdentifier: this.safetyIdentifier,
+    });
+  }
+
   protected _getReasoningParams(
     options?: this['ParsedCallOptions']
   ): OpenAIClient.Reasoning | undefined {
@@ -1273,7 +1754,9 @@ class LibreChatAzureOpenAICompletions extends OriginalAzureChatOpenAICompletions
     requestOptions?: OpenAICoreRequestOptions
   ): Promise<AsyncIterable<OpenAIChatCompletionChunk> | OpenAIChatCompletion> {
     return completionWithFilteredOpenAIStream(
-      request,
+      this.promptCacheExplicit === true
+        ? { ...request, messages: addChatCacheBreakpoints(request.messages) }
+        : request,
       requestOptions,
       super.completionWithRetry.bind(this) as OpenAIChatCompletionRetry
     );
@@ -1281,6 +1764,88 @@ class LibreChatAzureOpenAICompletions extends OriginalAzureChatOpenAICompletions
 }
 
 class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
+  private promptCacheExplicit?: boolean;
+  private safetyIdentifier?: string;
+
+  constructor(fields?: LibreChatAzureOpenAIFields) {
+    super(fields);
+    this.promptCacheExplicit = fields?.promptCacheExplicit;
+    this.safetyIdentifier = fields?.safety_identifier;
+  }
+
+  invocationParams(
+    options?: this['ParsedCallOptions']
+  ): ReturnType<OriginalAzureChatOpenAIResponses['invocationParams']> {
+    const params = applyManagedRequestParams(super.invocationParams(options), {
+      promptCacheExplicit: this.promptCacheExplicit,
+      safetyIdentifier: this.safetyIdentifier,
+    });
+    if (shouldIncludeEncryptedReasoning(this.model, params)) {
+      params.include = [
+        ...new Set([
+          ...(params.include ?? []),
+          'reasoning.encrypted_content' as const,
+        ]),
+      ];
+    }
+    return params;
+  }
+
+  async completionWithRetry(
+    request: OpenAIClient.Responses.ResponseCreateParamsStreaming,
+    requestOptions?: OpenAICoreRequestOptions
+  ): Promise<AsyncIterable<OpenAIClient.Responses.ResponseStreamEvent>>;
+  async completionWithRetry(
+    request: OpenAIClient.Responses.ResponseCreateParamsNonStreaming,
+    requestOptions?: OpenAICoreRequestOptions
+  ): Promise<OpenAIClient.Responses.Response>;
+  async completionWithRetry(
+    request: ResponsesRequest,
+    requestOptions?: OpenAICoreRequestOptions
+  ): Promise<ResponsesResult> {
+    const managedRequest = {
+      ...request,
+      input:
+        this.promptCacheExplicit === true
+          ? addResponseCacheBreakpoints(request.input)
+          : request.input,
+    };
+    const result = await super.completionWithRetry(
+      managedRequest as OpenAIClient.Responses.ResponseCreateParamsStreaming,
+      requestOptions
+    );
+    return isResponsesStream(result)
+      ? result
+      : attachCacheWriteMetadata(result);
+  }
+
+  async _generate(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions'],
+    runManager?: CallbackManagerForLLMRun
+  ): Promise<ChatResult> {
+    const result = await super._generate(messages, options, runManager);
+    for (const generation of result.generations) {
+      attachCacheWriteUsage(generation.message);
+    }
+    return result;
+  }
+
+  async *_streamResponseChunks(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions'],
+    runManager?: CallbackManagerForLLMRun
+  ): AsyncGenerator<ChatGenerationChunk> {
+    for await (const chunk of super._streamResponseChunks(
+      messages,
+      options,
+      runManager
+    )) {
+      attachCacheWriteUsage(chunk.message);
+      yield chunk;
+    }
+  }
+
   protected _getReasoningParams(
     options?: this['ParsedCallOptions']
   ): OpenAIClient.Reasoning | undefined {
