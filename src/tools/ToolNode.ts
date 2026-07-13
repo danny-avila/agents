@@ -2746,7 +2746,11 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
             const batchRequest: t.ToolExecuteBatchRequest = {
               toolCalls: dispatchRequests,
               userId: config.configurable?.user_id as string | undefined,
-              agentId: this.agentId,
+              // Dispatch attribution, NOT the hook subagent-scope marker:
+              // hosts key tool/credential lookup on the owning agent, and
+              // the eager path sends `agentContext.agentId` — this must
+              // match it at the top level too.
+              agentId: this.executingAgentId,
               configurable: config.configurable as
                   | Record<string, unknown>
                   | undefined,

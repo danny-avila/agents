@@ -336,6 +336,16 @@ export type StandardGraphInput = {
    * they already flow through the registry's `CHAT_MODEL_END` handler.
    */
   subagentUsageSink?: SubagentUsageSink;
+  /**
+   * True when this graph IS a subagent child run (set by `SubagentExecutor`
+   * when it constructs the child graph). Drives the hook-input `agentId`
+   * subagent-scope marker: hook dispatches from this graph's tool nodes
+   * carry `agentId` so run-scoped host hooks — which fire for child scopes
+   * too, because children inherit the parent's `run_id` — can tell child
+   * scope from the top level. Top-level graphs leave this unset and their
+   * hook inputs carry only `executingAgentId`.
+   */
+  subagentScope?: boolean;
 };
 
 export type GraphEdge = {
