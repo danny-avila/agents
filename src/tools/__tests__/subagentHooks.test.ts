@@ -423,12 +423,14 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
     };
     registry.register('PostToolBatch', { hooks: [batchHook] });
 
+    const dispatchAgentIds: Array<string | undefined> = [];
     const customHandlers: Record<string, t.EventHandler> = {
       [GraphEvents.TOOL_END]: new ToolEndHandler(),
       [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(),
       [GraphEvents.ON_TOOL_EXECUTE]: {
         handle: (_event, rawData): void => {
           const request = rawData as t.ToolExecuteBatchRequest;
+          dispatchAgentIds.push(request.agentId);
           const results: t.ToolExecuteResult[] = request.toolCalls.map(
             (call) => ({
               toolCallId: call.id,
@@ -447,7 +449,9 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
      * ON_TOOL_EXECUTE). Hook inputs here must NOT carry the subagent-scope
      * marker — a host hook keying on `agentId != null` (e.g. a steering
      * drain that must never inject into child state) would otherwise skip
-     * every top-level batch.
+     * every top-level batch. The DISPATCH payload is the opposite: hosts
+     * key tool/credential lookup on `request.agentId`, so it must keep
+     * identifying the owning agent.
      */
     const run = await Run.create<t.IState>({
       runId: `toplevel-event-hook-${Date.now()}`,
@@ -482,6 +486,7 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
     expect(scopeEvents).toContain('pre:-:hook-parent');
     expect(scopeEvents).toContain('post:-:hook-parent');
     expect(scopeEvents).toContain('batch:-:hook-parent');
+    expect(dispatchAgentIds).toEqual(['hook-parent']);
   });
 
   it('child subagent tool ask hooks fail closed instead of starting unsupported nested HITL', async () => {
