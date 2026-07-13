@@ -790,6 +790,11 @@ function formatAssistantMessage(
           )
         );
         lastAIMessage = null;
+        /** The steer splits the assistant message: the post-steer segment
+         *  starts with fresh reasoning state (pre-steer reasoning was either
+         *  flushed above or intentionally dropped when not preserving). */
+        hasReasoning = false;
+        pendingReasoningContent = '';
       } else if (
         part.type === ContentTypes.ERROR ||
         part.type === ContentTypes.AGENT_UPDATE ||
@@ -917,6 +922,12 @@ function labelAllAgentContent(
     }
 
     currentAgentId = agentId;
+    if (part.type === ContentTypes.STEER) {
+      /** User speech is never agent content — see the transfer path above. */
+      flushAgentBuffer();
+      result.push(part);
+      continue;
+    }
     agentContentBuffer.push(part);
   }
 
@@ -1052,6 +1063,15 @@ export const labelContentByAgent = (
       transferToolCallIndex = result.length - 1;
       transferToolCallId = (part as ToolCallContent).tool_call?.id;
       currentAgentId = undefined; // Reset to capture the next agent
+    } else if (part.type === ContentTypes.STEER) {
+      /**
+       * User speech is never agent content: flush the buffer in place and
+       * pass the steer through verbatim so `formatAssistantMessage` replays
+       * it as a user turn. Folding it into a labeled transfer summary would
+       * both drop the user's words and misattribute them to the agent.
+       */
+      flushAgentBuffer();
+      result.push(part);
     } else {
       agentContentBuffer.push(part);
     }

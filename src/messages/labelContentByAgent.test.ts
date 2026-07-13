@@ -54,6 +54,32 @@ describe('labelContentByAgent', () => {
     });
   });
 
+  describe('steer pass-through', () => {
+    it('passes steer parts through the parallel labeler verbatim', () => {
+      const steerPart = {
+        type: ContentTypes.STEER,
+        steer: 'User redirect mid-run',
+        steerId: 's1',
+      } as unknown as MessageContentComplex;
+      const contentParts: MessageContentComplex[] = [
+        { type: ContentTypes.TEXT, text: 'agent output' },
+        steerPart,
+        { type: ContentTypes.TEXT, text: 'post-steer output' },
+      ];
+
+      const result = labelContentByAgent(
+        contentParts,
+        { 0: 'agent_a', 1: 'agent_a', 2: 'agent_a' },
+        { agent_a: 'Alpha' },
+        { labelNonTransferContent: true }
+      );
+
+      // The user's words survive verbatim (not folded into a labeled
+      // summary) so formatAssistantMessage can replay them as a user turn.
+      expect(result).toContain(steerPart);
+    });
+  });
+
   describe('Transfer-based labeling (default)', () => {
     it('should consolidate transferred agent content into transfer tool output', () => {
       const contentParts: MessageContentComplex[] = [

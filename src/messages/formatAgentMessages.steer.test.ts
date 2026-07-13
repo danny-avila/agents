@@ -1,7 +1,7 @@
 import { AIMessage, HumanMessage, ToolMessage } from '@langchain/core/messages';
 import type { TPayload } from '@/types';
+import { ContentTypes, Constants, Providers } from '@/common';
 import { formatAgentMessages } from './format';
-import { ContentTypes } from '@/common';
 
 function toolCallPart(
   id: string,
@@ -186,6 +186,106 @@ describe('formatAgentMessages steer replay', () => {
     expect((messages[0] as HumanMessage).additional_kwargs.source).toBe(
       'steer'
     );
+  });
+
+  it('replays [THINK, STEER, TEXT] without duplicating the trailing text', () => {
+    const payload: TPayload = [
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.THINK,
+            [ContentTypes.THINK]: 'chain of thought',
+          },
+          {
+            type: ContentTypes.STEER,
+            [ContentTypes.STEER]: 'Redirect now.',
+          } as unknown as Record<string, unknown>,
+          {
+            type: ContentTypes.TEXT,
+            [ContentTypes.TEXT]: 'Post-steer answer.',
+          },
+        ],
+      },
+    ];
+
+    const { messages } = formatAgentMessages(
+      payload,
+      undefined,
+      undefined,
+      undefined,
+      {
+        preserveReasoningContent: true,
+      }
+    );
+
+    expect(messages.map((message) => message.constructor.name)).toEqual([
+      'AIMessage',
+      'HumanMessage',
+      'AIMessage',
+    ]);
+    expect(messages[0].additional_kwargs.reasoning_content).toBe(
+      'chain of thought'
+    );
+    // Post-steer segment starts with fresh reasoning state: the trailing
+    // text appears exactly once (end-of-loop array form) and carries no
+    // pre-steer reasoning.
+    expect(messages[2].content).toEqual([
+      { type: 'text', text: 'Post-steer answer.' },
+    ]);
+    expect(messages[2].additional_kwargs.reasoning_content).toBeUndefined();
+  });
+
+  it('keeps a paired Anthropic server-tool use/result together after the steer', () => {
+    const useId = `${Constants.ANTHROPIC_SERVER_TOOL_PREFIX}search1`;
+    const payload: TPayload = [
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: { id: useId, name: 'web_search', args: '{"query":"x"}' },
+          },
+          {
+            type: ContentTypes.STEER,
+            [ContentTypes.STEER]: 'Also check the docs.',
+          } as unknown as Record<string, unknown>,
+          {
+            type: 'web_search_tool_result',
+            tool_use_id: useId,
+            content: [
+              { type: 'web_search_result', url: 'https://example.com' },
+            ],
+          } as unknown as Record<string, unknown>,
+        ],
+      },
+    ];
+
+    const { messages } = formatAgentMessages(
+      payload,
+      undefined,
+      new Set(['web_search']),
+      undefined,
+      { provider: Providers.ANTHROPIC }
+    );
+
+    // The pair may not split across the user turn (invalid for Anthropic);
+    // it emits together in the post-steer assistant segment instead.
+    expect(messages[0]).toBeInstanceOf(HumanMessage);
+    expect(messages[0].content).toBe('Also check the docs.');
+    const assistant = messages[1];
+    expect(assistant).toBeInstanceOf(AIMessage);
+    const parts = assistant.content as Array<{
+      type?: string;
+      tool_use_id?: string;
+      id?: string;
+    }>;
+    const useIndex = parts.findIndex((part) => part.type === 'server_tool_use');
+    const resultIndex = parts.findIndex(
+      (part) => part.type === 'web_search_tool_result'
+    );
+    expect(useIndex).toBeGreaterThanOrEqual(0);
+    expect(resultIndex).toBe(useIndex + 1);
   });
 
   it('never leaks a steer part into assistant content sent to the provider', () => {
