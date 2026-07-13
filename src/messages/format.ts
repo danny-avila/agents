@@ -1069,8 +1069,15 @@ export const labelContentByAgent = (
        * pass the steer through verbatim so `formatAssistantMessage` replays
        * it as a user turn. Folding it into a labeled transfer summary would
        * both drop the user's words and misattribute them to the agent.
+       * The steer also CLOSES any open transfer capture — `flushAgentBuffer`
+       * no-ops on an empty buffer, and leaving the capture live would fold
+       * post-steer agent content into the pre-steer transfer output,
+       * replaying it BEFORE the user's redirect.
        */
       flushAgentBuffer();
+      transferToolCallIndex = undefined;
+      transferToolCallId = undefined;
+      currentAgentId = undefined;
       result.push(part);
     } else {
       agentContentBuffer.push(part);

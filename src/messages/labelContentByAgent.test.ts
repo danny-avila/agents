@@ -80,6 +80,55 @@ describe('labelContentByAgent', () => {
     });
   });
 
+  describe('steer vs transfer capture', () => {
+    it('closes an open transfer capture at a steer boundary', () => {
+      const transferPart: MessageContentComplex = {
+        type: ContentTypes.TOOL_CALL,
+        tool_call: {
+          id: 'call_transfer',
+          name: 'lc_transfer_to_beta',
+          args: '{}',
+          output: 'original output',
+        },
+      } as MessageContentComplex;
+      const steerPart = {
+        type: ContentTypes.STEER,
+        steer: 'Actually, stop and summarize.',
+      } as unknown as MessageContentComplex;
+      const contentParts: MessageContentComplex[] = [
+        transferPart,
+        steerPart,
+        { type: ContentTypes.TEXT, text: 'post-steer agent output' },
+      ];
+
+      const result = labelContentByAgent(
+        contentParts,
+        { 0: 'agent_a', 1: 'agent_a', 2: 'agent_b' },
+        { agent_b: 'Beta' }
+      );
+
+      // The steer passes through and post-steer content stays AFTER it —
+      // never folded into the pre-steer transfer output, which would replay
+      // it ahead of the user's redirect.
+      expect(result).toContain(steerPart);
+      const transferInResult = result.find(
+        (part) =>
+          isToolCallContent(part) && part.tool_call?.id === 'call_transfer'
+      );
+      expect(
+        isToolCallContent(transferInResult!)
+          ? transferInResult.tool_call?.output
+          : undefined
+      ).toBe('original output');
+      const steerIndex = result.indexOf(steerPart);
+      const textIndex = result.findIndex(
+        (part) =>
+          hasTextProperty(part) && part.text === 'post-steer agent output'
+      );
+      expect(textIndex).toBeGreaterThan(steerIndex);
+    });
+  });
+
   describe('Transfer-based labeling (default)', () => {
     it('should consolidate transferred agent content into transfer tool output', () => {
       const contentParts: MessageContentComplex[] = [
