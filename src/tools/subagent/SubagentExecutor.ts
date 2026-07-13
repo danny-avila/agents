@@ -373,6 +373,7 @@ export class SubagentExecutor {
       agents: [childInputs],
       langfuse: this.langfuse,
       tokenCounter: this.tokenCounter,
+      subagentScope: true,
       /**
        * Forwarded so the child graph's own `SubagentExecutor` (created in
        * its `createAgentNode` when `allowNested` keeps subagentConfigs)

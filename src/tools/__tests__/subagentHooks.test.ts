@@ -4,6 +4,7 @@ import type { ToolCall } from '@langchain/core/messages/tool';
 import type {
   HookCallback,
   PermissionDeniedHookOutput,
+  PostToolBatchHookOutput,
   PostToolUseHookOutput,
   PreToolUseHookOutput,
   SubagentStartHookInput,
@@ -363,6 +364,124 @@ describe('Subagent hook integration (end-to-end via Run)', () => {
     expect(preExecEvents).toContain('researcher-child:calculator');
     expect(postExecEvents).toContain('hook-parent:subagent');
     expect(postExecEvents).toContain('researcher-child:calculator');
+  });
+
+  it('top-level event-driven dispatches leave agentId unset (subagent-scope marker)', async () => {
+    getChatModelClassSpy.mockImplementation(((provider: Providers) => {
+      if (provider === Providers.OPENAI) {
+        return class extends FakeChatModel {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          constructor(_options: any) {
+            super({
+              responses: ['Calculating.', 'All done.'],
+              sleep: 1,
+              toolCalls: [createCalculatorToolCall()],
+            });
+          }
+          bindTools(tools: unknown): ReturnType<FakeChatModel['withConfig']> {
+            const config = {
+              tools,
+            } as Parameters<FakeChatModel['withConfig']>[0];
+            return this.withConfig(config);
+          }
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        } as any;
+      }
+      return originalGetChatModelClass(provider);
+    }) as typeof providers.getChatModelClass);
+
+    const registry = new HookRegistry();
+    const scopeEvents: string[] = [];
+
+    const preHook: HookCallback<'PreToolUse'> = async (
+      input
+    ): Promise<PreToolUseHookOutput> => {
+      scopeEvents.push(
+        `pre:${input.agentId ?? '-'}:${input.executingAgentId ?? '-'}`
+      );
+      return { decision: 'allow' };
+    };
+    registry.register('PreToolUse', { hooks: [preHook] });
+
+    const postHook: HookCallback<'PostToolUse'> = async (
+      input
+    ): Promise<PostToolUseHookOutput> => {
+      scopeEvents.push(
+        `post:${input.agentId ?? '-'}:${input.executingAgentId ?? '-'}`
+      );
+      return {};
+    };
+    registry.register('PostToolUse', { hooks: [postHook] });
+
+    const batchHook: HookCallback<'PostToolBatch'> = async (
+      input
+    ): Promise<PostToolBatchHookOutput> => {
+      scopeEvents.push(
+        `batch:${input.agentId ?? '-'}:${input.executingAgentId ?? '-'}`
+      );
+      return {};
+    };
+    registry.register('PostToolBatch', { hooks: [batchHook] });
+
+    const customHandlers: Record<string, t.EventHandler> = {
+      [GraphEvents.TOOL_END]: new ToolEndHandler(),
+      [GraphEvents.CHAT_MODEL_END]: new ModelEndHandler(),
+      [GraphEvents.ON_TOOL_EXECUTE]: {
+        handle: (_event, rawData): void => {
+          const request = rawData as t.ToolExecuteBatchRequest;
+          const results: t.ToolExecuteResult[] = request.toolCalls.map(
+            (call) => ({
+              toolCallId: call.id,
+              status: 'success',
+              content: '42',
+            })
+          );
+          request.resolve(results);
+        },
+      },
+    };
+
+    /**
+     * The LibreChat shape: a TOP-LEVEL agent whose tools ride
+     * `toolDefinitions` (event-driven ToolNode, host executes via
+     * ON_TOOL_EXECUTE). Hook inputs here must NOT carry the subagent-scope
+     * marker — a host hook keying on `agentId != null` (e.g. a steering
+     * drain that must never inject into child state) would otherwise skip
+     * every top-level batch.
+     */
+    const run = await Run.create<t.IState>({
+      runId: `toplevel-event-hook-${Date.now()}`,
+      graphConfig: {
+        type: 'standard',
+        agents: [
+          {
+            agentId: 'hook-parent',
+            provider: Providers.OPENAI,
+            clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'Use the calculator.',
+            maxContextTokens: 8000,
+            toolDefinitions: [calculatorDef],
+          },
+        ],
+      },
+      returnContent: true,
+      skipCleanup: true,
+      customHandlers,
+      hooks: registry,
+    });
+
+    run.Graph!.overrideTestModel(['Calculating.', 'All done.'], 5, [
+      createCalculatorToolCall(),
+    ]);
+
+    await run.processStream(
+      { messages: [new HumanMessage('what is 21 * 2?')] },
+      callerConfig
+    );
+
+    expect(scopeEvents).toContain('pre:-:hook-parent');
+    expect(scopeEvents).toContain('post:-:hook-parent');
+    expect(scopeEvents).toContain('batch:-:hook-parent');
   });
 
   it('child subagent tool ask hooks fail closed instead of starting unsupported nested HITL', async () => {

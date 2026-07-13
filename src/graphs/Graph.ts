@@ -870,6 +870,8 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    * {@link t.StandardGraphInput.subagentUsageSink}.
    */
   subagentUsageSink?: t.SubagentUsageSink;
+  /** See {@link t.StandardGraphInput.subagentScope}. */
+  subagentScope: boolean;
 
   constructor({
     runId,
@@ -880,12 +882,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     indexTokenCountMap,
     calibrationRatio,
     subagentUsageSink,
+    subagentScope,
   }: t.StandardGraphInput) {
     super();
     this.runId = runId;
     this.signal = signal;
     this.langfuse = langfuse;
     this.subagentUsageSink = subagentUsageSink;
+    this.subagentScope = subagentScope === true;
 
     if (agents.length === 0) {
       throw new Error('At least one agent configuration is required');
@@ -1272,7 +1276,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         eventDrivenMode: true,
         sessions: this.sessions,
         toolDefinitions: toolDefMap,
-        agentId: agentContext?.agentId,
+        // `agentId` is the subagent-scope marker — set ONLY for child-run
+        // graphs (hooks fire for child scopes too, via the inherited
+        // run_id); `executingAgentId` always identifies the owning agent.
+        agentId: this.subagentScope ? agentContext?.agentId : undefined,
         executingAgentId: agentContext?.agentId,
         toolCallStepIds: this.toolCallStepIds,
         toolRegistry: agentContext?.toolRegistry,
@@ -1339,9 +1346,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       trace: traceToolNode,
       runLangfuse: this.langfuse,
       agentLangfuse: agentContext?.langfuse,
-      // `agentId` is intentionally left unset on this path (it is the
-      // subagent-scope marker); `executingAgentId` always identifies the owning
-      // agent so hooks can attribute the batch even at the top level.
+      // `agentId` is the subagent-scope marker — set ONLY for child-run
+      // graphs; `executingAgentId` always identifies the owning agent so
+      // hooks can attribute the batch even at the top level.
+      agentId: this.subagentScope ? agentContext?.agentId : undefined,
       executingAgentId: agentContext?.agentId,
       toolCallStepIds: this.toolCallStepIds,
       errorHandler: (data, metadata): Promise<boolean> =>
