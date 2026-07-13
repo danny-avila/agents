@@ -466,9 +466,15 @@ function hasToolCallOutput(part: MessageContentComplex): boolean {
 function formatAssistantMessage(
   message: Partial<TMessage>,
   options?: FormatAssistantMessageOptions
-): Array<RoleBearingMessage<AIMessage> | RoleBearingMessage<ToolMessage>> {
+): Array<
+  | RoleBearingMessage<AIMessage>
+  | RoleBearingMessage<ToolMessage>
+  | RoleBearingMessage<HumanMessage>
+> {
   const formattedMessages: Array<
-    RoleBearingMessage<AIMessage> | RoleBearingMessage<ToolMessage>
+    | RoleBearingMessage<AIMessage>
+    | RoleBearingMessage<ToolMessage>
+    | RoleBearingMessage<HumanMessage>
   > = [];
   let currentContent: MessageContentComplex[] = [];
   let lastAIMessage: RoleBearingMessage<AIMessage> | null = null;
@@ -725,6 +731,70 @@ function formatAssistantMessage(
         hasReasoning = true;
         pendingReasoningContent += extractReasoningContent(part);
         continue;
+      } else if (part.type === ContentTypes.STEER) {
+        /*
+        A mid-run steer: user speech persisted inline in the assistant message
+        at the tool-batch boundary it was injected. Flush accumulated
+        assistant content first so ordering is preserved, then replay the
+        steer as a standalone user message — multimodal when the host stamped
+        a pre-encoded `media` content array (attachment refs are re-encoded
+        per turn host-side, like any other user media). `lastAIMessage` is
+        reset AFTER the HumanMessage: a post-steer tool_call must mint a
+        FRESH assistant anchor (the heal path) so its AIMessage lands after
+        the user turn — attaching it to the pre-steer anchor would emit its
+        ToolMessage after the HumanMessage while the call itself sat before
+        it, an invalid provider ordering.
+        */
+        if (currentContent.length > 0) {
+          if (
+            currentContent.some((content) => content.type !== ContentTypes.TEXT)
+          ) {
+            lastAIMessage = createAIMessage(toLangChainContent(currentContent));
+            formattedMessages.push(lastAIMessage);
+          } else {
+            const flushed = currentContent
+              .reduce((acc, curr) => `${acc}${getTextContent(curr)}\n`, '')
+              .trim();
+            if (flushed.length > 0) {
+              lastAIMessage = createAIMessage(flushed);
+              formattedMessages.push(lastAIMessage);
+            }
+          }
+          currentContent = [];
+        } else if (shouldPreserveReasoningContent && pendingReasoningContent) {
+          /**
+           * Reasoning directly preceding a steer has no `currentContent`
+           * flush to consume it and the anchor resets below — emit an anchor
+           * AIMessage now (createAIMessage folds the pending reasoning into
+           * `additional_kwargs.reasoning_content`) or the persisted
+           * assistant reasoning silently vanishes on replay.
+           */
+          lastAIMessage = createAIMessage('');
+          formattedMessages.push(lastAIMessage);
+        }
+        const steerPart = part as {
+          steer?: string;
+          media?: MessageContentComplex[];
+        };
+        const steerContent =
+          Array.isArray(steerPart.media) && steerPart.media.length > 0
+            ? toLangChainContent(steerPart.media)
+            : (steerPart.steer ?? '');
+        formattedMessages.push(
+          withMessageRole(
+            new HumanMessage({
+              content: steerContent as MessageContent,
+              additional_kwargs: { role: 'user', source: 'steer' },
+            }),
+            'user'
+          )
+        );
+        lastAIMessage = null;
+        /** The steer splits the assistant message: the post-steer segment
+         *  starts with fresh reasoning state (pre-steer reasoning was either
+         *  flushed above or intentionally dropped when not preserving). */
+        hasReasoning = false;
+        pendingReasoningContent = '';
       } else if (
         part.type === ContentTypes.ERROR ||
         part.type === ContentTypes.AGENT_UPDATE ||
@@ -852,6 +922,12 @@ function labelAllAgentContent(
     }
 
     currentAgentId = agentId;
+    if (part.type === ContentTypes.STEER) {
+      /** User speech is never agent content — see the transfer path above. */
+      flushAgentBuffer();
+      result.push(part);
+      continue;
+    }
     agentContentBuffer.push(part);
   }
 
@@ -987,6 +1063,22 @@ export const labelContentByAgent = (
       transferToolCallIndex = result.length - 1;
       transferToolCallId = (part as ToolCallContent).tool_call?.id;
       currentAgentId = undefined; // Reset to capture the next agent
+    } else if (part.type === ContentTypes.STEER) {
+      /**
+       * User speech is never agent content: flush the buffer in place and
+       * pass the steer through verbatim so `formatAssistantMessage` replays
+       * it as a user turn. Folding it into a labeled transfer summary would
+       * both drop the user's words and misattribute them to the agent.
+       * The steer also CLOSES any open transfer capture — `flushAgentBuffer`
+       * no-ops on an empty buffer, and leaving the capture live would fold
+       * post-steer agent content into the pre-steer transfer output,
+       * replaying it BEFORE the user's redirect.
+       */
+      flushAgentBuffer();
+      transferToolCallIndex = undefined;
+      transferToolCallId = undefined;
+      currentAgentId = undefined;
+      result.push(part);
     } else {
       agentContentBuffer.push(part);
     }
@@ -1440,7 +1532,8 @@ export const formatAgentMessages = (
     const formattedMessages = formatAssistantMessage(processedMessage, {
       preserveUnpairedServerToolUses: i === payload.length - 1,
       preserveReasoningContent:
-        options?.preserveReasoningContent ?? options?.provider === Providers.DEEPSEEK,
+        options?.preserveReasoningContent ??
+        options?.provider === Providers.DEEPSEEK,
       provider: options?.provider,
     });
     if (sourceMessageId != null && sourceMessageId !== '') {

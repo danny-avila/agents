@@ -2103,6 +2103,32 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
        * to defensively `?.` it across every reference inside.
        */
       const hookRegistry = this.hookRegistry;
+      /**
+       * Pull each call's prestarted eager record BEFORE awaiting the hooks:
+       * an async deny must never race the eager host promise into emitting a
+       * successful completion (`dispatchEagerToolCompletions`' map-identity
+       * check skips deleted records). Allowed entries get their record
+       * restored in the decision loop below so consumption still works;
+       * denied entries stay deleted. Ask/interrupt configs never have eager
+       * records (HITL disables the reservation gate).
+       */
+      const preemptedEagerRecords = new Map<
+        string,
+        t.EagerEventToolExecution
+      >();
+      if (this.eagerEventToolExecutions != null) {
+        for (const entry of preToolCalls) {
+          const callId = entry.call.id;
+          if (callId == null) {
+            continue;
+          }
+          const record = this.eagerEventToolExecutions.get(callId);
+          if (record != null) {
+            preemptedEagerRecords.set(callId, record);
+            this.eagerEventToolExecutions.delete(callId);
+          }
+        }
+      }
       const preResults = await Promise.all(
         preToolCalls.map((entry) =>
           executeHooks({
@@ -2185,6 +2211,14 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
           contentString,
           reason,
         });
+        /**
+         * A prestarted eager execution for a now-blocked call must neither be
+         * consumed nor emit its completion — the run reports this call as
+         * blocked. Deleting the record makes `dispatchEagerToolCompletions`'
+         * map-identity check skip the pending emission (same pattern as the
+         * rejected-results cleanup below).
+         */
+        this.eagerEventToolExecutions?.delete(entry.call.id!);
       };
 
       const flushDeferredBlockedSideEffects = async (): Promise<void> => {
@@ -2313,6 +2347,12 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
 
         if (hookResult.updatedInput != null) {
           applyInputOverride(entry, hookResult.updatedInput);
+        }
+        if (entry.call.id != null) {
+          const preempted = preemptedEagerRecords.get(entry.call.id);
+          if (preempted != null) {
+            this.eagerEventToolExecutions?.set(entry.call.id, preempted);
+          }
         }
         approvedEntries.push(entry);
       }
@@ -2646,6 +2686,18 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       const canEmitEarlyCompletions =
         this.hookRegistry?.hasResultAlteringHooks(runId) !== true &&
         this.humanInTheLoop?.enabled !== true;
+      /**
+       * Snapshot the post-hook gates at the same instant as the early-emission
+       * gate: a result-altering hook registered while this batch is in flight
+       * applies from the NEXT batch. Evaluating these after results settle
+       * would let a late hook rewrite the ToolMessage AFTER an early
+       * completion already emitted the pre-hook output — two views of the
+       * same call.
+       */
+      const hasPostHook =
+        this.hookRegistry?.hasHookFor('PostToolUse', runId) === true;
+      const hasFailureHook =
+        this.hookRegistry?.hasHookFor('PostToolUseFailure', runId) === true;
       const earlyCompletionDispatchedIds = new Set<string>();
       const earlyCompletionDispatches: Array<Promise<void>> = [];
       const dispatchRequestById = new Map(
@@ -2760,11 +2812,6 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
       ];
 
       this.storeCodeSessionFromResults(results, requestMap);
-
-      const hasPostHook =
-        this.hookRegistry?.hasHookFor('PostToolUse', runId) === true;
-      const hasFailureHook =
-        this.hookRegistry?.hasHookFor('PostToolUseFailure', runId) === true;
 
       for (const result of results) {
         if (result.injectedMessages && result.injectedMessages.length > 0) {
@@ -2903,6 +2950,15 @@ export class ToolNode<T = any> extends RunnableCallable<T, T> {
                 this.maxToolResultChars
               );
               finalToolOutput = hookResult.updatedOutput;
+              /**
+               * The hook ACTUALLY rewrote this output: any completion the
+               * stream already emitted for the consumed eager result showed
+               * the raw content, so un-mark it and let the dispatch below
+               * re-emit the corrected version. Hooks that merely observe or
+               * add context leave the original emission final — no
+               * duplicates.
+               */
+              eagerCompletionDispatchedIds.delete(result.toolCallId);
             }
           }
 

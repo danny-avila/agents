@@ -108,9 +108,25 @@ function getNonEmptyValue(possibleValues: string[]): string | undefined {
   return undefined;
 }
 
-function isBatchSensitiveToolExecution(graph: StandardGraph): boolean {
+function isBatchSensitiveToolExecution(
+  graph: StandardGraph,
+  metadata?: Record<string, unknown>
+): boolean {
+  /**
+   * Resolve the hook-session id exactly the way ToolNode will: its hook
+   * lookups read `config.configurable.run_id` ONLY, so that source wins here
+   * too (a subagent child graph carries its own `graph.runId`, but its
+   * ToolNode executes hooks under the PARENT's inherited configurable run
+   * id). The metadata / graph.runId fallbacks only apply when no
+   * configurable id exists and can only be conservative — a false positive
+   * merely skips eager prestart.
+   */
+  const runId =
+    (graph.config?.configurable?.run_id as string | undefined) ??
+    (metadata?.run_id as string | undefined) ??
+    graph.runId;
   return (
-    graph.hookRegistry?.hasResultAlteringHooks(graph.runId) === true ||
+    graph.hookRegistry?.hasResultAlteringHooks(runId) === true ||
     graph.humanInTheLoop?.enabled === true
   );
 }
@@ -249,7 +265,7 @@ function isEagerToolExecutionEnabledForBatch(args: {
   if ((agentContext?.toolDefinitions?.length ?? 0) === 0) {
     return false;
   }
-  if (isBatchSensitiveToolExecution(graph)) {
+  if (isBatchSensitiveToolExecution(graph, metadata)) {
     return false;
   }
   if (

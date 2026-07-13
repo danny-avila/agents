@@ -3228,6 +3228,47 @@ describe('ChatModelStreamHandler eager event tool execution', () => {
     expect(graph.eagerEventToolCallChunks.size).toBe(0);
   });
 
+  it('does not prestart when parent-run session hooks alter results', async () => {
+    // A subagent child graph has its own runId, but ToolNode executes hooks
+    // under the PARENT run id from `configurable.run_id` ONLY — the prestart
+    // gate must read the same source (a differing metadata run id here is a
+    // deliberate distractor pinning the precedence).
+    const sessionRegistry = new HookRegistry();
+    sessionRegistry.registerSession('parent-run', 'PreToolUse', {
+      hooks: [async () => ({ decision: 'allow' as const })],
+    });
+    const graph = createGraph({
+      runId: 'child-run',
+      hookRegistry: sessionRegistry,
+      config: {
+        configurable: { user_id: 'user_1', run_id: 'parent-run' },
+        metadata: { run_id: 'run_1' },
+      },
+    } as Partial<StandardGraph>);
+    const sessionDispatchSpy = jest.spyOn(events, 'safeDispatchCustomEvent');
+
+    await new ChatModelStreamHandler().handle(
+      GraphEvents.CHAT_MODEL_STREAM,
+      {
+        chunk: {
+          content: '',
+          tool_calls: [
+            { id: 'call_weather', name: 'weather', args: { city: 'NYC' } },
+          ],
+        } as unknown as t.StreamChunk,
+      },
+      { langgraph_node: 'agent', run_id: 'some-other-run' },
+      graph
+    );
+
+    expect(sessionDispatchSpy).not.toHaveBeenCalledWith(
+      GraphEvents.ON_TOOL_EXECUTE,
+      expect.anything(),
+      expect.anything()
+    );
+    expect(graph.eagerEventToolExecutions.size).toBe(0);
+  });
+
   it('does not prestart when batch-sensitive hooks are configured', async () => {
     const graph = createGraph({
       hookRegistry: createResultAlteringRegistry(),
