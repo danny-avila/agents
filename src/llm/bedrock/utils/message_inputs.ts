@@ -88,6 +88,29 @@ function isSerializableBedrockReasoningBlock(
   return content.redactedContent != null && content.redactedContent !== '';
 }
 
+function appendSerializableBedrockTextBlock(
+  contentBlocks: BedrockContentBlock[],
+  text: string
+): boolean {
+  if (text === '') {
+    return false;
+  }
+  const cleanedText = text.replace(/\n/g, '').trim();
+  if (cleanedText !== '') {
+    contentBlocks.push({ text });
+    return true;
+  }
+  const lastBlock = contentBlocks[contentBlocks.length - 1] as
+    | BedrockContentBlock
+    | undefined;
+  if (lastBlock == null || !('text' in lastBlock)) {
+    return false;
+  }
+  const mergedTextContent = `${lastBlock.text}${text}`;
+  (lastBlock as { text: string }).text = mergedTextContent;
+  return true;
+}
+
 /**
  * Concatenate consecutive reasoning blocks in content array.
  */
@@ -96,48 +119,57 @@ export function concatenateLangchainReasoningBlocks(
 ): Array<MessageContentComplex | MessageContentReasoningBlock> {
   const result: Array<MessageContentComplex | MessageContentReasoningBlock> =
     [];
+  let pendingReasoning: MessageContentReasoningBlock | undefined;
+
+  const flushPendingReasoning = (): void => {
+    if (pendingReasoning != null) {
+      result.push(pendingReasoning);
+      pendingReasoning = undefined;
+    }
+  };
 
   for (const block of content) {
-    if (block.type === 'reasoning_content') {
-      const currentReasoning = block as MessageContentReasoningBlock;
-      const lastIndex = result.length - 1;
-
-      // Check if we can merge with the previous block
-      if (lastIndex >= 0) {
-        const lastBlock = result[lastIndex];
-        if (
-          lastBlock.type === 'reasoning_content' &&
-          (lastBlock as MessageContentReasoningBlock).reasoningText != null &&
-          currentReasoning.reasoningText != null
-        ) {
-          const lastReasoning = lastBlock as MessageContentReasoningBlock;
-          // Merge consecutive reasoning text blocks
-          const lastText = lastReasoning.reasoningText?.text;
-          const currentText = currentReasoning.reasoningText.text;
-          if (
-            lastText != null &&
-            lastText !== '' &&
-            currentText != null &&
-            currentText !== ''
-          ) {
-            lastReasoning.reasoningText!.text = lastText + currentText;
-          } else if (
-            currentReasoning.reasoningText.signature != null &&
-            currentReasoning.reasoningText.signature !== ''
-          ) {
-            lastReasoning.reasoningText!.signature =
-              currentReasoning.reasoningText.signature;
-          }
-          continue;
-        }
-      }
-
-      result.push({ ...block } as MessageContentReasoningBlock);
-    } else {
+    if (block.type !== 'reasoning_content') {
+      flushPendingReasoning();
       result.push(block);
+      continue;
+    }
+
+    const currentReasoning = block as MessageContentReasoningBlock;
+    if (currentReasoning.reasoningText != null) {
+      const previousText = pendingReasoning?.reasoningText?.text;
+      const previousSignature = pendingReasoning?.reasoningText?.signature;
+      const { text, signature } = currentReasoning.reasoningText;
+      const mergedReasoningText: { text?: string; signature?: string } = {};
+      if (previousText !== undefined || text !== undefined) {
+        mergedReasoningText.text = (previousText ?? '') + (text ?? '');
+      }
+      if (previousSignature !== undefined || signature !== undefined) {
+        mergedReasoningText.signature =
+          (previousSignature ?? '') + (signature ?? '');
+      }
+      pendingReasoning = {
+        type: 'reasoning_content',
+        reasoningText: mergedReasoningText,
+      };
+
+      // A signature seals the accumulated reasoning text. Any following
+      // reasoning block starts a new independently signed Bedrock block.
+      if ('signature' in currentReasoning.reasoningText) {
+        flushPendingReasoning();
+      }
+    }
+
+    if (currentReasoning.redactedContent != null) {
+      flushPendingReasoning();
+      result.push({
+        type: 'reasoning_content',
+        redactedContent: currentReasoning.redactedContent,
+      });
     }
   }
 
+  flushPendingReasoning();
   return result;
 }
 
@@ -666,23 +698,7 @@ function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
     concatenatedBlocks.forEach((block) => {
       if (block.type === 'text') {
         const text = (block as { text?: string }).text ?? '';
-        // Skip completely empty text blocks (common in AI messages with tool_use blocks)
-        if (text === '') {
-          return;
-        }
-        // Merge whitespace/newlines with previous text blocks to avoid validation errors.
-        const cleanedText = text.replace(/\n/g, '').trim();
-        if (cleanedText === '') {
-          if (contentBlocks.length > 0) {
-            const lastBlock = contentBlocks[contentBlocks.length - 1];
-            if ('text' in lastBlock) {
-              const mergedTextContent = `${lastBlock.text}${text}`;
-              (lastBlock as { text: string }).text = mergedTextContent;
-            }
-          }
-        } else {
-          contentBlocks.push({ text });
-        }
+        appendSerializableBedrockTextBlock(contentBlocks, text);
       } else if (block.type === 'reasoning_content') {
         const reasoningBlock = block as MessageContentReasoningBlock;
         // Bedrock Converse rejects reasoningContent whose reasoningText.text is
@@ -757,26 +773,35 @@ function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
 function convertFromV1ToChatBedrockConverseMessage(
   msg: BaseMessage
 ): BedrockMessage {
+  const contentBlocks: BedrockContentBlock[] = [];
   const assistantMsg: BedrockMessage = {
     role: 'assistant',
-    content: [],
+    content: contentBlocks,
   };
+  let droppedUnserializableContent = false;
+  let unconvertedContentType: string | undefined;
 
   if (Array.isArray(msg.content)) {
-    for (const block of msg.content as Array<
-      MessageContentComplex | MessageContentReasoningBlock
-    >) {
+    const concatenatedBlocks = concatenateLangchainReasoningBlocks(
+      msg.content as Array<MessageContentComplex | MessageContentReasoningBlock>
+    );
+    for (const block of concatenatedBlocks) {
       if (typeof block === 'string') {
-        assistantMsg.content?.push({ text: block });
+        if (!appendSerializableBedrockTextBlock(contentBlocks, block)) {
+          droppedUnserializableContent = true;
+        }
       } else if (block.type === 'text') {
-        assistantMsg.content?.push({ text: (block as { text: string }).text });
+        const text = (block as { text?: string }).text ?? '';
+        if (!appendSerializableBedrockTextBlock(contentBlocks, text)) {
+          droppedUnserializableContent = true;
+        }
       } else if (block.type === 'tool_call') {
         const toolCall = block as {
           id: string;
           name: string;
           args: Record<string, unknown>;
         };
-        assistantMsg.content?.push({
+        contentBlocks.push({
           toolUse: {
             toolUseId: toolCall.id,
             name: toolCall.name,
@@ -784,38 +809,51 @@ function convertFromV1ToChatBedrockConverseMessage(
           },
         } as BedrockContentBlock);
       } else if (block.type === 'reasoning') {
-        const reasoning = block as { reasoning: string };
-        assistantMsg.content?.push({
+        const reasoning = block as { reasoning?: string };
+        /** Bedrock Converse rejects `reasoningText` with a null/empty `text`
+         * (`Member must not be null`), e.g. when the producing model omitted
+         * reasoning text (`thinking.display: "omitted"`) — drop rather than send. */
+        if (reasoning.reasoning == null || reasoning.reasoning === '') {
+          droppedUnserializableContent = true;
+          continue;
+        }
+        contentBlocks.push({
           reasoningContent: {
             reasoningText: { text: reasoning.reasoning },
           },
         } as BedrockContentBlock);
       } else if (block.type === 'reasoning_content') {
-        assistantMsg.content?.push({
-          reasoningContent: langchainReasoningBlockToBedrockReasoningBlock(
-            block as MessageContentReasoningBlock
-          ),
+        const reasoningBlock = block as MessageContentReasoningBlock;
+        if (!isSerializableBedrockReasoningBlock(reasoningBlock)) {
+          droppedUnserializableContent = true;
+          continue;
+        }
+        contentBlocks.push({
+          reasoningContent:
+            langchainReasoningBlockToBedrockReasoningBlock(reasoningBlock),
         } as BedrockContentBlock);
+      } else {
+        unconvertedContentType ??= block.type;
       }
     }
-  } else if (typeof msg.content === 'string' && msg.content !== '') {
-    assistantMsg.content?.push({ text: msg.content });
+  } else if (typeof msg.content === 'string') {
+    if (!appendSerializableBedrockTextBlock(contentBlocks, msg.content)) {
+      droppedUnserializableContent = true;
+    }
   }
 
   // Also handle tool_calls from the message
   if (isAIMessage(msg) && msg.tool_calls != null && msg.tool_calls.length > 0) {
     // Check if tool calls are already in content
     const existingToolUseIds = new Set(
-      assistantMsg.content
-        ?.filter((c) => 'toolUse' in c)
-        .map(
-          (c) => (c as { toolUse: { toolUseId: string } }).toolUse.toolUseId
-        ) ?? []
+      contentBlocks
+        .filter((c) => 'toolUse' in c)
+        .map((c) => (c as { toolUse: { toolUseId: string } }).toolUse.toolUseId)
     );
 
     for (const tc of msg.tool_calls) {
       if (!existingToolUseIds.has(tc.id ?? '')) {
-        assistantMsg.content?.push({
+        contentBlocks.push({
           toolUse: {
             toolUseId: tc.id,
             name: tc.name,
@@ -824,6 +862,16 @@ function convertFromV1ToChatBedrockConverseMessage(
         } as BedrockContentBlock);
       }
     }
+  }
+
+  const hasNoContent = contentBlocks.length === 0;
+  if (hasNoContent && unconvertedContentType != null) {
+    throw new Error(
+      `Unsupported v1 content block type: ${unconvertedContentType}`
+    );
+  }
+  if (hasNoContent && droppedUnserializableContent) {
+    contentBlocks.push({ text: BEDROCK_EMPTY_TEXT_PLACEHOLDER });
   }
 
   return assistantMsg;
