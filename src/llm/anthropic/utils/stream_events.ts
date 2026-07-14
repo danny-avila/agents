@@ -10,21 +10,27 @@ import type {
   FinishReason,
 } from '@langchain/core/language_models/event';
 import type { ContentBlock, UsageMetadata } from '@langchain/core/messages';
-import type { AnthropicMessageStreamEvent } from '../types';
+import type {
+  AnthropicCompactionBlock,
+  AnthropicCompactionContentBlockDelta,
+  AnthropicMessageStreamEvent,
+} from '../types';
 import type { AnthropicUsageData } from './message_outputs';
 import { getAnthropicUsageMetadata } from './message_outputs';
 
-type AnthropicContentBlock = Extract<
-  AnthropicMessageStreamEvent,
-  { type: 'content_block_start' }
->['content_block'];
+type AnthropicContentBlock =
+  | Extract<
+      AnthropicMessageStreamEvent,
+      { type: 'content_block_start' }
+    >['content_block']
+  | AnthropicCompactionBlock;
 
 type AnthropicContentDelta =
   | Extract<
       AnthropicMessageStreamEvent,
       { type: 'content_block_delta' }
     >['delta']
-  | ({ type: 'compaction_delta' } & Record<string, unknown>);
+  | AnthropicCompactionContentBlockDelta;
 
 interface AnthropicStreamErrorEvent {
   type: 'error';
@@ -207,6 +213,8 @@ function mapStopReason(stopReason: string | null | undefined): FinishReason {
   case 'max_tokens':
   case 'model_context_window_exceeded':
     return 'length';
+  case 'refusal':
+    return 'content_filter';
   default:
     return 'stop';
   }
@@ -266,23 +274,18 @@ function getArrayField(record: BlockAccumulator, key: string): unknown[] {
   return Array.isArray(value) ? value : [];
 }
 
-function getObjectField(
-  record: BlockAccumulator,
-  key: string
-): BlockAccumulator {
-  const value = record[key];
-  return typeof value === 'object' && value !== null
-    ? (value as BlockAccumulator)
-    : {};
-}
-
 function mapBlockToContentBlock(
   block: AnthropicContentBlock,
   index: number
 ): BlockAccumulator {
   switch (block.type) {
   case 'text':
-    return { type: 'text' as const, text: block.text, index };
+    return {
+      type: 'text' as const,
+      text: block.text,
+      ...(block.citations != null ? { citations: block.citations } : {}),
+      index,
+    };
   case 'thinking':
     return {
       type: 'reasoning' as const,
@@ -290,7 +293,7 @@ function mapBlockToContentBlock(
       index,
     };
   case 'redacted_thinking':
-    return { type: 'non_standard' as const, value: { ...block }, index };
+    return { ...block, index };
   case 'tool_use':
     return {
       type: 'tool_call_chunk' as const,
@@ -309,6 +312,8 @@ function mapBlockToContentBlock(
     };
   case 'web_search_tool_result':
     return { ...block, index };
+  case 'compaction':
+    return { ...block, index };
   default:
     return { type: 'non_standard' as const, value: { ...block }, index };
   }
@@ -325,7 +330,7 @@ function applyAnthropicDelta(
   contentDelta: ContentBlockDelta;
   accumulated: BlockAccumulator;
 } {
-  const rawDelta = delta as Record<string, unknown>;
+  const rawDelta = delta as unknown as Record<string, unknown>;
   switch (delta.type) {
   case 'text_delta':
     return {
@@ -363,8 +368,8 @@ function applyAnthropicDelta(
   }
 
   case 'citations_delta': {
-    const annotations = [
-      ...getArrayField(accumulated, 'annotations'),
+    const citations = [
+      ...getArrayField(accumulated, 'citations'),
       delta.citation,
     ];
     return {
@@ -372,12 +377,12 @@ function applyAnthropicDelta(
         type: 'block-delta' as const,
         fields: {
           type: getStringField(accumulated, 'type'),
-          annotations,
+          citations,
         },
       },
       accumulated: {
         ...accumulated,
-        annotations,
+        citations,
       },
     };
   }
@@ -394,26 +399,28 @@ function applyAnthropicDelta(
       accumulated: { ...accumulated, signature: delta.signature },
     };
 
-  case 'compaction_delta':
+  case 'compaction_delta': {
+    const previousContent = accumulated.content;
+    const content =
+        delta.content == null
+          ? (previousContent ?? null)
+          : getStringField(accumulated, 'content') + delta.content;
     return {
       contentDelta: {
         type: 'block-delta' as const,
         fields: {
-          type: 'non_standard',
-          value: {
-            ...getObjectField(accumulated, 'value'),
-            compaction: delta,
-          },
+          type: 'compaction',
+          content,
+          encrypted_content: delta.encrypted_content,
         },
       },
       accumulated: {
         ...accumulated,
-        value: {
-          ...getObjectField(accumulated, 'value'),
-          compaction: delta,
-        },
+        content,
+        encrypted_content: delta.encrypted_content,
       },
     };
+  }
 
   default:
     return {

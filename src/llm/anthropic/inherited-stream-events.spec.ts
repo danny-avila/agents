@@ -426,6 +426,131 @@ function serverToolUseEvents(): unknown[] {
   ];
 }
 
+function citationEvents(): unknown[] {
+  return [
+    {
+      type: 'message_start',
+      message: {
+        id: 'msg_08VWX',
+        type: 'message',
+        role: 'assistant',
+        content: [],
+        model: 'claude-sonnet-4-20250514',
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 25, output_tokens: 0 },
+      },
+    },
+    {
+      type: 'content_block_start',
+      index: 0,
+      content_block: { type: 'text', text: '', citations: [] },
+    },
+    {
+      type: 'content_block_delta',
+      index: 0,
+      delta: {
+        type: 'citations_delta',
+        citation: {
+          type: 'web_search_result_location',
+          cited_text: 'Example source',
+          encrypted_index: 'encrypted-index',
+          title: 'Example',
+          url: 'https://example.com',
+        },
+      },
+    },
+    {
+      type: 'content_block_delta',
+      index: 0,
+      delta: { type: 'text_delta', text: 'Cited answer.' },
+    },
+    { type: 'content_block_stop', index: 0 },
+    {
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn', stop_sequence: null },
+      usage: { output_tokens: 5 },
+    },
+    { type: 'message_stop' },
+  ];
+}
+
+function compactionEvents(): unknown[] {
+  return [
+    {
+      type: 'message_start',
+      message: {
+        id: 'msg_09YZA',
+        type: 'message',
+        role: 'assistant',
+        content: [],
+        model: 'claude-sonnet-4-20250514',
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 25, output_tokens: 0 },
+      },
+    },
+    {
+      type: 'content_block_start',
+      index: 0,
+      content_block: {
+        type: 'compaction',
+        content: null,
+        encrypted_content: null,
+      },
+    },
+    {
+      type: 'content_block_delta',
+      index: 0,
+      delta: {
+        type: 'compaction_delta',
+        content: 'Summary of the earlier conversation.',
+        encrypted_content: 'encrypted-summary',
+      },
+    },
+    { type: 'content_block_stop', index: 0 },
+    {
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn', stop_sequence: null },
+      usage: { output_tokens: 5 },
+    },
+    { type: 'message_stop' },
+  ];
+}
+
+function redactedThinkingEvents(): unknown[] {
+  return [
+    {
+      type: 'message_start',
+      message: {
+        id: 'msg_10BCD',
+        type: 'message',
+        role: 'assistant',
+        content: [],
+        model: 'claude-sonnet-4-20250514',
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 25, output_tokens: 0 },
+      },
+    },
+    {
+      type: 'content_block_start',
+      index: 0,
+      content_block: {
+        type: 'redacted_thinking',
+        data: 'encrypted-thinking',
+      },
+    },
+    { type: 'content_block_stop', index: 0 },
+    {
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn', stop_sequence: null },
+      usage: { output_tokens: 5 },
+    },
+    { type: 'message_stop' },
+  ];
+}
+
 function contextWindowExceededEvents(): unknown[] {
   return [
     ...textOnlyEvents().slice(0, -2),
@@ -435,6 +560,18 @@ function contextWindowExceededEvents(): unknown[] {
         stop_reason: 'model_context_window_exceeded',
         stop_sequence: null,
       },
+      usage: { output_tokens: 2 },
+    },
+    { type: 'message_stop' },
+  ];
+}
+
+function refusalEvents(): unknown[] {
+  return [
+    ...textOnlyEvents().slice(0, -2),
+    {
+      type: 'message_delta',
+      delta: { stop_reason: 'refusal', stop_sequence: null },
       usage: { output_tokens: 2 },
     },
     { type: 'message_stop' },
@@ -863,6 +1000,88 @@ describe('CustomAnthropic._streamChatModelEvents (inherited native)', () => {
       expect(message.tool_calls?.[0]?.name).toBe('web_search');
     });
 
+    test('output preserves client tool calls for follow-up turns', async () => {
+      const model = new MockStreamChatAnthropic(toolCallEvents());
+      const stream = new ChatModelStream(streamEvents(model));
+      const message = await stream.output;
+
+      const payload = _convertMessagesToAnthropicPayload([message]);
+      expect(payload.messages[0]?.content).toEqual([
+        { type: 'text', text: 'Let me search.' },
+        {
+          type: 'tool_use',
+          id: 'toolu_01ABC',
+          name: 'web_search',
+          input: { query: 'weather' },
+        },
+      ]);
+    });
+
+    test('output preserves signed thinking for follow-up turns', async () => {
+      const model = new MockStreamChatAnthropic(thinkingPlusTextEvents());
+      const stream = new ChatModelStream(streamEvents(model));
+      const message = await stream.output;
+
+      const payload = _convertMessagesToAnthropicPayload([message]);
+      expect(payload.messages[0]?.content).toEqual([
+        {
+          type: 'thinking',
+          thinking: 'Let me reason...',
+          signature: 'sig_abc',
+        },
+        { type: 'text', text: 'The answer is 42.' },
+      ]);
+    });
+
+    test('output preserves citations for follow-up turns', async () => {
+      const model = new MockStreamChatAnthropic(citationEvents());
+      const stream = new ChatModelStream(streamEvents(model));
+      const message = await stream.output;
+      const citation = {
+        type: 'web_search_result_location',
+        cited_text: 'Example source',
+        encrypted_index: 'encrypted-index',
+        title: 'Example',
+        url: 'https://example.com',
+      };
+
+      expect(message.content).toEqual([
+        { type: 'text', text: 'Cited answer.', citations: [citation] },
+      ]);
+      const payload = _convertMessagesToAnthropicPayload([message]);
+      expect(payload.messages[0]?.content).toEqual([
+        { type: 'text', text: 'Cited answer.', citations: [citation] },
+      ]);
+    });
+
+    test('output preserves compaction blocks for follow-up turns', async () => {
+      const model = new MockStreamChatAnthropic(compactionEvents());
+      const stream = new ChatModelStream(streamEvents(model));
+      const message = await stream.output;
+
+      expect(message.content).toEqual([
+        {
+          type: 'compaction',
+          content: 'Summary of the earlier conversation.',
+          encrypted_content: 'encrypted-summary',
+        },
+      ]);
+      const payload = _convertMessagesToAnthropicPayload([message]);
+      expect(payload.messages[0]?.content).toEqual(message.content);
+    });
+
+    test('output preserves redacted thinking for follow-up turns', async () => {
+      const model = new MockStreamChatAnthropic(redactedThinkingEvents());
+      const stream = new ChatModelStream(streamEvents(model));
+      const message = await stream.output;
+
+      expect(message.content).toEqual([
+        { type: 'redacted_thinking', data: 'encrypted-thinking' },
+      ]);
+      const payload = _convertMessagesToAnthropicPayload([message]);
+      expect(payload.messages[0]?.content).toEqual(message.content);
+    });
+
     test('output preserves web search results for follow-up turns', async () => {
       const model = new MockStreamChatAnthropic(webSearchResultEvents());
       const stream = new ChatModelStream(streamEvents(model));
@@ -985,13 +1204,20 @@ describe('CustomAnthropic._streamChatModelEvents (inherited native)', () => {
     });
 
     test('maps model context exhaustion to a length finish reason', async () => {
-      const model = new MockStreamChatAnthropic(
-        contextWindowExceededEvents()
-      );
+      const model = new MockStreamChatAnthropic(contextWindowExceededEvents());
       const events = await collectEvents(model);
 
       expect(events.find((event) => event.event === 'message-finish')).toEqual(
         expect.objectContaining({ reason: 'length' })
+      );
+    });
+
+    test('maps Anthropic refusals to a content-filter finish reason', async () => {
+      const model = new MockStreamChatAnthropic(refusalEvents());
+      const events = await collectEvents(model);
+
+      expect(events.find((event) => event.event === 'message-finish')).toEqual(
+        expect.objectContaining({ reason: 'content_filter' })
       );
     });
   });

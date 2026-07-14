@@ -61,6 +61,9 @@ export type AnthropicSearchResultBlockParam =
   Anthropic.Beta.BetaSearchResultBlockParam;
 export type AnthropicCompactionBlockParam =
   Anthropic.Beta.BetaCompactionBlockParam;
+export type AnthropicCompactionBlock = Anthropic.Beta.BetaCompactionBlock;
+export type AnthropicCompactionContentBlockDelta =
+  Anthropic.Beta.BetaCompactionContentBlockDelta;
 export type AnthropicOutputConfig = Anthropic.Messages.OutputConfig;
 export type ChatAnthropicOutputFormat = Anthropic.Messages.JSONOutputFormat;
 
