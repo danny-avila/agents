@@ -234,24 +234,26 @@ describe('convertToConverseMessages — v1 reasoning serialization', () => {
   });
 
   it('merges split v1 reasoning_content text and signature blocks before serialization', () => {
+    const splitContent = [
+      {
+        type: 'reasoning_content',
+        reasoningText: { text: 'first ' },
+      },
+      {
+        type: 'reasoning_content',
+        reasoningText: { text: 'second' },
+      },
+      {
+        type: 'reasoning_content',
+        reasoningText: { signature: 'sig-abc' },
+      },
+      { type: 'text', text: 'answer' },
+    ];
+    const originalContent = structuredClone(splitContent);
     const messages: BaseMessage[] = [
       new HumanMessage('hi'),
       new AIMessage({
-        content: [
-          {
-            type: 'reasoning_content',
-            reasoningText: { text: 'first ' },
-          },
-          {
-            type: 'reasoning_content',
-            reasoningText: { text: 'second' },
-          },
-          {
-            type: 'reasoning_content',
-            reasoningText: { signature: 'sig-abc' },
-          },
-          { type: 'text', text: 'answer' },
-        ],
+        content: splitContent,
         response_metadata: v1Metadata,
       }),
     ];
@@ -263,9 +265,10 @@ describe('convertToConverseMessages — v1 reasoning serialization', () => {
       text: 'first second',
       signature: 'sig-abc',
     });
+    expect(splitContent).toEqual(originalContent);
   });
 
-  it('does not replace unhandled v1 content with the empty-turn placeholder', () => {
+  it('throws instead of returning empty assistant content for an unhandled v1 block', () => {
     const messages: BaseMessage[] = [
       new HumanMessage('hi'),
       new AIMessage({
@@ -281,8 +284,9 @@ describe('convertToConverseMessages — v1 reasoning serialization', () => {
       }),
     ];
 
-    const content = assistantContent(convertToConverseMessages(messages));
-    expect(content).toEqual([]);
+    expect(() => convertToConverseMessages(messages)).toThrow(
+      'Unsupported v1 content block type: image'
+    );
   });
 
   it('still converts v1 reasoning and reasoning_content blocks that carry text', () => {

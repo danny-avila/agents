@@ -132,7 +132,12 @@ export function concatenateLangchainReasoningBlocks(
         }
       }
 
-      result.push({ ...block } as MessageContentReasoningBlock);
+      result.push({
+        ...currentReasoning,
+        ...(currentReasoning.reasoningText == null
+          ? {}
+          : { reasoningText: { ...currentReasoning.reasoningText } }),
+      });
     } else {
       result.push(block);
     }
@@ -762,7 +767,7 @@ function convertFromV1ToChatBedrockConverseMessage(
     content: [],
   };
   let droppedUnserializableReasoning = false;
-  let hasUnconvertedContent = false;
+  let unconvertedContentType: string | undefined;
 
   if (Array.isArray(msg.content)) {
     const concatenatedBlocks = concatenateLangchainReasoningBlocks(
@@ -811,7 +816,7 @@ function convertFromV1ToChatBedrockConverseMessage(
             langchainReasoningBlockToBedrockReasoningBlock(reasoningBlock),
         } as BedrockContentBlock);
       } else {
-        hasUnconvertedContent = true;
+        unconvertedContentType ??= block.type;
       }
     }
   } else if (typeof msg.content === 'string' && msg.content !== '') {
@@ -842,11 +847,14 @@ function convertFromV1ToChatBedrockConverseMessage(
     }
   }
 
-  if (
-    (assistantMsg.content == null || assistantMsg.content.length === 0) &&
-    droppedUnserializableReasoning &&
-    !hasUnconvertedContent
-  ) {
+  const hasNoContent =
+    assistantMsg.content == null || assistantMsg.content.length === 0;
+  if (hasNoContent && unconvertedContentType != null) {
+    throw new Error(
+      `Unsupported v1 content block type: ${unconvertedContentType}`
+    );
+  }
+  if (hasNoContent && droppedUnserializableReasoning) {
     assistantMsg.content = [{ text: BEDROCK_EMPTY_TEXT_PLACEHOLDER }];
   }
 
