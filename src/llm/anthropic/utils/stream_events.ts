@@ -26,6 +26,19 @@ type AnthropicContentDelta =
     >['delta']
   | ({ type: 'compaction_delta' } & Record<string, unknown>);
 
+interface AnthropicStreamErrorEvent {
+  type: 'error';
+  error: {
+    type: string;
+    message: string;
+  };
+  request_id?: string | null;
+}
+
+type AnthropicStreamInputEvent =
+  | AnthropicMessageStreamEvent
+  | AnthropicStreamErrorEvent;
+
 type BlockAccumulator = Record<string, unknown>;
 
 interface AnthropicEventUsage {
@@ -46,7 +59,7 @@ export interface ConvertAnthropicStreamOptions {
  * LangChain `ChatModelStreamEvent`s with typed deltas.
  */
 export async function* convertAnthropicStream(
-  source: AsyncIterable<AnthropicMessageStreamEvent>,
+  source: AsyncIterable<AnthropicStreamInputEvent>,
   options: ConvertAnthropicStreamOptions = {}
 ): AsyncGenerator<ChatModelStreamEvent> {
   const shouldStreamUsage = options.streamUsage ?? true;
@@ -111,10 +124,16 @@ export async function* convertAnthropicStream(
         event: 'message-finish' as const,
         reason: mapStopReason(stopReason),
         ...(usageSnapshot ? { usage: usageSnapshot } : {}),
-        metadata: { model_provider: 'anthropic' },
+        responseMetadata: { model_provider: 'anthropic' },
       };
-      yield finishEvent as unknown as ChatModelStreamEvent;
+      yield finishEvent;
       break;
+    }
+
+    case 'error': {
+      const streamError = new Error(data.error.message);
+      streamError.name = data.error.type;
+      throw streamError;
     }
 
     // ── Content block lifecycle ───────────────────────────
@@ -186,6 +205,7 @@ function mapStopReason(stopReason: string | null | undefined): FinishReason {
   case 'tool_use':
     return 'tool_use';
   case 'max_tokens':
+  case 'model_context_window_exceeded':
     return 'length';
   default:
     return 'stop';

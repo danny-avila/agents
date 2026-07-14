@@ -383,6 +383,78 @@ function webSearchResultEvents(): unknown[] {
   ];
 }
 
+function serverToolUseEvents(): unknown[] {
+  return [
+    {
+      type: 'message_start',
+      message: {
+        id: 'msg_07STU',
+        type: 'message',
+        role: 'assistant',
+        content: [],
+        model: 'claude-sonnet-4-20250514',
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 25, output_tokens: 0 },
+      },
+    },
+    {
+      type: 'content_block_start',
+      index: 0,
+      content_block: {
+        type: 'server_tool_use',
+        id: 'srvtoolu_01SERVER',
+        name: 'web_search',
+        input: {},
+      },
+    },
+    {
+      type: 'content_block_delta',
+      index: 0,
+      delta: {
+        type: 'input_json_delta',
+        partial_json: '{"query":"weather"}',
+      },
+    },
+    { type: 'content_block_stop', index: 0 },
+    {
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn', stop_sequence: null },
+      usage: { output_tokens: 8 },
+    },
+    { type: 'message_stop' },
+  ];
+}
+
+function contextWindowExceededEvents(): unknown[] {
+  return [
+    ...textOnlyEvents().slice(0, -2),
+    {
+      type: 'message_delta',
+      delta: {
+        stop_reason: 'model_context_window_exceeded',
+        stop_sequence: null,
+      },
+      usage: { output_tokens: 2 },
+    },
+    { type: 'message_stop' },
+  ];
+}
+
+function streamErrorEvents(): unknown[] {
+  return [
+    textOnlyEvents()[0],
+    {
+      type: 'error',
+      error: {
+        type: 'overloaded_error',
+        message: 'Anthropic stream overloaded',
+      },
+      request_id: 'req_01ERROR',
+    },
+  ];
+}
+
 // ─── Tests ───────────────────────────────────────────────────────
 
 describe('CustomAnthropic._streamChatModelEvents (inherited native)', () => {
@@ -769,6 +841,9 @@ describe('CustomAnthropic._streamChatModelEvents (inherited native)', () => {
 
       expect(message.id).toBe('msg_03GHI');
       expect(message._getType()).toBe('ai');
+      expect(message.response_metadata).toMatchObject({
+        model_provider: 'anthropic',
+      });
 
       const content = message.content as Array<{
         type: string;
@@ -828,6 +903,31 @@ describe('CustomAnthropic._streamChatModelEvents (inherited native)', () => {
       ]);
     });
 
+    test('output preserves server tool arguments for follow-up turns', async () => {
+      const model = new MockStreamChatAnthropic(serverToolUseEvents());
+      const stream = new ChatModelStream(streamEvents(model));
+      const message = await stream.output;
+
+      expect(message.content).toEqual([
+        {
+          type: 'server_tool_call',
+          id: 'srvtoolu_01SERVER',
+          name: 'web_search',
+          args: { query: 'weather' },
+        },
+      ]);
+
+      const payload = _convertMessagesToAnthropicPayload([message]);
+      expect(payload.messages[0]?.content).toEqual([
+        {
+          type: 'server_tool_use',
+          id: 'srvtoolu_01SERVER',
+          name: 'web_search',
+          input: { query: 'weather' },
+        },
+      ]);
+    });
+
     test('usage sub-stream works end-to-end', async () => {
       const model = new MockStreamChatAnthropic(cacheUsageEvents());
       const stream = new ChatModelStream(
@@ -873,6 +973,26 @@ describe('CustomAnthropic._streamChatModelEvents (inherited native)', () => {
       expect(text).toBe('Let me search.');
       expect(tools.length).toBe(1);
       expect(tools[0]!.name).toBe('web_search');
+    });
+  });
+
+  describe('failure and finish semantics', () => {
+    test('throws Anthropic errors emitted after the stream starts', async () => {
+      const model = new MockStreamChatAnthropic(streamErrorEvents());
+      await expect(collectEvents(model)).rejects.toThrow(
+        'Anthropic stream overloaded'
+      );
+    });
+
+    test('maps model context exhaustion to a length finish reason', async () => {
+      const model = new MockStreamChatAnthropic(
+        contextWindowExceededEvents()
+      );
+      const events = await collectEvents(model);
+
+      expect(events.find((event) => event.event === 'message-finish')).toEqual(
+        expect.objectContaining({ reason: 'length' })
+      );
     });
   });
 

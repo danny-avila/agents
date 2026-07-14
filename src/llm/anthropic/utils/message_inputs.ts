@@ -482,8 +482,8 @@ function _formatContent(message: BaseMessage) {
     const contentBlocks = contentParts.map((contentPart) => {
       /**
        * Normalize server_tool_use blocks into a clean shape the API accepts.
-       * These blocks may arrive with the correct type (server_tool_use) or mislabeled
-       * as text/tool_use after chunk concatenation or state serialization.
+       * These blocks may arrive with the correct type (server_tool_use), as a
+       * standardized server_tool_call, or mislabeled after state serialization.
        * Regardless of current type, if the id starts with 'srvtoolu_' we rebuild
        * a clean block with only the properties the API expects.
        */
@@ -496,7 +496,7 @@ function _formatContent(message: BaseMessage) {
         'name' in contentPart
       ) {
         const rawPart = contentPart as Record<string, unknown>;
-        let input = rawPart.input;
+        let input = rawPart.input ?? rawPart.args;
         if (typeof input === 'string') {
           try {
             input = JSON.parse(input);
