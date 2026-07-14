@@ -300,6 +300,36 @@ describe('convertToConverseMessages — v1 reasoning serialization', () => {
     expect(splitContent).toEqual(originalContent);
   });
 
+  it('keeps independently signed v1 reasoning blocks separate', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('hi'),
+      new AIMessage({
+        content: [
+          {
+            type: 'reasoning_content',
+            reasoningText: { text: 'first', signature: 'sig-first' },
+          },
+          {
+            type: 'reasoning_content',
+            reasoningText: { text: 'second', signature: 'sig-second' },
+          },
+          { type: 'text', text: 'answer' },
+        ],
+        response_metadata: v1Metadata,
+      }),
+    ];
+
+    const content = assistantContent(convertToConverseMessages(messages));
+    expect(
+      content
+        .filter((block) => block.reasoningContent != null)
+        .map((block) => block.reasoningContent?.reasoningText)
+    ).toEqual([
+      { text: 'first', signature: 'sig-first' },
+      { text: 'second', signature: 'sig-second' },
+    ]);
+  });
+
   it('throws instead of returning empty assistant content for an unhandled v1 block', () => {
     const messages: BaseMessage[] = [
       new HumanMessage('hi'),

@@ -119,53 +119,65 @@ export function concatenateLangchainReasoningBlocks(
 ): Array<MessageContentComplex | MessageContentReasoningBlock> {
   const result: Array<MessageContentComplex | MessageContentReasoningBlock> =
     [];
+  let pendingReasoning: MessageContentReasoningBlock | undefined;
+
+  const flushPendingReasoning = (): void => {
+    if (pendingReasoning != null) {
+      result.push(pendingReasoning);
+      pendingReasoning = undefined;
+    }
+  };
 
   for (const block of content) {
-    if (block.type === 'reasoning_content') {
-      const currentReasoning = block as MessageContentReasoningBlock;
-      const lastIndex = result.length - 1;
+    if (block.type !== 'reasoning_content') {
+      flushPendingReasoning();
+      result.push(block);
+      continue;
+    }
 
-      // Check if we can merge with the previous block
-      if (lastIndex >= 0) {
-        const lastBlock = result[lastIndex];
-        if (
-          lastBlock.type === 'reasoning_content' &&
-          (lastBlock as MessageContentReasoningBlock).reasoningText != null &&
-          currentReasoning.reasoningText != null
-        ) {
-          const lastReasoning = lastBlock as MessageContentReasoningBlock;
-          // Merge consecutive reasoning text blocks
-          const lastText = lastReasoning.reasoningText?.text;
-          const currentText = currentReasoning.reasoningText.text;
-          if (
-            lastText != null &&
-            lastText !== '' &&
-            currentText != null &&
-            currentText !== ''
-          ) {
-            lastReasoning.reasoningText!.text = lastText + currentText;
-          } else if (
-            currentReasoning.reasoningText.signature != null &&
-            currentReasoning.reasoningText.signature !== ''
-          ) {
-            lastReasoning.reasoningText!.signature =
-              currentReasoning.reasoningText.signature;
-          }
-          continue;
-        }
+    const currentReasoning = block as MessageContentReasoningBlock;
+    if (currentReasoning.reasoningText != null) {
+      if (pendingReasoning?.redactedContent != null) {
+        flushPendingReasoning();
       }
 
-      result.push({
-        ...currentReasoning,
-        ...(currentReasoning.reasoningText == null
-          ? {}
-          : { reasoningText: { ...currentReasoning.reasoningText } }),
-      });
-    } else {
-      result.push(block);
+      const previousText = pendingReasoning?.reasoningText?.text;
+      const previousSignature = pendingReasoning?.reasoningText?.signature;
+      const { text, signature } = currentReasoning.reasoningText;
+      const mergedReasoningText: { text?: string; signature?: string } = {};
+      if (previousText !== undefined || text !== undefined) {
+        mergedReasoningText.text = (previousText ?? '') + (text ?? '');
+      }
+      if (previousSignature !== undefined || signature !== undefined) {
+        mergedReasoningText.signature =
+          (previousSignature ?? '') + (signature ?? '');
+      }
+      pendingReasoning = {
+        type: 'reasoning_content',
+        reasoningText: mergedReasoningText,
+      };
+
+      // A signature seals the accumulated reasoning text. Any following
+      // reasoning block starts a new independently signed Bedrock block.
+      if ('signature' in currentReasoning.reasoningText) {
+        flushPendingReasoning();
+      }
+    }
+
+    if (currentReasoning.redactedContent != null) {
+      if (pendingReasoning?.reasoningText != null) {
+        flushPendingReasoning();
+      }
+      pendingReasoning = {
+        type: 'reasoning_content',
+        redactedContent:
+          (pendingReasoning?.redactedContent ?? '') +
+          currentReasoning.redactedContent,
+      };
     }
   }
 
+  flushPendingReasoning();
   return result;
 }
 
