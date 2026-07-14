@@ -961,7 +961,7 @@ class RecordingStreamingAnthropic extends ChatAnthropic {
   }
 }
 
-test('Anthropic message_delta usage emits only output token totals', () => {
+test('Anthropic message_delta usage preserves cumulative input totals', () => {
   const event: AnthropicStreamEvent = {
     type: 'message_delta',
     context_management: null,
@@ -978,6 +978,7 @@ test('Anthropic message_delta usage emits only output token totals', () => {
       cache_read_input_tokens: 13,
       server_tool_use: null,
       iterations: null,
+      output_tokens_details: null,
     },
   };
 
@@ -987,9 +988,13 @@ test('Anthropic message_delta usage emits only output token totals', () => {
   });
 
   expect(result?.chunk.usage_metadata).toEqual({
-    input_tokens: 0,
+    input_tokens: 267,
     output_tokens: 375,
-    total_tokens: 375,
+    total_tokens: 642,
+    input_token_details: {
+      cache_creation: 11,
+      cache_read: 13,
+    },
   });
 });
 
@@ -1002,6 +1007,7 @@ test('Anthropic stream usage does not double-count cumulative input tokens', asy
         container: null,
         context_management: null,
         content: [],
+        diagnostics: null,
         model: modelName,
         role: 'assistant',
         stop_details: null,
@@ -1010,8 +1016,8 @@ test('Anthropic stream usage does not double-count cumulative input tokens', asy
         type: 'message',
         usage: {
           cache_creation: null,
-          cache_creation_input_tokens: 0,
-          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 20,
+          cache_read_input_tokens: 30,
           inference_geo: null,
           input_tokens: 243,
           iterations: null,
@@ -1019,6 +1025,7 @@ test('Anthropic stream usage does not double-count cumulative input tokens', asy
           server_tool_use: null,
           service_tier: null,
           speed: null,
+          output_tokens_details: null,
         },
       },
     },
@@ -1034,10 +1041,11 @@ test('Anthropic stream usage does not double-count cumulative input tokens', asy
       usage: {
         input_tokens: 243,
         output_tokens: 375,
-        cache_creation_input_tokens: 0,
-        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 20,
+        cache_read_input_tokens: 30,
         server_tool_use: null,
         iterations: null,
+        output_tokens_details: null,
       },
     },
     { type: 'message_stop' },
@@ -1050,12 +1058,83 @@ test('Anthropic stream usage does not double-count cumulative input tokens', asy
   }
 
   expect(full?.usage_metadata).toEqual({
-    input_tokens: 243,
+    input_tokens: 293,
     output_tokens: 375,
-    total_tokens: 618,
+    total_tokens: 668,
     input_token_details: {
-      cache_creation: 0,
-      cache_read: 0,
+      cache_creation: 20,
+      cache_read: 30,
+    },
+    output_token_details: {},
+  });
+});
+
+test('Anthropic stream usage accepts input first reported at message_delta', async () => {
+  const events: AnthropicStreamEvent[] = [
+    {
+      type: 'message_start',
+      message: {
+        id: 'msg_late_input_usage',
+        container: null,
+        context_management: null,
+        content: [],
+        diagnostics: null,
+        model: modelName,
+        role: 'assistant',
+        stop_details: null,
+        stop_reason: null,
+        stop_sequence: null,
+        type: 'message',
+        usage: {
+          cache_creation: null,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 0,
+          inference_geo: null,
+          input_tokens: 0,
+          iterations: null,
+          output_tokens: 0,
+          server_tool_use: null,
+          service_tier: null,
+          speed: null,
+          output_tokens_details: null,
+        },
+      },
+    },
+    {
+      type: 'message_delta',
+      context_management: null,
+      delta: {
+        container: null,
+        stop_details: null,
+        stop_reason: 'end_turn',
+        stop_sequence: null,
+      },
+      usage: {
+        input_tokens: 100,
+        output_tokens: 42,
+        cache_creation_input_tokens: 500,
+        cache_read_input_tokens: 200,
+        server_tool_use: null,
+        iterations: null,
+        output_tokens_details: null,
+      },
+    },
+    { type: 'message_stop' },
+  ];
+  const model = new MockStreamingAnthropic(events);
+
+  let full: AIMessageChunk | undefined;
+  for await (const chunk of await model.stream('hello')) {
+    full = !full ? chunk : concat(full, chunk);
+  }
+
+  expect(full?.usage_metadata).toEqual({
+    input_tokens: 800,
+    output_tokens: 42,
+    total_tokens: 842,
+    input_token_details: {
+      cache_creation: 500,
+      cache_read: 200,
     },
     output_token_details: {},
   });
@@ -1070,6 +1149,7 @@ test('Anthropic stream usage handles multiple cumulative message_delta events', 
         container: null,
         context_management: null,
         content: [],
+        diagnostics: null,
         model: modelName,
         role: 'assistant',
         stop_details: null,
@@ -1087,6 +1167,7 @@ test('Anthropic stream usage handles multiple cumulative message_delta events', 
           server_tool_use: null,
           service_tier: null,
           speed: null,
+          output_tokens_details: null,
         },
       },
     },
@@ -1106,6 +1187,7 @@ test('Anthropic stream usage handles multiple cumulative message_delta events', 
         cache_read_input_tokens: 0,
         server_tool_use: null,
         iterations: null,
+        output_tokens_details: null,
       },
     },
     {
@@ -1124,6 +1206,7 @@ test('Anthropic stream usage handles multiple cumulative message_delta events', 
         cache_read_input_tokens: 0,
         server_tool_use: null,
         iterations: null,
+        output_tokens_details: null,
       },
     },
     { type: 'message_stop' },

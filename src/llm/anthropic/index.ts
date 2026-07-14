@@ -19,6 +19,7 @@ import type {
   AnthropicContextManagementConfigParam,
   AnthropicRequestOptions,
 } from '@/llm/anthropic/types';
+import type { AnthropicUsageData } from './utils/message_outputs';
 import {
   _convertMessagesToAnthropicPayload,
   stripUnsupportedAssistantPrefill,
@@ -33,6 +34,18 @@ const STREAM_CHUNK_MIN_SIZE = 4;
 const STREAM_BOUNDARIES = new Set([' ', '.', ',', '!', '?', ';', ':']);
 
 type StreamTokenType = 'string' | 'input' | 'content';
+
+interface AnthropicStreamUsage {
+  inputTokens: number;
+  cacheCreationInputTokens: number;
+  cacheReadInputTokens: number;
+  outputTokens: number;
+}
+
+interface CumulativeUsageValue {
+  cumulative: number;
+  increment: number;
+}
 
 const ANTHROPIC_TOOL_BETAS: Partial<Record<string, AnthropicBeta>> = {
   tool_search_tool_regex_20251119: 'advanced-tool-use-2025-11-20',
@@ -392,27 +405,77 @@ function cloneChunk(
   return chunk;
 }
 
+function resolveCumulativeUsageValue(
+  current: number | null | undefined,
+  previous: number
+): CumulativeUsageValue {
+  if (current == null) {
+    return { cumulative: previous, increment: 0 };
+  }
+  const cumulative = Math.max(previous, current);
+  return { cumulative, increment: cumulative - previous };
+}
+
 function withIncrementalMessageDeltaUsage(
   chunk: AIMessageChunk,
-  previousOutputTokens: number
-): { chunk: AIMessageChunk; outputTokens: number } {
+  previousUsage: AnthropicStreamUsage,
+  cumulativeUsage: AnthropicUsageData
+): { chunk: AIMessageChunk; usage: AnthropicStreamUsage } {
   const usage = chunk.usage_metadata;
   if (usage == null) {
-    return { chunk, outputTokens: previousOutputTokens };
+    return { chunk, usage: previousUsage };
   }
 
-  const outputTokens = Math.max(0, usage.output_tokens - previousOutputTokens);
+  const inputTokens = resolveCumulativeUsageValue(
+    cumulativeUsage.input_tokens,
+    previousUsage.inputTokens
+  );
+  const cacheCreationInputTokens = resolveCumulativeUsageValue(
+    cumulativeUsage.cache_creation_input_tokens,
+    previousUsage.cacheCreationInputTokens
+  );
+  const cacheReadInputTokens = resolveCumulativeUsageValue(
+    cumulativeUsage.cache_read_input_tokens,
+    previousUsage.cacheReadInputTokens
+  );
+  const outputTokens = resolveCumulativeUsageValue(
+    cumulativeUsage.output_tokens,
+    previousUsage.outputTokens
+  );
+  const incrementalInputTokens =
+    inputTokens.increment +
+    cacheCreationInputTokens.increment +
+    cacheReadInputTokens.increment;
+  const hasCacheUsage =
+    cumulativeUsage.cache_creation_input_tokens != null ||
+    cumulativeUsage.cache_read_input_tokens != null;
+  const inputTokenDetails = {
+    ...(cumulativeUsage.cache_creation_input_tokens != null && {
+      cache_creation: cacheCreationInputTokens.increment,
+    }),
+    ...(cumulativeUsage.cache_read_input_tokens != null && {
+      cache_read: cacheReadInputTokens.increment,
+    }),
+  };
+
   return {
     chunk: new AIMessageChunk(
       Object.assign({}, chunk, {
         usage_metadata: {
           ...usage,
-          output_tokens: outputTokens,
-          total_tokens: usage.input_tokens + outputTokens,
+          input_tokens: incrementalInputTokens,
+          output_tokens: outputTokens.increment,
+          total_tokens: incrementalInputTokens + outputTokens.increment,
+          input_token_details: hasCacheUsage ? inputTokenDetails : undefined,
         },
       })
     ),
-    outputTokens: usage.output_tokens,
+    usage: {
+      inputTokens: inputTokens.cumulative,
+      cacheCreationInputTokens: cacheCreationInputTokens.cumulative,
+      cacheReadInputTokens: cacheReadInputTokens.cumulative,
+      outputTokens: outputTokens.cumulative,
+    },
   };
 }
 
@@ -651,7 +714,12 @@ export class CustomAnthropic extends ChatAnthropicMessages {
     });
 
     const shouldStreamUsage = options.streamUsage ?? this.streamUsage;
-    let messageDeltaOutputTokens = 0;
+    let streamUsage: AnthropicStreamUsage = {
+      inputTokens: 0,
+      cacheCreationInputTokens: 0,
+      cacheReadInputTokens: 0,
+      outputTokens: 0,
+    };
     const queuedChunks: QueuedGenerationChunk[] = [];
     const producerState: {
       done: boolean;
@@ -833,13 +901,24 @@ export class CustomAnthropic extends ChatAnthropicMessages {
           }
 
           let { chunk } = result;
+          if (data.type === 'message_start') {
+            streamUsage = {
+              ...streamUsage,
+              inputTokens: data.message.usage.input_tokens,
+              cacheCreationInputTokens:
+                data.message.usage.cache_creation_input_tokens ?? 0,
+              cacheReadInputTokens:
+                data.message.usage.cache_read_input_tokens ?? 0,
+            };
+          }
           if (data.type === 'message_delta') {
             const incremental = withIncrementalMessageDeltaUsage(
               chunk,
-              messageDeltaOutputTokens
+              streamUsage,
+              data.usage
             );
             chunk = incremental.chunk;
-            messageDeltaOutputTokens = incremental.outputTokens;
+            streamUsage = incremental.usage;
           }
 
           const [token = '', tokenType] = extractToken(chunk);

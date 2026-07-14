@@ -9,7 +9,7 @@ import type { MessageContentComplex } from '@/types';
 import { toLangChainContent } from '@/messages/langchain';
 import { extractToolCalls } from './output_parsers';
 
-interface AnthropicUsageData {
+export interface AnthropicUsageData {
   input_tokens?: number | null;
   output_tokens?: number | null;
   cache_creation_input_tokens?: number | null;
@@ -92,31 +92,18 @@ export function _makeMessageChunkFromAnthropicEvent(
         context_management: data.delta.context_management,
       });
     }
-    // `message_delta.usage` is cumulative and may carry input-side fields
-    // (input_tokens, cache_creation_input_tokens, cache_read_input_tokens) —
-    // notably from OpenAI-backed Anthropic-compatible gateways (LiteLLM,
-    // Bedrock proxies), which only know usage at stream end.
-    const deltaUsage = data.usage as typeof data.usage & {
-      input_tokens?: number | null;
-      cache_creation_input_tokens?: number | null;
-      cache_read_input_tokens?: number | null;
-    };
-    const cacheCreation = deltaUsage.cache_creation_input_tokens;
-    const cacheRead = deltaUsage.cache_read_input_tokens;
-    const inputTokens =
-      (deltaUsage.input_tokens ?? 0) + (cacheCreation ?? 0) + (cacheRead ?? 0);
-    const usageMetadata: UsageMetadata = {
-      input_tokens: inputTokens,
+    const deltaUsage: AnthropicUsageData = data.usage;
+    const hasInputUsage =
+      deltaUsage.input_tokens != null ||
+      deltaUsage.cache_creation_input_tokens != null ||
+      deltaUsage.cache_read_input_tokens != null;
+    const cumulativeUsageMetadata = hasInputUsage
+      ? getAnthropicUsageMetadata(deltaUsage)
+      : undefined;
+    const usageMetadata: UsageMetadata = cumulativeUsageMetadata ?? {
+      input_tokens: 0,
       output_tokens: data.usage.output_tokens,
-      total_tokens: inputTokens + data.usage.output_tokens,
-      ...(cacheCreation != null || cacheRead != null
-        ? {
-            input_token_details: {
-              ...(cacheCreation != null && { cache_creation: cacheCreation }),
-              ...(cacheRead != null && { cache_read: cacheRead }),
-            },
-          }
-        : {}),
+      total_tokens: data.usage.output_tokens,
     };
     return {
       chunk: new AIMessageChunk({
