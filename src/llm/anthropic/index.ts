@@ -6,6 +6,7 @@ import type {
   BaseMessage,
   MessageContentComplex,
 } from '@langchain/core/messages';
+import type { ChatModelStreamEvent } from '@langchain/core/language_models/event';
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
 import type { AnthropicInput } from '@langchain/anthropic';
 import type { Anthropic } from '@anthropic-ai/sdk';
@@ -18,6 +19,7 @@ import type {
   AnthropicMCPServerURLDefinition,
   AnthropicContextManagementConfigParam,
   AnthropicRequestOptions,
+  AnthropicMessageStreamEvent,
 } from '@/llm/anthropic/types';
 import type { AnthropicUsageData } from './utils/message_outputs';
 import {
@@ -25,6 +27,7 @@ import {
   stripUnsupportedAssistantPrefill,
 } from './utils/message_inputs';
 import { _makeMessageChunkFromAnthropicEvent } from './utils/message_outputs';
+import { convertAnthropicStream } from './utils/stream_events';
 import { handleToolChoice } from './utils/tools';
 
 const DEFAULT_STREAM_DELAY = 25;
@@ -45,6 +48,11 @@ interface AnthropicStreamUsage {
 interface CumulativeUsageValue {
   cumulative: number;
   increment: number;
+}
+
+interface AnthropicEventStream
+  extends AsyncIterable<AnthropicMessageStreamEvent> {
+  controller?: { abort: () => void };
 }
 
 const ANTHROPIC_TOOL_BETAS: Partial<Record<string, AnthropicBeta>> = {
@@ -335,6 +343,19 @@ async function waitForStreamDelay(
 
 function isSignalAborted(signal?: AbortSignal): boolean {
   return signal?.aborted === true;
+}
+
+async function* abortableAnthropicStream(
+  source: AnthropicEventStream,
+  signal?: AbortSignal
+): AsyncGenerator<AnthropicMessageStreamEvent> {
+  for await (const data of source) {
+    if (isSignalAborted(signal)) {
+      source.controller?.abort();
+      return;
+    }
+    yield data;
+  }
 }
 
 function extractToken(
@@ -686,6 +707,29 @@ export class CustomAnthropic extends ChatAnthropicMessages {
     return super.completionWithRetry(
       stripUnsupportedAssistantPrefill(request),
       options
+    );
+  }
+
+  async *_streamChatModelEvents(
+    messages: BaseMessage[],
+    options: this['ParsedCallOptions'],
+    _runManager?: CallbackManagerForLLMRun
+  ): AsyncGenerator<ChatModelStreamEvent> {
+    const params = this.invocationParams(options);
+    const formattedMessages = _convertMessagesToAnthropicPayload(messages);
+    const payload = stripUnsupportedAssistantPrefill({
+      ...params,
+      ...formattedMessages,
+      stream: true,
+    } as const);
+    const stream = await this.createStreamWithRetry(payload, {
+      headers: options.headers,
+      signal: options.signal,
+    });
+    const shouldStreamUsage = options.streamUsage ?? this.streamUsage;
+    yield* convertAnthropicStream(
+      abortableAnthropicStream(stream, options.signal),
+      { streamUsage: shouldStreamUsage }
     );
   }
 

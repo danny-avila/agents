@@ -7,14 +7,11 @@
 //
 // Applicability to our fork:
 //   Our `CustomAnthropic` (imported here as `ChatAnthropic` from `@/llm/anthropic`)
-//   extends upstream `ChatAnthropicMessages` (1.5.1). It overrides the LEGACY
-//   `_streamResponseChunks` path (used by `.stream()` / `.invoke()`), but does NOT
-//   override `_streamChatModelEvents`. That native method is therefore inherited
-//   verbatim: it calls `invocationParams` -> `_convertMessagesToAnthropicPayload`
-//   -> `createStreamWithRetry` -> `convertAnthropicStream`. Our `createStreamWithRetry`
-//   override only strips unsupported assistant prefill before delegating to super, so
-//   mocking it (as upstream's `MockStreamChatAnthropic` does) drives the real native
-//   conversion path. A probe confirmed the lifecycle/sub-streams resolve correctly.
+//   extends upstream `ChatAnthropicMessages` (1.5.1). It overrides both the legacy
+//   `_streamResponseChunks` path and `_streamChatModelEvents`, whose request setup
+//   mirrors upstream while using the local cumulative-usage converter. Mocking
+//   `createStreamWithRetry` (as upstream's `MockStreamChatAnthropic` does) drives
+//   the real native conversion path without making API calls.
 //
 // Adaptation:
 //   - vitest -> jest (`@jest/globals`; `vi.*` -> `jest.*`).
@@ -298,6 +295,50 @@ function cacheUsageEvents(): unknown[] {
   ];
 }
 
+function lateUsageEvents(): unknown[] {
+  return [
+    {
+      type: 'message_start',
+      message: {
+        id: 'msg_05MNO',
+        type: 'message',
+        role: 'assistant',
+        content: [],
+        model: 'claude-sonnet-4-20250514',
+        stop_reason: null,
+        stop_sequence: null,
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 0,
+        },
+      },
+    },
+    {
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn', stop_sequence: null },
+      usage: {
+        input_tokens: 100,
+        output_tokens: 20,
+        cache_creation_input_tokens: 500,
+        cache_read_input_tokens: 200,
+      },
+    },
+    {
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn', stop_sequence: null },
+      usage: {
+        input_tokens: 100,
+        output_tokens: 42,
+        cache_creation_input_tokens: 500,
+        cache_read_input_tokens: 200,
+      },
+    },
+    { type: 'message_stop' },
+  ];
+}
+
 // ─── Tests ───────────────────────────────────────────────────────
 
 describe('CustomAnthropic._streamChatModelEvents (inherited native)', () => {
@@ -570,6 +611,39 @@ describe('CustomAnthropic._streamChatModelEvents (inherited native)', () => {
       };
       expect(finish.usage.input_tokens).toBe(800);
       expect(finish.usage.output_tokens).toBe(3);
+    });
+
+    test('usage events preserve cumulative message_delta totals', async () => {
+      const model = new MockStreamChatAnthropic(lateUsageEvents());
+      const events = await collectEvents(model, {
+        streamUsage: true,
+      } as BaseChatModelCallOptions);
+
+      const usageEvents = events.filter((event) => event.event === 'usage');
+      const lastUsage = usageEvents[usageEvents.length - 1] as {
+        usage: {
+          input_tokens: number;
+          output_tokens: number;
+          total_tokens: number;
+          input_token_details: {
+            cache_creation: number;
+            cache_read: number;
+          };
+        };
+      };
+      const expectedUsage = {
+        input_tokens: 800,
+        output_tokens: 42,
+        total_tokens: 842,
+        input_token_details: {
+          cache_creation: 500,
+          cache_read: 200,
+        },
+      };
+      expect(lastUsage.usage).toEqual(expectedUsage);
+      expect(
+        events.find((event) => event.event === 'message-finish')
+      ).toMatchObject({ usage: expectedUsage });
     });
 
     test('no usage events when streamUsage is false', async () => {
