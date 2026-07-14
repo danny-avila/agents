@@ -1021,7 +1021,7 @@ test('Anthropic stream usage does not double-count cumulative input tokens', asy
           inference_geo: null,
           input_tokens: 243,
           iterations: null,
-          output_tokens: 0,
+          output_tokens: 7,
           server_tool_use: null,
           service_tier: null,
           speed: null,
@@ -1163,7 +1163,7 @@ test('Anthropic stream usage handles multiple cumulative message_delta events', 
           inference_geo: null,
           input_tokens: 243,
           iterations: null,
-          output_tokens: 0,
+          output_tokens: 7,
           server_tool_use: null,
           service_tier: null,
           speed: null,
@@ -1313,9 +1313,10 @@ test('Anthropic live stream usage matches raw cumulative output snapshots', asyn
   expect(model.messageDeltaOutputTokens.length).toBeGreaterThan(0);
   const rawOutputTokens =
     model.messageDeltaOutputTokens[model.messageDeltaOutputTokens.length - 1];
-  expect(full?.usage_metadata?.output_tokens).toBe(
-    model.messageStartOutputTokens + rawOutputTokens
+  expect(rawOutputTokens).toBeGreaterThanOrEqual(
+    model.messageStartOutputTokens
   );
+  expect(full?.usage_metadata?.output_tokens).toBe(rawOutputTokens);
   expect(full?.usage_metadata?.total_tokens).toBe(
     (full?.usage_metadata?.input_tokens ?? 0) +
       (full?.usage_metadata?.output_tokens ?? 0)
@@ -1327,7 +1328,7 @@ test('Anthropic live stream usage matches raw cumulative output snapshots', asyn
       0
     );
     expect(full?.usage_metadata?.output_tokens).toBeLessThan(
-      model.messageStartOutputTokens + summedOutputTokens
+      summedOutputTokens
     );
   }
 });

@@ -32,8 +32,7 @@ interface AnthropicEventUsage {
   inputTokens: number;
   cacheCreationInputTokens: number;
   cacheReadInputTokens: number;
-  messageStartOutputTokens: number;
-  messageDeltaOutputTokens: number;
+  outputTokens: number;
 }
 
 // ─── Public API ─────────────────────────────────────────────────
@@ -68,8 +67,7 @@ export async function* convertAnthropicStream(
           inputTokens: usage.input_tokens,
           cacheCreationInputTokens: usage.cache_creation_input_tokens ?? 0,
           cacheReadInputTokens: usage.cache_read_input_tokens ?? 0,
-          messageStartOutputTokens: usage.output_tokens,
-          messageDeltaOutputTokens: 0,
+          outputTokens: usage.output_tokens,
         };
         usageSnapshot = buildUsageSnapshot(eventUsage);
       }
@@ -211,10 +209,9 @@ function updateEventUsage(
       current.cache_read_input_tokens,
       previous?.cacheReadInputTokens
     ),
-    messageStartOutputTokens: previous?.messageStartOutputTokens ?? 0,
-    messageDeltaOutputTokens: getCumulativeUsageValue(
+    outputTokens: getCumulativeUsageValue(
       current.output_tokens,
-      previous?.messageDeltaOutputTokens
+      previous?.outputTokens
     ),
   };
 }
@@ -229,8 +226,7 @@ function getCumulativeUsageValue(
 function buildUsageSnapshot(usage: AnthropicEventUsage): UsageMetadata {
   const metadata = getAnthropicUsageMetadata({
     input_tokens: usage.inputTokens,
-    output_tokens:
-      usage.messageStartOutputTokens + usage.messageDeltaOutputTokens,
+    output_tokens: usage.outputTokens,
     cache_creation_input_tokens: usage.cacheCreationInputTokens,
     cache_read_input_tokens: usage.cacheReadInputTokens,
   });
@@ -291,6 +287,8 @@ function mapBlockToContentBlock(
       args: '',
       index,
     };
+  case 'web_search_tool_result':
+    return { ...block, index };
   default:
     return { type: 'non_standard' as const, value: { ...block }, index };
   }

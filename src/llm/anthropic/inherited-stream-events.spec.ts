@@ -35,6 +35,7 @@ import type {
   AnthropicStreamingMessageCreateParams,
 } from './types';
 import type { CustomAnthropicCallOptions } from './index';
+import { _convertMessagesToAnthropicPayload } from './utils/message_inputs';
 import { CustomAnthropic as ChatAnthropic } from './index';
 
 // ─── Mock model ─────────────────────────────────────────────────
@@ -269,7 +270,7 @@ function cacheUsageEvents(): unknown[] {
         stop_sequence: null,
         usage: {
           input_tokens: 100,
-          output_tokens: 0,
+          output_tokens: 1,
           cache_creation_input_tokens: 500,
           cache_read_input_tokens: 200,
         },
@@ -309,7 +310,7 @@ function lateUsageEvents(): unknown[] {
         stop_sequence: null,
         usage: {
           input_tokens: 0,
-          output_tokens: 0,
+          output_tokens: 7,
           cache_creation_input_tokens: 0,
           cache_read_input_tokens: 0,
         },
@@ -334,6 +335,49 @@ function lateUsageEvents(): unknown[] {
         cache_creation_input_tokens: 500,
         cache_read_input_tokens: 200,
       },
+    },
+    { type: 'message_stop' },
+  ];
+}
+
+function webSearchResultEvents(): unknown[] {
+  return [
+    {
+      type: 'message_start',
+      message: {
+        id: 'msg_06PQR',
+        type: 'message',
+        role: 'assistant',
+        content: [],
+        model: 'claude-sonnet-4-20250514',
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 25, output_tokens: 0 },
+      },
+    },
+    {
+      type: 'content_block_start',
+      index: 0,
+      content_block: {
+        type: 'web_search_tool_result',
+        tool_use_id: 'srvtoolu_01WEB',
+        content: [
+          {
+            type: 'web_search_result',
+            url: 'https://example.com',
+            title: 'Example',
+            encrypted_content: 'encrypted',
+            page_age: null,
+          },
+        ],
+        caller: { type: 'direct' },
+      },
+    },
+    { type: 'content_block_stop', index: 0 },
+    {
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn', stop_sequence: null },
+      usage: { output_tokens: 1 },
     },
     { type: 'message_stop' },
   ];
@@ -742,6 +786,46 @@ describe('CustomAnthropic._streamChatModelEvents (inherited native)', () => {
 
       expect(message.tool_calls?.length).toBe(1);
       expect(message.tool_calls?.[0]?.name).toBe('web_search');
+    });
+
+    test('output preserves web search results for follow-up turns', async () => {
+      const model = new MockStreamChatAnthropic(webSearchResultEvents());
+      const stream = new ChatModelStream(streamEvents(model));
+      const message = await stream.output;
+
+      expect(message.content).toEqual([
+        {
+          type: 'web_search_tool_result',
+          tool_use_id: 'srvtoolu_01WEB',
+          content: [
+            {
+              type: 'web_search_result',
+              url: 'https://example.com',
+              title: 'Example',
+              encrypted_content: 'encrypted',
+              page_age: null,
+            },
+          ],
+          caller: { type: 'direct' },
+        },
+      ]);
+
+      const payload = _convertMessagesToAnthropicPayload([message]);
+      expect(payload.messages[0]?.content).toEqual([
+        {
+          type: 'web_search_tool_result',
+          tool_use_id: 'srvtoolu_01WEB',
+          content: [
+            {
+              type: 'web_search_result',
+              url: 'https://example.com',
+              title: 'Example',
+              encrypted_content: 'encrypted',
+              page_age: null,
+            },
+          ],
+        },
+      ]);
     });
 
     test('usage sub-stream works end-to-end', async () => {

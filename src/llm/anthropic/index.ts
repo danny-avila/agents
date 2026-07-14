@@ -949,6 +949,7 @@ export class CustomAnthropic extends ChatAnthropicMessages {
             streamUsage = {
               ...streamUsage,
               inputTokens: data.message.usage.input_tokens,
+              outputTokens: data.message.usage.output_tokens,
               cacheCreationInputTokens:
                 data.message.usage.cache_creation_input_tokens ?? 0,
               cacheReadInputTokens:
