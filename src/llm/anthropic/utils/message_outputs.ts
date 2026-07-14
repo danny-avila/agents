@@ -9,7 +9,7 @@ import type { MessageContentComplex } from '@/types';
 import { toLangChainContent } from '@/messages/langchain';
 import { extractToolCalls } from './output_parsers';
 
-interface AnthropicUsageData {
+export interface AnthropicUsageData {
   input_tokens?: number | null;
   output_tokens?: number | null;
   cache_creation_input_tokens?: number | null;
@@ -92,7 +92,15 @@ export function _makeMessageChunkFromAnthropicEvent(
         context_management: data.delta.context_management,
       });
     }
-    const usageMetadata: UsageMetadata = {
+    const deltaUsage: AnthropicUsageData = data.usage;
+    const hasInputUsage =
+      deltaUsage.input_tokens != null ||
+      deltaUsage.cache_creation_input_tokens != null ||
+      deltaUsage.cache_read_input_tokens != null;
+    const cumulativeUsageMetadata = hasInputUsage
+      ? getAnthropicUsageMetadata(deltaUsage)
+      : undefined;
+    const usageMetadata: UsageMetadata = cumulativeUsageMetadata ?? {
       input_tokens: 0,
       output_tokens: data.usage.output_tokens,
       total_tokens: data.usage.output_tokens,

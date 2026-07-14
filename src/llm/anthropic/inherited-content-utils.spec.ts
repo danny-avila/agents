@@ -185,7 +185,7 @@ describe('_makeMessageChunkFromAnthropicEvent (ported from message_outputs.test.
     expect(usage.input_token_details?.cache_read).toBe(1000);
   });
 
-  it('message_delta chunk has input_tokens=0 and no cache token details', () => {
+  it('message_delta chunk preserves cumulative input and cache usage', () => {
     const event = {
       type: 'message_delta' as const,
       delta: { stop_reason: 'end_turn' as const, stop_sequence: null },
@@ -202,10 +202,15 @@ describe('_makeMessageChunkFromAnthropicEvent (ported from message_outputs.test.
     expect(result).not.toBeNull();
 
     const usage = result!.chunk.usage_metadata!;
-    expect(usage.output_tokens).toBe(42);
-    expect(usage.input_tokens).toBe(0);
-    expect(usage.input_token_details?.cache_creation).toBeUndefined();
-    expect(usage.input_token_details?.cache_read).toBeUndefined();
+    expect(usage).toEqual({
+      input_tokens: 1600,
+      output_tokens: 42,
+      total_tokens: 1642,
+      input_token_details: {
+        cache_creation: 500,
+        cache_read: 1000,
+      },
+    });
   });
 });
 

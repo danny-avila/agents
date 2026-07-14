@@ -482,8 +482,8 @@ function _formatContent(message: BaseMessage) {
     const contentBlocks = contentParts.map((contentPart) => {
       /**
        * Normalize server_tool_use blocks into a clean shape the API accepts.
-       * These blocks may arrive with the correct type (server_tool_use) or mislabeled
-       * as text/tool_use after chunk concatenation or state serialization.
+       * These blocks may arrive with the correct type (server_tool_use), as a
+       * standardized server_tool_call, or mislabeled after state serialization.
        * Regardless of current type, if the id starts with 'srvtoolu_' we rebuild
        * a clean block with only the properties the API expects.
        */
@@ -496,7 +496,7 @@ function _formatContent(message: BaseMessage) {
         'name' in contentPart
       ) {
         const rawPart = contentPart as Record<string, unknown>;
-        let input = rawPart.input;
+        let input = rawPart.input ?? rawPart.args;
         if (typeof input === 'string') {
           try {
             input = JSON.parse(input);
@@ -547,6 +547,60 @@ function _formatContent(message: BaseMessage) {
           return corrected;
         }
         return null;
+      }
+
+      /**
+       * Native ChatModelStream output standardizes client tool uses as
+       * `tool_call` blocks. Convert those blocks back to Anthropic's wire shape
+       * before the generic content formatter sees them.
+       */
+      if (
+        contentPart.type === 'tool_call' &&
+        'id' in contentPart &&
+        typeof contentPart.id === 'string' &&
+        'name' in contentPart &&
+        typeof contentPart.name === 'string' &&
+        'args' in contentPart
+      ) {
+        let args = contentPart.args;
+        if (typeof args === 'string') {
+          try {
+            args = JSON.parse(args);
+          } catch {
+            args = {};
+          }
+        }
+        if (args == null || typeof args !== 'object' || Array.isArray(args)) {
+          args = {};
+        }
+        return _convertLangChainToolCallToAnthropic({
+          id: contentPart.id,
+          name: contentPart.name,
+          args: args as Record<string, unknown>,
+        });
+      }
+
+      /**
+       * Native Anthropic thinking is exposed through the standard reasoning
+       * stream, but its signature makes it safe and necessary to round-trip.
+       * Keep unsigned or cross-provider reasoning on the existing drop path.
+       */
+      if (
+        contentPart.type === 'reasoning' &&
+        isAIMessage(message) &&
+        message.response_metadata.model_provider === 'anthropic' &&
+        'reasoning' in contentPart &&
+        typeof contentPart.reasoning === 'string' &&
+        'signature' in contentPart &&
+        typeof contentPart.signature === 'string' &&
+        contentPart.signature !== ''
+      ) {
+        const block: AnthropicThinkingBlockParam = {
+          type: 'thinking',
+          thinking: contentPart.reasoning,
+          signature: contentPart.signature,
+        };
+        return block;
       }
 
       /**
@@ -665,6 +719,9 @@ function _formatContent(message: BaseMessage) {
         const block: AnthropicCompactionBlockParam = {
           type: 'compaction' as const,
           content: compactionPart.content,
+          ...('encrypted_content' in compactionPart
+            ? { encrypted_content: compactionPart.encrypted_content }
+            : {}),
           ...(cacheControl != null ? { cache_control: cacheControl } : {}),
         };
         return block;

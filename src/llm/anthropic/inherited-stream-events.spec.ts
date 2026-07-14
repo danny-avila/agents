@@ -7,14 +7,11 @@
 //
 // Applicability to our fork:
 //   Our `CustomAnthropic` (imported here as `ChatAnthropic` from `@/llm/anthropic`)
-//   extends upstream `ChatAnthropicMessages` (1.5.1). It overrides the LEGACY
-//   `_streamResponseChunks` path (used by `.stream()` / `.invoke()`), but does NOT
-//   override `_streamChatModelEvents`. That native method is therefore inherited
-//   verbatim: it calls `invocationParams` -> `_convertMessagesToAnthropicPayload`
-//   -> `createStreamWithRetry` -> `convertAnthropicStream`. Our `createStreamWithRetry`
-//   override only strips unsupported assistant prefill before delegating to super, so
-//   mocking it (as upstream's `MockStreamChatAnthropic` does) drives the real native
-//   conversion path. A probe confirmed the lifecycle/sub-streams resolve correctly.
+//   extends upstream `ChatAnthropicMessages` (1.5.1). It overrides both the legacy
+//   `_streamResponseChunks` path and `_streamChatModelEvents`, whose request setup
+//   mirrors upstream while using the local cumulative-usage converter. Mocking
+//   `createStreamWithRetry` (as upstream's `MockStreamChatAnthropic` does) drives
+//   the real native conversion path without making API calls.
 //
 // Adaptation:
 //   - vitest -> jest (`@jest/globals`; `vi.*` -> `jest.*`).
@@ -38,6 +35,7 @@ import type {
   AnthropicStreamingMessageCreateParams,
 } from './types';
 import type { CustomAnthropicCallOptions } from './index';
+import { _convertMessagesToAnthropicPayload } from './utils/message_inputs';
 import { CustomAnthropic as ChatAnthropic } from './index';
 
 // ─── Mock model ─────────────────────────────────────────────────
@@ -272,7 +270,7 @@ function cacheUsageEvents(): unknown[] {
         stop_sequence: null,
         usage: {
           input_tokens: 100,
-          output_tokens: 0,
+          output_tokens: 1,
           cache_creation_input_tokens: 500,
           cache_read_input_tokens: 200,
         },
@@ -295,6 +293,302 @@ function cacheUsageEvents(): unknown[] {
       usage: { output_tokens: 3 },
     },
     { type: 'message_stop' },
+  ];
+}
+
+function lateUsageEvents(): unknown[] {
+  return [
+    {
+      type: 'message_start',
+      message: {
+        id: 'msg_05MNO',
+        type: 'message',
+        role: 'assistant',
+        content: [],
+        model: 'claude-sonnet-4-20250514',
+        stop_reason: null,
+        stop_sequence: null,
+        usage: {
+          input_tokens: 0,
+          output_tokens: 7,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 0,
+        },
+      },
+    },
+    {
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn', stop_sequence: null },
+      usage: {
+        input_tokens: 100,
+        output_tokens: 20,
+        cache_creation_input_tokens: 500,
+        cache_read_input_tokens: 200,
+      },
+    },
+    {
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn', stop_sequence: null },
+      usage: {
+        input_tokens: 100,
+        output_tokens: 42,
+        cache_creation_input_tokens: 500,
+        cache_read_input_tokens: 200,
+      },
+    },
+    { type: 'message_stop' },
+  ];
+}
+
+function webSearchResultEvents(): unknown[] {
+  return [
+    {
+      type: 'message_start',
+      message: {
+        id: 'msg_06PQR',
+        type: 'message',
+        role: 'assistant',
+        content: [],
+        model: 'claude-sonnet-4-20250514',
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 25, output_tokens: 0 },
+      },
+    },
+    {
+      type: 'content_block_start',
+      index: 0,
+      content_block: {
+        type: 'web_search_tool_result',
+        tool_use_id: 'srvtoolu_01WEB',
+        content: [
+          {
+            type: 'web_search_result',
+            url: 'https://example.com',
+            title: 'Example',
+            encrypted_content: 'encrypted',
+            page_age: null,
+          },
+        ],
+        caller: { type: 'direct' },
+      },
+    },
+    { type: 'content_block_stop', index: 0 },
+    {
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn', stop_sequence: null },
+      usage: { output_tokens: 1 },
+    },
+    { type: 'message_stop' },
+  ];
+}
+
+function serverToolUseEvents(): unknown[] {
+  return [
+    {
+      type: 'message_start',
+      message: {
+        id: 'msg_07STU',
+        type: 'message',
+        role: 'assistant',
+        content: [],
+        model: 'claude-sonnet-4-20250514',
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 25, output_tokens: 0 },
+      },
+    },
+    {
+      type: 'content_block_start',
+      index: 0,
+      content_block: {
+        type: 'server_tool_use',
+        id: 'srvtoolu_01SERVER',
+        name: 'web_search',
+        input: {},
+      },
+    },
+    {
+      type: 'content_block_delta',
+      index: 0,
+      delta: {
+        type: 'input_json_delta',
+        partial_json: '{"query":"weather"}',
+      },
+    },
+    { type: 'content_block_stop', index: 0 },
+    {
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn', stop_sequence: null },
+      usage: { output_tokens: 8 },
+    },
+    { type: 'message_stop' },
+  ];
+}
+
+function citationEvents(): unknown[] {
+  return [
+    {
+      type: 'message_start',
+      message: {
+        id: 'msg_08VWX',
+        type: 'message',
+        role: 'assistant',
+        content: [],
+        model: 'claude-sonnet-4-20250514',
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 25, output_tokens: 0 },
+      },
+    },
+    {
+      type: 'content_block_start',
+      index: 0,
+      content_block: { type: 'text', text: '', citations: [] },
+    },
+    {
+      type: 'content_block_delta',
+      index: 0,
+      delta: {
+        type: 'citations_delta',
+        citation: {
+          type: 'web_search_result_location',
+          cited_text: 'Example source',
+          encrypted_index: 'encrypted-index',
+          title: 'Example',
+          url: 'https://example.com',
+        },
+      },
+    },
+    {
+      type: 'content_block_delta',
+      index: 0,
+      delta: { type: 'text_delta', text: 'Cited answer.' },
+    },
+    { type: 'content_block_stop', index: 0 },
+    {
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn', stop_sequence: null },
+      usage: { output_tokens: 5 },
+    },
+    { type: 'message_stop' },
+  ];
+}
+
+function compactionEvents(): unknown[] {
+  return [
+    {
+      type: 'message_start',
+      message: {
+        id: 'msg_09YZA',
+        type: 'message',
+        role: 'assistant',
+        content: [],
+        model: 'claude-sonnet-4-20250514',
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 25, output_tokens: 0 },
+      },
+    },
+    {
+      type: 'content_block_start',
+      index: 0,
+      content_block: {
+        type: 'compaction',
+        content: null,
+        encrypted_content: null,
+      },
+    },
+    {
+      type: 'content_block_delta',
+      index: 0,
+      delta: {
+        type: 'compaction_delta',
+        content: 'Summary of the earlier conversation.',
+        encrypted_content: 'encrypted-summary',
+      },
+    },
+    { type: 'content_block_stop', index: 0 },
+    {
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn', stop_sequence: null },
+      usage: { output_tokens: 5 },
+    },
+    { type: 'message_stop' },
+  ];
+}
+
+function redactedThinkingEvents(): unknown[] {
+  return [
+    {
+      type: 'message_start',
+      message: {
+        id: 'msg_10BCD',
+        type: 'message',
+        role: 'assistant',
+        content: [],
+        model: 'claude-sonnet-4-20250514',
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 25, output_tokens: 0 },
+      },
+    },
+    {
+      type: 'content_block_start',
+      index: 0,
+      content_block: {
+        type: 'redacted_thinking',
+        data: 'encrypted-thinking',
+      },
+    },
+    { type: 'content_block_stop', index: 0 },
+    {
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn', stop_sequence: null },
+      usage: { output_tokens: 5 },
+    },
+    { type: 'message_stop' },
+  ];
+}
+
+function contextWindowExceededEvents(): unknown[] {
+  return [
+    ...textOnlyEvents().slice(0, -2),
+    {
+      type: 'message_delta',
+      delta: {
+        stop_reason: 'model_context_window_exceeded',
+        stop_sequence: null,
+      },
+      usage: { output_tokens: 2 },
+    },
+    { type: 'message_stop' },
+  ];
+}
+
+function refusalEvents(): unknown[] {
+  return [
+    ...textOnlyEvents().slice(0, -2),
+    {
+      type: 'message_delta',
+      delta: { stop_reason: 'refusal', stop_sequence: null },
+      usage: { output_tokens: 2 },
+    },
+    { type: 'message_stop' },
+  ];
+}
+
+function streamErrorEvents(): unknown[] {
+  return [
+    textOnlyEvents()[0],
+    {
+      type: 'error',
+      error: {
+        type: 'overloaded_error',
+        message: 'Anthropic stream overloaded',
+      },
+      request_id: 'req_01ERROR',
+    },
   ];
 }
 
@@ -572,6 +866,39 @@ describe('CustomAnthropic._streamChatModelEvents (inherited native)', () => {
       expect(finish.usage.output_tokens).toBe(3);
     });
 
+    test('usage events preserve cumulative message_delta totals', async () => {
+      const model = new MockStreamChatAnthropic(lateUsageEvents());
+      const events = await collectEvents(model, {
+        streamUsage: true,
+      } as BaseChatModelCallOptions);
+
+      const usageEvents = events.filter((event) => event.event === 'usage');
+      const lastUsage = usageEvents[usageEvents.length - 1] as {
+        usage: {
+          input_tokens: number;
+          output_tokens: number;
+          total_tokens: number;
+          input_token_details: {
+            cache_creation: number;
+            cache_read: number;
+          };
+        };
+      };
+      const expectedUsage = {
+        input_tokens: 800,
+        output_tokens: 42,
+        total_tokens: 842,
+        input_token_details: {
+          cache_creation: 500,
+          cache_read: 200,
+        },
+      };
+      expect(lastUsage.usage).toEqual(expectedUsage);
+      expect(
+        events.find((event) => event.event === 'message-finish')
+      ).toMatchObject({ usage: expectedUsage });
+    });
+
     test('no usage events when streamUsage is false', async () => {
       const model = new MockStreamChatAnthropic(textOnlyEvents());
       model.streamUsage = false;
@@ -651,6 +978,9 @@ describe('CustomAnthropic._streamChatModelEvents (inherited native)', () => {
 
       expect(message.id).toBe('msg_03GHI');
       expect(message._getType()).toBe('ai');
+      expect(message.response_metadata).toMatchObject({
+        model_provider: 'anthropic',
+      });
 
       const content = message.content as Array<{
         type: string;
@@ -668,6 +998,153 @@ describe('CustomAnthropic._streamChatModelEvents (inherited native)', () => {
 
       expect(message.tool_calls?.length).toBe(1);
       expect(message.tool_calls?.[0]?.name).toBe('web_search');
+    });
+
+    test('output preserves client tool calls for follow-up turns', async () => {
+      const model = new MockStreamChatAnthropic(toolCallEvents());
+      const stream = new ChatModelStream(streamEvents(model));
+      const message = await stream.output;
+
+      const payload = _convertMessagesToAnthropicPayload([message]);
+      expect(payload.messages[0]?.content).toEqual([
+        { type: 'text', text: 'Let me search.' },
+        {
+          type: 'tool_use',
+          id: 'toolu_01ABC',
+          name: 'web_search',
+          input: { query: 'weather' },
+        },
+      ]);
+    });
+
+    test('output preserves signed thinking for follow-up turns', async () => {
+      const model = new MockStreamChatAnthropic(thinkingPlusTextEvents());
+      const stream = new ChatModelStream(streamEvents(model));
+      const message = await stream.output;
+
+      const payload = _convertMessagesToAnthropicPayload([message]);
+      expect(payload.messages[0]?.content).toEqual([
+        {
+          type: 'thinking',
+          thinking: 'Let me reason...',
+          signature: 'sig_abc',
+        },
+        { type: 'text', text: 'The answer is 42.' },
+      ]);
+    });
+
+    test('output preserves citations for follow-up turns', async () => {
+      const model = new MockStreamChatAnthropic(citationEvents());
+      const stream = new ChatModelStream(streamEvents(model));
+      const message = await stream.output;
+      const citation = {
+        type: 'web_search_result_location',
+        cited_text: 'Example source',
+        encrypted_index: 'encrypted-index',
+        title: 'Example',
+        url: 'https://example.com',
+      };
+
+      expect(message.content).toEqual([
+        { type: 'text', text: 'Cited answer.', citations: [citation] },
+      ]);
+      const payload = _convertMessagesToAnthropicPayload([message]);
+      expect(payload.messages[0]?.content).toEqual([
+        { type: 'text', text: 'Cited answer.', citations: [citation] },
+      ]);
+    });
+
+    test('output preserves compaction blocks for follow-up turns', async () => {
+      const model = new MockStreamChatAnthropic(compactionEvents());
+      const stream = new ChatModelStream(streamEvents(model));
+      const message = await stream.output;
+
+      expect(message.content).toEqual([
+        {
+          type: 'compaction',
+          content: 'Summary of the earlier conversation.',
+          encrypted_content: 'encrypted-summary',
+        },
+      ]);
+      const payload = _convertMessagesToAnthropicPayload([message]);
+      expect(payload.messages[0]?.content).toEqual(message.content);
+    });
+
+    test('output preserves redacted thinking for follow-up turns', async () => {
+      const model = new MockStreamChatAnthropic(redactedThinkingEvents());
+      const stream = new ChatModelStream(streamEvents(model));
+      const message = await stream.output;
+
+      expect(message.content).toEqual([
+        { type: 'redacted_thinking', data: 'encrypted-thinking' },
+      ]);
+      const payload = _convertMessagesToAnthropicPayload([message]);
+      expect(payload.messages[0]?.content).toEqual(message.content);
+    });
+
+    test('output preserves web search results for follow-up turns', async () => {
+      const model = new MockStreamChatAnthropic(webSearchResultEvents());
+      const stream = new ChatModelStream(streamEvents(model));
+      const message = await stream.output;
+
+      expect(message.content).toEqual([
+        {
+          type: 'web_search_tool_result',
+          tool_use_id: 'srvtoolu_01WEB',
+          content: [
+            {
+              type: 'web_search_result',
+              url: 'https://example.com',
+              title: 'Example',
+              encrypted_content: 'encrypted',
+              page_age: null,
+            },
+          ],
+          caller: { type: 'direct' },
+        },
+      ]);
+
+      const payload = _convertMessagesToAnthropicPayload([message]);
+      expect(payload.messages[0]?.content).toEqual([
+        {
+          type: 'web_search_tool_result',
+          tool_use_id: 'srvtoolu_01WEB',
+          content: [
+            {
+              type: 'web_search_result',
+              url: 'https://example.com',
+              title: 'Example',
+              encrypted_content: 'encrypted',
+              page_age: null,
+            },
+          ],
+        },
+      ]);
+    });
+
+    test('output preserves server tool arguments for follow-up turns', async () => {
+      const model = new MockStreamChatAnthropic(serverToolUseEvents());
+      const stream = new ChatModelStream(streamEvents(model));
+      const message = await stream.output;
+
+      expect(message.content).toEqual([
+        {
+          type: 'server_tool_call',
+          id: 'srvtoolu_01SERVER',
+          name: 'web_search',
+          args: { query: 'weather' },
+        },
+      ]);
+
+      const payload = _convertMessagesToAnthropicPayload([message]);
+      expect(payload.messages[0]?.content).toEqual([
+        {
+          type: 'server_tool_use',
+          id: 'srvtoolu_01SERVER',
+          name: 'web_search',
+          input: { query: 'weather' },
+        },
+      ]);
     });
 
     test('usage sub-stream works end-to-end', async () => {
@@ -715,6 +1192,33 @@ describe('CustomAnthropic._streamChatModelEvents (inherited native)', () => {
       expect(text).toBe('Let me search.');
       expect(tools.length).toBe(1);
       expect(tools[0]!.name).toBe('web_search');
+    });
+  });
+
+  describe('failure and finish semantics', () => {
+    test('throws Anthropic errors emitted after the stream starts', async () => {
+      const model = new MockStreamChatAnthropic(streamErrorEvents());
+      await expect(collectEvents(model)).rejects.toThrow(
+        'Anthropic stream overloaded'
+      );
+    });
+
+    test('maps model context exhaustion to a length finish reason', async () => {
+      const model = new MockStreamChatAnthropic(contextWindowExceededEvents());
+      const events = await collectEvents(model);
+
+      expect(events.find((event) => event.event === 'message-finish')).toEqual(
+        expect.objectContaining({ reason: 'length' })
+      );
+    });
+
+    test('maps Anthropic refusals to a content-filter finish reason', async () => {
+      const model = new MockStreamChatAnthropic(refusalEvents());
+      const events = await collectEvents(model);
+
+      expect(events.find((event) => event.event === 'message-finish')).toEqual(
+        expect.objectContaining({ reason: 'content_filter' })
+      );
     });
   });
 
