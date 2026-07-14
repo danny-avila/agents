@@ -4,6 +4,7 @@ import type * as t from './types';
 import { getAttribution, createDefaultLogger } from './utils';
 import { createKeenableAPI } from './keenable-search';
 import { createTavilyAPI } from './tavily-search';
+import { createCrwAPI } from './crw-search';
 import { BaseReranker } from './rerankers';
 
 const chunker = {
@@ -489,6 +490,9 @@ export const createSearchAPI = (
     keenableApiKey,
     keenableApiUrl,
     keenableSearchOptions,
+    crwApiKey,
+    crwApiUrl,
+    crwSearchOptions,
   } = config;
 
   if (searchProvider.toLowerCase() === 'serper') {
@@ -503,9 +507,11 @@ export const createSearchAPI = (
       keenableApiUrl,
       keenableSearchOptions
     );
+  } else if (searchProvider.toLowerCase() === 'crw') {
+    return createCrwAPI(crwApiKey, crwApiUrl, crwSearchOptions);
   } else {
     throw new Error(
-      `Invalid search provider: ${searchProvider}. Must be 'serper', 'searxng', 'tavily', or 'keenable'`
+      `Invalid search provider: ${searchProvider}. Must be 'serper', 'searxng', 'tavily', 'keenable', or 'crw'`
     );
   }
 };
