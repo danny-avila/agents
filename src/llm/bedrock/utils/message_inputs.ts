@@ -761,11 +761,14 @@ function convertFromV1ToChatBedrockConverseMessage(
     role: 'assistant',
     content: [],
   };
+  let droppedUnserializableReasoning = false;
+  let hasUnconvertedContent = false;
 
   if (Array.isArray(msg.content)) {
-    for (const block of msg.content as Array<
-      MessageContentComplex | MessageContentReasoningBlock
-    >) {
+    const concatenatedBlocks = concatenateLangchainReasoningBlocks(
+      msg.content as Array<MessageContentComplex | MessageContentReasoningBlock>
+    );
+    for (const block of concatenatedBlocks) {
       if (typeof block === 'string') {
         assistantMsg.content?.push({ text: block });
       } else if (block.type === 'text') {
@@ -789,6 +792,7 @@ function convertFromV1ToChatBedrockConverseMessage(
          * (`Member must not be null`), e.g. when the producing model omitted
          * reasoning text (`thinking.display: "omitted"`) — drop rather than send. */
         if (reasoning.reasoning == null || reasoning.reasoning === '') {
+          droppedUnserializableReasoning = true;
           continue;
         }
         assistantMsg.content?.push({
@@ -799,12 +803,15 @@ function convertFromV1ToChatBedrockConverseMessage(
       } else if (block.type === 'reasoning_content') {
         const reasoningBlock = block as MessageContentReasoningBlock;
         if (!isSerializableBedrockReasoningBlock(reasoningBlock)) {
+          droppedUnserializableReasoning = true;
           continue;
         }
         assistantMsg.content?.push({
           reasoningContent:
             langchainReasoningBlockToBedrockReasoningBlock(reasoningBlock),
         } as BedrockContentBlock);
+      } else {
+        hasUnconvertedContent = true;
       }
     }
   } else if (typeof msg.content === 'string' && msg.content !== '') {
@@ -835,7 +842,11 @@ function convertFromV1ToChatBedrockConverseMessage(
     }
   }
 
-  if (assistantMsg.content == null || assistantMsg.content.length === 0) {
+  if (
+    (assistantMsg.content == null || assistantMsg.content.length === 0) &&
+    droppedUnserializableReasoning &&
+    !hasUnconvertedContent
+  ) {
     assistantMsg.content = [{ text: BEDROCK_EMPTY_TEXT_PLACEHOLDER }];
   }
 

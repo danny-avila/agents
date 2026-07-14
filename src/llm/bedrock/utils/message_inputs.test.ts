@@ -233,6 +233,58 @@ describe('convertToConverseMessages — v1 reasoning serialization', () => {
     expect(content.every((b) => typeof b.text === 'string')).toBe(true);
   });
 
+  it('merges split v1 reasoning_content text and signature blocks before serialization', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('hi'),
+      new AIMessage({
+        content: [
+          {
+            type: 'reasoning_content',
+            reasoningText: { text: 'first ' },
+          },
+          {
+            type: 'reasoning_content',
+            reasoningText: { text: 'second' },
+          },
+          {
+            type: 'reasoning_content',
+            reasoningText: { signature: 'sig-abc' },
+          },
+          { type: 'text', text: 'answer' },
+        ],
+        response_metadata: v1Metadata,
+      }),
+    ];
+
+    const content = assistantContent(convertToConverseMessages(messages));
+    const reasoning = content.filter((b) => b.reasoningContent != null);
+    expect(reasoning).toHaveLength(1);
+    expect(reasoning[0].reasoningContent?.reasoningText).toEqual({
+      text: 'first second',
+      signature: 'sig-abc',
+    });
+  });
+
+  it('does not replace unhandled v1 content with the empty-turn placeholder', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('hi'),
+      new AIMessage({
+        content: [
+          {
+            type: 'image',
+            source_type: 'base64',
+            data: 'aGVsbG8=',
+            mime_type: 'image/png',
+          } as never,
+        ],
+        response_metadata: v1Metadata,
+      }),
+    ];
+
+    const content = assistantContent(convertToConverseMessages(messages));
+    expect(content).toEqual([]);
+  });
+
   it('still converts v1 reasoning and reasoning_content blocks that carry text', () => {
     const messages: BaseMessage[] = [
       new HumanMessage('hi'),
