@@ -582,6 +582,31 @@ describe('CrwScraper', () => {
     ]);
   });
 
+  it('strips inline base64 image data-URIs from text content but keeps the screenshot', async () => {
+    const bigB64 = 'A'.repeat(5000);
+    mockedAxios.post.mockResolvedValueOnce({
+      data: {
+        success: true,
+        data: {
+          markdown: `![logo](data:image/png;base64,${bigB64}) text`,
+          html: `<img src="data:image/jpeg;base64,${bigB64}"><p>x</p>`,
+          screenshot: `data:image/png;base64,${bigB64}`,
+        },
+      },
+    });
+    const scraper = createCrwScraper({ apiKey: 'k', logger: mockLogger });
+    const [, res] = await scraper.scrapeUrl('https://example.com');
+    expect(res.data?.markdown).toBe(
+      '![logo](data:base64-content-removed) text'
+    );
+    expect(res.data?.html).toBe(
+      '<img src="data:base64-content-removed"><p>x</p>'
+    );
+    // `screenshot` is base64 by design and never reaches the content processor.
+    expect(res.data?.screenshot).toBe(`data:image/png;base64,${bigB64}`);
+    expect(res.data?.markdown).not.toContain(bigB64);
+  });
+
   describe('extractContent', () => {
     const scraper = createCrwScraper({ apiKey: 'k', logger: mockLogger });
 

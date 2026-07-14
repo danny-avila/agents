@@ -205,15 +205,35 @@ function normalizeCrwResponse(
   return {
     success: true,
     data: {
-      markdown: data.markdown,
-      html: data.html,
-      rawHtml: data.rawHtml,
-      plainText: data.plainText,
+      // Strip inline base64 image payloads from text content (not `screenshot`,
+      // which is base64 by design and never reaches the content processor).
+      markdown: stripBase64DataUris(data.markdown),
+      html: stripBase64DataUris(data.html),
+      rawHtml: stripBase64DataUris(data.rawHtml),
+      plainText: stripBase64DataUris(data.plainText),
       screenshot: data.screenshot,
       links: data.links,
       metadata: data.metadata,
     },
   };
+}
+
+/**
+ * Replace inline base64 data-URI payloads (typically images) in scraped text
+ * with a short placeholder. Such payloads can be hundreds of KB; the content
+ * processor builds a per-link RegExp from each URL, and one that large overflows
+ * the engine's pattern-size limit ("Invalid regular expression"). Firecrawl
+ * drops them via removeBase64Images — mirror that so image-heavy pages stay
+ * processable (and don't bloat the LLM context with base64 noise).
+ */
+function stripBase64DataUris(text: string | undefined): string | undefined {
+  if (text == null) {
+    return text;
+  }
+  return text.replace(
+    /data:[\w.+-]+\/[\w.+-]+;base64,[A-Za-z0-9+/=]+/g,
+    'data:base64-content-removed'
+  );
 }
 
 // Helper function to clean up payload for fastCRW
