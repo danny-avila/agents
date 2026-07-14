@@ -784,17 +784,26 @@ function convertFromV1ToChatBedrockConverseMessage(
           },
         } as BedrockContentBlock);
       } else if (block.type === 'reasoning') {
-        const reasoning = block as { reasoning: string };
+        const reasoning = block as { reasoning?: string };
+        /** Bedrock Converse rejects `reasoningText` with a null/empty `text`
+         * (`Member must not be null`), e.g. when the producing model omitted
+         * reasoning text (`thinking.display: "omitted"`) — drop rather than send. */
+        if (reasoning.reasoning == null || reasoning.reasoning === '') {
+          continue;
+        }
         assistantMsg.content?.push({
           reasoningContent: {
             reasoningText: { text: reasoning.reasoning },
           },
         } as BedrockContentBlock);
       } else if (block.type === 'reasoning_content') {
+        const reasoningBlock = block as MessageContentReasoningBlock;
+        if (!isSerializableBedrockReasoningBlock(reasoningBlock)) {
+          continue;
+        }
         assistantMsg.content?.push({
-          reasoningContent: langchainReasoningBlockToBedrockReasoningBlock(
-            block as MessageContentReasoningBlock
-          ),
+          reasoningContent:
+            langchainReasoningBlockToBedrockReasoningBlock(reasoningBlock),
         } as BedrockContentBlock);
       }
     }
@@ -824,6 +833,10 @@ function convertFromV1ToChatBedrockConverseMessage(
         } as BedrockContentBlock);
       }
     }
+  }
+
+  if (assistantMsg.content == null || assistantMsg.content.length === 0) {
+    assistantMsg.content = [{ text: BEDROCK_EMPTY_TEXT_PLACEHOLDER }];
   }
 
   return assistantMsg;

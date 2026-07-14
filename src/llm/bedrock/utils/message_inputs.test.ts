@@ -127,3 +127,136 @@ describe('convertToConverseMessages — native Bedrock reasoning serialization',
     );
   });
 });
+
+/**
+ * Same failure class, v1 converter path. Assistant messages carrying
+ * `response_metadata.output_version === 'v1'` are converted by
+ * `convertFromV1ToChatBedrockConverseMessage`, which serialized `reasoning` /
+ * `reasoning_content` blocks without the null/empty-text guard applied to the
+ * non-v1 path — a `reasoning` block whose `reasoning` is null/empty (e.g. a
+ * model responding with `thinking.display: "omitted"`, the Opus 4.7+ /
+ * Sonnet 5 default) reached Bedrock as `reasoningText: { text: null }` and the
+ * whole request was rejected with `Member must not be null`.
+ */
+describe('convertToConverseMessages — v1 reasoning serialization', () => {
+  const v1Metadata = {
+    output_version: 'v1',
+    model_provider: 'anthropic',
+  } as const;
+
+  it('drops a v1 reasoning block whose reasoning text is missing, keeping text and tool calls', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('what data do you have?'),
+      new AIMessage({
+        content: [
+          { type: 'reasoning', reasoning: undefined } as never,
+          { type: 'text', text: 'Let me check your databases.' },
+        ],
+        tool_calls: [
+          {
+            id: 'tooluse_list',
+            name: 'list_databases',
+            args: {},
+            type: 'tool_call',
+          },
+        ],
+        response_metadata: v1Metadata,
+      }),
+    ];
+
+    expect(() => convertToConverseMessages(messages)).not.toThrow();
+    const content = assistantContent(convertToConverseMessages(messages));
+
+    expect(content.find((b) => b.reasoningContent != null)).toBeUndefined();
+    expect(content.some((b) => b.text === 'Let me check your databases.')).toBe(
+      true
+    );
+    const toolUse = content.find((b) => b.toolUse != null);
+    expect(toolUse?.toolUse).toMatchObject({
+      toolUseId: 'tooluse_list',
+      name: 'list_databases',
+    });
+  });
+
+  it('drops a v1 reasoning block whose reasoning text is empty', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('hi'),
+      new AIMessage({
+        content: [
+          { type: 'reasoning', reasoning: '' },
+          { type: 'text', text: 'answer' },
+        ],
+        response_metadata: v1Metadata,
+      }),
+    ];
+
+    const content = assistantContent(convertToConverseMessages(messages));
+    expect(content.find((b) => b.reasoningContent != null)).toBeUndefined();
+    expect(content.some((b) => b.text === 'answer')).toBe(true);
+  });
+
+  it('drops a v1 signature-only reasoning_content block', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('hi'),
+      new AIMessage({
+        content: [
+          {
+            type: 'reasoning_content',
+            reasoningText: { signature: 'sig-abc' },
+          },
+          { type: 'text', text: 'answer' },
+        ],
+        response_metadata: v1Metadata,
+      }),
+    ];
+
+    expect(() => convertToConverseMessages(messages)).not.toThrow();
+    const content = assistantContent(convertToConverseMessages(messages));
+    expect(content.find((b) => b.reasoningContent != null)).toBeUndefined();
+    expect(JSON.stringify(content)).not.toContain('sig-abc');
+    expect(content.some((b) => b.text === 'answer')).toBe(true);
+  });
+
+  it('emits a placeholder (not empty content) when dropping empties a v1 turn', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('hi'),
+      new AIMessage({
+        content: [{ type: 'reasoning', reasoning: undefined } as never],
+        response_metadata: v1Metadata,
+      }),
+    ];
+
+    expect(() => convertToConverseMessages(messages)).not.toThrow();
+    const content = assistantContent(convertToConverseMessages(messages));
+    expect(content.length).toBeGreaterThan(0);
+    expect(content.find((b) => b.reasoningContent != null)).toBeUndefined();
+    expect(content.every((b) => typeof b.text === 'string')).toBe(true);
+  });
+
+  it('still converts v1 reasoning and reasoning_content blocks that carry text', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('hi'),
+      new AIMessage({
+        content: [
+          { type: 'reasoning', reasoning: 'v1 standard reasoning' },
+          {
+            type: 'reasoning_content',
+            reasoningText: { text: 'native reasoning', signature: 'sig' },
+          },
+          { type: 'text', text: 'answer' },
+        ],
+        response_metadata: v1Metadata,
+      }),
+    ];
+
+    const content = assistantContent(convertToConverseMessages(messages));
+    const reasoningTexts = content
+      .filter((b) => b.reasoningContent != null)
+      .map((b) => b.reasoningContent?.reasoningText?.text);
+    expect(reasoningTexts).toEqual([
+      'v1 standard reasoning',
+      'native reasoning',
+    ]);
+    expect(content.some((b) => b.text === 'answer')).toBe(true);
+  });
+});
