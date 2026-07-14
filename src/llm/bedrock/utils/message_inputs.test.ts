@@ -233,6 +233,38 @@ describe('convertToConverseMessages — v1 reasoning serialization', () => {
     expect(content.every((b) => typeof b.text === 'string')).toBe(true);
   });
 
+  it.each(['', ' \n '])(
+    'emits a placeholder for invalid v1 text %j',
+    (text) => {
+      const messages: BaseMessage[] = [
+        new HumanMessage('hi'),
+        new AIMessage({
+          content: [{ type: 'text', text }],
+          response_metadata: v1Metadata,
+        }),
+      ];
+
+      const content = assistantContent(convertToConverseMessages(messages));
+      expect(content).toEqual([{ text: '_' }]);
+    }
+  );
+
+  it('merges whitespace-only v1 text into the preceding text block', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('hi'),
+      new AIMessage({
+        content: [
+          { type: 'text', text: 'answer' },
+          { type: 'text', text: ' \n ' },
+        ],
+        response_metadata: v1Metadata,
+      }),
+    ];
+
+    const content = assistantContent(convertToConverseMessages(messages));
+    expect(content).toEqual([{ text: 'answer \n ' }]);
+  });
+
   it('merges split v1 reasoning_content text and signature blocks before serialization', () => {
     const splitContent = [
       {

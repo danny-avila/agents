@@ -88,6 +88,29 @@ function isSerializableBedrockReasoningBlock(
   return content.redactedContent != null && content.redactedContent !== '';
 }
 
+function appendSerializableBedrockTextBlock(
+  contentBlocks: BedrockContentBlock[],
+  text: string
+): boolean {
+  if (text === '') {
+    return false;
+  }
+  const cleanedText = text.replace(/\n/g, '').trim();
+  if (cleanedText !== '') {
+    contentBlocks.push({ text });
+    return true;
+  }
+  const lastBlock = contentBlocks[contentBlocks.length - 1] as
+    | BedrockContentBlock
+    | undefined;
+  if (lastBlock == null || !('text' in lastBlock)) {
+    return false;
+  }
+  const mergedTextContent = `${lastBlock.text}${text}`;
+  (lastBlock as { text: string }).text = mergedTextContent;
+  return true;
+}
+
 /**
  * Concatenate consecutive reasoning blocks in content array.
  */
@@ -671,23 +694,7 @@ function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
     concatenatedBlocks.forEach((block) => {
       if (block.type === 'text') {
         const text = (block as { text?: string }).text ?? '';
-        // Skip completely empty text blocks (common in AI messages with tool_use blocks)
-        if (text === '') {
-          return;
-        }
-        // Merge whitespace/newlines with previous text blocks to avoid validation errors.
-        const cleanedText = text.replace(/\n/g, '').trim();
-        if (cleanedText === '') {
-          if (contentBlocks.length > 0) {
-            const lastBlock = contentBlocks[contentBlocks.length - 1];
-            if ('text' in lastBlock) {
-              const mergedTextContent = `${lastBlock.text}${text}`;
-              (lastBlock as { text: string }).text = mergedTextContent;
-            }
-          }
-        } else {
-          contentBlocks.push({ text });
-        }
+        appendSerializableBedrockTextBlock(contentBlocks, text);
       } else if (block.type === 'reasoning_content') {
         const reasoningBlock = block as MessageContentReasoningBlock;
         // Bedrock Converse rejects reasoningContent whose reasoningText.text is
@@ -762,11 +769,12 @@ function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
 function convertFromV1ToChatBedrockConverseMessage(
   msg: BaseMessage
 ): BedrockMessage {
+  const contentBlocks: BedrockContentBlock[] = [];
   const assistantMsg: BedrockMessage = {
     role: 'assistant',
-    content: [],
+    content: contentBlocks,
   };
-  let droppedUnserializableReasoning = false;
+  let droppedUnserializableContent = false;
   let unconvertedContentType: string | undefined;
 
   if (Array.isArray(msg.content)) {
@@ -775,16 +783,21 @@ function convertFromV1ToChatBedrockConverseMessage(
     );
     for (const block of concatenatedBlocks) {
       if (typeof block === 'string') {
-        assistantMsg.content?.push({ text: block });
+        if (!appendSerializableBedrockTextBlock(contentBlocks, block)) {
+          droppedUnserializableContent = true;
+        }
       } else if (block.type === 'text') {
-        assistantMsg.content?.push({ text: (block as { text: string }).text });
+        const text = (block as { text?: string }).text ?? '';
+        if (!appendSerializableBedrockTextBlock(contentBlocks, text)) {
+          droppedUnserializableContent = true;
+        }
       } else if (block.type === 'tool_call') {
         const toolCall = block as {
           id: string;
           name: string;
           args: Record<string, unknown>;
         };
-        assistantMsg.content?.push({
+        contentBlocks.push({
           toolUse: {
             toolUseId: toolCall.id,
             name: toolCall.name,
@@ -797,10 +810,10 @@ function convertFromV1ToChatBedrockConverseMessage(
          * (`Member must not be null`), e.g. when the producing model omitted
          * reasoning text (`thinking.display: "omitted"`) — drop rather than send. */
         if (reasoning.reasoning == null || reasoning.reasoning === '') {
-          droppedUnserializableReasoning = true;
+          droppedUnserializableContent = true;
           continue;
         }
-        assistantMsg.content?.push({
+        contentBlocks.push({
           reasoningContent: {
             reasoningText: { text: reasoning.reasoning },
           },
@@ -808,10 +821,10 @@ function convertFromV1ToChatBedrockConverseMessage(
       } else if (block.type === 'reasoning_content') {
         const reasoningBlock = block as MessageContentReasoningBlock;
         if (!isSerializableBedrockReasoningBlock(reasoningBlock)) {
-          droppedUnserializableReasoning = true;
+          droppedUnserializableContent = true;
           continue;
         }
-        assistantMsg.content?.push({
+        contentBlocks.push({
           reasoningContent:
             langchainReasoningBlockToBedrockReasoningBlock(reasoningBlock),
         } as BedrockContentBlock);
@@ -819,24 +832,24 @@ function convertFromV1ToChatBedrockConverseMessage(
         unconvertedContentType ??= block.type;
       }
     }
-  } else if (typeof msg.content === 'string' && msg.content !== '') {
-    assistantMsg.content?.push({ text: msg.content });
+  } else if (typeof msg.content === 'string') {
+    if (!appendSerializableBedrockTextBlock(contentBlocks, msg.content)) {
+      droppedUnserializableContent = true;
+    }
   }
 
   // Also handle tool_calls from the message
   if (isAIMessage(msg) && msg.tool_calls != null && msg.tool_calls.length > 0) {
     // Check if tool calls are already in content
     const existingToolUseIds = new Set(
-      assistantMsg.content
-        ?.filter((c) => 'toolUse' in c)
-        .map(
-          (c) => (c as { toolUse: { toolUseId: string } }).toolUse.toolUseId
-        ) ?? []
+      contentBlocks
+        .filter((c) => 'toolUse' in c)
+        .map((c) => (c as { toolUse: { toolUseId: string } }).toolUse.toolUseId)
     );
 
     for (const tc of msg.tool_calls) {
       if (!existingToolUseIds.has(tc.id ?? '')) {
-        assistantMsg.content?.push({
+        contentBlocks.push({
           toolUse: {
             toolUseId: tc.id,
             name: tc.name,
@@ -847,15 +860,14 @@ function convertFromV1ToChatBedrockConverseMessage(
     }
   }
 
-  const hasNoContent =
-    assistantMsg.content == null || assistantMsg.content.length === 0;
+  const hasNoContent = contentBlocks.length === 0;
   if (hasNoContent && unconvertedContentType != null) {
     throw new Error(
       `Unsupported v1 content block type: ${unconvertedContentType}`
     );
   }
-  if (hasNoContent && droppedUnserializableReasoning) {
-    assistantMsg.content = [{ text: BEDROCK_EMPTY_TEXT_PLACEHOLDER }];
+  if (hasNoContent && droppedUnserializableContent) {
+    contentBlocks.push({ text: BEDROCK_EMPTY_TEXT_PLACEHOLDER });
   }
 
   return assistantMsg;
