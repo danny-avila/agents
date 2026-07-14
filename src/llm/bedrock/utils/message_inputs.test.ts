@@ -15,7 +15,10 @@ type ConverseResult = ReturnType<typeof convertToConverseMessages>;
 /** Minimal view of a converted Bedrock Converse content block the assertions read. */
 interface ConverseBlock {
   text?: string;
-  reasoningContent?: { reasoningText?: { text?: string; signature?: string } };
+  reasoningContent?: {
+    reasoningText?: { text?: string; signature?: string };
+    redactedContent?: Uint8Array;
+  };
   toolUse?: {
     toolUseId?: string;
     name?: string;
@@ -328,6 +331,27 @@ describe('convertToConverseMessages — v1 reasoning serialization', () => {
       { text: 'first', signature: 'sig-first' },
       { text: 'second', signature: 'sig-second' },
     ]);
+  });
+
+  it('keeps adjacent redacted v1 reasoning payloads separate', () => {
+    const messages: BaseMessage[] = [
+      new HumanMessage('hi'),
+      new AIMessage({
+        content: [
+          { type: 'reasoning_content', redactedContent: 'YQ==' },
+          { type: 'reasoning_content', redactedContent: 'Yg==' },
+          { type: 'text', text: 'answer' },
+        ],
+        response_metadata: v1Metadata,
+      }),
+    ];
+
+    const content = assistantContent(convertToConverseMessages(messages));
+    const redacted = content
+      .map((block) => block.reasoningContent?.redactedContent)
+      .filter((value): value is Uint8Array => value != null)
+      .map((value) => Buffer.from(value).toString('utf8'));
+    expect(redacted).toEqual(['a', 'b']);
   });
 
   it('throws instead of returning empty assistant content for an unhandled v1 block', () => {

@@ -137,10 +137,6 @@ export function concatenateLangchainReasoningBlocks(
 
     const currentReasoning = block as MessageContentReasoningBlock;
     if (currentReasoning.reasoningText != null) {
-      if (pendingReasoning?.redactedContent != null) {
-        flushPendingReasoning();
-      }
-
       const previousText = pendingReasoning?.reasoningText?.text;
       const previousSignature = pendingReasoning?.reasoningText?.signature;
       const { text, signature } = currentReasoning.reasoningText;
@@ -165,15 +161,11 @@ export function concatenateLangchainReasoningBlocks(
     }
 
     if (currentReasoning.redactedContent != null) {
-      if (pendingReasoning?.reasoningText != null) {
-        flushPendingReasoning();
-      }
-      pendingReasoning = {
+      flushPendingReasoning();
+      result.push({
         type: 'reasoning_content',
-        redactedContent:
-          (pendingReasoning?.redactedContent ?? '') +
-          currentReasoning.redactedContent,
-      };
+        redactedContent: currentReasoning.redactedContent,
+      });
     }
   }
 
