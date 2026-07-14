@@ -1130,6 +1130,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   /* Misc.*/
 
   getRunMessages(): BaseMessage[] | undefined {
+    if (this.messages == null) {
+      return this.cachedRunMessages;
+    }
     if (this.messages.length === 0 && this.cachedRunMessages != null) {
       return this.cachedRunMessages;
     }
@@ -1137,6 +1140,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   }
 
   getContentParts(): t.MessageContentComplex[] | undefined {
+    // `messages` can be null/undefined on a graph that has been disposed
+    // (clearHeavyState) but is still reachable via a cache (e.g. RedisJobStore's
+    // WeakRef) during a HITL resume/reconnect. Guard instead of dereferencing null.
+    if (this.messages == null) {
+      return undefined;
+    }
     return convertMessagesToContent(this.messages.slice(this.startIndex));
   }
 
@@ -1169,6 +1178,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
    * Get all run steps, optionally filtered by agent ID
    */
   getRunSteps(agentId?: string): t.RunStep[] {
+    // `contentData` can be null/undefined on a disposed-but-cached graph during a
+    // HITL resume/reconnect; without this guard `[...this.contentData]` throws
+    // "this.contentData is not iterable".
+    if (this.contentData == null) {
+      return [];
+    }
     if (agentId == null || agentId === '') {
       return [...this.contentData];
     }
