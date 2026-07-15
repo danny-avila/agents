@@ -576,6 +576,8 @@ export abstract class Graph<
   /** Set of invoked tool call IDs from non-message run steps completed mid-run, if any */
   invokedToolIds?: Set<string>;
   handlerRegistry: HandlerRegistry | undefined;
+  /** Host registry retained only for forwarding tools from nested child graphs. */
+  protected parentToolHandlerRegistry: HandlerRegistry | undefined;
   /**
    * True when event-driven tool execution can be routed through callbacks even
    * though this graph intentionally does not own the full handler registry.
@@ -661,6 +663,7 @@ export abstract class Graph<
     this.prelimMessageIdsByStepKey = new Map();
     this.invokedToolIds = undefined;
     this.handlerRegistry = undefined;
+    this.parentToolHandlerRegistry = undefined;
     this.hookRegistry = undefined;
     this.humanInTheLoop = undefined;
     this.toolOutputReferences = undefined;
@@ -2376,7 +2379,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       );
       if (resolvedConfigs.length > 0) {
         const getParentHandlerRegistry = (): HandlerRegistry | undefined =>
-          this.handlerRegistry;
+          this.handlerRegistry ?? this.parentToolHandlerRegistry;
         const executor = new SubagentExecutor({
           configs: new Map(resolvedConfigs.map((c) => [c.type, c])),
           parentSignal: this.signal,
@@ -2393,6 +2396,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           maxDepth: effectiveSubagentDepth,
           createChildGraph: (input): StandardGraph => {
             const childGraph = new StandardGraph(input);
+            const toolHandlerRegistry = getParentHandlerRegistry();
             childGraph.hookRegistry = this.hookRegistry;
             /**
              * Do not propagate `humanInTheLoop` into the child graph yet:
@@ -2415,8 +2419,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             // have the executable graphTool, the guard correctly applies.
             childGraph.interruptingToolNames = this.interruptingToolNames;
             childGraph.toolExecution = this.toolExecution;
+            childGraph.parentToolHandlerRegistry = toolHandlerRegistry;
             childGraph.eventToolExecutionAvailable =
-              this.handlerRegistry?.getHandler(GraphEvents.ON_TOOL_EXECUTE) !=
+              toolHandlerRegistry?.getHandler(GraphEvents.ON_TOOL_EXECUTE) !=
               null;
             return childGraph;
           },
