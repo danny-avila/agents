@@ -34,6 +34,7 @@ const DEFAULT_MAX_TURNS = 25;
 const RECURSION_MULTIPLIER = 3;
 const ERROR_MESSAGE_MAX_CHARS = 200;
 const MAX_PENDING_SUBAGENT_UPDATES = 64;
+const TASK_COMPLETED_RESULT = 'Task completed';
 
 const HOOK_FALLBACK: AggregatedHookResult = Object.freeze({
   additionalContexts: [] as string[],
@@ -141,9 +142,15 @@ type QueuedSubagentUpdate = {
   data: unknown;
 };
 
+type SubagentMessageTextResult = {
+  latestAiText?: string;
+  fallbackText?: string;
+};
+
 type ForwarderCallback = {
   handler: BaseCallbackHandler;
   drain: () => Promise<void>;
+  getStreamedMessageText: () => string | undefined;
 };
 
 const LANGGRAPH_RUNTIME_CONFIG_PREFIX = '__pregel_';
@@ -531,7 +538,10 @@ export class SubagentExecutor {
       };
     }
 
-    const filteredContent = filterSubagentResult(result.messages);
+    const filteredContent = getSubagentResultContent(
+      result.messages,
+      forwarding?.getStreamedMessageText()
+    );
 
     if (
       this.hookRegistry?.hasHookFor('SubagentStop', this.parentRunId) === true
@@ -674,7 +684,10 @@ export class SubagentExecutor {
     };
 
     const queuedUpdates: QueuedSubagentUpdate[] = [];
+    const messageTextById = new Map<string, string>();
+    const messageIdOrder: string[] = [];
     let drainPromise: Promise<void> | undefined;
+    let latestMessageId: string | undefined;
 
     const enqueue = (update: QueuedSubagentUpdate): void => {
       if (queuedUpdates.length >= MAX_PENDING_SUBAGENT_UPDATES) {
@@ -759,6 +772,19 @@ export class SubagentExecutor {
           return;
         }
         if (eventName === GraphEvents.ON_MESSAGE_DELTA) {
+          const text = extractMessageDeltaText(data);
+          if (text !== '') {
+            const messageId =
+              getMessageDeltaId(data) ?? latestMessageId ?? childRunId;
+            latestMessageId = messageId;
+            if (!messageTextById.has(messageId)) {
+              messageIdOrder.push(messageId);
+            }
+            messageTextById.set(
+              messageId,
+              `${messageTextById.get(messageId) ?? ''}${text}`
+            );
+          }
           scheduleWrap(eventName, 'message_delta', data);
           return;
         }
@@ -778,7 +804,17 @@ export class SubagentExecutor {
      * preserve phase ordering.
      */
     handler.awaitHandlers = true;
-    return { handler, drain };
+    return {
+      handler,
+      drain,
+      getStreamedMessageText: (): string | undefined => {
+        const text = messageIdOrder
+          .map((messageId) => messageTextById.get(messageId)?.trim() ?? '')
+          .filter((part) => part !== '')
+          .join('\n');
+        return text !== '' ? text : undefined;
+      },
+    };
   }
 }
 
@@ -1249,6 +1285,121 @@ function assignNumber<T extends object, K extends keyof T>(
   }
 }
 
+function getMessageDeltaId(data: unknown): string | undefined {
+  if (!isObjectLike(data)) {
+    return undefined;
+  }
+  const event = data as Partial<MessageDeltaEvent>;
+  return typeof event.id === 'string' ? event.id : undefined;
+}
+
+function extractMessageDeltaText(data: unknown): string {
+  if (!isObjectLike(data)) {
+    return '';
+  }
+  const event = data as Partial<MessageDeltaEvent>;
+  const content = event.delta?.content;
+  if (!Array.isArray(content)) {
+    return '';
+  }
+  const textParts: string[] = [];
+  for (const block of content) {
+    const text = extractTextFromContentBlock(block);
+    if (text !== '') {
+      textParts.push(text);
+    }
+  }
+  return textParts.join('');
+}
+
+function extractTextFromContentBlock(block: unknown): string {
+  if (typeof block === 'string') {
+    return block;
+  }
+  if (!isObjectLike(block)) {
+    return '';
+  }
+  if (!('type' in block) || block.type !== 'text') {
+    return '';
+  }
+  if (!('text' in block) || typeof block.text !== 'string') {
+    return '';
+  }
+  return block.text;
+}
+
+function extractMessageText(message: BaseMessage): string | undefined {
+  const { content } = message;
+
+  if (typeof content === 'string') {
+    return content !== '' ? content : undefined;
+  }
+
+  if (!Array.isArray(content)) {
+    return undefined;
+  }
+
+  const textParts: string[] = [];
+  for (const block of content) {
+    const text = extractTextFromContentBlock(block);
+    if (text !== '') {
+      textParts.push(text);
+    }
+  }
+
+  return textParts.length > 0 ? textParts.join('\n') : undefined;
+}
+
+function getSubagentMessageText(
+  messages: BaseMessage[]
+): SubagentMessageTextResult {
+  let latestAiMessageSeen = false;
+
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]._getType() !== 'ai') {
+      continue;
+    }
+
+    const text = extractMessageText(messages[i]);
+    if (!latestAiMessageSeen) {
+      latestAiMessageSeen = true;
+      if (text != null) {
+        return { latestAiText: text };
+      }
+      continue;
+    }
+
+    if (text != null) {
+      return { fallbackText: text };
+    }
+  }
+
+  return {};
+}
+
+function normalizeSubagentResultText(text?: string): string | undefined {
+  const trimmed = text?.trim();
+  return trimmed != null && trimmed !== '' && trimmed !== TASK_COMPLETED_RESULT
+    ? trimmed
+    : undefined;
+}
+
+function getSubagentResultContent(
+  messages: BaseMessage[],
+  streamedMessageText?: string
+): string {
+  const { latestAiText, fallbackText } = getSubagentMessageText(messages);
+  if (latestAiText != null) {
+    return latestAiText;
+  }
+
+  return (
+    normalizeSubagentResultText(streamedMessageText) ??
+    fallbackText ??
+    TASK_COMPLETED_RESULT
+  );
+}
+
 /**
  * Produces a short single-line label for an arbitrary forwarded child event.
  * Used to populate {@link SubagentUpdateEvent.label} so the host UI can show
@@ -1311,37 +1462,8 @@ export function summarizeEvent(eventName: string, data: unknown): string {
  * any text.
  */
 export function filterSubagentResult(messages: BaseMessage[]): string {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i]._getType() !== 'ai') {
-      continue;
-    }
-
-    const content = messages[i].content;
-
-    if (typeof content === 'string') {
-      if (content) return content;
-      continue;
-    }
-
-    if (!Array.isArray(content)) {
-      continue;
-    }
-
-    const textParts: string[] = [];
-    for (const block of content) {
-      if (typeof block === 'string') {
-        textParts.push(block);
-      } else if ('type' in block && block.type === 'text' && 'text' in block) {
-        textParts.push(block.text as string);
-      }
-    }
-
-    if (textParts.length > 0) {
-      return textParts.join('\n');
-    }
-  }
-
-  return 'Task completed';
+  const { latestAiText, fallbackText } = getSubagentMessageText(messages);
+  return latestAiText ?? fallbackText ?? TASK_COMPLETED_RESULT;
 }
 
 /**
