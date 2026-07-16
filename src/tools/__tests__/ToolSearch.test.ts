@@ -830,6 +830,58 @@ describe('ToolSearch', () => {
       },
     ];
 
+    it('finds camelCase tools by exact name', () => {
+      const tools: ToolMetadata[] = [
+        {
+          name: 'addActivity',
+          description: 'Create an activity',
+          parameters: undefined,
+        },
+        {
+          name: 'addPerson',
+          description: 'Create a person',
+          parameters: undefined,
+        },
+      ];
+
+      const result = performLocalSearch(tools, 'addPerson', ['name'], 10);
+
+      expect(result.tool_references[0].tool_name).toBe('addPerson');
+      expect(result.tool_references[0].match_score).toBe(1.0);
+    });
+
+    it('prioritizes an exact full camelCase MCP tool ID', () => {
+      const tools: ToolMetadata[] = [
+        {
+          name: 'addActivity_mcp_pipedrive',
+          description: 'Create an activity',
+          parameters: undefined,
+        },
+        {
+          name: 'addPerson_mcp_pipedrive',
+          description: 'Create a person',
+          parameters: undefined,
+        },
+        {
+          name: 'updatePerson_mcp_pipedrive',
+          description: 'Update a person',
+          parameters: undefined,
+        },
+      ];
+
+      const result = performLocalSearch(
+        tools,
+        'addPerson_mcp_pipedrive',
+        ['name'],
+        1
+      );
+
+      expect(result.tool_references[0].tool_name).toBe(
+        'addPerson_mcp_pipedrive'
+      );
+      expect(result.tool_references[0].match_score).toBe(1.0);
+    });
+
     it('searches across all tools including MCP tools', () => {
       const result = performLocalSearch(
         mcpTools,

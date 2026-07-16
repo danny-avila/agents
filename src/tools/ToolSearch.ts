@@ -361,12 +361,14 @@ function simplifyParametersForSearch(
 
 /**
  * Tokenizes a string into lowercase words for BM25.
- * Splits on underscores and non-alphanumeric characters for consistent matching.
+ * Splits camelCase, underscores, and non-alphanumeric characters for consistent matching.
  * @param text - The text to tokenize
  * @returns Array of lowercase tokens
  */
 function tokenize(text: string): string[] {
   return text
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
     .toLowerCase()
     .replace(/[^a-z0-9]/g, ' ')
     .split(/\s+/)
@@ -396,7 +398,7 @@ function createToolDocument(tool: t.ToolMetadata, fields: string[]): string {
     parts.push(paramNames);
   }
 
-  return parts.join(' ');
+  return tokenize(parts.join(' ')).join(' ');
 }
 
 /**
@@ -497,7 +499,7 @@ function performLocalSearch(
   const scores = BM25(documents, queryTokens, { k1: 1.5, b: 0.75 }) as number[];
 
   const maxScore = Math.max(...scores.filter((s) => s > 0), 1);
-  const queryLower = query.toLowerCase().trim();
+  const queryIdentifier = queryTokens.join('');
 
   const results: t.ToolSearchResult[] = [];
   for (let i = 0; i < tools.length; i++) {
@@ -509,10 +511,11 @@ function performLocalSearch(
       );
       let normalizedScore = Math.min(scores[i] / maxScore, 1.0);
 
-      const baseName = getBaseToolName(tools[i].name).toLowerCase();
-      if (baseName === queryLower) {
+      const baseName = tokenize(getBaseToolName(tools[i].name)).join('');
+      const fullName = tokenize(tools[i].name).join('');
+      if (baseName === queryIdentifier || fullName === queryIdentifier) {
         normalizedScore = 1.0;
-      } else if (baseName.startsWith(queryLower)) {
+      } else if (baseName.startsWith(queryIdentifier)) {
         normalizedScore = Math.max(normalizedScore, 0.95);
       }
 
