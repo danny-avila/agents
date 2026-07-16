@@ -31,6 +31,19 @@ const getAnthropicPayloadBlocks = (
   return content as AnthropicPayloadBlock[];
 };
 
+function summaryBlock(
+  coverageMessageId: string,
+  text: string,
+  tokenCount: number
+): MessageContentComplex {
+  return {
+    type: ContentTypes.SUMMARY,
+    content: [{ type: ContentTypes.TEXT, text }],
+    tokenCount,
+    coverage: { throughMessageId: coverageMessageId },
+  };
+}
+
 describe('formatAgentMessages', () => {
   it('should format simple user and AI messages', () => {
     const payload: TPayload = [
@@ -100,19 +113,20 @@ describe('formatAgentMessages', () => {
     expect(Object.keys(result.messages[0])).not.toContain('role');
   });
 
-  it('should prepend the latest summary and trim context before its boundary', () => {
+  it('should use the latest summary and trim only its covered context', () => {
     const payload: TPayload = [
-      { role: 'user', content: 'Old user message' },
-      { role: 'assistant', content: 'Old assistant message' },
+      { role: 'user', messageId: 'old-user', content: 'Old user message' },
       {
         role: 'assistant',
+        messageId: 'old-assistant',
+        content: 'Old assistant message',
+      },
+      {
+        role: 'assistant',
+        messageId: 'summary-message',
         content: [
-          { type: ContentTypes.TEXT, text: 'Covered by summary' },
-          {
-            type: ContentTypes.SUMMARY,
-            text: 'Conversation summary',
-            tokenCount: 12,
-          },
+          { type: ContentTypes.TEXT, text: 'Retained recent response' },
+          summaryBlock('old-assistant', 'Conversation summary', 12),
           { type: ContentTypes.TEXT, text: 'Preserved tail' },
         ],
       },
@@ -136,27 +150,111 @@ describe('formatAgentMessages', () => {
       (result.messages[0].content as MessageContentComplex[])[0]
     ).toMatchObject({
       type: ContentTypes.TEXT,
-      text: 'Preserved tail',
+      text: 'Retained recent response',
     });
-    expect(result.indexTokenCountMap?.[0]).toBeLessThan(18);
-    expect(result.indexTokenCountMap?.[0]).toBeGreaterThan(0);
+    expect(result.indexTokenCountMap?.[0]).toBe(18);
     expect(result.indexTokenCountMap?.[1]).toBe(4);
+  });
+
+  it('should ignore unresolved summary coverage and preserve raw history', () => {
+    const payload: TPayload = [
+      { role: 'user', messageId: 'raw-user', content: 'Raw request' },
+      {
+        role: 'assistant',
+        messageId: 'summary-message',
+        content: [
+          summaryBlock('raw-user', 'Older resolvable summary', 8),
+          { type: ContentTypes.TEXT, text: 'Raw response before summary' },
+          summaryBlock('missing-message', 'Unresolvable summary', 12),
+          { type: ContentTypes.TEXT, text: 'Raw response after summary' },
+        ],
+      },
+    ];
+
+    const result = formatAgentMessages(payload);
+
+    expect(result.summary).toBeUndefined();
+    expect(result.messages).toHaveLength(2);
+    expect(result.messages[0].content).toEqual([
+      { type: ContentTypes.TEXT, text: 'Raw request' },
+    ]);
+    expect(result.messages[1].content).toEqual([
+      { type: ContentTypes.TEXT, text: 'Raw response before summary' },
+      { type: ContentTypes.TEXT, text: 'Raw response after summary' },
+    ]);
+  });
+
+  it('should preserve both retained turns across a request, including five image-only parts', () => {
+    const fiveImages: MessageContentComplex[] = Array.from(
+      { length: 5 },
+      (_, index) => ({
+        type: 'image_url',
+        image_url: { url: `https://example.com/image-${index + 1}.png` },
+      })
+    );
+    const payload: TPayload = [
+      { role: 'user', messageId: 'old-user', content: 'Old request' },
+      {
+        role: 'assistant',
+        messageId: 'old-assistant',
+        content: 'Old response',
+      },
+      {
+        role: 'user',
+        messageId: 'retained-user-1',
+        content: 'Describe the uploaded set',
+      },
+      {
+        role: 'assistant',
+        messageId: 'retained-assistant-1',
+        content: 'I will compare the set.',
+      },
+      {
+        role: 'user',
+        messageId: 'retained-user-2',
+        content: fiveImages,
+      },
+      {
+        role: 'assistant',
+        messageId: 'summary-step',
+        content: [summaryBlock('old-assistant', 'Covered old turn', 10)],
+      },
+    ];
+
+    const result = formatAgentMessages(payload);
+
+    expect(result.summary?.text).toBe('Covered old turn');
+    expect(result.messages).toHaveLength(3);
+    expect(result.messages.map((message) => message.id)).toEqual([
+      'retained-user-1',
+      'retained-assistant-1',
+      'retained-user-2',
+    ]);
+    expect(result.messages[2]).toBeInstanceOf(HumanMessage);
+    expect(result.messages[2].content).toEqual(fiveImages);
   });
 
   it('should apply last-summary-wins when multiple summary blocks exist', () => {
     const payload: TPayload = [
+      { role: 'user', messageId: 'covered-old', content: 'Old request' },
       {
         role: 'assistant',
+        messageId: 'old-summary-message',
         content: [
-          { type: ContentTypes.SUMMARY, text: 'Old summary', tokenCount: 3 },
+          summaryBlock('covered-old', 'Old summary', 3),
           { type: ContentTypes.TEXT, text: 'Old tail' },
         ],
       },
       {
         role: 'assistant',
+        messageId: 'covered-new',
+        content: 'Drop this message',
+      },
+      {
+        role: 'assistant',
+        messageId: 'new-summary-message',
         content: [
-          { type: ContentTypes.TEXT, text: 'Drop this part' },
-          { type: ContentTypes.SUMMARY, text: 'Newest summary', tokenCount: 9 },
+          summaryBlock('covered-new', 'Newest summary', 9),
           { type: ContentTypes.TEXT, text: 'Keep this part' },
         ],
       },
@@ -2216,9 +2314,15 @@ describe('formatAgentMessages', () => {
       },
     ];
 
-    const result = formatAgentMessages(payload, undefined, undefined, undefined, {
-      preserveReasoningContent: true,
-    });
+    const result = formatAgentMessages(
+      payload,
+      undefined,
+      undefined,
+      undefined,
+      {
+        preserveReasoningContent: true,
+      }
+    );
 
     const toolCallMessage = result.messages[0] as AIMessage;
     expect(toolCallMessage.tool_calls).toHaveLength(1);
@@ -2254,15 +2358,19 @@ describe('formatAgentMessages', () => {
       },
     ];
 
-    const result = formatAgentMessages(payload, undefined, undefined, undefined, {
-      provider: Providers.DEEPSEEK,
-      preserveReasoningContent: false,
-    });
+    const result = formatAgentMessages(
+      payload,
+      undefined,
+      undefined,
+      undefined,
+      {
+        provider: Providers.DEEPSEEK,
+        preserveReasoningContent: false,
+      }
+    );
 
     const toolCallMessage = result.messages[0] as AIMessage;
-    expect(
-      toolCallMessage.additional_kwargs.reasoning_content
-    ).toBeUndefined();
+    expect(toolCallMessage.additional_kwargs.reasoning_content).toBeUndefined();
   });
 
   it('should preserve DeepSeek reasoning from supported hidden content blocks', () => {
@@ -4191,236 +4299,25 @@ describe('formatAgentMessages', () => {
     });
   });
 
-  describe('summary boundary token count adjustment', () => {
-    it('should proportion token count when thinking block is sliced off by boundary', () => {
-      const thinkingText = 'x'.repeat(1000);
-      const payload: TPayload = [
-        { role: 'user', content: 'Old question' },
-        {
-          role: 'assistant',
-          content: [
-            { type: ContentTypes.THINKING, thinking: thinkingText },
-            {
-              type: ContentTypes.SUMMARY,
-              text: 'Summary of conversation',
-              tokenCount: 15,
-            },
-            { type: ContentTypes.TEXT, text: 'Brief response after summary' },
-          ],
-        },
-        { role: 'user', content: 'Follow-up question' },
-      ];
-
-      const indexTokenCountMap = { 0: 5, 1: 1590, 2: 8 };
-      const result = formatAgentMessages(payload, indexTokenCountMap);
-
-      expect(result.summary).toBeDefined();
-      expect(result.summary!.text).toBe('Summary of conversation');
-
-      const boundaryMsgTokens = result.indexTokenCountMap?.[0];
-      expect(boundaryMsgTokens).toBeDefined();
-      expect(boundaryMsgTokens!).toBeLessThan(200);
-      expect(boundaryMsgTokens!).toBeGreaterThan(0);
-
-      expect(result.indexTokenCountMap?.[1]).toBe(8);
-    });
-
-    it('should proportion token count when thinking + tool_use are sliced off', () => {
-      const thinkingText = 'a'.repeat(800);
-      const toolInput = JSON.stringify({ data: 'b'.repeat(400) });
-      const payload: TPayload = [
-        {
-          role: 'assistant',
-          content: [
-            { type: ContentTypes.THINKING, thinking: thinkingText },
-            {
-              type: ContentTypes.TOOL_CALL,
-              tool_call: {
-                id: 'tc1',
-                name: 'search',
-                args: toolInput,
-                output: 'result',
-              },
-            },
-            {
-              type: ContentTypes.SUMMARY,
-              text: 'Conversation summary after tool use',
-              tokenCount: 20,
-            },
-            { type: ContentTypes.TEXT, text: 'Short tail' },
-          ],
-        },
-      ];
-
-      const indexTokenCountMap = { 0: 2000 };
-      const result = formatAgentMessages(payload, indexTokenCountMap);
-
-      expect(result.summary).toBeDefined();
-
-      const totalOutputTokens = Object.values(
-        result.indexTokenCountMap || {}
-      ).reduce((sum, v) => sum + v, 0);
-
-      expect(totalOutputTokens).toBeLessThan(200);
-      expect(totalOutputTokens).toBeGreaterThan(0);
-    });
-
-    it('should roughly halve token count when content is evenly split around boundary', () => {
-      const payload: TPayload = [
-        {
-          role: 'assistant',
-          content: [
-            { type: ContentTypes.TEXT, text: 'a'.repeat(100) },
-            {
-              type: ContentTypes.SUMMARY,
-              text: 'Mid-conversation summary',
-              tokenCount: 10,
-            },
-            { type: ContentTypes.TEXT, text: 'b'.repeat(100) },
-          ],
-        },
-      ];
-
-      const indexTokenCountMap = { 0: 500 };
-      const result = formatAgentMessages(payload, indexTokenCountMap);
-
-      expect(result.summary).toBeDefined();
-
-      const adjustedTokens = result.indexTokenCountMap?.[0] ?? 0;
-      expect(adjustedTokens).toBeGreaterThan(150);
-      expect(adjustedTokens).toBeLessThan(350);
-    });
-
-    it('should still adjust when summary is the first content part (its own text is sliced off)', () => {
-      const payload: TPayload = [
-        {
-          role: 'assistant',
-          content: [
-            {
-              type: ContentTypes.SUMMARY,
-              text: 'Summary at start',
-              tokenCount: 10,
-            },
-            { type: ContentTypes.TEXT, text: 'Everything after the summary' },
-          ],
-        },
-        { role: 'user', content: 'Next question' },
-      ];
-
-      const indexTokenCountMap = { 0: 300, 1: 10 };
-      const result = formatAgentMessages(payload, indexTokenCountMap);
-
-      expect(result.summary).toBeDefined();
-
-      const adjustedTokens = result.indexTokenCountMap?.[0] ?? 0;
-      expect(adjustedTokens).toBeLessThan(300);
-      expect(adjustedTokens).toBeGreaterThan(100);
-      expect(result.indexTokenCountMap?.[1]).toBe(10);
-    });
-
-    it('should account for tool_use input size in the char-length ratio', () => {
-      const hugeInput = JSON.stringify({ payload: 'z'.repeat(5000) });
-      const payload: TPayload = [
-        {
-          role: 'assistant',
-          content: [
-            {
-              type: 'tool_use' as ContentTypes,
-              input: hugeInput,
-            } as unknown as MessageContentComplex,
-            {
-              type: ContentTypes.SUMMARY,
-              text: 'After heavy tool use',
-              tokenCount: 12,
-            },
-            { type: ContentTypes.TEXT, text: 'Tiny tail' },
-          ],
-        },
-      ];
-
-      const indexTokenCountMap = { 0: 3000 };
-      const result = formatAgentMessages(payload, indexTokenCountMap);
-
-      expect(result.summary).toBeDefined();
-
-      const adjustedTokens = result.indexTokenCountMap?.[0] ?? 0;
-      expect(adjustedTokens).toBeLessThan(100);
-      expect(adjustedTokens).toBeGreaterThan(0);
-    });
-
-    it('should handle multiple content parts after the boundary', () => {
-      const thinkingText = 'x'.repeat(2000);
-      const payload: TPayload = [
-        {
-          role: 'assistant',
-          content: [
-            { type: ContentTypes.THINKING, thinking: thinkingText },
-            {
-              type: ContentTypes.SUMMARY,
-              text: 'Conversation checkpoint',
-              tokenCount: 14,
-            },
-            { type: ContentTypes.TEXT, text: 'Part A of the tail' },
-            {
-              type: ContentTypes.TEXT,
-              text: 'Part B of the tail with more text',
-            },
-          ],
-        },
-        { role: 'user', content: 'Next message' },
-      ];
-
-      const indexTokenCountMap = { 0: 4000, 1: 6 };
-      const result = formatAgentMessages(payload, indexTokenCountMap);
-
-      expect(result.summary).toBeDefined();
-
-      const adjustedTokens = result.indexTokenCountMap?.[0] ?? 0;
-      expect(adjustedTokens).toBeLessThan(200);
-      expect(adjustedTokens).toBeGreaterThan(0);
-
-      expect(result.indexTokenCountMap?.[1]).toBe(6);
-    });
-
-    it('should produce integer token counts after proportional adjustment', () => {
-      const payload: TPayload = [
-        {
-          role: 'assistant',
-          content: [
-            { type: ContentTypes.THINKING, thinking: 'x'.repeat(333) },
-            {
-              type: ContentTypes.SUMMARY,
-              text: 'Summary',
-              tokenCount: 5,
-            },
-            { type: ContentTypes.TEXT, text: 'y'.repeat(77) },
-          ],
-        },
-      ];
-
-      const indexTokenCountMap = { 0: 997 };
-      const result = formatAgentMessages(payload, indexTokenCountMap);
-
-      const adjustedTokens = result.indexTokenCountMap?.[0];
-      expect(adjustedTokens).toBeDefined();
-      expect(Number.isInteger(adjustedTokens)).toBe(true);
-    });
-  });
-
   describe('cross-run summary token accounting', () => {
-    it('should conserve tokens: summary boundary excludes pre-boundary messages from the map', () => {
+    it('should exclude only covered messages from the map', () => {
       const payload: TPayload = [
-        { role: 'user', content: 'Old question' },
-        { role: 'assistant', content: 'Old answer' },
+        { role: 'user', messageId: 'old-user', content: 'Old question' },
         {
           role: 'assistant',
+          messageId: 'old-assistant',
+          content: 'Old answer',
+        },
+        {
+          role: 'assistant',
+          messageId: 'summary-step',
           content: [
             { type: ContentTypes.TEXT, text: 'Text before summary' },
-            {
-              type: ContentTypes.SUMMARY,
-              text: 'This is a conversation summary capturing prior context.',
-              tokenCount: 25,
-            },
+            summaryBlock(
+              'old-assistant',
+              'This is a conversation summary capturing prior context.',
+              25
+            ),
             { type: ContentTypes.TEXT, text: 'Text after summary' },
           ],
         },
@@ -4450,23 +4347,27 @@ describe('formatAgentMessages', () => {
       expect(outputKeys).toHaveLength(3);
 
       const boundaryMsgTokens = result.indexTokenCountMap?.[0] ?? 0;
-      expect(boundaryMsgTokens).toBeLessThan(60);
-      expect(boundaryMsgTokens).toBeGreaterThan(0);
+      expect(boundaryMsgTokens).toBe(60);
       expect(result.indexTokenCountMap?.[1]).toBe(10);
       expect(result.indexTokenCountMap?.[2]).toBe(15);
     });
 
     it('should preserve summary token at index 0 when tool calls expand post-boundary messages', () => {
       const payload: TPayload = [
-        { role: 'user', content: 'Summarized away' },
+        {
+          role: 'user',
+          messageId: 'covered-user',
+          content: 'Summarized away',
+        },
         {
           role: 'assistant',
+          messageId: 'summary-step',
           content: [
-            {
-              type: ContentTypes.SUMMARY,
-              text: 'Summary of the conversation so far.',
-              tokenCount: 20,
-            },
+            summaryBlock(
+              'covered-user',
+              'Summary of the conversation so far.',
+              20
+            ),
           ],
         },
         {
@@ -4517,8 +4418,12 @@ describe('formatAgentMessages', () => {
 
     it('should produce correct maps across a simulated multi-run lifecycle', () => {
       const run1Payload: TPayload = [
-        { role: 'user', content: 'What is 2+2?' },
-        { role: 'assistant', content: 'The answer is 4.' },
+        { role: 'user', messageId: 'run1-user', content: 'What is 2+2?' },
+        {
+          role: 'assistant',
+          messageId: 'run1-assistant',
+          content: 'The answer is 4.',
+        },
       ];
       const run1Map = { 0: 10, 1: 12 };
 
@@ -4529,16 +4434,21 @@ describe('formatAgentMessages', () => {
 
       const run2Payload: TPayload = [
         ...run1Payload,
-        { role: 'user', content: 'Now multiply 4 by 10.' },
+        {
+          role: 'user',
+          messageId: 'run2-user',
+          content: 'Now multiply 4 by 10.',
+        },
         {
           role: 'assistant',
+          messageId: 'run2-summary-step',
           content: [
             { type: ContentTypes.TEXT, text: 'Sure, the answer is 40.' },
-            {
-              type: ContentTypes.SUMMARY,
-              text: 'User asked basic arithmetic: 2+2=4, then 4*10=40.',
-              tokenCount: 18,
-            },
+            summaryBlock(
+              'run2-user',
+              'User asked basic arithmetic: 2+2=4, then 4*10=40.',
+              18
+            ),
           ],
         },
       ];
@@ -4554,26 +4464,17 @@ describe('formatAgentMessages', () => {
       const run2TotalPostBoundary = Object.values(
         run2Result.indexTokenCountMap || {}
       ).reduce((sum, v) => sum + v, 0);
-      expect(run2TotalPostBoundary).toBe(0);
+      expect(run2TotalPostBoundary).toBe(50);
 
       const run3Payload: TPayload = [
-        {
-          role: 'assistant',
-          content: [
-            {
-              type: ContentTypes.SUMMARY,
-              text: 'User asked basic arithmetic: 2+2=4, then 4*10=40.',
-              tokenCount: 18,
-            },
-          ],
-        },
+        ...run2Payload,
         { role: 'user', content: 'What is the square root of 40?' },
         {
           role: 'assistant',
           content: 'The square root of 40 is approximately 6.32.',
         },
       ];
-      const run3Map = { 0: 18, 1: 15, 2: 20 };
+      const run3Map = { 0: 10, 1: 12, 2: 14, 3: 50, 4: 15, 5: 20 };
 
       const run3Result = formatAgentMessages(run3Payload, run3Map);
       expect(run3Result.summary).toBeDefined();
@@ -4585,7 +4486,7 @@ describe('formatAgentMessages', () => {
       const run3Total = Object.values(
         run3Result.indexTokenCountMap || {}
       ).reduce((sum, count) => sum + count, 0);
-      expect(run3Total).toBe(15 + 20);
+      expect(run3Total).toBe(50 + 15 + 20);
     });
   });
 });

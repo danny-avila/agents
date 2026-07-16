@@ -1,6 +1,10 @@
 /* eslint-disable no-console */
 import { RunnableLambda } from '@langchain/core/runnables';
-import { HumanMessage, SystemMessage } from '@langchain/core/messages';
+import {
+  AIMessage,
+  HumanMessage,
+  SystemMessage,
+} from '@langchain/core/messages';
 import type {
   UsageMetadata,
   BaseMessage,
@@ -226,7 +230,7 @@ export class AgentContext {
   /** Total instruction overhead: system message + tool schemas + pending summary. */
   get instructionTokens(): number {
     const summaryOverhead =
-      this._summaryLocation === 'user_message' ? this.summaryTokenCount : 0;
+      this._summaryLocation === 'history_message' ? this.summaryTokenCount : 0;
     return (
       this.systemMessageTokens +
       this.dynamicInstructionTokens +
@@ -302,10 +306,11 @@ export class AgentContext {
   /**
    * Where the summary should be injected:
    * - `'system_prompt'`: cross-run summary, included in the dynamic system tail
-   * - `'user_message'`: mid-run compaction, injected as HumanMessage on clean slate
+   * - `'history_message'`: mid-run compaction, injected as neutral assistant history
    * - `'none'`: no summary present
    */
-  private _summaryLocation: 'system_prompt' | 'user_message' | 'none' = 'none';
+  private _summaryLocation: 'system_prompt' | 'history_message' | 'none' =
+    'none';
   /**
    * Durable summary that survives reset() calls. Set from initialSummary
    * during fromConfig() and updated by setSummary() so that the latest
@@ -581,8 +586,8 @@ export class AgentContext {
 
     // Cross-run summary: include in the system tail so the model has context
     // from the prior run without invalidating the cacheable prefix. Mid-run
-    // summaries are injected as a HumanMessage on the post-compaction clean
-    // slate instead (see buildSystemRunnable).
+    // summaries are injected as neutral assistant history on the
+    // post-compaction clean slate instead (see buildSystemRunnable).
     if (
       this._summaryLocation === 'system_prompt' &&
       this.summaryText != null &&
@@ -640,7 +645,7 @@ export class AgentContext {
       >
     | undefined {
     const hasMidRunSummary =
-      this._summaryLocation === 'user_message' &&
+      this._summaryLocation === 'history_message' &&
       this.summaryText != null &&
       this.summaryText !== '';
 
@@ -678,13 +683,13 @@ export class AgentContext {
       // cache markers separately so addCacheControl doesn't strip the
       // SystemMessage's own cache_control breakpoint set above.
       const hasSummaryBody =
-        this._summaryLocation === 'user_message' &&
+        this._summaryLocation === 'history_message' &&
         this.summaryText != null &&
         this.summaryText !== '';
 
       const bodyWithSummary =
         hasSummaryBody && promptCacheProvider == null
-          ? [this.buildSummaryHumanMessage(promptCacheProvider), ...messages]
+          ? [this.buildSummaryHistoryMessage(), ...messages]
           : messages;
       const dynamicTail = this.buildPromptCacheDynamicTail({
         dynamicInstructions,
@@ -712,30 +717,10 @@ export class AgentContext {
     }).withConfig({ runName: 'prompt' });
   }
 
-  private buildSummaryHumanMessage(
-    promptCacheProvider: PromptCacheProvider | undefined
-  ): HumanMessage {
-    const wrappedSummary =
-      '<summary>\n' +
-      (this.summaryText as string) +
-      '\n</summary>\n\n' +
-      'This is your own checkpoint: you wrote it to preserve context after compaction. Pick up where you left off based on the summary above. Do not repeat prior tasks, information or acknowledge this checkpoint message directly.';
-
-    if (promptCacheProvider !== Providers.ANTHROPIC) {
-      return new HumanMessage(wrappedSummary);
-    }
-
-    return new HumanMessage({
-      content: [
-        {
-          type: 'text',
-          text: wrappedSummary,
-          cache_control: buildAnthropicCacheControl(
-            this.getPromptCacheTtl(Providers.ANTHROPIC)
-          ),
-        },
-      ],
-    });
+  private buildSummaryHistoryMessage(): AIMessage {
+    return new AIMessage(
+      '<summary>\n' + (this.summaryText as string) + '\n</summary>'
+    );
   }
 
   private buildPromptCacheDynamicTail({
@@ -761,7 +746,7 @@ export class AgentContext {
       return dynamicTail;
     }
 
-    return [...dynamicTail, this.buildSummaryHumanMessage(undefined)];
+    return [...dynamicTail, this.buildSummaryHistoryMessage()];
   }
 
   private buildBodyWithPromptCacheDynamicTail(
@@ -1237,7 +1222,7 @@ export class AgentContext {
   setSummary(text: string, tokenCount: number): void {
     this.summaryText = text;
     this.summaryTokenCount = tokenCount;
-    this._summaryLocation = 'user_message';
+    this._summaryLocation = 'history_message';
     this._durableSummaryText = text;
     this._durableSummaryTokenCount = tokenCount;
     this._summaryVersion += 1;
@@ -1272,11 +1257,6 @@ export class AgentContext {
 
   hasSummary(): boolean {
     return this.summaryText != null && this.summaryText !== '';
-  }
-
-  /** True when a mid-run compaction summary is ready to be injected as a HumanMessage. */
-  hasPendingCompactionSummary(): boolean {
-    return this._summaryLocation === 'user_message' && this.hasSummary();
   }
 
   getSummaryText(): string | undefined {

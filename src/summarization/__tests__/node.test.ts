@@ -186,7 +186,10 @@ describe('createSummarizeNode', () => {
 
     await node(
       {
-        messages: [new HumanMessage('Hello'), new HumanMessage('World')],
+        messages: [
+          new HumanMessage({ id: 'message-1', content: 'Hello' }),
+          new HumanMessage({ id: 'message-2', content: 'World' }),
+        ],
         summarizationRequest: {
           remainingContextTokens: 1000,
           agentId: 'agent_0',
@@ -211,6 +214,9 @@ describe('createSummarizeNode', () => {
           .content?.[0] as { text: string } | undefined
       )?.text
     ).toBe('Test summary output');
+    expect(
+      (completeEvent?.data as t.SummarizeCompleteEvent).summary?.coverage
+    ).toEqual({ throughMessageId: 'message-2' });
     expect(
       (completeEvent?.data as t.SummarizeCompleteEvent).error
     ).toBeUndefined();
@@ -596,7 +602,7 @@ describe('createSummarizeNode', () => {
     expect(capturedMessages[3].type).toBe('human');
     // The last message should contain the summarization prompt
     expect(capturedMessages[3].content).toContain(
-      'context window is filling up'
+      'Produce a concise, declarative historical record'
     );
   });
 
@@ -656,7 +662,7 @@ describe('createSummarizeNode', () => {
     // The last message should contain the update prompt (prior summary exists)
     const lastMsg = capturedMessages[capturedMessages.length - 1];
     expect(lastMsg.type).toBe('human');
-    expect(lastMsg.content).toContain('Merge the new messages');
+    expect(lastMsg.content).toContain('merging the newly supplied messages');
     // Should include the prior summary
     expect(lastMsg.content).toContain('<previous-summary>');
     expect(lastMsg.content).toContain('Prior summary content');
@@ -675,6 +681,12 @@ describe('DEFAULT_SUMMARIZATION_PROMPT', () => {
     expect(DEFAULT_SUMMARIZATION_PROMPT).toContain('## Key Decisions');
     expect(DEFAULT_SUMMARIZATION_PROMPT).toContain('## Next Steps');
   });
+
+  it('uses neutral task wording without jailbreak-shaped controls', () => {
+    expect(DEFAULT_SUMMARIZATION_PROMPT).not.toMatch(
+      /hold on|ground truth|don't fact-check|only the checkpoint/i
+    );
+  });
 });
 
 describe('DEFAULT_UPDATE_SUMMARIZATION_PROMPT', () => {
@@ -684,14 +696,18 @@ describe('DEFAULT_UPDATE_SUMMARIZATION_PROMPT', () => {
   });
 
   it('instructs merging new content', () => {
-    expect(DEFAULT_UPDATE_SUMMARIZATION_PROMPT).toMatch(
-      /Merge the new messages/i
-    );
+    expect(DEFAULT_UPDATE_SUMMARIZATION_PROMPT).toMatch(/merging the newly/i);
   });
 
   it('instructs updating progress tracking', () => {
     expect(DEFAULT_UPDATE_SUMMARIZATION_PROMPT).toMatch(/Done/);
     expect(DEFAULT_UPDATE_SUMMARIZATION_PROMPT).toMatch(/In Progress/);
+  });
+
+  it('uses neutral task wording without jailbreak-shaped controls', () => {
+    expect(DEFAULT_UPDATE_SUMMARIZATION_PROMPT).not.toMatch(
+      /hold on|ground truth|don't fact-check|only the checkpoint/i
+    );
   });
 });
 

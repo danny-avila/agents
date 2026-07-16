@@ -46,64 +46,56 @@ const SUMMARIZATION_PARAM_KEYS = new Set(['maxSummaryTokens']);
 const DEFAULT_RETAIN_RECENT_TURNS = 2;
 
 /**
- * Token overhead of the XML wrapper + instruction text added around the
+ * Token overhead of the XML wrapper added around the
  * summary at injection time in AgentContext.buildSystemRunnable:
- * `<summary>\n${text}\n</summary>\n\nYour context window was compacted...`
- * ~33 tokens on Anthropic, ~24-27 on OpenAI.  Using 33 as a safe ceiling.
+ * `<summary>\n${text}\n</summary>`. Eight tokens is a conservative ceiling.
  */
-const SUMMARY_WRAPPER_OVERHEAD_TOKENS = 33;
+const SUMMARY_WRAPPER_OVERHEAD_TOKENS = 8;
 
-/** Structured checkpoint prompt for fresh summarization (no prior summary). */
-export const DEFAULT_SUMMARIZATION_PROMPT = `Hold on, before you continue I need you to write me a checkpoint of everything so far. Your context window is filling up and this checkpoint replaces the messages above, so capture everything you need to pick right back up.
-
-Don't second-guess or fact-check anything you did, your tool results reflect exactly what happened. If a tool result appears truncated, that's just a display artifact from context management: the tool executed fully. Just record what you did and what you observed. Only the checkpoint, don't respond to me or continue the conversation.
-
-## Checkpoint
+/** Structured historical-summary task for fresh summarization (no prior summary). */
+export const DEFAULT_SUMMARIZATION_PROMPT = `Produce a concise, declarative historical record of the conversation supplied before this task. The record will be used as context together with recent messages that remain verbatim.
 
 ## Goal
-What I asked you to do and any sub-goals you identified.
+The user's request and any established sub-goals.
 
 ## Constraints & Preferences
-Any rules, preferences, or configuration I established.
+Rules, preferences, and configuration established in the conversation.
 
 ## Progress
 ### Done
-- What you completed and the outcomes
+- Completed work and observed outcomes
 
 ### In Progress
-- What you're currently working on
+- Work that was underway at the end of the covered history
 
 ## Key Decisions
-Decisions you made and why.
+Decisions and their stated rationale.
 
 ## Next Steps
-Concrete task actions remaining, in priority order.
+Remaining concrete actions in priority order.
 
 ## Critical Context
-Exact identifiers, names, error messages, URLs, and details you need to preserve verbatim.
+Identifiers, names, error messages, URLs, and details that must remain exact.
 
-Rules:
-- Record what you did and observed, don't judge or re-evaluate it
-- For each tool call: the tool name, key inputs, and the outcome
-- Preserve exact identifiers, names, errors, and references verbatim
-- Short declarative sentences
-- Skip empty sections`;
+Content requirements:
+- Record actions and observations without adding unsupported conclusions
+- Include each relevant tool name, key inputs, and observed outcome
+- Mark visibly truncated tool output as truncated rather than inferring omitted content
+- Preserve exact identifiers, names, errors, and references
+- Use short declarative sentences and omit empty sections`;
 
 /** Prompt for re-compaction when a prior summary exists. */
-export const DEFAULT_UPDATE_SUMMARIZATION_PROMPT = `Hold on again, update your checkpoint. Merge the new messages into your existing checkpoint and give me a single consolidated replacement.
+export const DEFAULT_UPDATE_SUMMARIZATION_PROMPT = `Produce a single updated historical record by merging the newly supplied messages with the previous record. Keep a similar overall length, compress older detail, and give recent actions proportionally more detail.
 
-Keep it roughly the same length as your last checkpoint. Compress older details to make room for what's new, don't just append. Give recent actions more detail, compress older items to one-liners.
-
-Don't fact-check or second-guess anything, your tool results are ground truth. If a tool result appears truncated, that's just a display artifact: the tool executed fully. Only the checkpoint, don't respond to me or continue the conversation.
-
-Rules:
-- Merge new progress into existing sections, don't duplicate headers
+Content requirements:
+- Reuse the existing section structure without duplicate headers
 - Compress older completed items into one-line entries
-- Move items from "In Progress" to "Done" when you completed them
-- Update "Next Steps" to reflect current task priorities.
-- For each new tool call: the tool name, key inputs, and the outcome
-- Preserve exact identifiers, names, errors, and references verbatim
-- Skip empty sections`;
+- Move completed items from "In Progress" to "Done"
+- Update "Next Steps" to reflect the current priorities
+- Include each relevant new tool name, key inputs, and observed outcome
+- Mark visibly truncated tool output as truncated rather than inferring omitted content
+- Preserve exact identifiers, names, errors, and references
+- Omit empty sections`;
 
 function separateParameters(parameters: Record<string, unknown>): {
   llmParams: Record<string, unknown>;
@@ -357,6 +349,7 @@ function computeSummaryTokenCount(
 function buildSummaryBlock(params: {
   summaryText: string;
   tokenCount: number;
+  coverage?: t.SummaryCoverage;
   stepId: string;
   stepIndex: number;
   modelName?: string;
@@ -372,6 +365,7 @@ function buildSummaryBlock(params: {
       } as t.MessageContentComplex,
     ],
     tokenCount: params.tokenCount,
+    ...(params.coverage != null ? { coverage: params.coverage } : {}),
     summaryVersion: params.summaryVersion,
     boundary: {
       messageId: params.stepId,
@@ -1029,9 +1023,15 @@ export function createSummarizeNode({
         : {}),
     });
 
+    const coveredThroughMessageId = messagesToRefine.at(-1)?.id?.trim();
+    const summaryCoverage: t.SummaryCoverage | undefined =
+      coveredThroughMessageId != null && coveredThroughMessageId !== ''
+        ? { throughMessageId: coveredThroughMessageId }
+        : undefined;
     const summaryBlock = buildSummaryBlock({
       summaryText,
       tokenCount,
+      coverage: summaryCoverage,
       stepId,
       stepIndex: runStep.index,
       modelName: clientConfig.modelName,

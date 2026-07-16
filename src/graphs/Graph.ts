@@ -96,6 +96,73 @@ const { AGENT, TOOLS, SUMMARIZE } = GraphNodeKeys;
 /** Minimum relative variance before calibrated toolSchemaTokens overrides current value. */
 const CALIBRATION_VARIANCE_THRESHOLD = 0.15;
 
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  if (value == null || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function getToolBindingName(toolBinding: unknown): string | undefined {
+  if (
+    toolBinding == null ||
+    (typeof toolBinding !== 'object' && typeof toolBinding !== 'function') ||
+    !('name' in toolBinding)
+  ) {
+    return undefined;
+  }
+  return typeof toolBinding.name === 'string' ? toolBinding.name : undefined;
+}
+
+/** Applies explicit tool controls emitted after the latest real user turn. */
+export function filterToolsForCurrentTurn(
+  messages: BaseMessage[],
+  tools: t.GraphTools | undefined
+): t.GraphTools | undefined {
+  if (tools == null || tools.length === 0) {
+    return tools;
+  }
+
+  let latestHumanIndex = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].getType() === 'human') {
+      latestHumanIndex = i;
+      break;
+    }
+  }
+  if (latestHumanIndex < 0) {
+    return tools;
+  }
+
+  const disabledTools = new Set<string>();
+  for (let i = latestHumanIndex + 1; i < messages.length; i++) {
+    const message = messages[i];
+    if (!(message instanceof ToolMessage) || !isPlainRecord(message.artifact)) {
+      continue;
+    }
+    const toolControl = message.artifact.toolControl;
+    if (
+      !isPlainRecord(toolControl) ||
+      !Array.isArray(toolControl.disableTools)
+    ) {
+      continue;
+    }
+    for (const name of toolControl.disableTools) {
+      if (typeof name === 'string' && name.trim() !== '') {
+        disabledTools.add(name.trim());
+      }
+    }
+  }
+
+  if (disabledTools.size === 0) {
+    return tools;
+  }
+  return tools.filter(
+    (toolBinding) => !disabledTools.has(getToolBindingName(toolBinding) ?? '')
+  ) as t.GraphTools;
+}
+
 /**
  * Start index of the span post-prune formatters can mutate in place: the
  * trailing tool batch plus its owning AI message (artifact formatting touches
@@ -1450,10 +1517,14 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         agentContext.markToolsAsDiscovered(discoveredNames);
       }
 
-      const rawToolsForBinding = resolveLocalToolsForBinding({
+      const resolvedToolsForBinding = resolveLocalToolsForBinding({
         tools: agentContext.getToolsForBinding(),
         toolExecution: this.toolExecution,
       });
+      const rawToolsForBinding = filterToolsForCurrentTurn(
+        messages,
+        resolvedToolsForBinding
+      );
 
       /**
        * Anthropic prompt-cache breakpoint on the tool definitions.
@@ -1759,6 +1830,21 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         }
       }
 
+      const latestHumanMessage = messages.findLast(
+        (message) => message.getType() === 'human'
+      );
+      if (
+        latestHumanMessage != null &&
+        !messagesToUse.includes(latestHumanMessage)
+      ) {
+        throw new Error(
+          JSON.stringify({
+            type: 'current_turn_exceeds_context',
+            info: 'The latest user turn could not fit in the model context without losing structured content. Increase maxContextTokens or shorten the turn.',
+          })
+        );
+      }
+
       let finalMessages = messagesToUse;
       /** Tail snapshot for the dispatch-time usage delta: in-place
        *  formatters (artifact appends, Bedrock content rewrites, legacy
@@ -1983,10 +2069,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         (agentContext.clientOptions as t.LLMConfig | undefined)?.fallbacks ??
         [];
 
-      if (
-        finalMessages.length === 0 &&
-        !agentContext.hasPendingCompactionSummary()
-      ) {
+      if (finalMessages.length === 0) {
         const budgetBreakdown = agentContext.getTokenBudgetBreakdown(messages);
         const breakdown = agentContext.formatTokenBudgetBreakdown(messages);
         const instructionsExceedBudget =

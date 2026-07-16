@@ -1,16 +1,35 @@
+import { z } from 'zod';
+import { tool } from '@langchain/core/tools';
 import { ChatGenerationChunk } from '@langchain/core/outputs';
 import { FakeListChatModel } from '@langchain/core/utils/testing';
-import { AIMessageChunk, HumanMessage } from '@langchain/core/messages';
+import {
+  AIMessage,
+  AIMessageChunk,
+  HumanMessage,
+  ToolMessage,
+} from '@langchain/core/messages';
+import type {
+  BaseMessage,
+  MessageContent,
+  UsageMetadata,
+} from '@langchain/core/messages';
 import type { CallbackManagerForLLMRun } from '@langchain/core/callbacks/manager';
-import type { BaseMessage, UsageMetadata } from '@langchain/core/messages';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { OpenAIClient } from '@langchain/openai';
 import type * as t from '@/types';
-import { ContentTypes, GraphEvents, Providers, StepTypes } from '@/common';
+import {
+  Constants,
+  ContentTypes,
+  GraphEvents,
+  Providers,
+  StepTypes,
+} from '@/common';
 import { ChatModelStreamHandler, createContentAggregator } from '@/stream';
 import { ModelEndHandler, ToolEndHandler } from '@/events';
 import { toLangChainContent } from '@/messages/langchain';
+import { filterToolsForCurrentTurn } from '../Graph';
 import { ChatOpenRouter } from '@/llm/openrouter';
+import { ToolNode } from '@/tools/ToolNode';
 import { Run } from '@/run';
 
 type ReasoningKey = 'reasoning_content' | 'reasoning';
@@ -51,6 +70,15 @@ class InvokeOnlyMessageModel implements t.ChatModel {
     _config?: RunnableConfig
   ): Promise<AIMessageChunk> {
     return this.message;
+  }
+}
+
+class CapturingMessageModel implements t.ChatModel {
+  readonly invocations: BaseMessage[][] = [];
+
+  async invoke(messages: BaseMessage[]): Promise<AIMessageChunk> {
+    this.invocations.push(messages);
+    return new AIMessageChunk('ok');
   }
 }
 
@@ -1656,5 +1684,216 @@ describe('StandardGraph final response reasoning fallback', () => {
       { type: ContentTypes.THINK, think: reasoningText },
       { type: ContentTypes.TEXT, text },
     ]);
+  });
+
+  it('keeps an image-only latest user turn as the exact message passed to the provider', async () => {
+    const fiveImages: MessageContent = Array.from(
+      { length: 5 },
+      (_, index) => ({
+        type: 'image_url',
+        image_url: { url: `https://example.com/image-${index + 1}.png` },
+      })
+    );
+    const older = new HumanMessage('older turn');
+    const latest = new HumanMessage({ content: fiveImages });
+    const run = await Run.create<t.IState>({
+      runId: 'latest-image-turn-retained',
+      graphConfig: { type: 'standard', llmConfig },
+      skipCleanup: true,
+    });
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+
+    const graph = run.Graph;
+    const agentContext = graph.agentContexts.get('default');
+    if (!agentContext) {
+      throw new Error('Expected default agent context');
+    }
+    agentContext.pruneMessages = () => ({
+      context: [latest],
+      indexTokenCountMap: { 1: 5 },
+      messagesToRefine: [older],
+      prePruneContextTokens: 20,
+      remainingContextTokens: 5,
+      contextPressure: 0.8,
+      calibrationRatio: 1,
+      contextBudget: 25,
+      effectiveInstructionTokens: 0,
+    });
+    const model = new CapturingMessageModel();
+    graph.overrideModel = model;
+
+    await graph.createCallModel('default')(
+      { messages: [older, latest] },
+      {
+        ...config,
+        metadata: {
+          thread_id: 'latest-image-turn-retained',
+          langgraph_node: 'agent=default',
+          langgraph_step: 0,
+          checkpoint_ns: '',
+        },
+      }
+    );
+
+    expect(model.invocations).toHaveLength(1);
+    expect(model.invocations[0]).toHaveLength(1);
+    expect(model.invocations[0][0]).toBe(latest);
+    expect(model.invocations[0][0].content).toBe(fiveImages);
+    expect(model.invocations[0][0].content).toHaveLength(5);
+  });
+
+  it('fails before provider invocation when pruning loses the latest user turn', async () => {
+    const older = new HumanMessage('older turn');
+    const latest = new HumanMessage({
+      content: [
+        {
+          type: 'image_url',
+          image_url: { url: 'https://example.com/latest.png' },
+        },
+      ],
+    });
+    const run = await Run.create<t.IState>({
+      runId: 'latest-image-turn-lost',
+      graphConfig: { type: 'standard', llmConfig },
+      skipCleanup: true,
+    });
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+
+    const graph = run.Graph;
+    const agentContext = graph.agentContexts.get('default');
+    if (!agentContext) {
+      throw new Error('Expected default agent context');
+    }
+    agentContext.pruneMessages = () => ({
+      context: [older],
+      indexTokenCountMap: { 0: 5 },
+      messagesToRefine: [latest],
+      prePruneContextTokens: 20,
+      remainingContextTokens: 5,
+      contextPressure: 0.8,
+      calibrationRatio: 1,
+      contextBudget: 25,
+      effectiveInstructionTokens: 0,
+    });
+    const model = new CapturingMessageModel();
+    graph.overrideModel = model;
+
+    await expect(
+      graph.createCallModel('default')(
+        { messages: [older, latest] },
+        {
+          ...config,
+          metadata: {
+            thread_id: 'latest-image-turn-lost',
+            langgraph_node: 'agent=default',
+            langgraph_step: 0,
+            checkpoint_ns: '',
+          },
+        }
+      )
+    ).rejects.toThrow('current_turn_exceeds_context');
+    expect(model.invocations).toHaveLength(0);
+  });
+
+  it('removes only explicitly disabled tools from the next current-turn binding', () => {
+    const tools = [
+      { name: 'file_search' },
+      { name: 'calculator' },
+    ] as t.GraphTools;
+    const result = filterToolsForCurrentTurn(
+      [
+        new HumanMessage('search these files'),
+        new ToolMessage({
+          content: 'search budget exhausted',
+          tool_call_id: 'file-search-1',
+          name: 'file_search',
+          artifact: {
+            toolControl: { disableTools: ['file_search'] },
+          },
+        }),
+      ],
+      tools
+    );
+
+    expect(
+      (result as Array<{ name?: string }>).map((tool) => tool.name)
+    ).toEqual(['calculator']);
+  });
+
+  it('retains tool controls from a content_and_artifact ToolNode result', async () => {
+    const fileSearch = tool(
+      async () => [
+        'search budget exhausted',
+        { toolControl: { disableTools: ['file_search'] } },
+      ],
+      {
+        name: 'file_search',
+        description: 'Search files',
+        schema: z.object({}),
+        responseFormat: Constants.CONTENT_AND_ARTIFACT,
+      }
+    );
+    const toolNode = new ToolNode({ tools: [fileSearch] });
+    const result = (await toolNode.invoke({
+      messages: [
+        new AIMessage({
+          content: '',
+          tool_calls: [{ id: 'file-search-1', name: 'file_search', args: {} }],
+        }),
+      ],
+    })) as { messages: ToolMessage[] };
+
+    expect(result.messages[0].artifact).toEqual({
+      toolControl: { disableTools: ['file_search'] },
+    });
+    expect(
+      filterToolsForCurrentTurn(
+        [new HumanMessage('search'), ...result.messages],
+        [{ name: 'file_search' }] as t.GraphTools
+      )
+    ).toHaveLength(0);
+  });
+
+  it('ignores malformed tool-control artifacts', () => {
+    const tools = [{ name: 'file_search' }] as t.GraphTools;
+    const result = filterToolsForCurrentTurn(
+      [
+        new HumanMessage('search these files'),
+        new ToolMessage({
+          content: 'malformed control',
+          tool_call_id: 'file-search-1',
+          name: 'file_search',
+          artifact: { toolControl: { disableTools: 'file_search' } },
+        }),
+      ],
+      tools
+    );
+
+    expect(result).toBe(tools);
+  });
+
+  it('does not carry a tool-control artifact into a newer user turn', () => {
+    const tools = [{ name: 'file_search' }] as t.GraphTools;
+    const result = filterToolsForCurrentTurn(
+      [
+        new HumanMessage('first request'),
+        new ToolMessage({
+          content: 'search budget exhausted',
+          tool_call_id: 'file-search-1',
+          name: 'file_search',
+          artifact: {
+            toolControl: { disableTools: ['file_search'] },
+          },
+        }),
+        new HumanMessage('new request'),
+      ],
+      tools
+    );
+
+    expect(result).toBe(tools);
   });
 });
