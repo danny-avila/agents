@@ -546,6 +546,13 @@ export interface LangfuseConfig {
   publicKey?: string;
   secretKey?: string;
   baseUrl?: string;
+  /**
+   * Environment identifier attached to exported traces (Langfuse
+   * `environment`). When unset, falls back to `LANGFUSE_TRACING_ENVIRONMENT`
+   * then `NODE_ENV`, so production traces are not collapsed under the
+   * `default` environment.
+   */
+  environment?: string;
   metadata?: Record<string, string | number | boolean | null | undefined>;
   /**
    * Internal OTLP span attributes to attach to Langfuse observations before

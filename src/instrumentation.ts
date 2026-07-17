@@ -75,17 +75,29 @@ export function ensureOpenTelemetryContextManager(): void {
   }
 }
 
+function resolveLangfuseEnvironment(
+  langfuse?: t.LangfuseConfig
+): string | undefined {
+  return (
+    langfuse?.environment ??
+    process.env.LANGFUSE_TRACING_ENVIRONMENT ??
+    process.env.NODE_ENV
+  );
+}
+
 function getLangfuseSpanProcessorParams(
   langfuse?: t.LangfuseConfig
 ): LangfuseSpanProcessorParams | undefined {
   if (langfuse?.enabled === false) {
     return undefined;
   }
+  const environment = resolveLangfuseEnvironment(langfuse);
   if (hasLangfuseConfigCredentials(langfuse)) {
     return {
       publicKey: langfuse.publicKey,
       secretKey: langfuse.secretKey,
       ...(isPresent(langfuse.baseUrl) ? { baseUrl: langfuse.baseUrl } : {}),
+      ...(isPresent(environment) ? { environment } : {}),
     };
   }
   if (hasLangfuseEnvConfig()) {
@@ -97,6 +109,7 @@ function getLangfuseSpanProcessorParams(
       publicKey: process.env.LANGFUSE_PUBLIC_KEY as string,
       secretKey: process.env.LANGFUSE_SECRET_KEY as string,
       ...(isPresent(baseUrl) ? { baseUrl } : {}),
+      ...(isPresent(environment) ? { environment } : {}),
     };
   }
   if (isPresent(langfuse?.baseUrl) && hasLangfuseEnvCredentials()) {
@@ -104,6 +117,7 @@ function getLangfuseSpanProcessorParams(
       publicKey: process.env.LANGFUSE_PUBLIC_KEY as string,
       secretKey: process.env.LANGFUSE_SECRET_KEY as string,
       baseUrl: langfuse.baseUrl,
+      ...(isPresent(environment) ? { environment } : {}),
     };
   }
   return undefined;
