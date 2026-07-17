@@ -26,6 +26,7 @@ const INPUT = LangfuseOtelSpanAttributes.OBSERVATION_INPUT;
 const OUTPUT = LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT;
 const TRACE_INPUT = LangfuseOtelSpanAttributes.TRACE_INPUT;
 const TRACE_OUTPUT = LangfuseOtelSpanAttributes.TRACE_OUTPUT;
+const OBSERVATION_TYPE = LangfuseOtelSpanAttributes.OBSERVATION_TYPE;
 
 describe('shouldDropLangfuseSpan', () => {
   it('drops langgraph __start__ seed spans', () => {
@@ -34,6 +35,10 @@ describe('shouldDropLangfuseSpan', () => {
 
   it('drops anonymous RunnableLambda pass-throughs', () => {
     expect(shouldDropLangfuseSpan('RunnableLambda')).toBe(true);
+  });
+
+  it('drops the tool_batch run that duplicates its parent tools node', () => {
+    expect(shouldDropLangfuseSpan('tool_batch')).toBe(true);
   });
 
   it('keeps named observations', () => {
@@ -89,7 +94,7 @@ describe('shapeLangfuseSpan', () => {
       },
     ];
     const span = createSpan(
-      'tool_batch',
+      'tools=openAI__gpt-5.4',
       { [INPUT]: JSON.stringify({ messages }) },
       'parent-1'
     );
@@ -190,5 +195,25 @@ describe('shapeLangfuseSpan', () => {
     shapeLangfuseSpan(span);
     expect(span.attributes[INPUT]).toBe('plain text');
     expect(span.attributes[TRACE_INPUT]).toBeUndefined();
+  });
+
+  it('renames generation spans to a provider-agnostic name', () => {
+    const span = createSpan(
+      'ChatOpenAI',
+      { [OBSERVATION_TYPE]: 'generation' },
+      'parent-1'
+    );
+    shapeLangfuseSpan(span);
+    expect(span.name).toBe('llm');
+  });
+
+  it('marks the root span as an agent observation', () => {
+    const span = createSpan('LibreChat Agent', {
+      [INPUT]: JSON.stringify({
+        messages: [{ type: 'human', content: 'hi' }],
+      }),
+    });
+    shapeLangfuseSpan(span);
+    expect(span.attributes[OBSERVATION_TYPE]).toBe('agent');
   });
 });

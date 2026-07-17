@@ -7,6 +7,8 @@ const LANGGRAPH_AGENT_NODE_PREFIX = 'agent=';
 const LANGGRAPH_TOOL_NODE_PREFIX = 'tools=';
 const TOOL_BATCH_RUN_NAME = 'tool_batch';
 const AGENT_NODE_SPAN_NAME = 'agent';
+const GENERATION_SPAN_NAME = 'llm';
+const ROOT_OBSERVATION_TYPE = 'agent';
 
 type MutableSpan = ReadableSpan & {
   name: string;
@@ -205,12 +207,15 @@ function isRootSpan(span: ReadableSpan): boolean {
 
 /**
  * LangGraph plumbing observations that add noise without information:
- * the duplicated `__start__` channel-seed nodes and anonymous
- * `RunnableLambda` pass-throughs (Langfuse team feedback items 4 & 5).
+ * the duplicated `__start__` channel-seed nodes, anonymous `RunnableLambda`
+ * pass-throughs, and the `tool_batch` run that duplicates its parent
+ * `tools=<id>` node span verbatim (Langfuse team feedback items 4 & 5).
  */
 export function shouldDropLangfuseSpan(spanName: string): boolean {
   return (
-    spanName === LANGGRAPH_START_NODE || spanName === ANONYMOUS_LAMBDA_NAME
+    spanName === LANGGRAPH_START_NODE ||
+    spanName === ANONYMOUS_LAMBDA_NAME ||
+    spanName === TOOL_BATCH_RUN_NAME
   );
 }
 
@@ -249,17 +254,26 @@ function shapeRootSpan(span: MutableSpan): void {
   }
 }
 
+function isGenerationSpan(span: MutableSpan): boolean {
+  const type = span.attributes[LangfuseOtelSpanAttributes.OBSERVATION_TYPE];
+  return typeof type === 'string' && type.toLowerCase() === 'generation';
+}
+
 /**
  * Reshapes spans per Langfuse-team feedback before export:
  * - `agent=<id>` / `tools=<id>` node names carry the ephemeral agent id
  *   (`provider__model`) — strip it so switching models doesn't break
  *   name-based logic (item 1).
+ * - LLM generation spans keep the provider client class name (`ChatOpenAI`,
+ *   `AzureChatOpenAI`, …); rename them to a provider-agnostic `llm` so the
+ *   name reflects the operation, not the model (the model stays on the
+ *   generation's model attribute).
  * - Tool node spans are renamed to the actual tool name(s) and their
  *   input scoped to the pending tool-call args instead of the whole
  *   chat history (items 3 & 4).
- * - The root span (and trace) input/output become the user question and
- *   assistant response so the session view reads as a conversation
- *   (item 2).
+ * - The root span becomes a top-level `agent` observation whose input/output
+ *   (and the trace input/output derived from it) are the user question and
+ *   assistant response, so the session view reads as a conversation (item 2).
  */
 export function shapeLangfuseSpan(span: ReadableSpan): void {
   const mutable = span as MutableSpan;
@@ -267,14 +281,17 @@ export function shapeLangfuseSpan(span: ReadableSpan): void {
     mutable.name = AGENT_NODE_SPAN_NAME;
     return;
   }
-  if (
-    mutable.name.startsWith(LANGGRAPH_TOOL_NODE_PREFIX) ||
-    mutable.name === TOOL_BATCH_RUN_NAME
-  ) {
+  if (mutable.name.startsWith(LANGGRAPH_TOOL_NODE_PREFIX)) {
     shapeToolNodeSpan(mutable);
     return;
   }
+  if (isGenerationSpan(mutable)) {
+    mutable.name = GENERATION_SPAN_NAME;
+    return;
+  }
   if (isRootSpan(span)) {
+    mutable.attributes[LangfuseOtelSpanAttributes.OBSERVATION_TYPE] =
+      ROOT_OBSERVATION_TYPE;
     shapeRootSpan(mutable);
   }
 }
