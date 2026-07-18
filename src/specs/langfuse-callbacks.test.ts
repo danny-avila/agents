@@ -1,7 +1,8 @@
-import { HumanMessage } from '@langchain/core/messages';
 import { LangfuseOtelSpanAttributes } from '@langfuse/tracing';
+import { AIMessage, HumanMessage } from '@langchain/core/messages';
 import { CallbackManager } from '@langchain/core/callbacks/manager';
 import { context as otelContext, trace as otelTrace } from '@opentelemetry/api';
+import type { ChatGeneration } from '@langchain/core/outputs';
 import type * as t from '@/types';
 import { handleConverseStreamMetadata } from '@/llm/bedrock/utils/message_outputs';
 import { traceIdFromSeed } from '@/langfuseRuntimeContext';
@@ -445,6 +446,82 @@ describe('Langfuse callback composition', () => {
         input_cache_read: 10831,
         input_cache_creation: 10000,
       })
+    );
+  });
+
+  it('exports one hosted web search tool observation with its sources', async () => {
+    const { createLangfuseHandler } = await import('@/langfuse');
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    initializeLangfuseTracing({
+      publicKey: 'pk-test',
+      secretKey: 'sk-test',
+    });
+    const handler = createLangfuseHandler({
+      langfuse: {
+        publicKey: 'pk-test',
+        secretKey: 'sk-test',
+      },
+    });
+    const runId = 'test-langfuse-hosted-web-search';
+    const webSearchCall = {
+      type: 'web_search_call',
+      id: 'ws_abc123',
+      status: 'completed',
+      action: {
+        type: 'search',
+        query: 'weather in Munich today',
+        sources: [{ type: 'url', url: 'https://example.com/weather' }],
+      },
+    };
+    const generation: ChatGeneration = {
+      text: 'Sunny.',
+      message: new AIMessage({
+        content: 'Sunny.',
+        additional_kwargs: {
+          tool_outputs: [webSearchCall, webSearchCall],
+        },
+      }),
+    };
+
+    await handler?.handleChatModelStart(
+      {
+        lc: 1,
+        type: 'constructor',
+        id: ['AzureChatOpenAI'],
+        kwargs: {},
+      },
+      [[new HumanMessage('What is the weather in Munich today?')]],
+      runId
+    );
+    await handler?.handleLLMEnd(
+      {
+        generations: [[generation]],
+      },
+      runId
+    );
+
+    expect(
+      mockStartActiveSpan.mock.calls.filter(([name]) => name === 'web_search')
+    ).toHaveLength(1);
+    expect(mockSpanAttributeSets).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          [LangfuseOtelSpanAttributes.OBSERVATION_TYPE]: 'tool',
+          [LangfuseOtelSpanAttributes.OBSERVATION_INPUT]: JSON.stringify({
+            type: 'search',
+            query: 'weather in Munich today',
+          }),
+          [`${LangfuseOtelSpanAttributes.OBSERVATION_METADATA}.providerCallId`]:
+            'ws_abc123',
+        }),
+        expect.objectContaining({
+          [LangfuseOtelSpanAttributes.OBSERVATION_OUTPUT]: JSON.stringify({
+            status: 'completed',
+            sourceCount: 1,
+            sources: [{ type: 'url', url: 'https://example.com/weather' }],
+          }),
+        }),
+      ])
     );
   });
 
