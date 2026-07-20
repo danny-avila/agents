@@ -360,6 +360,37 @@ function simplifyParametersForSearch(
 }
 
 /**
+ * Splits one alphanumeric identifier segment on case boundaries without
+ * emitting artificial one-character acronym fragments.
+ */
+function splitCaseSegment(segment: string): string[] {
+  const splitTokens = segment
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(Boolean);
+
+  if (splitTokens.length < 2) return splitTokens;
+
+  const mergedTokens: string[] = [];
+  let prefix = '';
+  for (const token of splitTokens) {
+    if (token.length === 1) {
+      prefix += token;
+      continue;
+    }
+    mergedTokens.push(`${prefix}${token}`);
+    prefix = '';
+  }
+
+  if (prefix && mergedTokens.length > 0) {
+    mergedTokens[mergedTokens.length - 1] += prefix;
+  }
+  return mergedTokens.length > 0 ? mergedTokens : [prefix];
+}
+
+/**
  * Tokenizes a string into lowercase words for BM25.
  * Splits camelCase, underscores, and non-alphanumeric characters for consistent matching.
  * @param text - The text to tokenize
@@ -367,12 +398,9 @@ function simplifyParametersForSearch(
  */
 function tokenize(text: string): string[] {
   return text
-    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
-    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
-    .toLowerCase()
-    .replace(/[^a-z0-9]/g, ' ')
-    .split(/\s+/)
-    .filter((token) => token.length > 0);
+    .split(/[^a-zA-Z0-9]+/)
+    .filter(Boolean)
+    .flatMap(splitCaseSegment);
 }
 
 /**
@@ -499,9 +527,13 @@ function performLocalSearch(
   const scores = BM25(documents, queryTokens, { k1: 1.5, b: 0.75 }) as number[];
 
   const maxScore = Math.max(...scores.filter((s) => s > 0), 1);
+  const queryLower = query.toLowerCase().trim();
   const queryIdentifier = queryTokens.join('');
 
-  const results: t.ToolSearchResult[] = [];
+  const results: Array<{
+    result: t.ToolSearchResult;
+    identifierPriority: number;
+  }> = [];
   for (let i = 0; i < tools.length; i++) {
     if (scores[i] > 0) {
       const { field, snippet } = findMatchedField(
@@ -511,25 +543,49 @@ function performLocalSearch(
       );
       let normalizedScore = Math.min(scores[i] / maxScore, 1.0);
 
-      const baseName = tokenize(getBaseToolName(tools[i].name)).join('');
-      const fullName = tokenize(tools[i].name).join('');
-      if (baseName === queryIdentifier || fullName === queryIdentifier) {
+      const rawBaseName = getBaseToolName(tools[i].name).toLowerCase();
+      const rawFullName = tools[i].name.toLowerCase();
+      const baseIdentifier = tokenize(rawBaseName).join('');
+      const fullIdentifier = tokenize(rawFullName).join('');
+      let identifierPriority = 0;
+
+      if (rawFullName === queryLower) {
+        identifierPriority = 4;
         normalizedScore = 1.0;
-      } else if (baseName.startsWith(queryIdentifier)) {
+      } else if (rawBaseName === queryLower) {
+        identifierPriority = 3;
+        normalizedScore = 1.0;
+      } else if (
+        baseIdentifier === queryIdentifier ||
+        fullIdentifier === queryIdentifier
+      ) {
+        identifierPriority = 2;
+        normalizedScore = 1.0;
+      } else if (baseIdentifier.startsWith(queryIdentifier)) {
+        identifierPriority = 1;
         normalizedScore = Math.max(normalizedScore, 0.95);
       }
 
       results.push({
-        tool_name: tools[i].name,
-        match_score: normalizedScore,
-        matched_field: field,
-        snippet,
+        result: {
+          tool_name: tools[i].name,
+          match_score: normalizedScore,
+          matched_field: field,
+          snippet,
+        },
+        identifierPriority,
       });
     }
   }
 
-  results.sort((a, b) => b.match_score - a.match_score);
-  const topResults = results.slice(0, maxResults);
+  results.sort(
+    (a, b) =>
+      b.identifierPriority - a.identifierPriority ||
+      b.result.match_score - a.result.match_score
+  );
+  const topResults = results
+    .slice(0, maxResults)
+    .map(({ result }) => result);
 
   return {
     tool_references: topResults,

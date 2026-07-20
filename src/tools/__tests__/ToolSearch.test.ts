@@ -853,6 +853,11 @@ describe('ToolSearch', () => {
     it('prioritizes an exact full camelCase MCP tool ID', () => {
       const tools: ToolMetadata[] = [
         {
+          name: 'add_person_mcp_pipedrive',
+          description: 'Create a person with a separator variant',
+          parameters: undefined,
+        },
+        {
           name: 'addActivity_mcp_pipedrive',
           description: 'Create an activity',
           parameters: undefined,
@@ -881,6 +886,33 @@ describe('ToolSearch', () => {
       );
       expect(result.tool_references[0].match_score).toBe(1.0);
     });
+
+    it.each([
+      ['OAuthToken', 'close_order'],
+      ['iOSApp', 'inspect_inventory'],
+    ])(
+      'does not return tools matching only an acronym fragment from %s',
+      (matchingTool, unrelatedTool) => {
+        const tools: ToolMetadata[] = [
+          {
+            name: matchingTool,
+            description: 'Expected acronym tool',
+            parameters: undefined,
+          },
+          {
+            name: unrelatedTool,
+            description: 'Unrelated tool',
+            parameters: undefined,
+          },
+        ];
+
+        const result = performLocalSearch(tools, matchingTool, ['name'], 10);
+
+        expect(result.tool_references.map(({ tool_name }) => tool_name)).toEqual(
+          [matchingTool]
+        );
+      }
+    );
 
     it('searches across all tools including MCP tools', () => {
       const result = performLocalSearch(
