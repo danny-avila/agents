@@ -534,9 +534,9 @@ export type LangfuseToolOutputTracingConfig = {
 
 export type LangfuseToolNodeTracingConfig = {
   /**
-   * Overrides ToolNode callback tracing. ToolNode spans are exported by the
-   * env-backed Langfuse callback, so this only enables tracing when that
-   * callback is configured.
+   * Opts into the internal ToolNode batch observation. Graph tool-dispatch
+   * and individual tool observations are exported without this wrapper, so
+   * the default is false to avoid a redundant hierarchy level.
    */
   enabled?: boolean;
 };

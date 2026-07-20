@@ -78,11 +78,17 @@ export function ensureOpenTelemetryContextManager(): void {
 function resolveLangfuseEnvironment(
   langfuse?: t.LangfuseConfig
 ): string | undefined {
-  return (
-    langfuse?.environment ??
-    process.env.LANGFUSE_TRACING_ENVIRONMENT ??
-    process.env.NODE_ENV
-  );
+  const candidates = [
+    langfuse?.environment,
+    process.env.LANGFUSE_TRACING_ENVIRONMENT,
+    process.env.NODE_ENV,
+  ];
+  for (const candidate of candidates) {
+    if (candidate != null && candidate.trim() !== '') {
+      return candidate.trim();
+    }
+  }
+  return undefined;
 }
 
 function getLangfuseSpanProcessorParams(

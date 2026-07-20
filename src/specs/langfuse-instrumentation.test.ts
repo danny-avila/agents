@@ -215,6 +215,23 @@ describe('Langfuse instrumentation', () => {
     );
   });
 
+  it('falls through blank environment overrides and trims the selected value', async () => {
+    process.env.LANGFUSE_TRACING_ENVIRONMENT = '   ';
+    process.env.NODE_ENV = ' production ';
+
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    initializeLangfuseTracing({
+      publicKey: 'pk-config',
+      secretKey: 'sk-config',
+      baseUrl: 'https://langfuse.config',
+      environment: '',
+    });
+
+    expect(mockLangfuseSpanProcessor).toHaveBeenCalledWith(
+      expect.objectContaining({ environment: 'production' })
+    );
+  });
+
   it('prefers an explicit config environment over environment variables', async () => {
     process.env.LANGFUSE_TRACING_ENVIRONMENT = 'staging';
 
