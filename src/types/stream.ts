@@ -286,10 +286,16 @@ export type SummaryBoundary = {
   contentIndex: number;
 };
 
+export type SummaryCoverage = {
+  throughMessageId: string;
+};
+
 export type SummaryContentBlock = {
   type: ContentTypes.SUMMARY;
   content?: MessageContentComplex[];
   tokenCount?: number;
+  /** Last source content covered by the summary. Separate from the block's UI location. */
+  coverage?: SummaryCoverage;
   boundary?: SummaryBoundary;
   summaryVersion?: number;
   model?: string;

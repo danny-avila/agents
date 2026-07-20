@@ -746,7 +746,7 @@ describe('AgentContext', () => {
       expect(secondContent[0]).toHaveProperty('cache_control');
     });
 
-    it('places OpenRouter user-message summaries after the first stable message', async () => {
+    it('places OpenRouter summaries in neutral assistant history', async () => {
       const ctx = createBasicContext({
         agentConfig: {
           provider: Providers.OPENROUTER,
@@ -765,7 +765,11 @@ describe('AgentContext', () => {
       ]);
 
       expect(result[1].content).toBe('First');
-      expect(result[2].content).toContain('Rotating summary');
+      expect(result[2]).toBeInstanceOf(AIMessage);
+      expect(result[2].getType()).toBe('ai');
+      expect(result[2].content).toBe('<summary>\nRotating summary\n</summary>');
+      expect(result[2].content).not.toContain('checkpoint: you wrote');
+      expect(result[2].content).not.toContain('Pick up where you left off');
       expect(result[3].content).toBe('Second');
     });
 
@@ -2026,7 +2030,7 @@ describe('AgentContext', () => {
       const baseInstructionTokens = ctx.instructionTokens;
       expect(baseInstructionTokens).toBeGreaterThan(0);
 
-      // Mid-run summary is injected as HumanMessage but still counts as
+      // Mid-run summary is injected as assistant history but still counts as
       // instruction overhead so the pruner reserves budget for it.
       ctx.setSummary('User asked about math. Key results: 2+2=4, 3*5=15.', 50);
       expect(ctx.hasSummary()).toBe(true);

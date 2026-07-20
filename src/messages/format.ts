@@ -1131,17 +1131,16 @@ function extractToolNamesFromSearchOutput(output: string): string[] {
   return [];
 }
 
-type SummaryBoundary = {
+type ResolvedSummaryCoverage = {
   messageIndex: number;
-  contentIndex: number;
   text: string;
   tokenCount: number;
 };
 
-function getLatestSummaryBoundary(
+function getLatestSummaryCoverage(
   payload: TPayload
-): SummaryBoundary | undefined {
-  let summaryBoundary: SummaryBoundary | undefined;
+): ResolvedSummaryCoverage | undefined {
+  let summaryCoverage: ResolvedSummaryCoverage | undefined;
 
   for (let i = 0; i < payload.length; i++) {
     const message = payload[i];
@@ -1176,9 +1175,24 @@ function getLatestSummaryBoundary(
         continue;
       }
 
-      summaryBoundary = {
-        messageIndex: i,
-        contentIndex: j,
+      // A newer malformed summary must not fall back to an older checkpoint;
+      // preserve raw history unless the latest summary resolves safely.
+      summaryCoverage = undefined;
+      const coverage = summaryPart.coverage;
+      if (coverage == null || typeof coverage.throughMessageId !== 'string') {
+        continue;
+      }
+
+      const boundaryMessageIndex = payload.findIndex(
+        (candidate) =>
+          getSourceMessageId(candidate) === coverage.throughMessageId
+      );
+      if (boundaryMessageIndex < 0 || boundaryMessageIndex >= i) {
+        continue;
+      }
+
+      summaryCoverage = {
+        messageIndex: boundaryMessageIndex,
         text: summaryText,
         tokenCount:
           typeof summaryPart.tokenCount === 'number' &&
@@ -1189,51 +1203,22 @@ function getLatestSummaryBoundary(
     }
   }
 
-  return summaryBoundary;
+  return summaryCoverage;
 }
 
-function applySummaryBoundary(
+function applySummaryCoverage(
   message: Partial<TMessage>,
   messageIndex: number,
-  summaryBoundary?: SummaryBoundary
+  summaryCoverage?: ResolvedSummaryCoverage
 ): Partial<TMessage> | null {
-  if (!summaryBoundary) {
+  if (!summaryCoverage) {
     return message;
   }
 
-  if (messageIndex < summaryBoundary.messageIndex) {
+  if (messageIndex <= summaryCoverage.messageIndex) {
     return null;
   }
-
-  if (
-    messageIndex !== summaryBoundary.messageIndex ||
-    !Array.isArray(message.content)
-  ) {
-    return message;
-  }
-
-  return {
-    ...message,
-    content: message.content.slice(summaryBoundary.contentIndex + 1),
-  };
-}
-
-function contentPartCharLength(part: MessageContentComplex): number {
-  const record = part as Record<string, unknown>;
-  let len = 0;
-  if (typeof record.text === 'string') {
-    len += record.text.length;
-  }
-  if (typeof record.thinking === 'string') {
-    len += record.thinking.length;
-  }
-  const { input } = record;
-  if (typeof input === 'string') {
-    len += input.length;
-  } else if (input != null && typeof input === 'object') {
-    len += JSON.stringify(input).length;
-  }
-  return len;
+  return message;
 }
 
 /** Extracts the skillName from a skill tool_call's args (string or object). */
@@ -1282,14 +1267,6 @@ export const formatAgentMessages = (
   /** Cross-run summary extracted from the payload. Should be forwarded to the
    *  agent run so it can be included in the system message via AgentContext. */
   summary?: { text: string; tokenCount: number };
-  /** When a summary boundary sliced content from a message, the token count
-   *  was proportionally reduced. Returned so the caller can log it. */
-  boundaryTokenAdjustment?: {
-    original: number;
-    adjusted: number;
-    remainingChars: number;
-    totalChars: number;
-  };
 } => {
   const messages: Array<
     | RoleBearingMessage<HumanMessage>
@@ -1299,17 +1276,9 @@ export const formatAgentMessages = (
   > = [];
   // If indexTokenCountMap is provided, create a new map to track the updated indices
   const updatedIndexTokenCountMap: Record<number, number> = {};
-  let boundaryTokenAdjustment:
-    | {
-        original: number;
-        adjusted: number;
-        remainingChars: number;
-        totalChars: number;
-      }
-    | undefined;
   // Keep track of the mapping from original payload indices to result indices
   const indexMapping: Record<number, number[] | undefined> = {};
-  const summaryBoundary = getLatestSummaryBoundary(payload);
+  const summaryCoverage = getLatestSummaryCoverage(payload);
 
   // Summary metadata is returned to the caller so it can be forwarded to the
   // agent run and included in the single system message via AgentContext.
@@ -1327,7 +1296,7 @@ export const formatAgentMessages = (
   for (let i = 0; i < payload.length; i++) {
     const rawMessage = payload[i];
     const sourceMessageId = getSourceMessageId(rawMessage);
-    let message = applySummaryBoundary(rawMessage, i, summaryBoundary);
+    let message = applySummaryCoverage(rawMessage, i, summaryCoverage);
     if (!message) {
       indexMapping[i] = [];
       continue;
@@ -1587,44 +1556,10 @@ export const formatAgentMessages = (
       originalIndex++
     ) {
       const resultIndices = indexMapping[originalIndex] || [];
-      let tokenCount = indexTokenCountMap[originalIndex];
+      const tokenCount = indexTokenCountMap[originalIndex];
 
       if (tokenCount === undefined) {
         continue;
-      }
-
-      if (
-        summaryBoundary &&
-        originalIndex === summaryBoundary.messageIndex &&
-        Array.isArray(payload[originalIndex].content)
-      ) {
-        const content = payload[originalIndex]
-          .content as MessageContentComplex[];
-        const { contentIndex } = summaryBoundary;
-        if (contentIndex >= 0 && contentIndex < content.length - 1) {
-          let totalCharLen = 0;
-          let remainingCharLen = 0;
-          for (let p = 0; p < content.length; p++) {
-            const charLen = contentPartCharLength(content[p]);
-            totalCharLen += charLen;
-            if (p > contentIndex) {
-              remainingCharLen += charLen;
-            }
-          }
-          if (totalCharLen > 0) {
-            const original = tokenCount;
-            tokenCount = Math.max(
-              1,
-              Math.round(tokenCount * (remainingCharLen / totalCharLen))
-            );
-            boundaryTokenAdjustment = {
-              original,
-              adjusted: tokenCount,
-              remainingChars: remainingCharLen,
-              totalChars: totalCharLen,
-            };
-          }
-        }
       }
 
       const msgCount = resultIndices.length;
@@ -1703,10 +1638,9 @@ export const formatAgentMessages = (
     indexTokenCountMap: indexTokenCountMap
       ? updatedIndexTokenCountMap
       : undefined,
-    summary: summaryBoundary
-      ? { text: summaryBoundary.text, tokenCount: summaryBoundary.tokenCount }
+    summary: summaryCoverage
+      ? { text: summaryCoverage.text, tokenCount: summaryCoverage.tokenCount }
       : undefined,
-    boundaryTokenAdjustment,
   };
 };
 
