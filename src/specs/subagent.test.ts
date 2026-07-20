@@ -326,6 +326,7 @@ describe('Subagent Integration', () => {
         );
       }
     );
+    const parentUpdateHandler = jest.fn();
     let specialistToolDefinitions: t.LCTool[] | undefined;
     let forwardedToolResults: t.ToolExecuteResult[] | undefined;
 
@@ -391,6 +392,11 @@ describe('Subagent Integration', () => {
                     );
                   }
                 );
+                await forwarder.handleCustomEvent(
+                  GraphEvents.ON_RUN_STEP,
+                  { id: 'specialist-step', type: 'tool_calls' },
+                  'specialist-run'
+                );
               }
               return { messages: [new AIMessage('specialist done')] };
             }),
@@ -447,6 +453,9 @@ describe('Subagent Integration', () => {
         graphConfig: { type: 'standard', agents: [rootAgent] },
         customHandlers: {
           [GraphEvents.ON_TOOL_EXECUTE]: { handle: parentToolHandler },
+          [GraphEvents.ON_SUBAGENT_UPDATE]: {
+            handle: parentUpdateHandler,
+          },
         },
         returnContent: true,
         skipCleanup: true,
@@ -473,6 +482,11 @@ describe('Subagent Integration', () => {
           content: 'ran mcp_lookup',
         },
       ]);
+      const forwardedSubagentTypes = parentUpdateHandler.mock.calls.map(
+        ([, data]) => (data as t.SubagentUpdateEvent).subagentType
+      );
+      expect(forwardedSubagentTypes).toContain('router');
+      expect(forwardedSubagentTypes).not.toContain('specialist');
     } finally {
       createWorkflowSpy.mockRestore();
     }

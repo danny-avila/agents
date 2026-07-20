@@ -96,6 +96,18 @@ const { AGENT, TOOLS, SUMMARIZE } = GraphNodeKeys;
 /** Minimum relative variance before calibrated toolSchemaTokens overrides current value. */
 const CALIBRATION_VARIANCE_THRESHOLD = 0.15;
 
+function createToolHandlerRegistry(
+  source: HandlerRegistry | undefined
+): HandlerRegistry | undefined {
+  const toolHandler = source?.getHandler(GraphEvents.ON_TOOL_EXECUTE);
+  if (toolHandler == null) {
+    return undefined;
+  }
+  const registry = new HandlerRegistry();
+  registry.register(GraphEvents.ON_TOOL_EXECUTE, toolHandler);
+  return registry;
+}
+
 /**
  * Start index of the span post-prune formatters can mutate in place: the
  * trailing tool batch plus its owning AI message (artifact formatting touches
@@ -2396,7 +2408,9 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           maxDepth: effectiveSubagentDepth,
           createChildGraph: (input): StandardGraph => {
             const childGraph = new StandardGraph(input);
-            const toolHandlerRegistry = getParentHandlerRegistry();
+            const toolHandlerRegistry = createToolHandlerRegistry(
+              getParentHandlerRegistry()
+            );
             childGraph.hookRegistry = this.hookRegistry;
             /**
              * Do not propagate `humanInTheLoop` into the child graph yet:
@@ -2421,8 +2435,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             childGraph.toolExecution = this.toolExecution;
             childGraph.parentToolHandlerRegistry = toolHandlerRegistry;
             childGraph.eventToolExecutionAvailable =
-              toolHandlerRegistry?.getHandler(GraphEvents.ON_TOOL_EXECUTE) !=
-              null;
+              toolHandlerRegistry != null;
             return childGraph;
           },
         });
