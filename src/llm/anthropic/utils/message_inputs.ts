@@ -473,6 +473,13 @@ function _formatContent(message: BaseMessage) {
    * forwarding an unusable block. The receiving model produces its own thinking.
    */
   const foreignReasoningTypes = ['reasoning_content', 'reasoning', 'think'];
+  /**
+   * Google server-side tool blocks (`toolCall`/`toolResponse` parts from e.g.
+   * URL context or Google Search). Only Google can execute these and validate
+   * their thought signatures, so they are dropped on a cross-provider handoff
+   * (e.g. Google → Anthropic); the assistant's answer text is kept.
+   */
+  const foreignServerToolTypes = ['toolCall', 'toolResponse'];
   const { content } = message;
 
   if (typeof content === 'string') {
@@ -854,6 +861,14 @@ function _formatContent(message: BaseMessage) {
         // input and fall through to the throw below rather than being silently
         // dropped — as does any other unknown block (user media, Google
         // code-execution), which must be surfaced, not discarded.
+        return null;
+      } else if (
+        isAIMessage(message) &&
+        foreignServerToolTypes.some((t) => t === contentPart.type)
+      ) {
+        // Google server-side tool call/response (e.g. URL context) — only
+        // Google can execute it or validate its thought signature; drop it
+        // on a cross-provider handoff rather than crash.
         return null;
       } else {
         console.error(

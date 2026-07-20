@@ -42,6 +42,14 @@ const FOREIGN_REASONING_TYPES = [
 ];
 
 /**
+ * Google server-side tool blocks (`toolCall`/`toolResponse` parts from e.g.
+ * URL context or Google Search). Only Google can execute these and validate
+ * their thought signatures, so they are dropped on a cross-provider handoff
+ * (e.g. Google → Bedrock); the assistant's answer text is kept.
+ */
+const FOREIGN_SERVER_TOOL_TYPES = ['toolCall', 'toolResponse'];
+
+/**
  * Bedrock Converse rejects assistant messages with no content blocks. When
  * filtering (e.g. dropping foreign reasoning) empties an assistant turn that
  * also has no tool calls, fall back to this placeholder text.
@@ -726,6 +734,11 @@ function convertAIMessageToConverseMessage(msg: BaseMessage): BedrockMessage {
           // it on a cross-provider handoff (e.g. Anthropic → Bedrock) rather
           // than crash. The Bedrock model produces its own reasoning. Anything
           // else unknown still throws below — real content must be surfaced.
+          return;
+        } else if (FOREIGN_SERVER_TOOL_TYPES.some((t) => t === block.type)) {
+          // Google server-side tool call/response (e.g. URL context) — only
+          // Google can execute it or validate its thought signature; drop it
+          // on a cross-provider handoff rather than crash.
           return;
         } else {
           const blockValues = Object.fromEntries(
