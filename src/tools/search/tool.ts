@@ -203,6 +203,8 @@ function createSearchProcessor({
   supportsNews,
   sourceProcessor,
   onGetHighlights,
+  mainExpandBy,
+  separatorExpandBy,
   logger,
 }: {
   safeSearch: t.SearchToolConfig['safeSearch'];
@@ -212,6 +214,8 @@ function createSearchProcessor({
   searchAPI: ReturnType<typeof createSearchAPI>;
   sourceProcessor: ReturnType<typeof createSourceProcessor>;
   onGetHighlights: t.SearchToolConfig['onGetHighlights'];
+  mainExpandBy: t.SearchToolConfig['mainExpandBy'];
+  separatorExpandBy: t.SearchToolConfig['separatorExpandBy'];
   logger: t.Logger;
 }) {
   return async function ({
@@ -260,7 +264,11 @@ function createSearchProcessor({
         numElements: maxSources,
       });
 
-      return expandHighlights(processedSources);
+      return expandHighlights(
+        processedSources,
+        mainExpandBy,
+        separatorExpandBy
+      );
     } catch (error) {
       logger.error('Error in search:', error);
       return {
@@ -376,6 +384,8 @@ export const createSearchTool = (
     maxContentLength,
     chunkSize,
     chunkOverlap,
+    mainExpandBy,
+    separatorExpandBy,
     maxOutputChars,
     strategies = ['no_extraction'],
     filterContent = true,
@@ -525,6 +535,8 @@ export const createSearchTool = (
     supportsNews: searchProvider !== 'keenable',
     sourceProcessor,
     onGetHighlights,
+    mainExpandBy,
+    separatorExpandBy,
     logger,
   });
 
