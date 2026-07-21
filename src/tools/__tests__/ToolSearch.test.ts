@@ -360,6 +360,52 @@ describe('ToolSearch', () => {
       expect(result.tool_references[0].match_score).toBeGreaterThan(0);
     });
 
+    it('does not match tool names when searching only parameters', () => {
+      const tools: ToolMetadata[] = [
+        {
+          name: 'query',
+          description: 'A tool whose name matches but parameters do not',
+          parameters: {
+            type: 'object',
+            properties: { value: { type: 'string' } },
+          },
+        },
+        {
+          name: 'run_database_query',
+          description: 'Run a database query',
+          parameters: {
+            type: 'object',
+            properties: { query: { type: 'string' } },
+          },
+        },
+      ];
+
+      const result = performLocalSearch(tools, 'query', ['parameters'], 1);
+
+      expect(result.tool_references).toHaveLength(1);
+      expect(result.tool_references[0].tool_name).toBe('run_database_query');
+      expect(result.tool_references[0].matched_field).toBe('parameters');
+    });
+
+    it('returns no matches when every selected field is empty', () => {
+      const tools: ToolMetadata[] = [
+        {
+          name: 'get_weather',
+          description: 'Get the weather',
+          parameters: undefined,
+        },
+        {
+          name: 'send_email',
+          description: 'Send an email',
+          parameters: undefined,
+        },
+      ];
+
+      const result = performLocalSearch(tools, 'query', ['parameters'], 10);
+
+      expect(result.tool_references).toEqual([]);
+    });
+
     it('prioritizes name matches over description matches', () => {
       const result = performLocalSearch(
         mockTools,
@@ -829,6 +875,111 @@ describe('ToolSearch', () => {
         parameters: undefined,
       },
     ];
+
+    it('finds camelCase tools by exact name', () => {
+      const tools: ToolMetadata[] = [
+        {
+          name: 'addActivity',
+          description: 'Create an activity',
+          parameters: undefined,
+        },
+        {
+          name: 'addPerson',
+          description: 'Create a person',
+          parameters: undefined,
+        },
+      ];
+
+      const result = performLocalSearch(tools, 'addPerson', ['name'], 10);
+
+      expect(result.tool_references[0].tool_name).toBe('addPerson');
+      expect(result.tool_references[0].match_score).toBe(1.0);
+    });
+
+    it('finds camelCase tools by a lowercased exact name', () => {
+      const tools: ToolMetadata[] = [
+        {
+          name: 'addActivity',
+          description: 'Create an activity',
+          parameters: undefined,
+        },
+        {
+          name: 'addPerson',
+          description: 'Create a person',
+          parameters: undefined,
+        },
+      ];
+
+      const result = performLocalSearch(tools, 'addperson', ['name'], 10);
+
+      expect(result.tool_references).toHaveLength(1);
+      expect(result.tool_references[0].tool_name).toBe('addPerson');
+      expect(result.tool_references[0].match_score).toBe(1.0);
+    });
+
+    it('prioritizes an exact full camelCase MCP tool ID', () => {
+      const tools: ToolMetadata[] = [
+        {
+          name: 'add_person_mcp_pipedrive',
+          description: 'Create a person with a separator variant',
+          parameters: undefined,
+        },
+        {
+          name: 'addActivity_mcp_pipedrive',
+          description: 'Create an activity',
+          parameters: undefined,
+        },
+        {
+          name: 'addPerson_mcp_pipedrive',
+          description: 'Create a person',
+          parameters: undefined,
+        },
+        {
+          name: 'updatePerson_mcp_pipedrive',
+          description: 'Update a person',
+          parameters: undefined,
+        },
+      ];
+
+      const result = performLocalSearch(
+        tools,
+        'addPerson_mcp_pipedrive',
+        ['name'],
+        1
+      );
+
+      expect(result.tool_references[0].tool_name).toBe(
+        'addPerson_mcp_pipedrive'
+      );
+      expect(result.tool_references[0].match_score).toBe(1.0);
+    });
+
+    it.each([
+      ['OAuthToken', 'close_order'],
+      ['iOSApp', 'inspect_inventory'],
+    ])(
+      'does not return tools matching only an acronym fragment from %s',
+      (matchingTool, unrelatedTool) => {
+        const tools: ToolMetadata[] = [
+          {
+            name: matchingTool,
+            description: 'Expected acronym tool',
+            parameters: undefined,
+          },
+          {
+            name: unrelatedTool,
+            description: 'Unrelated tool',
+            parameters: undefined,
+          },
+        ];
+
+        const result = performLocalSearch(tools, matchingTool, ['name'], 10);
+
+        expect(
+          result.tool_references.map(({ tool_name }) => tool_name)
+        ).toEqual([matchingTool]);
+      }
+    );
 
     it('searches across all tools including MCP tools', () => {
       const result = performLocalSearch(

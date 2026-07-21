@@ -360,17 +360,47 @@ function simplifyParametersForSearch(
 }
 
 /**
+ * Splits one alphanumeric identifier segment on case boundaries without
+ * emitting artificial one-character acronym fragments.
+ */
+function splitCaseSegment(segment: string): string[] {
+  const splitTokens = segment
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(Boolean);
+
+  if (splitTokens.length < 2) return splitTokens;
+
+  const mergedTokens: string[] = [];
+  let prefix = '';
+  for (const token of splitTokens) {
+    if (token.length === 1) {
+      prefix += token;
+      continue;
+    }
+    mergedTokens.push(`${prefix}${token}`);
+    prefix = '';
+  }
+
+  if (prefix && mergedTokens.length > 0) {
+    mergedTokens[mergedTokens.length - 1] += prefix;
+  }
+  return mergedTokens.length > 0 ? mergedTokens : [prefix];
+}
+
+/**
  * Tokenizes a string into lowercase words for BM25.
- * Splits on underscores and non-alphanumeric characters for consistent matching.
+ * Splits camelCase, underscores, and non-alphanumeric characters for consistent matching.
  * @param text - The text to tokenize
  * @returns Array of lowercase tokens
  */
 function tokenize(text: string): string[] {
   return text
-    .toLowerCase()
-    .replace(/[^a-z0-9]/g, ' ')
-    .split(/\s+/)
-    .filter((token) => token.length > 0);
+    .split(/[^a-zA-Z0-9]+/)
+    .filter(Boolean)
+    .flatMap(splitCaseSegment);
 }
 
 /**
@@ -396,7 +426,7 @@ function createToolDocument(tool: t.ToolMetadata, fields: string[]): string {
     parts.push(paramNames);
   }
 
-  return parts.join(' ');
+  return tokenize(parts.join(' ')).join(' ');
 }
 
 /**
@@ -498,35 +528,63 @@ function performLocalSearch(
 
   const maxScore = Math.max(...scores.filter((s) => s > 0), 1);
   const queryLower = query.toLowerCase().trim();
+  const queryIdentifier = queryTokens.join('');
+  const matchesIdentifiers = fields.includes('name');
 
-  const results: t.ToolSearchResult[] = [];
+  const results: Array<{
+    result: t.ToolSearchResult;
+    identifierPriority: number;
+  }> = [];
   for (let i = 0; i < tools.length; i++) {
-    if (scores[i] > 0) {
-      const { field, snippet } = findMatchedField(
-        tools[i],
-        queryTokens,
-        fields
-      );
-      let normalizedScore = Math.min(scores[i] / maxScore, 1.0);
+    const score = scores[i];
+    const hasSearchScore = Number.isFinite(score) && score > 0;
+    let identifierPriority = 0;
+    let normalizedScore = hasSearchScore ? Math.min(score / maxScore, 1.0) : 0;
 
-      const baseName = getBaseToolName(tools[i].name).toLowerCase();
-      if (baseName === queryLower) {
+    if (matchesIdentifiers) {
+      const rawBaseName = getBaseToolName(tools[i].name).toLowerCase();
+      const rawFullName = tools[i].name.toLowerCase();
+      const baseIdentifier = tokenize(rawBaseName).join('');
+      const fullIdentifier = tokenize(rawFullName).join('');
+
+      if (rawFullName === queryLower) {
+        identifierPriority = 4;
         normalizedScore = 1.0;
-      } else if (baseName.startsWith(queryLower)) {
+      } else if (rawBaseName === queryLower) {
+        identifierPriority = 3;
+        normalizedScore = 1.0;
+      } else if (
+        baseIdentifier === queryIdentifier ||
+        fullIdentifier === queryIdentifier
+      ) {
+        identifierPriority = 2;
+        normalizedScore = 1.0;
+      } else if (baseIdentifier.startsWith(queryIdentifier)) {
+        identifierPriority = 1;
         normalizedScore = Math.max(normalizedScore, 0.95);
       }
+    }
 
-      results.push({
+    if (!hasSearchScore && identifierPriority === 0) continue;
+
+    const { field, snippet } = findMatchedField(tools[i], queryTokens, fields);
+    results.push({
+      result: {
         tool_name: tools[i].name,
         match_score: normalizedScore,
         matched_field: field,
         snippet,
-      });
-    }
+      },
+      identifierPriority,
+    });
   }
 
-  results.sort((a, b) => b.match_score - a.match_score);
-  const topResults = results.slice(0, maxResults);
+  results.sort(
+    (a, b) =>
+      b.identifierPriority - a.identifierPriority ||
+      b.result.match_score - a.result.match_score
+  );
+  const topResults = results.slice(0, maxResults).map(({ result }) => result);
 
   return {
     tool_references: topResults,
