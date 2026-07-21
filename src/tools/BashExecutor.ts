@@ -58,17 +58,18 @@ Usage:
 `.trim();
 
 /**
- * Bash statefulness is filesystem-tier: on a warm session the machine (files
- * including /tmp, installed packages, background processes) persists between
- * calls, but each call may start a fresh shell — so shell variables and cwd
- * are NOT reliable, and the machine can be reset at any time. Only /mnt/data
- * is durable.
+ * Bash statefulness is filesystem-tier and scoped to `/mnt/data`. The machine
+ * is warm across calls, but each call runs in a fresh sandbox (new process
+ * tree + private /tmp), so background processes are reaped when the call ends
+ * and anything written outside /mnt/data is discarded. The note must not
+ * promise otherwise: a model told background processes survive will start a
+ * server in one call and assume it is listening in the next.
  */
 export const STATEFUL_BASH_NOTE =
-  'Session state (best-effort): commands in this conversation usually run on the same machine, so files (including /tmp), installed packages, and running background processes from earlier calls typically persist. Each call may still start a fresh shell — do not rely on shell variables or the working directory carrying over — and the machine may be reset at any time. Only /mnt/data is durable.';
+  'Session state: commands in this conversation run on the same warm machine, so files written to /mnt/data persist between calls. Each call runs in a fresh, isolated sandbox: shell variables, the working directory, /tmp, and background processes do NOT survive after the call returns — a process started in one call is terminated when that call ends. Only /mnt/data is durable (the machine itself may also be reset at any time).';
 
 export const StatefulBashExecutionToolDescription = `
-Runs bash commands and returns stdout/stderr output from a session-based execution environment, similar to a long-running machine.
+Runs bash commands and returns stdout/stderr output. Commands in this conversation share one warm machine with a persistent /mnt/data, but each command runs in its own isolated sandbox (not a persistent shell session).
 
 ${STATEFUL_BASH_NOTE}
 
@@ -125,7 +126,7 @@ export function buildBashExecutionToolDescription(options?: {
 const STATELESS_BASH_PARAM_NOTE =
   'The environment is stateless; variables and state don\'t persist between executions.';
 const STATEFUL_BASH_PARAM_NOTE =
-  'Files, installed packages, and background processes usually persist between calls, but each call may start a fresh shell (do not rely on shell variables or cwd) and the machine may reset. Only /mnt/data is durable.';
+  'Files written to /mnt/data persist between calls on the same warm machine. Each call runs in a fresh sandbox: shell variables, cwd, /tmp, and background processes do NOT survive the call. Only /mnt/data is durable.';
 
 export function buildBashExecutionToolSchema(opts?: {
   statefulSessions?: boolean;

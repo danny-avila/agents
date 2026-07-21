@@ -483,10 +483,8 @@ export function shouldTraceToolNodeForLangfuse({
   }
 
   const explicit = langfuse?.toolNodeTracing?.enabled;
-  if (explicit != null) {
-    return (
-      explicit && (hasLangfuseConfigKeys(langfuse) || hasLangfuseEnvKeys())
-    );
+  if (explicit !== true) {
+    return false;
   }
 
   return hasLangfuseConfigKeys(langfuse) || hasLangfuseEnvKeys();

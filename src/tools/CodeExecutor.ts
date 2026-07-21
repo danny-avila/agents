@@ -150,16 +150,18 @@ Usage:
 `.trim();
 
 /**
- * Best-effort statefulness note. Deliberately hedged: warm reuse is an
- * optimization, not a guarantee (the runtime may be reset on idle timeout,
- * eviction, or the 8h VM lifetime), so the model must never depend on carried
- * state for correctness and must persist anything durable to /mnt/data.
+ * Statefulness here is FILESYSTEM-tier, not runtime-tier. Executions in a
+ * session reuse one warm machine, so `/mnt/data` carries across calls — but
+ * every execution is a brand-new interpreter process in a fresh sandbox, so
+ * variables and imports never survive. The note must not imply otherwise: a
+ * model told its in-memory state persists writes `df = ...` in one call and
+ * `df.head()` in the next, then hits a NameError it was told to treat as rare.
  */
 export const STATEFUL_ENV_NOTE =
-  'Session state (best-effort): consecutive executions in this conversation usually share one runtime, so variables, imports, and in-memory data from earlier successful calls are typically still available. The runtime may be reset at any time, so treat carried-over state as an optimization, never a guarantee. Anything that must survive MUST be written to /mnt/data. If a NameError/ImportError signals lost state, re-run the needed setup and continue.';
+  'Session state: executions in this conversation run on the same warm machine, so files persist between calls — but each execution is a NEW process. Variables, imports, and in-memory data NEVER carry over: every call must re-import and rebuild the state it needs. Only /mnt/data is durable (the machine itself may also be reset at any time), so write anything that must survive there and read it back next call.';
 
 export const StatefulCodeExecutionToolDescription = `
-Runs code and returns stdout/stderr output from a session-based execution environment, similar to a long-running command-line session.
+Runs code and returns stdout/stderr output. Executions in this conversation share one warm machine with a persistent /mnt/data, but each execution runs as a separate process (not a notebook-style kernel).
 
 ${STATEFUL_ENV_NOTE}
 
@@ -181,7 +183,7 @@ export function buildCodeExecutionToolDescription(opts?: {
 const STATELESS_CODE_PARAM_NOTE =
   'The environment is stateless; variables and imports don\'t persist between executions.';
 const STATEFUL_CODE_PARAM_NOTE =
-  'Executions in this conversation usually share one runtime: variables and imports from prior successful calls are typically still defined, but the runtime may reset between calls. Rebuild state on NameError/ImportError; persist anything important to /mnt/data.';
+  'Executions in this conversation share one warm machine, so files written to /mnt/data persist between calls. Each execution is a new process: variables and imports do NOT carry over — re-import and reload from /mnt/data every call.';
 
 export function buildCodeExecutionToolSchema(opts?: {
   statefulSessions?: boolean;

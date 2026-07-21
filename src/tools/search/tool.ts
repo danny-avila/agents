@@ -16,6 +16,7 @@ import { createSearchAPI, createSourceProcessor } from './search';
 import { createSerperScraper } from './serper-scraper';
 import { createTavilyScraper } from './tavily-scraper';
 import { createFirecrawlScraper } from './firecrawl';
+import { createCrwScraper } from './crw-scraper';
 import { expandHighlights } from './highlights';
 import { formatResultsForLLM } from './format';
 import { createDefaultLogger } from './utils';
@@ -202,6 +203,8 @@ function createSearchProcessor({
   supportsNews,
   sourceProcessor,
   onGetHighlights,
+  mainExpandBy,
+  separatorExpandBy,
   logger,
 }: {
   safeSearch: t.SearchToolConfig['safeSearch'];
@@ -211,6 +214,8 @@ function createSearchProcessor({
   searchAPI: ReturnType<typeof createSearchAPI>;
   sourceProcessor: ReturnType<typeof createSourceProcessor>;
   onGetHighlights: t.SearchToolConfig['onGetHighlights'];
+  mainExpandBy: t.SearchToolConfig['mainExpandBy'];
+  separatorExpandBy: t.SearchToolConfig['separatorExpandBy'];
   logger: t.Logger;
 }) {
   return async function ({
@@ -259,7 +264,11 @@ function createSearchProcessor({
         numElements: maxSources,
       });
 
-      return expandHighlights(processedSources);
+      return expandHighlights(
+        processedSources,
+        mainExpandBy,
+        separatorExpandBy
+      );
     } catch (error) {
       logger.error('Error in search:', error);
       return {
@@ -339,8 +348,8 @@ function createTool({
 /**
  * Creates a search tool with configurable search and scraper providers.
  *
- * Search providers: Serper (Google results), SearXNG (self-hosted meta-search), Tavily (AI-optimized).
- * Scraper providers: Firecrawl (default, full-featured), Serper (lightweight), Tavily (batch extraction).
+ * Search providers: Serper (Google results), SearXNG (self-hosted meta-search), Tavily (AI-optimized), fastCRW (Firecrawl-compatible, self-host or cloud).
+ * Scraper providers: Firecrawl (default, full-featured), Serper (lightweight), Tavily (batch extraction), fastCRW (Firecrawl-compatible, self-host or cloud).
  *
  * The country schema field is exposed to the LLM for providers that support localized results.
  */
@@ -375,6 +384,8 @@ export const createSearchTool = (
     maxContentLength,
     chunkSize,
     chunkOverlap,
+    mainExpandBy,
+    separatorExpandBy,
     maxOutputChars,
     strategies = ['no_extraction'],
     filterContent = true,
@@ -386,6 +397,10 @@ export const createSearchTool = (
     firecrawlOptions,
     serperScraperOptions,
     tavilyScraperOptions,
+    crwApiKey,
+    crwApiUrl,
+    crwSearchOptions,
+    crwScraperOptions,
     scraperTimeout,
     jinaApiKey,
     jinaApiUrl,
@@ -432,6 +447,9 @@ export const createSearchTool = (
     keenableApiKey,
     keenableApiUrl,
     keenableSearchOptions,
+    crwApiKey,
+    crwApiUrl,
+    crwSearchOptions,
   });
 
   /** Create scraper based on scraperProvider */
@@ -453,6 +471,16 @@ export const createSearchTool = (
         process.env.TAVILY_API_KEY,
       apiUrl: tavilyScraperOptions?.apiUrl ?? tavilyExtractUrl,
       timeout: scraperTimeout ?? tavilyScraperOptions?.timeout,
+      logger,
+    });
+  } else if (scraperProvider === 'crw') {
+    scraperInstance = createCrwScraper({
+      ...crwScraperOptions,
+      apiKey:
+        crwScraperOptions?.apiKey ?? crwApiKey ?? process.env.CRW_API_KEY,
+      apiUrl: crwScraperOptions?.apiUrl ?? crwApiUrl,
+      timeout: scraperTimeout ?? crwScraperOptions?.timeout,
+      formats: crwScraperOptions?.formats ?? ['markdown', 'rawHtml'],
       logger,
     });
   } else {
@@ -501,10 +529,14 @@ export const createSearchTool = (
     // sub-searches would spend rate limit and merge nothing.
     supportsImages: searchProvider !== 'keenable',
     supportsVideos:
-      searchProvider !== 'tavily' && searchProvider !== 'keenable',
+      searchProvider !== 'tavily' &&
+      searchProvider !== 'keenable' &&
+      searchProvider !== 'crw',
     supportsNews: searchProvider !== 'keenable',
     sourceProcessor,
     onGetHighlights,
+    mainExpandBy,
+    separatorExpandBy,
     logger,
   });
 

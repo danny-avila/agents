@@ -25,6 +25,8 @@ type SpanStartRecord = {
   name: string;
   params: ProcessorParams;
   traceId: string;
+  spanId: string;
+  parentSpanId?: string;
 };
 
 const spanStarts: SpanStartRecord[] = [];
@@ -140,11 +142,15 @@ jest.mock('@langfuse/otel', () => ({
   LangfuseSpanProcessor: jest.fn().mockImplementation((params) => ({
     forceFlush: jest.fn(),
     onEnd: jest.fn(),
-    onStart: jest.fn((span) => {
+    onStart: jest.fn((span, parentContext) => {
+      const spanContext = span.spanContext();
+      const parentSpanId = otelTrace.getSpanContext(parentContext)?.spanId;
       spanStarts.push({
         name: span.name,
         params,
-        traceId: span.spanContext().traceId,
+        traceId: spanContext.traceId,
+        spanId: spanContext.spanId,
+        ...(parentSpanId != null ? { parentSpanId } : {}),
       });
     }),
     shutdown: jest.fn(),
@@ -190,7 +196,6 @@ function tenantLangfuse(tenantId: string): t.LangfuseConfig {
     deterministicTraceId: true,
     metadata: { tenantId },
     tags: [`tenant:${tenantId}`],
-    toolNodeTracing: { enabled: true },
     toolOutputTracing: { enabled: true },
   };
 }
@@ -236,6 +241,23 @@ function expectNamedSpansUseTraceId({
     expect(
       matching.filter((record) => record.traceId !== traceId)
     ).toHaveLength(0);
+  }
+}
+
+function expectChildSpanParentName({
+  starts,
+  childName,
+  parentNamePrefix,
+}: {
+  starts: SpanStartRecord[];
+  childName: string;
+  parentNamePrefix: string;
+}): void {
+  const children = starts.filter((record) => record.name === childName);
+  expect(children).not.toHaveLength(0);
+  for (const child of children) {
+    const parent = starts.find((record) => record.spanId === child.parentSpanId);
+    expect(parent?.name.startsWith(parentNamePrefix)).toBe(true);
   }
 }
 
@@ -446,6 +468,23 @@ describe('Langfuse per-run routing integration', () => {
     getChatModelClassSpy.mockRestore();
   });
 
+  it('keeps tool observations attached to the exported dispatch parent', async () => {
+    await runTenantFlow('tenant-hierarchy');
+
+    const starts = startsForTenant('tenant-hierarchy');
+    expect(starts.some((record) => record.name === 'tool_batch')).toBe(false);
+    expectChildSpanParentName({
+      starts,
+      childName: 'echo',
+      parentNamePrefix: 'tools=',
+    });
+    expectChildSpanParentName({
+      starts,
+      childName: 'subagent',
+      parentNamePrefix: 'tools=',
+    });
+  });
+
   it('routes parallel root, model, tool, subagent, and title spans to each run config', async () => {
     await Promise.all([runTenantFlow('tenant-a'), runTenantFlow('tenant-b')]);
 
@@ -462,9 +501,15 @@ describe('Langfuse per-run routing integration', () => {
         names: [
           `LibreChat Agent: Parent ${tenantId}`,
           'FakeChatModel',
-          'tool_batch',
+          'echo',
           'subagent',
         ],
+      });
+      expect(starts.some((record) => record.name === 'tool_batch')).toBe(false);
+      expectChildSpanParentName({
+        starts,
+        childName: 'echo',
+        parentNamePrefix: 'tools=',
       });
       expectNamedSpansUseTraceId({
         starts,
