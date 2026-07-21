@@ -387,6 +387,25 @@ describe('ToolSearch', () => {
       expect(result.tool_references[0].matched_field).toBe('parameters');
     });
 
+    it('returns no matches when every selected field is empty', () => {
+      const tools: ToolMetadata[] = [
+        {
+          name: 'get_weather',
+          description: 'Get the weather',
+          parameters: undefined,
+        },
+        {
+          name: 'send_email',
+          description: 'Send an email',
+          parameters: undefined,
+        },
+      ];
+
+      const result = performLocalSearch(tools, 'query', ['parameters'], 10);
+
+      expect(result.tool_references).toEqual([]);
+    });
+
     it('prioritizes name matches over description matches', () => {
       const result = performLocalSearch(
         mockTools,

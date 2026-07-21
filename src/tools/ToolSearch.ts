@@ -536,8 +536,10 @@ function performLocalSearch(
     identifierPriority: number;
   }> = [];
   for (let i = 0; i < tools.length; i++) {
+    const score = scores[i];
+    const hasSearchScore = Number.isFinite(score) && score > 0;
     let identifierPriority = 0;
-    let normalizedScore = Math.min(scores[i] / maxScore, 1.0);
+    let normalizedScore = hasSearchScore ? Math.min(score / maxScore, 1.0) : 0;
 
     if (matchesIdentifiers) {
       const rawBaseName = getBaseToolName(tools[i].name).toLowerCase();
@@ -563,7 +565,7 @@ function performLocalSearch(
       }
     }
 
-    if (scores[i] <= 0 && identifierPriority === 0) continue;
+    if (!hasSearchScore && identifierPriority === 0) continue;
 
     const { field, snippet } = findMatchedField(tools[i], queryTokens, fields);
     results.push({
