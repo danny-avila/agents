@@ -36,6 +36,17 @@ Examples:
 - "in" for India
 `.trim();
 
+export const DEFAULT_DATE_DESCRIPTION =
+  `Optional publication or update date filter.
+Only provide this when the user explicitly requests recent results. Search providers filter using detected dates, which may exclude relevant pages without a detectable publication or update date. Otherwise, omit this parameter.
+Values:
+- "h": past hour
+- "d": past 24 hours
+- "w": past week
+- "m": past month
+- "y": past year
+`.trim();
+
 export const querySchema = {
   type: 'string',
   description: DEFAULT_QUERY_DESCRIPTION,
@@ -44,7 +55,7 @@ export const querySchema = {
 export const dateSchema = {
   type: 'string',
   enum: Object.values(DATE_RANGE),
-  description: 'Date range for search results.',
+  description: DEFAULT_DATE_DESCRIPTION,
 } as const;
 
 export const countrySchema = {

@@ -80,7 +80,8 @@ export interface TavilySearchOptions {
   includeDomains?: string[];
   excludeDomains?: string[];
   topic?: 'general' | 'news' | 'finance';
-  timeRange?: TavilyTimeRangeInput;
+  /** Pin a time range, or set false to ignore tool-requested date filters. */
+  timeRange?: TavilyTimeRangeInput | false;
   includeImageDescriptions?: boolean;
   includeFavicon?: boolean;
   chunksPerSource?: number;
