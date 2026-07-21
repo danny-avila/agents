@@ -312,6 +312,186 @@ describe('Subagent Integration', () => {
     createWorkflowSpy.mockRestore();
   });
 
+  it('forwards event-driven tools through nested child graphs', async () => {
+    const originalCreateWorkflow = StandardGraph.prototype.createWorkflow;
+    const parentToolHandler = jest.fn(
+      (_event: string, rawData: unknown): void => {
+        const request = rawData as t.ToolExecuteBatchRequest;
+        request.resolve(
+          request.toolCalls.map((call) => ({
+            toolCallId: call.id,
+            status: 'success' as const,
+            content: `ran ${call.name}`,
+          }))
+        );
+      }
+    );
+    const parentUpdateHandler = jest.fn();
+    let specialistToolDefinitions: t.LCTool[] | undefined;
+    let forwardedToolResults: t.ToolExecuteResult[] | undefined;
+
+    const createWorkflowSpy = jest
+      .spyOn(StandardGraph.prototype, 'createWorkflow')
+      .mockImplementation(function (this: StandardGraph) {
+        const workflow = originalCreateWorkflow.call(this);
+        if (this.defaultAgentId === 'router') {
+          return {
+            invoke: jest.fn(async () => {
+              const routerContext = this.agentContexts.get('router');
+              const nestedTool = (
+                routerContext?.graphTools as t.GenericTool[] | undefined
+              )?.find(
+                (tool) => 'name' in tool && tool.name === Constants.SUBAGENT
+              );
+              if (nestedTool == null) {
+                throw new Error('Nested subagent tool was not created');
+              }
+              await nestedTool.invoke(
+                {
+                  description: 'Use the event-driven lookup tool.',
+                  subagent_type: 'specialist',
+                },
+                callerConfig
+              );
+              return { messages: [new AIMessage('router done')] };
+            }),
+          } as unknown as ReturnType<StandardGraph['createWorkflow']>;
+        }
+        if (this.defaultAgentId === 'specialist') {
+          specialistToolDefinitions =
+            this.agentContexts.get('specialist')?.toolDefinitions;
+          return {
+            invoke: jest.fn(async (_state, options) => {
+              const invokeOptions = options as
+                | { callbacks?: unknown[] }
+                | undefined;
+              const forwarder = (invokeOptions?.callbacks ?? [])[0] as
+                | {
+                    handleCustomEvent?: (
+                      eventName: string,
+                      data: unknown,
+                      runId: string
+                    ) => Promise<void> | void;
+                  }
+                | undefined;
+              if (forwarder?.handleCustomEvent != null) {
+                forwardedToolResults = await new Promise<t.ToolExecuteResult[]>(
+                  (resolve, reject) => {
+                    const request: t.ToolExecuteBatchRequest = {
+                      toolCalls: [
+                        { id: 'nested-call', name: 'mcp_lookup', args: {} },
+                      ],
+                      agentId: 'specialist',
+                      resolve,
+                      reject,
+                    };
+                    void forwarder.handleCustomEvent?.(
+                      GraphEvents.ON_TOOL_EXECUTE,
+                      request,
+                      'specialist-run'
+                    );
+                  }
+                );
+                await forwarder.handleCustomEvent(
+                  GraphEvents.ON_RUN_STEP,
+                  { id: 'specialist-step', type: 'tool_calls' },
+                  'specialist-run'
+                );
+              }
+              return { messages: [new AIMessage('specialist done')] };
+            }),
+          } as unknown as ReturnType<StandardGraph['createWorkflow']>;
+        }
+        return workflow;
+      });
+
+    const rootAgent: t.AgentInputs = {
+      agentId: 'root',
+      provider: Providers.OPENAI,
+      clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+      instructions: 'Delegate through the router.',
+      maxContextTokens: 8000,
+      maxSubagentDepth: 2,
+      subagentConfigs: [
+        {
+          type: 'router',
+          name: 'Router',
+          description: 'Routes work to specialists.',
+          allowNested: true,
+          agentInputs: {
+            agentId: 'router',
+            provider: Providers.OPENAI,
+            clientOptions: { modelName: 'gpt-4o-mini', apiKey: 'test-key' },
+            instructions: 'Delegate to the specialist.',
+            maxContextTokens: 8000,
+            subagentConfigs: [
+              {
+                type: 'specialist',
+                name: 'Specialist',
+                description: 'Uses an event-driven tool.',
+                agentInputs: {
+                  agentId: 'specialist',
+                  provider: Providers.OPENAI,
+                  clientOptions: {
+                    modelName: 'gpt-4o-mini',
+                    apiKey: 'test-key',
+                  },
+                  instructions: 'Use the lookup tool.',
+                  maxContextTokens: 8000,
+                  toolDefinitions: [{ name: 'mcp_lookup' }],
+                },
+              },
+            ],
+          },
+        },
+      ],
+    };
+
+    try {
+      const run = await Run.create<t.IState>({
+        runId: `nested-event-tools-${Date.now()}`,
+        graphConfig: { type: 'standard', agents: [rootAgent] },
+        customHandlers: {
+          [GraphEvents.ON_TOOL_EXECUTE]: { handle: parentToolHandler },
+          [GraphEvents.ON_SUBAGENT_UPDATE]: {
+            handle: parentUpdateHandler,
+          },
+        },
+        returnContent: true,
+        skipCleanup: true,
+      });
+      const rootContext = (run.Graph as StandardGraph).agentContexts.get(
+        'root'
+      );
+      const rootSubagentTool = (
+        rootContext?.graphTools as t.GenericTool[] | undefined
+      )?.find((tool) => 'name' in tool && tool.name === Constants.SUBAGENT);
+      expect(rootSubagentTool).toBeDefined();
+
+      await rootSubagentTool!.invoke(
+        { description: 'Route this task.', subagent_type: 'router' },
+        callerConfig
+      );
+
+      expect(specialistToolDefinitions).toEqual([{ name: 'mcp_lookup' }]);
+      expect(parentToolHandler).toHaveBeenCalledTimes(1);
+      expect(forwardedToolResults).toEqual([
+        {
+          toolCallId: 'nested-call',
+          status: 'success',
+          content: 'ran mcp_lookup',
+        },
+      ]);
+      const forwardedSubagentTypes = parentUpdateHandler.mock.calls.map(
+        ([, data]) => (data as t.SubagentUpdateEvent).subagentType
+      );
+      expect(forwardedSubagentTypes).toContain('router');
+      expect(forwardedSubagentTypes).not.toContain('specialist');
+    } finally {
+      createWorkflowSpy.mockRestore();
+    }
+  });
+
   it('should not create subagent tool when maxSubagentDepth is 0', async () => {
     const agentWithZeroDepth: t.AgentInputs = {
       ...createParentAgent(),
