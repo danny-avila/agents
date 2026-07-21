@@ -631,6 +631,50 @@ export function convertBaseMessagesToContent(
   ).content;
 }
 
+/**
+ * Gemini models that reject a request whose `contents` end with a `model`-role
+ * turn (a "prefill"). Google enforces this on newer generations (Gemini 3.6
+ * Flash, Gemini 3.5 Flash-Lite) while older/sibling models still accept a
+ * trailing model turn, so the rule is model-scoped rather than version-wide.
+ * Extend this list as Google applies the restriction to further models.
+ * @see https://ai.google.dev/gemini-api/docs/latest-model#api-changes-and-parameter-updates
+ */
+const NO_PREFILL_GEMINI_MODELS = [
+  'gemini-3.6-flash',
+  'gemini-3.5-flash-lite',
+] as const;
+
+export function rejectsModelTurnPrefill(model?: string): boolean {
+  if (model == null || model === '') {
+    return false;
+  }
+  const modelId = model.toLowerCase().split('/').pop() ?? '';
+  return NO_PREFILL_GEMINI_MODELS.some(
+    (id) => modelId === id || modelId.startsWith(`${id}-`)
+  );
+}
+
+/**
+ * Drops trailing `model`-role turns for models that reject prefill (see
+ * {@link rejectsModelTurnPrefill}). Such a turn is only produced by prefill
+ * flows (e.g. editing an assistant reply and resubmitting); these models return
+ * HTTP 400 for it, so we drop it and let the model generate fresh from the
+ * preceding user turn. No-op for every other model, preserving working prefill.
+ */
+export function dropUnsupportedModelTurnPrefill(
+  contents: Content[] | undefined,
+  model?: string
+): Content[] | undefined {
+  if (contents == null || contents.length === 0 || !rejectsModelTurnPrefill(model)) {
+    return contents;
+  }
+  let end = contents.length;
+  while (end > 1 && contents[end - 1]?.role === 'model') {
+    end -= 1;
+  }
+  return end === contents.length ? contents : contents.slice(0, end);
+}
+
 export function convertResponseContentToChatGenerationChunk(
   response: EnhancedGenerateContentResponse,
   extra: {
