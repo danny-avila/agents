@@ -850,6 +850,27 @@ describe('ToolSearch', () => {
       expect(result.tool_references[0].match_score).toBe(1.0);
     });
 
+    it('finds camelCase tools by a lowercased exact name', () => {
+      const tools: ToolMetadata[] = [
+        {
+          name: 'addActivity',
+          description: 'Create an activity',
+          parameters: undefined,
+        },
+        {
+          name: 'addPerson',
+          description: 'Create a person',
+          parameters: undefined,
+        },
+      ];
+
+      const result = performLocalSearch(tools, 'addperson', ['name'], 10);
+
+      expect(result.tool_references).toHaveLength(1);
+      expect(result.tool_references[0].tool_name).toBe('addPerson');
+      expect(result.tool_references[0].match_score).toBe(1.0);
+    });
+
     it('prioritizes an exact full camelCase MCP tool ID', () => {
       const tools: ToolMetadata[] = [
         {

@@ -535,47 +535,46 @@ function performLocalSearch(
     identifierPriority: number;
   }> = [];
   for (let i = 0; i < tools.length; i++) {
-    if (scores[i] > 0) {
-      const { field, snippet } = findMatchedField(
-        tools[i],
-        queryTokens,
-        fields
-      );
-      let normalizedScore = Math.min(scores[i] / maxScore, 1.0);
+    const rawBaseName = getBaseToolName(tools[i].name).toLowerCase();
+    const rawFullName = tools[i].name.toLowerCase();
+    const baseIdentifier = tokenize(rawBaseName).join('');
+    const fullIdentifier = tokenize(rawFullName).join('');
+    let identifierPriority = 0;
+    let normalizedScore = Math.min(scores[i] / maxScore, 1.0);
 
-      const rawBaseName = getBaseToolName(tools[i].name).toLowerCase();
-      const rawFullName = tools[i].name.toLowerCase();
-      const baseIdentifier = tokenize(rawBaseName).join('');
-      const fullIdentifier = tokenize(rawFullName).join('');
-      let identifierPriority = 0;
-
-      if (rawFullName === queryLower) {
-        identifierPriority = 4;
-        normalizedScore = 1.0;
-      } else if (rawBaseName === queryLower) {
-        identifierPriority = 3;
-        normalizedScore = 1.0;
-      } else if (
-        baseIdentifier === queryIdentifier ||
-        fullIdentifier === queryIdentifier
-      ) {
-        identifierPriority = 2;
-        normalizedScore = 1.0;
-      } else if (baseIdentifier.startsWith(queryIdentifier)) {
-        identifierPriority = 1;
-        normalizedScore = Math.max(normalizedScore, 0.95);
-      }
-
-      results.push({
-        result: {
-          tool_name: tools[i].name,
-          match_score: normalizedScore,
-          matched_field: field,
-          snippet,
-        },
-        identifierPriority,
-      });
+    if (rawFullName === queryLower) {
+      identifierPriority = 4;
+      normalizedScore = 1.0;
+    } else if (rawBaseName === queryLower) {
+      identifierPriority = 3;
+      normalizedScore = 1.0;
+    } else if (
+      baseIdentifier === queryIdentifier ||
+      fullIdentifier === queryIdentifier
+    ) {
+      identifierPriority = 2;
+      normalizedScore = 1.0;
+    } else if (baseIdentifier.startsWith(queryIdentifier)) {
+      identifierPriority = 1;
+      normalizedScore = Math.max(normalizedScore, 0.95);
     }
+
+    if (scores[i] <= 0 && identifierPriority === 0) continue;
+
+    const { field, snippet } = findMatchedField(
+      tools[i],
+      queryTokens,
+      fields
+    );
+    results.push({
+      result: {
+        tool_name: tools[i].name,
+        match_score: normalizedScore,
+        matched_field: field,
+        snippet,
+      },
+      identifierPriority,
+    });
   }
 
   results.sort(
