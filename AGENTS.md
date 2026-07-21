@@ -86,9 +86,20 @@ Multi-line imports count total character length across all lines. Consolidate va
 | `npx tsc --noEmit`   | Type-check without emitting        |
 | `npx eslint src/`    | Lint source files                  |
 
-- Package manager: Yarn (`.yarn/` directory, `yarn.lock`)
+- Package manager: **npm** (`package-lock.json`, `packageManager: npm@10.5.2`)
 - TypeScript with path aliases: `@/*` → `src/*`
 - Test framework: Jest with `ts-jest`
+
+---
+
+## Dependency Management
+
+- **Prefer bumping the parent over adding an `overrides` entry.** When a transitive dependency is flagged (e.g. by `npm audit`), first check whether a package we actually declare has a newer version whose range already pulls the patched dependency — bump that parent instead. Fixing at the source is always preferred to overriding.
+- **Overrides are a last resort.** Only add one when no parent bump can supply the fix (e.g. an unmaintained parent, or a fix requiring a version the parent's range disallows). Every override is maintenance debt that must be revisited on future upgrades.
+- **Hard-bump direct deps explicitly; do not rely on `npm audit fix`.** Set the target version in `package.json`, run `npm install`, then re-run `npm audit` to confirm. `npm audit fix` makes opaque, wide-reaching changes.
+- **Keep overrides minimal and current.** A stale override that force-pins an old major can silently downgrade unrelated consumers into a semver-violating resolution — verify with `npm ls <pkg> --all` that a pin isn't harming packages that expect a newer major. Bump or delete overrides that are no longer needed.
+- **Use reference overrides (`"$name"`) to dedupe** a transitive copy to the version we already declare (e.g. `"uuid": "$uuid"`) instead of hard-coding a duplicate version string.
+- **After any dependency change**, verify the tree stays healthy: `npm install` → `npm audit` (expect 0) → `npx tsc --noEmit` → `npx eslint src/` → a `npx jest` smoke run, since overrides frequently affect dev/build tooling (eslint, jest, typescript-eslint).
 
 ---
 
