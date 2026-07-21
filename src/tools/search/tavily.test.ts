@@ -169,6 +169,24 @@ describe('Tavily search API', () => {
     expect(payload).not.toHaveProperty('time_range');
   });
 
+  it('omits unsupported hourly filtering from the Tavily tool schema', () => {
+    const searchTool = createSearchTool({
+      searchProvider: 'tavily',
+      tavilyApiKey: 'test-key',
+      scraperProvider: 'tavily',
+      rerankerType: 'none',
+      logger: mockLogger,
+    });
+
+    expect(searchTool.schema).toMatchObject({
+      properties: {
+        date: {
+          enum: ['d', 'w', 'm', 'y'],
+        },
+      },
+    });
+  });
+
   it('omits country for Tavily news searches', async () => {
     mockedAxios.post.mockResolvedValueOnce({
       data: {
