@@ -360,6 +360,33 @@ describe('ToolSearch', () => {
       expect(result.tool_references[0].match_score).toBeGreaterThan(0);
     });
 
+    it('does not match tool names when searching only parameters', () => {
+      const tools: ToolMetadata[] = [
+        {
+          name: 'query',
+          description: 'A tool whose name matches but parameters do not',
+          parameters: {
+            type: 'object',
+            properties: { value: { type: 'string' } },
+          },
+        },
+        {
+          name: 'run_database_query',
+          description: 'Run a database query',
+          parameters: {
+            type: 'object',
+            properties: { query: { type: 'string' } },
+          },
+        },
+      ];
+
+      const result = performLocalSearch(tools, 'query', ['parameters'], 1);
+
+      expect(result.tool_references).toHaveLength(1);
+      expect(result.tool_references[0].tool_name).toBe('run_database_query');
+      expect(result.tool_references[0].matched_field).toBe('parameters');
+    });
+
     it('prioritizes name matches over description matches', () => {
       const result = performLocalSearch(
         mockTools,
@@ -929,9 +956,9 @@ describe('ToolSearch', () => {
 
         const result = performLocalSearch(tools, matchingTool, ['name'], 10);
 
-        expect(result.tool_references.map(({ tool_name }) => tool_name)).toEqual(
-          [matchingTool]
-        );
+        expect(
+          result.tool_references.map(({ tool_name }) => tool_name)
+        ).toEqual([matchingTool]);
       }
     );
 

@@ -529,43 +529,43 @@ function performLocalSearch(
   const maxScore = Math.max(...scores.filter((s) => s > 0), 1);
   const queryLower = query.toLowerCase().trim();
   const queryIdentifier = queryTokens.join('');
+  const matchesIdentifiers = fields.includes('name');
 
   const results: Array<{
     result: t.ToolSearchResult;
     identifierPriority: number;
   }> = [];
   for (let i = 0; i < tools.length; i++) {
-    const rawBaseName = getBaseToolName(tools[i].name).toLowerCase();
-    const rawFullName = tools[i].name.toLowerCase();
-    const baseIdentifier = tokenize(rawBaseName).join('');
-    const fullIdentifier = tokenize(rawFullName).join('');
     let identifierPriority = 0;
     let normalizedScore = Math.min(scores[i] / maxScore, 1.0);
 
-    if (rawFullName === queryLower) {
-      identifierPriority = 4;
-      normalizedScore = 1.0;
-    } else if (rawBaseName === queryLower) {
-      identifierPriority = 3;
-      normalizedScore = 1.0;
-    } else if (
-      baseIdentifier === queryIdentifier ||
-      fullIdentifier === queryIdentifier
-    ) {
-      identifierPriority = 2;
-      normalizedScore = 1.0;
-    } else if (baseIdentifier.startsWith(queryIdentifier)) {
-      identifierPriority = 1;
-      normalizedScore = Math.max(normalizedScore, 0.95);
+    if (matchesIdentifiers) {
+      const rawBaseName = getBaseToolName(tools[i].name).toLowerCase();
+      const rawFullName = tools[i].name.toLowerCase();
+      const baseIdentifier = tokenize(rawBaseName).join('');
+      const fullIdentifier = tokenize(rawFullName).join('');
+
+      if (rawFullName === queryLower) {
+        identifierPriority = 4;
+        normalizedScore = 1.0;
+      } else if (rawBaseName === queryLower) {
+        identifierPriority = 3;
+        normalizedScore = 1.0;
+      } else if (
+        baseIdentifier === queryIdentifier ||
+        fullIdentifier === queryIdentifier
+      ) {
+        identifierPriority = 2;
+        normalizedScore = 1.0;
+      } else if (baseIdentifier.startsWith(queryIdentifier)) {
+        identifierPriority = 1;
+        normalizedScore = Math.max(normalizedScore, 0.95);
+      }
     }
 
     if (scores[i] <= 0 && identifierPriority === 0) continue;
 
-    const { field, snippet } = findMatchedField(
-      tools[i],
-      queryTokens,
-      fields
-    );
+    const { field, snippet } = findMatchedField(tools[i], queryTokens, fields);
     results.push({
       result: {
         tool_name: tools[i].name,
@@ -582,9 +582,7 @@ function performLocalSearch(
       b.identifierPriority - a.identifierPriority ||
       b.result.match_score - a.result.match_score
   );
-  const topResults = results
-    .slice(0, maxResults)
-    .map(({ result }) => result);
+  const topResults = results.slice(0, maxResults).map(({ result }) => result);
 
   return {
     tool_references: topResults,
