@@ -34,7 +34,7 @@ import type {
 import type * as t from '@/types';
 import { Providers as providers, GraphEvents } from '@/common';
 import * as events from '@/utils/events';
-import { HookRegistry } from '@/hooks';
+import { HookRegistry, createToolPolicyHook } from '@/hooks';
 import { ToolNode } from '../ToolNode';
 
 async function flushAsyncWork(): Promise<void> {
@@ -253,6 +253,119 @@ describe('ToolNode HITL — `ask` decision raises interrupt() when humanInTheLoo
         allowed_decisions: ['approve', 'reject', 'edit', 'respond'],
       },
     ]);
+  });
+
+  it('waits for approval before executing an explicit ask rule in bypass mode', async () => {
+    let toolExecuted = false;
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data) => {
+        if (event !== 'on_tool_execute') {
+          return;
+        }
+        toolExecuted = true;
+        const request = data as {
+          resolve: (results: t.ToolExecuteResult[]) => void;
+        };
+        request.resolve([
+          { toolCallId: 'call_1', content: 'deleted', status: 'success' },
+        ]);
+      });
+    const registry = new HookRegistry();
+    registry.register('PreToolUse', {
+      hooks: [
+        createToolPolicyHook({
+          mode: 'bypass',
+          ask: ['dangerous_*'],
+        }),
+      ],
+    });
+    const node = new ToolNode({
+      tools: [createSchemaStub('dangerous_tool')],
+      eventDrivenMode: true,
+      agentId: 'agent-x',
+      toolCallStepIds: new Map([['call_1', 'step_call_1']]),
+      hookRegistry: registry,
+      humanInTheLoop: { enabled: true },
+    });
+    const graph = buildHITLGraph(node, [
+      {
+        id: 'call_1',
+        name: 'dangerous_tool',
+        args: { command: 'delete data' },
+      },
+    ]);
+    const config = {
+      configurable: { thread_id: 'thread-bypass-explicit-ask' },
+    };
+
+    const interrupted = await graph.invoke({ messages: [] }, config);
+
+    expect(isInterrupted<t.HumanInterruptPayload>(interrupted)).toBe(true);
+    expect(toolExecuted).toBe(false);
+
+    const resumed = (await resumeGraph(
+      graph,
+      interrupted,
+      [{ type: 'approve' }],
+      config
+    )) as { messages: BaseMessage[] };
+
+    expect(toolExecuted).toBe(true);
+    expect(
+      resumed.messages.some(
+        (message) =>
+          message._getType() === 'tool' &&
+          (message as ToolMessage).tool_call_id === 'call_1' &&
+          message.content === 'deleted'
+      )
+    ).toBe(true);
+  });
+
+  it('executes an unmatched tool without interruption in bypass mode', async () => {
+    let toolExecuted = false;
+    jest
+      .spyOn(events, 'safeDispatchCustomEvent')
+      .mockImplementation(async (event, data) => {
+        if (event !== 'on_tool_execute') {
+          return;
+        }
+        toolExecuted = true;
+        const request = data as {
+          resolve: (results: t.ToolExecuteResult[]) => void;
+        };
+        request.resolve([
+          { toolCallId: 'call_1', content: 'read result', status: 'success' },
+        ]);
+      });
+    const registry = new HookRegistry();
+    registry.register('PreToolUse', {
+      hooks: [
+        createToolPolicyHook({
+          mode: 'bypass',
+          ask: ['dangerous_*'],
+        }),
+      ],
+    });
+    const node = new ToolNode({
+      tools: [createSchemaStub('read_tool')],
+      eventDrivenMode: true,
+      agentId: 'agent-x',
+      toolCallStepIds: new Map([['call_1', 'step_call_1']]),
+      hookRegistry: registry,
+      humanInTheLoop: { enabled: true },
+    });
+    const graph = buildHITLGraph(node, [
+      { id: 'call_1', name: 'read_tool', args: { command: 'read data' } },
+    ]);
+
+    const result = await graph.invoke(
+      { messages: [] },
+      { configurable: { thread_id: 'thread-bypass-unmatched' } }
+    );
+
+    expect(isInterrupted(result)).toBe(false);
+    expect(toolExecuted).toBe(true);
   });
 
   it('resume with approve runs the tool through the host event path', async () => {

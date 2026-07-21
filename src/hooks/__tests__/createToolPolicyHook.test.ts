@@ -98,12 +98,12 @@ describe('createToolPolicyHook — bypass mode', () => {
     expect((await callHook(hook, 'read_file')).decision).toBe('allow');
   });
 
-  it('overrides explicit ask patterns (bypass means stop asking)', async () => {
+  it('still asks tools that match an explicit ask pattern', async () => {
     const hook = createToolPolicyHook({
       mode: 'bypass',
       ask: ['execute_*'],
     });
-    expect((await callHook(hook, 'execute_code')).decision).toBe('allow');
+    expect((await callHook(hook, 'execute_code')).decision).toBe('ask');
   });
 });
 
@@ -154,6 +154,15 @@ describe('createToolPolicyHook — pattern matching', () => {
 });
 
 describe('createToolPolicyHook — precedence', () => {
+  it('deny wins over ask', async () => {
+    const hook = createToolPolicyHook({
+      mode: 'default',
+      deny: ['execute_delete'],
+      ask: ['execute_*'],
+    });
+    expect((await callHook(hook, 'execute_delete')).decision).toBe('deny');
+  });
+
   it('deny wins over allow', async () => {
     const hook = createToolPolicyHook({
       mode: 'default',
@@ -173,13 +182,13 @@ describe('createToolPolicyHook — precedence', () => {
     expect((await callHook(hook, 'anything_else')).decision).toBe('allow');
   });
 
-  it('allow wins over ask in default mode', async () => {
+  it('ask wins over allow in default mode', async () => {
     const hook = createToolPolicyHook({
       mode: 'default',
       allow: ['execute_safe'],
       ask: ['execute_*'],
     });
-    expect((await callHook(hook, 'execute_safe')).decision).toBe('allow');
+    expect((await callHook(hook, 'execute_safe')).decision).toBe('ask');
     expect((await callHook(hook, 'execute_dangerous')).decision).toBe('ask');
   });
 });
