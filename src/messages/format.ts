@@ -1046,6 +1046,14 @@ export const labelContentByAgent = (
 
   for (let i = 0; i < contentParts.length; i++) {
     const part = contentParts[i];
+    /** UI-only progress headers are not agent content and must not disturb
+     *  agent state: a label with no `agentIdMap` entry would otherwise look
+     *  like an agent change, flushing the buffer and resetting an open
+     *  transfer capture so the transferred agent's following chunks lose
+     *  their frame. Skipped before any state transition below. */
+    if (part.type === ContentTypes.ACTIVITY_LABEL) {
+      continue;
+    }
     const agentId = agentIdMap[i];
 
     // Check if this is a transfer tool call
@@ -1088,12 +1096,6 @@ export const labelContentByAgent = (
       transferToolCallId = undefined;
       currentAgentId = undefined;
       result.push(part);
-    } else if (part.type === ContentTypes.ACTIVITY_LABEL) {
-      /** UI-only progress headers are not agent content. Buffering one
-       *  would open (or keep alive) a transfer capture whose formatter
-       *  emits only the `--- Transfer to X ---` frame with nothing inside,
-       *  and would attribute the label to the agent. */
-      continue;
     } else {
       agentContentBuffer.push(part);
     }

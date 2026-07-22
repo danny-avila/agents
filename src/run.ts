@@ -52,6 +52,7 @@ import { createTokenCounter, encodingForModel } from '@/utils/tokens';
 import { initializeLangfuseTracing } from './instrumentation';
 import { GraphEvents, Callback, TitleMethod } from '@/common';
 import { MultiAgentGraph } from '@/graphs/MultiAgentGraph';
+import { getTraceIdSeed } from '@/langfuseRuntimeContext';
 import { StandardGraph } from '@/graphs/Graph';
 import { initializeModel } from '@/llm/init';
 import { HandlerRegistry } from '@/events';
@@ -1566,17 +1567,22 @@ export class Run<_T extends t.BaseGraphState> {
       labelContext?.langfuse
     );
     initializeLangfuseTracing(labelLangfuseConfig);
-    /** One seed for the handler AND the runtime scope: the scoped handler
-     *  prefers an inherited runtime seed, so passing the label seed only to
-     *  the handler would let the parent run's seed win and collapse label
-     *  generations into the main run trace.
-     *
-     *  Always computed — `runWithLangfuseRuntimeContext` spreads the
-     *  surrounding context, so an ABSENT seed INHERITS the parent's rather
-     *  than clearing it. A per-label seed is the only way to guarantee the
-     *  label never shares the parent's trace id; uniqueness comes from the
-     *  run id plus a per-run sequence. */
-    const labelTraceSeed = traceSeed ?? `activity-label-${this.id}-${labelSeq}`;
+    /** Seed policy, threading two constraints:
+     *  1. `runWithLangfuseRuntimeContext` SPREADS the surrounding context, so
+     *     an absent seed INHERITS the parent run's and collapses every label
+     *     into that trace. When a parent seed is active we must override it
+     *     with a per-label one.
+     *  2. Without deterministic tracing there is no parent seed, and forcing
+     *     one here would make label trace ids deterministic when neither
+     *     `processStream` nor `generateTitle` are — so leave it unset.
+     *  Seeded when determinism is opted into OR a parent seed is live;
+     *  otherwise unseeded, matching the other generation paths. */
+    const inheritedTraceSeed = getTraceIdSeed();
+    const labelTraceSeed =
+      labelLangfuseConfig?.deterministicTraceId === true ||
+      inheritedTraceSeed != null
+        ? (traceSeed ?? `activity-label-${this.id}-${labelSeq}`)
+        : undefined;
     const labelRuntimeScope = resolveLangfuseRuntimeScope({
       runLangfuse: this.langfuse,
       langfuseOverlay: labelContext?.langfuse,
@@ -1613,12 +1619,45 @@ export class Run<_T extends t.BaseGraphState> {
     /** The label prompt becomes Langfuse generation input, so the resolved
      *  tool-output redaction policy (global disable / redactedToolNames)
      *  applies to it exactly as to structured tool observations. */
-    const redaction = hasToolOutputTracingConfig(
+    let redaction = hasToolOutputTracingConfig(
       this.langfuse,
       labelContext?.langfuse
     )
       ? resolveToolOutputTracingConfig(this.langfuse, labelContext?.langfuse)
       : undefined;
+    /** Multi-agent graph with no `agentId`: the caller did not say WHICH
+     *  agent ran this batch, so resolving from the default agent could trace
+     *  raw output that a stricter sibling's policy forbids. Fold every
+     *  agent's policy into the strictest one instead of guessing. */
+    const agentContexts = this.Graph?.agentContexts;
+    if (agentId == null && agentContexts != null && agentContexts.size > 1) {
+      for (const context of agentContexts.values()) {
+        if (!hasToolOutputTracingConfig(this.langfuse, context.langfuse)) {
+          continue;
+        }
+        const candidate = resolveToolOutputTracingConfig(
+          this.langfuse,
+          context.langfuse
+        );
+        if (redaction == null) {
+          redaction = candidate;
+          continue;
+        }
+        redaction = {
+          enabled: redaction.enabled === false ? false : candidate.enabled,
+          redactedToolNames: new Set([
+            ...redaction.redactedToolNames,
+            ...candidate.redactedToolNames,
+          ]),
+          redactedToolNameMatchMode:
+            redaction.redactedToolNameMatchMode === 'partial' ||
+            candidate.redactedToolNameMatchMode === 'partial'
+              ? 'partial'
+              : 'exact',
+          redactionText: redaction.redactionText,
+        };
+      }
+    }
     /** An active redaction policy suppresses free-form reasoning/intent, so
      *  a reasoning-only block has nothing describable left — skip the model
      *  call rather than paying for a label built from the prompt alone. */

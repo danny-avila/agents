@@ -1,8 +1,8 @@
-import { getTraceIdSeed } from '@/langfuseRuntimeContext';
 import {
   resolveLangfuseRuntimeScope,
   withLangfuseRuntimeScope,
 } from '@/langfuseRuntimeScope';
+import { getTraceIdSeed } from '@/langfuseRuntimeContext';
 
 /**
  * `generateActivityLabel` passes one label seed to both the Langfuse handler
