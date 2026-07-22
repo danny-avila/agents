@@ -917,6 +917,14 @@ function labelAllAgentContent(
 
   for (let i = 0; i < contentParts.length; i++) {
     const part = contentParts[i];
+    /** UI-only progress headers are not agent content and must not disturb
+     *  agent state: a label with no `agentIdMap` entry would otherwise read
+     *  as an agent change and flush the buffer mid-agent, splitting one
+     *  agent's contiguous content into two labeled blocks. Skipped before
+     *  any state transition below (mirrors the transfer path). */
+    if (part.type === ContentTypes.ACTIVITY_LABEL) {
+      continue;
+    }
     const agentId = agentIdMap[i];
 
     // If agent changed, flush previous buffer
@@ -929,12 +937,6 @@ function labelAllAgentContent(
       /** User speech is never agent content — see the transfer path above. */
       flushAgentBuffer();
       result.push(part);
-      continue;
-    }
-    if (part.type === ContentTypes.ACTIVITY_LABEL) {
-      /** UI-only progress headers: buffering one would attribute it to the
-       *  agent and fold its text into replayed provider content, which the
-       *  formatter's exclusions exist to prevent. */
       continue;
     }
     agentContentBuffer.push(part);
