@@ -76,13 +76,25 @@ export function buildActivityLabelPrompt({
   redaction,
 }: BuildActivityLabelPromptParams): string {
   const clip = truncateForLabel;
+  /** Reasoning can quote tool output verbatim, so when the policy redacts
+   *  ANY entry in this batch (or tracing is globally disabled), the
+   *  excerpts are dropped wholesale — there is no reliable way to scrub a
+   *  quoted fragment out of free-form reasoning text. */
+  const excerptsRedacted =
+    redaction != null &&
+    (redaction.enabled === false ||
+      entries.some((entry) => shouldRedactTool(entry.toolName, redaction)));
   const sections: string[] = [];
   if (lastAssistantText != null && lastAssistantText.length > 0) {
     sections.push(
       `Intent (assistant's last message): ${clip(lastAssistantText, INPUT_CONTEXT_LIMIT)}`
     );
   }
-  if (thinkingExcerpts != null && thinkingExcerpts.length > 0) {
+  if (
+    !excerptsRedacted &&
+    thinkingExcerpts != null &&
+    thinkingExcerpts.length > 0
+  ) {
     sections.push(
       'Reasoning excerpts:\n' +
         thinkingExcerpts

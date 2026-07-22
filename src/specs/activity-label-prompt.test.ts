@@ -1,7 +1,7 @@
+import type { ActivityLabelToolEntry } from '@/types/activityLabel';
+import { LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT } from '@/langfuseToolOutputTracing';
 import { buildActivityLabelPrompt } from '@/prompts/activityLabel';
 import { resolveToolOutputTracingConfig } from '@/langfuseConfig';
-import { LANGFUSE_TOOL_OUTPUT_REDACTION_TEXT } from '@/langfuseToolOutputTracing';
-import type { ActivityLabelToolEntry } from '@/types/activityLabel';
 
 const entries: ActivityLabelToolEntry[] = [
   {
@@ -41,6 +41,35 @@ describe('buildActivityLabelPrompt redaction', () => {
      *  redacts output fields only. */
     expect(prompt).toContain('web_search');
     expect(prompt).toContain('runtime versions');
+  });
+
+  it('drops reasoning excerpts when any batch entry is redacted', () => {
+    const redaction = resolveToolOutputTracingConfig({
+      toolOutputTracing: { redactedToolNames: ['db_query'] },
+    });
+    const prompt = buildActivityLabelPrompt({
+      entries,
+      charLimit: 600,
+      thinkingExcerpts: [
+        'The db_query returned SECRET_CONNECTION_STRING_LEAK earlier',
+      ],
+      redaction,
+    });
+    expect(prompt).not.toContain('Reasoning excerpts');
+    expect(prompt).not.toContain('SECRET_CONNECTION_STRING_LEAK');
+  });
+
+  it('keeps reasoning excerpts when no batch entry matches the policy', () => {
+    const redaction = resolveToolOutputTracingConfig({
+      toolOutputTracing: { redactedToolNames: ['unrelated_tool'] },
+    });
+    const prompt = buildActivityLabelPrompt({
+      entries,
+      charLimit: 600,
+      thinkingExcerpts: ['Comparing versions across sources'],
+      redaction,
+    });
+    expect(prompt).toContain('Comparing versions across sources');
   });
 
   it('redacts only named tools, including their error text', () => {

@@ -1,3 +1,4 @@
+import type { RunnableConfig } from '@langchain/core/runnables';
 import type { Providers } from '@/common';
 
 /** One tool call's contribution to the label payload (host-assembled). */
@@ -33,7 +34,9 @@ export type RunActivityLabelOptions = {
   /** Per-entry serialization cap for the prompt. Default 600. */
   charLimit?: number;
   /** LangChain runnable config carrier (signal, callbacks, thread/user ids). */
-  chainOptions?: Record<string, unknown>;
+  chainOptions?: Partial<RunnableConfig> & {
+    configurable?: Record<string, unknown>;
+  };
   /**
    * Seed for deterministic Langfuse trace ids (e.g. `${runId}-${slotIndex}`)
    * so each batch's label gets a distinct, reproducible trace. When omitted,
