@@ -36,6 +36,21 @@ Examples:
 - "in" for India
 `.trim();
 
+const DATE_FILTER_GUIDANCE = `Optional publication or update date filter.
+Only provide this when the user explicitly requests recent results. Search providers filter using detected dates, which may exclude relevant pages without a detectable publication or update date. Otherwise, omit this parameter.
+Values:`;
+
+const TAVILY_DATE_RANGE_DESCRIPTION = `
+- "d": past 24 hours
+- "w": past week
+- "m": past month
+- "y": past year`;
+
+export const DEFAULT_DATE_DESCRIPTION = `${DATE_FILTER_GUIDANCE}
+- "h": past hour${TAVILY_DATE_RANGE_DESCRIPTION}`;
+
+export const TAVILY_DATE_DESCRIPTION = `${DATE_FILTER_GUIDANCE}${TAVILY_DATE_RANGE_DESCRIPTION}`;
+
 export const querySchema = {
   type: 'string',
   description: DEFAULT_QUERY_DESCRIPTION,
@@ -44,7 +59,18 @@ export const querySchema = {
 export const dateSchema = {
   type: 'string',
   enum: Object.values(DATE_RANGE),
-  description: 'Date range for search results.',
+  description: DEFAULT_DATE_DESCRIPTION,
+} as const;
+
+export const tavilyDateSchema = {
+  type: 'string',
+  enum: [
+    DATE_RANGE.PAST_24_HOURS,
+    DATE_RANGE.PAST_WEEK,
+    DATE_RANGE.PAST_MONTH,
+    DATE_RANGE.PAST_YEAR,
+  ],
+  description: TAVILY_DATE_DESCRIPTION,
 } as const;
 
 export const countrySchema = {

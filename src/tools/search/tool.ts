@@ -4,6 +4,7 @@ import type * as t from './types';
 import {
   WebSearchToolDescription,
   WebSearchToolName,
+  tavilyDateSchema,
   countrySchema,
   imagesSchema,
   videosSchema,
@@ -369,7 +370,7 @@ export const createSearchTool = (
 
   const schemaProperties: Record<string, unknown> = {
     query: querySchema,
-    date: dateSchema,
+    date: searchProvider === 'tavily' ? tavilyDateSchema : dateSchema,
     images: imagesSchema,
     videos: videosSchema,
     news: newsSchema,

@@ -2,6 +2,7 @@ import axios from 'axios';
 import type * as t from './types';
 import { TavilyScraper, createTavilyScraper } from './tavily-scraper';
 import { createSearchAPI } from './search';
+import { DATE_RANGE } from './schema';
 import { createSearchTool } from './tool';
 
 jest.mock('axios');
@@ -98,6 +99,7 @@ describe('Tavily search API', () => {
     const result = await searchAPI.getSources({
       query: 'example query',
       country: 'US',
+      date: DATE_RANGE.PAST_YEAR,
     });
     const [, payload] = mockedAxios.post.mock.calls[0];
 
@@ -127,6 +129,61 @@ describe('Tavily search API', () => {
     expect(result.data?.images?.[1]).toMatchObject({
       imageUrl: 'https://example.com/second.png',
       position: 2,
+    });
+  });
+
+  it('maps a requested date range to Tavily time_range', async () => {
+    mockedAxios.post.mockResolvedValueOnce({ data: { results: [] } });
+
+    const searchAPI = createSearchAPI({
+      searchProvider: 'tavily',
+      tavilyApiKey: 'test-key',
+    });
+
+    await searchAPI.getSources({
+      query: 'example query',
+      date: DATE_RANGE.PAST_YEAR,
+    });
+    const [, payload] = mockedAxios.post.mock.calls[0];
+
+    expect(payload).toMatchObject({ time_range: 'year' });
+  });
+
+  it('allows configured Tavily options to disable model time ranges', async () => {
+    mockedAxios.post.mockResolvedValueOnce({ data: { results: [] } });
+
+    const searchAPI = createSearchAPI({
+      searchProvider: 'tavily',
+      tavilyApiKey: 'test-key',
+      tavilySearchOptions: {
+        timeRange: false,
+      },
+    });
+
+    await searchAPI.getSources({
+      query: 'example query',
+      date: DATE_RANGE.PAST_YEAR,
+    });
+    const [, payload] = mockedAxios.post.mock.calls[0];
+
+    expect(payload).not.toHaveProperty('time_range');
+  });
+
+  it('omits unsupported hourly filtering from the Tavily tool schema', () => {
+    const searchTool = createSearchTool({
+      searchProvider: 'tavily',
+      tavilyApiKey: 'test-key',
+      scraperProvider: 'tavily',
+      rerankerType: 'none',
+      logger: mockLogger,
+    });
+
+    expect(searchTool.schema).toMatchObject({
+      properties: {
+        date: {
+          enum: ['d', 'w', 'm', 'y'],
+        },
+      },
     });
   });
 
