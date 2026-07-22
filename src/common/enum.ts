@@ -31,9 +31,6 @@ export enum GraphEvents {
   ON_SUBAGENT_UPDATE = 'on_subagent_update',
   /** [Custom] Diagnostic logging event for context management observability */
   ON_AGENT_LOG = 'on_agent_log',
-  /** [Custom] Smart activity label for a completed tool batch (fast-model generated;
-   *  additive — consumers that don't know the event are unaffected) */
-  ON_ACTIVITY_LABEL = 'on_activity_label',
   /** [Custom] Per-model-call context window usage snapshot (post-prune token budget) */
   ON_CONTEXT_USAGE = 'on_context_usage',
 

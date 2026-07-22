@@ -39,12 +39,19 @@ import {
   createCompletionTitleRunnable,
   createTitleRunnable,
 } from '@/utils/title';
-import { ACTIVITY_LABEL_PROMPT } from '@/prompts/activityLabel';
+import {
+  ACTIVITY_LABEL_PROMPT,
+  buildActivityLabelPrompt,
+} from '@/prompts/activityLabel';
 import { createTokenCounter, encodingForModel } from '@/utils/tokens';
 import { initializeLangfuseTracing } from './instrumentation';
 import { GraphEvents, Callback, TitleMethod } from '@/common';
 import { MultiAgentGraph } from '@/graphs/MultiAgentGraph';
-import { resolveLangfuseConfig } from '@/langfuseConfig';
+import {
+  hasToolOutputTracingConfig,
+  resolveLangfuseConfig,
+  resolveToolOutputTracingConfig,
+} from '@/langfuseConfig';
 import { StandardGraph } from '@/graphs/Graph';
 import { initializeModel } from '@/llm/init';
 import { HandlerRegistry } from '@/events';
@@ -78,7 +85,6 @@ const CUSTOM_GRAPH_EVENTS = new Set<string>([
   GraphEvents.ON_SUBAGENT_UPDATE,
   GraphEvents.ON_AGENT_LOG,
   GraphEvents.ON_CONTEXT_USAGE,
-  GraphEvents.ON_ACTIVITY_LABEL,
   GraphEvents.ON_CUSTOM_EVENT,
 ]);
 
@@ -1499,19 +1505,18 @@ export class Run<_T extends t.BaseGraphState> {
     thinkingExcerpts,
     lastAssistantText,
     prompt,
-    charLimit = 300,
+    charLimit = 600,
     chainOptions,
     traceSeed,
   }: t.RunActivityLabelOptions): Promise<{ label?: string }> {
-    if (entries.length === 0 && !(thinkingExcerpts && thinkingExcerpts.length > 0)) {
+    if (
+      entries.length === 0 &&
+      !(thinkingExcerpts && thinkingExcerpts.length > 0)
+    ) {
       return {};
     }
     const labelSeq = ++this.activityLabelSeq;
 
-    let labelLangfuseHandler: CallbackEntry | undefined;
-    let labelLangfuseConfig: t.LangfuseConfig | undefined;
-    let labelUserId: string | undefined;
-    let labelSessionId: string | undefined;
     const labelContext =
       this.Graph == null
         ? undefined
@@ -1528,87 +1533,68 @@ export class Run<_T extends t.BaseGraphState> {
     /** Shallow-cloned: activity labels run once per tool batch, and writing
      *  the Langfuse handler back onto a host-reused `chainOptions` would
      *  accumulate duplicate callbacks across batches. */
-    const labelChainOptions = { ...(chainOptions ?? {}) } as Partial<RunnableConfig> & {
+    const labelChainOptions = {
+      ...(chainOptions ?? {}),
+    } as Partial<RunnableConfig> & {
       configurable?: Record<string, unknown>;
     };
-    labelUserId =
+    const labelUserId =
       typeof labelChainOptions.configurable?.user_id === 'string'
         ? (labelChainOptions.configurable.user_id as string)
         : undefined;
-    labelSessionId =
+    const labelSessionId =
       typeof labelChainOptions.configurable?.thread_id === 'string'
         ? (labelChainOptions.configurable.thread_id as string)
         : undefined;
-    labelLangfuseConfig = resolveLangfuseConfig(
+    const labelLangfuseConfig = resolveLangfuseConfig(
       this.langfuse,
       labelContext?.langfuse
     );
     initializeLangfuseTracing(labelLangfuseConfig);
-    labelLangfuseHandler = createLangfuseHandler({
+    /** One seed for the handler AND both runtime scopes: the scoped handler
+     *  prefers an inherited runtime seed, so passing the label seed only to
+     *  the handler would let the parent run's seed win and collapse label
+     *  generations into the main run trace. */
+    const labelTraceSeed =
+      labelLangfuseConfig?.deterministicTraceId === true
+        ? (traceSeed ?? `activity-label-${this.id}-${labelSeq}`)
+        : undefined;
+    const labelRuntimeScope = resolveLangfuseRuntimeScope({
+      runLangfuse: this.langfuse,
+      langfuseOverlay: labelContext?.langfuse,
+      traceIdSeed: labelTraceSeed,
+    });
+    const labelLangfuseHandler = createLangfuseHandler({
       langfuse: labelLangfuseConfig,
       userId: labelUserId,
       sessionId: labelSessionId,
       traceMetadata,
       tags: ['librechat', 'activity-label'],
-      traceIdSeed:
-        labelLangfuseConfig?.deterministicTraceId === true
-          ? (traceSeed ?? `activity-label-${this.id}-${labelSeq}`)
-          : undefined,
+      traceIdSeed: labelTraceSeed,
     });
     if (labelLangfuseHandler != null) {
-      labelChainOptions.callbacks = appendCallbacks(labelChainOptions.callbacks, [
-        labelLangfuseHandler,
-      ]);
+      labelChainOptions.callbacks = appendCallbacks(
+        labelChainOptions.callbacks,
+        [labelLangfuseHandler]
+      );
     }
 
-    const serialize = (value: unknown): string => {
-      if (value == null) {
-        return '';
-      }
-      if (typeof value === 'string') {
-        return value;
-      }
-      try {
-        return JSON.stringify(value);
-      } catch {
-        return String(value);
-      }
-    };
-    const clip = (value: string, max: number): string =>
-      value.length <= max ? value : value.slice(0, Math.max(0, max - 1)) + '…';
-
-    const sections: string[] = [];
-    if (lastAssistantText) {
-      sections.push(
-        `Intent (assistant's last message): ${clip(lastAssistantText, 200)}`
-      );
-    }
-    if (thinkingExcerpts && thinkingExcerpts.length > 0) {
-      sections.push(
-        'Reasoning excerpts:\n' +
-          thinkingExcerpts
-            .slice(0, 4)
-            .map((excerpt) => `- ${clip(excerpt, charLimit)}`)
-            .join('\n')
-      );
-    }
-    if (entries.length > 0) {
-      sections.push(
-        'Tool calls:\n' +
-          entries
-            .map((entry) => {
-              const input = clip(serialize(entry.toolInput), charLimit);
-              const outcome =
-                entry.status === 'error'
-                  ? `ERROR: ${clip(entry.error ?? 'unknown error', charLimit)}`
-                  : clip(serialize(entry.toolOutput), charLimit);
-              return `- ${entry.toolName}(${input}) → ${outcome}`;
-            })
-            .join('\n')
-      );
-    }
-    sections.push('Label:');
-    const userPrompt = sections.join('\n\n');
+    /** The label prompt becomes Langfuse generation input, so the resolved
+     *  tool-output redaction policy (global disable / redactedToolNames)
+     *  applies to it exactly as to structured tool observations. */
+    const redaction = hasToolOutputTracingConfig(
+      this.langfuse,
+      labelContext?.langfuse
+    )
+      ? resolveToolOutputTracingConfig(this.langfuse, labelContext?.langfuse)
+      : undefined;
+    const userPrompt = buildActivityLabelPrompt({
+      entries,
+      charLimit,
+      thinkingExcerpts,
+      lastAssistantText,
+      redaction,
+    });
 
     const model = initializeModel({
       provider,
@@ -1663,7 +1649,7 @@ export class Run<_T extends t.BaseGraphState> {
           .map((block) =>
             typeof block === 'string'
               ? block
-              : ((block as { text?: string })?.text ?? '')
+              : ((block as { text?: string }).text ?? '')
           )
           .join('');
       }
@@ -1673,14 +1659,27 @@ export class Run<_T extends t.BaseGraphState> {
     try {
       let response: unknown;
       try {
-        response = await withLangfuseRuntimeScope(
-          resolveLangfuseRuntimeScope({
-            runLangfuse: this.langfuse,
-            langfuseOverlay: labelContext?.langfuse,
-          }),
-          () => invokeLabel(invokeConfig)
+        response = await withLangfuseRuntimeScope(labelRuntimeScope, () =>
+          invokeLabel(invokeConfig)
         );
-      } catch (_e) {
+      } catch (error) {
+        /** Retry ONLY recognized callback/tracer failures (the EventStream
+         *  tracer class of errors the stripped-callbacks fallback exists
+         *  for). Aborts and provider failures rethrow — retrying those
+         *  doubles traffic/cost and can restart cancelled requests. */
+        const aborted =
+          (labelChainOptions as { signal?: AbortSignal }).signal?.aborted ===
+            true || (error as Error | null)?.name === 'AbortError';
+        const callbackFailure = /callback|tracer|event.?stream/i.test(
+          String(
+            (error as Error | null)?.stack ??
+              (error as Error | null)?.message ??
+              ''
+          )
+        );
+        if (aborted || !callbackFailure) {
+          throw error;
+        }
         const langfuseHandler = findCallback(
           invokeConfig.callbacks,
           isLangfuseCallbackHandler
@@ -1689,12 +1688,8 @@ export class Run<_T extends t.BaseGraphState> {
         const safeConfig = Object.assign({}, rest, {
           callbacks: langfuseHandler ? [langfuseHandler] : [],
         });
-        response = await withLangfuseRuntimeScope(
-          resolveLangfuseRuntimeScope({
-            runLangfuse: this.langfuse,
-            langfuseOverlay: labelContext?.langfuse,
-          }),
-          () => invokeLabel(safeConfig as Partial<RunnableConfig>)
+        response = await withLangfuseRuntimeScope(labelRuntimeScope, () =>
+          invokeLabel(safeConfig as Partial<RunnableConfig>)
         );
       }
       const label = extractLabel(response);
