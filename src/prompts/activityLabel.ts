@@ -76,6 +76,10 @@ function serializeForLabel(value: unknown, limit: number): string {
 
 const INPUT_CONTEXT_LIMIT = 200;
 const MAX_THINKING_EXCERPTS = 4;
+/** A label is 5-9 words; no batch needs more than this many entries to
+ *  produce one, and the cap keeps a 200-call programmatic batch from
+ *  building an enormous prompt out of per-field-bounded pieces. */
+const MAX_PROMPT_ENTRIES = 12;
 
 export type BuildActivityLabelPromptParams = {
   entries: ActivityLabelToolEntry[];
@@ -137,9 +141,11 @@ export function buildActivityLabelPrompt({
     );
   }
   if (entries.length > 0) {
+    const shown = entries.slice(0, MAX_PROMPT_ENTRIES);
+    const omitted = entries.length - shown.length;
     sections.push(
       'Tool calls:\n' +
-        entries
+        shown
           .map((entry) => {
             const input = clip(
               serializeForLabel(entry.toolInput, charLimit),
@@ -160,7 +166,10 @@ export function buildActivityLabelPrompt({
             }
             return `- ${entry.toolName}(${input}) → ${outcome}`;
           })
-          .join('\n')
+          .join('\n') +
+        (omitted > 0
+          ? `\n- …and ${omitted} more tool ${omitted === 1 ? 'call' : 'calls'}`
+          : '')
     );
   }
   sections.push('Label:');

@@ -1,9 +1,9 @@
 // src/run.ts
-import { HumanMessage } from '@langchain/core/messages';
 import { PromptTemplate } from '@langchain/core/prompts';
 import { RunnableLambda } from '@langchain/core/runnables';
 import { AzureChatOpenAI, ChatOpenAI } from '@langchain/openai';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
+import { HumanMessage, SystemMessage } from '@langchain/core/messages';
 import {
   Command,
   INTERRUPT,
@@ -1667,17 +1667,10 @@ export class Run<_T extends t.BaseGraphState> {
           tags: ['librechat', 'activity-label'],
         },
         () =>
-          (
-            model as unknown as {
-              invoke: (
-                input: Array<[string, string]>,
-                config?: Partial<RunnableConfig>
-              ) => Promise<{ content?: unknown }>;
-            }
-          ).invoke(
+          model.invoke(
             [
-              ['system', prompt ?? ACTIVITY_LABEL_PROMPT],
-              ['human', userPrompt],
+              new SystemMessage(prompt ?? ACTIVITY_LABEL_PROMPT),
+              new HumanMessage(userPrompt),
             ],
             runtimeConfig
           )

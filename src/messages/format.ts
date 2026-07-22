@@ -1088,6 +1088,12 @@ export const labelContentByAgent = (
       transferToolCallId = undefined;
       currentAgentId = undefined;
       result.push(part);
+    } else if (part.type === ContentTypes.ACTIVITY_LABEL) {
+      /** UI-only progress headers are not agent content. Buffering one
+       *  would open (or keep alive) a transfer capture whose formatter
+       *  emits only the `--- Transfer to X ---` frame with nothing inside,
+       *  and would attribute the label to the agent. */
+      continue;
     } else {
       agentContentBuffer.push(part);
     }
