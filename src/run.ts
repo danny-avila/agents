@@ -1564,14 +1564,20 @@ export class Run<_T extends t.BaseGraphState> {
       langfuseOverlay: labelContext?.langfuse,
       traceIdSeed: labelTraceSeed,
     });
-    const labelLangfuseHandler = createLangfuseHandler({
-      langfuse: labelLangfuseConfig,
-      userId: labelUserId,
-      sessionId: labelSessionId,
-      traceMetadata,
-      tags: ['librechat', 'activity-label'],
-      traceIdSeed: labelTraceSeed,
-    });
+    /** Handler only when the caller supplied `chainOptions` (title parity):
+     *  without it there is no thread/user identity, and tracing the call
+     *  would create an orphan label trace outside any session. */
+    const labelLangfuseHandler =
+      chainOptions == null
+        ? undefined
+        : createLangfuseHandler({
+            langfuse: labelLangfuseConfig,
+            userId: labelUserId,
+            sessionId: labelSessionId,
+            traceMetadata,
+            tags: ['librechat', 'activity-label'],
+            traceIdSeed: labelTraceSeed,
+          });
     if (labelLangfuseHandler != null) {
       labelChainOptions.callbacks = appendCallbacks(
         labelChainOptions.callbacks,
