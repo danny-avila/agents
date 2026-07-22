@@ -1,4 +1,5 @@
 import type { RunnableConfig } from '@langchain/core/runnables';
+import type { ClientOptions } from '@/types/llm';
 import type { Providers } from '@/common';
 
 /** One tool call's contribution to the label payload (host-assembled). */
@@ -23,7 +24,14 @@ export type ActivityLabelToolEntry = {
  */
 export type RunActivityLabelOptions = {
   provider: Providers;
-  clientOptions?: Record<string, unknown>;
+  clientOptions?: ClientOptions;
+  /**
+   * Agent that executed the labeled batch. Selects that agent's Langfuse
+   * overlay (trace metadata AND tool-output redaction policy) instead of
+   * the graph default — a stricter per-agent policy must not be bypassed
+   * by labeling work the default agent never performed.
+   */
+  agentId?: string;
   entries: ActivityLabelToolEntry[];
   /** Truncated reasoning excerpts from the block being labeled. */
   thinkingExcerpts?: string[];

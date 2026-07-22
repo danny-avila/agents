@@ -27,9 +27,18 @@ import {
   withLangfuseAttributes,
 } from '@/langfuse';
 import {
+  hasToolOutputTracingConfig,
+  resolveLangfuseConfig,
+  resolveToolOutputTracingConfig,
+} from '@/langfuseConfig';
+import {
   resolveLangfuseRuntimeScope,
   withLangfuseRuntimeScope,
 } from '@/langfuseRuntimeScope';
+import {
+  ACTIVITY_LABEL_PROMPT,
+  buildActivityLabelPrompt,
+} from '@/prompts/activityLabel';
 import {
   appendCallbacks,
   findCallback,
@@ -39,19 +48,10 @@ import {
   createCompletionTitleRunnable,
   createTitleRunnable,
 } from '@/utils/title';
-import {
-  ACTIVITY_LABEL_PROMPT,
-  buildActivityLabelPrompt,
-} from '@/prompts/activityLabel';
 import { createTokenCounter, encodingForModel } from '@/utils/tokens';
 import { initializeLangfuseTracing } from './instrumentation';
 import { GraphEvents, Callback, TitleMethod } from '@/common';
 import { MultiAgentGraph } from '@/graphs/MultiAgentGraph';
-import {
-  hasToolOutputTracingConfig,
-  resolveLangfuseConfig,
-  resolveToolOutputTracingConfig,
-} from '@/langfuseConfig';
 import { StandardGraph } from '@/graphs/Graph';
 import { initializeModel } from '@/llm/init';
 import { HandlerRegistry } from '@/events';
@@ -1508,6 +1508,7 @@ export class Run<_T extends t.BaseGraphState> {
     charLimit = 600,
     chainOptions,
     traceSeed,
+    agentId,
   }: t.RunActivityLabelOptions): Promise<{ label?: string }> {
     if (
       entries.length === 0 &&
@@ -1517,10 +1518,16 @@ export class Run<_T extends t.BaseGraphState> {
     }
     const labelSeq = ++this.activityLabelSeq;
 
+    /** Resolve the LABELED agent's context (falling back to the graph
+     *  default): its Langfuse overlay carries the trace metadata and the
+     *  tool-output redaction policy that must govern this label. */
     const labelContext =
       this.Graph == null
         ? undefined
-        : this.Graph.agentContexts.get(this.Graph.defaultAgentId);
+        : ((agentId != null
+          ? this.Graph.agentContexts.get(agentId)
+          : undefined) ??
+          this.Graph.agentContexts.get(this.Graph.defaultAgentId));
     const traceMetadata = createLangfuseTraceMetadata({
       messageId: 'activity-label-' + this.id,
       agentName: labelContext?.name,
@@ -1564,20 +1571,21 @@ export class Run<_T extends t.BaseGraphState> {
       langfuseOverlay: labelContext?.langfuse,
       traceIdSeed: labelTraceSeed,
     });
-    /** Handler only when the caller supplied `chainOptions` (title parity):
-     *  without it there is no thread/user identity, and tracing the call
-     *  would create an orphan label trace outside any session. */
+    /** Handler only when a session id resolved from
+     *  `chainOptions.configurable.thread_id`: without it the label call has
+     *  no conversation identity, and tracing it would create an orphan
+     *  trace outside any session — worse than not tracing at all. */
     const labelLangfuseHandler =
-      chainOptions == null
+      labelSessionId == null
         ? undefined
         : createLangfuseHandler({
-            langfuse: labelLangfuseConfig,
-            userId: labelUserId,
-            sessionId: labelSessionId,
-            traceMetadata,
-            tags: ['librechat', 'activity-label'],
-            traceIdSeed: labelTraceSeed,
-          });
+          langfuse: labelLangfuseConfig,
+          userId: labelUserId,
+          sessionId: labelSessionId,
+          traceMetadata,
+          tags: ['librechat', 'activity-label'],
+          traceIdSeed: labelTraceSeed,
+        });
     if (labelLangfuseHandler != null) {
       labelChainOptions.callbacks = appendCallbacks(
         labelChainOptions.callbacks,
