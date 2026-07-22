@@ -78,6 +78,7 @@ const CUSTOM_GRAPH_EVENTS = new Set<string>([
   GraphEvents.ON_SUBAGENT_UPDATE,
   GraphEvents.ON_AGENT_LOG,
   GraphEvents.ON_CONTEXT_USAGE,
+  GraphEvents.ON_ACTIVITY_LABEL,
   GraphEvents.ON_CUSTOM_EVENT,
 ]);
 
@@ -154,6 +155,8 @@ export class Run<_T extends t.BaseGraphState> {
    * lets callers assert the type they expect.
    */
   private _interrupt: t.RunInterruptResult<unknown> | undefined;
+  /** Per-run sequence for batch-unique activity-label trace-seed fallbacks. */
+  private activityLabelSeq = 0;
   private _haltedReason: string | undefined;
 
   private constructor(config: Partial<t.RunConfig>) {
@@ -1503,6 +1506,7 @@ export class Run<_T extends t.BaseGraphState> {
     if (entries.length === 0 && !(thinkingExcerpts && thinkingExcerpts.length > 0)) {
       return {};
     }
+    const labelSeq = ++this.activityLabelSeq;
 
     let labelLangfuseHandler: CallbackEntry | undefined;
     let labelLangfuseConfig: t.LangfuseConfig | undefined;
@@ -1521,7 +1525,10 @@ export class Run<_T extends t.BaseGraphState> {
       'LibreChat Activity Label'
     );
 
-    const labelChainOptions = (chainOptions ?? {}) as Partial<RunnableConfig> & {
+    /** Shallow-cloned: activity labels run once per tool batch, and writing
+     *  the Langfuse handler back onto a host-reused `chainOptions` would
+     *  accumulate duplicate callbacks across batches. */
+    const labelChainOptions = { ...(chainOptions ?? {}) } as Partial<RunnableConfig> & {
       configurable?: Record<string, unknown>;
     };
     labelUserId =
@@ -1545,7 +1552,7 @@ export class Run<_T extends t.BaseGraphState> {
       tags: ['librechat', 'activity-label'],
       traceIdSeed:
         labelLangfuseConfig?.deterministicTraceId === true
-          ? (traceSeed ?? 'activity-label-' + this.id)
+          ? (traceSeed ?? `activity-label-${this.id}-${labelSeq}`)
           : undefined,
     });
     if (labelLangfuseHandler != null) {
