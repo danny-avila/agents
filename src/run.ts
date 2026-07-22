@@ -1566,14 +1566,17 @@ export class Run<_T extends t.BaseGraphState> {
       labelContext?.langfuse
     );
     initializeLangfuseTracing(labelLangfuseConfig);
-    /** One seed for the handler AND both runtime scopes: the scoped handler
+    /** One seed for the handler AND the runtime scope: the scoped handler
      *  prefers an inherited runtime seed, so passing the label seed only to
      *  the handler would let the parent run's seed win and collapse label
-     *  generations into the main run trace. */
-    const labelTraceSeed =
-      labelLangfuseConfig?.deterministicTraceId === true
-        ? (traceSeed ?? `activity-label-${this.id}-${labelSeq}`)
-        : undefined;
+     *  generations into the main run trace.
+     *
+     *  Always computed — `runWithLangfuseRuntimeContext` spreads the
+     *  surrounding context, so an ABSENT seed INHERITS the parent's rather
+     *  than clearing it. A per-label seed is the only way to guarantee the
+     *  label never shares the parent's trace id; uniqueness comes from the
+     *  run id plus a per-run sequence. */
+    const labelTraceSeed = traceSeed ?? `activity-label-${this.id}-${labelSeq}`;
     const labelRuntimeScope = resolveLangfuseRuntimeScope({
       runLangfuse: this.langfuse,
       langfuseOverlay: labelContext?.langfuse,
@@ -1583,17 +1586,23 @@ export class Run<_T extends t.BaseGraphState> {
      *  `chainOptions.configurable.thread_id`: without it the label call has
      *  no conversation identity, and tracing it would create an orphan
      *  trace outside any session — worse than not tracing at all. */
-    const labelLangfuseHandler =
-      labelSessionId == null
-        ? undefined
-        : createLangfuseHandler({
-          langfuse: labelLangfuseConfig,
-          userId: labelUserId,
-          sessionId: labelSessionId,
-          traceMetadata,
-          tags: ['librechat', 'activity-label'],
-          traceIdSeed: labelTraceSeed,
-        });
+    /** Declared then conditionally assigned (title precedent): a ternary
+     *  around the object literal makes eslint's indent rule and prettier
+     *  disagree, and both gate CI. */
+    let labelLangfuseHandler: CallbackEntry | undefined;
+    if (labelSessionId != null) {
+      labelLangfuseHandler = createLangfuseHandler({
+        langfuse: labelLangfuseConfig,
+        userId: labelUserId,
+        sessionId: labelSessionId,
+        traceMetadata,
+        tags: ['librechat', 'activity-label'],
+        traceIdSeed:
+          labelLangfuseConfig?.deterministicTraceId === true
+            ? labelTraceSeed
+            : undefined,
+      });
+    }
     if (labelLangfuseHandler != null) {
       labelChainOptions.callbacks = appendCallbacks(
         labelChainOptions.callbacks,
@@ -1610,6 +1619,15 @@ export class Run<_T extends t.BaseGraphState> {
     )
       ? resolveToolOutputTracingConfig(this.langfuse, labelContext?.langfuse)
       : undefined;
+    /** An active redaction policy suppresses free-form reasoning/intent, so
+     *  a reasoning-only block has nothing describable left — skip the model
+     *  call rather than paying for a label built from the prompt alone. */
+    const freeFormSuppressed =
+      redaction != null &&
+      (redaction.enabled === false || redaction.redactedToolNames.size > 0);
+    if (entries.length === 0 && freeFormSuppressed) {
+      return {};
+    }
     const userPrompt = buildActivityLabelPrompt({
       entries,
       charLimit,

@@ -931,6 +931,12 @@ function labelAllAgentContent(
       result.push(part);
       continue;
     }
+    if (part.type === ContentTypes.ACTIVITY_LABEL) {
+      /** UI-only progress headers: buffering one would attribute it to the
+       *  agent and fold its text into replayed provider content, which the
+       *  formatter's exclusions exist to prevent. */
+      continue;
+    }
     agentContentBuffer.push(part);
   }
 
