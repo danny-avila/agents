@@ -16,6 +16,7 @@ import type * as t from '@/types';
 import {
   formatAnthropicArtifactContent,
   ensureThinkingBlockInMessages,
+  foldToolBlocksForToollessAgent,
   convertMessagesToContent,
   sanitizeOrphanToolBlocks,
   extractToolDiscoveries,
@@ -1862,6 +1863,25 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           config,
           this.startIndex
         );
+      }
+
+      /**
+       * A destination that binds no tools is invoked without a tool schema, but
+       * in a multi-agent graph it can still inherit a prior agent's toolUse/
+       * toolResult history. Bedrock's Converse API (and other tool-schema-strict
+       * providers) reject such a request when no top-level toolConfig is sent.
+       * Fold that historical tool content into plain text so the tool-less agent
+       * receives valid, context-preserving messages. Handoff tools count as
+       * bound tools, so a tool-less router mid-handoff is not affected.
+       */
+      if (toolsForBinding == null || toolsForBinding.length === 0) {
+        finalMessages = foldToolBlocksForToollessAgent(finalMessages, config);
+        // The fold emits structured (array) content; re-flatten for agents that
+        // opted into string-only messages (`useLegacyContent`, run earlier at
+        // the top of this block) so the folded turn isn't the lone exception.
+        if (agentContext.useLegacyContent) {
+          finalMessages = formatContentStrings(finalMessages);
+        }
       }
 
       // Determine the prompt-cache strategy up front. Two distinct facts:

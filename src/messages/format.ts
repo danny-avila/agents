@@ -22,6 +22,7 @@ import type {
   SummaryContentBlock,
   ThinkingContentText,
   ToolCallContent,
+  ToolResultContent,
   ToolCallPart,
   TPayload,
   TMessage,
@@ -1806,6 +1807,65 @@ function appendMessageContent(
       continue;
     }
 
+    // A `tool_call` content block appears either as the v1 standard shape
+    // (`{ name, args }` at top level, which `@langchain/aws` maps to a Converse
+    // toolUse) or this repo's `ToolCallContent` (`{ tool_call: { name, args,
+    // output } }`, from `convertMessagesToContent` / persisted history). Handle
+    // both, and emit any embedded output, so the name/args/result survive.
+    if (block.type === 'tool_call') {
+      hasToolUseBlock = true;
+      const nested = (block as { tool_call?: ToolCallPart }).tool_call;
+      const name = String(nested?.name ?? block.name ?? '');
+      const rawArgs = nested?.args ?? block.args ?? {};
+      const argsText =
+        typeof rawArgs === 'string' ? rawArgs : JSON.stringify(rawArgs);
+      textChunks.push(`${role}: [tool_use] ${name} ${argsText}`.trimEnd());
+      const output = nested?.output;
+      if (output != null && output !== '') {
+        textChunks.push(`Tool: ${String(output)}`);
+      }
+      continue;
+    }
+
+    // A `tool_result` content block (e.g. an AIMessage(tool_call) followed by a
+    // user message carrying the result). Preserve nested image blocks as-is
+    // instead of JSON-stringifying them through the generic fallback.
+    if (block.type === 'tool_result') {
+      hasToolUseBlock = true;
+      const inner = (block as { content?: ToolResultContent['content'] })
+        .content;
+      if (typeof inner === 'string') {
+        if (inner) {
+          textChunks.push(`${role}: [tool_result] ${inner}`);
+        }
+      } else if (Array.isArray(inner)) {
+        for (const innerBlock of inner as Array<
+          string | ExtendedMessageContent
+        >) {
+          if (typeof innerBlock === 'string') {
+            if (innerBlock) {
+              textChunks.push(`${role}: [tool_result] ${innerBlock}`);
+            }
+          } else if (IMAGE_BLOCK_TYPES.has(innerBlock.type ?? '')) {
+            flushTextChunks(textChunks, parts);
+            parts.push({ ...innerBlock } as MessageContentComplex);
+          } else {
+            const innerText = innerBlock.text ?? innerBlock.input;
+            textChunks.push(
+              `${role}: [tool_result] ${
+                typeof innerText === 'string' && innerText
+                  ? innerText
+                  : JSON.stringify(innerBlock)
+              }`
+            );
+          }
+        }
+      } else if (inner != null) {
+        textChunks.push(`${role}: [tool_result] ${JSON.stringify(inner)}`);
+      }
+      continue;
+    }
+
     const text = block.text ?? block.input;
     if (typeof text === 'string' && text) {
       textChunks.push(`${role}: ${text}`);
@@ -1834,11 +1894,26 @@ function appendToolCalls(
     return;
   }
   const aiMsg = msg as AIMessage;
-  if (!aiMsg.tool_calls || aiMsg.tool_calls.length === 0) {
+  if (aiMsg.tool_calls && aiMsg.tool_calls.length > 0) {
+    for (const tc of aiMsg.tool_calls) {
+      textChunks.push(`AI: [tool_call] ${tc.name}(${JSON.stringify(tc.args)})`);
+    }
     return;
   }
-  for (const tc of aiMsg.tool_calls) {
-    textChunks.push(`AI: [tool_call] ${tc.name}(${JSON.stringify(tc.args)})`);
+  // Fall back to raw provider tool calls kept only in additional_kwargs.
+  const rawToolCalls = aiMsg.additional_kwargs.tool_calls;
+  if (!Array.isArray(rawToolCalls)) {
+    return;
+  }
+  for (const tc of rawToolCalls) {
+    const fn = (tc as { function?: { name?: string; arguments?: string } })
+      .function;
+    if (fn == null) {
+      continue;
+    }
+    textChunks.push(
+      `AI: [tool_call] ${String(fn.name ?? '')}(${String(fn.arguments ?? '')})`
+    );
   }
 }
 
@@ -2020,6 +2095,141 @@ export function ensureThinkingBlockInMessages(
       i++;
     }
   }
+
+  return result;
+}
+
+/** Whether a message carries tool content a tool-less agent cannot legally
+ *  send. Covers every representation a provider converter will serialize back
+ *  into a request: a ToolMessage, parsed `AIMessage.tool_calls`, raw
+ *  `additional_kwargs.tool_calls` (OpenAI keeps calls here when the parsed
+ *  array is empty), and `tool_use` / `tool_call` / `tool_result` content
+ *  blocks (`@langchain/aws` and the Anthropic converter map these to Converse
+ *  `toolUse` / `toolResult`). Missing the parent AI message is not just a
+ *  passthrough: folding its ToolMessage alone would leave an orphan
+ *  `assistant(tool_calls) -> user(...)` sequence. */
+function messageHasToolContent(msg: BaseMessage): boolean {
+  if (isToolMessage(msg)) {
+    return true;
+  }
+  const aiMsg = msg as AIMessage;
+  if (aiMsg.tool_calls != null && aiMsg.tool_calls.length > 0) {
+    return true;
+  }
+  const rawToolCalls = aiMsg.additional_kwargs.tool_calls;
+  if (Array.isArray(rawToolCalls) && rawToolCalls.length > 0) {
+    return true;
+  }
+  if (Array.isArray(msg.content)) {
+    for (const block of msg.content as ExtendedMessageContent[]) {
+      if (
+        typeof block === 'object' &&
+        (block.type === 'tool_use' ||
+          block.type === 'tool_call' ||
+          block.type === 'tool_result')
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/** Whether a message carries a tool RESULT: a ToolMessage, or a message whose
+ *  content includes a `tool_result` block (the shape when a call/result pair is
+ *  split as `AIMessage(tool_call)` + `HumanMessage(tool_result)`). Such a result
+ *  belongs with the preceding tool call, so it is absorbed into the same fold
+ *  and labelled as tool output. */
+function isToolResultMessage(msg: BaseMessage): boolean {
+  if (isToolMessage(msg)) {
+    return true;
+  }
+  if (Array.isArray(msg.content)) {
+    return (msg.content as ExtendedMessageContent[]).some(
+      (block) => typeof block === 'object' && block.type === 'tool_result'
+    );
+  }
+  return false;
+}
+
+/**
+ * Folds tool_use / tool_result content into plain text for an agent that binds
+ * no tools.
+ *
+ * In a multi-agent graph, a tool-less destination still inherits the prior
+ * agent's conversation history, which can contain toolUse/toolResult blocks.
+ * Because it binds no tools, the model is invoked with no tool schema — and
+ * Bedrock's Converse API rejects any request that carries toolUse/toolResult
+ * blocks without a top-level toolConfig ("The toolConfig field must be defined
+ * when using toolUse and toolResult content blocks"). Adding a dummy toolConfig
+ * is not an option: AWS requires at least one tool, and it would expose a
+ * capability the destination was intentionally denied.
+ *
+ * Each tool-call turn plus its trailing tool results (ToolMessages or
+ * `tool_result` content blocks) is collapsed into a single `[Previous tool
+ * interaction]` HumanMessage that preserves the tool name, arguments and result
+ * as text (image blocks are kept as-is). Runs in a single pass: non-tool
+ * messages pass through, `result` is allocated lazily on the first fold, and the
+ * original array is returned unchanged when it holds no tool content (the common
+ * fresh-tool-less-agent case).
+ */
+export function foldToolBlocksForToollessAgent(
+  messages: BaseMessage[],
+  config?: RunnableConfig
+): BaseMessage[] {
+  let result: BaseMessage[] | null = null;
+  let foldedCount = 0;
+  let i = 0;
+  while (i < messages.length) {
+    const msg = messages[i];
+    if (!messageHasToolContent(msg)) {
+      result?.push(msg);
+      i++;
+      continue;
+    }
+
+    /** First fold — copy the untouched prefix once, then append from here. */
+    if (result === null) {
+      result = messages.slice(0, i);
+    }
+
+    const parts: MessageContentComplex[] = [];
+    const textChunks: string[] = ['[Previous tool interaction]'];
+    appendMessageContent(
+      msg,
+      isToolResultMessage(msg) ? 'Tool' : 'AI',
+      textChunks,
+      parts
+    );
+    foldedCount++;
+
+    let j = i + 1;
+    while (j < messages.length && isToolResultMessage(messages[j])) {
+      appendMessageContent(messages[j], 'Tool', textChunks, parts);
+      foldedCount++;
+      j++;
+    }
+
+    flushTextChunks(textChunks, parts);
+    result.push(
+      withMessageRole(
+        new HumanMessage({ content: toLangChainContent(parts) }),
+        'user'
+      )
+    );
+    i = j;
+  }
+
+  if (result === null) {
+    return messages;
+  }
+
+  emitAgentLog(
+    config,
+    'warn',
+    'format',
+    `foldToolBlocksForToollessAgent: folded ${foldedCount} tool message(s) into text for a tool-less agent`
+  );
 
   return result;
 }
