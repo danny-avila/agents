@@ -36,7 +36,9 @@ function hasResidualToolContent(messages: BaseMessage[]): boolean {
     }
     if (Array.isArray(m.content)) {
       return (m.content as ExtendedMessageContent[]).some(
-        (b) => typeof b === 'object' && b.type === 'tool_use'
+        (b) =>
+          typeof b === 'object' &&
+          (b.type === 'tool_use' || b.type === 'tool_call')
       );
     }
     return false;
@@ -175,6 +177,40 @@ describe('foldToolBlocksForToollessAgent', () => {
     const folded = getTextContent(result[result.length - 1]);
     expect(folded).toContain('Let me search.');
     expect(folded).toContain('file_search');
+  });
+
+  test('detects v1 standard-content tool_call blocks (no AIMessage.tool_calls)', () => {
+    const messages = [
+      new HumanMessage('Search'),
+      // LangChain v1 standard content: the tool call lives only as a
+      // `tool_call` content block; @langchain/aws still serializes it to a
+      // Converse toolUse, so a tool-less destination must fold it too.
+      new AIMessage({
+        content: [
+          { type: 'text', text: 'Searching.' },
+          {
+            type: 'tool_call',
+            id: 'call_1',
+            name: 'file_search',
+            args: { query: 'roadmap' },
+          },
+        ],
+        response_metadata: { output_version: 'v1' },
+      }),
+      new ToolMessage({
+        content: 'Found roadmap.md',
+        tool_call_id: 'call_1',
+        name: 'file_search',
+      }),
+    ];
+
+    const result = foldToolBlocksForToollessAgent(messages);
+
+    expect(hasResidualToolContent(result)).toBe(false);
+    const folded = getTextContent(result[result.length - 1]);
+    expect(folded).toContain('file_search');
+    expect(folded).toContain('roadmap');
+    expect(folded).toContain('Found roadmap.md');
   });
 
   test('preserves image blocks in a tool result instead of stringifying them', () => {

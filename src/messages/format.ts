@@ -1806,6 +1806,16 @@ function appendMessageContent(
       continue;
     }
 
+    // v1 standard-content tool call (`@langchain/aws` serializes it to a
+    // Converse toolUse), so serialize it here rather than via the fallback.
+    if (block.type === 'tool_call') {
+      hasToolUseBlock = true;
+      textChunks.push(
+        `${role}: [tool_use] ${String(block.name ?? '')} ${JSON.stringify(block.args ?? {})}`
+      );
+      continue;
+    }
+
     const text = block.text ?? block.input;
     if (typeof text === 'string' && text) {
       textChunks.push(`${role}: ${text}`);
@@ -2025,8 +2035,10 @@ export function ensureThinkingBlockInMessages(
 }
 
 /** Whether a message carries tool_use / tool_result content that a tool-less
- *  agent cannot legally send (AI tool_calls, a tool_use content block, or a
- *  ToolMessage). */
+ *  agent cannot legally send: a ToolMessage, AI `tool_calls`, or a `tool_use`
+ *  / `tool_call` content block. Both block types matter — `@langchain/aws`
+ *  serializes each to a Converse `toolUse` (the latter via the v1
+ *  standard-content converter, `content: [{ type: 'tool_call' }]`). */
 function messageHasToolContent(msg: BaseMessage): boolean {
   if (isToolMessage(msg)) {
     return true;
@@ -2037,7 +2049,10 @@ function messageHasToolContent(msg: BaseMessage): boolean {
   }
   if (Array.isArray(msg.content)) {
     for (const block of msg.content as ExtendedMessageContent[]) {
-      if (typeof block === 'object' && block.type === 'tool_use') {
+      if (
+        typeof block === 'object' &&
+        (block.type === 'tool_use' || block.type === 'tool_call')
+      ) {
         return true;
       }
     }

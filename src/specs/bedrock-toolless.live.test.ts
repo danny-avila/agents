@@ -77,17 +77,22 @@ function toollessHistory(): BaseMessage[] {
 }
 
 describeIfLive('Bedrock tool-less destination (live)', () => {
-  let clientOptions: t.ClientOptions;
+  let clientOptions: t.BedrockConverseClientOptions;
 
   beforeAll(() => {
     // Force SigV4 with the explicit keys; the Bedrock API-key (bearer) auth
     // scheme otherwise takes precedence in the AWS SDK.
     delete process.env.AWS_BEARER_TOKEN_BEDROCK;
+    // `shouldRunLive` already guarantees both keys are set; `?? ''` only keeps
+    // the credential fields typed as strings.
     clientOptions = {
       region: REGION,
       model: MODEL,
-      credentials: { accessKeyId, secretAccessKey },
-    } as unknown as t.ClientOptions;
+      credentials: {
+        accessKeyId: accessKeyId ?? '',
+        secretAccessKey: secretAccessKey ?? '',
+      },
+    };
   });
 
   it('rejects inherited tool history when the agent binds no tools', async () => {

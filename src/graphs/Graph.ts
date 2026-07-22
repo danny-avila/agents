@@ -1876,6 +1876,12 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
        */
       if (toolsForBinding == null || toolsForBinding.length === 0) {
         finalMessages = foldToolBlocksForToollessAgent(finalMessages, config);
+        // The fold emits structured (array) content; re-flatten for agents that
+        // opted into string-only messages (`useLegacyContent`, run earlier at
+        // the top of this block) so the folded turn isn't the lone exception.
+        if (agentContext.useLegacyContent) {
+          finalMessages = formatContentStrings(finalMessages);
+        }
       }
 
       // Determine the prompt-cache strategy up front. Two distinct facts:
