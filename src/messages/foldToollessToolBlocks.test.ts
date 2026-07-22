@@ -292,6 +292,102 @@ describe('foldToolBlocksForToollessAgent', () => {
     expect(folded).toContain('Found roadmap.md');
   });
 
+  test('preserves name/args/output of the nested ToolCallContent shape', () => {
+    const messages = [
+      new HumanMessage('Search'),
+      // Shape produced by convertMessagesToContent / persisted LibreChat history:
+      // the call (and its output) are nested under `tool_call`, not top level.
+      new AIMessage({
+        content: [
+          {
+            type: 'tool_call',
+            tool_call: {
+              type: 'tool_call',
+              name: 'file_search',
+              args: { query: 'roadmap' },
+              output: 'Found roadmap.md',
+            },
+          },
+        ],
+      }),
+    ];
+
+    const result = foldToolBlocksForToollessAgent(messages);
+
+    expect(hasResidualToolContent(result)).toBe(false);
+    const folded = result.map(getTextContent).join('\n');
+    expect(folded).toContain('file_search');
+    expect(folded).toContain('roadmap');
+    // The embedded tool output is preserved, not dropped.
+    expect(folded).toContain('Found roadmap.md');
+  });
+
+  test('folds a split AIMessage(tool_call) + tool_result user message as one turn', () => {
+    const messages = [
+      new HumanMessage('Search'),
+      new AIMessage({
+        content: [
+          { type: 'text', text: 'Let me search.' },
+          {
+            type: 'tool_call',
+            id: 'c1',
+            name: 'file_search',
+            args: { query: 'roadmap' },
+          },
+        ],
+      }),
+      new HumanMessage({
+        content: [
+          { type: 'tool_result', tool_use_id: 'c1', content: 'Found roadmap.md' },
+        ],
+      }),
+      new HumanMessage('thanks'),
+    ];
+
+    const result = foldToolBlocksForToollessAgent(messages);
+
+    expect(hasResidualToolContent(result)).toBe(false);
+    // Call + result collapse into ONE folded turn (not split/mislabelled).
+    expect(result).toHaveLength(3);
+    const folded = getTextContent(result[1]);
+    expect(folded).toContain('file_search');
+    expect(folded).toContain('Found roadmap.md');
+    expect(getTextContent(result[2])).toBe('thanks');
+  });
+
+  test('preserves image blocks nested inside a tool_result content block', () => {
+    const messages = [
+      new HumanMessage('Chart'),
+      new AIMessage({
+        content: [{ type: 'tool_call', id: 'c1', name: 'chart', args: {} }],
+      }),
+      new HumanMessage({
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'c1',
+            content: [
+              { type: 'text', text: 'chart:' },
+              {
+                type: 'image_url',
+                image_url: { url: 'data:image/png;base64,AAAA' },
+              },
+            ],
+          },
+        ],
+      }),
+    ];
+
+    const result = foldToolBlocksForToollessAgent(messages);
+
+    expect(hasResidualToolContent(result)).toBe(false);
+    const folded = result[result.length - 1].content;
+    expect(Array.isArray(folded)).toBe(true);
+    expect(
+      (folded as ExtendedMessageContent[]).some((b) => b.type === 'image_url')
+    ).toBe(true);
+  });
+
   test('preserves image blocks in a tool result instead of stringifying them', () => {
     const messages = [
       new HumanMessage('Render a chart'),
