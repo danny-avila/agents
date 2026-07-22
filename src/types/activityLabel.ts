@@ -17,10 +17,11 @@ export type ActivityLabelToolEntry = {
  * (Claude Code's pattern) and the block's reasoning excerpts (claude.ai's
  * pattern) — user text stays out of this low-scrutiny pathway entirely.
  *
- * Event emission is intentionally host-owned: hosts claim content slots and
- * stream label lifecycle events on their own transport (e.g. LibreChat's
- * `on_activity_label` SSE event). The SDK's contract is limited to this
- * method and the `activity_label` content type's formatter exclusions.
+ * This SDK defines NO activity-label graph event and never dispatches one.
+ * Label lifecycle streaming is entirely host-owned: a host claims its own
+ * content slots and emits on its own transport, with a payload shape only
+ * it defines. The SDK surface here is exactly this method plus the
+ * `activity_label` content type's formatter exclusions.
  */
 export type RunActivityLabelOptions = {
   provider: Providers;
