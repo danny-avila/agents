@@ -401,7 +401,8 @@ function hasMeaningfulAssistantContent(part: MessageContentComplex): boolean {
     part.type === ContentTypes.TOOL_CALL ||
     part.type === ContentTypes.ERROR ||
     part.type === ContentTypes.AGENT_UPDATE ||
-    part.type === ContentTypes.SUMMARY
+    part.type === ContentTypes.SUMMARY ||
+    part.type === ContentTypes.ACTIVITY_LABEL
   ) {
     return false;
   }
@@ -799,7 +800,8 @@ function formatAssistantMessage(
       } else if (
         part.type === ContentTypes.ERROR ||
         part.type === ContentTypes.AGENT_UPDATE ||
-        part.type === ContentTypes.SUMMARY
+        part.type === ContentTypes.SUMMARY ||
+        part.type === ContentTypes.ACTIVITY_LABEL
       ) {
         continue;
       } else {

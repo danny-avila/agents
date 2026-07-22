@@ -39,6 +39,7 @@ import {
   createCompletionTitleRunnable,
   createTitleRunnable,
 } from '@/utils/title';
+import { ACTIVITY_LABEL_PROMPT } from '@/prompts/activityLabel';
 import { createTokenCounter, encodingForModel } from '@/utils/tokens';
 import { initializeLangfuseTracing } from './instrumentation';
 import { GraphEvents, Callback, TitleMethod } from '@/common';
@@ -1476,6 +1477,223 @@ export class Run<_T extends t.BaseGraphState> {
       }
     } finally {
       await disposeLangfuseHandler(titleLangfuseHandler);
+    }
+  }
+
+  /**
+   * Generates a short activity label for a completed tool/reasoning block
+   * using a fast model. Mirrors `generateTitle`'s Langfuse wiring so the
+   * call is traced under the conversation's session (sessionId from
+   * `chainOptions.configurable.thread_id`) with its own tags — never as an
+   * orphan trace. The payload contains no human messages by design: intent
+   * comes from `lastAssistantText`, content from reasoning excerpts and
+   * tool entries.
+   */
+  async generateActivityLabel({
+    provider,
+    clientOptions,
+    entries,
+    thinkingExcerpts,
+    lastAssistantText,
+    prompt,
+    charLimit = 300,
+    chainOptions,
+    traceSeed,
+  }: t.RunActivityLabelOptions): Promise<{ label?: string }> {
+    if (entries.length === 0 && !(thinkingExcerpts && thinkingExcerpts.length > 0)) {
+      return {};
+    }
+
+    let labelLangfuseHandler: CallbackEntry | undefined;
+    let labelLangfuseConfig: t.LangfuseConfig | undefined;
+    let labelUserId: string | undefined;
+    let labelSessionId: string | undefined;
+    const labelContext =
+      this.Graph == null
+        ? undefined
+        : this.Graph.agentContexts.get(this.Graph.defaultAgentId);
+    const traceMetadata = createLangfuseTraceMetadata({
+      messageId: 'activity-label-' + this.id,
+      agentName: labelContext?.name,
+    });
+    const labelRunName = getLangfuseTraceName(
+      traceMetadata,
+      'LibreChat Activity Label'
+    );
+
+    const labelChainOptions = (chainOptions ?? {}) as Partial<RunnableConfig> & {
+      configurable?: Record<string, unknown>;
+    };
+    labelUserId =
+      typeof labelChainOptions.configurable?.user_id === 'string'
+        ? (labelChainOptions.configurable.user_id as string)
+        : undefined;
+    labelSessionId =
+      typeof labelChainOptions.configurable?.thread_id === 'string'
+        ? (labelChainOptions.configurable.thread_id as string)
+        : undefined;
+    labelLangfuseConfig = resolveLangfuseConfig(
+      this.langfuse,
+      labelContext?.langfuse
+    );
+    initializeLangfuseTracing(labelLangfuseConfig);
+    labelLangfuseHandler = createLangfuseHandler({
+      langfuse: labelLangfuseConfig,
+      userId: labelUserId,
+      sessionId: labelSessionId,
+      traceMetadata,
+      tags: ['librechat', 'activity-label'],
+      traceIdSeed:
+        labelLangfuseConfig?.deterministicTraceId === true
+          ? (traceSeed ?? 'activity-label-' + this.id)
+          : undefined,
+    });
+    if (labelLangfuseHandler != null) {
+      labelChainOptions.callbacks = appendCallbacks(labelChainOptions.callbacks, [
+        labelLangfuseHandler,
+      ]);
+    }
+
+    const serialize = (value: unknown): string => {
+      if (value == null) {
+        return '';
+      }
+      if (typeof value === 'string') {
+        return value;
+      }
+      try {
+        return JSON.stringify(value);
+      } catch {
+        return String(value);
+      }
+    };
+    const clip = (value: string, max: number): string =>
+      value.length <= max ? value : value.slice(0, Math.max(0, max - 1)) + '…';
+
+    const sections: string[] = [];
+    if (lastAssistantText) {
+      sections.push(
+        `Intent (assistant's last message): ${clip(lastAssistantText, 200)}`
+      );
+    }
+    if (thinkingExcerpts && thinkingExcerpts.length > 0) {
+      sections.push(
+        'Reasoning excerpts:\n' +
+          thinkingExcerpts
+            .slice(0, 4)
+            .map((excerpt) => `- ${clip(excerpt, charLimit)}`)
+            .join('\n')
+      );
+    }
+    if (entries.length > 0) {
+      sections.push(
+        'Tool calls:\n' +
+          entries
+            .map((entry) => {
+              const input = clip(serialize(entry.toolInput), charLimit);
+              const outcome =
+                entry.status === 'error'
+                  ? `ERROR: ${clip(entry.error ?? 'unknown error', charLimit)}`
+                  : clip(serialize(entry.toolOutput), charLimit);
+              return `- ${entry.toolName}(${input}) → ${outcome}`;
+            })
+            .join('\n')
+      );
+    }
+    sections.push('Label:');
+    const userPrompt = sections.join('\n\n');
+
+    const model = initializeModel({
+      provider,
+      clientOptions: {
+        ...(clientOptions ?? {}),
+        streaming: false,
+      } as t.ClientOptions,
+    }) as t.ChatModelInstance;
+
+    const invokeConfig = Object.assign({}, labelChainOptions, {
+      run_id: this.id,
+      runId: this.id,
+      runName: labelChainOptions.runName ?? labelRunName,
+    }) as Partial<RunnableConfig>;
+
+    const invokeLabel = (
+      runtimeConfig: Partial<RunnableConfig>
+    ): Promise<unknown> =>
+      withLangfuseAttributes(
+        {
+          langfuse: labelLangfuseConfig,
+          userId: labelUserId,
+          sessionId: labelSessionId,
+          traceName: runtimeConfig.runName ?? labelRunName,
+          traceMetadata,
+          tags: ['librechat', 'activity-label'],
+        },
+        () =>
+          (
+            model as unknown as {
+              invoke: (
+                input: Array<[string, string]>,
+                config?: Partial<RunnableConfig>
+              ) => Promise<{ content?: unknown }>;
+            }
+          ).invoke(
+            [
+              ['system', prompt ?? ACTIVITY_LABEL_PROMPT],
+              ['human', userPrompt],
+            ],
+            runtimeConfig
+          )
+      );
+
+    const extractLabel = (response: unknown): string => {
+      const content = (response as { content?: unknown } | null)?.content;
+      let text = '';
+      if (typeof content === 'string') {
+        text = content;
+      } else if (Array.isArray(content)) {
+        text = content
+          .map((block) =>
+            typeof block === 'string'
+              ? block
+              : ((block as { text?: string })?.text ?? '')
+          )
+          .join('');
+      }
+      return text.trim().replace(/^["']|["']$/g, '');
+    };
+
+    try {
+      let response: unknown;
+      try {
+        response = await withLangfuseRuntimeScope(
+          resolveLangfuseRuntimeScope({
+            runLangfuse: this.langfuse,
+            langfuseOverlay: labelContext?.langfuse,
+          }),
+          () => invokeLabel(invokeConfig)
+        );
+      } catch (_e) {
+        const langfuseHandler = findCallback(
+          invokeConfig.callbacks,
+          isLangfuseCallbackHandler
+        );
+        const { callbacks: _cb, ...rest } = invokeConfig;
+        const safeConfig = Object.assign({}, rest, {
+          callbacks: langfuseHandler ? [langfuseHandler] : [],
+        });
+        response = await withLangfuseRuntimeScope(
+          resolveLangfuseRuntimeScope({
+            runLangfuse: this.langfuse,
+            langfuseOverlay: labelContext?.langfuse,
+          }),
+          () => invokeLabel(safeConfig as Partial<RunnableConfig>)
+        );
+      }
+      const label = extractLabel(response);
+      return label.length > 0 ? { label } : {};
+    } finally {
+      await disposeLangfuseHandler(labelLangfuseHandler);
     }
   }
 }
