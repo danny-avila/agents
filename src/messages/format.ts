@@ -2024,6 +2024,105 @@ export function ensureThinkingBlockInMessages(
   return result;
 }
 
+/** Whether a message carries tool_use / tool_result content that a tool-less
+ *  agent cannot legally send (AI tool_calls, a tool_use content block, or a
+ *  ToolMessage). */
+function messageHasToolContent(msg: BaseMessage): boolean {
+  if (isToolMessage(msg)) {
+    return true;
+  }
+  const aiMsg = msg as AIMessage;
+  if (aiMsg.tool_calls != null && aiMsg.tool_calls.length > 0) {
+    return true;
+  }
+  if (Array.isArray(msg.content)) {
+    for (const block of msg.content as ExtendedMessageContent[]) {
+      if (typeof block === 'object' && block.type === 'tool_use') {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Folds tool_use / tool_result content into plain text for an agent that binds
+ * no tools.
+ *
+ * In a multi-agent graph, a tool-less destination still inherits the prior
+ * agent's conversation history, which can contain toolUse/toolResult blocks.
+ * Because it binds no tools, the model is invoked with no tool schema — and
+ * Bedrock's Converse API rejects any request that carries toolUse/toolResult
+ * blocks without a top-level toolConfig ("The toolConfig field must be defined
+ * when using toolUse and toolResult content blocks"). Adding a dummy toolConfig
+ * is not an option: AWS requires at least one tool, and it would expose a
+ * capability the destination was intentionally denied.
+ *
+ * Each AI tool-call turn plus its trailing ToolMessages is collapsed into a
+ * single `[Previous tool interaction]` HumanMessage that preserves the tool
+ * name, arguments and result as text (image blocks are kept as-is). Non-tool
+ * messages pass through untouched, and the original array is returned unchanged
+ * when it holds no tool content, so the common (fresh tool-less agent) case is
+ * a single cheap scan.
+ */
+export function foldToolBlocksForToollessAgent(
+  messages: BaseMessage[],
+  config?: RunnableConfig
+): BaseMessage[] {
+  let firstToolIndex = -1;
+  for (let i = 0; i < messages.length; i++) {
+    if (messageHasToolContent(messages[i])) {
+      firstToolIndex = i;
+      break;
+    }
+  }
+  if (firstToolIndex === -1) {
+    return messages;
+  }
+
+  const result: BaseMessage[] = messages.slice(0, firstToolIndex);
+  let foldedCount = 0;
+  let i = firstToolIndex;
+  while (i < messages.length) {
+    const msg = messages[i];
+    if (!messageHasToolContent(msg)) {
+      result.push(msg);
+      i++;
+      continue;
+    }
+
+    const parts: MessageContentComplex[] = [];
+    const textChunks: string[] = ['[Previous tool interaction]'];
+    appendMessageContent(msg, isToolMessage(msg) ? 'Tool' : 'AI', textChunks, parts);
+    foldedCount++;
+
+    let j = i + 1;
+    while (j < messages.length && isToolMessage(messages[j])) {
+      appendMessageContent(messages[j], 'Tool', textChunks, parts);
+      foldedCount++;
+      j++;
+    }
+
+    flushTextChunks(textChunks, parts);
+    result.push(
+      withMessageRole(
+        new HumanMessage({ content: toLangChainContent(parts) }),
+        'user'
+      )
+    );
+    i = j;
+  }
+
+  emitAgentLog(
+    config,
+    'warn',
+    'format',
+    `foldToolBlocksForToollessAgent: folded ${foldedCount} tool message(s) into text for a tool-less agent`
+  );
+
+  return result;
+}
+
 /**
  * Walks backwards from `currentIndex` through the message array to check
  * whether an earlier AI message in the same "chain" (no HumanMessage boundary)
