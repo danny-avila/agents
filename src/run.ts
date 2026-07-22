@@ -1518,15 +1518,23 @@ export class Run<_T extends t.BaseGraphState> {
     }
     const labelSeq = ++this.activityLabelSeq;
 
-    /** Resolve the LABELED agent's context (falling back to the graph
-     *  default): its Langfuse overlay carries the trace metadata and the
-     *  tool-output redaction policy that must govern this label. */
+    /** Resolve the LABELED agent's context: its Langfuse overlay carries the
+     *  trace metadata and the tool-output redaction policy that must govern
+     *  this label. */
+    const requestedContext =
+      this.Graph == null || agentId == null
+        ? undefined
+        : this.Graph.agentContexts.get(agentId);
+    /** Fail closed: an explicit but unknown/stale `agentId` must NOT silently
+     *  fall back to the default agent, whose redaction policy may be weaker
+     *  than the labeled agent's. Skip generation entirely instead. */
+    if (agentId != null && requestedContext == null) {
+      return {};
+    }
     const labelContext =
       this.Graph == null
         ? undefined
-        : ((agentId != null
-          ? this.Graph.agentContexts.get(agentId)
-          : undefined) ??
+        : (requestedContext ??
           this.Graph.agentContexts.get(this.Graph.defaultAgentId));
     const traceMetadata = createLangfuseTraceMetadata({
       messageId: 'activity-label-' + this.id,
@@ -1618,9 +1626,13 @@ export class Run<_T extends t.BaseGraphState> {
       } as t.ClientOptions,
     }) as t.ChatModelInstance;
 
+    /** Distinct run id per label call: callback/tracing integrations key
+     *  in-flight runs by it, so reusing the parent run's id would collide
+     *  across successive (or concurrent) label batches. */
+    const labelRunId = `${this.id}-activity-${labelSeq}`;
     const invokeConfig = Object.assign({}, labelChainOptions, {
-      run_id: this.id,
-      runId: this.id,
+      run_id: labelRunId,
+      runId: labelRunId,
       runName: labelChainOptions.runName ?? labelRunName,
     }) as Partial<RunnableConfig>;
 

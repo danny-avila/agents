@@ -59,7 +59,10 @@ describe('buildActivityLabelPrompt redaction', () => {
     expect(prompt).not.toContain('SECRET_CONNECTION_STRING_LEAK');
   });
 
-  it('keeps reasoning excerpts when no batch entry matches the policy', () => {
+  it('drops free-form context under ANY active policy, even with no matching entry', () => {
+    /** Reasoning/intent can quote output from an EARLIER call to the
+     *  redacted tool that this batch does not contain, so an active policy
+     *  suppresses free-form prose regardless of this batch's entries. */
     const redaction = resolveToolOutputTracingConfig({
       toolOutputTracing: { redactedToolNames: ['unrelated_tool'] },
     });
@@ -67,9 +70,46 @@ describe('buildActivityLabelPrompt redaction', () => {
       entries,
       charLimit: 600,
       thinkingExcerpts: ['Comparing versions across sources'],
+      lastAssistantText: 'Checking the unrelated_tool result from before',
       redaction,
     });
+    expect(prompt).not.toContain('Comparing versions across sources');
+    expect(prompt).not.toContain('Intent');
+    /** Non-matching entries keep their own outcomes. */
+    expect(prompt).toContain('PUBLIC_SEARCH_RESULTS');
+  });
+
+  it('keeps free-form context when no redaction policy is configured', () => {
+    const prompt = buildActivityLabelPrompt({
+      entries,
+      charLimit: 600,
+      thinkingExcerpts: ['Comparing versions across sources'],
+      lastAssistantText: 'Verifying each runtime',
+      redaction: undefined,
+    });
     expect(prompt).toContain('Comparing versions across sources');
+    expect(prompt).toContain('Verifying each runtime');
+  });
+
+  it('bounds serialization of oversized structured tool output', () => {
+    const huge = Array.from({ length: 50_000 }, (_, i) => ({
+      id: i,
+      blob: 'x'.repeat(200),
+    }));
+    const prompt = buildActivityLabelPrompt({
+      entries: [
+        {
+          toolName: 'db_rows',
+          toolInput: { sql: 'select *' },
+          toolOutput: huge,
+          status: 'success',
+        },
+      ],
+      charLimit: 600,
+    });
+    /** Degrades to a shape summary instead of materializing ~10MB of JSON. */
+    expect(prompt).toContain('[Array(50000)]');
+    expect(prompt.length).toBeLessThan(2000);
   });
 
   it('redacts only named tools, including their error text', () => {

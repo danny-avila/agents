@@ -33,16 +33,43 @@ export function truncateForLabel(value: string, maxLength: number): string {
   return value.slice(0, Math.max(0, maxLength - 1)) + '…';
 }
 
-function serializeForLabel(value: unknown): string {
+const ABORT_SERIALIZATION = Symbol('abort-label-serialization');
+
+/**
+ * Serializes a tool value for the prompt WITHOUT materializing huge JSON:
+ * the output is clipped to a few hundred characters anyway, so a multi-
+ * megabyte tool result must not be stringified in full on the label path.
+ * Strings clip immediately; structured values serialize under a character
+ * budget and degrade to a shape summary once it is exhausted.
+ */
+function serializeForLabel(value: unknown, limit: number): string {
   if (value == null) {
     return '';
   }
   if (typeof value === 'string') {
-    return value;
+    return value.length > limit ? value.slice(0, limit + 1) : value;
   }
+  let budget = limit * 4;
   try {
-    return JSON.stringify(value);
-  } catch {
+    return (
+      JSON.stringify(value, (_key, nested: unknown) => {
+        if (budget <= 0) {
+          throw ABORT_SERIALIZATION;
+        }
+        if (typeof nested === 'string') {
+          const clipped =
+            nested.length > limit ? nested.slice(0, limit) : nested;
+          budget -= clipped.length;
+          return clipped;
+        }
+        budget -= 8;
+        return nested;
+      }) ?? ''
+    );
+  } catch (error) {
+    if (error === ABORT_SERIALIZATION) {
+      return Array.isArray(value) ? `[Array(${value.length})]` : '[Object]';
+    }
     return String(value);
   }
 }
@@ -76,14 +103,14 @@ export function buildActivityLabelPrompt({
   redaction,
 }: BuildActivityLabelPromptParams): string {
   const clip = truncateForLabel;
-  /** Reasoning and intent text can quote tool output verbatim, so when the
-   *  policy redacts ANY entry in this batch (or tracing is globally
-   *  disabled), both are dropped wholesale — there is no reliable way to
+  /** Reasoning and intent text can quote tool output verbatim — including
+   *  output from EARLIER calls to a redacted tool that this batch does not
+   *  contain — so any active policy (global disable or a configured
+   *  redacted-name list) drops both wholesale. There is no reliable way to
    *  scrub a quoted fragment out of free-form model prose. */
   const excerptsRedacted =
     redaction != null &&
-    (redaction.enabled === false ||
-      entries.some((entry) => shouldRedactTool(entry.toolName, redaction)));
+    (redaction.enabled === false || redaction.redactedToolNames.size > 0);
   const sections: string[] = [];
   /** Intent text is free-form assistant prose that can quote a redacted
    *  tool result just as reasoning can, so it shares the excerpts' fate. */
@@ -114,7 +141,10 @@ export function buildActivityLabelPrompt({
       'Tool calls:\n' +
         entries
           .map((entry) => {
-            const input = clip(serializeForLabel(entry.toolInput), charLimit);
+            const input = clip(
+              serializeForLabel(entry.toolInput, charLimit),
+              charLimit
+            );
             const redacted =
               redaction != null && shouldRedactTool(entry.toolName, redaction);
             let outcome: string;
@@ -123,7 +153,10 @@ export function buildActivityLabelPrompt({
             } else if (entry.status === 'error') {
               outcome = `ERROR: ${clip(entry.error ?? 'unknown error', charLimit)}`;
             } else {
-              outcome = clip(serializeForLabel(entry.toolOutput), charLimit);
+              outcome = clip(
+                serializeForLabel(entry.toolOutput, charLimit),
+                charLimit
+              );
             }
             return `- ${entry.toolName}(${input}) → ${outcome}`;
           })
