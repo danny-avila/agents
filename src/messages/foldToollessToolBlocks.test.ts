@@ -34,11 +34,17 @@ function hasResidualToolContent(messages: BaseMessage[]): boolean {
     if (ai.tool_calls != null && ai.tool_calls.length > 0) {
       return true;
     }
+    const rawToolCalls = ai.additional_kwargs.tool_calls;
+    if (Array.isArray(rawToolCalls) && rawToolCalls.length > 0) {
+      return true;
+    }
     if (Array.isArray(m.content)) {
       return (m.content as ExtendedMessageContent[]).some(
         (b) =>
           typeof b === 'object' &&
-          (b.type === 'tool_use' || b.type === 'tool_call')
+          (b.type === 'tool_use' ||
+            b.type === 'tool_call' ||
+            b.type === 'tool_result')
       );
     }
     return false;
@@ -177,6 +183,79 @@ describe('foldToolBlocksForToollessAgent', () => {
     const folded = getTextContent(result[result.length - 1]);
     expect(folded).toContain('Let me search.');
     expect(folded).toContain('file_search');
+  });
+
+  test('folds an AI message whose tool call is only in additional_kwargs', () => {
+    const messages = [
+      new HumanMessage('Search my files'),
+      // Parsed `tool_calls` is empty; the call survives only in the raw
+      // additional_kwargs. The OpenAI converter still serializes it, so the
+      // parent AI message must fold with its ToolMessage — otherwise the fold
+      // would leave an orphan assistant(tool_calls) -> user(...) sequence.
+      new AIMessage({
+        content: '',
+        additional_kwargs: {
+          tool_calls: [
+            {
+              id: 'call_1',
+              type: 'function',
+              function: {
+                name: 'file_search',
+                arguments: '{"query":"roadmap"}',
+              },
+            },
+          ],
+        },
+      }),
+      new ToolMessage({
+        content: 'Found roadmap.md',
+        tool_call_id: 'call_1',
+        name: 'file_search',
+      }),
+    ];
+
+    const result = foldToolBlocksForToollessAgent(messages);
+
+    expect(hasResidualToolContent(result)).toBe(false);
+    expect(result).toHaveLength(2);
+    const folded = getTextContent(result[1]);
+    expect(folded).toContain('file_search');
+    expect(folded).toContain('roadmap');
+    expect(folded).toContain('Found roadmap.md');
+  });
+
+  test('folds a standard tool_result content block on a user message', () => {
+    const messages = [
+      new HumanMessage('Search'),
+      new AIMessage({
+        content: '',
+        tool_calls: [
+          {
+            id: 'call_1',
+            name: 'file_search',
+            args: { query: 'roadmap' },
+            type: 'tool_call',
+          },
+        ],
+      }),
+      // Tool result stored as a content block on a user message (the shape the
+      // Anthropic converter produces/accepts) rather than a ToolMessage.
+      new HumanMessage({
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'call_1',
+            content: 'Found roadmap.md',
+          },
+        ],
+      }),
+      new HumanMessage('thanks'),
+    ];
+
+    const result = foldToolBlocksForToollessAgent(messages);
+
+    expect(hasResidualToolContent(result)).toBe(false);
+    expect(result.map(getTextContent).join('\n')).toContain('Found roadmap.md');
   });
 
   test('detects v1 standard-content tool_call blocks (no AIMessage.tool_calls)', () => {

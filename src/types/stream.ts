@@ -192,7 +192,7 @@ export interface ExtendedMessageContent {
   text?: string;
   input?: string;
   /** Tool-call arguments on a v1 standard-content `tool_call` block. */
-  args?: string | Record<string, unknown>;
+  args?: ToolCallPart['args'];
   index?: string | number;
   id?: string;
   name?: string;

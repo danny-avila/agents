@@ -1844,11 +1844,26 @@ function appendToolCalls(
     return;
   }
   const aiMsg = msg as AIMessage;
-  if (!aiMsg.tool_calls || aiMsg.tool_calls.length === 0) {
+  if (aiMsg.tool_calls && aiMsg.tool_calls.length > 0) {
+    for (const tc of aiMsg.tool_calls) {
+      textChunks.push(`AI: [tool_call] ${tc.name}(${JSON.stringify(tc.args)})`);
+    }
     return;
   }
-  for (const tc of aiMsg.tool_calls) {
-    textChunks.push(`AI: [tool_call] ${tc.name}(${JSON.stringify(tc.args)})`);
+  // Fall back to raw provider tool calls kept only in additional_kwargs.
+  const rawToolCalls = aiMsg.additional_kwargs.tool_calls;
+  if (!Array.isArray(rawToolCalls)) {
+    return;
+  }
+  for (const tc of rawToolCalls) {
+    const fn = (tc as { function?: { name?: string; arguments?: string } })
+      .function;
+    if (fn == null) {
+      continue;
+    }
+    textChunks.push(
+      `AI: [tool_call] ${String(fn.name ?? '')}(${String(fn.arguments ?? '')})`
+    );
   }
 }
 
@@ -2034,11 +2049,15 @@ export function ensureThinkingBlockInMessages(
   return result;
 }
 
-/** Whether a message carries tool_use / tool_result content that a tool-less
- *  agent cannot legally send: a ToolMessage, AI `tool_calls`, or a `tool_use`
- *  / `tool_call` content block. Both block types matter — `@langchain/aws`
- *  serializes each to a Converse `toolUse` (the latter via the v1
- *  standard-content converter, `content: [{ type: 'tool_call' }]`). */
+/** Whether a message carries tool content a tool-less agent cannot legally
+ *  send. Covers every representation a provider converter will serialize back
+ *  into a request: a ToolMessage, parsed `AIMessage.tool_calls`, raw
+ *  `additional_kwargs.tool_calls` (OpenAI keeps calls here when the parsed
+ *  array is empty), and `tool_use` / `tool_call` / `tool_result` content
+ *  blocks (`@langchain/aws` and the Anthropic converter map these to Converse
+ *  `toolUse` / `toolResult`). Missing the parent AI message is not just a
+ *  passthrough: folding its ToolMessage alone would leave an orphan
+ *  `assistant(tool_calls) -> user(...)` sequence. */
 function messageHasToolContent(msg: BaseMessage): boolean {
   if (isToolMessage(msg)) {
     return true;
@@ -2047,11 +2066,17 @@ function messageHasToolContent(msg: BaseMessage): boolean {
   if (aiMsg.tool_calls != null && aiMsg.tool_calls.length > 0) {
     return true;
   }
+  const rawToolCalls = aiMsg.additional_kwargs.tool_calls;
+  if (Array.isArray(rawToolCalls) && rawToolCalls.length > 0) {
+    return true;
+  }
   if (Array.isArray(msg.content)) {
     for (const block of msg.content as ExtendedMessageContent[]) {
       if (
         typeof block === 'object' &&
-        (block.type === 'tool_use' || block.type === 'tool_call')
+        (block.type === 'tool_use' ||
+          block.type === 'tool_call' ||
+          block.type === 'tool_result')
       ) {
         return true;
       }
