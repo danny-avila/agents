@@ -111,6 +111,54 @@ const EXEC_ENDPOINT = `${baseEndpoint}/exec`;
 
 type SupportedLanguage = (typeof SUPPORTED_LANGUAGES)[number];
 
+const MAX_RETRY_AFTER_SECONDS = 3600;
+
+export const CODE_API_UNAVAILABLE_ERROR_MESSAGE =
+  'Code execution is temporarily unavailable. Please retry.';
+export const CODE_API_EXECUTION_FAILED_ERROR_MESSAGE = 'Code execution failed.';
+export const CODE_API_INVALID_REQUEST_ERROR_MESSAGE =
+  'The code execution request was rejected. Please check the tool input and try again.';
+export const CODE_API_RATE_LIMITED_ERROR_MESSAGE =
+  'Code execution is temporarily rate-limited. Please retry shortly.';
+
+export class CodeApiRequestError extends Error {
+  constructor(message = CODE_API_UNAVAILABLE_ERROR_MESSAGE) {
+    super(message);
+    this.name = 'CodeApiRequestError';
+  }
+}
+
+function getRetryAfterSeconds(responseBody: string): number | undefined {
+  try {
+    const parsed = JSON.parse(responseBody) as {
+      error?: unknown;
+      retry_after_seconds?: unknown;
+    };
+    if (
+      parsed.error !== 'rate_limited' ||
+      typeof parsed.retry_after_seconds !== 'number' ||
+      !Number.isFinite(parsed.retry_after_seconds) ||
+      parsed.retry_after_seconds <= 0
+    ) {
+      return undefined;
+    }
+    return Math.min(
+      Math.ceil(parsed.retry_after_seconds),
+      MAX_RETRY_AFTER_SECONDS
+    );
+  } catch {
+    return undefined;
+  }
+}
+
+export function normalizeCodeApiRequestError(
+  error: unknown
+): CodeApiRequestError {
+  return error instanceof CodeApiRequestError
+    ? error
+    : new CodeApiRequestError();
+}
+
 export async function resolveCodeApiAuthHeaders(
   authHeaders?: t.CodeApiAuthHeaders
 ): Promise<t.CodeApiAuthHeaderMap> {
@@ -124,8 +172,8 @@ export async function resolveCodeApiAuthHeaders(
 }
 
 export async function buildCodeApiHttpErrorMessage(
-  method: string,
-  endpoint: string,
+  _method: string,
+  _endpoint: string,
   response: { status: number; text: () => Promise<string> }
 ): Promise<string> {
   let responseBody = '';
@@ -134,9 +182,16 @@ export async function buildCodeApiHttpErrorMessage(
   } catch {
     responseBody = '';
   }
-  const body = responseBody.trim();
-  const bodySuffix = body === '' ? '' : `, body: ${body.slice(0, 1000)}`;
-  return `CodeAPI request failed: ${method} ${endpoint} returned ${response.status}${bodySuffix}`;
+  if (response.status === 429) {
+    const retryAfterSeconds = getRetryAfterSeconds(responseBody);
+    return retryAfterSeconds != null
+      ? `Code execution is temporarily rate-limited. Retry after ${retryAfterSeconds} seconds.`
+      : CODE_API_RATE_LIMITED_ERROR_MESSAGE;
+  }
+  if (response.status === 400 || response.status === 422) {
+    return CODE_API_INVALID_REQUEST_ERROR_MESSAGE;
+  }
+  return CODE_API_UNAVAILABLE_ERROR_MESSAGE;
 }
 
 export const CodeExecutionToolDescription = `
@@ -314,7 +369,7 @@ function createCodeExecutionTool(
         }
         const response = await fetch(EXEC_ENDPOINT, fetchOptions);
         if (!response.ok) {
-          throw new Error(
+          throw new CodeApiRequestError(
             await buildCodeApiHttpErrorMessage('POST', EXEC_ENDPOINT, response)
           );
         }
@@ -358,7 +413,7 @@ function createCodeExecutionTool(
         ];
       } catch (error) {
         const messageWithReminder = appendFailedExecutionFileReminder(
-          (error as Error | undefined)?.message ?? '',
+          normalizeCodeApiRequestError(error).message,
           code
         );
         throw new Error(`Execution error:\n\n${messageWithReminder}`);

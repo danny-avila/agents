@@ -202,13 +202,129 @@ describe('CodeAPI auth header injection', () => {
     ).not.toHaveProperty('authHeaders');
   });
 
-  it('includes the CodeAPI endpoint and response body on direct execution failures', async () => {
+  it('redacts the CodeAPI endpoint and response body on direct execution failures', async () => {
     fetchMock.mockResolvedValueOnce(errorResponse(404, 'Cannot POST /exec'));
     const tool = createBashExecutionTool();
 
-    await expect(tool.invoke({ command: 'echo 1' })).rejects.toThrow(
-      /CodeAPI request failed: POST .*\/exec returned 404, body: Cannot POST \/exec/
+    const error = await tool
+      .invoke({ command: 'echo 1' })
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain(
+      'Code execution is temporarily unavailable. Please retry.'
     );
+    expect((error as Error).message).not.toContain('/exec');
+    expect((error as Error).message).not.toContain('Cannot POST');
+  });
+
+  it('preserves only a bounded retry delay from CodeAPI rate-limit failures', async () => {
+    fetchMock.mockResolvedValueOnce(
+      errorResponse(
+        429,
+        JSON.stringify({
+          error: 'rate_limited',
+          message:
+            'Too many CodeAPI execution requests from internal deployment details.',
+          retry_after_seconds: 8.2,
+        })
+      )
+    );
+    const tool = createBashExecutionTool();
+
+    const error = await tool
+      .invoke({ command: 'echo 1' })
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain(
+      'Code execution is temporarily rate-limited. Retry after 9 seconds.'
+    );
+    expect((error as Error).message).not.toContain('CodeAPI');
+    expect((error as Error).message).not.toContain('internal deployment');
+  });
+
+  it('redacts network details from direct execution failures', async () => {
+    fetchMock.mockRejectedValueOnce(
+      new Error(
+        'request to http://codeapi.internal.svc.cluster.local/exec failed: getaddrinfo ENOTFOUND'
+      )
+    );
+    const tool = createBashExecutionTool();
+
+    const error = await tool
+      .invoke({ command: 'echo 1' })
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain(
+      'Code execution is temporarily unavailable. Please retry.'
+    );
+    expect((error as Error).message).not.toContain('svc.cluster.local');
+    expect((error as Error).message).not.toContain('ENOTFOUND');
+  });
+
+  it('redacts network details from programmatic execution failures', async () => {
+    fetchMock.mockRejectedValueOnce(
+      new Error(
+        'request to http://codeapi.internal.svc.cluster.local/exec/programmatic failed'
+      )
+    );
+    const tool = createProgrammaticToolCallingTool();
+
+    const error = await tool
+      .invoke(
+        { code: 'print("hello")' },
+        {
+          toolCall: {
+            name: 'programmatic_code_execution',
+            args: {},
+            toolMap: toolMap(),
+            toolDefs,
+          },
+        }
+      )
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain(
+      'Code execution is temporarily unavailable. Please retry.'
+    );
+    expect((error as Error).message).not.toContain('svc.cluster.local');
+  });
+
+  it('redacts CodeAPI programmatic errors while preserving execution stderr', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        status: 'error',
+        error:
+          'sandbox worker codeapi-runtime-7f9d failed in internal namespace',
+        stderr: 'NameError: tenant_variable is not defined',
+      })
+    );
+    const tool = createProgrammaticToolCallingTool();
+
+    const error = await tool
+      .invoke(
+        { code: 'print(tenant_variable)' },
+        {
+          toolCall: {
+            name: 'programmatic_code_execution',
+            args: {},
+            toolMap: toolMap(),
+            toolDefs,
+          },
+        }
+      )
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain('Code execution failed.');
+    expect((error as Error).message).toContain(
+      'NameError: tenant_variable is not defined'
+    );
+    expect((error as Error).message).not.toContain('codeapi-runtime');
+    expect((error as Error).message).not.toContain('internal namespace');
   });
 
   it('forwards Authorization on programmatic initial and continuation requests', async () => {
