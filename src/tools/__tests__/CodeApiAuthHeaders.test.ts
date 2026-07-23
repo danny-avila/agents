@@ -145,6 +145,38 @@ describe('CodeAPI auth header injection', () => {
     );
   });
 
+  it('maps dynamic auth-header failures to the safe authorization error', async () => {
+    const authHeaders = jest.fn(async () => {
+      throw new Error(
+        'credential helper failed for secret codeapi-signing-key in namespace internal-auth'
+      );
+    });
+    const tool = createProgrammaticToolCallingTool({ authHeaders });
+
+    const error = await tool
+      .invoke(
+        { code: 'print("hello")' },
+        {
+          toolCall: {
+            name: 'programmatic_code_execution',
+            args: {},
+            toolMap: toolMap(),
+            toolDefs,
+          },
+        }
+      )
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain(
+      'Code execution is not authorized. Verify access before trying again.'
+    );
+    expect((error as Error).message).not.toContain('Please retry');
+    expect((error as Error).message).not.toContain('codeapi-signing-key');
+    expect((error as Error).message).not.toContain('internal-auth');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it('forwards Authorization for direct code execution', async () => {
     fetchMock.mockResolvedValueOnce(
       jsonResponse({ session_id: 'session_123', stdout: '1\n' })

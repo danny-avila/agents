@@ -214,7 +214,12 @@ export async function resolveCodeApiAuthHeaders(
     return {};
   }
   if (typeof authHeaders === 'function') {
-    return authHeaders();
+    try {
+      const resolvedHeaders = await authHeaders();
+      return resolvedHeaders;
+    } catch {
+      throw new CodeApiRequestError(CODE_API_AUTHORIZATION_ERROR_MESSAGE);
+    }
   }
   return authHeaders;
 }
