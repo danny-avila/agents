@@ -7,7 +7,7 @@ import {
   BASH_SHELL_GUIDANCE,
   CODE_ARTIFACT_PATH_GUIDANCE,
   appendFailedExecutionFileReminder,
-  CODE_API_EXECUTION_FAILED_ERROR_MESSAGE,
+  buildCodeApiExecutionErrorMessage,
   CodeApiRequestError,
   getCodeBaseURL,
 } from './CodeExecutor';
@@ -436,12 +436,7 @@ export function createBashProgrammaticToolCallingTool(
         }
 
         if (response.status === 'error') {
-          throw new Error(
-            CODE_API_EXECUTION_FAILED_ERROR_MESSAGE +
-              (response.stderr != null && response.stderr !== ''
-                ? `\n\nStderr:\n${response.stderr}`
-                : '')
-          );
+          throw new Error(buildCodeApiExecutionErrorMessage(response));
         }
 
         throw new CodeApiRequestError();

@@ -218,6 +218,31 @@ describe('CodeAPI auth header injection', () => {
     expect((error as Error).message).not.toContain('Cannot POST');
   });
 
+  it.each([401, 403])(
+    'reports CodeAPI HTTP %s authorization failures as non-retryable',
+    async (status) => {
+      fetchMock.mockResolvedValueOnce(
+        errorResponse(
+          status,
+          'Invalid bearer token for codeapi.internal.svc.cluster.local'
+        )
+      );
+      const tool = createBashExecutionTool();
+
+      const error = await tool
+        .invoke({ command: 'echo 1' })
+        .catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toContain(
+        'Code execution is not authorized. Verify access before trying again.'
+      );
+      expect((error as Error).message).not.toContain('Please retry');
+      expect((error as Error).message).not.toContain('svc.cluster.local');
+      expect((error as Error).message).not.toContain('Invalid bearer token');
+    }
+  );
+
   it('preserves only a bounded retry delay from CodeAPI rate-limit failures', async () => {
     fetchMock.mockResolvedValueOnce(
       errorResponse(
@@ -325,6 +350,94 @@ describe('CodeAPI auth header injection', () => {
     );
     expect((error as Error).message).not.toContain('codeapi-runtime');
     expect((error as Error).message).not.toContain('internal namespace');
+  });
+
+  it('preserves an allowlisted programmatic execution error when stderr is absent', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        status: 'error',
+        error: 'Time limit exceeded',
+      })
+    );
+    const tool = createProgrammaticToolCallingTool();
+
+    const error = await tool
+      .invoke(
+        { code: 'while True: pass' },
+        {
+          toolCall: {
+            name: 'programmatic_code_execution',
+            args: {},
+            toolMap: toolMap(),
+            toolDefs,
+          },
+        }
+      )
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain(
+      'Code execution failed. Execution exceeded the time limit.'
+    );
+  });
+
+  it('keeps arbitrary programmatic execution errors redacted when stderr is absent', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        status: 'error',
+        error:
+          'sandbox worker codeapi-runtime-7f9d failed in internal namespace',
+      })
+    );
+    const tool = createProgrammaticToolCallingTool();
+
+    const error = await tool
+      .invoke(
+        { code: 'print("hello")' },
+        {
+          toolCall: {
+            name: 'programmatic_code_execution',
+            args: {},
+            toolMap: toolMap(),
+            toolDefs,
+          },
+        }
+      )
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain('Code execution failed.');
+    expect((error as Error).message).not.toContain('codeapi-runtime');
+    expect((error as Error).message).not.toContain('internal namespace');
+  });
+
+  it('preserves an allowlisted bash execution error when stderr is absent', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        status: 'error',
+        error: 'Out of memory',
+      })
+    );
+    const tool = createBashProgrammaticToolCallingTool();
+
+    const error = await tool
+      .invoke(
+        { code: 'lookup_user "{}"' },
+        {
+          toolCall: {
+            name: 'bash_programmatic_code_execution',
+            args: {},
+            toolMap: toolMap(),
+            toolDefs,
+          },
+        }
+      )
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain(
+      'Code execution failed. Execution exceeded the memory limit.'
+    );
   });
 
   it('forwards Authorization on programmatic initial and continuation requests', async () => {

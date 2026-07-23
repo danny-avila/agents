@@ -115,11 +115,25 @@ const MAX_RETRY_AFTER_SECONDS = 3600;
 
 export const CODE_API_UNAVAILABLE_ERROR_MESSAGE =
   'Code execution is temporarily unavailable. Please retry.';
+export const CODE_API_AUTHORIZATION_ERROR_MESSAGE =
+  'Code execution is not authorized. Verify access before trying again.';
 export const CODE_API_EXECUTION_FAILED_ERROR_MESSAGE = 'Code execution failed.';
 export const CODE_API_INVALID_REQUEST_ERROR_MESSAGE =
   'The code execution request was rejected. Please check the tool input and try again.';
 export const CODE_API_RATE_LIMITED_ERROR_MESSAGE =
   'Code execution is temporarily rate-limited. Please retry shortly.';
+
+const SAFE_CODE_API_EXECUTION_ERROR_DETAILS: Readonly<
+  Partial<Record<string, string>>
+> = {
+  'Execution failed or timed out': 'Execution failed or timed out.',
+  'Out of memory': 'Execution exceeded the memory limit.',
+  'Time limit exceeded': 'Execution exceeded the time limit.',
+  'sandbox emitted an empty pending tool call block; aborting to avoid a tight retry loop':
+    'Generated code emitted an invalid empty tool request.',
+  'stderr length exceeded': 'Execution error output exceeded the size limit.',
+  'stdout length exceeded': 'Execution output exceeded the size limit.',
+};
 
 export class CodeApiRequestError extends Error {
   constructor(message = CODE_API_UNAVAILABLE_ERROR_MESSAGE) {
@@ -159,6 +173,38 @@ export function normalizeCodeApiRequestError(
     : new CodeApiRequestError();
 }
 
+function getSafeCodeApiExecutionErrorDetail(
+  error: unknown
+): string | undefined {
+  if (typeof error !== 'string') {
+    return undefined;
+  }
+  const exactMatch = SAFE_CODE_API_EXECUTION_ERROR_DETAILS[error];
+  if (exactMatch != null) {
+    return exactMatch;
+  }
+  if (/^Sandbox exited with code (?:-?\d{1,4}|unknown)$/.test(error)) {
+    return error.replace(/^Sandbox/, 'Execution');
+  }
+  if (/^Sandbox requested an unregistered tool: .+$/.test(error)) {
+    return 'Generated code requested a tool that is not available.';
+  }
+  return undefined;
+}
+
+export function buildCodeApiExecutionErrorMessage(response: {
+  error?: unknown;
+  stderr?: unknown;
+}): string {
+  if (typeof response.stderr === 'string' && response.stderr !== '') {
+    return `${CODE_API_EXECUTION_FAILED_ERROR_MESSAGE}\n\nStderr:\n${response.stderr}`;
+  }
+  const safeDetail = getSafeCodeApiExecutionErrorDetail(response.error);
+  return safeDetail != null
+    ? `${CODE_API_EXECUTION_FAILED_ERROR_MESSAGE} ${safeDetail}`
+    : CODE_API_EXECUTION_FAILED_ERROR_MESSAGE;
+}
+
 export async function resolveCodeApiAuthHeaders(
   authHeaders?: t.CodeApiAuthHeaders
 ): Promise<t.CodeApiAuthHeaderMap> {
@@ -187,6 +233,9 @@ export async function buildCodeApiHttpErrorMessage(
     return retryAfterSeconds != null
       ? `Code execution is temporarily rate-limited. Retry after ${retryAfterSeconds} seconds.`
       : CODE_API_RATE_LIMITED_ERROR_MESSAGE;
+  }
+  if (response.status === 401 || response.status === 403) {
+    return CODE_API_AUTHORIZATION_ERROR_MESSAGE;
   }
   if (response.status === 400 || response.status === 422) {
     return CODE_API_INVALID_REQUEST_ERROR_MESSAGE;

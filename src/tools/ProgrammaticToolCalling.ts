@@ -10,8 +10,8 @@ import {
   CODE_ARTIFACT_PATH_GUIDANCE,
   appendCodeSessionFileSummary,
   appendFailedExecutionFileReminder,
+  buildCodeApiExecutionErrorMessage,
   buildCodeApiHttpErrorMessage,
-  CODE_API_EXECUTION_FAILED_ERROR_MESSAGE,
   CodeApiRequestError,
   emptyOutputMessage,
   getCodeBaseURL,
@@ -1021,12 +1021,7 @@ export function createProgrammaticToolCallingTool(
         }
 
         if (response.status === 'error') {
-          throw new Error(
-            CODE_API_EXECUTION_FAILED_ERROR_MESSAGE +
-              (response.stderr != null && response.stderr !== ''
-                ? `\n\nStderr:\n${response.stderr}`
-                : '')
-          );
+          throw new Error(buildCodeApiExecutionErrorMessage(response));
         }
 
         throw new CodeApiRequestError();
