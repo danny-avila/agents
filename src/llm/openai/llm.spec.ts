@@ -59,7 +59,7 @@ import type { BaseMessage, BaseMessageChunk } from '@langchain/core/messages';
 import type { ChatGenerationChunk } from '@langchain/core/outputs';
 import type { OpenAIClient } from '@langchain/openai';
 import { _convertMessagesToOpenAIParams } from '@/llm/openai/utils';
-import { ChatOpenAI } from '@/llm/openai';
+import { AzureChatOpenAI, ChatOpenAI } from '@/llm/openai';
 
 type CompletionsDelegate = {
   _convertCompletionsMessageToBaseMessage(
@@ -89,6 +89,12 @@ type InvocationParamsDelegate = {
   ) => { tools?: { function: { strict?: boolean } }[] };
 };
 
+type ResponsesInvocationParamsDelegate = {
+  invocationParams: (options: Record<string, unknown>) => {
+    include?: string[];
+  };
+};
+
 type RawChunk = OpenAIClient.Chat.Completions.ChatCompletionChunk;
 
 type StreamEventsModel = {
@@ -109,9 +115,40 @@ function completionsDelegateOf(model: ChatOpenAI): CompletionsDelegate {
 const completionsOf = <T>(model: ChatOpenAI): T =>
   (model as unknown as { completions: T }).completions;
 
+const responsesOf = <T>(model: ChatOpenAI | AzureChatOpenAI): T =>
+  (model as unknown as { responses: T }).responses;
+
 function newOpenAI(): ChatOpenAI {
   return new ChatOpenAI({ model: 'gpt-4o-mini', apiKey: 'test-key' });
 }
+
+describe('Responses hosted web search sources', () => {
+  const models = [
+    new ChatOpenAI({ model: 'gpt-5.5', apiKey: 'test' }),
+    new AzureChatOpenAI({
+      azureOpenAIApiKey: 'test',
+      azureOpenAIApiInstanceName: 'test-instance',
+      azureOpenAIApiDeploymentName: 'test-deployment',
+      azureOpenAIApiVersion: '2024-08-01-preview',
+    }),
+  ];
+
+  test.each(models)('requests sources for hosted web search', (model) => {
+    const params = responsesOf<ResponsesInvocationParamsDelegate>(
+      model
+    ).invocationParams({ tools: [{ type: 'web_search' }] });
+
+    expect(params.include).toContain('web_search_call.action.sources');
+  });
+
+  test('does not request web sources without a hosted web search tool', () => {
+    const params = responsesOf<ResponsesInvocationParamsDelegate>(
+      models[0]
+    ).invocationParams({});
+
+    expect(params.include).toBeUndefined();
+  });
+});
 
 function createStreamModel(mockChunks: RawChunk[]): ChatOpenAI {
   const model = new ChatOpenAI({ model: 'gpt-4o-mini', apiKey: 'test-key' });
