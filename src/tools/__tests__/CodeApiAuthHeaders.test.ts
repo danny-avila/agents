@@ -381,6 +381,39 @@ describe('CodeAPI auth header injection', () => {
     );
   });
 
+  it('preserves an allowlisted execution error alongside stderr', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        status: 'error',
+        error: 'Time limit exceeded',
+        stderr: 'processed 42 records before termination',
+      })
+    );
+    const tool = createProgrammaticToolCallingTool();
+
+    const error = await tool
+      .invoke(
+        { code: 'while True: process_next_record()' },
+        {
+          toolCall: {
+            name: 'programmatic_code_execution',
+            args: {},
+            toolMap: toolMap(),
+            toolDefs,
+          },
+        }
+      )
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain(
+      'Code execution failed. Execution exceeded the time limit.'
+    );
+    expect((error as Error).message).toContain(
+      'Stderr:\nprocessed 42 records before termination'
+    );
+  });
+
   it('keeps arbitrary programmatic execution errors redacted when stderr is absent', async () => {
     fetchMock.mockResolvedValueOnce(
       jsonResponse({

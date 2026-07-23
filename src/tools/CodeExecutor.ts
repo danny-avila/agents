@@ -196,13 +196,15 @@ export function buildCodeApiExecutionErrorMessage(response: {
   error?: unknown;
   stderr?: unknown;
 }): string {
-  if (typeof response.stderr === 'string' && response.stderr !== '') {
-    return `${CODE_API_EXECUTION_FAILED_ERROR_MESSAGE}\n\nStderr:\n${response.stderr}`;
-  }
   const safeDetail = getSafeCodeApiExecutionErrorDetail(response.error);
-  return safeDetail != null
-    ? `${CODE_API_EXECUTION_FAILED_ERROR_MESSAGE} ${safeDetail}`
-    : CODE_API_EXECUTION_FAILED_ERROR_MESSAGE;
+  const message =
+    safeDetail != null
+      ? `${CODE_API_EXECUTION_FAILED_ERROR_MESSAGE} ${safeDetail}`
+      : CODE_API_EXECUTION_FAILED_ERROR_MESSAGE;
+  if (typeof response.stderr === 'string' && response.stderr !== '') {
+    return `${message}\n\nStderr:\n${response.stderr}`;
+  }
+  return message;
 }
 
 export async function resolveCodeApiAuthHeaders(
