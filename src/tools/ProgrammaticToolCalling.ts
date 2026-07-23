@@ -10,10 +10,13 @@ import {
   CODE_ARTIFACT_PATH_GUIDANCE,
   appendCodeSessionFileSummary,
   appendFailedExecutionFileReminder,
+  buildCodeApiExecutionErrorMessage,
   buildCodeApiHttpErrorMessage,
+  CodeApiRequestError,
   emptyOutputMessage,
   getCodeBaseURL,
   appendTmpScratchReminder,
+  normalizeCodeApiRequestError,
   resolveCodeApiAuthHeaders,
 } from './CodeExecutor';
 import {
@@ -474,30 +477,34 @@ export async function makeRequest(
   proxy?: string,
   authHeaders?: t.CodeApiAuthHeaders
 ): Promise<t.ProgrammaticExecutionResponse> {
-  const resolvedAuthHeaders = await resolveCodeApiAuthHeaders(authHeaders);
-  const fetchOptions: RequestInit = {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'User-Agent': 'LibreChat/1.0',
-      ...resolvedAuthHeaders,
-    },
-    body: JSON.stringify(body),
-  };
+  try {
+    const resolvedAuthHeaders = await resolveCodeApiAuthHeaders(authHeaders);
+    const fetchOptions: RequestInit = {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': 'LibreChat/1.0',
+        ...resolvedAuthHeaders,
+      },
+      body: JSON.stringify(body),
+    };
 
-  if (proxy != null && proxy !== '') {
-    fetchOptions.agent = new HttpsProxyAgent(proxy);
+    if (proxy != null && proxy !== '') {
+      fetchOptions.agent = new HttpsProxyAgent(proxy);
+    }
+
+    const response = await fetch(endpoint, fetchOptions);
+
+    if (!response.ok) {
+      throw new CodeApiRequestError(
+        await buildCodeApiHttpErrorMessage('POST', endpoint, response)
+      );
+    }
+
+    return (await response.json()) as t.ProgrammaticExecutionResponse;
+  } catch (error) {
+    throw normalizeCodeApiRequestError(error);
   }
-
-  const response = await fetch(endpoint, fetchOptions);
-
-  if (!response.ok) {
-    throw new Error(
-      await buildCodeApiHttpErrorMessage('POST', endpoint, response)
-    );
-  }
-
-  return (await response.json()) as t.ProgrammaticExecutionResponse;
 }
 
 /**
@@ -1014,15 +1021,10 @@ export function createProgrammaticToolCallingTool(
         }
 
         if (response.status === 'error') {
-          throw new Error(
-            `Execution error: ${response.error}` +
-              (response.stderr != null && response.stderr !== ''
-                ? `\n\nStderr:\n${response.stderr}`
-                : '')
-          );
+          throw new Error(buildCodeApiExecutionErrorMessage(response));
         }
 
-        throw new Error(`Unexpected response status: ${response.status}`);
+        throw new CodeApiRequestError();
       } catch (error) {
         const messageWithReminder = appendFailedExecutionFileReminder(
           (error as Error).message,
