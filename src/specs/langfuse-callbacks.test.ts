@@ -1,7 +1,8 @@
-import { HumanMessage } from '@langchain/core/messages';
 import { LangfuseOtelSpanAttributes } from '@langfuse/tracing';
+import { AIMessage, HumanMessage } from '@langchain/core/messages';
 import { CallbackManager } from '@langchain/core/callbacks/manager';
 import { context as otelContext, trace as otelTrace } from '@opentelemetry/api';
+import type { ChatGeneration } from '@langchain/core/outputs';
 import type * as t from '@/types';
 import { handleConverseStreamMetadata } from '@/llm/bedrock/utils/message_outputs';
 import { traceIdFromSeed } from '@/langfuseRuntimeContext';
@@ -446,6 +447,62 @@ describe('Langfuse callback composition', () => {
         input_cache_creation: 10000,
       })
     );
+  });
+
+  it('uses the provider-reported routed model for Langfuse pricing', async () => {
+    const { createLangfuseHandler } = await import('@/langfuse');
+    const { initializeLangfuseTracing } = await import('@/instrumentation');
+    initializeLangfuseTracing({
+      publicKey: 'pk-test',
+      secretKey: 'sk-test',
+    });
+    const handler = createLangfuseHandler({
+      langfuse: {
+        publicKey: 'pk-test',
+        secretKey: 'sk-test',
+      },
+    });
+    const runId = 'test-langfuse-routed-model';
+    const generation: ChatGeneration = {
+      text: 'hello',
+      message: new AIMessage({
+        content: 'hello',
+        response_metadata: {
+          model_name: 'model-router',
+          model: 'model-routergpt-5.5-2026-04-24',
+        },
+        usage_metadata: {
+          input_tokens: 10,
+          output_tokens: 5,
+          total_tokens: 15,
+        },
+      }),
+    };
+
+    await handler?.handleChatModelStart(
+      {
+        lc: 1,
+        type: 'constructor',
+        id: ['AzureModelRouter'],
+        kwargs: {},
+      },
+      [[new HumanMessage('hello')]],
+      runId
+    );
+    await handler?.handleLLMEnd(
+      {
+        generations: [[generation]],
+      },
+      runId
+    );
+
+    const model = mockSpanAttributeSets
+      .map(
+        (attributes) => attributes[LangfuseOtelSpanAttributes.OBSERVATION_MODEL]
+      )
+      .find((value): value is string => typeof value === 'string');
+
+    expect(model).toBe('gpt-5.5-2026-04-24');
   });
 
   it('uses deterministic trace ids when tracing is configured from env only', async () => {
