@@ -142,6 +142,8 @@ export enum ContentTypes {
   REASONING_CONTENT = 'reasoning_content',
   /** Mid-run user steer persisted inline in an assistant message; replayed as a user turn */
   STEER = 'steer',
+  /** Fast-model activity label for a tool/reasoning block; UI-only, never model input */
+  ACTIVITY_LABEL = 'activity_label',
 }
 
 export enum ToolCallTypes {

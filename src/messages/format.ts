@@ -401,7 +401,8 @@ function hasMeaningfulAssistantContent(part: MessageContentComplex): boolean {
     part.type === ContentTypes.TOOL_CALL ||
     part.type === ContentTypes.ERROR ||
     part.type === ContentTypes.AGENT_UPDATE ||
-    part.type === ContentTypes.SUMMARY
+    part.type === ContentTypes.SUMMARY ||
+    part.type === ContentTypes.ACTIVITY_LABEL
   ) {
     return false;
   }
@@ -799,7 +800,8 @@ function formatAssistantMessage(
       } else if (
         part.type === ContentTypes.ERROR ||
         part.type === ContentTypes.AGENT_UPDATE ||
-        part.type === ContentTypes.SUMMARY
+        part.type === ContentTypes.SUMMARY ||
+        part.type === ContentTypes.ACTIVITY_LABEL
       ) {
         continue;
       } else {
@@ -915,6 +917,14 @@ function labelAllAgentContent(
 
   for (let i = 0; i < contentParts.length; i++) {
     const part = contentParts[i];
+    /** UI-only progress headers are not agent content and must not disturb
+     *  agent state: a label with no `agentIdMap` entry would otherwise read
+     *  as an agent change and flush the buffer mid-agent, splitting one
+     *  agent's contiguous content into two labeled blocks. Skipped before
+     *  any state transition below (mirrors the transfer path). */
+    if (part.type === ContentTypes.ACTIVITY_LABEL) {
+      continue;
+    }
     const agentId = agentIdMap[i];
 
     // If agent changed, flush previous buffer
@@ -1038,6 +1048,14 @@ export const labelContentByAgent = (
 
   for (let i = 0; i < contentParts.length; i++) {
     const part = contentParts[i];
+    /** UI-only progress headers are not agent content and must not disturb
+     *  agent state: a label with no `agentIdMap` entry would otherwise look
+     *  like an agent change, flushing the buffer and resetting an open
+     *  transfer capture so the transferred agent's following chunks lose
+     *  their frame. Skipped before any state transition below. */
+    if (part.type === ContentTypes.ACTIVITY_LABEL) {
+      continue;
+    }
     const agentId = agentIdMap[i];
 
     // Check if this is a transfer tool call

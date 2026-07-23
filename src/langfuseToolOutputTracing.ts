@@ -84,7 +84,10 @@ function toolNameMatches(
   return config.redactedToolNames.has(normalizedToolName);
 }
 
-function shouldRedactTool(
+/** Whether a tool's outputs are excluded from tracing (global disable or
+ *  `redactedToolNames` match). Exported for the activity-label prompt
+ *  builder, whose prompt becomes Langfuse generation input. */
+export function shouldRedactTool(
   toolName: string | undefined,
   config: ResolvedLangfuseToolOutputTracingConfig
 ): boolean {

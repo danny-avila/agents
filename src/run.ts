@@ -1,9 +1,9 @@
 // src/run.ts
-import { HumanMessage } from '@langchain/core/messages';
 import { PromptTemplate } from '@langchain/core/prompts';
 import { RunnableLambda } from '@langchain/core/runnables';
 import { AzureChatOpenAI, ChatOpenAI } from '@langchain/openai';
 import { BaseCallbackHandler } from '@langchain/core/callbacks/base';
+import { HumanMessage, SystemMessage } from '@langchain/core/messages';
 import {
   Command,
   INTERRUPT,
@@ -27,9 +27,18 @@ import {
   withLangfuseAttributes,
 } from '@/langfuse';
 import {
+  hasToolOutputTracingConfig,
+  resolveLangfuseConfig,
+  resolveToolOutputTracingConfig,
+} from '@/langfuseConfig';
+import {
   resolveLangfuseRuntimeScope,
   withLangfuseRuntimeScope,
 } from '@/langfuseRuntimeScope';
+import {
+  ACTIVITY_LABEL_PROMPT,
+  buildActivityLabelPrompt,
+} from '@/prompts/activityLabel';
 import {
   appendCallbacks,
   findCallback,
@@ -43,7 +52,7 @@ import { createTokenCounter, encodingForModel } from '@/utils/tokens';
 import { initializeLangfuseTracing } from './instrumentation';
 import { GraphEvents, Callback, TitleMethod } from '@/common';
 import { MultiAgentGraph } from '@/graphs/MultiAgentGraph';
-import { resolveLangfuseConfig } from '@/langfuseConfig';
+import { getTraceIdSeed } from '@/langfuseRuntimeContext';
 import { StandardGraph } from '@/graphs/Graph';
 import { initializeModel } from '@/llm/init';
 import { HandlerRegistry } from '@/events';
@@ -153,6 +162,8 @@ export class Run<_T extends t.BaseGraphState> {
    * lets callers assert the type they expect.
    */
   private _interrupt: t.RunInterruptResult<unknown> | undefined;
+  /** Per-run sequence for batch-unique activity-label trace-seed fallbacks. */
+  private activityLabelSeq = 0;
   private _haltedReason: string | undefined;
 
   private constructor(config: Partial<t.RunConfig>) {
@@ -1476,6 +1487,291 @@ export class Run<_T extends t.BaseGraphState> {
       }
     } finally {
       await disposeLangfuseHandler(titleLangfuseHandler);
+    }
+  }
+
+  /**
+   * Generates a short activity label for a completed tool/reasoning block
+   * using a fast model. Mirrors `generateTitle`'s Langfuse wiring so the
+   * call is traced under the conversation's session (sessionId from
+   * `chainOptions.configurable.thread_id`) with its own tags — never as an
+   * orphan trace. The payload contains no human messages by design: intent
+   * comes from `lastAssistantText`, content from reasoning excerpts and
+   * tool entries.
+   */
+  async generateActivityLabel({
+    provider,
+    clientOptions,
+    entries,
+    thinkingExcerpts,
+    lastAssistantText,
+    prompt,
+    charLimit = 600,
+    chainOptions,
+    traceSeed,
+    agentId,
+  }: t.RunActivityLabelOptions): Promise<{ label?: string }> {
+    if (
+      entries.length === 0 &&
+      !(thinkingExcerpts && thinkingExcerpts.length > 0)
+    ) {
+      return {};
+    }
+    const labelSeq = ++this.activityLabelSeq;
+
+    /** Resolve the LABELED agent's context: its Langfuse overlay carries the
+     *  trace metadata and the tool-output redaction policy that must govern
+     *  this label. */
+    const requestedContext =
+      this.Graph == null || agentId == null
+        ? undefined
+        : this.Graph.agentContexts.get(agentId);
+    /** Fail closed: an explicit but unknown/stale `agentId` must NOT silently
+     *  fall back to the default agent, whose redaction policy may be weaker
+     *  than the labeled agent's. Skip generation entirely instead. */
+    if (agentId != null && requestedContext == null) {
+      return {};
+    }
+    const labelContext =
+      this.Graph == null
+        ? undefined
+        : (requestedContext ??
+          this.Graph.agentContexts.get(this.Graph.defaultAgentId));
+    const traceMetadata = createLangfuseTraceMetadata({
+      messageId: 'activity-label-' + this.id,
+      agentName: labelContext?.name,
+    });
+    const labelRunName = getLangfuseTraceName(
+      traceMetadata,
+      'LibreChat Activity Label'
+    );
+
+    /** Shallow-cloned: activity labels run once per tool batch, and writing
+     *  the Langfuse handler back onto a host-reused `chainOptions` would
+     *  accumulate duplicate callbacks across batches. */
+    const labelChainOptions = {
+      ...(chainOptions ?? {}),
+    } as Partial<RunnableConfig> & {
+      configurable?: Record<string, unknown>;
+    };
+    const labelUserId =
+      typeof labelChainOptions.configurable?.user_id === 'string'
+        ? (labelChainOptions.configurable.user_id as string)
+        : undefined;
+    const labelSessionId =
+      typeof labelChainOptions.configurable?.thread_id === 'string'
+        ? (labelChainOptions.configurable.thread_id as string)
+        : undefined;
+    const labelLangfuseConfig = resolveLangfuseConfig(
+      this.langfuse,
+      labelContext?.langfuse
+    );
+    initializeLangfuseTracing(labelLangfuseConfig);
+    /** Seed policy, threading two constraints:
+     *  1. `runWithLangfuseRuntimeContext` SPREADS the surrounding context, so
+     *     an absent seed INHERITS the parent run's and collapses every label
+     *     into that trace. When a parent seed is active we must override it
+     *     with a per-label one.
+     *  2. Without deterministic tracing there is no parent seed, and forcing
+     *     one here would make label trace ids deterministic when neither
+     *     `processStream` nor `generateTitle` are — so leave it unset.
+     *  Seeded when determinism is opted into OR a parent seed is live;
+     *  otherwise unseeded, matching the other generation paths. */
+    const inheritedTraceSeed = getTraceIdSeed();
+    const labelTraceSeed =
+      labelLangfuseConfig?.deterministicTraceId === true ||
+      inheritedTraceSeed != null
+        ? (traceSeed ?? `activity-label-${this.id}-${labelSeq}`)
+        : undefined;
+    const labelRuntimeScope = resolveLangfuseRuntimeScope({
+      runLangfuse: this.langfuse,
+      langfuseOverlay: labelContext?.langfuse,
+      traceIdSeed: labelTraceSeed,
+    });
+    /** Handler only when a session id resolved from
+     *  `chainOptions.configurable.thread_id`: without it the label call has
+     *  no conversation identity, and tracing it would create an orphan
+     *  trace outside any session — worse than not tracing at all. */
+    /** Declared then conditionally assigned (title precedent): a ternary
+     *  around the object literal makes eslint's indent rule and prettier
+     *  disagree, and both gate CI. */
+    let labelLangfuseHandler: CallbackEntry | undefined;
+    if (labelSessionId != null) {
+      labelLangfuseHandler = createLangfuseHandler({
+        langfuse: labelLangfuseConfig,
+        userId: labelUserId,
+        sessionId: labelSessionId,
+        traceMetadata,
+        tags: ['librechat', 'activity-label'],
+        traceIdSeed:
+          labelLangfuseConfig?.deterministicTraceId === true
+            ? labelTraceSeed
+            : undefined,
+      });
+    }
+    if (labelLangfuseHandler != null) {
+      labelChainOptions.callbacks = appendCallbacks(
+        labelChainOptions.callbacks,
+        [labelLangfuseHandler]
+      );
+    }
+
+    /** The label prompt becomes Langfuse generation input, so the resolved
+     *  tool-output redaction policy (global disable / redactedToolNames)
+     *  applies to it exactly as to structured tool observations. */
+    let redaction = hasToolOutputTracingConfig(
+      this.langfuse,
+      labelContext?.langfuse
+    )
+      ? resolveToolOutputTracingConfig(this.langfuse, labelContext?.langfuse)
+      : undefined;
+    /** Multi-agent graph with no `agentId`: the caller did not say WHICH
+     *  agent ran this batch, so resolving from the default agent could trace
+     *  raw output that a stricter sibling's policy forbids. Fold every
+     *  agent's policy into the strictest one instead of guessing. */
+    const agentContexts = this.Graph?.agentContexts;
+    if (agentId == null && agentContexts != null && agentContexts.size > 1) {
+      for (const context of agentContexts.values()) {
+        if (!hasToolOutputTracingConfig(this.langfuse, context.langfuse)) {
+          continue;
+        }
+        const candidate = resolveToolOutputTracingConfig(
+          this.langfuse,
+          context.langfuse
+        );
+        if (redaction == null) {
+          redaction = candidate;
+          continue;
+        }
+        redaction = {
+          enabled: redaction.enabled === false ? false : candidate.enabled,
+          redactedToolNames: new Set([
+            ...redaction.redactedToolNames,
+            ...candidate.redactedToolNames,
+          ]),
+          redactedToolNameMatchMode:
+            redaction.redactedToolNameMatchMode === 'partial' ||
+            candidate.redactedToolNameMatchMode === 'partial'
+              ? 'partial'
+              : 'exact',
+          redactionText: redaction.redactionText,
+        };
+      }
+    }
+    /** An active redaction policy suppresses free-form reasoning/intent, so
+     *  a reasoning-only block has nothing describable left — skip the model
+     *  call rather than paying for a label built from the prompt alone. */
+    const freeFormSuppressed =
+      redaction != null &&
+      (redaction.enabled === false || redaction.redactedToolNames.size > 0);
+    if (entries.length === 0 && freeFormSuppressed) {
+      return {};
+    }
+    const userPrompt = buildActivityLabelPrompt({
+      entries,
+      charLimit,
+      thinkingExcerpts,
+      lastAssistantText,
+      redaction,
+    });
+
+    const model = initializeModel({
+      provider,
+      clientOptions: {
+        ...(clientOptions ?? {}),
+        streaming: false,
+      } as t.ClientOptions,
+    }) as t.ChatModelInstance;
+
+    /** Distinct run id per label call: callback/tracing integrations key
+     *  in-flight runs by it, so reusing the parent run's id would collide
+     *  across successive (or concurrent) label batches. */
+    const labelRunId = `${this.id}-activity-${labelSeq}`;
+    const invokeConfig = Object.assign({}, labelChainOptions, {
+      run_id: labelRunId,
+      runId: labelRunId,
+      runName: labelChainOptions.runName ?? labelRunName,
+    }) as Partial<RunnableConfig>;
+
+    const invokeLabel = (
+      runtimeConfig: Partial<RunnableConfig>
+    ): Promise<unknown> =>
+      withLangfuseAttributes(
+        {
+          langfuse: labelLangfuseConfig,
+          userId: labelUserId,
+          sessionId: labelSessionId,
+          traceName: runtimeConfig.runName ?? labelRunName,
+          traceMetadata,
+          tags: ['librechat', 'activity-label'],
+        },
+        () =>
+          model.invoke(
+            [
+              new SystemMessage(prompt ?? ACTIVITY_LABEL_PROMPT),
+              new HumanMessage(userPrompt),
+            ],
+            runtimeConfig
+          )
+      );
+
+    const extractLabel = (response: unknown): string => {
+      const content = (response as { content?: unknown } | null)?.content;
+      let text = '';
+      if (typeof content === 'string') {
+        text = content;
+      } else if (Array.isArray(content)) {
+        text = content
+          .map((block) =>
+            typeof block === 'string'
+              ? block
+              : ((block as { text?: string }).text ?? '')
+          )
+          .join('');
+      }
+      return text.trim().replace(/^["']|["']$/g, '');
+    };
+
+    try {
+      let response: unknown;
+      try {
+        response = await withLangfuseRuntimeScope(labelRuntimeScope, () =>
+          invokeLabel(invokeConfig)
+        );
+      } catch (error) {
+        /** Retry ONLY recognized callback/tracer failures (the EventStream
+         *  tracer class of errors the stripped-callbacks fallback exists
+         *  for). Aborts and provider failures rethrow — retrying those
+         *  doubles traffic/cost and can restart cancelled requests. */
+        const aborted =
+          (labelChainOptions as { signal?: AbortSignal }).signal?.aborted ===
+            true || (error as Error | null)?.name === 'AbortError';
+        const callbackFailure = /callback|tracer|event.?stream/i.test(
+          String(
+            (error as Error | null)?.stack ??
+              (error as Error | null)?.message ??
+              ''
+          )
+        );
+        if (aborted || !callbackFailure) {
+          throw error;
+        }
+        const langfuseHandler = findCallback(
+          invokeConfig.callbacks,
+          isLangfuseCallbackHandler
+        );
+        const { callbacks: _cb, ...rest } = invokeConfig;
+        const safeConfig = Object.assign({}, rest, {
+          callbacks: langfuseHandler ? [langfuseHandler] : [],
+        });
+        response = await withLangfuseRuntimeScope(labelRuntimeScope, () =>
+          invokeLabel(safeConfig as Partial<RunnableConfig>)
+        );
+      }
+      const label = extractLabel(response);
+      return label.length > 0 ? { label } : {};
+    } finally {
+      await disposeLangfuseHandler(labelLangfuseHandler);
     }
   }
 }
