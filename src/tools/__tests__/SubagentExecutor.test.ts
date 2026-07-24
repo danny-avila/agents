@@ -374,6 +374,14 @@ describe('buildChildInputs', () => {
 describe('SubagentExecutor', () => {
   const config = makeConfig();
 
+  type ForwarderLike = {
+    handleCustomEvent?: (
+      eventName: string,
+      data: unknown,
+      runId: string
+    ) => Promise<void> | void;
+  };
+
   /**
    * Build a stub `createChildGraph` factory that returns a minimal
    * `StandardGraph`-shaped object whose `createWorkflow().invoke()`
@@ -412,6 +420,56 @@ describe('SubagentExecutor', () => {
       ({
         createWorkflow: (): { invoke: jest.Mock } => ({
           invoke: jest.fn().mockResolvedValue({ messages: [] }),
+        }),
+        clearHeavyState: jest.fn(),
+      }) as unknown as StandardGraph;
+  }
+
+  function getForwarderCallback(options: unknown): ForwarderLike {
+    const callbacks =
+      (options as { callbacks?: ForwarderLike[] }).callbacks ?? [];
+    if (callbacks.length === 0) {
+      throw new Error('Expected subagent forwarder callback');
+    }
+    const forwarder = callbacks[0];
+    if (typeof forwarder.handleCustomEvent !== 'function') {
+      throw new Error('Expected subagent forwarder callback');
+    }
+    return forwarder;
+  }
+
+  async function emitMessageDelta(
+    forwarder: ForwarderLike,
+    id: string,
+    text: string
+  ): Promise<void> {
+    const handleCustomEvent = forwarder.handleCustomEvent;
+    if (typeof handleCustomEvent !== 'function') {
+      throw new Error('Expected subagent forwarder callback');
+    }
+    await handleCustomEvent(
+      GraphEvents.ON_MESSAGE_DELTA,
+      {
+        id,
+        delta: {
+          content: [{ type: 'text', text }],
+        },
+      },
+      'child-run-id'
+    );
+  }
+
+  function makeStreamingGraphFactory(
+    drive: (forwarder: ForwarderLike) => Promise<{ messages: BaseMessage[] }>
+  ): () => StandardGraph {
+    return (): StandardGraph =>
+      ({
+        createWorkflow: (): { invoke: jest.Mock } => ({
+          invoke: jest
+            .fn()
+            .mockImplementation(async (_state: unknown, options: unknown) =>
+              drive(getForwarderCallback(options))
+            ),
         }),
         clearHeavyState: jest.fn(),
       }) as unknown as StandardGraph;
@@ -468,6 +526,81 @@ describe('SubagentExecutor', () => {
     expect(result.content).toBe('Here is my research summary.');
     expect(result.messages).toHaveLength(2);
     expect(clearHeavyState).toHaveBeenCalled();
+  });
+
+  it('returns streamed child text when final messages have no AI text', async () => {
+    const registry = new HandlerRegistry();
+    const factory = makeStreamingGraphFactory(async (forwarder) => {
+      await emitMessageDelta(forwarder, 'child_message_1', 'Here are ');
+      await emitMessageDelta(forwarder, 'child_message_1', 'the results.');
+      return { messages: [new HumanMessage('research this topic')] };
+    });
+    const executor = createExecutor({
+      createChildGraph: factory,
+      parentHandlerRegistry: registry,
+    });
+
+    const result = await executor.execute({
+      description: 'Research this topic',
+      subagentType: 'researcher',
+    });
+
+    expect(result.content).toBe('Here are the results.');
+  });
+
+  it('prefers streamed final text over stale earlier AI text', async () => {
+    const registry = new HandlerRegistry();
+    const factory = makeStreamingGraphFactory(async (forwarder) => {
+      await emitMessageDelta(forwarder, 'child_message_final', 'Final answer.');
+      return {
+        messages: [
+          new HumanMessage('research this topic'),
+          new AIMessage({
+            content: [
+              { type: 'text', text: 'Let me search.' },
+              { type: 'tool_use', id: 'c1', name: 'search', input: {} },
+            ],
+          }),
+          new ToolMessage({ content: 'tool output', tool_call_id: 'c1' }),
+          new AIMessage({
+            content: [
+              { type: 'tool_use', id: 'c2', name: 'search', input: {} },
+            ],
+          }),
+        ],
+      };
+    });
+    const executor = createExecutor({
+      createChildGraph: factory,
+      parentHandlerRegistry: registry,
+    });
+
+    const result = await executor.execute({
+      description: 'Research this topic',
+      subagentType: 'researcher',
+    });
+
+    expect(result.content).toBe('Final answer.');
+  });
+
+  it('combines streamed child text across message ids in order', async () => {
+    const registry = new HandlerRegistry();
+    const factory = makeStreamingGraphFactory(async (forwarder) => {
+      await emitMessageDelta(forwarder, 'child_message_1', 'First section.');
+      await emitMessageDelta(forwarder, 'child_message_2', 'Second section.');
+      return { messages: [new HumanMessage('research this topic')] };
+    });
+    const executor = createExecutor({
+      createChildGraph: factory,
+      parentHandlerRegistry: registry,
+    });
+
+    const result = await executor.execute({
+      description: 'Research this topic',
+      subagentType: 'researcher',
+    });
+
+    expect(result.content).toBe('First section.\nSecond section.');
   });
 
   it('passes parent Langfuse config to the child graph', async () => {
