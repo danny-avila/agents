@@ -7,7 +7,7 @@ import {
 } from './index';
 
 describe('managed GPT-5.6 request fields', () => {
-  it('places cache breakpoints after instructions and the prior history prefix', () => {
+  it('keeps the two latest history breakpoints alongside instructions', () => {
     const messages = addChatCacheBreakpoints([
       { role: 'system', content: 'Stable instructions.' },
       { role: 'user', content: 'First question.' },
@@ -33,12 +33,61 @@ describe('managed GPT-5.6 request fields', () => {
         },
       ],
     });
+    expect(messages[1]).toMatchObject({
+      content: [
+        {
+          type: 'text',
+          text: 'First question.',
+          prompt_cache_breakpoint: { mode: 'explicit' },
+        },
+      ],
+    });
+    expect(JSON.stringify(messages[3])).not.toContain(
+      'prompt_cache_breakpoint'
+    );
+  });
+
+  it('preserves the prior assistant breakpoint during chat rollover', () => {
+    const messages = addChatCacheBreakpoints([
+      { role: 'system', content: 'Stable instructions.' },
+      { role: 'user', content: 'First question.' },
+      { role: 'assistant', content: 'First answer.' },
+      { role: 'user', content: 'Second question.' },
+      { role: 'assistant', content: 'Second answer.' },
+      { role: 'user', content: 'Current question.' },
+    ]);
+
+    expect(JSON.stringify(messages[0])).toContain('prompt_cache_breakpoint');
+    expect(JSON.stringify(messages[2])).toContain('prompt_cache_breakpoint');
+    expect(JSON.stringify(messages[4])).toContain('prompt_cache_breakpoint');
     expect(JSON.stringify(messages[1])).not.toContain(
       'prompt_cache_breakpoint'
     );
     expect(JSON.stringify(messages[3])).not.toContain(
       'prompt_cache_breakpoint'
     );
+    expect(JSON.stringify(messages[5])).not.toContain(
+      'prompt_cache_breakpoint'
+    );
+  });
+
+  it('keeps the two newest completion breakpoints in long chat histories', () => {
+    const messages = addChatCacheBreakpoints([
+      { role: 'system', content: 'Stable instructions.' },
+      { role: 'user', content: 'First question.' },
+      { role: 'assistant', content: 'First answer.' },
+      { role: 'user', content: 'Second question.' },
+      { role: 'assistant', content: 'Second answer.' },
+      { role: 'user', content: 'Third question.' },
+      { role: 'assistant', content: 'Third answer.' },
+      { role: 'user', content: 'Current question.' },
+    ]);
+
+    expect(JSON.stringify(messages[2])).not.toContain(
+      'prompt_cache_breakpoint'
+    );
+    expect(JSON.stringify(messages[4])).toContain('prompt_cache_breakpoint');
+    expect(JSON.stringify(messages[6])).toContain('prompt_cache_breakpoint');
   });
 
   it('uses supported Responses content blocks for the same stable prefixes', () => {
@@ -80,6 +129,43 @@ describe('managed GPT-5.6 request fields', () => {
         content: [{ type: 'input_text', text: 'Current question.' }],
       },
     ]);
+  });
+
+  it('retains the previous Responses breakpoint while adding the latest one', () => {
+    const input = [
+      { type: 'message', role: 'developer', content: 'Stable instructions.' },
+      { type: 'message', role: 'user', content: 'First question.' },
+      { type: 'message', role: 'assistant', content: 'First answer.' },
+      { type: 'message', role: 'user', content: 'Second question.' },
+      { type: 'message', role: 'assistant', content: 'Second answer.' },
+      { type: 'message', role: 'user', content: 'Current question.' },
+    ] as unknown as OpenAI.Responses.ResponseInput;
+    const result = addResponseCacheBreakpoints(input) as unknown as Array<{
+      content: unknown;
+    }>;
+
+    expect(result[0].content).toEqual([
+      {
+        type: 'input_text',
+        text: 'Stable instructions.',
+        prompt_cache_breakpoint: { mode: 'explicit' },
+      },
+    ]);
+    expect(result[1].content).toEqual([
+      {
+        type: 'input_text',
+        text: 'First question.',
+        prompt_cache_breakpoint: { mode: 'explicit' },
+      },
+    ]);
+    expect(result[3].content).toEqual([
+      {
+        type: 'input_text',
+        text: 'Second question.',
+        prompt_cache_breakpoint: { mode: 'explicit' },
+      },
+    ]);
+    expect(result[5].content).toBe('Current question.');
   });
 
   it('does not mark replayed assistant output blocks as breakpoints', () => {

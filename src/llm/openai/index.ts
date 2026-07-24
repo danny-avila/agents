@@ -290,6 +290,7 @@ function selectCacheBreakpointIndexes(
   roles: Array<string | undefined>,
   cacheable: boolean[]
 ): number[] {
+  const maxHistoryBreakpoints = 2;
   let instructionIndex = -1;
   let latestUserIndex = -1;
   for (let index = 0; index < roles.length; index++) {
@@ -306,11 +307,32 @@ function selectCacheBreakpointIndexes(
   if (instructionIndex >= 0) {
     indexes.add(instructionIndex);
   }
+  const completionIndexes: number[] = [];
+  const userIndexes: number[] = [];
   for (let index = latestUserIndex - 1; index >= 0; index--) {
-    if (cacheable[index]) {
-      indexes.add(index);
-      break;
+    const role = roles[index];
+    if (!cacheable[index] || role === 'system' || role === 'developer') {
+      continue;
     }
+    if (role === 'user') {
+      if (userIndexes.length < maxHistoryBreakpoints) {
+        userIndexes.push(index);
+      }
+      continue;
+    }
+    if (completionIndexes.length < maxHistoryBreakpoints) {
+      completionIndexes.push(index);
+      if (completionIndexes.length === maxHistoryBreakpoints) {
+        break;
+      }
+    }
+  }
+  const historyIndexes = [...completionIndexes, ...userIndexes].slice(
+    0,
+    maxHistoryBreakpoints
+  );
+  for (const index of historyIndexes) {
+    indexes.add(index);
   }
   return [...indexes];
 }
@@ -406,14 +428,11 @@ export function addResponseCacheBreakpoints(
         if (!isResponseMessage(item)) {
           return false;
         }
+        const role: string = item.role;
         /** Only input roles take a Responses breakpoint. Assistant/tool turns
          *  carry output content (string or output_text) that the API rejects
          *  under an input marker, so they're never eligible. */
-        if (
-          item.role !== 'system' &&
-          item.role !== 'developer' &&
-          item.role !== 'user'
-        ) {
+        if (role !== 'system' && role !== 'developer' && role !== 'user') {
           return false;
         }
         const content = item.content as
@@ -1197,10 +1216,18 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
     message: OpenAIClient.ChatCompletionMessage,
     rawResponse: OpenAIClient.ChatCompletion
   ): BaseMessage {
-    return attachLibreChatMessageFields(
+    const converted = attachLibreChatMessageFields(
       super._convertCompletionsMessageToBaseMessage(message, rawResponse),
       message as unknown as Record<string, unknown>
     );
+    if (rawResponse.service_tier == null) {
+      return converted;
+    }
+    converted.response_metadata = {
+      ...converted.response_metadata,
+      service_tier: rawResponse.service_tier,
+    };
+    return converted;
   }
 
   async _generate(
