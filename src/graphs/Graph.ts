@@ -11,6 +11,7 @@ import type {
   MessageContent,
 } from '@langchain/core/messages';
 import type { ToolCall } from '@langchain/core/messages/tool';
+import type { OverflowRecoveryPlan } from '@/llm/contextOverflowRecovery';
 import type { HookRegistry } from '@/hooks';
 import type * as t from '@/types';
 import {
@@ -71,6 +72,7 @@ import { ToolNode as CustomToolNode, toolsCondition } from '@/tools/ToolNode';
 import { shouldTraceToolNodeForLangfuse } from '@/langfuseToolOutputTracing';
 import { createLocalCodingToolBundle } from '@/tools/local/LocalCodingTools';
 import { SubagentExecutor, resolveSubagentConfigs } from '@/tools/subagent';
+import { planContextOverflowRecovery } from '@/llm/contextOverflowRecovery';
 import { ToolOutputReferenceRegistry } from '@/tools/toolOutputReferences';
 import { partitionAndMarkBedrockToolCache } from '@/llm/bedrock/toolCache';
 import { safeDispatchCustomEvent, emitAgentLog } from '@/utils/events';
@@ -368,6 +370,28 @@ function clearCurrentDeltaStepMarkers({
     graph.messageStepHasTextDeltas.delete(stepId);
     graph.reasoningStepHasDeltas.delete(stepId);
   }
+}
+
+/**
+ * Our own estimate of the prompt that was actually sent, derived from the
+ * pre-invoke usage snapshot. Used to corroborate ambiguous provider errors
+ * and to measure how far our token accounting sits from the provider's.
+ */
+function getEstimatedPromptTokens(
+  contextUsage: t.ContextUsageEvent | null
+): number | undefined {
+  const budget = contextUsage?.contextBudget;
+  const remaining = contextUsage?.remainingContextTokens;
+  if (
+    budget == null ||
+    remaining == null ||
+    !Number.isFinite(budget) ||
+    !Number.isFinite(remaining)
+  ) {
+    return undefined;
+  }
+  const used = budget - remaining;
+  return used > 0 ? used : undefined;
 }
 
 async function dispatchMessageCreationStep({
@@ -1445,6 +1469,56 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     client.abortHandler = undefined;
   }
 
+  /**
+   * Applies a context-overflow recovery plan and hands control to the
+   * summarize node, which compacts and then routes straight back here for a
+   * retry against the corrected budget.
+   *
+   * Returning the detour rather than rethrowing is the whole point: the
+   * caller never sees the provider's rejection, only a slightly longer turn.
+   */
+  private beginOverflowRecovery({
+    recovery,
+    agentContext,
+    agentId,
+    config,
+  }: {
+    recovery: OverflowRecoveryPlan;
+    agentContext: AgentContext;
+    agentId: string;
+    config?: RunnableConfig;
+  }): Partial<t.AgentSubgraphState> {
+    const previousBudget = agentContext.maxContextTokens;
+    agentContext.applyContextBudgetCorrection(recovery.budgetTokens);
+
+    emitAgentLog(
+      config,
+      'warn',
+      'graph',
+      'Provider rejected the prompt as too large — compacting and retrying',
+      {
+        kind: recovery.info.kind,
+        previousBudget,
+        recoveredBudget: recovery.budgetTokens,
+        providerReportedLimit: recovery.info.limitTokens,
+        providerReportedTokens: recovery.info.requestedTokens,
+        observedCalibrationRatio: recovery.observedCalibrationRatio,
+        detectedBy: recovery.info.source,
+        attempt: agentContext.overflowRecoveryAttempts,
+      },
+      { runId: this.runId, agentId },
+      { force: true }
+    );
+
+    return {
+      summarizationRequest: {
+        remainingContextTokens: 0,
+        agentId: agentId || agentContext.agentId,
+        reason: 'overflow',
+      },
+    };
+  }
+
   createCallModel(agentId = 'default') {
     return async (
       state: t.AgentSubgraphState,
@@ -2220,6 +2294,28 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           graph: this,
           metadata,
         });
+        /**
+         * A context overflow is a deterministic consequence of the payload,
+         * not a provider being unavailable — so it is answered by compacting
+         * and retrying rather than by re-sending the same oversized prompt
+         * down the fallback chain. Fallbacks still run for every other
+         * failure, and for an overflow whose recovery budget is spent.
+         */
+        const recovery = planContextOverflowRecovery({
+          error: primaryError,
+          provider: agentContext.provider,
+          maxContextTokens: agentContext.maxContextTokens,
+          estimatedPromptTokens: getEstimatedPromptTokens(contextUsage),
+          attemptsSoFar: agentContext.overflowRecoveryAttempts,
+        });
+        if (recovery != null) {
+          return this.beginOverflowRecovery({
+            recovery,
+            agentContext,
+            agentId,
+            config,
+          });
+        }
         result = await withLangfuseRuntimeScope(
           resolveLangfuseRuntimeScope({
             runLangfuse: this.langfuse,

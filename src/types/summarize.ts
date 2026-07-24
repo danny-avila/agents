@@ -63,6 +63,17 @@ export interface SummarizeResult {
 export interface SummarizationNodeInput {
   remainingContextTokens: number;
   agentId: string;
+  /**
+   * Why the detour was requested.
+   *
+   * - `trigger` (default): the configured summarization trigger fired during
+   *   the pre-call budget check.
+   * - `overflow`: the provider rejected the prompt as too large and the run
+   *   is compacting to recover. When summarization is not enabled, this
+   *   variant performs no model call — the corrected budget alone is what the
+   *   retry needs.
+   */
+  reason?: 'trigger' | 'overflow';
 }
 
 export interface SummarizeStartEvent {

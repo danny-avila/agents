@@ -774,6 +774,28 @@ export function createSummarizeNode({
       return { summarizationRequest: undefined };
     }
 
+    /**
+     * Overflow recovery routes through this node purely to get back to the
+     * agent node with a corrected budget. When summarization was never
+     * enabled, making a model call here would be an unrequested cost the
+     * caller opted out of — the re-prune against the lower budget is the
+     * whole fix.
+     */
+    if (
+      request.reason === 'overflow' &&
+      agentContext.summarizationEnabled !== true
+    ) {
+      emitAgentLog(
+        config,
+        'debug',
+        'summarize',
+        'Overflow recovery re-prune — summarization not enabled, no summary generated',
+        { maxContextTokens: agentContext.maxContextTokens },
+        { runId: graph.runId, agentId: request.agentId }
+      );
+      return { summarizationRequest: undefined };
+    }
+
     const maxCtx = agentContext.maxContextTokens ?? 0;
     if (maxCtx > 0 && agentContext.instructionTokens >= maxCtx) {
       emitAgentLog(

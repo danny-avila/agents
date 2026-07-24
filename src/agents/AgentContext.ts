@@ -323,6 +323,12 @@ export class AgentContext {
    */
   private _lastSummarizationMsgCount: number = 0;
   /**
+   * Forced compactions performed after a provider rejected a prompt as too
+   * large. Bounds the recovery loop so a model that keeps refusing cannot
+   * make the run compact indefinitely.
+   */
+  private _overflowRecoveryAttempts: number = 0;
+  /**
    * Handoff context when this agent receives control via handoff.
    * Contains source and parallel execution info for system message context.
    */
@@ -1306,6 +1312,27 @@ export class AgentContext {
    */
   markSummarizationTriggered(msgCount: number): void {
     this._lastSummarizationMsgCount = msgCount;
+  }
+
+  get overflowRecoveryAttempts(): number {
+    return this._overflowRecoveryAttempts;
+  }
+
+  /**
+   * Retargets the context budget after a provider rejected the prompt as too
+   * large, and clears the memoized pruner so the next call is planned against
+   * the corrected budget rather than the one that was evidently wrong.
+   *
+   * Also clears the "already summarized at this message count" guard: that
+   * guard exists to stop redundant summarization of an unchanged history, but
+   * here the history has not changed and compaction is exactly what is
+   * needed.
+   */
+  applyContextBudgetCorrection(budgetTokens: number): void {
+    this.maxContextTokens = budgetTokens;
+    this.pruneMessages = undefined;
+    this._lastSummarizationMsgCount = 0;
+    this._overflowRecoveryAttempts += 1;
   }
 
   clearSummary(): void {
