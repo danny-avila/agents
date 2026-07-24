@@ -6,11 +6,12 @@ import {
   ToolMessage,
 } from '@langchain/core/messages';
 import type { MessageContentComplex, TPayload } from '@/types';
-import { _convertMessagesToAnthropicPayload } from '@/llm/anthropic/utils/message_inputs';
 import {
   convertMessagesToContent,
   formatAnthropicArtifactContent,
+  formatArtifactPayload,
 } from './core';
+import { _convertMessagesToAnthropicPayload } from '@/llm/anthropic/utils/message_inputs';
 import { Constants, ContentTypes, Providers } from '@/common';
 import { formatAgentMessages } from './format';
 
@@ -1572,6 +1573,44 @@ describe('formatAgentMessages', () => {
     ]);
   });
 
+  it('bridges tool image artifacts with an assistant message before the human message', () => {
+    const imagePart = {
+      type: 'image_url',
+      image_url: { url: 'data:image/png;base64,AAAA' },
+    } as unknown as MessageContentComplex;
+
+    const messages = [
+      new HumanMessage({ content: 'draw a red square' }),
+      new AIMessageChunk({
+        content: '',
+        tool_calls: [
+          {
+            id: 'call_img',
+            name: 'generate_image',
+            args: {},
+            type: 'tool_call' as const,
+          },
+        ],
+      }),
+      new ToolMessage({
+        content: 'Image generated successfully.',
+        tool_call_id: 'call_img',
+        name: 'generate_image',
+        artifact: { content: [imagePart] },
+      }),
+    ];
+
+    formatArtifactPayload(messages);
+
+    // A user message that carries the image must not directly follow the tool
+    // message (strict providers reject that); an assistant bridge sits between.
+    const roles = messages.map((m) => m._getType());
+    expect(roles).toEqual(['human', 'ai', 'tool', 'ai', 'human']);
+    expect(messages[messages.length - 1].content).toEqual(
+      expect.arrayContaining([imagePart])
+    );
+  });
+
   it('should dynamically discover tools from tool_search output and keep their tool calls', () => {
     const tools = new Set(['tool_search', 'calculator']);
     const payload = [
@@ -2216,9 +2255,15 @@ describe('formatAgentMessages', () => {
       },
     ];
 
-    const result = formatAgentMessages(payload, undefined, undefined, undefined, {
-      preserveReasoningContent: true,
-    });
+    const result = formatAgentMessages(
+      payload,
+      undefined,
+      undefined,
+      undefined,
+      {
+        preserveReasoningContent: true,
+      }
+    );
 
     const toolCallMessage = result.messages[0] as AIMessage;
     expect(toolCallMessage.tool_calls).toHaveLength(1);
@@ -2254,15 +2299,19 @@ describe('formatAgentMessages', () => {
       },
     ];
 
-    const result = formatAgentMessages(payload, undefined, undefined, undefined, {
-      provider: Providers.DEEPSEEK,
-      preserveReasoningContent: false,
-    });
+    const result = formatAgentMessages(
+      payload,
+      undefined,
+      undefined,
+      undefined,
+      {
+        provider: Providers.DEEPSEEK,
+        preserveReasoningContent: false,
+      }
+    );
 
     const toolCallMessage = result.messages[0] as AIMessage;
-    expect(
-      toolCallMessage.additional_kwargs.reasoning_content
-    ).toBeUndefined();
+    expect(toolCallMessage.additional_kwargs.reasoning_content).toBeUndefined();
   });
 
   it('should preserve DeepSeek reasoning from supported hidden content blocks', () => {
