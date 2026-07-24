@@ -115,9 +115,25 @@ export type StandardGraphConfig = Omit<
   'edges' | 'type'
 > & { type?: 'standard'; signal?: AbortSignal };
 
+/**
+ * Backend-agnostic user identity context for observability.
+ * Passed to `RunConfig.user` so all configured tracing backends
+ * (Langfuse, LangSmith, OTel, etc.) can attribute traces to the
+ * authenticated user without each backend re-deriving the same mapping.
+ */
+export type UserTraceContext = {
+  /** Human-readable identifier — e.g. email address or username. */
+  userId?: string;
+};
+
 export type RunConfig = {
   runId: string;
   graphConfig: LegacyGraphConfig | StandardGraphConfig | MultiAgentGraphConfig;
+  /**
+   * Authenticated user identity for trace attribution.
+   * When provided, tracing backends use `userId` as the trace owner.
+   */
+  user?: UserTraceContext;
   /**
    * Run-scoped Langfuse configuration. Per-agent `AgentInputs.langfuse`
    * takes precedence for agent-specific spans; this object supplies defaults

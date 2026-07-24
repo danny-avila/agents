@@ -72,6 +72,41 @@ export const defaultOmitOptions = new Set([
   'additionalModelRequestFields',
 ]);
 
+type ConfigurableUser = {
+  email?: string;
+  username?: string;
+  name?: string;
+};
+
+/**
+ * Resolve the trace userId from a configurable user object.
+ * Reads LIBRECHAT_TRACE_USER_ID_FIELD env var (email | username | name | id) to
+ * pick the field; falls back to email → username when the env var is unset.
+ * This is the fallback path used when RunConfig.user.userId is not set by
+ * the host (e.g. older LibreChat versions). The host-provided value in
+ * RunConfig.user.userId always takes precedence.
+ */
+function resolveConfigurableUserId(
+  user: ConfigurableUser | undefined,
+  rawUserId?: unknown
+): string | undefined {
+  const raw = typeof rawUserId === 'string' ? rawUserId : undefined;
+  const field =
+    typeof process !== 'undefined'
+      ? (process.env.LIBRECHAT_TRACE_USER_ID_FIELD ?? 'email')
+      : 'email';
+  if (field === 'name') {
+    return user?.name || user?.email || raw;
+  }
+  if (field === 'username') {
+    return user?.username || user?.email || raw;
+  }
+  if (field === 'id') {
+    return raw || user?.email;
+  }
+  return user?.email || user?.username || raw;
+}
+
 const CUSTOM_GRAPH_EVENTS = new Set<string>([
   GraphEvents.ON_AGENT_UPDATE,
   GraphEvents.ON_RUN_STEP,
@@ -134,6 +169,7 @@ export class Run<_T extends t.BaseGraphState> {
   private hookRegistry?: HookRegistry;
   private humanInTheLoop?: t.HumanInTheLoopConfig;
   private langfuse?: t.LangfuseConfig;
+  private user?: t.UserTraceContext;
   private toolOutputReferences?: t.ToolOutputReferencesConfig;
   private eagerEventToolExecution?: t.EagerEventToolExecutionConfig;
   private codeSessionToolNames?: string[];
@@ -193,6 +229,7 @@ export class Run<_T extends t.BaseGraphState> {
     this.hookRegistry = config.hooks;
     this.humanInTheLoop = config.humanInTheLoop;
     this.langfuse = config.langfuse;
+    this.user = config.user;
     this.toolOutputReferences = config.toolOutputReferences;
     this.eagerEventToolExecution = config.eagerEventToolExecution;
     this.codeSessionToolNames = config.codeSessionToolNames;
@@ -743,10 +780,12 @@ export class Run<_T extends t.BaseGraphState> {
     );
 
     const primaryContext = graph.agentContexts.get(graph.defaultAgentId);
+    const configurableUser = config.configurable?.user as
+      | ConfigurableUser
+      | undefined;
     const userId =
-      typeof config.configurable?.user_id === 'string'
-        ? config.configurable.user_id
-        : undefined;
+      this.user?.userId ??
+      resolveConfigurableUserId(configurableUser, config.configurable?.user_id);
     const sessionId =
       typeof config.configurable?.thread_id === 'string'
         ? config.configurable.thread_id
@@ -1344,10 +1383,15 @@ export class Run<_T extends t.BaseGraphState> {
     const titleRunName = getLangfuseTraceName(traceMetadata, 'LibreChat Title');
 
     if (chainOptions != null) {
+      const titleConfigurableUser = chainOptions.configurable?.user as
+        | ConfigurableUser
+        | undefined;
       titleUserId =
-        typeof chainOptions.configurable?.user_id === 'string'
-          ? chainOptions.configurable.user_id
-          : undefined;
+        this.user?.userId ??
+        resolveConfigurableUserId(
+          titleConfigurableUser,
+          chainOptions.configurable?.user_id
+        );
       titleSessionId =
         typeof chainOptions.configurable?.thread_id === 'string'
           ? chainOptions.configurable.thread_id
