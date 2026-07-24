@@ -429,6 +429,9 @@ export class AgentContext {
    * - Code_execution-only tools that ARE deferred but have been discovered via tool search
    */
   private buildProgrammaticOnlyToolsInstructions(): string {
+    if (this.usesNativeProgrammaticToolCalling()) {
+      return '';
+    }
     if (!this.toolRegistry) return '';
 
     const programmaticOnlyTools: t.LCTool[] = [];
@@ -1037,9 +1040,17 @@ export class AgentContext {
      * alone left programmatic-only definitions counted in
      * `toolSchemaTokens` even though they were never bound.
      */
+    const nativeProgrammaticToolCalling =
+      this.usesNativeProgrammaticToolCalling();
     return this.toolDefinitions.filter((def) => {
       const allowedCallers = def.allowed_callers ?? ['direct'];
-      if (!allowedCallers.includes('direct')) {
+      if (
+        !allowedCallers.includes('direct') &&
+        !(
+          nativeProgrammaticToolCalling &&
+          allowedCallers.includes('code_execution')
+        )
+      ) {
         return false;
       }
       return (
@@ -1603,6 +1614,8 @@ export class AgentContext {
 
   /** Filters tool instances for binding based on registry config */
   private filterToolsForBinding(tools: t.GraphTools): t.GraphTools {
+    const nativeProgrammaticToolCalling =
+      this.usesNativeProgrammaticToolCalling();
     return tools.filter((tool) => {
       if (!('name' in tool)) {
         return true;
@@ -1613,15 +1626,38 @@ export class AgentContext {
         return true;
       }
 
-      if (this.discoveredToolNames.has(tool.name)) {
-        const allowedCallers = toolDef.allowed_callers ?? ['direct'];
-        return allowedCallers.includes('direct');
+      const allowedCallers = toolDef.allowed_callers ?? ['direct'];
+      const isDiscovered = this.discoveredToolNames.has(tool.name);
+      const shouldBind =
+        (allowedCallers.includes('direct') ||
+          (nativeProgrammaticToolCalling &&
+            allowedCallers.includes('code_execution'))) &&
+        (isDiscovered || toolDef.defer_loading !== true);
+      if (!shouldBind) {
+        return false;
       }
 
-      const allowedCallers = toolDef.allowed_callers ?? ['direct'];
-      return (
-        allowedCallers.includes('direct') && toolDef.defer_loading !== true
-      );
+      if (
+        nativeProgrammaticToolCalling &&
+        allowedCallers.includes('code_execution')
+      ) {
+        const boundTool = tool as t.GenericTool & {
+          metadata?: Record<string, unknown>;
+        };
+        boundTool.metadata = {
+          ...boundTool.metadata,
+          allowed_callers: [...allowedCallers],
+        };
+      }
+      return true;
     });
+  }
+
+  private usesNativeProgrammaticToolCalling(): boolean {
+    const options = this.clientOptions as t.OpenAIClientOptions | undefined;
+    return (
+      options?.nativeProgrammaticToolCalling === true &&
+      options.useResponsesApi === true
+    );
   }
 }

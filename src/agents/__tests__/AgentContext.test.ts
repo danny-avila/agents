@@ -935,6 +935,35 @@ describe('AgentContext', () => {
       expect(result[0].content).not.toContain('run_tools_with_bash');
     });
 
+    it('omits LibreChat PTC guidance when native PTC is enabled', async () => {
+      const toolRegistry: t.LCToolRegistry = new Map([
+        [
+          'programmatic_tool',
+          {
+            name: 'programmatic_tool',
+            description: 'Only callable via code execution',
+            allowed_callers: ['code_execution'],
+          },
+        ],
+      ]);
+
+      const ctx = createBasicContext({
+        agentConfig: {
+          instructions: 'Base',
+          clientOptions: {
+            model: 'gpt-5.6',
+            nativeProgrammaticToolCalling: true,
+            useResponsesApi: true,
+          },
+          toolDefinitions: [{ name: Constants.PROGRAMMATIC_TOOL_CALLING }],
+          toolRegistry,
+        },
+      });
+
+      const result = await ctx.systemRunnable!.invoke([]);
+      expect(result[0].content).toBe('Base');
+    });
+
     it('excludes direct-callable tools from programmatic section', () => {
       const toolRegistry: t.LCToolRegistry = new Map([
         [
@@ -1023,6 +1052,73 @@ describe('AgentContext', () => {
       const result = ctx.getToolsForBinding();
       expect(result?.length).toBe(1);
       expect((result?.[0] as t.GenericTool).name).toBe('direct_tool');
+    });
+
+    it('includes code_execution-only tools when native PTC is enabled', () => {
+      const tools = [
+        createMockTool('direct_tool'),
+        createMockTool('code_only_tool'),
+      ];
+      const toolRegistry: t.LCToolRegistry = new Map([
+        ['direct_tool', { name: 'direct_tool', allowed_callers: ['direct'] }],
+        [
+          'code_only_tool',
+          { name: 'code_only_tool', allowed_callers: ['code_execution'] },
+        ],
+      ]);
+
+      const ctx = createBasicContext({
+        agentConfig: {
+          clientOptions: {
+            model: 'gpt-5.6',
+            nativeProgrammaticToolCalling: true,
+            useResponsesApi: true,
+          },
+          tools,
+          toolRegistry,
+        },
+      });
+      const result = ctx.getToolsForBinding();
+      expect(
+        result?.map((tool) => (tool as t.GenericTool).name).sort()
+      ).toEqual(['code_only_tool', 'direct_tool']);
+      expect(
+        (
+          result?.find(
+            (tool) => (tool as t.GenericTool).name === 'code_only_tool'
+          ) as t.GenericTool & { metadata?: Record<string, unknown> }
+        ).metadata
+      ).toMatchObject({ allowed_callers: ['code_execution'] });
+    });
+
+    it('keeps code_execution-only tools off Chat Completions', () => {
+      const tools = [
+        createMockTool('direct_tool'),
+        createMockTool('code_only_tool'),
+      ];
+      const toolRegistry: t.LCToolRegistry = new Map([
+        ['direct_tool', { name: 'direct_tool', allowed_callers: ['direct'] }],
+        [
+          'code_only_tool',
+          { name: 'code_only_tool', allowed_callers: ['code_execution'] },
+        ],
+      ]);
+
+      const ctx = createBasicContext({
+        agentConfig: {
+          clientOptions: {
+            model: 'gpt-5.6',
+            nativeProgrammaticToolCalling: true,
+            useResponsesApi: false,
+          },
+          tools,
+          toolRegistry,
+        },
+      });
+
+      expect(
+        ctx.getToolsForBinding()?.map((tool) => (tool as t.GenericTool).name)
+      ).toEqual(['direct_tool']);
     });
 
     it('excludes deferred tools until discovered', () => {

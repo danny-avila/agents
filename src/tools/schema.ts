@@ -23,6 +23,10 @@ export function createSchemaOnlyTool(
       description: description ?? '',
       schema: parameters ?? { type: 'object', properties: {} },
       responseFormat: responseFormat ?? 'content_and_artifact',
+      metadata:
+        definition.allowed_callers != null
+          ? { allowed_callers: definition.allowed_callers }
+          : undefined,
     }
   );
 }

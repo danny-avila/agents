@@ -35,6 +35,7 @@ import type { ChatXAIInput } from '@langchain/xai';
 import type * as t from '@langchain/openai';
 import type { SeenScalarMetadata } from './streamMetadata';
 import type { HeaderValue, HeadersLike } from './types';
+import { Constants } from '@/common';
 import {
   STREAMED_TOOL_CALL_ADAPTER_METADATA_KEY,
   OPENAI_CHAT_SEQUENTIAL_STREAMED_TOOL_CALL_ADAPTER,
@@ -47,6 +48,10 @@ const iife = <T>(fn: () => T) => fn();
 
 const STREAM_CHUNK_MIN_SIZE = 4;
 const STREAM_BOUNDARIES = new Set([' ', '.', ',', '!', '?', ';', ':']);
+const nativeProgrammaticWrapperNames = new Set<string>([
+  Constants.PROGRAMMATIC_TOOL_CALLING,
+  Constants.BASH_PROGRAMMATIC_TOOL_CALLING,
+]);
 
 export function isHeaders(headers: unknown): headers is Headers {
   return (
@@ -104,11 +109,13 @@ type LibreChatOpenAIFields = t.ChatOpenAIFields & {
   convertReasoningDetailsToContent?: boolean;
   promptCacheExplicit?: boolean;
   safety_identifier?: string;
+  nativeProgrammaticToolCalling?: boolean;
 };
 type LibreChatAzureOpenAIFields = t.AzureOpenAIInput & {
   _lc_stream_delay?: number;
   promptCacheExplicit?: boolean;
   safety_identifier?: string;
+  nativeProgrammaticToolCalling?: boolean;
 };
 type ReasoningCallOptions = {
   reasoning?: OpenAIClient.Reasoning;
@@ -168,12 +175,20 @@ type OpenAIManagedRequestParams = {
   };
   safety_identifier?: string;
 };
+type ResponsesTool = NonNullable<
+  OpenAIClient.Responses.ResponseCreateParams['tools']
+>[number];
 type ResponsesRequest =
   | OpenAIClient.Responses.ResponseCreateParamsStreaming
   | OpenAIClient.Responses.ResponseCreateParamsNonStreaming;
 type ResponsesResult =
   | AsyncIterable<OpenAIClient.Responses.ResponseStreamEvent>
   | OpenAIClient.Responses.Response;
+type ToolWithCallerMetadata = BindToolsInput & {
+  metadata?: {
+    allowed_callers?: Array<'direct' | 'code_execution'>;
+  };
+};
 type CacheableChatPart = {
   type: 'text' | 'image_url' | 'input_audio' | 'file' | 'refusal';
   prompt_cache_breakpoint?: { mode: 'explicit' };
@@ -209,6 +224,62 @@ function applyManagedRequestParams<T extends object>(
       safety_identifier: fields.safetyIdentifier,
     }),
   };
+}
+
+/** @internal */
+export function getNativeResponsesTools(
+  tools: BindToolsInput[],
+  reduced: ResponsesTool[],
+  enabled: boolean
+): ResponsesTool[] {
+  if (enabled !== true) {
+    return reduced;
+  }
+
+  const callerMetadata = new Map<string, ToolWithCallerMetadata['metadata']>();
+  for (const tool of tools) {
+    const candidate = tool as ToolWithCallerMetadata & {
+      name?: string;
+      function?: { name?: string };
+    };
+    const name = candidate.name ?? candidate.function?.name;
+    if (name != null && name !== '') {
+      callerMetadata.set(name, candidate.metadata);
+    }
+  }
+
+  const mapped = reduced.flatMap((tool): ResponsesTool[] => {
+    if (
+      tool.type === 'function' &&
+      nativeProgrammaticWrapperNames.has(tool.name)
+    ) {
+      return [];
+    }
+    if (tool.type === 'programmatic_tool_calling' || tool.type !== 'function') {
+      return [tool];
+    }
+
+    const metadata = callerMetadata.get(tool.name);
+    const configured = metadata?.allowed_callers;
+    if (configured?.includes('code_execution') !== true) {
+      return [tool];
+    }
+
+    return [
+      {
+        ...tool,
+        allowed_callers: [
+          ...(configured.includes('direct') ? (['direct'] as const) : []),
+          'programmatic' as const,
+        ],
+      },
+    ];
+  });
+
+  if (!mapped.some((tool) => tool.type === 'programmatic_tool_calling')) {
+    mapped.push({ type: 'programmatic_tool_calling' });
+  }
+  return mapped;
 }
 
 function isCacheableChatPart(part: unknown): part is CacheableChatPart {
@@ -406,14 +477,11 @@ export function addResponseCacheBreakpoints(
         if (!isResponseMessage(item)) {
           return false;
         }
+        const role: string = item.role;
         /** Only input roles take a Responses breakpoint. Assistant/tool turns
          *  carry output content (string or output_text) that the API rejects
          *  under an input marker, so they're never eligible. */
-        if (
-          item.role !== 'system' &&
-          item.role !== 'developer' &&
-          item.role !== 'user'
-        ) {
+        if (role !== 'system' && role !== 'developer' && role !== 'user') {
           return false;
         }
         const content = item.content as
@@ -429,6 +497,30 @@ export function addResponseCacheBreakpoints(
   return input.map((item, index) =>
     indexes.has(index) ? addResponseBreakpoint(item) : item
   );
+}
+
+/** @internal */
+export function addProgrammaticCallerLinkage(
+  input: OpenAIClient.Responses.ResponseCreateParams['input']
+): OpenAIClient.Responses.ResponseCreateParams['input'] {
+  if (!Array.isArray(input)) {
+    return input;
+  }
+
+  const callers = new Map<string, { type: 'program'; caller_id: string }>();
+  for (const item of input) {
+    if (item.type === 'function_call' && item.caller?.type === 'program') {
+      callers.set(item.call_id, item.caller);
+    }
+  }
+
+  return input.map((item) => {
+    if (item.type !== 'function_call_output' || item.caller != null) {
+      return item;
+    }
+    const caller = callers.get(item.call_id);
+    return caller ? { ...item, caller } : item;
+  });
 }
 
 /** @internal */
@@ -516,6 +608,231 @@ function isResponsesStream(
   result: ResponsesResult
 ): result is AsyncIterable<OpenAIClient.Responses.ResponseStreamEvent> {
   return Symbol.asyncIterator in result;
+}
+
+function isNativeProgramOnlyResponse(
+  response: OpenAIClient.Responses.Response
+): boolean {
+  const hasMessage = response.output.some((item) => item.type === 'message');
+  const hasPendingFunctionCall = response.output.some(
+    (item) => item.type === 'function_call'
+  );
+  const hasProgramState = response.output.some(
+    (item) => item.type === 'program' || item.type === 'program_output'
+  );
+  return !hasMessage && !hasPendingFunctionCall && hasProgramState;
+}
+
+function shouldContinueNativeProgram(
+  response: OpenAIClient.Responses.Response
+): boolean {
+  return response.status === 'completed' && isNativeProgramOnlyResponse(response);
+}
+
+function assertNativeProgramResponseComplete(
+  response: OpenAIClient.Responses.Response
+): void {
+  if (
+    response.status !== 'incomplete' ||
+    !isNativeProgramOnlyResponse(response)
+  ) {
+    return;
+  }
+  const reason = response.incomplete_details?.reason;
+  throw new Error(
+    `Native Programmatic Tool Calling response was incomplete${
+      reason ? `: ${reason}` : ''
+    }.`
+  );
+}
+
+function getNativeProgramReplayInput(
+  input: OpenAIClient.Responses.ResponseCreateParams['input']
+): OpenAIClient.Responses.ResponseInput {
+  if (Array.isArray(input)) {
+    return input;
+  }
+  if (input == null) {
+    return [];
+  }
+  return [{ role: 'user', content: input }];
+}
+
+function getNativeProgramContinuationRequest(
+  request: OpenAIClient.Responses.ResponseCreateParamsStreaming,
+  response: OpenAIClient.Responses.Response
+): OpenAIClient.Responses.ResponseCreateParamsStreaming;
+function getNativeProgramContinuationRequest(
+  request: OpenAIClient.Responses.ResponseCreateParamsNonStreaming,
+  response: OpenAIClient.Responses.Response
+): OpenAIClient.Responses.ResponseCreateParamsNonStreaming;
+function getNativeProgramContinuationRequest(
+  request: ResponsesRequest,
+  response: OpenAIClient.Responses.Response
+): ResponsesRequest {
+  if (request.store === false) {
+    return {
+      ...request,
+      input: [
+        ...getNativeProgramReplayInput(request.input),
+        ...(response.output as unknown as OpenAIClient.Responses.ResponseInput),
+      ],
+      previous_response_id: request.previous_response_id,
+    };
+  }
+  return {
+    ...request,
+    input: [],
+    previous_response_id: response.id,
+  };
+}
+
+function mergeResponsesUsage(
+  responses: OpenAIClient.Responses.Response[]
+): OpenAIClient.Responses.ResponseUsage | undefined {
+  const usages = responses
+    .map((response) => response.usage)
+    .filter(
+      (usage): usage is OpenAIClient.Responses.ResponseUsage => usage != null
+    );
+  const lastUsage = usages.at(-1);
+  if (lastUsage == null) {
+    return;
+  }
+  const cacheWriteTokens = usages.reduce((total, usage) => {
+    const cacheWriteTokens = (
+      usage.input_tokens_details as unknown as
+        | Record<string, unknown>
+        | undefined
+    )?.cache_write_tokens;
+    return (
+      total + (typeof cacheWriteTokens === 'number' ? cacheWriteTokens : 0)
+    );
+  }, 0);
+  return {
+    ...lastUsage,
+    input_tokens: usages.reduce(
+      (total, usage) => total + usage.input_tokens,
+      0
+    ),
+    output_tokens: usages.reduce(
+      (total, usage) => total + usage.output_tokens,
+      0
+    ),
+    total_tokens: usages.reduce(
+      (total, usage) => total + usage.total_tokens,
+      0
+    ),
+    input_tokens_details: {
+      ...lastUsage.input_tokens_details,
+      cached_tokens: usages.reduce(
+        (total, usage) => total + usage.input_tokens_details.cached_tokens,
+        0
+      ),
+      ...(cacheWriteTokens > 0 && { cache_write_tokens: cacheWriteTokens }),
+    },
+    output_tokens_details: {
+      ...lastUsage.output_tokens_details,
+      reasoning_tokens: usages.reduce(
+        (total, usage) => total + usage.output_tokens_details.reasoning_tokens,
+        0
+      ),
+    },
+  } as ResponsesUsageWithCacheWrite;
+}
+
+function mergeNativeProgramResponses(
+  responses: OpenAIClient.Responses.Response[]
+): OpenAIClient.Responses.Response {
+  const finalResponse = responses[responses.length - 1];
+  return {
+    ...finalResponse,
+    output: responses.flatMap((response) => response.output),
+    usage: mergeResponsesUsage(responses),
+  };
+}
+
+type CompleteResponsesRequest = (
+  request: ResponsesRequest,
+  requestOptions?: OpenAICoreRequestOptions
+) => Promise<ResponsesResult>;
+
+type ResponsesTerminalEvent = Extract<
+  OpenAIClient.Responses.ResponseStreamEvent,
+  { type: 'response.completed' | 'response.incomplete' }
+>;
+
+/** @internal */
+export async function completeResponsesWithNativeContinuation(
+  request: ResponsesRequest,
+  requestOptions: OpenAICoreRequestOptions | undefined,
+  enabled: boolean,
+  complete: CompleteResponsesRequest
+): Promise<ResponsesResult> {
+  if (enabled !== true) {
+    return complete(request, requestOptions);
+  }
+
+  if (request.stream === true) {
+    return (async function* (): AsyncGenerator<OpenAIClient.Responses.ResponseStreamEvent> {
+      const responses: OpenAIClient.Responses.Response[] = [];
+      let nextRequest = request;
+      for (let continuation = 0; continuation < 8; continuation++) {
+        const result = await complete(nextRequest, requestOptions);
+        if (!isResponsesStream(result)) {
+          throw new Error('Expected a streaming OpenAI Responses result.');
+        }
+        let terminalEvent: ResponsesTerminalEvent | undefined;
+        for await (const event of result) {
+          if (
+            event.type === 'response.completed' ||
+            event.type === 'response.incomplete'
+          ) {
+            terminalEvent = event;
+            continue;
+          }
+          yield event;
+        }
+        if (terminalEvent == null) {
+          return;
+        }
+        responses.push(terminalEvent.response);
+        assertNativeProgramResponseComplete(terminalEvent.response);
+        if (!shouldContinueNativeProgram(terminalEvent.response)) {
+          yield {
+            ...terminalEvent,
+            response: mergeNativeProgramResponses(responses),
+          };
+          return;
+        }
+        nextRequest = getNativeProgramContinuationRequest(
+          nextRequest,
+          terminalEvent.response
+        );
+      }
+      throw new Error(
+        'Native Programmatic Tool Calling exceeded the continuation limit.'
+      );
+    })();
+  }
+
+  const responses: OpenAIClient.Responses.Response[] = [];
+  let nextRequest = request;
+  for (let continuation = 0; continuation < 8; continuation++) {
+    const result = await complete(nextRequest, requestOptions);
+    if (isResponsesStream(result)) {
+      throw new Error('Expected a non-streaming OpenAI Responses result.');
+    }
+    responses.push(result);
+    assertNativeProgramResponseComplete(result);
+    if (!shouldContinueNativeProgram(result)) {
+      return mergeNativeProgramResponses(responses);
+    }
+    nextRequest = getNativeProgramContinuationRequest(nextRequest, result);
+  }
+  throw new Error(
+    'Native Programmatic Tool Calling exceeded the continuation limit.'
+  );
 }
 
 function createUsageMetadata(
@@ -1534,11 +1851,13 @@ class LibreChatOpenAICompletions extends OriginalChatOpenAICompletions {
 class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
   private promptCacheExplicit?: boolean;
   private safetyIdentifier?: string;
+  private nativeProgrammaticToolCalling?: boolean;
 
   constructor(fields?: LibreChatOpenAIFields) {
     super(fields);
     this.promptCacheExplicit = fields?.promptCacheExplicit;
     this.safetyIdentifier = fields?.safety_identifier;
+    this.nativeProgrammaticToolCalling = fields?.nativeProgrammaticToolCalling;
   }
 
   invocationParams(
@@ -1559,6 +1878,17 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
     return params;
   }
 
+  protected _reduceChatOpenAITools(
+    tools: BindToolsInput[],
+    fields: { stream?: boolean; strict?: boolean }
+  ): ResponsesTool[] {
+    return getNativeResponsesTools(
+      tools,
+      super._reduceChatOpenAITools(tools, fields),
+      this.nativeProgrammaticToolCalling === true
+    );
+  }
+
   async completionWithRetry(
     request: OpenAIClient.Responses.ResponseCreateParamsStreaming,
     requestOptions?: OpenAICoreRequestOptions
@@ -1571,16 +1901,26 @@ class LibreChatOpenAIResponses extends OriginalChatOpenAIResponses {
     request: ResponsesRequest,
     requestOptions?: OpenAICoreRequestOptions
   ): Promise<ResponsesResult> {
+    const linkedInput =
+      this.nativeProgrammaticToolCalling === true
+        ? addProgrammaticCallerLinkage(request.input)
+        : request.input;
     const managedRequest = {
       ...request,
       input:
         this.promptCacheExplicit === true
-          ? addResponseCacheBreakpoints(request.input)
-          : request.input,
+          ? addResponseCacheBreakpoints(linkedInput)
+          : linkedInput,
     };
-    const result = await super.completionWithRetry(
-      managedRequest as OpenAIClient.Responses.ResponseCreateParamsStreaming,
-      requestOptions
+    const result = await completeResponsesWithNativeContinuation(
+      managedRequest,
+      requestOptions,
+      this.nativeProgrammaticToolCalling === true,
+      (nextRequest, nextOptions) =>
+        super.completionWithRetry(
+          nextRequest as OpenAIClient.Responses.ResponseCreateParamsStreaming,
+          nextOptions
+        )
     );
     return isResponsesStream(result)
       ? result
@@ -1766,11 +2106,13 @@ class LibreChatAzureOpenAICompletions extends OriginalAzureChatOpenAICompletions
 class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
   private promptCacheExplicit?: boolean;
   private safetyIdentifier?: string;
+  private nativeProgrammaticToolCalling?: boolean;
 
   constructor(fields?: LibreChatAzureOpenAIFields) {
     super(fields);
     this.promptCacheExplicit = fields?.promptCacheExplicit;
     this.safetyIdentifier = fields?.safety_identifier;
+    this.nativeProgrammaticToolCalling = fields?.nativeProgrammaticToolCalling;
   }
 
   invocationParams(
@@ -1791,6 +2133,17 @@ class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
     return params;
   }
 
+  protected _reduceChatOpenAITools(
+    tools: BindToolsInput[],
+    fields: { stream?: boolean; strict?: boolean }
+  ): ResponsesTool[] {
+    return getNativeResponsesTools(
+      tools,
+      super._reduceChatOpenAITools(tools, fields),
+      this.nativeProgrammaticToolCalling === true
+    );
+  }
+
   async completionWithRetry(
     request: OpenAIClient.Responses.ResponseCreateParamsStreaming,
     requestOptions?: OpenAICoreRequestOptions
@@ -1803,16 +2156,26 @@ class LibreChatAzureOpenAIResponses extends OriginalAzureChatOpenAIResponses {
     request: ResponsesRequest,
     requestOptions?: OpenAICoreRequestOptions
   ): Promise<ResponsesResult> {
+    const linkedInput =
+      this.nativeProgrammaticToolCalling === true
+        ? addProgrammaticCallerLinkage(request.input)
+        : request.input;
     const managedRequest = {
       ...request,
       input:
         this.promptCacheExplicit === true
-          ? addResponseCacheBreakpoints(request.input)
-          : request.input,
+          ? addResponseCacheBreakpoints(linkedInput)
+          : linkedInput,
     };
-    const result = await super.completionWithRetry(
-      managedRequest as OpenAIClient.Responses.ResponseCreateParamsStreaming,
-      requestOptions
+    const result = await completeResponsesWithNativeContinuation(
+      managedRequest,
+      requestOptions,
+      this.nativeProgrammaticToolCalling === true,
+      (nextRequest, nextOptions) =>
+        super.completionWithRetry(
+          nextRequest as OpenAIClient.Responses.ResponseCreateParamsStreaming,
+          nextOptions
+        )
     );
     return isResponsesStream(result)
       ? result
