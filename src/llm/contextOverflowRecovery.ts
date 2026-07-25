@@ -6,12 +6,16 @@
  * should the retry target?" — deliberately kept as pure functions so the
  * policy can be reasoned about and tested without a graph.
  *
- * The interesting case is unit mismatch. A provider reports its ceiling in
- * *its* tokenizer's units, while our budget is expressed in ours. When the
- * error also names the size it attributed to the prompt we just sent, the
- * two numbers give us the conversion factor for free, so the retry targets a
- * budget that is genuinely under the limit instead of one that merely looks
- * smaller.
+ * On units: `maxContextTokens` is a **provider-space** budget. The pruner
+ * converts it into its own raw estimate space by dividing by the
+ * `calibrationRatio` it learns from reported usage. A provider-reported
+ * ceiling is therefore applied verbatim — converting it here as well would
+ * apply the same correction twice and prune toward roughly `limit / ratio²`,
+ * silently discarding far more history than the overflow called for.
+ *
+ * `observedCalibrationRatio` is still reported, because a large divergence
+ * between the provider's count and ours is worth surfacing, but it is
+ * deliberately not applied to the budget.
  */
 import type { ContextOverflowInfo } from '@/utils/errors';
 import type { Providers } from '@/common';
@@ -24,9 +28,10 @@ const BLIND_SHRINK_RATIO = 0.7;
 const CEILING_HEADROOM_RATIO = 0.95;
 
 /**
- * Floor for a recovered budget. Below this the prompt could not hold a system
- * prompt plus one turn, so shrinking further trades an overflow error for an
- * empty-context error.
+ * Fallback floor, used only when the instruction size is unknown. When it is
+ * known the floor is derived from it instead, so a genuinely small model — a
+ * 4k window, where a 95%-of-ceiling budget lands below this constant — can
+ * still recover.
  */
 const MIN_RECOVERY_BUDGET_TOKENS = 4_000;
 
@@ -47,13 +52,12 @@ export interface OverflowRecoveryPlan {
   info: ContextOverflowInfo;
   /**
    * Provider-reported prompt size divided by our own estimate, when both are
-   * known. Greater than 1 means we systematically under-count for this
-   * provider.
+   * known. Greater than 1 means we under-count relative to this provider.
    *
-   * Derived from `info.promptTokens`, never from `info.requestedTokens`:
-   * several providers fold the requested completion allowance into the
-   * latter, which would inflate the ratio and shrink the prompt far more than
-   * the overflow actually calls for.
+   * Reported for observability only — the pruner applies its own learned
+   * calibration to the budget, so applying this as well would double-count.
+   * Derived from `info.promptTokens`, never `info.requestedTokens`, since
+   * several providers fold the completion allowance into the latter.
    */
   observedCalibrationRatio?: number;
 }
@@ -88,19 +92,6 @@ function isUsable(value: number | undefined): value is number {
 }
 
 /**
- * Converts the provider's reported ceiling into our token units using the
- * ratio between what it said the prompt cost and what we estimated.
- * Only ratios above 1 are applied: if we over-count relative to the provider,
- * our budget is already conservative and scaling it up would undo that.
- */
-function toLocalUnits(limitTokens: number, ratio: number | undefined): number {
-  if (ratio == null || ratio <= 1) {
-    return limitTokens;
-  }
-  return limitTokens / ratio;
-}
-
-/**
  * The completion allowance the provider counted against the same ceiling,
  * when it reported both the total and the prompt portion. The retry budget
  * governs the prompt only, so this has to come off the ceiling first —
@@ -128,13 +119,11 @@ function reservedForCompletion(
 
 function resolveTargetBudget(
   info: ContextOverflowInfo,
-  ratio: number | undefined,
   maxContextTokens: number | undefined,
   estimatedPromptTokens: number | undefined,
   configuredCompletionTokens: number | undefined
 ): number | null {
   if (isUsable(info.limitTokens)) {
-    /** Subtract in provider units, then convert the remainder to ours. */
     const promptCeiling =
       info.limitTokens -
       reservedForCompletion(info, configuredCompletionTokens);
@@ -144,9 +133,7 @@ function resolveTargetBudget(
      * Compaction cannot fix that, so declining surfaces the real problem
      * instead of burning the recovery budget on retries that must fail.
      */
-    return promptCeiling > 0
-      ? toLocalUnits(promptCeiling, ratio) * CEILING_HEADROOM_RATIO
-      : null;
+    return promptCeiling > 0 ? promptCeiling * CEILING_HEADROOM_RATIO : null;
   }
   if (isUsable(estimatedPromptTokens)) {
     return estimatedPromptTokens * BLIND_SHRINK_RATIO;
@@ -195,7 +182,6 @@ export function planContextOverflowRecovery({
 
   const target = resolveTargetBudget(
     info,
-    observedCalibrationRatio,
     maxContextTokens,
     estimatedPromptTokens,
     configuredCompletionTokens
@@ -224,12 +210,9 @@ export function planContextOverflowRecovery({
    * lets the existing "instructions exceed context budget" guidance surface
    * instead.
    */
-  const floorTokens = Math.max(
-    MIN_RECOVERY_BUDGET_TOKENS,
-    isUsable(instructionTokens)
-      ? instructionTokens + MIN_MESSAGE_HEADROOM_TOKENS
-      : 0
-  );
+  const floorTokens = isUsable(instructionTokens)
+    ? instructionTokens + MIN_MESSAGE_HEADROOM_TOKENS
+    : MIN_RECOVERY_BUDGET_TOKENS;
   if (budgetTokens < floorTokens) {
     return null;
   }

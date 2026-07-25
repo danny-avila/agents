@@ -305,29 +305,30 @@ describe('context overflow recovery', () => {
     ).toBe(0);
   });
 
-  it('reports actionable guidance when a corrected budget fits nothing', async () => {
+  it('does not scale the corrected budget by the tokenizer divergence', async () => {
     /**
-     * One message larger than the corrected budget. Rather than looping, the
-     * run surfaces the empty-prompt guidance with the token breakdown.
+     * `maxContextTokens` is a provider-space budget that the pruner already
+     * divides by its learned calibrationRatio. Applying the observed
+     * divergence here as well would target `limit / ratio²` — with this
+     * fixture's 274,468-vs-estimate divergence that meant a 27,689 budget
+     * against a 200,000 ceiling, discarding roughly seven times more history
+     * than the overflow called for.
      */
     const run = await createRun({
-      runId: 'overflow-recovery-nothing-fits',
+      runId: 'overflow-recovery-no-double-calibration',
       maxContextTokens: 1_000_000,
     });
     if (!run.Graph) {
       throw new Error('Expected graph to be initialized');
     }
     run.Graph.overrideModel = new OverflowThenSucceedModel(
-      signatureFor('claude-haiku-4-5-20251001'),
-      Number.MAX_SAFE_INTEGER
+      signatureFor('claude-haiku-4-5-20251001')
     );
 
-    await expect(
-      run.processStream(
-        { messages: [new HumanMessage('one oversized turn')] },
-        streamConfig
-      )
-    ).rejects.toThrow(/empty_messages/);
+    await run.processStream({ messages: buildConversation(8) }, streamConfig);
+
+    const agentContext = run.Graph.agentContexts.get('default');
+    expect(agentContext?.maxContextTokens).toBe(Math.floor(200_000 * 0.95));
   });
 
   it('does not intercept errors compaction cannot fix', async () => {

@@ -451,14 +451,16 @@ export function getContextOverflowInfo(
 
     /**
      * A token-bucket rejection is only unrecoverable-by-waiting when the
-     * request alone overruns the bucket. When it does not, the account was
-     * merely busy and the correct response is a retry, not compaction.
+     * request alone overruns the bucket. When it merely fills it, the account
+     * was busy and the request will fit once the window drains — so equality
+     * belongs on the retry side, not the compaction side. Losing conversation
+     * history to a temporarily busy account is the worse error.
      */
     if (
       pattern.kind === 'request_too_large' &&
       limitTokens != null &&
       requestedTokens != null &&
-      requestedTokens < limitTokens
+      requestedTokens <= limitTokens
     ) {
       return null;
     }

@@ -1563,8 +1563,15 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
      * Preserved before the detour for the same reason the configured trigger
      * preserves it: the summarize node restores full tool output from this
      * map, and without it a forced summary is written from truncated stubs.
+     *
+     * Only when a summary will actually be written, though. On the re-prune
+     * -only path the node no-ops without consuming the map, and nothing else
+     * clears it, so storing megabytes of tool output there would be a leak
+     * for a detour that never reads it.
      */
-    preserveOriginalToolContent(agentContext, originalToolContent);
+    if (agentContext.summarizationEnabled === true) {
+      preserveOriginalToolContent(agentContext, originalToolContent);
+    }
     agentContext.applyContextBudgetCorrection(
       recovery.budgetTokens,
       estimatedPromptTokens

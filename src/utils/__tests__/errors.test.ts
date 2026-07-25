@@ -79,6 +79,19 @@ describe('token-bucket rejections', () => {
     expect(info?.requestedTokens).toBeGreaterThan(info?.limitTokens ?? 0);
   });
 
+  it('treats an exactly-filling request as throttling, not overflow', () => {
+    /** It fits an empty bucket, so waiting can succeed — compaction would lose context needlessly. */
+    const exactFit = {
+      name: 'Error',
+      status: 429,
+      code: 'rate_limit_exceeded',
+      type: 'tokens',
+      message:
+        '429 Request too large for gpt-4o on tokens per min (TPM): Limit 30000, Requested 30000.',
+    };
+    expect(getContextOverflowInfo(exactFit)).toBeNull();
+  });
+
   it('leaves ordinary throttling alone even when phrased with the same fields', () => {
     const throttled = {
       name: 'Error',

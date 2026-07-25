@@ -32,23 +32,44 @@ describe('planContextOverflowRecovery', () => {
     expect(plan?.info.limitTokens).toBe(200_000);
   });
 
-  it('converts the reported ceiling into our units when we under-count', () => {
+  it('applies the reported ceiling verbatim, leaving calibration to the pruner', () => {
     const openrouter = signatureFor('qwen/qwen-2.5-7b-instruct');
     /**
      * OpenRouter counted 56,811 input tokens for a prompt we estimated at
-     * 42,599 — it bills roughly 1.33 of our tokens per token, so a budget set
-     * to its raw 32,768 ceiling would still overflow.
+     * 42,599 — a ~1.33 divergence. `maxContextTokens` is a provider-space
+     * budget that the pruner already divides by its own learned
+     * calibrationRatio, so converting here too would prune toward
+     * `limit / ratio²`. The ratio is reported but not applied.
      */
     const plan = planContextOverflowRecovery({
       error: openrouter.error,
       provider: Providers.OPENROUTER,
-      maxContextTokens: 32_768,
+      maxContextTokens: 40_000,
       estimatedPromptTokens: 42_599,
       attemptsSoFar: 0,
     });
 
     expect(plan?.observedCalibrationRatio).toBeCloseTo(1.333, 2);
-    expect(plan?.budgetTokens).toBeLessThan(32_768 / 1.3);
+    expect(plan?.budgetTokens).toBe(Math.floor((32_768 - 16) * 0.95));
+  });
+
+  it('recovers on a small-window model despite the absolute floor', () => {
+    /** 4,096-token window: 95% of the ceiling lands under MIN_RECOVERY_BUDGET. */
+    const error = {
+      name: 'ContextOverflowError',
+      message:
+        '400 This model\'s maximum context length is 4096 tokens. However, your messages resulted in 6000 tokens. Please reduce the length of the messages.',
+    };
+    const plan = planContextOverflowRecovery({
+      error,
+      provider: Providers.OPENAI,
+      maxContextTokens: 8_192,
+      estimatedPromptTokens: 6_000,
+      instructionTokens: 200,
+      attemptsSoFar: 0,
+    });
+
+    expect(plan?.budgetTokens).toBe(Math.floor(4_096 * 0.95));
   });
 
   it('calibrates on the prompt, never on a completion-inclusive total', () => {
