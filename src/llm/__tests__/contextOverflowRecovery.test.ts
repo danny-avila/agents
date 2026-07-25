@@ -137,6 +137,80 @@ describe('planContextOverflowRecovery', () => {
     expect(plan?.budgetTokens).toBeLessThan(200_000);
   });
 
+  it('reserves the configured completion allowance on a total-only error', () => {
+    const openai = signatureFor('gpt-5-nano');
+    /**
+     * The 429 quotes a 200k bucket and no breakdown. With a 32k completion
+     * allowance configured, a retry aimed at the whole bucket would still be
+     * `prompt + 32k` and over the limit.
+     */
+    const plan = planContextOverflowRecovery({
+      error: openai.error,
+      provider: Providers.OPENAI,
+      maxContextTokens: 400_000,
+      estimatedPromptTokens: 240_000,
+      configuredCompletionTokens: 32_000,
+      attemptsSoFar: 0,
+    });
+
+    expect(plan?.budgetTokens).toBe(Math.floor((200_000 - 32_000) * 0.95));
+  });
+
+  it('prefers the provider breakdown over the configured allowance', () => {
+    const openrouter = signatureFor('qwen/qwen-2.5-7b-instruct');
+    /** The error itemized 16 output tokens; that beats a stale config value. */
+    const withConfig = planContextOverflowRecovery({
+      error: openrouter.error,
+      provider: Providers.OPENROUTER,
+      maxContextTokens: 32_768,
+      estimatedPromptTokens: 42_599,
+      configuredCompletionTokens: 8_000,
+      attemptsSoFar: 0,
+    });
+    const withoutConfig = planContextOverflowRecovery({
+      error: openrouter.error,
+      provider: Providers.OPENROUTER,
+      maxContextTokens: 32_768,
+      estimatedPromptTokens: 42_599,
+      attemptsSoFar: 0,
+    });
+
+    expect(withConfig?.budgetTokens).toBe(withoutConfig?.budgetTokens);
+  });
+
+  it('declines when the corrected budget would not clear the instructions', () => {
+    const anthropic = signatureFor('claude-haiku-4-5-20251001');
+    /**
+     * Tool schemas alone fill the provider's real window, so compaction has
+     * nowhere to put the messages and the summarize node would refuse to run —
+     * the detour would bounce between nodes without shrinking anything.
+     */
+    const plan = planContextOverflowRecovery({
+      error: anthropic.error,
+      provider: Providers.ANTHROPIC,
+      maxContextTokens: 1_000_000,
+      estimatedPromptTokens: 274_468,
+      instructionTokens: 199_000,
+      attemptsSoFar: 0,
+    });
+
+    expect(plan).toBeNull();
+  });
+
+  it('still recovers when the instructions leave room for messages', () => {
+    const anthropic = signatureFor('claude-haiku-4-5-20251001');
+    const plan = planContextOverflowRecovery({
+      error: anthropic.error,
+      provider: Providers.ANTHROPIC,
+      maxContextTokens: 1_000_000,
+      estimatedPromptTokens: 274_468,
+      instructionTokens: 20_000,
+      attemptsSoFar: 0,
+    });
+
+    expect(plan?.budgetTokens).toBeGreaterThan(180_000);
+  });
+
   it('stops once the per-run recovery budget is spent', () => {
     const anthropic = signatureFor('claude-haiku-4-5-20251001');
     const params = {

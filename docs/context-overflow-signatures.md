@@ -134,7 +134,17 @@ retries — the caller sees a slightly longer turn, not an error.
 Fallback providers still run for every other failure, and for an overflow whose
 recovery budget is spent. They are skipped on the first overflow on purpose:
 an overflow is caused by the payload, not by the provider being unavailable, so
-re-sending the same oversized prompt elsewhere is unlikely to help.
+re-sending the same oversized prompt elsewhere is unlikely to help. A fallback
+that overflows is recovered on the same path, and when several fallbacks fail
+`tryFallbackProviders` surfaces the overflow in preference to whichever failure
+came last — an overflow is the one the caller can act on.
+
+Recovery is skipped entirely when nothing could shrink the prompt: with no
+token counter there is no pruner, and with summarization disabled the summarize
+node no-ops, so the retry would resend a byte-identical payload. It is also
+declined when the corrected budget would not clear the instructions with room
+to spare, since the summarize node refuses to run in that state and the detour
+would bounce between nodes without compacting anything.
 
 When `summarizationEnabled` is `false`, the summarize node performs no model
 call — the corrected budget plus a re-prune is the entire fix, and the caller

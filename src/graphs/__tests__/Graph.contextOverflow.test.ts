@@ -266,6 +266,45 @@ describe('context overflow recovery', () => {
     expect(agentContext?.overflowRecoveryAttempts).toBe(1);
   });
 
+  it('does not retry when neither pruning nor summarization can shrink the prompt', async () => {
+    /**
+     * No token counter means no pruner, and summarization is off, so the
+     * summarize node deliberately no-ops — a retry would resend a
+     * byte-identical prompt.
+     */
+    const run = await Run.create<t.IState>({
+      runId: 'overflow-recovery-nothing-to-shrink',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: Providers.ANTHROPIC,
+          disableStreaming: true,
+          streamUsage: false,
+        },
+        maxContextTokens: 1_000_000,
+      },
+      returnContent: true,
+      skipCleanup: true,
+    });
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+    const model = new OverflowThenSucceedModel(
+      signatureFor('claude-haiku-4-5-20251001'),
+      Number.MAX_SAFE_INTEGER
+    );
+    run.Graph.overrideModel = model;
+
+    await expect(
+      run.processStream({ messages: buildConversation(8) }, streamConfig)
+    ).rejects.toThrow(/too long/i);
+
+    expect(model.calls).toHaveLength(1);
+    expect(
+      run.Graph.agentContexts.get('default')?.overflowRecoveryAttempts
+    ).toBe(0);
+  });
+
   it('does not intercept errors compaction cannot fix', async () => {
     const run = await createRun({
       runId: 'overflow-recovery-unrelated',

@@ -30,6 +30,13 @@ const CEILING_HEADROOM_RATIO = 0.95;
  */
 const MIN_RECOVERY_BUDGET_TOKENS = 4_000;
 
+/**
+ * Room a corrected budget must leave above the instructions for the messages
+ * themselves. Without it, a budget that merely clears the system prompt and
+ * tool schemas is not a budget anything can be compacted into.
+ */
+const MIN_MESSAGE_HEADROOM_TOKENS = 2_000;
+
 /** Bound on forced-compaction retries per agent, per run. */
 export const DEFAULT_MAX_OVERFLOW_RECOVERIES = 2;
 
@@ -58,6 +65,19 @@ export interface OverflowRecoveryParams {
   maxContextTokens?: number;
   /** Our own estimate of the prompt we actually sent. */
   estimatedPromptTokens?: number;
+  /**
+   * System prompt plus tool schemas — the part of the budget compaction
+   * cannot touch. A corrected budget at or below this leaves no room for
+   * messages, and the summarize node refuses to run, so recovery is declined
+   * rather than entered.
+   */
+  instructionTokens?: number;
+  /**
+   * Completion allowance the caller configured. Providers count it against
+   * the same ceiling, so it has to come off the top when the error itself did
+   * not break the total down.
+   */
+  configuredCompletionTokens?: number;
   /** Recoveries already attempted for this agent in this run. */
   attemptsSoFar: number;
   maxAttempts?: number;
@@ -87,23 +107,37 @@ function toLocalUnits(limitTokens: number, ratio: number | undefined): number {
  * otherwise a large `maxTokens` keeps the request over the limit no matter
  * how far the prompt is compacted.
  */
-function reservedForCompletion(info: ContextOverflowInfo): number {
-  if (!isUsable(info.requestedTokens) || !isUsable(info.promptTokens)) {
-    return 0;
+function reservedForCompletion(
+  info: ContextOverflowInfo,
+  configuredCompletionTokens: number | undefined
+): number {
+  if (isUsable(info.requestedTokens) && isUsable(info.promptTokens)) {
+    const difference = info.requestedTokens - info.promptTokens;
+    if (difference > 0) {
+      return difference;
+    }
   }
-  const difference = info.requestedTokens - info.promptTokens;
-  return difference > 0 ? difference : 0;
+  /**
+   * No breakdown on offer. Fall back to what the caller configured, because
+   * the provider still counts it: targeting the whole ceiling would leave the
+   * retry at `prompt + maxTokens` and over the limit however far the prompt
+   * is compacted.
+   */
+  return isUsable(configuredCompletionTokens) ? configuredCompletionTokens : 0;
 }
 
 function resolveTargetBudget(
   info: ContextOverflowInfo,
   ratio: number | undefined,
   maxContextTokens: number | undefined,
-  estimatedPromptTokens: number | undefined
+  estimatedPromptTokens: number | undefined,
+  configuredCompletionTokens: number | undefined
 ): number | null {
   if (isUsable(info.limitTokens)) {
     /** Subtract in provider units, then convert the remainder to ours. */
-    const promptCeiling = info.limitTokens - reservedForCompletion(info);
+    const promptCeiling =
+      info.limitTokens -
+      reservedForCompletion(info, configuredCompletionTokens);
     if (promptCeiling > 0) {
       return toLocalUnits(promptCeiling, ratio) * CEILING_HEADROOM_RATIO;
     }
@@ -130,6 +164,8 @@ export function planContextOverflowRecovery({
   provider,
   maxContextTokens,
   estimatedPromptTokens,
+  instructionTokens,
+  configuredCompletionTokens,
   attemptsSoFar,
   maxAttempts = DEFAULT_MAX_OVERFLOW_RECOVERIES,
 }: OverflowRecoveryParams): OverflowRecoveryPlan | null {
@@ -155,7 +191,8 @@ export function planContextOverflowRecovery({
     info,
     observedCalibrationRatio,
     maxContextTokens,
-    estimatedPromptTokens
+    estimatedPromptTokens,
+    configuredCompletionTokens
   );
   if (target == null) {
     return null;
@@ -171,14 +208,29 @@ export function planContextOverflowRecovery({
       ? maxContextTokens * BLIND_SHRINK_RATIO
       : target;
 
-  const budgetTokens = Math.max(
-    MIN_RECOVERY_BUDGET_TOKENS,
-    Math.floor(bounded)
-  );
+  const budgetTokens = Math.floor(bounded);
 
   /**
-   * Refuse to report a "recovery" that changes nothing: when the floor is
-   * already at or above the budget in force, re-pruning cannot free space.
+   * Below the floor there is no usable budget left: either nothing survives
+   * pruning, or the instructions alone fill the window, in which case the
+   * summarize node refuses to run and the detour would bounce between the
+   * agent and summarize nodes without ever shrinking the prompt. Declining
+   * lets the existing "instructions exceed context budget" guidance surface
+   * instead.
+   */
+  const floorTokens = Math.max(
+    MIN_RECOVERY_BUDGET_TOKENS,
+    isUsable(instructionTokens)
+      ? instructionTokens + MIN_MESSAGE_HEADROOM_TOKENS
+      : 0
+  );
+  if (budgetTokens < floorTokens) {
+    return null;
+  }
+
+  /**
+   * Refuse to report a "recovery" that changes nothing: when the budget in
+   * force is already at or below the target, re-pruning cannot free space.
    */
   if (isUsable(maxContextTokens) && budgetTokens >= maxContextTokens) {
     return null;

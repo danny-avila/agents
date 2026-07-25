@@ -383,6 +383,12 @@ function buildClientOptions(target: ProbeTarget): t.ClientOptions {
         envValue('GOOGLE_CLOUD_LOCATION') ??
         envValue('GOOGLE_LOC') ??
         'us-central1',
+      /**
+       * Matches `utils/llmConfig`. Without it, an environment that supplies
+       * only `VERTEXAI_KEY_FILE` passes the credential check and then records
+       * auth failures instead of overflow signatures.
+       */
+      keyFile: envValue('VERTEXAI_KEY_FILE'),
     } as t.VertexAIClientOptions;
   }
 

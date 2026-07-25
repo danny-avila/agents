@@ -413,6 +413,26 @@ function preserveOriginalToolContent(
 }
 
 /**
+ * The completion allowance the caller configured, under whichever key the
+ * provider's client uses. Providers count it against the same ceiling as the
+ * prompt, so overflow recovery has to reserve it when the error did not
+ * itemize the total.
+ */
+function getConfiguredCompletionTokens(
+  clientOptions: t.ClientOptions | undefined
+): number | undefined {
+  const options = clientOptions as
+    | { maxTokens?: unknown; maxOutputTokens?: unknown }
+    | undefined;
+  for (const value of [options?.maxTokens, options?.maxOutputTokens]) {
+    if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+/**
  * Our own estimate of the prompt that was actually sent, derived from the
  * pre-invoke usage snapshot. Used to corroborate ambiguous provider errors
  * and to measure how far our token accounting sits from the provider's.
@@ -2327,14 +2347,31 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
          * down the fallback chain. Fallbacks still run for every other
          * failure, and for an overflow whose recovery budget is spent.
          */
+        /**
+         * Compaction has to have something to work with. Without a token
+         * counter there is no pruner, and with summarization disabled the
+         * summarize node deliberately no-ops — so in that combination the
+         * retry would resend a byte-identical prompt. Skipping the detour
+         * keeps the original error and one round trip instead of three.
+         */
+        const canReduceContext =
+          agentContext.tokenCounter != null ||
+          agentContext.summarizationEnabled === true;
+
         const planRecovery = (error: unknown): OverflowRecoveryPlan | null =>
-          planContextOverflowRecovery({
-            error,
-            provider: agentContext.provider,
-            maxContextTokens: agentContext.maxContextTokens,
-            estimatedPromptTokens: getEstimatedPromptTokens(contextUsage),
-            attemptsSoFar: agentContext.overflowRecoveryAttempts,
-          });
+          canReduceContext
+            ? planContextOverflowRecovery({
+              error,
+              provider: agentContext.provider,
+              maxContextTokens: agentContext.maxContextTokens,
+              estimatedPromptTokens: getEstimatedPromptTokens(contextUsage),
+              instructionTokens: agentContext.instructionTokens,
+              configuredCompletionTokens: getConfiguredCompletionTokens(
+                agentContext.clientOptions
+              ),
+              attemptsSoFar: agentContext.overflowRecoveryAttempts,
+            })
+            : null;
 
         const recovery = planRecovery(primaryError);
         if (recovery != null) {

@@ -9,6 +9,7 @@ import { annotateMessagesForLLM } from '@/tools/toolOutputReferences';
 import { assertNotTruncatedToolCall } from '@/llm/truncation';
 import { Constants, GraphEvents, Providers } from '@/common';
 import { manualToolStreamProviders } from '@/llm/providers';
+import { getContextOverflowInfo } from '@/utils/errors';
 import { modifyDeltaProperties } from '@/messages';
 import { ChatModelStreamHandler } from '@/stream';
 import { initializeModel } from '@/llm/init';
@@ -333,7 +334,12 @@ function extractClientOptionsModel(
 
 /**
  * Attempts each fallback provider in order until one succeeds.
- * Throws the last error if all fallbacks fail.
+ *
+ * When every fallback fails, a context overflow among them is thrown in
+ * preference to whichever failure happened to come last. An overflow is the
+ * one failure the caller can act on — it compacts and retries — and losing it
+ * behind a later unrelated error would surface a dead end instead. Ordinary
+ * failures still throw last-error-wins.
  */
 export async function tryFallbackProviders({
   fallbacks,
@@ -353,6 +359,8 @@ export async function tryFallbackProviders({
   onChunk?: OnChunk;
 }): Promise<Partial<t.BaseGraphState> | undefined> {
   let lastError: unknown = primaryError;
+  let overflowError: unknown =
+    getContextOverflowInfo(primaryError) != null ? primaryError : undefined;
   for (const fb of fallbacks) {
     try {
       const fbModel = initializeModel({
@@ -391,8 +399,14 @@ export async function tryFallbackProviders({
       return result;
     } catch (e) {
       lastError = e;
+      if (overflowError === undefined && getContextOverflowInfo(e) != null) {
+        overflowError = e;
+      }
       continue;
     }
+  }
+  if (overflowError !== undefined) {
+    throw overflowError;
   }
   if (lastError !== undefined) {
     throw lastError;

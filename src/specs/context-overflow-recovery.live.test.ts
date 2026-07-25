@@ -153,6 +153,12 @@ describeIfLive('context overflow recovery (live)', () => {
             },
           },
           returnContent: true,
+          /**
+           * The assertions below read post-run `AgentContext` state, and the
+           * default cleanup path calls `clearHeavyState()` → `reset()`, which
+           * deliberately undoes the overflow correction for the next turn.
+           */
+          skipCleanup: true,
           tokenCounter,
           customHandlers: {
             [GraphEvents.ON_SUMMARIZE_COMPLETE]: {
