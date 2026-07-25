@@ -100,9 +100,20 @@ budget. Without corroboration the error propagates untouched.
 [`src/llm/contextOverflowRecovery.ts`](../src/llm/contextOverflowRecovery.ts)
 turns a detection into a budget for the retry:
 
-1. **Believe the provider over the config.** If the error names a ceiling, that
-   becomes the new budget — this is how a `maxContextTokens` that was simply
-   wrong gets corrected mid-run.
+1. **Shrink by the measured overage.** When the error names both its ceiling
+   and the size it attributed to our prompt, `ceiling / promptTokens` is a
+   pure ratio — applying it to our own estimate needs no conversion between
+   tokenizers, and targets the prompt that was actually rejected rather than a
+   budget it may have been sitting well under. When only a ceiling is named,
+   that ceiling becomes the budget directly; `maxContextTokens` is
+   provider-space, which is how a `maxContextTokens` that was simply wrong
+   gets corrected mid-run.
+
+   Note what must _not_ happen here: the pruner already divides the budget by
+   the `calibrationRatio` it learns from reported usage. Converting the
+   ceiling into "our" units as well applies the same correction twice and
+   prunes toward roughly `limit / ratio²`.
+
 2. **Reserve what the completion will cost.** Several providers count the
    requested `max_tokens` against the same ceiling and quote a combined total —
    OpenRouter's `you requested about 56827 tokens (56811 of text input, 16 in
@@ -130,6 +141,23 @@ overflow applies the corrected budget and returns a summarization request
 instead of throwing. The graph routes to the summarize node, compacts, and
 comes back to the agent node, which re-prunes against the corrected budget and
 retries — the caller sees a slightly longer turn, not an error.
+
+Compaction is staged, and the first stage costs nothing:
+
+1. **Compress.** The first recovery spends no summarization call. Re-pruning
+   under the corrected budget raises context pressure, which is what drives
+   the pruner's existing tool-output truncation and observation masking. Tool
+   output is usually where the bulk of an overflowing context sits, and
+   squeezing it loses no message content.
+2. **Summarize.** Only if the provider rejects the prompt again — and only
+   when summarization is enabled — does the next attempt spend a model call.
+
+A summarization that fails falls back to a metadata stub describing the
+history rather than summarizing it. Committing that stub means removing the
+head and keeping none of what it said, so on the overflow path it is refused:
+history is left intact and the provider error surfaces. Recovering by
+destroying the conversation the recovery exists to preserve is not a trade
+worth making. The configured-trigger path keeps its previous stub behavior.
 
 Fallback providers still run for every other failure, and for an overflow whose
 recovery budget is spent. They are skipped on the first overflow on purpose:

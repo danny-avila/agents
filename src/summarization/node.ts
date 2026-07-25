@@ -517,7 +517,16 @@ async function executeSummarizationWithFallback(params: {
   stepId: string;
   usePromptCache: boolean;
   log: LogFn;
-}): Promise<{ text: string; usage?: Partial<UsageMetadata> }> {
+}): Promise<{
+  text: string;
+  usage?: Partial<UsageMetadata>;
+  /**
+   * True when every model call failed and `text` is the generated metadata
+   * stub rather than a real summary. Callers that would replace history with
+   * this need to know it carries none of the original content.
+   */
+  usedMetadataStub?: boolean;
+}> {
   const {
     agentContext,
     messages,
@@ -532,6 +541,7 @@ async function executeSummarizationWithFallback(params: {
 
   let summaryText = '';
   let summaryUsage: Partial<UsageMetadata> | undefined;
+  let usedMetadataStub = false;
 
   try {
     /**
@@ -634,10 +644,11 @@ async function executeSummarizationWithFallback(params: {
         }
       );
       summaryText = generateMetadataStub(messages);
+      usedMetadataStub = true;
     }
   }
 
-  return { text: summaryText, usage: summaryUsage };
+  return { text: summaryText, usage: summaryUsage, usedMetadataStub };
 }
 
 /** Dispatches run step completion, ON_SUMMARIZE_COMPLETE, and rebuilds token map. */
@@ -776,21 +787,27 @@ export function createSummarizeNode({
 
     /**
      * Overflow recovery routes through this node purely to get back to the
-     * agent node with a corrected budget. When summarization was never
-     * enabled, making a model call here would be an unrequested cost the
-     * caller opted out of — the re-prune against the lower budget is the
-     * whole fix.
+     * agent node with a corrected budget, and deliberately spends no model
+     * call on its first attempt: re-pruning under the raised context pressure
+     * drives the pruner's tool-output compression and masking, which is
+     * cheaper than a summary and cannot lose message content. Summarization
+     * is also skipped outright when the caller never enabled it.
      */
     if (
       request.reason === 'overflow' &&
-      agentContext.summarizationEnabled !== true
+      (request.allowSummarization !== true ||
+        agentContext.summarizationEnabled !== true)
     ) {
       emitAgentLog(
         config,
         'debug',
         'summarize',
-        'Overflow recovery re-prune — summarization not enabled, no summary generated',
-        { maxContextTokens: agentContext.maxContextTokens },
+        'Overflow recovery re-prune — compressing tool output without a summarization call',
+        {
+          maxContextTokens: agentContext.maxContextTokens,
+          summarizationEnabled: agentContext.summarizationEnabled === true,
+          allowSummarization: request.allowSummarization === true,
+        },
         { runId: graph.runId, agentId: request.agentId }
       );
       return { summarizationRequest: undefined };
@@ -998,16 +1015,48 @@ export function createSummarizeNode({
       }
       : undefined;
 
-    const { text: rawText, usage: summaryUsage } =
-      await executeSummarizationWithFallback({
-        agentContext,
-        messages: messagesToRefine,
-        clientConfig,
-        summarizeConfig,
-        stepId,
-        usePromptCache: isSelfSummarizeModel && hasPromptCache,
-        log,
-      });
+    const {
+      text: rawText,
+      usage: summaryUsage,
+      usedMetadataStub,
+    } = await executeSummarizationWithFallback({
+      agentContext,
+      messages: messagesToRefine,
+      clientConfig,
+      summarizeConfig,
+      stepId,
+      usePromptCache: isSelfSummarizeModel && hasPromptCache,
+      log,
+    });
+
+    /**
+     * The metadata stub describes the history rather than summarizing it, so
+     * committing it means removing the head and keeping nothing of what it
+     * said. That trade is never worth making to paper over an overflow: the
+     * recovery would "succeed" only by destroying the conversation it was
+     * supposed to preserve. Leave state untouched and let the provider error
+     * surface instead.
+     */
+    if (usedMetadataStub === true && request.reason === 'overflow') {
+      log(
+        'warn',
+        'Overflow summarization failed; keeping history rather than replacing it with a metadata stub'
+      );
+      agentContext.markSummarizationTriggered(state.messages.length);
+      if (runnableConfig) {
+        await safeDispatchCustomEvent(
+          GraphEvents.ON_SUMMARIZE_COMPLETE,
+          {
+            id: stepId,
+            agentId: request.agentId,
+            error:
+              'Summarization failed during overflow recovery; conversation history was preserved',
+          } satisfies t.SummarizeCompleteEvent,
+          runnableConfig
+        );
+      }
+      return { summarizationRequest: undefined };
+    }
 
     if (!rawText) {
       agentContext.markSummarizationTriggered(0);

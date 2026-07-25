@@ -146,7 +146,7 @@ describe('context overflow recovery', () => {
     await run.processStream({ messages: buildConversation(8) }, streamConfig);
 
     const agentContext = run.Graph.agentContexts.get('default');
-    expect(agentContext?.maxContextTokens).toBeLessThanOrEqual(200_000);
+    expect(agentContext?.maxContextTokens).toBeLessThan(1_000_000);
     expect(agentContext?.overflowRecoveryAttempts).toBe(1);
   });
 
@@ -227,7 +227,7 @@ describe('context overflow recovery', () => {
     await run.processStream({ messages: buildConversation(8) }, streamConfig);
 
     const agentContext = run.Graph.agentContexts.get('default');
-    expect(agentContext?.maxContextTokens).toBeLessThanOrEqual(200_000);
+    expect(agentContext?.maxContextTokens).toBeLessThan(1_000_000);
     expect(agentContext?.overflowRecoveryAttempts).toBe(1);
 
     /** What `processStream` runs at the start of every turn. */
@@ -305,17 +305,16 @@ describe('context overflow recovery', () => {
     ).toBe(0);
   });
 
-  it('does not scale the corrected budget by the tokenizer divergence', async () => {
+  it('shrinks the budget in proportion to the measured overage', async () => {
     /**
-     * `maxContextTokens` is a provider-space budget that the pruner already
-     * divides by its learned calibrationRatio. Applying the observed
-     * divergence here as well would target `limit / ratio²` — with this
-     * fixture's 274,468-vs-estimate divergence that meant a 27,689 budget
-     * against a 200,000 ceiling, discarding roughly seven times more history
-     * than the overflow called for.
+     * The provider counted 274,468 for a prompt it caps at 200,000 — 1.37×
+     * over. Applying that ratio to our own estimate is unit-free, so it needs
+     * no tokenizer conversion; converting instead would double-count against
+     * the pruner's own calibration and discard far more than the overflow
+     * called for.
      */
     const run = await createRun({
-      runId: 'overflow-recovery-no-double-calibration',
+      runId: 'overflow-recovery-proportional',
       maxContextTokens: 1_000_000,
     });
     if (!run.Graph) {
@@ -325,10 +324,14 @@ describe('context overflow recovery', () => {
       signatureFor('claude-haiku-4-5-20251001')
     );
 
-    await run.processStream({ messages: buildConversation(8) }, streamConfig);
+    const messages = buildConversation(8);
+    await run.processStream({ messages }, streamConfig);
 
-    const agentContext = run.Graph.agentContexts.get('default');
-    expect(agentContext?.maxContextTokens).toBe(Math.floor(200_000 * 0.95));
+    const estimatedPrompt = messages.length * TOKENS_PER_MESSAGE;
+    const expected = Math.floor(estimatedPrompt * (200_000 / 274_468) * 0.95);
+    expect(run.Graph.agentContexts.get('default')?.maxContextTokens).toBe(
+      expected
+    );
   });
 
   it('does not intercept errors compaction cannot fix', async () => {

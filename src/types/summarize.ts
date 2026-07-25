@@ -74,6 +74,17 @@ export interface SummarizationNodeInput {
    *   retry needs.
    */
   reason?: 'trigger' | 'overflow';
+  /**
+   * Whether an overflow recovery may spend a summarization model call.
+   *
+   * The first recovery deliberately does not: re-pruning against the
+   * corrected budget raises context pressure, which drives the pruner's
+   * existing tool-output compression and masking. That is cheaper, needs no
+   * model call, and cannot lose message content the way a summary can. Only
+   * when deterministic compression proves insufficient does the next attempt
+   * allow the summarizer to run.
+   */
+  allowSummarization?: boolean;
 }
 
 export interface SummarizeStartEvent {

@@ -1560,6 +1560,17 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
   }): Partial<t.AgentSubgraphState> {
     const previousBudget = agentContext.maxContextTokens;
     /**
+     * Deterministic compaction first. Re-pruning against the corrected budget
+     * raises context pressure, which is what drives the pruner's tool-output
+     * truncation and observation masking — no model call, no cost, and no
+     * message content lost. A summarization call is held back until that has
+     * been tried and the provider rejected the prompt again.
+     */
+    const allowSummarization =
+      agentContext.summarizationEnabled === true &&
+      agentContext.overflowRecoveryAttempts > 0;
+
+    /**
      * Preserved before the detour for the same reason the configured trigger
      * preserves it: the summarize node restores full tool output from this
      * map, and without it a forced summary is written from truncated stubs.
@@ -1569,7 +1580,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
      * clears it, so storing megabytes of tool output there would be a leak
      * for a detour that never reads it.
      */
-    if (agentContext.summarizationEnabled === true) {
+    if (allowSummarization) {
       preserveOriginalToolContent(agentContext, originalToolContent);
     }
     agentContext.applyContextBudgetCorrection(
@@ -1588,9 +1599,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         recoveredBudget: recovery.budgetTokens,
         providerReportedLimit: recovery.info.limitTokens,
         providerReportedTokens: recovery.info.requestedTokens,
+        providerReportedPromptTokens: recovery.info.promptTokens,
         observedCalibrationRatio: recovery.observedCalibrationRatio,
         detectedBy: recovery.info.source,
         attempt: agentContext.overflowRecoveryAttempts,
+        compaction: allowSummarization ? 'summarize' : 'compress',
       },
       { runId: this.runId, agentId },
       { force: true }
@@ -1601,6 +1614,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         remainingContextTokens: 0,
         agentId: agentId || agentContext.agentId,
         reason: 'overflow',
+        allowSummarization,
       },
     };
   }

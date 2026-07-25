@@ -133,7 +133,25 @@ function resolveTargetBudget(
      * Compaction cannot fix that, so declining surfaces the real problem
      * instead of burning the recovery budget on retries that must fail.
      */
-    return promptCeiling > 0 ? promptCeiling * CEILING_HEADROOM_RATIO : null;
+    if (promptCeiling <= 0) {
+      return null;
+    }
+
+    /**
+     * Preferred path: scale by how far over the prompt actually was.
+     *
+     * `promptCeiling / promptTokens` is a pure ratio in the provider's units,
+     * so applying it to our own estimate needs no unit conversion — which is
+     * what makes this immune to the tokenizer divergence that the absolute
+     * ceiling below has to be careful about. It also targets the prompt that
+     * was rejected rather than a budget it may have been sitting well under.
+     */
+    if (isUsable(info.promptTokens) && isUsable(estimatedPromptTokens)) {
+      const overageScale = promptCeiling / info.promptTokens;
+      return estimatedPromptTokens * overageScale * CEILING_HEADROOM_RATIO;
+    }
+
+    return promptCeiling * CEILING_HEADROOM_RATIO;
   }
   if (isUsable(estimatedPromptTokens)) {
     return estimatedPromptTokens * BLIND_SHRINK_RATIO;
