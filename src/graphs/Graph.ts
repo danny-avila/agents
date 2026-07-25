@@ -51,16 +51,17 @@ import {
   sleep,
 } from '@/utils';
 import {
-  resolveLangfuseRuntimeScope,
-  withLangfuseRuntimeScope,
-} from '@/langfuseRuntimeScope';
-import {
+  Constants,
   GraphNodeKeys,
   ContentTypes,
   GraphEvents,
   Providers,
   StepTypes,
 } from '@/common';
+import {
+  resolveLangfuseRuntimeScope,
+  withLangfuseRuntimeScope,
+} from '@/langfuseRuntimeScope';
 import {
   appendCallbacks,
   findCallback,
@@ -2593,10 +2594,19 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             isMultiAgent: this.isMultiAgentGraph(),
             hookRegistry: this.hookRegistry,
             dispatchRunStep: async (runStep, nodeConfig) => {
+              const resolvedConfig = nodeConfig ?? this.config;
+              if (runStep.agentId != null) {
+                const groupId = this.resolveParallelGroupId(
+                  runStep.agentId,
+                  resolvedConfig?.metadata
+                );
+                if (groupId != null) {
+                  runStep.groupId = groupId;
+                }
+              }
               this.contentData.push(runStep);
               this.contentIndexMap.set(runStep.id, runStep.index);
 
-              const resolvedConfig = nodeConfig ?? this.config;
               const handler = this.handlerRegistry?.getHandler(
                 GraphEvents.ON_RUN_STEP
               );
@@ -2716,6 +2726,33 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
     return undefined;
   }
 
+  protected resolveParallelGroupId(
+    agentId: string,
+    metadata?: Record<string, unknown>
+  ): number | undefined {
+    if (
+      metadata == null ||
+      !Object.prototype.hasOwnProperty.call(
+        metadata,
+        Constants.HANDOFF_GROUP_ID
+      )
+    ) {
+      return this.getParallelGroupIdForAgent(agentId);
+    }
+    const runtimeGroupId = metadata[Constants.HANDOFF_GROUP_ID];
+    if (runtimeGroupId === null) {
+      return undefined;
+    }
+    if (
+      typeof runtimeGroupId === 'number' &&
+      Number.isSafeInteger(runtimeGroupId) &&
+      runtimeGroupId > 0
+    ) {
+      return runtimeGroupId;
+    }
+    return this.getParallelGroupIdForAgent(agentId);
+  }
+
   /* Dispatchers */
 
   /**
@@ -2760,7 +2797,10 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
         const agentContext = this.getAgentContext(metadata);
         if (this.isMultiAgentGraph() && agentContext.agentId) {
           runStep.agentId = agentContext.agentId;
-          const groupId = this.getParallelGroupIdForAgent(agentContext.agentId);
+          const groupId = this.resolveParallelGroupId(
+            agentContext.agentId,
+            metadata
+          );
           if (groupId != null) {
             runStep.groupId = groupId;
           }

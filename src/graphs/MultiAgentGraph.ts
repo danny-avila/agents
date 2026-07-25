@@ -23,6 +23,63 @@ import { Constants } from '@/common';
 
 /** Pattern to extract instructions from transfer ToolMessage content */
 const HANDOFF_INSTRUCTIONS_PATTERN = /(?:Instructions?|Context):\s*(.+)/is;
+const HANDOFF_INSTRUCTIONS_KEY = 'handoff_instructions';
+
+function getHandoffInstructions(
+  input: Record<string, unknown>,
+  promptKey: string,
+  hasHandoffInput: boolean
+): string | null {
+  if (
+    !hasHandoffInput ||
+    !Object.prototype.hasOwnProperty.call(input, promptKey)
+  ) {
+    return null;
+  }
+  const value = input[promptKey];
+  return typeof value === 'string' ? value : null;
+}
+
+function formatHandoffPromptLabel(promptKey: string): string {
+  return promptKey.charAt(0).toUpperCase() + promptKey.slice(1);
+}
+
+function extractLegacyHandoffInstructions(
+  content: string,
+  promptLabels: Set<string> | undefined
+): string | null {
+  let markerIndex = -1;
+  let markerLength = 0;
+  for (const label of promptLabels ?? []) {
+    const marker = `\n\n${label}:`;
+    const index = content.indexOf(marker);
+    if (index >= 0 && (markerIndex < 0 || index < markerIndex)) {
+      markerIndex = index;
+      markerLength = marker.length;
+    }
+  }
+  if (markerIndex >= 0) {
+    return content.slice(markerIndex + markerLength).trim();
+  }
+  return content.match(HANDOFF_INSTRUCTIONS_PATTERN)?.[1]?.trim() ?? null;
+}
+
+function isValidHandoffGroupId(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+}
+
+function withHandoffGroupMetadata(
+  config: LangGraphRunnableConfig | undefined,
+  groupId: number | undefined
+): LangGraphRunnableConfig {
+  return {
+    ...config,
+    metadata: {
+      ...config?.metadata,
+      [Constants.HANDOFF_GROUP_ID]: groupId ?? null,
+    },
+  };
+}
 
 /**
  * MultiAgentGraph extends StandardGraph to support dynamic multi-agent workflows
@@ -43,6 +100,7 @@ export class MultiAgentGraph extends StandardGraph {
   private startingNodes: Set<string> = new Set();
   private directEdges: t.GraphEdge[] = [];
   private handoffEdges: t.GraphEdge[] = [];
+  private handoffPromptLabels: Map<string, Set<string>> = new Map();
   /**
    * Map of agentId to parallel group info.
    * Contains groupId (incrementing number reflecting execution order) for agents in parallel groups.
@@ -271,6 +329,18 @@ export class MultiAgentGraph extends StandardGraph {
 
     // Only process handoff edges for tool creation
     for (const edge of this.handoffEdges) {
+      if (typeof edge.prompt === 'string') {
+        const label = formatHandoffPromptLabel(
+          edge.promptKey ?? 'instructions'
+        );
+        const destinations = Array.isArray(edge.to) ? edge.to : [edge.to];
+        for (const destination of destinations) {
+          const labels =
+            this.handoffPromptLabels.get(destination) ?? new Set<string>();
+          labels.add(label);
+          this.handoffPromptLabels.set(destination, labels);
+        }
+      }
       const sources = Array.isArray(edge.from) ? edge.from : [edge.from];
       sources.forEach((source) => {
         if (!handoffsByAgent.has(source)) {
@@ -349,13 +419,14 @@ export class MultiAgentGraph extends StandardGraph {
               destination = Array.isArray(result) ? result[0] : destinations[0];
             }
 
+            const handoffInstructions = getHandoffInstructions(
+              input,
+              promptKey,
+              hasHandoffInput
+            );
             let content = `Conditionally transferred to ${destination}`;
-            if (
-              hasHandoffInput &&
-              promptKey in input &&
-              input[promptKey] != null
-            ) {
-              content += `\n\n${promptKey.charAt(0).toUpperCase() + promptKey.slice(1)}: ${input[promptKey]}`;
+            if (handoffInstructions !== null) {
+              content += `\n\n${formatHandoffPromptLabel(promptKey)}: ${handoffInstructions}`;
             }
 
             const toolMessage = new ToolMessage({
@@ -367,6 +438,9 @@ export class MultiAgentGraph extends StandardGraph {
                 handoff_destination: destination,
                 /** Store source agent name for receiving agent to know who handed off */
                 handoff_source_name: sourceAgentName,
+                ...(handoffInstructions !== null && {
+                  [HANDOFF_INSTRUCTIONS_KEY]: handoffInstructions,
+                }),
               },
             });
 
@@ -415,13 +489,14 @@ export class MultiAgentGraph extends StandardGraph {
               const input = rawInput as Record<string, unknown>;
               const toolCallId = runtime.toolCall?.id ?? 'unknown';
 
+              const handoffInstructions = getHandoffInstructions(
+                input,
+                promptKey,
+                hasHandoffInput
+              );
               let content = `Successfully transferred to ${destination}`;
-              if (
-                hasHandoffInput &&
-                promptKey in input &&
-                input[promptKey] != null
-              ) {
-                content += `\n\n${promptKey.charAt(0).toUpperCase() + promptKey.slice(1)}: ${input[promptKey]}`;
+              if (handoffInstructions !== null) {
+                content += `\n\n${formatHandoffPromptLabel(promptKey)}: ${handoffInstructions}`;
               }
 
               const toolMessage = new ToolMessage({
@@ -431,6 +506,9 @@ export class MultiAgentGraph extends StandardGraph {
                 additional_kwargs: {
                   /** Store source agent name for receiving agent to know who handed off */
                   handoff_source_name: sourceAgentName,
+                  ...(handoffInstructions !== null && {
+                    [HANDOFF_INSTRUCTIONS_KEY]: handoffInstructions,
+                  }),
                 },
               });
 
@@ -558,8 +636,39 @@ export class MultiAgentGraph extends StandardGraph {
     instructions: string | null;
     sourceAgentName: string | null;
     parallelSiblings: string[];
+    parallelGroupId?: number;
   } | null {
     if (messages.length === 0) return null;
+
+    /**
+     * A handoff is active only while resolving the most recent assistant
+     * tool-call round. Older transfer results remain in conversation history,
+     * but must not be reused when this agent is reached later through a direct
+     * edge or cycle.
+     */
+    const activeTransferToolCallIds = new Set<string>();
+    let activeToolMessageStartIndex = messages.length;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const msg = messages[i];
+      if (msg.getType() === 'tool') continue;
+
+      if (msg.getType() === 'ai') {
+        const aiMsg = msg as AIMessage | AIMessageChunk;
+        for (const toolCall of aiMsg.tool_calls ?? []) {
+          if (
+            toolCall.id != null &&
+            (toolCall.name.startsWith(Constants.LC_TRANSFER_TO_) ||
+              toolCall.name === 'conditional_transfer')
+          ) {
+            activeTransferToolCallIds.add(toolCall.id);
+          }
+        }
+        activeToolMessageStartIndex = i + 1;
+      }
+      break;
+    }
+
+    if (activeTransferToolCallIds.size === 0) return null;
 
     /**
      * Search for a transfer ToolMessage targeting this agent.
@@ -569,14 +678,19 @@ export class MultiAgentGraph extends StandardGraph {
     let toolMessage: ToolMessage | null = null;
     let toolMessageIndex = -1;
 
-    for (let i = messages.length - 1; i >= 0; i--) {
+    for (let i = messages.length - 1; i >= activeToolMessageStartIndex; i--) {
       const msg = messages[i];
       if (msg.getType() !== 'tool') continue;
 
       const candidateMsg = msg as ToolMessage;
       const toolName = candidateMsg.name;
 
-      if (typeof toolName !== 'string') continue;
+      if (
+        typeof toolName !== 'string' ||
+        !activeTransferToolCallIds.has(candidateMsg.tool_call_id)
+      ) {
+        continue;
+      }
 
       /** Check for standard transfer pattern */
       const isTransferMessage = toolName.startsWith(Constants.LC_TRANSFER_TO_);
@@ -611,8 +725,15 @@ export class MultiAgentGraph extends StandardGraph {
         ? toolMessage.content
         : JSON.stringify(toolMessage.content);
 
-    const instructionsMatch = contentStr.match(HANDOFF_INSTRUCTIONS_PATTERN);
-    const instructions = instructionsMatch?.[1]?.trim() ?? null;
+    const structuredInstructions =
+      toolMessage.additional_kwargs[HANDOFF_INSTRUCTIONS_KEY];
+    const instructions =
+      typeof structuredInstructions === 'string'
+        ? structuredInstructions.trim()
+        : extractLegacyHandoffInstructions(
+          contentStr,
+          this.handoffPromptLabels.get(agentId)
+        );
 
     /** Extract source agent name from additional_kwargs */
     const handoffSourceName = toolMessage.additional_kwargs.handoff_source_name;
@@ -629,6 +750,11 @@ export class MultiAgentGraph extends StandardGraph {
       const ctx = this.agentContexts.get(id);
       return ctx?.name ?? id;
     });
+    const storedParallelGroupId =
+      toolMessage.additional_kwargs[Constants.HANDOFF_GROUP_ID];
+    const parallelGroupId = isValidHandoffGroupId(storedParallelGroupId)
+      ? storedParallelGroupId
+      : undefined;
 
     /** Get the tool_call_id to find and filter the AI message's tool call */
     const toolCallId = toolMessage.tool_call_id;
@@ -640,15 +766,27 @@ export class MultiAgentGraph extends StandardGraph {
      */
     const transferToolCallIds = new Set<string>([toolCallId]);
     for (const msg of messages) {
-      if (msg.getType() !== 'tool') continue;
-      const tm = msg as ToolMessage;
-      const tName = tm.name;
-      if (typeof tName !== 'string') continue;
-      if (
-        tName.startsWith(Constants.LC_TRANSFER_TO_) ||
-        tName === 'conditional_transfer'
-      ) {
-        transferToolCallIds.add(tm.tool_call_id);
+      if (msg.getType() === 'tool') {
+        const tm = msg as ToolMessage;
+        const tName = tm.name;
+        if (
+          typeof tName === 'string' &&
+          (tName.startsWith(Constants.LC_TRANSFER_TO_) ||
+            tName === 'conditional_transfer')
+        ) {
+          transferToolCallIds.add(tm.tool_call_id);
+        }
+      } else if (msg.getType() === 'ai') {
+        const aiMsg = msg as AIMessage | AIMessageChunk;
+        for (const toolCall of aiMsg.tool_calls ?? []) {
+          if (
+            toolCall.id != null &&
+            (toolCall.name.startsWith(Constants.LC_TRANSFER_TO_) ||
+              toolCall.name === 'conditional_transfer')
+          ) {
+            transferToolCallIds.add(toolCall.id);
+          }
+        }
       }
     }
 
@@ -708,6 +846,7 @@ export class MultiAgentGraph extends StandardGraph {
       instructions,
       sourceAgentName,
       parallelSiblings,
+      parallelGroupId,
     };
   }
 
@@ -795,27 +934,26 @@ export class MultiAgentGraph extends StandardGraph {
           state.messages,
           agentId
         );
+        const agentContext = this.agentContexts.get(agentId);
+
+        if (
+          handoffContext?.sourceAgentName != null &&
+          handoffContext.sourceAgentName !== ''
+        ) {
+          agentContext?.setHandoffContext(
+            handoffContext.sourceAgentName,
+            handoffContext.parallelSiblings
+          );
+        } else {
+          agentContext?.clearHandoffContext();
+        }
 
         if (handoffContext !== null) {
           const {
             filteredMessages,
             instructions,
-            sourceAgentName,
-            parallelSiblings,
+            parallelGroupId,
           } = handoffContext;
-
-          /**
-           * Set handoff context on the receiving agent.
-           * Uses pre-computed graph position for depth and parallel info.
-           */
-          const agentContext = this.agentContexts.get(agentId);
-          if (
-            agentContext &&
-            sourceAgentName != null &&
-            sourceAgentName !== ''
-          ) {
-            agentContext.setHandoffContext(sourceAgentName, parallelSiblings);
-          }
 
           /** Build messages for the receiving agent */
           let messagesForAgent = filteredMessages;
@@ -883,7 +1021,10 @@ export class MultiAgentGraph extends StandardGraph {
             ...state,
             messages: messagesForAgent,
           };
-          result = await agentSubgraph.invoke(transformedState, config);
+          result = await agentSubgraph.invoke(
+            transformedState,
+            withHandoffGroupMetadata(config, parallelGroupId)
+          );
           result = {
             ...result,
             agentMessages: [],
@@ -896,7 +1037,6 @@ export class MultiAgentGraph extends StandardGraph {
            * When using agentMessages (excludeResults=true), we need to update
            * the token map to account for the new prompt message
            */
-          const agentContext = this.agentContexts.get(agentId);
           if (agentContext && agentContext.tokenCounter) {
             /** The agentMessages contains:
              * 1. Filtered messages (0 to startIndex) - already have token counts
