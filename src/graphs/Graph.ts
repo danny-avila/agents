@@ -1570,22 +1570,11 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
       agentContext.summarizationEnabled === true &&
       agentContext.overflowRecoveryAttempts > 0;
 
-    /**
-     * Preserved before the detour for the same reason the configured trigger
-     * preserves it: the summarize node restores full tool output from this
-     * map, and without it a forced summary is written from truncated stubs.
-     *
-     * Only when a summary will actually be written, though. On the re-prune
-     * -only path the node no-ops without consuming the map, and nothing else
-     * clears it, so storing megabytes of tool output there would be a leak
-     * for a detour that never reads it.
-     */
-    if (allowSummarization) {
-      preserveOriginalToolContent(agentContext, originalToolContent);
-    }
+    preserveOriginalToolContent(agentContext, originalToolContent);
     agentContext.applyContextBudgetCorrection(
       recovery.budgetTokens,
-      estimatedPromptTokens
+      estimatedPromptTokens,
+      !allowSummarization
     );
 
     emitAgentLog(
@@ -1795,6 +1784,22 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           totalTokensFresh: agentContext.totalTokensFresh,
         });
         prunedOriginalToolContent = originalToolContent;
+        /**
+         * Masking rewrites tool content in `state.messages` in place, so this
+         * map is the only surviving copy of the full output. Persist it on
+         * every prune, not just when a summary is about to be written — the
+         * pruner closure that produced it is discarded on the next reset, and
+         * with it any chance of a later summary restoring the real content.
+         * `enforceOriginalContentCap` bounds what accumulates.
+         */
+        preserveOriginalToolContent(agentContext, originalToolContent);
+        /**
+         * Consumed once per pass so a compression-only retry suppresses the
+         * configured trigger exactly here — the summarize node's skip would
+         * otherwise hand control straight back and the ordinary trigger would
+         * spend the summarization call the staging exists to avoid.
+         */
+        const compressionRetryPending = agentContext.consumeCompressionRetry();
         agentContext.indexTokenCountMap = indexTokenCountMap;
         if (calibrationRatio != null && calibrationRatio > 0) {
           agentContext.calibrationRatio = calibrationRatio;
@@ -1863,6 +1868,7 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
           );
           const triggerResult =
             !shouldSkip &&
+            !compressionRetryPending &&
             shouldTriggerSummarization({
               trigger: agentContext.summarizationConfig?.trigger,
               maxContextTokens: agentContext.maxContextTokens,
@@ -1875,8 +1881,6 @@ export class StandardGraph extends Graph<t.BaseGraphState, t.GraphNode> {
             });
 
           if (triggerResult) {
-            preserveOriginalToolContent(agentContext, originalToolContent);
-
             emitAgentLog(
               config,
               'info',

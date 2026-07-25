@@ -342,6 +342,14 @@ export class AgentContext {
    */
   private _lastOverflowPromptTokens?: number;
   /**
+   * Set while a compression-only overflow retry is in flight. Suppressing the
+   * *configured* summarization trigger for that one pass is what makes the
+   * staging real: without it the summarize node's skip just hands control
+   * back to the agent node, where the ordinary trigger fires on the very
+   * messages the re-prune produced and spends the model call anyway.
+   */
+  private _compressionRetryPending: boolean = false;
+  /**
    * Handoff context when this agent receives control via handoff.
    * Contains source and parallel execution info for system message context.
    */
@@ -1344,7 +1352,8 @@ export class AgentContext {
    */
   applyContextBudgetCorrection(
     budgetTokens: number,
-    promptTokens?: number
+    promptTokens?: number,
+    compressionOnly = false
   ): void {
     if (this._overflowRecoveryAttempts === 0) {
       this._preOverflowMaxContextTokens = this.maxContextTokens;
@@ -1353,7 +1362,19 @@ export class AgentContext {
     this.pruneMessages = undefined;
     this._lastSummarizationMsgCount = 0;
     this._lastOverflowPromptTokens = promptTokens;
+    this._compressionRetryPending = compressionOnly;
     this._overflowRecoveryAttempts += 1;
+  }
+
+  /**
+   * Reads and clears the compression-only marker. Consumed once per pass
+   * through the agent node so the suppression covers exactly the retry it was
+   * issued for and cannot leak into a later turn's legitimate trigger.
+   */
+  consumeCompressionRetry(): boolean {
+    const pending = this._compressionRetryPending;
+    this._compressionRetryPending = false;
+    return pending;
   }
 
   /**
@@ -1389,6 +1410,7 @@ export class AgentContext {
     this.maxContextTokens = this._preOverflowMaxContextTokens;
     this._preOverflowMaxContextTokens = undefined;
     this._lastOverflowPromptTokens = undefined;
+    this._compressionRetryPending = false;
     this._overflowRecoveryAttempts = 0;
   }
 

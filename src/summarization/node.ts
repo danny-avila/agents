@@ -1043,6 +1043,19 @@ export function createSummarizeNode({
         'Overflow summarization failed; keeping history rather than replacing it with a metadata stub'
       );
       agentContext.markSummarizationTriggered(state.messages.length);
+      /**
+       * The run step was already dispatched, so it has to be resolved here or
+       * consumers tracking step lifecycle keep an unfinished placeholder for
+       * the rest of the run.
+       */
+      await graph.dispatchRunStepCompleted(
+        stepId,
+        {
+          type: 'summary',
+          summary: placeholderSummary,
+        } satisfies t.SummaryCompleted,
+        runnableConfig
+      );
       if (runnableConfig) {
         await safeDispatchCustomEvent(
           GraphEvents.ON_SUMMARIZE_COMPLETE,

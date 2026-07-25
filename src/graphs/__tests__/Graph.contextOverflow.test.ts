@@ -8,7 +8,7 @@ import type { RunnableConfig } from '@langchain/core/runnables';
 import type { BaseMessage } from '@langchain/core/messages';
 import type * as t from '@/types';
 import { OVERFLOW_SIGNATURES } from '@/utils/__tests__/fixtures/contextOverflowSignatures';
-import { Providers } from '@/common';
+import { GraphEvents, Providers } from '@/common';
 import { Run } from '@/run';
 
 /**
@@ -303,6 +303,57 @@ describe('context overflow recovery', () => {
     expect(
       run.Graph.agentContexts.get('default')?.overflowRecoveryAttempts
     ).toBe(0);
+  });
+
+  it('spends no summarization call on the first recovery', async () => {
+    /**
+     * The regression this guards: suppressing the summarize node alone is not
+     * enough, because it hands control straight back to the agent node, where
+     * the *configured* trigger fires by default on the very messages the
+     * re-prune produced — spending the model call the staging exists to
+     * avoid.
+     */
+    const summarizeStarts: unknown[] = [];
+    const run = await Run.create<t.IState>({
+      runId: 'overflow-recovery-compress-first',
+      graphConfig: {
+        type: 'standard',
+        llmConfig: {
+          provider: Providers.ANTHROPIC,
+          disableStreaming: true,
+          streamUsage: false,
+        },
+        maxContextTokens: 1_000_000,
+        summarizationEnabled: true,
+      },
+      returnContent: true,
+      skipCleanup: true,
+      tokenCounter,
+      customHandlers: {
+        [GraphEvents.ON_SUMMARIZE_START]: {
+          handle: (_event: string, data: t.StreamEventData): void => {
+            summarizeStarts.push(data);
+          },
+        },
+      },
+    });
+    if (!run.Graph) {
+      throw new Error('Expected graph to be initialized');
+    }
+    const model = new OverflowThenSucceedModel(
+      signatureFor('claude-haiku-4-5-20251001')
+    );
+    run.Graph.overrideModel = model;
+
+    const content = await run.processStream(
+      { messages: buildConversation(8) },
+      streamConfig
+    );
+
+    expect(content).toEqual([{ type: 'text', text: 'recovered' }]);
+    expect(model.calls).toHaveLength(2);
+    /** Recovered on tool-output compression alone. */
+    expect(summarizeStarts).toHaveLength(0);
   });
 
   it('shrinks the budget in proportion to the measured overage', async () => {

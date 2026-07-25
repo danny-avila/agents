@@ -44,6 +44,33 @@ describe('AgentContext overflow recovery state', () => {
     expect(context.maxContextTokens).toBe(500_000);
   });
 
+  it('marks a compression-only retry so the configured trigger is suppressed', () => {
+    const context = createContext(1_000_000);
+    context.applyContextBudgetCorrection(190_000, 274_468, true);
+
+    /**
+     * Consumed once, by the single agent-node pass the suppression covers.
+     * Leaving it set would silence a later turn's legitimate trigger.
+     */
+    expect(context.consumeCompressionRetry()).toBe(true);
+    expect(context.consumeCompressionRetry()).toBe(false);
+  });
+
+  it('does not mark an escalated recovery as compression-only', () => {
+    const context = createContext(1_000_000);
+    context.applyContextBudgetCorrection(190_000, 274_468, false);
+
+    expect(context.consumeCompressionRetry()).toBe(false);
+  });
+
+  it('clears the compression marker on reset', () => {
+    const context = createContext(1_000_000);
+    context.applyContextBudgetCorrection(190_000, 274_468, true);
+    context.reset();
+
+    expect(context.consumeCompressionRetry()).toBe(false);
+  });
+
   it('reports a stall when the prompt did not shrink', () => {
     const context = createContext(1_000_000);
     context.applyContextBudgetCorrection(190_000, 250_000);
