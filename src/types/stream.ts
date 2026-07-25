@@ -68,13 +68,14 @@ export type RunStep = {
   runId?: string; // #new
   agentId?: string; // #new - tracks which agent this step belongs to
   /**
-   * Group ID - incrementing number (1, 2, 3...) reflecting execution order.
-   * Agents with the same groupId run in parallel and should be rendered together.
-   * undefined means the agent runs sequentially (not part of any parallel group).
+   * Opaque positive safe-integer identifier for parallel execution.
+   * Agents with the same groupId should be rendered together.
+   * Consumers must use content indexes, not groupId ordering, for execution order.
+   * undefined means the agent runs sequentially (not part of a parallel group).
    *
    * Example for: researcher -> [analyst1, analyst2, analyst3] -> summarizer
    * - researcher: undefined (sequential)
-   * - analyst1, analyst2, analyst3: 1 (first parallel group)
+   * - analyst1, analyst2, analyst3: the same groupId (parallel group)
    * - summarizer: undefined (sequential)
    */
   groupId?: number; // #new

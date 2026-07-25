@@ -276,7 +276,7 @@ describe('ContentAggregator resumed tool completions', () => {
 
     aggregateContent({
       event: GraphEvents.ON_RUN_STEP,
-      data: { ...createRunStep('step_continuation'), index: 1 },
+      data: createRunStep('step_continuation'),
     });
     aggregateContent({
       event: GraphEvents.ON_MESSAGE_DELTA,
@@ -508,6 +508,248 @@ describe('ContentAggregator resumed tool completions', () => {
     });
   });
 
+  it('appends unmatched tools and continuation content after the entire seed', () => {
+    const { contentParts, aggregateContent, stepMap } =
+      createContentAggregator();
+    contentParts.push(
+      { type: ContentTypes.TEXT, text: 'Before approval' },
+      {
+        type: ContentTypes.TOOL_CALL,
+        tool_call: {
+          id: 'call_approval',
+          name: 'approval_probe',
+          args: {},
+        },
+      },
+      { type: ContentTypes.TEXT, text: 'Seeded tail one' },
+      { type: ContentTypes.TEXT, text: 'Seeded tail two' }
+    );
+
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP,
+      data: {
+        id: 'step_rebuilt',
+        stepIndex: 0,
+        type: StepTypes.TOOL_CALLS,
+        index: 0,
+        stepDetails: {
+          type: StepTypes.TOOL_CALLS,
+          tool_calls: [
+            {
+              id: 'call_approval',
+              name: 'approval_probe',
+              args: {},
+            },
+            {
+              id: 'call_new',
+              name: 'approval_probe',
+              args: { value: 'new' },
+            },
+          ],
+        },
+        usage: null,
+      },
+    });
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP,
+      data: { ...createRunStep('step_after_seed'), index: 1 },
+    });
+    aggregateContent({
+      event: GraphEvents.ON_MESSAGE_DELTA,
+      data: {
+        id: 'step_after_seed',
+        delta: {
+          content: [{ type: ContentTypes.TEXT, text: 'After seed' }],
+        },
+      } as t.MessageDeltaEvent,
+    });
+
+    expect(stepMap.get('step_rebuilt')?.index).toBe(1);
+    expect(stepMap.get('step_after_seed')?.index).toBe(5);
+    expect(contentParts.slice(2, 4)).toEqual([
+      { type: ContentTypes.TEXT, text: 'Seeded tail one' },
+      { type: ContentTypes.TEXT, text: 'Seeded tail two' },
+    ]);
+    expect(contentParts[4]).toMatchObject({
+      type: ContentTypes.TOOL_CALL,
+      tool_call: {
+        id: 'call_new',
+        args: { value: 'new' },
+      },
+    });
+    expect(contentParts[5]).toEqual({
+      type: ContentTypes.TEXT,
+      text: 'After seed',
+    });
+  });
+
+  it('preserves seeded metadata when a blank-id completion replaces a tool card', () => {
+    const { contentParts, aggregateContent, stepMap } =
+      createContentAggregator();
+    contentParts.push({
+      type: ContentTypes.TOOL_CALL,
+      agentId: 'researcher',
+      groupId: 7,
+      tool_call: {
+        id: 'call_with_metadata',
+        name: 'approval_probe',
+        args: {},
+      },
+    });
+
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP_COMPLETED,
+      data: {
+        result: {
+          id: '',
+          index: 42,
+          type: 'tool_call',
+          tool_call: {
+            id: 'call_with_metadata',
+            name: 'approval_probe',
+            args: '{}',
+            output: 'approved',
+            progress: 1,
+          } as t.ProcessedToolCall,
+        },
+      } as { result: t.ToolEndEvent },
+    });
+
+    expect(contentParts[0]).toMatchObject({
+      agentId: 'researcher',
+      groupId: 7,
+      tool_call: {
+        id: 'call_with_metadata',
+        output: 'approved',
+      },
+    });
+
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP,
+      data: createRunStep('step_after_large_completion_index'),
+    });
+    aggregateContent({
+      event: GraphEvents.ON_MESSAGE_DELTA,
+      data: {
+        id: 'step_after_large_completion_index',
+        delta: {
+          content: [{ type: ContentTypes.TEXT, text: 'Still dense' }],
+        },
+      } as t.MessageDeltaEvent,
+    });
+    expect(stepMap.get('step_after_large_completion_index')?.index).toBe(1);
+    expect(contentParts[1]).toEqual({
+      type: ContentTypes.TEXT,
+      text: 'Still dense',
+    });
+  });
+
+  it('applies metadata from a hydrated run step to its seeded tool card', () => {
+    const { contentParts, aggregateContent, stepMap } =
+      createContentAggregator();
+    contentParts.push({
+      type: ContentTypes.TOOL_CALL,
+      tool_call: {
+        id: 'call_hydrated',
+        name: 'approval_probe',
+        args: {},
+      },
+    });
+    stepMap.set('step_hydrated', {
+      id: 'step_hydrated',
+      stepIndex: 0,
+      type: StepTypes.TOOL_CALLS,
+      index: 0,
+      agentId: 'reviewer',
+      groupId: 11,
+      stepDetails: {
+        type: StepTypes.TOOL_CALLS,
+        tool_calls: [
+          {
+            id: 'call_hydrated',
+            name: 'approval_probe',
+            args: {},
+          },
+        ],
+      },
+      usage: null,
+    });
+
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP_COMPLETED,
+      data: {
+        result: {
+          id: 'step_hydrated',
+          index: 0,
+          type: 'tool_call',
+          tool_call: {
+            id: 'call_hydrated',
+            name: 'approval_probe',
+            args: '{}',
+            output: 'approved',
+            progress: 1,
+          } as t.ProcessedToolCall,
+        },
+      } as { result: t.ToolEndEvent },
+    });
+
+    expect(contentParts[0]).toMatchObject({
+      agentId: 'reviewer',
+      groupId: 11,
+      tool_call: { output: 'approved' },
+    });
+  });
+
+  it('drops an unknown completion for a parallel step', () => {
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const { contentParts, aggregateContent } = createContentAggregator();
+    try {
+      aggregateContent({
+        event: GraphEvents.ON_RUN_STEP,
+        data: {
+          id: 'step_parallel_unknown',
+          stepIndex: 0,
+          type: StepTypes.TOOL_CALLS,
+          index: 0,
+          stepDetails: {
+            type: StepTypes.TOOL_CALLS,
+            tool_calls: [
+              { id: 'call_known_first', name: 'first', args: {} },
+              { id: 'call_known_second', name: 'second', args: {} },
+            ],
+          },
+          usage: null,
+        },
+      });
+      aggregateContent({
+        event: GraphEvents.ON_RUN_STEP_COMPLETED,
+        data: {
+          result: {
+            id: 'step_parallel_unknown',
+            index: 999,
+            type: 'tool_call',
+            tool_call: {
+              id: 'call_unknown',
+              name: 'unknown',
+              args: '{}',
+              output: 'must not overwrite',
+              progress: 1,
+            } as t.ProcessedToolCall,
+          },
+        } as { result: t.ToolEndEvent },
+      });
+
+      expect(contentParts).toHaveLength(2);
+      expect(contentParts[0]?.type).toBe(ContentTypes.TOOL_CALL);
+      expect(contentParts[1]?.type).toBe(ContentTypes.TOOL_CALL);
+      expect(warnSpy).toHaveBeenCalledWith(
+        'No run step or tool call found for completed step event'
+      );
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
   it('drops a completion that matches neither a step nor seeded tool call', () => {
     const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
     const { contentParts, aggregateContent } = createContentAggregator();
@@ -538,6 +780,330 @@ describe('ContentAggregator resumed tool completions', () => {
     } finally {
       warnSpy.mockRestore();
     }
+  });
+});
+
+describe('ContentAggregator physical content indices', () => {
+  it('allocates physical slots independently from streamed chunk keys', () => {
+    const { contentParts, aggregateContent } = createContentAggregator();
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP,
+      data: {
+        id: 'step_streamed_tool',
+        stepIndex: 0,
+        type: StepTypes.TOOL_CALLS,
+        index: 0,
+        stepDetails: {
+          type: StepTypes.TOOL_CALLS,
+          tool_calls: [],
+        },
+        usage: null,
+      },
+    });
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP_DELTA,
+      data: {
+        id: 'step_streamed_tool',
+        delta: {
+          type: StepTypes.TOOL_CALLS,
+          tool_calls: [
+            {
+              index: 2,
+              id: 'call_streamed_first',
+              name: 'approval_probe',
+              args: '{"value":"first"}',
+            },
+            {
+              index: 5,
+              id: 'call_streamed_second',
+              name: 'approval_probe',
+              args: '{"value":"second"}',
+            },
+          ],
+        },
+      } as t.RunStepDeltaEvent,
+    });
+
+    expect(contentParts).toHaveLength(2);
+    expect(contentParts[0]).toMatchObject({
+      type: ContentTypes.TOOL_CALL,
+      tool_call: {
+        id: 'call_streamed_first',
+        name: 'approval_probe',
+      },
+    });
+    expect(contentParts[1]).toMatchObject({
+      type: ContentTypes.TOOL_CALL,
+      tool_call: {
+        id: 'call_streamed_second',
+        name: 'approval_probe',
+      },
+    });
+
+    for (const [id, output] of [
+      ['call_streamed_first', 'first complete'],
+      ['call_streamed_second', 'second complete'],
+    ]) {
+      aggregateContent({
+        event: GraphEvents.ON_RUN_STEP_COMPLETED,
+        data: {
+          result: {
+            id: 'step_streamed_tool',
+            index: 500,
+            type: 'tool_call',
+            tool_call: {
+              id,
+              name: 'approval_probe',
+              args: '{}',
+              output,
+              progress: 1,
+            } as t.ProcessedToolCall,
+          },
+        } as { result: t.ToolEndEvent },
+      });
+    }
+    expect(contentParts[0]).toMatchObject({
+      tool_call: { output: 'first complete' },
+    });
+    expect(contentParts[1]).toMatchObject({
+      tool_call: { output: 'second complete' },
+    });
+  });
+
+  it('keeps distinct chunk keys separate when tool ids arrive late', () => {
+    const { contentParts, aggregateContent } = createContentAggregator();
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP,
+      data: {
+        id: 'step_late_ids',
+        stepIndex: 0,
+        type: StepTypes.TOOL_CALLS,
+        index: 0,
+        stepDetails: {
+          type: StepTypes.TOOL_CALLS,
+          tool_calls: [],
+        },
+        usage: null,
+      },
+    });
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP_DELTA,
+      data: {
+        id: 'step_late_ids',
+        delta: {
+          type: StepTypes.TOOL_CALLS,
+          tool_calls: [
+            { index: 2, name: 'first', args: '{"value":"first"}' },
+          ],
+        },
+      } as t.RunStepDeltaEvent,
+    });
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP_DELTA,
+      data: {
+        id: 'step_late_ids',
+        delta: {
+          type: StepTypes.TOOL_CALLS,
+          tool_calls: [
+            { index: 5, name: 'second', args: '{"value":"second"}' },
+          ],
+        },
+      } as t.RunStepDeltaEvent,
+    });
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP_DELTA,
+      data: {
+        id: 'step_late_ids',
+        delta: {
+          type: StepTypes.TOOL_CALLS,
+          tool_calls: [
+            { index: 2, id: 'call_late_first', name: 'first', args: {} },
+            { index: 5, id: 'call_late_second', name: 'second', args: {} },
+          ],
+        },
+      } as t.RunStepDeltaEvent,
+    });
+
+    expect(contentParts).toHaveLength(2);
+    expect(contentParts[0]).toMatchObject({
+      tool_call: {
+        id: 'call_late_first',
+        name: 'first',
+      },
+    });
+    expect(contentParts[1]).toMatchObject({
+      tool_call: {
+        id: 'call_late_second',
+        name: 'second',
+      },
+    });
+  });
+
+  it('uses the reserved slot when a streamed tool id has no chunk index', () => {
+    const { contentParts, aggregateContent } = createContentAggregator();
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP,
+      data: {
+        id: 'step_without_chunk_index',
+        stepIndex: 0,
+        type: StepTypes.TOOL_CALLS,
+        index: 0,
+        stepDetails: {
+          type: StepTypes.TOOL_CALLS,
+          tool_calls: [],
+        },
+        usage: null,
+      },
+    });
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP_DELTA,
+      data: {
+        id: 'step_without_chunk_index',
+        delta: {
+          type: StepTypes.TOOL_CALLS,
+          tool_calls: [
+            {
+              id: 'call_without_chunk_index',
+              name: 'approval_probe',
+              args: '{}',
+            },
+          ],
+        },
+      } as t.RunStepDeltaEvent,
+    });
+
+    expect(contentParts).toHaveLength(1);
+    expect(contentParts[0]).toMatchObject({
+      tool_call: {
+        id: 'call_without_chunk_index',
+        name: 'approval_probe',
+      },
+    });
+  });
+
+  it('routes an id-less chunk to the only known tool card', () => {
+    const { contentParts, aggregateContent } = createContentAggregator();
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP,
+      data: {
+        id: 'step_single_tool',
+        stepIndex: 0,
+        type: StepTypes.TOOL_CALLS,
+        index: 0,
+        stepDetails: {
+          type: StepTypes.TOOL_CALLS,
+          tool_calls: [
+            {
+              id: 'call_single',
+              name: 'approval_probe',
+              args: {},
+            },
+          ],
+        },
+        usage: null,
+      },
+    });
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP_DELTA,
+      data: {
+        id: 'step_single_tool',
+        delta: {
+          type: StepTypes.TOOL_CALLS,
+          tool_calls: [
+            {
+              index: 9,
+              name: 'approval_probe',
+              args: '{"value":"updated"}',
+            },
+          ],
+        },
+      } as t.RunStepDeltaEvent,
+    });
+
+    expect(contentParts).toHaveLength(1);
+    expect(contentParts[0]).toMatchObject({
+      type: ContentTypes.TOOL_CALL,
+      tool_call: {
+        id: 'call_single',
+        args: '{"value":"updated"}',
+      },
+    });
+  });
+
+  it('routes indexed id-less chunks across known parallel tool cards', () => {
+    const { contentParts, aggregateContent } = createContentAggregator();
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP,
+      data: {
+        id: 'step_parallel_chunks',
+        stepIndex: 0,
+        type: StepTypes.TOOL_CALLS,
+        index: 0,
+        stepDetails: {
+          type: StepTypes.TOOL_CALLS,
+          tool_calls: [
+            { id: 'call_chunk_first', name: 'first', args: {} },
+            { id: 'call_chunk_second', name: 'second', args: {} },
+          ],
+        },
+        usage: null,
+      },
+    });
+    aggregateContent({
+      event: GraphEvents.ON_RUN_STEP_DELTA,
+      data: {
+        id: 'step_parallel_chunks',
+        delta: {
+          type: StepTypes.TOOL_CALLS,
+          tool_calls: [
+            { index: 7, name: 'first', args: '{"value":"first"}' },
+            { index: 9, name: 'second', args: '{"value":"second"}' },
+          ],
+        },
+      } as t.RunStepDeltaEvent,
+    });
+
+    expect(contentParts[0]).toMatchObject({
+      tool_call: {
+        id: 'call_chunk_first',
+        args: '{"value":"first"}',
+      },
+    });
+    expect(contentParts[1]).toMatchObject({
+      tool_call: {
+        id: 'call_chunk_second',
+        args: '{"value":"second"}',
+      },
+    });
+  });
+
+  it('places a raw agent update after seeded content', () => {
+    const { contentParts, aggregateContent } = createContentAggregator();
+    contentParts.push(
+      { type: ContentTypes.TEXT, text: 'Seed one' },
+      { type: ContentTypes.TEXT, text: 'Seed two' }
+    );
+
+    aggregateContent({
+      event: GraphEvents.ON_AGENT_UPDATE,
+      data: {
+        type: ContentTypes.AGENT_UPDATE,
+        agent_update: {
+          index: 0,
+          runId: 'run_resumed',
+          agentId: 'researcher',
+        },
+      },
+    });
+
+    expect(contentParts[2]).toEqual({
+      type: ContentTypes.AGENT_UPDATE,
+      agent_update: {
+        index: 2,
+        runId: 'run_resumed',
+        agentId: 'researcher',
+      },
+    });
   });
 });
 
