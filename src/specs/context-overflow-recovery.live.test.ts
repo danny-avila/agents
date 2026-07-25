@@ -191,7 +191,15 @@ describeIfLive('context overflow recovery (live)', () => {
         expect(agentContext?.maxContextTokens).toBeLessThan(
           testCase.contextWindow * 2
         );
-        expect(summarizeEvents.length).toBeGreaterThan(0);
+        /**
+         * No summarization assertion: the first recovery compacts by
+         * compressing tool output, so a run that fits after compression alone
+         * never spends a summarization call. Any summary event that does
+         * arrive must at least carry no error.
+         */
+        for (const event of summarizeEvents) {
+          expect(event.error).toBeUndefined();
+        }
       }
     );
   }

@@ -83,8 +83,10 @@ Two kinds are distinguished:
 - `request_too_large` — a single request exceeded a per-minute token
   allowance. Waiting cannot help, because the request can never fit the
   bucket; only a smaller prompt can. This is separated from ordinary
-  throttling numerically: it counts only when `Requested >= Limit`. When
-  `Requested < Limit`, the account was merely busy and a retry is correct.
+  throttling numerically: it counts only when `Requested > Limit`. At
+  `Requested <= Limit` the request fits an empty bucket, so the account was
+  merely busy and a retry is correct — losing conversation history to a
+  temporarily busy account would be the worse failure.
 
 Deliberately excluded, with fixtures pinning each: genuine RPM/TPM throttling,
 quota and billing failures, authentication failures, output-token-cap errors
